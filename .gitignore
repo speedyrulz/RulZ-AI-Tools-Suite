@@ -6,3 +6,5 @@ datasets/
 *.safetensors
 .cache/
 venv/
+configs/*
+!configs/example.yaml
