@@ -77,6 +77,8 @@ class TrainConfig:
     transformer_quant: str = "auto"  # auto (keep file format) | none | int8 | int8_convrot | nvfp4
     text_encoder_quant: str = "auto"  # auto | none | int8 | int8_convrot | nvfp4
     gradient_checkpointing: bool = True
+    int8_matmul: bool = True  # int8/int8_convrot layers: W8A8 (int8 activations x int8 weight via torch._int_mm)
+    int8_backward: str = "bf16"  # bf16 (exact: grad = grad_out @ W in bf16) | int8 (also quantizes grad_out)
 
     # --- dataset ---
     dataset_dir: str = "datasets/my_dataset"

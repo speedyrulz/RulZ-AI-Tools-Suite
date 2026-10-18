@@ -337,6 +337,7 @@ class Form:
             multi_gpu=v("multi_gpu"), devices=(v("devices") or "").strip(), split_plan=(v("split_plan") or "").strip(),
             transformer_quant=v("transformer_quant"), text_encoder_quant=v("text_encoder_quant"),
             gradient_checkpointing=bool(v("gradient_checkpointing")),
+            int8_matmul=bool(v("int8_matmul")), int8_backward=v("int8_backward"),
             dataset_dir=s("dataset_dir"), resolution=int(v("resolution")),
             enable_buckets=bool(v("enable_buckets")), flip_augment=bool(v("flip_augment")),
             trigger_word=s("trigger_word"), caption_dropout=float(v("caption_dropout")),
@@ -755,6 +756,16 @@ def build_page():
                     w["text_encoder_quant"] = ui.select(QUANTS, value="auto", label="Text encoder quant").classes("w-44")
                     w["gradient_checkpointing"] = ui.checkbox("Gradient checkpointing", value=True)
                     w["compile_model"] = ui.checkbox("Compile model (torch.compile, needs triton)", value=False)
+                with ui.row().classes("w-full items-end"):
+                    w["int8_matmul"] = ui.select({True: "W8A8 int8 matmul (fast)", False: "dequantize to bf16 (slow)"},
+                                                 value=True, label="int8 layers compute").classes("w-72")                         .tooltip("int8 / int8_convrot layers only. W8A8 quantizes the activations per token to int8 "
+                                 "and multiplies them with the stored int8 weight (torch._int_mm), so the weight is "
+                                 "never dequantized: about 1.2-1.5x faster than bf16 and far faster than the "
+                                 "dequantize path, at under 1% extra forward error. nvfp4 always dequantizes.")
+                    w["int8_backward"] = ui.select({"bf16": "bf16 (exact)", "int8": "int8 (faster, approximate)"},
+                                                   value="bf16", label="int8 backward").classes("w-56")                         .bind_visibility_from(w["int8_matmul"], "value", lambda x: bool(x))                         .tooltip("bf16: grad_x = grad_out @ W with the int8 weight widened to bf16 (exact). "
+                                 "int8: grad_out is also quantized per token and multiplied with the int8 weight "
+                                 "(about 1% gradient error, saves the bf16 weight copy in backward).")
 
             with ui.expansion("Dataset", value=True).classes("w-full"):
                 with ui.row().classes("w-full items-end"):
@@ -1491,6 +1502,12 @@ HELP = """
 ComfyUI int8/nvfp4 file stays quantized), `none` dequantizes to bf16, and `int8`, `int8_convrot` or `nvfp4`
 quantize on load. Only the frozen base weights are quantized; the LoRA itself always trains in fp32.
 int8 roughly halves VRAM for the base model (about 5 GB for the DiT); nvfp4 quarters it.
+
+*int8 layers compute*: with **W8A8** (default) int8 / int8_convrot layers quantize the activations per token to
+int8 and run an int8 x int8 matmul (`torch._int_mm`) on the stored weight, so training is faster than bf16
+instead of ~3x slower; the extra error is under 1% of the output. *int8 backward* `bf16` is exact (the weight
+is widened to bf16 only for the gradient), `int8` also quantizes the gradient (faster, ~1% gradient error).
+`dequantize to bf16` is the old slow path for A/B comparison. nvfp4 always dequantizes.
 
 ## Training states
 Tick *Save training state* to also write `state_XXXXXX/` folders (LoRA in fp32 + optimizer + scheduler + RNG).

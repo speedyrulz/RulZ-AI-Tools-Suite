@@ -8,6 +8,8 @@ Pillow>=10
 pyyaml>=6
 nicegui>=2
 bitsandbytes>=0.45
+# fused W8A8 kernels (rulztrainer/quant.py); Linux torch wheels already bundle triton
+triton-windows>=3.8; sys_platform == "win32"
 # optional: face / body similarity scoring for character LoRAs
 insightface>=0.7
 onnxruntime-gpu>=1.17

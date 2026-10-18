@@ -14,6 +14,7 @@ import torch
 from PIL import Image
 
 from . import lora as lora_mod
+from . import quant as Q
 from .config import TrainConfig
 from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, empty_text_path, load_batch,
                       scan_dataset, text_cache_path)
@@ -350,6 +351,7 @@ class Trainer:
         rng = random.Random(cfg.seed)
         gen = torch.Generator("cpu").manual_seed(cfg.seed)
         self.status.update(stage="resolving model")
+        Q.set_int8_defaults(cfg.int8_matmul, cfg.int8_backward)  # every QuantLinear built from here on
         self.model_dir = loading.resolve_for_config(cfg)
         items = scan_dataset(cfg)
         log.info("Dataset: %d images in %s", len(items), cfg.dataset_dir)
@@ -359,6 +361,10 @@ class Trainer:
         self.status.update(stage="loading transformer", step=0, total=cfg.steps)
         model = loading.get_transformer(cfg, self.model_dir)
         model.gradient_checkpointing = cfg.gradient_checkpointing
+        n_w8a8 = Q.configure_int8(model, cfg.int8_matmul, cfg.int8_backward)
+        if n_w8a8:
+            log.info("%d quantized Linear layers: int8 matmul %s (backward %s)", n_w8a8,
+                     "on" if cfg.int8_matmul else "off", cfg.int8_backward)
         blocks = lora_mod.parse_blocks(cfg.lora_blocks, len(model.layers))
         injected = lora_mod.inject_lora(model, cfg.lora_rank, cfg.lora_alpha, cfg.lora_targets,
                                         include_text_embedder=cfg.train_text_embedder, dropout=cfg.lora_dropout,
@@ -377,6 +383,7 @@ class Trainer:
                 self.status.update(stage=f"loading model replica on {dev}")
                 m = loading.get_transformer(cfg, self.model_dir, device=dev)
                 m.gradient_checkpointing = cfg.gradient_checkpointing
+                Q.configure_int8(m, cfg.int8_matmul, cfg.int8_backward)
                 inj = lora_mod.inject_lora(m, cfg.lora_rank, cfg.lora_alpha, cfg.lora_targets,
                                            include_text_embedder=cfg.train_text_embedder, dropout=cfg.lora_dropout,
                                            blocks=blocks)

@@ -97,8 +97,82 @@ Accepted weight formats: bf16 / fp16 / fp32, fp8 (upcast), ComfyUI `int8_tensorw
 | `int8`, `int8_convrot` | quantize eligible Linear layers on load (about half the VRAM) |
 | `nvfp4` | quantize on load to FP4 with FP8 block scales (about a quarter of the VRAM) |
 
-Only the frozen base weights are quantized. The LoRA trains in fp32 and the quantized weights are dequantized on
-the fly in forward and backward, so no bf16 copy is kept. Exported LoRAs are bf16 by default (`lora_save_dtype`).
+Only the frozen base weights are quantized. The LoRA trains in fp32. Exported LoRAs are bf16 by default
+(`lora_save_dtype`).
+
+### int8 compute: W8A8 (`int8_matmul`, `int8_backward`)
+
+int8 and int8_convrot layers do not dequantize their weight any more. With `int8_matmul: true` (the default)
+each Linear runs **W8A8**: the activations are quantized per token to int8 (symmetric, fp32 scale per row), the
+int8 activations are multiplied with the stored int8 weight by `torch._int_mm` (int32 accumulate), and the
+result is rescaled by the activation scale and the per-output-row weight scale in the compute dtype. For
+int8_convrot files the activations are first rotated with the same grouped Hadamard (group 256) the weight was
+stored with: x W^T = (xH)(WH)^T, so no inverse rotation of the weight is needed, and the rotation spreads
+activation outliers over the group, which is what makes per-token int8 accurate on these models.
+
+The two elementwise passes around the GEMM (per-token quantization of the activations, int32 -> bf16 rescale by
+both scales) are single fused triton kernels when `triton` imports (`triton-windows` on Windows, in
+`requirements.txt`; triton ships with the Linux torch wheels). For int8_convrot the Hadamard rotation of the
+activations is folded into the quantization kernel: H_256 = H_16 (x) H_16, so each 256-group of a token row is
+rotated as H_16 X H_16 with two tiny tensor-core dots (fp32 accumulate, the intermediate carried as a bf16
+hi + lo pair), the row amax is taken over the rotated values and they are quantized straight from registers;
+the rotated bf16 tensor is never written. Without triton the eager PyTorch versions run (a bf16 matmul for the
+rotation, then two and three memory passes); the choice is made once at import and a kernel failure at run time
+logs one warning and switches to eager. `RULZ_W8A8_TRITON=0` forces the eager path, e.g. for the before/after
+bench.
+
+The previous behaviour (`int8_matmul: false`) dequantized the weight to bf16 in every forward *and* every
+backward, three times per step with gradient checkpointing, which made int8 training about 3x slower than
+bf16. Measured with `scripts/bench_int8.py` (4096 tokens, int8_convrot, 50 iterations; "eager" is the same
+W8A8 path with `RULZ_W8A8_TRITON=0`), forward / forward+backward ms:
+
+| layer (K -> N) | path | RTX 5060 Ti | RTX 4060 Ti |
+|---|---|---|---|
+| 3072 -> 8192 (ffn up) | bf16 weight | 4.1 / 8.3 | 4.8 / 8.9 |
+| | W8A8 fused, bf16 backward (default) | **1.9** / 6.7 | **2.3** / 7.2 |
+| | W8A8 fused, int8 backward | 1.9 / 4.7 | 2.3 / 5.6 |
+| | W8A8 fused, Hadamard as a separate matmul (previous) | 2.0 / 6.7 | 2.4 / 7.3 |
+| | W8A8 eager, bf16 backward | 2.9 / 7.5 | 3.5 / 8.3 |
+| | W8A8 eager, int8 backward | 2.9 / 6.6 | 3.5 / 8.2 |
+| | dequantize per call (old) | 6.5 / 12.9 | 7.3 / 14.6 |
+| | `torch._int_mm` alone | 1.2 | 1.3 |
+| 8192 -> 3072 (ffn down) | bf16 weight | 4.2 / 8.3 | 4.7 / 8.9 |
+| | W8A8 fused, bf16 backward | **1.7** / 6.5 | **2.0** / 7.2 |
+| | W8A8 fused, int8 backward | 1.7 / 4.6 | 2.0 / 5.5 |
+| | W8A8 fused, Hadamard as a separate matmul (previous) | 2.1 / 7.1 | 2.5 / 7.7 |
+| | W8A8 eager, bf16 backward | 3.2 / 8.3 | 4.0 / 9.2 |
+| | dequantize per call (old) | 6.4 / 12.9 | 7.3 / 14.6 |
+| 3072 -> 3072 (q/k/v/o) | bf16 weight | 1.5 / 3.1 | 1.8 / 3.3 |
+| | W8A8 fused, bf16 backward | **0.8** / 2.6 | **1.0** / 3.0 |
+| | W8A8 fused, int8 backward | 0.8 / 2.0 | 1.0 / 2.6 |
+| | W8A8 fused, Hadamard as a separate matmul (previous) | 0.9 / 2.8 | 1.1 / 3.1 |
+| | W8A8 eager, bf16 backward | 1.5 / 3.3 | 1.9 / 3.8 |
+| | dequantize per call (old) | 2.4 / 4.8 | 2.7 / 5.5 |
+
+With the fused kernels the forward is 2-2.4x faster than bf16 on every MOSS layer shape (the eager W8A8
+path was 1.4x on the ffn layers and only bf16 speed on the 3072 -> 3072 ones). Folding the Hadamard into the
+quantization kernel took the rotate + quantize step from 0.31 / 0.93 ms (K = 3072 / 8192, 4060 Ti) to
+0.13 / 0.44 ms; the remaining gap to the bare int8 GEMM is the int32 -> bf16 rescale of the output plus that
+one read of x. With checkpointing the forward runs twice per step, so a step is bf16 speed or better at half
+the VRAM. Forward error versus the dequantized weight is under 1% (the activation quantization), the same
+order as the weight quantization itself. The fused quantizer and rescale round exactly like the eager ones
+(the rescale even avoids the eager path's second bf16 rounding); the fused rotation keeps the rotated values
+in fp32 where the separate bf16 matmul rounds them, so its int8 values are within 1 LSB of the two-step path
+and closer to the exact rotation (about 5% of the two-step values are 1 LSB off an fp64 reference, about
+0.002% of the fused ones).
+
+`int8_backward` chooses how grad_x is computed:
+
+| value | effect |
+|---|---|
+| `bf16` (default) | exact: the int8 weight is widened to bf16 once per backward and grad_x = grad_out @ W (no activation or gradient quantization; convrot applies the inverse Hadamard to grad_x) |
+| `int8` | the weight scale is folded into grad_out, grad_out is quantized per token to int8 and multiplied with the int8 weight; about 1% gradient error, saves the bf16 weight copy and is slightly faster |
+
+Fallbacks: nvfp4 layers always dequantize (there is no fp4 matmul here); CPU tensors and shapes the int8
+kernel rejects (in/out features not multiples of 8) use the dequantize path silently; a kernel error at run
+time logs one warning and falls back for that call. Rows are padded to 17 when a call has 16 tokens or
+fewer, because `torch._int_mm` refuses smaller M. In the WebUI these are *int8 layers compute* and *int8
+backward* in the model section.
 
 ## Training states
 
@@ -113,7 +187,7 @@ those folders to continue exactly where it stopped. `resume_from` loads only LoR
 `sample_before_training` renders a sample set at step 0 for comparison. The log reports each prompt and the
 Monitor page shows the sampling step. The Monitor page also has per-GPU VRAM/utilization bars, an adjustable
 loss-smoothing slider and an auto-scrolling log. `compile_model` runs the DiT blocks through torch.compile
-(skipped with a warning if triton is not installed, which is the usual case on Windows).
+(skipped with a warning if triton is not installed; `triton-windows` from requirements.txt provides it on Windows).
 
 ## Identity similarity for character LoRAs (face + body)
 

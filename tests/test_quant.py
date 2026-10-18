@@ -76,3 +76,232 @@ def test_quantized_model_trains_lora():
     lora_mod.set_extras_enabled(model, True)
     b = m(x)
     assert not torch.allclose(a, b)
+
+
+# ---------------------------------------------------------------- W8A8 (int8 activations x int8 weight)
+
+import pytest  # noqa: E402
+
+cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="W8A8 needs torch._int_mm on CUDA")
+
+
+def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
+    return ((a.float() - b.float()).norm() / b.float().norm()).item()
+
+
+def test_quantize_act_int8_matches_round():
+    torch.manual_seed(0)
+    x = torch.randn(64, 512) * 3
+    x[0] = 0  # all-zero token must not divide by zero
+    x[1, 7] = 1e4  # outlier token
+    q, s = Q.quantize_act_int8(x)
+    amax = x.abs().amax(1, keepdim=True).clamp(min=1e-12)
+    ref = torch.round(x / (amax / 127)).to(torch.int8)
+    assert q.dtype == torch.int8 and s.shape == (64, 1) and s.dtype == torch.float32
+    assert torch.allclose(s, amax / 127)
+    assert (q.int() - ref.int()).abs().max() <= 1  # only round-half-even vs half-away ties may differ
+    assert q.abs().max() <= 127 and q[0].abs().max() == 0
+
+
+@cuda_only
+@pytest.mark.parametrize("fmt", ["int8", "int8_convrot"])
+def test_w8a8_forward_matches_dequant(fmt):
+    torch.manual_seed(0)
+    w = (torch.randn(8192, 3072) * 0.02).to("cuda", torch.bfloat16)
+    x = torch.randn(64, 3072, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(8192, device="cuda", dtype=torch.bfloat16)
+    ql = Q.QuantLinear(Q.quantize_weight(w, fmt), bias, torch.bfloat16, int8_matmul=True)
+    assert ql.uses_w8a8(x)
+    y = ql(x)
+    ql.int8_matmul = False
+    ref = ql(x)
+    assert y.shape == ref.shape == (64, 8192) and y.dtype == torch.bfloat16
+    assert _rel(y, ref) < 0.01, _rel(y, ref)
+    # 3-D input keeps its leading dims
+    assert ql(x.view(2, 32, 3072)).shape == (2, 32, 8192)
+
+
+@cuda_only
+@pytest.mark.parametrize("fmt", ["int8", "int8_convrot"])
+def test_w8a8_backward_bf16_matches_dequant(fmt):
+    torch.manual_seed(0)
+    w = (torch.randn(8192, 3072) * 0.02).to("cuda", torch.bfloat16)
+    x = torch.randn(64, 3072, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    g = torch.randn(64, 8192, device="cuda", dtype=torch.bfloat16)
+    ql = Q.QuantLinear(Q.quantize_weight(w, fmt), None, torch.bfloat16, int8_matmul=False)
+    ql(x).backward(g)
+    ref = x.grad.clone()
+    x.grad = None
+    ql.int8_matmul, ql.int8_backward = True, "bf16"
+    ql(x).backward(g)
+    assert _rel(x.grad, ref) < 0.01, _rel(x.grad, ref)  # exact up to bf16 rounding (inverse rotation correct)
+    x.grad = None
+    ql.int8_backward = "int8"
+    ql(x).backward(g)
+    assert _rel(x.grad, ref) < 0.03, _rel(x.grad, ref)  # quantized grad_out: ~1% error
+
+
+@cuda_only
+def test_w8a8_small_m_padding():
+    torch.manual_seed(0)
+    w = (torch.randn(2048, 1024) * 0.02).to("cuda", torch.bfloat16)
+    ql = Q.QuantLinear(Q.quantize_weight(w, "int8_convrot"), None, torch.bfloat16, int8_matmul=True)
+    for m in (1, 5, 16, 17):
+        x = torch.randn(m, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        y = ql(x)
+        assert y.shape == (m, 2048)
+        ql.int8_matmul = False
+        ref = ql(x)
+        ql.int8_matmul = True
+        assert _rel(y, ref) < 0.01, (m, _rel(y, ref))
+        for bw in ("bf16", "int8"):
+            ql.int8_backward = bw
+            ql(x).float().sum().backward()
+            assert x.grad.shape == (m, 1024) and torch.isfinite(x.grad).all()
+            x.grad = None
+
+
+def test_w8a8_defaults_and_configure():
+    w = torch.randn(1024, 1024) * 0.02
+    qw = Q.quantize_weight(w, "int8")
+    old = (Q.DEFAULT_INT8_MATMUL, Q.DEFAULT_INT8_BACKWARD)
+    try:
+        Q.set_int8_defaults(False, "int8")
+        ql = Q.QuantLinear(qw, None)
+        assert ql.int8_matmul is False and ql.int8_backward == "int8"
+        ql2 = Q.QuantLinear(qw, None, int8_matmul=True, int8_backward="bf16")
+        assert ql2.int8_matmul is True and ql2.int8_backward == "bf16"
+        model = torch.nn.Sequential(ql, ql2, torch.nn.Linear(4, 4))
+        assert Q.configure_int8(model, True, "bf16") == 2
+        assert ql.int8_matmul and ql.int8_backward == "bf16"
+        with pytest.raises(ValueError):
+            Q.set_int8_defaults(True, "fp8")
+        # nvfp4 and CPU tensors never take the int8 path
+        assert not Q.QuantLinear(Q.quantize_weight(w, "nvfp4"), None).uses_w8a8(torch.randn(4, 1024))
+        assert not ql2.uses_w8a8(torch.randn(4, 1024))
+    finally:
+        Q.set_int8_defaults(*old)
+
+
+@cuda_only
+def test_quantized_model_trains_lora_w8a8():
+    torch.manual_seed(0)
+    tiny = dict(dim=1024, ffn_dim=1024, num_heads=8, num_layers=2, text_dim=32, freq_dim=16, latent_channels=128)
+    model = MOSSImageTransformer(**tiny).to("cuda", torch.bfloat16)
+    assert Q.quantize_module_linears(model, "int8_convrot", min_dim=1024) > 0
+    assert Q.configure_int8(model, True, "bf16") > 0
+    model.gradient_checkpointing = True
+    injected = lora_mod.inject_lora(model, 4, 4, ["q", "k", "v", "o", "ffn_up_gate", "ffn_down"])
+    model.train()
+    out = model(torch.randn(1, 128, 4, 4, device="cuda").to(torch.bfloat16), torch.tensor([300.0], device="cuda"),
+                torch.randn(1, 5, 32, device="cuda").to(torch.bfloat16))
+    out.float().pow(2).mean().backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in lora_mod.lora_parameters(injected))
+    assert not Q._W8A8_WARNED
+
+
+# ---------------------------------------------------------------- fused triton kernels vs eager helpers
+
+fused_cuda = pytest.mark.skipif(not (torch.cuda.is_available() and Q.HAS_TRITON),
+                                reason="fused W8A8 kernels need triton + CUDA")
+_devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())] or ["cuda"]
+
+
+@fused_cuda
+@pytest.mark.parametrize("device", _devices)
+def test_fused_kernels_match_eager(device):
+    torch.manual_seed(0)
+    shapes = [(64, 3072), (17, 8192), (5, 1000), (3, 12000)]  # single-tile, max tile, odd K, two-pass loop
+    for (m, k) in shapes:
+        for dt in (torch.bfloat16, torch.float32):
+            x = (torch.randn(m, k, device=device) * 3).to(dt)
+            x[0] = 0
+            x[1, 7] = 1e4
+            q_t, s_t = Q._quantize_act_int8_triton(x)
+            q_e, s_e = Q._quantize_act_int8_eager(x)
+            assert q_t.dtype == torch.int8 and s_t.shape == (m, 1) and s_t.dtype == torch.float32
+            assert torch.equal(s_t, s_e), (m, k, dt)
+            # both round to nearest even; bf16 inputs repeat values within a row, so an exact .5 tie flips every
+            # copy at once and the eager fp32 product may sit on the other side of it: never more than 1 LSB
+            assert (q_t.int() - q_e.int()).abs().max() <= 1, (m, k, dt)
+            assert q_t[0].abs().max() == 0 and q_t.abs().max() <= 127
+        y = torch.randint(-2**20, 2**20, (m, k), dtype=torch.int32, device=device)
+        rs = torch.rand(m, 1, device=device) + 0.1
+        cs = torch.rand(k, 1, device=device) + 0.1  # weight scale layout [N, 1]; passed transposed like w8a8_forward
+        for col in (cs.t(), None):
+            # fp32 output: identical operation order, bit-exact
+            assert torch.equal(Q._rescale_triton(y, rs, col, torch.float32), Q._rescale_eager(y, rs, col, torch.float32))
+            out_t = Q._rescale_triton(y, rs, col, torch.bfloat16)
+            out_e = Q._rescale_eager(y, rs, col, torch.bfloat16)
+            ref = (y.double() * rs.double() * (col.double() if col is not None else 1.0)).to(torch.bfloat16)
+            assert out_t.dtype == torch.bfloat16
+            # fused: one rounding to bf16; eager: two when col_scale is given -> within one bf16 ulp of each other
+            assert torch.allclose(out_t.float(), ref.float(), rtol=2 ** -7, atol=0), (m, k, col is None)
+            assert torch.allclose(out_t.float(), out_e.float(), rtol=2 ** -7, atol=0), (m, k, col is None)
+    # the public helpers dispatch to the fused kernels when triton is on
+    assert Q.USE_TRITON
+    x = torch.randn(8, 1024, device=device, dtype=torch.bfloat16)
+    assert torch.equal(Q.quantize_act_int8(x)[0], Q._quantize_act_int8_triton(x)[0])
+
+
+@fused_cuda
+@pytest.mark.parametrize("device", _devices)
+def test_fused_rotate_quant_matches_rotate_then_eager(device):
+    torch.manual_seed(0)
+    shapes = [(64, 3072), (17, 8192), (1, 256), (33, 1024), (300, 3072)]  # several / one / many row tiles, K = 1..32 groups
+    for m, k in shapes:
+        for dt in (torch.bfloat16, torch.float16):
+            x = (torch.randn(m, k, device=device) * 3).to(dt)
+            x[0] = 0  # all-zero token must not divide by zero
+            if m > 1:
+                x[1, 7] = 1e4  # one outlier: the rotation spreads it over its group
+            if m > 2:
+                x[2, ::97] = 300
+            q_t, s_t = Q._rotate_quantize_act_int8_triton(x, 256)
+            xr = Q.rotate_act(x, 256)  # two-step path: the matmul rounds the rotated values to the input dtype
+            q_e, s_e = Q._quantize_act_int8_eager(xr)
+            assert q_t.dtype == torch.int8 and s_t.shape == (m, 1) and s_t.dtype == torch.float32
+            # the fused kernel keeps the rotated values in fp32 (hi/lo split through the second dot), the two-step
+            # path rounds them to bf16 (rel 2^-8): the row amax, hence the scale, differs by up to one bf16 ulp and
+            # the int8 values by at most 1 LSB (|a - b| <= 0.5 LSB before rounding)
+            assert torch.allclose(s_t, s_e, rtol=2 ** -7, atol=0), (m, k, dt)
+            assert (q_t.int() - q_e.int()).abs().max() <= 1, (m, k, dt)
+            assert q_t[0].abs().max() == 0 and q_t.abs().max() <= 127
+            # against an fp64 rotation the fused result is the closer one (~0% mismatches vs ~5% for bf16 two-step)
+            xr64 = Q.rotate_act(x.double(), 256)
+            q64 = torch.round(xr64 / (xr64.abs().amax(1, keepdim=True).clamp(min=1e-12) / 127))
+            assert (q_t.double() - q64).abs().max() <= 1, (m, k, dt)
+            fused_mism = (q_t.double() != q64).float().mean().item()
+            eager_mism = (q_e.double() != q64).float().mean().item()
+            assert fused_mism <= eager_mism, (m, k, dt, fused_mism, eager_mism)
+    # dispatch: bf16 CUDA input takes the fused kernel; fp32 input and a K that is not a multiple of the group
+    # take the two-step path (rotate_act, then the fused quantizer)
+    assert Q.USE_TRITON
+    x = torch.randn(8, 1024, device=device, dtype=torch.bfloat16)
+    assert torch.equal(Q.rotate_quantize_act_int8(x, 256)[0], Q._rotate_quantize_act_int8_triton(x, 256)[0])
+    x32 = x.float()
+    q, s = Q.rotate_quantize_act_int8(x32, 256)
+    q_ref, s_ref = Q.quantize_act_int8(Q.rotate_act(x32, 256))
+    assert torch.equal(q, q_ref) and torch.equal(s, s_ref)
+    with pytest.raises(ValueError):
+        Q._rotate_quantize_act_int8_triton(torch.randn(8, 1000, device=device, dtype=torch.bfloat16), 256)
+    assert Q._hadamard_sub(256) == 16 and Q._hadamard_sub(4096) == 64
+    assert Q._hadamard_sub(64) is None and Q._hadamard_sub(1024) is None and Q._hadamard_sub(16) is None
+
+
+@fused_cuda
+def test_fused_kernel_failure_falls_back_to_eager(monkeypatch):
+    def boom(x):
+        raise RuntimeError("simulated triton failure")
+    x = torch.randn(8, 1024, device="cuda", dtype=torch.bfloat16)
+    q_e, s_e = Q._quantize_act_int8_eager(x)
+    monkeypatch.setattr(Q, "_quantize_act_int8_triton", boom)
+    monkeypatch.setattr(Q, "USE_TRITON", True)
+    q, s = Q.quantize_act_int8(x)
+    assert torch.equal(q, q_e) and torch.equal(s, s_e)
+    assert Q.USE_TRITON is False  # switched off once, no retry
+    assert torch.equal(Q.quantize_act_int8(x)[0], q_e)
+    # the fused rotate+quantize follows the same switch: two-step path (rotate_act, eager quantizer)
+    q_r, s_r = Q.rotate_quantize_act_int8(x, 256)
+    q_r_e, s_r_e = Q._quantize_act_int8_eager(Q.rotate_act(x, 256))
+    assert torch.equal(q_r, q_r_e) and torch.equal(s_r, s_r_e)
