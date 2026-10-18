@@ -72,12 +72,21 @@ def hadamard(size: int) -> torch.Tensor:
 _HADAMARD_DEV: dict[tuple, torch.Tensor] = {}
 
 
+@torch.compiler.disable
+def _build_hadamard_on(key: tuple) -> torch.Tensor:
+    # built eagerly even inside a torch.compile'd block: traced, the CPU construction would put CPU ops into the
+    # graph, which Inductor can only compile with a C++ compiler (MSVC on Windows)
+    size, device, dtype = key
+    h = _HADAMARD_DEV[key] = hadamard(size).to(device, dtype)
+    return h
+
+
 def hadamard_on(size: int, device, dtype) -> torch.Tensor:
     """hadamard(size) cached per device/dtype (a fresh .to(device) each call is a synchronous H2D copy)."""
     key = (size, torch.device(device), dtype)
     h = _HADAMARD_DEV.get(key)
     if h is None:
-        h = _HADAMARD_DEV[key] = hadamard(size).to(device, dtype)
+        h = _build_hadamard_on(key)
     return h
 
 
@@ -373,6 +382,10 @@ if HAS_TRITON:
 
     _QUANT_MAX_TILE = 8192  # rows up to this many columns are quantized from registers in one HBM read
 
+    # The launch wrappers are opaque to torch.compile (graph break around them, run eagerly): Dynamo's tracing of a
+    # triton launch with dynamic shapes fails (torch 2.14: "SymNodeVariable has no attribute value"), and a failure
+    # there would switch USE_TRITON off for the whole process.
+    @torch.compiler.disable
     def _quantize_act_int8_triton(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if x.stride(1) != 1:
             x = x.contiguous()
@@ -387,6 +400,7 @@ if HAS_TRITON:
                                     SINGLE_TILE=k <= block, BLOCK_K=block, num_warps=8 if block >= 2048 else 4)
         return q, scale
 
+    @torch.compiler.disable
     def _rescale_triton(y_i32: torch.Tensor, row_scale: torch.Tensor, col_scale: torch.Tensor | None,
                         dtype) -> torch.Tensor:
         if y_i32.stride(1) != 1:
@@ -460,6 +474,7 @@ if HAS_TRITON:
     # small tiles keep pass 2's re-read of x inside L2 and give the SMs ~1000 programs for a 4096-token call
     _ROT_QUANT_ROWS = 4
 
+    @torch.compiler.disable
     def _rotate_quantize_act_int8_triton(x: torch.Tensor, group: int) -> tuple[torch.Tensor, torch.Tensor]:
         if x.dtype not in (torch.bfloat16, torch.float16):
             raise TypeError(f"fused rotate+quantize needs a bf16/fp16 input, got {x.dtype}")

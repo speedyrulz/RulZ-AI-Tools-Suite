@@ -188,6 +188,10 @@ those folders to continue exactly where it stopped. `resume_from` loads only LoR
 Monitor page shows the sampling step. The Monitor page also has per-GPU VRAM/utilization bars, an adjustable
 loss-smoothing slider and an auto-scrolling log. `compile_model` runs the DiT blocks through torch.compile
 (skipped with a warning if triton is not installed; `triton-windows` from requirements.txt provides it on Windows).
+No C++ compiler is needed: the blocks are compiled with Dynamo's `specialize_float` so the LoRA scale and
+multiplier stay Python constants instead of becoming CPU tensors (which would make Inductor emit C++ and fail with
+"InvalidCxxCompiler: cl is not found" on a machine without MSVC on PATH), and the fused W8A8 kernels run eagerly
+behind a graph break, so int8 layers keep their fused triton path inside compiled blocks.
 
 ## Identity similarity for character LoRAs (face + body)
 

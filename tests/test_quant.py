@@ -290,6 +290,25 @@ def test_fused_rotate_quant_matches_rotate_then_eager(device):
 
 
 @fused_cuda
+def test_w8a8_under_torch_compile_keeps_fused_kernels():
+    """A torch.compile'd (dynamic) W8A8 layer must not trip the triton launch wrappers: they run eagerly behind a
+    graph break, USE_TRITON stays on and the result is bit-identical to the uncompiled fused forward."""
+    torch.manual_seed(0)
+    w = (torch.randn(2048, 1024) * 0.02).to("cuda", torch.bfloat16)
+    ql = Q.QuantLinear(Q.quantize_weight(w, "int8_convrot"), None, torch.bfloat16, int8_matmul=True)
+    compiled = torch.compile(ql, dynamic=True)
+    assert Q.USE_TRITON
+    for m in (64, 80):  # second shape: dynamic recompile / guard path
+        x = torch.randn(m, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        y = compiled(x)
+        y.float().sum().backward()
+        assert Q.USE_TRITON and not Q._W8A8_WARNED
+        assert torch.equal(y, ql(x))
+        assert x.grad is not None and torch.isfinite(x.grad).all()
+    torch._dynamo.reset()
+
+
+@fused_cuda
 def test_fused_kernel_failure_falls_back_to_eager(monkeypatch):
     def boom(x):
         raise RuntimeError("simulated triton failure")

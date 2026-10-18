@@ -606,6 +606,9 @@ class Trainer:
             log.warning("compile_model requested but triton is not installed; running without compile")
             return
         try:
+            # Python float attributes (LoRA scale / multiplier) would otherwise be traced as 0-d CPU tensors, and the
+            # CPU ops on them make Inductor emit C++ that needs MSVC on Windows ("InvalidCxxCompiler: cl is not found")
+            torch._dynamo.config.specialize_float = True
             for block in (*model.layers, *model.text_embedder.blocks):
                 block.compile(backend="inductor", dynamic=True)
             log.info("Compiled %d DiT blocks with torch.compile (first steps will be slow)", len(model.layers) + 2)
