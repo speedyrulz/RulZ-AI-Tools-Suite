@@ -317,6 +317,7 @@ class Form:
 
     def __init__(self):
         self.w: dict[str, object] = {}
+        self.preset_sync = False  # True while from_config moves the preset switch (its on_change must not re-apply)
 
     def value(self, key):
         return self.w[key].value
@@ -411,8 +412,15 @@ class Form:
         for key, widget in self.w.items():
             if key in values:
                 widget.value = values[key]
-        if "preset_toggle" in self.w and cfg.preset == "identity" and not self.w["preset_toggle"].value:
-            self.w["preset_toggle"].value = True  # loading a preset config shows the switch on (no re-apply)
+        toggle = self.w.get("preset_toggle")
+        if toggle is not None and toggle.value != (cfg.preset == "identity"):
+            # the switch mirrors the loaded config's preset in both directions; setting .value fires on_change,
+            # so flag it as a sync and not a user click (no re-apply, no restore)
+            self.preset_sync = True
+            try:
+                toggle.value = cfg.preset == "identity"
+            finally:
+                self.preset_sync = False
 
 
 def path_input(f: Form, key: str, label: str, kind: str, value: str = "", width: str = "w-96", filetypes=None):
@@ -685,13 +693,15 @@ def build_page():
                 preset_note = ui.label("").classes("text-xs")
 
                 def on_preset_toggle(e):
-                    if preset_state["applying"]:
+                    if preset_state["applying"] or f.preset_sync:
                         return
                     preset_state["applying"] = True
                     try:
                         if e.value:
-                            preset_state["snapshot"] = f.to_config()
-                            f.from_config(TrainConfig.from_dict(apply_preset(f.to_config().to_dict(), "identity")))
+                            snapshot = f.to_config()
+                            snapshot.preset = ""  # the switch already reads on here; the snapshot is the pre-preset state
+                            preset_state["snapshot"] = snapshot
+                            f.from_config(TrainConfig.from_dict(apply_preset(snapshot.to_dict(), "identity")))
                             keys = sorted(PRESETS["identity"])
                             preset_note.text = (f"Identity preset applied ({len(keys)} settings: region loss, LoRA+ 4, "
                                                 "adamw8bit, crops without upscaling, SAM 3 masks, probes every 25, "
