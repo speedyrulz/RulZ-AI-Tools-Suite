@@ -169,6 +169,49 @@ def transformer_from_hf_state(state: dict[str, torch.Tensor], config: dict, devi
 # ---------------------------------------------------------------- VAE
 
 
+def _count_blocks(state: dict, pattern: str) -> int:
+    return sum(1 for i in range(16) if pattern.format(i) in state)
+
+
+def vae_original_to_diffusers(state: dict) -> dict:
+    """Rename a VAE state dict from the original (BFL / ComfyUI / LDM) key layout to the diffusers layout.
+
+    `encoder.down.i.block.j` -> `encoder.down_blocks.i.resnets.j`, `decoder.up.i.block.j` -> `decoder.up_blocks.(n-1-i)
+    .resnets.j` (up blocks are numbered in reverse), `down.i.downsample` / `up.i.upsample` -> `...samplers.0`,
+    `mid.block_k` -> `mid_block.resnets.(k-1)`, `mid.attn_1.{q,k,v,proj_out}` (1x1 convs) -> `mid_block.attentions.0
+    .{to_q,to_k,to_v,to_out.0}` (linear), `nin_shortcut` -> `conv_shortcut`, `norm_out` -> `conv_norm_out`. Keys that
+    are the same in both layouts (conv_in, conv_out, quant_conv, post_quant_conv, bn.*) pass through.
+    """
+    n_down = _count_blocks(state, "encoder.down.{}.block.0.conv1.weight")
+    n_up = _count_blocks(state, "decoder.up.{}.block.0.conv1.weight")
+    renames: list[tuple[str, str]] = [("nin_shortcut", "conv_shortcut"), ("norm_out.", "conv_norm_out."),
+                                      ("mid.block_1.", "mid_block.resnets.0."), ("mid.block_2.", "mid_block.resnets.1."),
+                                      ("mid.attn_1.", "mid_block.attentions.0.")]
+    for i in range(n_down):
+        renames += [(f"encoder.down.{i}.block.", f"encoder.down_blocks.{i}.resnets."),
+                    (f"encoder.down.{i}.downsample.", f"encoder.down_blocks.{i}.downsamplers.0.")]
+    for i in range(n_up):
+        renames += [(f"decoder.up.{i}.block.", f"decoder.up_blocks.{n_up - 1 - i}.resnets."),
+                    (f"decoder.up.{i}.upsample.", f"decoder.up_blocks.{n_up - 1 - i}.upsamplers.0.")]
+    attn = [("norm.", "group_norm."), ("q.", "to_q."), ("k.", "to_k."), ("v.", "to_v."), ("proj_out.", "to_out.0.")]
+    out = {}
+    for k, v in state.items():
+        nk = k
+        for old, new in renames:
+            nk = nk.replace(old, new)
+        if "mid_block.attentions.0." in nk:
+            head, tail = nk.split("mid_block.attentions.0.", 1)
+            for old, new in attn:
+                if tail.startswith(old):
+                    tail = new + tail[len(old):]
+                    break
+            nk = head + "mid_block.attentions.0." + tail
+            if nk.endswith(".weight") and isinstance(v, torch.Tensor) and v.ndim == 4 and "group_norm" not in nk:
+                v = v.reshape(v.shape[0], v.shape[1])  # 1x1 conv -> linear
+        out[nk] = v
+    return out
+
+
 def load_vae_file(path: str | Path, device):
     from diffusers import AutoencoderKLFlux2
 
@@ -176,8 +219,14 @@ def load_vae_file(path: str | Path, device):
     if any(isinstance(v, Q.QuantWeight) for v in state.values()):
         raise ValueError("Quantized VAE files are not supported; use the fp32/bf16 Flux2 VAE")
     state = strip_prefix(state, ("vae.", "first_stage_model."))
+    state = {k.replace("decoder.post_quant_conv.", "post_quant_conv.").replace("encoder.quant_conv.", "quant_conv."): v
+             for k, v in state.items()}
     if "encoder.conv_in.weight" not in state or "bn.running_mean" not in state:
-        raise ValueError(f"{Path(path).name} is not a Flux2 VAE in diffusers key format")
+        raise ValueError(f"{Path(path).name} is not a Flux2 VAE (needs encoder.conv_in and the bn.* latent batch norm)")
+    if "decoder.up.0.block.0.conv1.weight" in state:  # original BFL / ComfyUI key layout (e.g. ae.safetensors)
+        state = vae_original_to_diffusers(state)
+    if "decoder.up_blocks.0.resnets.0.conv1.weight" not in state:
+        raise ValueError(f"{Path(path).name}: unrecognized VAE key layout (neither diffusers nor original)")
     config = json.loads((HERE / "flux2_vae_config.json").read_text())
     enc = [state[f"encoder.down_blocks.{i}.resnets.0.conv1.weight"].shape[0] for i in range(8)
            if f"encoder.down_blocks.{i}.resnets.0.conv1.weight" in state]
@@ -190,6 +239,7 @@ def load_vae_file(path: str | Path, device):
         config["decoder_block_out_channels"] = list(reversed(dec))
         config["up_block_types"] = ["UpDecoderBlock2D"] * len(dec)
     config["latent_channels"] = state["decoder.conv_in.weight"].shape[1]
+    config["layers_per_block"] = _count_blocks(state, "encoder.down_blocks.0.resnets.{}.conv1.weight") or 2
     import inspect
 
     accepted = set(inspect.signature(AutoencoderKLFlux2.__init__).parameters)
