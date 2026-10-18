@@ -10,6 +10,11 @@ directly in ComfyUI with the standard *Load LoRA* node.
 index URL as the first argument, e.g. `install.bat https://download.pytorch.org/whl/cu128`) and the requirements.
 Then double-click `run_webui.bat` to start the UI and open it in your browser (optional first argument: port).
 
+**Linux:** `./install.sh` does the same (`venv/`, cu128 PyTorch wheels by default, pass another index URL as the
+first argument, or `system` to keep an already installed torch), then `./run_webui.sh [port] [host]`. On a headless
+box (no display) the WebUI has no native Browse dialogs: type paths, or upload datasets on the Dataset tab.
+Cloud GPUs: see [Running on vast.ai](#running-on-vastai).
+
 **Manual:**
 
 ```bash
@@ -38,6 +43,50 @@ Open http://127.0.0.1:7870.
 ```bash
 python -m rulztrainer.train --config configs/example.yaml --set steps=1000 --set job_name=cat_lora
 ```
+
+## Running on vast.ai
+
+Everything needed is in `scripts/vast/` and the repo is public, so a template only has to point at it.
+
+**Create the template** (once), either with the CLI:
+
+```bash
+pip install vastai && vastai set api-key <your key>
+bash scripts/vast/create_template.sh
+```
+
+or in the web editor (Templates -> Create) with these settings:
+
+| field | value |
+|---|---|
+| Image path:tag | `vastai/pytorch:cuda-12.8.1-auto` (CUDA 12.8 build: RTX 30 / 40 / 50 series hosts) |
+| Launch mode | Jupyter + SSH, direct connections |
+| On-start script | `/opt/instance-tools/bin/entrypoint.sh` |
+| Ports | `1111`, `7870`, `8080`, `22` |
+| Environment variables | `PROVISIONING_SCRIPT=https://raw.githubusercontent.com/speedyrulz/RulzTrainer/main/scripts/vast/provision.sh`<br>`PORTAL_CONFIG=localhost:1111:11111:/:Instance Portal\|localhost:7870:17870:/:RulzTrainer\|localhost:8080:18080:/:Jupyter\|localhost:8080:8080:/terminals/1:Jupyter Terminal`<br>`OPEN_BUTTON_PORT=1111` |
+| Disk space | 120 GB (the base model download is about 30 GB; datasets, caches and outputs come on top) |
+
+Put `HF_TOKEN` (needed for the gated MOSS-Image repos) into your **account** environment variables
+(cloud.vast.ai -> Account -> Environment Variables), never into the template: account variables are injected into
+every instance and land in `/etc/environment`, where the WebUI and the training subprocess read them.
+
+**Rent an instance** from the template (one 16 GB+ GPU is enough; two GPUs enable the multi-GPU modes). On the first
+boot `provision.sh` clones the repo into `/workspace/RulzTrainer`, installs the requirements into the image's
+`/venv/main` (its torch is reused) and registers the WebUI as a supervisor service; this takes 3-5 minutes and
+shows in the Instance Portal's log viewer. Then click *Open* on the instance: the Instance Portal lists
+**RulzTrainer** (the WebUI, proxied by Caddy on port 7870 with the portal's token / basic auth, so it is never open
+to the internet unauthenticated), Jupyter (file browser + terminal for uploads and downloads) and the tunnel links.
+
+Datasets: upload on the WebUI's Dataset tab (drag and drop images + `.txt` captions) or into
+`/workspace/RulzTrainer/datasets/<name>` with Jupyter / `scp` / Syncthing. Results are written to
+`/workspace/RulzTrainer/output/<job>/`; download them from Jupyter before destroying the instance (the disk is gone
+with it; stopping keeps it). `models/` on the instance disk caches the downloaded base model between runs.
+
+Service control on the instance: `supervisorctl status|restart rulztrainer`; its log is
+`/var/log/portal/rulztrainer.log`. `RULZ_REPO` / `RULZ_BRANCH` environment variables point the provisioning at a
+fork or branch. `Dockerfile` builds an image with the install baked in (`FROM vastai/pytorch:cuda-12.8.1-auto`,
+same supervisor wiring) for faster instance starts: build, push and use it as the template image; the provisioning
+variable is then unnecessary.
 
 ## How it trains
 
@@ -354,6 +403,9 @@ rulztrainer/
 webui.py           NiceGUI web UI (runs training as a subprocess)
 configs/           example configs
 tests/             smoke tests (no weights needed): python -m pytest tests
+install.bat / run_webui.bat   Windows install and start;  install.sh / run_webui.sh   the same for Linux
+scripts/vast/      vast.ai: provision.sh (PROVISIONING_SCRIPT), supervisor wrapper + conf, create_template.sh
+Dockerfile         optional vast.ai image with the install baked in
 ```
 
 ## Adding another model

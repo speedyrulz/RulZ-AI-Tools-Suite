@@ -54,6 +54,11 @@ def _relative(path: str) -> str:
         return path
 
 
+# native pick dialogs need a desktop: always on Windows/macOS, only with a display on Linux (not on a headless
+# server such as a vast.ai instance, where paths are typed or come from the Dataset tab's uploader)
+HAS_DISPLAY = sys.platform in ("win32", "darwin") or bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
 def tk_dialog(kind: str, initial: str = "", filetypes=None) -> str:
     """Native pick dialog (runs in a worker thread). kind: 'dir' | 'file'."""
     import tkinter as tk
@@ -430,12 +435,16 @@ def path_input(f: Form, key: str, label: str, kind: str, value: str = "", width:
         f.w[key] = inp
 
         async def browse():
-            picked = await run.io_bound(tk_dialog, kind, inp.value or "", filetypes)
+            try:
+                picked = await run.io_bound(tk_dialog, kind, inp.value or "", filetypes)
+            except Exception as e:  # noqa: BLE001  (no tkinter, no display)
+                ui.notify(f"No file dialog available here ({type(e).__name__}); type the path instead", type="warning")
+                return
             if picked:
                 inp.value = _relative(picked)
 
-        ui.button(icon="folder_open" if kind == "dir" else "description", on_click=browse).props("flat dense") \
-            .tooltip("Browse")
+        if HAS_DISPLAY:
+            ui.button(icon="folder_open" if kind == "dir" else "description", on_click=browse).props("flat dense")                 .tooltip("Browse")
     return inp
 
 

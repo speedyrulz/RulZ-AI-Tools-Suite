@@ -1,0 +1,11 @@
+venv/
+models/
+output/
+datasets/
+__pycache__/
+*.pyc
+*.safetensors
+.cache/
+.git/
+defaulttest1/
+presettest1/
