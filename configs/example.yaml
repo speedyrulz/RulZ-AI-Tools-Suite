@@ -1,0 +1,43 @@
+job_name: my_first_lora
+output_dir: output
+seed: 42
+
+# Model: a HF repo id (downloaded into models_dir) or a local directory
+model_path: OpenMOSS-Team/MOSS-Image-Base   # or OpenMOSS-Team/MOSS-Image-SFT
+models_dir: models
+device: cuda:0
+text_encoder_device: auto      # auto spreads the 9B text encoder over GPUs + CPU during caching
+text_encoder_quant: none       # none | 8bit | 4bit
+gradient_checkpointing: true
+
+dataset_dir: datasets/my_dataset   # images + same-name .txt captions
+resolution: 1024
+enable_buckets: true
+flip_augment: false
+trigger_word: ""
+caption_dropout: 0.05
+max_token_length: 1024
+
+lora_rank: 16
+lora_alpha: 16
+lora_targets: [q, k, v, o, ffn_up_gate, ffn_down]
+train_text_embedder: false
+
+steps: 2000
+batch_size: 1
+gradient_accumulation: 1
+learning_rate: 0.0001
+optimizer: adamw8bit
+lr_scheduler: constant
+warmup_steps: 50
+timestep_sampling: logit_normal
+timestep_shift: 1.0
+
+save_every: 250
+sample_every: 250
+sample_prompts:
+  - "a photo of a cat sitting on a windowsill, soft morning light"
+sample_width: 1024
+sample_height: 1024
+sample_steps: 20
+sample_cfg: 3.0

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "webui",
+      "runtimeExecutable": "venv\\Scripts\\python.exe",
+      "runtimeArgs": ["webui.py", "--port", "7870"],
+      "port": 7870
+    }
+  ]
+}

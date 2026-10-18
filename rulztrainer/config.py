@@ -1,0 +1,241 @@
+"""Training configuration (dataclass + YAML round trip)."""
+from __future__ import annotations
+
+import dataclasses
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import yaml
+
+MODEL_PRESETS = {
+    "MOSS-Image-Base": "OpenMOSS-Team/MOSS-Image-Base",
+    "MOSS-Image-SFT": "OpenMOSS-Team/MOSS-Image-SFT",
+}
+
+
+# Named presets: values applied over a config (UI toggle, --preset on the CLI, or `preset:` in YAML).
+PRESETS: dict[str, dict] = {
+    "identity": {  # measured recipe for character LoRAs (see README "Identity training")
+        "region_weights": True, "face_loss_weight": 3.0, "body_loss_weight": 1.5, "background_loss_weight": 0.3,
+        "face_margin": 0.25, "region_feather_cells": 1, "region_prior_weight": 0.0,
+        "lora_plus_ratio": 4.0, "optimizer": "adamw8bit", "learning_rate": 1e-4,
+        "timestep_sampling": "logit_normal", "sigma_min": 0.0, "sigma_max": 1.0,
+        "crop_augment": "face+bust", "crop_augment_min_px": 0,
+        "body_backend": "mediapipe+sam3",
+        "batch_size": 1, "gradient_accumulation": 1, "lora_rank": 16, "lora_alpha": 16.0,
+        "probe_every": 25, "probe_seeds": 2, "probe_at_start": True, "probe_steps": 8, "probe_cfg": 1.0,
+        "likeness_track_best": True, "likeness_patience": 5, "likeness_lr_control": False,
+        "likeness_curriculum": True, "likeness_curriculum_strength": 0.5,
+        "loss_watch": True, "per_image_lr": True,
+    },
+}
+PRESET_PROBE_PROMPTS = {
+    "identity": ("close-up portrait photo of {trigger}, neutral background, soft light",
+                 "full body photo of {trigger} standing straight facing the camera, arms at sides, plain background, "
+                 "whole body visible head to feet"),
+}
+
+
+def apply_preset(data: dict, name: str) -> dict:
+    """Return a copy of a config dict with the preset applied. Probe prompts are filled in only when empty."""
+    if name not in PRESETS:
+        raise ValueError(f"Unknown preset {name!r}; available: {sorted(PRESETS)}")
+    out = dict(data)
+    out.update(PRESETS[name])
+    face_p, body_p = PRESET_PROBE_PROMPTS.get(name, ("", ""))
+    subject = out.get("trigger_word") or "the character"
+    if not out.get("probe_face_prompt"):
+        out["probe_face_prompt"] = face_p.format(trigger=subject)
+    if not out.get("probe_body_prompt"):
+        out["probe_body_prompt"] = body_p.format(trigger=subject)
+    out["preset"] = name
+    return out
+
+
+@dataclass
+class TrainConfig:
+    # --- job ---
+    preset: str = ""  # name of a preset that was applied (identity); informational, see apply_preset
+    job_name: str = "my_lora"
+    output_dir: str = "output"
+    seed: int = 42
+
+    # --- model ---
+    model_arch: str = "moss_image"
+    model_source: str = "hf"  # hf: repo id / diffusers dir | files: single ComfyUI-style safetensors files
+    model_path: str = "OpenMOSS-Team/MOSS-Image-Base"  # HF repo id or local dir with transformer/ text_encoder/ vae/
+    models_dir: str = "models"  # where HF repos are downloaded
+    transformer_file: str = ""  # model_source=files: ComfyUI diffusion_models/*.safetensors (bf16, fp8, int8, nvfp4)
+    text_encoder_file: str = ""  # model_source=files: ComfyUI text_encoders/*.safetensors (Qwen3.5-9B)
+    vae_file: str = ""  # model_source=files: ComfyUI vae/*.safetensors (Flux2 VAE)
+    tokenizer_path: str = ""  # model_source=files: dir with tokenizer_config.json; empty = auto-download
+    device: str = "cuda:0"
+    multi_gpu: str = "off"  # off | data_parallel (model copy per GPU, faster) | model_split (blocks across GPUs, memory only)
+    devices: str = "cuda:0,cuda:1"  # GPUs for multi_gpu; the first is the primary
+    split_plan: str = ""  # model_split: manual block plan e.g. "cuda:0=0-25;cuda:1=26-41"; empty = auto-balance
+    text_encoder_device: str = "auto"  # "auto" splits across GPUs/CPU; or "cuda:0", "cuda:1", "cpu"
+    transformer_quant: str = "auto"  # auto (keep file format) | none | int8 | int8_convrot | nvfp4
+    text_encoder_quant: str = "auto"  # auto | none | int8 | int8_convrot | nvfp4
+    gradient_checkpointing: bool = True
+
+    # --- dataset ---
+    dataset_dir: str = "datasets/my_dataset"
+    resolution: int = 1024  # target total pixels = resolution^2, aspect preserved, buckets at multiples of 16
+    enable_buckets: bool = True
+    min_bucket_side: int = 512
+    max_bucket_side: int = 2048
+    flip_augment: bool = False
+    caption_ext: str = ".txt"
+    trigger_word: str = ""
+    caption_dropout: float = 0.05
+    max_token_length: int = 1024
+    cache_dir: str = ""  # defaults to <dataset_dir>/.rulz_cache
+    recache: bool = False
+
+    # --- lora ---
+    lora_rank: int = 16
+    lora_alpha: float = 16.0
+    lora_dropout: float = 0.0
+    lora_targets: list[str] = field(default_factory=lambda: ["q", "k", "v", "o", "ffn_up_gate", "ffn_down"])
+    lora_blocks: str = ""  # DiT blocks to train, e.g. "0-41" (all), "21-41", "10-31,40", "even"; empty = all
+    train_text_embedder: bool = False  # also LoRA the 2-block text projection inside the DiT
+    resume_from: str = ""  # path to a previously exported LoRA .safetensors (weights only)
+    lora_save_dtype: str = "bf16"  # bf16 | fp16 | fp32 for the exported LoRA files
+    save_state: bool = False  # also save optimizer/scheduler/RNG state (resumable); final state always saved
+    save_state_every: int = 0  # steps between state saves; 0 = same as save_every
+    keep_states: int = 3  # rolling number of state folders to keep; 0 = keep all
+    resume_state: str = ""  # path to a state_XXXXXX directory to resume training from
+    compile_model: bool = False  # torch.compile the DiT blocks before training (needs a working triton)
+
+    # --- optimization ---
+    steps: int = 2000
+    batch_size: int = 1
+    gradient_accumulation: int = 1
+    learning_rate: float = 1e-4
+    optimizer: str = "adamw"  # adamw | adamw8bit | adafactor | automagic3
+    weight_decay: float = 0.01
+    automagic_min_lr: float = 1e-8  # automagic3: hard floor for the adapted lr
+    automagic_max_lr: float = 1e-3  # automagic3: hard ceiling for the adapted lr
+    automagic_polarity_history: int = 8  # automagic3: sign-history window (2-64)
+    automagic_clip_threshold: float = 1.0  # automagic3: update trust region
+    lr_scheduler: str = "constant"  # constant | cosine | linear
+    warmup_steps: int = 50
+    max_grad_norm: float = 1.0
+    timestep_sampling: str = "logit_normal"  # logit_normal | sigmoid | uniform
+    logit_mean: float = 0.0
+    logit_std: float = 1.0
+    sigmoid_scale: float = 1.0  # sigmoid mode: sigma = sigmoid(randn * sigmoid_scale)
+    timestep_shift: float = 1.0  # sigma shift applied to sampled sigmas (training_shift is 1.0 upstream)
+    loss_weighting: str = "none"  # none | min_snr (sigma-based) | sigma_sqrt
+
+    # --- saving / sampling ---
+    save_every: int = 250
+    sample_every: int = 250
+    sample_prompts: list[str] = field(default_factory=list)
+    sample_width: int = 1024
+    sample_height: int = 1024
+    sample_steps: int = 20
+    sample_cfg: float = 3.0
+    sample_shift: float = 5.0
+    sample_seed: int = 42
+    sample_walk_seed: bool = True  # seed + i for the i-th sample prompt; off = same seed for every prompt
+    sample_before_training: bool = False  # generate samples at step 0 before the first training step
+    sample_negative: str = ""
+    sample_skip_layer: int = 22  # negative-branch skip layer; -1 disables
+    turbo_lora: str = ""  # optional ComfyUI-format LoRA (e.g. an 8-step distill) applied only while sampling
+    turbo_lora_strength: float = 1.0
+    sample_lora: str = ""  # optional second ComfyUI-format LoRA applied only while sampling (with the turbo LoRA)
+    sample_lora_strength: float = 1.0
+    # --- face similarity (character LoRAs) ---
+    face_refs: list[str] = field(default_factory=list)  # dataset images whose largest face is the reference identity
+    face_provider: str = "cpu"  # cpu | cuda (onnxruntime provider for InsightFace)
+    face_det_size: int = 640
+    body_refs: list[str] = field(default_factory=list)  # dataset images (full body, neutral pose) for proportions
+    body_backend: str = "mediapipe"  # mediapipe (skeleton ratios) | mediapipe+sam3 (adds SAM 3 silhouette widths)
+    sam3_model: str = "facebook/sam3"  # HF repo id or local transformers-format directory
+    body_device: str = "cuda:0"  # where SAM 3 runs while scoring (moved back to CPU afterwards)
+    face_weight: float = 0.7  # weights for the combined score
+    body_weight: float = 0.3
+    # --- per-image loss watch ---
+    loss_watch: bool = False  # track every image's timestep-normalised loss and give epoch verdicts
+    per_image_lr: bool = False  # act on verdicts: stuck x0.5/0.25/0.125, exhausted x0.6 (not with automagic3)
+    loss_watch_buckets: int = 40  # sigma buckets for loss normalisation
+    loss_watch_beta: float = 0.9  # per-image residual EMA
+    loss_watch_high: float = 1.3  # residual above median x this = hard
+    loss_watch_low: float = 0.7  # residual below median x this = easy / learned
+    loss_watch_improve_tol: float = 0.03  # relative epoch-to-epoch drop that counts as improving
+    loss_watch_healthy_mult: float = 1.0  # lr multiplier for the healthy cohort (Fizgig uses 1.1)
+    loss_watch_exclude_after: int = 0  # epochs at the lowest throttle before an image is excluded; 0 = never
+    # --- identity training: region-weighted loss ---
+    region_weights: bool = False  # weight the loss by region: face > person > background (needs insightface)
+    face_loss_weight: float = 3.0
+    body_loss_weight: float = 1.5
+    background_loss_weight: float = 0.3
+    face_margin: float = 0.25  # face box dilation as a fraction of its size
+    region_feather_cells: int = 1  # 3x3 averaging passes on the cell map (0 = hard edges)
+    region_prior_weight: float = 0.0  # background cells regularised toward the base model's prediction (0 = off)
+    # --- identity training: timesteps ---
+    content_power: float = 3.0  # timestep_sampling=content/style: sigma = u^p (content) or 1 - u^p (style)
+    sigma_min: float = 0.0  # training sigma range (rescaled after timestep_shift; 0..1)
+    sigma_max: float = 1.0
+    # --- identity training: LoRA+ ---
+    lora_plus_ratio: float = 0.0  # lr of lora_up = lr x ratio (0/1 = off, 16 = LoRA+ paper); not with automagic3
+    # --- identity training: automatic crops ---
+    crop_augment: str = "none"  # none | face | face+bust: add face / bust crops of each image as extra items
+    crop_augment_min_px: int = 0  # min crop side in source px; 0 = the training resolution (never upscale crops)
+    crop_face_scale: float = 2.5  # face crop side = scale x max(face w, h)
+    crop_bust_scale: float = 5.0  # bust crop side = scale x max(face w, h), centred below the face
+    crop_skip_face_frac: float = 0.15  # already a close-up: no face crop
+    crop_skip_cover: float = 0.70  # crop covering more of the source than this is redundant
+    crop_face_caption: str = "close-up portrait photo of {caption}"
+    crop_bust_caption: str = "head and shoulders photo of {caption}"
+    crop_augment_weight: float = 1.0  # sampling weight of crop items
+    # --- likeness probes & controller (character LoRAs) ---
+    probe_every: int = 0  # steps between probe renders; 0 = off (needs face_refs and/or body_refs)
+    probe_at_start: bool = True  # also probe at step 0 for a baseline
+    probe_face_prompt: str = ""  # headshot prompt; empty = no face probe
+    probe_body_prompt: str = ""  # full-body prompt; empty = no body probe
+    probe_seeds: int = 1  # seeds per probe (scores averaged)
+    probe_seed: int = 1234
+    probe_size: int = 512  # face probe is square; body probe is probe_size x 1.5
+    probe_steps: int = 8
+    probe_cfg: float = 1.0
+    probe_ema: float = 0.5  # smoothing of probe scores (weight on the previous value)
+    likeness_noise_band: float = 1.0  # percent points a change must exceed to count
+    likeness_track_best: bool = True  # keep <job>_best.safetensors at the best smoothed score
+    likeness_patience: int = 0  # stop after N probes without improvement; 0 = never
+    likeness_lr_control: bool = False  # bounded lr multiplier driven by the probe trend
+    likeness_lr_min: float = 0.5
+    likeness_lr_max: float = 2.0
+    likeness_lr_step: float = 0.1  # relative change per decision
+    likeness_curriculum: bool = False  # face/body dataset weighting + timestep bias from the score gap
+    likeness_curriculum_strength: float = 1.0
+    sample_model_path: str = ""  # optional different diffusion model for sampling only: .safetensors, diffusers dir or repo id
+    sample_model_quant: str = "auto"  # auto | none | int8 | int8_convrot | nvfp4
+
+    def resolved_cache_dir(self) -> Path:
+        return Path(self.cache_dir) if self.cache_dir else Path(self.dataset_dir) / ".rulz_cache"
+
+    def job_dir(self) -> Path:
+        return Path(self.output_dir) / self.job_name
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "TrainConfig":
+        known = {f.name for f in dataclasses.fields(cls)}
+        unknown = set(data) - known
+        if unknown:
+            raise ValueError(f"Unknown config keys: {sorted(unknown)}")
+        return cls(**data)
+
+    @classmethod
+    def load(cls, path: str | Path) -> "TrainConfig":
+        with open(path, "r", encoding="utf-8") as f:
+            return cls.from_dict(yaml.safe_load(f) or {})
+
+    def save(self, path: str | Path) -> None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(self.to_dict(), f, sort_keys=False, allow_unicode=True)

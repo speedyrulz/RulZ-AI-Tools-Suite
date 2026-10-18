@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+models/
+output/
+datasets/
+*.safetensors
+.cache/
+venv/

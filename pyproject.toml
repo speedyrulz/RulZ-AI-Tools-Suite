@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rulztrainer"
+version = "0.1.0"
+description = "Simple diffusion LoRA trainer with a WebUI. Initial support: MOSS-Image (Base and SFT)."
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.9", "diffusers>=0.38", "transformers>=5.3", "accelerate>=1.10",
+  "safetensors>=0.6", "huggingface_hub>=0.30", "Pillow>=10", "pyyaml>=6", "nicegui>=2",
+]
+
+[tool.setuptools]
+packages = ["rulztrainer", "rulztrainer.moss", "rulztrainer.optimizers"]

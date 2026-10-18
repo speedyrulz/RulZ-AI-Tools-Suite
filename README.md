@@ -1,0 +1,284 @@
+# RulzTrainer
+
+A simple diffusion-model LoRA trainer with a WebUI. First supported model: **MOSS-Image**
+(5B single-stream DiT by OpenMOSS), both the **Base** and **SFT** checkpoints. Output LoRAs load
+directly in ComfyUI with the standard *Load LoRA* node.
+
+## Install
+
+**Windows:** double-click `install.bat`. It creates `venv\`, installs CUDA PyTorch (cu130 by default; pass another
+index URL as the first argument, e.g. `install.bat https://download.pytorch.org/whl/cu128`) and the requirements.
+Then double-click `run_webui.bat` to start the UI and open it in your browser (optional first argument: port).
+
+**Manual:**
+
+```bash
+pip install -r requirements.txt
+```
+
+Requires a CUDA build of PyTorch 2.9+, diffusers 0.38+ and transformers 5.3+ (Qwen3.5 support).
+
+## Run the WebUI
+
+```bash
+python webui.py --port 7870
+```
+
+Open http://127.0.0.1:7870.
+
+1. **Dataset**: a folder of images. Each image may have a same-name `.txt` caption. Use *Scan dataset*
+   to see the aspect-ratio buckets.
+2. **Model**: choose `MOSS-Image-Base` or `MOSS-Image-SFT` (or a custom local directory / HF repo id).
+   *Download / verify model* fetches about 30 GB into `models/`.
+3. **Start training**. The *Monitor* tab shows progress, loss curve, log tail and sample images.
+4. Results: `output/<job>/<job>_<step>.safetensors` (checkpoints) and `output/<job>/<job>.safetensors` (final).
+
+### CLI
+
+```bash
+python -m rulztrainer.train --config configs/example.yaml --set steps=1000 --set job_name=cat_lora
+```
+
+## How it trains
+
+- **Caching first.** On the first run the Flux2 VAE encodes every image into normalized 128-channel
+  latents (2x2 patchified, batch-norm normalized exactly as the reference pipeline does), and the
+  Qwen3.5-9B text encoder embeds every caption through the chat template. Both are cached under
+  `<dataset>/.rulz_cache`, then the encoders are unloaded. Training only holds the DiT and the LoRA.
+- **Timesteps.** `logit_normal` (mean/std), `sigmoid` (scale) or `uniform`, with an optional `timestep_shift`.
+- **Flow matching loss.** `x_t = (1 - sigma) x0 + sigma * noise`, target `noise - x0`, timestep = `sigma * 1000`,
+  sigmas snapped to the model's 1000-step training grid. Default sampling is logit-normal; `timestep_shift`
+  is available.
+- **LoRA** on the DiT attention and FFN projections (`q, k, v, o, ffn_up_gate, ffn_down`) in all 42 blocks, or
+  only the blocks you pick (`lora_blocks`, e.g. `21-41`, `10-31,40`, `even`; the UI has a per-block toggle grid
+  with presets). Blocks without LoRA get no backward pass if they sit before the first trained block, so
+  training only later blocks is also faster per step. The exported file simply omits the untrained blocks.
+  Optionally also the two text-projection blocks inside the DiT. The Qwen text encoder stays frozen, as the
+  authors recommend.
+- **Samples** are generated with the reference Euler schedule (shift 5, CFG 3, negative-branch layer-22 skip).
+
+## Using two GPUs
+
+`multi_gpu: data_parallel` with `devices: cuda:0,cuda:1` loads a full model copy on each GPU; every step each
+copy trains its own images (effective batch = batch_size x GPUs), the LoRA gradients are averaged onto the
+primary, the optimizer steps once and the LoRA weights are broadcast back. This is the mode that speeds
+training up (roughly 1.7-2x throughput with two cards; the faster card waits for the slower one each step).
+It needs no torch.distributed and works on Windows; each GPU must fit the whole model, so pair it with
+`transformer_quant: int8_convrot` or `nvfp4` on 16 GB cards, or bf16 at modest resolutions.
+
+`multi_gpu: model_split` places consecutive block ranges on different GPUs instead. It halves the memory per
+GPU (full bf16 at high resolution becomes possible) but is not faster, since the GPUs take turns. The split is
+auto-balanced by estimated cost (blocks before the first trained block are forward-only and cheap; every later
+block also runs backward), or set `split_plan: "cuda:0=0-25;cuda:1=26-41"` to give the faster card more.
+
+## Model sources and quantization
+
+**Hugging Face / diffusers folder**: pick Base or SFT, or any local folder with `transformer/`, `text_encoder/`,
+`tokenizer/`, `vae/`.
+
+**Single safetensors files (ComfyUI)**: point the UI at the three files you already use in ComfyUI: the diffusion
+model (`diffusion_models/`), the Qwen3.5-9B text encoder (`text_encoders/`) and the Flux2 VAE (`vae/`). Fused-qkv
+("repacked") files are split back automatically. The tokenizer is downloaded once (a few MB) if not given.
+Any file left empty is taken from the Hugging Face model instead, so you can mix (for example a ComfyUI DiT
+file with the HF text encoder). For decoding samples use the VAE that matches MOSS-Image (the FLUX.2 klein
+"small" VAE, `flux2-vae_small.safetensors` in ComfyUI); the encoder is identical across Flux2 VAEs, so caching
+latents works with either.
+
+Accepted weight formats: bf16 / fp16 / fp32, fp8 (upcast), ComfyUI `int8_tensorwise` with or without ConvRot
+(Hadamard rotation), and ComfyUI `nvfp4`. Those two quantized formats are decoded exactly as comfy_kitchen does
+(verified against the HF weights: re-quantizing them with RulzTrainer reproduces the ComfyUI file bit for bit).
+
+*Diffusion model quant* / *Text encoder quant*:
+
+| value | effect |
+|---|---|
+| `auto` | keep the file's format (bf16 stays bf16, int8/nvfp4 files stay quantized) |
+| `none` | dequantize everything to bf16 |
+| `int8`, `int8_convrot` | quantize eligible Linear layers on load (about half the VRAM) |
+| `nvfp4` | quantize on load to FP4 with FP8 block scales (about a quarter of the VRAM) |
+
+Only the frozen base weights are quantized. The LoRA trains in fp32 and the quantized weights are dequantized on
+the fly in forward and backward, so no bf16 copy is kept. Exported LoRAs are bf16 by default (`lora_save_dtype`).
+
+## Training states
+
+`save_state: true` writes `output/<job>/state_XXXXXX/` folders (fp32 LoRA, optimizer, LR scheduler and RNG
+states) every `save_state_every` steps (0 = with each LoRA save), keeps a rolling `keep_states` of them
+(0 = all), and always writes the final state when training ends or is stopped. Set `resume_state` to one of
+those folders to continue exactly where it stopped. `resume_from` loads only LoRA weights from any exported file.
+
+## Samples and monitoring
+
+`sample_seed` is the seed of the first prompt; with `sample_walk_seed` each further prompt uses seed + 1.
+`sample_before_training` renders a sample set at step 0 for comparison. The log reports each prompt and the
+Monitor page shows the sampling step. The Monitor page also has per-GPU VRAM/utilization bars, an adjustable
+loss-smoothing slider and an auto-scrolling log. `compile_model` runs the DiT blocks through torch.compile
+(skipped with a warning if triton is not installed, which is the usual case on Windows).
+
+## Identity similarity for character LoRAs (face + body)
+
+Pick reference images on the Dataset tab (*Face ref* / *Body ref* toggles) or list them as `face_refs` /
+`body_refs`. After every sampling pass each sample is scored and the results go to `face_scores.jsonl`, the
+Monitor chart and the sample captions:
+
+- **Face**: the largest face in the sample is embedded with InsightFace (ArcFace, `buffalo_l`) and compared by
+  cosine similarity to every reference face; the best match is reported as a percent (cosine x 100). For
+  ArcFace, 50%+ generally means the same person; the references' own pairwise similarity is shown as the
+  realistic ceiling.
+- **Body**: MediaPipe pose landmarks give scale-free proportion ratios (shoulder/hip width, torso/leg length,
+  upper/lower leg, upper arm/forearm, head/shoulder width, leg/height...). With `body_backend: mediapipe+sam3`,
+  a SAM 3 person mask adds silhouette widths at the shoulder, waist, hip and thigh levels (normalised by body
+  height) plus waist/hip and shoulder/waist, which captures build rather than only bone proportions. A median
+  profile over the body references is the target; a sample scores by how close its ratios are
+  (20% deviation on a ratio ~ 61%). Silhouette features are only used when the skeleton confirms a full-body
+  view, and samples without a usable pose get no body score. Body references should be full-body, upright,
+  fairly neutral poses, and the same goes for the sample prompts you want body-scored.
+- **Combined**: `face_weight` x face + `body_weight` x body (defaults 0.7 / 0.3; whichever is available).
+
+Model downloads (the InsightFace pack, the MediaPipe pose model and SAM 3) happen on first use with a progress
+bar in the UI (reference checks) and in the status line during training.
+
+Requirements: `insightface` + `onnxruntime-gpu` (face), `mediapipe` (body); `facebook/sam3` is a gated
+Hugging Face model (accept the license, then `hf auth login`), or point `sam3_model` at a local
+transformers-format folder. SAM 3 (3.4 GB) is kept in system RAM and moved to `body_device` only while scoring.
+
+## Per-image loss watch and per-image learning rate
+
+`loss_watch: true` records every image's loss normalised by the expected loss at its noise level (40 sigma
+buckets, kernel-smoothed) and smooths the residual per image. At each epoch boundary every image gets a
+verdict relative to the cohort median: *easy*, *healthy*, *suspect* (hard but improving), *stuck* (hard and not
+improving for two epochs) or *exhausted* (learned, flat). `per_image_lr: true` acts on the verdicts the way
+Fizgig's loss watch does: stuck images are throttled x0.5, then x0.25, then x0.125 (recovering one rung per
+improving epoch), exhausted ones ease to x0.6, the healthy cohort gets `loss_watch_healthy_mult`. With batch
+size 1 and no gradient accumulation this is a true per-image learning rate (the optimizer lr is scaled for that
+step); otherwise it becomes a per-sample loss weight. `loss_watch_exclude_after: N` benches an image that stays
+at the lowest throttle for N more epochs; exclusions are remembered in `<dataset>/.rulz_cache/excluded.json`
+and cleared by editing the image's caption. Output: `per_image_loss.jsonl` (every observation),
+`per_image_loss.json` (the table), a Monitor table and verdict badges on the Dataset tab. Not used with
+`automagic3`, whose step normalisation would absorb the per-image scaling. Verdicts need a few epochs to mean
+anything, so this suits typical character sets trained for thousands of steps.
+
+## Identity training: what each step teaches (character LoRAs)
+
+Four levers change the training objective and data for likeness, all off by default:
+
+- **Region-weighted loss** (`region_weights`): at cache time the largest face (InsightFace) and the person
+  silhouette (SAM 3 with `body_backend: mediapipe+sam3`, else a MediaPipe landmark hull) are mapped onto the
+  16-px latent cells of each bucketed image and turned into a weight map (`face_loss_weight` 3 / `body_loss_weight`
+  1.5 / `background_loss_weight` 0.3, `face_margin`, `region_feather_cells`), normalised to mean 1 and stored as
+  `<stem>_regions.safetensors`. The per-cell squared error is multiplied by it. `region_prior_weight` adds an
+  optional prior-preservation term on background cells toward the base model's prediction (extra forward).
+- **Timestep emphasis**: `timestep_sampling: identity` (logit-normal mean -0.5, median sigma ~0.38),
+  `content` (sigma = u^`content_power`, low-noise heavy) or `style` (mirror), plus `sigma_min` / `sigma_max`.
+- **Automatic crops** (`crop_augment: face | face+bust`): a square face crop (`crop_face_scale` x face size) and a
+  bust crop (`crop_bust_scale`) per image with a face, with captions from `crop_face_caption` / `crop_bust_caption`
+  (`{caption}`, `{raw}`, `{trigger}`), skipped when the image is already a close-up or the crop would be tiny.
+  Crops are ordinary items (own latents, captions, region maps, loss-watch verdicts) and count as face-heavy for
+  the curriculum; `crop_augment_weight` scales how often they are drawn.
+- **LoRA+** (`lora_plus_ratio`, 16 = paper): the `lora_up` matrices train at lr x ratio for faster convergence
+  (AdamW-style optimizers; ignored by automagic3). Resuming a state requires the same ratio.
+
+The face analysis cache is `<dataset>/.rulz_cache/faces.json`; the Train tab has preview buttons for region
+maps and crops.
+
+Measured on a 5-image synthetic character set (120 steps, probes every 20 steps, same seeds, face likeness EMA
+at step 100; baseline 74.2): region-weighted loss 76.0, LoRA+ ratio 4 74.7, `identity` timesteps 73.9, auto crops
+65.5 (the only crops available were 300 px and had to be upscaled), everything combined with LoRA+ 16: 63.1
+(unstable, loss 40% higher). The **Identity training preset** (a switch at the top of the Train tab, `--preset identity` on the CLI, or
+`preset: identity` recorded in the YAML) applies the whole recommendation in one go and restores your previous
+settings when switched off. Suggested recipe: `region_weights: true`, `lora_plus_ratio: 4` with `adamw8bit`,
+crops only from high-resolution photos (`crop_augment_min_px: 0` means crops are never upscaled), timesteps at
+`logit_normal`; treat `identity` timesteps and the curriculum as options to A/B with the probes.
+
+## Likeness probes and controller (character LoRAs)
+
+With face/body references set, `probe_every: N` renders a fixed-seed headshot (`probe_face_prompt`) and/or
+full-body image (`probe_body_prompt`) every N steps at `probe_size` with the turbo LoRA (cheap enough to do
+often), scores them, and records `likeness.jsonl` plus a Monitor chart. Scores are smoothed with `probe_ema`
+and only changes beyond `likeness_noise_band` count. The controller then, each individually switchable:
+
+- keeps `<job>_best.safetensors` at the best smoothed combined score (`likeness_track_best`) and stops after
+  `likeness_patience` probes without improvement;
+- hill-climbs a bounded learning-rate multiplier (`likeness_lr_control`, `likeness_lr_min/max/step`): up while
+  the smoothed score rises, down when it falls. It works with AdamW-style optimizers (through the scheduler)
+  and with Automagic 3 (by scaling its adaptive lr tensors), which keeps doing its own per-step adaptation;
+- applies a face/body curriculum (`likeness_curriculum`): when the face score lags the body score, close-up
+  dataset images (largest face >= 3% of the image, classified once with the face detector) are sampled more
+  often and the timestep distribution shifts toward lower noise where facial detail forms; the reverse when the
+  body lags. Strength 0..1.
+
+The scores never enter the loss; they steer data, lr and stopping. Use the same reference set and prompts for a
+whole run so the series is comparable.
+
+## Sampling with a different model
+
+`sample_model_path` (a `.safetensors` file, a diffusers folder or a repo id) plus `sample_model_quant` use another
+checkpoint for sample images only, for example training on Base while previewing on SFT. The current LoRA weights
+are copied onto it before each sampling pass, the turbo LoRA (if any) is applied there, and the training model is
+moved to system RAM for the duration (so RAM must hold both models; quantize the sampling model if tight).
+
+## Turbo LoRA for samples
+
+`turbo_lora` + `turbo_lora_strength` attach a ComfyUI-format LoRA (for example an 8-step distill) that is applied
+only while generating sample images, never during training steps. Set `sample_steps` to match. `sample_lora` +
+`sample_lora_strength` stack a second sampling-only LoRA (for example a style LoRA) alongside the turbo one.
+
+## Dataset page
+
+The WebUI's Dataset tab lets you upload images and `.txt` captions into a folder, shows them in a grid, and
+writes caption edits back to the `.txt` files as you type.
+
+## Using the LoRA in ComfyUI
+
+Recent ComfyUI builds support MOSS-Image natively (`comfy/ldm/moss_image`, CLIP type `moss_image`), so no
+plugin is required. Copy the trained `.safetensors` into `ComfyUI/models/loras/` and add a standard
+**Load LoRA** node after *Load Diffusion Model*. Both the unfused checkpoints and ComfyUI's repacked
+fused-qkv files work: ComfyUI maps the `proj.q/k/v` LoRA keys onto slices of the fused weight.
+
+The file uses the generic ComfyUI key format (the same one ComfyUI's own MOSS-Image LoRAs use):
+
+```
+diffusion_model.layers.<n>.proj.<q|k|v|o|ffn_up_gate|ffn_down>.lora_down.weight
+diffusion_model.layers.<n>.proj.<...>.lora_up.weight
+diffusion_model.layers.<n>.proj.<...>.alpha
+```
+
+These names are identical in the diffusers checkpoint and the ComfyUI plugin model, so no key conversion is needed.
+
+## VRAM guidance (16 GB cards)
+
+| Setting | Recommendation |
+|---|---|
+| Gradient checkpointing | on |
+| Batch size | 1 (use gradient accumulation instead) |
+| Optimizer | `adamw8bit`, or `automagic3` (self-tuning lr, ported from ai-toolkit) |
+| Resolution | 1024 |
+| Text encoder device | `auto` (spreads over all GPUs + CPU during caching only) |
+| Max caption tokens | 512 to 1024 unless you train on very long prompts |
+
+The DiT in bf16 is about 10 GB. The text encoder is about 18 GB in bf16, so it is loaded only for caching
+with `device_map="auto"`; pick `8bit` / `4bit` quantization if you want it on a single GPU.
+
+## Layout
+
+```
+rulztrainer/
+  config.py        TrainConfig dataclass + YAML
+  dataset.py       scanning, bucketing, latent/text caching, batching
+  lora.py          LoRA injection, ComfyUI-format export/import, sampling-only extra LoRAs
+  quant.py         int8 / int8_convrot / nvfp4 weight quantization matching comfy_kitchen, QuantLinear
+  sampler.py       flow-matching Euler sampler (reference schedule)
+  trainer.py       training loop, saving, sampling, status.json for the UI
+  train.py         CLI entry point
+  moss/model.py    MOSS-Image DiT (vendored, Apache-2.0, OpenMOSS)
+  moss/loading.py  download + load (HF layout or single files), quant dispatch, encode helpers
+  moss/single_file.py  ComfyUI single-file loaders (dequant, unfuse qkv, text-only Qwen3.5)
+webui.py           NiceGUI web UI (runs training as a subprocess)
+configs/           example configs
+tests/             smoke tests (no weights needed): python -m pytest tests
+```
+
+## Adding another model
+
+The trainer is split so another architecture only needs a `models/<arch>/` package providing: a transformer
+module whose Linear layer names match the ComfyUI model keys, `encode_images`, `encode_prompt`, and a sampler.
