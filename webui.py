@@ -796,8 +796,17 @@ def build_page():
                     path_input(f, "dataset_dir", "Dataset dir (images + .txt captions)", "dir", d.dataset_dir)
                     w["resolutions"] = ui.select(MP_OPTIONS, multiple=True, value=[1.0],
                                                  label="Training resolutions (megapixels)").classes("w-[32rem]")                         .props("use-chips")                         .tooltip("Area each image is bucketed to, aspect ratio preserved (1 MP = 1024x1024). Pick "
-                                 "several to train them all (mixed in every epoch) or, with Resolution step-up in "
-                                 "the likeness section, one after another from the lowest.")
+                                 "several to train them all (mixed in every epoch) or, with Resolution step-up, "
+                                 "one after another from the lowest.")
+                with ui.row().classes("w-full items-end"):
+                    w["resolution_step_up"] = ui.checkbox("Resolution step-up", value=d.resolution_step_up)                         .tooltip("Train the lowest selected resolution first. When the probe likeness score stops "
+                                 "improving, move to the next selected resolution; when it stops improving at the "
+                                 "highest one, stop training and save the final LoRA. Needs likeness probes (face/body "
+                                 "references, probe every N steps) and replaces their early-stop patience.")
+                    w["step_up_patience"] = ui.number("Probes w/o improvement before next resolution",
+                                                      value=d.step_up_patience, min=1, precision=0).classes("w-80")                         .bind_visibility_from(w["resolution_step_up"], "value")
+                    w["step_up_stop_patience"] = ui.number("Probes w/o improvement at the highest before stopping",
+                                                           value=d.step_up_stop_patience, min=1, precision=0)                         .classes("w-96").bind_visibility_from(w["resolution_step_up"], "value")
                 with ui.row().classes("w-full items-end"):
                     w["enable_buckets"] = ui.checkbox("Aspect-ratio buckets", value=True)
                     w["flip_augment"] = ui.checkbox("Horizontal flip augment", value=False)
@@ -1192,15 +1201,6 @@ def build_page():
                     w["likeness_patience"] = ui.number("Early stop after N probes w/o improvement (0 = never)",
                                                        value=d.likeness_patience, precision=0).classes("w-96")                         .tooltip("Not used while Resolution step-up is on (its two counts replace it).")
                 with ui.row().classes("w-full items-end"):
-                    w["resolution_step_up"] = ui.checkbox("Resolution step-up", value=d.resolution_step_up)                         .tooltip("Train the lowest selected resolution first. When the probe likeness score stops "
-                                 "improving, move to the next selected resolution; when it stops improving at the "
-                                 "highest one, stop training and save the final LoRA. Replaces the early-stop "
-                                 "patience above. Needs several training resolutions and probes.")
-                    w["step_up_patience"] = ui.number("Probes w/o improvement before next resolution",
-                                                      value=d.step_up_patience, min=1, precision=0).classes("w-80")                         .bind_visibility_from(w["resolution_step_up"], "value")
-                    w["step_up_stop_patience"] = ui.number("Probes w/o improvement at the highest before stopping",
-                                                           value=d.step_up_stop_patience, min=1, precision=0)                         .classes("w-96").bind_visibility_from(w["resolution_step_up"], "value")
-                with ui.row().classes("w-full items-end"):
                     w["likeness_lr_control"] = ui.checkbox("LR multiplier from probe trend", value=d.likeness_lr_control)
                     w["likeness_lr_min"] = ui.number("Min factor", value=d.likeness_lr_min, step=0.1).classes("w-28")
                     w["likeness_lr_max"] = ui.number("Max factor", value=d.likeness_lr_max, step=0.1).classes("w-28")
@@ -1546,7 +1546,7 @@ is widened to bf16 only for the gradient), `int8` also quantizes the gradient (f
 ## Training resolutions
 *Training resolutions* takes one or more megapixel values (1 MP = 1024x1024); each image is bucketed to every
 selected area with its aspect ratio kept and latents are cached per resolution. Several values are mixed in every
-epoch, or, with *Resolution step-up* in the likeness section, trained lowest first: when the probe likeness score
+epoch, or, with *Resolution step-up* (next to the resolutions), trained lowest first: when the probe likeness score
 stops improving for *N probes* the next resolution starts, and at the highest resolution *N probes* without
 improvement end training (two separate counts, default 1 each). Step-up needs probes (face/body references).
 
