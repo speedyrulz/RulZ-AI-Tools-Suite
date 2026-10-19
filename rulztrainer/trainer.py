@@ -21,9 +21,11 @@ from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, d
                       items_for_side, load_batch,
                       scan_dataset, text_cache_path)
 from .moss import loading
+from .multigpu import compile_count, no_recompile_stance, stance_available
 from .sampler import sample
 
 log = logging.getLogger("rulztrainer")
+DP_COMPILE_QUIET_STEPS = 3  # data parallel + compile: serial steps without a new graph before going parallel
 
 
 def setup_logging(job_dir: Path) -> None:
@@ -218,6 +220,8 @@ class Trainer:
             raise ValueError("sigma_min/sigma_max must satisfy 0 <= sigma_min < sigma_max <= 1")
         self.devices: list[str] = [cfg.device]
         self.dp = None  # DataParallelLoRA when multi_gpu == data_parallel
+        self.compiled = False  # torch.compile active on the DiT blocks
+        self.dp_quiet_steps = 0  # consecutive data-parallel steps without a new compile
         self.replicas: list[tuple] = []  # (model, device) for every training copy, primary first
         if cfg.multi_gpu in ("data_parallel", "model_split"):
             from .multigpu import parse_devices
@@ -436,7 +440,10 @@ class Trainer:
 
         if cfg.compile_model:
             for m, _, _ in self.replicas:
-                self.compile(m)
+                self.compiled = self.compile(m) or self.compiled
+            if self.compiled and self.dp is not None:
+                log.info("Data parallel + compile: replicas run one after another until compilation settles "
+                         "(%d steps without a new graph), then in parallel", DP_COMPILE_QUIET_STEPS)
         self.all_items = items
         self.sides = cfg.training_sides()
         if cfg.resolution_step_up:
@@ -517,7 +524,33 @@ class Trainer:
                     sigma = sample_sigmas(cfg, latents.shape[0], gen, self.ts_logit_shift)
                     noise = torch.randn(latents.shape, generator=gen)
                     jobs.append((rep, batch, latents, embeds, mask, sigma, noise, regions, step + 1))
-                results = self.dp.run(work, jobs) if self.dp is not None else [work(jobs[0])]
+                if self.dp is not None:
+                    # torch.compile + threads: a replica tracing a graph breaks the other replica's forward, so steps
+                    # that may compile run serially; parallel steps run under a stance that never compiles (an unseen
+                    # shape then runs that block eagerly once instead of tracing)
+                    serial = self.compiled and (self.dp_quiet_steps < DP_COMPILE_QUIET_STEPS or not stance_available())
+                    n_before = compile_count()
+                    if self.compiled and not serial:
+                        with no_recompile_stance():
+                            results = self.dp.run(work, jobs, serial=False)
+                    else:
+                        results = self.dp.run(work, jobs, serial=serial)
+                    if compile_count() != n_before:
+                        if not serial:
+                            log.warning("Data parallel: a graph compiled during a parallel step; running replicas "
+                                        "one after another again until compilation settles")
+                        self.dp_quiet_steps = 0
+                    elif self.compiled and self.dp_quiet_steps < DP_COMPILE_QUIET_STEPS:
+                        self.dp_quiet_steps += 1
+                        if self.dp_quiet_steps == DP_COMPILE_QUIET_STEPS:
+                            if not stance_available():
+                                log.warning("Data parallel + compile: this torch has no torch.compiler.set_stance, so "
+                                            "replicas keep running one after another (no parallel speed-up)")
+                            else:
+                                log.info("Data parallel: compilation settled, replicas now run in parallel "
+                                         "(new shapes run uncompiled instead of recompiling)")
+                else:
+                    results = [work(jobs[0])]
                 accum_loss += sum(r[0] for r in results)
                 if true_per_image_lr and results[0][1]:
                     step_lr_mult = results[0][1][0]
@@ -621,12 +654,12 @@ class Trainer:
         self.status.write()
         return state_dir
 
-    def compile(self, model) -> None:
+    def compile(self, model) -> bool:
         try:
             import triton  # noqa: F401
         except ImportError:
             log.warning("compile_model requested but triton is not installed; running without compile")
-            return
+            return False
         try:
             # Python float attributes (LoRA scale / multiplier) would otherwise be traced as 0-d CPU tensors, and the
             # CPU ops on them make Inductor emit C++ that needs MSVC on Windows ("InvalidCxxCompiler: cl is not found")
@@ -634,8 +667,10 @@ class Trainer:
             for block in (*model.layers, *model.text_embedder.blocks):
                 block.compile(backend="inductor", dynamic=True)
             log.info("Compiled %d DiT blocks with torch.compile (first steps will be slow)", len(model.layers) + 2)
+            return True
         except Exception as e:  # noqa: BLE001
             log.warning("torch.compile failed (%s); running without compile", e)
+            return False
 
     def load_state(self, path, injected, optimizer, scheduler, gen, rng) -> int:
         state_dir = Path(path)

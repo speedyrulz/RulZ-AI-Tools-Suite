@@ -79,13 +79,50 @@ class DataParallelLoRA:
             if str(dev).startswith("cuda"):
                 torch.cuda.synchronize(dev)
 
-    def run(self, fn, jobs: list):
-        """Run fn(job) for every job concurrently (one thread per device). Returns results in order."""
+    def run(self, fn, jobs: list, serial: bool = False):
+        """Run fn(job) for every job concurrently (one thread per device), or one after another with serial=True.
+        Returns results in order.
+
+        serial is for steps that may compile (torch.compile): while one thread traces a graph, dynamo / FX patch
+        nn.Module.__call__ process-wide, and the other thread's forward then fails with "Detected that you are
+        using FX to symbolically trace a dynamo-optimized function"."""
+        if serial:
+            return [fn(job) for job in jobs]
         return list(self._pool.map(fn, jobs))
 
     def train(self, mode: bool = True) -> None:
         for m, _, _ in self.replicas:
             m.train(mode)
+
+
+def stance_available() -> bool:
+    """True when this torch has torch.compiler.set_stance (checked without touching the current stance)."""
+    return getattr(getattr(torch, "compiler", None), "set_stance", None) is not None
+
+
+def no_recompile_stance():
+    """Context manager under which compiled code never compiles again (a guard miss runs that frame eagerly).
+
+    Parallel data-parallel steps run under it, so a late recompile (a new sequence length, say) can never trace
+    while another replica thread is executing. Use it only directly in a `with` statement: set_stance changes the
+    process-wide stance as soon as it is called and restores the previous one when the `with` block exits.
+    Returns None when this torch has no set_stance."""
+    if not stance_available():
+        return None
+    try:
+        return torch.compiler.set_stance("eager_on_recompile")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def compile_count() -> int:
+    """Number of frames dynamo has compiled so far in this process (0 without torch.compile)."""
+    try:
+        from torch._dynamo.utils import counters
+
+        return int(counters["frames"]["total"])
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 # ---------------------------------------------------------------- model split
