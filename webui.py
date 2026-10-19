@@ -1,7 +1,8 @@
 """RulzTrainer WebUI (NiceGUI). Run: python webui.py [--port 7870] [--open]
 
 Training runs in a subprocess so Stop frees GPU memory cleanly; the UI polls
-<output>/<job>/status.json and train.log.
+<output>/<job>/status.json and train.log. The running job (pid + job dir) is recorded in .webui_job.json, so a
+reloaded page, a second browser or a restarted WebUI reattaches to it.
 """
 from __future__ import annotations
 
@@ -27,8 +28,10 @@ QUANTS = ["auto", "none", "int8", "int8_convrot", "nvfp4"]
 MP_OPTIONS = {mp: f"{mp:g} MP ({mp_to_side(mp)}^2)" for mp in MEGAPIXEL_CHOICES}
 SAFETENSORS = [("safetensors", "*.safetensors"), ("all files", "*.*")]
 
-_proc: subprocess.Popen | None = None
+_proc: subprocess.Popen | None = None  # started by this WebUI process
+_adopted = None  # psutil.Process of a job started by an earlier WebUI process (reattached from JOB_FILE)
 _job_dir: Path | None = None
+JOB_FILE = ROOT / ".webui_job.json"
 
 
 # ---------------------------------------------------------------- backend helpers
@@ -44,7 +47,60 @@ def _gpus() -> list[str]:
 
 
 def _running() -> bool:
-    return _proc is not None and _proc.poll() is None
+    if _proc is not None:
+        return _proc.poll() is None
+    if _adopted is not None:
+        try:
+            import psutil
+
+            return _adopted.is_running() and _adopted.status() != psutil.STATUS_ZOMBIE
+        except Exception:  # noqa: BLE001  (process vanished between the checks)
+            return False
+    return False
+
+
+def _record_job(pid: int, job_dir: Path) -> None:
+    """Remember the job on disk so a reloaded page or a restarted WebUI can reattach to it."""
+    try:
+        import psutil
+
+        created = psutil.Process(pid).create_time()
+    except Exception:  # noqa: BLE001
+        created = None
+    data = {"pid": pid, "create_time": created, "job_dir": str(job_dir.resolve())}
+    try:
+        JOB_FILE.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def reattach_job() -> bool:
+    """Pick up the last job from JOB_FILE when this process has none. Returns True if that job is still running.
+
+    The job dir is adopted even when the process has ended, so the monitor shows the last run's final status.
+    The pid only counts as the same job when its create time matches (pids get reused)."""
+    global _adopted, _job_dir
+    if _proc is not None or _adopted is not None:
+        return _running()
+    try:
+        data = json.loads(JOB_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    job_dir = Path(data.get("job_dir") or "")
+    if not job_dir.is_dir():
+        return False
+    _job_dir = job_dir
+    try:
+        import psutil
+
+        proc = psutil.Process(int(data["pid"]))
+        created = data.get("create_time")
+        if created is not None and abs(proc.create_time() - float(created)) > 1.0:
+            return False
+        _adopted = proc
+    except Exception:  # noqa: BLE001  (gone, access denied, psutil missing)
+        return False
+    return _running()
 
 
 def _relative(path: str) -> str:
@@ -80,7 +136,8 @@ def tk_dialog(kind: str, initial: str = "", filetypes=None) -> str:
 
 
 def start_training(cfg: TrainConfig) -> str:
-    global _proc, _job_dir
+    global _proc, _adopted, _job_dir
+    reattach_job()
     if _running():
         return "A training job is already running."
     if not Path(cfg.dataset_dir).is_dir():
@@ -100,12 +157,22 @@ def start_training(cfg: TrainConfig) -> str:
     (_job_dir / "train.log").write_text("", encoding="utf-8")
     env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
     console = open(_job_dir / "console.log", "w", encoding="utf-8")  # noqa: SIM115
+    # detached from the WebUI (own process group / session, no console): closing or restarting the WebUI leaves the
+    # job running, and the next WebUI reattaches to it through JOB_FILE
+    if sys.platform == "win32":
+        detach = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
+    else:
+        detach = {"start_new_session": True}
     _proc = subprocess.Popen([sys.executable, "-m", "rulztrainer.train", "--config", str(cfg_path)],
-                             cwd=str(ROOT), env=env, stdout=console, stderr=subprocess.STDOUT)
+                             cwd=str(ROOT), env=env, stdout=console, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL, **detach)
+    _adopted = None
+    _record_job(_proc.pid, _job_dir)
     return f"Started job '{cfg.job_name}' (pid {_proc.pid}). Config saved to {cfg_path}"
 
 
 def stop_training() -> str:
+    reattach_job()
     if not _running():
         return "No job running."
     (_job_dir / "STOP").touch()
@@ -113,9 +180,13 @@ def stop_training() -> str:
 
 
 def kill_training() -> str:
+    reattach_job()
     if not _running():
         return "No job running."
-    _proc.kill()
+    if _proc is not None:
+        _proc.kill()
+    else:
+        _adopted.kill()
     return "Process killed (no final save)."
 
 
@@ -696,7 +767,8 @@ def build_page():
         tab_samples = ui.tab("Samples")
         tab_help = ui.tab("Help")
 
-    with ui.tab_panels(tabs, value=tab_train).classes("w-full").props("keep-alive"):
+    job_running = reattach_job()
+    with ui.tab_panels(tabs, value=tab_monitor if job_running else tab_train).classes("w-full")             .props("keep-alive"):
         # ------------------------------------------------------------ Train
         with ui.tab_panel(tab_train):
             with ui.row().classes("w-full items-end"):
@@ -1521,6 +1593,14 @@ def build_page():
         with ui.tab_panel(tab_help):
             ui.markdown(HELP)
 
+    if job_running and _job_dir is not None and (_job_dir / "config.yaml").is_file():
+        # reattached to a running job: show its settings instead of the defaults
+        try:
+            f.from_config(TrainConfig.load(_job_dir / "config.yaml"))
+            status_msg.text = f"Reconnected to the running job '{_job_dir.name}' (settings loaded from its config)"
+        except Exception as e:  # noqa: BLE001
+            status_msg.text = f"Reconnected to the running job '{_job_dir.name}' (could not load its config: {e})"
+
 
 HELP = """
 ## Quick start
@@ -1597,5 +1677,11 @@ if __name__ in {"__main__", "__mp_main__"}:
     ap.add_argument("--open", action="store_true", help="open the UI in the default browser once ready")
     a = ap.parse_args()
     port = _free_port(a.host, a.port)
-    build_page()
+
+    @ui.page("/")
+    def index():
+        # A real page function, not NiceGUI's script mode: script mode re-executes this file for every page load,
+        # which reset the job globals, so a reload lost the running job.
+        build_page()
+
     ui.run(host=a.host, port=port, title="RulzTrainer", show=a.open, reload=False, dark=None)

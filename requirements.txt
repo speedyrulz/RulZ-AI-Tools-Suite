@@ -14,3 +14,4 @@ triton-windows>=3.8; sys_platform == "win32"
 insightface>=0.7
 onnxruntime-gpu>=1.17
 mediapipe>=0.10
+psutil>=5.9  # WebUI reattaches to a running training job

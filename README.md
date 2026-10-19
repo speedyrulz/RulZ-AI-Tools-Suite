@@ -36,7 +36,10 @@ Open http://127.0.0.1:7870.
    "Training resolutions and resolution step-up" below.
 2. **Model**: choose `MOSS-Image-Base` or `MOSS-Image-SFT` (or a custom local directory / HF repo id).
    *Download / verify model* fetches about 30 GB into `models/`.
-3. **Start training**. The *Monitor* tab shows progress, loss curve, log tail and sample images.
+3. **Start training**. The *Monitor* tab shows progress, loss curve, log tail and sample images. Training runs
+   as its own process: reloading or closing the page, opening it from another browser, or restarting the
+   WebUI does not stop it, and the page reconnects to the running job (it opens on *Monitor* and loads the
+   job's settings into the form). *Stop (save)* and *Kill* work on a reconnected job too.
 4. Results: `output/<job>/<job>_<step>.safetensors` (checkpoints) and `output/<job>/<job>.safetensors` (final).
 
 ### CLI

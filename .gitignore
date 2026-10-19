@@ -8,3 +8,4 @@ datasets/
 venv/
 configs/*
 !configs/example.yaml
+.webui_job.json
