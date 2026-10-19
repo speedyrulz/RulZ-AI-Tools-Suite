@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -34,6 +35,18 @@ PRESET_PROBE_PROMPTS = {
                  "full body photo of {trigger} standing straight facing the camera, arms at sides, plain background, "
                  "whole body visible head to feet"),
 }
+
+
+MEGAPIXEL_CHOICES = [round(0.25 * i, 2) for i in range(1, 17)]  # 0.25 .. 4.0 MP
+
+
+def mp_to_side(mp: float) -> int:
+    """Megapixels -> square-equivalent side in pixels (1 MP = 1024x1024)."""
+    return int(round(math.sqrt(float(mp) * 1024 * 1024)))
+
+
+def side_to_mp(side: int) -> float:
+    return round(side * side / (1024 * 1024), 2)
 
 
 def apply_preset(data: dict, name: str) -> dict:
@@ -83,6 +96,10 @@ class TrainConfig:
     # --- dataset ---
     dataset_dir: str = "datasets/my_dataset"
     resolution: int = 1024  # target total pixels = resolution^2, aspect preserved, buckets at multiples of 16
+    resolutions: list[float] = field(default_factory=list)  # megapixels to train at (0.25..4 in 0.25 steps); [] = resolution
+    resolution_step_up: bool = False  # train the lowest resolution first and step up when the probe score stalls
+    step_up_patience: int = 1  # probes without improvement before moving to the next resolution
+    step_up_stop_patience: int = 1  # probes without improvement at the highest resolution before stopping
     enable_buckets: bool = True
     min_bucket_side: int = 512
     max_bucket_side: int = 2048
@@ -214,6 +231,24 @@ class TrainConfig:
     likeness_curriculum_strength: float = 1.0
     sample_model_path: str = ""  # optional different diffusion model for sampling only: .safetensors, diffusers dir or repo id
     sample_model_quant: str = "auto"  # auto | none | int8 | int8_convrot | nvfp4
+
+    def training_sides(self) -> list[int]:
+        """Training resolutions as square-equivalent side lengths (area = side^2), ascending and unique."""
+        if not self.resolutions:
+            return [int(self.resolution)]
+        sides = sorted({mp_to_side(mp) for mp in self.resolutions})
+        return sides
+
+    def validate(self) -> None:
+        for mp in self.resolutions:
+            if not (0.0 < float(mp) <= 16.0):
+                raise ValueError(f"resolutions must be megapixel values in (0, 16], got {mp!r}")
+        if self.resolution_step_up:
+            if self.step_up_patience < 1 or self.step_up_stop_patience < 1:
+                raise ValueError("step_up_patience and step_up_stop_patience must be at least 1")
+            if self.probe_every <= 0 or not (self.face_refs or self.body_refs):
+                raise ValueError("resolution_step_up needs likeness probes: set probe_every > 0 and face_refs "
+                                 "and/or body_refs (the step-up decision is the probe likeness score)")
 
     def resolved_cache_dir(self) -> Path:
         return Path(self.cache_dir) if self.cache_dir else Path(self.dataset_dir) / ".rulz_cache"

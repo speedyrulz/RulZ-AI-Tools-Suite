@@ -6,6 +6,10 @@ size, turbo LoRA) and scores it against the face / body references. The controll
 
   * best checkpoint + early stop   keep `<job>_best.safetensors` at the best smoothed combined score and stop
                                    after `likeness_patience` probes without improvement
+  * resolution step-up             with `resolution_step_up`, train the lowest selected resolution first; after
+                                   `step_up_patience` probes without a new per-stage best move to the next
+                                   resolution, and after `step_up_stop_patience` such probes at the highest
+                                   one stop training (replaces `likeness_patience` in that mode)
   * bounded lr multiplier          hill-climb a factor on the inner optimizer's lr (works with AdamW-style
                                    optimizers through the scheduler and with Automagic 3 through its lr tensors)
   * face / body curriculum         when the face lags the body (or vice versa), sample close-up dataset images
@@ -47,6 +51,9 @@ class ProbeRecord:
     best_step: int | None
     since_improve: int
     images: list[str] = field(default_factory=list)
+    stage: int = 0  # resolution stage index (resolution_step_up)
+    stage_best: float | None = None
+    stage_since_improve: int = 0
 
 
 class LikenessController:
@@ -63,6 +70,22 @@ class LikenessController:
         self.face_bias = 0.0
         self.stopped = False
         self.n_probes = 0
+        # resolution step-up: stage index into cfg.training_sides(), per-stage best and stall counter
+        self.step_up = bool(getattr(cfg, "resolution_step_up", False))
+        self.n_stages = len(cfg.training_sides()) if hasattr(cfg, "training_sides") else 1
+        self.stage = 0
+        self.stage_best = None
+        self.stage_since_improve = 0
+
+    def enter_stage(self, stage: int) -> None:
+        """Start a resolution stage: the next probe becomes that stage's baseline."""
+        self.stage = max(0, min(stage, self.n_stages - 1))
+        self.stage_best = None
+        self.stage_since_improve = 0
+
+    @property
+    def last_stage(self) -> bool:
+        return self.stage >= self.n_stages - 1
 
     def _ema(self, prev, value):
         if value is None:
@@ -89,9 +112,19 @@ class LikenessController:
                 actions["save_best"] = cfg.likeness_track_best
             else:
                 self.since_improve += 1
-                if cfg.likeness_patience > 0 and self.since_improve >= cfg.likeness_patience:
+                if not self.step_up and cfg.likeness_patience > 0 and self.since_improve >= cfg.likeness_patience:
                     self.stopped = True
                     actions["stop"] = True
+            if self.step_up:
+                if self.stage_best is None or comb > self.stage_best + band:
+                    self.stage_best, self.stage_since_improve = comb, 0
+                else:
+                    self.stage_since_improve += 1
+                    if not self.last_stage and self.stage_since_improve >= cfg.step_up_patience:
+                        actions["step_up"] = self.stage + 1
+                    elif self.last_stage and self.stage_since_improve >= cfg.step_up_stop_patience:
+                        self.stopped = True
+                        actions["stop"] = True
             if cfg.likeness_lr_control and self.prev_combined is not None:
                 delta = comb - self.prev_combined
                 new = self.lr_factor
@@ -111,14 +144,18 @@ class LikenessController:
                 actions["face_bias"] = bias
         rec = ProbeRecord(step, face, body, combine(face, body, cfg.face_weight, cfg.body_weight),
                           self.face_ema, self.body_ema, comb, self.lr_factor, self.face_bias, self.best,
-                          self.best_step, self.since_improve, list(images or []))
+                          self.best_step, self.since_improve, list(images or []), self.stage, self.stage_best,
+                          self.stage_since_improve)
+        if "step_up" in actions:
+            self.enter_stage(actions["step_up"])
         return rec, actions
 
     def state(self) -> dict:
         return {"best": self.best, "best_step": self.best_step, "since_improve": self.since_improve,
                 "lr_factor": self.lr_factor, "face_bias": self.face_bias, "stopped": self.stopped,
                 "face_ema": self.face_ema, "body_ema": self.body_ema, "combined_ema": self.combined_ema,
-                "n_probes": self.n_probes}
+                "n_probes": self.n_probes, "stage": self.stage, "n_stages": self.n_stages,
+                "stage_best": self.stage_best, "stage_since_improve": self.stage_since_improve}
 
 
 def append_record(job_dir: Path, rec: ProbeRecord) -> None:

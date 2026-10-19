@@ -15,7 +15,7 @@ from pathlib import Path
 
 from nicegui import run, ui
 
-from rulztrainer.config import MODEL_PRESETS, PRESETS, TrainConfig, apply_preset
+from rulztrainer.config import MEGAPIXEL_CHOICES, MODEL_PRESETS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp
 from rulztrainer import bodysim, facesim
 from rulztrainer.losswatch import read_verdicts
 
@@ -24,6 +24,7 @@ os.chdir(ROOT)
 CUSTOM = "Custom path / repo id"
 TARGETS = ["q", "k", "v", "o", "ffn_up_gate", "ffn_down"]
 QUANTS = ["auto", "none", "int8", "int8_convrot", "nvfp4"]
+MP_OPTIONS = {mp: f"{mp:g} MP ({mp_to_side(mp)}^2)" for mp in MEGAPIXEL_CHOICES}
 SAFETENSORS = [("safetensors", "*.safetensors"), ("all files", "*.*")]
 
 _proc: subprocess.Popen | None = None
@@ -344,7 +345,9 @@ class Form:
             transformer_quant=v("transformer_quant"), text_encoder_quant=v("text_encoder_quant"),
             gradient_checkpointing=bool(v("gradient_checkpointing")),
             int8_matmul=bool(v("int8_matmul")), int8_backward=v("int8_backward"),
-            dataset_dir=s("dataset_dir"), resolution=int(v("resolution")),
+            dataset_dir=s("dataset_dir"), resolutions=sorted(float(x) for x in (v("resolutions") or [1.0])),
+            resolution_step_up=bool(v("resolution_step_up")), step_up_patience=int(v("step_up_patience")),
+            step_up_stop_patience=int(v("step_up_stop_patience")),
             enable_buckets=bool(v("enable_buckets")), flip_augment=bool(v("flip_augment")),
             trigger_word=s("trigger_word"), caption_dropout=float(v("caption_dropout")),
             max_token_length=int(v("max_token_length")), recache=bool(v("recache")),
@@ -414,6 +417,8 @@ class Form:
                   else "Hugging Face repo / diffusers folder"}
         for t in TARGETS:
             values[f"target_{t}"] = t in cfg.lora_targets
+        if not cfg.resolutions:  # legacy single `resolution`: snap to the nearest megapixel choice
+            values["resolutions"] = [min(MEGAPIXEL_CHOICES, key=lambda m: abs(m - side_to_mp(cfg.resolution)))]
         for key, widget in self.w.items():
             if key in values:
                 widget.value = values[key]
@@ -789,10 +794,10 @@ def build_page():
             with ui.expansion("Dataset", value=True).classes("w-full"):
                 with ui.row().classes("w-full items-end"):
                     path_input(f, "dataset_dir", "Dataset dir (images + .txt captions)", "dir", d.dataset_dir)
-                    with ui.column().classes("w-72"):
-                        ui.label("Resolution (target area = res^2)").classes("text-xs")
-                        w["resolution"] = ui.slider(min=512, max=2048, step=64, value=d.resolution)
-                        ui.label().bind_text_from(w["resolution"], "value", lambda x: f"{int(x)} px")
+                    w["resolutions"] = ui.select(MP_OPTIONS, multiple=True, value=[1.0],
+                                                 label="Training resolutions (megapixels)").classes("w-[32rem]")                         .props("use-chips")                         .tooltip("Area each image is bucketed to, aspect ratio preserved (1 MP = 1024x1024). Pick "
+                                 "several to train them all (mixed in every epoch) or, with Resolution step-up in "
+                                 "the likeness section, one after another from the lowest.")
                 with ui.row().classes("w-full items-end"):
                     w["enable_buckets"] = ui.checkbox("Aspect-ratio buckets", value=True)
                     w["flip_augment"] = ui.checkbox("Horizontal flip augment", value=False)
@@ -1185,7 +1190,16 @@ def build_page():
                 with ui.row().classes("w-full items-end"):
                     w["likeness_track_best"] = ui.checkbox("Keep best checkpoint (<job>_best.safetensors)", value=d.likeness_track_best)
                     w["likeness_patience"] = ui.number("Early stop after N probes w/o improvement (0 = never)",
-                                                       value=d.likeness_patience, precision=0).classes("w-96")
+                                                       value=d.likeness_patience, precision=0).classes("w-96")                         .tooltip("Not used while Resolution step-up is on (its two counts replace it).")
+                with ui.row().classes("w-full items-end"):
+                    w["resolution_step_up"] = ui.checkbox("Resolution step-up", value=d.resolution_step_up)                         .tooltip("Train the lowest selected resolution first. When the probe likeness score stops "
+                                 "improving, move to the next selected resolution; when it stops improving at the "
+                                 "highest one, stop training and save the final LoRA. Replaces the early-stop "
+                                 "patience above. Needs several training resolutions and probes.")
+                    w["step_up_patience"] = ui.number("Probes w/o improvement before next resolution",
+                                                      value=d.step_up_patience, min=1, precision=0).classes("w-80")                         .bind_visibility_from(w["resolution_step_up"], "value")
+                    w["step_up_stop_patience"] = ui.number("Probes w/o improvement at the highest before stopping",
+                                                           value=d.step_up_stop_patience, min=1, precision=0)                         .classes("w-96").bind_visibility_from(w["resolution_step_up"], "value")
                 with ui.row().classes("w-full items-end"):
                     w["likeness_lr_control"] = ui.checkbox("LR multiplier from probe trend", value=d.likeness_lr_control)
                     w["likeness_lr_min"] = ui.number("Min factor", value=d.likeness_lr_min, step=0.1).classes("w-28")
@@ -1369,7 +1383,8 @@ def build_page():
                 state = "RUNNING" if running else "STOPPED"
                 if loss is not None:
                     lr_s = f" | lr {st['lr']:.2e}" if st.get("lr") is not None else ""
-                    progress_label.text = (f"{state} | stage: {st.get('stage')} | step {step}/{total} | loss {loss:.4f}"
+                    res_s = f" | res {st['resolution']}" if st.get("resolution") else ""
+                    progress_label.text = (f"{state} | stage: {st.get('stage')}{res_s} | step {step}/{total} | loss {loss:.4f}"
                                            f" | avg {st.get('avg_loss') or 0:.4f}{lr_s} | eta {eta_s}")
                 else:
                     progress_label.text = f"{state} | stage: {st.get('stage')} | {step}/{total}"
@@ -1527,6 +1542,13 @@ int8 and run an int8 x int8 matmul (`torch._int_mm`) on the stored weight, so tr
 instead of ~3x slower; the extra error is under 1% of the output. *int8 backward* `bf16` is exact (the weight
 is widened to bf16 only for the gradient), `int8` also quantizes the gradient (faster, ~1% gradient error).
 `dequantize to bf16` is the old slow path for A/B comparison. nvfp4 always dequantizes.
+
+## Training resolutions
+*Training resolutions* takes one or more megapixel values (1 MP = 1024x1024); each image is bucketed to every
+selected area with its aspect ratio kept and latents are cached per resolution. Several values are mixed in every
+epoch, or, with *Resolution step-up* in the likeness section, trained lowest first: when the probe likeness score
+stops improving for *N probes* the next resolution starts, and at the highest resolution *N probes* without
+improvement end training (two separate counts, default 1 each). Step-up needs probes (face/body references).
 
 ## Training states
 Tick *Save training state* to also write `state_XXXXXX/` folders (LoRA in fp32 + optimizer + scheduler + RNG).

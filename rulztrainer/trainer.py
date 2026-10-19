@@ -16,7 +16,9 @@ from PIL import Image
 from . import lora as lora_mod
 from . import quant as Q
 from .config import TrainConfig
-from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, empty_text_path, load_batch,
+from .config import side_to_mp
+from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, describe_sides, empty_text_path,
+                      items_for_side, load_batch,
                       scan_dataset, text_cache_path)
 from .moss import loading
 from .sampler import sample
@@ -206,6 +208,10 @@ class Trainer:
         self.item_face_frac: dict[str, float] = {}
         self.loss_watch = None
         self.curriculum_w: dict[str, float] | None = None
+        self.all_items: list = []
+        self.sides: list[int] = []
+        self.res_stage = 0
+        self.batch_iter = None
         self.face_detector = None
         self.face_analysis: dict[str, dict] = {}
         if not (0.0 <= cfg.sigma_min < cfg.sigma_max <= 1.0):
@@ -347,6 +353,7 @@ class Trainer:
 
     def _run(self):
         cfg = self.cfg
+        cfg.validate()
         torch.manual_seed(cfg.seed)
         rng = random.Random(cfg.seed)
         gen = torch.Generator("cpu").manual_seed(cfg.seed)
@@ -430,8 +437,21 @@ class Trainer:
         if cfg.compile_model:
             for m, _, _ in self.replicas:
                 self.compile(m)
-        self.batcher = BucketBatcher(items, cfg.batch_size, cfg.seed + step)
-        batcher = iter(self.batcher)
+        self.all_items = items
+        self.sides = cfg.training_sides()
+        if cfg.resolution_step_up:
+            if self.controller is None:
+                raise ValueError("resolution_step_up needs working likeness probes (face/body references and their "
+                                 "scoring packages); the controller could not be created")
+            if len(self.sides) < 2:
+                log.warning("resolution_step_up with a single resolution (%s): nothing to step up to; the stop "
+                            "patience still applies", describe_sides(cfg))
+            self.controller.enter_stage(self.res_stage)
+            log.info("Resolution step-up: %s; next resolution after %d probe(s) without improvement, stop after %d "
+                     "at the highest", describe_sides(cfg), cfg.step_up_patience, cfg.step_up_stop_patience)
+        elif len(self.sides) > 1:
+            log.info("Training at %s mixed in every epoch", describe_sides(cfg))
+        self._enter_stage(self.res_stage, step, initial=True)
         self.loss_watch = self._make_loss_watch(items, optimizer)
         true_per_image_lr = (self.loss_watch is not None and cfg.per_image_lr and cfg.batch_size == 1
                              and cfg.gradient_accumulation == 1 and len(self.replicas) == 1)
@@ -492,7 +512,7 @@ class Trainer:
             for _ in range(cfg.gradient_accumulation):
                 jobs = []
                 for rep in self.replicas:  # draw every copy's batch and noise in the main thread (shared RNG)
-                    batch = next(batcher)
+                    batch = next(self.batch_iter)
                     latents, embeds, mask, regions = load_batch(batch, cfg, rng)
                     sigma = sample_sigmas(cfg, latents.shape[0], gen, self.ts_logit_shift)
                     noise = torch.randn(latents.shape, generator=gen)
@@ -546,8 +566,9 @@ class Trainer:
                 stop = self.run_probe(model, step, optimizer, scheduler, injected)
                 model.train()
                 if stop:
-                    log.info("Likeness controller: no improvement for %d probes, stopping at step %d",
-                             cfg.likeness_patience, step)
+                    log.info("Likeness controller: no improvement for %d probes%s, stopping at step %d",
+                             cfg.step_up_stop_patience if cfg.resolution_step_up else cfg.likeness_patience,
+                             " at the highest resolution" if cfg.resolution_step_up else "", step)
                     break
             if self.stop_file.exists():
                 log.info("Stop requested at step %d", step)
@@ -580,7 +601,8 @@ class Trainer:
         state_dir.mkdir(exist_ok=True)
         lora_mod.save_lora(injected, state_dir / "lora.safetensors", dtype=torch.float32)
         torch.save({
-            "step": step, "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+            "step": step, "res_stage": self.res_stage, "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
             "torch_gen": gen.get_state(), "py_rng": rng.getstate(), "torch_rng": torch.get_rng_state(),
             "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
             "config": self.cfg.to_dict(),
@@ -638,6 +660,7 @@ class Trainer:
                 torch.cuda.set_rng_state_all(st["cuda_rng"])
             except Exception:  # noqa: BLE001
                 pass
+        self.res_stage = int(st.get("res_stage", 0))
         return int(st["step"])
 
     # ------------------------------------------------------------ sampling
@@ -714,6 +737,31 @@ class Trainer:
         if watch.active_count() < len(items):
             self._refresh_batcher_weights()
         return watch
+
+    # ------------------------------------------------------------ training resolutions
+    def _stage_label(self) -> str:
+        side = self.sides[self.res_stage] if self.sides else self.cfg.resolution
+        if self.cfg.resolution_step_up:
+            return f"{side_to_mp(side):g} MP (stage {self.res_stage + 1}/{len(self.sides)})"
+        return describe_sides(self.cfg)
+
+    def _enter_stage(self, stage: int, step: int, initial: bool = False) -> None:
+        """Build the batcher for a resolution stage (all resolutions at once unless resolution_step_up)."""
+        cfg = self.cfg
+        self.res_stage = max(0, min(stage, len(self.sides) - 1))
+        if cfg.resolution_step_up:
+            items = items_for_side(self.all_items, self.sides[self.res_stage])
+            if not items:
+                raise ValueError(f"No dataset items for resolution stage {self.res_stage}")
+        else:
+            items = self.all_items
+        self.batcher = BucketBatcher(items, cfg.batch_size, cfg.seed + step)
+        self.batch_iter = iter(self.batcher)
+        self._refresh_batcher_weights()
+        if cfg.resolution_step_up and not initial:
+            log.info("Resolution step-up: now training at %s from step %d (%d items)", self._stage_label(), step,
+                     len(items))
+        self.status.update(resolution=self._stage_label(), res_stage=self.res_stage, res_stages=len(self.sides))
 
     def _refresh_batcher_weights(self) -> None:
         """Combine curriculum weights with loss-watch exclusions into the batcher."""
@@ -834,6 +882,10 @@ class Trainer:
                  "| lr x%.2f | face bias %+.2f (%.1fs)", step, fmt(face), fmt(body), fmt(rec.combined),
                  fmt(rec.face_ema), fmt(rec.body_ema), fmt(rec.combined_ema), fmt(rec.best), rec.best_step,
                  rec.lr_factor, rec.face_bias, time.time() - t0)
+        if "step_up" in actions:
+            log.info("Resolution step-up: stage %d stalled for %d probe(s) (stage best %s)", rec.stage + 1,
+                     rec.stage_since_improve, fmt(rec.stage_best))
+            self._enter_stage(actions["step_up"], step)
         if actions.get("save_best"):
             path = self.job_dir / f"{cfg.job_name}_best.safetensors"
             lora_mod.save_lora(injected, path, metadata={"ss_steps": str(step), "likeness_best": f"{rec.best:.2f}",

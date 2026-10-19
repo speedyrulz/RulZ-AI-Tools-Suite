@@ -32,7 +32,8 @@ python webui.py --port 7870
 Open http://127.0.0.1:7870.
 
 1. **Dataset**: a folder of images. Each image may have a same-name `.txt` caption. Use *Scan dataset*
-   to see the aspect-ratio buckets.
+   to see the aspect-ratio buckets. Pick one or more *Training resolutions* (megapixels); see
+   "Training resolutions and resolution step-up" below.
 2. **Model**: choose `MOSS-Image-Base` or `MOSS-Image-SFT` (or a custom local directory / HF repo id).
    *Download / verify model* fetches about 30 GB into `models/`.
 3. **Start training**. The *Monitor* tab shows progress, loss curve, log tail and sample images.
@@ -222,6 +223,37 @@ kernel rejects (in/out features not multiples of 8) use the dequantize path sile
 time logs one warning and falls back for that call. Rows are padded to 17 when a call has 16 tokens or
 fewer, because `torch._int_mm` refuses smaller M. In the WebUI these are *int8 layers compute* and *int8
 backward* in the model section.
+
+## Training resolutions and resolution step-up
+
+*Training resolutions* is a list of megapixel values (`resolutions: [0.25, 1.0, 4.0]` in YAML; the WebUI offers
+0.25 to 4 MP in 0.25 steps, 1 MP = 1024x1024). Every image is bucketed to each selected area with its aspect
+ratio preserved (sides multiples of 16), and latents are cached once per image and resolution, so a second run at
+the same resolutions starts immediately. `min_bucket_side` / `max_bucket_side` now rescale the bucket uniformly
+before clamping, so a 2:3 portrait at 0.25 MP keeps its aspect ratio instead of being cropped to the minimum
+side; raise `max_bucket_side` above 2048 if you want 4 MP buckets for wide images. The old single `resolution`
+(a side length) still works when `resolutions` is empty.
+
+With several resolutions selected and *Resolution step-up* off, all of them are mixed in every epoch (one item per
+image and resolution, so an epoch is N times longer). Per-image loss watch, curriculum weights and exclusions are
+keyed by image, so they apply to every resolution of that image.
+
+**Resolution step-up** (`resolution_step_up: true`) trains the resolutions one after another, lowest first, and
+lets the likeness probes decide when to move on:
+
+* every probe (`probe_every` steps) yields the smoothed combined face/body score; the first probe of a stage is
+  that stage's baseline and a later probe counts as an improvement when it beats the stage's best by more than
+  the noise band;
+* after `step_up_patience` probes in a row without improvement (default 1) the batcher switches to the next
+  resolution; a new stage starts with a fresh baseline, so a dip right after the switch does not count against it;
+* at the highest resolution, `step_up_stop_patience` probes without improvement (default 1) stop training; the
+  final LoRA is saved as usual and `<job>_best.safetensors` still tracks the best score over the whole run.
+
+`steps` stays the hard upper limit. In this mode the plain early stop (`likeness_patience`) is not used; the
+learning-rate control, curriculum and best-checkpoint actions keep working across stages. The mode needs probes
+(`probe_every > 0` with face and/or body references); the trainer refuses to start otherwise. The current
+resolution and stage are logged, shown in the monitor line and written to `likeness.jsonl` (`stage`,
+`stage_best`, `stage_since_improve`) and to training states, so a resumed run continues at the same stage.
 
 ## Training states
 

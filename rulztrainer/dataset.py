@@ -31,6 +31,7 @@ class Item:
     src_box: tuple | None = None  # crop of the source image (x0, y0, x1, y1) for augmentation items
     category: str = "image"  # image | face_crop | bust_crop
     region_path: Path | None = None  # latent-cell loss weight map (region-weighted loss)
+    side: int = 0  # training resolution this item was bucketed for (square-equivalent side, area = side^2)
 
     @property
     def key(self) -> str:
@@ -47,19 +48,39 @@ class RegionBatch:
     meta: list  # per-sample RegionMap (face cells, kps, has_person)
 
 
-def bucket_size(w: int, h: int, cfg: TrainConfig) -> tuple[int, int]:
-    """Pick a (W,H) multiple of 16 with area ~= resolution^2 preserving aspect ratio."""
-    target_area = cfg.resolution ** 2
+def bucket_size(w: int, h: int, cfg: TrainConfig, side: int | None = None) -> tuple[int, int]:
+    """Pick a (W,H) multiple of 16 with area ~= side^2 preserving aspect ratio (side defaults to cfg.resolution).
+
+    min/max_bucket_side are applied as a uniform rescale first (so the aspect ratio survives the limit) and only
+    as a hard per-side clamp when an extreme aspect ratio cannot satisfy both limits."""
+    side = int(side or cfg.resolution)
     if not cfg.enable_buckets:
-        return cfg.resolution // 16 * 16, cfg.resolution // 16 * 16
+        return side // 16 * 16, side // 16 * 16
     aspect = w / h
-    bw = math.sqrt(target_area * aspect)
+    bw = math.sqrt(side * side * aspect)
     bh = bw / aspect
+    lo, hi = cfg.min_bucket_side, cfg.max_bucket_side
+    scale = 1.0
+    if max(bw, bh) > hi:
+        scale = hi / max(bw, bh)
+    if min(bw, bh) * scale < lo:
+        scale = lo / min(bw, bh)
+    bw, bh = bw * scale, bh * scale
     bw = int(round(bw / 16) * 16)
     bh = int(round(bh / 16) * 16)
-    bw = max(cfg.min_bucket_side, min(cfg.max_bucket_side, bw))
-    bh = max(cfg.min_bucket_side, min(cfg.max_bucket_side, bh))
+    bw = max(lo, min(hi, bw))
+    bh = max(lo, min(hi, bh))
     return bw, bh
+
+
+def items_for_side(items: list["Item"], side: int) -> list["Item"]:
+    return [it for it in items if it.side == side]
+
+
+def describe_sides(cfg: TrainConfig) -> str:
+    from .config import side_to_mp
+
+    return ", ".join(f"{side_to_mp(s):g} MP" for s in cfg.training_sides())
 
 
 def load_image_fit(path: Path, w: int, h: int, src_box=None) -> Image.Image:
@@ -90,6 +111,7 @@ def scan_dataset(cfg: TrainConfig) -> list[Item]:
     (cache / "latents").mkdir(parents=True, exist_ok=True)
     (cache / "text").mkdir(parents=True, exist_ok=True)
     items = []
+    sides = cfg.training_sides()
     for p in sorted(root.rglob("*")):
         if p.suffix.lower() not in IMAGE_EXTS or ".rulz_cache" in p.parts:
             continue
@@ -99,18 +121,27 @@ def scan_dataset(cfg: TrainConfig) -> list[Item]:
         except Exception as e:  # noqa: BLE001
             log.warning("Skipping unreadable image %s: %s", p, e)
             continue
-        bw, bh = bucket_size(w, h, cfg)
         caption = read_caption(p, cfg)
-        stem = _hash(str(p.resolve())) + f"_{bw}x{bh}"
-        items.append(Item(
-            image=p, caption=caption, width=bw, height=bh,
-            latent_path=cache / "latents" / f"{stem}.safetensors",
-            latent_flip_path=(cache / "latents" / f"{stem}_flip.safetensors") if cfg.flip_augment else None,
-            text_path=cache / "text" / f"{_hash(caption)}_{cfg.max_token_length}.safetensors",
-            region_path=cache / "regions" / f"{stem}_regions.safetensors",
-        ))
+        seen: set[tuple[int, int]] = set()
+        for side in sides:
+            bw, bh = bucket_size(w, h, cfg, side)
+            if (bw, bh) in seen:  # two resolutions clamped to the same bucket: keep one copy
+                continue
+            seen.add((bw, bh))
+            stem = _hash(str(p.resolve())) + f"_{bw}x{bh}"
+            items.append(Item(
+                image=p, caption=caption, width=bw, height=bh,
+                latent_path=cache / "latents" / f"{stem}.safetensors",
+                latent_flip_path=(cache / "latents" / f"{stem}_flip.safetensors") if cfg.flip_augment else None,
+                text_path=cache / "text" / f"{_hash(caption)}_{cfg.max_token_length}.safetensors",
+                region_path=cache / "regions" / f"{stem}_regions.safetensors",
+                side=side,
+            ))
     if not items:
         raise ValueError(f"No images found in {root}")
+    if len(sides) > 1:
+        log.info("Training resolutions: %s (%d items = %d images x %d resolutions)", describe_sides(cfg), len(items),
+                 len(items) // len(sides), len(sides))
     return items
 
 
@@ -154,7 +185,7 @@ def augment_items(items: list[Item], cfg: TrainConfig, analysis: dict[str, dict]
         for category, scale, center_y, template in plans:
             side = scale * side0
             side = min(side, W, H)
-            min_px = cfg.crop_augment_min_px or cfg.resolution  # upscaled crops teach blurry faces: skip them
+            min_px = cfg.crop_augment_min_px or it.side or cfg.resolution  # upscaled crops teach blurry faces: skip
             if side < min_px:
                 continue
             bx0, by0 = cx - side / 2, center_y - side / 2
@@ -163,7 +194,7 @@ def augment_items(items: list[Item], cfg: TrainConfig, analysis: dict[str, dict]
             box = (int(round(bx0)), int(round(by0)), int(round(bx0 + side)), int(round(by0 + side)))
             if (box[2] - box[0]) * (box[3] - box[1]) > cfg.crop_skip_cover * W * H:
                 continue
-            bw, bh = bucket_size(box[2] - box[0], box[3] - box[1], cfg)
+            bw, bh = bucket_size(box[2] - box[0], box[3] - box[1], cfg, it.side or None)
             caption = crop_caption(template, it.caption, cfg)
             stem = _hash(f"{it.image.resolve()}|crop{box[0]},{box[1]},{box[2]},{box[3]}") + f"_{bw}x{bh}"
             out.append(Item(
@@ -173,6 +204,7 @@ def augment_items(items: list[Item], cfg: TrainConfig, analysis: dict[str, dict]
                 text_path=cache / "text" / f"{_hash(caption)}_{cfg.max_token_length}.safetensors",
                 src_box=box, category=category,
                 region_path=cache / "regions" / f"{stem}_regions.safetensors",
+                side=it.side,
             ))
             added[category] += 1
     log.info("Crop augmentation: +%d face crops, +%d bust crops (%d items total)", added["face_crop"],
