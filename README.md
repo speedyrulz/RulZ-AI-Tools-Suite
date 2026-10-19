@@ -83,6 +83,27 @@ Datasets: upload on the WebUI's Dataset tab (drag and drop images + `.txt` capti
 `/workspace/RulzTrainer/output/<job>/`; download them from Jupyter before destroying the instance (the disk is gone
 with it; stopping keeps it). `models/` on the instance disk caches the downloaded base model between runs.
 
+**Auto-download your own model files from a Hugging Face Storage Bucket.** Add
+`RULZ_MODEL_BUCKET=speedyrulz/MOSS-Image-bucket` to the template's environment variables (web editor: Environment
+Variables; CLI: `MODEL_BUCKET=speedyrulz/MOSS-Image-bucket bash scripts/vast/create_template.sh`). After the
+install, `provision.sh` syncs the bucket into `/workspace/RulzTrainer/models/bucket/` in the background, keeping
+its folder layout, so the WebUI is usable (dataset uploads) while about 18 GB come down. Progress is in
+`models/bucket_download.log`; `models/bucket/.download_complete` appears when every file is there. Then point the
+single-file fields at the files, for example:
+
+| WebUI field | path on the instance |
+|---|---|
+| Diffusion model | `models/bucket/diffusion_models/moss_image_base_int8_convrot.safetensors` |
+| Text encoder | `models/bucket/text_encoders/qwen3.5_9b_int8_convrot.safetensors` |
+| VAE | `models/bucket/vae/flux2-vae.safetensors` |
+| Turbo LoRA (samples) | `models/bucket/MOSS-Image-Base-8-steps-dmd.safetensors` |
+
+Rerun `bash scripts/vast/download_models.sh` (with `RULZ_MODEL_BUCKET` set) to fetch files you add to the bucket
+later; complete files are skipped. `RULZ_MODEL_INCLUDE="vae/* text_encoders/*"` limits the download to matching
+files and `RULZ_MODEL_DIR` changes the destination. A public bucket needs no token; a private one uses `HF_TOKEN`
+from your account environment variables. The script upgrades `huggingface_hub` on the instance if its version
+has no bucket support.
+
 Service control on the instance: `supervisorctl status|restart rulztrainer`; its log is
 `/var/log/portal/rulztrainer.log`. `RULZ_REPO` / `RULZ_BRANCH` environment variables point the provisioning at a
 fork or branch. `Dockerfile` builds an image with the install baked in (`FROM vastai/pytorch:cuda-12.8.1-auto`,
