@@ -42,6 +42,11 @@ Open http://127.0.0.1:7870.
    job's settings into the form). *Stop (save)* and *Kill* work on a reconnected job too.
 4. Results: `output/<job>/<job>_<step>.safetensors` (checkpoints) and `output/<job>/<job>.safetensors` (final).
 
+*Save config* / *Load config* store the whole form as YAML (Browse opens in `configs/`). Loading a config saved by
+an older version fills every option added since with its default, appends those options to the end of the file
+(your values and comments are left as they are) and lists them under the buttons. Options a newer version no longer
+has are ignored instead of refusing the file. `configs/example.yaml` ships with the repo and is never modified.
+
 ### CLI
 
 ```bash

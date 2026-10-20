@@ -116,14 +116,33 @@ def _relative(path: str) -> str:
 HAS_DISPLAY = sys.platform in ("win32", "darwin") or bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
+def _is_repo_example(path: str) -> bool:
+    """configs/example.yaml ships with the repo; never modify it (a local change would block `git pull`)."""
+    p = Path(path)
+    p = p if p.is_absolute() else ROOT / p
+    try:
+        return p.resolve() == (ROOT / "configs" / "example.yaml").resolve()
+    except OSError:
+        return False
+
+
+def dialog_start_dir(initial: str = "") -> str:
+    """Folder a pick dialog opens in: the path itself if it is a folder, else its folder when that exists (also
+    for a file not created yet), else the project folder. Relative paths are taken from the project folder."""
+    init = Path(initial) if initial else ROOT
+    if not init.is_absolute():
+        init = ROOT / init
+    if not init.is_dir():
+        init = init.parent if init.parent.is_dir() else ROOT
+    return str(init)
+
+
 def tk_dialog(kind: str, initial: str = "", filetypes=None) -> str:
     """Native pick dialog (runs in a worker thread). kind: 'dir' | 'file'."""
     import tkinter as tk
     from tkinter import filedialog
 
-    init = initial if initial and Path(initial).exists() else str(ROOT)
-    if Path(init).is_file():
-        init = str(Path(init).parent)
+    init = dialog_start_dir(initial)
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
@@ -1306,11 +1325,30 @@ def build_page():
                 cfg_path = ui.input("Config file", value="configs/my_job.yaml").classes("w-96")
 
                 def on_load():
+                    path = cfg_path.value.strip()
                     try:
-                        f.from_config(TrainConfig.load(cfg_path.value))
-                        status_msg.text = f"Loaded {cfg_path.value}"
+                        cfg, missing, unknown = TrainConfig.load_report(path)
+                        f.from_config(cfg)
                     except Exception as e:  # noqa: BLE001
                         status_msg.text = f"Could not load config: {e}"
+                        return
+                    msg = f"Loaded {path}"
+                    if missing:
+                        names = ", ".join(missing[:12]) + (f" and {len(missing) - 12} more" if len(missing) > 12 else "")
+                        if _is_repo_example(path):
+                            msg += f". {len(missing)} newer options use their defaults: {names}"
+                        else:
+                            try:
+                                TrainConfig.append_missing(path, cfg, missing)
+                                msg += f". Added {len(missing)} newer options to the file with their defaults: {names}"
+                            except OSError as e:
+                                msg += f". {len(missing)} newer options use their defaults ({names}); could not " \
+                                       f"add them to the file: {e}"
+                        ui.notify(f"{len(missing)} options are new since this config was saved; they are now in the "
+                                  "form with their defaults", type="info")
+                    if unknown:
+                        msg += f". Ignored options this version no longer has: {', '.join(unknown)}"
+                    status_msg.text = msg
 
                 def on_save():
                     cfg = f.to_config()
@@ -1319,7 +1357,11 @@ def build_page():
                     status_msg.text = f"Saved {path}"
 
                 async def browse_cfg():
-                    picked = await run.io_bound(tk_dialog, "file", cfg_path.value, [("YAML", "*.yaml;*.yml")])
+                    start = cfg_path.value.strip()
+                    if not start or not (ROOT / start if not Path(start).is_absolute() else Path(start)).is_file():
+                        (ROOT / "configs").mkdir(exist_ok=True)
+                        start = str(ROOT / "configs")  # the configs folder unless the box names an existing file
+                    picked = await run.io_bound(tk_dialog, "file", start, [("YAML", "*.yaml;*.yml")])
                     if picked:
                         cfg_path.value = _relative(picked)
 

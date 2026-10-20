@@ -273,6 +273,36 @@ class TrainConfig:
         with open(path, "r", encoding="utf-8") as f:
             return cls.from_dict(yaml.safe_load(f) or {})
 
+    @classmethod
+    def load_report(cls, path: str | Path) -> tuple["TrainConfig", list[str], list[str]]:
+        """Lenient load for configs saved by an older version.
+
+        Returns (config, missing, unknown): `missing` are options added since the file was saved (they take their
+        defaults), `unknown` are keys this version no longer has (ignored instead of refusing the file)."""
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        if not isinstance(data, dict):
+            raise ValueError(f"{path} is not a RulzTrainer config (expected a mapping of options)")
+        known = [f.name for f in dataclasses.fields(cls)]
+        unknown = sorted(k for k in data if k not in known)
+        missing = [k for k in known if k not in data]
+        return cls(**{k: v for k, v in data.items() if k in known}), missing, unknown
+
+    @staticmethod
+    def append_missing(path: str | Path, cfg: "TrainConfig", missing: list[str]) -> None:
+        """Add the missing options (with their values in `cfg`) to the end of an existing config file.
+
+        Appends instead of rewriting, so the file's own values, order and comments stay exactly as they were."""
+        if not missing:
+            return
+        values = cfg.to_dict()
+        block = yaml.safe_dump({k: values[k] for k in missing}, sort_keys=False, allow_unicode=True)
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+        sep = "" if not text or text.endswith("\n") else "\n"
+        with open(path, "a", encoding="utf-8", newline="\n") as f:
+            f.write(f"{sep}# Options added in a newer RulzTrainer version (defaults; edit as needed):\n{block}")
+
     def save(self, path: str | Path) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
