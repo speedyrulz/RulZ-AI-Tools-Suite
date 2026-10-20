@@ -413,6 +413,7 @@ class Form:
             vae_file=s("vae_file"), tokenizer_path=s("tokenizer_path"),
             device=v("device"), text_encoder_device=v("text_encoder_device"),
             multi_gpu=v("multi_gpu"), devices=(v("devices") or "").strip(), split_plan=(v("split_plan") or "").strip(),
+            parallel_jobs=bool(v("parallel_jobs")),
             transformer_quant=v("transformer_quant"), text_encoder_quant=v("text_encoder_quant"),
             gradient_checkpointing=bool(v("gradient_checkpointing")),
             int8_matmul=bool(v("int8_matmul")), int8_backward=v("int8_backward"),
@@ -843,6 +844,13 @@ def build_page():
                         .bind_visibility_from(w["multi_gpu"], "value", lambda x: x == "model_split") \
                         .tooltip("Give the faster GPU more blocks. Auto-balance counts blocks before the first trained "
                                  "block as forward-only (cheap) and every later block as forward+backward.")
+                    w["parallel_jobs"] = (
+                        ui.switch("Split samples, probes and caching across GPUs", value=d.parallel_jobs)
+                        .bind_visibility_from(w["multi_gpu"], "value", lambda x: x != "off")
+                        .tooltip("Each GPU renders its own share of the sample and probe images, encodes its share of the latent "
+                                 "cache, and builds its share of the SAM 3 region masks; a second text encoder copy is loaded when "
+                                 "a quantized one fits on each GPU. In model split the training model spans both GPUs, so samples "
+                                 "and probes split only when a separate sampling model is set."))
                 with ui.row().classes("w-full items-end"):
                     w["device"] = ui.select(gpus, value=gpus[0], label="Training GPU").classes("w-40")
                     w["text_encoder_device"] = ui.select(["auto"] + gpus + ["cpu"], value="auto",

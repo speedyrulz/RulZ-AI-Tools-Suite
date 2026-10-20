@@ -86,6 +86,7 @@ class TrainConfig:
     multi_gpu: str = "off"  # off | data_parallel (model copy per GPU, faster) | model_split (blocks across GPUs, memory only)
     devices: str = "cuda:0,cuda:1"  # GPUs for multi_gpu; the first is the primary
     split_plan: str = ""  # model_split: manual block plan e.g. "cuda:0=0-25;cuda:1=26-41"; empty = auto-balance
+    parallel_jobs: bool = True  # multi_gpu: split samples, probes, latent/text caching and SAM 3 masks across the GPUs
     text_encoder_device: str = "auto"  # "auto" splits across GPUs/CPU; or "cuda:0", "cuda:1", "cpu"
     transformer_quant: str = "auto"  # auto (keep file format) | none | int8 | int8_convrot | nvfp4
     text_encoder_quant: str = "auto"  # auto | none | int8 | int8_convrot | nvfp4

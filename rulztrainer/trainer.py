@@ -1,6 +1,7 @@
 """LoRA training loop for MOSS-Image (flow matching)."""
 from __future__ import annotations
 
+import contextlib
 import gc
 import json
 import logging
@@ -8,6 +9,7 @@ import math
 import random
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -21,11 +23,57 @@ from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, d
                       items_for_side, load_batch,
                       scan_dataset, text_cache_path)
 from .moss import loading
-from .multigpu import compile_count, no_recompile_stance, stance_available
+from .multigpu import clone_to, compile_count, no_recompile_stance, norm_device, run_queue, stance_available
 from .sampler import sample
 
 log = logging.getLogger("rulztrainer")
 DP_COMPILE_QUIET_STEPS = 3  # data parallel + compile: serial steps without a new graph before going parallel
+TEXT_TIMING_PROMPTS = 4  # prompts encoded on the first copy to time it before deciding on a second copy
+
+
+@dataclass
+class SampleSlot:
+    """One GPU's share of a sampling round: the model copy, the VAE and the device they live on."""
+    model: object
+    device: str
+    vae: object
+    compiled: bool = False  # the model's blocks are torch.compiled (graph tracing must not overlap)
+
+
+@dataclass
+class RenderJob:
+    prompt: str
+    width: int
+    height: int
+    steps: int
+    cfg_scale: float
+    seed: int
+    out_path: Path
+    label: str  # e.g. "sample 2/4" or "probe face seed 1/2"
+    kind: str = "sample"  # sample | face | body
+
+    @property
+    def shape_key(self):
+        return (self.width, self.height, self.cfg_scale != 1.0)
+
+
+class _Board:
+    """Combines per-GPU progress into the single status 'stage' line the WebUI shows."""
+
+    def __init__(self, status, title: str):
+        import threading
+
+        self.status, self.title, self.parts, self.lock = status, title, {}, threading.Lock()
+
+    def set(self, device: str, text: str) -> None:
+        with self.lock:
+            self.parts[device] = text
+            if len(self.parts) == 1 and not self.title:
+                line = text
+            else:
+                line = " | ".join(([self.title] if self.title else []) +
+                                  [f"{d}: {t}" for d, t in sorted(self.parts.items())])
+            self.status.update(stage=line)
 
 
 def setup_logging(job_dir: Path) -> None:
@@ -62,22 +110,36 @@ def unload_model(model) -> None:
     free_cuda()
 
 
+def load_text_embeds(cfg: TrainConfig, prompt: str) -> torch.Tensor:
+    from safetensors.torch import load_file
+
+    return load_file(str(text_cache_path(cfg, prompt)))["embeds"]
+
+
 class Status:
     """Writes a small JSON file the WebUI polls."""
 
     def __init__(self, path: Path):
+        import threading
+
         self.path = path
+        self.lock = threading.RLock()  # GPU worker threads report progress concurrently
         self.data = {"stage": "starting", "step": 0, "total": 0, "loss": None, "avg_loss": None,
                      "elapsed": 0.0, "eta": None, "samples": [], "saved": [], "error": None, "done": False,
                      "losses": [], "states": []}
         self.write()
 
     def update(self, **kw):
-        self.data.update(kw)
-        self.write()
+        with self.lock:
+            self.data.update(kw)
+            self.write()
 
     def write(self):
         """Atomic replace with retries: on Windows a reader (the WebUI poll) can briefly lock the target."""
+        with self.lock:
+            self._write()
+
+    def _write(self):
         payload = json.dumps(self.data)
         tmp = self.path.with_suffix(".tmp")
         for attempt in range(6):
@@ -202,6 +264,8 @@ class Trainer:
             self.stop_file.unlink()
         self.device = torch.device(cfg.device)
         self.vae = None
+        self.vaes: dict[str, object] = {}  # VAE copies on the other GPUs (sampling / caching side jobs)
+        self.sample_graphs: set = set()  # (device, shape) pairs a compiled model has already traced for sampling
         self.face_scorer = None
         self.body_scorer = None
         self.controller = None
@@ -234,6 +298,24 @@ class Trainer:
             cfg.device = self.devices[0]
             self.device = torch.device(cfg.device)
         self.model_dir: Path | None = None
+
+    def side_devices(self) -> list[str]:
+        """GPUs that side jobs (samples, probes, caching, SAM 3 masks) are split across."""
+        cfg = self.cfg
+        if cfg.parallel_jobs and cfg.multi_gpu != "off" and len(self.devices) > 1:
+            return [norm_device(d) for d in self.devices]
+        return [norm_device(self.device)]
+
+    def _vae_on(self, device: str):
+        """The VAE on `device` (the primary one, or a cached copy made on first use)."""
+        device = norm_device(device)
+        if self.vae is None:
+            return None
+        if norm_device(self.vae.device) == device:
+            return self.vae
+        if device not in self.vaes:
+            self.vaes[device] = clone_to(self.vae, device).eval().requires_grad_(False)
+        return self.vaes[device]
 
     # ------------------------------------------------------------ stages
     def _needs_face_analysis(self) -> bool:
@@ -312,8 +394,22 @@ class Trainer:
                 except Exception as e:  # noqa: BLE001
                     log.warning("MediaPipe unavailable for person masks (%s); body_loss_weight ignored", e)
             self.status.update(stage="building region weight maps")
-            counts = R.cache_region_maps(items, cfg, self.face_analysis, person_fn,
-                                         progress=lambda i, n: self.status.update(step=i, total=n))
+            fns = None
+            side = self.side_devices()
+            sam_gpu = bool(holder and person_fn == getattr(holder[0], "person_mask", None)
+                           and holder[0].device != "cpu")
+            if sam_gpu and len(side) > 1:  # SAM 3: one copy per GPU
+                for d in [d for d in side if d != norm_device(holder[0].device)]:
+                    self.status.update(stage=f"copying SAM 3 to {d}")
+                    holder.append(holder[0].clone(d))
+                fns = [(h.person_mask, h.device) for h in holder]
+            with contextlib.ExitStack() as stack:
+                if sam_gpu:  # keep SAM 3 resident for the whole batch instead of moving it per image
+                    for h in holder:
+                        stack.enter_context(h.hold())
+                counts = R.cache_region_maps(items, cfg, self.face_analysis, person_fn,
+                                             progress=lambda i, n: self.status.update(step=i, total=n),
+                                             person_mask_fns=fns)
             log.info("Region maps ready (new this run): %s; weights face %.2g / body %.2g / background %.2g",
                      counts, cfg.face_loss_weight, cfg.body_loss_weight, cfg.background_loss_weight)
             self.status.update(regions=counts)
@@ -332,20 +428,92 @@ class Trainer:
         need_text = cfg.recache or not empty_text_path(cfg).exists() or any(
             not it.text_path.exists() for it in items) or any(
             not text_cache_path(cfg, p).exists() for p in prompts)
+        devices = self.side_devices()
         if need_latents:
             self.status.update(stage="caching latents")
             vae = loading.get_vae(cfg, self.model_dir)
-            cache_latents(items, cfg, vae, progress=lambda i, n: self.status.update(step=i, total=n))
-            unload_model(vae)
+            vaes = [vae]
+            for d in devices:
+                if d != norm_device(vae.device):
+                    vaes.append(clone_to(vae, d).eval().requires_grad_(False))
+            t0 = time.time()
+            cache_latents(items, cfg, vae, progress=lambda i, n: self.status.update(step=i, total=n),
+                          vaes=vaes if len(vaes) > 1 else None)
+            log.info("Latent caching took %.1fs", time.time() - t0)
+            for v in vaes:
+                unload_model(v)
+            del vaes, vae
+            free_cuda()
         if need_text:
             self.status.update(stage="loading text encoder")
+            t_load = time.time()
             te, tok = loading.get_text_encoder(cfg, self.model_dir)
+            t_load = time.time() - t_load
             self.status.update(stage="caching text embeddings")
+            t0 = time.time()
+            encoders = self._extra_text_encoders(te, tok, items, prompts, devices, t_load)
             cache_text(items, cfg, te, tok, extra_prompts=prompts,
-                       progress=lambda i, n: self.status.update(step=i, total=n))
-            unload_model(te)
-            del tok
+                       progress=lambda i, n: self.status.update(step=i, total=n),
+                       encoders=encoders if len(encoders) > 1 else None)
+            log.info("Text caching took %.1fs", time.time() - t0)
+            for enc in encoders:
+                unload_model(enc[0])
+            del te, tok, encoders
+            free_cuda()
             log.info("Text encoder unloaded after caching")
+
+    def _extra_text_encoders(self, te, tok, items, prompts, devices, load_seconds: float) -> list[tuple]:
+        """[(te, tokenizer, device), ...]: the loaded encoder plus a copy on every other GPU when it pays off.
+
+        A copy only fits when the encoder sits wholly on one GPU (a quantized Qwen3.5-9B, ~10 GB; bf16 is 19 GB and
+        is spread over several devices instead). Whether it pays off is measured: the first few prompts are encoded
+        on the loaded copy, and a second copy is loaded only if the time it saves on the remaining prompts beats
+        its load time (taken from how long the first copy took to load)."""
+        import dataclasses
+
+        from .dataset import text_jobs
+
+        tensors = list(te.parameters()) + list(te.buffers())
+        te_devs = {norm_device(t.device) for t in tensors if t.device.type != "meta"}
+        primary = [(te, tok, next(iter(te_devs)) if len(te_devs) == 1 else "cpu")]
+        if len(devices) < 2:
+            return primary
+        todo, _ = text_jobs(items, self.cfg, prompts)
+        if len(te_devs) != 1 or not next(iter(te_devs)).startswith("cuda"):
+            log.info("Text caching stays on one encoder: it is spread over %s (a quantized text encoder fits one GPU "
+                     "per copy)", ", ".join(sorted(te_devs)))
+            return primary
+        if len(todo) <= TEXT_TIMING_PROMPTS * 2:
+            return primary
+        stamps = [time.time()]
+        cache_text(items, self.cfg, te, tok, extra_prompts=prompts, max_prompts=TEXT_TIMING_PROMPTS,
+                   progress=lambda i, n: (stamps.append(time.time()), self.status.update(step=i, total=len(todo))))
+        per_prompt = (stamps[-1] - stamps[1]) / max(1, len(stamps) - 2)  # skips the first (warm-up) prompt
+        warm_up = max(0.0, stamps[1] - stamps[0] - per_prompt)  # first-call cost, which a new copy pays again
+        cost = load_seconds + warm_up
+        remaining = len(todo) - TEXT_TIMING_PROMPTS
+        saved = remaining * per_prompt * (1 - 1 / len(devices))
+        if saved < cost * 1.2:
+            log.info("Text caching stays on one encoder: %d prompts left at %.2fs each; a second copy would save "
+                     "~%.0fs but costs ~%.0fs (load %.0fs + first-call warm-up %.0fs)", remaining, per_prompt, saved,
+                     cost, load_seconds, warm_up)
+            return primary
+        log.info("Text caching: %d prompts left at %.2fs each; an encoder copy per GPU saves ~%.0fs (costs ~%.0fs)",
+                 remaining, per_prompt, saved, cost)
+        size = sum(t.numel() * t.element_size() for t in tensors)
+        out = primary
+        for d in devices:
+            if d == primary[0][2]:
+                continue
+            free, _ = torch.cuda.mem_get_info(torch.device(d))
+            if free < size * 1.15 + 1.5 * 2**30:
+                log.info("Text caching: not enough free memory on %s for a second encoder (%.1f GB free, %.1f GB "
+                         "needed)", d, free / 2**30, size / 2**30)
+                continue
+            self.status.update(stage=f"loading text encoder copy on {d}")
+            te2, tok2 = loading.get_text_encoder(dataclasses.replace(self.cfg, text_encoder_device=d), self.model_dir)
+            out.append((te2, tok2, d))
+        return out
 
     def run(self):
         try:
@@ -427,7 +595,8 @@ class Trainer:
         self.injected = injected
         self.sample_model = None
         if not cfg.sample_model_path:
-            self._attach_sampling_loras(model)
+            for m, _, _ in self.replicas:
+                self._attach_sampling_loras(m)
         if cfg.sample_prompts or cfg.probe_every > 0:
             self.vae = loading.get_vae(cfg, self.model_dir)
             self.face_scorer = self._make_face_scorer()
@@ -437,6 +606,14 @@ class Trainer:
             from .multigpu import gpu_memory_summary
 
             log.info("GPU memory after model load: %s", gpu_memory_summary(self.devices))
+        side = self.side_devices()
+        if len(side) > 1:
+            if cfg.multi_gpu == "model_split" and not cfg.sample_model_path:
+                log.info("Samples and probes render on the split model one at a time (it spans %s); set a separate "
+                         "sampling model to give each GPU its own images", ", ".join(side))
+            else:
+                log.info("Samples and probes split across %s (each GPU renders the next image in the queue)",
+                         ", ".join(side))
 
         if cfg.compile_model:
             for m, _, _ in self.replicas:
@@ -729,29 +906,95 @@ class Trainer:
                 dst.alpha, dst.scale = src.alpha, src.scale
         return self.sample_model
 
-    def _with_sampling_model(self, model, fn, step):
-        """Run fn(model_for_sampling) on the training model or, if configured, the separate sampling model."""
+    @contextlib.contextmanager
+    def _sampling_slots(self, model, step):
+        """Yield one SampleSlot per GPU that renders this round (several only with multi_gpu + parallel_jobs).
+
+        Without a separate sampling model the training copies render: one per GPU in data parallel, the split model
+        (one slot) in model_split. With sample_model_path every training copy is moved to the CPU and the sampling
+        model gets a copy on each GPU instead."""
         cfg = self.cfg
+        devices = self.side_devices()
         if not cfg.sample_model_path:
-            return fn(model)
+            if cfg.multi_gpu == "data_parallel" and len(devices) > 1:
+                pairs = [(m, norm_device(d)) for m, _, d in self.replicas]
+            else:
+                pairs = [(model, norm_device(self.device))]
+            modes = [m.training for m, _ in pairs]
+            slots = [SampleSlot(m, d, self._vae_on(d), compiled=self.compiled) for m, d in pairs]
+            try:
+                yield slots
+            finally:
+                for (m, _), mode in zip(pairs, modes):
+                    m.train(mode)
+            return
         self.status.update(stage=f"swapping in sampling model (step {step})")
-        model.to("cpu")
+        train_models = [(m, d) for m, _, d in self.replicas] or [(model, str(self.device))]
+        for m, _ in train_models:
+            m.to("cpu")
         free_cuda()
-        sample_model = self._get_sample_model().to(self.device)
+        base = self._get_sample_model()  # on the CPU, with the current LoRA weights
+        copies = []
         try:
-            return fn(sample_model)
+            for d in devices[1:]:
+                self.status.update(stage=f"copying sampling model to {d} (step {step})")
+                copies.append(clone_to(base, d))
+            base.to(devices[0])
+            slots = [SampleSlot(base, devices[0], self._vae_on(devices[0]))]
+            slots += [SampleSlot(c, d, self._vae_on(d)) for c, d in zip(copies, devices[1:])]
+            yield slots
         finally:
-            sample_model.to("cpu")
+            slots = None
+            copies.clear()
+            base.to("cpu")
             free_cuda()
-            model.to(self.device)
+            for m, d in train_models:
+                m.to(d)
             if getattr(model, "split_assignment", None):
                 from .multigpu import apply_assignment
 
                 apply_assignment(model, model.split_assignment)
 
+    def _render_round(self, slots, jobs, neg_e, neg_m, board, on_done=None) -> list[str]:
+        """Render every job, each GPU pulling the next one; returns the image paths in job order."""
+        cfg = self.cfg
+
+        def render(slot, job):
+            emb = load_text_embeds(cfg, job.prompt)
+            pos_e, pos_m = loading.pad_embeds([emb])
+            log.info("%s on %s (seed %d, %d steps, %dx%d): %s", job.label[:1].upper() + job.label[1:], slot.device,
+                     job.seed, job.steps, job.width, job.height, job.prompt[:80])
+            board.set(slot.device, f"{job.label} | step 0/{job.steps}")
+
+            def on_progress(k, total, _slot=slot, _job=job):
+                board.set(_slot.device, f"{_job.label} | step {k}/{total}")
+
+            lat = sample(slot.model, pos_e, pos_m, neg_e, neg_m, width=job.width, height=job.height, steps=job.steps,
+                         cfg=job.cfg_scale, shift=cfg.sample_shift, seed=job.seed, skip_layer=cfg.sample_skip_layer,
+                         device=slot.device, progress=on_progress)
+            img = loading.decode_latents(slot.vae, lat)[0]
+            arr = ((img.permute(1, 2, 0).float().cpu().numpy() + 1) * 127.5).round().clip(0, 255).astype("uint8")
+            Image.fromarray(arr).save(job.out_path)
+            board.set(slot.device, f"{job.label} done")
+            return str(job.out_path)
+
+        if len(slots) > 1 and any(sl.compiled for sl in slots):
+            # A compiled model traces new graphs for sampling shapes, and two threads tracing at once crash dynamo.
+            # The first round of each shape runs serially (job i on GPU i % n); later rounds run in parallel under
+            # a stance that never compiles.
+            needed = {(sl.device, j.shape_key) for sl in slots for j in jobs}
+            if not needed <= self.sample_graphs or not stance_available():
+                res = run_queue(slots, jobs, render, serial=True, on_done=on_done)
+                self.sample_graphs |= {(slots[i % len(slots)].device, j.shape_key) for i, j in enumerate(jobs)}
+                return res
+            with (no_recompile_stance() or contextlib.nullcontext()):
+                return run_queue(slots, jobs, render, on_done=on_done)
+        return run_queue(slots, jobs, render, on_done=on_done)
+
     @torch.no_grad()
     def sample_images(self, model, step):
-        return self._with_sampling_model(model, lambda m: self._sample_with(m, step), step)
+        with self._sampling_slots(model, step) as slots:
+            return self._sample_with(slots, step)
 
     # ------------------------------------------------------------ per-image loss watch
     def _make_loss_watch(self, items, optimizer):
@@ -846,59 +1089,50 @@ class Trainer:
                  cfg.likeness_track_best, cfg.likeness_patience, cfg.likeness_lr_control, cfg.likeness_curriculum)
         return ctrl
 
-    def _render(self, model, prompt, width, height, steps, cfg_scale, seed, out_path, neg_e, neg_m, stage):
-        from safetensors.torch import load_file
-
-        cfg = self.cfg
-        emb = load_file(str(text_cache_path(cfg, prompt)))["embeds"]
-        pos_e, pos_m = loading.pad_embeds([emb])
-        self.status.update(stage=stage)
-        lat = sample(model, pos_e, pos_m, neg_e, neg_m, width=width, height=height, steps=steps, cfg=cfg_scale,
-                     shift=cfg.sample_shift, seed=seed, skip_layer=cfg.sample_skip_layer, device=self.device)
-        img = loading.decode_latents(self.vae, lat)[0]
-        arr = ((img.permute(1, 2, 0).float().cpu().numpy() + 1) * 127.5).round().clip(0, 255).astype("uint8")
-        Image.fromarray(arr).save(out_path)
-        return str(out_path)
-
     @torch.no_grad()
-    def _probe_with(self, model, step):
-        from safetensors.torch import load_file
-
+    def _probe_with(self, slots, step):
         from .likeness import probe_body_size
 
         cfg = self.cfg
-        model.eval()
-        lora_mod.set_extras_enabled(model, True)
-        neg = load_file(str(text_cache_path(cfg, cfg.sample_negative)))["embeds"]
-        neg_e, neg_m = loading.pad_embeds([neg])
+        for sl in slots:
+            sl.model.eval()
+            lora_mod.set_extras_enabled(sl.model, True)
+        neg_e, neg_m = loading.pad_embeds([load_text_embeds(cfg, cfg.sample_negative)])
         out_dir = self.job_dir / "probes"
         out_dir.mkdir(exist_ok=True)
-        face_scores, body_scores, images = [], [], []
+        jobs = []
+        for kind, prompt in (("face", cfg.probe_face_prompt), ("body", cfg.probe_body_prompt)):
+            if not prompt:
+                continue
+            if kind == "face" and self.face_scorer is None:
+                continue
+            if kind == "body" and self.body_scorer is None:
+                continue
+            w, h = (cfg.probe_size, cfg.probe_size) if kind == "face" else probe_body_size(cfg.probe_size)
+            n_seeds = max(1, cfg.probe_seeds)
+            for k in range(n_seeds):
+                jobs.append(RenderJob(prompt, w, h, cfg.probe_steps, cfg.probe_cfg, cfg.probe_seed + k,
+                                      out_dir / f"step{step:06d}_{kind}_{k}.png",
+                                      f"probe {kind} seed {k + 1}/{n_seeds} at step {step}" if len(slots) == 1
+                                      else f"probe {kind} seed {k + 1}/{n_seeds}", kind))
+        title = f"probes at step {step} on {len(slots)} GPUs" if len(slots) > 1 and len(jobs) > 1 else ""
+        board = _Board(self.status, title)
         try:
-            for kind, prompt in (("face", cfg.probe_face_prompt), ("body", cfg.probe_body_prompt)):
-                if not prompt:
-                    continue
-                if kind == "face" and self.face_scorer is None:
-                    continue
-                if kind == "body" and self.body_scorer is None:
-                    continue
-                w, h = (cfg.probe_size, cfg.probe_size) if kind == "face" else probe_body_size(cfg.probe_size)
-                for s in range(max(1, cfg.probe_seeds)):
-                    seed = cfg.probe_seed + s
-                    p = self._render(model, prompt, w, h, cfg.probe_steps, cfg.probe_cfg, seed,
-                                     out_dir / f"step{step:06d}_{kind}_{s}.png", neg_e, neg_m,
-                                     f"probe {kind} seed {s + 1}/{cfg.probe_seeds} at step {step}")
-                    images.append(p)
-                    if kind == "face":
-                        sc = self.face_scorer.score(p, step, 0)
-                        if sc.percent is not None:
-                            face_scores.append(sc.percent)
-                    else:
-                        pct, _ = self.body_scorer.score(p)
-                        if pct is not None:
-                            body_scores.append(pct)
+            images = self._render_round(slots, jobs, neg_e, neg_m, board)
         finally:
-            lora_mod.set_extras_enabled(model, False)
+            for sl in slots:
+                lora_mod.set_extras_enabled(sl.model, False)
+        face_scores, body_scores = [], []
+        self.status.update(stage=f"scoring probes (step {step})")
+        for job, p in zip(jobs, images):  # scoring stays in this thread: the scorers are not shared across threads
+            if job.kind == "face":
+                sc = self.face_scorer.score(p, step, 0)
+                if sc.percent is not None:
+                    face_scores.append(sc.percent)
+            else:
+                pct, _ = self.body_scorer.score(p)
+                if pct is not None:
+                    body_scores.append(pct)
         face = sum(face_scores) / len(face_scores) if face_scores else None
         body = sum(body_scores) / len(body_scores) if body_scores else None
         return face, body, images
@@ -909,7 +1143,8 @@ class Trainer:
 
         cfg = self.cfg
         t0 = time.time()
-        face, body, images = self._with_sampling_model(model, lambda m: self._probe_with(m, step), step)
+        with self._sampling_slots(model, step) as slots:
+            face, body, images = self._probe_with(slots, step)
         rec, actions = self.controller.update(step, face, body, images)
         append_record(self.job_dir, rec)
         fmt = lambda v: "n/a" if v is None else f"{v:.1f}%"  # noqa: E731
@@ -948,43 +1183,32 @@ class Trainer:
         return bool(actions.get("stop"))
 
     @torch.no_grad()
-    def _sample_with(self, model, step):
-        from safetensors.torch import load_file
-
+    def _sample_with(self, slots, step):
         cfg = self.cfg
-        model.eval()
-        lora_mod.set_extras_enabled(model, True)
+        for sl in slots:
+            sl.model.eval()
+            lora_mod.set_extras_enabled(sl.model, True)
         self.status.update(stage=f"sampling (step {step})")
-        neg = load_file(str(text_cache_path(cfg, cfg.sample_negative)))["embeds"]
-        neg_e, neg_m = loading.pad_embeds([neg])
+        neg_e, neg_m = loading.pad_embeds([load_text_embeds(cfg, cfg.sample_negative)])
         out_dir = self.job_dir / "samples"
         out_dir.mkdir(exist_ok=True)
-        paths = []
+        n_prompts = len(cfg.sample_prompts)
+        jobs = [RenderJob(prompt, cfg.sample_width, cfg.sample_height, cfg.sample_steps, cfg.sample_cfg,
+                          cfg.sample_seed + (i if cfg.sample_walk_seed else 0), out_dir / f"step{step:06d}_{i}.png",
+                          f"sampling {i + 1}/{n_prompts} at step {step}" if len(slots) == 1
+                          else f"sample {i + 1}/{n_prompts}")
+                for i, prompt in enumerate(cfg.sample_prompts)]
+        title = f"sampling at step {step} on {len(slots)} GPUs" if len(slots) > 1 and n_prompts > 1 else ""
+        board = _Board(self.status, title)
+        t0 = time.time()
         try:
-            n_prompts = len(cfg.sample_prompts)
-            for i, prompt in enumerate(cfg.sample_prompts):
-                seed = cfg.sample_seed + (i if cfg.sample_walk_seed else 0)
-                log.info("Sampling %d/%d (seed %d, %d steps): %s", i + 1, n_prompts, seed, cfg.sample_steps,
-                         prompt[:80])
-                stage = f"sampling {i + 1}/{n_prompts} at step {step}"
-                self.status.update(stage=stage + " | step 0/%d" % cfg.sample_steps)
-
-                def on_progress(k, n, _stage=stage):
-                    self.status.update(stage=f"{_stage} | step {k}/{n}")
-
-                emb = load_file(str(text_cache_path(cfg, prompt)))["embeds"]
-                pos_e, pos_m = loading.pad_embeds([emb])
-                lat = sample(model, pos_e, pos_m, neg_e, neg_m, width=cfg.sample_width, height=cfg.sample_height,
-                             steps=cfg.sample_steps, cfg=cfg.sample_cfg, shift=cfg.sample_shift,
-                             seed=seed, skip_layer=cfg.sample_skip_layer, device=self.device, progress=on_progress)
-                img = loading.decode_latents(self.vae, lat)[0]
-                arr = ((img.permute(1, 2, 0).float().cpu().numpy() + 1) * 127.5).round().clip(0, 255).astype("uint8")
-                p = out_dir / f"step{step:06d}_{i}.png"
-                Image.fromarray(arr).save(p)
-                paths.append(str(p))
-                log.info("Sample saved %s", p)
+            paths = self._render_round(slots, jobs, neg_e, neg_m, board,
+                                       on_done=lambda i, job, p: log.info("Sample saved %s", p))
         finally:
-            lora_mod.set_extras_enabled(model, False)
+            for sl in slots:
+                lora_mod.set_extras_enabled(sl.model, False)
+        log.info("Sampling took %.1fs for %d image(s) on %s", time.time() - t0, len(paths),
+                 ", ".join(sorted({sl.device for sl in slots})))
         self.status.data["samples"] = paths + self.status.data["samples"]
         if (self.face_scorer is not None or self.body_scorer is not None) and paths:
             self.status.update(stage=f"similarity scoring (step {step})")

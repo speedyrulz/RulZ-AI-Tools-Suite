@@ -62,8 +62,37 @@ class SilhouetteScorer:
         self.model = Sam3Model.from_pretrained(model_id, dtype=torch.float32).eval()
         self.device = device if (device == "cpu" or torch.cuda.is_available()) else "cpu"
         self.threshold = threshold
+        self.held = False  # True inside hold(): the model stays on the GPU between images
         log.info("SAM 3 loaded from %s (%.1fM params), scoring on %s",
                  model_id, sum(p.numel() for p in self.model.parameters()) / 1e6, self.device)
+
+    def hold(self):
+        """Context manager: keep SAM 3 on its GPU for a batch of images instead of moving it per image."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def _ctx():
+            self.held = True
+            try:
+                yield self
+            finally:
+                self.held = False
+                if self.device != "cpu":
+                    self.model.to("cpu")
+                    self.torch.cuda.empty_cache()
+
+        return _ctx()
+
+    def clone(self, device: str) -> "SilhouetteScorer":
+        """A copy on another device (own processor too: its tokenizer is not thread-safe)."""
+        import copy
+
+        other = object.__new__(SilhouetteScorer)
+        other.torch, other.threshold, other.held = self.torch, self.threshold, False
+        other.processor = copy.deepcopy(self.processor)
+        other.model = copy.deepcopy(self.model.to("cpu")).eval()
+        other.device = device
+        return other
 
     def person_mask(self, image) -> np.ndarray | None:
         """Largest 'person' instance mask as a bool [H, W] array, or None."""
@@ -83,7 +112,7 @@ class SilhouetteScorer:
             self.device = "cpu"
             return self.person_mask(image)
         finally:
-            if self.device != "cpu":
+            if self.device != "cpu" and not self.held:
                 self.model.to("cpu")
                 torch.cuda.empty_cache()
         masks = res.get("masks")

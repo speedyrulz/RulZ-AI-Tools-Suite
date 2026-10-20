@@ -222,3 +222,105 @@ def gpu_memory_summary(devices: list[str]) -> str:
         if str(d).startswith("cuda") and torch.cuda.is_available():
             parts.append(f"{d} {torch.cuda.memory_allocated(torch.device(d)) / 1e9:.2f} GB")
     return ", ".join(parts)
+
+
+# ---------------------------------------------------------------- splitting side jobs across GPUs
+
+
+def norm_device(device) -> str:
+    """Canonical device string: "cuda" -> "cuda:<current>", torch.device -> "cuda:1", "cpu" stays."""
+    dev = torch.device(device)
+    if dev.type == "cuda" and dev.index is None:
+        dev = torch.device("cuda", torch.cuda.current_device() if torch.cuda.is_available() else 0)
+    return str(dev)
+
+
+def _device_ctx(device):
+    """torch.cuda.device(device) for a CUDA device (so triton / custom kernels launch on it), else a no-op."""
+    import contextlib
+
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    if dev.type == "cuda" and torch.cuda.is_available():
+        return torch.cuda.device(dev)
+    return contextlib.nullcontext()
+
+
+def run_queue(workers: list, jobs: list, fn, *, serial: bool = False, on_done=None) -> list:
+    """Run fn(worker, job) for every job and return the results in job order.
+
+    workers  one entry per device (any object with a .device attribute, or a (obj, device) tuple). Each worker
+             gets its own thread that pulls the next unstarted job, so a faster GPU simply takes more of them.
+    serial   run in the calling thread, job i on worker i % n (used while torch.compile may still trace graphs:
+             two threads tracing at once crash dynamo).
+    on_done  optional callback(index, job, result), always called in the calling thread as results arrive.
+    The first exception in any worker stops the others from starting new jobs and is re-raised here."""
+    import queue
+    import threading
+
+    def device_of(w):
+        return w[1] if isinstance(w, tuple) else getattr(w, "device", "cpu")
+
+    results = [None] * len(jobs)
+    if not jobs:
+        return results
+    if serial or len(workers) <= 1:
+        for i, job in enumerate(jobs):
+            w = workers[i % len(workers)]
+            with _device_ctx(device_of(w)):
+                results[i] = fn(w, job)
+            if on_done:
+                on_done(i, job, results[i])
+        return results
+
+    todo: "queue.SimpleQueue" = queue.SimpleQueue()
+    for i, job in enumerate(jobs):
+        todo.put((i, job))
+    done: "queue.SimpleQueue" = queue.SimpleQueue()
+    failed = threading.Event()
+
+    def loop(w):
+        with _device_ctx(device_of(w)):
+            while not failed.is_set():
+                try:
+                    i, job = todo.get_nowait()
+                except queue.Empty:
+                    return
+                try:
+                    done.put((i, fn(w, job), None))
+                except BaseException as e:  # noqa: BLE001
+                    failed.set()
+                    done.put((i, None, e))
+                    return
+
+    threads = [threading.Thread(target=loop, args=(w,), daemon=True, name=f"gpu-worker-{k}")
+               for k, w in enumerate(workers)]
+    for t in threads:
+        t.start()
+    error = None
+    received = 0
+    while received < len(jobs):
+        try:
+            i, res, exc = done.get(timeout=0.1)
+        except queue.Empty:
+            if not any(t.is_alive() for t in threads) and done.empty():
+                break  # a worker failed and the rest stopped before every job started
+            continue
+        received += 1
+        if exc is not None:
+            error = error or exc
+        elif error is None:
+            results[i] = res
+            if on_done:
+                on_done(i, jobs[i], res)
+    for t in threads:
+        t.join()
+    if error is not None:
+        raise error
+    return results
+
+
+def clone_to(module: nn.Module, device) -> nn.Module:
+    """A deep copy of a module on another device (meant for small ones such as the VAE)."""
+    import copy
+
+    return copy.deepcopy(module).to(device)

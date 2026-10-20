@@ -145,6 +145,40 @@ GPU (full bf16 at high resolution becomes possible) but is not faster, since the
 auto-balanced by estimated cost (blocks before the first trained block are forward-only and cheap; every later
 block also runs backward), or set `split_plan: "cuda:0=0-25;cuda:1=26-41"` to give the faster card more.
 
+### Splitting side jobs across the GPUs (`parallel_jobs`, on by default)
+
+With either multi-GPU mode, the work around training is split across the GPUs too. Each GPU has its own worker
+that pulls the next job from a shared queue, so the faster card simply does more of them:
+
+- **Samples and probes**: every sample prompt and every probe render (face, body, each seed) is a job. Two probes
+  means one per GPU. In data parallel each GPU renders on its own training copy. In model split the training
+  model spans both GPUs, so images split only when a separate sampling model is set (it gets a copy per GPU).
+  Scoring stays on the main thread after the renders.
+- **Latent caching**: a VAE copy per GPU, each encoding its share of the images (and their flips).
+- **Text caching**: a second text encoder copy is loaded on the other GPU when the encoder sits wholly on one
+  GPU (a quantized Qwen3.5-9B, about 10 GB) and timing shows the copy saves more than it costs to load. A bf16
+  encoder (19 GB) is spread over both GPUs and stays a single copy.
+- **SAM 3 region masks** (`region_weights` with `mediapipe+sam3`): a SAM 3 copy per GPU, each kept resident for
+  the whole batch instead of moving to the GPU and back for every image.
+
+Face detection (InsightFace) and MediaPipe run on the CPU and are not split. With `compile_model`, the first
+sampling round of each image size runs one GPU after the other while the graphs compile; later rounds run in
+parallel. Turn the switch off ("Split samples, probes and caching across GPUs") to keep all side jobs on the
+primary GPU.
+
+Measured with data parallel on an RTX 5060 Ti + RTX 4060 Ti (8 images, 512 px, 8 sampling steps):
+
+| Side job | One GPU | Split across both |
+|---|---|---|
+| 2 samples | 28.6 s | 14.7 s |
+| Face + body probe (render and score) | 35.4 s | 17.7 s |
+| Latent cache, 8 images + flips | 5.6 s | 1.9 s |
+| SAM 3 region masks, 8 images | 16 s (was 28 s before SAM 3 stayed resident) | 9 s |
+
+Text caching is only split when it pays: the first few prompts are timed on the loaded encoder, and a second copy
+is loaded only if it saves more time than loading it takes (about 13 s for the int8 Qwen3.5-9B). Images rendered on
+different GPU models differ very slightly in their pixels (different kernels); the same seed gives the same picture.
+
 ## Model sources and quantization
 
 **Hugging Face / diffusers folder**: pick Base or SFT, or any local folder with `transformer/`, `text_encoder/`,

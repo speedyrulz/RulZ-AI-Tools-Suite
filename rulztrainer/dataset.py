@@ -219,28 +219,44 @@ def empty_text_path(cfg: TrainConfig) -> Path:
 # ---------------------------------------------------------------- caching
 
 
-def cache_latents(items: list[Item], cfg: TrainConfig, vae, progress=None) -> None:
-    from .moss.loading import encode_images
-
-    todo = [it for it in items if cfg.recache or not it.latent_path.exists()
+def latents_todo(items: list[Item], cfg: TrainConfig) -> list[Item]:
+    return [it for it in items if cfg.recache or not it.latent_path.exists()
             or (it.latent_flip_path and not it.latent_flip_path.exists())]
-    log.info("Caching latents: %d of %d images need encoding", len(todo), len(items))
-    for i, it in enumerate(todo):
+
+
+def cache_latents(items: list[Item], cfg: TrainConfig, vae, progress=None, vaes: list | None = None) -> None:
+    """Encode and save the latents still missing. `vaes` (one VAE per GPU) splits the images across GPUs."""
+    from .moss.loading import encode_images
+    from .multigpu import run_queue
+
+    todo = latents_todo(items, cfg)
+    workers = [(v, v.device) for v in (vaes or [vae])]
+    log.info("Caching latents: %d of %d images need encoding%s", len(todo), len(items),
+             f" (split across {', '.join(str(d) for _, d in workers)})" if len(workers) > 1 else "")
+
+    @torch.no_grad()
+    def encode(worker, it):
+        v = worker[0]
         img = load_image_fit(it.image, it.width, it.height, it.src_box)
         t = torch.from_numpy(np.asarray(img).copy()).permute(2, 0, 1).float() / 127.5 - 1.0
-        lat = encode_images(vae, t.unsqueeze(0))[0].cpu()
+        lat = encode_images(v, t.unsqueeze(0))[0].cpu()
         save_file({"latent": lat.contiguous()}, str(it.latent_path))
         if it.latent_flip_path:
-            lat_f = encode_images(vae, t.flip(-1).unsqueeze(0))[0].cpu()
+            lat_f = encode_images(v, t.flip(-1).unsqueeze(0))[0].cpu()
             save_file({"latent": lat_f.contiguous()}, str(it.latent_flip_path))
+
+    count = [0]
+
+    def done(i, it, _):
+        count[0] += 1
         if progress:
-            progress(i + 1, len(todo))
+            progress(count[0], len(todo))
+
+    run_queue(workers, todo, encode, on_done=done)
 
 
-def cache_text(items: list[Item], cfg: TrainConfig, text_encoder, tokenizer,
-               extra_prompts: list[str] | None = None, progress=None) -> None:
-    from .moss.loading import encode_prompt
-
+def text_jobs(items: list[Item], cfg: TrainConfig, extra_prompts: list[str] | None = None) -> tuple[dict, int]:
+    """(cache path -> text for every prompt still missing, total prompt count)."""
     jobs: dict[Path, str] = {}
     for it in items:
         jobs.setdefault(it.text_path, it.caption)
@@ -248,13 +264,42 @@ def cache_text(items: list[Item], cfg: TrainConfig, text_encoder, tokenizer,
     cache = cfg.resolved_cache_dir() / "text"
     for p in extra_prompts or []:
         jobs.setdefault(cache / f"{_hash(p)}_{cfg.max_token_length}.safetensors", p)
-    todo = {k: v for k, v in jobs.items() if cfg.recache or not k.exists()}
-    log.info("Caching text embeddings: %d of %d prompts need encoding", len(todo), len(jobs))
-    for i, (path, text) in enumerate(todo.items()):
-        emb = encode_prompt(text_encoder, tokenizer, text, cfg.max_token_length)
+    return {k: v for k, v in jobs.items() if cfg.recache or not k.exists()}, len(jobs)
+
+
+def cache_text(items: list[Item], cfg: TrainConfig, text_encoder, tokenizer,
+               extra_prompts: list[str] | None = None, progress=None, encoders: list | None = None,
+               max_prompts: int | None = None) -> None:
+    """Encode and save the missing prompt embeddings. `encoders` is a list of (text_encoder, tokenizer, device),
+    one per GPU, to split the prompts across GPUs (each needs its own tokenizer: fast tokenizers are not
+    thread-safe). `max_prompts` encodes only the first N missing prompts (a timing probe)."""
+    from .moss.loading import encode_prompt
+    from .multigpu import run_queue
+
+    todo, total = text_jobs(items, cfg, extra_prompts)
+    workers = encoders or [(text_encoder, tokenizer, "cpu")]
+    if max_prompts is not None:
+        log.info("Caching text embeddings: timing the first %d of %d missing prompts", min(max_prompts, len(todo)),
+                 len(todo))
+        todo = dict(list(todo.items())[:max_prompts])
+    else:
+        log.info("Caching text embeddings: %d of %d prompts need encoding%s", len(todo), total,
+                 f" (split across {', '.join(str(w[2]) for w in workers)})" if len(workers) > 1 else "")
+
+    @torch.no_grad()
+    def encode(worker, job):
+        path, text = job
+        emb = encode_prompt(worker[0], worker[1], text, cfg.max_token_length)
         save_file({"embeds": emb.contiguous()}, str(path), metadata={"prompt": text[:2000]})
+
+    count = [0]
+
+    def done(i, job, _):
+        count[0] += 1
         if progress:
-            progress(i + 1, len(todo))
+            progress(count[0], len(todo))
+
+    run_queue([(w, w[2]) for w in workers], list(todo.items()), lambda w, job: encode(w[0], job), on_done=done)
 
 
 def text_cache_path(cfg: TrainConfig, prompt: str) -> Path:

@@ -240,34 +240,53 @@ def uniform_region_map(bw: int, bh: int) -> RegionMap:
     return RegionMap(torch.ones(1, h, w), torch.zeros(1, h, w, dtype=torch.bool), None, None, False)
 
 
-def cache_region_maps(items, cfg, analysis: dict[str, dict], person_mask_fn=None, progress=None) -> dict[str, int]:
-    """Write <latent stem>_regions.safetensors for every item (skips existing unless cfg.recache). Returns counts."""
-    from .dataset import load_image_fit
+def cache_region_maps(items, cfg, analysis: dict[str, dict], person_mask_fn=None, progress=None,
+                      person_mask_fns: list | None = None) -> dict[str, int]:
+    """Write <latent stem>_regions.safetensors for every item (skips existing unless cfg.recache). Returns counts.
+
+    person_mask_fns: optional list of (fn, device), one per GPU, splitting the images across GPUs (each fn is
+    only ever called from its own thread)."""
+    from .multigpu import run_queue
 
     counts = {"face": 0, "person": 0, "none": 0}
     todo = [it for it in items if it.region_path is not None and (cfg.recache or not it.region_path.exists())]
-    for i, it in enumerate(todo):
-        rec = analysis.get(str(it.image.resolve()))
-        bbox_px = None
-        kps_px = None
-        if rec and rec.get("bbox"):
-            bbox_px = remap_bbox(rec["bbox"], rec["W"], rec["H"], it.width, it.height, it.src_box)
-            if rec.get("kps"):
-                kps_px = remap_points(rec["kps"], rec["W"], rec["H"], it.width, it.height, it.src_box)
-        mask = None
-        if person_mask_fn is not None:
-            try:
-                mask = person_mask_fn(load_image_fit(it.image, it.width, it.height, it.src_box))
-            except Exception as e:  # noqa: BLE001
-                log.warning("person mask failed for %s: %s", it.key, e)
-        rm = build_weight_map(it.width, it.height, bbox_px, mask, cfg.face_loss_weight, cfg.body_loss_weight,
-                              cfg.background_loss_weight, cfg.face_margin, cfg.region_feather_cells)
-        rm.kps = kps_px
-        save_region_map(it.region_path, rm)
-        counts["face" if rm.face_cells else ("person" if rm.has_person else "none")] += 1
+    workers = person_mask_fns or [(person_mask_fn, "cpu")]
+    if len(workers) > 1:
+        log.info("Region maps: %d images split across %s", len(todo), ", ".join(str(d) for _, d in workers))
+    done_n = [0]
+
+    def done(i, it, kind):
+        counts[kind] += 1
+        done_n[0] += 1
         if progress:
-            progress(i + 1, len(todo))
+            progress(done_n[0], len(todo))
+
+    run_queue(workers, todo, lambda w, it: _region_map_for(it, cfg, analysis, w[0]), on_done=done)
     return counts
+
+
+def _region_map_for(it, cfg, analysis: dict[str, dict], person_mask_fn) -> str:
+    """Build and save one item's region map; returns its kind (face | person | none)."""
+    from .dataset import load_image_fit
+
+    rec = analysis.get(str(it.image.resolve()))
+    bbox_px = None
+    kps_px = None
+    if rec and rec.get("bbox"):
+        bbox_px = remap_bbox(rec["bbox"], rec["W"], rec["H"], it.width, it.height, it.src_box)
+        if rec.get("kps"):
+            kps_px = remap_points(rec["kps"], rec["W"], rec["H"], it.width, it.height, it.src_box)
+    mask = None
+    if person_mask_fn is not None:
+        try:
+            mask = person_mask_fn(load_image_fit(it.image, it.width, it.height, it.src_box))
+        except Exception as e:  # noqa: BLE001
+            log.warning("person mask failed for %s: %s", it.key, e)
+    rm = build_weight_map(it.width, it.height, bbox_px, mask, cfg.face_loss_weight, cfg.body_loss_weight,
+                          cfg.background_loss_weight, cfg.face_margin, cfg.region_feather_cells)
+    rm.kps = kps_px
+    save_region_map(it.region_path, rm)
+    return "face" if rm.face_cells else ("person" if rm.has_person else "none")
 
 
 def render_overlay(img, rm: RegionMap, bw: int, bh: int):
