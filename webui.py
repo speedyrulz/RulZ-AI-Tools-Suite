@@ -24,6 +24,12 @@ ROOT = Path(__file__).resolve().parent
 os.chdir(ROOT)
 CUSTOM = "Custom path / repo id"
 TARGETS = ["q", "k", "v", "o", "ffn_up_gate", "ffn_down"]
+FIBO_TARGETS = ["cross_attn", "adaln", "refiner", "perceiver", "embed"]  # FIBO 2.0 only (see rulztrainer.archs)
+N_BLOCKS_MAX = 44  # MOSS-Image has 42 blocks, FIBO 2.0 has 44
+
+
+def is_fibo_preset(preset: str, model_path: str = "") -> bool:
+    return "FIBO" in (preset or "") or (preset == CUSTOM and "fibo" in (model_path or "").lower())
 QUANTS = ["auto", "none", "int8", "int8_convrot", "nvfp4"]
 MP_OPTIONS = {mp: f"{mp:g} MP ({mp_to_side(mp)}^2)" for mp in MEGAPIXEL_CHOICES}
 SAFETENSORS = [("safetensors", "*.safetensors"), ("all files", "*.*")]
@@ -443,7 +449,8 @@ class Form:
             trigger_word=s("trigger_word"), caption_dropout=float(v("caption_dropout")),
             max_token_length=int(v("max_token_length")), recache=bool(v("recache")),
             lora_rank=int(v("lora_rank")), lora_alpha=float(v("lora_alpha")),
-            lora_targets=[t for t in TARGETS if self.w[f"target_{t}"].value],
+            lora_targets=[t for t in TARGETS + FIBO_TARGETS if self.w.get(f"target_{t}") is not None
+                          and self.w[f"target_{t}"].value],
             train_text_embedder=bool(v("train_text_embedder")), resume_from=s("resume_from"),
             lora_blocks=s("lora_blocks"),
             lora_save_dtype=v("lora_save_dtype"), save_state=bool(v("save_state")), resume_state=s("resume_state"),
@@ -506,7 +513,7 @@ class Form:
                   "face_refs": "\n".join(cfg.face_refs), "body_refs": "\n".join(cfg.body_refs),
                   "model_source": "Single safetensors files (ComfyUI)" if cfg.model_source == "files"
                   else "Hugging Face repo / diffusers folder"}
-        for t in TARGETS:
+        for t in TARGETS + FIBO_TARGETS:
             values[f"target_{t}"] = t in cfg.lora_targets
         if not cfg.resolutions:  # legacy single `resolution`: snap to the nearest megapixel choice
             values["resolutions"] = [min(MEGAPIXEL_CHOICES, key=lambda m: abs(m - side_to_mp(cfg.resolution)))]
@@ -778,7 +785,8 @@ def build_page():
     ui.page_title("RulzTrainer")
     with ui.header().classes("items-center"):
         ui.label("RulzTrainer").classes("text-xl font-bold")
-        ui.label("LoRA trainer for MOSS-Image (Base / SFT). Output LoRAs load directly in ComfyUI.").classes("text-sm")
+        ui.label("LoRA trainer for MOSS-Image (Base / SFT) and Bria FIBO 2.0. MOSS LoRAs load directly in ComfyUI; "
+                 "FIBO LoRAs load in diffusers' BriaFibo2Pipeline (dev and Edit Turbo).").classes("text-sm")
 
     with ui.tabs().classes("w-full") as tabs:
         tab_train = ui.tab("Train")
@@ -982,7 +990,17 @@ def build_page():
                         ui.label("Targets:").classes("text-sm")
                         for t in TARGETS:
                             w[f"target_{t}"] = ui.checkbox(t, value=t in d.lora_targets)
-                    w["train_text_embedder"] = ui.checkbox("Also train DiT text projection blocks", value=False)
+                        for t in FIBO_TARGETS:
+                            w[f"target_{t}"] = ui.checkbox(t, value=t in d.lora_targets) \
+                                .bind_visibility_from(w["model_preset"], "value",
+                                                      lambda p: is_fibo_preset(p, w["model_path"].value)) \
+                                .tooltip({"cross_attn": "text cross-attention in the 5 injection blocks",
+                                          "adaln": "per-block modulation Linear", "refiner": "the 2 noise-refiner blocks",
+                                          "perceiver": "the gist-token resampler",
+                                          "embed": "patch / timestep embedders and the final layer"}[t])
+                    w["train_text_embedder"] = ui.checkbox("Also train DiT text projection blocks", value=False) \
+                        .bind_visibility_from(w["model_preset"], "value",
+                                              lambda p: not is_fibo_preset(p, w["model_path"].value))
                     w["lora_save_dtype"] = ui.select(["bf16", "fp16", "fp32"], value=d.lora_save_dtype,
                                                      label="Save LoRA as").classes("w-32")
                     w["lora_plus_ratio"] = ui.number("LoRA+ ratio (0 = off, 16 = paper)", value=d.lora_plus_ratio,
@@ -993,23 +1011,27 @@ def build_page():
                                                 value=d.lora_blocks).classes("w-[32rem]")
                     ui.label("Training only later blocks also skips the backward pass through earlier ones.").classes("text-xs")
                 block_boxes: list = []
-                N_BLOCKS = 42
+
+                def n_blocks() -> int:
+                    return 44 if is_fibo_preset(w["model_preset"].value, w["model_path"].value) else 42
 
                 def blocks_from_text():
                     from rulztrainer.lora import parse_blocks
+                    n = n_blocks()
                     try:
-                        bl = parse_blocks(w["lora_blocks"].value or "", N_BLOCKS)
+                        bl = parse_blocks(w["lora_blocks"].value or "", n)
                     except ValueError:
                         return
-                    sel = set(range(N_BLOCKS)) if bl is None else set(bl)
+                    sel = set(range(n)) if bl is None else set(bl)
                     for i, cb in enumerate(block_boxes):
                         if cb.value != (i in sel):
                             cb.value = i in sel
 
                 def text_from_blocks():
                     from rulztrainer.lora import format_blocks
-                    sel = [i for i, cb in enumerate(block_boxes) if cb.value]
-                    txt = "" if len(sel) == N_BLOCKS else format_blocks(sel)
+                    n = n_blocks()
+                    sel = [i for i, cb in enumerate(block_boxes) if cb.value and i < n]
+                    txt = "" if len(sel) == n else format_blocks(sel)
                     if (w["lora_blocks"].value or "") != txt:
                         w["lora_blocks"].value = txt
 
@@ -1018,19 +1040,26 @@ def build_page():
                         cb.value = i in sel
                     text_from_blocks()
 
+                block_presets = (("All", lambda n: set(range(n))), ("None", lambda n: set()),
+                                 ("First half", lambda n: set(range(0, n // 2))),
+                                 ("Second half", lambda n: set(range(n // 2, n))),
+                                 ("Middle", lambda n: set(range(n // 4, n - n // 4))),
+                                 ("Even", lambda n: set(range(0, n, 2))), ("Odd", lambda n: set(range(1, n, 2))))
                 with ui.row().classes("w-full items-center gap-1"):
                     ui.label("Presets:").classes("text-xs")
-                    for label, sel in (("All", set(range(N_BLOCKS))), ("None", set()),
-                                       ("First half 0-20", set(range(0, 21))), ("Second half 21-41", set(range(21, 42))),
-                                       ("Middle 10-31", set(range(10, 32))), ("Even", set(range(0, N_BLOCKS, 2))),
-                                       ("Odd", set(range(1, N_BLOCKS, 2)))):
-                        ui.button(label, on_click=lambda _, s_=sel: set_blocks(s_)).props("dense flat size=sm")
-                    ui.button("Invert", on_click=lambda: set_blocks({i for i, cb in enumerate(block_boxes) if not cb.value})) \
+                    for label, fn in block_presets:
+                        ui.button(label, on_click=lambda _, f_=fn: set_blocks(f_(n_blocks()))).props("dense flat size=sm")
+                    ui.button("Invert", on_click=lambda: set_blocks({i for i, cb in enumerate(block_boxes)
+                                                                     if not cb.value and i < n_blocks()})) \
                         .props("dense flat size=sm")
                 with ui.grid(columns=14).classes("w-full gap-0"):
-                    for i in range(N_BLOCKS):
-                        block_boxes.append(ui.checkbox(str(i), value=True, on_change=lambda e: text_from_blocks())
-                                           .props("dense size=xs").classes("text-xs"))
+                    for i in range(N_BLOCKS_MAX):
+                        cb = ui.checkbox(str(i), value=True, on_change=lambda e: text_from_blocks()) \
+                            .props("dense size=xs").classes("text-xs")
+                        if i >= 42:  # FIBO 2.0's extra blocks
+                            cb.bind_visibility_from(w["model_preset"], "value",
+                                                    lambda p: is_fibo_preset(p, w["model_path"].value))
+                        block_boxes.append(cb)
                 w["lora_blocks"].on_value_change(lambda e: blocks_from_text())
                 path_input(f, "resume_from", "Resume from LoRA weights (.safetensors, optional)", "file", "", "w-[40rem]")
                 with ui.row().classes("w-full items-end"):
@@ -1067,10 +1096,12 @@ def build_page():
                 with ui.row().classes("w-full items-end"):
                     w["warmup_steps"] = ui.number("Warmup steps", value=d.warmup_steps, precision=0).classes("w-32")
                     w["max_grad_norm"] = ui.number("Max grad norm (0 = off)", value=d.max_grad_norm).classes("w-40")
-                    w["timestep_sampling"] = ui.select(["logit_normal", "sigmoid", "uniform", "identity", "content", "style"],
+                    w["timestep_sampling"] = ui.select(["logit_normal", "sigmoid", "uniform", "identity", "content", "style",
+                                                        "reference"],
                                                        value=d.timestep_sampling, label="Timestep sampling").classes("w-40") \
                         .tooltip("identity: logit-normal mean -0.5 (detail/low noise). content: sigma = u^p toward low "
-                                 "noise (ai-toolkit style). style: mirror toward high noise.")
+                                 "noise (ai-toolkit style). style: mirror toward high noise. reference: the model "
+                                 "family's own training recipe (Bria's for FIBO 2.0, the MOSS-Image report's for MOSS).")
                     w["content_power"] = ui.number("Content power", value=d.content_power, step=0.5).classes("w-32") \
                         .bind_visibility_from(w["timestep_sampling"], "value", lambda x: x in ("content", "style"))
                     w["sigma_min"] = ui.number("Sigma min", value=d.sigma_min, min=0, max=1, step=0.05).classes("w-28")
@@ -1104,6 +1135,11 @@ def build_page():
                     w["sample_shift"] = ui.number("Sample shift", value=d.sample_shift).classes("w-32")
                 w["sample_negative"] = ui.input("Sample negative prompt (optional)", value=d.sample_negative) \
                     .classes("w-full")
+                ui.label("FIBO 2.0: Bria samples the dev model at 50 steps / CFG 5 (20-30 steps is fine for previews); "
+                         "an empty negative prompt means the null caption it was trained with; sample shift and the "
+                         "skip layer are MOSS-only. Prompts can be plain sentences or VGL JSON captions.") \
+                    .classes("text-xs").bind_visibility_from(w["model_preset"], "value",
+                                                             lambda p: is_fibo_preset(p, w["model_path"].value))
                 with ui.row().classes("w-full items-end"):
                     path_input(f, "sample_model_path", "Sampling model (optional; .safetensors, diffusers folder or repo id)",
                                "file", "", "w-[36rem]")
@@ -1706,6 +1742,23 @@ targets; small batches with more steps beat large batches.
 ## Using in ComfyUI
 ComfyUI supports MOSS-Image natively. Copy the `.safetensors` to `ComfyUI/models/loras/` and use the standard
 **Load LoRA** node after *Load Diffusion Model*.
+
+## FIBO 2.0 (Bria)
+
+Pick **FIBO-2.0-dev** as the model (the gated `briaai/Fibo-2.0-dev` repo: accept its terms on Hugging Face and log
+in with `hf auth login` first). Train on **dev**, the full non-distilled base; **Edit Turbo** shares its architecture,
+so the LoRA loads onto it too. Captions can be plain `.txt` sentences or structured VGL `.json` captions (a `.json`
+next to the image wins). The 8B transformer is quantized to int8 (W8A8) automatically on 16 GB cards; the Qwen3-VL
+text encoder (8.9 GB) fits one card for caching and is unloaded afterwards.
+
+FIBO LoRAs are saved in the diffusers / PEFT format (ComfyUI has no FIBO support yet):
+
+```python
+from diffusers import BriaFibo2Pipeline  # diffusers main (PR #14991)
+pipe = BriaFibo2Pipeline.from_pretrained("briaai/Fibo-2.0-edit-turbo", dtype=torch.bfloat16).to("cuda")
+pipe.transformer.load_lora_adapter("output/<job>", weight_name="<job>.safetensors")
+edited = pipe(prompt=vgl(scene), image=source, num_inference_steps=4, guidance_scale=1.0).images[0]
+```
 """
 
 

@@ -450,6 +450,72 @@ only while generating sample images, never during training steps. Set `sample_st
 The WebUI's Dataset tab lets you upload images and `.txt` captions into a folder, shows them in a grid, and
 writes caption edits back to the `.txt` files as you type.
 
+## FIBO 2.0 (Bria): training on dev, using the LoRA on Edit Turbo
+
+RulzTrainer also trains LoRAs for [briaai/Fibo-2.0-dev](https://huggingface.co/briaai/Fibo-2.0-dev), Bria's 8B
+single-stream DiT (44 blocks, Qwen3-VL-4B text encoder, the same Flux2 VAE as MOSS-Image). Pick **FIBO-2.0-dev** as
+the model, or any diffusers folder / repo id whose transformer is a `BriaFibo2Transformer2DModel` (the architecture is
+detected from the model; `model_arch: auto`). The repo is gated: accept its terms on Hugging Face and `hf auth login`.
+
+- **Train on dev, use on Edit Turbo.** [Fibo-2.0-edit-turbo](https://huggingface.co/briaai/Fibo-2.0-edit-turbo) is
+  distilled from dev with a byte-identical transformer config, so a LoRA trained on dev loads onto it unchanged. Bria
+  says Turbo itself is not meant for fine-tuning.
+- **Captions** are plain `.txt` sentences or structured VGL `.json` captions next to each image (the `.json` wins). A
+  JSON caption is cleaned the way the model was trained (empty values and score keys dropped, compact form), and the
+  trigger word goes into its `short_description`. Caption dropout trains on FIBO's null caption.
+- **Memory.** The bf16 transformer is 16 GB, so `transformer_quant: auto` quantizes it to int8 (W8A8) on GPUs under
+  22 GB; set `none` for bf16 on a larger card. The text encoder (8.9 GB bf16) is loaded for caching only and unloaded
+  afterwards (`text_encoder_quant: int8` halves it). Measured on a 16 GB RTX 4060 Ti with int8 + W8A8, rank 16 on
+  the six block groups, gradient checkpointing, batch 1:
+
+  | Resolution | Peak training memory | Step |
+  |---|---|---|
+  | 512 px | 8.9 GB | 2.6 s |
+  | 768 px | 9.7 GB | 5.7 s |
+  | 1024 px (1 MP) | 11.0 GB | 10.9 s |
+
+  Loading and quantizing the transformer takes about 30 s; a 512 px preview of 12 steps with CFG takes about 10 s.
+- **LoRA targets.** The six usual groups map onto FIBO's `to_q/k/v`, `to_out`, `w1/w3` and `w2`; FIBO adds
+  `cross_attn` (the five text-injection blocks), `adaln`, `refiner`, `perceiver` and `embed`. Bria's own trainer adapts
+  every Linear layer (all of these); the default here is the six block groups.
+- **Timesteps.** `timestep_sampling: reference` uses Bria's recipe (sigma ~ sigmoid(N(shift, 1)) with the shift set by
+  the image size, 10% uniform); the other modes work as for MOSS. Previews use the pipeline's schedule (size-shifted
+  sigmas, CFG as a second pass with the null caption); Bria samples dev at 50 steps / CFG 5, 20-30 steps is fine for
+  previews. The MOSS-only sample shift and skip layer are ignored.
+- **Output format.** FIBO LoRAs are saved in the diffusers / PEFT format (`transformer.<module>.lora_A/B.weight` plus
+  the adapter config in the file metadata), since ComfyUI has no FIBO 2.0 support yet:
+
+  ```python
+  import torch
+  from diffusers import BriaFibo2Pipeline  # diffusers main (PR #14991)
+  pipe = BriaFibo2Pipeline.from_pretrained("briaai/Fibo-2.0-edit-turbo", dtype=torch.bfloat16).to("cuda")
+  pipe.transformer.load_lora_adapter("output/<job>", weight_name="<job>.safetensors")  # the pipeline has no load_lora_weights
+  edited = pipe(prompt=vgl(scene), image=source, num_inference_steps=4, guidance_scale=1.0).images[0]
+  ```
+
+- **Not yet:** edit-pair training (source + target + instruction), the `text_render` text images, single-file
+  (ComfyUI) checkpoints, and a separate turbo LoRA for previews (Bria ships none; use fewer steps instead).
+
+**Loading the LoRA in diffusers.** `BriaFibo2Pipeline` has no `load_lora_weights`; load through the transformer as
+above. On a 16 GB card the bf16 transformer needs offloading (`pipe.enable_sequential_cpu_offload()`): load the LoRA
+*before* enabling it. Loaded afterwards, the adapter weights miss the offload hooks and the output is noise or black
+(diffusers' pipeline-level loader works around this; the transformer-level one does not).
+
+**Verified** (12 photos of one person, 512 px, rank 16, lr 2e-4, `reference` timesteps, int8, one RTX 4060 Ti):
+
+| | Face likeness (ArcFace vs 3 reference photos) |
+|---|---|
+| Probes during training, steps 0 / 50 / 100 / 150 / 200 / 250 | 13.5 / 36 / 46 / 58 / 58 / 61 % |
+| diffusers `BriaFibo2Pipeline` on **dev**, text-to-image, base vs LoRA | 15 % vs **65 %** |
+| diffusers on **Edit Turbo**, re-pose edit of another person's photo, base vs LoRA | 12 % vs 22 % |
+| diffusers on **Edit Turbo**, "make the person smile" edit, base vs LoRA | 9 % vs 14 % |
+
+The LoRA file loads into diffusers' transformer without warnings, and with the same LoRA the diffusers model and
+RulzTrainer's produce bit-identical outputs. Note what an edit does, though: Edit Turbo conditions on the source
+image, so a text-to-image LoRA shifts an edit toward the trained identity only partly; it does not replace the face
+in a photo of someone else. Replacing identities in edits needs edit-pair training (not supported yet). Generation
+with the LoRA (dev, or Turbo given no source image) carries the full identity.
+
 ## Using the LoRA in ComfyUI
 
 Recent ComfyUI builds support MOSS-Image natively (`comfy/ldm/moss_image`, CLIP type `moss_image`), so no
@@ -505,5 +571,8 @@ Dockerfile         optional vast.ai image with the install baked in
 
 ## Adding another model
 
-The trainer is split so another architecture only needs a `models/<arch>/` package providing: a transformer
-module whose Linear layer names match the ComfyUI model keys, `encode_images`, `encode_prompt`, and a sampler.
+Model families are `Arch` classes in `rulztrainer/archs.py` (MOSS-Image and FIBO 2.0 today). An Arch provides the
+loading functions (transformer, VAE, text encoder), `encode_prompt` / `pad_embeds`, a sampler, the LoRA module names
+for the target groups, the export format, and its reference timestep recipe. The transformer must take the trainer's
+convention, `model(latents128, sigma * 1000, embeds, mask)` with the normalized 2x2-patchified Flux2 latents, and
+expose `.layers` (the blocks) for block selection, compile and the model split; `rulztrainer/fibo/` is the template.

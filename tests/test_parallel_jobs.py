@@ -228,6 +228,9 @@ def test_text_encoder_copy_only_when_it_pays(monkeypatch):
 
     t = T.Trainer.__new__(T.Trainer)
     t.cfg, t.model_dir = TrainConfig(), None
+    from rulztrainer.archs import get_arch
+
+    t.arch = get_arch(t.cfg)  # set by Trainer.__init__, which this test skips
 
     class St:
         def update(self, **kw):

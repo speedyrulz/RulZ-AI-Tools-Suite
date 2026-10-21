@@ -11,7 +11,10 @@ import yaml
 MODEL_PRESETS = {
     "MOSS-Image-Base": "OpenMOSS-Team/MOSS-Image-Base",
     "MOSS-Image-SFT": "OpenMOSS-Team/MOSS-Image-SFT",
+    "FIBO-2.0-dev": "briaai/Fibo-2.0-dev",
+    "FIBO-2.0-edit-turbo": "briaai/Fibo-2.0-edit-turbo",
 }
+ARCH_NAMES = ("moss_image", "fibo2")
 
 
 # Named presets: values applied over a config (UI toggle, --preset on the CLI, or `preset:` in YAML).
@@ -74,7 +77,7 @@ class TrainConfig:
     seed: int = 42
 
     # --- model ---
-    model_arch: str = "moss_image"
+    model_arch: str = "auto"  # auto | moss_image | fibo2 (auto: the model's transformer config, or the path)
     model_source: str = "hf"  # hf: repo id / diffusers dir | files: single ComfyUI-style safetensors files
     model_path: str = "OpenMOSS-Team/MOSS-Image-Base"  # HF repo id or local dir with transformer/ text_encoder/ vae/
     models_dir: str = "models"  # where HF repos are downloaded
@@ -240,7 +243,16 @@ class TrainConfig:
         sides = sorted({mp_to_side(mp) for mp in self.resolutions})
         return sides
 
+    def arch_name(self) -> str:
+        """The architecture this config trains: model_arch when set, else guessed from the model path or files."""
+        if self.model_arch and self.model_arch != "auto":
+            return self.model_arch
+        hint = " ".join([self.model_path or "", self.transformer_file or ""]).lower()
+        return "fibo2" if "fibo" in hint else "moss_image"
+
     def validate(self) -> None:
+        if self.model_arch not in ("auto", *ARCH_NAMES):
+            raise ValueError(f"model_arch must be auto or one of {ARCH_NAMES}, got {self.model_arch!r}")
         for mp in self.resolutions:
             if not (0.0 < float(mp) <= 16.0):
                 raise ValueError(f"resolutions must be megapixel values in (0, 16], got {mp!r}")

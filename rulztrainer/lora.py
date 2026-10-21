@@ -1,14 +1,18 @@
-"""Minimal LoRA for Linear layers with ComfyUI-compatible export, plus "extra" LoRAs (e.g. turbo /
+"""Minimal LoRA for Linear layers with ComfyUI- or diffusers-compatible export, plus "extra" LoRAs (e.g. turbo /
 step-distill adapters) that are applied only while sampling.
 
-Export key format (accepted by ComfyUI's LoRA loader for any model whose state-dict keys are
-"diffusion_model.<module>.weight"):
+Export key formats (Arch.lora_format):
 
+  comfy  accepted by ComfyUI's LoRA loader for any model whose state-dict keys are "diffusion_model.<module>.weight"
     diffusion_model.<module>.lora_down.weight   [rank, in]
     diffusion_model.<module>.lora_up.weight     [out, rank]
     diffusion_model.<module>.alpha              scalar
+  peft   diffusers / PEFT (pipe.load_lora_weights, transformer.load_lora_adapter); FIBO 2.0 uses it
+    transformer.<module>.lora_A.weight          [rank, in]
+    transformer.<module>.lora_B.weight          [out, rank]
+    + "lora_adapter_metadata" (the PEFT LoraConfig, prefixed "transformer.") in the file metadata
 
-Effective delta = (alpha / rank) * up @ down.
+Effective delta = (alpha / rank) * up @ down in both.
 """
 from __future__ import annotations
 
@@ -17,10 +21,57 @@ import math
 from typing import Iterable
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from torch import nn
 
 COMFY_PREFIX = "diffusion_model."
+PEFT_PREFIX = "transformer."
+LORA_FORMATS = ("comfy", "peft")
+# peft 0.21 LoraConfig fields: diffusers rebuilds the adapter config from the file metadata with LoraConfig(**these)
+PEFT_CONFIG_TEMPLATE = {
+    "alora_invocation_tokens": None,
+    "alpha_pattern": {},
+    "arrow_config": None,
+    "auto_mapping": None,
+    "base_model_name_or_path": None,
+    "bias": "none",
+    "corda_config": None,
+    "ensure_weight_tying": False,
+    "eva_config": None,
+    "exclude_modules": None,
+    "fan_in_fan_out": False,
+    "inference_mode": False,
+    "init_lora_weights": True,
+    "kasa_config": None,
+    "layer_replication": None,
+    "layers_pattern": None,
+    "layers_to_transform": None,
+    "loftq_config": {},
+    "lora_alpha": 16,
+    "lora_bias": False,
+    "lora_dropout": 0.0,
+    "lora_ga_config": None,
+    "megatron_config": None,
+    "megatron_core": "megatron.core",
+    "modules_to_save": None,
+    "monteclora_config": None,
+    "peft_type": "LORA",
+    "peft_version": "0.21.2",
+    "qalora_group_size": 16,
+    "r": 16,
+    "rank_pattern": {},
+    "revision": None,
+    "target_modules": [],
+    "target_parameters": None,
+    "task_type": None,
+    "trainable_token_indices": None,
+    "use_bdlora": None,
+    "use_dora": False,
+    "use_qalora": False,
+    "use_rslora": False,
+    "velora_config": None
+}
 SAVE_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 
 
@@ -140,12 +191,23 @@ def _is_linear_like(m: nn.Module) -> bool:
 
 def inject_lora(model: nn.Module, rank: int, alpha: float, targets: Iterable[str],
                 include_text_embedder: bool = False, dropout: float = 0.0,
-                blocks: Iterable[int] | None = None) -> dict[str, LoRALinear]:
+                blocks: Iterable[int] | None = None, names: Iterable[str] | None = None) -> dict[str, LoRALinear]:
     """Replace matching Linear modules in-place with trainable LoRA wrappers. Returns {name: LoRALinear}.
 
-    blocks: DiT block indices to train (None = all). Blocks outside the set get no LoRA; autograd then skips the
-    backward pass through every block before the first trained one, which also speeds training up.
+    names: the exact module names to wrap (Arch.lora_module_names); without it the MOSS-Image layout rules below
+    apply. blocks: DiT block indices to train (None = all). Blocks outside the set get no LoRA; autograd then skips
+    the backward pass through every block before the first trained one, which also speeds training up.
     """
+    if names is not None:
+        wanted = set(names)
+        injected = {}
+        for name, module in list(model.named_modules()):
+            if name in wanted and _is_linear_like(module):
+                injected[name] = _wrap(model, name, rank, alpha, dropout, trainable=True)
+        missing = wanted - set(injected)
+        if missing:
+            raise ValueError(f"LoRA targets not found in the model: {sorted(missing)[:5]}")
+        return injected
     targets = set(targets)
     block_set = None if blocks is None else set(int(b) for b in blocks)
     text_targets = {"qkv", "proj", "ffn_gate", "ffn_up", "ffn_down"}
@@ -188,32 +250,72 @@ def set_multiplier(injected: dict[str, LoRALinear], value: float) -> None:
         m.multiplier = value
 
 
-def export_state_dict(injected: dict[str, LoRALinear], dtype=torch.bfloat16) -> dict[str, torch.Tensor]:
+def export_state_dict(injected: dict[str, LoRALinear], dtype=torch.bfloat16, fmt: str = "comfy") -> dict[str, torch.Tensor]:
+    if fmt not in LORA_FORMATS:
+        raise ValueError(f"LoRA format must be one of {LORA_FORMATS}, got {fmt!r}")
     out = {}
     for name, m in injected.items():
-        key = COMFY_PREFIX + name
-        out[f"{key}.lora_down.weight"] = m.lora_down.weight.detach().to("cpu", dtype).contiguous()
-        out[f"{key}.lora_up.weight"] = m.lora_up.weight.detach().to("cpu", dtype).contiguous()
-        out[f"{key}.alpha"] = torch.tensor(float(m.alpha), dtype=torch.float32)
+        down = m.lora_down.weight.detach().to("cpu", dtype).contiguous()
+        up = m.lora_up.weight.detach().to("cpu", dtype).contiguous()
+        if fmt == "peft":
+            out[f"{PEFT_PREFIX}{name}.lora_A.weight"] = down
+            out[f"{PEFT_PREFIX}{name}.lora_B.weight"] = up
+        else:
+            key = COMFY_PREFIX + name
+            out[f"{key}.lora_down.weight"] = down
+            out[f"{key}.lora_up.weight"] = up
+            out[f"{key}.alpha"] = torch.tensor(float(m.alpha), dtype=torch.float32)
     return out
 
 
-def save_lora(injected: dict[str, LoRALinear], path, metadata: dict | None = None, dtype=torch.bfloat16) -> None:
+def peft_adapter_metadata(injected: dict[str, LoRALinear]) -> dict:
+    """The PEFT LoraConfig for these modules, keys prefixed "transformer." as diffusers' loader expects."""
+    cfg = dict(PEFT_CONFIG_TEMPLATE)
+    ranks = {m.rank for m in injected.values()}
+    alphas = {float(m.alpha) for m in injected.values()}
+    cfg["r"] = max(ranks)
+    cfg["lora_alpha"] = max(alphas)
+    cfg["target_modules"] = sorted(injected)
+    cfg["rank_pattern"] = {n: m.rank for n, m in injected.items() if m.rank != cfg["r"]}
+    cfg["alpha_pattern"] = {n: float(m.alpha) for n, m in injected.items() if float(m.alpha) != cfg["lora_alpha"]}
+    return {f"{PEFT_PREFIX}{k}": v for k, v in cfg.items()}
+
+
+def save_lora(injected: dict[str, LoRALinear], path, metadata: dict | None = None, dtype=torch.bfloat16,
+              fmt: str = "comfy") -> None:
     if isinstance(dtype, str):
         dtype = SAVE_DTYPES[dtype]
     meta = {"format": "pt", "rulztrainer_version": "0.1.0"}
+    if fmt == "peft":
+        meta["lora_adapter_metadata"] = json.dumps(peft_adapter_metadata(injected), indent=2, sort_keys=True)
     if metadata:
         meta.update({k: (v if isinstance(v, str) else json.dumps(v)) for k, v in metadata.items()})
-    save_file(export_state_dict(injected, dtype), str(path), metadata=meta)
+    save_file(export_state_dict(injected, dtype, fmt), str(path), metadata=meta)
+
+
+def read_peft_metadata(path) -> dict:
+    """The PEFT LoraConfig stored in a diffusers-format LoRA file (prefixes stripped), or {}."""
+    with safe_open(str(path), "pt") as f:
+        meta = f.metadata() or {}
+    raw = meta.get("lora_adapter_metadata")
+    if not raw:
+        return {}
+    return {k.removeprefix(PEFT_PREFIX): v for k, v in json.loads(raw).items()}
 
 
 def load_lora_weights(injected: dict[str, LoRALinear], path) -> int:
-    """Load a previously exported LoRA into injected modules. Returns number of modules loaded."""
+    """Load a previously exported LoRA (either format) into injected modules. Returns number of modules loaded."""
     state = load_file(str(path))
+    peft = any(k.endswith(".lora_A.weight") for k in state)
+    peft_meta = read_peft_metadata(path) if peft else {}
     loaded = 0
     for name, m in injected.items():
-        key = COMFY_PREFIX + name
-        down, up = state.get(f"{key}.lora_down.weight"), state.get(f"{key}.lora_up.weight")
+        if peft:
+            key = PEFT_PREFIX + name
+            down, up = state.get(f"{key}.lora_A.weight"), state.get(f"{key}.lora_B.weight")
+        else:
+            key = COMFY_PREFIX + name
+            down, up = state.get(f"{key}.lora_down.weight"), state.get(f"{key}.lora_up.weight")
         if down is None or up is None:
             continue
         if down.shape != m.lora_down.weight.shape or up.shape != m.lora_up.weight.shape:
@@ -221,7 +323,10 @@ def load_lora_weights(injected: dict[str, LoRALinear], path) -> int:
         with torch.no_grad():
             m.lora_down.weight.copy_(down.float())
             m.lora_up.weight.copy_(up.float())
-        alpha = state.get(f"{key}.alpha")
+        if peft:
+            alpha = (peft_meta.get("alpha_pattern") or {}).get(name, peft_meta.get("lora_alpha"))
+        else:
+            alpha = state.get(f"{key}.alpha")
         if alpha is not None:
             m.alpha = float(alpha)
             m.scale = m.alpha / m.rank
@@ -232,8 +337,10 @@ def load_lora_weights(injected: dict[str, LoRALinear], path) -> int:
 # ---------------------------------------------------------------- extra (sampling-only) LoRAs
 
 
-def parse_comfy_lora(state: dict[str, torch.Tensor]) -> dict[str, tuple[torch.Tensor, torch.Tensor, float]]:
-    """Return {module_name: (down, up, scale)} from a ComfyUI/PEFT-style LoRA file. Fused qkv is split."""
+def parse_comfy_lora(state: dict[str, torch.Tensor],
+                     default_alpha: float | None = None) -> dict[str, tuple[torch.Tensor, torch.Tensor, float]]:
+    """Return {module_name: (down, up, scale)} from a ComfyUI/PEFT-style LoRA file. Fused qkv is split.
+    default_alpha: the alpha for entries without an .alpha tensor (PEFT files keep it in their metadata)."""
     out: dict[str, tuple[torch.Tensor, torch.Tensor, float]] = {}
     stems = set()
     for k in state:
@@ -247,7 +354,8 @@ def parse_comfy_lora(state: dict[str, torch.Tensor]) -> dict[str, tuple[torch.Te
             continue
         rank = down.shape[0]
         alpha = state.get(f"{stem}.alpha")
-        scale = (float(alpha) / rank) if alpha is not None else 1.0
+        alpha = float(alpha) if alpha is not None else default_alpha
+        scale = (alpha / rank) if alpha is not None else 1.0
         name = stem
         for p in ("diffusion_model.", "transformer.", "lora_unet_"):
             if name.startswith(p):
@@ -265,7 +373,8 @@ def parse_comfy_lora(state: dict[str, torch.Tensor]) -> dict[str, tuple[torch.Te
 
 def attach_extra_lora(model: nn.Module, path: str, strength: float = 1.0) -> int:
     """Attach a sampling-only LoRA (e.g. a turbo/step-distill LoRA) to the model. Returns modules matched."""
-    entries = parse_comfy_lora(load_file(str(path)))
+    peft_meta = read_peft_metadata(path)
+    entries = parse_comfy_lora(load_file(str(path)), default_alpha=peft_meta.get("lora_alpha"))
     matched = 0
     names = {n for n, _ in model.named_modules()}
     for name, (down, up, scale) in entries.items():

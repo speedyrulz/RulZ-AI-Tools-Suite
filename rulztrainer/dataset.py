@@ -13,6 +13,9 @@ import torch
 from PIL import Image, ImageOps
 from safetensors.torch import load_file, save_file
 
+from .archs import get_arch
+from .archs import get_arch
+from .archs import get_arch
 from .config import TrainConfig
 
 log = logging.getLogger("rulztrainer")
@@ -92,11 +95,14 @@ def load_image_fit(path: Path, w: int, h: int, src_box=None) -> Image.Image:
 
 
 def read_caption(image: Path, cfg: TrainConfig) -> str:
-    cap = image.with_suffix(cfg.caption_ext)
+    """The image's caption: the architecture picks the file (FIBO 2.0 prefers a structured <name>.json caption), cleans
+    a JSON caption the way the model was trained, and puts the trigger word where it belongs."""
+    arch = get_arch(cfg)
+    cap = arch.caption_file(image, cfg)
     text = cap.read_text(encoding="utf-8").strip() if cap.is_file() else ""
-    if cfg.trigger_word:
-        text = f"{cfg.trigger_word}, {text}" if text else cfg.trigger_word
-    return text
+    if cap.suffix.lower() == ".json" and text:
+        text = arch.clean_prompt(text)
+    return arch.add_trigger(text, cfg.trigger_word)
 
 
 def _hash(s: str) -> str:
@@ -133,7 +139,7 @@ def scan_dataset(cfg: TrainConfig) -> list[Item]:
                 image=p, caption=caption, width=bw, height=bh,
                 latent_path=cache / "latents" / f"{stem}.safetensors",
                 latent_flip_path=(cache / "latents" / f"{stem}_flip.safetensors") if cfg.flip_augment else None,
-                text_path=cache / "text" / f"{_hash(caption)}_{cfg.max_token_length}.safetensors",
+                text_path=text_cache_path(cfg, caption),
                 region_path=cache / "regions" / f"{stem}_regions.safetensors",
                 side=side,
             ))
@@ -201,7 +207,7 @@ def augment_items(items: list[Item], cfg: TrainConfig, analysis: dict[str, dict]
                 image=it.image, caption=caption, width=bw, height=bh,
                 latent_path=cache / "latents" / f"{stem}.safetensors",
                 latent_flip_path=(cache / "latents" / f"{stem}_flip.safetensors") if cfg.flip_augment else None,
-                text_path=cache / "text" / f"{_hash(caption)}_{cfg.max_token_length}.safetensors",
+                text_path=text_cache_path(cfg, caption),
                 src_box=box, category=category,
                 region_path=cache / "regions" / f"{stem}_regions.safetensors",
                 side=it.side,
@@ -213,7 +219,8 @@ def augment_items(items: list[Item], cfg: TrainConfig, analysis: dict[str, dict]
 
 
 def empty_text_path(cfg: TrainConfig) -> Path:
-    return cfg.resolved_cache_dir() / "text" / f"{_hash('')}_{cfg.max_token_length}.safetensors"
+    """The cached embedding caption dropout trains on (the empty prompt; FIBO 2.0's null caption)."""
+    return text_cache_path(cfg, get_arch(cfg).empty_prompt)
 
 
 # ---------------------------------------------------------------- caching
@@ -260,21 +267,22 @@ def text_jobs(items: list[Item], cfg: TrainConfig, extra_prompts: list[str] | No
     jobs: dict[Path, str] = {}
     for it in items:
         jobs.setdefault(it.text_path, it.caption)
-    jobs.setdefault(empty_text_path(cfg), "")
-    cache = cfg.resolved_cache_dir() / "text"
+    jobs.setdefault(empty_text_path(cfg), get_arch(cfg).empty_prompt)
     for p in extra_prompts or []:
-        jobs.setdefault(cache / f"{_hash(p)}_{cfg.max_token_length}.safetensors", p)
+        jobs.setdefault(text_cache_path(cfg, p), p)
     return {k: v for k, v in jobs.items() if cfg.recache or not k.exists()}, len(jobs)
 
 
 def cache_text(items: list[Item], cfg: TrainConfig, text_encoder, tokenizer,
                extra_prompts: list[str] | None = None, progress=None, encoders: list | None = None,
-               max_prompts: int | None = None) -> None:
+               max_prompts: int | None = None, encode_fn=None) -> None:
     """Encode and save the missing prompt embeddings. `encoders` is a list of (text_encoder, tokenizer, device),
     one per GPU, to split the prompts across GPUs (each needs its own tokenizer: fast tokenizers are not
-    thread-safe). `max_prompts` encodes only the first N missing prompts (a timing probe)."""
-    from .moss.loading import encode_prompt
+    thread-safe). `max_prompts` encodes only the first N missing prompts (a timing probe). `encode_fn` is the
+    architecture's encode_prompt(text_encoder, tokenizer, text, max_length)."""
     from .multigpu import run_queue
+
+    encode_prompt = encode_fn or get_arch(cfg).encode_prompt
 
     todo, total = text_jobs(items, cfg, extra_prompts)
     workers = encoders or [(text_encoder, tokenizer, "cpu")]
@@ -303,7 +311,11 @@ def cache_text(items: list[Item], cfg: TrainConfig, text_encoder, tokenizer,
 
 
 def text_cache_path(cfg: TrainConfig, prompt: str) -> Path:
-    return cfg.resolved_cache_dir() / "text" / f"{_hash(prompt)}_{cfg.max_token_length}.safetensors"
+    """Cached text features of a prompt. Each architecture has its own text encoder, so other architectures' caches
+    get a suffix (the MOSS-Image cache keeps the original file names)."""
+    arch = cfg.arch_name()
+    tag = "" if arch == "moss_image" else f"_{arch}"
+    return cfg.resolved_cache_dir() / "text" / f"{_hash(prompt)}_{cfg.max_token_length}{tag}.safetensors"
 
 
 # ---------------------------------------------------------------- batching
@@ -351,8 +363,9 @@ def load_batch(batch: list[Item], cfg: TrainConfig, rng: random.Random):
 
     Only this function knows whether the flipped latent was picked, so it flips the region map (and mirrors
     its landmarks) to match."""
-    from .moss.loading import pad_embeds
     from .regions import flip_region_map, load_region_map, uniform_region_map
+
+    pad_embeds = get_arch(cfg).pad_embeds
 
     latents, rows, maps = [], [], []
     empty = empty_text_path(cfg)

@@ -1,4 +1,4 @@
-"""LoRA training loop for MOSS-Image (flow matching)."""
+"""LoRA training loop (flow matching) for the architectures in rulztrainer.archs: MOSS-Image and FIBO 2.0."""
 from __future__ import annotations
 
 import contextlib
@@ -22,10 +22,8 @@ from .config import side_to_mp
 from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, describe_sides, empty_text_path,
                       items_for_side, load_batch,
                       scan_dataset, text_cache_path)
-from .moss import loading
+from .archs import detect_arch, get_arch
 from .multigpu import clone_to, compile_count, no_recompile_stance, norm_device, run_queue, stance_available
-from .sampler import sample
-
 log = logging.getLogger("rulztrainer")
 DP_COMPILE_QUIET_STEPS = 3  # data parallel + compile: serial steps without a new graph before going parallel
 TEXT_TIMING_PROMPTS = 4  # prompts encoded on the first copy to time it before deciding on a second copy
@@ -163,10 +161,14 @@ def _shift_logit(s: torch.Tensor, logit_shift: float) -> torch.Tensor:
     return torch.sigmoid(torch.log(s / (1 - s)) + logit_shift)
 
 
-def sample_sigmas(cfg: TrainConfig, n: int, gen: torch.Generator, logit_shift: float = 0.0) -> torch.Tensor:
+def sample_sigmas(cfg: TrainConfig, n: int, gen: torch.Generator, logit_shift: float = 0.0, tokens: int = 0,
+                  arch=None) -> torch.Tensor:
+    """tokens: the batch's image token count (H/16 x W/16), which the architectures' own recipes depend on."""
     mode = cfg.timestep_sampling
     if mode == "uniform":
         s = _shift_logit(torch.rand(n, generator=gen), logit_shift)
+    elif mode == "reference":  # the model family's own training recipe (Bria's trainer / the MOSS-Image report)
+        s = _shift_logit((arch or get_arch(cfg)).reference_sigmas(n, gen, tokens), logit_shift)
     elif mode == "logit_normal":
         s = torch.sigmoid(torch.randn(n, generator=gen) * cfg.logit_std + cfg.logit_mean + logit_shift)
     elif mode == "sigmoid":
@@ -263,6 +265,7 @@ class Trainer:
         if self.stop_file.exists():
             self.stop_file.unlink()
         self.device = torch.device(cfg.device)
+        self.arch = get_arch(cfg)  # confirmed against the model's transformer config once the model dir is resolved
         self.vae = None
         self.vaes: dict[str, object] = {}  # VAE copies on the other GPUs (sampling / caching side jobs)
         self.sample_graphs: set = set()  # (device, shape) pairs a compiled model has already traced for sampling
@@ -298,6 +301,10 @@ class Trainer:
             cfg.device = self.devices[0]
             self.device = torch.device(cfg.device)
         self.model_dir: Path | None = None
+
+    def negative_prompt(self) -> str:
+        """The sample / probe negative prompt: the config's, or the architecture's default (FIBO 2.0: the null caption)."""
+        return self.cfg.sample_negative or self.arch.default_negative
 
     def side_devices(self) -> list[str]:
         """GPUs that side jobs (samples, probes, caching, SAM 3 masks) are split across."""
@@ -420,9 +427,9 @@ class Trainer:
 
     def prepare_cache(self, items):
         cfg = self.cfg
-        prompts = list(cfg.sample_prompts) + ([cfg.sample_negative] if cfg.sample_prompts else [])
+        prompts = list(cfg.sample_prompts) + ([self.negative_prompt()] if cfg.sample_prompts else [])
         if cfg.probe_every > 0:
-            prompts += [p for p in (cfg.probe_face_prompt, cfg.probe_body_prompt) if p] + [cfg.sample_negative]
+            prompts += [p for p in (cfg.probe_face_prompt, cfg.probe_body_prompt) if p] + [self.negative_prompt()]
         need_latents = cfg.recache or any(
             not it.latent_path.exists() or (it.latent_flip_path and not it.latent_flip_path.exists()) for it in items)
         need_text = cfg.recache or not empty_text_path(cfg).exists() or any(
@@ -431,7 +438,7 @@ class Trainer:
         devices = self.side_devices()
         if need_latents:
             self.status.update(stage="caching latents")
-            vae = loading.get_vae(cfg, self.model_dir)
+            vae = self.arch.get_vae(cfg, self.model_dir)
             vaes = [vae]
             for d in devices:
                 if d != norm_device(vae.device):
@@ -447,14 +454,14 @@ class Trainer:
         if need_text:
             self.status.update(stage="loading text encoder")
             t_load = time.time()
-            te, tok = loading.get_text_encoder(cfg, self.model_dir)
+            te, tok = self.arch.get_text_encoder(cfg, self.model_dir)
             t_load = time.time() - t_load
             self.status.update(stage="caching text embeddings")
             t0 = time.time()
             encoders = self._extra_text_encoders(te, tok, items, prompts, devices, t_load)
             cache_text(items, cfg, te, tok, extra_prompts=prompts,
                        progress=lambda i, n: self.status.update(step=i, total=n),
-                       encoders=encoders if len(encoders) > 1 else None)
+                       encoders=encoders if len(encoders) > 1 else None, encode_fn=self.arch.encode_prompt)
             log.info("Text caching took %.1fs", time.time() - t0)
             for enc in encoders:
                 unload_model(enc[0])
@@ -487,7 +494,8 @@ class Trainer:
             return primary
         stamps = [time.time()]
         cache_text(items, self.cfg, te, tok, extra_prompts=prompts, max_prompts=TEXT_TIMING_PROMPTS,
-                   progress=lambda i, n: (stamps.append(time.time()), self.status.update(step=i, total=len(todo))))
+                   progress=lambda i, n: (stamps.append(time.time()), self.status.update(step=i, total=len(todo))),
+                   encode_fn=self.arch.encode_prompt)
         per_prompt = (stamps[-1] - stamps[1]) / max(1, len(stamps) - 2)  # skips the first (warm-up) prompt
         warm_up = max(0.0, stamps[1] - stamps[0] - per_prompt)  # first-call cost, which a new copy pays again
         cost = load_seconds + warm_up
@@ -511,7 +519,7 @@ class Trainer:
                          "needed)", d, free / 2**30, size / 2**30)
                 continue
             self.status.update(stage=f"loading text encoder copy on {d}")
-            te2, tok2 = loading.get_text_encoder(dataclasses.replace(self.cfg, text_encoder_device=d), self.model_dir)
+            te2, tok2 = self.arch.get_text_encoder(dataclasses.replace(self.cfg, text_encoder_device=d), self.model_dir)
             out.append((te2, tok2, d))
         return out
 
@@ -531,23 +539,29 @@ class Trainer:
         gen = torch.Generator("cpu").manual_seed(cfg.seed)
         self.status.update(stage="resolving model")
         Q.set_int8_defaults(cfg.int8_matmul, cfg.int8_backward)  # every QuantLinear built from here on
-        self.model_dir = loading.resolve_for_config(cfg)
+        self.model_dir = self.arch.resolve_for_config(cfg)
+        self.arch = detect_arch(cfg, self.model_dir)
+        cfg.model_arch = self.arch.name
+        log.info("Model architecture: %s", self.arch.label)
         items = scan_dataset(cfg)
         log.info("Dataset: %d images in %s", len(items), cfg.dataset_dir)
         items = self.analyze_dataset(items)
         self.prepare_cache(items)
 
         self.status.update(stage="loading transformer", step=0, total=cfg.steps)
-        model = loading.get_transformer(cfg, self.model_dir)
+        model = self.arch.get_transformer(cfg, self.model_dir)
         model.gradient_checkpointing = cfg.gradient_checkpointing
         n_w8a8 = Q.configure_int8(model, cfg.int8_matmul, cfg.int8_backward)
         if n_w8a8:
             log.info("%d quantized Linear layers: int8 matmul %s (backward %s)", n_w8a8,
                      "on" if cfg.int8_matmul else "off", cfg.int8_backward)
         blocks = lora_mod.parse_blocks(cfg.lora_blocks, len(model.layers))
+        unknown = [t for t in cfg.lora_targets if t not in self.arch.target_groups]
+        if unknown:
+            log.warning("LoRA targets %s do not exist for %s and are ignored", unknown, self.arch.label)
         injected = lora_mod.inject_lora(model, cfg.lora_rank, cfg.lora_alpha, cfg.lora_targets,
                                         include_text_embedder=cfg.train_text_embedder, dropout=cfg.lora_dropout,
-                                        blocks=blocks)
+                                        blocks=blocks, names=self._lora_names(model, blocks))
         if blocks is not None:
             log.info("LoRA blocks: %s (%d of %d); backward skips blocks before %s", lora_mod.format_blocks(blocks),
                      len(blocks), len(model.layers), min(blocks) if blocks else "n/a")
@@ -560,12 +574,12 @@ class Trainer:
             reps = []
             for dev in self.devices[1:]:
                 self.status.update(stage=f"loading model replica on {dev}")
-                m = loading.get_transformer(cfg, self.model_dir, device=dev)
+                m = self.arch.get_transformer(cfg, self.model_dir, device=dev)
                 m.gradient_checkpointing = cfg.gradient_checkpointing
                 Q.configure_int8(m, cfg.int8_matmul, cfg.int8_backward)
                 inj = lora_mod.inject_lora(m, cfg.lora_rank, cfg.lora_alpha, cfg.lora_targets,
                                            include_text_embedder=cfg.train_text_embedder, dropout=cfg.lora_dropout,
-                                           blocks=blocks)
+                                           blocks=blocks, names=self._lora_names(m, blocks))
                 reps.append((m, inj, dev))
                 self.replicas.append((m, inj, dev))
             self.dp = DataParallelLoRA(injected, reps)
@@ -598,7 +612,7 @@ class Trainer:
             for m, _, _ in self.replicas:
                 self._attach_sampling_loras(m)
         if cfg.sample_prompts or cfg.probe_every > 0:
-            self.vae = loading.get_vae(cfg, self.model_dir)
+            self.vae = self.arch.get_vae(cfg, self.model_dir)
             self.face_scorer = self._make_face_scorer()
             self.body_scorer = self._make_body_scorer()
             self.controller = self._make_controller(items)
@@ -698,7 +712,8 @@ class Trainer:
                 for rep in self.replicas:  # draw every copy's batch and noise in the main thread (shared RNG)
                     batch = next(self.batch_iter)
                     latents, embeds, mask, regions = load_batch(batch, cfg, rng)
-                    sigma = sample_sigmas(cfg, latents.shape[0], gen, self.ts_logit_shift)
+                    sigma = sample_sigmas(cfg, latents.shape[0], gen, self.ts_logit_shift,
+                                          tokens=latents.shape[2] * latents.shape[3], arch=self.arch)
                     noise = torch.randn(latents.shape, generator=gen)
                     jobs.append((rep, batch, latents, embeds, mask, sigma, noise, regions, step + 1))
                 if self.dp is not None:
@@ -798,9 +813,9 @@ class Trainer:
         path = self.job_dir / name
         meta = {"ss_base_model": cfg.model_path if cfg.model_source == "hf" else Path(cfg.transformer_file).name,
                 "ss_network_dim": str(cfg.lora_rank), "ss_network_alpha": str(cfg.lora_alpha),
-                "ss_steps": str(step), "modelspec.architecture": "moss-image", "rulztrainer_config": cfg.to_dict(),
-                "ss_blocks": cfg.lora_blocks or "all"}
-        lora_mod.save_lora(injected, path, metadata=meta, dtype=cfg.lora_save_dtype)
+                "ss_steps": str(step), "modelspec.architecture": self.arch.modelspec,
+                "rulztrainer_config": cfg.to_dict(), "ss_blocks": cfg.lora_blocks or "all"}
+        lora_mod.save_lora(injected, path, metadata=meta, dtype=cfg.lora_save_dtype, fmt=self.arch.lora_format)
         log.info("Saved %s (%s)", path, cfg.lora_save_dtype)
         self.status.data["saved"].append(str(path))
         self.status.write()
@@ -809,7 +824,7 @@ class Trainer:
     def save_state(self, step, injected, optimizer, scheduler, gen, rng) -> Path:
         state_dir = self.job_dir / f"state_{step:06d}"
         state_dir.mkdir(exist_ok=True)
-        lora_mod.save_lora(injected, state_dir / "lora.safetensors", dtype=torch.float32)
+        lora_mod.save_lora(injected, state_dir / "lora.safetensors", dtype=torch.float32, fmt=self.arch.lora_format)
         torch.save({
             "step": step, "res_stage": self.res_stage, "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
@@ -841,9 +856,10 @@ class Trainer:
             # Python float attributes (LoRA scale / multiplier) would otherwise be traced as 0-d CPU tensors, and the
             # CPU ops on them make Inductor emit C++ that needs MSVC on Windows ("InvalidCxxCompiler: cl is not found")
             torch._dynamo.config.specialize_float = True
-            for block in (*model.layers, *model.text_embedder.blocks):
+            blocks = self.arch.compile_blocks(model)
+            for block in blocks:
                 block.compile(backend="inductor", dynamic=True)
-            log.info("Compiled %d DiT blocks with torch.compile (first steps will be slow)", len(model.layers) + 2)
+            log.info("Compiled %d DiT blocks with torch.compile (first steps will be slow)", len(blocks))
             return True
         except Exception as e:  # noqa: BLE001
             log.warning("torch.compile failed (%s); running without compile", e)
@@ -876,6 +892,9 @@ class Trainer:
         return int(st["step"])
 
     # ------------------------------------------------------------ sampling
+    def _lora_names(self, model, blocks) -> list[str]:
+        return self.arch.lora_module_names(model, self.cfg.lora_targets, blocks, self.cfg.train_text_embedder)
+
     def _attach_sampling_loras(self, model) -> None:
         """Attach the sampling-only LoRAs (turbo + optional secondary) to a model."""
         cfg = self.cfg
@@ -890,10 +909,11 @@ class Trainer:
         cfg = self.cfg
         if self.sample_model is None:
             log.info("Loading sampling model %s (quant=%s)", cfg.sample_model_path, cfg.sample_model_quant)
-            m = loading.load_any_transformer(cfg.sample_model_path, "cpu", cfg.sample_model_quant, cfg.models_dir)
+            m = self.arch.load_any_transformer(cfg.sample_model_path, "cpu", cfg.sample_model_quant, cfg.models_dir)
+            blocks = lora_mod.parse_blocks(cfg.lora_blocks, len(m.layers))
             inj = lora_mod.inject_lora(m, cfg.lora_rank, cfg.lora_alpha, cfg.lora_targets,
-                                       include_text_embedder=cfg.train_text_embedder,
-                                       blocks=lora_mod.parse_blocks(cfg.lora_blocks, len(m.layers)))
+                                       include_text_embedder=cfg.train_text_embedder, blocks=blocks,
+                                       names=self._lora_names(m, blocks))
             if set(inj) != set(self.injected):
                 raise ValueError("Sampling model has different LoRA targets than the training model")
             self._attach_sampling_loras(m)
@@ -961,7 +981,7 @@ class Trainer:
 
         def render(slot, job):
             emb = load_text_embeds(cfg, job.prompt)
-            pos_e, pos_m = loading.pad_embeds([emb])
+            pos_e, pos_m = self.arch.pad_embeds([emb])
             log.info("%s on %s (seed %d, %d steps, %dx%d): %s", job.label[:1].upper() + job.label[1:], slot.device,
                      job.seed, job.steps, job.width, job.height, job.prompt[:80])
             board.set(slot.device, f"{job.label} | step 0/{job.steps}")
@@ -969,10 +989,10 @@ class Trainer:
             def on_progress(k, total, _slot=slot, _job=job):
                 board.set(_slot.device, f"{_job.label} | step {k}/{total}")
 
-            lat = sample(slot.model, pos_e, pos_m, neg_e, neg_m, width=job.width, height=job.height, steps=job.steps,
-                         cfg=job.cfg_scale, shift=cfg.sample_shift, seed=job.seed, skip_layer=cfg.sample_skip_layer,
-                         device=slot.device, progress=on_progress)
-            img = loading.decode_latents(slot.vae, lat)[0]
+            lat = self.arch.sample(slot.model, pos_e, pos_m, neg_e, neg_m, width=job.width, height=job.height,
+                                   steps=job.steps, cfg=job.cfg_scale, shift=cfg.sample_shift, seed=job.seed,
+                                   skip_layer=cfg.sample_skip_layer, device=slot.device, progress=on_progress)
+            img = self.arch.decode_latents(slot.vae, lat)[0]
             arr = ((img.permute(1, 2, 0).float().cpu().numpy() + 1) * 127.5).round().clip(0, 255).astype("uint8")
             Image.fromarray(arr).save(job.out_path)
             board.set(slot.device, f"{job.label} done")
@@ -1097,7 +1117,7 @@ class Trainer:
         for sl in slots:
             sl.model.eval()
             lora_mod.set_extras_enabled(sl.model, True)
-        neg_e, neg_m = loading.pad_embeds([load_text_embeds(cfg, cfg.sample_negative)])
+        neg_e, neg_m = self.arch.pad_embeds([load_text_embeds(cfg, self.negative_prompt())])
         out_dir = self.job_dir / "probes"
         out_dir.mkdir(exist_ok=True)
         jobs = []
@@ -1159,8 +1179,8 @@ class Trainer:
         if actions.get("save_best"):
             path = self.job_dir / f"{cfg.job_name}_best.safetensors"
             lora_mod.save_lora(injected, path, metadata={"ss_steps": str(step), "likeness_best": f"{rec.best:.2f}",
-                                                         "modelspec.architecture": "moss-image"},
-                               dtype=cfg.lora_save_dtype)
+                                                         "modelspec.architecture": self.arch.modelspec},
+                               dtype=cfg.lora_save_dtype, fmt=self.arch.lora_format)
             log.info("New best likeness %.1f%% at step %d -> %s", rec.best, step, path)
             if str(path) not in self.status.data["saved"]:
                 self.status.data["saved"].append(str(path))
@@ -1189,7 +1209,7 @@ class Trainer:
             sl.model.eval()
             lora_mod.set_extras_enabled(sl.model, True)
         self.status.update(stage=f"sampling (step {step})")
-        neg_e, neg_m = loading.pad_embeds([load_text_embeds(cfg, cfg.sample_negative)])
+        neg_e, neg_m = self.arch.pad_embeds([load_text_embeds(cfg, self.negative_prompt())])
         out_dir = self.job_dir / "samples"
         out_dir.mkdir(exist_ok=True)
         n_prompts = len(cfg.sample_prompts)
