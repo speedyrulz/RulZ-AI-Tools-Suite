@@ -6,6 +6,12 @@
       "runtimeExecutable": "venv\\Scripts\\python.exe",
       "runtimeArgs": ["webui.py", "--port", "7870"],
       "port": 7870
+    },
+    {
+      "name": "webui-tailscale",
+      "runtimeExecutable": "venv\\Scripts\\python.exe",
+      "runtimeArgs": ["webui.py", "--port", "7870", "--tailscale"],
+      "port": 7870
     }
   ]
 }

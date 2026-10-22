@@ -9,20 +9,25 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
-from nicegui import run, ui
+from nicegui import app, run, ui
 
-from rulztrainer.config import MEGAPIXEL_CHOICES, MODEL_PRESETS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp
+from rulztrainer.config import (MEGAPIXEL_CHOICES, MODEL_PRESETS, PRESET_PROBE_PROMPTS, PRESETS, TrainConfig,
+                                apply_preset, mp_to_side, side_to_mp)
 from rulztrainer import bodysim, facesim
 from rulztrainer.losswatch import read_verdicts
 
 ROOT = Path(__file__).resolve().parent
 os.chdir(ROOT)
 CUSTOM = "Custom path / repo id"
+HF_SOURCE = "Hugging Face repo / diffusers folder"
+FILE_SOURCE = "Single safetensors files (ComfyUI)"
 TARGETS = ["q", "k", "v", "o", "ffn_up_gate", "ffn_down"]
 FIBO_TARGETS = ["cross_attn", "adaln", "refiner", "perceiver", "embed"]  # FIBO 2.0 only (see rulztrainer.archs)
 N_BLOCKS_MAX = 44  # MOSS-Image has 42 blocks, FIBO 2.0 has 44
@@ -120,6 +125,17 @@ def _relative(path: str) -> str:
 # native pick dialogs need a desktop: always on Windows/macOS, only with a display on Linux (not on a headless
 # server such as a vast.ai instance, where paths are typed or come from the Dataset tab's uploader)
 HAS_DISPLAY = sys.platform in ("win32", "darwin") or bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+# ...and a viewer sitting at that desktop: a dialog opened for a remote browser (Tailscale, LAN) would pop up on the
+# server's screen. Set per page load by build_page.
+_native_dialogs = HAS_DISPLAY
+
+
+def is_local_viewer(request) -> bool:
+    """True when the page was opened on this machine. `tailscale serve` connects from 127.0.0.1 too, but adds the
+    Tailscale-User-Login / X-Forwarded-For headers."""
+    host = request.client.host if request.client else ""
+    proxied = "tailscale-user-login" in request.headers or "x-forwarded-for" in request.headers
+    return host in ("127.0.0.1", "::1", "localhost") and not proxied
 
 
 def _is_repo_example(path: str) -> bool:
@@ -433,7 +449,7 @@ class Form:
         return TrainConfig(
             preset="identity" if self.w.get("preset_toggle") is not None and self.w["preset_toggle"].value else "",
             job_name=s("job_name") or "my_lora", output_dir=s("output_dir") or "output", seed=int(v("seed")),
-            model_source="files" if v("model_source") == "Single safetensors files (ComfyUI)" else "hf",
+            model_source="files" if v("model_source") == FILE_SOURCE else "hf",
             model_path=model_path, transformer_file=s("transformer_file"), text_encoder_file=s("text_encoder_file"),
             vae_file=s("vae_file"), tokenizer_path=s("tokenizer_path"),
             device=v("device"), text_encoder_device=v("text_encoder_device"),
@@ -515,8 +531,7 @@ class Form:
         preset = next((k for k, v in MODEL_PRESETS.items() if v == cfg.model_path), CUSTOM)
         values = {**cfg.to_dict(), "model_preset": preset, "sample_prompts": "\n".join(cfg.sample_prompts),
                   "face_refs": "\n".join(cfg.face_refs), "body_refs": "\n".join(cfg.body_refs),
-                  "model_source": "Single safetensors files (ComfyUI)" if cfg.model_source == "files"
-                  else "Hugging Face repo / diffusers folder"}
+                  "model_source": FILE_SOURCE if cfg.model_source == "files" else HF_SOURCE}
         for t in TARGETS + FIBO_TARGETS:
             values[f"target_{t}"] = t in cfg.lora_targets
         if not cfg.resolutions:  # legacy single `resolution`: snap to the nearest megapixel choice
@@ -535,11 +550,269 @@ class Form:
                 self.preset_sync = False
 
 
-def path_input(f: Form, key: str, label: str, kind: str, value: str = "", width: str = "w-96", filetypes=None):
-    """Text input with a Browse button that opens a native dialog."""
-    with ui.row().classes("items-end gap-1"):
-        inp = ui.input(label, value=value).classes(width)
-        f.w[key] = inp
+# ---------------------------------------------------------------- look and feel
+
+ASSETS = ROOT / "assets"
+RED = "#E10600"
+CHART_COLORS = ["#FF3B30", "#F4F4F5", "#F59E0B", "#A1A1AA", "#FB7185", "#60A5FA", "#34D399", "#C084FC"]
+
+THEME_CSS = """
+:root {
+  --rz-red: #E10600; --rz-red-bright: #FF3B30; --rz-red-soft: rgba(225, 6, 0, 0.14);
+  --rz-bg: #0A0A0A; --rz-surface: #131313; --rz-surface-2: #1A1A1A;
+  --rz-border: #262626; --rz-border-strong: #3A3A3A;
+  --rz-text: #EDEDED; --rz-muted: #A1A1AA; --rz-ok: #22C55E;
+}
+body, .q-page-container, .q-layout { background: var(--rz-bg); }
+body {
+  color: var(--rz-text); font-size: 15px; line-height: 1.5; -webkit-font-smoothing: antialiased;
+  font-family: "Inter", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Roboto, Arial, sans-serif;
+}
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: #2A2A2A; border-radius: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* header: logo, status pill, tabs */
+.nicegui-header.rz-header {
+  background: #000; border-bottom: 1px solid var(--rz-border); padding: 0; gap: 0;
+  flex-direction: column; align-items: stretch;
+}
+.rz-header-row { max-width: 1440px; margin: 0 auto; padding: 12px 20px 2px; }
+.rz-logo { height: 30px; width: auto; display: block; }
+.rz-wordmark { letter-spacing: .34em; font-weight: 600; font-size: 12px; color: var(--rz-muted); padding-top: 7px; }
+.rz-tagline { color: #71717A; font-size: 13px; padding-top: 6px; margin-left: 8px; }
+.rz-tabs { max-width: 1440px; margin: 0 auto; width: 100%; padding: 0 8px; }
+.rz-tabs .q-tab { color: var(--rz-muted); min-height: 44px; padding: 0 14px; }
+.rz-tabs .q-tab__label { font-weight: 500; font-size: 14px; }
+.rz-tabs .q-tab__icon { font-size: 19px; }
+.rz-tabs .q-tab--active { color: #fff; }
+.rz-tabs .q-tab--active .q-tab__icon { color: var(--rz-red-bright); }
+.rz-tabs .q-tab__indicator { background: var(--rz-red); height: 3px; border-radius: 3px 3px 0 0; }
+.rz-pill {
+  border: 1px solid var(--rz-border-strong); border-radius: 999px; padding: 4px 12px; font-size: 13px;
+  background: #0D0D0D; cursor: pointer; max-width: 320px;
+}
+.rz-pill:hover { border-color: #52525B; }
+.rz-pill-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rz-dot { width: 8px; height: 8px; border-radius: 50%; background: #52525B; display: inline-block; flex-shrink: 0; }
+.rz-dot.live { background: var(--rz-red-bright); animation: rz-pulse 1.6s infinite; }
+.rz-dot.done { background: var(--rz-ok); }
+.rz-dot.error { background: #F59E0B; }
+@keyframes rz-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(255, 59, 48, .6); }
+  70% { box-shadow: 0 0 0 8px rgba(255, 59, 48, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(255, 59, 48, 0); }
+}
+
+/* page and panels (visible overflow so the section list can stay in view) */
+.rz-panels { background: transparent; overflow: visible !important; }
+.rz-panels > .q-panel, .rz-panels > .q-panel > div { overflow: visible; }
+.rz-panels .q-tab-panel { padding: 20px 20px 28px; }
+.rz-page { width: 100%; max-width: 1440px; margin: 0 auto; }
+
+/* cards and settings sections */
+.rz-card { background: var(--rz-surface); border: 1px solid var(--rz-border); border-radius: 14px; padding: 18px 20px; }
+.rz-section { background: var(--rz-surface); border: 1px solid var(--rz-border); border-radius: 14px; scroll-margin-top: 104px; }
+.rz-section > .q-expansion-item__container > .q-item { padding: 12px 18px; min-height: 64px; border-radius: 14px; }
+.rz-section > .q-expansion-item__container > .q-item .q-item__section--avatar { min-width: 0; padding-right: 14px; }
+.rz-section > .q-expansion-item__container > .q-item .q-item__section--avatar .q-icon {
+  color: var(--rz-red-bright); background: var(--rz-red-soft); border-radius: 10px; font-size: 20px;
+  width: 38px; height: 38px;
+}
+.rz-section > .q-expansion-item__container > .q-item .q-item__label { font-size: 16px; font-weight: 600; color: #fff; }
+.rz-section > .q-expansion-item__container > .q-item .q-item__label--caption {
+  font-size: 13px; color: var(--rz-muted); font-weight: 400; margin-top: 2px;
+}
+.rz-section .nicegui-expansion-content { padding: 2px 18px 20px; gap: 14px; }
+.rz-advanced { border-top: 1px dashed var(--rz-border); }
+.rz-advanced > .q-expansion-item__container > .q-item { padding: 10px 0 4px; min-height: 0; color: #C4C4CC; font-weight: 500; }
+.rz-advanced > .q-expansion-item__container > .q-item .q-item__section--avatar { min-width: 0; padding-right: 8px; }
+.rz-advanced > .q-expansion-item__container > .q-item .q-icon { color: var(--rz-muted); font-size: 18px; }
+.rz-section .rz-advanced .nicegui-expansion-content { padding: 8px 0 6px; gap: 14px; }
+.rz-title { font-size: 16px; font-weight: 600; color: #fff; }
+.rz-step-title { font-size: 20px; font-weight: 700; color: #fff; }
+.rz-subhead { font-size: 12px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--rz-muted); margin-top: 4px; }
+.rz-hint { font-size: 13px; color: var(--rz-muted); line-height: 1.55; max-width: 980px; }
+.rz-warn { color: #FBBF24; }
+.rz-fields { gap: 14px 16px; align-items: center; flex-wrap: wrap; }
+
+/* form fields and buttons */
+.q-field--outlined .q-field__control { border-radius: 9px; }
+.q-field--outlined.q-field--dark .q-field__control:before { border-color: var(--rz-border-strong); }
+.q-field--dark .q-field__label { color: #B5B5BD; }
+.q-field--dark .q-field__native, .q-field--dark .q-field__input, .q-field--dark .q-select__dropdown-icon { color: #F4F4F5; }
+.q-btn { text-transform: none; font-weight: 600; letter-spacing: .01em; border-radius: 9px; }
+.q-toggle__label, .q-checkbox__label, .q-radio__label { color: #E4E4E7; }
+.q-tooltip { background: #1F1F1F; border: 1px solid var(--rz-border-strong); color: #F4F4F5; font-size: 13px; max-width: 440px; line-height: 1.45; }
+.q-menu { background: #161616; border: 1px solid var(--rz-border-strong); }
+
+/* Train tab: section list on the left */
+.rz-nav { position: sticky; top: 108px; width: 210px; flex-shrink: 0; gap: 2px; }
+.rz-nav-title { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--rz-muted); padding: 2px 12px 6px; }
+.rz-nav-btn { width: 100%; color: #D4D4D8; font-weight: 500; }
+.rz-nav-btn .q-btn__content { justify-content: flex-start; }
+.rz-nav-btn .q-icon { color: var(--rz-red-bright); font-size: 18px; }
+
+/* action bar */
+.nicegui-footer.rz-footer {
+  background: rgba(0, 0, 0, .94); backdrop-filter: blur(6px); border-top: 1px solid var(--rz-border); padding: 0;
+}
+.rz-footer-row { max-width: 1440px; margin: 0 auto; padding: 10px 20px; }
+.rz-status-msg {
+  font-size: 13px; color: #C4C4CC; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* Monitor */
+.rz-tile { background: var(--rz-surface); border: 1px solid var(--rz-border); border-radius: 12px; padding: 12px 16px; min-width: 150px; flex: 1 1 150px; }
+.rz-tile-label { font-size: 11px; color: var(--rz-muted); text-transform: uppercase; letter-spacing: .08em; }
+.rz-tile-value { font-size: 20px; font-weight: 600; color: #fff; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+.rz-tile-sub { font-size: 12px; color: var(--rz-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+.rz-banner { border-radius: 10px; padding: 10px 14px; font-size: 14px; width: 100%; }
+.rz-banner.error { background: rgba(225, 6, 0, .12); border: 1px solid rgba(255, 59, 48, .45); color: #FFB4AE; }
+.rz-banner.warning { background: rgba(245, 158, 11, .10); border: 1px solid rgba(245, 158, 11, .40); color: #FCD34D; }
+.rz-banner.info { background: #161616; border: 1px solid var(--rz-border-strong); color: #D4D4D8; }
+.rz-banner.ok { background: rgba(34, 197, 94, .10); border: 1px solid rgba(34, 197, 94, .40); color: #86EFAC; }
+.q-uploader { background: var(--rz-surface); border: 1px dashed var(--rz-border-strong); border-radius: 12px; }
+.rz-log { background: #050505; border: 1px solid var(--rz-border); border-radius: 10px; color: #D4D4D8; }
+.rz-thumb { background: var(--rz-surface-2); border: 1px solid var(--rz-border); border-radius: 10px; overflow: hidden; }
+.rz-mono { font-family: ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace; font-size: 12px; color: #C4C4CC; }
+
+/* Wizard */
+.rz-stepper { background: transparent; box-shadow: none; }
+.rz-stepper .q-stepper__header { border-bottom: 1px solid var(--rz-border); }
+.rz-stepper .q-stepper__tab { padding: 14px 8px; }
+.rz-stepper .q-stepper__title { font-size: 13px; font-weight: 500; color: #D4D4D8; }
+.rz-stepper .q-stepper__tab--active .q-stepper__title { color: #fff; font-weight: 600; }
+.rz-stepper .q-stepper__dot { width: 30px; min-width: 30px; height: 30px; }
+.rz-stepper .q-stepper__tab:not(.q-stepper__tab--active):not(.q-stepper__tab--done) .q-stepper__dot { background: #2A2A2A; }
+.rz-stepper .q-stepper__step-inner { padding: 22px 4px 8px; }
+.rz-stepper .q-stepper__nav { padding: 18px 4px 4px; border-top: 1px solid var(--rz-border); margin-top: 8px; width: 100%; }
+.rz-setting {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(240px, 380px); gap: 10px 32px; width: 100%;
+  padding: 18px 0; border-bottom: 1px solid var(--rz-border); align-items: start;
+}
+.rz-setting-title { font-weight: 600; font-size: 15px; color: #fff; }
+.rz-rec { font-size: 13px; color: #FCA5A5; margin-top: 2px; }
+.rz-rec .q-icon { color: var(--rz-red-bright); font-size: 17px; }
+.rz-rec.ok { color: #86EFAC; }
+.rz-rec.ok .q-icon { color: var(--rz-ok); }
+.rz-apply { background: var(--rz-red-soft); border: 1px solid rgba(255, 59, 48, .35); border-radius: 12px; padding: 10px 14px; }
+.rz-choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; width: 100%; }
+.rz-choice {
+  background: var(--rz-surface-2); border: 1px solid var(--rz-border-strong); border-radius: 12px; padding: 16px;
+  cursor: pointer; transition: border-color .15s, background .15s; gap: 8px;
+}
+.rz-choice:hover { border-color: #71717A; }
+.rz-choice.selected {
+  border-color: var(--rz-red); background: rgba(225, 6, 0, .16);
+  box-shadow: inset 0 0 0 1px var(--rz-red), 0 0 0 3px rgba(225, 6, 0, .18);
+}
+.rz-choice-icon { color: var(--rz-red-bright); font-size: 24px; }
+.rz-check { display: none; color: var(--rz-red-bright); font-size: 22px; }
+.rz-choice.selected .rz-check { display: inline-flex; }
+.rz-badge { font-size: 11px; font-weight: 600; letter-spacing: .04em; padding: 1px 8px; border-radius: 999px; background: var(--rz-red); color: #fff; }
+.rz-badge.muted { background: #3F3F46; }
+.rz-summary { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px 24px; width: 100%; font-size: 14px; }
+.rz-summary .k { color: var(--rz-muted); }
+.rz-summary .v { color: #F4F4F5; overflow-wrap: anywhere; }
+@media (max-width: 760px) {
+  .rz-setting { grid-template-columns: 1fr; }
+  .rz-panels .q-tab-panel { padding: 14px 12px 24px; }
+  .rz-footer-row, .rz-header-row { padding-left: 12px; padding-right: 12px; }
+}
+
+/* Help */
+.rz-help { max-width: 920px; }
+.rz-help h2 { font-size: 20px; font-weight: 700; color: #fff; margin: 28px 0 10px; padding-bottom: 6px; border-bottom: 1px solid var(--rz-border); }
+.rz-help h2:first-child { margin-top: 0; }
+.rz-help p, .rz-help li { color: #D4D4D8; line-height: 1.65; }
+.rz-help strong { color: #fff; }
+.rz-help code { background: #1F1F1F; color: #FCA5A5; padding: 1px 6px; border-radius: 5px; font-size: 13px; }
+.rz-help pre { background: #050505; border: 1px solid var(--rz-border); border-radius: 10px; padding: 12px 14px; overflow-x: auto; }
+.rz-help pre code { background: transparent; color: #E4E4E7; padding: 0; }
+.rz-help a { color: var(--rz-red-bright); }
+"""
+
+
+def setup_theme() -> None:
+    """Once per process, before the first page: logo files, the stylesheet and outlined form fields."""
+    app.add_static_files("/assets", ASSETS)
+    ui.add_css(THEME_CSS, shared=True)
+    for element in (ui.input, ui.number, ui.textarea):
+        element.default_props("outlined dense")
+    ui.select.default_props("outlined dense options-dense")
+
+
+def theme_colors() -> None:
+    ui.colors(primary=RED, secondary="#27272A", accent="#FF3B30", dark="#131313", dark_page="#0A0A0A",
+              positive="#22C55E", negative="#FF453A", info="#3F3F46", warning="#F59E0B")
+
+
+def section(title: str, caption: str, icon: str, open_: bool = True):
+    """A collapsible settings card (Train and Monitor tabs)."""
+    return ui.expansion(title, caption=caption, icon=icon, value=open_).classes("rz-section w-full")
+
+
+def advanced(title: str = "Advanced options"):
+    """Rarely changed options inside a section, folded away by default."""
+    return ui.expansion(title, icon="tune").props("dense").classes("rz-advanced w-full")
+
+
+def fields():
+    """A wrapping row of form fields."""
+    return ui.row().classes("rz-fields w-full")
+
+
+def hint(text: str = "", warn: bool = False):
+    return ui.label(text).classes("rz-hint" + (" rz-warn" if warn else ""))
+
+
+def subhead(text: str):
+    return ui.label(text).classes("rz-subhead")
+
+
+def card():
+    return ui.card().props("flat").classes("rz-card w-full")
+
+
+def stat_tile(label: str):
+    """A Monitor tile: small caption, big value, sub line. Returns (value label, sub label)."""
+    with ui.column().classes("rz-tile gap-0"):
+        ui.label(label).classes("rz-tile-label")
+        value = ui.label("-").classes("rz-tile-value")
+        sub = ui.label("").classes("rz-tile-sub")
+    return value, sub
+
+
+def _axis(name: str, **kw) -> dict:
+    return {"type": "value", "name": name, "axisLine": {"lineStyle": {"color": "#3F3F46"}},
+            "axisLabel": {"color": "#A1A1AA"}, "splitLine": {"lineStyle": {"color": "#222222"}},
+            "nameTextStyle": {"color": "#A1A1AA"}, **kw}
+
+
+def chart_options(x: dict, y, series: list, legend: list[str]) -> dict:
+    """ECharts options in the dark theme: transparent background, muted axes, the brand palette first."""
+    return {"backgroundColor": "transparent", "color": CHART_COLORS, "textStyle": {"color": "#D4D4D8"},
+            "xAxis": x, "yAxis": y, "series": series,
+            "legend": {"data": legend, "type": "scroll", "top": 0, "textStyle": {"color": "#D4D4D8"},
+                       "pageTextStyle": {"color": "#A1A1AA"}},
+            "tooltip": {"trigger": "axis", "backgroundColor": "#18181B", "borderColor": "#3F3F46",
+                        "textStyle": {"color": "#F4F4F5"}},
+            "grid": {"left": 60, "right": 60, "top": 40, "bottom": 40}}
+
+
+def _line(name: str, color: str, **kw) -> dict:
+    return {"name": name, "type": "line", "showSymbol": False, "data": [], "itemStyle": {"color": color},
+            "lineStyle": {"color": color, **kw.pop("lineStyle", {})}, **kw}
+
+
+def path_field(label: str, kind: str, value: str = "", width: str = "w-96", filetypes=None):
+    """Text input with a Browse button that opens a native dialog (no button on a headless server).
+    width "w-full" makes the input fill its container."""
+    full = width == "w-full"
+    with ui.row().classes("items-center gap-1 no-wrap max-w-full" + (" w-full" if full else "")):
+        inp = ui.input(label, value=value).classes("flex-grow min-w-0" if full else f"{width} min-w-0")
 
         async def browse():
             try:
@@ -550,9 +823,16 @@ def path_input(f: Form, key: str, label: str, kind: str, value: str = "", width:
             if picked:
                 inp.value = _relative(picked)
 
-        if HAS_DISPLAY:
-            ui.button(icon="folder_open" if kind == "dir" else "description", on_click=browse).props("flat dense")                 .tooltip("Browse")
+        if _native_dialogs:
+            ui.button(icon="folder_open" if kind == "dir" else "description", on_click=browse) \
+                .props("flat dense round").tooltip("Browse")
     return inp
+
+
+def path_input(f: Form, key: str, label: str, kind: str, value: str = "", width: str = "w-96", filetypes=None):
+    """A path_field registered in the form under `key`."""
+    f.w[key] = path_field(label, kind, value, width, filetypes)
+    return f.w[key]
 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
@@ -565,6 +845,26 @@ def list_dataset_images(folder: str) -> list[Path]:
     if not root.is_dir():
         return []
     return sorted(p for p in root.rglob("*") if p.suffix.lower() in IMAGE_EXTS and ".rulz_cache" not in p.parts)
+
+
+def dataset_summary(folder: str) -> dict | None:
+    """Image count, captions and typical image size of a dataset folder, for the wizard. None if it does not exist."""
+    from PIL import Image
+
+    if not folder or not Path(folder).is_dir():
+        return None
+    images = list_dataset_images(folder)
+    captioned = sum(1 for p in images if p.with_suffix(".txt").is_file() or p.with_suffix(".json").is_file())
+    sizes = []
+    for p in images[:300]:  # the header is enough for the size
+        try:
+            with Image.open(p) as im:
+                sizes.append(im.size[0] * im.size[1] / 2 ** 20)
+        except Exception:  # noqa: BLE001
+            continue
+    sizes.sort()
+    return {"folder": folder, "images": len(images), "captioned": captioned,
+            "median_mp": sizes[len(sizes) // 2] if sizes else None, "sample": images[:8]}
 
 
 def make_thumbs(images: list[Path], root: Path) -> list[Path]:
@@ -612,22 +912,26 @@ def image_viewer():
 def build_dataset_tab(f: Form):
     """Upload images/captions, view them in a grid and edit captions (saved to .txt on change)."""
     state = {"page": 0, "images": [], "busy": False}
-    with ui.row().classes("w-full items-end gap-2"):
-        folder = ui.input("Dataset folder", value=f.w["dataset_dir"].value).classes("w-96")
-        folder.bind_value(f.w["dataset_dir"], "value")  # keep in sync with the Train tab
+    with card():
+        with fields():
+            folder = ui.input("Dataset folder", value=f.w["dataset_dir"].value).classes("w-96 max-w-full")
+            folder.bind_value(f.w["dataset_dir"], "value")  # keep in sync with the Train tab
 
-        async def browse():
-            picked = await run.io_bound(tk_dialog, "dir", folder.value or "")
-            if picked:
-                folder.value = _relative(picked)
-                await refresh()
+            async def browse():
+                picked = await run.io_bound(tk_dialog, "dir", folder.value or "")
+                if picked:
+                    folder.value = _relative(picked)
+                    await refresh()
 
-        ui.button(icon="folder_open", on_click=browse).props("flat dense").tooltip("Browse")
-        ui.button("Load / refresh", on_click=lambda: refresh())
-        info = ui.label("").classes("text-sm")
-        spinner = ui.spinner(size="sm")
-        spinner.visible = False
-    with ui.row().classes("w-full items-center gap-2"):
+            if _native_dialogs:
+                ui.button(icon="folder_open", on_click=browse).props("flat dense round").tooltip("Browse")
+            ui.button("Load / refresh", icon="refresh", on_click=lambda: refresh()).props("unelevated")
+            spinner = ui.spinner(size="sm")
+            spinner.visible = False
+            info = ui.label("").classes("text-sm")
+        hint("Click a picture to see it full size. Captions are saved to the image's .txt file as you type. "
+             "Face ref / Body ref pick the images that character LoRAs are scored against.")
+    with ui.row().classes("w-full items-center gap-3"):
         def on_upload(e):
             dest = Path(folder.value or "datasets/new_dataset")
             dest.mkdir(parents=True, exist_ok=True)
@@ -638,12 +942,14 @@ def build_dataset_tab(f: Form):
             (dest / name).write_bytes(e.content.read())
 
         ui.upload(label="Upload images and .txt captions (drop files here)", multiple=True, auto_upload=True,
-                  on_upload=on_upload, on_multi_upload=lambda e: refresh()).props("accept=.png,.jpg,.jpeg,.webp,.bmp,.txt")             .classes("w-[36rem]")
-        with ui.row().classes("items-center"):
-            ui.button(icon="chevron_left", on_click=lambda: page(-1)).props("flat dense")
-            page_label = ui.label("")
-            ui.button(icon="chevron_right", on_click=lambda: page(1)).props("flat dense")
-            columns = ui.select([2, 3, 4, 5, 6], value=4, label="Columns").classes("w-24")
+                  on_upload=on_upload, on_multi_upload=lambda e: refresh()) \
+            .props("accept=.png,.jpg,.jpeg,.webp,.bmp,.txt flat bordered color=grey-10").classes("w-[36rem] max-w-full")
+        ui.space()
+        with ui.row().classes("items-center gap-1 no-wrap"):
+            ui.button(icon="chevron_left", on_click=lambda: page(-1)).props("flat dense round")
+            page_label = ui.label("").classes("text-sm")
+            ui.button(icon="chevron_right", on_click=lambda: page(1)).props("flat dense round")
+            columns = ui.select([2, 3, 4, 5, 6], value=4, label="Columns").classes("w-28 ml-2")
     grid = ui.grid(columns=4).classes("w-full gap-3")
     show_full = image_viewer()
 
@@ -684,9 +990,10 @@ def build_dataset_tab(f: Form):
             for img, thumb in zip(page_imgs, thumbs):
                 cap = img.with_suffix(".txt")
                 text = cap.read_text(encoding="utf-8") if cap.is_file() else ""
-                with ui.card().tight().classes("w-full"):
-                    ui.image(str(thumb)).props("fit=cover ratio=1").classes("w-full cursor-pointer")                         .on("click", lambda _, p=img: show_full(p)).tooltip("Click to view full size")
-                    with ui.row().classes("w-full items-center justify-between px-2 pt-1"):
+                with ui.card().tight().classes("w-full rz-thumb"):
+                    ui.image(str(thumb)).props("fit=cover ratio=1").classes("w-full cursor-pointer") \
+                        .on("click", lambda _, p=img: show_full(p)).tooltip("Click to view full size")
+                    with ui.row().classes("w-full items-center justify-between px-2 pt-1 gap-1"):
                         ui.label(img.name).classes("text-xs truncate")
                         vd = verdicts.get(str(img)) or verdicts.get(_relative(str(img)))
                         if vd and vd != "new":
@@ -699,7 +1006,8 @@ def build_dataset_tab(f: Form):
                             .classes("text-xs").tooltip("Use this image's body proportions as a reference")
                         status_label = ui.label("" if cap.is_file() else "no caption yet").classes("text-xs text-grey")
                     ui.textarea(value=text, placeholder="type a caption; it is saved to the .txt automatically",
-                                on_change=lambda e, p=img, sl=status_label: save_caption(p, e.value, sl))                         .props("dense outlined autogrow").classes("w-full px-2 pb-2 text-xs")
+                                on_change=lambda e, p=img, sl=status_label: save_caption(p, e.value, sl)) \
+                        .props("dense outlined autogrow").classes("w-full px-2 pb-2 text-xs")
 
     async def refresh():
         if state["busy"]:
@@ -725,19 +1033,21 @@ def build_dataset_tab(f: Form):
 def build_samples_tab(f: Form):
     """Live grid of generated sample images for the current (or any) job folder."""
     state = {"files": [], "columns": None}
-    with ui.row().classes("w-full items-end gap-2"):
-        folder = ui.input("Job folder (output/<job>)", value="").classes("w-96")
+    with card():
+        with fields():
+            folder = ui.input("Job folder (output/<job>)", value="").classes("w-96 max-w-full")
 
-        async def browse():
-            picked = await run.io_bound(tk_dialog, "dir", folder.value or str(ROOT / "output"))
-            if picked:
-                folder.value = _relative(picked)
-                state["files"] = []
+            async def browse():
+                picked = await run.io_bound(tk_dialog, "dir", folder.value or str(ROOT / "output"))
+                if picked:
+                    folder.value = _relative(picked)
+                    state["files"] = []
 
-        ui.button(icon="folder_open", on_click=browse).props("flat dense").tooltip("Browse")
-        follow = ui.checkbox("Follow current job", value=True)
-        columns = ui.select([2, 3, 4, 6], value=4, label="Columns").classes("w-28")
-        info = ui.label("").classes("text-sm")
+            if _native_dialogs:
+                ui.button(icon="folder_open", on_click=browse).props("flat dense round").tooltip("Browse")
+            follow = ui.switch("Follow current job", value=True)
+            columns = ui.select([2, 3, 4, 6], value=4, label="Columns").classes("w-28")
+            info = ui.label("").classes("rz-hint")
     grid = ui.grid(columns=4).classes("w-full gap-3")
     show_full = image_viewer()
 
@@ -769,8 +1079,9 @@ def build_samples_tab(f: Form):
         grid.clear()
         with grid:
             for p in files[:120]:
-                with ui.card().tight().classes("w-full"):
-                    ui.image(str(p)).props("fit=contain").classes("w-full h-64 bg-black cursor-pointer")                         .on("click", lambda _, q=p: show_full(q)).tooltip("Click to view full size")
+                with ui.card().tight().classes("w-full rz-thumb"):
+                    ui.image(str(p)).props("fit=contain").classes("w-full h-64 bg-black cursor-pointer") \
+                        .on("click", lambda _, q=p: show_full(q)).tooltip("Click to view full size")
                     sc = scores.get(p.name)
                     label = p.name + (score_caption(sc) if sc is not None else "")
                     ui.label(label).classes("text-xs px-2 py-1")
@@ -780,743 +1091,1720 @@ def build_samples_tab(f: Form):
     refresh()
 
 
-def build_page():
+# ---------------------------------------------------------------- wizard
+
+GOALS = {
+    "character": ("face", "Character / person",
+                  "A specific person or character. Turns on the measured identity recipe: region-weighted loss, face "
+                  "and bust crops, and likeness probes that keep the best checkpoint and stop early."),
+    "style": ("palette", "Style",
+              "An art style, medium, lighting or look that should carry over to any subject."),
+    "concept": ("category", "Concept / object",
+                "An object, outfit, pose or idea. Also the right pick when you are not sure."),
+}
+
+MODEL_NOTES = {
+    "MOSS-Image-Base": ("Recommended",
+                        "OpenMOSS's 5B base model and the usual one to train on: its LoRAs also work on SFT and load in "
+                        "ComfyUI with the standard Load LoRA node. About 30 GB to download."),
+    "MOSS-Image-SFT": ("", "The fine-tuned MOSS-Image checkpoint. Train on it only if you will generate with SFT alone; "
+                           "a Base LoRA can still preview its samples on SFT (Train tab, sampling model)."),
+    "FIBO-2.0-dev": ("", "Bria FIBO 2.0 (8B), the full non-distilled model. Gated: accept its terms on Hugging Face and "
+                         "run hf auth login first. LoRAs load in diffusers, also onto Edit Turbo; ComfyUI has no FIBO "
+                         "support yet."),
+    "FIBO-2.0-edit-turbo": ("Not for training", "The 4-step distilled edit model. Train on FIBO-2.0-dev instead: its "
+                                                "LoRAs load onto Edit Turbo."),
+}
+
+
+def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict], data: dict | None) -> dict[str, tuple]:
+    """Recommended (value, reason) per setting key, from the goal, the GPUs (nvidia-smi rows) and the dataset scan."""
+    r: dict[str, tuple] = {}
+    fibo = cfg.arch_name() == "fibo2"
+    character = goal == "character"
+    vram = min(g["total"] for g in gpus) / 1024 if gpus else None
+    gpu_name = "your smallest GPU" if len(gpus) > 1 else "your GPU"
+    # hardware
+    if len(gpus) >= 2:
+        r["multi_gpu"] = ("data_parallel", f"{len(gpus)} GPUs found: a model copy on each trains about 1.7-2x faster")
+    elif gpus:
+        r["multi_gpu"] = ("off", "one GPU found")
+    if cfg.model_source == "files":
+        r["transformer_quant"] = ("auto", "keeps the format of your file (a ComfyUI int8 or nvfp4 file stays quantized)")
+        r["text_encoder_quant"] = ("auto", "keeps the format of your file")
+    elif vram is not None:
+        if fibo:
+            r["transformer_quant"] = ("auto", "FIBO switches itself to int8 on GPUs under 22 GB")
+        elif vram >= 22:
+            r["transformer_quant"] = ("auto", f"{gpu_name} has {vram:.0f} GB, so the 10 GB bf16 model fits as it is")
+        elif vram >= 11:
+            r["transformer_quant"] = ("int8_convrot", f"{gpu_name} has {vram:.0f} GB: int8 halves the 10 GB model and "
+                                                      "its W8A8 compute is as fast as bf16, at under 1% error")
+        else:
+            r["transformer_quant"] = ("nvfp4", f"{gpu_name} has {vram:.0f} GB: nvfp4 quarters the model so it fits "
+                                               "(slower, fp4 weights are expanded every step)")
+        te_gb = 9 if fibo else 19
+        if vram >= te_gb + 4:
+            r["text_encoder_quant"] = ("auto", f"the {te_gb} GB text encoder fits on {gpu_name} as it is")
+        else:
+            r["text_encoder_quant"] = ("int8", f"halves the {te_gb} GB text encoder so it fits on the GPU for caching "
+                                               "instead of spilling into system RAM")
+    r["gradient_checkpointing"] = (True, "saves most of the activation memory for a modest slowdown")
+    r["compile_model"] = (False, "turn it on once a run works; the first steps compile slowly")
+    # dataset
+    target = 1.0 if vram is None or vram >= 12 else 0.5
+    reason = ("1 MP (1024x1024) is the size the model was trained at" if target == 1.0
+              else f"0.5 MP keeps memory low on a {vram:.0f} GB GPU")
+    if data and data.get("median_mp") and data["median_mp"] < target * 0.9:
+        med = data["median_mp"]
+        target = max(0.25, int(med * 4) / 4)
+        reason = f"half of your images are under {med:.2f} MP; training above their size only upscales them"
+    r["resolutions"] = ([target], reason)
+    r["enable_buckets"] = (True, "keeps every image's aspect ratio instead of cropping it square")
+    if character:
+        r["flip_augment"] = (False, "faces are not symmetric (hair parting, moles, logos); mirrored copies blur them")
+    elif goal == "style":
+        r["flip_augment"] = (True, "a mirrored image has the same style, so this doubles the variety for free")
+    else:
+        r["flip_augment"] = (False, "only worth it if your subject looks the same mirrored (no text or logos)")
+    if character and cfg.dataset_dir:
+        r["face_refs"] = (cfg.dataset_dir, "every image with a face becomes a reference (a folder means all its images)")
+    # training
+    n = (data or {}).get("images") or 0
+    if n:
+        steps = int(min(4000, max(1000, round(n * 100, -2))))
+        r["steps"] = (steps, f"about 100 steps per image for {n} images"
+                             + ("; the likeness probes can stop it earlier" if character else ""))
+    else:
+        r["steps"] = (2000, "a good start; scan your dataset (Dataset step) for a number that fits it")
+    r["learning_rate"] = (1e-4, "the usual LoRA learning rate; go lower (5e-5) if samples look burnt or noisy")
+    r["optimizer"] = ("adamw8bit", "AdamW with 8-bit state: the same results as adamw with less memory")
+    rank = 32 if goal == "style" else 16
+    r["lora_rank"] = (rank, "styles carry a lot of varied detail" if goal == "style"
+                      else "plenty for a character or concept; higher ranks mostly add file size")
+    r["lora_alpha"] = (float(rank), "alpha equal to rank keeps the adapter's scale at 1")
+    r["batch_size"] = (1, "small batches with more steps beat large batches for LoRAs")
+    if character:
+        r["region_weights"] = (True, "the best measured single setting for face likeness")
+    # saving and samples
+    total = int(cfg.steps or 2000)
+    every = max(100, int(round(total / 8 / 50)) * 50)
+    r["save_every"] = (every, f"about 8 checkpoints over {total} steps to choose from afterwards")
+    r["sample_every"] = (every, "a sample set at every checkpoint shows which one to keep")
+    if cfg.turbo_lora:
+        r["sample_steps"] = (8, "most turbo LoRAs are 8-step distills; match yours")
+        r["sample_cfg"] = (1.0, "distilled turbo LoRAs sample without guidance")
+    elif fibo:
+        r["sample_steps"] = (30, "Bria samples dev at 50 steps; 20-30 is plenty for previews")
+        r["sample_cfg"] = (5.0, "Bria's guidance scale for FIBO 2.0 dev")
+    else:
+        r["sample_steps"] = (20, "the reference MOSS-Image sampler")
+        r["sample_cfg"] = (3.0, "the reference MOSS-Image guidance scale")
+    if character:
+        r["probe_every"] = (25, "frequent quick checks give the best-checkpoint and early-stop decisions enough points")
+        if cfg.turbo_lora:
+            r["probe_steps"] = (8, "fast probes with the turbo LoRA")
+            r["probe_cfg"] = (1.0, "turbo LoRAs sample without guidance")
+        else:
+            r["probe_steps"] = (r["sample_steps"][0], "without a turbo LoRA a probe needs the full sampler steps")
+            r["probe_cfg"] = (r["sample_cfg"][0], "without a turbo LoRA a probe needs normal guidance")
+        face_p, body_p = PRESET_PROBE_PROMPTS["identity"]
+        subject = cfg.trigger_word or "the character"
+        r["probe_face_prompt"] = (face_p.format(trigger=subject), "a plain headshot scores the face reliably")
+        r["probe_body_prompt"] = (body_p.format(trigger=subject), "an upright full-body shot scores proportions")
+    return r
+
+
+def review_issues(cfg: TrainConfig, goal: str | None, data: dict | None, n_gpus: int) -> list[tuple[str, str]]:
+    """What the wizard's last step points out before starting: (error | warning | info, text)."""
+    out: list[tuple[str, str]] = []
+    if _running():
+        out.append(("error", "A training job is already running. Stop it (Monitor tab) before starting another."))
+    if not Path(cfg.dataset_dir).is_dir():
+        out.append(("error", f"Dataset folder not found: {cfg.dataset_dir or '(empty)'}"))
+    elif data is not None:
+        if not data["images"]:
+            out.append(("error", "The dataset folder has no images (png, jpg, webp or bmp)."))
+        elif data["captioned"] < data["images"] and not cfg.trigger_word:
+            out.append(("warning", f"{data['images'] - data['captioned']} of {data['images']} images have no caption "
+                                   "and there is no trigger word, so they train on an empty prompt."))
+    try:
+        cfg.validate()
+    except ValueError as e:
+        out.append(("error", str(e)))
+    if cfg.model_source == "files":
+        for key, label in (("transformer_file", "Diffusion model"), ("text_encoder_file", "Text encoder"),
+                           ("vae_file", "VAE")):
+            if getattr(cfg, key) and not Path(getattr(cfg, key)).is_file():
+                out.append(("error", f"{label} file not found: {getattr(cfg, key)}"))
+    elif "edit-turbo" in cfg.model_path.lower():
+        out.append(("warning", "FIBO-2.0-edit-turbo is a distilled model. Train on FIBO-2.0-dev: its LoRAs load "
+                               "onto Edit Turbo."))
+    elif cfg.arch_name() == "fibo2":
+        out.append(("info", "FIBO 2.0 is gated: accept its terms on Hugging Face and log in with hf auth login "
+                            "before the first download."))
+    if cfg.multi_gpu != "off" and n_gpus < 2:
+        out.append(("error", "Multi-GPU is on, but only one GPU was found."))
+    if goal == "character" or cfg.preset == "identity":
+        if not (cfg.face_refs or cfg.body_refs):
+            out.append(("warning", "No face or body references: likeness scores, the best checkpoint and early stop "
+                                   "need them (Dataset step)."))
+        elif cfg.probe_every > 0 and not cfg.turbo_lora and cfg.probe_steps <= 10:
+            out.append(("warning", f"Probes render in {cfg.probe_steps} steps without a turbo LoRA, so they come out "
+                                   "unfinished and their likeness scores mean little. Set a turbo LoRA or raise the "
+                                   "probe steps (Samples step)."))
+    if cfg.sample_every <= 0 or not cfg.sample_prompts:
+        out.append(("info", "No sample prompts (or sampling is off): there will be no preview images while training."))
+    if cfg.save_every > cfg.steps:
+        out.append(("info", "Save every is more than the number of steps, so only the final LoRA is saved."))
+    return out
+
+
+def suggested_prompts(goal: str | None, trigger: str) -> list[str]:
+    if goal == "character":
+        t = trigger or "the character"
+        return [f"photo of {t} smiling in a sunny park, natural light",
+                f"close-up portrait of {t}, studio lighting, plain grey background",
+                f"full body photo of {t} walking down a city street at night, neon lights"]
+    if goal == "style":
+        t = f"{trigger} style" if trigger else "the trained style"
+        return [f"a lighthouse on a rocky coast at sunset, {t}",
+                f"portrait of an old fisherman with a pipe, {t}",
+                f"a busy market street full of people, {t}"]
+    t = trigger or "the subject"
+    return [f"photo of {t} on a wooden table, soft daylight",
+            f"{t} in a snowy forest, cinematic lighting",
+            f"close-up photo of {t}, studio lighting, black background"]
+
+
+def _same(current, rec) -> bool:
+    """Does the current widget value match a recommended value?"""
+    if isinstance(rec, bool):
+        return bool(current) == rec
+    if isinstance(rec, (int, float)):
+        try:
+            return abs(float(current) - rec) <= 1e-6 * max(abs(float(current)), abs(rec), 1e-12)
+        except (TypeError, ValueError):
+            return False
+    if isinstance(rec, list):
+        try:
+            return sorted(float(x) for x in (current or [])) == sorted(float(x) for x in rec)
+        except (TypeError, ValueError):
+            return False
+    if isinstance(rec, str):
+        return (current or "").strip() == rec.strip()
+    return current == rec
+
+
+def _show(widget, value) -> str:
+    """A recommended value the way the user sees it (the option label of a select, on/off, megapixels)."""
+    options = getattr(widget, "options", None)
+    if isinstance(options, dict) and value in options:
+        return str(options[value])
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    if isinstance(value, list):
+        return ", ".join(f"{v:g} MP" for v in value)
+    if isinstance(value, float):
+        return f"{value:g}"
+    text = str(value)
+    return text if len(text) <= 48 else text[:45] + "..."
+
+
+class Wizard:
+    """Guided setup on its own tab: one step per topic, each setting explained, with a recommended value.
+
+    Its controls are bound to the full form's widgets (Train tab), so both views edit the same settings and a run
+    started from either is the same run."""
+
+    STEPS = (("goal", "Goal", "flag"), ("model", "Model", "model_training"), ("hardware", "Hardware", "memory"),
+             ("dataset", "Dataset", "photo_library"), ("training", "Training", "school"),
+             ("samples", "Samples", "image"), ("review", "Review & start", "rocket_launch"))
+
+    def __init__(self, f: Form, gpus: list[str], start, goto):
+        self.f, self.w = f, f.w
+        self.gpus = gpus  # torch device names for the device select
+        self.start = start  # start_job(): starts training from the form, True when it started
+        self.goto = goto  # goto(tab name)
+        self.goal: str | None = "character" if self.w["preset_toggle"].value else None
+        self.smi: list[dict] = []  # nvidia-smi rows (memory per GPU)
+        self.data: dict | None = None  # last dataset scan
+        self.recs: dict[str, tuple] = {}
+        self.rec_rows: list[tuple] = []
+        self.goal_cards: dict[str, ui.card] = {}
+        self.model_cards: dict[str, ui.card] = {}
+        self.steps: dict[str, ui.step] = {}
+
+    # ------------------------------------------------------------ building blocks
+
+    def bind(self, widget, key: str):
+        """Bind a wizard control to the form widget `key` and keep the recommendations current."""
+        widget.bind_value(self.w[key], "value")
+        widget.on_value_change(lambda _: self.refresh())
+        return widget
+
+    @contextmanager
+    def setting(self, key: str | None, title: str, text: str, show_if=None):
+        """One setting: title, explanation and recommendation on the left, the control (built in the block) on the
+        right. show_if=(form key, predicate) shows it only while the predicate holds for that widget's value."""
+        box = ui.element("div").classes("rz-setting")
+        if show_if is not None:
+            box.bind_visibility_from(self.w[show_if[0]], "value", show_if[1])
+        with box:
+            with ui.column().classes("gap-1 min-w-0"):
+                ui.label(title).classes("rz-setting-title")
+                ui.label(text).classes("rz-hint")
+                if key:
+                    self.rec_row(key)
+            with ui.column().classes("gap-2 w-full min-w-0 justify-center"):
+                yield
+
+    def rec_row(self, key: str):
+        with ui.row().classes("rz-rec items-start gap-2 no-wrap") as row:
+            icon = ui.icon("lightbulb").classes("mt-[2px] shrink-0")
+            label = ui.label("").classes("min-w-0")
+            btn = ui.button("Use", on_click=lambda: self.apply([key])) \
+                .props("outline dense size=sm no-caps color=white").classes("shrink-0 px-2") \
+                .tooltip("Use the recommended value")
+        self.rec_rows.append((key, row, icon, label, btn))
+
+    def apply_bar(self, keys: list[str]):
+        with ui.row().classes("rz-apply w-full items-center gap-3"):
+            ui.icon("auto_awesome").classes("text-xl").style("color: var(--rz-red-bright)")
+            ui.label("Not sure? Take every recommendation on this page.").classes("text-sm")
+            ui.space()
+            ui.button("Apply recommended", icon="done_all", on_click=lambda: self.apply(keys)).props("unelevated")
+
+    def nav(self, back: bool = True):
+        with ui.stepper_navigation():
+            if back:
+                ui.button("Back", icon="arrow_back", on_click=self.stepper.previous).props("flat")
+            ui.space()
+            ui.button("Next", on_click=self.stepper.next).props("unelevated icon-right=arrow_forward")
+
+    def heading(self, title: str, text: str):
+        ui.label(title).classes("rz-step-title")
+        hint(text)
+
+    # ------------------------------------------------------------ recommendations
+
+    def refresh(self):
+        try:
+            cfg = self.f.to_config()
+        except (TypeError, ValueError):
+            return  # a field is mid-edit (e.g. an empty number); keep the last recommendations
+        self.recs = wizard_recommendations(cfg, self.goal, self.smi, self.data)
+        for key, row, icon, label, btn in self.rec_rows:
+            rec = self.recs.get(key)
+            row.visible = rec is not None
+            if rec is None:
+                continue
+            value, reason = rec
+            same = _same(self.w[key].value, value)
+            if same:
+                row.classes(add="ok")
+                label.text = f"{reason[:1].upper()}{reason[1:]}."
+            else:
+                row.classes(remove="ok")
+                label.text = f"Recommended: {_show(self.w[key], value)}. {reason[:1].upper()}{reason[1:]}."
+            icon.name = "check_circle" if same else "lightbulb"
+            btn.visible = not same
+
+    def apply(self, keys: list[str]):
+        for key in keys:
+            rec = self.recs.get(key)
+            if rec is not None:
+                self.w[key].value = list(rec[0]) if isinstance(rec[0], list) else rec[0]
+            self.refresh()  # later recommendations can depend on earlier ones (save every on steps)
+
+    # ------------------------------------------------------------ steps
+
+    def build(self):
+        with ui.column().classes("rz-page gap-4"):
+            with card():
+                with ui.row().classes("w-full items-center gap-4"):
+                    with ui.column().classes("gap-1 flex-1 min-w-[16rem]"):
+                        ui.label("Guided setup").classes("rz-title")
+                        hint("Walks through a training run one topic at a time. Every setting is explained and comes "
+                             "with a recommendation for your GPUs and dataset: click Use to take it, or Apply "
+                             "recommended for a whole page. These are the same settings as on the Train tab, which "
+                             "has every option.")
+                    ui.button("All settings", icon="tune", on_click=lambda: self.goto("Train")).props("outline")
+            with ui.stepper(on_value_change=self.on_step).props("header-nav alternative-labels animated flat") \
+                    .classes("rz-stepper w-full") as self.stepper:
+                for name, title, icon in self.STEPS:
+                    with ui.step(name, title=title, icon=icon).props(f"active-icon={icon}") as step:
+                        self.steps[name] = step
+                        getattr(self, f"step_{name}")()
+        self.w["preset_toggle"].on_value_change(lambda e: self.sync_goal(e.value))
+        self.w["model_preset"].on_value_change(lambda _: (self.mark_model(), self.refresh()))
+        self.mark_goal()
+        self.mark_model()
+        self.refresh()
+        ui.timer(0.2, self.detect_gpus, once=True)
+
+    async def on_step(self, e):
+        name = e.value if isinstance(e.value, str) else e.value.props.get("name")
+        names = [s[0] for s in self.STEPS]
+        idx = names.index(name) if name in names else 0
+        for i, n in enumerate(names):
+            self.steps[n].props(add="done") if i < idx else self.steps[n].props(remove="done")
+        if name == "dataset" and self.data is None and Path(self.w["dataset_dir"].value or "").is_dir():
+            await self.scan()
+        if name == "review":
+            await self.render_review()
+
+    # ---- 1 goal
+    def step_goal(self):
+        self.heading("What are you training?", "This picks the recipe for the rest of the wizard. You can change "
+                                               "anything afterwards.")
+        with ui.element("div").classes("rz-choices"):
+            for key, (icon, title, text) in GOALS.items():
+                with ui.card().props("flat").classes("rz-choice") as c:
+                    with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                        ui.icon(icon).classes("rz-choice-icon")
+                        ui.label(title).classes("rz-setting-title")
+                        ui.space()
+                        ui.icon("check_circle").classes("rz-check")
+                    ui.label(text).classes("rz-hint")
+                c.on("click", lambda _, k=key: self.set_goal(k))
+                self.goal_cards[key] = c
+        self.goal_note = ui.label("").classes("rz-banner info")
+        with self.setting(None, "Job name", "The name of this run. Checkpoints are saved as "
+                                            "output/<job name>/<job name>_<step>.safetensors and the final LoRA as "
+                                            "output/<job name>/<job name>.safetensors."):
+            self.bind(ui.input("Job name"), "job_name").classes("w-full")
+        self.nav(back=False)
+
+    def set_goal(self, goal: str):
+        self.goal = goal
+        want = goal == "character"
+        if bool(self.w["preset_toggle"].value) != want:
+            self.w["preset_toggle"].value = want  # applies the identity recipe, or restores the settings from before
+        self.mark_goal()
+        self.refresh()
+
+    def sync_goal(self, preset_on: bool):
+        """The identity preset was switched elsewhere (Train tab, a loaded config)."""
+        if preset_on:
+            self.goal = "character"
+        elif self.goal == "character":
+            self.goal = None
+        self.mark_goal()
+        self.refresh()
+
+    def mark_goal(self):
+        for key, c in self.goal_cards.items():
+            c.classes(add="selected") if key == self.goal else c.classes(remove="selected")
+        if self.goal == "character":
+            self.goal_note.text = ("Identity recipe on: region-weighted loss (face 3 / person 1.5 / background 0.3), "
+                                   "LoRA+ 4 with adamw8bit, face and bust crops, likeness probes every 25 steps with "
+                                   "best checkpoint and early stop, curriculum, per-image loss watch.")
+        elif self.goal:
+            self.goal_note.text = f"{GOALS[self.goal][1]}: general settings, tuned on the next pages."
+        else:
+            self.goal_note.text = "Pick one to get recommendations that fit it."
+
+    # ---- 2 model
+    def step_model(self):
+        self.heading("Which model do you want to train on?", "The base model the LoRA is trained for.")
+        with self.setting(None, "Where the model comes from",
+                          "Hugging Face downloads the model once into models/ and reuses it after that. Single files "
+                          "uses the diffusion model, text encoder and VAE files you already have for ComfyUI, so "
+                          "nothing is downloaded (MOSS-Image only)."):
+            self.bind(ui.radio([HF_SOURCE, FILE_SOURCE]), "model_source")
+        with ui.column().classes("w-full gap-3 pt-4") \
+                .bind_visibility_from(self.w["model_source"], "value", lambda x: x == HF_SOURCE):
+            with ui.element("div").classes("rz-choices"):
+                for name, (badge, text) in [*MODEL_NOTES.items(), (CUSTOM, ("", "Any local diffusers folder "
+                                                                                 "(transformer/, text_encoder/, vae/) "
+                                                                                 "or Hugging Face repo id."))]:
+                    with ui.card().props("flat").classes("rz-choice") as c:
+                        with ui.row().classes("w-full items-center gap-2"):
+                            ui.label(name).classes("rz-setting-title")
+                            if badge:
+                                ui.label(badge).classes("rz-badge" + ("" if badge == "Recommended" else " muted"))
+                            ui.space()
+                            ui.icon("check_circle").classes("rz-check")
+                        ui.label(text).classes("rz-hint")
+                    c.on("click", lambda _, n=name: setattr(self.w["model_preset"], "value", n))
+                    self.model_cards[name] = c
+            with self.setting(None, "Custom model", "A local folder in diffusers layout, or a Hugging Face repo id "
+                                                    "such as OpenMOSS-Team/MOSS-Image-Base.",
+                              show_if=("model_preset", lambda p: p == CUSTOM)):
+                self.bind(ui.input("Path or repo id"), "model_path").classes("w-full")
+            with self.setting(None, "Download and check",
+                              "Fetches what is missing and checks the files already there. Training would also do "
+                              "this on start, but doing it now shows problems (gated repo, no login, disk space) "
+                              "before you start."):
+                status = hint("")
+
+                async def download():
+                    status.text = "Downloading / verifying... (about 30 GB on the first download)"
+                    status.text = await run.io_bound(download_model, self.f.to_config().model_path)
+
+                ui.button("Download / verify", icon="download", on_click=download).props("outline")
+        with ui.column().classes("w-full gap-0 pt-2") \
+                .bind_visibility_from(self.w["model_source"], "value", lambda x: x == FILE_SOURCE):
+            for key, title, text, kind in (
+                    ("transformer_file", "Diffusion model", "ComfyUI models/diffusion_models file: bf16, fp8, int8 or "
+                                                            "nvfp4.", "file"),
+                    ("text_encoder_file", "Text encoder", "ComfyUI models/text_encoders file: Qwen3.5-9B.", "file"),
+                    ("vae_file", "VAE", "ComfyUI models/vae file: the Flux2 VAE.", "file"),
+                    ("tokenizer_path", "Tokenizer folder (optional)", "Left empty, the tokenizer is downloaded once "
+                                                                      "(a few MB).", "dir")):
+                with self.setting(None, title, text + " Any file left empty is taken from the Hugging Face model."):
+                    self.bind(path_field(title, kind, width="w-full"), key)
+        self.nav()
+
+    def mark_model(self):
+        for name, c in self.model_cards.items():
+            c.classes(add="selected") if name == self.w["model_preset"].value else c.classes(remove="selected")
+
+    # ---- 3 hardware
+    async def detect_gpus(self):
+        self.smi = await run.io_bound(gpu_stats)
+        self.gpu_box.clear()
+        with self.gpu_box:
+            if not self.smi:
+                hint("No NVIDIA GPU found with nvidia-smi. The recommendations below assume a 16 GB+ card.", warn=True)
+            for g in self.smi:
+                with ui.column().classes("rz-tile gap-0"):
+                    ui.label(f"GPU {g['index']}").classes("rz-tile-label")
+                    ui.label(g["name"]).classes("rz-tile-value text-base")
+                    ui.label(f"{g['total'] / 1024:.0f} GB memory, {g['used'] / 1024:.1f} GB in use").classes("rz-tile-sub")
+        self.refresh()
+
+    def step_hardware(self):
+        self.heading("Your GPUs", "How the model is spread over your GPUs and how much memory it may take.")
+        self.gpu_box = ui.row().classes("w-full gap-3")
+        with self.gpu_box:
+            ui.spinner(size="sm")
+        self.apply_bar(["multi_gpu", "transformer_quant", "text_encoder_quant", "gradient_checkpointing",
+                        "compile_model"])
+        with self.setting("multi_gpu", "Multi-GPU",
+                          "Data parallel puts a full model copy on each GPU, each trains its own images, and the "
+                          "results are averaged: about 1.7-2x the speed with two cards (each must fit the model). "
+                          "Model split divides the model's blocks over the GPUs: half the memory each, not faster."):
+            self.bind(ui.select(dict(self.w["multi_gpu"].options), label="Multi-GPU"), "multi_gpu").classes("w-full")
+        with self.setting(None, "Training GPU", "The GPU that trains. Pick the one with the most memory "
+                                                "(listed in CUDA order).",
+                          show_if=("multi_gpu", lambda x: x == "off")):
+            self.bind(ui.select(self.gpus, label="Training GPU"), "device").classes("w-full")
+        with self.setting(None, "GPUs to use", "Comma-separated, the first is the main GPU (it also saves and "
+                                               "samples).", show_if=("multi_gpu", lambda x: x != "off")):
+            self.bind(ui.input("Devices"), "devices").classes("w-full")
+        with self.setting("transformer_quant", "Model quantization",
+                          "Stores the frozen base model in fewer bits to save memory; the LoRA itself always trains "
+                          "in full precision. auto keeps the model as it is. int8_convrot halves it at under 1% error "
+                          "and is as fast as bf16 or faster; nvfp4 quarters it but is slower."):
+            self.bind(ui.select(QUANTS, label="Diffusion model quant"), "transformer_quant").classes("w-full")
+        with self.setting("text_encoder_quant", "Text encoder quantization",
+                          "The text encoder only runs once before training, to turn your captions into embeddings, "
+                          "and is unloaded afterwards. Quantizing it lets it fit on the GPU, so that step is quick."):
+            self.bind(ui.select(QUANTS, label="Text encoder quant"), "text_encoder_quant").classes("w-full")
+        with self.setting("gradient_checkpointing", "Gradient checkpointing",
+                          "Recomputes intermediate results during the backward pass instead of keeping them in "
+                          "memory: far less memory for some extra time per step."):
+            self.bind(ui.switch("Gradient checkpointing"), "gradient_checkpointing")
+        with self.setting("compile_model", "Compile the model",
+                          "torch.compile makes every step faster after a slow first few (triton is installed with "
+                          "the requirements). Best left off for a first run."):
+            self.bind(ui.switch("Compile model"), "compile_model")
+        self.nav()
+
+    # ---- 4 dataset
+    def step_dataset(self):
+        self.heading("Your images", "A folder of images, each with an optional same-name .txt caption. 15-50 sharp, "
+                                    "varied images are typical for a character; styles and concepts like 20-100.")
+        with self.setting(None, "Dataset folder", "Upload images and write captions on the Dataset tab, or point "
+                                                  "this at a folder you already have. Sub-folders are included."):
+            folder = self.bind(path_field("Dataset folder", "dir", width="w-full"), "dataset_dir")
+            folder.on_value_change(lambda _: self.forget_scan())
+            with ui.row().classes("gap-2"):
+                ui.button("Scan folder", icon="search", on_click=self.scan).props("unelevated")
+                ui.button("Dataset tab", icon="photo_library", on_click=lambda: self.goto("Dataset")).props("flat")
+        self.scan_box = ui.column().classes("w-full gap-3")
+        self.apply_bar(["resolutions", "enable_buckets", "flip_augment", "face_refs"])
+        with self.setting(None, "Trigger word",
+                          "Put in front of every caption, and then used in your prompts to call up what the LoRA "
+                          "learned. Pick a word the model does not know yet, such as 'zxq woman' or 'inkwash style'. "
+                          "Leave it empty if your captions already contain one."):
+            self.bind(ui.input("Trigger word"), "trigger_word").classes("w-full")
+        with self.setting(None, "Captions",
+                          "Describe in each caption what should stay changeable: clothes, background, pose, "
+                          "lighting. What you leave out is what the LoRA learns as part of the trigger word, so for a "
+                          "character do not describe the face; for a style, describe the content but not the style."):
+            ui.button("Edit captions", icon="edit_note", on_click=lambda: self.goto("Dataset")).props("outline")
+        with self.setting("resolutions", "Training resolution",
+                          "The image area training works at, in megapixels (1 MP = 1024x1024), with each image's "
+                          "aspect ratio kept. Higher learns finer detail but takes more memory and time. Picking "
+                          "several mixes them."):
+            self.bind(ui.select(MP_OPTIONS, multiple=True, label="Resolutions").props("use-chips"), "resolutions") \
+                .classes("w-full")
+        with self.setting("enable_buckets", "Aspect-ratio buckets",
+                          "Groups images by shape and trains each at its own aspect ratio. Off, every image is cropped "
+                          "to a square."):
+            self.bind(ui.switch("Aspect-ratio buckets"), "enable_buckets")
+        with self.setting("flip_augment", "Mirror images",
+                          "Also trains a left-right mirrored copy of every image: twice the variety, but anything "
+                          "asymmetric (a hair parting, a logo, text) gets blurred."):
+            self.bind(ui.switch("Horizontal flip"), "flip_augment")
+        with self.setting("face_refs", "Face references",
+                          "Images whose face is the identity to match. Samples and probes are compared with them "
+                          "(ArcFace; 50%+ generally means the same person), which picks the best checkpoint and "
+                          "stops early. A folder counts as all its images; you can also tick Face ref on the Dataset "
+                          "tab.", show_if=("preset_toggle", bool)):
+            self.bind(ui.textarea("Face references (one path per line)"), "face_refs").classes("w-full")
+        with self.setting(None, "Body references (optional)",
+                          "Full-body shots in an upright, fairly neutral pose, to score body proportions as well. "
+                          "Tick Body ref on such images on the Dataset tab, or list them here.",
+                          show_if=("preset_toggle", bool)):
+            self.bind(ui.textarea("Body references (one path per line)"), "body_refs").classes("w-full")
+        self.nav()
+
+    def forget_scan(self):
+        if self.data is not None and self.data.get("folder") != (self.w["dataset_dir"].value or ""):
+            self.data = None
+            self.scan_box.clear()
+            self.refresh()
+
+    async def scan(self):
+        folder = (self.w["dataset_dir"].value or "").strip()
+        self.scan_box.clear()
+        with self.scan_box:
+            ui.spinner(size="sm")
+        self.data = await run.io_bound(dataset_summary, folder)
+        thumbs = await run.io_bound(make_thumbs, self.data["sample"], Path(folder)) if self.data else []
+        self.scan_box.clear()
+        with self.scan_box:
+            if self.data is None:
+                ui.label(f"Folder not found: {folder or '(empty)'}").classes("rz-banner error")
+            else:
+                n, cap, mp = self.data["images"], self.data["captioned"], self.data["median_mp"]
+                with ui.row().classes("w-full gap-3"):
+                    for label, value, sub in (("Images", str(n), "png, jpg, webp, bmp"),
+                                              ("Captioned", f"{cap} / {n}", ".txt or .json next to the image"),
+                                              ("Typical size", f"{mp:.2f} MP" if mp else "-", "median image area")):
+                        v, s = stat_tile(label)
+                        v.text, s.text = value, sub
+                if not n:
+                    ui.label("No images in this folder yet. Add them on the Dataset tab (drag and drop) or copy "
+                             "them into the folder, then scan again.").classes("rz-banner warning")
+                elif cap < n:
+                    ui.label(f"{n - cap} images have no caption yet. They train on the trigger word alone, which "
+                             "works for a quick character LoRA; captions give a more flexible one.") \
+                        .classes("rz-banner warning")
+                if thumbs:
+                    with ui.row().classes("w-full gap-2"):
+                        for t in thumbs:
+                            ui.image(str(t)).classes("w-24 h-24 rz-thumb")
+        self.refresh()
+
+    # ---- 5 training
+    def step_training(self):
+        self.heading("How to train", "How long and how hard to train, and how big the LoRA is.")
+        self.apply_bar(["steps", "learning_rate", "optimizer", "lora_rank", "lora_alpha", "batch_size",
+                        "region_weights"])
+        with self.setting("steps", "Training steps",
+                          "Each step trains on one batch of images. Too few and the LoRA is weak; too many and it "
+                          "starts copying the training images (overfitting). Checkpoints are saved on the way, so "
+                          "you can always go back to an earlier one."):
+            self.bind(ui.number("Steps", min=1, precision=0), "steps").classes("w-full")
+        with self.setting("learning_rate", "Learning rate",
+                          "How big each update is. Too high gives burnt, noisy samples; too low learns slowly. LoRAs "
+                          "use about 10x the learning rate of a full fine-tune, almost regardless of rank."):
+            self.bind(ui.number("Learning rate", format="%.1e", step=1e-5, min=0), "learning_rate").classes("w-full")
+        with self.setting("optimizer", "Optimizer",
+                          "adamw8bit is AdamW with its state stored in 8 bits: the default choice. adamw keeps full "
+                          "precision state (same results, more memory). adafactor is a lighter alternative. "
+                          "automagic3 tunes its own learning rate per weight."):
+            self.bind(ui.select(["adamw", "adamw8bit", "adafactor", "automagic3"], label="Optimizer"), "optimizer") \
+                .classes("w-full")
+        with self.setting("lora_rank", "LoRA rank",
+                          "The size of the adapter. Higher ranks can hold more detail but give bigger files and "
+                          "memorise the training images more easily."):
+            self.bind(ui.number("Rank", min=1, max=256, precision=0), "lora_rank").classes("w-full")
+        with self.setting("lora_alpha", "LoRA alpha",
+                          "Scales the adapter's effect (alpha / rank). Keeping alpha equal to rank is the safe "
+                          "default."):
+            self.bind(ui.number("Alpha", min=0), "lora_alpha").classes("w-full")
+        with self.setting("batch_size", "Batch size",
+                          "Images per step. Larger batches need more memory and, for LoRAs, rarely help."):
+            self.bind(ui.number("Batch size", min=1, precision=0), "batch_size").classes("w-full")
+        with self.setting("region_weights", "Region-weighted loss",
+                          "Weights what the model learns by region: the face counts most, the rest of the person "
+                          "next, the background least, so the LoRA spends its capacity on the identity.",
+                          show_if=("preset_toggle", bool)):
+            self.bind(ui.switch("Region-weighted loss"), "region_weights")
+        hint("Timesteps, schedules, LoRA layers and blocks, and per-image loss watch are on the Train tab.")
+        self.nav()
+
+    # ---- 6 samples
+    def step_samples(self):
+        self.heading("Checkpoints and preview images", "What gets saved along the way, and the pictures that show "
+                                                       "how training is going.")
+        self.apply_bar(["save_every", "sample_every", "sample_steps", "sample_cfg", "probe_every", "probe_steps",
+                        "probe_cfg", "probe_face_prompt", "probe_body_prompt"])
+        with self.setting("save_every", "Save a checkpoint every",
+                          "Steps between saved LoRAs (output/<job>/<job>_<step>.safetensors). Several of them let you "
+                          "pick the last one before it started to overfit."):
+            self.bind(ui.number("Save every", min=1, precision=0, suffix="steps"), "save_every").classes("w-full")
+        with self.setting("sample_every", "Preview images every",
+                          "Steps between sample sets (0 = never). Training pauses while they render; they show up "
+                          "on the Monitor and Samples tabs."):
+            self.bind(ui.number("Sample every", min=0, precision=0, suffix="steps"), "sample_every").classes("w-full")
+        with self.setting(None, "Sample prompts",
+                          "One prompt per line, rendered at every sample step with a fixed seed, so the pictures are "
+                          "comparable over time. Use your trigger word and vary the scene to see whether the LoRA "
+                          "carries over to new situations."):
+            self.bind(ui.textarea("Sample prompts (one per line)"), "sample_prompts").classes("w-full")
+            ui.button("Suggest prompts", icon="lightbulb", on_click=self.suggest).props("flat")
+        with self.setting(None, "Turbo LoRA (optional)",
+                          "A step-distilled LoRA (for example an 8-step DMD distill of MOSS-Image-Base), used only "
+                          "while rendering samples and probes, never in training. Previews then take seconds; set the "
+                          "steps and guidance below to match it."):
+            self.bind(path_field("Turbo LoRA", "file", width="w-full"), "turbo_lora")
+        with self.setting("sample_steps", "Sampling steps", "Denoising steps per preview image. More is slower and "
+                                                            "a little cleaner."):
+            self.bind(ui.number("Sample steps", min=1, precision=0), "sample_steps").classes("w-full")
+        with self.setting("sample_cfg", "Guidance (CFG)", "How strictly previews follow the prompt."):
+            self.bind(ui.number("Sample CFG", min=0, step=0.5), "sample_cfg").classes("w-full")
+        is_identity = ("preset_toggle", bool)
+        with self.setting("probe_every", "Likeness probe every",
+                          "A quick, small headshot and full-body render every N steps, scored against your "
+                          "references. The scores keep the best checkpoint (<job>_best.safetensors) and can stop "
+                          "training once it stops improving.", show_if=is_identity):
+            self.bind(ui.number("Probe every", min=0, precision=0, suffix="steps"), "probe_every").classes("w-full")
+        with self.setting("probe_face_prompt", "Face probe prompt",
+                          "A plain headshot of your character, rendered with a fixed seed.", show_if=is_identity):
+            self.bind(ui.textarea("Face probe prompt").props("autogrow"), "probe_face_prompt").classes("w-full")
+        with self.setting("probe_body_prompt", "Body probe prompt",
+                          "A full-body, upright shot, for the body proportions score.", show_if=is_identity):
+            self.bind(ui.textarea("Body probe prompt").props("autogrow"), "probe_body_prompt").classes("w-full")
+        with self.setting("probe_steps", "Probe steps", "Denoising steps per probe.", show_if=is_identity):
+            self.bind(ui.number("Probe steps", min=1, precision=0), "probe_steps").classes("w-full")
+        with self.setting("probe_cfg", "Probe guidance (CFG)", "Guidance for the probes.", show_if=is_identity):
+            self.bind(ui.number("Probe CFG", min=0, step=0.5), "probe_cfg").classes("w-full")
+        with self.setting(None, "Early stop", "Stop after this many probes in a row without improvement (0 = never: "
+                                              "run all the steps). The best checkpoint is kept either way.",
+                          show_if=is_identity):
+            self.bind(ui.number("Probes without improvement", min=0, precision=0), "likeness_patience") \
+                .classes("w-full")
+        self.nav()
+
+    def suggest(self):
+        replaced = bool((self.w["sample_prompts"].value or "").strip())
+        self.w["sample_prompts"].value = "\n".join(suggested_prompts(self.goal, (self.w["trigger_word"].value or "")
+                                                                     .strip()))
+        if replaced:
+            ui.notify("Replaced the sample prompts with suggestions")
+
+    # ---- 7 review
+    def step_review(self):
+        self.heading("Review and start", "A last look at the run before it starts.")
+        self.review_box = ui.column().classes("w-full gap-3")
+        with ui.row().classes("w-full items-center gap-3 pt-2"):
+            self.cfg_path = ui.input("Save as", value="").classes("w-80 max-w-full")
+            ui.button("Save config", icon="save", on_click=self.save).props("outline")
+            ui.space()
+            ui.button("Start training", icon="play_arrow", on_click=self.start).props("unelevated size=lg")
+        with ui.stepper_navigation():
+            ui.button("Back", icon="arrow_back", on_click=self.stepper.previous).props("flat")
+
+    def save(self):
+        try:
+            cfg = self.f.to_config()
+        except (TypeError, ValueError) as e:
+            ui.notify(f"A setting is invalid: {e}", type="negative")
+            return
+        path = (self.cfg_path.value or "").strip() or f"configs/{cfg.job_name}.yaml"
+        if _is_repo_example(path):
+            ui.notify("configs/example.yaml ships with RulzTrainer; save under another name", type="warning")
+            return
+        cfg.save(path)
+        ui.notify(f"Saved {path}", type="positive")
+
+    async def render_review(self):
+        try:
+            cfg = self.f.to_config()
+        except (TypeError, ValueError) as e:
+            self.review_box.clear()
+            with self.review_box:
+                ui.label(f"A setting is invalid: {e}").classes("rz-banner error")
+            return
+        if self.data is None or self.data.get("folder") != cfg.dataset_dir:
+            self.data = await run.io_bound(dataset_summary, cfg.dataset_dir)
+        if not self.cfg_path.value:
+            self.cfg_path.value = f"configs/{cfg.job_name}.yaml"
+        issues = review_issues(cfg, self.goal, self.data, len(self.gpus))
+        data = self.data or {}
+        multi = {"off": f"single GPU ({cfg.device})", "data_parallel": f"data parallel on {cfg.devices}",
+                 "model_split": f"model split over {cfg.devices}"}.get(cfg.multi_gpu, cfg.multi_gpu)
+        model = (Path(cfg.transformer_file).name or "Hugging Face model") if cfg.model_source == "files" \
+            else next((k for k, v in MODEL_PRESETS.items() if v == cfg.model_path), cfg.model_path)
+        rows = [
+            ("Goal", GOALS[self.goal][1] if self.goal else "not chosen (general settings)"),
+            ("Job", f"{cfg.job_name}  ->  {_relative(str(cfg.job_dir()))}/"),
+            ("Model", f"{model} ({'single files' if cfg.model_source == 'files' else 'Hugging Face'})"),
+            ("GPUs", f"{multi}; model quant {cfg.transformer_quant}, text encoder quant {cfg.text_encoder_quant}"),
+            ("Dataset", f"{cfg.dataset_dir} ({data.get('images', '?')} images, {data.get('captioned', '?')} captioned)"),
+            ("Trigger word", cfg.trigger_word or "(none)"),
+            ("Resolution", ", ".join(f"{mp:g} MP" for mp in cfg.resolutions)),
+            ("Training", f"{cfg.steps} steps, batch {cfg.batch_size}, lr {cfg.learning_rate:g}, {cfg.optimizer}"),
+            ("LoRA", f"rank {cfg.lora_rank}, alpha {cfg.lora_alpha:g}"),
+            ("Saving", f"every {cfg.save_every} steps; samples every {cfg.sample_every} steps "
+                       f"({len(cfg.sample_prompts)} prompts)"),
+        ]
+        if cfg.preset == "identity":
+            rows.append(("Likeness", f"{len(cfg.face_refs)} face / {len(cfg.body_refs)} body reference entries, "
+                                     f"probes every {cfg.probe_every} steps"))
+        self.review_box.clear()
+        with self.review_box:
+            if not issues:
+                ui.label("Everything looks ready.").classes("rz-banner ok")
+            for level, text in sorted(issues, key=lambda x: ("error", "warning", "info").index(x[0])):
+                ui.label(text).classes(f"rz-banner {level}")
+            with card():
+                with ui.element("div").classes("rz-summary"):
+                    for k, v in rows:
+                        ui.label(k).classes("k")
+                        ui.label(v).classes("v")
+
+
+# ---------------------------------------------------------------- page
+
+
+def build_page(local: bool = True):
+    global _native_dialogs
+    _native_dialogs = HAS_DISPLAY and local  # read while the widgets are built below
     d = TrainConfig()
     gpus = _gpus()
     f = Form()
     w = f.w
-
+    theme_colors()
     ui.page_title("RulzTrainer")
-    with ui.header().classes("items-center"):
-        ui.label("RulzTrainer").classes("text-xl font-bold")
-        ui.label("LoRA trainer for MOSS-Image (Base / SFT) and Bria FIBO 2.0. MOSS LoRAs load directly in ComfyUI; "
-                 "FIBO LoRAs load in diffusers' BriaFibo2Pipeline (dev and Edit Turbo).").classes("text-sm")
-
-    with ui.tabs().classes("w-full") as tabs:
-        tab_train = ui.tab("Train")
-        tab_dataset = ui.tab("Dataset")
-        tab_monitor = ui.tab("Monitor")
-        tab_samples = ui.tab("Samples")
-        tab_help = ui.tab("Help")
-
     job_running = reattach_job()
-    with ui.tab_panels(tabs, value=tab_monitor if job_running else tab_train).classes("w-full")             .props("keep-alive"):
+
+    with ui.header().classes("rz-header"):
+        with ui.row().classes("rz-header-row w-full items-center no-wrap gap-2"):
+            ui.element("img").props('src="/assets/logo_dark.png" alt="Rulz"').classes("rz-logo")
+            ui.label("TRAINER").classes("rz-wordmark")
+            ui.label("LoRA training for MOSS-Image and Bria FIBO 2.0").classes("rz-tagline gt-sm")
+            ui.space()
+            with ui.row().classes("rz-pill items-center gap-2 no-wrap") as pill:
+                pill_dot = ui.element("span").classes("rz-dot")
+                pill_text = ui.label("Idle").classes("rz-pill-text")
+        with ui.tabs().props("inline-label no-caps align=left dense").classes("rz-tabs") as tabs:
+            tab_wizard = ui.tab("Wizard", icon="auto_awesome")
+            tab_train = ui.tab("Train", icon="tune")
+            tab_dataset = ui.tab("Dataset", icon="photo_library")
+            tab_monitor = ui.tab("Monitor", icon="show_chart")
+            tab_samples = ui.tab("Samples", icon="collections")
+            tab_help = ui.tab("Help", icon="help_outline")
+
+    def goto(name: str):
+        tabs.value = name
+
+    def start_job() -> bool:
+        try:
+            cfg = f.to_config()
+        except (TypeError, ValueError) as e:
+            status_msg.text = f"A setting is invalid: {e}"
+            ui.notify(status_msg.text, type="negative")
+            return False
+        status_msg.text = start_training(cfg)
+        started = status_msg.text.startswith("Started")
+        ui.notify(status_msg.text, type="positive" if started else "warning")
+        if started:
+            tabs.value = tab_monitor
+        return started
+
+    pill.on("click", lambda: goto("Monitor"))
+    pill.tooltip("Open the Monitor")
+
+    with ui.tab_panels(tabs, value=tab_monitor if job_running else tab_wizard).classes("w-full rz-panels") \
+            .props("keep-alive"):
         # ------------------------------------------------------------ Train
         with ui.tab_panel(tab_train):
-            with ui.row().classes("w-full items-end"):
-                w["job_name"] = ui.input("Job name", value=d.job_name).classes("w-56")
-                path_input(f, "output_dir", "Output dir", "dir", d.output_dir, "w-72")
-                w["seed"] = ui.number("Seed", value=d.seed, precision=0).classes("w-32")
-                preset_state = {"snapshot": None, "applying": False}
-                preset_note = ui.label("").classes("text-xs")
+            with ui.row().classes("rz-page no-wrap items-start gap-6"):
+                nav = ui.column().classes("rz-nav gt-sm")
+                with ui.column().classes("gap-4 min-w-0 flex-1"):
+                    nav_items: list[tuple[str, str, object]] = []
 
-                def on_preset_toggle(e):
-                    if preset_state["applying"] or f.preset_sync:
-                        return
-                    preset_state["applying"] = True
-                    try:
-                        if e.value:
-                            snapshot = f.to_config()
-                            snapshot.preset = ""  # the switch already reads on here; the snapshot is the pre-preset state
-                            preset_state["snapshot"] = snapshot
-                            f.from_config(TrainConfig.from_dict(apply_preset(snapshot.to_dict(), "identity")))
-                            keys = sorted(PRESETS["identity"])
-                            preset_note.text = (f"Identity preset applied ({len(keys)} settings: region loss, LoRA+ 4, "
-                                                "adamw8bit, crops without upscaling, SAM 3 masks, probes every 25, "
-                                                "best/early-stop, curriculum 0.5, loss watch + per-image lr). "
-                                                "Set face/body references and check the probe prompts.")
-                        elif preset_state["snapshot"] is not None:
-                            f.from_config(preset_state["snapshot"])
-                            preset_note.text = "Previous settings restored."
-                    finally:
-                        preset_state["applying"] = False
+                    with card():
+                        with ui.row().classes("w-full items-center gap-4"):
+                            with ui.column().classes("gap-1 flex-1 min-w-[16rem]"):
+                                ui.label("Training job").classes("rz-title")
+                                hint("Every setting, grouped by topic; rarely changed ones are folded under Advanced. "
+                                     "New to this? The Wizard walks through the important ones with recommendations.")
+                            ui.button("Open the wizard", icon="auto_awesome", on_click=lambda: goto("Wizard")) \
+                                .props("outline")
+                        with fields():
+                            w["job_name"] = ui.input("Job name", value=d.job_name).classes("w-56")
+                            path_input(f, "output_dir", "Output folder", "dir", d.output_dir, "w-64")
+                            w["seed"] = ui.number("Seed", value=d.seed, precision=0).classes("w-32")
+                            preset_state = {"snapshot": None, "applying": False}
 
-                w["preset_toggle"] = ui.switch("Identity training preset", value=False, on_change=on_preset_toggle) \
-                    .tooltip("Applies the measured recipe for character LoRAs; switch off to restore your settings")
+                            def on_preset_toggle(e):
+                                if f.preset_sync and not e.value:
+                                    preset_note.text = ""  # a loaded config without the preset
+                                if preset_state["applying"] or f.preset_sync:
+                                    return
+                                preset_state["applying"] = True
+                                try:
+                                    if e.value:
+                                        snapshot = f.to_config()
+                                        snapshot.preset = ""  # the switch already reads on; the snapshot is pre-preset
+                                        preset_state["snapshot"] = snapshot
+                                        f.from_config(TrainConfig.from_dict(apply_preset(snapshot.to_dict(), "identity")))
+                                        keys = sorted(PRESETS["identity"])
+                                        preset_note.text = (f"Identity preset applied ({len(keys)} settings: region "
+                                                            "loss, LoRA+ 4, adamw8bit, crops without upscaling, SAM 3 "
+                                                            "masks, probes every 25, best/early-stop, curriculum 0.5, "
+                                                            "loss watch + per-image lr). Set face/body references and "
+                                                            "check the probe prompts.")
+                                    elif preset_state["snapshot"] is not None:
+                                        f.from_config(preset_state["snapshot"])
+                                        preset_note.text = "Previous settings restored."
+                                finally:
+                                    preset_state["applying"] = False
 
-            with ui.expansion("Model", value=True).classes("w-full"):
-                w["model_source"] = ui.radio(["Hugging Face repo / diffusers folder",
-                                              "Single safetensors files (ComfyUI)"],
-                                             value="Hugging Face repo / diffusers folder").props("inline")
-                with ui.column().classes("w-full").bind_visibility_from(
-                        w["model_source"], "value", lambda x: x.startswith("Hugging")):
-                    with ui.row().classes("w-full items-end"):
-                        w["model_preset"] = ui.select(list(MODEL_PRESETS) + [CUSTOM], value="MOSS-Image-Base",
-                                                      label="Model").classes("w-56")
-                        w["model_path"] = ui.input("Custom path or HF repo id", value=d.model_path).classes("w-96")
-                        dl_status = ui.label("").classes("text-sm")
+                            w["preset_toggle"] = ui.switch("Identity training preset", value=False,
+                                                           on_change=on_preset_toggle) \
+                                .tooltip("Applies the measured recipe for character LoRAs; switch off to restore your "
+                                         "settings")
+                        preset_note = hint("")
+                        with ui.row().classes("items-center gap-1 pt-1"):
+                            cfg_path = ui.input("Config file", value="configs/my_job.yaml").classes("w-72")
 
-                        async def on_download():
-                            dl_status.text = "Downloading / verifying... (about 30 GB on first download)"
-                            cfg = f.to_config()
-                            dl_status.text = await run.io_bound(download_model, cfg.model_path)
+                            def on_load():
+                                path = cfg_path.value.strip()
+                                try:
+                                    cfg, missing, unknown = TrainConfig.load_report(path)
+                                    f.from_config(cfg)
+                                except Exception as e:  # noqa: BLE001
+                                    status_msg.text = f"Could not load config: {e}"
+                                    return
+                                msg = f"Loaded {path}"
+                                if missing:
+                                    names = ", ".join(missing[:12]) + (f" and {len(missing) - 12} more" if len(missing) > 12 else "")
+                                    if _is_repo_example(path):
+                                        msg += f". {len(missing)} newer options use their defaults: {names}"
+                                    else:
+                                        try:
+                                            TrainConfig.append_missing(path, cfg, missing)
+                                            msg += f". Added {len(missing)} newer options to the file with their defaults: {names}"
+                                        except OSError as e:
+                                            msg += f". {len(missing)} newer options use their defaults ({names}); could not " \
+                                                   f"add them to the file: {e}"
+                                    ui.notify(f"{len(missing)} options are new since this config was saved; they are now in the "
+                                              "form with their defaults", type="info")
+                                if unknown:
+                                    msg += f". Ignored options this version no longer has: {', '.join(unknown)}"
+                                status_msg.text = msg
 
-                        ui.button("Download / verify model", on_click=on_download)
-                with ui.column().classes("w-full").bind_visibility_from(
-                        w["model_source"], "value", lambda x: x.startswith("Single")):
-                    path_input(f, "transformer_file", "Diffusion model (.safetensors: bf16, fp8, int8, nvfp4)", "file",
-                               "", "w-[40rem]")
-                    path_input(f, "text_encoder_file", "Text encoder (Qwen3.5-9B .safetensors)", "file", "", "w-[40rem]")
-                    path_input(f, "vae_file", "VAE (Flux2 .safetensors)", "file", "", "w-[40rem]")
-                    path_input(f, "tokenizer_path", "Tokenizer folder (optional; auto-downloads if empty)", "dir",
-                               "", "w-[40rem]")
-                    ui.label("Any file left empty is taken from the Hugging Face model above.").classes("text-xs")
-                with ui.row().classes("w-full items-end"):
-                    w["multi_gpu"] = ui.select({"off": "single GPU", "data_parallel": "2+ GPUs: data parallel (faster)",
-                                                "model_split": "2+ GPUs: model split (memory only)"},
-                                               value=d.multi_gpu, label="Multi-GPU").classes("w-72") \
-                        .tooltip("data parallel: a model copy per GPU, each trains its own images, LoRA grads are "
-                                 "averaged (about 1.7-2x throughput). model split: blocks divided across GPUs, half "
-                                 "the memory per GPU, not faster.")
-                    w["devices"] = ui.input("Devices (first = primary)", value=",".join(gpus[:2]) if len(gpus) > 1 else d.devices) \
-                        .classes("w-56").bind_visibility_from(w["multi_gpu"], "value", lambda x: x != "off")
-                    w["split_plan"] = ui.input("Split plan (empty = auto-balance), e.g. cuda:0=0-25;cuda:1=26-41",
-                                               value=d.split_plan).classes("w-[28rem]") \
-                        .bind_visibility_from(w["multi_gpu"], "value", lambda x: x == "model_split") \
-                        .tooltip("Give the faster GPU more blocks. Auto-balance counts blocks before the first trained "
-                                 "block as forward-only (cheap) and every later block as forward+backward.")
-                    w["parallel_jobs"] = (
-                        ui.switch("Split samples, probes and caching across GPUs", value=d.parallel_jobs)
-                        .bind_visibility_from(w["multi_gpu"], "value", lambda x: x != "off")
-                        .tooltip("Each GPU renders its own share of the sample and probe images, encodes its share of the latent "
-                                 "cache, and builds its share of the SAM 3 region masks; a second text encoder copy is loaded when "
-                                 "a quantized one fits on each GPU. In model split the training model spans both GPUs, so samples "
-                                 "and probes split only when a separate sampling model is set."))
-                with ui.row().classes("w-full items-end"):
-                    w["device"] = ui.select(gpus, value=gpus[0], label="Training GPU").classes("w-40")
-                    w["text_encoder_device"] = ui.select(["auto"] + gpus + ["cpu"], value="auto",
-                                                         label="Text encoder device (caching)").classes("w-56")
-                    w["transformer_quant"] = ui.select(QUANTS, value="auto", label="Diffusion model quant") \
-                        .classes("w-44").tooltip("auto keeps the file's format; int8/int8_convrot/nvfp4 quantize on load")
-                    w["text_encoder_quant"] = ui.select(QUANTS, value="auto", label="Text encoder quant").classes("w-44")
-                    w["gradient_checkpointing"] = ui.checkbox("Gradient checkpointing", value=True)
-                    w["compile_model"] = ui.checkbox("Compile model (torch.compile, needs triton)", value=False)
-                with ui.row().classes("w-full items-end"):
-                    w["int8_matmul"] = ui.select({True: "W8A8 int8 matmul (fast)", False: "dequantize to bf16 (slow)"},
-                                                 value=True, label="int8 layers compute").classes("w-72")                         .tooltip("int8 / int8_convrot layers only. W8A8 quantizes the activations per token to int8 "
-                                 "and multiplies them with the stored int8 weight (torch._int_mm), so the weight is "
-                                 "never dequantized: about 1.2-1.5x faster than bf16 and far faster than the "
-                                 "dequantize path, at under 1% extra forward error. nvfp4 always dequantizes.")
-                    w["int8_backward"] = ui.select({"bf16": "bf16 (exact)", "int8": "int8 (faster, approximate)"},
-                                                   value="bf16", label="int8 backward").classes("w-56")                         .bind_visibility_from(w["int8_matmul"], "value", lambda x: bool(x))                         .tooltip("bf16: grad_x = grad_out @ W with the int8 weight widened to bf16 (exact). "
-                                 "int8: grad_out is also quantized per token and multiplied with the int8 weight "
-                                 "(about 1% gradient error, saves the bf16 weight copy in backward).")
+                            def on_save():
+                                cfg = f.to_config()
+                                path = cfg_path.value.strip() or f"configs/{cfg.job_name}.yaml"
+                                if _is_repo_example(path):
+                                    status_msg.text = "configs/example.yaml ships with RulzTrainer; save under another name."
+                                    return
+                                cfg.save(path)
+                                status_msg.text = f"Saved {path}"
 
-            with ui.expansion("Dataset", value=True).classes("w-full"):
-                with ui.row().classes("w-full items-end"):
-                    path_input(f, "dataset_dir", "Dataset dir (images + .txt captions)", "dir", d.dataset_dir)
-                    w["resolutions"] = ui.select(MP_OPTIONS, multiple=True, value=[1.0],
-                                                 label="Training resolutions (megapixels)").classes("w-[32rem]")                         .props("use-chips")                         .tooltip("Area each image is bucketed to, aspect ratio preserved (1 MP = 1024x1024). Pick "
-                                 "several to train them all (mixed in every epoch) or, with Resolution step-up, "
-                                 "one after another from the lowest.")
-                with ui.row().classes("w-full items-end"):
-                    w["resolution_step_up"] = ui.checkbox("Resolution step-up", value=d.resolution_step_up)                         .tooltip("Train the lowest selected resolution first. When the probe likeness score stops "
-                                 "improving, move to the next selected resolution; when it stops improving at the "
-                                 "highest one, stop training and save the final LoRA. Needs likeness probes (face/body "
-                                 "references, probe every N steps) and replaces their early-stop patience.")
-                    w["step_up_patience"] = ui.number("Probes w/o improvement before next resolution",
-                                                      value=d.step_up_patience, min=1, precision=0).classes("w-80")                         .bind_visibility_from(w["resolution_step_up"], "value")
-                    w["step_up_stop_patience"] = ui.number("Probes w/o improvement at the highest before stopping",
-                                                           value=d.step_up_stop_patience, min=1, precision=0)                         .classes("w-96").bind_visibility_from(w["resolution_step_up"], "value")
-                with ui.row().classes("w-full items-end"):
-                    w["enable_buckets"] = ui.checkbox("Aspect-ratio buckets", value=True)
-                    w["flip_augment"] = ui.checkbox("Horizontal flip augment", value=False)
-                    w["trigger_word"] = ui.input("Trigger word (prepended to captions)").classes("w-64")
-                    w["caption_dropout"] = ui.number("Caption dropout", value=d.caption_dropout, min=0, max=0.5,
-                                                     step=0.01).classes("w-36")
-                    w["max_token_length"] = ui.number("Max caption tokens", value=d.max_token_length, min=64,
-                                                      max=4096, step=64, precision=0).classes("w-40")
-                    w["recache"] = ui.checkbox("Force re-cache", value=False)
-                scan_info = ui.label("").classes("text-sm")
-                gallery = ui.row().classes("w-full gap-2")
+                            async def browse_cfg():
+                                start = cfg_path.value.strip()
+                                if not start or not (ROOT / start if not Path(start).is_absolute() else Path(start)).is_file():
+                                    (ROOT / "configs").mkdir(exist_ok=True)
+                                    start = str(ROOT / "configs")  # the configs folder unless the box names an existing file
+                                picked = await run.io_bound(tk_dialog, "file", start, [("YAML", "*.yaml;*.yml")])
+                                if picked:
+                                    cfg_path.value = _relative(picked)
 
-                async def on_scan():
-                    cfg = f.to_config()
-                    scan_info.text = "Scanning..."
-                    try:
-                        info, items = await run.io_bound(scan_dataset, cfg)
-                    except Exception as e:  # noqa: BLE001
-                        scan_info.text = f"Error: {e}"
-                        return
-                    scan_info.text = info
-                    gallery.clear()
-                    with gallery:
-                        for path, caption in items:
-                            with ui.card().tight().classes("w-32"):
-                                ui.image(path).classes("w-32 h-32 object-cover")
-                                ui.tooltip(caption or "(no caption)")
+                            if _native_dialogs:
+                                ui.button(icon="description", on_click=browse_cfg).props("flat dense round").tooltip("Browse")
+                            ui.button("Load", icon="file_open", on_click=on_load).props("flat")
+                            ui.button("Save", icon="save", on_click=on_save).props("flat")
 
-                ui.button("Scan dataset", on_click=on_scan)
-                with ui.row().classes("w-full items-end"):
-                    w["crop_augment"] = ui.select(["none", "face", "face+bust"], value=d.crop_augment,
-                                                  label="Auto crops (character LoRAs)").classes("w-48") \
-                        .tooltip("Adds a face crop and/or a bust crop of every image with a detected face as extra "
-                                 "training items, with templated captions. Needs insightface.")
-                    w["crop_augment_min_px"] = ui.number("Min crop px (0 = resolution)", value=d.crop_augment_min_px, precision=0).classes("w-40")
-                    w["crop_face_scale"] = ui.number("Face crop x face size", value=d.crop_face_scale, step=0.5).classes("w-40")
-                    w["crop_bust_scale"] = ui.number("Bust crop x face size", value=d.crop_bust_scale, step=0.5).classes("w-40")
-                    w["crop_augment_weight"] = ui.number("Crop sampling weight", value=d.crop_augment_weight, step=0.1).classes("w-40")
-                with ui.row().classes("w-full items-end").bind_visibility_from(w["crop_augment"], "value", lambda x: x != "none"):
-                    w["crop_face_caption"] = ui.input("Face crop caption ({caption}, {raw}, {trigger})",
-                                                      value=d.crop_face_caption).classes("w-96")
-                    w["crop_bust_caption"] = ui.input("Bust crop caption", value=d.crop_bust_caption).classes("w-96")
-                    w["crop_skip_face_frac"] = ui.number("Skip face crop if face > frac", value=d.crop_skip_face_frac,
-                                                         step=0.05).classes("w-44")
-                    w["crop_skip_cover"] = ui.number("Skip crop covering > frac", value=d.crop_skip_cover, step=0.05).classes("w-44")
-                crop_info = ui.label("").classes("text-sm")
-                crop_row = ui.row().classes("w-full gap-2")
+                    # ---- Model
+                    with section("Model", "Base model, model files and GPUs", "model_training") as sec:
+                        nav_items.append(("Model", "model_training", sec))
+                        w["model_source"] = ui.radio([HF_SOURCE, FILE_SOURCE], value=HF_SOURCE).props("inline")
+                        with ui.column().classes("w-full gap-2").bind_visibility_from(
+                                w["model_source"], "value", lambda x: x == HF_SOURCE):
+                            with fields():
+                                w["model_preset"] = ui.select(list(MODEL_PRESETS) + [CUSTOM], value="MOSS-Image-Base",
+                                                              label="Model").classes("w-60")
+                                w["model_path"] = ui.input("Custom path or HF repo id", value=d.model_path) \
+                                    .classes("w-96 max-w-full") \
+                                    .bind_visibility_from(w["model_preset"], "value", lambda p: p == CUSTOM)
 
-                async def on_crop_preview():
-                    crop_info.text = "Working..."
-                    _task_progress.update(text="Preparing face detector...", frac=None, active=True)
-                    try:
-                        text, thumbs = await run.io_bound(analyse_and_preview, f.to_config().to_dict(), "crops")
-                    except Exception as e:  # noqa: BLE001
-                        crop_info.text = f"Error: {e}"
-                        return
-                    finally:
-                        _task_progress.update(active=False)
-                    crop_info.text = text
-                    crop_row.clear()
-                    with crop_row:
-                        for pth, cap in thumbs:
-                            with ui.card().tight().classes("w-32"):
-                                ui.image(pth).props("fit=contain").classes("w-32 h-32 bg-black")
-                                ui.tooltip(cap)
+                                async def on_download():
+                                    dl_status.text = "Downloading / verifying... (about 30 GB on first download)"
+                                    cfg = f.to_config()
+                                    dl_status.text = await run.io_bound(download_model, cfg.model_path)
 
-                ui.button("Analyse faces & preview crops", on_click=on_crop_preview)
+                                ui.button("Download / verify model", icon="download", on_click=on_download) \
+                                    .props("outline")
+                            dl_status = hint("")
+                        with ui.column().classes("w-full gap-3").bind_visibility_from(
+                                w["model_source"], "value", lambda x: x == FILE_SOURCE):
+                            path_input(f, "transformer_file", "Diffusion model (.safetensors: bf16, fp8, int8, nvfp4)",
+                                       "file", "", "w-[40rem]")
+                            path_input(f, "text_encoder_file", "Text encoder (Qwen3.5-9B .safetensors)", "file", "",
+                                       "w-[40rem]")
+                            path_input(f, "vae_file", "VAE (Flux2 .safetensors)", "file", "", "w-[40rem]")
+                            path_input(f, "tokenizer_path", "Tokenizer folder (optional; auto-downloads if empty)",
+                                       "dir", "", "w-[40rem]")
+                            hint("Any file left empty is taken from the Hugging Face model.")
+                        subhead("GPUs and memory")
+                        with fields():
+                            w["multi_gpu"] = ui.select({"off": "single GPU",
+                                                        "data_parallel": "2+ GPUs: data parallel (faster)",
+                                                        "model_split": "2+ GPUs: model split (memory only)"},
+                                                       value=d.multi_gpu, label="Multi-GPU").classes("w-72") \
+                                .tooltip("data parallel: a model copy per GPU, each trains its own images, LoRA grads "
+                                         "are averaged (about 1.7-2x throughput). model split: blocks divided across "
+                                         "GPUs, half the memory per GPU, not faster.")
+                            w["device"] = ui.select(gpus, value=gpus[0], label="Training GPU").classes("w-40") \
+                                .bind_visibility_from(w["multi_gpu"], "value", lambda x: x == "off")
+                            w["devices"] = ui.input("Devices (first = primary)",
+                                                    value=",".join(gpus[:2]) if len(gpus) > 1 else d.devices) \
+                                .classes("w-56").bind_visibility_from(w["multi_gpu"], "value", lambda x: x != "off")
+                            w["split_plan"] = ui.input("Split plan (empty = auto-balance)", value=d.split_plan) \
+                                .classes("w-80").props('placeholder="cuda:0=0-25;cuda:1=26-41"') \
+                                .bind_visibility_from(w["multi_gpu"], "value", lambda x: x == "model_split") \
+                                .tooltip("e.g. cuda:0=0-25;cuda:1=26-41. Give the faster GPU more blocks. Auto-balance "
+                                         "counts blocks before the first trained block as forward-only (cheap) and "
+                                         "every later block as forward+backward.")
+                            w["parallel_jobs"] = (
+                                ui.switch("Split samples, probes and caching across GPUs", value=d.parallel_jobs)
+                                .bind_visibility_from(w["multi_gpu"], "value", lambda x: x != "off")
+                                .tooltip("Each GPU renders its own share of the sample and probe images, encodes its "
+                                         "share of the latent cache, and builds its share of the SAM 3 region masks; a "
+                                         "second text encoder copy is loaded when a quantized one fits on each GPU. In "
+                                         "model split the training model spans both GPUs, so samples and probes split "
+                                         "only when a separate sampling model is set."))
+                        with fields():
+                            w["transformer_quant"] = ui.select(QUANTS, value="auto", label="Diffusion model quant") \
+                                .classes("w-48").tooltip("auto keeps the file's format; int8/int8_convrot/nvfp4 "
+                                                         "quantize on load")
+                            w["text_encoder_quant"] = ui.select(QUANTS, value="auto", label="Text encoder quant") \
+                                .classes("w-48")
+                            w["gradient_checkpointing"] = ui.switch("Gradient checkpointing", value=True)
+                        with advanced():
+                            with fields():
+                                w["text_encoder_device"] = ui.select(["auto"] + gpus + ["cpu"], value="auto",
+                                                                     label="Text encoder device (caching)") \
+                                    .classes("w-56")
+                                w["compile_model"] = ui.switch("Compile model (torch.compile, needs triton)",
+                                                               value=False)
+                            with fields():
+                                w["int8_matmul"] = ui.select({True: "W8A8 int8 matmul (fast)",
+                                                              False: "dequantize to bf16 (slow)"},
+                                                             value=True, label="int8 layers compute").classes("w-72") \
+                                    .tooltip("int8 / int8_convrot layers only. W8A8 quantizes the activations per "
+                                             "token to int8 and multiplies them with the stored int8 weight "
+                                             "(torch._int_mm), so the weight is never dequantized: about 1.2-1.5x "
+                                             "faster than bf16 and far faster than the dequantize path, at under 1% "
+                                             "extra forward error. nvfp4 always dequantizes.")
+                                w["int8_backward"] = ui.select({"bf16": "bf16 (exact)",
+                                                                "int8": "int8 (faster, approximate)"},
+                                                               value="bf16", label="int8 backward").classes("w-56") \
+                                    .bind_visibility_from(w["int8_matmul"], "value", lambda x: bool(x)) \
+                                    .tooltip("bf16: grad_x = grad_out @ W with the int8 weight widened to bf16 "
+                                             "(exact). int8: grad_out is also quantized per token and multiplied with "
+                                             "the int8 weight (about 1% gradient error, saves the bf16 weight copy in "
+                                             "backward).")
 
-            with ui.expansion("LoRA", value=True).classes("w-full"):
-                with ui.row().classes("w-full items-end"):
-                    w["lora_rank"] = ui.number("Rank", value=d.lora_rank, min=1, max=256, precision=0).classes("w-28")
-                    w["lora_alpha"] = ui.number("Alpha", value=d.lora_alpha).classes("w-28")
-                    with ui.row().classes("items-center"):
-                        ui.label("Targets:").classes("text-sm")
-                        for t in TARGETS:
-                            w[f"target_{t}"] = ui.checkbox(t, value=t in d.lora_targets)
-                        for t in FIBO_TARGETS:
-                            w[f"target_{t}"] = ui.checkbox(t, value=t in d.lora_targets) \
+                    # ---- Dataset
+                    with section("Dataset", "Images, captions and resolution", "photo_library") as sec:
+                        nav_items.append(("Dataset", "photo_library", sec))
+                        with fields():
+                            path_input(f, "dataset_dir", "Dataset folder (images + .txt captions)", "dir",
+                                       d.dataset_dir)
+                            w["trigger_word"] = ui.input("Trigger word (prepended to captions)").classes("w-64")
+
+                            async def on_scan():
+                                cfg = f.to_config()
+                                scan_info.text = "Scanning..."
+                                try:
+                                    info, items = await run.io_bound(scan_dataset, cfg)
+                                except Exception as e:  # noqa: BLE001
+                                    scan_info.text = f"Error: {e}"
+                                    return
+                                scan_info.text = info
+                                gallery.clear()
+                                with gallery:
+                                    for path, caption in items:
+                                        with ui.card().tight().classes("w-28 rz-thumb"):
+                                            ui.image(path).classes("w-28 h-28 object-cover")
+                                            ui.tooltip(caption or "(no caption)")
+
+                            ui.button("Scan dataset", icon="search", on_click=on_scan).props("outline")
+                        scan_info = hint("")
+                        gallery = ui.row().classes("w-full gap-2")
+                        with fields():
+                            w["resolutions"] = ui.select(MP_OPTIONS, multiple=True, value=[1.0],
+                                                         label="Training resolutions (megapixels)") \
+                                .classes("w-[30rem] max-w-full").props("use-chips") \
+                                .tooltip("Area each image is bucketed to, aspect ratio preserved (1 MP = 1024x1024). "
+                                         "Pick several to train them all (mixed in every epoch) or, with Resolution "
+                                         "step-up, one after another from the lowest.")
+                            w["resolution_step_up"] = ui.switch("Resolution step-up", value=d.resolution_step_up) \
+                                .tooltip("Train the lowest selected resolution first. When the probe likeness score "
+                                         "stops improving, move to the next selected resolution; when it stops "
+                                         "improving at the highest one, stop training and save the final LoRA. Needs "
+                                         "likeness probes (face/body references, probe every N steps) and replaces "
+                                         "their early-stop patience.")
+                        with fields().bind_visibility_from(w["resolution_step_up"], "value"):
+                            w["step_up_patience"] = ui.number("Probes w/o improvement before next resolution",
+                                                              value=d.step_up_patience, min=1, precision=0) \
+                                .classes("w-80")
+                            w["step_up_stop_patience"] = ui.number("Probes w/o improvement at the highest before "
+                                                                   "stopping", value=d.step_up_stop_patience, min=1,
+                                                                   precision=0).classes("w-96")
+                        with fields():
+                            w["enable_buckets"] = ui.switch("Aspect-ratio buckets", value=True)
+                            w["flip_augment"] = ui.switch("Horizontal flip augment", value=False)
+                        with advanced("Captions and cache"):
+                            with fields():
+                                w["caption_dropout"] = ui.number("Caption dropout", value=d.caption_dropout, min=0,
+                                                                 max=0.5, step=0.01).classes("w-36")
+                                w["max_token_length"] = ui.number("Max caption tokens", value=d.max_token_length,
+                                                                  min=64, max=4096, step=64, precision=0) \
+                                    .classes("w-40")
+                                w["recache"] = ui.switch("Force re-cache", value=False)
+                        subhead("Automatic crops (character LoRAs)")
+                        with fields():
+                            w["crop_augment"] = ui.select(["none", "face", "face+bust"], value=d.crop_augment,
+                                                          label="Auto crops").classes("w-48") \
+                                .tooltip("Adds a face crop and/or a bust crop of every image with a detected face as "
+                                         "extra training items, with templated captions. Needs insightface.")
+
+                            async def on_crop_preview():
+                                crop_info.text = "Working..."
+                                _task_progress.update(text="Preparing face detector...", frac=None, active=True)
+                                try:
+                                    text, thumbs = await run.io_bound(analyse_and_preview, f.to_config().to_dict(),
+                                                                      "crops")
+                                except Exception as e:  # noqa: BLE001
+                                    crop_info.text = f"Error: {e}"
+                                    return
+                                finally:
+                                    _task_progress.update(active=False)
+                                crop_info.text = text
+                                crop_row.clear()
+                                with crop_row:
+                                    for pth, cap in thumbs:
+                                        with ui.card().tight().classes("w-32 rz-thumb"):
+                                            ui.image(pth).props("fit=contain").classes("w-32 h-32 bg-black")
+                                            ui.tooltip(cap)
+
+                            ui.button("Analyse faces & preview crops", icon="center_focus_strong",
+                                      on_click=on_crop_preview).props("outline")
+                        with advanced("Crop details").bind_visibility_from(w["crop_augment"], "value",
+                                                                           lambda x: x != "none"):
+                            with fields():
+                                w["crop_augment_min_px"] = ui.number("Min crop px (0 = resolution)",
+                                                                     value=d.crop_augment_min_px, precision=0) \
+                                    .classes("w-48")
+                                w["crop_face_scale"] = ui.number("Face crop x face size", value=d.crop_face_scale,
+                                                                 step=0.5).classes("w-44")
+                                w["crop_bust_scale"] = ui.number("Bust crop x face size", value=d.crop_bust_scale,
+                                                                 step=0.5).classes("w-44")
+                                w["crop_augment_weight"] = ui.number("Crop sampling weight",
+                                                                     value=d.crop_augment_weight, step=0.1) \
+                                    .classes("w-44")
+                            with fields():
+                                w["crop_face_caption"] = ui.input("Face crop caption ({caption}, {raw}, {trigger})",
+                                                                  value=d.crop_face_caption).classes("w-96 max-w-full")
+                                w["crop_bust_caption"] = ui.input("Bust crop caption", value=d.crop_bust_caption) \
+                                    .classes("w-96 max-w-full")
+                                w["crop_skip_face_frac"] = ui.number("Skip face crop if face > frac",
+                                                                     value=d.crop_skip_face_frac, step=0.05) \
+                                    .classes("w-52")
+                                w["crop_skip_cover"] = ui.number("Skip crop covering > frac",
+                                                                 value=d.crop_skip_cover, step=0.05).classes("w-52")
+                        crop_info = hint("")
+                        crop_row = ui.row().classes("w-full gap-2")
+
+                    # ---- LoRA
+                    with section("LoRA", "Adapter size, layers and blocks", "hub") as sec:
+                        nav_items.append(("LoRA", "hub", sec))
+                        with fields():
+                            w["lora_rank"] = ui.number("Rank", value=d.lora_rank, min=1, max=256, precision=0) \
+                                .classes("w-28")
+                            w["lora_alpha"] = ui.number("Alpha", value=d.lora_alpha).classes("w-28")
+                            w["lora_plus_ratio"] = ui.number("LoRA+ ratio (0 = off, 16 = paper)",
+                                                             value=d.lora_plus_ratio, step=1).classes("w-60") \
+                                .tooltip("lora_up learns at lr x ratio (faster convergence); ignored by automagic3")
+                            w["lora_save_dtype"] = ui.select(["bf16", "fp16", "fp32"], value=d.lora_save_dtype,
+                                                             label="Save LoRA as").classes("w-36")
+                        subhead("Target layers")
+                        with ui.row().classes("w-full items-center gap-1"):
+                            for t in TARGETS:
+                                w[f"target_{t}"] = ui.checkbox(t, value=t in d.lora_targets)
+                            for t in FIBO_TARGETS:
+                                w[f"target_{t}"] = ui.checkbox(t, value=t in d.lora_targets) \
+                                    .bind_visibility_from(w["model_preset"], "value",
+                                                          lambda p: is_fibo_preset(p, w["model_path"].value)) \
+                                    .tooltip({"cross_attn": "text cross-attention in the 5 injection blocks",
+                                              "adaln": "per-block modulation Linear",
+                                              "refiner": "the 2 noise-refiner blocks",
+                                              "perceiver": "the gist-token resampler",
+                                              "embed": "patch / timestep embedders and the final layer"}[t])
+                            w["train_text_embedder"] = ui.checkbox("DiT text projection blocks", value=False) \
                                 .bind_visibility_from(w["model_preset"], "value",
-                                                      lambda p: is_fibo_preset(p, w["model_path"].value)) \
-                                .tooltip({"cross_attn": "text cross-attention in the 5 injection blocks",
-                                          "adaln": "per-block modulation Linear", "refiner": "the 2 noise-refiner blocks",
-                                          "perceiver": "the gist-token resampler",
-                                          "embed": "patch / timestep embedders and the final layer"}[t])
-                    w["train_text_embedder"] = ui.checkbox("Also train DiT text projection blocks", value=False) \
-                        .bind_visibility_from(w["model_preset"], "value",
-                                              lambda p: not is_fibo_preset(p, w["model_path"].value))
-                    w["lora_save_dtype"] = ui.select(["bf16", "fp16", "fp32"], value=d.lora_save_dtype,
-                                                     label="Save LoRA as").classes("w-32")
-                    w["lora_plus_ratio"] = ui.number("LoRA+ ratio (0 = off, 16 = paper)", value=d.lora_plus_ratio,
-                                                     step=1).classes("w-56") \
-                        .tooltip("lora_up learns at lr x ratio (faster convergence); ignored by automagic3")
-                with ui.row().classes("w-full items-end"):
-                    w["lora_blocks"] = ui.input("Blocks to train (e.g. 0-41, 21-41, 10-31,40, even; empty = all)",
-                                                value=d.lora_blocks).classes("w-[32rem]")
-                    ui.label("Training only later blocks also skips the backward pass through earlier ones.").classes("text-xs")
-                block_boxes: list = []
+                                                      lambda p: not is_fibo_preset(p, w["model_path"].value)) \
+                                .tooltip("Also train the 2-block text projection inside the DiT")
+                        with advanced("Blocks to train"):
+                            with fields():
+                                w["lora_blocks"] = ui.input("Blocks (e.g. 0-41, 21-41, 10-31,40, even; empty = all)",
+                                                            value=d.lora_blocks).classes("w-[30rem] max-w-full")
+                            hint("Training only later blocks also skips the backward pass through earlier ones.")
+                            block_boxes: list = []
 
-                def n_blocks() -> int:
-                    return 44 if is_fibo_preset(w["model_preset"].value, w["model_path"].value) else 42
+                            def n_blocks() -> int:
+                                return 44 if is_fibo_preset(w["model_preset"].value, w["model_path"].value) else 42
 
-                def blocks_from_text():
-                    from rulztrainer.lora import parse_blocks
-                    n = n_blocks()
-                    try:
-                        bl = parse_blocks(w["lora_blocks"].value or "", n)
-                    except ValueError:
-                        return
-                    sel = set(range(n)) if bl is None else set(bl)
-                    for i, cb in enumerate(block_boxes):
-                        if cb.value != (i in sel):
-                            cb.value = i in sel
+                            def blocks_from_text():
+                                from rulztrainer.lora import parse_blocks
+                                n = n_blocks()
+                                try:
+                                    bl = parse_blocks(w["lora_blocks"].value or "", n)
+                                except ValueError:
+                                    return
+                                sel = set(range(n)) if bl is None else set(bl)
+                                for i, cb in enumerate(block_boxes):
+                                    if cb.value != (i in sel):
+                                        cb.value = i in sel
 
-                def text_from_blocks():
-                    from rulztrainer.lora import format_blocks
-                    n = n_blocks()
-                    sel = [i for i, cb in enumerate(block_boxes) if cb.value and i < n]
-                    txt = "" if len(sel) == n else format_blocks(sel)
-                    if (w["lora_blocks"].value or "") != txt:
-                        w["lora_blocks"].value = txt
+                            def text_from_blocks():
+                                from rulztrainer.lora import format_blocks
+                                n = n_blocks()
+                                sel = [i for i, cb in enumerate(block_boxes) if cb.value and i < n]
+                                txt = "" if len(sel) == n else format_blocks(sel)
+                                if (w["lora_blocks"].value or "") != txt:
+                                    w["lora_blocks"].value = txt
 
-                def set_blocks(sel: set[int]):
-                    for i, cb in enumerate(block_boxes):
-                        cb.value = i in sel
-                    text_from_blocks()
+                            def set_blocks(sel: set[int]):
+                                for i, cb in enumerate(block_boxes):
+                                    cb.value = i in sel
+                                text_from_blocks()
 
-                block_presets = (("All", lambda n: set(range(n))), ("None", lambda n: set()),
-                                 ("First half", lambda n: set(range(0, n // 2))),
-                                 ("Second half", lambda n: set(range(n // 2, n))),
-                                 ("Middle", lambda n: set(range(n // 4, n - n // 4))),
-                                 ("Even", lambda n: set(range(0, n, 2))), ("Odd", lambda n: set(range(1, n, 2))))
-                with ui.row().classes("w-full items-center gap-1"):
-                    ui.label("Presets:").classes("text-xs")
-                    for label, fn in block_presets:
-                        ui.button(label, on_click=lambda _, f_=fn: set_blocks(f_(n_blocks()))).props("dense flat size=sm")
-                    ui.button("Invert", on_click=lambda: set_blocks({i for i, cb in enumerate(block_boxes)
-                                                                     if not cb.value and i < n_blocks()})) \
-                        .props("dense flat size=sm")
-                with ui.grid(columns=14).classes("w-full gap-0"):
-                    for i in range(N_BLOCKS_MAX):
-                        cb = ui.checkbox(str(i), value=True, on_change=lambda e: text_from_blocks()) \
-                            .props("dense size=xs").classes("text-xs")
-                        if i >= 42:  # FIBO 2.0's extra blocks
-                            cb.bind_visibility_from(w["model_preset"], "value",
-                                                    lambda p: is_fibo_preset(p, w["model_path"].value))
-                        block_boxes.append(cb)
-                w["lora_blocks"].on_value_change(lambda e: blocks_from_text())
-                path_input(f, "resume_from", "Resume from LoRA weights (.safetensors, optional)", "file", "", "w-[40rem]")
-                with ui.row().classes("w-full items-end"):
-                    w["save_state"] = ui.checkbox("Save training state (optimizer, scheduler, RNG); final state always saved",
-                                                  value=False)
-                    w["save_state_every"] = ui.number("State every N steps (0 = with each LoRA save)",
-                                                      value=d.save_state_every, precision=0).classes("w-72")
-                    w["keep_states"] = ui.number("States to keep (rolling, 0 = all)", value=d.keep_states,
-                                                 precision=0).classes("w-56")
-                path_input(f, "resume_state", "Resume from training state folder (state_XXXXXX, optional)", "dir", "",
-                           "w-[40rem]")
+                            block_presets = (("All", lambda n: set(range(n))), ("None", lambda n: set()),
+                                             ("First half", lambda n: set(range(0, n // 2))),
+                                             ("Second half", lambda n: set(range(n // 2, n))),
+                                             ("Middle", lambda n: set(range(n // 4, n - n // 4))),
+                                             ("Even", lambda n: set(range(0, n, 2))),
+                                             ("Odd", lambda n: set(range(1, n, 2))))
+                            with ui.row().classes("w-full items-center gap-1"):
+                                ui.label("Presets:").classes("rz-hint")
+                                for label, fn in block_presets:
+                                    ui.button(label, on_click=lambda _, f_=fn: set_blocks(f_(n_blocks()))) \
+                                        .props("dense flat size=sm")
+                                ui.button("Invert", on_click=lambda: set_blocks({i for i, cb in enumerate(block_boxes)
+                                                                                 if not cb.value and i < n_blocks()})) \
+                                    .props("dense flat size=sm")
+                            with ui.grid(columns=14).classes("w-full gap-0"):
+                                for i in range(N_BLOCKS_MAX):
+                                    cb = ui.checkbox(str(i), value=True, on_change=lambda e: text_from_blocks()) \
+                                        .props("dense size=xs").classes("text-xs")
+                                    if i >= 42:  # FIBO 2.0's extra blocks
+                                        cb.bind_visibility_from(w["model_preset"], "value",
+                                                                lambda p: is_fibo_preset(p, w["model_path"].value))
+                                    block_boxes.append(cb)
+                            w["lora_blocks"].on_value_change(lambda e: blocks_from_text())
+                        with advanced("Resume and training states"):
+                            path_input(f, "resume_from", "Resume from LoRA weights (.safetensors, optional)", "file",
+                                       "", "w-[40rem]")
+                            with fields():
+                                w["save_state"] = ui.switch("Save training state (optimizer, scheduler, RNG)",
+                                                            value=False) \
+                                    .tooltip("The final state is always saved")
+                                w["save_state_every"] = ui.number("State every N steps (0 = with each LoRA save)",
+                                                                  value=d.save_state_every, precision=0) \
+                                    .classes("w-80")
+                                w["keep_states"] = ui.number("States to keep (rolling, 0 = all)", value=d.keep_states,
+                                                             precision=0).classes("w-60")
+                            path_input(f, "resume_state", "Resume from training state folder (state_XXXXXX, optional)",
+                                       "dir", "", "w-[40rem]")
 
-            with ui.expansion("Optimization", value=True).classes("w-full"):
-                with ui.row().classes("w-full items-end"):
-                    w["steps"] = ui.number("Steps", value=d.steps, precision=0).classes("w-28")
-                    w["batch_size"] = ui.number("Batch size", value=d.batch_size, precision=0).classes("w-28")
-                    w["gradient_accumulation"] = ui.number("Grad accumulation", value=d.gradient_accumulation,
-                                                           precision=0).classes("w-36")
-                    w["learning_rate"] = ui.number("Learning rate", value=d.learning_rate, format="%.2e",
-                                                   step=1e-5).classes("w-36")
-                    w["optimizer"] = ui.select(["adamw", "adamw8bit", "adafactor", "automagic3"], value="adamw8bit",
-                                               label="Optimizer").classes("w-36")
-                    w["lr_scheduler"] = ui.select(["constant", "cosine", "linear"], value=d.lr_scheduler,
-                                                  label="LR schedule").classes("w-32")
-                with ui.row().classes("w-full items-end").bind_visibility_from(
-                        w["optimizer"], "value", lambda x: x == "automagic3"):
-                    ui.label("Automagic v3 (self-tuning lr; LR schedule/warmup are ignored):").classes("text-xs")
-                    w["automagic_min_lr"] = ui.number("Min lr", value=d.automagic_min_lr, format="%.1e").classes("w-32")
-                    w["automagic_max_lr"] = ui.number("Max lr", value=d.automagic_max_lr, format="%.1e").classes("w-32")
-                    w["automagic_polarity_history"] = ui.number("Polarity history", value=d.automagic_polarity_history,
-                                                                min=2, max=64, precision=0).classes("w-36")
-                    w["automagic_clip_threshold"] = ui.number("Clip threshold", value=d.automagic_clip_threshold,
-                                                              step=0.1).classes("w-32")
-                with ui.row().classes("w-full items-end"):
-                    w["warmup_steps"] = ui.number("Warmup steps", value=d.warmup_steps, precision=0).classes("w-32")
-                    w["max_grad_norm"] = ui.number("Max grad norm (0 = off)", value=d.max_grad_norm).classes("w-40")
-                    w["timestep_sampling"] = ui.select(["logit_normal", "sigmoid", "uniform", "identity", "content", "style",
-                                                        "reference"],
-                                                       value=d.timestep_sampling, label="Timestep sampling").classes("w-40") \
-                        .tooltip("identity: logit-normal mean -0.5 (detail/low noise). content: sigma = u^p toward low "
-                                 "noise (ai-toolkit style). style: mirror toward high noise. reference: the model "
-                                 "family's own training recipe (Bria's for FIBO 2.0, the MOSS-Image report's for MOSS).")
-                    w["content_power"] = ui.number("Content power", value=d.content_power, step=0.5).classes("w-32") \
-                        .bind_visibility_from(w["timestep_sampling"], "value", lambda x: x in ("content", "style"))
-                    w["sigma_min"] = ui.number("Sigma min", value=d.sigma_min, min=0, max=1, step=0.05).classes("w-28")
-                    w["sigma_max"] = ui.number("Sigma max", value=d.sigma_max, min=0, max=1, step=0.05).classes("w-28")
-                    w["sigmoid_scale"] = ui.number("Sigmoid scale", value=d.sigmoid_scale).classes("w-32") \
-                        .bind_visibility_from(w["timestep_sampling"], "value", lambda x: x == "sigmoid")
-                    w["logit_mean"] = ui.number("Logit mean", value=d.logit_mean).classes("w-32") \
-                        .bind_visibility_from(w["timestep_sampling"], "value", lambda x: x == "logit_normal")
-                    w["logit_std"] = ui.number("Logit std", value=d.logit_std).classes("w-32") \
-                        .bind_visibility_from(w["timestep_sampling"], "value", lambda x: x == "logit_normal")
-                    w["timestep_shift"] = ui.number("Timestep shift", value=d.timestep_shift).classes("w-32")
-                    w["loss_weighting"] = ui.select(["none", "min_snr", "sigma_sqrt"], value="none",
-                                                    label="Loss weighting").classes("w-36")
+                    # ---- Optimization
+                    with section("Optimization", "Steps, learning rate, optimizer and timesteps", "speed") as sec:
+                        nav_items.append(("Optimization", "speed", sec))
+                        with fields():
+                            w["steps"] = ui.number("Steps", value=d.steps, precision=0).classes("w-28")
+                            w["batch_size"] = ui.number("Batch size", value=d.batch_size, precision=0).classes("w-28")
+                            w["learning_rate"] = ui.number("Learning rate", value=d.learning_rate, format="%.2e",
+                                                           step=1e-5).classes("w-36")
+                            w["optimizer"] = ui.select(["adamw", "adamw8bit", "adafactor", "automagic3"],
+                                                       value="adamw8bit", label="Optimizer").classes("w-40")
+                            w["lr_scheduler"] = ui.select(["constant", "cosine", "linear"], value=d.lr_scheduler,
+                                                          label="LR schedule").classes("w-36")
+                            w["warmup_steps"] = ui.number("Warmup steps", value=d.warmup_steps, precision=0) \
+                                .classes("w-32")
+                        with ui.column().classes("w-full gap-2").bind_visibility_from(
+                                w["optimizer"], "value", lambda x: x == "automagic3"):
+                            hint("Automagic v3 tunes its own learning rate; LR schedule and warmup are ignored.")
+                            with fields():
+                                w["automagic_min_lr"] = ui.number("Min lr", value=d.automagic_min_lr, format="%.1e") \
+                                    .classes("w-32")
+                                w["automagic_max_lr"] = ui.number("Max lr", value=d.automagic_max_lr, format="%.1e") \
+                                    .classes("w-32")
+                                w["automagic_polarity_history"] = ui.number("Polarity history",
+                                                                            value=d.automagic_polarity_history,
+                                                                            min=2, max=64, precision=0).classes("w-36")
+                                w["automagic_clip_threshold"] = ui.number("Clip threshold",
+                                                                          value=d.automagic_clip_threshold,
+                                                                          step=0.1).classes("w-32")
+                        with advanced("Timesteps, loss weighting and gradients"):
+                            with fields():
+                                w["gradient_accumulation"] = ui.number("Grad accumulation",
+                                                                       value=d.gradient_accumulation,
+                                                                       precision=0).classes("w-40")
+                                w["max_grad_norm"] = ui.number("Max grad norm (0 = off)", value=d.max_grad_norm) \
+                                    .classes("w-44")
+                                w["loss_weighting"] = ui.select(["none", "min_snr", "sigma_sqrt"], value="none",
+                                                                label="Loss weighting").classes("w-40")
+                            with fields():
+                                w["timestep_sampling"] = ui.select(["logit_normal", "sigmoid", "uniform", "identity",
+                                                                    "content", "style", "reference"],
+                                                                   value=d.timestep_sampling,
+                                                                   label="Timestep sampling").classes("w-44") \
+                                    .tooltip("identity: logit-normal mean -0.5 (detail/low noise). content: sigma = u^p "
+                                             "toward low noise (ai-toolkit style). style: mirror toward high noise. "
+                                             "reference: the model family's own training recipe (Bria's for FIBO 2.0, "
+                                             "the MOSS-Image report's for MOSS).")
+                                w["content_power"] = ui.number("Content power", value=d.content_power, step=0.5) \
+                                    .classes("w-32").bind_visibility_from(w["timestep_sampling"], "value",
+                                                                          lambda x: x in ("content", "style"))
+                                w["sigma_min"] = ui.number("Sigma min", value=d.sigma_min, min=0, max=1, step=0.05) \
+                                    .classes("w-28")
+                                w["sigma_max"] = ui.number("Sigma max", value=d.sigma_max, min=0, max=1, step=0.05) \
+                                    .classes("w-28")
+                                w["sigmoid_scale"] = ui.number("Sigmoid scale", value=d.sigmoid_scale).classes("w-32") \
+                                    .bind_visibility_from(w["timestep_sampling"], "value", lambda x: x == "sigmoid")
+                                w["logit_mean"] = ui.number("Logit mean", value=d.logit_mean).classes("w-32") \
+                                    .bind_visibility_from(w["timestep_sampling"], "value",
+                                                          lambda x: x == "logit_normal")
+                                w["logit_std"] = ui.number("Logit std", value=d.logit_std).classes("w-32") \
+                                    .bind_visibility_from(w["timestep_sampling"], "value",
+                                                          lambda x: x == "logit_normal")
+                                w["timestep_shift"] = ui.number("Timestep shift", value=d.timestep_shift) \
+                                    .classes("w-32")
 
-            with ui.expansion("Saving & samples", value=True).classes("w-full"):
-                with ui.row().classes("w-full items-end"):
-                    w["save_every"] = ui.number("Save every N steps", value=d.save_every, precision=0).classes("w-40")
-                    w["sample_every"] = ui.number("Sample every N steps (0 = off)", value=d.sample_every,
-                                                  precision=0).classes("w-56")
-                w["sample_prompts"] = ui.textarea("Sample prompts (one per line; empty = no samples)").classes("w-full")
-                with ui.row().classes("w-full items-end"):
-                    w["sample_seed"] = ui.number("Sample seed", value=d.sample_seed, precision=0).classes("w-32")
-                    w["sample_walk_seed"] = ui.checkbox("Walk seed (+1 per prompt)", value=d.sample_walk_seed)
-                    w["sample_before_training"] = ui.checkbox("Generate samples before training starts",
-                                                              value=d.sample_before_training)
-                with ui.row().classes("w-full items-end"):
-                    w["sample_width"] = ui.number("Sample width", value=d.sample_width, precision=0).classes("w-32")
-                    w["sample_height"] = ui.number("Sample height", value=d.sample_height, precision=0).classes("w-32")
-                    w["sample_steps"] = ui.number("Sample steps", value=d.sample_steps, precision=0).classes("w-32")
-                    w["sample_cfg"] = ui.number("Sample CFG", value=d.sample_cfg).classes("w-32")
-                    w["sample_shift"] = ui.number("Sample shift", value=d.sample_shift).classes("w-32")
-                w["sample_negative"] = ui.input("Sample negative prompt (optional)", value=d.sample_negative) \
-                    .classes("w-full")
-                ui.label("FIBO 2.0: Bria samples the dev model at 50 steps / CFG 5 (20-30 steps is fine for previews); "
-                         "an empty negative prompt means the null caption it was trained with; sample shift and the "
-                         "skip layer are MOSS-only. Prompts can be plain sentences or VGL JSON captions.") \
-                    .classes("text-xs").bind_visibility_from(w["model_preset"], "value",
-                                                             lambda p: is_fibo_preset(p, w["model_path"].value))
-                with ui.row().classes("w-full items-end"):
-                    path_input(f, "sample_model_path", "Sampling model (optional; .safetensors, diffusers folder or repo id)",
-                               "file", "", "w-[36rem]")
-                    w["sample_model_quant"] = ui.select(QUANTS, value="auto", label="Sampling model quant").classes("w-44")
-                ui.label("Use a different checkpoint (e.g. SFT) for sample images only; the trained LoRA is copied onto it. "
-                         "The training model is parked in system RAM while sampling.").classes("text-xs")
-                with ui.row().classes("w-full items-end"):
-                    path_input(f, "turbo_lora", "Turbo / step-distill LoRA for sampling (optional)", "file", "",
-                               "w-[36rem]")
-                    w["turbo_lora_strength"] = ui.number("Turbo LoRA strength", value=d.turbo_lora_strength,
-                                                         step=0.05).classes("w-40")
-                with ui.row().classes("w-full items-end"):
-                    path_input(f, "sample_lora", "Secondary LoRA for sampling (optional, applied with the turbo LoRA)",
-                               "file", "", "w-[36rem]")
-                    w["sample_lora_strength"] = ui.number("Secondary LoRA strength", value=d.sample_lora_strength,
-                                                          step=0.05).classes("w-40")
+                    # ---- Saving & samples
+                    with section("Saving & samples", "Checkpoints and preview images", "save") as sec:
+                        nav_items.append(("Saving & samples", "save", sec))
+                        with fields():
+                            w["save_every"] = ui.number("Save every N steps", value=d.save_every, precision=0) \
+                                .classes("w-44")
+                            w["sample_every"] = ui.number("Sample every N steps (0 = off)", value=d.sample_every,
+                                                          precision=0).classes("w-60")
+                        w["sample_prompts"] = ui.textarea("Sample prompts (one per line; empty = no samples)") \
+                            .classes("w-full")
+                        with fields():
+                            w["sample_width"] = ui.number("Width", value=d.sample_width, precision=0).classes("w-28")
+                            w["sample_height"] = ui.number("Height", value=d.sample_height, precision=0) \
+                                .classes("w-28")
+                            w["sample_steps"] = ui.number("Steps", value=d.sample_steps, precision=0).classes("w-28")
+                            w["sample_cfg"] = ui.number("CFG", value=d.sample_cfg).classes("w-28")
+                            w["sample_shift"] = ui.number("Shift", value=d.sample_shift).classes("w-28")
+                        hint("FIBO 2.0: Bria samples the dev model at 50 steps / CFG 5 (20-30 steps is fine for "
+                             "previews); an empty negative prompt means the null caption it was trained with; sample "
+                             "shift and the skip layer are MOSS-only. Prompts can be plain sentences or VGL JSON "
+                             "captions.").bind_visibility_from(w["model_preset"], "value",
+                                                               lambda p: is_fibo_preset(p, w["model_path"].value))
+                        with fields():
+                            path_input(f, "turbo_lora", "Turbo / step-distill LoRA for sampling (optional)", "file",
+                                       "", "w-[34rem]")
+                            w["turbo_lora_strength"] = ui.number("Turbo LoRA strength", value=d.turbo_lora_strength,
+                                                                 step=0.05).classes("w-44")
+                        with advanced("Seeds, negative prompt and sampling models"):
+                            with fields():
+                                w["sample_seed"] = ui.number("Sample seed", value=d.sample_seed, precision=0) \
+                                    .classes("w-32")
+                                w["sample_walk_seed"] = ui.switch("Walk seed (+1 per prompt)",
+                                                                  value=d.sample_walk_seed)
+                                w["sample_before_training"] = ui.switch("Samples before training starts",
+                                                                        value=d.sample_before_training)
+                            w["sample_negative"] = ui.input("Negative prompt (optional)", value=d.sample_negative) \
+                                .classes("w-full")
+                            with fields():
+                                path_input(f, "sample_model_path", "Sampling model (optional; .safetensors, diffusers "
+                                                                   "folder or repo id)", "file", "", "w-[34rem]")
+                                w["sample_model_quant"] = ui.select(QUANTS, value="auto",
+                                                                    label="Sampling model quant").classes("w-48")
+                            hint("Use a different checkpoint (e.g. SFT) for sample images only; the trained LoRA is "
+                                 "copied onto it. The training model is parked in system RAM while sampling.")
+                            with fields():
+                                path_input(f, "sample_lora", "Secondary LoRA for sampling (optional, applied with the "
+                                                             "turbo LoRA)", "file", "", "w-[34rem]")
+                                w["sample_lora_strength"] = ui.number("Secondary LoRA strength",
+                                                                      value=d.sample_lora_strength, step=0.05) \
+                                    .classes("w-48")
 
-            with ui.expansion("Identity similarity: face + body (character LoRAs)", value=False).classes("w-full"):
-                ui.label("Pick reference images on the Dataset tab (\"Face ref\" / \"Body ref\" toggles) or list paths "
-                         "here. After each sampling pass, every sample's largest face is compared to the reference "
-                         "faces with InsightFace (ArcFace; 50%+ generally means the same person), and its body "
-                         "proportions (MediaPipe pose ratios) to the body references. Body references should show the "
-                         "whole body in a fairly neutral, upright pose.").classes("text-xs")
-                with ui.row().classes("w-full items-center gap-2") as progress_row:
-                    progress_spinner = ui.spinner(size="sm")
-                    progress_text = ui.label("").classes("text-sm")
-                    progress_bar = ui.linear_progress(value=0, show_value=False).classes("w-64")
-                progress_row.visible = False
+                    def _begin(text):
+                        _task_progress.update(text=text, frac=None, active=True)
 
-                def _progress_tick():
-                    if not _task_progress["active"]:
-                        progress_row.visible = False
-                        return
-                    progress_row.visible = True
-                    progress_text.text = _task_progress["text"]
-                    frac = _task_progress["frac"]
-                    progress_bar.visible = frac is not None
-                    progress_bar.value = frac or 0
-
-                ui.timer(0.5, _progress_tick)
-
-                def _begin(text):
-                    _task_progress.update(text=text, frac=None, active=True)
-
-                def _end():
-                    _task_progress.update(active=False)
-
-                w["face_refs"] = ui.textarea("Face reference images or folders (one path per line)").classes("w-full")
-                w["body_refs"] = ui.textarea("Body reference images or folders (one path per line; full-body shots)").classes("w-full")
-                with ui.row().classes("w-full items-end"):
-                    w["body_backend"] = ui.select(["mediapipe", "mediapipe+sam3"], value=d.body_backend,
-                                                  label="Body backend").classes("w-44") \
-                        .tooltip("mediapipe: skeleton proportion ratios. +sam3: also silhouette widths from a SAM 3 person mask")
-                    w["sam3_model"] = ui.input("SAM 3 model (repo id or folder)", value=d.sam3_model).classes("w-64") \
-                        .bind_visibility_from(w["body_backend"], "value", lambda x: x == "mediapipe+sam3")
-                    w["body_device"] = ui.select(["cuda:0", "cuda:1", "cpu"], value=d.body_device,
-                                                 label="SAM 3 device").classes("w-32") \
-                        .bind_visibility_from(w["body_backend"], "value", lambda x: x == "mediapipe+sam3")
-                with ui.row().classes("w-full items-end"):
-                    w["face_weight"] = ui.number("Face weight", value=d.face_weight, step=0.1, min=0).classes("w-32")
-                    w["body_weight"] = ui.number("Body weight", value=d.body_weight, step=0.1, min=0).classes("w-32")
-                    body_info = ui.label("").classes("text-sm")
-
-                    async def on_body_preview():
-                        paths = [p.strip() for p in (w["body_refs"].value or "").splitlines() if p.strip()]
-                        if not paths:
-                            body_info.text = "No body reference images listed."
-                            return
-                        body_info.text = "Working..."
-                        _begin("Preparing body models...")
-                        try:
-                            body_info.text = await run.io_bound(body_preview, paths, w["body_backend"].value,
-                                                                w["sam3_model"].value, w["body_device"].value)
-                        except Exception as e:  # noqa: BLE001
-                            body_info.text = f"Error: {e}"
-                        finally:
-                            _end()
-
-                    ui.button("Check body references", on_click=on_body_preview)
-                with ui.row().classes("w-full items-end"):
-                    w["face_provider"] = ui.select(["cpu", "cuda"], value=d.face_provider,
-                                                   label="Face model device").classes("w-32")
-                    w["face_det_size"] = ui.number("Detector size", value=d.face_det_size, precision=0).classes("w-32")
-                    face_info = ui.label("").classes("text-sm")
-
-                    async def on_face_preview():
-                        paths = [p.strip() for p in (w["face_refs"].value or "").splitlines() if p.strip()]
-                        if not paths:
-                            face_info.text = "No reference images listed."
-                            return
-                        face_info.text = "Working..."
-                        _begin("Preparing face model...")
-                        try:
-                            text, crops = await run.io_bound(face_preview, paths, w["face_provider"].value,
-                                                             w["face_det_size"].value)
-                        except Exception as e:  # noqa: BLE001
-                            face_info.text = f"Error: {e}"
-                            return
-                        finally:
-                            _end()
-                        face_info.text = text
-                        face_row.clear()
-                        with face_row:
-                            for crop, caption in crops:
-                                with ui.card().tight().classes("w-32"):
-                                    if crop:
-                                        ui.image(crop).props("fit=contain").classes("w-32 h-32 bg-black")
-                                    ui.label(caption).classes("text-xs px-1")
-
-                    ui.button("Preview reference faces", on_click=on_face_preview)
-                face_row = ui.row().classes("w-full gap-2")
-
-            with ui.expansion("Region-weighted loss (character LoRAs)", value=False).classes("w-full"):
-                ui.label("Weights each training image's loss by region: the detected face counts most, the person "
-                         "silhouette next (SAM 3 or MediaPipe), the background least. Maps are built once at cache "
-                         "time (16 px cells) and normalised to mean 1, so the loss scale is unchanged.").classes("text-xs")
-                with ui.row().classes("w-full items-end"):
-                    w["region_weights"] = ui.checkbox("Region-weighted loss", value=d.region_weights)
-                    w["face_loss_weight"] = ui.number("Face weight", value=d.face_loss_weight, step=0.5).classes("w-32")
-                    w["body_loss_weight"] = ui.number("Person weight", value=d.body_loss_weight, step=0.25).classes("w-32")
-                    w["background_loss_weight"] = ui.number("Background weight", value=d.background_loss_weight,
-                                                            step=0.1).classes("w-40")
-                    w["face_margin"] = ui.number("Face box margin", value=d.face_margin, step=0.05).classes("w-36")
-                    w["region_feather_cells"] = ui.number("Feather (cells)", value=d.region_feather_cells,
-                                                          precision=0).classes("w-32")
-                with ui.row().classes("w-full items-end"):
-                    w["region_prior_weight"] = ui.number("Background prior weight (0 = off; +35% step time)",
-                                                         value=d.region_prior_weight, step=0.1).classes("w-96") \
-                        .tooltip("Regularises background cells toward the base model's prediction (extra no-grad forward)")
-                    region_info = ui.label("").classes("text-sm")
-                region_row = ui.row().classes("w-full gap-2")
-
-                async def on_region_preview():
-                    region_info.text = "Working..."
-                    _task_progress.update(text="Preparing face detector...", frac=None, active=True)
-                    try:
-                        text, thumbs = await run.io_bound(analyse_and_preview, f.to_config().to_dict(), "regions")
-                    except Exception as e:  # noqa: BLE001
-                        region_info.text = f"Error: {e}"
-                        return
-                    finally:
+                    def _end():
                         _task_progress.update(active=False)
-                    region_info.text = text
-                    region_row.clear()
-                    with region_row:
-                        for pth, cap in thumbs:
-                            with ui.card().tight().classes("w-32"):
-                                ui.image(pth).props("fit=contain").classes("w-32 h-32 bg-black")
-                                ui.tooltip(cap)
 
-                ui.button("Preview region maps", on_click=on_region_preview)
-                ui.separator()
-                ui.label("Experimental: identity loss").classes("text-sm font-bold")
-                ui.label("On low-noise samples with a detected face, decodes the face of the model's predicted clean "
-                         "image (with gradients), aligns it and adds weight x (1 - cosine similarity) to a face "
-                         "reference embedding. Needs face references (Likeness scoring). Applied weight is capped at "
-                         "0.5; try 0.1-0.2 only once the rest of the recipe works. Costs a VAE decode + face network "
-                         "per eligible sample on the first GPU (data parallel: primary replica only). The likeness "
-                         "controller switches it off if the face probe score falls well below its best twice in a "
-                         "row.").classes("text-xs")
-                ui.label("Warning: with the arcface backend the face probe score is computed by the same network the "
-                         "loss optimises, so the probe metric becomes the training target and can rise without a real "
-                         "likeness gain. Use facenet to keep the probe an independent check, and judge the samples by "
-                         "eye.").classes("text-xs text-orange-600")
-                with ui.row().classes("w-full items-end"):
-                    w["id_loss_weight"] = ui.number("Identity loss weight (0 = off)", value=d.id_loss_weight, min=0,
-                                                    max=0.5, step=0.05).classes("w-56")
-                    w["id_loss_backend"] = ui.select(["arcface", "facenet"], value=d.id_loss_backend,
-                                                     label="Backend").classes("w-32")
-                    w["id_loss_sigma_max"] = ui.number("Max sigma", value=d.id_loss_sigma_max, min=0, max=1,
-                                                       step=0.05).classes("w-28")
-                    w["id_loss_every"] = ui.number("Every k-th eligible", value=d.id_loss_every, min=1,
-                                                   precision=0).classes("w-36")
-                    w["id_loss_min_face_cells"] = ui.number("Min face (cells)", value=d.id_loss_min_face_cells, min=1,
-                                                            precision=0).classes("w-32")
-                    w["id_loss_margin_cells"] = ui.number("Crop margin (cells)", value=d.id_loss_margin_cells, min=0,
-                                                          precision=0).classes("w-36")
-                    w["id_loss_random_ref"] = ui.checkbox("Random reference per step", value=d.id_loss_random_ref)
+                    # ---- Identity similarity
+                    with section("Identity similarity", "Face and body scoring for character LoRAs", "face",
+                                 open_=False) as sec:
+                        nav_items.append(("Identity similarity", "face", sec))
+                        hint("Pick reference images on the Dataset tab (\"Face ref\" / \"Body ref\") or list paths "
+                             "here. After each sampling pass, every sample's largest face is compared to the "
+                             "reference faces with InsightFace (ArcFace; 50%+ generally means the same person), and "
+                             "its body proportions (MediaPipe pose ratios) to the body references. Body references "
+                             "should show the whole body in a fairly neutral, upright pose.")
+                        w["face_refs"] = ui.textarea("Face reference images or folders (one path per line)") \
+                            .classes("w-full")
+                        with fields():
+                            w["face_provider"] = ui.select(["cpu", "cuda"], value=d.face_provider,
+                                                           label="Face model device").classes("w-40")
+                            w["face_det_size"] = ui.number("Detector size", value=d.face_det_size, precision=0) \
+                                .classes("w-32")
 
-            with ui.expansion("Per-image loss watch & per-image learning rate", value=False).classes("w-full"):
-                ui.label("Tracks every image's loss normalised by its timestep bucket and, at each epoch boundary, "
-                         "classes it as easy / healthy / suspect / stuck / exhausted. Per-image LR then throttles stuck "
-                         "images (x0.5, x0.25, x0.125), eases exhausted ones (x0.6) and can exclude images that stay "
-                         "stuck. A true per-image learning rate needs batch size 1 (otherwise per-sample loss weights). "
-                         "Not available with automagic3.").classes("text-xs")
-                with ui.row().classes("w-full items-end"):
-                    w["loss_watch"] = ui.checkbox("Loss watch (observe)", value=d.loss_watch)
-                    w["per_image_lr"] = ui.checkbox("Per-image learning rate (act on verdicts)", value=d.per_image_lr)
-                    w["loss_watch_exclude_after"] = ui.number("Exclude after N epochs at lowest throttle (0 = never)",
-                                                              value=d.loss_watch_exclude_after, precision=0).classes("w-96")
-                with ui.row().classes("w-full items-end"):
-                    w["loss_watch_buckets"] = ui.number("Sigma buckets", value=d.loss_watch_buckets, precision=0).classes("w-32")
-                    w["loss_watch_beta"] = ui.number("Residual EMA", value=d.loss_watch_beta, min=0, max=0.99, step=0.05).classes("w-32")
-                    w["loss_watch_high"] = ui.number("Hard above median x", value=d.loss_watch_high, step=0.05).classes("w-40")
-                    w["loss_watch_low"] = ui.number("Easy below median x", value=d.loss_watch_low, step=0.05).classes("w-40")
-                    w["loss_watch_improve_tol"] = ui.number("Improving = drop >", value=d.loss_watch_improve_tol, step=0.01).classes("w-36")
-                    w["loss_watch_healthy_mult"] = ui.number("Healthy multiplier", value=d.loss_watch_healthy_mult, step=0.05).classes("w-36")
+                            async def on_face_preview():
+                                paths = [p.strip() for p in (w["face_refs"].value or "").splitlines() if p.strip()]
+                                if not paths:
+                                    face_info.text = "No reference images listed."
+                                    return
+                                face_info.text = "Working..."
+                                _begin("Preparing face model...")
+                                try:
+                                    text, crops = await run.io_bound(face_preview, paths, w["face_provider"].value,
+                                                                     w["face_det_size"].value)
+                                except Exception as e:  # noqa: BLE001
+                                    face_info.text = f"Error: {e}"
+                                    return
+                                finally:
+                                    _end()
+                                face_info.text = text
+                                face_row.clear()
+                                with face_row:
+                                    for crop, caption in crops:
+                                        with ui.card().tight().classes("w-32 rz-thumb"):
+                                            if crop:
+                                                ui.image(crop).props("fit=contain").classes("w-32 h-32 bg-black")
+                                            ui.label(caption).classes("text-xs px-1")
 
-            with ui.expansion("Likeness probes & controller (character LoRAs)", value=False).classes("w-full"):
-                ui.label("Renders a fixed-seed headshot and/or full-body probe every N steps (small, turbo LoRA), scores "
-                         "it against the references, and lets a controller act on the smoothed scores: keep the best "
-                         "checkpoint and stop early, nudge the learning rate, and weight the dataset / timesteps toward "
-                         "whichever of face or body is lagging. Works with any optimizer. Needs face/body references "
-                         "above.").classes("text-xs")
-                with ui.row().classes("w-full items-end"):
-                    w["probe_every"] = ui.number("Probe every N steps (0 = off)", value=d.probe_every, precision=0).classes("w-56")
-                    w["probe_at_start"] = ui.checkbox("Probe at step 0 (baseline)", value=d.probe_at_start)
-                    w["probe_seeds"] = ui.number("Seeds per probe", value=d.probe_seeds, min=1, max=8, precision=0).classes("w-32")
-                    w["probe_seed"] = ui.number("Probe seed", value=d.probe_seed, precision=0).classes("w-32")
-                w["probe_face_prompt"] = ui.input("Face probe prompt (headshot; empty = none)").classes("w-full")
-                w["probe_body_prompt"] = ui.input("Body probe prompt (full body, upright; empty = none)").classes("w-full")
-                with ui.row().classes("w-full items-end"):
-                    w["probe_size"] = ui.number("Probe size (px)", value=d.probe_size, step=64, precision=0).classes("w-32")
-                    w["probe_steps"] = ui.number("Probe steps", value=d.probe_steps, precision=0).classes("w-32")
-                    w["probe_cfg"] = ui.number("Probe CFG", value=d.probe_cfg, step=0.5).classes("w-32")
-                    w["probe_ema"] = ui.number("Score smoothing (EMA)", value=d.probe_ema, min=0, max=0.95, step=0.05).classes("w-44")
-                    w["likeness_noise_band"] = ui.number("Noise band (% points)", value=d.likeness_noise_band, step=0.5).classes("w-44")
-                ui.label("Controller actions").classes("text-sm font-bold")
-                with ui.row().classes("w-full items-end"):
-                    w["likeness_track_best"] = ui.checkbox("Keep best checkpoint (<job>_best.safetensors)", value=d.likeness_track_best)
-                    w["likeness_patience"] = ui.number("Early stop after N probes w/o improvement (0 = never)",
-                                                       value=d.likeness_patience, precision=0).classes("w-96")                         .tooltip("Not used while Resolution step-up is on (its two counts replace it).")
-                with ui.row().classes("w-full items-end"):
-                    w["likeness_lr_control"] = ui.checkbox("LR multiplier from probe trend", value=d.likeness_lr_control)
-                    w["likeness_lr_min"] = ui.number("Min factor", value=d.likeness_lr_min, step=0.1).classes("w-28")
-                    w["likeness_lr_max"] = ui.number("Max factor", value=d.likeness_lr_max, step=0.1).classes("w-28")
-                    w["likeness_lr_step"] = ui.number("Step (relative)", value=d.likeness_lr_step, step=0.05).classes("w-32")
-                with ui.row().classes("w-full items-end"):
-                    w["likeness_curriculum"] = ui.checkbox("Face/body curriculum (dataset weighting + timestep bias)",
-                                                           value=d.likeness_curriculum)
-                    w["likeness_curriculum_strength"] = ui.number("Strength", value=d.likeness_curriculum_strength,
-                                                                  min=0, max=1, step=0.1).classes("w-28")
+                            ui.button("Preview reference faces", icon="face", on_click=on_face_preview) \
+                                .props("outline")
+                        face_info = hint("")
+                        face_row = ui.row().classes("w-full gap-2")
+                        w["body_refs"] = ui.textarea("Body reference images or folders (one path per line; "
+                                                     "full-body shots)").classes("w-full")
+                        with fields():
+                            w["body_backend"] = ui.select(["mediapipe", "mediapipe+sam3"], value=d.body_backend,
+                                                          label="Body backend").classes("w-48") \
+                                .tooltip("mediapipe: skeleton proportion ratios. +sam3: also silhouette widths from a "
+                                         "SAM 3 person mask")
+                            w["sam3_model"] = ui.input("SAM 3 model (repo id or folder)", value=d.sam3_model) \
+                                .classes("w-64") \
+                                .bind_visibility_from(w["body_backend"], "value", lambda x: x == "mediapipe+sam3")
+                            w["body_device"] = ui.select(["cuda:0", "cuda:1", "cpu"], value=d.body_device,
+                                                         label="SAM 3 device").classes("w-36") \
+                                .bind_visibility_from(w["body_backend"], "value", lambda x: x == "mediapipe+sam3")
 
-            status_msg = ui.label("").classes("text-sm")
-            with ui.row().classes("items-center"):
-                def on_start():
-                    status_msg.text = start_training(f.to_config())
-                    if status_msg.text.startswith("Started"):
-                        tabs.value = tab_monitor
+                            async def on_body_preview():
+                                paths = [p.strip() for p in (w["body_refs"].value or "").splitlines() if p.strip()]
+                                if not paths:
+                                    body_info.text = "No body reference images listed."
+                                    return
+                                body_info.text = "Working..."
+                                _begin("Preparing body models...")
+                                try:
+                                    body_info.text = await run.io_bound(body_preview, paths, w["body_backend"].value,
+                                                                        w["sam3_model"].value, w["body_device"].value)
+                                except Exception as e:  # noqa: BLE001
+                                    body_info.text = f"Error: {e}"
+                                finally:
+                                    _end()
 
-                ui.button("Start training", on_click=on_start, color="primary")
-                ui.button("Stop (save)", on_click=lambda: setattr(status_msg, "text", stop_training()))
-                ui.button("Kill", on_click=lambda: setattr(status_msg, "text", kill_training()), color="negative")
+                            ui.button("Check body references", icon="accessibility_new", on_click=on_body_preview) \
+                                .props("outline")
+                        body_info = hint("")
+                        with fields():
+                            w["face_weight"] = ui.number("Face weight (combined score)", value=d.face_weight,
+                                                         step=0.1, min=0).classes("w-56")
+                            w["body_weight"] = ui.number("Body weight (combined score)", value=d.body_weight,
+                                                         step=0.1, min=0).classes("w-56")
 
-            with ui.row().classes("w-full items-end"):
-                cfg_path = ui.input("Config file", value="configs/my_job.yaml").classes("w-96")
+                    # ---- Region-weighted loss
+                    with section("Region-weighted loss", "Face, person and background weights; identity loss",
+                                 "filter_center_focus", open_=False) as sec:
+                        nav_items.append(("Region loss", "filter_center_focus", sec))
+                        hint("Weights each training image's loss by region: the detected face counts most, the person "
+                             "silhouette next (SAM 3 or MediaPipe), the background least. Maps are built once at "
+                             "cache time (16 px cells) and normalised to mean 1, so the loss scale is unchanged.")
+                        with fields():
+                            w["region_weights"] = ui.switch("Region-weighted loss", value=d.region_weights)
+                            w["face_loss_weight"] = ui.number("Face weight", value=d.face_loss_weight, step=0.5) \
+                                .classes("w-32")
+                            w["body_loss_weight"] = ui.number("Person weight", value=d.body_loss_weight, step=0.25) \
+                                .classes("w-32")
+                            w["background_loss_weight"] = ui.number("Background weight",
+                                                                    value=d.background_loss_weight, step=0.1) \
+                                .classes("w-40")
 
-                def on_load():
-                    path = cfg_path.value.strip()
-                    try:
-                        cfg, missing, unknown = TrainConfig.load_report(path)
-                        f.from_config(cfg)
-                    except Exception as e:  # noqa: BLE001
-                        status_msg.text = f"Could not load config: {e}"
-                        return
-                    msg = f"Loaded {path}"
-                    if missing:
-                        names = ", ".join(missing[:12]) + (f" and {len(missing) - 12} more" if len(missing) > 12 else "")
-                        if _is_repo_example(path):
-                            msg += f". {len(missing)} newer options use their defaults: {names}"
-                        else:
-                            try:
-                                TrainConfig.append_missing(path, cfg, missing)
-                                msg += f". Added {len(missing)} newer options to the file with their defaults: {names}"
-                            except OSError as e:
-                                msg += f". {len(missing)} newer options use their defaults ({names}); could not " \
-                                       f"add them to the file: {e}"
-                        ui.notify(f"{len(missing)} options are new since this config was saved; they are now in the "
-                                  "form with their defaults", type="info")
-                    if unknown:
-                        msg += f". Ignored options this version no longer has: {', '.join(unknown)}"
-                    status_msg.text = msg
+                            async def on_region_preview():
+                                region_info.text = "Working..."
+                                _task_progress.update(text="Preparing face detector...", frac=None, active=True)
+                                try:
+                                    text, thumbs = await run.io_bound(analyse_and_preview, f.to_config().to_dict(),
+                                                                      "regions")
+                                except Exception as e:  # noqa: BLE001
+                                    region_info.text = f"Error: {e}"
+                                    return
+                                finally:
+                                    _task_progress.update(active=False)
+                                region_info.text = text
+                                region_row.clear()
+                                with region_row:
+                                    for pth, cap in thumbs:
+                                        with ui.card().tight().classes("w-32 rz-thumb"):
+                                            ui.image(pth).props("fit=contain").classes("w-32 h-32 bg-black")
+                                            ui.tooltip(cap)
 
-                def on_save():
-                    cfg = f.to_config()
-                    path = cfg_path.value.strip() or f"configs/{cfg.job_name}.yaml"
-                    cfg.save(path)
-                    status_msg.text = f"Saved {path}"
+                            ui.button("Preview region maps", icon="grid_on", on_click=on_region_preview) \
+                                .props("outline")
+                        region_info = hint("")
+                        region_row = ui.row().classes("w-full gap-2")
+                        with advanced():
+                            with fields():
+                                w["face_margin"] = ui.number("Face box margin", value=d.face_margin, step=0.05) \
+                                    .classes("w-36")
+                                w["region_feather_cells"] = ui.number("Feather (cells)", value=d.region_feather_cells,
+                                                                      precision=0).classes("w-32")
+                                w["region_prior_weight"] = ui.number("Background prior weight (0 = off; +35% step "
+                                                                     "time)", value=d.region_prior_weight, step=0.1) \
+                                    .classes("w-96 max-w-full") \
+                                    .tooltip("Regularises background cells toward the base model's prediction (extra "
+                                             "no-grad forward)")
+                        with advanced("Experimental: identity loss"):
+                            hint("On low-noise samples with a detected face, decodes the face of the model's predicted "
+                                 "clean image (with gradients), aligns it and adds weight x (1 - cosine similarity) to a "
+                                 "face reference embedding. Needs face references (Identity similarity). Applied "
+                                 "weight is capped at 0.5; try 0.1-0.2 only once the rest of the recipe works. Costs a "
+                                 "VAE decode + face network per eligible sample on the first GPU (data parallel: "
+                                 "primary replica only). The likeness controller switches it off if the face probe "
+                                 "score falls well below its best twice in a row.")
+                            hint("Warning: with the arcface backend the face probe score is computed by the same "
+                                 "network the loss optimises, so the probe metric becomes the training target and can "
+                                 "rise without a real likeness gain. Use facenet to keep the probe an independent "
+                                 "check, and judge the samples by eye.", warn=True)
+                            with fields():
+                                w["id_loss_weight"] = ui.number("Identity loss weight (0 = off)",
+                                                                value=d.id_loss_weight, min=0, max=0.5, step=0.05) \
+                                    .classes("w-56")
+                                w["id_loss_backend"] = ui.select(["arcface", "facenet"], value=d.id_loss_backend,
+                                                                 label="Backend").classes("w-36")
+                                w["id_loss_sigma_max"] = ui.number("Max sigma", value=d.id_loss_sigma_max, min=0,
+                                                                   max=1, step=0.05).classes("w-28")
+                                w["id_loss_every"] = ui.number("Every k-th eligible", value=d.id_loss_every, min=1,
+                                                               precision=0).classes("w-40")
+                                w["id_loss_min_face_cells"] = ui.number("Min face (cells)",
+                                                                        value=d.id_loss_min_face_cells, min=1,
+                                                                        precision=0).classes("w-36")
+                                w["id_loss_margin_cells"] = ui.number("Crop margin (cells)",
+                                                                      value=d.id_loss_margin_cells, min=0,
+                                                                      precision=0).classes("w-40")
+                                w["id_loss_random_ref"] = ui.switch("Random reference per step",
+                                                                    value=d.id_loss_random_ref)
 
-                async def browse_cfg():
-                    start = cfg_path.value.strip()
-                    if not start or not (ROOT / start if not Path(start).is_absolute() else Path(start)).is_file():
-                        (ROOT / "configs").mkdir(exist_ok=True)
-                        start = str(ROOT / "configs")  # the configs folder unless the box names an existing file
-                    picked = await run.io_bound(tk_dialog, "file", start, [("YAML", "*.yaml;*.yml")])
-                    if picked:
-                        cfg_path.value = _relative(picked)
+                    # ---- Loss watch
+                    with section("Per-image loss watch", "Per-image verdicts and learning rate", "rule",
+                                 open_=False) as sec:
+                        nav_items.append(("Loss watch", "rule", sec))
+                        hint("Tracks every image's loss normalised by its timestep bucket and, at each epoch boundary, "
+                             "classes it as easy / healthy / suspect / stuck / exhausted. Per-image LR then throttles "
+                             "stuck images (x0.5, x0.25, x0.125), eases exhausted ones (x0.6) and can exclude images "
+                             "that stay stuck. A true per-image learning rate needs batch size 1 (otherwise per-sample "
+                             "loss weights). Not available with automagic3.")
+                        with fields():
+                            w["loss_watch"] = ui.switch("Loss watch (observe)", value=d.loss_watch)
+                            w["per_image_lr"] = ui.switch("Per-image learning rate (act on verdicts)",
+                                                          value=d.per_image_lr)
+                            w["loss_watch_exclude_after"] = ui.number("Exclude after N epochs at lowest throttle "
+                                                                      "(0 = never)", value=d.loss_watch_exclude_after,
+                                                                      precision=0).classes("w-96 max-w-full")
+                        with advanced("Thresholds"):
+                            with fields():
+                                w["loss_watch_buckets"] = ui.number("Sigma buckets", value=d.loss_watch_buckets,
+                                                                    precision=0).classes("w-32")
+                                w["loss_watch_beta"] = ui.number("Residual EMA", value=d.loss_watch_beta, min=0,
+                                                                 max=0.99, step=0.05).classes("w-32")
+                                w["loss_watch_high"] = ui.number("Hard above median x", value=d.loss_watch_high,
+                                                                 step=0.05).classes("w-44")
+                                w["loss_watch_low"] = ui.number("Easy below median x", value=d.loss_watch_low,
+                                                                step=0.05).classes("w-44")
+                                w["loss_watch_improve_tol"] = ui.number("Improving = drop >",
+                                                                        value=d.loss_watch_improve_tol,
+                                                                        step=0.01).classes("w-40")
+                                w["loss_watch_healthy_mult"] = ui.number("Healthy multiplier",
+                                                                         value=d.loss_watch_healthy_mult,
+                                                                         step=0.05).classes("w-40")
 
-                ui.button(icon="description", on_click=browse_cfg).props("flat dense").tooltip("Browse")
-                ui.button("Load config", on_click=on_load)
-                ui.button("Save config", on_click=on_save)
+                    # ---- Likeness probes
+                    with section("Likeness probes & controller", "Best checkpoint, early stop and curriculum",
+                                 "insights", open_=False) as sec:
+                        nav_items.append(("Likeness probes", "insights", sec))
+                        hint("Renders a fixed-seed headshot and/or full-body probe every N steps (small, turbo LoRA), "
+                             "scores it against the references, and lets a controller act on the smoothed scores: "
+                             "keep the best checkpoint and stop early, nudge the learning rate, and weight the dataset "
+                             "/ timesteps toward whichever of face or body is lagging. Works with any optimizer. Needs "
+                             "face/body references (Identity similarity).")
+                        with fields():
+                            w["probe_every"] = ui.number("Probe every N steps (0 = off)", value=d.probe_every,
+                                                         precision=0).classes("w-60")
+                            w["probe_at_start"] = ui.switch("Probe at step 0 (baseline)", value=d.probe_at_start)
+                        w["probe_face_prompt"] = ui.input("Face probe prompt (headshot; empty = none)") \
+                            .classes("w-full")
+                        w["probe_body_prompt"] = ui.input("Body probe prompt (full body, upright; empty = none)") \
+                            .classes("w-full")
+                        with fields():
+                            w["probe_steps"] = ui.number("Probe steps", value=d.probe_steps, precision=0) \
+                                .classes("w-32")
+                            w["probe_cfg"] = ui.number("Probe CFG", value=d.probe_cfg, step=0.5).classes("w-32")
+                            w["probe_size"] = ui.number("Probe size (px)", value=d.probe_size, step=64,
+                                                        precision=0).classes("w-36")
+                        subhead("Controller actions")
+                        with fields():
+                            w["likeness_track_best"] = ui.switch("Keep best checkpoint (<job>_best.safetensors)",
+                                                                 value=d.likeness_track_best)
+                            w["likeness_patience"] = ui.number("Early stop after N probes w/o improvement (0 = never)",
+                                                               value=d.likeness_patience, precision=0) \
+                                .classes("w-96 max-w-full") \
+                                .tooltip("Not used while Resolution step-up is on (its two counts replace it).")
+                        with fields():
+                            w["likeness_lr_control"] = ui.switch("LR multiplier from probe trend",
+                                                                 value=d.likeness_lr_control)
+                            w["likeness_lr_min"] = ui.number("Min factor", value=d.likeness_lr_min, step=0.1) \
+                                .classes("w-28").bind_visibility_from(w["likeness_lr_control"], "value")
+                            w["likeness_lr_max"] = ui.number("Max factor", value=d.likeness_lr_max, step=0.1) \
+                                .classes("w-28").bind_visibility_from(w["likeness_lr_control"], "value")
+                            w["likeness_lr_step"] = ui.number("Step (relative)", value=d.likeness_lr_step, step=0.05) \
+                                .classes("w-32").bind_visibility_from(w["likeness_lr_control"], "value")
+                        with fields():
+                            w["likeness_curriculum"] = ui.switch("Face/body curriculum (dataset weighting + timestep "
+                                                                 "bias)", value=d.likeness_curriculum)
+                            w["likeness_curriculum_strength"] = ui.number("Strength",
+                                                                          value=d.likeness_curriculum_strength,
+                                                                          min=0, max=1, step=0.1).classes("w-28") \
+                                .bind_visibility_from(w["likeness_curriculum"], "value")
+                        with advanced("Probe scoring"):
+                            with fields():
+                                w["probe_seeds"] = ui.number("Seeds per probe", value=d.probe_seeds, min=1, max=8,
+                                                             precision=0).classes("w-36")
+                                w["probe_seed"] = ui.number("Probe seed", value=d.probe_seed, precision=0) \
+                                    .classes("w-32")
+                                w["probe_ema"] = ui.number("Score smoothing (EMA)", value=d.probe_ema, min=0,
+                                                           max=0.95, step=0.05).classes("w-48")
+                                w["likeness_noise_band"] = ui.number("Noise band (% points)",
+                                                                     value=d.likeness_noise_band, step=0.5) \
+                                    .classes("w-48")
+
+                def jump(exp):
+                    exp.value = True
+                    ui.run_javascript(f"getHtmlElement({exp.id}).scrollIntoView({{behavior: 'smooth', block: 'start'}})")
+
+                with nav:
+                    ui.label("Sections").classes("rz-nav-title")
+                    for title, icon, exp in nav_items:
+                        ui.button(title, icon=icon, on_click=lambda _, e=exp: jump(e)) \
+                            .props("flat no-caps align=left").classes("rz-nav-btn")
+
+        # ------------------------------------------------------------ Wizard (bound to the Train tab's widgets)
+        with ui.tab_panel(tab_wizard):
+            Wizard(f, gpus, start_job, goto).build()
 
         # ------------------------------------------------------------ Dataset
         with ui.tab_panel(tab_dataset):
-            build_dataset_tab(f)
+            with ui.column().classes("rz-page gap-4"):
+                build_dataset_tab(f)
 
         # ------------------------------------------------------------ Monitor
         with ui.tab_panel(tab_monitor):
-            progress_label = ui.label("idle").classes("font-mono text-sm")
-            progress_bar = ui.linear_progress(value=0, show_value=False).classes("w-full")
-            gpu_box = ui.column().classes("w-full gap-1")
-            gpu_widgets: list[dict] = []
-            with ui.row().classes("w-full items-center gap-4"):
-                ui.label("Loss smoothing").classes("text-sm")
-                smoothing = ui.slider(min=0, max=0.98, step=0.02, value=0.8).classes("w-64")
-                ui.label().bind_text_from(smoothing, "value", lambda x: f"{x:.2f}")
-            loss_chart = ui.echart({
-                "xAxis": {"type": "value", "name": "step", "min": "dataMin"},
-                "yAxis": [{"type": "value", "name": "loss", "scale": True},
-                          {"type": "value", "name": "id loss", "scale": True, "show": False,
-                           "splitLine": {"show": False}}],
-                "tooltip": {"trigger": "axis"},
-                "legend": {"data": ["raw", "smoothed"]},
-                "grid": {"left": 60, "right": 60, "top": 30, "bottom": 40},
-                "series": [
-                    {"name": "raw", "type": "line", "showSymbol": False, "data": [],
-                     "lineStyle": {"width": 1, "opacity": 0.35}},
-                    {"name": "smoothed", "type": "line", "showSymbol": False, "data": [], "lineStyle": {"width": 2}},
-                    {"name": "id loss (smoothed)", "type": "line", "showSymbol": False, "data": [], "yAxisIndex": 1,
-                     "lineStyle": {"width": 2, "type": "dashed"}},
-                ],
-            }).classes("w-full h-64")
-            with ui.expansion("Identity similarity (face / body / combined)", value=True).classes("w-full") as face_exp:
-                face_label = ui.label("").classes("text-sm")
-                face_chart = ui.echart({
-                    "xAxis": {"type": "value", "name": "step", "min": "dataMin"},
-                    "yAxis": {"type": "value", "name": "similarity %", "min": 0, "max": 100},
-                    "tooltip": {"trigger": "axis"},
-                    "legend": {"data": []},
-                    "grid": {"left": 60, "right": 20, "top": 30, "bottom": 40},
-                    "series": [],
-                }).classes("w-full h-56")
-            face_exp.visible = False
-            with ui.expansion("Per-image loss watch", value=True).classes("w-full") as lw_exp:
-                lw_label = ui.label("").classes("text-sm")
-                lw_table = ui.table(columns=[
-                    {"name": "image", "label": "image", "field": "image", "align": "left", "sortable": True},
-                    {"name": "verdict", "label": "verdict", "field": "verdict", "align": "left", "sortable": True},
-                    {"name": "residual", "label": "residual (epoch)", "field": "residual", "sortable": True},
-                    {"name": "ema", "label": "residual EMA", "field": "ema", "sortable": True},
-                    {"name": "trend", "label": "trend %", "field": "trend", "sortable": True},
-                    {"name": "multiplier", "label": "lr x", "field": "multiplier", "sortable": True},
-                    {"name": "seen", "label": "seen", "field": "seen", "sortable": True},
-                ], rows=[], row_key="path", pagination=15).classes("w-full text-xs")
-            lw_exp.visible = False
-            lw_state = {"sig": None}
-            with ui.expansion("Likeness probes & controller", value=True).classes("w-full") as probe_exp:
-                probe_label = ui.label("").classes("text-sm")
-                probe_chart = ui.echart({
-                    "xAxis": {"type": "value", "name": "step", "min": "dataMin"},
-                    "yAxis": {"type": "value", "name": "likeness %", "min": 0, "max": 100},
-                    "tooltip": {"trigger": "axis"},
-                    "legend": {"data": ["face", "body", "combined", "face (raw)", "body (raw)"]},
-                    "grid": {"left": 60, "right": 20, "top": 30, "bottom": 40},
-                    "series": [
-                        {"name": "face", "type": "line", "data": []},
-                        {"name": "body", "type": "line", "data": []},
-                        {"name": "combined", "type": "line", "data": [], "lineStyle": {"width": 3}},
-                        {"name": "face (raw)", "type": "scatter", "symbolSize": 5, "data": []},
-                        {"name": "body (raw)", "type": "scatter", "symbolSize": 5, "data": []},
-                    ],
-                }).classes("w-full h-56")
-                probe_row = ui.row().classes("w-full gap-2")
-            probe_exp.visible = False
-            shown_probes: list[str] = []
-            with ui.expansion("Latest samples", value=True).classes("w-full"):
-                samples_row = ui.row().classes("w-full gap-2")
-            saved_label = ui.label("").classes("font-mono text-xs whitespace-pre-wrap")
-            ui.label("Log").classes("text-sm font-bold")
-            log_view = ui.log(max_lines=600).classes("w-full h-72 font-mono text-xs")
+            with ui.column().classes("rz-page gap-4"):
+                with ui.row().classes("w-full gap-3"):
+                    tiles = {key: stat_tile(label) for key, label in (
+                        ("state", "Status"), ("stage", "Stage"), ("step", "Step"), ("loss", "Loss"),
+                        ("lr", "Learning rate"), ("eta", "Time left"))}
+                job_bar = ui.linear_progress(value=0, show_value=False, size="6px").classes("w-full") \
+                    .props("rounded track-color=grey-10")
+                error_box = ui.label("").classes("rz-banner error")
+                error_box.visible = False
+                gpu_box = ui.row().classes("w-full gap-3")
+                gpu_widgets: list[dict] = []
+                with card():
+                    with ui.row().classes("w-full items-center gap-4"):
+                        ui.label("Loss").classes("rz-title")
+                        ui.space()
+                        ui.label("Smoothing").classes("rz-hint")
+                        smoothing = ui.slider(min=0, max=0.98, step=0.02, value=0.8).classes("w-48")
+                        ui.label().bind_text_from(smoothing, "value", lambda x: f"{x:.2f}").classes("rz-hint w-10")
+                    loss_chart = ui.echart(chart_options(
+                        _axis("step", min="dataMin"),
+                        [_axis("loss", scale=True),
+                         _axis("id loss", scale=True, show=False, splitLine={"show": False})],
+                        [_line("raw", "#52525B", lineStyle={"width": 1}),
+                         _line("smoothed", "#FF3B30", lineStyle={"width": 2}),
+                         _line("id loss (smoothed)", "#F4F4F5", yAxisIndex=1,
+                               lineStyle={"width": 2, "type": "dashed"})],
+                        ["raw", "smoothed"])).classes("w-full h-72")
+                with section("Identity similarity", "Face / body / combined score of every sample", "face") as face_exp:
+                    face_label = hint("")
+                    face_chart = ui.echart(chart_options(_axis("step", min="dataMin"),
+                                                         _axis("similarity %", min=0, max=100), [], [])) \
+                        .classes("w-full h-60")
+                face_exp.visible = False
+                with section("Per-image loss watch", "Verdict per training image", "rule") as lw_exp:
+                    lw_label = hint("")
+                    lw_table = ui.table(columns=[
+                        {"name": "image", "label": "image", "field": "image", "align": "left", "sortable": True},
+                        {"name": "verdict", "label": "verdict", "field": "verdict", "align": "left", "sortable": True},
+                        {"name": "residual", "label": "residual (epoch)", "field": "residual", "sortable": True},
+                        {"name": "ema", "label": "residual EMA", "field": "ema", "sortable": True},
+                        {"name": "trend", "label": "trend %", "field": "trend", "sortable": True},
+                        {"name": "multiplier", "label": "lr x", "field": "multiplier", "sortable": True},
+                        {"name": "seen", "label": "seen", "field": "seen", "sortable": True},
+                    ], rows=[], row_key="path", pagination=15).props("flat dense").classes("w-full text-xs")
+                lw_exp.visible = False
+                lw_state = {"sig": None}
+                with section("Likeness probes & controller", "Smoothed probe scores and controller state",
+                             "insights") as probe_exp:
+                    probe_label = hint("")
+                    probe_chart = ui.echart(chart_options(
+                        _axis("step", min="dataMin"), _axis("likeness %", min=0, max=100),
+                        [_line("face", "#FF3B30"), _line("body", "#F4F4F5"),
+                         _line("combined", "#F59E0B", lineStyle={"width": 3}),
+                         {"name": "face (raw)", "type": "scatter", "symbolSize": 5, "data": [],
+                          "itemStyle": {"color": "#FB7185"}},
+                         {"name": "body (raw)", "type": "scatter", "symbolSize": 5, "data": [],
+                          "itemStyle": {"color": "#A1A1AA"}}],
+                        ["face", "body", "combined", "face (raw)", "body (raw)"])).classes("w-full h-60")
+                    probe_row = ui.row().classes("w-full gap-2")
+                probe_exp.visible = False
+                shown_probes: list[str] = []
+                with section("Latest samples", "Click an image to see it full size", "image"):
+                    with ui.row().classes("w-full gap-2") as samples_row:
+                        hint("No samples yet. They appear here every 'Sample every' steps.")
+                with section("Log and saved files", "train.log, checkpoints and training states", "terminal"):
+                    saved_label = ui.label("").classes("rz-mono whitespace-pre-wrap")
+                    log_view = ui.log(max_lines=600).classes("w-full h-80 rz-log rz-mono")
             shown_samples: list[str] = []
             log_state = {"job": None, "n": 0, "console_shown": False}
             show_full = image_viewer()
+
+            def show(key: str, value: str, sub: str = ""):
+                tiles[key][0].text = value
+                tiles[key][1].text = sub
 
             def update_gpus():
                 stats = gpu_stats()
@@ -1524,17 +2812,25 @@ def build_page():
                     gpu_box.clear()
                     gpu_widgets.clear()
                     with gpu_box:
-                        for st in stats:
-                            with ui.row().classes("w-full items-center gap-2"):
-                                lbl = ui.label("").classes("font-mono text-xs w-[30rem]")
-                                vram = ui.linear_progress(value=0, show_value=False).classes("w-48")
-                                util = ui.linear_progress(value=0, show_value=False, color="orange").classes("w-48")
-                            gpu_widgets.append({"lbl": lbl, "vram": vram, "util": util})
+                        for _ in stats:
+                            with ui.column().classes("rz-tile gap-1 min-w-[18rem]"):
+                                name = ui.label("").classes("text-sm font-semibold text-white")
+                                bars = {}
+                                for key, color in (("vram", "primary"), ("util", "grey-5")):
+                                    with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                                        ui.label("VRAM" if key == "vram" else "Load").classes("rz-tile-sub w-10")
+                                        bar = ui.linear_progress(value=0, show_value=False, size="6px",
+                                                                 color=color).props("rounded track-color=grey-10") \
+                                            .classes("flex-1")
+                                        text = ui.label("").classes("rz-tile-sub w-28 text-right")
+                                    bars[key] = (bar, text)
+                            gpu_widgets.append({"name": name, **bars})
                 for st, wdg in zip(stats, gpu_widgets):
-                    wdg["lbl"].text = (f"GPU{st['index']} {st['name']}: VRAM {st['used'] / 1024:.1f}/{st['total'] / 1024:.1f} GB"
-                                       f" | util {st['util']}%")
-                    wdg["vram"].value = st["used"] / max(1, st["total"])
-                    wdg["util"].value = st["util"] / 100
+                    wdg["name"].text = f"GPU {st['index']} · {st['name']}"
+                    wdg["vram"][0].value = st["used"] / max(1, st["total"])
+                    wdg["vram"][1].text = f"{st['used'] / 1024:.1f} / {st['total'] / 1024:.1f} GB"
+                    wdg["util"][0].value = st["util"] / 100
+                    wdg["util"][1].text = f"{st['util']}%"
 
             def update_log():
                 if _job_dir is None:
@@ -1567,23 +2863,27 @@ def build_page():
                 st = read_status()
                 running = _running()
                 if st is None:
-                    progress_label.text = "running: starting..." if running else "idle"
+                    show("state", "Starting" if running else "Idle", _job_dir.name if _job_dir else "no job yet")
+                    for key in ("stage", "step", "loss", "lr", "eta"):
+                        show(key, "-")
                     return
                 step, total = st.get("step", 0), st.get("total", 0) or 0
                 eta = st.get("eta")
-                eta_s = f"{eta / 60:.1f} min" if eta else "-"
                 loss = st.get("loss")
-                state = "RUNNING" if running else "STOPPED"
+                state = ("Running" if running else "Error" if st.get("error") else "Finished" if st.get("done")
+                         else "Stopped")
+                show("state", state, _job_dir.name if _job_dir else "")
+                show("stage", str(st.get("stage") or "-"), f"resolution {st['resolution']}"
+                     if st.get("resolution") else "")
+                show("step", f"{step:,} / {total:,}" if total else str(step),
+                     f"{step / total * 100:.0f}% done" if total else "")
                 if loss is not None:
-                    lr_s = f" | lr {st['lr']:.2e}" if st.get("lr") is not None else ""
-                    res_s = f" | res {st['resolution']}" if st.get("resolution") else ""
-                    progress_label.text = (f"{state} | stage: {st.get('stage')}{res_s} | step {step}/{total} | loss {loss:.4f}"
-                                           f" | avg {st.get('avg_loss') or 0:.4f}{lr_s} | eta {eta_s}")
-                else:
-                    progress_label.text = f"{state} | stage: {st.get('stage')} | {step}/{total}"
-                if st.get("error"):
-                    progress_label.text += f"  ERROR: {st['error']}"
-                progress_bar.value = (step / total) if total else 0
+                    show("loss", f"{loss:.4f}", f"average {st.get('avg_loss') or 0:.4f}")
+                show("lr", f"{st['lr']:.2e}" if st.get("lr") is not None else "-")
+                show("eta", f"{eta / 60:.1f} min" if eta and running else "-")
+                error_box.text = f"Error: {st['error']}" if st.get("error") else ""
+                error_box.visible = bool(st.get("error"))
+                job_bar.value = (step / total) if total else 0
                 losses = st.get("losses") or []
                 if losses:
                     start = max(0, step - len(losses))
@@ -1688,7 +2988,7 @@ def build_page():
                         probe_row.clear()
                         with probe_row:
                             for p in latest_imgs:
-                                with ui.card().tight():
+                                with ui.card().tight().classes("rz-thumb"):
                                     ui.image(p).props("fit=contain").classes("w-40 h-40 bg-black cursor-pointer") \
                                         .on("click", lambda _, q=p: show_full(Path(q)))
                                     ui.label(Path(p).name).classes("text-xs px-1")
@@ -1699,8 +2999,10 @@ def build_page():
                     shown_samples[:] = sample_sig
                     samples_row.clear()
                     with samples_row:
+                        if not sample_sig:
+                            hint("No samples yet. They appear here every 'Sample every' steps.")
                         for p, pct in sample_sig:
-                            with ui.card().tight():
+                            with ui.card().tight().classes("rz-thumb"):
                                 ui.image(p).props("fit=contain").classes("w-48 h-48 bg-black cursor-pointer") \
                                     .on("click", lambda _, q=p: show_full(Path(q)))
                                 caption = Path(p).name
@@ -1710,18 +3012,87 @@ def build_page():
                                 ui.label(caption).classes("text-xs px-1")
                 saved = list(st.get("saved") or [])
                 states = list(st.get("states") or [])
-                saved_label.text = "Saved:\n" + "\n".join(saved) + ("\nStates:\n" + "\n".join(states) if states else "")
+                saved_label.text = ("Saved:\n" + "\n".join(saved) if saved else "No LoRA saved yet.") \
+                    + ("\nStates:\n" + "\n".join(states) if states else "")
                 update_log()
 
             ui.timer(2.0, poll)
 
         # ------------------------------------------------------------ Samples
         with ui.tab_panel(tab_samples):
-            build_samples_tab(f)
+            with ui.column().classes("rz-page gap-4"):
+                build_samples_tab(f)
 
         # ------------------------------------------------------------ Help
         with ui.tab_panel(tab_help):
-            ui.markdown(HELP)
+            with ui.column().classes("rz-page"):
+                with card():
+                    ui.markdown(HELP).classes("rz-help")
+
+    # ---------------------------------------------------------------- action bar (Train and Monitor tabs)
+    with ui.footer().classes("rz-footer") as footer:
+        with ui.row().classes("rz-footer-row w-full items-center gap-3"):
+            with ui.column().classes("gap-1 min-w-[12rem] flex-1"):
+                status_msg = ui.label("").classes("rz-status-msg")
+                with ui.row().classes("items-center gap-2 no-wrap") as task_row:
+                    ui.spinner(size="sm")
+                    task_text = ui.label("").classes("text-sm")
+                    task_bar = ui.linear_progress(value=0, show_value=False, size="6px").classes("w-48") \
+                        .props("rounded track-color=grey-10")
+                task_row.visible = False
+            with ui.row().classes("items-center gap-2 no-wrap"):
+                ui.button("Start training", icon="play_arrow", on_click=start_job).props("unelevated")
+                ui.button("Stop", icon="stop", on_click=lambda: setattr(status_msg, "text", stop_training())) \
+                    .props("outline color=white").tooltip("Stop after the current step and save the LoRA")
+                ui.button("Kill", icon="dangerous", on_click=lambda: setattr(status_msg, "text", kill_training())) \
+                    .props("flat color=negative").tooltip("End the process now, without a final save")
+    footer.bind_value_from(tabs, "value", lambda t: t in ("Train", "Monitor", tab_train, tab_monitor))
+
+    def task_tick():
+        if not _task_progress["active"]:
+            task_row.visible = False
+            return
+        task_row.visible = True
+        task_text.text = _task_progress["text"]
+        frac = _task_progress["frac"]
+        task_bar.visible = frac is not None
+        task_bar.value = frac or 0
+
+    def pill_tick():
+        st = read_status() or {}
+        running = _running()
+        state = "live" if running else "error" if st.get("error") else "done" if st.get("done") else ""
+        pill_dot.classes(replace=f"rz-dot {state}")
+        if running:
+            stage = str(st.get("stage") or "starting")
+            pill_text.text = (f"Training · step {st.get('step', 0):,} / {st.get('total') or 0:,}"
+                              if stage == "training" else stage[:1].upper() + stage[1:])
+        else:
+            pill_text.text = {"error": "Last run failed", "done": "Last run finished"}.get(state, "Idle")
+
+    ui.timer(0.5, task_tick)
+    ui.timer(2.0, pill_tick)
+    pill_tick()
+
+    tab_names = ("Wizard", "Train", "Dataset", "Monitor", "Samples", "Help")
+
+    def remember_tab(e):
+        name = e.value if isinstance(e.value, str) else e.value.props.get("name")
+        ui.run_javascript(f"try {{ localStorage.setItem('rulz.tab', {json.dumps(name)}) }} catch (e) {{}}")
+
+    async def restore_tab():
+        """Open the tab used last in this browser (the Monitor wins while a job runs)."""
+        if job_running:
+            return
+        try:
+            name = await ui.run_javascript("localStorage.getItem('rulz.tab')", timeout=3)
+        except Exception:  # noqa: BLE001  (storage blocked, slow client)
+            return
+        if name in tab_names:
+            tabs.value = name
+
+    tabs.on_value_change(remember_tab)
+    ui.timer(0.05, restore_tab, once=True)
 
     if job_running and _job_dir is not None and (_job_dir / "config.yaml").is_file():
         # reattached to a running job: show its settings instead of the defaults
@@ -1733,12 +3104,19 @@ def build_page():
 
 
 HELP = """
+## Wizard
+New to LoRA training? The **Wizard** tab walks through a run one topic at a time: what you are training, the model,
+your GPUs, the dataset, the training settings and the preview images, then a review with any problems it finds.
+Every setting is explained and comes with a recommendation worked out from your GPUs (memory) and your dataset
+(image count and size): *Use* takes one, *Apply recommended* takes every one on the page. The wizard edits the same
+settings as the Train tab, so you can switch between the two at any time.
+
 ## Quick start
 1. **Dataset**: a folder of images; each image may have a same-name `.txt` caption. Optional trigger word is prepended.
 2. **Model**: either a Hugging Face repo (Base / SFT, about 30 GB, stored under `models/`) or three single
    ComfyUI-style files: diffusion model, Qwen3.5-9B text encoder and Flux2 VAE.
-3. Click **Start training**. First run caches VAE latents and text embeddings; the text encoder is loaded once
-   for caching and unloaded before the diffusion model is loaded.
+3. Click **Start training** (the bar at the bottom of the Train and Monitor tabs). First run caches VAE latents and
+   text embeddings; the text encoder is loaded once for caching and unloaded before the diffusion model is loaded.
 4. LoRAs are written to `output/<job>/<job>_<step>.safetensors` and `output/<job>/<job>.safetensors` (bf16 by default).
 
 ## Quantization
@@ -1747,9 +3125,9 @@ ComfyUI int8/nvfp4 file stays quantized), `none` dequantizes to bf16, and `int8`
 quantize on load. Only the frozen base weights are quantized; the LoRA itself always trains in fp32.
 int8 roughly halves VRAM for the base model (about 5 GB for the DiT); nvfp4 quarters it.
 
-*int8 layers compute*: with **W8A8** (default) int8 / int8_convrot layers quantize the activations per token to
-int8 and run an int8 x int8 matmul (`torch._int_mm`) on the stored weight, so training is faster than bf16
-instead of ~3x slower; the extra error is under 1% of the output. *int8 backward* `bf16` is exact (the weight
+*int8 layers compute* (Model, Advanced): with **W8A8** (default) int8 / int8_convrot layers quantize the activations
+per token to int8 and run an int8 x int8 matmul (`torch._int_mm`) on the stored weight, so training is faster than
+bf16 instead of ~3x slower; the extra error is under 1% of the output. *int8 backward* `bf16` is exact (the weight
 is widened to bf16 only for the gradient), `int8` also quantizes the gradient (faster, ~1% gradient error).
 `dequantize to bf16` is the old slow path for A/B comparison. nvfp4 always dequantizes.
 
@@ -1761,8 +3139,8 @@ stops improving for *N probes* the next resolution starts, and at the highest re
 improvement end training (two separate counts, default 1 each). Step-up needs probes (face/body references).
 
 ## Training states
-Tick *Save training state* to also write `state_XXXXXX/` folders (LoRA in fp32 + optimizer + scheduler + RNG).
-Point *Resume from training state folder* at one of them to continue exactly where it stopped.
+Turn on *Save training state* (LoRA, Advanced) to also write `state_XXXXXX/` folders (LoRA in fp32 + optimizer +
+scheduler + RNG). Point *Resume from training state folder* at one of them to continue exactly where it stopped.
 
 ## Sampling model
 Optionally sample with a different checkpoint than you train on (for example train on Base, preview on SFT).
@@ -1773,8 +3151,9 @@ An optional ComfyUI-format LoRA (for example an 8-step distill) applied only whi
 never during the training step. Set *Sample steps* to match it.
 
 ## Identity training (character LoRAs)
-The **Identity training preset** switch (top of the Train tab) applies the measured recipe below in one go and
-restores your previous settings when switched off; the CLI equivalent is `--preset identity`.
+The **Identity training preset** switch (top of the Train tab, or *Character / person* in the Wizard) applies the
+measured recipe below in one go and restores your previous settings when switched off; the CLI equivalent is
+`--preset identity`.
 Measured on a small test set (120 steps, same seeds): region-weighted loss gave the best face likeness (+2 points
 over baseline), LoRA+ at ratio 4 a small gain (ratio 16 on a 2e-4 lr was unstable), `identity` timesteps were
 neutral, and auto crops *hurt* when the crops had to be upscaled. Suggested recipe: *Region-weighted loss* on
@@ -1817,18 +3196,68 @@ def _free_port(host: str, start: int, tries: int = 10) -> int:
     raise SystemExit(f"No free port in range {start}-{start + tries - 1}")
 
 
+def _tailscale_exe() -> str | None:
+    exe = shutil.which("tailscale")
+    if exe is None and sys.platform == "win32":
+        default = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Tailscale" / "tailscale.exe"
+        exe = str(default) if default.is_file() else None
+    return exe
+
+
+def tailscale_serve(port: int) -> str:
+    """Publish the WebUI to your tailnet with `tailscale serve`: HTTPS with a Tailscale certificate, reachable only
+    from your own Tailscale devices, while the WebUI itself stays bound to 127.0.0.1. The HTTPS port is the WebUI's
+    port, so a `tailscale serve` already on 443 (ComfyUI, for example) is left alone. Returns the URL."""
+    exe = _tailscale_exe()
+    if exe is None:
+        raise RuntimeError("tailscale is not installed or not on PATH (https://tailscale.com/download)")
+    try:
+        state = json.loads(subprocess.run([exe, "status", "--json"], capture_output=True, text=True, timeout=15,
+                                          check=True).stdout)
+    except (subprocess.SubprocessError, json.JSONDecodeError) as e:
+        raise RuntimeError(f"tailscale status failed ({e}); is Tailscale running and logged in?") from e
+    if state.get("BackendState") != "Running":
+        raise RuntimeError(f"Tailscale is {state.get('BackendState')}, not connected; run `tailscale up` first")
+    res = subprocess.run([exe, "serve", "--bg", "--yes", f"--https={port}", f"http://127.0.0.1:{port}"],
+                         capture_output=True, text=True, timeout=60)
+    if res.returncode != 0:
+        raise RuntimeError("tailscale serve failed (the tailnet needs HTTPS certificates: admin console > DNS > "
+                           f"HTTPS Certificates):\n{(res.stderr or res.stdout).strip()}")
+    return f"https://{state['Self']['DNSName'].rstrip('.')}:{port}"
+
+
+def tailscale_unserve(port: int) -> None:
+    exe = _tailscale_exe()
+    if exe:
+        subprocess.run([exe, "serve", f"--https={port}", "off"], capture_output=True, timeout=30)
+
+
 if __name__ in {"__main__", "__mp_main__"}:
+    from fastapi import Request
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=7870)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--open", action="store_true", help="open the UI in the default browser once ready")
+    ap.add_argument("--tailscale", action="store_true", default=os.environ.get("RULZ_TAILSCALE") == "1",
+                    help="also serve the UI over HTTPS to your Tailscale devices (tailscale serve); "
+                         "RULZ_TAILSCALE=1 does the same")
     a = ap.parse_args()
     port = _free_port(a.host, a.port)
+    setup_theme()
+    if a.tailscale:
+        try:
+            url = tailscale_serve(port)
+        except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+            raise SystemExit(f"[tailscale] {e}") from e
+        print(f"Tailscale: open {url} on any of your Tailscale devices (tailnet only)")
+        app.on_shutdown(lambda: tailscale_unserve(port))
 
     @ui.page("/")
-    def index():
+    def index(request: Request):
         # A real page function, not NiceGUI's script mode: script mode re-executes this file for every page load,
         # which reset the job globals, so a reload lost the running job.
-        build_page()
+        build_page(local=is_local_viewer(request))
 
-    ui.run(host=a.host, port=port, title="RulzTrainer", show=a.open, reload=False, dark=None)
+    ui.run(host=a.host, port=port, title="RulzTrainer", show=a.open, reload=False, dark=True,
+           favicon=ASSETS / "icon.png")

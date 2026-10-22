@@ -8,12 +8,15 @@ if not exist "venv\Scripts\python.exe" (
     exit /b 1
 )
 
+rem run_webui.bat [port] [tailscale]   ("tailscale" also serves the UI to your Tailscale devices over HTTPS)
 set PORT=7870
 if not "%~1"=="" set PORT=%~1
+set EXTRA=
+if /i "%~2"=="tailscale" set EXTRA=--tailscale
 
 echo Starting RulzTrainer WebUI on http://127.0.0.1:%PORT%  (close this window to stop)
 echo.
-"venv\Scripts\python.exe" webui.py --port %PORT% --open
+"venv\Scripts\python.exe" webui.py --port %PORT% --open %EXTRA%
 if errorlevel 1 (
     echo.
     echo [ERROR] The WebUI exited with an error. See the messages above.

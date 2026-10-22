@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo_dark.png">
+    <img src="assets/logo.png" alt="Rulz" width="420">
+  </picture>
+</p>
+
 # RulzTrainer
 
 A simple diffusion-model LoRA trainer with a WebUI. First supported model: **MOSS-Image**
@@ -31,6 +38,13 @@ python webui.py --port 7870
 
 Open http://127.0.0.1:7870.
 
+New to LoRA training? Start on the **Wizard** tab. It walks through a run one step at a time (goal, model, GPUs,
+dataset, training, samples, review) and explains every setting. Each one gets a recommended value based on your GPU
+memory and on the image count and size of your dataset. *Use* takes one recommendation and *Apply recommended* takes
+every one on the page. The wizard edits the same settings as the **Train** tab, which lists every option grouped by
+topic, with rarely changed ones folded under *Advanced*. *Start training*, *Stop* and *Kill* sit in the bar at the
+bottom of the Train and Monitor tabs.
+
 1. **Dataset**: a folder of images. Each image may have a same-name `.txt` caption. Use *Scan dataset*
    to see the aspect-ratio buckets. Pick one or more *Training resolutions* (megapixels); see
    "Training resolutions and resolution step-up" below.
@@ -42,10 +56,27 @@ Open http://127.0.0.1:7870.
    job's settings into the form). *Stop (save)* and *Kill* work on a reconnected job too.
 4. Results: `output/<job>/<job>_<step>.safetensors` (checkpoints) and `output/<job>/<job>.safetensors` (final).
 
-*Save config* / *Load config* store the whole form as YAML (Browse opens in `configs/`). Loading a config saved by
+*Save* / *Load* (in the *Training job* card at the top of the Train tab) store the whole form as YAML (Browse opens
+in `configs/`). Loading a config saved by
 an older version fills every option added since with its default, appends those options to the end of the file
 (your values and comments are left as they are) and lists them under the buttons. Options a newer version no longer
 has are ignored instead of refusing the file. `configs/example.yaml` ships with the repo and is never modified.
+
+### Remote access with Tailscale
+
+To use the WebUI from your other devices (laptop, phone), start it with Tailscale. On Windows, double-click
+`run_webui_tailscale.bat` or run `run_webui.bat 7870 tailscale`. On Linux, run `./run_webui.sh 7870 127.0.0.1 tailscale`.
+`python webui.py --tailscale` and `RULZ_TAILSCALE=1` do the same.
+
+It runs `tailscale serve`, so the WebUI stays bound to `127.0.0.1`. Tailscale publishes it over HTTPS at
+`https://<machine>.<tailnet>.ts.net:7870`, and only devices logged in to your tailnet can open it. The URL is printed
+on start. It uses its own HTTPS port, so an existing `tailscale serve` on the default port (ComfyUI, for example) is
+not touched. Stopping the WebUI with Ctrl+C removes the entry. If you close the window instead, the entry stays and
+shows an error page until the WebUI starts again.
+
+Requirements: Tailscale installed and logged in on this machine, and HTTPS certificates turned on for the tailnet
+(admin console > DNS > HTTPS Certificates). Browsers that connect remotely get no native *Browse* buttons, because
+those dialogs would open on this machine's screen. Type server paths instead, or upload datasets on the Dataset tab.
 
 ### CLI
 
