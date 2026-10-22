@@ -26,7 +26,7 @@ function createWindow(): BrowserWindow {
     minHeight: 640,
     show: false,
     title: 'RulZ LLM Suite',
-    backgroundColor: '#0e1014',
+    backgroundColor: '#000000',
     autoHideMenuBar: true,
     // Packaged builds take the icon from the .exe; dev runs need it explicitly.
     ...(app.isPackaged ? {} : { icon: join(__dirname, '../../build/icon.png') }),

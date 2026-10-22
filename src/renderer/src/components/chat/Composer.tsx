@@ -99,7 +99,7 @@ export const Composer = forwardRef<ComposerHandle>(function Composer(_props, ref
           rows={1}
           value={text}
           placeholder="Send a message…"
-          className="block max-h-[40vh] w-full resize-none bg-transparent px-4 pt-3.5 pb-2 text-[14px] leading-relaxed placeholder:text-faint focus:outline-none"
+          className="block max-h-[40vh] w-full resize-none bg-transparent px-4 pt-3.5 pb-2 text-[14px] leading-relaxed placeholder:text-faint focus:outline-none focus-visible:outline-none"
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
