@@ -369,7 +369,7 @@ def load_batch(batch: list[Item], cfg: TrainConfig, rng: random.Random):
 
     latents, rows, maps = [], [], []
     empty = empty_text_path(cfg)
-    want_regions = bool(getattr(cfg, "region_weights", False))
+    want_regions = cfg.wants_regions()
     for it in batch:
         path = it.latent_path
         flipped = False

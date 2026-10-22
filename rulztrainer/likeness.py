@@ -76,6 +76,10 @@ class LikenessController:
         self.stage = 0
         self.stage_best = None
         self.stage_since_improve = 0
+        # identity-loss guard: face EMA best and consecutive probes far below it
+        self.face_best = None
+        self.face_drop_count = 0
+        self.id_loss_vetoed = False
 
     def enter_stage(self, stage: int) -> None:
         """Start a resolution stage: the next probe becomes that stage's baseline."""
@@ -97,7 +101,9 @@ class LikenessController:
 
     def update(self, step: int, face: float | None, body: float | None, images: list[str] | None = None):
         """Feed one probe result. Returns (record, actions) where actions may contain
-        save_best (bool), stop (bool), lr_ratio (float, new/old), face_bias (float)."""
+        save_best (bool), stop (bool), lr_ratio (float, new/old), face_bias (float), step_up (int),
+        id_loss_veto (bool: the face EMA fell more than 2 noise bands below its best for two probes in a row
+        while the identity loss is on)."""
         cfg = self.cfg
         actions: dict = {}
         self.n_probes += 1
@@ -106,6 +112,17 @@ class LikenessController:
         comb = combine(self.face_ema, self.body_ema, cfg.face_weight, cfg.body_weight)
         self.combined_ema = comb
         band = cfg.likeness_noise_band
+        if self.face_ema is not None and face is not None:
+            if self.face_best is None or self.face_ema > self.face_best:
+                self.face_best = self.face_ema
+            if self.face_ema < self.face_best - 2 * band:
+                self.face_drop_count += 1
+            else:
+                self.face_drop_count = 0
+            if (getattr(cfg, "id_loss_weight", 0.0) > 0 and not self.id_loss_vetoed
+                    and self.face_drop_count >= 2):
+                self.id_loss_vetoed = True
+                actions["id_loss_veto"] = True
         if comb is not None:
             if self.best is None or comb > self.best + band:
                 self.best, self.best_step, self.since_improve = comb, step, 0
@@ -155,7 +172,8 @@ class LikenessController:
                 "lr_factor": self.lr_factor, "face_bias": self.face_bias, "stopped": self.stopped,
                 "face_ema": self.face_ema, "body_ema": self.body_ema, "combined_ema": self.combined_ema,
                 "n_probes": self.n_probes, "stage": self.stage, "n_stages": self.n_stages,
-                "stage_best": self.stage_best, "stage_since_improve": self.stage_since_improve}
+                "stage_best": self.stage_best, "stage_since_improve": self.stage_since_improve,
+                "id_loss_vetoed": self.id_loss_vetoed}
 
 
 def append_record(job_dir: Path, rec: ProbeRecord) -> None:

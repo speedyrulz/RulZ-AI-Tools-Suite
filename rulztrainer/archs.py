@@ -64,6 +64,17 @@ class Arch:
 
         return decode_latents(vae, latents)
 
+    def decode_latents_grad(self, vae, latents: torch.Tensor) -> torch.Tensor:
+        from .moss.loading import decode_latents_grad
+
+        return decode_latents_grad(vae, latents)
+
+    def grad_vae(self, vae):
+        """The VAE copy decode_latents_grad runs on (bf16, gradient checkpointing)."""
+        from .moss.loading import grad_vae
+
+        return grad_vae(vae)
+
     def sample(self, model, pos_e, pos_m, neg_e, neg_m, **kw) -> torch.Tensor: ...
 
     # ---- prompts

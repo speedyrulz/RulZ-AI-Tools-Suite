@@ -213,6 +213,14 @@ class TrainConfig:
     crop_face_caption: str = "close-up portrait photo of {caption}"
     crop_bust_caption: str = "head and shoulders photo of {caption}"
     crop_augment_weight: float = 1.0  # sampling weight of crop items
+    # --- identity training: direct identity loss (experimental; needs face_refs) ---
+    id_loss_weight: float = 0.0  # 0 = off; applied weight is capped at 0.5. Loss = w * (1 - cos(face emb, ref))
+    id_loss_sigma_max: float = 0.35  # only low-noise samples, where the predicted x0 shows a recognisable face
+    id_loss_every: int = 1  # use every k-th eligible sample
+    id_loss_backend: str = "arcface"  # arcface (= the probe metric, onnx2torch) | facenet (independent of the probe)
+    id_loss_margin_cells: int = 2  # latent cells of context decoded around the face box
+    id_loss_min_face_cells: int = 4  # skip faces smaller than this many latent cells (16 px each) on a side
+    id_loss_random_ref: bool = True  # one random reference face per step (else the mean reference embedding)
     # --- likeness probes & controller (character LoRAs) ---
     probe_every: int = 0  # steps between probe renders; 0 = off (needs face_refs and/or body_refs)
     probe_at_start: bool = True  # also probe at step 0 for a baseline
@@ -256,12 +264,20 @@ class TrainConfig:
         for mp in self.resolutions:
             if not (0.0 < float(mp) <= 16.0):
                 raise ValueError(f"resolutions must be megapixel values in (0, 16], got {mp!r}")
+        if self.id_loss_backend not in ("arcface", "facenet"):
+            raise ValueError(f"id_loss_backend must be arcface or facenet, got {self.id_loss_backend!r}")
+        if self.id_loss_every < 1:
+            raise ValueError("id_loss_every must be at least 1")
         if self.resolution_step_up:
             if self.step_up_patience < 1 or self.step_up_stop_patience < 1:
                 raise ValueError("step_up_patience and step_up_stop_patience must be at least 1")
             if self.probe_every <= 0 or not (self.face_refs or self.body_refs):
                 raise ValueError("resolution_step_up needs likeness probes: set probe_every > 0 and face_refs "
                                  "and/or body_refs (the step-up decision is the probe likeness score)")
+
+    def wants_regions(self) -> bool:
+        """Region maps (face cells + landmarks) are needed by the region-weighted loss and the identity loss."""
+        return bool(self.region_weights or self.id_loss_weight > 0)
 
     def resolved_cache_dir(self) -> Path:
         return Path(self.cache_dir) if self.cache_dir else Path(self.dataset_dir) / ".rulz_cache"

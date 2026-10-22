@@ -231,7 +231,11 @@ def load_region_map(path: Path) -> RegionMap | None:
 def flip_region_map(rm: RegionMap, bw: int) -> RegionMap:
     w_cells = rm.weight.shape[-1]
     fc = (w_cells - rm.face_cells[2], rm.face_cells[1], w_cells - rm.face_cells[0], rm.face_cells[3]) if rm.face_cells else None
-    kps = [[bw - x, y] for x, y in rm.kps] if rm.kps else None
+    kps = None
+    if rm.kps:
+        kps = [[bw - x, y] for x, y in rm.kps]
+        if len(kps) == 5:  # mirrored face: the left eye / mouth corner is now the right one (keeps 5-point order)
+            kps = [kps[1], kps[0], kps[2], kps[4], kps[3]]
     return RegionMap(rm.weight.flip(-1), rm.prior.flip(-1), fc, kps, rm.has_person)
 
 

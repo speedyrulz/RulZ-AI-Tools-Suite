@@ -14,4 +14,6 @@ triton-windows>=3.8; sys_platform == "win32"
 insightface>=0.7
 onnxruntime-gpu>=1.17
 mediapipe>=0.10
+# optional: identity loss with the arcface backend (id_loss_backend: arcface)
+onnx2torch>=1.5
 psutil>=5.9  # WebUI reattaches to a running training job

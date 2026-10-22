@@ -498,6 +498,10 @@ class Form:
             body_loss_weight=float(v("body_loss_weight")), background_loss_weight=float(v("background_loss_weight")),
             face_margin=float(v("face_margin")), region_feather_cells=int(v("region_feather_cells")),
             region_prior_weight=float(v("region_prior_weight")),
+            id_loss_weight=float(v("id_loss_weight")), id_loss_sigma_max=float(v("id_loss_sigma_max")),
+            id_loss_every=int(v("id_loss_every")), id_loss_backend=v("id_loss_backend"),
+            id_loss_margin_cells=int(v("id_loss_margin_cells")),
+            id_loss_min_face_cells=int(v("id_loss_min_face_cells")), id_loss_random_ref=bool(v("id_loss_random_ref")),
             content_power=float(v("content_power")), sigma_min=float(v("sigma_min")), sigma_max=float(v("sigma_max")),
             lora_plus_ratio=float(v("lora_plus_ratio")),
             crop_augment=v("crop_augment"), crop_augment_min_px=int(v("crop_augment_min_px")),
@@ -1291,6 +1295,33 @@ def build_page():
                                 ui.tooltip(cap)
 
                 ui.button("Preview region maps", on_click=on_region_preview)
+                ui.separator()
+                ui.label("Experimental: identity loss").classes("text-sm font-bold")
+                ui.label("On low-noise samples with a detected face, decodes the face of the model's predicted clean "
+                         "image (with gradients), aligns it and adds weight x (1 - cosine similarity) to a face "
+                         "reference embedding. Needs face references (Likeness scoring). Applied weight is capped at "
+                         "0.5; try 0.1-0.2 only once the rest of the recipe works. Costs a VAE decode + face network "
+                         "per eligible sample on the first GPU (data parallel: primary replica only). The likeness "
+                         "controller switches it off if the face probe score falls well below its best twice in a "
+                         "row.").classes("text-xs")
+                ui.label("Warning: with the arcface backend the face probe score is computed by the same network the "
+                         "loss optimises, so the probe metric becomes the training target and can rise without a real "
+                         "likeness gain. Use facenet to keep the probe an independent check, and judge the samples by "
+                         "eye.").classes("text-xs text-orange-600")
+                with ui.row().classes("w-full items-end"):
+                    w["id_loss_weight"] = ui.number("Identity loss weight (0 = off)", value=d.id_loss_weight, min=0,
+                                                    max=0.5, step=0.05).classes("w-56")
+                    w["id_loss_backend"] = ui.select(["arcface", "facenet"], value=d.id_loss_backend,
+                                                     label="Backend").classes("w-32")
+                    w["id_loss_sigma_max"] = ui.number("Max sigma", value=d.id_loss_sigma_max, min=0, max=1,
+                                                       step=0.05).classes("w-28")
+                    w["id_loss_every"] = ui.number("Every k-th eligible", value=d.id_loss_every, min=1,
+                                                   precision=0).classes("w-36")
+                    w["id_loss_min_face_cells"] = ui.number("Min face (cells)", value=d.id_loss_min_face_cells, min=1,
+                                                            precision=0).classes("w-32")
+                    w["id_loss_margin_cells"] = ui.number("Crop margin (cells)", value=d.id_loss_margin_cells, min=0,
+                                                          precision=0).classes("w-36")
+                    w["id_loss_random_ref"] = ui.checkbox("Random reference per step", value=d.id_loss_random_ref)
 
             with ui.expansion("Per-image loss watch & per-image learning rate", value=False).classes("w-full"):
                 ui.label("Tracks every image's loss normalised by its timestep bucket and, at each epoch boundary, "
@@ -1421,14 +1452,18 @@ def build_page():
                 ui.label().bind_text_from(smoothing, "value", lambda x: f"{x:.2f}")
             loss_chart = ui.echart({
                 "xAxis": {"type": "value", "name": "step", "min": "dataMin"},
-                "yAxis": {"type": "value", "name": "loss", "scale": True},
+                "yAxis": [{"type": "value", "name": "loss", "scale": True},
+                          {"type": "value", "name": "id loss", "scale": True, "show": False,
+                           "splitLine": {"show": False}}],
                 "tooltip": {"trigger": "axis"},
                 "legend": {"data": ["raw", "smoothed"]},
-                "grid": {"left": 60, "right": 20, "top": 30, "bottom": 40},
+                "grid": {"left": 60, "right": 60, "top": 30, "bottom": 40},
                 "series": [
                     {"name": "raw", "type": "line", "showSymbol": False, "data": [],
                      "lineStyle": {"width": 1, "opacity": 0.35}},
                     {"name": "smoothed", "type": "line", "showSymbol": False, "data": [], "lineStyle": {"width": 2}},
+                    {"name": "id loss (smoothed)", "type": "line", "showSymbol": False, "data": [], "yAxisIndex": 1,
+                     "lineStyle": {"width": 2, "type": "dashed"}},
                 ],
             }).classes("w-full h-64")
             with ui.expansion("Identity similarity (face / body / combined)", value=True).classes("w-full") as face_exp:
@@ -1560,6 +1595,15 @@ def build_page():
                         sm.append([x, ema])
                     loss_chart.options["series"][0]["data"] = raw
                     loss_chart.options["series"][1]["data"] = sm
+                    id_pts = st.get("id_losses") or []  # [step, id loss] (identity loss, steps with a face only)
+                    if id_pts:
+                        ism, ema = [], None
+                        for x, v in id_pts:
+                            ema = v if ema is None else a * ema + (1 - a) * v
+                            ism.append([x, ema])
+                        loss_chart.options["series"][2]["data"] = ism
+                        loss_chart.options["yAxis"][1]["show"] = True
+                        loss_chart.options["legend"]["data"] = ["raw", "smoothed", "id loss (smoothed)"]
                     loss_chart.update()
                 fscores = st.get("face_scores") or []
                 if fscores:

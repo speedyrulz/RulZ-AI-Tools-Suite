@@ -23,6 +23,7 @@ from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, d
                       items_for_side, load_batch,
                       scan_dataset, text_cache_path)
 from .archs import detect_arch, get_arch
+from .idloss import effective_weight as idloss_weight
 from .multigpu import clone_to, compile_count, no_recompile_stance, norm_device, run_queue, stance_available
 log = logging.getLogger("rulztrainer")
 DP_COMPILE_QUIET_STEPS = 3  # data parallel + compile: serial steps without a new graph before going parallel
@@ -270,6 +271,9 @@ class Trainer:
         self.vaes: dict[str, object] = {}  # VAE copies on the other GPUs (sampling / caching side jobs)
         self.sample_graphs: set = set()  # (device, shape) pairs a compiled model has already traced for sampling
         self.face_scorer = None
+        self.id_loss = None  # idloss.IdentityLoss when id_loss_weight > 0
+        self.id_ref = None  # this step's reference embedding
+        self.id_time, self.id_count = 0.0, 0  # identity-loss seconds and samples (overhead logging)
         self.body_scorer = None
         self.controller = None
         self.batcher = None
@@ -327,7 +331,7 @@ class Trainer:
     # ------------------------------------------------------------ stages
     def _needs_face_analysis(self) -> bool:
         cfg = self.cfg
-        return bool(cfg.region_weights or (cfg.crop_augment or "none") != "none" or cfg.likeness_curriculum)
+        return bool(cfg.wants_regions() or (cfg.crop_augment or "none") != "none" or cfg.likeness_curriculum)
 
     def _ensure_face_detector(self):
         """A FaceScorer used as a detector (no references needed); shared with the likeness scorer."""
@@ -363,10 +367,12 @@ class Trainer:
         log.info("Face analysis: %d of %d source images have a face", n_face, len(self.face_analysis))
         if (cfg.crop_augment or "none") != "none":
             items = augment_items(items, cfg, self.face_analysis)
-        if cfg.region_weights:
+        if cfg.wants_regions():
             person_fn = None
             holder = []
-            if cfg.body_backend == "mediapipe+sam3":
+            if not cfg.region_weights:
+                pass  # identity loss only: face cells + landmarks are enough, no person masks
+            elif cfg.body_backend == "mediapipe+sam3":
                 try:
                     from .bodysim import SilhouetteScorer
 
@@ -376,7 +382,7 @@ class Trainer:
                     person_fn = sil.person_mask
                 except Exception as e:  # noqa: BLE001
                     log.warning("SAM 3 unavailable for person masks (%s); trying MediaPipe", e)
-            if person_fn is None:
+            if person_fn is None and cfg.region_weights:
                 try:
                     from .bodysim import BodyScorer, available
 
@@ -611,11 +617,12 @@ class Trainer:
         if not cfg.sample_model_path:
             for m, _, _ in self.replicas:
                 self._attach_sampling_loras(m)
-        if cfg.sample_prompts or cfg.probe_every > 0:
+        if cfg.sample_prompts or cfg.probe_every > 0 or cfg.id_loss_weight > 0:
             self.vae = self.arch.get_vae(cfg, self.model_dir)
             self.face_scorer = self._make_face_scorer()
             self.body_scorer = self._make_body_scorer()
             self.controller = self._make_controller(items)
+        self.id_loss = self._make_id_loss()
         if torch.cuda.is_available():
             from .multigpu import gpu_memory_summary
 
@@ -667,8 +674,11 @@ class Trainer:
         start = time.time()
         start_step = step
         losses: list[float] = []
+        id_losses: list[list] = []  # [step, mean id loss] for steps that had eligible samples
+        id_w = idloss_weight(cfg.id_loss_weight)
         def work(job):
-            """Forward + backward for one model copy on its device. Returns (loss value, per-image multipliers)."""
+            """Forward + backward for one model copy on its device. Returns (loss value, per-image multipliers,
+            (identity loss value, samples, seconds) or None)."""
             (rmodel, rinj, rdev), batch, latents, embeds, mask, sigma, noise, regions, cur_step = job
             latents = latents.to(rdev, torch.float32)
             embeds, mask, sigma, noise = embeds.to(rdev), mask.to(rdev), sigma.to(rdev), noise.to(rdev)
@@ -678,10 +688,11 @@ class Trainer:
             noisy_in = noisy.to(torch.bfloat16)
             pred = rmodel(noisy_in, sigma * 1000.0, embeds, mask).float()
             sq = (pred - target).pow(2)
-            if regions is not None:  # region-weighted loss: face > person > background (map has mean 1)
+            if regions is not None and cfg.region_weights:  # region-weighted loss: face > person > background (mean 1)
                 sq = sq * regions.weight.to(rdev)
             per = sq.mean(dim=(1, 2, 3))
-            if regions is not None and cfg.region_prior_weight > 0 and bool(regions.prior.any()):
+            if (regions is not None and cfg.region_weights and cfg.region_prior_weight > 0
+                    and bool(regions.prior.any())):
                 # prior preservation: keep background cells close to what the base model (LoRA off) predicts
                 lora_mod.set_multiplier(rinj, 0.0)
                 with torch.no_grad():
@@ -700,13 +711,24 @@ class Trainer:
                 if cfg.per_image_lr and not true_per_image_lr:
                     weights = weights * torch.tensor(mults, device=weights.device, dtype=weights.dtype)
             loss = (per * weights).mean() / (cfg.gradient_accumulation * n_dev)
+            if self.id_loss is not None and regions is not None and rmodel is model:  # primary replica only
+                t_id = time.time()
+                id_val, n_id = self.id_loss(noisy, pred, sigma, regions.meta, self.id_ref)
+                if id_val is not None:
+                    (loss + id_w * id_val / (cfg.gradient_accumulation * n_dev)).backward()
+                    if str(rdev).startswith("cuda"):
+                        torch.cuda.synchronize(rdev)
+                    return loss.item(), mults, (id_val.item(), n_id, time.time() - t_id)
             loss.backward()
-            return loss.item(), mults
+            return loss.item(), mults, None
 
         while step < cfg.steps:
             optimizer.zero_grad(set_to_none=True)
             accum_loss = 0.0
             step_lr_mult = 1.0
+            step_id: list[tuple] = []
+            if self.id_loss is not None:
+                self.id_ref = self.id_loss.pick_ref()  # one reference face per step
             for _ in range(cfg.gradient_accumulation):
                 jobs = []
                 for rep in self.replicas:  # draw every copy's batch and noise in the main thread (shared RNG)
@@ -744,6 +766,7 @@ class Trainer:
                 else:
                     results = [work(jobs[0])]
                 accum_loss += sum(r[0] for r in results)
+                step_id += [r[2] for r in results if r[2] is not None]
                 if true_per_image_lr and results[0][1]:
                     step_lr_mult = results[0][1][0]
             if self.dp is not None:
@@ -768,11 +791,28 @@ class Trainer:
             done_steps = max(1, step - start_step)
             eta = elapsed / done_steps * (cfg.steps - step)
             lr_now = current_lr(optimizer, scheduler)
+            id_extra = {}
+            if step_id:
+                n_id = sum(r[1] for r in step_id)
+                id_now = sum(r[0] * r[1] for r in step_id) / n_id
+                id_losses.append([step, id_now])
+                self.id_time += sum(r[2] for r in step_id)
+                self.id_count += n_id
+                id_extra = {"id_losses": id_losses[-2000:], "id_loss": id_now}
             if step % 5 == 0 or step == start_step + 1:
-                log.info("step %d/%d loss %.4f avg %.4f lr %.2e %.1fs/it", step, cfg.steps, accum_loss, avg,
-                         lr_now, elapsed / done_steps)
+                id_s = ""
+                if self.id_loss is not None and id_losses:
+                    recent = [v for _, v in id_losses[-10:]]
+                    id_s = (f" | id loss {sum(recent) / len(recent):.4f} ({self.id_count} samples, "
+                            f"{self.id_time / max(1, self.id_count):.2f}s each incl. the step's backward, "
+                            f"{self.id_time / done_steps:.2f}s/it")
+                    if torch.cuda.is_available() and str(self.devices[0]).startswith("cuda"):
+                        id_s += f", peak {torch.cuda.max_memory_allocated(self.devices[0]) / 1e9:.2f} GB"
+                    id_s += ")"
+                log.info("step %d/%d loss %.4f avg %.4f lr %.2e %.1fs/it%s", step, cfg.steps, accum_loss, avg,
+                         lr_now, elapsed / done_steps, id_s)
             self.status.update(step=step, total=cfg.steps, loss=accum_loss, avg_loss=avg, elapsed=elapsed, eta=eta,
-                               lr=lr_now, losses=losses[-2000:])
+                               lr=lr_now, losses=losses[-2000:], **id_extra)
             if self.loss_watch is not None and self.loss_watch.epoch_complete():
                 summary = self.loss_watch.end_epoch(step)
                 log.info("Loss watch epoch %d: %s (median residual %.3f, %d/%d active)", summary["epoch"],
@@ -1184,6 +1224,12 @@ class Trainer:
             log.info("New best likeness %.1f%% at step %d -> %s", rec.best, step, path)
             if str(path) not in self.status.data["saved"]:
                 self.status.data["saved"].append(str(path))
+        if actions.get("id_loss_veto") and self.id_loss is not None:
+            self.id_loss = None
+            log.warning("Identity loss vetoed at step %d: the smoothed face score %s fell more than %.1f points below "
+                        "its best %s for two probes in a row; the identity loss is off for the rest of the run", step,
+                        fmt(rec.face_ema), 2 * cfg.likeness_noise_band, fmt(self.controller.face_best))
+            self.status.update(id_loss_vetoed=step)
         if "lr_ratio" in actions:
             apply_lr_ratio(optimizer, scheduler, actions["lr_ratio"])
             log.info("Likeness lr control: factor now x%.2f (lr %.2e)", rec.lr_factor, current_lr(optimizer, scheduler))
@@ -1267,6 +1313,36 @@ class Trainer:
             return None
         self.status.update(face_ref_similarity=scorer.ref_self_similarity, face_refs=len(scorer.refs))
         return scorer
+
+    def _make_id_loss(self):
+        """The direct identity loss (experimental), or None when it is off or cannot run."""
+        cfg = self.cfg
+        if cfg.id_loss_weight <= 0:
+            return None
+        if self.face_scorer is None:
+            log.warning("Identity loss needs face_refs (and insightface) for the reference identity; disabled")
+            return None
+        from . import idloss
+
+        dev = self.devices[0]
+        vae = self.arch.grad_vae(self._vae_on(dev))
+        self.status.update(stage=f"loading the identity loss ({cfg.id_loss_backend})")
+        try:
+            loss = idloss.build(cfg, self.face_scorer, lambda z: self.arch.decode_latents_grad(vae, z), dev,
+                                progress=lambda t, f: self.status.update(stage=t))
+        except Exception as e:  # noqa: BLE001
+            log.warning("Could not initialise the identity loss (%s); disabled", e)
+            return None
+        self.id_ref = loss.pick_ref()
+        log.info("Identity loss on: backend %s, weight %g (applied %g), sigma <= %g, every %d eligible sample(s), "
+                 "faces >= %d cells, margin %d cells, %d reference(s)%s", cfg.id_loss_backend, cfg.id_loss_weight,
+                 idloss.effective_weight(cfg.id_loss_weight), cfg.id_loss_sigma_max, cfg.id_loss_every,
+                 cfg.id_loss_min_face_cells, cfg.id_loss_margin_cells, len(loss.refs),
+                 ", random reference per step" if cfg.id_loss_random_ref else ", mean reference")
+        if cfg.id_loss_backend == "arcface" and self.controller is not None:
+            log.info("Identity loss uses the probe's own face network (arcface): the face probe score is now the "
+                     "training target; check the samples by eye")
+        return loss
 
     def _make_body_scorer(self):
         cfg = self.cfg

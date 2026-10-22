@@ -412,6 +412,41 @@ settings when switched off. Suggested recipe: `region_weights: true`, `lora_plus
 crops only from high-resolution photos (`crop_augment_min_px: 0` means crops are never upscaled), timesteps at
 `logit_normal`; treat `identity` timesteps and the curriculum as options to A/B with the probes.
 
+### Experimental: direct identity loss
+
+`id_loss_weight > 0` (default 0 = off; the applied weight is capped at 0.5) adds a face-recognition term to the
+diffusion loss. On every `id_loss_every`-th training sample with `sigma <= id_loss_sigma_max` (0.35) and a cached
+face at least `id_loss_min_face_cells` (4) latent cells wide, the trainer forms the predicted clean latent
+`x0 = noisy - sigma * pred`, crops the face cells plus `id_loss_margin_cells` (2) of context, decodes only that
+crop with gradients (`decode_latents_grad`), aligns it to the 5-point face template with a differentiable affine
+warp built from the cached landmarks, embeds it, and adds `weight * (1 - cos(embedding, reference))`. The
+reference is one random face reference per step (`id_loss_random_ref`) or their mean embedding.
+
+- Backends (`id_loss_backend`): `arcface` ports InsightFace's `buffalo_l/w600k_r50.onnx` to torch with
+  `onnx2torch` (`pip install onnx2torch`; a self-check against the ONNX scorer on a reference face must reach
+  cosine > 0.99, else the loss is disabled). This is the very network the face probe scores with, so **the probe
+  metric becomes the training target** and can climb without a real likeness gain. `facenet` uses a vendored
+  InceptionResnetV1 with VGGFace2 weights (downloaded once to `models/facenet/`) and keeps the probe an
+  independent check.
+- Needs `face_refs` (the reference identity) and builds the face cells / landmarks cache even without
+  `region_weights` (person masks are skipped then). Runs on the primary GPU only (data parallel: the other
+  replicas train on the diffusion loss alone).
+- Guard: with probes on, if the smoothed face score falls more than 2 x `likeness_noise_band` below its best for
+  two probes in a row, the controller vetoes the identity loss for the rest of the run (logged, `id_loss_vetoed`
+  in the status).
+- The Monitor loss chart shows the identity loss (smoothed, right axis); the step log reports its mean, sample
+  count, seconds per sample and the peak VRAM.
+
+Cost and effect, measured on an 8-image synthetic character set (512 px, base int8, rank 16, lr 2e-4, 80 steps,
+one 16 GB card, arcface, weight 0.2; 22 of 80 steps had an eligible sample): the ArcFace port matched ONNX at
+cosine 0.9998; the decoder runs as a bf16 copy with gradient checkpointing (an 18 x 18-cell face crop costs
+~0.6 GB for forward + backward instead of 3.5 GB in fp32); peak VRAM 8.0 GB vs 6.05 GB without the loss (+2 GB
+including the extra VAE and face network); 0.86 vs 0.80 s/it (+7%). The identity loss fell from 0.86 (steps
+10-25) to 0.61 (27-43) to 0.47 (51-79). A control with the same draws and a negligible weight (1e-6, measured
+only) fell 0.88 / 0.68 / 0.54, so most of the drop is ordinary learning and the loss adds roughly 0.07 on top in
+this short run. Treat it as an experiment to A/B against the probes (with the facenet backend for an independent
+score), not a default.
+
 ## Likeness probes and controller (character LoRAs)
 
 With face/body references set, `probe_every: N` renders a fixed-seed headshot (`probe_face_prompt`) and/or

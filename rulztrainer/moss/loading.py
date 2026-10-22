@@ -159,16 +159,37 @@ def encode_images(vae, images: torch.Tensor) -> torch.Tensor:
     return (z - mean) / std
 
 
-@torch.no_grad()
-def decode_latents(vae, latents: torch.Tensor) -> torch.Tensor:
-    """Inverse of encode_images. Returns images [B,3,H,W] in [-1,1]."""
+def _decode(vae, latents: torch.Tensor) -> torch.Tensor:
     z = latents.to(vae.device, vae.dtype)
     mean = vae.bn.running_mean.view(1, -1, 1, 1).to(z)
     std = torch.sqrt(vae.bn.running_var.view(1, -1, 1, 1) + vae.config.batch_norm_eps).to(z)
     z = z * std + mean
     b, c, h, w = z.shape
     z = z.reshape(b, c // 4, 2, 2, h, w).permute(0, 1, 4, 2, 5, 3).reshape(b, c // 4, 2 * h, 2 * w)
-    return vae.decode(z, return_dict=False)[0].clamp(-1, 1)
+    return vae.decode(z, return_dict=False)[0]
+
+
+@torch.no_grad()
+def decode_latents(vae, latents: torch.Tensor) -> torch.Tensor:
+    """Inverse of encode_images. Returns images [B,3,H,W] in [-1,1]."""
+    return _decode(vae, latents).clamp(-1, 1)
+
+
+def decode_latents_grad(vae, latents: torch.Tensor) -> torch.Tensor:
+    """decode_latents with gradients to `latents` (identity loss on a face crop). Not clamped: a clamp would zero
+    the gradient of every saturated pixel. The identity loss passes its own bf16 copy of the VAE with gradient
+    checkpointing on (`grad_vae`), which keeps a face crop's forward + backward around 1 GB."""
+    return _decode(vae, latents).float()
+
+
+def grad_vae(vae):
+    """A bf16 copy of the VAE with gradient checkpointing, for decode_latents_grad (the shared fp32 VAE that
+    samples and probes use stays untouched)."""
+    import copy
+
+    out = copy.deepcopy(vae).to(torch.bfloat16).eval().requires_grad_(False)
+    out.enable_gradient_checkpointing()
+    return out
 
 
 def _te_input_device(text_encoder) -> torch.device:
