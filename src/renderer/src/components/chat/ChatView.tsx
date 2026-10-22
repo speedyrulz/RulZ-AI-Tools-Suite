@@ -4,6 +4,7 @@ import { cn, formatCompact } from '../../lib/format'
 import { useApp } from '../../stores/app'
 import { useChat } from '../../stores/chat'
 import { useModels } from '../../stores/models'
+import { LogoWordmark } from '../Logo'
 import { IconButton, Tooltip } from '../ui'
 import { Composer, type ComposerHandle } from './Composer'
 import { MessageItem } from './MessageItem'
@@ -179,9 +180,11 @@ function EmptyState() {
   const openPicker = useApp((s) => s.openPicker)
   return (
     <div className="flex h-full flex-col items-center justify-center gap-4 px-6 text-center">
-      <div className="flex size-14 items-center justify-center rounded-2xl bg-accent text-xl font-black text-accent-fg">RZ</div>
+      <div className="flex flex-col items-center gap-2 select-none">
+        <LogoWordmark className="w-72" />
+        <div className="text-xs font-semibold tracking-[0.35em] text-muted uppercase">LLM Suite</div>
+      </div>
       <div>
-        <div className="text-lg font-semibold">RulZ LLM Suite</div>
         <div className="mt-1 text-sm text-muted">
           {activeModelId
             ? 'Ask anything. Drop images or files to attach them.'

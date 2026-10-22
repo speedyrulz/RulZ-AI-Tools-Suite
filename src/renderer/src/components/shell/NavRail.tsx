@@ -2,6 +2,7 @@ import { CodeXml, FolderOpen, MessageSquare, Search, Settings } from 'lucide-rea
 import type { ReactNode } from 'react'
 import { cn } from '../../lib/format'
 import { useApp, type Page } from '../../stores/app'
+import { LogoMark } from '../Logo'
 import { Tooltip } from '../ui'
 
 const ITEMS: { page: Page; label: string; icon: ReactNode; soon?: boolean }[] = [
@@ -33,8 +34,8 @@ export function NavRail() {
 
   return (
     <nav className="flex w-15 shrink-0 flex-col items-center gap-1.5 border-r border-border bg-panel py-3">
-      <div className="mb-3 flex size-9 items-center justify-center rounded-lg bg-accent text-[13px] font-black tracking-tight text-accent-fg select-none">
-        RZ
+      <div className="mb-3 flex size-10 items-center justify-center select-none">
+        <LogoMark className="w-8" />
       </div>
       {ITEMS.map(item)}
       <div className="flex-1" />
