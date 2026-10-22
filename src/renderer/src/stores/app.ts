@@ -4,7 +4,7 @@ import type { AppInfo } from '@shared/ipc'
 import type { AppSettings, EngineInfo } from '@shared/types'
 import { errorMessage, invoke } from '../lib/api'
 
-export type Page = 'chat' | 'models' | 'settings' | 'discover' | 'developer'
+export type Page = 'chat' | 'models' | 'mcp' | 'settings' | 'discover' | 'developer'
 
 interface AppState {
   page: Page

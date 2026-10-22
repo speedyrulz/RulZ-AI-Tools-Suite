@@ -1,7 +1,7 @@
 import type { ChatRequest, GenerationStats, LoadedInstance, SamplingParams, StreamEvent, WireMessage } from '@shared/types'
 import type { InstanceManager } from '../engine/instances'
 import { fitToContext, IMAGE_TOKENS, imageCount, textOf, type ContextApi } from './context'
-import { errorFromBody, interpretChunk, SseParser, statsFromTimings } from './sse'
+import { errorFromBody, interpretChunk, SseParser, statsFromTimings, ToolCallAccumulator } from './sse'
 
 export function buildRequestBody(
   alias: string,
@@ -38,14 +38,20 @@ export class ChatService {
 
   constructor(
     private readonly instances: InstanceManager,
-    private readonly send: (event: StreamEvent) => void
+    private readonly send: (event: StreamEvent) => void,
+    /** Tool definitions to offer when a request asks for tools. */
+    private readonly getTools: () => unknown[] = () => []
   ) {}
 
   abort(requestId: string): void {
     this.active.get(requestId)?.abort()
   }
 
-  contextApi(instance: LoadedInstance): ContextApi {
+  /** Token count of the tool definitions sent with each request, cached per model and tool set. */
+  private toolTokenCache = new Map<string, number>()
+
+  /** `tools` are the definitions sent with the request; they take context space too. */
+  contextApi(instance: LoadedInstance, tools: unknown[] = []): ContextApi {
     const base = this.instances.baseUrl(instance)
     const tokenize = async (content: string): Promise<number | null> => {
       const res = await fetch(`${base}/tokenize`, {
@@ -58,12 +64,24 @@ export class ChatService {
       const j = (await res.json()) as { tokens?: unknown[] }
       return j.tokens?.length ?? null
     }
+    const toolTokens = async (): Promise<number> => {
+      if (!tools.length) return 0
+      const json = JSON.stringify(tools)
+      const key = `${instance.instanceId}:${json}`
+      let n = this.toolTokenCache.get(key)
+      if (n === undefined) {
+        n = (await tokenize(json).catch(() => null)) ?? Math.ceil(json.length / 3)
+        this.toolTokenCache.set(key, n)
+      }
+      return n
+    }
     return {
       countText: (text) => tokenize(text).catch(() => null),
       countConversation: async (messages) => {
         try {
           // Images are replaced by a placeholder for counting; /apply-template only needs text.
-          const textOnly = messages.map((m) => ({ role: m.role, content: textOf(m) }))
+          // Tool messages are counted as plain text so templates without tool support still apply.
+          const textOnly = messages.map((m) => ({ role: m.role === 'tool' ? 'user' : m.role, content: textOf(m) }))
           const res = await fetch(`${base}/apply-template`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -74,7 +92,8 @@ export class ChatService {
           const { prompt } = (await res.json()) as { prompt?: string }
           if (typeof prompt !== 'string') return null
           const n = await tokenize(prompt)
-          return n === null ? null : n + messages.reduce((a, m) => a + imageCount(m) * IMAGE_TOKENS, 0)
+          if (n === null) return null
+          return n + messages.reduce((a, m) => a + imageCount(m) * IMAGE_TOKENS, 0) + (await toolTokens())
         } catch {
           return null
         }
@@ -82,10 +101,10 @@ export class ChatService {
     }
   }
 
-  async countTokens(modelId: string, messages: WireMessage[]): Promise<number | null> {
+  async countTokens(modelId: string, messages: WireMessage[], useTools = false): Promise<number | null> {
     const inst = this.instances.readyFor(modelId)
     if (!inst) return null
-    return this.contextApi(inst).countConversation(messages)
+    return this.contextApi(inst, useTools ? this.getTools() : []).countConversation(messages)
   }
 
   async start(req: ChatRequest): Promise<void> {
@@ -106,24 +125,28 @@ export class ChatService {
       stats.modelName = inst.modelName
 
       let messages = req.messages
+      const tools = req.useTools ? this.getTools() : []
       if (inst.contextLength) {
         // Room kept for the reply; capped so a large max-tokens setting can't crowd out the whole chat.
         const reserve = Math.min(
           req.sampling.maxTokens ?? Math.min(2048, Math.floor(inst.contextLength / 4)),
           Math.floor(inst.contextLength / 3)
         )
-        messages = await fitToContext(messages, inst.contextLength, reserve, req.overflow, this.contextApi(inst))
+        messages = await fitToContext(messages, inst.contextLength, reserve, req.overflow, this.contextApi(inst, tools))
       }
 
+      const body = buildRequestBody(inst.modelName, messages, req.sampling, req.disableThinking)
+      if (tools.length) body.tools = tools
       const res = await fetch(`${this.instances.baseUrl(inst)}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(buildRequestBody(inst.modelName, messages, req.sampling, req.disableThinking)),
+        body: JSON.stringify(body),
         signal: ctrl.signal
       })
       if (!res.ok || !res.body) throw new Error(errorFromBody(res.status, await res.text()))
 
       const parser = new SseParser()
+      const toolCalls = new ToolCallAccumulator()
       const decoder = new TextDecoder()
       const reader = res.body.getReader()
       for (;;) {
@@ -148,11 +171,22 @@ export class ChatService {
             predicted++
             this.send({ type: 'delta', requestId, content: c.content, reasoning: c.reasoning })
           }
+          if (c.toolCalls) {
+            firstTokenAt ??= performance.now()
+            toolCalls.push(c.toolCalls)
+          }
           if (c.finishReason) finishReason = c.finishReason
           if (c.timings) stats = statsFromTimings(c.timings, stats)
         }
       }
-      this.send({ type: 'done', requestId, stats: this.finalStats(stats, t0, firstTokenAt, predicted, finishReason), reasoningMs: reasoningMs() })
+      const calls = toolCalls.result()
+      this.send({
+        type: 'done',
+        requestId,
+        stats: this.finalStats(stats, t0, firstTokenAt, predicted, finishReason),
+        reasoningMs: reasoningMs(),
+        toolCalls: calls.length ? calls : undefined
+      })
     } catch (err) {
       const final = this.finalStats(stats, t0, firstTokenAt, predicted, ctrl.signal.aborted ? 'stopped' : 'error')
       if (ctrl.signal.aborted) this.send({ type: 'done', requestId, stats: final, reasoningMs: reasoningMs() })

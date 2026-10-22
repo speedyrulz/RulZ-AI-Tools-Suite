@@ -9,10 +9,12 @@ import type {
   InstanceErrorEvent,
   LoadConfig,
   LoadedInstance,
+  McpServerStatus,
   MemoryEstimate,
   ModelEntry,
   Preset,
   StreamEvent,
+  ToolResult,
   WireMessage
 } from './types'
 
@@ -56,7 +58,7 @@ export interface IpcInvoke {
 
   'chat:start': (req: ChatRequest) => void
   'chat:abort': (requestId: string) => void
-  'chat:countTokens': (modelId: string, messages: WireMessage[]) => number | null
+  'chat:countTokens': (modelId: string, messages: WireMessage[], useTools: boolean) => number | null
 
   'conversations:list': () => ConversationSummary[]
   'conversations:get': (id: string) => Conversation | null
@@ -64,6 +66,12 @@ export interface IpcInvoke {
   'conversations:delete': (id: string) => void
   'folders:list': () => string[]
   'folders:save': (folders: string[]) => void
+
+  'mcp:getConfig': () => { text: string; path: string }
+  'mcp:saveConfig': (text: string) => McpServerStatus[]
+  'mcp:status': () => McpServerStatus[]
+  'mcp:restart': (name: string | null) => void
+  'mcp:callTool': (name: string, args: string) => ToolResult
 
   'presets:list': () => Preset[]
   'presets:save': (preset: Preset) => Preset[]
@@ -77,6 +85,7 @@ export interface IpcEvents {
   'instances:error': InstanceErrorEvent
   'hardware:update': HardwareSnapshot
   'chat:event': StreamEvent
+  'mcp:changed': McpServerStatus[]
 }
 
 export type InvokeChannel = keyof IpcInvoke

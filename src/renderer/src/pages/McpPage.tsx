@@ -1,0 +1,234 @@
+import * as Collapsible from '@radix-ui/react-collapsible'
+import { ChevronRight, FileText, FolderOpen, Plus, RefreshCw, ShieldCheck } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { toast } from 'sonner'
+import type { McpServerStatus, McpServerConfig } from '@shared/types'
+import { Badge, Button, DropdownMenu, Field, IconButton, Switch, Tooltip } from '../components/ui'
+import { errorMessage, invoke } from '../lib/api'
+import { cn } from '../lib/format'
+import { useApp } from '../stores/app'
+import { useMcp } from '../stores/mcp'
+
+const EXAMPLES: { label: string; name: string; config: McpServerConfig }[] = [
+  {
+    label: 'Filesystem (read/write a folder)',
+    name: 'filesystem',
+    config: { command: 'npx', args: ['-y', '@modelcontextprotocol/server-filesystem', 'C:\\path\\to\\folder'] }
+  },
+  { label: 'Memory (knowledge graph)', name: 'memory', config: { command: 'npx', args: ['-y', '@modelcontextprotocol/server-memory'] } },
+  { label: 'Fetch web pages (needs uv)', name: 'fetch', config: { command: 'uvx', args: ['mcp-server-fetch'] } },
+  { label: 'Remote server (HTTP)', name: 'remote', config: { url: 'https://example.com/mcp', headers: { Authorization: 'Bearer YOUR_TOKEN' } } }
+]
+
+const STATE_TONE = { connected: 'ok', connecting: 'accent', error: 'danger', disabled: 'neutral' } as const
+
+export function McpPage() {
+  const servers = useMcp((s) => s.servers)
+  const settings = useApp((s) => s.settings)
+  const update = useApp((s) => s.updateSettings)
+  const [text, setText] = useState<string | null>(null)
+  const [path, setPath] = useState('')
+  const [saved, setSaved] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    void invoke('mcp:getConfig').then((c) => {
+      setText(c.text)
+      setSaved(c.text)
+      setPath(c.path)
+    })
+  }, [])
+
+  if (!settings || text === null) return null
+  const dirty = text !== saved
+  const toolCount = servers.reduce((n, s) => n + (s.state === 'connected' ? s.tools.length : 0), 0)
+
+  const save = async (): Promise<void> => {
+    setSaving(true)
+    try {
+      await invoke('mcp:saveConfig', text)
+      setSaved(text)
+      setError(null)
+      toast.success('Saved mcp.json and reconnected servers')
+    } catch (e) {
+      setError(errorMessage(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const addExample = (ex: (typeof EXAMPLES)[number]): void => {
+    try {
+      const parsed = JSON.parse(text) as { mcpServers?: Record<string, McpServerConfig> }
+      const servers = parsed.mcpServers ?? {}
+      let name = ex.name
+      for (let i = 2; servers[name]; i++) name = `${ex.name}-${i}`
+      servers[name] = ex.config
+      setText(JSON.stringify({ ...parsed, mcpServers: servers }, null, 2) + '\n')
+      setError(null)
+    } catch {
+      setError('Fix the JSON before adding an example.')
+    }
+  }
+
+  return (
+    <div className="flex h-full">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <div className="flex items-center gap-3 border-b border-border px-6 py-4">
+          <div className="min-w-0 flex-1">
+            <h1 className="text-base font-semibold">MCP servers</h1>
+            <div className="text-xs text-muted">
+              {servers.length} {servers.length === 1 ? 'server' : 'servers'} · {toolCount} {toolCount === 1 ? 'tool' : 'tools'} available to chats
+            </div>
+          </div>
+          <Button size="sm" onClick={() => void invoke('mcp:restart', null)}>
+            <RefreshCw size={14} /> Reconnect all
+          </Button>
+        </div>
+
+        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-6 py-5">
+          <div className="space-y-1 rounded-xl border border-border bg-panel p-4">
+            <Field inline label="Use MCP tools in chats" hint="The model can call enabled tools while answering">
+              <Switch checked={settings.toolsEnabled} onCheckedChange={(v) => void update({ toolsEnabled: v })} />
+            </Field>
+            <Field inline label="Ask before running a tool" hint="Tools you mark “always allow” skip the question">
+              <Switch checked={settings.confirmToolCalls} onCheckedChange={(v) => void update({ confirmToolCalls: v })} />
+            </Field>
+            {settings.allowedTools.length > 0 && (
+              <div className="pt-2">
+                <div className="mb-1.5 text-[11px] text-faint">Always allowed</div>
+                <div className="flex flex-wrap gap-1.5">
+                  {settings.allowedTools.map((t) => (
+                    <button
+                      key={t}
+                      onClick={() => void update({ allowedTools: settings.allowedTools.filter((x) => x !== t) })}
+                      className="flex items-center gap-1 rounded border border-border bg-panel-2 px-2 py-0.5 font-mono text-[11px] hover:border-danger/50 hover:text-danger"
+                      title="Click to require approval again"
+                    >
+                      <ShieldCheck size={11} /> {t} ✕
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {servers.length === 0 && (
+            <div className="rounded-xl border border-dashed border-border p-8 text-center text-sm text-muted">
+              No MCP servers yet. Add one to <span className="font-mono">mcp.json</span> on the right, then save.
+            </div>
+          )}
+          {servers.map((s) => (
+            <ServerCard key={s.name} server={s} />
+          ))}
+        </div>
+      </div>
+
+      <aside className="flex w-[460px] shrink-0 flex-col border-l border-border bg-panel">
+        <div className="flex items-center gap-2 border-b border-border px-4 py-3">
+          <FileText size={15} className="text-muted" />
+          <span className="text-sm font-medium">mcp.json</span>
+          {dirty && <Badge tone="warn">Unsaved</Badge>}
+          <div className="flex-1" />
+          <DropdownMenu
+            trigger={
+              <Button size="sm" variant="ghost">
+                <Plus size={13} /> Add example
+              </Button>
+            }
+            items={EXAMPLES.map((ex) => ({ label: ex.label, onSelect: () => addExample(ex) }))}
+          />
+          <IconButton size="sm" label="Show file in Explorer" onClick={() => void invoke('shell:showItem', path)}>
+            <FolderOpen size={14} />
+          </IconButton>
+        </div>
+        <textarea
+          spellCheck={false}
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.ctrlKey && e.key.toLowerCase() === 's') {
+              e.preventDefault()
+              void save()
+            }
+          }}
+          className="min-h-0 flex-1 resize-none bg-code p-4 font-mono text-[12.5px] leading-relaxed focus:outline-none focus-visible:outline-none"
+        />
+        {error && <div className="border-t border-danger/40 bg-danger/10 px-4 py-2 text-xs whitespace-pre-wrap text-danger">{error}</div>}
+        <div className="flex items-center gap-2 border-t border-border px-4 py-3">
+          <span className="text-[11px] text-faint">Same format as LM Studio and Cursor. Ctrl+S saves.</span>
+          <div className="flex-1" />
+          <Button size="sm" variant="ghost" disabled={!dirty} onClick={() => setText(saved)}>
+            Revert
+          </Button>
+          <Button size="sm" variant="primary" disabled={saving} onClick={() => void save()}>
+            Save & reconnect
+          </Button>
+        </div>
+      </aside>
+    </div>
+  )
+}
+
+function ServerCard({ server }: { server: McpServerStatus }) {
+  const settings = useApp((s) => s.settings)!
+  const update = useApp((s) => s.updateSettings)
+  const [showLog, setShowLog] = useState(false)
+  const disabled = new Set(settings.disabledTools)
+
+  const toggleTool = (name: string, on: boolean): void => {
+    const next = on ? settings.disabledTools.filter((t) => t !== name) : [...settings.disabledTools, name]
+    void update({ disabledTools: next })
+  }
+
+  return (
+    <div className="rounded-xl border border-border bg-panel">
+      <div className="flex items-center gap-2 px-4 py-3">
+        <span className="font-medium">{server.name}</span>
+        <Badge>{server.transport}</Badge>
+        <Badge tone={STATE_TONE[server.state]}>{server.state}</Badge>
+        <span className="text-xs text-faint">{server.state === 'connected' ? `${server.tools.length} tools` : ''}</span>
+        <div className="flex-1" />
+        {server.log.length > 0 && (
+          <Button size="sm" variant="ghost" onClick={() => setShowLog((v) => !v)}>
+            {showLog ? 'Hide log' : 'Log'}
+          </Button>
+        )}
+        <IconButton size="sm" label="Reconnect" onClick={() => void invoke('mcp:restart', server.name)}>
+          <RefreshCw size={13} />
+        </IconButton>
+      </div>
+      {server.error && <div className="mx-4 mb-3 rounded-md border border-danger/40 bg-danger/10 px-3 py-2 text-xs whitespace-pre-wrap text-danger">{server.error}</div>}
+      {showLog && (
+        <pre className="mx-4 mb-3 max-h-48 overflow-auto rounded-md bg-code p-2 font-mono text-[11px] whitespace-pre-wrap text-muted">{server.log.join('\n')}</pre>
+      )}
+      {server.tools.length > 0 && (
+        <Collapsible.Root defaultOpen={server.tools.length <= 8} className="border-t border-border">
+          <Collapsible.Trigger className="group flex w-full items-center gap-1 px-4 py-2 text-xs text-muted hover:text-text">
+            <ChevronRight size={13} className="transition-transform group-data-[state=open]:rotate-90" />
+            Tools
+          </Collapsible.Trigger>
+          <Collapsible.Content className="space-y-1 px-4 pb-3">
+            {server.tools.map((t) => (
+              <div key={t.qualifiedName} className="flex items-start gap-3 rounded-md px-2 py-1.5 hover:bg-hover/40">
+                <div className="min-w-0 flex-1">
+                  <div className={cn('font-mono text-[12px]', disabled.has(t.qualifiedName) && 'text-faint line-through')}>
+                    {t.name}
+                    {settings.allowedTools.includes(t.qualifiedName) && (
+                      <Tooltip content="Runs without asking">
+                        <ShieldCheck size={12} className="ml-1.5 inline text-ok" />
+                      </Tooltip>
+                    )}
+                  </div>
+                  {t.description && <div className="line-clamp-2 text-[11.5px] text-muted">{t.description}</div>}
+                </div>
+                <Switch checked={!disabled.has(t.qualifiedName)} onCheckedChange={(v) => toggleTool(t.qualifiedName, v)} />
+              </div>
+            ))}
+          </Collapsible.Content>
+        </Collapsible.Root>
+      )}
+    </div>
+  )
+}

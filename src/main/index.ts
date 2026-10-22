@@ -5,6 +5,7 @@ import { ChatService } from './chat/service'
 import { ConversationStore } from './chat/conversations'
 import { EngineService } from './engine/engine'
 import { HardwareMonitor } from './engine/hardware'
+import { McpManager } from './mcp/manager'
 import { InstanceManager } from './engine/instances'
 import { broadcast, handle } from './ipc'
 import { estimateMemory } from './models/estimate'
@@ -104,7 +105,15 @@ async function main(): Promise<void> {
   })
   await instances.cleanupOrphans()
 
-  const chat = new ChatService(instances, (e) => broadcast('chat:event', e))
+  const mcpConfigPath = join(userData, 'mcp.json')
+  const mcp = new McpManager(mcpConfigPath, (s) => broadcast('mcp:changed', s))
+  void mcp.init()
+
+  const chat = new ChatService(
+    instances,
+    (e) => broadcast('chat:event', e),
+    () => mcp.toolDefinitions(new Set(settings.get().disabledTools))
+  )
   const conversations = new ConversationStore(join(userData, 'conversations'))
 
   // ---- IPC ----
@@ -162,7 +171,7 @@ async function main(): Promise<void> {
     void chat.start(req)
   })
   handle('chat:abort', (id) => chat.abort(id))
-  handle('chat:countTokens', (modelId, messages) => chat.countTokens(modelId, messages))
+  handle('chat:countTokens', (modelId, messages, useTools) => chat.countTokens(modelId, messages, useTools))
 
   handle('conversations:list', () => conversations.list())
   handle('conversations:get', (id) => conversations.get(id))
@@ -170,6 +179,12 @@ async function main(): Promise<void> {
   handle('conversations:delete', (id) => conversations.delete(id))
   handle('folders:list', () => conversations.listFolders())
   handle('folders:save', (f) => conversations.saveFolders(f))
+
+  handle('mcp:getConfig', () => ({ text: mcp.getConfigText(), path: mcpConfigPath }))
+  handle('mcp:saveConfig', (text) => mcp.saveConfig(text))
+  handle('mcp:status', () => mcp.status())
+  handle('mcp:restart', (name) => mcp.restart(name))
+  handle('mcp:callTool', (name, args) => mcp.callTool({ name, arguments: args }))
 
   handle('presets:list', () => settings.listPresets())
   handle('presets:save', (p) => settings.savePreset(p))
@@ -191,6 +206,7 @@ async function main(): Promise<void> {
     hardware.stop()
     library.dispose()
     instances.killAllSync()
+    void mcp.dispose()
   })
 }
 

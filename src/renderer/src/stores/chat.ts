@@ -7,6 +7,7 @@ import type {
   ConversationSummary,
   Preset,
   StreamEvent,
+  ToolCall,
   WireMessage
 } from '@shared/types'
 import { DEFAULT_SAMPLING } from '@shared/defaults'
@@ -22,6 +23,18 @@ interface Generation {
   conversationId: string
   messageId: string
   promptProgress: number | null
+  /** 'tools' while the model's tool calls are being approved and run. */
+  phase?: 'generating' | 'tools'
+}
+
+/** Stops runaway loops where the model keeps calling tools without answering. */
+const MAX_TOOL_ROUNDS = 12
+
+export type ToolDecision = 'deny' | 'once' | 'always'
+
+export interface ToolApproval {
+  call: ToolCall
+  resolve: (decision: ToolDecision) => void
 }
 
 /** Share of the context window at which the user is offered a handoff. */
@@ -64,6 +77,8 @@ interface ChatState {
   handoff: HandoffState | null
   /** Which handoff confirmation is open: from the button, or the automatic context warning. */
   handoffConfirm: 'manual' | 'auto' | null
+  /** Tool call waiting for the user's approval. */
+  toolApproval: ToolApproval | null
 
   init: () => Promise<void>
   newChat: () => Promise<Conversation>
@@ -103,6 +118,20 @@ export function toWire(messages: ChatMessage[], systemPrompt: string, vision: bo
   const out: WireMessage[] = []
   if (systemPrompt.trim()) out.push({ role: 'system', content: systemPrompt })
   for (const m of messages) {
+    if (m.role === 'assistant' && m.toolCalls?.length) {
+      // A tool-calling turn becomes the assistant's calls followed by one result message per call.
+      out.push({
+        role: 'assistant',
+        content: m.content,
+        tool_calls: m.toolCalls.map((c) => ({ id: c.id, type: 'function', function: { name: c.name, arguments: c.arguments } }))
+      })
+      for (const c of m.toolCalls) {
+        const result =
+          c.result ?? (c.status === 'denied' ? 'The user declined to run this tool.' : 'The tool did not return a result.')
+        out.push({ role: 'tool', tool_call_id: c.id, content: result })
+      }
+      continue
+    }
     if (m.role === 'assistant' && !m.content && m.error) continue
     let text = m.content
     for (const a of m.attachments ?? []) {
@@ -229,6 +258,19 @@ export const useChat = create<ChatState>((set, get) => {
     if (ho && e.requestId === ho.requestId) return handleHandoffEvent(ho, e)
     const gen = get().generation
     if (!gen || e.requestId !== gen.requestId) return
+    if (e.type === 'done' && e.toolCalls?.length && e.stats.stopReason !== 'stopped') {
+      flushPending()
+      const calls: ToolCall[] = e.toolCalls.map((c) => ({
+        id: c.id,
+        name: c.function.name,
+        arguments: c.function.arguments,
+        status: 'pending'
+      }))
+      applyToGenMessage((m) => ({ ...m, stats: e.stats, reasoningMs: e.reasoningMs ?? m.reasoningMs, toolCalls: calls }))
+      set({ generation: { ...gen, phase: 'tools', promptProgress: null } })
+      void runTools(gen.requestId, calls)
+      return
+    }
     switch (e.type) {
       case 'progress':
         set({ generation: { ...gen, promptProgress: e.total ? e.processed / e.total : null } })
@@ -258,6 +300,56 @@ export const useChat = create<ChatState>((set, get) => {
         break
       }
     }
+  }
+
+  const updateCall = (id: string, patch: Partial<ToolCall>): void =>
+    applyToGenMessage((m) => ({ ...m, toolCalls: m.toolCalls?.map((c) => (c.id === id ? { ...c, ...patch } : c)) }))
+
+  /** True while the tool phase started by `requestId` is still the active one (not stopped). */
+  const inToolPhase = (requestId: string): boolean => {
+    const g = get().generation
+    return g?.requestId === requestId && g.phase === 'tools'
+  }
+
+  /** Approves and runs each tool call, then continues the reply with the results. */
+  const runTools = async (requestId: string, calls: ToolCall[]): Promise<void> => {
+    for (const call of calls) {
+      if (!inToolPhase(requestId)) return
+      const s = useApp.getState().settings
+      let approved = !s?.confirmToolCalls || s.allowedTools.includes(call.name)
+      if (!approved) {
+        const decision = await new Promise<ToolDecision>((resolve) => set({ toolApproval: { call, resolve } }))
+        set({ toolApproval: null })
+        if (!inToolPhase(requestId)) return
+        if (decision === 'always' && s) {
+          await useApp.getState().updateSettings({ allowedTools: [...new Set([...s.allowedTools, call.name])] })
+        }
+        approved = decision !== 'deny'
+      }
+      if (!approved) {
+        updateCall(call.id, { status: 'denied', result: 'The user declined to run this tool.' })
+        continue
+      }
+      updateCall(call.id, { status: 'running' })
+      const r = await invoke('mcp:callTool', call.name, call.arguments).catch((e) => ({ text: errorMessage(e), isError: true }))
+      if (!inToolPhase(requestId)) return
+      updateCall(call.id, { status: r.isError ? 'error' : 'done', result: r.text })
+    }
+
+    const conv = get().genConversation
+    set({ generation: null, genConversation: null })
+    if (!conv) return
+    await persistNow(conv)
+
+    let rounds = 0
+    for (let i = conv.messages.length - 1; i >= 0 && conv.messages[i].role === 'assistant'; i--) {
+      if (conv.messages[i].toolCalls?.length) rounds++
+    }
+    if (rounds >= MAX_TOOL_ROUNDS) {
+      toast.warning(`Stopped after ${MAX_TOOL_ROUNDS} rounds of tool calls without a final answer.`)
+      return
+    }
+    await startGeneration(conv, 'new')
   }
 
   /** Ensures a model is ready, then streams a reply into `conv`. */
@@ -324,7 +416,8 @@ export const useChat = create<ChatState>((set, get) => {
         modelId,
         messages: toWire(history, conv.systemPrompt, inst.hasVision),
         sampling: conv.sampling,
-        overflow: settings?.contextOverflow ?? 'truncateMiddle'
+        overflow: settings?.contextOverflow ?? 'truncateMiddle',
+        useTools: settings?.toolsEnabled ?? false
       })
     } catch (e) {
       handleEvent({ type: 'error', requestId, error: errorMessage(e) })
@@ -354,6 +447,7 @@ export const useChat = create<ChatState>((set, get) => {
     tokenCount: null,
     handoff: null,
     handoffConfirm: null,
+    toolApproval: null,
 
     init: async () => {
       on('chat:event', handleEvent)
@@ -486,7 +580,19 @@ export const useChat = create<ChatState>((set, get) => {
 
     stop: () => {
       const gen = get().generation
-      if (gen) void invoke('chat:abort', gen.requestId)
+      if (!gen) return
+      if (gen.phase !== 'tools') return void invoke('chat:abort', gen.requestId)
+      // Stopping during the tool phase: skip the remaining calls and end the turn here.
+      get().toolApproval?.resolve('deny')
+      applyToGenMessage((m) => ({
+        ...m,
+        toolCalls: m.toolCalls?.map((c) =>
+          c.status === 'pending' || c.status === 'running' ? { ...c, status: 'denied', result: 'Stopped by the user.' } : c
+        )
+      }))
+      const conv = get().genConversation
+      set({ generation: null, genConversation: null, toolApproval: null })
+      if (conv) void persistNow(conv)
     },
 
     rename: (id, title) => withConversation(id, (c) => ({ ...c, title: title.trim() || c.title })),
@@ -616,7 +722,10 @@ export const useChat = create<ChatState>((set, get) => {
         const modelId = useModels.getState().activeModelId ?? conv?.modelId ?? null
         const inst = readyInstance(modelId)
         if (!conv || !inst) return set({ tokenCount: null })
-        const n = await invoke('chat:countTokens', inst.modelId, toWire(conv.messages, conv.systemPrompt, inst.hasVision)).catch(() => null)
+        const useTools = useApp.getState().settings?.toolsEnabled ?? false
+        const n = await invoke('chat:countTokens', inst.modelId, toWire(conv.messages, conv.systemPrompt, inst.hasVision), useTools).catch(
+          () => null
+        )
         if (get().current?.id === conv.id) set({ tokenCount: n })
       }, 600)
     }

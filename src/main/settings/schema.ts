@@ -54,7 +54,11 @@ export const settingsSchema = z.object({
   defaultSystemPrompt: z.string().catch(D.defaultSystemPrompt),
   contextOverflow: z.enum(['stop', 'truncateMiddle']).catch(D.contextOverflow),
   expandThinking: z.boolean().catch(D.expandThinking),
-  rightPanelOpen: z.boolean().catch(D.rightPanelOpen)
+  rightPanelOpen: z.boolean().catch(D.rightPanelOpen),
+  toolsEnabled: z.boolean().catch(D.toolsEnabled),
+  confirmToolCalls: z.boolean().catch(D.confirmToolCalls),
+  allowedTools: z.array(z.string()).catch(D.allowedTools),
+  disabledTools: z.array(z.string()).catch(D.disabledTools)
 })
 
 export const presetSchema = z.object({

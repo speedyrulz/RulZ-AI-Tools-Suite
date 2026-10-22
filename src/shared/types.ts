@@ -63,6 +63,59 @@ export interface AppSettings {
   contextOverflow: ContextOverflow
   expandThinking: boolean
   rightPanelOpen: boolean
+  /** Offer MCP tools to the model in chats. */
+  toolsEnabled: boolean
+  /** Ask before each tool call unless the tool is in allowedTools. */
+  confirmToolCalls: boolean
+  /** Qualified tool names that run without asking. */
+  allowedTools: string[]
+  /** Qualified tool names hidden from the model. */
+  disabledTools: string[]
+}
+
+// ---------- MCP ----------
+
+export interface McpServerConfig {
+  command?: string
+  args?: string[]
+  env?: Record<string, string>
+  cwd?: string
+  url?: string
+  headers?: Record<string, string>
+  disabled?: boolean
+}
+
+export interface McpToolInfo {
+  /** Name the model sees: "<server>__<tool>". */
+  qualifiedName: string
+  server: string
+  name: string
+  description?: string
+  inputSchema: unknown
+}
+
+export interface McpServerStatus {
+  name: string
+  transport: 'stdio' | 'http'
+  state: 'disabled' | 'connecting' | 'connected' | 'error'
+  error?: string
+  tools: McpToolInfo[]
+  log: string[]
+}
+
+export interface ToolCall {
+  id: string
+  /** Qualified tool name as the model called it. */
+  name: string
+  /** Raw JSON arguments from the model. */
+  arguments: string
+  status: 'pending' | 'running' | 'done' | 'error' | 'denied'
+  result?: string
+}
+
+export interface ToolResult {
+  text: string
+  isError: boolean
 }
 
 // ---------- Models ----------
@@ -216,6 +269,8 @@ export interface ChatMessage {
   attachments?: Attachment[]
   stats?: GenerationStats
   error?: string
+  /** Tool calls the assistant made in this turn, with their results once run. */
+  toolCalls?: ToolCall[]
   createdAt: number
 }
 
@@ -258,9 +313,17 @@ export type WireContentPart =
   | { type: 'text'; text: string }
   | { type: 'image_url'; image_url: { url: string } }
 
+export interface WireToolCall {
+  id: string
+  type: 'function'
+  function: { name: string; arguments: string }
+}
+
 export interface WireMessage {
-  role: Role
+  role: Role | 'tool'
   content: string | WireContentPart[]
+  tool_calls?: WireToolCall[]
+  tool_call_id?: string
 }
 
 export interface ChatRequest {
@@ -271,10 +334,12 @@ export interface ChatRequest {
   overflow: ContextOverflow
   /** Ask the chat template to skip reasoning (honoured by templates with an enable_thinking switch). */
   disableThinking?: boolean
+  /** Offer the enabled MCP tools to the model. */
+  useTools?: boolean
 }
 
 export type StreamEvent =
   | { type: 'progress'; requestId: string; processed: number; total: number }
   | { type: 'delta'; requestId: string; content?: string; reasoning?: string }
-  | { type: 'done'; requestId: string; stats: GenerationStats; reasoningMs?: number }
+  | { type: 'done'; requestId: string; stats: GenerationStats; reasoningMs?: number; toolCalls?: WireToolCall[] }
   | { type: 'error'; requestId: string; error: string; stats?: GenerationStats }

@@ -7,10 +7,12 @@ import { useChat } from '../../stores/chat'
 import { Button, IconButton, ProgressBar, Textarea, Tooltip } from '../ui'
 import { Markdown } from './Markdown'
 import { splitThink, ThinkingBlock } from './ThinkingBlock'
+import { ToolCallBlock } from './ToolCalls'
 
 const STOP_REASONS: Record<string, string> = {
   stop: 'Finished',
   length: 'Hit the token limit',
+  tool_calls: 'Called tools',
   stopped: 'Stopped',
   error: 'Error'
 }
@@ -127,7 +129,7 @@ export const MessageItem = memo(function MessageItem({
     )
   }
 
-  const waiting = streaming && !content && !reasoning
+  const waiting = streaming && !content && !reasoning && !message.toolCalls?.length
   return (
     <div className="group">
       {reasoning && (
@@ -152,6 +154,7 @@ export const MessageItem = memo(function MessageItem({
           </div>
         ))}
       {content && <Markdown text={content} />}
+      {message.toolCalls?.map((c) => <ToolCallBlock key={c.id} call={c} />)}
       {message.error && (
         <div className="mt-2 flex items-start gap-2 rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger">
           <TriangleAlert size={14} className="mt-px shrink-0" />

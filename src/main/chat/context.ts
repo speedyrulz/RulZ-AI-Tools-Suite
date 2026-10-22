@@ -4,9 +4,10 @@ import type { ContextOverflow, WireMessage } from '@shared/types'
 export const IMAGE_TOKENS = 600
 
 export function textOf(m: WireMessage): string {
-  return typeof m.content === 'string'
-    ? m.content
-    : m.content.map((p) => (p.type === 'text' ? p.text : '')).join('\n')
+  const text =
+    typeof m.content === 'string' ? m.content : m.content.map((p) => (p.type === 'text' ? p.text : '')).join('\n')
+  const calls = m.tool_calls?.map((c) => `${c.function.name}(${c.function.arguments})`).join('\n')
+  return calls ? `${text}\n${calls}` : text
 }
 
 export function imageCount(m: WireMessage): number {
@@ -63,14 +64,30 @@ export async function fitToContext(
   const counts = await Promise.all(
     messages.map(async (m) => ((await api.countText(textOf(m))) ?? textOf(m).length / 3) + 8 + imageCount(m) * IMAGE_TOKENS)
   )
-  let kept = truncateMiddle(counts, budget, pinnedPrefixLength(messages)).map((i) => messages[i])
+  let kept = pairToolMessages(truncateMiddle(counts, budget, pinnedPrefixLength(messages)).map((i) => messages[i]))
   // Per-message counts ignore template overhead; re-check and trim further if needed.
   for (let guard = 0; guard < 20; guard++) {
     const now = await api.countConversation(kept)
     if (now === null || now <= budget) break
     const pinned = pinnedPrefixLength(kept)
     if (pinned >= kept.length - 1) break
-    kept = [...kept.slice(0, pinned), ...kept.slice(pinned + 1)]
+    kept = pairToolMessages([...kept.slice(0, pinned), ...kept.slice(pinned + 1)])
   }
   return kept
+}
+
+/**
+ * After trimming, keeps tool calls and tool results consistent: drops results whose call was
+ * removed, and removes calls whose results were removed (the server rejects either).
+ */
+export function pairToolMessages(messages: WireMessage[]): WireMessage[] {
+  const callIds = new Set(messages.flatMap((m) => m.tool_calls?.map((c) => c.id) ?? []))
+  const resultIds = new Set(messages.filter((m) => m.role === 'tool').map((m) => m.tool_call_id))
+  return messages
+    .filter((m) => m.role !== 'tool' || callIds.has(m.tool_call_id ?? ''))
+    .map((m) => {
+      if (!m.tool_calls) return m
+      const calls = m.tool_calls.filter((c) => resultIds.has(c.id))
+      return calls.length === m.tool_calls.length ? m : { ...m, tool_calls: calls.length ? calls : undefined }
+    })
 }

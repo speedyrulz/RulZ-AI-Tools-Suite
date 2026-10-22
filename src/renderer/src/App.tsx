@@ -7,6 +7,8 @@ import { ModelPicker } from './components/models/ModelPicker'
 import { LogDialog } from './components/models/LogDialog'
 import { ChatPage } from './pages/ChatPage'
 import { ModelsPage } from './pages/ModelsPage'
+import { McpPage } from './pages/McpPage'
+import { useMcp } from './stores/mcp'
 import { SettingsPage } from './pages/SettingsPage'
 import { ComingSoonPage } from './pages/ComingSoonPage'
 import { useShortcuts } from './hooks/useShortcuts'
@@ -25,6 +27,7 @@ export function App() {
     void (async () => {
       await useApp.getState().init()
       await useModels.getState().init()
+      await useMcp.getState().init()
       await useChat.getState().init()
       if (!cancelled) setReady(true)
     })()
@@ -46,6 +49,7 @@ export function App() {
           <main className="min-h-0 flex-1">
             {page === 'chat' && <ChatPage />}
             {page === 'models' && <ModelsPage />}
+            {page === 'mcp' && <McpPage />}
             {page === 'settings' && <SettingsPage />}
             {page === 'discover' && <ComingSoonPage title="Discover" what="Search Hugging Face for GGUF models, pick a quantization that fits your GPUs, and download it straight into your models folder." />}
             {page === 'developer' && <ComingSoonPage title="Developer" what="Serve loaded models over OpenAI- and Anthropic-compatible APIs, with loading on first request, idle auto-unload and live logs." />}

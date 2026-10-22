@@ -3,7 +3,7 @@
 A Windows desktop app for running local LLMs, modelled on LM Studio's feature set. Models run in your own
 llama.cpp build (`llama-server.exe`), one process per loaded model, bound to `127.0.0.1`.
 
-**v0.1 covers chat and model loading.** Discover/downloads, the local API server, MCP tools, RAG and a CLI are planned.
+**v0.1 covers chat and model loading.** Discover/downloads, the local API server, RAG and a CLI are planned.
 
 ## Features
 
@@ -18,6 +18,11 @@ llama.cpp build (`llama-server.exe`), one process per loaded model, bound to `12
   highlighted code, image and text-file attachments (drag-drop / paste), edit, regenerate, continue, branch,
   delete; tok/s, time-to-first-token and token stats; context usage meter with "truncate middle" or "stop" overflow
   policy; folders, pinning, search; per-chat system prompt and sampling settings; presets; JSON-schema structured output.
+- **Chat handoff** — at 85% context (or any time via the header button) the model writes a handoff summary and
+  a new chat with the same settings continues from it.
+- **MCP tools** — configure servers in `mcp.json` (same format as LM Studio / Cursor; stdio `command` or remote
+  `url`) on the MCP Tools page. Enabled tools are offered to the model; each call asks for approval unless the
+  tool is marked "always allow", and calls and results show inline in the chat.
 - GPU/RAM meters (nvidia-smi), dark/light theme, keyboard shortcuts (see Settings).
 
 ## Engine

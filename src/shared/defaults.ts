@@ -45,5 +45,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   defaultSystemPrompt: '',
   contextOverflow: 'truncateMiddle',
   expandThinking: false,
-  rightPanelOpen: true
+  rightPanelOpen: true,
+  toolsEnabled: true,
+  confirmToolCalls: true,
+  allowedTools: [],
+  disabledTools: []
 }

@@ -3,6 +3,7 @@ import { useState, type ReactNode } from 'react'
 import type { SamplingParams } from '@shared/types'
 import { useApp } from '../../stores/app'
 import { useChat } from '../../stores/chat'
+import { useMcp } from '../../stores/mcp'
 import { Button, Dialog, Field, IconButton, Input, NumberInput, Select, Slider, Switch, Textarea } from '../ui'
 
 function SliderRow({
@@ -41,6 +42,31 @@ function Section({ title, children, action }: { title: string; children: ReactNo
       </div>
       {children}
     </section>
+  )
+}
+
+function ToolsSection() {
+  const settings = useApp((s) => s.settings)
+  const updateSettings = useApp((s) => s.updateSettings)
+  const setPage = useApp((s) => s.setPage)
+  const servers = useMcp((s) => s.servers)
+  if (!settings) return null
+  const disabled = new Set(settings.disabledTools)
+  const connected = servers.filter((s) => s.state === 'connected')
+  const tools = connected.flatMap((s) => s.tools).filter((t) => !disabled.has(t.qualifiedName)).length
+  return (
+    <Section
+      title="Tools (MCP)"
+      action={
+        <button className="text-[11px] text-muted hover:text-accent" onClick={() => setPage('mcp')}>
+          Manage
+        </button>
+      }
+    >
+      <Field inline label="Let the model use tools" hint={servers.length ? `${tools} tools from ${connected.length} of ${servers.length} servers` : 'No MCP servers configured'}>
+        <Switch checked={settings.toolsEnabled} onCheckedChange={(v) => void updateSettings({ toolsEnabled: v })} />
+      </Field>
+    </Section>
   )
 }
 
@@ -137,6 +163,8 @@ export function InferencePanel() {
           />
         </Field>
       </Section>
+
+      <ToolsSection />
 
       <Section title="Structured output">
         <Field inline label="Constrain to a JSON schema">

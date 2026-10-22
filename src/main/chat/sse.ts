@@ -1,4 +1,4 @@
-import type { GenerationStats } from '@shared/types'
+import type { GenerationStats, WireToolCall } from '@shared/types'
 
 /** Incremental parser for text/event-stream bodies; returns each complete `data:` payload. */
 export class SseParser {
@@ -36,9 +36,17 @@ interface Timings {
   cache_n?: number
 }
 
+export interface ToolCallDelta {
+  index: number
+  id?: string
+  name?: string
+  arguments?: string
+}
+
 export interface ChunkInfo {
   content?: string
   reasoning?: string
+  toolCalls?: ToolCallDelta[]
   finishReason?: string
   timings?: Timings
   progress?: { processed: number; total: number }
@@ -48,7 +56,14 @@ export interface ChunkInfo {
 /** Extracts what we need from one /v1/chat/completions stream chunk. */
 export function interpretChunk(json: unknown): ChunkInfo {
   const j = json as {
-    choices?: { delta?: { content?: string | null; reasoning_content?: string | null }; finish_reason?: string | null }[]
+    choices?: {
+      delta?: {
+        content?: string | null
+        reasoning_content?: string | null
+        tool_calls?: { index?: number; id?: string; function?: { name?: string; arguments?: string } }[]
+      }
+      finish_reason?: string | null
+    }[]
     timings?: Timings
     prompt_progress?: { total?: number; processed?: number; cache?: number }
     error?: { message?: string } | string
@@ -61,6 +76,14 @@ export function interpretChunk(json: unknown): ChunkInfo {
   const choice = j.choices?.[0]
   if (choice?.delta?.content) out.content = choice.delta.content
   if (choice?.delta?.reasoning_content) out.reasoning = choice.delta.reasoning_content
+  if (choice?.delta?.tool_calls?.length) {
+    out.toolCalls = choice.delta.tool_calls.map((t, i) => ({
+      index: t.index ?? i,
+      id: t.id,
+      name: t.function?.name,
+      arguments: t.function?.arguments
+    }))
+  }
   if (choice?.finish_reason) out.finishReason = choice.finish_reason
   if (j.timings) out.timings = j.timings
   if (j.prompt_progress?.total) {
@@ -80,6 +103,28 @@ export function statsFromTimings(t: Timings | undefined, extra: GenerationStats)
     predictedTokens: t?.predicted_n ?? extra.predictedTokens,
     promptTokens: t?.prompt_n !== undefined ? t.prompt_n + (t.cache_n ?? 0) : extra.promptTokens,
     cachedTokens: t?.cache_n ?? extra.cachedTokens
+  }
+}
+
+/** Merges streamed tool-call fragments (keyed by index) into complete calls. */
+export class ToolCallAccumulator {
+  private calls = new Map<number, { id: string; name: string; arguments: string }>()
+
+  push(deltas: ToolCallDelta[]): void {
+    for (const d of deltas) {
+      const cur = this.calls.get(d.index) ?? { id: '', name: '', arguments: '' }
+      if (d.id) cur.id = d.id
+      if (d.name) cur.name += d.name
+      if (d.arguments) cur.arguments += d.arguments
+      this.calls.set(d.index, cur)
+    }
+  }
+
+  result(): WireToolCall[] {
+    return [...this.calls.entries()]
+      .sort(([a], [b]) => a - b)
+      .filter(([, c]) => c.name)
+      .map(([i, c]) => ({ id: c.id || `call_${i}`, type: 'function' as const, function: { name: c.name, arguments: c.arguments } }))
   }
 }
 

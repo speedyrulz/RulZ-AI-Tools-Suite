@@ -8,6 +8,7 @@ import { LogoWordmark } from '../Logo'
 import { IconButton, Tooltip } from '../ui'
 import { Composer, type ComposerHandle } from './Composer'
 import { HandoffDialogs, useHandoffTrigger } from './Handoff'
+import { ToolApprovalDialog } from './ToolCalls'
 import { MessageItem } from './MessageItem'
 
 export function ChatView() {
@@ -149,6 +150,7 @@ export function ChatView() {
 
       <Composer ref={composer} />
       <HandoffDialogs />
+      <ToolApprovalDialog />
 
       {dragging && (
         <div className="pointer-events-none absolute inset-3 flex flex-col items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-accent bg-bg/85 text-accent">
