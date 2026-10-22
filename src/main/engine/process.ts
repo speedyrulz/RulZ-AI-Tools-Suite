@@ -1,6 +1,19 @@
 import { spawn, spawnSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { join } from 'node:path'
+
+/**
+ * Folders holding DLLs a llama.cpp build commonly links against but that are often not on the
+ * PATH Windows gives apps started from Explorer: the CUDA runtime and OpenSSL.
+ */
+function runtimeDllDirs(): string[] {
+  const dirs: string[] = []
+  const cuda = process.env.CUDA_PATH
+  if (cuda) dirs.push(join(cuda, 'bin', 'x64'), join(cuda, 'bin'))
+  dirs.push('C:\\OpenSSL-Win64\\bin', 'C:\\Program Files\\OpenSSL-Win64\\bin', 'C:\\Program Files\\OpenSSL\\bin')
+  return dirs.filter((d) => existsSync(d))
+}
 
 /**
  * Environment for llama.cpp child processes. CUDA_DEVICE_ORDER=PCI_BUS_ID makes CUDA0/CUDA1
@@ -8,12 +21,30 @@ import { join } from 'node:path'
  */
 export function engineEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, CUDA_DEVICE_ORDER: 'PCI_BUS_ID' }
-  const cuda = process.env.CUDA_PATH
-  if (cuda) {
+  const extra = runtimeDllDirs()
+  if (extra.length) {
     const pathKey = Object.keys(env).find((k) => k.toLowerCase() === 'path') ?? 'PATH'
-    env[pathKey] = [join(cuda, 'bin', 'x64'), join(cuda, 'bin'), env[pathKey] ?? ''].join(';')
+    env[pathKey] = [...extra, env[pathKey] ?? ''].join(';')
   }
   return env
+}
+
+/** Explains Windows loader exit codes, which come with no output at all. */
+export function describeExitCode(code: number | null): string | undefined {
+  if (code === null) return undefined
+  const unsigned = code < 0 ? code + 0x100000000 : code
+  switch (unsigned) {
+    case 0xc0000135:
+      return 'A DLL that llama-server.exe needs could not be found (Windows error 0xC0000135). Make sure the CUDA and OpenSSL DLLs it was built against are installed and on PATH, or copy them next to llama-server.exe.'
+    case 0xc000007b:
+      return 'llama-server.exe or one of its DLLs is the wrong architecture (Windows error 0xC000007B).'
+    case 0xc0000139:
+      return 'A DLL loaded by llama-server.exe is the wrong version (Windows error 0xC0000139, entry point not found).'
+    case 0xc0000005:
+      return 'llama-server.exe crashed (access violation, 0xC0000005).'
+    default:
+      return undefined
+  }
 }
 
 export interface CaptureResult {

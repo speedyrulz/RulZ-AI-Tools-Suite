@@ -4,7 +4,7 @@ import type { ModelEntry } from '@shared/types'
 import { buildServerArgs } from '../src/main/engine/args'
 import { parseDevices, parseVersion } from '../src/main/engine/engine'
 import { parseNvidiaSmi } from '../src/main/engine/hardware'
-import { splitArgs } from '../src/main/engine/process'
+import { describeExitCode, splitArgs } from '../src/main/engine/process'
 import { LogLineSplitter, nextProgress, progressFromDots } from '../src/main/engine/progress'
 import { estimateMemory, kvCacheBytes } from '../src/main/models/estimate'
 
@@ -57,6 +57,14 @@ describe('buildServerArgs', () => {
     expect(args).toContain('--no-mmap')
     expect(args).not.toContain('--mmproj')
     expect(args.endsWith('--override-tensor exps=CPU -v')).toBe(true)
+  })
+})
+
+describe('describeExitCode', () => {
+  it('explains a missing DLL whether the code is signed or unsigned', () => {
+    expect(describeExitCode(3221225781)).toMatch(/DLL .* could not be found/)
+    expect(describeExitCode(-1073741515)).toMatch(/0xC0000135/)
+    expect(describeExitCode(1)).toBeUndefined()
   })
 })
 

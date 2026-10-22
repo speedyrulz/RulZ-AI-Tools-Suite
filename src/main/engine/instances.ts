@@ -5,7 +5,7 @@ import type { InstanceErrorEvent, LoadConfig, LoadedInstance, MemoryEstimate, Mo
 import { readJson, writeJsonAtomic } from '../util/jsonFile'
 import { buildServerArgs } from './args'
 import type { EngineService } from './engine'
-import { engineEnv, freePort, isLlamaServerPid, killTree } from './process'
+import { describeExitCode, engineEnv, freePort, isLlamaServerPid, killTree } from './process'
 import { LogLineSplitter, nextProgress, progressFromDots } from './progress'
 
 const MAX_LOG_LINES = 3000
@@ -204,7 +204,8 @@ export class InstanceManager {
 
   private failureMessage(run: Running): string {
     const errLines = run.log.filter((l) => /error|failed|out of memory|unable|cannot|invalid/i.test(l)).slice(-6)
-    const detail = errLines.length ? errLines.join('\n') : run.log.slice(-6).join('\n')
+    const detail =
+      describeExitCode(run.exitCode) ?? (errLines.length ? errLines.join('\n') : run.log.slice(-6).join('\n'))
     return `llama-server exited while loading ${run.info.modelName} (code ${run.exitCode}).\n${detail}`
   }
 

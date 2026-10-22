@@ -1,7 +1,7 @@
 import { existsSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { EngineDevice, EngineInfo } from '@shared/types'
-import { runCapture } from './process'
+import { describeExitCode, runCapture } from './process'
 
 const EXE_NAME = process.platform === 'win32' ? 'llama-server.exe' : 'llama-server'
 const DEFAULT_LLAMA_CPP_DIR = 'C:\\coding\\llama.cpp'
@@ -55,13 +55,15 @@ export class EngineService {
       runCapture(exePath, ['--list-devices'], dir)
     ])
     const version = parseVersion(ver.output)
+    const ok = ver.code === 0 || !!version
+    const detail = ver.output.trim().slice(-2000) || describeExitCode(ver.code) || `exit code ${ver.code}`
     this.cached = {
-      ok: ver.code === 0 || !!version,
+      ok,
       exePath,
       version,
       devices: parseDevices(dev.output),
       searched,
-      error: ver.code === 0 || version ? undefined : `llama-server failed to start:\n${ver.output.trim().slice(-2000)}`
+      error: ok ? undefined : `llama-server failed to start:\n${detail}`
     }
     return this.cached
   }
