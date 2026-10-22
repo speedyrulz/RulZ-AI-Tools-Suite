@@ -13,6 +13,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -3226,10 +3227,40 @@ def tailscale_serve(port: int) -> str:
     return f"https://{state['Self']['DNSName'].rstrip('.')}:{port}"
 
 
-def tailscale_unserve(port: int) -> None:
+def tailscale_park(port: int) -> None:
+    """Point the WebUI's tailnet address at a short notice instead of the stopped server, so it says what is wrong
+    rather than answering 502 Bad Gateway. The next start replaces it with the proxy again."""
     exe = _tailscale_exe()
     if exe:
-        subprocess.run([exe, "serve", f"--https={port}", "off"], capture_output=True, timeout=30)
+        note = (f"RulzTrainer is not running on {socket.gethostname()}.\n\nStart run_webui_tailscale.bat there (or "
+                "python webui.py --tailscale), keep its window open, then reload this page.\n\nTo remove this address "
+                f"for good: tailscale serve --https={port} off")
+        subprocess.run([exe, "serve", "--bg", "--yes", f"--https={port}", f"text:{note}"], capture_output=True,
+                       timeout=20)
+
+
+def on_exit_signals(callback) -> None:
+    """Also run `callback` when the WebUI ends without a normal shutdown: its console window closed, logoff or system
+    shutdown on Windows (about 5 s are allowed), a terminal hangup (SIGHUP) elsewhere. Ctrl+C keeps its usual path."""
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        def handler(event):
+            if event in (2, 5, 6):  # CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT
+                callback()
+            return False  # carry on with the default handling (the process ends)
+
+        on_exit_signals.handler = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)(handler)  # keep a reference
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(on_exit_signals.handler, True)
+    else:
+        import signal
+
+        def hangup(*_):
+            callback()
+            os.kill(os.getpid(), signal.SIGTERM)  # then shut down the usual way
+
+        signal.signal(signal.SIGHUP, hangup)
 
 
 if __name__ in {"__main__", "__mp_main__"}:
@@ -3251,7 +3282,15 @@ if __name__ in {"__main__", "__mp_main__"}:
         except (RuntimeError, OSError, subprocess.SubprocessError) as e:
             raise SystemExit(f"[tailscale] {e}") from e
         print(f"Tailscale: open {url} on any of your Tailscale devices (tailnet only)")
-        app.on_shutdown(lambda: tailscale_unserve(port))
+        parked = threading.Event()
+
+        def park():
+            if not parked.is_set():  # once, whichever way the WebUI ends
+                parked.set()
+                tailscale_park(port)
+
+        app.on_shutdown(park)
+        on_exit_signals(park)
 
     @ui.page("/")
     def index(request: Request):

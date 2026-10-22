@@ -71,8 +71,9 @@ To use the WebUI from your other devices (laptop, phone), start it with Tailscal
 It runs `tailscale serve`, so the WebUI stays bound to `127.0.0.1`. Tailscale publishes it over HTTPS at
 `https://<machine>.<tailnet>.ts.net:7870`, and only devices logged in to your tailnet can open it. The URL is printed
 on start. It uses its own HTTPS port, so an existing `tailscale serve` on the default port (ComfyUI, for example) is
-not touched. Stopping the WebUI with Ctrl+C removes the entry. If you close the window instead, the entry stays and
-shows an error page until the WebUI starts again.
+not touched. When the WebUI stops (Ctrl+C, closing its console window, logging off), the address switches to a short
+"RulzTrainer is not running" notice instead of a 502 error, and the next start brings the WebUI back on it.
+Only a hard kill (Task Manager, a crash) leaves the 502. `tailscale serve --https=7870 off` removes the address for good.
 
 Requirements: Tailscale installed and logged in on this machine, and HTTPS certificates turned on for the tailnet
 (admin console > DNS > HTTPS Certificates). Browsers that connect remotely get no native *Browse* buttons, because
