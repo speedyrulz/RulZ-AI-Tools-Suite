@@ -231,6 +231,8 @@ export interface Conversation {
   sampling: SamplingParams
   presetId: string | null
   messages: ChatMessage[]
+  /** Set once the user has answered (or acted on) the "context nearly full" handoff prompt. */
+  handoffPrompted?: boolean
 }
 
 export interface ConversationSummary {
@@ -267,6 +269,8 @@ export interface ChatRequest {
   messages: WireMessage[]
   sampling: SamplingParams
   overflow: ContextOverflow
+  /** Ask the chat template to skip reasoning (honoured by templates with an enable_thinking switch). */
+  disableThinking?: boolean
 }
 
 export type StreamEvent =

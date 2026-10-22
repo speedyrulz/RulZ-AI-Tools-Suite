@@ -3,7 +3,7 @@ import { ChevronRight, FolderSearch } from 'lucide-react'
 import { useState } from 'react'
 import { KV_CACHE_TYPES, type KvCacheType, type LoadConfig, type ModelEntry } from '@shared/types'
 import { invoke } from '../../lib/api'
-import { formatCompact } from '../../lib/format'
+import { formatTokens } from '../../lib/format'
 import { useApp } from '../../stores/app'
 import { useModels } from '../../stores/models'
 import { Field, IconButton, Input, NumberInput, Select, Slider, Switch } from '../ui'
@@ -35,7 +35,7 @@ export function LoadSettingsForm({
     <div className="space-y-4">
       <Field
         label="Context length"
-        hint={model?.info?.contextLength ? `Model supports ${formatCompact(model.info.contextLength)} tokens` : undefined}
+        hint={model?.info?.contextLength ? `Model supports ${formatTokens(model.info.contextLength)} tokens` : undefined}
       >
         <div className="flex items-center gap-3">
           <Slider
@@ -61,7 +61,7 @@ export function LoadSettingsForm({
           </PresetChip>
           {CTX_PRESETS.filter((p) => p <= maxCtx).map((p) => (
             <PresetChip key={p} active={config.contextLength === p} onClick={() => set('contextLength', p)}>
-              {formatCompact(p)}
+              {formatTokens(p)}
             </PresetChip>
           ))}
         </div>

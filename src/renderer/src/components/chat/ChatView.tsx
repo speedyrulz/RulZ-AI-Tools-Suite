@@ -1,18 +1,22 @@
-import { ArrowDown, PanelRight, PanelRightClose, Upload } from 'lucide-react'
+import { ArrowDown, Forward, PanelRight, PanelRightClose, Upload } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
-import { cn, formatCompact } from '../../lib/format'
+import { cn, formatCompact, formatTokens } from '../../lib/format'
 import { useApp } from '../../stores/app'
 import { useChat } from '../../stores/chat'
 import { useModels } from '../../stores/models'
 import { LogoWordmark } from '../Logo'
 import { IconButton, Tooltip } from '../ui'
 import { Composer, type ComposerHandle } from './Composer'
+import { HandoffDialogs, useHandoffTrigger } from './Handoff'
 import { MessageItem } from './MessageItem'
 
 export function ChatView() {
   const current = useChat((s) => s.current)
   const generation = useChat((s) => s.generation)
   const rename = useChat((s) => s.rename)
+  const setHandoffConfirm = useChat((s) => s.setHandoffConfirm)
+  const handoffBusy = useChat((s) => s.handoff)
+  useHandoffTrigger()
   const panelOpen = useApp((s) => s.settings?.rightPanelOpen ?? true)
   const updateSettings = useApp((s) => s.updateSettings)
   const composer = useRef<ComposerHandle>(null)
@@ -90,6 +94,13 @@ export function ChatView() {
         <div className="flex-1" />
         <ContextMeter />
         <IconButton
+          label="Hand off to a new chat"
+          onClick={() => setHandoffConfirm('manual')}
+          disabled={!current.messages.length || !!generation || !!handoffBusy}
+        >
+          <Forward size={17} />
+        </IconButton>
+        <IconButton
           label={panelOpen ? 'Hide chat settings (Ctrl+B)' : 'Show chat settings (Ctrl+B)'}
           onClick={() => void updateSettings({ rightPanelOpen: !panelOpen })}
         >
@@ -137,6 +148,7 @@ export function ChatView() {
       )}
 
       <Composer ref={composer} />
+      <HandoffDialogs />
 
       {dragging && (
         <div className="pointer-events-none absolute inset-3 flex flex-col items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-accent bg-bg/85 text-accent">
@@ -168,7 +180,7 @@ function ContextMeter() {
         <div className="h-1.5 w-24 overflow-hidden rounded-full bg-hover">
           <div className={cn('h-full rounded-full', frac > 0.9 ? 'bg-danger' : frac > 0.7 ? 'bg-warn' : 'bg-accent')} style={{ width: `${frac * 100}%` }} />
         </div>
-        {tokenCount === null ? '—' : formatCompact(used)} / {formatCompact(ctx)}
+        {tokenCount === null ? '—' : formatCompact(used)} / {formatTokens(ctx)}
       </div>
     </Tooltip>
   )

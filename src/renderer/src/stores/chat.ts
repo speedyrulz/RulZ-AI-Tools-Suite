@@ -24,6 +24,31 @@ interface Generation {
   promptProgress: number | null
 }
 
+/** Share of the context window at which the user is offered a handoff. */
+export const HANDOFF_THRESHOLD = 0.85
+
+const HANDOFF_PROMPT = `This conversation is about to continue in a new chat with a fresh context window, and you will not see anything above this message there.
+
+Write a detailed handoff message that will be sent as the first message of the new chat. Write it in the first person, as me (the user), so it can be sent exactly as written. Include:
+- the overall goal and the context behind it;
+- key facts, decisions, preferences and constraints we have established;
+- important specifics verbatim where they matter (names, numbers, code, file names, wording);
+- what has been done so far and the current state;
+- open questions, and what I want to happen next.
+
+Be thorough but do not pad. Output only the handoff message, with no preamble.`
+
+export interface HandoffState {
+  requestId: string
+  /** Snapshot of the chat being handed off; the new chat copies its settings. */
+  source: Conversation
+  modelId: string
+  text: string
+  status: 'loading' | 'writing' | 'error'
+  promptProgress: number | null
+  error?: string
+}
+
 interface ChatState {
   loaded: boolean
   summaries: ConversationSummary[]
@@ -36,6 +61,9 @@ interface ChatState {
   /** Model being loaded automatically before a send. */
   autoLoadingModelId: string | null
   tokenCount: number | null
+  handoff: HandoffState | null
+  /** Which handoff confirmation is open: from the button, or the automatic context warning. */
+  handoffConfirm: 'manual' | 'auto' | null
 
   init: () => Promise<void>
   newChat: () => Promise<Conversation>
@@ -59,6 +87,10 @@ interface ChatState {
   applyPreset: (id: string | null) => void
   deletePreset: (id: string) => Promise<void>
   refreshTokenCount: () => void
+  setHandoffConfirm: (mode: 'manual' | 'auto' | null) => void
+  dismissHandoffPrompt: () => void
+  startHandoff: () => Promise<void>
+  cancelHandoff: () => void
 }
 
 function makeTitle(text: string): string {
@@ -146,7 +178,55 @@ function flushPending(): void {
 let tokenTimer: ReturnType<typeof setTimeout> | null = null
 
 export const useChat = create<ChatState>((set, get) => {
+  const handleHandoffEvent = (ho: HandoffState, e: StreamEvent): void => {
+    switch (e.type) {
+      case 'progress':
+        set({ handoff: { ...ho, promptProgress: e.total ? e.processed / e.total : null } })
+        break
+      case 'delta':
+        if (e.content) set({ handoff: { ...ho, text: ho.text + e.content, promptProgress: null } })
+        break
+      case 'error':
+        set({ handoff: { ...ho, status: 'error', error: e.error } })
+        break
+      case 'done': {
+        if (e.stats.stopReason === 'stopped') return set({ handoff: null })
+        // Some models put their reasoning inline; keep only the final answer.
+        const text = ho.text.replace(/^\s*<think>[\s\S]*?<\/think>/, '').trim()
+        if (!text) return set({ handoff: { ...ho, status: 'error', error: 'The model returned an empty handoff message.' } })
+        void finishHandoff(ho, text)
+        break
+      }
+    }
+  }
+
+  /** Opens a new chat with the source chat's settings and sends the handoff message in it. */
+  const finishHandoff = async (ho: HandoffState, text: string): Promise<void> => {
+    const src = ho.source
+    const now = Date.now()
+    const conv: Conversation = {
+      id: uid(),
+      title: `Handoff: ${src.title}`.slice(0, 60),
+      folder: src.folder,
+      pinned: false,
+      createdAt: now,
+      updatedAt: now,
+      modelId: ho.modelId,
+      systemPrompt: src.systemPrompt,
+      sampling: src.sampling,
+      presetId: src.presetId,
+      messages: []
+    }
+    await withConversation(src.id, (c) => ({ ...c, handoffPrompted: true }))
+    set({ handoff: null, current: conv, tokenCount: null })
+    await persistNow(conv)
+    toast.success('Handed off to a new chat')
+    await get().send(text, [])
+  }
+
   const handleEvent = (e: StreamEvent): void => {
+    const ho = get().handoff
+    if (ho && e.requestId === ho.requestId) return handleHandoffEvent(ho, e)
     const gen = get().generation
     if (!gen || e.requestId !== gen.requestId) return
     switch (e.type) {
@@ -272,6 +352,8 @@ export const useChat = create<ChatState>((set, get) => {
     generation: null,
     autoLoadingModelId: null,
     tokenCount: null,
+    handoff: null,
+    handoffConfirm: null,
 
     init: async () => {
       on('chat:event', handleEvent)
@@ -472,6 +554,59 @@ export const useChat = create<ChatState>((set, get) => {
     deletePreset: async (id) => {
       set({ presets: await invoke('presets:delete', id) })
       if (get().current?.presetId === id) get().mutateCurrent((c) => ({ ...c, presetId: null }))
+    },
+
+    setHandoffConfirm: (handoffConfirm) => set({ handoffConfirm }),
+
+    dismissHandoffPrompt: () => {
+      set({ handoffConfirm: null })
+      get().mutateCurrent((c) => ({ ...c, handoffPrompted: true }))
+    },
+
+    startHandoff: async () => {
+      const conv = get().current
+      set({ handoffConfirm: null })
+      if (!conv || get().generation || get().handoff || get().autoLoadingModelId) return
+      if (!conv.messages.length) {
+        toast('There is nothing to hand off yet.')
+        return
+      }
+      const modelId = useModels.getState().activeModelId ?? conv.modelId
+      if (!modelId) {
+        toast('Load a model to write the handoff')
+        useApp.getState().openPicker()
+        return
+      }
+      const requestId = uid()
+      set({ handoff: { requestId, source: conv, modelId, text: '', status: 'loading', promptProgress: null } })
+
+      let inst = readyInstance(modelId)
+      if (!inst) inst = (await useModels.getState().load(modelId, null)) ?? undefined
+      if (get().handoff?.requestId !== requestId) return // cancelled while loading
+      if (!inst) return set({ handoff: null })
+
+      set((s) => ({ handoff: s.handoff && { ...s.handoff, status: 'writing' } }))
+      try {
+        await invoke('chat:start', {
+          requestId,
+          modelId,
+          messages: [...toWire(conv.messages, conv.systemPrompt, inst.hasVision), { role: 'user', content: HANDOFF_PROMPT }],
+          sampling: { ...conv.sampling, temperature: Math.min(conv.sampling.temperature, 0.5), maxTokens: null, jsonSchema: '' },
+          // The chat is near the limit by definition, so always make room rather than refuse.
+          overflow: 'truncateMiddle',
+          // Little context is left at this point; spend it on the handoff, not on reasoning.
+          disableThinking: true
+        })
+      } catch (e) {
+        set((s) => ({ handoff: s.handoff && { ...s.handoff, status: 'error', error: errorMessage(e) } }))
+      }
+    },
+
+    cancelHandoff: () => {
+      const ho = get().handoff
+      if (!ho) return
+      if (ho.status === 'writing') void invoke('chat:abort', ho.requestId)
+      set({ handoff: null })
     },
 
     refreshTokenCount: () => {

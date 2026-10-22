@@ -6,7 +6,7 @@ import { EstimateView, useEstimate } from '../components/models/EstimateView'
 import { LoadSettingsForm } from '../components/models/LoadSettingsForm'
 import { Badge, Button, Dialog, DropdownMenu, IconButton, Input } from '../components/ui'
 import { errorMessage, invoke } from '../lib/api'
-import { cn, formatBytes, formatCompact } from '../lib/format'
+import { cn, formatBytes, formatTokens } from '../lib/format'
 import { useApp } from '../stores/app'
 import { useModels } from '../stores/models'
 
@@ -130,7 +130,7 @@ export function ModelsPage() {
                       <td className="border-b border-border py-2 text-muted">{m.info?.sizeLabel ?? '—'}</td>
                       <td className="border-b border-border py-2">{m.info?.quantization ? <Badge>{m.info.quantization}</Badge> : '—'}</td>
                       <td className="border-b border-border py-2 text-muted tabular-nums">
-                        {m.info?.contextLength ? formatCompact(m.info.contextLength) : '—'}
+                        {m.info?.contextLength ? formatTokens(m.info.contextLength) : '—'}
                       </td>
                       <td className="border-b border-border py-2 text-right text-muted tabular-nums">{formatBytes(m.sizeBytes)}</td>
                       <td className="border-b border-border py-2 pr-2">

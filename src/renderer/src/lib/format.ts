@@ -28,6 +28,12 @@ export function formatCompact(n: number): string {
   return String(n)
 }
 
+/** Context sizes are powers of two, so 8192 reads as "8K" and 262144 as "256K". */
+export function formatTokens(n: number): string {
+  if (n >= 1024 && n % 1024 === 0) return `${n / 1024}K`
+  return formatCompact(n)
+}
+
 export function formatDuration(ms: number | null | undefined): string {
   if (ms === null || ms === undefined) return '—'
   if (ms < 1000) return `${Math.round(ms)} ms`

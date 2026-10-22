@@ -3,7 +3,12 @@ import type { InstanceManager } from '../engine/instances'
 import { fitToContext, IMAGE_TOKENS, imageCount, textOf, type ContextApi } from './context'
 import { errorFromBody, interpretChunk, SseParser, statsFromTimings } from './sse'
 
-export function buildRequestBody(alias: string, messages: WireMessage[], s: SamplingParams): Record<string, unknown> {
+export function buildRequestBody(
+  alias: string,
+  messages: WireMessage[],
+  s: SamplingParams,
+  disableThinking = false
+): Record<string, unknown> {
   const body: Record<string, unknown> = {
     model: alias,
     messages,
@@ -20,6 +25,7 @@ export function buildRequestBody(alias: string, messages: WireMessage[], s: Samp
   if (s.maxTokens !== null) body.max_tokens = s.maxTokens
   if (s.stop.length) body.stop = s.stop
   if (s.seed !== null) body.seed = s.seed
+  if (disableThinking) body.chat_template_kwargs = { enable_thinking: false }
   if (s.jsonSchema.trim()) {
     body.response_format = { type: 'json_schema', json_schema: { name: 'output', schema: JSON.parse(s.jsonSchema) } }
   }
@@ -101,14 +107,18 @@ export class ChatService {
 
       let messages = req.messages
       if (inst.contextLength) {
-        const reserve = req.sampling.maxTokens ?? Math.min(2048, Math.floor(inst.contextLength / 4))
+        // Room kept for the reply; capped so a large max-tokens setting can't crowd out the whole chat.
+        const reserve = Math.min(
+          req.sampling.maxTokens ?? Math.min(2048, Math.floor(inst.contextLength / 4)),
+          Math.floor(inst.contextLength / 3)
+        )
         messages = await fitToContext(messages, inst.contextLength, reserve, req.overflow, this.contextApi(inst))
       }
 
       const res = await fetch(`${this.instances.baseUrl(inst)}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(buildRequestBody(inst.modelName, messages, req.sampling)),
+        body: JSON.stringify(buildRequestBody(inst.modelName, messages, req.sampling, req.disableThinking)),
         signal: ctrl.signal
       })
       if (!res.ok || !res.body) throw new Error(errorFromBody(res.status, await res.text()))
