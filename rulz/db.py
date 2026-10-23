@@ -70,6 +70,8 @@ CREATE INDEX IF NOT EXISTS ix_photos_taken ON photos(taken_at);
 CREATE INDEX IF NOT EXISTS ix_photos_pending ON photos(faces_done);
 CREATE INDEX IF NOT EXISTS ix_faces_photo ON faces(photo_id);
 CREATE INDEX IF NOT EXISTS ix_faces_person ON faces(person_id);
+-- Covering index: a person's photo list and counts never touch the (large) face rows.
+CREATE INDEX IF NOT EXISTS ix_faces_person_ignored_photo ON faces(person_id, ignored, photo_id);
 """
 
 # Columns added after the first release: (name, definition). Existing faces get attrs_done=0.
@@ -226,13 +228,14 @@ class Database:
 
     def photos(self, person_ids: list[int] | None = None) -> list[Photo]:
         """All photos newest first; optionally only photos containing *all* given people."""
-        sql = "SELECT id, path, taken_at, width, height, size FROM photos p"
+        sql = "SELECT id, path, taken_at, width, height, size FROM photos"
         params: list = []
         if person_ids:
-            for pid in person_ids:
-                sql += (" WHERE" if not params else " AND") + \
-                       " EXISTS(SELECT 1 FROM faces f WHERE f.photo_id=p.id AND f.person_id=?)"
-                params.append(pid)
+            # IN-subqueries walk only that person's faces (ix_faces_person_photo). A correlated EXISTS let
+            # SQLite rescan all of a person's faces once per photo, which took minutes for big libraries.
+            sql += " WHERE " + " AND ".join(
+                "id IN (SELECT photo_id FROM faces WHERE person_id=? AND ignored=0)" for _ in person_ids)
+            params += list(person_ids)
         sql += " ORDER BY taken_at DESC, id DESC"
         return [Photo(r["id"], r["path"], r["taken_at"] or 0, r["width"] or 0, r["height"] or 0, r["size"] or 0)
                 for r in self.q(sql, params)]
@@ -328,10 +331,10 @@ class Database:
                 for r in rows]
 
     def person(self, person_id: int) -> Person | None:
-        r = self.one("""SELECT p.id, p.name, p.cover_face_id, p.hidden,
-                   (SELECT COUNT(DISTINCT photo_id) FROM faces WHERE person_id=p.id AND ignored=0) AS photos,
-                   (SELECT COUNT(*) FROM faces WHERE person_id=p.id AND ignored=0) AS faces
-                   FROM people p WHERE p.id=?""", (person_id,))
+        r = self.one("""SELECT p.id, p.name, p.cover_face_id, p.hidden, c.photos, c.faces
+                   FROM people p, (SELECT COUNT(DISTINCT photo_id) AS photos, COUNT(*) AS faces
+                                   FROM faces WHERE person_id=? AND ignored=0) c
+                   WHERE p.id=?""", (person_id, person_id))
         return Person(r["id"], r["name"], r["cover_face_id"], bool(r["hidden"]), r["photos"], r["faces"]) if r else None
 
     def person_by_name(self, name: str) -> Person | None:

@@ -132,22 +132,28 @@ def circle_pixmap(path: str | None, size: int) -> QPixmap:
 
 
 def face_image(face_id: int | None) -> str:
-    return str(config.face_crop_path(face_id)) if face_id else ""
+    return config.face_crop_file(face_id) if face_id else ""
 
 
 def photo_tile(ph: Photo) -> Tile:
-    return Tile(key=ph.id, image=str(config.thumb_path(ph.id)), fallback=ph.path, data=ph)
+    return Tile(key=ph.id, image=config.thumb_file(ph.id), fallback=ph.path, data=ph)
 
 
 def month_sections(photos: list[Photo]) -> list[Section]:
     sections: list[Section] = []
     current = None
+    labels: dict[tuple[int, int], str] = {}  # strftime is slow; format each month once
     for ph in photos:
         try:
             dt = datetime.fromtimestamp(ph.taken_at) if ph.taken_at else None
         except (OSError, OverflowError, ValueError):
             dt = None
-        key = dt.strftime("%B %Y") if dt else "Unknown date"
+        if dt is None:
+            key = "Unknown date"
+        else:
+            key = labels.get((dt.year, dt.month))
+            if key is None:
+                key = labels[(dt.year, dt.month)] = dt.strftime("%B %Y")
         if key != current:
             sections.append(Section(key))
             current = key

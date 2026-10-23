@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import os
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 APP_NAME = "RulZ Image Organizer"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 IMAGE_EXTS = {
     ".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".bmp", ".gif", ".webp",
@@ -37,9 +38,14 @@ def resource_path(*parts: str) -> Path:
 def data_dir() -> Path:
     override = os.environ.get("RULZ_DATA_DIR")
     if override:
-        root = Path(override)
-    else:
-        root = Path(os.environ.get("LOCALAPPDATA", Path.home())) / APP_NAME
+        return _ensure_dir(override)
+    return _ensure_dir(str(Path(os.environ.get("LOCALAPPDATA", Path.home())) / APP_NAME))
+
+
+@lru_cache(maxsize=4)
+def _ensure_dir(path: str) -> Path:
+    # Cached: thumb_path()/face_crop_path() run once per tile, and a mkdir per call was slow.
+    root = Path(path)
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -54,6 +60,15 @@ def thumb_path(photo_id: int) -> Path:
 
 def face_crop_path(face_id: int) -> Path:
     return data_dir() / "faces" / f"{face_id % 256:02x}" / f"{face_id}.jpg"
+
+
+# String versions for building thousands of grid tiles quickly (Path objects are slow in bulk).
+def thumb_file(photo_id: int) -> str:
+    return f"{data_dir()}\\thumbs\\{photo_id % 256:02x}\\{photo_id}.jpg"
+
+
+def face_crop_file(face_id: int) -> str:
+    return f"{data_dir()}\\faces\\{face_id % 256:02x}\\{face_id}.jpg"
 
 
 DETECTOR_MODEL = resource_path("models", "face_detection_yunet_2023mar.onnx")

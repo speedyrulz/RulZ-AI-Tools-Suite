@@ -1,6 +1,9 @@
 """People overview and the per-person page with face corrections."""
 from __future__ import annotations
 
+from collections import OrderedDict
+from dataclasses import dataclass
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QCheckBox, QHBoxLayout, QLabel, QMenu, QPushButton, QStackedWidget, QVBoxLayout,
                                QWidget)
@@ -173,13 +176,24 @@ class PeopleOverview(QWidget):
         m.exec(pos)
 
 
+@dataclass
+class _PersonData:
+    version: int
+    photo_sections: list[Section]
+    face_tiles: list[Tile]
+    suggestion_tiles: list[Tile]
+
+
 class PersonPage(QWidget):
     TAB_PHOTOS, TAB_FACES, TAB_SUGGEST = range(3)
+    CACHE_SIZE = 8  # recently opened people kept in memory
 
     def __init__(self, ctx, owner: PeoplePage):
         super().__init__()
         self.ctx, self.owner = ctx, owner
         self.person_id: int | None = None
+        self._cache: OrderedDict[int, _PersonData] = OrderedDict()
+        self._shown: tuple[int, int] | None = None  # (person, version) currently in the grids
         self.setObjectName("Page")
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -280,6 +294,24 @@ class PersonPage(QWidget):
     def _p(self):
         return self.ctx.db.person(self.person_id) if self.person_id else None
 
+    def _data(self, person_id: int) -> "_PersonData":
+        """Photo/face/suggestion tiles for a person, cached until the library data changes."""
+        version = self.ctx.data_version
+        data = self._cache.get(person_id)
+        if data is None or data.version != version:
+            db = self.ctx.db
+            data = _PersonData(
+                version,
+                month_sections(db.photos([person_id])),
+                [Tile(key=f.id, image=face_image(f.id), data=f) for f, _ in db.faces_of_person(person_id)],
+                [Tile(key=fid, image=face_image(fid), badge=f"{round(score * 100)}%")
+                 for fid, score in clustering.suggestions(db, person_id)])
+            self._cache[person_id] = data
+        self._cache.move_to_end(person_id)
+        while len(self._cache) > self.CACHE_SIZE:
+            self._cache.popitem(last=False)
+        return data
+
     def refresh(self, reset_scroll: bool = False) -> bool:
         db = self.ctx.db
         p = self._p()
@@ -296,16 +328,13 @@ class PersonPage(QWidget):
         self.not_btn.setText(f"Not {p.name}" if p.name else "Not this person")
         self.yes_btn.setText(f"Yes, it's {p.name}" if p.name else "Yes, same person")
 
-        photos = db.photos([p.id])
-        self.photos.set_sections(month_sections(photos), keep_scroll=not reset_scroll)
-
-        faces = db.faces_of_person(p.id)
-        tiles = [Tile(key=f.id, image=face_image(f.id), data=f) for f, _ in faces]
-        self.faces.set_sections([Section(None, tiles)], keep_scroll=not reset_scroll)
-
-        sugg = clustering.suggestions(db, p.id)
-        s_tiles = [Tile(key=fid, image=face_image(fid), badge=f"{round(score * 100)}%") for fid, score in sugg]
-        self.suggest.set_sections([Section(None, s_tiles)], keep_scroll=not reset_scroll)
+        data = self._data(p.id)
+        if self._shown != (p.id, data.version) or reset_scroll:
+            self._shown = (p.id, data.version)
+            self.photos.set_sections(data.photo_sections, keep_scroll=not reset_scroll)
+            self.faces.set_sections([Section(None, data.face_tiles)], keep_scroll=not reset_scroll)
+            self.suggest.set_sections([Section(None, data.suggestion_tiles)], keep_scroll=not reset_scroll)
+        s_tiles = data.suggestion_tiles
         self.suggest.set_empty("Nothing to review", f"There are no other unassigned faces that look like {who}.")
         self.tabs.set_text(self.TAB_SUGGEST, f"Review suggestions ({len(s_tiles)})" if s_tiles else "Review suggestions")
         self._update_hint()

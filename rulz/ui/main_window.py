@@ -32,6 +32,8 @@ class MainWindow(QMainWindow):
         self.db = Database()
         self.scanner = ScanController(self)
         self._engine: FaceEngine | None = None
+        # Bumped whenever library data changes; pages use it to know when cached results are stale.
+        self.data_version = 0
 
         self.root = QStackedWidget()
         self.setCentralWidget(self.root)
@@ -178,12 +180,14 @@ class MainWindow(QMainWindow):
     # ---- refresh -------------------------------------------------------------
     def data_changed(self, quiet: bool = False):
         """Called after the user edits something. ``quiet`` defers refresh (e.g. while in the viewer)."""
+        self.data_version += 1
         for p in (self.photos, self.people, self.library):
             p.dirty = True
         if not quiet:
             self._refresh_visible()
 
     def _schedule_refresh(self):
+        self.data_version += 1  # the scanner changed something
         ThumbLoader.instance().failed.clear()  # thumbnails that didn't exist yet may exist now
         self._refresh_timer.start()
 

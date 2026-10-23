@@ -13,6 +13,7 @@ import numpy as np
 from .db import Database
 
 CHUNK = 512
+MAX_EXEMPLARS = 400  # per-person sample used for suggestions
 
 
 def cluster(db: Database, threshold: float | None = None) -> dict:
@@ -137,16 +138,15 @@ def suggestions(db: Database, person_id: int, limit: int = 200, threshold: float
     cand_ids, _, cand = db.embeddings("person_id IS NULL")
     if len(cand_ids) == 0:
         return []
-    rejected = {r[0] for r in db.q("SELECT face_id FROM rejections WHERE person_id=?", (person_id,))}
+    rejected = np.fromiter((r[0] for r in db.q("SELECT face_id FROM rejections WHERE person_id=?", (person_id,))),
+                           np.int64)
     cen = mine.sum(0)
     cen /= max(float(np.linalg.norm(cen)), 1e-6)
-    out = []
-    for lo in range(0, len(cand_ids), CHUNK):
-        block = cand[lo:lo + CHUNK]
-        score = np.maximum(block @ cen, (block @ mine.T).max(1) - 0.08)
-        for i, s in enumerate(score):
-            fid = int(cand_ids[lo + i])
-            if s >= t and fid not in rejected:
-                out.append((fid, float(s)))
-    out.sort(key=lambda p: -p[1])
-    return out[:limit]
+    if len(mine) > MAX_EXEMPLARS:
+        # Comparing against thousands of faces is slow and adds little: an even spread is enough.
+        mine = mine[np.linspace(0, len(mine) - 1, MAX_EXEMPLARS).astype(np.int64)]
+    score = np.concatenate([np.maximum(block @ cen, (block @ mine.T).max(1) - 0.08)
+                            for block in (cand[lo:lo + CHUNK] for lo in range(0, len(cand), CHUNK))])
+    keep = (score >= t) & ~np.isin(cand_ids, rejected)
+    order = np.argsort(-score[keep], kind="stable")[:limit]
+    return [(int(f), float(s)) for f, s in zip(cand_ids[keep][order], score[keep][order])]
