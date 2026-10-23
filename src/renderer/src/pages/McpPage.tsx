@@ -132,6 +132,28 @@ export function McpPage() {
                 onChange={(v) => v !== null && v >= 500 && void update({ toolBudgetTokens: Math.round(v) })}
               />
             </Field>
+            <Field
+              inline
+              label="Shorten older tool results"
+              hint="Sends older results as their beginning and end only; the chat still shows them in full"
+            >
+              <Switch checked={settings.compactToolResults} onCheckedChange={(v) => void update({ compactToolResults: v })} />
+            </Field>
+            {settings.compactToolResults && (
+              <Field
+                inline
+                label="Keep recent results in full"
+                hint="How many of the latest results in the current turn stay complete; earlier turns are always shortened"
+              >
+                <NumberInput
+                  className="w-20"
+                  value={settings.keepFullToolResults}
+                  min={0}
+                  max={100}
+                  onChange={(v) => v !== null && v >= 0 && void update({ keepFullToolResults: Math.round(v) })}
+                />
+              </Field>
+            )}
             <Field inline label="Ask before running a tool" hint="Tools you mark “always allow” skip the question">
               <Switch checked={settings.confirmToolCalls} onCheckedChange={(v) => void update({ confirmToolCalls: v })} />
             </Field>

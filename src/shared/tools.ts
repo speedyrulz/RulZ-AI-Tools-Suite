@@ -99,6 +99,49 @@ export function resolveTool(tools: McpToolInfo[], name: string): McpToolInfo | u
   return bare.length === 1 ? bare[0] : undefined
 }
 
+// ---------- Compacting old tool results ----------
+
+/** Results at or below this size are always sent in full. */
+export const COMPACT_MIN_CHARS = 800
+const HEAD_CHARS = 500
+const TAIL_CHARS = 200
+
+/**
+ * Shortens a tool result to its beginning and end. The chat keeps the full text; only what is
+ * sent to the model is shortened, and the model is told it can run the tool again.
+ */
+export function compactToolResult(text: string): string {
+  if (text.length <= COMPACT_MIN_CHARS) return text
+  // Cut on line breaks when one is near, so the excerpt doesn't end mid-line.
+  let head = text.slice(0, HEAD_CHARS)
+  const nl = head.lastIndexOf('\n')
+  if (nl > HEAD_CHARS * 0.6) head = head.slice(0, nl)
+  let tail = text.slice(-TAIL_CHARS)
+  const tnl = tail.indexOf('\n')
+  if (tnl >= 0 && tnl < TAIL_CHARS * 0.4) tail = tail.slice(tnl + 1)
+  const omitted = text.length - head.length - tail.length
+  return `${head}\n[… ${omitted.toLocaleString('en-US')} characters of this older tool result omitted to save context; call the tool again if you need them …]\n${tail}`
+}
+
+/**
+ * Ids of tool calls whose results stay complete: the `keep` most recent calls made since the
+ * user's last message. Results from earlier turns are compacted, since the model has already
+ * answered from them; the built-in loader tools don't count toward `keep`.
+ */
+export function recentToolCallIds(
+  messages: { role: string; toolCalls?: { id: string; name: string }[] }[],
+  keep: number
+): Set<string> {
+  let start = messages.length
+  while (start > 0 && messages[start - 1].role !== 'user') start--
+  const ids = messages
+    .slice(start)
+    .flatMap((m) => m.toolCalls ?? [])
+    .filter((c) => !META_TOOLS.has(c.name))
+    .map((c) => c.id)
+  return new Set(keep > 0 ? ids.slice(-keep) : [])
+}
+
 const CATALOG_CHAR_LIMIT = 6000
 
 /** System-prompt note for on-demand mode: how to load tools, and which exist. */

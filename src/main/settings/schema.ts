@@ -60,7 +60,9 @@ export const settingsSchema = z.object({
   allowedTools: z.array(z.string()).catch(D.allowedTools),
   disabledTools: z.array(z.string()).catch(D.disabledTools),
   toolMode: z.enum(['auto', 'all', 'dynamic']).catch(D.toolMode),
-  toolBudgetTokens: z.number().int().min(500).max(200000).catch(D.toolBudgetTokens)
+  toolBudgetTokens: z.number().int().min(500).max(200000).catch(D.toolBudgetTokens),
+  compactToolResults: z.boolean().catch(D.compactToolResults),
+  keepFullToolResults: z.number().int().min(0).max(100).catch(D.keepFullToolResults)
 })
 
 export const presetSchema = z.object({

@@ -17,7 +17,15 @@ import { uid } from '../lib/format'
 import { useApp } from './app'
 import { availableTools, effectiveToolMode, tokensOf, toolRequestFor } from './mcp'
 import { readyInstance, useModels } from './models'
-import { META_LOAD, META_SEARCH, META_TOOLS, resolveTool, searchTools } from '@shared/tools'
+import {
+  compactToolResult,
+  META_LOAD,
+  META_SEARCH,
+  META_TOOLS,
+  recentToolCallIds,
+  resolveTool,
+  searchTools
+} from '@shared/tools'
 
 export const NEW_CHAT_TITLE = 'New Chat'
 
@@ -116,8 +124,23 @@ function makeTitle(text: string): string {
   return line.length > 48 ? `${line.slice(0, 47)}…` : line || NEW_CHAT_TITLE
 }
 
-/** Converts chat history to the OpenAI message format llama-server expects. */
-export function toWire(messages: ChatMessage[], systemPrompt: string, vision: boolean): WireMessage[] {
+/** How many recent tool results to keep whole, or null to send every result in full. */
+function keepFullToolResults(): number | null {
+  const s = useApp.getState().settings
+  return s?.compactToolResults ? s.keepFullToolResults : null
+}
+
+/**
+ * Converts chat history to the OpenAI message format llama-server expects. With `keepFull` set,
+ * all but that many of the most recent tool results are shortened (the chat itself keeps them).
+ */
+export function toWire(
+  messages: ChatMessage[],
+  systemPrompt: string,
+  vision: boolean,
+  keepFull: number | null = keepFullToolResults()
+): WireMessage[] {
+  const keepIds = keepFull === null ? null : recentToolCallIds(messages, keepFull)
   const out: WireMessage[] = []
   if (systemPrompt.trim()) out.push({ role: 'system', content: systemPrompt })
   for (const m of messages) {
@@ -131,7 +154,8 @@ export function toWire(messages: ChatMessage[], systemPrompt: string, vision: bo
       for (const c of m.toolCalls) {
         const result =
           c.result ?? (c.status === 'denied' ? 'The user declined to run this tool.' : 'The tool did not return a result.')
-        out.push({ role: 'tool', tool_call_id: c.id, content: result })
+        const compact = keepIds !== null && !keepIds.has(c.id)
+        out.push({ role: 'tool', tool_call_id: c.id, content: compact ? compactToolResult(result) : result })
       }
       continue
     }

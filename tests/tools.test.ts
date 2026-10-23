@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import { resolveTool, searchTools, toolCatalogNote, toolSummary } from '@shared/tools'
+import {
+  COMPACT_MIN_CHARS,
+  compactToolResult,
+  recentToolCallIds,
+  resolveTool,
+  searchTools,
+  toolCatalogNote,
+  toolSummary
+} from '@shared/tools'
 import type { McpToolInfo } from '@shared/types'
 import { withSystemNote } from '../src/main/chat/service'
 
@@ -52,6 +60,44 @@ describe('toolCatalogNote', () => {
     const note = toolCatalogNote(many, [])
     expect(note.length).toBeLessThan(7000)
     expect(note).toMatch(/more tools not listed; use rulz_search_tools/)
+  })
+})
+
+describe('compactToolResult', () => {
+  it('leaves short results alone', () => {
+    expect(compactToolResult('ok')).toBe('ok')
+    expect(compactToolResult('x'.repeat(COMPACT_MIN_CHARS))).toHaveLength(COMPACT_MIN_CHARS)
+  })
+  it('keeps the beginning and end of long results and says what was cut', () => {
+    const lines = Array.from({ length: 400 }, (_, i) => `string ${i}: value`)
+    const text = lines.join('\n')
+    const out = compactToolResult(text)
+    expect(out.length).toBeLessThan(1000)
+    expect(out.startsWith('string 0: value')).toBe(true)
+    expect(out.endsWith('string 399: value')).toBe(true)
+    expect(out).toMatch(/characters of this older tool result omitted/)
+    // Cuts land on line boundaries.
+    expect(out.split('\n').every((l) => /^string \d+: value$|omitted/.test(l))).toBe(true)
+  })
+})
+
+describe('recentToolCallIds', () => {
+  const call = (id: string, name = 'rea__x') => ({ id, name })
+  it('keeps only the most recent calls of the current turn', () => {
+    const msgs = [
+      { role: 'user' },
+      { role: 'assistant', toolCalls: [call('old1'), call('old2')] },
+      { role: 'assistant' },
+      { role: 'user' },
+      { role: 'assistant', toolCalls: [call('a'), call('meta', 'rulz_load_tools')] },
+      { role: 'assistant', toolCalls: [call('b'), call('c')] }
+    ]
+    expect([...recentToolCallIds(msgs, 2)]).toEqual(['b', 'c'])
+    expect([...recentToolCallIds(msgs, 10)]).toEqual(['a', 'b', 'c'])
+    expect(recentToolCallIds(msgs, 0).size).toBe(0)
+  })
+  it('compacts everything once the user has replied', () => {
+    expect(recentToolCallIds([{ role: 'assistant', toolCalls: [call('a')] }, { role: 'user' }], 3).size).toBe(0)
   })
 })
 

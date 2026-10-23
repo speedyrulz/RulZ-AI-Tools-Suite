@@ -51,5 +51,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   allowedTools: [],
   disabledTools: [],
   toolMode: 'auto',
-  toolBudgetTokens: 6000
+  toolBudgetTokens: 6000,
+  compactToolResults: true,
+  keepFullToolResults: 3
 }

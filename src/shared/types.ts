@@ -75,6 +75,10 @@ export interface AppSettings {
   toolMode: ToolMode
   /** Token budget for tool descriptions in on-demand mode (and the threshold for auto). */
   toolBudgetTokens: number
+  /** Send older tool results shortened to their beginning and end. */
+  compactToolResults: boolean
+  /** How many of the most recent tool results are always sent in full. */
+  keepFullToolResults: number
 }
 
 /**

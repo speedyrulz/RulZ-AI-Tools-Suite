@@ -27,6 +27,9 @@ llama.cpp build (`llama-server.exe`), one process per loaded model, bound to `12
     `rulz_search_tools` / `rulz_load_tools` / `rulz_unload_tools`, and only loaded tools' full descriptions are
     sent, within a token budget (least recently used are unloaded first). "Auto" switches to this once the
     enabled tools exceed the budget.
+  - **Tool-result compaction**: once you send a new message, tool results from earlier turns are sent to the
+    model as their beginning and end only (the chat still shows them in full); the latest results of the turn in
+    progress stay complete.
 - GPU/RAM meters (nvidia-smi), dark/light theme, keyboard shortcuts (see Settings).
 
 ## Engine
