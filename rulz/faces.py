@@ -10,6 +10,7 @@ import cv2  # noqa: E402
 import numpy as np
 
 from . import attributes, config
+from .body import BodyAnalyzer
 
 
 @dataclass
@@ -19,6 +20,8 @@ class FaceAttrs:
     yaw: float | None = None
     pitch: float | None = None
     roll: float | None = None
+    pose: str | None = None       # filled in by body.BodyAnalyzer
+    arms_up: bool = False
 
 
 @dataclass
@@ -41,6 +44,12 @@ class FaceEngine:
         if config.EXPRESSION_MODEL.exists():  # optional: without it, expressions are simply not tagged
             try:
                 self.expression_net = cv2.dnn.readNetFromONNX(str(config.EXPRESSION_MODEL))
+            except cv2.error:
+                pass
+        self.body = None  # optional too: body pose (standing/sitting/...)
+        if BodyAnalyzer.available():
+            try:
+                self.body = BodyAnalyzer()
             except cv2.error:
                 pass
 
@@ -104,10 +113,28 @@ class FaceEngine:
                 continue
             emb, attrs = self.analyze_row(bgr, row)
             out.append(DetectedFace((x0 / W, y0 / H, (x1 - x0) / W, (y1 - y0) / H), float(row[14]), emb, attrs))
+        for face, body in zip(out, self.poses(bgr, [f.box for f in out])):
+            if body is not None:
+                face.attrs.pose, face.attrs.arms_up = body.pose, body.arms_up
         return out
 
+    def poses(self, bgr: np.ndarray, boxes_norm: list) -> list:
+        """Body pose for each face box (normalized x, y, w, h); None where it can't be read."""
+        if self.body is None or not boxes_norm:
+            return [None] * len(boxes_norm)
+        H, W = bgr.shape[:2]
+        return self.body.analyze(bgr, [(b[0] * W, b[1] * H, b[2] * W, b[3] * H) for b in boxes_norm])
+
     def embed_region(self, bgr: np.ndarray, box_norm) -> DetectedFace:
-        """Embed a user-drawn face box. Tries to find landmarks inside the box for proper alignment."""
+        """Embed a user-drawn face box (with expression, head direction and body pose)."""
+        face = self._embed_region(bgr, box_norm)
+        body = self.poses(bgr, [face.box])[0]
+        if body is not None:
+            face.attrs.pose, face.attrs.arms_up = body.pose, body.arms_up
+        return face
+
+    def _embed_region(self, bgr: np.ndarray, box_norm) -> DetectedFace:
+        """Tries to find landmarks inside the box for proper alignment."""
         H, W = bgr.shape[:2]
         x, y, w, h = box_norm[0] * W, box_norm[1] * H, box_norm[2] * W, box_norm[3] * H
         pad = 0.35 * max(w, h)

@@ -162,31 +162,42 @@ def process_pending(db: Database, engine: FaceEngine, progress: Progress, change
 
 def backfill_attributes(db: Database, engine: FaceEngine, progress: Progress, changed: Callable[[], None],
                         should_stop: Callable[[], bool]) -> int:
-    """Add expression/head-pose data to faces found before those features existed.
+    """Add expression, head direction and body pose to faces found before those features existed.
 
-    Faces are matched to fresh detections by overlap, so their people assignments stay untouched.
+    Works from the stored face boxes, so people assignments stay untouched.
     """
-    rows = db.q("SELECT DISTINCT p.id, p.path FROM photos p JOIN faces f ON f.photo_id=p.id "
-                "WHERE f.attrs_done=0 ORDER BY p.id")
+    want_body = engine.body is not None
+    pending = "f.attrs_done=0" + (" OR f.body_done=0" if want_body else "")
+    rows = db.q(f"SELECT DISTINCT p.id, p.path FROM photos p JOIN faces f ON f.photo_id=p.id "
+                f"WHERE {pending} ORDER BY p.id")
     total = len(rows)
     last_notify = time.monotonic()
     for n, row in enumerate(rows, 1):
         if should_stop():
             raise Cancelled
-        todo = db.q("SELECT id, x, y, w, h, ignored FROM faces WHERE photo_id=? AND attrs_done=0", (row["id"],))
+        todo = db.q("SELECT id, x, y, w, h, ignored, attrs_done, body_done FROM faces f WHERE photo_id=? AND "
+                    f"({pending})", (row["id"],))
         try:
             bgr = imaging.load(row["path"], config.DETECT_MAX_SIDE).bgr()
         except Exception:
             bgr = None
+        need_pose = [f for f in todo if want_body and not f["body_done"] and not f["ignored"]]
+        poses = engine.poses(bgr, [(f["x"], f["y"], f["w"], f["h"]) for f in need_pose]) if bgr is not None \
+            else [None] * len(need_pose)
+        pose_of = {f["id"]: body for f, body in zip(need_pose, poses)}
         with db.transaction():
             for f in todo:
-                attrs = None
-                if bgr is not None and not f["ignored"]:
-                    match = engine.find_row(bgr, (f["x"], f["y"], f["w"], f["h"]))
-                    if match is not None:
-                        attrs = engine.attributes_row(bgr, match)
-                db.set_face_attrs(f["id"], attrs)
-        progress(n, total, f"Reading expressions… {n:,} of {total:,}")
+                if not f["attrs_done"]:
+                    attrs = None
+                    if bgr is not None and not f["ignored"]:
+                        match = engine.find_row(bgr, (f["x"], f["y"], f["w"], f["h"]))
+                        if match is not None:
+                            attrs = engine.attributes_row(bgr, match)
+                    db.set_face_attrs(f["id"], attrs)
+                if want_body and not f["body_done"]:
+                    body = pose_of.get(f["id"])
+                    db.set_face_pose(f["id"], body.pose if body else None, bool(body and body.arms_up))
+        progress(n, total, f"Reading expressions and poses… {n:,} of {total:,}")
         if time.monotonic() - last_notify > 3:
             changed()
             last_notify = time.monotonic()

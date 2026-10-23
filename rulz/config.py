@@ -7,7 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 
 APP_NAME = "RulZ Image Organizer"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.0"
 
 IMAGE_EXTS = {
     ".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".bmp", ".gif", ".webp",
@@ -74,3 +74,5 @@ def face_crop_file(face_id: int) -> str:
 DETECTOR_MODEL = resource_path("models", "face_detection_yunet_2023mar.onnx")
 RECOGNIZER_MODEL = resource_path("models", "face_recognition_sface_2021dec.onnx")
 EXPRESSION_MODEL = resource_path("models", "emotion-ferplus-8.onnx")
+PERSON_DETECTOR_MODEL = resource_path("models", "person_detection_mediapipe_2023mar.onnx")
+POSE_MODEL = resource_path("models", "pose_estimation_mediapipe_2023mar.onnx")

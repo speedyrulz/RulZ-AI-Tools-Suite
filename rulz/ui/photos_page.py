@@ -17,6 +17,8 @@ EXPRESSION_CHIPS = [("Smiling", "smiling"), ("Neutral", "neutral"), ("Surprised"
 DIRECTION_CHIPS = [("Facing camera", "facing camera"), ("Facing left", "facing left"),
                    ("Facing right", "facing right"), ("Looking up", "looking up"), ("Looking down", "looking down"),
                    ("Side profile", "side profile"), ("Head tilted", "head tilted")]
+POSE_CHIPS = [("Standing", "standing"), ("Sitting", "sitting"), ("Lying down", "lying down"),
+              ("Arms raised", "arms raised")]
 
 
 class PhotosPage(QWidget):
@@ -61,7 +63,7 @@ class PhotosPage(QWidget):
         fl.setContentsMargins(28, 0, 28, 10)
         fl.setSpacing(6)
         self.chips: dict[str, list[QPushButton]] = {}
-        for title, chips in (("Expression", EXPRESSION_CHIPS), ("Direction", DIRECTION_CHIPS)):
+        for title, chips in (("Expression", EXPRESSION_CHIPS), ("Direction", DIRECTION_CHIPS), ("Pose", POSE_CHIPS)):
             row = QHBoxLayout()
             row.setSpacing(6)
             lb = label(title, "Muted")
@@ -87,7 +89,8 @@ class PhotosPage(QWidget):
             self.chips[title] = group
             fl.addLayout(row)
         hint = label("Filters apply to the people you search for (or anyone, if the search is empty). "
-                     "Expressions and directions are estimated automatically and won't always be right.",
+                     "All of these are estimated automatically and won't always be right. Pose needs the "
+                     "person's legs in the photo.",
                      "Muted", wrap=True)
         hint.setStyleSheet("font-size: 12px;")
         fl.addWidget(hint)

@@ -57,7 +57,9 @@ CREATE TABLE IF NOT EXISTS faces(
     manual INTEGER NOT NULL DEFAULT 0,       -- box drawn by the user
     expression TEXT, expr_conf REAL,         -- see attributes.py
     yaw REAL, pitch REAL, roll REAL,
-    attrs_done INTEGER NOT NULL DEFAULT 1    -- 0: added before attributes existed, needs analysis
+    attrs_done INTEGER NOT NULL DEFAULT 1,   -- 0: added before attributes existed, needs analysis
+    pose TEXT, arms_up INTEGER,              -- see body.py
+    body_done INTEGER NOT NULL DEFAULT 1     -- 0: added before body poses existed, needs analysis
 );
 CREATE TABLE IF NOT EXISTS rejections(
     face_id INTEGER NOT NULL REFERENCES faces(id) ON DELETE CASCADE,
@@ -78,6 +80,7 @@ CREATE INDEX IF NOT EXISTS ix_faces_person_ignored_photo ON faces(person_id, ign
 MIGRATIONS = [
     ("expression", "TEXT"), ("expr_conf", "REAL"), ("yaw", "REAL"), ("pitch", "REAL"), ("roll", "REAL"),
     ("attrs_done", "INTEGER NOT NULL DEFAULT 0"),
+    ("pose", "TEXT"), ("arms_up", "INTEGER"), ("body_done", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -108,9 +111,11 @@ class Face:
     yaw: float | None = None
     pitch: float | None = None
     roll: float | None = None
+    pose: str | None = None
+    arms_up: bool = False
 
     def tags(self) -> list[str]:
-        return attributes.describe(self.expression, self.yaw, self.pitch, self.roll)
+        return attributes.describe(self.expression, self.yaw, self.pitch, self.roll, self.pose, self.arms_up)
 
 
 @dataclass
@@ -255,14 +260,14 @@ class Database:
 
     # ---- faces ---------------------------------------------------------------
     _FACE_COLS = ("f.id, f.photo_id, f.x, f.y, f.w, f.h, f.score, f.person_id, p.name AS person_name, "
-                  "f.assigned_by, f.manual, f.expression, f.yaw, f.pitch, f.roll")
+                  "f.assigned_by, f.manual, f.expression, f.yaw, f.pitch, f.roll, f.pose, f.arms_up")
     _FACE_SQL = f"SELECT {_FACE_COLS} FROM faces f LEFT JOIN people p ON p.id=f.person_id "
 
     @staticmethod
     def _face(r) -> Face:
         return Face(r["id"], r["photo_id"], r["x"], r["y"], r["w"], r["h"], r["score"] or 0,
                     r["person_id"], r["person_name"], r["assigned_by"], r["manual"],
-                    r["expression"], r["yaw"], r["pitch"], r["roll"])
+                    r["expression"], r["yaw"], r["pitch"], r["roll"], r["pose"], bool(r["arms_up"]))
 
     def faces_in_photo(self, photo_id: int) -> list[Face]:
         return [self._face(r) for r in self.q(self._FACE_SQL + "WHERE f.photo_id=? AND f.ignored=0 ORDER BY f.x",
@@ -281,9 +286,10 @@ class Database:
     def insert_face(self, photo_id: int, face: "DetectedFace", manual: bool = False) -> int:
         a = face.attrs
         cur = self.x("INSERT INTO faces(photo_id, x, y, w, h, score, embedding, manual, expression, expr_conf, "
-                     "yaw, pitch, roll, attrs_done) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
+                     "yaw, pitch, roll, attrs_done, pose, arms_up, body_done) "
+                     "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,1)",
                      (photo_id, *map(float, face.box), float(face.score), to_blob(face.embedding), int(manual),
-                      a.expression, a.expr_conf, a.yaw, a.pitch, a.roll))
+                      a.expression, a.expr_conf, a.yaw, a.pitch, a.roll, a.pose, int(a.arms_up)))
         return cur.lastrowid
 
     def set_face_attrs(self, face_id: int, attrs: "FaceAttrs | None") -> None:
@@ -292,6 +298,9 @@ class Database:
         else:
             self.x("UPDATE faces SET expression=?, expr_conf=?, yaw=?, pitch=?, roll=?, attrs_done=1 WHERE id=?",
                    (attrs.expression, attrs.expr_conf, attrs.yaw, attrs.pitch, attrs.roll, face_id))
+
+    def set_face_pose(self, face_id: int, pose: str | None, arms_up: bool) -> None:
+        self.x("UPDATE faces SET pose=?, arms_up=?, body_done=1 WHERE id=?", (pose, int(arms_up), face_id))
 
     def search_faces(self, person_ids: list[int] | None, conditions: list[str]) -> set[int]:
         """Photo ids having one face that is any of ``person_ids`` (None = anyone) and meets every condition.

@@ -12,8 +12,8 @@ Everything runs on your PC. No photos or face data ever leave your computer.
   or when you click **Scan now** (F5). New, changed, deleted and *moved/renamed* photos are picked up;
   moved files keep their face tags.
 - **Photos**: a timeline of all photos grouped by month (from EXIF date taken). Ctrl + mouse wheel zooms
-  the grid. Search by person, facial expression and head direction. Words in one comma-separated group
-  describe one face:
+  the grid. Search by person, facial expression, head direction and body pose. Words in one
+  comma-separated group describe one person:
 
   | Search | Finds |
   | --- | --- |
@@ -23,13 +23,17 @@ Everything runs on your PC. No photos or face data ever leave your computer.
   | `Mom smiling, Dad` | Mom smiling, with Dad somewhere in the photo |
   | `Dad facing left` | Dad's head turned towards the left side of the photo |
   | `looking down`, `side profile`, `head tilted` | anyone posed that way |
+  | `Mom sitting`, `standing`, `lying down`, `arms raised` | body pose |
 
   Expressions: smiling, neutral, surprised, sad, angry, disgusted, scared, smirking (and "not smiling").
   Directions: facing camera, facing left/right, looking up/down, side profile, head tilted.
+  Poses: standing, sitting, lying down, arms raised.
   The **Filters** button shows the same options as clickable chips; they apply to the people you searched
-  for, or to anyone if the search box is empty. The photo viewer lists each face's expression and direction.
-  These are estimated automatically and won't always be right (a smirk may read as a smile, and
-  up/down is less reliable than left/right).
+  for, or to anyone if the search box is empty. The photo viewer lists each face's expression, direction
+  and pose. These are estimated automatically and won't always be right (a smirk may read as a smile, and
+  up/down is less reliable than left/right). Pose is only decided when the person's lower legs are in the
+  photo, so head-and-shoulders and waist-up shots get no pose, and only people whose face was found are
+  covered.
 - **People**: automatic face groups. Click a group to name it. Select several groups (hover → tick the
   circle) and **Merge** them. Naming a group with an existing name offers to merge them. Hide people you
   don't care about. **Ungroup** dissolves a wrong group.
@@ -75,6 +79,7 @@ Set `RULZ_DATA_DIR` to use a different location, and `RULZ_THEME=light|dark` to 
 | Face recognition: OpenCV **SFace** 128-d embeddings (`models/face_recognition_sface_2021dec.onnx`) | `rulz/faces.py` |
 | Expressions: **FER+** emotion model (`models/emotion-ferplus-8.onnx`) on the aligned face crop | `rulz/faces.py` |
 | Head direction: yaw/pitch/roll from the 5 face landmarks; search vocabulary | `rulz/attributes.py`, `rulz/search.py` |
+| Body pose: MediaPipe **BlazePose** person detector + 33 body landmarks, run around each face; joint-angle rules | `rulz/body.py` |
 | Grouping: match to existing people (centroid + nearest face), then link remaining faces into new groups | `rulz/clustering.py` |
 | Scanning, thumbnails, moved-file detection | `rulz/scanner.py`, `rulz/imaging.py` |
 | SQLite storage (WAL) | `rulz/db.py` |
@@ -83,4 +88,5 @@ Set `RULZ_DATA_DIR` to use a different location, and `RULZ_THEME=light|dark` to 
 The face models come from the [OpenCV Model Zoo](https://github.com/opencv/opencv_zoo) and the expression
 model from the [ONNX Model Zoo](https://github.com/onnx/models); see [models/README.md](models/README.md)
 for their licenses. Libraries created before
-expressions were added are analyzed once in the background on the next scan; people assignments are kept.
+expressions or poses were added are analyzed once in the background on the next scan; people assignments
+are kept.

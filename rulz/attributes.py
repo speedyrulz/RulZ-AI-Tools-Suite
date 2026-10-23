@@ -22,6 +22,8 @@ EXPRESSION_DISPLAY = {
     "disgusted": "Disgusted", "scared": "Scared", "contempt": "Smirking",
 }
 
+POSE_DISPLAY = {"standing": "Standing", "sitting": "Sitting", "lying": "Lying down"}
+
 YAW_TURNED = 0.20      # ~15-20 degrees
 YAW_PROFILE = 0.60     # ~45 degrees or more
 PITCH_UP = 0.40
@@ -44,8 +46,9 @@ def head_pose(landmarks: np.ndarray) -> tuple[float, float, float]:
     return float(yaw), float(pitch), float(roll)
 
 
-def describe(expression: str | None, yaw: float | None, pitch: float | None, roll: float | None) -> list[str]:
-    """Short human-readable tags for a face, e.g. ['Smiling', 'Facing left']."""
+def describe(expression: str | None, yaw: float | None, pitch: float | None, roll: float | None,
+             pose: str | None = None, arms_up: bool = False) -> list[str]:
+    """Short human-readable tags for a face, e.g. ['Smiling', 'Facing left', 'Sitting']."""
     out = []
     if expression:
         out.append(EXPRESSION_DISPLAY.get(expression, expression.title()))
@@ -65,6 +68,10 @@ def describe(expression: str | None, yaw: float | None, pitch: float | None, rol
             out.append("Looking down")
     if roll is not None and abs(roll) >= ROLL_TILTED:
         out.append("Head tilted")
+    if pose:
+        out.append(POSE_DISPLAY.get(pose, pose.title()))
+    if arms_up:
+        out.append("Arms raised")
     return out
 
 
@@ -96,6 +103,15 @@ SEARCH_TERMS: dict[str, str] = {
     "looking down": f"pitch>{PITCH_DOWN}", "facing down": f"pitch>{PITCH_DOWN}",
     "head tilted": f"abs(roll)>={ROLL_TILTED}", "tilted": f"abs(roll)>={ROLL_TILTED}",
     "head tilt": f"abs(roll)>={ROLL_TILTED}",
+
+    # body pose (body.py)
+    "standing": "pose='standing'", "stands": "pose='standing'", "standing up": "pose='standing'",
+    "sitting": "pose='sitting'", "sitting down": "pose='sitting'", "seated": "pose='sitting'",
+    "sits": "pose='sitting'",
+    "lying down": "pose='lying'", "lying": "pose='lying'", "laying down": "pose='lying'", "laying": "pose='lying'",
+    "reclining": "pose='lying'",
+    "arms up": "arms_up=1", "arms raised": "arms_up=1", "raised arms": "arms_up=1", "hands up": "arms_up=1",
+    "hands raised": "arms_up=1",
 }
 _PHRASES = sorted(SEARCH_TERMS, key=len, reverse=True)
 _FILLER = {"with", "who", "is", "are", "was", "people", "person", "face", "faces", "photos", "photo", "pictures",

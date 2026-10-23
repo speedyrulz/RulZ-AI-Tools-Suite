@@ -18,6 +18,11 @@ if (-not (Test-Path "$models\face_recognition_sface_2021dec.onnx")) {
     Invoke-WebRequest "$base/face_recognition_sface/face_recognition_sface_2021dec.onnx" -OutFile "$models\face_recognition_sface_2021dec.onnx"
 }
 
+foreach ($m in @("person_detection_mediapipe", "pose_estimation_mediapipe")) {
+    if (-not (Test-Path "$models\${m}_2023mar.onnx")) {
+        Invoke-WebRequest "$base/$m/${m}_2023mar.onnx" -OutFile "$models\${m}_2023mar.onnx"
+    }
+}
 if (-not (Test-Path "$models\emotion-ferplus-8.onnx")) {
     Invoke-WebRequest "https://media.githubusercontent.com/media/onnx/models/main/validated/vision/body_analysis/emotion_ferplus/model/emotion-ferplus-8.onnx" -OutFile "$models\emotion-ferplus-8.onnx"
 }
