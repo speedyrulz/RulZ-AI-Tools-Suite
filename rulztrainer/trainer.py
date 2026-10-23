@@ -15,6 +15,7 @@ from pathlib import Path
 import torch
 from PIL import Image
 
+from . import checkpointing as ckpt
 from . import lora as lora_mod
 from . import quant as Q
 from .config import TrainConfig
@@ -268,6 +269,7 @@ class Trainer:
         self.device = torch.device(cfg.device)
         self.arch = get_arch(cfg)  # confirmed against the model's transformer config once the model dir is resolved
         self.vae = None
+        self.kept: dict[int, list[int]] = {}  # id(model copy) -> blocks keeping their activations
         self.vaes: dict[str, object] = {}  # VAE copies on the other GPUs (sampling / caching side jobs)
         self.sample_graphs: set = set()  # (device, shape) pairs a compiled model has already traced for sampling
         self.face_scorer = None
@@ -675,6 +677,7 @@ class Trainer:
         model.train()
         if self.dp is not None:
             self.dp.train(True)
+        self._setup_checkpointing(items, blocks)
         self.status.update(stage="training", step=step)
         start = time.time()
         start_step = step
@@ -734,46 +737,56 @@ class Trainer:
             step_id: list[tuple] = []
             if self.id_loss is not None:
                 self.id_ref = self.id_loss.pick_ref()  # one reference face per step
-            for _ in range(cfg.gradient_accumulation):
-                jobs = []
-                for rep in self.replicas:  # draw every copy's batch and noise in the main thread (shared RNG)
-                    batch = next(self.batch_iter)
-                    latents, embeds, mask, regions = load_batch(batch, cfg, rng)
-                    sigma = sample_sigmas(cfg, latents.shape[0], gen, self.ts_logit_shift,
-                                          tokens=latents.shape[2] * latents.shape[3], arch=self.arch)
-                    noise = torch.randn(latents.shape, generator=gen)
-                    jobs.append((rep, batch, latents, embeds, mask, sigma, noise, regions, step + 1))
-                if self.dp is not None:
-                    # torch.compile + threads: a replica tracing a graph breaks the other replica's forward, so steps
-                    # that may compile run serially; parallel steps run under a stance that never compiles (an unseen
-                    # shape then runs that block eagerly once instead of tracing)
-                    serial = self.compiled and (self.dp_quiet_steps < DP_COMPILE_QUIET_STEPS or not stance_available())
-                    n_before = compile_count()
-                    if self.compiled and not serial:
-                        with no_recompile_stance():
-                            results = self.dp.run(work, jobs, serial=False)
+            retries0 = self._alloc_retries() if any(self.kept.values()) else None
+            try:
+                for _ in range(cfg.gradient_accumulation):
+                    jobs = []
+                    for rep in self.replicas:  # draw every copy's batch and noise in the main thread (shared RNG)
+                        batch = next(self.batch_iter)
+                        latents, embeds, mask, regions = load_batch(batch, cfg, rng)
+                        sigma = sample_sigmas(cfg, latents.shape[0], gen, self.ts_logit_shift,
+                                              tokens=latents.shape[2] * latents.shape[3], arch=self.arch)
+                        noise = torch.randn(latents.shape, generator=gen)
+                        jobs.append((rep, batch, latents, embeds, mask, sigma, noise, regions, step + 1))
+                    if self.dp is not None:
+                        # torch.compile + threads: a replica tracing a graph breaks the other replica's forward, so steps
+                        # that may compile run serially; parallel steps run under a stance that never compiles (an unseen
+                        # shape then runs that block eagerly once instead of tracing)
+                        serial = self.compiled and (self.dp_quiet_steps < DP_COMPILE_QUIET_STEPS or not stance_available())
+                        n_before = compile_count()
+                        if self.compiled and not serial:
+                            with no_recompile_stance():
+                                results = self.dp.run(work, jobs, serial=False)
+                        else:
+                            results = self.dp.run(work, jobs, serial=serial)
+                        if compile_count() != n_before:
+                            if not serial:
+                                log.warning("Data parallel: a graph compiled during a parallel step; running replicas "
+                                            "one after another again until compilation settles")
+                            self.dp_quiet_steps = 0
+                        elif self.compiled and self.dp_quiet_steps < DP_COMPILE_QUIET_STEPS:
+                            self.dp_quiet_steps += 1
+                            if self.dp_quiet_steps == DP_COMPILE_QUIET_STEPS:
+                                if not stance_available():
+                                    log.warning("Data parallel + compile: this torch has no torch.compiler.set_stance, so "
+                                                "replicas keep running one after another (no parallel speed-up)")
+                                else:
+                                    log.info("Data parallel: compilation settled, replicas now run in parallel "
+                                             "(new shapes run uncompiled instead of recompiling)")
                     else:
-                        results = self.dp.run(work, jobs, serial=serial)
-                    if compile_count() != n_before:
-                        if not serial:
-                            log.warning("Data parallel: a graph compiled during a parallel step; running replicas "
-                                        "one after another again until compilation settles")
-                        self.dp_quiet_steps = 0
-                    elif self.compiled and self.dp_quiet_steps < DP_COMPILE_QUIET_STEPS:
-                        self.dp_quiet_steps += 1
-                        if self.dp_quiet_steps == DP_COMPILE_QUIET_STEPS:
-                            if not stance_available():
-                                log.warning("Data parallel + compile: this torch has no torch.compiler.set_stance, so "
-                                            "replicas keep running one after another (no parallel speed-up)")
-                            else:
-                                log.info("Data parallel: compilation settled, replicas now run in parallel "
-                                         "(new shapes run uncompiled instead of recompiling)")
-                else:
-                    results = [work(jobs[0])]
-                accum_loss += sum(r[0] for r in results)
-                step_id += [r[2] for r in results if r[2] is not None]
-                if true_per_image_lr and results[0][1]:
-                    step_lr_mult = results[0][1][0]
+                        results = [work(jobs[0])]
+                    accum_loss += sum(r[0] for r in results)
+                    step_id += [r[2] for r in results if r[2] is not None]
+                    if true_per_image_lr and results[0][1]:
+                        step_lr_mult = results[0][1][0]
+            except torch.OutOfMemoryError:
+                # blocks keeping their activations ran out of memory (a larger bucket, the identity loss, another
+                # process): keep fewer and redo the step; partial gradients of the failed step are dropped
+                optimizer.zero_grad(set_to_none=True)
+                if not self._shrink_kept_blocks():
+                    raise
+                free_cuda()
+                continue
             if self.dp is not None:
                 self.dp.reduce_grads()
             if cfg.max_grad_norm > 0:
@@ -787,6 +800,8 @@ class Trainer:
                 for g, lr0 in zip(optimizer.param_groups, saved_lrs):
                     g["lr"] = lr0
             scheduler.step()
+            if retries0 is not None:
+                self._ease_memory_pressure(retries0)
             if self.dp is not None:
                 self.dp.sync_weights()
             step += 1
@@ -939,6 +954,135 @@ class Trainer:
     # ------------------------------------------------------------ sampling
     def _lora_names(self, model, blocks) -> list[str]:
         return self.arch.lora_module_names(model, self.cfg.lora_targets, blocks, self.cfg.train_text_embedder)
+
+    # ------------------------------------------------------------ selective checkpointing
+
+    def _setup_checkpointing(self, items, blocks) -> None:
+        """Pick the blocks that keep their activations (see rulztrainer.checkpointing)."""
+        cfg = self.cfg
+        n_blocks = len(self.replicas[0][0].layers)
+        candidates = ckpt.trained_block_indices(n_blocks, blocks)
+        self.kept = {}
+        if not cfg.gradient_checkpointing or cfg.checkpoint_keep_blocks == 0 or not candidates:
+            return
+        if cfg.checkpoint_keep_blocks > 0:
+            keep = ckpt.kept_indices(candidates, cfg.checkpoint_keep_blocks)
+            for m, _, _ in self.replicas:
+                self.kept[id(m)] = keep
+                ckpt.set_kept_blocks(m, keep)
+            log.info("Checkpointing: %d of %d blocks keep their activations (checkpoint_keep_blocks)", len(keep),
+                     n_blocks)
+            return
+        if not torch.cuda.is_available() or not all(str(d).startswith("cuda") for d in self.devices):
+            return
+        self.status.update(stage="measuring activation memory")
+        try:
+            self._calibrate_checkpointing(items, candidates, n_blocks)
+        except Exception as e:  # noqa: BLE001  (an OOM while measuring included: then nothing is kept)
+            log.warning("Checkpointing calibration failed (%s: %s); every block is checkpointed",
+                        type(e).__name__, str(e)[:200])
+            for m, _, _ in self.replicas:
+                ckpt.set_kept_blocks(m, [])
+            self.kept = {}
+        finally:
+            for _, inj, _ in self.replicas:
+                for p in lora_mod.lora_parameters(inj):
+                    p.grad = None
+            free_cuda()
+
+    def _calibrate_checkpointing(self, items, candidates: list[int], n_blocks: int) -> None:
+        """Measure one forward+backward on the largest bucket with every block checkpointed, then with a few blocks
+        kept per GPU, and keep as many of the last trained blocks as the free memory allows."""
+        cfg = self.cfg
+        rng, gen = random.Random(0), torch.Generator("cpu").manual_seed(0)  # the run's own streams stay untouched
+        big = max(items, key=lambda it: (it.width // 16) * (it.height // 16))
+        latents, embeds, mask, _ = load_batch([big] * cfg.batch_size, cfg, rng)
+        noise = torch.randn(latents.shape, generator=gen)
+        sigma = torch.full((latents.shape[0],), 0.5)
+        tokens = (big.width // 16) * (big.height // 16)
+
+        for m, inj, dev in self.replicas:
+            dev = norm_device(dev)
+            assignment = [norm_device(d) for d in getattr(m, "split_assignment", None) or [dev] * n_blocks]
+            devices = list(dict.fromkeys(assignment))
+            per_dev = {d: [i for i in candidates if assignment[i] == d] for d in devices}
+
+            def measure(n_kept: int) -> dict[str, tuple[int, int]]:
+                """Keep the last n_kept candidate blocks of every GPU; (peak reserved, peak allocated) per GPU."""
+                ckpt.set_kept_blocks(m, [i for c in per_dev.values() for i in ckpt.kept_indices(c, n_kept)])
+                free_cuda()  # an empty cache, so the reserved peak shows this pattern's fragmentation too
+                for d in devices:
+                    torch.cuda.synchronize(d)
+                    torch.cuda.reset_peak_memory_stats(d)
+                noisy = ((1 - 0.5) * latents + 0.5 * noise).to(dev, torch.bfloat16)
+                pred = m(noisy, sigma.to(dev) * 1000.0, embeds.to(dev), mask.to(dev)).float()
+                pred.pow(2).mean().backward()
+                del pred
+                for d in devices:
+                    torch.cuda.synchronize(d)
+                for p in lora_mod.lora_parameters(inj):
+                    p.grad = None
+                return {d: (torch.cuda.max_memory_reserved(d), torch.cuda.max_memory_allocated(d)) for d in devices}
+
+            one, three = measure(1), measure(3)
+            keep, notes = [], []
+            for d in devices:
+                n = len(per_dev[d])
+                if not n:
+                    continue
+                kept_three = min(3, n)
+                # per extra block: the allocated slope (clean); peak: reserved (includes fragmentation)
+                per_block = ((three[d][1] - one[d][1]) / (kept_three - 1)) if kept_three > 1 else 0.0
+                peak_one = one[d][0]
+                free, total = torch.cuda.mem_get_info(d)
+                budget = min(free + torch.cuda.memory_reserved(d), total) - ckpt.memory_margin(
+                    total, identity_loss=self.id_loss is not None)
+                k = ckpt.choose_kept_blocks(n, peak_one, per_block, budget)
+                keep += ckpt.kept_indices(per_dev[d], k)
+                peak_k = peak_one + max(0, k - 1) * per_block
+                notes.append(f"{d}: {k} of {n} ({per_block / ckpt.GB:.2f} GB per extra block, peak "
+                             f"{peak_k / ckpt.GB:.1f} of {total / ckpt.GB:.0f} GB, budget {budget / ckpt.GB:.1f})")
+            self.kept[id(m)] = sorted(keep)
+            ckpt.set_kept_blocks(m, keep)
+            log.info("Checkpointing: %d of %d blocks keep their activations, measured at %d tokens (%s)", len(keep),
+                     n_blocks, tokens, "; ".join(notes))
+
+    def _alloc_retries(self) -> dict[str, int]:
+        """cudaMalloc retries per training GPU so far: the allocator ran out, freed its cache and tried again (slow)."""
+        return {d: torch.cuda.memory_stats(d).get("num_alloc_retries", 0) for d in self.devices
+                if str(d).startswith("cuda")}
+
+    def _ease_memory_pressure(self, before: dict[str, int]) -> None:
+        """A step with allocator retries is slower than recomputing a block: give one kept block back on every GPU
+        that retried (the earliest kept one there), until the steps run without retries."""
+        after = self._alloc_retries()
+        hit = {d for d, n in after.items() if n > before.get(d, 0)}
+        if not hit:
+            return
+        for m, _, _ in self.replicas:
+            keep = self.kept.get(id(m), [])
+            assignment = [norm_device(d) for d in getattr(m, "split_assignment", None) or []]
+            for d in hit:
+                on_d = [i for i in keep if (assignment[i] if assignment else norm_device(self.devices[0])) == d]
+                if on_d:
+                    keep.remove(on_d[0])
+            self.kept[id(m)] = keep
+            ckpt.set_kept_blocks(m, keep)
+        log.info("Checkpointing: memory allocator retries on %s; now %s", ", ".join(sorted(hit)),
+                 ", ".join(f"{len(v)} kept" for v in self.kept.values()))
+
+    def _shrink_kept_blocks(self) -> bool:
+        """After an out-of-memory step: halve the kept blocks of every model copy. False when none were kept."""
+        if not any(self.kept.values()):
+            return False
+        for m, _, _ in self.replicas:
+            keep = self.kept.get(id(m), [])
+            keep = keep[len(keep) - len(keep) // 2:] if len(keep) > 1 else []
+            self.kept[id(m)] = keep
+            ckpt.set_kept_blocks(m, keep)
+        log.warning("Out of GPU memory with blocks keeping their activations: now %s",
+                    ", ".join(f"{len(v)} kept" for v in self.kept.values()))
+        return True
 
     def _log_nvfp4(self, n: int) -> None:
         """How the nvfp4 layers compute on each training GPU, and a hint when another GPU has FP4 tensor cores."""

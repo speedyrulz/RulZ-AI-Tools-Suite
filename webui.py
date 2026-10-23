@@ -474,6 +474,7 @@ class Form:
             parallel_jobs=bool(v("parallel_jobs")),
             transformer_quant=v("transformer_quant"), text_encoder_quant=v("text_encoder_quant"),
             gradient_checkpointing=bool(v("gradient_checkpointing")),
+            checkpoint_keep_blocks=int(v("checkpoint_keep_blocks")),
             int8_matmul=bool(v("int8_matmul")), int8_backward=v("int8_backward"),
             nvfp4_matmul=bool(v("nvfp4_matmul")),
             dataset_dir=s("dataset_dir"), resolutions=sorted(float(x) for x in (v("resolutions") or [1.0])),
@@ -1181,6 +1182,7 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
             r["text_encoder_quant"] = ("int8", f"halves the {te_gb} GB text encoder so it fits on the GPU for caching "
                                                "instead of spilling into system RAM")
     r["gradient_checkpointing"] = (True, "saves most of the activation memory for a modest slowdown")
+    r["checkpoint_keep_blocks"] = (-1, "measured at the start: as many blocks as fit skip the recompute")
     r["compile_model"] = (False, "turn it on once a run works; the first steps compile slowly")
     # dataset
     target = 1.0 if vram is None or vram >= 12 else 0.5
@@ -1635,7 +1637,7 @@ class Wizard:
         with self.gpu_box:
             ui.spinner(size="sm")
         self.apply_bar(["multi_gpu", "transformer_quant", "text_encoder_quant", "gradient_checkpointing",
-                        "compile_model"])
+                        "checkpoint_keep_blocks", "compile_model"])
         with self.setting("multi_gpu", "Multi-GPU",
                           "Data parallel puts a full model copy on each GPU, each trains its own images, and the "
                           "results are averaged: about 1.7-2x the speed with two cards (each must fit the model). "
@@ -1661,6 +1663,13 @@ class Wizard:
                           "Recomputes intermediate results during the backward pass instead of keeping them in "
                           "memory: far less memory for some extra time per step."):
             self.bind(ui.switch("Gradient checkpointing"), "gradient_checkpointing")
+        with self.setting("checkpoint_keep_blocks", "Blocks that skip the recompute",
+                          "Spends spare GPU memory on speed: these blocks keep their intermediate results instead of "
+                          "recomputing them, about a third faster each. -1 measures your largest images at the start "
+                          "and keeps as many as fit; 0 recomputes every block.",
+                          show_if=("gradient_checkpointing", bool)):
+            self.bind(ui.number("Kept blocks (-1 = auto)", min=-1, precision=0), "checkpoint_keep_blocks") \
+                .classes("w-full")
         with self.setting("compile_model", "Compile the model",
                           "torch.compile makes every step faster after a slow first few (triton is installed with "
                           "the requirements). Best left off for a first run."):
@@ -2155,6 +2164,16 @@ def build_page(local: bool = True):
                             w["text_encoder_quant"] = ui.select(QUANTS, value="auto", label="Text encoder quant") \
                                 .classes("w-48")
                             w["gradient_checkpointing"] = ui.switch("Gradient checkpointing", value=True)
+                            w["checkpoint_keep_blocks"] = ui.number("Blocks kept without recompute (-1 = auto)",
+                                                                    value=d.checkpoint_keep_blocks, min=-1,
+                                                                    precision=0).classes("w-64") \
+                                .bind_visibility_from(w["gradient_checkpointing"], "value") \
+                                .tooltip("Checkpointing runs every block's forward twice per step to save memory. "
+                                         "Blocks kept here store their activations instead and skip the recompute, "
+                                         "about a third of that block's time. -1 measures the largest training "
+                                         "bucket at the start and keeps as many of the last blocks as the free GPU "
+                                         "memory allows (a step that still runs out keeps fewer); 0 = every block "
+                                         "is checkpointed.")
                         with advanced():
                             with fields():
                                 w["text_encoder_device"] = ui.select(["auto"] + gpus + ["cpu"], value="auto",
@@ -3199,6 +3218,11 @@ settings as the Train tab, so you can switch between the two at any time.
 ComfyUI int8/nvfp4 file stays quantized), `none` dequantizes to bf16, and `int8`, `int8_convrot` or `nvfp4`
 quantize on load. Only the frozen base weights are quantized; the LoRA itself always trains in fp32.
 int8 roughly halves VRAM for the base model (about 5 GB for the DiT); nvfp4 quarters it.
+
+*Blocks kept without recompute* (next to *Gradient checkpointing*): checkpointing runs each block's forward twice
+per step to save memory. Kept blocks store their activations and skip the second run, with identical results.
+`-1` (default) measures the largest bucket at the start and keeps as many of the last blocks as fit; `0` keeps
+none. On 16 GB cards the gain is small (0-4% per step); cards with more free memory keep more blocks.
 
 *int8 layers compute* (Model, Advanced): with **W8A8** (default) int8 / int8_convrot layers quantize the activations
 per token to int8 and run an int8 x int8 matmul (`torch._int_mm`) on the stored weight, so training is faster than

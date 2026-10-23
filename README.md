@@ -705,6 +705,28 @@ These names are identical in the diffusers checkpoint and the ComfyUI plugin mod
 The DiT in bf16 is about 10 GB. The text encoder is about 18 GB in bf16, so it is loaded only for caching
 with `device_map="auto"`; pick `8bit` / `4bit` quantization if you want it on a single GPU.
 
+### Selective checkpointing (`checkpoint_keep_blocks`)
+
+Gradient checkpointing stores only each block's input and runs the block's forward a second time during the
+backward. Blocks that fit in spare GPU memory can keep their activations instead and skip that recompute: the
+results are bit-identical, only speed and memory change. `checkpoint_keep_blocks: -1` (the default) measures one
+forward and backward of the largest training bucket before the first step, with one and with three blocks kept, and
+keeps as many of the last trained blocks as the free memory allows, minus a margin (1.5 GB or 8% of the card, 1.5 GB
+more with the identity loss). Each GPU of a model split chooses for its own blocks. `0` checkpoints every block (the
+previous behavior), `N` keeps N blocks. If a step still runs out of memory the kept blocks are halved and the step
+reruns; if the allocator has to retry, the earliest kept block on that GPU goes.
+
+Measured, 20 steps at 1 MP, seconds per step without and with auto:
+
+| run | every block checkpointed | auto | change |
+|---|---|---|---|
+| MOSS-Image int8, one 16 GB card | 6.70 | 6.43 (6 of 42 blocks kept) | -4% |
+| Krea 2 int8, split over two 16 GB cards | 9.87 | 9.68-9.88 (7 of 28) | 0-2%, within noise |
+| Krea 2 nvfp4, one 16 GB card | 8.31 | 8.37 (1 of 28) | none |
+
+The gain is small on 16 GB cards: there is little spare memory, and with int8/nvfp4 the forward a kept block skips
+is cheap next to its bf16 backward. Cards with more free memory keep more blocks; that case is not measured here.
+
 ## Layout
 
 ```
@@ -715,6 +737,7 @@ rulztrainer/
   quant.py         int8 / int8_convrot / nvfp4 weight quantization matching comfy_kitchen, QuantLinear
   sampler.py       flow-matching Euler sampler (reference schedule)
   trainer.py       training loop, saving, sampling, status.json for the UI
+  checkpointing.py selective gradient checkpointing (which blocks keep their activations)
   train.py         CLI entry point
   moss/model.py    MOSS-Image DiT (vendored, Apache-2.0, OpenMOSS)
   moss/loading.py  download + load (HF layout or single files), quant dispatch, encode helpers

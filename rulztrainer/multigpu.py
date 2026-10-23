@@ -13,6 +13,7 @@ model_split    The DiT blocks are divided across GPUs (pipeline style); activati
 """
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 from concurrent.futures import ThreadPoolExecutor
 
@@ -88,7 +89,9 @@ class DataParallelLoRA:
         using FX to symbolically trace a dynamo-optimized function"."""
         if serial:
             return [fn(job) for job in jobs]
-        return list(self._pool.map(fn, jobs))
+        futures = [self._pool.submit(fn, job) for job in jobs]
+        concurrent.futures.wait(futures)  # all done before an error surfaces: no replica is still mid-backward
+        return [f.result() for f in futures]
 
     def train(self, mode: bool = True) -> None:
         for m, _, _ in self.replicas:

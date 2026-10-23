@@ -314,7 +314,8 @@ class FiboTransformer(nn.Module):
         return torch.stack(torch.meshgrid(axes, indexing="ij"), dim=-1).flatten(0, 2)
 
     def _run(self, block, *args):
-        if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+        if (self.gradient_checkpointing and self.training and torch.is_grad_enabled()
+                and not getattr(block, "keep_activations", False)):  # see rulztrainer.checkpointing
             return checkpoint(block, *args, use_reentrant=False)
         return block(*args)
 

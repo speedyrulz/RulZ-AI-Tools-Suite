@@ -180,7 +180,8 @@ class MOSSImageTransformer(nn.Module):
         return cls(**{k: config[k] for k in cls.CONFIG_KEYS if k in config})
 
     def _run_layer(self, layer, x, rope, mod):
-        if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+        if (self.gradient_checkpointing and self.training and torch.is_grad_enabled()
+                and not getattr(layer, "keep_activations", False)):  # see rulztrainer.checkpointing
             return checkpoint(layer, x, rope, mod, use_reentrant=False)
         return layer(x, rope, mod)
 

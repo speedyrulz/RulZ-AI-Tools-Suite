@@ -96,6 +96,8 @@ class TrainConfig:
     transformer_quant: str = "auto"  # auto (keep file format) | none | int8 | int8_convrot | nvfp4
     text_encoder_quant: str = "auto"  # auto | none | int8 | int8_convrot | nvfp4
     gradient_checkpointing: bool = True
+    checkpoint_keep_blocks: int = -1  # with checkpointing: blocks that keep their activations instead (no recompute);
+    #                                   -1 = as many as the free GPU memory allows (measured), 0 = none, N = the last N
     int8_matmul: bool = True  # int8/int8_convrot layers: W8A8 (int8 activations x int8 weight via torch._int_mm)
     int8_backward: str = "bf16"  # bf16 (exact: grad = grad_out @ W in bf16) | int8 (also quantizes grad_out)
     nvfp4_matmul: bool = True  # nvfp4 layers on Blackwell GPUs (RTX 50): activations to NVFP4, FP4 tensor-core matmul
