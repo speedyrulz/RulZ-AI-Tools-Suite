@@ -102,6 +102,7 @@ class TrainConfig:
     int8_backward: str = "bf16"  # bf16 (exact: grad = grad_out @ W in bf16) | int8 (also quantizes grad_out)
     nvfp4_matmul: bool = True  # nvfp4 layers on Blackwell GPUs (RTX 50): activations to NVFP4, FP4 tensor-core matmul
     #                            (W4A4, backward exact in bf16); off, or on older GPUs: weight dequantized to bf16
+    nvfp4_backward: str = "bf16"  # native nvfp4 layers' grad_x: bf16 (exact) | fp4 (FP4 tensor cores, faster, approx.)
 
     # --- dataset ---
     dataset_dir: str = "datasets/my_dataset"

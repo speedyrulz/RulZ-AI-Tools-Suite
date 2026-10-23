@@ -327,8 +327,9 @@ nvfp4 layers multiply on the **FP4 tensor cores** of Blackwell GPUs (RTX 50, com
 with `nvfp4_matmul: true` (the default): the activations are quantized to NVFP4 by a fused triton kernel (per
 16-value block an e4m3 scale written straight into cuBLAS's swizzled layout, values rounded to e2m1 nearest-even,
 two per byte, plus a per-tensor fp32 scale), and `torch._scaled_mm` multiplies them with the stored NVFP4 weight.
-That is **W4A4**: faster than any other path, but the activations lose precision too. The backward stays exact
-against the stored weight (dequantized to bf16 for grad_x), as the int8 layers' default.
+That is **W4A4**: faster than any other path, but the activations lose precision too. By default the backward
+stays exact against the stored weight (dequantized to bf16 for grad_x), as the int8 layers' default does; an
+opt-in FP4 backward is described below.
 
 GPUs without FP4 tensor cores (RTX 40 and older), `nvfp4_matmul: false`, CPU tensors and K not a multiple of 32
 dequantize instead, now with one fused triton kernel (codes and scales read once, bf16 written directly; bit-identical
@@ -358,6 +359,32 @@ Whole training steps, Krea 2 LoRA (rank 16) in nvfp4 at 1 MP on one RTX 5060 Ti,
 
 Attention, norms and the bf16 backward are the same in all three, so the step gains less than the matmul alone.
 Samples rendered through the native path come out clean.
+
+**FP4 backward (`nvfp4_backward: fp4`, opt-in).** With native FP4 on, grad_x = grad_out @ W can run on the FP4
+tensor cores too. grad_out is quantized to NVFP4 in 16-value blocks along the output axis with stochastic rounding
+(unbiased; its block scales round up, so no value clips or flushes to zero), and the weight is requantized along the
+other axis on the fly (a stored copy would cost 6 GB for Krea 2). Only the gradient flowing back through the frozen
+base weights changes; the LoRA's own gradients stay in full precision. The default stays `bf16` (exact).
+
+Measured on the RTX 5060 Ti, Krea 2 layer shapes on 4113 tokens:
+
+| layer | exact backward | FP4 backward | grad_x error vs exact |
+|---|---|---|---|
+| feed-forward up (6144 -> 16384) | 17.6 ms | 11.4 ms | 17.6% (cosine 0.985) |
+| feed-forward down (16384 -> 6144) | 17.3 ms | 9.8 ms | 17.5% |
+| attention q (6144 -> 6144) | 6.5 ms | 4.6 ms | 17.5% |
+
+On the whole model (one fixed batch, all LoRA gradients at once) the FP4 gradients point the same way as the exact
+ones with cosine 0.99 at sigma 0.2, 0.93-0.96 at 0.5 and 0.97-0.98 at 0.8, and are 1-5% shorter. A 20-step run
+(same setup as above, back to back):
+
+| backward | s/step (steps 5-20) | loss (average over 20 steps) | peak memory |
+|---|---|---|---|
+| bf16 (exact) | 8.73 | 0.0724 | 12.9 GB |
+| **FP4** | **7.93** (-9%) | 0.0724 (every step within 0.0007) | 13.1 GB |
+
+20 steps show that training behaves the same, not what thousands of steps do with noisier gradients. Compare
+samples on your own data before using it for a final run.
 
 ## Training resolutions and resolution step-up
 

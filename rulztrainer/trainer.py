@@ -547,7 +547,7 @@ class Trainer:
         gen = torch.Generator("cpu").manual_seed(cfg.seed)
         self.status.update(stage="resolving model")
         Q.set_int8_defaults(cfg.int8_matmul, cfg.int8_backward)  # every QuantLinear built from here on
-        Q.set_nvfp4_default(cfg.nvfp4_matmul)
+        Q.set_nvfp4_default(cfg.nvfp4_matmul, cfg.nvfp4_backward)
         self.model_dir = self.arch.resolve_for_config(cfg)
         self.arch = detect_arch(cfg, self.model_dir)
         cfg.model_arch = self.arch.name
@@ -561,7 +561,7 @@ class Trainer:
         model = self.arch.get_transformer(cfg, self.model_dir)
         model.gradient_checkpointing = cfg.gradient_checkpointing
         n_quant = Q.configure_int8(model, cfg.int8_matmul, cfg.int8_backward)
-        n_fp4 = Q.configure_nvfp4(model, cfg.nvfp4_matmul)
+        n_fp4 = Q.configure_nvfp4(model, cfg.nvfp4_matmul, cfg.nvfp4_backward)
         if n_quant - n_fp4:
             log.info("%d quantized Linear layers: int8 matmul %s (backward %s)", n_quant - n_fp4,
                      "on" if cfg.int8_matmul else "off", cfg.int8_backward)
@@ -589,7 +589,7 @@ class Trainer:
                 m = self.arch.get_transformer(cfg, self.model_dir, device=dev)
                 m.gradient_checkpointing = cfg.gradient_checkpointing
                 Q.configure_int8(m, cfg.int8_matmul, cfg.int8_backward)
-                Q.configure_nvfp4(m, cfg.nvfp4_matmul)
+                Q.configure_nvfp4(m, cfg.nvfp4_matmul, cfg.nvfp4_backward)
                 inj = lora_mod.inject_lora(m, cfg.lora_rank, cfg.lora_alpha, cfg.lora_targets,
                                            include_text_embedder=cfg.train_text_embedder, dropout=cfg.lora_dropout,
                                            blocks=blocks, names=self._lora_names(m, blocks))
@@ -1092,7 +1092,8 @@ class Trainer:
         native = [d for d in self.devices if Q.fp4_tensor_cores(d)]
         other = [d for d in self.devices if d not in native]
         if native:
-            log.info("%d nvfp4 layers: native FP4 matmul (W4A4, exact bf16 backward) on %s", n, ", ".join(native))
+            log.info("%d nvfp4 layers: native FP4 matmul (W4A4, %s backward) on %s", n,
+                     "FP4" if self.cfg.nvfp4_backward == "fp4" else "exact bf16", ", ".join(native))
         if other:
             log.info("%d nvfp4 layers dequantize to bf16 on %s (no FP4 tensor cores)", n, ", ".join(other))
             capable = [f"cuda:{i} ({torch.cuda.get_device_name(i)})" for i in range(torch.cuda.device_count())

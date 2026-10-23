@@ -411,3 +411,51 @@ def test_nvfp4_native_forward_backward():
     assert torch.equal(x.grad, want)
     ql.nvfp4_matmul = False
     assert not ql.uses_native_fp4(x)
+
+
+@fp4_cuda
+def test_nvfp4_stochastic_rounding_is_unbiased():
+    """Stochastic rounding: block scales round up (no value clips), every value lands on one of its two e2m1
+    neighbours, and the mean over seeds is the value (round to nearest is biased toward the grid points)."""
+    dev = _fp4_devices[0]
+    torch.manual_seed(3)
+    x = (torch.randn(64, 256) * 2).to(dev, torch.bfloat16)
+    x[5] *= 1e-5  # blocks whose scale is an e4m3 subnormal, or rounds to 0 to nearest
+    q, s, g = Q._quantize_act_nvfp4_triton(x)
+    nearest = Q.dequantize_nvfp4(q, s, g, (64, 256), torch.float32)
+    step = x.float().abs().amax(dim=1, keepdim=True) * 0.4  # wider than any e2m1 gap at this scale
+    exact = (x.float().reshape(64, 16, 16).abs().amax(-1) / 6 / g).clamp(max=448)
+    e4m3 = torch.arange(127, dtype=torch.uint8).view(torch.float8_e4m3fn).float().to(dev)  # all finite, ascending
+    acc = torch.zeros(64, 256, device=dev)
+    n = 400
+    for seed in range(n):
+        qs, ss, gs = Q._quantize_act_nvfp4_triton(x, stochastic=True, seed=seed)
+        got = Q.from_blocked(ss, 128, 16)[:64].float()
+        assert torch.equal(got, e4m3[torch.searchsorted(e4m3, exact)]) and torch.equal(gs, g)  # smallest >= exact
+        v = Q.dequantize_nvfp4(qs, ss, gs, (64, 256), torch.float32)
+        assert ((v - x.float()).abs() <= step + 1e-6).all()
+        acc += v
+    mean_err = ((acc / n) - x.float()).norm() / x.float().norm()
+    rtn_err = (nearest - x.float()).norm() / x.float().norm()
+    assert mean_err < rtn_err / 3, (mean_err.item(), rtn_err.item())
+
+
+@fp4_cuda
+def test_nvfp4_fp4_backward_close_to_exact():
+    """nvfp4_backward="fp4": grad_x on the FP4 tensor cores stays close to the exact bf16 backward (same forward)."""
+    dev = _fp4_devices[0]
+    torch.manual_seed(4)
+    w = (torch.randn(1000, 3072) * 0.02).to(dev)
+    qw = Q.quantize_weight(w, "nvfp4")
+    ql = Q.QuantLinear(qw, None, torch.bfloat16)
+    Q.configure_nvfp4(torch.nn.Sequential(ql), True, "fp4")
+    assert ql.nvfp4_backward == "fp4"
+    x = torch.randn(2, 77, 3072, device=dev, dtype=torch.bfloat16, requires_grad=True)
+    g = torch.randn(2, 77, 1000, device=dev, dtype=torch.bfloat16)
+    ql(x).backward(g)
+    exact = (g.reshape(-1, 1000) @ qw.dequantize(torch.bfloat16)).float().reshape(x.shape)
+    rel = ((x.grad.float() - exact).norm() / exact.norm()).item()
+    cos = torch.nn.functional.cosine_similarity(x.grad.float().flatten(), exact.flatten(), dim=0).item()
+    assert rel < 0.3 and cos > 0.95, (rel, cos)
+    with pytest.raises(ValueError):
+        Q.configure_nvfp4(torch.nn.Sequential(ql), True, "int4")

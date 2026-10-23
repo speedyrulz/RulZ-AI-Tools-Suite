@@ -476,7 +476,7 @@ class Form:
             gradient_checkpointing=bool(v("gradient_checkpointing")),
             checkpoint_keep_blocks=int(v("checkpoint_keep_blocks")),
             int8_matmul=bool(v("int8_matmul")), int8_backward=v("int8_backward"),
-            nvfp4_matmul=bool(v("nvfp4_matmul")),
+            nvfp4_matmul=bool(v("nvfp4_matmul")), nvfp4_backward=v("nvfp4_backward"),
             dataset_dir=s("dataset_dir"), resolutions=sorted(float(x) for x in (v("resolutions") or [1.0])),
             resolution_step_up=bool(v("resolution_step_up")), step_up_patience=int(v("step_up_patience")),
             step_up_stop_patience=int(v("step_up_stop_patience")),
@@ -2208,6 +2208,18 @@ def build_page(local: bool = True):
                                              "random data). The backward stays exact in bf16. GPUs without FP4 tensor "
                                              "cores (RTX 40 and older) always dequantize; pick the RTX 50 card as the "
                                              "training GPU to use it.")
+                                w["nvfp4_backward"] = ui.select({"bf16": "bf16 (exact)",
+                                                                 "fp4": "FP4 (faster, approximate)"},
+                                                                value=d.nvfp4_backward, label="nvfp4 backward") \
+                                    .classes("w-56") \
+                                    .bind_visibility_from(w["nvfp4_matmul"], "value", lambda x: bool(x)) \
+                                    .tooltip("Native nvfp4 layers only. bf16: grad_x = grad_out @ W with the weight "
+                                             "expanded to bf16 (exact). FP4: grad_out is quantized to NVFP4 with "
+                                             "stochastic rounding (unbiased) and multiplied with the weight requantized "
+                                             "along the other axis, on the FP4 tensor cores. Krea 2 on an RTX 5060 Ti: "
+                                             "9% faster per step, LoRA gradients at cosine 0.93-0.99 to the exact "
+                                             "ones, same loss over 20 steps. Noisier gradients: compare samples before "
+                                             "a final run.")
 
                     # ---- Dataset
                     with section("Dataset", "Images, captions and resolution", "photo_library") as sec:
@@ -3233,7 +3245,9 @@ is widened to bf16 only for the gradient), `int8` also quantizes the gradient (f
 *nvfp4 layers compute* (Model, Advanced): on RTX 50 / Blackwell GPUs `native FP4` quantizes the activations to NVFP4
 as well and multiplies on the FP4 tensor cores (about 4x faster than a bf16 matmul, W4A4: more forward error than
 dequantizing), with an exact bf16 backward. GPUs without FP4 tensor cores always dequantize (a fused kernel). Pick
-the RTX 50 card as the training GPU to use it; the log says which GPUs run native.
+the RTX 50 card as the training GPU to use it; the log says which GPUs run native. *nvfp4 backward* `FP4` (opt-in)
+runs the gradient through those layers on the FP4 tensor cores too: about 9% faster per step on Krea 2, with
+noisier gradients (cosine 0.93-0.99 to the exact ones); `bf16` stays exact.
 
 ## Training resolutions
 *Training resolutions* takes one or more megapixel values (1 MP = 1024x1024); each image is bucketed to every

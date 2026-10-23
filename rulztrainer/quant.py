@@ -22,6 +22,7 @@ rotation, two/three-pass elementwise). The choice is made once at import (RULZ_W
 """
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import math
@@ -38,6 +39,8 @@ INT8_BACKWARDS = ("bf16", "int8")
 DEFAULT_INT8_MATMUL = True
 DEFAULT_INT8_BACKWARD = "bf16"
 DEFAULT_NVFP4_MATMUL = True  # nvfp4 layers multiply on FP4 tensor cores where the GPU has them (set_nvfp4_default)
+NVFP4_BACKWARDS = ("bf16", "fp4")
+DEFAULT_NVFP4_BACKWARD = "bf16"  # native nvfp4 layers: exact bf16 backward, or "fp4" (FP4 tensor cores, approximate)
 _W8A8_WARNED = False
 F4_E2M1_MAX = 6.0
 F8_E4M3_MAX = 448.0
@@ -259,18 +262,26 @@ def set_int8_defaults(int8_matmul: bool, int8_backward: str = "bf16") -> None:
     DEFAULT_INT8_BACKWARD = int8_backward
 
 
-def set_nvfp4_default(native: bool) -> None:
-    """Default for nvfp4 QuantLinear layers created afterwards: native FP4 matmul (where supported) or dequantize."""
-    global DEFAULT_NVFP4_MATMUL
+def set_nvfp4_default(native: bool, backward: str = "bf16") -> None:
+    """Defaults for nvfp4 QuantLinear layers created afterwards: native FP4 matmul (where supported) or dequantize,
+    and the native layers' backward (bf16 exact | fp4)."""
+    global DEFAULT_NVFP4_MATMUL, DEFAULT_NVFP4_BACKWARD
+    if backward not in NVFP4_BACKWARDS:
+        raise ValueError(f"nvfp4_backward must be one of {NVFP4_BACKWARDS}, got {backward!r}")
     DEFAULT_NVFP4_MATMUL = bool(native)
+    DEFAULT_NVFP4_BACKWARD = backward
 
 
-def configure_nvfp4(model: nn.Module, native: bool) -> int:
-    """Set native FP4 matmul on every nvfp4 QuantLinear in `model`. Returns the number of nvfp4 layers."""
+def configure_nvfp4(model: nn.Module, native: bool, backward: str = "bf16") -> int:
+    """Set native FP4 matmul and its backward on every nvfp4 QuantLinear in `model`. Returns the number of nvfp4
+    layers."""
+    if backward not in NVFP4_BACKWARDS:
+        raise ValueError(f"nvfp4_backward must be one of {NVFP4_BACKWARDS}, got {backward!r}")
     n = 0
     for m in model.modules():
         if isinstance(m, QuantLinear) and m.fmt == "nvfp4":
             m.nvfp4_matmul = bool(native)
+            m.nvfp4_backward = backward
             n += 1
     return n
 
@@ -568,10 +579,18 @@ if HAS_TRITON:
         return out
 
     @triton.jit
-    def _nvfp4_quant_act_kernel(x_ptr, q_ptr, s_ptr, g_ptr, M, K, n_col_blocks, stride_x, stride_q,
-                                BLOCK_M: tl.constexpr, GROUPS: tl.constexpr):
+    def _e2m1_value(code):
+        """Magnitude of an e2m1 code 0..7: 0, 0.5, 1, 1.5, 2, 3, 4, 6."""
+        return tl.where(code < 4, code * 0.5,
+                        tl.where(code == 4, 2.0, tl.where(code == 5, 3.0, tl.where(code == 6, 4.0, 6.0))))
+
+    @triton.jit(do_not_specialize=["seed"])  # a new seed every call must not mean a new compiled kernel
+    def _nvfp4_quant_act_kernel(x_ptr, q_ptr, s_ptr, g_ptr, M, K, n_col_blocks, stride_x, stride_q, seed,
+                                BLOCK_M: tl.constexpr, GROUPS: tl.constexpr, STOCHASTIC: tl.constexpr):
         """NVFP4 of activations, as quantize_nvfp4 rounds: per 16-value block amax / 6 / g -> e4m3 scale, values /
-        (g * scale) -> nearest e2m1 (ties to even), packed two per byte (first in the high nibble)."""
+        (g * scale) -> nearest e2m1 (ties to even), packed two per byte (first in the high nibble).
+        STOCHASTIC: the value rounds to the lower or upper e2m1 neighbour with probability by distance (unbiased:
+        the expectation is the value itself), for gradients."""
         rows = (tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
         cols = tl.program_id(1) * (GROUPS * 16) + tl.arange(0, GROUPS * 16)
         mask = (rows[:, None] < M) & (cols[None, :] < K)
@@ -581,16 +600,34 @@ if HAS_TRITON:
         amax = tl.max(tl.abs(x3), axis=2)
         scaled = tl.minimum(_libdevice.div_rn(_libdevice.div_rn(amax, 6.0), g), 448.0)
         s8 = scaled.to(tl.float8e4nv)
+        if STOCHASTIC:  # scale rounded up, never down: no value clips at 6 or flushes to 0, both biased to zero
+            sf = s8.to(tl.float32)
+            # the next e4m3 value: 3 mantissa bits per binade, 2^-9 apart among the subnormals (log2(0) = -inf)
+            step = tl.maximum(_libdevice.exp2(tl.floor(_libdevice.log2(sf)) - 3.0), 0.001953125)
+            s8 = tl.where(sf < scaled, sf + step, sf).to(tl.float8e4nv)
         total = g * s8.to(tl.float32)
         safe = tl.where(total == 0.0, 1.0, total)
         v = _libdevice.div_rn(x3, safe[:, :, None])
         v = tl.minimum(tl.maximum(v, -6.0), 6.0)
         v = tl.where((total == 0.0)[:, :, None], 0.0, v)
         a = tl.abs(v)
-        code = ((a > 0.25).to(tl.int32) + (a > 0.75).to(tl.int32) + (a > 1.25).to(tl.int32)
-                + (a > 1.75).to(tl.int32) + (a > 2.5).to(tl.int32) + (a > 3.5).to(tl.int32) + (a > 5.0).to(tl.int32))
-        tie = (a == 0.25) | (a == 0.75) | (a == 1.25) | (a == 1.75) | (a == 2.5) | (a == 3.5) | (a == 5.0)
-        code = tl.where(tie & ((code % 2) == 1), code + 1, code)
+        if STOCHASTIC:
+            lo_code = ((a >= 0.5).to(tl.int32) + (a >= 1.0).to(tl.int32) + (a >= 1.5).to(tl.int32)
+                       + (a >= 2.0).to(tl.int32) + (a >= 3.0).to(tl.int32) + (a >= 4.0).to(tl.int32)
+                       + (a >= 6.0).to(tl.int32))
+            hi_code = tl.minimum(lo_code + 1, 7)
+            lo = _e2m1_value(lo_code)
+            span = _e2m1_value(hi_code) - lo
+            p = tl.where(span > 0.0, (a - lo) / tl.where(span > 0.0, span, 1.0), 0.0)
+            offs = rows[:, None] * K + cols[None, :]
+            r = tl.reshape(tl.rand(seed, offs.to(tl.int32)), (BLOCK_M, GROUPS, 16))
+            code = tl.where(r < p, hi_code, lo_code)
+        else:
+            code = ((a > 0.25).to(tl.int32) + (a > 0.75).to(tl.int32) + (a > 1.25).to(tl.int32)
+                    + (a > 1.75).to(tl.int32) + (a > 2.5).to(tl.int32) + (a > 3.5).to(tl.int32)
+                    + (a > 5.0).to(tl.int32))
+            tie = (a == 0.25) | (a == 0.75) | (a == 1.25) | (a == 1.75) | (a == 2.5) | (a == 3.5) | (a == 5.0)
+            code = tl.where(tie & ((code % 2) == 1), code + 1, code)
         code = tl.minimum(code, 7) | tl.where(v < 0.0, 8, 0)
         hi, lo = tl.split(tl.reshape(code, (BLOCK_M, GROUPS * 8, 2)))
         packed = ((hi << 4) | lo).to(tl.uint8)
@@ -602,7 +639,7 @@ if HAS_TRITON:
                  mask=(rows[:, None] < M) & (gcols[None, :] < K // 16))
 
     @torch.compiler.disable
-    def _quantize_act_nvfp4_triton(x: torch.Tensor):
+    def _quantize_act_nvfp4_triton(x: torch.Tensor, stochastic: bool = False, seed: int = 0):
         if x.stride(1) != 1:
             x = x.contiguous()
         m, k = x.shape
@@ -616,8 +653,8 @@ if HAS_TRITON:
         bm, groups = 16, 8
         with _on_device(x.device):
             _nvfp4_quant_act_kernel[(_ceil_div(m, bm), _ceil_div(k // 16, groups))](
-                x, q, scales, g, m, k, n_col_blocks, x.stride(0), q.stride(0), BLOCK_M=bm, GROUPS=groups,
-                num_warps=4)
+                x, q, scales, g, m, k, n_col_blocks, x.stride(0), q.stride(0), seed, BLOCK_M=bm, GROUPS=groups,
+                STOCHASTIC=stochastic, num_warps=4)
         return q, scales, g
 
 _E2M1_LUT_ON: dict = {}  # the e2m1 value table per CUDA device, for the dequantize kernel
@@ -810,14 +847,37 @@ def nvfp4_forward(x2d: torch.Tensor, qw: "QuantWeight", bias: torch.Tensor | Non
     return y
 
 
+_SR_CALLS = itertools.count(1)  # seeds for the stochastic rounding of gradients (own stream: no global RNG use)
+
+
+def nvfp4_backward_fp4(g2d: torch.Tensor, qw: "QuantWeight") -> torch.Tensor:
+    """grad_x [M, K] = grad_out [M, N] @ W [N, K] on the FP4 tensor cores. Both operands need their 16-blocks along N:
+    grad_out is quantized per row with stochastic rounding (unbiased), and W is requantized transposed (dequantized,
+    W^T [K, N] quantized per row, round to nearest), on the fly: a stored transposed copy would cost another half
+    byte per weight."""
+    k = qw.orig_shape[1]
+    wt_q, wt_s, wt_g = _quantize_act_nvfp4_triton(qw.dequantize(g2d.dtype).t().contiguous())
+    seed = (next(_SR_CALLS) * 2654435761) % 2147483647
+    g_q, g_s, g_g = _quantize_act_nvfp4_triton(g2d, stochastic=True, seed=seed)
+    gx = torch._scaled_mm(g_q.view(torch.float4_e2m1fn_x2), wt_q.view(torch.float4_e2m1fn_x2).t(),
+                          scale_a=g_s.view(-1), scale_b=wt_s.view(-1), out_dtype=g2d.dtype)
+    return gx[:, :k] * (g_g * wt_g).to(gx.dtype)
+
+
+def nvfp4_backward_fp4_supported(g2d: torch.Tensor, qw: "QuantWeight") -> bool:
+    return USE_TRITON and fp4_tensor_cores(g2d.device) and g2d.shape[1] % 32 == 0 and qw.orig_shape[1] % 16 == 0
+
+
 class _NVFP4LinearFn(torch.autograd.Function):
-    """Forward on the FP4 tensor cores (W4A4); backward exact against the stored weight (dequantized to the grad's
-    dtype by the fused kernel), as the int8 layers' default bf16 backward."""
+    """Forward on the FP4 tensor cores (W4A4). Backward "bf16": exact against the stored weight (dequantized to the
+    grad's dtype by the fused kernel), as the int8 layers' default; "fp4": on the FP4 tensor cores too
+    (nvfp4_backward_fp4), faster but approximate."""
 
     @staticmethod
-    def forward(ctx, x, bias, qw: QuantWeight):
+    def forward(ctx, x, bias, qw: QuantWeight, backward_mode: str = "bf16"):
         global _NVFP4_WARNED
         ctx.qw = qw
+        ctx.backward_mode = backward_mode
         x2d = x.reshape(-1, x.shape[-1])
         try:
             y = nvfp4_forward(x2d, qw, bias)
@@ -831,7 +891,20 @@ class _NVFP4LinearFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        return grad_out @ ctx.qw.dequantize(grad_out.dtype), None, None
+        global _NVFP4_WARNED
+        qw = ctx.qw
+        if ctx.backward_mode == "fp4":
+            g2d = grad_out.reshape(-1, grad_out.shape[-1])
+            if nvfp4_backward_fp4_supported(g2d, qw):
+                try:
+                    gx = nvfp4_backward_fp4(g2d, qw)
+                    return gx.reshape(*grad_out.shape[:-1], gx.shape[-1]), None, None, None
+                except Exception as e:  # noqa: BLE001
+                    if not _NVFP4_WARNED:
+                        _NVFP4_WARNED = True
+                        log.warning("fp4 backward failed (%s: %s); exact bf16 backward instead for this call",
+                                    type(e).__name__, e)
+        return grad_out @ qw.dequantize(grad_out.dtype), None, None, None
 
 
 class _QuantLinearFn(torch.autograd.Function):
@@ -867,6 +940,7 @@ class QuantLinear(nn.Module):
         self.int8_matmul = DEFAULT_INT8_MATMUL if int8_matmul is None else bool(int8_matmul)
         self.int8_backward = DEFAULT_INT8_BACKWARD if int8_backward is None else int8_backward
         self.nvfp4_matmul = DEFAULT_NVFP4_MATMUL
+        self.nvfp4_backward = DEFAULT_NVFP4_BACKWARD
         if self.int8_backward not in INT8_BACKWARDS:
             raise ValueError(f"int8_backward must be one of {INT8_BACKWARDS}, got {self.int8_backward!r}")
         self.register_buffer("qdata", qw.qdata)
@@ -900,7 +974,7 @@ class QuantLinear(nn.Module):
         if self.int8_matmul and w8a8_supported(x, qw):
             return _W8A8LinearFn.apply(x, self.bias, qw, self.int8_backward)
         if self.nvfp4_matmul and nvfp4_native_supported(x, qw):
-            return _NVFP4LinearFn.apply(x, self.bias, qw)
+            return _NVFP4LinearFn.apply(x, self.bias, qw, self.nvfp4_backward)
         return _QuantLinearFn.apply(x, self.bias, qw)
 
     def extra_repr(self):
