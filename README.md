@@ -2,7 +2,12 @@
 
 A Windows app that finds your favorite image by single-elimination tournament. It shows two images at a time. You keep one, and the other is moved to a Losers folder (or recycled, deleted, or left alone). This repeats until one champion is left.
 
-![RulZ](assets/logo-light.png)
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo.png">
+    <img src="assets/logo-light.png" alt="RulZ" width="420">
+  </picture>
+</p>
 
 ## Run
 
