@@ -30,12 +30,28 @@ CUSTOM = "Custom path / repo id"
 HF_SOURCE = "Hugging Face repo / diffusers folder"
 FILE_SOURCE = "Single safetensors files (ComfyUI)"
 TARGETS = ["q", "k", "v", "o", "ffn_up_gate", "ffn_down"]
-FIBO_TARGETS = ["cross_attn", "adaln", "refiner", "perceiver", "embed"]  # FIBO 2.0 only (see rulztrainer.archs)
-N_BLOCKS_MAX = 44  # MOSS-Image has 42 blocks, FIBO 2.0 has 44
+# model-specific LoRA target groups (see rulztrainer.archs): name -> (families that have it, tooltip)
+EXTRA_TARGETS = {
+    "cross_attn": (("fibo2",), "text cross-attention in the 5 injection blocks"),
+    "adaln": (("fibo2",), "per-block modulation Linear"),
+    "refiner": (("fibo2",), "the 2 noise-refiner blocks"),
+    "perceiver": (("fibo2",), "the gist-token resampler"),
+    "attn_gate": (("krea2",), "the sigmoid output gate of every attention (Krea's own LoRAs train it too)"),
+    "text_fusion": (("krea2",), "the text fusion blocks that mix the 12 text encoder layers"),
+    "embed": (("fibo2", "krea2"), "image / text / timestep embedders and the final layer"),
+}
+N_BLOCKS = {"moss_image": 42, "fibo2": 44, "krea2": 28}
+N_BLOCKS_MAX = max(N_BLOCKS.values())
+
+
+def preset_arch(preset: str, model_path: str = "") -> str:
+    """The model family behind a preset name (or a custom path / repo id)."""
+    path = (model_path or "") if preset == CUSTOM else MODEL_PRESETS.get(preset, preset or "")
+    return TrainConfig(model_path=path).arch_name()
 
 
 def is_fibo_preset(preset: str, model_path: str = "") -> bool:
-    return "FIBO" in (preset or "") or (preset == CUSTOM and "fibo" in (model_path or "").lower())
+    return preset_arch(preset, model_path) == "fibo2"
 QUANTS = ["auto", "none", "int8", "int8_convrot", "nvfp4"]
 MP_OPTIONS = {mp: f"{mp:g} MP ({mp_to_side(mp)}^2)" for mp in MEGAPIXEL_CHOICES}
 SAFETENSORS = [("safetensors", "*.safetensors"), ("all files", "*.*")]
@@ -466,7 +482,7 @@ class Form:
             trigger_word=s("trigger_word"), caption_dropout=float(v("caption_dropout")),
             max_token_length=int(v("max_token_length")), recache=bool(v("recache")),
             lora_rank=int(v("lora_rank")), lora_alpha=float(v("lora_alpha")),
-            lora_targets=[t for t in TARGETS + FIBO_TARGETS if self.w.get(f"target_{t}") is not None
+            lora_targets=[t for t in TARGETS + list(EXTRA_TARGETS) if self.w.get(f"target_{t}") is not None
                           and self.w[f"target_{t}"].value],
             train_text_embedder=bool(v("train_text_embedder")), resume_from=s("resume_from"),
             lora_blocks=s("lora_blocks"),
@@ -533,7 +549,7 @@ class Form:
         values = {**cfg.to_dict(), "model_preset": preset, "sample_prompts": "\n".join(cfg.sample_prompts),
                   "face_refs": "\n".join(cfg.face_refs), "body_refs": "\n".join(cfg.body_refs),
                   "model_source": FILE_SOURCE if cfg.model_source == "files" else HF_SOURCE}
-        for t in TARGETS + FIBO_TARGETS:
+        for t in TARGETS + list(EXTRA_TARGETS):
             values[f"target_{t}"] = t in cfg.lora_targets
         if not cfg.resolutions:  # legacy single `resolution`: snap to the nearest megapixel choice
             values["resolutions"] = [min(MEGAPIXEL_CHOICES, key=lambda m: abs(m - side_to_mp(cfg.resolution)))]
@@ -1115,6 +1131,11 @@ MODEL_NOTES = {
                          "support yet."),
     "FIBO-2.0-edit-turbo": ("Not for training", "The 4-step distilled edit model. Train on FIBO-2.0-dev instead: its "
                                                 "LoRAs load onto Edit Turbo."),
+    "Krea-2-Raw": ("", "Krea 2 (12B), the base checkpoint Krea publishes for training. Gated: accept its license on "
+                       "Hugging Face and log in first. Its LoRAs are meant for Krea 2 Turbo, like Krea's own. About 35 GB "
+                       "to download; needs a 24 GB card or two 16 GB cards for int8 (one 16 GB card: nvfp4)."),
+    "Krea-2-Turbo": ("Not for training", "The 8-step distilled Krea 2. Train on Krea-2-Raw and use Turbo to preview "
+                                         "and generate with the LoRA."),
 }
 
 
@@ -1122,11 +1143,16 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     """Recommended (value, reason) per setting key, from the goal, the GPUs (nvidia-smi rows) and the dataset scan."""
     r: dict[str, tuple] = {}
     fibo = cfg.arch_name() == "fibo2"
+    krea = cfg.arch_name() == "krea2"
+    krea_turbo = krea and "krea-2-turbo" in (cfg.sample_model_path or "").lower()
     character = goal == "character"
     vram = min(g["total"] for g in gpus) / 1024 if gpus else None
     gpu_name = "your smallest GPU" if len(gpus) > 1 else "your GPU"
     # hardware
-    if len(gpus) >= 2:
+    if len(gpus) >= 2 and krea and vram is not None and vram < 22:
+        r["multi_gpu"] = ("model_split", f"{len(gpus)} GPUs of {vram:.0f} GB: split, the 12B model trains in int8; a "
+                                         "full copy on each card would only fit in nvfp4")
+    elif len(gpus) >= 2:
         r["multi_gpu"] = ("data_parallel", f"{len(gpus)} GPUs found: a model copy on each trains about 1.7-2x faster")
     elif gpus:
         r["multi_gpu"] = ("off", "one GPU found")
@@ -1136,6 +1162,9 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     elif vram is not None:
         if fibo:
             r["transformer_quant"] = ("auto", "FIBO switches itself to int8 on GPUs under 22 GB")
+        elif krea:
+            r["transformer_quant"] = ("auto", "Krea 2 picks for the memory it runs in: int8 (13.5 GB) from 22 GB, "
+                                              "e.g. two 16 GB cards in model split, else nvfp4 (8 GB); bf16 is 25 GB")
         elif vram >= 22:
             r["transformer_quant"] = ("auto", f"{gpu_name} has {vram:.0f} GB, so the 10 GB bf16 model fits as it is")
         elif vram >= 11:
@@ -1144,7 +1173,7 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
         else:
             r["transformer_quant"] = ("nvfp4", f"{gpu_name} has {vram:.0f} GB: nvfp4 quarters the model so it fits "
                                                "(slower, fp4 weights are expanded every step)")
-        te_gb = 9 if fibo else 19
+        te_gb = 9 if fibo or krea else 19
         if vram >= te_gb + 4:
             r["text_encoder_quant"] = ("auto", f"the {te_gb} GB text encoder fits on {gpu_name} as it is")
         else:
@@ -1192,9 +1221,20 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     every = max(100, int(round(total / 8 / 50)) * 50)
     r["save_every"] = (every, f"about 8 checkpoints over {total} steps to choose from afterwards")
     r["sample_every"] = (every, "a sample set at every checkpoint shows which one to keep")
-    if cfg.turbo_lora:
+    if krea:
+        r["sample_model_path"] = ("krea/Krea-2-Turbo", "Krea trains LoRAs on Raw and uses them on Turbo: previews and "
+                                                       "probes in 8 steps without guidance instead of 28+ with it "
+                                                       "(Turbo is gated separately: accept its license on Hugging "
+                                                       "Face too; about 35 GB)")
+    if krea_turbo:
+        r["sample_steps"] = (8, "Krea 2 Turbo is an 8-step distill")
+        r["sample_cfg"] = (1.0, "Turbo samples without guidance")
+    elif cfg.turbo_lora:
         r["sample_steps"] = (8, "most turbo LoRAs are 8-step distills; match yours")
         r["sample_cfg"] = (1.0, "distilled turbo LoRAs sample without guidance")
+    elif krea:
+        r["sample_steps"] = (28, "Krea samples Raw with 52 steps; 28 is enough for previews")
+        r["sample_cfg"] = (4.5, "Krea's guidance 3.5 for Raw, in this trainer's convention (1 = off)")
     elif fibo:
         r["sample_steps"] = (30, "Bria samples dev at 50 steps; 20-30 is plenty for previews")
         r["sample_cfg"] = (5.0, "Bria's guidance scale for FIBO 2.0 dev")
@@ -1203,9 +1243,9 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
         r["sample_cfg"] = (3.0, "the reference MOSS-Image guidance scale")
     if character:
         r["probe_every"] = (25, "frequent quick checks give the best-checkpoint and early-stop decisions enough points")
-        if cfg.turbo_lora:
-            r["probe_steps"] = (8, "fast probes with the turbo LoRA")
-            r["probe_cfg"] = (1.0, "turbo LoRAs sample without guidance")
+        if cfg.turbo_lora or krea_turbo:
+            r["probe_steps"] = (8, "fast probes with the turbo model" if krea_turbo else "fast probes with the turbo LoRA")
+            r["probe_cfg"] = (1.0, "turbo models sample without guidance")
         else:
             r["probe_steps"] = (r["sample_steps"][0], "without a turbo LoRA a probe needs the full sampler steps")
             r["probe_cfg"] = (r["sample_cfg"][0], "without a turbo LoRA a probe needs normal guidance")
@@ -1233,7 +1273,10 @@ def review_issues(cfg: TrainConfig, goal: str | None, data: dict | None, n_gpus:
         cfg.validate()
     except ValueError as e:
         out.append(("error", str(e)))
-    if cfg.model_source == "files":
+    if cfg.model_source == "files" and cfg.arch_name() != "moss_image":
+        out.append(("error", "Single safetensors files are supported for MOSS-Image only: pick the Hugging Face source "
+                             "for this model."))
+    elif cfg.model_source == "files":
         for key, label in (("transformer_file", "Diffusion model"), ("text_encoder_file", "Text encoder"),
                            ("vae_file", "VAE")):
             if getattr(cfg, key) and not Path(getattr(cfg, key)).is_file():
@@ -1241,6 +1284,14 @@ def review_issues(cfg: TrainConfig, goal: str | None, data: dict | None, n_gpus:
     elif "edit-turbo" in cfg.model_path.lower():
         out.append(("warning", "FIBO-2.0-edit-turbo is a distilled model. Train on FIBO-2.0-dev: its LoRAs load "
                                "onto Edit Turbo."))
+    elif "krea-2-turbo" in cfg.model_path.lower():
+        out.append(("warning", "Krea-2-Turbo is a distilled model. Train on Krea-2-Raw and set Turbo as the sampling "
+                               "model: LoRAs trained on Raw are meant for Turbo."))
+    elif cfg.arch_name() == "krea2":
+        out.append(("info", "Krea 2 is gated: accept its license on Hugging Face and log in with hf auth login before "
+                            "the first download." + (" Krea-2-Turbo (the sampling model) has a gate of its own: accept "
+                                                     "its license as well." if "krea-2-turbo" in
+                                                     (cfg.sample_model_path or "").lower() else "")))
     elif cfg.arch_name() == "fibo2":
         out.append(("info", "FIBO 2.0 is gated: accept its terms on Hugging Face and log in with hf auth login "
                             "before the first download."))
@@ -1250,7 +1301,8 @@ def review_issues(cfg: TrainConfig, goal: str | None, data: dict | None, n_gpus:
         if not (cfg.face_refs or cfg.body_refs):
             out.append(("warning", "No face or body references: likeness scores, the best checkpoint and early stop "
                                    "need them (Dataset step)."))
-        elif cfg.probe_every > 0 and not cfg.turbo_lora and cfg.probe_steps <= 10:
+        elif (cfg.probe_every > 0 and cfg.probe_steps <= 10
+              and not (cfg.turbo_lora or "turbo" in (cfg.sample_model_path or "").lower())):
             out.append(("warning", f"Probes render in {cfg.probe_steps} steps without a turbo LoRA, so they come out "
                                    "unfinished and their likeness scores mean little. Set a turbo LoRA or raise the "
                                    "probe steps (Samples step)."))
@@ -1745,8 +1797,9 @@ class Wizard:
     def step_samples(self):
         self.heading("Checkpoints and preview images", "What gets saved along the way, and the pictures that show "
                                                        "how training is going.")
-        self.apply_bar(["save_every", "sample_every", "sample_steps", "sample_cfg", "probe_every", "probe_steps",
-                        "probe_cfg", "probe_face_prompt", "probe_body_prompt"])
+        # the sampling model first: the step and guidance recommendations depend on it
+        self.apply_bar(["sample_model_path", "save_every", "sample_every", "sample_steps", "sample_cfg", "probe_every",
+                        "probe_steps", "probe_cfg", "probe_face_prompt", "probe_body_prompt"])
         with self.setting("save_every", "Save a checkpoint every",
                           "Steps between saved LoRAs (output/<job>/<job>_<step>.safetensors). Several of them let you "
                           "pick the last one before it started to overfit."):
@@ -1761,10 +1814,17 @@ class Wizard:
                           "carries over to new situations."):
             self.bind(ui.textarea("Sample prompts (one per line)"), "sample_prompts").classes("w-full")
             ui.button("Suggest prompts", icon="lightbulb", on_click=self.suggest).props("flat")
+        is_krea = ("model_preset", lambda p: preset_arch(p, self.w["model_path"].value) == "krea2")
+        with self.setting("sample_model_path", "Preview with Krea 2 Turbo",
+                          "Renders previews and probes with Krea-2-Turbo carrying your LoRA, while training stays on "
+                          "Raw. That is how Krea uses LoRAs trained on Raw, and Turbo needs 8 steps without guidance "
+                          "where Raw needs 28 or more with it. Empty = preview on Raw.", show_if=is_krea):
+            self.bind(ui.input("Sampling model (repo id or folder)"), "sample_model_path").classes("w-full")
         with self.setting(None, "Turbo LoRA (optional)",
                           "A step-distilled LoRA (for example an 8-step DMD distill of MOSS-Image-Base), used only "
                           "while rendering samples and probes, never in training. Previews then take seconds; set the "
-                          "steps and guidance below to match it."):
+                          "steps and guidance below to match it.",
+                          show_if=("model_preset", lambda p: preset_arch(p, self.w["model_path"].value) != "krea2")):
             self.bind(path_field("Turbo LoRA", "file", width="w-full"), "turbo_lora")
         with self.setting("sample_steps", "Sampling steps", "Denoising steps per preview image. More is slower and "
                                                             "a little cleaner."):
@@ -1891,7 +1951,7 @@ def build_page(local: bool = True):
         with ui.row().classes("rz-header-row w-full items-center no-wrap gap-2"):
             ui.element("img").props('src="/assets/logo_dark.png" alt="Rulz"').classes("rz-logo")
             ui.label("TRAINER").classes("rz-wordmark")
-            ui.label("LoRA training for MOSS-Image and Bria FIBO 2.0").classes("rz-tagline gt-sm")
+            ui.label("LoRA training for MOSS-Image, Bria FIBO 2.0 and Krea 2").classes("rz-tagline gt-sm")
             ui.space()
             with ui.row().classes("rz-pill items-center gap-2 no-wrap") as pill:
                 pill_dot = ui.element("span").classes("rz-dot")
@@ -2247,18 +2307,14 @@ def build_page(local: bool = True):
                         with ui.row().classes("w-full items-center gap-1"):
                             for t in TARGETS:
                                 w[f"target_{t}"] = ui.checkbox(t, value=t in d.lora_targets)
-                            for t in FIBO_TARGETS:
+                            for t, (families, tip) in EXTRA_TARGETS.items():
                                 w[f"target_{t}"] = ui.checkbox(t, value=t in d.lora_targets) \
                                     .bind_visibility_from(w["model_preset"], "value",
-                                                          lambda p: is_fibo_preset(p, w["model_path"].value)) \
-                                    .tooltip({"cross_attn": "text cross-attention in the 5 injection blocks",
-                                              "adaln": "per-block modulation Linear",
-                                              "refiner": "the 2 noise-refiner blocks",
-                                              "perceiver": "the gist-token resampler",
-                                              "embed": "patch / timestep embedders and the final layer"}[t])
+                                                          lambda p, fs=families: preset_arch(p, w["model_path"].value)
+                                                          in fs).tooltip(tip)
                             w["train_text_embedder"] = ui.checkbox("DiT text projection blocks", value=False) \
                                 .bind_visibility_from(w["model_preset"], "value",
-                                                      lambda p: not is_fibo_preset(p, w["model_path"].value)) \
+                                                      lambda p: preset_arch(p, w["model_path"].value) == "moss_image") \
                                 .tooltip("Also train the 2-block text projection inside the DiT")
                         with advanced("Blocks to train"):
                             with fields():
@@ -2268,7 +2324,7 @@ def build_page(local: bool = True):
                             block_boxes: list = []
 
                             def n_blocks() -> int:
-                                return 44 if is_fibo_preset(w["model_preset"].value, w["model_path"].value) else 42
+                                return N_BLOCKS[preset_arch(w["model_preset"].value, w["model_path"].value)]
 
                             def blocks_from_text():
                                 from rulztrainer.lora import parse_blocks
@@ -2313,9 +2369,10 @@ def build_page(local: bool = True):
                                 for i in range(N_BLOCKS_MAX):
                                     cb = ui.checkbox(str(i), value=True, on_change=lambda e: text_from_blocks()) \
                                         .props("dense size=xs").classes("text-xs")
-                                    if i >= 42:  # FIBO 2.0's extra blocks
-                                        cb.bind_visibility_from(w["model_preset"], "value",
-                                                                lambda p: is_fibo_preset(p, w["model_path"].value))
+                                    if i >= min(N_BLOCKS.values()):  # blocks only some families have
+                                        cb.bind_visibility_from(
+                                            w["model_preset"], "value",
+                                            lambda p, i=i: i < N_BLOCKS[preset_arch(p, w["model_path"].value)])
                                     block_boxes.append(cb)
                             w["lora_blocks"].on_value_change(lambda e: blocks_from_text())
                         with advanced("Resume and training states"):
@@ -2419,6 +2476,12 @@ def build_page(local: bool = True):
                              "shift and the skip layer are MOSS-only. Prompts can be plain sentences or VGL JSON "
                              "captions.").bind_visibility_from(w["model_preset"], "value",
                                                                lambda p: is_fibo_preset(p, w["model_path"].value))
+                        hint("Krea 2: Raw is a base for training and needs many steps (Krea samples it with 52 steps "
+                             "at CFG 4.5 here, their guidance 3.5); 28 is enough for previews. Faster: set "
+                             "krea/Krea-2-Turbo as the sampling model (Advanced below) with 8 steps and CFG 1, the "
+                             "way Krea uses LoRAs trained on Raw. Sample shift and the skip layer are MOSS-only.") \
+                            .bind_visibility_from(w["model_preset"], "value",
+                                                  lambda p: preset_arch(p, w["model_path"].value) == "krea2")
                         with fields():
                             path_input(f, "turbo_lora", "Turbo / step-distill LoRA for sampling (optional)", "file",
                                        "", "w-[34rem]")
@@ -3182,6 +3245,28 @@ from diffusers import BriaFibo2Pipeline  # diffusers main (PR #14991)
 pipe = BriaFibo2Pipeline.from_pretrained("briaai/Fibo-2.0-edit-turbo", dtype=torch.bfloat16).to("cuda")
 pipe.transformer.load_lora_adapter("output/<job>", weight_name="<job>.safetensors")
 edited = pipe(prompt=vgl(scene), image=source, num_inference_steps=4, guidance_scale=1.0).images[0]
+```
+
+## Krea 2
+
+Pick **Krea-2-Raw** as the model (the gated `krea/Krea-2-Raw` repo: accept the Krea 2 Community License on Hugging
+Face and log in with `hf auth login` first; about 35 GB). Raw is the checkpoint Krea publishes for training; its LoRAs
+are meant for **Krea-2-Turbo**, the 8-step distill, as Krea's own Krea-2 LoRAs are. Set `krea/Krea-2-Turbo` as the
+*sampling model* (Saving & samples, Advanced) with 8 steps and CFG 1 to preview the LoRA the way it will be used,
+much faster than sampling Raw (28-52 steps with guidance). The 12B transformer is 25 GB in bf16; *Diffusion model
+quant* `auto` makes it int8 (13.5 GB) when the GPUs it runs on have 22 GB or more together (one 24 GB card, or two
+16 GB cards with *model split*) and nvfp4 (about 8 GB) on a single 16 GB card.
+
+*Sample CFG* uses the same convention for every model (1 = off). Krea's own guidance scale g is CFG g + 1 here:
+Krea's 3.5 for Raw is 4.5.
+
+Krea 2 LoRAs are saved in the diffusers / PEFT format, with the same module names as Krea's published LoRAs:
+
+```python
+from diffusers import Krea2Pipeline
+pipe = Krea2Pipeline.from_pretrained("krea/Krea-2-Turbo", torch_dtype=torch.bfloat16).to("cuda")
+pipe.load_lora_weights("output/<job>/<job>.safetensors")
+image = pipe("<trigger>, ...", num_inference_steps=8, guidance_scale=0.0).images[0]
 ```
 """
 

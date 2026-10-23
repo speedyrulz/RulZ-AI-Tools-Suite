@@ -7,9 +7,12 @@
 
 # RulzTrainer
 
-A simple diffusion-model LoRA trainer with a WebUI. First supported model: **MOSS-Image**
-(5B single-stream DiT by OpenMOSS), both the **Base** and **SFT** checkpoints. Output LoRAs load
-directly in ComfyUI with the standard *Load LoRA* node.
+A simple diffusion-model LoRA trainer with a WebUI. Supported models:
+
+- **MOSS-Image** (5B single-stream DiT by OpenMOSS), both the **Base** and **SFT** checkpoints. Output LoRAs load
+  directly in ComfyUI with the standard *Load LoRA* node.
+- **Bria FIBO 2.0** (8B): train on dev, use on Edit Turbo ([details](#fibo-20-bria-training-on-dev-using-the-lora-on-edit-turbo)).
+- **Krea 2** (12B): train on Raw, use on Turbo ([details](#krea-2-training-on-raw-using-the-lora-on-turbo)).
 
 ## Install
 
@@ -583,6 +586,55 @@ image, so a text-to-image LoRA shifts an edit toward the trained identity only p
 in a photo of someone else. Replacing identities in edits needs edit-pair training (not supported yet). Generation
 with the LoRA (dev, or Turbo given no source image) carries the full identity.
 
+## Krea 2: training on Raw, using the LoRA on Turbo
+
+RulzTrainer trains LoRAs for [krea/Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw), Krea's 12B single-stream DiT
+(28 blocks with grouped-query attention, a Qwen3-VL-4B text encoder whose twelve tapped layers are fused per token, and
+the 16-channel Qwen-Image VAE). Pick **Krea-2-Raw** as the model, or any diffusers folder / repo id whose transformer
+is a `Krea2Transformer2DModel` (detected from the model). The repo is gated: accept the Krea 2 Community License on
+Hugging Face and `hf auth login`. The download skips the repo's 26 GB single-file copy and sample images (about 35 GB).
+
+- **Train on Raw, use on Turbo.** Krea publishes Raw as the checkpoint to train on and uses LoRAs trained on it with
+  [Krea-2-Turbo](https://huggingface.co/krea/Krea-2-Turbo), the 8-step distill (its own
+  [Krea-2 LoRAs](https://huggingface.co/collections/krea/krea-2-loras) work that way). Set `sample_model_path:
+  krea/Krea-2-Turbo` with `sample_steps: 8` and `sample_cfg: 1` to preview (and probe) the LoRA as it will be used;
+  Turbo is gated separately, so accept its license too. Sampling Raw needs 28-52 steps with guidance.
+- **Guidance.** `sample_cfg` uses the same convention for every model (1 = off). Krea's `guidance_scale` g is
+  `sample_cfg` g + 1 here: Krea's 3.5 for Raw is 4.5.
+- **Memory.** The transformer is 25 GB in bf16, 13.5 GB in int8, about 8 GB in nvfp4. `transformer_quant: auto`
+  counts the memory the model will live in, all GPUs of a model split together: bf16 from 40 GB, int8 (W8A8) from
+  22 GB, else nvfp4. One 16 GB card therefore trains in nvfp4 (int8 plus the VAE already fill 14.2 GB, with no room
+  left for training activations at 1 MP); two 16 GB cards with `multi_gpu: model_split` train in int8, the model
+  loaded on the CPU and its blocks placed directly on both cards. Split in int8 over an RTX 5060 Ti + RTX 4060 Ti:
+  10.0 s per step at 1 MP, peaking at 11.5 / 10.5 GB, with int8's smaller error (weights only, under 1%).
+- **Text features** follow `Krea2Pipeline`: the prompt in Krea's system/user template, twelve Qwen3-VL hidden layers
+  per token. The pipeline pads every prompt to 512 tokens; padding is never attended to and text tokens have no
+  position in the DiT, so the cache stores only the real tokens (a few MB per caption) with the same result.
+- **Latents** come from the Qwen-Image VAE (16 channels, 8x), normalized with its per-channel mean/std and packed 2x2
+  into 64 channels, so they are cached under their own file names (`_qwenvae`); region maps are shared with the
+  other models (16-pixel cells either way).
+- **LoRA targets**: the usual groups map onto `attn.to_q/k/v`, `attn.to_out.0`, `ff.gate/up`, `ff.down`; Krea 2
+  adds `attn_gate` (the sigmoid output gate of every attention), `text_fusion` and `embed`. Krea's own LoRAs adapt all
+  of them (rank 32).
+- **Export** is the diffusers / PEFT format with the same module names as Krea's LoRAs
+  (`transformer.transformer_blocks.<n>.attn.to_q.lora_A.weight`), with the adapter config (alpha) in the metadata.
+  Loaders that ignore the metadata assume alpha = rank, so keep alpha equal to rank (the default) for those.
+- **Timesteps**: `timestep_sampling: reference` is a logit-normal shifted like the sampler (Krea has not published its
+  training distribution); the default `logit_normal` works as for the other models.
+
+```python
+from diffusers import Krea2Pipeline  # needs peft for load_lora_weights
+pipe = Krea2Pipeline.from_pretrained("krea/Krea-2-Turbo", torch_dtype=torch.bfloat16).to("cuda")
+pipe.load_lora_weights("output/<job>/<job>.safetensors")
+image = pipe("<trigger>, ...", num_inference_steps=8, guidance_scale=0.0).images[0]
+```
+
+Verified against diffusers: `tests/test_krea2.py` checks the port against `Krea2Transformer2DModel` (tiny random
+weights; also the compact text layout, the latent packing, the schedule against `FlowMatchEulerDiscreteScheduler`, and
+an exported LoRA merged into diffusers' weights). With the real Raw weights in bf16 the port matches diffusers' model to
+bf16 rounding (cosine 0.99999 over a 512x512 prediction), and the compact prompt features are as close to the
+pipeline's (cosine 0.99989) as the pipeline is to itself at another padding length.
+
 ## Using the LoRA in ComfyUI
 
 Recent ComfyUI builds support MOSS-Image natively (`comfy/ldm/moss_image`, CLIP type `moss_image`), so no
@@ -628,6 +680,9 @@ rulztrainer/
   moss/model.py    MOSS-Image DiT (vendored, Apache-2.0, OpenMOSS)
   moss/loading.py  download + load (HF layout or single files), quant dispatch, encode helpers
   moss/single_file.py  ComfyUI single-file loaders (dequant, unfuse qkv, text-only Qwen3.5)
+  archs.py         the model families (MOSS-Image, FIBO 2.0, Krea 2) behind one interface
+  fibo/            Bria FIBO 2.0: DiT port, loading, VGL prompts, sampler
+  krea2/           Krea 2: DiT port, loading (Qwen-Image VAE, Qwen3-VL layer stack), sampler
 webui.py           NiceGUI web UI (runs training as a subprocess)
 configs/           example configs
 tests/             smoke tests (no weights needed): python -m pytest tests
@@ -638,8 +693,11 @@ Dockerfile         optional vast.ai image with the install baked in
 
 ## Adding another model
 
-Model families are `Arch` classes in `rulztrainer/archs.py` (MOSS-Image and FIBO 2.0 today). An Arch provides the
-loading functions (transformer, VAE, text encoder), `encode_prompt` / `pad_embeds`, a sampler, the LoRA module names
-for the target groups, the export format, and its reference timestep recipe. The transformer must take the trainer's
-convention, `model(latents128, sigma * 1000, embeds, mask)` with the normalized 2x2-patchified Flux2 latents, and
-expose `.layers` (the blocks) for block selection, compile and the model split; `rulztrainer/fibo/` is the template.
+Model families are `Arch` classes in `rulztrainer/archs.py` (MOSS-Image, FIBO 2.0 and Krea 2 today). An Arch provides
+the loading functions (transformer, VAE, text encoder), `encode_prompt` / `pad_embeds`, `encode_images` /
+`decode_latents` for its VAE, a sampler, the LoRA module names for the target groups, the export format, and its
+reference timestep recipe. A family with a VAE of its own sets `latent_tag`, so its latents are cached under their own
+file names. The transformer must take the trainer's convention, `model(latents, sigma * 1000, embeds, mask)` with the
+normalized 2x2-patchified latents [B, C, H/16, W/16], and expose `.layers` (the blocks) for block selection, compile
+and the model split, plus `split_tail_modules()` (what runs after the last block); `rulztrainer/krea2/` is the most
+recent template, and `tests/test_krea2.py` checks a port against the diffusers model with tiny random weights.

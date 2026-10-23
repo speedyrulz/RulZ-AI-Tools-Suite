@@ -21,7 +21,10 @@ from .model import MOSSImageTransformer
 
 log = logging.getLogger("rulztrainer")
 
-IGNORE_PATTERNS = ["assets/*", "*.webp", "*.svg", "*.md", "scheduler/*.py", "transformer/*.py"]
+# also skipped: Krea 2's sample images and its single-file copies of the transformer (26 GB each, the diffusers
+# transformer/ folder holds the same weights)
+IGNORE_PATTERNS = ["assets/*", "*.webp", "*.svg", "*.md", "scheduler/*.py", "transformer/*.py", "images/*",
+                   "raw.safetensors", "turbo.safetensors"]
 
 
 def resolve_model_dir(model_path: str, models_dir: str = "models", download: bool = True) -> Path:

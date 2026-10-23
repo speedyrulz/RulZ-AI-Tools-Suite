@@ -300,6 +300,10 @@ class FiboTransformer(nn.Module):
             for i in range(n_layers)])
         self.final_layer = FinalLayer(dim, self.latent_channels)
 
+    def split_tail_modules(self) -> list[nn.Module]:
+        """Modules that run after the last block (they follow it in a model split)."""
+        return [self.final_layer]
+
     @classmethod
     def from_config(cls, config: dict) -> "FiboTransformer":
         return cls(**{k: config[k] for k in cls.CONFIG_KEYS if k in config})

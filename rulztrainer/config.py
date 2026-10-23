@@ -13,8 +13,10 @@ MODEL_PRESETS = {
     "MOSS-Image-SFT": "OpenMOSS-Team/MOSS-Image-SFT",
     "FIBO-2.0-dev": "briaai/Fibo-2.0-dev",
     "FIBO-2.0-edit-turbo": "briaai/Fibo-2.0-edit-turbo",
+    "Krea-2-Raw": "krea/Krea-2-Raw",
+    "Krea-2-Turbo": "krea/Krea-2-Turbo",
 }
-ARCH_NAMES = ("moss_image", "fibo2")
+ARCH_NAMES = ("moss_image", "fibo2", "krea2")
 
 
 # Named presets: values applied over a config (UI toggle, --preset on the CLI, or `preset:` in YAML).
@@ -77,7 +79,7 @@ class TrainConfig:
     seed: int = 42
 
     # --- model ---
-    model_arch: str = "auto"  # auto | moss_image | fibo2 (auto: the model's transformer config, or the path)
+    model_arch: str = "auto"  # auto | moss_image | fibo2 | krea2 (auto: the model's transformer config, or the path)
     model_source: str = "hf"  # hf: repo id / diffusers dir | files: single ComfyUI-style safetensors files
     model_path: str = "OpenMOSS-Team/MOSS-Image-Base"  # HF repo id or local dir with transformer/ text_encoder/ vae/
     models_dir: str = "models"  # where HF repos are downloaded
@@ -256,7 +258,7 @@ class TrainConfig:
         if self.model_arch and self.model_arch != "auto":
             return self.model_arch
         hint = " ".join([self.model_path or "", self.transformer_file or ""]).lower()
-        return "fibo2" if "fibo" in hint else "moss_image"
+        return "fibo2" if "fibo" in hint else "krea2" if "krea" in hint else "moss_image"
 
     def validate(self) -> None:
         if self.model_arch not in ("auto", *ARCH_NAMES):

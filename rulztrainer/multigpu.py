@@ -193,16 +193,29 @@ def balanced_assignment(n_blocks: int, devices: list[str], trained: list[int] | 
     return assignment
 
 
-def apply_assignment(model: nn.Module, assignment: list[str]) -> list[tuple[str, str]]:
-    """Move blocks to their devices; the final norm/head follow the last block. Returns [(device, blocks)]."""
+def apply_assignment(model: nn.Module, assignment: list[str], primary: str | None = None) -> list[tuple[str, str]]:
+    """Move blocks to their devices, the final norm/head after the last block, and everything else (embedders, text
+    stages) to the primary device, so the model never has to fit one GPU as a whole (it may come from the CPU).
+    Returns [(device, blocks)]."""
     from .lora import format_blocks
 
+    primary = primary or getattr(model, "split_primary", None) or assignment[0]
+    tail = model.split_tail_modules() if hasattr(model, "split_tail_modules") else [
+        model.final_norm_video, model.final_linear_video]  # MOSS-Image
+    placed = {id(model.layers), *(id(m) for m in tail)}
+    for child in model.children():
+        if id(child) not in placed:
+            child.to(primary)
+    for p in model.parameters(recurse=False):
+        p.data = p.data.to(primary)
+    for name, b in list(model.named_buffers(recurse=False)):
+        setattr(model, name, b.to(primary))
     for i, dev in enumerate(assignment):
         model.layers[i].to(dev)
-    last_dev = assignment[-1]
-    model.final_norm_video.to(last_dev)
-    model.final_linear_video.to(last_dev)
+    for m in tail:
+        m.to(assignment[-1])
     model.split_assignment = list(assignment)
+    model.split_primary = primary
     model.split_devices = list(dict.fromkeys(assignment))
     summary = [(dev, format_blocks([i for i, d in enumerate(assignment) if d == dev])) for dev in model.split_devices]
     log.info("Model split: %s", ", ".join(f"{d}: blocks {b}" for d, b in summary))
@@ -210,10 +223,10 @@ def apply_assignment(model: nn.Module, assignment: list[str]) -> list[tuple[str,
 
 
 def split_model(model: nn.Module, devices: list[str], trained: list[int] | None = None, plan: str = ""):
-    """Split by a manual plan when given, else auto-balance by estimated cost."""
+    """Split by a manual plan when given, else auto-balance by estimated cost. devices[0] is the primary."""
     n = len(model.layers)
     assignment = parse_split_plan(plan, n) if plan.strip() else balanced_assignment(n, devices, trained)
-    return apply_assignment(model, assignment)
+    return apply_assignment(model, assignment, primary=devices[0])
 
 
 def gpu_memory_summary(devices: list[str]) -> str:

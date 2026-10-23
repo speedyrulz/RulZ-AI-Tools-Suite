@@ -14,8 +14,6 @@ from PIL import Image, ImageOps
 from safetensors.torch import load_file, save_file
 
 from .archs import get_arch
-from .archs import get_arch
-from .archs import get_arch
 from .config import TrainConfig
 
 log = logging.getLogger("rulztrainer")
@@ -116,6 +114,7 @@ def scan_dataset(cfg: TrainConfig) -> list[Item]:
     cache = cfg.resolved_cache_dir()
     (cache / "latents").mkdir(parents=True, exist_ok=True)
     (cache / "text").mkdir(parents=True, exist_ok=True)
+    tag = get_arch(cfg).latent_tag  # latents of another VAE get their own files
     items = []
     sides = cfg.training_sides()
     for p in sorted(root.rglob("*")):
@@ -137,8 +136,8 @@ def scan_dataset(cfg: TrainConfig) -> list[Item]:
             stem = _hash(str(p.resolve())) + f"_{bw}x{bh}"
             items.append(Item(
                 image=p, caption=caption, width=bw, height=bh,
-                latent_path=cache / "latents" / f"{stem}.safetensors",
-                latent_flip_path=(cache / "latents" / f"{stem}_flip.safetensors") if cfg.flip_augment else None,
+                latent_path=cache / "latents" / f"{stem}{tag}.safetensors",
+                latent_flip_path=(cache / "latents" / f"{stem}_flip{tag}.safetensors") if cfg.flip_augment else None,
                 text_path=text_cache_path(cfg, caption),
                 region_path=cache / "regions" / f"{stem}_regions.safetensors",
                 side=side,
@@ -203,10 +202,11 @@ def augment_items(items: list[Item], cfg: TrainConfig, analysis: dict[str, dict]
             bw, bh = bucket_size(box[2] - box[0], box[3] - box[1], cfg, it.side or None)
             caption = crop_caption(template, it.caption, cfg)
             stem = _hash(f"{it.image.resolve()}|crop{box[0]},{box[1]},{box[2]},{box[3]}") + f"_{bw}x{bh}"
+            tag = get_arch(cfg).latent_tag
             out.append(Item(
                 image=it.image, caption=caption, width=bw, height=bh,
-                latent_path=cache / "latents" / f"{stem}.safetensors",
-                latent_flip_path=(cache / "latents" / f"{stem}_flip.safetensors") if cfg.flip_augment else None,
+                latent_path=cache / "latents" / f"{stem}{tag}.safetensors",
+                latent_flip_path=(cache / "latents" / f"{stem}_flip{tag}.safetensors") if cfg.flip_augment else None,
                 text_path=text_cache_path(cfg, caption),
                 src_box=box, category=category,
                 region_path=cache / "regions" / f"{stem}_regions.safetensors",
@@ -233,9 +233,9 @@ def latents_todo(items: list[Item], cfg: TrainConfig) -> list[Item]:
 
 def cache_latents(items: list[Item], cfg: TrainConfig, vae, progress=None, vaes: list | None = None) -> None:
     """Encode and save the latents still missing. `vaes` (one VAE per GPU) splits the images across GPUs."""
-    from .moss.loading import encode_images
     from .multigpu import run_queue
 
+    encode_images = get_arch(cfg).encode_images
     todo = latents_todo(items, cfg)
     workers = [(v, v.device) for v in (vaes or [vae])]
     log.info("Caching latents: %d of %d images need encoding%s", len(todo), len(items),

@@ -1009,11 +1009,12 @@ class Trainer:
             base.to("cpu")
             free_cuda()
             for m, d in train_models:
-                m.to(d)
-            if getattr(model, "split_assignment", None):
-                from .multigpu import apply_assignment
+                if getattr(m, "split_assignment", None):  # straight back to its GPUs (it may not fit one)
+                    from .multigpu import apply_assignment
 
-                apply_assignment(model, model.split_assignment)
+                    apply_assignment(m, m.split_assignment)
+                else:
+                    m.to(d)
 
     def _render_round(self, slots, jobs, neg_e, neg_m, board, on_done=None) -> list[str]:
         """Render every job, each GPU pulling the next one; returns the image paths in job order."""

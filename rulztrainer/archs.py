@@ -1,9 +1,10 @@
-"""Model architectures the trainer can train: MOSS-Image and Bria FIBO 2.0.
+"""Model architectures the trainer can train: MOSS-Image, Bria FIBO 2.0 and Krea 2.
 
 Everything the training loop, sampler, caches and LoRA export need to know about a model family lives in an `Arch`.
-Both families share the Flux2 VAE (so the latent cache, region maps and likeness code are the same), the training
-loss (flow matching, velocity target) and the model call convention: `model(latents128, sigma * 1000, embeds, mask)`
-with latents in the normalized 2x2-patchified layout [B, 128, H/16, W/16].
+All families share the training loss (flow matching, velocity target), the 16-pixel latent cell (so region maps and
+the likeness code are the same) and the model call convention: `model(latents, sigma * 1000, embeds, mask)` with
+latents in a normalized 2x2-patchified layout [B, C, H/16, W/16]. MOSS-Image and FIBO 2.0 share the Flux2 VAE
+(C = 128); Krea 2 uses the Qwen-Image VAE (C = 64) and caches its latents under their own names (`latent_tag`).
 
     get_arch(cfg)              the Arch for a config (model_arch, or guessed from the model path)
     detect_arch(cfg, model_dir) the Arch from a resolved model directory's transformer/config.json
@@ -23,7 +24,7 @@ from .config import TrainConfig
 
 log = logging.getLogger("rulztrainer")
 
-ARCH_NAMES = ("moss_image", "fibo2")
+ARCH_NAMES = ("moss_image", "fibo2", "krea2")
 
 
 def _match_suffix(name: str, suffixes: Iterable[str]) -> bool:
@@ -43,7 +44,8 @@ class Arch:
     default_negative = ""  # negative prompt for samples/probes when none is given
     default_sample_steps = 20
     default_sample_cfg = 3.0
-    block_token_px = 16  # pixels per latent cell (Flux2 VAE 8x, 2x2 patches)
+    block_token_px = 16  # pixels per latent cell (an 8x VAE, 2x2 patches)
+    latent_tag = ""  # latent cache file suffix: families with another VAE must not reuse each other's latents
 
     # ---- loading / encoding (see rulztrainer.moss.loading / rulztrainer.fibo.loading)
     def resolve_for_config(self, cfg: TrainConfig) -> Path | None: ...
@@ -287,7 +289,105 @@ class FiboArch(Arch):
         return torch.where(u < 0.1, torch.rand(n, generator=gen), s)
 
 
-_ARCHS = {"moss_image": MossArch, "fibo2": FiboArch}
+class Krea2Arch(Arch):
+    name = "krea2"
+    label = "Krea 2"
+    modelspec = "krea-2"
+    lora_format = "peft"  # the diffusers / PEFT layout Krea's own Krea-2 LoRAs use (transformer.<module>.lora_A/B)
+    n_blocks = 28
+    GROUPS = {
+        "q": ("attn.to_q",), "k": ("attn.to_k",), "v": ("attn.to_v",), "o": ("attn.to_out.0",),
+        "ffn_up_gate": ("ff.gate", "ff.up"), "ffn_down": ("ff.down",), "attn_gate": ("attn.to_gate",),
+    }
+    EMBED = ("img_in", "txt_in", "time_embed", "time_mod_proj", "final_layer")
+    target_groups = {"q": "attention query", "k": "attention key", "v": "attention value", "o": "attention out",
+                     "ffn_up_gate": "feed-forward gate/up", "ffn_down": "feed-forward down",
+                     "attn_gate": "attention output gate", "text_fusion": "text fusion blocks",
+                     "embed": "image/text/timestep projections and final layer"}
+    default_targets = ("q", "k", "v", "o", "ffn_up_gate", "ffn_down")
+    supports_single_files = False
+    default_sample_steps, default_sample_cfg = 28, 4.5
+    latent_tag = "_qwenvae"
+
+    def __init__(self):
+        from .krea2 import loading
+
+        self._loading = loading
+
+    def resolve_for_config(self, cfg):
+        return self._loading.resolve_for_config(cfg)
+
+    def get_transformer(self, cfg, model_dir, device=None):
+        return self._loading.get_transformer(cfg, model_dir, device)
+
+    def get_vae(self, cfg, model_dir):
+        return self._loading.get_vae(cfg, model_dir)
+
+    def get_text_encoder(self, cfg, model_dir):
+        return self._loading.get_text_encoder(cfg, model_dir)
+
+    def load_any_transformer(self, path, device, quant="auto", models_dir="models"):
+        return self._loading.load_any_transformer(path, device, quant, models_dir)
+
+    def encode_prompt(self, text_encoder, tokenizer, prompt, max_length):
+        return self._loading.encode_prompt(text_encoder, tokenizer, prompt, max_length)
+
+    def pad_embeds(self, rows):
+        return self._loading.pad_embeds(rows)
+
+    def encode_images(self, vae, images):
+        return self._loading.encode_images(vae, images)
+
+    def decode_latents(self, vae, latents):
+        return self._loading.decode_latents(vae, latents)
+
+    def decode_latents_grad(self, vae, latents):
+        return self._loading.decode_latents_grad(vae, latents)
+
+    def grad_vae(self, vae):
+        return self._loading.grad_vae(vae)
+
+    def sample(self, model, pos_e, pos_m, neg_e, neg_m, **kw):
+        from .krea2.sampler import sample
+
+        return sample(model, pos_e, pos_m, neg_e, neg_m, **kw)
+
+    def lora_module_names(self, model, targets, blocks, include_text_embedder=False):
+        from .lora import _is_linear_like
+
+        targets = set(targets)
+        block_set = None if blocks is None else {int(b) for b in blocks}
+        in_block = [s for t in targets for s in self.GROUPS.get(t, ())]
+        names = []
+        for name, module in model.named_modules():
+            if not _is_linear_like(module):
+                continue
+            if name.startswith("transformer_blocks."):
+                if block_set is not None and int(name.split(".")[1]) not in block_set:
+                    continue
+                if _match_suffix(name, in_block):
+                    names.append(name)
+            elif name.startswith("text_fusion."):
+                if "text_fusion" in targets:
+                    names.append(name)
+            elif "embed" in targets and name.split(".")[0] in self.EMBED:
+                names.append(name)
+        return names
+
+    def compile_blocks(self, model):
+        return list(model.transformer_blocks)
+
+    def reference_sigmas(self, n, gen, tokens):
+        # Krea has not published its training noise distribution. This is the usual recipe for a model sampled with
+        # a resolution-dependent shift: logit-normal sigmas shifted by the same mu as the sampler (0.5 at 256 tokens
+        # to 1.15 at 6400).
+        from .krea2.sampler import calculate_shift, time_shift
+
+        s = torch.sigmoid(torch.randn(n, generator=gen))
+        return time_shift(calculate_shift(tokens), s).clamp(0.0, 1.0)
+
+
+_ARCHS = {"moss_image": MossArch, "fibo2": FiboArch, "krea2": Krea2Arch}
 _cache: dict[str, Arch] = {}
 
 
@@ -316,8 +416,8 @@ def detect_arch(cfg: TrainConfig, model_dir: Path | None) -> Arch:
             cls = json.loads((Path(model_dir) / "transformer" / "config.json").read_text(encoding="utf-8")).get("_class_name")
         except (OSError, ValueError):
             cls = None
-        found = "fibo2" if cls == "BriaFibo2Transformer2DModel" else "moss_image" if cls in (
-            "MOSImageTransformer", "MOSSImageTransformer") else None
+        found = {"BriaFibo2Transformer2DModel": "fibo2", "Krea2Transformer2DModel": "krea2",
+                 "MOSImageTransformer": "moss_image", "MOSSImageTransformer": "moss_image"}.get(cls)
         if found and found != guessed:
             if cfg.model_arch not in ("", "auto"):
                 raise ValueError(f"model_arch is {cfg.model_arch!r} but {model_dir} holds a {found} transformer")
