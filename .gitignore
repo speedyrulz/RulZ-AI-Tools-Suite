@@ -1,0 +1,3 @@
+# Build output (run build.ps1 or launch.bat to recreate)
+bin/
+*.tmp
