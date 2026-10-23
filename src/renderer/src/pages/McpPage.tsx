@@ -2,10 +2,10 @@ import * as Collapsible from '@radix-ui/react-collapsible'
 import { ChevronRight, FileText, FolderOpen, Plus, RefreshCw, ShieldCheck } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
-import type { McpServerStatus, McpServerConfig } from '@shared/types'
-import { Badge, Button, DropdownMenu, Field, IconButton, Switch, Tooltip } from '../components/ui'
+import type { McpServerConfig, McpServerStatus, McpToolInfo } from '@shared/types'
+import { Badge, Button, DropdownMenu, Field, IconButton, Input, Switch, Tooltip } from '../components/ui'
 import { errorMessage, invoke } from '../lib/api'
-import { cn } from '../lib/format'
+import { cn, formatCompact } from '../lib/format'
 import { useApp } from '../stores/app'
 import { useMcp } from '../stores/mcp'
 
@@ -21,6 +21,14 @@ const EXAMPLES: { label: string; name: string; config: McpServerConfig }[] = [
 ]
 
 const STATE_TONE = { connected: 'ok', connecting: 'accent', error: 'danger', disabled: 'neutral' } as const
+
+/** Above this many tokens of tool descriptions per message, small contexts start to suffer. */
+const TOOL_TOKEN_WARNING = 8000
+
+/** Rough token cost of one tool definition as sent to the model (~3.5 characters per token). */
+function toolTokens(t: McpToolInfo): number {
+  return Math.ceil(JSON.stringify({ name: t.qualifiedName, description: t.description, parameters: t.inputSchema }).length / 3.5)
+}
 
 export function McpPage() {
   const servers = useMcp((s) => s.servers)
@@ -42,7 +50,10 @@ export function McpPage() {
 
   if (!settings || text === null) return null
   const dirty = text !== saved
-  const toolCount = servers.reduce((n, s) => n + (s.state === 'connected' ? s.tools.length : 0), 0)
+  const disabledSet = new Set(settings.disabledTools)
+  const enabled = servers.filter((s) => s.state === 'connected').flatMap((s) => s.tools).filter((t) => !disabledSet.has(t.qualifiedName))
+  const toolCount = enabled.length
+  const totalTokens = enabled.reduce((sum, t) => sum + toolTokens(t), 0)
 
   const save = async (): Promise<void> => {
     setSaving(true)
@@ -79,7 +90,10 @@ export function McpPage() {
           <div className="min-w-0 flex-1">
             <h1 className="text-base font-semibold">MCP servers</h1>
             <div className="text-xs text-muted">
-              {servers.length} {servers.length === 1 ? 'server' : 'servers'} · {toolCount} {toolCount === 1 ? 'tool' : 'tools'} available to chats
+              {servers.length} {servers.length === 1 ? 'server' : 'servers'} · {toolCount} {toolCount === 1 ? 'tool' : 'tools'} available to chats ·{' '}
+              <span className={totalTokens > TOOL_TOKEN_WARNING ? 'text-warn' : undefined}>
+                ≈{formatCompact(totalTokens)} tokens of tool descriptions per message
+              </span>
             </div>
           </div>
           <Button size="sm" onClick={() => void invoke('mcp:restart', null)}>
@@ -175,11 +189,24 @@ function ServerCard({ server }: { server: McpServerStatus }) {
   const settings = useApp((s) => s.settings)!
   const update = useApp((s) => s.updateSettings)
   const [showLog, setShowLog] = useState(false)
+  const [filter, setFilter] = useState('')
   const disabled = new Set(settings.disabledTools)
+  const enabledTools = server.tools.filter((t) => !disabled.has(t.qualifiedName))
+  const enabledTokens = enabledTools.reduce((sum, t) => sum + toolTokens(t), 0)
+  const q = filter.trim().toLowerCase()
+  const visibleTools = q
+    ? server.tools.filter((t) => t.name.toLowerCase().includes(q) || t.description?.toLowerCase().includes(q))
+    : server.tools
 
   const toggleTool = (name: string, on: boolean): void => {
     const next = on ? settings.disabledTools.filter((t) => t !== name) : [...settings.disabledTools, name]
     void update({ disabledTools: next })
+  }
+
+  const setAll = (on: boolean): void => {
+    const mine = new Set(server.tools.map((t) => t.qualifiedName))
+    const others = settings.disabledTools.filter((t) => !mine.has(t))
+    void update({ disabledTools: on ? others : [...others, ...mine] })
   }
 
   return (
@@ -205,12 +232,29 @@ function ServerCard({ server }: { server: McpServerStatus }) {
       )}
       {server.tools.length > 0 && (
         <Collapsible.Root defaultOpen={server.tools.length <= 8} className="border-t border-border">
-          <Collapsible.Trigger className="group flex w-full items-center gap-1 px-4 py-2 text-xs text-muted hover:text-text">
-            <ChevronRight size={13} className="transition-transform group-data-[state=open]:rotate-90" />
-            Tools
-          </Collapsible.Trigger>
+          <div className="flex items-center gap-2 px-4 py-2">
+            <Collapsible.Trigger className="group flex items-center gap-1 text-xs text-muted hover:text-text">
+              <ChevronRight size={13} className="transition-transform group-data-[state=open]:rotate-90" />
+              Tools · {enabledTools.length} of {server.tools.length} enabled
+            </Collapsible.Trigger>
+            <Tooltip content="Tool descriptions are sent with every message and use context">
+              <span className={cn('text-[11px]', enabledTokens > TOOL_TOKEN_WARNING ? 'text-warn' : 'text-faint')}>
+                ≈{formatCompact(enabledTokens)} tokens per message
+              </span>
+            </Tooltip>
+            <div className="flex-1" />
+            <Button size="sm" variant="ghost" onClick={() => setAll(true)}>
+              Enable all
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => setAll(false)}>
+              Disable all
+            </Button>
+          </div>
           <Collapsible.Content className="space-y-1 px-4 pb-3">
-            {server.tools.map((t) => (
+            {server.tools.length > 8 && (
+              <Input className="mb-2 h-8" placeholder={`Filter ${server.tools.length} tools`} value={filter} onChange={(e) => setFilter(e.target.value)} />
+            )}
+            {visibleTools.map((t) => (
               <div key={t.qualifiedName} className="flex items-start gap-3 rounded-md px-2 py-1.5 hover:bg-hover/40">
                 <div className="min-w-0 flex-1">
                   <div className={cn('font-mono text-[12px]', disabled.has(t.qualifiedName) && 'text-faint line-through')}>

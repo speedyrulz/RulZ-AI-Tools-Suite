@@ -42,6 +42,8 @@ export class ContextFullError extends Error {}
 export interface ContextApi {
   countConversation: (messages: WireMessage[]) => Promise<number | null>
   countText: (text: string) => Promise<number | null>
+  /** Tokens used by the tool definitions sent alongside the chat. */
+  countTools?: () => Promise<number>
 }
 
 /** Applies the overflow policy so the prompt plus `reserve` tokens fits in `nCtx`. */

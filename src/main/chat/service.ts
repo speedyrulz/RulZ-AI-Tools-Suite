@@ -76,6 +76,7 @@ export class ChatService {
       return n
     }
     return {
+      countTools: toolTokens,
       countText: (text) => tokenize(text).catch(() => null),
       countConversation: async (messages) => {
         try {
@@ -127,12 +128,23 @@ export class ChatService {
       let messages = req.messages
       const tools = req.useTools ? this.getTools() : []
       if (inst.contextLength) {
+        const api = this.contextApi(inst, tools)
+        // Tool definitions are resent with every message; if they alone eat most of the context,
+        // no amount of trimming the chat helps, so say so plainly.
+        const toolTokens = await api.countTools!()
+        if (toolTokens > inst.contextLength * 0.6) {
+          throw new Error(
+            `The enabled MCP tools take about ${toolTokens.toLocaleString()} tokens of descriptions, more than this model's ` +
+              `${inst.contextLength.toLocaleString()}-token context can hold alongside the chat. Disable some tools on the MCP Tools page, ` +
+              'turn tools off for chats, or load the model with a larger context.'
+          )
+        }
         // Room kept for the reply; capped so a large max-tokens setting can't crowd out the whole chat.
         const reserve = Math.min(
           req.sampling.maxTokens ?? Math.min(2048, Math.floor(inst.contextLength / 4)),
           Math.floor(inst.contextLength / 3)
         )
-        messages = await fitToContext(messages, inst.contextLength, reserve, req.overflow, this.contextApi(inst, tools))
+        messages = await fitToContext(messages, inst.contextLength, reserve, req.overflow, api)
       }
 
       const body = buildRequestBody(inst.modelName, messages, req.sampling, req.disableThinking)
