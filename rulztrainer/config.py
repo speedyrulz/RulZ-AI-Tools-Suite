@@ -98,6 +98,8 @@ class TrainConfig:
     gradient_checkpointing: bool = True
     int8_matmul: bool = True  # int8/int8_convrot layers: W8A8 (int8 activations x int8 weight via torch._int_mm)
     int8_backward: str = "bf16"  # bf16 (exact: grad = grad_out @ W in bf16) | int8 (also quantizes grad_out)
+    nvfp4_matmul: bool = True  # nvfp4 layers on Blackwell GPUs (RTX 50): activations to NVFP4, FP4 tensor-core matmul
+    #                            (W4A4, backward exact in bf16); off, or on older GPUs: weight dequantized to bf16
 
     # --- dataset ---
     dataset_dir: str = "datasets/my_dataset"

@@ -475,6 +475,7 @@ class Form:
             transformer_quant=v("transformer_quant"), text_encoder_quant=v("text_encoder_quant"),
             gradient_checkpointing=bool(v("gradient_checkpointing")),
             int8_matmul=bool(v("int8_matmul")), int8_backward=v("int8_backward"),
+            nvfp4_matmul=bool(v("nvfp4_matmul")),
             dataset_dir=s("dataset_dir"), resolutions=sorted(float(x) for x in (v("resolutions") or [1.0])),
             resolution_step_up=bool(v("resolution_step_up")), step_up_patience=int(v("step_up_patience")),
             step_up_stop_patience=int(v("step_up_stop_patience")),
@@ -2169,7 +2170,7 @@ def build_page(local: bool = True):
                                              "token to int8 and multiplies them with the stored int8 weight "
                                              "(torch._int_mm), so the weight is never dequantized: about 1.2-1.5x "
                                              "faster than bf16 and far faster than the dequantize path, at under 1% "
-                                             "extra forward error. nvfp4 always dequantizes.")
+                                             "extra forward error. nvfp4 layers have their own setting.")
                                 w["int8_backward"] = ui.select({"bf16": "bf16 (exact)",
                                                                 "int8": "int8 (faster, approximate)"},
                                                                value="bf16", label="int8 backward").classes("w-56") \
@@ -2178,6 +2179,16 @@ def build_page(local: bool = True):
                                              "(exact). int8: grad_out is also quantized per token and multiplied with "
                                              "the int8 weight (about 1% gradient error, saves the bf16 weight copy in "
                                              "backward).")
+                                w["nvfp4_matmul"] = ui.select({True: "native FP4 (RTX 50 / Blackwell)",
+                                                               False: "dequantize to bf16"},
+                                                              value=d.nvfp4_matmul, label="nvfp4 layers compute") \
+                                    .classes("w-72") \
+                                    .tooltip("nvfp4 layers only. Native: the activations are quantized to NVFP4 too "
+                                             "and multiplied on the FP4 tensor cores (about 4x faster than a bf16 "
+                                             "matmul; W4A4, so the forward error grows from about 9.5% to 13% on "
+                                             "random data). The backward stays exact in bf16. GPUs without FP4 tensor "
+                                             "cores (RTX 40 and older) always dequantize; pick the RTX 50 card as the "
+                                             "training GPU to use it.")
 
                     # ---- Dataset
                     with section("Dataset", "Images, captions and resolution", "photo_library") as sec:
@@ -3193,7 +3204,12 @@ int8 roughly halves VRAM for the base model (about 5 GB for the DiT); nvfp4 quar
 per token to int8 and run an int8 x int8 matmul (`torch._int_mm`) on the stored weight, so training is faster than
 bf16 instead of ~3x slower; the extra error is under 1% of the output. *int8 backward* `bf16` is exact (the weight
 is widened to bf16 only for the gradient), `int8` also quantizes the gradient (faster, ~1% gradient error).
-`dequantize to bf16` is the old slow path for A/B comparison. nvfp4 always dequantizes.
+`dequantize to bf16` is the old slow path for A/B comparison.
+
+*nvfp4 layers compute* (Model, Advanced): on RTX 50 / Blackwell GPUs `native FP4` quantizes the activations to NVFP4
+as well and multiplies on the FP4 tensor cores (about 4x faster than a bf16 matmul, W4A4: more forward error than
+dequantizing), with an exact bf16 backward. GPUs without FP4 tensor cores always dequantize (a fused kernel). Pick
+the RTX 50 card as the training GPU to use it; the log says which GPUs run native.
 
 ## Training resolutions
 *Training resolutions* takes one or more megapixel values (1 MP = 1024x1024); each image is bucketed to every

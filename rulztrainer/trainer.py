@@ -545,6 +545,7 @@ class Trainer:
         gen = torch.Generator("cpu").manual_seed(cfg.seed)
         self.status.update(stage="resolving model")
         Q.set_int8_defaults(cfg.int8_matmul, cfg.int8_backward)  # every QuantLinear built from here on
+        Q.set_nvfp4_default(cfg.nvfp4_matmul)
         self.model_dir = self.arch.resolve_for_config(cfg)
         self.arch = detect_arch(cfg, self.model_dir)
         cfg.model_arch = self.arch.name
@@ -557,10 +558,13 @@ class Trainer:
         self.status.update(stage="loading transformer", step=0, total=cfg.steps)
         model = self.arch.get_transformer(cfg, self.model_dir)
         model.gradient_checkpointing = cfg.gradient_checkpointing
-        n_w8a8 = Q.configure_int8(model, cfg.int8_matmul, cfg.int8_backward)
-        if n_w8a8:
-            log.info("%d quantized Linear layers: int8 matmul %s (backward %s)", n_w8a8,
+        n_quant = Q.configure_int8(model, cfg.int8_matmul, cfg.int8_backward)
+        n_fp4 = Q.configure_nvfp4(model, cfg.nvfp4_matmul)
+        if n_quant - n_fp4:
+            log.info("%d quantized Linear layers: int8 matmul %s (backward %s)", n_quant - n_fp4,
                      "on" if cfg.int8_matmul else "off", cfg.int8_backward)
+        if n_fp4:
+            self._log_nvfp4(n_fp4)
         blocks = lora_mod.parse_blocks(cfg.lora_blocks, len(model.layers))
         unknown = [t for t in cfg.lora_targets if t not in self.arch.target_groups]
         if unknown:
@@ -583,6 +587,7 @@ class Trainer:
                 m = self.arch.get_transformer(cfg, self.model_dir, device=dev)
                 m.gradient_checkpointing = cfg.gradient_checkpointing
                 Q.configure_int8(m, cfg.int8_matmul, cfg.int8_backward)
+                Q.configure_nvfp4(m, cfg.nvfp4_matmul)
                 inj = lora_mod.inject_lora(m, cfg.lora_rank, cfg.lora_alpha, cfg.lora_targets,
                                            include_text_embedder=cfg.train_text_embedder, dropout=cfg.lora_dropout,
                                            blocks=blocks, names=self._lora_names(m, blocks))
@@ -934,6 +939,22 @@ class Trainer:
     # ------------------------------------------------------------ sampling
     def _lora_names(self, model, blocks) -> list[str]:
         return self.arch.lora_module_names(model, self.cfg.lora_targets, blocks, self.cfg.train_text_embedder)
+
+    def _log_nvfp4(self, n: int) -> None:
+        """How the nvfp4 layers compute on each training GPU, and a hint when another GPU has FP4 tensor cores."""
+        if not self.cfg.nvfp4_matmul:
+            log.info("%d nvfp4 layers: weights dequantized to bf16 (nvfp4_matmul off)", n)
+            return
+        native = [d for d in self.devices if Q.fp4_tensor_cores(d)]
+        other = [d for d in self.devices if d not in native]
+        if native:
+            log.info("%d nvfp4 layers: native FP4 matmul (W4A4, exact bf16 backward) on %s", n, ", ".join(native))
+        if other:
+            log.info("%d nvfp4 layers dequantize to bf16 on %s (no FP4 tensor cores)", n, ", ".join(other))
+            capable = [f"cuda:{i} ({torch.cuda.get_device_name(i)})" for i in range(torch.cuda.device_count())
+                       if Q.fp4_tensor_cores(f"cuda:{i}") and f"cuda:{i}" not in self.devices]
+            if capable:
+                log.info("Native FP4 is available on %s: train there for faster nvfp4 steps", ", ".join(capable))
 
     def _attach_sampling_loras(self, model) -> None:
         """Attach the sampling-only LoRAs (turbo + optional secondary) to a model."""

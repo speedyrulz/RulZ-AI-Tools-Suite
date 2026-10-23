@@ -37,6 +37,7 @@ INT8_BACKWARDS = ("bf16", "int8")
 # process-wide defaults for QuantLinear layers built without explicit values (set_int8_defaults / TrainConfig)
 DEFAULT_INT8_MATMUL = True
 DEFAULT_INT8_BACKWARD = "bf16"
+DEFAULT_NVFP4_MATMUL = True  # nvfp4 layers multiply on FP4 tensor cores where the GPU has them (set_nvfp4_default)
 _W8A8_WARNED = False
 F4_E2M1_MAX = 6.0
 F8_E4M3_MAX = 448.0
@@ -175,6 +176,18 @@ def quantize_nvfp4(w: torch.Tensor, per_tensor_scale: torch.Tensor | None = None
 
 def dequantize_nvfp4(packed: torch.Tensor, block_scales: torch.Tensor, per_tensor_scale: torch.Tensor,
                      orig_shape: tuple[int, int], dtype) -> torch.Tensor:
+    """The weight in `dtype`: one fused triton kernel on CUDA (codes and scales read once, `dtype` written
+    directly), else the eager table lookup. Both compute value * block scale * per-tensor scale in fp32."""
+    if USE_TRITON and packed.is_cuda:
+        try:
+            return _dequantize_nvfp4_triton(packed, block_scales, per_tensor_scale, orig_shape, dtype)
+        except Exception as e:  # noqa: BLE001
+            _disable_triton("dequantize_nvfp4", e)
+    return _dequantize_nvfp4_eager(packed, block_scales, per_tensor_scale, orig_shape, dtype)
+
+
+def _dequantize_nvfp4_eager(packed: torch.Tensor, block_scales: torch.Tensor, per_tensor_scale: torch.Tensor,
+                            orig_shape: tuple[int, int], dtype) -> torch.Tensor:
     pr, half = packed.shape
     pc = half * 2
     lut = _E2M1_LUT.to(packed.device, torch.float32)
@@ -244,6 +257,22 @@ def set_int8_defaults(int8_matmul: bool, int8_backward: str = "bf16") -> None:
         raise ValueError(f"int8_backward must be one of {INT8_BACKWARDS}, got {int8_backward!r}")
     DEFAULT_INT8_MATMUL = bool(int8_matmul)
     DEFAULT_INT8_BACKWARD = int8_backward
+
+
+def set_nvfp4_default(native: bool) -> None:
+    """Default for nvfp4 QuantLinear layers created afterwards: native FP4 matmul (where supported) or dequantize."""
+    global DEFAULT_NVFP4_MATMUL
+    DEFAULT_NVFP4_MATMUL = bool(native)
+
+
+def configure_nvfp4(model: nn.Module, native: bool) -> int:
+    """Set native FP4 matmul on every nvfp4 QuantLinear in `model`. Returns the number of nvfp4 layers."""
+    n = 0
+    for m in model.modules():
+        if isinstance(m, QuantLinear) and m.fmt == "nvfp4":
+            m.nvfp4_matmul = bool(native)
+            n += 1
+    return n
 
 
 def configure_int8(model: nn.Module, int8_matmul: bool, int8_backward: str = "bf16") -> int:
@@ -497,6 +526,102 @@ if HAS_TRITON:
                                                          num_stages=1)
         return q, scale
 
+    # ---- nvfp4: dequantize to the compute dtype, and quantize activations for the native FP4 matmul
+
+    @triton.jit
+    def _swizzled_offset(rows, cols, n_col_blocks):
+        """Offset of scale (row, col) in the cuBLAS block-scale layout of to_blocked (128 x 4 tiles)."""
+        return (((rows // 128) * n_col_blocks + cols // 4) * 512 + (rows % 32) * 16 + ((rows % 128) // 32) * 4
+                + cols % 4)
+
+    @triton.jit
+    def _nvfp4_dequant_kernel(q_ptr, s_ptr, g_ptr, lut_ptr, out_ptr, R, C, NB, n_col_blocks, stride_q, stride_o,
+                              BLOCK_R: tl.constexpr, BLOCK_B: tl.constexpr):
+        """out[r, c] = e2m1(code) * block_scale * per-tensor scale; BLOCK_B packed bytes = 2 * BLOCK_B values."""
+        rows = (tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)).to(tl.int64)
+        byts = tl.program_id(1) * BLOCK_B + tl.arange(0, BLOCK_B)
+        mask = (rows[:, None] < R) & (byts[None, :] < NB)
+        b = tl.load(q_ptr + rows[:, None] * stride_q + byts[None, :], mask=mask, other=0).to(tl.int32)
+        hi = tl.load(lut_ptr + ((b >> 4) & 15))  # the first value of a pair sits in the high nibble
+        lo = tl.load(lut_ptr + (b & 15))
+        s_off = _swizzled_offset(rows[:, None], (byts // 8)[None, :], n_col_blocks)  # 8 bytes = one 16-block
+        s = tl.load(s_ptr + s_off, mask=mask, other=0.0).to(tl.float32) * tl.load(g_ptr)
+        vals = tl.interleave(hi * s, lo * s)  # [BLOCK_R, 2 * BLOCK_B]
+        cols = tl.program_id(1) * (2 * BLOCK_B) + tl.arange(0, 2 * BLOCK_B)
+        omask = (rows[:, None] < R) & (cols[None, :] < C)
+        tl.store(out_ptr + rows[:, None] * stride_o + cols[None, :], vals.to(out_ptr.dtype.element_ty), mask=omask)
+
+    @torch.compiler.disable
+    def _dequantize_nvfp4_triton(packed, block_scales, per_tensor_scale, orig_shape, dtype) -> torch.Tensor:
+        rows, cols = orig_shape
+        nb = packed.shape[1]
+        out = torch.empty((rows, cols), dtype=dtype, device=packed.device)
+        lut = _E2M1_LUT_ON.get(packed.device)
+        if lut is None:
+            lut = _E2M1_LUT_ON[packed.device] = _E2M1_LUT.to(packed.device, torch.float32)
+        g = per_tensor_scale.reshape(1).to(device=packed.device, dtype=torch.float32)
+        br, bb = 32, 64
+        with _on_device(packed.device):
+            _nvfp4_dequant_kernel[(_ceil_div(rows, br), _ceil_div(nb, bb))](
+                packed, block_scales, g, lut, out, rows, cols, nb, _ceil_div(nb * 2 // 16, 4), packed.stride(0),
+                out.stride(0), BLOCK_R=br, BLOCK_B=bb, num_warps=4)
+        return out
+
+    @triton.jit
+    def _nvfp4_quant_act_kernel(x_ptr, q_ptr, s_ptr, g_ptr, M, K, n_col_blocks, stride_x, stride_q,
+                                BLOCK_M: tl.constexpr, GROUPS: tl.constexpr):
+        """NVFP4 of activations, as quantize_nvfp4 rounds: per 16-value block amax / 6 / g -> e4m3 scale, values /
+        (g * scale) -> nearest e2m1 (ties to even), packed two per byte (first in the high nibble)."""
+        rows = (tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
+        cols = tl.program_id(1) * (GROUPS * 16) + tl.arange(0, GROUPS * 16)
+        mask = (rows[:, None] < M) & (cols[None, :] < K)
+        x = tl.load(x_ptr + rows[:, None] * stride_x + cols[None, :], mask=mask, other=0.0).to(tl.float32)
+        g = tl.load(g_ptr)
+        x3 = tl.reshape(x, (BLOCK_M, GROUPS, 16))
+        amax = tl.max(tl.abs(x3), axis=2)
+        scaled = tl.minimum(_libdevice.div_rn(_libdevice.div_rn(amax, 6.0), g), 448.0)
+        s8 = scaled.to(tl.float8e4nv)
+        total = g * s8.to(tl.float32)
+        safe = tl.where(total == 0.0, 1.0, total)
+        v = _libdevice.div_rn(x3, safe[:, :, None])
+        v = tl.minimum(tl.maximum(v, -6.0), 6.0)
+        v = tl.where((total == 0.0)[:, :, None], 0.0, v)
+        a = tl.abs(v)
+        code = ((a > 0.25).to(tl.int32) + (a > 0.75).to(tl.int32) + (a > 1.25).to(tl.int32)
+                + (a > 1.75).to(tl.int32) + (a > 2.5).to(tl.int32) + (a > 3.5).to(tl.int32) + (a > 5.0).to(tl.int32))
+        tie = (a == 0.25) | (a == 0.75) | (a == 1.25) | (a == 1.75) | (a == 2.5) | (a == 3.5) | (a == 5.0)
+        code = tl.where(tie & ((code % 2) == 1), code + 1, code)
+        code = tl.minimum(code, 7) | tl.where(v < 0.0, 8, 0)
+        hi, lo = tl.split(tl.reshape(code, (BLOCK_M, GROUPS * 8, 2)))
+        packed = ((hi << 4) | lo).to(tl.uint8)
+        byts = tl.program_id(1) * (GROUPS * 8) + tl.arange(0, GROUPS * 8)
+        tl.store(q_ptr + rows[:, None] * stride_q + byts[None, :], packed,
+                 mask=(rows[:, None] < M) & (byts[None, :] < K // 2))
+        gcols = tl.program_id(1) * GROUPS + tl.arange(0, GROUPS)
+        tl.store(s_ptr + _swizzled_offset(rows[:, None], gcols[None, :], n_col_blocks), s8,
+                 mask=(rows[:, None] < M) & (gcols[None, :] < K // 16))
+
+    @torch.compiler.disable
+    def _quantize_act_nvfp4_triton(x: torch.Tensor):
+        if x.stride(1) != 1:
+            x = x.contiguous()
+        m, k = x.shape
+        g = (x.abs().amax().float().clamp(min=1e-12) / (F8_E4M3_MAX * F4_E2M1_MAX)).reshape(1)
+        q = torch.empty((m, k // 2), dtype=torch.uint8, device=x.device)
+        n_col_blocks = _ceil_div(k // 16, 4)
+        scales = torch.zeros((_roundup(max(m, 1), 128), n_col_blocks * 4), dtype=torch.float8_e4m3fn,
+                             device=x.device)
+        if m == 0:
+            return q, scales, g
+        bm, groups = 16, 8
+        with _on_device(x.device):
+            _nvfp4_quant_act_kernel[(_ceil_div(m, bm), _ceil_div(k // 16, groups))](
+                x, q, scales, g, m, k, n_col_blocks, x.stride(0), q.stride(0), BLOCK_M=bm, GROUPS=groups,
+                num_warps=4)
+        return q, scales, g
+
+_E2M1_LUT_ON: dict = {}  # the e2m1 value table per CUDA device, for the dequantize kernel
+
 
 def _disable_triton(stage: str, exc: Exception) -> None:
     global USE_TRITON
@@ -630,6 +755,85 @@ class _W8A8LinearFn(torch.autograd.Function):
         return gx.reshape(*grad_out.shape[:-1], gx.shape[-1]), None, None, None
 
 
+# ---------------------------------------------------------------- native NVFP4 (FP4 tensor cores, Blackwell)
+
+_FP4_CAPABLE: dict = {}
+
+
+def fp4_tensor_cores(device) -> bool:
+    """Blackwell (compute capability 10.x / 12.x: B200, RTX 50) multiplies NVFP4 natively; older GPUs do not."""
+    dev = torch.device(device)
+    if dev.type != "cuda" or not torch.cuda.is_available():
+        return False
+    idx = dev.index if dev.index is not None else torch.cuda.current_device()
+    if idx not in _FP4_CAPABLE:
+        _FP4_CAPABLE[idx] = torch.cuda.get_device_capability(idx)[0] >= 10 and hasattr(torch, "float4_e2m1fn_x2")
+    return _FP4_CAPABLE[idx]
+
+
+def quantize_act_nvfp4(x2d: torch.Tensor):
+    """NVFP4 of a [M, K] activation (K a multiple of 32): (packed uint8 [M, K/2], swizzled e4m3 block scales,
+    fp32 per-tensor scale [1]). Fused triton kernel when available, else quantize_nvfp4."""
+    if USE_TRITON and x2d.is_cuda:
+        try:
+            return _quantize_act_nvfp4_triton(x2d)
+        except Exception as e:  # noqa: BLE001
+            _disable_triton("quantize_act_nvfp4", e)
+    m = x2d.shape[0]
+    g = (x2d.float().abs().amax().clamp(min=1e-12) / (F8_E4M3_MAX * F4_E2M1_MAX)).reshape(1)
+    packed, scales, _ = quantize_nvfp4(x2d, g)
+    k = x2d.shape[1]
+    full = torch.zeros((_roundup(max(m, 1), 128), _ceil_div(k // 16, 4) * 4), dtype=scales.dtype, device=x2d.device)
+    full[: scales.shape[0], : scales.shape[1]] = scales  # quantize_nvfp4 pads rows to 16; cuBLAS wants 128
+    return packed[:m], full, g
+
+
+def nvfp4_native_supported(x: torch.Tensor, qw: "QuantWeight") -> bool:
+    if qw.fmt != "nvfp4" or not x.is_cuda or not qw.qdata.is_cuda or not fp4_tensor_cores(x.device):
+        return False
+    k = x.shape[-1]
+    return k % 32 == 0 and qw.qdata.shape[1] * 2 == k
+
+
+_NVFP4_WARNED = False
+
+
+def nvfp4_forward(x2d: torch.Tensor, qw: "QuantWeight", bias: torch.Tensor | None) -> torch.Tensor:
+    """x2d [M, K] -> [M, N] in x2d.dtype: activations quantized to NVFP4, multiplied with the stored NVFP4 weight on
+    the FP4 tensor cores (torch._scaled_mm, block scales), then scaled by both per-tensor scales."""
+    a, a_scales, a_g = quantize_act_nvfp4(x2d)
+    y = torch._scaled_mm(a.view(torch.float4_e2m1fn_x2), qw.qdata.view(torch.float4_e2m1fn_x2).t(),
+                         scale_a=a_scales.view(-1), scale_b=qw.scale.view(-1), out_dtype=x2d.dtype)
+    y = y[:, : qw.orig_shape[0]] * (a_g * qw.scale2).to(y.dtype)
+    if bias is not None:
+        y = y + bias.to(y.dtype)
+    return y
+
+
+class _NVFP4LinearFn(torch.autograd.Function):
+    """Forward on the FP4 tensor cores (W4A4); backward exact against the stored weight (dequantized to the grad's
+    dtype by the fused kernel), as the int8 layers' default bf16 backward."""
+
+    @staticmethod
+    def forward(ctx, x, bias, qw: QuantWeight):
+        global _NVFP4_WARNED
+        ctx.qw = qw
+        x2d = x.reshape(-1, x.shape[-1])
+        try:
+            y = nvfp4_forward(x2d, qw, bias)
+        except Exception as e:  # noqa: BLE001
+            if not _NVFP4_WARNED:
+                _NVFP4_WARNED = True
+                log.warning("native nvfp4 matmul failed (%s: %s); dequantizing instead for this call",
+                            type(e).__name__, e)
+            y = nn.functional.linear(x2d, qw.dequantize(x.dtype), bias)
+        return y.reshape(*x.shape[:-1], y.shape[-1])
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        return grad_out @ ctx.qw.dequantize(grad_out.dtype), None, None
+
+
 class _QuantLinearFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, bias, qw: QuantWeight):
@@ -662,6 +866,7 @@ class QuantLinear(nn.Module):
         self.compute_dtype = compute_dtype
         self.int8_matmul = DEFAULT_INT8_MATMUL if int8_matmul is None else bool(int8_matmul)
         self.int8_backward = DEFAULT_INT8_BACKWARD if int8_backward is None else int8_backward
+        self.nvfp4_matmul = DEFAULT_NVFP4_MATMUL
         if self.int8_backward not in INT8_BACKWARDS:
             raise ValueError(f"int8_backward must be one of {INT8_BACKWARDS}, got {self.int8_backward!r}")
         self.register_buffer("qdata", qw.qdata)
@@ -687,14 +892,22 @@ class QuantLinear(nn.Module):
     def uses_w8a8(self, x: torch.Tensor) -> bool:
         return self.int8_matmul and w8a8_supported(x, self.qw)
 
+    def uses_native_fp4(self, x: torch.Tensor) -> bool:
+        return self.nvfp4_matmul and nvfp4_native_supported(x, self.qw)
+
     def forward(self, x):
         qw = self.qw
         if self.int8_matmul and w8a8_supported(x, qw):
             return _W8A8LinearFn.apply(x, self.bias, qw, self.int8_backward)
+        if self.nvfp4_matmul and nvfp4_native_supported(x, qw):
+            return _NVFP4LinearFn.apply(x, self.bias, qw)
         return _QuantLinearFn.apply(x, self.bias, qw)
 
     def extra_repr(self):
-        mm = f", w8a8(backward={self.int8_backward})" if self.int8_matmul and self.fmt != "nvfp4" else ""
+        if self.fmt == "nvfp4":
+            mm = ", native fp4 where supported" if self.nvfp4_matmul else ""
+        else:
+            mm = f", w8a8(backward={self.int8_backward})" if self.int8_matmul else ""
         return f"in={self.in_features}, out={self.out_features}, fmt={self.fmt}, bias={self.bias is not None}{mm}"
 
 

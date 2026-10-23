@@ -324,3 +324,90 @@ def test_fused_kernel_failure_falls_back_to_eager(monkeypatch):
     q_r, s_r = Q.rotate_quantize_act_int8(x, 256)
     q_r_e, s_r_e = Q._quantize_act_int8_eager(Q.rotate_act(x, 256))
     assert torch.equal(q_r, q_r_e) and torch.equal(s_r, s_r_e)
+
+
+# ---------------------------------------------------------------- native NVFP4 (FP4 tensor cores)
+
+_fp4_devices = [f"cuda:{i}" for i in range(torch.cuda.device_count()) if Q.fp4_tensor_cores(f"cuda:{i}")]
+fp4_cuda = pytest.mark.skipif(not (_fp4_devices and Q.HAS_TRITON), reason="needs a Blackwell GPU (FP4 tensor cores)")
+
+
+def test_nvfp4_native_off_cpu_and_settings():
+    """CPU tensors, the setting off, or a GPU without FP4 tensor cores: the dequantize path, as before."""
+    torch.manual_seed(0)
+    w = torch.randn(256, 512) * 0.02
+    qw = Q.quantize_weight(w, "nvfp4")
+    assert not Q.nvfp4_native_supported(torch.randn(4, 512), qw) and not Q.fp4_tensor_cores("cpu")
+    old = Q.DEFAULT_NVFP4_MATMUL
+    try:
+        Q.set_nvfp4_default(False)
+        ql = Q.QuantLinear(qw, None, torch.float32)
+        assert ql.nvfp4_matmul is False
+        Q.set_nvfp4_default(True)
+        ql2 = Q.QuantLinear(qw, None, torch.float32)
+        model = torch.nn.Sequential(ql, ql2, Q.QuantLinear(Q.quantize_weight(w, "int8"), None, torch.float32))
+        assert Q.configure_nvfp4(model, True) == 2 and ql.nvfp4_matmul and ql2.nvfp4_matmul
+    finally:
+        Q.set_nvfp4_default(old)
+    x = torch.randn(4, 512, requires_grad=True)
+    y = ql(x)
+    ref = x.detach() @ qw.dequantize(torch.float32).t()
+    assert torch.allclose(y, ref, atol=1e-5)
+    # the eager activation quantizer (fallback) lays scales out for cuBLAS: rows padded to 128
+    q, s, g = Q.quantize_act_nvfp4(torch.randn(20, 512))
+    assert q.shape == (20, 256) and s.shape == (128, 32) and g.shape == (1,)
+
+
+@fused_cuda
+@pytest.mark.parametrize("device", _devices)
+def test_nvfp4_dequant_kernel_matches_eager(device):
+    torch.manual_seed(0)
+    for rows, cols in ((1000, 3000), (128, 64), (6144, 1536)):
+        qw = Q.quantize_weight((torch.randn(rows, cols) * 0.02).to(device), "nvfp4")
+        for dtype in (torch.bfloat16, torch.float32):
+            fast = Q._dequantize_nvfp4_triton(qw.qdata, qw.scale, qw.scale2, qw.orig_shape, dtype)
+            slow = Q._dequantize_nvfp4_eager(qw.qdata, qw.scale, qw.scale2, qw.orig_shape, dtype)
+            assert torch.equal(fast, slow), (rows, cols, dtype)
+
+
+@fused_cuda
+@pytest.mark.parametrize("device", _devices)
+def test_nvfp4_act_quant_kernel_matches_reference(device):
+    torch.manual_seed(1)
+    for m, k in ((4113, 3072), (5, 64), (300, 6144)):
+        x = (torch.randn(m, k) * 3).to(device, torch.bfloat16)
+        x[0, :16] = 0  # an all-zero block
+        x[1, 16:32] = 0.25 * torch.tensor([1.0, -1.0] * 8)  # exact e2m1 ties after scaling
+        q, s, g = Q._quantize_act_nvfp4_triton(x)
+        q_r, s_r, _ = Q.quantize_nvfp4(x, g)
+        assert torch.equal(q, q_r[:m])
+        got = Q.from_blocked(s, Q._roundup(m, 128), Q._ceil_div(k // 16, 4) * 4)[:m, : k // 16]
+        want = Q.from_blocked(s_r, Q._roundup(m, 16), k // 16)[:m]
+        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+
+
+@fp4_cuda
+def test_nvfp4_native_forward_backward():
+    """W4A4 forward = the product of the two NVFP4 operands (to bf16 rounding); backward exact against the stored
+    weight; the bias and padded weight rows are handled; a QuantLinear takes the native path."""
+    dev = _fp4_devices[0]
+    torch.manual_seed(2)
+    w = (torch.randn(1000, 3072) * 0.02).to(dev)  # 1000 rows: padded to 1008 in storage
+    bias = torch.randn(1000, device=dev, dtype=torch.bfloat16)
+    qw = Q.quantize_weight(w, "nvfp4")
+    ql = Q.QuantLinear(qw, bias, torch.bfloat16)
+    ql.nvfp4_matmul = True
+    x = torch.randn(2, 77, 3072, device=dev, dtype=torch.bfloat16, requires_grad=True)
+    assert ql.uses_native_fp4(x)
+    y = ql(x)
+    a, a_s, a_g = Q.quantize_act_nvfp4(x.detach().reshape(-1, 3072))
+    x_q = Q.dequantize_nvfp4(a, a_s, a_g, (154, 3072), torch.float32)  # what the FP4 kernel sees
+    ref = x_q @ qw.dequantize(torch.float32).t() + bias.float()
+    assert y.shape == (2, 77, 1000)
+    assert ((y.float().reshape(-1, 1000) - ref).norm() / ref.norm()) < 5e-3
+    g = torch.randn_like(y)
+    y.backward(g)
+    want = (g.reshape(-1, 1000) @ qw.dequantize(torch.bfloat16)).reshape(x.shape)
+    assert torch.equal(x.grad, want)
+    ql.nvfp4_matmul = False
+    assert not ql.uses_native_fp4(x)

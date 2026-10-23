@@ -316,11 +316,48 @@ and closer to the exact rotation (about 5% of the two-step values are 1 LSB off 
 | `bf16` (default) | exact: the int8 weight is widened to bf16 once per backward and grad_x = grad_out @ W (no activation or gradient quantization; convrot applies the inverse Hadamard to grad_x) |
 | `int8` | the weight scale is folded into grad_out, grad_out is quantized per token to int8 and multiplied with the int8 weight; about 1% gradient error, saves the bf16 weight copy and is slightly faster |
 
-Fallbacks: nvfp4 layers always dequantize (there is no fp4 matmul here); CPU tensors and shapes the int8
-kernel rejects (in/out features not multiples of 8) use the dequantize path silently; a kernel error at run
-time logs one warning and falls back for that call. Rows are padded to 17 when a call has 16 tokens or
-fewer, because `torch._int_mm` refuses smaller M. In the WebUI these are *int8 layers compute* and *int8
-backward* in the model section.
+Fallbacks: CPU tensors and shapes the int8 kernel rejects (in/out features not multiples of 8) use the
+dequantize path silently; a kernel error at run time logs one warning and falls back for that call. Rows are
+padded to 17 when a call has 16 tokens or fewer, because `torch._int_mm` refuses smaller M. In the WebUI these
+are *int8 layers compute* and *int8 backward* in the model section.
+
+### nvfp4 compute: native FP4 on Blackwell (`nvfp4_matmul`)
+
+nvfp4 layers multiply on the **FP4 tensor cores** of Blackwell GPUs (RTX 50, compute capability 12.x; B200 10.x)
+with `nvfp4_matmul: true` (the default): the activations are quantized to NVFP4 by a fused triton kernel (per
+16-value block an e4m3 scale written straight into cuBLAS's swizzled layout, values rounded to e2m1 nearest-even,
+two per byte, plus a per-tensor fp32 scale), and `torch._scaled_mm` multiplies them with the stored NVFP4 weight.
+That is **W4A4**: faster than any other path, but the activations lose precision too. The backward stays exact
+against the stored weight (dequantized to bf16 for grad_x), as the int8 layers' default.
+
+GPUs without FP4 tensor cores (RTX 40 and older), `nvfp4_matmul: false`, CPU tensors and K not a multiple of 32
+dequantize instead, now with one fused triton kernel (codes and scales read once, bf16 written directly; bit-identical
+to the previous eager lookup). On a mixed machine CUDA numbers the GPUs by speed, not by slot, so check which index
+is the RTX 50 card: the training log lists the GPUs that run native FP4 and names a capable GPU that was not picked.
+
+Measured on an RTX 5060 Ti, one Krea 2 feed-forward layer (6144 -> 16384) on 4113 tokens:
+
+| path | forward | error vs exact (random weights, uneven activations) |
+|---|---|---|
+| eager dequantize (previous) | 29.8 ms | 9.5% |
+| fused dequantize | 17.2 ms | 9.5% (identical) |
+| **native FP4 (W4A4)** | **4.0 ms** | 13.4% |
+| bf16 weight, for reference | 16.7 ms | 0 |
+
+The exact backward of that layer takes 17.5 ms either way. The kernels are checked bit for bit against the
+reference quantizer and dequantizer in `tests/test_quant.py` (the native-matmul test runs on a Blackwell GPU only).
+
+Whole training steps, Krea 2 LoRA (rank 16) in nvfp4 at 1 MP on one RTX 5060 Ti, batch 1, gradient checkpointing,
+20 steps on the same 8 images:
+
+| path | s/step | loss (average over 20 steps) |
+|---|---|---|
+| eager dequantize (previous) | 16.7 | 0.0714 |
+| fused dequantize | 12.5 | 0.0713 |
+| **native FP4** | **9.2** | 0.0724 |
+
+Attention, norms and the bf16 backward are the same in all three, so the step gains less than the matmul alone.
+Samples rendered through the native path come out clean.
 
 ## Training resolutions and resolution step-up
 
@@ -605,8 +642,10 @@ Hugging Face and `hf auth login`. The download skips the repo's 26 GB single-fil
   counts the memory the model will live in, all GPUs of a model split together: bf16 from 40 GB, int8 (W8A8) from
   22 GB, else nvfp4. One 16 GB card therefore trains in nvfp4 (int8 plus the VAE already fill 14.2 GB, with no room
   left for training activations at 1 MP); two 16 GB cards with `multi_gpu: model_split` train in int8, the model
-  loaded on the CPU and its blocks placed directly on both cards. Split in int8 over an RTX 5060 Ti + RTX 4060 Ti:
-  10.0 s per step at 1 MP, peaking at 11.5 / 10.5 GB, with int8's smaller error (weights only, under 1%).
+  loaded on the CPU and its blocks placed directly on both cards. On an RTX 50 card nvfp4 runs on the FP4 tensor
+  cores (see [nvfp4 compute](#nvfp4-compute-native-fp4-on-blackwell-nvfp4_matmul)): 9.2 s per step at 1 MP on an
+  RTX 5060 Ti, peaking at 14 GB. Split in int8 over an RTX 5060 Ti + RTX 4060 Ti: 10.0 s per step at 1 MP, peaking
+  at 11.5 / 10.5 GB, with int8's smaller error (weights only, under 1%).
 - **Text features** follow `Krea2Pipeline`: the prompt in Krea's system/user template, twelve Qwen3-VL hidden layers
   per token. The pipeline pads every prompt to 512 tokens; padding is never attended to and text tokens have no
   position in the DiT, so the cache stores only the real tokens (a few MB per caption) with the same result.
