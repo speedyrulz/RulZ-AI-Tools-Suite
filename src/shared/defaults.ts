@@ -49,5 +49,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   toolsEnabled: true,
   confirmToolCalls: true,
   allowedTools: [],
-  disabledTools: []
+  disabledTools: [],
+  toolMode: 'auto',
+  toolBudgetTokens: 6000
 }

@@ -2,8 +2,9 @@ import * as Collapsible from '@radix-ui/react-collapsible'
 import { ChevronRight, FileText, FolderOpen, Plus, RefreshCw, ShieldCheck } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
-import type { McpServerConfig, McpServerStatus, McpToolInfo } from '@shared/types'
-import { Badge, Button, DropdownMenu, Field, IconButton, Input, Switch, Tooltip } from '../components/ui'
+import { toolTokens } from '@shared/tools'
+import type { McpServerConfig, McpServerStatus } from '@shared/types'
+import { Badge, Button, DropdownMenu, Field, IconButton, Input, NumberInput, Select, Switch, Tooltip } from '../components/ui'
 import { errorMessage, invoke } from '../lib/api'
 import { cn, formatCompact } from '../lib/format'
 import { useApp } from '../stores/app'
@@ -24,11 +25,6 @@ const STATE_TONE = { connected: 'ok', connecting: 'accent', error: 'danger', dis
 
 /** Above this many tokens of tool descriptions per message, small contexts start to suffer. */
 const TOOL_TOKEN_WARNING = 8000
-
-/** Rough token cost of one tool definition as sent to the model (~3.5 characters per token). */
-function toolTokens(t: McpToolInfo): number {
-  return Math.ceil(JSON.stringify({ name: t.qualifiedName, description: t.description, parameters: t.inputSchema }).length / 3.5)
-}
 
 export function McpPage() {
   const servers = useMcp((s) => s.servers)
@@ -105,6 +101,36 @@ export function McpPage() {
           <div className="space-y-1 rounded-xl border border-border bg-panel p-4">
             <Field inline label="Use MCP tools in chats" hint="The model can call enabled tools while answering">
               <Switch checked={settings.toolsEnabled} onCheckedChange={(v) => void update({ toolsEnabled: v })} />
+            </Field>
+            <Field
+              inline
+              label="Tool loading"
+              hint={
+                settings.toolMode === 'all'
+                  ? 'Every enabled tool is described in every message'
+                  : settings.toolMode === 'dynamic'
+                    ? 'The model searches for and loads only the tools it needs'
+                    : `All tools while they fit the budget, on demand beyond it (now: ${totalTokens > settings.toolBudgetTokens ? 'on demand' : 'all'})`
+              }
+            >
+              <Select
+                className="w-40"
+                value={settings.toolMode}
+                onChange={(e) => void update({ toolMode: e.target.value as typeof settings.toolMode })}
+              >
+                <option value="auto">Auto</option>
+                <option value="all">All enabled tools</option>
+                <option value="dynamic">On demand</option>
+              </Select>
+            </Field>
+            <Field inline label="Tool budget" hint="Most tokens of tool descriptions loaded at once; the least recently used are unloaded first">
+              <NumberInput
+                className="w-28"
+                value={settings.toolBudgetTokens}
+                min={500}
+                step={500}
+                onChange={(v) => v !== null && v >= 500 && void update({ toolBudgetTokens: Math.round(v) })}
+              />
             </Field>
             <Field inline label="Ask before running a tool" hint="Tools you mark “always allow” skip the question">
               <Switch checked={settings.confirmToolCalls} onCheckedChange={(v) => void update({ confirmToolCalls: v })} />

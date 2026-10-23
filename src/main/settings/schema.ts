@@ -58,7 +58,9 @@ export const settingsSchema = z.object({
   toolsEnabled: z.boolean().catch(D.toolsEnabled),
   confirmToolCalls: z.boolean().catch(D.confirmToolCalls),
   allowedTools: z.array(z.string()).catch(D.allowedTools),
-  disabledTools: z.array(z.string()).catch(D.disabledTools)
+  disabledTools: z.array(z.string()).catch(D.disabledTools),
+  toolMode: z.enum(['auto', 'all', 'dynamic']).catch(D.toolMode),
+  toolBudgetTokens: z.number().int().min(500).max(200000).catch(D.toolBudgetTokens)
 })
 
 export const presetSchema = z.object({

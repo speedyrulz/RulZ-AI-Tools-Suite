@@ -179,12 +179,21 @@ export class McpManager {
     return undefined
   }
 
-  /** OpenAI-style tool definitions for every connected, enabled tool. */
-  toolDefinitions(disabled: Set<string>): { type: 'function'; function: { name: string; description: string; parameters: unknown } }[] {
+  /** Connected tools the user has not switched off. */
+  availableTools(disabled: Set<string>): McpToolInfo[] {
     return [...this.connections.values()]
       .filter((c) => c.status.state === 'connected')
       .flatMap((c) => c.status.tools)
       .filter((t) => !disabled.has(t.qualifiedName))
+  }
+
+  /** OpenAI-style tool definitions for enabled tools, optionally limited to `only`. */
+  toolDefinitions(
+    disabled: Set<string>,
+    only?: Set<string>
+  ): { type: 'function'; function: { name: string; description: string; parameters: unknown } }[] {
+    return this.availableTools(disabled)
+      .filter((t) => !only || only.has(t.qualifiedName))
       .map((t) => ({
         type: 'function' as const,
         function: {

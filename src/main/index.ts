@@ -1,5 +1,6 @@
 import { join } from 'node:path'
 import { app, BrowserWindow, dialog, shell } from 'electron'
+import { META_TOOL_DEFS, toolCatalogNote } from '@shared/tools'
 import type { LoadConfig, ModelEntry } from '@shared/types'
 import { ChatService } from './chat/service'
 import { ConversationStore } from './chat/conversations'
@@ -109,11 +110,17 @@ async function main(): Promise<void> {
   const mcp = new McpManager(mcpConfigPath, (s) => broadcast('mcp:changed', s))
   void mcp.init()
 
-  const chat = new ChatService(
-    instances,
-    (e) => broadcast('chat:event', e),
-    () => mcp.toolDefinitions(new Set(settings.get().disabledTools))
-  )
+  const chat = new ChatService(instances, (e) => broadcast('chat:event', e), (req) => {
+    const disabled = new Set(settings.get().disabledTools)
+    if (req.mode === 'all') return { defs: mcp.toolDefinitions(disabled) }
+    // On demand: the three loader tools, the loaded tools' full descriptions, and a name catalog.
+    const available = mcp.availableTools(disabled)
+    const active = req.active.filter((n) => available.some((t) => t.qualifiedName === n))
+    return {
+      defs: [...META_TOOL_DEFS, ...mcp.toolDefinitions(disabled, new Set(active))],
+      note: available.length ? toolCatalogNote(available, active) : undefined
+    }
+  })
   const conversations = new ConversationStore(join(userData, 'conversations'))
 
   // ---- IPC ----
@@ -171,7 +178,7 @@ async function main(): Promise<void> {
     void chat.start(req)
   })
   handle('chat:abort', (id) => chat.abort(id))
-  handle('chat:countTokens', (modelId, messages, useTools) => chat.countTokens(modelId, messages, useTools))
+  handle('chat:countTokens', (modelId, messages, tools) => chat.countTokens(modelId, messages, tools))
 
   handle('conversations:list', () => conversations.list())
   handle('conversations:get', (id) => conversations.get(id))

@@ -14,6 +14,7 @@ import type {
   ModelEntry,
   Preset,
   StreamEvent,
+  ToolRequest,
   ToolResult,
   WireMessage
 } from './types'
@@ -58,7 +59,7 @@ export interface IpcInvoke {
 
   'chat:start': (req: ChatRequest) => void
   'chat:abort': (requestId: string) => void
-  'chat:countTokens': (modelId: string, messages: WireMessage[], useTools: boolean) => number | null
+  'chat:countTokens': (modelId: string, messages: WireMessage[], tools: ToolRequest | null) => number | null
 
   'conversations:list': () => ConversationSummary[]
   'conversations:get': (id: string) => Conversation | null

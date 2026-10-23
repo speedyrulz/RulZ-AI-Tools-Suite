@@ -71,6 +71,30 @@ export interface AppSettings {
   allowedTools: string[]
   /** Qualified tool names hidden from the model. */
   disabledTools: string[]
+  /** How tool descriptions reach the model; see ToolMode. */
+  toolMode: ToolMode
+  /** Token budget for tool descriptions in on-demand mode (and the threshold for auto). */
+  toolBudgetTokens: number
+}
+
+/**
+ * 'all': every enabled tool is described in every request.
+ * 'dynamic': the model searches and loads the tools it needs, within toolBudgetTokens.
+ * 'auto': 'all' while the enabled tools fit the budget, otherwise 'dynamic'.
+ */
+export type ToolMode = 'auto' | 'all' | 'dynamic'
+
+/** Which tools a chat request offers the model. */
+export interface ToolRequest {
+  mode: 'all' | 'dynamic'
+  /** Loaded tools (qualified names) in dynamic mode. */
+  active: string[]
+}
+
+export interface ToolSearchHit {
+  name: string
+  server: string
+  summary: string
 }
 
 // ---------- MCP ----------
@@ -288,6 +312,8 @@ export interface Conversation {
   messages: ChatMessage[]
   /** Set once the user has answered (or acted on) the "context nearly full" handoff prompt. */
   handoffPrompted?: boolean
+  /** Tools the model has loaded in on-demand mode, least recently used first. */
+  activeTools?: string[]
 }
 
 export interface ConversationSummary {
@@ -334,8 +360,8 @@ export interface ChatRequest {
   overflow: ContextOverflow
   /** Ask the chat template to skip reasoning (honoured by templates with an enable_thinking switch). */
   disableThinking?: boolean
-  /** Offer the enabled MCP tools to the model. */
-  useTools?: boolean
+  /** Tools to offer the model; omitted = no tools. */
+  tools?: ToolRequest
 }
 
 export type StreamEvent =

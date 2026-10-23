@@ -1,6 +1,7 @@
 import * as Collapsible from '@radix-ui/react-collapsible'
 import { Ban, Check, ChevronRight, CircleX, LoaderCircle, Wrench } from 'lucide-react'
 import { useState } from 'react'
+import { META_LOAD, META_SEARCH, META_UNLOAD } from '@shared/tools'
 import type { ToolCall } from '@shared/types'
 import { cn } from '../../lib/format'
 import { useChat, type ToolDecision } from '../../stores/chat'
@@ -15,7 +16,14 @@ function prettyJson(text: string): string {
   }
 }
 
+const META_LABELS: Record<string, string> = {
+  [META_SEARCH]: 'Search tools',
+  [META_LOAD]: 'Load tools',
+  [META_UNLOAD]: 'Unload tools'
+}
+
 function toolLabel(qualifiedName: string): { tool: string; server: string | null } {
+  if (META_LABELS[qualifiedName]) return { tool: META_LABELS[qualifiedName], server: 'RulZ' }
   const t = findTool(qualifiedName)
   if (t) return { tool: t.name, server: t.server }
   const i = qualifiedName.indexOf('__')

@@ -8,13 +8,16 @@ import type {
   Preset,
   StreamEvent,
   ToolCall,
+  ToolResult,
   WireMessage
 } from '@shared/types'
 import { DEFAULT_SAMPLING } from '@shared/defaults'
 import { errorMessage, invoke, on } from '../lib/api'
 import { uid } from '../lib/format'
 import { useApp } from './app'
+import { availableTools, effectiveToolMode, tokensOf, toolRequestFor } from './mcp'
 import { readyInstance, useModels } from './models'
+import { META_LOAD, META_SEARCH, META_TOOLS, resolveTool, searchTools } from '@shared/tools'
 
 export const NEW_CHAT_TITLE = 'New Chat'
 
@@ -244,6 +247,7 @@ export const useChat = create<ChatState>((set, get) => {
       systemPrompt: src.systemPrompt,
       sampling: src.sampling,
       presetId: src.presetId,
+      activeTools: src.activeTools,
       messages: []
     }
     await withConversation(src.id, (c) => ({ ...c, handoffPrompted: true }))
@@ -311,10 +315,91 @@ export const useChat = create<ChatState>((set, get) => {
     return g?.requestId === requestId && g.phase === 'tools'
   }
 
+  /** Updates the loaded-tools list of the conversation being generated into. */
+  const setActiveTools = (fn: (active: string[]) => string[]): void => {
+    const g = get().genConversation
+    if (!g) return
+    const next = { ...g, activeTools: fn(g.activeTools ?? []) }
+    set({ genConversation: next, current: get().current?.id === next.id ? next : get().current })
+  }
+
+  /** Marks tools as loaded and most recently used, then evicts the least recently used over budget. */
+  const loadTools = (names: string[]): string[] => {
+    const budget = useApp.getState().settings?.toolBudgetTokens ?? 6000
+    let evicted: string[] = []
+    setActiveTools((active) => {
+      const next = [...active.filter((n) => !names.includes(n)), ...names]
+      evicted = []
+      while (next.length > names.length && tokensOf(next) > budget) evicted.push(next.shift()!)
+      return next
+    })
+    return evicted
+  }
+
+  /** Runs one of the built-in loader tools; these change chat state only, so they need no approval. */
+  const runMetaTool = (call: ToolCall): ToolResult => {
+    let args: { query?: string; limit?: number; names?: unknown } = {}
+    try {
+      args = call.arguments.trim() ? JSON.parse(call.arguments) : {}
+    } catch {
+      return { text: `The arguments were not valid JSON: ${call.arguments}`, isError: true }
+    }
+    const tools = availableTools()
+    const active = new Set(get().genConversation?.activeTools ?? [])
+    if (call.name === META_SEARCH) {
+      const hits = searchTools(tools, String(args.query ?? ''), Number(args.limit) || 10)
+      if (!hits.length) return { text: `No tools match "${args.query ?? ''}".`, isError: false }
+      return {
+        text: hits
+          .map((h) => `- ${h.name} (${h.server})${active.has(resolveTool(tools, `${h.server}__${h.name}`)?.qualifiedName ?? '') ? ' [loaded]' : ''}: ${h.summary}`)
+          .join('\n'),
+        isError: false
+      }
+    }
+    const names = Array.isArray(args.names) ? args.names.map(String) : typeof args.names === 'string' ? [args.names] : []
+    if (!names.length) return { text: 'Pass the tool names to load or unload in "names".', isError: true }
+    const resolved = names.map((n) => ({ n, t: resolveTool(tools, n) }))
+    const unknown = resolved.filter((r) => !r.t).map((r) => {
+      const guess = searchTools(tools, r.n, 3).map((h) => h.name)
+      return guess.length ? `${r.n} (did you mean ${guess.join(', ')}?)` : r.n
+    })
+    const found = [...new Set(resolved.flatMap((r) => (r.t ? [r.t.qualifiedName] : [])))]
+    const lines: string[] = []
+    if (call.name === META_LOAD) {
+      if (found.length) {
+        const evicted = loadTools(found)
+        lines.push(`Loaded: ${found.join(', ')}. You can call them in your next step.`)
+        if (evicted.length) lines.push(`Unloaded to stay within the tool budget (least recently used): ${evicted.join(', ')}.`)
+      }
+    } else if (found.length) {
+      setActiveTools((a) => a.filter((n) => !found.includes(n)))
+      lines.push(`Unloaded: ${found.join(', ')}.`)
+    }
+    if (unknown.length) lines.push(`Unknown tools: ${unknown.join('; ')}.`)
+    return { text: lines.join('\n'), isError: found.length === 0 }
+  }
+
   /** Approves and runs each tool call, then continues the reply with the results. */
   const runTools = async (requestId: string, calls: ToolCall[]): Promise<void> => {
-    for (const call of calls) {
+    for (let call of calls) {
       if (!inToolPhase(requestId)) return
+      if (META_TOOLS.has(call.name)) {
+        const r = runMetaTool(call)
+        updateCall(call.id, { status: r.isError ? 'error' : 'done', result: r.text })
+        continue
+      }
+      // The model may call a tool by its bare name; map it to the real one.
+      const target = resolveTool(availableTools(), call.name)
+      if (!target) {
+        updateCall(call.id, { status: 'error', result: `Tool "${call.name}" is not available or is switched off.` })
+        continue
+      }
+      if (target.qualifiedName !== call.name) {
+        call = { ...call, name: target.qualifiedName }
+        updateCall(call.id, { name: call.name })
+      }
+      // Calling a tool keeps it loaded and marks it recently used.
+      if (effectiveToolMode() === 'dynamic') loadTools([target.qualifiedName])
       const s = useApp.getState().settings
       let approved = !s?.confirmToolCalls || s.allowedTools.includes(call.name)
       if (!approved) {
@@ -417,7 +502,7 @@ export const useChat = create<ChatState>((set, get) => {
         messages: toWire(history, conv.systemPrompt, inst.hasVision),
         sampling: conv.sampling,
         overflow: settings?.contextOverflow ?? 'truncateMiddle',
-        useTools: settings?.toolsEnabled ?? false
+        tools: toolRequestFor(conv.activeTools)
       })
     } catch (e) {
       handleEvent({ type: 'error', requestId, error: errorMessage(e) })
@@ -722,8 +807,8 @@ export const useChat = create<ChatState>((set, get) => {
         const modelId = useModels.getState().activeModelId ?? conv?.modelId ?? null
         const inst = readyInstance(modelId)
         if (!conv || !inst) return set({ tokenCount: null })
-        const useTools = useApp.getState().settings?.toolsEnabled ?? false
-        const n = await invoke('chat:countTokens', inst.modelId, toWire(conv.messages, conv.systemPrompt, inst.hasVision), useTools).catch(
+        const tools = toolRequestFor(conv.activeTools) ?? null
+        const n = await invoke('chat:countTokens', inst.modelId, toWire(conv.messages, conv.systemPrompt, inst.hasVision), tools).catch(
           () => null
         )
         if (get().current?.id === conv.id) set({ tokenCount: n })

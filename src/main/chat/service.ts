@@ -1,4 +1,12 @@
-import type { ChatRequest, GenerationStats, LoadedInstance, SamplingParams, StreamEvent, WireMessage } from '@shared/types'
+import type {
+  ChatRequest,
+  GenerationStats,
+  LoadedInstance,
+  SamplingParams,
+  StreamEvent,
+  ToolRequest,
+  WireMessage
+} from '@shared/types'
 import type { InstanceManager } from '../engine/instances'
 import { fitToContext, IMAGE_TOKENS, imageCount, textOf, type ContextApi } from './context'
 import { errorFromBody, interpretChunk, SseParser, statsFromTimings, ToolCallAccumulator } from './sse'
@@ -32,6 +40,22 @@ export function buildRequestBody(
   return body
 }
 
+export interface ToolSet {
+  defs: unknown[]
+  /** Extra system-prompt text (the on-demand tool catalog). */
+  note?: string
+}
+
+/** Appends `note` to the leading system message, or adds one. */
+export function withSystemNote(messages: WireMessage[], note: string | undefined): WireMessage[] {
+  if (!note) return messages
+  const first = messages[0]
+  if (first?.role === 'system' && typeof first.content === 'string') {
+    return [{ ...first, content: `${first.content}\n\n${note}` }, ...messages.slice(1)]
+  }
+  return [{ role: 'system', content: note }, ...messages]
+}
+
 /** Streams chat completions from a loaded instance and forwards them to the renderer. */
 export class ChatService {
   private active = new Map<string, AbortController>()
@@ -39,9 +63,13 @@ export class ChatService {
   constructor(
     private readonly instances: InstanceManager,
     private readonly send: (event: StreamEvent) => void,
-    /** Tool definitions to offer when a request asks for tools. */
-    private readonly getTools: () => unknown[] = () => []
+    /** Tool definitions (and, in on-demand mode, a system note) for a request's tool selection. */
+    private readonly getTools: (req: ToolRequest) => ToolSet = () => ({ defs: [] })
   ) {}
+
+  private toolSet(req: ToolRequest | null | undefined): ToolSet {
+    return req ? this.getTools(req) : { defs: [] }
+  }
 
   abort(requestId: string): void {
     this.active.get(requestId)?.abort()
@@ -102,10 +130,11 @@ export class ChatService {
     }
   }
 
-  async countTokens(modelId: string, messages: WireMessage[], useTools = false): Promise<number | null> {
+  async countTokens(modelId: string, messages: WireMessage[], tools: ToolRequest | null = null): Promise<number | null> {
     const inst = this.instances.readyFor(modelId)
     if (!inst) return null
-    return this.contextApi(inst, useTools ? this.getTools() : []).countConversation(messages)
+    const set = this.toolSet(tools)
+    return this.contextApi(inst, set.defs).countConversation(withSystemNote(messages, set.note))
   }
 
   async start(req: ChatRequest): Promise<void> {
@@ -125,8 +154,9 @@ export class ChatService {
       if (!inst) throw new Error('The model for this chat is not loaded.')
       stats.modelName = inst.modelName
 
-      let messages = req.messages
-      const tools = req.useTools ? this.getTools() : []
+      const set = this.toolSet(req.tools)
+      const tools = set.defs
+      let messages = withSystemNote(req.messages, set.note)
       if (inst.contextLength) {
         const api = this.contextApi(inst, tools)
         // Tool definitions are resent with every message; if they alone eat most of the context,
@@ -135,8 +165,8 @@ export class ChatService {
         if (toolTokens > inst.contextLength * 0.6) {
           throw new Error(
             `The enabled MCP tools take about ${toolTokens.toLocaleString()} tokens of descriptions, more than this model's ` +
-              `${inst.contextLength.toLocaleString()}-token context can hold alongside the chat. Disable some tools on the MCP Tools page, ` +
-              'turn tools off for chats, or load the model with a larger context.'
+              `${inst.contextLength.toLocaleString()}-token context can hold alongside the chat. On the MCP Tools page, set Tool loading ` +
+              'to "On demand" or "Auto", or disable some tools; or load the model with a larger context.'
           )
         }
         // Room kept for the reply; capped so a large max-tokens setting can't crowd out the whole chat.

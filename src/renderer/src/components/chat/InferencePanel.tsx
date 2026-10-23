@@ -3,7 +3,8 @@ import { useState, type ReactNode } from 'react'
 import type { SamplingParams } from '@shared/types'
 import { useApp } from '../../stores/app'
 import { useChat } from '../../stores/chat'
-import { useMcp } from '../../stores/mcp'
+import { effectiveToolMode, findTool, tokensOf, useMcp } from '../../stores/mcp'
+import { formatCompact } from '../../lib/format'
 import { Button, Dialog, Field, IconButton, Input, NumberInput, Select, Slider, Switch, Textarea } from '../ui'
 
 function SliderRow({
@@ -45,15 +46,21 @@ function Section({ title, children, action }: { title: string; children: ReactNo
   )
 }
 
+const NO_TOOLS: string[] = []
+
 function ToolsSection() {
   const settings = useApp((s) => s.settings)
   const updateSettings = useApp((s) => s.updateSettings)
   const setPage = useApp((s) => s.setPage)
   const servers = useMcp((s) => s.servers)
+  const activeTools = useChat((s) => s.current?.activeTools ?? NO_TOOLS)
+  const mutate = useChat((s) => s.mutateCurrent)
   if (!settings) return null
   const disabled = new Set(settings.disabledTools)
   const connected = servers.filter((s) => s.state === 'connected')
   const tools = connected.flatMap((s) => s.tools).filter((t) => !disabled.has(t.qualifiedName)).length
+  const mode = effectiveToolMode()
+  const loaded = activeTools.filter((n) => findTool(n))
   return (
     <Section
       title="Tools (MCP)"
@@ -66,6 +73,41 @@ function ToolsSection() {
       <Field inline label="Let the model use tools" hint={servers.length ? `${tools} tools from ${connected.length} of ${servers.length} servers` : 'No MCP servers configured'}>
         <Switch checked={settings.toolsEnabled} onCheckedChange={(v) => void updateSettings({ toolsEnabled: v })} />
       </Field>
+      {mode && (
+        <div className="text-[11px] text-faint">
+          {mode === 'all'
+            ? 'All enabled tools are described to the model.'
+            : `On demand: the model loads tools as it needs them (≈${formatCompact(tokensOf(loaded))} of ${formatCompact(settings.toolBudgetTokens)} tokens used).`}
+        </div>
+      )}
+      {mode === 'dynamic' && (
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between text-[11px] text-muted">
+            <span>Loaded in this chat</span>
+            {loaded.length > 0 && (
+              <button className="hover:text-accent" onClick={() => mutate((c) => ({ ...c, activeTools: [] }))}>
+                Clear
+              </button>
+            )}
+          </div>
+          {loaded.length === 0 ? (
+            <div className="text-[11px] text-faint">None yet.</div>
+          ) : (
+            <div className="flex flex-wrap gap-1">
+              {loaded.map((n) => (
+                <button
+                  key={n}
+                  title="Unload"
+                  onClick={() => mutate((c) => ({ ...c, activeTools: (c.activeTools ?? []).filter((x) => x !== n) }))}
+                  className="rounded border border-border bg-panel-2 px-1.5 py-0.5 font-mono text-[11px] hover:border-danger/50 hover:text-danger"
+                >
+                  {findTool(n)?.name ?? n} ✕
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </Section>
   )
 }

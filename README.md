@@ -23,6 +23,10 @@ llama.cpp build (`llama-server.exe`), one process per loaded model, bound to `12
 - **MCP tools** — configure servers in `mcp.json` (same format as LM Studio / Cursor; stdio `command` or remote
   `url`) on the MCP Tools page. Enabled tools are offered to the model; each call asks for approval unless the
   tool is marked "always allow", and calls and results show inline in the chat.
+  - **On-demand tool loading** for large servers (e.g. REA's 207 tools): the model gets a name catalog plus
+    `rulz_search_tools` / `rulz_load_tools` / `rulz_unload_tools`, and only loaded tools' full descriptions are
+    sent, within a token budget (least recently used are unloaded first). "Auto" switches to this once the
+    enabled tools exceed the budget.
 - GPU/RAM meters (nvidia-smi), dark/light theme, keyboard shortcuts (see Settings).
 
 ## Engine
