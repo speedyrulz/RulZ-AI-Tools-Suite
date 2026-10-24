@@ -19,7 +19,7 @@ To build that zip yourself:
 
 ```
 .venv\Scripts\python -m pip install pyinstaller
-.venv\Scripts\python packaginguild.py
+.venv\Scripts\python packaging\build.py
 ```
 
 ## Requirements
