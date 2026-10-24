@@ -120,3 +120,22 @@ def test_allocator_retries_give_back_one_kept_block_per_gpu():
     counts["cuda:0"] = 3  # only the second GPU retried: its earliest kept block goes
     trainer._ease_memory_pressure({"cuda:1": 5, "cuda:0": 2})
     assert C.kept_blocks(model) == [0, 1, 3]
+
+
+def test_calibration_uses_the_longest_caption(tmp_path):
+    """The blocks see text and image tokens, so the activation memory is measured with the longest cached caption
+    (for each family's own embeds layout)."""
+    from types import SimpleNamespace
+
+    from safetensors.torch import save_file
+
+    from rulztrainer.trainer import _longest_text_path
+
+    for name, shape in (("krea2", lambda s: (s, 12, 8)), ("moss_image", lambda s: (s, 8)),
+                        ("fibo2", lambda s: (6, s, 8))):
+        items = []
+        for i, s in enumerate((5, 40, 12)):
+            p = tmp_path / f"{name}_{i}.safetensors"
+            save_file({"embeds": torch.zeros(shape(s))}, str(p))
+            items += [SimpleNamespace(text_path=p)] * 2
+        assert _longest_text_path(items, archs.arch_by_name(name).pad_embeds).name == f"{name}_1.safetensors"

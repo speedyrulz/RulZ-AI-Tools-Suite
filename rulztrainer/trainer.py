@@ -116,6 +116,19 @@ def unload_model(model) -> None:
     free_cuda()
 
 
+def _longest_text_path(items, pad_embeds) -> Path:
+    """The cached caption with the most tokens, read from the file headers only (the family's pad_embeds, run on a
+    meta tensor of that shape, says which dim is the sequence)."""
+    from safetensors import safe_open
+
+    def length(path) -> int:
+        with safe_open(str(path), "pt") as f:
+            shape = f.get_slice("embeds").get_shape()
+        return pad_embeds([torch.empty(shape, device="meta")])[1].shape[1]
+
+    return max({it.text_path for it in items}, key=length)
+
+
 def load_text_embeds(cfg: TrainConfig, prompt: str) -> torch.Tensor:
     from safetensors.torch import load_file
 
@@ -1185,10 +1198,13 @@ class Trainer:
         cfg = self.cfg
         rng, gen = random.Random(0), torch.Generator("cpu").manual_seed(0)  # the run's own streams stay untouched
         big = max(items, key=lambda it: (it.width // 16) * (it.height // 16))
-        latents, embeds, mask, _ = load_batch([big] * cfg.batch_size, cfg, rng)
+        # the worst case: the most image tokens with the longest caption (the blocks see text and image tokens)
+        big = dataclasses.replace(big, text_path=_longest_text_path(items, self.arch.pad_embeds))
+        latents, embeds, mask, _ = load_batch([big] * cfg.batch_size, dataclasses.replace(cfg, caption_dropout=0.0),
+                                              rng)
         noise = torch.randn(latents.shape, generator=gen)
         sigma = torch.full((latents.shape[0],), 0.5)
-        tokens = (big.width // 16) * (big.height // 16)
+        tokens = (big.width // 16) * (big.height // 16) + mask.shape[1]
 
         for m, inj, dev in self.replicas:
             dev = norm_device(dev)

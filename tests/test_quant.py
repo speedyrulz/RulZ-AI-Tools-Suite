@@ -459,3 +459,42 @@ def test_nvfp4_fp4_backward_close_to_exact():
     assert rel < 0.3 and cos > 0.95, (rel, cos)
     with pytest.raises(ValueError):
         Q.configure_nvfp4(torch.nn.Sequential(ql), True, "int4")
+
+
+def test_out_of_memory_passes_through_the_quantized_matmuls(monkeypatch):
+    """An OOM is never a kernel problem: it must reach the trainer (which keeps fewer activations and redoes the
+    step) instead of being retried with a dequantized weight, which needs more memory still."""
+    import pytest
+
+    def oom(*a, **k):
+        raise torch.OutOfMemoryError("CUDA out of memory (test)")
+
+    qw = Q.quantize_weight(torch.randn(32, 64), "int8")
+    x = torch.randn(3, 64, requires_grad=True)
+    monkeypatch.setattr(Q, "w8a8_forward", oom)
+    with pytest.raises(torch.OutOfMemoryError):
+        Q._W8A8LinearFn.apply(x, None, qw, "int8")
+    monkeypatch.setattr(Q, "w8a8_forward", lambda x2d, w, b: x2d @ w.dequantize(x2d.dtype).t())
+    monkeypatch.setattr(Q, "w8a8_backward_x", oom)
+    with pytest.raises(torch.OutOfMemoryError):
+        Q._W8A8LinearFn.apply(x, None, qw, "int8").sum().backward()
+    q4 = Q.quantize_weight(torch.randn(32, 64), "nvfp4")
+    monkeypatch.setattr(Q, "nvfp4_forward", oom)
+    with pytest.raises(torch.OutOfMemoryError):
+        Q._NVFP4LinearFn.apply(x, None, q4, "bf16")
+
+
+def test_out_of_memory_in_a_triton_kernel_keeps_triton_on(monkeypatch):
+    import pytest
+
+    if not (torch.cuda.is_available() and Q.HAS_TRITON):
+        pytest.skip("needs CUDA and triton")
+
+    def oom(*a, **k):
+        raise torch.OutOfMemoryError("CUDA out of memory (test)")
+
+    monkeypatch.setattr(Q, "USE_TRITON", True)
+    monkeypatch.setattr(Q, "_quantize_act_int8_triton", oom)
+    with pytest.raises(torch.OutOfMemoryError):
+        Q.quantize_act_int8(torch.randn(4, 32, device="cuda"))
+    assert Q.USE_TRITON  # a launch failure switches triton off for the process; an OOM must not

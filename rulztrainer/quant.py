@@ -184,6 +184,8 @@ def dequantize_nvfp4(packed: torch.Tensor, block_scales: torch.Tensor, per_tenso
     if USE_TRITON and packed.is_cuda:
         try:
             return _dequantize_nvfp4_triton(packed, block_scales, per_tensor_scale, orig_shape, dtype)
+        except torch.OutOfMemoryError:  # never a kernel problem: the caller frees memory and retries
+            raise
         except Exception as e:  # noqa: BLE001
             _disable_triton("dequantize_nvfp4", e)
     return _dequantize_nvfp4_eager(packed, block_scales, per_tensor_scale, orig_shape, dtype)
@@ -677,6 +679,8 @@ def quantize_act_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     if USE_TRITON and x.is_cuda:
         try:
             return _quantize_act_int8_triton(x)
+        except torch.OutOfMemoryError:  # never a kernel problem: the caller frees memory and retries
+            raise
         except Exception as e:  # noqa: BLE001
             _disable_triton("quantize_act_int8", e)
     return _quantize_act_int8_eager(x)
@@ -688,6 +692,8 @@ def _rescale(y_i32: torch.Tensor, row_scale: torch.Tensor, col_scale: torch.Tens
     if USE_TRITON and y_i32.is_cuda:
         try:
             return _rescale_triton(y_i32, row_scale, col_scale, dtype)
+        except torch.OutOfMemoryError:  # never a kernel problem: the caller frees memory and retries
+            raise
         except Exception as e:  # noqa: BLE001
             _disable_triton("rescale", e)
     return _rescale_eager(y_i32, row_scale, col_scale, dtype)
@@ -705,6 +711,8 @@ def rotate_quantize_act_int8(x: torch.Tensor, group: int) -> tuple[torch.Tensor,
     if USE_TRITON and fusable and _hadamard_sub(group) is not None:
         try:
             return _rotate_quantize_act_int8_triton(x, group)
+        except torch.OutOfMemoryError:  # never a kernel problem: the caller frees memory and retries
+            raise
         except Exception as e:  # noqa: BLE001
             _disable_triton("rotate_quantize_act_int8", e)
     return quantize_act_int8(rotate_act(x, group))
@@ -775,7 +783,9 @@ class _W8A8LinearFn(torch.autograd.Function):
         x2d = x.reshape(-1, x.shape[-1])
         try:
             y = w8a8_forward(x2d, qw, bias)
-        except Exception as e:  # noqa: BLE001  (kernel rejected the shape/layout, OOM in the int32 buffer, ...)
+        except torch.OutOfMemoryError:  # never a kernel problem: the caller frees memory and retries
+            raise
+        except Exception as e:  # noqa: BLE001  (kernel rejected the shape/layout, ...)
             _warn_w8a8_fallback("forward", e)
             y = nn.functional.linear(x2d, qw.dequantize(x.dtype), bias)
         return y.reshape(*x.shape[:-1], y.shape[-1])
@@ -786,6 +796,8 @@ class _W8A8LinearFn(torch.autograd.Function):
         g2d = grad_out.reshape(-1, grad_out.shape[-1])
         try:
             gx = w8a8_backward_x(g2d, qw, ctx.backward_mode)
+        except torch.OutOfMemoryError:  # never a kernel problem: the caller frees memory and retries
+            raise
         except Exception as e:  # noqa: BLE001
             _warn_w8a8_fallback("backward", e)
             gx = g2d @ qw.dequantize(grad_out.dtype)
@@ -814,6 +826,8 @@ def quantize_act_nvfp4(x2d: torch.Tensor):
     if USE_TRITON and x2d.is_cuda:
         try:
             return _quantize_act_nvfp4_triton(x2d)
+        except torch.OutOfMemoryError:  # never a kernel problem: the caller frees memory and retries
+            raise
         except Exception as e:  # noqa: BLE001
             _disable_triton("quantize_act_nvfp4", e)
     m = x2d.shape[0]
@@ -881,6 +895,8 @@ class _NVFP4LinearFn(torch.autograd.Function):
         x2d = x.reshape(-1, x.shape[-1])
         try:
             y = nvfp4_forward(x2d, qw, bias)
+        except torch.OutOfMemoryError:  # never a kernel problem: the caller frees memory and retries
+            raise
         except Exception as e:  # noqa: BLE001
             if not _NVFP4_WARNED:
                 _NVFP4_WARNED = True
@@ -899,6 +915,8 @@ class _NVFP4LinearFn(torch.autograd.Function):
                 try:
                     gx = nvfp4_backward_fp4(g2d, qw)
                     return gx.reshape(*grad_out.shape[:-1], gx.shape[-1]), None, None, None
+                except torch.OutOfMemoryError:  # never a kernel problem: the caller frees memory and retries
+                    raise
                 except Exception as e:  # noqa: BLE001
                     if not _NVFP4_WARNED:
                         _NVFP4_WARNED = True
