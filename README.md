@@ -270,3 +270,7 @@ clips exported before this fix, this repairs one without touching the video:
 - `simplecut/theme.py` — RulZ name, logo assets and the black-and-red theme
 - `simplecut/assets/` — logo, icon and theme images
 - `simplecut/colormatch.py` — skin-tone matching maths and dialog
+
+## License
+
+Released under the [MIT License](LICENSE).
