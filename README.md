@@ -6,6 +6,8 @@ A small Windows video trimmer: frame-accurate stepping, keyframe navigation,
 In/Out marks, and export either **lossless** (stream copy, when In and Out are
 on keyframes) or **re-encoded with NVIDIA NVENC** to MP4.
 
+![RulZ Simple Video Clip Extractor with a 16:9 crop box and a 2.5 second fixed-length selection](docs/screenshot.png)
+
 ## Requirements
 
 - Windows 10/11, Python 3.10+ on PATH
