@@ -273,4 +273,11 @@ clips exported before this fix, this repairs one without touching the video:
 
 ## License
 
-Released under the [MIT License](LICENSE).
+The source code is released under the [MIT License](LICENSE).
+
+The RulZ name and logo are excluded from the MIT License. All rights are
+reserved. The logo files are `simplecut/assets/logo_dark.png`,
+`simplecut/assets/logo_light.png` and `simplecut/assets/icon256.png`. They
+may not be reused in other projects. If you fork or redistribute this
+project, remove or replace the RulZ branding. See
+[simplecut/assets/LOGO-NOTICE.md](simplecut/assets/LOGO-NOTICE.md).
