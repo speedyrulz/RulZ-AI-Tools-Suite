@@ -80,6 +80,12 @@ class DataParallelLoRA:
             if str(dev).startswith("cuda"):
                 torch.cuda.synchronize(dev)
 
+    def zero_grads(self) -> None:
+        """Drop the replicas' LoRA grads without reducing them (a failed step's partial gradients)."""
+        for _, inj, _ in self.replicas:
+            for mod in inj.values():
+                mod.lora_down.weight.grad = mod.lora_up.weight.grad = None
+
     def run(self, fn, jobs: list, serial: bool = False):
         """Run fn(job) for every job concurrently (one thread per device), or one after another with serial=True.
         Returns results in order.

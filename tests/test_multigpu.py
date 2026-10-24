@@ -67,6 +67,11 @@ def test_data_parallel_averages_grads_and_syncs_weights():
         pi[name].lora_down.weight.add_(1.0)
     dp.sync_weights()
     assert torch.equal(pi[name].lora_down.weight, ri[name].lora_down.weight)
+    # a failed step (out of memory) drops the replica's partial grads instead of leaving them for the next reduce
+    dp.run(work, [(primary, xa, ta, ca), (replica, xb, tb, cb)])
+    dp.zero_grads()
+    assert all(m.lora_down.weight.grad is None and m.lora_up.weight.grad is None for m in ri.values())
+    assert any(m.lora_down.weight.grad is not None for m in pi.values())  # the primary's are the optimizer's to clear
 
 
 def test_model_split_forward_matches_unsplit():

@@ -783,6 +783,8 @@ class Trainer:
                 # blocks keeping their activations ran out of memory (a larger bucket, the identity loss, another
                 # process): keep fewer and redo the step; partial gradients of the failed step are dropped
                 optimizer.zero_grad(set_to_none=True)
+                if self.dp is not None:
+                    self.dp.zero_grads()  # the replicas' too: reduce_grads never ran for this step
                 if not self._shrink_kept_blocks():
                     raise
                 free_cuda()
