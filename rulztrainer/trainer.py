@@ -17,6 +17,7 @@ from PIL import Image
 
 from . import checkpointing as ckpt
 from . import lora as lora_mod
+from .ema import LoraEMA
 from . import quant as Q
 from .config import TrainConfig
 from .config import side_to_mp
@@ -273,6 +274,8 @@ class Trainer:
         self.arch = get_arch(cfg)  # confirmed against the model's transformer config once the model dir is resolved
         self.vae = None
         self.kept: dict[int, list[int]] = {}  # id(model copy) -> blocks keeping their activations
+        self.ema = None  # LoraEMA: the weight average saves, samples and probes use (lora_ema)
+        self.resumed_ema = None  # its state from a resumed training state
         self.vaes: dict[str, object] = {}  # VAE copies on the other GPUs (sampling / caching side jobs)
         self.sample_graphs: set = set()  # (device, shape) pairs a compiled model has already traced for sampling
         self.face_scorer = None
@@ -632,6 +635,17 @@ class Trainer:
         if cfg.resume_state:
             step = self.load_state(cfg.resume_state, injected, optimizer, scheduler, gen, rng)
             log.info("Resumed training state from %s at step %d", cfg.resume_state, step)
+        if cfg.lora_ema > 0:
+            per_step = cfg.batch_size * cfg.gradient_accumulation * len(self.replicas)
+            self.ema = LoraEMA(injected, cfg.lora_ema, total_images=cfg.steps * per_step)
+            if self.resumed_ema is not None:
+                self.ema.load_state_dict(self.resumed_ema)
+                log.info("Weight average restored from the training state (%d images averaged)", self.ema.images)
+            elif cfg.resume_state:
+                log.info("Weight average starts from the resumed weights (the state has none)")
+            log.info("Weight average (EMA) of the LoRA for saves, samples and probes: decay %g per image (%.4f per "
+                     "step of %d images), %.0f MB", cfg.lora_ema, self.ema.steady_step_decay(per_step), per_step,
+                     self.ema.nbytes() / 2**20)
         self.injected = injected
         self.sample_model = None
         if not cfg.sample_model_path:
@@ -746,6 +760,7 @@ class Trainer:
         while step < cfg.steps:
             optimizer.zero_grad(set_to_none=True)
             accum_loss = 0.0
+            step_images = 0
             step_lr_mult = 1.0
             step_id: list[tuple] = []
             if self.id_loss is not None:
@@ -756,6 +771,7 @@ class Trainer:
                     jobs = []
                     for rep in self.replicas:  # draw every copy's batch and noise in the main thread (shared RNG)
                         batch = next(self.batch_iter)
+                        step_images += len(batch)
                         latents, embeds, mask, regions = load_batch(batch, cfg, rng)
                         sigma = sample_sigmas(cfg, latents.shape[0], gen, self.ts_logit_shift,
                                               tokens=latents.shape[2] * latents.shape[3], arch=self.arch)
@@ -814,6 +830,8 @@ class Trainer:
             if step_lr_mult != 1.0:
                 for g, lr0 in zip(optimizer.param_groups, saved_lrs):
                     g["lr"] = lr0
+            if self.ema is not None:
+                self.ema.update(step_images)
             scheduler.step()
             if retries0 is not None:
                 self._ease_memory_pressure(retries0)
@@ -882,6 +900,23 @@ class Trainer:
         log.info("Done. Final LoRA: %s", path)
 
     # ------------------------------------------------------------ saving
+    @contextlib.contextmanager
+    def _averaged(self, replicas: bool = False):
+        """The weight average (lora_ema) in the LoRA while saving, sampling or probing; training goes on with the raw
+        weights. replicas=True hands it to the data-parallel copies too (they render samples and probes) and the raw
+        weights back afterwards. A no-op without an average, or inside another _averaged."""
+        if self.ema is None or self.ema.applied_now:
+            yield
+            return
+        try:
+            with self.ema.applied():
+                if replicas and self.dp is not None:
+                    self.dp.sync_weights()
+                yield
+        finally:
+            if replicas and self.dp is not None:
+                self.dp.sync_weights()
+
     def save(self, injected, step, final=False) -> Path:
         cfg = self.cfg
         name = f"{cfg.job_name}.safetensors" if final else f"{cfg.job_name}_{step:06d}.safetensors"
@@ -890,7 +925,10 @@ class Trainer:
                 "ss_network_dim": str(cfg.lora_rank), "ss_network_alpha": str(cfg.lora_alpha),
                 "ss_steps": str(step), "modelspec.architecture": self.arch.modelspec,
                 "rulztrainer_config": cfg.to_dict(), "ss_blocks": cfg.lora_blocks or "all"}
-        lora_mod.save_lora(injected, path, metadata=meta, dtype=cfg.lora_save_dtype, fmt=self.arch.lora_format)
+        if self.ema is not None:
+            meta["rulztrainer_ema"] = f"{cfg.lora_ema:g}"
+        with self._averaged():
+            lora_mod.save_lora(injected, path, metadata=meta, dtype=cfg.lora_save_dtype, fmt=self.arch.lora_format)
         log.info("Saved %s (%s)", path, cfg.lora_save_dtype)
         self.status.data["saved"].append(str(path))
         self.status.write()
@@ -906,6 +944,7 @@ class Trainer:
             "torch_gen": gen.get_state(), "py_rng": rng.getstate(), "torch_rng": torch.get_rng_state(),
             "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
             "config": self.cfg.to_dict(),
+            "ema": self.ema.state_dict() if self.ema is not None else None,  # lora.safetensors holds the raw weights
         }, state_dir / "train_state.pt")
         log.info("Saved training state %s", state_dir)
         self.status.data["states"].append(str(state_dir))
@@ -965,6 +1004,7 @@ class Trainer:
             except Exception:  # noqa: BLE001
                 pass
         self.res_stage = int(st.get("res_stage", 0))
+        self.resumed_ema = st.get("ema")  # None in states saved without an average (or by an older version)
         return int(st["step"])
 
     # ------------------------------------------------------------ sampling
@@ -1236,7 +1276,7 @@ class Trainer:
 
     @torch.no_grad()
     def sample_images(self, model, step):
-        with self._sampling_slots(model, step) as slots:
+        with self._averaged(replicas=True), self._sampling_slots(model, step) as slots:
             return self._sample_with(slots, step)
 
     # ------------------------------------------------------------ per-image loss watch
@@ -1381,7 +1421,13 @@ class Trainer:
         return face, body, images
 
     def run_probe(self, model, step, optimizer, scheduler, injected) -> bool:
-        """Render + score probes, update the controller, apply its actions. Returns True to stop training."""
+        """Render + score probes, update the controller, apply its actions. Returns True to stop training.
+
+        With a weight average the probes score it, so a best checkpoint is exactly the weights that were scored."""
+        with self._averaged(replicas=True):
+            return self._run_probe(model, step, optimizer, scheduler, injected)
+
+    def _run_probe(self, model, step, optimizer, scheduler, injected) -> bool:
         from .likeness import append_record, apply_lr_ratio, curriculum_weights, timestep_logit_shift
 
         cfg = self.cfg

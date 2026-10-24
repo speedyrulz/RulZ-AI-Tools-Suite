@@ -137,6 +137,7 @@ class TrainConfig:
     train_text_embedder: bool = False  # also LoRA the 2-block text projection inside the DiT
     resume_from: str = ""  # path to a previously exported LoRA .safetensors (weights only)
     lora_save_dtype: str = "bf16"  # bf16 | fp16 | fp32 for the exported LoRA files
+    lora_ema: float = 0.98  # weight average (EMA) decay per image for saves, samples and probes; 0 = off (see ema.py)
     save_state: bool = False  # also save optimizer/scheduler/RNG state (resumable); final state always saved
     save_state_every: int = 0  # steps between state saves; 0 = same as save_every
     keep_states: int = 3  # rolling number of state folders to keep; 0 = keep all
@@ -287,6 +288,8 @@ class TrainConfig:
             raise ValueError(f"id_loss_backend must be arcface or facenet, got {self.id_loss_backend!r}")
         if self.id_loss_every < 1:
             raise ValueError("id_loss_every must be at least 1")
+        if not 0.0 <= self.lora_ema < 1.0:
+            raise ValueError(f"lora_ema must be 0 (off) or a decay below 1, got {self.lora_ema!r}")
         if self.automagic_groups not in ("single", "by_type"):
             raise ValueError(f"automagic_groups must be single or by_type, got {self.automagic_groups!r}")
         if self.resolution_step_up:

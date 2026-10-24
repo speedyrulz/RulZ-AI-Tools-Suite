@@ -508,7 +508,8 @@ class Form:
                           and self.w[f"target_{t}"].value],
             train_text_embedder=bool(v("train_text_embedder")), resume_from=s("resume_from"),
             lora_blocks=s("lora_blocks"),
-            lora_save_dtype=v("lora_save_dtype"), save_state=bool(v("save_state")), resume_state=s("resume_state"),
+            lora_save_dtype=v("lora_save_dtype"), lora_ema=float(v("lora_ema") or 0),
+            save_state=bool(v("save_state")), resume_state=s("resume_state"),
             save_state_every=int(v("save_state_every")), keep_states=int(v("keep_states")),
             compile_model=bool(v("compile_model")), sample_seed=int(v("sample_seed")),
             sample_walk_seed=bool(v("sample_walk_seed")), sample_before_training=bool(v("sample_before_training")),
@@ -1253,6 +1254,8 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     total = int(cfg.steps or 2000)
     every = max(100, int(round(total / 8 / 50)) * 50)
     r["save_every"] = (every, f"about 8 checkpoints over {total} steps to choose from afterwards")
+    r["lora_ema"] = (0.98, "measured by Fizgig: 5 likeness points above no average late in a run, with half the swing "
+                           "between checkpoints; longer averages (0.995) lag behind")
     r["sample_every"] = (every, "a sample set at every checkpoint shows which one to keep")
     if krea:
         r["sample_model_path"] = ("krea/Krea-2-Turbo", "Krea trains LoRAs on Raw and uses them on Turbo: previews and "
@@ -1849,12 +1852,18 @@ class Wizard:
         self.heading("Checkpoints and preview images", "What gets saved along the way, and the pictures that show "
                                                        "how training is going.")
         # the sampling model first: the step and guidance recommendations depend on it
-        self.apply_bar(["sample_model_path", "save_every", "sample_every", "sample_steps", "sample_cfg", "probe_every",
-                        "probe_steps", "probe_cfg", "probe_face_prompt", "probe_body_prompt"])
+        self.apply_bar(["sample_model_path", "save_every", "lora_ema", "sample_every", "sample_steps", "sample_cfg",
+                        "probe_every", "probe_steps", "probe_cfg", "probe_face_prompt", "probe_body_prompt"])
         with self.setting("save_every", "Save a checkpoint every",
                           "Steps between saved LoRAs (output/<job>/<job>_<step>.safetensors). Several of them let you "
                           "pick the last one before it started to overfit."):
             self.bind(ui.number("Save every", min=1, precision=0, suffix="steps"), "save_every").classes("w-full")
+        with self.setting("lora_ema", "Weight average",
+                          "Each step pulls the LoRA toward the last image it saw, so a checkpoint carries a bit of "
+                          "chance. Saving a running average of the recent steps instead (about the last 50 images at "
+                          "0.98) steadies it: checkpoints, previews and likeness probes use the average while training "
+                          "goes on as before. 0 turns it off."):
+            self.bind(ui.number("Decay", min=0, max=0.999, step=0.005, format="%.3f"), "lora_ema").classes("w-full")
         with self.setting("sample_every", "Preview images every",
                           "Steps between sample sets (0 = never). Training pauses while they render; they show up "
                           "on the Monitor and Samples tabs."):
@@ -2557,6 +2566,12 @@ def build_page(local: bool = True):
                                 .classes("w-44")
                             w["sample_every"] = ui.number("Sample every N steps (0 = off)", value=d.sample_every,
                                                           precision=0).classes("w-60")
+                            w["lora_ema"] = ui.number("Weight average decay (0 = off)", value=d.lora_ema, min=0,
+                                                      max=0.999, step=0.005, format="%.3f").classes("w-56") \
+                                .tooltip("Checkpoints, samples and likeness probes use a running average of the LoRA "
+                                         "over about the last 1 / (1 - decay) images (50 at 0.98); training goes on "
+                                         "with the raw weights. Fizgig measured 0.98 at +5 likeness points late in a "
+                                         "run with half the swing between checkpoints; 0.995 lagged behind.")
                         w["sample_prompts"] = ui.textarea("Sample prompts (one per line; empty = no samples)") \
                             .classes("w-full")
                         with fields():
@@ -3312,6 +3327,12 @@ improvement end training (two separate counts, default 1 each). Step-up needs pr
 ## Training states
 Turn on *Save training state* (LoRA, Advanced) to also write `state_XXXXXX/` folders (LoRA in fp32 + optimizer +
 scheduler + RNG). Point *Resume from training state folder* at one of them to continue exactly where it stopped.
+
+## Weight average
+*Weight average decay* (Saving & samples, default 0.98, 0 = off): checkpoints, samples and likeness probes use a
+running average of the LoRA over about the last 1 / (1 - decay) images (50 at 0.98), while training goes on with the
+raw weights. Fizgig measured 0.98 at 5 likeness points above no average late in a run, with half the swing between
+checkpoints; longer averages (0.995) lag behind. Training states keep both the raw weights and the average.
 
 ## Sampling model
 Optionally sample with a different checkpoint than you train on (for example train on Base, preview on SFT).

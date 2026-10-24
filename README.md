@@ -424,6 +424,23 @@ states) every `save_state_every` steps (0 = with each LoRA save), keeps a rollin
 (0 = all), and always writes the final state when training ends or is stopped. Set `resume_state` to one of
 those folders to continue exactly where it stopped. `resume_from` loads only LoRA weights from any exported file.
 
+## Weight average (`lora_ema`)
+
+At batch size 1 each step pulls the LoRA toward the image it just saw, so a checkpoint carries the tail of the
+shuffle. With `lora_ema: 0.98` (the default; 0 = off) every checkpoint, sample, likeness probe and `_best` file is
+made from a running average of the LoRA over roughly the last 1 / (1 - decay) images (50 at 0.98), while training
+goes on with the raw weights. The decay is per image, so the window is the same at any batch size, gradient
+accumulation or number of GPUs; it warms up over the first few hundred images and is capped at a quarter of a short
+run. Training states keep the raw weights in `lora.safetensors` and the average beside them, so a resume continues
+both; a state without one starts the average from the resumed weights. The average costs one fp32 copy of the LoRA
+(about 0.2 GB at rank 16) and under a millisecond or two per step.
+
+The default follows [Fizgig](https://github.com/shootthesound/Fizgig)'s measurement on MiniMax H3 (4-way A/B, 50
+epochs, same dataset and seed): decay 0.98 scored 61.5% likeness over epochs 41-50 against 56.5% without an average,
+with the swing between epochs down from 3.9 to 1.6 points; 0.99 smoothed without lifting it, and 0.995 averaged over
+so many steps that it lagged the run and finished below no average. Fizgig uses 0.98 for Krea 2 and MOSS-Image too;
+it has not been measured on the models here.
+
 ## Samples and monitoring
 
 `sample_seed` is the seed of the first prompt; with `sample_walk_seed` each further prompt uses seed + 1.
@@ -776,6 +793,7 @@ rulztrainer/
   sampler.py       flow-matching Euler sampler (reference schedule)
   trainer.py       training loop, saving, sampling, status.json for the UI
   checkpointing.py selective gradient checkpointing (which blocks keep their activations)
+  ema.py           weight average (EMA) of the LoRA for saves, samples and probes
   train.py         CLI entry point
   moss/model.py    MOSS-Image DiT (vendored, Apache-2.0, OpenMOSS)
   moss/loading.py  download + load (HF layout or single files), quant dispatch, encode helpers
