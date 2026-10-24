@@ -20,7 +20,9 @@ function Card({ title, description, children }: { title: string; description?: s
 /** Text input that saves on blur/Enter instead of on every keystroke. */
 function PathInput({ value, placeholder, onCommit }: { value: string; placeholder?: string; onCommit: (v: string) => void }) {
   const [draft, setDraft] = useState(value)
-  useEffect(() => setDraft(value), [value])
+  useEffect(() => {
+    setDraft(value)
+  }, [value])
   return (
     <Input
       className="font-mono text-xs"
@@ -192,7 +194,9 @@ function withSampling<K extends keyof SamplingParams>(s: SamplingParams, key: K,
 
 function NumberSetting({ label, value, step, onChange }: { label: string; value: number; step: number; onChange: (v: number) => void }) {
   const [draft, setDraft] = useState(String(value))
-  useEffect(() => setDraft(String(value)), [value])
+  useEffect(() => {
+    setDraft(String(value))
+  }, [value])
   return (
     <Field label={label}>
       <Input

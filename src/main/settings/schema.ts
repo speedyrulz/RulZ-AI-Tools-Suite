@@ -62,7 +62,18 @@ export const settingsSchema = z.object({
   toolMode: z.enum(['auto', 'all', 'dynamic']).catch(D.toolMode),
   toolBudgetTokens: z.number().int().min(500).max(200000).catch(D.toolBudgetTokens),
   compactToolResults: z.boolean().catch(D.compactToolResults),
-  keepFullToolResults: z.number().int().min(0).max(100).catch(D.keepFullToolResults)
+  keepFullToolResults: z.number().int().min(0).max(100).catch(D.keepFullToolResults),
+  apiServer: z
+    .object({
+      autoStart: z.boolean().catch(D.apiServer.autoStart),
+      port: z.number().int().min(1).max(65535).catch(D.apiServer.port),
+      bind: z.enum(['localhost', 'lan']).catch(D.apiServer.bind),
+      apiKey: z.string().catch(D.apiServer.apiKey),
+      cors: z.boolean().catch(D.apiServer.cors),
+      idleUnloadMinutes: z.number().min(0).max(100000).catch(D.apiServer.idleUnloadMinutes),
+      defaultModelId: z.string().catch(D.apiServer.defaultModelId)
+    })
+    .catch(D.apiServer)
 })
 
 export const presetSchema = z.object({

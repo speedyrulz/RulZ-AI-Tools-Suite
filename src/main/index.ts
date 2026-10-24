@@ -11,6 +11,7 @@ import { InstanceManager } from './engine/instances'
 import { broadcast, handle } from './ipc'
 import { estimateMemory } from './models/estimate'
 import { ModelLibrary } from './models/library'
+import { ApiServer } from './server/apiServer'
 import { SettingsStore } from './settings/store'
 
 const MiB = 1024 * 1024
@@ -110,6 +111,14 @@ async function main(): Promise<void> {
   const mcp = new McpManager(mcpConfigPath, (s) => broadcast('mcp:changed', s))
   void mcp.init()
 
+  const apiServer = new ApiServer({
+    instances,
+    getModels: () => library.list(),
+    getSettings: () => settings.get().apiServer,
+    onStatus: (s) => broadcast('server:changed', s),
+    onRequest: (e) => broadcast('server:request', e)
+  })
+
   const chat = new ChatService(instances, (e) => broadcast('chat:event', e), (req) => {
     const disabled = new Set(settings.get().disabledTools)
     if (req.mode === 'all') return { defs: mcp.toolDefinitions(disabled) }
@@ -168,8 +177,14 @@ async function main(): Promise<void> {
 
   handle('instances:list', () => instances.list())
   handle('instances:load', (modelId, config) => instances.load(modelId, config))
-  handle('instances:unload', (id) => instances.unload(id))
-  handle('instances:unloadAll', () => instances.unloadAll())
+  handle('instances:unload', (id) => {
+    apiServer.forget(id)
+    return instances.unload(id)
+  })
+  handle('instances:unloadAll', () => {
+    for (const i of instances.list()) apiServer.forget(i.instanceId)
+    return instances.unloadAll()
+  })
   handle('instances:log', (id) => instances.getLog(id))
 
   handle('hardware:snapshot', () => hardware.refresh())
@@ -193,6 +208,12 @@ async function main(): Promise<void> {
   handle('mcp:restart', (name) => mcp.restart(name))
   handle('mcp:callTool', (name, args) => mcp.callTool({ name, arguments: args }))
 
+  handle('server:status', () => apiServer.getStatus())
+  handle('server:start', () => apiServer.start())
+  handle('server:stop', () => apiServer.stop())
+  handle('server:log', () => apiServer.getLog())
+  handle('server:clearLog', () => apiServer.clearLog())
+
   handle('presets:list', () => settings.listPresets())
   handle('presets:save', (p) => settings.savePreset(p))
   handle('presets:delete', (id) => settings.deletePreset(id))
@@ -202,6 +223,7 @@ async function main(): Promise<void> {
   hardware.start()
   void library.scan()
   void engine.getInfo()
+  if (settings.get().apiServer.autoStart) apiServer.start().catch(() => undefined)
 
   app.on('second-instance', () => {
     if (!mainWindow) return
@@ -214,6 +236,7 @@ async function main(): Promise<void> {
     library.dispose()
     instances.killAllSync()
     void mcp.dispose()
+    void apiServer.stop()
   })
 }
 

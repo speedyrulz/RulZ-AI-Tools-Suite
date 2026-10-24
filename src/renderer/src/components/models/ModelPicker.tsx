@@ -49,7 +49,9 @@ function PickerBody({ preselect, onDone }: { preselect: string | null; onDone: (
   const selected = models.find((m) => m.id === selectedId) ?? filtered[0] ?? null
   const searchRef = useRef<HTMLInputElement>(null)
 
-  useEffect(() => searchRef.current?.focus(), [])
+  useEffect(() => {
+    searchRef.current?.focus()
+  }, [])
 
   const move = (delta: number): void => {
     if (!filtered.length) return

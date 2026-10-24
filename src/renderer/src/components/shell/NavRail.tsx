@@ -10,7 +10,7 @@ const ITEMS: { page: Page; label: string; icon: ReactNode; soon?: boolean }[] = 
   { page: 'models', label: 'My Models', icon: <FolderOpen size={19} /> },
   { page: 'mcp', label: 'MCP Tools', icon: <Plug size={19} /> },
   { page: 'discover', label: 'Discover (coming soon)', icon: <Search size={19} />, soon: true },
-  { page: 'developer', label: 'Developer (coming soon)', icon: <CodeXml size={19} />, soon: true }
+  { page: 'developer', label: 'Developer', icon: <CodeXml size={19} /> }
 ]
 
 export function NavRail() {

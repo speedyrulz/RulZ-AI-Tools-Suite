@@ -79,6 +79,52 @@ export interface AppSettings {
   compactToolResults: boolean
   /** How many of the most recent tool results are always sent in full. */
   keepFullToolResults: number
+  apiServer: ApiServerSettings
+}
+
+// ---------- Local API server ----------
+
+export interface ApiServerSettings {
+  /** Start the server when the app starts. */
+  autoStart: boolean
+  port: number
+  /** 'localhost' = 127.0.0.1 only; 'lan' = all interfaces. */
+  bind: 'localhost' | 'lan'
+  /** Empty = no authentication. */
+  apiKey: string
+  cors: boolean
+  /** Unload models the server loaded after this many idle minutes; 0 = never. */
+  idleUnloadMinutes: number
+  /** Model used when a request names none; empty = the loaded model, or an error. */
+  defaultModelId: string
+}
+
+export interface ApiServerStatus {
+  running: boolean
+  host: string
+  port: number
+  error?: string
+  startedAt?: number
+  requestCount: number
+  /** Instances the server loaded itself, with when they were last used. */
+  jitInstances: { instanceId: string; lastUsedAt: number }[]
+}
+
+export interface ApiRequestLog {
+  id: string
+  at: number
+  method: string
+  path: string
+  model?: string
+  status?: number
+  durationMs?: number
+  stream?: boolean
+  promptTokens?: number
+  completionTokens?: number
+  tokensPerSecond?: number
+  error?: string
+  /** 'loading' while the server waits for a model to load. */
+  phase?: 'loading' | 'running' | 'done'
 }
 
 /**

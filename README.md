@@ -3,7 +3,7 @@
 A Windows desktop app for running local LLMs, modelled on LM Studio's feature set. Models run in your own
 llama.cpp build (`llama-server.exe`), one process per loaded model, bound to `127.0.0.1`.
 
-**v0.1 covers chat and model loading.** Discover/downloads, the local API server, RAG and a CLI are planned.
+**v0.1 covers chat and model loading.** Discover/downloads, RAG and a CLI are planned.
 
 ## Features
 
@@ -30,6 +30,11 @@ llama.cpp build (`llama-server.exe`), one process per loaded model, bound to `12
   - **Tool-result compaction**: once you send a new message, tool results from earlier turns are sent to the
     model as their beginning and end only (the chat still shows them in full); the latest results of the turn in
     progress stay complete.
+- **Developer tab: local API server** — OpenAI-compatible (`/v1/models`, `/v1/chat/completions`, `/v1/completions`,
+  `/v1/embeddings`, `/v1/responses`) and Anthropic-compatible (`/v1/messages`) endpoints in front of your models.
+  A request for a model that isn't loaded loads it with its saved settings; models the server loaded are unloaded
+  after an idle timeout. Optional API key, CORS, localhost-only or LAN, and a live request log with token counts.
+  Default port 1234 (pick another if LM Studio is running).
 - GPU/RAM meters (nvidia-smi), dark/light theme, keyboard shortcuts (see Settings).
 
 ## Engine

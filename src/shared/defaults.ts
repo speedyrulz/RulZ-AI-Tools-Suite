@@ -53,5 +53,14 @@ export const DEFAULT_SETTINGS: AppSettings = {
   toolMode: 'auto',
   toolBudgetTokens: 6000,
   compactToolResults: true,
-  keepFullToolResults: 3
+  keepFullToolResults: 3,
+  apiServer: {
+    autoStart: false,
+    port: 1234,
+    bind: 'localhost',
+    apiKey: '',
+    cors: true,
+    idleUnloadMinutes: 10,
+    defaultModelId: ''
+  }
 }

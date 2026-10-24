@@ -1,5 +1,7 @@
 // Single source of truth for IPC channels between the renderer and the main process.
 import type {
+  ApiRequestLog,
+  ApiServerStatus,
   AppSettings,
   ChatRequest,
   Conversation,
@@ -74,6 +76,12 @@ export interface IpcInvoke {
   'mcp:restart': (name: string | null) => void
   'mcp:callTool': (name: string, args: string) => ToolResult
 
+  'server:status': () => ApiServerStatus
+  'server:start': () => ApiServerStatus
+  'server:stop': () => ApiServerStatus
+  'server:log': () => ApiRequestLog[]
+  'server:clearLog': () => void
+
   'presets:list': () => Preset[]
   'presets:save': (preset: Preset) => Preset[]
   'presets:delete': (id: string) => Preset[]
@@ -87,6 +95,8 @@ export interface IpcEvents {
   'hardware:update': HardwareSnapshot
   'chat:event': StreamEvent
   'mcp:changed': McpServerStatus[]
+  'server:changed': ApiServerStatus
+  'server:request': ApiRequestLog
 }
 
 export type InvokeChannel = keyof IpcInvoke

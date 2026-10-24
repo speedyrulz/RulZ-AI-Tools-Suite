@@ -6,7 +6,7 @@ import { useModels } from '../stores/models'
 export const SHORTCUTS: [string, string][] = [
   ['Ctrl+L', 'Open the model picker'],
   ['Ctrl+N', 'New chat'],
-  ['Ctrl+1 / 2 / 3 / 4', 'Chat / My Models / MCP Tools / Settings'],
+  ['Ctrl+1 … 5', 'Chat / My Models / MCP Tools / Developer / Settings'],
   ['Ctrl+E', 'Eject all models'],
   ['Ctrl+B', 'Toggle the chat settings panel'],
   ['Enter / Shift+Enter', 'Send / new line'],
@@ -14,7 +14,7 @@ export const SHORTCUTS: [string, string][] = [
   ['F12', 'Developer tools']
 ]
 
-const PAGE_KEYS: Record<string, Page> = { '1': 'chat', '2': 'models', '3': 'mcp', '4': 'settings' }
+const PAGE_KEYS: Record<string, Page> = { '1': 'chat', '2': 'models', '3': 'mcp', '4': 'developer', '5': 'settings' }
 
 export function useShortcuts(): void {
   useEffect(() => {
