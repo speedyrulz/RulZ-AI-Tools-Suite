@@ -8,6 +8,20 @@ on keyframes) or **re-encoded with NVIDIA NVENC** to MP4.
 
 ![RulZ Simple Video Clip Extractor with a 16:9 crop box and a 2.5 second fixed-length selection](docs/screenshot.png)
 
+## Download
+
+Grab the latest `RulZ-Simple-Video-Clip-Extractor-v*-win64.zip` from the
+[Releases page](https://github.com/speedyrulz/rulz-simple-video-clip-extractor/releases/latest),
+unzip it anywhere and run `RulZ Clip Extractor.exe`. No Python is needed, but
+ffmpeg and ffprobe must be on your PATH (see below).
+
+To build that zip yourself:
+
+```
+.venv\Scripts\python -m pip install pyinstaller
+.venv\Scripts\python packaginguild.py
+```
+
 ## Requirements
 
 - Windows 10/11, Python 3.10+ on PATH
@@ -271,6 +285,7 @@ clips exported before this fix, this repairs one without touching the video:
 - `simplecut/defaults.py` — stored preferences and the Preferences window
 - `simplecut/theme.py` — RulZ name, logo assets and the black-and-red theme
 - `simplecut/assets/` — logo, icon and theme images
+- `packaging/` — Windows release build script and the notices shipped in the zip
 - `simplecut/colormatch.py` — skin-tone matching maths and dialog
 
 ## License

@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 samples/*_clip_*
+build/
+dist/
+*.spec
