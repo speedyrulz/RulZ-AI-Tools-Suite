@@ -17,13 +17,17 @@ Effective delta = (alpha / rank) * up @ down in both.
 from __future__ import annotations
 
 import json
+import logging
 import math
-from typing import Iterable
+from pathlib import Path
+from typing import Callable, Iterable
 
 import torch
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from torch import nn
+
+log = logging.getLogger("rulztrainer")
 
 COMFY_PREFIX = "diffusion_model."
 PEFT_PREFIX = "transformer."
@@ -97,8 +101,10 @@ class LoRALinear(nn.Module):
         self.lora_down.weight.requires_grad_(trainable)
         self.lora_up.weight.requires_grad_(trainable)
         self.multiplier = 1.0
-        # extras: list of (down [r,in], up [out,r], scale) applied only when extras_enabled
+        # extras: list of (down [r,in], up [out,r], scale) applied only when extras_enabled; extra_biases: (bias
+        # offset [out], scale), a LoRA file's diff_b entries, likewise
         self.extras: list[tuple[torch.Tensor, torch.Tensor, float]] = []
+        self.extra_biases: list[tuple[torch.Tensor, float]] = []
         self.extras_enabled = False
 
     @property
@@ -116,10 +122,12 @@ class LoRALinear(nn.Module):
             h = nn.functional.linear(h, self.lora_down.weight.to(h.dtype))
             h = nn.functional.linear(h, self.lora_up.weight.to(h.dtype))
             out = out + h * (self.scale * self.multiplier)
-        if self.extras_enabled and self.extras:
+        if self.extras_enabled:
             for down, up, scale in self.extras:
                 h = nn.functional.linear(x, down.to(x.device, x.dtype))
                 out = out + nn.functional.linear(h, up.to(x.device, x.dtype)) * scale
+            for bias, scale in self.extra_biases:
+                out = out + bias.to(out.device, out.dtype) * scale
         return out
 
 
@@ -395,12 +403,7 @@ def parse_comfy_lora(state: dict[str, torch.Tensor],
         alpha = state.get(f"{stem}.alpha")
         alpha = float(alpha) if alpha is not None else default_alpha
         scale = (alpha / rank) if alpha is not None else 1.0
-        name = stem
-        for p in ("diffusion_model.", "transformer.", "lora_unet_"):
-            if name.startswith(p):
-                name = name[len(p):]
-        if name.startswith("layers_"):  # lora_unet_layers_0_proj_q style
-            name = name.replace("_", ".", 2).replace("proj_", "proj.")
+        name = _module_name(stem)
         down, up = down.float(), up.float()
         if name.endswith(".proj.qkv"):
             for n, part in zip("qkv", up.chunk(3, 0)):
@@ -410,23 +413,68 @@ def parse_comfy_lora(state: dict[str, torch.Tensor],
     return out
 
 
-def attach_extra_lora(model: nn.Module, path: str, strength: float = 1.0) -> int:
-    """Attach a sampling-only LoRA (e.g. a turbo/step-distill LoRA) to the model. Returns modules matched."""
+def _module_name(stem: str) -> str:
+    """A LoRA file's module stem without its trainer prefix (diffusion_model. / transformer. / lora_unet_)."""
+    name = stem
+    for p in ("diffusion_model.", "transformer.", "lora_unet_"):
+        if name.startswith(p):
+            name = name[len(p):]
+    if name.startswith("layers_"):  # lora_unet_layers_0_proj_q style
+        name = name.replace("_", ".", 2).replace("proj_", "proj.")
+    return name
+
+
+def parse_bias_diffs(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """{module_name: bias offset} from a LoRA file's `<module>.diff_b` entries (ComfyUI adds them to the bias)."""
+    return {_module_name(k[: -len(".diff_b")]): v.float() for k, v in state.items() if k.endswith(".diff_b")}
+
+
+def attach_extra_lora(model: nn.Module, path: str, strength: float = 1.0,
+                      rename: Callable[[str], str] | None = None) -> int:
+    """Attach a sampling-only LoRA (e.g. a turbo/step-distill LoRA) to the model, with its diff_b bias offsets.
+    rename: maps a file's module name that the model does not have to the model's own (another trainer's layout,
+    e.g. ComfyUI's Krea 2 names). Returns the modules matched; the unmatched ones are logged."""
+    state = load_file(str(path))
     peft_meta = read_peft_metadata(path)
-    entries = parse_comfy_lora(load_file(str(path)), default_alpha=peft_meta.get("lora_alpha"))
-    matched = 0
+    entries = parse_comfy_lora(state, default_alpha=peft_meta.get("lora_alpha"))
+    biases = parse_bias_diffs(state)
     names = {n for n, _ in model.named_modules()}
-    for name, (down, up, scale) in entries.items():
+
+    def resolve(name: str) -> str | None:
+        if name not in names and rename is not None:
+            name = rename(name)
         if name not in names:
-            continue
-        module = model.get_submodule(name)
-        if not isinstance(module, LoRALinear):
-            if not _is_linear_like(module):
+            return None
+        if isinstance(model.get_submodule(name), LoRALinear):
+            return name
+        return name if _is_linear_like(model.get_submodule(name)) else None
+
+    matched, missed = set(), []
+    for kind, table in (("lora", entries), ("bias", biases)):
+        for name, value in table.items():
+            target = resolve(name)
+            if target is None:
+                missed.append(name)
                 continue
-            module = _wrap(model, name, rank=1, alpha=1.0, trainable=False)
-        module.extras.append((down, up, scale * strength))
-        matched += 1
-    return matched
+            module = model.get_submodule(target)
+            if not isinstance(module, LoRALinear):
+                module = _wrap(model, target, rank=1, alpha=1.0, trainable=False)
+            if kind == "lora":
+                down, up, scale = value
+                module.extras.append((down, up, scale * strength))
+            else:
+                module.extra_biases.append((value, strength))
+            matched.add(target)
+    if missed:
+        log.warning("%s: %d of %d LoRA entries match no layer of this model (e.g. %s)", Path(path).name, len(missed),
+                    len(entries) + len(biases), ", ".join(sorted(missed)[:3]))
+    return len(matched)
+
+
+def extras_active(model: nn.Module) -> bool:
+    """Whether a sampling-only LoRA is attached and switched on."""
+    return any(isinstance(m, LoRALinear) and m.extras_enabled and (m.extras or m.extra_biases)
+               for m in model.modules())
 
 
 def set_extras_enabled(model: nn.Module, enabled: bool) -> None:

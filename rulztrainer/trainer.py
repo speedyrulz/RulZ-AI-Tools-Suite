@@ -1576,8 +1576,11 @@ class Trainer:
         for label, path, strength in (("Turbo LoRA", cfg.turbo_lora, cfg.turbo_lora_strength),
                                       ("Sampling LoRA", cfg.sample_lora, cfg.sample_lora_strength)):
             if path:
-                n = lora_mod.attach_extra_lora(model, path, strength)
+                n = lora_mod.attach_extra_lora(model, path, strength,
+                                               rename=getattr(self.arch, "lora_module_name", None))
                 log.info("%s %s: matched %d modules (strength %g, sampling only)", label, path, n, strength)
+                if label == "Turbo LoRA" and n:
+                    model.turbo_lora_attached = True  # the Krea 2 sampler then uses the distilled schedule
 
     def _get_sample_model(self):
         """Lazily load the separate sampling model (kept on CPU between samplings) with matching LoRA slots."""

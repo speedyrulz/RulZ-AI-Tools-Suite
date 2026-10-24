@@ -326,6 +326,14 @@ class Krea2Arch(Arch):
     default_sample_steps, default_sample_cfg = 28, 4.5
     latent_tag = "_qwenvae"
 
+    @staticmethod
+    def lora_module_name(name: str) -> str:
+        """ComfyUI's Krea 2 module names (blocks.N.attn.wq, tproj.1, txtfusion...) -> ours, for LoRA files trained
+        on ComfyUI's layout (turbo / distill LoRAs and others made for ComfyUI)."""
+        from .krea2.single_file import comfy_key_to_diffusers
+
+        return comfy_key_to_diffusers(name + ".weight")[: -len(".weight")]
+
     def __init__(self):
         from .krea2 import loading
 

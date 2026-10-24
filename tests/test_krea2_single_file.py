@@ -214,3 +214,52 @@ def test_text_only_qwen3vl_from_comfy_layout(tmp_path):
     assert len(a.hidden_states) == 3
     assert all(torch.equal(x, y) for x, y in zip(a.hidden_states, b.hidden_states))
     assert model.get_input_embeddings().weight.shape == (512, 64)
+
+
+def test_comfy_layout_sampling_lora_with_bias_offsets(tmp_path):
+    """A Krea 2 LoRA in ComfyUI's module names (blocks.N.attn.wq, tproj.1, txtfusion...) with diff_b bias offsets,
+    as turbo / distill LoRAs made for ComfyUI are: attached for sampling, it gives the same output as the LoRA merged
+    into the weights (ComfyUI's own way of applying it)."""
+    import copy
+
+    from rulztrainer import lora as L
+
+    torch.manual_seed(0)
+    model = Krea2Transformer(**TINY).float().eval()
+    merged = copy.deepcopy(model)
+    ours = ["transformer_blocks.0.attn.to_q", "transformer_blocks.2.ff.down", "time_mod_proj", "img_in",
+            "text_fusion.refiner_blocks.1.attn.to_gate", "final_layer.linear"]
+    comfy_names = {k[: -len(".weight")]: v[: -len(".weight")]
+                   for k, v in zip(model.state_dict(), to_comfy(model.state_dict())) if k[: -len(".weight")] in ours}
+    assert set(comfy_names) == set(ours) and comfy_names["time_mod_proj"] == "tproj.1"
+    state = {}
+    with torch.no_grad():
+        for name in ours:
+            lin = model.get_submodule(name)
+            down, up = torch.randn(4, lin.in_features) * 0.1, torch.randn(lin.out_features, 4) * 0.1
+            stem = "diffusion_model." + comfy_names[name]
+            state[f"{stem}.lora_down.weight"], state[f"{stem}.lora_up.weight"] = down, up
+            ref = merged.get_submodule(name)
+            ref.weight += 0.5 * (up @ down)
+            if lin.bias is not None:
+                diff = torch.randn(lin.out_features) * 0.1
+                state[f"{stem}.diff_b"] = diff
+                ref.bias += 0.5 * diff
+    path = tmp_path / "krea2_comfy_lora.safetensors"
+    save_file(state, str(path))
+    assert L.attach_extra_lora(model, str(path), 0.5) == 0  # without the family's names nothing matches
+    n = L.attach_extra_lora(model, str(path), 0.5, rename=archs.arch_by_name("krea2").lora_module_name)
+    assert n == len(ours)
+    L.set_extras_enabled(model, True)
+    x, enc = torch.randn(1, 64, 2, 3), torch.randn(1, 5, 3, 40)
+    with torch.no_grad():
+        assert torch.allclose(model(x, 400.0, enc, None), merged(x, 400.0, enc, None), atol=1e-5)
+        L.set_extras_enabled(model, False)
+        assert not torch.allclose(model(x, 400.0, enc, None), merged(x, 400.0, enc, None), atol=1e-3)
+    # a turbo LoRA switched on samples with the distilled schedule (fixed shift), as a Turbo model does
+    from rulztrainer.krea2.sampler import uses_distilled_schedule
+
+    model.turbo_lora_attached = True
+    assert not uses_distilled_schedule(model)  # attached but off (training forwards, probes without it)
+    L.set_extras_enabled(model, True)
+    assert uses_distilled_schedule(model)

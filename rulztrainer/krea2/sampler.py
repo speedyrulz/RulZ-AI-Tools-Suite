@@ -31,6 +31,18 @@ def krea2_sigmas(steps: int, image_seq_len: int, distilled: bool = False) -> tor
     return torch.cat([time_shift(mu, sigmas).float(), torch.zeros(1)])
 
 
+def uses_distilled_schedule(model) -> bool:
+    """Turbo (distilled) samples with a fixed shift (mu 1.15, as ComfyUI samples every Krea 2 model): a Turbo model,
+    or Raw with a turbo LoRA attached and switched on for this sampling."""
+    if getattr(model, "is_distilled", False):
+        return True
+    if getattr(model, "turbo_lora_attached", False):
+        from ..lora import extras_active
+
+        return extras_active(model)
+    return False
+
+
 @torch.no_grad()
 def sample(model, pos_embeds, pos_mask, neg_embeds, neg_mask, *, width, height, steps=28, cfg=4.5, shift=None,
            seed=0, skip_layer=-1, device="cuda", progress=None) -> torch.Tensor:
@@ -39,7 +51,7 @@ def sample(model, pos_embeds, pos_mask, neg_embeds, neg_mask, *, width, height, 
     gen = torch.Generator("cpu").manual_seed(seed)
     h, w = height // 16, width // 16
     latents = torch.randn((1, model.latent_channels, h, w), generator=gen).to(device)
-    sigmas = krea2_sigmas(steps, h * w, getattr(model, "is_distilled", False)).to(device)
+    sigmas = krea2_sigmas(steps, h * w, uses_distilled_schedule(model)).to(device)
     pos_embeds, pos_mask = pos_embeds.to(device), pos_mask.to(device)
     if neg_embeds is not None:
         neg_embeds, neg_mask = neg_embeds.to(device), neg_mask.to(device)
