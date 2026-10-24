@@ -322,7 +322,7 @@ class Krea2Arch(Arch):
                      "embed": "image/text/timestep projections and final layer"}
     default_targets = ARCH_DEFAULT_TARGETS["krea2"]  # + attention gate and text fusion (see config.py)
     text_prefixes = ("text_fusion.",)
-    supports_single_files = False
+    supports_single_files = True  # ComfyUI's Krea 2 diffusion model, Qwen3-VL-4B text encoder and Qwen-Image VAE files
     default_sample_steps, default_sample_cfg = 28, 4.5
     latent_tag = "_qwenvae"
 
@@ -416,8 +416,44 @@ def arch_by_name(name: str) -> Arch:
     return _cache[name]
 
 
+_FILE_ARCH_CACHE: dict[tuple, str | None] = {}
+
+
+def arch_from_transformer_file(path: str) -> str | None:
+    """The family a single diffusion-model file holds, read from its safetensors header (None: unknown, or the file
+    cannot be read). Cached per path, size and modification time."""
+    p = Path(path).expanduser()
+    try:
+        st = p.stat()
+    except OSError:
+        return None
+    key = (str(p), st.st_size, st.st_mtime_ns)
+    if key not in _FILE_ARCH_CACHE:
+        found = None
+        try:
+            from safetensors import safe_open
+
+            with safe_open(str(p), "pt") as f:
+                names = {k.split("diffusion_model.", 1)[-1] for k in f.keys()}
+            if "txtfusion.projector.weight" in names or "text_fusion.projector.weight" in names:
+                found = "krea2"
+            elif "shared_block_modulation.weight" in names:
+                found = "moss_image"
+        except Exception:  # noqa: BLE001
+            found = None
+        _FILE_ARCH_CACHE[key] = found
+    return _FILE_ARCH_CACHE[key]
+
+
 def guess_arch_name(cfg: TrainConfig) -> str:
-    """The architecture a config refers to: model_arch when set, else guessed from the model path or files."""
+    """The architecture a config refers to: model_arch when set, else the transformer file's own family (single
+    files), else guessed from the model path or file names."""
+    if cfg.model_arch and cfg.model_arch != "auto":
+        return cfg.model_arch
+    if cfg.model_source == "files" and cfg.transformer_file:
+        found = arch_from_transformer_file(cfg.transformer_file)
+        if found:
+            return found
     return cfg.arch_name()
 
 
@@ -440,4 +476,8 @@ def detect_arch(cfg: TrainConfig, model_dir: Path | None) -> Arch:
                 raise ValueError(f"model_arch is {cfg.model_arch!r} but {model_dir} holds a {found} transformer")
             log.info("Model architecture detected: %s", found)
             guessed = found
+    if cfg.model_source == "files" and cfg.transformer_file:
+        found = arch_from_transformer_file(cfg.transformer_file)
+        if found and found != guessed:  # guess_arch_name already follows the file unless model_arch is explicit
+            raise ValueError(f"model_arch is {cfg.model_arch!r} but {cfg.transformer_file} holds a {found} model")
     return arch_by_name(guessed)

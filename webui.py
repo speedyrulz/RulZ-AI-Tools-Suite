@@ -1714,8 +1714,10 @@ class Wizard:
             for key, title, text, kind in (
                     ("transformer_file", "Diffusion model", "ComfyUI models/diffusion_models file: bf16, fp8, int8 or "
                                                             "nvfp4.", "file"),
-                    ("text_encoder_file", "Text encoder", "ComfyUI models/text_encoders file: Qwen3.5-9B.", "file"),
-                    ("vae_file", "VAE", "ComfyUI models/vae file: the Flux2 VAE.", "file"),
+                    ("text_encoder_file", "Text encoder", "ComfyUI models/text_encoders file: Qwen3.5-9B for "
+                                                          "MOSS-Image, Qwen3-VL-4B for Krea 2.", "file"),
+                    ("vae_file", "VAE", "ComfyUI models/vae file: the Flux2 VAE for MOSS-Image, the Qwen-Image VAE for "
+                                        "Krea 2.", "file"),
                     ("tokenizer_path", "Tokenizer folder (optional)", "Left empty, the tokenizer is downloaded once "
                                                                       "(a few MB).", "dir")):
                 with self.setting(None, title, text + " Any file left empty is taken from the Hugging Face model."):
@@ -2240,17 +2242,18 @@ def build_page(local: bool = True):
                     with section("Model", "Base model, model files and GPUs", "model_training") as sec:
                         nav_items.append(("Model", "model_training", sec))
                         w["model_source"] = ui.radio([HF_SOURCE, FILE_SOURCE], value=HF_SOURCE).props("inline")
-                        with ui.column().classes("w-full gap-2").bind_visibility_from(
-                                w["model_source"], "value", lambda x: x == HF_SOURCE):
-                            with fields():
-                                w["model_preset"] = ui.select(list(MODEL_PRESETS) + [CUSTOM], value="MOSS-Image-Base",
-                                                              label="Model").classes("w-60")
-                                w["model_path"] = ui.input("Custom path or HF repo id", value=d.model_path) \
-                                    .classes("w-96 max-w-full") \
-                                    .bind_visibility_from(w["model_preset"], "value", lambda p: p == CUSTOM)
-                                for key in ("model_preset", "model_path"):  # each family has its own default targets
-                                    w[key].on_value_change(lambda _: f.follow_family_targets())
-
+                        with fields():  # the model (family) in both modes: with files it is also the HF fallback
+                            w["model_preset"] = ui.select(list(MODEL_PRESETS) + [CUSTOM], value="MOSS-Image-Base",
+                                                          label="Model").classes("w-60") \
+                                .tooltip("The model family. With single files, pick the model the files belong to: "
+                                         "anything left empty comes from it on Hugging Face, and the page's "
+                                         "model-specific settings (blocks, LoRA layers) follow it.")
+                            w["model_path"] = ui.input("Custom path or HF repo id", value=d.model_path) \
+                                .classes("w-96 max-w-full") \
+                                .bind_visibility_from(w["model_preset"], "value", lambda p: p == CUSTOM)
+                            for key in ("model_preset", "model_path"):  # each family has its own default targets
+                                w[key].on_value_change(lambda _: f.follow_family_targets())
+                            with ui.row().bind_visibility_from(w["model_source"], "value", lambda x: x == HF_SOURCE):
                                 async def on_download():
                                     dl_status.text = "Downloading / verifying... (about 30 GB on first download)"
                                     cfg = f.to_config()
@@ -2258,17 +2261,20 @@ def build_page(local: bool = True):
 
                                 ui.button("Download / verify model", icon="download", on_click=on_download) \
                                     .props("outline")
-                            dl_status = hint("")
+                        dl_status = hint("")
                         with ui.column().classes("w-full gap-3").bind_visibility_from(
                                 w["model_source"], "value", lambda x: x == FILE_SOURCE):
                             path_input(f, "transformer_file", "Diffusion model (.safetensors: bf16, fp8, int8, nvfp4)",
                                        "file", "", "w-[40rem]")
-                            path_input(f, "text_encoder_file", "Text encoder (Qwen3.5-9B .safetensors)", "file", "",
-                                       "w-[40rem]")
-                            path_input(f, "vae_file", "VAE (Flux2 .safetensors)", "file", "", "w-[40rem]")
+                            path_input(f, "text_encoder_file", "Text encoder (.safetensors: Qwen3.5-9B for MOSS-Image, "
+                                                               "Qwen3-VL-4B for Krea 2)", "file", "", "w-[40rem]")
+                            path_input(f, "vae_file", "VAE (.safetensors: Flux2 for MOSS-Image, Qwen-Image for Krea 2)",
+                                       "file", "", "w-[40rem]")
                             path_input(f, "tokenizer_path", "Tokenizer folder (optional; auto-downloads if empty)",
                                        "dir", "", "w-[40rem]")
-                            hint("Any file left empty is taken from the Hugging Face model.")
+                            hint("ComfyUI's files for MOSS-Image and Krea 2 (bf16, scaled fp8, int8, nvfp4; the family "
+                                 "is read from the diffusion model file). Any file left empty is taken from the model "
+                                 "picked above on Hugging Face. FIBO 2.0 has no single-file loader.")
                         subhead("GPUs and memory")
                         with fields():
                             w["multi_gpu"] = ui.select({"off": "single GPU",
@@ -3596,6 +3602,11 @@ are meant for **Krea-2-Turbo**, the 8-step distill, as Krea's own Krea-2 LoRAs a
 much faster than sampling Raw (28-52 steps with guidance). The 12B transformer is 25 GB in bf16; *Diffusion model
 quant* `auto` makes it int8 (13.5 GB) when the GPUs it runs on have 22 GB or more together (one 24 GB card, or two
 16 GB cards with *model split*) and nvfp4 (about 8 GB) on a single 16 GB card.
+
+Krea 2 also loads from **single ComfyUI files** (Model, "Single safetensors files"): the diffusion model
+(bf16, scaled fp8, int8 or nvfp4, finetunes and Turbo included), the Qwen3-VL-4B text encoder and the Qwen-Image VAE,
+with no Hugging Face repo needed when all three are given. Pick Krea-2-Raw as the model so the page's Krea settings
+show; a file name containing "turbo" marks the distilled model. The sampling model can be a Turbo single file too.
 
 Krea 2 LoRAs train the attention gate and the **text fusion** blocks by default, on top of the usual attention and
 feed-forward layers: the usual recipe leaves text fusion under-trained (boosting it on finished LoRAs lifted

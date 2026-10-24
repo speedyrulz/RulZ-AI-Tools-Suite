@@ -257,9 +257,23 @@ file with the HF text encoder). For decoding samples use the VAE that matches MO
 "small" VAE, `flux2-vae_small.safetensors` in ComfyUI); the encoder is identical across Flux2 VAEs, so caching
 latents works with either.
 
-Accepted weight formats: bf16 / fp16 / fp32, fp8 (upcast), ComfyUI `int8_tensorwise` with or without ConvRot
-(Hadamard rotation), and ComfyUI `nvfp4`. Those two quantized formats are decoded exactly as comfy_kitchen does
-(verified against the HF weights: re-quantizing them with RulzTrainer reproduces the ComfyUI file bit for bit).
+**Krea 2 from single files** works the same way with ComfyUI's Krea 2 files: the diffusion model (ComfyUI's own
+`blocks.N.attn.wq` layout is renamed to ours on load; `transformer_quant: auto` keeps a quantized file's format where
+it fits, converts an int8 file to nvfp4 on a single 16 GB card, and quantizes a bf16 / fp8 file for the memory it runs
+in; a file name containing "turbo" marks the distilled model, whose
+sampler shift is fixed), the Qwen3-VL-4B text encoder (ComfyUI's or the HF layout; the vision tower is dropped and the
+language model runs text-only, which gives the same features) and the Qwen-Image VAE (its original Wan layout is
+converted with diffusers' converter; the latent statistics are built in). The Qwen3-VL tokenizer comes from a
+downloaded Krea 2 repo if there is one, else `Qwen/Qwen3-VL-4B-Instruct` (not gated, a few MB). The family is read
+from the diffusion-model file's header, so the file name does not matter. Checked against the Hugging Face model:
+the VAE file matches exactly, the int8 and scaled-fp8 text encoder files match the bf16 encoder at cosine 0.999
+(quantization noise), and ComfyUI's int8_convrot DiT file matches the HF weights quantized the same way. FIBO 2.0
+has no single-file loader.
+
+Accepted weight formats: bf16 / fp16 / fp32, fp8 (upcast) and ComfyUI's scaled fp8 (`weight_scale` applied on load),
+ComfyUI `int8_tensorwise` with or without ConvRot (Hadamard rotation), and ComfyUI `nvfp4`. Those two quantized
+formats are decoded exactly as comfy_kitchen does (verified against the HF weights: re-quantizing them with
+RulzTrainer reproduces the ComfyUI file bit for bit).
 
 *Diffusion model quant* / *Text encoder quant*:
 
@@ -762,6 +776,9 @@ Hugging Face and `hf auth login`. The download skips the repo's 26 GB single-fil
   cores (see [nvfp4 compute](#nvfp4-compute-native-fp4-on-blackwell-nvfp4_matmul)): 9.2 s per step at 1 MP on an
   RTX 5060 Ti, peaking at 14 GB. Split in int8 over an RTX 5060 Ti + RTX 4060 Ti: 10.0 s per step at 1 MP, peaking
   at 11.5 / 10.5 GB, with int8's smaller error (weights only, under 1%).
+- **Single files.** `model_source: files` loads ComfyUI's Krea 2 files (diffusion model, Qwen3-VL-4B text encoder,
+  Qwen-Image VAE), including finetunes and the gated Turbo, without the Hugging Face repo; see
+  [Model sources](#model-sources-and-quantization).
 - **Text features** follow `Krea2Pipeline`: the prompt in Krea's system/user template, twelve Qwen3-VL hidden layers
   per token. The pipeline pads every prompt to 512 tokens; padding is never attended to and text tokens have no
   position in the DiT, so the cache stores only the real tokens (a few MB per caption) with the same result.

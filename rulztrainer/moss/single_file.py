@@ -23,23 +23,29 @@ FLOAT8 = {getattr(torch, n) for n in ("float8_e4m3fn", "float8_e5m2") if hasattr
 
 
 def read_state(path: str | Path, dtype=torch.bfloat16) -> dict[str, torch.Tensor | Q.QuantWeight]:
-    """Read a safetensors file. Quantized ComfyUI layers come back as QuantWeight; floats as `dtype` on CPU."""
+    """Read a safetensors file. Quantized ComfyUI layers come back as QuantWeight; floats as `dtype` on CPU.
+
+    ComfyUI's scaled fp8 (a `weight_scale` next to an fp8 `weight`, with or without a `comfy_quant` of format
+    float8_*) is dequantized here: weight x scale, as a plain tensor."""
     state: dict = {}
     quant_meta: dict[str, dict] = {}
     with safe_open(str(path), "pt") as f:
-        keys = list(f.keys())
+        keys = set(f.keys())
         for k in keys:
             if k.endswith(".comfy_quant"):
                 quant_meta[k[: -len(".comfy_quant")]] = Q.parse_comfy_quant(f.get_tensor(k))
-        for k in keys:
+        for k in sorted(keys):
             if k.endswith((".comfy_quant", ".weight_scale", ".weight_scale_2")):
                 continue
             t = f.get_tensor(k)
             base = k[: -len(".weight")] if k.endswith(".weight") else None
-            if base is not None and base in quant_meta:
+            fmt = quant_meta[base].get("format", "") if base is not None and base in quant_meta else None
+            if fmt is not None and not str(fmt).startswith("float8"):
                 s2 = f.get_tensor(f"{base}.weight_scale_2") if f"{base}.weight_scale_2" in keys else None
                 state[k] = Q.quant_weight_from_comfy(quant_meta[base], t, f.get_tensor(f"{base}.weight_scale"), s2)
                 continue
+            if base is not None and f"{base}.weight_scale" in keys:  # scaled fp8: per-tensor or per-row scale
+                t = t.to(torch.float32) * f.get_tensor(f"{base}.weight_scale").to(torch.float32)
             if t.dtype in FLOAT8:
                 t = t.to(torch.float32)
             if t.is_floating_point():

@@ -1,4 +1,5 @@
-"""Load Krea 2 components from the Hugging Face / diffusers layout (krea/Krea-2-Raw, Krea-2-Turbo) and encode.
+"""Load Krea 2 components from the Hugging Face / diffusers layout (krea/Krea-2-Raw, Krea-2-Turbo) and encode;
+single ComfyUI-style files go through krea2.single_file (model_source "files").
 
     model_index.json  Krea2Pipeline: text_encoder_select_layers, is_distilled (Turbo)
     transformer/      config.json (Krea2Transformer2DModel) + sharded diffusion_pytorch_model*.safetensors
@@ -215,43 +216,72 @@ def grad_vae(vae):
 # ---------------------------------------------------------------- config-driven entry points
 
 
-def _hf_only(cfg: TrainConfig) -> None:
-    if cfg.model_source == "files":
-        raise ValueError("Krea 2 loads from the Hugging Face layout only: use model_source 'hf' with the "
-                         "krea/Krea-2-Raw repo id or a diffusers folder")
+def _need_dir(cfg: TrainConfig, model_dir: Path | None, what: str) -> Path:
+    if model_dir is None:
+        raise ValueError(f"No {what} file is set and no Hugging Face model to take it from: set the file (model "
+                         f"source 'files') or the krea/Krea-2-Raw repo id / a diffusers folder")
+    return model_dir
 
 
-def resolve_for_config(cfg: TrainConfig) -> Path:
-    _hf_only(cfg)
+def resolve_for_config(cfg: TrainConfig) -> Path | None:
+    """Download / locate the HF model dir when any component comes from it (single files cover the rest)."""
+    if cfg.model_source == "files" and all(getattr(cfg, f) for f in ("transformer_file", "text_encoder_file", "vae_file")):
+        return None
     return moss_loading.resolve_model_dir(cfg.model_path, cfg.models_dir)
 
 
 def get_transformer(cfg: TrainConfig, model_dir: Path | None, device: str | None = None) -> Krea2Transformer:
-    _hf_only(cfg)
+    from . import single_file as ksf
+
+    use_file = moss_loading._use_file(cfg, "transformer_file")
+    if use_file:
+        moss_loading._check_files(cfg, "transformer_file")
+    else:
+        model_dir = _need_dir(cfg, model_dir, "diffusion model")
     if cfg.multi_gpu == "model_split" and device is None:
         # the trainer splits it right after loading: stay on the CPU (25 GB of bf16 fit no single 16 GB card) and
         # size "auto" for all the split GPUs
         from ..multigpu import parse_devices
 
-        return load_transformer(model_dir, "cpu", cfg.transformer_quant,
-                                quant_devices=parse_devices(cfg.devices, cfg.device))
+        gpus = parse_devices(cfg.devices, cfg.device)
+        if use_file:
+            return ksf.load_transformer_file(cfg.transformer_file, "cpu", cfg.transformer_quant, quant_devices=gpus)
+        return load_transformer(model_dir, "cpu", cfg.transformer_quant, quant_devices=gpus)
+    if use_file:
+        return ksf.load_transformer_file(cfg.transformer_file, device or cfg.device, cfg.transformer_quant)
     return load_transformer(model_dir, device or cfg.device, cfg.transformer_quant)
 
 
 def get_vae(cfg: TrainConfig, model_dir: Path | None):
-    _hf_only(cfg)
-    return load_vae(model_dir, cfg.device)
+    if moss_loading._use_file(cfg, "vae_file"):
+        from . import single_file as ksf
+
+        moss_loading._check_files(cfg, "vae_file")
+        return ksf.load_vae_file(cfg.vae_file, cfg.device)
+    return load_vae(_need_dir(cfg, model_dir, "VAE"), cfg.device)
 
 
 def get_text_encoder(cfg: TrainConfig, model_dir: Path | None):
-    _hf_only(cfg)
-    return load_text_encoder(model_dir, cfg.text_encoder_device, cfg.text_encoder_quant)
+    if moss_loading._use_file(cfg, "text_encoder_file"):
+        from transformers import AutoTokenizer
+
+        from . import single_file as ksf
+
+        moss_loading._check_files(cfg, "text_encoder_file")
+        tokenizer = AutoTokenizer.from_pretrained(str(ksf.resolve_tokenizer(cfg.tokenizer_path, cfg.models_dir)))
+        model = ksf.load_text_encoder_file(cfg.text_encoder_file, cfg.text_encoder_device, cfg.text_encoder_quant)
+        return model, tokenizer
+    return load_text_encoder(_need_dir(cfg, model_dir, "text encoder"), cfg.text_encoder_device,
+                             cfg.text_encoder_quant)
 
 
 def load_any_transformer(path: str, device, quant: str = "auto", models_dir: str = "models") -> Krea2Transformer:
+    """Load a transformer from a single .safetensors file, a diffusers directory, or a HF repo id."""
     p = Path(path).expanduser()
     if p.is_file():
-        raise ValueError("Krea 2 models load from a diffusers folder or repo id, not a single file")
+        from . import single_file as ksf
+
+        return ksf.load_transformer_file(p, device, quant)
     if p.is_dir() and (p / "transformer" / "config.json").is_file():
         return load_transformer(p, device, quant)
     return load_transformer(moss_loading.resolve_model_dir(path, models_dir), device, quant)
