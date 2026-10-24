@@ -243,6 +243,23 @@ def inject_lora(model: nn.Module, rank: int, alpha: float, targets: Iterable[str
     return injected
 
 
+@torch.no_grad()
+def mirror_lora(src: dict, dst: dict) -> None:
+    """Copy LoRA state from one model's wrappers onto another's with the same module names (a data-parallel replica,
+    the sampling model): weights (resized when the rank differs), alpha / scale / rank, on/off and dropout."""
+    for name, s in src.items():
+        d = dst[name]
+        for sp, dp in ((s.lora_down.weight, d.lora_down.weight), (s.lora_up.weight, d.lora_up.weight)):
+            if dp.shape != sp.shape:
+                dp.data = torch.empty(sp.shape, dtype=sp.dtype, device=dp.device)
+            dp.copy_(sp, non_blocking=True)
+        d.alpha, d.scale, d.rank = s.alpha, s.scale, s.rank
+        if d.trainable != s.trainable:
+            d.trainable = s.trainable
+        if getattr(d.dropout, "p", 0.0) != getattr(s.dropout, "p", 0.0):
+            d.dropout = nn.Dropout(s.dropout.p) if getattr(s.dropout, "p", 0.0) > 0 else nn.Identity()
+
+
 def lora_parameters(injected: dict[str, LoRALinear]):
     for m in injected.values():
         yield m.lora_down.weight

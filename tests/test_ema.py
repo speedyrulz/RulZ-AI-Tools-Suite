@@ -125,7 +125,7 @@ def _trainer(tmp_path, inj, model, decay=0.98):
     trainer.job_dir = tmp_path
     trainer.arch = archs.arch_by_name("moss_image")
     trainer.status = Status(tmp_path / "status.json")
-    trainer.dp = trainer.balancer = None
+    trainer.dp = trainer.balancer = trainer.race = None
     trainer.res_stage = 0
     trainer.replicas = [(model, inj, "cpu")]
     trainer.ema = LoraEMA(inj, decay) if decay else None

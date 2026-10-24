@@ -260,6 +260,10 @@ class TrainConfig:
     likeness_lr_step: float = 0.1  # relative change per decision
     likeness_curriculum: bool = False  # face/body dataset weighting + timestep bias from the score gap
     likeness_curriculum_strength: float = 1.0
+    # configuration race (see race.py): the configurations train in turn, are probed, and the lowest is dropped
+    race: bool = False
+    race_configs: list[dict] = field(default_factory=list)  # [{"name": ..., <setting>: <value>, ...}], 2 or more
+    race_warmup_probes: int = 0  # probe rounds before the first configuration is dropped
     sample_model_path: str = ""  # optional different diffusion model for sampling only: .safetensors, diffusers dir or repo id
     sample_model_quant: str = "auto"  # auto | none | int8 | int8_convrot | nvfp4
 
@@ -299,6 +303,10 @@ class TrainConfig:
             raise ValueError(f"automagic_groups must be single or by_type, got {self.automagic_groups!r}")
         if self.compile_model not in (True, False, "auto"):
             raise ValueError(f"compile_model must be true, false or auto, got {self.compile_model!r}")
+        if self.race:
+            from . import race
+
+            race.validate(self)
         if self.resolution_step_up:
             if self.step_up_patience < 1 or self.step_up_stop_patience < 1:
                 raise ValueError("step_up_patience and step_up_stop_patience must be at least 1")

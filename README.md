@@ -613,6 +613,48 @@ and only changes beyond `likeness_noise_band` count. The controller then, each i
 The scores never enter the loss; they steer data, lr and stopping. Use the same reference set and prompts for a
 whole run so the series is comparable.
 
+## Configuration race (`race`)
+
+Not sure which settings suit a dataset? `race: true` trains several configurations in one run and lets the likeness
+probes pick. Each configuration trains until its next probe (`probe_every` steps), then the next one does; once all
+of them have been probed (a round), the one with the lowest smoothed combined probe score is dropped.
+`race_warmup_probes` rounds pass before the first drop. The last one keeps training until `steps`, counted in its
+own steps, so the race costs extra steps: with N configurations, W warm-up rounds and a probe every P steps,
+P x (W x N + N(N+1)/2 - 1) steps of racing before the winner continues alone (10 configurations, 2 warm-up rounds, a
+probe every 100 steps and 3000 steps: about 9300 steps in all, 3.1x one run; the WebUI shows the total).
+
+```yaml
+race: true
+race_warmup_probes: 1
+race_configs:
+  - name: base                     # the run's own settings
+  - name: lr2e-4
+    learning_rate: 2.0e-4
+  - name: rank32_tf
+    lora_rank: 32
+    lora_alpha: 32
+    lora_targets: [q, k, v, o, ffn_up_gate, ffn_down, text_fusion]
+  - name: identity_ts
+    timestep_sampling: identity
+    lora_ema: 0
+```
+
+A configuration may change the learning rate and optimizer settings, the timestep sampling and loss settings
+(including region weights, the identity loss and the curriculum), the LoRA rank, alpha, targets, blocks and dropout,
+and caption dropout, flips and crop augmentation (the full list is `race.RACE_KEYS`); the model, quantization, GPUs,
+dataset, resolutions and probes are shared. The comparison is kept fair: every configuration starts from the same
+LoRA initialisation for its shape, sees the same images in the same order with the same noise, and is probed at the
+same own step with the same seeds. The trainer keeps one set of LoRA wrappers over every configuration's layers;
+switching parks the outgoing configuration's weights, optimizer state and weight average on the CPU, so only the
+training one takes GPU memory. Configurations that differ in region weights get their own region maps in the cache.
+
+While the race runs, a configuration's files carry its name (`<job>_<name>_<step>.safetensors`,
+`<job>_<name>_best.safetensors`, and samples and probe images prefixed with it). A dropped configuration is saved as
+`<job>_<name>_dropped.safetensors` (its weight average). The winner continues under the run's own file names, its
+best file is copied to `<job>_best.safetensors`, and `<job>_winner.yaml` holds its full settings (resume or retrain
+from it). `race.json` and the Monitor tab show every configuration's score per round. Training states are saved only
+after the race, and a race cannot resume or step up resolutions.
+
 ## Sampling with a different model
 
 `sample_model_path` (a `.safetensors` file, a diffusers folder or a repo id) plus `sample_model_quant` use another
@@ -845,6 +887,7 @@ rulztrainer/
   ema.py           weight average (EMA) of the LoRA for saves, samples and probes
   compiling.py     torch.compile settings, the compile_model auto rule, compile stats
   profiling.py     one-step GPU profile by kernel group (RULZ_PROFILE_STEP)
+  race.py          configuration race: settings, round schedule, swapping configurations' LoRAs
   train.py         CLI entry point
   moss/model.py    MOSS-Image DiT (vendored, Apache-2.0, OpenMOSS)
   moss/loading.py  download + load (HF layout or single files), quant dispatch, encode helpers

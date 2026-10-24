@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import gc
 import json
 import logging
@@ -19,6 +20,7 @@ from . import checkpointing as ckpt
 from . import compiling
 from . import lora as lora_mod
 from . import profiling
+from . import race as race_mod
 from .ema import LoraEMA
 from . import quant as Q
 from .config import TrainConfig
@@ -305,6 +307,14 @@ class Trainer:
         self.balancer = None  # multigpu.Balancer: batches per model copy per step (dp_balance)
         self.balance_hinted = False  # the dp_balance suggestion was logged
         self.resumed_dp_counts = None  # its split from a resumed training state
+        self.race = None  # race.RaceRun while a configuration race runs (and after, for its report)
+        self.last_probe = None  # (face, body, images) of the last probe
+        self.race_base = None  # the run's own config when racing (the configurations change parts of it)
+        self.race_rows = None  # [(name, config, overrides)] of the race
+        self.race_layouts = None  # [(blocks, LoRA module names)] per configuration
+        self.race_union_names = None  # the LoRA wrappers: every configuration's modules together
+        self.race_region_dirs: dict[str, Path | None] = {}  # configuration -> its own region-map folder
+        self.race_id_loss = None  # the identity loss shared by the configurations that use it
         self.compiled = False  # torch.compile active on the DiT blocks
         self.dp_quiet_steps = 0  # consecutive data-parallel steps without a new compile
         self.replicas: list[tuple] = []  # (model, device) for every training copy, primary first
@@ -434,16 +444,39 @@ class Trainer:
                 if sam_gpu:  # keep SAM 3 resident for the whole batch instead of moving it per image
                     for h in holder:
                         stack.enter_context(h.hold())
-                counts = R.cache_region_maps(items, cfg, self.face_analysis, person_fn,
-                                             progress=lambda i, n: self.status.update(step=i, total=n),
-                                             person_mask_fns=fns)
-            log.info("Region maps ready (new this run): %s; weights face %.2g / body %.2g / background %.2g",
-                     counts, cfg.face_loss_weight, cfg.body_loss_weight, cfg.background_loss_weight)
+                for rcfg, ritems in self._region_jobs(items):
+                    counts = R.cache_region_maps(ritems, rcfg, self.face_analysis, person_fn,
+                                                 progress=lambda i, n: self.status.update(step=i, total=n),
+                                                 person_mask_fns=fns)
+                    log.info("Region maps ready (new this run): %s; weights face %.2g / body %.2g / background %.2g",
+                             counts, rcfg.face_loss_weight, rcfg.body_loss_weight, rcfg.background_loss_weight)
             self.status.update(regions=counts)
             for obj in holder:
                 unload_model(obj.model if hasattr(obj, "model") else obj)
             free_cuda()
         return items
+
+    def _region_jobs(self, items) -> list[tuple]:
+        """(config, items) per set of region weight maps to build: the run's own; in a race one per distinct set of
+        region weights among the configurations that use maps (the run's own set in the usual folder, others in
+        their own folder of the cache, remembered in race_region_dirs)."""
+        if not self.race_rows:
+            return [(self.cfg, items)]
+        jobs, folders = [], {}
+        own = race_mod.region_key(self.cfg)
+        for name, vcfg, _ in self.race_rows:
+            if not vcfg.wants_regions():
+                continue
+            key = race_mod.region_key(vcfg)
+            if key not in folders:
+                folder = None if key == own else self.cfg.resolved_cache_dir() / race_mod.region_dir(vcfg)
+                folders[key] = folder
+                if folder is not None:
+                    folder.mkdir(parents=True, exist_ok=True)
+                jobs.append((vcfg, items if folder is None else race_mod.variant_items(items, dataclasses.replace(
+                    vcfg, flip_augment=True, crop_augment="face+bust"), folder)))
+            self.race_region_dirs[name] = folders[key]
+        return jobs
 
     def prepare_cache(self, items):
         cfg = self.cfg
@@ -567,6 +600,9 @@ class Trainer:
         if not cfg.lora_targets:
             cfg.lora_targets = list(self.arch.default_targets)
             log.info("LoRA targets: the %s default (%s)", self.arch.label, ", ".join(cfg.lora_targets))
+        if cfg.race:  # the dataset is prepared for whatever any configuration of the race needs
+            self.race_base = cfg
+            cfg = self.cfg = self._race_prep_config(cfg)
         items = scan_dataset(cfg)
         log.info("Dataset: %d images in %s", len(items), cfg.dataset_dir)
         items = self.analyze_dataset(items)
@@ -583,7 +619,9 @@ class Trainer:
         if n_fp4:
             self._log_nvfp4(n_fp4)
         blocks = lora_mod.parse_blocks(cfg.lora_blocks, len(model.layers))
-        unknown = [t for t in cfg.lora_targets if t not in self.arch.target_groups]
+        if self.race_rows:  # wrappers over every configuration's modules
+            blocks = self._race_lora_layout(model)
+        unknown = [t for t in cfg.lora_targets if t not in self.arch.target_groups] if not self.race_rows else []
         if unknown:
             log.warning("LoRA targets %s do not exist for %s and are ignored", unknown, self.arch.label)
         injected = lora_mod.inject_lora(model, cfg.lora_rank, cfg.lora_alpha, cfg.lora_targets,
@@ -625,28 +663,21 @@ class Trainer:
         if cfg.resume_from:
             n = lora_mod.load_lora_weights(injected, cfg.resume_from)
             log.info("Resumed %d LoRA modules from %s", n, cfg.resume_from)
-        params = list(lora_mod.lora_parameters(injected))
-        n_params = sum(p.numel() for p in params)
-        log.info("LoRA: %d modules, %.2fM trainable params, rank %d alpha %g", len(injected), n_params / 1e6,
-                 cfg.lora_rank, cfg.lora_alpha)
-        if cfg.optimizer.lower() == "automagic3" and cfg.automagic_groups == "by_type":
-            groups = lora_mod.lora_param_groups_by(injected, cfg.learning_rate, self.arch.param_group_of)
-            log.info("Automagic3: an adaptive lr per layer type (%s)", ", ".join(
-                f"{g['name']} {sum(p.numel() for p in g['params']) / 1e6:.1f}M" for g in groups))
-        else:
-            groups = lora_mod.lora_param_groups(injected, cfg.learning_rate, cfg.lora_plus_ratio)
-            if len(groups) > 1:
-                log.info("LoRA+: lora_up lr = %.2e (x%g), lora_down lr = %.2e", groups[1]["lr"], cfg.lora_plus_ratio,
-                         groups[0]["lr"])
-        optimizer = build_optimizer(cfg, groups)
-        scheduler = build_scheduler(cfg, optimizer)
+        if self.race_rows is None:
+            params = list(lora_mod.lora_parameters(injected))
+            n_params = sum(p.numel() for p in params)
+            log.info("LoRA: %d modules, %.2fM trainable params, rank %d alpha %g", len(injected), n_params / 1e6,
+                     cfg.lora_rank, cfg.lora_alpha)
+            optimizer, scheduler = self._make_optimizer(cfg, injected)
+        else:  # each configuration of the race builds its own on its first turn
+            params, optimizer, scheduler = [], None, None
         step = 0
         if cfg.resume_state:
             step = self.load_state(cfg.resume_state, injected, optimizer, scheduler, gen, rng)
             log.info("Resumed training state from %s at step %d", cfg.resume_state, step)
-        if cfg.lora_ema > 0:
+        if cfg.lora_ema > 0 and self.race_rows is None:
             per_step = cfg.batch_size * cfg.gradient_accumulation * len(self.replicas)
-            self.ema = LoraEMA(injected, cfg.lora_ema, total_images=cfg.steps * per_step)
+            self.ema = self._make_ema(cfg, injected)
             if self.resumed_ema is not None:
                 self.ema.load_state_dict(self.resumed_ema)
                 log.info("Weight average restored from the training state (%d images averaged)", self.ema.images)
@@ -706,17 +737,40 @@ class Trainer:
                      "at the highest", describe_sides(cfg), cfg.step_up_patience, cfg.step_up_stop_patience)
         elif len(self.sides) > 1:
             log.info("Training at %s mixed in every epoch", describe_sides(cfg))
-        self._enter_stage(self.res_stage, step, initial=True)
-        self.loss_watch = self._make_loss_watch(items, optimizer)
-        true_per_image_lr = (self.loss_watch is not None and cfg.per_image_lr and cfg.batch_size == 1
-                             and cfg.gradient_accumulation == 1 and len(self.replicas) == 1)
+        losses: list[float] = []
+        id_losses: list[list] = []  # [step, mean id loss] for steps that had eligible samples
         n_dev = len(self.replicas)
+
+        def bind(v):
+            """The loop's per-configuration values from the race configuration that trains now."""
+            nonlocal cfg, injected, params, optimizer, scheduler, gen, rng, step, losses, id_losses
+            nonlocal true_per_image_lr, id_w
+            st = v.state
+            cfg, injected, params = v.cfg, st["injected"], st["params"]
+            optimizer, scheduler, gen, rng = st["optimizer"], st["scheduler"], st["gen"], st["rng"]
+            step, losses, id_losses = st["step"], st["losses"], st["id_losses"]
+            true_per_image_lr, id_w = st["true_per_image_lr"], st["id_w"]
+
+        if self.race_rows is None:
+            self._enter_stage(self.res_stage, step, initial=True)
+            self.loss_watch = self._make_loss_watch(items, optimizer)
+            true_per_image_lr = (self.loss_watch is not None and cfg.per_image_lr and cfg.batch_size == 1
+                                 and cfg.gradient_accumulation == 1 and len(self.replicas) == 1)
+            id_w = idloss_weight(cfg.id_loss_weight)
+        else:
+            self.race_id_loss = self.id_loss
+            self._race_setup(injected, items)
+            bind(self.race.active)
         if self.dp is not None:
             self.dp.sync_weights()
         if cfg.sample_prompts and cfg.sample_before_training and step == 0:
             self.sample_images(model, step)
         if self.controller is not None and cfg.probe_at_start and step == 0:
             self.run_probe(model, step, optimizer, scheduler, injected)
+            if self.race is not None:  # every configuration starts from the same base model: one baseline for all
+                face, body, images = self.last_probe
+                for v in self.race.variants[1:]:
+                    v.state["controller"].update(0, face, body, images)
         model.train()
         if self.dp is not None:
             self.dp.train(True)
@@ -724,11 +778,10 @@ class Trainer:
         self.status.update(stage="training", step=step)
         start = time.time()
         start_step = step
-        losses: list[float] = []
+        compute_done = 0  # optimizer steps of every configuration (a race trains several)
         step_times: list[float] = []  # seconds per optimizer step, training only (no saves, samples or probes)
         profile_at = profiling.requested_step()
-        id_losses: list[list] = []  # [step, mean id loss] for steps that had eligible samples
-        id_w = idloss_weight(cfg.id_loss_weight)
+
         def work(job):
             """Forward + backward for one model copy on its device. Returns (loss value, per-image multipliers,
             (identity loss value, samples, seconds) or None)."""
@@ -784,7 +837,7 @@ class Trainer:
                 out.append((res, time.perf_counter() - t0, job[2].shape[2] * job[2].shape[3]))
             return out
 
-        while step < cfg.steps:
+        while step < cfg.steps or self._race_running():
             t_step = time.perf_counter()
             prof = profiling.StepProfile(self.job_dir, step + 1, self.devices) if step + 1 == profile_at else None
             if prof is not None:
@@ -879,20 +932,22 @@ class Trainer:
             if self.dp is not None:
                 self.dp.sync_weights()
             step += 1
+            compute_done += 1
             if prof is not None:
                 prof.stop(time.perf_counter() - t_step)
             step_times.append(time.perf_counter() - t_step)
             if self.balancer is not None:
-                if step - start_step > 2 and not compiled_now:  # warm-up and compiling steps are not the GPUs' speed
+                if compute_done > 2 and not compiled_now:  # warm-up and compiling steps are not the GPUs' speed
                     self.balancer.observe(timed)
                 self._balance(step)
-            if self.compiled and step - start_step == 5:
+            if self.compiled and compute_done == 5:
                 compiling.report("after 5 steps")
             losses.append(accum_loss)
             avg = sum(losses[-50:]) / len(losses[-50:])
             elapsed = time.time() - start
-            done_steps = max(1, step - start_step)
-            eta = elapsed / done_steps * (cfg.steps - step)
+            done_steps = max(1, compute_done)
+            total_steps = self.race.estimate["total"] if self.race is not None else cfg.steps - start_step
+            eta = elapsed / done_steps * max(0, total_steps - compute_done)
             lr_now = current_lr(optimizer, scheduler)
             id_extra = {}
             if step_id:
@@ -902,7 +957,7 @@ class Trainer:
                 self.id_time += sum(r[2] for r in step_id)
                 self.id_count += n_id
                 id_extra = {"id_losses": id_losses[-2000:], "id_loss": id_now}
-            if step % 5 == 0 or step == start_step + 1:
+            if step % 5 == 0 or compute_done == 1:
                 id_s = ""
                 if self.id_loss is not None and id_losses:
                     recent = [v for _, v in id_losses[-10:]]
@@ -913,12 +968,18 @@ class Trainer:
                         id_s += f", peak {torch.cuda.max_memory_allocated(self.devices[0]) / 1e9:.2f} GB"
                     id_s += ")"
                 last = step_times[-5:]
-                log.info("step %d/%d loss %.4f avg %.4f lr %.2e %.1fs/it (last %d steps %.2fs each)%s", step, cfg.steps,
-                         accum_loss, avg, lr_now, elapsed / done_steps, len(last), sum(last) / len(last), id_s)
+                who = f"[{self.race.active.name}] " if self._race_running() else ""
+                log.info("%sstep %d/%d loss %.4f avg %.4f lr %.2e %.1fs/it (last %d steps %.2fs each)%s", who, step,
+                         cfg.steps, accum_loss, avg, lr_now, elapsed / done_steps, len(last), sum(last) / len(last),
+                         id_s)
             peak = {str(d): round(torch.cuda.max_memory_allocated(torch.device(d)) / 1e9, 2) for d in self.devices
                     if str(d).startswith("cuda")} if torch.cuda.is_available() else {}
-            self.status.update(step=step, total=cfg.steps, loss=accum_loss, avg_loss=avg, elapsed=elapsed, eta=eta,
-                               lr=lr_now, losses=losses[-2000:], step_times=[round(t, 3) for t in step_times[-2000:]],
+            if self.race is not None:  # progress over every configuration's steps; the race table separately
+                id_extra = {**id_extra, "race": self._race_status(), "race_step": step}
+            self.status.update(step=compute_done if self.race is not None else step,
+                               total=self.race.estimate["total"] if self.race is not None else cfg.steps,
+                               loss=accum_loss, avg_loss=avg, elapsed=elapsed, eta=eta, lr=lr_now,
+                               losses=losses[-2000:], step_times=[round(t, 3) for t in step_times[-2000:]],
                                peak_mem=peak, **id_extra)
             if self.loss_watch is not None and self.loss_watch.epoch_complete():
                 summary = self.loss_watch.end_epoch(step)
@@ -929,14 +990,19 @@ class Trainer:
             if step % cfg.save_every == 0 and step < cfg.steps:
                 self.save(injected, step)
             state_every = cfg.save_state_every or cfg.save_every
-            if cfg.save_state and step % state_every == 0 and step < cfg.steps:
-                self.save_state(step, injected, optimizer, scheduler, gen, rng)
+            if cfg.save_state and step % state_every == 0 and step < cfg.steps and not self._race_running():
+                self.save_state(step, injected, optimizer, scheduler, gen, rng)  # (a race keeps no states)
             if cfg.sample_prompts and cfg.sample_every > 0 and step % cfg.sample_every == 0 and step < cfg.steps:
                 self.sample_images(model, step)
                 model.train()
-            if self.controller is not None and step % cfg.probe_every == 0 and step < cfg.steps:
+            racing = self._race_running()
+            if self.controller is not None and step % cfg.probe_every == 0 and (step < cfg.steps or racing):
                 stop = self.run_probe(model, step, optimizer, scheduler, injected)
                 model.train()
+                if racing:  # the race decides who goes on: record, maybe drop, and switch configuration
+                    stop = False
+                    self.race.active.state.update(step=step, losses=losses, id_losses=id_losses)
+                    bind(self._race_after_probe())
                 if stop:
                     log.info("Likeness controller: no improvement for %d probes%s, stopping at step %d",
                              cfg.step_up_stop_patience if cfg.resolution_step_up else cfg.likeness_patience,
@@ -947,11 +1013,16 @@ class Trainer:
                 break
         if self.compiled:
             compiling.report("end of training")
+        if self._race_running():
+            log.warning("Stopped before the race was decided; the final save is %s's (the others are in race.json "
+                        "and their _dropped files)", self.race.active.name)
         path = self.save(injected, step, final=True)
-        if cfg.save_state:
+        if cfg.save_state and not self._race_running():
             self.save_state(step, injected, optimizer, scheduler, gen, rng)
         if cfg.sample_prompts:
             self.sample_images(model, step)
+        if self.race is not None:
+            self._race_report()
         self.status.update(stage="finished", done=True)
         log.info("Done. Final LoRA: %s", path)
 
@@ -975,7 +1046,8 @@ class Trainer:
 
     def save(self, injected, step, final=False) -> Path:
         cfg = self.cfg
-        name = f"{cfg.job_name}.safetensors" if final else f"{cfg.job_name}_{step:06d}.safetensors"
+        tag = self._file_tag()  # a race's training configuration while the race runs
+        name = f"{cfg.job_name}{tag}.safetensors" if final else f"{cfg.job_name}{tag}_{step:06d}.safetensors"
         path = self.job_dir / name
         meta = {"ss_base_model": cfg.model_path if cfg.model_source == "hf" else Path(cfg.transformer_file).name,
                 "ss_network_dim": str(cfg.lora_rank), "ss_network_alpha": str(cfg.lora_alpha),
@@ -983,6 +1055,9 @@ class Trainer:
                 "rulztrainer_config": cfg.to_dict(), "ss_blocks": cfg.lora_blocks or "all"}
         if self.ema is not None:
             meta["rulztrainer_ema"] = f"{cfg.lora_ema:g}"
+        if self.race is not None:
+            v = self.race.active
+            meta["rulztrainer_race"] = f"{v.name}: {race_mod.format_overrides(v.overrides)}"
         with self._averaged():
             lora_mod.save_lora(injected, path, metadata=meta, dtype=cfg.lora_save_dtype, fmt=self.arch.lora_format)
         log.info("Saved %s (%s)", path, cfg.lora_save_dtype)
@@ -1065,6 +1140,8 @@ class Trainer:
 
     # ------------------------------------------------------------ sampling
     def _lora_names(self, model, blocks) -> list[str]:
+        if self.race_union_names is not None:  # a race: wrappers over every configuration's modules
+            return list(self.race_union_names)
         return self.arch.lora_module_names(model, self.cfg.lora_targets, blocks, self.cfg.train_text_embedder)
 
     # ------------------------------------------------------------ selective checkpointing
@@ -1185,6 +1262,244 @@ class Trainer:
         log.info("Checkpointing: memory allocator retries on %s; now %s", ", ".join(sorted(hit)),
                  ", ".join(f"{len(v)} kept" for v in self.kept.values()))
 
+    # ------------------------------------------------------------ configuration race (see race.py)
+    def _race_prep_config(self, cfg):
+        """The race's configurations, and the config the dataset is prepared with: flips, crops, region maps, face
+        analysis and the identity loss whenever any configuration needs them."""
+        rows = race_mod.variant_configs(cfg)
+        self.race_rows = rows
+        crops = {(r[1].crop_augment or "none").lower() for r in rows}
+        crop = "face+bust" if "face+bust" in crops else ("face" if "face" in crops else "none")
+        prep = dataclasses.replace(cfg, flip_augment=any(r[1].flip_augment for r in rows), crop_augment=crop,
+                                   region_weights=any(r[1].region_weights for r in rows),
+                                   id_loss_weight=max(r[1].id_loss_weight for r in rows),
+                                   likeness_curriculum=any(r[1].likeness_curriculum for r in rows))
+        est = race_mod.estimate_steps(len(rows), cfg.race_warmup_probes, cfg.probe_every, cfg.steps)
+        log.info("Configuration race: %d configurations, %d warm-up probe round(s), a probe every %d steps: %d rounds "
+                 "and %d probes, about %d training steps in all (%.1fx one %d-step run)", len(rows),
+                 cfg.race_warmup_probes, cfg.probe_every, est["rounds"], est["probes"], est["total"], est["ratio"],
+                 cfg.steps)
+        for name, _, over in rows:
+            log.info("  %s: %s", name, race_mod.format_overrides(over) or "the run's own settings")
+        return prep
+
+    def _race_lora_layout(self, model) -> list[int] | None:
+        """Every configuration's LoRA modules; the trainer's wrappers cover their union. Returns the union of their
+        blocks (None = all)."""
+        n = len(model.layers)
+        layouts = []
+        for name, vcfg, _ in self.race_rows:
+            unknown = [t for t in vcfg.lora_targets if t not in self.arch.target_groups]
+            if unknown:
+                log.warning("Race configuration %s: LoRA targets %s do not exist for %s and are ignored", name,
+                            unknown, self.arch.label)
+            b = lora_mod.parse_blocks(vcfg.lora_blocks, n)
+            names = self.arch.lora_module_names(model, vcfg.lora_targets, b, vcfg.train_text_embedder)
+            if not names:
+                raise ValueError(f"Race configuration {name}: no LoRA modules selected (check its targets / blocks)")
+            layouts.append((b, names))
+        order = {name: i for i, (name, _) in enumerate(model.named_modules())}
+        self.race_union_names = sorted({nm for _, ns in layouts for nm in ns}, key=order.get)
+        self.race_layouts = layouts
+        return None if any(b is None for b, _ in layouts) else sorted({i for b, _ in layouts for i in b})
+
+    def _race_setup(self, wrappers: dict, items) -> None:
+        """Build the race's configurations (LoRA weights on the CPU, own controller and items) and start the first."""
+        from .likeness import LikenessController
+
+        if self.controller is None:
+            raise ValueError("The configuration race needs working likeness probes (face/body references and their "
+                             "scoring packages); the probe controller could not be created")
+        base = self.race_base
+        variants = []
+        for i, ((name, vcfg, over), (_, names)) in enumerate(zip(self.race_rows, self.race_layouts)):
+            v = race_mod.Variant(i, name, vcfg, over, names)
+            v.init_lora(wrappers, base.seed)
+            v.state["items"] = race_mod.variant_items(items, vcfg, self.race_region_dirs.get(name))
+            v.state["controller"] = LikenessController(vcfg)
+            n_w = sum(v.down[m].numel() + v.up[m].numel() for m in names)
+            log.info("Race configuration %s: %d LoRA modules, %.2fM weights (rank %d, alpha %g), %d dataset items",
+                     name, len(names), n_w / 1e6, v.rank, v.alpha, len(v.state["items"]))
+            variants.append(v)
+        est = race_mod.estimate_steps(len(variants), base.race_warmup_probes, base.probe_every, base.steps)
+        self.race = race_mod.RaceRun(variants, race_mod.RaceSchedule([v.name for v in variants],
+                                                                     base.race_warmup_probes), wrappers, base, est)
+        self._race_activate(variants[0])
+        self._race_report()
+
+    def _race_activate(self, v) -> None:
+        """Swap configuration v in: its LoRA, settings and per-run state (built on its first turn)."""
+        race_mod.swap_in(v, self.race.wrappers)
+        if self.dp is not None:
+            self.dp.sync_weights()  # replicas follow the wrappers' shapes, scale and on/off
+        self.cfg = v.cfg
+        st = v.state
+        if not v.started:
+            self._race_start_variant(v)
+        else:
+            race_mod.onload_optimizer(st["optimizer"], v.offloaded)
+            v.offloaded = []
+            race_mod.move_average(st["ema"], to_cpu=False)
+        self.ema, self.loss_watch, self.controller = st["ema"], st["loss_watch"], st["controller"]
+        self.batcher, self.batch_iter = st["batcher"], st["batch_iter"]
+        self.curriculum_w, self.ts_logit_shift = st["curriculum_w"], st["ts_logit_shift"]
+        self.all_items, self.injected = st["items"], st["injected"]
+        il = self.race_id_loss
+        self.id_loss = il if il is not None and v.cfg.id_loss_weight > 0 and not st.get("id_vetoed") else None
+        if self.id_loss is not None:  # the shared identity loss with this configuration's settings and counters
+            il.sigma_max, il.every = float(v.cfg.id_loss_sigma_max), max(1, int(v.cfg.id_loss_every))
+            il.margin, il.min_cells = max(0, int(v.cfg.id_loss_margin_cells)), max(1, int(v.cfg.id_loss_min_face_cells))
+            il.random_ref = v.cfg.id_loss_random_ref
+            il.rng = st.setdefault("id_rng", random.Random(v.cfg.seed))
+            il.n_eligible = st.get("id_n_eligible", 0)
+        if self.compiled:  # new guards (rank, scale, on/off): let dynamo compile this configuration's graphs
+            self.dp_quiet_steps = 0
+            self.sample_graphs = set()
+        self.race.active = v
+        self.status.update(race=self._race_status())
+
+    def _race_start_variant(self, v) -> None:
+        """A configuration's first turn: its optimizer, schedule, weight average, image queue and loss watch."""
+        cfg, st = v.cfg, v.state
+        st["injected"] = {name: self.race.wrappers[name] for name in v.names}
+        st["params"] = list(lora_mod.lora_parameters(st["injected"]))
+        st["optimizer"], st["scheduler"] = self._make_optimizer(cfg, st["injected"])
+        st["ema"] = self._make_ema(cfg, st["injected"])
+        st["rng"], st["gen"] = random.Random(cfg.seed), torch.Generator("cpu").manual_seed(cfg.seed)
+        st["step"], st["losses"], st["id_losses"] = 0, [], []
+        st["curriculum_w"], st["ts_logit_shift"] = None, 0.0
+        self.all_items, self.curriculum_w, self.ts_logit_shift, self.loss_watch = st["items"], None, 0.0, None
+        self._enter_stage(0, 0, initial=True)  # its own image queue, seeded like every other configuration's
+        st["batcher"], st["batch_iter"] = self.batcher, self.batch_iter
+        st["loss_watch"] = self._make_loss_watch(st["items"], st["optimizer"])
+        st["true_per_image_lr"] = (st["loss_watch"] is not None and cfg.per_image_lr and cfg.batch_size == 1
+                                   and cfg.gradient_accumulation == 1 and len(self.replicas) == 1)
+        st["id_w"] = idloss_weight(cfg.id_loss_weight)
+        v.started = True
+
+    def _race_park(self, v) -> None:
+        """Park the configuration that trained: its weights, optimizer state and weight average go to the CPU."""
+        st = v.state
+        st.update(curriculum_w=self.curriculum_w, ts_logit_shift=self.ts_logit_shift, batcher=self.batcher,
+                  batch_iter=self.batch_iter, loss_watch=self.loss_watch)
+        if self.id_loss is not None:
+            st["id_n_eligible"] = self.id_loss.n_eligible
+        race_mod.swap_out(v, self.race.wrappers)
+        v.offloaded = race_mod.offload_optimizer(st["optimizer"])
+        race_mod.move_average(st["ema"], to_cpu=True)
+
+    def _race_after_probe(self):
+        """After the training configuration's probe: record its smoothed combined score, drop the lowest when the
+        round is complete, and switch to the configuration whose turn it is. Returns that configuration."""
+        rr = self.race
+        cur = rr.active
+        score = self.controller.combined_ema if self.controller is not None else None
+        rounds = len(rr.schedule.history)
+        dropped = rr.schedule.record(cur.idx, score)
+        if len(rr.schedule.history) > rounds:
+            entry = rr.schedule.history[-1]
+            fmt = ", ".join(f"{n} {'n/a' if s is None else f'{s:.1f}%'}" for n, s in entry["scores"].items())
+            log.info("Race round %d: %s%s", entry["round"], fmt,
+                     f" -> {entry['dropped']} is out" if entry["dropped"] else " (warm-up: nobody is dropped)")
+        if dropped is not None:
+            self._race_drop(rr.variants[dropped])
+        nxt = rr.variants[rr.schedule.current]
+        if nxt is not cur:
+            if cur.alive:
+                self._race_park(cur)
+            self._race_activate(nxt)
+            free_cuda()
+        if rr.schedule.done:
+            self._race_finish()
+        self._race_report()
+        return nxt
+
+    def _race_drop(self, v) -> None:
+        """Save a dropped configuration's LoRA (its weight average when it has one) and free its state."""
+        cfg = self.race.base_cfg
+        path = self.job_dir / f"{cfg.job_name}_{v.name}_dropped.safetensors"
+        meta = {"ss_network_dim": str(v.rank), "ss_network_alpha": str(v.alpha), "modelspec.architecture":
+                self.arch.modelspec, "rulztrainer_race": f"{v.name}: {race_mod.format_overrides(v.overrides)}",
+                "ss_steps": str(v.state.get("step", 0))}
+        if v is self.race.active:
+            with self._averaged():
+                lora_mod.save_lora(v.state["injected"], path, metadata=meta, dtype=cfg.lora_save_dtype,
+                                   fmt=self.arch.lora_format)
+        else:
+            lora_mod.save_lora(v.view(use_average=True), path, metadata=meta, dtype=cfg.lora_save_dtype,
+                               fmt=self.arch.lora_format)
+        log.info("Race: %s dropped after round %d -> %s", v.name, self.race.schedule.dropped[v.idx], path.name)
+        if str(path) not in self.status.data["saved"]:
+            self.status.data["saved"].append(str(path))
+        v.alive = False
+        keep = {k: v.state[k] for k in ("step", "controller") if k in v.state}
+        v.state.clear()
+        v.state.update(keep)
+        v.down, v.up = {}, {}
+
+    def _race_finish(self) -> None:
+        """One configuration left: it trains on as the run, with the run's own file names."""
+        import shutil
+
+        rr = self.race
+        win = rr.active
+        cfg = rr.base_cfg
+        best = self.job_dir / f"{cfg.job_name}_{win.name}_best.safetensors"
+        if best.exists():
+            shutil.copyfile(best, self.job_dir / f"{cfg.job_name}_best.safetensors")
+        win_cfg = dataclasses.replace(win.cfg, race=False, race_configs=[], race_warmup_probes=0)
+        win.cfg = win_cfg
+        self.cfg = win_cfg
+        win_cfg.save(self.job_dir / f"{cfg.job_name}_winner.yaml")
+        log.info("Race over: %s wins (%s); it trains on to step %d with the run's own file names (its settings: %s)",
+                 win.name, race_mod.format_overrides(win.overrides) or "the run's own settings", cfg.steps,
+                 f"{cfg.job_name}_winner.yaml")
+
+    def _race_status(self) -> dict:
+        rr = self.race
+        out = rr.schedule.state()
+        out["active"] = rr.active.name if rr.active is not None else None
+        out["steps"] = {v.name: (v.state.get("step", 0) if v is not rr.active else None) for v in rr.variants}
+        out["scores"] = {v.name: (v.state["controller"].combined_ema if "controller" in v.state else None)
+                         for v in rr.variants}
+        out["settings"] = {v.name: race_mod.format_overrides(v.overrides) for v in rr.variants}
+        out["estimate"] = rr.estimate
+        return out
+
+    def _race_report(self) -> None:
+        rr = self.race
+        race_mod.write_report(self.job_dir / "race.json", rr.schedule, rr.variants, {"estimate": rr.estimate})
+        self.status.update(race=self._race_status())
+
+    def _race_running(self) -> bool:
+        return self.race is not None and self.race.running
+
+    def _file_tag(self) -> str:
+        """While a race runs, files of the training configuration carry its name."""
+        return f"_{self.race.active.name}" if self._race_running() else ""
+
+    def _image_prefix(self) -> str:
+        return f"{self.race.active.name}_" if self._race_running() else ""
+
+    def _make_optimizer(self, cfg, injected):
+        if cfg.optimizer.lower() == "automagic3" and cfg.automagic_groups == "by_type":
+            groups = lora_mod.lora_param_groups_by(injected, cfg.learning_rate, self.arch.param_group_of)
+            log.info("Automagic3: an adaptive lr per layer type (%s)", ", ".join(
+                f"{g['name']} {sum(p.numel() for p in g['params']) / 1e6:.1f}M" for g in groups))
+        else:
+            groups = lora_mod.lora_param_groups(injected, cfg.learning_rate, cfg.lora_plus_ratio)
+            if len(groups) > 1:
+                log.info("LoRA+: lora_up lr = %.2e (x%g), lora_down lr = %.2e", groups[1]["lr"], cfg.lora_plus_ratio,
+                         groups[0]["lr"])
+        optimizer = build_optimizer(cfg, groups)
+        return optimizer, build_scheduler(cfg, optimizer)
+
+    def _make_ema(self, cfg, injected):
+        if cfg.lora_ema <= 0:
+            return None
+        per_step = cfg.batch_size * cfg.gradient_accumulation * len(self.replicas)
+        return LoraEMA(injected, cfg.lora_ema, total_images=cfg.steps * per_step)
+
     def _balance(self, step: int) -> None:
         """dp_balance: take a new split of the batches when the measured speeds call for one, and once point out
         `grow` when auto cannot split the step (too few batches) but the GPUs differ enough for it to pay."""
@@ -1258,16 +1573,13 @@ class Trainer:
             inj = lora_mod.inject_lora(m, cfg.lora_rank, cfg.lora_alpha, cfg.lora_targets,
                                        include_text_embedder=cfg.train_text_embedder, blocks=blocks,
                                        names=self._lora_names(m, blocks))
-            if set(inj) != set(self.injected):
+            source = self.race.wrappers if self.race is not None else self.injected
+            if set(inj) != set(source):
                 raise ValueError("Sampling model has different LoRA targets than the training model")
             self._attach_sampling_loras(m)
             self.sample_model, self.sample_injected = m, inj
-        with torch.no_grad():  # copy the current LoRA weights
-            for name, src in self.injected.items():
-                dst = self.sample_injected[name]
-                dst.lora_down.weight.copy_(src.lora_down.weight.detach().to(dst.lora_down.weight.device))
-                dst.lora_up.weight.copy_(src.lora_up.weight.detach().to(dst.lora_up.weight.device))
-                dst.alpha, dst.scale = src.alpha, src.scale
+        # the current LoRA (in a race: the training configuration's, with every other layer switched off)
+        lora_mod.mirror_lora(self.race.wrappers if self.race is not None else self.injected, self.sample_injected)
         return self.sample_model
 
     @contextlib.contextmanager
@@ -1480,7 +1792,7 @@ class Trainer:
             n_seeds = max(1, cfg.probe_seeds)
             for k in range(n_seeds):
                 jobs.append(RenderJob(prompt, w, h, cfg.probe_steps, cfg.probe_cfg, cfg.probe_seed + k,
-                                      out_dir / f"step{step:06d}_{kind}_{k}.png",
+                                      out_dir / f"{self._image_prefix()}step{step:06d}_{kind}_{k}.png",
                                       f"probe {kind} seed {k + 1}/{n_seeds} at step {step}" if len(slots) == 1
                                       else f"probe {kind} seed {k + 1}/{n_seeds}", kind))
         title = f"probes at step {step} on {len(slots)} GPUs" if len(slots) > 1 and len(jobs) > 1 else ""
@@ -1519,11 +1831,13 @@ class Trainer:
         t0 = time.time()
         with self._sampling_slots(model, step) as slots:
             face, body, images = self._probe_with(slots, step)
+        self.last_probe = (face, body, images)
         rec, actions = self.controller.update(step, face, body, images)
         append_record(self.job_dir, rec)
         fmt = lambda v: "n/a" if v is None else f"{v:.1f}%"  # noqa: E731
-        log.info("Probe step %d: face %s body %s combined %s | ema face %s body %s combined %s | best %s @%s "
-                 "| lr x%.2f | face bias %+.2f (%.1fs)", step, fmt(face), fmt(body), fmt(rec.combined),
+        who = f"[{self.race.active.name}] " if self._race_running() else ""
+        log.info("%sProbe step %d: face %s body %s combined %s | ema face %s body %s combined %s | best %s @%s "
+                 "| lr x%.2f | face bias %+.2f (%.1fs)", who, step, fmt(face), fmt(body), fmt(rec.combined),
                  fmt(rec.face_ema), fmt(rec.body_ema), fmt(rec.combined_ema), fmt(rec.best), rec.best_step,
                  rec.lr_factor, rec.face_bias, time.time() - t0)
         if "step_up" in actions:
@@ -1531,7 +1845,7 @@ class Trainer:
                      rec.stage_since_improve, fmt(rec.stage_best))
             self._enter_stage(actions["step_up"], step)
         if actions.get("save_best"):
-            path = self.job_dir / f"{cfg.job_name}_best.safetensors"
+            path = self.job_dir / f"{cfg.job_name}{self._file_tag()}_best.safetensors"
             lora_mod.save_lora(injected, path, metadata={"ss_steps": str(step), "likeness_best": f"{rec.best:.2f}",
                                                          "modelspec.architecture": self.arch.modelspec},
                                dtype=cfg.lora_save_dtype, fmt=self.arch.lora_format)
@@ -1540,6 +1854,8 @@ class Trainer:
                 self.status.data["saved"].append(str(path))
         if actions.get("id_loss_veto") and self.id_loss is not None:
             self.id_loss = None
+            if self._race_running():
+                self.race.active.state["id_vetoed"] = True
             log.warning("Identity loss vetoed at step %d: the smoothed face score %s fell more than %.1f points below "
                         "its best %s for two probes in a row; the identity loss is off for the rest of the run", step,
                         fmt(rec.face_ema), 2 * cfg.likeness_noise_band, fmt(self.controller.face_best))
@@ -1574,7 +1890,8 @@ class Trainer:
         out_dir.mkdir(exist_ok=True)
         n_prompts = len(cfg.sample_prompts)
         jobs = [RenderJob(prompt, cfg.sample_width, cfg.sample_height, cfg.sample_steps, cfg.sample_cfg,
-                          cfg.sample_seed + (i if cfg.sample_walk_seed else 0), out_dir / f"step{step:06d}_{i}.png",
+                          cfg.sample_seed + (i if cfg.sample_walk_seed else 0),
+                          out_dir / f"{self._image_prefix()}step{step:06d}_{i}.png",
                           f"sampling {i + 1}/{n_prompts} at step {step}" if len(slots) == 1
                           else f"sample {i + 1}/{n_prompts}")
                 for i, prompt in enumerate(cfg.sample_prompts)]

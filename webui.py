@@ -450,6 +450,75 @@ def gpu_stats() -> list[dict]:
 # ---------------------------------------------------------------- UI
 
 
+class RaceRows:
+    """The configuration race's rows: a name and the settings that differ from the rest of the page. .value is the
+    race_configs list, so the Form reads and fills it like any other widget."""
+
+    def __init__(self, on_change=None):
+        self.rows: list[tuple] = []  # (row element, name input, settings input, check label)
+        self.on_change = on_change
+        self.box = ui.column().classes("w-full gap-1")
+
+    @property
+    def value(self) -> list[dict]:
+        from rulztrainer import race
+
+        out = []
+        for _, name, text, _ in self.rows:
+            over = race.parse_overrides(text.value or "")
+            out.append({"name": (name.value or "").strip() or f"c{len(out) + 1}", **over})
+        return out
+
+    @value.setter
+    def value(self, rows) -> None:
+        from rulztrainer import race
+
+        for row, _, _, check in self.rows:
+            row.delete()
+            check.delete()
+        self.rows = []
+        for r in rows or []:
+            self.add(str(r.get("name") or ""), race.format_overrides(race.row_overrides(r)))
+        self.changed()
+
+    def add(self, name: str = "", text: str = "") -> None:
+        with self.box:
+            with ui.row().classes("w-full items-center gap-2 no-wrap") as row:
+                n = ui.input("Name", value=name or f"c{len(self.rows) + 1}").classes("w-44")
+                t = ui.input("Settings that differ: setting=value, ...", value=text).classes("flex-grow")
+                ui.button(icon="close", on_click=lambda _, r=row: self.remove(r)).props("flat round dense") \
+                    .tooltip("Remove this configuration")
+            check = ui.label("").classes("text-xs rz-hint")
+        self.rows.append((row, n, t, check))
+        for widget in (n, t):
+            widget.on_value_change(lambda _: self.changed())
+        self.changed()
+
+    def remove(self, row) -> None:
+        for entry in list(self.rows):
+            if entry[0] is row:
+                entry[0].delete()
+                entry[3].delete()
+                self.rows.remove(entry)
+        self.changed()
+
+    def changed(self) -> None:
+        """Check every row as it is typed: unreadable text, settings a race shares, or what the row changes."""
+        from rulztrainer import race
+
+        for _, _, text, check in self.rows:
+            try:
+                over = race.parse_overrides(text.value or "")
+            except ValueError as e:
+                check.text = f"Cannot read this: {e}"
+                continue
+            bad = [k for k in over if k not in race.ALLOWED]
+            check.text = (f"A race shares these, so a configuration cannot change them: {', '.join(bad)}" if bad else
+                          f"Changes {', '.join(over)}" if over else "The page's own settings")
+        if self.on_change is not None:
+            self.on_change()
+
+
 class Form:
     """Holds the NiceGUI widgets and converts to/from TrainConfig."""
 
@@ -566,6 +635,8 @@ class Form:
             crop_skip_face_frac=float(v("crop_skip_face_frac")), crop_skip_cover=float(v("crop_skip_cover")),
             crop_face_caption=v("crop_face_caption") or "", crop_bust_caption=v("crop_bust_caption") or "",
             crop_augment_weight=float(v("crop_augment_weight")),
+            race=bool(v("race")), race_warmup_probes=int(v("race_warmup_probes") or 0),
+            race_configs=self.w["race_configs"].value,
         )
 
     def from_config(self, cfg: TrainConfig) -> None:
@@ -2043,6 +2114,10 @@ def build_page(local: bool = True):
     def start_job() -> bool:
         try:
             cfg = f.to_config()
+            if cfg.race:  # the race's own checks before a model loads (step budget, settings, probes)
+                from rulztrainer import race
+
+                race.validate(cfg)
         except (TypeError, ValueError) as e:
             status_msg.text = f"A setting is invalid: {e}"
             ui.notify(status_msg.text, type="negative")
@@ -2913,6 +2988,60 @@ def build_page(local: bool = True):
                                                                      value=d.likeness_noise_band, step=0.5) \
                                     .classes("w-48")
 
+                    # ---- Configuration race
+                    with section("Configuration race", "Several configurations, the probes pick the winner",
+                                 "emoji_events", open_=False) as sec:
+                        nav_items.append(("Configuration race", "emoji_events", sec))
+                        hint("Each configuration below trains until its next probe, then the next one does. Once all of "
+                             "them have been probed (a round), the one with the lowest smoothed likeness score is "
+                             "dropped; the last one left trains until Steps, which counts its own steps, so the race "
+                             "adds the others' steps on top. They all start from the same LoRA initialisation and see "
+                             "the same images and noise. A configuration changes only what its row lists; everything "
+                             "else on this page is shared. Needs the likeness probes above.")
+                        with fields():
+                            w["race"] = ui.switch("Race these configurations", value=d.race)
+                            w["race_warmup_probes"] = ui.number("Warm-up probe rounds (nobody is dropped)",
+                                                                value=d.race_warmup_probes, min=0, precision=0) \
+                                .classes("w-72")
+                        race_summary = hint("")
+
+                        def race_summary_update():
+                            from rulztrainer import race
+
+                            try:
+                                rows = w["race_configs"].value
+                            except ValueError as e:
+                                race_summary.text = f"Check the rows: {e}"
+                                return
+                            steps, every = int(w["steps"].value or 0), int(w["probe_every"].value or 0)
+                            warmup = int(w["race_warmup_probes"].value or 0)
+                            if len(rows) < 2 or every <= 0:
+                                race_summary.text = ("Add at least two configurations." if len(rows) < 2 else
+                                                     "Set 'Probe every N steps' above: the race runs on the probes.")
+                                return
+                            est = race.estimate_steps(len(rows), warmup, every, steps)
+                            race_summary.text = (
+                                f"{len(rows)} configurations: {est['rounds']} rounds and {est['probes']} probes, about "
+                                f"{est['total']} training steps in all ({est['ratio']:.1f}x the {steps}-step run)"
+                                + (f". Steps must be at least {est['race_own_steps']} for the race to finish."
+                                   if steps < est["race_own_steps"] else "."))
+
+                        w["race_configs"] = RaceRows(on_change=race_summary_update)
+                        w["race_configs"].value = d.race_configs
+                        with ui.row().classes("items-center gap-2"):
+                            ui.button("Add configuration", icon="add",
+                                      on_click=lambda: w["race_configs"].add()).props("outline")
+                        for key in ("steps", "probe_every", "race_warmup_probes"):
+                            w[key].on_value_change(lambda _: race_summary_update())
+                        with advanced("What a configuration may change"):
+                            from rulztrainer.race import RACE_KEYS
+
+                            for group, keys in RACE_KEYS.items():
+                                ui.label(f"{group}: {', '.join(keys)}").classes("text-xs rz-mono")
+                            hint('Lists in brackets (lora_targets=[q, k, v, o]); quote a value with a comma '
+                                 '(lora_blocks="10-31,40"). Rank, layers and blocks may differ: each configuration '
+                                 'keeps its own LoRA.')
+
                 def jump(exp):
                     exp.value = True
                     ui.run_javascript(f"getHtmlElement({exp.id}).scrollIntoView({{behavior: 'smooth', block: 'start'}})")
@@ -2980,6 +3109,17 @@ def build_page(local: bool = True):
                     ], rows=[], row_key="path", pagination=15).props("flat dense").classes("w-full text-xs")
                 lw_exp.visible = False
                 lw_state = {"sig": None}
+                with section("Configuration race", "Smoothed probe score per configuration; the lowest leaves after "
+                             "every round", "emoji_events") as race_exp:
+                    race_label = hint("")
+                    race_table = ui.table(columns=[
+                        {"name": "name", "label": "Configuration", "field": "name", "align": "left"},
+                        {"name": "state", "label": "Status", "field": "state", "align": "left"},
+                        {"name": "score", "label": "Score now", "field": "score"},
+                        {"name": "rounds", "label": "Score after each round", "field": "rounds", "align": "left"},
+                        {"name": "settings", "label": "Settings", "field": "settings", "align": "left"}],
+                        rows=[], row_key="name").classes("w-full")
+                race_exp.visible = False
                 with section("Likeness probes & controller", "Smoothed probe scores and controller state",
                              "insights") as probe_exp:
                     probe_label = hint("")
@@ -3167,6 +3307,25 @@ def build_page(local: bool = True):
                                          if med is not None else f"Epoch {lw.get('epoch')}: waiting for the first epoch")
                         lw_table.rows = lw.get("rows") or []
                         lw_table.update()
+                rc = st.get("race")
+                race_exp.visible = bool(rc)
+                if rc:
+                    names, dropped = rc.get("names") or [], rc.get("dropped") or {}
+                    f1 = lambda x: "n/a" if x is None else f"{x:.1f}%"  # noqa: E731
+                    rows = []
+                    for n in names:
+                        state = ("winner" if rc.get("winner") == n else f"out after round {dropped[n]}" if n in dropped
+                                 else "training" if rc.get("active") == n else "waiting its turn")
+                        per_round = [h["scores"].get(n) for h in rc.get("history") or [] if n in h["scores"]]
+                        rows.append({"name": n, "state": state, "score": f1((rc.get("scores") or {}).get(n)),
+                                     "rounds": " / ".join(f1(s) for s in per_round) or "-",
+                                     "settings": (rc.get("settings") or {}).get(n) or "the page's own settings"})
+                    race_table.rows = rows
+                    race_table.update()
+                    est = rc.get("estimate") or {}
+                    race_label.text = (f"{rc.get('winner')} won; it trains on to the end" if rc.get("winner") else
+                                       f"Round {rc.get('round')}: {len(rc.get('alive') or [])} of {len(names)} "
+                                       f"configurations left, about {est.get('total')} steps in all")
                 probes = st.get("probes") or []
                 if probes:
                     probe_exp.visible = True
@@ -3394,6 +3553,18 @@ neutral, and auto crops *hurt* when the crops had to be upscaled. Suggested reci
 high-resolution (crops are never upscaled by default), timesteps left at `logit_normal`.
 LoRA rules of thumb: LoRA lr is ~10x a full fine-tune lr and nearly rank-independent; keep MLP layers in the
 targets; small batches with more steps beat large batches.
+
+## Configuration race
+*Configuration race* (Train tab, after the likeness probes) trains several configurations in turn: each trains until
+its next probe, then the next one. After a round (every configuration probed once more) the one with the lowest
+smoothed likeness score is dropped, after *Warm-up probe rounds* rounds without drops. The last one trains until
+*Steps*, counted in its own steps, so the race adds the others' steps (the section shows the total). Each row names a
+configuration and the settings it changes, for example `learning_rate=2e-4, lora_rank=32` or
+`lora_targets=[q, k, v, o], timestep_sampling=identity`; the rest of the page is shared. All of them start from the
+same LoRA initialisation and see the same images and noise. Files of a configuration carry its name while the race
+runs (`<job>_<name>_<step>`, `<job>_<name>_best`); a dropped one is saved as `<job>_<name>_dropped`; the winner
+continues with the run's own names, and `<job>_winner.yaml` holds its settings. Training states are only saved after
+the race. The Monitor tab shows each configuration's score per round.
 
 ## Using in ComfyUI
 ComfyUI supports MOSS-Image natively. Copy the `.safetensors` to `ComfyUI/models/loras/` and use the standard

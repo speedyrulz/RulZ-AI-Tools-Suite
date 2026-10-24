@@ -53,13 +53,12 @@ class DataParallelLoRA:
 
     @torch.no_grad()
     def sync_weights(self) -> None:
-        """Broadcast the primary LoRA weights (and alpha) to every replica."""
+        """Broadcast the primary LoRA weights (and alpha / rank / on-off, which a configuration race switches) to
+        every replica."""
+        from .lora import mirror_lora
+
         for _, inj, _ in self.replicas:
-            for name, src in self.primary.items():
-                dst = inj[name]
-                dst.lora_down.weight.copy_(src.lora_down.weight, non_blocking=True)
-                dst.lora_up.weight.copy_(src.lora_up.weight, non_blocking=True)
-                dst.alpha, dst.scale = src.alpha, src.scale
+            mirror_lora(self.primary, inj)
 
     @torch.no_grad()
     def reduce_grads(self) -> None:
