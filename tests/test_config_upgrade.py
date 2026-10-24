@@ -69,3 +69,39 @@ def test_dialog_start_dir_and_repo_example():
     assert webui.dialog_start_dir(str(root / "configs" / "example.yaml")) == str(root / "configs")
     assert webui._is_repo_example("configs/example.yaml")
     assert not webui._is_repo_example("configs/test.yaml")
+
+
+def test_lora_targets_default_per_family(tmp_path):
+    """An empty lora_targets (new configs, and old ones without the key) means the family's default groups; a config
+    that lists its targets keeps them."""
+    from rulztrainer.config import ARCH_DEFAULT_TARGETS
+
+    path = tmp_path / "old.yaml"
+    path.write_text(OLD + "model_path: krea/Krea-2-Raw\n", encoding="utf-8")
+    cfg, missing, _ = TrainConfig.load_report(path)
+    assert "lora_targets" in missing and cfg.lora_targets == []
+    assert cfg.resolved_lora_targets() == list(ARCH_DEFAULT_TARGETS["krea2"])
+    path.write_text(OLD + "model_path: krea/Krea-2-Raw\nlora_targets: [q, k]\n", encoding="utf-8")
+    assert TrainConfig.load_report(path)[0].resolved_lora_targets() == ["q", "k"]
+    assert TrainConfig().resolved_lora_targets() == ["q", "k", "v", "o", "ffn_up_gate", "ffn_down"]
+
+
+def test_form_follows_the_family_default_targets():
+    pytest.importorskip("nicegui")
+    import webui
+
+    class Widget:
+        def __init__(self, value):
+            self.value = value
+
+    form = webui.Form()
+    form.w.update(model_preset=Widget("MOSS-Image-Base"), model_path=Widget(""))
+    for t in webui.TARGETS + list(webui.EXTRA_TARGETS):
+        form.w[f"target_{t}"] = Widget(t in webui.ARCH_DEFAULT_TARGETS["moss_image"])
+    form.w["model_preset"].value = "Krea-2-Raw"
+    form.follow_family_targets()
+    assert form.ticked_targets() == set(webui.ARCH_DEFAULT_TARGETS["krea2"])
+    form.w["target_text_fusion"].value = False  # the user's own choice is kept on the next model change
+    form.w["model_preset"].value = "MOSS-Image-Base"
+    form.follow_family_targets()
+    assert "text_fusion" not in form.ticked_targets() and "attn_gate" in form.ticked_targets()

@@ -498,6 +498,10 @@ Four levers change the training objective and data for likeness, all off by defa
   the curriculum; `crop_augment_weight` scales how often they are drawn.
 - **LoRA+** (`lora_plus_ratio`, 16 = paper): the `lora_up` matrices train at lr x ratio for faster convergence
   (AdamW-style optimizers; ignored by automagic3). Resuming a state requires the same ratio.
+- **Automagic lr groups** (`automagic_groups: by_type`, automagic3 only): text-side layers (Krea's text fusion,
+  MOSS's text projection, FIBO's perceiver), attention, feed-forward and the rest each adapt their own learning
+  rate instead of one shared rate the largest group dominates. Fizgig trains Krea 2 this way (its text fusion is the
+  slow minority), with `automagic_polarity_history: 16`. Resuming a state requires the same setting.
 
 The face analysis cache is `<dataset>/.rulz_cache/faces.json`; the Train tab has preview buttons for region
 maps and crops.
@@ -681,7 +685,14 @@ Hugging Face and `hf auth login`. The download skips the repo's 26 GB single-fil
   other models (16-pixel cells either way).
 - **LoRA targets**: the usual groups map onto `attn.to_q/k/v`, `attn.to_out.0`, `ff.gate/up`, `ff.down`; Krea 2
   adds `attn_gate` (the sigmoid output gate of every attention), `text_fusion` and `embed`. Krea's own LoRAs adapt all
-  of them (rank 32).
+  of them (rank 32). **By default Krea 2 trains the usual groups plus `attn_gate` and `text_fusion`**
+  (`lora_targets: []` means the family's default; a config that lists its targets keeps them). The text-fusion stack
+  (2 layerwise + 2 refiner blocks mixing the 12 text-encoder layers) is under-trained by the attention + feed-forward
+  recipe: in [Fizgig](https://github.com/shootthesound/Fizgig)'s tests, scaling a finished LoRA's text-fusion blocks
+  x3 lifted likeness 2-7 points on every LoRA but an overtrained one. At rank 16 this adds 8.9M LoRA weights (48.2M ->
+  57.1M). The text-fusion blocks are checkpointed like the main ones, and since their gradient flows back through
+  every block, `lora_blocks` no longer skips the backward of the earlier blocks while they are trained. ComfyUI loads
+  these keys (`transformer.text_fusion.*` and `attn.to_gate` map to its `txtfusion.*` / `attn.gate`).
 - **Export** is the diffusers / PEFT format with the same module names as Krea's LoRAs
   (`transformer.transformer_blocks.<n>.attn.to_q.lora_A.weight`), with the adapter config (alpha) in the metadata.
   Loaders that ignore the metadata assume alpha = rank, so keep alpha equal to rank (the default) for those.

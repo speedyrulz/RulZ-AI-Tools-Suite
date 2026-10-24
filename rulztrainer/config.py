@@ -17,6 +17,12 @@ MODEL_PRESETS = {
     "Krea-2-Turbo": "krea/Krea-2-Turbo",
 }
 ARCH_NAMES = ("moss_image", "fibo2", "krea2")
+# LoRA target groups each family trains when lora_targets is empty. Krea 2 adds the attention output gate and its
+# text-fusion stack, which Fizgig measured to be under-trained by the attention + feed-forward recipe (scaling a
+# finished LoRA's text-fusion blocks x3 lifted likeness 2-7 points on several Krea 2 LoRAs).
+_CORE_TARGETS = ("q", "k", "v", "o", "ffn_up_gate", "ffn_down")
+ARCH_DEFAULT_TARGETS = {"moss_image": _CORE_TARGETS, "fibo2": _CORE_TARGETS,
+                        "krea2": _CORE_TARGETS + ("attn_gate", "text_fusion")}
 
 
 # Named presets: values applied over a config (UI toggle, --preset on the CLI, or `preset:` in YAML).
@@ -126,7 +132,7 @@ class TrainConfig:
     lora_rank: int = 16
     lora_alpha: float = 16.0
     lora_dropout: float = 0.0
-    lora_targets: list[str] = field(default_factory=lambda: ["q", "k", "v", "o", "ffn_up_gate", "ffn_down"])
+    lora_targets: list[str] = field(default_factory=list)  # target groups; [] = the family's (ARCH_DEFAULT_TARGETS)
     lora_blocks: str = ""  # DiT blocks to train, e.g. "0-41" (all), "21-41", "10-31,40", "even"; empty = all
     train_text_embedder: bool = False  # also LoRA the 2-block text projection inside the DiT
     resume_from: str = ""  # path to a previously exported LoRA .safetensors (weights only)
@@ -148,6 +154,8 @@ class TrainConfig:
     automagic_max_lr: float = 1e-3  # automagic3: hard ceiling for the adapted lr
     automagic_polarity_history: int = 8  # automagic3: sign-history window (2-64)
     automagic_clip_threshold: float = 1.0  # automagic3: update trust region
+    automagic_groups: str = "single"  # automagic3: single (one adaptive lr) | by_type (text / attention / feed-forward /
+    #                                   other layers each adapt their own; Fizgig's setup for Krea 2's text fusion)
     lr_scheduler: str = "constant"  # constant | cosine | linear
     warmup_steps: int = 50
     max_grad_norm: float = 1.0
@@ -265,6 +273,10 @@ class TrainConfig:
         hint = " ".join([self.model_path or "", self.transformer_file or ""]).lower()
         return "fibo2" if "fibo" in hint else "krea2" if "krea" in hint else "moss_image"
 
+    def resolved_lora_targets(self) -> list[str]:
+        """lora_targets, or the model family's default groups when it is empty."""
+        return list(self.lora_targets) or list(ARCH_DEFAULT_TARGETS[self.arch_name()])
+
     def validate(self) -> None:
         if self.model_arch not in ("auto", *ARCH_NAMES):
             raise ValueError(f"model_arch must be auto or one of {ARCH_NAMES}, got {self.model_arch!r}")
@@ -275,6 +287,8 @@ class TrainConfig:
             raise ValueError(f"id_loss_backend must be arcface or facenet, got {self.id_loss_backend!r}")
         if self.id_loss_every < 1:
             raise ValueError("id_loss_every must be at least 1")
+        if self.automagic_groups not in ("single", "by_type"):
+            raise ValueError(f"automagic_groups must be single or by_type, got {self.automagic_groups!r}")
         if self.resolution_step_up:
             if self.step_up_patience < 1 or self.step_up_stop_patience < 1:
                 raise ValueError("step_up_patience and step_up_stop_patience must be at least 1")

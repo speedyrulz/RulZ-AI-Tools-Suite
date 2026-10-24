@@ -172,6 +172,20 @@ def format_blocks(blocks: Iterable[int]) -> str:
     return ",".join(parts)
 
 
+def backprop_blocks(model: nn.Module, injected: dict, blocks: list[int] | None) -> list[int] | None:
+    """The trained blocks as the backward pass sees them: `blocks` when every LoRA sits in the DiT blocks or after
+    them (the head), so the blocks before the first trained one stay forward-only; None (every block runs a backward)
+    when a LoRA sits before the blocks (Krea's text fusion, the text / patch / timestep projections, MOSS's text
+    embedder, FIBO's refiners), since its gradient flows back through all of them."""
+    if blocks is None:
+        return None
+    tail = getattr(model, "split_tail_modules", None)
+    after = [model.layers, *(tail() if tail else [m for m in (getattr(model, "final_norm_video", None),
+                                                             getattr(model, "final_linear_video", None)) if m])]
+    inside = {id(m) for part in after for m in part.modules()}
+    return blocks if all(id(mod) in inside for mod in injected.values()) else None
+
+
 def _wrap(model: nn.Module, name: str, rank: int, alpha: float, dropout: float = 0.0, trainable: bool = True):
     module = model.get_submodule(name)
     if isinstance(module, LoRALinear):
@@ -243,6 +257,14 @@ def lora_param_groups(injected: dict[str, LoRALinear], lr: float, plus_ratio: fl
         return [{"params": downs, "lr": lr, "name": "lora_down"},
                 {"params": ups, "lr": lr * plus_ratio, "name": "lora_up"}]
     return [{"params": downs + ups, "lr": lr, "name": "lora"}]
+
+
+def lora_param_groups_by(injected: dict[str, LoRALinear], lr: float, group_of) -> list[dict]:
+    """One param group per layer type (group_of(module name) -> type), for optimizers that adapt one lr per group."""
+    groups: dict[str, list] = {}
+    for name, m in injected.items():
+        groups.setdefault(group_of(name), []).extend([m.lora_down.weight, m.lora_up.weight])
+    return [{"params": ps, "lr": lr, "name": g} for g, ps in sorted(groups.items())]
 
 
 def set_multiplier(injected: dict[str, LoRALinear], value: float) -> None:

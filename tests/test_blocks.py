@@ -42,3 +42,27 @@ def test_inject_with_block_subset_and_backward_skips_early_blocks():
     model2 = MOSSImageTransformer(**TINY).to(torch.bfloat16)
     inj_all = L.inject_lora(model2, 4, 4, targets)
     assert len(inj_all) == 6 * 6
+
+
+def test_backprop_blocks_counts_lora_before_the_blocks():
+    """A LoRA before the DiT blocks (text embedder, Krea text fusion) gets its gradient through every block, so the
+    backward no longer starts at the first trained block (model-split costs and checkpoint candidates follow)."""
+    from rulztrainer import archs
+    from rulztrainer.krea2.model import Krea2Transformer
+
+    targets = ["q", "k", "v", "o", "ffn_up_gate", "ffn_down"]
+    moss = MOSSImageTransformer(**TINY)
+    assert L.backprop_blocks(moss, L.inject_lora(moss, 4, 4, targets, blocks=[3, 4, 5]), [3, 4, 5]) == [3, 4, 5]
+    moss = MOSSImageTransformer(**TINY)
+    inj = L.inject_lora(moss, 4, 4, targets, blocks=[3, 4, 5], include_text_embedder=True)
+    assert any(n.startswith("text_embedder.") for n in inj) and L.backprop_blocks(moss, inj, [3, 4, 5]) is None
+    assert L.backprop_blocks(moss, inj, None) is None
+    krea_arch = archs.arch_by_name("krea2")
+    for groups, want in ((["q", "attn_gate"], [1, 2]), (["q", "text_fusion"], None), (["q", "embed"], None)):
+        krea = Krea2Transformer(in_channels=64, num_layers=3, attention_head_dim=16, num_attention_heads=4,
+                                num_key_value_heads=2, intermediate_size=96, timestep_embed_dim=32, text_hidden_dim=40,
+                                num_text_layers=3, text_num_attention_heads=4, text_num_key_value_heads=4,
+                                text_intermediate_size=56, num_layerwise_text_blocks=1, num_refiner_text_blocks=1,
+                                axes_dims_rope=(4, 6, 6))
+        inj = L.inject_lora(krea, 4, 4, groups, names=krea_arch.lora_module_names(krea, groups, [1, 2]))
+        assert L.backprop_blocks(krea, inj, [1, 2]) == want, groups

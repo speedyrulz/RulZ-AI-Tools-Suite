@@ -140,9 +140,14 @@ def test_lora_names_match_krea_layout_and_export(tmp_path):
     assert sorted(everything) == sorted(linears)  # all groups together = every Linear, as Krea's own LoRAs adapt
     assert KREA.lora_module_names(ours, ["q"], [0, 2]) == ["transformer_blocks.0.attn.to_q",
                                                            "transformer_blocks.2.attn.to_q"]
+    # the default adds the attention gate and the text-fusion stack (3 blocks x 8 Linears + the layer projector)
     default = KREA.lora_module_names(ours, KREA.default_targets, None)
-    assert len(default) == 3 * 7 and not any("to_gate" in n or n.startswith("text_fusion") for n in default)
-    names = KREA.lora_module_names(ours, ["q", "attn_gate", "ffn_down", "embed"], None)
+    assert len(default) == 3 * 8 + 3 * 8 + 1
+    assert "transformer_blocks.1.attn.to_gate" in default and "text_fusion.projector" in default
+    assert not any(n.split(".")[0] in KREA.EMBED for n in default)
+    assert TrainConfig(model_path="krea/Krea-2-Raw").resolved_lora_targets() == list(KREA.default_targets)
+    assert TrainConfig(lora_targets=["q"], model_path="krea/Krea-2-Raw").resolved_lora_targets() == ["q"]
+    names = KREA.lora_module_names(ours, ["q", "attn_gate", "ffn_down", "embed", "text_fusion"], None)
     inj = L.inject_lora(ours, 4, 8.0, ["q"], names=names)
     with torch.no_grad():
         for mod in inj.values():
@@ -154,6 +159,8 @@ def test_lora_names_match_krea_layout_and_export(tmp_path):
     state = load_file(str(path))
     assert "transformer.transformer_blocks.0.attn.to_gate.lora_A.weight" in state
     assert "transformer.final_layer.linear.lora_B.weight" in state and "transformer.img_in.lora_A.weight" in state
+    assert "transformer.text_fusion.refiner_blocks.1.attn.to_q.lora_A.weight" in state
+    assert "transformer.text_fusion.projector.lora_B.weight" in state
     # merged into diffusers' model the PEFT way (W + alpha / r * B @ A), it predicts what our LoRA model predicts
     with torch.no_grad():
         for name in names:

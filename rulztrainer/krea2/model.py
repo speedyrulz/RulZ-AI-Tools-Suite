@@ -142,14 +142,17 @@ class TextFusion(nn.Module):
         self.refiner_blocks = nn.ModuleList(
             [TextFusionBlock(dim, heads, kv_heads, intermediate_size, eps) for _ in range(num_refiner)])
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None, run=None) -> torch.Tensor:
+        """run(block, *args): the transformer's block runner, so these blocks are checkpointed like the main ones
+        (with a LoRA here they would otherwise keep every activation: several MB per text token)."""
+        run = run or (lambda block, *args: block(*args))
         batch, seq, layers, dim = x.shape
         h = x.reshape(batch * seq, layers, dim)
         for block in self.layerwise_blocks:
-            h = block(h.contiguous())
+            h = run(block, h.contiguous())
         h = self.projector(h.reshape(batch, seq, layers, dim).permute(0, 1, 3, 2)).squeeze(-1)
         for block in self.refiner_blocks:
-            h = block(h, mask)
+            h = run(block, h, mask)
         return h
 
 
@@ -304,7 +307,7 @@ class Krea2Transformer(nn.Module):
             m = encoder_attention_mask.to(device=device, dtype=torch.bool)
             text_mask = m[:, None, None, :]
             mask = torch.cat([m, m.new_ones(batch, height * width)], dim=1)[:, None, None, :]
-        enc = self.txt_in(self.text_fusion(encoder_hidden_states.to(device, dtype), text_mask))
+        enc = self.txt_in(self.text_fusion(encoder_hidden_states.to(device, dtype), text_mask, run=self._run))
         x = self.img_in(hidden_states.flatten(2).transpose(1, 2).to(dtype))
         x = torch.cat([enc, x], dim=1)
         cos, sin = rope_tables(self.position_ids(text_len, height, width, device), self.axes_dims, self.rope_theta)

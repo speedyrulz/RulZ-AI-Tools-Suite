@@ -221,10 +221,13 @@ def build_optimizer(cfg: TrainConfig, params):
     if name == "automagic3":
         from .optimizers.automagic3 import Automagic3
 
-        if params and isinstance(params[0], dict):  # Automagic owns its lr: collapse LoRA+ groups
-            if len(params) > 1:
-                log.warning("lora_plus_ratio is ignored with automagic3 (it adapts each group's lr itself)")
-            params = [p for g in params for p in g["params"]]
+        if params and isinstance(params[0], dict):
+            if {g.get("name") for g in params} <= {"lora", "lora_down", "lora_up"}:  # Automagic owns its lr: collapse
+                if len(params) > 1:  # the LoRA+ groups
+                    log.warning("lora_plus_ratio is ignored with automagic3 (it adapts each group's lr itself)")
+                params = [p for g in params for p in g["params"]]
+            else:  # automagic_groups: by_type, each layer type adapts its own lr from the shared start
+                params = [{"params": g["params"]} for g in params]
         return Automagic3(params, lr=cfg.learning_rate, min_lr=cfg.automagic_min_lr, max_lr=cfg.automagic_max_lr,
                           weight_decay=cfg.weight_decay, polarity_history=cfg.automagic_polarity_history,
                           clip_threshold=cfg.automagic_clip_threshold, fused=False)
@@ -552,6 +555,9 @@ class Trainer:
         self.arch = detect_arch(cfg, self.model_dir)
         cfg.model_arch = self.arch.name
         log.info("Model architecture: %s", self.arch.label)
+        if not cfg.lora_targets:
+            cfg.lora_targets = list(self.arch.default_targets)
+            log.info("LoRA targets: the %s default (%s)", self.arch.label, ", ".join(cfg.lora_targets))
         items = scan_dataset(cfg)
         log.info("Dataset: %d images in %s", len(items), cfg.dataset_dir)
         items = self.analyze_dataset(items)
@@ -574,9 +580,11 @@ class Trainer:
         injected = lora_mod.inject_lora(model, cfg.lora_rank, cfg.lora_alpha, cfg.lora_targets,
                                         include_text_embedder=cfg.train_text_embedder, dropout=cfg.lora_dropout,
                                         blocks=blocks, names=self._lora_names(model, blocks))
+        backprop = lora_mod.backprop_blocks(model, injected, blocks)  # blocks the backward runs from (None = all)
         if blocks is not None:
-            log.info("LoRA blocks: %s (%d of %d); backward skips blocks before %s", lora_mod.format_blocks(blocks),
-                     len(blocks), len(model.layers), min(blocks) if blocks else "n/a")
+            log.info("LoRA blocks: %s (%d of %d); %s", lora_mod.format_blocks(blocks), len(blocks), len(model.layers),
+                     f"backward skips blocks before {min(blocks) if blocks else 'n/a'}" if backprop is not None else
+                     "LoRA before the blocks too (text fusion / projections), so the backward runs through every block")
         if not injected:
             raise ValueError("No LoRA modules selected: check lora_targets / lora_blocks")
         self.replicas = [(model, injected, self.devices[0])]
@@ -601,7 +609,7 @@ class Trainer:
         elif cfg.multi_gpu == "model_split":
             from .multigpu import split_model
 
-            split_model(model, self.devices, trained=blocks, plan=cfg.split_plan)
+            split_model(model, self.devices, trained=backprop, plan=cfg.split_plan)
         if cfg.resume_from:
             n = lora_mod.load_lora_weights(injected, cfg.resume_from)
             log.info("Resumed %d LoRA modules from %s", n, cfg.resume_from)
@@ -609,10 +617,15 @@ class Trainer:
         n_params = sum(p.numel() for p in params)
         log.info("LoRA: %d modules, %.2fM trainable params, rank %d alpha %g", len(injected), n_params / 1e6,
                  cfg.lora_rank, cfg.lora_alpha)
-        groups = lora_mod.lora_param_groups(injected, cfg.learning_rate, cfg.lora_plus_ratio)
-        if len(groups) > 1:
-            log.info("LoRA+: lora_up lr = %.2e (x%g), lora_down lr = %.2e", groups[1]["lr"], cfg.lora_plus_ratio,
-                     groups[0]["lr"])
+        if cfg.optimizer.lower() == "automagic3" and cfg.automagic_groups == "by_type":
+            groups = lora_mod.lora_param_groups_by(injected, cfg.learning_rate, self.arch.param_group_of)
+            log.info("Automagic3: an adaptive lr per layer type (%s)", ", ".join(
+                f"{g['name']} {sum(p.numel() for p in g['params']) / 1e6:.1f}M" for g in groups))
+        else:
+            groups = lora_mod.lora_param_groups(injected, cfg.learning_rate, cfg.lora_plus_ratio)
+            if len(groups) > 1:
+                log.info("LoRA+: lora_up lr = %.2e (x%g), lora_down lr = %.2e", groups[1]["lr"], cfg.lora_plus_ratio,
+                         groups[0]["lr"])
         optimizer = build_optimizer(cfg, groups)
         scheduler = build_scheduler(cfg, optimizer)
         step = 0
@@ -677,7 +690,7 @@ class Trainer:
         model.train()
         if self.dp is not None:
             self.dp.train(True)
-        self._setup_checkpointing(items, blocks)
+        self._setup_checkpointing(items, backprop)
         self.status.update(stage="training", step=step)
         start = time.time()
         start_step = step
@@ -937,9 +950,10 @@ class Trainer:
         st = torch.load(state_dir / "train_state.pt", map_location="cpu", weights_only=False)
         saved_groups = len(st["optimizer"].get("param_groups", []))
         if saved_groups and saved_groups != len(optimizer.param_groups):
-            raise ValueError(f"Training state was saved with lora_plus_ratio="
-                             f"{st.get('config', {}).get('lora_plus_ratio', 0)} ({saved_groups} param groups); "
-                             f"set the same value to resume")
+            saved_cfg = st.get("config", {})
+            raise ValueError(f"Training state was saved with lora_plus_ratio={saved_cfg.get('lora_plus_ratio', 0)} "
+                             f"and automagic_groups={saved_cfg.get('automagic_groups', 'single')} ({saved_groups} "
+                             f"param groups); set the same values to resume")
         optimizer.load_state_dict(st["optimizer"])
         scheduler.load_state_dict(st["scheduler"])
         gen.set_state(st["torch_gen"])

@@ -19,8 +19,8 @@ from pathlib import Path
 
 from nicegui import app, run, ui
 
-from rulztrainer.config import (MEGAPIXEL_CHOICES, MODEL_PRESETS, PRESET_PROBE_PROMPTS, PRESETS, TrainConfig,
-                                apply_preset, mp_to_side, side_to_mp)
+from rulztrainer.config import (ARCH_DEFAULT_TARGETS, MEGAPIXEL_CHOICES, MODEL_PRESETS, PRESET_PROBE_PROMPTS, PRESETS,
+                                TrainConfig, apply_preset, mp_to_side, side_to_mp)
 from rulztrainer import bodysim, facesim
 from rulztrainer.losswatch import read_verdicts
 
@@ -36,8 +36,10 @@ EXTRA_TARGETS = {
     "adaln": (("fibo2",), "per-block modulation Linear"),
     "refiner": (("fibo2",), "the 2 noise-refiner blocks"),
     "perceiver": (("fibo2",), "the gist-token resampler"),
-    "attn_gate": (("krea2",), "the sigmoid output gate of every attention (Krea's own LoRAs train it too)"),
-    "text_fusion": (("krea2",), "the text fusion blocks that mix the 12 text encoder layers"),
+    "attn_gate": (("krea2",), "the sigmoid output gate of every attention (Krea's own LoRAs train it too; on by "
+                              "default)"),
+    "text_fusion": (("krea2",), "the text fusion blocks that mix the 12 text encoder layers (on by default: the usual "
+                                "recipe leaves them under-trained)"),
     "embed": (("fibo2", "krea2"), "image / text / timestep embedders and the final layer"),
 }
 N_BLOCKS = {"moss_image": 42, "fibo2": 44, "krea2": 28}
@@ -453,9 +455,27 @@ class Form:
     def __init__(self):
         self.w: dict[str, object] = {}
         self.preset_sync = False  # True while from_config moves the preset switch (its on_change must not re-apply)
+        self.loading = False  # True while from_config fills the widgets
+        self.target_family = TrainConfig().arch_name()  # the family whose default LoRA targets the boxes started from
 
     def value(self, key):
         return self.w[key].value
+
+    def ticked_targets(self) -> set[str]:
+        return {t for t in TARGETS + list(EXTRA_TARGETS)
+                if self.w.get(f"target_{t}") is not None and self.w[f"target_{t}"].value}
+
+    def follow_family_targets(self) -> None:
+        """On a model change, tick the new family's default LoRA targets, unless the user changed the ticks from
+        the previous family's defaults (their own choice stays)."""
+        family = preset_arch(self.w["model_preset"].value, self.w["model_path"].value)
+        if family == self.target_family:
+            return
+        if not self.loading and self.ticked_targets() == set(ARCH_DEFAULT_TARGETS[self.target_family]):
+            for t in TARGETS + list(EXTRA_TARGETS):
+                if self.w.get(f"target_{t}") is not None:
+                    self.w[f"target_{t}"].value = t in ARCH_DEFAULT_TARGETS[family]
+        self.target_family = family
 
     def to_config(self) -> TrainConfig:
         v = self.value
@@ -497,7 +517,7 @@ class Form:
             optimizer=v("optimizer"), lr_scheduler=v("lr_scheduler"), warmup_steps=int(v("warmup_steps")),
             max_grad_norm=float(v("max_grad_norm")), timestep_sampling=v("timestep_sampling"),
             automagic_min_lr=float(v("automagic_min_lr")), automagic_max_lr=float(v("automagic_max_lr")),
-            automagic_polarity_history=int(v("automagic_polarity_history")),
+            automagic_polarity_history=int(v("automagic_polarity_history")), automagic_groups=v("automagic_groups"),
             automagic_clip_threshold=float(v("automagic_clip_threshold")),
             timestep_shift=float(v("timestep_shift")), sigmoid_scale=float(v("sigmoid_scale")),
             logit_mean=float(v("logit_mean")), logit_std=float(v("logit_std")), loss_weighting=v("loss_weighting"),
@@ -551,13 +571,19 @@ class Form:
         values = {**cfg.to_dict(), "model_preset": preset, "sample_prompts": "\n".join(cfg.sample_prompts),
                   "face_refs": "\n".join(cfg.face_refs), "body_refs": "\n".join(cfg.body_refs),
                   "model_source": FILE_SOURCE if cfg.model_source == "files" else HF_SOURCE}
+        targets = cfg.resolved_lora_targets()  # an empty list means the family's defaults
         for t in TARGETS + list(EXTRA_TARGETS):
-            values[f"target_{t}"] = t in cfg.lora_targets
+            values[f"target_{t}"] = t in targets
         if not cfg.resolutions:  # legacy single `resolution`: snap to the nearest megapixel choice
             values["resolutions"] = [min(MEGAPIXEL_CHOICES, key=lambda m: abs(m - side_to_mp(cfg.resolution)))]
-        for key, widget in self.w.items():
-            if key in values:
-                widget.value = values[key]
+        self.loading = True
+        try:
+            for key, widget in self.w.items():
+                if key in values:
+                    widget.value = values[key]
+        finally:
+            self.loading = False
+        self.target_family = cfg.arch_name()
         toggle = self.w.get("preset_toggle")
         if toggle is not None and toggle.value != (cfg.preset == "identity"):
             # the switch mirrors the loaded config's preset in both directions; setting .value fires on_change,
@@ -1217,6 +1243,10 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
                       else "plenty for a character or concept; higher ranks mostly add file size")
     r["lora_alpha"] = (float(rank), "alpha equal to rank keeps the adapter's scale at 1")
     r["batch_size"] = (1, "small batches with more steps beat large batches for LoRAs")
+    if krea:
+        r["target_text_fusion"] = (True, "the attention + feed-forward recipe leaves Krea's text fusion under-trained: "
+                                         "Fizgig measured 2-7 likeness points from boosting it on finished LoRAs")
+        r["target_attn_gate"] = (True, "Krea's own LoRAs train the attention output gate too")
     if character:
         r["region_weights"] = (True, "the best measured single setting for face likeness")
     # saving and samples
@@ -1768,7 +1798,7 @@ class Wizard:
     def step_training(self):
         self.heading("How to train", "How long and how hard to train, and how big the LoRA is.")
         self.apply_bar(["steps", "learning_rate", "optimizer", "lora_rank", "lora_alpha", "batch_size",
-                        "region_weights"])
+                        "target_text_fusion", "target_attn_gate", "region_weights"])
         with self.setting("steps", "Training steps",
                           "Each step trains on one batch of images. Too few and the LoRA is weak; too many and it "
                           "starts copying the training images (overfitting). Checkpoints are saved on the way, so "
@@ -1795,6 +1825,17 @@ class Wizard:
         with self.setting("batch_size", "Batch size",
                           "Images per step. Larger batches need more memory and, for LoRAs, rarely help."):
             self.bind(ui.number("Batch size", min=1, precision=0), "batch_size").classes("w-full")
+        is_krea = ("model_preset", lambda p: preset_arch(p, self.w["model_path"].value) == "krea2")
+        with self.setting("target_text_fusion", "Train Krea's text fusion",
+                          "Krea 2 mixes 12 layers of its text encoder in four text-fusion blocks before the main "
+                          "model. The usual attention + feed-forward LoRA leaves them under-trained: boosting them on "
+                          "finished LoRAs lifted likeness 2-7 points in Fizgig's tests. Training them adds about 3.5M "
+                          "LoRA weights, and the backward then runs through every block.", show_if=is_krea):
+            self.bind(ui.switch("Text fusion"), "target_text_fusion")
+        with self.setting("target_attn_gate", "Train the attention gate",
+                          "Every Krea 2 attention has a sigmoid gate on its output. Krea's own LoRAs train it.",
+                          show_if=is_krea):
+            self.bind(ui.switch("Attention gate"), "target_attn_gate")
         with self.setting("region_weights", "Region-weighted loss",
                           "Weights what the model learns by region: the face counts most, the rest of the person "
                           "next, the background least, so the LoRA spends its capacity on the identity.",
@@ -2110,6 +2151,8 @@ def build_page(local: bool = True):
                                 w["model_path"] = ui.input("Custom path or HF repo id", value=d.model_path) \
                                     .classes("w-96 max-w-full") \
                                     .bind_visibility_from(w["model_preset"], "value", lambda p: p == CUSTOM)
+                                for key in ("model_preset", "model_path"):  # each family has its own default targets
+                                    w[key].on_value_change(lambda _: f.follow_family_targets())
 
                                 async def on_download():
                                     dl_status.text = "Downloading / verifying... (about 30 GB on first download)"
@@ -2348,9 +2391,9 @@ def build_page(local: bool = True):
                         subhead("Target layers")
                         with ui.row().classes("w-full items-center gap-1"):
                             for t in TARGETS:
-                                w[f"target_{t}"] = ui.checkbox(t, value=t in d.lora_targets)
+                                w[f"target_{t}"] = ui.checkbox(t, value=t in d.resolved_lora_targets())
                             for t, (families, tip) in EXTRA_TARGETS.items():
-                                w[f"target_{t}"] = ui.checkbox(t, value=t in d.lora_targets) \
+                                w[f"target_{t}"] = ui.checkbox(t, value=t in d.resolved_lora_targets()) \
                                     .bind_visibility_from(w["model_preset"], "value",
                                                           lambda p, fs=families: preset_arch(p, w["model_path"].value)
                                                           in fs).tooltip(tip)
@@ -2362,7 +2405,9 @@ def build_page(local: bool = True):
                             with fields():
                                 w["lora_blocks"] = ui.input("Blocks (e.g. 0-41, 21-41, 10-31,40, even; empty = all)",
                                                             value=d.lora_blocks).classes("w-[30rem] max-w-full")
-                            hint("Training only later blocks also skips the backward pass through earlier ones.")
+                            hint("Training only later blocks also skips the backward pass through earlier ones, "
+                                 "unless LoRA layers sit before the blocks (Krea's text fusion, embedders, MOSS's "
+                                 "text projection): their gradient passes through every block.")
                             block_boxes: list = []
 
                             def n_blocks() -> int:
@@ -2460,6 +2505,14 @@ def build_page(local: bool = True):
                                 w["automagic_clip_threshold"] = ui.number("Clip threshold",
                                                                           value=d.automagic_clip_threshold,
                                                                           step=0.1).classes("w-32")
+                                w["automagic_groups"] = ui.select({"single": "one lr for every layer",
+                                                                   "by_type": "an lr per layer type"},
+                                                                  value=d.automagic_groups,
+                                                                  label="Automagic lr groups").classes("w-56") \
+                                    .tooltip("by_type: text-side layers (Krea's text fusion), attention, feed-forward "
+                                             "and the rest each adapt their own learning rate, so a small, slower "
+                                             "group is not outvoted by the large ones. Fizgig trains Krea 2 this way, "
+                                             "with a polarity history of 16.")
                         with advanced("Timesteps, loss weighting and gradients"):
                             with fields():
                                 w["gradient_accumulation"] = ui.number("Grad accumulation",
@@ -3310,6 +3363,11 @@ are meant for **Krea-2-Turbo**, the 8-step distill, as Krea's own Krea-2 LoRAs a
 much faster than sampling Raw (28-52 steps with guidance). The 12B transformer is 25 GB in bf16; *Diffusion model
 quant* `auto` makes it int8 (13.5 GB) when the GPUs it runs on have 22 GB or more together (one 24 GB card, or two
 16 GB cards with *model split*) and nvfp4 (about 8 GB) on a single 16 GB card.
+
+Krea 2 LoRAs train the attention gate and the **text fusion** blocks by default, on top of the usual attention and
+feed-forward layers: the usual recipe leaves text fusion under-trained (boosting it on finished LoRAs lifted
+likeness 2-7 points in Fizgig's tests). Untick *text_fusion* / *attn_gate* under LoRA, Target layers, for the old
+set; ComfyUI loads both.
 
 *Sample CFG* uses the same convention for every model (1 = off). Krea's own guidance scale g is CFG g + 1 here:
 Krea's 3.5 for Raw is 4.5.
