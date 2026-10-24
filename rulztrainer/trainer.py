@@ -16,7 +16,9 @@ import torch
 from PIL import Image
 
 from . import checkpointing as ckpt
+from . import compiling
 from . import lora as lora_mod
+from . import profiling
 from .ema import LoraEMA
 from . import quant as Q
 from .config import TrainConfig
@@ -26,7 +28,8 @@ from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, d
                       scan_dataset, text_cache_path)
 from .archs import detect_arch, get_arch
 from .idloss import effective_weight as idloss_weight
-from .multigpu import clone_to, compile_count, no_recompile_stance, norm_device, run_queue, stance_available
+from .multigpu import (Balancer, choose_counts, clone_to, compile_count, job_order, no_recompile_stance, norm_device,
+                       run_queue, stance_available, step_seconds)
 log = logging.getLogger("rulztrainer")
 DP_COMPILE_QUIET_STEPS = 3  # data parallel + compile: serial steps without a new graph before going parallel
 TEXT_TIMING_PROMPTS = 4  # prompts encoded on the first copy to time it before deciding on a second copy
@@ -299,6 +302,9 @@ class Trainer:
             raise ValueError("sigma_min/sigma_max must satisfy 0 <= sigma_min < sigma_max <= 1")
         self.devices: list[str] = [cfg.device]
         self.dp = None  # DataParallelLoRA when multi_gpu == data_parallel
+        self.balancer = None  # multigpu.Balancer: batches per model copy per step (dp_balance)
+        self.balance_hinted = False  # the dp_balance suggestion was logged
+        self.resumed_dp_counts = None  # its split from a resumed training state
         self.compiled = False  # torch.compile active on the DiT blocks
         self.dp_quiet_steps = 0  # consecutive data-parallel steps without a new compile
         self.replicas: list[tuple] = []  # (model, device) for every training copy, primary first
@@ -607,8 +613,11 @@ class Trainer:
                 reps.append((m, inj, dev))
                 self.replicas.append((m, inj, dev))
             self.dp = DataParallelLoRA(injected, reps)
-            log.info("Data parallel on %s: %d images per step, LoRA grads averaged", ", ".join(self.devices),
-                     cfg.batch_size * len(self.devices))
+            log.info("Data parallel on %s: %d images per step, LoRA grads averaged (dp_balance %s)",
+                     ", ".join(self.devices), cfg.batch_size * cfg.gradient_accumulation * len(self.devices),
+                     cfg.dp_balance)
+            # measures in every mode (the log reports each GPU's speed); dp_balance off never changes the split
+            self.balancer = Balancer(len(self.replicas), cfg.gradient_accumulation, cfg.dp_balance)
         elif cfg.multi_gpu == "model_split":
             from .multigpu import split_model
 
@@ -646,6 +655,10 @@ class Trainer:
             log.info("Weight average (EMA) of the LoRA for saves, samples and probes: decay %g per image (%.4f per "
                      "step of %d images), %.0f MB", cfg.lora_ema, self.ema.steady_step_decay(per_step), per_step,
                      self.ema.nbytes() / 2**20)
+        if self.balancer is not None and self.resumed_dp_counts and len(self.resumed_dp_counts) == self.balancer.n:
+            self.balancer.counts, self.balancer.decided_at = list(self.resumed_dp_counts), step
+            log.info("Data parallel balance from the training state: %s batches per step",
+                     "+".join(map(str, self.balancer.counts)))
         self.injected = injected
         self.sample_model = None
         if not cfg.sample_model_path:
@@ -670,9 +683,12 @@ class Trainer:
                 log.info("Samples and probes split across %s (each GPU renders the next image in the queue)",
                          ", ".join(side))
 
-        if cfg.compile_model:
+        do_compile, why = compiling.decide(cfg.compile_model, cfg.steps - step, self.devices)
+        if why:
+            log.info("torch.compile %s (%s)", "on" if do_compile else "off", why)
+        if do_compile:
             for m, _, _ in self.replicas:
-                self.compiled = self.compile(m) or self.compiled
+                self.compiled = self.compile(m, fall_back=cfg.compile_model == "auto") or self.compiled
             if self.compiled and self.dp is not None:
                 log.info("Data parallel + compile: replicas run one after another until compilation settles "
                          "(%d steps without a new graph), then in parallel", DP_COMPILE_QUIET_STEPS)
@@ -709,12 +725,14 @@ class Trainer:
         start = time.time()
         start_step = step
         losses: list[float] = []
+        step_times: list[float] = []  # seconds per optimizer step, training only (no saves, samples or probes)
+        profile_at = profiling.requested_step()
         id_losses: list[list] = []  # [step, mean id loss] for steps that had eligible samples
         id_w = idloss_weight(cfg.id_loss_weight)
         def work(job):
             """Forward + backward for one model copy on its device. Returns (loss value, per-image multipliers,
             (identity loss value, samples, seconds) or None)."""
-            (rmodel, rinj, rdev), batch, latents, embeds, mask, sigma, noise, regions, cur_step = job
+            (rmodel, rinj, rdev), batch, latents, embeds, mask, sigma, noise, regions, cur_step, n_total = job
             latents = latents.to(rdev, torch.float32)
             embeds, mask, sigma, noise = embeds.to(rdev), mask.to(rdev), sigma.to(rdev), noise.to(rdev)
             s = sigma.view(-1, 1, 1, 1)
@@ -745,19 +763,32 @@ class Trainer:
                     mults.append(self.loss_watch.multiplier(it.key))
                 if cfg.per_image_lr and not true_per_image_lr:
                     weights = weights * torch.tensor(mults, device=weights.device, dtype=weights.dtype)
-            loss = (per * weights).mean() / (cfg.gradient_accumulation * n_dev)
+            loss = (per * weights).mean() / n_total  # the step's update is the mean over all of its batches
             if self.id_loss is not None and regions is not None and rmodel is model:  # primary replica only
                 t_id = time.time()
                 id_val, n_id = self.id_loss(noisy, pred, sigma, regions.meta, self.id_ref)
                 if id_val is not None:
-                    (loss + id_w * id_val / (cfg.gradient_accumulation * n_dev)).backward()
+                    (loss + id_w * id_val / n_total).backward()
                     if str(rdev).startswith("cuda"):
                         torch.cuda.synchronize(rdev)
                     return loss.item(), mults, (id_val.item(), n_id, time.time() - t_id)
             loss.backward()
             return loss.item(), mults, None
 
+        def work_list(entry):
+            """One model copy's batches of a step, one after another: [(work result, seconds, image tokens)]."""
+            out = []
+            for job in entry[1]:
+                t0 = time.perf_counter()
+                res = work(job)  # its .item() waits for the GPU, so this is the batch's own time
+                out.append((res, time.perf_counter() - t0, job[2].shape[2] * job[2].shape[3]))
+            return out
+
         while step < cfg.steps:
+            t_step = time.perf_counter()
+            prof = profiling.StepProfile(self.job_dir, step + 1, self.devices) if step + 1 == profile_at else None
+            if prof is not None:
+                prof.start()
             optimizer.zero_grad(set_to_none=True)
             accum_loss = 0.0
             step_images = 0
@@ -766,54 +797,64 @@ class Trainer:
             if self.id_loss is not None:
                 self.id_ref = self.id_loss.pick_ref()  # one reference face per step
             retries0 = self._alloc_retries() if any(self.kept.values()) else None
+            # batches per model copy this step: gradient_accumulation each in lockstep, split by speed with dp_balance
+            counts = self.balancer.counts if self.balancer is not None else [cfg.gradient_accumulation] * n_dev
+            n_total = sum(counts)
+            compiled_now = False
             try:
-                for _ in range(cfg.gradient_accumulation):
-                    jobs = []
-                    for rep in self.replicas:  # draw every copy's batch and noise in the main thread (shared RNG)
-                        batch = next(self.batch_iter)
-                        step_images += len(batch)
-                        latents, embeds, mask, regions = load_batch(batch, cfg, rng)
-                        sigma = sample_sigmas(cfg, latents.shape[0], gen, self.ts_logit_shift,
-                                              tokens=latents.shape[2] * latents.shape[3], arch=self.arch)
-                        noise = torch.randn(latents.shape, generator=gen)
-                        jobs.append((rep, batch, latents, embeds, mask, sigma, noise, regions, step + 1))
-                    if self.dp is not None:
-                        # torch.compile + threads: a replica tracing a graph breaks the other replica's forward, so steps
-                        # that may compile run serially; parallel steps run under a stance that never compiles (an unseen
-                        # shape then runs that block eagerly once instead of tracing)
-                        serial = self.compiled and (self.dp_quiet_steps < DP_COMPILE_QUIET_STEPS or not stance_available())
-                        n_before = compile_count()
-                        if self.compiled and not serial:
-                            with no_recompile_stance():
-                                results = self.dp.run(work, jobs, serial=False)
-                        else:
-                            results = self.dp.run(work, jobs, serial=serial)
-                        if compile_count() != n_before:
-                            if not serial:
-                                log.warning("Data parallel: a graph compiled during a parallel step; running replicas "
-                                            "one after another again until compilation settles")
-                            self.dp_quiet_steps = 0
-                        elif self.compiled and self.dp_quiet_steps < DP_COMPILE_QUIET_STEPS:
-                            self.dp_quiet_steps += 1
-                            if self.dp_quiet_steps == DP_COMPILE_QUIET_STEPS:
-                                if not stance_available():
-                                    log.warning("Data parallel + compile: this torch has no torch.compiler.set_stance, so "
-                                                "replicas keep running one after another (no parallel speed-up)")
-                                else:
-                                    log.info("Data parallel: compilation settled, replicas now run in parallel "
-                                             "(new shapes run uncompiled instead of recompiling)")
+                per_rep: list[list] = [[] for _ in self.replicas]
+                for r in job_order(counts):  # every batch and its noise drawn in the main thread (shared RNG), in
+                    batch = next(self.batch_iter)  # lockstep order: copy 0, copy 1, copy 0, ...
+                    step_images += len(batch)
+                    latents, embeds, mask, regions = load_batch(batch, cfg, rng)
+                    sigma = sample_sigmas(cfg, latents.shape[0], gen, self.ts_logit_shift,
+                                          tokens=latents.shape[2] * latents.shape[3], arch=self.arch)
+                    noise = torch.randn(latents.shape, generator=gen)
+                    per_rep[r].append((self.replicas[r], batch, latents, embeds, mask, sigma, noise, regions, step + 1,
+                                       n_total))
+                entries = list(enumerate(per_rep))
+                if self.dp is not None:
+                    # torch.compile + threads: a replica tracing a graph breaks the other replica's forward, so steps
+                    # that may compile run serially; parallel steps run under a stance that never compiles (an unseen
+                    # shape then runs that block eagerly once instead of tracing)
+                    serial = self.compiled and (self.dp_quiet_steps < DP_COMPILE_QUIET_STEPS or not stance_available())
+                    n_before = compile_count()
+                    if self.compiled and not serial:
+                        with no_recompile_stance():
+                            lists = self.dp.run(work_list, entries, serial=False)
                     else:
-                        results = [work(jobs[0])]
-                    accum_loss += sum(r[0] for r in results)
-                    step_id += [r[2] for r in results if r[2] is not None]
-                    if true_per_image_lr and results[0][1]:
-                        step_lr_mult = results[0][1][0]
+                        lists = self.dp.run(work_list, entries, serial=serial)
+                    compiled_now = compile_count() != n_before
+                    if compiled_now:
+                        if not serial:
+                            log.warning("Data parallel: a graph compiled during a parallel step; running replicas "
+                                        "one after another again until compilation settles")
+                        self.dp_quiet_steps = 0
+                    elif self.compiled and self.dp_quiet_steps < DP_COMPILE_QUIET_STEPS:
+                        self.dp_quiet_steps += 1
+                        if self.dp_quiet_steps == DP_COMPILE_QUIET_STEPS:
+                            if not stance_available():
+                                log.warning("Data parallel + compile: this torch has no torch.compiler.set_stance, so "
+                                            "replicas keep running one after another (no parallel speed-up)")
+                            else:
+                                log.info("Data parallel: compilation settled, replicas now run in parallel "
+                                         "(new shapes run uncompiled instead of recompiling)")
+                else:
+                    lists = [work_list(entries[0])]
+                timed = [(r, sec, tok) for r, lst in enumerate(lists) for _, sec, tok in lst]
+                results = [res for lst in lists for res, _, _ in lst]
+                accum_loss += sum(r[0] for r in results)
+                step_id += [r[2] for r in results if r[2] is not None]
+                if true_per_image_lr and results[0][1]:
+                    step_lr_mult = results[0][1][0]
             except torch.OutOfMemoryError:
                 # blocks keeping their activations ran out of memory (a larger bucket, the identity loss, another
                 # process): keep fewer and redo the step; partial gradients of the failed step are dropped
                 optimizer.zero_grad(set_to_none=True)
                 if self.dp is not None:
                     self.dp.zero_grads()  # the replicas' too: reduce_grads never ran for this step
+                if prof is not None:
+                    prof.stop(None)
                 if not self._shrink_kept_blocks():
                     raise
                 free_cuda()
@@ -838,6 +879,15 @@ class Trainer:
             if self.dp is not None:
                 self.dp.sync_weights()
             step += 1
+            if prof is not None:
+                prof.stop(time.perf_counter() - t_step)
+            step_times.append(time.perf_counter() - t_step)
+            if self.balancer is not None:
+                if step - start_step > 2 and not compiled_now:  # warm-up and compiling steps are not the GPUs' speed
+                    self.balancer.observe(timed)
+                self._balance(step)
+            if self.compiled and step - start_step == 5:
+                compiling.report("after 5 steps")
             losses.append(accum_loss)
             avg = sum(losses[-50:]) / len(losses[-50:])
             elapsed = time.time() - start
@@ -862,10 +912,14 @@ class Trainer:
                     if torch.cuda.is_available() and str(self.devices[0]).startswith("cuda"):
                         id_s += f", peak {torch.cuda.max_memory_allocated(self.devices[0]) / 1e9:.2f} GB"
                     id_s += ")"
-                log.info("step %d/%d loss %.4f avg %.4f lr %.2e %.1fs/it%s", step, cfg.steps, accum_loss, avg,
-                         lr_now, elapsed / done_steps, id_s)
+                last = step_times[-5:]
+                log.info("step %d/%d loss %.4f avg %.4f lr %.2e %.1fs/it (last %d steps %.2fs each)%s", step, cfg.steps,
+                         accum_loss, avg, lr_now, elapsed / done_steps, len(last), sum(last) / len(last), id_s)
+            peak = {str(d): round(torch.cuda.max_memory_allocated(torch.device(d)) / 1e9, 2) for d in self.devices
+                    if str(d).startswith("cuda")} if torch.cuda.is_available() else {}
             self.status.update(step=step, total=cfg.steps, loss=accum_loss, avg_loss=avg, elapsed=elapsed, eta=eta,
-                               lr=lr_now, losses=losses[-2000:], **id_extra)
+                               lr=lr_now, losses=losses[-2000:], step_times=[round(t, 3) for t in step_times[-2000:]],
+                               peak_mem=peak, **id_extra)
             if self.loss_watch is not None and self.loss_watch.epoch_complete():
                 summary = self.loss_watch.end_epoch(step)
                 log.info("Loss watch epoch %d: %s (median residual %.3f, %d/%d active)", summary["epoch"],
@@ -891,6 +945,8 @@ class Trainer:
             if self.stop_file.exists():
                 log.info("Stop requested at step %d", step)
                 break
+        if self.compiled:
+            compiling.report("end of training")
         path = self.save(injected, step, final=True)
         if cfg.save_state:
             self.save_state(step, injected, optimizer, scheduler, gen, rng)
@@ -945,6 +1001,7 @@ class Trainer:
             "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
             "config": self.cfg.to_dict(),
             "ema": self.ema.state_dict() if self.ema is not None else None,  # lora.safetensors holds the raw weights
+            "dp_counts": self.balancer.counts if self.balancer is not None else None,
         }, state_dir / "train_state.pt")
         log.info("Saved training state %s", state_dir)
         self.status.data["states"].append(str(state_dir))
@@ -960,16 +1017,14 @@ class Trainer:
         self.status.write()
         return state_dir
 
-    def compile(self, model) -> bool:
+    def compile(self, model, fall_back: bool = False) -> bool:
         try:
             import triton  # noqa: F401
         except ImportError:
             log.warning("compile_model requested but triton is not installed; running without compile")
             return False
         try:
-            # Python float attributes (LoRA scale / multiplier) would otherwise be traced as 0-d CPU tensors, and the
-            # CPU ops on them make Inductor emit C++ that needs MSVC on Windows ("InvalidCxxCompiler: cl is not found")
-            torch._dynamo.config.specialize_float = True
+            compiling.prepare(fall_back)  # raised recompile limits, dynamo warnings in train.log
             blocks = self.arch.compile_blocks(model)
             for block in blocks:
                 block.compile(backend="inductor", dynamic=True)
@@ -1005,6 +1060,7 @@ class Trainer:
                 pass
         self.res_stage = int(st.get("res_stage", 0))
         self.resumed_ema = st.get("ema")  # None in states saved without an average (or by an older version)
+        self.resumed_dp_counts = st.get("dp_counts")
         return int(st["step"])
 
     # ------------------------------------------------------------ sampling
@@ -1080,6 +1136,8 @@ class Trainer:
                     p.grad = None
                 return {d: (torch.cuda.max_memory_reserved(d), torch.cuda.max_memory_allocated(d)) for d in devices}
 
+            if self.compiled:
+                measure(0)  # compile first: the peaks below are then the compiled blocks' own, not compilation's
             one, three = measure(1), measure(3)
             keep, notes = [], []
             for d in devices:
@@ -1126,6 +1184,30 @@ class Trainer:
             ckpt.set_kept_blocks(m, keep)
         log.info("Checkpointing: memory allocator retries on %s; now %s", ", ".join(sorted(hit)),
                  ", ".join(f"{len(v)} kept" for v in self.kept.values()))
+
+    def _balance(self, step: int) -> None:
+        """dp_balance: take a new split of the batches when the measured speeds call for one, and once point out
+        `grow` when auto cannot split the step (too few batches) but the GPUs differ enough for it to pay."""
+        bal = self.balancer
+        lock = [bal.base] * bal.n
+        new = bal.update(step)
+        if new is not None:
+            log.info("Data parallel balance: %s batches per step on %s (measured %s s per batch of 1 MP), %.2f s per "
+                     "image instead of %.2f in lockstep", "+".join(map(str, new)), ", ".join(self.devices),
+                     " / ".join(f"{t:.2f}" for t in bal.meter.times()), bal.per_image(new), bal.per_image(lock))
+            self.status.update(dp_counts=new)
+        if not self.balance_hinted and bal.meter.ready():
+            self.balance_hinted = True
+            times = bal.meter.times()
+            log.info("Data parallel: measured %s s per batch of 1 MP on %s", " / ".join(f"{t:.2f}" for t in times),
+                     " / ".join(self.devices))
+            grow = choose_counts(times, bal.base, "grow")
+            if self.cfg.dp_balance == "auto" and bal.counts == lock and grow != lock:
+                log.info("Data parallel: the GPUs take %s s per batch of 1 MP. dp_balance: grow would run %s batches "
+                         "per step at %.2f s per image instead of %.2f (more images per step, so lower steps to "
+                         "match), or gradient_accumulation 3 or more lets auto split the step",
+                         " / ".join(f"{t:.2f}" for t in times), "+".join(map(str, grow)),
+                         step_seconds(times, grow) / sum(grow), step_seconds(times, lock) / sum(lock))
 
     def _shrink_kept_blocks(self) -> bool:
         """After an out-of-memory step: halve the kept blocks of every model copy. False when none were kept."""
@@ -1319,6 +1401,9 @@ class Trainer:
         self.batcher = BucketBatcher(items, cfg.batch_size, cfg.seed + step)
         self.batch_iter = iter(self.batcher)
         self._refresh_batcher_weights()
+        if self.balancer is not None and not initial:  # a new resolution changes the GPUs' speeds: measure again
+            self.balancer.reset()
+            self.status.update(dp_counts=self.balancer.counts)
         if cfg.resolution_step_up and not initial:
             log.info("Resolution step-up: now training at %s from step %d (%d items)", self._stage_label(), step,
                      len(items))

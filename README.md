@@ -180,6 +180,31 @@ training up (roughly 1.7-2x throughput with two cards; the faster card waits for
 It needs no torch.distributed and works on Windows; each GPU must fit the whole model, so pair it with
 `transformer_quant: int8_convrot` or `nvfp4` on 16 GB cards, or bf16 at modest resolutions.
 
+Measured on an RTX 5060 Ti + RTX 4060 Ti at 1 MP, seconds per step of 2 images (per image in brackets):
+
+| model | eager | compiled |
+|---|---|---|
+| MOSS-Image, int8_convrot | 7.30 (3.65) | **4.79 (2.40)** |
+| Krea 2, nvfp4 | 12.74 (6.37) | 11.81 (5.91) |
+
+### Unequal GPUs (`dp_balance`)
+
+Each step waits for the slowest GPU. `dp_balance: auto` (the default) times every GPU's batches during the first
+steps, logs them, and when the GPUs differ splits a step's batches by speed: with `gradient_accumulation: 4` on two
+cards that run 1 : 1.6, 5+3 instead of 4+4. The images per step and the random draws stay the same; only the waiting
+goes. A split replaces lockstep only when it is at least 5% faster per image; it is re-checked every 25 steps (another
+job may share a card), resets when a resolution step-up starts a new stage, and is kept in training states. With
+one batch per GPU per step there is nothing to split; `dp_balance: grow` then lets the faster GPU run more batches in
+the slower one's time (for example 3+2), so a step holds more images and `steps` should be lowered to match.
+`off` keeps lockstep. Drawing all of a step's batches first also drops the sync points between micro-batches:
+Krea 2 with `gradient_accumulation: 4` trains at 6.26 s per image against 6.37 at 1 per step.
+
+On these two cards the balancer finds nothing to split. Alone, the 5060 Ti trains Krea 2 nvfp4 at 8.5 s per image
+(FP4 tensor cores) and the 4060 Ti at about 12.5 (it dequantizes), but together they measured 14.2 and 12.4 s per
+batch. Both GPUs are driven by threads of one Python process; the 5060 Ti's many short FP4 kernels most likely wait
+on the other thread's turn at the interpreter, while the 4060 Ti's longer kernels hide it. Compiling cuts the work
+the threads do in Python (see the table above).
+
 `multi_gpu: model_split` places consecutive block ranges on different GPUs instead. It halves the memory per
 GPU (full bf16 at high resolution becomes possible) but is not faster, since the GPUs take turns. The split is
 auto-balanced by estimated cost (blocks before the first trained block are forward-only and cheap; every later
@@ -446,7 +471,8 @@ it has not been measured on the models here.
 `sample_seed` is the seed of the first prompt; with `sample_walk_seed` each further prompt uses seed + 1.
 `sample_before_training` renders a sample set at step 0 for comparison. The log reports each prompt and the
 Monitor page shows the sampling step. The Monitor page also has per-GPU VRAM/utilization bars, an adjustable
-loss-smoothing slider and an auto-scrolling log. `compile_model` runs the DiT blocks through torch.compile
+loss-smoothing slider and an auto-scrolling log. `compile_model` (default `auto`, see
+[torch.compile](#torchcompile-compile_model)) runs the DiT blocks through torch.compile
 (skipped with a warning if triton is not installed; `triton-windows` from requirements.txt provides it on Windows).
 No C++ compiler is needed: the blocks are compiled with Dynamo's `specialize_float` so the LoRA scale and
 multiplier stay Python constants instead of becoming CPU tensors (which would make Inductor emit C++ and fail with
@@ -782,6 +808,29 @@ Measured, 20 steps at 1 MP, seconds per step without and with auto:
 The gain is small on 16 GB cards: there is little spare memory, and with int8/nvfp4 the forward a kept block skips
 is cheap next to its bf16 backward. Cards with more free memory keep more blocks; that case is not measured here.
 
+## torch.compile (`compile_model`)
+
+`compile_model: auto` (the default) compiles the DiT blocks for runs with at least 100 steps to go, on a GPU with
+triton installed; `true` always compiles, `false` never. Inductor fuses the elementwise work between the matrix
+multiplies (norms, RoPE, modulation, gates, residuals) into fewer kernels. Measured on the RTX 5060 Ti at 1 MP, 20
+steps, every block checkpointed:
+
+| model | eager | compiled | warm-up (first steps) |
+|---|---|---|---|
+| MOSS-Image, int8_convrot | 6.61 s/step | **4.90 s/step (-26%)** | 25 s |
+| Krea 2, nvfp4 (native FP4) | 8.77 s/step | **7.74 s/step (-12%)** | 36 s |
+
+In data parallel over the 5060 Ti and a 4060 Ti (2 images per step) the gain was larger for MOSS-Image: 7.30 ->
+4.79 s/step (-34%), and 12.74 -> 11.81 s/step (-7%) for Krea 2 (see [Using two GPUs](#using-two-gpus)). Losses match
+to bf16 noise. The quantized Linears' triton kernels stay opaque to dynamo (a graph break at each),
+which still leaves 19-29 graphs per model; the limits on recompiles are raised so no block silently drops back to
+eager, and dynamo's warnings go to `train.log`. The log reports frames, graphs and graph breaks after 5 steps and at
+the end. With `auto`, a block that fails to compile runs uncompiled instead of stopping the run. A profile of the
+compiled steps puts attention at 42-50% and the matrix multiplies at 31-38% of the GPU time; the fused kernels are
+about 10%, so removing the graph breaks (custom ops for the quantized Linears) could gain a few percent at most and
+is not done. `RULZ_PROFILE_STEP=N` writes such a profile of step N (`profile_step_N.txt` in the job folder), and
+`scripts/bench.py` runs the short timing runs used here (it waits for idle GPUs).
+
 ## Layout
 
 ```
@@ -794,6 +843,8 @@ rulztrainer/
   trainer.py       training loop, saving, sampling, status.json for the UI
   checkpointing.py selective gradient checkpointing (which blocks keep their activations)
   ema.py           weight average (EMA) of the LoRA for saves, samples and probes
+  compiling.py     torch.compile settings, the compile_model auto rule, compile stats
+  profiling.py     one-step GPU profile by kernel group (RULZ_PROFILE_STEP)
   train.py         CLI entry point
   moss/model.py    MOSS-Image DiT (vendored, Apache-2.0, OpenMOSS)
   moss/loading.py  download + load (HF layout or single files), quant dispatch, encode helpers
@@ -806,6 +857,7 @@ configs/           example configs
 tests/             smoke tests (no weights needed): python -m pytest tests
 install.bat / run_webui.bat   Windows install and start;  install.sh / run_webui.sh   the same for Linux
 scripts/vast/      vast.ai: provision.sh (PROVISIONING_SCRIPT), supervisor wrapper + conf, create_template.sh
+scripts/bench.py   short timing runs that wait for idle GPUs (s/step, warm-up, peak memory)
 Dockerfile         optional vast.ai image with the install baked in
 ```
 

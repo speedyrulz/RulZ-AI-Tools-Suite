@@ -98,6 +98,8 @@ class TrainConfig:
     devices: str = "cuda:0,cuda:1"  # GPUs for multi_gpu; the first is the primary
     split_plan: str = ""  # model_split: manual block plan e.g. "cuda:0=0-25;cuda:1=26-41"; empty = auto-balance
     parallel_jobs: bool = True  # multi_gpu: split samples, probes, latent/text caching and SAM 3 masks across the GPUs
+    dp_balance: str = "auto"  # data_parallel batches per GPU and step by measured speed: off (lockstep) | auto (same
+    #                           images per step, split by speed) | grow (faster GPUs fill the slowest one's time)
     text_encoder_device: str = "auto"  # "auto" splits across GPUs/CPU; or "cuda:0", "cuda:1", "cpu"
     transformer_quant: str = "auto"  # auto (keep file format) | none | int8 | int8_convrot | nvfp4
     text_encoder_quant: str = "auto"  # auto | none | int8 | int8_convrot | nvfp4
@@ -142,7 +144,8 @@ class TrainConfig:
     save_state_every: int = 0  # steps between state saves; 0 = same as save_every
     keep_states: int = 3  # rolling number of state folders to keep; 0 = keep all
     resume_state: str = ""  # path to a state_XXXXXX directory to resume training from
-    compile_model: bool = False  # torch.compile the DiT blocks before training (needs a working triton)
+    compile_model: bool | str = "auto"  # torch.compile the DiT blocks: true | false | auto (runs of 100+ steps on a GPU
+    #                                     with triton; measured 26% faster per step on MOSS-Image, 12% on Krea 2)
 
     # --- optimization ---
     steps: int = 2000
@@ -290,8 +293,12 @@ class TrainConfig:
             raise ValueError("id_loss_every must be at least 1")
         if not 0.0 <= self.lora_ema < 1.0:
             raise ValueError(f"lora_ema must be 0 (off) or a decay below 1, got {self.lora_ema!r}")
+        if self.dp_balance not in ("off", "auto", "grow"):
+            raise ValueError(f"dp_balance must be off, auto or grow, got {self.dp_balance!r}")
         if self.automagic_groups not in ("single", "by_type"):
             raise ValueError(f"automagic_groups must be single or by_type, got {self.automagic_groups!r}")
+        if self.compile_model not in (True, False, "auto"):
+            raise ValueError(f"compile_model must be true, false or auto, got {self.compile_model!r}")
         if self.resolution_step_up:
             if self.step_up_patience < 1 or self.step_up_stop_patience < 1:
                 raise ValueError("step_up_patience and step_up_stop_patience must be at least 1")

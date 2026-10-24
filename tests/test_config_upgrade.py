@@ -105,3 +105,19 @@ def test_form_follows_the_family_default_targets():
     form.w["model_preset"].value = "MOSS-Image-Base"
     form.follow_family_targets()
     assert "text_fusion" not in form.ticked_targets() and "attn_gate" in form.ticked_targets()
+
+
+def test_compile_auto_rule():
+    from rulztrainer import compiling
+
+    assert TrainConfig().compile_model == "auto"
+    TrainConfig(compile_model=True).validate()
+    with pytest.raises(ValueError):
+        TrainConfig(compile_model="sometimes").validate()
+    assert compiling.decide(True, 5, ["cpu"])[0] and not compiling.decide(False, 5000, ["cuda:0"])[0]
+    assert compiling.decide(False, 5000, ["cuda:0"])[1] == ""  # simply off: nothing to log
+    on, why = compiling.decide("auto", 20, ["cuda:0"])
+    assert not on and ("20 steps" in why or "triton" in why)  # a short test run is not worth the warm-up
+    assert not compiling.decide("auto", 5000, ["cpu"])[0]
+    pytest.importorskip("triton")
+    assert compiling.decide("auto", 5000, ["cuda:1", "cuda:0"]) == (True, "compile_model auto: 5000 steps to go")

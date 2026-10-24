@@ -104,6 +104,144 @@ class DataParallelLoRA:
             m.train(mode)
 
 
+def split_batches(times: list[float], total: int) -> list[int]:
+    """Batches per GPU for `total` equal batches, given each GPU's seconds per batch: each next batch goes to the GPU
+    that would finish it first (optimal for identical batches). Every GPU gets at least one."""
+    counts = [1] * len(times)
+    for _ in range(max(0, total - len(times))):
+        i = min(range(len(times)), key=lambda k: (counts[k] + 1) * times[k])
+        counts[i] += 1
+    return counts
+
+
+def step_seconds(times: list[float], counts: list[int]) -> float:
+    """Wall time of a step: the GPUs run their batches side by side, the slowest one sets the pace."""
+    return max(t * c for t, c in zip(times, counts))
+
+
+def choose_counts(times: list[float], base: int, mode: str, min_gain: float = 0.05) -> list[int]:
+    """Batches per GPU for one optimizer step (dp_balance).
+
+    off   `base` each (lockstep, as before).
+    auto  the same total (base x GPUs) split by speed: same images per step, only the waiting goes.
+    grow  the slowest GPU runs `base` (or 2 x base) batches and the others fill its time: more images per step.
+    A split replaces lockstep only when it is at least `min_gain` faster per image."""
+    n = len(times)
+    lockstep = [base] * n
+    if mode == "off" or n < 2 or any(t <= 0 for t in times):
+        return lockstep
+
+    def per_image(c):
+        return step_seconds(times, c) / sum(c)
+
+    if mode == "auto":
+        options = [split_batches(times, base * n)]
+    elif mode == "grow":  # the faster GPUs fill the slowest one's time, rounded down or up
+        import itertools
+        import math
+
+        slow = max(times)
+        options = []
+        for k in (1, 2):
+            fill = [k * base * slow / t for t in times]
+            choices = [sorted({max(1, math.floor(f + 1e-9)), max(1, math.ceil(f - 1e-9))}) for f in fill]
+            options += [list(c) for c in itertools.product(*choices)]
+    else:
+        raise ValueError(f"dp_balance must be off, auto or grow, got {mode!r}")
+    best = min(options, key=per_image)
+    return best if per_image(best) <= per_image(lockstep) * (1 - min_gain) else lockstep
+
+
+def job_order(counts: list[int]) -> list[int]:
+    """Which GPU each drawn batch goes to, interleaved: [3, 2] -> [0, 1, 0, 1, 0]. Equal counts give the lockstep
+    order (one batch per GPU in turn), so the random draws stay those of a lockstep run."""
+    order, left = [], list(counts)
+    while any(left):
+        for i, c in enumerate(left):
+            if c:
+                order.append(i)
+                left[i] -= 1
+    return order
+
+
+class SpeedMeter:
+    """Seconds per batch for each GPU, as a rolling median over recent batches, normalized by image tokens (buckets
+    of different size do not look like a speed change)."""
+
+    def __init__(self, n: int, window: int = 12):
+        self.samples: list[list[float]] = [[] for _ in range(n)]
+        self.window = window
+
+    def add(self, replica: int, seconds: float, tokens: int) -> None:
+        s = self.samples[replica]
+        s.append(seconds / max(1, tokens))
+        del s[:-self.window]
+
+    def ready(self, minimum: int = 3) -> bool:
+        return all(len(s) >= minimum for s in self.samples)
+
+    def times(self, tokens: int = 4096) -> list[float]:
+        """Seconds per batch of `tokens` image tokens on each GPU."""
+        import statistics
+
+        return [statistics.median(s) * tokens if s else 0.0 for s in self.samples]
+
+    def reset(self) -> None:
+        for s in self.samples:
+            s.clear()
+
+
+class Balancer:
+    """dp_balance for a data-parallel run: measures each GPU's seconds per batch and picks the batches per GPU per
+    optimizer step. Starts in lockstep, decides once every GPU has 3 timed batches, re-decides every `every` steps
+    (other jobs may share the cards) and switches only for a gain above `hysteresis`."""
+
+    def __init__(self, n: int, base: int, mode: str, every: int = 25, hysteresis: float = 0.03):
+        self.n, self.base, self.mode = n, base, mode
+        self.every, self.hysteresis = every, hysteresis
+        self.meter = SpeedMeter(n)
+        self.counts = [base] * n
+        self.decided_at: int | None = None
+
+    def observe(self, timings: list[tuple[int, float, int]]) -> None:
+        """(replica, seconds, image tokens) for every batch of a step (leave out warm-up and compiling steps)."""
+        for replica, seconds, tokens in timings:
+            self.meter.add(replica, seconds, tokens)
+
+    def update(self, step: int) -> list[int] | None:
+        """New batches per GPU when the split should change, else None."""
+        if self.mode == "off" or not self.meter.ready():
+            return None
+        if self.decided_at is not None and step - self.decided_at < self.every:
+            return None
+        self.decided_at = step
+        times = self.meter.times()
+        new = choose_counts(times, self.base, self.mode)
+        if new == self.counts:
+            return None
+
+        def per_image(c):
+            return step_seconds(times, c) / sum(c)
+
+        if per_image(new) > per_image(self.counts) * (1 - self.hysteresis):
+            return None
+        self.counts = new
+        return new
+
+    def per_image(self, counts: list[int] | None = None) -> float | None:
+        if not self.meter.ready(1):
+            return None
+        times = self.meter.times()
+        c = counts or self.counts
+        return step_seconds(times, c) / sum(c)
+
+    def reset(self) -> None:
+        """Back to lockstep with fresh measurements (a new training resolution changes the speeds)."""
+        self.meter.reset()
+        self.counts = [self.base] * self.n
+        self.decided_at = None
+
+
 def stance_available() -> bool:
     """True when this torch has torch.compiler.set_stance (checked without touching the current stance)."""
     return getattr(getattr(torch, "compiler", None), "set_stance", None) is not None

@@ -43,6 +43,7 @@ EXTRA_TARGETS = {
     "embed": (("fibo2", "krea2"), "image / text / timestep embedders and the final layer"),
 }
 N_BLOCKS = {"moss_image": 42, "fibo2": 44, "krea2": 28}
+COMPILE_CHOICES = {"auto": "auto: runs of 100+ steps", True: "on", False: "off"}
 N_BLOCKS_MAX = max(N_BLOCKS.values())
 
 
@@ -491,7 +492,7 @@ class Form:
             vae_file=s("vae_file"), tokenizer_path=s("tokenizer_path"),
             device=v("device"), text_encoder_device=v("text_encoder_device"),
             multi_gpu=v("multi_gpu"), devices=(v("devices") or "").strip(), split_plan=(v("split_plan") or "").strip(),
-            parallel_jobs=bool(v("parallel_jobs")),
+            parallel_jobs=bool(v("parallel_jobs")), dp_balance=v("dp_balance"),
             transformer_quant=v("transformer_quant"), text_encoder_quant=v("text_encoder_quant"),
             gradient_checkpointing=bool(v("gradient_checkpointing")),
             checkpoint_keep_blocks=int(v("checkpoint_keep_blocks")),
@@ -511,7 +512,7 @@ class Form:
             lora_save_dtype=v("lora_save_dtype"), lora_ema=float(v("lora_ema") or 0),
             save_state=bool(v("save_state")), resume_state=s("resume_state"),
             save_state_every=int(v("save_state_every")), keep_states=int(v("keep_states")),
-            compile_model=bool(v("compile_model")), sample_seed=int(v("sample_seed")),
+            compile_model=v("compile_model"), sample_seed=int(v("sample_seed")),
             sample_walk_seed=bool(v("sample_walk_seed")), sample_before_training=bool(v("sample_before_training")),
             steps=int(v("steps")), batch_size=int(v("batch_size")),
             gradient_accumulation=int(v("gradient_accumulation")), learning_rate=float(v("learning_rate")),
@@ -1183,6 +1184,9 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
                                          "full copy on each card would only fit in nvfp4")
     elif len(gpus) >= 2:
         r["multi_gpu"] = ("data_parallel", f"{len(gpus)} GPUs found: a model copy on each trains about 1.7-2x faster")
+    if len(gpus) >= 2:
+        r["dp_balance"] = ("auto", "measures the cards and splits each step's images by speed, so the faster one "
+                                   "does not wait; the images per step stay the same")
     elif gpus:
         r["multi_gpu"] = ("off", "one GPU found")
     if cfg.model_source == "files":
@@ -1210,7 +1214,8 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
                                                "instead of spilling into system RAM")
     r["gradient_checkpointing"] = (True, "saves most of the activation memory for a modest slowdown")
     r["checkpoint_keep_blocks"] = (-1, "measured at the start: as many blocks as fit skip the recompute")
-    r["compile_model"] = (False, "turn it on once a run works; the first steps compile slowly")
+    r["compile_model"] = ("auto", "measured 26% (MOSS-Image) and 12% (Krea 2) faster per step after a warm-up of "
+                                  "under a minute; auto skips it for short test runs")
     # dataset
     target = 1.0 if vram is None or vram >= 12 else 0.5
     reason = ("1 MP (1024x1024) is the size the model was trained at" if target == 1.0
@@ -1669,7 +1674,7 @@ class Wizard:
         self.gpu_box = ui.row().classes("w-full gap-3")
         with self.gpu_box:
             ui.spinner(size="sm")
-        self.apply_bar(["multi_gpu", "transformer_quant", "text_encoder_quant", "gradient_checkpointing",
+        self.apply_bar(["multi_gpu", "dp_balance", "transformer_quant", "text_encoder_quant", "gradient_checkpointing",
                         "checkpoint_keep_blocks", "compile_model"])
         with self.setting("multi_gpu", "Multi-GPU",
                           "Data parallel puts a full model copy on each GPU, each trains its own images, and the "
@@ -1683,6 +1688,13 @@ class Wizard:
         with self.setting(None, "GPUs to use", "Comma-separated, the first is the main GPU (it also saves and "
                                                "samples).", show_if=("multi_gpu", lambda x: x != "off")):
             self.bind(ui.input("Devices"), "devices").classes("w-full")
+        with self.setting("dp_balance", "Balance unequal GPUs",
+                          "With two different cards the faster one waits for the slower one every step. auto measures "
+                          "them during the first steps and splits each step's images by speed (it needs a few images "
+                          "per step: gradient accumulation 3 or more). grow lets the faster card train more images in "
+                          "the same time instead, so each step holds more images.",
+                          show_if=("multi_gpu", lambda x: x == "data_parallel")):
+            self.bind(ui.select(dict(self.w["dp_balance"].options), label="Balance"), "dp_balance").classes("w-full")
         with self.setting("transformer_quant", "Model quantization",
                           "Stores the frozen base model in fewer bits to save memory; the LoRA itself always trains "
                           "in full precision. auto keeps the model as it is. int8_convrot halves it at under 1% error "
@@ -1704,9 +1716,10 @@ class Wizard:
             self.bind(ui.number("Kept blocks (-1 = auto)", min=-1, precision=0), "checkpoint_keep_blocks") \
                 .classes("w-full")
         with self.setting("compile_model", "Compile the model",
-                          "torch.compile makes every step faster after a slow first few (triton is installed with "
-                          "the requirements). Best left off for a first run."):
-            self.bind(ui.switch("Compile model"), "compile_model")
+                          "torch.compile turns the small steps between the big matrix multiplies into fewer, fused GPU "
+                          "kernels: measured 26% faster per step on MOSS-Image and 12% on Krea 2, after a warm-up of "
+                          "under a minute. auto does it for runs of 100 steps or more."):
+            self.bind(ui.select(COMPILE_CHOICES, label="Compile"), "compile_model").classes("w-full")
         self.nav()
 
     # ---- 4 dataset
@@ -2209,6 +2222,18 @@ def build_page(local: bool = True):
                                          "second text encoder copy is loaded when a quantized one fits on each GPU. In "
                                          "model split the training model spans both GPUs, so samples and probes split "
                                          "only when a separate sampling model is set."))
+                            w["dp_balance"] = (
+                                ui.select({"auto": "auto: split each step by GPU speed",
+                                           "grow": "grow: faster GPUs fill the slowest one's time",
+                                           "off": "off: lockstep"}, value=d.dp_balance,
+                                          label="Data parallel balance").classes("w-80")
+                                .bind_visibility_from(w["multi_gpu"], "value", lambda x: x == "data_parallel")
+                                .tooltip("Unequal GPUs (an RTX 50 card runs nvfp4 on FP4 tensor cores, an RTX 40 card "
+                                         "dequantizes) wait for the slowest each step. auto measures them and splits "
+                                         "the step's batches by speed (gradient accumulation 4 on two cards: 5+3 "
+                                         "instead of 4+4), so the images per step stay the same. grow lets the faster "
+                                         "cards run more batches in the slowest one's time (Krea 2 nvfp4: 3+2 instead "
+                                         "of 1+1), so a step holds more images: lower the steps to match."))
                         with fields():
                             w["transformer_quant"] = ui.select(QUANTS, value="auto", label="Diffusion model quant") \
                                 .classes("w-48").tooltip("auto keeps the file's format; int8/int8_convrot/nvfp4 "
@@ -2231,8 +2256,12 @@ def build_page(local: bool = True):
                                 w["text_encoder_device"] = ui.select(["auto"] + gpus + ["cpu"], value="auto",
                                                                      label="Text encoder device (caching)") \
                                     .classes("w-56")
-                                w["compile_model"] = ui.switch("Compile model (torch.compile, needs triton)",
-                                                               value=False)
+                                w["compile_model"] = ui.select(COMPILE_CHOICES, value=d.compile_model,
+                                                               label="Compile model (torch.compile)").classes("w-72")                                     .tooltip("Fuses the work between the matrix multiplies into fewer GPU kernels. "
+                                             "Measured at 1 MP on an RTX 5060 Ti: MOSS-Image 26% and Krea 2 12% faster "
+                                             "per step, after a 25-40 s warm-up. auto compiles runs of 100+ steps "
+                                             "(needs triton, installed with the requirements); a block that fails to "
+                                             "compile then runs uncompiled.")
                             with fields():
                                 w["int8_matmul"] = ui.select({True: "W8A8 int8 matmul (fast)",
                                                               False: "dequantize to bf16 (slow)"},
@@ -3327,6 +3356,18 @@ improvement end training (two separate counts, default 1 each). Step-up needs pr
 ## Training states
 Turn on *Save training state* (LoRA, Advanced) to also write `state_XXXXXX/` folders (LoRA in fp32 + optimizer +
 scheduler + RNG). Point *Resume from training state folder* at one of them to continue exactly where it stopped.
+
+## Unequal GPUs
+*Data parallel balance* (Model, next to the GPU settings): in data parallel every step waits for the slowest GPU.
+auto (default) times each GPU during the first steps and splits a step's images by speed when that is at least 5%
+faster per image, keeping the images per step the same (it needs several per step: gradient accumulation 3 or
+more). grow lets the faster GPU train more images in the slower one's time, so each step holds more images: lower
+the steps to match. The log says what was measured and chosen.
+
+## Compile
+*Compile model* (Model, Advanced; default auto): torch.compile fuses the small steps between the matrix multiplies
+into fewer GPU kernels. Measured at 1 MP on an RTX 5060 Ti: MOSS-Image 26% and Krea 2 12% faster per step, after a
+warm-up of under a minute. auto compiles runs of 100 steps or more (triton is installed with the requirements).
 
 ## Weight average
 *Weight average decay* (Saving & samples, default 0.98, 0 = off): checkpoints, samples and likeness probes use a
