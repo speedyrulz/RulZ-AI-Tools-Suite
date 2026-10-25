@@ -378,12 +378,27 @@ def test_nvfp4_act_quant_kernel_matches_reference(device):
         x = (torch.randn(m, k) * 3).to(device, torch.bfloat16)
         x[0, :16] = 0  # an all-zero block
         x[1, 16:32] = 0.25 * torch.tensor([1.0, -1.0] * 8)  # exact e2m1 ties after scaling
-        q, s, g = Q._quantize_act_nvfp4_triton(x)
-        q_r, s_r, _ = Q.quantize_nvfp4(x, g)
-        assert torch.equal(q, q_r[:m])
-        got = Q.from_blocked(s, Q._roundup(m, 128), Q._ceil_div(k // 16, 4) * 4)[:m, : k // 16]
-        want = Q.from_blocked(s_r, Q._roundup(m, 16), k // 16)[:m]
-        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+        _check_act_quant_nvfp4(x)
+    # block scales on, and a hair (below an fp16 ulp) either side of, every e4m3 midpoint, subnormals included: a
+    # cast that rounds through fp16 first (triton 3.6 on sm_89) lands on the wrong neighbour. Global amax 2688 makes
+    # the per-tensor scale exactly 1, so a block's scale is its amax / 6.
+    e4m3 = torch.arange(127, dtype=torch.uint8).view(torch.float8_e4m3fn).float()  # 0 .. 448 (127 is NaN)
+    mids = (e4m3[:-1] + e4m3[1:]) / 2
+    amax = torch.cat([6 * 448.0 * torch.ones(1)] + [6 * mids * (1 + d) for d in (-2.0 ** -14, 0.0, 2.0 ** -14)])
+    blocks = torch.zeros(Q._roundup(amax.numel(), 64), 16)
+    blocks[: amax.numel(), 0] = amax
+    blocks[: amax.numel(), 1] = -amax / 3
+    _check_act_quant_nvfp4(blocks.reshape(-1, 1024).to(device))
+
+
+def _check_act_quant_nvfp4(x):
+    m, k = x.shape
+    q, s, g = Q._quantize_act_nvfp4_triton(x)
+    q_r, s_r, _ = Q.quantize_nvfp4(x, g)
+    assert torch.equal(q, q_r[:m])
+    got = Q.from_blocked(s, Q._roundup(m, 128), Q._ceil_div(k // 16, 4) * 4)[:m, : k // 16]
+    want = Q.from_blocked(s_r, Q._roundup(m, 16), k // 16)[:m]
+    assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
 
 
 @fp4_cuda
