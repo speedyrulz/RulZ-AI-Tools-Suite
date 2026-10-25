@@ -20,8 +20,7 @@ def button(text: str = "", icon: str | None = None, *, primary=False, flat=False
     b = QPushButton(text)
     b.setCursor(Qt.PointingHandCursor)
     if icon:
-        color = theme.C["on_accent"] if primary else theme.C["danger"] if danger else theme.C["text"]
-        b.setIcon(theme.icon(icon, color, 16))
+        theme.set_icon(b, icon, "on_accent" if primary else "danger" if danger else "text", 16)
     for prop, on in (("primary", primary), ("flat", flat), ("danger", danger)):
         if on:
             b.setProperty(prop, True)
@@ -51,7 +50,7 @@ class SelectionBar(QFrame):
         lay.setSpacing(6)
         self.close_btn = QPushButton()
         self.close_btn.setProperty("flat", True)
-        self.close_btn.setIcon(theme.icon("close", size=16))
+        theme.set_icon(self.close_btn, "close", "text", 16)
         self.close_btn.setToolTip("Clear selection (Esc)")
         self.close_btn.setCursor(Qt.PointingHandCursor)
         self.close_btn.clicked.connect(self.cleared.emit)
@@ -186,7 +185,7 @@ def open_default(path: str) -> None:
 def hline() -> QFrame:
     f = QFrame()
     f.setFixedHeight(1)
-    f.setStyleSheet(f"background: {theme.C['border']};")
+    theme.set_style(f, "background: %(border)s;")
     return f
 
 

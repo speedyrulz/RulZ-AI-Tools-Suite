@@ -286,7 +286,7 @@ class ViewerPage(QWidget):
         il.addWidget(ph)
         self.people_hint = QLabel()
         self.people_hint.setWordWrap(True)
-        self.people_hint.setStyleSheet(f"color: {theme.C['muted']}; font-size: 12px;")
+        theme.set_style(self.people_hint, "color: %(muted)s; font-size: 12px;")
         il.addWidget(self.people_hint)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -358,6 +358,9 @@ class ViewerPage(QWidget):
         finally:
             self.unsetCursor()
         self._load_faces()
+        self._set_details(ph)
+
+    def _set_details(self, ph):
         taken = datetime.fromtimestamp(ph.taken_at).strftime("%A, %B %d, %Y · %I:%M %p") if ph.taken_at else "Unknown"
         dims = f"{ph.width} × {ph.height}" if ph.width else ""
         mp = f" · {ph.width * ph.height / 1e6:.1f} MP" if ph.width else ""
@@ -366,6 +369,13 @@ class ViewerPage(QWidget):
             f"<span style='color:{theme.C['muted']}'>{dims}{mp} · {_fmt_size(ph.size)}</span><br><br>"
             f"{os.path.basename(ph.path)}<br>"
             f"<span style='color:{theme.C['muted']}'>{os.path.dirname(ph.path)}</span>")
+
+    def retheme(self):
+        """Redo the palette-colored parts of the info panel after a theme switch."""
+        ph = self._photo() if self.ids else None
+        if ph is not None:
+            self._set_details(ph)
+            self._load_faces()
 
     def _load_faces(self):
         ph = self._photo()

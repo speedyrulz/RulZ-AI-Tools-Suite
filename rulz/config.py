@@ -7,7 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 
 APP_NAME = "RulZ Image Organizer"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 IMAGE_EXTS = {
     ".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".bmp", ".gif", ".webp",
@@ -48,6 +48,14 @@ def _ensure_dir(path: str) -> Path:
     root = Path(path)
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+def settings():
+    """App preferences (theme, window geometry) in settings.ini next to the library, so RULZ_DATA_DIR
+    isolates them too."""
+    from PySide6.QtCore import QSettings
+
+    return QSettings(str(data_dir() / "settings.ini"), QSettings.IniFormat)
 
 
 def db_path() -> Path:

@@ -1,10 +1,10 @@
 """Dialogs: text input, confirmation, person picker, and the rename/merge flows."""
 from __future__ import annotations
 
-from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import (QDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QVBoxLayout,
-                               QWidget)
+from PySide6.QtCore import QRectF, QSize, Qt
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen
+from PySide6.QtWidgets import (QAbstractButton, QApplication, QDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+                               QListWidgetItem, QVBoxLayout, QWidget)
 
 from ..db import Database, Person
 from . import theme
@@ -250,3 +250,139 @@ def merge_into(parent, db: Database, person_id: int) -> int | None:
         return person_id
     db.merge_people([person_id], target)
     return target
+
+
+# ---- first run: choose Dark or Light -------------------------------------------------
+class _ThemeCard(QAbstractButton):
+    """A big selectable card with a tiny preview of one theme."""
+
+    def __init__(self, title: str, palette: dict, parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.pal = palette
+        self.setCheckable(True)
+        self.setAutoExclusive(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(236, 196)
+        self.setFocusPolicy(Qt.TabFocus)
+
+    def paintEvent(self, e):
+        C, P = theme.C, self.pal
+        p = QPainter(self)
+        p.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing)
+        outer = QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
+        sel = self.isChecked()
+        p.setPen(QPen(QColor(C["accent"] if sel else C["border"]), 2.5 if sel else 1))
+        p.setBrush(QColor(C["select"] if sel else C["card"]) if sel or self.underMouse() else QColor(C["card"]))
+        p.drawRoundedRect(outer, 14, 14)
+
+        # mini window
+        win = QRectF(16, 16, self.width() - 32, 122)
+        p.setPen(QPen(QColor(P["border"]), 1))
+        p.setBrush(QColor(P["bg"]))
+        p.drawRoundedRect(win, 8, 8)
+        side = QRectF(win.left() + 1, win.top() + 1, 52, win.height() - 2)
+        path = QPainterPath()
+        path.addRoundedRect(side, 7, 7)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(P["sidebar"]))
+        p.drawPath(path)
+        p.setBrush(QColor(P["accent"]))
+        p.drawRoundedRect(QRectF(side.left() + 8, side.top() + 10, 14, 6), 2, 2)
+        p.setBrush(QColor(P["side_text"]))
+        p.drawRoundedRect(QRectF(side.left() + 24, side.top() + 10, 20, 6), 2, 2)
+        for i in range(3):
+            p.setBrush(QColor(P["side_select"] if i == 0 else P["side_hover"]))
+            p.drawRoundedRect(QRectF(side.left() + 6, side.top() + 28 + i * 14, side.width() - 12, 10), 3, 3)
+        x0 = side.right() + 10
+        p.setBrush(QColor(P["text"]))
+        p.drawRoundedRect(QRectF(x0, win.top() + 12, 54, 8), 3, 3)
+        p.setBrush(QColor(P["accent"]))
+        p.drawRoundedRect(QRectF(win.right() - 42, win.top() + 10, 32, 12), 6, 6)
+        tw = (win.right() - 10 - x0 - 3 * 6) / 4
+        for r in range(2):
+            for c in range(4):
+                p.setBrush(QColor(P["placeholder"]))
+                p.drawRoundedRect(QRectF(x0 + c * (tw + 6), win.top() + 34 + r * (tw + 6), tw, tw), 3, 3)
+
+        # radio + title
+        cy = 166
+        p.setPen(QPen(QColor(C["accent"] if sel else C["muted"]), 2))
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(QRectF(20, cy - 8, 16, 16))
+        if sel:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(C["accent"]))
+            p.drawEllipse(QRectF(24, cy - 4, 8, 8))
+        f = QFont(self.font())
+        f.setPixelSize(15)
+        f.setWeight(QFont.DemiBold)
+        p.setFont(f)
+        p.setPen(QColor(C["text"]))
+        p.drawText(QRectF(44, cy - 12, 160, 24), Qt.AlignVCenter | Qt.AlignLeft, self.title)
+
+    def enterEvent(self, e):
+        self.update()
+
+    def leaveEvent(self, e):
+        self.update()
+
+
+class ThemeChoiceDialog(QDialog):
+    """First launch: pick Dark (preselected) or Light. The pick previews live and is saved on Continue;
+    closing the dialog keeps Dark."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Choose your look")
+        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(28, 24, 28, 22)
+        lay.setSpacing(10)
+        h = QLabel("Choose your look")
+        h.setObjectName("PageTitle")
+        lay.addWidget(h)
+        sub = QLabel("How should RulZ Image Organizer look? You can change this any time with the "
+                     "Light mode / Dark mode button at the bottom of the sidebar, or in Library ▸ Appearance.")
+        sub.setWordWrap(True)
+        sub.setObjectName("Muted")
+        sub.setMaximumWidth(500)
+        lay.addWidget(sub)
+        lay.addSpacing(8)
+        row = QHBoxLayout()
+        row.setSpacing(16)
+        self.dark_card = _ThemeCard("Dark", theme.DARK)
+        self.light_card = _ThemeCard("Light", theme.LIGHT)
+        self.dark_card.setChecked(True)
+        for c in (self.dark_card, self.light_card):
+            c.toggled.connect(self._preview)
+            row.addWidget(c)
+        lay.addLayout(row)
+        lay.addSpacing(10)
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        self.ok = button("Continue", primary=True)
+        self.ok.setDefault(True)
+        self.ok.clicked.connect(self.accept)
+        btns.addWidget(self.ok)
+        lay.addLayout(btns)
+        self.setFixedSize(self.sizeHint())
+
+    def chosen_dark(self) -> bool:
+        return not self.light_card.isChecked()
+
+    def _preview(self, on: bool):
+        if on:
+            theme.apply(QApplication.instance(), self.chosen_dark())
+            theme.retheme_widgets(self)
+            for c in (self.dark_card, self.light_card):
+                c.update()
+
+
+def choose_theme_first_run() -> bool:
+    """Shows the "Choose your look" dialog, saves and applies the result. Closing it = Dark."""
+    dlg = ThemeChoiceDialog()
+    dark = dlg.chosen_dark() if dlg.exec() == QDialog.Accepted else True
+    theme.save_choice(dark)
+    theme.apply(QApplication.instance(), dark)
+    return dark

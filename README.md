@@ -6,6 +6,16 @@ You name people and fix any mistakes; your corrections are always kept.
 
 Everything runs on your PC. No photos or face data ever leave your computer.
 
+| Dark (default) | Light |
+| --- | --- |
+| ![Photos timeline in dark mode](docs/screenshots/01-photos-dark.png) | ![Photos timeline in light mode](docs/screenshots/02-photos-light.png) |
+
+![Photo viewer with the info panel](docs/screenshots/03-photo-viewer.png)
+
+![Search filters for expression, head direction and pose](docs/screenshots/04-search-filters.png)
+
+<sub>Screenshots show generated demo pictures, not real photos.</sub>
+
 ## Features
 
 - **Library**: add any number of folders (subfolders included). Scans run in the background on startup,
@@ -46,7 +56,12 @@ Everything runs on your PC. No photos or face data ever leave your computer.
 - **Face grouping sensitivity** (Library page): move towards *Stricter* if different people get mixed,
   towards *Looser* if one person is split into many groups, then **Apply and regroup**. Named people and
   manual corrections are never undone.
-- Supports JPG, PNG, WebP, BMP, GIF, TIFF and HEIC/HEIF (iPhone) photos. Follows the Windows light/dark theme.
+- **Dark or light**: dark is the default. The first launch asks which look you want (*Choose your look*);
+  switch any time with the **Light mode / Dark mode** button at the bottom of the sidebar, in
+  **Library ▸ Appearance**, or with Ctrl+Shift+L. The change applies immediately and is remembered.
+
+  ![Choose your look](docs/screenshots/05-choose-your-look.png)
+- Supports JPG, PNG, WebP, BMP, GIF, TIFF and HEIC/HEIF (iPhone) photos.
 
 ### How corrections stick
 - Faces you assign by hand are never moved automatically.
@@ -69,7 +84,8 @@ python -m venv .venv
 **Build the .exe:** `powershell -ExecutionPolicy Bypass -File .\build.ps1`
 
 Library data (database, thumbnails, face crops) lives in `%LOCALAPPDATA%\RulZ Image Organizer`.
-Set `RULZ_DATA_DIR` to use a different location, and `RULZ_THEME=light|dark` to force a theme.
+Your preferences (theme, window size) are kept there too, in `settings.ini`.
+Set `RULZ_DATA_DIR` to use a different location, and `RULZ_THEME=light|dark` to force a theme for that run.
 
 ## How it works
 

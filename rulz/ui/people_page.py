@@ -203,7 +203,7 @@ class PersonPage(QWidget):
         head.setContentsMargins(16, 16, 28, 8)
         head.setSpacing(14)
         back = QPushButton()
-        back.setIcon(theme.icon("back", size=18))
+        theme.set_icon(back, "back", "text", 18)
         back.setProperty("flat", True)
         back.setToolTip("Back to People")
         back.setCursor(Qt.PointingHandCursor)

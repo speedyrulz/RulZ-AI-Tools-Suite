@@ -30,8 +30,12 @@ def main() -> int:
     icon_file = config.resource_path("assets", "icon.ico")
     if icon_file.exists():
         app.setWindowIcon(QIcon(str(icon_file)))
-    dark = {"dark": True, "light": False}.get(os.environ.get("RULZ_THEME", "").lower())
-    theme.apply(app, dark)
+    # Dark by default; RULZ_THEME=light|dark forces one. The first launch asks (and saves the answer).
+    theme.apply(app)
+    if theme.env_override() is None and theme.saved_choice() is None:
+        from .ui.dialogs import choose_theme_first_run
+
+        choose_theme_first_run()
     win = MainWindow()
     win.show()
     return app.exec()

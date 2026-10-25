@@ -44,7 +44,8 @@ class PhotosPage(QWidget):
         self.search.setToolTip("Words in one group describe one face; separate groups with commas.\n"
                                "Examples:  smiling   ·   Mom facing left   ·   Mom smiling, Dad   ·   looking down")
         self.search.setClearButtonEnabled(True)
-        self.search.addAction(theme.icon("search", theme.C["muted"], 16), QLineEdit.LeadingPosition)
+        search_icon = self.search.addAction(theme.icon("search", theme.C["muted"], 16), QLineEdit.LeadingPosition)
+        search_icon.setProperty("_rulzThemeIcon", "search|muted|16")
         self.search.setMinimumWidth(380)
         self.names = QStringListModel()
         comp = QCompleter(self.names, self)

@@ -1,10 +1,12 @@
 """Main window: sidebar navigation, pages, viewer and background scanning."""
 from __future__ import annotations
 
+import os
+
 from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtGui import QIcon, QKeySequence, QPixmap, QShortcut
-from PySide6.QtWidgets import (QButtonGroup, QFrame, QHBoxLayout, QLabel, QMainWindow, QProgressBar, QPushButton,
-                               QStackedWidget, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QFrame, QHBoxLayout, QLabel, QMainWindow, QProgressBar,
+                               QPushButton, QStackedWidget, QVBoxLayout, QWidget)
 
 from .. import config
 from ..db import Database
@@ -66,9 +68,11 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+2"), self, lambda: self.navigate(self.PEOPLE))
         QShortcut(QKeySequence("Ctrl+3"), self, lambda: self.navigate(self.LIBRARY))
         QShortcut(QKeySequence("F5"), self, self.scanner.scan)
+        QShortcut(QKeySequence("Ctrl+Shift+L"), self, lambda: self.set_theme(not theme.is_dark()))
 
-        settings = QSettings("RulZ", config.APP_NAME)
-        geo = settings.value("geometry")
+        geo = config.settings().value("geometry")
+        if geo is None and not os.environ.get("RULZ_DATA_DIR"):
+            geo = QSettings("RulZ", config.APP_NAME).value("geometry")  # where v1.1 kept it (read only)
         if geo is not None:
             self.restoreGeometry(geo)
         else:
@@ -89,18 +93,10 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(side)
         lay.setContentsMargins(12, 18, 12, 16)
         lay.setSpacing(4)
-        logo = QLabel()
-        logo.setContentsMargins(8, 2, 0, 0)
-        png = config.resource_path("assets", "logo_full_white.png")  # sidebar is always black
-        pm = QPixmap(str(png))
-        if not pm.isNull():
-            dpr = 2
-            pm = pm.scaledToWidth(168 * dpr, Qt.SmoothTransformation)
-            pm.setDevicePixelRatio(dpr)
-            logo.setPixmap(pm)
-        else:
-            logo.setText("RulZ")
-        lay.addWidget(logo)
+        self.logo = QLabel()
+        self.logo.setContentsMargins(8, 2, 0, 0)
+        self._update_logo()
+        lay.addWidget(self.logo)
         sub = QLabel("IMAGE ORGANIZER")
         sub.setObjectName("BrandSub")
         sub.setContentsMargins(10, 4, 0, 0)
@@ -130,7 +126,49 @@ class MainWindow(QMainWindow):
         self.side_progress.hide()
         lay.addWidget(self.side_status)
         lay.addWidget(self.side_progress)
+        lay.addSpacing(6)
+        self.theme_btn = QPushButton()
+        self.theme_btn.setObjectName("ThemeButton")
+        self.theme_btn.setCursor(Qt.PointingHandCursor)
+        self.theme_btn.setToolTip("Switch between dark and light (Ctrl+Shift+L)")
+        self.theme_btn.clicked.connect(lambda: self.set_theme(not theme.is_dark()))
+        lay.addWidget(self.theme_btn)
+        self._update_theme_button()
         return side
+
+    def _update_logo(self):
+        pm = QPixmap(theme.logo_file())
+        if not pm.isNull():
+            dpr = 2
+            pm = pm.scaledToWidth(168 * dpr, Qt.SmoothTransformation)
+            pm.setDevicePixelRatio(dpr)
+            self.logo.setPixmap(pm)
+        else:
+            self.logo.setText("RulZ")
+
+    def _update_theme_button(self):
+        dark = theme.is_dark()
+        self.theme_btn.setText("  Light mode" if dark else "  Dark mode")
+        self.theme_btn.setIcon(theme.icon("sun" if dark else "moon", theme.C["side_muted"], 16))
+
+    # ---- theme -----------------------------------------------------------------
+    def set_theme(self, dark: bool):
+        """Switch Dark/Light right away and remember it."""
+        theme.save_choice(dark)
+        if dark == theme.is_dark():
+            return
+        theme.apply(QApplication.instance(), dark)
+        theme.retheme_widgets(self)
+        self._update_logo()
+        self._update_theme_button()
+        self._update_nav_icons()
+        self.library.update_theme()
+        for p in (self.photos, self.people, self.library):
+            p.dirty = True
+        if self.root.currentWidget() is self.viewer:
+            self.viewer.retheme()
+        else:
+            self.pages.currentWidget().refresh()
 
     def _update_nav_icons(self):
         for i, btn in enumerate(self.nav_buttons):
@@ -220,6 +258,6 @@ class MainWindow(QMainWindow):
         self._schedule_refresh()
 
     def closeEvent(self, e):
-        QSettings("RulZ", config.APP_NAME).setValue("geometry", self.saveGeometry())
+        config.settings().setValue("geometry", self.saveGeometry())
         self.scanner.wait(8000)
         super().closeEvent(e)

@@ -6,7 +6,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[("models/*.onnx", "models"), ("assets/icon.ico", "assets"), ("assets/icon.png", "assets"),
-           ("assets/logo_full_white.png", "assets")],
+           ("assets/logo_full_white.png", "assets"), ("assets/logo_full.png", "assets")],
     hiddenimports=["pillow_heif"],
     excludes=[
         "tkinter", "matplotlib", "scipy", "pandas", "IPython", "pytest",

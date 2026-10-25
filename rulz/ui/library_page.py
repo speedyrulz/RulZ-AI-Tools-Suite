@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (QFileDialog, QFrame, QHBoxLayout, QListWidget, QL
 
 from .. import config
 from . import dialogs, theme
-from .common import button, label, plural
+from .common import Segmented, button, label, plural
 
 
 class Card(QFrame):
@@ -118,6 +118,15 @@ class LibraryPage(QWidget):
         grp.lay.addLayout(row)
         lay.addWidget(grp)
 
+        # appearance -----------------------------------------------------------
+        look = Card("Appearance", "Dark is the default. The sun/moon button at the bottom of the sidebar "
+                                  "(or Ctrl+Shift+L) switches too.")
+        self.theme_seg = Segmented(["Dark", "Light"])
+        self.theme_seg.changed.connect(lambda i: ctx.set_theme(i == 0))
+        look.lay.addWidget(self.theme_seg)
+        lay.addWidget(look)
+        self.update_theme()
+
         about = Card("About")
         about.lay.addWidget(label(f"{config.APP_NAME} {config.APP_VERSION}. Everything runs on this PC – no photos "
                                   "or faces ever leave your computer.", "Muted", wrap=True))
@@ -134,6 +143,9 @@ class LibraryPage(QWidget):
         ctx.scanner.started.connect(self._scan_state)
         ctx.scanner.finished.connect(self._finished)
         self._scan_state()
+
+    def update_theme(self):
+        self.theme_seg.set_current(0 if theme.is_dark() else 1)
 
     # ---- refresh -------------------------------------------------------------
     def refresh(self):
