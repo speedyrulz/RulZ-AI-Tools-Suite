@@ -586,6 +586,16 @@ if HAS_TRITON:
         return tl.where(code < 4, code * 0.5,
                         tl.where(code == 4, 2.0, tl.where(code == 5, 3.0, tl.where(code == 6, 4.0, 6.0))))
 
+    @triton.jit
+    def _round_e4m3(s):
+        """fp32 s in [0, 448] rounded to the nearest e4m3 value (ties to even), still fp32, so the cast to float8e4nv
+        after it is exact. Triton's own cast is not portable: 3.6 on sm_89 truncates to fp16 first (cvt.rz.f16.f32),
+        a double rounding that lands on the other e4m3 neighbour just above a midpoint (200.03 -> 192, not 208)."""
+        e = tl.maximum(((s.to(tl.int32, bitcast=True) >> 23) & 0xFF) - 127, -6)  # binade; subnormals below 2^-6
+        step = ((e + 124) << 23).to(tl.float32, bitcast=True)  # 2^(e-3): 3 mantissa bits
+        inv = ((130 - e) << 23).to(tl.float32, bitcast=True)  # 2^(3-e), so both products are exact
+        return _libdevice.rint(s * inv) * step
+
     @triton.jit(do_not_specialize=["seed"])  # a new seed every call must not mean a new compiled kernel
     def _nvfp4_quant_act_kernel(x_ptr, q_ptr, s_ptr, g_ptr, M, K, n_col_blocks, stride_x, stride_q, seed,
                                 BLOCK_M: tl.constexpr, GROUPS: tl.constexpr, STOCHASTIC: tl.constexpr):
@@ -601,7 +611,7 @@ if HAS_TRITON:
         x3 = tl.reshape(x, (BLOCK_M, GROUPS, 16))
         amax = tl.max(tl.abs(x3), axis=2)
         scaled = tl.minimum(_libdevice.div_rn(_libdevice.div_rn(amax, 6.0), g), 448.0)
-        s8 = scaled.to(tl.float8e4nv)
+        s8 = _round_e4m3(scaled).to(tl.float8e4nv)
         if STOCHASTIC:  # scale rounded up, never down: no value clips at 6 or flushes to 0, both biased to zero
             sf = s8.to(tl.float32)
             # the next e4m3 value: 3 mantissa bits per binade, 2^-9 apart among the subnormals (log2(0) = -inf)
