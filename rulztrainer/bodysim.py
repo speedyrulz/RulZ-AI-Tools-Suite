@@ -16,6 +16,7 @@ import math
 from pathlib import Path
 
 import numpy as np
+import torch
 
 log = logging.getLogger("rulztrainer")
 
@@ -366,6 +367,10 @@ class BodyScorer:
                  f"{self.ref_self_similarity:.3f}" if self.ref_self_similarity is not None else "n/a")
         return info
 
+    @property
+    def ready(self) -> bool:
+        return bool(self.profile)
+
     def score(self, path: str | Path) -> tuple[float | None, int]:
         """(body similarity percent | None, ratios compared)."""
         if not self.profile:
@@ -374,3 +379,119 @@ class BodyScorer:
         if not r:
             return None, 0
         return ratio_similarity(r, self.profile)
+
+
+# ---------------------------------------------------------------- appearance (DINOv2 on the person crop)
+
+APPEARANCE_MODEL = "facebook/dinov2-base"
+APPEARANCE_PATTERNS = ["config.json", "preprocessor_config.json", "model.safetensors"]
+
+
+class AppearanceScorer:
+    """Body likeness as a DINOv2 embedding of the person crop (MediaPipe's pose box, padded), scored like the face:
+    the best cosine match against the reference crops, as a percent.
+
+    Measured on a 15-photo dataset against 11 base-model probes: the worst same-person match (leave-one-out) 0.49,
+    the best stranger 0.26 (CLS token; whole images overlapped, scene and clothing dominating). A stranger scores
+    ~10-26, the person 50-70+, the face score's range. Hair, build, skin and style count, and clothing too: vary the
+    outfits among the references. The proportion score (BodyScorer) could not score that dataset's references at all
+    (one of eight skeleton ratios measurable)."""
+
+    def __init__(self, models_dir: str | Path = "models", device: str = "cuda:0", model_id: str = APPEARANCE_MODEL,
+                 pad: float = 0.2, progress=None):
+        self.pose = BodyScorer(models_dir, progress=progress)  # the person box
+        self.device = device if (device == "cpu" or torch.cuda.is_available()) else "cpu"
+        self.pad = pad
+        self.model = self.processor = None
+        self.model_id = model_id
+        self.progress = progress
+        self.refs: list[tuple[str, np.ndarray]] = []
+        self.ref_count = 0
+        self.ref_self_similarity: float | None = None
+
+    @classmethod
+    def with_embedder(cls, embed, crop) -> "AppearanceScorer":
+        """A scorer around given functions, for tests: embed(PIL image) -> unit vector, crop(path) -> image | None."""
+        self = cls.__new__(cls)
+        self.refs, self.ref_count, self.ref_self_similarity = [], 0, None
+        self._embed, self.person_crop = embed, crop  # type: ignore[method-assign]
+        return self
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.refs)
+
+    def _load(self) -> None:
+        if self.model is not None:
+            return
+        from transformers import AutoImageProcessor, AutoModel
+
+        from .downloads import ensure_hf_snapshot
+
+        path = ensure_hf_snapshot(self.model_id, "DINOv2", self.progress, allow_patterns=APPEARANCE_PATTERNS)
+        if self.progress:
+            self.progress("Loading DINOv2...", None)
+        self.processor = AutoImageProcessor.from_pretrained(path)
+        self.model = AutoModel.from_pretrained(path).to(self.device).eval().requires_grad_(False)
+
+    def person_crop(self, path: str | Path):
+        """The person's box from the visible pose landmarks, padded; None without a pose."""
+        from PIL import Image, ImageOps
+
+        lm = self.pose.landmarks(path)
+        if lm is None:
+            return None
+        pts, vis = lm
+        with Image.open(path) as im:
+            im = ImageOps.exif_transpose(im).convert("RGB")
+            if max(im.size) > 1536:  # the landmarks were found on this size
+                im.thumbnail((1536, 1536))
+            p = pts[vis > 0.5] if int((vis > 0.5).sum()) >= 4 else pts
+            x0, y0 = p.min(0)
+            x1, y1 = p.max(0)
+            w, h = max(1.0, x1 - x0), max(1.0, y1 - y0)
+            box = (max(0, int(x0 - self.pad * w)), max(0, int(y0 - self.pad * h)),
+                   min(im.width, int(x1 + self.pad * w)), min(im.height, int(y1 + self.pad * h)))
+            return im.crop(box)
+
+    @torch.no_grad()
+    def _embed(self, image) -> np.ndarray:
+        self._load()
+        x = self.processor(images=image, return_tensors="pt").to(self.device)
+        v = self.model(**x).last_hidden_state[:, 0].float()  # the CLS token
+        return torch.nn.functional.normalize(v, dim=-1)[0].cpu().numpy()
+
+    def set_references(self, paths: list[str | Path]) -> list[dict]:
+        from .facesim import expand_refs
+
+        self.refs, info = [], []
+        for p in expand_refs(paths):
+            crop = self.person_crop(p)
+            if crop is None:
+                info.append({"image": str(p), "person": False})
+                log.warning("Body reference %s: no person found", p)
+                continue
+            self.refs.append((str(p), self._embed(crop)))
+            info.append({"image": str(p), "person": True, "crop_size": list(getattr(crop, "size", ()) or ())})
+        self.ref_count = len(self.refs)
+        if self.ref_count >= 2:
+            embs = np.stack([e for _, e in self.refs])
+            sims = embs @ embs.T
+            np.fill_diagonal(sims, -1.0)
+            self.ref_self_similarity = float(sims.max(axis=1).mean())  # each reference's best match: the ceiling
+        else:
+            self.ref_self_similarity = None
+        log.info("Body references (appearance): %d of %d images had a person; self-similarity %s", self.ref_count,
+                 len(info), f"{self.ref_self_similarity:.3f}" if self.ref_self_similarity is not None else "n/a")
+        return info
+
+    def score(self, path: str | Path) -> tuple[float | None, int]:
+        """(appearance similarity percent | None, references compared)."""
+        if not self.refs:
+            return None, 0
+        crop = self.person_crop(path)
+        if crop is None:
+            return None, 0
+        emb = self._embed(crop)
+        best = max(float(emb @ ref) for _, ref in self.refs)
+        return max(0.0, min(1.0, best)) * 100.0, len(self.refs)

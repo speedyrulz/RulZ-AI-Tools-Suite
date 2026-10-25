@@ -495,10 +495,23 @@ def face_preview(paths: list[str], provider: str, det_size: int) -> tuple[str, l
 
 
 def body_preview(paths: list[str], backend: str = "mediapipe", sam3_model: str = "facebook/sam3",
-                 device: str = "cuda:0") -> str:
+                 device: str = "cuda:0", body_score: str = "appearance") -> str:
     ok, msg = bodysim.available()
     if not ok:
         return msg
+    if body_score == "appearance":
+        scorer = bodysim.AppearanceScorer("models", device, progress=set_progress)
+        set_progress("Finding people...", None)
+        paths = [str(p) for p in facesim.expand_refs(paths)]
+        if not paths:
+            return "No image files found in the listed paths (folders are expanded to the images inside)."
+        info = scorer.set_references(paths)
+        text = f"{scorer.ref_count} of {len(paths)} body references have a person (appearance score, DINOv2)."
+        if scorer.ref_self_similarity is not None:
+            text += f" Reference self-similarity {scorer.ref_self_similarity * 100:.1f}% (the normalized 100%)."
+        else:
+            text += " Add 2+ references to measure the self-similarity ceiling."
+        return text
     sil = None
     note = ""
     if backend == "mediapipe+sam3":
@@ -773,6 +786,7 @@ class Form:
             body_refs=[p.strip() for p in (v("body_refs") or "").splitlines() if p.strip()],
             face_weight=float(v("face_weight")), body_weight=float(v("body_weight")),
             body_backend=v("body_backend"), sam3_model=(v("sam3_model") or "facebook/sam3").strip(),
+            body_score=v("body_score"),
             body_device=v("body_device"),
             probe_every=int(v("probe_every")), probe_at_start=bool(v("probe_at_start")),
             probe_face_prompt=s("probe_face_prompt"), probe_body_prompt=s("probe_body_prompt"),
@@ -2967,10 +2981,17 @@ def build_page(local: bool = True):
                         w["body_refs"] = ui.textarea("Body reference images or folders (one path per line; "
                                                      "full-body shots)").classes("w-full")
                         with fields():
+                            w["body_score"] = ui.select({"appearance": "appearance (DINOv2)",
+                                                         "proportions": "proportions (skeleton)"},
+                                                        value=d.body_score, label="Body score").classes("w-52") \
+                                .tooltip("appearance: a DINOv2 embedding of the person crop, best match against the "
+                                         "references, like the face score (hair, build, skin, style; clothing too, "
+                                         "so vary the outfits among the references). proportions: skeleton ratios "
+                                         "against the references' median, which shift with pose and camera angle.")
                             w["body_backend"] = ui.select(["mediapipe", "mediapipe+sam3"], value=d.body_backend,
-                                                          label="Body backend").classes("w-48") \
-                                .tooltip("mediapipe: skeleton proportion ratios. +sam3: also silhouette widths from a "
-                                         "SAM 3 person mask")
+                                                          label="Pose / mask backend").classes("w-48") \
+                                .tooltip("mediapipe: pose landmarks (the person box, skeleton ratios, region masks). "
+                                         "+sam3: a SAM 3 person mask for region masks and silhouette widths")
                             w["sam3_model"] = ui.input("SAM 3 model (repo id or folder)", value=d.sam3_model) \
                                 .classes("w-64") \
                                 .bind_visibility_from(w["body_backend"], "value", lambda x: x == "mediapipe+sam3")
@@ -2987,7 +3008,8 @@ def build_page(local: bool = True):
                                 _begin("Preparing body models...")
                                 try:
                                     body_info.text = await run.io_bound(body_preview, paths, w["body_backend"].value,
-                                                                        w["sam3_model"].value, w["body_device"].value)
+                                                                        w["sam3_model"].value, w["body_device"].value,
+                                                                        w["body_score"].value)
                                 except Exception as e:  # noqa: BLE001
                                     body_info.text = f"Error: {e}"
                                 finally:
@@ -3756,11 +3778,15 @@ targets; small batches with more steps beat large batches. *Dropped captions kee
 section, default on): caption dropout trains on the trigger alone instead of the empty prompt, so the trigger by
 itself summons the subject.
 
-**Probe scores.** The face score (ArcFace: a stranger ~10-25, the references against each other ~60-80) and the body
-score (proportions: every human ~80, the references ~90-96) are not on one scale, so with *Normalize face and body
-scores* (default on) each is first mapped to 0 = a stranger's score (the step-0 probe, so keep *Probe at start* on)
-and 100 = the references' own self-similarity. The combined score, best checkpoint, early stop, curriculum and race
-decisions use these; the Monitor shows the raw scores next to them.
+**Probe scores.** The face score is ArcFace's best match against the references (a stranger ~10-25, the references
+against each other ~60-80). The body score (*Body score*, Identity similarity section) is by default a DINOv2
+embedding of the person crop, best match against the references the same way (a stranger ~10-26, the person
+50-70+: hair, build, skin, style, and clothing, so vary the outfits among the references); `proportions` is the older
+skeleton-ratio match (every human ~80, the references ~90-96), which shifts with pose and camera angle. With
+*Normalize face and body scores* (default on) each is first mapped to 0 = a stranger's score (the step-0 probe, so
+keep *Probe at start* on) and 100 = the references' own self-similarity (each reference's best match among the
+others). The combined score, best checkpoint, early stop, curriculum and race decisions use these; the Monitor
+shows the raw scores next to them.
 
 ## Configuration race
 *Configuration race* (Train tab, after the likeness probes) trains several configurations in turn: each trains until

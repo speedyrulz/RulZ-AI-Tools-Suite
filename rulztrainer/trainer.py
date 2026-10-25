@@ -2062,22 +2062,27 @@ class Trainer:
             log.warning("%s; body scoring disabled", msg)
             return None
         try:
-            sil = None
-            if cfg.body_backend == "mediapipe+sam3":
-                try:
-                    sil = bodysim.SilhouetteScorer(cfg.sam3_model, cfg.body_device,
-                                                   progress=lambda t, f: self.status.update(stage=t))
-                except Exception as e:  # noqa: BLE001
-                    log.warning("SAM 3 unavailable (%s); body scoring uses MediaPipe only. For facebook/sam3 accept "
-                                "the license on huggingface.co and run 'hf auth login'.", e)
-            scorer = bodysim.BodyScorer(cfg.models_dir, silhouette=sil,
-                                        progress=lambda t, f: self.status.update(stage=t))
+            if cfg.body_score == "appearance":
+                scorer = bodysim.AppearanceScorer(cfg.models_dir, cfg.body_device,
+                                                  progress=lambda t, f: self.status.update(stage=t))
+            else:
+                sil = None
+                if cfg.body_backend == "mediapipe+sam3":
+                    try:
+                        sil = bodysim.SilhouetteScorer(cfg.sam3_model, cfg.body_device,
+                                                       progress=lambda t, f: self.status.update(stage=t))
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("SAM 3 unavailable (%s); body scoring uses MediaPipe only. For facebook/sam3 "
+                                    "accept the license on huggingface.co and run 'hf auth login'.", e)
+                scorer = bodysim.BodyScorer(cfg.models_dir, silhouette=sil,
+                                            progress=lambda t, f: self.status.update(stage=t))
             scorer.set_references(cfg.body_refs)
         except Exception as e:  # noqa: BLE001
             log.warning("Could not initialise body scoring (%s); disabled", e)
             return None
-        if not scorer.profile:
-            log.warning("No usable pose in any body reference image; body scoring disabled")
+        if not scorer.ready:
+            log.warning("No usable %s in any body reference image; body scoring disabled",
+                        "person" if cfg.body_score == "appearance" else "pose")
             return None
         self.status.update(body_ref_similarity=scorer.ref_self_similarity, body_refs=scorer.ref_count)
         return scorer

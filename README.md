@@ -648,14 +648,27 @@ and only changes beyond `likeness_noise_band` count. The controller then, each i
 The scores never enter the loss; they steer data, lr and stopping. Use the same reference set and prompts for a
 whole run so the series is comparable.
 
+**Body score** (`body_score`). `appearance` (the default): a DINOv2-base embedding of the person crop (MediaPipe's
+pose box, padded 20%), scored like the face as the best cosine match against the reference crops, in percent. On a
+15-photo dataset against 11 base-model probes the worst same-person match (leave-one-out) was 0.49 and the best
+stranger 0.26, where embeddings of whole images overlapped (scene and clothing dominate) and the proportion score
+could not score the references at all (one of eight skeleton ratios measurable). A stranger scores ~10-26, the
+person 50-70+. Hair, build, skin and style count, and clothing too, so vary the outfits among the references. The
+model (350 MB, `facebook/dinov2-base`) downloads on first use and runs on `body_device`. `proportions`: the older
+match of skeleton ratios (shoulder/hip width, leg/height, ...) against the references' median, plus SAM 3
+silhouette widths with `body_backend: mediapipe+sam3`; proportions in a photo shift with pose and camera angle, so
+this score can fall while the image gets closer.
+
 **One scale for face and body** (`likeness_normalize`, on by default). Raw, the two scores are not comparable: the
-face score is an ArcFace cosine (a stranger scores ~10-25, your references against each other ~60-80), the body score
-a proportion match where every human already scores ~80 and the references ~90-96. A run's face score moves ~60
-points, its body score ~10, so a 0.7 / 0.3 average is really ~93% face and "the face lags the body" is true all run.
+face score is an ArcFace cosine (a stranger scores ~10-25, your references against each other ~60-80), the proportion
+body score a match where every human already scores ~80 and the references ~90-96. A run's face score moves ~60
+points, a proportion body score ~10, so a 0.7 / 0.3 average is really ~93% face and "the face lags the body" is true
+all run.
 Each score is therefore mapped first onto one scale, 0 = what a stranger scores and 100 = what the references score
 against each other: the floor is the step-0 probe (the base model without the LoRA; `probe_at_start`) or a default
 (face 20, body 80), the ceiling the references' self-similarity when two or more are given, or a default (face 75,
-body 95), the ceiling raised to at least 10 face / 8 body points above the floor when the step-0 score is at or
+body 95; the face ceiling is each reference's best match among the others, the statistic a probe is scored
+with), the ceiling raised to at least 10 face / 8 body points above the floor when the step-0 score is at or
 above it, with scores above the ceiling counting up to 120. The combined score, the noise band, the curriculum gap,
 the lr control, the best checkpoint, early stop and the race drops all use the normalized values; the log, the
 Monitor and `likeness.jsonl` show the raw face / body next to them (`face_norm`, `body_norm`, `scale`). Earlier runs'

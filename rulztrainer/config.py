@@ -200,7 +200,9 @@ class TrainConfig:
     face_provider: str = "cpu"  # cpu | cuda (onnxruntime provider for InsightFace)
     face_det_size: int = 640
     body_refs: list[str] = field(default_factory=list)  # dataset images (full body, neutral pose) for proportions
-    body_backend: str = "mediapipe"  # mediapipe (skeleton ratios) | mediapipe+sam3 (adds SAM 3 silhouette widths)
+    body_score: str = "appearance"  # appearance (DINOv2 of the person crop, best match against the references) |
+    #   proportions (skeleton ratios from body_backend, + SAM 3 silhouette widths with mediapipe+sam3)
+    body_backend: str = "mediapipe"  # mediapipe (skeleton ratios, region masks) | mediapipe+sam3 (adds SAM 3 masks)
     sam3_model: str = "facebook/sam3"  # HF repo id or local transformers-format directory
     body_device: str = "cuda:0"  # where SAM 3 runs while scoring (moved back to CPU afterwards)
     face_weight: float = 0.7  # weights for the combined score

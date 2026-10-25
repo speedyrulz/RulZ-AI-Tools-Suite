@@ -138,8 +138,11 @@ class FaceScorer:
         if len(self.refs) >= 2:
             embs = np.stack([e for _, e in self.refs])
             sims = embs @ embs.T
-            n = len(embs)
-            self.ref_self_similarity = float((sims.sum() - np.trace(sims)) / (n * (n - 1)))
+            np.fill_diagonal(sims, -1.0)
+            # each reference's best match among the others: the statistic a probe is scored with (its best match
+            # among the references), so it is the ceiling of the normalized scale. The mean pairwise similarity sat
+            # 8 points lower on a 15-photo set and read a good probe as 120%
+            self.ref_self_similarity = float(sims.max(axis=1).mean())
         else:
             self.ref_self_similarity = None
         log.info("Face references: %d of %d images had a face; reference self-similarity %s", len(self.refs),
