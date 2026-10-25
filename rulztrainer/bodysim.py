@@ -196,6 +196,20 @@ def available() -> tuple[bool, str]:
     return True, ""
 
 
+def mask_width_multiple() -> int:
+    """The image width the pose model's person mask needs: mediapipe 1.0.0 and 1.0.1 abort the whole process (a native
+    check, which Python cannot catch) when they read a float mask whose rows are padded, which is any width that is
+    not a multiple of 4 (a 1233 px wide photo, say). 1.1.0 fixed it. On 1.0.x the image is padded on the right by up
+    to 3 px (its own edge pixels) and the mask cut back, so scores can differ from 1.1+ by a hair."""
+    try:
+        import mediapipe
+
+        major, minor = (int(x) for x in str(mediapipe.__version__).split(".")[:2])
+    except Exception:  # noqa: BLE001
+        return 1
+    return 4 if (major, minor) == (1, 0) else 1
+
+
 def ensure_model(models_dir: str | Path = "models", progress=None) -> Path:
     from .downloads import ensure_mediapipe_pose
 
@@ -295,6 +309,11 @@ class BodyScorer:
         self.landmarker = vision.PoseLandmarker.create_from_options(opts)
         self.min_visibility = min_visibility
         self.silhouette = silhouette
+        self.pad_to = mask_width_multiple() if segment else 1
+        if self.pad_to > 1:
+            log.warning("mediapipe %s crashes reading person masks of some image widths: images are padded to a "
+                        "width that is a multiple of %d (upgrade to mediapipe 1.1 or newer for exactly the scores "
+                        "of other machines)", mp.__version__, self.pad_to)
         self.profile: dict[str, float] = {}
         self.ref_count = 0
         self.ref_self_similarity: float | None = None
@@ -312,17 +331,21 @@ class BodyScorer:
 
     def _detect(self, im):
         """(pts [33,2] pixels, vis [33], person mask [H, W] bool | None) or None if no person found."""
-        arr = np.ascontiguousarray(np.asarray(im))
+        arr = np.asarray(im)
+        h, w = arr.shape[:2]
+        pad = (-w) % getattr(self, "pad_to", 1)  # mediapipe 1.0.x only (mask_width_multiple)
+        if pad:
+            arr = np.pad(arr, ((0, 0), (0, pad), (0, 0)), mode="edge")
+        arr = np.ascontiguousarray(arr)
         res = self.landmarker.detect(self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=arr))
         if not res.pose_landmarks:
             return None
         lm = res.pose_landmarks[0]
-        h, w = arr.shape[:2]
-        pts = np.array([[q.x * w, q.y * h] for q in lm], dtype=np.float32)
+        pts = np.array([[q.x * (w + pad), q.y * h] for q in lm], dtype=np.float32)
         vis = np.array([q.visibility if q.visibility is not None else 1.0 for q in lm], dtype=np.float32)
         mask = None
         if getattr(res, "segmentation_masks", None):
-            mask = np.squeeze(res.segmentation_masks[0].numpy_view()) > 0.5
+            mask = np.squeeze(res.segmentation_masks[0].numpy_view())[:, :w] > 0.5
         return pts, vis, mask
 
     def landmarks(self, path: str | Path):

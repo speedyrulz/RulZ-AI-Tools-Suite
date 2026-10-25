@@ -1042,6 +1042,16 @@ diffusion_model.layers.<n>.proj.<...>.alpha
 
 These names are identical in the diffusers checkpoint and the ComfyUI plugin model, so no key conversion is needed.
 
+### Scoring likeness in ComfyUI
+
+`comfyui/rulztrainer_likeness` is a ComfyUI node pack that scores any images against a person's references with the
+trainer's own scoring code and defaults: face, body and overall on the normalized scale, averaged over one image, a
+batch or folders of images, with every image's own scores and an optional .xlsx or CSV export. References can be
+shared or separate for face and body, as in the trainer. An optional set of base-model images sets the 0 of the scale
+like the trainer's step-0 probe, and a trainer job folder can supply that run's exact scale. Link the folder into
+ComfyUI's `custom_nodes` and load `workflows/RulzTrainer Likeness Scoring.json`; its
+[README](comfyui/rulztrainer_likeness/README.md) covers installation and every input.
+
 ## VRAM guidance (16 GB cards)
 
 | Setting | Recommendation |
