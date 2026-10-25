@@ -121,8 +121,9 @@ shows in the Instance Portal's log viewer. Then click *Open* on the instance: th
 **RulzTrainer** (the WebUI, proxied by Caddy on port 7870 with the portal's token / basic auth, so it is never open
 to the internet unauthenticated), Jupyter (file browser + terminal for uploads and downloads) and the tunnel links.
 
-Datasets: upload on the WebUI's Dataset tab (drag and drop images + `.txt` captions) or into
-`/workspace/RulzTrainer/datasets/<name>` with Jupyter / `scp` / Syncthing. Results are written to
+Datasets: on the WebUI's Dataset tab, *Create dataset*, open it and upload images and `.txt` captions from your own
+computer (drag and drop), or put them into `/workspace/RulzTrainer/datasets/<name>` with Jupyter / `scp` / Syncthing.
+Results are written to
 `/workspace/RulzTrainer/output/<job>/`; download them from Jupyter before destroying the instance (the disk is gone
 with it; stopping keeps it). `models/` on the instance disk caches the downloaded base model between runs.
 
@@ -791,8 +792,36 @@ Caption dropout (`caption_dropout`, 5% of batches) trains on the trigger word al
 which is how a character LoRA is usually prompted. Off, a dropped caption is the empty prompt (FIBO: its null
 caption), the base model's unconditional input.
 
-The WebUI's Dataset tab lets you upload images and `.txt` captions into a folder, shows them in a grid, and
-writes caption edits back to the `.txt` files as you type.
+The WebUI's Dataset tab lists every dataset as a card with a few thumbnails: the folders in `datasets/` next to
+the WebUI (where *Create dataset* makes new ones; git-ignored) and folders elsewhere added with *Add a folder*
+(remembered in `datasets/.rulz_datasets.json`; *Remove from list* forgets one without touching its files). Click a
+dataset to open it:
+
+- *Upload* sends images and their `.txt` or `.json` captions from the computer the browser runs on to the machine
+  running RulzTrainer, a vast.ai instance included; on the same machine that is a plain copy. Files keep their names
+  and a file with the same name is replaced.
+- *Copy from a folder* copies the images and captions of a folder on the machine running RulzTrainer into the dataset,
+  sub-folders kept; files the dataset already has are left alone.
+- The grid shows every picture with its caption, saved to the `.txt` file as you type, and the *Face ref* / *Body ref*
+  ticks; *Train on this dataset* ticks the dataset for training.
+
+**Several datasets per run.** On the Train tab (Dataset section) tick the datasets a run trains on. Each can train at
+its own resolutions (none picked: the run's *Training resolutions*) and has *Repeats*, how many times each of its
+images comes up per epoch (default 1): a dataset at 2 counts twice as much as one at 1, which weights a small or
+important set up. In YAML:
+
+```yaml
+datasets:
+  - {path: datasets/anna_portraits}
+  - {path: datasets/anna_full_body, resolutions: [0.5, 1.0], repeats: 2}
+```
+
+The run trains at every resolution any dataset uses (resolution step-up steps through all of them; a dataset joins
+the stages at its own resolutions). Each dataset caches its latents and region maps in its own `.rulz_cache`, so it
+trains again without re-encoding whatever it is combined with; text embeddings, the face analysis and loss-watch
+exclusions live in the first dataset's cache (or `cache_dir`, which then holds everything). A config with a single
+`dataset_dir` and no `datasets` trains that folder as before; listing a dataset twice, or one inside another (whose
+scan includes its sub-folders), is refused.
 
 ## FIBO 2.0 (Bria): training on dev, using the LoRA on Edit Turbo
 

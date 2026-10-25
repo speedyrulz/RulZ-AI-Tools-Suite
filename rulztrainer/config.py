@@ -64,6 +64,18 @@ def side_to_mp(side: int) -> float:
     return round(side * side / (1024 * 1024), 2)
 
 
+DATASET_KEYS = ("path", "resolutions", "repeats")
+
+
+@dataclass(frozen=True)
+class DatasetSpec:
+    """One dataset of a run: its folder (sub-folders included), its own training resolutions in megapixels (empty:
+    the run's) and how many times each of its images comes up per epoch."""
+    path: str
+    resolutions: tuple = ()
+    repeats: int = 1
+
+
 def apply_preset(data: dict, name: str) -> dict:
     """Return a copy of a config dict with the preset applied. Probe prompts are filled in only when empty."""
     if name not in PRESETS:
@@ -119,7 +131,10 @@ class TrainConfig:
     #   torch (PyTorch picks) | cudnn | flash | efficient | math
 
     # --- dataset ---
-    dataset_dir: str = "datasets/my_dataset"
+    dataset_dir: str = "datasets/my_dataset"  # the dataset folder when `datasets` lists none (single-dataset configs)
+    # several datasets: [{"path": folder, "resolutions": [MP, ...] (empty: the run's), "repeats": N (times each image
+    # comes up per epoch, default 1)}, ...]; empty = dataset_dir alone
+    datasets: list[dict] = field(default_factory=list)
     resolution: int = 1024  # target total pixels = resolution^2, aspect preserved, buckets at multiples of 16
     resolutions: list[float] = field(default_factory=list)  # megapixels to train at (0.25..4 in 0.25 steps); [] = resolution
     resolution_step_up: bool = False  # train the lowest resolution first and step up when the probe score stalls
@@ -134,7 +149,7 @@ class TrainConfig:
     caption_dropout: float = 0.05
     caption_dropout_keep_trigger: bool = True  # a dropped caption keeps the trigger word (else the empty prompt)
     max_token_length: int = 1024
-    cache_dir: str = ""  # defaults to <dataset_dir>/.rulz_cache
+    cache_dir: str = ""  # defaults to <dataset>/.rulz_cache per dataset (the run's own files: the first dataset's)
     recache: bool = False
 
     # --- lora ---
@@ -280,12 +295,34 @@ class TrainConfig:
     sample_model_path: str = ""  # optional different diffusion model for sampling only: .safetensors, diffusers dir or repo id
     sample_model_quant: str = "auto"  # auto | none | int8 | int8_convrot | nvfp4
 
-    def training_sides(self) -> list[int]:
-        """Training resolutions as square-equivalent side lengths (area = side^2), ascending and unique."""
+    def dataset_specs(self) -> list[DatasetSpec]:
+        """The run's datasets: the `datasets` entries, else dataset_dir alone at the run's resolutions, once per epoch."""
+        if not self.datasets:
+            return [DatasetSpec(str(self.dataset_dir or "").strip())]
+        out = []
+        for d in self.datasets:
+            if not isinstance(d, dict):
+                d = {"path": str(d)}
+            reps = d.get("repeats", 1)
+            out.append(DatasetSpec(str(d.get("path") or "").strip(),
+                                   tuple(float(x) for x in (d.get("resolutions") or [])),
+                                   1 if reps is None else int(reps)))
+        return out
+
+    def run_sides(self) -> list[int]:
+        """The run's own training resolutions as square-equivalent side lengths (area = side^2), ascending, unique."""
         if not self.resolutions:
             return [int(self.resolution)]
-        sides = sorted({mp_to_side(mp) for mp in self.resolutions})
-        return sides
+        return sorted({mp_to_side(mp) for mp in self.resolutions})
+
+    def dataset_sides(self, spec: DatasetSpec) -> list[int]:
+        """A dataset's training resolutions as sides: its own when it has any, else the run's."""
+        return sorted({mp_to_side(mp) for mp in spec.resolutions}) if spec.resolutions else self.run_sides()
+
+    def training_sides(self) -> list[int]:
+        """Every resolution the run trains at, all datasets together, as square-equivalent side lengths (area =
+        side^2), ascending and unique (the stages of resolution_step_up)."""
+        return sorted({s for spec in self.dataset_specs() for s in self.dataset_sides(spec)})
 
     def arch_name(self) -> str:
         """The architecture this config trains: model_arch when set, else guessed from the model path or files."""
@@ -304,6 +341,7 @@ class TrainConfig:
         for mp in self.resolutions:
             if not (0.0 < float(mp) <= 16.0):
                 raise ValueError(f"resolutions must be megapixel values in (0, 16], got {mp!r}")
+        self.validate_datasets()
         if self.id_loss_backend not in ("arcface", "facenet"):
             raise ValueError(f"id_loss_backend must be arcface or facenet, got {self.id_loss_backend!r}")
         if self.id_loss_every < 1:
@@ -327,12 +365,50 @@ class TrainConfig:
                 raise ValueError("resolution_step_up needs likeness probes: set probe_every > 0 and face_refs "
                                  "and/or body_refs (the step-up decision is the probe likeness score)")
 
+    def validate_datasets(self) -> None:
+        """Every dataset has a path, at least one repeat and megapixel resolutions; none is listed twice or lies
+        inside another (whose scan includes its sub-folders, so its images would train twice)."""
+        import os
+
+        for d in self.datasets:
+            if not isinstance(d, (dict, str)):
+                raise ValueError(f"datasets entries are mappings of {', '.join(DATASET_KEYS)}, got {d!r}")
+            bad = sorted(set(d) - set(DATASET_KEYS)) if isinstance(d, dict) else []
+            if bad:
+                raise ValueError(f"datasets entries take {', '.join(DATASET_KEYS)}; unknown: {', '.join(bad)}")
+        seen: dict[str, str] = {}
+        for spec in self.dataset_specs():
+            if not spec.path:
+                raise ValueError("No dataset: pick at least one (datasets), or set dataset_dir")
+            if spec.repeats < 1:
+                raise ValueError(f"Dataset {spec.path}: repeats must be at least 1, got {spec.repeats}")
+            for mp in spec.resolutions:
+                if not (0.0 < mp <= 16.0):
+                    raise ValueError(f"Dataset {spec.path}: resolutions must be megapixel values in (0, 16], "
+                                     f"got {mp!r}")
+            key = os.path.normcase(os.path.abspath(spec.path))
+            if key in seen:
+                raise ValueError(f"Dataset {spec.path} is listed twice")
+            seen[key] = spec.path
+        for a in seen:
+            for b in seen:
+                if a != b and a.startswith(b.rstrip("\\/") + os.sep):
+                    raise ValueError(f"Dataset {seen[a]} lies inside dataset {seen[b]}, whose scan includes its "
+                                     "sub-folders: its images would train twice")
+
     def wants_regions(self) -> bool:
         """Region maps (face cells + landmarks) are needed by the region-weighted loss and the identity loss."""
         return bool(self.region_weights or self.id_loss_weight > 0)
 
     def resolved_cache_dir(self) -> Path:
-        return Path(self.cache_dir) if self.cache_dir else Path(self.dataset_dir) / ".rulz_cache"
+        """The run's cache (text embeddings, face analysis, loss-watch exclusions): cache_dir, else the first
+        dataset's .rulz_cache."""
+        return Path(self.cache_dir) if self.cache_dir else Path(self.dataset_specs()[0].path) / ".rulz_cache"
+
+    def dataset_cache_dir(self, path: str | Path) -> Path:
+        """A dataset's own cache for its images' latents and region maps: cache_dir, else <dataset>/.rulz_cache, so a
+        dataset's latents are reused whichever datasets it trains with."""
+        return Path(self.cache_dir) if self.cache_dir else Path(path) / ".rulz_cache"
 
     def job_dir(self) -> Path:
         return Path(self.output_dir) / self.job_name

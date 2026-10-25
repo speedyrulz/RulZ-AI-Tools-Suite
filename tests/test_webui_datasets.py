@@ -1,0 +1,110 @@
+"""The WebUI's dataset helpers: names and Create dataset, the list of dataset folders (the datasets folder, folders
+added from elsewhere, a loaded config's), where uploads land, Copy from a folder, the cards' counts and thumbnails,
+the wizard's summary over several datasets and the review line."""
+import sys
+from pathlib import Path
+
+import pytest
+from PIL import Image
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import webui  # noqa: E402
+from rulztrainer.config import TrainConfig  # noqa: E402
+
+
+def _img(path: Path, caption: str | None = None, size=(64, 48)) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", size, (200, 80, 40)).save(path)
+    if caption is not None:
+        path.with_suffix(".txt").write_text(caption, encoding="utf-8")
+    return path
+
+
+def test_dataset_names_and_create(tmp_path):
+    root = tmp_path / "datasets"
+    assert webui.dataset_name_error("", root) and webui.dataset_name_error("  ", root)
+    for bad in ("../up", "a/b", "-dash", "dot.", "con", "LPT1.txt", "x" * 65):
+        assert webui.dataset_name_error(bad, root), bad
+    assert webui.dataset_name_error("Anna full body_2.v1", root) is None
+    made = webui.create_dataset("  anna  ", root)
+    assert made == root / "anna" and made.is_dir()
+    assert "already" in webui.dataset_name_error("anna", root)
+    with pytest.raises(ValueError):
+        webui.create_dataset("anna", root)
+
+
+def test_dataset_list_registry_and_extra(tmp_path):
+    root = tmp_path / "datasets"
+    for name in ("b_set", "A_set", ".hidden"):
+        (root / name).mkdir(parents=True)
+    (root / "notes.txt").write_text("not a dataset")
+    outside = tmp_path / "elsewhere" / "old_set"
+    outside.mkdir(parents=True)
+    other = tmp_path / "other"
+    other.mkdir()
+    webui.register_dataset(str(outside), root)
+    webui.register_dataset(str(outside), root)  # once only
+    webui.register_dataset(str(root / "A_set"), root)  # inside the datasets folder: listed anyway, not stored
+    assert webui.registered_datasets(root) == [str(outside)]
+    with pytest.raises(ValueError):
+        webui.register_dataset(str(root), root)  # the datasets folder itself
+    with pytest.raises(ValueError):
+        webui.register_dataset(str(tmp_path), root)  # a folder around it
+    listed = webui.known_datasets([str(other), str(tmp_path / "missing"), str(outside)], root)
+    assert listed == [str(root / "A_set"), str(root / "b_set"), str(outside), str(other)]
+    webui.unregister_dataset(str(outside), root)
+    assert webui.registered_datasets(root) == [] and str(outside) not in webui.known_datasets(root=root)
+    (root / webui.DATASETS_REGISTRY).write_text("not json")
+    assert webui.registered_datasets(root) == []  # a broken list file: no added folders, no crash
+
+
+def test_upload_targets(tmp_path):
+    ds = tmp_path / "ds"
+    assert webui.upload_target(ds, "photo.JPG") == ds / "photo.JPG" and ds.is_dir()
+    assert webui.upload_target(ds, "photo.txt") == ds / "photo.txt"
+    assert webui.upload_target(ds, "photo.json") == ds / "photo.json"
+    assert webui.upload_target(ds, "../../escape.png") == ds / "escape.png"  # the name only, never a folder
+    assert webui.upload_target(ds, "C:\\\\Users\\\\x\\\\pic.webp") == ds / "pic.webp"
+    for bad in ("model.safetensors", "script.py", ".hidden.png", ""):
+        assert webui.upload_target(ds, bad) is None, bad
+
+
+def test_copy_from_a_folder_keeps_existing_files(tmp_path):
+    src, ds = tmp_path / "src", tmp_path / "ds"
+    _img(src / "a.png", "an a")
+    _img(src / "sub" / "b.jpg", "a b")
+    (src / "c.json").write_text("{}")
+    (src / "readme.md").write_text("skip me")
+    _img(src / ".rulz_cache" / "thumbs" / "t.jpg")  # another dataset's cache is not copied
+    _img(ds / "a.png", "edited caption")
+    res = webui.copy_into_dataset(src, ds)
+    assert res == {"copied": 3, "kept": 2, "ignored": 1}  # a.png and its edited a.txt stay; b, b.txt, c.json come
+    assert (ds / "a.txt").read_text() == "edited caption" and (ds / "sub" / "b.jpg").is_file()
+    assert (ds / "sub" / "b.txt").read_text() == "a b" and not (ds / ".rulz_cache").exists()
+    for bad_src in (ds, ds / "sub", tmp_path):
+        with pytest.raises(ValueError):
+            webui.copy_into_dataset(bad_src, ds)
+    with pytest.raises(ValueError):
+        webui.copy_into_dataset(tmp_path / "missing", ds)
+
+
+def test_cards_summary_and_review_line(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    for i in range(6):
+        _img(a / f"{i}.png", f"caption {i}" if i % 2 == 0 else None)
+    _img(b / "x.png", "x")
+    (tmp_path / "empty").mkdir()
+    counts = webui.dataset_counts([str(a), str(b), str(tmp_path / "missing")])
+    assert counts == {str(a): (6, 3), str(b): (1, 1)}
+    cards = webui.dataset_cards([str(a), str(tmp_path / "empty")])
+    assert cards[0]["name"] == "a" and cards[0]["images"] == 6 and len(cards[0]["thumbs"]) == 4
+    assert all(Path(t).parent == a / ".rulz_cache" / "thumbs" for t in cards[0]["thumbs"])
+    assert cards[1]["images"] == 0 and cards[1]["thumbs"] == []
+    data = webui.datasets_summary([str(a), str(b), str(tmp_path / "missing")])
+    assert data["images"] == 7 and data["captioned"] == 4 and data["missing"] == [str(tmp_path / "missing")]
+    assert {root for root, _ in data["sample"]} == {str(a), str(b)}
+    assert len(webui.summary_thumbs(data)) == len(data["sample"])
+    assert webui.datasets_summary([]) is None
+    cfg = TrainConfig(datasets=[{"path": str(a)}, {"path": str(b), "repeats": 3, "resolutions": [0.5, 1.0]}])
+    assert webui.datasets_line(cfg, data) == "a, b (x3, 0.5 MP + 1 MP): 7 images, 4 captioned"

@@ -626,7 +626,8 @@ class Trainer:
             self.race_base = cfg
             cfg = self.cfg = self._race_prep_config(cfg)
         items = scan_dataset(cfg)
-        log.info("Dataset: %d images in %s", len(items), cfg.dataset_dir)
+        log.info("Dataset: %d images in %s", len({it.image for it in items}),
+                 ", ".join(spec.path for spec in cfg.dataset_specs()))
         items = self.analyze_dataset(items)
         self.prepare_cache(items)
 

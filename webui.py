@@ -359,8 +359,9 @@ def start_training(cfg: TrainConfig) -> str:
     reattach_job()
     if _running():
         return "A training job is already running."
-    if not Path(cfg.dataset_dir).is_dir():
-        return f"Dataset dir not found: {cfg.dataset_dir}"
+    missing = [sp.path or "(none picked)" for sp in cfg.dataset_specs() if not sp.path or not Path(sp.path).is_dir()]
+    if missing:
+        return f"Dataset folder not found: {', '.join(missing)}"
     if cfg.model_source == "files":
         for n in ("transformer_file", "text_encoder_file", "vae_file"):
             if getattr(cfg, n) and not Path(getattr(cfg, n)).is_file():
@@ -699,6 +700,112 @@ class RaceRows:
             self.on_change()
 
 
+class DatasetPicker:
+    """The datasets a run trains on: a row per known dataset with a tick, its own resolutions (none picked: the run's
+    training resolutions) and its repeats (how many times each of its images comes up per epoch). .value is the
+    config's `datasets` list (the ticked rows) and .selected their paths, so the Form, the wizard and the Dataset tab
+    use it like any other widget."""
+
+    def __init__(self, on_change=None):
+        self.rows: dict[str, dict] = {}
+        self.on_change = on_change
+        self.listeners: list = []  # called when rows are added or removed (the wizard's dataset choices)
+        self.box = ui.column().classes("w-full gap-1")
+        with self.box:
+            self.empty = ui.label("No datasets yet: create one on the Dataset tab, or add a folder you already have.") \
+                .classes("rz-hint")
+
+    @staticmethod
+    def key(path) -> str:
+        return os.path.normcase(os.path.abspath(str(path)))
+
+    def paths(self) -> list[str]:
+        return [r["path"] for r in self.rows.values()]
+
+    @property
+    def value(self) -> list[dict]:
+        return [{"path": r["path"], "resolutions": sorted(float(x) for x in (r["res"].value or [])),
+                 "repeats": max(1, int(r["rep"].value or 1))} for r in self.rows.values() if r["use"].value]
+
+    @value.setter
+    def value(self, entries) -> None:
+        for r in self.rows.values():
+            r["use"].value = False
+        for d in entries or []:
+            d = d if isinstance(d, dict) else {"path": str(d)}
+            path = str(d.get("path") or "").strip()
+            if not path:
+                continue
+            r = self.ensure(path)
+            r["res"].value = sorted({min(MEGAPIXEL_CHOICES, key=lambda m, x=float(x): abs(m - x))
+                                     for x in (d.get("resolutions") or [])})
+            r["rep"].value = int(d.get("repeats") or 1)
+            r["use"].value = True
+        self.changed()
+
+    @property
+    def selected(self) -> list[str]:
+        return [r["path"] for r in self.rows.values() if r["use"].value]
+
+    @selected.setter
+    def selected(self, paths) -> None:
+        want = {self.key(p) for p in paths or []}
+        for p in paths or []:
+            self.ensure(p)
+        for k, r in self.rows.items():
+            if r["use"].value != (k in want):
+                r["use"].value = k in want
+
+    def ensure(self, path: str) -> dict:
+        """The row of a dataset, added (unticked) when it has none yet."""
+        key = self.key(path)
+        if key in self.rows:
+            return self.rows[key]
+        with self.box:
+            with ui.row().classes("w-full items-center gap-3 no-wrap") as row:
+                use = ui.checkbox(Path(path).name or path).classes("w-56 min-w-0").tooltip(path)
+                info = ui.label(path).classes("rz-hint flex-grow min-w-0 truncate")
+                res = ui.select(MP_OPTIONS, multiple=True, value=[], label="Own resolutions (none: the run's)") \
+                    .props("use-chips dense").classes("w-80 max-w-full") \
+                    .tooltip("This dataset's training resolutions. None picked: the Training resolutions below.")
+                rep = ui.number("Repeats", value=1, min=1, max=1000, precision=0).classes("w-24") \
+                    .tooltip("How many times each image of this dataset comes up per epoch: 2 counts a dataset "
+                             "twice as much as one at 1.")
+        for el in (res, rep):
+            el.bind_enabled_from(use, "value")
+        for el in (use, res, rep):
+            el.on_value_change(lambda _: self.changed())
+        self.rows[key] = {"path": path, "row": row, "use": use, "info": info, "res": res, "rep": rep}
+        self.empty.visible = False
+        for fn in self.listeners:
+            fn()
+        return self.rows[key]
+
+    def refresh(self, paths) -> None:
+        """Rows for the listed datasets: new ones added; unticked ones no longer listed removed (a ticked one stays
+        until it is unticked)."""
+        keys = {self.key(p) for p in paths}
+        for p in paths:
+            self.ensure(p)
+        for k, r in list(self.rows.items()):
+            if k not in keys and not r["use"].value:
+                r["row"].delete()
+                del self.rows[k]
+        self.empty.visible = not self.rows
+        for fn in self.listeners:
+            fn()
+
+    def set_counts(self, counts: dict) -> None:
+        for r in self.rows.values():
+            c = counts.get(r["path"])
+            if c is not None:
+                r["info"].text = f"{r['path']}: {images_text(c[0])}, {c[1]} captioned"
+
+    def changed(self) -> None:
+        if self.on_change is not None:
+            self.on_change()
+
+
 class Form:
     """Holds the NiceGUI widgets and converts to/from TrainConfig."""
 
@@ -757,7 +864,8 @@ class Form:
             int8_matmul=bool(v("int8_matmul")), int8_backward=v("int8_backward"),
             nvfp4_matmul=bool(v("nvfp4_matmul")), nvfp4_backward=v("nvfp4_backward"),
             attention_backend=v("attention_backend"),
-            dataset_dir=s("dataset_dir"), resolutions=sorted(float(x) for x in (v("resolutions") or [1.0])),
+            datasets=self.w["datasets"].value, dataset_dir=(self.w["datasets"].selected or [""])[0],
+            resolutions=sorted(float(x) for x in (v("resolutions") or [1.0])),
             resolution_step_up=bool(v("resolution_step_up")), step_up_patience=int(v("step_up_patience")),
             step_up_stop_patience=int(v("step_up_stop_patience")),
             enable_buckets=bool(v("enable_buckets")), flip_augment=bool(v("flip_augment")),
@@ -839,6 +947,8 @@ class Form:
         values = {**cfg.to_dict(), "model_preset": preset, "sample_prompts": "\n".join(cfg.sample_prompts),
                   "face_refs": "\n".join(cfg.face_refs), "body_refs": "\n".join(cfg.body_refs),
                   "model_source": FILE_SOURCE if cfg.model_source == "files" else HF_SOURCE}
+        values["datasets"] = [{"path": sp.path, "resolutions": list(sp.resolutions), "repeats": sp.repeats}
+                              for sp in cfg.dataset_specs() if sp.path]  # a single-folder config: that folder
         targets = cfg.resolved_lora_targets()  # an empty list means the family's defaults
         for t in TARGETS + list(EXTRA_TARGETS):
             values[f"target_{t}"] = t in targets
@@ -989,6 +1099,14 @@ body {
 .q-uploader { background: var(--rz-surface); border: 1px dashed var(--rz-border-strong); border-radius: 12px; }
 .rz-log { background: #050505; border: 1px solid var(--rz-border); border-radius: 10px; color: #D4D4D8; }
 .rz-thumb { background: var(--rz-surface-2); border: 1px solid var(--rz-border); border-radius: 10px; overflow: hidden; }
+.rz-ds-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; width: 100%; }
+.rz-ds-card { background: var(--rz-surface-2); border: 1px solid var(--rz-border); border-radius: 12px;
+  overflow: hidden; transition: border-color .15s; min-width: 0; }
+.rz-ds-card:hover { border-color: var(--rz-border-strong); }
+.rz-ds-card.rz-ds-open { border-color: var(--rz-red); }
+.rz-ds-thumbs { display: grid; grid-template-columns: repeat(4, 1fr); gap: 2px; background: #0E0E0E; }
+.rz-ds-empty { display: flex; align-items: center; justify-content: center; aspect-ratio: 4 / 1;
+  color: var(--rz-muted); font-size: 13px; background: #0E0E0E; }
 .rz-mono { font-family: ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace; font-size: 12px; color: #C4C4CC; }
 
 /* Wizard */
@@ -1150,6 +1268,32 @@ PAGE_SIZE = 24
 THUMB_SIZE = 512
 
 
+@app.get("/rz-image")
+def _serve_image(path: str):
+    """An image file of this machine for the page (image_url). Image files only."""
+    from fastapi import HTTPException
+    from fastapi.responses import FileResponse
+
+    p = Path(path)
+    if p.suffix.lower() not in IMAGE_EXTS or not p.is_file():
+        raise HTTPException(status_code=404, detail="Not Found")
+    return FileResponse(p, headers={"Cache-Control": "max-age=86400"})
+
+
+def image_url(path) -> str:
+    """The page's URL for an image file on this machine, served by one fixed route (/rz-image) and versioned by the
+    file's modification time. NiceGUI's own route for a local file is shared by every element and page showing that
+    file and removed with any one of them, so after a reload the old page's cleanup left thumbnails at 404."""
+    from urllib.parse import quote
+
+    p = Path(path).resolve()
+    try:
+        version = p.stat().st_mtime_ns
+    except OSError:
+        version = 0
+    return f"/rz-image?path={quote(str(p))}&v={version}"
+
+
 def list_dataset_images(folder: str) -> list[Path]:
     root = Path(folder)
     if not root.is_dir():
@@ -1202,6 +1346,190 @@ def make_thumbs(images: list[Path], root: Path) -> list[Path]:
     return out
 
 
+DATASETS_ROOT = ROOT / "datasets"  # where Create dataset puts new datasets (git-ignored)
+DATASETS_REGISTRY = ".rulz_datasets.json"  # in DATASETS_ROOT: dataset folders elsewhere that were added to the list
+CAPTION_EXTS = {".txt", ".json"}
+_RESERVED_NAMES = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
+
+
+def _same_path(a, b) -> bool:
+    return os.path.normcase(os.path.abspath(str(a))) == os.path.normcase(os.path.abspath(str(b)))
+
+
+def _inside(child, parent) -> bool:
+    """True when `child` lies strictly inside the folder `parent`."""
+    c, p = (os.path.normcase(os.path.abspath(str(x))) for x in (child, parent))
+    return c != p and c.startswith(p.rstrip("\\/") + os.sep)
+
+
+def dataset_name_error(name: str, root: Path | None = None) -> str | None:
+    """Why a new dataset cannot take this name, or None when it can."""
+    import re
+
+    root = DATASETS_ROOT if root is None else Path(root)
+    name = (name or "").strip()
+    if not name:
+        return "Give the dataset a name."
+    if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}", name) or name.endswith(".")
+            or name.split(".")[0].lower() in _RESERVED_NAMES):
+        return "Use letters, digits, spaces, - _ and . (starting with a letter or digit), up to 64 characters."
+    if (root / name).exists():
+        return f"There is already a dataset called {name}."
+    return None
+
+
+def create_dataset(name: str, root: Path | None = None) -> Path:
+    """A new, empty dataset folder in the datasets folder."""
+    root = DATASETS_ROOT if root is None else Path(root)
+    err = dataset_name_error(name, root)
+    if err:
+        raise ValueError(err)
+    path = root / name.strip()
+    path.mkdir(parents=True)
+    return path
+
+
+def registered_datasets(root: Path | None = None) -> list[str]:
+    """Dataset folders outside the datasets folder that were added to the list."""
+    root = DATASETS_ROOT if root is None else Path(root)
+    try:
+        data = json.loads((root / DATASETS_REGISTRY).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [str(p) for p in (data.get("external") or []) if str(p).strip()] if isinstance(data, dict) else []
+
+
+def _save_registry(paths: list[str], root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / DATASETS_REGISTRY).write_text(json.dumps({"external": paths}, indent=1), encoding="utf-8")
+
+
+def register_dataset(path: str, root: Path | None = None) -> None:
+    """Add a folder to the dataset list (one inside the datasets folder is listed anyway)."""
+    root = DATASETS_ROOT if root is None else Path(root)
+    if _same_path(path, root) or _inside(root, path):
+        raise ValueError("That folder holds the datasets folder: pick one dataset inside it instead.")
+    paths = registered_datasets(root)
+    if _inside(path, root) or any(_same_path(path, p) for p in paths):
+        return
+    _save_registry(paths + [str(path)], root)
+
+
+def unregister_dataset(path: str, root: Path | None = None) -> None:
+    """Take a folder off the dataset list; its files stay where they are."""
+    root = DATASETS_ROOT if root is None else Path(root)
+    paths = registered_datasets(root)
+    keep = [p for p in paths if not _same_path(p, path)]
+    if len(keep) != len(paths):
+        _save_registry(keep, root)
+
+
+def known_datasets(extra=(), root: Path | None = None) -> list[str]:
+    """The dataset folders to list: the sub-folders of the datasets folder (by name), then the folders added from
+    elsewhere and `extra` (those a loaded config trains on), each once and only while it exists; paths inside the
+    WebUI folder relative to it."""
+    root = DATASETS_ROOT if root is None else Path(root)
+    found: list[str] = []
+    if root.is_dir():
+        found += [str(p) for p in sorted(root.iterdir(), key=lambda p: p.name.lower())
+                  if p.is_dir() and not p.name.startswith(".")]
+    found += [str(p) for p in [*registered_datasets(root), *(extra or [])] if str(p).strip() and Path(p).is_dir()]
+    out: list[str] = []
+    for p in found:
+        rel = _relative(p)
+        if not any(_same_path(rel, q) for q in out):
+            out.append(rel)
+    return out
+
+
+def upload_target(dest, name: str) -> Path | None:
+    """Where an uploaded file goes in a dataset folder: its own file name (a same-named file is replaced), for images
+    and .txt / .json captions only; None for any other kind of file. The folder is created."""
+    fname = Path(str(name).replace("\\", "/")).name  # the name only: never a folder from the browser
+    if not fname or fname.startswith(".") or Path(fname).suffix.lower() not in IMAGE_EXTS | CAPTION_EXTS:
+        return None
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    return dest / fname
+
+
+def copy_into_dataset(src, dest) -> dict:
+    """Copy the images and captions (.txt, .json) of a folder on this machine into a dataset, sub-folders included
+    and kept; files the dataset already has stay as they are. Returns {"copied", "kept", "ignored"} counts."""
+    src, dest = Path(src), Path(dest)
+    if not src.is_dir():
+        raise ValueError(f"Folder not found: {src}")
+    if _same_path(src, dest) or _inside(dest, src) or _inside(src, dest):
+        raise ValueError("Pick a folder that is not the dataset itself, nor inside it or around it.")
+    out = {"copied": 0, "kept": 0, "ignored": 0}
+    for p in sorted(src.rglob("*")):
+        if not p.is_file() or ".rulz_cache" in p.parts:
+            continue
+        if p.suffix.lower() not in IMAGE_EXTS | CAPTION_EXTS:
+            out["ignored"] += 1
+            continue
+        target = dest / p.relative_to(src)
+        if target.exists():
+            out["kept"] += 1
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(p, target)
+        out["copied"] += 1
+    return out
+
+
+def images_text(n) -> str:
+    """"1 image", "16 images" ("? images" when unknown)."""
+    return f"{n} image" if n == 1 else f"{n} images"
+
+
+def _captioned(img: Path) -> bool:
+    return img.with_suffix(".txt").is_file() or img.with_suffix(".json").is_file()
+
+
+def dataset_counts(paths) -> dict[str, tuple[int, int]]:
+    """{path: (images, captioned)} for dataset folders that exist."""
+    out = {}
+    for p in paths:
+        if Path(p).is_dir():
+            imgs = list_dataset_images(p)
+            out[p] = (len(imgs), sum(1 for i in imgs if _captioned(i)))
+    return out
+
+
+def dataset_cards(paths, n_thumbs: int = 4) -> list[dict]:
+    """The Dataset tab's cards: name, path, image and caption counts and a few thumbnails spread over the dataset."""
+    out = []
+    for p in paths:
+        imgs = list_dataset_images(p)
+        pick = imgs[::max(1, len(imgs) // n_thumbs)][:n_thumbs]
+        out.append({"path": p, "name": Path(p).name or p, "images": len(imgs),
+                    "captioned": sum(1 for i in imgs if _captioned(i)),
+                    "thumbs": [str(t) for t in make_thumbs(pick, Path(p))] if pick else []})
+    return out
+
+
+def datasets_summary(paths) -> dict | None:
+    """dataset_summary over several dataset folders: images and captions added up, the median image size over all,
+    a sample of (dataset, image) from each; "missing" lists folders that do not exist. None without any folder."""
+    paths = [str(p) for p in paths or [] if str(p).strip()]
+    if not paths:
+        return None
+    parts = [(p, dataset_summary(p)) for p in paths]
+    found = [(p, x) for p, x in parts if x is not None]
+    meds = sorted(x["median_mp"] for _, x in found if x["median_mp"])
+    share = max(1, 8 // max(1, len(found)))
+    return {"folder": "|".join(paths), "images": sum(x["images"] for _, x in found),
+            "captioned": sum(x["captioned"] for _, x in found), "median_mp": meds[len(meds) // 2] if meds else None,
+            "sample": [(p, img) for p, x in found for img in x["sample"][:share]][:8],
+            "missing": [p for p, x in parts if x is None]}
+
+
+def summary_thumbs(data: dict | None) -> list[Path]:
+    """Thumbnails of a datasets_summary's sample, each in its own dataset's cache."""
+    return [make_thumbs([img], Path(root))[0] for root, img in (data or {}).get("sample", [])]
+
+
 def image_viewer():
     """Full-window image viewer dialog. Returns show(path) callable."""
     with ui.dialog().props("maximized") as dlg, ui.card().tight().classes("w-full h-full bg-black"):
@@ -1213,56 +1541,81 @@ def image_viewer():
 
     def show(path: Path):
         title.text = str(path)
-        big.set_source(str(path))
+        big.set_source(image_url(path))
         dlg.open()
 
     return show
 
 
 def build_dataset_tab(f: Form):
-    """Upload images/captions, view them in a grid and edit captions (saved to .txt on change)."""
-    state = {"page": 0, "images": [], "busy": False}
-    with card():
-        with fields():
-            folder = ui.input("Dataset folder", value=f.w["dataset_dir"].value).classes("w-96 max-w-full")
-            folder.bind_value(f.w["dataset_dir"], "value")  # keep in sync with the Train tab
-
-            native = _native_dialogs
-
-            async def browse():
-                picked = await pick_path("dir", folder.value or "", native=native)
-                if picked:
-                    folder.value = _relative(picked)
-                    await refresh()
-
-            ui.button(icon="folder_open", on_click=browse).props("flat dense round").tooltip(BROWSE_TIP[native])
-            ui.button("Load / refresh", icon="refresh", on_click=lambda: refresh()).props("unelevated")
-            spinner = ui.spinner(size="sm")
-            spinner.visible = False
-            info = ui.label("").classes("text-sm")
-        hint("Click a picture to see it full size. Captions are saved to the image's .txt file as you type. "
-             "Face ref / Body ref pick the images that character LoRAs are scored against.")
-    with ui.row().classes("w-full items-center gap-3"):
-        def on_upload(e):
-            dest = Path(folder.value or "datasets/new_dataset")
-            dest.mkdir(parents=True, exist_ok=True)
-            name = Path(e.name).name
-            if Path(name).suffix.lower() not in IMAGE_EXTS | {".txt"}:
-                ui.notify(f"Skipped {name}: not an image or .txt", type="warning")
-                return
-            (dest / name).write_bytes(e.content.read())
-
-        ui.upload(label="Upload images and .txt captions (drop files here)", multiple=True, auto_upload=True,
-                  on_upload=on_upload, on_multi_upload=lambda e: refresh()) \
-            .props("accept=.png,.jpg,.jpeg,.webp,.bmp,.txt flat bordered color=grey-10").classes("w-[36rem] max-w-full")
-        ui.space()
-        with ui.row().classes("items-center gap-1 no-wrap"):
-            ui.button(icon="chevron_left", on_click=lambda: page(-1)).props("flat dense round")
-            page_label = ui.label("").classes("text-sm")
-            ui.button(icon="chevron_right", on_click=lambda: page(1)).props("flat dense round")
-            columns = ui.select([2, 3, 4, 5, 6], value=4, label="Columns").classes("w-28 ml-2")
-    grid = ui.grid(columns=4).classes("w-full gap-3")
+    """The datasets as cards with a few thumbnails each, Create dataset and Add a folder; a dataset opened below to
+    add images and captions (upload from this computer, or copy a folder on the machine running RulzTrainer), edit
+    its captions and pick references."""
+    picker: DatasetPicker = f.w["datasets"]
+    state = {"page": 0, "images": [], "busy": False, "open": None, "sync": False}
+    native = _native_dialogs
     show_full = image_viewer()
+    root_label = _relative(str(DATASETS_ROOT))
+
+    with ui.dialog() as create_dlg, ui.card().classes("w-[28rem] max-w-full"):
+        ui.label("Create dataset").classes("rz-setting-title")
+        name_in = ui.input("Name", placeholder="for example: anna full body").classes("w-full")
+        name_err = ui.label("").classes("text-xs text-negative")
+        hint(f"A new, empty folder in {root_label}/ on the machine running RulzTrainer.")
+        with ui.row().classes("w-full justify-end gap-2"):
+            ui.button("Cancel", on_click=create_dlg.close).props("flat")
+            create_btn = ui.button("Create", icon="add").props("unelevated")
+
+    with card():
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.label("Datasets").classes("rz-setting-title")
+            ui.space()
+            ui.button("Create dataset", icon="add",
+                      on_click=lambda: (name_err.set_text(""), create_dlg.open())).props("unelevated")
+            add_btn = ui.button("Add a folder", icon="create_new_folder").props("flat") \
+                .tooltip("A dataset folder you already have on the machine running RulzTrainer: it joins the list")
+            ui.button(icon="refresh", on_click=lambda: refresh_cards()).props("flat round dense").tooltip("Refresh")
+        hint(f"New datasets go in {root_label}/ on the machine running RulzTrainer. Click a dataset to add images and "
+             "write captions. Tick the ones to train on with Train on this dataset, or on the Train tab (Dataset "
+             "section), where each also gets its own resolutions and repeats.")
+        cards = ui.element("div").classes("rz-ds-grid")
+
+    editor = ui.column().classes("w-full gap-3")
+    editor.visible = False
+    with editor:
+        with card():
+            with ui.row().classes("w-full items-center gap-2"):
+                ui.icon("photo_library").classes("text-xl")
+                ed_title = ui.label("").classes("rz-setting-title")
+                ed_path = ui.label("").classes("rz-hint")
+                ui.space()
+                use_box = ui.checkbox("Train on this dataset").tooltip("Ticks it on the Train tab (Dataset section)")
+                copy_btn = ui.button("Copy from a folder", icon="drive_folder_upload").props("flat") \
+                    .tooltip("Copy the images and captions of a folder on the machine running RulzTrainer into this "
+                             "dataset (sub-folders kept; files it already has are left alone)")
+                remove_btn = ui.button("Remove from list", icon="playlist_remove").props("flat") \
+                    .tooltip("Takes this folder off the list; its files stay where they are")
+                ui.button(icon="close", on_click=lambda: close_dataset()).props("flat round dense").tooltip("Close")
+            with ui.row().classes("w-full items-center gap-2"):
+                spinner = ui.spinner(size="sm")
+                spinner.visible = False
+                info = ui.label("").classes("text-sm")
+            hint("Upload sends images and their .txt or .json captions from the computer this browser runs on to the "
+                 "machine running RulzTrainer; on the same machine that is a plain copy. A file with the same name is "
+                 "replaced. Click a picture to see it full size. Captions are saved to the image's .txt file as you "
+                 "type. Face ref / Body ref pick the images that character LoRAs are scored against.")
+        with ui.row().classes("w-full items-center gap-3"):
+            upload = ui.upload(label="Upload images and captions (drop files here)", multiple=True, auto_upload=True,
+                               on_upload=lambda e: on_upload(e), on_multi_upload=lambda e: after_upload()) \
+                .props("accept=.png,.jpg,.jpeg,.webp,.bmp,.txt,.json flat bordered color=grey-10") \
+                .classes("w-[36rem] max-w-full")
+            ui.space()
+            with ui.row().classes("items-center gap-1 no-wrap"):
+                ui.button(icon="chevron_left", on_click=lambda: page(-1)).props("flat dense round")
+                page_label = ui.label("").classes("text-sm")
+                ui.button(icon="chevron_right", on_click=lambda: page(1)).props("flat dense round")
+                columns = ui.select([2, 3, 4, 5, 6], value=4, label="Columns").classes("w-28 ml-2")
+        grid = ui.grid(columns=4).classes("w-full gap-3")
 
     def ref_set(key: str) -> set[str]:
         return {p.strip() for p in (f.w[key].value or "").splitlines() if p.strip()}
@@ -1282,6 +1635,20 @@ def build_dataset_tab(f: Form):
             status_label.text = f"error: {e}"
             ui.notify(f"Could not save {cap.name}: {e}", type="negative")
 
+    async def on_upload(e):
+        if state["open"] is None:
+            return
+        target = upload_target(Path(state["open"]), e.file.name)
+        if target is None:
+            ui.notify(f"Skipped {Path(e.file.name).name}: not an image or a .txt / .json caption", type="warning")
+            return
+        await e.file.save(target)  # streamed to disk
+
+    async def after_upload():
+        upload.reset()
+        await refresh()
+        await refresh_cards()
+
     async def render():
         imgs = state["images"]
         n_pages = max(1, (len(imgs) + PAGE_SIZE - 1) // PAGE_SIZE)
@@ -1290,7 +1657,7 @@ def build_dataset_tab(f: Form):
         start = state["page"] * PAGE_SIZE
         page_imgs = imgs[start:start + PAGE_SIZE]
         spinner.visible = True
-        thumbs = await run.io_bound(make_thumbs, page_imgs, Path(folder.value))
+        thumbs = await run.io_bound(make_thumbs, page_imgs, Path(state["open"]))
         spinner.visible = False
         verdicts = read_verdicts(_job_dir)
         badge_color = {"stuck": "red", "excluded": "grey", "suspect": "orange", "exhausted": "blue", "easy": "green",
@@ -1302,7 +1669,7 @@ def build_dataset_tab(f: Form):
                 cap = img.with_suffix(".txt")
                 text = cap.read_text(encoding="utf-8") if cap.is_file() else ""
                 with ui.card().tight().classes("w-full rz-thumb"):
-                    ui.image(str(thumb)).props("fit=cover ratio=1").classes("w-full cursor-pointer") \
+                    ui.image(image_url(thumb)).props("fit=cover ratio=1").classes("w-full cursor-pointer") \
                         .on("click", lambda _, p=img: show_full(p)).tooltip("Click to view full size")
                     with ui.row().classes("w-full items-center justify-between px-2 pt-1 gap-1"):
                         ui.label(img.name).classes("text-xs truncate")
@@ -1314,21 +1681,21 @@ def build_dataset_tab(f: Form):
                             .classes("text-xs").tooltip("Use this image's face as a similarity reference")
                         ui.checkbox("Body ref", value=_relative(str(img)) in ref_set("body_refs"),
                                     on_change=lambda e, p=img: toggle_ref("body_refs", p, e.value)).props("dense") \
-                            .classes("text-xs").tooltip("Use this image's body proportions as a reference")
+                            .classes("text-xs").tooltip("Use this image's body as a similarity reference")
                         status_label = ui.label("" if cap.is_file() else "no caption yet").classes("text-xs text-grey")
                     ui.textarea(value=text, placeholder="type a caption; it is saved to the .txt automatically",
                                 on_change=lambda e, p=img, sl=status_label: save_caption(p, e.value, sl)) \
                         .props("dense outlined autogrow").classes("w-full px-2 pb-2 text-xs")
 
     async def refresh():
-        if state["busy"]:
+        if state["busy"] or state["open"] is None:
             return
         state["busy"] = True
         try:
-            state["images"] = await run.io_bound(list_dataset_images, folder.value or "")
-            missing = sum(1 for p in state["images"] if not p.with_suffix(".txt").is_file())
-            info.text = (f"{len(state['images'])} images, {missing} without caption" if state["images"]
-                         else "No images found in that folder")
+            state["images"] = await run.io_bound(list_dataset_images, state["open"])
+            missing = sum(1 for p in state["images"] if not _captioned(p))
+            info.text = (f"{images_text(len(state['images']))}, {missing} without caption" if state["images"]
+                         else "No images yet: upload some, or copy a folder.")
             await render()
         finally:
             state["busy"] = False
@@ -1337,8 +1704,127 @@ def build_dataset_tab(f: Form):
         state["page"] = max(0, state["page"] + delta)
         await render()
 
+    async def refresh_cards():
+        paths = await run.io_bound(known_datasets, picker.selected)
+        picker.refresh(paths)
+        data = await run.io_bound(dataset_cards, paths)
+        picker.set_counts({d["path"]: (d["images"], d["captioned"]) for d in data})
+        chosen = {DatasetPicker.key(p) for p in picker.selected}
+        cards.clear()
+        with cards:
+            if not data:
+                ui.label("No datasets yet: Create dataset makes one.").classes("rz-hint")
+            for d in data:
+                opened = state["open"] is not None and _same_path(d["path"], state["open"])
+                with ui.element("div").classes("rz-ds-card cursor-pointer" + (" rz-ds-open" if opened else "")) as c:
+                    if d["thumbs"]:
+                        with ui.element("div").classes("rz-ds-thumbs"):
+                            for t in d["thumbs"]:
+                                ui.image(image_url(t)).props("fit=cover ratio=1")
+                    else:
+                        ui.label("no images yet").classes("rz-ds-empty")
+                    with ui.column().classes("gap-0 px-3 py-2 w-full min-w-0"):
+                        with ui.row().classes("items-center gap-2 no-wrap w-full"):
+                            ui.label(d["name"]).classes("font-medium truncate")
+                            if DatasetPicker.key(d["path"]) in chosen:
+                                ui.badge("training", color="red").props("dense")
+                        ui.label(f"{images_text(d['images'])}, {d['captioned']} captioned")                             .classes("text-xs rz-hint")
+                        ui.label(d["path"]).classes("text-xs rz-hint truncate w-full")
+                c.on("click", lambda _, p=d["path"]: open_dataset(p))
+
+    async def open_dataset(path: str):
+        state.update(open=path, page=0, images=[])
+        ed_title.text = Path(path).name or path
+        ed_path.text = path
+        state["sync"] = True
+        try:
+            use_box.value = any(_same_path(path, p) for p in picker.selected)
+        finally:
+            state["sync"] = False
+        remove_btn.visible = any(_same_path(path, p) for p in registered_datasets())
+        editor.visible = True
+        await refresh()
+        await refresh_cards()
+
+    async def close_dataset():
+        state["open"] = None
+        editor.visible = False
+        grid.clear()
+        await refresh_cards()
+
+    async def on_use(e):
+        if state["sync"] or state["open"] is None:
+            return
+        rest = [p for p in picker.selected if not _same_path(p, state["open"])]
+        picker.selected = rest + ([state["open"]] if e.value else [])
+        await refresh_cards()
+
+    async def do_create():
+        err = dataset_name_error(name_in.value)
+        if err:
+            name_err.text = err
+            return
+        try:
+            path = create_dataset(name_in.value)
+        except (OSError, ValueError) as e:
+            name_err.text = str(e)
+            return
+        create_dlg.close()
+        name_in.value = ""
+        rel = _relative(str(path))
+        await refresh_cards()
+        await open_dataset(rel)
+        ui.notify(f"Created {rel}", type="positive")
+
+    async def add_folder():
+        picked = await pick_path("dir", "", native=native)
+        if not picked:
+            return
+        try:
+            register_dataset(_relative(picked))
+        except ValueError as e:
+            ui.notify(str(e), type="warning")
+            return
+        await refresh_cards()
+        await open_dataset(_relative(picked))
+
+    async def copy_folder():
+        if state["open"] is None:
+            return
+        picked = await pick_path("dir", "", native=native)
+        if not picked:
+            return
+        spinner.visible = True
+        try:
+            res = await run.io_bound(copy_into_dataset, picked, state["open"])
+        except (OSError, ValueError) as e:
+            ui.notify(f"Could not copy: {e}", type="negative")
+            return
+        finally:
+            spinner.visible = False
+        ui.notify(f"Copied {res['copied']} files"
+                  + (f"; {res['kept']} the dataset already had were left alone" if res["kept"] else "")
+                  + (f"; {res['ignored']} other files skipped" if res["ignored"] else ""), type="positive")
+        await refresh()
+        await refresh_cards()
+
+    async def remove_from_list():
+        if state["open"] is None:
+            return
+        gone = state["open"]
+        unregister_dataset(gone)
+        picker.selected = [p for p in picker.selected if not _same_path(p, gone)]
+        await close_dataset()
+        ui.notify(f"{gone} is off the list; its files are untouched")
+
+    create_btn.on_click(do_create)
+    name_in.on("keydown.enter", do_create)
+    add_btn.on_click(add_folder)
+    copy_btn.on_click(copy_folder)
+    remove_btn.on_click(remove_from_list)
+    use_box.on_value_change(on_use)
     columns.on_value_change(lambda e: render())
-    ui.timer(0.1, refresh, once=True)
+    ui.timer(0.1, refresh_cards, once=True)
 
 
 def build_samples_tab(f: Form):
@@ -1497,8 +1983,10 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
         r["flip_augment"] = (True, "a mirrored image has the same style, so this doubles the variety for free")
     else:
         r["flip_augment"] = (False, "only worth it if your subject looks the same mirrored (no text or logos)")
-    if character and cfg.dataset_dir:
-        r["face_refs"] = (cfg.dataset_dir, "every image with a face becomes a reference (a folder means all its images)")
+    ds_paths = [sp.path for sp in cfg.dataset_specs() if sp.path]
+    if character and ds_paths:
+        r["face_refs"] = ("\n".join(ds_paths), "every image with a face becomes a reference (a folder means all its "
+                                               "images)")
     # training
     n = (data or {}).get("images") or 0
     if n:
@@ -1562,16 +2050,34 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     return r
 
 
+def datasets_line(cfg: TrainConfig, data: dict | None) -> str:
+    """The review's dataset line: each dataset's name with its own repeats and resolutions, then the totals."""
+    parts = []
+    for sp in cfg.dataset_specs():
+        if not sp.path:
+            continue
+        extra = ([f"x{sp.repeats}"] if sp.repeats != 1 else []) + \
+            ([" + ".join(f"{mp:g} MP" for mp in sp.resolutions)] if sp.resolutions else [])
+        parts.append((Path(sp.path).name or sp.path) + (f" ({', '.join(extra)})" if extra else ""))
+    data = data or {}
+    return (f"{', '.join(parts) or '(none picked)'}: {images_text(data.get('images', '?'))}, "
+            f"{data.get('captioned', '?')} captioned")
+
+
 def review_issues(cfg: TrainConfig, goal: str | None, data: dict | None, n_gpus: int) -> list[tuple[str, str]]:
     """What the wizard's last step points out before starting: (error | warning | info, text)."""
     out: list[tuple[str, str]] = []
     if _running():
         out.append(("error", "A training job is already running. Stop it (Monitor tab) before starting another."))
-    if not Path(cfg.dataset_dir).is_dir():
-        out.append(("error", f"Dataset folder not found: {cfg.dataset_dir or '(empty)'}"))
+    specs = [sp for sp in cfg.dataset_specs() if sp.path]
+    missing = [sp.path for sp in specs if not Path(sp.path).is_dir()]
+    if not specs:
+        out.append(("error", "No dataset picked: pick one or more (Dataset step), or create one on the Dataset tab."))
+    elif missing:
+        out.append(("error", f"Dataset folder not found: {', '.join(missing)}"))
     elif data is not None:
         if not data["images"]:
-            out.append(("error", "The dataset folder has no images (png, jpg, webp or bmp)."))
+            out.append(("error", "The datasets have no images (png, jpg, webp or bmp)."))
         elif data["captioned"] < data["images"] and not cfg.trigger_word:
             out.append(("warning", f"{data['images'] - data['captioned']} of {data['images']} images have no caption "
                                    "and there is no trigger word, so they train on an empty prompt."))
@@ -1808,7 +2314,7 @@ class Wizard:
         idx = names.index(name) if name in names else 0
         for i, n in enumerate(names):
             self.steps[n].props(add="done") if i < idx else self.steps[n].props(remove="done")
-        if name == "dataset" and self.data is None and Path(self.w["dataset_dir"].value or "").is_dir():
+        if name == "dataset" and self.data is None and any(Path(p).is_dir() for p in self.w["datasets"].selected):
             await self.scan()
         if name == "review":
             await self.render_review()
@@ -1991,14 +2497,24 @@ class Wizard:
 
     # ---- 4 dataset
     def step_dataset(self):
-        self.heading("Your images", "A folder of images, each with an optional same-name .txt caption. 15-50 sharp, "
-                                    "varied images are typical for a character; styles and concepts like 20-100.")
-        with self.setting(None, "Dataset folder", "Upload images and write captions on the Dataset tab, or point "
-                                                  "this at a folder you already have. Sub-folders are included."):
-            folder = self.bind(path_field("Dataset folder", "dir", width="w-full"), "dataset_dir")
-            folder.on_value_change(lambda _: self.forget_scan())
+        self.heading("Your images", "One or more datasets: folders of images, each with an optional same-name .txt "
+                                    "caption. 15-50 sharp, varied images are typical for a character; styles and "
+                                    "concepts like 20-100.")
+        with self.setting(None, "Datasets", "Pick the datasets to train on. Create them, upload images and write "
+                                            "captions on the Dataset tab. Each dataset's own resolutions and repeats "
+                                            "are on the Train tab (Dataset section)."):
+            picker = self.w["datasets"]
+
+            def choices():
+                return {p: Path(p).name or p for p in picker.paths()}
+
+            chosen = ui.select(choices(), multiple=True, value=picker.selected, label="Datasets") \
+                .props("use-chips").classes("w-full")
+            chosen.bind_value(picker, "selected")
+            chosen.on_value_change(lambda _: (self.forget_scan(), self.refresh()))
+            picker.listeners.append(lambda: chosen.set_options(choices(), value=picker.selected))
             with ui.row().classes("gap-2"):
-                ui.button("Scan folder", icon="search", on_click=self.scan).props("unelevated")
+                ui.button("Scan datasets", icon="search", on_click=self.scan).props("unelevated")
                 ui.button("Dataset tab", icon="photo_library", on_click=lambda: self.goto("Dataset")).props("flat")
         self.scan_box = ui.column().classes("w-full gap-3")
         self.apply_bar(["resolutions", "enable_buckets", "flip_augment", "face_refs"])
@@ -2040,23 +2556,26 @@ class Wizard:
         self.nav()
 
     def forget_scan(self):
-        if self.data is not None and self.data.get("folder") != (self.w["dataset_dir"].value or ""):
+        if self.data is not None and self.data.get("folder") != "|".join(self.w["datasets"].selected):
             self.data = None
             self.scan_box.clear()
             self.refresh()
 
     async def scan(self):
-        folder = (self.w["dataset_dir"].value or "").strip()
+        paths = self.w["datasets"].selected
         self.scan_box.clear()
         with self.scan_box:
             ui.spinner(size="sm")
-        self.data = await run.io_bound(dataset_summary, folder)
-        thumbs = await run.io_bound(make_thumbs, self.data["sample"], Path(folder)) if self.data else []
+        self.data = await run.io_bound(datasets_summary, paths)
+        thumbs = await run.io_bound(summary_thumbs, self.data) if self.data else []
         self.scan_box.clear()
         with self.scan_box:
             if self.data is None:
-                ui.label(f"Folder not found: {folder or '(empty)'}").classes("rz-banner error")
+                ui.label("No dataset picked yet: pick one above, or create one on the Dataset tab.") \
+                    .classes("rz-banner error")
             else:
+                if self.data["missing"]:
+                    ui.label(f"Folder not found: {', '.join(self.data['missing'])}").classes("rz-banner error")
                 n, cap, mp = self.data["images"], self.data["captioned"], self.data["median_mp"]
                 with ui.row().classes("w-full gap-3"):
                     for label, value, sub in (("Images", str(n), "png, jpg, webp, bmp"),
@@ -2065,8 +2584,8 @@ class Wizard:
                         v, s = stat_tile(label)
                         v.text, s.text = value, sub
                 if not n:
-                    ui.label("No images in this folder yet. Add them on the Dataset tab (drag and drop) or copy "
-                             "them into the folder, then scan again.").classes("rz-banner warning")
+                    ui.label("No images in these datasets yet. Add them on the Dataset tab (upload them, or copy a "
+                             "folder), then scan again.").classes("rz-banner warning")
                 elif cap < n:
                     ui.label(f"{n - cap} images have no caption yet. They train on the trigger word alone, which "
                              "works for a quick character LoRA; captions give a more flexible one.") \
@@ -2074,7 +2593,7 @@ class Wizard:
                 if thumbs:
                     with ui.row().classes("w-full gap-2"):
                         for t in thumbs:
-                            ui.image(str(t)).classes("w-24 h-24 rz-thumb")
+                            ui.image(image_url(t)).classes("w-24 h-24 rz-thumb")
         self.refresh()
 
     # ---- 5 training
@@ -2234,8 +2753,9 @@ class Wizard:
             with self.review_box:
                 ui.label(f"A setting is invalid: {e}").classes("rz-banner error")
             return
-        if self.data is None or self.data.get("folder") != cfg.dataset_dir:
-            self.data = await run.io_bound(dataset_summary, cfg.dataset_dir)
+        ds_paths = [sp.path for sp in cfg.dataset_specs() if sp.path]
+        if self.data is None or self.data.get("folder") != "|".join(ds_paths):
+            self.data = await run.io_bound(datasets_summary, ds_paths)
         if not self.cfg_path.value:
             self.cfg_path.value = f"configs/{cfg.job_name}.yaml"
         issues = review_issues(cfg, self.goal, self.data, len(self.gpus))
@@ -2249,9 +2769,10 @@ class Wizard:
             ("Job", f"{cfg.job_name}  ->  {_relative(str(cfg.job_dir()))}/"),
             ("Model", f"{model} ({'single files' if cfg.model_source == 'files' else 'Hugging Face'})"),
             ("GPUs", f"{multi}; model quant {cfg.transformer_quant}, text encoder quant {cfg.text_encoder_quant}"),
-            ("Dataset", f"{cfg.dataset_dir} ({data.get('images', '?')} images, {data.get('captioned', '?')} captioned)"),
+            ("Datasets" if len(ds_paths) > 1 else "Dataset", datasets_line(cfg, data)),
             ("Trigger word", cfg.trigger_word or "(none)"),
-            ("Resolution", ", ".join(f"{mp:g} MP" for mp in cfg.resolutions)),
+            ("Resolution", ", ".join(f"{mp:g} MP" for mp in cfg.resolutions)
+             + (" (datasets with their own: those)" if any(sp.resolutions for sp in cfg.dataset_specs()) else "")),
             ("Training", f"{cfg.steps} steps, batch {cfg.batch_size}, lr {cfg.learning_rate:g}, {cfg.optimizer}"),
             ("LoRA", f"rank {cfg.lora_rank}, alpha {cfg.lora_alpha:g}"),
             ("Saving", f"every {cfg.save_every} steps; samples every {cfg.sample_every} steps "
@@ -2589,9 +3110,38 @@ def build_page(local: bool = True):
                     # ---- Dataset
                     with section("Dataset", "Images, captions and resolution", "photo_library") as sec:
                         nav_items.append(("Dataset", "photo_library", sec))
+                        subhead("Datasets to train on")
+                        hint("Tick one or more. Each can train at its own resolutions (none picked: the Training "
+                             "resolutions below) and come up several times per epoch (Repeats), to weight a small or "
+                             "important dataset up. Create datasets and add images on the Dataset tab.")
+                        w["datasets"] = DatasetPicker()
+                        w["datasets"].refresh(known_datasets())
+                        w["datasets"].value = [{"path": sp.path} for sp in d.dataset_specs() if Path(sp.path).is_dir()]
+                        ds_native = _native_dialogs
+
+                        async def refresh_datasets():
+                            picker = w["datasets"]
+                            picker.refresh(await run.io_bound(known_datasets, picker.selected))
+                            picker.set_counts(await run.io_bound(dataset_counts, picker.paths()))
+
+                        async def add_dataset_folder():
+                            picked = await pick_path("dir", "", native=ds_native)
+                            if picked:
+                                try:
+                                    register_dataset(_relative(picked))
+                                except ValueError as e:
+                                    ui.notify(str(e), type="warning")
+                                    return
+                                w["datasets"].selected = [*w["datasets"].selected, _relative(picked)]
+                                await refresh_datasets()
+
+                        with ui.row().classes("items-center gap-2"):
+                            ui.button("Refresh list", icon="refresh", on_click=refresh_datasets).props("flat")
+                            ui.button("Add a folder", icon="create_new_folder", on_click=add_dataset_folder) \
+                                .props("flat").tooltip("A dataset folder you already have, here or elsewhere on "
+                                                       "this machine: it joins the list")
+                        ui.timer(0.2, refresh_datasets, once=True)
                         with fields():
-                            path_input(f, "dataset_dir", "Dataset folder (images + .txt captions)", "dir",
-                                       d.dataset_dir)
                             w["trigger_word"] = ui.input("Trigger word (prepended to captions)").classes("w-64")
 
                             async def on_scan():
@@ -2607,7 +3157,7 @@ def build_page(local: bool = True):
                                 with gallery:
                                     for path, caption in items:
                                         with ui.card().tight().classes("w-28 rz-thumb"):
-                                            ui.image(path).classes("w-28 h-28 object-cover")
+                                            ui.image(image_url(path)).classes("w-28 h-28 object-cover")
                                             ui.tooltip(caption or "(no caption)")
 
                             ui.button("Scan dataset", icon="search", on_click=on_scan).props("outline")
@@ -2619,7 +3169,8 @@ def build_page(local: bool = True):
                                 .classes("w-[30rem] max-w-full").props("use-chips") \
                                 .tooltip("Area each image is bucketed to, aspect ratio preserved (1 MP = 1024x1024). "
                                          "Pick several to train them all (mixed in every epoch) or, with Resolution "
-                                         "step-up, one after another from the lowest.")
+                                         "step-up, one after another from the lowest. A dataset with its own "
+                                         "resolutions (above) trains at those instead.")
                             w["resolution_step_up"] = ui.switch("Resolution step-up", value=d.resolution_step_up) \
                                 .tooltip("Train the lowest selected resolution first. When the probe likeness score "
                                          "stops improving, move to the next selected resolution; when it stops "
@@ -3754,7 +4305,9 @@ Every setting is explained and comes with a recommendation worked out from your 
 settings as the Train tab, so you can switch between the two at any time.
 
 ## Quick start
-1. **Dataset**: a folder of images; each image may have a same-name `.txt` caption. Optional trigger word is prepended.
+1. **Datasets**: on the Dataset tab, *Create dataset*, open it and upload images with same-name `.txt` captions (or
+   copy a folder on the machine running RulzTrainer); tick one or more for training. Optional trigger word is
+   prepended.
 2. **Model**: either a Hugging Face repo (Base / SFT, about 30 GB, stored under `models/`) or three single
    ComfyUI-style files: diffusion model, Qwen3.5-9B text encoder and Flux2 VAE.
 3. Click **Start training** (the bar at the bottom of the Train and Monitor tabs). First run caches VAE latents and
@@ -3787,6 +4340,19 @@ noisier gradients (cosine 0.93-0.99 to the exact ones); `bf16` stays exact. *Att
 attention on Blackwell GPUs (RTX 50, B200), where it ran Krea 2 steps 15-22% faster at the same loss, and lets
 PyTorch pick elsewhere; `torch`, `cudnn`, `flash`, `efficient`, `math` force one. A kernel that rejects a call falls
 back to PyTorch's pick with a warning.
+
+## Datasets
+The Dataset tab lists every dataset with a few thumbnails: the folders in `datasets/` (where *Create dataset* puts
+new ones) and folders elsewhere added with *Add a folder*. Click one to open it. *Upload* sends images and their
+`.txt` or `.json` captions from the computer the browser runs on to the machine running RulzTrainer (on the same
+machine that is a plain copy; a file with the same name is replaced). *Copy from a folder* copies the images and
+captions of a folder on that machine (sub-folders kept, files the dataset already has left alone). Each picture has
+its caption and the Face ref / Body ref ticks, and *Train on this dataset* ticks it for training.
+On the Train tab (Dataset section) tick the datasets a run trains on. Each can have its own resolutions (none
+picked: the Training resolutions) and *Repeats*: how many times each of its images comes up per epoch, so a dataset
+at 2 counts twice as much as one at 1. Each dataset caches its latents in its own `.rulz_cache`, so it trains again
+without re-encoding whatever it is combined with. A config file lists them as `datasets:` entries (`path`,
+`resolutions`, `repeats`); a single `dataset_dir` still works.
 
 ## Training resolutions
 *Training resolutions* takes one or more megapixel values (1 MP = 1024x1024); each image is bucketed to every

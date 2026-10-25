@@ -33,6 +33,8 @@ class Item:
     category: str = "image"  # image | face_crop | bust_crop
     region_path: Path | None = None  # latent-cell loss weight map (region-weighted loss)
     side: int = 0  # training resolution this item was bucketed for (square-equivalent side, area = side^2)
+    repeats: int = 1  # times the item comes up per epoch (its dataset's repeats)
+    dataset: str = ""  # the dataset folder it came from
 
     @property
     def key(self) -> str:
@@ -108,45 +110,63 @@ def _hash(s: str) -> str:
 
 
 def scan_dataset(cfg: TrainConfig) -> list[Item]:
-    root = Path(cfg.dataset_dir)
-    if not root.is_dir():
-        raise FileNotFoundError(f"Dataset dir not found: {root}")
-    cache = cfg.resolved_cache_dir()
-    (cache / "latents").mkdir(parents=True, exist_ok=True)
-    (cache / "text").mkdir(parents=True, exist_ok=True)
+    """Items of every dataset of the run (cfg.dataset_specs()): one per image and training resolution of its dataset,
+    carrying the dataset's repeats; latents and region maps in the dataset's own cache (cfg.dataset_cache_dir)."""
+    specs = cfg.dataset_specs()
+    for spec in specs:  # before any cache folder is made: making one would create a missing dataset folder
+        if not Path(spec.path).is_dir():
+            raise FileNotFoundError(f"Dataset dir not found: {spec.path}")
+    (cfg.resolved_cache_dir() / "text").mkdir(parents=True, exist_ok=True)
     tag = get_arch(cfg).latent_tag  # latents of another VAE get their own files
     items = []
-    sides = cfg.training_sides()
-    for p in sorted(root.rglob("*")):
-        if p.suffix.lower() not in IMAGE_EXTS or ".rulz_cache" in p.parts:
-            continue
-        try:
-            with Image.open(p) as im:
-                w, h = ImageOps.exif_transpose(im).size
-        except Exception as e:  # noqa: BLE001
-            log.warning("Skipping unreadable image %s: %s", p, e)
-            continue
-        caption = read_caption(p, cfg)
-        seen: set[tuple[int, int]] = set()
-        for side in sides:
-            bw, bh = bucket_size(w, h, cfg, side)
-            if (bw, bh) in seen:  # two resolutions clamped to the same bucket: keep one copy
+    summary = []
+    for spec in specs:
+        root = Path(spec.path)
+        if not root.is_dir():
+            raise FileNotFoundError(f"Dataset dir not found: {root}")
+        cache = cfg.dataset_cache_dir(root)
+        (cache / "latents").mkdir(parents=True, exist_ok=True)
+        sides = cfg.dataset_sides(spec)
+        n_images = 0
+        for p in sorted(root.rglob("*")):
+            if p.suffix.lower() not in IMAGE_EXTS or ".rulz_cache" in p.parts:
                 continue
-            seen.add((bw, bh))
-            stem = _hash(str(p.resolve())) + f"_{bw}x{bh}"
-            items.append(Item(
-                image=p, caption=caption, width=bw, height=bh,
-                latent_path=cache / "latents" / f"{stem}{tag}.safetensors",
-                latent_flip_path=(cache / "latents" / f"{stem}_flip{tag}.safetensors") if cfg.flip_augment else None,
-                text_path=text_cache_path(cfg, caption),
-                region_path=cache / "regions" / f"{stem}_regions.safetensors",
-                side=side,
-            ))
-    if not items:
-        raise ValueError(f"No images found in {root}")
-    if len(sides) > 1:
+            try:
+                with Image.open(p) as im:
+                    w, h = ImageOps.exif_transpose(im).size
+            except Exception as e:  # noqa: BLE001
+                log.warning("Skipping unreadable image %s: %s", p, e)
+                continue
+            n_images += 1
+            caption = read_caption(p, cfg)
+            seen: set[tuple[int, int]] = set()
+            for side in sides:
+                bw, bh = bucket_size(w, h, cfg, side)
+                if (bw, bh) in seen:  # two resolutions clamped to the same bucket: keep one copy
+                    continue
+                seen.add((bw, bh))
+                stem = _hash(str(p.resolve())) + f"_{bw}x{bh}"
+                items.append(Item(
+                    image=p, caption=caption, width=bw, height=bh,
+                    latent_path=cache / "latents" / f"{stem}{tag}.safetensors",
+                    latent_flip_path=((cache / "latents" / f"{stem}_flip{tag}.safetensors") if cfg.flip_augment
+                                      else None),
+                    text_path=text_cache_path(cfg, caption),
+                    region_path=cache / "regions" / f"{stem}_regions.safetensors",
+                    side=side, repeats=spec.repeats, dataset=str(root),
+                ))
+        if not n_images:
+            raise ValueError(f"No images found in {root}")
+        summary.append((root, n_images, sides, spec.repeats))
+    if len(specs) > 1:
+        from .config import side_to_mp
+
+        for root, n, sides, reps in summary:
+            log.info("Dataset %s: %d images at %s, %d repeat%s per epoch", root, n,
+                     ", ".join(f"{side_to_mp(s):g} MP" for s in sides), reps, "" if reps == 1 else "s")
+    elif len(summary[0][2]) > 1:
         log.info("Training resolutions: %s (%d items = %d images x %d resolutions)", describe_sides(cfg), len(items),
-                 len(items) // len(sides), len(sides))
+                 summary[0][1], len(summary[0][2]))
     return items
 
 
@@ -167,7 +187,6 @@ def augment_items(items: list[Item], cfg: TrainConfig, analysis: dict[str, dict]
     mode = (cfg.crop_augment or "none").lower()
     if mode == "none":
         return items
-    cache = cfg.resolved_cache_dir()
     out = list(items)
     added = {"face_crop": 0, "bust_crop": 0}
     for it in items:
@@ -203,6 +222,7 @@ def augment_items(items: list[Item], cfg: TrainConfig, analysis: dict[str, dict]
             caption = crop_caption(template, it.caption, cfg)
             stem = _hash(f"{it.image.resolve()}|crop{box[0]},{box[1]},{box[2]},{box[3]}") + f"_{bw}x{bh}"
             tag = get_arch(cfg).latent_tag
+            cache = it.latent_path.parent.parent  # the source image's dataset cache
             out.append(Item(
                 image=it.image, caption=caption, width=bw, height=bh,
                 latent_path=cache / "latents" / f"{stem}{tag}.safetensors",
@@ -210,7 +230,7 @@ def augment_items(items: list[Item], cfg: TrainConfig, analysis: dict[str, dict]
                 text_path=text_cache_path(cfg, caption),
                 src_box=box, category=category,
                 region_path=cache / "regions" / f"{stem}_regions.safetensors",
-                side=it.side,
+                side=it.side, repeats=it.repeats, dataset=it.dataset,
             ))
             added[category] += 1
     log.info("Crop augmentation: +%d face crops, +%d bust crops (%d items total)", added["face_crop"],
@@ -335,7 +355,8 @@ def text_cache_path(cfg: TrainConfig, prompt: str) -> Path:
 
 
 class BucketBatcher:
-    """Yields batches of Items with identical bucket size, shuffled each epoch."""
+    """Yields batches of Items with identical bucket size, shuffled each epoch. An item with repeats N comes up N
+    times per epoch (its dataset's repeats)."""
 
     def __init__(self, items: list[Item], batch_size: int, seed: int):
         self.items = items
@@ -343,7 +364,7 @@ class BucketBatcher:
         self.rng = random.Random(seed)
         self.buckets: dict[tuple[int, int], list[Item]] = {}
         for it in items:
-            self.buckets.setdefault((it.width, it.height), []).append(it)
+            self.buckets.setdefault((it.width, it.height), []).extend([it] * max(1, int(it.repeats or 1)))
         log.info("Buckets: %s", {f"{k[0]}x{k[1]}": len(v) for k, v in self.buckets.items()})
         self.weights: dict[str, float] | None = None
 
