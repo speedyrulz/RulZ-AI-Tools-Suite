@@ -17,12 +17,13 @@ size, turbo LoRA) and scores it against the face / body references. The controll
                                    higher (structure) noise
 
 Scores. The face score is an ArcFace cosine (a stranger ~10-25, the references against each other ~60-80); the
-body score is a proportion match where every human already scores ~80 and the references ~90-96. Raw, the two live
-on different scales: a 0.7 / 0.3 average is really ~93% face, and "the face lags the body" is always true. With
-`likeness_normalize` (the default) each score is first mapped onto one scale, 0 = what a stranger scores (the
-step-0 probe: the base model without the LoRA, or a default) and 100 = what the references score against each
-other (their self-similarity, or a default), and the combined score, the noise band, the curriculum, the lr
-control and the best / stop / race decisions all run on those.
+body score a DINOv2 cosine of the body window (bodysim.body_window; a stranger ~80, the references ~85-90) or a
+proportion match (every human ~80, the references ~90-96). Raw, they live on different scales: a 0.7 / 0.3 average
+is really ~93% face, and "the face lags the body" is always true. With `likeness_normalize` (the default) each score
+is first mapped onto one scale, 0 = what a stranger scores (the step-0 probe: the base model without the LoRA,
+rendered with at least `probe_floor_seeds` seeds, or a default) and 100 = what a typical reference scores against
+the others (reference_ceiling: the median of each reference's best match, or a default), capped at 100. The
+combined score, the noise band, the curriculum, the lr control and the best / stop / race decisions all run on those.
 
 The controller never touches the loss; it only steers sampling, lr and when to stop.
 """
@@ -47,9 +48,42 @@ def combine(face, body, face_weight: float, body_weight: float):
 # the raw-score scale each probe kind is normalized on: floor = a stranger's score (replaced by the step-0 probe when
 # there is one), ceiling = the references' own self-similarity (replaced by the measured one when there are 2+ refs)
 FLOOR_DEFAULT = {"face": 20.0, "body": 80.0}
-CEILING_DEFAULT = {"face": 75.0, "body": 95.0}
+CEILING_DEFAULT = {"face": 75.0, "body": 90.0}  # body: a window's references ~85-90, proportions ~90-96
 MIN_SPAN = {"face": 10.0, "body": 8.0}  # the ceiling stays at least this far above the floor (raw points)
-NORM_MAX = 120.0  # beating the references' self-similarity still counts, up to here
+# matching the references better than a typical one of them does is no more likeness (a probe that copies one photo
+# reads higher), so the scale stops at 100
+NORM_MAX = 100.0
+
+
+def reference_ceiling(embs, usable=None) -> float | None:
+    """The references' typical best match, the 100 of the normalized scale: each reference's best cosine against
+    the others (the statistic a probe is scored with), the median over the usable ones (all of them when fewer than
+    two are usable). The median, not the mean: hard references (a face turned away, one cut off by the frame) pulled
+    the mean below what a clean probe of the same person scores, and on a real run a typical probe read 108%."""
+    import numpy as np
+
+    e = np.asarray(embs, dtype=np.float32)
+    if e.ndim != 2 or len(e) < 2:
+        return None
+    sims = e @ e.T
+    np.fill_diagonal(sims, -np.inf)
+    best = sims.max(axis=1)
+    if usable is not None:
+        keep = np.asarray(usable, dtype=bool)
+        if int(keep.sum()) >= 2:
+            best = best[keep]
+    return float(np.median(best))
+
+
+def probe_seed_count(cfg, step: int) -> int:
+    """Seeds a probe renders: probe_seeds, and at least probe_floor_seeds for the step-0 probe that sets the zero of
+    the normalized scale. A seed's luck does not stay paired across a run (on a real run the two probe seeds' gap
+    flipped sign once the LoRA learned), so more seeds at step 0 steady the zero; later probes keep probe_seeds
+    (the same first seeds)."""
+    n = max(1, int(getattr(cfg, "probe_seeds", 1) or 1))
+    if step == 0 and getattr(cfg, "likeness_normalize", True):
+        n = max(n, int(getattr(cfg, "probe_floor_seeds", 0) or 0))
+    return n
 
 
 def normalize(value, floor: float, ceiling: float):
@@ -159,7 +193,8 @@ class LikenessController:
             lo, hi = self.scale(kind)
             src = "step-0 probe" if self.floor[kind] is not None else "default"
             parts.append(f"{kind} {lo:.1f} -> {hi:.1f} (floor: {src})")
-        return "; ".join(parts) + " (raw percent: 0 = a stranger, 100 = the references' self-similarity)"
+        return "; ".join(parts) + (" (raw percent: 0 = a stranger, 100 = a typical reference's best match among "
+                                   "the others)")
 
     def update(self, step: int, face: float | None, body: float | None, images: list[str] | None = None):
         """Feed one probe result. Returns (record, actions) where actions may contain

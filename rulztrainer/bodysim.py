@@ -277,7 +277,8 @@ def ratio_similarity(sample: dict[str, float], profile: dict[str, float], sigma:
 
 class BodyScorer:
     def __init__(self, models_dir: str | Path = "models", min_visibility: float = 0.5,
-                 silhouette: "SilhouetteScorer | None" = None, progress=None):
+                 silhouette: "SilhouetteScorer | None" = None, progress=None, segment: bool = False):
+        """segment: the pose model also returns its person mask (pose_and_mask), for the body window."""
         ok, msg = available()
         if not ok:
             raise RuntimeError(msg)
@@ -289,7 +290,7 @@ class BodyScorer:
             progress("Loading pose model...", None)
         opts = vision.PoseLandmarkerOptions(base_options=BaseOptions(model_asset_path=str(model)),
                                             running_mode=vision.RunningMode.IMAGE, num_poses=1,
-                                            min_pose_detection_confidence=0.5)
+                                            min_pose_detection_confidence=0.5, output_segmentation_masks=segment)
         self._mp = mp
         self.landmarker = vision.PoseLandmarker.create_from_options(opts)
         self.min_visibility = min_visibility
@@ -298,24 +299,43 @@ class BodyScorer:
         self.ref_count = 0
         self.ref_self_similarity: float | None = None
 
-    def landmarks(self, path: str | Path):
-        """Returns (pts [33,2] pixels, vis [33]) or None if no person found."""
+    @staticmethod
+    def _image(path: str | Path):
+        """The image as RGB, EXIF-rotated, longest side at most 1536 (the size landmarks are found on)."""
         from PIL import Image, ImageOps
 
         with Image.open(path) as im:
             im = ImageOps.exif_transpose(im).convert("RGB")
-            if max(im.size) > 1536:
-                im.thumbnail((1536, 1536))
-            arr = np.asarray(im)
-        mp_img = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=np.ascontiguousarray(arr))
-        res = self.landmarker.detect(mp_img)
+        if max(im.size) > 1536:
+            im.thumbnail((1536, 1536))
+        return im
+
+    def _detect(self, im):
+        """(pts [33,2] pixels, vis [33], person mask [H, W] bool | None) or None if no person found."""
+        arr = np.ascontiguousarray(np.asarray(im))
+        res = self.landmarker.detect(self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=arr))
         if not res.pose_landmarks:
             return None
         lm = res.pose_landmarks[0]
         h, w = arr.shape[:2]
-        pts = np.array([[l.x * w, l.y * h] for l in lm], dtype=np.float32)
-        vis = np.array([l.visibility if l.visibility is not None else 1.0 for l in lm], dtype=np.float32)
-        return pts, vis
+        pts = np.array([[q.x * w, q.y * h] for q in lm], dtype=np.float32)
+        vis = np.array([q.visibility if q.visibility is not None else 1.0 for q in lm], dtype=np.float32)
+        mask = None
+        if getattr(res, "segmentation_masks", None):
+            mask = np.squeeze(res.segmentation_masks[0].numpy_view()) > 0.5
+        return pts, vis, mask
+
+    def landmarks(self, path: str | Path):
+        """Returns (pts [33,2] pixels, vis [33]) or None if no person found."""
+        found = self._detect(self._image(path))
+        return None if found is None else (found[0], found[1])
+
+    def pose_and_mask(self, path: str | Path):
+        """(image, pts, vis, person mask) at the landmark size; pts, vis and mask None without a person. The mask
+        needs segment=True."""
+        im = self._image(path)
+        found = self._detect(im)
+        return (im, None, None, None) if found is None else (im, *found)
 
     def ratios(self, path: str | Path) -> dict[str, float] | None:
         """Skeleton ratios (MediaPipe) plus, when SAM 3 is enabled, silhouette ratios. None if nothing usable."""
@@ -381,27 +401,71 @@ class BodyScorer:
         return ratio_similarity(r, self.profile)
 
 
-# ---------------------------------------------------------------- appearance (DINOv2 on the person crop)
+# ---------------------------------------------------------------- appearance (DINOv2 on the body window)
 
 APPEARANCE_MODEL = "facebook/dinov2-base"
 APPEARANCE_PATTERNS = ["config.json", "preprocessor_config.json", "model.safetensors"]
+# the body window, in torso lengths (shoulder line to hip line) from the shoulder line: from the neck to mid-thigh,
+# 1.6 torso lengths wide. The head belongs to the face score; legs below mid-thigh are often out of the frame (Krea 2
+# draws a 2:3 "full body" probe from head to thigh)
+WINDOW_TOP, WINDOW_BOTTOM, WINDOW_HALF_WIDTH = 0.15, 1.75, 0.80
+WINDOW_MIN_COVER = 0.9  # a reference photo counts when this much of its window lies inside the photo
+WINDOW_MIN_SCORE_COVER = 0.6  # an image with less of its window inside the frame gets no body score
+WINDOW_GREY = (124, 116, 104)  # ~DINOv2's mean colour: background, out-of-frame parts, letterbox bars
+_IMAGENET_MEAN, _IMAGENET_STD = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
+
+
+def body_window(image, pts, vis, mask=None, min_vis: float = 0.5):
+    """The body from the neck to mid-thigh, turned upright: the image is rotated about the shoulder midpoint until
+    the shoulder->hip line points straight down, a window scaled by that torso length is cut out (WINDOW_* above),
+    and every pixel outside the person mask or outside the photo turns grey. The same part of the body, the same
+    way up and at the same scale in every photo and probe, so a lying, leaning or far-away body compares with a
+    standing close one and the background, the head and the framing drop out.
+
+    Returns (window image, coverage: the fraction of the window inside the photo) or None without both shoulders
+    and both hips visible."""
+    from PIL import Image
+
+    if pts is None or vis is None or min(vis[L_SHO], vis[R_SHO], vis[L_HIP], vis[R_HIP]) < min_vis:
+        return None
+    s = (pts[L_SHO] + pts[R_SHO]) / 2.0
+    v = (pts[L_HIP] + pts[R_HIP]) / 2.0 - s
+    torso = float(np.hypot(v[0], v[1]))
+    if torso < 16:
+        return None
+    angle = float(np.degrees(np.arctan2(v[0], v[1])))  # 0 with the hips straight below the shoulders
+    center = (float(s[0]), float(s[1]))
+    turned = image.rotate(-angle, resample=Image.BICUBIC, center=center, fillcolor=WINDOW_GREY)
+    person = (Image.fromarray(np.asarray(mask, dtype=np.uint8) * 255) if mask is not None
+              else Image.new("L", image.size, 255))  # without a mask the background stays in
+    person = person.rotate(-angle, resample=Image.NEAREST, center=center, fillcolor=0)  # 0 outside the photo
+    inside = Image.new("L", image.size, 255).rotate(-angle, resample=Image.NEAREST, center=center, fillcolor=0)
+    box = (int(round(s[0] - WINDOW_HALF_WIDTH * torso)), int(round(s[1] - WINDOW_TOP * torso)),
+           int(round(s[0] + WINDOW_HALF_WIDTH * torso)), int(round(s[1] + WINDOW_BOTTOM * torso)))
+    cover = float((np.asarray(inside.crop(box)) > 127).mean())
+    keep = person.crop(box)  # crop() pads outside the image with 0: out of the frame is never the person
+    return Image.composite(turned.crop(box), Image.new("RGB", keep.size, WINDOW_GREY), keep), cover
 
 
 class AppearanceScorer:
-    """Body likeness as a DINOv2 embedding of the person crop (MediaPipe's pose box, padded), scored like the face:
-    the best cosine match against the reference crops, as a percent.
+    """Body likeness as a DINOv2 embedding of the body window (body_window: neck to mid-thigh, upright, cut out on
+    grey, the head left to the face score), scored like the face: the best cosine match against the reference
+    photos that show the same window, as a percent. The ceiling of the normalized scale is a typical reference's
+    best match among the others (the median).
 
-    Measured on a 15-photo dataset against 11 base-model probes: the worst same-person match (leave-one-out) 0.49,
-    the best stranger 0.26 (CLS token; whole images overlapped, scene and clothing dominating). A stranger scores
-    ~10-26, the person 50-70+, the face score's range. Hair, build, skin and style count, and clothing too: vary the
-    outfits among the references. The proportion score (BodyScorer) could not score that dataset's references at all
-    (one of eight skeleton ratios measurable)."""
+    Measured on a real run (60 photos: 20 close-ups, 40 medium to full-body shots; probes every 60 steps to step
+    960): the earlier input, the padded pose box through the processor's 224 centre crop, kept half of a standing
+    body and was matched against close-ups too, so the base model's stranger outscored the person's own photos
+    against each other (0.73 against 0.67) and the score had no relation to training (rank correlation -0.13). The
+    window against the 16 photos that show it rose with training (rank correlation +0.94; most of it survives in
+    greyscale, so body shape and skin rather than lighting): 0 to about half of the way to the references by step 960,
+    while the face reached them. Hair, build, skin and clothing count, so vary the outfits among the references."""
 
     def __init__(self, models_dir: str | Path = "models", device: str = "cuda:0", model_id: str = APPEARANCE_MODEL,
-                 pad: float = 0.2, progress=None):
-        self.pose = BodyScorer(models_dir, progress=progress)  # the person box
+                 min_cover: float = WINDOW_MIN_COVER, progress=None):
+        self.pose = BodyScorer(models_dir, progress=progress, segment=True)  # landmarks + person mask
         self.device = device if (device == "cpu" or torch.cuda.is_available()) else "cpu"
-        self.pad = pad
+        self.min_cover = min_cover
         self.model = self.processor = None
         self.model_id = model_id
         self.progress = progress
@@ -410,11 +474,12 @@ class AppearanceScorer:
         self.ref_self_similarity: float | None = None
 
     @classmethod
-    def with_embedder(cls, embed, crop) -> "AppearanceScorer":
-        """A scorer around given functions, for tests: embed(PIL image) -> unit vector, crop(path) -> image | None."""
+    def with_embedder(cls, embed, window, min_cover: float = WINDOW_MIN_COVER) -> "AppearanceScorer":
+        """A scorer around given functions, for tests: embed(image) -> unit vector, window(path) -> (image,
+        coverage) | None."""
         self = cls.__new__(cls)
-        self.refs, self.ref_count, self.ref_self_similarity = [], 0, None
-        self._embed, self.person_crop = embed, crop  # type: ignore[method-assign]
+        self.refs, self.ref_count, self.ref_self_similarity, self.min_cover = [], 0, None, min_cover
+        self._embed, self.window = embed, window  # type: ignore[method-assign]
         return self
 
     @property
@@ -434,64 +499,73 @@ class AppearanceScorer:
         self.processor = AutoImageProcessor.from_pretrained(path)
         self.model = AutoModel.from_pretrained(path).to(self.device).eval().requires_grad_(False)
 
-    def person_crop(self, path: str | Path):
-        """The person's box from the visible pose landmarks, padded; None without a pose."""
-        from PIL import Image, ImageOps
-
-        lm = self.pose.landmarks(path)
-        if lm is None:
-            return None
-        pts, vis = lm
-        with Image.open(path) as im:
-            im = ImageOps.exif_transpose(im).convert("RGB")
-            if max(im.size) > 1536:  # the landmarks were found on this size
-                im.thumbnail((1536, 1536))
-            p = pts[vis > 0.5] if int((vis > 0.5).sum()) >= 4 else pts
-            x0, y0 = p.min(0)
-            x1, y1 = p.max(0)
-            w, h = max(1.0, x1 - x0), max(1.0, y1 - y0)
-            box = (max(0, int(x0 - self.pad * w)), max(0, int(y0 - self.pad * h)),
-                   min(im.width, int(x1 + self.pad * w)), min(im.height, int(y1 + self.pad * h)))
-            return im.crop(box)
+    def window(self, path: str | Path):
+        """(body window image, coverage) of an image (body_window), or None without shoulders and hips."""
+        im, pts, vis, mask = self.pose.pose_and_mask(path)
+        return body_window(im, pts, vis, mask)
 
     @torch.no_grad()
     def _embed(self, image) -> np.ndarray:
+        """DINOv2's CLS token of the image letterboxed to a square at 224 px: no centre crop, the whole window
+        counts (the processor's own centre crop kept half of a tall crop)."""
+        from PIL import Image
+
         self._load()
-        x = self.processor(images=image, return_tensors="pt").to(self.device)
-        v = self.model(**x).last_hidden_state[:, 0].float()  # the CLS token
+        side = max(image.size)
+        square = Image.new("RGB", (side, side), WINDOW_GREY)
+        square.paste(image, ((side - image.width) // 2, (side - image.height) // 2))
+        mean = np.asarray(getattr(self.processor, "image_mean", None) or _IMAGENET_MEAN, dtype=np.float32)
+        std = np.asarray(getattr(self.processor, "image_std", None) or _IMAGENET_STD, dtype=np.float32)
+        arr = (np.asarray(square.resize((224, 224), Image.BICUBIC), dtype=np.float32) / 255.0 - mean) / std
+        x = torch.from_numpy(arr.transpose(2, 0, 1).copy())[None].to(self.device)
+        v = self.model(pixel_values=x).last_hidden_state[:, 0].float()  # the CLS token
         return torch.nn.functional.normalize(v, dim=-1)[0].cpu().numpy()
 
     def set_references(self, paths: list[str | Path]) -> list[dict]:
+        """Embed the body window of every reference that shows one. The photos whose window lies at least min_cover
+        inside the frame are the references (a close-up has no hips, a waist-up shot no thighs); with fewer than two
+        such photos every photo with shoulders and hips counts, with a warning."""
         from .facesim import expand_refs
+        from .likeness import reference_ceiling
 
-        self.refs, info = [], []
-        for p in expand_refs(paths):
-            crop = self.person_crop(p)
-            if crop is None:
+        found, info = [], []
+        paths = expand_refs(paths)
+        for p in paths:
+            win = self.window(p)
+            if win is None:
                 info.append({"image": str(p), "person": False})
-                log.warning("Body reference %s: no person found", p)
                 continue
-            self.refs.append((str(p), self._embed(crop)))
-            info.append({"image": str(p), "person": True, "crop_size": list(getattr(crop, "size", ()) or ())})
+            image, cover = win
+            found.append((str(p), self._embed(image), cover))
+            info.append({"image": str(p), "person": True, "cover": round(float(cover), 3)})
+        used = [f for f in found if f[2] >= self.min_cover]
+        if len(used) < 2 and len(found) > len(used):
+            log.warning("Body references: only %d of %d photos show the body from the neck to mid-thigh; scoring "
+                        "against all %d with shoulders and hips, which is less reliable (add three-quarter or "
+                        "full-length photos)", len(used), len(paths), len(found))
+            used = found
+        names = {p for p, _, _ in used}
+        for item in info:
+            if item["person"]:
+                item["used"] = item["image"] in names
+        self.refs = [(p, e) for p, e, _ in used]
         self.ref_count = len(self.refs)
-        if self.ref_count >= 2:
-            embs = np.stack([e for _, e in self.refs])
-            sims = embs @ embs.T
-            np.fill_diagonal(sims, -1.0)
-            self.ref_self_similarity = float(sims.max(axis=1).mean())  # each reference's best match: the ceiling
-        else:
-            self.ref_self_similarity = None
-        log.info("Body references (appearance): %d of %d images had a person; self-similarity %s", self.ref_count,
-                 len(info), f"{self.ref_self_similarity:.3f}" if self.ref_self_similarity is not None else "n/a")
+        self.ref_self_similarity = (reference_ceiling(np.stack([e for _, e in self.refs]))
+                                    if self.ref_count >= 2 else None)
+        sim = self.ref_self_similarity
+        log.info("Body references (appearance): %d of %d photos show shoulders and hips, %d of them the body down "
+                 "to mid-thigh (the references); typical best match among them %s", len(found), len(paths),
+                 self.ref_count, f"{sim:.3f}" if sim is not None else "n/a")
         return info
 
     def score(self, path: str | Path) -> tuple[float | None, int]:
-        """(appearance similarity percent | None, references compared)."""
+        """(appearance similarity percent | None, references compared). None without shoulders and hips, or when
+        less than WINDOW_MIN_SCORE_COVER of the window is inside the frame (a portrait, a waist-up shot)."""
         if not self.refs:
             return None, 0
-        crop = self.person_crop(path)
-        if crop is None:
+        win = self.window(path)
+        if win is None or win[1] < WINDOW_MIN_SCORE_COVER:
             return None, 0
-        emb = self._embed(crop)
+        emb = self._embed(win[0])
         best = max(float(emb @ ref) for _, ref in self.refs)
         return max(0.0, min(1.0, best)) * 100.0, len(self.refs)

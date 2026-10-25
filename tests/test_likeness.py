@@ -109,15 +109,15 @@ def test_normalized_scores_put_face_and_body_on_one_scale():
     assert abs(c.face_bias) < 1e-9  # no gap on the normalized scale (raw: 88 - 42.5 = 45.5 points)
     rec, act = c.update(20, 42.5, 94.0)  # the body reaches the references, the face does not: face-heavy
     assert rec.body_norm == 100.0 and c.face_bias > 0.9
-    rec, _ = c.update(30, 80.0, 82.0)  # above the ceiling counts, up to 120; the floor clips at 0
-    assert rec.face_norm == 118.18181818181819 or abs(rec.face_norm - 118.18) < 0.01
+    rec, _ = c.update(30, 80.0, 82.0)  # above a typical reference stops at 100; the floor clips at 0
+    assert rec.face_norm == 100.0
     assert rec.body_norm == 0.0
 
 
 def test_normalization_defaults_floor_clamp_and_switch():
     c = L.LikenessController(_cfg(likeness_normalize=True))  # no step-0 probe, no reference self-similarity
     rec, _ = c.update(25, 20.0, 80.0)
-    assert c.scale("face") == (20.0, 75.0) and c.scale("body") == (80.0, 95.0)
+    assert c.scale("face") == (20.0, 75.0) and c.scale("body") == (80.0, 90.0)
     assert rec.face_norm == 0.0 and rec.body_norm == 0.0 and c.describe_scale().count("default") == 2
     # the step-0 probe above the measured ceiling (a base model that already resembles the references, or a body
     # self-similarity below what probes score): step 0 is still 0, the ceiling moves up to floor + MIN_SPAN
@@ -176,3 +176,21 @@ def test_sample_scores_carry_normalized_values_and_captions_show_them(tmp_path):
     raw = facesim.score_samples(face, [str(tmp_path / "s.png")], 10, tmp_path, body, 0.5, 0.5)[0]
     assert raw.face_norm is None and webui.score_caption(facesim.asdict(raw)) == "  |  face 42%, body 34%, combined 38%"
     assert len(facesim.read_scores(tmp_path)) == 2
+
+
+def test_reference_ceiling_is_the_median_best_match():
+    """Each reference's best match among the others, the median over the usable ones: one odd photo does not drag
+    the 100% down the way it drags a mean."""
+    vecs = [[1.0, 0.0, 0.0], [0.8, 0.6, 0.0], [0.0, 1.0, 0.0], [0.6, 0.8, 0.0], [0.0, 0.0, -1.0]]
+    assert abs(L.reference_ceiling(vecs) - 0.8) < 1e-6  # best matches .8 .96 .8 .96 0 (mean .70)
+    assert abs(L.reference_ceiling(vecs, [True, True, True, True, False]) - 0.88) < 1e-6  # the odd one left out
+    assert abs(L.reference_ceiling(vecs, [True, False, False, False, False]) - 0.8) < 1e-6  # < 2 usable: all
+    assert L.reference_ceiling(vecs[:1]) is None and L.reference_ceiling([]) is None
+
+
+def test_the_step0_probe_renders_more_seeds():
+    cfg = TrainConfig(probe_seeds=2, probe_floor_seeds=4)
+    assert L.probe_seed_count(cfg, 0) == 4 and L.probe_seed_count(cfg, 60) == 2
+    assert L.probe_seed_count(TrainConfig(probe_seeds=6, probe_floor_seeds=4), 0) == 6  # never fewer than usual
+    assert L.probe_seed_count(TrainConfig(probe_seeds=2, probe_floor_seeds=4, likeness_normalize=False), 0) == 2
+    assert L.probe_seed_count(TrainConfig(probe_seeds=0, probe_floor_seeds=0), 0) == 1

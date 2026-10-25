@@ -489,8 +489,8 @@ def face_preview(paths: list[str], provider: str, det_size: int) -> tuple[str, l
             crops.append(("", f"{Path(item['image']).name}: NO FACE FOUND"))
     self_sim = scorer.ref_self_similarity
     text = (f"{len(scorer.refs)} of {len(paths)} reference images have a face. "
-            + (f"Reference self-similarity: {self_sim * 100:.1f}% (the realistic ceiling for samples)."
-               if self_sim is not None else "Add 2+ references to see the self-similarity ceiling."))
+            + (f"Typical best match among them: {self_sim * 100:.1f}% (the normalized 100%; faces cut off by the "
+               f"frame left out)." if self_sim is not None else "Add 2+ references to see the ceiling."))
     return text, crops
 
 
@@ -506,11 +506,13 @@ def body_preview(paths: list[str], backend: str = "mediapipe", sam3_model: str =
         if not paths:
             return "No image files found in the listed paths (folders are expanded to the images inside)."
         info = scorer.set_references(paths)
-        text = f"{scorer.ref_count} of {len(paths)} body references have a person (appearance score, DINOv2)."
+        shown = sum(1 for i in info if i.get("person"))
+        text = (f"{shown} of {len(paths)} body references show shoulders and hips; {scorer.ref_count} show the body "
+                "from the neck to mid-thigh and are compared (appearance score, DINOv2).")
         if scorer.ref_self_similarity is not None:
-            text += f" Reference self-similarity {scorer.ref_self_similarity * 100:.1f}% (the normalized 100%)."
+            text += f" Typical best match among them {scorer.ref_self_similarity * 100:.1f}% (the normalized 100%)."
         else:
-            text += " Add 2+ references to measure the self-similarity ceiling."
+            text += " Add 2+ three-quarter or full-length photos to measure the ceiling."
         return text
     sil = None
     note = ""
@@ -799,6 +801,7 @@ class Form:
             probe_every=int(v("probe_every")), probe_at_start=bool(v("probe_at_start")),
             probe_face_prompt=s("probe_face_prompt"), probe_body_prompt=s("probe_body_prompt"),
             probe_seeds=int(v("probe_seeds")), probe_seed=int(v("probe_seed")), probe_size=int(v("probe_size")),
+            probe_floor_seeds=int(v("probe_floor_seeds") or 4),
             probe_steps=int(v("probe_steps")), probe_cfg=float(v("probe_cfg")), probe_ema=float(v("probe_ema")),
             likeness_noise_band=float(v("likeness_noise_band")), likeness_track_best=bool(v("likeness_track_best")),
             likeness_normalize=bool(v("likeness_normalize")),
@@ -3005,15 +3008,16 @@ def build_page(local: bool = True):
                         face_info = hint("")
                         face_row = ui.row().classes("w-full gap-2")
                         w["body_refs"] = ui.textarea("Body reference images or folders (one path per line; "
-                                                     "full-body shots)").classes("w-full")
+                                                     "three-quarter or full-length shots)").classes("w-full")
                         with fields():
                             w["body_score"] = ui.select({"appearance": "appearance (DINOv2)",
                                                          "proportions": "proportions (skeleton)"},
                                                         value=d.body_score, label="Body score").classes("w-52") \
-                                .tooltip("appearance: a DINOv2 embedding of the person crop, best match against the "
-                                         "references, like the face score (hair, build, skin, style; clothing too, "
-                                         "so vary the outfits among the references). proportions: skeleton ratios "
-                                         "against the references' median, which shift with pose and camera angle.")
+                                .tooltip("appearance: a DINOv2 embedding of the body from the neck to mid-thigh, "
+                                         "turned upright and cut out from the background, best match against the "
+                                         "reference photos that show the same part of the body (build, skin, hair; "
+                                         "clothing too, so vary the outfits). proportions: skeleton ratios against "
+                                         "the references' median, which shift with pose and camera angle.")
                             w["body_backend"] = ui.select(["mediapipe", "mediapipe+sam3"], value=d.body_backend,
                                                           label="Pose / mask backend").classes("w-48") \
                                 .tooltip("mediapipe: pose landmarks (the person box, skeleton ratios, region masks). "
@@ -3223,6 +3227,11 @@ def build_page(local: bool = True):
                             with fields():
                                 w["probe_seeds"] = ui.number("Seeds per probe", value=d.probe_seeds, min=1, max=8,
                                                              precision=0).classes("w-36")
+                                w["probe_floor_seeds"] = ui.number("Step-0 seeds", value=d.probe_floor_seeds, min=1,
+                                                                   max=16, precision=0).classes("w-32") \
+                                    .tooltip("The step-0 probe (the base model: the 0 of the normalized scale) renders "
+                                             "at least this many seeds, for a steadier zero; later probes render "
+                                             "Seeds per probe. Costs a few extra renders once, at the start.")
                                 w["probe_seed"] = ui.number("Probe seed", value=d.probe_seed, precision=0) \
                                     .classes("w-32")
                                 w["probe_ema"] = ui.number("Score smoothing (EMA)", value=d.probe_ema, min=0,
@@ -3370,7 +3379,7 @@ def build_page(local: bool = True):
                     probe_label = hint("")
                     # the normalized scores (0 = a stranger, 100 = the references): smoothed lines, per-probe dots
                     probe_chart = ui.echart(chart_options(
-                        _axis("step", min="dataMin"), _axis("likeness % (normalized)", min=0, max=120),
+                        _axis("step", min="dataMin"), _axis("likeness % (normalized)", min=0, max=100),
                         [_line("face", "#FF3B30"), _line("body", "#F4F4F5"),
                          _line("combined", "#F59E0B", lineStyle={"width": 3}),
                          {"name": "face (probe)", "type": "scatter", "symbolSize": 5, "data": [],
@@ -3839,12 +3848,15 @@ against LoKr: `network_type=lokr, lokr_factor=8` in one row.
 
 **Probe scores.** The face score is ArcFace's best match against the references (a stranger ~10-25, the references
 against each other ~60-80). The body score (*Body score*, Identity similarity section) is by default a DINOv2
-embedding of the person crop, best match against the references the same way (a stranger ~10-26, the person
-50-70+: hair, build, skin, style, and clothing, so vary the outfits among the references); `proportions` is the older
-skeleton-ratio match (every human ~80, the references ~90-96), which shifts with pose and camera angle. With
-*Normalize face and body scores* (default on) each is first mapped to 0 = a stranger's score (the step-0 probe, so
-keep *Probe at start* on) and 100 = the references' own self-similarity (each reference's best match among the
-others). The combined score, best checkpoint, early stop, curriculum and race decisions use these; the Monitor
+embedding of the body from the neck to mid-thigh, turned upright, cut out from the background and without the head
+(the face score covers that), best match against the reference photos that show the same part of the body
+(three-quarter or full-length shots; close-ups are left out). Build, skin, hair and clothing count, so vary the
+outfits among the references. `proportions` is the older skeleton-ratio match (every human ~80, the references
+~90-96), which shifts with pose and camera angle. With *Normalize face and body scores* (default on) each is first
+mapped to 0 = a stranger's score (the step-0 probe, rendered with *Step-0 seeds* seeds, so keep *Probe at start*
+on) and 100 = what a typical reference scores against the others (the median of each one's best match; faces cut
+off by the frame left out), capped at 100: matching the references better than a typical one of them is no more
+likeness. The combined score, best checkpoint, early stop, curriculum and race decisions use these; the Monitor
 shows the raw scores next to them.
 
 ## Configuration race

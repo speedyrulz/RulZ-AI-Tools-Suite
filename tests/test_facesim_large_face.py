@@ -61,3 +61,37 @@ def test_4x_canvas_and_the_thumbnail_scale_compose(tmp_path):
 def test_small_face_needs_no_canvas(tmp_path):
     s, p = _scorer(tmp_path, 1024, 400)  # a face that is 32% of the frame
     assert len(s.faces(p)) == 1 and s.app.calls == [1024]
+
+
+def test_cut_off_faces_and_the_displayed_size(tmp_path):
+    from PIL import Image
+
+    assert not facesim.cut_off([10, 10, 90, 90], (100, 100))
+    assert not facesim.cut_off([-3, 10, 90, 103], (100, 100))  # within 5% of the box: a tight crop, still whole
+    assert facesim.cut_off([-20, 10, 90, 90], (100, 100)) and facesim.cut_off([10, 10, 90, 130], (100, 100))
+    p = tmp_path / "rotated.jpg"
+    exif = Image.Exif()
+    exif[0x0112] = 6  # stored landscape, shown portrait
+    Image.new("RGB", (300, 200)).save(p, exif=exif)
+    assert facesim.image_size(p) == (200, 300)
+
+
+def test_cut_off_faces_are_left_out_of_the_ceiling(tmp_path):
+    """The ceiling is the median of each reference's best match among the others over the whole faces: a face the
+    frame cuts off (an unreliable embedding, here unlike every other) is still a reference but not in the median."""
+    from PIL import Image
+
+    vecs = {"a": [1.0, 0.0, 0.0], "b": [0.8, 0.6, 0.0], "c": [0.0, 1.0, 0.0], "d": [0.6, 0.8, 0.0],
+            "cut": [0.0, 0.0, -1.0]}
+    paths = []
+    for name in vecs:
+        paths.append(tmp_path / f"{name}.png")
+        Image.new("RGB", (100, 100)).save(paths[-1])
+    s = facesim.FaceScorer.__new__(facesim.FaceScorer)
+    s.refs = []
+    s.faces = lambda p: [SimpleNamespace(
+        bbox=np.array([-30, 5, 95, 120] if Path(p).stem == "cut" else [10, 10, 90, 90], dtype=np.float32),
+        normed_embedding=np.asarray(vecs[Path(p).stem], dtype=np.float32), det_score=0.9)]
+    info = s.set_references(paths)
+    assert len(s.refs) == 5 and [i["cut_off"] for i in info] == [False] * 4 + [True]
+    assert abs(s.ref_self_similarity - 0.88) < 1e-6  # .8 .96 .8 .96 (with the cut-off face: .8)

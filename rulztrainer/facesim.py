@@ -2,8 +2,8 @@
 
 Reference faces come from one or more dataset images; each generated sample's largest detected face is
 embedded with InsightFace (ArcFace "buffalo_l") and compared by cosine similarity against every reference
-embedding. The reported score is the best match. The reference set's own pairwise similarity is reported
-too, as the realistic ceiling for that character.
+embedding. The reported score is the best match. A typical reference's best match among the others (the median,
+faces cut off by the frame left out) is reported too: the realistic ceiling, the 100 of the normalized scale.
 
 Cosine similarity for ArcFace: same identity is typically 0.5 to 0.8, different people 0.0 to 0.3.
 "percent" is the cosine similarity clipped to [0, 1] times 100 (so 50%+ generally means "same person").
@@ -20,6 +20,28 @@ import numpy as np
 
 log = logging.getLogger("rulztrainer")
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
+
+def image_size(path) -> tuple[int, int]:
+    """(width, height) as displayed: an EXIF rotation by 90 or 270 degrees swaps the stored size."""
+    from PIL import Image
+
+    with Image.open(path) as im:
+        w, h = im.size
+        try:
+            orient = im.getexif().get(0x0112, 1)
+        except Exception:  # noqa: BLE001
+            orient = 1
+    return (h, w) if orient in (5, 6, 7, 8) else (w, h)
+
+
+def cut_off(bbox, size, margin: float = 0.05) -> bool:
+    """True when a face box reaches past the photo's edge by more than `margin` of its own size: a face the frame
+    cuts off (a close-up that overfills it), whose embedding is unreliable."""
+    x0, y0, x1, y1 = (float(v) for v in bbox)
+    w, h = size
+    mx, my = margin * (x1 - x0), margin * (y1 - y0)
+    return x0 < -mx or y0 < -my or x1 > w + mx or y1 > h + my
 
 
 def expand_refs(paths) -> list[Path]:
@@ -152,8 +174,11 @@ class FaceScorer:
 
     def set_references(self, paths: list[str | Path]) -> list[dict]:
         """Embed the largest face of each reference image. Returns per-image info for the UI."""
+        from .likeness import reference_ceiling
+
         self.refs = []
         info = []
+        cut = []
         paths = expand_refs(paths)
         for p in paths:
             fs = self.faces(p)
@@ -162,21 +187,20 @@ class FaceScorer:
                 log.warning("Face reference %s: no face detected", p)
                 continue
             f = fs[0]
+            off = cut_off(f.bbox, image_size(p))
             self.refs.append((str(p), f.normed_embedding.astype(np.float32)))
+            cut.append(off)
             info.append({"image": str(p), "faces": len(fs), "bbox": [float(x) for x in f.bbox],
-                         "det_score": float(f.det_score)})
-        if len(self.refs) >= 2:
-            embs = np.stack([e for _, e in self.refs])
-            sims = embs @ embs.T
-            np.fill_diagonal(sims, -1.0)
-            # each reference's best match among the others: the statistic a probe is scored with (its best match
-            # among the references), so it is the ceiling of the normalized scale. The mean pairwise similarity sat
-            # 8 points lower on a 15-photo set and read a good probe as 120%
-            self.ref_self_similarity = float(sims.max(axis=1).mean())
-        else:
-            self.ref_self_similarity = None
-        log.info("Face references: %d of %d images had a face; reference self-similarity %s", len(self.refs),
-                 len(paths), f"{self.ref_self_similarity:.3f}" if self.ref_self_similarity is not None else "n/a")
+                         "det_score": float(f.det_score), "cut_off": off})
+        # each reference's best match among the others is the statistic a probe is scored with; its median over the
+        # references whose face is whole is the ceiling of the normalized scale (reference_ceiling). The mean read a
+        # typical probe as 108% on a real run: profile views and cut-off faces pull it down, while a probe is
+        # always a clean front-facing headshot
+        self.ref_self_similarity = (reference_ceiling(np.stack([e for _, e in self.refs]), [not c for c in cut])
+                                    if len(self.refs) >= 2 else None)
+        log.info("Face references: %d of %d images had a face (%d cut off by the frame, left out of the ceiling); "
+                 "typical best match among them %s", len(self.refs), len(paths), sum(cut),
+                 f"{self.ref_self_similarity:.3f}" if self.ref_self_similarity is not None else "n/a")
         return info
 
     # ------------------------------------------------------------ scoring
@@ -248,7 +272,7 @@ def score_samples(scorer, paths: list[str], step: int, job_dir: Path, body_score
         body = ""
         if body_scorer is not None:
             body = (f"body {s.body_percent:.1f}% ({s.body_ratios} ratios)" if s.body_percent is not None
-                    else "body: no usable pose")
+                    else "body: n/a (no usable body in the frame)")
         comb = f"combined {s.combined_percent:.1f}%" if s.combined_percent is not None else "combined: n/a"
         log.info("Similarity step %d sample %d: %s | %s | %s", step, s.prompt_index, face, body, comb)
     log.info("Similarity scoring took %.1fs", time.time() - t0)

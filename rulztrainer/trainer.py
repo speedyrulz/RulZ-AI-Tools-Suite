@@ -1868,7 +1868,7 @@ class Trainer:
 
     @torch.no_grad()
     def _probe_with(self, slots, step):
-        from .likeness import probe_body_size
+        from .likeness import probe_body_size, probe_seed_count
 
         cfg = self.cfg
         for sl in slots:
@@ -1886,7 +1886,7 @@ class Trainer:
             if kind == "body" and self.body_scorer is None:
                 continue
             w, h = (cfg.probe_size, cfg.probe_size) if kind == "face" else probe_body_size(cfg.probe_size)
-            n_seeds = max(1, cfg.probe_seeds)
+            n_seeds = probe_seed_count(cfg, step)  # more at step 0: the normalized scale's zero
             for k in range(n_seeds):
                 jobs.append(RenderJob(prompt, w, h, cfg.probe_steps, cfg.probe_cfg, cfg.probe_seed + k,
                                       out_dir / f"{self._image_prefix()}step{step:06d}_{kind}_{k}.png",

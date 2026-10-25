@@ -522,14 +522,19 @@ Monitor chart and the sample captions:
 
 - **Face**: the largest face in the sample is embedded with InsightFace (ArcFace, `buffalo_l`) and compared by
   cosine similarity to every reference face; the best match is reported as a percent (cosine x 100). For
-  ArcFace, 50%+ generally means the same person; the references' own pairwise similarity is shown as the
-  realistic ceiling.
-- **Body**: MediaPipe pose landmarks give scale-free proportion ratios (shoulder/hip width, torso/leg length,
-  upper/lower leg, upper arm/forearm, head/shoulder width, leg/height...). With `body_backend: mediapipe+sam3`,
-  a SAM 3 person mask adds silhouette widths at the shoulder, waist, hip and thigh levels (normalised by body
-  height) plus waist/hip and shoulder/waist, which captures build rather than only bone proportions. A median
-  profile over the body references is the target; a sample scores by how close its ratios are
-  (20% deviation on a ratio ~ 61%). Silhouette features are only used when the skeleton confirms a full-body
+  ArcFace, 50%+ generally means the same person; a typical reference's best match among the others is shown as
+  the realistic ceiling.
+- **Body** (`body_score: appearance`, the default): the body from the neck to mid-thigh, turned upright, cut out
+  from the background and without the head, embedded with DINOv2 and compared with the reference photos that show
+  the same part of the body; the best match is reported as a percent (details under *Body score* below). Body
+  references should include three-quarter or full-length shots; samples that show no hips (portraits) or too
+  little of the window get no body score.
+- **Body** (`body_score: proportions`): MediaPipe pose landmarks give scale-free proportion ratios (shoulder/hip
+  width, torso/leg length, upper/lower leg, upper arm/forearm, head/shoulder width, leg/height...). With
+  `body_backend: mediapipe+sam3`, a SAM 3 person mask adds silhouette widths at the shoulder, waist, hip and thigh
+  levels (normalised by body height) plus waist/hip and shoulder/waist, which captures build rather than only bone
+  proportions. A median profile over the body references is the target; a sample scores by how close its ratios
+  are (20% deviation on a ratio ~ 61%). Silhouette features are only used when the skeleton confirms a full-body
   view, and samples without a usable pose get no body score. Body references should be full-body, upright,
   fairly neutral poses, and the same goes for the sample prompts you want body-scored.
 - **Combined**: `face_weight` x face + `body_weight` x body (defaults 0.7 / 0.3; whichever is available).
@@ -632,7 +637,8 @@ score), not a default.
 
 With face/body references set, `probe_every: N` renders a fixed-seed headshot (`probe_face_prompt`) and/or
 full-body image (`probe_body_prompt`) every N steps at `probe_size` (the face square, the body a 2:3 portrait with the
-same pixel count) with the turbo LoRA (cheap enough to do often), scores them, and records `likeness.jsonl` plus a Monitor chart. Scores are smoothed with `probe_ema`
+same pixel count) with the turbo LoRA (cheap enough to do often), scores them, and records `likeness.jsonl` plus a Monitor chart. Each probe renders `probe_seeds` seeds and averages the scores; the step-0 probe, the zero
+of the normalized scale, renders at least `probe_floor_seeds` (4). Scores are smoothed with `probe_ema`
 and only changes beyond `likeness_noise_band` count. The controller then, each individually switchable:
 
 - keeps `<job>_best.safetensors` at the best smoothed combined score (`likeness_track_best`) and stops after
@@ -652,13 +658,25 @@ The face detector rescales every image to `face_det_size` and misses a face that
 probe: its box spanned 87% of the image), so when it finds nothing the image is retried at the centre of a canvas
 2x and 4x its size, where the same face is found with confidence 0.9.
 
-**Body score** (`body_score`). `appearance` (the default): a DINOv2-base embedding of the person crop (MediaPipe's
-pose box, padded 20%), scored like the face as the best cosine match against the reference crops, in percent. On a
-15-photo dataset against 11 base-model probes the worst same-person match (leave-one-out) was 0.49 and the best
-stranger 0.26, where embeddings of whole images overlapped (scene and clothing dominate) and the proportion score
-could not score the references at all (one of eight skeleton ratios measurable). A stranger scores ~10-26, the
-person 50-70+. Hair, build, skin and style count, and clothing too, so vary the outfits among the references. The
-model (350 MB, `facebook/dinov2-base`) downloads on first use and runs on `body_device`. `proportions`: the older
+**Body score** (`body_score`). `appearance` (the default): a DINOv2-base embedding of the *body window*, scored
+like the face as the best cosine match against the references, in percent. The window is the body from the neck to
+mid-thigh: MediaPipe's shoulders and hips set its position and scale (1.6 torso lengths wide, from 0.15 above the
+shoulder line to 1.75 below it), the image is turned so the shoulder-to-hip line points straight down, and
+everything outside MediaPipe's person mask turns grey. The same part of the body then sits the same way up and at
+the same scale in every photo and probe, so lying, leaning and distant bodies compare with standing close ones, and
+the background, the head (the face score's job) and the framing drop out. Only the reference photos whose window
+lies at least 90% inside the frame are compared (close-ups have no hips, waist-up shots no thighs); with fewer than
+two such photos every photo with shoulders and hips counts, with a warning. The window is letterboxed to a square,
+not centre-cropped.
+Measured on a real run (60 photos: 20 close-ups, 40 medium to full-body shots; Krea 2, probes every 60 steps to
+step 960): the earlier input, the padded pose box through DINOv2's 224 px centre crop, kept half of a standing body
+and was matched against the close-ups too, so the base model's stranger outscored the person's own photos against
+each other (0.73 against 0.67) and the score had no relation to training (rank correlation -0.13 with the step).
+The window against the 16 photos that show it rose with training (+0.94; most of the rise survives in greyscale,
+so body shape and skin rather than lighting), from 0 to about half of the way to the references by step 960 while
+the face reached them. Krea 2 draws a 2:3 "full body" probe from head to thigh, which the window covers. Build,
+skin and hair count, and clothing too, so vary the outfits among the references. The model (350 MB,
+`facebook/dinov2-base`) downloads on first use and runs on `body_device`. `proportions`: the older
 match of skeleton ratios (shoulder/hip width, leg/height, ...) against the references' median, plus SAM 3
 silhouette widths with `body_backend: mediapipe+sam3`; proportions in a photo shift with pose and camera angle, so
 this score can fall while the image gets closer.
@@ -668,12 +686,16 @@ face score is an ArcFace cosine (a stranger scores ~10-25, your references again
 body score a match where every human already scores ~80 and the references ~90-96. A run's face score moves ~60
 points, a proportion body score ~10, so a 0.7 / 0.3 average is really ~93% face and "the face lags the body" is true
 all run.
-Each score is therefore mapped first onto one scale, 0 = what a stranger scores and 100 = what the references score
-against each other: the floor is the step-0 probe (the base model without the LoRA; `probe_at_start`) or a default
-(face 20, body 80), the ceiling the references' self-similarity when two or more are given, or a default (face 75,
-body 95; the face ceiling is each reference's best match among the others, the statistic a probe is scored
-with), the ceiling raised to at least 10 face / 8 body points above the floor when the step-0 score is at or
-above it, with scores above the ceiling counting up to 120. The combined score, the noise band, the curriculum gap,
+Each score is therefore mapped first onto one scale, 0 = what a stranger scores and 100 = what a typical reference
+scores against the others: the floor is the step-0 probe (the base model without the LoRA; `probe_at_start`,
+rendered with at least `probe_floor_seeds` seeds, default 4, for a steadier zero) or a default (face 20, body 80),
+the ceiling the median of each reference's best match among the others when two or more are given (the statistic
+a probe is scored with; faces cut off by the frame left out), or a default (face 75, body 90). The ceiling is
+raised to at least 10 face / 8 body points above the floor when the step-0 score is at or above it, and scores stop
+at 100: matching the references better than a typical one of them is no more likeness (a probe that copies one
+photo reads higher). The median replaced the mean because hard references (profile views, cut-off faces) pull the
+mean below what a clean front-facing probe scores: on a real run a typical probe read 108% against the mean and
+100% against the median. The combined score, the noise band, the curriculum gap,
 the lr control, the best checkpoint, early stop and the race drops all use the normalized values; the log, the
 Monitor and `likeness.jsonl` show the raw face / body next to them (`face_norm`, `body_norm`, `scale`). Earlier runs'
 `likeness.jsonl` keep their raw combined scores.

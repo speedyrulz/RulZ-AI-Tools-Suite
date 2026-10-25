@@ -257,6 +257,7 @@ class TrainConfig:
     probe_face_prompt: str = ""  # headshot prompt; empty = no face probe
     probe_body_prompt: str = ""  # full-body prompt; empty = no body probe
     probe_seeds: int = 1  # seeds per probe (scores averaged)
+    probe_floor_seeds: int = 4  # the step-0 probe (the normalized scale's zero) renders at least this many seeds
     probe_seed: int = 1234
     probe_size: int = 512  # face probe is square; body probe is 2:3 portrait with the same pixel count
     probe_steps: int = 8
