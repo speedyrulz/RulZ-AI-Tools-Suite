@@ -48,7 +48,7 @@ def combine(face, body, face_weight: float, body_weight: float):
 # there is one), ceiling = the references' own self-similarity (replaced by the measured one when there are 2+ refs)
 FLOOR_DEFAULT = {"face": 20.0, "body": 80.0}
 CEILING_DEFAULT = {"face": 75.0, "body": 95.0}
-MIN_SPAN = {"face": 10.0, "body": 5.0}  # the ceiling stays at least this far above the floor
+MIN_SPAN = {"face": 10.0, "body": 8.0}  # the ceiling stays at least this far above the floor (raw points)
 NORM_MAX = 120.0  # beating the references' self-similarity still counts, up to here
 
 
@@ -145,11 +145,13 @@ class LikenessController:
         return normalize(value, *self.scale(kind))
 
     def _set_floors(self, face, body) -> None:
-        """The step-0 probe (the base model, no LoRA) is what a stranger scores: the floor of each scale, kept at
-        least MIN_SPAN below the ceiling so a base model that already resembles the references leaves room."""
+        """The step-0 probe (the base model, no LoRA) is what a stranger scores: the floor of each scale, so step 0
+        reads 0 by construction. A ceiling at or below it (a base model that already resembles the references, or
+        a body self-similarity dragged down by the references' varied poses) is raised to floor + MIN_SPAN by
+        scale(), never the floor lowered."""
         for kind, value in (("face", face), ("body", body)):
             if value is not None and self.floor[kind] is None:
-                self.floor[kind] = min(value, self.ceiling[kind] - MIN_SPAN[kind])
+                self.floor[kind] = float(value)
 
     def describe_scale(self) -> str:
         parts = []

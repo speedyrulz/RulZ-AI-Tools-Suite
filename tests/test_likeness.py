@@ -118,14 +118,19 @@ def test_normalization_defaults_floor_clamp_and_switch():
     c = L.LikenessController(_cfg(likeness_normalize=True))  # no step-0 probe, no reference self-similarity
     rec, _ = c.update(25, 20.0, 80.0)
     assert c.scale("face") == (20.0, 75.0) and c.scale("body") == (80.0, 95.0)
-    assert rec.face_norm == 0.0 and rec.body_norm == 0.0
-    # a base model that already resembles the references: the floor stays MIN_SPAN below the ceiling
-    c = L.LikenessController(_cfg(likeness_normalize=True), face_ceiling=60.0)
-    c.update(0, 58.0, None)
-    assert c.scale("face") == (50.0, 60.0)
-    assert "step-0 probe" in c.describe_scale() and "default" in c.describe_scale()
+    assert rec.face_norm == 0.0 and rec.body_norm == 0.0 and c.describe_scale().count("default") == 2
+    # the step-0 probe above the measured ceiling (a base model that already resembles the references, or a body
+    # self-similarity below what probes score): step 0 is still 0, the ceiling moves up to floor + MIN_SPAN
+    c = L.LikenessController(_cfg(likeness_normalize=True), face_ceiling=60.0, body_ceiling=85.0)
+    rec, _ = c.update(0, 58.0, 90.0)
+    assert c.scale("face") == (58.0, 68.0) and c.scale("body") == (90.0, 98.0)
+    assert rec.face_norm == 0.0 and rec.body_norm == 0.0 and rec.combined_ema == 0.0
+    rec, _ = c.update(10, 63.0, 94.0)
+    assert abs(rec.face_norm - 50.0) < 1e-9 and abs(rec.body_norm - 50.0) < 1e-9
+    assert c.describe_scale().count("step-0 probe") == 2
     # the switch off: the old raw behaviour
     c = L.LikenessController(_cfg())
     rec, _ = c.update(0, 15.0, 82.0)
     assert rec.combined_ema == 0.7 * 15.0 + 0.3 * 82.0 and rec.face_norm == 15.0 and rec.scale == {}
     assert "face_norm_ema" in c.state() and c.state()["normalize"] is False
+

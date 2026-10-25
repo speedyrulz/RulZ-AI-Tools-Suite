@@ -639,7 +639,8 @@ points, its body score ~10, so a 0.7 / 0.3 average is really ~93% face and "the 
 Each score is therefore mapped first onto one scale, 0 = what a stranger scores and 100 = what the references score
 against each other: the floor is the step-0 probe (the base model without the LoRA; `probe_at_start`) or a default
 (face 20, body 80), the ceiling the references' self-similarity when two or more are given, or a default (face 75,
-body 95), with scores above the ceiling counting up to 120. The combined score, the noise band, the curriculum gap,
+body 95), the ceiling raised to at least 10 face / 8 body points above the floor when the step-0 score is at or
+above it, with scores above the ceiling counting up to 120. The combined score, the noise band, the curriculum gap,
 the lr control, the best checkpoint, early stop and the race drops all use the normalized values; the log, the
 Monitor and `likeness.jsonl` show the raw face / body next to them (`face_norm`, `body_norm`, `scale`). Earlier runs'
 `likeness.jsonl` keep their raw combined scores.
