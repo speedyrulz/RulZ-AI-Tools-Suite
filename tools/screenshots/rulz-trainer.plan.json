@@ -1,0 +1,37 @@
+{
+  "port": 9341,
+  "match": "127.0.0.1:7899",
+  "width": 1600,
+  "height": 960,
+  "outDir": "R:/out/rulz-trainer",
+  "startWaitMs": 1500,
+  "shots": [
+    {
+      "name": "wizard-tab",
+      "js": "localStorage.setItem('rulz.tab', 'Wizard'); setTimeout(() => location.reload(), 50); 'reloading'",
+      "waitMs": 5000,
+      "check": "[...document.querySelectorAll('.q-tab')].map(t => t.textContent.trim() + (t.classList.contains('q-tab--active') ? '*' : '')).join(' | ')"
+    },
+    {
+      "name": "04-wizard-goal.png",
+      "js": "[...document.querySelectorAll('.q-tab')].find(t => t.textContent.includes('Wizard')).click(), 'ok'",
+      "waitMs": 1500
+    },
+    {
+      "name": "02-wizard-hardware.png",
+      "js": "(() => { const el = [...document.querySelectorAll('.q-stepper__tab *')].find(e => e.children.length === 0 && e.textContent.trim() === 'Hardware'); if (!el) return 'not found'; el.closest('.q-stepper__tab').click(); return 'ok' })()",
+      "waitMs": 2500
+    },
+    {
+      "name": "01-train-settings.png",
+      "js": "[...document.querySelectorAll('.q-tab')].find(t => t.textContent.includes('Train')).click(), 'ok'",
+      "waitMs": 2500
+    },
+    {
+      "name": "03-monitor.png",
+      "js": "[...document.querySelectorAll('.q-tab')].find(t => t.textContent.includes('Monitor')).click(), 'ok'",
+      "waitMs": 3000,
+      "check": "document.body.innerText.includes('no job yet') ? 'idle, no job' : 'JOB PRESENT?'"
+    }
+  ]
+}

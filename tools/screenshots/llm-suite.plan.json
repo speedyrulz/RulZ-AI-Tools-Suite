@@ -1,0 +1,43 @@
+{
+  "port": 9335,
+  "match": "index.html",
+  "width": 1600,
+  "height": 960,
+  "outDir": "R:/out/llm-suite",
+  "startWaitMs": 3000,
+  "shots": [
+    {
+      "name": "close-any-open-dialog",
+      "js": "(() => { const d = document.querySelector('[role=dialog]'); if (!d) return 'no dialog'; const b = [...d.querySelectorAll('button')].find(x => /close/i.test(x.getAttribute('aria-label') || '') || x.textContent.trim() === '×'); if (b) { b.click(); return 'closed via button' } document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); return 'sent Escape' })()",
+      "waitMs": 1000,
+      "check": "document.querySelector('[role=dialog]') ? 'DIALOG STILL OPEN' : 'no dialog'"
+    },
+    {
+      "name": "01-my-models.png",
+      "js": "document.querySelector('button[aria-label=\"My Models\"]').click(), 'ok'",
+      "waitMs": 2500,
+      "check": "document.querySelector('main, body').innerText.match(/\\d+ models[^\\n]*/)?.[0]"
+    },
+    {
+      "name": "03-developer-api.png",
+      "js": "document.querySelector('button[aria-label=\"Developer\"]').click(), 'ok'",
+      "waitMs": 1500
+    },
+    {
+      "name": "04-settings.png",
+      "js": "document.querySelector('button[aria-label=\"Settings\"]').click(), 'ok'",
+      "waitMs": 3000
+    },
+    {
+      "name": "go-to-chat",
+      "js": "document.querySelector('button[aria-label=\"Chat\"]').click(), 'ok'",
+      "waitMs": 1000,
+      "check": "document.body.innerText.includes('No chats yet') ? 'chat list is empty' : 'CHATS PRESENT'"
+    },
+    {
+      "name": "02-load-model.png",
+      "js": "[...document.querySelectorAll('button')].find(b => b.textContent.includes('Select a model to load')).click(), 'ok'",
+      "waitMs": 2000
+    }
+  ]
+}

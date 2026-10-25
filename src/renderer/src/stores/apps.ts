@@ -1,0 +1,122 @@
+import { toast } from 'sonner'
+import { create } from 'zustand'
+import type { AppView, JobState, RequirementStatus, Settings } from '@shared/types'
+import { errorMessage, invoke, on } from '../lib/api'
+
+const LOG_LIMIT = 3000
+const FINISHED = new Set(['done', 'error', 'cancelled'])
+let initialized = false
+
+export function isActive(job: JobState | null | undefined): job is JobState {
+  return !!job && !FINISHED.has(job.phase)
+}
+
+interface AppsState {
+  apps: AppView[]
+  loaded: boolean
+  refreshing: boolean
+  /** Latest job state per app, kept after a failure until dismissed. */
+  jobs: Record<string, JobState>
+  logs: Record<string, string[]>
+  requirements: RequirementStatus[]
+  settings: Settings | null
+  selectedId: string | null
+
+  init: () => Promise<void>
+  refresh: () => Promise<void>
+  checkRequirements: () => Promise<void>
+  select: (id: string | null) => void
+  dismissJob: (id: string) => void
+  updateSettings: (patch: Partial<Settings>) => Promise<void>
+}
+
+const ACTION_DONE: Record<JobState['action'], string> = {
+  install: 'installed',
+  update: 'updated',
+  repair: 'repaired',
+  uninstall: 'removed'
+}
+
+export const useApps = create<AppsState>((set, get) => ({
+  apps: [],
+  loaded: false,
+  refreshing: false,
+  jobs: {},
+  logs: {},
+  requirements: [],
+  settings: null,
+  selectedId: null,
+
+  init: async () => {
+    // StrictMode runs effects twice in development; subscribe only once.
+    if (initialized) return
+    initialized = true
+    on('apps:changed', (apps) => set({ apps }))
+    on('job:log', ({ appId, line, replace }) =>
+      set((s) => {
+        const prev = s.logs[appId] ?? []
+        const kept = replace ? prev.slice(0, -1) : prev
+        const next = kept.length >= LOG_LIMIT ? [...kept.slice(kept.length - LOG_LIMIT + 1), line] : [...kept, line]
+        return { logs: { ...s.logs, [appId]: next } }
+      })
+    )
+    on('job:update', (job) => {
+      const prev = get().jobs[job.appId]
+      // A new job starts with a fresh log.
+      if (!isActive(prev) && isActive(job)) set((s) => ({ logs: { ...s.logs, [job.appId]: [] } }))
+      set((s) => ({ jobs: { ...s.jobs, [job.appId]: job } }))
+      if (isActive(prev) || !prev) notify(job, get().apps.find((a) => a.app.id === job.appId)?.app.name ?? job.appId)
+      if (job.phase === 'done' || job.phase === 'cancelled') {
+        setTimeout(() => {
+          if (get().jobs[job.appId] === job) get().dismissJob(job.appId)
+        }, 2500)
+      }
+    })
+    const [apps, settings] = await Promise.all([invoke('apps:list'), invoke('settings:get')])
+    set({ apps, settings, loaded: true })
+    void get().checkRequirements()
+  },
+
+  refresh: async () => {
+    set({ refreshing: true })
+    try {
+      set({ apps: await invoke('apps:refresh') })
+    } catch (e) {
+      toast.error(errorMessage(e))
+    } finally {
+      set({ refreshing: false })
+    }
+    void get().checkRequirements()
+  },
+
+  checkRequirements: async () => {
+    set({ requirements: await invoke('requirements:check') })
+  },
+
+  select: (id) => set({ selectedId: id }),
+
+  dismissJob: (id) =>
+    set((s) => {
+      const jobs = { ...s.jobs }
+      delete jobs[id]
+      return { jobs }
+    }),
+
+  updateSettings: async (patch) => {
+    set({ settings: await invoke('settings:update', patch) })
+  }
+}))
+
+function notify(job: JobState, name: string): void {
+  if (job.phase === 'done') toast.success(`${name} ${ACTION_DONE[job.action]}`)
+  else if (job.phase === 'error') toast.error(`${name}: ${job.error ?? 'failed'}`)
+}
+
+/** Runs an IPC action and shows its error as a toast. */
+export async function act(fn: () => Promise<unknown>): Promise<void> {
+  try {
+    await fn()
+  } catch (e) {
+    toast.error(errorMessage(e))
+  }
+}

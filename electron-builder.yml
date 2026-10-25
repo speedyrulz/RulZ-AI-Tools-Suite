@@ -1,0 +1,26 @@
+appId: com.rulz.aitoolssuite
+productName: RulZ AI Tools Suite
+directories:
+  buildResources: build
+  output: dist
+files:
+  - out/**
+  - package.json
+  - '!**/*.map'
+extraResources:
+  - from: catalog
+    to: catalog
+win:
+  icon: build/icon.ico
+  target:
+    - target: nsis
+      arch: [x64]
+  artifactName: RulZ-AI-Tools-Suite-Setup-${version}.${ext}
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  shortcutName: RulZ AI Tools Suite
+  uninstallDisplayName: RulZ AI Tools Suite
+npmRebuild: false
