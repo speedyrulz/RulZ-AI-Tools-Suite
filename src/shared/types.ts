@@ -60,6 +60,8 @@ export interface AppSettings {
   /** Folder containing llama-server.exe (or the exe itself). Empty = auto-detect. */
   enginePath: string
   theme: Theme
+  /** False until the user picks a look in the first-run "Choose your look" dialog (or changes the theme). */
+  themeChosen: boolean
   unloadPreviousOnLoad: boolean
   defaultLoadConfig: LoadConfig
   defaultSampling: SamplingParams

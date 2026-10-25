@@ -42,6 +42,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   modelsDir: 'C:\\LLM',
   enginePath: '',
   theme: 'dark',
+  themeChosen: false,
   unloadPreviousOnLoad: true,
   defaultLoadConfig: DEFAULT_LOAD_CONFIG,
   defaultSampling: DEFAULT_SAMPLING,

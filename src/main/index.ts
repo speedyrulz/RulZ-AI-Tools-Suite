@@ -1,7 +1,7 @@
 import { join } from 'node:path'
-import { app, BrowserWindow, dialog, shell } from 'electron'
+import { app, BrowserWindow, dialog, nativeTheme, shell } from 'electron'
 import { META_TOOL_DEFS, toolCatalogNote } from '@shared/tools'
-import type { LoadConfig, ModelEntry } from '@shared/types'
+import type { LoadConfig, ModelEntry, Theme } from '@shared/types'
 import { ChatService } from './chat/service'
 import { ConversationStore } from './chat/conversations'
 import { EngineService } from './engine/engine'
@@ -21,7 +21,13 @@ if (!app.requestSingleInstanceLock()) app.quit()
 
 let mainWindow: BrowserWindow | null = null
 
-function createWindow(): BrowserWindow {
+/** Window background for a theme, so no wrong-coloured frame shows while the page loads or resizes. */
+function isDarkTheme(theme: Theme): boolean {
+  return theme === 'dark' || (theme === 'system' && nativeTheme.shouldUseDarkColors)
+}
+const windowBackground = (theme: Theme): string => (isDarkTheme(theme) ? '#000000' : '#ffffff')
+
+function createWindow(theme: Theme): BrowserWindow {
   const win = new BrowserWindow({
     width: 1440,
     height: 920,
@@ -29,7 +35,7 @@ function createWindow(): BrowserWindow {
     minHeight: 640,
     show: false,
     title: 'RulZ LLM Suite',
-    backgroundColor: '#000000',
+    backgroundColor: windowBackground(theme),
     autoHideMenuBar: true,
     // Packaged builds take the icon from the .exe; dev runs need it explicitly.
     ...(app.isPackaged ? {} : { icon: join(__dirname, '../../build/icon.png') }),
@@ -61,8 +67,10 @@ function createWindow(): BrowserWindow {
     }
   })
 
-  if (isDev) void win.loadURL(process.env.ELECTRON_RENDERER_URL!)
-  else void win.loadFile(join(__dirname, '../renderer/index.html'))
+  // The page applies this before its first paint; the saved settings take over once they load.
+  const look = isDarkTheme(theme) ? 'dark' : 'light'
+  if (isDev) void win.loadURL(`${process.env.ELECTRON_RENDERER_URL!}?theme=${look}`)
+  else void win.loadFile(join(__dirname, '../renderer/index.html'), { query: { theme: look } })
   return win
 }
 
@@ -140,6 +148,7 @@ async function main(): Promise<void> {
     const next = await settings.update(patch)
     if (next.modelsDir !== before.modelsDir) void library.scan()
     if (next.enginePath !== before.enginePath) void engine.getInfo(true)
+    if (next.theme !== before.theme) mainWindow?.setBackgroundColor(windowBackground(next.theme))
     return next
   })
   handle('dialog:pickFolder', async ({ title, defaultPath }) => {
@@ -219,7 +228,7 @@ async function main(): Promise<void> {
   handle('presets:delete', (id) => settings.deletePreset(id))
 
   // ---- Lifecycle ----
-  mainWindow = createWindow()
+  mainWindow = createWindow(settings.get().theme)
   hardware.start()
   void library.scan()
   void engine.getInfo()

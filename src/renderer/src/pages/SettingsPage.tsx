@@ -149,7 +149,7 @@ export function SettingsPage() {
 
         <Card title="Appearance">
           <Field inline label="Theme">
-            <Select className="w-36" value={settings.theme} onChange={(e) => void update({ theme: e.target.value as typeof settings.theme })}>
+            <Select className="w-36" value={settings.theme} onChange={(e) => void update({ theme: e.target.value as typeof settings.theme, themeChosen: true })}>
               <option value="dark">Dark</option>
               <option value="light">Light</option>
               <option value="system">System</option>

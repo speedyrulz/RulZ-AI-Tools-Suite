@@ -1,7 +1,7 @@
-import { ArrowUpFromLine, ChevronDown, Cpu, FileText, LoaderCircle } from 'lucide-react'
+import { ArrowUpFromLine, ChevronDown, Cpu, FileText, LoaderCircle, Moon, Sun } from 'lucide-react'
 import type { LoadedInstance } from '@shared/types'
 import { cn, formatBytes } from '../../lib/format'
-import { useApp } from '../../stores/app'
+import { isDarkTheme, useApp } from '../../stores/app'
 import { useModels } from '../../stores/models'
 import { IconButton, Kbd, ProgressBar, Tooltip } from '../ui'
 
@@ -36,7 +36,19 @@ export function TopBar() {
         </div>
       </div>
       <HardwareMeters />
+      <ThemeToggle />
     </header>
+  )
+}
+
+function ThemeToggle() {
+  const theme = useApp((s) => s.settings?.theme ?? 'dark')
+  const setTheme = useApp((s) => s.setTheme)
+  const dark = isDarkTheme(theme)
+  return (
+    <IconButton label={dark ? 'Switch to light mode' : 'Switch to dark mode'} onClick={() => void setTheme(dark ? 'light' : 'dark')}>
+      {dark ? <Sun size={17} /> : <Moon size={17} />}
+    </IconButton>
   )
 }
 
@@ -109,7 +121,7 @@ function Meter({ label, title, used, total, icon }: { label: string; title?: str
             {formatBytes(used)} / {formatBytes(total, 0)}
           </span>
         </div>
-        <div className="h-1 overflow-hidden rounded-full bg-hover">
+        <div className="h-1 overflow-hidden rounded-full bg-track">
           <div
             className={cn('h-full rounded-full', frac > 0.92 ? 'bg-danger' : frac > 0.75 ? 'bg-warn' : 'bg-accent')}
             style={{ width: `${Math.round(frac * 100)}%` }}

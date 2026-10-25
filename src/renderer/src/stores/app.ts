@@ -22,6 +22,8 @@ interface AppState {
   showLog: (instanceId: string | null) => void
   init: () => Promise<void>
   updateSettings: (patch: Partial<AppSettings>) => Promise<void>
+  /** Saves a theme as the user's choice (also ends the first-run prompt). */
+  setTheme: (theme: AppSettings['theme']) => Promise<void>
   refreshEngine: () => Promise<void>
 }
 
@@ -57,6 +59,11 @@ export const useApp = create<AppState>((set, get) => ({
     }
   },
 
+  setTheme: async (theme) => {
+    applyTheme(theme)
+    await get().updateSettings({ theme, themeChosen: true })
+  },
+
   refreshEngine: async () => {
     set({ engineChecking: true })
     try {
@@ -69,9 +76,12 @@ export const useApp = create<AppState>((set, get) => ({
 
 const media = window.matchMedia('(prefers-color-scheme: dark)')
 
+export function isDarkTheme(theme: AppSettings['theme']): boolean {
+  return theme === 'dark' || (theme === 'system' && media.matches)
+}
+
 export function applyTheme(theme: AppSettings['theme']): void {
-  const dark = theme === 'dark' || (theme === 'system' && media.matches)
-  document.documentElement.classList.toggle('dark', dark)
+  document.documentElement.classList.toggle('dark', isDarkTheme(theme))
 }
 
 media.addEventListener('change', () => {

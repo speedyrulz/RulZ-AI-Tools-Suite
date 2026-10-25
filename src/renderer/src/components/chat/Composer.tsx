@@ -139,7 +139,7 @@ export const Composer = forwardRef<ComposerHandle>(function Composer(_props, ref
               label="Send (Enter)"
               onClick={submit}
               disabled={!canSend}
-              className="bg-accent text-accent-fg hover:bg-accent hover:text-accent-fg hover:brightness-110"
+              className="bg-accent text-accent-fg hover:bg-accent-hover hover:text-accent-fg"
             >
               {autoLoading ? <LoaderCircle size={16} className="animate-spin" /> : <ArrowUp size={17} />}
             </IconButton>

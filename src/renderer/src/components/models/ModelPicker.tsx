@@ -18,7 +18,7 @@ export function ModelPicker() {
   return (
     <DialogPrimitive.Root open={open} onOpenChange={(o) => !o && close()}>
       <DialogPrimitive.Portal>
-        <DialogPrimitive.Overlay className="fixed inset-0 z-40 bg-black/50 backdrop-blur-[2px]" />
+        <DialogPrimitive.Overlay className="fixed inset-0 z-40 bg-black/30 dark:bg-black/50 backdrop-blur-[2px]" />
         <DialogPrimitive.Content className="fixed top-[6vh] left-1/2 z-50 flex h-[84vh] w-[min(1060px,calc(100vw-32px))] -translate-x-1/2 overflow-hidden rounded-xl border border-border bg-panel shadow-2xl focus:outline-none">
           <DialogPrimitive.Title className="sr-only">Load a model</DialogPrimitive.Title>
           <DialogPrimitive.Description className="sr-only">Choose a model and its load settings</DialogPrimitive.Description>

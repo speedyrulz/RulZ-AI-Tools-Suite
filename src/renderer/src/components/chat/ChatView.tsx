@@ -179,7 +179,7 @@ function ContextMeter() {
   return (
     <Tooltip content={`${used.toLocaleString()} of ${ctx.toLocaleString()} context tokens used`}>
       <div className="flex items-center gap-2 text-[11px] text-muted tabular-nums">
-        <div className="h-1.5 w-24 overflow-hidden rounded-full bg-hover">
+        <div className="h-1.5 w-24 overflow-hidden rounded-full bg-track">
           <div className={cn('h-full rounded-full', frac > 0.9 ? 'bg-danger' : frac > 0.7 ? 'bg-warn' : 'bg-accent')} style={{ width: `${frac * 100}%` }} />
         </div>
         {tokenCount === null ? '—' : formatCompact(used)} / {formatTokens(ctx)}
@@ -208,7 +208,7 @@ function EmptyState() {
         </div>
       </div>
       {!activeModelId && (
-        <button className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-accent-fg hover:brightness-110" onClick={() => openPicker()}>
+        <button className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-accent-fg hover:bg-accent-hover" onClick={() => openPicker()}>
           Load a model <span className="opacity-70">(Ctrl+L)</span>
         </button>
       )}

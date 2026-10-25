@@ -1,7 +1,7 @@
 {
   "name": "rulz-llm-suite",
   "productName": "RulZ LLM Suite",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Run local LLMs with llama.cpp: model library, model loading and chat.",
   "main": "./out/main/index.js",
   "author": "RulZ",

@@ -3,6 +3,7 @@ import { Toaster } from 'sonner'
 import { TooltipProvider } from './components/ui'
 import { NavRail } from './components/shell/NavRail'
 import { TopBar } from './components/shell/TopBar'
+import { ThemeChooser } from './components/shell/ThemeChooser'
 import { ModelPicker } from './components/models/ModelPicker'
 import { LogDialog } from './components/models/LogDialog'
 import { ChatPage } from './pages/ChatPage'
@@ -61,6 +62,7 @@ export function App() {
       </div>
       <ModelPicker />
       <LogDialog />
+      <ThemeChooser />
       <Toaster
         theme={theme === 'light' ? 'light' : theme === 'system' ? 'system' : 'dark'}
         position="bottom-right"

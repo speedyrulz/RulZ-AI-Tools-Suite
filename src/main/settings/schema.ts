@@ -50,6 +50,7 @@ export const settingsSchema = z.object({
   modelsDir: z.string().catch(D.modelsDir),
   enginePath: z.string().catch(D.enginePath),
   theme: z.enum(['dark', 'light', 'system']).catch(D.theme),
+  themeChosen: z.boolean().catch(D.themeChosen),
   unloadPreviousOnLoad: z.boolean().catch(D.unloadPreviousOnLoad),
   defaultLoadConfig: loadConfigSchema.catch(D.defaultLoadConfig),
   defaultSampling: samplingSchema.catch(D.defaultSampling),

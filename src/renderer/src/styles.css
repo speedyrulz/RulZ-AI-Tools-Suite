@@ -4,21 +4,25 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 :root {
-  --bg: #f6f7f9;
-  --panel: #ffffff;
-  --panel-2: #eef0f3;
-  --hover: #e6e9ee;
-  --border: #dde1e7;
-  --text: #15181e;
-  --muted: #5f6775;
-  --faint: #959cab;
-  --accent: #d90f1f;
-  --accent-soft: #fde2e4;
+  /* Light: white window, black text, the RulZ red accent. */
+  --bg: #ffffff;
+  --panel: #f5f5f7;
+  --panel-2: #efeff2;
+  --hover: #e6e6eb;
+  --border: #d9d9de;
+  --track: #d9d9de;
+  --scroll: #c4c4cb;
+  --text: #111114;
+  --muted: #5f6068;
+  --faint: #8b8c95;
+  --accent: #ed000d;
+  --accent-hover: #c8000b;
+  --accent-soft: #fde3e4;
   --accent-fg: #ffffff;
-  --danger: #dc2626;
+  --danger: #d1001c;
   --warn: #c2410c;
   --ok: #15803d;
-  --code-bg: #f3f4f6;
+  --code-bg: #f7f7f9;
   color-scheme: light;
 }
 
@@ -28,10 +32,13 @@
   --panel-2: #141414;
   --hover: #1f1f1f;
   --border: #262626;
+  --track: #1f1f1f;
+  --scroll: #2a2a2a;
   --text: #ededed;
   --muted: #a3a3a3;
   --faint: #6b6b6b;
   --accent: #ef2b2b;
+  --accent-hover: #ff4646;
   --accent-soft: #3a0a0d;
   --accent-fg: #ffffff;
   --danger: #ff6b6b;
@@ -51,6 +58,8 @@
   --color-muted: var(--muted);
   --color-faint: var(--faint);
   --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-track: var(--track);
   --color-accent-soft: var(--accent-soft);
   --color-accent-fg: var(--accent-fg);
   --color-danger: var(--danger);
@@ -83,7 +92,7 @@ body {
 
 * {
   scrollbar-width: thin;
-  scrollbar-color: var(--hover) transparent;
+  scrollbar-color: var(--scroll) transparent;
 }
 
 button,
@@ -91,7 +100,16 @@ input,
 textarea,
 select {
   font: inherit;
-  color: inherit;
+}
+
+/* Colour reset in the base layer, so utilities such as text-accent-fg on buttons still apply. */
+@layer base {
+  button,
+  input,
+  textarea,
+  select {
+    color: inherit;
+  }
 }
 
 /* In the base layer so utilities like focus-visible:outline-none can override it. */

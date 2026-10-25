@@ -10,7 +10,7 @@ import { cn } from '../lib/format'
 type Variant = 'primary' | 'secondary' | 'ghost' | 'danger'
 
 const VARIANTS: Record<Variant, string> = {
-  primary: 'bg-accent text-accent-fg hover:brightness-110 font-medium',
+  primary: 'bg-accent text-accent-fg hover:bg-accent-hover font-medium',
   secondary: 'bg-panel-2 border border-border hover:bg-hover',
   ghost: 'hover:bg-hover text-muted hover:text-text',
   danger: 'bg-danger/90 text-white hover:bg-danger font-medium'
@@ -119,7 +119,7 @@ export function Switch({
       checked={checked}
       onCheckedChange={onCheckedChange}
       disabled={disabled}
-      className="relative h-5 w-9 shrink-0 rounded-full bg-hover transition-colors data-[state=checked]:bg-accent disabled:opacity-40"
+      className="relative h-5 w-9 shrink-0 rounded-full bg-track transition-colors data-[state=checked]:bg-accent disabled:opacity-40"
     >
       <SwitchPrimitive.Thumb className="block size-4 translate-x-0.5 rounded-full bg-white shadow transition-transform data-[state=checked]:translate-x-[18px]" />
     </SwitchPrimitive.Root>
@@ -151,7 +151,7 @@ export function Slider({
       disabled={disabled}
       onValueChange={(v) => onChange(v[0])}
     >
-      <SliderPrimitive.Track className="relative h-1 grow rounded-full bg-hover">
+      <SliderPrimitive.Track className="relative h-1 grow rounded-full bg-track">
         <SliderPrimitive.Range className="absolute h-full rounded-full bg-accent" />
       </SliderPrimitive.Track>
       <SliderPrimitive.Thumb className="block size-3.5 rounded-full border-2 border-accent bg-panel shadow focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50" />
@@ -185,7 +185,8 @@ export function Dialog({
   description,
   children,
   className,
-  footer
+  footer,
+  keepOnFocusOutside
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -194,17 +195,20 @@ export function Dialog({
   children?: ReactNode
   className?: string
   footer?: ReactNode
+  /** Don't close when something else on the page takes focus (e.g. a field that autofocuses after startup). */
+  keepOnFocusOutside?: boolean
 }) {
   return (
     <DialogPrimitive.Root open={open} onOpenChange={onOpenChange}>
       <DialogPrimitive.Portal>
-        <DialogPrimitive.Overlay className="fixed inset-0 z-40 bg-black/50 backdrop-blur-[2px]" />
+        <DialogPrimitive.Overlay className="fixed inset-0 z-40 bg-black/30 dark:bg-black/50 backdrop-blur-[2px]" />
         <DialogPrimitive.Content
           className={cn(
             'fixed top-1/2 left-1/2 z-50 flex max-h-[88vh] w-[min(560px,calc(100vw-32px))] -translate-x-1/2 -translate-y-1/2 flex-col rounded-xl border border-border bg-panel shadow-2xl focus:outline-none',
             className
           )}
           aria-describedby={description ? undefined : undefined}
+          onFocusOutside={keepOnFocusOutside ? (e) => e.preventDefault() : undefined}
         >
           <div className="flex items-start justify-between gap-4 border-b border-border px-5 py-3.5">
             <div>
@@ -286,7 +290,7 @@ export function Badge({ children, tone = 'neutral', className }: { children: Rea
 
 export function ProgressBar({ value, className }: { value: number; className?: string }) {
   return (
-    <div className={cn('h-1 overflow-hidden rounded-full bg-hover', className)}>
+    <div className={cn('h-1 overflow-hidden rounded-full bg-track', className)}>
       <div className="h-full rounded-full bg-accent transition-[width] duration-200" style={{ width: `${Math.round(Math.min(1, Math.max(0, value)) * 100)}%` }} />
     </div>
   )
