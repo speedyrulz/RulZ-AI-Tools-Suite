@@ -14,6 +14,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from ..attention import sdpa
+from ..compiling import thread_prepare
 
 
 def _wdtype(m: nn.Module) -> torch.dtype:
@@ -181,6 +182,7 @@ class MOSSImageTransformer(nn.Module):
         return cls(**{k: config[k] for k in cls.CONFIG_KEYS if k in config})
 
     def _run_layer(self, layer, x, rope, mod):
+        thread_prepare()  # dynamo's limits in this thread (autograd recompute, data-parallel workers)
         if (self.gradient_checkpointing and self.training and torch.is_grad_enabled()
                 and not getattr(layer, "keep_activations", False)):  # see rulztrainer.checkpointing
             return checkpoint(layer, x, rope, mod, use_reentrant=False)

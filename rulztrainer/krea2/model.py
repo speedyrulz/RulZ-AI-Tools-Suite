@@ -29,6 +29,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from ..attention import sdpa
+from ..compiling import thread_prepare
 
 NORM_NAMES = ("norm", "norm1", "norm2", "norm_q", "norm_k")  # modules kept in fp32 (diffusers' _keep_in_fp32_modules)
 
@@ -272,6 +273,7 @@ class Krea2Transformer(nn.Module):
         return cls(**{k: config[k] for k in cls.CONFIG_KEYS if k in config})
 
     def _run(self, block, *args):
+        thread_prepare()  # dynamo's limits in this thread (autograd recompute, data-parallel workers)
         if (self.gradient_checkpointing and self.training and torch.is_grad_enabled()
                 and not getattr(block, "keep_activations", False)):  # see rulztrainer.checkpointing
             return checkpoint(block, *args, use_reentrant=False)

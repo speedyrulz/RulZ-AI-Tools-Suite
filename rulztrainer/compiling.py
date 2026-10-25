@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 
 import torch
 
@@ -41,22 +42,48 @@ def decide(setting, remaining_steps: int, devices) -> tuple[bool, str]:
     return True, f"compile_model auto: {remaining_steps} steps to go"
 
 
+_settings: dict = {}  # the dynamo config values prepare() chose, re-applied per thread by thread_prepare()
+_thread = threading.local()
+
+
+def _apply(cfg) -> None:
+    for name, value in _settings.items():
+        if hasattr(cfg, name):
+            setattr(cfg, name, value)
+
+
+def thread_prepare() -> None:
+    """Apply prepare()'s dynamo settings in the calling thread, once per thread. torch's dynamo config is thread-local
+    (torch 2.12+): a limit raised in the main thread is still 8 in the autograd thread that recomputes checkpointed
+    blocks and in the data-parallel worker threads, where dynamo would then run the blocks eagerly after 8 shapes
+    without saying so. Cheap: one attribute check after the first call in a thread."""
+    if not _settings or getattr(_thread, "done", False):
+        return
+    import torch._dynamo as dynamo
+
+    _apply(dynamo.config)
+    _thread.done = True
+
+
 def prepare(fall_back: bool = False) -> None:
     """Dynamo settings for compiling the blocks; call once before the first compile. fall_back (compile_model: auto):
-    a frame that fails to compile runs eagerly instead of stopping the run."""
+    a frame that fails to compile runs eagerly instead of stopping the run. The settings are kept for thread_prepare(),
+    which the models call before running a block, so every thread that runs one gets them."""
     import torch._dynamo as dynamo
 
     cfg = dynamo.config
     if fall_back:
-        cfg.suppress_errors = True
+        _settings["suppress_errors"] = True
     # Python float attributes (LoRA scale / multiplier) would otherwise be traced as 0-d CPU tensors, and the CPU ops
     # on them make Inductor emit C++ that needs MSVC on Windows ("InvalidCxxCompiler: cl is not found")
-    cfg.specialize_float = True
+    _settings["specialize_float"] = True
     for name, floor in LIMITS.items():
         if hasattr(cfg, name):
-            setattr(cfg, name, max(int(getattr(cfg, name)), floor))
+            _settings[name] = max(int(getattr(cfg, name)), floor)
     if os.environ.get("RULZ_COMPILE_NESTED") == "1" and hasattr(cfg, "nested_graph_breaks"):
-        cfg.nested_graph_breaks = True
+        _settings["nested_graph_breaks"] = True
+    _apply(cfg)
+    _thread.done = True
     dyn_log = logging.getLogger("torch._dynamo")
     for h in log.handlers:
         if h not in dyn_log.handlers:
