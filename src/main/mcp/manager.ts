@@ -105,7 +105,7 @@ export class McpManager {
     }
 
     try {
-      const client = new Client({ name: 'RulZ LLM Suite', version: '0.1.0' })
+      const client = new Client({ name: 'RulZ LLM Suite', version: '0.2.0' })
       if (cfg.url) {
         const transport = new StreamableHTTPClientTransport(new URL(cfg.url), {
           requestInit: cfg.headers ? { headers: cfg.headers } : undefined
