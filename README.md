@@ -126,6 +126,11 @@ Datasets: upload on the WebUI's Dataset tab (drag and drop images + `.txt` capti
 `/workspace/RulzTrainer/output/<job>/`; download them from Jupyter before destroying the instance (the disk is gone
 with it; stopping keeps it). `models/` on the instance disk caches the downloaded base model between runs.
 
+Every path field's Browse button opens a browser of the instance's own disk inside the page (folders, and files of
+the field's type with their sizes; shortcuts to RulzTrainer's `models` / `datasets` / `output`, `/workspace`, home and
+a ComfyUI `models` folder when there is one), so single model files, the dataset and the config are picked instead of
+typed. The same browser opens for any viewer that is not at the machine's own desktop; there the system dialog opens.
+
 **Auto-download your own model files from a Hugging Face Storage Bucket.** Add
 `RULZ_MODEL_BUCKET=speedyrulz/MOSS-Image-bucket` to the template's environment variables (web editor: Environment
 Variables; CLI: `MODEL_BUCKET=speedyrulz/MOSS-Image-bucket bash scripts/vast/create_template.sh`). After the

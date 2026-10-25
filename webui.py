@@ -143,7 +143,7 @@ def _relative(path: str) -> str:
 
 
 # native pick dialogs need a desktop: always on Windows/macOS, only with a display on Linux (not on a headless
-# server such as a vast.ai instance, where paths are typed or come from the Dataset tab's uploader)
+# server such as a vast.ai instance, where Browse opens the in-page browser of the server's files, server_pick)
 HAS_DISPLAY = sys.platform in ("win32", "darwin") or bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 # ...and a viewer sitting at that desktop: a dialog opened for a remote browser (Tailscale, LAN) would pop up on the
 # server's screen. Set per page load by build_page.
@@ -194,6 +194,164 @@ def tk_dialog(kind: str, initial: str = "", filetypes=None) -> str:
         return filedialog.askopenfilename(initialdir=init, filetypes=filetypes or SAFETENSORS, parent=root) or ""
     finally:
         root.destroy()
+
+
+# ---------------------------------------------------------------- in-page browser of the server's files
+
+BROWSE_LIMIT = 2000  # entries listed per folder
+BROWSE_TIP = {True: "Browse", False: "Browse the server's files"}  # by whether the native dialog is used
+
+
+def file_suffixes(filetypes=None) -> set[str] | None:
+    """The suffixes of a tk filetypes list's first (default) entry: {".safetensors"}; None for any file."""
+    spec = (filetypes or SAFETENSORS)[0][1]
+    pats = [p.strip() for p in spec.split(";") if p.strip()]
+    if not pats or any(p in ("*", "*.*") for p in pats):
+        return None
+    return {p.lstrip("*").lower() for p in pats}
+
+
+def list_folder(folder: Path, suffixes: set[str] | None, kind: str = "file", show_hidden: bool = False):
+    """(folders, files, error) of a server folder, sorted by name: files only when picking a file, filtered by
+    suffix (None = all). Folders that cannot be read give an error, not an exception."""
+    dirs, files = [], []
+    try:
+        with os.scandir(folder) as it:
+            for e in it:
+                if not show_hidden and e.name.startswith("."):
+                    continue
+                try:
+                    if e.is_dir():
+                        dirs.append(Path(e.path))
+                    elif (kind == "file" and e.is_file()
+                          and (suffixes is None or Path(e.name).suffix.lower() in suffixes)):
+                        files.append((Path(e.path), e.stat().st_size))
+                except OSError:
+                    continue
+    except OSError as e:
+        return [], [], f"{type(e).__name__}: {e.strerror or e}"
+    dirs.sort(key=lambda p: p.name.casefold())
+    files.sort(key=lambda t: t[0].name.casefold())
+    return dirs[:BROWSE_LIMIT], files[:BROWSE_LIMIT], ""
+
+
+def browse_shortcuts() -> list[tuple[str, Path]]:
+    """Folders worth one click: the project and its models / datasets / output, the vast.ai workspace, home, a
+    ComfyUI models folder, and the drives (Windows) or / (Linux). Only existing ones, each once."""
+    workspace = Path(os.environ.get("WORKSPACE") or "/workspace")
+    cands = [("RulzTrainer", ROOT), ("models", ROOT / "models"), ("datasets", ROOT / "datasets"),
+             ("output", ROOT / "output"), ("workspace", workspace), ("home", Path.home())]
+    cands += [("ComfyUI models", base / "ComfyUI" / "models") for base in (workspace, Path.home(), ROOT.parent)]
+    if sys.platform == "win32":
+        cands += [(f"{d}:", Path(f"{d}:\\")) for d in "CDEFGHIJ" if Path(f"{d}:\\").exists()]
+    else:
+        cands.append(("/", Path("/")))
+    out, seen = [], set()
+    for name, p in cands:
+        try:
+            key = p.resolve()
+        except OSError:
+            continue
+        if p.is_dir() and key not in seen:
+            seen.add(key)
+            out.append((name, p))
+    return out
+
+
+def _human_size(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+async def server_pick(kind: str, initial: str = "", filetypes=None) -> str:
+    """Pick a file or folder on the server from the page itself (for a remote browser, such as a vast.ai instance,
+    where a native dialog would open on the server's screen, or on none). Returns "" when cancelled."""
+    suffixes = file_suffixes(filetypes)
+    start = Path(dialog_start_dir(initial))
+    state = {"dir": start, "picked": None, "all": False}
+    with ui.dialog() as dlg, ui.card().classes("w-[52rem] max-w-full"):
+        ui.label("Choose a folder on the server" if kind == "dir" else "Choose a file on the server") \
+            .classes("text-base font-medium")
+        with ui.row().classes("w-full items-center gap-1 no-wrap"):
+            ui.button(icon="arrow_upward", on_click=lambda: go(state["dir"].parent)).props("flat dense round") \
+                .tooltip("Up one folder")
+            where = ui.input("Folder").classes("flex-grow min-w-0").props("dense")
+            where.on("keydown.enter", lambda: go(Path(where.value.strip() or "/").expanduser()))
+        with ui.row().classes("w-full gap-1"):
+            for name, path in browse_shortcuts():
+                ui.button(name, on_click=lambda p=path: go(p)).props("flat dense no-caps size=sm")
+        listing = ui.column().classes("w-full gap-0 overflow-auto").style("height: 50vh")
+        with ui.row().classes("w-full items-center justify-between no-wrap"):
+            chosen = ui.label("").classes("rz-hint truncate min-w-0")
+            with ui.row().classes("items-center gap-1 no-wrap"):
+                if kind == "file" and suffixes is not None:
+                    ui.switch("All files", on_change=lambda e: (state.update(all=e.value), go(state["dir"])))
+                ui.button("Cancel", on_click=lambda: dlg.submit("")).props("flat")
+                ok = ui.button("Select this folder" if kind == "dir" else "Select", on_click=lambda: finish()) \
+                    .props("unelevated")
+
+    def finish():
+        if kind == "dir":
+            dlg.submit(str(state["dir"]))
+        elif state["picked"] is not None:
+            dlg.submit(str(state["picked"]))
+
+    def pick(path: Path):
+        state["picked"] = path
+        chosen.text = str(path)
+        ok.enable()
+
+    def go(folder: Path):
+        if not folder.is_dir():
+            ui.notify(f"Not a folder: {folder}", type="warning")
+            return
+        state["dir"], state["picked"] = folder, None
+        where.value = str(folder)
+        chosen.text = str(folder) if kind == "dir" else "No file selected"
+        if kind == "file":
+            ok.disable()
+        dirs, files, error = list_folder(folder, None if state["all"] else suffixes, kind)
+        listing.clear()
+        with listing:
+            if error:
+                ui.label(error).classes("rz-hint")
+            for d in dirs:
+                with ui.item(on_click=lambda p=d: go(p)).props("dense clickable").classes("w-full"):
+                    with ui.item_section().props("avatar"):
+                        ui.icon("folder")
+                    ui.item_section(d.name)
+            for p, size in files:
+                with ui.item(on_click=lambda p=p: pick(p)).props("dense clickable").classes("w-full") as row:
+                    with ui.item_section().props("avatar"):
+                        ui.icon("description")
+                    ui.item_section(p.name)
+                    with ui.item_section().props("side"):
+                        ui.label(_human_size(size)).classes("rz-hint")
+                row.on("dblclick", lambda p=p: (pick(p), finish()))
+            if not dirs and not files and not error:
+                ui.label("Empty folder" if kind == "dir" or state["all"] or suffixes is None
+                         else f"No {', '.join(sorted(suffixes))} files here").classes("rz-hint")
+            if len(dirs) == BROWSE_LIMIT or len(files) == BROWSE_LIMIT:
+                ui.label(f"Only the first {BROWSE_LIMIT} entries are listed").classes("rz-hint")
+
+    go(start)
+    result = await dlg
+    dlg.delete()
+    return result or ""
+
+
+async def pick_path(kind: str, initial: str = "", filetypes=None, native: bool = False) -> str:
+    """A Browse button's pick: the native dialog for a viewer at this machine's desktop (native), else the in-page
+    browser of the server's files. "" when nothing was picked."""
+    if native:
+        try:
+            return await run.io_bound(tk_dialog, kind, initial, filetypes)
+        except Exception:  # noqa: BLE001  (no tkinter, no display): the in-page browser instead
+            pass
+    return await server_pick(kind, initial, filetypes)
 
 
 def start_training(cfg: TrainConfig) -> str:
@@ -935,24 +1093,21 @@ def _line(name: str, color: str, **kw) -> dict:
 
 
 def path_field(label: str, kind: str, value: str = "", width: str = "w-96", filetypes=None):
-    """Text input with a Browse button that opens a native dialog (no button on a headless server).
-    width "w-full" makes the input fill its container."""
+    """Text input with a Browse button: a native dialog for a viewer at this machine's desktop, the in-page browser of
+    the server's files otherwise (a vast.ai instance, a remote browser). width "w-full" makes the input fill its
+    container."""
     full = width == "w-full"
+    native = _native_dialogs  # this page's viewer, read while the page is built
     with ui.row().classes("items-center gap-1 no-wrap max-w-full" + (" w-full" if full else "")):
         inp = ui.input(label, value=value).classes("flex-grow min-w-0" if full else f"{width} min-w-0")
 
         async def browse():
-            try:
-                picked = await run.io_bound(tk_dialog, kind, inp.value or "", filetypes)
-            except Exception as e:  # noqa: BLE001  (no tkinter, no display)
-                ui.notify(f"No file dialog available here ({type(e).__name__}); type the path instead", type="warning")
-                return
+            picked = await pick_path(kind, inp.value or "", filetypes, native)
             if picked:
                 inp.value = _relative(picked)
 
-        if _native_dialogs:
-            ui.button(icon="folder_open" if kind == "dir" else "description", on_click=browse) \
-                .props("flat dense round").tooltip("Browse")
+        ui.button(icon="folder_open" if kind == "dir" else "description", on_click=browse) \
+            .props("flat dense round").tooltip(BROWSE_TIP[native])
     return inp
 
 
@@ -1044,14 +1199,15 @@ def build_dataset_tab(f: Form):
             folder = ui.input("Dataset folder", value=f.w["dataset_dir"].value).classes("w-96 max-w-full")
             folder.bind_value(f.w["dataset_dir"], "value")  # keep in sync with the Train tab
 
+            native = _native_dialogs
+
             async def browse():
-                picked = await run.io_bound(tk_dialog, "dir", folder.value or "")
+                picked = await pick_path("dir", folder.value or "", native=native)
                 if picked:
                     folder.value = _relative(picked)
                     await refresh()
 
-            if _native_dialogs:
-                ui.button(icon="folder_open", on_click=browse).props("flat dense round").tooltip("Browse")
+            ui.button(icon="folder_open", on_click=browse).props("flat dense round").tooltip(BROWSE_TIP[native])
             ui.button("Load / refresh", icon="refresh", on_click=lambda: refresh()).props("unelevated")
             spinner = ui.spinner(size="sm")
             spinner.visible = False
@@ -1164,14 +1320,15 @@ def build_samples_tab(f: Form):
         with fields():
             folder = ui.input("Job folder (output/<job>)", value="").classes("w-96 max-w-full")
 
+            native = _native_dialogs
+
             async def browse():
-                picked = await run.io_bound(tk_dialog, "dir", folder.value or str(ROOT / "output"))
+                picked = await pick_path("dir", folder.value or str(ROOT / "output"), native=native)
                 if picked:
                     folder.value = _relative(picked)
                     state["files"] = []
 
-            if _native_dialogs:
-                ui.button(icon="folder_open", on_click=browse).props("flat dense round").tooltip("Browse")
+            ui.button(icon="folder_open", on_click=browse).props("flat dense round").tooltip(BROWSE_TIP[native])
             follow = ui.switch("Follow current job", value=True)
             columns = ui.select([2, 3, 4, 6], value=4, label="Columns").classes("w-28")
             info = ui.label("").classes("rz-hint")
@@ -2238,12 +2395,13 @@ def build_page(local: bool = True):
                                 if not start or not (ROOT / start if not Path(start).is_absolute() else Path(start)).is_file():
                                     (ROOT / "configs").mkdir(exist_ok=True)
                                     start = str(ROOT / "configs")  # the configs folder unless the box names an existing file
-                                picked = await run.io_bound(tk_dialog, "file", start, [("YAML", "*.yaml;*.yml")])
+                                picked = await pick_path("file", start, [("YAML", "*.yaml;*.yml")], native_cfg)
                                 if picked:
                                     cfg_path.value = _relative(picked)
 
-                            if _native_dialogs:
-                                ui.button(icon="description", on_click=browse_cfg).props("flat dense round").tooltip("Browse")
+                            native_cfg = _native_dialogs
+                            ui.button(icon="description", on_click=browse_cfg).props("flat dense round") \
+                                .tooltip(BROWSE_TIP[native_cfg])
                             ui.button("Load", icon="file_open", on_click=on_load).props("flat")
                             ui.button("Save", icon="save", on_click=on_save).props("flat")
 
