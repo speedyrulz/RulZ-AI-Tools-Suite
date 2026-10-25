@@ -99,3 +99,10 @@ set RULZ_TOURNAMENT_DATA=D:\Portable\TournamentData
 ## Supported formats
 
 JPEG, PNG, BMP, GIF (first frame), TIFF, WebP, ICO, and JPEG XR. HEIC/HEIF and AVIF also work when the matching Windows codec extensions are installed. Camera rotation (EXIF orientation) is applied automatically.
+
+## License
+
+Open source under the [MIT License](LICENSE).
+
+The RulZ name and logo are excluded from the MIT License; all rights reserved. If you fork or redistribute this
+project, remove or replace the RulZ branding. See [LOGO-NOTICE.md](LOGO-NOTICE.md).

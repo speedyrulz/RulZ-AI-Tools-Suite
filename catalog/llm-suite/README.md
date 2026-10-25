@@ -77,3 +77,10 @@ npm run build:win    # installer → dist/RulZ-LLM-Suite-Setup-<version>.exe
 ```
 
 App data (settings, chats, presets, metadata cache) lives in `%APPDATA%\RulZ LLM Suite`.
+
+## License
+
+Open source under the [MIT License](LICENSE).
+
+The RulZ name and logo are excluded from the MIT License; all rights reserved. If you fork or redistribute this
+project, remove or replace the RulZ branding. See [LOGO-NOTICE.md](LOGO-NOTICE.md).

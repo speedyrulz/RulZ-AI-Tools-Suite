@@ -108,4 +108,7 @@ The launcher shows the README from GitHub when it can, and the copy in `catalog/
 
 ## License
 
-The source code is released under the MIT License. The RulZ name and logo are not covered by it; all rights reserved.
+Open source under the [MIT License](LICENSE). Each app in `apps/` is MIT-licensed in its own repository too.
+
+The RulZ name and logo are excluded from the MIT License; all rights reserved. If you fork or redistribute this
+project, remove or replace the RulZ branding. See [LOGO-NOTICE.md](LOGO-NOTICE.md).

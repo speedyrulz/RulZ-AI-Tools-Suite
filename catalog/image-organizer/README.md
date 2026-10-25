@@ -106,3 +106,10 @@ model from the [ONNX Model Zoo](https://github.com/onnx/models); see [models/REA
 for their licenses. Libraries created before
 expressions or poses were added are analyzed once in the background on the next scan; people assignments
 are kept.
+
+## License
+
+Open source under the [MIT License](LICENSE). The face, expression and pose models in `models/` keep their own licenses; see [models/README.md](models/README.md).
+
+The RulZ name and logo are excluded from the MIT License; all rights reserved. If you fork or redistribute this
+project, remove or replace the RulZ branding. See [LOGO-NOTICE.md](LOGO-NOTICE.md).
