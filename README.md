@@ -745,6 +745,13 @@ own steps, so the race costs extra steps: with N configurations, W warm-up round
 P x (W x N + N(N+1)/2 - 1) steps of racing before the winner continues alone (10 configurations, 2 warm-up rounds, a
 probe every 100 steps and 3000 steps: about 9300 steps in all, 3.1x one run; the WebUI shows the total).
 
+**Dropping one by hand.** The Monitor's race table has a *Drop* button on every configuration still in the race (after
+a confirmation). The trainer reads the request after the current step: the configuration stops, its LoRA is saved as
+`<job>_<name>_dropped.safetensors`, and the race goes on without it. If it was the one training, the next one takes
+over at once; a round it was the last of to be probed ends with this drop instead of dropping the lowest score as well;
+with one left, that one wins and trains on to `steps` like any winner. Without the WebUI, put the configuration's name
+in a file `RACE_DROP` in the job folder (one name per line); the trainer reads and removes it.
+
 ```yaml
 race: true
 race_warmup_probes: 1

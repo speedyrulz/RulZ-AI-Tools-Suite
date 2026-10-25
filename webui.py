@@ -445,6 +445,12 @@ def start_training(cfg: TrainConfig) -> str:
     return f"Started job '{cfg.job_name}' (pid {_proc.pid}). Config saved to {cfg_path}"
 
 
+def request_race_drop(job_dir: Path, name: str) -> None:
+    """Ask the running trainer to drop a race configuration (it reads RACE_DROP after every step)."""
+    with open(Path(job_dir) / "RACE_DROP", "a", encoding="utf-8") as f:
+        f.write(name.strip() + "\n")
+
+
 def stop_training() -> str:
     reattach_job()
     if not _running():
@@ -4287,8 +4293,40 @@ def build_page(local: bool = True):
                         {"name": "face", "label": "Face now", "field": "face"},
                         {"name": "body", "label": "Body now", "field": "body"},
                         {"name": "rounds", "label": "Score after each round", "field": "rounds", "align": "left"},
-                        {"name": "settings", "label": "Settings", "field": "settings", "align": "left"}],
+                        {"name": "settings", "label": "Settings", "field": "settings", "align": "left"},
+                        {"name": "drop", "label": "", "field": "can_drop"}],
                         rows=[], row_key="name").classes("w-full")
+                    race_table.add_slot("body-cell-drop", """
+                        <q-td :props="props">
+                            <q-btn v-if="props.row.can_drop" flat dense no-caps size="sm" color="negative"
+                                   icon="close" label="Drop"
+                                   @click="() => $parent.$emit('drop', props.row.name)" />
+                        </q-td>""")
+
+                    with ui.dialog() as drop_dlg, ui.card().classes("w-[26rem] max-w-full"):
+                        drop_title = ui.label("").classes("rz-setting-title")
+                        ui.label("It stops training now and its LoRA is saved as <job>_<name>_dropped; the race "
+                                 "goes on without it. This cannot be undone.").classes("rz-hint")
+                        with ui.row().classes("w-full justify-end gap-2"):
+                            ui.button("Keep it", on_click=drop_dlg.close).props("flat")
+                            drop_go = ui.button("Drop it", icon="close", color="negative").props("unelevated")
+                    drop_state = {"name": ""}
+
+                    def ask_drop(e):
+                        drop_state["name"] = str(e.args)
+                        drop_title.text = f"Drop {drop_state['name']} from the race?"
+                        drop_dlg.open()
+
+                    def do_drop():
+                        drop_dlg.close()
+                        if _job_dir is None or not _running():
+                            ui.notify("No job is running.", type="warning")
+                            return
+                        request_race_drop(_job_dir, drop_state["name"])
+                        ui.notify(f"{drop_state['name']} will be dropped after the current step.")
+
+                    drop_go.on_click(do_drop)
+                    race_table.on("drop", ask_drop)
                 race_exp.visible = False
                 with section("Likeness probes & controller", "Smoothed probe scores and controller state",
                              "insights") as probe_exp:
@@ -4498,8 +4536,12 @@ def build_page(local: bool = True):
                         return "n/a" if norm is None else f1(norm)
 
                     rows = []
+                    running_now = _running()
                     for n in names:
-                        state = ("winner" if rc.get("winner") == n else f"out after round {dropped[n]}" if n in dropped
+                        manual = n in (rc.get("manual") or [])
+                        state = ("winner" if rc.get("winner") == n else
+                                 f"dropped by you in round {dropped[n]}" if n in dropped and manual else
+                                 f"out after round {dropped[n]}" if n in dropped
                                  else "training" if rc.get("active") == n else "waiting its turn")
                         per_round = [(h["scores"].get(n), (h.get("steps") or {}).get(n))
                                      for h in rc.get("history") or [] if n in h["scores"]]
@@ -4509,7 +4551,8 @@ def build_page(local: bool = True):
                                      "face": part("face", n), "body": part("body", n),
                                      "rounds": " / ".join(f1(s) + ("" if st is None else f" @{st}")
                                                           for s, st in per_round) or "-",
-                                     "settings": (rc.get("settings") or {}).get(n) or "the page's own settings"})
+                                     "settings": (rc.get("settings") or {}).get(n) or "the page's own settings",
+                                     "can_drop": n not in dropped and not rc.get("winner") and running_now})
                     race_table.rows = rows
                     race_table.update()
                     est = rc.get("estimate") or {}
@@ -4890,7 +4933,8 @@ configuration and the settings it changes, for example `learning_rate=2e-4, lora
 same LoRA initialisation and see the same images and noise. Files of a configuration carry its name while the race
 runs (`<job>_<name>_<step>`, `<job>_<name>_best`); a dropped one is saved as `<job>_<name>_dropped`; the winner
 continues with the run's own names, and `<job>_winner.yaml` holds its settings. Training states are only saved after
-the race. The Monitor tab shows each configuration's score per round.
+the race. The Monitor tab shows each configuration's score per round, with a *Drop* button on each one still in: it stops
+that configuration after the current step, saves its LoRA as `_dropped` and the race goes on without it (one left wins).
 
 ## Using in ComfyUI
 ComfyUI supports MOSS-Image natively. Copy the `.safetensors` to `ComfyUI/models/loras/` and use the standard

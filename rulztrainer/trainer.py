@@ -1044,6 +1044,9 @@ class Trainer:
                              cfg.step_up_stop_patience if cfg.resolution_step_up else cfg.likeness_patience,
                              " at the highest resolution" if cfg.resolution_step_up else "", step)
                     break
+            if self._race_running() and self._race_manual_drops(step, losses, id_losses):
+                bind(self.race.active)  # the configuration that trained was dropped: the next one takes over
+                model.train()
             if self.stop_file.exists():
                 log.info("Stop requested at step %d", step)
                 break
@@ -1456,6 +1459,43 @@ class Trainer:
         self._race_report()
         return nxt
 
+    def _race_manual_drops(self, step: int, losses, id_losses) -> bool:
+        """Drop the configurations the Monitor's Drop button asked for (RACE_DROP in the job folder, one name per
+        line, read once and removed): each is saved like any dropped configuration and the race goes on without it.
+        A dropped configuration that is training now hands over to the next one at once; one left is the winner.
+        Returns True when the configuration that trains changed."""
+        request = self.job_dir / "RACE_DROP"
+        if not request.exists():
+            return False
+        try:
+            names = [x.strip() for x in request.read_text(encoding="utf-8").splitlines() if x.strip()]
+            request.unlink()
+        except OSError:
+            return False
+        rr = self.race
+        switched = False
+        for name in names:
+            v = next((x for x in rr.variants if x.name == name), None)
+            if v is None or not v.alive or rr.schedule.done:
+                log.warning("Race: cannot drop %r (not in the race any more)", name)
+                continue
+            was_active = v is rr.active
+            if was_active:
+                v.state.update(step=step, losses=losses, id_losses=id_losses)
+            rr.schedule.drop(v.idx)
+            log.info("Race: %s dropped by request at step %d (its own step count)", v.name, v.state.get("step", 0))
+            self._race_drop(v)
+            if was_active:
+                self._race_activate(rr.variants[rr.schedule.current])  # the dropped one is gone: nothing to park
+                switched = True
+            if rr.schedule.done:
+                self._race_finish()
+                break
+        if names:
+            free_cuda()
+            self._race_report()
+        return switched
+
     def _race_drop(self, v) -> None:
         """Save a dropped configuration's LoRA (its weight average when it has one) and free its state."""
         cfg = self.race.base_cfg
@@ -1471,7 +1511,8 @@ class Trainer:
         else:
             lora_mod.save_lora(v.view(use_average=True), path, metadata=meta, dtype=cfg.lora_save_dtype,
                                fmt=self.arch.lora_format)
-        log.info("Race: %s dropped after round %d -> %s", v.name, self.race.schedule.dropped[v.idx], path.name)
+        log.info("Race: %s dropped after round %d%s -> %s", v.name, self.race.schedule.dropped[v.idx],
+                 " (by hand)" if v.idx in self.race.schedule.manual else "", path.name)
         if str(path) not in self.status.data["saved"]:
             self.status.data["saved"].append(str(path))
         v.alive = False

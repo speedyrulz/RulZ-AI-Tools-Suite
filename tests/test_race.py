@@ -250,3 +250,52 @@ def test_race_records_the_step_each_score_was_probed_at():
     s2.record(0, 1.0)
     s2.record(1, 2.0)
     assert s2.history[0]["steps"] == {"a": None, "b": None}
+
+
+def test_manual_drop_mid_round_and_when_last_to_probe():
+    s = R.RaceSchedule(["a", "b", "c"], warmup=0)
+    s.record(0, 50.0, 100)  # a probed; b trains now
+    s.drop(2)  # c is dropped by hand before its turn
+    assert s.alive == [0, 1] and s.pending == [1] and s.dropped[2] == 1 and s.manual == {2}
+    assert s.current == 1 and s.history == []  # the round goes on with b
+    assert s.record(1, 40.0, 100) == 1  # b ends the round: the lowest (b) leaves the usual way
+    assert s.done and s.alive == [0] and s.state()["winner"] == "a" and s.state()["manual"] == ["c"]
+    # the active one is the last to be probed: dropping it ends the round without an automatic drop
+    s = R.RaceSchedule(["a", "b", "c"], warmup=0)
+    s.record(0, 50.0, 100)
+    s.record(1, 60.0, 100)
+    s.drop(2)
+    assert s.alive == [0, 1] and s.round == 2 and s.pending == [0, 1]
+    assert s.history[0]["dropped"] == "c" and s.history[0]["manual"] is True
+    assert s.history[0]["scores"] == {"a": 50.0, "b": 60.0} and s.history[0]["steps"] == {"a": 100, "b": 100}
+    # dropping the one training now with two left makes the other the winner
+    s.drop(0)
+    assert s.done and s.current == 1 and s.state()["winner"] == "b" and s.manual == {0, 2}
+    with pytest.raises(ValueError):
+        s.drop(1)  # the race is over
+    with pytest.raises(ValueError):
+        R.RaceSchedule(["a", "b"], 0).drop(5)
+
+
+def test_trainer_reads_the_drop_request(tmp_path):
+    from types import SimpleNamespace
+
+    from rulztrainer import trainer as T
+
+    sched = R.RaceSchedule(["a", "b", "c"], warmup=0)
+    variants = [SimpleNamespace(name=n, idx=i, alive=True, state={"step": 120}) for i, n in enumerate("abc")]
+    calls = []
+    fake = SimpleNamespace(job_dir=tmp_path, race=SimpleNamespace(schedule=sched, variants=variants, active=variants[0]))
+    fake._race_drop = lambda v: calls.append(("drop", v.name)) or setattr(v, "alive", False)
+    fake._race_activate = lambda v: (calls.append(("activate", v.name)), setattr(fake.race, "active", v))
+    fake._race_finish = lambda: calls.append(("finish", fake.race.active.name))
+    fake._race_report = lambda: calls.append(("report",))
+    drops = T.Trainer._race_manual_drops
+    assert drops(fake, 130, [], []) is False  # no request file
+    (tmp_path / "RACE_DROP").write_text("c\nnobody\n")
+    assert drops(fake, 130, [], []) is False  # c is not training: no switch; "nobody" is ignored
+    assert not (tmp_path / "RACE_DROP").exists() and calls[0] == ("drop", "c") and sched.alive == [0, 1]
+    (tmp_path / "RACE_DROP").write_text("a\n")
+    assert drops(fake, 130, [], []) is True  # the one training now: b takes over, and as the last one it wins
+    assert variants[0].state["step"] == 130 and fake.race.active is variants[1]
+    assert ("activate", "b") in calls and ("finish", "b") in calls and sched.done

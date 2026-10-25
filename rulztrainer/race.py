@@ -222,6 +222,7 @@ class RaceSchedule:
         #                                score was probed at}, "dropped": name | None}
         self.steps: dict[int, int | None] = {}
         self.dropped: dict[int, int] = {}  # index -> round it was dropped after
+        self.manual: set[int] = set()  # the ones dropped by hand (drop), not by a round's lowest score
 
     @property
     def done(self) -> bool:
@@ -260,9 +261,34 @@ class RaceSchedule:
         self.pending = [] if self.done else list(self.alive)
         return dropped
 
+    def drop(self, idx: int) -> None:
+        """Take a configuration out of the race at any time, probed this round or not (a manual drop). The race goes
+        on without it: a round it was the last one of to be probed ends here, with this drop standing in for the
+        round's own (nobody else is dropped for that round); one left makes it the winner."""
+        if self.done or idx not in self.alive:
+            raise ValueError(f"configuration {idx} is not in the race")
+        self.alive.remove(idx)
+        if idx in self.pending:
+            self.pending.remove(idx)
+        self.scores.pop(idx, None)
+        self.steps.pop(idx, None)
+        self.dropped[idx] = self.round
+        self.manual.add(idx)
+        if self.done:
+            self.pending = []
+            return
+        if not self.pending:
+            self.history.append({"round": self.round, "scores": {self.names[i]: self.scores.get(i) for i in self.alive},
+                                 "steps": {self.names[i]: self.steps.get(i) for i in self.alive},
+                                 "dropped": self.names[idx], "manual": True})
+            self.round += 1
+            self.scores, self.steps = {}, {}
+            self.pending = list(self.alive)
+
     def state(self) -> dict:
         return {"names": self.names, "warmup": self.warmup, "round": self.round, "alive": [self.names[i] for i in
                 self.alive], "dropped": {self.names[i]: r for i, r in self.dropped.items()},
+                "manual": [self.names[i] for i in sorted(self.manual)],
                 "history": self.history, "winner": self.names[self.alive[0]] if self.done else None}
 
 
