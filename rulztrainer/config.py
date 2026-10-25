@@ -334,6 +334,8 @@ class TrainConfig:
     race: bool = False
     race_configs: list[dict] = field(default_factory=list)  # [{"name": ..., <setting>: <value>, ...}], 2 or more
     race_warmup_probes: int = 0  # probe rounds before the first configuration is dropped
+    race_parallel: bool = False  # data_parallel race: one configuration per GPU at the same time (an odd one out
+    #                              is split over the GPUs when its step has batches enough, else it runs on the first)
     sample_model_path: str = ""  # optional different diffusion model for sampling only: .safetensors, diffusers dir or repo id
     sample_model_quant: str = "auto"  # auto | none | int8 | int8_convrot | nvfp4
 

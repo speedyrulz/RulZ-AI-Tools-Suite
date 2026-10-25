@@ -1081,6 +1081,7 @@ class Form:
             crop_face_caption=v("crop_face_caption") or "", crop_bust_caption=v("crop_bust_caption") or "",
             crop_augment_weight=float(v("crop_augment_weight")),
             race=bool(v("race")), race_warmup_probes=int(v("race_warmup_probes") or 0),
+            race_parallel=bool(v("race_parallel")),
             race_configs=self.w["race_configs"].value,
         )
 
@@ -4174,6 +4175,16 @@ def build_page(local: bool = True):
                             w["race_warmup_probes"] = ui.number("Warm-up probe rounds (nobody is dropped)",
                                                                 value=d.race_warmup_probes, min=0, precision=0) \
                                 .classes("w-72")
+                            w["race_parallel"] = ui.switch("One configuration per GPU at the same time",
+                                                          value=d.race_parallel) \
+                                .bind_visibility_from(w["multi_gpu"], "value", lambda x: x == "data_parallel") \
+                                .tooltip("With data parallel on 2+ GPUs: instead of every configuration training over "
+                                         "all the GPUs in turn, each GPU trains its own configuration at the same "
+                                         "time. An odd one left over trains over the GPUs together when its step has "
+                                         "batches enough (Gradient accumulation 2+) and that is faster, else on the "
+                                         "first GPU. Every configuration then sees Batch size x Gradient accumulation "
+                                         "images per step, the same for all. Not with the identity loss; no "
+                                         "torch.compile.")
                         race_summary = hint("")
 
                         def race_summary_update():
@@ -4542,7 +4553,9 @@ def build_page(local: bool = True):
                         state = ("winner" if rc.get("winner") == n else
                                  f"dropped by you in round {dropped[n]}" if n in dropped and manual else
                                  f"out after round {dropped[n]}" if n in dropped
-                                 else "training" if rc.get("active") == n else "waiting its turn")
+                                 else "training" if (n in (rc.get("lanes") or []) or (rc.get("active") == n
+                                                                                       and not rc.get("parallel")))
+                                 else "waiting its turn")
                         per_round = [(h["scores"].get(n), (h.get("steps") or {}).get(n))
                                      for h in rc.get("history") or [] if n in h["scores"]]
                         at = (rc.get("score_steps") or {}).get(n)
@@ -4933,7 +4946,8 @@ configuration and the settings it changes, for example `learning_rate=2e-4, lora
 same LoRA initialisation and see the same images and noise. Files of a configuration carry its name while the race
 runs (`<job>_<name>_<step>`, `<job>_<name>_best`); a dropped one is saved as `<job>_<name>_dropped`; the winner
 continues with the run's own names, and `<job>_winner.yaml` holds its settings. Training states are only saved after
-the race. The Monitor tab shows each configuration's score per round, with a *Drop* button on each one still in: it stops
+the race. With data parallel on 2+ GPUs, *One configuration per GPU at the same time* trains the configurations side
+by side (an odd one left over splits over the GPUs, or runs on the first). The Monitor tab shows each configuration's score per round, with a *Drop* button on each one still in: it stops
 that configuration after the current step, saves its LoRA as `_dropped` and the race goes on without it (one left wins).
 
 ## Using in ComfyUI

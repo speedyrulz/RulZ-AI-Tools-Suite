@@ -745,6 +745,19 @@ own steps, so the race costs extra steps: with N configurations, W warm-up round
 P x (W x N + N(N+1)/2 - 1) steps of racing before the winner continues alone (10 configurations, 2 warm-up rounds, a
 probe every 100 steps and 3000 steps: about 9300 steps in all, 3.1x one run; the WebUI shows the total).
 
+**One configuration per GPU (`race_parallel: true`).** With `multi_gpu: data_parallel` on two or more GPUs, the
+configurations of a round train side by side instead of in turn: each GPU's model copy trains its own configuration
+at the same moment, both run the same `probe_every` steps, and each is probed at the end of its turn as before. With
+an odd number left, the last one of the round trains alone over every GPU when its step has batches enough
+(`gradient_accumulation` 2 or more, the batches split by the GPUs' measured speeds) and that is faster than the first
+GPU alone (by 5%), else on the first GPU only. The winner trains on the same way. Every configuration sees
+`batch_size` x `gradient_accumulation` images per step, wherever it runs, so the comparison stays fair (plain data
+parallel gives each step that many images on every GPU). Each configuration owns its parameters, optimizer and weight
+average, parked on the CPU while it waits; the model copies carry the weights of whoever trains there. Not with the
+identity loss; `torch.compile` is off; no training states. Manual drops, the gallery and the race table work as before
+(the table marks every configuration that is training). A three-configuration test on an RTX 5060 Ti and an RTX 4060
+Ti ran two at once at about 6.6 s per step each, against about 13 s one after the other.
+
 **Dropping one by hand.** The Monitor's race table has a *Drop* button on every configuration still in the race (after
 a confirmation). The trainer reads the request after the current step: the configuration stops, its LoRA is saved as
 `<job>_<name>_dropped.safetensors`, and the race goes on without it. If it was the one training, the next one takes

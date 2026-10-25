@@ -13,7 +13,14 @@ themselves are shared; RACE_KEYS lists what a configuration may change.
 
 The trainer keeps one set of LoRA wrappers over the union of every configuration's layers. Switching parks the
 outgoing configuration's weights, optimizer state and weight average on the CPU and puts the next one's in: its
-weights (any rank), scale, dropout and enabled layers (swap_in / swap_out)."""
+weights (any rank), scale, dropout and enabled layers (swap_in / swap_out).
+
+With race_parallel (data parallel, 2+ GPUs) the configurations train side by side instead: a "wave" of one
+configuration per GPU runs the same steps at the same time, each on its GPU's own model copy, and is probed at the
+end of its turn as before; an odd one left over trains alone, split over the GPUs when its step has batches enough
+(gradient_accumulation 2 or more) and the split is faster than one GPU, else on the first GPU. Each configuration
+then owns its parameters (build_master), so any model copy can host it: the copies' wrappers carry (attach) a
+configuration's weights while it trains there."""
 from __future__ import annotations
 
 import dataclasses
@@ -166,6 +173,16 @@ def validate(cfg) -> None:
                          "winner's config, <job>_winner.yaml)")
     if cfg.race_warmup_probes < 0:
         raise ValueError("race_warmup_probes must be 0 or more")
+    if getattr(cfg, "race_parallel", False):
+        from .multigpu import parse_devices
+
+        if cfg.multi_gpu != "data_parallel" or len(parse_devices(cfg.devices, cfg.device)) < 2:
+            raise ValueError("race_parallel (one configuration per GPU) needs multi_gpu: data_parallel with at "
+                             "least two devices")
+        if any(float(r.get("id_loss_weight", cfg.id_loss_weight) or 0) > 0 for r in rows if isinstance(r, dict)) \
+                or cfg.id_loss_weight > 0:
+            raise ValueError("race_parallel does not support the identity loss: set id_loss_weight to 0 or turn "
+                             "race_parallel off")
     names = []
     for i, row in enumerate(rows):
         if not isinstance(row, dict):
@@ -232,6 +249,11 @@ class RaceSchedule:
     def current(self) -> int:
         """The configuration that trains now (the winner once the race is over)."""
         return self.pending[0] if self.pending else self.alive[0]
+
+    def wave(self, slots: int) -> list[int]:
+        """The configurations that train at the same time now: the first `slots` of those still to be probed this
+        round (one per GPU). A round with an odd number left ends with a wave of one."""
+        return [] if self.done else list(self.pending[:max(1, int(slots))])
 
     def record(self, idx: int, score: float | None, step: int | None = None) -> int | None:
         """The probe score of `idx` after its turn this round; returns the configuration dropped when this probe ended
@@ -309,6 +331,7 @@ class Variant:
         self.state: dict = {}  # the trainer's per-run state (optimizer, scheduler, ema, step, losses, ...)
         self.offloaded: list = []  # optimizer state tensors parked on the CPU: (param, key, device)
         self.alive = True
+        self.master: dict = {}  # race_parallel: {module: view over the configuration's own Parameters} (build_master)
 
     @property
     def scale(self) -> float:
@@ -341,6 +364,34 @@ class Variant:
     def n_weights(self) -> int:
         return sum(t.numel() for parts in self.weights.values() for t in parts.values())
 
+    def build_master(self, device="cpu") -> None:
+        """race_parallel: the configuration's own trainable parameters, in place of the shared wrappers'. `weights`
+        then holds the same Parameters (saving, parking and swap_in read them); `master` has module-like views that
+        the optimizer, the weight average and save_lora take like the wrappers."""
+        self.master = {}
+        for name in self.names:
+            parts = {part: nn.Parameter(t.detach().clone().to(device)) for part, t in self.weights[name].items()}
+            self.weights[name] = parts
+            view = SimpleNamespace(kind=self.kind, alpha=self.alpha, rank=self.rank, factor=self.factor,
+                                   trainable=True, multiplier=1.0, adapter_params=lambda parts=parts: parts)
+            if self.kind == "lora":
+                view.lora_down, view.lora_up = (SimpleNamespace(weight=parts["lora_down"]),
+                                                SimpleNamespace(weight=parts["lora_up"]))
+            self.master[name] = view
+
+    @torch.no_grad()
+    def move_master(self, device) -> None:
+        """Move the parameters, the optimizer state and the weight average to `device` (the GPU the configuration
+        trains on, or the CPU while it waits). The Parameter objects stay, so the optimizer keeps pointing at them."""
+        for parts in self.weights.values():
+            for p in parts.values():
+                p.data = p.data.to(device)
+                p.grad = None
+        opt = self.state.get("optimizer")
+        if opt is not None:
+            move_optimizer(opt, device)
+        move_average(self.state.get("ema"), to_cpu=False)  # the shadow follows its parameters
+
 
 def _dropout_module(p: float) -> nn.Module:
     return nn.Dropout(p) if p > 0 else nn.Identity()
@@ -357,7 +408,7 @@ def swap_in(v: Variant, wrappers: dict) -> None:
                 m.set_kind(v.kind)
             params = m.adapter_params()
             for part, t in v.weights[name].items():
-                params[part].data = t.to(dev)
+                params[part].data = t.detach().to(dev)  # the same storage when already there (race_parallel)
             m.rank, m.alpha, m.factor, m.scale = v.rank, v.alpha, v.factor, v.scale
             p = getattr(m.dropout, "p", 0.0)
             if p != v.dropout:
@@ -375,6 +426,45 @@ def swap_out(v: Variant, wrappers: dict) -> None:
     for name in v.names:
         m = wrappers[name]
         v.weights[name] = {part: p.detach().to("cpu", copy=True) for part, p in m.adapter_params().items()}
+
+
+@torch.no_grad()
+def attach(v: Variant, wrappers: dict) -> None:
+    """Make the wrappers of one model copy carry `v`'s weights again (race_parallel, after an optimizer step or an
+    event that loaded other weights): the same storage as the configuration's parameters on the copy's own device,
+    a copy on another. The layers' settings (kind, rank, scale, enabled layers) are those swap_in already set."""
+    for name in v.names:
+        m = wrappers[name]
+        dev = m.weight.device
+        params = m.adapter_params()
+        for part, t in v.weights[name].items():
+            params[part].data = t.detach().to(dev)
+
+
+@torch.no_grad()
+def collect_grads(v: Variant, replicas: list[dict]) -> None:
+    """Move the gradients that backward left on the wrappers of the model copies `v` trained on into its own
+    parameters (summed over the copies, losses were already scaled by the step's batch count) and clear them."""
+    for name in v.names:
+        for part, master in v.weights[name].items():
+            total = None
+            for wrappers in replicas:
+                p = wrappers[name].adapter_params()[part]
+                if p.grad is None:
+                    continue
+                g = p.grad.to(master.device)
+                total = g if total is None else total.add_(g)
+                p.grad = None
+            master.grad = total
+
+
+@torch.no_grad()
+def move_optimizer(opt, device) -> None:
+    """Every tensor of an optimizer's state to `device` (a parked configuration's state sits on the CPU)."""
+    for st in opt.state.values():
+        for k, t in list(st.items()):
+            if torch.is_tensor(t) and t.device != torch.device(device):
+                st[k] = t.to(device)
 
 
 def offload_optimizer(opt) -> list:

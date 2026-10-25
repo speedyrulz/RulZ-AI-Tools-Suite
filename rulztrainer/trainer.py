@@ -32,6 +32,7 @@ from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, d
                       scan_dataset, text_cache_path)
 from .archs import detect_arch, get_arch
 from .idloss import effective_weight as idloss_weight
+from .race_parallel import RaceParallelMixin
 from .multigpu import (Balancer, choose_counts, clone_to, compile_count, job_order, no_recompile_stance, norm_device,
                        run_queue, stance_available, step_seconds)
 log = logging.getLogger("rulztrainer")
@@ -280,7 +281,7 @@ def build_scheduler(cfg: TrainConfig, optimizer):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, fn)
 
 
-class Trainer:
+class Trainer(RaceParallelMixin):
     def __init__(self, cfg: TrainConfig):
         self.cfg = cfg
         self.job_dir = cfg.job_dir()
@@ -330,6 +331,7 @@ class Trainer:
         self.race_union_names = None  # the LoRA wrappers: every configuration's modules together
         self.race_region_dirs: dict[str, Path | None] = {}  # configuration -> its own region-map folder
         self.race_id_loss = None  # the identity loss shared by the configurations that use it
+        self.race_parallel = False  # race_parallel: one configuration per GPU at the same time (race_parallel.py)
         self.compiled = False  # torch.compile active on the DiT blocks
         self.dp_quiet_steps = 0  # consecutive data-parallel steps without a new compile
         self.replicas: list[tuple] = []  # (model, device) for every training copy, primary first
@@ -750,6 +752,8 @@ class Trainer:
                          ", ".join(side))
 
         do_compile, why = compiling.decide(cfg.compile_model, cfg.steps - step, self.devices)
+        if self.race_parallel and do_compile:
+            do_compile, why = False, "race_parallel trains the model copies in threads at once"
         if why:
             log.info("torch.compile %s (%s)", "on" if do_compile else "off", why)
         if do_compile:
@@ -796,6 +800,9 @@ class Trainer:
         else:
             self.race_id_loss = self.id_loss
             self._race_setup(injected, items)
+            if self.race_parallel:
+                self._race_parallel_main(items, backprop)
+                return
             bind(self.race.active)
         if self.dp is not None:
             self.dp.sync_weights()
@@ -1317,6 +1324,10 @@ class Trainer:
                                    region_weights=any(r[1].region_weights for r in rows),
                                    id_loss_weight=max(r[1].id_loss_weight for r in rows),
                                    likeness_curriculum=any(r[1].likeness_curriculum for r in rows))
+        self.race_parallel = bool(cfg.race_parallel)
+        if self.race_parallel:
+            log.info("Race in parallel: one configuration per GPU at the same time; a lone one left over trains over "
+                     "every GPU when that is faster, else on the first (no torch.compile, no identity loss)")
         est = race_mod.estimate_steps(len(rows), cfg.race_warmup_probes, cfg.probe_every, cfg.steps)
         log.info("Configuration race: %d configurations, %d warm-up probe round(s), a probe every %d steps: %d rounds "
                  "and %d probes, about %d training steps in all (%.1fx one %d-step run)", len(rows),
@@ -1369,7 +1380,10 @@ class Trainer:
         est = race_mod.estimate_steps(len(variants), base.race_warmup_probes, base.probe_every, base.steps)
         self.race = race_mod.RaceRun(variants, race_mod.RaceSchedule([v.name for v in variants],
                                                                      base.race_warmup_probes), wrappers, base, est)
-        self._race_activate(variants[0])
+        if self.race_parallel:  # every configuration trains on its own parameters (race_parallel.py)
+            self.race.active = variants[0]
+        else:
+            self._race_activate(variants[0])
         self._race_report()
 
     def _race_activate(self, v) -> None:
@@ -1406,7 +1420,7 @@ class Trainer:
     def _race_start_variant(self, v) -> None:
         """A configuration's first turn: its optimizer, schedule, weight average, image queue and loss watch."""
         cfg, st = v.cfg, v.state
-        st["injected"] = {name: self.race.wrappers[name] for name in v.names}
+        st["injected"] = v.master if self.race_parallel else {name: self.race.wrappers[name] for name in v.names}
         st["params"] = list(lora_mod.lora_parameters(st["injected"]))
         st["optimizer"], st["scheduler"] = self._make_optimizer(cfg, st["injected"])
         st["ema"] = self._make_ema(cfg, st["injected"])
@@ -1504,7 +1518,7 @@ class Trainer:
                 "ss_network_alpha": str(1.0 if v.kind == "lokr" else v.alpha), "modelspec.architecture":
                 self.arch.modelspec, "rulztrainer_race": f"{v.name}: {race_mod.format_overrides(v.overrides)}",
                 "ss_steps": str(v.state.get("step", 0))}
-        if v is self.race.active:
+        if v is self.race.active and not self.race_parallel:
             with self._averaged():
                 lora_mod.save_lora(v.state["injected"], path, metadata=meta, dtype=cfg.lora_save_dtype,
                                    fmt=self.arch.lora_format)
@@ -1520,6 +1534,9 @@ class Trainer:
         v.state.clear()
         v.state.update(keep)
         v.down, v.up = {}, {}
+        if self.race_parallel:  # its own parameters (and their GPU memory) go with it
+            v.weights, v.master = {}, {}
+            free_cuda()
 
     def _race_finish(self) -> None:
         """One configuration left: it trains on as the run, with the run's own file names."""
@@ -1543,7 +1560,10 @@ class Trainer:
         rr = self.race
         out = rr.schedule.state()
         out["active"] = rr.active.name if rr.active is not None else None
-        out["steps"] = {v.name: (v.state.get("step", 0) if v is not rr.active else None) for v in rr.variants}
+        out["lanes"] = [v.name for v, _ in getattr(self, "rp_lanes", [])] if getattr(self, "race_parallel", False) else []
+        out["parallel"] = getattr(self, "race_parallel", False)
+        out["steps"] = {v.name: (v.state.get("step", 0) if (v is not rr.active or getattr(self, "race_parallel", False)) else None)
+                        for v in rr.variants}
         out["scores"] = {v.name: (v.state["controller"].combined_ema if "controller" in v.state else None)
                          for v in rr.variants}
         out["score_steps"] = {v.name: (v.state["controller"].last_step if "controller" in v.state else None)
@@ -1591,7 +1611,7 @@ class Trainer:
     def _make_ema(self, cfg, injected):
         if cfg.lora_ema <= 0:
             return None
-        per_step = cfg.batch_size * cfg.gradient_accumulation * len(self.replicas)
+        per_step = cfg.batch_size * cfg.gradient_accumulation * (1 if self.race_parallel else len(self.replicas))
         return LoraEMA(injected, cfg.lora_ema, total_images=cfg.steps * per_step)
 
     def _balance(self, step: int) -> None:
