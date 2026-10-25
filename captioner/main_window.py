@@ -106,7 +106,7 @@ class MainWindow(QMainWindow):
         tb = QToolBar("Main")
         tb.setMovable(False)
         self.addToolBar(tb)
-        brand = QLabel()
+        self.brand = brand = QLabel()
         brand.setPixmap(theme.logo(26))
         brand.setContentsMargins(4, 0, 14, 0)
         brand.setToolTip("Rulz Training Captioner")
@@ -193,7 +193,13 @@ class MainWindow(QMainWindow):
         self.log_dock.setWidget(self.log_view)
         self.addDockWidget(Qt.BottomDockWidgetArea, self.log_dock)
         self.log_dock.hide()
-        self.menuBar().addMenu("&View").addAction(self.log_dock.toggleViewAction())
+        view = self.menuBar().addMenu("&View")
+        view.addAction(self.log_dock.toggleViewAction())
+        view.addSeparator()
+        self.a_light = QAction("Light mode", self, checkable=True)
+        self.a_light.setChecked(theme.current() == theme.LIGHT)
+        self.a_light.toggled.connect(self.set_light_mode)
+        view.addAction(self.a_light)
 
     def _build_status(self):
         self.progress = QProgressBar()
@@ -332,6 +338,18 @@ class MainWindow(QMainWindow):
         if dlg.exec():
             self.s = dlg.result_settings()
             config.save_settings(self.s)
+
+    def set_light_mode(self, on):
+        """Switch the whole app between the dark and light theme right away and remember it."""
+        mode = theme.LIGHT if on else theme.DARK
+        if mode == theme.current():
+            return
+        theme.apply(QApplication.instance(), mode)
+        self.brand.setPixmap(theme.logo(26))
+        self.grid.empty_logo = None
+        self.grid.viewport().update()
+        self.s["theme"] = mode
+        config.save_settings(self.current_settings())
 
     def _log(self, line):
         self.log_view.appendPlainText(line)

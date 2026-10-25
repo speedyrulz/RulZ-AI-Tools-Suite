@@ -1,4 +1,7 @@
-"""Settings and saved system prompts, stored as JSON under %APPDATA%."""
+r"""Settings and saved system prompts, stored as JSON in %APPDATA%\RulzCaptioner.
+
+Set the RULZ_CAPTIONER_DIR environment variable to use a different folder (portable installs, testing).
+"""
 import json
 import os
 import subprocess
@@ -6,7 +9,8 @@ from pathlib import Path
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 
-APP_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "RulzCaptioner"
+APP_DIR = (Path(os.environ["RULZ_CAPTIONER_DIR"]) if os.environ.get("RULZ_CAPTIONER_DIR")
+           else Path(os.environ.get("APPDATA", str(Path.home()))) / "RulzCaptioner")
 SETTINGS_FILE = APP_DIR / "settings.json"
 PROMPTS_FILE = APP_DIR / "prompts.json"
 
@@ -39,6 +43,7 @@ DEFAULT_SETTINGS = {
     "thumb_size": 180,
     "last_dir": "",
     "last_prompt": "Natural language",
+    "theme": "",  # "dark" or "light"; blank until the first-run "Choose your look" prompt is answered
 }
 
 DEFAULT_PROMPTS = [

@@ -2,11 +2,20 @@
 
 Windows desktop app for captioning image datasets with a local vision LLM.
 
+| Dark | Light |
+| --- | --- |
+| ![Caption grid, dark theme](docs/screenshots/01-main-dark.png) | ![Caption grid, light theme](docs/screenshots/02-main-light.png) |
+
+| Inline caption editing | Settings | First launch |
+| --- | --- | --- |
+| ![Editing a caption in the grid](docs/screenshots/04-edit-caption.png) | ![Settings dialog, light theme](docs/screenshots/05-settings-light.png) | ![Choose your look dialog](docs/screenshots/03-choose-your-look.png) |
+
 - Add images, folders (or drag & drop). Thumbnail grid with an editable caption box under every image.
 - Captions live in `image.txt` next to `image.png`. Editing a box (adding or removing text) writes the file, creating it if needed.
 - Save/edit/delete your own system prompts (stored in `%APPDATA%\RulzCaptioner\prompts.json`).
 - Multi-GPU: **Parallel** (one model copy per GPU, images shared out) or **Split** (one model spread across GPUs via `--tensor-split`).
 - Works with any OpenAI-compatible server too (LM Studio, Ollama, vLLM…); list several URLs to caption in parallel.
+- Dark (default) or light theme: the first launch asks which look you want; switch any time with **View ▸ Light mode**.
 
 ## Run
 
@@ -34,3 +43,9 @@ Double-click `run.bat` (creates a venv and installs PySide6 + requests on first 
 - Prefix/suffix fields add a trigger word or fixed text to every generated caption.
 - "Skip images that already have a caption" applies to *Caption All*; *Caption Selected* always overwrites.
 - The log (View ▸ Log) shows llama-server output, useful if a model fails to load.
+
+## Settings folder
+
+Settings, the theme choice and saved prompts are stored in `%APPDATA%\RulzCaptioner`. Set the environment
+variable `RULZ_CAPTIONER_DIR` to use another folder instead (for a portable setup or for testing with a fresh
+profile).
