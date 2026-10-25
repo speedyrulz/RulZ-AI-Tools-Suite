@@ -108,3 +108,25 @@ def test_cards_summary_and_review_line(tmp_path):
     assert webui.datasets_summary([]) is None
     cfg = TrainConfig(datasets=[{"path": str(a)}, {"path": str(b), "repeats": 3, "resolutions": [0.5, 1.0]}])
     assert webui.datasets_line(cfg, data) == "a, b (x3, 0.5 MP + 1 MP): 7 images, 4 captioned"
+
+
+def test_race_images_group_by_generation_with_normalized_scores(tmp_path):
+    names = ["lora16", "lokr8"]
+    files = [f"{tmp_path}/samples/{n}_step000120_{i}.png" for n in names for i in (0, 1)]
+    files += [f"{tmp_path}/probes/{n}_step000240_{k}_0.png" for n in ("lokr8", "lora16") for k in ("face", "body")]
+    files += [f"{tmp_path}/samples/step000300_0.png", f"{tmp_path}/samples/notes.png"]  # the winner after the race
+    groups = webui.group_by_generation(files, names)
+    assert [(s, r) for s, r, _ in groups] == [(300, "0"), (240, "body_0"), (240, "face_0"), (120, "0"), (120, "1")]
+    by = {(s, r): [w for w, _ in m] for s, r, m in groups}
+    assert by[(120, "0")] == ["lora16", "lokr8"] and by[(240, "face_0")] == ["lora16", "lokr8"]  # race order
+    assert by[(300, "0")] == [""]  # the winner's image has no configuration prefix
+    assert webui.generation_label(120, "1") == "step 120, sample 2"
+    assert webui.generation_label(240, "face_0") == "step 240, face probe 1"
+    assert webui.generation_label(240, "body_1") == "step 240, body probe 2"
+    rec = {"face_norm": 47.2, "body_norm": 17.4, "combined": 32.3, "face": 60.0, "body": 80.0, "scale": {"face": [1, 2]}}
+    assert webui.probe_score_line(rec) == "overall 32% | face 47% | body 17%"  # never the raw scores
+    assert webui.probe_score_line({"face": 60.0, "body": 80.0, "combined": 70.0, "scale": {}}) == \
+        "overall 70% | face 60% | body 80%"  # normalization off: the scores themselves
+    assert webui.probe_score_line(None) == ""
+    (tmp_path / "race.json").write_text('{"names": ["a", "b"]}')
+    assert webui.race_names(tmp_path) == ["a", "b"] and webui.race_names(tmp_path / "none") == []

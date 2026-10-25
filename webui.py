@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -591,13 +592,13 @@ def body_preview(paths: list[str], backend: str = "mediapipe", sam3_model: str =
 
 
 def score_caption(sc: dict) -> str:
-    """"face 47% (raw 40), body 17% (raw 73), combined 38%": the normalized scores with the raw ones behind them;
-    raw only for scores recorded without a scale."""
+    """"face 47%, body 17%, combined 38%": the normalized scores (the scores themselves for samples recorded without a
+    scale, normalization off)."""
     def one(label, norm_key, raw_key):
-        norm, raw = sc.get(norm_key), sc.get(raw_key)
-        if norm is not None:
-            return f"{label} {norm:.0f}%" + (f" (raw {raw:.0f})" if raw is not None else "")
-        return f"{label} {raw:.0f}%" if raw is not None else None
+        v = sc.get(norm_key)
+        if v is None:
+            v = sc.get(raw_key)
+        return f"{label} {v:.0f}%" if v is not None else None
 
     parts = [one("face", "face_norm", "percent") or "no face"]
     for label, nk, rk in (("body", "body_norm", "body_percent"), ("combined", "combined_norm", "combined_percent")):
@@ -605,6 +606,62 @@ def score_caption(sc: dict) -> str:
         if p:
             parts.append(p)
     return "  |  " + ", ".join(parts)
+
+
+_RACE_IMAGE = re.compile(r"^(?P<name>.+?)_step(?P<step>\d{6})_(?P<rest>.+)\.png$")
+
+
+def race_names(job_dir: Path | None) -> list[str]:
+    """The configurations of a job's race (race.json), [] without one."""
+    try:
+        data = json.loads((Path(job_dir) / "race.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return []
+    names = data.get("names") if isinstance(data, dict) else None
+    return [str(n) for n in names] if isinstance(names, list) else []
+
+
+def generation_label(step: int, rest: str) -> str:
+    """"step 240, sample 2" / "step 240, face probe 1" for the image-name tail after the step ("1" / "face_0")."""
+    kind, _, seed = rest.rpartition("_")
+    if kind and seed.isdigit():
+        return f"step {step}, {kind} probe {int(seed) + 1}"
+    return f"step {step}, sample {int(rest) + 1}" if rest.isdigit() else f"step {step}, {rest}"
+
+
+def group_by_generation(paths, names: list[str]) -> list[tuple[int, str, list[tuple[str, str]]]]:
+    """Race images grouped by generation: [(step, rest, [(contender, path), ...])], the newest step first, each
+    group's contenders in race order. The same generation is the same step, prompt (or probe kind and seed) and seed,
+    one image per configuration; an image of the winner after the race (no configuration prefix) is its own group."""
+    groups: dict[tuple[int, str], dict[str, str]] = {}
+    for p in paths:
+        m = _RACE_IMAGE.match(Path(p).name)
+        name = m["name"] if m and m["name"] in names else ""
+        if m and name:
+            key = (int(m["step"]), m["rest"])
+        else:
+            m2 = re.match(r"^step(\d{6})_(.+)\.png$", Path(p).name)
+            if not m2:
+                continue
+            key = (int(m2.group(1)), m2.group(2))
+        groups.setdefault(key, {})[name] = str(p)
+    order = {n: i for i, n in enumerate(names)}
+    out = []
+    for (step, rest), by in sorted(groups.items(), key=lambda kv: (-kv[0][0], kv[0][1])):
+        out.append((step, rest, sorted(by.items(), key=lambda kv: order.get(kv[0], len(order)))))
+    return out
+
+
+def probe_score_line(rec: dict | None) -> str:
+    """"overall 38% | face 47% | body 17%": one probe's normalized scores (the scores themselves with normalization
+    off)."""
+    if not rec:
+        return ""
+    face, body, comb = rec.get("face_norm"), rec.get("body_norm"), rec.get("combined")
+    if face is None and body is None and not rec.get("scale"):
+        face, body = rec.get("face"), rec.get("body")
+    parts = [f"{label} {v:.0f}%" for label, v in (("overall", comb), ("face", face), ("body", body)) if v is not None]
+    return " | ".join(parts)
 
 
 def face_scores_by_image(job_dir: Path | None) -> dict[str, dict]:
@@ -2061,11 +2118,28 @@ def build_samples_tab(f: Form):
         grid.style(f"grid-template-columns: repeat({columns.value}, minmax(0, 1fr))")
         info.text = f"{len(files)} samples in {sd}" if sd else "No job selected"
         scores = face_scores_by_image(sd.parent if sd else None)
+        names = race_names(sd.parent if sd else None)
         grid.clear()
+        if names:  # a race: the same generation of every configuration side by side
+            grid.style("grid-template-columns: minmax(0, 1fr)")
+            with grid:
+                for step, rest, members in group_by_generation([str(p) for p in files[:120]], names):
+                    ui.label(generation_label(step, rest)).classes("rz-subhead")
+                    with ui.row().classes("w-full gap-3 no-wrap"):
+                        for who, path in members:
+                            with ui.card().tight().classes("rz-thumb").style("flex: 1 1 0; min-width: 0"):
+                                ui.image(image_url(path)).props("fit=contain") \
+                                    .classes("w-full h-64 rz-imgbg cursor-pointer") \
+                                    .on("click", lambda _, q=Path(path): show_full(q)) \
+                                    .tooltip("Click to view full size")
+                                sc = scores.get(Path(path).name)
+                                ui.label((who or "winner") + (score_caption(sc) if sc is not None else "")) \
+                                    .classes("text-xs px-2 py-1")
+            return
         with grid:
             for p in files[:120]:
                 with ui.card().tight().classes("w-full rz-thumb"):
-                    ui.image(str(p)).props("fit=contain").classes("w-full h-64 rz-imgbg cursor-pointer") \
+                    ui.image(image_url(p)).props("fit=contain").classes("w-full h-64 rz-imgbg cursor-pointer") \
                         .on("click", lambda _, q=p: show_full(q)).tooltip("Click to view full size")
                     sc = scores.get(p.name)
                     label = p.name + (score_caption(sc) if sc is not None else "")
@@ -4419,11 +4493,9 @@ def build_page(local: bool = True):
                     names, dropped = rc.get("names") or [], rc.get("dropped") or {}
                     f1 = lambda x: "n/a" if x is None else f"{x:.1f}%"  # noqa: E731
 
-                    def part(kind, n):  # "57.2% (raw 67.7)": the normalized smoothed score, the raw one behind it
-                        norm, raw = (rc.get(kind) or {}).get(n) or (None, None)
-                        if norm is None:
-                            return "n/a"
-                        return f1(norm) if raw is None or abs(norm - raw) < 0.05 else f"{f1(norm)} (raw {raw:.1f})"
+                    def part(kind, n):  # the normalized smoothed score
+                        norm, _ = (rc.get(kind) or {}).get(n) or (None, None)
+                        return "n/a" if norm is None else f1(norm)
 
                     rows = []
                     for n in names:
@@ -4465,40 +4537,66 @@ def build_page(local: bool = True):
                     lk = st.get("likeness") or {}
                     last = probes[-1]
                     f2 = lambda x: "n/a" if x is None else f"{x:.1f}%"  # noqa: E731
-                    norm = (f" (normalized {f2(last.get('face_norm_ema'))} / {f2(last.get('body_norm_ema'))})"
-                            if last.get("face_norm_ema") is not None or last.get("body_norm_ema") is not None else "")
-                    probe_label.text = (f"Probe @ step {last['step']}: face {f2(last.get('face_ema'))} body {f2(last.get('body_ema'))}"
-                                        f"{norm} combined {f2(last.get('combined_ema'))} | best {f2(lk.get('best'))} @ step {lk.get('best_step')}"
+                    normed = last.get("face_norm_ema") is not None or last.get("body_norm_ema") is not None
+                    fe = last.get("face_norm_ema") if normed else last.get("face_ema")
+                    be = last.get("body_norm_ema") if normed else last.get("body_ema")
+                    probe_label.text = (f"Probe @ step {last['step']}: face {f2(fe)} body {f2(be)}"
+                                        f" combined {f2(last.get('combined_ema'))} | best {f2(lk.get('best'))} @ step {lk.get('best_step')}"
                                         f" | {lk.get('since_improve', 0)} probe(s) since improvement | lr x{lk.get('lr_factor', 1.0):.2f}"
                                         f" | face bias {lk.get('face_bias', 0.0):+.2f}" + (" | STOPPED" if lk.get("stopped") else ""))
-                    latest_imgs = list(last.get("images") or [])[:6]
-                    if latest_imgs != shown_probes:
-                        shown_probes[:] = latest_imgs
+                    rec_of = {Path(p).name: pr for pr in probes for p in (pr.get("images") or [])}
+                    rnames = (rc or {}).get("names") or []
+                    if rnames:  # a race: each probe image of every configuration side by side, newest step first
+                        shown = group_by_generation([p for pr in probes[-60:] for p in (pr.get("images") or [])],
+                                                    rnames)[:8]
+                        sig = [(st_, r_, [(w_, p_, probe_score_line(rec_of.get(Path(p_).name))) for w_, p_ in m_])
+                               for st_, r_, m_ in shown]
+                    else:
+                        sig = [(0, "", [("", p, probe_score_line(rec_of.get(Path(p).name)))])
+                               for p in list(last.get("images") or [])[:6]]
+                    if sig != shown_probes:
+                        shown_probes[:] = sig
                         probe_row.clear()
                         with probe_row:
-                            for p in latest_imgs:
-                                with ui.card().tight().classes("rz-thumb"):
-                                    ui.image(p).props("fit=contain").classes("w-40 h-40 rz-imgbg cursor-pointer") \
-                                        .on("click", lambda _, q=p: show_full(Path(q)))
-                                    ui.label(Path(p).name).classes("text-xs px-1")
+                            for st_, r_, members in sig:
+                                if rnames:
+                                    ui.label(generation_label(st_, r_)).classes("rz-subhead w-full")
+                                for who, p, line in members:
+                                    with ui.card().tight().classes("rz-thumb"):
+                                        ui.image(image_url(p)).props("fit=contain") \
+                                            .classes("w-40 h-40 rz-imgbg cursor-pointer") \
+                                            .on("click", lambda _, q=p: show_full(Path(q)))
+                                        ui.label(who or Path(p).name).classes("text-xs px-1")
+                                        if line:
+                                            ui.label(line).classes("text-xs px-1 pb-1 rz-hint")
                 score_by_name = {Path(sc["image"]).name: sc for sc in fscores}
-                samples = (st.get("samples") or [])[:12]
-                sample_sig = [(p, (score_by_name.get(Path(p).name) or {}).get("combined_percent")) for p in samples]
+                rnames = (rc or {}).get("names") or []
+                samples = (st.get("samples") or [])[:max(12, 6 * len(rnames))]
+                sample_sig = [(p, score_caption(score_by_name[Path(p).name]) if Path(p).name in score_by_name else "")
+                              for p in samples]
                 if sample_sig != shown_samples:
                     shown_samples[:] = sample_sig
                     samples_row.clear()
+                    cap_of = dict(sample_sig)
                     with samples_row:
                         if not sample_sig:
                             hint("No samples yet. They appear here every 'Sample every' steps.")
-                        for p, pct in sample_sig:
-                            with ui.card().tight().classes("rz-thumb"):
-                                ui.image(p).props("fit=contain").classes("w-48 h-48 rz-imgbg cursor-pointer") \
-                                    .on("click", lambda _, q=p: show_full(Path(q)))
-                                caption = Path(p).name
-                                sc_ = score_by_name.get(Path(p).name)
-                                if sc_ is not None:
-                                    caption += score_caption(sc_)
-                                ui.label(caption).classes("text-xs px-1")
+                        if rnames:  # a race: the same generation of every configuration side by side
+                            for step_, rest_, members in group_by_generation(samples, rnames)[:6]:
+                                ui.label(generation_label(step_, rest_)).classes("rz-subhead w-full")
+                                for who, p in members:
+                                    with ui.card().tight().classes("rz-thumb"):
+                                        ui.image(image_url(p)).props("fit=contain") \
+                                            .classes("w-48 h-48 rz-imgbg cursor-pointer") \
+                                            .on("click", lambda _, q=p: show_full(Path(q)))
+                                        ui.label((who or "winner") + cap_of.get(p, "")).classes("text-xs px-1")
+                        else:
+                            for p, cap_ in sample_sig:
+                                with ui.card().tight().classes("rz-thumb"):
+                                    ui.image(image_url(p)).props("fit=contain") \
+                                        .classes("w-48 h-48 rz-imgbg cursor-pointer") \
+                                        .on("click", lambda _, q=p: show_full(Path(q)))
+                                    ui.label(Path(p).name + cap_).classes("text-xs px-1")
                 saved = list(st.get("saved") or [])
                 states = list(st.get("states") or [])
                 saved_label.text = ("Saved:\n" + "\n".join(saved) if saved else "No LoRA saved yet.") \
@@ -4779,7 +4877,8 @@ mapped to 0 = a stranger's score (the step-0 probe, rendered with *Step-0 seeds*
 on) and 100 = what a typical reference scores against the others (the median of each one's best match; faces cut
 off by the frame left out), capped at 100: matching the references better than a typical one of them is no more
 likeness. The combined score, best checkpoint, early stop, curriculum and race decisions use these; the Monitor
-shows the raw scores next to them.
+and Samples tab show only these (probe images carry their overall / face / body score), and in a race the same
+generation of every configuration sits side by side in one row.
 
 ## Configuration race
 *Configuration race* (Train tab, after the likeness probes) trains several configurations in turn: each trains until

@@ -172,7 +172,7 @@ def test_sample_scores_carry_normalized_values_and_captions_show_them(tmp_path):
     assert abs(s.face_norm - 50.0) < 1e-9 and abs(s.body_norm - 50.0) < 1e-9 and abs(s.combined_norm - 50.0) < 1e-9
     import webui
 
-    assert webui.score_caption(facesim.asdict(s)) == "  |  face 50% (raw 42), body 50% (raw 34), combined 50% (raw 38)"
+    assert webui.score_caption(facesim.asdict(s)) == "  |  face 50%, body 50%, combined 50%"
     raw = facesim.score_samples(face, [str(tmp_path / "s.png")], 10, tmp_path, body, 0.5, 0.5)[0]
     assert raw.face_norm is None and webui.score_caption(facesim.asdict(raw)) == "  |  face 42%, body 34%, combined 38%"
     assert len(facesim.read_scores(tmp_path)) == 2

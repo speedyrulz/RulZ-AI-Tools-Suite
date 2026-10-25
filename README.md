@@ -729,9 +729,11 @@ at 100: matching the references better than a typical one of them is no more lik
 photo reads higher). The median replaced the mean because hard references (profile views, cut-off faces) pull the
 mean below what a clean front-facing probe scores: on a real run a typical probe read 108% against the mean and
 100% against the median. The combined score, the noise band, the curriculum gap,
-the lr control, the best checkpoint, early stop and the race drops all use the normalized values; the log, the
-Monitor and `likeness.jsonl` show the raw face / body next to them (`face_norm`, `body_norm`, `scale`). Earlier runs'
-`likeness.jsonl` keep their raw combined scores.
+the lr control, the best checkpoint, early stop and the race drops all use the normalized values. The Monitor and the
+Samples tab show only the normalized scores (the log and `likeness.jsonl` keep the raw face / body next to them as
+`face`, `body`, `face_norm`, `body_norm`, `scale`); probe images carry their overall / face / body score underneath.
+In a race, the Monitor and the Samples tab put the same generation (step, prompt or probe kind, seed) of every
+configuration side by side in one row. Earlier runs' `likeness.jsonl` keep their raw combined scores.
 
 ## Configuration race (`race`)
 
