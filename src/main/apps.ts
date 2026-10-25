@@ -14,6 +14,7 @@ import type {
   JobState,
   LatestInfo,
   ReadmeDoc,
+  RequirementId,
   ShortcutOptions
 } from '@shared/types'
 import { exists, extractZip, findFile, flattenSingleFolder, overlay, swapInto } from './archive'
@@ -31,6 +32,7 @@ import {
   type Release
 } from './github'
 import { capture, launchDetached, runCommand } from './process'
+import { ensureRequirements, requirementLabel } from './requirements'
 import { createShortcut, foreignShortcutPaths, removeShortcut, shortcutPaths } from './shortcuts'
 import type { Store } from './store'
 
@@ -71,6 +73,16 @@ function expandEnv(path: string): string {
 /** "Receiving objects:  40% (11/27)" → "Receiving objects:", for collapsing progress counters into one line. */
 function progressKey(line: string): string | null {
   return /^(.{3,60}?:)\s+\d{1,3}% /.exec(`${line} `)?.[1] ?? null
+}
+
+/** The install can't go on until these are installed by hand. */
+class MissingRequirementsError extends Error {
+  constructor(readonly missing: RequirementId[]) {
+    super(
+      `${missing.map(requirementLabel).join(' and ')} ${missing.length > 1 ? 'are' : 'is'} needed first. ` +
+        'Follow the install steps, then try again.'
+    )
+  }
 }
 
 function errorText(e: unknown): string {
@@ -328,7 +340,8 @@ export class AppManager {
             label: cancelled ? 'Cancelled' : 'Failed',
             error: cancelled ? undefined : errorText(e),
             progress: null,
-            hasLog: log.length > 1
+            hasLog: log.length > 1,
+            missing: e instanceof MissingRequirementsError ? e.missing : undefined
           })
         }
       )
@@ -404,7 +417,8 @@ export class AppManager {
       desktopShortcut: !!info.shortcuts.desktop,
       startMenuShortcut: !!info.shortcuts.startMenu,
       components: [],
-      launchAfter: false
+      launchAfter: false,
+      installPrerequisites: true
     }
     this.latest.delete(appId) // always fetch the newest release for an update
     this.startJob(appId, 'update', (ctx) => this.runInstall(ctx, app, opts, info))
@@ -417,14 +431,28 @@ export class AppManager {
     if (!info?.managed) throw new Error(`${app.name} wasn't installed by the launcher.`)
     if (app.install.kind !== 'source') return this.update(appId)
     this.startJob(appId, 'repair', async (ctx) => {
+      await this.ensurePrerequisites(ctx, app)
       await this.runSetupSteps(ctx, app, info)
       const launchPath = await this.resolveLaunch(app, info.dir)
       await this.o.store.setInstalled(appId, { ...info, launchPath, needsSetup: false })
     })
   }
 
+  /** Installs missing prerequisites with winget; stops the job if any are still missing. */
+  private async ensurePrerequisites(ctx: JobContext, app: CatalogApp): Promise<void> {
+    ctx.set({ phase: 'prerequisites', label: 'Checking prerequisites…', progress: null })
+    const missing = await ensureRequirements(
+      app.requirements,
+      ctx.log,
+      (label) => ctx.set({ label: `Installing ${label}…` }),
+      ctx.signal
+    )
+    if (missing.length) throw new MissingRequirementsError(missing)
+  }
+
   private async runInstall(ctx: JobContext, app: CatalogApp, opts: InstallOptions, prev: InstalledInfo | null): Promise<void> {
     const dir = opts.dir
+    if (opts.installPrerequisites) await this.ensurePrerequisites(ctx, app)
     const spec = app.install
     let version: string | null = null
     let method: InstalledInfo['method']

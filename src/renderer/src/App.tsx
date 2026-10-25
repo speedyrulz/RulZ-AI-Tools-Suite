@@ -2,6 +2,7 @@ import { Loader2 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { Toaster } from 'sonner'
 import { InstallDialog } from './components/InstallDialog'
+import { RequirementGuide } from './components/RequirementGuide'
 import { SettingsDialog } from './components/SettingsDialog'
 import { TopBar } from './components/TopBar'
 import { AppPage } from './pages/AppPage'
@@ -49,6 +50,7 @@ export function App() {
 
       <InstallDialog view={installing} onClose={() => setInstallId(null)} />
       {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
+      <RequirementGuide />
       <Toaster
         theme="dark"
         position="bottom-right"

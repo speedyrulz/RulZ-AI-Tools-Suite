@@ -4,7 +4,12 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { findFile, flattenSingleFolder, swapInto } from '../src/main/archive'
 import { findAsset, isNewer, type Release } from '../src/main/github'
-import { quoteArg, spawnArgs } from '../src/main/process'
+import { quoteArg, resolveProgram, spawnArgs } from '../src/main/process'
+
+let dir: string
+afterEach(async () => {
+  if (dir) await rm(dir, { recursive: true, force: true })
+})
 
 describe('isNewer', () => {
   it('compares version tags numerically', () => {
@@ -52,17 +57,21 @@ describe('command lines', () => {
     expect(r.args[3]).toBe('""C:\\Apps\\Rulz Trainer\\run_webui.bat" 7870"')
   })
 
+  it('finds bare commands on PATH even when cwd has a folder of that name', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'rulz-test-'))
+    await mkdir(join(dir, 'winget'))
+    await writeFile(join(dir, 'install.bat'), '')
+    expect(resolveProgram('winget', dir)).toBe('winget')
+    expect(resolveProgram('install.bat', dir)).toBe(join(dir, 'install.bat'))
+    expect(resolveProgram('.venv\\Scripts\\python.exe', dir)).toBe(join(dir, '.venv\\Scripts\\python.exe'))
+  })
+
   it('starts programs directly', () => {
     expect(spawnArgs('C:\\x\\app.exe', ['a b'])).toEqual({ file: 'C:\\x\\app.exe', args: ['a b'], verbatim: false })
   })
 })
 
 describe('archive helpers', () => {
-  let dir: string
-  afterEach(async () => {
-    if (dir) await rm(dir, { recursive: true, force: true })
-  })
-
   it('moves the contents of a single top-level folder up', async () => {
     dir = await mkdtemp(join(tmpdir(), 'rulz-test-'))
     await mkdir(join(dir, 'App-v1.0.0', '_internal'), { recursive: true })

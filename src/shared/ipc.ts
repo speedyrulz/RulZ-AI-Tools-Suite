@@ -49,7 +49,8 @@ export interface IpcInvoke {
   'apps:openFolder': (appId: string) => void
   'apps:log': (appId: string) => string[]
 
-  'requirements:check': () => RequirementStatus[]
+  /** `reloadPath` re-reads PATH first, to find programs installed since the launcher started. */
+  'requirements:check': (reloadPath?: boolean) => RequirementStatus[]
   /** Installs a requirement with winget; resolves when winget exits. */
   'requirements:install': (id: RequirementId) => RequirementStatus[]
 }

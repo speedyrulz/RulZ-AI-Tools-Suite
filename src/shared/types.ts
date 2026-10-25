@@ -99,6 +99,7 @@ export interface LatestInfo {
 }
 
 export type JobPhase =
+  | 'prerequisites'
   | 'resolving'
   | 'downloading'
   | 'extracting'
@@ -124,6 +125,8 @@ export interface JobState {
   error?: string
   /** Set on failure when the setup log has the details. */
   hasLog?: boolean
+  /** Required prerequisites that are still missing (the install stopped; they need installing by hand). */
+  missing?: RequirementId[]
 }
 
 export interface AppView {
@@ -154,6 +157,8 @@ export interface InstallOptions {
   startMenuShortcut: boolean
   components: string[]
   launchAfter: boolean
+  /** Install missing required prerequisites (Python, FFmpeg…) with winget first. */
+  installPrerequisites: boolean
 }
 
 export interface ShortcutOptions {

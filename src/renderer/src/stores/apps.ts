@@ -1,6 +1,6 @@
 import { toast } from 'sonner'
 import { create } from 'zustand'
-import type { AppView, JobState, RequirementStatus, Settings } from '@shared/types'
+import type { AppView, JobState, RequirementId, RequirementStatus, Settings } from '@shared/types'
 import { errorMessage, invoke, on } from '../lib/api'
 
 const LOG_LIMIT = 3000
@@ -21,10 +21,12 @@ interface AppsState {
   requirements: RequirementStatus[]
   settings: Settings | null
   selectedId: string | null
+  /** The prerequisite whose install guide is open. */
+  guideId: RequirementId | null
 
   init: () => Promise<void>
   refresh: () => Promise<void>
-  checkRequirements: () => Promise<void>
+  checkRequirements: (reloadPath?: boolean) => Promise<void>
   select: (id: string | null) => void
   dismissJob: (id: string) => void
   updateSettings: (patch: Partial<Settings>) => Promise<void>
@@ -46,6 +48,7 @@ export const useApps = create<AppsState>((set, get) => ({
   requirements: [],
   settings: null,
   selectedId: null,
+  guideId: null,
 
   init: async () => {
     // StrictMode runs effects twice in development; subscribe only once.
@@ -66,6 +69,13 @@ export const useApps = create<AppsState>((set, get) => ({
       if (!isActive(prev) && isActive(job)) set((s) => ({ logs: { ...s.logs, [job.appId]: [] } }))
       set((s) => ({ jobs: { ...s.jobs, [job.appId]: job } }))
       if (isActive(prev) || !prev) notify(job, get().apps.find((a) => a.app.id === job.appId)?.app.name ?? job.appId)
+      // Something has to be installed by hand: walk them through it.
+      if (job.phase === 'error' && job.missing?.length) {
+        set({ guideId: job.missing[0] })
+        void get().checkRequirements()
+      }
+      // A prerequisite may have just been installed.
+      if (job.phase === 'done') void get().checkRequirements()
       if (job.phase === 'done' || job.phase === 'cancelled') {
         setTimeout(() => {
           if (get().jobs[job.appId] === job) get().dismissJob(job.appId)
@@ -89,8 +99,8 @@ export const useApps = create<AppsState>((set, get) => ({
     void get().checkRequirements()
   },
 
-  checkRequirements: async () => {
-    set({ requirements: await invoke('requirements:check') })
+  checkRequirements: async (reloadPath) => {
+    set({ requirements: await invoke('requirements:check', reloadPath) })
   },
 
   select: (id) => set({ selectedId: id }),

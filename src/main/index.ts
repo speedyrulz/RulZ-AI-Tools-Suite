@@ -134,7 +134,7 @@ async function main(): Promise<void> {
   handle('apps:openFolder', (id) => apps.openFolder(id))
   handle('apps:log', (id) => apps.getLog(id))
 
-  handle('requirements:check', () => checkRequirements())
+  handle('requirements:check', (reloadPath) => checkRequirements(reloadPath))
   handle('requirements:install', async (id) => {
     await installRequirement(id, (line) => broadcast('job:log', { appId: `requirement:${id}`, line }))
     return checkRequirements()

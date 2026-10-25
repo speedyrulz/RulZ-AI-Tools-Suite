@@ -1,4 +1,4 @@
-import { CheckCircle2, CircleDashed, Download, ExternalLink, Loader2, XCircle } from 'lucide-react'
+import { BookOpen, CheckCircle2, CircleDashed, Download, Loader2, XCircle } from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
 import type { RequirementRef } from '@shared/types'
@@ -22,6 +22,7 @@ export function RequirementList({ refs }: { refs: RequirementRef[] }) {
       else toast.warning(`${label} was installed, but isn't found yet. Restart the launcher if it stays missing.`)
     } catch (e) {
       toast.error(`${label}: ${errorMessage(e)}`)
+      useApps.setState({ guideId: id })
     } finally {
       setInstalling(null)
     }
@@ -61,8 +62,14 @@ export function RequirementList({ refs }: { refs: RequirementRef[] }) {
                     Install
                   </Button>
                 )}
-                <Button size="sm" variant="ghost" className="px-2" title="Download page" onClick={() => void invoke('shell:openExternal', s.helpUrl)}>
-                  <ExternalLink className="size-3.5" />
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="px-2"
+                  title="How to install it by hand"
+                  onClick={() => useApps.setState({ guideId: r.id })}
+                >
+                  <BookOpen className="size-3.5" />
                 </Button>
               </div>
             )}

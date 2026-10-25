@@ -15,7 +15,10 @@ function isBatch(path: string): boolean {
 /** A program path from the catalog: relative paths (or bare names of files in `cwd`) resolve in `cwd`. */
 export function resolveProgram(program: string, cwd: string): string {
   if (isAbsolute(program)) return program
-  if (/[\\/]/.test(program) || existsSync(join(cwd, program))) return join(cwd, program)
+  // Only a program file counts: a bare "winget" must not match a folder of that name in cwd.
+  if (/[\\/]/.test(program) || (/\.(exe|bat|cmd)$/i.test(program) && existsSync(join(cwd, program)))) {
+    return join(cwd, program)
+  }
   return program
 }
 

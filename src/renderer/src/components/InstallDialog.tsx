@@ -1,6 +1,6 @@
-import { AlertTriangle, FolderOpen, Info } from 'lucide-react'
+import { AlertTriangle, BookOpen, FolderOpen, Info, Wand2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import type { AppView, InstallOptions } from '@shared/types'
+import type { AppView, InstallOptions, RequirementStatus } from '@shared/types'
 import { invoke } from '../lib/api'
 import { formatBytes, formatVersion } from '../lib/format'
 import { act, useApps } from '../stores/apps'
@@ -10,6 +10,7 @@ import { Button, Checkbox, Dialog } from './ui'
 export function InstallDialog({ view, onClose }: { view: AppView | null; onClose: () => void }) {
   const [opts, setOpts] = useState<InstallOptions | null>(null)
   const [busy, setBusy] = useState(false)
+  const [force, setForce] = useState(false)
   const requirements = useApps((s) => s.requirements)
   const app = view?.app
 
@@ -22,13 +23,21 @@ export function InstallDialog({ view, onClose }: { view: AppView | null; onClose
         desktopShortcut: true,
         startMenuShortcut: true,
         components: (app.components ?? []).filter((c) => c.default).map((c) => c.id),
-        launchAfter: true
+        launchAfter: true,
+        installPrerequisites: true
       })
     )
   }, [app])
 
   if (!view || !app) return null
-  const missing = app.requirements.filter((r) => !r.optional && requirements.find((s) => s.id === r.id)?.ok === false)
+  // Required prerequisites that aren't installed: winget can do some, the rest need the guide.
+  const missing = app.requirements
+    .filter((r) => !r.optional)
+    .map((r) => requirements.find((s) => s.id === r.id))
+    .filter((s) => s && !s.ok) as RequirementStatus[]
+  const automatic = missing.filter((s) => s.canInstall)
+  const manual = missing.filter((s) => !s.canInstall || (opts && !opts.installPrerequisites))
+  const blocked = manual.length > 0 && !force
   const patch = (p: Partial<InstallOptions>): void => setOpts((o) => (o ? { ...o, ...p } : o))
 
   const install = async (): Promise<void> => {
@@ -67,7 +76,7 @@ export function InstallDialog({ view, onClose }: { view: AppView | null; onClose
           <Button variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" disabled={!opts || busy} onClick={() => void install()}>
+          <Button variant="primary" disabled={!opts || busy || blocked} onClick={() => void install()}>
             Install{view.latest ? ` ${formatVersion(view.latest.version)}` : ''}
           </Button>
         </>
@@ -133,10 +142,42 @@ export function InstallDialog({ view, onClose }: { view: AppView | null; onClose
             <section>
               <div className="mb-2 text-xs font-medium tracking-wide text-faint uppercase">Requirements</div>
               <RequirementList refs={app.requirements} />
-              {missing.length > 0 && (
-                <div className="mt-3 flex gap-2 rounded-lg border border-[#fbbf24]/25 bg-[#fbbf24]/[0.07] px-3 py-2 text-[13px] text-[#fcd679]">
-                  <AlertTriangle className="mt-0.5 size-4 shrink-0" />
-                  <span>Install the missing requirements first, or the setup may fail.</span>
+              {automatic.length > 0 && (
+                <div className="mt-3 rounded-lg border border-accent/30 bg-accent-soft px-3 py-2.5 text-[13px]">
+                  <Checkbox
+                    checked={opts.installPrerequisites}
+                    onChange={(v) => patch({ installPrerequisites: v })}
+                    label={
+                      <span className="flex items-center gap-1.5">
+                        <Wand2 className="size-3.5 text-[#ff6b72]" />
+                        Install {automatic.map((s) => s.label).join(' and ')} automatically first
+                      </span>
+                    }
+                    hint="With winget, before the app. Windows may ask for permission."
+                  />
+                </div>
+              )}
+              {manual.length > 0 && (
+                <div className="mt-3 space-y-2 rounded-lg border border-[#fbbf24]/25 bg-[#fbbf24]/[0.07] px-3 py-2.5 text-[13px] text-[#fcd679]">
+                  <p className="flex gap-2">
+                    <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+                    <span>
+                      {manual.map((s) => s.label).join(' and ')} {manual.length > 1 ? 'need' : 'needs'} to be installed
+                      by hand first. The steps walk you through it.
+                    </span>
+                  </p>
+                  <div className="flex flex-wrap items-center gap-2 pl-6">
+                    {manual.map((s) => (
+                      <Button key={s.id} size="sm" onClick={() => useApps.setState({ guideId: s.id })}>
+                        <BookOpen className="size-3.5" /> How to install {s.label}
+                      </Button>
+                    ))}
+                    {!force && (
+                      <button className="cursor-pointer text-xs text-faint underline hover:text-muted" onClick={() => setForce(true)}>
+                        Install anyway
+                      </button>
+                    )}
+                  </div>
                 </div>
               )}
             </section>

@@ -32,8 +32,10 @@ click, keep it updated, and launch it, all from a single black-and-red window.
 - **Uninstall** removes the shortcuts and moves the app's folder to the Recycle Bin (apps with a setup program run
   their own uninstaller first). Installs the launcher found or that you located are only forgotten; their files
   are never touched.
-- **Requirements** (Python, FFmpeg, Git, an NVIDIA GPU, .NET Framework) are checked on each app's page. Missing
-  ones can be installed with winget from there or from Settings.
+- **Prerequisites** (Python, FFmpeg, Git, an NVIDIA GPU, .NET Framework) are checked on each app's page. When you
+  install an app, missing ones it needs are installed first with winget (Python with *Add to PATH*). Anything winget
+  can't install (a GPU driver, or any of them on a PC without winget) gets a step-by-step guide with a *Check again*
+  button, and the install waits until it's found.
 
 Settings and the list of installed apps are kept in `%APPDATA%\RulZ AI Tools Suite`.
 
