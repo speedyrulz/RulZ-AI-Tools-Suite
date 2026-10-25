@@ -211,8 +211,11 @@ class RaceParallelMixin:
                     batch = next(st["batch_iter"])
                     step_images[v.idx] = step_images.get(v.idx, 0) + len(batch)
                     latents, embeds, mask, regions = load_batch(batch, cfg, st["rng"])
-                    sigma = sample_sigmas(cfg, latents.shape[0], st["gen"], st["ts_logit_shift"],
-                                          tokens=latents.shape[2] * latents.shape[3], arch=self.arch)
+                    tok = latents.shape[2] * latents.shape[3]
+                    shift = st["ts_logit_shift"] + (self._clean_offset(  # clean_share: the epoch's share
+                        cfg, st["step"], tok, st.get("batcher"), cfg.batch_size * cfg.gradient_accumulation)
+                        if cfg.clean_share else 0.0)
+                    sigma = sample_sigmas(cfg, latents.shape[0], st["gen"], shift, tokens=tok, arch=self.arch)
                     noise = torch.randn(latents.shape, generator=st["gen"])
                     per_rep[k].append((self.replicas[reps[k]], batch, latents, embeds, mask, sigma, noise, regions,
                                        st["step"] + 1, n_total, ctx))

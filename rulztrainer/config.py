@@ -231,6 +231,8 @@ class TrainConfig:
     logit_std: float = 1.0
     sigmoid_scale: float = 1.0  # sigmoid mode: sigma = sigmoid(randn * sigmoid_scale)
     timestep_shift: float = 1.0  # sigma shift applied to sampled sigmas (training_shift is 1.0 upstream)
+    clean_share: str = ""  # share of steps below sigma 0.5 by epoch (clean_share.py): "" = the sampler's own,
+    #                        "40", "75:5:40", or Fizgig's MOSS Slide "60:7:30:15:2"
     loss_weighting: str = "none"  # none | min_snr (sigma-based) | sigma_sqrt
 
     # --- saving / sampling ---
@@ -390,6 +392,9 @@ class TrainConfig:
             if not (0.0 < float(mp) <= 16.0):
                 raise ValueError(f"resolutions must be megapixel values in (0, 16], got {mp!r}")
         self.validate_datasets()
+        from .clean_share import parse as parse_clean_share
+
+        parse_clean_share(self.clean_share)
         if self.id_loss_backend not in ("arcface", "facenet"):
             raise ValueError(f"id_loss_backend must be arcface or facenet, got {self.id_loss_backend!r}")
         if self.id_loss_every < 1:

@@ -909,8 +909,10 @@ class Trainer(RaceParallelMixin):
                     batch = next(self.batch_iter)  # lockstep order: copy 0, copy 1, copy 0, ...
                     step_images += len(batch)
                     latents, embeds, mask, regions = load_batch(batch, cfg, rng)
-                    sigma = sample_sigmas(cfg, latents.shape[0], gen, self.ts_logit_shift,
-                                          tokens=latents.shape[2] * latents.shape[3], arch=self.arch)
+                    tok = latents.shape[2] * latents.shape[3]
+                    shift = self.ts_logit_shift + self._clean_offset(
+                        cfg, step, tok, self.batcher, cfg.batch_size * cfg.gradient_accumulation * n_dev)
+                    sigma = sample_sigmas(cfg, latents.shape[0], gen, shift, tokens=tok, arch=self.arch)
                     noise = torch.randn(latents.shape, generator=gen)
                     per_rep[r].append((self.replicas[r], batch, latents, embeds, mask, sigma, noise, regions, step + 1,
                                        n_total))
@@ -1873,6 +1875,27 @@ class Trainer(RaceParallelMixin):
                      len(items))
         self.status.update(resolution=self._stage_label(), res_stage=self.res_stage, res_stages=len(self.sides))
 
+    def _epoch_images(self, batcher) -> int:
+        """Images in one epoch of an image queue (repeats counted)."""
+        cache = self.__dict__.setdefault("_epoch_sizes", {})
+        size = cache.get(id(batcher))
+        if size is None:
+            size = cache[id(batcher)] = max(1, sum(max(1, int(it.repeats or 1)) for it in batcher.items))
+        return size
+
+    def _clean_offset(self, cfg, steps_done: int, tokens: int, batcher, images_per_step: int) -> float:
+        """clean_share: the logit offset that puts the epoch's clean-end share of steps below sigma 0.5 (0 when
+        unset). One schedule per configuration (a race has several)."""
+        if not cfg.clean_share or batcher is None:
+            return 0.0
+        from .clean_share import CleanShare
+
+        shares = self.__dict__.setdefault("_clean_shares", {})
+        cs = shares.get(id(cfg))
+        if cs is None:
+            cs = shares[id(cfg)] = CleanShare(cfg, self.arch, log)
+        return cs.offset(steps_done * images_per_step, self._epoch_images(batcher), tokens)
+
     def _look_outlier_images(self, cfg, items) -> set[str]:
         """look_warmup: the images (as the items name them) that the look consistency filter's saved scan puts under
         its fence, in every dataset of the run."""
@@ -1900,10 +1923,7 @@ class Trainer(RaceParallelMixin):
         images of one epoch (repeats counted) of the configuration's own image queue."""
         if not getattr(self, "look_outliers", None) or not cfg.look_warmup or batcher is None:
             return None
-        cache = self.__dict__.setdefault("_look_epoch_size", {})
-        size = cache.get(id(batcher))
-        if size is None:
-            size = cache[id(batcher)] = max(1, sum(max(1, int(it.repeats or 1)) for it in batcher.items))
+        size = self._epoch_images(batcher)
         from .lookfilter import warmup_factor
 
         f = warmup_factor((cur_step - 1) * images_per_step / size, cfg.look_warmup_start, cfg.look_warmup_epochs)

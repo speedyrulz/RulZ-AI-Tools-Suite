@@ -178,6 +178,27 @@ variable is then unnecessary.
   Qwen3.5-9B text encoder embeds every caption through the chat template. Both are cached under
   `<dataset>/.rulz_cache`, then the encoders are unloaded. Training only holds the DiT and the LoRA.
 - **Timesteps.** `logit_normal` (mean/std), `sigmoid` (scale) or `uniform`, with an optional `timestep_shift`.
+- **Clean-end share** (`clean_share`, after Fizgig's MOSS-Image "Slide"; off by default). It sets the share of
+  training steps at the clean end, where sigma is below 0.5 and faces and fine detail are refined, and it can change
+  by epoch.
+  - **Where the curve starts.** RulzTrainer's default logit-normal puts 50% of steps there, MOSS's own pretraining
+    curve (`timestep_sampling: reference`) about 11%.
+  - **How it hits the target.** The sampled curve is moved along the logit axis until the share is hit after
+    `timestep_shift`, `sigma_min` / `sigma_max` and the 1000-step grid; its shape stays. The run logs each change.
+  - **Notation** (Fizgig's; percentages, and 1-based epochs of the run's image queue):
+
+    | Value | Meaning |
+    |---|---|
+    | `40` | 40% all run |
+    | `75:5:40` | 75% for 5 epochs, then 40% |
+    | `60:7:30:15` | 60% until epoch 7, sliding in a straight line to 30% by epoch 15 |
+    | `60:7:30:15:2` | the same, plus one epoch in 2 after that back at 60% (Fizgig's MOSS default, the WebUI's *Slide* button) |
+
+  - **What Fizgig measured.** On MOSS-Image, against MOSS's own ~11% curve and on its hardest dataset, Slide was the
+    best of eight schedules. It led from epoch 12 and still held 71% likeness at epoch 60. A sudden drop from 75% to
+    40% dipped likeness two epochs later.
+  - **Unmeasured here.** RulzTrainer's default already starts at 50%, so race `clean_share: "60:7:30:15:2"` against
+    `""` on your own data. It works with every model and timestep mode.
 - **Flow matching loss.** `x_t = (1 - sigma) x0 + sigma * noise`, target `noise - x0`, timestep = `sigma * 1000`,
   sigmas snapped to the model's 1000-step training grid. Default sampling is logit-normal; `timestep_shift`
   is available.

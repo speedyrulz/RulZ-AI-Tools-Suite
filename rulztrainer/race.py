@@ -40,7 +40,8 @@ RACE_KEYS: dict[str, tuple[str, ...]] = {
         "lora_plus_ratio", "lora_ema", "automagic_min_lr", "automagic_max_lr", "automagic_polarity_history",
         "automagic_clip_threshold", "automagic_groups"),
     "Timesteps & loss": (
-        "timestep_sampling", "logit_mean", "logit_std", "sigmoid_scale", "timestep_shift", "loss_weighting",
+        "timestep_sampling", "logit_mean", "logit_std", "sigmoid_scale", "timestep_shift", "clean_share",
+        "loss_weighting",
         "sigma_min", "sigma_max", "content_power", "region_weights", "face_loss_weight", "body_loss_weight",
         "background_loss_weight", "face_margin", "region_feather_cells", "region_prior_weight", "id_loss_weight",
         "id_loss_sigma_max", "id_loss_every", "id_loss_margin_cells", "id_loss_min_face_cells", "id_loss_random_ref",

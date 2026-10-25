@@ -1032,6 +1032,7 @@ class Form:
             automagic_polarity_history=int(v("automagic_polarity_history")), automagic_groups=v("automagic_groups"),
             automagic_clip_threshold=float(v("automagic_clip_threshold")),
             timestep_shift=float(v("timestep_shift")), sigmoid_scale=float(v("sigmoid_scale")),
+            clean_share=str(v("clean_share") or "").strip(),
             logit_mean=float(v("logit_mean")), logit_std=float(v("logit_std")), loss_weighting=v("loss_weighting"),
             save_every=int(v("save_every")), sample_every=int(v("sample_every")), sample_prompts=prompts,
             sample_width=aspect_size(v("sample_aspect"), v("sample_mp"))[0],
@@ -1433,6 +1434,35 @@ def setup_theme() -> None:
 def theme_colors() -> None:
     ui.colors(primary=RED, secondary="#27272A", accent="#FF3B30", dark="#131313", dark_page="#0A0A0A",
               positive="#22C55E", negative="#FF453A", info="#3F3F46", warning="#F59E0B")
+
+
+CLEAN_SLIDE = "60:7:30:15:2"  # Fizgig's MOSS-Image Slide (rulztrainer.clean_share.SLIDE)
+
+
+def clean_share_hint(form) -> str:
+    """What the timestep settings put at the clean end (sigma below 0.5), and what clean_share makes of it."""
+    from rulztrainer import clean_share as cs
+    from rulztrainer.archs import get_arch
+
+    try:
+        cfg = form.to_config()
+        schedule = cs.parse(cfg.clean_share)
+        own = cs.measured_share(cfg, 0.0, 4096, get_arch(cfg))
+    except NotImplementedError:
+        return "This model has no reference timestep recipe: pick another timestep sampling."
+    except (ValueError, TypeError) as e:
+        return f"Check the clean-end share: {e}"
+    text = f"These timestep settings put {own:.0f}% of steps at the clean end on their own."
+    if schedule is None:
+        return text
+    first, until, rest, end, every = schedule
+    if first == rest:
+        return text + f" With the schedule: {first:g}% all run."
+    plan = (f"{first:g}% until epoch {until:g}, then {rest:g}%" if end <= until else
+            f"{first:g}% until epoch {until:g}, sliding to {rest:g}% by epoch {end:g}")
+    again = (f", and after that one epoch in {every} back at {first:g}%" if every > 1 else
+             f", and after that {first:g}% again" if every == 1 else "")
+    return text + " With the schedule: " + plan + again + "."
 
 
 def section(title: str, caption: str, icon: str, open_: bool = True):
@@ -3970,6 +4000,27 @@ def build_page(local: bool = True):
                                                           lambda x: x == "logit_normal")
                                 w["timestep_shift"] = ui.number("Timestep shift", value=d.timestep_shift) \
                                     .classes("w-32")
+                            with fields():
+                                w["clean_share"] = ui.input("Clean-end share (%, by epoch)", value=d.clean_share,
+                                                            placeholder="empty = the sampler's own") \
+                                    .classes("w-64").tooltip(
+                                        "The share of training steps at the clean end (noise below half), where faces "
+                                        "and fine detail are refined; the sampling curve above is moved to hit it. "
+                                        "40 = 40% all run. 75:5:40 = 75% for 5 epochs, then 40%. 60:7:30:15:2 = "
+                                        "Fizgig's MOSS-Image Slide: 60% until epoch 7, down to 30% by epoch 15, and "
+                                        "every 2nd epoch after that one epoch at 60% again.")
+                                ui.button("Slide", on_click=lambda: w["clean_share"].set_value(CLEAN_SLIDE)) \
+                                    .props("flat dense").tooltip("Fizgig's MOSS-Image default, 60:7:30:15:2")
+                                clean_hint = hint("")
+
+                                def clean_hint_update(_=None):
+                                    clean_hint.text = clean_share_hint(f)
+
+                                ui.timer(0.1, clean_hint_update, once=True)
+                                for key in ("timestep_sampling", "logit_mean", "logit_std", "sigmoid_scale",
+                                            "content_power", "sigma_min", "sigma_max", "timestep_shift",
+                                            "clean_share"):
+                                    w[key].on_value_change(clean_hint_update)
 
                     # ---- Saving & samples
                     with section("Saving & samples", "Checkpoints and preview images", "save") as sec:
