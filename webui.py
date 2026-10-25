@@ -4208,6 +4208,7 @@ def build_page(local: bool = True):
                     race_table = ui.table(columns=[
                         {"name": "name", "label": "Configuration", "field": "name", "align": "left"},
                         {"name": "state", "label": "Status", "field": "state", "align": "left"},
+                        {"name": "at", "label": "At step", "field": "at"},
                         {"name": "score", "label": "Score now", "field": "score"},
                         {"name": "face", "label": "Face now", "field": "face"},
                         {"name": "body", "label": "Body now", "field": "body"},
@@ -4428,10 +4429,14 @@ def build_page(local: bool = True):
                     for n in names:
                         state = ("winner" if rc.get("winner") == n else f"out after round {dropped[n]}" if n in dropped
                                  else "training" if rc.get("active") == n else "waiting its turn")
-                        per_round = [h["scores"].get(n) for h in rc.get("history") or [] if n in h["scores"]]
-                        rows.append({"name": n, "state": state, "score": f1((rc.get("scores") or {}).get(n)),
+                        per_round = [(h["scores"].get(n), (h.get("steps") or {}).get(n))
+                                     for h in rc.get("history") or [] if n in h["scores"]]
+                        at = (rc.get("score_steps") or {}).get(n)
+                        rows.append({"name": n, "state": state, "at": "-" if at is None else f"step {at}",
+                                     "score": f1((rc.get("scores") or {}).get(n)),
                                      "face": part("face", n), "body": part("body", n),
-                                     "rounds": " / ".join(f1(s) for s in per_round) or "-",
+                                     "rounds": " / ".join(f1(s) + ("" if st is None else f" @{st}")
+                                                          for s, st in per_round) or "-",
                                      "settings": (rc.get("settings") or {}).get(n) or "the page's own settings"})
                     race_table.rows = rows
                     race_table.update()

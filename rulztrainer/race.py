@@ -218,7 +218,9 @@ class RaceSchedule:
         self.round = 1
         self.pending = list(self.alive)  # still to train and probe this round, in order
         self.scores: dict[int, float | None] = {}
-        self.history: list[dict] = []  # per round: {"round", "scores": {name: score}, "dropped": name | None}
+        self.history: list[dict] = []  # per round: {"round", "scores": {name: score}, "steps": {name: the step the
+        #                                score was probed at}, "dropped": name | None}
+        self.steps: dict[int, int | None] = {}
         self.dropped: dict[int, int] = {}  # index -> round it was dropped after
 
     @property
@@ -230,17 +232,18 @@ class RaceSchedule:
         """The configuration that trains now (the winner once the race is over)."""
         return self.pending[0] if self.pending else self.alive[0]
 
-    def record(self, idx: int, score: float | None) -> int | None:
+    def record(self, idx: int, score: float | None, step: int | None = None) -> int | None:
         """The probe score of `idx` after its turn this round; returns the configuration dropped when this probe ended
         a round with a drop. A missing score (no face found) counts as the lowest; on a tie the later one goes."""
         if self.done or not self.pending or idx != self.pending[0]:
             raise ValueError(f"configuration {idx} is not the one training now")
         self.pending.pop(0)
         self.scores[idx] = score
+        self.steps[idx] = step
         if self.pending:
             return None
         entry = {"round": self.round, "scores": {self.names[i]: self.scores.get(i) for i in self.alive},
-                 "dropped": None}
+                 "steps": {self.names[i]: self.steps.get(i) for i in self.alive}, "dropped": None}
         dropped = None
         if self.round > self.warmup:
             def key(i):
@@ -253,7 +256,7 @@ class RaceSchedule:
             entry["dropped"] = self.names[dropped]
         self.history.append(entry)
         self.round += 1
-        self.scores = {}
+        self.scores, self.steps = {}, {}
         self.pending = [] if self.done else list(self.alive)
         return dropped
 

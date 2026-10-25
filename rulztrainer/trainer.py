@@ -1437,7 +1437,7 @@ class Trainer:
         cur = rr.active
         score = self.controller.combined_ema if self.controller is not None else None
         rounds = len(rr.schedule.history)
-        dropped = rr.schedule.record(cur.idx, score)
+        dropped = rr.schedule.record(cur.idx, score, self.controller.last_step if self.controller is not None else None)
         if len(rr.schedule.history) > rounds:
             entry = rr.schedule.history[-1]
             fmt = ", ".join(f"{n} {'n/a' if s is None else f'{s:.1f}%'}" for n, s in entry["scores"].items())
@@ -1505,6 +1505,8 @@ class Trainer:
         out["steps"] = {v.name: (v.state.get("step", 0) if v is not rr.active else None) for v in rr.variants}
         out["scores"] = {v.name: (v.state["controller"].combined_ema if "controller" in v.state else None)
                          for v in rr.variants}
+        out["score_steps"] = {v.name: (v.state["controller"].last_step if "controller" in v.state else None)
+                              for v in rr.variants}  # the step each configuration's score is from
         # the smoothed face and body behind the combined score: [normalized, raw] (raw twice without normalization)
         out["face"], out["body"] = {}, {}
         for v in rr.variants:

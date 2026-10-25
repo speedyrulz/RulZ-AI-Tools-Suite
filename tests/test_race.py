@@ -236,3 +236,17 @@ def test_race_status_carries_face_and_body_behind_the_combined_score():
     assert [round(x, 6) for x in out["face"]["a"]] == [50.0, 42.5] and [round(x, 6) for x in out["body"]["a"]] == [50.0, 34.0]
     assert out["face"]["b"] == [None, None] and "c" not in out["face"]
     assert out["steps"] == {"a": 10, "b": None, "c": 0} and out["settings"]["a"] == "learning_rate=0.0001"
+
+
+def test_race_records_the_step_each_score_was_probed_at():
+    s = R.RaceSchedule(["a", "b"], 0)
+    assert s.record(0, 40.0, 120) is None
+    assert s.steps == {0: 120}
+    assert s.record(1, 50.0, 240) == 0  # round 1 ends: a (the lower score) is out
+    entry = s.history[0]
+    assert entry["scores"] == {"a": 40.0, "b": 50.0} and entry["steps"] == {"a": 120, "b": 240}
+    assert s.steps == {}  # the next round starts clean
+    s2 = R.RaceSchedule(["a", "b"], 0)  # an old caller without steps still works
+    s2.record(0, 1.0)
+    s2.record(1, 2.0)
+    assert s2.history[0]["steps"] == {"a": None, "b": None}

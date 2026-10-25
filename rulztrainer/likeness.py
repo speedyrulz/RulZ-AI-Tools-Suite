@@ -138,6 +138,7 @@ class LikenessController:
         self.face_bias = 0.0
         self.stopped = False
         self.n_probes = 0
+        self.last_step: int | None = None  # the step of the latest probe (the configuration's own, in a race)
         # resolution step-up: stage index into cfg.training_sides(), per-stage best and stall counter
         self.step_up = bool(getattr(cfg, "resolution_step_up", False))
         self.n_stages = len(cfg.training_sides()) if hasattr(cfg, "training_sides") else 1
@@ -204,6 +205,7 @@ class LikenessController:
         cfg = self.cfg
         actions: dict = {}
         self.n_probes += 1
+        self.last_step = step
         if self.normalize and step == 0:
             self._set_floors(face, body)
         self.face_ema = self._ema(self.face_ema, face)
