@@ -37,10 +37,11 @@ import { createShortcut, foreignShortcutPaths, removeShortcut, shortcutPaths } f
 import type { Store } from './store'
 
 const LOG_LIMIT = 3000
-// electron-builder's silent setup crashed (0xC0000005) whenever it was started from a folder inside the user
-// profile (Temp, the profile itself), but ran fine from C:\, C:\coding or C:\Windows.
 const SETUP_CWD = process.env.SystemRoot ?? 'C:\\Windows'
 const IMAGE_EXT = /\.(png|jpe?g|webp|gif)$/i
+// electron-builder's NSIS setups now and then crash at startup inside their System.dll plugin
+// (0xC0000005, before doing anything); running them again works.
+const ACCESS_VIOLATION = 0xc0000005
 
 interface JobContext {
   signal: AbortSignal
@@ -73,6 +74,17 @@ function expandEnv(path: string): string {
 /** "Receiving objects:  40% (11/27)" → "Receiving objects:", for collapsing progress counters into one line. */
 function progressKey(line: string): string | null {
   return /^(.{3,60}?:)\s+\d{1,3}% /.exec(`${line} `)?.[1] ?? null
+}
+
+/** Runs an NSIS setup or uninstaller silently, retrying the occasional startup crash. */
+async function runSetupProgram(run: string[], ctx: JobContext): Promise<number> {
+  let code = 0
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    code = await runCommand(run, { cwd: SETUP_CWD, signal: ctx.signal, gui: true })
+    if ((code | 0) !== (ACCESS_VIOLATION | 0)) break
+    ctx.log(`The setup program crashed while starting (attempt ${attempt} of 3).`)
+  }
+  return code
 }
 
 /** The install can't go on until these are installed by hand. */
@@ -481,11 +493,7 @@ export class AppManager {
       const setup = await this.fetchFile(ctx, asset.url, asset.name, asset.size, `Downloading ${release.tag}`)
       ctx.set({ phase: 'installing', label: 'Running the setup program…', progress: null })
       ctx.log(`> ${basename(setup)} /S /currentuser /D="${dir}"`)
-      const code = await runCommand([setup, '/S', '/currentuser', `/D="${dir}"`], {
-        cwd: SETUP_CWD,
-        signal: ctx.signal,
-        gui: true
-      })
+      const code = await runSetupProgram([setup, '/S', '/currentuser', `/D="${dir}"`], ctx)
       if (code !== 0) throw new Error(`The setup program exited with code ${code}.`)
       launchPath = join(dir, app.launch.target)
       for (let i = 0; i < 60 && !existsSync(launchPath); i++) await new Promise((r) => setTimeout(r, 500))
@@ -738,7 +746,7 @@ export class AppManager {
           if (existsSync(uninstaller)) {
             ctx.set({ label: 'Running the uninstaller…' })
             ctx.log(`> ${basename(uninstaller)} /S /currentuser`)
-            await runCommand([uninstaller, '/S', '/currentuser'], { cwd: SETUP_CWD, signal: ctx.signal, gui: true })
+            await runSetupProgram([uninstaller, '/S', '/currentuser'], ctx)
             // NSIS uninstallers copy themselves to %TEMP% and return at once; wait for the files to go.
             for (let i = 0; i < 120 && existsSync(info.launchPath); i++) await new Promise((r) => setTimeout(r, 500))
           }
