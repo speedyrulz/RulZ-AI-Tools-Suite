@@ -231,6 +231,8 @@ class TrainConfig:
     sigma_max: float = 1.0
     # --- identity training: LoRA+ ---
     lora_plus_ratio: float = 0.0  # lr of lora_up = lr x ratio (0/1 = off, 16 = LoRA+ paper); not with automagic3
+    network_type: str = "lora"  # lora | lokr (LyCORIS Kronecker factors: w1 up to lokr_factor square, w2 the rest)
+    lokr_factor: int = 8  # LoKr: w1 is [a, b] with a, b the largest divisors of out / in <= this (8: Fizgig's default)
     # --- identity training: automatic crops ---
     crop_augment: str = "none"  # none | face | face+bust: add face / bust crops of each image as extra items
     crop_augment_min_px: int = 0  # min crop side in source px; 0 = the training resolution (never upscale crops)

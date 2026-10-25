@@ -287,13 +287,13 @@ def test_unreadable_lora_kinds_and_sample_settings_are_reported(tmp_path, caplog
     from rulztrainer.trainer import Trainer
 
     model = Krea2Transformer(**TINY).float()
-    path = tmp_path / "lokr.safetensors"
-    save_file({"diffusion_model.blocks.0.attn.wq.lokr_w1": torch.zeros(4, 4),
-               "diffusion_model.blocks.0.attn.wq.lokr_w2": torch.zeros(16, 16),
+    path = tmp_path / "loha.safetensors"
+    save_file({"diffusion_model.blocks.0.attn.wq.hada_w1_a": torch.zeros(4, 4),
+               "diffusion_model.blocks.0.attn.wq.hada_w1_b": torch.zeros(4, 16),
                "diffusion_model.blocks.0.attn.wq.alpha": torch.tensor(4.0)}, str(path))
     with caplog.at_level(logging.WARNING, logger="rulztrainer"):
         assert L.attach_extra_lora(model, str(path), 1.0) == 0
-    assert "lokr_w1" in caplog.text and "cannot apply" in caplog.text
+    assert "hada_w1_a" in caplog.text and "cannot apply" in caplog.text
 
     def warnings_for(**kw):
         caplog.clear()

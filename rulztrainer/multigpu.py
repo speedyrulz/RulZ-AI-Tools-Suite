@@ -66,7 +66,9 @@ class DataParallelLoRA:
         for _, inj, _ in self.replicas:
             for name, src in self.primary.items():
                 rep = inj[name]
-                for ps, pr in ((src.lora_down.weight, rep.lora_down.weight), (src.lora_up.weight, rep.lora_up.weight)):
+                reps = rep.adapter_params()
+                for part, ps in src.adapter_params().items():
+                    pr = reps[part]
                     if pr.grad is None:
                         continue
                     g = pr.grad.to(ps.device, non_blocking=True)
@@ -83,7 +85,8 @@ class DataParallelLoRA:
         """Drop the replicas' LoRA grads without reducing them (a failed step's partial gradients)."""
         for _, inj, _ in self.replicas:
             for mod in inj.values():
-                mod.lora_down.weight.grad = mod.lora_up.weight.grad = None
+                for p in mod.adapter_params().values():
+                    p.grad = None
 
     def run(self, fn, jobs: list, serial: bool = False):
         """Run fn(job) for every job concurrently (one thread per device), or one after another with serial=True.

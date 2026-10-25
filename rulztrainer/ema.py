@@ -24,8 +24,8 @@ class LoraEMA:
             raise ValueError(f"EMA decay must be in (0, 1), got {decay}")
         self.decay = float(decay)
         self.total_images = int(total_images)
-        self.keys = [f"{name}.{part}" for name in injected for part in ("lora_down", "lora_up")]
-        self.params = [p for m in injected.values() for p in (m.lora_down.weight, m.lora_up.weight)]
+        self.keys = [f"{name}.{part}" for name, m in injected.items() for part in m.adapter_params()]
+        self.params = [p for m in injected.values() for p in m.adapter_params().values()]
         self.shadow: list[torch.Tensor] = []
         self.images = 0  # images averaged in so far
         self.updates = 0  # optimizer steps averaged in so far

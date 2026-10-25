@@ -763,6 +763,7 @@ class Form:
             caption_dropout_keep_trigger=bool(v("caption_dropout_keep_trigger")),
             max_token_length=int(v("max_token_length")), recache=bool(v("recache")),
             lora_rank=int(v("lora_rank")), lora_alpha=float(v("lora_alpha")),
+            network_type=v("network_type"), lokr_factor=int(v("lokr_factor") or 8),
             lora_targets=[t for t in TARGETS + list(EXTRA_TARGETS) if self.w.get(f"target_{t}") is not None
                           and self.w[f"target_{t}"].value],
             train_text_embedder=bool(v("train_text_embedder")), resume_from=s("resume_from"),
@@ -2702,11 +2703,29 @@ def build_page(local: bool = True):
                     with section("LoRA", "Adapter size, layers and blocks", "hub") as sec:
                         nav_items.append(("LoRA", "hub", sec))
                         with fields():
+                            w["network_type"] = ui.select({"lora": "LoRA", "lokr": "LoKr"}, value=d.network_type,
+                                                          label="Adapter").classes("w-28") \
+                                .tooltip("LoRA: a rank-r pair per layer (rank, alpha). LoKr: a Kronecker pair, w1 "
+                                         "up to factor x factor and w2 the rest (about 1/64 of the weights at "
+                                         "factor 8, Fizgig's measured default: its highest likeness, more natural "
+                                         "skin, ~20% slower steps). LyCORIS format: loads in ComfyUI (Krea 2 "
+                                         "included); diffusers has no LoKr loader. Rank, alpha, LoRA+ and dropout "
+                                         "are LoRA-only.")
                             w["lora_rank"] = ui.number("Rank", value=d.lora_rank, min=1, max=256, precision=0) \
-                                .classes("w-28")
-                            w["lora_alpha"] = ui.number("Alpha", value=d.lora_alpha).classes("w-28")
+                                .classes("w-28") \
+                                .bind_visibility_from(w["network_type"], "value", lambda x: x != "lokr")
+                            w["lora_alpha"] = ui.number("Alpha", value=d.lora_alpha).classes("w-28") \
+                                .bind_visibility_from(w["network_type"], "value", lambda x: x != "lokr")
+                            w["lokr_factor"] = ui.number("LoKr factor", value=d.lokr_factor, min=1, max=64,
+                                                         precision=0).classes("w-32") \
+                                .bind_visibility_from(w["network_type"], "value", lambda x: x == "lokr") \
+                                .tooltip("w1 is [a, b] with a and b the largest divisors of each layer's output / "
+                                         "input size that are <= the factor; w2 holds the rest. Lower = more "
+                                         "capacity and bigger files (8: ~400 MB on a 12B model, 16: ~100 MB). "
+                                         "Fizgig found no quality gain above 8.")
                             w["lora_plus_ratio"] = ui.number("LoRA+ ratio (0 = off, 16 = paper)",
                                                              value=d.lora_plus_ratio, step=1).classes("w-60") \
+                                .bind_visibility_from(w["network_type"], "value", lambda x: x != "lokr") \
                                 .tooltip("lora_up learns at lr x ratio (faster convergence); ignored by automagic3")
                             w["lora_save_dtype"] = ui.select(["bf16", "fp16", "fp32"], value=d.lora_save_dtype,
                                                              label="Save LoRA as").classes("w-36")
@@ -3810,6 +3829,13 @@ LoRA rules of thumb: LoRA lr is ~10x a full fine-tune lr and nearly rank-indepen
 targets; small batches with more steps beat large batches. *Dropped captions keep the trigger word* (Dataset
 section, default on): caption dropout trains on the trigger alone instead of the empty prompt, so the trigger by
 itself summons the subject.
+
+**LoKr** (*Adapter* in the LoRA section): instead of a rank-r pair, each layer learns a Kronecker pair, a small w1
+(up to factor x factor) and w2 holding the rest, so the update tiles the weight with structure rather than a thin
+slice. Fizgig's measured default is factor 8 (its highest likeness and more natural skin on the same data; ~20%
+slower steps; about 400 MB on a 12B model). Rank, alpha, LoRA+ and dropout don't apply. The file is LyCORIS
+format: ComfyUI's LoRA loader takes it for MOSS-Image and Krea 2; diffusers cannot load LoKr. A race can pit LoRA
+against LoKr: `network_type=lokr, lokr_factor=8` in one row.
 
 **Probe scores.** The face score is ArcFace's best match against the references (a stranger ~10-25, the references
 against each other ~60-80). The body score (*Body score*, Identity similarity section) is by default a DINOv2

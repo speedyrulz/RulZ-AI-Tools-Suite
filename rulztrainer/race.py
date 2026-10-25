@@ -42,7 +42,8 @@ RACE_KEYS: dict[str, tuple[str, ...]] = {
         "loss_watch_beta", "loss_watch_high", "loss_watch_low", "loss_watch_improve_tol",
         "loss_watch_healthy_mult", "loss_watch_exclude_after"),
     "LoRA rank & layers": (
-        "lora_rank", "lora_alpha", "lora_targets", "lora_blocks", "train_text_embedder", "lora_dropout"),
+        "lora_rank", "lora_alpha", "lora_targets", "lora_blocks", "train_text_embedder", "lora_dropout",
+        "network_type", "lokr_factor"),
     "Data & augmentation": ("caption_dropout", "flip_augment", "crop_augment", "crop_augment_weight"),
 }
 ALLOWED = {k for keys in RACE_KEYS.values() for k in keys}
@@ -273,23 +274,28 @@ class Variant:
         self.idx, self.name, self.cfg, self.overrides = idx, name, cfg, overrides
         self.names = list(names)  # its LoRA modules (a subset of the trainer's wrappers)
         self.rank, self.alpha, self.dropout = int(cfg.lora_rank), float(cfg.lora_alpha), float(cfg.lora_dropout)
-        self.down: dict[str, torch.Tensor] = {}  # CPU fp32 while parked
-        self.up: dict[str, torch.Tensor] = {}
+        self.kind, self.factor = str(getattr(cfg, "network_type", "lora")), int(getattr(cfg, "lokr_factor", 8))
+        self.weights: dict[str, dict[str, torch.Tensor]] = {}  # {module: {part: CPU fp32 tensor}} while parked
         self.started = False  # optimizer, scheduler and the rest are built on its first turn
         self.state: dict = {}  # the trainer's per-run state (optimizer, scheduler, ema, step, losses, ...)
         self.offloaded: list = []  # optimizer state tensors parked on the CPU: (param, key, device)
         self.alive = True
 
+    @property
+    def scale(self) -> float:
+        return self.alpha / self.rank if self.kind == "lora" else 1.0
+
     def init_lora(self, wrappers: dict, seed: int) -> None:
-        """Fresh LoRA weights: down kaiming-uniform as LoRALinear does, up zero. Seeded per module name, so every
-        configuration with the same rank starts from the same weights."""
+        """Fresh adapter weights as LoRALinear.init_adapter makes them (the first factor kaiming-uniform, the second
+        zero). Seeded per module name, so every configuration with the same shapes starts from the same weights."""
         for name in self.names:
             m = wrappers[name]
             g = torch.Generator().manual_seed((seed * 1_000_003 + zlib.crc32(name.encode())) % (2**63))
-            down = torch.empty(self.rank, m.in_features)
-            nn.init.kaiming_uniform_(down, a=math.sqrt(5), generator=g)
-            self.down[name] = down
-            self.up[name] = torch.zeros(m.out_features, self.rank)
+            shapes = m.adapter_shapes(self.kind, self.rank, self.factor)
+            first, second = list(shapes)
+            w = torch.empty(shapes[first])
+            nn.init.kaiming_uniform_(w, a=math.sqrt(5), generator=g)
+            self.weights[name] = {first: w, second: torch.zeros(shapes[second])}
 
     def view(self, use_average: bool = False) -> dict:
         """Module-like views of the parked weights (or of its weight average) for lora.save_lora."""
@@ -297,11 +303,14 @@ class Variant:
         avg = dict(zip(ema.keys, ema.shadow)) if ema is not None else {}
         out = {}
         for name in self.names:
-            down = avg.get(f"{name}.lora_down", self.down[name])
-            up = avg.get(f"{name}.lora_up", self.up[name])
-            out[name] = SimpleNamespace(lora_down=SimpleNamespace(weight=down), lora_up=SimpleNamespace(weight=up),
-                                        alpha=self.alpha, rank=self.rank)
+            parts = {part: avg.get(f"{name}.{part}", t) for part, t in self.weights[name].items()}
+            out[name] = SimpleNamespace(kind=self.kind, alpha=self.alpha, rank=self.rank, factor=self.factor,
+                                        trainable=True, adapter_params=lambda parts=parts: parts)
         return out
+
+    @property
+    def n_weights(self) -> int:
+        return sum(t.numel() for parts in self.weights.values() for t in parts.values())
 
 
 def _dropout_module(p: float) -> nn.Module:
@@ -314,18 +323,21 @@ def swap_in(v: Variant, wrappers: dict) -> None:
     does not train switched off (its weights freed)."""
     for name, m in wrappers.items():
         dev = m.weight.device
-        if name in v.down:
-            m.lora_down.weight.data = v.down[name].to(dev)
-            m.lora_up.weight.data = v.up[name].to(dev)
-            m.rank, m.alpha, m.scale = v.rank, v.alpha, v.alpha / v.rank
+        if name in v.weights:
+            if m.kind != v.kind:
+                m.set_kind(v.kind)
+            params = m.adapter_params()
+            for part, t in v.weights[name].items():
+                params[part].data = t.to(dev)
+            m.rank, m.alpha, m.factor, m.scale = v.rank, v.alpha, v.factor, v.scale
             p = getattr(m.dropout, "p", 0.0)
             if p != v.dropout:
                 m.dropout = _dropout_module(v.dropout)
             m.trainable = True
         else:
             m.trainable = False
-            m.lora_down.weight.data = torch.empty(0, m.in_features, device=dev)
-            m.lora_up.weight.data = torch.empty(m.out_features, 0, device=dev)
+            for p in m.adapter_params().values():
+                p.data = torch.empty((0,) * p.dim() if p.dim() else (0,), device=dev)
 
 
 @torch.no_grad()
@@ -333,8 +345,7 @@ def swap_out(v: Variant, wrappers: dict) -> None:
     """Park `v`'s current weights on the CPU."""
     for name in v.names:
         m = wrappers[name]
-        v.down[name] = m.lora_down.weight.detach().to("cpu", copy=True)
-        v.up[name] = m.lora_up.weight.detach().to("cpu", copy=True)
+        v.weights[name] = {part: p.detach().to("cpu", copy=True) for part, p in m.adapter_params().items()}
 
 
 def offload_optimizer(opt) -> list:

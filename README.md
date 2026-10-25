@@ -720,6 +720,26 @@ best file is copied to `<job>_best.safetensors`, and `<job>_winner.yaml` holds i
 from it). `race.json` and the Monitor tab show every configuration's score per round. Training states are saved only
 after the race, and a race cannot resume or step up resolutions.
 
+## LoKr (`network_type: lokr`)
+
+Instead of a rank-r LoRA pair, each layer learns a Kronecker pair: `w1` [a, b] with a, b the largest divisors of the
+layer's output / input size that are at most `lokr_factor`, and `w2` [out / a, in / b] full-matrix; the update is
+kron(w1, w2), applied without materializing it. w1 starts kaiming-uniform and w2 at zero, so the delta is zero at
+step 0 and both factors get gradients from step 1 (the LyCORIS / Fizgig conventions). Factor 8 is Fizgig's measured
+default ("the highest likeness we've ever measured, with noticeably more natural skin than standard LoRA on the same
+data"; ~20% slower steps; files ~1/64 of the weights, about 400 MB on a 12B model; no quality gain above 8).
+
+- `lora_rank`, `lora_alpha`, `lora_plus_ratio` and `lora_dropout` are LoRA-only; a LoKr layer's scale is 1.
+- Saved keys are LyCORIS: `<stem>.lokr_w1`, `.lokr_w2`, `.alpha` (1.0), with the family's usual stems
+  (`diffusion_model.<module>` for MOSS-Image, `transformer.<module>` for Krea 2 and FIBO). ComfyUI's LoRA loader
+  takes both for MOSS-Image and Krea 2 (it maps the diffusers stems); diffusers has no LoKr loader, so a FIBO 2.0
+  LoKr loads only back into RulzTrainer. The metadata carries `ss_network_module: lycoris.kohya` and
+  `ss_network_args: {"algo": "lokr", "factor": N}`.
+- A LoKr file (Fizgig's, ai-toolkit's, LyCORIS) also works as a sampling-only `turbo_lora` / `sample_lora`;
+  low-rank-stored factors (`lokr_w2_a/b`) are rebuilt, Tucker (`lokr_t2`) is not.
+- EMA, the configuration race (one row `network_type=lokr, lokr_factor=8` against a LoRA row trains both on the same
+  layers and lets the probes pick), the sampling model and data parallel all handle it.
+
 ## Sampling with a different model
 
 `sample_model_path` (a `.safetensors` file, a diffusers folder or a repo id) plus `sample_model_quant` use another

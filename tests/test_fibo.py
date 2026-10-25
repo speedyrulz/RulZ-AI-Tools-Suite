@@ -102,7 +102,7 @@ def test_lora_names_peft_export_and_reload(tmp_path):
     m3 = tiny()
     assert L.attach_extra_lora(m3, str(path), strength=0.5) == len(names)
     extra = m3.get_submodule("layers.0.attention.to_q").extras[0]
-    assert abs(extra[2] - (8.0 / 4) * 0.5) < 1e-6
+    assert extra[0] == "lora" and abs(extra[3] - (8.0 / 4) * 0.5) < 1e-6  # (kind, down, up, scale)
 
 
 def test_prompts_cleaning_trigger_and_null_caption():

@@ -155,7 +155,8 @@ def test_switching_configurations_is_invisible_to_each_of_them():
             _train_step(model, inj, opts[v.name], seed=10 + k)
             active = v
         R.swap_out(active, wrappers)
-        return {v.name: ({n: t.clone() for n, t in v.down.items()}, {n: t.clone() for n, t in v.up.items()})
+        return {v.name: ({n: w["lora_down"].clone() for n, w in v.weights.items()},
+                         {n: w["lora_up"].clone() for n, w in v.weights.items()})
                 for v in variants}
 
     raced = run(["a", "b", "a"])
@@ -178,7 +179,7 @@ def run_alone(layouts, which, seeds):
     for s in seeds:
         _train_step(model, inj, opt, seed=s)
     R.swap_out(v, wrappers)
-    return dict(v.down), dict(v.up)
+    return ({n: w["lora_down"] for n, w in v.weights.items()}, {n: w["lora_up"] for n, w in v.weights.items()})
 
 
 def test_replicas_and_views_follow_the_configuration(tmp_path):
@@ -210,7 +211,7 @@ def test_replicas_and_views_follow_the_configuration(tmp_path):
 
     state = load_file(str(path))
     name = vb.names[0]
-    assert torch.equal(state[f"diffusion_model.{name}.lora_up.weight"], vb.up[name].to(torch.bfloat16))
+    assert torch.equal(state[f"diffusion_model.{name}.lora_up.weight"], vb.weights[name]["lora_up"].to(torch.bfloat16))
     assert state[f"diffusion_model.{name}.lora_down.weight"].shape[0] == 8
 
 
