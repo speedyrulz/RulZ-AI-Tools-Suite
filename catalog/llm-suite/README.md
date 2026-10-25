@@ -5,6 +5,18 @@ llama.cpp build (`llama-server.exe`), one process per loaded model, bound to `12
 
 **v0.1 covers chat and model loading.** Discover/downloads, RAG and a CLI are planned.
 
+| Dark (default) | Light |
+| --- | --- |
+| ![Chat in the dark theme](docs/screenshots/chat-dark.png) | ![Chat in the light theme](docs/screenshots/chat-light.png) |
+
+![Loading a model: context length, GPU offload and a memory estimate](docs/screenshots/load-model.png)
+
+![My Models: the GGUF files in your models folder](docs/screenshots/my-models.png)
+
+![First launch: Choose your look](docs/screenshots/choose-your-look.png)
+
+<sub>Screenshots use demo content: made-up chats and header-only model files.</sub>
+
 ## Features
 
 - **My Models** — scans a folder (default `C:\LLM`) for `.gguf` files, reads GGUF metadata (architecture,
@@ -37,7 +49,9 @@ llama.cpp build (`llama-server.exe`), one process per loaded model, bound to `12
   A request for a model that isn't loaded loads it with its saved settings; models the server loaded are unloaded
   after an idle timeout. Optional API key, CORS, localhost-only or LAN, and a live request log with token counts.
   Default port 1234 (pick another if LM Studio is running).
-- GPU/RAM meters (nvidia-smi), dark/light theme, keyboard shortcuts (see Settings).
+- **Dark and light themes** — dark is the default; the first launch asks which look you want ("Choose your look").
+  Switch any time with the sun/moon button in the top bar or in Settings ▸ Appearance (Dark, Light or System).
+- GPU/RAM meters (nvidia-smi), keyboard shortcuts (see Settings).
 
 ## Engine
 

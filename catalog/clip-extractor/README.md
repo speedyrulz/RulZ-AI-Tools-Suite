@@ -6,7 +6,13 @@ A small Windows video trimmer: frame-accurate stepping, keyframe navigation,
 In/Out marks, and export either **lossless** (stream copy, when In and Out are
 on keyframes) or **re-encoded with NVIDIA NVENC** to MP4.
 
-![RulZ Simple Video Clip Extractor with a 16:9 crop box and a 2.5 second fixed-length selection](docs/screenshot.png)
+| Dark | Light |
+| --- | --- |
+| ![RulZ Simple Video Clip Extractor in the dark theme, with a 16:9 crop box and a 2.5 second fixed-length selection](docs/screenshots/main-dark.png) | ![The same view in the light theme](docs/screenshots/main-light.png) |
+
+| Choose your look (first launch) | Export dialog | Match colour to a reference photo |
+| --- | --- | --- |
+| ![First-launch prompt with Dark and Light cards](docs/screenshots/choose-your-look.png) | ![Export dialog offering a lossless cut between two keyframes](docs/screenshots/export-dialog.png) | ![Skin-tone colour match dialog with a drawn sample face](docs/screenshots/colour-match.png) |
 
 ## Download
 
@@ -210,7 +216,12 @@ The **Settings** menu sets the default output folder used for both clips and
 frame PNGs. "Save next to source video" clears it (the default). "Open output
 folder" opens the folder in Explorer. The choice is remembered between runs.
 
-**Settings → Preferences…** (Ctrl+,) opens a window with four tabs:
+**Settings → Light mode** switches between the dark (black and red, the
+default) and the light (white and red) look straight away, and is remembered.
+On the very first launch the app asks once ("Choose your look"); closing that
+window without choosing keeps Dark.
+
+**Settings → Preferences…** (Ctrl+,) opens a window with five tabs:
 
 - **Export**: codec, CQ, preset, audio handling and frame rate the Export
   dialog opens with, and whether it pre-selects Lossless when the In and Out
@@ -223,11 +234,18 @@ folder" opens the folder in Explorer. The choice is remembered between runs.
 - **Crop & clip**: the aspect ratio the crop box starts locked to, and the
   default fixed clip length in seconds or frames.
 - **Output**: save next to the source video or to a chosen folder.
+- **Appearance**: Dark or Light (the same switch as Settings → Light mode).
 
 OK saves everything and applies it to the current window straight away.
 "Restore built-in defaults" resets the first three tabs to the shipped values
 (H.264, CQ 18, p5, copy audio, 24 fps, Quick export same as Export, Free
-aspect, 2.00 s) and leaves the output folder alone.
+aspect, 2.00 s) and leaves the output folder and the theme alone.
+
+Preferences are stored per user in the registry under
+`HKEY_CURRENT_USER\Software\SimpleCut`. To try the app with a fresh profile
+without touching them (for testing, or to see the first-launch prompt again),
+point the environment variable `SIMPLECUT_SETTINGS_INI` at an .ini file
+path; that file is used instead.
 
 ## Marks and export
 
@@ -283,7 +301,7 @@ clips exported before this fix, this repairs one without touching the video:
 - `simplecut/export.py` — ffmpeg command builder + async job
 - `simplecut/app.py` — main window and export dialog
 - `simplecut/defaults.py` — stored preferences and the Preferences window
-- `simplecut/theme.py` — RulZ name, logo assets and the black-and-red theme
+- `simplecut/theme.py` — RulZ name, logo assets and the dark and light themes
 - `simplecut/assets/` — logo, icon and theme images
 - `packaging/` — Windows release build script and the notices shipped in the zip
 - `simplecut/colormatch.py` — skin-tone matching maths and dialog
