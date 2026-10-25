@@ -17,6 +17,7 @@ from pathlib import Path
 import torch
 from PIL import Image
 
+from . import attention
 from . import checkpointing as ckpt
 from . import compiling
 from . import lora as lora_mod
@@ -26,7 +27,7 @@ from .ema import LoraEMA
 from . import quant as Q
 from .config import TrainConfig
 from .config import side_to_mp
-from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, describe_sides, empty_text_path,
+from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, describe_sides, dropout_text_path,
                       items_for_side, load_batch,
                       scan_dataset, text_cache_path)
 from .archs import detect_arch, get_arch
@@ -499,7 +500,7 @@ class Trainer:
             prompts += [p for p in (cfg.probe_face_prompt, cfg.probe_body_prompt) if p] + [self.negative_prompt()]
         need_latents = cfg.recache or any(
             not it.latent_path.exists() or (it.latent_flip_path and not it.latent_flip_path.exists()) for it in items)
-        need_text = cfg.recache or not empty_text_path(cfg).exists() or any(
+        need_text = cfg.recache or not dropout_text_path(cfg).exists() or any(
             not it.text_path.exists() for it in items) or any(
             not text_cache_path(cfg, p).exists() for p in prompts)
         devices = self.side_devices()
@@ -611,6 +612,10 @@ class Trainer:
         self.arch = detect_arch(cfg, self.model_dir)
         cfg.model_arch = self.arch.name
         log.info("Model architecture: %s", self.arch.label)
+        attention.set_backend(cfg.attention_backend, cfg.device)
+        log.info("Attention backend: %s%s", attention.backend_name(),
+                 " (auto: cuDNN on a Blackwell GPU)" if cfg.attention_backend == "auto"
+                 and attention.backend_name() == "cudnn" else "")
         alloc = os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
         if alloc:
             log.info("CUDA allocator: %s", alloc)

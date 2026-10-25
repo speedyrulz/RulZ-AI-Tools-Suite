@@ -134,3 +134,20 @@ def test_normalization_defaults_floor_clamp_and_switch():
     assert rec.combined_ema == 0.7 * 15.0 + 0.3 * 82.0 and rec.face_norm == 15.0 and rec.scale == {}
     assert "face_norm_ema" in c.state() and c.state()["normalize"] is False
 
+
+def test_caption_dropout_keeps_the_trigger_word(tmp_path):
+    """Caption dropout trains on the trigger word alone (the way the LoRA is prompted), per family's trigger
+    placement; the switch off gives the empty prompt (FIBO: its null caption)."""
+    from rulztrainer import dataset as D
+
+    cfg = TrainConfig(trigger_word="zkrea", cache_dir=str(tmp_path), model_arch="krea2")
+    assert D.dropout_prompt(cfg) == "zkrea"
+    assert D.dropout_prompt(TrainConfig(trigger_word="", cache_dir=str(tmp_path), model_arch="krea2")) == ""
+    assert D.dropout_prompt(TrainConfig(trigger_word="zkrea", caption_dropout_keep_trigger=False,
+                                        cache_dir=str(tmp_path), model_arch="krea2")) == ""
+    fibo = TrainConfig(trigger_word="zkrea", cache_dir=str(tmp_path), model_arch="fibo2")
+    assert '"short_description":"zkrea"' in D.dropout_prompt(fibo)
+    fibo_off = TrainConfig(trigger_word="zkrea", caption_dropout_keep_trigger=False, cache_dir=str(tmp_path),
+                           model_arch="fibo2")
+    assert '"short_description":""' in D.dropout_prompt(fibo_off)
+    assert D.dropout_text_path(cfg) != D.dropout_text_path(fibo_off)

@@ -26,6 +26,8 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from ..attention import sdpa
+
 ADALN_EMBED_DIM = 256
 
 
@@ -178,8 +180,7 @@ class Attention(nn.Module):
             q, k = _apply_rope(q, freqs_cis), _apply_rope(k, freqs_cis)
         if attention_mask is not None and attention_mask.ndim == 2:
             attention_mask = attention_mask[:, None, None, :]
-        out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-                                             attn_mask=attention_mask)
+        out = sdpa(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=attention_mask)
         return self.to_out[0](out.transpose(1, 2).flatten(2))
 
 

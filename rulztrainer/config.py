@@ -115,6 +115,8 @@ class TrainConfig:
     nvfp4_matmul: bool = True  # nvfp4 layers on Blackwell GPUs (RTX 50): activations to NVFP4, FP4 tensor-core matmul
     #                            (W4A4, backward exact in bf16); off, or on older GPUs: weight dequantized to bf16
     nvfp4_backward: str = "bf16"  # native nvfp4 layers' grad_x: bf16 (exact) | fp4 (FP4 tensor cores, faster, approx.)
+    attention_backend: str = "auto"  # DiT attention kernel: auto (cuDNN on RTX 50 / Blackwell, else PyTorch's pick) |
+    #   torch (PyTorch picks) | cudnn | flash | efficient | math
 
     # --- dataset ---
     dataset_dir: str = "datasets/my_dataset"
@@ -130,6 +132,7 @@ class TrainConfig:
     caption_ext: str = ".txt"
     trigger_word: str = ""
     caption_dropout: float = 0.05
+    caption_dropout_keep_trigger: bool = True  # a dropped caption keeps the trigger word (else the empty prompt)
     max_token_length: int = 1024
     cache_dir: str = ""  # defaults to <dataset_dir>/.rulz_cache
     recache: bool = False

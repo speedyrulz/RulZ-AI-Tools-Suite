@@ -734,11 +734,13 @@ class Form:
             checkpoint_keep_blocks=int(v("checkpoint_keep_blocks")),
             int8_matmul=bool(v("int8_matmul")), int8_backward=v("int8_backward"),
             nvfp4_matmul=bool(v("nvfp4_matmul")), nvfp4_backward=v("nvfp4_backward"),
+            attention_backend=v("attention_backend"),
             dataset_dir=s("dataset_dir"), resolutions=sorted(float(x) for x in (v("resolutions") or [1.0])),
             resolution_step_up=bool(v("resolution_step_up")), step_up_patience=int(v("step_up_patience")),
             step_up_stop_patience=int(v("step_up_stop_patience")),
             enable_buckets=bool(v("enable_buckets")), flip_augment=bool(v("flip_augment")),
             trigger_word=s("trigger_word"), caption_dropout=float(v("caption_dropout")),
+            caption_dropout_keep_trigger=bool(v("caption_dropout_keep_trigger")),
             max_token_length=int(v("max_token_length")), recache=bool(v("recache")),
             lora_rank=int(v("lora_rank")), lora_alpha=float(v("lora_alpha")),
             lora_targets=[t for t in TARGETS + list(EXTRA_TARGETS) if self.w.get(f"target_{t}") is not None
@@ -2550,6 +2552,14 @@ def build_page(local: bool = True):
                                              "9% faster per step, LoRA gradients at cosine 0.93-0.99 to the exact "
                                              "ones, same loss over 20 steps. Noisier gradients: compare samples before "
                                              "a final run.")
+                                w["attention_backend"] = ui.select({"auto": "auto (cuDNN on RTX 50, else PyTorch's pick)",
+                                                                    "torch": "PyTorch picks", "cudnn": "cuDNN",
+                                                                    "flash": "flash", "efficient": "memory-efficient",
+                                                                    "math": "math (slow, exact)"},
+                                                                   value=d.attention_backend, label="Attention kernel")                                     .classes("w-72")                                     .tooltip("The attention kernel of the DiT blocks. cuDNN ran Krea 2 steps 15-22% "
+                                             "faster on an RTX 5060 Ti at the same loss, so auto pins it on Blackwell "
+                                             "GPUs (RTX 50, B200) and lets PyTorch pick elsewhere. A pinned kernel that "
+                                             "rejects a call falls back to PyTorch's pick with a warning.")
 
                     # ---- Dataset
                     with section("Dataset", "Images, captions and resolution", "photo_library") as sec:
@@ -2605,6 +2615,10 @@ def build_page(local: bool = True):
                             with fields():
                                 w["caption_dropout"] = ui.number("Caption dropout", value=d.caption_dropout, min=0,
                                                                  max=0.5, step=0.01).classes("w-36")
+                                w["caption_dropout_keep_trigger"] = ui.switch("Dropped captions keep the trigger word",
+                                                                              value=d.caption_dropout_keep_trigger)                                     .tooltip("A dropped caption becomes the trigger word alone instead of the empty "
+                                             "prompt, so the trigger by itself summons the subject, the way the LoRA "
+                                             "is prompted. Off: the empty prompt (FIBO: its null caption).")
                                 w["max_token_length"] = ui.number("Max caption tokens", value=d.max_token_length,
                                                                   min=64, max=4096, step=64, precision=0) \
                                     .classes("w-40")
@@ -3686,7 +3700,10 @@ as well and multiplies on the FP4 tensor cores (about 4x faster than a bf16 matm
 dequantizing), with an exact bf16 backward. GPUs without FP4 tensor cores always dequantize (a fused kernel). Pick
 the RTX 50 card as the training GPU to use it; the log says which GPUs run native. *nvfp4 backward* `FP4` (opt-in)
 runs the gradient through those layers on the FP4 tensor cores too: about 9% faster per step on Krea 2, with
-noisier gradients (cosine 0.93-0.99 to the exact ones); `bf16` stays exact.
+noisier gradients (cosine 0.93-0.99 to the exact ones); `bf16` stays exact. *Attention kernel*: `auto` pins cuDNN's
+attention on Blackwell GPUs (RTX 50, B200), where it ran Krea 2 steps 15-22% faster at the same loss, and lets
+PyTorch pick elsewhere; `torch`, `cudnn`, `flash`, `efficient`, `math` force one. A kernel that rejects a call falls
+back to PyTorch's pick with a warning.
 
 ## Training resolutions
 *Training resolutions* takes one or more megapixel values (1 MP = 1024x1024); each image is bucketed to every
@@ -3735,7 +3752,9 @@ neutral, and auto crops *hurt* when the crops had to be upscaled. Suggested reci
 (face 3 / person 1.5 / background 0.3), *LoRA+ ratio* 4 with `adamw8bit`, *Auto crops* only when your photos are
 high-resolution (crops are never upscaled by default), timesteps left at `logit_normal`.
 LoRA rules of thumb: LoRA lr is ~10x a full fine-tune lr and nearly rank-independent; keep MLP layers in the
-targets; small batches with more steps beat large batches.
+targets; small batches with more steps beat large batches. *Dropped captions keep the trigger word* (Dataset
+section, default on): caption dropout trains on the trigger alone instead of the empty prompt, so the trigger by
+itself summons the subject.
 
 **Probe scores.** The face score (ArcFace: a stranger ~10-25, the references against each other ~60-80) and the body
 score (proportions: every human ~80, the references ~90-96) are not on one scale, so with *Normalize face and body

@@ -28,6 +28,8 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from ..attention import sdpa
+
 NORM_NAMES = ("norm", "norm1", "norm2", "norm_q", "norm_k")  # modules kept in fp32 (diffusers' _keep_in_fp32_modules)
 
 
@@ -100,7 +102,7 @@ class Attention(nn.Module):
         if self.heads != self.kv_heads:  # repeated heads: every SDPA kernel accepts a mask then (see diffusers)
             k = k.repeat_interleave(self.heads // self.kv_heads, dim=2)
             v = v.repeat_interleave(self.heads // self.kv_heads, dim=2)
-        out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask)
+        out = sdpa(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask)
         out = out.transpose(1, 2).flatten(2, 3) * torch.sigmoid(gate)
         return self.to_out[0](out)
 

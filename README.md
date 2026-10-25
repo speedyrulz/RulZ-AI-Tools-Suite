@@ -430,6 +430,22 @@ ones with cosine 0.99 at sigma 0.2, 0.93-0.96 at 0.5 and 0.97-0.98 at 0.8, and a
 20 steps show that training behaves the same, not what thousands of steps do with noisier gradients. Compare
 samples on your own data before using it for a final run.
 
+### Attention kernel (`attention_backend`)
+
+The DiT blocks run PyTorch's scaled-dot-product attention. `torch` lets PyTorch pick the kernel (flash where it
+can); `cudnn`, `flash`, `efficient` and `math` pin one; `auto` (the default) pins cuDNN on a Blackwell training GPU
+(RTX 50, B200; ai-toolkit pins it there too) and lets PyTorch pick elsewhere. A pinned kernel that rejects a call (a
+mask or dtype it does not take) falls back to PyTorch's pick for the rest of the run with one warning. Measured on
+the RTX 5060 Ti, 1 MP, batch 1, 20 steps (median of steps 6-20), two runs each:
+
+| model | PyTorch's pick | cuDNN | loss (both) | peak memory (both) |
+|---|---|---|---|---|
+| Krea 2 nvfp4 | 9.40 / 8.56 s per step | 7.90 / 6.70 s per step (-16% / -22%) | 0.0725 | 14.3 GB |
+| MOSS-Image int8 | 6.66 / 6.65 s per step | 5.27 / 5.28 s per step (-21%) | 0.801 | 12.9 GB |
+
+The attention kernel is a fifth of the step at 1 MP; the RTX 40 series (Ada) is not measured, so `auto` leaves
+PyTorch's pick there. Set `cudnn` to try it on any card: the log says which kernel runs.
+
 ## Training resolutions and resolution step-up
 
 *Training resolutions* is a list of megapixel values (`resolutions: [0.25, 1.0, 4.0]` in YAML; the WebUI offers
@@ -711,6 +727,11 @@ levels).
 
 ## Dataset page
 
+Caption dropout (`caption_dropout`, 5% of batches) trains on the trigger word alone rather than the empty prompt
+(`caption_dropout_keep_trigger`, on by default, as ai-toolkit does): the trigger by itself then summons the subject,
+which is how a character LoRA is usually prompted. Off, a dropped caption is the empty prompt (FIBO: its null
+caption), the base model's unconditional input.
+
 The WebUI's Dataset tab lets you upload images and `.txt` captions into a folder, shows them in a grid, and
 writes caption edits back to the `.txt` files as you type.
 
@@ -726,7 +747,8 @@ detected from the model; `model_arch: auto`). The repo is gated: accept its term
   says Turbo itself is not meant for fine-tuning.
 - **Captions** are plain `.txt` sentences or structured VGL `.json` captions next to each image (the `.json` wins). A
   JSON caption is cleaned the way the model was trained (empty values and score keys dropped, compact form), and the
-  trigger word goes into its `short_description`. Caption dropout trains on FIBO's null caption.
+  trigger word goes into its `short_description`. Caption dropout trains on FIBO's null caption with the trigger in
+  its `short_description` (`caption_dropout_keep_trigger`), or on the null caption itself.
 - **Memory.** The bf16 transformer is 16 GB, so `transformer_quant: auto` quantizes it to int8 (W8A8) on GPUs under
   22 GB; set `none` for bf16 on a larger card. The text encoder (8.9 GB bf16) is loaded for caching only and unloaded
   afterwards (`text_encoder_quant: int8` halves it). Measured on a 16 GB RTX 4060 Ti with int8 + W8A8, rank 16 on

@@ -219,8 +219,21 @@ def augment_items(items: list[Item], cfg: TrainConfig, analysis: dict[str, dict]
 
 
 def empty_text_path(cfg: TrainConfig) -> Path:
-    """The cached embedding caption dropout trains on (the empty prompt; FIBO 2.0's null caption)."""
+    """The cached embedding of the empty prompt (FIBO 2.0's null caption)."""
     return text_cache_path(cfg, get_arch(cfg).empty_prompt)
+
+
+def dropout_prompt(cfg: TrainConfig) -> str:
+    """What caption dropout trains on: the trigger word alone (caption_dropout_keep_trigger, so the trigger by itself
+    summons the subject, the way the LoRA is prompted), else the empty prompt."""
+    arch = get_arch(cfg)
+    if cfg.caption_dropout_keep_trigger and cfg.trigger_word:
+        return arch.add_trigger(arch.empty_prompt, cfg.trigger_word)  # FIBO: into the null caption's short_description
+    return arch.empty_prompt
+
+
+def dropout_text_path(cfg: TrainConfig) -> Path:
+    return text_cache_path(cfg, dropout_prompt(cfg))
 
 
 # ---------------------------------------------------------------- caching
@@ -267,7 +280,7 @@ def text_jobs(items: list[Item], cfg: TrainConfig, extra_prompts: list[str] | No
     jobs: dict[Path, str] = {}
     for it in items:
         jobs.setdefault(it.text_path, it.caption)
-    jobs.setdefault(empty_text_path(cfg), get_arch(cfg).empty_prompt)
+    jobs.setdefault(dropout_text_path(cfg), dropout_prompt(cfg))
     for p in extra_prompts or []:
         jobs.setdefault(text_cache_path(cfg, p), p)
     return {k: v for k, v in jobs.items() if cfg.recache or not k.exists()}, len(jobs)
@@ -368,7 +381,7 @@ def load_batch(batch: list[Item], cfg: TrainConfig, rng: random.Random):
     pad_embeds = get_arch(cfg).pad_embeds
 
     latents, rows, maps = [], [], []
-    empty = empty_text_path(cfg)
+    empty = dropout_text_path(cfg)
     want_regions = cfg.wants_regions()
     for it in batch:
         path = it.latent_path

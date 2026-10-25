@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
+
+from ..attention import sdpa
 
 
 def _wdtype(m: nn.Module) -> torch.dtype:
@@ -56,7 +57,7 @@ def _attention(q, k, v, rope, heads):
     q = _rotate(q.reshape(shape), rope).transpose(1, 2)
     k = _rotate(k.reshape(shape), rope).transpose(1, 2)
     v = v.reshape(shape).transpose(1, 2)
-    return F.scaled_dot_product_attention(q.to(v.dtype), k.to(v.dtype), v).transpose(1, 2).flatten(2)
+    return sdpa(q.to(v.dtype), k.to(v.dtype), v).transpose(1, 2).flatten(2)
 
 
 class TextBlock(nn.Module):
