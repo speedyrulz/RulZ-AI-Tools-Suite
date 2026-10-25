@@ -263,12 +263,14 @@ def current_lr(optimizer, scheduler) -> float:
     return float(scheduler.get_last_lr()[0])
 
 
-def build_scheduler(cfg: TrainConfig, optimizer):
+def build_scheduler(cfg: TrainConfig, optimizer, offset: int = 0):
+    """offset: the run's step this optimizer starts at (a fine-tune rebuilds its optimizer every window)."""
     warm = max(0, cfg.warmup_steps)
     if cfg.optimizer.lower() == "automagic3":  # self-tuning lr: no warmup/decay from outside
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
 
     def fn(step):
+        step += offset
         if step < warm:
             return (step + 1) / (warm + 1)
         p = (step - warm) / max(1, cfg.steps - warm)
@@ -333,6 +335,11 @@ class Trainer(RaceParallelMixin):
         self.race_id_loss = None  # the identity loss shared by the configurations that use it
         self.race_parallel = False  # race_parallel: one configuration per GPU at the same time (race_parallel.py)
         self.look_outliers: set[str] = set()  # look_warmup: the look filter's outlier images (_look_outlier_images)
+        self.ft = None  # finetune.FineTuner while a full fine-tune runs
+        self.ft_rotate_steps = 1
+        self.ft_pending_save = False
+        self.ft_window = 0
+        self.ft_rotated_at = -1  # the step of the last rotation
         self.compiled = False  # torch.compile active on the DiT blocks
         self.dp_quiet_steps = 0  # consecutive data-parallel steps without a new compile
         self.replicas: list[tuple] = []  # (model, device) for every training copy, primary first
@@ -656,16 +663,26 @@ class Trainer(RaceParallelMixin):
         unknown = [t for t in cfg.lora_targets if t not in self.arch.target_groups] if not self.race_rows else []
         if unknown:
             log.warning("LoRA targets %s do not exist for %s and are ignored", unknown, self.arch.label)
-        injected = lora_mod.inject_lora(model, cfg.lora_rank, cfg.lora_alpha, cfg.lora_targets,
-                                        include_text_embedder=cfg.train_text_embedder, dropout=cfg.lora_dropout,
-                                        blocks=blocks, names=self._lora_names(model, blocks),
-                                        kind=cfg.network_type, factor=cfg.lokr_factor)
-        backprop = lora_mod.backprop_blocks(model, injected, blocks)  # blocks the backward runs from (None = all)
+        if cfg.finetune:  # the targets' own weights train, by rotation (finetune.py); no adapter
+            from .finetune import FineTuner
+
+            injected = {}
+            names = self._lora_names(model, blocks)
+            if not names:
+                raise ValueError("No layers selected to fine-tune: check lora_targets / lora_blocks")
+            self.ft = FineTuner(model, names, self.devices[0], log)
+            backprop = None  # a window spans every block: the backward runs through all of them
+        else:
+            injected = lora_mod.inject_lora(model, cfg.lora_rank, cfg.lora_alpha, cfg.lora_targets,
+                                            include_text_embedder=cfg.train_text_embedder, dropout=cfg.lora_dropout,
+                                            blocks=blocks, names=self._lora_names(model, blocks),
+                                            kind=cfg.network_type, factor=cfg.lokr_factor)
+            backprop = lora_mod.backprop_blocks(model, injected, blocks)  # blocks the backward runs from (None = all)
         if blocks is not None:
             log.info("LoRA blocks: %s (%d of %d); %s", lora_mod.format_blocks(blocks), len(blocks), len(model.layers),
                      f"backward skips blocks before {min(blocks) if blocks else 'n/a'}" if backprop is not None else
                      "LoRA before the blocks too (text fusion / projections), so the backward runs through every block")
-        if not injected:
+        if not injected and not cfg.finetune:
             raise ValueError("No LoRA modules selected: check lora_targets / lora_blocks")
         self.replicas = [(model, injected, self.devices[0])]
         if cfg.multi_gpu == "data_parallel":
@@ -697,7 +714,9 @@ class Trainer(RaceParallelMixin):
         if cfg.resume_from:
             n = lora_mod.load_lora_weights(injected, cfg.resume_from)
             log.info("Resumed %d LoRA modules from %s", n, cfg.resume_from)
-        if self.race_rows is None:
+        if self.ft is not None:
+            params, optimizer, scheduler = self._finetune_setup(cfg, items)
+        elif self.race_rows is None:
             params = list(lora_mod.lora_parameters(injected))
             n_params = sum(p.numel() for p in params)
             if cfg.network_type == "lokr":
@@ -713,7 +732,9 @@ class Trainer(RaceParallelMixin):
         if cfg.resume_state:
             step = self.load_state(cfg.resume_state, injected, optimizer, scheduler, gen, rng)
             log.info("Resumed training state from %s at step %d", cfg.resume_state, step)
-        if cfg.lora_ema > 0 and self.race_rows is None:
+        if cfg.lora_ema > 0 and self.ft is not None:
+            log.info("Weight average (lora_ema) is not kept for a fine-tune; saves extract the deltas as they are")
+        if cfg.lora_ema > 0 and self.race_rows is None and self.ft is None:
             per_step = cfg.batch_size * cfg.gradient_accumulation * len(self.replicas)
             self.ema = self._make_ema(cfg, injected)
             if self.resumed_ema is not None:
@@ -730,6 +751,10 @@ class Trainer(RaceParallelMixin):
                      "+".join(map(str, self.balancer.counts)))
         self.injected = injected
         self.sample_model = None
+        if cfg.sample_model_path and self.ft is not None:
+            log.warning("sample_model_path is ignored for a fine-tune: samples and probes render the fine-tuned model "
+                        "itself")
+            cfg.sample_model_path = ""
         if not cfg.sample_model_path:
             for m, _, _ in self.replicas:
                 self._attach_sampling_loras(m)
@@ -756,6 +781,8 @@ class Trainer(RaceParallelMixin):
         do_compile, why = compiling.decide(cfg.compile_model, cfg.steps - step, self.devices)
         if self.race_parallel and do_compile:
             do_compile, why = False, "race_parallel trains the model copies in threads at once"
+        if self.ft is not None and do_compile:
+            do_compile, why = False, "a fine-tune swaps its layers in and out of the model"
         if why:
             log.info("torch.compile %s (%s)", "on" if do_compile else "off", why)
         if do_compile:
@@ -886,7 +913,15 @@ class Trainer(RaceParallelMixin):
                 out.append((res, time.perf_counter() - t0, job[2].shape[2] * job[2].shape[3]))
             return out
 
+        def ft_rotate(at_step: int) -> None:
+            """A fine-tune's next window: the trained one written back, the next one up, a fresh optimizer."""
+            nonlocal params, optimizer, scheduler
+            params, optimizer, scheduler = self._finetune_rotate(cfg, at_step)
+
         while step < cfg.steps or self._race_running():
+            if (self.ft is not None and step > start_step and step % self.ft_rotate_steps == 0
+                    and step != self.ft_rotated_at):  # (an out-of-memory retry of a step must not rotate twice)
+                ft_rotate(step)
             t_step = time.perf_counter()
             prof = profiling.StepProfile(self.job_dir, step + 1, self.devices) if step + 1 == profile_at else None
             if prof is not None:
@@ -1039,6 +1074,11 @@ class Trainer(RaceParallelMixin):
                 self.status.update(loss_watch=summary)
                 self._refresh_batcher_weights()
             if step % cfg.save_every == 0 and step < cfg.steps:
+                if self.ft is not None and not self._finetune_cycle_done(step):
+                    self.ft_pending_save = True  # saved at the end of the cycle: every window trained alike
+                else:
+                    self.save(injected, step)
+            elif self.ft is not None and self.ft_pending_save and self._finetune_cycle_done(step) and step < cfg.steps:
                 self.save(injected, step)
             state_every = cfg.save_state_every or cfg.save_every
             if cfg.save_state and step % state_every == 0 and step < cfg.steps and not self._race_running():
@@ -1070,8 +1110,10 @@ class Trainer(RaceParallelMixin):
         if self._race_running():
             log.warning("Stopped before the race was decided; the final save is %s's (the others are in race.json "
                         "and their _dropped files)", self.race.active.name)
+        if self.ft is not None:
+            self.ft.deactivate()  # the last window's update into the deltas before the final extraction
         path = self.save(injected, step, final=True)
-        if cfg.save_state and not self._race_running():
+        if cfg.save_state and not self._race_running() and self.ft is None:
             self.save_state(step, injected, optimizer, scheduler, gen, rng)
         if cfg.sample_prompts:
             self.sample_images(model, step)
@@ -1079,6 +1121,102 @@ class Trainer(RaceParallelMixin):
             self._race_report()
         self.status.update(stage="finished", done=True)
         log.info("Done. Final LoRA: %s", path)
+
+    # ------------------------------------------------------------ full fine-tune (see finetune.py)
+    def _finetune_setup(self, cfg, items):
+        """Plan the windows for this card, activate the first and build its optimizer."""
+        from . import finetune as ft_mod
+        from .config import side_to_mp
+
+        ft = self.ft
+        if cfg.finetune_resume:
+            n = ft.load_delta(cfg.finetune_resume)
+            log.info("Fine-tune continues from %s: %d layers' deltas", cfg.finetune_resume, n)
+        dev = self.devices[0]
+        free = torch.cuda.mem_get_info(torch.device(dev))[0] if str(dev).startswith("cuda") else 64 * 2**30
+        max_mp = max((side_to_mp(s) for s in cfg.training_sides()), default=1.0)
+        reserve = cfg.finetune_reserve_gb or ft_mod.default_reserve_gb(max_mp)
+        budget = ft_mod.plan_budget(free, reserve, cfg.finetune_window_gb)
+        bpp = ft_mod.BYTES_PER_PARAM.get(cfg.optimizer.lower(), 18)
+        windows = ft.plan(budget, bpp)
+        per_step = cfg.batch_size * cfg.gradient_accumulation
+        self.ft_rotate_steps = ft_mod.epoch_steps(sum(max(1, int(it.repeats or 1)) for it in items), per_step,
+                                                  cfg.finetune_rotate_epochs)
+        self.ft_pending_save = False
+        self.ft_window = 0
+        log.info("Fine-tune: %.2fB weights in %d layers, %d window(s) of up to %.1f GiB (free %.1f GiB, %.1f GiB kept "
+                 "for activations, %d bytes per weight with %s); each window trains %g epoch(s) = %d steps, a cycle "
+                 "%d steps; saves extract rank %s", ft.n_params / 1e9, len(ft.slots), len(windows), budget / 2**30,
+                 free / 2**30, reserve, bpp, cfg.optimizer, cfg.finetune_rotate_epochs, self.ft_rotate_steps,
+                 self.ft_rotate_steps * len(windows), ", ".join(map(str, cfg.finetune_extract_ranks)))
+        for i, names in enumerate(windows):
+            log.info("  window %d: %s (%.2fB weights)", i + 1, ft_mod.describe_window(names), ft.window_params(i) / 1e9)
+        if cfg.learning_rate > 5e-5:
+            log.warning("Learning rate %g is high for a fine-tune (Fizgig measured 1e-5 on Krea 2; 1e-4 overcooks): "
+                        "the weights themselves move, not an adapter", cfg.learning_rate)
+        return self._finetune_window(cfg, 0, 0)
+
+    def _finetune_window(self, cfg, i: int, step: int):
+        params = self.ft.activate(i)
+        self.ft_window = i
+        optimizer = build_optimizer(cfg, [{"params": params, "lr": cfg.learning_rate, "name": "finetune"}])
+        scheduler = build_scheduler(cfg, optimizer, offset=step)
+        self.status.update(finetune={"window": i + 1, "windows": len(self.ft.windows), "cycle": self.ft.cycles + 1,
+                                     "layers": len(self.ft.windows[i]), "rotate_steps": self.ft_rotate_steps})
+        return params, optimizer, scheduler
+
+    def _finetune_rotate(self, cfg, step: int):
+        ft = self.ft
+        ft.deactivate()
+        free_cuda()
+        self.ft_rotated_at = step
+        nxt = (self.ft_window + 1) % len(ft.windows)
+        if nxt == 0:
+            log.info("Fine-tune: cycle %d complete at step %d (every window trained)", ft.cycles, step)
+        from .finetune import describe_window
+
+        log.info("Fine-tune: window %d of %d (%s) from step %d", nxt + 1, len(ft.windows), describe_window(ft.windows[nxt]),
+                 step)
+        return self._finetune_window(cfg, nxt, step)
+
+    def _finetune_cycle_done(self, step: int) -> bool:
+        """True at the steps that end a cycle (the last window's last step)."""
+        n = len(self.ft.windows)
+        return step % self.ft_rotate_steps == 0 and (step // self.ft_rotate_steps) % n == 0
+
+    def _finetune_save(self, step: int, final: bool, label: str = "") -> Path:
+        """Extract the deltas into a LoRA per rank (the usual file names; a second rank gets _r<rank>), and the deltas
+        themselves when asked."""
+        cfg = self.cfg
+        ft = self.ft
+        ranks = [int(r) for r in cfg.finetune_extract_ranks]
+        meta = {"ss_base_model": cfg.model_path if cfg.model_source == "hf" else Path(cfg.transformer_file).name,
+                "ss_steps": str(step), "modelspec.architecture": self.arch.modelspec, "rulztrainer_config": cfg.to_dict(),
+                "rulztrainer_finetune": f"extracted at step {step}, cycle {ft.cycles}", "ss_blocks": cfg.lora_blocks or "all"}
+        first = None
+        t0 = time.time()
+        for k, rank in enumerate(ranks):
+            suffix = f"_r{rank}" if k else ""
+            name = (f"{cfg.job_name}{label}{suffix}.safetensors" if final else
+                    f"{cfg.job_name}{label}_{step:06d}{suffix}.safetensors")
+            path = self.job_dir / name
+            stubs = ft.extract(rank, device=self.devices[0])
+            lora_mod.save_lora(stubs, path, metadata={**meta, "ss_network_dim": str(rank), "ss_network_alpha": str(rank)},
+                               dtype=cfg.lora_save_dtype, fmt=self.arch.lora_format)
+            log.info("Saved %s: rank %d LoRA extracted from %d fine-tuned layers (%.1fs)", path, rank, len(stubs),
+                     time.time() - t0)
+            if str(path) not in self.status.data["saved"]:
+                self.status.data["saved"].append(str(path))
+            first = first or path
+        if cfg.finetune_save_delta:
+            dpath = self.job_dir / f"{cfg.job_name}{label}_finetune.safetensors"
+            ft.save_delta(dpath, {**meta, "lora_format": self.arch.lora_format})
+            log.info("Saved the fine-tune's deltas %s (%.1f GB)", dpath, dpath.stat().st_size / 1e9)
+            if str(dpath) not in self.status.data["saved"]:
+                self.status.data["saved"].append(str(dpath))
+        self.ft_pending_save = False
+        self.status.write()
+        return first
 
     # ------------------------------------------------------------ saving
     @contextlib.contextmanager
@@ -1100,6 +1238,8 @@ class Trainer(RaceParallelMixin):
 
     def save(self, injected, step, final=False) -> Path:
         cfg = self.cfg
+        if getattr(self, "ft", None) is not None:
+            return self._finetune_save(step, final)
         tag = self._file_tag()  # a race's training configuration while the race runs
         name = f"{cfg.job_name}{tag}.safetensors" if final else f"{cfg.job_name}{tag}_{step:06d}.safetensors"
         path = self.job_dir / name
@@ -2087,11 +2227,14 @@ class Trainer(RaceParallelMixin):
             log.info("Resolution step-up: stage %d stalled for %d probe(s) (stage best %s)", rec.stage + 1,
                      rec.stage_since_improve, fmt(rec.stage_best))
             self._enter_stage(actions["step_up"], step)
-        if actions.get("save_best"):
+        if actions.get("save_best") and getattr(self, "ft", None) is not None:
+            path = self._finetune_save(step, True, label="_best")
+        elif actions.get("save_best"):
             path = self.job_dir / f"{cfg.job_name}{self._file_tag()}_best.safetensors"
             lora_mod.save_lora(injected, path, metadata={"ss_steps": str(step), "likeness_best": f"{rec.best:.2f}",
                                                          "modelspec.architecture": self.arch.modelspec},
                                dtype=cfg.lora_save_dtype, fmt=self.arch.lora_format)
+        if actions.get("save_best"):
             log.info("New best likeness %.1f%% at step %d -> %s", rec.best, step, path)
             if str(path) not in self.status.data["saved"]:
                 self.status.data["saved"].append(str(path))

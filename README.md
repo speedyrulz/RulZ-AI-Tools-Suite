@@ -838,6 +838,44 @@ data"; ~20% slower steps; files ~1/64 of the weights, about 400 MB on a 12B mode
 - EMA, the configuration race (one row `network_type=lokr, lokr_factor=8` against a LoRA row trains both on the same
   layers and lets the probes pick), the sampling model and data parallel all handle it.
 
+## Full fine-tune, then extract a LoRA (`finetune`)
+
+A LoRA confines every update to a few directions, so concepts compete for them and pull pose, framing and lighting
+along with the likeness. `finetune: true` trains the target layers' own weights instead (after Fizgig's fine-tune).
+Fizgig measured on Krea 2: a LoRA *extracted* from a fine-tune beat one *trained* at the same rank on the same
+dataset, and rank 64 was indistinguishable from the full 26 GB checkpoint at about 0.5 GB. The full-rank phase does
+the work; extraction is one SVD per layer. Unmeasured here.
+
+**How it fits one card.** The model stays as it was loaded (its int8 / nvfp4 trunk, or bf16). The target layers (the
+same `lora_targets` / `lora_blocks` / `train_text_embedder` as a LoRA's) are grouped into *components*, one Linear
+name across every block (every block's attention query, say), and the components are packed into *windows* of what
+the card holds. One window at a time is swapped up to fp32 weights (gradients and optimizer state only for that
+window; the forward runs in bf16), trained for `finetune_rotate_epochs` epochs, and swapped back: its update is kept
+as a bf16 *delta* in RAM, at the delta's own precision, so a small update is never rounded away, and the trunk's
+layer is re-quantized from original + delta. A *cycle* of windows trains every component once. The original
+quantized weight of every trained layer stays in RAM too, so each delta is always against the exact base the model
+loaded with and the trunk never accumulates re-quantization error.
+
+- **Windows.** Planned at launch from the free VRAM after the model loads, less an activation reserve
+  (`finetune_reserve_gb`, default 3 GB + 3 GB per megapixel), at 10 bytes per weight with adafactor (fp32 weight,
+  gradient, bf16 copy; 18 with adamw). A component larger than a window is cut into block ranges. `finetune_window_gb`
+  sets the window size by hand. The log lists the plan.
+- **Measured here.** MOSS-Image int8 on a 16 GB RTX 4060 Ti at 0.25 MP, every target, adafactor: 4.76 B weights in 10
+  windows (q, k, v, o whole; up-gate in 4 block ranges; down in 2), 13.1 GB peak, about 1.4 s per step. RAM: about
+  2 bytes per trained weight for the deltas plus the original quantized copy (MOSS: 10 + 5 GB; Krea 2: 24 + 12 GB).
+- **Saves** extract a LoRA per rank in `finetune_extract_ranks` (default `[64]`; a second rank gets `_r<rank>`), in
+  the family's usual LoRA format with alpha = rank, at cycle boundaries (`save_every` waits for the cycle to end, so
+  every saved file has each component trained alike; the best-likeness checkpoint extracts at once). Samples and
+  probes render the fine-tuned model itself, with the turbo LoRA as usual; `sample_model_path` is ignored.
+- **The deltas.** `finetune_save_delta: true` also writes `<job>_finetune.safetensors` (bf16, 2 bytes per weight: 9.5
+  GB for all of MOSS): the fine-tune's state. `finetune_resume: <that file>` continues from it, and
+  `python -m rulztrainer.extract_finetune <that file> --rank 32 64 128` extracts at other ranks without the model.
+- **Learning rate.** The weights themselves move, not an adapter: Fizgig measured 1e-5 on Krea 2 (1e-4 trains but
+  overcooks) and 3e-5 for larger-weight models. The WebUI's switch sets 1e-5 with adafactor and warns above 5e-5.
+  Runs are long: one cycle is one true epoch of the whole model.
+- **Not with** a race, data parallel (`model_split` is fine), torch.compile, the weight average, training states,
+  `resume_from` or the region prior; rank, alpha, the adapter kind, LoRA+ and dropout do not apply.
+
 ## Sampling with a different model
 
 `sample_model_path` (a `.safetensors` file, a diffusers folder or a repo id) plus `sample_model_quant` use another

@@ -1015,6 +1015,10 @@ class Form:
             max_token_length=int(v("max_token_length")), recache=bool(v("recache")),
             lora_rank=int(v("lora_rank")), lora_alpha=float(v("lora_alpha")),
             network_type=v("network_type"), lokr_factor=int(v("lokr_factor") or 8),
+            finetune=bool(v("finetune")), finetune_rotate_epochs=float(v("finetune_rotate_epochs") or 1),
+            finetune_window_gb=float(v("finetune_window_gb") or 0), finetune_reserve_gb=float(v("finetune_reserve_gb") or 0),
+            finetune_extract_ranks=parse_ranks(v("finetune_extract_ranks")),
+            finetune_save_delta=bool(v("finetune_save_delta")), finetune_resume=s("finetune_resume"),
             lora_targets=[t for t in TARGETS + list(EXTRA_TARGETS) if self.w.get(f"target_{t}") is not None
                           and self.w[f"target_{t}"].value],
             train_text_embedder=bool(v("train_text_embedder")), resume_from=s("resume_from"),
@@ -1098,6 +1102,7 @@ class Form:
                               for sp in cfg.dataset_specs() if sp.path]  # a single-folder config: that folder
         values["sample_aspect"], values["sample_mp"] = size_aspect(cfg.sample_width, cfg.sample_height)
         values["turbo_mode"] = ("auto" if cfg.turbo_lora == "auto" else "file" if cfg.turbo_lora else "none")
+        values["finetune_extract_ranks"] = ", ".join(str(r) for r in cfg.finetune_extract_ranks)
         values["turbo_lora"] = "" if cfg.turbo_lora == "auto" else cfg.turbo_lora
         targets = cfg.resolved_lora_targets()  # an empty list means the family's defaults
         for t in TARGETS + list(EXTRA_TARGETS):
@@ -1437,6 +1442,16 @@ def theme_colors() -> None:
 
 
 CLEAN_SLIDE = "60:7:30:15:2"  # Fizgig's MOSS-Image Slide (rulztrainer.clean_share.SLIDE)
+
+
+def parse_ranks(text) -> list[int]:
+    """"64, 128" -> [64, 128]; empty -> [64]."""
+    out = []
+    for part in str(text or "").replace(";", ",").split(","):
+        part = part.strip()
+        if part:
+            out.append(int(float(part)))
+    return out or [64]
 
 
 def clean_share_hint(form) -> str:
@@ -3814,6 +3829,58 @@ def build_page(local: bool = True):
                     with section("LoRA", "Adapter size, layers and blocks", "hub") as sec:
                         nav_items.append(("LoRA", "hub", sec))
                         with fields():
+                            w["finetune"] = ui.switch("Fine-tune the whole model, then extract a LoRA",
+                                                      value=d.finetune).tooltip(
+                                "Trains the target layers' own weights instead of an adapter (no rank bottleneck), "
+                                "by rotation: the model stays as loaded (int8 / nvfp4 / bf16), one window of layers "
+                                "at a time is held in fp32 and trained for N epochs, then written back as a bf16 "
+                                "delta in RAM and re-quantized. Saves extract a LoRA of the chosen rank from the "
+                                "deltas, at cycle boundaries. Fizgig measured: an extracted LoRA beat one trained at "
+                                "the same rank; rank 64 matched the full checkpoint. Needs a low learning rate "
+                                "(1e-5) and a long run; not with a race, data parallel, torch.compile, the weight "
+                                "average or the region prior.")
+                        with fields() as ft_fields:
+                            w["finetune_rotate_epochs"] = ui.number("Epochs per window", value=d.finetune_rotate_epochs,
+                                                                    min=0.05, step=0.5).classes("w-40") \
+                                .tooltip("Each window of layers trains this many epochs before the next one; a cycle "
+                                         "trains every window once. Fizgig: 1.")
+                            w["finetune_extract_ranks"] = ui.input("Extract LoRA rank(s)", value="64") \
+                                .classes("w-44").tooltip("Every save extracts a LoRA per rank, comma separated "
+                                                         "(64, 128). Rank 64 was indistinguishable from the full "
+                                                         "checkpoint in Fizgig's tests.")
+                            w["finetune_window_gb"] = ui.number("Window VRAM (GB, 0 = auto)", value=d.finetune_window_gb,
+                                                                min=0, step=0.5).classes("w-48") \
+                                .tooltip("What one window may hold: fp32 weights, gradients and optimizer state. "
+                                         "Auto: the free VRAM after the model loads, less the activation reserve.")
+                            w["finetune_reserve_gb"] = ui.number("Activation reserve (GB, 0 = auto)",
+                                                                 value=d.finetune_reserve_gb, min=0, step=0.5) \
+                                .classes("w-56").tooltip("VRAM kept out of the windows for activations and "
+                                                         "fragmentation. Auto: 3 GB + 3 GB per megapixel.")
+                            w["finetune_save_delta"] = ui.switch("Also save the deltas", value=d.finetune_save_delta) \
+                                .tooltip("<job>_finetune.safetensors, 2 bytes per trained weight (MOSS ~10 GB): the "
+                                         "fine-tune's state, to continue from or to extract at other ranks later "
+                                         "(python -m rulztrainer.extract_finetune).")
+                            w["finetune_resume"] = ui.input("Continue from deltas (optional)",
+                                                            value=d.finetune_resume).classes("w-96 max-w-full")
+                        ft_fields.bind_visibility_from(w["finetune"], "value")
+                        ft_hint = hint("")
+                        ft_hint.bind_visibility_from(w["finetune"], "value")
+
+                        def on_finetune(e):
+                            if not e.value:
+                                ft_hint.text = ""
+                                return
+                            ft_hint.text = ("Rank, alpha, the adapter kind, LoRA+ and dropout do not apply to a "
+                                            "fine-tune; the target layers and blocks do. A fine-tune wants a much "
+                                            "lower learning rate than a LoRA.")
+                            if float(w["learning_rate"].value or 0) > 5e-5:
+                                w["learning_rate"].value = 1e-5
+                                w["optimizer"].value = "adafactor"
+                                ui.notify("Fine-tune: learning rate set to 1e-5 and optimizer to adafactor "
+                                          "(Fizgig's measured settings)", type="info")
+
+                        w["finetune"].on_value_change(on_finetune)
+                        with fields():
                             w["network_type"] = ui.select({"lora": "LoRA", "lokr": "LoKr"}, value=d.network_type,
                                                           label="Adapter").classes("w-28") \
                                 .tooltip("LoRA: a rank-r pair per layer (rank, alpha). LoKr: a Kronecker pair, w1 "
@@ -4964,7 +5031,10 @@ def build_page(local: bool = True):
         pill_dot.classes(replace=f"rz-dot {state}")
         if running:
             stage = str(st.get("stage") or "starting")
-            pill_text.text = (f"Training · step {st.get('step', 0):,} / {st.get('total') or 0:,}"
+            ft = st.get("finetune") or {}
+            ft_text = (f" · fine-tune window {ft['window']}/{ft['windows']}, cycle {ft['cycle']}"
+                       if ft.get("windows") else "")
+            pill_text.text = (f"Training · step {st.get('step', 0):,} / {st.get('total') or 0:,}{ft_text}"
                               if stage == "training" else stage[:1].upper() + stage[1:])
         else:
             pill_text.text = {"error": "Last run failed", "done": "Last run finished"}.get(state, "Idle")
@@ -5204,6 +5274,19 @@ continues with the run's own names, and `<job>_winner.yaml` holds its settings. 
 the race. With data parallel on 2+ GPUs, *One configuration per GPU at the same time* trains the configurations side
 by side (an odd one left over splits over the GPUs, or runs on the first). The Monitor tab shows each configuration's score per round, with a *Drop* button on each one still in: it stops
 that configuration after the current step, saves its LoRA as `_dropped` and the race goes on without it (one left wins).
+
+## Full fine-tune, then extract a LoRA
+*Fine-tune the whole model, then extract a LoRA* (Train tab, LoRA section) trains the target layers' own weights
+instead of an adapter, after Fizgig's fine-tune: the model stays as loaded (int8 / nvfp4 / bf16), the layers are
+grouped into windows of what the card holds, and one window at a time is held in fp32 and trained for *Epochs per
+window*, then written back as a bf16 delta in RAM and re-quantized; a cycle trains every window once (the log lists
+the plan, the status pill shows the window). Every save extracts a LoRA of the rank(s) you set from the deltas, at the
+end of a cycle, so each saved file has every layer trained alike; samples and probes render the fine-tuned model
+itself. *Also save the deltas* writes `<job>_finetune.safetensors` (2 bytes per weight), to continue from (*Continue
+from deltas*) or to extract at other ranks later with `python -m rulztrainer.extract_finetune`. Fizgig measured: a LoRA
+extracted from a fine-tune beat one trained at the same rank, and rank 64 matched the full checkpoint. The switch sets
+the learning rate to 1e-5 with adafactor: the weights themselves move, so a LoRA's rate overcooks. Not with a race,
+data parallel, torch.compile, the weight average, training states or the region prior.
 
 ## Using in ComfyUI
 ComfyUI supports MOSS-Image natively. Copy the `.safetensors` to `ComfyUI/models/loras/` and use the standard

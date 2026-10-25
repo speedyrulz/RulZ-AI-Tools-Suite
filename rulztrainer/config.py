@@ -201,6 +201,14 @@ class TrainConfig:
     lora_blocks: str = ""  # DiT blocks to train, e.g. "0-41" (all), "21-41", "10-31,40", "even"; empty = all
     train_text_embedder: bool = False  # also LoRA the 2-block text projection inside the DiT
     resume_from: str = ""  # path to a previously exported LoRA .safetensors (weights only)
+    # --- full fine-tune (finetune.py): the model's own Linears by rotation, saved as extracted LoRAs ---
+    finetune: bool = False  # fine-tune the targets' weights themselves instead of a LoRA (lora_rank etc. unused)
+    finetune_rotate_epochs: float = 1.0  # epochs each window trains before the next (a cycle trains every window)
+    finetune_window_gb: float = 0.0  # VRAM a window may hold (fp32 weights, grads, optimizer state); 0 = auto
+    finetune_reserve_gb: float = 0.0  # VRAM kept free of the windows for activations; 0 = 3 GB + 3 GB per megapixel
+    finetune_extract_ranks: list[int] = field(default_factory=lambda: [64])  # the LoRA rank(s) each save extracts
+    finetune_save_delta: bool = False  # also save the deltas (<job>_finetune.safetensors, 2 bytes per weight)
+    finetune_resume: str = ""  # a delta file to continue a fine-tune from
     lora_save_dtype: str = "bf16"  # bf16 | fp16 | fp32 for the exported LoRA files
     lora_ema: float = 0.98  # weight average (EMA) decay per image for saves, samples and probes; 0 = off (see ema.py)
     save_state: bool = False  # also save optimizer/scheduler/RNG state (resumable); final state always saved
@@ -395,6 +403,8 @@ class TrainConfig:
         from .clean_share import parse as parse_clean_share
 
         parse_clean_share(self.clean_share)
+        if self.finetune:
+            self.validate_finetune()
         if self.id_loss_backend not in ("arcface", "facenet"):
             raise ValueError(f"id_loss_backend must be arcface or facenet, got {self.id_loss_backend!r}")
         if self.id_loss_every < 1:
@@ -417,6 +427,26 @@ class TrainConfig:
             if self.probe_every <= 0 or not (self.face_refs or self.body_refs):
                 raise ValueError("resolution_step_up needs likeness probes: set probe_every > 0 and face_refs "
                                  "and/or body_refs (the step-up decision is the probe likeness score)")
+
+    def validate_finetune(self) -> None:
+        """What a full fine-tune cannot combine with (finetune.py)."""
+        if self.race:
+            raise ValueError("finetune and race cannot be combined (race LoRA configurations, then fine-tune the "
+                             "winner's settings)")
+        if self.multi_gpu == "data_parallel":
+            raise ValueError("finetune does not run data parallel (its trained weights are not a LoRA to average): "
+                             "set multi_gpu to off or model_split")
+        if self.resume_from:
+            raise ValueError("finetune has no LoRA to resume from (resume_from); continue a fine-tune with "
+                             "finetune_resume (its delta file)")
+        if self.region_prior_weight > 0:
+            raise ValueError("finetune cannot use region_prior_weight (there is no base model to compare with)")
+        ranks = [int(r) for r in (self.finetune_extract_ranks or [])]
+        if not ranks or any(r < 1 for r in ranks):
+            raise ValueError("finetune_extract_ranks needs one or more ranks of 1 or more (64 is Fizgig's measured "
+                             "match for the full checkpoint)")
+        if self.finetune_rotate_epochs <= 0:
+            raise ValueError("finetune_rotate_epochs must be above 0")
 
     def validate_datasets(self) -> None:
         """Every dataset has a path, at least one repeat and megapixel resolutions; none is listed twice or lies
