@@ -14,6 +14,14 @@ A simple diffusion-model LoRA trainer with a WebUI. Supported models:
 - **Bria FIBO 2.0** (8B): train on dev, use on Edit Turbo ([details](#fibo-20-bria-training-on-dev-using-the-lora-on-edit-turbo)).
 - **Krea 2** (12B): train on Raw, use on Turbo ([details](#krea-2-training-on-raw-using-the-lora-on-turbo)).
 
+| Dark | Light |
+| --- | --- |
+| ![The Train tab in the dark look](docs/screenshots/01-train-dark.png) | ![The Train tab in the light look](docs/screenshots/02-train-light.png) |
+
+| Wizard: hardware step | Monitor | First visit |
+| --- | --- | --- |
+| ![The wizard's hardware step with recommendations](docs/screenshots/03-wizard-hardware.png) | ![The Monitor tab](docs/screenshots/04-monitor.png) | ![Choose your look](docs/screenshots/05-choose-your-look.png) |
+
 ## Install
 
 **Windows:** double-click `install.bat`. It creates `venv\`, installs CUDA PyTorch (cu130 by default; pass another
@@ -47,6 +55,10 @@ memory and on the image count and size of your dataset. *Use* takes one recommen
 every one on the page. The wizard edits the same settings as the **Train** tab, which lists every option grouped by
 topic, with rarely changed ones folded under *Advanced*. *Start training*, *Stop* and *Kill* sit in the bar at the
 bottom of the Train and Monitor tabs.
+
+The WebUI has a dark look (the default) and a light one. The first time you open it in a browser it asks which one
+you want (*Choose your look*); the sun / moon button at the top right switches between them at any time. The choice
+is kept per browser (its local storage).
 
 1. **Dataset**: a folder of images. Each image may have a same-name `.txt` caption. Use *Scan dataset*
    to see the aspect-ratio buckets. Pick one or more *Training resolutions* (megapixels); see

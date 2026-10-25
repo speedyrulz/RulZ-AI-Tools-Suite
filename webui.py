@@ -985,6 +985,24 @@ THEME_CSS = """
   --rz-bg: #0A0A0A; --rz-surface: #131313; --rz-surface-2: #1A1A1A;
   --rz-border: #262626; --rz-border-strong: #3A3A3A;
   --rz-text: #EDEDED; --rz-muted: #A1A1AA; --rz-ok: #22C55E;
+  --rz-heading: #FFFFFF; --rz-text-2: #D4D4D8; --rz-text-3: #E4E4E7; --rz-tagline: #71717A;
+  --rz-header-bg: #000000; --rz-footer-bg: rgba(0, 0, 0, .94); --rz-pill-bg: #0D0D0D; --rz-hover-border: #52525B;
+  --rz-scroll: #2A2A2A; --rz-tooltip-bg: #1F1F1F; --rz-menu-bg: #161616; --rz-deep: #050505; --rz-thumb-bg: #0E0E0E;
+  --rz-code-bg: #1F1F1F; --rz-code: #FCA5A5; --rz-dot-idle: #2A2A2A; --rz-badge-muted: #3F3F46; --rz-label: #B5B5BD;
+  --rz-warn: #FBBF24; --rz-rec: #FCA5A5; --rz-ok-text: #86EFAC; --rz-err-text: #FFB4AE; --rz-warn-text: #FCD34D;
+  --rz-track: #212121; --rz-img-bg: #000000; --rz-choice-bg: rgba(225, 6, 0, .16);
+}
+html[data-theme="light"] {
+  --rz-bg: #FFFFFF; --rz-surface: #F5F5F7; --rz-surface-2: #EBEBEF;
+  --rz-border: #D9D9DE; --rz-border-strong: #C4C4CC;
+  --rz-text: #111114; --rz-muted: #5F6068; --rz-ok: #16A34A;
+  --rz-heading: #111114; --rz-text-2: #2E2E33; --rz-text-3: #1F1F23; --rz-tagline: #6B6B73;
+  --rz-header-bg: #FFFFFF; --rz-footer-bg: rgba(255, 255, 255, .94); --rz-pill-bg: #F5F5F7; --rz-hover-border: #A1A1AA;
+  --rz-scroll: #C9C9CF; --rz-tooltip-bg: #FFFFFF; --rz-menu-bg: #FFFFFF; --rz-deep: #F5F5F7; --rz-thumb-bg: #E4E4E8;
+  --rz-code-bg: #EBEBEF; --rz-code: #B4000A; --rz-dot-idle: #A1A1AA; --rz-badge-muted: #8A8A93; --rz-label: #4A4A52;
+  --rz-warn: #B45309; --rz-rec: #C8000B; --rz-ok-text: #15803D; --rz-err-text: #B4000A; --rz-warn-text: #92400E;
+  --rz-track: #E4E4E8; --rz-img-bg: #EBEBEF; --rz-choice-bg: rgba(225, 6, 0, .08);
+  color-scheme: light;
 }
 body, .q-page-container, .q-layout { background: var(--rz-bg); }
 body {
@@ -992,31 +1010,31 @@ body {
   font-family: "Inter", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Roboto, Arial, sans-serif;
 }
 ::-webkit-scrollbar { width: 10px; height: 10px; }
-::-webkit-scrollbar-thumb { background: #2A2A2A; border-radius: 10px; }
+::-webkit-scrollbar-thumb { background: var(--rz-scroll); border-radius: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
 
 /* header: logo, status pill, tabs */
 .nicegui-header.rz-header {
-  background: #000; border-bottom: 1px solid var(--rz-border); padding: 0; gap: 0;
+  background: var(--rz-header-bg); border-bottom: 1px solid var(--rz-border); padding: 0; gap: 0;
   flex-direction: column; align-items: stretch;
 }
 .rz-header-row { max-width: 1440px; margin: 0 auto; padding: 12px 20px 2px; }
 .rz-logo { height: 30px; width: auto; display: block; }
 .rz-wordmark { letter-spacing: .34em; font-weight: 600; font-size: 12px; color: var(--rz-muted); padding-top: 7px; }
-.rz-tagline { color: #71717A; font-size: 13px; padding-top: 6px; margin-left: 8px; }
+.rz-tagline { color: var(--rz-tagline); font-size: 13px; padding-top: 6px; margin-left: 8px; }
 .rz-tabs { max-width: 1440px; margin: 0 auto; width: 100%; padding: 0 8px; }
 .rz-tabs .q-tab { color: var(--rz-muted); min-height: 44px; padding: 0 14px; }
 .rz-tabs .q-tab__label { font-weight: 500; font-size: 14px; }
 .rz-tabs .q-tab__icon { font-size: 19px; }
-.rz-tabs .q-tab--active { color: #fff; }
+.rz-tabs .q-tab--active { color: var(--rz-heading); }
 .rz-tabs .q-tab--active .q-tab__icon { color: var(--rz-red-bright); }
 .rz-tabs .q-tab__indicator { background: var(--rz-red); height: 3px; border-radius: 3px 3px 0 0; }
 .rz-pill {
   border: 1px solid var(--rz-border-strong); border-radius: 999px; padding: 4px 12px; font-size: 13px;
-  background: #0D0D0D; cursor: pointer; max-width: 320px;
+  background: var(--rz-pill-bg); cursor: pointer; max-width: 320px;
 }
-.rz-pill:hover { border-color: #52525B; }
-.rz-pill-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rz-pill:hover { border-color: var(--rz-hover-border); }
+.rz-pill-text { color: var(--rz-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .rz-dot { width: 8px; height: 8px; border-radius: 50%; background: #52525B; display: inline-block; flex-shrink: 0; }
 .rz-dot.live { background: var(--rz-red-bright); animation: rz-pulse 1.6s infinite; }
 .rz-dot.done { background: var(--rz-ok); }
@@ -1042,91 +1060,93 @@ body {
   color: var(--rz-red-bright); background: var(--rz-red-soft); border-radius: 10px; font-size: 20px;
   width: 38px; height: 38px;
 }
-.rz-section > .q-expansion-item__container > .q-item .q-item__label { font-size: 16px; font-weight: 600; color: #fff; }
+.rz-section > .q-expansion-item__container > .q-item .q-item__label { font-size: 16px; font-weight: 600; color: var(--rz-heading); }
 .rz-section > .q-expansion-item__container > .q-item .q-item__label--caption {
   font-size: 13px; color: var(--rz-muted); font-weight: 400; margin-top: 2px;
 }
 .rz-section .nicegui-expansion-content { padding: 2px 18px 20px; gap: 14px; }
 .rz-advanced { border-top: 1px dashed var(--rz-border); }
-.rz-advanced > .q-expansion-item__container > .q-item { padding: 10px 0 4px; min-height: 0; color: #C4C4CC; font-weight: 500; }
+.rz-advanced > .q-expansion-item__container > .q-item { padding: 10px 0 4px; min-height: 0; color: var(--rz-text-2); font-weight: 500; }
 .rz-advanced > .q-expansion-item__container > .q-item .q-item__section--avatar { min-width: 0; padding-right: 8px; }
 .rz-advanced > .q-expansion-item__container > .q-item .q-icon { color: var(--rz-muted); font-size: 18px; }
 .rz-section .rz-advanced .nicegui-expansion-content { padding: 8px 0 6px; gap: 14px; }
-.rz-title { font-size: 16px; font-weight: 600; color: #fff; }
-.rz-step-title { font-size: 20px; font-weight: 700; color: #fff; }
+.rz-title { font-size: 16px; font-weight: 600; color: var(--rz-heading); }
+.rz-step-title { font-size: 20px; font-weight: 700; color: var(--rz-heading); }
 .rz-subhead { font-size: 12px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--rz-muted); margin-top: 4px; }
 .rz-hint { font-size: 13px; color: var(--rz-muted); line-height: 1.55; max-width: 980px; }
-.rz-warn { color: #FBBF24; }
+.rz-warn { color: var(--rz-warn); }
 .rz-fields { gap: 14px 16px; align-items: center; flex-wrap: wrap; }
 
 /* form fields and buttons */
 .q-field--outlined .q-field__control { border-radius: 9px; }
 .q-field--outlined.q-field--dark .q-field__control:before { border-color: var(--rz-border-strong); }
-.q-field--dark .q-field__label { color: #B5B5BD; }
+.q-field__label { color: var(--rz-label); }
 .q-field--dark .q-field__native, .q-field--dark .q-field__input, .q-field--dark .q-select__dropdown-icon { color: #F4F4F5; }
+.q-field--outlined:not(.q-field--dark) .q-field__control:before { border-color: var(--rz-border-strong); }
 .q-btn { text-transform: none; font-weight: 600; letter-spacing: .01em; border-radius: 9px; }
-.q-toggle__label, .q-checkbox__label, .q-radio__label { color: #E4E4E7; }
-.q-tooltip { background: #1F1F1F; border: 1px solid var(--rz-border-strong); color: #F4F4F5; font-size: 13px; max-width: 440px; line-height: 1.45; }
-.q-menu { background: #161616; border: 1px solid var(--rz-border-strong); }
+.q-toggle__label, .q-checkbox__label, .q-radio__label { color: var(--rz-text-3); }
+.q-tooltip { background: var(--rz-tooltip-bg); border: 1px solid var(--rz-border-strong); color: var(--rz-text); font-size: 13px; max-width: 440px; line-height: 1.45; }
+.q-menu { background: var(--rz-menu-bg); border: 1px solid var(--rz-border-strong); }
 
 /* Train tab: section list on the left */
 .rz-nav { position: sticky; top: 108px; width: 210px; flex-shrink: 0; gap: 2px; }
 .rz-nav-title { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--rz-muted); padding: 2px 12px 6px; }
-.rz-nav-btn { width: 100%; color: #D4D4D8; font-weight: 500; }
+.rz-nav-btn { width: 100%; color: var(--rz-text-2); font-weight: 500; }
 .rz-nav-btn .q-btn__content { justify-content: flex-start; }
 .rz-nav-btn .q-icon { color: var(--rz-red-bright); font-size: 18px; }
 
 /* action bar */
 .nicegui-footer.rz-footer {
-  background: rgba(0, 0, 0, .94); backdrop-filter: blur(6px); border-top: 1px solid var(--rz-border); padding: 0;
+  background: var(--rz-footer-bg); backdrop-filter: blur(6px); border-top: 1px solid var(--rz-border); padding: 0;
 }
 .rz-footer-row { max-width: 1440px; margin: 0 auto; padding: 10px 20px; }
 .rz-status-msg {
-  font-size: 13px; color: #C4C4CC; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  font-size: 13px; color: var(--rz-text-2); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
   overflow: hidden;
 }
 
 /* Monitor */
 .rz-tile { background: var(--rz-surface); border: 1px solid var(--rz-border); border-radius: 12px; padding: 12px 16px; min-width: 150px; flex: 1 1 150px; }
 .rz-tile-label { font-size: 11px; color: var(--rz-muted); text-transform: uppercase; letter-spacing: .08em; }
-.rz-tile-value { font-size: 20px; font-weight: 600; color: #fff; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+.rz-tile-value { font-size: 20px; font-weight: 600; color: var(--rz-heading); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
 .rz-tile-sub { font-size: 12px; color: var(--rz-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
 .rz-banner { border-radius: 10px; padding: 10px 14px; font-size: 14px; width: 100%; }
-.rz-banner.error { background: rgba(225, 6, 0, .12); border: 1px solid rgba(255, 59, 48, .45); color: #FFB4AE; }
-.rz-banner.warning { background: rgba(245, 158, 11, .10); border: 1px solid rgba(245, 158, 11, .40); color: #FCD34D; }
-.rz-banner.info { background: #161616; border: 1px solid var(--rz-border-strong); color: #D4D4D8; }
+.rz-banner.error { background: rgba(225, 6, 0, .12); border: 1px solid rgba(255, 59, 48, .45); color: var(--rz-err-text); }
+.rz-banner.warning { background: rgba(245, 158, 11, .10); border: 1px solid rgba(245, 158, 11, .40); color: var(--rz-warn-text); }
+.rz-banner.info { background: var(--rz-surface); border: 1px solid var(--rz-border-strong); color: var(--rz-text-2); }
 .rz-banner.ok { background: rgba(34, 197, 94, .10); border: 1px solid rgba(34, 197, 94, .40); color: #86EFAC; }
 .q-uploader { background: var(--rz-surface); border: 1px dashed var(--rz-border-strong); border-radius: 12px; }
-.rz-log { background: #050505; border: 1px solid var(--rz-border); border-radius: 10px; color: #D4D4D8; }
+.q-uploader__header { color: var(--rz-text); border-bottom: 1px solid var(--rz-border); }
+.rz-log { background: var(--rz-deep); border: 1px solid var(--rz-border); border-radius: 10px; color: var(--rz-text-2); }
 .rz-thumb { background: var(--rz-surface-2); border: 1px solid var(--rz-border); border-radius: 10px; overflow: hidden; }
 .rz-ds-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; width: 100%; }
 .rz-ds-card { background: var(--rz-surface-2); border: 1px solid var(--rz-border); border-radius: 12px;
   overflow: hidden; transition: border-color .15s; min-width: 0; }
 .rz-ds-card:hover { border-color: var(--rz-border-strong); }
 .rz-ds-card.rz-ds-open { border-color: var(--rz-red); }
-.rz-ds-thumbs { display: grid; grid-template-columns: repeat(4, 1fr); gap: 2px; background: #0E0E0E; }
+.rz-ds-thumbs { display: grid; grid-template-columns: repeat(4, 1fr); gap: 2px; background: var(--rz-thumb-bg); }
 .rz-ds-empty { display: flex; align-items: center; justify-content: center; aspect-ratio: 4 / 1;
-  color: var(--rz-muted); font-size: 13px; background: #0E0E0E; }
-.rz-mono { font-family: ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace; font-size: 12px; color: #C4C4CC; }
+  color: var(--rz-muted); font-size: 13px; background: var(--rz-thumb-bg); }
+.rz-mono { font-family: ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace; font-size: 12px; color: var(--rz-text-2); }
 
 /* Wizard */
 .rz-stepper { background: transparent; box-shadow: none; }
 .rz-stepper .q-stepper__header { border-bottom: 1px solid var(--rz-border); }
 .rz-stepper .q-stepper__tab { padding: 14px 8px; }
-.rz-stepper .q-stepper__title { font-size: 13px; font-weight: 500; color: #D4D4D8; }
-.rz-stepper .q-stepper__tab--active .q-stepper__title { color: #fff; font-weight: 600; }
+.rz-stepper .q-stepper__title { font-size: 13px; font-weight: 500; color: var(--rz-text-2); }
+.rz-stepper .q-stepper__tab--active .q-stepper__title { color: var(--rz-heading); font-weight: 600; }
 .rz-stepper .q-stepper__dot { width: 30px; min-width: 30px; height: 30px; }
-.rz-stepper .q-stepper__tab:not(.q-stepper__tab--active):not(.q-stepper__tab--done) .q-stepper__dot { background: #2A2A2A; }
+.rz-stepper .q-stepper__tab:not(.q-stepper__tab--active):not(.q-stepper__tab--done) .q-stepper__dot { background: var(--rz-dot-idle); }
 .rz-stepper .q-stepper__step-inner { padding: 22px 4px 8px; }
 .rz-stepper .q-stepper__nav { padding: 18px 4px 4px; border-top: 1px solid var(--rz-border); margin-top: 8px; width: 100%; }
 .rz-setting {
   display: grid; grid-template-columns: minmax(0, 1fr) minmax(240px, 380px); gap: 10px 32px; width: 100%;
   padding: 18px 0; border-bottom: 1px solid var(--rz-border); align-items: start;
 }
-.rz-setting-title { font-weight: 600; font-size: 15px; color: #fff; }
-.rz-rec { font-size: 13px; color: #FCA5A5; margin-top: 2px; }
+.rz-setting-title { font-weight: 600; font-size: 15px; color: var(--rz-heading); }
+.rz-rec { font-size: 13px; color: var(--rz-rec); margin-top: 2px; }
 .rz-rec .q-icon { color: var(--rz-red-bright); font-size: 17px; }
-.rz-rec.ok { color: #86EFAC; }
+.rz-rec.ok { color: var(--rz-ok-text); }
 .rz-rec.ok .q-icon { color: var(--rz-ok); }
 .rz-apply { background: var(--rz-red-soft); border: 1px solid rgba(255, 59, 48, .35); border-radius: 12px; padding: 10px 14px; }
 .rz-choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; width: 100%; }
@@ -1136,39 +1156,123 @@ body {
 }
 .rz-choice:hover { border-color: #71717A; }
 .rz-choice.selected {
-  border-color: var(--rz-red); background: rgba(225, 6, 0, .16);
+  border-color: var(--rz-red); background: var(--rz-choice-bg);
   box-shadow: inset 0 0 0 1px var(--rz-red), 0 0 0 3px rgba(225, 6, 0, .18);
 }
 .rz-choice-icon { color: var(--rz-red-bright); font-size: 24px; }
 .rz-check { display: none; color: var(--rz-red-bright); font-size: 22px; }
 .rz-choice.selected .rz-check { display: inline-flex; }
 .rz-badge { font-size: 11px; font-weight: 600; letter-spacing: .04em; padding: 1px 8px; border-radius: 999px; background: var(--rz-red); color: #fff; }
-.rz-badge.muted { background: #3F3F46; }
+.rz-badge.muted { background: var(--rz-badge-muted); }
 .rz-summary { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px 24px; width: 100%; font-size: 14px; }
 .rz-summary .k { color: var(--rz-muted); }
-.rz-summary .v { color: #F4F4F5; overflow-wrap: anywhere; }
+.rz-summary .v { color: var(--rz-text-3); overflow-wrap: anywhere; }
 @media (max-width: 760px) {
   .rz-setting { grid-template-columns: 1fr; }
   .rz-panels .q-tab-panel { padding: 14px 12px 24px; }
   .rz-footer-row, .rz-header-row { padding-left: 12px; padding-right: 12px; }
 }
 
+/* light look: progress tracks, image backdrops, theme toggle, logos */
+.q-linear-progress__track { background: var(--rz-track); opacity: 1; }
+.rz-imgbg { background: var(--rz-img-bg); }
+.rz-strong { color: var(--rz-heading); }
+.rz-header-row, .rz-footer-row { color: var(--rz-text); }  /* the header and footer bars carry Quasar text-white */
+.rz-rec .q-btn { color: var(--rz-text-3); }
+.rz-light-only { display: none !important; }
+html[data-theme="light"] .rz-light-only { display: inline-flex !important; }
+html[data-theme="light"] .rz-dark-only { display: none !important; }
+.rz-theme-btn { color: var(--rz-muted); }
+.rz-theme-btn:hover { color: var(--rz-heading); }
+.rz-look-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; width: 100%; }
+.rz-look { border: 2px solid var(--rz-border-strong); border-radius: 14px; padding: 10px; cursor: pointer; gap: 10px;
+  background: var(--rz-surface); transition: border-color .15s, box-shadow .15s; }
+.rz-look:hover { border-color: var(--rz-hover-border); }
+.rz-look.selected { border-color: var(--rz-red); box-shadow: 0 0 0 3px rgba(225, 6, 0, .18); }
+.rz-look-name { font-weight: 600; font-size: 15px; color: var(--rz-heading); }
+.rz-look .rz-check { font-size: 20px; }
+.rz-look.selected .rz-check { display: inline-flex; }
+.rz-mini { border-radius: 9px; height: 96px; padding: 10px; display: flex; flex-direction: column; gap: 7px;
+  border: 1px solid #262626; overflow: hidden; align-self: stretch; }
+.rz-mini.dark { background: #0A0A0A; }
+.rz-mini.light { background: #FFFFFF; border-color: #D9D9DE; }
+.rz-mini .bar { height: 8px; border-radius: 4px; }
+.rz-mini.dark .bar { background: #1F1F1F; }
+.rz-mini.light .bar { background: #EBEBEF; }
+.rz-mini .bar.text { width: 60%; }
+.rz-mini.dark .bar.text { background: #EDEDED; }
+.rz-mini.light .bar.text { background: #111114; }
+.rz-mini .bar.red { width: 34%; background: #E10600; height: 14px; margin-top: auto; }
+.rz-mini .panel { border-radius: 6px; flex: 1; padding: 6px; display: flex; flex-direction: column; gap: 5px; }
+.rz-mini.dark .panel { background: #131313; border: 1px solid #262626; }
+.rz-mini.light .panel { background: #F5F5F7; border: 1px solid #D9D9DE; }
+
 /* Help */
 .rz-help { max-width: 920px; }
-.rz-help h2 { font-size: 20px; font-weight: 700; color: #fff; margin: 28px 0 10px; padding-bottom: 6px; border-bottom: 1px solid var(--rz-border); }
+.rz-help h2 { font-size: 20px; font-weight: 700; color: var(--rz-heading); margin: 28px 0 10px; padding-bottom: 6px; border-bottom: 1px solid var(--rz-border); }
 .rz-help h2:first-child { margin-top: 0; }
-.rz-help p, .rz-help li { color: #D4D4D8; line-height: 1.65; }
-.rz-help strong { color: #fff; }
-.rz-help code { background: #1F1F1F; color: #FCA5A5; padding: 1px 6px; border-radius: 5px; font-size: 13px; }
-.rz-help pre { background: #050505; border: 1px solid var(--rz-border); border-radius: 10px; padding: 12px 14px; overflow-x: auto; }
-.rz-help pre code { background: transparent; color: #E4E4E7; padding: 0; }
+.rz-help p, .rz-help li { color: var(--rz-text-2); line-height: 1.65; }
+.rz-help strong { color: var(--rz-heading); }
+.rz-help code { background: var(--rz-code-bg); color: var(--rz-code); padding: 1px 6px; border-radius: 5px; font-size: 13px; }
+.rz-help pre { background: var(--rz-deep); border: 1px solid var(--rz-border); border-radius: 10px; padding: 12px 14px; overflow-x: auto; }
+.rz-help pre code { background: transparent; color: var(--rz-text-3); padding: 0; }
 .rz-help a { color: var(--rz-red-bright); }
 """
+
+
+# The look (dark or light) is per browser: localStorage "rulz.theme". This runs in <head>, before anything is drawn,
+# so the page starts in the saved look; rzSetTheme switches it live (Quasar components and the CSS variables).
+THEME_KEY = "rulz.theme"
+THEME_HEAD = """<script>
+(function () {
+  var t = 'dark';
+  try { t = localStorage.getItem('%(key)s') === 'light' ? 'light' : 'dark'; } catch (e) {}
+  document.documentElement.dataset.theme = t;
+  window.rzDark = t !== 'light';
+  window.rzSetTheme = function (theme, save) {
+    if (save) { try { localStorage.setItem('%(key)s', theme); } catch (e) {} }
+    document.documentElement.dataset.theme = theme;
+    window.rzDark = theme !== 'light';
+    if (typeof setDark === 'function') setDark(window.rzDark);
+  };
+})();
+</script>
+<style>html[data-theme="light"], html[data-theme="light"] body { background: #FFFFFF; }</style>""" % {"key": THEME_KEY}
+
+# ECharts colors are options, not CSS: the light look swaps these (and back). Keys and values must not overlap.
+CHART_LIGHT = {"#F4F4F5": "#1C1C21", "#D4D4D8": "#3A3A40", "#A1A1AA": "#6E6E77", "#3F3F46": "#B8B8C0",
+               "#222222": "#E6E6EA", "#18181B": "#FFFFFE", "#52525B": "#9A9AA3", "#F59E0B": "#D97706",
+               "#34D399": "#059669", "#60A5FA": "#2563EB", "#C084FC": "#9333EA", "#FB7185": "#E11D48"}
+CHART_DARK = {v: k for k, v in CHART_LIGHT.items()}
+
+
+def _recolor(obj, table: dict):
+    if isinstance(obj, str):
+        return table.get(obj, obj)
+    if isinstance(obj, dict):
+        return {k: (v if k == "data" else _recolor(v, table)) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_recolor(v, table) for v in obj]
+    return obj
+
+
+def recolor_chart(chart, light: bool) -> None:
+    """Switch an ECharts chart built with chart_options() to the light or the dark look (no-op if already there)."""
+    if getattr(chart, "_rz_light", False) == light:
+        return
+    chart._rz_light = light
+    chart.options.update(_recolor(dict(chart.options), CHART_LIGHT if light else CHART_DARK))
+    chart.update()
 
 
 def setup_theme() -> None:
     """Once per process, before the first page: logo files, the stylesheet and outlined form fields."""
     app.add_static_files("/assets", ASSETS)
+    ui.add_head_html(THEME_HEAD, shared=True)
+    # Quasar starts in the look saved in this browser (set by THEME_HEAD) instead of always dark, so a reload in
+    # the light look does not flash dark first
+    app.config.vue_config_script = app.config.vue_config_script.replace(
+        "setDark(dark);", "setDark(window.rzDark ?? dark);")
     ui.add_css(THEME_CSS, shared=True)
     for element in (ui.input, ui.number, ui.textarea):
         element.default_props("outlined dense")
@@ -1607,7 +1711,7 @@ def build_dataset_tab(f: Form):
         with ui.row().classes("w-full items-center gap-3"):
             upload = ui.upload(label="Upload images and captions (drop files here)", multiple=True, auto_upload=True,
                                on_upload=lambda e: on_upload(e), on_multi_upload=lambda e: after_upload()) \
-                .props("accept=.png,.jpg,.jpeg,.webp,.bmp,.txt,.json flat bordered color=grey-10") \
+                .props("accept=.png,.jpg,.jpeg,.webp,.bmp,.txt,.json flat bordered color=transparent") \
                 .classes("w-[36rem] max-w-full")
             ui.space()
             with ui.row().classes("items-center gap-1 no-wrap"):
@@ -1878,7 +1982,7 @@ def build_samples_tab(f: Form):
         with grid:
             for p in files[:120]:
                 with ui.card().tight().classes("w-full rz-thumb"):
-                    ui.image(str(p)).props("fit=contain").classes("w-full h-64 bg-black cursor-pointer") \
+                    ui.image(str(p)).props("fit=contain").classes("w-full h-64 rz-imgbg cursor-pointer") \
                         .on("click", lambda _, q=p: show_full(q)).tooltip("Click to view full size")
                     sc = scores.get(p.name)
                     label = p.name + (score_caption(sc) if sc is not None else "")
@@ -2228,8 +2332,8 @@ class Wizard:
         with ui.row().classes("rz-rec items-start gap-2 no-wrap") as row:
             icon = ui.icon("lightbulb").classes("mt-[2px] shrink-0")
             label = ui.label("").classes("min-w-0")
-            btn = ui.button("Use", on_click=lambda: self.apply([key])) \
-                .props("outline dense size=sm no-caps color=white").classes("shrink-0 px-2") \
+            btn = ui.button("Use", on_click=lambda: self.apply([key]), color=None) \
+                .props("outline dense size=sm no-caps").classes("shrink-0 px-2") \
                 .tooltip("Use the recommended value")
         self.rec_rows.append((key, row, icon, label, btn))
 
@@ -2807,13 +2911,29 @@ def build_page(local: bool = True):
     theme_colors()
     ui.page_title("RulzTrainer")
     job_running = reattach_job()
+    look = {"light": False}  # this browser's look, read from its localStorage once the page is connected
+    charts: list = []  # ECharts to recolor when the look changes
+
+    def set_look(light: bool, save: bool = True) -> None:
+        look["light"] = light
+        ui.run_javascript(f"rzSetTheme({json.dumps('light' if light else 'dark')}, {json.dumps(save)})")
+        for chart in charts:
+            recolor_chart(chart, light)
 
     with ui.header().classes("rz-header"):
         with ui.row().classes("rz-header-row w-full items-center no-wrap gap-2"):
-            ui.element("img").props('src="/assets/logo_dark.png" alt="Rulz"').classes("rz-logo")
+            ui.element("img").props('src="/assets/logo_dark.png" alt="Rulz"').classes("rz-logo rz-dark-only")
+            ui.element("img").props('src="/assets/logo.png" alt="Rulz"').classes("rz-logo rz-light-only")
             ui.label("TRAINER").classes("rz-wordmark")
             ui.label("LoRA training for MOSS-Image, Bria FIBO 2.0 and Krea 2").classes("rz-tagline gt-sm")
             ui.space()
+            # sun in the dark look (switch to light), moon in the light look; CSS picks the icon, so it is right
+            # from the first paint
+            with ui.button(on_click=lambda: set_look(not look["light"]), color=None) \
+                    .props("flat round dense").classes("rz-theme-btn") as theme_btn:
+                ui.icon("light_mode").classes("rz-dark-only")
+                ui.icon("dark_mode").classes("rz-light-only")
+            theme_btn.tooltip("Switch between the dark and the light look")
             with ui.row().classes("rz-pill items-center gap-2 no-wrap") as pill:
                 pill_dot = ui.element("span").classes("rz-dot")
                 pill_text = ui.label("Idle").classes("rz-pill-text")
@@ -3222,7 +3342,7 @@ def build_page(local: bool = True):
                                 with crop_row:
                                     for pth, cap in thumbs:
                                         with ui.card().tight().classes("w-32 rz-thumb"):
-                                            ui.image(pth).props("fit=contain").classes("w-32 h-32 bg-black")
+                                            ui.image(pth).props("fit=contain").classes("w-32 h-32 rz-imgbg")
                                             ui.tooltip(cap)
 
                             ui.button("Analyse faces & preview crops", icon="center_focus_strong",
@@ -3551,7 +3671,7 @@ def build_page(local: bool = True):
                                     for crop, caption in crops:
                                         with ui.card().tight().classes("w-32 rz-thumb"):
                                             if crop:
-                                                ui.image(crop).props("fit=contain").classes("w-32 h-32 bg-black")
+                                                ui.image(crop).props("fit=contain").classes("w-32 h-32 rz-imgbg")
                                             ui.label(caption).classes("text-xs px-1")
 
                             ui.button("Preview reference faces", icon="face", on_click=on_face_preview) \
@@ -3638,7 +3758,7 @@ def build_page(local: bool = True):
                                 with region_row:
                                     for pth, cap in thumbs:
                                         with ui.card().tight().classes("w-32 rz-thumb"):
-                                            ui.image(pth).props("fit=contain").classes("w-32 h-32 bg-black")
+                                            ui.image(pth).props("fit=contain").classes("w-32 h-32 rz-imgbg")
                                             ui.tooltip(cap)
 
                             ui.button("Preview region maps", icon="grid_on", on_click=on_region_preview) \
@@ -3872,7 +3992,7 @@ def build_page(local: bool = True):
                         ("state", "Status"), ("stage", "Stage"), ("step", "Step"), ("loss", "Loss"),
                         ("lr", "Learning rate"), ("eta", "Time left"))}
                 job_bar = ui.linear_progress(value=0, show_value=False, size="6px").classes("w-full") \
-                    .props("rounded track-color=grey-10")
+                    .props("rounded")
                 error_box = ui.label("").classes("rz-banner error")
                 error_box.visible = False
                 gpu_box = ui.row().classes("w-full gap-3")
@@ -3893,11 +4013,13 @@ def build_page(local: bool = True):
                          _line("id loss (smoothed)", "#F4F4F5", yAxisIndex=1,
                                lineStyle={"width": 2, "type": "dashed"})],
                         ["raw", "smoothed"])).classes("w-full h-72")
+                    charts.append(loss_chart)
                 with section("Identity similarity", "Face / body / combined score of every sample", "face") as face_exp:
                     face_label = hint("")
                     face_chart = ui.echart(chart_options(_axis("step", min="dataMin"),
                                                          _axis("similarity %", min=0, max=100), [], [])) \
                         .classes("w-full h-60")
+                    charts.append(face_chart)
                 face_exp.visible = False
                 with section("Per-image loss watch", "Verdict per training image", "rule") as lw_exp:
                     lw_label = hint("")
@@ -3938,6 +4060,7 @@ def build_page(local: bool = True):
                          {"name": "body (probe)", "type": "scatter", "symbolSize": 5, "data": [],
                           "itemStyle": {"color": "#A1A1AA"}}],
                         ["face", "body", "combined", "face (probe)", "body (probe)"])).classes("w-full h-60")
+                    charts.append(probe_chart)
                     probe_row = ui.row().classes("w-full gap-2")
                 probe_exp.visible = False
                 shown_probes: list[str] = []
@@ -3963,13 +4086,13 @@ def build_page(local: bool = True):
                     with gpu_box:
                         for _ in stats:
                             with ui.column().classes("rz-tile gap-1 min-w-[18rem]"):
-                                name = ui.label("").classes("text-sm font-semibold text-white")
+                                name = ui.label("").classes("text-sm font-semibold rz-strong")
                                 bars = {}
                                 for key, color in (("vram", "primary"), ("util", "grey-5")):
                                     with ui.row().classes("w-full items-center gap-2 no-wrap"):
                                         ui.label("VRAM" if key == "vram" else "Load").classes("rz-tile-sub w-10")
                                         bar = ui.linear_progress(value=0, show_value=False, size="6px",
-                                                                 color=color).props("rounded track-color=grey-10") \
+                                                                 color=color).props("rounded") \
                                             .classes("flex-1")
                                         text = ui.label("").classes("rz-tile-sub w-28 text-right")
                                     bars[key] = (bar, text)
@@ -4182,7 +4305,7 @@ def build_page(local: bool = True):
                         with probe_row:
                             for p in latest_imgs:
                                 with ui.card().tight().classes("rz-thumb"):
-                                    ui.image(p).props("fit=contain").classes("w-40 h-40 bg-black cursor-pointer") \
+                                    ui.image(p).props("fit=contain").classes("w-40 h-40 rz-imgbg cursor-pointer") \
                                         .on("click", lambda _, q=p: show_full(Path(q)))
                                     ui.label(Path(p).name).classes("text-xs px-1")
                 score_by_name = {Path(sc["image"]).name: sc for sc in fscores}
@@ -4196,7 +4319,7 @@ def build_page(local: bool = True):
                             hint("No samples yet. They appear here every 'Sample every' steps.")
                         for p, pct in sample_sig:
                             with ui.card().tight().classes("rz-thumb"):
-                                ui.image(p).props("fit=contain").classes("w-48 h-48 bg-black cursor-pointer") \
+                                ui.image(p).props("fit=contain").classes("w-48 h-48 rz-imgbg cursor-pointer") \
                                     .on("click", lambda _, q=p: show_full(Path(q)))
                                 caption = Path(p).name
                                 sc_ = score_by_name.get(Path(p).name)
@@ -4231,12 +4354,13 @@ def build_page(local: bool = True):
                     ui.spinner(size="sm")
                     task_text = ui.label("").classes("text-sm")
                     task_bar = ui.linear_progress(value=0, show_value=False, size="6px").classes("w-48") \
-                        .props("rounded track-color=grey-10")
+                        .props("rounded")
                 task_row.visible = False
             with ui.row().classes("items-center gap-2 no-wrap"):
                 ui.button("Start training", icon="play_arrow", on_click=start_job).props("unelevated")
-                ui.button("Stop", icon="stop", on_click=lambda: setattr(status_msg, "text", stop_training())) \
-                    .props("outline color=white").tooltip("Stop after the current step and save the LoRA")
+                ui.button("Stop", icon="stop", on_click=lambda: setattr(status_msg, "text", stop_training()),
+                          color=None) \
+                    .props("outline").tooltip("Stop after the current step and save the LoRA")
                 ui.button("Kill", icon="dangerous", on_click=lambda: setattr(status_msg, "text", kill_training())) \
                     .props("flat color=negative").tooltip("End the process now, without a final save")
     footer.bind_value_from(tabs, "value", lambda t: t in ("Train", "Monitor", tab_train, tab_monitor))
@@ -4286,6 +4410,65 @@ def build_page(local: bool = True):
 
     tabs.on_value_change(remember_tab)
     ui.timer(0.05, restore_tab, once=True)
+
+    def choose_look() -> None:
+        """First visit in this browser (no saved look): pick Dark or Light. Closing the dialog keeps Dark."""
+        picked = {"light": False, "saved": False}
+        with ui.dialog() as dlg, ui.card().classes("rz-card gap-4").style("width: 520px; max-width: 94vw"):
+            ui.label("Choose your look").classes("rz-step-title")
+            ui.label("You can change it any time with the sun / moon button at the top right.").classes("rz-hint")
+            cards = {}
+            with ui.element("div").classes("rz-look-grid"):
+                for light, name in ((False, "Dark"), (True, "Light")):
+                    with ui.column().classes("rz-look") as c:
+                        with ui.element("div").classes("rz-mini " + ("light" if light else "dark")):
+                            ui.element("div").classes("bar text")
+                            with ui.element("div").classes("panel"):
+                                ui.element("div").classes("bar")
+                                ui.element("div").classes("bar")
+                            ui.element("div").classes("bar red")
+                        with ui.row().classes("items-center w-full no-wrap"):
+                            ui.label(name).classes("rz-look-name")
+                            ui.space()
+                            ui.icon("check_circle").classes("rz-check")
+                    cards[light] = c
+                    c.on("click", lambda _, lt=light: pick(lt))
+
+            def pick(light: bool) -> None:
+                picked["light"] = light
+                for lt, c in cards.items():
+                    c.classes(add="selected") if lt == light else c.classes(remove="selected")
+                set_look(light, save=False)  # a live preview; saved on Continue
+
+            def done() -> None:
+                picked["saved"] = True
+                set_look(picked["light"])
+                dlg.close()
+
+            def closed() -> None:
+                if not picked["saved"]:  # dismissed without Continue: Dark, saved
+                    set_look(False)
+
+            with ui.row().classes("w-full justify-end"):
+                ui.button("Continue", on_click=done).props("unelevated color=primary")
+            dlg.on("hide", closed)
+        cards[False].classes(add="selected")
+        dlg.open()
+
+    async def restore_look():
+        """Charts follow the saved look; with no saved look yet, ask once."""
+        try:
+            saved = await ui.run_javascript(f"localStorage.getItem({json.dumps(THEME_KEY)})", timeout=3)
+        except Exception:  # noqa: BLE001  (storage blocked, slow client): stay dark, don't ask
+            return
+        if saved in ("dark", "light"):
+            look["light"] = saved == "light"
+            for chart in charts:
+                recolor_chart(chart, look["light"])
+        else:
+            choose_look()
+
+    ui.timer(0.05, restore_look, once=True)
 
     if job_running and _job_dir is not None and (_job_dir / "config.yaml").is_file():
         # reattached to a running job: show its settings instead of the defaults
