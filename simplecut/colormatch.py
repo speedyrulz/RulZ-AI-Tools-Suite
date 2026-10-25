@@ -17,9 +17,10 @@ import tempfile
 from dataclasses import dataclass
 
 import numpy as np
-from PySide6.QtCore import Qt, Signal, QRectF, QPointF, QSettings
+from PySide6.QtCore import Qt, Signal, QRectF, QPointF
 from PySide6.QtGui import QImage, QImageReader, QPainter, QColor, QPen, QPixmap
 from . import theme
+from .defaults import settings as _settings
 from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QCheckBox, QSlider, QWidget, QSizePolicy, QFileDialog, QMessageBox,
@@ -413,13 +414,13 @@ class ColorMatchDialog(QDialog):
         self.ok_btn.setEnabled(False)
         lay.addWidget(btns)
 
-        last = QSettings("SimpleCut", "SimpleCut").value("ref_photo", "", type=str)
+        last = _settings().value("ref_photo", "", type=str)
         if last and os.path.isfile(last):
             self._load_photo(last)
 
     # --- photo
     def _choose_photo(self):
-        start = QSettings("SimpleCut", "SimpleCut").value("ref_photo", "", type=str)
+        start = _settings().value("ref_photo", "", type=str)
         p, _ = QFileDialog.getOpenFileName(self, "Reference photo", os.path.dirname(start) if start else "",
                                            "Images (*.jpg *.jpeg *.png *.heic *.heif *.webp *.bmp *.tif *.tiff);;All files (*.*)")
         if p:
@@ -433,7 +434,7 @@ class ColorMatchDialog(QDialog):
         self.ref_rgb = qimage_to_rgb(downscale(img))
         self.r_view.set_image(self.ref_rgb)
         self.photo_label.setText(path)
-        QSettings("SimpleCut", "SimpleCut").setValue("ref_photo", path)
+        _settings().setValue("ref_photo", path)
         self._recompute()
 
     def _skin_toggled(self, on: bool):

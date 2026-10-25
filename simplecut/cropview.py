@@ -371,7 +371,7 @@ class VideoView(QWidget):
             if r:
                 txt = f"{r[2]}×{r[3]}  @ {r[0]},{r[1]}"
                 p.setPen(QColor(255, 255, 255))
-                p.setBrush(QBrush(QColor(theme.RED_DARK)))
+                p.setBrush(QBrush(QColor(theme.OVERLAY_LABEL_BG)))
                 fm = p.fontMetrics()
                 tw = fm.horizontalAdvance(txt) + 10
                 ty = wr.top() - 22 if wr.top() > 24 else wr.top() + 4

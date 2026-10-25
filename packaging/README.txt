@@ -16,6 +16,8 @@ You can also drag a video file onto the .exe, or onto the app window.
 
 Keep the "_internal" folder next to the .exe; the app needs it.
 
+Dark or light look: Settings > Light mode. The first launch asks once.
+
 Settings are stored per user in the Windows registry under
 HKEY_CURRENT_USER\Software\SimpleCut. Delete that key to reset everything.
 

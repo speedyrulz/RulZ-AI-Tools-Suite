@@ -116,14 +116,14 @@ class Timeline(QWidget):
 
         # base bar
         p.fillRect(QRectF(self._pad, bar_top, self.width() - 2 * self._pad, bar_bot - bar_top),
-                   QColor(28, 28, 32))
-        p.setPen(QPen(QColor(52, 52, 58), 1))
+                   theme.Q_TL_BAR)
+        p.setPen(QPen(theme.Q_TL_BAR_BORDER, 1))
         p.drawRect(QRectF(self._pad, bar_top, self.width() - 2 * self._pad, bar_bot - bar_top))
 
         if self.selection:
             a, b = self.selection
             xa, xb = self._x(a), self._x(b)
-            p.fillRect(QRectF(xa, bar_top, xb - xa, bar_bot - bar_top), QColor(226, 18, 28, 120))
+            p.fillRect(QRectF(xa, bar_top, xb - xa, bar_bot - bar_top), theme.Q_TL_SEL)
             p.setPen(QPen(theme.Q_RED_HOVER, 2))
             p.drawRect(QRectF(xa, bar_top, xb - xa, bar_bot - bar_top))
             # grip
@@ -138,11 +138,11 @@ class Timeline(QWidget):
             b = self.mark_out if self.mark_out is not None else self.end
             if b > a:
                 p.fillRect(QRectF(self._x(a), bar_top, self._x(b) - self._x(a), bar_bot - bar_top),
-                           QColor(125, 10, 16, 190))
+                           theme.Q_TL_INOUT)
 
         # keyframe ticks (thin out when there are too many for the width)
         if self.keyframes:
-            p.setPen(QPen(QColor(205, 205, 212), 1))
+            p.setPen(QPen(theme.Q_TL_TICK, 1))
             last_x = -10.0
             for k in self.keyframes:
                 x = self._x(k)
@@ -154,7 +154,7 @@ class Timeline(QWidget):
         # in/out markers (hidden in fixed-length mode)
         if not self.selection:
             if self.mark_in is not None:
-                p.setPen(QPen(QColor(255, 255, 255), 2))
+                p.setPen(QPen(theme.Q_TL_MARK, 2))
                 x = self._x(self.mark_in)
                 p.drawLine(QPointF(x, bar_top - 6), QPointF(x, bar_bot + 4))
                 p.drawText(QPointF(x + 3, bar_bot + 12), "IN")
@@ -166,6 +166,6 @@ class Timeline(QWidget):
 
         # playhead
         x = self._x(self.position)
-        p.setPen(QPen(QColor(255, 255, 255), 2))
+        p.setPen(QPen(theme.Q_TL_MARK, 2))
         p.drawLine(QPointF(x, bar_top - 10), QPointF(x, bar_bot + 6))
         p.end()

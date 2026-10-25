@@ -27,7 +27,7 @@ from .colormatch import ColorMatchDialog, apply_tables, write_cube_1d
 from .defaults import (ASPECT_PRESETS, PRESET_LABELS, AUDIO_LABELS, AUDIO_KEYS, settings,
                        parse_aspect, load_export_defaults, load_ui_defaults, DefaultsDialog,
                        PreferencesDialog, load_quick_defaults, prefer_lossless,
-                       quick_lossless_when_possible)
+                       quick_lossless_when_possible, save_theme, ensure_theme_chosen)
 
 def output_dir() -> str | None:
     """User-chosen default folder for clips and images, or None for 'next to the source'."""
@@ -573,6 +573,12 @@ class MainWindow(QMainWindow):
         sm.addSeparator()
         sm.addAction(a_open_outdir)
         sm.addSeparator()
+        self.a_light = QAction("Light mode", self, checkable=True)
+        self.a_light.setChecked(theme.is_light())
+        self.a_light.setToolTip("Switch between the dark and the light look")
+        self.a_light.toggled.connect(lambda on: self.set_theme(theme.LIGHT if on else theme.DARK))
+        sm.addAction(self.a_light)
+        sm.addSeparator()
         a_prefs = QAction("&Preferences…", self, shortcut="Ctrl+,", triggered=self.edit_preferences)
         a_prefs.setMenuRole(QAction.PreferencesRole)
         sm.addAction(a_prefs)
@@ -684,9 +690,27 @@ class MainWindow(QMainWindow):
         if dlg.exec() == QDialog.Accepted:
             self._apply_ui_defaults()
             self._refresh_outdir_action()
+            self.set_theme(theme.LIGHT if dlg.rb_light.isChecked() else theme.DARK)
             self.status.showMessage("Preferences saved.", 4000)
 
     edit_defaults = edit_preferences   # old name
+
+    # ------------------------------------------------------------------ theme
+    def set_theme(self, mode: str):
+        """Switch Dark/Light live and remember it (Settings > Light mode, Preferences > Appearance)."""
+        save_theme(mode)
+        if self.a_light.isChecked() != (mode == theme.LIGHT):
+            self.a_light.blockSignals(True)
+            self.a_light.setChecked(mode == theme.LIGHT)
+            self.a_light.blockSignals(False)
+        if theme.mode() == mode:
+            return
+        theme.apply_mode(QApplication.instance(), mode)
+        self.brand_logo.setPixmap(theme.logo_pixmap(22))
+        if self.dec is not None and self.dec.current is not None:
+            self._show_current()
+        self.timeline.update()
+        self.view.update()
 
     def _apply_ui_defaults(self):
         """Push the stored crop-aspect and fixed-length defaults into the controls."""
@@ -1235,7 +1259,7 @@ class MainWindow(QMainWindow):
         self.frame_label.setText(f"  frame {round((t - info.start_time) * info.fps)}")
         on_kf = f.key_frame or info.is_keyframe_time(t)
         self.kf_label.setText("  ● keyframe" if on_kf else "")
-        self.kf_label.setStyleSheet(f"color:{theme.RED_HOVER};font-weight:bold" if on_kf else "")
+        self.kf_label.setStyleSheet(f"color:{theme.ACCENT_TEXT};font-weight:bold" if on_kf else "")
 
     # ------------------------------------------------------------ playback
     def toggle_play(self):
@@ -1569,6 +1593,8 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     theme.apply(app)
+    # first run: "Choose your look" (Dark/Light); afterwards the saved choice
+    theme.apply_mode(app, ensure_theme_chosen(app))
     w = MainWindow()
     w.show()
     if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):

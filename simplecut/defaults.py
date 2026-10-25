@@ -9,14 +9,16 @@ from dataclasses import dataclass
 
 import os
 
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import QRectF, QSettings, Qt
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
     QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit, QRadioButton, QPushButton,
-    QMessageBox, QLabel, QCheckBox, QTabWidget, QWidget, QFileDialog,
+    QMessageBox, QLabel, QCheckBox, QTabWidget, QWidget, QFileDialog, QFrame,
 )
 
 from .export import ExportSettings, NVENC_CODECS, FPS_PRESETS, parse_fps
+from . import theme
 
 ASPECT_PRESETS = {
     "Free": None,
@@ -34,8 +36,33 @@ BUILTIN_FIXED_FRAMES = 60
 BUILTIN_FIXED_UNIT = "seconds"
 
 
+SETTINGS_ENV = "SIMPLECUT_SETTINGS_INI"
+
+
 def settings() -> QSettings:
+    """The app's preferences: QSettings("SimpleCut", "SimpleCut") (the registry on Windows).
+
+    Set the environment variable SIMPLECUT_SETTINGS_INI to a file path to use that .ini file
+    instead, e.g. to test with a fresh profile without touching your real preferences.
+    """
+    ini = os.environ.get(SETTINGS_ENV)
+    if ini:
+        return QSettings(ini, QSettings.IniFormat)
     return QSettings("SimpleCut", "SimpleCut")
+
+
+# ------------------------------------------------------------------- theme
+THEME_KEY = "ui/theme"   # "dark" | "light"; missing until the first-run "Choose your look" prompt
+
+
+def stored_theme() -> str | None:
+    """The saved theme, or None if the user hasn't chosen one yet (first run)."""
+    v = settings().value(THEME_KEY, "", type=str)
+    return v if v in (theme.DARK, theme.LIGHT) else None
+
+
+def save_theme(mode: str):
+    settings().setValue(THEME_KEY, theme.LIGHT if mode == theme.LIGHT else theme.DARK)
 
 
 def parse_aspect(text: str) -> float | None:
@@ -321,6 +348,17 @@ class PreferencesDialog(QDialog):
         self.folder.textEdited.connect(lambda _: self.rb_folder.setChecked(True))
         self.tabs.addTab(page, "Output")
 
+        # --- Appearance tab
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.addWidget(_note("Also switchable any time with Settings \u25b8 Light mode."))
+        self.rb_dark = QRadioButton("Dark (black and red)")
+        self.rb_light = QRadioButton("Light (white and red)")
+        v.addWidget(self.rb_dark)
+        v.addWidget(self.rb_light)
+        v.addStretch(1)
+        self.tabs.addTab(page, "Appearance")
+
         # --- buttons
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self.b_reset = QPushButton("Restore built-in defaults")
@@ -369,6 +407,7 @@ class PreferencesDialog(QDialog):
         d = settings().value("output_dir", "", type=str)
         self.folder.setText(d)
         (self.rb_folder if d else self.rb_next_to).setChecked(True)
+        (self.rb_light if theme.is_light() else self.rb_dark).setChecked(True)
 
     def _restore_builtin(self):
         """Reset the Export, Quick export and Crop & clip tabs (the output folder is left alone)."""
@@ -426,7 +465,155 @@ class PreferencesDialog(QDialog):
             st.setValue("output_dir", folder)
         else:
             st.remove("output_dir")
+        save_theme(theme.LIGHT if self.rb_light.isChecked() else theme.DARK)
         self.accept()
 
 
 DefaultsDialog = PreferencesDialog   # old name
+
+
+# ------------------------------------------------------------- first run
+class _LookPreview(QWidget):
+    """A tiny drawing of the app in one theme (fixed colours, whatever the current theme is)."""
+
+    def __init__(self, mode: str, parent=None):
+        super().__init__(parent)
+        self.mode = mode
+        self.setFixedSize(220, 128)
+        self._logo = theme.logo_pixmap(12, dark=(mode == theme.DARK))
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+
+    def paintEvent(self, _):
+        c = {k: QColor(v) for k, v in theme.PALETTES[self.mode].items() if v.startswith("#")}
+        dark = self.mode == theme.DARK
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        path = QPainterPath()
+        path.addRoundedRect(r, 6, 6)
+        p.setClipPath(path)
+        p.fillRect(r, c["BG"])
+        # menu bar with the red rule and the logo
+        p.fillRect(QRectF(r.left(), r.top(), r.width(), 16), c["BAR"])
+        p.fillRect(QRectF(r.left(), r.top() + 16, r.width(), 2), c["RED"])
+        for i, w in enumerate((18, 26)):
+            p.fillRect(QRectF(r.left() + 8 + i * 26, r.top() + 6, w, 4), c["MUTED"])
+        if not self._logo.isNull():
+            p.drawPixmap(int(r.right() - self._logo.width() - 6), int(r.top() + 2), self._logo)
+        # picture area with a crop box
+        p.fillRect(QRectF(r.left() + 40, r.top() + 24, r.width() - 80, 50), QColor("#000000") if dark else c["PANEL"])
+        p.setPen(QColor(255, 255, 255, 200) if dark else c["MUTED"])
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(QRectF(r.left() + 70, r.top() + 32, r.width() - 140, 34))
+        # timeline with a red selection
+        p.setPen(c["TL_BAR_BORDER"])
+        p.setBrush(c["TL_BAR"])
+        p.drawRect(QRectF(r.left() + 8, r.top() + 82, r.width() - 16, 10))
+        p.fillRect(QRectF(r.left() + 70, r.top() + 82, 50, 10), c["RED"])
+        # buttons: two plain, one red
+        p.setPen(c["BORDER"])
+        p.setBrush(c["RAISED"])
+        p.drawRoundedRect(QRectF(r.left() + 8, r.top() + 102, 40, 14), 3, 3)
+        p.drawRoundedRect(QRectF(r.left() + 54, r.top() + 102, 40, 14), 3, 3)
+        p.setPen(Qt.NoPen)
+        p.setBrush(c["RED"])
+        p.drawRoundedRect(QRectF(r.right() - 58, r.top() + 102, 50, 14), 3, 3)
+        p.fillRect(QRectF(r.left() + 14, r.top() + 108, 28, 2), c["TEXT"])
+        p.fillRect(QRectF(r.left() + 60, r.top() + 108, 28, 2), c["TEXT"])
+        p.fillRect(QRectF(r.right() - 50, r.top() + 108, 34, 2), QColor("#ffffff"))
+        p.setClipping(False)
+        p.setPen(QPen(c["BORDER"], 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(r, 6, 6)
+        p.end()
+
+
+class _LookCard(QFrame):
+    """A clickable card: preview + name. The selected one gets a red border."""
+
+    def __init__(self, mode: str, title: str, on_click, parent=None):
+        super().__init__(parent)
+        self.mode = mode
+        self._on_click = on_click
+        self.setObjectName("lookCard")
+        self.setCursor(Qt.PointingHandCursor)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(14, 14, 14, 12)
+        v.addWidget(_LookPreview(mode), 0, Qt.AlignHCenter)
+        lab = QLabel(title)
+        lab.setObjectName("lookTitle")
+        lab.setAlignment(Qt.AlignHCenter)
+        v.addWidget(lab)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._on_click(self.mode)
+
+    def set_selected(self, on: bool):
+        self.setProperty("selected", "true" if on else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+
+class ChooseLookDialog(QDialog):
+    """First-run prompt: Dark (preselected) or Light. Picking a card switches the theme right away
+    as a preview; closing the dialog without Continue means Dark."""
+
+    def __init__(self, app, parent=None):
+        super().__init__(parent)
+        self.app = app
+        self.choice = theme.DARK
+        self.setWindowTitle("Choose your look")
+        self.setWindowIcon(theme.app_icon())
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 20, 24, 18)
+        lay.setSpacing(12)
+        head = QLabel("Choose your look")
+        head.setObjectName("lookHeading")
+        lay.addWidget(head)
+        lay.addWidget(_note("Pick how RulZ Clip Extractor looks. You can change it later with "
+                            "Settings ▸ Light mode, or in Settings ▸ Preferences ▸ Appearance."))
+        row = QHBoxLayout()
+        row.setSpacing(16)
+        self.cards = [_LookCard(theme.DARK, "Dark", self._pick), _LookCard(theme.LIGHT, "Light", self._pick)]
+        for c in self.cards:
+            row.addWidget(c)
+        lay.addLayout(row)
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        self.b_continue = QPushButton("Continue")
+        self.b_continue.setObjectName("primary")
+        self.b_continue.setDefault(True)
+        self.b_continue.clicked.connect(self.accept)
+        btns.addWidget(self.b_continue)
+        lay.addLayout(btns)
+        self._pick(theme.DARK)
+
+    def _pick(self, mode: str):
+        self.choice = mode
+        for c in self.cards:
+            c.set_selected(c.mode == mode)
+        if theme.mode() != mode:
+            theme.apply_mode(self.app, mode)
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key_Left, Qt.Key_Right):
+            self._pick(theme.LIGHT if self.choice == theme.DARK else theme.DARK)
+            return
+        super().keyPressEvent(e)
+
+    def reject(self):
+        # closed without Continue: Dark
+        self._pick(theme.DARK)
+        super().reject()
+
+
+def ensure_theme_chosen(app) -> str:
+    """The stored theme; on first run (none stored) ask with ChooseLookDialog and save the answer."""
+    m = stored_theme()
+    if m is None:
+        dlg = ChooseLookDialog(app)
+        dlg.exec()
+        m = dlg.choice
+        save_theme(m)
+    return m
