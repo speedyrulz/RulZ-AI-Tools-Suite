@@ -19,6 +19,7 @@ import type {
 import { exists, extractZip, findFile, flattenSingleFolder, overlay, swapInto } from './archive'
 import { download } from './download'
 import {
+  commitsAhead,
   findAsset,
   GitHubError,
   headCommit,
@@ -228,11 +229,16 @@ export class AppManager {
     if (!app.repo) return { info: null, error: "This app isn't published on GitHub yet.", release: null }
     try {
       if (app.install.kind === 'source') {
-        const c = await headCommit(app.repo, app.branch)
+        // Source installs follow the branch; the label names the latest release when there is one.
+        const [c, release] = await Promise.all([headCommit(app.repo, app.branch), latestRelease(app.repo)])
+        const ahead = release ? await commitsAhead(app.repo, release.tag, c.sha).catch(() => null) : null
+        let label = `${app.branch} @ ${c.sha.slice(0, 7)}`
+        if (release && ahead === 0) label = release.tag
+        else if (release && ahead) label = `${release.tag} + ${ahead} commit${ahead === 1 ? '' : 's'}`
         return {
           info: {
             version: c.sha,
-            label: `${app.branch} @ ${c.sha.slice(0, 7)}`,
+            label,
             date: c.date,
             downloadSize: null,
             url: `https://github.com/${app.repo}/commits/${app.branch}`
@@ -512,7 +518,11 @@ export class AppManager {
     )
     await this.o.store.setInstalled(app.id, info)
     ctx.log(`Installed ${app.name} ${version ?? ''} in ${dir}`)
-    this.latest.set(app.id, await this.fetchLatest(app))
+    const latest = await this.fetchLatest(app)
+    this.latest.set(app.id, latest)
+    if (latest.info && latest.info.version === version && latest.info.label !== version) {
+      await this.o.store.setInstalled(app.id, { ...info, versionLabel: latest.info.label })
+    }
     if (opts.launchAfter) await this.launch(app.id).catch((e) => ctx.log(`Couldn't start it: ${errorText(e)}`))
   }
 

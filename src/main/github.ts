@@ -106,6 +106,14 @@ export async function headCommit(repo: string, branch: string): Promise<Commit> 
   return { sha: c.sha, date: c.commit.committer?.date ?? null, message: c.commit.message.split('\n')[0] }
 }
 
+/** How many commits `head` is ahead of `base` (a tag, branch or SHA). */
+export async function commitsAhead(repo: string, base: string, head: string): Promise<number> {
+  const c = await api<{ ahead_by: number }>(
+    `/repos/${repo}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`
+  )
+  return c.ahead_by
+}
+
 export async function rawFile(repo: string, branch: string, path: string): Promise<string> {
   const res = await fetchImpl(`https://raw.githubusercontent.com/${repo}/${branch}/${path}`, {
     signal: AbortSignal.timeout(10_000)

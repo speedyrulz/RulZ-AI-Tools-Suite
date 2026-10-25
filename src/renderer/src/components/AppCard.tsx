@@ -92,7 +92,7 @@ export function AppCard({ view, onOpen, onInstall }: { view: AppView; onOpen: ()
           <span className="truncate text-xs text-faint">
             {view.installed
               ? view.installed.version
-                ? formatVersion(view.installed.version)
+                ? (view.installed.versionLabel ?? formatVersion(view.installed.version))
                 : 'Installed'
               : (view.latest?.label ?? '')}
           </span>

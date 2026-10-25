@@ -78,6 +78,8 @@ export interface InstalledInfo {
   launchArgs: string[]
   /** Release tag or commit SHA; null when unknown (found or located installs). */
   version: string | null
+  /** How to show the version when it isn't the tag itself, e.g. "v1.0.0 + 3 commits" for a commit SHA. */
+  versionLabel?: string
   method: InstallMethod
   /** True when the launcher installed it (and may update or remove the files). */
   managed: boolean

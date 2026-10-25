@@ -173,7 +173,11 @@ export function AppPage({ view, onBack, onInstall }: { view: AppView; onBack: ()
             <dl className="space-y-2.5 text-[13px]">
               {installed && (
                 <Row label="Installed">
-                  {installed.version ? formatVersion(installed.version) : installed.managed ? 'yes' : 'found on this PC'}
+                  {installed.version
+                    ? (installed.versionLabel ?? formatVersion(installed.version))
+                    : installed.managed
+                      ? 'yes'
+                      : 'found on this PC'}
                 </Row>
               )}
               <Row label="Latest">
