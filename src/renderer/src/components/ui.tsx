@@ -11,9 +11,9 @@ const VARIANTS: Record<Variant, string> = {
   primary:
     'bg-accent text-accent-fg hover:bg-accent-hover shadow-[0_6px_20px_-8px_rgb(237_0_13/0.8)] disabled:shadow-none',
   secondary: 'bg-panel-2 text-text border border-border hover:bg-hover hover:border-border-strong',
-  outline: 'border border-accent/70 text-[#ff5961] hover:bg-accent-soft hover:border-accent',
+  outline: 'border border-accent/70 text-link hover:bg-accent-soft hover:border-accent',
   ghost: 'text-muted hover:text-text hover:bg-hover',
-  danger: 'bg-[#3a0c0f] text-[#ff8a8e] border border-[#6b1418] hover:bg-[#4a1014]'
+  danger: 'bg-danger-bg text-danger-text border border-danger-border hover:bg-danger-hover'
 }
 const SIZES: Record<Size, string> = {
   sm: 'h-8 px-3 text-[13px] gap-1.5 rounded-md',
@@ -58,10 +58,10 @@ IconButton.displayName = 'IconButton'
 
 export function Badge({ children, tone = 'neutral', className }: { children: ReactNode; tone?: 'neutral' | 'accent' | 'ok' | 'warn'; className?: string }) {
   const tones = {
-    neutral: 'bg-white/[0.06] text-muted border-white/[0.08]',
-    accent: 'bg-accent-soft text-[#ff6b72] border-accent/40',
-    ok: 'bg-[#4ade80]/10 text-ok border-[#4ade80]/25',
-    warn: 'bg-[#fbbf24]/10 text-warn border-[#fbbf24]/25'
+    neutral: 'bg-subtle text-muted border-subtle-border',
+    accent: 'bg-accent-soft text-accent-text border-accent/40',
+    ok: 'bg-ok/10 text-ok border-ok/25',
+    warn: 'bg-warn/10 text-warn border-warn/25'
   }
   return (
     <span
@@ -78,7 +78,7 @@ export function Badge({ children, tone = 'neutral', className }: { children: Rea
 
 export function ProgressBar({ value, className }: { value: number | null; className?: string }) {
   return (
-    <div className={cn('h-1.5 overflow-hidden rounded-full bg-white/[0.08]', className)}>
+    <div className={cn('h-1.5 overflow-hidden rounded-full bg-track', className)}>
       {value === null ? (
         <div className="progress-stripes h-full w-full rounded-full bg-accent/80" />
       ) : (
@@ -170,11 +170,11 @@ export function Dialog({
   return (
     <RDialog.Root open={open} onOpenChange={onOpenChange}>
       <RDialog.Portal>
-        <RDialog.Overlay className="fixed inset-0 z-40 bg-black/70 backdrop-blur-[2px]" />
+        <RDialog.Overlay className="fixed inset-0 z-40 bg-scrim backdrop-blur-[2px]" />
         <RDialog.Content
           className={cn(
             'fixed top-1/2 left-1/2 z-50 flex max-h-[86vh] w-[520px] max-w-[92vw] -translate-x-1/2 -translate-y-1/2 flex-col',
-            'rounded-xl border border-border bg-panel shadow-[0_30px_80px_-20px_rgb(0_0_0/0.9)]',
+            'rounded-xl border border-border bg-panel shadow-[0_30px_80px_-20px_var(--shadow)]',
             className
           )}
         >
@@ -210,7 +210,7 @@ export function MenuContent({ children, align = 'end' }: { children: ReactNode; 
       <RMenu.Content
         align={align}
         sideOffset={6}
-        className="z-50 min-w-[220px] rounded-lg border border-border bg-panel-2 p-1 shadow-[0_16px_40px_-10px_rgb(0_0_0/0.9)]"
+        className="z-50 min-w-[220px] rounded-lg border border-border bg-panel-2 p-1 shadow-[0_16px_40px_-10px_var(--shadow)]"
       >
         {children}
       </RMenu.Content>
@@ -238,7 +238,7 @@ export function MenuItem({
       className={cn(
         'flex cursor-pointer items-center gap-2.5 rounded-md px-2.5 py-2 text-[13px] outline-none select-none',
         'data-[disabled]:cursor-not-allowed data-[disabled]:opacity-40 data-[highlighted]:bg-hover',
-        danger ? 'text-[#ff7a7f]' : 'text-text'
+        danger ? 'text-danger-text' : 'text-text'
       )}
     >
       <span className="flex size-4 items-center justify-center text-muted [&>svg]:size-4">{icon}</span>

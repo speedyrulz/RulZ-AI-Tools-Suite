@@ -5,7 +5,15 @@
 # RulZ AI Tools Suite
 
 One launcher for the RulZ apps. Browse every tool with screenshots and its full README, install it with one
-click, keep it updated, and launch it, all from a single black-and-red window.
+click, keep it updated, and launch it, all from a single black-and-red window (or white-and-red, in light mode).
+
+| Dark (default) | Light |
+| --- | --- |
+| ![The launcher's home page in dark mode](docs/screenshots/home-dark.png) | ![The launcher's home page in light mode](docs/screenshots/home-light.png) |
+
+![An app's page: screenshot gallery, details, requirements and its README](docs/screenshots/app-page.png)
+
+![Installing an app: folder, shortcuts, optional components and prerequisites](docs/screenshots/install-dialog.png)
 
 | App | What it does | How it installs |
 | --- | --- | --- |
@@ -36,6 +44,9 @@ click, keep it updated, and launch it, all from a single black-and-red window.
   install an app, missing ones it needs are installed first with winget (Python with *Add to PATH*). Anything winget
   can't install (a GPU driver, or any of them on a PC without winget) gets a step-by-step guide with a *Check again*
   button, and the install waits until it's found.
+
+- **Dark or light:** the first launch asks which look you want (dark is the default). Switch any time with the
+  sun/moon button in the top bar or under Settings ▸ Appearance.
 
 Settings and the list of installed apps are kept in `%APPDATA%\RulZ AI Tools Suite`.
 

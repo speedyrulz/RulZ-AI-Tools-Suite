@@ -65,14 +65,14 @@ export function AppCard({ view, onOpen, onInstall }: { view: AppView; onOpen: ()
       }}
       className="card-glow group flex cursor-pointer flex-col overflow-hidden rounded-xl border border-border bg-panel transition-[box-shadow,transform,border-color] duration-200 hover:-translate-y-0.5 hover:border-transparent"
     >
-      <div className="relative aspect-[16/10] overflow-hidden bg-black">
+      <div className="relative aspect-[16/10] overflow-hidden bg-media">
         <Cover
           view={view}
           className="h-full w-full object-cover object-top transition-transform duration-500 group-hover:scale-[1.03]"
         />
         <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-panel via-panel/10 to-transparent" />
         <div className="absolute top-3 left-3">
-          <Badge className="border-white/10 bg-black/60 text-[#d4d4d8] backdrop-blur">{app.category}</Badge>
+          <Badge className="border-white/10 bg-black/60 text-white/85 backdrop-blur">{app.category}</Badge>
         </div>
         <div className="absolute top-3 right-3">
           <StatusBadge view={view} />
@@ -84,7 +84,7 @@ export function AppCard({ view, onOpen, onInstall }: { view: AppView; onOpen: ()
           src={view.icon}
           alt=""
           draggable={false}
-          className="-mt-7 mb-2 size-12 rounded-xl border border-border bg-panel-2 shadow-[0_8px_20px_-6px_rgb(0_0_0/0.9)]"
+          className="-mt-7 mb-2 size-12 rounded-xl border border-border bg-panel-2 shadow-[0_8px_20px_-6px_var(--shadow)]"
         />
         <h3 className="font-[family-name:var(--font-display)] text-[16px] leading-snug font-semibold text-text">{app.name}</h3>
         <p className="mt-1 line-clamp-2 text-[13px] leading-relaxed text-muted">{app.tagline}</p>

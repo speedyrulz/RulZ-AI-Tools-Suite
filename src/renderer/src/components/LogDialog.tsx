@@ -42,7 +42,7 @@ export function LogDialog({ appId, title, onClose }: { appId: string; title: str
         </>
       }
     >
-      <pre className="min-h-[200px] rounded-lg border border-border bg-code p-3 font-mono text-[12px] leading-relaxed whitespace-pre-wrap text-[#cfcfd4]">
+      <pre className="min-h-[200px] rounded-lg border border-border bg-code p-3 font-mono text-[12px] leading-relaxed whitespace-pre-wrap text-body">
         {lines?.length ? lines.join('\n') : 'Nothing logged yet.'}
         <div ref={end} />
       </pre>

@@ -1,8 +1,10 @@
 """Builds the launcher's logo and icon from assets/logo-source.webp (needs Pillow).
 
 Writes:
-  src/renderer/src/assets/logo.png   transparent wordmark for the dark UI (black lettering turned white)
-  src/renderer/src/assets/mark.png   the "R" mark alone, same colors
+  src/renderer/src/assets/logo.png        transparent wordmark for the dark UI (black lettering turned white)
+  src/renderer/src/assets/logo-light.png  the original colors (black lettering), for the light UI
+  src/renderer/src/assets/mark.png        the "R" mark alone, white and red
+  src/renderer/src/assets/mark-light.png  the "R" mark in its original colors
   build/icon.ico, build/icon.png     the "R" mark on a black tile with a red border (the .exe and window icon)
 """
 from pathlib import Path
@@ -50,10 +52,13 @@ logo = unblend_from_white(source)
 logo = logo.crop(logo.getbbox())
 UI_ASSETS.mkdir(parents=True, exist_ok=True)
 lighten_black(logo).save(UI_ASSETS / "logo.png")
+logo.save(UI_ASSETS / "logo-light.png")
 
 # The "R" mark is the part left of the first wide gap in the artwork.
 mark = logo.crop((0, 0, 320, logo.height))
-mark = lighten_black(mark.crop(mark.getbbox()))
+mark = mark.crop(mark.getbbox())
+mark.save(UI_ASSETS / "mark-light.png")
+mark = lighten_black(mark)
 mark.save(UI_ASSETS / "mark.png")
 
 SIZE = 256
@@ -67,4 +72,4 @@ tile.alpha_composite(mark, ((SIZE - mark.width) // 2, (SIZE - mark.height) // 2)
 BUILD.mkdir(exist_ok=True)
 tile.save(BUILD / "icon.ico", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
 tile.save(BUILD / "icon.png")
-print("Wrote logo.png, mark.png, build/icon.ico, build/icon.png")
+print("Wrote logo.png, logo-light.png, mark.png, mark-light.png, build/icon.ico, build/icon.png")

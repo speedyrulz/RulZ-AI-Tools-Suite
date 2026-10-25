@@ -2,7 +2,7 @@ import { AlertTriangle, BookOpen, FolderOpen, Info, Wand2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import type { AppView, InstallOptions, RequirementStatus } from '@shared/types'
 import { invoke } from '../lib/api'
-import { formatBytes, formatVersion } from '../lib/format'
+import { formatBytes } from '../lib/format'
 import { act, useApps } from '../stores/apps'
 import { RequirementList } from './Requirements'
 import { Button, Checkbox, Dialog } from './ui'
@@ -77,7 +77,7 @@ export function InstallDialog({ view, onClose }: { view: AppView | null; onClose
             Cancel
           </Button>
           <Button variant="primary" disabled={!opts || busy || blocked} onClick={() => void install()}>
-            Install{view.latest ? ` ${formatVersion(view.latest.version)}` : ''}
+            Install{view.latest ? ` ${view.latest.label}` : ''}
           </Button>
         </>
       }
@@ -149,7 +149,7 @@ export function InstallDialog({ view, onClose }: { view: AppView | null; onClose
                     onChange={(v) => patch({ installPrerequisites: v })}
                     label={
                       <span className="flex items-center gap-1.5">
-                        <Wand2 className="size-3.5 text-[#ff6b72]" />
+                        <Wand2 className="size-3.5 text-accent-text" />
                         Install {automatic.map((s) => s.label).join(' and ')} automatically first
                       </span>
                     }
@@ -158,7 +158,7 @@ export function InstallDialog({ view, onClose }: { view: AppView | null; onClose
                 </div>
               )}
               {manual.length > 0 && (
-                <div className="mt-3 space-y-2 rounded-lg border border-[#fbbf24]/25 bg-[#fbbf24]/[0.07] px-3 py-2.5 text-[13px] text-[#fcd679]">
+                <div className="mt-3 space-y-2 rounded-lg border border-warn/25 bg-warn/[0.07] px-3 py-2.5 text-[13px] text-warn-text">
                   <p className="flex gap-2">
                     <AlertTriangle className="mt-0.5 size-4 shrink-0" />
                     <span>

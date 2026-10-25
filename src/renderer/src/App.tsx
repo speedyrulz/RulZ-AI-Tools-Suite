@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Toaster } from 'sonner'
 import { InstallDialog } from './components/InstallDialog'
 import { RequirementGuide } from './components/RequirementGuide'
+import { ThemeChooser } from './components/ThemeChooser'
 import { SettingsDialog } from './components/SettingsDialog'
 import { TopBar } from './components/TopBar'
 import { AppPage } from './pages/AppPage'
@@ -10,7 +11,7 @@ import { HomePage } from './pages/HomePage'
 import { useApps } from './stores/apps'
 
 export function App() {
-  const { apps, loaded, selectedId, select, init } = useApps()
+  const { apps, loaded, selectedId, select, init, theme, settings } = useApps()
   const [query, setQuery] = useState('')
   const [installId, setInstallId] = useState<string | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -51,10 +52,11 @@ export function App() {
       <InstallDialog view={installing} onClose={() => setInstallId(null)} />
       {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
       <RequirementGuide />
+      {settings && !settings.theme && <ThemeChooser />}
       <Toaster
-        theme="dark"
+        theme={theme}
         position="bottom-right"
-        toastOptions={{ style: { background: '#141417', border: '1px solid #2a2a30', color: '#f2f2f3' } }}
+        toastOptions={{ style: { background: 'var(--panel)', border: '1px solid var(--border)', color: 'var(--text)' } }}
       />
     </div>
   )

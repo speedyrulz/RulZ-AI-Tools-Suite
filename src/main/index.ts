@@ -2,6 +2,7 @@ import { join, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { app, BrowserWindow, dialog, nativeTheme, net, protocol, shell } from 'electron'
 import { findApp } from '@shared/catalog'
+import type { ThemeName } from '@shared/types'
 import { AppManager } from './apps'
 import { setFetch } from './github'
 import { broadcast, handle } from './ipc'
@@ -19,7 +20,22 @@ protocol.registerSchemesAsPrivileged([
 
 let mainWindow: BrowserWindow | null = null
 
-function createWindow(): BrowserWindow {
+const WINDOW_COLORS = {
+  dark: { background: '#050505', symbols: '#e5e5e5' },
+  light: { background: '#ffffff', symbols: '#111114' }
+}
+
+/** Title bar buttons, window background and the READMEs' prefers-color-scheme follow the theme. */
+function applyTheme(win: BrowserWindow | null, theme: ThemeName): void {
+  nativeTheme.themeSource = theme
+  if (!win || win.isDestroyed()) return
+  const c = WINDOW_COLORS[theme]
+  win.setBackgroundColor(c.background)
+  win.setTitleBarOverlay({ color: c.background, symbolColor: c.symbols, height: 48 })
+}
+
+function createWindow(theme: ThemeName): BrowserWindow {
+  const colors = WINDOW_COLORS[theme]
   const win = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -27,9 +43,9 @@ function createWindow(): BrowserWindow {
     minHeight: 640,
     show: false,
     title: 'RulZ AI Tools Suite',
-    backgroundColor: '#050505',
+    backgroundColor: colors.background,
     titleBarStyle: 'hidden',
-    titleBarOverlay: { color: '#050505', symbolColor: '#e5e5e5', height: 48 },
+    titleBarOverlay: { color: colors.background, symbolColor: colors.symbols, height: 48 },
     // Packaged builds take the icon from the .exe; dev runs need it explicitly.
     ...(app.isPackaged ? {} : { icon: join(__dirname, '../../build/icon.png') }),
     webPreferences: {
@@ -59,16 +75,15 @@ function createWindow(): BrowserWindow {
     }
   })
 
-  if (isDev) void win.loadURL(process.env.ELECTRON_RENDERER_URL!)
-  else void win.loadFile(join(__dirname, '../renderer/index.html'))
+  // The theme goes in the URL so the first paint already has the right colors.
+  if (isDev) void win.loadURL(`${process.env.ELECTRON_RENDERER_URL!}?theme=${theme}`)
+  else void win.loadFile(join(__dirname, '../renderer/index.html'), { query: { theme } })
   return win
 }
 
 async function main(): Promise<void> {
   await app.whenReady()
   app.setAppUserModelId('com.rulz.aitoolssuite')
-  // READMEs pick their dark-theme images through prefers-color-scheme.
-  nativeTheme.themeSource = 'dark'
   setFetch((url, init) => net.fetch(url, init))
 
   const userData = app.getPath('userData')
@@ -97,7 +112,11 @@ async function main(): Promise<void> {
   // ---- IPC ----
   handle('app:info', () => ({ version: app.getVersion(), userData, platform: process.platform }))
   handle('settings:get', () => store.getSettings())
-  handle('settings:update', (patch) => store.updateSettings(patch))
+  handle('settings:update', async (patch) => {
+    const next = await store.updateSettings(patch)
+    if (patch.theme) applyTheme(mainWindow, patch.theme)
+    return next
+  })
   handle('dialog:pickFolder', async ({ title, defaultPath }) => {
     const r = await dialog.showOpenDialog(mainWindow!, { title, defaultPath, properties: ['openDirectory', 'createDirectory'] })
     return r.canceled ? null : (r.filePaths[0] ?? null)
@@ -141,7 +160,9 @@ async function main(): Promise<void> {
   })
 
   // ---- Lifecycle ----
-  mainWindow = createWindow()
+  const theme = store.getSettings().theme ?? 'dark'
+  applyTheme(null, theme)
+  mainWindow = createWindow(theme)
   if (store.getSettings().checkUpdatesOnStart) void apps.refreshLatest()
 
   app.on('second-instance', () => {

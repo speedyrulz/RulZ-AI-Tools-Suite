@@ -4,11 +4,14 @@ import type { AppInfo } from '@shared/ipc'
 import { invoke } from '../lib/api'
 import { act, useApps } from '../stores/apps'
 import { RequirementList } from './Requirements'
+import { ThemeCard } from './ThemeChooser'
 import { Button, Dialog, Switch } from './ui'
 
 export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const settings = useApps((s) => s.settings)
   const update = useApps((s) => s.updateSettings)
+  const theme = useApps((s) => s.theme)
+  const setTheme = useApps((s) => s.setTheme)
   const [info, setInfo] = useState<AppInfo | null>(null)
   const [root, setRoot] = useState(settings?.installRoot ?? '')
 
@@ -18,6 +21,14 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()} title="Settings" className="w-[600px]" footer={<Button onClick={onClose}>Done</Button>}>
       <div className="space-y-6">
+        <section>
+          <div className="mb-2 text-xs font-medium tracking-wide text-faint uppercase">Appearance</div>
+          <div className="grid grid-cols-2 gap-3">
+            <ThemeCard theme="dark" label="Dark" selected={theme === 'dark'} onPick={(t) => void act(() => setTheme(t))} />
+            <ThemeCard theme="light" label="Light" selected={theme === 'light'} onPick={(t) => void act(() => setTheme(t))} />
+          </div>
+        </section>
+
         <section>
           <label className="mb-1.5 block text-xs font-medium tracking-wide text-faint uppercase">Default install folder</label>
           <div className="flex gap-2">

@@ -28,10 +28,10 @@ export function Gallery({ images, name }: { images: string[]; name: string }) {
       <button
         type="button"
         onClick={() => setOpen(true)}
-        className="group relative block aspect-[16/9] w-full cursor-zoom-in overflow-hidden rounded-xl border border-border bg-black"
+        className="group relative block aspect-[16/9] w-full cursor-zoom-in overflow-hidden rounded-xl border border-border bg-media"
       >
         <img src={images[index]} alt={`${name} screenshot ${index + 1}`} className="h-full w-full object-contain" draggable={false} />
-        <span className="absolute right-3 bottom-3 flex items-center gap-1.5 rounded-md bg-black/70 px-2 py-1 text-xs text-muted opacity-0 transition-opacity group-hover:opacity-100">
+        <span className="absolute right-3 bottom-3 flex items-center gap-1.5 rounded-md bg-black/70 px-2 py-1 text-xs text-white/80 opacity-0 transition-opacity group-hover:opacity-100">
           <Maximize2 className="size-3.5" /> View full size
         </span>
         {images.length > 1 && (
@@ -50,7 +50,7 @@ export function Gallery({ images, name }: { images: string[]; name: string }) {
               type="button"
               onClick={() => setIndex(i)}
               className={cn(
-                'relative aspect-[16/10] w-32 shrink-0 cursor-pointer overflow-hidden rounded-lg border-2 bg-black transition-all',
+                'relative aspect-[16/10] w-32 shrink-0 cursor-pointer overflow-hidden rounded-lg border-2 bg-media transition-all',
                 i === index ? 'border-accent' : 'border-transparent opacity-55 hover:opacity-100'
               )}
             >

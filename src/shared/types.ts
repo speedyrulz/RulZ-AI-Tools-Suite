@@ -175,7 +175,11 @@ export interface ReadmeDoc {
   source: 'github' | 'bundled'
 }
 
+export type ThemeName = 'dark' | 'light'
+
 export interface Settings {
+  /** Unset until the user picks one on first launch (the UI is dark until then). */
+  theme?: ThemeName
   /** Apps install into <installRoot>\<folderName> unless another folder is picked. */
   installRoot: string
   checkUpdatesOnStart: boolean

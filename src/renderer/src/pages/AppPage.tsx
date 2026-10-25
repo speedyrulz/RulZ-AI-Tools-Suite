@@ -124,9 +124,9 @@ export function AppPage({ view, onBack, onInstall }: { view: AppView; onBack: ()
         </div>
 
         {job && (job.phase === 'error' || job.phase === 'cancelled') && (
-          <div className="relative flex items-center gap-3 border-t border-accent/30 bg-[#2a0709]/80 px-7 py-3 text-[13px]">
+          <div className="relative flex items-center gap-3 border-t border-accent/30 bg-banner px-7 py-3 text-[13px]">
             <AlertCircle className="size-4 shrink-0 text-danger" />
-            <span className="min-w-0 flex-1 text-[#ffb3b6]">
+            <span className="min-w-0 flex-1 text-banner-text">
               {job.phase === 'cancelled' ? 'Cancelled.' : job.error}
             </span>
             {job.missing?.map((id) => (
@@ -143,9 +143,9 @@ export function AppPage({ view, onBack, onInstall }: { view: AppView; onBack: ()
           </div>
         )}
         {busy && job.phase === 'setup' && (
-          <div className="relative flex items-center gap-3 border-t border-border bg-black/40 px-7 py-2 text-xs text-muted">
+          <div className="relative flex items-center gap-3 border-t border-border bg-sunken px-7 py-2 text-xs text-muted">
             <span className="min-w-0 flex-1 truncate font-mono">{lastLine || jobDetail(job)}</span>
-            <button className="cursor-pointer text-[#ff5961] hover:underline" onClick={() => setLogOpen(true)}>
+            <button className="cursor-pointer text-link hover:underline" onClick={() => setLogOpen(true)}>
               Show log
             </button>
           </div>
@@ -155,7 +155,7 @@ export function AppPage({ view, onBack, onInstall }: { view: AppView; onBack: ()
       {/* Body */}
       <div className="mt-8 grid grid-cols-1 gap-8 lg:grid-cols-[minmax(0,1fr)_320px]">
         <main className="min-w-0">
-          <p className="mb-6 text-[15px] leading-relaxed text-[#d4d4d8]">{app.description}</p>
+          <p className="mb-6 text-[15px] leading-relaxed text-body">{app.description}</p>
           <Gallery images={view.screenshots} name={app.name} />
           <h2 className="mt-10 mb-4 flex items-center gap-2 font-[family-name:var(--font-display)] text-xs font-semibold tracking-[0.16em] text-faint uppercase">
             <span className="h-3 w-1 -skew-x-[20deg] bg-accent" /> Read me
@@ -204,7 +204,7 @@ export function AppPage({ view, onBack, onInstall }: { view: AppView; onBack: ()
               {installed && (
                 <Row label="Location">
                   <button
-                    className="cursor-pointer text-left break-all text-[#ff5961] hover:underline"
+                    className="cursor-pointer text-left break-all text-link hover:underline"
                     onClick={() => void act(() => invoke('apps:openFolder', app.id))}
                   >
                     {installed.dir}
@@ -214,7 +214,7 @@ export function AppPage({ view, onBack, onInstall }: { view: AppView; onBack: ()
               {app.repo && (
                 <Row label="Source">
                   <button
-                    className="cursor-pointer text-left break-all text-[#ff5961] hover:underline"
+                    className="cursor-pointer text-left break-all text-link hover:underline"
                     onClick={() => void invoke('shell:openExternal', `https://github.com/${app.repo}`)}
                   >
                     {app.repo} <ExternalLink className="inline size-3 align-[-1px]" />
@@ -280,7 +280,7 @@ export function AppPage({ view, onBack, onInstall }: { view: AppView; onBack: ()
                 <span className="font-mono text-text">{installed.dir}</span> and everything in it moves to the Recycle Bin.
               </p>
               {app.install.kind === 'source' && (
-                <p className="text-[#fcd679]">That includes anything you saved inside it, such as downloaded models or outputs.</p>
+                <p className="text-warn-text">That includes anything you saved inside it, such as downloaded models or outputs.</p>
               )}
               <p>Its shortcuts are removed. Settings the app keeps elsewhere stay.</p>
             </div>

@@ -1,7 +1,8 @@
 import { toast } from 'sonner'
 import { create } from 'zustand'
-import type { AppView, JobState, RequirementId, RequirementStatus, Settings } from '@shared/types'
+import type { AppView, JobState, RequirementId, RequirementStatus, Settings, ThemeName } from '@shared/types'
 import { errorMessage, invoke, on } from '../lib/api'
+import { applyThemeClass, initialTheme } from '../lib/theme'
 
 const LOG_LIMIT = 3000
 const FINISHED = new Set(['done', 'error', 'cancelled'])
@@ -23,6 +24,8 @@ interface AppsState {
   selectedId: string | null
   /** The prerequisite whose install guide is open. */
   guideId: RequirementId | null
+  /** The theme in use; settings.theme stays unset until the first-launch choice. */
+  theme: ThemeName
 
   init: () => Promise<void>
   refresh: () => Promise<void>
@@ -30,6 +33,7 @@ interface AppsState {
   select: (id: string | null) => void
   dismissJob: (id: string) => void
   updateSettings: (patch: Partial<Settings>) => Promise<void>
+  setTheme: (theme: ThemeName) => Promise<void>
 }
 
 const ACTION_DONE: Record<JobState['action'], string> = {
@@ -49,6 +53,7 @@ export const useApps = create<AppsState>((set, get) => ({
   settings: null,
   selectedId: null,
   guideId: null,
+  theme: initialTheme,
 
   init: async () => {
     // StrictMode runs effects twice in development; subscribe only once.
@@ -114,6 +119,12 @@ export const useApps = create<AppsState>((set, get) => ({
 
   updateSettings: async (patch) => {
     set({ settings: await invoke('settings:update', patch) })
+  },
+
+  setTheme: async (theme) => {
+    applyThemeClass(theme)
+    set({ theme })
+    await get().updateSettings({ theme })
   }
 }))
 

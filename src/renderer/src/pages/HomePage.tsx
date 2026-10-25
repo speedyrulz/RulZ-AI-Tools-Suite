@@ -1,9 +1,10 @@
 import { SearchX } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import type { AppView } from '@shared/types'
-import logo from '../assets/logo.png'
 import { AppCard } from '../components/AppCard'
 import { cn } from '../lib/format'
+import { LOGOS } from '../lib/theme'
+import { useApps } from '../stores/apps'
 
 const INSTALLED = 'Installed'
 
@@ -19,6 +20,7 @@ export function HomePage({
   onInstall: (id: string) => void
 }) {
   const [filter, setFilter] = useState<string>('All')
+  const theme = useApps((s) => s.theme)
   const categories = useMemo(() => ['All', ...new Set(apps.map((a) => a.app.category)), INSTALLED], [apps])
 
   const installedCount = apps.filter((a) => a.installed).length
@@ -39,8 +41,8 @@ export function HomePage({
         <div className="hero-slashes absolute inset-0" />
         <div className="relative flex flex-wrap items-end justify-between gap-6 px-9 py-9">
           <div>
-            <img src={logo} alt="RulZ" className="h-16 drop-shadow-[0_8px_30px_rgb(237_0_13/0.35)]" draggable={false} />
-            <div className="mt-4 font-[family-name:var(--font-display)] text-[13px] font-semibold tracking-[0.42em] text-[#ff4d55] uppercase">
+            <img src={LOGOS[theme].logo} alt="RulZ" className="h-16 drop-shadow-[0_8px_30px_rgb(237_0_13/0.35)]" draggable={false} />
+            <div className="mt-4 font-[family-name:var(--font-display)] text-[13px] font-semibold tracking-[0.42em] text-accent-text uppercase">
               AI Tools Suite
             </div>
             <p className="mt-2 max-w-[520px] text-[15px] leading-relaxed text-muted">
@@ -93,10 +95,10 @@ function Stat({ value, label, highlight }: { value: number; label: string; highl
     <div
       className={cn(
         'min-w-[96px] rounded-xl border px-4 py-3 backdrop-blur',
-        highlight ? 'border-accent/50 bg-accent-soft' : 'border-white/[0.08] bg-black/40'
+        highlight ? 'border-accent/50 bg-accent-soft' : 'border-subtle-border bg-sunken'
       )}
     >
-      <div className={cn('font-[family-name:var(--font-display)] text-2xl font-bold tabular-nums', highlight && 'text-[#ff4d55]')}>
+      <div className={cn('font-[family-name:var(--font-display)] text-2xl font-bold tabular-nums', highlight && 'text-accent-text')}>
         {value}
       </div>
       <div className="text-xs text-faint">{label}</div>

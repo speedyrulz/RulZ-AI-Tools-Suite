@@ -49,7 +49,7 @@ export function RequirementList({ refs }: { refs: RequirementRef[] }) {
                 {s?.label ?? r.id}
                 {r.optional && <span className="text-faint"> (optional)</span>}
               </div>
-              <div className={cn('text-xs', s && !s.ok && !r.optional ? 'text-[#ff8a8e]' : 'text-faint')}>
+              <div className={cn('text-xs', s && !s.ok && !r.optional ? 'text-danger-text' : 'text-faint')}>
                 {s ? s.detail : 'Checking…'}
                 {r.note && <span className="text-faint"> · {r.note}</span>}
               </div>

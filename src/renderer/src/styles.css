@@ -20,7 +20,64 @@
   --warn: #fbbf24;
   --ok: #4ade80;
   --code-bg: #0a0a0c;
+  /* Semantic colors that differ between the themes. */
+  --body: #d4d4d8;
+  --link: #ff5961;
+  --accent-text: #ff6b72;
+  --warn-text: #fcd679;
+  --danger-text: #ff8a8e;
+  --danger-bg: #3a0c0f;
+  --danger-border: #6b1418;
+  --danger-hover: #4a1014;
+  --banner-bg: rgb(42 7 9 / 0.8);
+  --banner-text: #ffb3b6;
+  --sunken: rgb(0 0 0 / 0.4);
+  --subtle: rgb(255 255 255 / 0.06);
+  --subtle-border: rgb(255 255 255 / 0.08);
+  --track: rgb(255 255 255 / 0.08);
+  --media-bg: #000000;
+  --scrim: rgb(0 0 0 / 0.7);
+  --shadow: rgb(0 0 0 / 0.9);
+  --hero-base: linear-gradient(180deg, #0d0d10, #070708);
   color-scheme: dark;
+}
+
+/* Light mode: white background, same red. */
+:root.light {
+  --bg: #ffffff;
+  --panel: #f5f5f7;
+  --panel-2: #ebebef;
+  --hover: #e2e2e7;
+  --border: #d9d9de;
+  --border-strong: #c4c4cb;
+  --text: #111114;
+  --muted: #5f6068;
+  --faint: #8a8b93;
+  --accent-hover: #c8000b;
+  --accent-soft: rgb(237 0 13 / 0.08);
+  --danger: #d4161c;
+  --warn: #a16207;
+  --ok: #15803d;
+  --code-bg: #f5f5f7;
+  --body: #2a2a30;
+  --link: #d0000b;
+  --accent-text: #c8000b;
+  --warn-text: #8a5300;
+  --danger-text: #b4000a;
+  --danger-bg: #fdecec;
+  --danger-border: #f5b8bb;
+  --danger-hover: #fbd8da;
+  --banner-bg: #fdecec;
+  --banner-text: #9f000a;
+  --sunken: rgb(0 0 0 / 0.03);
+  --subtle: rgb(0 0 0 / 0.04);
+  --subtle-border: rgb(0 0 0 / 0.08);
+  --track: rgb(0 0 0 / 0.08);
+  --media-bg: #ececef;
+  --scrim: rgb(0 0 0 / 0.35);
+  --shadow: rgb(0 0 0 / 0.18);
+  --hero-base: linear-gradient(180deg, #ffffff, #f6f6f8);
+  color-scheme: light;
 }
 
 @theme inline {
@@ -41,6 +98,22 @@
   --color-warn: var(--warn);
   --color-ok: var(--ok);
   --color-code: var(--code-bg);
+  --color-body: var(--body);
+  --color-link: var(--link);
+  --color-accent-text: var(--accent-text);
+  --color-warn-text: var(--warn-text);
+  --color-danger-text: var(--danger-text);
+  --color-danger-bg: var(--danger-bg);
+  --color-danger-border: var(--danger-border);
+  --color-danger-hover: var(--danger-hover);
+  --color-banner: var(--banner-bg);
+  --color-banner-text: var(--banner-text);
+  --color-sunken: var(--sunken);
+  --color-subtle: var(--subtle);
+  --color-subtle-border: var(--subtle-border);
+  --color-track: var(--track);
+  --color-media: var(--media-bg);
+  --color-scrim: var(--scrim);
   --font-sans: 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
   --font-display: 'Segoe UI Variable Display', 'Segoe UI', system-ui, sans-serif;
   --font-mono: 'Cascadia Code', 'Cascadia Mono', Consolas, ui-monospace, monospace;
@@ -98,7 +171,7 @@ body {
   background:
     radial-gradient(ellipse 60% 120% at 0% 0%, rgb(237 0 13 / 0.22), transparent 60%),
     radial-gradient(ellipse 50% 90% at 100% 100%, rgb(237 0 13 / 0.1), transparent 60%),
-    linear-gradient(180deg, #0d0d10, #070708);
+    var(--hero-base);
 }
 /* Diagonal slashes echoing the strokes of the R mark. */
 .hero-slashes {
@@ -136,7 +209,7 @@ body {
 .md {
   line-height: 1.7;
   overflow-wrap: anywhere;
-  color: #d9d9dd;
+  color: var(--body);
 }
 .md > :first-child {
   margin-top: 0;
@@ -204,9 +277,9 @@ body {
   color: var(--accent);
 }
 .md a {
-  color: #ff5961;
+  color: var(--link);
   text-decoration: underline;
-  text-decoration-color: rgb(255 89 97 / 0.35);
+  text-decoration-color: color-mix(in srgb, var(--link) 35%, transparent);
   text-underline-offset: 2px;
   cursor: pointer;
 }
@@ -258,7 +331,7 @@ body {
   font-weight: 600;
 }
 .md tr:nth-child(even) td {
-  background: rgb(255 255 255 / 0.015);
+  background: var(--subtle);
 }
 .md blockquote {
   border-left: 3px solid var(--accent);

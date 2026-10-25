@@ -52,8 +52,8 @@ export function RequirementGuide() {
     >
       <ol className="space-y-3">
         {guide.steps.map((step, i) => (
-          <li key={step} className="flex gap-3 text-[13.5px] leading-relaxed text-[#d4d4d8]">
-            <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-accent-soft text-xs font-semibold text-[#ff6b72]">
+          <li key={step} className="flex gap-3 text-[13.5px] leading-relaxed text-body">
+            <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-accent-soft text-xs font-semibold text-accent-text">
               {i + 1}
             </span>
             <span className="pt-0.5">{step}</span>
@@ -64,8 +64,8 @@ export function RequirementGuide() {
         <div
           className={`mt-5 flex items-center gap-2 rounded-lg border px-3 py-2 text-[13px] ${
             status.ok
-              ? 'border-[#4ade80]/25 bg-[#4ade80]/[0.07] text-ok'
-              : 'border-[#ff5a5f]/25 bg-[#ff5a5f]/[0.07] text-[#ff8a8e]'
+              ? 'border-ok/25 bg-ok/[0.07] text-ok'
+              : 'border-danger/25 bg-danger/[0.07] text-danger-text'
           }`}
         >
           {status.ok ? <CheckCircle2 className="size-4" /> : <XCircle className="size-4" />}
