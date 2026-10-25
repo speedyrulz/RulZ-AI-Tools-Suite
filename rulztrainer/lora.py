@@ -593,11 +593,15 @@ def parse_bias_diffs(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
 
 
 def attach_extra_lora(model: nn.Module, path: str, strength: float = 1.0,
-                      rename: Callable[[str], str] | None = None) -> int:
-    """Attach a sampling-only LoRA (e.g. a turbo/step-distill LoRA) to the model, with its diff_b bias offsets.
-    rename: maps a file's module name that the model does not have to the model's own (another trainer's layout,
-    e.g. ComfyUI's Krea 2 names). Returns the modules matched; the unmatched ones are logged."""
+                      rename: Callable[[str], str] | None = None,
+                      convert: Callable[[dict], dict] | None = None) -> int:
+    """Attach a sampling-only LoRA (e.g. a turbo/step-distill LoRA) to the model, with its diff_b bias offsets and the
+    `diff` weight offsets of normalization layers. rename: maps a file's module name that the model does not have to
+    the model's own (another trainer's layout, e.g. ComfyUI's Krea 2 names); convert: rewrites the whole file first
+    (ComfyUI's fused FIBO 2.0 layout). Returns the modules matched; the unmatched ones are logged."""
     state = load_file(str(path))
+    if convert is not None:
+        state = convert(state)
     peft_meta = read_peft_metadata(path)
     entries = parse_comfy_lora(state, default_alpha=peft_meta.get("lora_alpha"))
     biases = parse_bias_diffs(state)
@@ -613,6 +617,19 @@ def attach_extra_lora(model: nn.Module, path: str, strength: float = 1.0,
         return name if _is_linear_like(model.get_submodule(name)) else None
 
     matched, missed = set(), []
+    for stem in [k[: -len(".diff")] for k in state if k.endswith(".diff")]:  # a norm's weight offset
+        name = _module_name(stem)
+        if name not in names and rename is not None:
+            name = rename(name)
+        module = model.get_submodule(name) if name in names else None
+        weight = getattr(module, "weight", None) if module is not None and not _is_linear_like(module) else None
+        delta = state[stem + ".diff"]
+        if not isinstance(weight, torch.Tensor) or tuple(weight.shape) != tuple(delta.shape):
+            missed.append(name)
+            continue
+        diffs = model.__dict__.setdefault("_rz_param_diffs", [])
+        diffs.append((weight, weight.detach().clone(), delta.to(weight.device, torch.float32) * strength))
+        matched.add(name)
     for kind, table in (("lora", entries), ("bias", biases)):
         for name, value in table.items():
             target = resolve(name)
@@ -638,7 +655,7 @@ def attach_extra_lora(model: nn.Module, path: str, strength: float = 1.0,
         log.warning("%s: %d of %d LoRA entries match no layer of this model (e.g. %s)", Path(path).name, len(missed),
                     len(entries) + len(biases), ", ".join(sorted(missed)[:3]))
     read = (".lora_down.weight", ".lora_up.weight", ".lora_A.weight", ".lora_B.weight", ".alpha", ".diff_b",
-            ".lokr_w1", ".lokr_w2", ".lokr_w1_a", ".lokr_w1_b", ".lokr_w2_a", ".lokr_w2_b")
+            ".diff", ".lokr_w1", ".lokr_w2", ".lokr_w1_a", ".lokr_w1_b", ".lokr_w2_a", ".lokr_w2_b")
     unread = sorted({k.rsplit(".", 2)[-2] if k.endswith(".weight") else k.rsplit(".", 1)[-1]
                      for k in state if not k.endswith(read)})
     if unread:  # LoHa (hada_w1_a...), full weight diffs (diff), DoRA (dora_scale), Tucker LoKr (lokr_t2)
@@ -658,3 +675,9 @@ def set_extras_enabled(model: nn.Module, enabled: bool) -> None:
     for m in model.modules():
         if isinstance(m, LoRALinear):
             m.extras_enabled = enabled
+    with torch.no_grad():  # norm weight offsets: swapped in for sampling, the original weight back for training
+        for weight, original, delta in model.__dict__.get("_rz_param_diffs", []):
+            if weight.device != original.device:  # the model moved since the LoRA was attached
+                original.data = original.data.to(weight.device)
+                delta.data = delta.data.to(weight.device)
+            weight.copy_((original.float() + delta).to(weight.dtype) if enabled else original)

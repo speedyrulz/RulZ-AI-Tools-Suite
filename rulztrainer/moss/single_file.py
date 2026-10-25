@@ -306,8 +306,14 @@ def place_text_encoder(model, device: str):
     return model.to(device)
 
 
+MOSS_TOKENIZER_MIN_VOCAB = 200_000  # Qwen3.5's tokenizer has 248k tokens; Qwen3-VL's (Krea 2, FIBO 2.0) 152k
+
+
 def resolve_tokenizer(tokenizer_path: str, models_dir: str = "models") -> Path:
-    """Local tokenizer dir; downloads the MOSS-Image tokenizer folder (small) if none is given."""
+    """Local tokenizer dir; downloads the MOSS-Image tokenizer folder (small) if none is given. Only MOSS-Image's own
+    folders count: any other model's tokenizer under models_dir (Krea 2's Qwen3-VL one, 152k tokens and no <think>
+    turn in its chat template) fed MOSS's Qwen3.5 text encoder the wrong token ids, so every prompt came out as
+    noise in samples and in the cached training captions."""
     if tokenizer_path:
         p = Path(tokenizer_path).expanduser()
         if (p / "tokenizer_config.json").is_file():
@@ -315,8 +321,10 @@ def resolve_tokenizer(tokenizer_path: str, models_dir: str = "models") -> Path:
         if (p / "tokenizer" / "tokenizer_config.json").is_file():
             return p / "tokenizer"
         raise FileNotFoundError(f"No tokenizer_config.json under {p}")
-    for cand in Path(models_dir).glob("*/tokenizer/tokenizer_config.json"):
-        return cand.parent
+    for pattern in ("OpenMOSS-Team__MOSS-Image*/tokenizer/tokenizer_config.json",
+                    "tokenizer__MOSS-Image/tokenizer/tokenizer_config.json"):
+        for cand in sorted(Path(models_dir).glob(pattern)):
+            return cand.parent
     from huggingface_hub import snapshot_download
 
     local = Path(models_dir) / "tokenizer__MOSS-Image"

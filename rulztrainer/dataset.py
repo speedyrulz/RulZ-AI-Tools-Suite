@@ -344,10 +344,11 @@ def cache_text(items: list[Item], cfg: TrainConfig, text_encoder, tokenizer,
 
 
 def text_cache_path(cfg: TrainConfig, prompt: str) -> Path:
-    """Cached text features of a prompt. Each architecture has its own text encoder, so other architectures' caches
-    get a suffix (the MOSS-Image cache keeps the original file names)."""
+    """Cached text features of a prompt. Each architecture has its own text encoder, so each has its own suffix.
+    MOSS-Image's is "_q35": its single-file mode once read prompts with Krea 2's tokenizer when a Krea 2 folder was in
+    models/, and the features cached then (no suffix) must not be reused."""
     arch = cfg.arch_name()
-    tag = "" if arch == "moss_image" else f"_{arch}"
+    tag = "_q35" if arch == "moss_image" else f"_{arch}"
     return cfg.resolved_cache_dir() / "text" / f"{_hash(prompt)}_{cfg.max_token_length}{tag}.safetensors"
 
 

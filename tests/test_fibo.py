@@ -154,7 +154,7 @@ def test_arch_detection_captions_and_cache_names(tmp_path):
     assert D.read_caption(img, moss_cfg) == "zxc, a woman on a beach"
     # text caches of the two text encoders never collide; MOSS keeps its original file names
     assert D.text_cache_path(fibo_cfg, "p").name.endswith("_fibo2.safetensors")
-    assert D.text_cache_path(moss_cfg, "p").name == f"{D._hash('p')}_{moss_cfg.max_token_length}.safetensors"
+    assert D.text_cache_path(moss_cfg, "p").name == f"{D._hash('p')}_{moss_cfg.max_token_length}_q35.safetensors"
     assert D.empty_text_path(fibo_cfg) == D.text_cache_path(fibo_cfg, P.NULL_CAPTION)
     assert D.empty_text_path(moss_cfg) == D.text_cache_path(moss_cfg, "")
 

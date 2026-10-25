@@ -267,13 +267,14 @@ def test_comfy_layout_sampling_lora_with_bias_offsets(tmp_path):
 
 def test_family_sample_defaults_and_krea_guidance():
     """Krea's pipeline samples Raw at guidance_scale 4.5 (cond + g * (cond - uncond)): CFG 5.5 in this trainer's
-    convention. Every family's defaults come from one table the WebUI reads too."""
-    from rulztrainer.config import ARCH_SAMPLE_DEFAULTS
+    convention. Every family's full-quality defaults come from one table the WebUI reads too (the default samples use
+    the turbo LoRA's, ARCH_SAMPLE_DEFAULTS)."""
+    from rulztrainer.config import ARCH_FULL_SAMPLE
 
     for name in ("moss_image", "fibo2", "krea2"):
         a = archs.arch_by_name(name)
-        assert (a.default_sample_steps, a.default_sample_cfg) == ARCH_SAMPLE_DEFAULTS[name]
-    assert ARCH_SAMPLE_DEFAULTS["krea2"] == (28, 5.5)
+        assert (a.default_sample_steps, a.default_sample_cfg) == ARCH_FULL_SAMPLE[name]
+    assert ARCH_FULL_SAMPLE["krea2"] == (28, 5.5)
     cond, uncond, g = torch.tensor(2.0), torch.tensor(0.5), 4.5
     assert torch.equal(cond + g * (cond - uncond), uncond + (g + 1) * (cond - uncond))
 
@@ -297,7 +298,7 @@ def test_unreadable_lora_kinds_and_sample_settings_are_reported(tmp_path, caplog
 
     def warnings_for(**kw):
         caplog.clear()
-        fake = SimpleNamespace(cfg=TrainConfig(**kw), arch=archs.arch_by_name("krea2"))
+        fake = SimpleNamespace(cfg=TrainConfig(**{"turbo_lora": "", **kw}), arch=archs.arch_by_name("krea2"))
         with caplog.at_level(logging.WARNING, logger="rulztrainer"):
             Trainer._check_sample_settings(fake)
         return caplog.text

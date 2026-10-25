@@ -264,16 +264,37 @@ different GPU models differ very slightly in their pixels (different kernels); t
 
 ## Model sources and quantization
 
-**Hugging Face / diffusers folder**: pick Base or SFT, or any local folder with `transformer/`, `text_encoder/`,
-`tokenizer/`, `vae/`.
+**Single safetensors files (the default, `model_source: files`)**: the model you pick comes as ComfyUI files from
+Comfy-Org's repackages on Hugging Face, downloaded on the first run (into Hugging Face's cache, reused after that; the
+WebUI's *Download now* fetches them ahead of time). `model_file_quant` and `text_encoder_file_quant` pick the format,
+`int8_convrot` by default (about half of bf16, trains as fast, under 1% error):
 
-**Single safetensors files (ComfyUI)**: point the UI at the three files you already use in ComfyUI: the diffusion
-model (`diffusion_models/`), the Qwen3.5-9B text encoder (`text_encoders/`) and the Flux2 VAE (`vae/`). Fused-qkv
-("repacked") files are split back automatically. The tokenizer is downloaded once (a few MB) if not given.
-Any file left empty is taken from the Hugging Face model instead, so you can mix (for example a ComfyUI DiT
-file with the HF text encoder). For decoding samples use the VAE that matches MOSS-Image (the FLUX.2 klein
-"small" VAE, `flux2-vae_small.safetensors` in ComfyUI); the encoder is identical across Flux2 VAEs, so caching
-latents works with either.
+| Model | Repo | Diffusion model | Text encoder | VAE |
+|---|---|---|---|---|
+| MOSS-Image Base / SFT | [Comfy-Org/MOSS-Image](https://huggingface.co/Comfy-Org/MOSS-Image) | int8_convrot 5.4 GB, bf16 10.2 GB | Qwen3.5-9B int8_convrot 9.8 GB, bf16 19.3 GB | `flux2-vae_small` |
+| Krea 2 Raw / Turbo | [Comfy-Org/Krea-2](https://huggingface.co/Comfy-Org/Krea-2) | int8_convrot 13.5 GB, fp8_scaled 13.1 GB, bf16 26.3 GB | Qwen3-VL-4B int8_convrot 4.9 GB, fp8_scaled 5.2 GB, bf16 8.9 GB | `qwen_image_vae` |
+| FIBO 2.0 dev / Edit Turbo | [Comfy-Org/Fibo-2.0](https://huggingface.co/Comfy-Org/Fibo-2.0) | int8_convrot 8.4 GB, bf16 16.5 GB | Qwen3-VL-4B, the same files as Krea 2's | `flux2-vae` |
+
+To use files you already have, set `transformer_file`, `text_encoder_file` and `vae_file` (the WebUI's optional file
+fields): only the ones left empty are downloaded. Fused-qkv ("repacked") files are split back automatically. The
+tokenizer is downloaded once (a few MB) if not given. MOSS-Image only takes its own Qwen3.5 tokenizer: earlier
+versions took the first tokenizer folder under `models/`, Krea 2's when one was there, which turned every MOSS-Image
+prompt into the wrong tokens (noise in samples and in the cached training captions); those cached captions are
+encoded again automatically. For decoding MOSS-Image samples use the VAE that matches
+MOSS-Image (the FLUX.2 klein "small" VAE, `flux2-vae_small.safetensors`); the encoder is identical across Flux2
+VAEs, so caching latents works with either.
+
+**Hugging Face / diffusers folder** (`model_source: hf`): the original diffusers repos (pick Base or SFT, or any
+local folder with `transformer/`, `text_encoder/`, `tokenizer/`, `vae/`), downloaded into `models/`.
+
+**FIBO 2.0 from single files**: ComfyUI's FIBO file fuses `to_q/to_k/to_v` into `qkv`, the cross-attention and
+Perceiver `to_k/to_v` into `to_kv` and the feed-forward `w1/w3` into `w13`, and zero-pads the feed-forward width from
+9536 to 9728. On load the fused weights are split back (an int8 weight is cut by rows with its per-row scales) and the
+padding is cut off, so the model, and every LoRA trained on it, has Bria's shapes: a LoRA trained from single files
+loads in diffusers. The int8 `w2` loses its padding columns by being dequantized, cut and quantized again (its
+Hadamard rotation groups do not survive the cut), as per-row int8. Checked against Bria's weights: every split part
+and every cut, re-quantized weight matches at cosine 1.00, and every diffusers weight is present. The text encoder is
+Krea 2's Qwen3-VL-4B file (byte-identical in both repos) run text-only, the VAE MOSS-Image's Flux2 loader.
 
 **Krea 2 from single files** works the same way with ComfyUI's Krea 2 files: the diffusion model (ComfyUI's own
 `blocks.N.attn.wq` layout is renamed to ours on load; `transformer_quant: auto` keeps a quantized file's format where
@@ -285,8 +306,7 @@ converted with diffusers' converter; the latent statistics are built in). The Qw
 downloaded Krea 2 repo if there is one, else `Qwen/Qwen3-VL-4B-Instruct` (not gated, a few MB). The family is read
 from the diffusion-model file's header, so the file name does not matter. Checked against the Hugging Face model:
 the VAE file matches exactly, the int8 and scaled-fp8 text encoder files match the bf16 encoder at cosine 0.999
-(quantization noise), and ComfyUI's int8_convrot DiT file matches the HF weights quantized the same way. FIBO 2.0
-has no single-file loader.
+(quantization noise), and ComfyUI's int8_convrot DiT file matches the HF weights quantized the same way.
 
 Accepted weight formats: bf16 / fp16 / fp32, fp8 (upcast) and ComfyUI's scaled fp8 (`weight_scale` applied on load),
 ComfyUI `int8_tensorwise` with or without ConvRot (Hadamard rotation), and ComfyUI `nvfp4`. Those two quantized
@@ -784,13 +804,32 @@ moved to system RAM for the duration (so RAM must hold both models; quantize the
 
 ## Turbo LoRA for samples
 
-`turbo_lora` + `turbo_lora_strength` attach a ComfyUI-format LoRA (for example an 8-step distill) that is applied
-only while generating sample images, never during training steps. Set `sample_steps` to match. `sample_lora` +
-`sample_lora_strength` stack a second sampling-only LoRA (for example a style LoRA) alongside the turbo one.
-LoRA layers (`lora_down/up`, `lora_A/B`) and `diff_b` bias offsets are applied; Krea 2 LoRAs may use ComfyUI's
-module names (`blocks.N.attn.wq`) or ours. LoKr / LoHa / full-diff entries cannot be applied while sampling and are
-named in a warning. With a turbo LoRA, Krea 2 samples on its distilled schedule (fixed shift, as ComfyUI does), and
-the log warns about guidance other than CFG 1.
+Samples and probes render with a turbo (step-distilled) LoRA by default: `turbo_lora: auto` downloads the model
+family's own and the sampling defaults are the ones it is made for. It is applied only while generating sample and
+probe images, never during training steps.
+
+| Family | Turbo LoRA | Steps | CFG | Shift |
+|---|---|---|---|---|
+| MOSS-Image | lodestones' `8-steps-dmd-lora` ([lodestones/Kromoss](https://huggingface.co/lodestones/Kromoss)), Fizgig's pick, distilled from Base | 12 | 1 | 5 |
+| Krea 2 | `krea2_turbo_lora_rank_64_bf16` ([Comfy-Org/Krea-2](https://huggingface.co/Comfy-Org/Krea-2)) | 8 | 1 | from the image size |
+| FIBO 2.0 | `fibo_2.0_turbo_lora_avg_rank_270_bf16` ([Comfy-Org/Fibo-2.0](https://huggingface.co/Comfy-Org/Fibo-2.0)): Edit Turbo as a LoRA on dev | 4 | 1 | from the image size |
+
+MOSS-Image renders 12 steps rather than the card's 8 because Fizgig found 12 much better; Fizgig also found that
+its turbo LoRA can understate likeness, so judge a run's likeness on full-quality samples (`turbo_lora: ""`, 20 steps,
+CFG 3). The WebUI's *Turbo LoRA* choice (the model's own, none, or a file) moves the steps and CFG between the turbo
+and the full-quality defaults while they are still at a default. `turbo_lora` can also be a path to any
+ComfyUI-format LoRA with `turbo_lora_strength`. `sample_lora` + `sample_lora_strength` stack a second sampling-only
+LoRA (for example a style LoRA) alongside the turbo one.
+LoRA layers (`lora_down/up`, `lora_A/B`), `diff_b` bias offsets and `diff` offsets of normalization weights (swapped
+in only while sampling) are applied; Krea 2 LoRAs may use ComfyUI's module names (`blocks.N.attn.wq`) or ours, and a
+FIBO 2.0 LoRA in ComfyUI's fused layout (Comfy-Org's Turbo LoRA) is split back into the model's own. LoKr / LoHa /
+full-weight diffs of linear layers cannot be applied while sampling and are named in a warning. With a turbo LoRA,
+Krea 2 samples on its distilled schedule (fixed shift, as ComfyUI does), and the log warns about guidance other than
+CFG 1.
+
+**Sample size.** The WebUI picks the sample size as an aspect ratio (1:1, 4:5, 3:4, 2:3, 9:16 and the landscape ones)
+and an area in megapixels (0.25 to 4, 1 MP = 1024 x 1024); it is stored as `sample_width` / `sample_height`,
+multiples of 16 (2:3 at 1 MP: 832 x 1248).
 
 Krea 2's previews and probes decode in 512 px VAE tiles: the Qwen-Image VAE normalizes per pixel, so the tiles give
 the full decode to 0.06 of an 8-bit level (PSNR 68 dB), at +2.0 GB instead of +7.9 GB per megapixel. The Flux2 VAE of
@@ -879,8 +918,9 @@ detected from the model; `model_arch: auto`). The repo is gated: accept its term
   edited = pipe(prompt=vgl(scene), image=source, num_inference_steps=4, guidance_scale=1.0).images[0]
   ```
 
-- **Not yet:** edit-pair training (source + target + instruction), the `text_render` text images, single-file
-  (ComfyUI) checkpoints, and a separate turbo LoRA for previews (Bria ships none; use fewer steps instead).
+- **Not yet:** edit-pair training (source + target + instruction) and the `text_render` text images. Single files
+  and the turbo LoRA for previews come from Comfy-Org (see [Model sources](#model-sources-and-quantization) and
+  [Turbo LoRA for samples](#turbo-lora-for-samples)).
 
 **Loading the LoRA in diffusers.** `BriaFibo2Pipeline` has no `load_lora_weights`; load through the transformer as
 above. On a 16 GB card the bf16 transformer needs offloading (`pipe.enable_sequential_cpu_offload()`): load the LoRA

@@ -19,7 +19,8 @@ from pathlib import Path
 
 from nicegui import app, run, ui
 
-from rulztrainer.config import (ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, MEGAPIXEL_CHOICES, MODEL_PRESETS,
+from rulztrainer.config import (ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
+                                MODEL_PRESETS,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
 from rulztrainer import bodysim, facesim
 from rulztrainer.losswatch import read_verdicts
@@ -57,6 +58,58 @@ def is_fibo_preset(preset: str, model_path: str = "") -> bool:
     return preset_arch(preset, model_path) == "fibo2"
 QUANTS = ["auto", "none", "int8", "int8_convrot", "nvfp4"]
 MP_OPTIONS = {mp: f"{mp:g} MP ({mp_to_side(mp)}^2)" for mp in MEGAPIXEL_CHOICES}
+# the single files to download (Comfy-Org's repackages): which format
+FILE_QUANT_LABELS = {"int8_convrot": "int8 ConvRot (about half of bf16)", "fp8_scaled": "fp8 scaled",
+                     "bf16": "bf16 (full size)"}
+TURBO_MODES = {"auto": "The model's turbo LoRA (downloaded)", "none": "None: full-quality sampling",
+               "file": "A LoRA file"}
+SAMPLE_ASPECTS = {"1:1": "1:1 square", "4:5": "4:5 portrait", "3:4": "3:4 portrait", "2:3": "2:3 portrait",
+                  "9:16": "9:16 portrait", "5:4": "5:4 landscape", "4:3": "4:3 landscape", "3:2": "3:2 landscape",
+                  "16:9": "16:9 landscape", "21:9": "21:9 wide"}
+
+
+def file_quant_options(family: str, kind: str) -> dict[str, str]:
+    """The formats Comfy-Org offers a family's diffusion model ("model") or text encoder ("text") in."""
+    from rulztrainer.config import COMFY_DIFFUSION_QUANTS, COMFY_TEXT_ENCODER_QUANTS
+
+    table = COMFY_DIFFUSION_QUANTS if kind == "model" else COMFY_TEXT_ENCODER_QUANTS
+    return {q: FILE_QUANT_LABELS[q] for q in table.get(family, ("int8_convrot", "bf16"))}
+
+
+def aspect_size(aspect: str, mp: float) -> tuple[int, int]:
+    """(width, height) for an aspect ratio "w:h" and an area in megapixels (1 MP = 1024 x 1024), multiples of 16."""
+    import math
+
+    a, b = (float(x) for x in str(aspect).split(":"))
+    area = float(mp) * 1024 * 1024
+    w = math.sqrt(area * a / b)
+    return max(16, int(round(w / 16)) * 16), max(16, int(round(w * b / a / 16)) * 16)
+
+
+def size_aspect(width: int, height: int) -> tuple[str, float]:
+    """The nearest listed aspect ratio and megapixel choice for a width x height (a config's sample size)."""
+    import math
+
+    ratio = width / max(1, height)
+    aspect = min(SAMPLE_ASPECTS, key=lambda k: abs(math.log(ratio * float(k.split(":")[1]) / float(k.split(":")[0]))))
+    mp = min(MEGAPIXEL_CHOICES, key=lambda m: abs(m - width * height / 2 ** 20))
+    return aspect, mp
+
+
+def download_files(cfg: TrainConfig) -> str:
+    """Download (or find in the cache) the single files and turbo LoRA a config leaves to Comfy-Org. Runs in a worker."""
+    from rulztrainer.comfy_files import planned_downloads, resolve_downloads
+
+    try:
+        plan = planned_downloads(cfg)
+        if not plan:
+            return "Nothing to download: every file is set."
+        resolved = resolve_downloads(cfg, progress=set_progress)
+    except Exception as e:  # noqa: BLE001
+        return f"Download failed: {e}"
+    return "Ready: " + "; ".join(f"{Path(getattr(resolved, field)).name}" for field, _, _ in plan)
+
+
 SAFETENSORS = [("safetensors", "*.safetensors"), ("all files", "*.*")]
 
 _proc: subprocess.Popen | None = None  # started by this WebUI process
@@ -832,16 +885,39 @@ class Form:
             for t in TARGETS + list(EXTRA_TARGETS):
                 if self.w.get(f"target_{t}") is not None:
                     self.w[f"target_{t}"].value = t in ARCH_DEFAULT_TARGETS[family]
-        # the sample steps / CFG likewise: each family samples at its own (Krea 2 Raw at CFG 5.5, MOSS-Image at 3)
-        steps, cfg = self.w.get("sample_steps"), self.w.get("sample_cfg")
-        if not self.loading and steps is not None and cfg is not None:
-            try:
-                current = (int(steps.value), float(cfg.value))
-            except (TypeError, ValueError):
-                current = None
-            if current == ARCH_SAMPLE_DEFAULTS[self.target_family]:
-                steps.value, cfg.value = ARCH_SAMPLE_DEFAULTS[family]
+        # the sample steps / CFG likewise: each family samples at its own (its turbo LoRA's, or full quality)
+        if not self.loading:
+            self.follow_sample_defaults(self.target_family, family, self.turbo_on(), self.turbo_on())
+            self.set_quant_options(family)
         self.target_family = family
+
+    def turbo_on(self) -> bool:
+        mode = self.w.get("turbo_mode")
+        return mode is None or mode.value != "none"
+
+    def follow_sample_defaults(self, old_family: str, new_family: str, old_turbo: bool, new_turbo: bool) -> None:
+        """Move the sample steps / CFG to the new family's or mode's defaults (turbo LoRA: ARCH_SAMPLE_DEFAULTS; none:
+        ARCH_FULL_SAMPLE), unless the user changed them from the old defaults (their own choice stays)."""
+        from rulztrainer.config import ARCH_FULL_SAMPLE
+
+        steps, cfg = self.w.get("sample_steps"), self.w.get("sample_cfg")
+        if steps is None or cfg is None:
+            return
+        try:
+            current = (int(steps.value), float(cfg.value))
+        except (TypeError, ValueError):
+            return
+        old = (ARCH_SAMPLE_DEFAULTS if old_turbo else ARCH_FULL_SAMPLE)[old_family]
+        if current == old:
+            steps.value, cfg.value = (ARCH_SAMPLE_DEFAULTS if new_turbo else ARCH_FULL_SAMPLE)[new_family]
+
+    def set_quant_options(self, family: str) -> None:
+        """The quant choices of the single files to download follow the family (Krea 2 also has fp8)."""
+        for key, kind in (("model_file_quant", "model"), ("text_encoder_file_quant", "text")):
+            sel = self.w.get(key)
+            if sel is not None:
+                opts = file_quant_options(family, kind)
+                sel.set_options(opts, value=sel.value if sel.value in opts else "int8_convrot")
 
     def to_config(self) -> TrainConfig:
         v = self.value
@@ -855,6 +931,7 @@ class Form:
             model_source="files" if v("model_source") == FILE_SOURCE else "hf",
             model_path=model_path, transformer_file=s("transformer_file"), text_encoder_file=s("text_encoder_file"),
             vae_file=s("vae_file"), tokenizer_path=s("tokenizer_path"),
+            model_file_quant=v("model_file_quant"), text_encoder_file_quant=v("text_encoder_file_quant"),
             device=v("device"), text_encoder_device=v("text_encoder_device"),
             multi_gpu=v("multi_gpu"), devices=(v("devices") or "").strip(), split_plan=(v("split_plan") or "").strip(),
             parallel_jobs=bool(v("parallel_jobs")), dp_balance=v("dp_balance"),
@@ -893,10 +970,12 @@ class Form:
             timestep_shift=float(v("timestep_shift")), sigmoid_scale=float(v("sigmoid_scale")),
             logit_mean=float(v("logit_mean")), logit_std=float(v("logit_std")), loss_weighting=v("loss_weighting"),
             save_every=int(v("save_every")), sample_every=int(v("sample_every")), sample_prompts=prompts,
-            sample_width=int(v("sample_width")), sample_height=int(v("sample_height")),
+            sample_width=aspect_size(v("sample_aspect"), v("sample_mp"))[0],
+            sample_height=aspect_size(v("sample_aspect"), v("sample_mp"))[1],
             sample_steps=int(v("sample_steps")), sample_cfg=float(v("sample_cfg")),
             sample_shift=float(v("sample_shift")), sample_negative=v("sample_negative") or "",
-            turbo_lora=s("turbo_lora"), turbo_lora_strength=float(v("turbo_lora_strength")),
+            turbo_lora={"auto": "auto", "none": ""}.get(v("turbo_mode"), s("turbo_lora")),
+            turbo_lora_strength=float(v("turbo_lora_strength")),
             sample_model_path=s("sample_model_path"), sample_model_quant=v("sample_model_quant"),
             sample_lora=s("sample_lora"), sample_lora_strength=float(v("sample_lora_strength")),
             face_refs=[p.strip() for p in (v("face_refs") or "").splitlines() if p.strip()],
@@ -949,6 +1028,9 @@ class Form:
                   "model_source": FILE_SOURCE if cfg.model_source == "files" else HF_SOURCE}
         values["datasets"] = [{"path": sp.path, "resolutions": list(sp.resolutions), "repeats": sp.repeats}
                               for sp in cfg.dataset_specs() if sp.path]  # a single-folder config: that folder
+        values["sample_aspect"], values["sample_mp"] = size_aspect(cfg.sample_width, cfg.sample_height)
+        values["turbo_mode"] = ("auto" if cfg.turbo_lora == "auto" else "file" if cfg.turbo_lora else "none")
+        values["turbo_lora"] = "" if cfg.turbo_lora == "auto" else cfg.turbo_lora
         targets = cfg.resolved_lora_targets()  # an empty list means the family's defaults
         for t in TARGETS + list(EXTRA_TARGETS):
             values[f"target_{t}"] = t in targets
@@ -956,6 +1038,7 @@ class Form:
             values["resolutions"] = [min(MEGAPIXEL_CHOICES, key=lambda m: abs(m - side_to_mp(cfg.resolution)))]
         self.loading = True
         try:
+            self.set_quant_options(cfg.arch_name())  # the loaded family's download formats, before its values
             for key, widget in self.w.items():
                 if key in values:
                     widget.value = values[key]
@@ -2119,14 +2202,14 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     r["lora_ema"] = (0.98, "measured by Fizgig: 5 likeness points above no average late in a run, with half the swing "
                            "between checkpoints; longer averages (0.995) lag behind")
     r["sample_every"] = (every, "a sample set at every checkpoint shows which one to keep")
-    if krea:
-        r["sample_model_path"] = ("krea/Krea-2-Turbo", "Krea trains LoRAs on Raw and uses them on Turbo: previews and "
-                                                       "probes in 8 steps without guidance instead of 28+ with it "
-                                                       "(Turbo is gated separately: accept its license on Hugging "
-                                                       "Face too; about 35 GB)")
+    fam = cfg.arch_name()
     if krea_turbo:
         r["sample_steps"] = (8, "Krea 2 Turbo is an 8-step distill")
         r["sample_cfg"] = (1.0, "Turbo samples without guidance")
+    elif cfg.turbo_lora == "auto" and fam in ARCH_TURBO:
+        t = ARCH_TURBO[fam]
+        r["sample_steps"] = (t["steps"], f"what {Path(t['file']).name}, the model's turbo LoRA, is made for")
+        r["sample_cfg"] = (t["cfg"], "a turbo LoRA samples without guidance")
     elif cfg.turbo_lora:
         r["sample_steps"] = (8, "most turbo LoRAs are 8-step distills; match yours")
         r["sample_cfg"] = (1.0, "distilled turbo LoRAs sample without guidance")
@@ -2142,7 +2225,8 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     if character:
         r["probe_every"] = (25, "frequent quick checks give the best-checkpoint and early-stop decisions enough points")
         if cfg.turbo_lora or krea_turbo:
-            r["probe_steps"] = (8, "fast probes with the turbo model" if krea_turbo else "fast probes with the turbo LoRA")
+            r["probe_steps"] = (r["sample_steps"][0], "fast probes with the turbo model" if krea_turbo
+                                else "fast probes with the turbo LoRA")
             r["probe_cfg"] = (1.0, "turbo models sample without guidance")
         else:
             r["probe_steps"] = (r["sample_steps"][0], "without a turbo LoRA a probe needs the full sampler steps")
@@ -2189,26 +2273,33 @@ def review_issues(cfg: TrainConfig, goal: str | None, data: dict | None, n_gpus:
         cfg.validate()
     except ValueError as e:
         out.append(("error", str(e)))
-    if cfg.model_source == "files" and cfg.arch_name() != "moss_image":
-        out.append(("error", "Single safetensors files are supported for MOSS-Image only: pick the Hugging Face source "
-                             "for this model."))
-    elif cfg.model_source == "files":
+    if cfg.model_source == "files":
+        try:
+            from rulztrainer.comfy_files import planned_downloads
+
+            planned = planned_downloads(cfg)
+        except ValueError as e:
+            out.append(("error", str(e)))
+            planned = []
+        if planned:
+            out.append(("info", "Downloads on start (cached after the first run): "
+                                + ", ".join(file.rsplit("/", 1)[-1] for _, _, file in planned)))
         for key, label in (("transformer_file", "Diffusion model"), ("text_encoder_file", "Text encoder"),
                            ("vae_file", "VAE")):
             if getattr(cfg, key) and not Path(getattr(cfg, key)).is_file():
                 out.append(("error", f"{label} file not found: {getattr(cfg, key)}"))
-    elif "edit-turbo" in cfg.model_path.lower():
+    if "edit-turbo" in cfg.model_path.lower():
         out.append(("warning", "FIBO-2.0-edit-turbo is a distilled model. Train on FIBO-2.0-dev: its LoRAs load "
                                "onto Edit Turbo."))
     elif "krea-2-turbo" in cfg.model_path.lower():
         out.append(("warning", "Krea-2-Turbo is a distilled model. Train on Krea-2-Raw and set Turbo as the sampling "
                                "model: LoRAs trained on Raw are meant for Turbo."))
-    elif cfg.arch_name() == "krea2":
+    elif cfg.model_source != "files" and cfg.arch_name() == "krea2":
         out.append(("info", "Krea 2 is gated: accept its license on Hugging Face and log in with hf auth login before "
                             "the first download." + (" Krea-2-Turbo (the sampling model) has a gate of its own: accept "
                                                      "its license as well." if "krea-2-turbo" in
                                                      (cfg.sample_model_path or "").lower() else "")))
-    elif cfg.arch_name() == "fibo2":
+    elif cfg.model_source != "files" and cfg.arch_name() == "fibo2":
         out.append(("info", "FIBO 2.0 is gated: accept its terms on Hugging Face and log in with hf auth login "
                             "before the first download."))
     if cfg.multi_gpu != "off" and n_gpus < 2:
@@ -2478,12 +2569,12 @@ class Wizard:
     def step_model(self):
         self.heading("Which model do you want to train on?", "The base model the LoRA is trained for.")
         with self.setting(None, "Where the model comes from",
-                          "Hugging Face downloads the model once into models/ and reuses it after that. Single files "
-                          "uses the diffusion model, text encoder and VAE files you already have for ComfyUI, so "
-                          "nothing is downloaded (MOSS-Image only)."):
-            self.bind(ui.radio([HF_SOURCE, FILE_SOURCE]), "model_source")
-        with ui.column().classes("w-full gap-3 pt-4") \
-                .bind_visibility_from(self.w["model_source"], "value", lambda x: x == HF_SOURCE):
+                          "Single files (the default) downloads Comfy-Org's ComfyUI files for the model: the diffusion "
+                          "model and text encoder in the format you pick (int8 ConvRot: about half of bf16) and the "
+                          "VAE, or uses files you already have. Hugging Face downloads the original diffusers repo "
+                          "into models/ instead."):
+            self.bind(ui.radio([FILE_SOURCE, HF_SOURCE]), "model_source")
+        with ui.column().classes("w-full gap-3 pt-4"):
             with ui.element("div").classes("rz-choices"):
                 for name, (badge, text) in [*MODEL_NOTES.items(), (CUSTOM, ("", "Any local diffusers folder "
                                                                                  "(transformer/, text_encoder/, vae/) "
@@ -2502,29 +2593,48 @@ class Wizard:
                                                     "such as OpenMOSS-Team/MOSS-Image-Base.",
                               show_if=("model_preset", lambda p: p == CUSTOM)):
                 self.bind(ui.input("Path or repo id"), "model_path").classes("w-full")
-            with self.setting(None, "Download and check",
-                              "Fetches what is missing and checks the files already there. Training would also do "
-                              "this on start, but doing it now shows problems (gated repo, no login, disk space) "
-                              "before you start."):
-                status = hint("")
+            with ui.column().classes("w-full gap-0") \
+                    .bind_visibility_from(self.w["model_source"], "value", lambda x: x == HF_SOURCE):
+                with self.setting(None, "Download and check",
+                                  "Fetches what is missing and checks the files already there. Training would also do "
+                                  "this on start, but doing it now shows problems (gated repo, no login, disk space) "
+                                  "before you start."):
+                    status = hint("")
 
-                async def download():
-                    status.text = "Downloading / verifying... (about 30 GB on the first download)"
-                    status.text = await run.io_bound(download_model, self.f.to_config().model_path)
+                    async def download():
+                        status.text = "Downloading / verifying... (about 30 GB on the first download)"
+                        status.text = await run.io_bound(download_model, self.f.to_config().model_path)
 
-                ui.button("Download / verify", icon="download", on_click=download).props("outline")
+                    ui.button("Download / verify", icon="download", on_click=download).props("outline")
         with ui.column().classes("w-full gap-0 pt-2") \
                 .bind_visibility_from(self.w["model_source"], "value", lambda x: x == FILE_SOURCE):
+            with self.setting(None, "File formats to download",
+                              "int8 ConvRot is about half the size of bf16, trains as fast and loses under 1% "
+                              "accuracy. Krea 2 also offers fp8."):
+                self.bind(ui.select(file_quant_options(preset_arch("MOSS-Image-Base"), "model"),
+                                    label="Diffusion model"), "model_file_quant").classes("w-full")
+                self.bind(ui.select(file_quant_options(preset_arch("MOSS-Image-Base"), "text"),
+                                    label="Text encoder"), "text_encoder_file_quant").classes("w-full")
+            with self.setting(None, "Download now",
+                              "Training downloads the files on start; this does it now, so a problem (disk space, "
+                              "network) shows before you start. Hugging Face's cache keeps them for later runs."):
+                files_status = hint("")
+
+                async def download_now():
+                    files_status.text = "Downloading / checking the model files..."
+                    files_status.text = await run.io_bound(download_files, self.f.to_config())
+
+                ui.button("Download now", icon="download", on_click=download_now).props("outline")
             for key, title, text, kind in (
-                    ("transformer_file", "Diffusion model", "ComfyUI models/diffusion_models file: bf16, fp8, int8 or "
-                                                            "nvfp4.", "file"),
-                    ("text_encoder_file", "Text encoder", "ComfyUI models/text_encoders file: Qwen3.5-9B for "
-                                                          "MOSS-Image, Qwen3-VL-4B for Krea 2.", "file"),
-                    ("vae_file", "VAE", "ComfyUI models/vae file: the Flux2 VAE for MOSS-Image, the Qwen-Image VAE for "
-                                        "Krea 2.", "file"),
+                    ("transformer_file", "Diffusion model file (optional)", "A ComfyUI models/diffusion_models file "
+                                                                            "you already have.", "file"),
+                    ("text_encoder_file", "Text encoder file (optional)", "Qwen3.5-9B for MOSS-Image, Qwen3-VL-4B for "
+                                                                          "Krea 2 and FIBO 2.0.", "file"),
+                    ("vae_file", "VAE file (optional)", "The Flux2 VAE for MOSS-Image and FIBO 2.0, the Qwen-Image VAE "
+                                                        "for Krea 2.", "file"),
                     ("tokenizer_path", "Tokenizer folder (optional)", "Left empty, the tokenizer is downloaded once "
                                                                       "(a few MB).", "dir")):
-                with self.setting(None, title, text + " Any file left empty is taken from the Hugging Face model."):
+                with self.setting(None, title, text + " Left empty, it is downloaded."):
                     self.bind(path_field(title, kind, width="w-full"), key)
         self.nav()
 
@@ -2783,12 +2893,14 @@ class Wizard:
                           "Raw. That is how Krea uses LoRAs trained on Raw, and Turbo needs 8 steps without guidance "
                           "where Raw needs 28 or more with it. Empty = preview on Raw.", show_if=is_krea):
             self.bind(ui.input("Sampling model (repo id or folder)"), "sample_model_path").classes("w-full")
-        with self.setting(None, "Turbo LoRA (optional)",
-                          "A step-distilled LoRA (for example an 8-step DMD distill of MOSS-Image-Base), used only "
-                          "while rendering samples and probes, never in training. Previews then take seconds; set the "
-                          "steps and guidance below to match it.",
-                          show_if=("model_preset", lambda p: preset_arch(p, self.w["model_path"].value) != "krea2")):
-            self.bind(path_field("Turbo LoRA", "file", width="w-full"), "turbo_lora")
+        with self.setting(None, "Turbo LoRA",
+                          "A step-distilled LoRA used only while rendering samples and probes, never in training: "
+                          "previews take seconds. The model's own is downloaded (MOSS-Image: 12 steps at CFG 1; "
+                          "Krea 2: 8; FIBO 2.0: 4) and the steps and guidance below follow it. For MOSS-Image, Fizgig "
+                          "found it can understate likeness: judge likeness on full-quality samples."):
+            self.bind(ui.select(TURBO_MODES, label="Turbo LoRA"), "turbo_mode").classes("w-full")
+            self.bind(path_field("Turbo LoRA file", "file", width="w-full"), "turbo_lora") \
+                .parent_slot.parent.bind_visibility_from(self.w["turbo_mode"], "value", lambda x: x == "file")
         with self.setting("sample_steps", "Sampling steps", "Denoising steps per preview image. More is slower and "
                                                             "a little cleaner."):
             self.bind(ui.number("Sample steps", min=1, precision=0), "sample_steps").classes("w-full")
@@ -3077,7 +3189,7 @@ def build_page(local: bool = True):
                     # ---- Model
                     with section("Model", "Base model, model files and GPUs", "model_training") as sec:
                         nav_items.append(("Model", "model_training", sec))
-                        w["model_source"] = ui.radio([HF_SOURCE, FILE_SOURCE], value=HF_SOURCE).props("inline")
+                        w["model_source"] = ui.radio([FILE_SOURCE, HF_SOURCE], value=FILE_SOURCE).props("inline")
                         with fields():  # the model (family) in both modes: with files it is also the HF fallback
                             w["model_preset"] = ui.select(list(MODEL_PRESETS) + [CUSTOM], value="MOSS-Image-Base",
                                                           label="Model").classes("w-60") \
@@ -3100,17 +3212,39 @@ def build_page(local: bool = True):
                         dl_status = hint("")
                         with ui.column().classes("w-full gap-3").bind_visibility_from(
                                 w["model_source"], "value", lambda x: x == FILE_SOURCE):
-                            path_input(f, "transformer_file", "Diffusion model (.safetensors: bf16, fp8, int8, nvfp4)",
+                            fam0 = preset_arch("MOSS-Image-Base")
+                            with fields():
+                                w["model_file_quant"] = ui.select(file_quant_options(fam0, "model"),
+                                                                  value=d.model_file_quant,
+                                                                  label="Diffusion model download").classes("w-72") \
+                                    .tooltip("The format of the diffusion model file downloaded from Comfy-Org for "
+                                             "the model picked above, when no file is set below. int8 ConvRot is "
+                                             "about half the size of bf16 and trains as fast.")
+                                w["text_encoder_file_quant"] = ui.select(file_quant_options(fam0, "text"),
+                                                                         value=d.text_encoder_file_quant,
+                                                                         label="Text encoder download").classes("w-72")
+
+                                async def on_download_files():
+                                    files_status.text = "Downloading / checking the model files..."
+                                    files_status.text = await run.io_bound(download_files, f.to_config())
+
+                                ui.button("Download now", icon="download", on_click=on_download_files) \
+                                    .props("outline").tooltip("Training downloads them on start anyway; this does it "
+                                                              "now (Hugging Face's cache keeps them for later runs)")
+                            files_status = hint("")
+                            hint("The model picked above comes as single files from Comfy-Org's ComfyUI repackages "
+                                 "(Comfy-Org/MOSS-Image, Comfy-Org/Krea-2, Comfy-Org/Fibo-2.0), downloaded on the first "
+                                 "run. To use files you already have, set them below: anything left empty is "
+                                 "downloaded.")
+                            path_input(f, "transformer_file", "Diffusion model file (optional; empty = download)",
                                        "file", "", "w-[40rem]")
-                            path_input(f, "text_encoder_file", "Text encoder (.safetensors: Qwen3.5-9B for MOSS-Image, "
-                                                               "Qwen3-VL-4B for Krea 2)", "file", "", "w-[40rem]")
-                            path_input(f, "vae_file", "VAE (.safetensors: Flux2 for MOSS-Image, Qwen-Image for Krea 2)",
-                                       "file", "", "w-[40rem]")
+                            path_input(f, "text_encoder_file", "Text encoder file (optional; Qwen3.5-9B for MOSS-Image, "
+                                                               "Qwen3-VL-4B for Krea 2 and FIBO 2.0)", "file", "",
+                                       "w-[40rem]")
+                            path_input(f, "vae_file", "VAE file (optional; Flux2 for MOSS-Image and FIBO 2.0, "
+                                                      "Qwen-Image for Krea 2)", "file", "", "w-[40rem]")
                             path_input(f, "tokenizer_path", "Tokenizer folder (optional; auto-downloads if empty)",
                                        "dir", "", "w-[40rem]")
-                            hint("ComfyUI's files for MOSS-Image and Krea 2 (bf16, scaled fp8, int8, nvfp4; the family "
-                                 "is read from the diffusion model file). Any file left empty is taken from the model "
-                                 "picked above on Hugging Face. FIBO 2.0 has no single-file loader.")
                         subhead("GPUs and memory")
                         with fields():
                             w["multi_gpu"] = ui.select({"off": "single GPU",
@@ -3581,28 +3715,62 @@ def build_page(local: bool = True):
                         w["sample_prompts"] = ui.textarea("Sample prompts (one per line; empty = no samples)") \
                             .classes("w-full")
                         with fields():
-                            w["sample_width"] = ui.number("Width", value=d.sample_width, precision=0).classes("w-28")
-                            w["sample_height"] = ui.number("Height", value=d.sample_height, precision=0) \
-                                .classes("w-28")
+                            aspect0, mp0 = size_aspect(d.sample_width, d.sample_height)
+                            w["sample_aspect"] = ui.select(SAMPLE_ASPECTS, value=aspect0, label="Aspect ratio") \
+                                .classes("w-44")
+                            w["sample_mp"] = ui.select(MP_OPTIONS, value=mp0, label="Resolution").classes("w-44")
+                            size_label = ui.label("").classes("rz-hint self-center")
+
+                            def show_size(_=None):
+                                try:
+                                    sw, sh = aspect_size(w["sample_aspect"].value, w["sample_mp"].value)
+                                    size_label.text = f"= {sw} x {sh}"
+                                except (TypeError, ValueError):
+                                    size_label.text = ""
+
+                            for key in ("sample_aspect", "sample_mp"):
+                                w[key].on_value_change(show_size)
+                            show_size()
+                        with fields():
+                            w["turbo_mode"] = ui.select(TURBO_MODES, value="auto", label="Turbo LoRA").classes("w-80") \
+                                .tooltip("A step-distilled LoRA used only while rendering samples and probes, never "
+                                         "in training. The model's own: MOSS-Image lodestones' 8-step DMD LoRA (12 "
+                                         "steps, CFG 1, shift 5), Krea 2 Comfy-Org's Turbo LoRA (8 steps, CFG 1), "
+                                         "FIBO 2.0 Comfy-Org's Turbo LoRA (4 steps, CFG 1).")
+                            path_input(f, "turbo_lora", "Turbo / step-distill LoRA file", "file", "", "w-[30rem]")
+                            f.w["turbo_lora"].parent_slot.parent.bind_visibility_from(w["turbo_mode"], "value",
+                                                                                      lambda x: x == "file")
+                            w["turbo_lora_strength"] = ui.number("Turbo LoRA strength", value=d.turbo_lora_strength,
+                                                                 step=0.05).classes("w-44") \
+                                .bind_visibility_from(w["turbo_mode"], "value", lambda x: x != "none")
+
+                            def on_turbo_mode(e):
+                                was = getattr(on_turbo_mode, "last", "auto") != "none"
+                                on_turbo_mode.last = e.value
+                                if f.loading:
+                                    return
+                                fam = preset_arch(w["model_preset"].value, w["model_path"].value)
+                                f.follow_sample_defaults(fam, fam, was, e.value != "none")
+
+                            w["turbo_mode"].on_value_change(on_turbo_mode)
+                        with fields():
                             w["sample_steps"] = ui.number("Steps", value=d.sample_steps, precision=0).classes("w-28")
                             w["sample_cfg"] = ui.number("CFG", value=d.sample_cfg).classes("w-28")
-                            w["sample_shift"] = ui.number("Shift", value=d.sample_shift).classes("w-28")
-                        hint("FIBO 2.0: Bria samples the dev model at 50 steps / CFG 5 (20-30 steps is fine for "
-                             "previews); an empty negative prompt means the null caption it was trained with; sample "
-                             "shift and the skip layer are MOSS-only. Prompts can be plain sentences or VGL JSON "
-                             "captions.").bind_visibility_from(w["model_preset"], "value",
-                                                               lambda p: is_fibo_preset(p, w["model_path"].value))
-                        hint("Krea 2: Raw is a base for training and needs many steps with guidance (Krea's pipeline: "
-                             "28 steps at their guidance 4.5, CFG 5.5 here). Faster: set "
-                             "krea/Krea-2-Turbo as the sampling model (Advanced below) with 8 steps and CFG 1, the "
-                             "way Krea uses LoRAs trained on Raw. Sample shift and the skip layer are MOSS-only.") \
-                            .bind_visibility_from(w["model_preset"], "value",
-                                                  lambda p: preset_arch(p, w["model_path"].value) == "krea2")
-                        with fields():
-                            path_input(f, "turbo_lora", "Turbo / step-distill LoRA for sampling (optional)", "file",
-                                       "", "w-[34rem]")
-                            w["turbo_lora_strength"] = ui.number("Turbo LoRA strength", value=d.turbo_lora_strength,
-                                                                 step=0.05).classes("w-44")
+                            w["sample_shift"] = ui.number("Shift", value=d.sample_shift).classes("w-28") \
+                                .tooltip("MOSS-Image only (5); Krea 2 and FIBO 2.0 take their shift from the image size")
+                        hint("FIBO 2.0: with its turbo LoRA (Edit Turbo as a LoRA on dev) samples render 4 steps at "
+                             "CFG 1; without it Bria samples dev at 50 steps / CFG 5 (20-30 is fine for previews). An "
+                             "empty negative prompt means the null caption it was trained with. Prompts can be plain "
+                             "sentences or VGL JSON captions.").bind_visibility_from(
+                            w["model_preset"], "value", lambda p: is_fibo_preset(p, w["model_path"].value))
+                        hint("Krea 2: with its turbo LoRA samples render 8 steps at CFG 1. Without it, Raw needs "
+                             "many steps with guidance (Krea's pipeline: 28 steps at their guidance 4.5, CFG 5.5 "
+                             "here).").bind_visibility_from(
+                            w["model_preset"], "value", lambda p: preset_arch(p, w["model_path"].value) == "krea2")
+                        hint("MOSS-Image: lodestones' turbo LoRA renders 12 steps at CFG 1 on Base. Fizgig found it "
+                             "can understate likeness: judge a run's likeness on full-quality samples (Turbo LoRA: "
+                             "none, 20 steps, CFG 3).").bind_visibility_from(
+                            w["model_preset"], "value", lambda p: preset_arch(p, w["model_path"].value) == "moss_image")
                         with advanced("Seeds, negative prompt and sampling models"):
                             with fields():
                                 w["sample_seed"] = ui.number("Sample seed", value=d.sample_seed, precision=0) \

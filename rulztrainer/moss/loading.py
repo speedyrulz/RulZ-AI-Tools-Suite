@@ -118,6 +118,13 @@ def get_vae(cfg: TrainConfig, model_dir: Path | None):
     return load_vae(model_dir, cfg.device)
 
 
+def check_tokenizer(tokenizer) -> None:
+    """MOSS-Image's text encoder reads Qwen3.5 token ids: refuse a smaller vocabulary (another model's tokenizer)."""
+    if len(tokenizer) < sf.MOSS_TOKENIZER_MIN_VOCAB:
+        raise ValueError(f"The tokenizer has {len(tokenizer)} tokens: it is not MOSS-Image's Qwen3.5 tokenizer "
+                         f"(248k). Point tokenizer_path at MOSS-Image's tokenizer folder, or leave it empty to download it")
+
+
 def get_text_encoder(cfg: TrainConfig, model_dir: Path | None):
     if _use_file(cfg, "text_encoder_file"):
         from transformers import AutoTokenizer
@@ -125,6 +132,7 @@ def get_text_encoder(cfg: TrainConfig, model_dir: Path | None):
         _check_files(cfg, "text_encoder_file")
         tok_dir = sf.resolve_tokenizer(cfg.tokenizer_path, cfg.models_dir)
         tokenizer = AutoTokenizer.from_pretrained(str(tok_dir))
+        check_tokenizer(tokenizer)
         return sf.load_text_encoder_file(cfg.text_encoder_file, cfg.text_encoder_device, cfg.text_encoder_quant), tokenizer
     return load_text_encoder(model_dir, cfg.text_encoder_device, cfg.text_encoder_quant)
 

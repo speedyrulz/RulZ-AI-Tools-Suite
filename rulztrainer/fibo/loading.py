@@ -123,8 +123,9 @@ def _input_device(model: nn.Module) -> torch.device:
 def encode_prompt(text_encoder, processor, prompt: str, max_length: int = 4096) -> torch.Tensor:
     """Text features for one prompt: [6, S, 7680] bf16 on the CPU (the six bundles, see the module docstring)."""
     text = PROMPT_TEMPLATE.format(clean_prompt(prompt))
-    inputs = processor(text=[text], images=None, padding="longest", max_length=max_length, truncation=True,
-                       return_tensors="pt")
+    extra = {"images": None} if hasattr(processor, "image_processor") else {}  # the processor, or a plain tokenizer
+    inputs = processor(text=[text], padding="longest", max_length=max_length, truncation=True, return_tensors="pt",
+                       **extra)
     device = _input_device(text_encoder)
     inputs = {k: v.to(device) for k, v in inputs.items()}
     hidden = text_encoder(**inputs, output_hidden_states=True).hidden_states
@@ -151,19 +152,19 @@ def pad_embeds(rows: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
 # ---------------------------------------------------------------- config-driven entry points
 
 
-def _hf_only(cfg: TrainConfig) -> None:
-    if cfg.model_source == "files":
-        raise ValueError("FIBO 2.0 has no single-file (ComfyUI) checkpoints yet: use model_source 'hf' with the "
-                         "briaai/Fibo-2.0-dev repo id or a diffusers folder")
-
-
-def resolve_for_config(cfg: TrainConfig) -> Path:
-    _hf_only(cfg)
+def resolve_for_config(cfg: TrainConfig) -> Path | None:
+    """Download / locate the HF model dir when any component comes from it (single files cover the rest)."""
+    if cfg.model_source == "files" and all(getattr(cfg, f) for f in ("transformer_file", "text_encoder_file", "vae_file")):
+        return None
     return moss_loading.resolve_model_dir(cfg.model_path, cfg.models_dir)
 
 
 def get_transformer(cfg: TrainConfig, model_dir: Path | None, device: str | None = None) -> FiboTransformer:
-    _hf_only(cfg)
+    if moss_loading._use_file(cfg, "transformer_file"):
+        from . import single_file as fsf
+
+        moss_loading._check_files(cfg, "transformer_file")
+        return fsf.load_transformer_file(cfg.transformer_file, device or cfg.device, cfg.transformer_quant)
     return load_transformer(model_dir, device or cfg.device, cfg.transformer_quant)
 
 
@@ -174,14 +175,24 @@ def get_vae(cfg: TrainConfig, model_dir: Path | None):
 
 
 def get_text_encoder(cfg: TrainConfig, model_dir: Path | None):
-    _hf_only(cfg)
+    if moss_loading._use_file(cfg, "text_encoder_file"):  # Comfy-Org's Qwen3-VL-4B file, the same one Krea 2 uses
+        from transformers import AutoTokenizer
+
+        from ..krea2 import single_file as ksf
+
+        moss_loading._check_files(cfg, "text_encoder_file")
+        tokenizer = AutoTokenizer.from_pretrained(str(ksf.resolve_tokenizer(cfg.tokenizer_path, cfg.models_dir)))
+        model = ksf.load_text_encoder_file(cfg.text_encoder_file, cfg.text_encoder_device, cfg.text_encoder_quant)
+        return model, tokenizer
     return load_text_encoder(model_dir, cfg.text_encoder_device, cfg.text_encoder_quant)
 
 
 def load_any_transformer(path: str, device, quant: str = "auto", models_dir: str = "models") -> FiboTransformer:
     p = Path(path).expanduser()
     if p.is_file():
-        raise ValueError("FIBO 2.0 models load from a diffusers folder or repo id, not a single file")
+        from . import single_file as fsf
+
+        return fsf.load_transformer_file(p, device, quant)
     if p.is_dir() and (p / "transformer" / "config.json").is_file():
         return load_transformer(p, device, quant)
     return load_transformer(moss_loading.resolve_model_dir(path, models_dir), device, quant)

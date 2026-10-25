@@ -67,6 +67,19 @@ def ensure_insightface_pack(name: str = "buffalo_l", root: str = "~/.insightface
     return pack_dir
 
 
+def ensure_hf_file(repo_id: str, filename: str, label: str, progress: ProgressFn | None = None) -> Path:
+    """One file of a Hugging Face repo, from the local cache or downloaded with progress (a cached snapshot of the
+    repo does not mean this file is in it)."""
+    from huggingface_hub import hf_hub_download
+
+    try:
+        return Path(hf_hub_download(repo_id, filename, local_files_only=True))
+    except Exception:  # noqa: BLE001 - not cached yet
+        pass
+    _snapshot_download(repo_id, label, progress, [filename])
+    return Path(hf_hub_download(repo_id, filename, local_files_only=True))
+
+
 def ensure_hf_snapshot(repo_id: str, label: str, progress: ProgressFn | None = None,
                        allow_patterns: list[str] | None = None, **kwargs) -> str:
     """Return the local snapshot path of a Hugging Face repo, downloading with progress if needed."""
@@ -76,6 +89,13 @@ def ensure_hf_snapshot(repo_id: str, label: str, progress: ProgressFn | None = N
         return snapshot_download(repo_id, allow_patterns=allow_patterns, local_files_only=True, **kwargs)
     except Exception:  # noqa: BLE001 - not cached (or incomplete): download below
         pass
+    return _snapshot_download(repo_id, label, progress, allow_patterns, **kwargs)
+
+
+def _snapshot_download(repo_id: str, label: str, progress: ProgressFn | None = None,
+                       allow_patterns: list[str] | None = None, **kwargs) -> str:
+    """Download (the allowed files of) a repo with progress through the callback."""
+    from huggingface_hub import snapshot_download
     from huggingface_hub.utils import tqdm as hf_tqdm
 
     class ReportingTqdm(hf_tqdm):  # one instance per file plus one "Fetching N files" counter

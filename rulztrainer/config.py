@@ -23,10 +23,47 @@ ARCH_NAMES = ("moss_image", "fibo2", "krea2")
 _CORE_TARGETS = ("q", "k", "v", "o", "ffn_up_gate", "ffn_down")
 ARCH_DEFAULT_TARGETS = {"moss_image": _CORE_TARGETS, "fibo2": _CORE_TARGETS,
                         "krea2": _CORE_TARGETS + ("attn_gate", "text_fusion")}
-# (sample steps, sample CFG) per family, in this trainer's guidance convention (uncond + cfg * (cond - uncond), 1 = off):
-# MOSS-Image's reference CFG 3; Bria's FIBO 2.0 pipeline, 30 steps at 5; Krea's pipeline, 28 steps at its
-# guidance_scale 4.5, which computes cond + g * (cond - uncond): cfg 5.5 here
-ARCH_SAMPLE_DEFAULTS = {"moss_image": (20, 3.0), "fibo2": (30, 5.0), "krea2": (28, 5.5)}
+# (sample steps, sample CFG) per family at full quality, in this trainer's guidance convention (uncond + cfg * (cond -
+# uncond), 1 = off): MOSS-Image's reference CFG 3; Bria's FIBO 2.0 pipeline, 30 steps at 5; Krea's pipeline, 28 steps
+# at its guidance_scale 4.5, which computes cond + g * (cond - uncond): cfg 5.5 here
+ARCH_FULL_SAMPLE = {"moss_image": (20, 3.0), "fibo2": (30, 5.0), "krea2": (28, 5.5)}
+# Each family's turbo LoRA (turbo_lora: auto downloads it) and the sampling it is made for. The shift only matters for
+# MOSS-Image: the Krea 2 and FIBO 2.0 samplers take theirs from the image size.
+#   MOSS-Image: lodestones' 8-step DMD LoRA distilled from Base (Fizgig's pick), at 12 steps (Fizgig: much better than
+#               the card's 8), CFG 1, shift 5; it suits Base, not SFT, and can understate likeness (Fizgig, 20 Oct 2026)
+#   Krea 2:     Comfy-Org's Krea 2 Turbo LoRA (rank 64), 8 steps, CFG 1 (ComfyUI's Krea 2 Turbo workflow)
+#   FIBO 2.0:   Comfy-Org's FIBO 2.0 Turbo LoRA (Edit Turbo as a LoRA on dev), 4 steps, CFG 1 (Bria's Edit Turbo card)
+ARCH_TURBO = {
+    "moss_image": {"repo": "lodestones/Kromoss", "file": "8-steps-dmd-lora.safetensors", "strength": 1.0,
+                   "steps": 12, "cfg": 1.0, "shift": 5.0},
+    "krea2": {"repo": "Comfy-Org/Krea-2", "file": "loras/krea2_turbo_lora_rank_64_bf16.safetensors", "strength": 1.0,
+              "steps": 8, "cfg": 1.0, "shift": 5.0},
+    "fibo2": {"repo": "Comfy-Org/Fibo-2.0", "file": "loras/fibo_2.0_turbo_lora_avg_rank_270_bf16.safetensors",
+              "strength": 1.0, "steps": 4, "cfg": 1.0, "shift": 5.0},
+}
+# (sample steps, sample CFG) per family by default: the turbo LoRA's
+ARCH_SAMPLE_DEFAULTS = {fam: (t["steps"], t["cfg"]) for fam, t in ARCH_TURBO.items()}
+
+# Single files (model_source "files") come from Comfy-Org's ComfyUI repackages when a file is left empty: the diffusion
+# model of the picked model in model_file_quant, the family's text encoder in text_encoder_file_quant, its VAE
+COMFY_REPOS = {"moss_image": "Comfy-Org/MOSS-Image", "krea2": "Comfy-Org/Krea-2", "fibo2": "Comfy-Org/Fibo-2.0"}
+COMFY_DIFFUSION_FILES = {
+    "OpenMOSS-Team/MOSS-Image-Base": "diffusion_models/moss_image_base_{quant}.safetensors",
+    "OpenMOSS-Team/MOSS-Image-SFT": "diffusion_models/moss_image_sft_{quant}.safetensors",
+    "krea/Krea-2-Raw": "diffusion_models/krea2_raw_{quant}.safetensors",
+    "krea/Krea-2-Turbo": "diffusion_models/krea2_turbo_{quant}.safetensors",
+    "briaai/Fibo-2.0-dev": "diffusion_models/fibo2_dev_{quant}.safetensors",
+    "briaai/Fibo-2.0-edit-turbo": "diffusion_models/fibo2_edit_turbo_{quant}.safetensors",
+}
+COMFY_DIFFUSION_QUANTS = {"moss_image": ("int8_convrot", "bf16"), "krea2": ("int8_convrot", "fp8_scaled", "bf16"),
+                          "fibo2": ("int8_convrot", "bf16")}
+COMFY_TEXT_ENCODER_FILES = {"moss_image": "text_encoders/qwen3.5_9b_{quant}.safetensors",
+                            "krea2": "text_encoders/qwen3vl_4b_{quant}.safetensors",
+                            "fibo2": "text_encoders/qwen3vl_4b_{quant}.safetensors"}
+COMFY_TEXT_ENCODER_QUANTS = {"moss_image": ("int8_convrot", "bf16"), "krea2": ("int8_convrot", "fp8_scaled", "bf16"),
+                             "fibo2": ("int8_convrot", "bf16")}
+COMFY_VAE_FILES = {"moss_image": "vae/flux2-vae_small.safetensors", "krea2": "vae/qwen_image_vae.safetensors",
+                   "fibo2": "vae/flux2-vae.safetensors"}
 
 
 # Named presets: values applied over a config (UI toggle, --preset on the CLI, or `preset:` in YAML).
@@ -102,13 +139,17 @@ class TrainConfig:
 
     # --- model ---
     model_arch: str = "auto"  # auto | moss_image | fibo2 | krea2 (auto: the model's transformer config, or the path)
-    model_source: str = "hf"  # hf: repo id / diffusers dir | files: single ComfyUI-style safetensors files
+    model_source: str = "files"  # files: single ComfyUI-style safetensors files | hf: repo id / diffusers dir
     model_path: str = "OpenMOSS-Team/MOSS-Image-Base"  # HF repo id or local dir with transformer/ text_encoder/ vae/
     models_dir: str = "models"  # where HF repos are downloaded
     transformer_file: str = ""  # model_source=files: ComfyUI diffusion_models/*.safetensors (bf16, fp8, int8, nvfp4)
     text_encoder_file: str = ""  # model_source=files: ComfyUI text_encoders/*.safetensors (Qwen3.5-9B)
     vae_file: str = ""  # model_source=files: ComfyUI vae/*.safetensors (Flux2 VAE)
     tokenizer_path: str = ""  # model_source=files: dir with tokenizer_config.json; empty = auto-download
+    # model_source=files, a file left empty: downloaded from Comfy-Org's ComfyUI repackage of the model (COMFY_*), in
+    # this format: int8_convrot (default; half of bf16), bf16, fp8_scaled (Krea 2 only)
+    model_file_quant: str = "int8_convrot"
+    text_encoder_file_quant: str = "int8_convrot"
     device: str = "cuda:0"
     multi_gpu: str = "off"  # off | data_parallel (model copy per GPU, faster) | model_split (blocks across GPUs, memory only)
     devices: str = "cuda:0,cuda:1"  # GPUs for multi_gpu; the first is the primary
@@ -198,15 +239,16 @@ class TrainConfig:
     sample_prompts: list[str] = field(default_factory=list)
     sample_width: int = 1024
     sample_height: int = 1024
-    sample_steps: int = 20
-    sample_cfg: float = 3.0
+    sample_steps: int = 12  # the default MOSS-Image turbo LoRA's (ARCH_TURBO); each family has its own
+    sample_cfg: float = 1.0
     sample_shift: float = 5.0
     sample_seed: int = 42
     sample_walk_seed: bool = True  # seed + i for the i-th sample prompt; off = same seed for every prompt
     sample_before_training: bool = False  # generate samples at step 0 before the first training step
     sample_negative: str = ""
     sample_skip_layer: int = 22  # negative-branch skip layer; -1 disables
-    turbo_lora: str = ""  # optional ComfyUI-format LoRA (e.g. an 8-step distill) applied only while sampling
+    turbo_lora: str = "auto"  # a LoRA (e.g. an 8-step distill) applied only while sampling: auto = the model family's
+    #                            turbo LoRA (ARCH_TURBO, downloaded), "" = none, or a .safetensors path
     turbo_lora_strength: float = 1.0
     sample_lora: str = ""  # optional second ComfyUI-format LoRA applied only while sampling (with the turbo LoRA)
     sample_lora_strength: float = 1.0
@@ -217,7 +259,7 @@ class TrainConfig:
     body_refs: list[str] = field(default_factory=list)  # dataset images (full body, neutral pose) for proportions
     body_score: str = "appearance"  # appearance (DINOv2 of the person crop, best match against the references) |
     #   proportions (skeleton ratios from body_backend, + SAM 3 silhouette widths with mediapipe+sam3)
-    body_backend: str = "mediapipe"  # mediapipe (skeleton ratios, region masks) | mediapipe+sam3 (adds SAM 3 masks)
+    body_backend: str = "mediapipe+sam3"  # mediapipe+sam3 (SAM 3 person masks too) | mediapipe (skeleton only)
     sam3_model: str = "facebook/sam3"  # HF repo id or local transformers-format directory
     body_device: str = "cuda:0"  # where SAM 3 runs while scoring (moved back to CPU afterwards)
     face_weight: float = 0.7  # weights for the combined score

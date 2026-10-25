@@ -605,6 +605,11 @@ class Trainer:
         torch.manual_seed(cfg.seed)
         rng = random.Random(cfg.seed)
         gen = torch.Generator("cpu").manual_seed(cfg.seed)
+        from .comfy_files import resolve_downloads
+
+        self.status.update(stage="model files")
+        cfg = self.cfg = resolve_downloads(cfg, progress=lambda text, frac=None: self.status.update(stage=text))
+        self.arch = get_arch(cfg)  # a downloaded single file names its own family
         self.status.update(stage="resolving model")
         Q.set_int8_defaults(cfg.int8_matmul, cfg.int8_backward)  # every QuantLinear built from here on
         Q.set_nvfp4_default(cfg.nvfp4_matmul, cfg.nvfp4_backward)
@@ -1607,7 +1612,8 @@ class Trainer:
                                       ("Sampling LoRA", cfg.sample_lora, cfg.sample_lora_strength)):
             if path:
                 n = lora_mod.attach_extra_lora(model, path, strength,
-                                               rename=getattr(self.arch, "lora_module_name", None))
+                                               rename=getattr(self.arch, "lora_module_name", None),
+                                               convert=getattr(self.arch, "extra_lora_converter", None))
                 log.info("%s %s: matched %d modules (strength %g, sampling only)", label, path, n, strength)
                 if label == "Turbo LoRA" and n:
                     model.turbo_lora_attached = True  # the Krea 2 sampler then uses the distilled schedule
