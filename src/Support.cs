@@ -9,25 +9,81 @@ using System.Windows.Forms;
 
 namespace RulZ.ImageTournament
 {
-    // Black and red, matching the RulZ logo.
+    // The app's colors. Dark (black and red, matching the RulZ logo) is the default; Light is white with the
+    // same red. Code reads the current palette through Theme; MainForm.ApplyTheme re-colors the controls.
+    sealed class Palette
+    {
+        public bool IsLight;
+        public Color Back, Panel, Control, Hover, Border, Text, Dim;
+        public Color Accent, AccentText, AccentFill, AccentFillHover, OnAccent, Overlay, ErrorText;
+        public string LogoResource;
+
+        public static readonly Palette Dark = new Palette
+        {
+            Back = Color.FromArgb(12, 12, 14),
+            Panel = Color.FromArgb(22, 22, 25),
+            Control = Color.FromArgb(36, 36, 40),
+            Hover = Color.FromArgb(54, 54, 60),
+            Border = Color.FromArgb(64, 64, 70),
+            Text = Color.FromArgb(242, 242, 242),
+            Dim = Color.FromArgb(150, 150, 158),
+            Accent = Color.FromArgb(237, 0, 13),          // the logo red
+            AccentText = Color.FromArgb(255, 70, 70),     // red that stays readable on black
+            AccentFill = Color.FromArgb(120, 0, 8),       // selected toggles and the Keep buttons
+            AccentFillHover = Color.FromArgb(165, 0, 12),
+            OnAccent = Color.FromArgb(242, 242, 242),
+            Overlay = Color.FromArgb(16, 16, 18),         // boxes behind text drawn over the images
+            ErrorText = Color.Salmon,
+            LogoResource = "RulZ.ImageTournament.logo.png",
+        };
+
+        public static readonly Palette Light = new Palette
+        {
+            IsLight = true,
+            Back = Color.FromArgb(255, 255, 255),
+            Panel = Color.FromArgb(245, 245, 247),
+            Control = Color.FromArgb(255, 255, 255),
+            Hover = Color.FromArgb(235, 235, 239),
+            Border = Color.FromArgb(217, 217, 222),
+            Text = Color.FromArgb(17, 17, 20),
+            Dim = Color.FromArgb(95, 96, 104),
+            Accent = Color.FromArgb(237, 0, 13),
+            AccentText = Color.FromArgb(200, 0, 11),      // a little darker so small text reads well on white
+            AccentFill = Color.FromArgb(237, 0, 13),
+            AccentFillHover = Color.FromArgb(200, 0, 11),
+            OnAccent = Color.FromArgb(255, 255, 255),
+            Overlay = Color.FromArgb(255, 255, 255),
+            ErrorText = Color.FromArgb(200, 0, 11),
+            LogoResource = "RulZ.ImageTournament.logo-light.png",
+        };
+    }
+
     static class Theme
     {
-        public static readonly Color Back = Color.FromArgb(12, 12, 14);
-        public static readonly Color Panel = Color.FromArgb(22, 22, 25);
-        public static readonly Color Control = Color.FromArgb(36, 36, 40);
-        public static readonly Color Hover = Color.FromArgb(54, 54, 60);
-        public static readonly Color Border = Color.FromArgb(64, 64, 70);
-        public static readonly Color Text = Color.FromArgb(242, 242, 242);
-        public static readonly Color Dim = Color.FromArgb(150, 150, 158);
-        public static readonly Color Accent = Color.FromArgb(237, 0, 13);       // the logo red
-        public static readonly Color AccentText = Color.FromArgb(255, 70, 70);  // red that stays readable on black
-        public static readonly Color AccentDark = Color.FromArgb(120, 0, 8);
-        public static readonly Color AccentHover = Color.FromArgb(165, 0, 12);
+        public static Palette Current = Palette.Dark;
 
-        // The wordmark, embedded in the .exe by build.ps1 (white lettering for dark backgrounds).
-        public static Bitmap LoadLogo()
+        public static bool IsLight { get { return Current.IsLight; } }
+        public static Color Back { get { return Current.Back; } }
+        public static Color Panel { get { return Current.Panel; } }
+        public static Color Control { get { return Current.Control; } }
+        public static Color Hover { get { return Current.Hover; } }
+        public static Color Border { get { return Current.Border; } }
+        public static Color Text { get { return Current.Text; } }
+        public static Color Dim { get { return Current.Dim; } }
+        public static Color Accent { get { return Current.Accent; } }
+        public static Color AccentText { get { return Current.AccentText; } }
+        public static Color AccentFill { get { return Current.AccentFill; } }
+        public static Color AccentFillHover { get { return Current.AccentFillHover; } }
+        public static Color OnAccent { get { return Current.OnAccent; } }
+        public static Color ErrorText { get { return Current.ErrorText; } }
+
+        // The translucent box behind text drawn over images.
+        public static Color Overlay(int alpha) { return Color.FromArgb(alpha, Current.Overlay); }
+
+        // The wordmark, embedded in the .exe by build.ps1: white lettering for dark, the original black for light.
+        public static Bitmap LoadLogo(Palette palette)
         {
-            using (var s = typeof(Theme).Assembly.GetManifestResourceStream("RulZ.ImageTournament.logo.png"))
+            using (var s = typeof(Theme).Assembly.GetManifestResourceStream(palette.LogoResource))
             {
                 if (s == null) return null;
                 using (var img = Image.FromStream(s)) return new Bitmap(img);
@@ -38,7 +94,13 @@ namespace RulZ.ImageTournament
     // Draws an image scaled to fit, keeping its aspect ratio, with high-quality filtering.
     sealed class LogoBox : System.Windows.Forms.Control
     {
-        readonly Image _image;
+        Image _image;
+
+        public Image Image
+        {
+            get { return _image; }
+            set { _image = value; Invalidate(); }
+        }
 
         public LogoBox(Image image)
         {
@@ -59,10 +121,23 @@ namespace RulZ.ImageTournament
     }
 
     // Simple key=value settings stored in %APPDATA%\RulZ Image Tournament.
+    // If the RULZ_TOURNAMENT_DATA environment variable names a folder, <that folder>\RulZ Image Tournament is
+    // used instead (for testing or a portable copy), and the normal settings and saved tournament are left alone.
     sealed class Settings
     {
-        public static readonly string Folder = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "RulZ Image Tournament");
+        public static readonly string Folder = Path.Combine(DataRoot(), "RulZ Image Tournament");
+
+        static string DataRoot()
+        {
+            string custom = Environment.GetEnvironmentVariable("RULZ_TOURNAMENT_DATA");
+            if (!string.IsNullOrWhiteSpace(custom))
+            {
+                try { return Path.GetFullPath(Environment.ExpandEnvironmentVariables(custom.Trim().Trim('"'))); }
+                catch (ArgumentException) { }
+                catch (NotSupportedException) { }
+            }
+            return Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        }
 
         static string FilePath { get { return Path.Combine(Folder, "settings.ini"); } }
 
@@ -108,6 +183,8 @@ namespace RulZ.ImageTournament
             return int.TryParse(Get(key, null), NumberStyles.Integer, CultureInfo.InvariantCulture, out v) ? v : fallback;
         }
 
+        public bool Has(string key) { return _values.ContainsKey(key); }
+
         public bool GetBool(string key, bool fallback)
         {
             bool v;
@@ -134,10 +211,20 @@ namespace RulZ.ImageTournament
         [DllImport("dwmapi.dll")]
         static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 
-        public static void UseDarkTitleBar(IntPtr hwnd)
+        [DllImport("user32.dll")]
+        static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+
+        const uint SWP_NOSIZE = 0x1, SWP_NOMOVE = 0x2, SWP_NOZORDER = 0x4, SWP_NOACTIVATE = 0x10, SWP_FRAMECHANGED = 0x20;
+
+        // A dark or light title bar (Windows 10 20H1+ and 11). Redraws the frame so it also applies to an open window.
+        public static void UseDarkTitleBar(IntPtr hwnd, bool dark)
         {
-            int on = 1;
-            try { DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ref on, sizeof(int)); }
+            int on = dark ? 1 : 0;
+            try
+            {
+                DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ref on, sizeof(int));
+                SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            }
             catch (DllNotFoundException) { }
             catch (EntryPointNotFoundException) { }
         }

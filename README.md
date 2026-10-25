@@ -9,6 +9,14 @@ A Windows app that finds your favorite image by single-elimination tournament. I
   </picture>
 </p>
 
+| Dark (default) | Light |
+|---|---|
+| ![A match side by side in the dark look](docs/screenshots/01-dark.png) | ![The same match in the light look](docs/screenshots/02-light.png) |
+
+| Split view with a movable divider | Zoom and pan stay in sync |
+|---|---|
+| ![Split view](docs/screenshots/03-split-view.png) | ![Both images zoomed to the same spot](docs/screenshots/04-synced-zoom.png) |
+
 ## Run
 
 Double-click **`launch.bat`**. It builds the app first if needed. You can also drop images or folders onto `launch.bat` to start a tournament with them.
@@ -32,7 +40,7 @@ Run `install.bat` again to update the installed copy after changing the code. `u
 .\build.ps1 -Test    # also runs the bracket logic tests
 ```
 
-It uses the C# compiler that ships with Windows, so no SDK or Visual Studio is needed. The logo is embedded in the `.exe`, so it remains a single file.
+It uses the C# compiler that ships with Windows, so no SDK or Visual Studio is needed. Both logos (white lettering for dark, black for light) are embedded in the `.exe`, so it remains a single file.
 
 `tools\make_logo.py` (needs Pillow) builds the app's artwork from `assets\logo-source.webp`. It makes a transparent wordmark with white lettering for the dark UI (`logo.png`), a light-background version (`logo-light.png`), and the "R" icon (`app.ico`). Rerun it, then `build.ps1`, if the logo changes.
 
@@ -73,8 +81,20 @@ Zoom and pan stay in sync. Both images show the same spot measured as a fraction
 - **Subfolders** scans folders recursively and skips the Losers folder.
 - **Shuffle** randomizes the order of newly added images.
 - **Keep zoom** keeps the zoom and position from one match to the next. This is handy for comparing the same detail across a burst of similar shots.
+- **Light mode** (at the right end of the toolbar) switches between the dark look and a light one with a white background. It switches immediately and is remembered.
 
-Progress is saved after every pick. If the app is closed mid-tournament, it offers to resume the next time it starts. Settings and progress are stored in `%APPDATA%\RulZ Image Tournament`.
+The first time the app starts, it asks you to choose a look, Dark or Light. Closing that window without choosing keeps Dark. You can change it any time with **Light mode**.
+
+![The first-run "Choose your look" window](docs/screenshots/05-choose-your-look.png)
+
+Progress is saved after every pick. If the app is closed mid-tournament, it offers to resume the next time it starts. Settings (including the look) and progress are stored in `%APPDATA%\RulZ Image Tournament`.
+
+To keep them somewhere else, set the `RULZ_TOURNAMENT_DATA` environment variable to a folder before starting the app. It then uses `<that folder>\RulZ Image Tournament` and leaves the normal settings and saved tournament alone. This is handy for testing or a portable copy, for example:
+
+```bat
+set RULZ_TOURNAMENT_DATA=D:\Portable\TournamentData
+"RulZ Image Tournament.exe"
+```
 
 ## Supported formats
 

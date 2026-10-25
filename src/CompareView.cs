@@ -282,7 +282,7 @@ namespace RulZ.ImageTournament
             if (image.Bitmap == null)
             {
                 TextRenderer.DrawText(g, "Couldn't open this image\n\n" + image.FileName + "\n" + image.Error, _bold, clip,
-                    Color.Salmon, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.WordBreak);
+                    Theme.ErrorText, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.WordBreak);
                 return;
             }
 
@@ -335,7 +335,7 @@ namespace RulZ.ImageTournament
             int x = alignRight ? pane.Right - margin - w : pane.X + margin;
             var box = new Rectangle(x, pane.Y + margin, w, h);
 
-            using (var bg = new SolidBrush(Color.FromArgb(190, 16, 16, 18))) g.FillRectangle(bg, box);
+            using (var bg = new SolidBrush(Theme.Overlay(Theme.IsLight ? 215 : 190))) g.FillRectangle(bg, box);
             if (alignRight) flags |= TextFormatFlags.Right;
             TextRenderer.DrawText(g, title, _bold, new Rectangle(x + pad, box.Y + pad, w - 2 * pad, s1.Height), side == null ? Theme.Text : Theme.AccentText, flags);
             TextRenderer.DrawText(g, info, _small, new Rectangle(x + pad, box.Y + pad + s1.Height, w - 2 * pad, s2.Height), Theme.Dim, flags);
@@ -348,7 +348,7 @@ namespace RulZ.ImageTournament
             using (var line = new Pen(Theme.Accent, 2 * Dpi)) g.DrawLine(line, x, 0, x, h);
             g.SmoothingMode = SmoothingMode.AntiAlias;
             using (var fill = new SolidBrush(Theme.Accent)) g.FillEllipse(fill, x - r, cy - r, 2 * r, 2 * r);
-            using (var arrow = new SolidBrush(Theme.Text))
+            using (var arrow = new SolidBrush(Theme.OnAccent))
             {
                 int gap = (int)(2 * Dpi);
                 g.FillPolygon(arrow, new[] { new Point(x - gap, cy - t), new Point(x - gap, cy + t), new Point(x - gap - t, cy) });
@@ -396,14 +396,14 @@ namespace RulZ.ImageTournament
             Size s = TextRenderer.MeasureText(g, text, font);
             int padX = (int)(24 * Dpi), padY = (int)(10 * Dpi);
             var box = new Rectangle((ClientSize.Width - s.Width) / 2 - padX, centerY - s.Height / 2 - padY, s.Width + 2 * padX, s.Height + 2 * padY);
-            using (var bg = new SolidBrush(Color.FromArgb(210, 16, 16, 18))) g.FillRectangle(bg, box);
+            using (var bg = new SolidBrush(Theme.Overlay(Theme.IsLight ? 230 : 210))) g.FillRectangle(bg, box);
             TextRenderer.DrawText(g, text, font, box, color, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
         }
 
         void DrawDropHint(Graphics g)
         {
             Rectangle r = ClientRectangle;
-            using (var bg = new SolidBrush(Color.FromArgb(150, 0, 0, 0))) g.FillRectangle(bg, r);
+            using (var bg = new SolidBrush(Theme.Overlay(Theme.IsLight ? 170 : 150))) g.FillRectangle(bg, r);
             int m = (int)(16 * Dpi);
             using (var pen = new Pen(Theme.Accent, 3 * Dpi) { DashStyle = DashStyle.Dash })
                 g.DrawRectangle(pen, r.X + m, r.Y + m, r.Width - 2 * m, r.Height - 2 * m);

@@ -44,17 +44,35 @@ namespace RulZ.ImageTournament
 
         Bitmap _logo;
         CompareView _view;
+        LogoBox _logoBox;
+        FlowLayoutPanel _bar;
+        TableLayoutPanel _bottom;
         Button _btnLeft, _btnRight, _btnUndo, _btnBrowse;
         Label _lblStatus;
         ComboBox _cmbAction;
         TextBox _txtLosers;
-        CheckBox _chkSubfolders, _chkShuffle, _chkKeepZoom, _tglSide, _tglSplit;
+        CheckBox _chkSubfolders, _chkShuffle, _chkKeepZoom, _chkLight, _tglSide, _tglSplit;
+
+        // Themed controls by role, re-colored by ApplyTheme.
+        readonly List<Button> _buttons = new List<Button>();
+        readonly List<CheckBox> _toggles = new List<CheckBox>();
+        readonly List<CheckBox> _checks = new List<CheckBox>();
+        readonly List<Label> _labels = new List<Label>();
+        readonly List<Label> _separators = new List<Label>();
 
         public MainForm(string[] startupPaths)
         {
             _startupPaths = startupPaths;
+            if (!_settings.Has("theme"))
+            {
+                // First launch: ask once, before the main window appears, and remember the answer.
+                _settings.Set("theme", ChooseLookDialog.Ask().IsLight ? "light" : "dark");
+                _settings.Save();
+            }
+            Theme.Current = _settings.Get("theme", "dark") == "light" ? Palette.Light : Palette.Dark;
             BuildUi();
             ApplySettings();
+            ApplyTheme();
         }
 
         // ---------- UI construction ----------
@@ -65,8 +83,6 @@ namespace RulZ.ImageTournament
             AutoScaleDimensions = new SizeF(96f, 96f);
             AutoScaleMode = AutoScaleMode.Dpi;
             Text = AppName;
-            BackColor = Theme.Back;
-            ForeColor = Theme.Text;
             Font = new Font("Segoe UI", 9f);
             MinimumSize = new Size(900, 560);
             Size = new Size(1400, 900);
@@ -75,17 +91,16 @@ namespace RulZ.ImageTournament
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
             catch (ArgumentException) { }
 
-            _logo = Theme.LoadLogo();
-            _view = new CompareView { Dock = DockStyle.Fill, BackColor = Theme.Back, ForeColor = Theme.Text, AllowDrop = true, Logo = _logo };
+            _logo = Theme.LoadLogo(Theme.Current);
+            _view = new CompareView { Dock = DockStyle.Fill, AllowDrop = true, Logo = _logo };
             _view.ShowMessage(WelcomeText);
 
-            var bar = new FlowLayoutPanel
+            var bar = _bar = new FlowLayoutPanel
             {
                 Dock = DockStyle.Top,
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
                 WrapContents = true,
-                BackColor = Theme.Panel,
                 Padding = new Padding(6, 5, 6, 5),
                 AllowDrop = true,
             };
@@ -101,8 +116,6 @@ namespace RulZ.ImageTournament
             {
                 DropDownStyle = ComboBoxStyle.DropDownList,
                 FlatStyle = FlatStyle.Flat,
-                BackColor = Theme.Control,
-                ForeColor = Theme.Text,
                 Width = 160,
                 Anchor = AnchorStyles.Left,
                 Margin = new Padding(3, 3, 3, 3),
@@ -114,8 +127,6 @@ namespace RulZ.ImageTournament
             _txtLosers = new TextBox
             {
                 Width = 140,
-                BackColor = Theme.Control,
-                ForeColor = Theme.Text,
                 BorderStyle = BorderStyle.FixedSingle,
                 Anchor = AnchorStyles.Left,
             };
@@ -139,30 +150,31 @@ namespace RulZ.ImageTournament
             _btnUndo.Click += delegate { Undo(); };
             var btnNew = MakeButton("New Tournament", "Clear the current tournament");
             btnNew.Click += delegate { NewTournament(true); };
+            _chkLight = MakeCheck("Light mode", "Switch between the dark and light look");
+            _chkLight.Checked = Theme.IsLight;
+            _chkLight.CheckedChanged += delegate { SetLightMode(_chkLight.Checked); };
 
             if (_logo != null)
-                bar.Controls.Add(new LogoBox(_logo)
+                bar.Controls.Add(_logoBox = new LogoBox(_logo)
                 {
                     Size = new Size(20 * _logo.Width / _logo.Height, 20),
                     Anchor = AnchorStyles.Left,
                     Margin = new Padding(4, 3, 12, 3),
-                    BackColor = Theme.Panel,
                 });
             bar.Controls.AddRange(new Control[]
             {
                 btnImages, btnFolder, _chkSubfolders, _chkShuffle, MakeSeparator(),
                 MakeLabel("Loser:"), _cmbAction, _txtLosers, _btnBrowse, MakeSeparator(),
                 _tglSide, _tglSplit, btnFit, _chkKeepZoom, MakeSeparator(),
-                _btnUndo, btnNew,
+                _btnUndo, btnNew, MakeSeparator(), _chkLight,
             });
 
-            var bottom = new TableLayoutPanel
+            var bottom = _bottom = new TableLayoutPanel
             {
                 Dock = DockStyle.Bottom,
                 Height = 74,
                 ColumnCount = 3,
                 RowCount = 1,
-                BackColor = Theme.Panel,
                 Padding = new Padding(6),
                 AllowDrop = true,
             };
@@ -179,7 +191,6 @@ namespace RulZ.ImageTournament
             {
                 Dock = DockStyle.Fill,
                 TextAlign = ContentAlignment.MiddleCenter,
-                ForeColor = Theme.Text,
                 Font = new Font("Segoe UI", 10f),
                 UseMnemonic = false,
             };
@@ -203,15 +214,12 @@ namespace RulZ.ImageTournament
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
                 FlatStyle = FlatStyle.Flat,
-                BackColor = Theme.Control,
-                ForeColor = Theme.Text,
                 Padding = new Padding(3, 2, 3, 2),
                 Margin = new Padding(2, 3, 2, 3),
                 UseVisualStyleBackColor = false,
                 Anchor = AnchorStyles.Left,
             };
-            b.FlatAppearance.BorderColor = Theme.Border;
-            b.FlatAppearance.MouseOverBackColor = Theme.Hover;
+            _buttons.Add(b);
             _tips.SetToolTip(b, tip);
             return b;
         }
@@ -222,8 +230,6 @@ namespace RulZ.ImageTournament
             b.AutoSize = false;
             b.Dock = DockStyle.Fill;
             b.Font = new Font("Segoe UI", 13f, FontStyle.Bold);
-            b.FlatAppearance.BorderColor = Theme.Accent;
-            b.FlatAppearance.MouseOverBackColor = Theme.AccentHover;
             return b;
         }
 
@@ -238,34 +244,97 @@ namespace RulZ.ImageTournament
                 AutoSize = false,
                 Size = new Size(textSize.Width + 22, textSize.Height + 14),
                 FlatStyle = FlatStyle.Flat,
-                BackColor = Theme.Control,
-                ForeColor = Theme.Text,
                 Margin = new Padding(2, 3, 2, 3),
                 TextAlign = ContentAlignment.MiddleCenter,
                 Anchor = AnchorStyles.Left,
             };
-            c.FlatAppearance.BorderColor = Theme.Border;
-            c.FlatAppearance.CheckedBackColor = Theme.AccentDark;
-            c.FlatAppearance.MouseOverBackColor = Theme.Hover;
+            // The selected toggle is red, so its text uses the on-accent color.
+            c.CheckedChanged += delegate { c.ForeColor = c.Checked ? Theme.OnAccent : Theme.Text; };
+            _toggles.Add(c);
             _tips.SetToolTip(c, tip);
             return c;
         }
 
         CheckBox MakeCheck(string text, string tip)
         {
-            var c = new CheckBox { Text = text, AutoSize = true, ForeColor = Theme.Text, Anchor = AnchorStyles.Left, Margin = new Padding(4, 3, 0, 3) };
+            var c = new CheckBox { Text = text, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(4, 3, 0, 3) };
+            _checks.Add(c);
             _tips.SetToolTip(c, tip);
             return c;
         }
 
-        static Label MakeLabel(string text)
+        Label MakeLabel(string text)
         {
-            return new Label { Text = text, AutoSize = true, ForeColor = Theme.Dim, Anchor = AnchorStyles.Left, Margin = new Padding(3, 3, 0, 3) };
+            var l = new Label { Text = text, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 3, 0, 3) };
+            _labels.Add(l);
+            return l;
         }
 
-        static Label MakeSeparator()
+        Label MakeSeparator()
         {
-            return new Label { AutoSize = false, Width = 1, Height = 26, BackColor = Theme.Border, Margin = new Padding(5, 4, 5, 4) };
+            var l = new Label { AutoSize = false, Width = 1, Height = 26, Margin = new Padding(5, 4, 5, 4) };
+            _separators.Add(l);
+            return l;
+        }
+
+        // ---------- Theme ----------
+
+        // Colors every control from the current palette; called at startup and when Light mode is toggled.
+        void ApplyTheme()
+        {
+            SuspendLayout();
+            BackColor = Theme.Back;
+            ForeColor = Theme.Text;
+            _view.BackColor = Theme.Back;
+            _view.ForeColor = Theme.Text;
+            _bar.BackColor = _bottom.BackColor = Theme.Panel;
+            _lblStatus.ForeColor = Theme.Text;
+            _lblStatus.BackColor = Theme.Panel;
+
+            foreach (var b in _buttons)
+            {
+                bool big = b == _btnLeft || b == _btnRight;
+                b.ForeColor = Theme.Text;
+                b.BackColor = Theme.Control;
+                b.FlatAppearance.BorderColor = big ? Theme.Accent : Theme.Border;
+                b.FlatAppearance.MouseOverBackColor = big ? Theme.AccentFillHover : Theme.Hover;
+                b.FlatAppearance.MouseDownBackColor = big ? Theme.AccentFill : Theme.Border;
+            }
+            foreach (var c in _toggles)
+            {
+                c.BackColor = Theme.Control;
+                c.ForeColor = c.Checked ? Theme.OnAccent : Theme.Text;
+                c.FlatAppearance.BorderColor = Theme.Border;
+                c.FlatAppearance.CheckedBackColor = Theme.AccentFill;
+                c.FlatAppearance.MouseOverBackColor = Theme.Hover;
+                c.FlatAppearance.MouseDownBackColor = Theme.Border;
+            }
+            foreach (var c in _checks) { c.ForeColor = Theme.Text; c.BackColor = Theme.Panel; }
+            foreach (var l in _labels) { l.ForeColor = Theme.Dim; l.BackColor = Theme.Panel; }
+            foreach (var l in _separators) l.BackColor = Theme.Border;
+            _cmbAction.BackColor = _txtLosers.BackColor = Theme.Control;
+            _cmbAction.ForeColor = _txtLosers.ForeColor = Theme.Text;
+
+            var oldLogo = _logo;
+            _logo = Theme.LoadLogo(Theme.Current);
+            _view.Logo = _logo;
+            if (_logoBox != null) { _logoBox.BackColor = Theme.Panel; _logoBox.Image = _logo; }
+            if (oldLogo != null && oldLogo != _logo) oldLogo.Dispose();
+
+            if (IsHandleCreated) NativeMethods.UseDarkTitleBar(Handle, !Theme.IsLight);
+            UpdateStatus();
+            ResumeLayout(true);
+            Invalidate(true);
+        }
+
+        void SetLightMode(bool light)
+        {
+            if (light == Theme.IsLight) return;
+            Theme.Current = light ? Palette.Light : Palette.Dark;
+            _settings.Set("theme", light ? "light" : "dark");
+            _settings.Save();
+            ApplyTheme();
+            _view.Focus();
         }
 
         void WireDragDrop(Control root)
@@ -306,7 +375,7 @@ namespace RulZ.ImageTournament
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
-            NativeMethods.UseDarkTitleBar(Handle);
+            NativeMethods.UseDarkTitleBar(Handle, !Theme.IsLight);
         }
 
         protected override void OnLoad(EventArgs e)
@@ -345,6 +414,7 @@ namespace RulZ.ImageTournament
             _settings.Set("shuffle", _chkShuffle.Checked);
             _settings.Set("keepZoom", _chkKeepZoom.Checked);
             _settings.Set("viewMode", _view.Mode);
+            _settings.Set("theme", Theme.IsLight ? "light" : "dark");
             _settings.Save();
             SaveState();
         }
@@ -598,7 +668,8 @@ namespace RulZ.ImageTournament
             }
 
             _btnLeft.Enabled = _btnRight.Enabled = match || champion != null;
-            _btnLeft.BackColor = _btnRight.BackColor = match ? Theme.AccentDark : Theme.Control;
+            _btnLeft.BackColor = _btnRight.BackColor = match ? Theme.AccentFill : Theme.Control;
+            _btnLeft.ForeColor = _btnRight.ForeColor = match ? Theme.OnAccent : Theme.Text;
             _btnUndo.Enabled = _history.Count > 0 && _history[_history.Count - 1].Reversible;
         }
 

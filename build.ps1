@@ -20,6 +20,7 @@ if ($Test) {
     "/out:bin\RulZ Image Tournament.exe" `
     /win32icon:assets\app.ico /win32manifest:app.manifest `
     "/resource:assets\logo.png,RulZ.ImageTournament.logo.png" `
+    "/resource:assets\logo-light.png,RulZ.ImageTournament.logo-light.png" `
     /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:Microsoft.VisualBasic.dll `
     "/r:$wpf\PresentationCore.dll" "/r:$wpf\WindowsBase.dll" /r:System.Xaml.dll `
     src\*.cs
