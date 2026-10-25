@@ -1,6 +1,6 @@
 import { promises as fs, watch, type FSWatcher } from 'node:fs'
 import { basename, dirname, join, relative, sep } from 'node:path'
-import type { GgufInfo, ModelEntry, SidecarFile } from '@shared/types'
+import type { DraftKind, GgufInfo, ModelEntry, SidecarFile } from '@shared/types'
 import { readJson, writeJsonAtomic } from '../util/jsonFile'
 import { readGgufHeader, toGgufInfo } from './gguf'
 
@@ -16,11 +16,21 @@ export type FileKind = 'model' | 'mmproj' | 'draft' | 'adapter' | 'shard'
 
 const SHARD_RE = /-(\d{5})-of-(\d{5})\.gguf$/i
 
+/** Draft heads are named after their format, e.g. "mtp-<model>.gguf" or "<model>-eagle3.gguf". */
+export function draftKind(fileName: string): DraftKind | undefined {
+  const base = fileName.replace(/\.gguf$/i, '').toLowerCase()
+  for (const kind of ['mtp', 'eagle3', 'dflash', 'dspark'] as const) {
+    if (new RegExp(`(^|[-_. ])${kind}([-_. ]|$)`).test(base)) return kind
+  }
+  return undefined
+}
+
 export function classifyFile(fileName: string, info: GgufInfo | null): FileKind {
   const shard = fileName.match(SHARD_RE)
   if (shard && Number(shard[1]) !== 1) return 'shard'
   if (info?.architecture === 'clip' || info?.type === 'mmproj' || /mmproj/i.test(fileName)) return 'mmproj'
-  if (/^mtp[-_. ]/i.test(fileName)) return 'draft'
+  // A draft head is tiny next to its model; a full model with "MTP" in its name stays a model.
+  if (draftKind(fileName) && (/^(mtp|eagle3|dflash|dspark)[-_. ]/i.test(fileName) || info?.architecture?.endsWith('-assistant'))) return 'draft'
   if (info?.type === 'adapter') return 'adapter'
   return 'model'
 }
@@ -48,7 +58,10 @@ export function groupModels(root: string, files: ScannedFile[]): ModelEntry[] {
       const hit = kinds
         .filter((k) => k.kind === kind)
         .sort((a, b) => basename(a.f.path).localeCompare(basename(b.f.path)))[0]
-      return hit ? { path: hit.f.path, sizeBytes: hit.f.sizeBytes } : undefined
+      if (!hit) return undefined
+      const out: SidecarFile = { path: hit.f.path, sizeBytes: hit.f.sizeBytes }
+      if (kind === 'draft') out.kind = draftKind(basename(hit.f.path))
+      return out
     }
     const mmproj = sidecar('mmproj')
     const draft = sidecar('draft')

@@ -26,6 +26,10 @@ export interface LoadConfig {
   useMmap: boolean
   useMlock: boolean
   useMmproj: boolean
+  /** Use the model's draft sidecar (MTP etc.) for speculative decoding when one exists. */
+  useDraft: boolean
+  /** Tokens to draft per step (--spec-draft-n-max); null = llama.cpp's default. */
+  draftTokens: number | null
   seed: number | null
   chatTemplateFile: string
   parallel: number
@@ -216,9 +220,14 @@ export interface GgufInfo {
   hasChatTemplate: boolean
 }
 
+/** Speculative-decoding head formats llama.cpp can load from a sidecar file. */
+export type DraftKind = 'mtp' | 'eagle3' | 'dflash' | 'dspark'
+
 export interface SidecarFile {
   path: string
   sizeBytes: number
+  /** Set on draft sidecars; decides the --spec-type passed to llama-server. */
+  kind?: DraftKind
 }
 
 export interface ModelEntry {

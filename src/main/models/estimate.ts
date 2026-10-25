@@ -32,7 +32,7 @@ export interface FreeMemory {
 
 /** Rough memory estimate for loading `model` with `cfg`. Errs on the high side. */
 export function estimateMemory(model: ModelEntry, cfg: LoadConfig, free: FreeMemory): MemoryEstimate {
-  const projector = cfg.useMmproj && model.mmproj ? model.mmproj.sizeBytes : 0
+  const projector = (cfg.useMmproj && model.mmproj ? model.mmproj.sizeBytes : 0) + (cfg.useDraft && model.draft?.kind ? model.draft.sizeBytes : 0)
   const weightsBytes = model.sizeBytes + projector
   const ctx = cfg.contextLength
   const kvBytes = ctx ? kvCacheBytes(model, cfg, ctx) : null

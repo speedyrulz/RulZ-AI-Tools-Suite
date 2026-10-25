@@ -15,6 +15,9 @@ export const DEFAULT_LOAD_CONFIG: LoadConfig = {
   useMmap: true,
   useMlock: false,
   useMmproj: true,
+  useDraft: true,
+  // 2 beat llama.cpp's default of 3 in every matched run on a 26B-A4B MoE with its MTP head.
+  draftTokens: 2,
   seed: null,
   chatTemplateFile: '',
   parallel: 1,

@@ -1,7 +1,7 @@
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import type { GgufInfo } from '@shared/types'
-import { classifyFile, groupModels, type ScannedFile } from '../src/main/models/library'
+import { classifyFile, draftKind, groupModels, type ScannedFile } from '../src/main/models/library'
 
 const root = 'C:\\LLM'
 const info = (architecture: string, extra: Partial<GgufInfo> = {}): GgufInfo => ({
@@ -22,9 +22,14 @@ describe('classifyFile', () => {
     expect(classifyFile('Qwen-Image-2.1-PE-I2I.mmproj-bf16.gguf', info('qwen2vl'))).toBe('mmproj')
     expect(classifyFile('gemma-4-26B-A4B-it-mmproj-BF16.gguf', null)).toBe('mmproj')
   })
-  it('treats mtp-* files as draft sidecars but not models with MTP in their name', () => {
+  it('treats draft-head files as draft sidecars but not models with MTP in their name', () => {
     expect(classifyFile('mtp-gemma-4-26B-A4B-it (1).gguf', info('gemma4'))).toBe('draft')
+    expect(classifyFile('eagle3-llama.gguf', null)).toBe('draft')
+    expect(classifyFile('llama-mtp.gguf', info('llama-assistant'))).toBe('draft')
     expect(classifyFile('Qwen3.6-27B-Fable-NM-DAU-MTP.i1-Q4_K_M.gguf', info('qwen3'))).toBe('model')
+    expect(draftKind('mtp-gemma-4-26B-A4B-it (1).gguf')).toBe('mtp')
+    expect(draftKind('model-dflash.gguf')).toBe('dflash')
+    expect(draftKind('plain.gguf')).toBeUndefined()
   })
   it('marks non-first shards and adapters', () => {
     expect(classifyFile('big-00002-of-00003.gguf', null)).toBe('shard')
@@ -54,6 +59,7 @@ describe('groupModels', () => {
     const gemma = models[0]
     expect(gemma.mmproj?.path).toMatch(/gemma-mmproj-BF16\.gguf$/)
     expect(gemma.draft?.path).toMatch(/mtp-gemma \(1\)\.gguf$/)
+    expect(gemma.draft?.kind).toBe('mtp')
     const kimi = models[1]
     expect(kimi.name).toBe('kimi')
     expect(kimi.files).toHaveLength(2)

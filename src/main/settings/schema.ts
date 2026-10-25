@@ -22,6 +22,8 @@ export const loadConfigSchema = z.object({
   useMmap: z.boolean().catch(L.useMmap),
   useMlock: z.boolean().catch(L.useMlock),
   useMmproj: z.boolean().catch(L.useMmproj),
+  useDraft: z.boolean().catch(L.useDraft),
+  draftTokens: z.number().int().min(1).max(64).nullable().catch(L.draftTokens),
   seed: z.number().int().nullable().catch(L.seed),
   chatTemplateFile: z.string().catch(L.chatTemplateFile),
   parallel: z.number().int().min(1).max(64).catch(L.parallel),

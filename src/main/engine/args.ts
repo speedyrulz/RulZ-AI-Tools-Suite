@@ -38,6 +38,10 @@ export function buildServerArgs({ model, config: c, port, alias }: ServerArgsInp
   if (!c.useMmap) args.push('--no-mmap')
   if (c.useMlock) args.push('--mlock')
   if (c.useMmproj && model.mmproj) args.push('--mmproj', model.mmproj.path)
+  if (c.useDraft && model.draft?.kind) {
+    args.push('--spec-type', `draft-${model.draft.kind}`, '--spec-draft-model', model.draft.path)
+    if (c.draftTokens !== null) args.push('--spec-draft-n-max', String(c.draftTokens))
+  }
   if (c.seed !== null) args.push('--seed', String(c.seed))
   if (c.chatTemplateFile.trim()) args.push('--chat-template-file', c.chatTemplateFile.trim())
   if (c.extraArgs.trim()) args.push(...splitArgs(c.extraArgs))

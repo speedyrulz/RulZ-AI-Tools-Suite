@@ -1,7 +1,7 @@
 import * as Collapsible from '@radix-ui/react-collapsible'
 import { ChevronRight, FolderSearch } from 'lucide-react'
 import { useState } from 'react'
-import { KV_CACHE_TYPES, type KvCacheType, type LoadConfig, type ModelEntry } from '@shared/types'
+import { KV_CACHE_TYPES, type DraftKind, type KvCacheType, type LoadConfig, type ModelEntry } from '@shared/types'
 import { invoke } from '../../lib/api'
 import { formatTokens } from '../../lib/format'
 import { useApp } from '../../stores/app'
@@ -9,6 +9,7 @@ import { useModels } from '../../stores/models'
 import { Field, IconButton, Input, NumberInput, Select, Slider, Switch } from '../ui'
 
 const CTX_PRESETS = [4096, 8192, 16384, 32768, 65536, 131072, 262144]
+const DRAFT_LABELS: Record<DraftKind, string> = { mtp: 'MTP', eagle3: 'EAGLE-3', dflash: 'DFlash', dspark: 'DSpark' }
 
 export function LoadSettingsForm({
   model,
@@ -138,12 +139,27 @@ export function LoadSettingsForm({
         </Field>
       )}
 
+      {model?.draft?.kind && (
+        <Field
+          inline
+          label={`Speculative decoding (${DRAFT_LABELS[model.draft.kind]} draft head)`}
+          hint={`${model.draft.path.split(/[\\/]/).pop()} · drafts several tokens per step; output is unchanged`}
+        >
+          <Switch checked={config.useDraft} onCheckedChange={(v) => set('useDraft', v)} />
+        </Field>
+      )}
+
       <Collapsible.Root open={advanced} onOpenChange={setAdvanced}>
         <Collapsible.Trigger className="flex items-center gap-1 text-xs font-medium text-muted hover:text-text">
           <ChevronRight size={14} className={advanced ? 'rotate-90 transition-transform' : 'transition-transform'} />
           Advanced
         </Collapsible.Trigger>
         <Collapsible.Content className="mt-3 space-y-1">
+          {model?.draft?.kind && config.useDraft && (
+            <Field inline label="Draft tokens per step" hint="2 is a good default; empty = llama.cpp's own (3)">
+              <NumberInput value={config.draftTokens} placeholder="3" min={1} max={64} onChange={(v) => set('draftTokens', v === null ? null : Math.max(1, Math.min(64, Math.round(v))))} />
+            </Field>
+          )}
           <Field inline label="CPU threads" hint="Empty = automatic">
             <NumberInput value={config.threads} placeholder="Auto" min={1} onChange={(v) => set('threads', v)} />
           </Field>

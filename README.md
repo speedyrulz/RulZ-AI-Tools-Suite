@@ -14,6 +14,8 @@ llama.cpp build (`llama-server.exe`), one process per loaded model, bound to `12
   across GPUs, flash attention, KV cache quantization, threads, batch sizes, mmap/mlock, chat template override and
   extra arguments; per-model saved defaults; memory estimate with a fits/partial/likely-OOM verdict; load progress;
   live server log; several models loaded at once.
+  - **Speculative decoding**: a draft-head sidecar next to the model (`mtp-*.gguf`, or eagle3/dflash/dspark) is
+    detected and used automatically (`--spec-type draft-<kind>`), with a per-model switch and draft length.
 - **Chat** — streaming replies, collapsible reasoning ("thinking") blocks, Markdown with tables, LaTeX and
   highlighted code, image and text-file attachments (drag-drop / paste), edit, regenerate, continue, branch,
   delete; tok/s, time-to-first-token and token stats; context usage meter with "truncate middle" or "stop" overflow

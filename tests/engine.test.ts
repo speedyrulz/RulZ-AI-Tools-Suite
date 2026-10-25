@@ -68,6 +68,20 @@ describe('describeExitCode', () => {
   })
 })
 
+describe('draft head arguments', () => {
+  const withDraft: ModelEntry = { ...model, draft: { path: 'C:\\LLM\\Qwen\\mtp-q.gguf', sizeBytes: 2e8, kind: 'mtp' } }
+  it('passes the sidecar as an MTP draft when enabled', () => {
+    const args = buildServerArgs({ model: withDraft, config: { ...DEFAULT_LOAD_CONFIG, draftTokens: 4 }, port: 1, alias: 'q' }).join(' ')
+    expect(args).toContain('--spec-type draft-mtp --spec-draft-model C:\\LLM\\Qwen\\mtp-q.gguf')
+    expect(args).toContain('--spec-draft-n-max 4')
+  })
+  it('skips it when disabled or when the sidecar kind is unknown', () => {
+    expect(buildServerArgs({ model: withDraft, config: { ...DEFAULT_LOAD_CONFIG, useDraft: false }, port: 1, alias: 'q' }).join(' ')).not.toContain('--spec-type')
+    const unknown = { ...withDraft, draft: { path: 'x', sizeBytes: 1 } }
+    expect(buildServerArgs({ model: unknown, config: DEFAULT_LOAD_CONFIG, port: 1, alias: 'q' }).join(' ')).not.toContain('--spec-type')
+  })
+})
+
 describe('splitArgs', () => {
   it('honours quotes', () => {
     expect(splitArgs('-a "b c" d')).toEqual(['-a', 'b c', 'd'])
