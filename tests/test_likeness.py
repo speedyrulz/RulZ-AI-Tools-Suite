@@ -151,3 +151,28 @@ def test_caption_dropout_keeps_the_trigger_word(tmp_path):
                            model_arch="fibo2")
     assert '"short_description":""' in D.dropout_prompt(fibo_off)
     assert D.dropout_text_path(cfg) != D.dropout_text_path(fibo_off)
+
+
+def test_sample_scores_carry_normalized_values_and_captions_show_them(tmp_path):
+    """Preview samples are scored on the probes' normalized scale too (score_samples(scale=controller)), and the
+    caption shows the normalized number with the raw one behind it; without a scale, raw only."""
+    from types import SimpleNamespace
+
+    from rulztrainer import facesim
+
+    c = L.LikenessController(_cfg(likeness_normalize=True, face_weight=0.5, body_weight=0.5), face_ceiling=70.0,
+                             body_ceiling=60.0)
+    c.update(0, 15.0, 8.0)  # the floors
+    face = SimpleNamespace(score=lambda p, step, i: facesim.FaceScore(step, str(p), i, 1, 0.425, 42.5, "ref"))
+    body = SimpleNamespace(score=lambda p: (34.0, 3))
+    (tmp_path / "s.png").write_bytes(b"")
+    scores = facesim.score_samples(face, [str(tmp_path / "s.png")], 10, tmp_path, body, 0.5, 0.5, scale=c)
+    s = scores[0]
+    assert s.percent == 42.5 and s.body_percent == 34.0 and abs(s.combined_percent - 38.25) < 1e-9
+    assert abs(s.face_norm - 50.0) < 1e-9 and abs(s.body_norm - 50.0) < 1e-9 and abs(s.combined_norm - 50.0) < 1e-9
+    import webui
+
+    assert webui.score_caption(facesim.asdict(s)) == "  |  face 50% (raw 42), body 50% (raw 34), combined 50% (raw 38)"
+    raw = facesim.score_samples(face, [str(tmp_path / "s.png")], 10, tmp_path, body, 0.5, 0.5)[0]
+    assert raw.face_norm is None and webui.score_caption(facesim.asdict(raw)) == "  |  face 42%, body 34%, combined 38%"
+    assert len(facesim.read_scores(tmp_path)) == 2

@@ -535,12 +535,19 @@ def body_preview(paths: list[str], backend: str = "mediapipe", sam3_model: str =
 
 
 def score_caption(sc: dict) -> str:
-    parts = []
-    parts.append(f"face {sc['percent']:.0f}%" if sc.get("percent") is not None else "no face")
-    if sc.get("body_percent") is not None:
-        parts.append(f"body {sc['body_percent']:.0f}%")
-    if sc.get("combined_percent") is not None:
-        parts.append(f"combined {sc['combined_percent']:.0f}%")
+    """"face 47% (raw 40), body 17% (raw 73), combined 38%": the normalized scores with the raw ones behind them;
+    raw only for scores recorded without a scale."""
+    def one(label, norm_key, raw_key):
+        norm, raw = sc.get(norm_key), sc.get(raw_key)
+        if norm is not None:
+            return f"{label} {norm:.0f}%" + (f" (raw {raw:.0f})" if raw is not None else "")
+        return f"{label} {raw:.0f}%" if raw is not None else None
+
+    parts = [one("face", "face_norm", "percent") or "no face"]
+    for label, nk, rk in (("body", "body_norm", "body_percent"), ("combined", "combined_norm", "combined_percent")):
+        p = one(label, nk, rk)
+        if p:
+            parts.append(p)
     return "  |  " + ", ".join(parts)
 
 
@@ -3342,15 +3349,16 @@ def build_page(local: bool = True):
                 with section("Likeness probes & controller", "Smoothed probe scores and controller state",
                              "insights") as probe_exp:
                     probe_label = hint("")
+                    # the normalized scores (0 = a stranger, 100 = the references): smoothed lines, per-probe dots
                     probe_chart = ui.echart(chart_options(
-                        _axis("step", min="dataMin"), _axis("likeness %", min=0, max=100),
+                        _axis("step", min="dataMin"), _axis("likeness % (normalized)", min=0, max=120),
                         [_line("face", "#FF3B30"), _line("body", "#F4F4F5"),
                          _line("combined", "#F59E0B", lineStyle={"width": 3}),
-                         {"name": "face (raw)", "type": "scatter", "symbolSize": 5, "data": [],
+                         {"name": "face (probe)", "type": "scatter", "symbolSize": 5, "data": [],
                           "itemStyle": {"color": "#FB7185"}},
-                         {"name": "body (raw)", "type": "scatter", "symbolSize": 5, "data": [],
+                         {"name": "body (probe)", "type": "scatter", "symbolSize": 5, "data": [],
                           "itemStyle": {"color": "#A1A1AA"}}],
-                        ["face", "body", "combined", "face (raw)", "body (raw)"])).classes("w-full h-60")
+                        ["face", "body", "combined", "face (probe)", "body (probe)"])).classes("w-full h-60")
                     probe_row = ui.row().classes("w-full gap-2")
                 probe_exp.visible = False
                 shown_probes: list[str] = []
@@ -3472,14 +3480,18 @@ def build_page(local: bool = True):
                     face_exp.visible = True
                     by_prompt: dict[int, list] = {}
                     per_step: dict[int, dict[str, list]] = {}
+                    normalized = any(sc.get("combined_norm") is not None for sc in fscores)  # else raw (older runs)
+                    nz = lambda sc, nk, rk: sc.get(nk) if normalized else sc.get(rk)  # noqa: E731
+
                     for sc in fscores:
-                        if sc.get("combined_percent") is not None:
-                            by_prompt.setdefault(sc["prompt_index"], []).append([sc["step"], round(sc["combined_percent"], 1)])
+                        comb = nz(sc, "combined_norm", "combined_percent")
+                        if comb is not None:
+                            by_prompt.setdefault(sc["prompt_index"], []).append([sc["step"], round(comb, 1)])
                         d_ = per_step.setdefault(sc["step"], {"face": [], "body": []})
-                        if sc.get("percent") is not None:
-                            d_["face"].append(sc["percent"])
-                        if sc.get("body_percent") is not None:
-                            d_["body"].append(sc["body_percent"])
+                        if nz(sc, "face_norm", "percent") is not None:
+                            d_["face"].append(nz(sc, "face_norm", "percent"))
+                        if nz(sc, "body_norm", "body_percent") is not None:
+                            d_["body"].append(nz(sc, "body_norm", "body_percent"))
                     series = [{"name": f"combined p{k + 1}", "type": "line", "data": v}
                               for k, v in sorted(by_prompt.items())]
                     for key, name in (("face", "mean face"), ("body", "mean body")):
@@ -3487,25 +3499,29 @@ def build_page(local: bool = True):
                         if pts:
                             series.append({"name": name, "type": "line", "data": pts, "lineStyle": {"type": "dotted"}})
                     ref_sim = st.get("face_ref_similarity")
-                    if ref_sim is not None and series:
+                    if series and (normalized or ref_sim is not None):
                         xs = [pt[0] for v in by_prompt.values() for pt in v] or [0, 1]
-                        series.append({"name": "face reference self-similarity", "type": "line", "showSymbol": False,
-                                       "lineStyle": {"type": "dashed"},
-                                       "data": [[min(xs), ref_sim * 100], [max(xs), ref_sim * 100]]})
+                        level = 100.0 if normalized else ref_sim * 100  # normalized: the references are 100 as such
+                        series.append({"name": "the references" if normalized else "face reference self-similarity",
+                                       "type": "line", "showSymbol": False, "lineStyle": {"type": "dashed"},
+                                       "data": [[min(xs), level], [max(xs), level]]})
                     face_chart.options["legend"]["data"] = [sr["name"] for sr in series]
                     face_chart.options["series"] = series
                     face_chart.update()
                     latest_step = max(sc["step"] for sc in fscores)
                     latest = [sc for sc in fscores if sc["step"] == latest_step]
-                    fv = [sc["percent"] for sc in latest if sc.get("percent") is not None]
-                    bv = [sc["body_percent"] for sc in latest if sc.get("body_percent") is not None]
-                    cv = [sc["combined_percent"] for sc in latest if sc.get("combined_percent") is not None]
-                    parts = [f"Step {latest_step}:"]
+                    fv = [nz(sc, "face_norm", "percent") for sc in latest if nz(sc, "face_norm", "percent") is not None]
+                    bv = [nz(sc, "body_norm", "body_percent") for sc in latest
+                          if nz(sc, "body_norm", "body_percent") is not None]
+                    cv = [nz(sc, "combined_norm", "combined_percent") for sc in latest
+                          if nz(sc, "combined_norm", "combined_percent") is not None]
+                    parts = [f"Step {latest_step}" + (" (normalized: 0 = a stranger, 100 = the references):"
+                                                      if normalized else ":")]
                     parts.append(f"face {sum(fv) / len(fv):.1f}% ({len(fv)}/{len(latest)} with a face)" if fv
                                  else f"face: none in {len(latest)} sample(s)")
                     if st.get("body_refs"):
-                        parts.append(f"body {sum(bv) / len(bv):.1f}% ({len(bv)}/{len(latest)} with a pose)" if bv
-                                     else "body: no usable pose")
+                        parts.append(f"body {sum(bv) / len(bv):.1f}% ({len(bv)}/{len(latest)} with a person)" if bv
+                                     else "body: no usable person")
                     if cv:
                         parts.append(f"combined {sum(cv) / len(cv):.1f}%")
                     if ref_sim is not None:
@@ -3556,13 +3572,20 @@ def build_page(local: bool = True):
                 probes = st.get("probes") or []
                 if probes:
                     probe_exp.visible = True
-                    def pts(key):
-                        return [[pr["step"], round(pr[key], 1)] for pr in probes if pr.get(key) is not None]
-                    probe_chart.options["series"][0]["data"] = pts("face_ema")
-                    probe_chart.options["series"][1]["data"] = pts("body_ema")
+                    def pts(key, fallback=None):  # normalized where the record has it, raw for older runs
+                        out = []
+                        for pr in probes:
+                            v = pr.get(key)
+                            if v is None and fallback:
+                                v = pr.get(fallback)
+                            if v is not None:
+                                out.append([pr["step"], round(v, 1)])
+                        return out
+                    probe_chart.options["series"][0]["data"] = pts("face_norm_ema", "face_ema")
+                    probe_chart.options["series"][1]["data"] = pts("body_norm_ema", "body_ema")
                     probe_chart.options["series"][2]["data"] = pts("combined_ema")
-                    probe_chart.options["series"][3]["data"] = pts("face")
-                    probe_chart.options["series"][4]["data"] = pts("body")
+                    probe_chart.options["series"][3]["data"] = pts("face_norm", "face")
+                    probe_chart.options["series"][4]["data"] = pts("body_norm", "body")
                     probe_chart.update()
                     lk = st.get("likeness") or {}
                     last = probes[-1]

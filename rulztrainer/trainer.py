@@ -1833,6 +1833,19 @@ class Trainer:
                  cfg.likeness_track_best, cfg.likeness_patience, cfg.likeness_lr_control, cfg.likeness_curriculum)
         return ctrl
 
+    def _likeness_scale(self):
+        """The scale the samples' scores are normalized on: the probe controller's (its floors from the step-0
+        probe), else one with the references' ceilings and default floors; None with likeness_normalize off."""
+        if not self.cfg.likeness_normalize:
+            return None
+        if self.controller is not None:
+            return self.controller
+        if getattr(self, "_fallback_scale", None) is None:
+            from .likeness import LikenessController
+
+            self._fallback_scale = LikenessController(self.cfg, **self._controller_ceilings())
+        return self._fallback_scale
+
     def _controller_ceilings(self) -> dict:
         """The references' own self-similarity per scorer (raw percent), the 100 of the normalized scale."""
         out = {}
@@ -1998,7 +2011,7 @@ class Trainer:
                 from dataclasses import asdict
 
                 scores = score_samples(self.face_scorer, paths, step, self.job_dir, self.body_scorer,
-                                       cfg.face_weight, cfg.body_weight)
+                                       cfg.face_weight, cfg.body_weight, scale=self._likeness_scale())
                 self.status.data["face_scores"] = self.status.data.get("face_scores", []) + [asdict(s) for s in scores]
             except Exception as e:  # noqa: BLE001
                 log.warning("Similarity scoring failed: %s", e)

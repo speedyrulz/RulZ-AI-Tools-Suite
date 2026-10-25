@@ -55,9 +55,13 @@ class FaceScore:
     cosine: float | None  # best cosine similarity to any reference face (None = no face)
     percent: float | None  # face similarity percent (None = no face)
     best_ref: str | None
-    body_percent: float | None = None  # body-proportion similarity (None = no usable pose)
-    body_ratios: int = 0  # number of proportion ratios compared
-    combined_percent: float | None = None  # weighted face/body score
+    body_percent: float | None = None  # body similarity (None = no usable person / pose)
+    body_ratios: int = 0  # references or proportion ratios compared
+    combined_percent: float | None = None  # weighted face/body score (raw)
+    # on the likeness scale (0 = a stranger, 100 = the references), when a scale was given
+    face_norm: float | None = None
+    body_norm: float | None = None
+    combined_norm: float | None = None
 
 
 def combine(face, body, face_weight: float, body_weight: float):
@@ -223,7 +227,9 @@ def read_scores(job_dir: Path) -> list[dict]:
 
 
 def score_samples(scorer, paths: list[str], step: int, job_dir: Path, body_scorer=None,
-                  face_weight: float = 0.7, body_weight: float = 0.3) -> list[FaceScore]:
+                  face_weight: float = 0.7, body_weight: float = 0.3, scale=None) -> list[FaceScore]:
+    """scale: the likeness controller (or anything with .normalize and .norm(kind, value)): the samples' scores on
+    the normalized likeness scale as well, so previews read like the probes."""
     t0 = time.time()
     scores = []
     for i, p in enumerate(paths):
@@ -231,6 +237,9 @@ def score_samples(scorer, paths: list[str], step: int, job_dir: Path, body_score
         if body_scorer is not None:
             s.body_percent, s.body_ratios = body_scorer.score(p)
         s.combined_percent = combine(s.percent, s.body_percent, face_weight, body_weight)
+        if scale is not None and getattr(scale, "normalize", False):
+            s.face_norm, s.body_norm = scale.norm("face", s.percent), scale.norm("body", s.body_percent)
+            s.combined_norm = combine(s.face_norm, s.body_norm, face_weight, body_weight)
         scores.append(s)
     append_scores(job_dir, scores)
     for s in scores:
