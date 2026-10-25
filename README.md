@@ -648,6 +648,10 @@ and only changes beyond `likeness_noise_band` count. The controller then, each i
 The scores never enter the loss; they steer data, lr and stopping. Use the same reference set and prompts for a
 whole run so the series is comparable.
 
+The face detector rescales every image to `face_det_size` and misses a face that fills the frame (a tight headshot
+probe: its box spanned 87% of the image), so when it finds nothing the image is retried at the centre of a canvas
+2x and 4x its size, where the same face is found with confidence 0.9.
+
 **Body score** (`body_score`). `appearance` (the default): a DINOv2-base embedding of the person crop (MediaPipe's
 pose box, padded 20%), scored like the face as the best cosine match against the reference crops, in percent. On a
 15-photo dataset against 11 base-model probes the worst same-person match (leave-one-out) was 0.49 and the best

@@ -109,10 +109,36 @@ class FaceScorer:
                 scale = full / max(im.size)
             return np.asarray(im)[:, :, ::-1].copy(), scale
 
+    FALLBACK_PADS = (2, 4)  # the image on a canvas this many times its size, when a face fills the frame
+
+    def _detect(self, arr: np.ndarray):
+        """Faces in a BGR array, with the boxes in its pixels. The detector rescales every input to det_size and its
+        anchors stop at a face size relative to that frame, so a face that fills the frame (a tight headshot probe)
+        is missed whatever the image size: when nothing is found, the image is placed at the centre of a canvas 2x
+        and then 4x its size (the same face at half / a quarter of the frame, found with confidence 0.9) and the
+        boxes are shifted back."""
+        found = self.app.get(arr)
+        if found:
+            return found
+        h, w = arr.shape[:2]
+        for k in self.FALLBACK_PADS:
+            canvas = np.full((h * k, w * k, 3), 114, dtype=arr.dtype)  # the detector's own neutral gray
+            oy, ox = (h * k - h) // 2, (w * k - w) // 2
+            canvas[oy:oy + h, ox:ox + w] = arr
+            found = self.app.get(canvas)
+            if found:
+                shift = np.array([ox, oy, ox, oy], dtype=np.float32)
+                for f in found:
+                    f.bbox = f.bbox - shift
+                    if getattr(f, "kps", None) is not None:
+                        f.kps = f.kps - shift[:2]
+                return found
+        return []
+
     def faces(self, path: str | Path):
         """All faces in an image, largest first, with .bbox / .kps in *source* pixels, .normed_embedding, .det_score."""
         arr, scale = self._load_bgr(path)
-        found = self.app.get(arr)
+        found = self._detect(arr)
         if scale != 1.0:
             for f in found:
                 f.bbox = f.bbox * scale
