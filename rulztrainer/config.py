@@ -111,6 +111,9 @@ class DatasetSpec:
     path: str
     resolutions: tuple = ()
     repeats: int = 1
+    trigger: str = ""  # this dataset's trigger word (empty: the run's trigger_word)
+    subject_class: str = ""  # LoRA Isolation: what the subject is ("man", "a woman"); empty: read from the captions
+    subject_kind: str = "auto"  # LoRA Isolation: auto | person | thing | style
 
 
 def apply_preset(data: dict, name: str) -> dict:
@@ -201,6 +204,15 @@ class TrainConfig:
     lora_blocks: str = ""  # DiT blocks to train, e.g. "0-41" (all), "21-41", "10-31,40", "even"; empty = all
     train_text_embedder: bool = False  # also LoRA the 2-block text projection inside the DiT
     resume_from: str = ""  # path to a previously exported LoRA .safetensors (weights only)
+    # --- LoRA Isolation (isolation.py): keep the subject(s) off everyone else in a picture ---
+    isolation: bool = False  # DOP + fused triggers + side-by-side pairs with strangers + balanced subjects
+    isolation_class: str = ""  # what a single dataset_dir subject is (datasets: each entry's "class"); empty: captions
+    isolation_kind: str = "auto"  # likewise its kind (datasets: each entry's "kind"): auto | person | thing | style
+    dop_weight: float = 2.0  # DOP: weight of the trigger-free pass, held to the model without the LoRA
+    dop_every: int = 2  # DOP: a trigger-free pass every N steps (Fizgig: every 2nd at weight 2)
+    isolation_pairs: int = 16  # side-by-side pictures per person subject (a training photo next to a stranger)
+    isolation_pair_weight: float = 2.0  # their loss weight
+    isolation_balance: bool = True  # repeat smaller subject datasets so each trains about as often as the largest
     # --- full fine-tune (finetune.py): the model's own Linears by rotation, saved as extracted LoRAs ---
     finetune: bool = False  # fine-tune the targets' weights themselves instead of a LoRA (lora_rank etc. unused)
     finetune_rotate_epochs: float = 1.0  # epochs each window trains before the next (a cycle trains every window)
@@ -364,7 +376,8 @@ class TrainConfig:
             reps = d.get("repeats", 1)
             out.append(DatasetSpec(str(d.get("path") or "").strip(),
                                    tuple(float(x) for x in (d.get("resolutions") or [])),
-                                   1 if reps is None else int(reps)))
+                                   1 if reps is None else int(reps), str(d.get("trigger") or "").strip(),
+                                   str(d.get("class") or "").strip(), str(d.get("kind") or "auto").strip() or "auto"))
         return out
 
     def run_sides(self) -> list[int]:
@@ -405,6 +418,18 @@ class TrainConfig:
         parse_clean_share(self.clean_share)
         if self.finetune:
             self.validate_finetune()
+        if self.isolation:
+            if self.finetune:
+                raise ValueError("isolation and finetune cannot be combined (DOP holds the LoRA to the model without "
+                                 "it; a fine-tune has no LoRA to switch off)")
+            if self.race and self.race_parallel:
+                raise ValueError("isolation does not run in a race_parallel race: turn race_parallel off")
+            if self.dop_every < 1 or self.dop_weight < 0 or self.isolation_pairs < 0:
+                raise ValueError("isolation: dop_every must be 1 or more, dop_weight and isolation_pairs 0 or more")
+            for spec in self.dataset_specs():
+                kind = spec.subject_kind if self.datasets else self.isolation_kind
+                if (kind or "auto") not in ("auto", "person", "thing", "style"):
+                    raise ValueError(f"{spec.path}: subject kind must be auto, person, thing or style")
         if self.id_loss_backend not in ("arcface", "facenet"):
             raise ValueError(f"id_loss_backend must be arcface or facenet, got {self.id_loss_backend!r}")
         if self.id_loss_every < 1:

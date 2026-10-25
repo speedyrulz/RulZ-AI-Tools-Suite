@@ -838,6 +838,49 @@ data"; ~20% slower steps; files ~1/64 of the weights, about 400 MB on a 12B mode
 - EMA, the configuration race (one row `network_type=lokr, lokr_factor=8` against a LoRA row trains both on the same
   layers and lets the probes pick), the sampling model and data parallel all handle it.
 
+## LoRA Isolation (`isolation`)
+
+A character LoRA spreads its subject onto other people: strangers in the background, a friend beside them, a crowd.
+`isolation: true` keeps the subject to its trigger, after Fizgig's LoRA Isolation. Fizgig measured it on Krea 2, two
+people in one LoRA, 50 split pictures of a carefully described stranger next to the subject, each face scored with
+ArcFace:
+
+| | Normal LoRA | LoRA Isolation |
+|---|---|---|
+| Strangers that read as the subject | 48 of 50 | 0 of 50 |
+| How much the subject looks like themselves | 0.77 | 0.78 |
+
+Unmeasured here. Its parts:
+
+1. **DOP** (Differential Output Preservation, from Ostris's AI-Toolkit). Every `dop_every` steps (2), each picture whose
+   caption names a subject also trains on a freshly noised copy, with the subject swapped for its class phrase,
+   held to what the model predicts there with the LoRA at 0, at `dop_weight` (2). Without the trigger the LoRA
+   learns to change nothing. The log shows the DOP loss.
+2. **Several subjects**, one per dataset, each with its own trigger (the Dataset rows' *Trigger*, or `trigger:` on a
+   `datasets` entry). Two faces learned side by side teach the LoRA that a face belongs to one trigger, not to the
+   class, so a second person helps; Fizgig recommends one even for a LoRA of one person. `isolation_balance` repeats
+   smaller subject datasets so each trains about as often as the largest.
+3. **The fused trigger.** `gwelt, a man` trains as `gweltman` (the caption files are never changed). The plain " man"
+   token is shared by every other man; joined to the trigger it becomes a different token, so the subject's look
+   does not attach to it. **Prompt with the joined word** (`gweltman at a cafe`); the sample and probe prompts are
+   rewritten for you, and the log names the word. The class comes from the dataset's *Is a* (`class:`), else from the
+   captions' "<trigger>, a [young] man". When the tokenizer splits the joined word so the class word is no longer
+   a whole token (`zk | re | ab | oy`), the log warns: a trigger ending in a consonant cluster joins better.
+4. **Side-by-side pairs.** Each person gets `isolation_pairs` (16) 1024 x 512 pictures: one of their photos, cropped
+   around the face, next to one of 32 generated strangers (8 ethnicities, men and women, 20s to 50s;
+   ShootTheSound/fizgig-multi-person-strangers, CC BY 4.0, pinned, downloaded once into `models/`), side at random,
+   captioned stranger first: `an Indian man in his 30s on the left, and gweltman on the right, two people side by
+   side, two close-up portraits`. The text encoders are causal, so words before the trigger stay clean of it. They
+   train at `isolation_pair_weight` (2) times the loss and are never flipped (left and right are in the caption).
+5. **What a subject is** (*Kind*, `kind:`). A person gets the fused trigger and the pairs. An animal or thing
+   (`rexodog`) gets the fused trigger only. A style keeps its trigger as written and drops it from the trigger-free
+   caption, so the look appears only when called.
+
+A single `dataset_dir` uses `trigger_word`, `isolation_class` and `isolation_kind`. A dataset without any trigger
+trains as it is, not as a subject. In a short Krea 2 test on a 16 GB card a step with a DOP pass took about twice as
+long as one without (an extra forward without gradients and one with); Fizgig reports about 1.5x over a run. Not with
+a fine-tune or a `race_parallel` race.
+
 ## Full fine-tune, then extract a LoRA (`finetune`)
 
 A LoRA confines every update to a few directions, so concepts compete for them and pull pose, framing and lighting

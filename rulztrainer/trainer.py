@@ -335,6 +335,8 @@ class Trainer(RaceParallelMixin):
         self.race_id_loss = None  # the identity loss shared by the configurations that use it
         self.race_parallel = False  # race_parallel: one configuration per GPU at the same time (race_parallel.py)
         self.look_outliers: set[str] = set()  # look_warmup: the look filter's outlier images (_look_outlier_images)
+        self.isolation = None  # LoRA Isolation's subjects (isolation.py) when it is on
+        self.dop_values: list[float] = []  # DOP losses since the last log line
         self.ft = None  # finetune.FineTuner while a full fine-tune runs
         self.ft_rotate_steps = 1
         self.ft_pending_save = False
@@ -380,7 +382,8 @@ class Trainer(RaceParallelMixin):
     # ------------------------------------------------------------ stages
     def _needs_face_analysis(self) -> bool:
         cfg = self.cfg
-        return bool(cfg.wants_regions() or (cfg.crop_augment or "none") != "none" or cfg.likeness_curriculum)
+        return bool(cfg.wants_regions() or (cfg.crop_augment or "none") != "none" or cfg.likeness_curriculum
+                    or (cfg.isolation and cfg.isolation_pairs > 0))  # pairs crop the subject around the face
 
     def _ensure_face_detector(self):
         """A FaceScorer used as a detector (no references needed); shared with the likeness scorer."""
@@ -511,7 +514,8 @@ class Trainer(RaceParallelMixin):
         need_latents = cfg.recache or any(
             not it.latent_path.exists() or (it.latent_flip_path and not it.latent_flip_path.exists()) for it in items)
         need_text = cfg.recache or not dropout_text_path(cfg).exists() or any(
-            not it.text_path.exists() for it in items) or any(
+            not it.text_path.exists() or (it.dop_text_path is not None and not it.dop_text_path.exists())
+            for it in items) or any(
             not text_cache_path(cfg, p).exists() for p in prompts)
         devices = self.side_devices()
         if need_latents:
@@ -537,6 +541,12 @@ class Trainer(RaceParallelMixin):
             self.status.update(stage="caching text embeddings")
             t0 = time.time()
             encoders = self._extra_text_encoders(te, tok, items, prompts, devices, t_load)
+            for subject in self.isolation or []:  # LoRA Isolation: does the fused word keep the class token whole?
+                from .isolation import fusion_warning
+
+                warn = fusion_warning(tok, subject)
+                if warn:
+                    log.warning("LoRA Isolation: %s", warn)
             cache_text(items, cfg, te, tok, extra_prompts=prompts,
                        progress=lambda i, n: self.status.update(step=i, total=n),
                        encoders=encoders if len(encoders) > 1 else None, encode_fn=self.arch.encode_prompt)
@@ -645,6 +655,8 @@ class Trainer(RaceParallelMixin):
                  ", ".join(spec.path for spec in cfg.dataset_specs()))
         items = self.analyze_dataset(items)
         self.look_outliers = self._look_outlier_images(cfg, items)
+        if cfg.isolation:
+            items = self._isolation_prepare(cfg, items)
         self.prepare_cache(items)
 
         self.status.update(stage="loading transformer", step=0, total=cfg.steps)
@@ -857,7 +869,7 @@ class Trainer(RaceParallelMixin):
         def work(job):
             """Forward + backward for one model copy on its device. Returns (loss value, per-image multipliers,
             (identity loss value, samples, seconds) or None)."""
-            (rmodel, rinj, rdev), batch, latents, embeds, mask, sigma, noise, regions, cur_step, n_total = job
+            (rmodel, rinj, rdev), batch, latents, embeds, mask, sigma, noise, regions, cur_step, n_total, dop = job
             latents = latents.to(rdev, torch.float32)
             embeds, mask, sigma, noise = embeds.to(rdev), mask.to(rdev), sigma.to(rdev), noise.to(rdev)
             s = sigma.view(-1, 1, 1, 1)
@@ -892,7 +904,11 @@ class Trainer(RaceParallelMixin):
                     mults.append(self.loss_watch.multiplier(it.key))
                 if cfg.per_image_lr and not true_per_image_lr:
                     weights = weights * torch.tensor(mults, device=weights.device, dtype=weights.dtype)
+            if any(it.loss_scale != 1.0 for it in batch):  # LoRA Isolation's side-by-side pairs
+                weights = weights * torch.tensor([it.loss_scale for it in batch], device=weights.device,
+                                                 dtype=weights.dtype)
             loss = (per * weights).mean() / n_total  # the step's update is the mean over all of its batches
+            result = None
             if self.id_loss is not None and regions is not None and rmodel is model:  # primary replica only
                 t_id = time.time()
                 id_val, n_id = self.id_loss(noisy, pred, sigma, regions.meta, self.id_ref)
@@ -900,9 +916,14 @@ class Trainer(RaceParallelMixin):
                     (loss + id_w * id_val / n_total).backward()
                     if str(rdev).startswith("cuda"):
                         torch.cuda.synchronize(rdev)
-                    return loss.item(), mults, (id_val.item(), n_id, time.time() - t_id)
-            loss.backward()
-            return loss.item(), mults, None
+                    result = (loss.item(), mults, (id_val.item(), n_id, time.time() - t_id))
+            if result is None:
+                loss.backward()
+                result = (loss.item(), mults, None)
+            if dop is not None:  # LoRA Isolation: the trigger-free pass, after this batch's backward freed its graph
+                del pred, sq, per, noisy, noisy_in
+                self._dop_pass(rmodel, rinj, rdev, latents, len(batch), dop, n_total, cfg)
+            return result
 
         def work_list(entry):
             """One model copy's batches of a step, one after another: [(work result, seconds, image tokens)]."""
@@ -949,8 +970,9 @@ class Trainer(RaceParallelMixin):
                         cfg, step, tok, self.batcher, cfg.batch_size * cfg.gradient_accumulation * n_dev)
                     sigma = sample_sigmas(cfg, latents.shape[0], gen, shift, tokens=tok, arch=self.arch)
                     noise = torch.randn(latents.shape, generator=gen)
+                    dop = self._dop_job(cfg, batch, latents, step + 1, gen, shift, tok)  # LoRA Isolation
                     per_rep[r].append((self.replicas[r], batch, latents, embeds, mask, sigma, noise, regions, step + 1,
-                                       n_total))
+                                       n_total, dop))
                 entries = list(enumerate(per_rep))
                 if self.dp is not None:
                     # torch.compile + threads: a replica tracing a graph breaks the other replica's forward, so steps
@@ -1053,6 +1075,9 @@ class Trainer(RaceParallelMixin):
                     if torch.cuda.is_available() and str(self.devices[0]).startswith("cuda"):
                         id_s += f", peak {torch.cuda.max_memory_allocated(self.devices[0]) / 1e9:.2f} GB"
                     id_s += ")"
+                if self.dop_values:  # LoRA Isolation: the trigger-free passes since the last line
+                    id_s += f" | dop {sum(self.dop_values) / len(self.dop_values):.4f}"
+                    self.dop_values.clear()
                 last = step_times[-5:]
                 who = f"[{self.race.active.name}] " if self._race_running() else ""
                 log.info("%sstep %d/%d loss %.4f avg %.4f lr %.2e %.1fs/it (last %d steps %.2fs each)%s", who, step,
@@ -2014,6 +2039,119 @@ class Trainer(RaceParallelMixin):
             log.info("Resolution step-up: now training at %s from step %d (%d items)", self._stage_label(), step,
                      len(items))
         self.status.update(resolution=self._stage_label(), res_stage=self.res_stage, res_stages=len(self.sides))
+
+    # ------------------------------------------------------------ LoRA Isolation (see isolation.py)
+    def _isolation_prepare(self, cfg, items):
+        """Fused triggers, trigger-free DOP captions, balanced subjects and the side-by-side pairs; the sample and
+        probe prompts read with the fused triggers too."""
+        from . import isolation as iso
+        from .dataset import Item, _hash, bucket_size
+
+        specs = cfg.dataset_specs()
+        subjects, by_ds = [], {}
+        for spec in specs:
+            root = str(Path(spec.path))
+            trigger = spec.trigger or cfg.trigger_word
+            if not trigger:
+                log.info("LoRA Isolation: %s has no trigger word: it trains as it is, not as a subject", spec.path)
+                continue
+            caps = [it.caption for it in items if it.dataset == root and it.category == "image"]
+            cls = spec.subject_class if cfg.datasets else cfg.isolation_class
+            kind = spec.subject_kind if cfg.datasets else cfg.isolation_kind
+            s = iso.resolve_subject(spec.path, trigger, caps, cls, kind)
+            subjects.append(s)
+            by_ds[root] = (s, spec)
+        if not subjects:
+            raise ValueError("LoRA Isolation needs a trigger word: set trigger_word, or a trigger on each subject "
+                             "dataset")
+        rules = [r for s in subjects for r in s.rules]
+        dop_pairs = [s.dop_pair for s in subjects] + [(s.trigger, s.phrase) for s in subjects if s.rules]
+        for it in items:
+            it.caption = iso.fuse(it.caption, rules)
+            it.text_path = text_cache_path(cfg, it.caption)
+        if cfg.isolation_balance and len(by_ds) > 1:
+            counts = {d: len({it.image for it in items if it.dataset == d and it.category == "image"}) for d in by_ds}
+            reps = iso.balance_repeats(counts, {d: spec.repeats for d, (_, spec) in by_ds.items()})
+            for it in items:
+                if it.dataset in reps:
+                    it.repeats = reps[it.dataset]
+            log.info("LoRA Isolation: subjects balanced: %s", ", ".join(
+                f"{by_ds[d][0].fused} {counts[d]} images x{r}" for d, r in reps.items()))
+        n_pairs = 0
+        people = None
+        for d, (s, spec) in by_ds.items():
+            if s.kind != "person" or cfg.isolation_pairs <= 0:
+                continue
+            if people is None:
+                people = iso.strangers(cfg.models_dir)
+            photos = sorted({it.image for it in items if it.dataset == d and it.category == "image"})
+            cache = cfg.dataset_cache_dir(Path(d))
+            pairs = iso.build_pairs(s, photos, cache / "isolation" / s.fused, people, cfg.isolation_pairs, cfg.seed,
+                                    getattr(self, "face_analysis", None))
+            reps = next((it.repeats for it in items if it.dataset == d), spec.repeats)
+            tag = get_arch(cfg).latent_tag
+            for png, caption in pairs:
+                caption = iso.fuse(caption, rules)
+                for side in cfg.dataset_sides(spec):
+                    bw, bh = bucket_size(2 * iso.PANEL, iso.PANEL, cfg, side)
+                    stem = _hash(f"{png.resolve()}|{png.stat().st_mtime_ns}") + f"_{bw}x{bh}"
+                    items.append(Item(image=png, caption=caption, width=bw, height=bh,
+                                      latent_path=cache / "latents" / f"{stem}{tag}.safetensors", latent_flip_path=None,
+                                      text_path=text_cache_path(cfg, caption), category="pair", side=side,
+                                      repeats=reps, dataset=d, loss_scale=cfg.isolation_pair_weight))
+                    n_pairs += 1
+        n_dop = 0
+        for it in items:
+            dc = iso.dop_caption(it.caption, dop_pairs)
+            it.dop_caption = dc
+            it.dop_text_path = text_cache_path(cfg, dc) if dc is not None else None
+            n_dop += dc is not None
+        cfg.sample_prompts = [iso.fuse(p, rules) for p in cfg.sample_prompts]
+        cfg.probe_face_prompt = iso.fuse(cfg.probe_face_prompt, rules)
+        cfg.probe_body_prompt = iso.fuse(cfg.probe_body_prompt, rules)
+        self.isolation = subjects
+        for s in subjects:
+            log.info("LoRA Isolation: %s (%s) trains as '%s'%s; prompt with '%s'", s.trigger, s.kind, s.fused,
+                     f", its trigger-free caption says '{s.phrase}'" if s.phrase else ", dropped from the trigger-free "
+                     "caption", s.fused)
+        log.info("LoRA Isolation: %d side-by-side pair item(s) at x%g, DOP on %d item(s) every %d step(s) at x%g",
+                 n_pairs, cfg.isolation_pair_weight, n_dop, cfg.dop_every, cfg.dop_weight)
+        return items
+
+    def _dop_job(self, cfg, batch, latents, cur_step: int, gen, shift: float, tokens: int):
+        """The step's trigger-free pass for a batch, drawn in the main thread with the run's random streams: (the
+        batch rows with a DOP caption, their text features and mask, fresh sigmas and noise), or None."""
+        if not cfg.isolation or self.isolation is None or cfg.dop_weight <= 0 or cur_step % max(1, cfg.dop_every):
+            return None
+        sel = [i for i, it in enumerate(batch) if it.dop_text_path is not None]
+        if not sel:
+            return None
+        from safetensors.torch import load_file
+        emb, mask = self.arch.pad_embeds([load_file(str(batch[i].dop_text_path))["embeds"] for i in sel])
+        sigma = sample_sigmas(cfg, len(sel), gen, shift, tokens=tokens, arch=self.arch)
+        noise = torch.randn((len(sel), *latents.shape[1:]), generator=gen)
+        return sel, emb, mask, sigma, noise
+
+    def _dop_pass(self, rmodel, rinj, rdev, latents, n_batch: int, dop, n_total: int, cfg) -> None:
+        """DOP (Differential Output Preservation, Ostris's AI-Toolkit): a fresh noising of the pictures with the
+        trigger swapped for its class, held to the model's own prediction there with the LoRA at 0, so without the
+        trigger the LoRA learns to change nothing. Backpropagated here."""
+        sel, emb, mask, sigma, noise = dop
+        lat = latents[sel]
+        s = sigma.to(rdev).view(-1, 1, 1, 1)
+        noisy = ((1 - s) * lat + s * noise.to(rdev, torch.float32)).to(torch.bfloat16)
+        t = sigma.to(rdev) * 1000.0
+        emb, mask = emb.to(rdev), mask.to(rdev)
+        lora_mod.set_multiplier(rinj, 0.0)
+        try:
+            with torch.no_grad():
+                target = rmodel(noisy, t, emb, mask).float()
+        finally:
+            lora_mod.set_multiplier(rinj, 1.0)
+        pred = rmodel(noisy, t, emb, mask).float()
+        loss = torch.nn.functional.mse_loss(pred, target)
+        (loss * (cfg.dop_weight * len(sel) / max(1, n_batch) / n_total)).backward()
+        self.dop_values.append(float(loss.detach()))
 
     def _epoch_images(self, batcher) -> int:
         """Images in one epoch of an image queue (repeats counted)."""

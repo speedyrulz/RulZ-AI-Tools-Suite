@@ -47,6 +47,9 @@ class Item:
     side: int = 0  # training resolution this item was bucketed for (square-equivalent side, area = side^2)
     repeats: int = 1  # times the item comes up per epoch (its dataset's repeats)
     dataset: str = ""  # the dataset folder it came from
+    loss_scale: float = 1.0  # its loss weight (LoRA Isolation's side-by-side pairs train at isolation_pair_weight)
+    dop_caption: str | None = None  # LoRA Isolation: the trigger-free caption of its DOP pass (None: no DOP)
+    dop_text_path: Path | None = None  # its cached text features
 
     @property
     def key(self) -> str:
@@ -106,15 +109,16 @@ def load_image_fit(path: Path, w: int, h: int, src_box=None) -> Image.Image:
     return ImageOps.fit(img, (w, h), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
 
 
-def read_caption(image: Path, cfg: TrainConfig) -> str:
+def read_caption(image: Path, cfg: TrainConfig, trigger: str | None = None) -> str:
     """The image's caption: the architecture picks the file (FIBO 2.0 prefers a structured <name>.json caption), cleans
-    a JSON caption the way the model was trained, and puts the trigger word where it belongs."""
+    a JSON caption the way the model was trained, and puts the trigger word (its dataset's, else the run's) where it
+    belongs."""
     arch = get_arch(cfg)
     cap = arch.caption_file(image, cfg)
     text = cap.read_text(encoding="utf-8").strip() if cap.is_file() else ""
     if cap.suffix.lower() == ".json" and text:
         text = arch.clean_prompt(text)
-    return arch.add_trigger(text, cfg.trigger_word)
+    return arch.add_trigger(text, cfg.trigger_word if trigger is None else trigger)
 
 
 def _hash(s: str) -> str:
@@ -150,7 +154,7 @@ def scan_dataset(cfg: TrainConfig) -> list[Item]:
                 log.warning("Skipping unreadable image %s: %s", p, e)
                 continue
             n_images += 1
-            caption = read_caption(p, cfg)
+            caption = read_caption(p, cfg, spec.trigger or cfg.trigger_word)
             seen: set[tuple[int, int]] = set()
             for side in sides:
                 bw, bh = bucket_size(w, h, cfg, side)
@@ -312,6 +316,8 @@ def text_jobs(items: list[Item], cfg: TrainConfig, extra_prompts: list[str] | No
     jobs: dict[Path, str] = {}
     for it in items:
         jobs.setdefault(it.text_path, it.caption)
+        if it.dop_text_path is not None and it.dop_caption is not None:  # LoRA Isolation's trigger-free captions
+            jobs.setdefault(it.dop_text_path, it.dop_caption)
     jobs.setdefault(dropout_text_path(cfg), dropout_prompt(cfg))
     for p in extra_prompts or []:
         jobs.setdefault(text_cache_path(cfg, p), p)

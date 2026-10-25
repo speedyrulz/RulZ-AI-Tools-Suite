@@ -506,7 +506,8 @@ def variant_items(items: list, cfg, maps_dir=None) -> list:
     """A configuration's share of the race's dataset items: its crop kinds only, no flipped latents unless it flips,
     and its own region maps (maps_dir) when its region weights differ from the run's."""
     mode = (cfg.crop_augment or "none").lower()
-    kinds = {"image"} | ({"face_crop"} if "face" in mode else set()) | ({"bust_crop"} if "bust" in mode else set())
+    kinds = {"image", "pair"} | ({"face_crop"} if "face" in mode else set()) | ({"bust_crop"} if "bust" in mode
+                                                                                 else set())
     out = []
     for it in items:
         if it.category not in kinds:

@@ -841,8 +841,19 @@ class DatasetPicker:
 
     @property
     def value(self) -> list[dict]:
-        return [{"path": r["path"], "resolutions": sorted(float(x) for x in (r["res"].value or [])),
-                 "repeats": max(1, int(r["rep"].value or 1))} for r in self.rows.values() if r["use"].value]
+        out = []
+        for r in self.rows.values():
+            if not r["use"].value:
+                continue
+            d = {"path": r["path"], "resolutions": sorted(float(x) for x in (r["res"].value or [])),
+                 "repeats": max(1, int(r["rep"].value or 1))}
+            for key, el in (("trigger", r["trig"]), ("class", r["cls"])):
+                if str(el.value or "").strip():
+                    d[key] = str(el.value).strip()
+            if r["kind"].value and r["kind"].value != "auto":
+                d["kind"] = r["kind"].value
+            out.append(d)
+        return out
 
     @value.setter
     def value(self, entries) -> None:
@@ -857,6 +868,9 @@ class DatasetPicker:
             r["res"].value = sorted({min(MEGAPIXEL_CHOICES, key=lambda m, x=float(x): abs(m - x))
                                      for x in (d.get("resolutions") or [])})
             r["rep"].value = int(d.get("repeats") or 1)
+            r["trig"].value = str(d.get("trigger") or "")
+            r["cls"].value = str(d.get("class") or "")
+            r["kind"].value = str(d.get("kind") or "auto")
             r["use"].value = True
         self.changed()
 
@@ -888,11 +902,23 @@ class DatasetPicker:
                 rep = ui.number("Repeats", value=1, min=1, max=1000, precision=0).classes("w-24") \
                     .tooltip("How many times each image of this dataset comes up per epoch: 2 counts a dataset "
                              "twice as much as one at 1.")
-        for el in (res, rep):
+                trig = ui.input("Trigger", placeholder="the run's").props("dense").classes("w-28") \
+                    .tooltip("This dataset's own trigger word (empty: the Trigger word of the run). Several "
+                             "subjects, each with its own trigger, train together (LoRA Isolation).")
+                cls = ui.input("Is a", placeholder="from captions").props("dense").classes("w-28") \
+                    .tooltip("LoRA Isolation: what the subject is (man, woman, dog...). Empty: read from the "
+                             "captions' \"<trigger>, a man\".")
+                kind = ui.select({"auto": "auto", "person": "person", "thing": "animal / thing", "style": "style"},
+                                 value="auto", label="Kind").props("dense").classes("w-32") \
+                    .tooltip("LoRA Isolation: a person gets the fused trigger and the side-by-side pairs with "
+                             "strangers, an animal or thing the fused trigger only, a style keeps its trigger as "
+                             "written. auto: a person when the class is one.")
+        for el in (res, rep, trig, cls, kind):
             el.bind_enabled_from(use, "value")
-        for el in (use, res, rep):
+        for el in (use, res, rep, trig, cls, kind):
             el.on_value_change(lambda _: self.changed())
-        self.rows[key] = {"path": path, "row": row, "use": use, "info": info, "res": res, "rep": rep}
+        self.rows[key] = {"path": path, "row": row, "use": use, "info": info, "res": res, "rep": rep, "trig": trig,
+                          "cls": cls, "kind": kind}
         self.empty.visible = False
         for fn in self.listeners:
             fn()
@@ -1071,6 +1097,10 @@ class Form:
             loss_watch_improve_tol=float(v("loss_watch_improve_tol")),
             loss_watch_healthy_mult=float(v("loss_watch_healthy_mult")),
             loss_watch_exclude_after=int(v("loss_watch_exclude_after")),
+            isolation=bool(v("isolation")), isolation_class=s("isolation_class"),
+            isolation_kind=v("isolation_kind") or "auto", dop_weight=float(v("dop_weight")),
+            dop_every=int(v("dop_every") or 1), isolation_pairs=int(v("isolation_pairs") or 0),
+            isolation_pair_weight=float(v("isolation_pair_weight")), isolation_balance=bool(v("isolation_balance")),
             look_warmup=bool(v("look_warmup")), look_warmup_start=float(v("look_warmup_start")),
             look_warmup_epochs=float(v("look_warmup_epochs")),
             region_weights=bool(v("region_weights")), face_loss_weight=float(v("face_loss_weight")),
@@ -4411,6 +4441,43 @@ def build_page(local: bool = True):
                                                                          value=d.loss_watch_healthy_mult,
                                                                          step=0.05).classes("w-40")
 
+                    # ---- LoRA Isolation
+                    with section("LoRA Isolation", "Keep your subject(s) off everyone else in a picture",
+                                 "group_off", open_=False) as sec:
+                        nav_items.append(("LoRA Isolation", "group_off", sec))
+                        hint("After Fizgig's LoRA Isolation. A character LoRA spreads its subject onto other people: "
+                             "strangers in the background, a friend beside them. With it on: every caption that "
+                             "names a subject also trains without the trigger, held to the model without the LoRA "
+                             "(DOP, Ostris's AI-Toolkit); the trigger is joined to its class word (\"gwelt, a man\" "
+                             "trains as \"gweltman\": prompt with that word); each person gets side-by-side "
+                             "pictures of one of their photos next to a generated stranger; and several subjects "
+                             "(one per dataset, each with its trigger on the Dataset rows above) balance. Fizgig "
+                             "measured on Krea 2: strangers reading as the subject 48 of 50 -> 0 of 50, likeness "
+                             "unchanged. A second person in the LoRA helps. About 1.5x the training time.")
+                        with fields():
+                            w["isolation"] = ui.switch("LoRA Isolation", value=d.isolation)
+                        with fields() as iso_fields:
+                            w["isolation_class"] = ui.input("Subject is a (one dataset)", value=d.isolation_class,
+                                                            placeholder="from captions").classes("w-48") \
+                                .tooltip("With a single dataset folder: what the subject is (man, woman, dog). "
+                                         "With datasets: each row's 'Is a'.")
+                            w["isolation_kind"] = ui.select({"auto": "auto", "person": "person",
+                                                             "thing": "animal / thing", "style": "style"},
+                                                            value=d.isolation_kind, label="Kind (one dataset)") \
+                                .classes("w-44")
+                            w["dop_weight"] = ui.number("DOP weight", value=d.dop_weight, min=0, step=0.5) \
+                                .classes("w-32")
+                            w["dop_every"] = ui.number("DOP every N steps", value=d.dop_every, min=1, precision=0) \
+                                .classes("w-40")
+                            w["isolation_pairs"] = ui.number("Side-by-sides per person", value=d.isolation_pairs,
+                                                             min=0, precision=0).classes("w-48")
+                            w["isolation_pair_weight"] = ui.number("Their weight", value=d.isolation_pair_weight,
+                                                                   min=0, step=0.5).classes("w-32")
+                            w["isolation_balance"] = ui.switch("Balance the subjects", value=d.isolation_balance) \
+                                .tooltip("Smaller subject datasets repeat so each trains about as often as the "
+                                         "largest.")
+                        iso_fields.bind_visibility_from(w["isolation"], "value")
+
                     # ---- Likeness probes
                     with section("Likeness probes & controller", "Best checkpoint, early stop and curriculum",
                                  "insights", open_=False) as sec:
@@ -5274,6 +5341,16 @@ continues with the run's own names, and `<job>_winner.yaml` holds its settings. 
 the race. With data parallel on 2+ GPUs, *One configuration per GPU at the same time* trains the configurations side
 by side (an odd one left over splits over the GPUs, or runs on the first). The Monitor tab shows each configuration's score per round, with a *Drop* button on each one still in: it stops
 that configuration after the current step, saves its LoRA as `_dropped` and the race goes on without it (one left wins).
+
+## LoRA Isolation
+*LoRA Isolation* (Train tab) keeps your subject(s) off everyone else in a picture, after Fizgig's: every caption that
+names a subject also trains without its trigger, held to the model without the LoRA (DOP); the trigger is joined to its
+class word (`gwelt, a man` trains as `gweltman`: prompt with that word, the sample and probe prompts are rewritten);
+each person gets side-by-side pictures of one of their photos next to a generated stranger, captioned stranger first;
+and several subjects, one per dataset with its own *Trigger* on the Dataset rows, balance. *Is a* sets what a subject
+is when its captions don't say; *Kind* makes it a person (fused trigger + pairs), an animal or thing (fused trigger) or
+a style (trigger kept, no pairs). Fizgig measured on Krea 2: strangers reading as the subject 48 of 50 -> 0 of 50,
+likeness unchanged. Training takes about 1.5-2x as long.
 
 ## Full fine-tune, then extract a LoRA
 *Fine-tune the whole model, then extract a LoRA* (Train tab, LoRA section) trains the target layers' own weights
