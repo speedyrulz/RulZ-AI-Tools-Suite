@@ -49,3 +49,10 @@ Double-click `run.bat` (creates a venv and installs PySide6 + requests on first 
 Settings, the theme choice and saved prompts are stored in `%APPDATA%\RulzCaptioner`. Set the environment
 variable `RULZ_CAPTIONER_DIR` to use another folder instead (for a portable setup or for testing with a fresh
 profile).
+
+## License
+
+Open source under the [MIT License](LICENSE). llama.cpp, which you download separately, has its own MIT license.
+
+The RulZ name and logo are excluded from the MIT License; all rights reserved. If you fork or redistribute this
+project, remove or replace the RulZ branding. See [LOGO-NOTICE.md](LOGO-NOTICE.md).
