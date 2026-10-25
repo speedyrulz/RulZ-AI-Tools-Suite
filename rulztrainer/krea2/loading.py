@@ -197,8 +197,19 @@ def _decode(vae, latents: torch.Tensor) -> torch.Tensor:
 
 @torch.no_grad()
 def decode_latents(vae, latents: torch.Tensor) -> torch.Tensor:
-    """Inverse of encode_images. Returns images [B,3,H,W] in [-1,1]."""
-    return _decode(vae, latents).clamp(-1, 1)
+    """Inverse of encode_images. Returns images [B,3,H,W] in [-1,1].
+
+    Decoded in 512 px tiles (384 px apart, the overlaps blended): this VAE normalizes per pixel and its convolutions
+    see a few pixels around each tile, so the result is the full decode's to 0.06 of an 8-bit level on average
+    (PSNR 68 dB, measured at 1024 x 1536), with a peak of +2.0 GB instead of +7.9 GB at 1 MP and +11.8 GB at 1.5 MP.
+    Encoding (the training latents) is never tiled."""
+    prev = vae.use_tiling
+    vae.enable_tiling(tile_sample_min_height=512, tile_sample_min_width=512, tile_sample_stride_height=384,
+                      tile_sample_stride_width=384)
+    try:
+        return _decode(vae, latents).clamp(-1, 1)
+    finally:
+        vae.use_tiling = prev
 
 
 def decode_latents_grad(vae, latents: torch.Tensor) -> torch.Tensor:

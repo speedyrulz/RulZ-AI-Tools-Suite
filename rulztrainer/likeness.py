@@ -237,7 +237,8 @@ def classify_counts(fractions: dict[str, float], threshold: float = 0.03) -> tup
 
 
 def probe_body_size(size: int) -> tuple[int, int]:
-    """Full-body probes are portrait 2:3 at the given width, rounded to multiples of 16."""
-    w = max(256, size // 16 * 16)
+    """Full-body probes are portrait 2:3 with the face probe's pixel count (size x size), in multiples of 16: a probe
+    size equal to the sample size then renders and decodes in the samples' memory (1024 -> 832 x 1248, not 1536 tall)."""
+    w = max(256, int(size * math.sqrt(2 / 3)) // 16 * 16)
     h = int(math.ceil(w * 1.5 / 16) * 16)
     return w, h

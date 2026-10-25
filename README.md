@@ -610,8 +610,8 @@ score), not a default.
 ## Likeness probes and controller (character LoRAs)
 
 With face/body references set, `probe_every: N` renders a fixed-seed headshot (`probe_face_prompt`) and/or
-full-body image (`probe_body_prompt`) every N steps at `probe_size` with the turbo LoRA (cheap enough to do
-often), scores them, and records `likeness.jsonl` plus a Monitor chart. Scores are smoothed with `probe_ema`
+full-body image (`probe_body_prompt`) every N steps at `probe_size` (the face square, the body a 2:3 portrait with the
+same pixel count) with the turbo LoRA (cheap enough to do often), scores them, and records `likeness.jsonl` plus a Monitor chart. Scores are smoothed with `probe_ema`
 and only changes beyond `likeness_noise_band` count. The controller then, each individually switchable:
 
 - keeps `<job>_best.safetensors` at the best smoothed combined score (`likeness_track_best`) and stops after
@@ -681,6 +681,15 @@ moved to system RAM for the duration (so RAM must hold both models; quantize the
 `turbo_lora` + `turbo_lora_strength` attach a ComfyUI-format LoRA (for example an 8-step distill) that is applied
 only while generating sample images, never during training steps. Set `sample_steps` to match. `sample_lora` +
 `sample_lora_strength` stack a second sampling-only LoRA (for example a style LoRA) alongside the turbo one.
+LoRA layers (`lora_down/up`, `lora_A/B`) and `diff_b` bias offsets are applied; Krea 2 LoRAs may use ComfyUI's
+module names (`blocks.N.attn.wq`) or ours. LoKr / LoHa / full-diff entries cannot be applied while sampling and are
+named in a warning. With a turbo LoRA, Krea 2 samples on its distilled schedule (fixed shift, as ComfyUI does), and
+the log warns about guidance other than CFG 1.
+
+Krea 2's previews and probes decode in 512 px VAE tiles: the Qwen-Image VAE normalizes per pixel, so the tiles give
+the full decode to 0.06 of an 8-bit level (PSNR 68 dB), at +2.0 GB instead of +7.9 GB per megapixel. The Flux2 VAE of
+MOSS-Image and FIBO is not tiled (its GroupNorm and attention see the whole image: tiles would shift tones by 4-7
+levels).
 
 ## Dataset page
 
@@ -767,7 +776,7 @@ Hugging Face and `hf auth login`. The download skips the repo's 26 GB single-fil
   krea/Krea-2-Turbo` with `sample_steps: 8` and `sample_cfg: 1` to preview (and probe) the LoRA as it will be used;
   Turbo is gated separately, so accept its license too. Sampling Raw needs 28-52 steps with guidance.
 - **Guidance.** `sample_cfg` uses the same convention for every model (1 = off). Krea's `guidance_scale` g is
-  `sample_cfg` g + 1 here: Krea's 3.5 for Raw is 4.5.
+  `sample_cfg` g + 1 here: Krea's 4.5 for Raw (its pipeline's default, 28 steps) is 5.5.
 - **Memory.** The transformer is 25 GB in bf16, 13.5 GB in int8, about 8 GB in nvfp4. `transformer_quant: auto`
   counts the memory the model will live in, all GPUs of a model split together: bf16 from 40 GB, int8 (W8A8) from
   22 GB, else nvfp4. One 16 GB card therefore trains in nvfp4 (int8 plus the VAE already fill 14.2 GB, with no room
@@ -866,6 +875,16 @@ Measured, 20 steps at 1 MP, seconds per step without and with auto:
 
 The gain is small on 16 GB cards: there is little spare memory, and with int8/nvfp4 the forward a kept block skips
 is cheap next to its bf16 backward. Cards with more free memory keep more blocks; that case is not measured here.
+
+**Memory for samples and probes after training steps.** The activations a step frees stay reserved by PyTorch's
+allocator, and with its default segments they are cut into hundreds of pieces by small tensors that live on, so a
+large sample or probe could run out of memory after the first steps although the same image rendered before
+training (measured, Krea 2 on Windows: 3.9 GB cached in 784 segments, the largest free piece 0.19 GB). On Linux the
+trainer runs the allocator with `expandable_segments:True` (unless `PYTORCH_ALLOC_CONF` / `PYTORCH_CUDA_ALLOC_CONF`
+is set), where freed memory stays one piece; before every sample and probe round it drops the finished step's
+gradients and returns the cached memory. Measured on Linux: the probe after two training steps starts at 8.40 GB
+allocated / 8.52 GB reserved, the one before training at 8.28 / 8.29 GB. The Windows CUDA driver has no expandable
+segments; there only the cleanup applies.
 
 ## torch.compile (`compile_model`)
 

@@ -86,4 +86,5 @@ def test_batcher_weights_and_curriculum(tmp_path):
     picks = [batch[0] for batch in b.epoch()]
     assert len(set(str(it.image) for it in picks)) == 10  # uniform shuffle visits every image
     assert L.timestep_logit_shift(1.0) < 0 < L.timestep_logit_shift(-1.0)
-    assert L.probe_body_size(512) == (512, 768)
+    assert L.probe_body_size(512) == (416, 624) and L.probe_body_size(1024) == (832, 1248)  # ~ the face's area
+    assert L.probe_body_size(256) == (256, 384)

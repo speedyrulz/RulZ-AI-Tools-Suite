@@ -20,7 +20,7 @@ from typing import Iterable
 import torch
 from torch import nn
 
-from .config import ARCH_DEFAULT_TARGETS, TrainConfig
+from .config import ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, TrainConfig
 
 log = logging.getLogger("rulztrainer")
 
@@ -129,7 +129,7 @@ class MossArch(Arch):
     default_targets = ARCH_DEFAULT_TARGETS["moss_image"]
     text_prefixes = ("text_embedder.",)
     supports_single_files = True
-    default_sample_steps, default_sample_cfg = 20, 3.0
+    default_sample_steps, default_sample_cfg = ARCH_SAMPLE_DEFAULTS["moss_image"]
 
     def __init__(self):
         from .moss import loading
@@ -223,7 +223,7 @@ class FiboArch(Arch):
     default_targets = ARCH_DEFAULT_TARGETS["fibo2"]
     text_prefixes = ("perceiver.",)
     supports_single_files = False
-    default_sample_steps, default_sample_cfg = 30, 5.0
+    default_sample_steps, default_sample_cfg = ARCH_SAMPLE_DEFAULTS["fibo2"]
 
     def __init__(self):
         from .fibo import loading, prompts
@@ -323,7 +323,7 @@ class Krea2Arch(Arch):
     default_targets = ARCH_DEFAULT_TARGETS["krea2"]  # + attention gate and text fusion (see config.py)
     text_prefixes = ("text_fusion.",)
     supports_single_files = True  # ComfyUI's Krea 2 diffusion model, Qwen3-VL-4B text encoder and Qwen-Image VAE files
-    default_sample_steps, default_sample_cfg = 28, 4.5
+    default_sample_steps, default_sample_cfg = ARCH_SAMPLE_DEFAULTS["krea2"]
     latent_tag = "_qwenvae"
 
     @staticmethod

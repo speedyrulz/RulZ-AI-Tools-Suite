@@ -468,6 +468,13 @@ def attach_extra_lora(model: nn.Module, path: str, strength: float = 1.0,
     if missed:
         log.warning("%s: %d of %d LoRA entries match no layer of this model (e.g. %s)", Path(path).name, len(missed),
                     len(entries) + len(biases), ", ".join(sorted(missed)[:3]))
+    read = (".lora_down.weight", ".lora_up.weight", ".lora_A.weight", ".lora_B.weight", ".alpha", ".diff_b")
+    unread = sorted({k.rsplit(".", 2)[-2] if k.endswith(".weight") else k.rsplit(".", 1)[-1]
+                     for k in state if not k.endswith(read)})
+    if unread:  # LoKr (lokr_w1...), LoHa (hada_w1_a...), full weight diffs (diff), DoRA (dora_scale)
+        log.warning("%s: %d entries of kinds this loader cannot apply are ignored (%s); only LoRA (lora_down/up, "
+                    "lora_A/B) and diff_b are applied while sampling", Path(path).name,
+                    sum(1 for k in state if not k.endswith(read)), ", ".join(unread[:5]))
     return len(matched)
 
 

@@ -23,6 +23,10 @@ ARCH_NAMES = ("moss_image", "fibo2", "krea2")
 _CORE_TARGETS = ("q", "k", "v", "o", "ffn_up_gate", "ffn_down")
 ARCH_DEFAULT_TARGETS = {"moss_image": _CORE_TARGETS, "fibo2": _CORE_TARGETS,
                         "krea2": _CORE_TARGETS + ("attn_gate", "text_fusion")}
+# (sample steps, sample CFG) per family, in this trainer's guidance convention (uncond + cfg * (cond - uncond), 1 = off):
+# MOSS-Image's reference CFG 3; Bria's FIBO 2.0 pipeline, 30 steps at 5; Krea's pipeline, 28 steps at its
+# guidance_scale 4.5, which computes cond + g * (cond - uncond): cfg 5.5 here
+ARCH_SAMPLE_DEFAULTS = {"moss_image": (20, 3.0), "fibo2": (30, 5.0), "krea2": (28, 5.5)}
 
 
 # Named presets: values applied over a config (UI toggle, --preset on the CLI, or `preset:` in YAML).
@@ -247,7 +251,7 @@ class TrainConfig:
     probe_body_prompt: str = ""  # full-body prompt; empty = no body probe
     probe_seeds: int = 1  # seeds per probe (scores averaged)
     probe_seed: int = 1234
-    probe_size: int = 512  # face probe is square; body probe is probe_size x 1.5
+    probe_size: int = 512  # face probe is square; body probe is 2:3 portrait with the same pixel count
     probe_steps: int = 8
     probe_cfg: float = 1.0
     probe_ema: float = 0.5  # smoothing of probe scores (weight on the previous value)

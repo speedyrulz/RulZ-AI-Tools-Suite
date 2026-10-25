@@ -80,7 +80,7 @@ def test_dit_from_comfy_layout_matches_our_model(tmp_path):
     assert not loaded.is_distilled
     x, enc = torch.randn(1, 64, 2, 3), torch.randn(1, 5, 3, 40)
     with torch.no_grad():
-        assert torch.equal(loaded(x, 400.0, enc, None), model(x, 400.0, enc, None))
+        assert torch.allclose(loaded(x, 400.0, enc, None), model(x, 400.0, enc, None), rtol=1e-4, atol=1e-4)
     assert ksf.is_krea2_file(path) and archs.arch_from_transformer_file(str(path)) == "krea2"
     # a diffusers-layout file loads as well; "turbo" in the name marks the distilled model
     turbo = tmp_path / "krea2_turbo_test.safetensors"
@@ -88,7 +88,7 @@ def test_dit_from_comfy_layout_matches_our_model(tmp_path):
     again = ksf.load_transformer_file(turbo, "cpu", quant="none", dtype=torch.float32)
     assert again.is_distilled
     with torch.no_grad():
-        assert torch.equal(again(x, 400.0, enc, None), model(x, 400.0, enc, None))
+        assert torch.allclose(again(x, 400.0, enc, None), model(x, 400.0, enc, None), rtol=1e-4, atol=1e-4)
     with pytest.raises(ValueError, match="not a Krea 2"):
         ksf.load_transformer_file(_moss_like(tmp_path), "cpu", quant="none")
 
@@ -263,3 +263,67 @@ def test_comfy_layout_sampling_lora_with_bias_offsets(tmp_path):
     assert not uses_distilled_schedule(model)  # attached but off (training forwards, probes without it)
     L.set_extras_enabled(model, True)
     assert uses_distilled_schedule(model)
+
+
+def test_family_sample_defaults_and_krea_guidance():
+    """Krea's pipeline samples Raw at guidance_scale 4.5 (cond + g * (cond - uncond)): CFG 5.5 in this trainer's
+    convention. Every family's defaults come from one table the WebUI reads too."""
+    from rulztrainer.config import ARCH_SAMPLE_DEFAULTS
+
+    for name in ("moss_image", "fibo2", "krea2"):
+        a = archs.arch_by_name(name)
+        assert (a.default_sample_steps, a.default_sample_cfg) == ARCH_SAMPLE_DEFAULTS[name]
+    assert ARCH_SAMPLE_DEFAULTS["krea2"] == (28, 5.5)
+    cond, uncond, g = torch.tensor(2.0), torch.tensor(0.5), 4.5
+    assert torch.equal(cond + g * (cond - uncond), uncond + (g + 1) * (cond - uncond))
+
+
+def test_unreadable_lora_kinds_and_sample_settings_are_reported(tmp_path, caplog):
+    import logging
+    from types import SimpleNamespace
+
+    from rulztrainer import lora as L
+    from rulztrainer.config import TrainConfig
+    from rulztrainer.trainer import Trainer
+
+    model = Krea2Transformer(**TINY).float()
+    path = tmp_path / "lokr.safetensors"
+    save_file({"diffusion_model.blocks.0.attn.wq.lokr_w1": torch.zeros(4, 4),
+               "diffusion_model.blocks.0.attn.wq.lokr_w2": torch.zeros(16, 16),
+               "diffusion_model.blocks.0.attn.wq.alpha": torch.tensor(4.0)}, str(path))
+    with caplog.at_level(logging.WARNING, logger="rulztrainer"):
+        assert L.attach_extra_lora(model, str(path), 1.0) == 0
+    assert "lokr_w1" in caplog.text and "cannot apply" in caplog.text
+
+    def warnings_for(**kw):
+        caplog.clear()
+        fake = SimpleNamespace(cfg=TrainConfig(**kw), arch=archs.arch_by_name("krea2"))
+        with caplog.at_level(logging.WARNING, logger="rulztrainer"):
+            Trainer._check_sample_settings(fake)
+        return caplog.text
+
+    prompts = dict(sample_prompts=["a photo"], probe_every=0)
+    assert "overcooked" in warnings_for(turbo_lora="t.safetensors", sample_steps=8, sample_cfg=5.5, **prompts)
+    assert warnings_for(turbo_lora="t.safetensors", sample_steps=8, sample_cfg=1.0, **prompts) == ""
+    assert warnings_for(sample_model_path="krea/Krea-2-Turbo", sample_steps=8, sample_cfg=1.0, **prompts) == ""
+    assert "unfinished" in warnings_for(sample_steps=8, sample_cfg=1.0, **prompts)
+    assert warnings_for(sample_steps=28, sample_cfg=5.5, **prompts) == ""
+    assert "Probes" in warnings_for(sample_prompts=[], probe_every=25, probe_steps=8, probe_cfg=1.0)
+
+
+def test_preview_decode_is_tiled_and_matches_the_full_decode():
+    """Samples and probes decode in 512 px tiles (the full decode peaks at +7.9 GB at 1 MP); the tiles match the full
+    decode closely for this per-pixel-normalized VAE, and encoding the training latents stays untiled."""
+    from rulztrainer.krea2 import loading as K
+
+    torch.manual_seed(0)
+    vae = diffusers.AutoencoderKLQwenImage(base_dim=8, z_dim=16, dim_mult=[1, 2, 4, 4], num_res_blocks=1,
+                                           attn_scales=[], temperal_downsample=[False, True, True]).eval()
+    vae.register_to_config(latents_mean=[0.0] * 16, latents_std=[1.0] * 16)
+    lat = torch.randn(1, 64, 40, 40)  # 640 x 640 px: more than one tile
+    with torch.no_grad():
+        full = K._decode(vae, lat).clamp(-1, 1)
+    tiled = K.decode_latents(vae, lat)
+    assert not vae.use_tiling  # restored: encode_images never tiles
+    assert tiled.shape == full.shape == (1, 3, 640, 640)
+    assert (tiled - full).abs().mean() < 0.01

@@ -19,8 +19,8 @@ from pathlib import Path
 
 from nicegui import app, run, ui
 
-from rulztrainer.config import (ARCH_DEFAULT_TARGETS, MEGAPIXEL_CHOICES, MODEL_PRESETS, PRESET_PROBE_PROMPTS, PRESETS,
-                                TrainConfig, apply_preset, mp_to_side, side_to_mp)
+from rulztrainer.config import (ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, MEGAPIXEL_CHOICES, MODEL_PRESETS,
+                                PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
 from rulztrainer import bodysim, facesim
 from rulztrainer.losswatch import read_verdicts
 
@@ -545,6 +545,15 @@ class Form:
             for t in TARGETS + list(EXTRA_TARGETS):
                 if self.w.get(f"target_{t}") is not None:
                     self.w[f"target_{t}"].value = t in ARCH_DEFAULT_TARGETS[family]
+        # the sample steps / CFG likewise: each family samples at its own (Krea 2 Raw at CFG 5.5, MOSS-Image at 3)
+        steps, cfg = self.w.get("sample_steps"), self.w.get("sample_cfg")
+        if not self.loading and steps is not None and cfg is not None:
+            try:
+                current = (int(steps.value), float(cfg.value))
+            except (TypeError, ValueError):
+                current = None
+            if current == ARCH_SAMPLE_DEFAULTS[self.target_family]:
+                steps.value, cfg.value = ARCH_SAMPLE_DEFAULTS[family]
         self.target_family = family
 
     def to_config(self) -> TrainConfig:
@@ -1345,8 +1354,8 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
         r["sample_steps"] = (8, "most turbo LoRAs are 8-step distills; match yours")
         r["sample_cfg"] = (1.0, "distilled turbo LoRAs sample without guidance")
     elif krea:
-        r["sample_steps"] = (28, "Krea samples Raw with 52 steps; 28 is enough for previews")
-        r["sample_cfg"] = (4.5, "Krea's guidance 3.5 for Raw, in this trainer's convention (1 = off)")
+        r["sample_steps"] = (28, "Krea's pipeline samples Raw at 28 steps")
+        r["sample_cfg"] = (5.5, "Krea's guidance 4.5 for Raw, in this trainer's convention (1 = off)")
     elif fibo:
         r["sample_steps"] = (30, "Bria samples dev at 50 steps; 20-30 is plenty for previews")
         r["sample_cfg"] = (5.0, "Bria's guidance scale for FIBO 2.0 dev")
@@ -2696,8 +2705,8 @@ def build_page(local: bool = True):
                              "shift and the skip layer are MOSS-only. Prompts can be plain sentences or VGL JSON "
                              "captions.").bind_visibility_from(w["model_preset"], "value",
                                                                lambda p: is_fibo_preset(p, w["model_path"].value))
-                        hint("Krea 2: Raw is a base for training and needs many steps (Krea samples it with 52 steps "
-                             "at CFG 4.5 here, their guidance 3.5); 28 is enough for previews. Faster: set "
+                        hint("Krea 2: Raw is a base for training and needs many steps with guidance (Krea's pipeline: "
+                             "28 steps at their guidance 4.5, CFG 5.5 here). Faster: set "
                              "krea/Krea-2-Turbo as the sampling model (Advanced below) with 8 steps and CFG 1, the "
                              "way Krea uses LoRAs trained on Raw. Sample shift and the skip layer are MOSS-only.") \
                             .bind_visibility_from(w["model_preset"], "value",
@@ -2957,7 +2966,9 @@ def build_page(local: bool = True):
                                 .classes("w-32")
                             w["probe_cfg"] = ui.number("Probe CFG", value=d.probe_cfg, step=0.5).classes("w-32")
                             w["probe_size"] = ui.number("Probe size (px)", value=d.probe_size, step=64,
-                                                        precision=0).classes("w-36")
+                                                        precision=0).classes("w-36")                                 .tooltip("The face probe is size x size; the body probe is a 2:3 portrait with the "
+                                         "same pixel count (1024: 832 x 1248), so it fits wherever samples of that "
+                                         "size do")
                         subhead("Controller actions")
                         with fields():
                             w["likeness_track_best"] = ui.switch("Keep best checkpoint (<job>_best.safetensors)",

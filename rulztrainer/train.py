@@ -3,9 +3,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 
-from .config import TrainConfig
-from .trainer import Trainer
+
+def _allocator_config() -> None:
+    """Expandable segments for the CUDA caching allocator, before torch first touches CUDA: memory a training step
+    freed then serves large blocks again. Without it the freed activations stay reserved in hundreds of segments split
+    by small live tensors (measured: 3.9 GB cached in 784 segments, the largest free block 0.19 GB), so a large
+    sample or probe after training ran out of memory where the same one before training fit. Linux only (the Windows
+    CUDA driver has no support); a setting of the user's own is kept."""
+    if sys.platform.startswith("linux") and not (os.environ.get("PYTORCH_ALLOC_CONF")
+                                                 or os.environ.get("PYTORCH_CUDA_ALLOC_CONF")):
+        os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
+
+_allocator_config()
+
+from .config import TrainConfig  # noqa: E402
+from .trainer import Trainer  # noqa: E402
 
 
 def main(argv=None):

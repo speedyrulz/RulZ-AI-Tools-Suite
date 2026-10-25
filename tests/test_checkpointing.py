@@ -139,3 +139,31 @@ def test_calibration_uses_the_longest_caption(tmp_path):
             save_file({"embeds": torch.zeros(shape(s))}, str(p))
             items += [SimpleNamespace(text_path=p)] * 2
         assert _longest_text_path(items, archs.arch_by_name(name).pad_embeds).name == f"{name}_1.safetensors"
+
+
+def test_allocator_config_and_rendering_frees_training_memory(monkeypatch):
+    """Linux runs use expandable segments (a user setting wins; Windows has no support), and samples / probes start
+    without the finished step's gradients."""
+    from types import SimpleNamespace
+
+    from rulztrainer import train
+    from rulztrainer.trainer import Trainer
+
+    for var in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(train.sys, "platform", "linux")
+    train._allocator_config()
+    assert train.os.environ["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
+    monkeypatch.setenv("PYTORCH_ALLOC_CONF", "backend:cudaMallocAsync")
+    train._allocator_config()
+    assert train.os.environ["PYTORCH_ALLOC_CONF"] == "backend:cudaMallocAsync"
+    monkeypatch.delenv("PYTORCH_ALLOC_CONF")
+    monkeypatch.setattr(train.sys, "platform", "win32")
+    train._allocator_config()
+    assert "PYTORCH_ALLOC_CONF" not in train.os.environ
+
+    a, b = torch.nn.Linear(4, 4), torch.nn.Linear(4, 4)
+    for m in (a, b):
+        m(torch.randn(2, 4)).sum().backward()
+    Trainer._free_for_rendering(SimpleNamespace(replicas=[(a, None, "cpu"), (b, None, "cpu")]))
+    assert all(p.grad is None for m in (a, b) for p in m.parameters())

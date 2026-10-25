@@ -3,8 +3,8 @@ exponentially (FlowMatchEulerDiscreteScheduler with dynamic shifting: mu from 0.
 or a fixed 1.15 for the distilled Turbo checkpoint), classifier-free guidance as a second pass with the empty prompt.
 
 Guidance follows the trainer's convention for every family, uncond + cfg * (cond - uncond) with cfg 1 = off. Krea's
-own guidance_scale g computes cond + g * (cond - uncond), which is the same with cfg = 1 + g: Krea's 3.5 for Raw is
-4.5 here, and Turbo (g = 0) samples at cfg 1."""
+own guidance_scale g computes cond + g * (cond - uncond), which is the same with cfg = 1 + g: Krea's 4.5 for Raw (its
+pipeline's default and documented setting, 28 steps) is 5.5 here, and Turbo (g = 0) samples at cfg 1."""
 from __future__ import annotations
 
 import math

@@ -7,6 +7,7 @@ import gc
 import json
 import logging
 import math
+import os
 import random
 import sys
 import time
@@ -610,6 +611,9 @@ class Trainer:
         self.arch = detect_arch(cfg, self.model_dir)
         cfg.model_arch = self.arch.name
         log.info("Model architecture: %s", self.arch.label)
+        alloc = os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
+        if alloc:
+            log.info("CUDA allocator: %s", alloc)
         if not cfg.lora_targets:
             cfg.lora_targets = list(self.arch.default_targets)
             log.info("LoRA targets: the %s default (%s)", self.arch.label, ", ".join(cfg.lora_targets))
@@ -708,6 +712,7 @@ class Trainer:
         if not cfg.sample_model_path:
             for m, _, _ in self.replicas:
                 self._attach_sampling_loras(m)
+        self._check_sample_settings()
         if cfg.sample_prompts or cfg.probe_every > 0 or cfg.id_loss_weight > 0:
             self.vae = self.arch.get_vae(cfg, self.model_dir)
             self.face_scorer = self._make_face_scorer()
@@ -1582,6 +1587,24 @@ class Trainer:
                 if label == "Turbo LoRA" and n:
                     model.turbo_lora_attached = True  # the Krea 2 sampler then uses the distilled schedule
 
+    def _check_sample_settings(self) -> None:
+        """Warn about sample / probe settings that give unusable images: guidance on a distilled (turbo) sampler burns
+        them, a few steps or no guidance without one leaves them unfinished."""
+        cfg = self.cfg
+        distilled = bool(cfg.turbo_lora) or "turbo" in (cfg.sample_model_path or "").lower()
+        steps0, cfg0 = self.arch.default_sample_steps, self.arch.default_sample_cfg
+        for what, steps, guidance, on in (("Samples", cfg.sample_steps, cfg.sample_cfg, bool(cfg.sample_prompts)),
+                                          ("Probes", cfg.probe_steps, cfg.probe_cfg, cfg.probe_every > 0)):
+            if not on:
+                continue
+            if distilled and guidance != 1.0:
+                log.warning("%s use CFG %g with a turbo (distilled) sampler, which samples without guidance: set CFG "
+                            "1 or the images come out overcooked", what, guidance)
+            elif not distilled and (steps < 12 or guidance <= 1.0):
+                log.warning("%s render %d steps at CFG %g without a turbo LoRA or turbo sampling model, so they come "
+                            "out unfinished; %s samples at %d steps, CFG %g", what, steps, guidance, self.arch.label,
+                            steps0, cfg0)
+
     def _get_sample_model(self):
         """Lazily load the separate sampling model (kept on CPU between samplings) with matching LoRA slots."""
         cfg = self.cfg
@@ -1688,7 +1711,16 @@ class Trainer:
         return run_queue(slots, jobs, render, on_done=on_done)
 
     @torch.no_grad()
+    def _free_for_rendering(self) -> None:
+        """Before samples / probes: drop the finished step's gradients (the next step clears them anyway) and hand the
+        allocator's cached blocks back, so a large render finds the memory training freed."""
+        for m, _, _ in self.replicas:
+            for p in m.parameters():
+                p.grad = None
+        free_cuda()
+
     def sample_images(self, model, step):
+        self._free_for_rendering()
         with self._averaged(replicas=True), self._sampling_slots(model, step) as slots:
             return self._sample_with(slots, step)
 
@@ -1840,6 +1872,7 @@ class Trainer:
         """Render + score probes, update the controller, apply its actions. Returns True to stop training.
 
         With a weight average the probes score it, so a best checkpoint is exactly the weights that were scored."""
+        self._free_for_rendering()
         with self._averaged(replicas=True):
             return self._run_probe(model, step, optimizer, scheduler, injected)
 
