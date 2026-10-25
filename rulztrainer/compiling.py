@@ -69,15 +69,21 @@ def thread_prepare() -> None:
     _thread.done = True
 
 
-def prepare(fall_back: bool = False) -> None:
+def prepare(fall_back: bool = False, shape_swaps: bool = False) -> None:
     """Dynamo settings for compiling the blocks; call once before the first compile. fall_back (compile_model: auto):
-    a frame that fails to compile runs eagerly instead of stopping the run. The settings are kept for thread_prepare(),
-    which the models call before running a block, so every thread that runs one gets them."""
+    a frame that fails to compile runs eagerly instead of stopping the run. shape_swaps (a race): LoRA tensors change
+    shape in place (param.data = a tensor of another rank), so their size guards must always be checked. The settings
+    are kept for thread_prepare(), which the models call before running a block, so every thread that runs one gets
+    them."""
     import torch._dynamo as dynamo
 
     cfg = dynamo.config
     if fall_back:
         _settings["suppress_errors"] = True
+    if shape_swaps:
+        # dynamo skips a module tensor's guards while the module's __dict__ is unchanged, and a .data swap leaves it
+        # unchanged: the rank-32 graph would then run on rank-64 weights ("expected size 64==32")
+        _settings["skip_tensor_guards_with_matching_dict_tags"] = False
     # Python float attributes (LoRA scale / multiplier) would otherwise be traced as 0-d CPU tensors, and the CPU ops
     # on them make Inductor emit C++ that needs MSVC on Windows ("InvalidCxxCompiler: cl is not found")
     _settings["specialize_float"] = True

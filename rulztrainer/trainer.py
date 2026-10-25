@@ -749,7 +749,8 @@ class Trainer:
             log.info("torch.compile %s (%s)", "on" if do_compile else "off", why)
         if do_compile:
             for m, _, _ in self.replicas:
-                self.compiled = self.compile(m, fall_back=cfg.compile_model == "auto") or self.compiled
+                self.compiled = self.compile(m, fall_back=cfg.compile_model == "auto",
+                                             shape_swaps=self.race_rows is not None) or self.compiled
             if self.compiled and self.dp is not None:
                 log.info("Data parallel + compile: replicas run one after another until compilation settles "
                          "(%d steps without a new graph), then in parallel", DP_COMPILE_QUIET_STEPS)
@@ -1123,14 +1124,14 @@ class Trainer:
         self.status.write()
         return state_dir
 
-    def compile(self, model, fall_back: bool = False) -> bool:
+    def compile(self, model, fall_back: bool = False, shape_swaps: bool = False) -> bool:
         try:
             import triton  # noqa: F401
         except ImportError:
             log.warning("compile_model requested but triton is not installed; running without compile")
             return False
         try:
-            compiling.prepare(fall_back)  # raised recompile limits, dynamo warnings in train.log
+            compiling.prepare(fall_back, shape_swaps)  # raised recompile limits, dynamo warnings in train.log
             blocks = self.arch.compile_blocks(model)
             for block in blocks:
                 block.compile(backend="inductor", dynamic=True)
