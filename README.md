@@ -954,6 +954,13 @@ steps, every block checkpointed:
 |---|---|---|---|
 | MOSS-Image, int8_convrot | 6.61 s/step | **4.90 s/step (-26%)** | 25 s |
 | Krea 2, nvfp4 (native FP4) | 8.77 s/step | **7.74 s/step (-12%)** | 36 s |
+| Krea 2, nvfp4, cuDNN attention, 15-image set, 45 steps (median of steps 21-45) | 7.33 s/step | **6.09-6.22 s/step (-15 to -17%)** | 36 s (160 s with a cold inductor cache) |
+
+Dynamo's settings are thread-local in torch 2.12+, so the raised recompile limits are applied in every thread that
+runs a block (autograd's recompute thread, the data-parallel workers). Measured, that changed nothing here: the
+per-block graphs use dynamic shapes, and the compile stats show 0 recompiles over 45 steps and 15 caption lengths, so
+no limit was ever reached (`RULZ_COMPILE_THREAD_LIMITS=0` runs with torch's own limits in the other threads, for
+measuring).
 
 In data parallel over the 5060 Ti and a 4060 Ti (2 images per step) the gain was larger for MOSS-Image: 7.30 ->
 4.79 s/step (-34%), and 12.74 -> 11.81 s/step (-7%) for Krea 2 (see [Using two GPUs](#using-two-gpus)). Losses match

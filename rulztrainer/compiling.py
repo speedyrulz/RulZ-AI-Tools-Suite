@@ -7,7 +7,8 @@ sampling, guidance batches, the region-prior pass and every GPU add variants. to
 a hit recompile limit) go to train.log. report() summarizes frames, graphs, graph breaks by reason and compile time.
 
 RULZ_COMPILE_NESTED=1 sets nested_graph_breaks (a measurement variant: a break no longer bubbles up to the caller's
-frame)."""
+frame); RULZ_COMPILE_THREAD_LIMITS=0 leaves torch's own limits in the other threads (the behaviour before
+thread_prepare, for measuring it)."""
 from __future__ import annotations
 
 import logging
@@ -58,6 +59,9 @@ def thread_prepare() -> None:
     blocks and in the data-parallel worker threads, where dynamo would then run the blocks eagerly after 8 shapes
     without saying so. Cheap: one attribute check after the first call in a thread."""
     if not _settings or getattr(_thread, "done", False):
+        return
+    if os.environ.get("RULZ_COMPILE_THREAD_LIMITS") == "0":  # a measurement variant: torch's own limits in other threads
+        _thread.done = True
         return
     import torch._dynamo as dynamo
 
