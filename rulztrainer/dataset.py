@@ -18,6 +18,18 @@ from .config import TrainConfig
 
 log = logging.getLogger("rulztrainer")
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+SKIP_DIRS = {".rulz_cache", "excluded_by_look"}  # folders inside a dataset that never train (cache, look filter)
+
+
+def skipped(path: Path, root: Path | None = None) -> bool:
+    """True for a file inside a folder that never trains (SKIP_DIRS), below `root` when given."""
+    parts = path.parts
+    if root is not None:
+        try:
+            parts = path.relative_to(root).parts
+        except ValueError:
+            pass
+    return any(p in SKIP_DIRS for p in parts)
 
 
 @dataclass
@@ -129,7 +141,7 @@ def scan_dataset(cfg: TrainConfig) -> list[Item]:
         sides = cfg.dataset_sides(spec)
         n_images = 0
         for p in sorted(root.rglob("*")):
-            if p.suffix.lower() not in IMAGE_EXTS or ".rulz_cache" in p.parts:
+            if p.suffix.lower() not in IMAGE_EXTS or skipped(p, root):
                 continue
             try:
                 with Image.open(p) as im:

@@ -57,6 +57,9 @@ def forward_backward(job):
         prior = ((pred - base_pred).pow(2) * pm).sum(dim=(1, 2, 3)) / (pm.sum(dim=(1, 2, 3)) * pred.shape[1]).clamp(min=1)
         per = per + cfg.region_prior_weight * prior
     weights = loss_weight(cfg, sigma)
+    look = ctx.look(batch, cur_step) if getattr(ctx, "look", None) else None
+    if look is not None:  # look_warmup: the look filter's outliers ease in
+        weights = weights * torch.tensor(look, device=weights.device, dtype=weights.dtype)
     mults: list[float] = []
     if ctx.loss_watch is not None:
         per_cpu, sig_cpu = per.detach().cpu().tolist(), sigma.detach().cpu().tolist()
@@ -198,7 +201,11 @@ class RaceParallelMixin:
                 st, cfg = v.state, v.cfg
                 counts = self._rp_counts(reps)
                 n_total = sum(counts)
-                ctx = SimpleNamespace(cfg=cfg, loss_watch=st.get("loss_watch"))
+                look = None
+                if getattr(self, "look_outliers", None):  # look_warmup: this lane's weights for the outliers
+                    look = (lambda batch, step, _cfg=cfg, _b=st.get("batcher"): self._look_factors(
+                        batch, step, _cfg, _b, _cfg.batch_size * _cfg.gradient_accumulation))
+                ctx = SimpleNamespace(cfg=cfg, loss_watch=st.get("loss_watch"), look=look)
                 per_rep: list[list] = [[] for _ in reps]
                 for k in job_order(counts):
                     batch = next(st["batch_iter"])

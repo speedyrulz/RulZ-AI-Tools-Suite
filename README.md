@@ -878,6 +878,32 @@ dataset to open it:
 - The grid shows every picture with its caption, saved to the `.txt` file as you type, and the *Face ref* / *Body ref*
   ticks; *Train on this dataset* ticks the dataset for training.
 
+**Look consistency filter** (after Fizgig's), in the opened dataset: finds the pictures whose face drifts from the
+look you want.
+- **Baselines.** Tick *Baseline* on a few pictures that nail the look; 3 is a good number, since one photo would bake
+  its own angle and light into every score.
+- **Scan.** Every picture's largest face is embedded with the face model the likeness probes use (InsightFace ArcFace)
+  and scored by its mean cosine similarity to the baselines' faces, worst first.
+  - 0.45 and up is a solid match.
+  - 0.30 to 0.45 is the same person, drifting.
+  - Under 0.30 is likely off-look or someone else.
+  - Pictures without a face get no score; judge those by eye.
+- **Auto-suggest** marks the pictures under the fence: the median minus 1.5 times the interquartile range of the scores,
+  never under 0.25, and only with at least 4 faces. Baselines and faceless pictures are never marked.
+- **Move marked out** moves the marked pictures and their captions into `excluded_by_look/` inside the dataset, keeping
+  sub-folders. That folder never trains and nothing is deleted. *Move all back* restores them.
+- The scan is saved with the dataset as `look_scores.json`. Each picture in the grid shows its look score.
+
+On a real 60-photo set with three front-facing baselines, the scan took about a minute on the CPU. The median match was
+0.60 and the fence 0.36. It flagged an extreme close-up with the eyes cropped off and a small, distant face turned away:
+real shots, just unusual.
+
+**Warm up look outliers** (`look_warmup`, Train tab, Per-image loss watch section; off by default) is for such shots when
+you keep them. The pictures under the scan's fence start at a loss weight of `look_warmup_start` (0.4) and reach full
+weight after `look_warmup_epochs` (4) epochs of their dataset, while the identity forms from the typical pictures. It
+needs a scan of the dataset (Fizgig's `fizgig_look_scores.json` is read too), works without the loss watch, and a race
+configuration may switch it.
+
 **Several datasets per run.** On the Train tab (Dataset section) tick the datasets a run trains on. Each can train at
 its own resolutions (none picked: the run's *Training resolutions*) and has *Repeats*, how many times each of its
 images comes up per epoch (default 1): a dataset at 2 counts twice as much as one at 1, which weights a small or

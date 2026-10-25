@@ -274,6 +274,10 @@ class TrainConfig:
     loss_watch_improve_tol: float = 0.03  # relative epoch-to-epoch drop that counts as improving
     loss_watch_healthy_mult: float = 1.0  # lr multiplier for the healthy cohort (Fizgig uses 1.1)
     loss_watch_exclude_after: int = 0  # epochs at the lowest throttle before an image is excluded; 0 = never
+    # --- look consistency filter (Dataset tab): ease the scan's outliers in ---
+    look_warmup: bool = False  # images under the look filter's fence (look_scores.json) start at a lower loss weight
+    look_warmup_start: float = 0.4  # their loss weight at the start, rising linearly to 1
+    look_warmup_epochs: float = 4.0  # epochs (of their dataset) to reach full weight
     # --- identity training: region-weighted loss ---
     region_weights: bool = False  # weight the loss by region: face > person > background (needs insightface)
     face_loss_weight: float = 3.0

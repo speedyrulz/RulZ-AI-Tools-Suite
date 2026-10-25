@@ -23,7 +23,8 @@ from nicegui import app, run, ui
 from rulztrainer.config import (ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
                                 MODEL_PRESETS,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
-from rulztrainer import bodysim, facesim
+from rulztrainer import bodysim, facesim, lookfilter
+from rulztrainer.dataset import skipped as dataset_skipped
 from rulztrainer.losswatch import read_verdicts
 
 ROOT = Path(__file__).resolve().parent
@@ -1065,6 +1066,8 @@ class Form:
             loss_watch_improve_tol=float(v("loss_watch_improve_tol")),
             loss_watch_healthy_mult=float(v("loss_watch_healthy_mult")),
             loss_watch_exclude_after=int(v("loss_watch_exclude_after")),
+            look_warmup=bool(v("look_warmup")), look_warmup_start=float(v("look_warmup_start")),
+            look_warmup_epochs=float(v("look_warmup_epochs")),
             region_weights=bool(v("region_weights")), face_loss_weight=float(v("face_loss_weight")),
             body_loss_weight=float(v("body_loss_weight")), background_loss_weight=float(v("background_loss_weight")),
             face_margin=float(v("face_margin")), region_feather_cells=int(v("region_feather_cells")),
@@ -1267,6 +1270,7 @@ body {
 .rz-log { background: var(--rz-deep); border: 1px solid var(--rz-border); border-radius: 10px; color: var(--rz-text-2); }
 .rz-thumb { background: var(--rz-surface-2); border: 1px solid var(--rz-border); border-radius: 10px; overflow: hidden; }
 .rz-ds-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; width: 100%; }
+.rz-look-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; }
 .rz-ds-card { background: var(--rz-surface-2); border: 1px solid var(--rz-border); border-radius: 12px;
   overflow: hidden; transition: border-color .15s; min-width: 0; }
 .rz-ds-card:hover { border-color: var(--rz-border-strong); }
@@ -1517,6 +1521,8 @@ def path_input(f: Form, key: str, label: str, kind: str, value: str = "", width:
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 PAGE_SIZE = 24
 THUMB_SIZE = 512
+LOOK_SHOWN = 48  # look filter results shown before Show all
+LOOK_COLORS = {"match": "positive", "borderline": "warning", "drift": "negative", "no face": "grey"}
 
 
 @app.get("/rz-image")
@@ -1549,7 +1555,7 @@ def list_dataset_images(folder: str) -> list[Path]:
     root = Path(folder)
     if not root.is_dir():
         return []
-    return sorted(p for p in root.rglob("*") if p.suffix.lower() in IMAGE_EXTS and ".rulz_cache" not in p.parts)
+    return sorted(p for p in root.rglob("*") if p.suffix.lower() in IMAGE_EXTS and not dataset_skipped(p, root))
 
 
 def dataset_summary(folder: str) -> dict | None:
@@ -1804,6 +1810,8 @@ def build_dataset_tab(f: Form):
     its captions and pick references."""
     picker: DatasetPicker = f.w["datasets"]
     state = {"page": 0, "images": [], "busy": False, "open": None, "sync": False}
+    look = {"baselines": [], "scores": {}, "marks": set(), "cutoff": None, "median": None, "all": False,
+            "busy": False, "progress": "", "excluded": 0}
     native = _native_dialogs
     show_full = image_viewer()
     root_label = _relative(str(DATASETS_ROOT))
@@ -1855,6 +1863,37 @@ def build_dataset_tab(f: Form):
                  "machine running RulzTrainer; on the same machine that is a plain copy. A file with the same name is "
                  "replaced. Click a picture to see it full size. Captions are saved to the image's .txt file as you "
                  "type. Face ref / Body ref pick the images that character LoRAs are scored against.")
+        with section("Look consistency filter", "Find the pictures whose face drifts from the look you want",
+                     "face_retouching_natural", open_=False):
+            hint("Tick Baseline on a few pictures below that nail the look (3 is a good number), then Scan: every "
+                 "picture's face is compared with theirs by the face model the likeness probes use, worst first. "
+                 "0.45 and up is a solid match, 0.30 to 0.45 the same person drifting, under 0.30 likely off-look or "
+                 "someone else. Auto-suggest marks the outliers (below the median minus 1.5 times the spread, never "
+                 "under 0.25). Move marked out puts them and their captions in excluded_by_look/ inside the dataset, "
+                 "which never trains; nothing is deleted, and Move all back restores them. The scores are saved with "
+                 "the dataset, for the Train tab's Warm up look outliers.")
+            with ui.row().classes("w-full items-center gap-2"):
+                look_base_label = ui.label("").classes("text-sm")
+                ui.space()
+                look_scan_btn = ui.button("Scan", icon="search", on_click=lambda: look_scan()).props("unelevated")
+                look_suggest_btn = ui.button("Auto-suggest", icon="auto_fix_high",
+                                             on_click=lambda: look_suggest()).props("flat")
+                ui.button("Clear marks", icon="clear_all", on_click=lambda: look_clear()).props("flat")
+                look_move_btn = ui.button("Move marked out", icon="drive_file_move",
+                                          on_click=lambda: look_move_dlg.open()).props("flat color=negative")
+                look_back_btn = ui.button("Move all back", icon="undo", on_click=lambda: look_back()).props("flat")
+            look_info = ui.label("").classes("text-sm")
+            look_grid = ui.element("div").classes("rz-look-grid w-full")
+            look_more = ui.button("", on_click=lambda: look_toggle_all()).props("flat dense")
+            look_more.visible = False
+        with ui.dialog() as look_move_dlg, ui.card().classes("w-[28rem] max-w-full"):
+            look_move_title = ui.label("").classes("rz-setting-title")
+            ui.label("They move with their captions into excluded_by_look/ inside the dataset, which never trains. "
+                     "Nothing is deleted: Move all back restores them.").classes("rz-hint")
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("Cancel", on_click=look_move_dlg.close).props("flat")
+                ui.button("Move them out", icon="drive_file_move", color="negative",
+                          on_click=lambda: look_move()).props("unelevated")
         with ui.row().classes("w-full items-center gap-3"):
             upload = ui.upload(label="Upload images and captions (drop files here)", multiple=True, auto_upload=True,
                                on_upload=lambda e: on_upload(e), on_multi_upload=lambda e: after_upload()) \
@@ -1933,10 +1972,161 @@ def build_dataset_tab(f: Form):
                         ui.checkbox("Body ref", value=_relative(str(img)) in ref_set("body_refs"),
                                     on_change=lambda e, p=img: toggle_ref("body_refs", p, e.value)).props("dense") \
                             .classes("text-xs").tooltip("Use this image's body as a similarity reference")
+                        ui.checkbox("Baseline", value=str(img) in look["baselines"],
+                                    on_change=lambda e, p=img: look_toggle_base(p, e.value)).props("dense") \
+                            .classes("text-xs").tooltip("A baseline of the look consistency filter: a picture that "
+                                                        "nails the look")
+                        sc = look["scores"].get(str(img), "unscanned")
+                        if sc != "unscanned":
+                            vd = lookfilter.verdict(sc)
+                            ui.badge("no face" if sc is None else f"look {sc:.2f}", color=LOOK_COLORS[vd]) \
+                                .props("dense").tooltip(f"Look consistency: {vd}")
                         status_label = ui.label("" if cap.is_file() else "no caption yet").classes("text-xs text-grey")
                     ui.textarea(value=text, placeholder="type a caption; it is saved to the .txt automatically",
                                 on_change=lambda e, p=img, sl=status_label: save_caption(p, e.value, sl)) \
                         .props("dense outlined autogrow").classes("w-full px-2 pb-2 text-xs")
+
+    # ---------------------------------------------------------------- look consistency filter
+    def look_load(path: str):
+        data = lookfilter.load_scores(path)
+        look.update(baselines=[], scores={}, marks=set(), cutoff=None, median=None, all=False, progress="")
+        if data:
+            look.update(baselines=[b for b in data["baselines"] if Path(b).is_file()], scores=data["scores"],
+                        cutoff=data.get("cutoff"), median=data.get("median"))
+        look["excluded"] = len(lookfilter.excluded_images(path))
+
+    def look_toggle_base(p: Path, on: bool):
+        bases = [b for b in look["baselines"] if b != str(p)]
+        look["baselines"] = bases + ([str(p)] if on else [])
+        look["marks"].discard(str(p))
+        look_status()
+
+    def look_status():
+        n = len(look["baselines"])
+        look_base_label.text = (f"{n} baseline{'s' if n != 1 else ''} picked" + (
+            ": " + ", ".join(Path(b).name for b in look["baselines"]) if n else
+            " (tick Baseline on the pictures that nail the look)"))
+        look_scan_btn.enabled = n > 0 and not look["busy"]
+        look_suggest_btn.enabled = look["cutoff"] is not None and not look["busy"]
+        look_move_btn.text = f"Move marked out ({len(look['marks'])})"
+        look_move_btn.enabled = bool(look["marks"]) and not look["busy"]
+        look_back_btn.text = f"Move all back ({look['excluded']})"
+        look_back_btn.visible = look["excluded"] > 0
+        look_move_title.text = f"Move {len(look['marks'])} picture(s) out of the dataset?"
+        if look["busy"]:
+            look_info.text = look["progress"]
+        elif look["scores"]:
+            live = {str(p) for p in state["images"]}  # pictures moved out since the scan no longer count
+            here = {p: v for p, v in look["scores"].items() if p in live}
+            scored = [v for v in here.values() if v is not None]
+            fence = (f"; fence {look['cutoff']:.2f} (median {look['median']:.2f})" if look["cutoff"] is not None else
+                     "; no fence (needs 4 faces)")
+            look_info.text = (f"{len(here)} pictures scanned, {len(scored)} with a face" + fence +
+                              f"; {len(lookfilter.suggest(here, look['baselines']))} under it")
+        else:
+            look_info.text = "Not scanned yet."
+
+    async def look_render():
+        look_status()
+        live = {str(p) for p in state["images"]}
+        rows = sorted(((p, s) for p, s in look["scores"].items() if p in live),
+                      key=lambda kv: (kv[1] is None, kv[1] if kv[1] is not None else 0.0))  # worst first, no face last
+        shown = rows if look["all"] else rows[:LOOK_SHOWN]
+        look_more.visible = len(rows) > LOOK_SHOWN
+        look_more.text = (f"Show the worst {LOOK_SHOWN} only" if look["all"] else f"Show all {len(rows)}")
+        thumbs = await run.io_bound(make_thumbs, [Path(p) for p, _ in shown], Path(state["open"])) if shown else []
+        look_grid.clear()
+        with look_grid:
+            for (p, sc), thumb in zip(shown, thumbs):
+                vd = lookfilter.verdict(sc)
+                base = p in look["baselines"]
+                with ui.card().tight().classes("rz-thumb rz-look-card"):
+                    ui.image(image_url(thumb)).props("fit=cover ratio=1").classes("w-full cursor-pointer") \
+                        .on("click", lambda _, q=Path(p): show_full(q)).tooltip("Click to view full size")
+                    with ui.column().classes("gap-0 px-2 py-1 w-full min-w-0"):
+                        ui.label(Path(p).name).classes("text-xs truncate w-full")
+                        with ui.row().classes("items-center gap-1 no-wrap"):
+                            ui.badge("no face" if sc is None else f"{sc:.2f}", color=LOOK_COLORS[vd]).props("dense")
+                            if base:
+                                ui.badge("baseline", color="primary").props("dense outline")
+                            else:
+                                ui.checkbox("move out", value=p in look["marks"],
+                                            on_change=lambda e, q=p: look_mark(q, e.value)) \
+                                    .props("dense").classes("text-xs")
+
+    def look_mark(p: str, on: bool):
+        (look["marks"].add if on else look["marks"].discard)(p)
+        look_status()
+
+    async def look_toggle_all():
+        look["all"] = not look["all"]
+        await look_render()
+
+    async def look_scan():
+        if look["busy"] or not look["baselines"] or state["open"] is None:
+            return
+        folder, files, bases = state["open"], [str(p) for p in state["images"]], list(look["baselines"])
+        look.update(busy=True, progress="Loading the face model...")
+        look_status()
+
+        def progress(i, n):
+            look["progress"] = f"Scanning faces: {i} of {n}"
+
+        def work():
+            embed = lookfilter.face_embedder(progress=lambda t, f=None: look.__setitem__("progress", t))
+            scores = lookfilter.score_images(files, bases, embed, progress)
+            lookfilter.save_scores(folder, bases, scores)
+            return scores
+
+        timer = ui.timer(0.5, look_status)
+        try:
+            scores = await run.io_bound(work)
+        except Exception as e:  # noqa: BLE001
+            look["busy"] = False
+            timer.cancel()
+            look_status()
+            ui.notify(f"Look scan failed: {e}", type="negative", multi_line=True)
+            return
+        timer.cancel()
+        med, cut = lookfilter.fence(scores)
+        look.update(scores=scores, cutoff=cut, median=med, marks=set(), busy=False)
+        await look_render()
+        await render()
+        ui.notify(f"Scanned {len(scores)} pictures; saved {lookfilter.SCORES_FILE} in the dataset", type="positive")
+
+    async def look_suggest():
+        look["marks"] = lookfilter.suggest(look["scores"], look["baselines"])
+        await look_render()
+        if not look["marks"]:
+            ui.notify("Nothing is under the fence")
+
+    async def look_clear():
+        look["marks"] = set()
+        await look_render()
+
+    async def look_move():
+        look_move_dlg.close()
+        folder, marks = state["open"], sorted(look["marks"])
+        moved, errors = await run.io_bound(lookfilter.move_out, folder, marks)
+        for p in moved:  # a reference that left the dataset stops being one
+            for key in ("face_refs", "body_refs"):
+                toggle_ref(key, Path(p), False)
+        look["marks"] -= set(moved)
+        look["excluded"] = len(await run.io_bound(lookfilter.excluded_images, folder))
+        await refresh()
+        await refresh_cards()
+        ui.notify(f"Moved {len(moved)} picture(s) to {lookfilter.EXCLUDED_DIR}/" +
+                  (f"; {len(errors)} failed: {errors[0]}" if errors else ""),
+                  type="warning" if errors else "positive", multi_line=True)
+
+    async def look_back():
+        folder = state["open"]
+        moved, errors = await run.io_bound(lookfilter.move_back, folder)
+        look["excluded"] = len(await run.io_bound(lookfilter.excluded_images, folder))
+        await refresh()
+        await refresh_cards()
+        ui.notify(f"Moved {len(moved)} picture(s) back" + (f"; {len(errors)} failed: {errors[0]}" if errors else ""),
+                  type="warning" if errors else "positive", multi_line=True)
 
     async def refresh():
         if state["busy"] or state["open"] is None:
@@ -1948,6 +2138,7 @@ def build_dataset_tab(f: Form):
             info.text = (f"{images_text(len(state['images']))}, {missing} without caption" if state["images"]
                          else "No images yet: upload some, or copy a folder.")
             await render()
+            await look_render()
         finally:
             state["busy"] = False
 
@@ -1994,6 +2185,7 @@ def build_dataset_tab(f: Form):
             state["sync"] = False
         remove_btn.visible = any(_same_path(path, p) for p in registered_datasets())
         editor.visible = True
+        await run.io_bound(look_load, path)
         await refresh()
         await refresh_cards()
 
@@ -4072,6 +4264,18 @@ def build_page(local: bool = True):
                             w["loss_watch_exclude_after"] = ui.number("Exclude after N epochs at lowest throttle "
                                                                       "(0 = never)", value=d.loss_watch_exclude_after,
                                                                       precision=0).classes("w-96 max-w-full")
+                        with fields():
+                            w["look_warmup"] = ui.switch("Warm up look outliers", value=d.look_warmup).tooltip(
+                                "Images the look consistency filter (Dataset tab) put under its fence, real but "
+                                "unusual shots such as tight angles and profiles, start at a lower loss weight and "
+                                "reach full weight after a few epochs, while the identity forms from the typical "
+                                "images. Needs a look scan of the dataset; works without the loss watch.")
+                            w["look_warmup_start"] = ui.number("Start weight", value=d.look_warmup_start, min=0,
+                                                               max=1, step=0.05).classes("w-32") \
+                                .bind_visibility_from(w["look_warmup"], "value")
+                            w["look_warmup_epochs"] = ui.number("Full weight after (epochs)",
+                                                                value=d.look_warmup_epochs, min=0, step=0.5) \
+                                .classes("w-52").bind_visibility_from(w["look_warmup"], "value")
                         with advanced("Thresholds"):
                             with fields():
                                 w["loss_watch_buckets"] = ui.number("Sigma buckets", value=d.loss_watch_buckets,

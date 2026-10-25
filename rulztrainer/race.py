@@ -51,7 +51,8 @@ RACE_KEYS: dict[str, tuple[str, ...]] = {
     "LoRA rank & layers": (
         "lora_rank", "lora_alpha", "lora_targets", "lora_blocks", "train_text_embedder", "lora_dropout",
         "network_type", "lokr_factor"),
-    "Data & augmentation": ("caption_dropout", "flip_augment", "crop_augment", "crop_augment_weight"),
+    "Data & augmentation": ("caption_dropout", "flip_augment", "crop_augment", "crop_augment_weight", "look_warmup",
+                            "look_warmup_start", "look_warmup_epochs"),
 }
 ALLOWED = {k for keys in RACE_KEYS.values() for k in keys}
 REGION_KEYS = ("face_loss_weight", "body_loss_weight", "background_loss_weight", "face_margin", "region_feather_cells")

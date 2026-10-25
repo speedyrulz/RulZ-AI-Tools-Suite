@@ -332,6 +332,7 @@ class Trainer(RaceParallelMixin):
         self.race_region_dirs: dict[str, Path | None] = {}  # configuration -> its own region-map folder
         self.race_id_loss = None  # the identity loss shared by the configurations that use it
         self.race_parallel = False  # race_parallel: one configuration per GPU at the same time (race_parallel.py)
+        self.look_outliers: set[str] = set()  # look_warmup: the look filter's outlier images (_look_outlier_images)
         self.compiled = False  # torch.compile active on the DiT blocks
         self.dp_quiet_steps = 0  # consecutive data-parallel steps without a new compile
         self.replicas: list[tuple] = []  # (model, device) for every training copy, primary first
@@ -636,6 +637,7 @@ class Trainer(RaceParallelMixin):
         log.info("Dataset: %d images in %s", len({it.image for it in items}),
                  ", ".join(spec.path for spec in cfg.dataset_specs()))
         items = self.analyze_dataset(items)
+        self.look_outliers = self._look_outlier_images(cfg, items)
         self.prepare_cache(items)
 
         self.status.update(stage="loading transformer", step=0, total=cfg.steps)
@@ -851,6 +853,10 @@ class Trainer(RaceParallelMixin):
                 prior = ((pred - base_pred).pow(2) * pm).sum(dim=(1, 2, 3)) / (pm.sum(dim=(1, 2, 3)) * pred.shape[1]).clamp(min=1)
                 per = per + cfg.region_prior_weight * prior
             weights = loss_weight(cfg, sigma)
+            look = self._look_factors(batch, cur_step, cfg, self.batcher,
+                                      cfg.batch_size * cfg.gradient_accumulation * len(self.replicas))
+            if look is not None:  # look_warmup: the look filter's outliers ease in
+                weights = weights * torch.tensor(look, device=weights.device, dtype=weights.dtype)
             mults: list[float] = []
             if self.loss_watch is not None:
                 per_cpu, sig_cpu = per.detach().cpu().tolist(), sigma.detach().cpu().tolist()
@@ -1866,6 +1872,44 @@ class Trainer(RaceParallelMixin):
             log.info("Resolution step-up: now training at %s from step %d (%d items)", self._stage_label(), step,
                      len(items))
         self.status.update(resolution=self._stage_label(), res_stage=self.res_stage, res_stages=len(self.sides))
+
+    def _look_outlier_images(self, cfg, items) -> set[str]:
+        """look_warmup: the images (as the items name them) that the look consistency filter's saved scan puts under
+        its fence, in every dataset of the run."""
+        race_rows = self.race_rows or []
+        if not (cfg.look_warmup or any(r[1].look_warmup for r in race_rows)):
+            return set()
+        from . import lookfilter
+
+        found, scanned = set(), 0
+        for spec in cfg.dataset_specs():
+            if lookfilter.load_scores(spec.path) is not None:
+                scanned += 1
+            found |= lookfilter.outliers(spec.path)
+        if not scanned:
+            log.warning("look_warmup: no look consistency scan in the dataset folder(s) (look_scores.json): run the "
+                        "Look consistency filter on the Dataset tab first; warm-up off this run")
+            return set()
+        names = {str(it.image) for it in items if str(Path(it.image).resolve()) in found}
+        log.info("look_warmup: %d look outlier image(s) start at a loss weight of x%g, full after %g epoch(s)",
+                 len(names), cfg.look_warmup_start, cfg.look_warmup_epochs)
+        return names
+
+    def _look_factors(self, batch, cur_step: int, cfg, batcher, images_per_step: int) -> list[float] | None:
+        """Each batch item's look warm-up loss weight (None: all 1). The epoch is the images trained so far over the
+        images of one epoch (repeats counted) of the configuration's own image queue."""
+        if not getattr(self, "look_outliers", None) or not cfg.look_warmup or batcher is None:
+            return None
+        cache = self.__dict__.setdefault("_look_epoch_size", {})
+        size = cache.get(id(batcher))
+        if size is None:
+            size = cache[id(batcher)] = max(1, sum(max(1, int(it.repeats or 1)) for it in batcher.items))
+        from .lookfilter import warmup_factor
+
+        f = warmup_factor((cur_step - 1) * images_per_step / size, cfg.look_warmup_start, cfg.look_warmup_epochs)
+        if f >= 1.0:
+            return None
+        return [f if str(it.image) in self.look_outliers else 1.0 for it in batch]
 
     def _refresh_batcher_weights(self) -> None:
         """Combine curriculum weights with loss-watch exclusions into the batcher."""
