@@ -1337,7 +1337,7 @@ class Trainer:
             v = race_mod.Variant(i, name, vcfg, over, names)
             v.init_lora(wrappers, base.seed)
             v.state["items"] = race_mod.variant_items(items, vcfg, self.race_region_dirs.get(name))
-            v.state["controller"] = LikenessController(vcfg)
+            v.state["controller"] = LikenessController(vcfg, **self._controller_ceilings())
             n_w = sum(v.down[m].numel() + v.up[m].numel() for m in names)
             log.info("Race configuration %s: %d LoRA modules, %.2fM weights (rank %d, alpha %g), %d dataset items",
                      name, len(names), n_w / 1e6, v.rank, v.alpha, len(v.state["items"]))
@@ -1804,7 +1804,7 @@ class Trainer:
             return None
         from .likeness import LikenessController, classify_counts, face_area_fractions
 
-        ctrl = LikenessController(cfg)
+        ctrl = LikenessController(cfg, **self._controller_ceilings())
         if cfg.likeness_curriculum:
             if self.face_scorer is None:
                 log.warning("Curriculum needs face_refs (face detector); curriculum disabled")
@@ -1819,6 +1819,15 @@ class Trainer:
                  cfg.probe_every, "+".join(k for k, p in (("face", cfg.probe_face_prompt), ("body", cfg.probe_body_prompt)) if p),
                  cfg.likeness_track_best, cfg.likeness_patience, cfg.likeness_lr_control, cfg.likeness_curriculum)
         return ctrl
+
+    def _controller_ceilings(self) -> dict:
+        """The references' own self-similarity per scorer (raw percent), the 100 of the normalized scale."""
+        out = {}
+        for key, scorer in (("face_ceiling", self.face_scorer), ("body_ceiling", self.body_scorer)):
+            sim = getattr(scorer, "ref_self_similarity", None) if scorer is not None else None
+            if sim is not None:
+                out[key] = float(sim) * 100.0
+        return out
 
     @torch.no_grad()
     def _probe_with(self, slots, step):
@@ -1888,10 +1897,20 @@ class Trainer:
         append_record(self.job_dir, rec)
         fmt = lambda v: "n/a" if v is None else f"{v:.1f}%"  # noqa: E731
         who = f"[{self.race.active.name}] " if self._race_running() else ""
-        log.info("%sProbe step %d: face %s body %s combined %s | ema face %s body %s combined %s | best %s @%s "
-                 "| lr x%.2f | face bias %+.2f (%.1fs)", who, step, fmt(face), fmt(body), fmt(rec.combined),
-                 fmt(rec.face_ema), fmt(rec.body_ema), fmt(rec.combined_ema), fmt(rec.best), rec.best_step,
-                 rec.lr_factor, rec.face_bias, time.time() - t0)
+        if self.controller.normalize and self.controller.n_probes == 1:
+            log.info("Likeness scale: %s", self.controller.describe_scale())
+        if self.controller.normalize:
+            log.info("%sProbe step %d: face %s body %s (normalized %s / %s, combined %s) | ema face %s body %s "
+                     "(normalized %s / %s, combined %s) | best %s @%s | lr x%.2f | face bias %+.2f (%.1fs)", who, step,
+                     fmt(face), fmt(body), fmt(rec.face_norm), fmt(rec.body_norm), fmt(rec.combined),
+                     fmt(rec.face_ema), fmt(rec.body_ema), fmt(rec.face_norm_ema), fmt(rec.body_norm_ema),
+                     fmt(rec.combined_ema), fmt(rec.best), rec.best_step, rec.lr_factor, rec.face_bias,
+                     time.time() - t0)
+        else:
+            log.info("%sProbe step %d: face %s body %s combined %s | ema face %s body %s combined %s | best %s @%s "
+                     "| lr x%.2f | face bias %+.2f (%.1fs)", who, step, fmt(face), fmt(body), fmt(rec.combined),
+                     fmt(rec.face_ema), fmt(rec.body_ema), fmt(rec.combined_ema), fmt(rec.best), rec.best_step,
+                     rec.lr_factor, rec.face_bias, time.time() - t0)
         if "step_up" in actions:
             log.info("Resolution step-up: stage %d stalled for %d probe(s) (stage best %s)", rec.stage + 1,
                      rec.stage_since_improve, fmt(rec.stage_best))

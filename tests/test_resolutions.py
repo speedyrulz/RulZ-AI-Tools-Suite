@@ -74,7 +74,7 @@ def test_scan_dataset_items_per_resolution(tmp_path):
 def _ctrl(**kw):
     base = dict(resolutions=[0.25, 1.0, 4.0], resolution_step_up=True, probe_every=10, probe_ema=0.0,
                 likeness_noise_band=1.0, likeness_track_best=False, likeness_patience=1, face_refs=["x.png"],
-                face_weight=1.0, body_weight=0.0)
+                face_weight=1.0, body_weight=0.0, likeness_normalize=False)  # the step-up mechanics on raw scores
     base.update(kw)
     return LikenessController(TrainConfig(**base))
 

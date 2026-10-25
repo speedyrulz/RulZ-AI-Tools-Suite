@@ -256,6 +256,7 @@ class TrainConfig:
     probe_cfg: float = 1.0
     probe_ema: float = 0.5  # smoothing of probe scores (weight on the previous value)
     likeness_noise_band: float = 1.0  # percent points a change must exceed to count
+    likeness_normalize: bool = True  # score face and body on one scale (0 = a stranger, 100 = the references) first
     likeness_track_best: bool = True  # keep <job>_best.safetensors at the best smoothed score
     likeness_patience: int = 0  # stop after N probes without improvement; 0 = never
     likeness_lr_control: bool = False  # bounded lr multiplier driven by the probe trend

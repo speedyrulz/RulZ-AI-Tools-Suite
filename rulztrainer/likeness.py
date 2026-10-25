@@ -16,6 +16,14 @@ size, turbo LoRA) and scores it against the face / body references. The controll
                                    more often and shift the timestep distribution toward lower (detail) or
                                    higher (structure) noise
 
+Scores. The face score is an ArcFace cosine (a stranger ~10-25, the references against each other ~60-80); the
+body score is a proportion match where every human already scores ~80 and the references ~90-96. Raw, the two live
+on different scales: a 0.7 / 0.3 average is really ~93% face, and "the face lags the body" is always true. With
+`likeness_normalize` (the default) each score is first mapped onto one scale, 0 = what a stranger scores (the
+step-0 probe: the base model without the LoRA, or a default) and 100 = what the references score against each
+other (their self-similarity, or a default), and the combined score, the noise band, the curriculum, the lr
+control and the best / stop / race decisions all run on those.
+
 The controller never touches the loss; it only steers sampling, lr and when to stop.
 """
 from __future__ import annotations
@@ -36,6 +44,21 @@ def combine(face, body, face_weight: float, body_weight: float):
     return sum(v * w for v, w in parts) / sum(w for _, w in parts)
 
 
+# the raw-score scale each probe kind is normalized on: floor = a stranger's score (replaced by the step-0 probe when
+# there is one), ceiling = the references' own self-similarity (replaced by the measured one when there are 2+ refs)
+FLOOR_DEFAULT = {"face": 20.0, "body": 80.0}
+CEILING_DEFAULT = {"face": 75.0, "body": 95.0}
+MIN_SPAN = {"face": 10.0, "body": 5.0}  # the ceiling stays at least this far above the floor
+NORM_MAX = 120.0  # beating the references' self-similarity still counts, up to here
+
+
+def normalize(value, floor: float, ceiling: float):
+    """A raw score as a percent of the way from `floor` (0) to `ceiling` (100), clipped to 0..NORM_MAX."""
+    if value is None:
+        return None
+    return max(0.0, min(NORM_MAX, (value - floor) / (ceiling - floor) * 100.0))
+
+
 @dataclass
 class ProbeRecord:
     step: int
@@ -54,11 +77,22 @@ class ProbeRecord:
     stage: int = 0  # resolution stage index (resolution_step_up)
     stage_best: float | None = None
     stage_since_improve: int = 0
+    # normalized scores (likeness_normalize): 0 = a stranger, 100 = the references; combined* are on this scale too
+    face_norm: float | None = None
+    body_norm: float | None = None
+    face_norm_ema: float | None = None
+    body_norm_ema: float | None = None
+    scale: dict = field(default_factory=dict)  # {"face": [floor, ceiling], "body": [floor, ceiling]} raw points
 
 
 class LikenessController:
-    def __init__(self, cfg):
+    def __init__(self, cfg, face_ceiling: float | None = None, body_ceiling: float | None = None):
+        """face_ceiling / body_ceiling: the references' self-similarity in raw percent (None: the default)."""
         self.cfg = cfg
+        self.normalize = bool(getattr(cfg, "likeness_normalize", True))
+        self.ceiling = {"face": face_ceiling if face_ceiling is not None else CEILING_DEFAULT["face"],
+                        "body": body_ceiling if body_ceiling is not None else CEILING_DEFAULT["body"]}
+        self.floor = {"face": None, "body": None}  # None: the default, until a step-0 probe sets it
         self.face_ema = None
         self.body_ema = None
         self.combined_ema = None
@@ -99,6 +133,32 @@ class LikenessController:
         a = self.cfg.probe_ema
         return a * prev + (1 - a) * value
 
+    def scale(self, kind: str) -> tuple[float, float]:
+        """(floor, ceiling) in raw points for "face" / "body"; the ceiling at least MIN_SPAN above the floor."""
+        floor = self.floor[kind] if self.floor[kind] is not None else FLOOR_DEFAULT[kind]
+        return floor, max(self.ceiling[kind], floor + MIN_SPAN[kind])
+
+    def norm(self, kind: str, value):
+        """A raw score on the normalized scale (the raw score itself with likeness_normalize off)."""
+        if value is None or not self.normalize:
+            return value
+        return normalize(value, *self.scale(kind))
+
+    def _set_floors(self, face, body) -> None:
+        """The step-0 probe (the base model, no LoRA) is what a stranger scores: the floor of each scale, kept at
+        least MIN_SPAN below the ceiling so a base model that already resembles the references leaves room."""
+        for kind, value in (("face", face), ("body", body)):
+            if value is not None and self.floor[kind] is None:
+                self.floor[kind] = min(value, self.ceiling[kind] - MIN_SPAN[kind])
+
+    def describe_scale(self) -> str:
+        parts = []
+        for kind in ("face", "body"):
+            lo, hi = self.scale(kind)
+            src = "step-0 probe" if self.floor[kind] is not None else "default"
+            parts.append(f"{kind} {lo:.1f} -> {hi:.1f} (floor: {src})")
+        return "; ".join(parts) + " (raw percent: 0 = a stranger, 100 = the references' self-similarity)"
+
     def update(self, step: int, face: float | None, body: float | None, images: list[str] | None = None):
         """Feed one probe result. Returns (record, actions) where actions may contain
         save_best (bool), stop (bool), lr_ratio (float, new/old), face_bias (float), step_up (int),
@@ -107,15 +167,18 @@ class LikenessController:
         cfg = self.cfg
         actions: dict = {}
         self.n_probes += 1
+        if self.normalize and step == 0:
+            self._set_floors(face, body)
         self.face_ema = self._ema(self.face_ema, face)
         self.body_ema = self._ema(self.body_ema, body)
-        comb = combine(self.face_ema, self.body_ema, cfg.face_weight, cfg.body_weight)
+        face_n, body_n = self.norm("face", self.face_ema), self.norm("body", self.body_ema)
+        comb = combine(face_n, body_n, cfg.face_weight, cfg.body_weight)
         self.combined_ema = comb
         band = cfg.likeness_noise_band
-        if self.face_ema is not None and face is not None:
-            if self.face_best is None or self.face_ema > self.face_best:
-                self.face_best = self.face_ema
-            if self.face_ema < self.face_best - 2 * band:
+        if face_n is not None and face is not None:
+            if self.face_best is None or face_n > self.face_best:
+                self.face_best = face_n
+            if face_n < self.face_best - 2 * band:
                 self.face_drop_count += 1
             else:
                 self.face_drop_count = 0
@@ -153,16 +216,18 @@ class LikenessController:
                     actions["lr_ratio"] = new / self.lr_factor
                     self.lr_factor = new
             self.prev_combined = comb
-        if cfg.likeness_curriculum and self.face_ema is not None and self.body_ema is not None:
-            gap = self.body_ema - self.face_ema  # > 0: the face lags the body
+        if cfg.likeness_curriculum and face_n is not None and body_n is not None:
+            gap = body_n - face_n  # > 0: the face lags the body (both on the normalized scale)
             bias = max(-1.0, min(1.0, gap / 20.0)) * cfg.likeness_curriculum_strength
             if abs(bias - self.face_bias) > 0.02:
                 self.face_bias = bias
                 actions["face_bias"] = bias
-        rec = ProbeRecord(step, face, body, combine(face, body, cfg.face_weight, cfg.body_weight),
+        rec = ProbeRecord(step, face, body,
+                          combine(self.norm("face", face), self.norm("body", body), cfg.face_weight, cfg.body_weight),
                           self.face_ema, self.body_ema, comb, self.lr_factor, self.face_bias, self.best,
                           self.best_step, self.since_improve, list(images or []), self.stage, self.stage_best,
-                          self.stage_since_improve)
+                          self.stage_since_improve, self.norm("face", face), self.norm("body", body), face_n, body_n,
+                          {k: list(self.scale(k)) for k in ("face", "body")} if self.normalize else {})
         if "step_up" in actions:
             self.enter_stage(actions["step_up"])
         return rec, actions
@@ -173,7 +238,9 @@ class LikenessController:
                 "face_ema": self.face_ema, "body_ema": self.body_ema, "combined_ema": self.combined_ema,
                 "n_probes": self.n_probes, "stage": self.stage, "n_stages": self.n_stages,
                 "stage_best": self.stage_best, "stage_since_improve": self.stage_since_improve,
-                "id_loss_vetoed": self.id_loss_vetoed}
+                "id_loss_vetoed": self.id_loss_vetoed, "normalize": self.normalize,
+                "face_norm_ema": self.norm("face", self.face_ema), "body_norm_ema": self.norm("body", self.body_ema),
+                "scale": {k: list(self.scale(k)) for k in ("face", "body")} if self.normalize else {}}
 
 
 def append_record(job_dir: Path, rec: ProbeRecord) -> None:

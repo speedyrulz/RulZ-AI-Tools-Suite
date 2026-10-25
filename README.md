@@ -632,6 +632,18 @@ and only changes beyond `likeness_noise_band` count. The controller then, each i
 The scores never enter the loss; they steer data, lr and stopping. Use the same reference set and prompts for a
 whole run so the series is comparable.
 
+**One scale for face and body** (`likeness_normalize`, on by default). Raw, the two scores are not comparable: the
+face score is an ArcFace cosine (a stranger scores ~10-25, your references against each other ~60-80), the body score
+a proportion match where every human already scores ~80 and the references ~90-96. A run's face score moves ~60
+points, its body score ~10, so a 0.7 / 0.3 average is really ~93% face and "the face lags the body" is true all run.
+Each score is therefore mapped first onto one scale, 0 = what a stranger scores and 100 = what the references score
+against each other: the floor is the step-0 probe (the base model without the LoRA; `probe_at_start`) or a default
+(face 20, body 80), the ceiling the references' self-similarity when two or more are given, or a default (face 75,
+body 95), with scores above the ceiling counting up to 120. The combined score, the noise band, the curriculum gap,
+the lr control, the best checkpoint, early stop and the race drops all use the normalized values; the log, the
+Monitor and `likeness.jsonl` show the raw face / body next to them (`face_norm`, `body_norm`, `scale`). Earlier runs'
+`likeness.jsonl` keep their raw combined scores.
+
 ## Configuration race (`race`)
 
 Not sure which settings suit a dataset? `race: true` trains several configurations in one run and lets the likeness

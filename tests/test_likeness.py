@@ -12,9 +12,13 @@ from rulztrainer.dataset import BucketBatcher, Item  # noqa: E402
 
 
 def _cfg(**kw):
-    return TrainConfig(probe_every=10, probe_ema=0.0, likeness_noise_band=1.0, likeness_track_best=True,
-                       likeness_patience=3, likeness_lr_control=True, likeness_lr_min=0.5, likeness_lr_max=2.0,
-                       likeness_lr_step=0.1, likeness_curriculum=True, likeness_curriculum_strength=1.0, **kw)
+    """Controller settings; the mechanics tests run on the raw scores (likeness_normalize off), the normalization
+    tests switch it on."""
+    base = dict(probe_every=10, probe_ema=0.0, likeness_noise_band=1.0, likeness_track_best=True,
+                likeness_patience=3, likeness_lr_control=True, likeness_lr_min=0.5, likeness_lr_max=2.0,
+                likeness_lr_step=0.1, likeness_curriculum=True, likeness_curriculum_strength=1.0,
+                likeness_normalize=False)
+    return TrainConfig(**{**base, **kw})
 
 
 def test_controller_best_stop_lr_and_curriculum():
@@ -88,3 +92,40 @@ def test_batcher_weights_and_curriculum(tmp_path):
     assert L.timestep_logit_shift(1.0) < 0 < L.timestep_logit_shift(-1.0)
     assert L.probe_body_size(512) == (416, 624) and L.probe_body_size(1024) == (832, 1248)  # ~ the face's area
     assert L.probe_body_size(256) == (256, 384)
+
+
+def test_normalized_scores_put_face_and_body_on_one_scale():
+    """Raw, a body score moves ~10 points over a run and a face score ~60. Normalized (0 = the step-0 probe, 100 = the
+    references' self-similarity) both count as the weights say, the curriculum reads the gap on that scale, and the
+    log / record keep the raw values next to the normalized ones."""
+    c = L.LikenessController(_cfg(likeness_normalize=True, face_weight=0.5, body_weight=0.5), face_ceiling=70.0,
+                             body_ceiling=94.0)
+    rec, _ = c.update(0, 15.0, 82.0)  # the base model: the floors
+    assert c.scale("face") == (15.0, 70.0) and c.scale("body") == (82.0, 94.0)
+    assert rec.face_norm == 0.0 and rec.body_norm == 0.0 and rec.combined_ema == 0.0
+    assert rec.face == 15.0 and rec.body == 82.0 and rec.scale == {"face": [15.0, 70.0], "body": [82.0, 94.0]}
+    rec, act = c.update(10, 42.5, 88.0)  # both halfway to the references
+    assert abs(rec.face_norm - 50.0) < 1e-9 and abs(rec.body_norm - 50.0) < 1e-9 and abs(rec.combined_ema - 50.0) < 1e-9
+    assert abs(c.face_bias) < 1e-9  # no gap on the normalized scale (raw: 88 - 42.5 = 45.5 points)
+    rec, act = c.update(20, 42.5, 94.0)  # the body reaches the references, the face does not: face-heavy
+    assert rec.body_norm == 100.0 and c.face_bias > 0.9
+    rec, _ = c.update(30, 80.0, 82.0)  # above the ceiling counts, up to 120; the floor clips at 0
+    assert rec.face_norm == 118.18181818181819 or abs(rec.face_norm - 118.18) < 0.01
+    assert rec.body_norm == 0.0
+
+
+def test_normalization_defaults_floor_clamp_and_switch():
+    c = L.LikenessController(_cfg(likeness_normalize=True))  # no step-0 probe, no reference self-similarity
+    rec, _ = c.update(25, 20.0, 80.0)
+    assert c.scale("face") == (20.0, 75.0) and c.scale("body") == (80.0, 95.0)
+    assert rec.face_norm == 0.0 and rec.body_norm == 0.0
+    # a base model that already resembles the references: the floor stays MIN_SPAN below the ceiling
+    c = L.LikenessController(_cfg(likeness_normalize=True), face_ceiling=60.0)
+    c.update(0, 58.0, None)
+    assert c.scale("face") == (50.0, 60.0)
+    assert "step-0 probe" in c.describe_scale() and "default" in c.describe_scale()
+    # the switch off: the old raw behaviour
+    c = L.LikenessController(_cfg())
+    rec, _ = c.update(0, 15.0, 82.0)
+    assert rec.combined_ema == 0.7 * 15.0 + 0.3 * 82.0 and rec.face_norm == 15.0 and rec.scale == {}
+    assert "face_norm_ema" in c.state() and c.state()["normalize"] is False

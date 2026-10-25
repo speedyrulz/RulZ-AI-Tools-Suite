@@ -777,6 +777,7 @@ class Form:
             probe_seeds=int(v("probe_seeds")), probe_seed=int(v("probe_seed")), probe_size=int(v("probe_size")),
             probe_steps=int(v("probe_steps")), probe_cfg=float(v("probe_cfg")), probe_ema=float(v("probe_ema")),
             likeness_noise_band=float(v("likeness_noise_band")), likeness_track_best=bool(v("likeness_track_best")),
+            likeness_normalize=bool(v("likeness_normalize")),
             likeness_patience=int(v("likeness_patience")), likeness_lr_control=bool(v("likeness_lr_control")),
             likeness_lr_min=float(v("likeness_lr_min")), likeness_lr_max=float(v("likeness_lr_max")),
             likeness_lr_step=float(v("likeness_lr_step")), likeness_curriculum=bool(v("likeness_curriculum")),
@@ -3129,6 +3130,11 @@ def build_page(local: bool = True):
                                          "size do")
                         subhead("Controller actions")
                         with fields():
+                            w["likeness_normalize"] = ui.switch("Normalize face and body scores", value=d.likeness_normalize) \
+                                .tooltip("Score each on one scale first: 0 = what a stranger scores (the step-0 probe), "
+                                         "100 = what your references score against each other. Raw, a body score "
+                                         "moves ~10 points over a run and a face score ~60, so the combined score, "
+                                         "the curriculum and the noise band would follow the face alone.")
                             w["likeness_track_best"] = ui.switch("Keep best checkpoint (<job>_best.safetensors)",
                                                                  value=d.likeness_track_best)
                             w["likeness_patience"] = ui.number("Early stop after N probes w/o improvement (0 = never)",
@@ -3515,8 +3521,10 @@ def build_page(local: bool = True):
                     lk = st.get("likeness") or {}
                     last = probes[-1]
                     f2 = lambda x: "n/a" if x is None else f"{x:.1f}%"  # noqa: E731
+                    norm = (f" (normalized {f2(last.get('face_norm_ema'))} / {f2(last.get('body_norm_ema'))})"
+                            if last.get("face_norm_ema") is not None or last.get("body_norm_ema") is not None else "")
                     probe_label.text = (f"Probe @ step {last['step']}: face {f2(last.get('face_ema'))} body {f2(last.get('body_ema'))}"
-                                        f" combined {f2(last.get('combined_ema'))} | best {f2(lk.get('best'))} @ step {lk.get('best_step')}"
+                                        f"{norm} combined {f2(last.get('combined_ema'))} | best {f2(lk.get('best'))} @ step {lk.get('best_step')}"
                                         f" | {lk.get('since_improve', 0)} probe(s) since improvement | lr x{lk.get('lr_factor', 1.0):.2f}"
                                         f" | face bias {lk.get('face_bias', 0.0):+.2f}" + (" | STOPPED" if lk.get("stopped") else ""))
                     latest_imgs = list(last.get("images") or [])[:6]
@@ -3728,6 +3736,12 @@ neutral, and auto crops *hurt* when the crops had to be upscaled. Suggested reci
 high-resolution (crops are never upscaled by default), timesteps left at `logit_normal`.
 LoRA rules of thumb: LoRA lr is ~10x a full fine-tune lr and nearly rank-independent; keep MLP layers in the
 targets; small batches with more steps beat large batches.
+
+**Probe scores.** The face score (ArcFace: a stranger ~10-25, the references against each other ~60-80) and the body
+score (proportions: every human ~80, the references ~90-96) are not on one scale, so with *Normalize face and body
+scores* (default on) each is first mapped to 0 = a stranger's score (the step-0 probe, so keep *Probe at start* on)
+and 100 = the references' own self-similarity. The combined score, best checkpoint, early stop, curriculum and race
+decisions use these; the Monitor shows the raw scores next to them.
 
 ## Configuration race
 *Configuration race* (Train tab, after the likeness probes) trains several configurations in turn: each trains until
