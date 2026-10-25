@@ -14,9 +14,11 @@ Double-click `run.bat` (creates a venv and installs PySide6 + requests on first 
 
 ## Set up the model (managed mode)
 
-1. **llama.cpp** (build b11823, CUDA 13.4, supports RTX 50-series) is included in `llama.cpp\` and auto-detected.
-   To update it, download `llama-bXXXX-bin-win-cuda-13.x-x64.zip` + `cudart-llama-bin-win-cuda-13.x-x64.zip` from
-   <https://github.com/ggml-org/llama.cpp/releases> and unzip both over that folder.
+1. **llama.cpp**: download `llama-bXXXX-bin-win-cuda-13.x-x64.zip` + `cudart-llama-bin-win-cuda-13.x-x64.zip` from
+   <https://github.com/ggml-org/llama.cpp/releases> (CUDA 13 builds support RTX 50-series) and unzip both into a
+   `llama.cpp\` folder next to `main.py`, where it's auto-detected. Unzip newer builds over it to update.
+   Installing the app with the [RulZ AI Tools Suite](https://github.com/speedyrulz/RulZ-AI-Tools-Suite) launcher
+   does this for you.
 2. Download a vision-capable **GGUF** model and its **mmproj** file (e.g. Qwen2.5-VL / Qwen3-VL, Gemma 3, InternVL, MiniCPM-V, Mistral Small 3.x vision).
 3. Settings ▸ Backend: choose the exe, model and mmproj. Settings ▸ GPUs: tick GPUs and the mode.
 4. Press **Caption All** (or select images ▸ **Caption Selected**). The servers start on first use and stay loaded; **Server ▸ Stop Servers** frees VRAM.

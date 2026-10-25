@@ -59,20 +59,12 @@ export const CATALOG: CatalogApp[] = [
     category: 'Photos',
     repo: 'speedyrulz/RulZ-Image-Tournament',
     branch: 'main',
-    install: {
-      kind: 'source',
-      setup: [
-        {
-          label: 'Building the app with the C# compiler built into Windows',
-          run: ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'build.ps1']
-        }
-      ]
-    },
-    launch: { target: 'bin\\RulZ Image Tournament.exe' },
+    install: { kind: 'zip', asset: '^RulZ-Image-Tournament-v[\\d.]+-win64\\.zip$' },
+    launch: { target: 'RulZ Image Tournament.exe' },
     requirements: [{ id: 'dotnet-fx' }],
     folderName: 'RulZ Image Tournament',
     detect: ['%LOCALAPPDATA%\\Programs\\RulZ Image Tournament\\RulZ Image Tournament.exe'],
-    notes: ['Builds in a few seconds; no SDK or Visual Studio needed.'],
+    notes: ['A single .exe. Settings and tournament progress are kept in %APPDATA%\\RulZ Image Tournament.'],
     highlights: ['Side by side & split view', 'Synced zoom and pan', 'Undo', 'Resumes where you left off']
   },
   {

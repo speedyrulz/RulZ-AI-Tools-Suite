@@ -1,4 +1,5 @@
-@import 'tailwindcss';
+/* Only the renderer is scanned for class names (not the app submodules in apps/). */
+@import 'tailwindcss' source('../');
 
 /* Black and red, matching the RulZ logo (its red is #ED000D). */
 :root {

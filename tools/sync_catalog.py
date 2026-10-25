@@ -2,7 +2,8 @@
 
 For every app it copies README.md, the images the README references (into catalog/<app>/repo/, keeping their
 paths), and the app icon as icon.png (256 px) and icon.ico. Screenshots in catalog/<app>/screenshots/ are left
-alone. Sources are the local checkouts below when they exist, otherwise the GitHub repositories.
+alone. The source is the app's submodule in apps/ (run `git submodule update --init` first, or
+`git submodule update --remote` for the newest commits); without it, the file comes from GitHub.
 
     python tools/sync_catalog.py            # all apps
     python tools/sync_catalog.py llm-suite  # just one
@@ -19,17 +20,15 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parent.parent
 CATALOG = ROOT / "catalog"
 
-# id: (local checkout, GitHub repo, branch, icon png, icon ico or None)
+# id: (GitHub repo = submodule folder in apps/, branch, icon png, icon ico or None)
 APPS = {
-    "rulz-trainer": (r"C:\ai\RulzTrainer", "speedyrulz/RulzTrainer", "main", "assets/icon.png", None),
-    "image-organizer": (r"C:\coding\RulZ Image Organizer", "speedyrulz/RulZ-Image-Organizer", "main",
-                        "assets/icon.png", "assets/icon.ico"),
-    "image-tournament": (r"C:\coding\RulZ Image Tournament", "speedyrulz/RulZ-Image-Tournament", "main",
-                         "assets/app.png", "assets/app.ico"),
-    "llm-suite": (r"C:\coding\RulZ LLM Suite", "speedyrulz/rulz-llm-suite", "master", "build/icon.png", "build/icon.ico"),
-    "training-captioner": (r"C:\coding\Rulz Training Captioner", None, "main", "assets/icon.png", "assets/icon.ico"),
-    "clip-extractor": (r"C:\simplest-video-edit", "speedyrulz/rulz-simple-video-clip-extractor", "main",
-                       "simplecut/assets/icon256.png", "simplecut/assets/icon.ico"),
+    "rulz-trainer": ("speedyrulz/RulzTrainer", "main", "assets/icon.png", None),
+    "image-organizer": ("speedyrulz/RulZ-Image-Organizer", "main", "assets/icon.png", "assets/icon.ico"),
+    "image-tournament": ("speedyrulz/RulZ-Image-Tournament", "main", "assets/app.png", "assets/app.ico"),
+    "llm-suite": ("speedyrulz/rulz-llm-suite", "master", "build/icon.png", "build/icon.ico"),
+    "training-captioner": ("speedyrulz/Rulz-Training-Captioner", "main", "assets/icon.png", "assets/icon.ico"),
+    "clip-extractor": ("speedyrulz/rulz-simple-video-clip-extractor", "main", "simplecut/assets/icon256.png",
+                       "simplecut/assets/icon.ico"),
 }
 
 IMAGE_REFS = [
@@ -40,11 +39,10 @@ IMAGE_REFS = [
 
 
 class Source:
-    def __init__(self, local, repo, branch):
-        self.local = Path(local) if local and Path(local).exists() else None
+    def __init__(self, repo, branch):
+        sub = ROOT / "apps" / repo.split("/")[1]
+        self.local = sub if (sub / "README.md").exists() else None
         self.repo, self.branch = repo, branch
-        if not self.local and not repo:
-            raise SystemExit(f"No source for {local}: not on this PC and not on GitHub")
 
     def read(self, rel):
         if self.local:
@@ -58,12 +56,12 @@ class Source:
             return None
 
     def __str__(self):
-        return str(self.local) if self.local else f"github.com/{self.repo}@{self.branch}"
+        return f"apps/{self.local.name}" if self.local else f"github.com/{self.repo}@{self.branch}"
 
 
 def sync(app_id):
-    local, repo, branch, icon_png, icon_ico = APPS[app_id]
-    src = Source(local, repo, branch)
+    repo, branch, icon_png, icon_ico = APPS[app_id]
+    src = Source(repo, branch)
     out = CATALOG / app_id
     out.mkdir(parents=True, exist_ok=True)
     (out / "screenshots").mkdir(exist_ok=True)

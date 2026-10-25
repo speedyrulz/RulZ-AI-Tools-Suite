@@ -11,9 +11,9 @@ click, keep it updated, and launch it, all from a single black-and-red window.
 | --- | --- | --- |
 | [RulzTrainer](https://github.com/speedyrulz/RulzTrainer) | LoRA trainer for MOSS-Image, FIBO 2.0 and Krea 2, with a guided WebUI | From source, then its `install.bat` (venv + CUDA PyTorch) |
 | [RulZ Image Organizer](https://github.com/speedyrulz/RulZ-Image-Organizer) | Offline face grouping and search for your photo library | Portable release zip |
-| [RulZ Image Tournament](https://github.com/speedyrulz/RulZ-Image-Tournament) | Finds your favorite image, two at a time | From source, built with the C# compiler in Windows |
+| [RulZ Image Tournament](https://github.com/speedyrulz/RulZ-Image-Tournament) | Finds your favorite image, two at a time | Portable release zip (a single .exe) |
 | [RulZ LLM Suite](https://github.com/speedyrulz/rulz-llm-suite) | Local LLMs with llama.cpp: models, chat, MCP tools, API server | Its setup program, run silently |
-| Rulz Training Captioner | Captions image datasets with a local vision LLM | From source (venv), plus an optional llama.cpp CUDA build |
+| [Rulz Training Captioner](https://github.com/speedyrulz/Rulz-Training-Captioner) | Captions image datasets with a local vision LLM | From source (venv), plus an optional llama.cpp CUDA build |
 | [RulZ Simple Video Clip Extractor](https://github.com/speedyrulz/rulz-simple-video-clip-extractor) | Frame-accurate clips with lossless cuts and NVENC export | Portable release zip |
 
 ## Using the launcher
@@ -43,6 +43,17 @@ Download `RulZ-AI-Tools-Suite-Setup-<version>.exe` from the Releases page and ru
 
 To run it from source instead, double-click `install.bat` (needs Node.js 22+), then `run.bat`.
 
+## The apps' source
+
+Each app lives in its own repository, included here as a git submodule in `apps/`, pinned to its current release.
+The launcher doesn't need them (it downloads apps from GitHub); they're for browsing and working on the source:
+
+```
+git clone --recurse-submodules https://github.com/speedyrulz/RulZ-AI-Tools-Suite.git
+git submodule update --init          # in an existing clone
+git submodule update --remote        # move every app to its latest commit
+```
+
 ## Development
 
 ```
@@ -67,14 +78,17 @@ Pushing a `v*` tag builds the installer on GitHub Actions and attaches it to a r
 | Requirement checks and winget installs | `src/main/requirements.ts` |
 | UI (React + Tailwind) | `src/renderer/src/` |
 | Logo and icon generation from `assets/logo-source.webp` | `tools/make_logo.py` |
+| How the catalog screenshots were made (demo content only) | `tools/screenshots/` |
+| The apps' repositories (submodules) | `apps/` |
 
 ### Adding an app
 
 1. Add an entry to `src/shared/catalog.ts`. `install.kind` is `zip` (a portable zip on the latest release),
    `installer` (an NSIS setup .exe on the latest release) or `source` (the repository plus setup commands), and
    `launch.target` is the program to start, relative to the install folder.
-2. Add the app to `tools/sync_catalog.py` and run `npm run sync-catalog` to copy its README, README images and icon
-   into `catalog/<id>/`.
+2. Add its repository as a submodule (`git submodule add <url> apps/<repo name>`), add it to
+   `tools/sync_catalog.py`, and run `npm run sync-catalog` to copy its README, README images and icon into
+   `catalog/<id>/`. Run the same command after updating the submodules to refresh every app's README copy.
 3. Put 2–4 screenshots in `catalog/<id>/screenshots/` (`01-…` is the card thumbnail).
 
 The launcher shows the README from GitHub when it can, and the copy in `catalog/` when offline.
