@@ -212,3 +212,26 @@ def test_replicas_and_views_follow_the_configuration(tmp_path):
     name = vb.names[0]
     assert torch.equal(state[f"diffusion_model.{name}.lora_up.weight"], vb.up[name].to(torch.bfloat16))
     assert state[f"diffusion_model.{name}.lora_down.weight"].shape[0] == 8
+
+
+def test_race_status_carries_face_and_body_behind_the_combined_score():
+    """The Monitor's race table shows face and body next to the combined score: [normalized, raw] per variant."""
+    from types import SimpleNamespace
+
+    from rulztrainer.likeness import LikenessController
+    from rulztrainer.trainer import Trainer
+
+    cfg = TrainConfig(probe_every=10, probe_ema=0.0, likeness_normalize=True)
+    c1, c2 = LikenessController(cfg, face_ceiling=70.0, body_ceiling=60.0), LikenessController(cfg)
+    c1.update(0, 15.0, 8.0)  # floors
+    c1.update(10, 42.5, 34.0)  # halfway to both ceilings
+    v1 = SimpleNamespace(name="a", state={"controller": c1, "step": 10}, overrides={"learning_rate": 1e-4})
+    v2 = SimpleNamespace(name="b", state={"controller": c2}, overrides={})
+    v3 = SimpleNamespace(name="c", state={}, overrides={})
+    rr = SimpleNamespace(schedule=SimpleNamespace(state=lambda: {"names": ["a", "b", "c"]}), active=v2,
+                         variants=[v1, v2, v3], estimate={"total": 100})
+    out = Trainer._race_status(SimpleNamespace(race=rr))
+    assert abs(out["scores"]["a"] - 50.0) < 1e-9 and out["scores"]["b"] is None and out["scores"]["c"] is None
+    assert [round(x, 6) for x in out["face"]["a"]] == [50.0, 42.5] and [round(x, 6) for x in out["body"]["a"]] == [50.0, 34.0]
+    assert out["face"]["b"] == [None, None] and "c" not in out["face"]
+    assert out["steps"] == {"a": 10, "b": None, "c": 0} and out["settings"]["a"] == "learning_rate=0.0001"

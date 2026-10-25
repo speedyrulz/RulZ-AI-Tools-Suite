@@ -1488,6 +1488,14 @@ class Trainer:
         out["steps"] = {v.name: (v.state.get("step", 0) if v is not rr.active else None) for v in rr.variants}
         out["scores"] = {v.name: (v.state["controller"].combined_ema if "controller" in v.state else None)
                          for v in rr.variants}
+        # the smoothed face and body behind the combined score: [normalized, raw] (raw twice without normalization)
+        out["face"], out["body"] = {}, {}
+        for v in rr.variants:
+            c = v.state.get("controller")
+            if c is None:
+                continue
+            out["face"][v.name] = [c.norm("face", c.face_ema), c.face_ema]
+            out["body"][v.name] = [c.norm("body", c.body_ema), c.body_ema]
         out["settings"] = {v.name: race_mod.format_overrides(v.overrides) for v in rr.variants}
         out["estimate"] = rr.estimate
         return out

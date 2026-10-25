@@ -3333,6 +3333,8 @@ def build_page(local: bool = True):
                         {"name": "name", "label": "Configuration", "field": "name", "align": "left"},
                         {"name": "state", "label": "Status", "field": "state", "align": "left"},
                         {"name": "score", "label": "Score now", "field": "score"},
+                        {"name": "face", "label": "Face now", "field": "face"},
+                        {"name": "body", "label": "Body now", "field": "body"},
                         {"name": "rounds", "label": "Score after each round", "field": "rounds", "align": "left"},
                         {"name": "settings", "label": "Settings", "field": "settings", "align": "left"}],
                         rows=[], row_key="name").classes("w-full")
@@ -3529,12 +3531,20 @@ def build_page(local: bool = True):
                 if rc:
                     names, dropped = rc.get("names") or [], rc.get("dropped") or {}
                     f1 = lambda x: "n/a" if x is None else f"{x:.1f}%"  # noqa: E731
+
+                    def part(kind, n):  # "57.2% (raw 67.7)": the normalized smoothed score, the raw one behind it
+                        norm, raw = (rc.get(kind) or {}).get(n) or (None, None)
+                        if norm is None:
+                            return "n/a"
+                        return f1(norm) if raw is None or abs(norm - raw) < 0.05 else f"{f1(norm)} (raw {raw:.1f})"
+
                     rows = []
                     for n in names:
                         state = ("winner" if rc.get("winner") == n else f"out after round {dropped[n]}" if n in dropped
                                  else "training" if rc.get("active") == n else "waiting its turn")
                         per_round = [h["scores"].get(n) for h in rc.get("history") or [] if n in h["scores"]]
                         rows.append({"name": n, "state": state, "score": f1((rc.get("scores") or {}).get(n)),
+                                     "face": part("face", n), "body": part("body", n),
                                      "rounds": " / ".join(f1(s) for s in per_round) or "-",
                                      "settings": (rc.get("settings") or {}).get(n) or "the page's own settings"})
                     race_table.rows = rows
