@@ -1097,3 +1097,10 @@ file names. The transformer must take the trainer's convention, `model(latents, 
 normalized 2x2-patchified latents [B, C, H/16, W/16], and expose `.layers` (the blocks) for block selection, compile
 and the model split, plus `split_tail_modules()` (what runs after the last block); `rulztrainer/krea2/` is the most
 recent template, and `tests/test_krea2.py` checks a port against the diffusers model with tiny random weights.
+
+## License
+
+Open source under the [MIT License](LICENSE). Base models you download (MOSS-Image, FIBO, Krea, text encoders) keep their own licenses.
+
+The RulZ name and logo are excluded from the MIT License; all rights reserved. If you fork or redistribute this
+project, remove or replace the RulZ branding. See [LOGO-NOTICE.md](LOGO-NOTICE.md).
