@@ -130,3 +130,25 @@ def test_race_images_group_by_generation_with_normalized_scores(tmp_path):
     assert webui.probe_score_line(None) == ""
     (tmp_path / "race.json").write_text('{"names": ["a", "b"]}')
     assert webui.race_names(tmp_path) == ["a", "b"] and webui.race_names(tmp_path / "none") == []
+
+
+def test_race_probe_chart_names_each_configuration():
+    names = ["lora16", "lokr8"]
+
+    def rec(name, step, face, body, comb):
+        prefix = f"{name}_" if name else ""
+        return {"step": step, "face_norm_ema": face, "body_norm_ema": body, "combined_ema": comb,
+                "images": [f"out/probes/{prefix}step{step:06d}_face_0.png"]}
+
+    probes = [rec("lora16", 100, 5.0, 16.2, 10.6), rec("lokr8", 100, 6.7, 21.9, 14.3), rec("", 300, 9.0, 25.0, 17.0)]
+    assert webui.probe_racer(probes[1], names) == "lokr8" and webui.probe_racer(probes[2], names) == ""
+    series, legend = webui.probe_chart_series(probes, names)
+    assert legend == ["lora16 combined", "lora16 face", "lora16 body", "lokr8 combined", "lokr8 face", "lokr8 body",
+                      "winner combined", "winner face", "winner body"]
+    data = {s["name"]: s["data"] for s in series}
+    assert data["lora16 face"] == [[100, 5.0]] and data["lokr8 face"] == [[100, 6.7]]
+    assert data["lokr8 combined"] == [[100, 14.3]] and data["winner body"] == [[300, 25.0]]
+    colors = {s["name"].split()[0]: s["lineStyle"]["color"] for s in series}
+    assert len(set(colors.values())) == 3  # one colour per configuration
+    single, legend1 = webui.probe_chart_series(probes[:1], [])  # one run: the lines and the per-probe dots
+    assert legend1 == ["face", "body", "combined", "face (probe)", "body (probe)"] and single[0]["data"] == [[100, 5.0]]

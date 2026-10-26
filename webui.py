@@ -664,6 +664,61 @@ def group_by_generation(paths, names: list[str]) -> list[tuple[int, str, list[tu
     return out
 
 
+def probe_racer(rec: dict, names: list[str]) -> str:
+    """The race configuration a probe record belongs to (its images carry the name as a prefix); "" for a probe
+    outside the race (the winner training on after it)."""
+    for p in rec.get("images") or []:
+        m = _RACE_IMAGE.match(Path(p).name)
+        if m and m["name"] in names:
+            return m["name"]
+    return ""
+
+
+def _probe_points(probes: list[dict], key: str, fallback: str | None = None) -> list[list]:
+    """[step, score] of each probe record for a key (normalized where the record has it, raw for older runs)."""
+    out = []
+    for pr in probes:
+        v = pr.get(key)
+        if v is None and fallback:
+            v = pr.get(fallback)
+        if v is not None:
+            out.append([pr["step"], round(v, 1)])
+    return out
+
+
+PROBE_DEFAULT_SERIES = ["face", "body", "combined", "face (probe)", "body (probe)"]
+
+
+def probe_chart_series(probes: list[dict], names: list[str]) -> tuple[list[dict], list[str]]:
+    """(series, legend) of the Monitor's likeness chart. One run: the smoothed face, body and combined lines plus each
+    probe's face and body dots. A race: the smoothed lines of every configuration, named after it ("lora16 face"),
+    one colour per configuration and one line style per score (combined thick, face solid, body dashed); the
+    winner's probes after the race are "winner"."""
+    if not names:
+        series = [_line("face", "#FF3B30", data=_probe_points(probes, "face_norm_ema", "face_ema")),
+                  _line("body", "#F4F4F5", data=_probe_points(probes, "body_norm_ema", "body_ema")),
+                  _line("combined", "#F59E0B", lineStyle={"width": 3}, data=_probe_points(probes, "combined_ema")),
+                  {"name": "face (probe)", "type": "scatter", "symbolSize": 5,
+                   "data": _probe_points(probes, "face_norm", "face"), "itemStyle": {"color": "#FB7185"}},
+                  {"name": "body (probe)", "type": "scatter", "symbolSize": 5,
+                   "data": _probe_points(probes, "body_norm", "body"), "itemStyle": {"color": "#A1A1AA"}}]
+        return series, list(PROBE_DEFAULT_SERIES)
+    by: dict[str, list[dict]] = {}
+    for pr in probes:
+        by.setdefault(probe_racer(pr, names), []).append(pr)
+    series, legend = [], []
+    for i, name in enumerate([n for n in names if n in by] + ([""] if "" in by else [])):
+        color = CHART_COLORS[i % len(CHART_COLORS)]
+        label = name or "winner"
+        for score, key, fallback, style in (("combined", "combined_ema", None, {"width": 3}),
+                                            ("face", "face_norm_ema", "face_ema", {"width": 1.5}),
+                                            ("body", "body_norm_ema", "body_ema", {"width": 1.5, "type": "dashed"})):
+            series.append(_line(f"{label} {score}", color, lineStyle=dict(style),
+                                data=_probe_points(by[name], key, fallback)))
+            legend.append(f"{label} {score}")
+    return series, legend
+
+
 def probe_score_line(rec: dict | None) -> str:
     """"overall 38% | face 47% | body 17%": one probe's normalized scores (the scores themselves with normalization
     off)."""
@@ -6088,13 +6143,7 @@ def build_page(local: bool = True):
                     # the normalized scores (0 = a stranger, 100 = the references): smoothed lines, per-probe dots
                     probe_chart = ui.echart(chart_options(
                         _axis("step", min="dataMin"), _axis("likeness % (normalized)", min=0, max=100),
-                        [_line("face", "#FF3B30"), _line("body", "#F4F4F5"),
-                         _line("combined", "#F59E0B", lineStyle={"width": 3}),
-                         {"name": "face (probe)", "type": "scatter", "symbolSize": 5, "data": [],
-                          "itemStyle": {"color": "#FB7185"}},
-                         {"name": "body (probe)", "type": "scatter", "symbolSize": 5, "data": [],
-                          "itemStyle": {"color": "#A1A1AA"}}],
-                        ["face", "body", "combined", "face (probe)", "body (probe)"])).classes("w-full h-60")
+                        *probe_chart_series([], []))).classes("w-full h-60")
                     charts.append(probe_chart)
                     probe_row = ui.row().classes("w-full gap-2")
                 probe_exp.visible = False
@@ -6340,20 +6389,10 @@ def build_page(local: bool = True):
                 probes = st.get("probes") or []
                 if probes:
                     probe_exp.visible = True
-                    def pts(key, fallback=None):  # normalized where the record has it, raw for older runs
-                        out = []
-                        for pr in probes:
-                            v = pr.get(key)
-                            if v is None and fallback:
-                                v = pr.get(fallback)
-                            if v is not None:
-                                out.append([pr["step"], round(v, 1)])
-                        return out
-                    probe_chart.options["series"][0]["data"] = pts("face_norm_ema", "face_ema")
-                    probe_chart.options["series"][1]["data"] = pts("body_norm_ema", "body_ema")
-                    probe_chart.options["series"][2]["data"] = pts("combined_ema")
-                    probe_chart.options["series"][3]["data"] = pts("face_norm", "face")
-                    probe_chart.options["series"][4]["data"] = pts("body_norm", "body")
+                    series, legend = probe_chart_series(probes, (rc or {}).get("names") or [])
+                    probe_chart.options["series"] = series
+                    probe_chart.options["legend"]["data"] = legend
+                    probe_chart.options["grid"]["top"] = 60 if len(legend) > 5 else 40  # room for a race's legend
                     probe_chart.update()
                     lk = st.get("likeness") or {}
                     last = probes[-1]

@@ -1005,6 +1005,10 @@ identity loss; `torch.compile` is off; no training states. Manual drops, the gal
 (the table marks every configuration that is training). A three-configuration test on an RTX 5060 Ti and an RTX 4060
 Ti ran two at once at about 6.6 s per step each, against about 13 s one after the other.
 
+**On the Monitor.** The *Likeness probes* chart draws every configuration's smoothed face, body and combined scores
+as its own lines, named after it (`lora16 face`, `lokr8 combined`): one colour per configuration, the combined score
+thick, the body dashed; after the race the winner's go on as `winner`.
+
 **Dropping one by hand.** The Monitor's race table has a *Drop* button on every configuration still in the race (after
 a confirmation). The trainer reads the request after the current step: the configuration stops, its LoRA is saved as
 `<job>_<name>_dropped.safetensors`, and the race goes on without it. If it was the one training, the next one takes
