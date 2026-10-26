@@ -20,7 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 HISTORY_DIR = ROOT / "output" / "_history"
 SCAN_DIRS = ("_history", "_crops")  # folders under output/ that are not jobs
-CONFIG_KEYS = ("job_name", "preset", "network_type", "lora_rank", "lokr_factor", "learning_rate", "optimizer", "steps",
+CONFIG_KEYS = ("job_name", "preset", "network_type", "lora_rank", "lokr_factor", "oft_block_size", "dora", "learning_rate", "optimizer", "steps",
                "batch_size", "lora_ema", "face_weight", "body_weight", "face_loss_weight", "body_loss_weight",
                "crop_augment", "isolation", "finetune", "race", "timestep_sampling", "likeness_curriculum",
                "face_scale_span", "face_scale_curve")

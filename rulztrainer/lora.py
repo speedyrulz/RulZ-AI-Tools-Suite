@@ -20,12 +20,27 @@ applied without materializing the product. Keys <stem>.lokr_w1, .lokr_w2, .alpha
 full-matrix factors), with the comfy prefix or the peft one ("transformer.", which ComfyUI maps for Krea 2);
 diffusers has no LoKr loader. w1 starts kaiming-uniform and w2 at zero, so the delta is 0 at step 0 and both get
 gradients from step 1. Fizgig's measured default is factor 8 (its highest likeness; ~1/64 of the weight size).
+
+OFT (network_type "oft", LyCORIS diag-OFT as ComfyUI's weight adapter reads it): instead of adding to a layer, it
+rotates the layer's output channels in blocks: oft_blocks [n, b, b] with n * b = out (b the largest divisor of out
+<= oft_block_size), Q = blocks - blocks^T (skew-symmetric), R = (I + Q)(I - Q)^-1 (Cayley, orthogonal) and the
+merged weight R^T W per block; the bias is not rotated. oft_constraint > 0 (COFT) caps the Frobenius norm of Q and
+is saved as the .alpha key, which ComfyUI reads as that cap. Blocks start at zero (R = I). Applied to the frozen
+layer's output, so it works on quantized weights as they are.
+
+DoRA (dora: true, on LoRA or LoKr; weight-decomposed): the merged weight is W' = V * diag(m / ||V||_col) with
+V = W + delta and the norm per input column, i.e. the layer sees its input scaled by g = m / ||V||_col. ComfyUI's
+weight_decompose normalizes by the merged weight only on this input axis (on the output axis it divides by the
+original W's norm), so the input axis is the one a file must use to load the same: <stem>.dora_scale [1, in]. m starts
+at ||W||_col (g = 1 at step 0). The norm is recomputed every forward from the dequantized weight and, as the DoRA
+paper suggests, kept out of the gradient. diffusers / PEFT cannot read this axis: DoRA files load in ComfyUI and here.
 """
 from __future__ import annotations
 
 import json
 import logging
 import math
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -86,8 +101,10 @@ PEFT_CONFIG_TEMPLATE = {
 SAVE_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 
 
-KINDS = ("lora", "lokr")
-PARTS = {"lora": ("lora_down", "lora_up"), "lokr": ("lokr_w1", "lokr_w2")}
+KINDS = ("lora", "lokr", "oft")
+PARTS = {"lora": ("lora_down", "lora_up"), "lokr": ("lokr_w1", "lokr_w2"), "oft": ("oft_blocks",)}
+DORA_KINDS = ("lora", "lokr")  # DoRA decomposes an added delta; OFT rotates instead
+DORA_EPS = torch.finfo(torch.float32).eps  # what ComfyUI adds to the norm (it patches in fp32)
 
 
 def factorization(n: int, factor: int) -> tuple[int, int]:
@@ -97,6 +114,54 @@ def factorization(n: int, factor: int) -> tuple[int, int]:
         if n % cand == 0:
             return cand, n // cand
     return 1, n
+
+
+_FROZEN = {"depth": 0, "round": 0}  # frozen_adapters(): nesting depth and render round
+
+
+@contextmanager
+def frozen_adapters():
+    """While samples and probes render the adapters do not change, so DoRA computes each layer's norm once per round
+    instead of on every denoising step (training forwards, with gradients on, always recompute it)."""
+    _FROZEN["round"] += 1
+    _FROZEN["depth"] += 1
+    try:
+        yield
+    finally:
+        _FROZEN["depth"] -= 1
+
+
+def oft_shape(out_features: int, block: int) -> tuple[int, int]:
+    """(blocks, block size) of an OFT layer: the block size the largest divisor of out_features <= block."""
+    size, n = factorization(out_features, block)
+    return n, size
+
+
+def oft_rotation(blocks: torch.Tensor, constraint: float = 0.0) -> torch.Tensor:
+    """The orthogonal blocks R [n, b, b] from oft_blocks, as ComfyUI computes them: Q = blocks - blocks^T, its
+    Frobenius norm capped at `constraint` when that is > 0, R = (I + Q)(I - Q)^-1 (in fp32)."""
+    q = blocks.float() - blocks.float().transpose(1, 2)
+    if constraint > 0:
+        norm = q.norm() + 1e-8
+        q = torch.where(norm > constraint, q * (constraint / norm), q)
+    eye = torch.eye(q.shape[-1], device=q.device, dtype=q.dtype)
+    return (eye + q) @ torch.linalg.inv(eye - q)
+
+
+def dense_weight(base: nn.Module) -> torch.Tensor:
+    """A frozen layer's weight [out, in] as a plain tensor (a quantized one dequantized), for DoRA's norms."""
+    if hasattr(base, "dequantized"):
+        return base.dequantized(torch.float32)
+    return base.weight.detach().float()
+
+
+def adapter_label(kind: str, rank: int = 16, alpha: float = 16.0, factor: int = 8, block: int = 32,
+                  dora: bool = False, constraint: float = 0.0) -> str:
+    """One adapter setup in words, for logs and the review: "LoRA rank 16, alpha 16 + DoRA", "OFT block 32"."""
+    if kind == "oft":
+        return f"OFT block {block}" + (f", constraint {constraint:g}" if constraint > 0 else "")
+    text = f"LoKr factor {factor}" if kind == "lokr" else f"LoRA rank {rank}, alpha {alpha:g}"
+    return text + (" + DoRA" if dora else "")
 
 
 def lokr_update(x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor) -> torch.Tensor:
@@ -126,12 +191,13 @@ def _apply_extras(x, out, extras, extra_biases):
 
 
 class LoRALinear(nn.Module):
-    """Wraps a Linear (plain or QuantLinear) with a trainable adapter in fp32, a LoRA pair (kind "lora") or a LoKr
-    Kronecker pair (kind "lokr"), plus frozen extras (sampling-only LoRA / LoKr files). The inactive kind's tensors
-    are empty; a configuration race switches kinds on the same wrapper (set_kind)."""
+    """Wraps a Linear (plain or QuantLinear) with a trainable adapter in fp32: a LoRA pair (kind "lora"), a LoKr
+    Kronecker pair ("lokr") or OFT rotation blocks ("oft"), with DoRA's magnitude (dora_scale) on LoRA and LoKr when
+    `dora` is on; plus frozen extras (sampling-only LoRA / LoKr files). The inactive kinds' tensors are empty; a
+    configuration race switches kinds on the same wrapper (set_kind)."""
 
     def __init__(self, base: nn.Module, rank: int, alpha: float, dropout: float = 0.0, trainable: bool = True,
-                 kind: str = "lora", factor: int = 8):
+                 kind: str = "lora", factor: int = 8, block: int = 32, constraint: float = 0.0, dora: bool = False):
         super().__init__()
         if kind not in KINDS:
             raise ValueError(f"network_type must be one of {KINDS}, got {kind!r}")
@@ -150,6 +216,11 @@ class LoRALinear(nn.Module):
         b, d = factorization(self.in_features, self.factor)
         self.lokr_w1 = nn.Parameter(torch.empty(a, b))
         self.lokr_w2 = nn.Parameter(torch.empty(c, d))
+        self.block, self.constraint = int(block), float(constraint)
+        self.dora = bool(dora) and kind in DORA_KINDS
+        self.oft_blocks = nn.Parameter(torch.empty(*self.adapter_shapes("oft")["oft_blocks"]))
+        self.dora_scale = nn.Parameter(torch.empty(self.in_features if self.dora else 0))
+        self.w_col_norm: torch.Tensor | None = None  # ||W|| per input column (CPU fp32), DoRA's starting magnitude
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.kind = kind
         self.init_adapter()
@@ -166,44 +237,133 @@ class LoRALinear(nn.Module):
 
     # ---- the adapter API (both kinds)
     def adapter_params(self) -> dict[str, nn.Parameter]:
-        """The active kind's tensors by part name: {"lora_down", "lora_up"} or {"lokr_w1", "lokr_w2"}."""
+        """The active kind's tensors by part name: {"lora_down", "lora_up"}, {"lokr_w1", "lokr_w2"} or
+        {"oft_blocks"}, plus "dora_scale" with DoRA."""
         if self.kind == "lora":
-            return {"lora_down": self.lora_down.weight, "lora_up": self.lora_up.weight}
-        return {"lokr_w1": self.lokr_w1, "lokr_w2": self.lokr_w2}
+            out = {"lora_down": self.lora_down.weight, "lora_up": self.lora_up.weight}
+        elif self.kind == "lokr":
+            out = {"lokr_w1": self.lokr_w1, "lokr_w2": self.lokr_w2}
+        else:
+            return {"oft_blocks": self.oft_blocks}
+        if self.dora:
+            out["dora_scale"] = self.dora_scale
+        return out
 
-    def adapter_shapes(self, kind: str, rank: int | None = None, factor: int | None = None) -> dict[str, tuple]:
-        """The tensor shapes of a kind on this layer (rank / factor default to the wrapper's)."""
+    def adapter_shapes(self, kind: str, rank: int | None = None, factor: int | None = None,
+                       block: int | None = None, dora: bool | None = None) -> dict[str, tuple]:
+        """The tensor shapes of a kind on this layer (rank / factor / block / dora default to the wrapper's)."""
+        dora = (self.dora if dora is None else bool(dora)) and kind in DORA_KINDS
         if kind == "lora":
             r = int(rank if rank is not None else self.rank)
-            return {"lora_down": (r, self.in_features), "lora_up": (self.out_features, r)}
-        f = int(factor if factor is not None else self.factor)
-        a, c = factorization(self.out_features, f)
-        b, d = factorization(self.in_features, f)
-        return {"lokr_w1": (a, b), "lokr_w2": (c, d)}
+            out = {"lora_down": (r, self.in_features), "lora_up": (self.out_features, r)}
+        elif kind == "lokr":
+            f = int(factor if factor is not None else self.factor)
+            a, c = factorization(self.out_features, f)
+            b, d = factorization(self.in_features, f)
+            out = {"lokr_w1": (a, b), "lokr_w2": (c, d)}
+        else:
+            n, size = oft_shape(self.out_features, int(block if block is not None else self.block))
+            return {"oft_blocks": (n, size, size)}
+        if dora:
+            out["dora_scale"] = (self.in_features,)
+        return out
+
+    @torch.no_grad()
+    def weight_col_norm(self) -> torch.Tensor:
+        """||W|| per input column of the frozen weight (CPU fp32, computed once): DoRA's starting magnitude."""
+        if self.w_col_norm is None:
+            self.w_col_norm = dense_weight(self.base).norm(dim=0).float().cpu()
+        return self.w_col_norm
+
+    def init_parts(self, kind: str, rank: int | None = None, factor: int | None = None, block: int | None = None,
+                   dora: bool | None = None, generator=None) -> dict[str, torch.Tensor]:
+        """Fresh CPU fp32 weights of a kind on this layer: a LoRA's down and a LoKr's w1 kaiming-uniform, its other
+        factor zero (delta 0); OFT blocks zero (R = I); DoRA's magnitude ||W|| per input column (scale 1)."""
+        out = {}
+        for part, shape in self.adapter_shapes(kind, rank, factor, block, dora).items():
+            if part in ("lora_down", "lokr_w1"):
+                w = torch.empty(shape)
+                nn.init.kaiming_uniform_(w, a=math.sqrt(5), generator=generator)
+            elif part == "dora_scale":
+                w = self.weight_col_norm().clone()
+            else:
+                w = torch.zeros(shape)
+            out[part] = w
+        return out
 
     @torch.no_grad()
     def init_adapter(self, generator=None) -> None:
-        """Fresh weights for the active kind: the first factor kaiming-uniform, the second zero (delta 0)."""
-        if self.kind == "lora":
-            nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5), generator=generator)
-            nn.init.zeros_(self.lora_up.weight)
-        else:
-            nn.init.kaiming_uniform_(self.lokr_w1, a=math.sqrt(5), generator=generator)
-            nn.init.zeros_(self.lokr_w2)
+        """Fresh weights for the active kind (init_parts)."""
+        params = self.adapter_params()
+        for part, w in self.init_parts(self.kind, generator=generator).items():
+            params[part].data = w.to(params[part].device)
 
     @torch.no_grad()
-    def set_kind(self, kind: str) -> None:
-        """Make `kind` the active adapter; the other kind's tensors are freed (empty)."""
+    def set_kind(self, kind: str, dora: bool | None = None, block: int | None = None) -> None:
+        """Make `kind` (with or without DoRA, with this OFT block size) the active adapter; the inactive tensors are
+        freed (empty). The active ones keep their data when their shape still fits, else they are fresh (init)."""
         if kind not in KINDS:
             raise ValueError(f"network_type must be one of {KINDS}, got {kind!r}")
         self.kind = kind
+        if block is not None:
+            self.block = int(block)
+        self.dora = (self.dora if dora is None else bool(dora)) and kind in DORA_KINDS
         dev = self.lora_down.weight.device
-        if kind == "lokr":
-            self.lora_down.weight.data = torch.empty(0, self.in_features, device=dev)
-            self.lora_up.weight.data = torch.empty(self.out_features, 0, device=dev)
-        else:
-            self.lokr_w1.data = torch.empty(0, 0, device=dev)
-            self.lokr_w2.data = torch.empty(0, 0, device=dev)
+        empty = {"lora_down": (0, self.in_features), "lora_up": (self.out_features, 0), "lokr_w1": (0, 0),
+                 "lokr_w2": (0, 0), "oft_blocks": (0, 0, 0), "dora_scale": (0,)}
+        tensors = {"lora_down": self.lora_down.weight, "lora_up": self.lora_up.weight, "lokr_w1": self.lokr_w1,
+                   "lokr_w2": self.lokr_w2, "oft_blocks": self.oft_blocks, "dora_scale": self.dora_scale}
+        want = self.adapter_shapes(kind)
+        fresh = self.init_parts(kind) if any(tuple(tensors[p].shape) != s for p, s in want.items()) else {}
+        for part, t in tensors.items():
+            if part not in want:
+                t.data = torch.empty(empty[part], device=dev)
+            elif tuple(t.shape) != want[part]:
+                t.data = fresh[part].to(dev)
+
+    @torch.no_grad()
+    def delta_weight(self) -> torch.Tensor:
+        """The added weight [out, in] of a LoRA / LoKr in fp32 (its scale applied), as ComfyUI merges it."""
+        if self.kind == "lora":
+            return (self.lora_up.weight.float() @ self.lora_down.weight.float()) * self.scale
+        return torch.kron(self.lokr_w1.float(), self.lokr_w2.float()) * self.scale
+
+    def dora_input_scale(self) -> torch.Tensor:
+        """DoRA's per-input-column scale m / ||W + delta||_col [in]; the norm is computed without gradient (the
+        DoRA paper's memory saving), the magnitude m trains. Inside frozen_adapters() without gradients the norm is
+        kept for the round (keyed on the weights' storage and version as well)."""
+        key = None
+        if _FROZEN["depth"] and not torch.is_grad_enabled():
+            key = (_FROZEN["round"], *((p.data_ptr(), p._version) for p in self.adapter_params().values()))
+            cached = getattr(self, "_dora_norm", None)
+            if cached is not None and cached[0] == key:
+                return self.dora_scale / cached[1]
+        with torch.no_grad():
+            w = dense_weight(self.base).to(self.dora_scale.device)
+            norm = (w + self.delta_weight()).norm(dim=0) + DORA_EPS
+        self._dora_norm = (key, norm) if key is not None else None
+        return self.dora_scale / norm
+
+    def _added(self, x):
+        """The LoRA / LoKr output for input x (scaled, before the multiplier)."""
+        if self.kind == "lora":
+            h = self.dropout(x)
+            h = nn.functional.linear(h, self.lora_down.weight.to(h.dtype))
+            return nn.functional.linear(h, self.lora_up.weight.to(h.dtype)) * self.scale
+        return lokr_update(x, self.lokr_w1.to(x.dtype), self.lokr_w2.to(x.dtype)) * self.scale
+
+    def _rotated(self, y, multiplier: float):
+        """OFT: the frozen output y rotated per block, R^T (y - bias) + bias, as y + (R - I)^T (y - bias); a
+        multiplier blends R with the identity (ComfyUI's bypass mode does the same)."""
+        rot = oft_rotation(self.oft_blocks, self.constraint)
+        rot = rot - torch.eye(rot.shape[-1], device=rot.device, dtype=rot.dtype)
+        if multiplier != 1.0:
+            rot = rot * multiplier
+        bias = self.base.bias
+        yb = y - bias.to(y.dtype) if bias is not None else y
+        n, size = rot.shape[0], rot.shape[1]
+        delta = torch.einsum("knm,...kn->...km", rot.to(y.dtype), yb.reshape(*yb.shape[:-1], n, size))
+        return y + delta.reshape(y.shape)
 
     @property
     def weight(self):  # for code that only inspects .weight.dtype / .device
@@ -214,16 +374,18 @@ class LoRALinear(nn.Module):
         return self.base.bias
 
     def forward(self, x):
-        out = self.base(x)
-        if self.multiplier != 0.0 and self.trainable:
-            if self.kind == "lora":
-                h = self.dropout(x)
-                h = nn.functional.linear(h, self.lora_down.weight.to(h.dtype))
-                h = nn.functional.linear(h, self.lora_up.weight.to(h.dtype))
-                out = out + h * (self.scale * self.multiplier)
-            else:
-                out = out + lokr_update(x, self.lokr_w1.to(x.dtype), self.lokr_w2.to(x.dtype)) \
-                    * (self.scale * self.multiplier)
+        if self.multiplier == 0.0 or not self.trainable:
+            out = self.base(x)
+        elif self.kind == "oft":
+            out = self._rotated(self.base(x), self.multiplier)
+        elif self.dora:  # W' x = (W + delta)(g x): the frozen layer and the delta both see the scaled input
+            h = x * self.dora_input_scale().to(x.dtype)
+            out = self.base(h) + self._added(h)
+            if self.multiplier != 1.0:  # ComfyUI's strength: W + s (W' - W)
+                plain = self.base(x)
+                out = plain + (out - plain) * self.multiplier
+        else:
+            out = self.base(x) + self._added(x) * self.multiplier
         if self.extras_enabled:
             out = _apply_extras(x, out, self.extras, self.extra_biases)
         return out
@@ -293,14 +455,14 @@ def backprop_blocks(model: nn.Module, injected: dict, blocks: list[int] | None) 
 
 
 def _wrap(model: nn.Module, name: str, rank: int, alpha: float, dropout: float = 0.0, trainable: bool = True,
-          kind: str = "lora", factor: int = 8):
+          kind: str = "lora", factor: int = 8, block: int = 32, constraint: float = 0.0, dora: bool = False):
     module = model.get_submodule(name)
     if isinstance(module, LoRALinear):
         return module
     parent_name, _, child = name.rpartition(".")
     parent = model.get_submodule(parent_name) if parent_name else model
     device = module.weight.device if hasattr(module, "weight") else "cpu"
-    wrapper = LoRALinear(module, rank, alpha, dropout, trainable, kind, factor).to(device)
+    wrapper = LoRALinear(module, rank, alpha, dropout, trainable, kind, factor, block, constraint, dora).to(device)
     setattr(parent, child, wrapper)
     return wrapper
 
@@ -313,9 +475,10 @@ def _is_linear_like(m: nn.Module) -> bool:
 def inject_lora(model: nn.Module, rank: int, alpha: float, targets: Iterable[str],
                 include_text_embedder: bool = False, dropout: float = 0.0,
                 blocks: Iterable[int] | None = None, names: Iterable[str] | None = None,
-                kind: str = "lora", factor: int = 8) -> dict[str, LoRALinear]:
-    """Replace matching Linear modules in-place with trainable adapter wrappers (kind "lora" or "lokr"). Returns
-    {name: LoRALinear}.
+                kind: str = "lora", factor: int = 8, block: int = 32, constraint: float = 0.0,
+                dora: bool = False) -> dict[str, LoRALinear]:
+    """Replace matching Linear modules in-place with trainable adapter wrappers (kind "lora", "lokr" or "oft"; dora
+    on LoRA / LoKr). Returns {name: LoRALinear}.
 
     names: the exact module names to wrap (Arch.lora_module_names); without it the MOSS-Image layout rules below
     apply. blocks: DiT block indices to train (None = all). Blocks outside the set get no LoRA; autograd then skips
@@ -326,7 +489,8 @@ def inject_lora(model: nn.Module, rank: int, alpha: float, targets: Iterable[str
         injected = {}
         for name, module in list(model.named_modules()):
             if name in wanted and _is_linear_like(module):
-                injected[name] = _wrap(model, name, rank, alpha, dropout, trainable=True, kind=kind, factor=factor)
+                injected[name] = _wrap(model, name, rank, alpha, dropout, trainable=True, kind=kind, factor=factor,
+                                       block=block, constraint=constraint, dora=dora)
         missing = wanted - set(injected)
         if missing:
             raise ValueError(f"LoRA targets not found in the model: {sorted(missing)[:5]}")
@@ -348,7 +512,8 @@ def inject_lora(model: nn.Module, rank: int, alpha: float, targets: Iterable[str
                 continue
         else:
             continue
-        injected[name] = _wrap(model, name, rank, alpha, dropout, trainable=True, kind=kind, factor=factor)
+        injected[name] = _wrap(model, name, rank, alpha, dropout, trainable=True, kind=kind, factor=factor,
+                               block=block, constraint=constraint, dora=dora)
     return injected
 
 
@@ -358,8 +523,9 @@ def mirror_lora(src: dict, dst: dict) -> None:
     the sampling model): weights (resized when the rank differs), alpha / scale / rank, on/off and dropout."""
     for name, s in src.items():
         d = dst[name]
-        if d.kind != s.kind:
-            d.set_kind(s.kind)
+        dora, block = getattr(s, "dora", False), getattr(s, "block", d.block)
+        if (d.kind, d.dora, d.block) != (s.kind, dora, block):
+            d.set_kind(s.kind, dora=dora, block=block)
         dps = d.adapter_params()
         for part, sp in s.adapter_params().items():
             dp = dps[part]
@@ -367,6 +533,7 @@ def mirror_lora(src: dict, dst: dict) -> None:
                 dp.data = torch.empty(sp.shape, dtype=sp.dtype, device=dp.device)
             dp.copy_(sp, non_blocking=True)
         d.alpha, d.scale, d.rank, d.factor = s.alpha, s.scale, s.rank, s.factor
+        d.constraint = getattr(s, "constraint", 0.0)
         if d.trainable != s.trainable:
             d.trainable = s.trainable
         if getattr(d.dropout, "p", 0.0) != getattr(s.dropout, "p", 0.0):
@@ -379,11 +546,12 @@ def lora_parameters(injected: dict[str, LoRALinear]):
 
 
 def lora_param_groups(injected: dict[str, LoRALinear], lr: float, plus_ratio: float = 0.0) -> list[dict]:
-    """Optimizer param groups. With LoRA+ (ratio > 1) the LoRA up matrices get lr x ratio in their own group; LoKr
-    layers stay at lr (LoRA+ is a LoRA result)."""
+    """Optimizer param groups. With LoRA+ (ratio > 1) the LoRA up matrices get lr x ratio in their own group; LoKr,
+    OFT and DoRA's magnitudes stay at lr (LoRA+ is a LoRA result)."""
     downs = [m.lora_down.weight for m in injected.values() if m.kind == "lora"]
     ups = [m.lora_up.weight for m in injected.values() if m.kind == "lora"]
-    lokr = [p for m in injected.values() if m.kind == "lokr" for p in m.adapter_params().values()]
+    lokr = [p for m in injected.values() for part, p in m.adapter_params().items()
+            if part not in ("lora_down", "lora_up")]
     if plus_ratio and plus_ratio > 1.0 and ups:
         groups = [{"params": downs, "lr": lr, "name": "lora_down"}, {"params": ups, "lr": lr * plus_ratio, "name": "lora_up"}]
         if lokr:
@@ -413,8 +581,15 @@ def export_state_dict(injected: dict[str, LoRALinear], dtype=torch.bfloat16, fmt
         if not getattr(m, "trainable", True):
             continue  # a race's switched-off layer (empty tensors)
         parts = {k: v.detach().to("cpu", dtype).contiguous() for k, v in m.adapter_params().items()}
-        if m.kind == "lokr":  # LyCORIS keys; the prefix of the format (ComfyUI maps "transformer." for Krea 2)
-            key = (PEFT_PREFIX if fmt == "peft" else COMFY_PREFIX) + name
+        key = (PEFT_PREFIX if fmt == "peft" else COMFY_PREFIX) + name  # ComfyUI maps "transformer." for Krea 2
+        if "dora_scale" in parts:  # DoRA on the input axis: [1, in] (see the module docstring)
+            out[f"{key}.dora_scale"] = parts.pop("dora_scale").reshape(1, -1)
+        if m.kind == "oft":  # LyCORIS diag-OFT keys; .alpha is the COFT norm cap (absent: none)
+            out[f"{key}.oft_blocks"] = parts["oft_blocks"]
+            if getattr(m, "constraint", 0.0) > 0:
+                out[f"{key}.alpha"] = torch.tensor(float(m.constraint), dtype=torch.float32)
+            continue
+        if m.kind == "lokr":  # LyCORIS keys
             out[f"{key}.lokr_w1"], out[f"{key}.lokr_w2"] = parts["lokr_w1"], parts["lokr_w2"]
             out[f"{key}.alpha"] = torch.tensor(1.0, dtype=torch.float32)  # full factors: no scaling
             continue
@@ -454,11 +629,25 @@ def save_lora(injected: dict[str, LoRALinear], path, metadata: dict | None = Non
         dtype = SAVE_DTYPES[dtype]
     meta = {"format": "pt", "rulztrainer_version": "0.1.0"}
     kinds = network_kinds(injected)
+    live = [m for m in injected.values() if getattr(m, "trainable", True)]
+    dora = any(getattr(m, "dora", False) for m in live)
     if "lokr" in kinds:
         meta["rulztrainer_network"] = "lokr"
         meta["ss_network_module"] = "lycoris.kohya"
-        meta["ss_network_args"] = json.dumps({"algo": "lokr", "factor": max(m.factor for m in injected.values()
-                                                                               if m.kind == "lokr")})
+        meta["ss_network_args"] = json.dumps({"algo": "lokr", "factor": max(m.factor for m in live
+                                                                               if m.kind == "lokr"),
+                                              **({"dora_wd": True, "wd_on_output": False} if dora else {})})
+    elif "oft" in kinds:
+        meta["rulztrainer_network"] = "oft"
+        meta["ss_network_module"] = "lycoris.kohya"
+        meta["ss_network_args"] = json.dumps({"algo": "diag-oft", "block_size": max(m.block for m in live
+                                                                                     if m.kind == "oft"),
+                                              "constraint": max(float(getattr(m, "constraint", 0.0)) for m in live)})
+    elif dora:
+        meta["rulztrainer_network"] = "lora"
+        meta["ss_network_args"] = json.dumps({"dora_wd": True, "wd_on_output": False})
+    if dora:
+        meta["rulztrainer_dora"] = "input axis: <stem>.dora_scale [1, in], ComfyUI's weight_decompose"
     if fmt == "peft" and "lora" in kinds:
         meta["lora_adapter_metadata"] = json.dumps(peft_adapter_metadata(injected), indent=2, sort_keys=True)
     if metadata:
@@ -482,7 +671,34 @@ def load_lora_weights(injected: dict[str, LoRALinear], path) -> int:
     peft = any(k.endswith(".lora_A.weight") for k in state)
     peft_meta = read_peft_metadata(path) if peft else {}
     loaded = 0
+    dora_fresh = []  # DoRA layers whose file has no magnitude: it starts where the loaded delta leaves the norm
     for name, m in injected.items():
+        stem = next((p + name for p in (COMFY_PREFIX, PEFT_PREFIX, "") if any(
+            f"{p}{name}.{part}" in state for part in ("oft_blocks", "lokr_w1", "dora_scale", "lora_down.weight",
+                                                       "lora_A.weight"))), None)
+        if m.dora:
+            scale = state.get(f"{stem}.dora_scale") if stem else None
+            if scale is None:
+                dora_fresh.append(m)
+            elif scale.numel() != m.in_features or (scale.dim() == 2 and scale.shape[0] != 1):
+                raise ValueError(f"{name}: the file's dora_scale has {tuple(scale.shape)}, not [1, {m.in_features}] "
+                                 "(an output-axis DoRA file cannot continue here)")
+            else:
+                with torch.no_grad():
+                    m.dora_scale.copy_(scale.reshape(-1).float())
+        if m.kind == "oft":
+            blocks = state.get(f"{stem}.oft_blocks") if stem else None
+            if blocks is None:
+                continue
+            if tuple(blocks.shape) != tuple(m.oft_blocks.shape):
+                raise ValueError(f"OFT shape mismatch for {name}: file has {tuple(blocks.shape)}, oft_block_size "
+                                 f"{m.block} gives {tuple(m.oft_blocks.shape)}")
+            with torch.no_grad():
+                m.oft_blocks.copy_(blocks.float())
+            alpha = state.get(f"{stem}.alpha")
+            m.constraint = float(alpha) if alpha is not None else 0.0
+            loaded += 1
+            continue
         if m.kind == "lokr":
             key = next((p + name for p in (COMFY_PREFIX, PEFT_PREFIX, "") if f"{p}{name}.lokr_w1" in state), None)
             if key is None:
@@ -517,6 +733,13 @@ def load_lora_weights(injected: dict[str, LoRALinear], path) -> int:
             m.alpha = float(alpha)
             m.scale = m.alpha / m.rank
         loaded += 1
+    with torch.no_grad():
+        for m in dora_fresh:  # m = ||W + delta|| per input column: the loaded LoRA's effect unchanged (scale 1)
+            w = dense_weight(m.base).to(m.dora_scale.device)
+            m.dora_scale.copy_((w + m.delta_weight()).norm(dim=0))
+    if dora_fresh:
+        log.info("DoRA: %d layers had no dora_scale in %s; their magnitude starts at the loaded weights' norm",
+                 len(dora_fresh), Path(str(path)).name)
     return loaded
 
 

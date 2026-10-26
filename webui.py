@@ -1043,6 +1043,8 @@ class Form:
             max_token_length=int(v("max_token_length")), recache=bool(v("recache")),
             lora_rank=int(v("lora_rank")), lora_alpha=float(v("lora_alpha")),
             network_type=v("network_type"), lokr_factor=int(v("lokr_factor") or 8),
+            oft_block_size=int(v("oft_block_size") or 32), oft_constraint=float(v("oft_constraint") or 0.0),
+            dora=bool(v("dora")),
             finetune=bool(v("finetune")), finetune_rotate_epochs=float(v("finetune_rotate_epochs") or 1),
             finetune_window_gb=float(v("finetune_window_gb") or 0), finetune_reserve_gb=float(v("finetune_reserve_gb") or 0),
             finetune_extract_ranks=parse_ranks(v("finetune_extract_ranks")),
@@ -2740,7 +2742,7 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
                                                                               "into RulzTrainer)")))
         if cfg.network_type == "lokr":
             r["lokr_factor"] = (8, "Fizgig's measured default: lower is bigger files, nothing gained above 8")
-        else:
+        elif cfg.network_type == "lora":
             rank = 32 if goal == "style" else 16
             r["lora_rank"] = (rank, "styles carry a lot of varied detail" if goal == "style"
                               else "plenty for a character or concept; higher ranks mostly add file size")
@@ -2810,10 +2812,13 @@ def extra_review_rows(cfg: TrainConfig) -> list[tuple[str, str]]:
     """The review's rows about the adapter, memory, previews and the optional features that are on."""
     if cfg.finetune:
         adapter = "full fine-tune, extracting a LoRA of rank " + ", ".join(str(r) for r in cfg.finetune_extract_ranks)
+    elif cfg.network_type == "oft":
+        adapter = f"OFT, block {cfg.oft_block_size}" + (f", constraint {cfg.oft_constraint:g}"
+                                                       if cfg.oft_constraint > 0 else "")
     elif cfg.network_type == "lokr":
-        adapter = f"LoKr, factor {cfg.lokr_factor}"
+        adapter = f"LoKr, factor {cfg.lokr_factor}" + (" + DoRA" if cfg.dora else "")
     else:
-        adapter = f"LoRA, rank {cfg.lora_rank}, alpha {cfg.lora_alpha:g}"
+        adapter = f"LoRA, rank {cfg.lora_rank}, alpha {cfg.lora_alpha:g}" + (" + DoRA" if cfg.dora else "")
     rows = [("Adapter", adapter),
             ("Memory", f"gradient checkpointing {'on' if cfg.gradient_checkpointing else 'off'}; "
                        + (f"block swap {cfg.block_swap} blocks" if cfg.block_swap else "no block swap"))]
@@ -3085,7 +3090,7 @@ class Wizard:
         return self.goal == "character" and self.focus != "face_only"
 
     def is_lora(self) -> bool:
-        return not self.w["finetune"].value and self.w["network_type"].value != "lokr"
+        return not self.w["finetune"].value and self.w["network_type"].value == "lora"
 
     def refresh(self):
         try:
@@ -3559,9 +3564,24 @@ class Wizard:
         with self.setting("network_type", "Adapter",
                           "LoRA: a rank-r pair of small matrices per layer. LoKr: a Kronecker pair, about 1/64 of the "
                           "weights at factor 8: Fizgig's measured best likeness and more natural skin, about 20% "
-                          "slower steps. Both load in ComfyUI; diffusers has no LoKr loader.",
+                          "slower steps. OFT: rotates each layer's output channels in blocks instead of adding to the "
+                          "weights; the OFT paper found it held a subject's identity better than LoRA and stayed "
+                          "stable in long runs (not yet measured here: race it). All load in ComfyUI; diffusers has "
+                          "no LoKr or OFT loader.",
                           when=lambda: not self.w["finetune"].value):
-            self.bind(ui.select({"lora": "LoRA", "lokr": "LoKr"}, label="Adapter"), "network_type").classes("w-full")
+            self.bind(ui.select({"lora": "LoRA", "lokr": "LoKr", "oft": "OFT"}, label="Adapter"), "network_type") \
+                .classes("w-full")
+        with self.setting(None, "DoRA",
+                          "Splits each layer's weight into a direction, which the LoRA / LoKr changes, and a "
+                          "magnitude that trains on its own (weight-decomposed adaptation). Saved as keys ComfyUI "
+                          "applies; diffusers cannot read them. Steps are somewhat slower. Race it with and without.",
+                          when=lambda: not self.w["finetune"].value and self.w["network_type"].value != "oft"):
+            self.bind(ui.switch("DoRA"), "dora")
+        with self.setting(None, "OFT block size",
+                          "Each layer's output channels rotate in blocks of this size. Larger blocks rotate more "
+                          "channels together: more freedom and more weights (32: about as many as a rank 16 LoRA).",
+                          when=lambda: not self.w["finetune"].value and self.w["network_type"].value == "oft"):
+            self.bind(ui.number("Block size", min=2, max=256, precision=0), "oft_block_size").classes("w-full")
         with self.setting("lokr_factor", "LoKr factor",
                           "How the Kronecker pair splits each layer: the first factor is at most this. Lower is more "
                           "capacity and bigger files (8: about 400 MB on a 12B model, 16: about 100 MB). Fizgig found "
@@ -3807,8 +3827,10 @@ def history_rows(runs: list[dict]) -> list[dict]:
     rows = []
     for r in runs:
         cfg, probes = r.get("config") or {}, r.get("probes") or {}
-        adapter = ("fine-tune" if cfg.get("finetune") else f"LoKr f{cfg.get('lokr_factor', 8)}"
-                   if cfg.get("network_type") == "lokr" else f"LoRA r{cfg.get('lora_rank', '?')}")
+        adapter = ("fine-tune" if cfg.get("finetune") else f"OFT b{cfg.get('oft_block_size', 32)}"
+                   if cfg.get("network_type") == "oft" else f"LoKr f{cfg.get('lokr_factor', 8)}"
+                   if cfg.get("network_type") == "lokr" else f"LoRA r{cfg.get('lora_rank', '?')}") \
+            + (" + DoRA" if cfg.get("dora") else "")
         comb = probes.get("combined") or []
         rows.append({"id": r["id"], "run": history_label(r),
                      "started": datetime.fromtimestamp(r.get("started") or 0).strftime("%Y-%m-%d %H:%M"),
@@ -4517,19 +4539,35 @@ def build_page(local: bool = True):
 
                         w["finetune"].on_value_change(on_finetune)
                         with fields():
-                            w["network_type"] = ui.select({"lora": "LoRA", "lokr": "LoKr"}, value=d.network_type,
-                                                          label="Adapter").classes("w-28") \
+                            w["network_type"] = ui.select({"lora": "LoRA", "lokr": "LoKr", "oft": "OFT"},
+                                                          value=d.network_type, label="Adapter").classes("w-28") \
                                 .tooltip("LoRA: a rank-r pair per layer (rank, alpha). LoKr: a Kronecker pair, w1 "
                                          "up to factor x factor and w2 the rest (about 1/64 of the weights at "
                                          "factor 8, Fizgig's measured default: its highest likeness, more natural "
-                                         "skin, ~20% slower steps). LyCORIS format: loads in ComfyUI (Krea 2 "
-                                         "included); diffusers has no LoKr loader. Rank, alpha, LoRA+ and dropout "
-                                         "are LoRA-only.")
+                                         "skin, ~20% slower steps). OFT: rotates each layer's output channels in "
+                                         "blocks instead of adding to the weights, which keeps the base model's "
+                                         "structure; the OFT paper found it held a subject's identity better than "
+                                         "LoRA and stayed stable in long runs. LoKr and OFT are LyCORIS files that "
+                                         "load in ComfyUI (Krea 2 included); diffusers has no loader for them. Rank, "
+                                         "alpha, LoRA+ and dropout are LoRA-only.")
                             w["lora_rank"] = ui.number("Rank", value=d.lora_rank, min=1, max=256, precision=0) \
                                 .classes("w-28") \
-                                .bind_visibility_from(w["network_type"], "value", lambda x: x != "lokr")
+                                .bind_visibility_from(w["network_type"], "value", lambda x: x == "lora")
                             w["lora_alpha"] = ui.number("Alpha", value=d.lora_alpha).classes("w-28") \
-                                .bind_visibility_from(w["network_type"], "value", lambda x: x != "lokr")
+                                .bind_visibility_from(w["network_type"], "value", lambda x: x == "lora")
+                            w["oft_block_size"] = ui.number("OFT block size", value=d.oft_block_size, min=2, max=256,
+                                                            precision=0).classes("w-36") \
+                                .bind_visibility_from(w["network_type"], "value", lambda x: x == "oft") \
+                                .tooltip("Each layer's output channels are rotated in blocks of this size (the "
+                                         "largest divisor of the layer's outputs up to it). Larger blocks rotate more "
+                                         "channels together: more freedom and weights (32: about as many as a rank "
+                                         "16 LoRA on a square layer).")
+                            w["oft_constraint"] = ui.number("OFT constraint (0 = off)", value=d.oft_constraint, min=0,
+                                                            step=0.01).classes("w-48") \
+                                .bind_visibility_from(w["network_type"], "value", lambda x: x == "oft") \
+                                .tooltip("COFT: caps how far each layer may rotate away from the base model (the "
+                                         "norm of its rotation generator), saved as the file's alpha, which ComfyUI "
+                                         "applies the same way. 0 = no cap.")
                             w["lokr_factor"] = ui.number("LoKr factor", value=d.lokr_factor, min=1, max=64,
                                                          precision=0).classes("w-32") \
                                 .bind_visibility_from(w["network_type"], "value", lambda x: x == "lokr") \
@@ -4537,9 +4575,16 @@ def build_page(local: bool = True):
                                          "input size that are <= the factor; w2 holds the rest. Lower = more "
                                          "capacity and bigger files (8: ~400 MB on a 12B model, 16: ~100 MB). "
                                          "Fizgig found no quality gain above 8.")
+                            w["dora"] = ui.switch("DoRA", value=d.dora) \
+                                .bind_visibility_from(w["network_type"], "value", lambda x: x != "oft") \
+                                .tooltip("Weight-decomposed LoRA / LoKr: each layer's weight is split into a "
+                                         "direction (the adapter changes it) and a magnitude per input channel that "
+                                         "trains on its own. Saved as dora_scale keys that ComfyUI applies; "
+                                         "diffusers cannot read them. Each step also computes the layer's norm from "
+                                         "its full weight: steps about 40% slower (Krea 2).")
                             w["lora_plus_ratio"] = ui.number("LoRA+ ratio (0 = off, 16 = paper)",
                                                              value=d.lora_plus_ratio, step=1).classes("w-60") \
-                                .bind_visibility_from(w["network_type"], "value", lambda x: x != "lokr") \
+                                .bind_visibility_from(w["network_type"], "value", lambda x: x == "lora") \
                                 .tooltip("lora_up learns at lr x ratio (faster convergence); ignored by automagic3")
                             w["lora_save_dtype"] = ui.select(["bf16", "fp16", "fp32"], value=d.lora_save_dtype,
                                                              label="Save LoRA as").classes("w-36")
@@ -5935,6 +5980,15 @@ The trained LoRA is copied onto it before each sampling pass; the training model
 ## Turbo LoRA
 An optional ComfyUI-format LoRA (for example an 8-step distill) applied only while generating sample images,
 never during the training step. Set *Sample steps* to match it.
+
+## Adapters: LoRA, LoKr, OFT and DoRA
+The *Adapter* field (Train tab, LoRA section) picks what each layer learns. **LoRA**: a rank-r pair. **LoKr**: a
+Kronecker pair (factor 8 is Fizgig's best measured likeness). **OFT**: rotates each layer's output channels in blocks
+(*OFT block size*, 32) instead of adding to the weights, which keeps the base model's structure; the OFT paper found
+better subject identity than LoRA and stable long runs. *OFT constraint* > 0 caps how far a layer rotates. **DoRA**
+(a switch for LoRA and LoKr): a magnitude per input channel trains on its own while the adapter steers the
+direction; steps are about 40% slower on Krea 2. OFT and DoRA files load in ComfyUI exactly as trained (not in diffusers). To
+compare them, race rows such as `network_type=oft` or `dora=true` against a LoKr row.
 
 ## Previous runs (run history)
 

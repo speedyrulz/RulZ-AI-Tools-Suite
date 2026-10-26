@@ -318,8 +318,12 @@ class TrainConfig:
     sigma_max: float = 1.0
     # --- identity training: LoRA+ ---
     lora_plus_ratio: float = 0.0  # lr of lora_up = lr x ratio (0/1 = off, 16 = LoRA+ paper); not with automagic3
-    network_type: str = "lora"  # lora | lokr (LyCORIS Kronecker factors: w1 up to lokr_factor square, w2 the rest)
+    network_type: str = "lora"  # lora | lokr (LyCORIS Kronecker factors: w1 up to lokr_factor square, w2 the rest) |
+    #                             oft (orthogonal fine-tuning: each layer's output channels rotated in blocks)
     lokr_factor: int = 8  # LoKr: w1 is [a, b] with a, b the largest divisors of out / in <= this (8: Fizgig's default)
+    oft_block_size: int = 32  # OFT: rotation block size (the largest divisor of each layer's outputs <= this)
+    oft_constraint: float = 0.0  # OFT: cap on the rotation's size (COFT; the file's .alpha); 0 = none
+    dora: bool = False  # DoRA on a LoRA or LoKr: the weight split into a trained magnitude and a direction
     # --- identity training: automatic crops ---
     crop_augment: str = "none"  # none | face | face+bust: add face / bust crops of each image as extra items
     crop_augment_min_px: int = 0  # min crop side in source px; 0 = the training resolution (never upscale crops)
@@ -426,6 +430,16 @@ class TrainConfig:
         parse_clean_share(self.clean_share)
         if self.finetune:
             self.validate_finetune()
+        from .lora import KINDS as NETWORK_KINDS
+
+        if self.network_type not in NETWORK_KINDS:
+            raise ValueError(f"network_type must be one of {NETWORK_KINDS}, got {self.network_type!r}")
+        if self.oft_block_size < 2 or self.oft_constraint < 0:
+            raise ValueError("oft_block_size must be 2 or more and oft_constraint 0 (off) or more")
+        if self.dora and self.network_type == "oft":
+            raise ValueError("dora works on a LoRA or a LoKr; OFT rotates the weights instead (turn one off)")
+        if self.dora and self.finetune:
+            raise ValueError("dora is an adapter option; a fine-tune trains the weights themselves (turn one off)")
         if self.keep_checkpoints < 0:
             raise ValueError("keep_checkpoints must be 0 (keep all) or the number of checkpoints to keep")
         if self.block_swap:

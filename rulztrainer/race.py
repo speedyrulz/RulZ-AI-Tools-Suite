@@ -52,7 +52,7 @@ RACE_KEYS: dict[str, tuple[str, ...]] = {
         "loss_watch_healthy_mult", "loss_watch_exclude_after"),
     "LoRA rank & layers": (
         "lora_rank", "lora_alpha", "lora_targets", "lora_blocks", "train_text_embedder", "lora_dropout",
-        "network_type", "lokr_factor"),
+        "network_type", "lokr_factor", "oft_block_size", "oft_constraint", "dora"),
     "Data & augmentation": ("caption_dropout", "flip_augment", "crop_augment", "crop_augment_weight", "look_warmup",
                             "look_warmup_start", "look_warmup_epochs"),
 }
@@ -329,6 +329,8 @@ class Variant:
         self.names = list(names)  # its LoRA modules (a subset of the trainer's wrappers)
         self.rank, self.alpha, self.dropout = int(cfg.lora_rank), float(cfg.lora_alpha), float(cfg.lora_dropout)
         self.kind, self.factor = str(getattr(cfg, "network_type", "lora")), int(getattr(cfg, "lokr_factor", 8))
+        self.block, self.constraint = int(getattr(cfg, "oft_block_size", 32)), float(getattr(cfg, "oft_constraint", 0))
+        self.dora = bool(getattr(cfg, "dora", False)) and self.kind != "oft"
         self.weights: dict[str, dict[str, torch.Tensor]] = {}  # {module: {part: CPU fp32 tensor}} while parked
         self.started = False  # optimizer, scheduler and the rest are built on its first turn
         self.state: dict = {}  # the trainer's per-run state (optimizer, scheduler, ema, step, losses, ...)
@@ -340,17 +342,26 @@ class Variant:
     def scale(self) -> float:
         return self.alpha / self.rank if self.kind == "lora" else 1.0
 
+    @property
+    def label(self) -> str:
+        from .lora import adapter_label
+
+        return adapter_label(self.kind, self.rank, self.alpha, self.factor, self.block, self.dora, self.constraint)
+
+    def _ns(self, parts: dict, **extra) -> SimpleNamespace:
+        """A module-like view of the configuration's adapter on one layer (for save_lora and the optimizer)."""
+        return SimpleNamespace(kind=self.kind, alpha=self.alpha, rank=self.rank, factor=self.factor,
+                               block=self.block, constraint=self.constraint, dora=self.dora, trainable=True,
+                               adapter_params=lambda parts=parts: parts, **extra)
+
     def init_lora(self, wrappers: dict, seed: int) -> None:
-        """Fresh adapter weights as LoRALinear.init_adapter makes them (the first factor kaiming-uniform, the second
-        zero). Seeded per module name, so every configuration with the same shapes starts from the same weights."""
+        """Fresh adapter weights as LoRALinear.init_parts makes them (a LoRA / LoKr: the first factor
+        kaiming-uniform, the second zero; OFT: zero; DoRA's magnitude: the layer's own norm). Seeded per module name,
+        so every configuration with the same shapes starts from the same weights."""
         for name in self.names:
             m = wrappers[name]
             g = torch.Generator().manual_seed((seed * 1_000_003 + zlib.crc32(name.encode())) % (2**63))
-            shapes = m.adapter_shapes(self.kind, self.rank, self.factor)
-            first, second = list(shapes)
-            w = torch.empty(shapes[first])
-            nn.init.kaiming_uniform_(w, a=math.sqrt(5), generator=g)
-            self.weights[name] = {first: w, second: torch.zeros(shapes[second])}
+            self.weights[name] = m.init_parts(self.kind, self.rank, self.factor, self.block, self.dora, generator=g)
 
     def view(self, use_average: bool = False) -> dict:
         """Module-like views of the parked weights (or of its weight average) for lora.save_lora."""
@@ -359,8 +370,7 @@ class Variant:
         out = {}
         for name in self.names:
             parts = {part: avg.get(f"{name}.{part}", t) for part, t in self.weights[name].items()}
-            out[name] = SimpleNamespace(kind=self.kind, alpha=self.alpha, rank=self.rank, factor=self.factor,
-                                        trainable=True, adapter_params=lambda parts=parts: parts)
+            out[name] = self._ns(parts)
         return out
 
     @property
@@ -375,8 +385,7 @@ class Variant:
         for name in self.names:
             parts = {part: nn.Parameter(t.detach().clone().to(device)) for part, t in self.weights[name].items()}
             self.weights[name] = parts
-            view = SimpleNamespace(kind=self.kind, alpha=self.alpha, rank=self.rank, factor=self.factor,
-                                   trainable=True, multiplier=1.0, adapter_params=lambda parts=parts: parts)
+            view = self._ns(parts, multiplier=1.0)
             if self.kind == "lora":
                 view.lora_down, view.lora_up = (SimpleNamespace(weight=parts["lora_down"]),
                                                 SimpleNamespace(weight=parts["lora_up"]))
@@ -407,12 +416,14 @@ def swap_in(v: Variant, wrappers: dict) -> None:
     for name, m in wrappers.items():
         dev = m.lora_down.weight.device  # the adapter's own device (a swapped block's frozen weight is in RAM)
         if name in v.weights:
-            if m.kind != v.kind:
-                m.set_kind(v.kind)
+            dora, block = getattr(v, "dora", False), getattr(v, "block", m.block)
+            if (m.kind, m.dora, m.block) != (v.kind, dora, block):
+                m.set_kind(v.kind, dora=dora, block=block)
             params = m.adapter_params()
             for part, t in v.weights[name].items():
                 params[part].data = t.detach().to(dev)  # the same storage when already there (race_parallel)
             m.rank, m.alpha, m.factor, m.scale = v.rank, v.alpha, v.factor, v.scale
+            m.constraint = getattr(v, "constraint", 0.0)
             p = getattr(m.dropout, "p", 0.0)
             if p != v.dropout:
                 m.dropout = _dropout_module(v.dropout)

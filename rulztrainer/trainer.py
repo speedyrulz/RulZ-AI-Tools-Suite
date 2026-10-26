@@ -723,7 +723,8 @@ class Trainer(RaceParallelMixin):
             injected = lora_mod.inject_lora(model, cfg.lora_rank, cfg.lora_alpha, cfg.lora_targets,
                                             include_text_embedder=cfg.train_text_embedder, dropout=cfg.lora_dropout,
                                             blocks=blocks, names=self._lora_names(model, blocks),
-                                            kind=cfg.network_type, factor=cfg.lokr_factor)
+                                            kind=cfg.network_type, factor=cfg.lokr_factor,
+                                            block=cfg.oft_block_size, constraint=cfg.oft_constraint, dora=cfg.dora)
             backprop = lora_mod.backprop_blocks(model, injected, blocks)  # blocks the backward runs from (None = all)
         if blocks is not None:
             log.info("LoRA blocks: %s (%d of %d); %s", lora_mod.format_blocks(blocks), len(blocks), len(model.layers),
@@ -745,7 +746,8 @@ class Trainer(RaceParallelMixin):
                 inj = lora_mod.inject_lora(m, cfg.lora_rank, cfg.lora_alpha, cfg.lora_targets,
                                            include_text_embedder=cfg.train_text_embedder, dropout=cfg.lora_dropout,
                                            blocks=blocks, names=self._lora_names(m, blocks),
-                                           kind=cfg.network_type, factor=cfg.lokr_factor)
+                                           kind=cfg.network_type, factor=cfg.lokr_factor,
+                                           block=cfg.oft_block_size, constraint=cfg.oft_constraint, dora=cfg.dora)
                 reps.append((m, inj, dev))
                 self.replicas.append((m, inj, dev))
             self.dp = DataParallelLoRA(injected, reps)
@@ -768,12 +770,11 @@ class Trainer(RaceParallelMixin):
         elif self.race_rows is None:
             params = list(lora_mod.lora_parameters(injected))
             n_params = sum(p.numel() for p in params)
-            if cfg.network_type == "lokr":
-                log.info("LoKr: %d modules, %.2fM trainable params, factor %d (w1 up to %d x %d per layer, w2 the "
-                         "rest)", len(injected), n_params / 1e6, cfg.lokr_factor, cfg.lokr_factor, cfg.lokr_factor)
-            else:
-                log.info("LoRA: %d modules, %.2fM trainable params, rank %d alpha %g", len(injected), n_params / 1e6,
-                         cfg.lora_rank, cfg.lora_alpha)
+            log.info("%s: %d modules, %.2fM trainable params%s", lora_mod.adapter_label(
+                cfg.network_type, cfg.lora_rank, cfg.lora_alpha, cfg.lokr_factor, cfg.oft_block_size, cfg.dora,
+                cfg.oft_constraint), len(injected), n_params / 1e6,
+                " (LoKr: w1 up to factor x factor per layer, w2 the rest)" if cfg.network_type == "lokr" else
+                " (OFT: output channels rotated in blocks)" if cfg.network_type == "oft" else "")
             optimizer, scheduler = self._make_optimizer(cfg, injected)
         else:  # each configuration of the race builds its own on its first turn
             params, optimizer, scheduler = [], None, None
@@ -1318,8 +1319,10 @@ class Trainer(RaceParallelMixin):
         name = f"{cfg.job_name}{tag}.safetensors" if final else f"{cfg.job_name}{tag}_{step:06d}.safetensors"
         path = self.job_dir / name
         meta = {"ss_base_model": cfg.model_path if cfg.model_source == "hf" else Path(cfg.transformer_file).name,
-                "ss_network_dim": str(cfg.lokr_factor if cfg.network_type == "lokr" else cfg.lora_rank),
-                "ss_network_alpha": str(1.0 if cfg.network_type == "lokr" else cfg.lora_alpha),
+                "ss_network_dim": str({"lokr": cfg.lokr_factor, "oft": cfg.oft_block_size}.get(cfg.network_type,
+                                                                                               cfg.lora_rank)),
+                "ss_network_alpha": str({"lokr": 1.0, "oft": cfg.oft_constraint}.get(cfg.network_type,
+                                                                                      cfg.lora_alpha)),
                 "ss_steps": str(step), "modelspec.architecture": self.arch.modelspec,
                 "rulztrainer_config": cfg.to_dict(), "ss_blocks": cfg.lora_blocks or "all"}
         if self.ema is not None:
@@ -1599,10 +1602,8 @@ class Trainer(RaceParallelMixin):
             v.state["items"] = race_mod.variant_items(items, vcfg, self.race_region_dirs.get(name))
             v.state["controller"] = LikenessController(vcfg, **self._controller_ceilings())
             n_w = v.n_weights
-            log.info("Race configuration %s: %d %s modules, %.2fM weights (%s), %d dataset items",
-                     name, len(names), "LoKr" if v.kind == "lokr" else "LoRA", n_w / 1e6,
-                     f"factor {v.factor}" if v.kind == "lokr" else f"rank {v.rank}, alpha {v.alpha:g}",
-                     len(v.state["items"]))
+            log.info("Race configuration %s: %d modules, %.2fM weights (%s), %d dataset items",
+                     name, len(names), n_w / 1e6, v.label, len(v.state["items"]))
             variants.append(v)
         est = race_mod.estimate_steps(len(variants), base.race_warmup_probes, base.probe_every, base.steps)
         self.race = race_mod.RaceRun(variants, race_mod.RaceSchedule([v.name for v in variants],
@@ -1741,8 +1742,9 @@ class Trainer(RaceParallelMixin):
         """Save a dropped configuration's LoRA (its weight average when it has one) and free its state."""
         cfg = self.race.base_cfg
         path = self.job_dir / f"{cfg.job_name}_{v.name}_dropped.safetensors"
-        meta = {"ss_network_dim": str(v.factor if v.kind == "lokr" else v.rank),
-                "ss_network_alpha": str(1.0 if v.kind == "lokr" else v.alpha), "modelspec.architecture":
+        meta = {"ss_network_dim": str({"lokr": v.factor, "oft": v.block}.get(v.kind, v.rank)),
+                "ss_network_alpha": str({"lokr": 1.0, "oft": v.constraint}.get(v.kind, v.alpha)),
+                "modelspec.architecture":
                 self.arch.modelspec, "rulztrainer_race": f"{v.name}: {race_mod.format_overrides(v.overrides)}",
                 "ss_steps": str(v.state.get("step", 0))}
         if v is self.race.active and not self.race_parallel:
@@ -1936,7 +1938,8 @@ class Trainer(RaceParallelMixin):
             inj = lora_mod.inject_lora(m, cfg.lora_rank, cfg.lora_alpha, cfg.lora_targets,
                                        include_text_embedder=cfg.train_text_embedder, blocks=blocks,
                                        names=self._lora_names(m, blocks), kind=cfg.network_type,
-                                       factor=cfg.lokr_factor)
+                                       factor=cfg.lokr_factor, block=cfg.oft_block_size,
+                                       constraint=cfg.oft_constraint, dora=cfg.dora)
             source = self.race.wrappers if self.race is not None else self.injected
             if set(inj) != set(source):
                 raise ValueError("Sampling model has different LoRA targets than the training model")
@@ -2045,7 +2048,7 @@ class Trainer(RaceParallelMixin):
 
     def sample_images(self, model, step):
         self._free_for_rendering()
-        with self._averaged(replicas=True), self._sampling_slots(model, step) as slots:
+        with self._averaged(replicas=True), lora_mod.frozen_adapters(), self._sampling_slots(model, step) as slots:
             return self._sample_with(slots, step)
 
     # ------------------------------------------------------------ per-image loss watch
@@ -2411,7 +2414,7 @@ class Trainer(RaceParallelMixin):
 
         cfg = self.cfg
         t0 = time.time()
-        with self._sampling_slots(model, step) as slots:
+        with lora_mod.frozen_adapters(), self._sampling_slots(model, step) as slots:
             face, body, images = self._probe_with(slots, step)
         self.last_probe = (face, body, images)
         rec, actions = self.controller.update(step, face, body, images)

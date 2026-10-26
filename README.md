@@ -890,6 +890,43 @@ data"; ~20% slower steps; files ~1/64 of the weights, about 400 MB on a 12B mode
 - EMA, the configuration race (one row `network_type=lokr, lokr_factor=8` against a LoRA row trains both on the same
   layers and lets the probes pick), the sampling model and data parallel all handle it.
 
+## OFT (`network_type: oft`) and DoRA (`dora`)
+
+Two more adapters to race against LoRA and LoKr. Both save files ComfyUI's LoRA loader applies as they were trained:
+its own weight-adapter code, run on the saved keys, reproduces the training forward to about 1e-7 (plain and int8
+weights, with and without the OFT constraint). diffusers has no loader for either.
+
+- **OFT** (orthogonal fine-tuning, LyCORIS diag-OFT). Instead of adding to a layer it rotates the layer's output
+  channels in blocks of `oft_block_size` (32; the largest divisor of each layer's outputs up to it), with an
+  orthogonal R from the Cayley transform of a skew-symmetric matrix, so the base model's structure (its weights'
+  norms and angles) is kept. The OFT paper reported better subject identity than LoRA (DINO 0.632 vs 0.613 on
+  DreamBooth objects with Stable Diffusion) and stable results over long runs where LoRA drifted. `oft_constraint`
+  > 0 (COFT) caps how far each layer rotates. Blocks start at zero (R = I). The rotation is applied to the frozen
+  layer's output, so it trains on int8 / nvfp4 weights as they are. Keys: `<stem>.oft_blocks` [blocks, size, size]
+  and, with a constraint, `<stem>.alpha` (ComfyUI reads it as that cap). Rank, alpha, LoRA+ and DoRA do not apply.
+- **DoRA** (weight-decomposed LoRA, on a LoRA or a LoKr). The merged weight is W' = (W + delta) * m / ||W + delta||
+  per input column: the adapter steers the direction, and a magnitude m per input channel trains on its own (it
+  starts at ||W||, so the layer is unchanged at step 0). The norm is computed every forward from the dequantized
+  weight, without gradient (the DoRA paper's memory saving), so steps cost more. Saved as `<stem>.dora_scale` [1, in]
+  next to the LoRA / LoKr keys. The input axis is deliberate: ComfyUI's `weight_decompose` normalizes the merged
+  weight on that axis, but on the output axis it divides by the original weight's norm, which would not match what
+  DoRA trains. A plain LoRA resumed with `dora: true` starts its magnitude where the loaded weights leave it.
+- In a race: rows like `network_type=oft, oft_block_size=32` or `dora=true` next to a LoKr row train on the same
+  layers from the same start, and the probes pick. EMA, the sampling model, data parallel, `resume_from` and the
+  race's saved files all handle both.
+- Measured cost, Krea 2 nvfp4 at 0.25 MP on the 16 GB RTX 4060 Ti (12-step runs, steady step time; likeness not yet
+  compared on a full run):
+
+  | Adapter | Trainable weights | Step | Blocks kept from the recompute |
+  |---|---|---|---|
+  | LoKr 8 | 195 M | 3.5 s | 2 |
+  | OFT block 32 | 58 M | 2.6 s | 4 |
+  | LoKr 8 + DoRA | 197 M | 4.9 s | 1 |
+
+  DoRA's extra time is the norm from the full (dequantized) weight in every forward and its recompute; while
+  samples and probes render it is computed once per layer per round (a probe: 14-15 s, as LoKr's). ComfyUI's own
+  loader (a 2026-10-20 build) read every key of the three race files above and merged them without errors.
+
 ## LoRA Isolation (`isolation`)
 
 A character LoRA spreads its subject onto other people: strangers in the background, a friend beside them, a crowd.

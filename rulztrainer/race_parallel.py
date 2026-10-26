@@ -132,7 +132,7 @@ class RaceParallelMixin:
         for a probe, a sample or a save."""
         src = {name: dict(ns.adapter_params()) for name, ns in self._rp_view(v).items()}
         tmp = SimpleNamespace(weights=src, names=v.names, kind=v.kind, rank=v.rank, alpha=v.alpha, factor=v.factor,
-                              scale=v.scale, dropout=v.dropout)
+                              scale=v.scale, dropout=v.dropout, block=v.block, constraint=v.constraint, dora=v.dora)
         race_mod.swap_in(tmp, self.race.wrappers)
         self.dp.sync_weights()
 
