@@ -41,11 +41,11 @@ def test_bucket_size_per_side_keeps_aspect():
             assert bw % 16 == 0 and bh % 16 == 0
             assert abs(bw * bh - side * side) / (side * side) < 0.08, (side, w, h, bw, bh)
             assert abs(bw / bh - w / h) < 0.08
-    # 0.25 MP portrait with the default 512 minimum: it used to be cropped to 512x624; now the whole bucket is
-    # scaled up so the aspect ratio survives
+    # 0.25 MP with the default 512 minimum: the pixel count stays ~512^2 (ai-toolkit style), not short edge >= 512
     cfg = TrainConfig(min_bucket_side=512, max_bucket_side=2048)
-    bw, bh = D.bucket_size(1000, 1500, cfg, 512)
-    assert bh >= 512 and bw >= 512 and abs(bw / bh - 2 / 3) < 0.06, (bw, bh)
+    for w, h in ((1000, 1500), (1500, 1000), (1600, 900)):
+        bw, bh = D.bucket_size(w, h, cfg, 512)
+        assert abs(bw * bh - 512 * 512) / (512 * 512) < 0.08 and abs(bw / bh - w / h) < 0.08, (bw, bh)
     # the default (cfg.resolution) path is unchanged for ordinary aspects
     assert D.bucket_size(1000, 1500, cfg) == D.bucket_size(1000, 1500, cfg, 1024)
     assert D.bucket_size(1000, 1500, TrainConfig(enable_buckets=False), 512) == (512, 512)
