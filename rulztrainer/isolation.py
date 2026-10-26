@@ -245,6 +245,13 @@ def build_pairs(subject: Subject, photos: list[Path], out_dir: Path, people, n: 
     return [(out_dir / f, c) for f, c in pairs]
 
 
+def pair_side(caption: str, fused: str) -> str:
+    """The subject's panel in a side-by-side pair from its caption ("... and gweltman on the right, ..."): "left",
+    "right", or "" when the caption does not say."""
+    m = re.search(rf"{re.escape(fused)} on the (left|right)\b", caption, re.IGNORECASE)
+    return m.group(1).lower() if m else ""
+
+
 def balance_repeats(counts: dict[str, int], repeats: dict[str, int]) -> dict[str, int]:
     """Repeats per subject dataset so each comes up about as often per epoch as the largest (images x repeats)."""
     top = max((counts[d] * repeats.get(d, 1) for d in counts), default=0)

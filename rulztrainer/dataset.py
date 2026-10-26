@@ -50,6 +50,7 @@ class Item:
     loss_scale: float = 1.0  # its loss weight (LoRA Isolation's side-by-side pairs train at isolation_pair_weight)
     dop_caption: str | None = None  # LoRA Isolation: the trigger-free caption of its DOP pass (None: no DOP)
     dop_text_path: Path | None = None  # its cached text features
+    pair_side: str = ""  # LoRA Isolation's side-by-side pairs: the subject's panel ("left" / "right"; never mirrored)
 
     @property
     def key(self) -> str:

@@ -362,7 +362,7 @@ class Trainer(RaceParallelMixin):
         self.align_layer: int | None = None
         self.id_aligner = None
         self.id_align_opt = None
-        self.align_values: dict[str, list[float]] = {"attn": [], "id": []}
+        self.align_values: dict[str, list[float]] = {"attn": [], "id": [], "pairs": []}
         if not (0.0 <= cfg.sigma_min < cfg.sigma_max <= 1.0):
             raise ValueError("sigma_min/sigma_max must satisfy 0 <= sigma_min < sigma_max <= 1")
         self.devices: list[str] = [cfg.device]
@@ -1165,7 +1165,10 @@ class Trainer(RaceParallelMixin):
                     vals = self.align_values[key]
                     if vals:
                         id_s += f" | {label} {sum(vals) / len(vals):.3f}"
+                        if key == "attn" and sum(self.align_values["pairs"]):
+                            id_s += f" ({sum(self.align_values['pairs'])} Isolation pairs)"
                         vals.clear()
+                self.align_values["pairs"].clear()
                 last = step_times[-5:]
                 who = f"[{self.race.active.name}] " if self._race_running() else ""
                 log.info("%sstep %d/%d loss %.4f avg %.4f lr %.2e %.1fs/it (last %d steps %.2fs each)%s", who, step,
@@ -2236,7 +2239,8 @@ class Trainer(RaceParallelMixin):
                     items.append(Item(image=png, caption=caption, width=bw, height=bh,
                                       latent_path=cache / "latents" / f"{stem}{tag}.safetensors", latent_flip_path=None,
                                       text_path=text_cache_path(cfg, caption), category="pair", side=side,
-                                      repeats=reps, dataset=d, loss_scale=cfg.isolation_pair_weight))
+                                      repeats=reps, dataset=d, loss_scale=cfg.isolation_pair_weight,
+                                      pair_side=iso.pair_side(caption, s.fused)))
                     n_pairs += 1
         n_dop = 0
         for it in items:
@@ -2505,9 +2509,12 @@ class Trainer(RaceParallelMixin):
 
         terms = []
         if use_attn:
-            val, _ = A.localization_loss(taps, regions)
+            hh, ww = regions.prior.shape[-2:]  # a pair's subject is its own panel; the stranger's counts as leakage
+            val, _ = A.localization_loss(taps, regions, [A.panel_mask(getattr(it, "pair_side", ""), hh, ww)
+                                                         for it in batch])
             if val is not None:
                 self.align_values["attn"].append(float(val.detach()))
+                self.align_values["pairs"].append(sum(1 for it in batch if getattr(it, "pair_side", "")))
                 terms.append(cfg.attn_localize_weight * val)
         if use_align:
             targets = [self.face_embs.get(str(it.image.resolve())) for it in batch]

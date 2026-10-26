@@ -730,6 +730,9 @@ character, and race keys. Neither is measured for likeness yet: race them agains
   tokenizer and prompt template (each dataset's trigger, Isolation's fused words, caption dropout's prompt); FIBO 2.0
   condenses the caption into Perceiver gist tokens, so it is read in the cross-attention of its injection blocks.
   Person masks are built for it even without the region-weighted loss. Needs a trigger word.
+  In LoRA Isolation's side-by-side pairs (the subject next to a generated stranger) the subject's panel is the
+  region, so the trigger's attention on the stranger counts against it: MultiCrafter's case of two subjects in one
+  picture. The step log counts the pairs it saw.
 - **Identity alignment** (`id_align`, weight `id_align_weight` 0.05, block `id_align_layer`; auto: a third of the
   depth). After that block, the image tokens inside the face box are averaged and a small MLP (about 7M weights on
   Krea 2, its own AdamW, never saved) maps them onto that photo's ArcFace embedding (stored with the face analysis);

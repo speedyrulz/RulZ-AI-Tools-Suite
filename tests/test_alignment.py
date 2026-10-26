@@ -183,3 +183,29 @@ def test_config_checks():
         TrainConfig(attn_localize=True).validate()
     with pytest.raises(ValueError, match="weight"):
         TrainConfig(id_align_weight=-1).validate()
+
+
+def test_isolation_pairs_use_the_subjects_panel():
+    from rulztrainer import isolation as iso
+
+    caption = "a man with a beard on the left, and gweltman on the right, two people side by side, two portraits"
+    assert iso.pair_side(caption, "gweltman") == "right" and iso.pair_side(caption, "zkrea") == ""
+    assert iso.pair_side("zkrea on the left, a woman on the right", "zkrea") == "left"
+    left = A.panel_mask("left", 2, 5).view(2, 5)
+    assert left[:, :2].eq(1).all() and left[:, 2:].eq(0).all()  # the odd middle column belongs to neither
+    assert A.panel_mask("right", 2, 4).view(2, 4)[:, 2:].eq(1).all() and A.panel_mask("", 2, 4) is None
+    # a pair has no region map (uniform: no subject), so only the panel makes it count
+    regions = SimpleNamespace(prior=torch.zeros(1, 1, H, W, dtype=torch.bool),
+                              meta=[SimpleNamespace(prior=torch.zeros(1, H, W, dtype=torch.bool), face_cells=None,
+                                                    has_person=False)])
+    taps = A.Taps([], [3])
+    taps.begin([[0]])
+    on_right = torch.full((H * W, 2), 0.5)
+    right = A.panel_mask("right", H, W).bool()
+    on_right[right, 0], on_right[right, 1] = 1.0, 0.0  # the trigger (token 0) is attended to on the right only
+    on_right[~right, 0], on_right[~right, 1] = 0.0, 1.0
+    taps.attn = {3: {0: on_right}}
+    assert A.localization_loss(taps, regions) == (None, 0)
+    loss, n = A.localization_loss(taps, regions, [A.panel_mask("right", H, W)])
+    assert n == 1 and float(loss) < 1e-6
+    assert abs(float(A.localization_loss(taps, regions, [A.panel_mask("left", H, W)])[0]) - 1.0) < 1e-6

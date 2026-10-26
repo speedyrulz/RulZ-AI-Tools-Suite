@@ -8,7 +8,9 @@ alignment's small projector is thrown away.
     the subject (the person mask and face box the region maps already hold): 1 - share inside. It ties the identity
     to the trigger and keeps the trigger's attention off the background and off other people, the kind of
     positional supervision MultiCrafter (2025) used on FLUX's attention to stop attributes leaking between subjects.
-    MOSS-Image and Krea 2 read it in their joint attention; FIBO 2.0 condenses the caption into Perceiver "gist"
+    In LoRA Isolation's side-by-side pairs (the subject next to a generated stranger) the subject's panel is the
+    region, so the trigger's attention on the stranger counts against it: MultiCrafter's case of two subjects in one
+    picture. MOSS-Image and Krea 2 read it in their joint attention; FIBO 2.0 condenses the caption into Perceiver "gist"
     tokens, so there it is read in the cross-attention of its injection blocks, which see the caption token by
     token.
   * identity feature alignment (id_align): after one block, the image tokens inside the face box are averaged and a
@@ -139,14 +141,31 @@ def subject_mask(rm) -> torch.Tensor | None:
     return (~rm.prior).flatten().float()
 
 
-def localization_loss(taps: Taps, regions) -> tuple[torch.Tensor | None, int]:
+def panel_mask(side: str, h: int, w: int) -> torch.Tensor | None:
+    """The subject's cells [h * w] in a LoRA Isolation pair (two square panels side by side): its half of the
+    picture, the middle column of an odd width left out; None when it is not a pair."""
+    if side not in ("left", "right"):
+        return None
+    m = torch.zeros(h, w)
+    half = w // 2
+    if side == "left":
+        m[:, :half] = 1.0
+    else:
+        m[:, w - half:] = 1.0
+    return m.flatten()
+
+
+def localization_loss(taps: Taps, regions, masks: list | None = None) -> tuple[torch.Tensor | None, int]:
     """1 - the share of the trigger's attention map (normalized to sum 1 over the image) that lies on the subject,
-    averaged over the tapped layers and the samples that have a subject and a trigger. Returns (loss, samples)."""
+    averaged over the tapped layers and the samples that have a subject and a trigger. masks: per sample, a subject
+    mask [h * w] that replaces the region map's (a LoRA Isolation pair: the subject's panel, so attention on the
+    stranger beside it is leakage). Returns (loss, samples)."""
     terms, samples = [], set()
     for per in taps.attn.values():
         for b, probs in per.items():
             pos = [p for p in (taps.positions[b] if b < len(taps.positions) else []) if 0 <= p < probs.shape[-1]]
-            mask = subject_mask(regions.meta[b]) if b < len(regions.meta) else None
+            mask = masks[b] if masks is not None and b < len(masks) and masks[b] is not None else (
+                subject_mask(regions.meta[b]) if b < len(regions.meta) else None)
             if not pos or mask is None or mask.numel() != probs.shape[0]:
                 continue
             share = probs[:, pos].sum(-1)  # each image token's attention to the trigger
