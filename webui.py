@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -20,6 +21,7 @@ from pathlib import Path
 
 from nicegui import app, run, ui
 
+from rulztrainer.archs import get_arch
 from rulztrainer.config import (ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
                                 MODEL_PRESETS,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
@@ -1856,6 +1858,9 @@ def datasets_summary(paths) -> dict | None:
     meds = sorted(x["median_mp"] for _, x in found if x["median_mp"])
     share = max(1, 8 // max(1, len(found)))
     return {"folder": "|".join(paths), "images": sum(x["images"] for _, x in found),
+            "counts": {p: x["images"] for p, x in found},
+            "outliers": len(set().union(*[lookfilter.outliers(p) for p, _ in found])),
+            "scanned": any(lookfilter.load_scores(p, k) for p, _ in found for k in lookfilter.KINDS),
             "captioned": sum(x["captioned"] for _, x in found), "median_mp": meds[len(meds) // 2] if meds else None,
             "sample": [(p, img) for p, x in found for img in x["sample"][:share]][:8],
             "missing": [p for p, x in parts if x is None]}
@@ -2487,13 +2492,103 @@ def build_samples_tab(f: Form):
 
 GOALS = {
     "character": ("face", "Character / person",
-                  "A specific person or character. Turns on the measured identity recipe: region-weighted loss, face "
-                  "and bust crops, and likeness probes that keep the best checkpoint and stop early."),
+                  "A specific person or character. Turns on the measured identity recipe: region-weighted loss, "
+                  "close-up crops, and likeness probes that keep the best checkpoint and stop early. Then pick how "
+                  "much of the person counts: the face, the body or both."),
     "style": ("palette", "Style",
               "An art style, medium, lighting or look that should carry over to any subject."),
     "concept": ("category", "Concept / object",
                 "An object, outfit, pose or idea. Also the right pick when you are not sure."),
 }
+
+# Character / person: how much of the person the likeness covers. Face focus is the identity recipe as it is; the
+# others move the scoring (face / body share of the combined score) and the loss weights (face region / person region)
+# toward the face or toward the body.
+CHARACTER_FOCUS = {
+    "face_only": ("face", "Face only",
+                  "The face alone. Probes render only the headshot (half the time), crops are face close-ups, and "
+                  "the body is left to the prompt: no body probe, references or score."),
+    "face_focus": ("face_retouching_natural", "Face focus",
+                   "The face first, the body second. The face counts 3 against the person's 1.5 in the loss and 70% "
+                   "of the likeness score (30% the body). Face and bust crops. The recipe as measured."),
+    "face_body": ("accessibility_new", "Face and body",
+                  "Both the same. Face and person each weigh 1.5 in the loss, and the likeness score is half face, "
+                  "half body. Face and bust crops; the curriculum evens out whichever of the two lags."),
+    "body_focus": ("directions_walk", "Body focus",
+                   "The build first, the face second. The person counts 3 against the face's 1.5 in the loss and 70% "
+                   "of the likeness score (30% the face)."),
+    "body_only": ("emoji_people", "Body only",
+                  "The build alone. Probes render only the full-body shot, there is no face reference or score, and "
+                  "no close-up crops; the person counts 3 and the face 1 in the loss."),
+}
+FOCUS_NOTES = {
+    "face_only": "face only: face 3 / person 1 / background 0.3, face crops, face probes only",
+    "face_focus": "face focus: face 3 / person 1.5 / background 0.3, face and bust crops, score 70% face and 30% body",
+    "face_body": "face and body: face 1.5 / person 1.5 / background 0.3, face and bust crops, score 50% face and "
+                 "50% body",
+    "body_focus": "body focus: face 1.5 / person 3 / background 0.3, face and bust crops, score 30% face and "
+                  "70% body",
+    "body_only": "body only: face 1 / person 3 / background 0.3, no crops, body probes only",
+}
+
+
+def focus_settings(focus: str, trigger: str = "") -> dict:
+    """The settings a Character / person focus sets on top of the identity recipe: the probe prompts and references
+    it uses (the ones it does not are emptied), the score weights, the crops, the loss weights and the curriculum."""
+    face_p, body_p = PRESET_PROBE_PROMPTS["identity"]
+    subject = trigger or "the character"
+    out = {"probe_face_prompt": face_p.format(trigger=subject), "probe_body_prompt": body_p.format(trigger=subject),
+           "crop_augment": "face+bust", "likeness_curriculum": True}
+    weights = {"face_only": (1.0, 0.0, 3.0, 1.0), "face_focus": (0.7, 0.3, 3.0, 1.5),
+               "face_body": (0.5, 0.5, 1.5, 1.5), "body_focus": (0.3, 0.7, 1.5, 3.0),
+               "body_only": (0.0, 1.0, 1.0, 3.0)}[focus]
+    out.update(face_weight=weights[0], body_weight=weights[1], face_loss_weight=weights[2],
+               body_loss_weight=weights[3])
+    if focus == "face_only":
+        out.update(probe_body_prompt="", body_refs=[], crop_augment="face", likeness_curriculum=False)
+    elif focus == "body_only":
+        out.update(probe_face_prompt="", face_refs=[], crop_augment="none", likeness_curriculum=False)
+    return out
+
+
+def character_focus(cfg: TrainConfig) -> str:
+    """Which focus a config is on: face only / body only when nothing scores the other, else by the weights of the
+    combined score (equal: face and body)."""
+    has_body = bool(cfg.probe_body_prompt.strip()) and cfg.body_weight > 0
+    has_face = bool(cfg.probe_face_prompt.strip()) and cfg.face_weight > 0
+    if not has_body:
+        return "face_only"
+    if not has_face:
+        return "body_only"
+    if abs(cfg.face_weight - cfg.body_weight) < 1e-6:
+        return "face_body"
+    return "face_focus" if cfg.face_weight > cfg.body_weight else "body_focus"
+
+
+# Frozen DiT weights by family and quantization, in GB (what block swap moves into system RAM), and the memory a step
+# needs besides them (activations, the LoRA, the VAE, the CUDA context).
+MODEL_GB = {"moss_image": {"bf16": 10.0, "int8": 5.5, "nvfp4": 3.0}, "krea2": {"bf16": 25.0, "int8": 13.5, "nvfp4": 8.0},
+            "fibo2": {"bf16": 16.0, "int8": 9.0, "nvfp4": 5.0}}
+STEP_HEADROOM_GB = 4.5
+
+
+def block_swap_plan(cfg: TrainConfig, vram: float, quant: str) -> tuple[int, float]:
+    """(blocks to swap, GB of weights they hold) so the model plus a step's memory fits in `vram` GB; 0 when it fits."""
+    fam = cfg.arch_name()
+    if quant == "auto":
+        if cfg.model_source == "files":
+            quant = "bf16" if cfg.model_file_quant == "bf16" else "int8"
+        else:
+            quant = {"krea2": "int8" if vram >= 22 else "nvfp4", "fibo2": "int8" if vram < 22 else "bf16"}.get(fam, "bf16")
+    quant = {"int8_convrot": "int8", "none": "bf16"}.get(quant, quant)
+    gb = MODEL_GB.get(fam, MODEL_GB["moss_image"]).get(quant, 10.0)
+    blocks = get_arch(cfg).n_blocks or 28
+    over = gb + STEP_HEADROOM_GB - vram
+    if over <= 0:
+        return 0, 0.0
+    n = max(1, min(blocks - 2, math.ceil(blocks * over / gb)))
+    return n, gb * n / blocks
+
 
 MODEL_NOTES = {
     "MOSS-Image-Base": ("Recommended",
@@ -2514,9 +2609,12 @@ MODEL_NOTES = {
 }
 
 
-def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict], data: dict | None) -> dict[str, tuple]:
-    """Recommended (value, reason) per setting key, from the goal, the GPUs (nvidia-smi rows) and the dataset scan."""
+def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict], data: dict | None,
+                           focus: str = "face_focus") -> dict[str, tuple]:
+    """Recommended (value, reason) per setting key, from the goal (and a character's focus, a key of
+    CHARACTER_FOCUS), the GPUs (nvidia-smi rows) and the dataset scan."""
     r: dict[str, tuple] = {}
+    face_only, body_only = focus == "face_only", focus == "body_only"
     fibo = cfg.arch_name() == "fibo2"
     krea = cfg.arch_name() == "krea2"
     krea_turbo = krea and "krea-2-turbo" in (cfg.sample_model_path or "").lower()
@@ -2527,9 +2625,12 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     if len(gpus) >= 2 and krea and vram is not None and vram < 22:
         r["multi_gpu"] = ("model_split", f"{len(gpus)} GPUs of {vram:.0f} GB: split, the 12B model trains in int8; a "
                                          "full copy on each card would only fit in nvfp4")
+    elif len(gpus) >= 2 and (cfg.finetune or cfg.block_swap):
+        r["multi_gpu"] = ("off", "a full fine-tune cannot run data parallel (its trained weights are not a LoRA to "
+                                 "average)" if cfg.finetune else "block swap runs on one GPU")
     elif len(gpus) >= 2:
         r["multi_gpu"] = ("data_parallel", f"{len(gpus)} GPUs found: a model copy on each trains about 1.7-2x faster")
-    if len(gpus) >= 2:
+    if len(gpus) >= 2 and r["multi_gpu"][0] == "data_parallel":
         r["dp_balance"] = ("auto", "measures the cards and splits each step's images by speed, so the faster one "
                                    "does not wait; the images per step stay the same")
     elif gpus:
@@ -2561,6 +2662,13 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     r["checkpoint_keep_blocks"] = (-1, "measured at the start: as many blocks as fit skip the recompute")
     r["compile_model"] = ("auto", "measured 26% (MOSS-Image) and 12% (Krea 2) faster per step after a warm-up of "
                                   "under a minute; auto skips it for short test runs")
+    if vram is not None and cfg.multi_gpu == "off" and not cfg.finetune:
+        swap, saved = block_swap_plan(cfg, vram, r.get("transformer_quant", (cfg.transformer_quant,))[0])
+        if swap:
+            r["block_swap"] = (swap, f"the model and a step's memory do not fit {vram:.0f} GB: {swap} blocks' frozen "
+                                     f"weights ({saved:.1f} GB) wait in system RAM and stream in as each block runs")
+        else:
+            r["block_swap"] = (0, f"the model fits {vram:.0f} GB as it is; swapping only slows the steps")
     # dataset
     target = 1.0 if vram is None or vram >= 12 else 0.5
     reason = ("1 MP (1024x1024) is the size the model was trained at" if target == 1.0
@@ -2581,20 +2689,66 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     if character and ds_paths:
         r["face_refs"] = ("\n".join(ds_paths), "every image with a face becomes a reference (a folder means all its "
                                                "images)")
+    if character and body_only:
+        r["face_refs"] = ("", "body only: nothing scores the face")
+    if character and face_only:
+        r["body_refs"] = ("", "face only: nothing scores the body")
+    elif character and ds_paths and not cfg.body_refs:
+        r["body_refs"] = ("\n".join(ds_paths), "every photo that shows the person from neck to mid-thigh becomes a "
+                                               "reference; the others are skipped")
+    if character:
+        r["crop_augment"] = (("face", "close-ups teach the face's detail; bust crops would mostly teach the build")
+                             if face_only else
+                             ("none", "the crops are of the face and the bust; the build is learned from the whole "
+                                      "photos") if body_only else
+                             ("face+bust", "close-ups for the face, head-and-shoulders crops between them and the "
+                                           "full photos"))
+        n_out = (data or {}).get("outliers") or 0
+        r["look_warmup"] = (bool(n_out), f"{n_out} pictures are under the look filter's fence: they stay in the "
+                                         "dataset but start at a lower loss weight" if n_out else
+                            "no outliers in the saved look scans (scan on the Dataset tab, Look consistency filter)")
+        subject = cfg.trigger_word or any(sp.trigger for sp in cfg.dataset_specs())
+        r["isolation"] = (bool(subject), "keeps the subject's face off other people (Fizgig: strangers reading as "
+                                         "the subject 48 of 50 -> 0 of 50); about 1.5-2x the training time"
+                          if subject else "needs a trigger word to isolate (Dataset step)")
     # training
     n = (data or {}).get("images") or 0
     if n:
-        steps = int(min(4000, max(1000, round(n * 100, -2))))
-        r["steps"] = (steps, f"about 100 steps per image for {n} images"
+        counts = (data or {}).get("counts") or {}
+        reps = sum(counts.get(sp.path, 0) * sp.repeats for sp in cfg.dataset_specs() if sp.path in counts)
+        items = reps or n  # pictures per epoch, repeats counted
+        crops = {"face": 0.6, "face+bust": 1.2}.get(cfg.crop_augment, 0.0)  # extra items per picture (some are skipped)
+        per_epoch = items * (1 + crops)
+        steps = int(min(4000, max(1000, round(per_epoch * 100, -2))))
+        r["steps"] = (steps, f"about 100 epochs: {n} images" + (f" x repeats = {items}" if items != n else "")
+                             + (f", plus about {int(items * crops)} close-up crops" if crops else "")
                              + ("; the likeness probes can stop it earlier" if character else ""))
     else:
         r["steps"] = (2000, "a good start; scan your dataset (Dataset step) for a number that fits it")
-    r["learning_rate"] = (1e-4, "the usual LoRA learning rate; go lower (5e-5) if samples look burnt or noisy")
-    r["optimizer"] = ("adamw8bit", "AdamW with 8-bit state: the same results as adamw with less memory")
-    rank = 32 if goal == "style" else 16
-    r["lora_rank"] = (rank, "styles carry a lot of varied detail" if goal == "style"
-                      else "plenty for a character or concept; higher ranks mostly add file size")
-    r["lora_alpha"] = (float(rank), "alpha equal to rank keeps the adapter's scale at 1")
+    if cfg.finetune:
+        r["learning_rate"] = (1e-5, "a full fine-tune needs about a tenth of a LoRA's rate (Fizgig's measured 1e-5)")
+        r["optimizer"] = ("adafactor", "Fizgig's measured optimizer for a fine-tune: a much smaller state than AdamW")
+    else:
+        r["optimizer"] = ("adamw8bit", "AdamW with 8-bit state: the same results as adamw with less memory")
+        if cfg.optimizer != "automagic3":  # it sets its own rate per layer type
+            r["learning_rate"] = (1e-4, "the usual LoRA learning rate; go lower (5e-5) if samples look burnt or noisy")
+        lokr_ok = cfg.arch_name() != "fibo2"  # diffusers has no LoKr loader
+        r["network_type"] = (("lokr", "Fizgig's measured best likeness and more natural skin, about 20% slower steps")
+                             if character and lokr_ok else
+                             ("lora", "loads everywhere" + ("" if lokr_ok else " (a FIBO 2.0 LoKr loads only back "
+                                                                              "into RulzTrainer)")))
+        if cfg.network_type == "lokr":
+            r["lokr_factor"] = (8, "Fizgig's measured default: lower is bigger files, nothing gained above 8")
+        else:
+            rank = 32 if goal == "style" else 16
+            r["lora_rank"] = (rank, "styles carry a lot of varied detail" if goal == "style"
+                              else "plenty for a character or concept; higher ranks mostly add file size")
+            r["lora_alpha"] = (float(rank), "alpha equal to rank keeps the adapter's scale at 1")
+    if goal == "style":
+        r["timestep_sampling"] = ("logsnr", "spends most steps at very high noise, where an art style is learned "
+                                            "(the style-friendly sampler)")
+    elif not character:  # the identity recipe sets logit_normal itself
+        r["timestep_sampling"] = ("logit_normal", "the default: most steps at middle noise, fewer at the extremes")
     r["batch_size"] = (1, "small batches with more steps beat large batches for LoRAs")
     if krea:
         r["target_text_fusion"] = (True, "the attention + feed-forward recipe leaves Krea's text fusion under-trained: "
@@ -2606,6 +2760,9 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     total = int(cfg.steps or 2000)
     every = max(100, int(round(total / 8 / 50)) * 50)
     r["save_every"] = (every, f"about 8 checkpoints over {total} steps to choose from afterwards")
+    saves = total // max(1, int(cfg.save_every or every))  # with the save interval as it is now
+    r["keep_checkpoints"] = ((0, f"{saves} small files at most: keep them all to compare") if saves <= 10 else
+                             (8, f"{saves} checkpoints would pile up: delete all but the newest 8 as you go"))
     r["lora_ema"] = (0.98, "measured by Fizgig: 5 likeness points above no average late in a run, with half the swing "
                            "between checkpoints; longer averages (0.995) lag behind")
     r["sample_every"] = (every, "a sample set at every checkpoint shows which one to keep")
@@ -2640,9 +2797,48 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
             r["probe_cfg"] = (r["sample_cfg"][0], "without a turbo LoRA a probe needs normal guidance")
         face_p, body_p = PRESET_PROBE_PROMPTS["identity"]
         subject = cfg.trigger_word or "the character"
-        r["probe_face_prompt"] = (face_p.format(trigger=subject), "a plain headshot scores the face reliably")
-        r["probe_body_prompt"] = (body_p.format(trigger=subject), "an upright full-body shot scores proportions")
+        r["probe_face_prompt"] = (("", "body only: nothing scores the face") if body_only else
+                                  (face_p.format(trigger=subject), "a plain headshot scores the face reliably"))
+        r["probe_body_prompt"] = (("", "face only: each probe renders the headshot alone, in half the time")
+                                  if face_only else
+                                  (body_p.format(trigger=subject), "an upright full-body shot scores the build"))
     return r
+
+
+def extra_review_rows(cfg: TrainConfig) -> list[tuple[str, str]]:
+    """The review's rows about the adapter, memory, previews and the optional features that are on."""
+    if cfg.finetune:
+        adapter = "full fine-tune, extracting a LoRA of rank " + ", ".join(str(r) for r in cfg.finetune_extract_ranks)
+    elif cfg.network_type == "lokr":
+        adapter = f"LoKr, factor {cfg.lokr_factor}"
+    else:
+        adapter = f"LoRA, rank {cfg.lora_rank}, alpha {cfg.lora_alpha:g}"
+    rows = [("Adapter", adapter),
+            ("Memory", f"gradient checkpointing {'on' if cfg.gradient_checkpointing else 'off'}; "
+                       + (f"block swap {cfg.block_swap} blocks" if cfg.block_swap else "no block swap"))]
+    if cfg.sample_model_path and "turbo" in cfg.sample_model_path.lower():
+        turbo = ", on the Turbo sampling model"
+    elif cfg.turbo_lora == "auto" and cfg.arch_name() in ARCH_TURBO:
+        turbo = ", with the model's turbo LoRA"
+    elif cfg.turbo_lora and cfg.turbo_lora != "auto":
+        turbo = ", with your turbo LoRA"
+    else:
+        turbo = ", plain model"
+    rows.append(("Previews", f"{cfg.sample_steps} steps, CFG {cfg.sample_cfg:g}{turbo}"))
+    options = []
+    if cfg.timestep_sampling != "logit_normal":
+        options.append(f"{cfg.timestep_sampling} timesteps")
+    if cfg.isolation:
+        options.append("LoRA Isolation")
+    if cfg.look_warmup:
+        options.append("look warm-up")
+    if cfg.lora_ema:
+        options.append(f"weight average {cfg.lora_ema:g}")
+    if cfg.keep_checkpoints:
+        options.append(f"newest {cfg.keep_checkpoints} checkpoints kept")
+    if options:
+        rows.append(("Options", ", ".join(options)))
+    return rows
 
 
 def datasets_line(cfg: TrainConfig, data: dict | None) -> str:
@@ -2715,6 +2911,13 @@ def review_issues(cfg: TrainConfig, goal: str | None, data: dict | None, n_gpus:
         if not (cfg.face_refs or cfg.body_refs):
             out.append(("warning", "No face or body references: likeness scores, the best checkpoint and early stop "
                                    "need them (Dataset step)."))
+        elif character_focus(cfg) != "face_only" and not cfg.body_refs:
+            out.append(("info", "This focus scores the body, but there are no body references: the body probe goes "
+                                "unscored and the overall score is the face alone. Tick Body ref on full-length "
+                                "photos, or take the recommendation (Dataset step)."))
+        elif character_focus(cfg) != "body_only" and not cfg.face_refs:
+            out.append(("info", "This focus scores the face, but there are no face references: the face probe goes "
+                                "unscored (Dataset step)."))
         elif (cfg.probe_every > 0 and cfg.probe_steps <= 10
               and not (cfg.turbo_lora or "turbo" in (cfg.sample_model_path or "").lower())):
             out.append(("warning", f"Probes render in {cfg.probe_steps} steps without a turbo LoRA, so they come out "
@@ -2727,7 +2930,12 @@ def review_issues(cfg: TrainConfig, goal: str | None, data: dict | None, n_gpus:
     return out
 
 
-def suggested_prompts(goal: str | None, trigger: str) -> list[str]:
+def suggested_prompts(goal: str | None, trigger: str, focus: str = "face_focus") -> list[str]:
+    if goal == "character" and focus == "face_only":
+        t = trigger or "the character"
+        return [f"photo of {t} smiling in a sunny park, natural light",
+                f"close-up portrait of {t}, studio lighting, plain grey background",
+                f"photo of {t} laughing at a cafe table, waist up, warm evening light"]
     if goal == "character":
         t = trigger or "the character"
         return [f"photo of {t} smiling in a sunny park, natural light",
@@ -2774,6 +2982,8 @@ def _show(widget, value) -> str:
         return ", ".join(f"{v:g} MP" for v in value)
     if isinstance(value, float):
         return f"{value:g}"
+    if value == "":
+        return "empty"
     text = str(value)
     return text if len(text) <= 48 else text[:45] + "..."
 
@@ -2794,11 +3004,15 @@ class Wizard:
         self.start = start  # start_job(): starts training from the form, True when it started
         self.goto = goto  # goto(tab name)
         self.goal: str | None = "character" if self.w["preset_toggle"].value else None
+        self.focus = "face_focus"  # Character / person: a key of CHARACTER_FOCUS; follows the form (character_focus)
+        self.focus_stash: dict = {}  # references and probe prompts from before a face only / body only pick
+        self.conditional: list[tuple] = []  # (box, predicate): settings shown only while the predicate holds
         self.smi: list[dict] = []  # nvidia-smi rows (memory per GPU)
         self.data: dict | None = None  # last dataset scan
         self.recs: dict[str, tuple] = {}
         self.rec_rows: list[tuple] = []
         self.goal_cards: dict[str, ui.card] = {}
+        self.focus_cards: dict[str, ui.card] = {}
         self.model_cards: dict[str, ui.card] = {}
         self.steps: dict[str, ui.step] = {}
 
@@ -2811,10 +3025,15 @@ class Wizard:
         return widget
 
     @contextmanager
-    def setting(self, key: str | None, title: str, text: str, show_if=None):
+    def setting(self, key: str | None, title: str, text: str, show_if=None, when=None):
         """One setting: title, explanation and recommendation on the left, the control (built in the block) on the
-        right. show_if=(form key, predicate) shows it only while the predicate holds for that widget's value."""
+        right. show_if=(form key, predicate) shows it only while the predicate holds for that widget's value; when
+        is a no-argument predicate re-read on every refresh (for conditions on more than one setting). Yields the
+        setting's box."""
         box = ui.element("div").classes("rz-setting")
+        if when is not None:
+            self.conditional.append((box, when))
+            box.visible = bool(when())
         if show_if is not None:
             box.bind_visibility_from(self.w[show_if[0]], "value", show_if[1])
         with box:
@@ -2824,7 +3043,7 @@ class Wizard:
                 if key:
                     self.rec_row(key)
             with ui.column().classes("gap-2 w-full min-w-0 justify-center"):
-                yield
+                yield box
 
     def rec_row(self, key: str):
         with ui.row().classes("rz-rec items-start gap-2 no-wrap") as row:
@@ -2855,12 +3074,29 @@ class Wizard:
 
     # ------------------------------------------------------------ recommendations
 
+    def is_character(self) -> bool:
+        return self.goal == "character"
+
+    def has_face(self) -> bool:
+        return self.goal == "character" and self.focus != "body_only"
+
+    def has_body(self) -> bool:
+        return self.goal == "character" and self.focus != "face_only"
+
+    def is_lora(self) -> bool:
+        return not self.w["finetune"].value and self.w["network_type"].value != "lokr"
+
     def refresh(self):
         try:
             cfg = self.f.to_config()
         except (TypeError, ValueError):
             return  # a field is mid-edit (e.g. an empty number); keep the last recommendations
-        self.recs = wizard_recommendations(cfg, self.goal, self.smi, self.data)
+        if self.goal == "character":
+            self.focus = character_focus(cfg)
+        self.mark_focus()
+        for box, when in self.conditional:
+            box.visible = bool(when())
+        self.recs = wizard_recommendations(cfg, self.goal, self.smi, self.data, self.focus)
         for key, row, icon, label, btn in self.rec_rows:
             rec = self.recs.get(key)
             row.visible = rec is not None
@@ -2936,6 +3172,19 @@ class Wizard:
                     ui.label(text).classes("rz-hint")
                 c.on("click", lambda _, k=key: self.set_goal(k))
                 self.goal_cards[key] = c
+        with ui.column().classes("w-full gap-2") as self.focus_box:
+            ui.label("What should the likeness cover?").classes("rz-setting-title")
+            with ui.element("div").classes("rz-choices"):
+                for key, (icon, title, text) in CHARACTER_FOCUS.items():
+                    with ui.card().props("flat").classes("rz-choice") as c:
+                        with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                            ui.icon(icon).classes("rz-choice-icon")
+                            ui.label(title).classes("rz-setting-title")
+                            ui.space()
+                            ui.icon("check_circle").classes("rz-check")
+                        ui.label(text).classes("rz-hint")
+                    c.on("click", lambda _, k=key: self.set_focus(k))
+                    self.focus_cards[key] = c
         self.goal_note = ui.label("").classes("rz-banner info")
         with self.setting(None, "Job name", "The name of this run. Checkpoints are saved as "
                                             "output/<job name>/<job name>_<step>.safetensors and the final LoRA as "
@@ -2944,12 +3193,36 @@ class Wizard:
         self.nav(back=False)
 
     def set_goal(self, goal: str):
+        focus = self.focus  # the recipe below is face focus; the pick made before is put back on top of it
         self.goal = goal
         want = goal == "character"
         if bool(self.w["preset_toggle"].value) != want:
             self.w["preset_toggle"].value = want  # applies the identity recipe, or restores the settings from before
+        self.focus = focus
+        if want and focus != "face_focus":
+            self.apply_focus()
         self.mark_goal()
         self.refresh()
+
+    def set_focus(self, focus: str):
+        """One of the five focuses: the probes, references, crops, loss weights and score weights for it."""
+        for key in ("face_refs", "body_refs", "probe_face_prompt", "probe_body_prompt"):
+            if (self.w[key].value or "").strip():  # what the user has, kept for when the focus needs it again
+                self.focus_stash[key] = self.w[key].value
+        self.focus = focus
+        self.apply_focus()
+        self.mark_goal()
+        self.refresh()
+
+    def apply_focus(self):
+        values = focus_settings(self.focus, (self.w["trigger_word"].value or "").strip())
+        for key, needed in (("face_refs", self.focus != "body_only"), ("body_refs", self.focus != "face_only"),
+                            ("probe_face_prompt", self.focus != "body_only"),
+                            ("probe_body_prompt", self.focus != "face_only")):
+            if needed and (self.focus_stash.get(key) or "").strip():
+                values[key] = self.focus_stash[key]  # the user's own, from before it was emptied
+        for key, value in values.items():
+            self.w[key].value = "\n".join(value) if isinstance(value, list) else value
 
     def sync_goal(self, preset_on: bool):
         """The identity preset was switched elsewhere (Train tab, a loaded config)."""
@@ -2963,14 +3236,23 @@ class Wizard:
     def mark_goal(self):
         for key, c in self.goal_cards.items():
             c.classes(add="selected") if key == self.goal else c.classes(remove="selected")
+        self.mark_focus()
         if self.goal == "character":
-            self.goal_note.text = ("Identity recipe on: region-weighted loss (face 3 / person 1.5 / background 0.3), "
-                                   "LoRA+ 4 with adamw8bit, face and bust crops, likeness probes every 25 steps with "
-                                   "best checkpoint and early stop, curriculum, per-image loss watch.")
+            self.goal_note.text = ("Identity recipe, " + FOCUS_NOTES[self.focus] + "; LoRA+ 4 with adamw8bit, "
+                                   "likeness probes every 25 steps with best checkpoint and early stop, per-image "
+                                   "loss watch.")
         elif self.goal:
             self.goal_note.text = f"{GOALS[self.goal][1]}: general settings, tuned on the next pages."
         else:
             self.goal_note.text = "Pick one to get recommendations that fit it."
+
+    def mark_focus(self):
+        """The focus cards."""
+        character = self.goal == "character"
+        if hasattr(self, "focus_box"):
+            self.focus_box.visible = character
+        for key, c in self.focus_cards.items():
+            c.classes(add="selected") if key == self.focus else c.classes(remove="selected")
 
     # ---- 2 model
     def step_model(self):
@@ -3069,7 +3351,7 @@ class Wizard:
         with self.gpu_box:
             ui.spinner(size="sm")
         self.apply_bar(["multi_gpu", "dp_balance", "transformer_quant", "text_encoder_quant", "gradient_checkpointing",
-                        "checkpoint_keep_blocks", "compile_model"])
+                        "checkpoint_keep_blocks", "block_swap", "compile_model"])
         with self.setting("multi_gpu", "Multi-GPU",
                           "Data parallel puts a full model copy on each GPU, each trains its own images, and the "
                           "results are averaged: about 1.7-2x the speed with two cards (each must fit the model). "
@@ -3109,6 +3391,14 @@ class Wizard:
                           show_if=("gradient_checkpointing", bool)):
             self.bind(ui.number("Kept blocks (-1 = auto)", min=-1, precision=0), "checkpoint_keep_blocks") \
                 .classes("w-full")
+        with self.setting("block_swap", "Block swap",
+                          "For a card the model does not fit: this many blocks keep their frozen weights in system "
+                          "RAM and stream to the GPU as each one runs, the next copied in while the current computes. "
+                          "Measured on Krea 2 int8 (16 GB card): 14 of 28 blocks swapped cut the step's peak from "
+                          "10.8 to 7.7 GB at about the same speed. Needs gradient checkpointing and one GPU; not "
+                          "with a fine-tune. 0 = off.",
+                          when=lambda: self.w["multi_gpu"].value == "off" and not self.w["finetune"].value):
+            self.bind(ui.number("Blocks swapped (0 = off)", min=0, precision=0), "block_swap").classes("w-full")
         with self.setting("compile_model", "Compile the model",
                           "torch.compile turns the small steps between the big matrix multiplies into fewer, fused GPU "
                           "kernels: measured 26% faster per step on MOSS-Image and 12% on Krea 2, after a warm-up of "
@@ -3138,7 +3428,8 @@ class Wizard:
                 ui.button("Scan datasets", icon="search", on_click=self.scan).props("unelevated")
                 ui.button("Dataset tab", icon="photo_library", on_click=lambda: self.goto("Dataset")).props("flat")
         self.scan_box = ui.column().classes("w-full gap-3")
-        self.apply_bar(["resolutions", "enable_buckets", "flip_augment", "face_refs"])
+        self.apply_bar(["resolutions", "enable_buckets", "flip_augment", "crop_augment", "face_refs", "body_refs",
+                        "look_warmup"])
         with self.setting(None, "Trigger word",
                           "Put in front of every caption, and then used in your prompts to call up what the LoRA "
                           "learned. Pick a word the model does not know yet, such as 'zxq woman' or 'inkwash style'. "
@@ -3163,17 +3454,29 @@ class Wizard:
                           "Also trains a left-right mirrored copy of every image: twice the variety, but anything "
                           "asymmetric (a hair parting, a logo, text) gets blurred."):
             self.bind(ui.switch("Horizontal flip"), "flip_augment")
+        with self.setting("crop_augment", "Close-up crops",
+                          "Adds crops of every image as extra training images, so the model sees the face up close "
+                          "and not only small in a full-length photo: face close-ups, and with face+bust also head "
+                          "and shoulders. Crops never upscale past the source.", when=self.is_character):
+            self.bind(ui.select(["none", "face", "face+bust"], label="Crops"), "crop_augment").classes("w-full")
         with self.setting("face_refs", "Face references",
                           "Images whose face is the identity to match. Samples and probes are compared with them "
                           "(ArcFace; 50%+ generally means the same person), which picks the best checkpoint and "
                           "stops early. A folder counts as all its images; you can also tick Face ref on the Dataset "
-                          "tab.", show_if=("preset_toggle", bool)):
+                          "tab.", when=self.has_face):
             self.bind(ui.textarea("Face references (one path per line)"), "face_refs").classes("w-full")
-        with self.setting(None, "Body references (optional)",
-                          "Full-body shots in an upright, fairly neutral pose, to score body proportions as well. "
-                          "Tick Body ref on such images on the Dataset tab, or list them here.",
-                          show_if=("preset_toggle", bool)):
+        with self.setting("body_refs", "Body references",
+                          "Photos that show the person's build, from the neck to mid-thigh or more. Probes and samples "
+                          "are compared with them to score the body. A folder counts as all its images (those without "
+                          "a usable view of the body are skipped); you can also tick Body ref on the Dataset tab.",
+                          when=self.has_body):
             self.bind(ui.textarea("Body references (one path per line)"), "body_refs").classes("w-full")
+        with self.setting("look_warmup", "Warm up look outliers",
+                          "Pictures the Dataset tab's Look consistency filter puts under its fence (they do not look "
+                          "like the rest) stay in the dataset but start at a lower loss weight and reach full weight "
+                          "after a few epochs, while the identity forms from the typical pictures.",
+                          when=self.is_character):
+            self.bind(ui.switch("Warm up look outliers"), "look_warmup")
         self.nav()
 
     def forget_scan(self):
@@ -3215,13 +3518,28 @@ class Wizard:
                     with ui.row().classes("w-full gap-2"):
                         for t in thumbs:
                             ui.image(image_url(t)).classes("w-24 h-24 rz-thumb")
+                if self.goal == "character" and n:
+                    with ui.row().classes("w-full items-center gap-3 no-wrap"):
+                        if self.data["outliers"]:
+                            ui.label(f"The saved look scans put {self.data['outliers']} of {n} pictures under the "
+                                     "fence: they do not look like the rest. Review them on the Dataset tab "
+                                     "(Look consistency filter), or ease them in below.").classes("rz-banner warning")
+                        elif self.data["scanned"]:
+                            ui.label("The saved look scans found no outliers.").classes("rz-banner ok")
+                        else:
+                            ui.label("Not scanned for look outliers yet: the Dataset tab's Look consistency filter "
+                                     "finds the pictures whose face or body does not match the rest.") \
+                                .classes("rz-banner info")
+                        ui.button("Dataset tab", icon="photo_library", on_click=lambda: self.goto("Dataset")) \
+                            .props("outline dense no-caps").classes("shrink-0")
         self.refresh()
 
     # ---- 5 training
     def step_training(self):
         self.heading("How to train", "How long and how hard to train, and how big the LoRA is.")
-        self.apply_bar(["steps", "learning_rate", "optimizer", "lora_rank", "lora_alpha", "batch_size",
-                        "target_text_fusion", "target_attn_gate", "region_weights"])
+        self.apply_bar(["steps", "learning_rate", "optimizer", "network_type", "lokr_factor", "lora_rank",
+                        "lora_alpha", "timestep_sampling", "batch_size", "target_text_fusion", "target_attn_gate",
+                        "region_weights", "isolation"])
         with self.setting("steps", "Training steps",
                           "Each step trains on one batch of images. Too few and the LoRA is weak; too many and it "
                           "starts copying the training images (overfitting). Checkpoints are saved on the way, so "
@@ -3237,14 +3555,33 @@ class Wizard:
                           "automagic3 tunes its own learning rate per weight."):
             self.bind(ui.select(["adamw", "adamw8bit", "adafactor", "automagic3"], label="Optimizer"), "optimizer") \
                 .classes("w-full")
+        with self.setting("network_type", "Adapter",
+                          "LoRA: a rank-r pair of small matrices per layer. LoKr: a Kronecker pair, about 1/64 of the "
+                          "weights at factor 8: Fizgig's measured best likeness and more natural skin, about 20% "
+                          "slower steps. Both load in ComfyUI; diffusers has no LoKr loader.",
+                          when=lambda: not self.w["finetune"].value):
+            self.bind(ui.select({"lora": "LoRA", "lokr": "LoKr"}, label="Adapter"), "network_type").classes("w-full")
+        with self.setting("lokr_factor", "LoKr factor",
+                          "How the Kronecker pair splits each layer: the first factor is at most this. Lower is more "
+                          "capacity and bigger files (8: about 400 MB on a 12B model, 16: about 100 MB). Fizgig found "
+                          "no gain above 8.", when=lambda: not self.w["finetune"].value
+                          and self.w["network_type"].value == "lokr"):
+            self.bind(ui.number("LoKr factor", min=1, max=64, precision=0), "lokr_factor").classes("w-full")
         with self.setting("lora_rank", "LoRA rank",
                           "The size of the adapter. Higher ranks can hold more detail but give bigger files and "
-                          "memorise the training images more easily."):
+                          "memorise the training images more easily.", when=self.is_lora):
             self.bind(ui.number("Rank", min=1, max=256, precision=0), "lora_rank").classes("w-full")
         with self.setting("lora_alpha", "LoRA alpha",
                           "Scales the adapter's effect (alpha / rank). Keeping alpha equal to rank is the safe "
-                          "default."):
+                          "default.", when=self.is_lora):
             self.bind(ui.number("Alpha", min=0), "lora_alpha").classes("w-full")
+        with self.setting("timestep_sampling", "Noise levels (timestep sampling)",
+                          "Which noise levels the steps train on. logit_normal (the default) favours the middle; "
+                          "logsnr spends most steps at very high noise, where an art style is learned (use it for "
+                          "styles). The Train tab has the rest: identity, content, style, sigmoid, uniform, "
+                          "reference.", when=lambda: self.goal != "character"):
+            self.bind(ui.select(["logit_normal", "sigmoid", "uniform", "identity", "content", "style", "logsnr",
+                                 "reference"], label="Timestep sampling"), "timestep_sampling").classes("w-full")
         with self.setting("batch_size", "Batch size",
                           "Images per step. Larger batches need more memory and, for LoRAs, rarely help."):
             self.bind(ui.number("Batch size", min=1, precision=0), "batch_size").classes("w-full")
@@ -3264,7 +3601,14 @@ class Wizard:
                           "next, the background least, so the LoRA spends its capacity on the identity.",
                           show_if=("preset_toggle", bool)):
             self.bind(ui.switch("Region-weighted loss"), "region_weights")
-        hint("Timesteps, schedules, LoRA layers and blocks, and per-image loss watch are on the Train tab.")
+        with self.setting("isolation", "LoRA Isolation",
+                          "A character LoRA tends to put its subject's face on everyone else. Isolation trains each "
+                          "picture again without its trigger, held to what the model does without the LoRA; fuses "
+                          "the trigger into one word (prompt with it joined, e.g. gweltman); adds pictures of the "
+                          "subject next to a generated stranger; and balances several subjects. Needs a trigger "
+                          "word. About 1.5-2x the training time.", when=self.is_character):
+            self.bind(ui.switch("LoRA Isolation"), "isolation")
+        hint("Schedules, LoRA layers and blocks, the full fine-tune and per-image loss watch are on the Train tab.")
         self.nav()
 
     # ---- 6 samples
@@ -3272,12 +3616,17 @@ class Wizard:
         self.heading("Checkpoints and preview images", "What gets saved along the way, and the pictures that show "
                                                        "how training is going.")
         # the sampling model first: the step and guidance recommendations depend on it
-        self.apply_bar(["sample_model_path", "save_every", "lora_ema", "sample_every", "sample_steps", "sample_cfg",
-                        "probe_every", "probe_steps", "probe_cfg", "probe_face_prompt", "probe_body_prompt"])
+        self.apply_bar(["sample_model_path", "save_every", "keep_checkpoints", "lora_ema", "sample_every",
+                        "sample_steps", "sample_cfg", "probe_every", "probe_steps", "probe_cfg", "probe_face_prompt",
+                        "probe_body_prompt"])
         with self.setting("save_every", "Save a checkpoint every",
                           "Steps between saved LoRAs (output/<job>/<job>_<step>.safetensors). Several of them let you "
                           "pick the last one before it started to overfit."):
             self.bind(ui.number("Save every", min=1, precision=0, suffix="steps"), "save_every").classes("w-full")
+        with self.setting("keep_checkpoints", "Checkpoints to keep",
+                          "Keeps only the newest N of the step checkpoints, deleting the oldest as new ones are "
+                          "saved. The final file and the best-likeness file are never deleted. 0 keeps every one."):
+            self.bind(ui.number("Keep", min=0, precision=0), "keep_checkpoints").classes("w-full")
         with self.setting("lora_ema", "Weight average",
                           "Each step pulls the LoRA toward the last image it saw, so a checkpoint carries a bit of "
                           "chance. Saving a running average of the recent steps instead (about the last 50 images at "
@@ -3320,10 +3669,12 @@ class Wizard:
                           "training once it stops improving.", show_if=is_identity):
             self.bind(ui.number("Probe every", min=0, precision=0, suffix="steps"), "probe_every").classes("w-full")
         with self.setting("probe_face_prompt", "Face probe prompt",
-                          "A plain headshot of your character, rendered with a fixed seed.", show_if=is_identity):
+                          "A plain headshot of your character, rendered with a fixed seed. Empty = no face "
+                          "probe.", when=self.has_face):
             self.bind(ui.textarea("Face probe prompt").props("autogrow"), "probe_face_prompt").classes("w-full")
         with self.setting("probe_body_prompt", "Body probe prompt",
-                          "A full-body, upright shot, for the body proportions score.", show_if=is_identity):
+                          "A full-body, upright shot, for the body score. Empty = no body probe.",
+                          when=self.has_body):
             self.bind(ui.textarea("Body probe prompt").props("autogrow"), "probe_body_prompt").classes("w-full")
         with self.setting("probe_steps", "Probe steps", "Denoising steps per probe.", show_if=is_identity):
             self.bind(ui.number("Probe steps", min=1, precision=0), "probe_steps").classes("w-full")
@@ -3339,7 +3690,7 @@ class Wizard:
     def suggest(self):
         replaced = bool((self.w["sample_prompts"].value or "").strip())
         self.w["sample_prompts"].value = "\n".join(suggested_prompts(self.goal, (self.w["trigger_word"].value or "")
-                                                                     .strip()))
+                                                                     .strip(), self.focus))
         if replaced:
             ui.notify("Replaced the sample prompts with suggestions")
 
@@ -3388,7 +3739,9 @@ class Wizard:
         model = (Path(cfg.transformer_file).name or "Hugging Face model") if cfg.model_source == "files" \
             else next((k for k, v in MODEL_PRESETS.items() if v == cfg.model_path), cfg.model_path)
         rows = [
-            ("Goal", GOALS[self.goal][1] if self.goal else "not chosen (general settings)"),
+            ("Goal", (GOALS[self.goal][1] + (f": {CHARACTER_FOCUS[self.focus][1].lower()}"
+                                             if self.goal == "character" else "")) if self.goal
+             else "not chosen (general settings)"),
             ("Job", f"{cfg.job_name}  ->  {_relative(str(cfg.job_dir()))}/"),
             ("Model", f"{model} ({'single files' if cfg.model_source == 'files' else 'Hugging Face'})"),
             ("GPUs", f"{multi}; model quant {cfg.transformer_quant}, text encoder quant {cfg.text_encoder_quant}"),
@@ -3397,12 +3750,15 @@ class Wizard:
             ("Resolution", ", ".join(f"{mp:g} MP" for mp in cfg.resolutions)
              + (" (datasets with their own: those)" if any(sp.resolutions for sp in cfg.dataset_specs()) else "")),
             ("Training", f"{cfg.steps} steps, batch {cfg.batch_size}, lr {cfg.learning_rate:g}, {cfg.optimizer}"),
-            ("LoRA", f"rank {cfg.lora_rank}, alpha {cfg.lora_alpha:g}"),
             ("Saving", f"every {cfg.save_every} steps; samples every {cfg.sample_every} steps "
                        f"({len(cfg.sample_prompts)} prompts)"),
         ]
+        rows[len(rows) - 1:len(rows) - 1] = extra_review_rows(cfg)  # before "Saving"
         if cfg.preset == "identity":
-            rows.append(("Likeness", f"{len(cfg.face_refs)} face / {len(cfg.body_refs)} body reference entries, "
+            focus = character_focus(cfg)
+            refs = ([f"{len(cfg.face_refs)} face"] if focus != "body_only" else []) + \
+                   ([f"{len(cfg.body_refs)} body"] if focus != "face_only" else [])
+            rows.append(("Likeness", f"{CHARACTER_FOCUS[focus][1].lower()}: {' / '.join(refs)} reference entries, "
                                      f"probes every {cfg.probe_every} steps"))
         self.review_box.clear()
         with self.review_box:
@@ -5385,6 +5741,19 @@ never during the training step. Set *Sample steps* to match it.
 The **Identity training preset** switch (top of the Train tab, or *Character / person* in the Wizard) applies the
 measured recipe below in one go and restores your previous settings when switched off; the CLI equivalent is
 `--preset identity`.
+In the Wizard, *Character / person* then asks how much of the person the likeness covers, and sets the loss weights
+(face region / person region), the score weights, the crops and the probes for it:
+
+| Focus | Loss face / person | Score face / body | Crops | Probes |
+|---|---|---|---|---|
+| Face only | 3 / 1 | 100% / 0 | face | face only (no body references) |
+| Face focus (the recipe) | 3 / 1.5 | 70% / 30% | face + bust | both |
+| Face and body | 1.5 / 1.5 | 50% / 50% | face + bust | both |
+| Body focus | 1.5 / 3 | 30% / 70% | face + bust | both |
+| Body only | 1 / 3 | 0 / 100% | none | body only (no face references) |
+
+The curriculum is on for the three in the middle. The wizard also recommends the adapter (LoKr for a character),
+block swap for a card the model does not fit, LoRA Isolation, the look warm-up and how many checkpoints to keep.
 Measured on a small test set (120 steps, same seeds): region-weighted loss gave the best face likeness (+2 points
 over baseline), LoRA+ at ratio 4 a small gain (ratio 16 on a 2e-4 lr was unstable), `identity` timesteps were
 neutral, and auto crops *hurt* when the crops had to be upscaled. Suggested recipe: *Region-weighted loss* on

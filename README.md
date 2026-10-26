@@ -664,6 +664,19 @@ at step 100; baseline 74.2): region-weighted loss 76.0, LoRA+ ratio 4 74.7, `ide
 settings when switched off. Suggested recipe: `region_weights: true`, `lora_plus_ratio: 4` with `adamw8bit`,
 crops only from high-resolution photos (`crop_augment_min_px: 0` means crops are never upscaled), timesteps at
 `logit_normal`; treat `identity` timesteps and the curriculum as options to A/B with the probes.
+In the Wizard, *Character / person* then asks how much of the person the likeness covers, and sets the loss weights
+(face region / person region), the score weights, the crops and the probes for it:
+
+| Focus | Loss face / person | Score face / body | Crops | Probes |
+|---|---|---|---|---|
+| Face only | 3 / 1 | 100% / 0 | face | face only (no body references) |
+| Face focus (the recipe) | 3 / 1.5 | 70% / 30% | face + bust | both |
+| Face and body | 1.5 / 1.5 | 50% / 50% | face + bust | both |
+| Body focus | 1.5 / 3 | 30% / 70% | face + bust | both |
+| Body only | 1 / 3 | 0 / 100% | none | body only (no face references) |
+
+The curriculum is on for the three in the middle. The wizard also recommends the adapter (LoKr for a character),
+block swap for a card the model does not fit, LoRA Isolation, the look warm-up and how many checkpoints to keep.
 
 ### Experimental: direct identity loss
 
