@@ -178,6 +178,10 @@ variable is then unnecessary.
   Qwen3.5-9B text encoder embeds every caption through the chat template. Both are cached under
   `<dataset>/.rulz_cache`, then the encoders are unloaded. Training only holds the DiT and the LoRA.
 - **Timesteps.** `logit_normal` (mean/std), `sigmoid` (scale) or `uniform`, with an optional `timestep_shift`.
+  `logsnr` is the style-friendly sampler ([arXiv 2411.14793](https://arxiv.org/abs/2411.14793), via musubi-tuner):
+  the log signal-to-noise ratio is drawn from N(`logsnr_mean`, `logsnr_std`), -6 and 2 as the paper recommends, so
+  most steps are very noisy (median sigma about 0.95), where a style's colours and strokes are learned. It is meant for
+  style LoRAs; RulzTrainer's `style` mode tilts the same way more gently.
 - **Clean-end share** (`clean_share`, after Fizgig's MOSS-Image "Slide"; off by default). It sets the share of
   training steps at the clean end, where sigma is below 0.5 and faces and fine detail are refined, and it can change
   by epoch.
@@ -1225,6 +1229,33 @@ is set), where freed memory stays one piece; before every sample and probe round
 gradients and returns the cached memory. Measured on Linux: the probe after two training steps starts at 8.40 GB
 allocated / 8.52 GB reserved, the one before training at 8.28 / 8.29 GB. The Windows CUDA driver has no expandable
 segments; there only the cleanup applies.
+
+### Block swap (`block_swap`)
+
+For a card the model does not fit, after musubi-tuner's block swap. `block_swap: N` keeps the frozen weights of the
+first N DiT blocks in system RAM (pinned) and streams each block's weights to the GPU just before it runs: the int8 or
+nvfp4 data, scales, biases and norms. The next block is copied in on a side CUDA stream while the current one computes.
+Frozen weights never change, so nothing is copied back. The LoRA adapters, the rest of the model and the activations
+stay on the GPU.
+
+- **Why it needs gradient checkpointing.** In training it relies on checkpointing: a checkpointed block keeps no
+  weights for its backward, its recomputation streams them in again, and they go once that block's backward is done.
+  The swapped blocks are therefore never among the blocks that keep their activations.
+- **Two blocks at most.** At most two swapped blocks' weights are on the GPU at a time. The CPU waits rather than
+  queue copies far ahead of the GPU, and a recomputation that stops early still releases its block.
+- **Measured.** Krea 2 int8 on the 16 GB RTX 4060 Ti, 0.25 MP, 14 of 28 blocks swapped (3.4 GB in pinned RAM), every
+  block checkpointed:
+
+  | | Model on the GPU | Training-step peak | Step time |
+  |---|---|---|---|
+  | No swap | 9.17 GB | 10.81 GB | 2.2-2.8 s |
+  | `block_swap: 14` | 5.74 GB | 7.66 GB | 2.6 s |
+
+  The loss matches the unswapped run. The transfers mostly hide behind the blocks' compute on this PCIe link; a
+  slower link or a smaller per-block compute shows more of them.
+- **Limits.** Single GPU only (`model_split` spreads blocks over GPUs instead). Not with data parallel or a fine-tune.
+  torch.compile is turned off. A sampling model swapped in and out keeps the split. The *Block swap* field is on the
+  Train tab's memory section.
 
 ## torch.compile (`compile_model`)
 

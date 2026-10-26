@@ -672,6 +672,9 @@ def extras_active(model: nn.Module) -> bool:
 
 
 def set_extras_enabled(model: nn.Module, enabled: bool) -> None:
+    swap = model.__dict__.get("_rz_block_swap")
+    if swap is not None:  # norm offsets change the streamed weights: no stale prefetched copies
+        swap.reset()
     for m in model.modules():
         if isinstance(m, LoRALinear):
             m.extras_enabled = enabled

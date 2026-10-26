@@ -40,7 +40,8 @@ RACE_KEYS: dict[str, tuple[str, ...]] = {
         "lora_plus_ratio", "lora_ema", "automagic_min_lr", "automagic_max_lr", "automagic_polarity_history",
         "automagic_clip_threshold", "automagic_groups"),
     "Timesteps & loss": (
-        "timestep_sampling", "logit_mean", "logit_std", "sigmoid_scale", "timestep_shift", "clean_share",
+        "timestep_sampling", "logit_mean", "logit_std", "sigmoid_scale", "timestep_shift", "clean_share", "logsnr_mean",
+        "logsnr_std",
         "loss_weighting",
         "sigma_min", "sigma_max", "content_power", "region_weights", "face_loss_weight", "body_loss_weight",
         "background_loss_weight", "face_margin", "region_feather_cells", "region_prior_weight", "id_loss_weight",
@@ -404,7 +405,7 @@ def swap_in(v: Variant, wrappers: dict) -> None:
     """Make `v` the trained LoRA: its weights on each layer's device, its rank / alpha / dropout, and every layer it
     does not train switched off (its weights freed)."""
     for name, m in wrappers.items():
-        dev = m.weight.device
+        dev = m.lora_down.weight.device  # the adapter's own device (a swapped block's frozen weight is in RAM)
         if name in v.weights:
             if m.kind != v.kind:
                 m.set_kind(v.kind)
@@ -437,7 +438,7 @@ def attach(v: Variant, wrappers: dict) -> None:
     a copy on another. The layers' settings (kind, rank, scale, enabled layers) are those swap_in already set."""
     for name in v.names:
         m = wrappers[name]
-        dev = m.weight.device
+        dev = m.lora_down.weight.device
         params = m.adapter_params()
         for part, t in v.weights[name].items():
             params[part].data = t.detach().to(dev)

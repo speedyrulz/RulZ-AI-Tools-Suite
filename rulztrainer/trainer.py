@@ -197,6 +197,9 @@ def sample_sigmas(cfg: TrainConfig, n: int, gen: torch.Generator, logit_shift: f
         s = torch.sigmoid(torch.randn(n, generator=gen) * cfg.logit_std + cfg.logit_mean + logit_shift)
     elif mode == "sigmoid":
         s = torch.sigmoid(torch.randn(n, generator=gen) * cfg.sigmoid_scale + logit_shift)
+    elif mode == "logsnr":  # style-friendly (arXiv 2411.14793): log-SNR ~ N(mean, std); SNR = ((1 - s) / s)^2
+        logsnr = torch.randn(n, generator=gen) * cfg.logsnr_std + cfg.logsnr_mean
+        s = torch.sigmoid(-logsnr / 2 + logit_shift)
     elif mode == "identity":  # detail-heavy: logit-normal with mean -0.5 (median sigma ~0.38)
         s = torch.sigmoid(torch.randn(n, generator=gen) * 1.0 - 0.5 + logit_shift)
     elif mode == "content":  # ai-toolkit style cubic sampling toward low noise (structure/identity)
@@ -338,6 +341,7 @@ class Trainer(RaceParallelMixin):
         self.isolation = None  # LoRA Isolation's subjects (isolation.py) when it is on
         self.dop_values: list[float] = []  # DOP losses since the last log line
         self.ft = None  # finetune.FineTuner while a full fine-tune runs
+        self.block_swap = None  # blockswap.BlockSwap when block_swap is on
         self.ft_rotate_steps = 1
         self.ft_pending_save = False
         self.ft_window = 0
@@ -660,7 +664,8 @@ class Trainer(RaceParallelMixin):
         self.prepare_cache(items)
 
         self.status.update(stage="loading transformer", step=0, total=cfg.steps)
-        model = self.arch.get_transformer(cfg, self.model_dir)
+        # block swap: loaded in RAM, the swapped blocks' frozen weights stay there and the rest moves to the GPU
+        model = self.arch.get_transformer(cfg, self.model_dir, device="cpu" if cfg.block_swap > 0 else None)
         model.gradient_checkpointing = cfg.gradient_checkpointing
         n_quant = Q.configure_int8(model, cfg.int8_matmul, cfg.int8_backward)
         n_fp4 = Q.configure_nvfp4(model, cfg.nvfp4_matmul, cfg.nvfp4_backward)
@@ -726,6 +731,8 @@ class Trainer(RaceParallelMixin):
         if cfg.resume_from:
             n = lora_mod.load_lora_weights(injected, cfg.resume_from)
             log.info("Resumed %d LoRA modules from %s", n, cfg.resume_from)
+        if cfg.block_swap > 0:
+            self._setup_block_swap(cfg, model)
         if self.ft is not None:
             params, optimizer, scheduler = self._finetune_setup(cfg, items)
         elif self.race_rows is None:
@@ -795,6 +802,8 @@ class Trainer(RaceParallelMixin):
             do_compile, why = False, "race_parallel trains the model copies in threads at once"
         if self.ft is not None and do_compile:
             do_compile, why = False, "a fine-tune swaps its layers in and out of the model"
+        if self.block_swap is not None and do_compile:
+            do_compile, why = False, "block swap streams the blocks' weights in and out"
         if why:
             log.info("torch.compile %s (%s)", "on" if do_compile else "off", why)
         if do_compile:
@@ -1371,6 +1380,9 @@ class Trainer(RaceParallelMixin):
         cfg = self.cfg
         n_blocks = len(self.replicas[0][0].layers)
         candidates = ckpt.trained_block_indices(n_blocks, blocks)
+        if self.block_swap is not None:  # swapped blocks must stay checkpointed (or their weights stay on the GPU)
+            swapped = set(self.block_swap.indices)
+            candidates = [c for c in candidates if c not in swapped]
         self.kept = {}
         if not cfg.gradient_checkpointing or cfg.checkpoint_keep_blocks == 0 or not candidates:
             return
@@ -1939,6 +1951,8 @@ class Trainer(RaceParallelMixin):
                     from .multigpu import apply_assignment
 
                     apply_assignment(m, m.split_assignment)
+                elif self.block_swap is not None and m is self.block_swap.model:
+                    self.block_swap.reoffload()  # all but the swapped blocks' weights back (it may not fit the GPU)
                 else:
                     m.to(d)
 
@@ -2039,6 +2053,21 @@ class Trainer(RaceParallelMixin):
             log.info("Resolution step-up: now training at %s from step %d (%d items)", self._stage_label(), step,
                      len(items))
         self.status.update(resolution=self._stage_label(), res_stage=self.res_stage, res_stages=len(self.sides))
+
+    # ------------------------------------------------------------ block swap (see blockswap.py)
+    def _setup_block_swap(self, cfg, model) -> None:
+        from .blockswap import BlockSwap
+
+        n = len(model.layers)
+        k = min(int(cfg.block_swap), n - 1)
+        if k < cfg.block_swap:
+            log.warning("block_swap %d is more than the %d blocks allow: %d swapped", cfg.block_swap, n, k)
+        self.status.update(stage="setting up block swap")
+        self.block_swap = BlockSwap(model, range(k), self.devices[0])
+        model._rz_block_swap = self.block_swap  # set_extras_enabled resets its prefetch (rulztrainer.lora)
+        log.info("Block swap: the frozen weights of blocks 0-%d (%d of %d) stay in RAM, %.1f GB pinned, and stream to "
+                 "%s as each block runs (prefetching the next)", k - 1, k, n, self.block_swap.bytes / 1e9,
+                 self.devices[0])
 
     # ------------------------------------------------------------ LoRA Isolation (see isolation.py)
     def _isolation_prepare(self, cfg, items):

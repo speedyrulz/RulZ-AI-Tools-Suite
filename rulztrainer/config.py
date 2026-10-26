@@ -156,6 +156,7 @@ class TrainConfig:
     device: str = "cuda:0"
     multi_gpu: str = "off"  # off | data_parallel (model copy per GPU, faster) | model_split (blocks across GPUs, memory only)
     devices: str = "cuda:0,cuda:1"  # GPUs for multi_gpu; the first is the primary
+    block_swap: int = 0  # DiT blocks whose frozen weights stay in RAM and stream to the GPU as they run (blockswap.py)
     split_plan: str = ""  # model_split: manual block plan e.g. "cuda:0=0-25;cuda:1=26-41"; empty = auto-balance
     parallel_jobs: bool = True  # multi_gpu: split samples, probes, latent/text caching and SAM 3 masks across the GPUs
     dp_balance: str = "auto"  # data_parallel batches per GPU and step by measured speed: off (lockstep) | auto (same
@@ -250,6 +251,8 @@ class TrainConfig:
     logit_mean: float = 0.0
     logit_std: float = 1.0
     sigmoid_scale: float = 1.0  # sigmoid mode: sigma = sigmoid(randn * sigmoid_scale)
+    logsnr_mean: float = -6.0  # logsnr mode (style-friendly, arXiv 2411.14793): log-SNR ~ N(mean, std), very noisy
+    logsnr_std: float = 2.0  #   steps where style is learned; the paper recommends -6 and 2 or 3
     timestep_shift: float = 1.0  # sigma shift applied to sampled sigmas (training_shift is 1.0 upstream)
     clean_share: str = ""  # share of steps below sigma 0.5 by epoch (clean_share.py): "" = the sampler's own,
     #                        "40", "75:5:40", or Fizgig's MOSS Slide "60:7:30:15:2"
@@ -418,6 +421,19 @@ class TrainConfig:
         parse_clean_share(self.clean_share)
         if self.finetune:
             self.validate_finetune()
+        if self.block_swap:
+            if self.block_swap < 0:
+                raise ValueError("block_swap must be 0 (off) or a number of blocks")
+            if self.multi_gpu in ("model_split", "data_parallel"):
+                raise ValueError("block_swap runs on one GPU: set multi_gpu to off (model_split spreads the blocks "
+                                 "over GPUs instead)")
+            if self.finetune:
+                raise ValueError("block_swap streams frozen weights; a fine-tune trains them: turn one off")
+            if not self.gradient_checkpointing:
+                raise ValueError("block_swap needs gradient_checkpointing (without it every swapped block's weights "
+                                 "stay on the GPU until the backward)")
+        if self.timestep_sampling == "logsnr" and self.logsnr_std <= 0:
+            raise ValueError("logsnr_std must be above 0")
         if self.isolation:
             if self.finetune:
                 raise ValueError("isolation and finetune cannot be combined (DOP holds the LoRA to the model without "

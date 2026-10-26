@@ -785,10 +785,24 @@ def w8a8_backward_x(grad2d: torch.Tensor, qw: "QuantWeight", mode: str) -> torch
     return gx
 
 
+def _save_qw(ctx, qw: "QuantWeight") -> None:
+    """Keep a quantized weight for the backward through save_for_backward, not as a ctx attribute: gradient
+    checkpointing then drops it with the rest of a checkpointed block's saved tensors and the recomputation saves it
+    again (block swap relies on it: a ctx attribute would hold every streamed block's GPU copy until the backward)."""
+    ctx.qw_meta = (qw.fmt, tuple(qw.orig_shape), qw.group, qw.scale2 is not None)
+    ctx.save_for_backward(qw.qdata, qw.scale, *([qw.scale2] if qw.scale2 is not None else []))
+
+
+def _load_qw(ctx) -> "QuantWeight":
+    fmt, shape, group, has2 = ctx.qw_meta
+    saved = ctx.saved_tensors
+    return QuantWeight(fmt, saved[0], saved[1], saved[2] if has2 else None, shape, group)
+
+
 class _W8A8LinearFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, bias, qw: QuantWeight, backward_mode: str):
-        ctx.qw = qw
+        _save_qw(ctx, qw)
         ctx.backward_mode = backward_mode
         x2d = x.reshape(-1, x.shape[-1])
         try:
@@ -802,7 +816,7 @@ class _W8A8LinearFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        qw = ctx.qw
+        qw = _load_qw(ctx)
         g2d = grad_out.reshape(-1, grad_out.shape[-1])
         try:
             gx = w8a8_backward_x(g2d, qw, ctx.backward_mode)
@@ -900,7 +914,7 @@ class _NVFP4LinearFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, bias, qw: QuantWeight, backward_mode: str = "bf16"):
         global _NVFP4_WARNED
-        ctx.qw = qw
+        _save_qw(ctx, qw)
         ctx.backward_mode = backward_mode
         x2d = x.reshape(-1, x.shape[-1])
         try:
@@ -918,7 +932,7 @@ class _NVFP4LinearFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         global _NVFP4_WARNED
-        qw = ctx.qw
+        qw = _load_qw(ctx)
         if ctx.backward_mode == "fp4":
             g2d = grad_out.reshape(-1, grad_out.shape[-1])
             if nvfp4_backward_fp4_supported(g2d, qw):
@@ -939,12 +953,12 @@ class _QuantLinearFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, bias, qw: QuantWeight):
         w = qw.dequantize(x.dtype)
-        ctx.qw = qw
+        _save_qw(ctx, qw)
         return nn.functional.linear(x, w, bias)
 
     @staticmethod
     def backward(ctx, grad_out):
-        w = ctx.qw.dequantize(grad_out.dtype)
+        w = _load_qw(ctx).dequantize(grad_out.dtype)
         grad_x = grad_out @ w
         return grad_x, None, None
 

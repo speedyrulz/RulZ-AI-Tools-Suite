@@ -1062,6 +1062,8 @@ class Form:
             automagic_polarity_history=int(v("automagic_polarity_history")), automagic_groups=v("automagic_groups"),
             automagic_clip_threshold=float(v("automagic_clip_threshold")),
             timestep_shift=float(v("timestep_shift")), sigmoid_scale=float(v("sigmoid_scale")),
+            logsnr_mean=float(v("logsnr_mean")), logsnr_std=float(v("logsnr_std")),
+            block_swap=int(v("block_swap") or 0),
             clean_share=str(v("clean_share") or "").strip(),
             logit_mean=float(v("logit_mean")), logit_std=float(v("logit_std")), loss_weighting=v("loss_weighting"),
             save_every=int(v("save_every")), sample_every=int(v("sample_every")), sample_prompts=prompts,
@@ -3650,6 +3652,15 @@ def build_page(local: bool = True):
                                          "bucket at the start and keeps as many of the last blocks as the free GPU "
                                          "memory allows (a step that still runs out keeps fewer); 0 = every block "
                                          "is checkpointed.")
+                            w["block_swap"] = ui.number("Block swap (blocks in RAM, 0 = off)", value=d.block_swap,
+                                                        min=0, precision=0).classes("w-64") \
+                                .bind_visibility_from(w["multi_gpu"], "value", lambda x: x == "off") \
+                                .tooltip("For a card the model does not fit: this many DiT blocks keep their frozen "
+                                         "weights in system RAM (pinned) and stream to the GPU as each block runs, "
+                                         "the next one copied in while the current one computes. Saves about the "
+                                         "blocks' share of the model in VRAM for some speed, depending on the PCIe "
+                                         "link. Needs gradient checkpointing; single GPU only; turns torch.compile "
+                                         "off.")
                         with advanced():
                             with fields():
                                 w["text_encoder_device"] = ui.select(["auto"] + gpus + ["cpu"], value="auto",
@@ -4073,13 +4084,21 @@ def build_page(local: bool = True):
                                                                 label="Loss weighting").classes("w-40")
                             with fields():
                                 w["timestep_sampling"] = ui.select(["logit_normal", "sigmoid", "uniform", "identity",
-                                                                    "content", "style", "reference"],
+                                                                    "content", "style", "logsnr", "reference"],
                                                                    value=d.timestep_sampling,
                                                                    label="Timestep sampling").classes("w-44") \
                                     .tooltip("identity: logit-normal mean -0.5 (detail/low noise). content: sigma = u^p "
                                              "toward low noise (ai-toolkit style). style: mirror toward high noise. "
                                              "reference: the model family's own training recipe (Bria's for FIBO 2.0, "
-                                             "the MOSS-Image report's for MOSS).")
+                                             "the MOSS-Image report's for MOSS). logsnr: the style-friendly sampler "
+                                             "(log-SNR ~ N(mean, std), mean -6: mostly very noisy steps, where style is "
+                                             "learned; for style LoRAs).")
+                                w["logsnr_mean"] = ui.number("Log-SNR mean", value=d.logsnr_mean, step=0.5) \
+                                    .classes("w-32").bind_visibility_from(w["timestep_sampling"], "value",
+                                                                          lambda x: x == "logsnr")
+                                w["logsnr_std"] = ui.number("Log-SNR std", value=d.logsnr_std, min=0.1, step=0.5) \
+                                    .classes("w-32").bind_visibility_from(w["timestep_sampling"], "value",
+                                                                          lambda x: x == "logsnr")
                                 w["content_power"] = ui.number("Content power", value=d.content_power, step=0.5) \
                                     .classes("w-32").bind_visibility_from(w["timestep_sampling"], "value",
                                                                           lambda x: x in ("content", "style"))
@@ -5273,6 +5292,12 @@ auto (default) times each GPU during the first steps and splits a step's images 
 faster per image, keeping the images per step the same (it needs several per step: gradient accumulation 3 or
 more). grow lets the faster GPU train more images in the slower one's time, so each step holds more images: lower
 the steps to match. The log says what was measured and chosen.
+
+## Block swap
+*Block swap* (Train tab, memory section; single GPU) keeps the frozen weights of that many DiT blocks in system RAM and
+streams each block's weights to the GPU just before it runs, the next one copied in while the current one computes.
+Measured on Krea 2 int8 with 14 of 28 blocks swapped: the training step's peak went from 10.8 to 7.7 GB at about the
+same step time. It needs gradient checkpointing and turns torch.compile off.
 
 ## Compile
 *Compile model* (Model, Advanced; default auto): torch.compile fuses the small steps between the matrix multiplies
