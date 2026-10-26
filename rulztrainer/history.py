@@ -5,7 +5,8 @@ once more when it ends. The WebUI's Previous Runs tab lists them and overlays an
 What is kept is what the Monitor's two likeness charts plot:
 
   * identity: the mean face and the mean body score of the sample images at each sampling step;
-  * probes:   the smoothed face, body and combined score of the likeness probes at each probe step;
+  * probes:   the smoothed face, body and combined score of the likeness probes at each probe step, and for a race
+              each configuration's own (probes.racers, by name; "winner" for the probes after the race);
 
 on the normalized scale (0 = a stranger, 100 = the references) where the run had one, else the raw percentages.
 Runs from before the history existed are imported from their job folders' status.json."""
@@ -50,8 +51,23 @@ def identity_series(face_scores: list[dict]) -> dict:
             "body": _mean_by_step([(sc["step"], pick(sc, "body_norm", "body_percent")) for sc in face_scores])}
 
 
-def probe_series(probes: list[dict]) -> dict:
-    """The smoothed face, body and combined score per probe (the Likeness probes chart)."""
+_RACE_IMAGE = re.compile(r"^(?P<name>.+?)_step(?P<step>\d{6})_(?P<rest>.+)\.png$")
+
+
+def probe_racer(rec: dict, names) -> str:
+    """The race configuration a probe record belongs to (its images carry the name as a prefix); "" for a probe
+    outside the race (the winner training on after it)."""
+    for p in rec.get("images") or []:
+        m = _RACE_IMAGE.match(Path(p).name)
+        if m and m["name"] in names:
+            return m["name"]
+    return ""
+
+
+def probe_series(probes: list[dict], names=()) -> dict:
+    """The smoothed face, body and combined score per probe (the Likeness probes chart), all probes together; with a
+    race's configuration names also each configuration's own under "racers" (the winner's after the race:
+    "winner")."""
     def pts(key: str, fallback: str | None = None) -> list[list]:
         out = []
         for pr in probes:
@@ -62,8 +78,18 @@ def probe_series(probes: list[dict]) -> dict:
                 out.append([pr["step"], round(v, 1)])
         return out
 
-    return {"face": pts("face_norm_ema", "face_ema"), "body": pts("body_norm_ema", "body_ema"),
-            "combined": pts("combined_ema")}
+    out = {"face": pts("face_norm_ema", "face_ema"), "body": pts("body_norm_ema", "body_ema"),
+           "combined": pts("combined_ema")}
+    if names:
+        by: dict[str, list[dict]] = {}
+        for pr in probes:
+            by.setdefault(probe_racer(pr, names), []).append(pr)
+        out["racers"] = {(n or "winner"): probe_series(by[n]) for n in [*names, ""] if n in by}
+    return out
+
+
+def race_names(status: dict) -> list[str]:
+    return [str(n) for n in ((status.get("race") or {}).get("names") or [])]
 
 
 def build_record(cfg: dict, arch: str, run_id: str, started: float, status: dict, state: str,
@@ -73,11 +99,12 @@ def build_record(cfg: dict, arch: str, run_id: str, started: float, status: dict
             "step": status.get("step") or 0, "total": status.get("total") or cfg.get("steps") or 0,
             "config": {k: cfg[k] for k in CONFIG_KEYS if k in cfg},
             "identity": identity_series(status.get("face_scores") or []),
-            "probes": probe_series(status.get("probes") or [])}
+            "probes": probe_series(status.get("probes") or [], race_names(status))}
 
 
 def has_data(record: dict) -> bool:
-    return any(record["identity"].get(k) for k in ("face", "body")) or any(record["probes"].values())
+    return any(record["identity"].get(k) for k in ("face", "body")) or any(
+        record["probes"].get(k) for k in ("face", "body", "combined"))
 
 
 def _write(path: Path, record: dict) -> None:
@@ -144,11 +171,14 @@ def delete_runs(run_ids: list[str], root: Path = HISTORY_DIR) -> int:
 
 def import_jobs(output: Path | None = None, root: Path = HISTORY_DIR) -> int:
     """History for the job folders (output/**/status.json) from before the history existed: one run per folder whose
-    job has no history yet and whose status.json holds likeness scores. Returns how many were added."""
+    job has no history yet and whose status.json holds likeness scores. A race run saved before the history kept each
+    configuration's probes apart gets them from its folder. Returns how many runs were added or updated."""
     import yaml
 
     output = output or ROOT / "output"
-    have = {r["job"] for r in list_runs(root)}
+    runs = list_runs(root)
+    have = {r["job"] for r in runs}
+    unsplit = {r["job"]: r for r in runs if (r.get("config") or {}).get("race") and "racers" not in r["probes"]}
     added = 0
     for status_path in sorted(output.rglob("status.json")) if output.is_dir() else []:
         job_dir = status_path.parent
@@ -161,6 +191,12 @@ def import_jobs(output: Path | None = None, root: Path = HISTORY_DIR) -> int:
         except (OSError, ValueError, yaml.YAMLError):
             continue
         job = cfg.get("job_name") or job_dir.name
+        if job in unsplit and race_names(status):
+            rec = unsplit.pop(job)
+            rec["probes"] = probe_series(status.get("probes") or [], race_names(status))
+            _write(root / f"{rec['id']}.json", rec)
+            added += 1
+            continue
         if job in have:
             continue
         try:

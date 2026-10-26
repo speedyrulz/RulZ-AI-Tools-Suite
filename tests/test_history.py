@@ -98,3 +98,35 @@ def test_the_table_and_the_overlay_series():
     both = webui.history_series(runs, "identity", ["face"])
     assert len(both) == 1 and both[0]["data"] == [[300, 15.0]] and both[0]["showSymbol"]
     assert webui.history_series(runs, "probes", []) == []
+
+
+def test_a_race_keeps_each_configuration_s_probes_apart(tmp_path):
+    def rec(name, step, comb):
+        prefix = f"{name}_" if name else ""
+        return {"step": step, "face_norm_ema": comb - 5, "body_norm_ema": comb + 5, "combined_ema": comb,
+                "images": [f"out/probes/{prefix}step{step:06d}_face_0.png"]}
+
+    status = {"race": {"names": ["lora16", "lokr8"]},
+              "probes": [rec("lora16", 50, 10.0), rec("lokr8", 50, 14.0), rec("lokr8", 100, 20.0), rec("", 150, 25.0)]}
+    series = history.probe_series(status["probes"], history.race_names(status))
+    assert series["combined"] == [[50, 10.0], [50, 14.0], [100, 20.0], [150, 25.0]]  # all together, as before
+    assert list(series["racers"]) == ["lora16", "lokr8", "winner"]
+    assert series["racers"]["lokr8"]["combined"] == [[50, 14.0], [100, 20.0]]
+    assert series["racers"]["winner"]["face"] == [[150, 20.0]]
+    run = {"id": "r", "job": "race", "label": "my race", "probes": series, "identity": {}, "config": {"race": True}}
+    lines = webui.history_series([run], "probes", ["combined"])
+    assert [s["name"] for s in lines] == ["my race lora16 - combined", "my race lokr8 - combined",
+                                          "my race winner - combined"]
+    assert len({s["itemStyle"]["color"] for s in lines}) == 3  # one colour per configuration
+    # a race saved before the split gets it from its job folder on import
+    job = tmp_path / "output" / "race"
+    job.mkdir(parents=True)
+    (job / "status.json").write_text(json.dumps(status))
+    (job / "config.yaml").write_text("job_name: race\nrace: true\n")
+    root = tmp_path / "history"
+    old = {**run, "probes": {k: v for k, v in series.items() if k != "racers"}}
+    history._write(root / "r.json", old)
+    assert history.import_jobs(tmp_path / "output", root) == 1
+    upgraded = history.list_runs(root)
+    assert len(upgraded) == 1 and list(upgraded[0]["probes"]["racers"]) == ["lora16", "lokr8", "winner"]
+    assert upgraded[0]["label"] == "my race"

@@ -620,7 +620,7 @@ def score_caption(sc: dict) -> str:
     return "  |  " + ", ".join(parts)
 
 
-_RACE_IMAGE = re.compile(r"^(?P<name>.+?)_step(?P<step>\d{6})_(?P<rest>.+)\.png$")
+_RACE_IMAGE = history._RACE_IMAGE  # "<configuration>_step000120_<rest>.png"
 
 
 def race_names(job_dir: Path | None) -> list[str]:
@@ -664,14 +664,7 @@ def group_by_generation(paths, names: list[str]) -> list[tuple[int, str, list[tu
     return out
 
 
-def probe_racer(rec: dict, names: list[str]) -> str:
-    """The race configuration a probe record belongs to (its images carry the name as a prefix); "" for a probe
-    outside the race (the winner training on after it)."""
-    for p in rec.get("images") or []:
-        m = _RACE_IMAGE.match(Path(p).name)
-        if m and m["name"] in names:
-            return m["name"]
-    return ""
+probe_racer = history.probe_racer
 
 
 def _probe_points(probes: list[dict], key: str, fallback: str | None = None) -> list[list]:
@@ -4370,15 +4363,22 @@ def history_series(runs: list[dict], part: str, metrics: list[str]) -> list[dict
     body dashed, combined thick). part is "identity" (the sample images' means) or "probes"."""
     styles = {"face": {}, "body": {"type": "dashed"}, "combined": {"width": 3}}
     out = []
-    for i, r in enumerate(runs):
-        color = HISTORY_COLORS[i % len(HISTORY_COLORS)]
-        for metric in metrics:
-            pts = (r.get(part) or {}).get(metric) or []
-            if not pts:
-                continue
-            out.append({"name": f"{history_label(r)} - {metric}", "type": "line", "data": pts,
-                        "showSymbol": part == "identity", "symbolSize": 6, "itemStyle": {"color": color},
-                        "lineStyle": {"color": color, "width": 2, **styles[metric]}})
+    n_color = 0
+    for r in runs:
+        data = r.get(part) or {}
+        racers = data.get("racers") if part == "probes" else None
+        # a race: each configuration's own lines in its own colour ("<run> lora16 - face"), else the run's
+        groups = [(f"{history_label(r)} {name}", d) for name, d in racers.items()] if racers else             [(history_label(r), data)]
+        for label, d in groups:
+            color = HISTORY_COLORS[n_color % len(HISTORY_COLORS)]
+            n_color += 1
+            for metric in metrics:
+                pts = d.get(metric) or []
+                if not pts:
+                    continue
+                out.append({"name": f"{label} - {metric}", "type": "line", "data": pts,
+                            "showSymbol": part == "identity", "symbolSize": 6, "itemStyle": {"color": color},
+                            "lineStyle": {"color": color, "width": 2, **styles[metric]}})
     return out
 
 
