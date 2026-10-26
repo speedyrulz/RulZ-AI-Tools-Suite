@@ -11,7 +11,14 @@ least 4 faces). Images under it are suggested; baselines and images without a fa
 <dataset>/excluded_by_look/ with their captions, keeping their sub-folders, so they can be moved back; nothing is
 deleted, and training skips that folder.
 
-The scores are saved to <dataset>/look_scores.json. With look_warmup on, training eases the outliers that stayed in
+Body outliers work the same way (kind "body"): the score is the cosine similarity of the picture's body window (the
+trainer's body score: neck to mid-thigh, turned upright, the person cut out on grey, embedded with DINOv2) to the body
+windows of the body baselines, so a picture with a different build, skin, hair or outfit than the baselines falls under
+the fence. A picture without shoulders and hips in the frame, or with less than WINDOW_MIN_SCORE_COVER of its window
+inside it, has no body score. DINOv2 cosines sit high and close together (no ArcFace-style 0.45 / 0.30 rules), so the
+verdicts read off the fence and the median, and the fence has no floor.
+
+The scores are saved to <dataset>/look_scores.json (body: look_scores_body.json). With look_warmup on, training eases the outliers that stayed in
 (real but unusual shots: tight angles, profiles) in: their loss weight starts at look_warmup_start and ramps to full
 over look_warmup_epochs epochs, while the identity forms from the typical images. Fizgig's own fizgig_look_scores.json
 is read too."""
@@ -26,17 +33,30 @@ from pathlib import Path
 log = logging.getLogger("rulztrainer")
 
 SCORES_FILE = "look_scores.json"
+BODY_SCORES_FILE = "look_scores_body.json"
 FIZGIG_FILE = "fizgig_look_scores.json"
+KINDS = ("face", "body")
+
+
+def scores_file(kind: str = "face") -> str:
+    return BODY_SCORES_FILE if kind == "body" else SCORES_FILE
 EXCLUDED_DIR = "excluded_by_look"
 MATCH, BORDERLINE, FENCE_FLOOR = 0.45, 0.30, 0.25
 MIN_FACES = 4  # the fence needs this many scored faces
 CAPTION_EXTS = (".txt", ".json")
 
 
-def verdict(score) -> str:
-    """match (solid), borderline (same person, drifting), drift (likely off-look or someone else) or no face."""
+def verdict(score, kind: str = "face", median=None, cutoff=None) -> str:
+    """match (solid), borderline (drifting), drift (likely off-look or someone else) or no face / no body. Faces read
+    ArcFace's conventions; a body score (DINOv2 cosines, close together) reads off the scan's median and fence."""
     if score is None:
-        return "no face"
+        return "no body" if kind == "body" else "no face"
+    if kind == "body":
+        if cutoff is None:
+            return "match"
+        if score < cutoff:
+            return "drift"
+        return "borderline" if median is not None and score < (cutoff + median) / 2 else "match"
     return "match" if score >= MATCH else "borderline" if score >= BORDERLINE else "drift"
 
 
@@ -61,19 +81,20 @@ def score_images(files, baselines, embed, progress=None) -> dict[str, float | No
     return out
 
 
-def fence(scores) -> tuple[float | None, float | None]:
-    """(median, cutoff) of the scored faces: cutoff = median - 1.5 x IQR, at least FENCE_FLOOR; (None, None) under
-    MIN_FACES faces."""
+def fence(scores, kind: str = "face") -> tuple[float | None, float | None]:
+    """(median, cutoff) of the scored pictures: cutoff = median - 1.5 x IQR, at least FENCE_FLOOR for faces (none for
+    bodies); (None, None) under MIN_FACES scored pictures."""
     vals = sorted(v for v in (scores.values() if isinstance(scores, dict) else scores) if v is not None)
     if len(vals) < MIN_FACES:
         return None, None
     q1, med, q3 = statistics.quantiles(vals, n=4, method="inclusive")
-    return med, max(med - 1.5 * (q3 - q1), FENCE_FLOOR)
+    cut = med - 1.5 * (q3 - q1)
+    return med, (max(cut, FENCE_FLOOR) if kind == "face" else cut)
 
 
-def suggest(scores: dict, baselines=()) -> set[str]:
-    """The images under the fence; never a baseline, never one without a face."""
-    _, cut = fence(scores)
+def suggest(scores: dict, baselines=(), kind: str = "face") -> set[str]:
+    """The images under the fence; never a baseline, never one without a score."""
+    _, cut = fence(scores, kind)
     if cut is None:
         return set()
     keep = {str(b) for b in baselines}
@@ -87,23 +108,23 @@ def _rel(folder: Path, p) -> str:
         return Path(p).name
 
 
-def save_scores(folder, baselines, scores) -> Path:
-    """<folder>/look_scores.json: the baselines, the fence and every image's score, keyed by its path inside the
-    dataset folder (the file travels with the dataset)."""
+def save_scores(folder, baselines, scores, kind: str = "face") -> Path:
+    """<folder>/look_scores.json (body: look_scores_body.json): the baselines, the fence and every image's score,
+    keyed by its path inside the dataset folder (the file travels with the dataset)."""
     folder = Path(folder)
-    med, cut = fence(scores)
+    med, cut = fence(scores, kind)
     payload = {"baselines": [_rel(folder, b) for b in baselines], "median": med, "cutoff": cut,
                "scores": {_rel(folder, p): s for p, s in scores.items()}}
-    path = folder / SCORES_FILE
+    path = folder / scores_file(kind)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return path
 
 
-def load_scores(folder) -> dict | None:
+def load_scores(folder, kind: str = "face") -> dict | None:
     """The saved scan of a dataset folder as {"baselines": [paths], "cutoff", "median", "scores": {path: score}} with
-    absolute paths, or None. Reads Fizgig's file (scores keyed by file stem) when there is no RulzTrainer one."""
+    absolute paths, or None. Faces read Fizgig's file (scores keyed by file stem) when there is no RulzTrainer one."""
     folder = Path(folder)
-    for name in (SCORES_FILE, FIZGIG_FILE):
+    for name in ((BODY_SCORES_FILE,) if kind == "body" else (SCORES_FILE, FIZGIG_FILE)):
         p = folder / name
         if not p.is_file():
             continue
@@ -127,15 +148,18 @@ def load_scores(folder) -> dict | None:
     return None
 
 
-def outliers(folder) -> set[str]:
-    """Resolved paths of the images of a dataset folder that its saved scan puts under the fence (and that are still
-    there): the ones the look warm-up eases in."""
-    data = load_scores(folder)
-    if not data or data.get("cutoff") is None:
-        return set()
-    cut = float(data["cutoff"])
-    return {str(Path(p).resolve()) for p, s in data["scores"].items()
-            if isinstance(s, (int, float)) and s < cut and Path(p).is_file()}
+def outliers(folder, kinds=KINDS) -> set[str]:
+    """Resolved paths of the images of a dataset folder that its saved scans (face and / or body) put under their
+    fence (and that are still there): the ones the look warm-up eases in."""
+    out: set[str] = set()
+    for kind in kinds:
+        data = load_scores(folder, kind)
+        if not data or data.get("cutoff") is None:
+            continue
+        cut = float(data["cutoff"])
+        out |= {str(Path(p).resolve()) for p, s in data["scores"].items()
+                if isinstance(s, (int, float)) and s < cut and Path(p).is_file()}
+    return out
 
 
 def _move(src: Path, dest: Path) -> Path:
@@ -237,5 +261,28 @@ def face_embedder(provider: str = "cpu", det_size: int = 640, progress=None):
     def embed(path):
         fs = scorer.faces(path)
         return fs[0].normed_embedding.astype("float32") if fs else None
+
+    return embed
+
+
+_BODY: dict = {}
+
+
+def body_embedder(models_dir="models", device: str = "cpu", progress=None):
+    """embed(path) -> the picture's body-window embedding (DINOv2, the trainer's AppearanceScorer: the neck to mid-thigh
+    cut out, upright, on grey) or None when the window is not in the frame (no shoulders and hips, or less than
+    bodysim.WINDOW_MIN_SCORE_COVER of it inside the photo). Loaded once per process and device."""
+    from . import bodysim
+
+    key = (str(models_dir), device)
+    if key not in _BODY:
+        _BODY[key] = bodysim.AppearanceScorer(models_dir, device, progress=progress)
+    scorer = _BODY[key]
+
+    def embed(path):
+        win = scorer.window(path)
+        if win is None or win[1] < bodysim.WINDOW_MIN_SCORE_COVER:
+            return None
+        return scorer._embed(win[0])
 
     return embed

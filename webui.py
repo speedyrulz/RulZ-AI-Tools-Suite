@@ -1066,7 +1066,8 @@ class Form:
             block_swap=int(v("block_swap") or 0),
             clean_share=str(v("clean_share") or "").strip(),
             logit_mean=float(v("logit_mean")), logit_std=float(v("logit_std")), loss_weighting=v("loss_weighting"),
-            save_every=int(v("save_every")), sample_every=int(v("sample_every")), sample_prompts=prompts,
+            save_every=int(v("save_every")), keep_checkpoints=int(v("keep_checkpoints") or 0),
+            sample_every=int(v("sample_every")), sample_prompts=prompts,
             sample_width=aspect_size(v("sample_aspect"), v("sample_mp"))[0],
             sample_height=aspect_size(v("sample_aspect"), v("sample_mp"))[1],
             sample_steps=int(v("sample_steps")), sample_cfg=float(v("sample_cfg")),
@@ -1599,7 +1600,8 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 PAGE_SIZE = 24
 THUMB_SIZE = 512
 LOOK_SHOWN = 48  # look filter results shown before Show all
-LOOK_COLORS = {"match": "positive", "borderline": "warning", "drift": "negative", "no face": "grey"}
+LOOK_COLORS = {"match": "positive", "borderline": "warning", "drift": "negative", "no face": "grey",
+               "no body": "grey"}
 
 
 @app.get("/rz-image")
@@ -1887,8 +1889,35 @@ def build_dataset_tab(f: Form):
     its captions and pick references."""
     picker: DatasetPicker = f.w["datasets"]
     state = {"page": 0, "images": [], "busy": False, "open": None, "sync": False}
-    look = {"baselines": [], "scores": {}, "marks": set(), "cutoff": None, "median": None, "all": False,
-            "busy": False, "progress": "", "excluded": 0}
+    class LookState:
+        """The look filter's state per kind (face, body); item access reads and writes the kind being shown."""
+
+        def __init__(self):
+            self.kind = "face"
+            self.by_kind = {k: self.fresh() for k in lookfilter.KINDS}
+            self.shared = {"busy": False, "progress": "", "excluded": 0, "all": False}
+
+        @staticmethod
+        def fresh():
+            return {"baselines": [], "scores": {}, "marks": set(), "cutoff": None, "median": None}
+
+        def _bucket(self, key):
+            return self.shared if key in self.shared else self.by_kind[self.kind]
+
+        def __getitem__(self, key):
+            return self._bucket(key)[key]
+
+        def __setitem__(self, key, value):
+            self._bucket(key)[key] = value
+
+        def update(self, **kw):
+            for k, v in kw.items():
+                self[k] = v
+
+        def of(self, kind):
+            return self.by_kind[kind]
+
+    look = LookState()
     native = _native_dialogs
     show_full = image_viewer()
     root_label = _relative(str(DATASETS_ROOT))
@@ -1948,7 +1977,12 @@ def build_dataset_tab(f: Form):
                  "someone else. Auto-suggest marks the outliers (below the median minus 1.5 times the spread, never "
                  "under 0.25). Move marked out puts them and their captions in excluded_by_look/ inside the dataset, "
                  "which never trains; nothing is deleted, and Move all back restores them. The scores are saved with "
-                 "the dataset, for the Train tab's Warm up look outliers.")
+                 "the dataset, for the Train tab's Warm up look outliers. Body outliers: the same with the body (neck to "
+                 "mid-thigh, cut out and turned upright, as the likeness probes score it) instead of the face, so a "
+                 "different build, skin, hair or outfit than your body baselines shows; pictures without that part of "
+                 "the body in the frame get no score. It runs on the Body score device (Identity similarity).")
+            ui.toggle({"face": "Face outliers", "body": "Body outliers"}, value="face",
+                                  on_change=lambda e: look_set_kind(e.value)).props("no-caps dense")
             with ui.row().classes("w-full items-center gap-2"):
                 look_base_label = ui.label("").classes("text-sm")
                 ui.space()
@@ -2053,11 +2087,14 @@ def build_dataset_tab(f: Form):
                                     on_change=lambda e, p=img: look_toggle_base(p, e.value)).props("dense") \
                             .classes("text-xs").tooltip("A baseline of the look consistency filter: a picture that "
                                                         "nails the look")
-                        sc = look["scores"].get(str(img), "unscanned")
-                        if sc != "unscanned":
-                            vd = lookfilter.verdict(sc)
-                            ui.badge("no face" if sc is None else f"look {sc:.2f}", color=LOOK_COLORS[vd]) \
-                                .props("dense").tooltip(f"Look consistency: {vd}")
+                        for kind in lookfilter.KINDS:
+                            st = look.of(kind)
+                            sc = st["scores"].get(str(img), "unscanned")
+                            if sc != "unscanned":
+                                vd = lookfilter.verdict(sc, kind, st["median"], st["cutoff"])
+                                word = "body" if kind == "body" else "look"
+                                ui.badge(f"no {kind}" if sc is None else f"{word} {sc:.2f}", color=LOOK_COLORS[vd]) \
+                                    .props("dense").tooltip(f"Look consistency ({kind}): {vd}")
                         status_label = ui.label("" if cap.is_file() else "no caption yet").classes("text-xs text-grey")
                     ui.textarea(value=text, placeholder="type a caption; it is saved to the .txt automatically",
                                 on_change=lambda e, p=img, sl=status_label: save_caption(p, e.value, sl)) \
@@ -2065,12 +2102,20 @@ def build_dataset_tab(f: Form):
 
     # ---------------------------------------------------------------- look consistency filter
     def look_load(path: str):
-        data = lookfilter.load_scores(path)
-        look.update(baselines=[], scores={}, marks=set(), cutoff=None, median=None, all=False, progress="")
-        if data:
-            look.update(baselines=[b for b in data["baselines"] if Path(b).is_file()], scores=data["scores"],
-                        cutoff=data.get("cutoff"), median=data.get("median"))
+        for kind in lookfilter.KINDS:
+            st = look.by_kind[kind] = look.fresh()
+            data = lookfilter.load_scores(path, kind)
+            if data:
+                st.update(baselines=[b for b in data["baselines"] if Path(b).is_file()], scores=data["scores"],
+                          cutoff=data.get("cutoff"), median=data.get("median"))
+        look.shared.update(all=False, progress="")
         look["excluded"] = len(lookfilter.excluded_images(path))
+
+    async def look_set_kind(kind: str):
+        look.kind = kind
+        look["all"] = False
+        await look_render()
+        await render()
 
     def look_toggle_base(p: Path, on: bool):
         bases = [b for b in look["baselines"] if b != str(p)]
@@ -2080,9 +2125,11 @@ def build_dataset_tab(f: Form):
 
     def look_status():
         n = len(look["baselines"])
-        look_base_label.text = (f"{n} baseline{'s' if n != 1 else ''} picked" + (
+        what = "body" if look.kind == "body" else "look"
+        look_base_label.text = (f"{n} {what} baseline{'s' if n != 1 else ''} picked" + (
             ": " + ", ".join(Path(b).name for b in look["baselines"]) if n else
-            " (tick Baseline on the pictures that nail the look)"))
+            (" (tick Baseline on the pictures that show the body you want: neck to mid-thigh in the frame)"
+             if look.kind == "body" else " (tick Baseline on the pictures that nail the look)")))
         look_scan_btn.enabled = n > 0 and not look["busy"]
         look_suggest_btn.enabled = look["cutoff"] is not None and not look["busy"]
         look_move_btn.text = f"Move marked out ({len(look['marks'])})"
@@ -2097,9 +2144,10 @@ def build_dataset_tab(f: Form):
             here = {p: v for p, v in look["scores"].items() if p in live}
             scored = [v for v in here.values() if v is not None]
             fence = (f"; fence {look['cutoff']:.2f} (median {look['median']:.2f})" if look["cutoff"] is not None else
-                     "; no fence (needs 4 faces)")
-            look_info.text = (f"{len(here)} pictures scanned, {len(scored)} with a face" + fence +
-                              f"; {len(lookfilter.suggest(here, look['baselines']))} under it")
+                     f"; no fence (needs {lookfilter.MIN_FACES} scored pictures)")
+            has = "a body" if look.kind == "body" else "a face"
+            look_info.text = (f"{len(here)} pictures scanned, {len(scored)} with {has}" + fence +
+                              f"; {len(lookfilter.suggest(here, look['baselines'], look.kind))} under it")
         else:
             look_info.text = "Not scanned yet."
 
@@ -2115,15 +2163,16 @@ def build_dataset_tab(f: Form):
         look_grid.clear()
         with look_grid:
             for (p, sc), thumb in zip(shown, thumbs):
-                vd = lookfilter.verdict(sc)
+                vd = lookfilter.verdict(sc, look.kind, look["median"], look["cutoff"])
                 base = p in look["baselines"]
+                none = "no body" if look.kind == "body" else "no face"
                 with ui.card().tight().classes("rz-thumb rz-look-card"):
                     ui.image(image_url(thumb)).props("fit=cover ratio=1").classes("w-full cursor-pointer") \
                         .on("click", lambda _, q=Path(p): show_full(q)).tooltip("Click to view full size")
                     with ui.column().classes("gap-0 px-2 py-1 w-full min-w-0"):
                         ui.label(Path(p).name).classes("text-xs truncate w-full")
                         with ui.row().classes("items-center gap-1 no-wrap"):
-                            ui.badge("no face" if sc is None else f"{sc:.2f}", color=LOOK_COLORS[vd]).props("dense")
+                            ui.badge(none if sc is None else f"{sc:.2f}", color=LOOK_COLORS[vd]).props("dense")
                             if base:
                                 ui.badge("baseline", color="primary").props("dense outline")
                             else:
@@ -2143,16 +2192,22 @@ def build_dataset_tab(f: Form):
         if look["busy"] or not look["baselines"] or state["open"] is None:
             return
         folder, files, bases = state["open"], [str(p) for p in state["images"]], list(look["baselines"])
-        look.update(busy=True, progress="Loading the face model...")
+        kind = look.kind
+        look.update(busy=True, progress="Loading the body model..." if kind == "body" else "Loading the face model...")
         look_status()
 
         def progress(i, n):
-            look["progress"] = f"Scanning faces: {i} of {n}"
+            look["progress"] = f"Scanning {'bodies' if kind == 'body' else 'faces'}: {i} of {n}"
 
         def work():
-            embed = lookfilter.face_embedder(progress=lambda t, f=None: look.__setitem__("progress", t))
+            note = lambda t, f=None: look.__setitem__("progress", t)  # noqa: E731
+            if kind == "body":
+                device = str(f.w["body_device"].value or "cpu")
+                embed = lookfilter.body_embedder("models", device, progress=note)
+            else:
+                embed = lookfilter.face_embedder(progress=note)
             scores = lookfilter.score_images(files, bases, embed, progress)
-            lookfilter.save_scores(folder, bases, scores)
+            lookfilter.save_scores(folder, bases, scores, kind)
             return scores
 
         timer = ui.timer(0.5, look_status)
@@ -2165,14 +2220,16 @@ def build_dataset_tab(f: Form):
             ui.notify(f"Look scan failed: {e}", type="negative", multi_line=True)
             return
         timer.cancel()
-        med, cut = lookfilter.fence(scores)
-        look.update(scores=scores, cutoff=cut, median=med, marks=set(), busy=False)
+        med, cut = lookfilter.fence(scores, kind)
+        look.by_kind[kind].update(scores=scores, cutoff=cut, median=med, marks=set())
+        look["busy"] = False
         await look_render()
         await render()
-        ui.notify(f"Scanned {len(scores)} pictures; saved {lookfilter.SCORES_FILE} in the dataset", type="positive")
+        ui.notify(f"Scanned {len(scores)} pictures; saved {lookfilter.scores_file(kind)} in the dataset",
+                  type="positive")
 
     async def look_suggest():
-        look["marks"] = lookfilter.suggest(look["scores"], look["baselines"])
+        look["marks"] = lookfilter.suggest(look["scores"], look["baselines"], look.kind)
         await look_render()
         if not look["marks"]:
             ui.notify("Nothing is under the fence")
@@ -4144,6 +4201,12 @@ def build_page(local: bool = True):
                         with fields():
                             w["save_every"] = ui.number("Save every N steps", value=d.save_every, precision=0) \
                                 .classes("w-44")
+                            w["keep_checkpoints"] = ui.number("Checkpoints to keep (0 = all)",
+                                                              value=d.keep_checkpoints, min=0, precision=0) \
+                                .classes("w-56").tooltip(
+                                    "Keeps only this many of the step checkpoints (the LoRA / LoKr files saved every "
+                                    "N steps); each new one deletes the oldest. The final file, the best-likeness "
+                                    "file and the race's dropped files are never deleted. 0 keeps every one.")
                             w["sample_every"] = ui.number("Sample every N steps (0 = off)", value=d.sample_every,
                                                           precision=0).classes("w-60")
                             w["lora_ema"] = ui.number("Weight average decay (0 = off)", value=d.lora_ema, min=0,

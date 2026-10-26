@@ -260,6 +260,7 @@ class TrainConfig:
 
     # --- saving / sampling ---
     save_every: int = 250
+    keep_checkpoints: int = 0  # rolling number of the step checkpoints (LoRA / LoKr files) to keep; 0 = keep all
     sample_every: int = 250
     sample_prompts: list[str] = field(default_factory=list)
     sample_width: int = 1024
@@ -421,6 +422,8 @@ class TrainConfig:
         parse_clean_share(self.clean_share)
         if self.finetune:
             self.validate_finetune()
+        if self.keep_checkpoints < 0:
+            raise ValueError("keep_checkpoints must be 0 (keep all) or the number of checkpoints to keep")
         if self.block_swap:
             if self.block_swap < 0:
                 raise ValueError("block_swap must be 0 (off) or a number of blocks")

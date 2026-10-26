@@ -542,6 +542,15 @@ states) every `save_state_every` steps (0 = with each LoRA save), keeps a rollin
 (0 = all), and always writes the final state when training ends or is stopped. Set `resume_state` to one of
 those folders to continue exactly where it stopped. `resume_from` loads only LoRA weights from any exported file.
 
+## Checkpoints to keep (`keep_checkpoints`)
+
+`save_every` writes a LoRA or LoKr file every N steps (`<job>_000250.safetensors`, and `_r<rank>` files beside it for a
+fine-tune's extra ranks). `keep_checkpoints: N` keeps only the newest N of those and deletes the oldest each time a new
+one is saved; 0 (the default) keeps them all. The final file (`<job>.safetensors`), the best-likeness file
+(`<job>_best`), a race's dropped and winner files and the training states are never deleted: states have their own
+`keep_states`. In a race each configuration keeps its own newest N. The WebUI's *Checkpoints to keep* field is in
+Saving & samples.
+
 ## Weight average (`lora_ema`)
 
 At batch size 1 each step pulls the LoRA toward the image it just saw, so a checkpoint carries the tail of the
@@ -999,6 +1008,17 @@ look you want.
 - **Move marked out** moves the marked pictures and their captions into `excluded_by_look/` inside the dataset, keeping
   sub-folders. That folder never trains and nothing is deleted. *Move all back* restores them.
 - The scan is saved with the dataset as `look_scores.json`. Each picture in the grid shows its look score.
+
+**Body outliers.** The *Body outliers* switch above the buttons runs the same filter on the body. It has its own
+baselines (tick pictures that show the body you want), scan, marks and file (`look_scores_body.json`). The score is the
+cosine similarity of the picture's body window (the trainer's body score: neck to mid-thigh, turned upright, the person
+cut out on grey, embedded with DINOv2) to the baselines' windows, so a different build, skin, hair or outfit shows, and
+so does an unusual pose or a rear view when the baselines are all front views. DINOv2 cosines sit high and close
+together, so there are no ArcFace-style 0.45 / 0.30 rules: the colours read off the scan's median and fence, and the fence
+has no floor. A picture without shoulders and hips in the frame, or with under 60% of its window inside it (a
+portrait), gets no score. It runs on the *Body score device* (Identity similarity) and downloads the pose model and DINOv2
+once, as the trainer does. On the 60 AZav50 photos, 22 had a usable window; with three front views as baselines the
+fence flagged a pose lying on sand and two rear views. *Warm up look outliers* eases in the outliers of both scans.
 
 On a real 60-photo set with three front-facing baselines, the scan took about a minute on the CPU. The median match was
 0.60 and the fence 0.36. It flagged an extreme close-up with the eyes cropped off and a small, distant face turned away:

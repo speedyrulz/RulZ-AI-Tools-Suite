@@ -119,3 +119,86 @@ def test_trainer_finds_the_outliers(tmp_path, caplog):
         ("a.png", 0.7), ("b.png", 0.69), ("c.png", 0.68), ("d.png", 0.67), ("e.png", 0.1))})
     assert tr._look_outlier_images(cfg, items) == {str(it.image) for it in items if it.image.name == "e.png"}
     assert tr._look_outlier_images(TrainConfig(dataset_dir=str(root)), items) == set()  # look_warmup off
+
+
+def test_body_outliers_have_their_own_scan_and_no_face_floor(tmp_path):
+    root = _dataset(tmp_path)
+    near = {n: 0.90 - 0.005 * i for i, n in enumerate(("a.png", "b.png", "c.png", "d.png"))}
+    scores = {str(root / n): v for n, v in near.items()}
+    scores[str(root / "e.png")] = None  # no body in the frame
+    scores[str(root / "sub" / "f.png")] = 0.55  # a very different body
+    # DINOv2 cosines sit high and close: the fence is the median less 1.5 spreads, with no 0.25 face floor
+    med, cut = LF.fence(scores, "body")
+    assert 0.8 < cut < 0.9 and med > cut
+    assert LF.fence({k: 0.2 for k in "abcd"}, "face")[1] == 0.25 and LF.fence({k: 0.2 for k in "abcd"}, "body")[1] == 0.2
+    assert LF.suggest(scores, [str(root / "a.png")], "body") == {str(root / "sub" / "f.png")}
+    assert [LF.verdict(v, "body", med, cut) for v in (0.9, 0.55, None)] == ["match", "drift", "no body"]
+    assert LF.verdict(med - 0.2 * (med - cut), "body", med, cut) == "match"
+    assert LF.verdict(cut + 0.2 * (med - cut), "body", med, cut) == "borderline"
+    LF.save_scores(root, [root / "a.png"], scores, "body")
+    assert (root / LF.BODY_SCORES_FILE).is_file() and not (root / LF.SCORES_FILE).exists()
+    data = LF.load_scores(root, "body")
+    assert data["cutoff"] == pytest.approx(cut) and data["scores"][str(root / "sub" / "f.png")] == 0.55
+    assert LF.load_scores(root, "face") is None  # the face scan is separate
+    assert LF.outliers(root, ("body",)) == {str((root / "sub" / "f.png").resolve())}
+    # the warm-up's outliers are both scans together
+    face = {str(root / n): v for n, v in (("a.png", .7), ("b.png", .69), ("c.png", .68), ("d.png", .67), ("e.png", .1))}
+    LF.save_scores(root, [root / "a.png"], face)
+    assert LF.outliers(root) == {str((root / "e.png").resolve()), str((root / "sub" / "f.png").resolve())}
+
+
+def test_body_embedder_needs_the_window_in_the_frame(monkeypatch):
+    import numpy as np
+    from rulztrainer import bodysim
+
+    class FakeScorer:
+        def __init__(self, *a, **k):
+            pass
+
+        def window(self, path):
+            return {"in": ("img", 1.0), "low": ("img", 0.4), "none": None}[Path(path).name]
+
+        def _embed(self, image):
+            return np.ones(3, dtype=np.float32)
+
+    monkeypatch.setattr(bodysim, "AppearanceScorer", FakeScorer)
+    LF._BODY.clear()
+    embed = LF.body_embedder("models", "cpu")
+    assert embed("in") is not None and embed("low") is None and embed("none") is None
+    LF._BODY.clear()
+
+
+def test_keep_checkpoints_prunes_the_oldest(tmp_path):
+    from rulztrainer.trainer import prune_checkpoints
+
+    for step in (100, 200, 300, 400, 500):
+        (tmp_path / f"job_{step:06d}.safetensors").write_text("x")
+        (tmp_path / f"job_{step:06d}_r128.safetensors").write_text("x")  # a fine-tune's second rank goes with it
+    for name in ("job.safetensors", "job_best.safetensors", "job_winner.yaml", "job_lora16_000100.safetensors",
+                 "job_finetune.safetensors", "other_000100.safetensors"):
+        (tmp_path / name).write_text("x")
+    assert prune_checkpoints(tmp_path, "job", 0) == []  # 0 keeps all
+    gone = prune_checkpoints(tmp_path, "job", 2)
+    assert sorted(p.name for p in gone) == [f"job_{s:06d}{x}.safetensors" for s in (100, 200, 300) for x in ("", "_r128")]
+    left = sorted(p.name for p in tmp_path.iterdir())
+    assert "job_000400.safetensors" in left and "job_000500_r128.safetensors" in left and "job_000300.safetensors" not in left
+    for kept in ("job.safetensors", "job_best.safetensors", "job_lora16_000100.safetensors", "other_000100.safetensors",
+                 "job_finetune.safetensors", "job_winner.yaml"):
+        assert kept in left  # the final, best, other contenders' and other jobs' files stay
+    assert prune_checkpoints(tmp_path, "job_lora16", 1) == []  # a race configuration's own set
+    with pytest.raises(ValueError, match="keep_checkpoints"):
+        TrainConfig(keep_checkpoints=-1).validate()
+
+
+def test_trainer_save_prunes_and_forgets_deleted_files(tmp_path):
+    cfg = TrainConfig(job_name="job", keep_checkpoints=2)
+    tr = Trainer.__new__(Trainer)
+    tr.cfg, tr.job_dir = cfg, tmp_path
+    tr.status = SimpleNamespace(data={"saved": []})
+    for step in (100, 200, 300):
+        p = tmp_path / f"job_{step:06d}.safetensors"
+        p.write_text("x")
+        tr.status.data["saved"].append(str(p))
+        tr._prune_saved("job")
+    assert not (tmp_path / "job_000100.safetensors").exists()
+    assert tr.status.data["saved"] == [str(tmp_path / "job_000200.safetensors"), str(tmp_path / "job_000300.safetensors")]

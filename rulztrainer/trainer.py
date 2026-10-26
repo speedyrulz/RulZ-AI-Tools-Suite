@@ -95,6 +95,32 @@ def setup_logging(job_dir: Path) -> None:
         log.addHandler(h)
 
 
+def prune_checkpoints(job_dir: Path, stem: str, keep: int) -> list[Path]:
+    """Keep the newest `keep` step checkpoints of `stem` (<stem>_<step>.safetensors and its extra ranks
+    <stem>_<step>_r<rank>.safetensors) in a job folder and delete the older ones. The final file, <stem>_best and
+    the dropped / winner files are never numbered, so they are never touched. keep <= 0 keeps everything. Returns the
+    files deleted."""
+    if keep <= 0:
+        return []
+    import re
+
+    pat = re.compile(r"^" + re.escape(stem) + r"_(\d{6})(?:_r\d+)?\.safetensors$")
+    by_step: dict[int, list[Path]] = {}
+    for p in Path(job_dir).iterdir():
+        m = pat.match(p.name)
+        if m:
+            by_step.setdefault(int(m.group(1)), []).append(p)
+    gone = []
+    for step in sorted(by_step)[: max(0, len(by_step) - keep)]:
+        for p in by_step[step]:
+            try:
+                p.unlink()
+                gone.append(p)
+            except OSError as e:
+                log.warning("Could not delete the old checkpoint %s: %s", p, e)
+    return gone
+
+
 def free_cuda():
     gc.collect()
     if torch.cuda.is_available():
@@ -1218,6 +1244,13 @@ class Trainer(RaceParallelMixin):
         n = len(self.ft.windows)
         return step % self.ft_rotate_steps == 0 and (step // self.ft_rotate_steps) % n == 0
 
+    def _prune_saved(self, stem: str) -> None:
+        """keep_checkpoints: delete the step checkpoints beyond the newest N (and forget them in the status)."""
+        for p in prune_checkpoints(self.job_dir, stem, self.cfg.keep_checkpoints):
+            log.info("Deleted the old checkpoint %s (keep_checkpoints %d)", p.name, self.cfg.keep_checkpoints)
+            if str(p) in self.status.data["saved"]:
+                self.status.data["saved"].remove(str(p))
+
     def _finetune_save(self, step: int, final: bool, label: str = "") -> Path:
         """Extract the deltas into a LoRA per rank (the usual file names; a second rank gets _r<rank>), and the deltas
         themselves when asked."""
@@ -1242,6 +1275,8 @@ class Trainer(RaceParallelMixin):
             if str(path) not in self.status.data["saved"]:
                 self.status.data["saved"].append(str(path))
             first = first or path
+        if not final:
+            self._prune_saved(f"{cfg.job_name}{label}")
         if cfg.finetune_save_delta:
             dpath = self.job_dir / f"{cfg.job_name}{label}_finetune.safetensors"
             ft.save_delta(dpath, {**meta, "lora_format": self.arch.lora_format})
@@ -1291,6 +1326,8 @@ class Trainer(RaceParallelMixin):
             lora_mod.save_lora(injected, path, metadata=meta, dtype=cfg.lora_save_dtype, fmt=self.arch.lora_format)
         log.info("Saved %s (%s)", path, cfg.lora_save_dtype)
         self.status.data["saved"].append(str(path))
+        if not final:
+            self._prune_saved(f"{cfg.job_name}{tag}")
         self.status.write()
         return path
 
@@ -2213,12 +2250,12 @@ class Trainer(RaceParallelMixin):
 
         found, scanned = set(), 0
         for spec in cfg.dataset_specs():
-            if lookfilter.load_scores(spec.path) is not None:
+            if any(lookfilter.load_scores(spec.path, k) is not None for k in lookfilter.KINDS):
                 scanned += 1
             found |= lookfilter.outliers(spec.path)
         if not scanned:
-            log.warning("look_warmup: no look consistency scan in the dataset folder(s) (look_scores.json): run the "
-                        "Look consistency filter on the Dataset tab first; warm-up off this run")
+            log.warning("look_warmup: no look consistency scan in the dataset folder(s) (look_scores.json / look_scores_body.json): "
+                        "run the Look consistency filter on the Dataset tab first; warm-up off this run")
             return set()
         names = {str(it.image) for it in items if str(Path(it.image).resolve()) in found}
         log.info("look_warmup: %d look outlier image(s) start at a loss weight of x%g, full after %g epoch(s)",
