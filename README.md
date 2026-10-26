@@ -6,6 +6,8 @@ You name people and fix any mistakes; your corrections are always kept.
 
 Everything runs on your PC. No photos or face data ever leave your computer.
 
+**[Download](https://github.com/speedyrulz/RulZ-Image-Organizer/releases/latest)** · **[Wiki: guides, FAQ and troubleshooting](https://github.com/speedyrulz/RulZ-Image-Organizer/wiki)**
+
 | Dark (default) | Light |
 | --- | --- |
 | ![Photos timeline in dark mode](docs/screenshots/01-photos-dark.png) | ![Photos timeline in light mode](docs/screenshots/02-photos-light.png) |
