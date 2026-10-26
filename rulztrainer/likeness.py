@@ -23,7 +23,11 @@ is really ~93% face, and "the face lags the body" is always true. With `likeness
 is first mapped onto one scale, 0 = what a stranger scores (the step-0 probe: the base model without the LoRA,
 rendered with at least `probe_floor_seeds` seeds, or a default) and 100 = what a typical reference scores against
 the others (reference_ceiling: the median of each reference's best match, or a default), capped at 100. The
-combined score, the noise band, the curriculum, the lr control and the best / stop / race decisions all run on those.
+face scale is then stretched (`face_scale_span`, 1.35: its 100 sits 1.35x as far above the stranger as the references
+do) and curved (`face_scale_curve`, 1.5: the score is the position on that scale raised to this power): an ArcFace
+cosine saturates, so a decent likeness already reached the references' level and the face read 90 while the body, on
+its narrower DINOv2 range, read 50 for pictures that looked equally close; now the references' own face level reads
+about 64, and the score still has room to grow past it. The combined score, the noise band, the curriculum, the lr control and the best / stop / race decisions all run on those.
 
 The controller never touches the loss; it only steers sampling, lr and when to stop.
 """
@@ -53,6 +57,10 @@ MIN_SPAN = {"face": 10.0, "body": 8.0}  # the ceiling stays at least this far ab
 # matching the references better than a typical one of them does is no more likeness (a probe that copies one photo
 # reads higher), so the scale stops at 100
 NORM_MAX = 100.0
+# the face's raw score saturates (see the module docstring): its scale is stretched by FACE_SPAN_DEFAULT and curved by
+# FACE_CURVE_DEFAULT (config: face_scale_span, face_scale_curve; 1 and 1 give the plain linear scale)
+FACE_SPAN_DEFAULT = 1.35
+FACE_CURVE_DEFAULT = 1.5
 
 
 def reference_ceiling(embs, usable=None) -> float | None:
@@ -86,11 +94,13 @@ def probe_seed_count(cfg, step: int) -> int:
     return n
 
 
-def normalize(value, floor: float, ceiling: float):
-    """A raw score as a percent of the way from `floor` (0) to `ceiling` (100), clipped to 0..NORM_MAX."""
+def normalize(value, floor: float, ceiling: float, curve: float = 1.0):
+    """A raw score as a percent of the way from `floor` (0) to `ceiling` (100), raised to `curve` (above 1: a slower
+    start, so a score that saturates early reads lower), clipped to 0..NORM_MAX."""
     if value is None:
         return None
-    return max(0.0, min(NORM_MAX, (value - floor) / (ceiling - floor) * 100.0))
+    t = max(0.0, (value - floor) / (ceiling - floor))
+    return min(NORM_MAX, 100.0 * t ** curve)
 
 
 @dataclass
@@ -116,7 +126,7 @@ class ProbeRecord:
     body_norm: float | None = None
     face_norm_ema: float | None = None
     body_norm_ema: float | None = None
-    scale: dict = field(default_factory=dict)  # {"face": [floor, ceiling], "body": [floor, ceiling]} raw points
+    scale: dict = field(default_factory=dict)  # {"face": [floor, ceiling], "body": [...], "curve": {...}} raw points
 
 
 class LikenessController:
@@ -127,6 +137,8 @@ class LikenessController:
         self.ceiling = {"face": face_ceiling if face_ceiling is not None else CEILING_DEFAULT["face"],
                         "body": body_ceiling if body_ceiling is not None else CEILING_DEFAULT["body"]}
         self.floor = {"face": None, "body": None}  # None: the default, until a step-0 probe sets it
+        self.span = {"face": float(getattr(cfg, "face_scale_span", FACE_SPAN_DEFAULT)), "body": 1.0}
+        self.curve = {"face": float(getattr(cfg, "face_scale_curve", FACE_CURVE_DEFAULT)), "body": 1.0}
         self.face_ema = None
         self.body_ema = None
         self.combined_ema = None
@@ -169,15 +181,20 @@ class LikenessController:
         return a * prev + (1 - a) * value
 
     def scale(self, kind: str) -> tuple[float, float]:
-        """(floor, ceiling) in raw points for "face" / "body"; the ceiling at least MIN_SPAN above the floor."""
+        """(floor, ceiling) in raw points for "face" / "body": the ceiling at least MIN_SPAN above the floor, then
+        the face's span stretched (face_scale_span)."""
         floor = self.floor[kind] if self.floor[kind] is not None else FLOOR_DEFAULT[kind]
-        return floor, max(self.ceiling[kind], floor + MIN_SPAN[kind])
+        return floor, floor + (max(self.ceiling[kind], floor + MIN_SPAN[kind]) - floor) * self.span[kind]
 
     def norm(self, kind: str, value):
         """A raw score on the normalized scale (the raw score itself with likeness_normalize off)."""
         if value is None or not self.normalize:
             return value
-        return normalize(value, *self.scale(kind))
+        return normalize(value, *self.scale(kind), self.curve[kind])
+
+    def scale_record(self) -> dict:
+        """The scale as the probe records keep it ({"face": [floor, ceiling], "body": [...], "curve": {...}})."""
+        return {**{k: list(self.scale(k)) for k in ("face", "body")}, "curve": dict(self.curve)}
 
     def _set_floors(self, face, body) -> None:
         """The step-0 probe (the base model, no LoRA) is what a stranger scores: the floor of each scale, so step 0
@@ -193,9 +210,10 @@ class LikenessController:
         for kind in ("face", "body"):
             lo, hi = self.scale(kind)
             src = "step-0 probe" if self.floor[kind] is not None else "default"
-            parts.append(f"{kind} {lo:.1f} -> {hi:.1f} (floor: {src})")
-        return "; ".join(parts) + (" (raw percent: 0 = a stranger, 100 = a typical reference's best match among "
-                                   "the others)")
+            parts.append(f"{kind} {lo:.1f} -> {hi:.1f} (floor: {src}"
+                         + (f", curve x{self.curve[kind]:g}" if self.curve[kind] != 1.0 else "") + ")")
+        return "; ".join(parts) + (" (raw percent: 0 = a stranger; body 100 = a typical reference's best match among "
+                                   "the others, the face scale reaches past it)")
 
     def update(self, step: int, face: float | None, body: float | None, images: list[str] | None = None):
         """Feed one probe result. Returns (record, actions) where actions may contain
@@ -266,7 +284,7 @@ class LikenessController:
                           self.face_ema, self.body_ema, comb, self.lr_factor, self.face_bias, self.best,
                           self.best_step, self.since_improve, list(images or []), self.stage, self.stage_best,
                           self.stage_since_improve, self.norm("face", face), self.norm("body", body), face_n, body_n,
-                          {k: list(self.scale(k)) for k in ("face", "body")} if self.normalize else {})
+                          self.scale_record() if self.normalize else {})
         if "step_up" in actions:
             self.enter_stage(actions["step_up"])
         return rec, actions
@@ -279,7 +297,7 @@ class LikenessController:
                 "stage_best": self.stage_best, "stage_since_improve": self.stage_since_improve,
                 "id_loss_vetoed": self.id_loss_vetoed, "normalize": self.normalize,
                 "face_norm_ema": self.norm("face", self.face_ema), "body_norm_ema": self.norm("body", self.body_ema),
-                "scale": {k: list(self.scale(k)) for k in ("face", "body")} if self.normalize else {}}
+                "scale": self.scale_record() if self.normalize else {}}
 
 
 def append_record(job_dir: Path, rec: ProbeRecord) -> None:

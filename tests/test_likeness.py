@@ -17,7 +17,7 @@ def _cfg(**kw):
     base = dict(probe_every=10, probe_ema=0.0, likeness_noise_band=1.0, likeness_track_best=True,
                 likeness_patience=3, likeness_lr_control=True, likeness_lr_min=0.5, likeness_lr_max=2.0,
                 likeness_lr_step=0.1, likeness_curriculum=True, likeness_curriculum_strength=1.0,
-                likeness_normalize=False)
+                likeness_normalize=False, face_scale_span=1.0, face_scale_curve=1.0)  # the plain linear scale
     return TrainConfig(**{**base, **kw})
 
 
@@ -103,7 +103,7 @@ def test_normalized_scores_put_face_and_body_on_one_scale():
     rec, _ = c.update(0, 15.0, 82.0)  # the base model: the floors
     assert c.scale("face") == (15.0, 70.0) and c.scale("body") == (82.0, 94.0)
     assert rec.face_norm == 0.0 and rec.body_norm == 0.0 and rec.combined_ema == 0.0
-    assert rec.face == 15.0 and rec.body == 82.0 and rec.scale == {"face": [15.0, 70.0], "body": [82.0, 94.0]}
+    assert rec.face == 15.0 and rec.body == 82.0 and rec.scale == {"face": [15.0, 70.0], "body": [82.0, 94.0], "curve": {"face": 1.0, "body": 1.0}}
     rec, act = c.update(10, 42.5, 88.0)  # both halfway to the references
     assert abs(rec.face_norm - 50.0) < 1e-9 and abs(rec.body_norm - 50.0) < 1e-9 and abs(rec.combined_ema - 50.0) < 1e-9
     assert abs(c.face_bias) < 1e-9  # no gap on the normalized scale (raw: 88 - 42.5 = 45.5 points)
@@ -112,6 +112,31 @@ def test_normalized_scores_put_face_and_body_on_one_scale():
     rec, _ = c.update(30, 80.0, 82.0)  # above a typical reference stops at 100; the floor clips at 0
     assert rec.face_norm == 100.0
     assert rec.body_norm == 0.0
+
+
+def test_the_face_scale_is_stretched_and_curved_so_it_keeps_room_to_improve():
+    """An ArcFace cosine saturates: on a real run a decent face read 90 while the body, on the same pictures, read 51.
+    The face's 100 sits face_scale_span x as far above a stranger as the references do, and the position on that scale
+    is raised to face_scale_curve; the body stays linear."""
+    plain = L.LikenessController(_cfg(likeness_normalize=True), face_ceiling=73.7, body_ceiling=88.4)
+    new = L.LikenessController(TrainConfig(likeness_normalize=True, probe_ema=0.0), face_ceiling=73.7,
+                               body_ceiling=88.4)
+    assert (new.cfg.face_scale_span, new.cfg.face_scale_curve) == (L.FACE_SPAN_DEFAULT, L.FACE_CURVE_DEFAULT)
+    for c in (plain, new):
+        c.update(0, 13.8, 73.3)  # the floors
+    raw_face = 13.8 + 0.9 * (73.7 - 13.8)  # 90 on the old scale
+    assert abs(plain.norm("face", raw_face) - 90.0) < 1e-9
+    face = new.norm("face", raw_face)
+    assert 50 < face < 60 and abs(face - 54.4) < 0.5  # about what the body read for the same likeness
+    assert abs(new.norm("body", 81.0) - plain.norm("body", 81.0)) < 1e-9  # the body is unchanged
+    ref_level = new.norm("face", 73.7)  # the references' own face level: no longer the ceiling
+    assert 60 < ref_level < 68 and new.norm("face", 80.0) > ref_level  # and a better likeness still counts
+    assert new.norm("face", 13.8) == 0.0 and new.norm("face", 200.0) == 100.0
+    lo, hi = new.scale("face")
+    assert lo == 13.8 and abs(hi - (13.8 + (73.7 - 13.8) * L.FACE_SPAN_DEFAULT)) < 1e-9
+    assert new.scale_record()["curve"] == {"face": L.FACE_CURVE_DEFAULT, "body": 1.0}
+    assert "curve x1.5" in new.describe_scale()
+    assert L.normalize(50.0, 0.0, 100.0, 2.0) == 25.0 and L.normalize(150.0, 0.0, 100.0) == 100.0
 
 
 def test_normalization_defaults_floor_clamp_and_switch():

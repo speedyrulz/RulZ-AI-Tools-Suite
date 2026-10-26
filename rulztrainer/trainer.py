@@ -20,6 +20,7 @@ from PIL import Image
 from . import attention
 from . import checkpointing as ckpt
 from . import compiling
+from . import history
 from . import lora as lora_mod
 from . import profiling
 from . import race as race_mod
@@ -319,6 +320,8 @@ class Trainer(RaceParallelMixin):
         setup_logging(self.job_dir)
         cfg.save(self.job_dir / "config.yaml")
         self.status = Status(self.job_dir / "status.json")
+        self.run_id = history.new_run_id(cfg.job_name)  # this run's file in output/_history (Previous Runs tab)
+        self.run_started = time.time()
         self.stop_file = self.job_dir / "STOP"
         if self.stop_file.exists():
             self.stop_file.unlink()
@@ -647,6 +650,7 @@ class Trainer(RaceParallelMixin):
         except Exception as e:  # noqa: BLE001
             log.exception("Training failed")
             self.status.update(stage="error", error=f"{type(e).__name__}: {e}", done=True)
+            self._save_history("error")
             raise
 
     def _run(self):
@@ -1180,6 +1184,7 @@ class Trainer(RaceParallelMixin):
         if self.race is not None:
             self._race_report()
         self.status.update(stage="finished", done=True)
+        self._save_history("finished" if step >= cfg.steps else "stopped")
         log.info("Done. Final LoRA: %s", path)
 
     # ------------------------------------------------------------ full fine-tune (see finetune.py)
@@ -2466,7 +2471,15 @@ class Trainer(RaceParallelMixin):
 
         probes.append(asdict(rec))
         self.status.update(probes=probes[-500:], likeness=self.controller.state(), stage="training")
+        self._save_history()
         return bool(actions.get("stop"))
+
+    def _save_history(self, state: str = "running") -> None:
+        """Keep this run's likeness scores in output/_history (never fails a run)."""
+        try:
+            history.save_run(self.cfg, self.run_id, self.run_started, self.status.data, state)
+        except Exception as e:  # noqa: BLE001
+            log.debug("Run history not saved: %s", e)
 
     @torch.no_grad()
     def _sample_with(self, slots, step):
@@ -2506,6 +2519,7 @@ class Trainer(RaceParallelMixin):
                 scores = score_samples(self.face_scorer, paths, step, self.job_dir, self.body_scorer,
                                        cfg.face_weight, cfg.body_weight, scale=self._likeness_scale())
                 self.status.data["face_scores"] = self.status.data.get("face_scores", []) + [asdict(s) for s in scores]
+                self._save_history()
             except Exception as e:  # noqa: BLE001
                 log.warning("Similarity scoring failed: %s", e)
         self.status.update(stage="training")

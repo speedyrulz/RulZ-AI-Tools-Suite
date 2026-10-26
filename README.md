@@ -775,12 +775,38 @@ raised to at least 10 face / 8 body points above the floor when the step-0 score
 at 100: matching the references better than a typical one of them is no more likeness (a probe that copies one
 photo reads higher). The median replaced the mean because hard references (profile views, cut-off faces) pull the
 mean below what a clean front-facing probe scores: on a real run a typical probe read 108% against the mean and
-100% against the median. The combined score, the noise band, the curriculum gap,
+100% against the median.
+
+**The face scale is stretched and curved** (`face_scale_span` 1.35, `face_scale_curve` 1.5; 1 and 1 give the plain
+scale above). An ArcFace cosine saturates: a decent likeness already matches the references' best-match level, so the
+face read ~90 and then sat at 100 while the pictures still improved, and read far above the body (on a real run face 90
+against body 51 for pictures judged equally close). The face's 100 now sits `face_scale_span` times as far above the
+stranger as the references do, and the face score is its position on that scale raised to `face_scale_curve`. A face
+that read 90 now reads ~54, your references' own face level reads ~64, and the score keeps growing beyond it. The body
+scale is unchanged (its 100 is still a typical reference). The scale in force is kept in each probe record's `scale`,
+with the curve; runs saved before this change used the plain scale, so compare their face numbers with care. The ComfyUI
+nodes use the same scale.
+
+The combined score, the noise band, the curriculum gap,
 the lr control, the best checkpoint, early stop and the race drops all use the normalized values. The Monitor and the
 Samples tab show only the normalized scores (the log and `likeness.jsonl` keep the raw face / body next to them as
 `face`, `body`, `face_norm`, `body_norm`, `scale`); probe images carry their overall / face / body score underneath.
 In a race, the Monitor and the Samples tab put the same generation (step, prompt or probe kind, seed) of every
 configuration side by side in one row. Earlier runs' `likeness.jsonl` keep their raw combined scores.
+
+## Previous runs (run history)
+
+The **Previous Runs** tab keeps the likeness history of every run, like TensorBoard, so runs can be compared after the
+job folder has been reused. A run with likeness scores writes one small file in `output/_history/` while it trains (a
+crash keeps what was saved) and again when it ends. It keeps what the Monitor's two likeness charts plot, on the run's
+normalized scale: the **mean face and mean body** score of the sample images at each sampling step (Identity
+similarity), and the smoothed **face, body and combined** score at each probe (Likeness probes & controller). Runs
+from before the history existed are imported from their job folders when the tab first loads, or with *Import old runs*.
+
+Tick any number of runs in the table (name, start, state, steps, adapter, learning rate, last and best scores) to
+overlay them: one colour per run, solid lines for the face, dashed for the body and thick for the combined score, with
+checkboxes to show only some of the three. *Rename* gives a run a name of your own and *Remove from history* deletes
+its history file only (never the job folder). A run that is still training updates live.
 
 ## Configuration race (`race`)
 

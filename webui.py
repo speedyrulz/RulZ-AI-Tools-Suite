@@ -25,7 +25,7 @@ from rulztrainer.archs import get_arch
 from rulztrainer.config import (ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
                                 MODEL_PRESETS,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
-from rulztrainer import bodysim, facesim, lookfilter
+from rulztrainer import bodysim, facesim, history, lookfilter
 from rulztrainer.dataset import skipped as dataset_skipped
 from rulztrainer.losswatch import read_verdicts
 
@@ -1092,6 +1092,7 @@ class Form:
             probe_steps=int(v("probe_steps")), probe_cfg=float(v("probe_cfg")), probe_ema=float(v("probe_ema")),
             likeness_noise_band=float(v("likeness_noise_band")), likeness_track_best=bool(v("likeness_track_best")),
             likeness_normalize=bool(v("likeness_normalize")),
+            face_scale_span=float(v("face_scale_span")), face_scale_curve=float(v("face_scale_curve")),
             likeness_patience=int(v("likeness_patience")), likeness_lr_control=bool(v("likeness_lr_control")),
             likeness_lr_min=float(v("likeness_lr_min")), likeness_lr_max=float(v("likeness_lr_max")),
             likeness_lr_step=float(v("likeness_lr_step")), likeness_curriculum=bool(v("likeness_curriculum")),
@@ -3773,6 +3774,186 @@ class Wizard:
                         ui.label(v).classes("v")
 
 
+# ---------------------------------------------------------------- previous runs
+
+HISTORY_COLORS = ["#FF3B30", "#60A5FA", "#34D399", "#F59E0B", "#C084FC", "#22D3EE", "#F472B6", "#A3E635", "#94A3B8",
+                  "#FB923C"]
+HISTORY_COLUMNS = [
+    {"name": "run", "label": "Run", "field": "run", "align": "left", "sortable": True},
+    {"name": "started", "label": "Started", "field": "started", "align": "left", "sortable": True},
+    {"name": "state", "label": "State", "field": "state", "align": "left", "sortable": True},
+    {"name": "steps", "label": "Steps", "field": "steps", "align": "right"},
+    {"name": "adapter", "label": "Adapter", "field": "adapter", "align": "left"},
+    {"name": "lr", "label": "LR", "field": "lr", "align": "right"},
+    {"name": "face", "label": "Face", "field": "face", "align": "right"},
+    {"name": "body", "label": "Body", "field": "body", "align": "right"},
+    {"name": "combined", "label": "Combined", "field": "combined", "align": "right"},
+    {"name": "best", "label": "Best", "field": "best", "align": "right"},
+]
+
+
+def history_label(run: dict) -> str:
+    """A run's name in the table and the legends: the label it was given, else the job and when it started."""
+    from datetime import datetime
+
+    return run.get("label") or f"{run.get('job') or 'run'} {datetime.fromtimestamp(run.get('started') or 0):%b %d %H:%M}"
+
+
+def history_rows(runs: list[dict]) -> list[dict]:
+    """The Previous Runs table: one row per run, with its last smoothed probe scores and its best combined score."""
+    from datetime import datetime
+
+    last = lambda pts: "-" if not pts else f"{pts[-1][1]:.1f}%"  # noqa: E731
+    rows = []
+    for r in runs:
+        cfg, probes = r.get("config") or {}, r.get("probes") or {}
+        adapter = ("fine-tune" if cfg.get("finetune") else f"LoKr f{cfg.get('lokr_factor', 8)}"
+                   if cfg.get("network_type") == "lokr" else f"LoRA r{cfg.get('lora_rank', '?')}")
+        comb = probes.get("combined") or []
+        rows.append({"id": r["id"], "run": history_label(r),
+                     "started": datetime.fromtimestamp(r.get("started") or 0).strftime("%Y-%m-%d %H:%M"),
+                     "state": r.get("state", ""), "steps": f"{r.get('step', 0):,} / {r.get('total', 0):,}",
+                     "adapter": adapter, "lr": f"{cfg['learning_rate']:.1e}" if cfg.get("learning_rate") else "-",
+                     "face": last(probes.get("face")), "body": last(probes.get("body")), "combined": last(comb),
+                     "best": "-" if not comb else f"{max(v for _, v in comb):.1f}%"})
+    return rows
+
+
+def history_series(runs: list[dict], part: str, metrics: list[str]) -> list[dict]:
+    """ECharts line series overlaying the chosen runs: one colour per run, one line style per metric (face solid,
+    body dashed, combined thick). part is "identity" (the sample images' means) or "probes"."""
+    styles = {"face": {}, "body": {"type": "dashed"}, "combined": {"width": 3}}
+    out = []
+    for i, r in enumerate(runs):
+        color = HISTORY_COLORS[i % len(HISTORY_COLORS)]
+        for metric in metrics:
+            pts = (r.get(part) or {}).get(metric) or []
+            if not pts:
+                continue
+            out.append({"name": f"{history_label(r)} - {metric}", "type": "line", "data": pts,
+                        "showSymbol": part == "identity", "symbolSize": 6, "itemStyle": {"color": color},
+                        "lineStyle": {"color": color, "width": 2, **styles[metric]}})
+    return out
+
+
+def build_history_tab(charts: list):
+    """Previous Runs: the saved likeness history of every run (output/_history), any number of them ticked to overlay
+    their charts."""
+    state = {"runs": [], "sig": None}
+
+    def selected_runs() -> list[dict]:
+        ids = {row["id"] for row in table.selected}
+        return [r for r in state["runs"] if r["id"] in ids]
+
+    def draw():
+        picked = selected_runs()
+        for part, chart, boxes, empty in (("identity", id_chart, id_metrics, id_empty),
+                                           ("probes", probe_chart_h, probe_metrics, probe_empty)):
+            series = history_series(picked, part, [m for m, box in boxes.items() if box.value])
+            chart.options["series"] = series
+            chart.options["legend"]["data"] = [sr["name"] for sr in series]
+            chart.update()
+            empty.text = ("Tick one or more runs above to draw them here." if not picked else
+                          "" if series else "The ticked runs have no scores of this kind.")
+        compare.text = f"{len(picked)} run(s) overlaid" if picked else ""
+
+    def reload(force: bool = False):
+        sig = history.signature()
+        if sig == state["sig"] and not force:
+            return
+        state["sig"] = sig
+        state["runs"] = history.list_runs()
+        keep = {row["id"] for row in table.selected}
+        table.rows = history_rows(state["runs"])
+        table.selected = [row for row in table.rows if row["id"] in keep]
+        table.update()
+        count.text = (f"{len(state['runs'])} saved run(s) in {history.HISTORY_DIR}" if state["runs"] else
+                      "No saved runs yet. A run is saved while it trains once it has likeness scores.")
+        draw()
+
+    def import_old():
+        n = history.import_jobs()
+        ui.notify(f"Imported {n} earlier run(s) from the output folder" if n else
+                  "Nothing new to import: every job folder with scores already has a saved run", type="info")
+        reload(True)
+
+    async def rename():
+        picked = selected_runs()
+        if len(picked) != 1:
+            ui.notify("Tick one run to rename it", type="warning")
+            return
+        with ui.dialog() as dlg, ui.card().classes("w-96"):
+            ui.label("Name this run").classes("rz-setting-title")
+            name = ui.input("Name", value=picked[0].get("label") or "").classes("w-full") \
+                .props('placeholder="empty = the job name and date"')
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("Cancel", on_click=lambda: dlg.submit(None)).props("flat")
+                ui.button("Save", on_click=lambda: dlg.submit(name.value)).props("unelevated")
+        result = await dlg
+        if result is not None:
+            history.set_label(picked[0]["id"], result)
+            reload(True)
+
+    async def delete():
+        picked = selected_runs()
+        if not picked:
+            ui.notify("Tick the runs to remove", type="warning")
+            return
+        with ui.dialog() as dlg, ui.card():
+            ui.label(f"Remove {len(picked)} run(s) from the history? The job folders and their files are not "
+                     "touched.").classes("text-sm")
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("Cancel", on_click=lambda: dlg.submit(False)).props("flat")
+                ui.button("Remove", on_click=lambda: dlg.submit(True)).props("unelevated color=negative")
+        if await dlg:
+            history.delete_runs([r["id"] for r in picked])
+            reload(True)
+
+    with card():
+        with ui.row().classes("w-full items-center gap-4"):
+            with ui.column().classes("gap-1 flex-1 min-w-[16rem]"):
+                ui.label("Previous runs").classes("rz-title")
+                hint("Every run with likeness scores is saved here while it trains, even when a later run reuses its "
+                     "job name. Tick any number of runs to overlay the mean face and body of their samples and the "
+                     "smoothed face, body and combined score of their probes, to see which setup learned the likeness "
+                     "faster or higher. Scores are on the run's own normalized scale (0 = a stranger, 100 = the "
+                     "references).")
+            ui.button("Import old runs", icon="move_to_inbox", on_click=import_old).props("outline") \
+                .tooltip("Add the runs whose job folders are in the output folder but not in this list yet")
+    with card():
+        count = hint("")
+        table = ui.table(columns=HISTORY_COLUMNS, rows=[], row_key="id", selection="multiple",
+                         pagination={"rowsPerPage": 10, "sortBy": "started", "descending": True},
+                         on_select=lambda _: draw()).props("flat dense").classes("w-full")
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.button("Rename", icon="edit", on_click=rename).props("flat dense")
+            ui.button("Remove from history", icon="delete", on_click=delete).props("flat dense color=negative")
+            ui.button("Clear ticks", icon="deselect",
+                      on_click=lambda: (setattr(table, "selected", []), table.update(), draw())).props("flat dense")
+            ui.space()
+            compare = hint("")
+    with section("Identity similarity", "Mean face and mean body score of the sample images", "face"):
+        with ui.row().classes("items-center gap-3"):
+            id_metrics = {m: ui.checkbox(m, value=True, on_change=lambda _: draw()) for m in ("face", "body")}
+            id_empty = hint("")
+        id_chart = ui.echart(chart_options(_axis("step", min="dataMin"), _axis("similarity %", min=0), [],
+                                           [])).classes("w-full h-72")
+    with section("Likeness probes & controller", "Smoothed face, body and combined score of the probes", "show_chart"):
+        with ui.row().classes("items-center gap-3"):
+            probe_metrics = {m: ui.checkbox(m, value=True, on_change=lambda _: draw())
+                             for m in ("face", "body", "combined")}
+            probe_empty = hint("")
+        probe_chart_h = ui.echart(chart_options(_axis("step", min="dataMin"), _axis("likeness %", min=0),
+                                                [], [])).classes("w-full h-72")
+    charts.extend([id_chart, probe_chart_h])
+    try:
+        history.import_jobs()  # the runs from before the history existed, once
+    except Exception:  # noqa: BLE001
+        pass
+    reload(True)
+    ui.timer(4.0, reload)
+
+
 # ---------------------------------------------------------------- page
 
 
@@ -3818,6 +3999,7 @@ def build_page(local: bool = True):
             tab_dataset = ui.tab("Dataset", icon="photo_library")
             tab_monitor = ui.tab("Monitor", icon="show_chart")
             tab_samples = ui.tab("Samples", icon="collections")
+            tab_history = ui.tab("Previous Runs", icon="history")
             tab_help = ui.tab("Help", icon="help_outline")
 
     def goto(name: str):
@@ -4945,9 +5127,21 @@ def build_page(local: bool = True):
                         with fields():
                             w["likeness_normalize"] = ui.switch("Normalize face and body scores", value=d.likeness_normalize) \
                                 .tooltip("Score each on one scale first: 0 = what a stranger scores (the step-0 probe), "
-                                         "100 = what your references score against each other. Raw, a body score "
+                                         "100 = what your references score against each other (the face scale is "
+                                         "stretched, see its span and curve). Raw, a body score "
                                          "moves ~10 points over a run and a face score ~60, so the combined score, "
                                          "the curriculum and the noise band would follow the face alone.")
+                            w["face_scale_span"] = ui.number("Face scale span", value=d.face_scale_span, min=1,
+                                                             step=0.05, format="%.2f").classes("w-36")                                 .bind_visibility_from(w["likeness_normalize"], "value")                                 .tooltip("An ArcFace cosine saturates: a decent likeness already matches your "
+                                         "references, so the face read ~90 while the body read ~50 for pictures that "
+                                         "looked equally close. The face's 100 sits this many times as far above a "
+                                         "stranger as your references do (1 = the references themselves, the old "
+                                         "scale).")
+                            w["face_scale_curve"] = ui.number("Face scale curve", value=d.face_scale_curve, min=1,
+                                                              step=0.1, format="%.2f").classes("w-36")                                 .bind_visibility_from(w["likeness_normalize"], "value")                                 .tooltip("The face score is its position on that scale raised to this power: above "
+                                         "1 the face starts slower and leaves room to keep improving. 1 = linear "
+                                         "(the old scale). With the defaults (1.35 / 1.5) your references' own face "
+                                         "level reads about 64.")
                             w["likeness_track_best"] = ui.switch("Keep best checkpoint (<job>_best.safetensors)",
                                                                  value=d.likeness_track_best)
                             w["likeness_patience"] = ui.number("Early stop after N probes w/o improvement (0 = never)",
@@ -5493,6 +5687,11 @@ def build_page(local: bool = True):
             with ui.column().classes("rz-page gap-4"):
                 build_samples_tab(f)
 
+        # ------------------------------------------------------------ Previous Runs
+        with ui.tab_panel(tab_history):
+            with ui.column().classes("rz-page gap-4"):
+                build_history_tab(charts)
+
         # ------------------------------------------------------------ Help
         with ui.tab_panel(tab_help):
             with ui.column().classes("rz-page"):
@@ -5736,6 +5935,21 @@ The trained LoRA is copied onto it before each sampling pass; the training model
 ## Turbo LoRA
 An optional ComfyUI-format LoRA (for example an 8-step distill) applied only while generating sample images,
 never during the training step. Set *Sample steps* to match it.
+
+## Previous runs (run history)
+
+The **Previous Runs** tab keeps the likeness history of every run, like TensorBoard, so runs can be compared after the
+job folder has been reused. 
+A run with likeness scores writes one small file in `output/_history/` while it trains (a
+crash keeps what was saved) and again when it ends. It keeps what the Monitor's two likeness charts plot, on the run's
+normalized scale: the **mean face and mean body** score of the sample images at each sampling step (Identity
+similarity), and the smoothed **face, body and combined** score at each probe (Likeness probes & controller). Runs
+from before the history existed are imported from their job folders when the tab first loads, or with *Import old runs*.
+
+Tick any number of runs in the table (name, start, state, steps, adapter, learning rate, last and best scores) to
+overlay them: one colour per run, solid lines for the face, dashed for the body and thick for the combined score, with
+checkboxes to show only some of the three. *Rename* gives a run a name of your own and *Remove from history* deletes
+its history file only (never the job folder). A run that is still training updates live.
 
 ## Identity training (character LoRAs)
 The **Identity training preset** switch (top of the Train tab, or *Character / person* in the Wizard) applies the

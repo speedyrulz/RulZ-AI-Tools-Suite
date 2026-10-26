@@ -21,7 +21,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from rulztrainer import bodysim, facesim
-from rulztrainer.likeness import LikenessController, combine
+from rulztrainer.likeness import LikenessController, combine, MIN_SPAN, normalize as normalize_score
 
 log = logging.getLogger("rulztrainer")
 
@@ -157,12 +157,12 @@ class Scale:
     face: tuple
     body: tuple
     sources: dict
+    curve: dict = field(default_factory=lambda: {"face": 1.0, "body": 1.0})
 
     def norm(self, kind: str, value):
         if value is None or not self.normalize:
             return value
-        lo, hi = getattr(self, kind)
-        return max(0.0, min(100.0, (value - lo) / (hi - lo) * 100.0))
+        return normalize_score(value, *getattr(self, kind), self.curve.get(kind, 1.0))
 
     def describe(self) -> str:
         if not self.normalize:
@@ -171,7 +171,8 @@ class Scale:
         for k in ("face", "body"):
             lo, hi = getattr(self, k)
             parts.append(f"{k} {lo:.1f} -> {hi:.1f} raw (floor: {self.sources[k]['floor']}, "
-                         f"ceiling: {self.sources[k]['ceiling']})")
+                         f"ceiling: {self.sources[k]['ceiling']}"
+                         + (f", curve x{self.curve[k]:g}" if self.curve.get(k, 1.0) != 1.0 else "") + ")")
         return "Scale: " + "; ".join(parts)
 
 
@@ -204,6 +205,8 @@ def build_scale(refs: RefSet, normalize=True, baseline_rows=None, job=None, face
                              face_ceiling=refs.face_ceiling, body_ceiling=refs.body_ceiling)
     sources = {k: {"floor": "default", "ceiling": "references" if c is not None else "default"}
                for k, c in (("face", refs.face_ceiling), ("body", refs.body_ceiling))}
+    fixed: dict[str, list] = {"face": [None, None], "body": [None, None]}  # final raw numbers, as a run logged them
+    curve = dict(ctl.curve)
     for kind, key in (("face", "face_raw"), ("body", "body_raw")):
         vals = [r[key] for r in (baseline_rows or []) if r.get(key) is not None]
         if vals:
@@ -212,16 +215,25 @@ def build_scale(refs: RefSet, normalize=True, baseline_rows=None, job=None, face
     if job:
         for kind in ("face", "body"):
             if kind in job:
-                ctl.floor[kind], ctl.ceiling[kind] = float(job[kind][0]), float(job[kind][1])
+                fixed[kind] = [float(job[kind][0]), float(job[kind][1])]
                 sources[kind] = {"floor": "trainer run", "ceiling": "trainer run"}
+                curve[kind] = float((job.get("curve") or {}).get(kind, 1.0))  # a run from before the curve: linear
     for kind, lo, hi in (("face", face_floor, face_ceiling), ("body", body_floor, body_ceiling)):
         if lo is not None and lo >= 0:
-            ctl.floor[kind] = float(lo)
+            fixed[kind][0] = float(lo)
             sources[kind]["floor"] = "typed in"
         if hi is not None and hi >= 0:
-            ctl.ceiling[kind] = float(hi)
+            fixed[kind][1] = float(hi)
             sources[kind]["ceiling"] = "typed in"
-    return Scale(normalize, ctl.scale("face"), ctl.scale("body"), sources)
+    scales = {}
+    for kind in ("face", "body"):
+        if fixed[kind][0] is not None:
+            ctl.floor[kind] = fixed[kind][0]  # a floor typed in or logged moves the stretched span with it
+        lo, hi = ctl.scale(kind)
+        if fixed[kind][1] is not None:  # a ceiling typed in or logged is the final one (the trainer prints these)
+            hi = max(fixed[kind][1], lo + MIN_SPAN[kind])
+        scales[kind] = (lo, hi)
+    return Scale(normalize, scales["face"], scales["body"], sources, curve)
 
 
 # ---------------------------------------------------------------- scoring

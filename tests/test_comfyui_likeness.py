@@ -18,7 +18,8 @@ sys.path.insert(0, str(ROOT / "comfyui"))
 import rulztrainer_likeness as pkg  # noqa: E402
 from rulztrainer import bodysim  # noqa: E402
 from rulztrainer.facesim import FaceScore  # noqa: E402
-from rulztrainer.likeness import CEILING_DEFAULT, FLOOR_DEFAULT, MIN_SPAN, LikenessController, combine  # noqa: E402
+from rulztrainer.likeness import (CEILING_DEFAULT, FACE_CURVE_DEFAULT, FACE_SPAN_DEFAULT, FLOOR_DEFAULT,  # noqa: E402
+                                  MIN_SPAN, LikenessController, combine)
 from rulztrainer_likeness import core, nodes  # noqa: E402
 
 FACE = {"a.png": 60.0, "b.png": 40.0, "c.png": None, "ref1.png": 70.0, "ref2.png": 66.0, "base.png": 20.0}
@@ -125,13 +126,15 @@ def test_the_scale_sources_in_order(fakes, tmp_path):
     refs, _ = nodes.RZLikenessReferences().build(str(fakes / "refs" / "ref1.png"), "", "", "appearance",
                                                  "mediapipe+sam3", "cpu", "cpu", 640, "x")
     s = core.build_scale(refs)  # one reference: no measured ceiling
-    assert s.face == (FLOOR_DEFAULT["face"], CEILING_DEFAULT["face"]) and s.sources["face"]["ceiling"] == "default"
+    span = FACE_SPAN_DEFAULT  # the face scale is stretched, as in the trainer
+    assert s.face == (FLOOR_DEFAULT["face"], FLOOR_DEFAULT["face"] + (CEILING_DEFAULT["face"] - FLOOR_DEFAULT["face"]) * span)
+    assert s.sources["face"]["ceiling"] == "default" and s.curve == {"face": FACE_CURVE_DEFAULT, "body": 1.0}
     s = core.build_scale(refs, baseline_rows=[{"face_raw": 20.0, "body_raw": 81.0}, {"face_raw": 30.0,
                                                                                      "body_raw": None}])
     assert s.face[0] == 25.0 and s.body[0] == 81.0 and s.sources["face"]["floor"] == "baseline images (2)"
     assert s.body[1] == 90.0  # the default ceiling, at least MIN_SPAN above the floor
     s = core.build_scale(refs, baseline_rows=[{"face_raw": 70.0}])
-    assert s.face == (70.0, 70.0 + MIN_SPAN["face"])  # a floor above the ceiling lifts the ceiling, as the trainer
+    assert s.face == (70.0, 70.0 + MIN_SPAN["face"] * span)  # a floor above the ceiling lifts the ceiling, as the trainer
     job = tmp_path / "job"
     job.mkdir()
     (job / "likeness.jsonl").write_text("\n".join(json.dumps(r) for r in (
@@ -139,6 +142,11 @@ def test_the_scale_sources_in_order(fakes, tmp_path):
         {"step": 60, "scale": {"face": [13.8, 69.2], "body": [73.3, 81.3]}})))
     s = core.build_scale(refs, baseline_rows=[{"face_raw": 30.0}], job=core.job_scale(job), body_floor=75.0)
     assert s.face == (13.8, 69.2) and s.sources["face"]["floor"] == "trainer run"  # the run beats the baseline
+    assert s.curve == {"face": 1.0, "body": 1.0}  # a run from before the curve was linear
+    new_run = {"face": [13.8, 94.7], "body": [73.3, 81.3], "curve": {"face": 1.5, "body": 1.0}}
+    s2 = core.build_scale(refs, job=new_run)
+    assert s2.face == (13.8, 94.7) and s2.curve["face"] == 1.5  # the run's own numbers and curve, as logged
+    assert abs(s2.norm("face", 67.7) - 100 * ((67.7 - 13.8) / (94.7 - 13.8)) ** 1.5) < 1e-9
     assert s.body == (75.0, 83.0) and s.sources["body"]["floor"] == "typed in"  # typed in beats the run
     assert core.build_scale(refs, normalize=False).norm("face", 37.5) == 37.5
     with pytest.raises(FileNotFoundError):
