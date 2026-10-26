@@ -1,6 +1,6 @@
 import { toast } from 'sonner'
 import { create } from 'zustand'
-import type { AppView, JobState, RequirementId, RequirementStatus, Settings, ThemeName } from '@shared/types'
+import type { AppView, JobState, SelfUpdate, RequirementId, RequirementStatus, Settings, ThemeName } from '@shared/types'
 import { errorMessage, invoke, on } from '../lib/api'
 import { applyThemeClass, initialTheme } from '../lib/theme'
 
@@ -26,6 +26,9 @@ interface AppsState {
   guideId: RequirementId | null
   /** The theme in use; settings.theme stays unset until the first-launch choice. */
   theme: ThemeName
+  /** A newer launcher release to offer, and the install progress (null before it starts, -1 on failure). */
+  selfUpdate: SelfUpdate | null
+  selfProgress: number | null
 
   init: () => Promise<void>
   refresh: () => Promise<void>
@@ -54,6 +57,8 @@ export const useApps = create<AppsState>((set, get) => ({
   selectedId: null,
   guideId: null,
   theme: initialTheme,
+  selfUpdate: null,
+  selfProgress: null,
 
   init: async () => {
     // StrictMode runs effects twice in development; subscribe only once.
@@ -89,6 +94,12 @@ export const useApps = create<AppsState>((set, get) => ({
     })
     const [apps, settings] = await Promise.all([invoke('apps:list'), invoke('settings:get')])
     set({ apps, settings, loaded: true })
+    on('self:progress', (f) => set({ selfProgress: f }))
+    if (settings.checkUpdatesOnStart) {
+      void invoke('self:check').then((u) => {
+        if (u && u.tag !== get().settings?.skippedUpdate) set({ selfUpdate: u })
+      })
+    }
     void get().checkRequirements()
   },
 

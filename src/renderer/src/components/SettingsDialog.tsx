@@ -61,6 +61,12 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             onChange={(v) => void act(() => update({ checkUpdatesOnStart: v }))}
           />
           <Toggle
+            label="Close the launcher when an app is opened"
+            hint="Applies to the Launch button; stays open while something is installing"
+            checked={settings.closeOnLaunch}
+            onChange={(v) => void act(() => update({ closeOnLaunch: v }))}
+          />
+          <Toggle
             label="Show the latest README from GitHub"
             hint="Off: show the copy that came with the launcher"
             checked={settings.liveReadme}

@@ -4,7 +4,7 @@ import type { InstalledInfo, Settings } from '@shared/types'
 
 export function defaultSettings(): Settings {
   const local = process.env.LOCALAPPDATA ?? join(process.env.USERPROFILE ?? 'C:\\', 'AppData', 'Local')
-  return { installRoot: join(local, 'Programs', 'RulZ AI Tools'), checkUpdatesOnStart: true, liveReadme: true }
+  return { installRoot: join(local, 'Programs', 'RulZ AI Tools'), checkUpdatesOnStart: true, liveReadme: true, closeOnLaunch: false }
 }
 
 async function readJson<T>(path: string, fallback: T): Promise<T> {

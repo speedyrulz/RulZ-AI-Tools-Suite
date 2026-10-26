@@ -4,6 +4,7 @@ import type {
   InstallOptions,
   JobState,
   ReadmeDoc,
+  SelfUpdate,
   RequirementId,
   RequirementStatus,
   Settings,
@@ -50,6 +51,8 @@ export interface IpcInvoke {
   'apps:log': (appId: string) => string[]
 
   /** `reloadPath` re-reads PATH first, to find programs installed since the launcher started. */
+  'self:check': () => SelfUpdate | null
+  'self:install': (update: SelfUpdate) => void
   'requirements:check': (reloadPath?: boolean) => RequirementStatus[]
   /** Installs a requirement with winget; resolves when winget exits. */
   'requirements:install': (id: RequirementId) => RequirementStatus[]
@@ -57,6 +60,7 @@ export interface IpcInvoke {
 
 /** Push channels (webContents.send → ipcRenderer.on). */
 export interface IpcEvents {
+  'self:progress': number
   'apps:changed': AppView[]
   'job:update': JobState
   'job:log': LogLine

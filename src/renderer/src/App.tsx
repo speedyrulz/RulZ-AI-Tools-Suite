@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Toaster } from 'sonner'
 import { InstallDialog } from './components/InstallDialog'
 import { RequirementGuide } from './components/RequirementGuide'
+import { SelfUpdateDialog } from './components/SelfUpdateDialog'
 import { ThemeChooser } from './components/ThemeChooser'
 import { SettingsDialog } from './components/SettingsDialog'
 import { TopBar } from './components/TopBar'
@@ -52,6 +53,7 @@ export function App() {
       <InstallDialog view={installing} onClose={() => setInstallId(null)} />
       {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
       <RequirementGuide />
+      <SelfUpdateDialog />
       {settings && !settings.theme && <ThemeChooser />}
       <Toaster
         theme={theme}

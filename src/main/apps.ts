@@ -731,6 +731,11 @@ export class AppManager {
     this.changed()
   }
 
+  /** True while any app is being installed, updated or removed. */
+  hasActiveJobs(): boolean {
+    return this.jobs.size > 0
+  }
+
   uninstall(appId: string): void {
     const app = this.app(appId)
     const info = this.o.store.getInstalled(appId)

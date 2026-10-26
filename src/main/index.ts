@@ -7,6 +7,7 @@ import { AppManager } from './apps'
 import { setFetch } from './github'
 import { broadcast, handle } from './ipc'
 import { checkRequirements, installRequirement } from './requirements'
+import { checkSelfUpdate, installSelfUpdate } from './selfUpdate'
 import { Store } from './store'
 
 const isDev = !app.isPackaged && !!process.env.ELECTRON_RENDERER_URL
@@ -137,7 +138,11 @@ async function main(): Promise<void> {
   handle('apps:update', (id) => apps.update(id))
   handle('apps:repair', (id) => apps.repair(id))
   handle('apps:cancel', (id) => apps.cancel(id))
-  handle('apps:launch', (id) => apps.launch(id))
+  handle('apps:launch', async (id) => {
+    await apps.launch(id)
+    // The app runs on its own, so the launcher can go. Not while an install is still running: quitting would cancel it.
+    if (store.getSettings().closeOnLaunch && !apps.hasActiveJobs()) setTimeout(() => app.quit(), 800)
+  })
   handle('apps:uninstall', (id) => apps.uninstall(id))
   handle('apps:locate', async (id) => {
     const r = await dialog.showOpenDialog(mainWindow!, {
@@ -153,6 +158,15 @@ async function main(): Promise<void> {
   handle('apps:openFolder', (id) => apps.openFolder(id))
   handle('apps:log', (id) => apps.getLog(id))
 
+  handle('self:check', () => checkSelfUpdate().catch(() => null))
+  handle('self:install', async (u) => {
+    try {
+      await installSelfUpdate(u, (f) => broadcast('self:progress', f))
+    } catch (e) {
+      broadcast('self:progress', -1)
+      throw e
+    }
+  })
   handle('requirements:check', (reloadPath) => checkRequirements(reloadPath))
   handle('requirements:install', async (id) => {
     await installRequirement(id, (line) => broadcast('job:log', { appId: `requirement:${id}`, line }))
@@ -163,7 +177,9 @@ async function main(): Promise<void> {
   const theme = store.getSettings().theme ?? 'dark'
   applyTheme(null, theme)
   mainWindow = createWindow(theme)
-  if (store.getSettings().checkUpdatesOnStart) void apps.refreshLatest()
+  if (store.getSettings().checkUpdatesOnStart) {
+    void apps.refreshLatest()
+  }
 
   app.on('second-instance', () => {
     if (!mainWindow) return

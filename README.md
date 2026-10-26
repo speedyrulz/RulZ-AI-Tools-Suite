@@ -45,6 +45,10 @@ click, keep it updated, and launch it, all from a single black-and-red window (o
   can't install (a GPU driver, or any of them on a PC without winget) gets a step-by-step guide with a *Check again*
   button, and the install waits until it's found.
 
+- **Updates:** when it starts, the launcher checks GitHub for a newer version of itself and asks whether to update
+  (it closes, installs over itself and reopens). It also checks your installed apps. Both checks can be turned off in
+  Settings.
+- **Close on launch:** an optional setting (off by default) closes the launcher when you open an app.
 - **Dark or light:** the first launch asks which look you want (dark is the default). Switch any time with the
   sun/moon button in the top bar or under Settings ▸ Appearance.
 

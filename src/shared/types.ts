@@ -175,6 +175,15 @@ export interface ReadmeDoc {
   source: 'github' | 'bundled'
 }
 
+/** A newer release of the launcher itself. */
+export interface SelfUpdate {
+  version: string
+  tag: string
+  size: number
+  url: string
+  notesUrl: string
+}
+
 export type ThemeName = 'dark' | 'light'
 
 export interface Settings {
@@ -185,4 +194,8 @@ export interface Settings {
   checkUpdatesOnStart: boolean
   /** Show the README from GitHub (falls back to the copy shipped with the launcher). */
   liveReadme: boolean
+  /** Quit the launcher after it starts an app. */
+  closeOnLaunch: boolean
+  /** An update the user chose "Skip" for. */
+  skippedUpdate?: string
 }
