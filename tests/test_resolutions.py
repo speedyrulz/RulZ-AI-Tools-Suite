@@ -46,6 +46,10 @@ def test_bucket_size_per_side_keeps_aspect():
     for w, h in ((1000, 1500), (1500, 1000), (1600, 900)):
         bw, bh = D.bucket_size(w, h, cfg, 512)
         assert abs(bw * bh - 512 * 512) / (512 * 512) < 0.08 and abs(bw / bh - w / h) < 0.08, (bw, bh)
+    # 4 MP with the default 2048 maximum: area holds instead of shrinking the bucket to fit the limit
+    for w, h in ((1000, 1500), (1600, 900)):
+        bw, bh = D.bucket_size(w, h, cfg, 2048)
+        assert abs(bw * bh - 2048 * 2048) / (2048 * 2048) < 0.08 and abs(bw / bh - w / h) < 0.08, (bw, bh)
     # the default (cfg.resolution) path is unchanged for ordinary aspects
     assert D.bucket_size(1000, 1500, cfg) == D.bucket_size(1000, 1500, cfg, 1024)
     assert D.bucket_size(1000, 1500, TrainConfig(enable_buckets=False), 512) == (512, 512)

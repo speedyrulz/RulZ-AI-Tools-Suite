@@ -523,7 +523,7 @@ PyTorch's pick there. Set `cudnn` to try it on any card: the log says which kern
 ratio preserved (sides multiples of 16), and latents are cached once per image and resolution, so a second run at
 the same resolutions starts immediately. `min_bucket_side` / `max_bucket_side` now rescale the bucket uniformly
 before clamping, and the minimum is capped at half the resolution, so a 0.25 MP bucket keeps ~512x512 of area
-(ai-toolkit style) instead of getting a 512 short edge; raise `max_bucket_side` above 2048 if you want 4 MP buckets for wide images. The old single `resolution`
+(ai-toolkit style) instead of getting a 512 short edge, and the maximum is raised to twice the resolution so 4 MP buckets keep their area too. The old single `resolution`
 (a side length) still works when `resolutions` is empty.
 
 With several resolutions selected and *Resolution step-up* off, all of them are mixed in every epoch (one item per

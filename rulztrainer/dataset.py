@@ -79,9 +79,10 @@ def bucket_size(w: int, h: int, cfg: TrainConfig, side: int | None = None) -> tu
     aspect = w / h
     bw = math.sqrt(side * side * aspect)
     bh = bw / aspect
-    # the minimum never exceeds half the side, so a small resolution keeps its pixel count (512 -> ~512x512 of area)
-    # instead of being inflated until its short edge reaches the minimum
-    lo, hi = min(cfg.min_bucket_side, side // 2 // 16 * 16), cfg.max_bucket_side
+    # the limits are relative to the side: the minimum never exceeds half of it and the maximum never drops below
+    # twice it, so every resolution keeps its pixel count (512 -> ~512x512 of area, 2048 -> ~2048x2048) instead of
+    # being inflated or shrunk until a fixed limit is met
+    lo, hi = min(cfg.min_bucket_side, side // 2 // 16 * 16), max(cfg.max_bucket_side, side * 2)
     scale = 1.0
     if max(bw, bh) > hi:
         scale = hi / max(bw, bh)
