@@ -107,6 +107,9 @@ export const useApps = create<AppsState>((set, get) => ({
     set({ refreshing: true })
     try {
       set({ apps: await invoke('apps:refresh') })
+      // A manual check also offers a newer launcher, even one that was skipped before.
+      const u = await invoke('self:check', true)
+      if (u) set({ selfUpdate: u })
     } catch (e) {
       toast.error(errorMessage(e))
     } finally {

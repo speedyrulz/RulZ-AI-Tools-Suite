@@ -57,6 +57,15 @@ export class Store {
     await writeJson(join(this.dir, 'installed.json'), this.installed)
   }
 
+  /** Small cached JSON (GitHub answers) kept next to the settings. */
+  loadCache<T>(name: string, fallback: T): Promise<T> {
+    return readJson(join(this.dir, name), fallback)
+  }
+
+  saveCache(name: string, data: unknown): Promise<void> {
+    return writeJson(join(this.dir, name), data)
+  }
+
   isDetectHidden(id: string): boolean {
     return this.detectHidden.includes(id)
   }

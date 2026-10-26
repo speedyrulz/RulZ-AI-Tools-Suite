@@ -129,7 +129,7 @@ async function main(): Promise<void> {
 
   handle('apps:list', () => apps.views())
   handle('apps:refresh', async () => {
-    await apps.refreshLatest()
+    await apps.refreshLatest(true)
     return apps.views()
   })
   handle('apps:readme', (id) => apps.readme(id, store.getSettings().liveReadme))
@@ -158,7 +158,7 @@ async function main(): Promise<void> {
   handle('apps:openFolder', (id) => apps.openFolder(id))
   handle('apps:log', (id) => apps.getLog(id))
 
-  handle('self:check', () => checkSelfUpdate().catch(() => null))
+  handle('self:check', (force) => checkSelfUpdate(store, !!force).catch(() => null))
   handle('self:install', async (u) => {
     try {
       await installSelfUpdate(u, (f) => broadcast('self:progress', f))
@@ -178,7 +178,7 @@ async function main(): Promise<void> {
   applyTheme(null, theme)
   mainWindow = createWindow(theme)
   if (store.getSettings().checkUpdatesOnStart) {
-    void apps.refreshLatest()
+    void apps.refreshLatest(false)
   }
 
   app.on('second-instance', () => {

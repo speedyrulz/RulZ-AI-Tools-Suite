@@ -41,6 +41,33 @@ describe('findAsset', () => {
   })
 })
 
+describe('launcher update asset', () => {
+  it('matches the setup installer of a release', async () => {
+    const { SETUP_ASSET } = await import('../src/main/selfUpdate')
+    const release = { tag: 'v1.2.0', name: '', date: null, prerelease: false, htmlUrl: '', assets: [
+      { name: 'RulZ-AI-Tools-Suite-Setup-1.2.0.exe.blockmap', size: 1, url: 'a' },
+      { name: 'RulZ-AI-Tools-Suite-Setup-1.2.0.exe', size: 2, url: 'b' }
+    ] }
+    expect(findAsset(release, SETUP_ASSET)?.url).toBe('b')
+  })
+})
+
+describe('launcher update helper', () => {
+  it('is a valid PowerShell script', async () => {
+    const { execFileSync } = await import('node:child_process')
+    const { HELPER } = await import('../src/main/selfUpdate')
+    dir = await mkdtemp(join(tmpdir(), 'rulz-test-'))
+    const file = join(dir, 'helper.ps1')
+    await writeFile(file, HELPER, 'utf8')
+    const out = execFileSync(
+      'powershell.exe',
+      ['-NoProfile', '-Command', `$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile('${file}', [ref]$null, [ref]$e); $e.Count`],
+      { encoding: 'utf8' }
+    )
+    expect(out.trim()).toBe('0')
+  })
+})
+
 describe('command lines', () => {
   it('quotes arguments the way Windows programs parse them', () => {
     expect(quoteArg('plain')).toBe('plain')

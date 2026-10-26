@@ -51,7 +51,8 @@ export interface IpcInvoke {
   'apps:log': (appId: string) => string[]
 
   /** `reloadPath` re-reads PATH first, to find programs installed since the launcher started. */
-  'self:check': () => SelfUpdate | null
+  /** `force` skips the 30-minute cache. */
+  'self:check': (force?: boolean) => SelfUpdate | null
   'self:install': (update: SelfUpdate) => void
   'requirements:check': (reloadPath?: boolean) => RequirementStatus[]
   /** Installs a requirement with winget; resolves when winget exits. */

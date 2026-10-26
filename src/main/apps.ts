@@ -37,6 +37,12 @@ import { createShortcut, foreignShortcutPaths, removeShortcut, shortcutPaths } f
 import type { Store } from './store'
 
 const LOG_LIMIT = 3000
+const LATEST_TTL_MS = 30 * 60_000
+
+interface LatestCache {
+  at: number
+  entries: Record<string, LatestInfo>
+}
 const SETUP_CWD = process.env.SystemRoot ?? 'C:\\Windows'
 const IMAGE_EXT = /\.(png|jpe?g|webp|gif)$/i
 // electron-builder's NSIS setups now and then crash at startup inside their System.dll plugin
@@ -133,6 +139,7 @@ export class AppManager {
   private running = new Map<string, ChildProcess>()
   private readmes = new Map<string, ReadmeDoc>()
   private screenshots = new Map<string, string[]>()
+  private latestAt = 0
 
   constructor(private readonly o: AppManagerOptions) {}
 
@@ -143,6 +150,13 @@ export class AppManager {
       this.screenshots.set(app.id, files.map((f) => `rulz://catalog/${app.id}/screenshots/${encodeURIComponent(f)}`))
     }
     await this.reconcileInstalls()
+    // The last GitHub answers, so cards have versions at once and repeated launches don't use up the API's
+    // 60 requests an hour.
+    const cache = await this.o.store.loadCache<LatestCache | null>('latest-cache.json', null)
+    if (cache) {
+      this.latestAt = cache.at
+      for (const [id, info] of Object.entries(cache.entries)) this.latest.set(id, { info, error: null, release: null })
+    }
   }
 
   // ---------- Views ----------
@@ -239,13 +253,24 @@ export class AppManager {
 
   // ---------- GitHub ----------
 
-  async refreshLatest(): Promise<void> {
+  /** Asks GitHub for the newest versions; unless `force`, answers from the last 30 minutes are reused. */
+  async refreshLatest(force = true): Promise<void> {
     await this.reconcileInstalls()
-    await Promise.all(
-      CATALOG.map(async (app) => {
-        this.latest.set(app.id, await this.fetchLatest(app))
-      })
-    )
+    const fresh = Date.now() - this.latestAt < LATEST_TTL_MS && CATALOG.every((a) => this.latest.get(a.id)?.info)
+    if (force || !fresh) {
+      await Promise.all(
+        CATALOG.map(async (app) => {
+          this.latest.set(app.id, await this.fetchLatest(app))
+        })
+      )
+      const entries: Record<string, LatestInfo> = {}
+      for (const [id, e] of this.latest) if (e.info) entries[id] = e.info
+      // Only a complete answer counts as fresh (an error, e.g. the rate limit, should be retried).
+      if (CATALOG.every((a) => entries[a.id])) {
+        this.latestAt = Date.now()
+        await this.o.store.saveCache('latest-cache.json', { at: this.latestAt, entries } satisfies LatestCache)
+      }
+    }
     this.changed()
   }
 
