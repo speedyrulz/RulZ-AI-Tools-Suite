@@ -1115,6 +1115,9 @@ class Form:
             body_loss_weight=float(v("body_loss_weight")), background_loss_weight=float(v("background_loss_weight")),
             face_margin=float(v("face_margin")), region_feather_cells=int(v("region_feather_cells")),
             region_prior_weight=float(v("region_prior_weight")),
+            attn_localize=bool(v("attn_localize")), attn_localize_weight=float(v("attn_localize_weight") or 0.0),
+            attn_localize_layers=s("attn_localize_layers"), id_align=bool(v("id_align")),
+            id_align_weight=float(v("id_align_weight") or 0.0), id_align_layer=int(v("id_align_layer")),
             id_loss_weight=float(v("id_loss_weight")), id_loss_sigma_max=float(v("id_loss_sigma_max")),
             id_loss_every=int(v("id_loss_every")), id_loss_backend=v("id_loss_backend"),
             id_loss_margin_cells=int(v("id_loss_margin_cells")),
@@ -2836,6 +2839,10 @@ def extra_review_rows(cfg: TrainConfig) -> list[tuple[str, str]]:
         options.append(f"{cfg.timestep_sampling} timesteps")
     if cfg.isolation:
         options.append("LoRA Isolation")
+    if cfg.attn_localize:
+        options.append(f"trigger attention on the subject ({cfg.attn_localize_weight:g})")
+    if cfg.id_align:
+        options.append(f"identity alignment ({cfg.id_align_weight:g})")
     if cfg.look_warmup:
         options.append("look warm-up")
     if cfg.lora_ema:
@@ -3629,6 +3636,18 @@ class Wizard:
                           "subject next to a generated stranger; and balances several subjects. Needs a trigger "
                           "word. About 1.5-2x the training time.", when=self.is_character):
             self.bind(ui.switch("LoRA Isolation"), "isolation")
+        with self.setting(None, "Trigger attention on the subject",
+                          "Reads, inside the model, where the trigger word's attention lands in each training "
+                          "picture and pulls it onto the person (their face box and silhouette), so the trigger is "
+                          "bound to them and not to the background or other people. Training-only: the LoRA file is "
+                          "the same. Not yet measured: race it.", when=self.is_character):
+            self.bind(ui.switch("Keep the trigger's attention on the subject"), "attn_localize")
+        with self.setting(None, "Identity alignment",
+                          "Teaches the face's tokens inside the model to carry that photo's identity (its ArcFace "
+                          "embedding), through a small helper network that is thrown away afterwards. Identity "
+                          "feedback at every noise level. Training-only. Not yet measured: race it.",
+                          when=self.is_character):
+            self.bind(ui.switch("Align the face tokens with the identity"), "id_align")
         hint("Schedules, LoRA layers and blocks, the full fine-tune and per-image loss watch are on the Train tab.")
         self.nav()
 
@@ -5030,6 +5049,35 @@ def build_page(local: bool = True):
                                     .classes("w-96 max-w-full") \
                                     .tooltip("Regularises background cells toward the base model's prediction (extra "
                                              "no-grad forward)")
+                        with advanced("Trigger attention and identity alignment"):
+                            hint("Two training-only losses that read the model's insides; the saved LoRA is the same "
+                                 "kind of file. Not yet measured here: race them against the run's own settings.")
+                            with fields():
+                                w["attn_localize"] = ui.switch("Keep the trigger's attention on the subject",
+                                                               value=d.attn_localize).tooltip(
+                                    "Attention localization: in a few attention layers, reads how much of each image "
+                                    "token's attention to the caption goes to the trigger word, and penalizes the part "
+                                    "of that map outside the person (the region maps' person mask and face box). Ties "
+                                    "the identity to the trigger and keeps it off the background and other people. "
+                                    "Needs a trigger word. FIBO 2.0 reads it in its injection blocks.")
+                                w["attn_localize_weight"] = ui.number("Weight", value=d.attn_localize_weight, min=0,
+                                                                      step=0.01).classes("w-28")
+                                w["attn_localize_layers"] = ui.input("Blocks (empty = auto)",
+                                                                     value=d.attn_localize_layers).classes("w-44") \
+                                    .tooltip("Comma-separated block numbers to read it in. Auto: a third and half "
+                                             "of the depth (FIBO 2.0: its injection blocks).")
+                            with fields():
+                                w["id_align"] = ui.switch("Align the face tokens with the photo's identity",
+                                                          value=d.id_align).tooltip(
+                                    "Identity feature alignment (REPA pointed at identity): after one block, the "
+                                    "image tokens inside the face box are averaged and a small projector maps them "
+                                    "onto that photo's ArcFace embedding. Identity feedback at every noise level, "
+                                    "without the identity loss's decode. The projector is not saved.")
+                                w["id_align_weight"] = ui.number("Weight", value=d.id_align_weight, min=0,
+                                                                 step=0.01).classes("w-28")
+                                w["id_align_layer"] = ui.number("Block (-1 = auto)", value=d.id_align_layer, min=-1,
+                                                                precision=0).classes("w-36") \
+                                    .tooltip("The block whose output is aligned. Auto: a third of the depth.")
                         with advanced("Experimental: identity loss"):
                             hint("On low-noise samples with a detected face, decodes the face of the model's predicted "
                                  "clean image (with gradients), aligns it and adds weight x (1 - cosine similarity) to a "
@@ -5989,6 +6037,14 @@ better subject identity than LoRA and stable long runs. *OFT constraint* > 0 cap
 (a switch for LoRA and LoKr): a magnitude per input channel trains on its own while the adapter steers the
 direction; steps are about 40% slower on Krea 2. OFT and DoRA files load in ComfyUI exactly as trained (not in diffusers). To
 compare them, race rows such as `network_type=oft` or `dora=true` against a LoKr row.
+
+## Trigger attention and identity alignment
+Two training-only losses (Train tab, Region-weighted loss section; the Wizard's Training step for a character). **Keep
+the trigger's attention on the subject** reads, inside the model, where the trigger word's attention lands in each
+picture and pulls it onto the person (their silhouette and face box), so the trigger is bound to them and not to the
+background or other people; it needs a trigger word. **Align the face tokens with the photo's identity** teaches the
+face's tokens after one block to carry that photo's identity (its ArcFace embedding) through a small helper network
+that is thrown away. The LoRA file is the same either way. Not yet measured: race them.
 
 ## Previous runs (run history)
 

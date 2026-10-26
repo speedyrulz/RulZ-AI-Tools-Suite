@@ -342,6 +342,13 @@ class TrainConfig:
     id_loss_margin_cells: int = 2  # latent cells of context decoded around the face box
     id_loss_min_face_cells: int = 4  # skip faces smaller than this many latent cells (16 px each) on a side
     id_loss_random_ref: bool = True  # one random reference face per step (else the mean reference embedding)
+    # --- trigger attention and identity alignment: training-only losses read inside the model (alignment.py) ---
+    attn_localize: bool = False  # keep the trigger word's attention on the subject (person mask + face box)
+    attn_localize_weight: float = 0.05
+    attn_localize_layers: str = ""  # blocks it is read in, e.g. "14,21"; "" = auto (FIBO: its injection blocks)
+    id_align: bool = False  # align the face tokens' states after one block to the photo's ArcFace embedding
+    id_align_weight: float = 0.05
+    id_align_layer: int = -1  # that block; -1 = auto (a third of the depth)
     # --- likeness probes & controller (character LoRAs) ---
     probe_every: int = 0  # steps between probe renders; 0 = off (needs face_refs and/or body_refs)
     probe_at_start: bool = True  # also probe at step 0 for a baseline
@@ -430,6 +437,11 @@ class TrainConfig:
         parse_clean_share(self.clean_share)
         if self.finetune:
             self.validate_finetune()
+        if self.attn_localize_weight < 0 or self.id_align_weight < 0:
+            raise ValueError("attn_localize_weight and id_align_weight must be 0 or more")
+        if self.attn_localize and not (self.trigger_word or any(sp.trigger for sp in self.dataset_specs())):
+            raise ValueError("attn_localize needs a trigger word (trigger_word, or a dataset's own trigger): it keeps "
+                             "that word's attention on the subject")
         from .lora import KINDS as NETWORK_KINDS
 
         if self.network_type not in NETWORK_KINDS:
@@ -542,8 +554,14 @@ class TrainConfig:
                                      "sub-folders: its images would train twice")
 
     def wants_regions(self) -> bool:
-        """Region maps (face cells + landmarks) are needed by the region-weighted loss and the identity loss."""
-        return bool(self.region_weights or self.id_loss_weight > 0)
+        """Region maps (face cells, landmarks, the subject's cells) are needed by the region-weighted loss, the identity
+        loss, attention localization and identity alignment."""
+        return bool(self.region_weights or self.id_loss_weight > 0 or self.attn_localize or self.id_align)
+
+    def wants_person_masks(self) -> bool:
+        """Person masks in the region maps: the region-weighted loss's person weight, attention localization's
+        subject."""
+        return bool(self.region_weights or self.attn_localize)
 
     def resolved_cache_dir(self) -> Path:
         """The run's cache (text embeddings, face analysis, loss-watch exclusions): cache_dir, else the first

@@ -179,6 +179,9 @@ class Attention(nn.Module):
         v = v.unflatten(-1, (self.heads, -1))
         if freqs_cis is not None:
             q, k = _apply_rope(q, freqs_cis), _apply_rope(k, freqs_cis)
+        tap = getattr(self, "_rz_tap", None)  # rulztrainer.alignment: the trigger's attention (training-only loss)
+        if tap is not None:
+            tap(q.transpose(1, 2), k.transpose(1, 2))
         if attention_mask is not None and attention_mask.ndim == 2:
             attention_mask = attention_mask[:, None, None, :]
         out = sdpa(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=attention_mask)
@@ -397,6 +400,11 @@ class FiboTransformer(nn.Module):
         # 6. main blocks; injection blocks read their own bundle
         bundle_index = {lid: i + 1 for i, lid in enumerate(self.injection_layer_ids)}
         split = getattr(self, "split_devices", None)  # blocks may live on several devices (model split)
+        taps = getattr(self, "_rz_taps", None)  # rulztrainer.alignment (training-only losses)
+        if taps is not None and taps.armed:  # the injection blocks' cross-attention reads the caption token by token
+            text_valid = (encoder_attention_mask.to(device=device, dtype=torch.bool)
+                          if encoder_attention_mask is not None else None)
+            taps.set_layout(0, (image_start, num_image_tokens), (0, enc.shape[2]), text_valid)
         for lid, block in enumerate(self.layers):
             if lid in skip_layers:
                 continue
@@ -413,6 +421,8 @@ class FiboTransformer(nn.Module):
                         encoder_attention_mask = encoder_attention_mask.to(ldev)
             x = self._run(block, x, attention_mask, freqs_cis, noise_mask, adaln_noisy, adaln_clean, text,
                           encoder_attention_mask)
+            if taps is not None and taps.armed:
+                taps.record_hidden(lid, x[:, image_start:image_start + num_image_tokens])
 
         # 7. final layer on the image tokens, back to the input layout
         if split:

@@ -89,9 +89,11 @@ def _file_key(path: Path) -> str:
     return f"{path.resolve()}|{st.st_mtime_ns}|{st.st_size}"
 
 
-def analyze_faces(items, face_scorer, cache_path: Path, progress=None, recache: bool = False) -> dict[str, dict]:
+def analyze_faces(items, face_scorer, cache_path: Path, progress=None, recache: bool = False,
+                  embeddings: bool = False) -> dict[str, dict]:
     """Largest face per *source image* in source pixels: {str(resolved path): {bbox, kps, det, W, H}} (bbox None if
-    no face). Cached in faces.json keyed by path|mtime|size."""
+    no face), with embeddings=True also its ArcFace embedding ("emb", 512 floats; identity alignment). Cached in
+    faces.json keyed by path|mtime|size; a face cached without an embedding is analysed again when one is wanted."""
     from PIL import Image, ImageOps
 
     cache: dict[str, dict] = {}
@@ -103,7 +105,8 @@ def analyze_faces(items, face_scorer, cache_path: Path, progress=None, recache: 
     sources: dict[str, Path] = {}
     for it in items:
         sources.setdefault(str(it.image.resolve()), it.image)
-    todo = [(k, p) for k, p in sources.items() if _file_key(p) not in cache]
+    todo = [(k, p) for k, p in sources.items() if _file_key(p) not in cache
+            or (embeddings and cache[_file_key(p)].get("bbox") and not cache[_file_key(p)].get("emb"))]
     for i, (k, p) in enumerate(todo):
         rec: dict = {"bbox": None, "kps": None, "det": 0.0, "W": 0, "H": 0}
         try:
@@ -118,6 +121,9 @@ def analyze_faces(items, face_scorer, cache_path: Path, progress=None, recache: 
                     kps = getattr(f, "kps", None)
                     rec["kps"] = [[float(x), float(y)] for x, y in kps] if kps is not None else None
                     rec["det"] = float(f.det_score)
+                    emb = getattr(f, "normed_embedding", None)
+                    if emb is not None:
+                        rec["emb"] = [round(float(v), 6) for v in emb]
         except Exception as e:  # noqa: BLE001
             log.warning("face analysis failed for %s: %s", p, e)
         cache[_file_key(p)] = rec

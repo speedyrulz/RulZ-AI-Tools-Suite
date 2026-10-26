@@ -5,7 +5,7 @@ import hashlib
 import logging
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -64,6 +64,7 @@ class RegionBatch:
     weight: torch.Tensor  # [B, 1, h, w]
     prior: torch.Tensor  # [B, 1, h, w] bool
     meta: list  # per-sample RegionMap (face cells, kps, has_person)
+    text_paths: list = field(default_factory=list)  # per sample: the cached text it trained on (caption dropout too)
 
 
 def bucket_size(w: int, h: int, cfg: TrainConfig, side: int | None = None) -> tuple[int, int]:
@@ -420,7 +421,7 @@ def load_batch(batch: list[Item], cfg: TrainConfig, rng: random.Random):
 
     pad_embeds = get_arch(cfg).pad_embeds
 
-    latents, rows, maps = [], [], []
+    latents, rows, maps, paths = [], [], [], []
     empty = dropout_text_path(cfg)
     want_regions = cfg.wants_regions()
     for it in batch:
@@ -431,6 +432,7 @@ def load_batch(batch: list[Item], cfg: TrainConfig, rng: random.Random):
         latents.append(load_file(str(path))["latent"])
         tp = empty if (cfg.caption_dropout > 0 and rng.random() < cfg.caption_dropout) else it.text_path
         rows.append(load_file(str(tp))["embeds"])
+        paths.append(tp)
         if want_regions:
             rm = load_region_map(it.region_path) if it.region_path is not None else None
             if rm is None:
@@ -441,5 +443,6 @@ def load_batch(batch: list[Item], cfg: TrainConfig, rng: random.Random):
     embeds, mask = pad_embeds(rows)
     regions = None
     if want_regions:
-        regions = RegionBatch(torch.stack([m.weight for m in maps]), torch.stack([m.prior for m in maps]), maps)
+        regions = RegionBatch(torch.stack([m.weight for m in maps]), torch.stack([m.prior for m in maps]), maps,
+                              [str(p) for p in paths])
     return torch.stack(latents), embeds, mask, regions

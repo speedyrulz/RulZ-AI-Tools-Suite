@@ -103,6 +103,9 @@ class Attention(nn.Module):
         if self.heads != self.kv_heads:  # repeated heads: every SDPA kernel accepts a mask then (see diffusers)
             k = k.repeat_interleave(self.heads // self.kv_heads, dim=2)
             v = v.repeat_interleave(self.heads // self.kv_heads, dim=2)
+        tap = getattr(self, "_rz_tap", None)  # rulztrainer.alignment: the trigger's attention (training-only loss)
+        if tap is not None:
+            tap(q.transpose(1, 2), k.transpose(1, 2))
         out = sdpa(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask)
         out = out.transpose(1, 2).flatten(2, 3) * torch.sigmoid(gate)
         return self.to_out[0](out)
@@ -317,6 +320,11 @@ class Krea2Transformer(nn.Module):
         cos, sin = rope_tables(self.position_ids(text_len, height, width, device), self.axes_dims, self.rope_theta)
 
         split = getattr(self, "split_devices", None)  # blocks may live on several devices (model split)
+        taps = getattr(self, "_rz_taps", None)  # rulztrainer.alignment (training-only losses)
+        if taps is not None and taps.armed:
+            text_valid = (encoder_attention_mask.to(device=device, dtype=torch.bool)
+                          if encoder_attention_mask is not None else None)
+            taps.set_layout(0, (text_len, height * width), (0, text_len), text_valid)
         for i, block in enumerate(self.transformer_blocks):
             if i in skip_layers:
                 continue
@@ -326,6 +334,8 @@ class Krea2Transformer(nn.Module):
                     x, temb_mod, cos, sin = x.to(bdev), temb_mod.to(bdev), cos.to(bdev), sin.to(bdev)
                     mask = mask.to(bdev) if mask is not None else None
             x = self._run(block, x, temb_mod, cos, sin, mask)
+            if taps is not None and taps.armed:
+                taps.record_hidden(i, x[:, text_len:])
 
         if split:
             fdev = _module_device(self.final_layer)

@@ -138,6 +138,25 @@ def encode_prompt(text_encoder, processor, prompt: str, max_length: int = 4096) 
     return torch.stack(bundles, dim=1)[0].cpu()  # [6, S, 7680]
 
 
+def get_tokenizer(cfg: TrainConfig, model_dir: Path | None):
+    from transformers import AutoTokenizer
+
+    if moss_loading._use_file(cfg, "text_encoder_file"):
+        from ..krea2 import single_file as ksf
+
+        return AutoTokenizer.from_pretrained(str(ksf.resolve_tokenizer(cfg.tokenizer_path, cfg.models_dir)))
+    return AutoTokenizer.from_pretrained(str(Path(model_dir) / "processor"))
+
+
+def prompt_tokens(tokenizer, prompt: str) -> tuple[str, list, int, int]:
+    """encode_prompt's text (the chat template around the cleaned prompt) with its token offsets; the cache keeps
+    every token."""
+    tok = getattr(tokenizer, "tokenizer", tokenizer)  # a processor, or the tokenizer itself
+    text = PROMPT_TEMPLATE.format(clean_prompt(prompt))
+    offsets = tok(text, return_offsets_mapping=True)["offset_mapping"]
+    return text, [tuple(o) for o in offsets], 0, len(offsets)
+
+
 def pad_embeds(rows: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
     """[6, S_i, 7680] rows -> [B, 6, S, 7680] and a [B, S] bool mask of the real tokens."""
     length = max(r.shape[1] for r in rows)

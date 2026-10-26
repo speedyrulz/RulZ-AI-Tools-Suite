@@ -53,11 +53,13 @@ def _rotate(x, rope):
     return x * cos + torch.cat((-b, a), -1) * sin
 
 
-def _attention(q, k, v, rope, heads):
+def _attention(q, k, v, rope, heads, tap=None):
     shape = (*q.shape[:2], heads, q.shape[-1] // heads)
     q = _rotate(q.reshape(shape), rope).transpose(1, 2)
     k = _rotate(k.reshape(shape), rope).transpose(1, 2)
     v = v.reshape(shape).transpose(1, 2)
+    if tap is not None:  # rulztrainer.alignment: the trigger's attention, read for a training-only loss
+        tap(q.to(v.dtype), k.to(v.dtype))
     return sdpa(q.to(v.dtype), k.to(v.dtype), v).transpose(1, 2).flatten(2)
 
 
@@ -111,7 +113,8 @@ class Block(nn.Module):
         y = y.to(dtype)
         q = self.q_norm(self.proj["q"](y).unflatten(-1, (self.heads, -1))).flatten(2)
         k = self.k_norm(self.proj["k"](y).unflatten(-1, (self.heads, -1))).flatten(2)
-        x = x + self.proj["o"](_attention(q, k, self.proj["v"](y), rope, self.heads)) * gate_a[:, None]
+        x = x + self.proj["o"](_attention(q, k, self.proj["v"](y), rope, self.heads,
+                                          getattr(self, "_rz_tap", None))) * gate_a[:, None]
         y = self.norm2(x) * (1 + scale_f[:, None]) + shift_f[:, None]
         hidden, gate = self.proj["ffn_up_gate"](y.to(dtype)).chunk(2, -1)
         return x + self.proj["ffn_down"](_situ(hidden, gate)) * gate_f[:, None]
@@ -221,6 +224,9 @@ class MOSSImageTransformer(nn.Module):
             mod_i = mod[index:index + 1]
             rope_i = rope
             split = getattr(self, "split_devices", None)  # blocks may live on several devices (model split)
+            taps = getattr(self, "_rz_taps", None)  # rulztrainer.alignment (training-only losses)
+            if taps is not None and taps.armed:
+                taps.set_layout(index, (0, height * width), (height * width, -1))
             for layer_index, layer in enumerate(self.layers):
                 if layer_index in skip_layers:
                     continue
@@ -229,6 +235,8 @@ class MOSSImageTransformer(nn.Module):
                     if ldev is not None and x.device != ldev:
                         x, rope_i, mod_i = x.to(ldev), rope_i.to(ldev), mod_i.to(ldev)
                 x = self._run_layer(layer, x, rope_i, mod_i)
+                if taps is not None and taps.armed:
+                    taps.record_hidden(layer_index, x[:, :height * width])
             head_i = head[index:index + 1]
             if split:
                 fdev = self.final_norm_video.weight.device

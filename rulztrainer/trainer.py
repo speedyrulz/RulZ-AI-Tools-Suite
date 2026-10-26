@@ -350,6 +350,14 @@ class Trainer(RaceParallelMixin):
         self.batch_iter = None
         self.face_detector = None
         self.face_analysis: dict[str, dict] = {}
+        # attention localization / identity alignment (alignment.py): the trigger's token positions per cached text,
+        # each photo's face embedding, the alignment's projector and its optimizer, and their values since the log
+        self.trigger_pos: dict[str, list[int]] = {}
+        self.face_embs: dict[str, torch.Tensor] = {}
+        self.align_layer: int | None = None
+        self.id_aligner = None
+        self.id_align_opt = None
+        self.align_values: dict[str, list[float]] = {"attn": [], "id": []}
         if not (0.0 <= cfg.sigma_min < cfg.sigma_max <= 1.0):
             raise ValueError("sigma_min/sigma_max must satisfy 0 <= sigma_min < sigma_max <= 1")
         self.devices: list[str] = [cfg.device]
@@ -447,7 +455,12 @@ class Trainer(RaceParallelMixin):
         self.status.update(stage="analysing faces in the dataset")
         self.face_analysis = R.analyze_faces(items, detector, cache / "faces.json",
                                              progress=lambda i, n: self.status.update(step=i, total=n),
-                                             recache=cfg.recache)
+                                             recache=cfg.recache, embeddings=cfg.id_align)
+        if cfg.id_align:
+            self.face_embs = {k: torch.tensor(r["emb"], dtype=torch.float32)
+                              for k, r in self.face_analysis.items() if r.get("emb")}
+            log.info("Identity alignment: %d of %d source images have a face embedding", len(self.face_embs),
+                     len(self.face_analysis))
         n_face = sum(1 for r in self.face_analysis.values() if r.get("bbox"))
         log.info("Face analysis: %d of %d source images have a face", n_face, len(self.face_analysis))
         if (cfg.crop_augment or "none") != "none":
@@ -455,8 +468,8 @@ class Trainer(RaceParallelMixin):
         if cfg.wants_regions():
             person_fn = None
             holder = []
-            if not cfg.region_weights:
-                pass  # identity loss only: face cells + landmarks are enough, no person masks
+            if not cfg.wants_person_masks():
+                pass  # identity loss / alignment only: face cells + landmarks are enough, no person masks
             elif cfg.body_backend == "mediapipe+sam3":
                 try:
                     from .bodysim import SilhouetteScorer
@@ -467,7 +480,7 @@ class Trainer(RaceParallelMixin):
                     person_fn = sil.person_mask
                 except Exception as e:  # noqa: BLE001
                     log.warning("SAM 3 unavailable for person masks (%s); trying MediaPipe", e)
-            if person_fn is None and cfg.region_weights:
+            if person_fn is None and cfg.wants_person_masks():
                 try:
                     from .bodysim import BodyScorer, available
 
@@ -828,6 +841,7 @@ class Trainer(RaceParallelMixin):
                 log.info("Samples and probes split across %s (each GPU renders the next image in the queue)",
                          ", ".join(side))
 
+        self._setup_alignment(cfg, items)
         do_compile, why = compiling.decide(cfg.compile_model, cfg.steps - step, self.devices)
         if self.race_parallel and do_compile:
             do_compile, why = False, "race_parallel trains the model copies in threads at once"
@@ -916,7 +930,18 @@ class Trainer(RaceParallelMixin):
             noisy = (1 - s) * latents + s * noise
             target = noise - latents
             noisy_in = noisy.to(torch.bfloat16)
+            taps = getattr(rmodel, "_rz_taps", None)
+            use_attn = bool(cfg.attn_localize and taps is not None and regions is not None)
+            use_align = bool(cfg.id_align and taps is not None and regions is not None and rmodel is model
+                             and self.id_aligner is not None)
+            if use_attn or use_align:  # this forward records the trigger's attention / the face tokens' states
+                taps.begin([self.trigger_pos.get(p, []) for p in regions.text_paths] if use_attn
+                           else [[] for _ in batch], attention=use_attn)
             pred = rmodel(noisy_in, sigma * 1000.0, embeds, mask).float()
+            aux = None
+            if use_attn or use_align:
+                taps.stop()  # later forwards (the prior pass, the backward's recompute) record nothing
+                aux = self._alignment_losses(cfg, taps, batch, regions, use_attn, use_align)
             sq = (pred - target).pow(2)
             if regions is not None and cfg.region_weights:  # region-weighted loss: face > person > background (mean 1)
                 sq = sq * regions.weight.to(rdev)
@@ -948,6 +973,9 @@ class Trainer(RaceParallelMixin):
                 weights = weights * torch.tensor([it.loss_scale for it in batch], device=weights.device,
                                                  dtype=weights.dtype)
             loss = (per * weights).mean() / n_total  # the step's update is the mean over all of its batches
+            report = loss.detach()  # the diffusion loss alone for the log and the chart
+            if aux is not None:
+                loss = loss + aux.to(loss.device) / n_total
             result = None
             if self.id_loss is not None and regions is not None and rmodel is model:  # primary replica only
                 t_id = time.time()
@@ -956,10 +984,12 @@ class Trainer(RaceParallelMixin):
                     (loss + id_w * id_val / n_total).backward()
                     if str(rdev).startswith("cuda"):
                         torch.cuda.synchronize(rdev)
-                    result = (loss.item(), mults, (id_val.item(), n_id, time.time() - t_id))
+                    result = (report.item(), mults, (id_val.item(), n_id, time.time() - t_id))
             if result is None:
                 loss.backward()
-                result = (loss.item(), mults, None)
+                result = (report.item(), mults, None)
+            if use_attn or use_align:
+                taps.end()
             if dop is not None:  # LoRA Isolation: the trigger-free pass, after this batch's backward freed its graph
                 del pred, sq, per, noisy, noisy_in
                 self._dop_pass(rmodel, rinj, rdev, latents, len(batch), dop, n_total, cfg)
@@ -988,6 +1018,8 @@ class Trainer(RaceParallelMixin):
             if prof is not None:
                 prof.start()
             optimizer.zero_grad(set_to_none=True)
+            if self.id_align_opt is not None:
+                self.id_align_opt.zero_grad(set_to_none=True)
             accum_loss = 0.0
             step_images = 0
             step_lr_mult = 1.0
@@ -1069,6 +1101,8 @@ class Trainer(RaceParallelMixin):
                 for g in optimizer.param_groups:
                     g["lr"] = g["lr"] * step_lr_mult
             optimizer.step()
+            if self.id_align_opt is not None and cfg.id_align:
+                self.id_align_opt.step()
             if step_lr_mult != 1.0:
                 for g, lr0 in zip(optimizer.param_groups, saved_lrs):
                     g["lr"] = lr0
@@ -1118,6 +1152,11 @@ class Trainer(RaceParallelMixin):
                 if self.dop_values:  # LoRA Isolation: the trigger-free passes since the last line
                     id_s += f" | dop {sum(self.dop_values) / len(self.dop_values):.4f}"
                     self.dop_values.clear()
+                for key, label in (("attn", "trigger attention off the subject"), ("id", "identity alignment")):
+                    vals = self.align_values[key]
+                    if vals:
+                        id_s += f" | {label} {sum(vals) / len(vals):.3f}"
+                        vals.clear()
                 last = step_times[-5:]
                 who = f"[{self.race.active.name}] " if self._race_running() else ""
                 log.info("%sstep %d/%d loss %.4f avg %.4f lr %.2e %.1fs/it (last %d steps %.2fs each)%s", who, step,
@@ -1374,7 +1413,7 @@ class Trainer(RaceParallelMixin):
             return False
         try:
             compiling.prepare(fall_back, shape_swaps)  # raised recompile limits, dynamo warnings in train.log
-            blocks = self.arch.compile_blocks(model)
+            blocks = [b for b in self.arch.compile_blocks(model) if not getattr(b, "_rz_tapped", False)]
             for block in blocks:
                 block.compile(backend="inductor", dynamic=True)
             log.info("Compiled %d DiT blocks with torch.compile (first steps will be slow)", len(blocks))
@@ -1552,6 +1591,8 @@ class Trainer(RaceParallelMixin):
         crop = "face+bust" if "face+bust" in crops else ("face" if "face" in crops else "none")
         prep = dataclasses.replace(cfg, flip_augment=any(r[1].flip_augment for r in rows), crop_augment=crop,
                                    region_weights=any(r[1].region_weights for r in rows),
+                                   attn_localize=any(r[1].attn_localize for r in rows),
+                                   id_align=any(r[1].id_align for r in rows),
                                    id_loss_weight=max(r[1].id_loss_weight for r in rows),
                                    likeness_curriculum=any(r[1].likeness_curriculum for r in rows))
         self.race_parallel = bool(cfg.race_parallel)
@@ -1631,6 +1672,9 @@ class Trainer(RaceParallelMixin):
         self.batcher, self.batch_iter = st["batcher"], st["batch_iter"]
         self.curriculum_w, self.ts_logit_shift = st["curriculum_w"], st["ts_logit_shift"]
         self.all_items, self.injected = st["items"], st["injected"]
+        self.id_aligner, self.id_align_opt = st.get("id_aligner"), st.get("id_align_opt")
+        for vals in self.align_values.values():  # the log reports this configuration's values only
+            vals.clear()
         il = self.race_id_loss
         self.id_loss = il if il is not None and v.cfg.id_loss_weight > 0 and not st.get("id_vetoed") else None
         if self.id_loss is not None:  # the shared identity loss with this configuration's settings and counters
@@ -1662,6 +1706,8 @@ class Trainer(RaceParallelMixin):
         st["true_per_image_lr"] = (st["loss_watch"] is not None and cfg.per_image_lr and cfg.batch_size == 1
                                    and cfg.gradient_accumulation == 1 and len(self.replicas) == 1)
         st["id_w"] = idloss_weight(cfg.id_loss_weight)
+        st["id_aligner"], st["id_align_opt"] = self._make_id_aligner(cfg)
+        self.id_aligner, self.id_align_opt = st["id_aligner"], st["id_align_opt"]
         v.started = True
 
     def _race_park(self, v) -> None:
@@ -2330,6 +2376,129 @@ class Trainer(RaceParallelMixin):
                  cfg.probe_every, "+".join(k for k, p in (("face", cfg.probe_face_prompt), ("body", cfg.probe_body_prompt)) if p),
                  cfg.likeness_track_best, cfg.likeness_patience, cfg.likeness_lr_control, cfg.likeness_curriculum)
         return ctrl
+
+    def _setup_alignment(self, cfg, items) -> None:
+        """Attention localization / identity alignment: taps on every model copy, the trigger's token positions in
+        every cached text, and the alignment's projector (a race: whenever any configuration uses them)."""
+        from . import alignment as A
+
+        rows = [r[1] for r in self.race_rows] if self.race_rows is not None else [cfg]
+        attn, align = any(c.attn_localize for c in rows), any(c.id_align for c in rows)
+        if not (attn or align):
+            return
+        if self.ft is not None:
+            log.warning("Attention localization and identity alignment are adapter training losses; a fine-tune "
+                        "trains without them")
+            return
+        if self.race_parallel:
+            log.warning("The parallel race trains without attention localization and identity alignment; run the "
+                        "race one configuration at a time to compare them")
+            return
+        model = self.replicas[0][0]
+        n = len(model.layers)
+        attn_layers = []
+        if attn:
+            attn_layers = A.parse_layers(cfg.attn_localize_layers, n) or A.auto_attn_layers(
+                self.arch.name, n, getattr(model, "injection_layer_ids", ()))
+        self.align_layer = (int(cfg.id_align_layer) if cfg.id_align_layer >= 0 else A.auto_hidden_layer(n)) \
+            if align else None
+        if self.align_layer is not None and not 0 <= self.align_layer < n:
+            raise ValueError(f"id_align_layer {self.align_layer} is outside the model's {n} blocks")
+        for m, _, _ in self.replicas:
+            taps = A.Taps([self.align_layer] if align else [], attn_layers)
+            m._rz_taps = taps
+            for i in attn_layers:
+                block = m.layers[i]
+                module = A.attention_module(block)
+                if module is None:
+                    raise ValueError(f"block {i} has no attention that reads the caption token by token (FIBO 2.0: "
+                                     f"use its injection blocks {list(getattr(m, 'injection_layer_ids', ()))})")
+                module._rz_tap = A.AttnTap(taps, i)
+                block._rz_tapped = True  # runs uncompiled: the tap is Python
+        if attn:
+            self.trigger_pos = self._trigger_positions(items, rows)
+            n_pos = sum(1 for p in self.trigger_pos.values() if p)
+            log.info("Attention localization: weight %g in blocks %s; the trigger's tokens found in %d of %d cached "
+                     "texts", cfg.attn_localize_weight, ",".join(map(str, attn_layers)), n_pos, len(self.trigger_pos))
+            if not n_pos:
+                log.warning("Attention localization: the trigger word is in none of the captions; nothing to localize")
+        if align:
+            if self.race_rows is None:
+                self.id_aligner, self.id_align_opt = self._make_id_aligner(cfg)
+            dim = A.model_dim(model)
+            log.info("Identity alignment: weight %g, the face tokens after block %d mapped onto each photo's ArcFace "
+                     "embedding by a %.1fM-weight projector that is not saved", cfg.id_align_weight, self.align_layer,
+                     (dim * 1024 + 1024 + 1024 * A.FACE_EMB_DIM + A.FACE_EMB_DIM) / 1e6)
+
+    def _make_id_aligner(self, cfg):
+        """(projector, its AdamW) for identity alignment, or (None, None)."""
+        from . import alignment as A
+
+        if not cfg.id_align or self.align_layer is None:
+            return None, None
+        proj = A.IdAligner(A.model_dim(self.replicas[0][0])).to(self.devices[0])
+        return proj, torch.optim.AdamW(proj.parameters(), lr=1e-4, weight_decay=0.0)
+
+    def _trigger_positions(self, items, rows) -> dict[str, list[int]]:
+        """{cached text path: the trigger's token positions in it} for every caption training reads (each dataset's
+        trigger, LoRA Isolation's fused words, caption dropout's prompt)."""
+        from . import alignment as A
+        from .dataset import dropout_prompt, text_cache_path
+
+        cfg = self.cfg
+        triggers = {c.trigger_word for c in rows} | {sp.trigger for sp in cfg.dataset_specs()}
+        for s in self.isolation or []:
+            triggers |= {getattr(s, "fused", ""), getattr(s, "trigger", "")}
+        triggers = [t for t in triggers if t]
+        captions = {str(text_cache_path(cfg, it.caption)): it.caption for it in items}
+        for c in rows:
+            captions[str(text_cache_path(c, dropout_prompt(c)))] = dropout_prompt(c)
+        tok = self.arch.get_tokenizer(cfg, self.model_dir)
+        out, mismatched = {}, 0
+        for path, caption in captions.items():
+            text, offsets, drop, length = self.arch.prompt_tokens(tok, caption)
+            pos = A.token_positions(text, offsets, triggers, drop)
+            if Path(path).exists():
+                cached = self._cached_text_length(path)
+                if cached is not None and cached != length:
+                    mismatched += 1
+                    pos = []  # the cache was made another way: positions would point at the wrong tokens
+            out[path] = [p for p in pos if p < length]
+        if mismatched:
+            log.warning("Attention localization: %d cached texts do not have the length their caption tokenizes to "
+                        "(recache to include them)", mismatched)
+        return out
+
+    def _cached_text_length(self, path) -> int | None:
+        from safetensors import safe_open
+
+        try:
+            with safe_open(str(path), "pt") as f:
+                shape = f.get_slice("embeds").get_shape()
+        except Exception:  # noqa: BLE001
+            return None
+        return int(shape[1]) if self.arch.name == "fibo2" else int(shape[0])
+
+    def _alignment_losses(self, cfg, taps, batch, regions, use_attn: bool, use_align: bool):
+        """The weighted sum of this batch's attention localization and identity alignment losses (None when no
+        sample had what they need)."""
+        from . import alignment as A
+
+        terms = []
+        if use_attn:
+            val, _ = A.localization_loss(taps, regions)
+            if val is not None:
+                self.align_values["attn"].append(float(val.detach()))
+                terms.append(cfg.attn_localize_weight * val)
+        if use_align:
+            targets = [self.face_embs.get(str(it.image.resolve())) for it in batch]
+            val, _ = self.id_aligner.loss(taps, self.align_layer, regions, targets)
+            if val is not None:
+                self.align_values["id"].append(float(val.detach()))
+                terms.append(cfg.id_align_weight * val)
+        if not terms:
+            return None
+        return sum(t.to(terms[0].device) for t in terms[1:]) + terms[0] if len(terms) > 1 else terms[0]
 
     def _likeness_scale(self):
         """The scale the samples' scores are normalized on: the probe controller's (its floors from the step-0

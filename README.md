@@ -713,6 +713,37 @@ only) fell 0.88 / 0.68 / 0.54, so most of the drop is ordinary learning and the 
 this short run. Treat it as an experiment to A/B against the probes (with the facenet backend for an independent
 score), not a default.
 
+### Trigger attention and identity alignment (`attn_localize`, `id_align`)
+
+Two training-only losses that read the model's insides and reuse what the trainer already has (the region maps'
+person mask and face box, the face analysis); the saved LoRA is the same kind of file. Both are switches in the
+Region-weighted loss section (*Trigger attention and identity alignment*) and in the Wizard's Training step for a
+character, and race keys. Neither is measured for likeness yet: race them against the run's own settings.
+
+- **Attention localization** (`attn_localize`, weight `attn_localize_weight` 0.05). In a few attention layers
+  (`attn_localize_layers`; auto: a third and half of the depth, FIBO 2.0's injection blocks) every image token's
+  attention over the caption is read (softmax over the text tokens, averaged over heads) and the share that goes to
+  the trigger word's tokens forms a map over the picture. Normalized to sum 1, the loss is the part of that map off
+  the subject: 1 - share on the person mask and face box. It binds the identity to the trigger and keeps it off the
+  background and other people, the kind of positional supervision MultiCrafter (2025) put on FLUX's attention to stop
+  attributes leaking between subjects. The trigger's tokens are found in each cached caption with the model's own
+  tokenizer and prompt template (each dataset's trigger, Isolation's fused words, caption dropout's prompt); FIBO 2.0
+  condenses the caption into Perceiver gist tokens, so it is read in the cross-attention of its injection blocks.
+  Person masks are built for it even without the region-weighted loss. Needs a trigger word.
+- **Identity alignment** (`id_align`, weight `id_align_weight` 0.05, block `id_align_layer`; auto: a third of the
+  depth). After that block, the image tokens inside the face box are averaged and a small MLP (about 7M weights on
+  Krea 2, its own AdamW, never saved) maps them onto that photo's ArcFace embedding (stored with the face analysis);
+  the loss is 1 - cosine. It is REPA's representation alignment (Yu et al. 2024) pointed at identity: feedback at
+  every noise level, where the identity loss above needs a nearly clean prediction and a VAE decode.
+- How it runs: the trainer arms taps on the model for a batch, the main forward records, nothing records on later
+  forwards, and a checkpointed block that recomputes in the backward computes the same tensors again (the gradients
+  match an unchecked run exactly on all three models). Tapped blocks run uncompiled. Data parallel: localization on
+  every GPU, alignment on the first (like the identity loss). Not in the parallel race or a fine-tune.
+- Checked on real models at 0.25 MP (16 GB card), both losses in one short run: Krea 2 (blocks 9 and 14; steps as
+  long as without them; the trigger's attention off the subject 0.87 -> 0.84 over 10 steps), MOSS-Image (blocks 14
+  and 21) and FIBO 2.0 (its five injection blocks). A Krea 2 race with a row for each trained, probed and dropped
+  them like any other configuration. The trigger's tokens were found in every cached caption on all three.
+
 ## Likeness probes and controller (character LoRAs)
 
 With face/body references set, `probe_every: N` renders a fixed-seed headshot (`probe_face_prompt`) and/or

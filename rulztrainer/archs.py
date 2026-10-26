@@ -56,6 +56,15 @@ class Arch:
     def encode_prompt(self, text_encoder, tokenizer, prompt: str, max_length: int) -> torch.Tensor: ...
     def pad_embeds(self, rows: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]: ...
 
+    def get_tokenizer(self, cfg: TrainConfig, model_dir: Path | None):
+        """The text encoder's tokenizer alone (a few MB), for finding the trigger word's tokens."""
+        return self._loading.get_tokenizer(cfg, model_dir)
+
+    def prompt_tokens(self, tokenizer, prompt: str) -> tuple[str, list, int, int]:
+        """(text, token offsets, leading tokens the cache drops, cached length) of a prompt as encode_prompt forms it,
+        so a word's tokens can be found in the cached features."""
+        return self._loading.prompt_tokens(tokenizer, prompt)
+
     def encode_images(self, vae, images: torch.Tensor) -> torch.Tensor:
         from .moss.loading import encode_images
 

@@ -154,6 +154,24 @@ def encode_prompt(text_encoder, tokenizer, prompt: str, max_length: int = MAX_TE
     return hidden[0, PREFIX_TOKENS:].to(torch.bfloat16).cpu()
 
 
+def get_tokenizer(cfg: TrainConfig, model_dir: Path | None):
+    from transformers import AutoTokenizer
+
+    if moss_loading._use_file(cfg, "text_encoder_file"):
+        from . import single_file as ksf
+
+        return AutoTokenizer.from_pretrained(str(ksf.resolve_tokenizer(cfg.tokenizer_path, cfg.models_dir)))
+    return AutoTokenizer.from_pretrained(str(_need_dir(cfg, model_dir, "tokenizer") / "tokenizer"))
+
+
+def prompt_tokens(tokenizer, prompt: str) -> tuple[str, list, int, int]:
+    """encode_prompt's text (the system prefix + the prompt; the suffix follows) with its token offsets; the cache
+    drops the PREFIX_TOKENS prefix tokens and keeps the SUFFIX_TOKENS suffix ones."""
+    text = PROMPT_PREFIX + prompt
+    offsets = tokenizer(text, return_offsets_mapping=True)["offset_mapping"]
+    return text, [tuple(o) for o in offsets], PREFIX_TOKENS, len(offsets) - PREFIX_TOKENS + SUFFIX_TOKENS
+
+
 def pad_embeds(rows: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
     """[S_i, 12, 2560] rows -> [B, S, 12, 2560] and a [B, S] bool mask of the real tokens."""
     length = max(r.shape[0] for r in rows)

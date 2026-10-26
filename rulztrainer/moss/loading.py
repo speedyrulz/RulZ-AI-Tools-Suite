@@ -222,6 +222,25 @@ def encode_prompt(text_encoder, tokenizer, prompt: str, max_length: int = 4096) 
     return out.last_hidden_state[0].to(torch.bfloat16).cpu()
 
 
+def get_tokenizer(cfg: TrainConfig, model_dir: Path | None):
+    from transformers import AutoTokenizer
+
+    if _use_file(cfg, "text_encoder_file"):
+        tokenizer = AutoTokenizer.from_pretrained(str(sf.resolve_tokenizer(cfg.tokenizer_path, cfg.models_dir)))
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(str(Path(model_dir) / "tokenizer"))
+    check_tokenizer(tokenizer)
+    return tokenizer
+
+
+def prompt_tokens(tokenizer, prompt: str) -> tuple[str, list, int, int]:
+    """encode_prompt's text (the chat template) with its token offsets; the cache keeps every token."""
+    formatted = tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True, enable_thinking=True)
+    offsets = tokenizer(formatted, return_offsets_mapping=True, truncation=True, max_length=4096)["offset_mapping"]
+    return formatted, [tuple(o) for o in offsets], 0, len(offsets)
+
+
 def pad_embeds(rows: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
     length = max(r.shape[0] for r in rows)
     embeds = rows[0].new_zeros(len(rows), length, rows[0].shape[-1])
