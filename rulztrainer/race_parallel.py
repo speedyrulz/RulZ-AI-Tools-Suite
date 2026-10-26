@@ -410,11 +410,11 @@ class RaceParallelMixin:
             for v, reps in list(lanes):
                 if not v.alive or rr.schedule.done:
                     continue
-                score, _ = self._rp_probe(v)
-                dropped = rr.schedule.record(v.idx, score, v.state["step"])
+                self._rp_probe(v)
+                self._race_record(v, v.state.get("controller"))
                 self._rp_log_round(rr)
-                if dropped is not None:
-                    self._race_drop(rr.variants[dropped])
+                for i in rr.schedule.just_dropped:
+                    self._race_drop(rr.variants[i])
             for v, _ in lanes:
                 if v.alive and not rr.schedule.done:
                     self._rp_park(v)
@@ -431,10 +431,7 @@ class RaceParallelMixin:
     def _rp_log_round(self, rr) -> None:
         if rr.schedule.history and getattr(self, "_rp_logged_rounds", 0) < len(rr.schedule.history):
             self._rp_logged_rounds = len(rr.schedule.history)
-            entry = rr.schedule.history[-1]
-            fmt = ", ".join(f"{n} {'n/a' if s is None else f'{s:.1f}%'}" for n, s in entry["scores"].items())
-            log.info("Race round %d: %s%s", entry["round"], fmt,
-                     f" -> {entry['dropped']} is out" if entry["dropped"] else " (warm-up: nobody is dropped)")
+            log.info("Race round %s", race_mod.describe_round(rr.schedule.history[-1], rr.schedule))
 
     def _rp_stop_save(self, lanes) -> None:
         log.warning("Stopped before the race was decided; the final saves are the configurations that were training "
@@ -460,7 +457,9 @@ class RaceParallelMixin:
             outcome = self._rp_train_lanes(lanes, target)
             if outcome == "stop":
                 break
-            if win.state["step"] % pe == 0 and win.state["step"] < win.cfg.steps and "controller" in win.state:
+            final_too = rr.schedule.keeps_all  # the last one is scored at its last step like the others were
+            if win.state["step"] % pe == 0 and (win.state["step"] < win.cfg.steps or final_too) \
+                    and "controller" in win.state:
                 _, stop = self._rp_probe(win)
                 if stop:
                     log.info("Likeness controller: stopping at step %d", win.state["step"])
@@ -472,6 +471,7 @@ class RaceParallelMixin:
             if win.cfg.sample_prompts:
                 self.sample_images(model, step)
         free_cuda()
+        self._race_decide()
         self._race_report()
         self.status.update(stage="finished", done=True)
         log.info("Done. Final LoRA: %s", path)

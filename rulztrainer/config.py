@@ -116,6 +116,14 @@ class DatasetSpec:
     subject_kind: str = "auto"  # LoRA Isolation: auto | person | thing | style
 
 
+def soup_strength_list(text: str) -> list[float]:
+    """soup_strengths ("1.0, 1.15, 1.3") as numbers, each above 0; 1.0 always among them."""
+    vals = [float(x) for x in str(text or "").replace(";", ",").split(",") if x.strip()]
+    if any(v <= 0 for v in vals):
+        raise ValueError("soup_strengths must all be above 0")
+    return sorted(set(vals) | {1.0})
+
+
 def apply_preset(data: dict, name: str) -> dict:
     """Return a copy of a config dict with the preset applied. Probe prompts are filled in only when empty."""
     if name not in PRESETS:
@@ -363,6 +371,18 @@ class TrainConfig:
     reward_noise: float = 0.7  # the stochastic sampler's noise level (Flow-GRPO's)
     reward_kl: float = 0.04  # KL penalty to the LoRA as the stage started
     reward_size: int = 0  # image size (square; full-body prompts 2:3); 0 = probe_size
+    # --- likeness-filtered self-training: the LoRA's own best pictures train beside the photos (selftrain.py) ---
+    selftrain: bool = False
+    selftrain_at: str = "0.5"  # fractions of the steps a round runs at, e.g. "0.5,0.75" (each replaces the last)
+    selftrain_images: int = 32  # pictures rendered per round (sample_steps / sample_cfg, the largest resolution)
+    selftrain_min_likeness: float = 60.0  # a kept picture scores at least this and the probes' smoothed score
+    selftrain_share: float = 0.2  # at most this share of the real images (repeats counted) per round
+    selftrain_weight: float = 0.5  # their loss weight
+    selftrain_prompts: list[str] = field(default_factory=list)  # empty: the reward stage's varied prompts
+    # --- seed soup: average LoRAs of one subject, picked by the probes (soup.py; steps 0) ---
+    soup_files: list[str] = field(default_factory=list)  # 2+ LoRA / LoKr files: a greedy soup instead of training
+    soup_rank: int = 32  # the soup's rank (0 = exact, LoRA files only)
+    soup_strengths: str = "1.0, 1.15, 1.3"  # strengths each candidate soup is probed at (an average is weaker)
     # --- likeness probes & controller (character LoRAs) ---
     probe_every: int = 0  # steps between probe renders; 0 = off (needs face_refs and/or body_refs)
     probe_at_start: bool = True  # also probe at step 0 for a baseline
@@ -391,6 +411,10 @@ class TrainConfig:
     race: bool = False
     race_configs: list[dict] = field(default_factory=list)  # [{"name": ..., <setting>: <value>, ...}], 2 or more
     race_warmup_probes: int = 0  # probe rounds before the first configuration is dropped
+    race_drop_lowest: bool = True  # after each round the lowest-scoring configuration leaves
+    race_patience_drop: bool = False  # a configuration leaves after race_patience probes of its own without
+    #                                   improvement; the winner is the best score anyone reached
+    race_patience: int = 3
     race_parallel: bool = False  # data_parallel race: one configuration per GPU at the same time (an odd one out
     #                              is split over the GPUs when its step has batches enough, else it runs on the first)
     sample_model_path: str = ""  # optional different diffusion model for sampling only: .safetensors, diffusers dir or repo id
@@ -469,6 +493,27 @@ class TrainConfig:
                                  "reward_lr above 0 and reward_kl 0 or more")
             if self.steps == 0 and not self.resume_from:
                 raise ValueError("steps 0 runs only the reward stage: give it a trained LoRA (resume_from)")
+        if self.soup_files:
+            if len(self.soup_files) < 2:
+                raise ValueError("soup_files needs 2 or more LoRA files")
+            if not (self.face_refs or self.body_refs) or self.probe_every <= 0 \
+                    or not (self.probe_face_prompt or self.probe_body_prompt):
+                raise ValueError("soup_files picks the soup with the likeness probes: set face_refs / body_refs, "
+                                 "probe_every and a probe prompt")
+            if self.steps != 0 or self.resume_from or self.race or self.finetune or self.sample_model_path:
+                raise ValueError("soup_files runs alone: steps 0, no resume_from, race, full fine-tune or separate "
+                                 "sampling model")
+            soup_strength_list(self.soup_strengths)  # raises on a bad list
+        if self.selftrain:
+            if not (self.face_refs or self.body_refs):
+                raise ValueError("selftrain keeps the pictures that look most like face_refs / body_refs: set "
+                                 "references")
+            if self.selftrain_images < 1 or not 0.0 < self.selftrain_share <= 1.0 or self.selftrain_weight <= 0:
+                raise ValueError("selftrain_images must be 1 or more, selftrain_share above 0 and at most 1, "
+                                 "selftrain_weight above 0")
+            from .selftrain import round_steps
+
+            round_steps(max(2, self.steps), self.selftrain_at)  # raises on a bad fraction
         if self.attn_localize_weight < 0 or self.id_align_weight < 0 or self.body_align_weight < 0:
             raise ValueError("attn_localize_weight, id_align_weight and body_align_weight must be 0 or more")
         if self.attn_localize and not (self.trigger_word or any(sp.trigger for sp in self.dataset_specs())):

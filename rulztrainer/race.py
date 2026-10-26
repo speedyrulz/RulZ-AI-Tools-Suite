@@ -6,9 +6,15 @@ the one with the lowest smoothed combined probe score is dropped; race_warmup_pr
 drop. The last one left keeps training until `steps`, counted in its own steps, so the race adds the others' steps
 on top of a normal run (estimate_steps).
 
+race_patience_drop drops a configuration instead once its own probes have not improved for race_patience in a row,
+while the others race on: a setting that learns slowly but ends higher is not cut for being behind early. With it, or
+with race_drop_lowest off (every configuration trains all the steps unless patience ends it), the winner is the one
+whose best smoothed score was the highest at any point; its best checkpoint becomes <job>_best.safetensors.
+
 The comparison is kept fair: every configuration starts from the same LoRA initialisation for its shape, sees the
 same images in the same order with the same noise (its own copies of the run's random streams), and is probed at the
-same own step count with the same probe seeds. The model, quantization, GPUs, dataset, resolutions and the probes
+same own step count with the same probe seeds. A row that sets its own `seed` opts out of that on purpose: its own
+initialisation, image order and noise (seed twins, the ingredients of a seed soup, soup.py). The model, quantization, GPUs, dataset, resolutions and the probes
 themselves are shared; RACE_KEYS lists what a configuration may change.
 
 The trainer keeps one set of LoRA wrappers over the union of every configuration's layers. Switching parks the
@@ -56,6 +62,10 @@ RACE_KEYS: dict[str, tuple[str, ...]] = {
         "network_type", "lokr_factor", "oft_block_size", "oft_constraint", "dora"),
     "Data & augmentation": ("caption_dropout", "flip_augment", "crop_augment", "crop_augment_weight", "look_warmup",
                             "look_warmup_start", "look_warmup_epochs"),
+    "Self-training": ("selftrain", "selftrain_at", "selftrain_images", "selftrain_min_likeness", "selftrain_share",
+                      "selftrain_weight"),
+    # a row's own seed gives it its own LoRA initialisation, image order and noise: seed twins for a seed soup
+    "Seed": ("seed",),
 }
 ALLOWED = {k for keys in RACE_KEYS.values() for k in keys}
 REGION_KEYS = ("face_loss_weight", "body_loss_weight", "background_loss_weight", "face_margin", "region_feather_cells")
@@ -177,6 +187,8 @@ def validate(cfg) -> None:
                          "winner's config, <job>_winner.yaml)")
     if cfg.race_warmup_probes < 0:
         raise ValueError("race_warmup_probes must be 0 or more")
+    if getattr(cfg, "race_patience_drop", False) and int(cfg.race_patience) < 1:
+        raise ValueError("race_patience must be 1 or more (probes without improvement before a configuration leaves)")
     if getattr(cfg, "race_parallel", False):
         from .multigpu import parse_devices
 
@@ -187,6 +199,9 @@ def validate(cfg) -> None:
                 or cfg.id_loss_weight > 0:
             raise ValueError("race_parallel does not support the identity loss: set id_loss_weight to 0 or turn "
                              "race_parallel off")
+        if cfg.selftrain or any(_value(str(r.get("selftrain", ""))) is True for r in rows if isinstance(r, dict)):
+            raise ValueError("race_parallel does not support self-training: turn selftrain off or race_parallel "
+                             "off")
     names = []
     for i, row in enumerate(rows):
         if not isinstance(row, dict):
@@ -207,43 +222,75 @@ def validate(cfg) -> None:
             vcfg.validate()
         except ValueError as e:
             raise ValueError(f"race configuration '{name}': {e}") from e
-    est = estimate_steps(len(rows), cfg.race_warmup_probes, cfg.probe_every, cfg.steps)
-    if cfg.steps < est["race_own_steps"]:
+    if not getattr(cfg, "race_drop_lowest", True) and cfg.steps % cfg.probe_every:
+        raise ValueError(f"without dropping the lowest every configuration trains to the last step and is probed "
+                         f"there: make steps ({cfg.steps}) a multiple of probe_every ({cfg.probe_every})")
+    est = estimate_steps(len(rows), cfg.race_warmup_probes, cfg.probe_every, cfg.steps,
+                         getattr(cfg, "race_drop_lowest", True))
+    if est["drop_lowest"] and cfg.steps < est["race_own_steps"]:
         raise ValueError(f"the race needs at least {est['race_own_steps']} steps ({len(rows)} configurations, "
                          f"{cfg.race_warmup_probes} warm-up probes, a probe every {cfg.probe_every} steps); raise "
                          f"steps or lower the others")
 
 
-def estimate_steps(n: int, warmup: int, probe_every: int, steps: int) -> dict:
+def estimate_steps(n: int, warmup: int, probe_every: int, steps: int, drop_lowest: bool = True) -> dict:
     """Training steps a race costs. Rounds: `warmup` with all n configurations, then n, n-1, ..., 2 (a drop after
     each). race_own_steps: each survivor's own steps when the winner is found; total: every configuration's steps
-    plus the winner's remaining ones; probes: probe renders during the race."""
+    plus the winner's remaining ones; probes: probe renders during the race. Without drop_lowest every configuration
+    may train all the steps: the most it can cost (patience drops make it less)."""
+    if not drop_lowest:
+        probes = n * max(1, math.ceil(steps / max(1, probe_every)))
+        return {"rounds": math.ceil(steps / max(1, probe_every)), "race_steps": n * steps, "race_own_steps": steps,
+                "total": n * steps, "probes": probes, "ratio": float(n), "drop_lowest": False}
     rounds = warmup + n - 1
     race = probe_every * (warmup * n + n * (n + 1) // 2 - 1)
     own = rounds * probe_every
     total = race + max(0, steps - own)
     return {"rounds": rounds, "race_steps": race, "race_own_steps": own, "total": total,
-            "probes": warmup * n + n * (n + 1) // 2 - 1, "ratio": total / max(1, steps)}
+            "probes": warmup * n + n * (n + 1) // 2 - 1, "ratio": total / max(1, steps), "drop_lowest": True}
 
 
 # ---------------------------------------------------------------- schedule
 
 
 class RaceSchedule:
-    """Who trains next and who is dropped. Pure bookkeeping (no torch)."""
+    """Who trains next and who is dropped. Pure bookkeeping (no torch).
 
-    def __init__(self, names: list[str], warmup: int):
+    drop_lowest: each round (after the warm-up) the lowest score leaves. patience > 0: a configuration leaves as soon
+    as its own probes have not improved for that many in a row (the likeness controller's count), whatever the others
+    do, so a slow starter is not cut for being behind. Without drop_lowest a configuration that reaches total_steps
+    of its own leaves as finished. The last one in the race trains on to the end; with patience or without
+    drop_lowest the winner is decided at the end of the run: the best score any configuration reached (champion)."""
+
+    def __init__(self, names: list[str], warmup: int, drop_lowest: bool = True, patience: int = 0,
+                 total_steps: int | None = None):
         self.names = list(names)
         self.warmup = int(warmup)
+        self.drop_lowest = bool(drop_lowest)
+        self.patience = max(0, int(patience))
+        self.total_steps = total_steps
         self.alive = list(range(len(names)))
         self.round = 1
         self.pending = list(self.alive)  # still to train and probe this round, in order
+        self.members = list(self.alive)  # in the race when this round began
         self.scores: dict[int, float | None] = {}
         self.history: list[dict] = []  # per round: {"round", "scores": {name: score}, "steps": {name: the step the
-        #                                score was probed at}, "dropped": name | None}
+        #                                score was probed at}, "dropped": name | None, "left": {name: why}}
         self.steps: dict[int, int | None] = {}
         self.dropped: dict[int, int] = {}  # index -> round it was dropped after
         self.manual: set[int] = set()  # the ones dropped by hand (drop), not by a round's lowest score
+        self.stale: set[int] = set()  # left after `patience` probes without improvement
+        self.finished: set[int] = set()  # left having trained total_steps (without drop_lowest)
+        self.left: dict[int, str] = {}  # this round's: index -> "patience" | "finished"
+        self.just_dropped: list[int] = []  # who left with the last record() call, in order
+        self.best: dict[int, float | None] = {}  # each configuration's best smoothed score so far
+        self.best_step: dict[int, int | None] = {}
+        self.champion: int | None = None  # the winner, once decided (decide())
+
+    @property
+    def keeps_all(self) -> bool:
+        """The winner is the best score reached by anyone, decided at the end (not the last one left)."""
+        return self.patience > 0 or not self.drop_lowest
 
     @property
     def done(self) -> bool:
@@ -259,20 +306,38 @@ class RaceSchedule:
         round (one per GPU). A round with an odd number left ends with a wave of one."""
         return [] if self.done else list(self.pending[:max(1, int(slots))])
 
-    def record(self, idx: int, score: float | None, step: int | None = None) -> int | None:
-        """The probe score of `idx` after its turn this round; returns the configuration dropped when this probe ended
-        a round with a drop. A missing score (no face found) counts as the lowest; on a tie the later one goes."""
+    def record(self, idx: int, score: float | None, step: int | None = None, best: float | None = None,
+               best_step: int | None = None, since_improve: int | None = None) -> int | None:
+        """The probe score of `idx` after its turn this round (best / best_step / since_improve: its controller's).
+        Returns the configuration dropped as the round's lowest when this probe ended a round with a drop;
+        just_dropped lists everyone who left with this call (patience, finished, lowest). A missing score (no face
+        found) counts as the lowest; on a tie the later one goes. The last one in the race never leaves."""
         if self.done or not self.pending or idx != self.pending[0]:
             raise ValueError(f"configuration {idx} is not the one training now")
         self.pending.pop(0)
         self.scores[idx] = score
         self.steps[idx] = step
-        if self.pending:
+        self.just_dropped = []
+        if best is not None:
+            self.best[idx], self.best_step[idx] = best, best_step
+        why = None
+        if self.patience and since_improve is not None and since_improve >= self.patience:
+            why = "patience"
+        elif not self.drop_lowest and self.total_steps and step is not None and step >= self.total_steps:
+            why = "finished"
+        if why and len(self.alive) > 1:
+            self.alive.remove(idx)
+            self.dropped[idx] = self.round
+            (self.stale if why == "patience" else self.finished).add(idx)
+            self.left[idx] = why
+            self.just_dropped.append(idx)
+        if self.pending and not self.done:
             return None
-        entry = {"round": self.round, "scores": {self.names[i]: self.scores.get(i) for i in self.alive},
-                 "steps": {self.names[i]: self.steps.get(i) for i in self.alive}, "dropped": None}
+        entry = {"round": self.round, "scores": {self.names[i]: self.scores.get(i) for i in self.members},
+                 "steps": {self.names[i]: self.steps.get(i) for i in self.members}, "dropped": None,
+                 "left": {self.names[i]: w for i, w in self.left.items()}}
         dropped = None
-        if self.round > self.warmup:
+        if self.drop_lowest and self.round > self.warmup and not self.done:
             def key(i):
                 s = self.scores.get(i)
                 return (-math.inf if s is None else s, -i)
@@ -281,11 +346,26 @@ class RaceSchedule:
             self.alive.remove(dropped)
             self.dropped[dropped] = self.round
             entry["dropped"] = self.names[dropped]
+            self.just_dropped.append(dropped)
         self.history.append(entry)
         self.round += 1
-        self.scores, self.steps = {}, {}
+        self.scores, self.steps, self.left = {}, {}, {}
         self.pending = [] if self.done else list(self.alive)
+        self.members = list(self.alive)
         return dropped
+
+    def decide(self, bests: dict[int, float | None] | None = None) -> int:
+        """The winner: the last one left, or with keeps_all the highest best score any configuration reached (bests:
+        the controllers' final ones, which include the last one's training after the race; a tie goes to the one
+        left in the race)."""
+        if bests:
+            self.best.update({i: b for i, b in bests.items() if b is not None})
+        if not self.keeps_all or not self.best:
+            self.champion = self.alive[0]
+            return self.champion
+        last = self.alive[0] if self.alive else None
+        self.champion = max(self.best, key=lambda i: (self.best[i], i == last, -i))
+        return self.champion
 
     def drop(self, idx: int) -> None:
         """Take a configuration out of the race at any time, probed this round or not (a manual drop). The race goes
@@ -308,14 +388,25 @@ class RaceSchedule:
                                  "steps": {self.names[i]: self.steps.get(i) for i in self.alive},
                                  "dropped": self.names[idx], "manual": True})
             self.round += 1
-            self.scores, self.steps = {}, {}
+            self.scores, self.steps, self.left = {}, {}, {}
             self.pending = list(self.alive)
+            self.members = list(self.alive)
 
     def state(self) -> dict:
+        if self.champion is not None:
+            winner = self.names[self.champion]
+        else:
+            winner = self.names[self.alive[0]] if self.done and not self.keeps_all else None
         return {"names": self.names, "warmup": self.warmup, "round": self.round, "alive": [self.names[i] for i in
                 self.alive], "dropped": {self.names[i]: r for i, r in self.dropped.items()},
                 "manual": [self.names[i] for i in sorted(self.manual)],
-                "history": self.history, "winner": self.names[self.alive[0]] if self.done else None}
+                "stale": [self.names[i] for i in sorted(self.stale)],
+                "finished": [self.names[i] for i in sorted(self.finished)],
+                "drop_lowest": self.drop_lowest, "patience": self.patience,
+                "best": {self.names[i]: b for i, b in self.best.items()},
+                "best_step": {self.names[i]: s for i, s in self.best_step.items()},
+                "last": self.names[self.alive[0]] if self.done and self.alive else None,
+                "history": self.history, "winner": winner}
 
 
 # ---------------------------------------------------------------- one configuration's LoRA and state
@@ -547,6 +638,18 @@ class RaceRun:
     @property
     def running(self) -> bool:
         return not self.schedule.done
+
+
+def describe_round(entry: dict, schedule: RaceSchedule) -> str:
+    """A round for the log: "2: a 41.0%, b 38.5% -> b is out" (with who left on patience or finished their steps)."""
+    fmt = ", ".join(f"{n} {'n/a' if s is None else f'{s:.1f}%'}" for n, s in entry["scores"].items())
+    why = {"patience": f"out after {schedule.patience} probes without improvement", "finished": "finished its steps"}
+    parts = [f"{n} {why[w]}" for n, w in (entry.get("left") or {}).items()]
+    if entry.get("dropped"):
+        parts.append(f"{entry['dropped']} is out (lowest)")
+    elif schedule.drop_lowest and entry["round"] <= schedule.warmup:
+        parts.append("warm-up: nobody is dropped")
+    return f"{entry['round']}: {fmt}" + (f" -> {'; '.join(parts)}" if parts else "")
 
 
 def write_report(path, schedule: RaceSchedule, variants: list[Variant], extra: dict | None = None) -> None:

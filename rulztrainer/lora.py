@@ -746,11 +746,13 @@ def load_lora_weights(injected: dict[str, LoRALinear], path) -> int:
 # ---------------------------------------------------------------- extra (sampling-only) LoRAs
 
 
-def parse_comfy_lora(state: dict[str, torch.Tensor], default_alpha: float | None = None) -> dict[str, tuple]:
+def parse_comfy_lora(state: dict[str, torch.Tensor], default_alpha: float | None = None,
+                     alpha_pattern: dict | None = None) -> dict[str, tuple]:
     """Return {module_name: (kind, first, second, scale)} from a ComfyUI/PEFT-style LoRA file or a LyCORIS LoKr
-    file: ("lora", down, up, scale) or ("lokr", w1, w2, scale). Fused qkv is split. default_alpha: the alpha for
-    LoRA entries without an .alpha tensor (PEFT files keep it in their metadata). LoKr factors are rebuilt from
-    their low-rank parts (w_a @ w_b x alpha / rank) when a file stores them that way; Tucker (lokr_t2) is not read."""
+    file: ("lora", down, up, scale) or ("lokr", w1, w2, scale). Fused qkv is split. default_alpha / alpha_pattern:
+    the alpha for LoRA entries without an .alpha tensor (PEFT files keep it in their metadata: lora_alpha, and per
+    module where it differs). LoKr factors are rebuilt from their low-rank parts (w_a @ w_b x alpha / rank) when a
+    file stores them that way; Tucker (lokr_t2) is not read."""
     out: dict[str, tuple] = {}
     stems = set()
     for k in state:
@@ -786,10 +788,10 @@ def parse_comfy_lora(state: dict[str, torch.Tensor], default_alpha: float | None
         if down is None or up is None:
             continue
         rank = down.shape[0]
-        alpha = state.get(f"{stem}.alpha")
-        alpha = float(alpha) if alpha is not None else default_alpha
-        scale = (alpha / rank) if alpha is not None else 1.0
         name = _module_name(stem)
+        alpha = state.get(f"{stem}.alpha")
+        alpha = float(alpha) if alpha is not None else (alpha_pattern or {}).get(name, default_alpha)
+        scale = (float(alpha) / rank) if alpha is not None else 1.0
         down, up = down.float(), up.float()
         if name.endswith(".proj.qkv"):
             for n, part in zip("qkv", up.chunk(3, 0)):
@@ -826,7 +828,8 @@ def attach_extra_lora(model: nn.Module, path: str, strength: float = 1.0,
     if convert is not None:
         state = convert(state)
     peft_meta = read_peft_metadata(path)
-    entries = parse_comfy_lora(state, default_alpha=peft_meta.get("lora_alpha"))
+    entries = parse_comfy_lora(state, default_alpha=peft_meta.get("lora_alpha"),
+                               alpha_pattern=peft_meta.get("alpha_pattern"))
     biases = parse_bias_diffs(state)
     names = {n for n, _ in model.named_modules()}
 

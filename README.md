@@ -56,6 +56,18 @@ every one on the page. The wizard edits the same settings as the **Train** tab, 
 topic, with rarely changed ones folded under *Advanced*. *Start training*, *Stop* and *Kill* sit in the bar at the
 bottom of the Train and Monitor tabs.
 
+**Race wizard.** For a character, the wizard's first page also asks *One run* or *Race several setups*. A race sets
+up the base racer on the usual pages, then adds two:
+
+- **Racers:** how many (2-8), which settings may differ (any setting a race configuration may change: learning rate,
+  LoRA rank, adapter, self-training, seed...), then one card per racer with a field for each, filled in with the base
+  value. Only what you change is written into that racer's row; the rest follows the base setup.
+- **Race rules:** whether the lowest racer leaves after each round and after how many warm-up rounds, and whether a
+  racer leaves when it stops improving and after how many probes, with the race's cost in training steps.
+
+The review then offers *Start the race*, or *Adjust in all settings* to fine-tune it on the Train tab (its
+Configuration race section holds the same rows).
+
 The WebUI has a dark look (the default) and a light one. The first time you open it in a browser it asks which one
 you want (*Choose your look*); the sun / moon button at the top right switches between them at any time. The choice
 is kept per browser (its local storage).
@@ -833,6 +845,75 @@ Samples tab show only the normalized scores (the log and `likeness.jsonl` keep t
 In a race, the Monitor and the Samples tab put the same generation (step, prompt or probe kind, seed) of every
 configuration side by side in one row. Earlier runs' `likeness.jsonl` keep their raw combined scores.
 
+## Likeness-filtered self-training (`selftrain`)
+
+Partway through the steps the LoRA renders the subject over varied prompts; the pictures that pass a quality filter
+and look more like the person than the probes do train beside the photos, at a lower weight, for the rest of the run.
+It is reward-ranked fine-tuning (RAFT, Dong et al. 2023: sample, rank by a reward, fine-tune on the best) with the
+probes' likeness score as the reward, done inside the run: far cheaper than the reward stage below, but it learns only
+from the good pictures, not away from the bad ones. At each step of `selftrain_at` (fractions of the steps, `0.5`;
+`0.5,0.75` for two rounds):
+
+1. it renders `selftrain_images` (32) pictures with the weight average, cycling through `selftrain_prompts` (empty: the
+   reward stage's close-up, upper-body and full-body prompts from the trigger word), with the Previews' steps and
+   guidance (`sample_steps`, `sample_cfg`) at the largest training resolution, on new seeds each round;
+2. leaves out the pictures with several faces, no face (when the face counts), a face the detector is unsure of
+   (below 0.7) or the frame cuts off, and the ones far blurrier than the round's other pictures (variance of the
+   Laplacian below 0.4 x the round's median, at the training resolution; on the face when it is 64 px or larger there,
+   since a render's soft background is not blur, else on the whole picture). Renders are compared with renders: real
+   photos carry grain and texture a clean render never has, so against them every render looks soft;
+3. scores the rest like the probes (normalized face and body, combined with `face_weight` / `body_weight`) and keeps
+   those above both `selftrain_min_likeness` (60) and the probes' current smoothed score, best first, skipping
+   near-copies of a kept one (32 px thumbnails correlating above 0.95), up to `selftrain_share` (0.2) of the real
+   images (repeats counted);
+4. trains on them with their prompt as the caption at `selftrain_weight` (0.5) in place of the last round's pictures,
+   at every training resolution they are not upscaled to (region maps from their own face; no person masks).
+
+The pictures, every candidate's scores and why it was left out are in `<job>/selftrain/` (`selftrain.json`); a resumed
+run trains on with the last round's pictures. Not in a race. Training a model on its own output can amplify its own
+artifacts: LoRAs retrained on their outputs over several rounds lost quality visibly by the third (*Model Collapse in
+the Self-Consuming Chain of Diffusion Finetuning*, arXiv 2407.17493), which is why the rounds are few, replace each
+other and stay a small share. The scorer that picks the pictures is the probes' own, so judge the samples by eye too.
+
+## Seed soup (`soup_files`, `scripts/soup.py`)
+
+Train the same subject two or three times with different seeds (or keep a race's finalists, their `_best` files),
+then average what each changes in the model and save it as one LoRA: the "model soup" of Wortsman et al. (ICML 2022),
+whose greedy soup of fine-tuned models beat the best single one. What the runs agree on, likely the likeness, stays;
+what each learned on its own fades. Untested on this trainer: compare by eye too.
+
+- **What is averaged** is each layer's weight change (up @ down x alpha / rank; LoKr: kron(w1, w2)), never the
+  factors: two runs can reach the same change with entirely different factors. A layer one file does not change counts
+  as zero for it. LoRA and LoKr files of the same model (ComfyUI, PEFT or LyCORIS keys); OFT and DoRA change the
+  weights through the base weights, so they cannot be averaged from the files alone.
+- **Rank** (`soup_rank`, 32): the average of three rank-16 LoRAs has rank up to 48. `0` saves it exactly (LoRA files
+  only: the factors side by side); a rank keeps the directions the files share and drops the ones only one has (an
+  SVD, the full fine-tune's extraction). A LoKr changes nearly every direction of a layer, so a low rank keeps little
+  of it (16% at rank 32 for two LoKr factor-8 files on Krea 2): soup LoKr files at a high rank (128 or more), and
+  watch the energy share the log reports; every file is also scored through the same rank, so the comparison stays
+  fair.
+- **Strength:** where the files disagree the average is smaller than each of them, so a soup can act like a lower LoRA
+  strength. The strength is baked into the saved file.
+- **The report** says how much the files agree (the mean cosine between their changes), the soup's size against
+  theirs, and the share of the average kept at the rank.
+
+Two ways to make one (the Train tab's **Seed soup** section has both):
+
+- **Average now** (`python scripts/soup.py a.safetensors b.safetensors --out soup.safetensors --rank 32 [--weights
+  2,1] [--strength 1.1]`): every file, at strength 1, no probes; saved as `<job>_soup_plain.safetensors` from the
+  WebUI.
+- **Picked by the probes** (`soup_files: [a, b, c]` with `steps: 0`; the WebUI's *Pick the soup with the probes*
+  switch sets both): Start trains nothing. It probes the base model (the scale's zero), each file alone (the best one
+  also at every `soup_strengths`, 1.0, 1.15, 1.3, so a soup is never credited for a strength change), then adds the
+  others best-first, each at its best strength, keeping it only when the soup's probe score does not drop (the
+  greedy soup), and also scores the plain average of all for comparison. Saves `<job>_soup.safetensors` and
+  `soup/soup.json` (every trial's score, agreement and size). Uses the run's model, references and probe settings;
+  more `probe_seeds` give a steadier choice.
+
+Seed twins in one run: a race row may set its own `seed`, which gives it its own LoRA initialisation, image order and
+noise (the other rows keep sharing theirs); with `race_drop_lowest: false` every twin trains to the end and keeps its
+`_best` file.
+
 ## Likeness reward fine-tuning (`reward_steps`)
 
 An optional second stage after the regular steps that trains on likeness itself, after Flow-GRPO (Liu et al., NeurIPS
@@ -893,6 +974,18 @@ of them have been probed (a round), the one with the lowest smoothed combined pr
 own steps, so the race costs extra steps: with N configurations, W warm-up rounds and a probe every P steps,
 P x (W x N + N(N+1)/2 - 1) steps of racing before the winner continues alone (10 configurations, 2 warm-up rounds, a
 probe every 100 steps and 3000 steps: about 9300 steps in all, 3.1x one run; the WebUI shows the total).
+
+**Slow starters (`race_patience_drop`, `race_drop_lowest`).** Dropping the lowest each round cuts a setting that learns
+slowly but would end higher. With `race_patience_drop: true` a configuration leaves as soon as its own probes have not
+improved (by more than `likeness_noise_band`) for `race_patience` (3) probes in a row, whatever the others score, and
+the rest race on. `race_drop_lowest: false` stops the round drops altogether: every configuration trains all the steps
+(`steps` must be a multiple of `probe_every`) unless the patience drop ends it, at up to one full run per
+configuration. Either way the winner is decided at the end: the configuration whose best smoothed score was the highest
+at any point. Its best checkpoint becomes `<job>_best.safetensors` and its settings `<job>_winner.yaml`; the last one
+racing trains on to the end with the run's own file names (`<job>.safetensors`), and the log says when that is not the
+winner. A configuration that leaves on patience is saved as `<job>_<name>_dropped.safetensors`, one that finished its
+steps as `<job>_<name>_final.safetensors`, and each keeps its `<job>_<name>_best.safetensors`. Both work with the
+round drops on (`race_drop_lowest: true`), and in parallel races.
 
 **One configuration per GPU (`race_parallel: true`).** With `multi_gpu: data_parallel` on two or more GPUs, the
 configurations of a round train side by side instead of in turn: each GPU's model copy trains its own configuration

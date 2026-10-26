@@ -277,6 +277,81 @@ def test_manual_drop_mid_round_and_when_last_to_probe():
         R.RaceSchedule(["a", "b"], 0).drop(5)
 
 
+def test_patience_drops_each_one_when_it_stalls_and_the_best_ever_wins():
+    s = R.RaceSchedule(["a", "b", "c"], warmup=0, drop_lowest=False, patience=2, total_steps=100)
+    assert s.keeps_all
+    s.record(0, 30.0, 10, best=30.0, best_step=10, since_improve=0)
+    s.record(1, 20.0, 10, best=20.0, best_step=10, since_improve=0)
+    s.record(2, 10.0, 10, best=10.0, best_step=10, since_improve=0)
+    assert s.alive == [0, 1, 2] and s.history[0]["dropped"] is None  # behind is no reason to leave
+    s.record(0, 29.0, 20, best=30.0, best_step=10, since_improve=1)
+    s.record(1, 25.0, 20, best=25.0, best_step=20, since_improve=0)
+    s.record(2, 15.0, 20, best=15.0, best_step=20, since_improve=0)
+    assert s.record(0, 28.0, 30, best=30.0, best_step=10, since_improve=2) is None
+    assert s.just_dropped == [0] and s.alive == [1, 2] and s.stale == {0} and s.current == 1  # a leaves at once
+    s.record(1, 26.0, 30, best=26.0, best_step=30, since_improve=0)
+    s.record(2, 20.0, 30, best=20.0, best_step=30, since_improve=0)
+    assert s.history[-1]["left"] == {"a": "patience"} and s.history[-1]["scores"] == {"a": 28.0, "b": 26.0, "c": 20.0}
+    assert "a out after 2 probes without improvement" in R.describe_round(s.history[-1], s)
+    s.record(1, 25.0, 40, best=26.0, best_step=30, since_improve=1)
+    s.record(2, 24.0, 40, best=24.0, best_step=40, since_improve=0)
+    s.record(1, 24.0, 50, best=26.0, best_step=30, since_improve=2)  # b stalls too: c is the last one racing
+    assert s.done and s.alive == [2] and s.state()["winner"] is None and s.state()["last"] == "c"
+    # c trains on to the end; the winner is the highest best anyone reached, a's 30 unless c passes it
+    assert s.decide({2: 29.0}) == 0 and s.state()["winner"] == "a"
+    s.champion = None
+    assert s.decide({2: 30.0}) == 2  # a tie goes to the one that trained to the end
+
+
+def test_without_dropping_the_lowest_everyone_trains_all_the_steps():
+    s = R.RaceSchedule(["a", "b", "c"], warmup=0, drop_lowest=False, total_steps=20)
+    for step in (10, 20):
+        for i, score in enumerate((10.0, 30.0, 20.0)):
+            if not s.done:
+                s.record(i, score, step, best=score, best_step=step, since_improve=0)
+    assert s.finished == {0, 1} and s.alive == [2] and s.done  # c, the last, trains its own last turn on
+    assert s.history[-1]["left"] == {"a": "finished", "b": "finished"} and s.decide() == 1
+    assert R.estimate_steps(3, 0, 10, 20, drop_lowest=False)["total"] == 60
+
+
+def test_patience_and_lowest_drops_together():
+    s = R.RaceSchedule(["a", "b", "c"], warmup=0, patience=1)
+    s.record(0, 50.0, 10, best=50.0, since_improve=0)
+    s.record(1, 40.0, 10, best=40.0, since_improve=1)  # b stalls
+    assert s.just_dropped == [1]
+    assert s.record(2, 30.0, 10, best=30.0, since_improve=0) == 2  # and c is the round's lowest
+    assert s.just_dropped == [2] and s.done and s.alive == [0]
+
+
+def test_race_mode_checks():
+    race_cfg([{"name": "a"}, {"name": "b"}, {"name": "c"}], steps=10, race_drop_lowest=False).validate()
+    with pytest.raises(ValueError, match="multiple of probe_every"):
+        race_cfg([{"name": "a"}, {"name": "b"}], steps=45, race_drop_lowest=False).validate()
+    with pytest.raises(ValueError, match="race_patience"):
+        race_cfg([{"name": "a"}, {"name": "b"}], race_patience_drop=True, race_patience=0).validate()
+
+
+def test_trainer_decides_the_winner_at_the_end(tmp_path):
+    from types import SimpleNamespace
+
+    from rulztrainer import trainer as T
+
+    sched = R.RaceSchedule(["a", "b"], 0, drop_lowest=False, patience=1, total_steps=40)
+    sched.record(0, 50.0, 10, best=50.0, best_step=10, since_improve=0)
+    sched.record(1, 40.0, 10, best=40.0, best_step=10, since_improve=0)
+    sched.record(0, 45.0, 20, best=50.0, best_step=10, since_improve=1)  # a stalls: b races on alone
+    base = race_cfg([{"name": "a"}, {"name": "b"}], job_name="job")
+    ctl = {0: SimpleNamespace(best=50.0, best_step=10), 1: SimpleNamespace(best=44.0, best_step=40)}
+    variants = [SimpleNamespace(name=n, idx=i, cfg=base, state={"controller": ctl[i]}) for i, n in enumerate("ab")]
+    (tmp_path / "job_a_best.safetensors").write_bytes(b"a")
+    (tmp_path / "job_best.safetensors").write_bytes(b"b")  # the last one's, kept after the race
+    fake = SimpleNamespace(job_dir=tmp_path, race=SimpleNamespace(schedule=sched, variants=variants, base_cfg=base))
+    fake._race_report = lambda: None
+    T.Trainer._race_decide(fake)
+    assert sched.champion == 0 and (tmp_path / "job_best.safetensors").read_bytes() == b"a"
+    assert (tmp_path / "job_winner.yaml").exists() and sched.state()["winner"] == "a"
+
+
 def test_trainer_reads_the_drop_request(tmp_path):
     from types import SimpleNamespace
 

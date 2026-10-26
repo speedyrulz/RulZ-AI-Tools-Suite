@@ -1059,7 +1059,7 @@ class Form:
             save_state_every=int(v("save_state_every")), keep_states=int(v("keep_states")),
             compile_model=v("compile_model"), sample_seed=int(v("sample_seed")),
             sample_walk_seed=bool(v("sample_walk_seed")), sample_before_training=bool(v("sample_before_training")),
-            steps=int(v("steps")), batch_size=int(v("batch_size")),
+            steps=0 if v("soup_run") else int(v("steps")), batch_size=int(v("batch_size")),
             gradient_accumulation=int(v("gradient_accumulation")), learning_rate=float(v("learning_rate")),
             optimizer=v("optimizer"), lr_scheduler=v("lr_scheduler"), warmup_steps=int(v("warmup_steps")),
             max_grad_norm=float(v("max_grad_norm")), timestep_sampling=v("timestep_sampling"),
@@ -1079,6 +1079,12 @@ class Form:
             reward_sample_steps=int(v("reward_sample_steps") or 0), reward_train_steps=int(v("reward_train_steps") or 4),
             reward_noise=float(v("reward_noise") or 0.7), reward_kl=float(v("reward_kl") or 0.0),
             reward_size=int(v("reward_size") or 0),
+            selftrain=bool(v("selftrain")), selftrain_at=s("selftrain_at") or "0.5",
+            selftrain_images=int(v("selftrain_images") or 32),
+            selftrain_min_likeness=float(v("selftrain_min_likeness") if v("selftrain_min_likeness") is not None
+                                         else 60.0),
+            selftrain_share=float(v("selftrain_share") or 0.2), selftrain_weight=float(v("selftrain_weight") or 0.5),
+            selftrain_prompts=[p.strip() for p in (v("selftrain_prompts") or "").splitlines() if p.strip()],
             sample_width=aspect_size(v("sample_aspect"), v("sample_mp"))[0],
             sample_height=aspect_size(v("sample_aspect"), v("sample_mp"))[1],
             sample_steps=int(v("sample_steps")), sample_cfg=float(v("sample_cfg")),
@@ -1138,14 +1144,21 @@ class Form:
             crop_face_caption=v("crop_face_caption") or "", crop_bust_caption=v("crop_bust_caption") or "",
             crop_augment_weight=float(v("crop_augment_weight")),
             race=bool(v("race")), race_warmup_probes=int(v("race_warmup_probes") or 0),
+            race_drop_lowest=bool(v("race_drop_lowest")), race_patience_drop=bool(v("race_patience_drop")),
+            race_patience=int(v("race_patience") or 3),
             race_parallel=bool(v("race_parallel")),
             race_configs=self.w["race_configs"].value,
+            soup_files=([p.strip() for p in (v("soup_files") or "").splitlines() if p.strip()]
+                        if v("soup_run") else []),
+            soup_rank=int(v("soup_rank") or 0), soup_strengths=s("soup_strengths") or "1.0",
         )
 
     def from_config(self, cfg: TrainConfig) -> None:
         preset = next((k for k, v in MODEL_PRESETS.items() if v == cfg.model_path), CUSTOM)
         values = {**cfg.to_dict(), "model_preset": preset, "sample_prompts": "\n".join(cfg.sample_prompts),
                   "reward_prompts": "\n".join(cfg.reward_prompts),
+                  "selftrain_prompts": "\n".join(cfg.selftrain_prompts),
+                  "soup_files": "\n".join(cfg.soup_files), "soup_run": bool(cfg.soup_files),
                   "face_refs": "\n".join(cfg.face_refs), "body_refs": "\n".join(cfg.body_refs),
                   "model_source": FILE_SOURCE if cfg.model_source == "files" else HF_SOURCE}
         values["datasets"] = [{"path": sp.path, "resolutions": list(sp.resolutions), "repeats": sp.repeats}
@@ -1357,6 +1370,11 @@ body {
 .rz-rec.ok .q-icon { color: var(--rz-ok); }
 .rz-apply { background: var(--rz-red-soft); border: 1px solid rgba(255, 59, 48, .35); border-radius: 12px; padding: 10px 14px; }
 .rz-choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; width: 100%; }
+.rz-racers { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 14px; }
+.rz-racer {
+  background: var(--rz-surface-2); border: 1px solid var(--rz-border-strong); border-radius: 12px; padding: 14px;
+  gap: 6px;
+}
 .rz-choice {
   background: var(--rz-surface-2); border: 1px solid var(--rz-border-strong); border-radius: 12px; padding: 16px;
   cursor: pointer; transition: border-color .15s, background .15s; gap: 8px;
@@ -2516,6 +2534,71 @@ GOALS = {
                 "An object, outfit, pose or idea. Also the right pick when you are not sure."),
 }
 
+# The wizard's run modes: one run, or a configuration race of several racers built on the same base setup
+RUN_MODES = {
+    "single": ("play_circle", "One run",
+               "Train the setup on these pages once."),
+    "race": ("emoji_events", "Race several setups",
+             "Train a few versions of this setup side by side, each changing only what you assign it (a learning "
+             "rate, the adapter, a seed...), and let the likeness probes pick the winner."),
+}
+
+# names for the settings a racer may change (the rest show their config name)
+RACE_LABELS = {
+    "learning_rate": "Learning rate", "optimizer": "Optimizer", "weight_decay": "Weight decay",
+    "lr_scheduler": "Learning rate schedule", "warmup_steps": "Warm-up steps", "lora_plus_ratio": "LoRA+ ratio",
+    "lora_ema": "Weight average", "timestep_sampling": "Timestep sampling", "loss_weighting": "Loss weighting",
+    "region_weights": "Region-weighted loss", "face_loss_weight": "Face loss weight",
+    "body_loss_weight": "Body loss weight", "background_loss_weight": "Background loss weight",
+    "id_loss_weight": "Identity loss weight", "attn_localize": "Trigger attention on the subject",
+    "attn_localize_weight": "Trigger attention weight", "id_align": "Identity alignment",
+    "id_align_weight": "Identity alignment weight", "body_align": "Body alignment",
+    "body_align_weight": "Body alignment weight", "likeness_curriculum": "Face/body curriculum",
+    "likeness_lr_control": "Likeness lr control", "loss_watch": "Per-image loss watch",
+    "per_image_lr": "Per-image learning rate", "lora_rank": "LoRA rank", "lora_alpha": "LoRA alpha",
+    "lora_targets": "LoRA layers", "lora_blocks": "LoRA blocks", "lora_dropout": "LoRA dropout",
+    "network_type": "Adapter type", "lokr_factor": "LoKr factor", "oft_block_size": "OFT block size",
+    "oft_constraint": "OFT constraint", "dora": "DoRA", "caption_dropout": "Caption dropout",
+    "flip_augment": "Flip augment", "crop_augment": "Close-up crops", "crop_augment_weight": "Crop weight",
+    "look_warmup": "Look warm-up", "selftrain": "Self-training", "selftrain_at": "Self-training at",
+    "selftrain_images": "Self-training pictures", "selftrain_min_likeness": "Self-training likeness floor",
+    "selftrain_share": "Self-training share", "selftrain_weight": "Self-training weight", "seed": "Seed",
+}
+
+
+def race_choice_options() -> dict[str, str]:
+    """{setting: "group: name"} of everything a racer may change, for the wizard's picker."""
+    from rulztrainer.race import RACE_KEYS
+
+    return {k: f"{group}: {RACE_LABELS.get(k, k)}" for group, keys in RACE_KEYS.items() for k in keys}
+
+
+def race_value_text(key: str, value) -> str:
+    """A setting's value as a racer's text box shows it (the race rows' own notation)."""
+    from rulztrainer import race
+
+    return race.format_overrides({key: value}).split("=", 1)[1]
+
+
+def race_review_line(cfg: TrainConfig) -> str:
+    """The review's race row: the racers and what each changes, and how racers leave."""
+    from rulztrainer import race
+
+    rows = race.variant_configs(cfg)
+    racers = "; ".join(f"{n}: {race.format_overrides(o) or 'the base setup'}" for n, _, o in rows)
+    rules = []
+    if cfg.race_drop_lowest:
+        rules.append("the lowest leaves after each round" + (f" (after {cfg.race_warmup_probes} warm-up rounds)"
+                                                             if cfg.race_warmup_probes else ""))
+    else:
+        rules.append("nobody is dropped for being behind")
+    if cfg.race_patience_drop:
+        rules.append(f"a racer leaves after {cfg.race_patience} probes without improvement")
+    if cfg.race_patience_drop or not cfg.race_drop_lowest:
+        rules.append("the best score at any point wins")
+    return f"{len(rows)} racers ({racers}); " + ", ".join(rules)
+
+
 # Character / person: how much of the person the likeness covers. Face focus is the identity recipe as it is; the
 # others move the scoring (face / body share of the combined score) and the loss weights (face region / person region)
 # toward the face or toward the body.
@@ -2854,6 +2937,10 @@ def extra_review_rows(cfg: TrainConfig) -> list[tuple[str, str]]:
         options.append(f"identity alignment ({cfg.id_align_weight:g})")
     if cfg.body_align:
         options.append(f"body alignment ({cfg.body_align_weight:g})")
+    if cfg.selftrain:
+        options.append(f"self-training at {cfg.selftrain_at} of the steps (x{cfg.selftrain_weight:g})")
+    if cfg.soup_files:
+        options.append(f"no training: a seed soup of {len(cfg.soup_files)} LoRAs picked by the probes")
     if cfg.reward_steps:
         options.append(f"then {cfg.reward_steps} likeness reward steps")
     if cfg.look_warmup:
@@ -2864,6 +2951,11 @@ def extra_review_rows(cfg: TrainConfig) -> list[tuple[str, str]]:
         options.append(f"newest {cfg.keep_checkpoints} checkpoints kept")
     if options:
         rows.append(("Options", ", ".join(options)))
+    if cfg.race:
+        try:
+            rows.append(("Race", race_review_line(cfg)))
+        except ValueError as e:
+            rows.append(("Race", f"cannot read the racers: {e}"))
     return rows
 
 
@@ -3022,7 +3114,9 @@ class Wizard:
 
     STEPS = (("goal", "Goal", "flag"), ("model", "Model", "model_training"), ("hardware", "Hardware", "memory"),
              ("dataset", "Dataset", "photo_library"), ("training", "Training", "school"),
-             ("samples", "Samples", "image"), ("review", "Review & start", "rocket_launch"))
+             ("samples", "Samples", "image"), ("racers", "Racers", "groups"), ("rules", "Race rules", "emoji_events"),
+             ("review", "Review & start", "rocket_launch"))
+    RACE_STEPS = ("racers", "rules")  # shown only when the run is a race
 
     def __init__(self, f: Form, gpus: list[str], start, goto):
         self.f, self.w = f, f.w
@@ -3040,7 +3134,14 @@ class Wizard:
         self.goal_cards: dict[str, ui.card] = {}
         self.focus_cards: dict[str, ui.card] = {}
         self.model_cards: dict[str, ui.card] = {}
+        self.mode_cards: dict[str, ui.card] = {}
         self.steps: dict[str, ui.step] = {}
+        # the race: how many racers, the settings they may differ in, and each racer's name and assigned values
+        # (a value only once it is assigned: the others follow the base setup on the earlier pages)
+        self.n_racers = 2
+        self.race_keys: list[str] = ["learning_rate"]
+        self.racer_vals: list[dict] = []
+        self.racers_loaded = False  # the Train tab's race rows were read in once
 
     # ------------------------------------------------------------ building blocks
 
@@ -3090,9 +3191,19 @@ class Wizard:
     def nav(self, back: bool = True):
         with ui.stepper_navigation():
             if back:
-                ui.button("Back", icon="arrow_back", on_click=self.stepper.previous).props("flat")
+                ui.button("Back", icon="arrow_back", on_click=lambda: self.move(-1)).props("flat")
             ui.space()
-            ui.button("Next", on_click=self.stepper.next).props("unelevated icon-right=arrow_forward")
+            ui.button("Next", on_click=lambda: self.move(1)).props("unelevated icon-right=arrow_forward")
+
+    def racing(self) -> bool:
+        return bool(self.w["race"].value)
+
+    def move(self, d: int):
+        """The next / previous step, skipping the race steps when the run is not a race."""
+        names = [n for n, _, _ in self.STEPS if self.racing() or n not in self.RACE_STEPS]
+        cur = self.stepper.value if isinstance(self.stepper.value, str) else names[0]
+        i = names.index(cur) if cur in names else 0
+        self.stepper.value = names[max(0, min(len(names) - 1, i + d))]
 
     def heading(self, title: str, text: str):
         ui.label(title).classes("rz-step-title")
@@ -3122,6 +3233,9 @@ class Wizard:
         self.mark_focus()
         for box, when in self.conditional:
             box.visible = bool(when())
+        if self.racing():
+            self.estimate_race()
+            self.check_race()
         self.recs = wizard_recommendations(cfg, self.goal, self.smi, self.data, self.focus)
         for key, row, icon, label, btn in self.rec_rows:
             rec = self.recs.get(key)
@@ -3149,6 +3263,9 @@ class Wizard:
     # ------------------------------------------------------------ steps
 
     def build(self):
+        names = [n for n, _, _ in self.STEPS]  # the race steps' headers, hidden while the run is not a race
+        ui.add_css(",\n".join(f".rz-norace .q-stepper__header > .q-stepper__tab:nth-child({names.index(n) + 1})"
+                             for n in self.RACE_STEPS) + " { display: none; }")
         with ui.column().classes("rz-page gap-4"):
             with card():
                 with ui.row().classes("w-full items-center gap-4"):
@@ -3167,8 +3284,10 @@ class Wizard:
                         getattr(self, f"step_{name}")()
         self.w["preset_toggle"].on_value_change(lambda e: self.sync_goal(e.value))
         self.w["model_preset"].on_value_change(lambda _: (self.mark_model(), self.refresh()))
+        self.w["race"].on_value_change(lambda _: (self.mark_race(), self.refresh()))
         self.mark_goal()
         self.mark_model()
+        self.mark_race()
         self.refresh()
         ui.timer(0.2, self.detect_gpus, once=True)
 
@@ -3180,6 +3299,11 @@ class Wizard:
             self.steps[n].props(add="done") if i < idx else self.steps[n].props(remove="done")
         if name == "dataset" and self.data is None and any(Path(p).is_dir() for p in self.w["datasets"].selected):
             await self.scan()
+        if name == "racers":
+            self.load_racers()
+            self.rebuild_racers()  # the base setup may have changed on the earlier pages
+        if name == "rules":
+            self.estimate_race()
         if name == "review":
             await self.render_review()
 
@@ -3212,6 +3336,21 @@ class Wizard:
                     c.on("click", lambda _, k=key: self.set_focus(k))
                     self.focus_cards[key] = c
         self.goal_note = ui.label("").classes("rz-banner info")
+        with ui.column().classes("w-full gap-2") as self.mode_box:
+            ui.label("One run, or a race?").classes("rz-setting-title")
+            with ui.element("div").classes("rz-choices"):
+                for key, (icon, title, text) in RUN_MODES.items():
+                    with ui.card().props("flat").classes("rz-choice") as c:
+                        with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                            ui.icon(icon).classes("rz-choice-icon")
+                            ui.label(title).classes("rz-setting-title")
+                            ui.space()
+                            ui.icon("check_circle").classes("rz-check")
+                        ui.label(text).classes("rz-hint")
+                    c.on("click", lambda _, k=key: self.set_mode(k))
+                    self.mode_cards[key] = c
+            hint("A race needs the likeness probes, so it is for a character / person. The next pages set up the "
+                 "base racer; then you pick the racers and the race's rules.")
         with self.setting(None, "Job name", "The name of this run. Checkpoints are saved as "
                                             "output/<job name>/<job name>_<step>.safetensors and the final LoRA as "
                                             "output/<job name>/<job name>.safetensors."):
@@ -3272,9 +3411,24 @@ class Wizard:
         else:
             self.goal_note.text = "Pick one to get recommendations that fit it."
 
+    def set_mode(self, mode: str):
+        self.w["race"].value = mode == "race"  # mark_race follows through the switch
+
+    def mark_race(self):
+        """The run-mode cards, the race steps and the review's start button."""
+        racing = self.racing()
+        for key, c in self.mode_cards.items():
+            c.classes(add="selected") if (key == "race") == racing else c.classes(remove="selected")
+        if hasattr(self, "stepper"):  # a step's header is drawn by the stepper: hidden by its position (CSS)
+            self.stepper.classes(remove="rz-norace") if racing else self.stepper.classes(add="rz-norace")
+        if hasattr(self, "start_btn"):
+            self.start_btn.text = "Start the race" if racing else "Start training"
+
     def mark_focus(self):
         """The focus cards."""
         character = self.goal == "character"
+        if hasattr(self, "mode_box"):
+            self.mode_box.visible = character
         if hasattr(self, "focus_box"):
             self.focus_box.visible = character
         for key, c in self.focus_cards.items():
@@ -3739,6 +3893,13 @@ class Wizard:
             self.bind(ui.number("Probe steps", min=1, precision=0), "probe_steps").classes("w-full")
         with self.setting("probe_cfg", "Probe guidance (CFG)", "Guidance for the probes.", show_if=is_identity):
             self.bind(ui.number("Probe CFG", min=0, step=0.5), "probe_cfg").classes("w-full")
+        with self.setting(None, "Self-training on its best pictures",
+                          "Halfway through, the LoRA draws about 30 pictures of your person in new scenes; the few "
+                          "that are clean, sharp and look more like them than the probes do train beside your photos "
+                          "for the rest of the run, at half weight and never more than a fifth of them. Cheap (a few "
+                          "minutes), but it can copy the model's own flaws: judge the samples by eye. Not yet "
+                          "measured: race it.", show_if=is_identity):
+            self.bind(ui.switch("Self-train on its best pictures"), "selftrain")
         with self.setting(None, "Second stage: likeness reward fine-tuning",
                           "After the steps, the LoRA renders groups of pictures of new prompts, the probes rate how "
                           "much each looks like your person, and the LoRA learns to make the better ones more likely. "
@@ -3760,6 +3921,199 @@ class Wizard:
         if replaced:
             ui.notify("Replaced the sample prompts with suggestions")
 
+    # ---- race: the racers
+    def step_racers(self):
+        self.heading("The racers", "Every racer starts from the setup on the earlier pages, the base racer, and "
+                                   "changes only what you assign it below. They train in turn on the same images and "
+                                   "probes, and the likeness probes pick the winner.")
+        with self.setting(None, "How many racers",
+                          "Each racer trains up to the full steps, so every one adds to the time (the rules page "
+                          "shows the total). Two to four is a good race."):
+            self.racer_count = ui.number("Racers", value=self.n_racers, min=2, max=8, precision=0) \
+                .classes("w-full")
+            self.racer_count.on_value_change(lambda e: self.set_racer_count(e.value))
+        with self.setting(None, "What differs between them",
+                          "Pick the settings the racers may change; each racer below gets a field for each, filled "
+                          "in with the base value. Common picks: learning rate, LoRA rank, adapter type, or seed (the "
+                          "same setup trained twice, for a seed soup). Everything else stays the same for all."):
+            self.race_picker = ui.select(race_choice_options(), multiple=True, value=list(self.race_keys),
+                                         label="Settings", with_input=True).props("use-chips").classes("w-full")
+            self.race_picker.on_value_change(lambda e: self.set_race_keys(e.value))
+        self.racer_grid = ui.element("div").classes("rz-racers w-full")
+        self.race_check = ui.label("").classes("rz-banner info")
+        self.nav()
+
+    def load_racers(self):
+        """Read the Train tab's race rows in once (a loaded config, or rows typed there)."""
+        if self.racers_loaded:
+            return
+        self.racers_loaded = True
+        rows = self.w["race_configs"].value or []
+        if len(rows) < 2:
+            return
+        from rulztrainer import race
+
+        self.n_racers = len(rows)
+        keys = []
+        for r in rows:
+            keys += [k for k in race.row_overrides(r) if k not in keys and k in race.ALLOWED]
+        self.race_keys = keys or self.race_keys
+        self.racer_vals = [{"name": str(r.get("name") or f"r{i + 1}"),
+                            **{k: v for k, v in race.row_overrides(r).items() if k in race.ALLOWED}}
+                           for i, r in enumerate(rows)]
+        self.racer_count.value = self.n_racers
+        self.race_picker.value = list(self.race_keys)
+
+    def set_racer_count(self, n):
+        try:
+            self.n_racers = max(2, min(8, int(n or 2)))
+        except (TypeError, ValueError):
+            return
+        self.rebuild_racers()
+
+    def set_race_keys(self, keys):
+        self.race_keys = list(keys or [])
+        self.rebuild_racers()
+
+    def rebuild_racers(self):
+        """One card per racer: its name and a field for every setting it may change (the base value until set)."""
+        try:
+            base = self.f.to_config()
+        except (TypeError, ValueError):
+            return
+        while len(self.racer_vals) < self.n_racers:
+            i = len(self.racer_vals)
+            self.racer_vals.append({"name": "base" if i == 0 else f"r{i + 1}"})
+        del self.racer_vals[self.n_racers:]
+        self.racer_grid.clear()
+        with self.racer_grid:
+            for i, vals in enumerate(self.racer_vals):
+                with ui.card().props("flat").classes("rz-racer"):
+                    name = ui.input("Racer name", value=vals.get("name", f"r{i + 1}")).classes("w-full")
+                    name.on_value_change(lambda e, v=vals: (v.__setitem__("name", (e.value or "").strip()),
+                                                            self.write_race()))
+                    for key in self.race_keys:
+                        self.racer_field(key, vals, base)
+                    if not self.race_keys:
+                        ui.label("The base setup").classes("rz-hint")
+        self.write_race()
+
+    def racer_field(self, key: str, vals: dict, base: TrainConfig):
+        """A racer's control for one setting: a switch, the Train tab's choices, or a text box (numbers, lists)."""
+        from rulztrainer.race import _value
+
+        label = RACE_LABELS.get(key, key)
+        base_v = getattr(base, key)
+        cur = vals.get(key, base_v)
+
+        def set_v(value, v=vals):
+            v[key] = value
+            self.write_race()
+
+        form = self.w.get(key)
+        if isinstance(base_v, bool):
+            ui.switch(label, value=bool(cur), on_change=lambda e: set_v(bool(e.value)))
+        elif isinstance(form, ui.select) and not isinstance(base_v, list):
+            ui.select(form.options, value=cur if cur in (form.options or {}) else base_v, label=label,
+                      on_change=lambda e: set_v(e.value)).classes("w-full")
+        else:
+            ui.input(label, value=race_value_text(key, cur),
+                     on_change=lambda e: set_v(_value(e.value or ""))).classes("w-full") \
+                .tooltip(f"Base: {race_value_text(key, base_v)}")
+
+    def write_race(self):
+        """The racers into the Train tab's race rows (only what differs from the base), then check them."""
+        try:
+            base = self.f.to_config()
+        except (TypeError, ValueError):
+            return
+        rows = []
+        for i, vals in enumerate(self.racer_vals):
+            over = {k: vals[k] for k in self.race_keys if k in vals and not _same(vals[k], getattr(base, k))}
+            rows.append({"name": vals.get("name") or f"r{i + 1}", **over})
+        self.w["race_configs"].value = rows
+        self.check_race()
+
+    def check_race(self):
+        if not hasattr(self, "race_check"):
+            return
+        try:
+            cfg = self.f.to_config()
+            from rulztrainer import race
+
+            race.validate(cfg)
+        except (TypeError, ValueError) as e:
+            self.race_check.text = f"Not ready: {e}"
+            self.race_check.classes(replace="rz-banner warning")
+            return
+        same = len({race.format_overrides(r) for _, _, r in race.variant_configs(cfg)})
+        dup = same < len(self.racer_vals)
+        self.race_check.text = ("Two racers have the same settings: give each one something of its own." if dup else
+                                race_review_line(cfg))
+        self.race_check.classes(replace=f"rz-banner {'warning' if dup else 'info'}")
+
+    # ---- race: the rules
+    def step_rules(self):
+        self.heading("The race's rules", "When racers leave the race, and how the winner is chosen.")
+        with self.setting(None, "Drop the lowest racer after each round",
+                          "Every racer trains until its next probe, then the next one does; after a round the one "
+                          "with the lowest likeness score leaves. Fast and cheap, but a racer that learns slowly and "
+                          "would end higher can be cut early. Off: nobody is cut for being behind and every racer "
+                          "can train all the steps (up to one full run each; the steps must be a multiple of the "
+                          "probe interval)."):
+            self.bind(ui.switch("Drop the lowest after each round"), "race_drop_lowest")
+        with self.setting(None, "Warm-up probe rounds",
+                          "Rounds before the first racer is dropped: everyone gets a few probes to get going. 1-2 is "
+                          "plenty.", show_if=("race_drop_lowest", bool)):
+            self.bind(ui.number("Warm-up rounds", min=0, precision=0), "race_warmup_probes").classes("w-full")
+        with self.setting(None, "Drop a racer when it stops improving",
+                          "A racer leaves once its own probes have not improved for a number of probes in a row, "
+                          "however it compares with the others; the rest race on. Good with slow starters. With it, "
+                          "or without dropping the lowest, the winner is the racer whose score was highest at any "
+                          "point, and its best checkpoint becomes <job>_best.safetensors."):
+            self.bind(ui.switch("Drop a racer when it stops improving"), "race_patience_drop")
+        with self.setting(None, "After how many probes without improvement",
+                          "Probes in a row without a gain bigger than the noise band. 3 gives a racer a fair chance; "
+                          "lower ends the race sooner.", show_if=("race_patience_drop", bool)):
+            self.bind(ui.number("Probes", min=1, precision=0), "race_patience").classes("w-full")
+        with self.setting(None, "One racer per GPU at the same time",
+                          "With data parallel on 2+ GPUs: each GPU trains its own racer at once instead of all of "
+                          "them taking turns over every GPU. Not with the identity loss or self-training.",
+                          show_if=("multi_gpu", lambda x: x == "data_parallel")):
+            self.bind(ui.switch("One racer per GPU"), "race_parallel")
+        self.race_estimate = ui.label("").classes("rz-banner info")
+        for key in ("race_drop_lowest", "race_warmup_probes", "race_patience_drop", "race_patience"):
+            self.w[key].on_value_change(lambda _: self.estimate_race())
+        self.nav()
+
+    def estimate_race(self):
+        if not hasattr(self, "race_estimate"):
+            return
+        from rulztrainer import race
+
+        try:
+            cfg = self.f.to_config()
+        except (TypeError, ValueError):
+            return
+        n = len(cfg.race_configs or [])
+        if n < 2 or cfg.probe_every <= 0:
+            self.race_estimate.text = ("Pick at least two racers." if n < 2 else
+                                       "The race runs on the likeness probes: set a probe interval (Samples page).")
+            return
+        est = race.estimate_steps(n, cfg.race_warmup_probes, cfg.probe_every, cfg.steps, cfg.race_drop_lowest)
+        if cfg.race_drop_lowest:
+            text = (f"{n} racers: {est['rounds']} rounds and {est['probes']} probes, about {est['total']} training "
+                    f"steps in all ({est['ratio']:.1f}x one {cfg.steps}-step run)")
+            text += (f". Steps must be at least {est['race_own_steps']} for the race to finish."
+                     if cfg.steps < est["race_own_steps"] else ".")
+        else:
+            text = (f"{n} racers, nobody cut for being behind: at most {est['total']} training steps "
+                    f"({est['ratio']:.0f}x one run)" + (f". Steps must be a multiple of {cfg.probe_every}."
+                                                         if cfg.steps % cfg.probe_every else "."))
+        if cfg.race_patience_drop:
+            text += f" A racer leaves after {cfg.race_patience} probes without improvement."
+        self.race_estimate.text = text
+
     # ---- 7 review
     def step_review(self):
         self.heading("Review and start", "A last look at the run before it starts.")
@@ -3768,9 +4122,12 @@ class Wizard:
             self.cfg_path = ui.input("Save as", value="").classes("w-80 max-w-full")
             ui.button("Save config", icon="save", on_click=self.save).props("outline")
             ui.space()
-            ui.button("Start training", icon="play_arrow", on_click=self.start).props("unelevated size=lg")
+            ui.button("Adjust in all settings", icon="tune", on_click=lambda: self.goto("Train")).props("outline") \
+                .tooltip("The Train tab has every setting, already filled in from these pages")
+            self.start_btn = ui.button("Start the race" if self.racing() else "Start training", icon="play_arrow",
+                                       on_click=self.start).props("unelevated size=lg")
         with ui.stepper_navigation():
-            ui.button("Back", icon="arrow_back", on_click=self.stepper.previous).props("flat")
+            ui.button("Back", icon="arrow_back", on_click=lambda: self.move(-1)).props("flat")
 
     def save(self):
         try:
@@ -5301,6 +5658,33 @@ def build_page(local: bool = True):
                                                                           value=d.likeness_curriculum_strength,
                                                                           min=0, max=1, step=0.1).classes("w-28") \
                                 .bind_visibility_from(w["likeness_curriculum"], "value")
+                        with advanced("Likeness-filtered self-training"):
+                            hint("Partway through the steps the LoRA renders pictures of new prompts (Previews' steps "
+                                 "and guidance, the largest training resolution). Those with one confident, uncut "
+                                 "face, as sharp as your photos and not repeating each other, that score above both "
+                                 "the floor and the probes' smoothed score, train beside the photos at a lower weight; "
+                                 "each round replaces the last. Reward-ranked fine-tuning (RAFT) done inside the run: "
+                                 "cheap, but it trains on the model's own output, so keep the share small and judge "
+                                 "the samples by eye. The pictures and their scores are in <job>/selftrain.")
+                            with fields():
+                                w["selftrain"] = ui.switch("Self-train on its best pictures", value=d.selftrain)
+                                w["selftrain_at"] = ui.input("At (fractions of the steps)", value=d.selftrain_at) \
+                                    .classes("w-48").tooltip("e.g. 0.5, or 0.5, 0.75 for two rounds")
+                                w["selftrain_images"] = ui.number("Pictures per round", value=d.selftrain_images,
+                                                                  min=1, max=256, precision=0).classes("w-40")
+                            with fields():
+                                w["selftrain_min_likeness"] = ui.number("Likeness floor", value=d.selftrain_min_likeness,
+                                                                        step=5).classes("w-36") \
+                                    .tooltip("On the probes' scale (0 = a stranger, 100 = the references). A picture "
+                                             "must also beat the probes' current smoothed score.")
+                                w["selftrain_share"] = ui.number("Most, as a share of the photos",
+                                                                 value=d.selftrain_share, min=0.01, max=1,
+                                                                 step=0.05).classes("w-56")
+                                w["selftrain_weight"] = ui.number("Loss weight", value=d.selftrain_weight, min=0.05,
+                                                                  max=1, step=0.05).classes("w-32")
+                            w["selftrain_prompts"] = ui.textarea("Self-training prompts (one per line; empty = the "
+                                                                 "reward stage's varied close-up, upper-body and "
+                                                                 "full-body prompts)").classes("w-full")
                         with advanced("Second stage: likeness reward fine-tuning"):
                             hint("After the steps, the LoRA renders groups of pictures of new prompts, the probes' "
                                  "scorers rate their likeness, and a policy-gradient update (Flow-GRPO) makes the "
@@ -5365,9 +5749,25 @@ def build_page(local: bool = True):
                              "else on this page is shared. Needs the likeness probes above.")
                         with fields():
                             w["race"] = ui.switch("Race these configurations", value=d.race)
+                            w["race_drop_lowest"] = ui.switch("Drop the lowest after each round",
+                                                              value=d.race_drop_lowest) \
+                                .tooltip("Off: nobody is dropped for being behind; every configuration trains all the "
+                                         "steps (unless the patience drop below ends it) and the winner is the highest "
+                                         "score any of them reached. Costs up to one full run per configuration.")
                             w["race_warmup_probes"] = ui.number("Warm-up probe rounds (nobody is dropped)",
                                                                 value=d.race_warmup_probes, min=0, precision=0) \
-                                .classes("w-72")
+                                .classes("w-72").bind_visibility_from(w["race_drop_lowest"], "value")
+                        with fields():
+                            w["race_patience_drop"] = ui.switch("Drop each one when it stops improving",
+                                                                value=d.race_patience_drop) \
+                                .tooltip("A configuration leaves once its own probes have not improved (by more than "
+                                         "the noise band) for this many in a row; the others race on. A setting that "
+                                         "learns slowly but ends higher is not cut for being behind. The winner is the "
+                                         "configuration whose best smoothed score was the highest at any point: its "
+                                         "best checkpoint becomes <job>_best.safetensors.")
+                            w["race_patience"] = ui.number("Probes without improvement", value=d.race_patience,
+                                                           min=1, precision=0).classes("w-56") \
+                                .bind_visibility_from(w["race_patience_drop"], "value")
                             w["race_parallel"] = ui.switch("One configuration per GPU at the same time",
                                                           value=d.race_parallel) \
                                 .bind_visibility_from(w["multi_gpu"], "value", lambda x: x == "data_parallel") \
@@ -5394,19 +5794,31 @@ def build_page(local: bool = True):
                                 race_summary.text = ("Add at least two configurations." if len(rows) < 2 else
                                                      "Set 'Probe every N steps' above: the race runs on the probes.")
                                 return
-                            est = race.estimate_steps(len(rows), warmup, every, steps)
+                            lowest = bool(w["race_drop_lowest"].value)
+                            est = race.estimate_steps(len(rows), warmup, every, steps, lowest)
+                            patience = (f" A configuration leaves after {int(w['race_patience'].value or 0)} probes "
+                                        "without improvement; the winner is the best score anyone reached."
+                                        if w["race_patience_drop"].value else "")
+                            if not lowest:
+                                race_summary.text = (
+                                    f"{len(rows)} configurations, nobody dropped for being behind: each trains up to "
+                                    f"{steps} steps, at most {est['total']} training steps in all "
+                                    f"({est['ratio']:.0f}x the run)." + patience
+                                    + (f" Steps must be a multiple of {every}." if steps % every else ""))
+                                return
                             race_summary.text = (
                                 f"{len(rows)} configurations: {est['rounds']} rounds and {est['probes']} probes, about "
                                 f"{est['total']} training steps in all ({est['ratio']:.1f}x the {steps}-step run)"
                                 + (f". Steps must be at least {est['race_own_steps']} for the race to finish."
-                                   if steps < est["race_own_steps"] else "."))
+                                   if steps < est["race_own_steps"] else ".") + patience)
 
                         w["race_configs"] = RaceRows(on_change=race_summary_update)
                         w["race_configs"].value = d.race_configs
                         with ui.row().classes("items-center gap-2"):
                             ui.button("Add configuration", icon="add",
                                       on_click=lambda: w["race_configs"].add()).props("outline")
-                        for key in ("steps", "probe_every", "race_warmup_probes"):
+                        for key in ("steps", "probe_every", "race_warmup_probes", "race_drop_lowest",
+                                    "race_patience_drop", "race_patience"):
                             w[key].on_value_change(lambda _: race_summary_update())
                         with advanced("What a configuration may change"):
                             from rulztrainer.race import RACE_KEYS
@@ -5415,7 +5827,55 @@ def build_page(local: bool = True):
                                 ui.label(f"{group}: {', '.join(keys)}").classes("text-xs rz-mono")
                             hint('Lists in brackets (lora_targets=[q, k, v, o]); quote a value with a comma '
                                  '(lora_blocks="10-31,40"). Rank, layers and blocks may differ: each configuration '
-                                 'keeps its own LoRA.')
+                                 'keeps its own LoRA. A row with its own seed= starts from its own LoRA weights and '
+                                 'sees its own image order and noise: seed twins for a seed soup.')
+
+                    # ---- Seed soup
+                    with section("Seed soup", "Average finished LoRAs of one subject into one",
+                                 "blender", open_=False) as sec:
+                        nav_items.append(("Seed soup", "blender", sec))
+                        hint("Train the same subject two or three times with different seeds (or keep a race's "
+                             "finalists: their _best files), then average what each one changes in the model and "
+                             "save it as one LoRA: the model soup of Wortsman et al. (2022). What the runs agree on, "
+                             "likely the likeness, stays; what each learned on its own fades. LoRA and LoKr files of "
+                             "the same model; not OFT or DoRA. The average of LoRAs that disagree is weaker than "
+                             "each, so it is tried at a few strengths. Untested on this trainer: compare by eye too.")
+                        w["soup_files"] = ui.textarea("LoRA files (one per line)").props("autogrow") \
+                            .classes("w-full")
+                        with fields():
+                            w["soup_rank"] = ui.number("Rank (0 = exact)", value=d.soup_rank, min=0,
+                                                       precision=0).classes("w-40") \
+                                .tooltip("The average of three rank-16 LoRAs has rank up to 48. 0 keeps it exactly "
+                                         "(LoRA files only); a rank keeps the directions they share and drops the rest.")
+                            w["soup_strengths"] = ui.input("Strengths to try", value=d.soup_strengths) \
+                                .classes("w-48")
+                        soup_info = ui.label("").classes("text-sm")
+
+                        async def soup_now():
+                            from rulztrainer.soup import describe, make_soup
+
+                            files = [p.strip().strip('"') for p in (w["soup_files"].value or "").splitlines()
+                                     if p.strip()]
+                            cfg = f.to_config()
+                            out = cfg.job_dir() / f"{cfg.job_name}_soup_plain.safetensors"
+                            out.parent.mkdir(parents=True, exist_ok=True)
+                            soup_info.text = f"Averaging {len(files)} files..."
+                            try:
+                                rep = await run.io_bound(make_soup, files, out, int(w["soup_rank"].value or 0))
+                            except Exception as e:  # noqa: BLE001
+                                soup_info.text = f"Could not make the soup: {e}"
+                                return
+                            soup_info.text = f"{describe(rep)}. Saved {rep['out']}"
+
+                        with ui.row().classes("items-center gap-3"):
+                            ui.button("Average now (strength 1, no probes)", icon="blender",
+                                      on_click=soup_now).props("outline")
+                            w["soup_run"] = ui.switch("Pick the soup with the probes when I press Start") \
+                                .tooltip("Start then trains nothing: it probes each file alone (the best also at "
+                                         "every strength), then adds the others best-first, keeping each only if the "
+                                         "soup's probe score does not drop: the greedy soup. Saves "
+                                         "<job>_soup.safetensors and soup/soup.json. Uses this page's model, "
+                                         "references and probe settings; more probe seeds give a steadier choice.")
 
                 def jump(exp):
                     exp.value = True

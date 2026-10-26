@@ -357,6 +357,15 @@ class Trainer(RaceParallelMixin):
             from .reward import default_prompts
 
             cfg.reward_prompts = default_prompts(cfg.trigger_word, cfg.face_weight, cfg.body_weight)
+        try:
+            racing_selftrain = cfg.race and any(c.selftrain for _, c, _ in race_mod.variant_configs(cfg))
+        except ValueError:  # bad race rows: validate() says so
+            racing_selftrain = False
+        if (cfg.selftrain or racing_selftrain) and not cfg.selftrain_prompts:
+            from .reward import default_prompts
+
+            cfg.selftrain_prompts = default_prompts(cfg.trigger_word, cfg.face_weight, cfg.body_weight)
+        self.selftrain_steps: list[int] = []  # the steps a self-training round runs at (selftrain.py)
         self.trigger_pos: dict[str, list[int]] = {}
         self.face_embs: dict[str, torch.Tensor] = {}
         self.body_embs: dict[str, torch.Tensor] = {}
@@ -567,6 +576,8 @@ class Trainer(RaceParallelMixin):
             prompts += [p for p in (cfg.probe_face_prompt, cfg.probe_body_prompt) if p] + [self.negative_prompt()]
         if cfg.reward_steps > 0:
             prompts += list(cfg.reward_prompts) + [self.negative_prompt()]
+        if cfg.selftrain:
+            prompts += list(cfg.selftrain_prompts) + [self.negative_prompt()]
         need_latents = cfg.recache or any(
             not it.latent_path.exists() or (it.latent_flip_path and not it.latent_flip_path.exists()) for it in items)
         need_text = cfg.recache or not dropout_text_path(cfg).exists() or any(
@@ -832,7 +843,8 @@ class Trainer(RaceParallelMixin):
             for m, _, _ in self.replicas:
                 self._attach_sampling_loras(m)
         self._check_sample_settings()
-        if cfg.sample_prompts or cfg.probe_every > 0 or cfg.id_loss_weight > 0 or cfg.reward_steps > 0:
+        if cfg.sample_prompts or cfg.probe_every > 0 or cfg.id_loss_weight > 0 or cfg.reward_steps > 0 \
+                or cfg.selftrain or cfg.soup_files:
             self.vae = self.arch.get_vae(cfg, self.model_dir)
             self.face_scorer = self._make_face_scorer()
             self.body_scorer = self._make_body_scorer()
@@ -911,6 +923,11 @@ class Trainer(RaceParallelMixin):
             bind(self.race.active)
         if self.dp is not None:
             self.dp.sync_weights()
+        if cfg.selftrain:
+            self._selftrain_setup(step)
+        if cfg.soup_files:  # a greedy soup of finished LoRAs instead of training
+            self._soup_stage(model)
+            return
         if cfg.sample_prompts and cfg.sample_before_training and step == 0:
             self.sample_images(model, step)
         if self.controller is not None and cfg.probe_at_start and step == 0:
@@ -1207,7 +1224,9 @@ class Trainer(RaceParallelMixin):
                 self.sample_images(model, step)
                 model.train()
             racing = self._race_running()
-            if self.controller is not None and step % cfg.probe_every == 0 and (step < cfg.steps or racing):
+            final_too = self.race is not None and self.race.schedule.keeps_all  # scored at the end like the others
+            if self.controller is not None and step % cfg.probe_every == 0 and (step < cfg.steps or racing
+                                                                                 or final_too):
                 stop = self.run_probe(model, step, optimizer, scheduler, injected)
                 model.train()
                 if racing:  # the race decides who goes on: record, maybe drop, and switch configuration
@@ -1219,6 +1238,10 @@ class Trainer(RaceParallelMixin):
                              cfg.step_up_stop_patience if cfg.resolution_step_up else cfg.likeness_patience,
                              " at the highest resolution" if cfg.resolution_step_up else "", step)
                     break
+            rounds = self._selftrain_rounds(cfg)
+            if step in rounds:  # in a race, the configuration training now: its own setting and its own steps
+                self._self_train_round(model, step, rounds.index(step) + 1)
+                model.train()
             if self._race_running() and self._race_manual_drops(step, losses, id_losses):
                 bind(self.race.active)  # the configuration that trained was dropped: the next one takes over
                 model.train()
@@ -1238,6 +1261,7 @@ class Trainer(RaceParallelMixin):
         if cfg.sample_prompts:
             self.sample_images(model, step)
         if self.race is not None:
+            self._race_decide()
             self._race_report()
         if cfg.reward_steps > 0 and not self.stop_file.exists():
             path = self._reward_stage(model, injected, step) or path
@@ -1619,17 +1643,27 @@ class Trainer(RaceParallelMixin):
                                    attn_localize=any(r[1].attn_localize for r in rows),
                                    id_align=any(r[1].id_align for r in rows),
                                    body_align=any(r[1].body_align for r in rows),
+                                   selftrain=any(r[1].selftrain for r in rows),
                                    id_loss_weight=max(r[1].id_loss_weight for r in rows),
                                    likeness_curriculum=any(r[1].likeness_curriculum for r in rows))
         self.race_parallel = bool(cfg.race_parallel)
         if self.race_parallel:
             log.info("Race in parallel: one configuration per GPU at the same time; a lone one left over trains over "
                      "every GPU when that is faster, else on the first (no torch.compile, no identity loss)")
-        est = race_mod.estimate_steps(len(rows), cfg.race_warmup_probes, cfg.probe_every, cfg.steps)
-        log.info("Configuration race: %d configurations, %d warm-up probe round(s), a probe every %d steps: %d rounds "
-                 "and %d probes, about %d training steps in all (%.1fx one %d-step run)", len(rows),
-                 cfg.race_warmup_probes, cfg.probe_every, est["rounds"], est["probes"], est["total"], est["ratio"],
-                 cfg.steps)
+        est = race_mod.estimate_steps(len(rows), cfg.race_warmup_probes, cfg.probe_every, cfg.steps,
+                                      cfg.race_drop_lowest)
+        if cfg.race_drop_lowest:
+            log.info("Configuration race: %d configurations, %d warm-up probe round(s), a probe every %d steps: %d "
+                     "rounds and %d probes, about %d training steps in all (%.1fx one %d-step run)", len(rows),
+                     cfg.race_warmup_probes, cfg.probe_every, est["rounds"], est["probes"], est["total"], est["ratio"],
+                     cfg.steps)
+        else:
+            log.info("Configuration race without dropping the lowest: %d configurations, a probe every %d steps; each "
+                     "trains up to %d steps of its own, at most %d training steps in all (%.1fx one run)", len(rows),
+                     cfg.probe_every, cfg.steps, est["total"], est["ratio"])
+        if cfg.race_patience_drop:
+            log.info("Race: a configuration leaves after %d probes of its own without improvement; the winner is the "
+                     "highest smoothed score any configuration reached", cfg.race_patience)
         for name, _, over in rows:
             log.info("  %s: %s", name, race_mod.format_overrides(over) or "the run's own settings")
         return prep
@@ -1665,16 +1699,18 @@ class Trainer(RaceParallelMixin):
         variants = []
         for i, ((name, vcfg, over), (_, names)) in enumerate(zip(self.race_rows, self.race_layouts)):
             v = race_mod.Variant(i, name, vcfg, over, names)
-            v.init_lora(wrappers, base.seed)
+            v.init_lora(wrappers, vcfg.seed)  # the run's seed unless the row sets its own
             v.state["items"] = race_mod.variant_items(items, vcfg, self.race_region_dirs.get(name))
             v.state["controller"] = LikenessController(vcfg, **self._controller_ceilings())
             n_w = v.n_weights
             log.info("Race configuration %s: %d modules, %.2fM weights (%s), %d dataset items",
                      name, len(names), n_w / 1e6, v.label, len(v.state["items"]))
             variants.append(v)
-        est = race_mod.estimate_steps(len(variants), base.race_warmup_probes, base.probe_every, base.steps)
-        self.race = race_mod.RaceRun(variants, race_mod.RaceSchedule([v.name for v in variants],
-                                                                     base.race_warmup_probes), wrappers, base, est)
+        est = race_mod.estimate_steps(len(variants), base.race_warmup_probes, base.probe_every, base.steps,
+                                      base.race_drop_lowest)
+        sched = race_mod.RaceSchedule([v.name for v in variants], base.race_warmup_probes, base.race_drop_lowest,
+                                      base.race_patience if base.race_patience_drop else 0, base.steps)
+        self.race = race_mod.RaceRun(variants, sched, wrappers, base, est)
         if self.race_parallel:  # every configuration trains on its own parameters (race_parallel.py)
             self.race.active = variants[0]
         else:
@@ -1752,16 +1788,12 @@ class Trainer(RaceParallelMixin):
         round is complete, and switch to the configuration whose turn it is. Returns that configuration."""
         rr = self.race
         cur = rr.active
-        score = self.controller.combined_ema if self.controller is not None else None
         rounds = len(rr.schedule.history)
-        dropped = rr.schedule.record(cur.idx, score, self.controller.last_step if self.controller is not None else None)
+        self._race_record(cur, self.controller)
         if len(rr.schedule.history) > rounds:
-            entry = rr.schedule.history[-1]
-            fmt = ", ".join(f"{n} {'n/a' if s is None else f'{s:.1f}%'}" for n, s in entry["scores"].items())
-            log.info("Race round %d: %s%s", entry["round"], fmt,
-                     f" -> {entry['dropped']} is out" if entry["dropped"] else " (warm-up: nobody is dropped)")
-        if dropped is not None:
-            self._race_drop(rr.variants[dropped])
+            log.info("Race round %s", race_mod.describe_round(rr.schedule.history[-1], rr.schedule))
+        for i in rr.schedule.just_dropped:
+            self._race_drop(rr.variants[i])
         nxt = rr.variants[rr.schedule.current]
         if nxt is not cur:
             if cur.alive:
@@ -1772,6 +1804,44 @@ class Trainer(RaceParallelMixin):
             self._race_finish()
         self._race_report()
         return nxt
+
+    def _race_record(self, v, controller) -> None:
+        """Record a configuration's probe in the schedule: its smoothed score, its best and its probes since the best."""
+        c = controller
+        self.race.schedule.record(v.idx, c.combined_ema if c is not None else None,
+                                  c.last_step if c is not None else v.state.get("step"),
+                                  best=c.best if c is not None else None, best_step=c.best_step if c is not None else None,
+                                  since_improve=c.since_improve if c is not None else None)
+
+    def _race_decide(self) -> None:
+        """At the end of a race that keeps every configuration's chance (patience drops, or no lowest drops): the
+        winner is the highest best score any configuration reached. Its best checkpoint becomes <job>_best and its
+        settings <job>_winner.yaml."""
+        import shutil
+
+        rr = self.race
+        if rr is None or not rr.schedule.keeps_all or not rr.schedule.done or rr.schedule.champion is not None:
+            return
+        sched = rr.schedule
+        bests = {v.idx: v.state["controller"].best for v in rr.variants if v.state.get("controller") is not None}
+        steps = {v.idx: v.state["controller"].best_step for v in rr.variants if v.state.get("controller") is not None}
+        sched.best_step.update({i: s for i, s in steps.items() if bests.get(i) is not None})
+        win = rr.variants[sched.decide(bests)]
+        cfg = rr.base_cfg
+        last = rr.variants[sched.alive[0]] if sched.alive else None
+        best = self.job_dir / f"{cfg.job_name}_{win.name}_best.safetensors"
+        if win is not last and best.exists():
+            shutil.copyfile(best, self.job_dir / f"{cfg.job_name}_best.safetensors")
+        dataclasses.replace(win.cfg, race=False, race_configs=[], race_warmup_probes=0, race_patience_drop=False,
+                            race_drop_lowest=True).save(self.job_dir / f"{cfg.job_name}_winner.yaml")
+        fmt = lambda b: "n/a" if b is None else f"{b:.1f}%"  # noqa: E731
+        log.info("Race decided: %s wins with the best smoothed score %s at its step %s (%s); %s", win.name,
+                 fmt(sched.best.get(win.idx)), sched.best_step.get(win.idx),
+                 ", ".join(f"{v.name} {fmt(sched.best.get(v.idx))}" for v in rr.variants),
+                 f"its best checkpoint is {cfg.job_name}_best.safetensors" + (
+                     f" ({cfg.job_name}.safetensors is {last.name}'s, the last one racing)"
+                     if last is not None and win is not last else ""))
+        self._race_report()
 
     def _race_manual_drops(self, step: int, losses, id_losses) -> bool:
         """Drop the configurations the Monitor's Drop button asked for (RACE_DROP in the job folder, one name per
@@ -1813,7 +1883,9 @@ class Trainer(RaceParallelMixin):
     def _race_drop(self, v) -> None:
         """Save a dropped configuration's LoRA (its weight average when it has one) and free its state."""
         cfg = self.race.base_cfg
-        path = self.job_dir / f"{cfg.job_name}_{v.name}_dropped.safetensors"
+        sched = self.race.schedule
+        finished = v.idx in sched.finished
+        path = self.job_dir / f"{cfg.job_name}_{v.name}_{'final' if finished else 'dropped'}.safetensors"
         meta = {"ss_network_dim": str({"lokr": v.factor, "oft": v.block}.get(v.kind, v.rank)),
                 "ss_network_alpha": str({"lokr": 1.0, "oft": v.constraint}.get(v.kind, v.alpha)),
                 "modelspec.architecture":
@@ -1826,8 +1898,13 @@ class Trainer(RaceParallelMixin):
         else:
             lora_mod.save_lora(v.view(use_average=True), path, metadata=meta, dtype=cfg.lora_save_dtype,
                                fmt=self.arch.lora_format)
-        log.info("Race: %s dropped after round %d%s -> %s", v.name, self.race.schedule.dropped[v.idx],
-                 " (by hand)" if v.idx in self.race.schedule.manual else "", path.name)
+        why = (" (by hand)" if v.idx in sched.manual else
+               f" ({sched.patience} probes without improvement)" if v.idx in sched.stale else "")
+        if finished:
+            log.info("Race: %s finished its %d steps in round %d -> %s", v.name, v.state.get("step", 0),
+                     sched.dropped[v.idx], path.name)
+        else:
+            log.info("Race: %s dropped after round %d%s -> %s", v.name, sched.dropped[v.idx], why, path.name)
         if str(path) not in self.status.data["saved"]:
             self.status.data["saved"].append(str(path))
         v.alive = False
@@ -1849,9 +1926,15 @@ class Trainer(RaceParallelMixin):
         best = self.job_dir / f"{cfg.job_name}_{win.name}_best.safetensors"
         if best.exists():
             shutil.copyfile(best, self.job_dir / f"{cfg.job_name}_best.safetensors")
-        win_cfg = dataclasses.replace(win.cfg, race=False, race_configs=[], race_warmup_probes=0)
+        win_cfg = dataclasses.replace(win.cfg, race=False, race_configs=[], race_warmup_probes=0,
+                                      race_patience_drop=False, race_drop_lowest=True)
         win.cfg = win_cfg
         self.cfg = win_cfg
+        if rr.schedule.keeps_all:
+            log.info("Race: %s is the last one racing (%s); it trains on to step %d with the run's own file names. "
+                     "The winner is decided at the end: the highest smoothed score any configuration reached",
+                     win.name, race_mod.format_overrides(win.overrides) or "the run's own settings", cfg.steps)
+            return
         win_cfg.save(self.job_dir / f"{cfg.job_name}_winner.yaml")
         log.info("Race over: %s wins (%s); it trains on to step %d with the run's own file names (its settings: %s)",
                  win.name, race_mod.format_overrides(win.overrides) or "the run's own settings", cfg.steps,
@@ -2257,6 +2340,7 @@ class Trainer(RaceParallelMixin):
         cfg.probe_face_prompt = iso.fuse(cfg.probe_face_prompt, rules)
         cfg.probe_body_prompt = iso.fuse(cfg.probe_body_prompt, rules)
         cfg.reward_prompts = [iso.fuse(p, rules) for p in cfg.reward_prompts]
+        cfg.selftrain_prompts = [iso.fuse(p, rules) for p in cfg.selftrain_prompts]
         self.isolation = subjects
         for s in subjects:
             log.info("LoRA Isolation: %s (%s) trains as '%s'%s; prompt with '%s'", s.trigger, s.kind, s.fused,
@@ -2365,7 +2449,7 @@ class Trainer(RaceParallelMixin):
         if (self.cfg.crop_augment or "none") != "none" and self.cfg.crop_augment_weight != 1.0:
             weights = weights or {}
             for it in self.batcher.items:
-                if it.category != "image":
+                if it.category not in ("image", "selftrain"):  # the crops (self-training has its own loss weight)
                     weights[it.key] = weights.get(it.key, 1.0) * self.cfg.crop_augment_weight
         if self.loss_watch is not None:
             mask = self.loss_watch.sampling_mask()
@@ -2751,6 +2835,294 @@ class Trainer(RaceParallelMixin):
         comb = combine(face, body, cfg.face_weight, cfg.body_weight)
         return -1.0 if comb is None else float(comb)
 
+    # ------------------------------------------------------------ likeness-filtered self-training (see selftrain.py)
+    def _selftrain_setup(self, step: int) -> None:
+        """The rounds' steps; a resumed run trains on with the last round's pictures."""
+        from . import selftrain as ST
+
+        cfg = self.cfg
+        if self.face_scorer is None and self.body_scorer is None:
+            log.warning("Self-training off: no face or body scorer (references and the scoring packages)")
+            return
+        self.selftrain_steps = ST.round_steps(cfg.steps, cfg.selftrain_at)
+        log.info("Self-training: round(s) at step %s, %d pictures each over %d prompts; kept above %g and the probes' "
+                 "smoothed score, at most %d per round (%g%% of the real images), trained at x%g",
+                 ", ".join(map(str, self.selftrain_steps)) or "(none: too few steps)", cfg.selftrain_images,
+                 len(cfg.selftrain_prompts), cfg.selftrain_min_likeness,
+                 ST.cap_count(self.all_items, cfg.selftrain_share), cfg.selftrain_share * 100, cfg.selftrain_weight)
+        if step > 0:
+            last = ST.last_kept(self.job_dir / "selftrain" / "selftrain.json", step)
+            if last and last[1]:
+                self._selftrain_add(last[1], step)
+                log.info("Self-training: round %d's %d picture(s) train on from the resumed step %d", last[0],
+                         len(last[1]), step)
+
+    def _selftrain_rounds(self, cfg) -> list[int]:
+        """The steps cfg's self-training rounds run at (none when it is off or nothing can score the pictures)."""
+        if not cfg.selftrain or (self.face_scorer is None and self.body_scorer is None):
+            return []
+        from .selftrain import round_steps
+
+        return round_steps(cfg.steps, cfg.selftrain_at)
+
+    def _self_train_round(self, model, step: int, rnd: int) -> None:
+        """Render selftrain_images pictures with the LoRA (its weight average, as the probes), score them like the
+        probes, keep the best that pass the quality filter and the bar, and train on them in place of the last
+        round's."""
+        from . import selftrain as ST
+        from .likeness import probe_body_size
+        from .reward import is_full_body
+
+        cfg = self.cfg
+        t0 = time.time()
+        out_dir = self.job_dir / "selftrain"
+        out_dir.mkdir(exist_ok=True)
+        cap = ST.cap_count(self.all_items, cfg.selftrain_share)
+        if cap < 1:
+            log.warning("Self-training round %d skipped: %g of the real images is less than one picture", rnd,
+                        cfg.selftrain_share)
+            return
+        side = max(cfg.training_sides()) // 16 * 16  # the largest resolution: no item is trained upscaled
+        jobs = []
+        prompts = ST.plan(cfg.selftrain_prompts, cfg.selftrain_images)
+        for i, prompt in enumerate(prompts):
+            w, h = probe_body_size(side) if is_full_body(prompt) else (side, side)
+            jobs.append(RenderJob(prompt, w, h, cfg.sample_steps, cfg.sample_cfg, ST.seed(cfg.seed, rnd, i),
+                                  out_dir / f"{self._image_prefix()}round{rnd}_{i:02d}.png",
+                                  f"self-training picture {i + 1}/{len(prompts)}", "selftrain"))
+        log.info("Self-training round %d at step %d: rendering %d pictures", rnd, step, len(jobs))
+        paths = self._selftrain_render(model, step, rnd, jobs)
+        self.status.update(stage=f"self-training round {rnd}: scoring {len(paths)} pictures")
+        scale = self._likeness_scale()
+        cands = [self._selftrain_candidate(p, job.prompt, scale, side) for job, p in zip(jobs, paths)]
+        probe = self.controller.combined_ema if self.controller is not None else None
+        bar = max(cfg.selftrain_min_likeness, probe) if probe is not None else cfg.selftrain_min_likeness
+        need_face = self.face_scorer is not None and cfg.face_weight > 0
+        kept, reasons = ST.select(cands, need_face=need_face, bar=bar, cap=cap)
+        ST.record(out_dir / f"{self._image_prefix()}selftrain.json", rnd, step, bar, cands)
+        self.status.update(stage=f"self-training round {rnd}: adding {len(kept)} pictures")
+        n_items = self._selftrain_add([(c.path, c.prompt) for c in kept], step)
+        scores = sorted((c.likeness for c in cands if c.likeness is not None), reverse=True)
+        log.info("Self-training round %d at step %d: kept %d of %d (bar %.1f: the floor %g%s; best %s); left out: %s; "
+                 "%d training item(s) at x%g in place of the last round's (%.0fs)", rnd, step, len(kept), len(cands),
+                 bar, cfg.selftrain_min_likeness,
+                 f", the probes' smoothed {probe:.1f}" if probe is not None else "",
+                 " / ".join(f"{s:.0f}" for s in scores[:5]) or "n/a", ST.describe(reasons), n_items,
+                 cfg.selftrain_weight, time.time() - t0)
+        self.status.update(stage="training", selftrain={
+            "round": rnd, "step": step, "rendered": len(cands), "kept": [c.path for c in kept], "bar": round(bar, 2),
+            "left_out": dict(reasons)})
+        free_cuda()
+
+    @torch.no_grad()
+    def _selftrain_render(self, model, step: int, rnd: int, jobs: list) -> list[str]:
+        """Render a round's pictures with the weight average, as the probes do (on every sampling GPU)."""
+        self._free_for_rendering()
+        with self._averaged(replicas=True), lora_mod.frozen_adapters(), self._sampling_slots(model, step) as slots:
+            for sl in slots:
+                sl.model.eval()
+                lora_mod.set_extras_enabled(sl.model, True)
+            try:
+                neg_e, neg_m = self.arch.pad_embeds([load_text_embeds(self.cfg, self.negative_prompt())])
+                title = f"self-training round {rnd} on {len(slots)} GPUs" if len(slots) > 1 else ""
+                return self._render_round(slots, jobs, neg_e, neg_m, _Board(self.status, title))
+            finally:
+                for sl in slots:
+                    lora_mod.set_extras_enabled(sl.model, False)
+
+    def _selftrain_candidate(self, path: str, prompt: str, scale, side: int = 512):
+        """A rendered picture's faces, likeness on the probes' scale (None when the face, or a full-body prompt's
+        body, is missing), sharpness and thumbnail."""
+        from . import selftrain as ST
+        from .facesim import cut_off, image_size
+        from .likeness import combine
+        from .reward import is_full_body
+
+        cfg = self.cfg
+        c = ST.Candidate(str(path), prompt, None)
+        face = body = None
+        missing = False
+        box = None
+        if self.face_scorer is not None:
+            fs = self.face_scorer.faces(path)
+            c.faces = len(fs)
+            if fs:
+                c.det = float(fs[0].det_score)
+                c.cut_off = cut_off(fs[0].bbox, image_size(path))
+                box = fs[0].bbox
+            if cfg.face_weight > 0:
+                face = self.face_scorer.score(path).percent
+                missing = face is None
+        if self.body_scorer is not None and cfg.body_weight > 0:
+            body, _ = self.body_scorer.score(path)
+            missing = missing or (body is None and is_full_body(prompt))
+        if scale is not None and getattr(scale, "normalize", False):
+            face, body = scale.norm("face", face), scale.norm("body", body)
+        if not missing:
+            c.likeness = combine(face, body, cfg.face_weight, cfg.body_weight)
+        c.face_sharp = ST.big_face(box, image_size(path), side)  # large enough at the training resolution
+        c.sharp, c.thumb = ST.sharpness(path, box if c.face_sharp else None, side), ST.thumb(path)
+        return c
+
+    def _selftrain_add(self, kept: list[tuple[str, str]], step: int) -> int:
+        """Train on these (image, prompt) pairs in place of the last round's: one item per training resolution the
+        picture is not upscaled to, at selftrain_weight; latents and region maps in <job>/selftrain/cache. Returns
+        the items added."""
+        from . import regions as R
+        from .dataset import Item, bucket_size
+        from .facesim import image_size
+
+        cfg = self.cfg
+        cache = self.job_dir / "selftrain" / "cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        tag = self.arch.latent_tag
+        new = []
+        for image, prompt in kept:
+            p = Path(image)
+            w, h = image_size(p)
+            for side in cfg.training_sides():
+                if side * side > w * h * 1.05:  # an upscaled picture teaches blur
+                    continue
+                bw, bh = bucket_size(w, h, cfg, side)
+                stem = f"{p.stem}_{bw}x{bh}"
+                new.append(Item(image=p, caption=prompt, width=bw, height=bh,
+                                latent_path=cache / f"{stem}{tag}.safetensors",
+                                latent_flip_path=(cache / f"{stem}_flip{tag}.safetensors") if cfg.flip_augment
+                                else None,
+                                text_path=text_cache_path(cfg, prompt),
+                                region_path=(cache / f"{stem}_regions.safetensors") if cfg.wants_regions() else None,
+                                category="selftrain", side=side, repeats=1, dataset="selftrain",
+                                loss_scale=cfg.selftrain_weight))
+        if new:
+            cache_latents(new, cfg, self.vae)
+            if cfg.wants_regions():  # face cells and landmarks; the person-mask models were unloaded after the photos
+                analysis = R.analyze_faces(new, self._ensure_face_detector(), cache / "faces.json")
+                self.face_analysis.update(analysis)
+                R.cache_region_maps(new, cfg, analysis)
+            if self.trigger_pos:  # attention localization reads the trigger in their captions too
+                self.trigger_pos.update(self._trigger_positions(new, [cfg]))
+        self.all_items = [it for it in self.all_items if it.category != "selftrain"] + new
+        self._enter_stage(self.res_stage, step, initial=True)
+        if self._race_running():  # the configuration keeps its own items and image queue when it is parked
+            self.race.active.state.update(items=self.all_items, batcher=self.batcher, batch_iter=self.batch_iter)
+        return len(new)
+
+    # ------------------------------------------------------------ seed soup (see soup.py)
+    def _soup_stage(self, model) -> None:
+        """A greedy soup of soup_files, scored by the likeness probes: each file alone (the best also at every soup
+        strength, so a soup is never credited for a strength change), then best-first, each next file joins the soup
+        when the soup's score at its best strength does not drop. Saves <job>_soup.safetensors and soup.json."""
+        import json
+
+        from . import soup as S
+        from .config import soup_strength_list
+        from .likeness import combine, probe_seed_count
+
+        cfg = self.cfg
+        if self.controller is None:
+            raise ValueError("The soup is picked by the likeness probes, which could not be set up (references, "
+                             "probe prompts and their scoring packages)")
+        t0 = time.time()
+        out_dir = self.job_dir / "soup"
+        out_dir.mkdir(exist_ok=True)
+        strengths = soup_strength_list(cfg.soup_strengths)
+        names = [Path(p).name for p in cfg.soup_files]
+        self.status.update(stage="seed soup: reading the LoRAs")
+        ings = [S.read_ingredient(p) for p in cfg.soup_files]
+        fmt = self.arch.lora_format
+        log.info("Seed soup: %d LoRAs (%s), rank %s, strengths %s, %d probe seed(s) each", len(ings),
+                 ", ".join(names), cfg.soup_rank or "exact", ", ".join(f"{s:g}" for s in strengths), cfg.probe_seeds)
+        self._free_for_rendering()
+        with lora_mod.frozen_adapters(), self._sampling_slots(model, 0) as slots:  # the base model: the scale's zero
+            face, body, _ = self._probe_with(slots, 0, tag="soup_base")
+        if self.controller.normalize:
+            self.controller._set_floors(face, body)
+            log.info("Likeness scale: %s (%d seeds)", self.controller.describe_scale(), probe_seed_count(cfg, 0))
+        trials: list[dict] = []
+
+        def score(members: list[int], strength: float, label: str) -> float | None:
+            stubs, rep = S.cook([ings[i] for i in members], rank=cfg.soup_rank, strength=strength,
+                                device=self.devices[0])
+            path = S.save(stubs, out_dir / "candidate.safetensors", [cfg.soup_files[i] for i in members], rep, fmt)
+            self.status.update(stage=f"seed soup: probing {label}")
+            f, b = self._soup_probe(model, path, f"soup{len(trials) + 1:02d}")
+            comb = combine(self.controller.norm("face", f), self.controller.norm("body", b), cfg.face_weight,
+                           cfg.body_weight)
+            if rep["energy"] < 0.5 and not trials:
+                log.warning("Seed soup: rank %d keeps only %.0f%% of the change (LoKr and high-rank files change "
+                            "nearly every direction): a higher soup_rank, or 0 for LoRA files, keeps more",
+                            cfg.soup_rank, rep["energy"] * 100)
+            trials.append({"files": [names[i] for i in members], "strength": strength, "score": comb, "face": f,
+                           "body": b, "agreement": rep["agreement"], "norm_ratio": rep["norm_ratio"],
+                           "energy": rep["energy"]})
+            fmt_s = "n/a" if comb is None else f"{comb:.1f}%"
+            log.info("Seed soup: %s at strength %g -> %s%s", label, strength, fmt_s,
+                     f" ({S.describe(rep)})" if len(members) > 1 else "")
+            return comb
+
+        def val(x):
+            return float("-inf") if x is None else x
+
+        alone = [score([i], 1.0, names[i]) for i in range(len(ings))]
+        order = sorted(range(len(ings)), key=lambda i: -val(alone[i]))
+        soup, best, best_s = [order[0]], alone[order[0]], 1.0
+        for s in strengths:  # the best file alone at the other strengths: what a stronger soup must beat
+            if s != 1.0:
+                v = score([order[0]], s, names[order[0]])
+                if val(v) > val(best):
+                    best, best_s = v, s
+        for j in order[1:]:
+            cand = soup + [j]
+            got = [(score(cand, s, " + ".join(names[i] for i in cand)), s) for s in strengths]
+            v, s = max(got, key=lambda g: val(g[0]))
+            if val(v) >= val(best):
+                soup, best, best_s = cand, v, s
+                log.info("Seed soup: %s joins (%.1f%% at strength %g)", names[j], val(v), s)
+            else:
+                log.info("Seed soup: %s left out (the soup with it scores %s, without %s)", names[j],
+                         "n/a" if v is None else f"{v:.1f}%", "n/a" if best is None else f"{best:.1f}%")
+        uniform = score(list(range(len(ings))), 1.0, "every file (plain average)") if len(soup) < len(ings) else None
+        stubs, rep = S.cook([ings[i] for i in soup], rank=cfg.soup_rank, strength=best_s, device=self.devices[0])
+        final = S.save(stubs, self.job_dir / f"{cfg.job_name}_soup.safetensors", [cfg.soup_files[i] for i in soup],
+                       rep, fmt)
+        (out_dir / "candidate.safetensors").unlink(missing_ok=True)
+        (out_dir / "soup.json").write_text(json.dumps({
+            "files": names, "alone": dict(zip(names, alone)), "soup": [names[i] for i in soup], "strength": best_s,
+            "score": best, "uniform": uniform, "report": rep, "trials": trials}, indent=1), encoding="utf-8")
+        what = ("only " + names[soup[0]] + ": no soup beat it" if len(soup) == 1
+                else " + ".join(names[i] for i in soup))
+        log.info("Seed soup done: %s at strength %g scores %s (the best single file %s%s) -> %s (%.0fs)", what, best_s,
+                 "n/a" if best is None else f"{best:.1f}%", f"{val(alone[order[0]]):.1f}%",
+                 "" if uniform is None else f", every file averaged {val(uniform):.1f}%", final.name, time.time() - t0)
+        self.status.data["saved"].append(str(final))
+        self.status.update(stage="finished", done=True, soup={"files": [names[i] for i in soup], "strength": best_s,
+                                                              "score": best, "trials": trials})
+
+    @torch.no_grad()
+    def _soup_probe(self, model, path, tag: str):
+        """Probe the model with a LoRA file attached as an extra (the training adapter is untouched and still
+        zero), then take it off again. Returns the raw (face, body)."""
+        from .lora import LoRALinear
+
+        models = [m for m, _, _ in self.replicas] or [model]
+        sizes = {id(mod): (len(mod.extras), len(mod.extra_biases)) for m in models for mod in m.modules()
+                 if isinstance(mod, LoRALinear)}
+        try:
+            for m in models:
+                lora_mod.attach_extra_lora(m, str(path), 1.0, rename=getattr(self.arch, "lora_module_name", None),
+                                           convert=getattr(self.arch, "extra_lora_converter", None))
+            self._free_for_rendering()
+            with lora_mod.frozen_adapters(), self._sampling_slots(model, 0) as slots:
+                face, body, _ = self._probe_with(slots, 0, tag=tag)
+        finally:
+            for m in models:
+                for mod in m.modules():
+                    if isinstance(mod, LoRALinear):
+                        n_e, n_b = sizes.get(id(mod), (0, 0))
+                        del mod.extras[n_e:]
+                        del mod.extra_biases[n_b:]
+        return face, body
+
     def _likeness_scale(self):
         """The scale the samples' scores are normalized on: the probe controller's (its floors from the step-0
         probe), else one with the references' ceilings and default floors; None with likeness_normalize off."""
@@ -2774,7 +3146,7 @@ class Trainer(RaceParallelMixin):
         return out
 
     @torch.no_grad()
-    def _probe_with(self, slots, step):
+    def _probe_with(self, slots, step, tag: str = ""):
         from .likeness import probe_body_size, probe_seed_count
 
         cfg = self.cfg
@@ -2796,7 +3168,7 @@ class Trainer(RaceParallelMixin):
             n_seeds = probe_seed_count(cfg, step)  # more at step 0: the normalized scale's zero
             for k in range(n_seeds):
                 jobs.append(RenderJob(prompt, w, h, cfg.probe_steps, cfg.probe_cfg, cfg.probe_seed + k,
-                                      out_dir / f"{self._image_prefix()}step{step:06d}_{kind}_{k}.png",
+                                      out_dir / f"{self._image_prefix()}{tag or f'step{step:06d}'}_{kind}_{k}.png",
                                       f"probe {kind} seed {k + 1}/{n_seeds} at step {step}" if len(slots) == 1
                                       else f"probe {kind} seed {k + 1}/{n_seeds}", kind))
         title = f"probes at step {step} on {len(slots)} GPUs" if len(slots) > 1 and len(jobs) > 1 else ""
