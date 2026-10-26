@@ -825,6 +825,43 @@ Samples tab show only the normalized scores (the log and `likeness.jsonl` keep t
 In a race, the Monitor and the Samples tab put the same generation (step, prompt or probe kind, seed) of every
 configuration side by side in one row. Earlier runs' `likeness.jsonl` keep their raw combined scores.
 
+## Likeness reward fine-tuning (`reward_steps`)
+
+An optional second stage after the regular steps that trains on likeness itself, after Flow-GRPO (Liu et al., NeurIPS
+2025), the online reinforcement-learning recipe for flow-matching models. Regular training teaches the LoRA to
+rebuild the training photos; this stage asks, over prompts the photos never had, which of the LoRA's own pictures look
+most like the person. Each reward step:
+
+1. renders `reward_group` (4) pictures of one prompt from different seeds with a stochastic sampler: the usual sampler
+   turned into an SDE with the same marginals (Flow-GRPO's step, noise level `reward_noise` 0.7), so every denoising
+   move is a Gaussian with a known probability. Steps and guidance are the probes' (`reward_sample_steps` 0 =
+   `probe_steps`, `probe_cfg`), with the turbo LoRA the probes use;
+2. scores each with the probes' scorers on their scale, unclipped (0 = a stranger, 1 = the references; a missing
+   face counts -1), combined with `face_weight` / `body_weight`;
+3. turns the scores into advantages within the group ((score - mean) / std: only the differences between the
+   pictures count, not the prompt's difficulty);
+4. on `reward_train_steps` (4) of the denoising moves, one picture at a time, raises the log-probability of the moves
+   behind the better pictures and lowers it for the worse (policy gradient), plus `reward_kl` (0.04) times the KL
+   divergence to the LoRA as the stage started; AdamW at `reward_lr` (2e-5), gradients clipped at 1.
+
+- **Starts from** the LoRA the steps saved (their weight average). `<job>.safetensors` stays the first stage's; the
+  stage saves `<job>_reward_<step>` every `save_every` reward steps (pruned with `keep_checkpoints`) and
+  `<job>_reward.safetensors`; its pictures are in `<job>/reward/`. Probes continue every `probe_every` reward steps:
+  a probe that beats the best of both stages saves `<job>_reward_best.safetensors`, and early stop ends the stage.
+- **Measured cost:** Krea 2 (nvfp4, 16 GB RTX 4060 Ti), 4 pictures of 512 px at 4 denoising steps with guidance 5.5,
+  2 trained moves per update: about 77 s per reward step (with a turbo LoRA at guidance 1 the guidance passes go).
+- **Alone:** `steps: 0` with a LoRA in `resume_from` runs only this stage, for example on a race winner's file (it
+  does not follow a race in the same run).
+- **Prompts:** `reward_prompts`, or by default eight varied close-up, upper-body and full-body prompts with the
+  trigger word (full-body prompts dropped when the body weighs nothing, close-ups when the face does). Full-body
+  prompts render 2:3 like the body probe; LoRA Isolation's fused trigger applies.
+- **Risk:** the scorers are not differentiable here, so the LoRA cannot chase their gradients pixel by pixel, but it
+  can still learn what they like more than a person does (reward hacking). The KL penalty, the small learning rate and
+  the probes on their own fixed seeds are the guards; look at the pictures.
+- **Cost:** every step renders the group (`reward_group` x steps forward passes, x2 with guidance) and trains
+  `reward_train_steps` x `reward_group` x 2 forward passes (the policy and its reference). Every block recomputes
+  during the stage (kept activations are released). One GPU (data parallel: the first), no fine-tune.
+
 ## Previous runs (run history)
 
 The **Previous Runs** tab keeps the likeness history of every run, like TensorBoard, so runs can be compared after the
@@ -1019,6 +1056,14 @@ layer is re-quantized from original + delta. A *cycle* of windows trains every c
 quantized weight of every trained layer stays in RAM too, so each delta is always against the exact base the model
 loaded with and the trunk never accumulates re-quantization error.
 
+- **Held near the original** (`finetune_anchor`, 0.01). After every step the trained weights move
+  lr x `finetune_anchor` of the way back toward the original model's: w -= lr x anchor x (w - original), decoupled like
+  AdamW's weight decay. This is the bounded drift of "Preserve and Personalize" (Kim et al., ICLR 2026), whose full
+  fine-tune of Stable Diffusion 1.5 held near its base this way scored above an unheld one in likeness (DINO 0.639 vs
+  0.603) and prompt-following (CLIP-T 0.298 vs 0.279). The optimizer's own `weight_decay` is off for a fine-tune: it
+  would shrink the model's weights themselves toward zero (it did before v1.9.0). The original weights of the window
+  that trains stay on the GPU in their own format (1 byte per weight for int8, 2 for bf16; the window plan counts 2).
+  0 turns it off.
 - **Windows.** Planned at launch from the free VRAM after the model loads, less an activation reserve
   (`finetune_reserve_gb`, default 3 GB + 3 GB per megapixel), at 10 bytes per weight with adafactor (fp32 weight,
   gradient, bf16 copy; 18 with adamw). A component larger than a window is cut into block ranges. `finetune_window_gb`

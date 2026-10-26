@@ -222,6 +222,8 @@ class TrainConfig:
     finetune_extract_ranks: list[int] = field(default_factory=lambda: [64])  # the LoRA rank(s) each save extracts
     finetune_save_delta: bool = False  # also save the deltas (<job>_finetune.safetensors, 2 bytes per weight)
     finetune_resume: str = ""  # a delta file to continue a fine-tune from
+    finetune_anchor: float = 0.01  # a fine-tune's weights decay toward the original model's (x lr per step; 0 = off).
+    #                                 Replaces weight_decay, which would shrink the model's own weights toward zero
     lora_save_dtype: str = "bf16"  # bf16 | fp16 | fp32 for the exported LoRA files
     lora_ema: float = 0.98  # weight average (EMA) decay per image for saves, samples and probes; 0 = off (see ema.py)
     save_state: bool = False  # also save optimizer/scheduler/RNG state (resumable); final state always saved
@@ -349,6 +351,16 @@ class TrainConfig:
     id_align: bool = False  # align the face tokens' states after one block to the photo's ArcFace embedding
     id_align_weight: float = 0.05
     id_align_layer: int = -1  # that block; -1 = auto (a third of the depth)
+    # --- likeness reward fine-tuning: an optional second stage after the steps (reward.py, after Flow-GRPO) ---
+    reward_steps: int = 0  # optimizer steps of the stage (0 = off); it starts from the LoRA the steps saved
+    reward_lr: float = 2e-5
+    reward_group: int = 4  # images per prompt and step; their scores count relative to each other
+    reward_prompts: list[str] = field(default_factory=list)  # empty: varied prompts built from the trigger word
+    reward_sample_steps: int = 0  # denoising steps per image; 0 = probe_steps (guidance: probe_cfg)
+    reward_train_steps: int = 4  # of those, the steps each update trains on (picked at random)
+    reward_noise: float = 0.7  # the stochastic sampler's noise level (Flow-GRPO's)
+    reward_kl: float = 0.04  # KL penalty to the LoRA as the stage started
+    reward_size: int = 0  # image size (square; full-body prompts 2:3); 0 = probe_size
     # --- likeness probes & controller (character LoRAs) ---
     probe_every: int = 0  # steps between probe renders; 0 = off (needs face_refs and/or body_refs)
     probe_at_start: bool = True  # also probe at step 0 for a baseline
@@ -437,6 +449,24 @@ class TrainConfig:
         parse_clean_share(self.clean_share)
         if self.finetune:
             self.validate_finetune()
+        if self.finetune_anchor < 0:
+            raise ValueError("finetune_anchor must be 0 (off) or more")
+        if self.reward_steps < 0:
+            raise ValueError("reward_steps must be 0 (off) or more")
+        if self.reward_steps > 0:
+            if not (self.face_refs or self.body_refs):
+                raise ValueError("reward_steps scores its pictures against face_refs / body_refs: set references")
+            if self.race:
+                raise ValueError("reward_steps does not follow a race: race first, then run the stage on the "
+                                 "winner's file (resume_from, steps 0)")
+            if self.finetune:
+                raise ValueError("reward_steps fine-tunes an adapter; a full fine-tune has none")
+            if self.reward_group < 2 or self.reward_train_steps < 1 or self.reward_noise <= 0 or self.reward_lr <= 0 \
+                    or self.reward_kl < 0:
+                raise ValueError("reward_group must be 2 or more, reward_train_steps 1 or more, reward_noise and "
+                                 "reward_lr above 0 and reward_kl 0 or more")
+            if self.steps == 0 and not self.resume_from:
+                raise ValueError("steps 0 runs only the reward stage: give it a trained LoRA (resume_from)")
         if self.attn_localize_weight < 0 or self.id_align_weight < 0:
             raise ValueError("attn_localize_weight and id_align_weight must be 0 or more")
         if self.attn_localize and not (self.trigger_word or any(sp.trigger for sp in self.dataset_specs())):

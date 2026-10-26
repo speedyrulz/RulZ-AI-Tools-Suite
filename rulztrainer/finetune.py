@@ -23,6 +23,12 @@ themselves (<job>_finetune.safetensors, bf16: the fine-tune's state, to continue
 extract at other ranks with `python -m rulztrainer.extract_finetune`). Samples and probes render the fine-tuned
 model directly (its sampling-only turbo LoRA attaches as usual).
 
+Weight decay pulls toward the original weights, not toward zero (finetune_anchor, decoupled like AdamW's: after each
+step w -= lr x finetune_anchor x (w - original)): the bounded drift of "Preserve and Personalize" (ICLR 2026), which
+measured a full fine-tune held near its base this way above an unheld one in both likeness and prompt-following. The
+optimizer's own weight decay, which would shrink the model's weights themselves toward zero, is off. The original
+weights stay on the GPU in their own format while their window trains (1 byte per weight for int8, 2 for bf16).
+
 Not in a fine-tune: a race, data parallel, torch.compile (the layers swap), the weight average, training states,
 resume_from, the region prior (no base model to compare with). Use a much lower learning rate than a LoRA's: Fizgig's
 measured rates are 1e-5 for Krea 2 (1e-4 trains but overcooks), 3e-5 for larger-weight models; the WebUI's switch sets
@@ -46,6 +52,7 @@ from . import quant as Q
 log = logging.getLogger("rulztrainer")
 
 BYTES_PER_PARAM = {"adafactor": 10, "adamw8bit": 12, "adamw": 18, "automagic3": 18}  # fp32 w + grad + state + bf16
+ANCHOR_BYTES = 2  # the original weights kept for finetune_anchor (int8 / nvfp4 need less; bf16 needs this)
 DELTA_SUFFIX = "_finetune.safetensors"
 
 
@@ -83,6 +90,7 @@ class Slot:
     flags: dict = field(default_factory=dict)  # a QuantLinear's matmul settings, put back on re-quantization
     delta: torch.Tensor | None = None  # bf16 CPU [out, in]; None = untrained (zero)
     live: TunedLinear | None = None  # while its window trains
+    anchor: object = None  # its original weight on the GPU (own format) while its window trains, for finetune_anchor
 
 
 def component_key(name: str) -> tuple[str, int | None]:
@@ -201,6 +209,7 @@ class FineTuner:
         self.windows: list[list[str]] = []
         self.active: int | None = None
         self.cycles = 0  # completed cycles
+        self.anchored = False  # keep the original weights on the GPU for pull_to_base
 
     # ------------------------------------------------------------ sizes and planning
     @property
@@ -263,6 +272,8 @@ class FineTuner:
             if slot.delta is not None:
                 w += slot.delta.to(self.device, torch.float32)
             slot.live = TunedLinear(w, bias, slot.compute_dtype).to(self.device)
+            if self.anchored:
+                slot.anchor = self._to_device(slot)
             _set_module(self.model, name, slot.live)
             params.append(slot.live.weight)
             del inner
@@ -282,13 +293,37 @@ class FineTuner:
             slot.delta = (w - base).to("cpu", torch.bfloat16)
             merged = base + slot.delta.to(self.device, torch.float32)
             _set_module(self.model, name, self._frozen_module(slot, merged, live.bias))
-            slot.live = None
+            slot.live = slot.anchor = None
             del live, w, base, merged
         if self.active == len(self.windows) - 1:
             self.cycles += 1
         self.active = None
         if str(self.device).startswith("cuda"):
             torch.cuda.empty_cache()
+
+    def _to_device(self, slot: Slot):
+        """The slot's original weight on the device in its own format (bf16, or the quantized data and scales)."""
+        if slot.fmt == "bf16":
+            return slot.base.to(self.device)
+        qw = slot.base
+        return Q.QuantWeight(qw.fmt, qw.qdata.to(self.device), qw.scale.to(self.device),
+                             None if qw.scale2 is None else qw.scale2.to(self.device), qw.orig_shape, qw.group)
+
+    @torch.no_grad()
+    def pull_to_base(self, rate: float) -> None:
+        """Decoupled decay toward the original weights: w -= rate * (w - original) for the active window (rate =
+        lr x finetune_anchor). The original is rebuilt exactly as the window's weights were (base_weight), so an
+        untrained weight stays exactly where it is."""
+        if self.active is None or rate <= 0:
+            return
+        for name in self.windows[self.active]:
+            slot = self.slots[name]
+            if slot.live is None or slot.anchor is None:
+                continue
+            base = slot.anchor.float() if slot.fmt == "bf16" else slot.anchor.dequantize(torch.float32)
+            w = slot.live.weight
+            w.sub_(w.sub(base).mul_(rate))
+            del base
 
     @property
     def at_cycle_start(self) -> bool:

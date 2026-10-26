@@ -116,6 +116,36 @@ def test_window_round_trip_and_deltas():
     assert torch.allclose(ft.slots[names[0]].delta.float(), slot.delta.float(), atol=2e-3)
 
 
+def test_the_weights_decay_toward_the_original_not_zero():
+    """finetune_anchor: w -= rate * (w - original), exact for an untrained weight (int8 and bf16 layers)."""
+    model = _quantized_tiny()
+    names = _names(model)
+    ft = FT.FineTuner(model, names, "cpu")
+    ft.anchored = True
+    ft.plan(10**9, 10)
+    params = ft.activate(0)
+    assert all(ft.slots[n].anchor is not None for n in names)
+    start = [p.detach().clone() for p in params]
+    ft.pull_to_base(0.1)
+    assert all(torch.equal(p, s) for p, s in zip(params, start))  # nothing trained yet: nothing moves
+    with torch.no_grad():
+        for p in params:
+            p.add_(0.05 * torch.randn_like(p))
+    deltas = [ft.delta_of(ft.slots[n]).clone() for n in names]
+    ft.pull_to_base(0.1)
+    for n, d in zip(names, deltas):
+        assert torch.allclose(ft.delta_of(ft.slots[n]), 0.9 * d, atol=1e-6)  # the delta shrinks, the base stays
+    ft.deactivate()
+    assert all(ft.slots[n].anchor is None for n in names)  # freed with the window
+    plain = FT.FineTuner(_quantized_tiny(), _names(_quantized_tiny()), "cpu")
+    plain.plan(10**9, 10)
+    plain.activate(0)
+    assert all(s.anchor is None for s in plain.slots.values())  # finetune_anchor 0: nothing extra on the GPU
+    TrainConfig(finetune=True, finetune_anchor=0.0).validate()
+    with pytest.raises(ValueError, match="finetune_anchor"):
+        TrainConfig(finetune_anchor=-1).validate()
+
+
 def test_extraction_reproduces_the_delta(tmp_path):
     model = _quantized_tiny()
     names = _names(model)

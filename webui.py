@@ -1049,6 +1049,7 @@ class Form:
             finetune_window_gb=float(v("finetune_window_gb") or 0), finetune_reserve_gb=float(v("finetune_reserve_gb") or 0),
             finetune_extract_ranks=parse_ranks(v("finetune_extract_ranks")),
             finetune_save_delta=bool(v("finetune_save_delta")), finetune_resume=s("finetune_resume"),
+            finetune_anchor=float(v("finetune_anchor") or 0.0),
             lora_targets=[t for t in TARGETS + list(EXTRA_TARGETS) if self.w.get(f"target_{t}") is not None
                           and self.w[f"target_{t}"].value],
             train_text_embedder=bool(v("train_text_embedder")), resume_from=s("resume_from"),
@@ -1072,6 +1073,12 @@ class Form:
             logit_mean=float(v("logit_mean")), logit_std=float(v("logit_std")), loss_weighting=v("loss_weighting"),
             save_every=int(v("save_every")), keep_checkpoints=int(v("keep_checkpoints") or 0),
             sample_every=int(v("sample_every")), sample_prompts=prompts,
+            reward_steps=int(v("reward_steps") or 0), reward_lr=float(v("reward_lr") or 2e-5),
+            reward_group=int(v("reward_group") or 4),
+            reward_prompts=[p.strip() for p in (v("reward_prompts") or "").splitlines() if p.strip()],
+            reward_sample_steps=int(v("reward_sample_steps") or 0), reward_train_steps=int(v("reward_train_steps") or 4),
+            reward_noise=float(v("reward_noise") or 0.7), reward_kl=float(v("reward_kl") or 0.0),
+            reward_size=int(v("reward_size") or 0),
             sample_width=aspect_size(v("sample_aspect"), v("sample_mp"))[0],
             sample_height=aspect_size(v("sample_aspect"), v("sample_mp"))[1],
             sample_steps=int(v("sample_steps")), sample_cfg=float(v("sample_cfg")),
@@ -1137,6 +1144,7 @@ class Form:
     def from_config(self, cfg: TrainConfig) -> None:
         preset = next((k for k, v in MODEL_PRESETS.items() if v == cfg.model_path), CUSTOM)
         values = {**cfg.to_dict(), "model_preset": preset, "sample_prompts": "\n".join(cfg.sample_prompts),
+                  "reward_prompts": "\n".join(cfg.reward_prompts),
                   "face_refs": "\n".join(cfg.face_refs), "body_refs": "\n".join(cfg.body_refs),
                   "model_source": FILE_SOURCE if cfg.model_source == "files" else HF_SOURCE}
         values["datasets"] = [{"path": sp.path, "resolutions": list(sp.resolutions), "repeats": sp.repeats}
@@ -2843,6 +2851,8 @@ def extra_review_rows(cfg: TrainConfig) -> list[tuple[str, str]]:
         options.append(f"trigger attention on the subject ({cfg.attn_localize_weight:g})")
     if cfg.id_align:
         options.append(f"identity alignment ({cfg.id_align_weight:g})")
+    if cfg.reward_steps:
+        options.append(f"then {cfg.reward_steps} likeness reward steps")
     if cfg.look_warmup:
         options.append("look warm-up")
     if cfg.lora_ema:
@@ -3720,6 +3730,13 @@ class Wizard:
             self.bind(ui.number("Probe steps", min=1, precision=0), "probe_steps").classes("w-full")
         with self.setting("probe_cfg", "Probe guidance (CFG)", "Guidance for the probes.", show_if=is_identity):
             self.bind(ui.number("Probe CFG", min=0, step=0.5), "probe_cfg").classes("w-full")
+        with self.setting(None, "Second stage: likeness reward fine-tuning",
+                          "After the steps, the LoRA renders groups of pictures of new prompts, the probes rate how "
+                          "much each looks like your person, and the LoRA learns to make the better ones more likely. "
+                          "It aims straight at likeness, but it is slow (a few seconds to a minute a step) and can "
+                          "learn to please the scorer instead of the eye: the probes keep the best checkpoint, and "
+                          "the first stage's LoRA is kept. 0 = off; try 100-200.", show_if=is_identity):
+            self.bind(ui.number("Reward steps", min=0, precision=0), "reward_steps").classes("w-full")
         with self.setting(None, "Early stop", "Stop after this many probes in a row without improvement (0 = never: "
                                               "run all the steps). The best checkpoint is kept either way.",
                           show_if=is_identity):
@@ -4537,6 +4554,14 @@ def build_page(local: bool = True):
                                 .tooltip("<job>_finetune.safetensors, 2 bytes per trained weight (MOSS ~10 GB): the "
                                          "fine-tune's state, to continue from or to extract at other ranks later "
                                          "(python -m rulztrainer.extract_finetune).")
+                            w["finetune_anchor"] = ui.number("Pull toward the original (0 = off)",
+                                                             value=d.finetune_anchor, min=0, step=0.005,
+                                                             format="%.3f").classes("w-60") \
+                                .tooltip("After each step the weights move this much x the learning rate back "
+                                         "toward the original model's: bounded drift (Preserve and Personalize, ICLR "
+                                         "2026), measured above an unheld fine-tune in likeness and prompt-following. "
+                                         "It replaces weight decay, which would shrink the model's own weights toward "
+                                         "zero. Keeps the window's original weights on the GPU (1-2 bytes each).")
                             w["finetune_resume"] = ui.input("Continue from deltas (optional)",
                                                             value=d.finetune_resume).classes("w-96 max-w-full")
                         ft_fields.bind_visibility_from(w["finetune"], "value")
@@ -5257,6 +5282,41 @@ def build_page(local: bool = True):
                                                                           value=d.likeness_curriculum_strength,
                                                                           min=0, max=1, step=0.1).classes("w-28") \
                                 .bind_visibility_from(w["likeness_curriculum"], "value")
+                        with advanced("Second stage: likeness reward fine-tuning"):
+                            hint("After the steps, the LoRA renders groups of pictures of new prompts, the probes' "
+                                 "scorers rate their likeness, and a policy-gradient update (Flow-GRPO) makes the "
+                                 "better ones more likely and the worse ones less, held near the first stage's LoRA "
+                                 "by a KL penalty. It optimizes what you are after directly, but it is slow and can "
+                                 "learn what the scorer likes more than the person (keep the probes on and judge by "
+                                 "eye). Files: <job>_reward_<step> and <job>_reward.safetensors; <job>.safetensors "
+                                 "stays the first stage's. Steps 0 with a LoRA in Resume from runs this stage alone.")
+                            with fields():
+                                w["reward_steps"] = ui.number("Reward steps (0 = off)", value=d.reward_steps, min=0,
+                                                              precision=0).classes("w-44")
+                                w["reward_lr"] = ui.number("Learning rate", value=d.reward_lr, min=0, format="%.1e",
+                                                           step=1e-5).classes("w-36")
+                                w["reward_group"] = ui.number("Images per step", value=d.reward_group, min=2,
+                                                              max=16, precision=0).classes("w-36") \
+                                    .tooltip("Pictures of one prompt per step; only the differences between them "
+                                             "count, so 4 or more.")
+                                w["reward_kl"] = ui.number("KL penalty", value=d.reward_kl, min=0, step=0.01) \
+                                    .classes("w-32").tooltip("Keeps each step's moves near the first stage's LoRA: "
+                                                             "higher is safer and slower.")
+                            with fields():
+                                w["reward_train_steps"] = ui.number("Trained denoising steps", value=d.reward_train_steps,
+                                                                    min=1, precision=0).classes("w-52") \
+                                    .tooltip("Of each picture's denoising steps, how many the update trains on.")
+                                w["reward_sample_steps"] = ui.number("Denoising steps (0 = probe steps)",
+                                                                     value=d.reward_sample_steps, min=0,
+                                                                     precision=0).classes("w-60")
+                                w["reward_noise"] = ui.number("Sampler noise", value=d.reward_noise, min=0.05, max=1.5,
+                                                              step=0.05).classes("w-32") \
+                                    .tooltip("The stochastic sampler's noise level; the pictures vary more above it.")
+                                w["reward_size"] = ui.number("Size (0 = probe size)", value=d.reward_size, min=0,
+                                                             step=64, precision=0).classes("w-44")
+                            w["reward_prompts"] = ui.textarea("Reward prompts (one per line; empty = varied "
+                                                              "close-up, upper-body and full-body prompts from the "
+                                                              "trigger word)").classes("w-full")
                         with advanced("Probe scoring"):
                             with fields():
                                 w["probe_seeds"] = ui.number("Seeds per probe", value=d.probe_seeds, min=1, max=8,
@@ -6045,6 +6105,14 @@ picture and pulls it onto the person (their silhouette and face box), so the tri
 background or other people; it needs a trigger word. **Align the face tokens with the photo's identity** teaches the
 face's tokens after one block to carry that photo's identity (its ArcFace embedding) through a small helper network
 that is thrown away. The LoRA file is the same either way. Not yet measured: race them.
+
+## Likeness reward fine-tuning (second stage)
+*Reward steps* (Likeness probes section, *Second stage*; or the Wizard's Samples step) adds a stage after the steps:
+the LoRA renders groups of 4 pictures of new prompts, the probes' scorers rate their likeness, and the better ones are
+made more likely and the worse ones less (Flow-GRPO), held near the first stage's LoRA. It aims straight at likeness
+but is slow and can learn what the scorer likes more than what you see: keep the probes on and look at the pictures.
+`<job>.safetensors` stays the first stage's; the stage saves `<job>_reward.safetensors`. Steps 0 with a LoRA in
+*Resume from* runs the stage alone.
 
 ## Previous runs (run history)
 

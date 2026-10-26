@@ -88,6 +88,12 @@ class Arch:
 
     def sample(self, model, pos_e, pos_m, neg_e, neg_m, **kw) -> torch.Tensor: ...
 
+    def sample_sigmas(self, model, steps: int, height: int, width: int, shift: float) -> torch.Tensor:
+        """The sampler's noise schedule (ending in 0) for an image of height x width pixels."""
+        from .sampler import moss_sigmas
+
+        return moss_sigmas(steps, shift)
+
     # ---- prompts
     def clean_prompt(self, prompt: str) -> str:
         return prompt
@@ -267,6 +273,11 @@ class FiboArch(Arch):
 
         return sample(model, pos_e, pos_m, neg_e, neg_m, **kw)
 
+    def sample_sigmas(self, model, steps, height, width, shift):
+        from .fibo.sampler import fibo_sigmas
+
+        return fibo_sigmas(steps, (height // 16) * (width // 16))
+
     def clean_prompt(self, prompt):
         return self._prompts.clean_prompt(prompt)
 
@@ -392,6 +403,11 @@ class Krea2Arch(Arch):
         from .krea2.sampler import sample
 
         return sample(model, pos_e, pos_m, neg_e, neg_m, **kw)
+
+    def sample_sigmas(self, model, steps, height, width, shift):
+        from .krea2.sampler import krea2_sigmas, uses_distilled_schedule
+
+        return krea2_sigmas(steps, (height // 16) * (width // 16), uses_distilled_schedule(model))
 
     def lora_module_names(self, model, targets, blocks, include_text_embedder=False):
         from .lora import _is_linear_like

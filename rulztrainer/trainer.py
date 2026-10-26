@@ -352,6 +352,11 @@ class Trainer(RaceParallelMixin):
         self.face_analysis: dict[str, dict] = {}
         # attention localization / identity alignment (alignment.py): the trigger's token positions per cached text,
         # each photo's face embedding, the alignment's projector and its optimizer, and their values since the log
+        self.stage_tag = ""  # "_reward" while the reward stage saves its files
+        if cfg.reward_steps > 0 and not cfg.reward_prompts:
+            from .reward import default_prompts
+
+            cfg.reward_prompts = default_prompts(cfg.trigger_word, cfg.face_weight, cfg.body_weight)
         self.trigger_pos: dict[str, list[int]] = {}
         self.face_embs: dict[str, torch.Tensor] = {}
         self.align_layer: int | None = None
@@ -557,6 +562,8 @@ class Trainer(RaceParallelMixin):
         prompts = list(cfg.sample_prompts) + ([self.negative_prompt()] if cfg.sample_prompts else [])
         if cfg.probe_every > 0:
             prompts += [p for p in (cfg.probe_face_prompt, cfg.probe_body_prompt) if p] + [self.negative_prompt()]
+        if cfg.reward_steps > 0:
+            prompts += list(cfg.reward_prompts) + [self.negative_prompt()]
         need_latents = cfg.recache or any(
             not it.latent_path.exists() or (it.latent_flip_path and not it.latent_flip_path.exists()) for it in items)
         need_text = cfg.recache or not dropout_text_path(cfg).exists() or any(
@@ -822,7 +829,7 @@ class Trainer(RaceParallelMixin):
             for m, _, _ in self.replicas:
                 self._attach_sampling_loras(m)
         self._check_sample_settings()
-        if cfg.sample_prompts or cfg.probe_every > 0 or cfg.id_loss_weight > 0:
+        if cfg.sample_prompts or cfg.probe_every > 0 or cfg.id_loss_weight > 0 or cfg.reward_steps > 0:
             self.vae = self.arch.get_vae(cfg, self.model_dir)
             self.face_scorer = self._make_face_scorer()
             self.body_scorer = self._make_body_scorer()
@@ -1101,6 +1108,8 @@ class Trainer(RaceParallelMixin):
                 for g in optimizer.param_groups:
                     g["lr"] = g["lr"] * step_lr_mult
             optimizer.step()
+            if self.ft is not None and cfg.finetune_anchor > 0:  # bounded drift: toward the original weights
+                self.ft.pull_to_base(current_lr(optimizer, scheduler) * cfg.finetune_anchor)
             if self.id_align_opt is not None and cfg.id_align:
                 self.id_align_opt.step()
             if step_lr_mult != 1.0:
@@ -1223,6 +1232,8 @@ class Trainer(RaceParallelMixin):
             self.sample_images(model, step)
         if self.race is not None:
             self._race_report()
+        if cfg.reward_steps > 0 and not self.stop_file.exists():
+            path = self._reward_stage(model, injected, step) or path
         self.status.update(stage="finished", done=True)
         self._save_history("finished" if step >= cfg.steps else "stopped")
         log.info("Done. Final LoRA: %s", path)
@@ -1242,7 +1253,9 @@ class Trainer(RaceParallelMixin):
         max_mp = max((side_to_mp(s) for s in cfg.training_sides()), default=1.0)
         reserve = cfg.finetune_reserve_gb or ft_mod.default_reserve_gb(max_mp)
         budget = ft_mod.plan_budget(free, reserve, cfg.finetune_window_gb)
-        bpp = ft_mod.BYTES_PER_PARAM.get(cfg.optimizer.lower(), 18)
+        bpp = ft_mod.BYTES_PER_PARAM.get(cfg.optimizer.lower(), 18) + (ft_mod.ANCHOR_BYTES if cfg.finetune_anchor > 0
+                                                                        else 0)
+        ft.anchored = cfg.finetune_anchor > 0
         windows = ft.plan(budget, bpp)
         per_step = cfg.batch_size * cfg.gradient_accumulation
         self.ft_rotate_steps = ft_mod.epoch_steps(sum(max(1, int(it.repeats or 1)) for it in items), per_step,
@@ -1256,6 +1269,9 @@ class Trainer(RaceParallelMixin):
                  self.ft_rotate_steps * len(windows), ", ".join(map(str, cfg.finetune_extract_ranks)))
         for i, names in enumerate(windows):
             log.info("  window %d: %s (%.2fB weights)", i + 1, ft_mod.describe_window(names), ft.window_params(i) / 1e9)
+        if cfg.finetune_anchor > 0:
+            log.info("Fine-tune: the weights decay toward the original model's (finetune_anchor %g x lr per step), "
+                     "not toward zero", cfg.finetune_anchor)
         if cfg.learning_rate > 5e-5:
             log.warning("Learning rate %g is high for a fine-tune (Fizgig measured 1e-5 on Krea 2; 1e-4 overcooks): "
                         "the weights themselves move, not an adapter", cfg.learning_rate)
@@ -1264,7 +1280,9 @@ class Trainer(RaceParallelMixin):
     def _finetune_window(self, cfg, i: int, step: int):
         params = self.ft.activate(i)
         self.ft_window = i
-        optimizer = build_optimizer(cfg, [{"params": params, "lr": cfg.learning_rate, "name": "finetune"}])
+        # the optimizer's weight decay would shrink the model's weights toward zero: off (finetune_anchor instead)
+        optimizer = build_optimizer(dataclasses.replace(cfg, weight_decay=0.0),
+                                    [{"params": params, "lr": cfg.learning_rate, "name": "finetune"}])
         scheduler = build_scheduler(cfg, optimizer, offset=step)
         self.status.update(finetune={"window": i + 1, "windows": len(self.ft.windows), "cycle": self.ft.cycles + 1,
                                      "layers": len(self.ft.windows[i]), "rotate_steps": self.ft_rotate_steps})
@@ -1864,8 +1882,8 @@ class Trainer(RaceParallelMixin):
         return self.race is not None and self.race.running
 
     def _file_tag(self) -> str:
-        """While a race runs, files of the training configuration carry its name."""
-        return f"_{self.race.active.name}" if self._race_running() else ""
+        """While a race runs, files of the training configuration carry its name; the reward stage's carry _reward."""
+        return (f"_{self.race.active.name}" if self._race_running() else "") + getattr(self, "stage_tag", "")
 
     def _image_prefix(self) -> str:
         return f"{self.race.active.name}_" if self._race_running() else ""
@@ -2229,6 +2247,7 @@ class Trainer(RaceParallelMixin):
         cfg.sample_prompts = [iso.fuse(p, rules) for p in cfg.sample_prompts]
         cfg.probe_face_prompt = iso.fuse(cfg.probe_face_prompt, rules)
         cfg.probe_body_prompt = iso.fuse(cfg.probe_body_prompt, rules)
+        cfg.reward_prompts = [iso.fuse(p, rules) for p in cfg.reward_prompts]
         self.isolation = subjects
         for s in subjects:
             log.info("LoRA Isolation: %s (%s) trains as '%s'%s; prompt with '%s'", s.trigger, s.kind, s.fused,
@@ -2499,6 +2518,184 @@ class Trainer(RaceParallelMixin):
         if not terms:
             return None
         return sum(t.to(terms[0].device) for t in terms[1:]) + terms[0] if len(terms) > 1 else terms[0]
+
+    # ------------------------------------------------------------ likeness reward fine-tuning (see reward.py)
+    def _reward_stage(self, model, injected, step0: int):
+        """The optional second stage: reward_steps policy-gradient updates on the likeness of the LoRA's own pictures
+        (Flow-GRPO). Starts from the LoRA the steps saved (their weight average), saves <job>_reward_<step> files and
+        <job>_reward.safetensors, and keeps probing. Returns the final file."""
+        from . import reward as RW
+        from .likeness import probe_body_size
+
+        cfg = self.cfg
+        if self.face_scorer is None and self.body_scorer is None:
+            log.warning("Reward stage skipped: no face or body scorer (references and the scoring packages)")
+            return None
+        if self.dp is not None:
+            log.info("Reward stage: renders and trains on %s alone (the other GPUs wait)", self.devices[0])
+        if self.ema is not None:  # start from the averaged LoRA: the one the steps saved
+            with torch.no_grad():
+                for p, s in zip(self.ema.params, self.ema.shadow):
+                    p.copy_(s)
+            self.ema = None
+        params = list(lora_mod.lora_parameters(injected))
+        ref = [p.detach().clone() for p in params]  # the KL reference: the LoRA as the stage starts
+        opt = torch.optim.AdamW(params, lr=cfg.reward_lr, weight_decay=0.0)
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda _: 1.0)
+        dropouts = {name: m.dropout for name, m in injected.items()}
+        for m in injected.values():
+            m.dropout = torch.nn.Identity()  # the policy must be the same function when it renders and when it trains
+        scale = self._likeness_scale()
+        steps_t = cfg.reward_sample_steps or cfg.probe_steps
+        dev = norm_device(self.device)
+        skip = [cfg.sample_skip_layer] if self.arch.name == "moss_image" and cfg.sample_skip_layer >= 0 else None
+        neg_row = load_text_embeds(cfg, self.negative_prompt())
+        out_dir = self.job_dir / "reward"
+        out_dir.mkdir(exist_ok=True)
+        rng = random.Random(cfg.seed + 7)
+        group = int(cfg.reward_group)
+        total = step0 + cfg.reward_steps
+        log.info("Reward stage: %d steps of %d images (%d denoising steps, guidance %g, noise %.2g), %d of them trained "
+                 "per update, lr %.1e, KL %g, %d prompts; scored by %s", cfg.reward_steps, group, steps_t,
+                 cfg.probe_cfg, cfg.reward_noise, min(cfg.reward_train_steps, steps_t - 1), cfg.reward_lr,
+                 cfg.reward_kl, len(cfg.reward_prompts),
+                 " + ".join(k for k, s in (("face", self.face_scorer), ("body", self.body_scorer)) if s is not None))
+        self.stage_tag = "_reward"
+        self.status.update(stage="reward fine-tuning", total=total)
+        model.train()
+        lora_mod.set_extras_enabled(model, True)  # the policy is the sampler the probes use: turbo LoRA included
+        kept = ckpt.kept_blocks(model)  # measured for one training image; an update's guidance pass needs more:
+        ckpt.set_kept_blocks(model, [])  # every block recomputes during the stage
+        history = self.status.data.get("rewards", [])
+        s = 0
+        t0 = time.time()
+        try:
+            for s in range(1, cfg.reward_steps + 1):
+                if self.stop_file.exists():
+                    log.info("Reward stage stopped at step %d", s - 1)
+                    s -= 1
+                    break
+                prompt = cfg.reward_prompts[(s - 1) % len(cfg.reward_prompts)]
+                size = cfg.reward_size or cfg.probe_size
+                w, h = probe_body_size(size) if RW.is_full_body(prompt) else (size, size)
+                pos_e, pos_m = self.arch.pad_embeds([load_text_embeds(cfg, prompt)] * group)
+                pos_e, pos_m = pos_e.to(dev), pos_m.to(dev)
+                neg_e = neg_m = None
+                if cfg.probe_cfg != 1.0:
+                    neg_e, neg_m = self.arch.pad_embeds([neg_row] * group)
+                    neg_e, neg_m = neg_e.to(dev), neg_m.to(dev)
+                sigmas = self.arch.sample_sigmas(model, steps_t, h, w, cfg.sample_shift)
+                sig = [float(x) for x in sigmas]
+                seeds = [cfg.seed * 100_003 + s * 97 + k for k in range(group)]
+                self.status.update(stage=f"reward fine-tuning {s}/{cfg.reward_steps}: rendering {group} images")
+                with lora_mod.frozen_adapters():
+                    xs, stds = RW.sample_group(model, sigmas, pos_e, pos_m, neg_e, neg_m, cfg_scale=cfg.probe_cfg,
+                                               noise_level=cfg.reward_noise, seeds=seeds,
+                                               shape=(model.latent_channels, h // 16, w // 16), device=dev, skip=skip)
+                rewards = []
+                for k in range(group):
+                    img = self.arch.decode_latents(self.vae, xs[-1][k:k + 1])[0]
+                    arr = ((img.permute(1, 2, 0).float().cpu().numpy() + 1) * 127.5).round().clip(0, 255)
+                    path = out_dir / f"step{step0 + s:06d}_{k}.png"
+                    Image.fromarray(arr.astype("uint8")).save(path)
+                    rewards.append(self._reward_of(path, prompt, scale))
+                adv = RW.advantages(rewards)
+                kl_val = None
+                if adv is not None:
+                    self.status.update(stage=f"reward fine-tuning {s}/{cfg.reward_steps}: updating")
+                    idx = [j for j, sd in enumerate(stds) if sd > 0]
+                    idx = sorted(rng.sample(idx, min(int(cfg.reward_train_steps), len(idx))))
+                    opt.zero_grad(set_to_none=True)
+                    adv_d, kls = adv.to(dev), []
+                    for j in idx:
+                        for k in range(group):  # one picture at a time: a training step's memory
+                            one = slice(k, k + 1)
+                            x_j, x_next = xs[j][one], xs[j + 1][one]
+                            ne = None if neg_e is None else neg_e[one]
+                            nm = None if neg_m is None else neg_m[one]
+                            v = RW.velocity(model, x_j, sig[j], pos_e[one], pos_m[one], ne, nm, cfg.probe_cfg, skip)
+                            mean, std = RW.sde_step_stats(x_j, v, sig[j], sig[j + 1], sig[1], cfg.reward_noise)
+                            lp = RW.log_prob(x_next, mean, std)
+                            with torch.no_grad():
+                                self._swap_weights(params, ref)
+                                try:
+                                    v_ref = RW.velocity(model, x_j, sig[j], pos_e[one], pos_m[one], ne, nm,
+                                                        cfg.probe_cfg, skip)
+                                finally:
+                                    self._swap_weights(params, ref)
+                                mean_ref, _ = RW.sde_step_stats(x_j, v_ref, sig[j], sig[j + 1], sig[1],
+                                                                cfg.reward_noise)
+                            kl = RW.kl_to(mean, mean_ref, std)
+                            ratio = torch.exp(lp - lp.detach())  # 1 on-policy; its gradient is the log-probability's
+                            ((-(adv_d[k] * ratio) + cfg.reward_kl * kl).sum() / (len(idx) * group)).backward()
+                            kls.append(float(kl.mean()))
+                    torch.nn.utils.clip_grad_norm_(params, 1.0)
+                    opt.step()
+                    sched.step()
+                    kl_val = sum(kls) / len(kls)
+                mean_r = sum(rewards) / len(rewards)
+                history.append([step0 + s, round(mean_r * 100, 2)])
+                log.info("Reward step %d/%d: likeness %s (mean %.1f) for \"%s\"%s | %.1fs/step", s, cfg.reward_steps,
+                         " / ".join(f"{r * 100:.0f}" for r in rewards), mean_r * 100, prompt[:60],
+                         f" | KL {kl_val:.4f}" if kl_val is not None else " | all alike: no update",
+                         (time.time() - t0) / s)
+                self.status.update(step=step0 + s, total=total, rewards=history[-2000:],
+                                   stage=f"reward fine-tuning {s}/{cfg.reward_steps}")
+                if cfg.save_every > 0 and s % cfg.save_every == 0 and s < cfg.reward_steps:
+                    self.save(injected, step0 + s)
+                if self.controller is not None and cfg.probe_every > 0 and s % cfg.probe_every == 0:
+                    lora_mod.set_extras_enabled(model, False)
+                    stop = self.run_probe(model, step0 + s, opt, sched, injected)
+                    model.train()
+                    lora_mod.set_extras_enabled(model, True)
+                    if stop:
+                        log.info("Reward stage: the likeness probes stopped improving; ending at step %d", s)
+                        break
+        finally:
+            lora_mod.set_extras_enabled(model, False)
+            ckpt.set_kept_blocks(model, kept)
+            for name, m in injected.items():
+                m.dropout = dropouts[name]
+        path = self.save(injected, step0 + s, final=True)
+        self.stage_tag = ""
+        log.info("Reward stage done: %s (the first stage's LoRA is %s.safetensors)", path.name, cfg.job_name)
+        return path
+
+    @staticmethod
+    @torch.no_grad()
+    def _swap_weights(params: list, other: list) -> None:
+        """Exchange the adapter weights with another set in place (twice restores them)."""
+        for i, p in enumerate(params):
+            p.data, other[i] = other[i], p.data
+
+    def _reward_of(self, path, prompt: str, scale) -> float:
+        """A reward picture's likeness: on the probes' scale but neither clipped nor curved (0 = a stranger, 1 = the
+        references; below 0 and above 1 still count, so a weak LoRA's pictures still differ), combined with
+        face_weight / body_weight. A missing face counts -1 (every reward prompt shows one), a missing body only in a
+        full-body prompt."""
+        from . import reward as RW
+        from .likeness import combine
+
+        cfg = self.cfg
+
+        def linear(kind, value):
+            if scale is None or not getattr(scale, "normalize", False):
+                return value / 100.0
+            lo, hi = scale.scale(kind)
+            return (value - lo) / (hi - lo)
+
+        face = body = None
+        if self.face_scorer is not None and cfg.face_weight > 0:
+            sc = self.face_scorer.score(path, 0, 0)
+            face = -1.0 if sc.percent is None else linear("face", sc.percent)
+        if self.body_scorer is not None and cfg.body_weight > 0:
+            pct, _ = self.body_scorer.score(path)
+            if pct is not None:
+                body = linear("body", pct)
+            elif RW.is_full_body(prompt):
+                body = -1.0
+        comb = combine(face, body, cfg.face_weight, cfg.body_weight)
+        return -1.0 if comb is None else float(comb)
 
     def _likeness_scale(self):
         """The scale the samples' scores are normalized on: the probe controller's (its floors from the step-0
