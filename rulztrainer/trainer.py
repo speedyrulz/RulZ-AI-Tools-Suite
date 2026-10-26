@@ -766,6 +766,7 @@ class Trainer(RaceParallelMixin):
                      "LoRA before the blocks too (text fusion / projections), so the backward runs through every block")
         if not injected and not cfg.finetune:
             raise ValueError("No LoRA modules selected: check lora_targets / lora_blocks")
+        self._attach_training_adapter(model, log_it=True)
         self.replicas = [(model, injected, self.devices[0])]
         if cfg.multi_gpu == "data_parallel":
             from .multigpu import DataParallelLoRA
@@ -782,6 +783,7 @@ class Trainer(RaceParallelMixin):
                                            blocks=blocks, names=self._lora_names(m, blocks),
                                            kind=cfg.network_type, factor=cfg.lokr_factor,
                                            block=cfg.oft_block_size, constraint=cfg.oft_constraint, dora=cfg.dora)
+                self._attach_training_adapter(m)
                 reps.append((m, inj, dev))
                 self.replicas.append((m, inj, dev))
             self.dp = DataParallelLoRA(injected, reps)
@@ -2051,6 +2053,26 @@ class Trainer(RaceParallelMixin):
                        if Q.fp4_tensor_cores(f"cuda:{i}") and f"cuda:{i}" not in self.devices]
             if capable:
                 log.info("Native FP4 is available on %s: train there for faster nvfp4 steps", ", ".join(capable))
+
+    def _attach_training_adapter(self, model, log_it: bool = False) -> None:
+        """Attach the training adapter (a LoRA on while training, off while sampling, never saved) to a model."""
+        cfg = self.cfg
+        if not cfg.training_adapter or cfg.training_adapter == "auto":
+            return
+        if self.ft is not None:
+            if log_it:
+                log.info("Training adapter %s is not used by a fine-tune (it trains the weights themselves)",
+                         cfg.training_adapter)
+            return
+        n = lora_mod.attach_training_adapter(model, cfg.training_adapter, cfg.training_adapter_strength,
+                                             rename=getattr(self.arch, "lora_module_name", None),
+                                             convert=getattr(self.arch, "extra_lora_converter", None))
+        if log_it:
+            log.info("Training adapter %s: matched %d modules (strength %g; on while training, off for samples and "
+                     "probes, not saved)", cfg.training_adapter, n, cfg.training_adapter_strength)
+        if not n:
+            raise ValueError(f"The training adapter {cfg.training_adapter} matches no layer of this {self.arch.label} "
+                             "model: pick one made for it, or clear training_adapter")
 
     def _attach_sampling_loras(self, model) -> None:
         """Attach the sampling-only LoRAs (turbo + optional secondary) to a model."""

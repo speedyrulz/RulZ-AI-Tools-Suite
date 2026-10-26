@@ -15,24 +15,29 @@ MODEL_PRESETS = {
     "FIBO-2.0-edit-turbo": "briaai/Fibo-2.0-edit-turbo",
     "Krea-2-Raw": "krea/Krea-2-Raw",
     "Krea-2-Turbo": "krea/Krea-2-Turbo",
+    "Qwen-Image-2.1": "Qwen/Qwen-Image-2.1",
+    "Qwen-Image-2.1-Turbo": "Qwen/Qwen-Image-2.1-Turbo",
 }
-ARCH_NAMES = ("moss_image", "fibo2", "krea2")
+ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21")
 # LoRA target groups each family trains when lora_targets is empty. Krea 2 adds the attention output gate and its
 # text-fusion stack, which Fizgig measured to be under-trained by the attention + feed-forward recipe (scaling a
 # finished LoRA's text-fusion blocks x3 lifted likeness 2-7 points on several Krea 2 LoRAs).
 _CORE_TARGETS = ("q", "k", "v", "o", "ffn_up_gate", "ffn_down")
 ARCH_DEFAULT_TARGETS = {"moss_image": _CORE_TARGETS, "fibo2": _CORE_TARGETS,
-                        "krea2": _CORE_TARGETS + ("attn_gate", "text_fusion")}
+                        "krea2": _CORE_TARGETS + ("attn_gate", "text_fusion"), "qwen_image21": _CORE_TARGETS}
 # (sample steps, sample CFG) per family at full quality, in this trainer's guidance convention (uncond + cfg * (cond -
 # uncond), 1 = off): MOSS-Image's reference CFG 3; Bria's FIBO 2.0 pipeline, 30 steps at 5; Krea's pipeline, 28 steps
-# at its guidance_scale 4.5, which computes cond + g * (cond - uncond): cfg 5.5 here
-ARCH_FULL_SAMPLE = {"moss_image": (20, 3.0), "fibo2": (30, 5.0), "krea2": (28, 5.5)}
+# at its guidance_scale 4.5, which computes cond + g * (cond - uncond): cfg 5.5 here; Qwen-Image 2.1 is meant to be
+# sampled without guidance (ComfyUI's template: 25 steps at CFG 1; the diffusers pipeline 40)
+ARCH_FULL_SAMPLE = {"moss_image": (20, 3.0), "fibo2": (30, 5.0), "krea2": (28, 5.5), "qwen_image21": (25, 1.0)}
 # Each family's turbo LoRA (turbo_lora: auto downloads it) and the sampling it is made for. The shift only matters for
 # MOSS-Image: the Krea 2 and FIBO 2.0 samplers take theirs from the image size.
 #   MOSS-Image: lodestones' 8-step DMD LoRA distilled from Base (Fizgig's pick), at 12 steps (Fizgig: much better than
 #               the card's 8), CFG 1, shift 5; it suits Base, not SFT, and can understate likeness (Fizgig, 20 Oct 2026)
 #   Krea 2:     Comfy-Org's Krea 2 Turbo LoRA (rank 64), 8 steps, CFG 1 (ComfyUI's Krea 2 Turbo workflow)
 #   FIBO 2.0:   Comfy-Org's FIBO 2.0 Turbo LoRA (Edit Turbo as a LoRA on dev), 4 steps, CFG 1 (Bria's Edit Turbo card)
+#   Qwen-Image 2.1: Comfy-Org's Turbo LoRA (extracted from Qwen-Image-2.1-Turbo), 8 steps, CFG 1 (its model card), with
+#               the Turbo checkpoint's own sigmas
 ARCH_TURBO = {
     "moss_image": {"repo": "lodestones/Kromoss", "file": "8-steps-dmd-lora.safetensors", "strength": 1.0,
                    "steps": 12, "cfg": 1.0, "shift": 5.0},
@@ -40,13 +45,25 @@ ARCH_TURBO = {
               "steps": 8, "cfg": 1.0, "shift": 5.0},
     "fibo2": {"repo": "Comfy-Org/Fibo-2.0", "file": "loras/fibo_2.0_turbo_lora_avg_rank_270_bf16.safetensors",
               "strength": 1.0, "steps": 4, "cfg": 1.0, "shift": 5.0},
+    "qwen_image21": {"repo": "Comfy-Org/Qwen-Image-2.1",
+                     "file": "loras/qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors", "strength": 1.0,
+                     "steps": 8, "cfg": 1.0, "shift": 5.0},
+}
+# Each family's training adapter (training_adapter: auto downloads it): a LoRA that is on while the LoRA trains and off
+# while it samples, and never saved into it, so the trained LoRA works on the plain model. Fizgig measured on
+# Qwen-Image 2.1: a LoRA trained without one collapses into texture or wobbles part-way, with no warning in the loss;
+# with Fizgig's adapter likeness reached 77 against 56 without (and 76 with SimpleTuner's).
+ARCH_TRAINING_ADAPTER = {
+    "qwen_image21": {"repo": "ShootTheSound/Fizgig-Qwen-Image-2.1-Training-Adapter",
+                     "file": "fizgig_qwen_image_2.1_training_adapter_v2.safetensors"},
 }
 # (sample steps, sample CFG) per family by default: the turbo LoRA's
 ARCH_SAMPLE_DEFAULTS = {fam: (t["steps"], t["cfg"]) for fam, t in ARCH_TURBO.items()}
 
 # Single files (model_source "files") come from Comfy-Org's ComfyUI repackages when a file is left empty: the diffusion
 # model of the picked model in model_file_quant, the family's text encoder in text_encoder_file_quant, its VAE
-COMFY_REPOS = {"moss_image": "Comfy-Org/MOSS-Image", "krea2": "Comfy-Org/Krea-2", "fibo2": "Comfy-Org/Fibo-2.0"}
+COMFY_REPOS = {"moss_image": "Comfy-Org/MOSS-Image", "krea2": "Comfy-Org/Krea-2", "fibo2": "Comfy-Org/Fibo-2.0",
+               "qwen_image21": "Comfy-Org/Qwen-Image-2.1"}
 COMFY_DIFFUSION_FILES = {
     "OpenMOSS-Team/MOSS-Image-Base": "diffusion_models/moss_image_base_{quant}.safetensors",
     "OpenMOSS-Team/MOSS-Image-SFT": "diffusion_models/moss_image_sft_{quant}.safetensors",
@@ -54,16 +71,19 @@ COMFY_DIFFUSION_FILES = {
     "krea/Krea-2-Turbo": "diffusion_models/krea2_turbo_{quant}.safetensors",
     "briaai/Fibo-2.0-dev": "diffusion_models/fibo2_dev_{quant}.safetensors",
     "briaai/Fibo-2.0-edit-turbo": "diffusion_models/fibo2_edit_turbo_{quant}.safetensors",
+    "Qwen/Qwen-Image-2.1": "diffusion_models/qwen_image_2.1_{quant}.safetensors",
+    "Qwen/Qwen-Image-2.1-Turbo": "diffusion_models/qwen_image_2.1_turbo_{quant}.safetensors",
 }
 COMFY_DIFFUSION_QUANTS = {"moss_image": ("int8_convrot", "bf16"), "krea2": ("int8_convrot", "fp8_scaled", "bf16"),
-                          "fibo2": ("int8_convrot", "bf16")}
+                          "fibo2": ("int8_convrot", "bf16"), "qwen_image21": ("int8_convrot", "bf16")}
 COMFY_TEXT_ENCODER_FILES = {"moss_image": "text_encoders/qwen3.5_9b_{quant}.safetensors",
                             "krea2": "text_encoders/qwen3vl_4b_{quant}.safetensors",
-                            "fibo2": "text_encoders/qwen3vl_4b_{quant}.safetensors"}
+                            "fibo2": "text_encoders/qwen3vl_4b_{quant}.safetensors",
+                            "qwen_image21": "text_encoders/qwen3vl_8b_{quant}.safetensors"}
 COMFY_TEXT_ENCODER_QUANTS = {"moss_image": ("int8_convrot", "bf16"), "krea2": ("int8_convrot", "fp8_scaled", "bf16"),
-                             "fibo2": ("int8_convrot", "bf16")}
+                             "fibo2": ("int8_convrot", "bf16"), "qwen_image21": ("int8_convrot", "bf16")}
 COMFY_VAE_FILES = {"moss_image": "vae/flux2-vae_small.safetensors", "krea2": "vae/qwen_image_vae.safetensors",
-                   "fibo2": "vae/flux2-vae.safetensors"}
+                   "fibo2": "vae/flux2-vae.safetensors", "qwen_image21": "vae/qwen_image_2.1_vae_bf16.safetensors"}
 
 
 # Named presets: values applied over a config (UI toggle, --preset on the CLI, or `preset:` in YAML).
@@ -149,7 +169,8 @@ class TrainConfig:
     seed: int = 42
 
     # --- model ---
-    model_arch: str = "auto"  # auto | moss_image | fibo2 | krea2 (auto: the model's transformer config, or the path)
+    model_arch: str = "auto"  # auto | moss_image | fibo2 | krea2 | qwen_image21 (auto: the model's transformer config,
+    #                           or the path)
     model_source: str = "files"  # files: single ComfyUI-style safetensors files | hf: repo id / diffusers dir
     model_path: str = "OpenMOSS-Team/MOSS-Image-Base"  # HF repo id or local dir with transformer/ text_encoder/ vae/
     models_dir: str = "models"  # where HF repos are downloaded
@@ -288,6 +309,9 @@ class TrainConfig:
     turbo_lora_strength: float = 1.0
     sample_lora: str = ""  # optional second ComfyUI-format LoRA applied only while sampling (with the turbo LoRA)
     sample_lora_strength: float = 1.0
+    training_adapter: str = "auto"  # a LoRA on while training and off while sampling, never saved (ARCH_TRAINING_ADAPTER;
+    #   Qwen-Image 2.1: Fizgig's): auto = the model family's (downloaded; the others have none), "" = none, or a path
+    training_adapter_strength: float = 1.0
     # --- face similarity (character LoRAs) ---
     face_refs: list[str] = field(default_factory=list)  # dataset images whose largest face is the reference identity
     face_provider: str = "cpu"  # cpu | cuda (onnxruntime provider for InsightFace)
@@ -455,6 +479,8 @@ class TrainConfig:
         if self.model_arch and self.model_arch != "auto":
             return self.model_arch
         hint = " ".join([self.model_path or "", self.transformer_file or ""]).lower()
+        if "qwen-image" in hint or "qwen_image" in hint or "qwenimage" in hint:
+            return "qwen_image21"
         return "fibo2" if "fibo" in hint else "krea2" if "krea" in hint else "moss_image"
 
     def resolved_lora_targets(self) -> list[str]:

@@ -51,16 +51,17 @@ def backend_name() -> str:
     return _name
 
 
-def sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+def sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attn_mask: torch.Tensor | None = None,
+         is_causal: bool = False) -> torch.Tensor:
     """scaled_dot_product_attention on [B, heads, S, D] tensors, through the pinned backend when there is one."""
     global _pinned, _name
     if _pinned is None:
-        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
     try:
         with sdpa_kernel(_pinned):
-            return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+            return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
     except RuntimeError as e:
         log.warning("attention_backend %s rejected a call (%s); PyTorch picks the kernel from here on", _name,
                     str(e).splitlines()[0][:160])
         _pinned, _name = None, "torch"
-        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)

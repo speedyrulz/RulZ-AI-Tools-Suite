@@ -45,9 +45,10 @@ EXTRA_TARGETS = {
                               "default)"),
     "text_fusion": (("krea2",), "the text fusion blocks that mix the 12 text encoder layers (on by default: the usual "
                                 "recipe leaves them under-trained)"),
-    "embed": (("fibo2", "krea2"), "image / text / timestep embedders and the final layer"),
+    "text_in": (("qwen_image21",), "the text projection that brings Qwen3-VL's features into the model"),
+    "embed": (("fibo2", "krea2", "qwen_image21"), "image / text / timestep embedders and the final layer"),
 }
-N_BLOCKS = {"moss_image": 42, "fibo2": 44, "krea2": 28}
+N_BLOCKS = {"moss_image": 42, "fibo2": 44, "krea2": 28, "qwen_image21": 32}
 COMPILE_CHOICES = {"auto": "auto: runs of 100+ steps", True: "on", False: "off"}
 N_BLOCKS_MAX = max(N_BLOCKS.values())
 
@@ -67,6 +68,8 @@ FILE_QUANT_LABELS = {"int8_convrot": "int8 ConvRot (about half of bf16)", "fp8_s
                      "bf16": "bf16 (full size)"}
 TURBO_MODES = {"auto": "The model's turbo LoRA (downloaded)", "none": "None: full-quality sampling",
                "file": "A LoRA file"}
+ADAPTER_MODES = {"auto": "The model's training adapter (downloaded; Qwen-Image 2.1)", "none": "None",
+                 "file": "A LoRA file"}
 SAMPLE_ASPECTS = {"1:1": "1:1 square", "4:5": "4:5 portrait", "3:4": "3:4 portrait", "2:3": "2:3 portrait",
                   "9:16": "9:16 portrait", "5:4": "5:4 landscape", "4:3": "4:3 landscape", "3:2": "3:2 landscape",
                   "16:9": "16:9 landscape", "21:9": "21:9 wide"}
@@ -1093,6 +1096,9 @@ class Form:
             turbo_lora_strength=float(v("turbo_lora_strength")),
             sample_model_path=s("sample_model_path"), sample_model_quant=v("sample_model_quant"),
             sample_lora=s("sample_lora"), sample_lora_strength=float(v("sample_lora_strength")),
+            training_adapter={"auto": "auto", "none": ""}.get(v("adapter_mode"), s("training_adapter")),
+            training_adapter_strength=float(v("training_adapter_strength") if v("training_adapter_strength") is not None
+                                            else 1.0),
             face_refs=[p.strip() for p in (v("face_refs") or "").splitlines() if p.strip()],
             face_provider=v("face_provider"), face_det_size=int(v("face_det_size")),
             body_refs=[p.strip() for p in (v("body_refs") or "").splitlines() if p.strip()],
@@ -1167,6 +1173,9 @@ class Form:
         values["turbo_mode"] = ("auto" if cfg.turbo_lora == "auto" else "file" if cfg.turbo_lora else "none")
         values["finetune_extract_ranks"] = ", ".join(str(r) for r in cfg.finetune_extract_ranks)
         values["turbo_lora"] = "" if cfg.turbo_lora == "auto" else cfg.turbo_lora
+        values["adapter_mode"] = ("auto" if cfg.training_adapter == "auto" else "file" if cfg.training_adapter
+                                  else "none")
+        values["training_adapter"] = "" if cfg.training_adapter == "auto" else cfg.training_adapter
         targets = cfg.resolved_lora_targets()  # an empty list means the family's defaults
         for t in TARGETS + list(EXTRA_TARGETS):
             values[f"target_{t}"] = t in targets
@@ -1649,6 +1658,25 @@ def _serve_image(path: str):
     if p.suffix.lower() not in IMAGE_EXTS or not p.is_file():
         raise HTTPException(status_code=404, detail="Not Found")
     return FileResponse(p, headers={"Cache-Control": "max-age=86400"})
+
+
+@app.get("/rz-lora")
+def _serve_lora(path: str):
+    """A LoRA a run saved, as a download: .safetensors files inside a job folder (one with a status.json) only."""
+    from fastapi import HTTPException
+    from fastapi.responses import FileResponse
+
+    p = Path(path)
+    if p.suffix.lower() != ".safetensors" or not p.is_file() or not (p.parent / "status.json").is_file():
+        raise HTTPException(status_code=404, detail="Not Found")
+    return FileResponse(p, filename=p.name, media_type="application/octet-stream")
+
+
+def lora_url(path) -> str:
+    """The download URL of a LoRA a run saved (served by /rz-lora)."""
+    from urllib.parse import quote
+
+    return f"/rz-lora?path={quote(str(Path(path).resolve()))}"
 
 
 def image_url(path) -> str:
@@ -2666,7 +2694,8 @@ def character_focus(cfg: TrainConfig) -> str:
 # Frozen DiT weights by family and quantization, in GB (what block swap moves into system RAM), and the memory a step
 # needs besides them (activations, the LoRA, the VAE, the CUDA context).
 MODEL_GB = {"moss_image": {"bf16": 10.0, "int8": 5.5, "nvfp4": 3.0}, "krea2": {"bf16": 25.0, "int8": 13.5, "nvfp4": 8.0},
-            "fibo2": {"bf16": 16.0, "int8": 9.0, "nvfp4": 5.0}}
+            "fibo2": {"bf16": 16.0, "int8": 9.0, "nvfp4": 5.0},
+            "qwen_image21": {"bf16": 14.2, "int8": 7.3, "nvfp4": 4.0}}
 STEP_HEADROOM_GB = 4.5
 
 
@@ -2677,7 +2706,8 @@ def block_swap_plan(cfg: TrainConfig, vram: float, quant: str) -> tuple[int, flo
         if cfg.model_source == "files":
             quant = "bf16" if cfg.model_file_quant == "bf16" else "int8"
         else:
-            quant = {"krea2": "int8" if vram >= 22 else "nvfp4", "fibo2": "int8" if vram < 22 else "bf16"}.get(fam, "bf16")
+            quant = {"krea2": "int8" if vram >= 22 else "nvfp4", "fibo2": "int8" if vram < 22 else "bf16",
+                     "qwen_image21": "bf16" if vram >= 24 else "int8" if vram >= 11 else "nvfp4"}.get(fam, "bf16")
     quant = {"int8_convrot": "int8", "none": "bf16"}.get(quant, quant)
     gb = MODEL_GB.get(fam, MODEL_GB["moss_image"]).get(quant, 10.0)
     blocks = get_arch(cfg).n_blocks or 28
@@ -2704,6 +2734,12 @@ MODEL_NOTES = {
                        "to download; needs a 24 GB card or two 16 GB cards for int8 (one 16 GB card: nvfp4)."),
     "Krea-2-Turbo": ("Not for training", "The 8-step distilled Krea 2. Train on Krea-2-Raw and use Turbo to preview "
                                          "and generate with the LoRA."),
+    "Qwen-Image-2.1": ("", "Qwen-Image 2.1 (7B), text-to-image and editing in one model. Comfy-Org's single files "
+                           "(int8, 7.3 GB, with the 9.4 GB Qwen3-VL-8B text encoder) train on one 16 GB card; its "
+                           "LoRAs load in ComfyUI and diffusers, on Turbo too. Qwen Research License: non-commercial "
+                           "unless Qwen grants more."),
+    "Qwen-Image-2.1-Turbo": ("Not for training", "The 8-step distilled Qwen-Image 2.1. Train on Qwen-Image-2.1: its "
+                                                 "LoRAs load onto Turbo, and the Turbo LoRA previews the same way."),
 }
 
 
@@ -2716,6 +2752,7 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     fibo = cfg.arch_name() == "fibo2"
     krea = cfg.arch_name() == "krea2"
     krea_turbo = krea and "krea-2-turbo" in (cfg.sample_model_path or "").lower()
+    qwen = cfg.arch_name() == "qwen_image21"
     character = goal == "character"
     vram = min(g["total"] for g in gpus) / 1024 if gpus else None
     gpu_name = "your smallest GPU" if len(gpus) > 1 else "your GPU"
@@ -2742,6 +2779,9 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
         elif krea:
             r["transformer_quant"] = ("auto", "Krea 2 picks for the memory it runs in: int8 (13.5 GB) from 22 GB, "
                                               "e.g. two 16 GB cards in model split, else nvfp4 (8 GB); bf16 is 25 GB")
+        elif qwen:
+            r["transformer_quant"] = ("auto", "Qwen-Image 2.1 picks for the memory it runs in: bf16 (14.2 GB) from "
+                                              "24 GB, int8 (7.3 GB) from 11 GB, else nvfp4")
         elif vram >= 22:
             r["transformer_quant"] = ("auto", f"{gpu_name} has {vram:.0f} GB, so the 10 GB bf16 model fits as it is")
         elif vram >= 11:
@@ -2750,7 +2790,7 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
         else:
             r["transformer_quant"] = ("nvfp4", f"{gpu_name} has {vram:.0f} GB: nvfp4 quarters the model so it fits "
                                                "(slower, fp4 weights are expanded every step)")
-        te_gb = 9 if fibo or krea else 19
+        te_gb = 9 if fibo or krea else 17 if qwen else 19
         if vram >= te_gb + 4:
             r["text_encoder_quant"] = ("auto", f"the {te_gb} GB text encoder fits on {gpu_name} as it is")
         else:
@@ -2775,6 +2815,9 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
         med = data["median_mp"]
         target = max(0.25, int(med * 4) / 4)
         reason = f"half of your images are under {med:.2f} MP; training above their size only upscales them"
+    if qwen and target >= 0.5:
+        target, reason = 0.5, ("Fizgig's sweet spot for Qwen-Image 2.1: quicker than 1 MP, and a LoRA pulls less of the "
+                               "model's sharpness toward the photos'")
     r["resolutions"] = ([target], reason)
     r["enable_buckets"] = (True, "keeps every image's aspect ratio instead of cropping it square")
     if character:
@@ -2830,17 +2873,22 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
         r["optimizer"] = ("adamw8bit", "AdamW with 8-bit state: the same results as adamw with less memory")
         if cfg.optimizer != "automagic3":  # it sets its own rate per layer type
             r["learning_rate"] = (1e-4, "the usual LoRA learning rate; go lower (5e-5) if samples look burnt or noisy")
-        lokr_ok = cfg.arch_name() != "fibo2"  # diffusers has no LoKr loader
-        r["network_type"] = (("lokr", "Fizgig's measured best likeness and more natural skin, about 20% slower steps")
-                             if character and lokr_ok else
-                             ("lora", "loads everywhere" + ("" if lokr_ok else " (a FIBO 2.0 LoKr loads only back "
-                                                                              "into RulzTrainer)")))
+            if qwen and cfg.network_type == "lora":
+                r["learning_rate"] = ((1.5e-4, "Fizgig's Qwen-Image 2.1 style preset (rank 16)") if goal == "style" else
+                                      (2e-4, "Fizgig's fastest-to-likeness Qwen-Image 2.1 recipe: rank 8 from 2e-4"))
+        r["network_type"] = ("lora", "reached likeness much sooner than LoKr in RulzTrainer's tests so far, and "
+                                     "loads everywhere (ComfyUI and diffusers)")
         if cfg.network_type == "lokr":
             r["lokr_factor"] = (8, "Fizgig's measured default: lower is bigger files, nothing gained above 8")
         elif cfg.network_type == "lora":
             rank = 32 if goal == "style" else 16
             r["lora_rank"] = (rank, "styles carry a lot of varied detail" if goal == "style"
                               else "plenty for a character or concept; higher ranks mostly add file size")
+            if qwen:
+                rank = 16 if goal == "style" else 8
+                r["lora_rank"] = (rank, "Fizgig's Qwen-Image 2.1 style preset" if goal == "style" else
+                                  "Fizgig's Qwen-Image 2.1 recipe: rank 8 held skin detail best; 16 at the same rate "
+                                  "overcooked")
             r["lora_alpha"] = (float(rank), "alpha equal to rank keeps the adapter's scale at 1")
     if goal == "style":
         r["timestep_sampling"] = ("logsnr", "spends most steps at very high noise, where an art style is learned "
@@ -2848,6 +2896,9 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     elif not character:  # the identity recipe sets logit_normal itself
         r["timestep_sampling"] = ("logit_normal", "the default: most steps at middle noise, fewer at the extremes")
     r["batch_size"] = (1, "small batches with more steps beat large batches for LoRAs")
+    if qwen and not cfg.finetune:
+        r["adapter_mode"] = ("auto", "Fizgig's training adapter: without one Qwen-Image 2.1 LoRAs collapse into "
+                                     "texture or wobble part-way (likeness 77 with it, 56 without)")
     if krea:
         r["target_text_fusion"] = (True, "the attention + feed-forward recipe leaves Krea's text fusion under-trained: "
                                          "Fizgig measured 2-7 likeness points from boosting it on finished LoRAs")
@@ -2881,6 +2932,9 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     elif fibo:
         r["sample_steps"] = (30, "Bria samples dev at 50 steps; 20-30 is plenty for previews")
         r["sample_cfg"] = (5.0, "Bria's guidance scale for FIBO 2.0 dev")
+    elif qwen:
+        r["sample_steps"] = (25, "ComfyUI's Qwen-Image 2.1 template (the diffusers pipeline: 40)")
+        r["sample_cfg"] = (1.0, "Qwen-Image 2.1 is meant to be sampled without guidance")
     else:
         r["sample_steps"] = (20, "the reference MOSS-Image sampler")
         r["sample_cfg"] = (3.0, "the reference MOSS-Image guidance scale")
@@ -3012,6 +3066,9 @@ def review_issues(cfg: TrainConfig, goal: str | None, data: dict | None, n_gpus:
     if "edit-turbo" in cfg.model_path.lower():
         out.append(("warning", "FIBO-2.0-edit-turbo is a distilled model. Train on FIBO-2.0-dev: its LoRAs load "
                                "onto Edit Turbo."))
+    elif "qwen-image-2.1-turbo" in cfg.model_path.lower():
+        out.append(("warning", "Qwen-Image-2.1-Turbo is a distilled model. Train on Qwen-Image-2.1: its LoRAs load "
+                               "onto Turbo, and the Turbo LoRA previews them the same way."))
     elif "krea-2-turbo" in cfg.model_path.lower():
         out.append(("warning", "Krea-2-Turbo is a distilled model. Train on Krea-2-Raw and set Turbo as the sampling "
                                "model: LoRAs trained on Raw are meant for Turbo."))
@@ -3092,7 +3149,7 @@ def _same(current, rec) -> bool:
 def _show(widget, value) -> str:
     """A recommended value the way the user sees it (the option label of a select, on/off, megapixels)."""
     options = getattr(widget, "options", None)
-    if isinstance(options, dict) and value in options:
+    if isinstance(options, dict) and not isinstance(value, list) and value in options:
         return str(options[value])
     if isinstance(value, bool):
         return "on" if value else "off"
@@ -3479,7 +3536,7 @@ class Wizard:
                 .bind_visibility_from(self.w["model_source"], "value", lambda x: x == FILE_SOURCE):
             with self.setting(None, "File formats to download",
                               "int8 ConvRot is about half the size of bf16, trains as fast and loses under 1% "
-                              "accuracy. Krea 2 also offers fp8."):
+                              "accuracy (the default). Krea 2 also offers fp8."):
                 self.bind(ui.select(file_quant_options(preset_arch("MOSS-Image-Base"), "model"),
                                     label="Diffusion model"), "model_file_quant").classes("w-full")
                 self.bind(ui.select(file_quant_options(preset_arch("MOSS-Image-Base"), "text"),
@@ -3498,9 +3555,10 @@ class Wizard:
                     ("transformer_file", "Diffusion model file (optional)", "A ComfyUI models/diffusion_models file "
                                                                             "you already have.", "file"),
                     ("text_encoder_file", "Text encoder file (optional)", "Qwen3.5-9B for MOSS-Image, Qwen3-VL-4B for "
-                                                                          "Krea 2 and FIBO 2.0.", "file"),
+                                                                          "Krea 2 and FIBO 2.0, Qwen3-VL-8B for "
+                                                                          "Qwen-Image 2.1.", "file"),
                     ("vae_file", "VAE file (optional)", "The Flux2 VAE for MOSS-Image and FIBO 2.0, the Qwen-Image VAE "
-                                                        "for Krea 2.", "file"),
+                                                        "for Krea 2, its own for Qwen-Image 2.1.", "file"),
                     ("tokenizer_path", "Tokenizer folder (optional)", "Left empty, the tokenizer is downloaded once "
                                                                       "(a few MB).", "dir")):
                 with self.setting(None, title, text + " Left empty, it is downloaded."):
@@ -3791,6 +3849,14 @@ class Wizard:
                           "Every Krea 2 attention has a sigmoid gate on its output. Krea's own LoRAs train it.",
                           show_if=is_krea):
             self.bind(ui.switch("Attention gate"), "target_attn_gate")
+        is_qwen = ("model_preset", lambda p: preset_arch(p, self.w["model_path"].value) == "qwen_image21")
+        with self.setting("adapter_mode", "Training adapter",
+                          "A small LoRA that stays on while your LoRA trains and off for samples and probes, and is "
+                          "never saved into it, so your LoRA works on the plain model. Fizgig measured on Qwen-Image "
+                          "2.1: without one, LoRAs collapse into texture or wobble part-way with no warning in the "
+                          "loss; with Fizgig's adapter (downloaded, 80 MB) likeness reached 77 against 56.",
+                          show_if=is_qwen):
+            self.bind(ui.select(ADAPTER_MODES, label="Training adapter"), "adapter_mode").classes("w-full")
         with self.setting("region_weights", "Region-weighted loss",
                           "Weights what the model learns by region: the face counts most, the rest of the person "
                           "next, the background least, so the LoRA spends its capacity on the identity.",
@@ -3865,8 +3931,9 @@ class Wizard:
         with self.setting(None, "Turbo LoRA",
                           "A step-distilled LoRA used only while rendering samples and probes, never in training: "
                           "previews take seconds. The model's own is downloaded (MOSS-Image: 12 steps at CFG 1; "
-                          "Krea 2: 8; FIBO 2.0: 4) and the steps and guidance below follow it. For MOSS-Image, Fizgig "
-                          "found it can understate likeness: judge likeness on full-quality samples."):
+                          "Krea 2 and Qwen-Image 2.1: 8; FIBO 2.0: 4) and the steps and guidance below follow it. "
+                          "For MOSS-Image, Fizgig found it can understate likeness: judge likeness on full-quality "
+                          "samples."):
             self.bind(ui.select(TURBO_MODES, label="Turbo LoRA"), "turbo_mode").classes("w-full")
             self.bind(path_field("Turbo LoRA file", "file", width="w-full"), "turbo_lora") \
                 .parent_slot.parent.bind_visibility_from(self.w["turbo_mode"], "value", lambda x: x == "file")
@@ -4405,7 +4472,8 @@ def build_page(local: bool = True):
             ui.element("img").props('src="/assets/logo_dark.png" alt="Rulz"').classes("rz-logo rz-dark-only")
             ui.element("img").props('src="/assets/logo.png" alt="Rulz"').classes("rz-logo rz-light-only")
             ui.label("TRAINER").classes("rz-wordmark")
-            ui.label("LoRA training for MOSS-Image, Bria FIBO 2.0 and Krea 2").classes("rz-tagline gt-sm")
+            ui.label("LoRA training for MOSS-Image, Bria FIBO 2.0, Krea 2 and Qwen-Image 2.1") \
+                .classes("rz-tagline gt-sm")
             ui.space()
             # sun in the dark look (switch to light), moon in the light look; CSS picks the icon, so it is right
             # from the first paint
@@ -4602,16 +4670,18 @@ def build_page(local: bool = True):
                                                               "now (Hugging Face's cache keeps them for later runs)")
                             files_status = hint("")
                             hint("The model picked above comes as single files from Comfy-Org's ComfyUI repackages "
-                                 "(Comfy-Org/MOSS-Image, Comfy-Org/Krea-2, Comfy-Org/Fibo-2.0), downloaded on the first "
+                                 "(Comfy-Org/MOSS-Image, Comfy-Org/Krea-2, Comfy-Org/Fibo-2.0, Comfy-Org/Qwen-Image-2.1), "
+                                 "downloaded on the first "
                                  "run. To use files you already have, set them below: anything left empty is "
                                  "downloaded.")
                             path_input(f, "transformer_file", "Diffusion model file (optional; empty = download)",
                                        "file", "", "w-[40rem]")
                             path_input(f, "text_encoder_file", "Text encoder file (optional; Qwen3.5-9B for MOSS-Image, "
-                                                               "Qwen3-VL-4B for Krea 2 and FIBO 2.0)", "file", "",
-                                       "w-[40rem]")
+                                                               "Qwen3-VL-4B for Krea 2 and FIBO 2.0, Qwen3-VL-8B for "
+                                                               "Qwen-Image 2.1)", "file", "", "w-[40rem]")
                             path_input(f, "vae_file", "VAE file (optional; Flux2 for MOSS-Image and FIBO 2.0, "
-                                                      "Qwen-Image for Krea 2)", "file", "", "w-[40rem]")
+                                                      "Qwen-Image for Krea 2, its own for Qwen-Image 2.1)", "file", "",
+                                       "w-[40rem]")
                             path_input(f, "tokenizer_path", "Tokenizer folder (optional; auto-downloads if empty)",
                                        "dir", "", "w-[40rem]")
                         subhead("GPUs and memory")
@@ -4998,6 +5068,21 @@ def build_page(local: bool = True):
                                 .tooltip("lora_up learns at lr x ratio (faster convergence); ignored by automagic3")
                             w["lora_save_dtype"] = ui.select(["bf16", "fp16", "fp32"], value=d.lora_save_dtype,
                                                              label="Save LoRA as").classes("w-36")
+                        with fields():
+                            w["adapter_mode"] = ui.select(ADAPTER_MODES, value="auto", label="Training adapter") \
+                                .classes("w-96") \
+                                .tooltip("A LoRA that stays on while your LoRA trains and off for samples and probes, "
+                                         "never saved into it, so your LoRA works on the plain model. Qwen-Image "
+                                         "2.1's is Fizgig's (downloaded, 80 MB): without one its LoRAs collapse "
+                                         "into texture or wobble part-way (likeness 77 with it, 56 without). The "
+                                         "other models have none of their own; a file works on any.")
+                            path_input(f, "training_adapter", "Training adapter file", "file", "", "w-[30rem]")
+                            f.w["training_adapter"].parent_slot.parent.bind_visibility_from(w["adapter_mode"], "value",
+                                                                                            lambda x: x == "file")
+                            w["training_adapter_strength"] = ui.number("Adapter strength",
+                                                                       value=d.training_adapter_strength, step=0.05) \
+                                .classes("w-40").bind_visibility_from(w["adapter_mode"], "value",
+                                                                      lambda x: x != "none")
                         subhead("Target layers")
                         with ui.row().classes("w-full items-center gap-1"):
                             for t in TARGETS:
@@ -5231,8 +5316,8 @@ def build_page(local: bool = True):
                             w["turbo_mode"] = ui.select(TURBO_MODES, value="auto", label="Turbo LoRA").classes("w-80") \
                                 .tooltip("A step-distilled LoRA used only while rendering samples and probes, never "
                                          "in training. The model's own: MOSS-Image lodestones' 8-step DMD LoRA (12 "
-                                         "steps, CFG 1, shift 5), Krea 2 Comfy-Org's Turbo LoRA (8 steps, CFG 1), "
-                                         "FIBO 2.0 Comfy-Org's Turbo LoRA (4 steps, CFG 1).")
+                                         "steps, CFG 1, shift 5), Krea 2 and Qwen-Image 2.1 Comfy-Org's Turbo LoRAs "
+                                         "(8 steps, CFG 1), FIBO 2.0 Comfy-Org's Turbo LoRA (4 steps, CFG 1).")
                             path_input(f, "turbo_lora", "Turbo / step-distill LoRA file", "file", "", "w-[30rem]")
                             f.w["turbo_lora"].parent_slot.parent.bind_visibility_from(w["turbo_mode"], "value",
                                                                                       lambda x: x == "file")
@@ -5253,7 +5338,7 @@ def build_page(local: bool = True):
                             w["sample_steps"] = ui.number("Steps", value=d.sample_steps, precision=0).classes("w-28")
                             w["sample_cfg"] = ui.number("CFG", value=d.sample_cfg).classes("w-28")
                             w["sample_shift"] = ui.number("Shift", value=d.sample_shift).classes("w-28") \
-                                .tooltip("MOSS-Image only (5); Krea 2 and FIBO 2.0 take their shift from the image size")
+                                .tooltip("MOSS-Image only (5); the other models take their shift from the image size")
                         hint("FIBO 2.0: with its turbo LoRA (Edit Turbo as a LoRA on dev) samples render 4 steps at "
                              "CFG 1; without it Bria samples dev at 50 steps / CFG 5 (20-30 is fine for previews). An "
                              "empty negative prompt means the null caption it was trained with. Prompts can be plain "
@@ -5263,6 +5348,11 @@ def build_page(local: bool = True):
                              "many steps with guidance (Krea's pipeline: 28 steps at their guidance 4.5, CFG 5.5 "
                              "here).").bind_visibility_from(
                             w["model_preset"], "value", lambda p: preset_arch(p, w["model_path"].value) == "krea2")
+                        hint("Qwen-Image 2.1: with its turbo LoRA samples render 8 steps at CFG 1 on the Turbo "
+                             "checkpoint's own schedule. Without it, 25 steps at CFG 1 (ComfyUI's template; the model "
+                             "is meant to be sampled without guidance).").bind_visibility_from(
+                            w["model_preset"], "value",
+                            lambda p: preset_arch(p, w["model_path"].value) == "qwen_image21")
                         hint("MOSS-Image: lodestones' turbo LoRA renders 12 steps at CFG 1 on Base. Fizgig found it "
                              "can understate likeness: judge a run's likeness on full-quality samples (Turbo LoRA: "
                              "none, 20 steps, CFG 3).").bind_visibility_from(
@@ -6013,9 +6103,31 @@ def build_page(local: bool = True):
                     with ui.row().classes("w-full gap-2") as samples_row:
                         hint("No samples yet. They appear here every 'Sample every' steps.")
                 with section("Log and saved files", "train.log, checkpoints and training states", "terminal"):
+                    downloads_row = ui.row().classes("w-full gap-2 items-center")
                     saved_label = ui.label("").classes("rz-mono whitespace-pre-wrap")
                     log_view = ui.log(max_lines=600).classes("w-full h-80 rz-log rz-mono")
             shown_samples: list[str] = []
+            shown_downloads: list = []
+
+            def show_downloads(saved: list[str]) -> None:
+                """A download button per saved LoRA file that is still there (rolling saves delete old ones)."""
+                rows = []
+                for p in saved:
+                    try:
+                        rows.append((p, Path(p).stat().st_size))
+                    except OSError:
+                        continue
+                if rows == shown_downloads:
+                    return
+                shown_downloads[:] = rows
+                downloads_row.clear()
+                with downloads_row:
+                    if rows:
+                        ui.label("Download:").classes("rz-hint")
+                    for p, size in rows:
+                        ui.button(f"{Path(p).name} ({size / 2**20:.0f} MB)", icon="download",
+                                  on_click=lambda _, q=p: ui.download(lora_url(q), Path(q).name))                             .props("outline dense no-caps size=sm")                             .tooltip("Save this LoRA to this computer (useful when the WebUI runs remotely)")
+
             log_state = {"job": None, "n": 0, "console_shown": False}
             show_full = image_viewer()
 
@@ -6307,6 +6419,7 @@ def build_page(local: bool = True):
                                         .on("click", lambda _, q=p: show_full(Path(q)))
                                     ui.label(Path(p).name + cap_).classes("text-xs px-1")
                 saved = list(st.get("saved") or [])
+                show_downloads(saved)
                 states = list(st.get("states") or [])
                 saved_label.text = ("Saved:\n" + "\n".join(saved) if saved else "No LoRA saved yet.") \
                     + ("\nStates:\n" + "\n".join(states) if states else "")
@@ -6623,7 +6736,7 @@ In the Wizard, *Character / person* then asks how much of the person the likenes
 | Body focus | 1.5 / 3 | 30% / 70% | face + bust | both |
 | Body only | 1 / 3 | 0 / 100% | none | body only (no face references) |
 
-The curriculum is on for the three in the middle. The wizard also recommends the adapter (LoKr for a character),
+The curriculum is on for the three in the middle. The wizard also recommends the adapter (a LoRA for every model),
 block swap for a card the model does not fit, LoRA Isolation, the look warm-up and how many checkpoints to keep.
 Measured on a small test set (120 steps, same seeds): region-weighted loss gave the best face likeness (+2 points
 over baseline), LoRA+ at ratio 4 a small gain (ratio 16 on a 2e-4 lr was unstable), `identity` timesteps were
@@ -6745,6 +6858,34 @@ pipe = Krea2Pipeline.from_pretrained("krea/Krea-2-Turbo", torch_dtype=torch.bflo
 pipe.load_lora_weights("output/<job>/<job>.safetensors")
 image = pipe("<trigger>, ...", num_inference_steps=8, guidance_scale=0.0).images[0]
 ```
+
+## Qwen-Image 2.1
+
+Pick **Qwen-Image-2.1** as the model. By default it comes as Comfy-Org's single files (Comfy-Org/Qwen-Image-2.1,
+int8 ConvRot): the 7B diffusion model (7.3 GB), the Qwen3-VL-8B text encoder (9.4 GB, used for caching and then
+unloaded) and its RGBA VAE, so one 16 GB card trains it. Training images are bucketed on a 32 px grid (the model's
+image tokens come in 2x2 groups).
+
+The **training adapter** (LoRA, *Training adapter*, `auto`) is Fizgig's: a small LoRA that stays on while your LoRA
+trains and off for samples and probes, and is never saved into your file. Fizgig measured that Qwen-Image 2.1 LoRAs
+trained without one collapse into texture or wobble part-way, with nothing in the loss to warn you (likeness 77 with
+it, 56 without). Fizgig's recipe: 0.5 MP, rank 8, learning rate 2e-4 (rank 16 for big or mixed datasets at half the
+rate), EMA 0.98; the setup wizard suggests it.
+
+Samples render with Comfy-Org's **Turbo LoRA** (8 steps, CFG 1, the Turbo checkpoint's own schedule); without it,
+25 steps at CFG 1 (the model is meant to be sampled without guidance). LoRAs are saved in the diffusers / PEFT
+format; ComfyUI's LoRA loader maps them (the feed-forward's gate and up halves onto its fused layer), and so does
+diffusers:
+
+```python
+from diffusers import QwenImage21Pipeline
+pipe = QwenImage21Pipeline.from_pretrained("Qwen/Qwen-Image-2.1-Turbo", torch_dtype=torch.bfloat16).to("cuda")
+pipe.load_lora_weights("output/<job>/<job>.safetensors")
+image = pipe("<trigger>, ...").images[0]
+```
+
+Only text-to-image LoRAs train for now (no edit LoRAs from before / after pairs). Qwen-Image 2.1 is under the Qwen
+Research License: non-commercial use unless Qwen grants more, and a shared LoRA must say "Built with Qwen".
 """
 
 

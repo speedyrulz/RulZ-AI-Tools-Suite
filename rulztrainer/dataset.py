@@ -69,28 +69,31 @@ class RegionBatch:
 
 
 def bucket_size(w: int, h: int, cfg: TrainConfig, side: int | None = None) -> tuple[int, int]:
-    """Pick a (W,H) multiple of 16 with area ~= side^2 preserving aspect ratio (side defaults to cfg.resolution).
+    """Pick a (W,H) multiple of 16 (the family's size_multiple: 32 for Qwen-Image 2.1) with area ~= side^2 preserving
+    aspect ratio (side defaults to cfg.resolution).
 
     min/max_bucket_side are applied as a uniform rescale first (so the aspect ratio survives the limit) and only
     as a hard per-side clamp when an extreme aspect ratio cannot satisfy both limits."""
+    m = get_arch(cfg).size_multiple
     side = int(side or cfg.resolution)
     if not cfg.enable_buckets:
-        return side // 16 * 16, side // 16 * 16
+        return side // m * m, side // m * m
     aspect = w / h
     bw = math.sqrt(side * side * aspect)
     bh = bw / aspect
     # the limits are relative to the side: the minimum never exceeds half of it and the maximum never drops below
     # twice it, so every resolution keeps its pixel count (512 -> ~512x512 of area, 2048 -> ~2048x2048) instead of
     # being inflated or shrunk until a fixed limit is met
-    lo, hi = min(cfg.min_bucket_side, side // 2 // 16 * 16), max(cfg.max_bucket_side, side * 2)
+    lo, hi = min(cfg.min_bucket_side, side // 2 // m * m), max(cfg.max_bucket_side, side * 2)
+    lo, hi = -(-lo // m) * m, hi // m * m
     scale = 1.0
     if max(bw, bh) > hi:
         scale = hi / max(bw, bh)
     if min(bw, bh) * scale < lo:
         scale = lo / min(bw, bh)
     bw, bh = bw * scale, bh * scale
-    bw = int(round(bw / 16) * 16)
-    bh = int(round(bh / 16) * 16)
+    bw = int(round(bw / m) * m)
+    bh = int(round(bh / m) * m)
     bw = max(lo, min(hi, bw))
     bh = max(lo, min(hi, bh))
     return bw, bh

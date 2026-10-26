@@ -13,6 +13,8 @@ A simple diffusion-model LoRA trainer with a WebUI. Supported models:
   directly in ComfyUI with the standard *Load LoRA* node.
 - **Bria FIBO 2.0** (8B): train on dev, use on Edit Turbo ([details](#fibo-20-bria-training-on-dev-using-the-lora-on-edit-turbo)).
 - **Krea 2** (12B): train on Raw, use on Turbo ([details](#krea-2-training-on-raw-using-the-lora-on-turbo)).
+- **Qwen-Image 2.1** (7B): text-to-image LoRAs on one 16 GB card, with Fizgig's training adapter
+  ([details](#qwen-image-21)).
 
 | Dark | Light |
 | --- | --- |
@@ -311,6 +313,7 @@ WebUI's *Download now* fetches them ahead of time). `model_file_quant` and `text
 | MOSS-Image Base / SFT | [Comfy-Org/MOSS-Image](https://huggingface.co/Comfy-Org/MOSS-Image) | int8_convrot 5.4 GB, bf16 10.2 GB | Qwen3.5-9B int8_convrot 9.8 GB, bf16 19.3 GB | `flux2-vae_small` |
 | Krea 2 Raw / Turbo | [Comfy-Org/Krea-2](https://huggingface.co/Comfy-Org/Krea-2) | int8_convrot 13.5 GB, fp8_scaled 13.1 GB, bf16 26.3 GB | Qwen3-VL-4B int8_convrot 4.9 GB, fp8_scaled 5.2 GB, bf16 8.9 GB | `qwen_image_vae` |
 | FIBO 2.0 dev / Edit Turbo | [Comfy-Org/Fibo-2.0](https://huggingface.co/Comfy-Org/Fibo-2.0) | int8_convrot 8.4 GB, bf16 16.5 GB | Qwen3-VL-4B, the same files as Krea 2's | `flux2-vae` |
+| Qwen-Image 2.1 / Turbo | [Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1) | int8_convrot 7.3 GB, bf16 14.2 GB | Qwen3-VL-8B int8_convrot 9.4 GB, bf16 17.5 GB | `qwen_image_2.1_vae_bf16` |
 
 To use files you already have, set `transformer_file`, `text_encoder_file` and `vae_file` (the WebUI's optional file
 fields): only the ones left empty are downloaded. Fused-qkv ("repacked") files are split back automatically. The
@@ -585,7 +588,9 @@ it has not been measured on the models here.
 `sample_seed` is the seed of the first prompt; with `sample_walk_seed` each further prompt uses seed + 1.
 `sample_before_training` renders a sample set at step 0 for comparison. The log reports each prompt and the
 Monitor page shows the sampling step. The Monitor page also has per-GPU VRAM/utilization bars, an adjustable
-loss-smoothing slider and an auto-scrolling log. `compile_model` (default `auto`, see
+loss-smoothing slider, an auto-scrolling log and, under *Log and saved files*, a download button for every LoRA the run
+has saved (the checkpoints, the best and the final file), so a run on a rented or remote GPU hands its LoRAs straight to
+the browser. Only `.safetensors` files inside a run's folder are served. `compile_model` (default `auto`, see
 [torch.compile](#torchcompile-compile_model)) runs the DiT blocks through torch.compile
 (skipped with a warning if triton is not installed; `triton-windows` from requirements.txt provides it on Windows).
 No C++ compiler is needed: the blocks are compiled with Dynamo's `specialize_float` so the LoRA scale and
@@ -687,7 +692,7 @@ In the Wizard, *Character / person* then asks how much of the person the likenes
 | Body focus | 1.5 / 3 | 30% / 70% | face + bust | both |
 | Body only | 1 / 3 | 0 / 100% | none | body only (no face references) |
 
-The curriculum is on for the three in the middle. The wizard also recommends the adapter (LoKr for a character),
+The curriculum is on for the three in the middle. The wizard also recommends the adapter (a LoRA for every model),
 block swap for a card the model does not fit, LoRA Isolation, the look warm-up and how many checkpoints to keep.
 
 ### Experimental: direct identity loss
@@ -1203,6 +1208,7 @@ probe images, never during training steps.
 | MOSS-Image | lodestones' `8-steps-dmd-lora` ([lodestones/Kromoss](https://huggingface.co/lodestones/Kromoss)), Fizgig's pick, distilled from Base | 12 | 1 | 5 |
 | Krea 2 | `krea2_turbo_lora_rank_64_bf16` ([Comfy-Org/Krea-2](https://huggingface.co/Comfy-Org/Krea-2)) | 8 | 1 | from the image size |
 | FIBO 2.0 | `fibo_2.0_turbo_lora_avg_rank_270_bf16` ([Comfy-Org/Fibo-2.0](https://huggingface.co/Comfy-Org/Fibo-2.0)): Edit Turbo as a LoRA on dev | 4 | 1 | from the image size |
+| Qwen-Image 2.1 | `qwen_image_2.1_turbo_lora_avg_rank_178_bf16` ([Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1)), extracted from Qwen-Image-2.1-Turbo | 8 | 1 | the Turbo checkpoint's own sigmas |
 
 MOSS-Image renders 12 steps rather than the card's 8 because Fizgig found 12 much better; Fizgig also found that
 its turbo LoRA can understate likeness, so judge a run's likeness on full-quality samples (`turbo_lora: ""`, 20 steps,
@@ -1212,7 +1218,8 @@ ComfyUI-format LoRA with `turbo_lora_strength`. `sample_lora` + `sample_lora_str
 LoRA (for example a style LoRA) alongside the turbo one.
 LoRA layers (`lora_down/up`, `lora_A/B`), `diff_b` bias offsets and `diff` offsets of normalization weights (swapped
 in only while sampling) are applied; Krea 2 LoRAs may use ComfyUI's module names (`blocks.N.attn.wq`) or ours, and a
-FIBO 2.0 LoRA in ComfyUI's fused layout (Comfy-Org's Turbo LoRA) is split back into the model's own. LoKr / LoHa /
+FIBO 2.0 LoRA in ComfyUI's fused layout (Comfy-Org's Turbo LoRA) is split back into the model's own, and so is a
+Qwen-Image 2.1 LoRA on ComfyUI's fused feed-forward (`img_mlp.gate_up`, Comfy-Org's Turbo LoRA). LoKr / LoHa /
 full-weight diffs of linear layers cannot be applied while sampling and are named in a warning. With a turbo LoRA,
 Krea 2 samples on its distilled schedule (fixed shift, as ComfyUI does), and the log warns about guidance other than
 CFG 1.
@@ -1429,6 +1436,64 @@ weights; also the compact text layout, the latent packing, the schedule against 
 an exported LoRA merged into diffusers' weights). With the real Raw weights in bf16 the port matches diffusers' model to
 bf16 rounding (cosine 0.99999 over a 512x512 prediction), and the compact prompt features are as close to the
 pipeline's (cosine 0.99989) as the pipeline is to itself at another padding length.
+
+## Qwen-Image 2.1
+
+RulzTrainer trains text-to-image LoRAs for [Qwen/Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1), Qwen's
+7B single-stream DiT (32 blocks, one modulation shared by every block, a Qwen3-VL-8B text encoder read at its last
+layer before the final norm, and its own RGBA VAE: 16x, 64 channels). Pick **Qwen-Image-2.1** as the model. Edit LoRAs
+(before / after pairs with reference images) are not supported yet.
+
+- **Files.** By default the model comes as Comfy-Org's single files
+  ([Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1), int8 ConvRot): the diffusion model
+  (7.3 GB), the Qwen3-VL-8B text encoder (9.4 GB, used to cache the captions and then unloaded) and the VAE, so one
+  16 GB card trains it. The diffusers repo (`model_source: hf`) works too; `transformer_quant: auto` makes a bf16
+  model int8 from 11 GB and keeps bf16 from 24 GB. A file name containing "turbo" marks Qwen-Image-2.1-Turbo.
+- **Training adapter** (`training_adapter: auto`, the default). [Fizgig](https://github.com/shootthesound/Fizgig)
+  measured that Qwen-Image 2.1 LoRAs trained alone collapse into texture or wobble part-way, with nothing in the loss
+  to warn you; trained with a frozen *training adapter* (a small LoRA that is on for every training step, off for
+  samples and probes, and never saved into your file) likeness reached 77 against 56 without. `auto` downloads
+  Fizgig's ([ShootTheSound/Fizgig-Qwen-Image-2.1-Training-Adapter](https://huggingface.co/ShootTheSound/Fizgig-Qwen-Image-2.1-Training-Adapter),
+  80 MB); `""` trains without one, a path uses another, `training_adapter_strength` scales it. The other families
+  have none of their own, and a path works on them too. Not used by a full fine-tune.
+- **Recipe** (Fizgig's, which the setup wizard suggests): 0.5 MP (it keeps more of the model's sharpness than 1 MP and
+  is quicker), rank 8 at learning rate 2e-4 (rank 16 at half the rate for big or mixed datasets; 1.5e-4 for styles),
+  EMA 0.98. Fizgig found identity sits in blocks 10-14 (`lora_blocks: 10-14` trains only those).
+- **Buckets** are multiples of 32 px (the model takes its image tokens in 2x2 groups); latents are cached under their
+  own names (`_qi21vae`), region maps are shared with the other models.
+- **Attention** is block-causal as in the reference: caption tokens see only the caption before them, image tokens see
+  everything, and the caption tokens are modulated at t = 0. RoPE positions are counted per sample, so a padded batch
+  predicts exactly what each sample predicts alone.
+- **Text features** follow `QwenImage21Pipeline`: the prompt in Qwen's system/user template, the last decoder layer's
+  output before the final RMSNorm (hooked out, as the pipeline does on transformers 5), the system turn dropped. The
+  int8 text encoder runs weight-only: W8A8 moved the features 5-8% against it at the same speed.
+- **Samples** render with Comfy-Org's Turbo LoRA (8 steps, CFG 1, the Turbo checkpoint's own sigmas). Without it they
+  follow the pipeline: the dynamic exponential shift (0.5 at 256 tokens to 0.9 at 8192) with the terminal stretch to
+  0.02, 25 steps (ComfyUI's template) at CFG 1: Qwen-Image 2.1 is meant to be sampled without guidance. Sample sizes
+  are rounded down to multiples of 32. Previews decode in 512 px VAE tiles: this VAE normalizes per pixel, so they give
+  the full decode to 0.3 of an 8-bit level (PSNR 54 dB) at +1.7 GB instead of +6.6 GB at 1 MP.
+- **LoRA targets**: the usual groups map onto `attn.to_q/k/v`, `attn.to_out.0`, `img_mlp.gate_layer/proj`
+  (ffn_up_gate) and `img_mlp.out` (ffn_down); `text_in` adds the text projection and `embed` the image / timestep
+  projections, the shared modulation and the final layer.
+- **Export** is the diffusers / PEFT format (`transformer.transformer_blocks.<n>.attn.to_q.lora_A.weight`). ComfyUI's
+  LoRA loader maps these keys, `img_mlp.gate_layer` / `img_mlp.proj` onto the two halves of its fused `gate_up`;
+  keep alpha equal to rank (the default) for loaders that ignore the metadata.
+- **Measured** on an RTX 5060 Ti (16 GB), int8, 0.5 MP, rank 8, identity preset: about 2.5 s per step with
+  torch.compile, 10 of 32 blocks keeping their activations at a 13.1 GB peak.
+- **Licence**: the Qwen Research License, non-commercial use unless Qwen grants more; a shared LoRA or fine-tune must
+  say "Built with Qwen" or "Improved using Qwen".
+
+```python
+from diffusers import QwenImage21Pipeline  # needs peft for load_lora_weights
+pipe = QwenImage21Pipeline.from_pretrained("Qwen/Qwen-Image-2.1-Turbo", torch_dtype=torch.bfloat16).to("cuda")
+pipe.load_lora_weights("output/<job>/<job>.safetensors")
+image = pipe("<trigger>, ...").images[0]
+```
+
+Verified against diffusers: `tests/test_qwen21.py` checks the port against `QwenImage21Transformer2DModel` (tiny random
+weights, a padded batch against each sample alone), ComfyUI's fused single-file layout, the schedules against
+`FlowMatchEulerDiscreteScheduler`, an exported LoRA merged into diffusers' weights, the Turbo LoRA's fused feed-forward
+split onto both halves, and the training adapter (on while training, off while sampling, not saved).
 
 ## Using the LoRA in ComfyUI
 

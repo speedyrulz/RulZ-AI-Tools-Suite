@@ -1,5 +1,6 @@
 """Minimal LoRA for Linear layers with ComfyUI- or diffusers-compatible export, plus "extra" LoRAs (e.g. turbo /
-step-distill adapters) that are applied only while sampling.
+step-distill adapters) that are applied only while sampling, and a training adapter: a frozen LoRA applied only while
+training (the extras off), never saved (Fizgig's Qwen-Image 2.1 adapter keeps that model's LoRAs from collapsing).
 
 Export key formats (Arch.lora_format):
 
@@ -234,6 +235,10 @@ class LoRALinear(nn.Module):
         self.extras: list[tuple] = []
         self.extra_biases: list[tuple[torch.Tensor, float]] = []
         self.extras_enabled = False
+        # the training adapter (attach_training_adapter): down [r, in] and up [out, r] (its scale folded in) in the
+        # compute dtype, applied while the extras are off; buffers, so moves, block swap and model splits carry it
+        self.register_buffer("train_down", None, persistent=False)
+        self.register_buffer("train_up", None, persistent=False)
 
     # ---- the adapter API (both kinds)
     def adapter_params(self) -> dict[str, nn.Parameter]:
@@ -388,6 +393,9 @@ class LoRALinear(nn.Module):
             out = self.base(x) + self._added(x) * self.multiplier
         if self.extras_enabled:
             out = _apply_extras(x, out, self.extras, self.extra_biases)
+        elif self.train_down is not None:
+            out = out + nn.functional.linear(nn.functional.linear(x, self.train_down.to(x.dtype)),
+                                             self.train_up.to(x.dtype))
         return out
 
 
@@ -888,6 +896,47 @@ def attach_extra_lora(model: nn.Module, path: str, strength: float = 1.0,
         log.warning("%s: %d entries of kinds this loader cannot apply are ignored (%s); only LoRA (lora_down/up, "
                     "lora_A/B), LoKr (lokr_w1/w2) and diff_b are applied while sampling", Path(path).name,
                     sum(1 for k in state if not k.endswith(read)), ", ".join(unread[:5]))
+    return len(matched)
+
+
+def attach_training_adapter(model: nn.Module, path: str, strength: float = 1.0,
+                            rename: Callable[[str], str] | None = None,
+                            convert: Callable[[dict], dict] | None = None) -> int:
+    """Attach a training adapter: a LoRA file applied while training and off while sampling (it follows the extras'
+    switch: on whenever they are off), never part of the saved LoRA. Only LoRA entries (lora_down/up, lora_A/B) are
+    read. Returns the modules matched; the unmatched ones are logged."""
+    state = load_file(str(path))
+    if convert is not None:
+        state = convert(state)
+    peft_meta = read_peft_metadata(path)
+    entries = parse_comfy_lora(state, default_alpha=peft_meta.get("lora_alpha"),
+                               alpha_pattern=peft_meta.get("alpha_pattern"))
+    names = {n for n, _ in model.named_modules()}
+    matched, missed, skipped = set(), [], 0
+    for name, (kind, down, up, scale) in entries.items():
+        if kind != "lora":
+            skipped += 1
+            continue
+        if name not in names and rename is not None:
+            name = rename(name)
+        module = model.get_submodule(name) if name in names else None
+        if module is None or not (isinstance(module, LoRALinear) or _is_linear_like(module)) \
+                or down.shape[1] != module.in_features or up.shape[0] != module.out_features:
+            missed.append(name)
+            continue
+        if not isinstance(module, LoRALinear):
+            module = _wrap(model, name, rank=1, alpha=1.0, trainable=False)
+        dev, dtype = module.lora_down.weight.device, module.compute_dtype
+        down, up = down.to(dev, dtype), (up * (scale * strength)).to(dev, dtype)
+        if module.train_down is not None:  # a second adapter on the layer: the ranks side by side
+            down, up = torch.cat([module.train_down, down]), torch.cat([module.train_up, up], dim=1)
+        module.train_down, module.train_up = down, up
+        matched.add(name)
+    if missed:
+        log.warning("%s: %d of %d training adapter entries match no layer of this model (e.g. %s)", Path(path).name,
+                    len(missed), len(entries), ", ".join(sorted(missed)[:3]))
+    if skipped:
+        log.warning("%s: %d LoKr entries ignored (a training adapter is read as a LoRA)", Path(path).name, skipped)
     return len(matched)
 
 
