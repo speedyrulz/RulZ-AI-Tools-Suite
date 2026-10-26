@@ -18,6 +18,10 @@ alignment's small projector is thrown away.
     alignment (Yu et al. 2024, aligning a diffusion transformer's hidden states to a frozen encoder's features)
     pointed at identity: it gives identity feedback at every noise level, where the experimental identity loss
     (id_loss_weight) needs a nearly clean prediction and a VAE decode. Untested idea: race it.
+  * body alignment (body_align): the same for the build. The image tokens of the person outside the face box (the
+    region maps' person mask) are averaged and a second MLP maps them onto the photo's DINOv2 body-window embedding,
+    the one the body probe scores with (the neck to mid-thigh, upright, cut out on grey). Photos without a usable
+    window (a close-up, a waist-up shot) or without a person mask are left out.
 
 Taps carry the side outputs. The trainer arms them for a batch with the trigger token positions of each sample,
 the model records on its main forward, recording stops before any other forward, and they are disarmed after the
@@ -36,6 +40,7 @@ from torch import nn
 log = logging.getLogger("rulztrainer")
 
 FACE_EMB_DIM = 512  # ArcFace (InsightFace buffalo_l w600k_r50)
+BODY_EMB_DIM = 768  # DINOv2-base's CLS token (bodysim.APPEARANCE_MODEL)
 
 
 class Taps:
@@ -178,35 +183,60 @@ def localization_loss(taps: Taps, regions, masks: list | None = None) -> tuple[t
 
 
 class IdAligner(nn.Module):
-    """The identity alignment's projector: mean face-token state [dim] -> ArcFace space [512]. Training-only."""
+    """An alignment projector: the mean state of a region's tokens [dim] -> an embedding space. region "face": the face
+    box -> ArcFace [512]; "body": the person outside the face box -> the DINOv2 body window [768]. Training-only."""
 
-    def __init__(self, dim: int, hidden: int = 1024, out: int = FACE_EMB_DIM):
+    def __init__(self, dim: int, hidden: int = 1024, out: int = FACE_EMB_DIM, region: str = "face"):
         super().__init__()
+        self.region = region
         self.net = nn.Sequential(nn.Linear(dim, hidden), nn.SiLU(), nn.Linear(hidden, out))
 
+    def _tokens(self, h: torch.Tensor, rm, hh: int, ww: int) -> torch.Tensor | None:
+        """The region's token states [n, dim] of one sample, or None when it has none."""
+        if self.region == "face":
+            if rm.face_cells is None:
+                return None
+            cx0, cy0, cx1, cy1 = rm.face_cells
+            return h.reshape(hh, ww, -1)[cy0:cy1, cx0:cx1].reshape(-1, h.shape[-1])
+        if not rm.has_person:
+            return None
+        person = (~rm.prior).reshape(hh, ww).clone()
+        if rm.face_cells is not None:
+            cx0, cy0, cx1, cy1 = rm.face_cells
+            person[cy0:cy1, cx0:cx1] = False
+        return h[person.flatten().to(h.device)]
+
     def loss(self, taps: Taps, layer: int, regions, targets: list) -> tuple[torch.Tensor | None, int]:
-        """1 - cosine between the projected mean of each sample's face tokens and its photo's face embedding, over
-        the samples with a face box and an embedding. Returns (loss, samples)."""
+        """1 - cosine between the projected mean of each sample's region tokens and its photo's embedding, over the
+        samples that have the region and an embedding. Returns (loss, samples)."""
         per = taps.hidden.get(layer, {})
         dev = next(self.parameters()).device
         terms = []
         for b, h in per.items():
             rm = regions.meta[b] if b < len(regions.meta) else None
             target = targets[b] if b < len(targets) else None
-            if rm is None or rm.face_cells is None or target is None:
+            if rm is None or target is None:
                 continue
             hh, ww = regions.prior.shape[-2:]
             if h.shape[0] != hh * ww:
                 continue
-            cx0, cy0, cx1, cy1 = rm.face_cells
-            face = h.reshape(hh, ww, -1)[cy0:cy1, cx0:cx1].reshape(-1, h.shape[-1])
-            if face.shape[0] == 0:
+            tokens = self._tokens(h, rm, hh, ww)
+            if tokens is None or tokens.shape[0] == 0:
                 continue
-            z = self.net(face.float().mean(0).to(dev))
+            z = self.net(tokens.float().mean(0).to(dev))
             terms.append(1.0 - F.cosine_similarity(z, target.to(dev, torch.float32), dim=0))
         if not terms:
             return None, 0
         return torch.stack(terms).mean(), len(terms)
+
+
+class Aligners(nn.Module):
+    """The run's alignment projectors (one AdamW trains them all): face (id_align), body (body_align)."""
+
+    def __init__(self, dim: int, face: bool, body: bool):
+        super().__init__()
+        self.face = IdAligner(dim, out=FACE_EMB_DIM, region="face") if face else None
+        self.body = IdAligner(dim, out=BODY_EMB_DIM, region="body") if body else None
 
 
 def auto_attn_layers(arch: str, n_layers: int, injection_layers=()) -> list[int]:

@@ -209,3 +209,57 @@ def test_isolation_pairs_use_the_subjects_panel():
     loss, n = A.localization_loss(taps, regions, [A.panel_mask("right", H, W)])
     assert n == 1 and float(loss) < 1e-6
     assert abs(float(A.localization_loss(taps, regions, [A.panel_mask("left", H, W)])[0]) - 1.0) < 1e-6
+
+
+def test_body_alignment_uses_the_person_outside_the_face():
+    torch.manual_seed(0)
+    dim = 8
+    prior = torch.ones(1, H, W, dtype=torch.bool)
+    prior[:, 0:4, 1:4] = False  # the person: rows 0-3, columns 1-3
+    rm = SimpleNamespace(prior=prior, face_cells=(1, 0, 4, 1), has_person=True)  # the face: row 0 of the person
+    regions = SimpleNamespace(prior=prior[None], meta=[rm])
+    h = torch.randn(H * W, dim)
+    body = A.IdAligner(dim, out=A.BODY_EMB_DIM, region="body")
+    tokens = body._tokens(h, rm, H, W)
+    assert tokens.shape == (9, dim)  # 12 person cells less the 3 face cells
+    face = A.IdAligner(dim, region="face")._tokens(h, rm, H, W)
+    assert face.shape == (3, dim)
+    assert body._tokens(h, SimpleNamespace(prior=prior, face_cells=None, has_person=False), H, W) is None
+    taps = A.Taps([2], [])
+    taps.begin([[]], attention=False)
+    taps.hidden = {2: {0: h}}
+    target = torch.nn.functional.normalize(torch.randn(A.BODY_EMB_DIM), dim=0)
+    opt = torch.optim.Adam(body.parameters(), lr=1e-2)
+    first = None
+    for _ in range(30):  # the projector learns to map the body tokens onto the target
+        loss, n = body.loss(taps, 2, regions, [target])
+        first = first if first is not None else loss.item()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    assert n == 1 and loss.item() < first * 0.5
+    both = A.Aligners(dim, face=True, body=True)
+    assert both.face.region == "face" and both.body.region == "body"
+    assert A.Aligners(dim, face=False, body=True).face is None
+
+
+def test_body_embeddings_are_cached(tmp_path):
+    from PIL import Image
+
+    from rulztrainer import regions as R
+
+    a, b = tmp_path / "a.png", tmp_path / "b.png"
+    for p in (a, b):
+        Image.new("RGB", (16, 16)).save(p)
+    calls = []
+
+    def embed(p):
+        calls.append(p)
+        return [0.1] * A.BODY_EMB_DIM if p.name == "a.png" else None  # b shows no body window
+
+    items = [SimpleNamespace(image=a), SimpleNamespace(image=b), SimpleNamespace(image=a)]
+    found = R.analyze_bodies(items, embed, tmp_path / "bodies.json")
+    assert len(calls) == 2 and found[str(a.resolve())] is not None and found[str(b.resolve())] is None
+    again = R.analyze_bodies(items, embed, tmp_path / "bodies.json")
+    assert len(calls) == 2 and again == found  # cached
+    assert TrainConfig(body_align=True).wants_person_masks() and TrainConfig(body_align=True).wants_regions()

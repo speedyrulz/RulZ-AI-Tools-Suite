@@ -134,6 +134,36 @@ def analyze_faces(items, face_scorer, cache_path: Path, progress=None, recache: 
     return {k: cache[_file_key(p)] for k, p in sources.items()}
 
 
+def analyze_bodies(items, embed, cache_path: Path, progress=None, recache: bool = False) -> dict[str, list | None]:
+    """The DINOv2 body-window embedding of every *source image* ({str(resolved path): 768 floats, or None without a
+    usable window}), body alignment's targets. embed(path) -> unit vector | None (lookfilter.body_embedder's). Cached
+    in bodies.json keyed like faces.json."""
+    cache: dict[str, dict] = {}
+    if cache_path.exists() and not recache:
+        try:
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            cache = {}
+    sources: dict[str, Path] = {}
+    for it in items:
+        sources.setdefault(str(it.image.resolve()), it.image)
+    todo = [(k, p) for k, p in sources.items() if _file_key(p) not in cache]
+    for i, (k, p) in enumerate(todo):
+        emb = None
+        try:
+            v = embed(p)
+            emb = None if v is None else [round(float(x), 6) for x in v]
+        except Exception as e:  # noqa: BLE001
+            log.warning("body analysis failed for %s: %s", p, e)
+        cache[_file_key(p)] = {"emb": emb}
+        if progress:
+            progress(i + 1, len(todo))
+    if todo:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(cache), encoding="utf-8")
+    return {k: cache[_file_key(p)].get("emb") for k, p in sources.items()}
+
+
 def face_fraction(rec: dict | None, src_box=None) -> float:
     """Face area as a fraction of the (cropped) source image."""
     if not rec or not rec.get("bbox"):

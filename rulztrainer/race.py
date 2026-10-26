@@ -46,7 +46,7 @@ RACE_KEYS: dict[str, tuple[str, ...]] = {
         "sigma_min", "sigma_max", "content_power", "region_weights", "face_loss_weight", "body_loss_weight",
         "background_loss_weight", "face_margin", "region_feather_cells", "region_prior_weight", "id_loss_weight",
         "id_loss_sigma_max", "id_loss_every", "id_loss_margin_cells", "id_loss_min_face_cells", "id_loss_random_ref",
-        "attn_localize", "attn_localize_weight", "id_align", "id_align_weight",
+        "attn_localize", "attn_localize_weight", "id_align", "id_align_weight", "body_align", "body_align_weight",
         "likeness_curriculum", "likeness_curriculum_strength", "likeness_lr_control", "likeness_lr_min",
         "likeness_lr_max", "likeness_lr_step", "loss_watch", "per_image_lr", "loss_watch_buckets",
         "loss_watch_beta", "loss_watch_high", "loss_watch_low", "loss_watch_improve_tol",

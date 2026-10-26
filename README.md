@@ -738,6 +738,11 @@ character, and race keys. Neither is measured for likeness yet: race them agains
   Krea 2, its own AdamW, never saved) maps them onto that photo's ArcFace embedding (stored with the face analysis);
   the loss is 1 - cosine. It is REPA's representation alignment (Yu et al. 2024) pointed at identity: feedback at
   every noise level, where the identity loss above needs a nearly clean prediction and a VAE decode.
+- **Body alignment** (`body_align`, weight `body_align_weight` 0.05, the same block). The same for the build: the
+  image tokens of the person outside the face box (the region maps' person mask) are averaged and a second small MLP
+  maps them onto that photo's DINOv2 body-window embedding, the one the body probe scores with (the neck to
+  mid-thigh, upright, cut out on grey; cached in `bodies.json`). Photos that do not show the window, or have no
+  person mask, are left out; person masks are built for it even without the region-weighted loss.
 - How it runs: the trainer arms taps on the model for a batch, the main forward records, nothing records on later
   forwards, and a checkpointed block that recomputes in the backward computes the same tensors again (the gradients
   match an unchecked run exactly on all three models). Tapped blocks run uncompiled. Data parallel: localization on

@@ -1125,6 +1125,7 @@ class Form:
             attn_localize=bool(v("attn_localize")), attn_localize_weight=float(v("attn_localize_weight") or 0.0),
             attn_localize_layers=s("attn_localize_layers"), id_align=bool(v("id_align")),
             id_align_weight=float(v("id_align_weight") or 0.0), id_align_layer=int(v("id_align_layer")),
+            body_align=bool(v("body_align")), body_align_weight=float(v("body_align_weight") or 0.0),
             id_loss_weight=float(v("id_loss_weight")), id_loss_sigma_max=float(v("id_loss_sigma_max")),
             id_loss_every=int(v("id_loss_every")), id_loss_backend=v("id_loss_backend"),
             id_loss_margin_cells=int(v("id_loss_margin_cells")),
@@ -2851,6 +2852,8 @@ def extra_review_rows(cfg: TrainConfig) -> list[tuple[str, str]]:
         options.append(f"trigger attention on the subject ({cfg.attn_localize_weight:g})")
     if cfg.id_align:
         options.append(f"identity alignment ({cfg.id_align_weight:g})")
+    if cfg.body_align:
+        options.append(f"body alignment ({cfg.body_align_weight:g})")
     if cfg.reward_steps:
         options.append(f"then {cfg.reward_steps} likeness reward steps")
     if cfg.look_warmup:
@@ -3658,6 +3661,12 @@ class Wizard:
                           "feedback at every noise level. Training-only. Not yet measured: race it.",
                           when=self.is_character):
             self.bind(ui.switch("Align the face tokens with the identity"), "id_align")
+        with self.setting(None, "Body alignment",
+                          "The same for the build: teaches the person's tokens inside the model to carry that photo's "
+                          "body (its DINOv2 body-window embedding, what the body probe scores), through a helper that "
+                          "is thrown away. Only photos showing the neck to mid-thigh count. Not yet measured: race it.",
+                          when=self.has_body):
+            self.bind(ui.switch("Align the body tokens with the build"), "body_align")
         hint("Schedules, LoRA layers and blocks, the full fine-tune and per-image loss watch are on the Train tab.")
         self.nav()
 
@@ -5102,7 +5111,17 @@ def build_page(local: bool = True):
                                                                  step=0.01).classes("w-28")
                                 w["id_align_layer"] = ui.number("Block (-1 = auto)", value=d.id_align_layer, min=-1,
                                                                 precision=0).classes("w-36") \
-                                    .tooltip("The block whose output is aligned. Auto: a third of the depth.")
+                                    .tooltip("The block whose output is aligned (also for the body). Auto: a third of "
+                                             "the depth.")
+                            with fields():
+                                w["body_align"] = ui.switch("Align the body tokens with the photo's build",
+                                                            value=d.body_align).tooltip(
+                                    "The same for the build: the person's tokens outside the face box (the region "
+                                    "maps' person mask) are averaged and a second small projector maps them onto "
+                                    "that photo's DINOv2 body-window embedding, the one the body probe scores with. "
+                                    "Photos that do not show the neck to mid-thigh are left out.")
+                                w["body_align_weight"] = ui.number("Weight", value=d.body_align_weight, min=0,
+                                                                   step=0.01).classes("w-28")
                         with advanced("Experimental: identity loss"):
                             hint("On low-noise samples with a detected face, decodes the face of the model's predicted "
                                  "clean image (with gradients), aligns it and adds weight x (1 - cosine similarity) to a "

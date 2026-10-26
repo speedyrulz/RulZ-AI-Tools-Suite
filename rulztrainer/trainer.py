@@ -359,10 +359,11 @@ class Trainer(RaceParallelMixin):
             cfg.reward_prompts = default_prompts(cfg.trigger_word, cfg.face_weight, cfg.body_weight)
         self.trigger_pos: dict[str, list[int]] = {}
         self.face_embs: dict[str, torch.Tensor] = {}
+        self.body_embs: dict[str, torch.Tensor] = {}
         self.align_layer: int | None = None
         self.id_aligner = None
         self.id_align_opt = None
-        self.align_values: dict[str, list[float]] = {"attn": [], "id": [], "pairs": []}
+        self.align_values: dict[str, list[float]] = {"attn": [], "id": [], "body": [], "pairs": []}
         if not (0.0 <= cfg.sigma_min < cfg.sigma_max <= 1.0):
             raise ValueError("sigma_min/sigma_max must satisfy 0 <= sigma_min < sigma_max <= 1")
         self.devices: list[str] = [cfg.device]
@@ -466,6 +467,8 @@ class Trainer(RaceParallelMixin):
                               for k, r in self.face_analysis.items() if r.get("emb")}
             log.info("Identity alignment: %d of %d source images have a face embedding", len(self.face_embs),
                      len(self.face_analysis))
+        if cfg.body_align:
+            self._analyze_bodies(items, cache)
         n_face = sum(1 for r in self.face_analysis.values() if r.get("bbox"))
         log.info("Face analysis: %d of %d source images have a face", n_face, len(self.face_analysis))
         if (cfg.crop_augment or "none") != "none":
@@ -939,8 +942,8 @@ class Trainer(RaceParallelMixin):
             noisy_in = noisy.to(torch.bfloat16)
             taps = getattr(rmodel, "_rz_taps", None)
             use_attn = bool(cfg.attn_localize and taps is not None and regions is not None)
-            use_align = bool(cfg.id_align and taps is not None and regions is not None and rmodel is model
-                             and self.id_aligner is not None)
+            use_align = bool((cfg.id_align or cfg.body_align) and taps is not None and regions is not None
+                             and rmodel is model and self.id_aligner is not None)
             if use_attn or use_align:  # this forward records the trigger's attention / the face tokens' states
                 taps.begin([self.trigger_pos.get(p, []) for p in regions.text_paths] if use_attn
                            else [[] for _ in batch], attention=use_attn)
@@ -1110,7 +1113,7 @@ class Trainer(RaceParallelMixin):
             optimizer.step()
             if self.ft is not None and cfg.finetune_anchor > 0:  # bounded drift: toward the original weights
                 self.ft.pull_to_base(current_lr(optimizer, scheduler) * cfg.finetune_anchor)
-            if self.id_align_opt is not None and cfg.id_align:
+            if self.id_align_opt is not None and (cfg.id_align or cfg.body_align):
                 self.id_align_opt.step()
             if step_lr_mult != 1.0:
                 for g, lr0 in zip(optimizer.param_groups, saved_lrs):
@@ -1161,7 +1164,8 @@ class Trainer(RaceParallelMixin):
                 if self.dop_values:  # LoRA Isolation: the trigger-free passes since the last line
                     id_s += f" | dop {sum(self.dop_values) / len(self.dop_values):.4f}"
                     self.dop_values.clear()
-                for key, label in (("attn", "trigger attention off the subject"), ("id", "identity alignment")):
+                for key, label in (("attn", "trigger attention off the subject"), ("id", "identity alignment"),
+                                   ("body", "body alignment")):
                     vals = self.align_values[key]
                     if vals:
                         id_s += f" | {label} {sum(vals) / len(vals):.3f}"
@@ -1614,6 +1618,7 @@ class Trainer(RaceParallelMixin):
                                    region_weights=any(r[1].region_weights for r in rows),
                                    attn_localize=any(r[1].attn_localize for r in rows),
                                    id_align=any(r[1].id_align for r in rows),
+                                   body_align=any(r[1].body_align for r in rows),
                                    id_loss_weight=max(r[1].id_loss_weight for r in rows),
                                    likeness_curriculum=any(r[1].likeness_curriculum for r in rows))
         self.race_parallel = bool(cfg.race_parallel)
@@ -2406,7 +2411,7 @@ class Trainer(RaceParallelMixin):
         from . import alignment as A
 
         rows = [r[1] for r in self.race_rows] if self.race_rows is not None else [cfg]
-        attn, align = any(c.attn_localize for c in rows), any(c.id_align for c in rows)
+        attn, align = any(c.attn_localize for c in rows), any(c.id_align or c.body_align for c in rows)
         if not (attn or align):
             return
         if self.ft is not None:
@@ -2449,18 +2454,54 @@ class Trainer(RaceParallelMixin):
             if self.race_rows is None:
                 self.id_aligner, self.id_align_opt = self._make_id_aligner(cfg)
             dim = A.model_dim(model)
-            log.info("Identity alignment: weight %g, the face tokens after block %d mapped onto each photo's ArcFace "
-                     "embedding by a %.1fM-weight projector that is not saved", cfg.id_align_weight, self.align_layer,
-                     (dim * 1024 + 1024 + 1024 * A.FACE_EMB_DIM + A.FACE_EMB_DIM) / 1e6)
+            for on, what, weight, out in ((any(c.id_align for c in rows), "face tokens", cfg.id_align_weight,
+                                           "photo's ArcFace embedding", ),
+                                          (any(c.body_align for c in rows), "person's tokens outside the face",
+                                           cfg.body_align_weight, "photo's DINOv2 body-window embedding")):
+                if on:
+                    log.info("Alignment: weight %g, the %s after block %d mapped onto each %s by a projector that is "
+                             "not saved", weight, what, self.align_layer, out)
 
     def _make_id_aligner(self, cfg):
-        """(projector, its AdamW) for identity alignment, or (None, None)."""
+        """(projectors, their AdamW) for face / body alignment, or (None, None)."""
         from . import alignment as A
 
-        if not cfg.id_align or self.align_layer is None:
+        if not (cfg.id_align or cfg.body_align) or self.align_layer is None:
             return None, None
-        proj = A.IdAligner(A.model_dim(self.replicas[0][0])).to(self.devices[0])
+        proj = A.Aligners(A.model_dim(self.replicas[0][0]), cfg.id_align, cfg.body_align).to(self.devices[0])
         return proj, torch.optim.AdamW(proj.parameters(), lr=1e-4, weight_decay=0.0)
+
+    def _analyze_bodies(self, items, cache) -> None:
+        """Body alignment's targets: each source photo's DINOv2 body-window embedding (cached in bodies.json)."""
+        from . import bodysim
+        from . import regions as R
+
+        ok, msg = bodysim.available()
+        if not ok:
+            log.warning("%s; body alignment has no targets", msg)
+            return
+        self.status.update(stage="embedding the photos' bodies")
+        scorer = bodysim.AppearanceScorer(self.cfg.models_dir, self.cfg.body_device,
+                                          progress=lambda t, f: self.status.update(stage=t))
+
+        def embed(path):
+            win = scorer.window(path)
+            if win is None or win[1] < bodysim.WINDOW_MIN_SCORE_COVER:
+                return None
+            return scorer._embed(win[0])
+
+        try:
+            found = R.analyze_bodies(items, embed, cache / "bodies.json",
+                                     progress=lambda i, n: self.status.update(step=i, total=n),
+                                     recache=self.cfg.recache)
+        finally:
+            if scorer.model is not None:
+                unload_model(scorer.model)
+            del scorer
+            free_cuda()
+        self.body_embs = {k: torch.tensor(v, dtype=torch.float32) for k, v in found.items() if v}
+        log.info("Body alignment: %d of %d source images show the body from the neck to mid-thigh", len(self.body_embs),
+                 len(found))
 
     def _trigger_positions(self, items, rows) -> dict[str, list[int]]:
         """{cached text path: the trigger's token positions in it} for every caption training reads (each dataset's
@@ -2517,11 +2558,17 @@ class Trainer(RaceParallelMixin):
                 self.align_values["pairs"].append(sum(1 for it in batch if getattr(it, "pair_side", "")))
                 terms.append(cfg.attn_localize_weight * val)
         if use_align:
-            targets = [self.face_embs.get(str(it.image.resolve())) for it in batch]
-            val, _ = self.id_aligner.loss(taps, self.align_layer, regions, targets)
-            if val is not None:
-                self.align_values["id"].append(float(val.detach()))
-                terms.append(cfg.id_align_weight * val)
+            for key, on, proj, embs, weight in (("id", cfg.id_align, self.id_aligner.face, self.face_embs,
+                                                 cfg.id_align_weight),
+                                                ("body", cfg.body_align, self.id_aligner.body, self.body_embs,
+                                                 cfg.body_align_weight)):
+                if not on or proj is None:
+                    continue
+                targets = [embs.get(str(it.image.resolve())) for it in batch]
+                val, _ = proj.loss(taps, self.align_layer, regions, targets)
+                if val is not None:
+                    self.align_values[key].append(float(val.detach()))
+                    terms.append(weight * val)
         if not terms:
             return None
         return sum(t.to(terms[0].device) for t in terms[1:]) + terms[0] if len(terms) > 1 else terms[0]

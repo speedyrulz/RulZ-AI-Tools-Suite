@@ -351,6 +351,8 @@ class TrainConfig:
     id_align: bool = False  # align the face tokens' states after one block to the photo's ArcFace embedding
     id_align_weight: float = 0.05
     id_align_layer: int = -1  # that block; -1 = auto (a third of the depth)
+    body_align: bool = False  # the same for the build: the person's tokens -> the photo's DINOv2 body-window embedding
+    body_align_weight: float = 0.05
     # --- likeness reward fine-tuning: an optional second stage after the steps (reward.py, after Flow-GRPO) ---
     reward_steps: int = 0  # optimizer steps of the stage (0 = off); it starts from the LoRA the steps saved
     reward_lr: float = 2e-5
@@ -467,8 +469,8 @@ class TrainConfig:
                                  "reward_lr above 0 and reward_kl 0 or more")
             if self.steps == 0 and not self.resume_from:
                 raise ValueError("steps 0 runs only the reward stage: give it a trained LoRA (resume_from)")
-        if self.attn_localize_weight < 0 or self.id_align_weight < 0:
-            raise ValueError("attn_localize_weight and id_align_weight must be 0 or more")
+        if self.attn_localize_weight < 0 or self.id_align_weight < 0 or self.body_align_weight < 0:
+            raise ValueError("attn_localize_weight, id_align_weight and body_align_weight must be 0 or more")
         if self.attn_localize and not (self.trigger_word or any(sp.trigger for sp in self.dataset_specs())):
             raise ValueError("attn_localize needs a trigger word (trigger_word, or a dataset's own trigger): it keeps "
                              "that word's attention on the subject")
@@ -586,12 +588,13 @@ class TrainConfig:
     def wants_regions(self) -> bool:
         """Region maps (face cells, landmarks, the subject's cells) are needed by the region-weighted loss, the identity
         loss, attention localization and identity alignment."""
-        return bool(self.region_weights or self.id_loss_weight > 0 or self.attn_localize or self.id_align)
+        return bool(self.region_weights or self.id_loss_weight > 0 or self.attn_localize or self.id_align
+                    or self.body_align)
 
     def wants_person_masks(self) -> bool:
         """Person masks in the region maps: the region-weighted loss's person weight, attention localization's
         subject."""
-        return bool(self.region_weights or self.attn_localize)
+        return bool(self.region_weights or self.attn_localize or self.body_align)
 
     def resolved_cache_dir(self) -> Path:
         """The run's cache (text embeddings, face analysis, loss-watch exclusions): cache_dir, else the first
