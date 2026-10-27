@@ -10,7 +10,11 @@ The scores are computed in the sheet from the raw ones, the trainer's normalize(
 / (top - floor)) ^ curve) with top = floor + (ceiling - floor) * span, the body's ceiling at least halfway from its floor
 to 100. A run from before a scale change is rescored on the span and curve its config file has now (a config saved
 before body_scale_span existed gets the current defaults). In a race each configuration gets its own pair of sheets
-(and the winner's probes after the race theirs); each has its own column on the Scale sheet."""
+(and the winner's probes after the race theirs); each has its own column on the Scale sheet.
+
+build_workbook_from() makes the same workbook from probe records and settings without a job folder: the Previous Runs
+tab exports a run from its history record (history.probe_raw keeps its raw scores), whose job folder a later run with
+the same job name may have overwritten."""
 from __future__ import annotations
 
 import json
@@ -47,19 +51,23 @@ def _load_cfg(job_dir: Path):
         return TrainConfig()
 
 
-def _groups(job_dir: Path, probes: list[dict]) -> list[tuple[str, list[dict]]]:
-    """[(label, probes)]: the run as one group, or a race's configurations (and "winner" after the race)."""
+def _race_names(job_dir: Path) -> list[str]:
+    try:
+        return json.loads((Path(job_dir) / "race.json").read_text(encoding="utf-8")).get("names") or []
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def _groups(probes: list[dict], names) -> list[tuple[str, list[dict]]]:
+    """[(label, probes)]: the run as one group, or a race's configurations (and "winner" after the race). A record
+    names its configuration in "racer" (history.probe_raw), else its images do."""
     from .history import probe_racer
 
-    try:
-        names = json.loads((Path(job_dir) / "race.json").read_text(encoding="utf-8")).get("names") or []
-    except (OSError, ValueError, AttributeError):
-        names = []
     if not names:
         return [("", probes)]
     by: dict[str, list[dict]] = {}
     for pr in probes:
-        by.setdefault(probe_racer(pr, names), []).append(pr)
+        by.setdefault(pr["racer"] if "racer" in pr else probe_racer(pr, names), []).append(pr)
     return [(n or "winner", by[n]) for n in [*names, ""] if n in by]
 
 
@@ -85,16 +93,23 @@ def _reference_levels(probes: list[dict], cfg) -> dict:
 
 def build_workbook(job_dir: Path):
     """The workbook for a job folder (openpyxl Workbook). Raises FileNotFoundError without probes."""
-    from openpyxl import Workbook
-    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-    from openpyxl.utils import get_column_letter
-
     job_dir = Path(job_dir)
     probes = read_probes(job_dir)
     if not probes:
         raise FileNotFoundError(f"No likeness probes in {job_dir} yet (likeness.jsonl)")
-    cfg = _load_cfg(job_dir)
-    groups = _groups(job_dir, probes)
+    return build_workbook_from(probes, _load_cfg(job_dir), _race_names(job_dir))
+
+
+def build_workbook_from(probes: list[dict], cfg, race_names=()):
+    """The workbook for probe records ({"step", "face", "body"} raw, "scale" as the trainer logs it, a race's "racer"
+    or images) and a config (its job_name, scale span / curve, weights and probe_ema go on the Scale sheet)."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    if not probes:
+        raise FileNotFoundError("No likeness probes to export")
+    groups = _groups(probes, race_names)
 
     plain, bold = Font(name=FONT), Font(name=FONT, bold=True)
     blue, green = Font(name=FONT, color="0000FF"), Font(name=FONT, color="008000")
@@ -110,14 +125,17 @@ def build_workbook(job_dir: Path):
     labels = ["Face floor (raw, step-0 probe)", "Face references' own level (raw)", "Face scale span", "Face scale curve",
               "Body floor (raw, step-0 probe)", "Body references' own level (raw)", "Body scale span",
               "Body scale curve", "Body minimum share of the room to 100", "Face weight", "Body weight",
-              "Probe smoothing (probe_ema)", "Face scale top (raw)", "Body scale top (raw)"]
+              "Probe smoothing (probe_ema)", "Face scale top (raw)", "Body scale top (raw)",
+              "Face: your references' own level reads", "Body: your references' own level reads"]
     notes = ["The run's step-0 probe (its logged scale).", "What your references score against each other.",
              "face_scale_span", "face_scale_curve", "The run's step-0 probe (its logged scale).",
              "What your references score against each other.", "body_scale_span", "body_scale_curve",
              "The body ceiling sits at least this share of the way from its floor to 100.", "face_weight",
              "body_weight", "Weight on the previous smoothed value.",
              "Computed: floor + (references' level - floor) x span.",
-             "Computed: the ceiling at least 8 points and the minimum share above the floor, then x span."]
+             "Computed: the ceiling at least 8 points and the minimum share above the floor, then x span.",
+             "Computed: where the references' own face level lands on this scale.",
+             "Computed: where the references' own body level lands on this scale."]
     for i, (lab, txt) in enumerate(zip(labels, notes)):
         sa.cell(3 + i, 1, lab).font = bold if i >= 12 else plain
         sa.cell(3 + i, 2 + len(groups), txt).font = note
@@ -139,8 +157,12 @@ def build_workbook(job_dir: Path):
         sa.cell(15, 2 + g, f"={col}3+({col}4-{col}3)*{col}5").font = plain
         sa.cell(16, 2 + g, f"={col}7+(MAX({col}8,{col}7+MAX({MIN_SPAN['body']:g},{col}11*(100-{col}7)))-{col}7)*{col}9") \
             .font = plain
+        sa.cell(17, 2 + g, f"=MIN(100,100*MAX(0,({col}4-{col}3)/({col}15-{col}3))^{col}6)").font = plain
+        sa.cell(18, 2 + g, f"=MIN(100,100*MAX(0,({col}8-{col}7)/({col}16-{col}7))^{col}10)").font = plain
         for r in (15, 16):
             sa.cell(r, 2 + g).number_format = "0.00"
+        for r in (17, 18):
+            sa.cell(r, 2 + g).number_format = "0.0"
 
         suffix = f" {label}" if label else ""
         raw = wb.create_sheet(f"Raw probe scores{suffix}"[:31])
@@ -162,8 +184,9 @@ def build_workbook(job_dir: Path):
 
         ws["A1"] = f"{cfg.job_name}{' - ' + label if label else ''}: likeness on the normalized scale"
         ws["A1"].font = Font(name=FONT, bold=True, size=12)
-        ws["A2"] = ("0 = a stranger (the step-0 probe), about 64 = your references' own level, 100 = the scale's top. "
-                    "Smoothed = what the Monitor and the best checkpoint use. Edit the Scale sheet to rescore.")
+        ws["A2"] = ("0 = a stranger (the step-0 probe), 100 = the scale's top; where your references' own level "
+                    "lands is on the Scale sheet. Smoothed = what the Monitor and the best checkpoint use. Edit the "
+                    "Scale sheet's blue cells to rescore.")
         ws["A2"].font = note
         heads = ["Step", "Face (smoothed)", "Body (smoothed)", "Combined (smoothed)", "Face (probe)", "Body (probe)",
                  "Combined (probe)", "", "Face raw smoothed", "Body raw smoothed"]
@@ -217,6 +240,32 @@ def build_workbook(job_dir: Path):
     wb.active = 0
     wb.calculation.fullCalcOnLoad = True  # openpyxl writes no cached values: the reader computes them on opening
     return wb
+
+
+def config_for(values: dict):
+    """A TrainConfig from saved values (a history record's config): the defaults for what it doesn't hold, keys a newer
+    or older version doesn't know left out."""
+    import dataclasses
+
+    from .config import TrainConfig
+
+    known = {f.name for f in dataclasses.fields(TrainConfig)}
+    cfg = TrainConfig()
+    for k, v in (values or {}).items():
+        if k in known:
+            setattr(cfg, k, v)
+    return cfg
+
+
+def export_run(record: dict, out: Path) -> Path:
+    """Write a Previous Runs record's spreadsheet (its probe_raw and config) to `out`. Raises FileNotFoundError for a
+    record without raw probe scores (saved before the history kept them)."""
+    raw = record.get("probe_raw") or {}
+    if not raw.get("records"):
+        raise FileNotFoundError("This run was saved before the history kept its raw probe scores")
+    cfg = config_for({**(record.get("config") or {}), "job_name": record.get("job") or "run"})
+    build_workbook_from(raw["records"], cfg, raw.get("names") or []).save(out)
+    return Path(out)
 
 
 def export(job_dir: Path, out: Path | None = None) -> Path:

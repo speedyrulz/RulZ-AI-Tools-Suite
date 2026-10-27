@@ -1824,6 +1824,37 @@ def _serve_likeness_xlsx(job: str):
                         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
+@app.get("/rz-history-xlsx")
+def _serve_history_xlsx(run: str):
+    """The likeness spreadsheet of a Previous Runs record, built from its saved raw probe scores."""
+    import tempfile
+
+    from fastapi import HTTPException
+    from fastapi.responses import FileResponse
+
+    from rulztrainer import likeness_export
+
+    rec = next((r for r in history.list_runs() if r["id"] == run), None)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="No such run in the history")
+    out = Path(tempfile.gettempdir()) / f"{history_file_name(rec)}_likeness.xlsx"
+    try:
+        likeness_export.export_run(rec, out)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except (OSError, ValueError) as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return FileResponse(out, filename=out.name,
+                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+def history_file_name(rec: dict) -> str:
+    """A file name for a history run: its own name if it has one, else the job and its start."""
+    started = time.strftime("%Y%m%d-%H%M", time.localtime(rec.get("started") or 0))
+    base = rec.get("label") or f"{rec.get('job') or 'run'}_{started}"
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._") or "run"
+
+
 def lora_url(path) -> str:
     """The download URL of a LoRA a run saved (served by /rz-lora)."""
     from urllib.parse import quote
@@ -4699,6 +4730,22 @@ def build_history_tab(charts: list):
                       "No saved runs yet. A run is saved while it trains once it has likeness scores.")
         draw()
 
+    def export_runs():
+        from urllib.parse import quote
+
+        picked = selected_runs()
+        if not picked:
+            ui.notify("Tick the runs to export", type="warning")
+            return
+        missing = [history_label(r) for r in picked if not (r.get("probe_raw") or {}).get("records")]
+        for r in picked:
+            if (r.get("probe_raw") or {}).get("records"):
+                ui.download(f"/rz-history-xlsx?run={quote(r['id'])}", f"{history_file_name(r)}_likeness.xlsx")
+        if missing:
+            ui.notify(f"No raw probe scores saved for {', '.join(missing)}: runs saved before this version only have "
+                      "them if their job folder still holds the run (Import old runs adds them then)",
+                      type="warning", multi_line=True)
+
     def import_old():
         n = history.import_jobs()
         ui.notify(f"Imported {n} earlier run(s) from the output folder" if n else
@@ -4755,6 +4802,10 @@ def build_history_tab(charts: list):
                          on_select=lambda _: draw()).props("flat dense").classes("w-full")
         with ui.row().classes("w-full items-center gap-2"):
             ui.button("Rename", icon="edit", on_click=rename).props("flat dense")
+            ui.button("Export spreadsheet", icon="table_view", on_click=export_runs).props("flat dense") \
+                .tooltip("The ticked runs' likeness spreadsheets (one file each), the same as the Monitor's: every "
+                         "probe's face, body and combined score as formulas of the raw scores and the run's scale, "
+                         "editable on the Scale sheet. Works after the job folder is gone or reused.")
             ui.button("Remove from history", icon="delete", on_click=delete).props("flat dense color=negative")
             ui.button("Clear ticks", icon="deselect",
                       on_click=lambda: (setattr(table, "selected", []), table.update(), draw())).props("flat dense")

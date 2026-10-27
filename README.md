@@ -889,7 +889,13 @@ floors (the step-0 probe), its references' own levels, the span and curve of eac
 The scores are Excel formulas of the raw scores and the Scale sheet, so editing a span, a curve or a weight rescores
 the run (a run from before a scale change is shown on the span and curve its config has now). In a race each
 configuration, and the winner after the race, gets its own pair of sheets and its own Scale column. Without the WebUI:
-`python -c "from rulztrainer import likeness_export; likeness_export.export('output/<job>')"`.
+`python -c "from rulztrainer import likeness_export; likeness_export.export('output/<job>')"`. The Scale sheet also shows
+where your references' own face and body level land on the chosen scales.
+
+The same spreadsheet comes from **Previous Runs** too (*Export spreadsheet* under the table, one file per ticked run),
+built from the raw probe scores the run history keeps, so it works after a later run has reused the job folder. Runs
+saved before this version have those scores only if their job folder still holds the run: *Import old runs* (or
+opening the tab) adds them then.
 
 ## Likeness-filtered self-training (`selftrain`)
 
@@ -1012,7 +1018,8 @@ a *Show lines (all runs)* bar of Face / Body / Combined chips above each chart: 
 every ticked run at once, and on again to bring it back. A race run draws each configuration's probe lines in its own colour, named
 after it (`<run> lora16 - face`; the winner's after the race: `winner`); *Import old runs* adds that split to race runs
 saved before it existed, while their job folder is still there. *Rename* gives a run a name of your own and *Remove from history* deletes
-its history file only (never the job folder). A run that is still training updates live.
+its history file only (never the job folder). *Export spreadsheet* downloads each ticked run's likeness spreadsheet (see
+*Export spreadsheet* under the likeness probes), from the raw probe scores the history keeps for it. A run that is still training updates live.
 
 **Probe images** (below the charts) puts the ticked runs' likeness probes side by side: pick Face or Body and a probe
 step (the arrows step through them), and each run, or each configuration of a race, shows its probe images of that

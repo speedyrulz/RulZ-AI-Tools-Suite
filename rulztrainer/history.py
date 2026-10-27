@@ -30,7 +30,7 @@ CONFIG_KEYS = ("job_name", "preset", "network_type", "lora_rank", "lokr_factor",
                "finetune", "race", "timestep_sampling", "likeness_curriculum", "face_scale_span", "face_scale_curve",
                "body_scale_span", "body_scale_curve", "probe_face_prompt", "probe_body_prompt", "probe_seed",
                "probe_seeds", "probe_size", "probe_steps", "probe_cfg", "turbo_lora", "resolutions",
-               "reward_steps", "body_align", "selftrain")
+               "reward_steps", "body_align", "selftrain", "probe_ema")
 
 
 def new_run_id(job_name: str, now: float | None = None) -> str:
@@ -138,6 +138,30 @@ def keep_probe_images(run_id: str, status: dict, root: Path = HISTORY_DIR) -> li
     return out
 
 
+def probe_raw(status: dict) -> dict:
+    """The raw probe scores, enough to rebuild the likeness spreadsheet with any scale after the job folder is gone:
+    {"names": the race's configurations, "records": [{"step", "face", "body", "racer" (a race), "scale" (the logged
+    scale, where it changes)}]}. A probe logged twice (the step-0 probe) is kept once, the later copy."""
+    names = race_names(status)
+    out: list[dict] = []
+    last_scale: dict[str, dict] = {}
+    for rec in status.get("probes") or []:
+        racer = probe_racer(rec, names) if names else ""
+        e = {"step": rec.get("step"), "face": rec.get("face"), "body": rec.get("body")}
+        if names:
+            e["racer"] = racer
+        scale = rec.get("scale")
+        if out and out[-1]["step"] == e["step"] and out[-1].get("racer") == e.get("racer"):
+            dropped = out.pop()
+            if "scale" in dropped:
+                last_scale.pop(racer, None)
+        if scale and last_scale.get(racer) != scale:
+            e["scale"] = scale
+            last_scale[racer] = scale
+        out.append(e)
+    return {"names": names, "records": out}
+
+
 def race_names(status: dict) -> list[str]:
     return [str(n) for n in ((status.get("race") or {}).get("names") or [])]
 
@@ -149,7 +173,8 @@ def build_record(cfg: dict, arch: str, run_id: str, started: float, status: dict
             "step": status.get("step") or 0, "total": status.get("total") or cfg.get("steps") or 0,
             "config": {k: cfg[k] for k in CONFIG_KEYS if k in cfg},
             "identity": identity_series(status.get("face_scores") or []),
-            "probes": probe_series(status.get("probes") or [], race_names(status))}
+            "probes": probe_series(status.get("probes") or [], race_names(status)),
+            "probe_raw": probe_raw(status)}
 
 
 def has_data(record: dict) -> bool:
@@ -228,19 +253,19 @@ def delete_runs(run_ids: list[str], root: Path = HISTORY_DIR) -> int:
 def import_jobs(output: Path | None = None, root: Path = HISTORY_DIR) -> int:
     """History for the job folders (output/**/status.json) from before the history existed: one run per folder whose
     job has no history yet and whose status.json holds likeness scores. A race run saved before the history kept each
-    configuration's probes apart gets them from its folder, and a run saved before the history kept probe images
-    gets them when its folder still holds that same run (the same probe scores). Returns how many runs were added
-    or updated."""
+    configuration's probes apart gets them from its folder, and a run saved before the history kept probe images or
+    raw probe scores (probe_raw, for its spreadsheet) gets them when its folder still holds that same run (the same
+    probe scores). Returns how many runs were added or updated."""
     import yaml
 
     output = output or ROOT / "output"
     runs = list_runs(root)
     have = {r["job"] for r in runs}
     unsplit = {r["job"]: r for r in runs if (r.get("config") or {}).get("race") and "racers" not in r["probes"]}
-    imageless: dict[str, list[dict]] = {}  # a job name can have several runs
+    incomplete: dict[str, list[dict]] = {}  # without probe images or raw scores; a job name can have several runs
     for r in runs:
-        if "probe_images" not in r:
-            imageless.setdefault(r["job"], []).append(r)
+        if "probe_images" not in r or "probe_raw" not in r:
+            incomplete.setdefault(r["job"], []).append(r)
     added = 0
     for status_path in sorted(output.rglob("status.json")) if output.is_dir() else []:
         job_dir = status_path.parent
@@ -259,15 +284,21 @@ def import_jobs(output: Path | None = None, root: Path = HISTORY_DIR) -> int:
             rec = unsplit.pop(job)
             rec["probes"] = series
             changed = True
-        same = [r for r in imageless.get(job, []) if series.get("combined")
+        same = [r for r in incomplete.get(job, []) if series.get("combined")
                 and r["probes"].get("combined") == series.get("combined")]
         if same:
-            rec = same[0]  # the folder still holds this very run: its probe images are its own
-            imageless[job].remove(rec)
-            images = keep_probe_images(rec["id"], status, root)
-            if images:
-                rec["probe_images"] = images
-                changed = True
+            rec = same[0]  # the folder still holds this very run: its probe images and scores are its own
+            incomplete[job].remove(rec)
+            if "probe_images" not in rec:
+                images = keep_probe_images(rec["id"], status, root)
+                if images:
+                    rec["probe_images"] = images
+                    changed = True
+            if "probe_raw" not in rec:
+                raw = probe_raw(status)
+                if raw["records"]:
+                    rec["probe_raw"] = raw
+                    changed = True
         if changed:
             _write(root / f"{rec['id']}.json", rec)
             added += 1

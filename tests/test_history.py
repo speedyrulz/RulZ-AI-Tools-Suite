@@ -4,6 +4,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import webui  # noqa: E402
@@ -169,3 +171,50 @@ def test_probe_images_are_kept_with_their_run_and_compared_at_the_same_step(tmp_
     assert webui.probe_settings_differences([run, other]) == ["probe_size: 512 / 768"]
     assert webui.probe_caption({"combined": 61.4, "face": 70.0, "body": None}) == "overall 61 | face 70 | body -"
     assert history.delete_runs(["run1"], root) == 0 and not (root / "run1").exists()  # the copies go too
+
+
+def _raw_probe(step, face, body, prefix="", scale=None):
+    return {"step": step, "face": face, "body": body, "scale": scale or {"face": [10.0, 91.0]},
+            "images": [f"output/j/probes/{prefix}step{step:06d}_face_0.png"]}
+
+
+def test_raw_probe_scores_are_kept_for_the_spreadsheet(tmp_path):
+    from openpyxl import load_workbook
+
+    from rulztrainer import likeness_export
+
+    probes = [_raw_probe(0, 10.0, 30.0), _raw_probe(0, 10.0, 30.0), _raw_probe(100, 50.0, 70.0),
+              _raw_probe(200, 55.0, None, scale={"face": [10.0, 95.0]})]
+    raw = history.probe_raw({"probes": probes})
+    assert raw["names"] == [] and [r["step"] for r in raw["records"]] == [0, 100, 200]  # step 0 kept once
+    assert "scale" in raw["records"][0] and "scale" not in raw["records"][1] and "scale" in raw["records"][2]
+    race = history.probe_raw({"race": {"names": ["a", "b"]},
+                              "probes": [_raw_probe(0, 10.0, 30.0, "a_"), _raw_probe(0, 11.0, 31.0, "b_")]})
+    assert [(r["racer"], "scale" in r) for r in race["records"]] == [("a", True), ("b", True)]
+
+    cfg = TrainConfig(job_name="kept", face_scale_span=1.1, face_scale_curve=3.0, face_weight=0.8, body_weight=0.2)
+    history.save_run(cfg, "kept-1", 1.0, _status(probes=probes), root=tmp_path)
+    (run,) = history.list_runs(tmp_path)
+    assert run["probe_raw"] == raw and run["config"]["probe_ema"] == cfg.probe_ema
+    out = likeness_export.export_run(run, tmp_path / "kept.xlsx")
+    sc = load_workbook(out)["Scale"]
+    assert (sc["B5"].value, sc["B6"].value, sc["B12"].value) == (1.1, 3.0, 0.8)  # the run's own settings
+    assert load_workbook(out)["Raw probe scores"].max_row == 4
+    run.pop("probe_raw")
+    with pytest.raises(FileNotFoundError):
+        likeness_export.export_run(run, tmp_path / "none.xlsx")
+
+
+def test_import_adds_raw_scores_to_a_run_saved_before_they_were_kept(tmp_path):
+    out, root = tmp_path / "output", tmp_path / "output" / "_history"
+    probes = [{**_raw_probe(0, 10.0, 30.0), **PROBES[0]}, {**_raw_probe(25, 40.0, 60.0), **PROBES[1]}]
+    _job(out, "old", face_scores=SCORES, probes=probes)
+    assert history.import_jobs(out, root) == 1
+    (run,) = history.list_runs(root)
+    path = root / f"{run['id']}.json"
+    run.pop("probe_raw")
+    path.write_text(json.dumps(run), encoding="utf-8")  # as saved by an older version
+    assert history.import_jobs(out, root) == 1
+    (run,) = history.list_runs(root)
+    assert [r["step"] for r in run["probe_raw"]["records"]] == [0, 25]
+    assert history.import_jobs(out, root) == 0
