@@ -130,3 +130,42 @@ def test_a_race_keeps_each_configuration_s_probes_apart(tmp_path):
     upgraded = history.list_runs(root)
     assert len(upgraded) == 1 and list(upgraded[0]["probes"]["racers"]) == ["lora16", "lokr8", "winner"]
     assert upgraded[0]["label"] == "my race"
+
+
+def test_probe_images_are_kept_with_their_run_and_compared_at_the_same_step(tmp_path):
+    from PIL import Image
+
+    job = tmp_path / "out" / "probes"
+    job.mkdir(parents=True)
+    for name in ("lora16_step000100_face_0.png", "lora16_step000100_face_1.png", "lokr8_step000100_face_0.png",
+                 "lokr8_step000200_face_0.png", "step000300_face_0.png"):
+        Image.new("RGB", (1024, 1024), "white").save(job / name)
+
+    def rec(step, prefix, seeds, comb):
+        return {"step": step, "face_norm": comb, "body_norm": None, "combined": comb,
+                "images": [str(job / f"{prefix}step{step:06d}_face_{k}.png") for k in seeds]}
+
+    status = {"race": {"names": ["lora16", "lokr8"]}, "probes": [
+        rec(100, "lora16_", (0, 1), 30.0), rec(100, "lokr8_", (0,), 35.0), rec(200, "lokr8_", (0,), 50.0),
+        rec(300, "", (0,), 60.0)]}
+    root = tmp_path / "history"
+    kept = history.keep_probe_images("run1", status, root)
+    assert len(kept) == 5 and all((root / e["file"]).is_file() for e in kept)
+    assert {(e["racer"], e["step"], e["seed"]) for e in kept} >= {("lora16", 100, 1), ("", 300, 0)}
+    with Image.open(root / kept[0]["file"]) as im:
+        assert max(im.size) == history.PROBE_THUMB_PX and im.format == "JPEG"
+    assert next(e for e in kept if e["racer"] == "lokr8" and e["step"] == 200)["combined"] == 50.0
+    (job / "lora16_step000100_face_0.png").unlink()  # copies outlive the job folder's own (a reused job name)
+    assert len(history.keep_probe_images("run1", status, root)) == 5
+
+    run = {"id": "run1", "job": "race", "label": "my race", "probe_images": kept, "config": {"probe_size": 512}}
+    groups = webui.probe_image_groups([run])
+    assert [g[0] for g in groups] == ["my race lora16", "my race lokr8", "my race winner"]
+    assert webui.probe_image_steps(groups, "face") == [100, 200, 300] and webui.probe_image_steps(groups, "body") == []
+    at, imgs = webui.probe_images_at(groups[0][2], 200, "face")  # lora16 left the race after step 100
+    assert at == 100 and [e["seed"] for e in imgs] == [0, 1]
+    assert webui.probe_images_at(groups[2][2], 200, "face") == (None, [])  # the winner only from step 300
+    other = {"id": "run2", "job": "x", "label": "", "probe_images": [], "config": {"probe_size": 768}}
+    assert webui.probe_settings_differences([run, other]) == ["probe_size: 512 / 768"]
+    assert webui.probe_caption({"combined": 61.4, "face": 70.0, "body": None}) == "overall 61 | face 70 | body -"
+    assert history.delete_runs(["run1"], root) == 0 and not (root / "run1").exists()  # the copies go too

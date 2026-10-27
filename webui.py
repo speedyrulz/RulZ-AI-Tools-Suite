@@ -1396,6 +1396,7 @@ body {
 .q-uploader__header { color: var(--rz-text); border-bottom: 1px solid var(--rz-border); }
 .rz-log { background: var(--rz-deep); border: 1px solid var(--rz-border); border-radius: 10px; color: var(--rz-text-2); }
 .rz-thumb { background: var(--rz-surface-2); border: 1px solid var(--rz-border); border-radius: 10px; overflow: hidden; }
+.rz-thumb.rz-picked { border: 2px solid var(--rz-red, #E10600); }
 .rz-ds-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; width: 100%; }
 .rz-look-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; }
 .rz-ds-card { background: var(--rz-surface-2); border: 1px solid var(--rz-border); border-radius: 12px;
@@ -4403,10 +4404,60 @@ def history_series(runs: list[dict], part: str, metrics: list[str]) -> list[dict
     return out
 
 
+PROBE_SETTING_KEYS = ("probe_face_prompt", "probe_body_prompt", "probe_seed", "probe_size", "probe_steps", "probe_cfg",
+                      "turbo_lora", "resolutions")
+
+
+def probe_image_groups(runs: list[dict]) -> list[tuple[str, dict, list[dict]]]:
+    """[(label, run, entries)] of the runs' kept probe images: one group per run, or per configuration of a race
+    ("<run> lora16"; its winner after the race: "<run> winner")."""
+    out = []
+    for r in runs:
+        entries = r.get("probe_images") or []
+        racers = list(dict.fromkeys(e.get("racer", "") for e in entries))
+        for racer in sorted(racers, key=lambda x: x == ""):  # the winner's after the race last
+            mine = [e for e in entries if e.get("racer", "") == racer]
+            label = history_label(r) + (f" {racer}" if racer else (" winner" if len(racers) > 1 else ""))
+            out.append((label, r, mine))
+    return out
+
+
+def probe_image_steps(groups, kind: str) -> list[int]:
+    """Every probe step any of the groups has an image of this kind at, ascending."""
+    return sorted({e["step"] for _, _, entries in groups for e in entries if e["kind"] == kind})
+
+
+def probe_images_at(entries: list[dict], step: int, kind: str) -> tuple[int | None, list[dict]]:
+    """(the step shown, its images by seed): the group's probe at `step`, else its latest one before it (a run probed
+    on another interval), else None."""
+    steps = sorted({e["step"] for e in entries if e["kind"] == kind and e["step"] <= step})
+    if not steps:
+        return None, []
+    at = steps[-1]
+    return at, sorted((e for e in entries if e["kind"] == kind and e["step"] == at), key=lambda e: e["seed"])
+
+
+def probe_settings_differences(runs: list[dict]) -> list[str]:
+    """The probe settings that differ between the runs ("probe_size: 512 / 768"): their probes are not the same
+    picture of a likeness then."""
+    out = []
+    for key in PROBE_SETTING_KEYS:
+        vals = [(r.get("config") or {}).get(key) for r in runs]
+        known = [v for v in vals if v is not None]
+        if len({json.dumps(v, sort_keys=True) for v in known}) > 1:
+            out.append(f"{key}: " + " / ".join(str(v) for v in vals))
+    return out
+
+
+def probe_caption(entry: dict) -> str:
+    f2 = lambda x: "-" if x is None else f"{x:.0f}"  # noqa: E731
+    return f"overall {f2(entry.get('combined'))} | face {f2(entry.get('face'))} | body {f2(entry.get('body'))}"
+
+
 def build_history_tab(charts: list):
     """Previous Runs: the saved likeness history of every run (output/_history), any number of them ticked to overlay
     their charts."""
-    state = {"runs": [], "sig": None}
+    state = {"runs": [], "sig": None, "picks": [], "captions": [], "shown": None}
 
     def selected_runs() -> list[dict]:
         ids = {row["id"] for row in table.selected}
@@ -4423,6 +4474,92 @@ def build_history_tab(charts: list):
             empty.text = ("Tick one or more runs above to draw them here." if not picked else
                           "" if series else "The ticked runs have no scores of this kind.")
         compare.text = f"{len(picked)} run(s) overlaid" if picked else ""
+        draw_probes()
+
+    def draw_probes(*_):
+        picked = selected_runs()
+        groups = probe_image_groups(picked)
+        kind = probe_kind.value
+        steps = probe_image_steps(groups, kind)
+        opts = {s: f"step {s:,}" for s in steps}
+        if probe_step.options != opts:
+            probe_step.set_options(opts, value=probe_step.value if probe_step.value in opts else
+                                   (steps[-1] if steps else None))
+        step = probe_step.value
+        sig = (tuple(r["id"] for r in picked), tuple(len(e) for _, _, e in groups), kind, step,
+               tuple(state["picks"]))
+        if sig == state["shown"]:
+            return
+        state["shown"] = sig
+        diffs = probe_settings_differences(picked)
+        probe_warn.text = ("Probe settings differ, so these probes are not the same test: " + "; ".join(diffs)) \
+            if diffs else ""
+        pick_label.text = f"{len(state['picks'])} of 2 picked" if state["picks"] else \
+            "Pick any two images (any run, any step) to compare them large"
+        compare_btn.enabled = len(state["picks"]) == 2
+        probe_grid.clear()
+        with probe_grid:
+            if not picked:
+                hint("Tick one or more runs above to see their probe images side by side.")
+                return
+            if not steps:
+                hint("The ticked runs have no kept probe images (runs from before RulzTrainer kept them, unless their "
+                     "job folder still holds them: Import old runs adds those).")
+                return
+            for label, run, entries in groups:
+                at, imgs = probe_images_at(entries, step, kind)
+                with ui.row().classes("w-full items-start gap-2 no-wrap"):
+                    with ui.column().classes("w-44 shrink-0 gap-0"):
+                        ui.label(label).classes("text-sm font-medium break-words")
+                        if at is None:
+                            hint(f"no {kind} probe by step {step:,}")
+                        elif at != step:
+                            hint(f"its latest {kind} probe before: step {at:,}")
+                    with ui.row().classes("gap-2"):
+                        for e in imgs:
+                            path = history.HISTORY_DIR / e["file"]
+                            picked_now = str(path) in state["picks"]
+                            with ui.card().tight().classes("rz-thumb" + (" rz-picked" if picked_now else "")):
+                                ui.image(image_url(path)).props("fit=contain") \
+                                    .classes("w-48 h-48 rz-imgbg cursor-pointer") \
+                                    .on("click", lambda _, q=path: show_full(q))
+                                with ui.row().classes("w-full items-center no-wrap px-1 gap-1"):
+                                    ui.label(f"seed {e['seed'] + 1}  {probe_caption(e)}").classes("text-xs rz-hint")
+                                    ui.space()
+                                    ui.button(icon="check_box" if picked_now else "check_box_outline_blank",
+                                              on_click=lambda _, q=str(path), c=f"{label}, step {e['step']:,}, "
+                                              f"{kind} seed {e['seed'] + 1}: {probe_caption(e)}": toggle_pick(q, c)) \
+                                        .props("flat dense round size=sm").tooltip("Pick to compare")
+
+    def toggle_pick(path: str, caption: str):
+        if path in state["picks"]:
+            i = state["picks"].index(path)
+            del state["picks"][i]
+            del state["captions"][i]
+        else:
+            if len(state["picks"]) == 2:  # a third pick replaces the older one
+                state["picks"].pop(0)
+                state["captions"].pop(0)
+            state["picks"].append(path)
+            state["captions"].append(caption)
+        state["shown"] = None
+        if len(state["picks"]) == 2:  # before the redraw, which removes the button this click came from
+            open_compare()
+        draw_probes()
+
+    def open_compare():
+        if len(state["picks"]) != 2:
+            return
+        for img, cap, path, text in zip(cmp_imgs, cmp_caps, state["picks"], state["captions"]):
+            img.set_source(image_url(path))
+            cap.text = text
+        cmp_dlg.open()
+
+    def clear_picks():
+        state["picks"].clear()
+        state["captions"].clear()
+        state["shown"] = None
+        draw_probes()
 
     def reload(force: bool = False):
         sig = history.signature()
@@ -4512,6 +4649,41 @@ def build_history_tab(charts: list):
             probe_empty = hint("")
         probe_chart_h = ui.echart(chart_options(_axis("step", min="dataMin"), _axis("likeness %", min=0),
                                                 [], [])).classes("w-full h-72")
+    with section("Probe images", "The ticked runs' probes at the same step side by side; pick two to compare",
+                 "compare"):
+        with ui.row().classes("w-full items-center gap-2"):
+            probe_kind = ui.toggle({"face": "Face", "body": "Body"}, value="face",
+                                   on_change=lambda _: draw_probes()).props("dense no-caps")
+
+            def step_by(delta: int):
+                keys = list(probe_step.options)
+                if probe_step.value in keys:
+                    i = min(len(keys) - 1, max(0, keys.index(probe_step.value) + delta))
+                    probe_step.value = keys[i]
+
+            ui.button(icon="chevron_left", on_click=lambda: step_by(-1)).props("flat dense round") \
+                .tooltip("Earlier probe")
+            probe_step = ui.select({}, label="Probe step", on_change=lambda _: draw_probes()).classes("w-40")
+            ui.button(icon="chevron_right", on_click=lambda: step_by(1)).props("flat dense round") \
+                .tooltip("Later probe")
+            ui.space()
+            pick_label = hint("")
+            compare_btn = ui.button("Compare", icon="compare", on_click=open_compare).props("outline dense no-caps")
+            ui.button("Clear picks", icon="deselect", on_click=clear_picks).props("flat dense no-caps")
+        probe_warn = hint("", warn=True)
+        probe_grid = ui.column().classes("w-full gap-3")
+    with ui.dialog().props("maximized") as cmp_dlg, ui.card().tight().classes("w-full h-full bg-black"):
+        with ui.row().classes("w-full items-center justify-between px-3 py-1"):
+            ui.label("Compare").classes("text-sm text-white")
+            ui.button(icon="close", on_click=cmp_dlg.close).props("flat dense round color=white")
+        with ui.row().classes("w-full no-wrap gap-2 px-2"):
+            cmp_imgs, cmp_caps = [], []
+            for _ in range(2):
+                with ui.column().classes("w-1/2 items-center gap-1"):
+                    cmp_imgs.append(ui.image("").props("fit=contain").classes("w-full")
+                                    .style("height: calc(100vh - 96px)"))
+                    cmp_caps.append(ui.label("").classes("text-xs text-white text-center"))
+    show_full = image_viewer()
     charts.extend([id_chart, probe_chart_h])
     try:
         history.import_jobs()  # the runs from before the history existed, once
@@ -6807,6 +6979,16 @@ Tick any number of runs in the table (name, start, state, steps, adapter, learni
 overlay them: one colour per run, solid lines for the face, dashed for the body and thick for the combined score, with
 checkboxes to show only some of the three. *Rename* gives a run a name of your own and *Remove from history* deletes
 its history file only (never the job folder). A run that is still training updates live.
+
+**Probe images** (below the charts) puts the ticked runs' likeness probes side by side: pick Face or Body and a probe
+step (the arrows step through them), and each run, or each configuration of a race, shows its probe images of that
+step in one row with their overall / face / body scores. A run probed on another interval shows its latest probe before
+that step, marked. Click an image to see it full size; tick the box under any two (any run, any step) to open them
+side by side, large, with their scores (*Compare* opens them again, *Clear picks* starts over). When the ticked runs
+used different probe settings (prompts, seed, size, steps, guidance, turbo LoRA or resolutions) a note says which:
+their probes are not the same test then. The images are kept with the run, as small JPEG copies in
+`output/_history/<run id>/`, so a later run with the same job name does not replace them; *Remove from history* deletes
+them too. Runs saved before v2.4.0 get theirs from *Import old runs* while their job folder still holds that same run.
 
 ## Identity training (character LoRAs)
 The **Identity training preset** switch (top of the Train tab, or *Character / person* in the Wizard) applies the

@@ -9,7 +9,10 @@ What is kept is what the Monitor's two likeness charts plot:
               each configuration's own (probes.racers, by name; "winner" for the probes after the race);
 
 on the normalized scale (0 = a stranger, 100 = the references) where the run had one, else the raw percentages.
-Runs from before the history existed are imported from their job folders' status.json."""
+The probe images are kept too, as small JPEG copies in output/_history/<run id>/ (a later run with the same job name
+overwrites the job folder's own), each with its step, kind, seed, configuration and that probe's scores
+(probe_images), for the Previous Runs tab's side-by-side comparison. Runs from before the history existed are imported
+from their job folders' status.json."""
 from __future__ import annotations
 
 import json
@@ -25,7 +28,8 @@ CONFIG_KEYS = ("job_name", "preset", "network_type", "lora_rank", "lokr_factor",
                "attn_localize", "id_align", "learning_rate", "optimizer", "steps", "batch_size", "lora_ema",
                "face_weight", "body_weight", "face_loss_weight", "body_loss_weight", "crop_augment", "isolation",
                "finetune", "race", "timestep_sampling", "likeness_curriculum", "face_scale_span", "face_scale_curve",
-               "body_scale_span", "body_scale_curve",
+               "body_scale_span", "body_scale_curve", "probe_face_prompt", "probe_body_prompt", "probe_seed",
+               "probe_seeds", "probe_size", "probe_steps", "probe_cfg", "turbo_lora", "resolutions",
                "reward_steps", "body_align", "selftrain")
 
 
@@ -89,6 +93,51 @@ def probe_series(probes: list[dict], names=()) -> dict:
     return out
 
 
+_PROBE_IMAGE = re.compile(r"step(?P<step>\d{6})_(?P<kind>face|body)_(?P<seed>\d+)\.png$")
+PROBE_THUMB_PX = 768  # the copies' longest side (probes render at probe_size, 512 by default)
+
+
+def _source(path: str) -> Path:
+    p = Path(path)
+    return p if p.is_absolute() else ROOT / p
+
+
+def keep_probe_images(run_id: str, status: dict, root: Path = HISTORY_DIR) -> list[dict]:
+    """Copy the run's probe images into root/<run id>/ (JPEG, at most PROBE_THUMB_PX; already copied ones are kept)
+    and return their entries: {"step", "kind", "seed", "racer", "file" (relative to root), "face", "body",
+    "combined"} with that probe's scores (normalized where the run had them)."""
+    names = race_names(status)
+    out = []
+    for rec in status.get("probes") or []:
+        racer = probe_racer(rec, names) if names else ""
+        norm = rec.get("face_norm") is not None or rec.get("body_norm") is not None
+        scores = {"face": rec.get("face_norm") if norm else rec.get("face"),
+                  "body": rec.get("body_norm") if norm else rec.get("body"), "combined": rec.get("combined")}
+        for img in rec.get("images") or []:
+            m = _PROBE_IMAGE.search(Path(img).name)
+            if not m:
+                continue
+            name = f"{racer + '_' if racer else ''}step{int(m['step']):06d}_{m['kind']}_{m['seed']}.jpg"
+            dest = root / run_id / name
+            if not dest.is_file():
+                src = _source(img)
+                if not src.is_file():
+                    continue
+                try:
+                    from PIL import Image
+
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    with Image.open(src) as im:
+                        im = im.convert("RGB")
+                        im.thumbnail((PROBE_THUMB_PX, PROBE_THUMB_PX))
+                        im.save(dest, quality=90)
+                except OSError:
+                    continue
+            out.append({"step": int(rec.get("step", m["step"])), "kind": m["kind"], "seed": int(m["seed"]),
+                        "racer": racer, "file": f"{run_id}/{name}", **scores})
+    return out
+
+
 def race_names(status: dict) -> list[str]:
     return [str(n) for n in ((status.get("race") or {}).get("names") or [])]
 
@@ -127,6 +176,7 @@ def save_run(cfg, run_id: str, started: float, status: dict, state: str = "runni
         record["label"] = json.loads(path.read_text(encoding="utf-8")).get("label", "")
     except (OSError, ValueError):
         pass
+    record["probe_images"] = keep_probe_images(run_id, status, root)
     _write(path, record)
     return path
 
@@ -167,19 +217,30 @@ def delete_runs(run_ids: list[str], root: Path = HISTORY_DIR) -> int:
         if p.is_file() and p.parent == root:
             p.unlink()
             n += 1
+        images = root / rid
+        if images.is_dir() and images.parent == root:
+            import shutil
+
+            shutil.rmtree(images, ignore_errors=True)
     return n
 
 
 def import_jobs(output: Path | None = None, root: Path = HISTORY_DIR) -> int:
     """History for the job folders (output/**/status.json) from before the history existed: one run per folder whose
     job has no history yet and whose status.json holds likeness scores. A race run saved before the history kept each
-    configuration's probes apart gets them from its folder. Returns how many runs were added or updated."""
+    configuration's probes apart gets them from its folder, and a run saved before the history kept probe images
+    gets them when its folder still holds that same run (the same probe scores). Returns how many runs were added
+    or updated."""
     import yaml
 
     output = output or ROOT / "output"
     runs = list_runs(root)
     have = {r["job"] for r in runs}
     unsplit = {r["job"]: r for r in runs if (r.get("config") or {}).get("race") and "racers" not in r["probes"]}
+    imageless: dict[str, list[dict]] = {}  # a job name can have several runs
+    for r in runs:
+        if "probe_images" not in r:
+            imageless.setdefault(r["job"], []).append(r)
     added = 0
     for status_path in sorted(output.rglob("status.json")) if output.is_dir() else []:
         job_dir = status_path.parent
@@ -192,9 +253,22 @@ def import_jobs(output: Path | None = None, root: Path = HISTORY_DIR) -> int:
         except (OSError, ValueError, yaml.YAMLError):
             continue
         job = cfg.get("job_name") or job_dir.name
+        changed = False
+        series = probe_series(status.get("probes") or [], race_names(status))
         if job in unsplit and race_names(status):
             rec = unsplit.pop(job)
-            rec["probes"] = probe_series(status.get("probes") or [], race_names(status))
+            rec["probes"] = series
+            changed = True
+        same = [r for r in imageless.get(job, []) if series.get("combined")
+                and r["probes"].get("combined") == series.get("combined")]
+        if same:
+            rec = same[0]  # the folder still holds this very run: its probe images are its own
+            imageless[job].remove(rec)
+            images = keep_probe_images(rec["id"], status, root)
+            if images:
+                rec["probe_images"] = images
+                changed = True
+        if changed:
             _write(root / f"{rec['id']}.json", rec)
             added += 1
             continue
@@ -211,6 +285,7 @@ def import_jobs(output: Path | None = None, root: Path = HISTORY_DIR) -> int:
         record = build_record({**cfg, "job_name": job}, arch, new_run_id(job, started) + "-imported", started, status,
                               state, updated)
         if has_data(record):
+            record["probe_images"] = keep_probe_images(record["id"], status, root)
             _write(root / f"{record['id']}.json", record)
             have.add(job)
             added += 1

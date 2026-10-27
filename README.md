@@ -994,6 +994,16 @@ after it (`<run> lora16 - face`; the winner's after the race: `winner`); *Import
 saved before it existed, while their job folder is still there. *Rename* gives a run a name of your own and *Remove from history* deletes
 its history file only (never the job folder). A run that is still training updates live.
 
+**Probe images** (below the charts) puts the ticked runs' likeness probes side by side: pick Face or Body and a probe
+step (the arrows step through them), and each run, or each configuration of a race, shows its probe images of that
+step in one row with their overall / face / body scores. A run probed on another interval shows its latest probe before
+that step, marked. Click an image to see it full size; tick the box under any two (any run, any step) to open them
+side by side, large, with their scores (*Compare* opens them again, *Clear picks* starts over). When the ticked runs
+used different probe settings (prompts, seed, size, steps, guidance, turbo LoRA or resolutions) a note says which:
+their probes are not the same test then. The images are kept with the run, as small JPEG copies in
+`output/_history/<run id>/`, so a later run with the same job name does not replace them; *Remove from history* deletes
+them too. Runs saved before v2.4.0 get theirs from *Import old runs* while their job folder still holds that same run.
+
 ## Configuration race (`race`)
 
 Not sure which settings suit a dataset? `race: true` trains several configurations in one run and lets the likeness
