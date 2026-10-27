@@ -1160,6 +1160,8 @@ class Form:
             probe_floor_seeds=int(v("probe_floor_seeds") or 4),
             probe_steps=int(v("probe_steps")), probe_cfg=float(v("probe_cfg")), probe_ema=float(v("probe_ema")),
             likeness_noise_band=float(v("likeness_noise_band")), likeness_track_best=bool(v("likeness_track_best")),
+            likeness_track_best_face=bool(v("likeness_track_best_face")),
+            likeness_track_best_body=bool(v("likeness_track_best_body")),
             likeness_normalize=bool(v("likeness_normalize")),
             face_scale_span=float(v("face_scale_span")), face_scale_curve=float(v("face_scale_curve")),
             body_scale_span=float(v("body_scale_span")), body_scale_curve=float(v("body_scale_curve")),
@@ -2451,7 +2453,8 @@ def build_dataset_tab(f: Form):
                             ui.label(d["name"]).classes("font-medium truncate")
                             if DatasetPicker.key(d["path"]) in chosen:
                                 ui.badge("training", color="red").props("dense")
-                        ui.label(f"{images_text(d['images'])}, {d['captioned']} captioned")                             .classes("text-xs rz-hint")
+                        ui.label(f"{images_text(d['images'])}, {d['captioned']} captioned") \
+                            .classes("text-xs rz-hint")
                         ui.label(d["path"]).classes("text-xs rz-hint truncate w-full")
                 c.on("click", lambda _, p=d["path"]: open_dataset(p))
 
@@ -5051,7 +5054,8 @@ def build_page(local: bool = True):
                                                                      label="Text encoder device (caching)") \
                                     .classes("w-56")
                                 w["compile_model"] = ui.select(COMPILE_CHOICES, value=d.compile_model,
-                                                               label="Compile model (torch.compile)").classes("w-72")                                     .tooltip("Fuses the work between the matrix multiplies into fewer GPU kernels. "
+                                                               label="Compile model (torch.compile)").classes("w-72") \
+                                    .tooltip("Fuses the work between the matrix multiplies into fewer GPU kernels. "
                                              "Measured at 1 MP on an RTX 5060 Ti: MOSS-Image 26% and Krea 2 12% faster "
                                              "per step, after a 25-40 s warm-up. auto compiles runs of 100+ steps "
                                              "(needs triton, installed with the requirements); a block that fails to "
@@ -5099,7 +5103,9 @@ def build_page(local: bool = True):
                                                                     "torch": "PyTorch picks", "cudnn": "cuDNN",
                                                                     "flash": "flash", "efficient": "memory-efficient",
                                                                     "math": "math (slow, exact)"},
-                                                                   value=d.attention_backend, label="Attention kernel")                                     .classes("w-72")                                     .tooltip("The attention kernel of the DiT blocks. cuDNN ran Krea 2 steps 15-22% "
+                                                                   value=d.attention_backend, label="Attention kernel") \
+                                    .classes("w-72") \
+                                    .tooltip("The attention kernel of the DiT blocks. cuDNN ran Krea 2 steps 15-22% "
                                              "faster on an RTX 5060 Ti at the same loss, so auto puts it first on "
                                              "Blackwell GPUs (RTX 50, B200) and lets PyTorch pick elsewhere. The other "
                                              "kernels stay enabled behind the chosen one: a call it cannot take runs on "
@@ -5190,7 +5196,8 @@ def build_page(local: bool = True):
                                 w["caption_dropout"] = ui.number("Caption dropout", value=d.caption_dropout, min=0,
                                                                  max=0.5, step=0.01).classes("w-36")
                                 w["caption_dropout_keep_trigger"] = ui.switch("Dropped captions keep the trigger word",
-                                                                              value=d.caption_dropout_keep_trigger)                                     .tooltip("A dropped caption becomes the trigger word alone instead of the empty "
+                                                                              value=d.caption_dropout_keep_trigger) \
+                                    .tooltip("A dropped caption becomes the trigger word alone instead of the empty "
                                              "prompt, so the trigger by itself summons the subject, the way the LoRA "
                                              "is prompted. Off: the empty prompt (FIBO: its null caption).")
                                 w["max_token_length"] = ui.number("Max caption tokens", value=d.max_token_length,
@@ -6000,7 +6007,8 @@ def build_page(local: bool = True):
                                 .classes("w-32")
                             w["probe_cfg"] = ui.number("Probe CFG", value=d.probe_cfg, step=0.5).classes("w-32")
                             w["probe_size"] = ui.number("Probe size (px)", value=d.probe_size, step=64,
-                                                        precision=0).classes("w-36")                                 .tooltip("The face probe is size x size; the body probe is a 2:3 portrait with the "
+                                                        precision=0).classes("w-36") \
+                                .tooltip("The face probe is size x size; the body probe is a 2:3 portrait with the "
                                          "same pixel count (1024: 832 x 1248), so it fits wherever samples of that "
                                          "size do")
                         subhead("Controller actions")
@@ -6012,29 +6020,49 @@ def build_page(local: bool = True):
                                          "moves ~10 points over a run and a face score ~60, so the combined score, "
                                          "the curriculum and the noise band would follow the face alone.")
                             w["face_scale_span"] = ui.number("Face scale span", value=d.face_scale_span, min=1,
-                                                             step=0.05, format="%.2f").classes("w-36")                                 .bind_visibility_from(w["likeness_normalize"], "value")                                 .tooltip("An ArcFace cosine saturates: a decent likeness already matches your "
+                                                             step=0.05, format="%.2f").classes("w-36") \
+                                .bind_visibility_from(w["likeness_normalize"], "value") \
+                                .tooltip("An ArcFace cosine saturates: a decent likeness already matches your "
                                          "references, so the face read ~90 while the body read ~50 for pictures that "
                                          "looked equally close. The face's 100 sits this many times as far above a "
                                          "stranger as your references do (1 = the references themselves, the old "
                                          "scale).")
                             w["face_scale_curve"] = ui.number("Face scale curve", value=d.face_scale_curve, min=1,
-                                                              step=0.1, format="%.2f").classes("w-36")                                 .bind_visibility_from(w["likeness_normalize"], "value")                                 .tooltip("The face score is its position on that scale raised to this power: above "
+                                                              step=0.1, format="%.2f").classes("w-36") \
+                                .bind_visibility_from(w["likeness_normalize"], "value") \
+                                .tooltip("The face score is its position on that scale raised to this power: above "
                                          "1 the face starts slower and leaves room to keep improving. 1 = linear "
                                          "(the old scale). With the defaults (1.35 / 1.5) your references' own face "
                                          "level reads about 64.")
                             w["body_scale_span"] = ui.number("Body scale span", value=d.body_scale_span, min=1,
-                                                             step=0.05, format="%.2f").classes("w-36")                                 .bind_visibility_from(w["likeness_normalize"], "value")                                 .tooltip("The body's DINOv2 score saturates too: a probe that copies the photos' "
+                                                             step=0.05, format="%.2f").classes("w-36") \
+                                .bind_visibility_from(w["likeness_normalize"], "value") \
+                                .tooltip("The body's DINOv2 score saturates too: a probe that copies the photos' "
                                          "outfit and setting matches them better than your references, in their varied "
                                          "outfits, match each other, so the body read 100 while the face read 50-60. "
                                          "The body's 100 sits this many times as far above a stranger as your "
                                          "references do (1 = the references themselves, the scale of v2.1.3 and "
                                          "before).")
                             w["body_scale_curve"] = ui.number("Body scale curve", value=d.body_scale_curve, min=1,
-                                                              step=0.1, format="%.2f").classes("w-36")                                 .bind_visibility_from(w["likeness_normalize"], "value")                                 .tooltip("The body score is its position on that scale raised to this power, as for "
+                                                              step=0.1, format="%.2f").classes("w-36") \
+                                .bind_visibility_from(w["likeness_normalize"], "value") \
+                                .tooltip("The body score is its position on that scale raised to this power, as for "
                                          "the face. With the defaults (1.35 / 1.5) your references' own body level "
                                          "reads about 64, the same as their face.")
                             w["likeness_track_best"] = ui.switch("Keep best checkpoint (<job>_best.safetensors)",
-                                                                 value=d.likeness_track_best)
+                                                                 value=d.likeness_track_best) \
+                                .tooltip("Saved whenever the smoothed combined score beats its best so far by more "
+                                         "than the noise band.")
+                            w["likeness_track_best_face"] = ui.switch("Keep best face checkpoint "
+                                                                      "(<job>_best_face.safetensors)",
+                                                                      value=d.likeness_track_best_face) \
+                                .tooltip("A separate file at the best smoothed face score, whatever the body scores "
+                                         "then (same noise-band rule). Independent of the overall best checkpoint.")
+                            w["likeness_track_best_body"] = ui.switch("Keep best body checkpoint "
+                                                                      "(<job>_best_body.safetensors)",
+                                                                      value=d.likeness_track_best_body) \
+                                .tooltip("A separate file at the best smoothed body score, whatever the face scores "
+                                         "then (same noise-band rule). Independent of the overall best checkpoint.")
                             w["likeness_patience"] = ui.number("Early stop after N probes w/o improvement (0 = never)",
                                                                value=d.likeness_patience, precision=0) \
                                 .classes("w-96 max-w-full") \

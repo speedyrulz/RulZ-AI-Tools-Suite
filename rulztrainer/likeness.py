@@ -169,6 +169,8 @@ class LikenessController:
         self.face_best = None
         self.face_drop_count = 0
         self.id_loss_vetoed = False
+        # best face / body checkpoints (likeness_track_best_face / _body): {kind: (smoothed score, step)}
+        self.part_best: dict[str, tuple[float, int]] = {}
 
     def enter_stage(self, stage: int) -> None:
         """Start a resolution stage: the next probe becomes that stage's baseline."""
@@ -227,7 +229,9 @@ class LikenessController:
 
     def update(self, step: int, face: float | None, body: float | None, images: list[str] | None = None):
         """Feed one probe result. Returns (record, actions) where actions may contain
-        save_best (bool), stop (bool), lr_ratio (float, new/old), face_bias (float), step_up (int),
+        save_best (bool), save_best_face / save_best_body (bool: the smoothed face / body score beat its best by
+        the noise band and its checkpoint is kept), stop (bool), lr_ratio (float, new/old), face_bias (float),
+        step_up (int),
         id_loss_veto (bool: the face EMA fell more than 2 noise bands below its best for two probes in a row
         while the identity loss is on)."""
         cfg = self.cfg
@@ -253,6 +257,12 @@ class LikenessController:
                     and self.face_drop_count >= 2):
                 self.id_loss_vetoed = True
                 actions["id_loss_veto"] = True
+        for kind, value in (("face", face_n), ("body", body_n)):
+            prev = self.part_best.get(kind)
+            if value is not None and (prev is None or value > prev[0] + band):
+                self.part_best[kind] = (value, step)
+                if getattr(cfg, f"likeness_track_best_{kind}", False):
+                    actions[f"save_best_{kind}"] = True
         if comb is not None:
             if self.best is None or comb > self.best + band:
                 self.best, self.best_step, self.since_improve = comb, step, 0
@@ -306,6 +316,7 @@ class LikenessController:
                 "n_probes": self.n_probes, "stage": self.stage, "n_stages": self.n_stages,
                 "stage_best": self.stage_best, "stage_since_improve": self.stage_since_improve,
                 "id_loss_vetoed": self.id_loss_vetoed, "normalize": self.normalize,
+                "part_best": {k: {"score": v, "step": s} for k, (v, s) in self.part_best.items()},
                 "face_norm_ema": self.norm("face", self.face_ema), "body_norm_ema": self.norm("body", self.body_ema),
                 "scale": self.scale_record() if self.normalize else {}}
 

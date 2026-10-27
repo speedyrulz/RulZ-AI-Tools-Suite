@@ -3264,6 +3264,20 @@ class Trainer(RaceParallelMixin):
             log.info("New best likeness %.1f%% at step %d -> %s", rec.best, step, path)
             if str(path) not in self.status.data["saved"]:
                 self.status.data["saved"].append(str(path))
+        for kind in ("face", "body"):
+            if actions.get(f"save_best_{kind}"):
+                score = self.controller.part_best[kind][0]
+                if getattr(self, "ft", None) is not None:
+                    path = self._finetune_save(step, True, label=f"_best_{kind}")
+                else:
+                    path = self.job_dir / f"{cfg.job_name}{self._file_tag()}_best_{kind}.safetensors"
+                    lora_mod.save_lora(injected, path, metadata={"ss_steps": str(step),
+                                                                 f"likeness_best_{kind}": f"{score:.2f}",
+                                                                 "modelspec.architecture": self.arch.modelspec},
+                                       dtype=cfg.lora_save_dtype, fmt=self.arch.lora_format)
+                log.info("New best %s likeness %.1f%% at step %d -> %s", kind, score, step, path)
+                if str(path) not in self.status.data["saved"]:
+                    self.status.data["saved"].append(str(path))
         if actions.get("id_loss_veto") and self.id_loss is not None:
             self.id_loss = None
             if self._race_running():

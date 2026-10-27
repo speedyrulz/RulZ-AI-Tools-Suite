@@ -47,6 +47,21 @@ def test_controller_best_stop_lr_and_curriculum():
     assert c.lr_factor <= 2.0
 
 
+def test_best_face_and_body_checkpoints_are_kept_apart_from_the_overall_best():
+    c = L.LikenessController(_cfg(likeness_track_best_face=True))  # the body file off
+    _, act = c.update(0, 40.0, 80.0)
+    assert act.get("save_best") and act.get("save_best_face") and not act.get("save_best_body")
+    _, act = c.update(10, 50.0, 40.0)  # the face rises, the body and the combined score fall
+    assert act.get("save_best_face") and not act.get("save_best")
+    _, act = c.update(20, 50.5, 90.0)  # the face within the noise band: no new face best
+    assert not act.get("save_best_face") and act.get("save_best")
+    assert c.part_best == {"face": (50.0, 10), "body": (90.0, 20)}
+    assert c.state()["part_best"]["face"] == {"score": 50.0, "step": 10}
+    off = L.LikenessController(_cfg())
+    _, act = off.update(0, 40.0, 80.0)
+    assert not act.get("save_best_face") and not act.get("save_best_body")
+
+
 def test_controller_handles_missing_modalities():
     c = L.LikenessController(_cfg())
     rec, _ = c.update(0, None, 70.0)

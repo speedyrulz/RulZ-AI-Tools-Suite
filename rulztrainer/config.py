@@ -426,6 +426,8 @@ class TrainConfig:
     body_scale_span: float = 1.35  # the same for the body: its 100 this many times as far above a stranger
     body_scale_curve: float = 1.5  # and its curve (1 and 1 = the linear body scale of v2.1.3 and before)
     likeness_track_best: bool = True  # keep <job>_best.safetensors at the best smoothed score
+    likeness_track_best_face: bool = False  # also keep <job>_best_face.safetensors at the best smoothed face score
+    likeness_track_best_body: bool = False  # and <job>_best_body.safetensors at the best smoothed body score
     likeness_patience: int = 0  # stop after N probes without improvement; 0 = never
     likeness_lr_control: bool = False  # bounded lr multiplier driven by the probe trend
     likeness_lr_min: float = 0.5
