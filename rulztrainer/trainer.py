@@ -2728,7 +2728,7 @@ class Trainer(RaceParallelMixin):
         kept = ckpt.kept_blocks(model)  # measured for one training image; an update's guidance pass needs more:
         ckpt.set_kept_blocks(model, [])  # every block recomputes during the stage
         history = self.status.data.get("rewards", [])
-        s = 0
+        s = probed = 0
         t0 = time.time()
         try:
             for s in range(1, cfg.reward_steps + 1):
@@ -2807,6 +2807,7 @@ class Trainer(RaceParallelMixin):
                 if self.controller is not None and cfg.probe_every > 0 and s % cfg.probe_every == 0:
                     lora_mod.set_extras_enabled(model, False)
                     stop = self.run_probe(model, step0 + s, opt, sched, injected)
+                    probed = s
                     model.train()
                     lora_mod.set_extras_enabled(model, True)
                     if stop:
@@ -2817,10 +2818,23 @@ class Trainer(RaceParallelMixin):
             ckpt.set_kept_blocks(model, kept)
             for name, m in injected.items():
                 m.dropout = dropouts[name]
+        if s > probed and not self.stop_file.exists():
+            self._reward_final_probe(model, step0 + s, opt, sched, injected)
         path = self.save(injected, step0 + s, final=True)
         self.stage_tag = ""
         log.info("Reward stage done: %s (the first stage's LoRA is %s.safetensors)", path.name, cfg.job_name)
         return path
+
+    def _reward_final_probe(self, model, step: int, opt, sched, injected) -> None:
+        """Probe the reward stage's final LoRA when its last step wasn't probed (probe_every not dividing reward_steps,
+        or larger than it), so the stage's result has its likeness score, on the run's scale, next to the first
+        stage's."""
+        if self.controller is None:
+            log.info("Reward stage: no likeness probes (probe_every 0 or no references), so no closing likeness check")
+            return
+        log.info("Reward stage: probing the final LoRA's likeness (step %d)", step)
+        self.status.update(stage="reward fine-tuning: closing likeness probe")
+        self.run_probe(model, step, opt, sched, injected)
 
     @staticmethod
     @torch.no_grad()

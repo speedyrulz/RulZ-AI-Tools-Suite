@@ -6324,8 +6324,9 @@ def build_page(local: bool = True):
                                  "better ones more likely and the worse ones less, held near the first stage's LoRA "
                                  "by a KL penalty. It optimizes what you are after directly, but it is slow and can "
                                  "learn what the scorer likes more than the person (keep the probes on and judge by "
-                                 "eye). Files: <job>_reward_<step> and <job>_reward.safetensors; <job>.safetensors "
-                                 "stays the first stage's. Steps 0 with a LoRA in Resume from runs this stage alone.")
+                                 "eye). The probes run every Probe every reward steps and once more at the end, so the "
+                                 "final LoRA's likeness is in the chart. Files: <job>_reward_<step> and "
+                                 "<job>_reward.safetensors; <job>.safetensors stays the first stage's. Steps 0 with a LoRA in Resume from runs this stage alone.")
                             with fields():
                                 w["reward_steps"] = ui.number("Reward steps (0 = off)", value=d.reward_steps, min=0,
                                                               precision=0).classes("w-44")
@@ -7315,6 +7316,7 @@ that is thrown away. The LoRA file is the same either way. Not yet measured: rac
 the LoRA renders groups of 4 pictures of new prompts, the probes' scorers rate their likeness, and the better ones are
 made more likely and the worse ones less (Flow-GRPO), held near the first stage's LoRA. It aims straight at likeness
 but is slow and can learn what the scorer likes more than what you see: keep the probes on and look at the pictures.
+The probes also score the stage's final LoRA when it ends, so its likeness shows next to the first stage's.
 `<job>.safetensors` stays the first stage's; the stage saves `<job>_reward.safetensors`. Steps 0 with a LoRA in
 *Resume from* runs the stage alone.
 

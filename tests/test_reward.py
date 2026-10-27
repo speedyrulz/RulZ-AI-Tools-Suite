@@ -130,3 +130,22 @@ def test_config_checks():
                        (dict(reward_steps=50, face_refs=["x"], steps=0), "resume_from")):
         with pytest.raises(ValueError, match=match):
             TrainConfig(**bad).validate()
+
+
+def test_the_reward_stage_closes_with_a_likeness_probe():
+    from rulztrainer.trainer import Trainer
+
+    class Status:
+        def update(self, **kw):
+            pass
+
+    calls = []
+    t = Trainer.__new__(Trainer)
+    t.status = Status()
+    t.run_probe = lambda model, step, opt, sched, injected: calls.append(step) or False
+    t.controller = object()
+    Trainer._reward_final_probe(t, None, 1450, None, None, {})
+    assert calls == [1450]
+    t.controller = None  # probes off: nothing to probe with
+    Trainer._reward_final_probe(t, None, 1500, None, None, {})
+    assert calls == [1450]

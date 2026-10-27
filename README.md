@@ -989,6 +989,8 @@ most like the person. Each reward step:
   stage saves `<job>_reward_<step>` every `save_every` reward steps (pruned with `keep_checkpoints`) and
   `<job>_reward.safetensors`; its pictures are in `<job>/reward/`. Probes continue every `probe_every` reward steps:
   a probe that beats the best of both stages saves `<job>_reward_best.safetensors`, and early stop ends the stage.
+  When the stage's last step was not probed (`probe_every` not dividing `reward_steps`, or larger than it), a closing
+  probe scores the final LoRA, so the stage always ends with its likeness on the run's scale.
 - **Measured cost:** Krea 2 (nvfp4, 16 GB RTX 4060 Ti), 4 pictures of 512 px at 4 denoising steps with guidance 5.5,
   2 trained moves per update: about 77 s per reward step (with a turbo LoRA at guidance 1 the guidance passes go).
 - **Alone:** `steps: 0` with a LoRA in `resume_from` runs only this stage, for example on a race winner's file (it
