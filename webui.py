@@ -1162,6 +1162,7 @@ class Form:
             likeness_noise_band=float(v("likeness_noise_band")), likeness_track_best=bool(v("likeness_track_best")),
             likeness_track_best_face=bool(v("likeness_track_best_face")),
             likeness_track_best_body=bool(v("likeness_track_best_body")),
+            likeness_best_any_rise=bool(v("likeness_best_any_rise")),
             likeness_normalize=bool(v("likeness_normalize")),
             face_scale_span=float(v("face_scale_span")), face_scale_curve=float(v("face_scale_curve")),
             body_scale_span=float(v("body_scale_span")), body_scale_curve=float(v("body_scale_curve")),
@@ -6057,12 +6058,21 @@ def build_page(local: bool = True):
                                                                       "(<job>_best_face.safetensors)",
                                                                       value=d.likeness_track_best_face) \
                                 .tooltip("A separate file at the best smoothed face score, whatever the body scores "
-                                         "then (same noise-band rule). Independent of the overall best checkpoint.")
+                                         "then (same rule as the overall best). Independent of the overall best checkpoint.")
                             w["likeness_track_best_body"] = ui.switch("Keep best body checkpoint "
                                                                       "(<job>_best_body.safetensors)",
                                                                       value=d.likeness_track_best_body) \
                                 .tooltip("A separate file at the best smoothed body score, whatever the face scores "
-                                         "then (same noise-band rule). Independent of the overall best checkpoint.")
+                                         "then (same rule as the overall best). Independent of the overall best checkpoint.")
+                            w["likeness_best_any_rise"] = ui.switch("New best on any rise",
+                                                                    value=d.likeness_best_any_rise) \
+                                .tooltip("Off (default): a best checkpoint (overall, face, body) is replaced only when "
+                                         "the smoothed score beats it by more than the noise band, so the file "
+                                         "doesn't churn on noise; the log can then show a probe slightly above "
+                                         "'best' (e.g. 35.1 vs best 34.1 with a 1.0 band) without a new save. On: any "
+                                         "higher smoothed score replaces it, so the file is always the highest score "
+                                         "seen, even by a hair. Either way early stop and the resolution step-up "
+                                         "only count a rise beyond the noise band as progress.")
                             w["likeness_patience"] = ui.number("Early stop after N probes w/o improvement (0 = never)",
                                                                value=d.likeness_patience, precision=0) \
                                 .classes("w-96 max-w-full") \

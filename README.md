@@ -786,6 +786,10 @@ and only changes beyond `likeness_noise_band` count. The controller then, each i
   (`likeness_track_best_face`) and `<job>_best_body.safetensors` at the best smoothed body score
   (`likeness_track_best_body`), whatever the other part and the combined score do then; the same noise-band rule
   decides a new best. In a race each configuration keeps its own (`<job>_<name>_best_face.safetensors`);
+- by default replaces a best checkpoint only when the smoothed score beats it by more than the noise band, so a probe
+  can log a smoothed score a little above `best` (35.1 against best 34.1 with the 1.0 band) without a new save. With
+  *New best on any rise* (`likeness_best_any_rise`) any higher smoothed score replaces the overall, face and body
+  best files. Either way early stop and the resolution step-up count only a rise beyond the band as progress;
 - hill-climbs a bounded learning-rate multiplier (`likeness_lr_control`, `likeness_lr_min/max/step`): up while
   the smoothed score rises, down when it falls. It works with AdamW-style optimizers (through the scheduler)
   and with Automagic 3 (by scaling its adaptive lr tensors), which keeps doing its own per-step adaptation;

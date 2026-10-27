@@ -428,6 +428,9 @@ class TrainConfig:
     likeness_track_best: bool = True  # keep <job>_best.safetensors at the best smoothed score
     likeness_track_best_face: bool = False  # also keep <job>_best_face.safetensors at the best smoothed face score
     likeness_track_best_body: bool = False  # and <job>_best_body.safetensors at the best smoothed body score
+    # a best checkpoint (overall, face, body) is replaced by any higher smoothed score, not only one that beats it by
+    # the noise band; whether the run still improves (early stop, step-up) still needs the band
+    likeness_best_any_rise: bool = False
     likeness_patience: int = 0  # stop after N probes without improvement; 0 = never
     likeness_lr_control: bool = False  # bounded lr multiplier driven by the probe trend
     likeness_lr_min: float = 0.5

@@ -154,6 +154,7 @@ class LikenessController:
         self.best = None
         self.best_step = None
         self.since_improve = 0
+        self.progress = None  # the smoothed score of the latest probe that counted as progress (beat it by the band)
         self.lr_factor = 1.0
         self.face_bias = 0.0
         self.stopped = False
@@ -257,16 +258,20 @@ class LikenessController:
                     and self.face_drop_count >= 2):
                 self.id_loss_vetoed = True
                 actions["id_loss_veto"] = True
+        # a new best must beat the old one by the noise band, or with likeness_best_any_rise by any amount
+        best_margin = 0.0 if getattr(cfg, "likeness_best_any_rise", False) else band
         for kind, value in (("face", face_n), ("body", body_n)):
             prev = self.part_best.get(kind)
-            if value is not None and (prev is None or value > prev[0] + band):
+            if value is not None and (prev is None or value > prev[0] + best_margin):
                 self.part_best[kind] = (value, step)
                 if getattr(cfg, f"likeness_track_best_{kind}", False):
                     actions[f"save_best_{kind}"] = True
         if comb is not None:
-            if self.best is None or comb > self.best + band:
-                self.best, self.best_step, self.since_improve = comb, step, 0
+            if self.best is None or comb > self.best + best_margin:
+                self.best, self.best_step = comb, step
                 actions["save_best"] = cfg.likeness_track_best
+            if self.progress is None or comb > self.progress + band:  # progress always needs the band
+                self.progress, self.since_improve = comb, 0
             else:
                 self.since_improve += 1
                 if not self.step_up and cfg.likeness_patience > 0 and self.since_improve >= cfg.likeness_patience:

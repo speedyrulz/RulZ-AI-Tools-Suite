@@ -62,6 +62,20 @@ def test_best_face_and_body_checkpoints_are_kept_apart_from_the_overall_best():
     assert not act.get("save_best_face") and not act.get("save_best_body")
 
 
+def test_a_new_best_needs_the_noise_band_unless_any_rise_is_on():
+    # the run that asked: best 34.1 at step 900, step 1100 smoothed to 35.1 (body 34.1 / 35.1 alone: combined = body)
+    for any_rise, saved in ((False, False), (True, True)):
+        c = L.LikenessController(_cfg(likeness_best_any_rise=any_rise, likeness_track_best_body=True,
+                                      face_weight=0.0, body_weight=1.0, likeness_lr_control=False))
+        c.update(900, None, 34.1)
+        _, act = c.update(1100, None, 35.05)  # above the best, within the 1.0 band
+        assert bool(act.get("save_best")) is saved and bool(act.get("save_best_body")) is saved
+        assert c.best_step == (1100 if any_rise else 900)
+        assert c.since_improve == 1  # never progress for early stop: within the band either way
+        _, act = c.update(1200, None, 35.2)  # 1.1 above the last progress: progress, and a best in both modes
+        assert act.get("save_best") and c.since_improve == 0 and c.best_step == 1200
+
+
 def test_controller_handles_missing_modalities():
     c = L.LikenessController(_cfg())
     rec, _ = c.update(0, None, 70.0)
