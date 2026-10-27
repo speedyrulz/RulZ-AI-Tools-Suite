@@ -160,6 +160,12 @@ export function toolCatalogNote(available: McpToolInfo[], active: string[]): str
     'You can use tools from connected MCP servers, but only loaded tools can be called.',
     `Loaded tools: ${loaded}.`,
     `To use another tool, call ${META_LOAD} with its name (or ${META_SEARCH} to find one by keyword). Load only what the next step needs, and call ${META_UNLOAD} for tools you are finished with.`,
+    ...(available.some((t) => t.server === 'rulz' && t.name === 'list_directory')
+      ? [
+          "If you have a folder but a tool needs a file (such as a program's .exe), call rulz__list_directory or " +
+            'rulz__find_files to find the exact path first. Never guess file names.'
+        ]
+      : []),
     'Available tools by server:',
     catalog.trimEnd() + (omitted ? `\n(${omitted} more tools not listed; use ${META_SEARCH}.)` : '')
   ].join('\n')

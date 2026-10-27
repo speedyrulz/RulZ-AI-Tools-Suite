@@ -5,6 +5,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { getDefaultEnvironment, StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import type { McpConfigState, McpServerConfig, McpServerStatus, McpToolInfo, ToolResult, WireToolCall } from '@shared/types'
+import { FILE_TOOL_DEFS, FILE_TOOLS_SERVER, runFileTool } from '../files/fileTools'
 import { contentToText, EMPTY_CONFIG, parseMcpConfig, qualifyToolName, readMcpConfigFile } from './config'
 
 const MAX_LOG = 200
@@ -37,6 +38,22 @@ export class McpManager {
   private configText = EMPTY_CONFIG
   private configError: string | null = null
   private readFailed = false
+  /** Built-in read-only file tools, always present and handled in-process. */
+  private readonly builtin: Connection = {
+    status: {
+      name: FILE_TOOLS_SERVER,
+      transport: 'builtin',
+      state: 'connected',
+      tools: FILE_TOOL_DEFS.map((t) => ({
+        qualifiedName: qualifyToolName(FILE_TOOLS_SERVER, t.name),
+        server: FILE_TOOLS_SERVER,
+        name: t.name,
+        description: t.description,
+        inputSchema: t.inputSchema
+      })),
+      log: []
+    }
+  }
 
   constructor(
     private readonly configPath: string,
@@ -44,8 +61,12 @@ export class McpManager {
     private readonly onConfig: (config: McpConfigState) => void = () => undefined
   ) {}
 
+  private allConnections(): Connection[] {
+    return [this.builtin, ...this.connections.values()]
+  }
+
   status(): McpServerStatus[] {
-    return [...this.connections.values()].map((c) => ({ ...c.status, log: c.status.log.slice() }))
+    return this.allConnections().map((c) => ({ ...c.status, log: c.status.log.slice() }))
   }
 
   config(): McpConfigState {
@@ -115,6 +136,12 @@ export class McpManager {
     }
     const conn: Connection = { status }
     this.connections.set(name, conn)
+    if (name === FILE_TOOLS_SERVER) {
+      status.state = 'error'
+      status.error = `The name "${FILE_TOOLS_SERVER}" is used by the built-in file tools. Rename this server in mcp.json.`
+      this.emit()
+      return
+    }
     this.emit()
     if (cfg.disabled) return
 
@@ -191,7 +218,7 @@ export class McpManager {
   }
 
   private findTool(qualifiedName: string): { conn: Connection; tool: McpToolInfo } | undefined {
-    for (const conn of this.connections.values()) {
+    for (const conn of this.allConnections()) {
       const tool = conn.status.tools.find((t) => t.qualifiedName === qualifiedName)
       if (tool) return { conn, tool }
     }
@@ -200,7 +227,7 @@ export class McpManager {
 
   /** Connected tools the user has not switched off. */
   availableTools(disabled: Set<string>): McpToolInfo[] {
-    return [...this.connections.values()]
+    return this.allConnections()
       .filter((c) => c.status.state === 'connected')
       .flatMap((c) => c.status.tools)
       .filter((t) => !disabled.has(t.qualifiedName))
@@ -225,6 +252,19 @@ export class McpManager {
 
   async callTool(call: Pick<WireToolCall['function'], 'name' | 'arguments'>): Promise<ToolResult> {
     const found = this.findTool(call.name)
+    if (found?.conn === this.builtin) {
+      let args: Record<string, unknown> = {}
+      try {
+        args = call.arguments.trim() ? JSON.parse(call.arguments) : {}
+      } catch {
+        return { text: `The tool arguments were not valid JSON: ${call.arguments}`, isError: true }
+      }
+      const res = await runFileTool(found.tool.name, args)
+      return res.text.length > MAX_RESULT_CHARS
+        ? { ...res, text: `${res.text.slice(0, MAX_RESULT_CHARS)}
+…[truncated ${res.text.length - MAX_RESULT_CHARS} characters]` }
+        : res
+    }
     if (!found?.conn.client) return { text: `Tool "${call.name}" is not available.`, isError: true }
     let args: Record<string, unknown> = {}
     if (call.arguments.trim()) {

@@ -47,6 +47,7 @@ export function McpPage() {
 
   if (!settings || !config || text === null) return null
   const path = config.path
+  const external = servers.filter((s) => s.transport !== 'builtin')
   const dirty = text !== saved
 
   const reconnectAll = async (): Promise<void> => {
@@ -104,7 +105,7 @@ export function McpPage() {
           <div className="min-w-0 flex-1">
             <h1 className="text-base font-semibold">MCP servers</h1>
             <div className="text-xs text-muted">
-              {servers.length} {servers.length === 1 ? 'server' : 'servers'} · {toolCount} {toolCount === 1 ? 'tool' : 'tools'} available to chats ·{' '}
+              {external.length} {external.length === 1 ? 'server' : 'servers'} + built-in file tools · {toolCount} {toolCount === 1 ? 'tool' : 'tools'} available to chats ·{' '}
               <span className={totalTokens > TOOL_TOKEN_WARNING ? 'text-warn' : undefined}>
                 ≈{formatCompact(totalTokens)} tokens of tool descriptions per message
               </span>
@@ -212,7 +213,7 @@ export function McpPage() {
               </div>
             </div>
           )}
-          {servers.length === 0 && !config.error && (
+          {external.length === 0 && !config.error && (
             <div className="rounded-xl border border-dashed border-border p-8 text-center text-sm text-muted">
               No MCP servers yet. Add one to <span className="font-mono">mcp.json</span> on the right, then save.
             </div>
@@ -297,7 +298,7 @@ function ServerCard({ server }: { server: McpServerStatus }) {
     <div className="rounded-xl border border-border bg-panel">
       <div className="flex items-center gap-2 px-4 py-3">
         <span className="font-medium">{server.name}</span>
-        <Badge>{server.transport}</Badge>
+        <Badge>{server.transport === 'builtin' ? 'built-in' : server.transport}</Badge>
         <Badge tone={STATE_TONE[server.state]}>{server.state}</Badge>
         <span className="text-xs text-faint">{server.state === 'connected' ? `${server.tools.length} tools` : ''}</span>
         <div className="flex-1" />
@@ -306,10 +307,19 @@ function ServerCard({ server }: { server: McpServerStatus }) {
             {showLog ? 'Hide log' : 'Log'}
           </Button>
         )}
-        <IconButton size="sm" label="Reconnect" onClick={() => void invoke('mcp:restart', server.name)}>
-          <RefreshCw size={13} />
-        </IconButton>
+        {server.transport !== 'builtin' && (
+          <IconButton size="sm" label="Reconnect" onClick={() => void invoke('mcp:restart', server.name)}>
+            <RefreshCw size={13} />
+          </IconButton>
+        )}
       </div>
+      {server.transport === 'builtin' && (
+        <div className="mx-4 mb-3 text-xs text-muted">
+          Read-only tools for listing folders and finding files on this computer, so the model can find exact paths for
+          other tools. They show names and sizes only: they can't read or change files. Calls ask for approval like any
+          other tool.
+        </div>
+      )}
       {server.error && <div className="mx-4 mb-3 rounded-md border border-danger/40 bg-danger/10 px-3 py-2 text-xs whitespace-pre-wrap text-danger">{server.error}</div>}
       {showLog && (
         <pre className="mx-4 mb-3 max-h-48 overflow-auto rounded-md bg-code p-2 font-mono text-[11px] whitespace-pre-wrap text-muted">{server.log.join('\n')}</pre>

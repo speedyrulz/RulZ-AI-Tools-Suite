@@ -105,13 +105,13 @@ describe('McpManager config loading', () => {
     writeFileSync(file, JSON.stringify({ mcpServers: { a: { command: 'x', disabled: true } } }))
     await mgr.restart(null)
     expect(mgr.config().error).toBeNull()
-    expect(mgr.status().map((s) => [s.name, s.state])).toEqual([['a', 'disabled']])
+    expect(mgr.status().map((s) => [s.name, s.state])).toEqual([['rulz', 'connected'], ['a', 'disabled']])
 
     // A bad edit later keeps the servers that are already set up.
     writeFileSync(file, 'nope')
     await mgr.restart(null)
     expect(mgr.config().error).toMatch(/not valid JSON/)
-    expect(mgr.status()).toHaveLength(1)
+    expect(mgr.status()).toHaveLength(2)
     await mgr.dispose()
     rmSync(dir, { recursive: true, force: true })
   })

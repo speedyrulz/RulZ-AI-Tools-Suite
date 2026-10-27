@@ -13,6 +13,7 @@ import { estimateMemory } from './models/estimate'
 import { ModelLibrary } from './models/library'
 import { ApiServer } from './server/apiServer'
 import { SettingsStore } from './settings/store'
+import { FILE_TOOLS_SERVER } from './files/fileTools'
 
 const MiB = 1024 * 1024
 const isDev = !app.isPackaged && !!process.env.ELECTRON_RENDERER_URL
@@ -136,7 +137,9 @@ async function main(): Promise<void> {
     if (req.mode === 'all') return { defs: mcp.toolDefinitions(disabled) }
     // On demand: the three loader tools, the loaded tools' full descriptions, and a name catalog.
     const available = mcp.availableTools(disabled)
-    const active = req.active.filter((n) => available.some((t) => t.qualifiedName === n))
+    // The built-in file tools are small and often needed first, so they stay loaded.
+    const pinned = available.filter((t) => t.server === FILE_TOOLS_SERVER).map((t) => t.qualifiedName)
+    const active = [...new Set([...pinned, ...req.active])].filter((n) => available.some((t) => t.qualifiedName === n))
     return {
       defs: [...META_TOOL_DEFS, ...mcp.toolDefinitions(disabled, new Set(active))],
       note: available.length ? toolCatalogNote(available, active) : undefined

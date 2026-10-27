@@ -42,6 +42,8 @@ Discover/downloads, RAG and a CLI are planned.
     `rulz_search_tools` / `rulz_load_tools` / `rulz_unload_tools`, and only loaded tools' full descriptions are
     sent, within a token budget (least recently used are unloaded first). "Auto" switches to this once the
     enabled tools exceed the budget.
+  - **Built-in file tools**: read-only `list_directory` and `find_files`, so the model can find exact paths (such as a
+    program's `.exe`) before handing them to other tools.
   - **Tool-result compaction**: once you send a new message, tool results from earlier turns are sent to the
     model as their beginning and end only (the chat still shows them in full); the latest results of the turn in
     progress stay complete.

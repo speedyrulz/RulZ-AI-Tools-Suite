@@ -176,7 +176,7 @@ export interface McpToolInfo {
 
 export interface McpServerStatus {
   name: string
-  transport: 'stdio' | 'http'
+  transport: 'stdio' | 'http' | 'builtin'
   state: 'disabled' | 'connecting' | 'connected' | 'error'
   error?: string
   tools: McpToolInfo[]
