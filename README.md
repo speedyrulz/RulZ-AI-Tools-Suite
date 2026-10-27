@@ -860,6 +860,15 @@ Samples tab show only the normalized scores (the log and `likeness.jsonl` keep t
 In a race, the Monitor and the Samples tab put the same generation (step, prompt or probe kind, seed) of every
 configuration side by side in one row. Earlier runs' `likeness.jsonl` keep their raw combined scores.
 
+**Export spreadsheet** (Monitor, *Likeness probes & controller*, during or after a run) downloads `<job>_likeness.xlsx`,
+also written into the job folder: *Updated scores* has every probe's smoothed and per-probe face, body and combined
+score and the best smoothed combined score with its step; *Raw probe scores* the raw similarities; *Scale* the run's
+floors (the step-0 probe), its references' own levels, the span and curve of each scale, the weights and the smoothing.
+The scores are Excel formulas of the raw scores and the Scale sheet, so editing a span, a curve or a weight rescores
+the run (a run from before a scale change is shown on the span and curve its config has now). In a race each
+configuration, and the winner after the race, gets its own pair of sheets and its own Scale column. Without the WebUI:
+`python -c "from rulztrainer import likeness_export; likeness_export.export('output/<job>')"`.
+
 ## Likeness-filtered self-training (`selftrain`)
 
 Partway through the steps the LoRA renders the subject over varied prompts; the pictures that pass a quality filter

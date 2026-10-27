@@ -1721,6 +1721,25 @@ def _serve_lora(path: str):
     return FileResponse(p, filename=p.name, media_type="application/octet-stream")
 
 
+@app.get("/rz-likeness-xlsx")
+def _serve_likeness_xlsx(job: str):
+    """The likeness spreadsheet of a job folder (one with a status.json), built now: the run's probes so far."""
+    from fastapi import HTTPException
+    from fastapi.responses import FileResponse
+
+    from rulztrainer import likeness_export
+
+    d = Path(job)
+    if not (d / "status.json").is_file() or not (d / "likeness.jsonl").is_file():
+        raise HTTPException(status_code=404, detail="No likeness probes in this job yet")
+    try:
+        out = likeness_export.export(d)
+    except (OSError, ValueError) as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return FileResponse(out, filename=out.name,
+                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
 def lora_url(path) -> str:
     """The download URL of a LoRA a run saved (served by /rz-lora)."""
     from urllib.parse import quote
@@ -6152,7 +6171,22 @@ def build_page(local: bool = True):
                 race_exp.visible = False
                 with section("Likeness probes & controller", "Smoothed probe scores and controller state",
                              "insights") as probe_exp:
-                    probe_label = hint("")
+                    with ui.row().classes("w-full items-center gap-2"):
+                        probe_label = hint("").classes("flex-1")
+
+                        def export_likeness():
+                            from urllib.parse import quote
+
+                            if _job_dir is None:
+                                ui.notify("No run to export yet.", type="warning")
+                                return
+                            ui.download(f"/rz-likeness-xlsx?job={quote(str(Path(_job_dir).resolve()))}",
+                                        f"{Path(_job_dir).name}_likeness.xlsx")
+
+                        ui.button("Export spreadsheet", icon="table_view", on_click=export_likeness)                             .props("outline dense no-caps size=sm")                             .tooltip("Every probe's face, body and combined score so far, smoothed and per probe, as "
+                                     "an Excel file: the scores are formulas of the raw ones and the run's scale "
+                                     "(floors, references' level, span, curve, weights) on its own sheet, so you can "
+                                     "rescore. In a race each configuration gets its own sheets.")
                     # the normalized scores (0 = a stranger, 100 = the references): smoothed lines, per-probe dots
                     probe_chart = ui.echart(chart_options(
                         _axis("step", min="dataMin"), _axis("likeness % (normalized)", min=0, max=100),

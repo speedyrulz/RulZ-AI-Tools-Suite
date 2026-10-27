@@ -202,8 +202,9 @@ class LikenessController:
         return normalize(value, *self.scale(kind), self.curve[kind])
 
     def scale_record(self) -> dict:
-        """The scale as the probe records keep it ({"face": [floor, ceiling], "body": [...], "curve": {...}})."""
-        return {**{k: list(self.scale(k)) for k in ("face", "body")}, "curve": dict(self.curve)}
+        """The scale as the probe records keep it ({"face": [floor, ceiling], "body": [...], "curve": {...},
+        "span": {...}}): the ceiling is the stretched one, the span what stretched it."""
+        return {**{k: list(self.scale(k)) for k in ("face", "body")}, "curve": dict(self.curve), "span": dict(self.span)}
 
     def _set_floors(self, face, body) -> None:
         """The step-0 probe (the base model, no LoRA) is what a stranger scores: the floor of each scale, so step 0

@@ -1,7 +1,9 @@
+import json
 import random
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -104,7 +106,8 @@ def test_normalized_scores_put_face_and_body_on_one_scale():
     rec, _ = c.update(0, 15.0, 82.0)  # the base model: the floors
     assert c.scale("face") == (15.0, 70.0) and c.scale("body") == (82.0, 94.0)
     assert rec.face_norm == 0.0 and rec.body_norm == 0.0 and rec.combined_ema == 0.0
-    assert rec.face == 15.0 and rec.body == 82.0 and rec.scale == {"face": [15.0, 70.0], "body": [82.0, 94.0], "curve": {"face": 1.0, "body": 1.0}}
+    assert rec.face == 15.0 and rec.body == 82.0 and rec.scale == {"face": [15.0, 70.0], "body": [82.0, 94.0], "curve": {"face": 1.0, "body": 1.0},
+                                                                  "span": {"face": 1.0, "body": 1.0}}
     rec, act = c.update(10, 42.5, 88.0)  # both halfway to the references
     assert abs(rec.face_norm - 50.0) < 1e-9 and abs(rec.body_norm - 50.0) < 1e-9 and abs(rec.combined_ema - 50.0) < 1e-9
     assert abs(c.face_bias) < 1e-9  # no gap on the normalized scale (raw: 88 - 42.5 = 45.5 points)
@@ -242,3 +245,52 @@ def test_the_body_scale_is_stretched_like_the_face_and_never_too_narrow():
                                   body_ceiling=88.0)
     linear.floor["body"] = 30.0
     assert linear.norm("body", 88.0) == 100.0  # 1 and 1: the old body scale
+
+
+def test_likeness_spreadsheet_export(tmp_path):
+    """The Monitor's Export spreadsheet: one row per probe (the step-0 probe logged twice kept once), the run's floors and
+    references' own levels on the Scale sheet (an old record's stretch taken back out), live formulas, and a race's
+    configurations each on their own sheets."""
+    from openpyxl import load_workbook
+
+    from rulztrainer import likeness_export as X
+
+    old_scale = {"face": [11.0, 11.0 + 60.0 * 1.35], "body": [26.0, 88.0], "curve": {"face": 1.5, "body": 1.0}}
+
+    def rec(step, face, body, prefix="", scale=old_scale):
+        return {"step": step, "face": face, "body": body, "scale": scale,
+                "images": [f"probes/{prefix}step{step:06d}_face_0.png"]}
+
+    job = tmp_path / "run"
+    job.mkdir()
+    (job / "likeness.jsonl").write_text("\n".join(json.dumps(r) for r in (
+        rec(0, 11.0, 26.0), rec(0, 11.0, 26.0), rec(100, 40.0, 60.0), rec(200, 70.0, None))))
+    out = X.export(job)
+    wb = load_workbook(out)
+    assert wb.sheetnames == ["Updated scores", "Raw probe scores", "Scale"]
+    sc, ws, raw = wb["Scale"], wb["Updated scores"], wb["Raw probe scores"]
+    assert abs(sc["B4"].value - 71.0) < 1e-9 and sc["B8"].value == 88.0  # the references' own levels, unstretched
+    assert sc["B5"].value == 1.35 and sc["B9"].value == L.BODY_SPAN_DEFAULT  # rescored on the current body scale
+    assert [raw.cell(r, 1).value for r in range(2, 5)] == [0, 100, 200] and raw["C4"].value is None
+    assert ws["B6"].value.startswith('=IF(I6="","",MIN(100,100*MAX(0,(I6-Scale!$B$3)')
+    assert ws["D9"].value == "=MAX(D5:D7)" and "INDEX(A5:A7" in ws["D10"].value
+    assert wb.calculation.fullCalcOnLoad
+
+    race = tmp_path / "race"
+    race.mkdir()
+    (race / "race.json").write_text(json.dumps({"names": ["lora16", "lokr8"]}))
+    new_scale = {"face": [10.0, 91.0], "body": [30.0, 108.0], "curve": {"face": 1.5, "body": 1.5},
+                 "span": {"face": 1.35, "body": 1.3}}
+    (race / "likeness.jsonl").write_text("\n".join(json.dumps(r) for r in (
+        rec(0, 10.0, 30.0, "lora16_", new_scale), rec(0, 12.0, 31.0, "lokr8_", new_scale),
+        rec(100, 50.0, 70.0, "lokr8_", new_scale), rec(300, 60.0, 80.0, "", new_scale))))
+    wb = X.build_workbook(race)
+    assert wb.sheetnames == ["Updated scores lora16", "Updated scores lokr8", "Updated scores winner",
+                             "Raw probe scores lora16", "Raw probe scores lokr8", "Raw probe scores winner", "Scale"]
+    sc = wb["Scale"]
+    assert [sc.cell(2, c).value for c in (2, 3, 4)] == ["lora16", "lokr8", "winner"]
+    assert abs(sc["C8"].value - (30.0 + 78.0 / 1.3)) < 1e-9  # the logged span taken out
+    assert "Scale!$C$3" in wb["Updated scores lokr8"]["B5"].value
+    assert wb["Raw probe scores lokr8"].max_row == 3
+    with pytest.raises(FileNotFoundError):
+        X.build_workbook(tmp_path / "empty")
