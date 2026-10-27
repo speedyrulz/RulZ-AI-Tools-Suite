@@ -85,6 +85,17 @@ is kept per browser (its local storage).
    job's settings into the form). *Stop (save)* and *Kill* work on a reconnected job too.
 4. Results: `output/<job>/<job>_<step>.safetensors` (checkpoints) and `output/<job>/<job>.safetensors` (final).
 
+**Training queue.** *Add to queue* (next to *Start training*, and on the wizard's last page) saves the current
+settings as a run that starts by itself when the one running now, and every run queued before it, is done: finished,
+stopped or failed. With nothing running it starts right away. The *Queue* section on the Monitor lists the waiting
+runs (move them up or down, remove them), pauses or resumes the queue, clears it and shows the last runs it started
+(or why one could not start: that run stays first and the queue pauses). Each queued run is a full copy of the
+settings at the time you added it, so you can change the form for the next one straight away. A job name that is
+running or already queued is refused, since the later run would write over the earlier one's folder. *Kill* pauses
+the queue; *Stop* goes on to the next run. The queue is kept in `output/_queue.json`, but the WebUI is what starts
+the next run, so keep it running; a WebUI restarted with runs waiting and nothing running pauses the queue until you
+*Resume* it.
+
 *Save* / *Load* (in the *Training job* card at the top of the Train tab) store the whole form as YAML (Browse opens
 in `configs/`). Loading a config saved by
 an older version fills every option added since with its default, appends those options to the end of the file

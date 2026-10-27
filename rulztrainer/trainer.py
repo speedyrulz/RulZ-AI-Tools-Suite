@@ -1212,7 +1212,7 @@ class Trainer(RaceParallelMixin):
                          summary["counts"], summary["median"] or 0.0, summary["active"], summary["total"])
                 self.status.update(loss_watch=summary)
                 self._refresh_batcher_weights()
-            if step % cfg.save_every == 0 and step < cfg.steps:
+            if cfg.save_every > 0 and step % cfg.save_every == 0 and step < cfg.steps:  # 0: the final save only
                 if self.ft is not None and not self._finetune_cycle_done(step):
                     self.ft_pending_save = True  # saved at the end of the cycle: every window trained alike
                 else:
@@ -1220,7 +1220,8 @@ class Trainer(RaceParallelMixin):
             elif self.ft is not None and self.ft_pending_save and self._finetune_cycle_done(step) and step < cfg.steps:
                 self.save(injected, step)
             state_every = cfg.save_state_every or cfg.save_every
-            if cfg.save_state and step % state_every == 0 and step < cfg.steps and not self._race_running():
+            if (cfg.save_state and state_every > 0 and step % state_every == 0 and step < cfg.steps
+                    and not self._race_running()):
                 self.save_state(step, injected, optimizer, scheduler, gen, rng)  # (a race keeps no states)
             if cfg.sample_prompts and cfg.sample_every > 0 and step % cfg.sample_every == 0 and step < cfg.steps:
                 self.sample_images(model, step)

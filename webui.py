@@ -16,6 +16,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from rulztrainer.config import (ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH
                                 MODEL_PRESETS,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
 from rulztrainer import bodysim, facesim, history, lookfilter
+from rulztrainer.train_queue import TrainQueue
 from rulztrainer.dataset import skipped as dataset_skipped
 from rulztrainer.losswatch import read_verdicts
 
@@ -123,6 +125,8 @@ _proc: subprocess.Popen | None = None  # started by this WebUI process
 _adopted = None  # psutil.Process of a job started by an earlier WebUI process (reattached from JOB_FILE)
 _job_dir: Path | None = None
 JOB_FILE = ROOT / ".webui_job.json"
+QUEUE = TrainQueue()  # runs waiting for the current one (output/_queue.json); queue_loop() starts them in turn
+_start_lock = threading.RLock()  # the queue's thread and a page may start a run at the same moment
 
 
 # ---------------------------------------------------------------- backend helpers
@@ -415,6 +419,11 @@ async def pick_path(kind: str, initial: str = "", filetypes=None, native: bool =
 
 
 def start_training(cfg: TrainConfig) -> str:
+    with _start_lock:
+        return _start_training(cfg)
+
+
+def _start_training(cfg: TrainConfig) -> str:
     global _proc, _adopted, _job_dir
     reattach_job()
     if _running():
@@ -473,7 +482,66 @@ def kill_training() -> str:
         _proc.kill()
     else:
         _adopted.kill()
+    if QUEUE.snapshot()["waiting"]:  # a kill usually means "stop everything": the queued runs wait for Resume
+        QUEUE.set_paused(True)
+        return "Process killed (no final save). The queue is paused: Resume it on the Monitor to go on."
     return "Process killed (no final save)."
+
+
+def validated_config(cfg: TrainConfig) -> TrainConfig:
+    """The checks a run gets before it starts or is queued (a race's step budget, settings and probes); raises
+    ValueError."""
+    if cfg.race:
+        from rulztrainer import race
+
+        race.validate(cfg)
+    return cfg
+
+
+def _start_queued(config: dict) -> tuple[bool, str]:
+    try:
+        msg = start_training(validated_config(TrainConfig.from_dict(config)))
+    except (TypeError, ValueError) as e:
+        return False, f"A setting is invalid: {e}"
+    return msg.startswith("Started"), msg
+
+
+def queue_run(cfg: TrainConfig) -> tuple[bool, str]:
+    """Add a run to the queue (it starts once nothing runs). Refuses a job name the running job or a waiting run
+    already uses: the later run would write over the earlier one's folder."""
+    reattach_job()
+    taken = {e["job"] for e in QUEUE.snapshot()["waiting"]}
+    if _running() and _job_dir is not None:
+        taken.add(_job_dir.name)
+    if cfg.job_name in taken:
+        return False, (f"Job name '{cfg.job_name}' is already running or queued; give this run another job name so "
+                       "it doesn't overwrite that one's folder.")
+    QUEUE.add(cfg.to_dict(), label=cfg.arch_name())
+    n = len(QUEUE.snapshot()["waiting"])
+    if not _running():
+        return True, f"Queued '{cfg.job_name}': nothing is running, so it starts in a moment."
+    return True, f"Queued '{cfg.job_name}' (#{n}): it starts when the runs before it are done."
+
+
+def queue_tick() -> None:
+    """One step of the queue: start the next waiting run when the job has ended."""
+    reattach_job()
+    done = QUEUE.advance(_running(), _start_queued)
+    if done is not None:
+        print(f"[queue] {done.get('job')}: {done.get('message')}", flush=True)
+
+
+def queue_loop() -> None:
+    reattach_job()
+    if QUEUE.on_startup(_running()):
+        print("[queue] runs are waiting and nothing runs: the queue is paused until you Resume it (Monitor)",
+              flush=True)
+    while True:
+        try:
+            queue_tick()
+        except Exception as e:  # noqa: BLE001  (a bad tick must not end the queue)
+            print(f"[queue] {e}", flush=True)
+        time.sleep(3.0)
 
 
 def read_status() -> dict | None:
@@ -3261,10 +3329,11 @@ class Wizard:
              ("review", "Review & start", "rocket_launch"))
     RACE_STEPS = ("racers", "rules")  # shown only when the run is a race
 
-    def __init__(self, f: Form, gpus: list[str], start, goto):
+    def __init__(self, f: Form, gpus: list[str], start, goto, enqueue=None):
         self.f, self.w = f, f.w
         self.gpus = gpus  # torch device names for the device select
         self.start = start  # start_job(): starts training from the form, True when it started
+        self.enqueue = enqueue  # queue_job(): adds the form's run to the training queue
         self.goto = goto  # goto(tab name)
         self.goal: str | None = "character" if self.w["preset_toggle"].value else None
         self.focus = "face_focus"  # Character / person: a key of CHARACTER_FOCUS; follows the form (character_focus)
@@ -4277,6 +4346,9 @@ class Wizard:
             ui.space()
             ui.button("Adjust in all settings", icon="tune", on_click=lambda: self.goto("Train")).props("outline") \
                 .tooltip("The Train tab has every setting, already filled in from these pages")
+            if self.enqueue is not None:
+                ui.button("Add to queue", icon="playlist_add", on_click=self.enqueue).props("outline size=lg") \
+                    .tooltip("Start this run after the current one (and any queued before it) is done")
             self.start_btn = ui.button("Start the race" if self.racing() else "Start training", icon="play_arrow",
                                        on_click=self.start).props("unelevated size=lg")
         with ui.stepper_navigation():
@@ -4796,16 +4868,25 @@ def build_page(local: bool = True):
     def goto(name: str):
         tabs.value = name
 
-    def start_job() -> bool:
+    def form_config() -> TrainConfig | None:
         try:
-            cfg = f.to_config()
-            if cfg.race:  # the race's own checks before a model loads (step budget, settings, probes)
-                from rulztrainer import race
-
-                race.validate(cfg)
+            return validated_config(f.to_config())  # a race's own checks before a model loads
         except (TypeError, ValueError) as e:
             status_msg.text = f"A setting is invalid: {e}"
             ui.notify(status_msg.text, type="negative")
+            return None
+
+    def queue_job() -> bool:
+        cfg = form_config()
+        if cfg is None:
+            return False
+        ok, status_msg.text = queue_run(cfg)
+        ui.notify(status_msg.text, type="positive" if ok else "warning")
+        return ok
+
+    def start_job() -> bool:
+        cfg = form_config()
+        if cfg is None:
             return False
         status_msg.text = start_training(cfg)
         started = status_msg.text.startswith("Started")
@@ -6324,7 +6405,7 @@ def build_page(local: bool = True):
 
         # ------------------------------------------------------------ Wizard (bound to the Train tab's widgets)
         with ui.tab_panel(tab_wizard):
-            Wizard(f, gpus, start_job, goto).build()
+            Wizard(f, gpus, start_job, goto, queue_job).build()
 
         # ------------------------------------------------------------ Dataset
         with ui.tab_panel(tab_dataset):
@@ -6344,6 +6425,24 @@ def build_page(local: bool = True):
                 error_box.visible = False
                 gpu_box = ui.row().classes("w-full gap-3")
                 gpu_widgets: list[dict] = []
+                with section("Queue", "Runs that start one after another when the current one is done",
+                             "queue") as queue_exp:
+                    with ui.row().classes("w-full items-center gap-2"):
+                        queue_state = ui.label("").classes("text-sm font-medium")
+                        ui.space()
+                        queue_pause = ui.button("", on_click=lambda: (QUEUE.set_paused(
+                            not QUEUE.snapshot()["paused"]), queue_draw(force=True)), color=None) \
+                            .props("outline dense no-caps")
+                        ui.button("Clear queue", icon="clear_all", on_click=lambda: (QUEUE.clear(),
+                                                                                     queue_draw(force=True)),
+                                  color=None).props("flat dense no-caps") \
+                            .tooltip("Remove every waiting run (the running one goes on)")
+                    hint("Add runs with Add to queue (bottom bar, or the wizard's last page): each starts when the "
+                         "one before it is done, finished, stopped or failed. Kill pauses the queue. The queue lives "
+                         "in output/_queue.json, but it is the WebUI that starts the next run, so keep the WebUI "
+                         "running; a WebUI restarted with runs waiting and nothing running pauses the queue until you "
+                         "Resume it.")
+                    queue_list = ui.column().classes("w-full gap-1")
                 with card():
                     with ui.row().classes("w-full items-center gap-4"):
                         ui.label("Loss").classes("rz-title")
@@ -6486,6 +6585,47 @@ def build_page(local: bool = True):
                             .props("flat no-caps").classes("rz-file-btn") \
                             .tooltip("Save this LoRA to this computer (useful when the WebUI runs remotely)")
 
+            queue_shown = {"sig": None}
+
+            def queue_draw(force: bool = False):
+                q = QUEUE.snapshot()
+                sig = json.dumps([[e["id"] for e in q["waiting"]], q["paused"], [r.get("started") or r.get("error")
+                                                                                  for r in q["recent"][:5]]])
+                if sig == queue_shown["sig"] and not force:
+                    return
+                queue_shown["sig"] = sig
+                n = len(q["waiting"])
+                queue_state.text = (f"{n} run{'s' if n != 1 else ''} waiting" if n else "Nothing queued") + \
+                    (" · paused" if q["paused"] else "")
+                queue_note.text = (f"Queue: {n} waiting" + (", paused" if q["paused"] else "")) if n else ""
+                queue_pause.text = "Resume queue" if q["paused"] else "Pause queue"
+                queue_pause.props(f"icon={'play_arrow' if q['paused'] else 'pause'}")
+                queue_list.clear()
+                with queue_list:
+                    for i, e in enumerate(q["waiting"]):
+                        c = e.get("config") or {}
+                        what = ", ".join(x for x in (
+                            e.get("label") or "", f"{c.get('steps', 0):,} steps",
+                            "race" if c.get("race") else "") if x)
+                        with ui.row().classes("w-full items-center gap-2 no-wrap rz-queue-row"):
+                            ui.label(f"#{i + 1}").classes("rz-hint w-8")
+                            ui.label(e.get("job") or "(no job name)").classes("text-sm font-medium")
+                            hint(what)
+                            ui.space()
+                            ui.button(icon="arrow_upward", on_click=lambda _, k=e["id"]: (QUEUE.move(k, -1),
+                                                                                          queue_draw())) \
+                                .props("flat dense round size=sm").tooltip("Earlier")
+                            ui.button(icon="arrow_downward", on_click=lambda _, k=e["id"]: (QUEUE.move(k, 1),
+                                                                                            queue_draw())) \
+                                .props("flat dense round size=sm").tooltip("Later")
+                            ui.button(icon="close", on_click=lambda _, k=e["id"]: (QUEUE.remove(k), queue_draw())) \
+                                .props("flat dense round size=sm color=negative").tooltip("Remove from the queue")
+                    for r in q["recent"][:5]:
+                        when = time.strftime("%b %d %H:%M", time.localtime(r.get("started") or r.get("added") or 0))
+                        text = (f"started {when}" if r.get("started") else f"could not start: {r.get('error')}")
+                        hint(f"{r.get('job')}: {text}", warn=bool(r.get("error")))
+
+            ui.timer(2.0, queue_draw)
             log_state = {"job": None, "n": 0, "console_shown": False}
             show_full = image_viewer()
 
@@ -6803,6 +6943,10 @@ def build_page(local: bool = True):
                         .props("rounded")
                 task_row.visible = False
             with ui.row().classes("items-center gap-2 no-wrap"):
+                queue_note = ui.label("").classes("rz-hint text-sm cursor-pointer")
+                queue_note.on("click", lambda: goto("Monitor"))
+                ui.button("Add to queue", icon="playlist_add", on_click=queue_job, color=None).props("outline") \
+                    .tooltip("Start this run after the current one (and any queued before it) is done")
                 ui.button("Start training", icon="play_arrow", on_click=start_job).props("unelevated")
                 ui.button("Stop", icon="stop", on_click=lambda: setattr(status_msg, "text", stop_training()),
                           color=None) \
@@ -6944,6 +7088,9 @@ settings as the Train tab, so you can switch between the two at any time.
    ComfyUI-style files: diffusion model, Qwen3.5-9B text encoder and Flux2 VAE.
 3. Click **Start training** (the bar at the bottom of the Train and Monitor tabs). First run caches VAE latents and
    text embeddings; the text encoder is loaded once for caching and unloaded before the diffusion model is loaded.
+   **Add to queue** instead starts the run after the current one (and any queued before it) is done; the Monitor's
+   *Queue* section reorders, removes, pauses and resumes the waiting runs. Kill pauses the queue, Stop goes on to the
+   next run. Keep the WebUI open: it is what starts the next run.
 4. LoRAs are written to `output/<job>/<job>_<step>.safetensors` and `output/<job>/<job>.safetensors` (bf16 by default).
 
 ## Quantization
@@ -7352,6 +7499,8 @@ if __name__ in {"__main__", "__mp_main__"}:
 
         app.on_shutdown(park)
         on_exit_signals(park)
+
+    app.on_startup(lambda: threading.Thread(target=queue_loop, name="rulz-queue", daemon=True).start())
 
     @ui.page("/")
     def index(request: Request):
