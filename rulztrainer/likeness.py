@@ -22,12 +22,14 @@ proportion match (every human ~80, the references ~90-96). Raw, they live on dif
 is really ~93% face, and "the face lags the body" is always true. With `likeness_normalize` (the default) each score
 is first mapped onto one scale, 0 = what a stranger scores (the step-0 probe: the base model without the LoRA,
 rendered with at least `probe_floor_seeds` seeds, or a default) and 100 = what a typical reference scores against
-the others (reference_ceiling: the median of each reference's best match, or a default), capped at 100. The
-face scale is then stretched (`face_scale_span`, 1.35: its 100 sits 1.35x as far above the stranger as the references
-do) and curved (`face_scale_curve`, 1.5: the score is the position on that scale raised to this power): an ArcFace
-cosine saturates, so a decent likeness already reached the references' level and the face read 90 while the body, on
-its narrower DINOv2 range, read 50 for pictures that looked equally close; now the references' own face level reads
-about 64, and the score still has room to grow past it. The combined score, the noise band, the curriculum, the lr control and the best / stop / race decisions all run on those.
+the others (reference_ceiling: the median of each reference's best match, or a default), capped at 100. Each scale
+is then stretched (`face_scale_span` / `body_scale_span`, 1.35: its 100 sits 1.35x as far above the stranger as the
+references do) and curved (`face_scale_curve` / `body_scale_curve`, 1.5: the score is the position on that scale
+raised to this power), so the references' own level reads about 64 on both and the score still has room to grow past
+it. Both raw scores saturate near the references' level: an ArcFace cosine because a decent likeness already reaches
+it, a DINOv2 cosine because a probe that copies the photos' outfit and setting matches them better than the
+references, in their varied outfits, match each other. With the face alone stretched (until v2.1.3) the body read 100
+while the face, for pictures that looked equally close, read 50-60. The combined score, the noise band, the curriculum, the lr control and the best / stop / race decisions all run on those.
 
 The controller never touches the loss; it only steers sampling, lr and when to stop.
 """
@@ -54,13 +56,17 @@ def combine(face, body, face_weight: float, body_weight: float):
 FLOOR_DEFAULT = {"face": 20.0, "body": 80.0}
 CEILING_DEFAULT = {"face": 75.0, "body": 90.0}  # body: a window's references ~85-90, proportions ~90-96
 MIN_SPAN = {"face": 10.0, "body": 8.0}  # the ceiling stays at least this far above the floor (raw points)
+# ... and at least this share of the way from the floor to a perfect 100: a body ceiling (the references' typical best
+# match among themselves) that sits barely above the base model's step-0 score is no measure of a likeness, and a few
+# points of copied outfit then read 100 (a real run: floor 73.3, ceiling 81.3)
+MIN_ROOM_SHARE = {"face": 0.0, "body": 0.5}
 # matching the references better than a typical one of them does is no more likeness (a probe that copies one photo
 # reads higher), so the scale stops at 100
 NORM_MAX = 100.0
-# the face's raw score saturates (see the module docstring): its scale is stretched by FACE_SPAN_DEFAULT and curved by
-# FACE_CURVE_DEFAULT (config: face_scale_span, face_scale_curve; 1 and 1 give the plain linear scale)
-FACE_SPAN_DEFAULT = 1.35
-FACE_CURVE_DEFAULT = 1.5
+# both raw scores saturate (see the module docstring): each scale is stretched by its SPAN_DEFAULT and curved by its
+# CURVE_DEFAULT (config: face_scale_span / _curve, body_scale_span / _curve; 1 and 1 give the plain linear scale)
+FACE_SPAN_DEFAULT = BODY_SPAN_DEFAULT = 1.35
+FACE_CURVE_DEFAULT = BODY_CURVE_DEFAULT = 1.5
 
 
 def reference_ceiling(embs, usable=None) -> float | None:
@@ -137,8 +143,10 @@ class LikenessController:
         self.ceiling = {"face": face_ceiling if face_ceiling is not None else CEILING_DEFAULT["face"],
                         "body": body_ceiling if body_ceiling is not None else CEILING_DEFAULT["body"]}
         self.floor = {"face": None, "body": None}  # None: the default, until a step-0 probe sets it
-        self.span = {"face": float(getattr(cfg, "face_scale_span", FACE_SPAN_DEFAULT)), "body": 1.0}
-        self.curve = {"face": float(getattr(cfg, "face_scale_curve", FACE_CURVE_DEFAULT)), "body": 1.0}
+        self.span = {"face": float(getattr(cfg, "face_scale_span", FACE_SPAN_DEFAULT)),
+                     "body": float(getattr(cfg, "body_scale_span", BODY_SPAN_DEFAULT))}
+        self.curve = {"face": float(getattr(cfg, "face_scale_curve", FACE_CURVE_DEFAULT)),
+                      "body": float(getattr(cfg, "body_scale_curve", BODY_CURVE_DEFAULT))}
         self.face_ema = None
         self.body_ema = None
         self.combined_ema = None
@@ -181,10 +189,11 @@ class LikenessController:
         return a * prev + (1 - a) * value
 
     def scale(self, kind: str) -> tuple[float, float]:
-        """(floor, ceiling) in raw points for "face" / "body": the ceiling at least MIN_SPAN above the floor, then
-        the face's span stretched (face_scale_span)."""
+        """(floor, ceiling) in raw points for "face" / "body": the ceiling at least MIN_SPAN above the floor (the body's
+        also at least halfway to 100, MIN_ROOM_SHARE), then the span stretched (face_scale_span / body_scale_span)."""
         floor = self.floor[kind] if self.floor[kind] is not None else FLOOR_DEFAULT[kind]
-        return floor, floor + (max(self.ceiling[kind], floor + MIN_SPAN[kind]) - floor) * self.span[kind]
+        least = max(MIN_SPAN[kind], MIN_ROOM_SHARE[kind] * (100.0 - floor))
+        return floor, floor + (max(self.ceiling[kind], floor + least) - floor) * self.span[kind]
 
     def norm(self, kind: str, value):
         """A raw score on the normalized scale (the raw score itself with likeness_normalize off)."""

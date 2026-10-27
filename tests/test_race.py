@@ -222,7 +222,8 @@ def test_race_status_carries_face_and_body_behind_the_combined_score():
     from rulztrainer.likeness import LikenessController
     from rulztrainer.trainer import Trainer
 
-    cfg = TrainConfig(probe_every=10, probe_ema=0.0, likeness_normalize=True, face_scale_span=1.0, face_scale_curve=1.0)
+    cfg = TrainConfig(probe_every=10, probe_ema=0.0, likeness_normalize=True, face_scale_span=1.0, face_scale_curve=1.0,
+                      body_scale_span=1.0, body_scale_curve=1.0)
     c1, c2 = LikenessController(cfg, face_ceiling=70.0, body_ceiling=60.0), LikenessController(cfg)
     c1.update(0, 15.0, 8.0)  # floors
     c1.update(10, 42.5, 34.0)  # halfway to both ceilings

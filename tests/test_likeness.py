@@ -17,7 +17,8 @@ def _cfg(**kw):
     base = dict(probe_every=10, probe_ema=0.0, likeness_noise_band=1.0, likeness_track_best=True,
                 likeness_patience=3, likeness_lr_control=True, likeness_lr_min=0.5, likeness_lr_max=2.0,
                 likeness_lr_step=0.1, likeness_curriculum=True, likeness_curriculum_strength=1.0,
-                likeness_normalize=False, face_scale_span=1.0, face_scale_curve=1.0)  # the plain linear scale
+                likeness_normalize=False, face_scale_span=1.0, face_scale_curve=1.0,
+                body_scale_span=1.0, body_scale_curve=1.0)  # the plain linear scales
     return TrainConfig(**{**base, **kw})
 
 
@@ -117,7 +118,8 @@ def test_normalized_scores_put_face_and_body_on_one_scale():
 def test_the_face_scale_is_stretched_and_curved_so_it_keeps_room_to_improve():
     """An ArcFace cosine saturates: on a real run a decent face read 90 while the body, on the same pictures, read 51.
     The face's 100 sits face_scale_span x as far above a stranger as the references do, and the position on that scale
-    is raised to face_scale_curve; the body stays linear."""
+    is raised to face_scale_curve; the body likewise (body_scale_span / _curve), so both read their references'
+    own level alike."""
     plain = L.LikenessController(_cfg(likeness_normalize=True), face_ceiling=73.7, body_ceiling=88.4)
     new = L.LikenessController(TrainConfig(likeness_normalize=True, probe_ema=0.0), face_ceiling=73.7,
                                body_ceiling=88.4)
@@ -128,13 +130,13 @@ def test_the_face_scale_is_stretched_and_curved_so_it_keeps_room_to_improve():
     assert abs(plain.norm("face", raw_face) - 90.0) < 1e-9
     face = new.norm("face", raw_face)
     assert 50 < face < 60 and abs(face - 54.4) < 0.5  # about what the body read for the same likeness
-    assert abs(new.norm("body", 81.0) - plain.norm("body", 81.0)) < 1e-9  # the body is unchanged
+    assert new.norm("body", 81.0) < plain.norm("body", 81.0)  # the body is stretched and curved too
     ref_level = new.norm("face", 73.7)  # the references' own face level: no longer the ceiling
     assert 60 < ref_level < 68 and new.norm("face", 80.0) > ref_level  # and a better likeness still counts
     assert new.norm("face", 13.8) == 0.0 and new.norm("face", 200.0) == 100.0
     lo, hi = new.scale("face")
     assert lo == 13.8 and abs(hi - (13.8 + (73.7 - 13.8) * L.FACE_SPAN_DEFAULT)) < 1e-9
-    assert new.scale_record()["curve"] == {"face": L.FACE_CURVE_DEFAULT, "body": 1.0}
+    assert new.scale_record()["curve"] == {"face": L.FACE_CURVE_DEFAULT, "body": L.BODY_CURVE_DEFAULT}
     assert "curve x1.5" in new.describe_scale()
     assert L.normalize(50.0, 0.0, 100.0, 2.0) == 25.0 and L.normalize(150.0, 0.0, 100.0) == 100.0
 
@@ -219,3 +221,24 @@ def test_the_step0_probe_renders_more_seeds():
     assert L.probe_seed_count(TrainConfig(probe_seeds=6, probe_floor_seeds=4), 0) == 6  # never fewer than usual
     assert L.probe_seed_count(TrainConfig(probe_seeds=2, probe_floor_seeds=4, likeness_normalize=False), 0) == 2
     assert L.probe_seed_count(TrainConfig(probe_seeds=0, probe_floor_seeds=0), 0) == 1
+
+
+def test_the_body_scale_is_stretched_like_the_face_and_never_too_narrow():
+    """A reference-level body reads like a reference-level face (~64), and a body ceiling barely above the step-0 score
+    is widened to halfway to 100 (a real run's 73.3 -> 81.3 read 100 at a few points of copied outfit)."""
+    from types import SimpleNamespace
+
+    cfg = SimpleNamespace(likeness_normalize=True, probe_ema=0.5, resolution_step_up=False)
+    c = L.LikenessController(cfg, face_ceiling=70.0, body_ceiling=88.0)
+    c.floor.update(face=15.0, body=30.0)
+    assert abs(c.norm("body", 88.0) - c.norm("face", 70.0)) < 1e-9 and 60 < c.norm("body", 88.0) < 66
+    assert c.norm("body", 100.0) < 90  # a probe that copies the photos no longer reaches 100
+    narrow = L.LikenessController(cfg, body_ceiling=81.3)
+    narrow.floor["body"] = 73.3
+    lo, hi = narrow.scale("body")
+    assert abs(hi - (73.3 + 0.5 * (100 - 73.3) * L.BODY_SPAN_DEFAULT)) < 1e-9
+    assert narrow.norm("body", 81.3) < 35
+    linear = L.LikenessController(SimpleNamespace(**vars(cfg), body_scale_span=1.0, body_scale_curve=1.0),
+                                  body_ceiling=88.0)
+    linear.floor["body"] = 30.0
+    assert linear.norm("body", 88.0) == 100.0  # 1 and 1: the old body scale

@@ -18,7 +18,8 @@ sys.path.insert(0, str(ROOT / "comfyui"))
 import rulztrainer_likeness as pkg  # noqa: E402
 from rulztrainer import bodysim  # noqa: E402
 from rulztrainer.facesim import FaceScore  # noqa: E402
-from rulztrainer.likeness import (CEILING_DEFAULT, FACE_CURVE_DEFAULT, FACE_SPAN_DEFAULT, FLOOR_DEFAULT,  # noqa: E402
+from rulztrainer.likeness import (BODY_CURVE_DEFAULT, BODY_SPAN_DEFAULT, CEILING_DEFAULT,  # noqa: E402
+                                  FACE_CURVE_DEFAULT, FACE_SPAN_DEFAULT, FLOOR_DEFAULT,
                                   MIN_SPAN, LikenessController, combine)
 from rulztrainer_likeness import core, nodes  # noqa: E402
 
@@ -128,11 +129,12 @@ def test_the_scale_sources_in_order(fakes, tmp_path):
     s = core.build_scale(refs)  # one reference: no measured ceiling
     span = FACE_SPAN_DEFAULT  # the face scale is stretched, as in the trainer
     assert s.face == (FLOOR_DEFAULT["face"], FLOOR_DEFAULT["face"] + (CEILING_DEFAULT["face"] - FLOOR_DEFAULT["face"]) * span)
-    assert s.sources["face"]["ceiling"] == "default" and s.curve == {"face": FACE_CURVE_DEFAULT, "body": 1.0}
+    assert s.sources["face"]["ceiling"] == "default" and s.curve == {"face": FACE_CURVE_DEFAULT, "body": BODY_CURVE_DEFAULT}
     s = core.build_scale(refs, baseline_rows=[{"face_raw": 20.0, "body_raw": 81.0}, {"face_raw": 30.0,
                                                                                      "body_raw": None}])
     assert s.face[0] == 25.0 and s.body[0] == 81.0 and s.sources["face"]["floor"] == "baseline images (2)"
-    assert s.body[1] == 90.0  # the default ceiling, at least MIN_SPAN above the floor
+    # the default ceiling (90), lifted to halfway from the floor to 100 (90.5), then stretched like the face
+    assert abs(s.body[1] - (81.0 + 9.5 * BODY_SPAN_DEFAULT)) < 1e-9
     s = core.build_scale(refs, baseline_rows=[{"face_raw": 70.0}])
     assert s.face == (70.0, 70.0 + MIN_SPAN["face"] * span)  # a floor above the ceiling lifts the ceiling, as the trainer
     job = tmp_path / "job"

@@ -1162,6 +1162,7 @@ class Form:
             likeness_noise_band=float(v("likeness_noise_band")), likeness_track_best=bool(v("likeness_track_best")),
             likeness_normalize=bool(v("likeness_normalize")),
             face_scale_span=float(v("face_scale_span")), face_scale_curve=float(v("face_scale_curve")),
+            body_scale_span=float(v("body_scale_span")), body_scale_curve=float(v("body_scale_curve")),
             likeness_patience=int(v("likeness_patience")), likeness_lr_control=bool(v("likeness_lr_control")),
             likeness_lr_min=float(v("likeness_lr_min")), likeness_lr_max=float(v("likeness_lr_max")),
             likeness_lr_step=float(v("likeness_lr_step")), likeness_curriculum=bool(v("likeness_curriculum")),
@@ -5767,8 +5768,8 @@ def build_page(local: bool = True):
                         with fields():
                             w["likeness_normalize"] = ui.switch("Normalize face and body scores", value=d.likeness_normalize) \
                                 .tooltip("Score each on one scale first: 0 = what a stranger scores (the step-0 probe), "
-                                         "100 = what your references score against each other (the face scale is "
-                                         "stretched, see its span and curve). Raw, a body score "
+                                         "100 = what your references score against each other (both scales are "
+                                         "stretched, see their span and curve). Raw, a body score "
                                          "moves ~10 points over a run and a face score ~60, so the combined score, "
                                          "the curriculum and the noise band would follow the face alone.")
                             w["face_scale_span"] = ui.number("Face scale span", value=d.face_scale_span, min=1,
@@ -5782,6 +5783,17 @@ def build_page(local: bool = True):
                                          "1 the face starts slower and leaves room to keep improving. 1 = linear "
                                          "(the old scale). With the defaults (1.35 / 1.5) your references' own face "
                                          "level reads about 64.")
+                            w["body_scale_span"] = ui.number("Body scale span", value=d.body_scale_span, min=1,
+                                                             step=0.05, format="%.2f").classes("w-36")                                 .bind_visibility_from(w["likeness_normalize"], "value")                                 .tooltip("The body's DINOv2 score saturates too: a probe that copies the photos' "
+                                         "outfit and setting matches them better than your references, in their varied "
+                                         "outfits, match each other, so the body read 100 while the face read 50-60. "
+                                         "The body's 100 sits this many times as far above a stranger as your "
+                                         "references do (1 = the references themselves, the scale of v2.1.3 and "
+                                         "before).")
+                            w["body_scale_curve"] = ui.number("Body scale curve", value=d.body_scale_curve, min=1,
+                                                              step=0.1, format="%.2f").classes("w-36")                                 .bind_visibility_from(w["likeness_normalize"], "value")                                 .tooltip("The body score is its position on that scale raised to this power, as for "
+                                         "the face. With the defaults (1.35 / 1.5) your references' own body level "
+                                         "reads about 64, the same as their face.")
                             w["likeness_track_best"] = ui.switch("Keep best checkpoint (<job>_best.safetensors)",
                                                                  value=d.likeness_track_best)
                             w["likeness_patience"] = ui.number("Early stop after N probes w/o improvement (0 = never)",

@@ -838,9 +838,19 @@ scale above). An ArcFace cosine saturates: a decent likeness already matches the
 face read ~90 and then sat at 100 while the pictures still improved, and read far above the body (on a real run face 90
 against body 51 for pictures judged equally close). The face's 100 now sits `face_scale_span` times as far above the
 stranger as the references do, and the face score is its position on that scale raised to `face_scale_curve`. A face
-that read 90 now reads ~54, your references' own face level reads ~64, and the score keeps growing beyond it. The body
-scale is unchanged (its 100 is still a typical reference). The scale in force is kept in each probe record's `scale`,
-with the curve; runs saved before this change used the plain scale, so compare their face numbers with care. The ComfyUI
+that read 90 now reads ~54, your references' own face level reads ~64, and the score keeps growing beyond it.
+
+**The body scale is stretched and curved the same way** (`body_scale_span` 1.35, `body_scale_curve` 1.5, since v2.2.0).
+With the face alone stretched the body read 100 while the face read 50-60: a DINOv2 body score saturates too, because a
+probe that copies the photos' outfit and setting matches them better than the references, in their varied outfits and
+poses, match each other, and where the references' own body match sits close to the base model's (a ceiling only
+`MIN_SPAN` above the floor) a few points of gain read 100. The body's ceiling now also sits at least halfway from the
+floor to a perfect match (a real run's 73.3 -> 81.3 becomes 73.3 -> 86.7 before the stretch). Now the references' own
+level reads ~64 on both scales, a
+reference-level body no longer outscores a reference-level face, and 100 is out of reach of a probe that only copies the
+photos (raw 100 reads ~84 with an ordinary scale). Set both body numbers to 1 for the old body scale. The scale in force is kept in each probe record's `scale`,
+with the curves; runs saved before these changes used the plain scales, so compare their face (before v2.0) and body
+(before v2.2.0) numbers with care. The ComfyUI
 nodes use the same scale.
 
 The combined score, the noise band, the curriculum gap,

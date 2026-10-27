@@ -423,6 +423,8 @@ class TrainConfig:
     likeness_normalize: bool = True  # score face and body on one scale (0 = a stranger, 100 = the references) first
     face_scale_span: float = 1.35  # the face's 100 sits this many times as far above a stranger as the references do
     face_scale_curve: float = 1.5  # the face score is its position on that scale raised to this power (1 = linear)
+    body_scale_span: float = 1.35  # the same for the body: its 100 this many times as far above a stranger
+    body_scale_curve: float = 1.5  # and its curve (1 and 1 = the linear body scale of v2.1.3 and before)
     likeness_track_best: bool = True  # keep <job>_best.safetensors at the best smoothed score
     likeness_patience: int = 0  # stop after N probes without improvement; 0 = never
     likeness_lr_control: bool = False  # bounded lr multiplier driven by the probe trend
@@ -488,8 +490,9 @@ class TrainConfig:
         return list(self.lora_targets) or list(ARCH_DEFAULT_TARGETS[self.arch_name()])
 
     def validate(self) -> None:
-        if self.face_scale_span < 1.0 or self.face_scale_curve < 1.0:
-            raise ValueError("face_scale_span and face_scale_curve must be 1 or more (1 and 1 = the plain linear scale)")
+        if min(self.face_scale_span, self.face_scale_curve, self.body_scale_span, self.body_scale_curve) < 1.0:
+            raise ValueError("face_scale_span / _curve and body_scale_span / _curve must be 1 or more (1 and 1 = the "
+                             "plain linear scale)")
         if self.model_arch not in ("auto", *ARCH_NAMES):
             raise ValueError(f"model_arch must be auto or one of {ARCH_NAMES}, got {self.model_arch!r}")
         for mp in self.resolutions:
