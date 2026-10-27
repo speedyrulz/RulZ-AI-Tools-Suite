@@ -8,6 +8,22 @@ Everything runs on your computer. The model is served by
 [RulZ LLM Suite](https://github.com/speedyrulz/rulz-llm-suite); this app is the "hands" that edit files and run
 commands. No cloud services and no accounts.
 
+## Screenshots
+
+| Dark | Light |
+| --- | --- |
+| ![Conversation, Steps and Files changed (dark)](docs/screenshots/conversation-dark.png) | ![Conversation, Steps and Files changed (light)](docs/screenshots/conversation-light.png) |
+
+The light look is one click away: use the sun/moon button in the top bar (or **Settings > Look**).
+
+![First-run wizard](docs/screenshots/first-run-wizard.png)
+
+![Approval prompt before a command](docs/screenshots/approval.png)
+
+![Run my app panel](docs/screenshots/run-my-app.png)
+
+![A changed file as a diff](docs/screenshots/file-diff.png)
+
 ## Getting started
 
 1. In **RulZ LLM Suite**, open the **Developer** page and click **Start server**. If LM Studio is also running it
