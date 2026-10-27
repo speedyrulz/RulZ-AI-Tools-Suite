@@ -1,8 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import type { WireMessage } from '@shared/types'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import type { McpConfigState, WireMessage } from '@shared/types'
 import { pairToolMessages } from '../src/main/chat/context'
 import { interpretChunk, ToolCallAccumulator } from '../src/main/chat/sse'
-import { contentToText, parseMcpConfig, qualifyToolName } from '../src/main/mcp/config'
+import { contentToText, EMPTY_CONFIG, parseMcpConfig, qualifyToolName, readMcpConfigFile } from '../src/main/mcp/config'
+import { McpManager } from '../src/main/mcp/manager'
 
 describe('parseMcpConfig', () => {
   it('accepts stdio and http servers', () => {
@@ -60,5 +64,63 @@ describe('pairToolMessages', () => {
     const out = pairToolMessages(msgs)
     expect(out.map((m) => m.role)).toEqual(['user', 'assistant', 'tool'])
     expect(out[1].tool_calls?.map((c) => c.id)).toEqual(['a'])
+  })
+})
+
+describe('readMcpConfigFile', () => {
+  const err = (code: string): NodeJS.ErrnoException => Object.assign(new Error(`${code}: nope`), { code })
+
+  it('treats a missing file as an empty config', async () => {
+    const r = await readMcpConfigFile('x', async () => Promise.reject(err('ENOENT')), 3, 0)
+    expect(r).toEqual({ text: EMPTY_CONFIG, error: null })
+  })
+  it('retries a briefly locked file', async () => {
+    let calls = 0
+    const r = await readMcpConfigFile('x', async () => (++calls < 3 ? Promise.reject(err('EBUSY')) : '{"mcpServers":{}}'), 4, 0)
+    expect(r.error).toBeNull()
+    expect(calls).toBe(3)
+  })
+  it('reports a file it cannot read', async () => {
+    const r = await readMcpConfigFile('x', async () => Promise.reject(err('EPERM')), 2, 0)
+    expect(r.text).toBeNull()
+    expect(r.error).toMatch(/Couldn't read mcp.json: EPERM/)
+  })
+})
+
+describe('McpManager config loading', () => {
+  const tmp = (): string => mkdtempSync(join(tmpdir(), 'rulz-mcp-'))
+
+  it('reports a broken file instead of hiding it, and Reconnect all re-reads the file', async () => {
+    const dir = tmp()
+    const file = join(dir, 'mcp.json')
+    writeFileSync(file, '{ "mcpServers": ')
+    const configs: McpConfigState[] = []
+    const mgr = new McpManager(file, () => undefined, (c) => configs.push(c))
+    await mgr.init()
+    expect(mgr.config().error).toMatch(/not valid JSON/)
+    expect(mgr.config().readFailed).toBe(false)
+    expect(configs.at(-1)?.error).toMatch(/not valid JSON/)
+
+    // A disabled server needs no process, so the test stays offline.
+    writeFileSync(file, JSON.stringify({ mcpServers: { a: { command: 'x', disabled: true } } }))
+    await mgr.restart(null)
+    expect(mgr.config().error).toBeNull()
+    expect(mgr.status().map((s) => [s.name, s.state])).toEqual([['a', 'disabled']])
+
+    // A bad edit later keeps the servers that are already set up.
+    writeFileSync(file, 'nope')
+    await mgr.restart(null)
+    expect(mgr.config().error).toMatch(/not valid JSON/)
+    expect(mgr.status()).toHaveLength(1)
+    await mgr.dispose()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('starts empty, without an error, when there is no file', async () => {
+    const dir = tmp()
+    const mgr = new McpManager(join(dir, 'mcp.json'), () => undefined)
+    await mgr.init()
+    expect(mgr.config()).toMatchObject({ text: EMPTY_CONFIG, error: null, readFailed: false })
+    rmSync(dir, { recursive: true, force: true })
   })
 })

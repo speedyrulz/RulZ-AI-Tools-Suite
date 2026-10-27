@@ -183,6 +183,16 @@ export interface McpServerStatus {
   log: string[]
 }
 
+/** mcp.json as the app last read it, and any problem reading or parsing it. */
+export interface McpConfigState {
+  text: string
+  path: string
+  /** Why the file couldn't be read or used; null when it loaded fine. */
+  error: string | null
+  /** True when the file couldn't be read at all, so `text` may not match what is on disk. */
+  readFailed: boolean
+}
+
 export interface ToolCall {
   id: string
   /** Qualified tool name as the model called it. */

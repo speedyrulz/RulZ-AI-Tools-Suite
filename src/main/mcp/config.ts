@@ -2,6 +2,31 @@ import type { McpServerConfig } from '@shared/types'
 
 export const EMPTY_CONFIG = '{\n  "mcpServers": {}\n}\n'
 
+type ReadText = (path: string) => Promise<string>
+
+/**
+ * Reads mcp.json. A missing file is an empty config; other failures (a file briefly locked by an
+ * installer or antivirus, say) are retried a few times and then reported instead of being hidden.
+ */
+export async function readMcpConfigFile(
+  path: string,
+  read: ReadText,
+  attempts = 4,
+  delayMs = 250
+): Promise<{ text: string; error: null } | { text: null; error: string }> {
+  let last: unknown
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return { text: await read(path), error: null }
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT') return { text: EMPTY_CONFIG, error: null }
+      last = e
+      if (i < attempts - 1) await new Promise((r) => setTimeout(r, delayMs))
+    }
+  }
+  return { text: null, error: `Couldn't read mcp.json: ${(last as Error)?.message ?? String(last)}` }
+}
+
 /** Parses mcp.json text (the Cursor/LM Studio "mcpServers" format). Throws a readable error. */
 export function parseMcpConfig(text: string): Record<string, McpServerConfig> {
   let raw: unknown

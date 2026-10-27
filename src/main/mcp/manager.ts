@@ -4,8 +4,8 @@ import { join } from 'node:path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { getDefaultEnvironment, StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
-import type { McpServerConfig, McpServerStatus, McpToolInfo, ToolResult, WireToolCall } from '@shared/types'
-import { contentToText, EMPTY_CONFIG, parseMcpConfig, qualifyToolName } from './config'
+import type { McpConfigState, McpServerConfig, McpServerStatus, McpToolInfo, ToolResult, WireToolCall } from '@shared/types'
+import { contentToText, EMPTY_CONFIG, parseMcpConfig, qualifyToolName, readMcpConfigFile } from './config'
 
 const MAX_LOG = 200
 const MAX_RESULT_CHARS = 24000
@@ -35,31 +35,25 @@ function launcherDirs(): string[] {
 export class McpManager {
   private connections = new Map<string, Connection>()
   private configText = EMPTY_CONFIG
+  private configError: string | null = null
+  private readFailed = false
 
   constructor(
     private readonly configPath: string,
-    private readonly onChange: (status: McpServerStatus[]) => void
+    private readonly onChange: (status: McpServerStatus[]) => void,
+    private readonly onConfig: (config: McpConfigState) => void = () => undefined
   ) {}
 
   status(): McpServerStatus[] {
     return [...this.connections.values()].map((c) => ({ ...c.status, log: c.status.log.slice() }))
   }
 
-  getConfigText(): string {
-    return this.configText
+  config(): McpConfigState {
+    return { text: this.configText, path: this.configPath, error: this.configError, readFailed: this.readFailed }
   }
 
   async init(): Promise<void> {
-    try {
-      this.configText = await fs.readFile(this.configPath, 'utf8')
-    } catch {
-      this.configText = EMPTY_CONFIG
-    }
-    try {
-      await this.apply(parseMcpConfig(this.configText))
-    } catch {
-      // A broken file is reported when the user opens or saves it; start with no servers.
-    }
+    await this.reload(null)
   }
 
   /** Validates and saves mcp.json, then reconnects every server. */
@@ -67,17 +61,42 @@ export class McpManager {
     const servers = parseMcpConfig(text)
     await fs.writeFile(this.configPath, text, 'utf8')
     this.configText = text
+    this.configError = null
+    this.readFailed = false
+    this.emitConfig()
     await this.apply(servers)
     return this.status()
   }
 
+  /** Re-reads mcp.json from disk, then reconnects one server (by name) or all of them (null). */
   async restart(name: string | null): Promise<void> {
-    const servers = parseMcpConfig(this.configText)
+    await this.reload(name)
+  }
+
+  /**
+   * Reads and parses mcp.json and reconnects. If the file can't be read or parsed, the problem is
+   * reported on the MCP page and the servers that are already connected are left alone.
+   */
+  private async reload(name: string | null): Promise<void> {
+    const read = await readMcpConfigFile(this.configPath, (p) => fs.readFile(p, 'utf8'))
+    this.readFailed = read.text === null
+    if (read.text !== null) this.configText = read.text
+    let servers: Record<string, McpServerConfig> | null = null
+    this.configError = read.error
+    if (read.text !== null) {
+      try {
+        servers = parseMcpConfig(read.text)
+      } catch (e) {
+        this.configError = (e as Error).message
+      }
+    }
+    this.emitConfig()
+    if (!servers) return
     if (name === null) return this.apply(servers)
     const cfg = servers[name]
-    if (!cfg) return
     await this.disconnect(name)
-    await this.connect(name, cfg)
+    if (cfg) await this.connect(name, cfg)
+    else this.emit()
   }
 
   private async apply(servers: Record<string, McpServerConfig>): Promise<void> {
@@ -234,5 +253,9 @@ export class McpManager {
 
   private emit(): void {
     this.onChange(this.status())
+  }
+
+  private emitConfig(): void {
+    this.onConfig(this.config())
   }
 }

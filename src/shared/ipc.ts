@@ -11,6 +11,7 @@ import type {
   InstanceErrorEvent,
   LoadConfig,
   LoadedInstance,
+  McpConfigState,
   McpServerStatus,
   MemoryEstimate,
   ModelEntry,
@@ -70,7 +71,7 @@ export interface IpcInvoke {
   'folders:list': () => string[]
   'folders:save': (folders: string[]) => void
 
-  'mcp:getConfig': () => { text: string; path: string }
+  'mcp:getConfig': () => McpConfigState
   'mcp:saveConfig': (text: string) => McpServerStatus[]
   'mcp:status': () => McpServerStatus[]
   'mcp:restart': (name: string | null) => void
@@ -95,6 +96,7 @@ export interface IpcEvents {
   'hardware:update': HardwareSnapshot
   'chat:event': StreamEvent
   'mcp:changed': McpServerStatus[]
+  'mcp:config': McpConfigState
   'server:changed': ApiServerStatus
   'server:request': ApiRequestLog
 }

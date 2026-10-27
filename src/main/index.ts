@@ -116,7 +116,11 @@ async function main(): Promise<void> {
   await instances.cleanupOrphans()
 
   const mcpConfigPath = join(userData, 'mcp.json')
-  const mcp = new McpManager(mcpConfigPath, (s) => broadcast('mcp:changed', s))
+  const mcp = new McpManager(
+    mcpConfigPath,
+    (s) => broadcast('mcp:changed', s),
+    (c) => broadcast('mcp:config', c)
+  )
   void mcp.init()
 
   const apiServer = new ApiServer({
@@ -211,7 +215,7 @@ async function main(): Promise<void> {
   handle('folders:list', () => conversations.listFolders())
   handle('folders:save', (f) => conversations.saveFolders(f))
 
-  handle('mcp:getConfig', () => ({ text: mcp.getConfigText(), path: mcpConfigPath }))
+  handle('mcp:getConfig', () => mcp.config())
   handle('mcp:saveConfig', (text) => mcp.saveConfig(text))
   handle('mcp:status', () => mcp.status())
   handle('mcp:restart', (name) => mcp.restart(name))

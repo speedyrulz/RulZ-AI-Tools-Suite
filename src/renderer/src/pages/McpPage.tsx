@@ -1,5 +1,5 @@
 import * as Collapsible from '@radix-ui/react-collapsible'
-import { ChevronRight, FileText, FolderOpen, Plus, RefreshCw, ShieldCheck } from 'lucide-react'
+import { ChevronRight, FileText, FolderOpen, Plus, RefreshCw, ShieldCheck, TriangleAlert } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import { toolTokens } from '@shared/tools'
@@ -28,30 +28,48 @@ const TOOL_TOKEN_WARNING = 8000
 
 export function McpPage() {
   const servers = useMcp((s) => s.servers)
+  const config = useMcp((s) => s.config)
   const settings = useApp((s) => s.settings)
   const update = useApp((s) => s.updateSettings)
   const [text, setText] = useState<string | null>(null)
-  const [path, setPath] = useState('')
   const [saved, setSaved] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
+  const [reconnecting, setReconnecting] = useState(false)
 
+  // Follow the file as the app reads it (startup, Reconnect all), unless you have unsaved edits.
+  const loadedText = config?.text ?? null
   useEffect(() => {
-    void invoke('mcp:getConfig').then((c) => {
-      setText(c.text)
-      setSaved(c.text)
-      setPath(c.path)
-    })
-  }, [])
+    if (loadedText === null) return
+    setText((cur) => (cur === null || cur === saved ? loadedText : cur))
+    setSaved(loadedText)
+  }, [loadedText])
 
-  if (!settings || text === null) return null
+  if (!settings || !config || text === null) return null
+  const path = config.path
   const dirty = text !== saved
+
+  const reconnectAll = async (): Promise<void> => {
+    setReconnecting(true)
+    try {
+      await invoke('mcp:restart', null)
+    } catch (e) {
+      toast.error(errorMessage(e))
+    } finally {
+      setReconnecting(false)
+    }
+  }
   const disabledSet = new Set(settings.disabledTools)
   const enabled = servers.filter((s) => s.state === 'connected').flatMap((s) => s.tools).filter((t) => !disabledSet.has(t.qualifiedName))
   const toolCount = enabled.length
   const totalTokens = enabled.reduce((sum, t) => sum + toolTokens(t), 0)
 
   const save = async (): Promise<void> => {
+    if (
+      config.readFailed &&
+      !window.confirm("mcp.json couldn't be read, so this editor may not show what is in the file. Replace the file with the editor's contents?")
+    )
+      return
     setSaving(true)
     try {
       await invoke('mcp:saveConfig', text)
@@ -92,9 +110,11 @@ export function McpPage() {
               </span>
             </div>
           </div>
-          <Button size="sm" onClick={() => void invoke('mcp:restart', null)}>
-            <RefreshCw size={14} /> Reconnect all
-          </Button>
+          <Tooltip content="Re-reads mcp.json from disk and reconnects every server">
+            <Button size="sm" disabled={reconnecting} onClick={() => void reconnectAll()}>
+              <RefreshCw size={14} className={reconnecting ? 'animate-spin' : undefined} /> Reconnect all
+            </Button>
+          </Tooltip>
         </div>
 
         <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-6 py-5">
@@ -176,7 +196,23 @@ export function McpPage() {
             )}
           </div>
 
-          {servers.length === 0 && (
+          {config.error && (
+            <div className="flex gap-3 rounded-xl border border-danger/40 bg-danger/10 p-4 text-sm">
+              <TriangleAlert size={16} className="mt-0.5 shrink-0 text-danger" />
+              <div className="min-w-0 space-y-1">
+                <div className="font-medium text-danger">
+                  {config.readFailed ? "Couldn't read mcp.json" : 'mcp.json has a problem'}
+                </div>
+                <div className="text-xs whitespace-pre-wrap text-muted">{config.error}</div>
+                <div className="text-xs text-muted">
+                  {config.readFailed
+                    ? 'Servers that were already connected keep running. Fix the cause, then press Reconnect all to read the file again.'
+                    : 'Fix it in the editor and save, or edit the file and press Reconnect all.'}
+                </div>
+              </div>
+            </div>
+          )}
+          {servers.length === 0 && !config.error && (
             <div className="rounded-xl border border-dashed border-border p-8 text-center text-sm text-muted">
               No MCP servers yet. Add one to <span className="font-mono">mcp.json</span> on the right, then save.
             </div>

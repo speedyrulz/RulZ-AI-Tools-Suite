@@ -1,19 +1,24 @@
 import { create } from 'zustand'
 import { toolTokens } from '@shared/tools'
-import type { McpServerStatus, McpToolInfo, ToolRequest } from '@shared/types'
+import type { McpConfigState, McpServerStatus, McpToolInfo, ToolRequest } from '@shared/types'
 import { invoke, on } from '../lib/api'
 import { useApp } from './app'
 
 interface McpState {
   servers: McpServerStatus[]
+  /** mcp.json as the main process last read it, with any read or parse error. */
+  config: McpConfigState | null
   init: () => Promise<void>
 }
 
 export const useMcp = create<McpState>((set) => ({
   servers: [],
+  config: null,
   init: async () => {
     on('mcp:changed', (servers) => set({ servers }))
-    set({ servers: await invoke('mcp:status') })
+    on('mcp:config', (config) => set({ config }))
+    const [servers, config] = await Promise.all([invoke('mcp:status'), invoke('mcp:getConfig')])
+    set({ servers, config })
   }
 }))
 
