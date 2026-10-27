@@ -218,3 +218,29 @@ def test_import_adds_raw_scores_to_a_run_saved_before_they_were_kept(tmp_path):
     (run,) = history.list_runs(root)
     assert [r["step"] for r in run["probe_raw"]["records"]] == [0, 25]
     assert history.import_jobs(out, root) == 0
+
+
+def test_runs_compare_on_one_scale():
+    scale = {"face": [10.0, 10.0 + 60.0 * 1.35], "body": [70.0, 70.0 + 15.0 * 1.35], "curve": {"face": 1.5, "body": 1.5},
+             "span": {"face": 1.35, "body": 1.35}}
+    probes = [{"step": 0, "face": 10.0, "body": 70.0, "scale": scale}, {"step": 100, "face": 70.0, "body": 85.0}]
+    run = {"id": "r", "job": "j", "started": 0, "label": "", "config": {"probe_ema": 0.0},
+           "probe_raw": {"names": [], "records": probes}, "probes": {"face": [], "body": [], "combined": []}}
+    old = {**run, "id": "o", "label": "old", "probes": {"face": [[0, 0.0]], "body": [], "combined": [[0, 0.0]]}}
+    old.pop("probe_raw")
+    linear = {"face_scale_span": 1.0, "face_scale_curve": 1.0, "body_scale_span": 1.0, "body_scale_curve": 1.0,
+              "face_weight": 0.5}
+    (new, kept), own = webui.rescaled_runs([run, old], linear)
+    assert new["probes"]["face"] == [[0, 0.0], [100, 100.0]] and new["probes"]["body"][-1] == [100, 100.0]
+    assert new["probes"]["combined"][-1] == [100, 100.0] and kept is old and own == ["old"]
+    (curved,), _ = webui.rescaled_runs([run], {**linear, "face_scale_span": 1.25, "face_scale_curve": 2.0,
+                                               "face_weight": 1.0})
+    assert curved["probes"]["face"][-1] == [100, 64.0] and curved["probes"]["combined"][-1] == [100, 64.0]
+    assert webui.rescaled_runs([run], None) == ([run], [])
+
+    race = {**run, "probe_raw": {"names": ["a", "b"], "records": [
+        {**probes[0], "racer": "a"}, {**probes[0], "racer": "b"}, {**probes[1], "racer": "a"},
+        {"step": 100, "face": 40.0, "body": 77.5, "racer": "b"}]}}
+    (r,), _ = webui.rescaled_runs([race], linear)
+    assert r["probes"]["racers"]["a"]["face"][-1] == [100, 100.0] and r["probes"]["racers"]["b"]["face"][-1] == [100, 50.0]
+    assert [p[1] for p in r["probes"]["face"]] == [0.0, 0.0, 100.0, 50.0]  # each racer smoothed on its own

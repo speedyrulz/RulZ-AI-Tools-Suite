@@ -4499,6 +4499,29 @@ def history_rows(runs: list[dict]) -> list[dict]:
     return rows
 
 
+COMMON_SCALE_KEYS = ("face_scale_span", "face_scale_curve", "body_scale_span", "body_scale_curve", "face_weight")
+
+
+def rescaled_runs(runs: list[dict], scale: dict | None) -> tuple[list[dict], list[str]]:
+    """(runs, the labels of those left on their own scale): with a common scale ({face_scale_span, face_scale_curve,
+    body_scale_span, body_scale_curve, face_weight}) each run's probe series rebuilt from its raw scores
+    (history.rescore: its own floors and references, these spans, curves and weights); a run without raw scores
+    keeps its own. None: the runs as saved."""
+    if not scale:
+        return runs, []
+    out, own = [], []
+    fw = float(scale["face_weight"])
+    for r in runs:
+        series = history.rescore(r, float(scale["face_scale_span"]), float(scale["face_scale_curve"]),
+                                 float(scale["body_scale_span"]), float(scale["body_scale_curve"]), fw, 1.0 - fw)
+        if series is None:
+            own.append(history_label(r))
+            out.append(r)
+        else:
+            out.append({**r, "probes": series})
+    return out, own
+
+
 def history_series(runs: list[dict], part: str, metrics: list[str]) -> list[dict]:
     """ECharts line series overlaying the chosen runs: one colour per run, one line style per metric (face solid,
     body dashed, combined thick). part is "identity" (the sample images' means) or "probes"."""
@@ -4612,11 +4635,31 @@ def probe_caption(entry: dict) -> str:
 def build_history_tab(charts: list):
     """Previous Runs: the saved likeness history of every run (output/_history), any number of them ticked to overlay
     their charts."""
-    state = {"runs": [], "sig": None, "picks": [], "captions": [], "shown": None}
+    state = {"runs": [], "view": [], "own": [], "sig": None, "picks": [], "captions": [], "shown": None}
 
     def selected_runs() -> list[dict]:
         ids = {row["id"] for row in table.selected}
-        return [r for r in state["runs"] if r["id"] in ids]
+        return [r for r in state["view"] if r["id"] in ids]
+
+    def common_scale() -> dict | None:
+        if not scale_on.value:
+            return None
+        vals = {k: w.value for k, w in scale_inputs.items()}
+        if any(v is None for v in vals.values()):
+            return None
+        return {**vals, "face_weight": float(vals["face_weight"]) / 100.0}
+
+    def apply_scale():
+        """Rebuild the shown runs on the common scale (or as saved), the table and the charts with them."""
+        state["view"], state["own"] = rescaled_runs(state["runs"], common_scale())
+        keep = {row["id"] for row in table.selected}
+        table.rows = history_rows(state["view"])
+        table.selected = [row for row in table.rows if row["id"] in keep]
+        table.update()
+        own = [r for r in state["own"] if r in {history_label(x) for x in selected_runs()}]
+        scale_note.text = (f"On their own scale (saved before the history kept raw probe scores): {', '.join(own)}"
+                           if own and scale_on.value else "")
+        draw()
 
     def draw():
         picked = selected_runs()
@@ -4722,13 +4765,9 @@ def build_history_tab(charts: list):
             return
         state["sig"] = sig
         state["runs"] = history.list_runs()
-        keep = {row["id"] for row in table.selected}
-        table.rows = history_rows(state["runs"])
-        table.selected = [row for row in table.rows if row["id"] in keep]
-        table.update()
         count.text = (f"{len(state['runs'])} saved run(s) in {history.HISTORY_DIR}" if state["runs"] else
                       "No saved runs yet. A run is saved while it trains once it has likeness scores.")
-        draw()
+        apply_scale()
 
     def export_runs():
         from urllib.parse import quote
@@ -4799,7 +4838,7 @@ def build_history_tab(charts: list):
         count = hint("")
         table = ui.table(columns=HISTORY_COLUMNS, rows=[], row_key="id", selection="multiple",
                          pagination={"rowsPerPage": 10, "sortBy": "started", "descending": True},
-                         on_select=lambda _: draw()).props("flat dense").classes("w-full")
+                         on_select=lambda _: apply_scale()).props("flat dense").classes("w-full")
         with ui.row().classes("w-full items-center gap-2"):
             ui.button("Rename", icon="edit", on_click=rename).props("flat dense")
             ui.button("Export spreadsheet", icon="table_view", on_click=export_runs).props("flat dense") \
@@ -4821,6 +4860,33 @@ def build_history_tab(charts: list):
         with ui.row().classes("items-center gap-3"):
             probe_metrics = metric_chips(("face", "body", "combined"), lambda: draw())
             probe_empty = hint("")
+        d = TrainConfig()
+        with ui.row().classes("w-full items-center gap-3"):
+            scale_on = ui.switch("Compare on one scale", value=False, on_change=lambda _: apply_scale()) \
+                .tooltip("Rescore every ticked run's probes, and the table's scores, on the same face / body scale "
+                         "and weights instead of each run's own. Each run keeps its own floor (its step-0 probe) and "
+                         "references' level; only the span, curve and weights become common, so runs trained with "
+                         "different scale settings compare fairly. Runs saved before v2.9.0 need their raw probe "
+                         "scores (Import old runs adds them while the job folder still holds the run).")
+            scale_inputs = {}
+            with ui.row().classes("items-center gap-2") as scale_row:
+                for key, label, value, mn, step in (
+                        ("face_scale_span", "Face span", d.face_scale_span, 1, 0.05),
+                        ("face_scale_curve", "Face curve", d.face_scale_curve, 1, 0.1),
+                        ("body_scale_span", "Body span", d.body_scale_span, 1, 0.05),
+                        ("body_scale_curve", "Body curve", d.body_scale_curve, 1, 0.1),
+                        ("face_weight", "Face weight %", round(d.face_weight * 100), 0, 5)):
+                    scale_inputs[key] = ui.number(label, value=value, min=mn, max=100 if key == "face_weight" else 10,
+                                                  step=step, on_change=lambda _: apply_scale()) \
+                        .props("dense").classes("w-28")
+                ui.button("Recommended", icon="auto_fix_high", on_click=lambda: [
+                    scale_inputs[k].set_value(v) for k, v in (("face_scale_span", 1.1), ("face_scale_curve", 3.0),
+                                                             ("body_scale_span", 1.0), ("body_scale_curve", 1.0),
+                                                             ("face_weight", 80))]).props("flat dense no-caps") \
+                    .tooltip("Face 1.1 / 3, body 1 / 1, 80% face: the face lines spread further apart and the body, "
+                             "which moves little between runs, no longer swings the combined score")
+            scale_row.bind_visibility_from(scale_on, "value")
+        scale_note = hint("", warn=True)
         probe_chart_h = ui.echart(chart_options(_axis("step", min="dataMin"), _axis("likeness %", min=0),
                                                 [], [])).classes("w-full h-72")
     with section("Probe images", "The ticked runs' probes at the same step side by side; pick two to compare",

@@ -1019,7 +1019,15 @@ every ticked run at once, and on again to bring it back. A race run draws each c
 after it (`<run> lora16 - face`; the winner's after the race: `winner`); *Import old runs* adds that split to race runs
 saved before it existed, while their job folder is still there. *Rename* gives a run a name of your own and *Remove from history* deletes
 its history file only (never the job folder). *Export spreadsheet* downloads each ticked run's likeness spreadsheet (see
-*Export spreadsheet* under the likeness probes), from the raw probe scores the history keeps for it. A run that is still training updates live.
+*Export spreadsheet* under the likeness probes), from the raw probe scores the history keeps for it.
+
+**Compare on one scale** (above the *Likeness probes & controller* chart) rescores the ticked runs and the table on the
+same face span / curve, body span / curve and face weight, instead of each run's own settings: runs trained with
+different scale settings, or before a default changed, then compare fairly. Each run keeps its own floor (its step-0
+probe) and its references' own level; the smoothing is its own too. *Recommended* sets face 1.1 / 3, body 1 / 1 and
+80% face. Runs saved before v2.9.0 stay on their own scale unless their raw probe scores were added (*Import old
+runs*, while the job folder still holds the run); a note names them. The probe images' captions keep each run's own
+scores. A run that is still training updates live.
 
 **Probe images** (below the charts) puts the ticked runs' likeness probes side by side: pick Face or Body and a probe
 step (the arrows step through them), and each run, or each configuration of a race, shows its probe images of that

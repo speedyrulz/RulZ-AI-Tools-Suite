@@ -162,6 +162,60 @@ def probe_raw(status: dict) -> dict:
     return {"names": names, "records": out}
 
 
+def rescore(record: dict, face_span: float, face_curve: float, body_span: float, body_curve: float,
+            face_weight: float, body_weight: float) -> dict | None:
+    """The run's probe series (probe_series' shape) rebuilt from its raw scores on other scale settings: its own
+    floors and references' levels, the given span / curve per kind and weights, its own smoothing. None for a run
+    without raw scores (probe_raw)."""
+    from .likeness import MIN_ROOM_SHARE, MIN_SPAN, combine, normalize
+    from .likeness_export import _groups, _reference_levels
+
+    raw = record.get("probe_raw") or {}
+    records = raw.get("records") or []
+    if not records:
+        return None
+    names = raw.get("names") or []
+    a = float((record.get("config") or {}).get("probe_ema", 0.5))
+    shape = {"face": (face_span, face_curve), "body": (body_span, body_curve)}
+
+    def tops(rows: list[dict]) -> dict:
+        out = {}
+        for kind, (floor, ref) in _reference_levels(rows, None).items():
+            least = max(MIN_SPAN[kind], MIN_ROOM_SHARE[kind] * (100.0 - floor))
+            out[kind] = (floor, floor + (max(ref, floor + least) - floor) * shape[kind][0])
+        return out
+
+    def points(rows: list[dict]) -> list[tuple]:
+        """(step, face, body, combined) per probe, smoothed within these rows."""
+        scale, ema, out = tops(rows), {"face": None, "body": None}, []
+        for r in rows:
+            norm = {}
+            for kind in ("face", "body"):
+                v = r.get(kind)
+                if v is not None:
+                    ema[kind] = v if ema[kind] is None else a * ema[kind] + (1 - a) * v
+                norm[kind] = normalize(ema[kind], *scale[kind], shape[kind][1])
+            out.append((r["step"], norm["face"], norm["body"],
+                        combine(norm["face"], norm["body"], face_weight, body_weight)))
+        return out
+
+    def series(pts: list[tuple]) -> dict:
+        return {key: [[p[0], round(p[i], 1)] for p in pts if p[i] is not None]
+                for i, key in ((1, "face"), (2, "body"), (3, "combined"))}
+
+    if not names:
+        return series(points(records))
+    by_record: dict[int, tuple] = {}
+    racers = {}
+    for label, rows in _groups(records, names):
+        pts = points(rows)  # each configuration smoothed on its own, as its controller did
+        racers[label] = series(pts)
+        by_record.update({id(r): p for r, p in zip(rows, pts)})
+    out = series([by_record[id(r)] for r in records])  # all probes in order (the table's last / best)
+    out["racers"] = racers
+    return out
+
+
 def race_names(status: dict) -> list[str]:
     return [str(n) for n in ((status.get("race") or {}).get("names") or [])]
 
