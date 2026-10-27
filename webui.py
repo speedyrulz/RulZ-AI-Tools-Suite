@@ -4881,9 +4881,10 @@ def build_page(local: bool = True):
                                                                     "flash": "flash", "efficient": "memory-efficient",
                                                                     "math": "math (slow, exact)"},
                                                                    value=d.attention_backend, label="Attention kernel")                                     .classes("w-72")                                     .tooltip("The attention kernel of the DiT blocks. cuDNN ran Krea 2 steps 15-22% "
-                                             "faster on an RTX 5060 Ti at the same loss, so auto pins it on Blackwell "
-                                             "GPUs (RTX 50, B200) and lets PyTorch pick elsewhere. A pinned kernel that "
-                                             "rejects a call falls back to PyTorch's pick with a warning.")
+                                             "faster on an RTX 5060 Ti at the same loss, so auto puts it first on "
+                                             "Blackwell GPUs (RTX 50, B200) and lets PyTorch pick elsewhere. The other "
+                                             "kernels stay enabled behind the chosen one: a call it cannot take runs on "
+                                             "the next.")
 
                     # ---- Dataset
                     with section("Dataset", "Images, captions and resolution", "photo_library") as sec:
@@ -6706,10 +6707,10 @@ as well and multiplies on the FP4 tensor cores (about 4x faster than a bf16 matm
 dequantizing), with an exact bf16 backward. GPUs without FP4 tensor cores always dequantize (a fused kernel). Pick
 the RTX 50 card as the training GPU to use it; the log says which GPUs run native. *nvfp4 backward* `FP4` (opt-in)
 runs the gradient through those layers on the FP4 tensor cores too: about 9% faster per step on Krea 2, with
-noisier gradients (cosine 0.93-0.99 to the exact ones); `bf16` stays exact. *Attention kernel*: `auto` pins cuDNN's
+noisier gradients (cosine 0.93-0.99 to the exact ones); `bf16` stays exact. *Attention kernel*: `auto` puts cuDNN's
 attention on Blackwell GPUs (RTX 50, B200), where it ran Krea 2 steps 15-22% faster at the same loss, and lets
-PyTorch pick elsewhere; `torch`, `cudnn`, `flash`, `efficient`, `math` force one. A kernel that rejects a call falls
-back to PyTorch's pick with a warning.
+PyTorch pick elsewhere; `torch`, `cudnn`, `flash`, `efficient`, `math` put one first. The others stay enabled behind
+it: a call it cannot take runs on the next.
 
 ## Datasets
 The Dataset tab lists every dataset with a few thumbnails: the folders in `datasets/` (where *Create dataset* puts

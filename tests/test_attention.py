@@ -1,6 +1,5 @@
-"""The attention backend option: auto is plain SDPA, a pinned backend runs through sdpa_kernel, a rejected call falls
-back to auto with one warning, and an unknown name is refused."""
-import logging
+"""The attention backend option: auto is PyTorch's own pick, a chosen backend goes first in PyTorch's priority order
+with every other one still enabled (a call it cannot take runs on the next), and an unknown name is refused."""
 import sys
 from pathlib import Path
 
@@ -43,11 +42,24 @@ def test_backends_match_plain_sdpa_and_unknown_names_are_refused():
         A.set_backend("sage")
 
 
-def test_rejected_backend_falls_back_to_auto(caplog):
+def test_a_call_the_first_backend_cannot_take_runs_on_the_next():
     torch.manual_seed(0)
     q, k, v = (torch.randn(1, 4, 9, 16) for _ in range(3))
-    A.set_backend("cudnn")  # cuDNN attention needs CUDA tensors: the CPU call is rejected
-    with caplog.at_level(logging.WARNING, logger="rulztrainer"):
-        out = A.sdpa(q, k, v)
-    assert torch.equal(out, F.scaled_dot_product_attention(q, k, v))
-    assert A.backend_name() == "torch" and "rejected" in caplog.text
+    A.set_backend("cudnn")  # cuDNN attention needs CUDA tensors: the CPU call runs on the next backend
+    assert torch.equal(A.sdpa(q, k, v), F.scaled_dot_product_attention(q, k, v))
+    assert A.backend_name() == "cudnn"
+
+
+def test_choosing_a_backend_leaves_every_other_one_enabled():
+    """The choice is PyTorch's priority order, never its global enable flags: with samples and probes rendering on
+    several GPUs in threads, a per-call sdpa_kernel(cudnn) disabled the other backends for every thread, and Krea 2's
+    fp32 VAE attention in another thread failed with "No available kernel"."""
+    for name in ("cudnn", "flash", "efficient", "math", "torch"):
+        A.set_backend(name)
+        assert torch.backends.cuda.flash_sdp_enabled() and torch.backends.cuda.mem_efficient_sdp_enabled()
+        assert torch.backends.cuda.math_sdp_enabled() and torch.backends.cuda.cudnn_sdp_enabled()
+        order = torch._C._get_sdp_priority_order()
+        assert sorted(order) == sorted(A._DEFAULT_ORDER)
+        if name != "torch":
+            assert order[0] == int(A.BACKENDS[name])
+    assert torch._C._get_sdp_priority_order() == A._DEFAULT_ORDER  # "torch": PyTorch's own order again

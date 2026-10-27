@@ -506,9 +506,12 @@ samples on your own data before using it for a final run.
 ### Attention kernel (`attention_backend`)
 
 The DiT blocks run PyTorch's scaled-dot-product attention. `torch` lets PyTorch pick the kernel (flash where it
-can); `cudnn`, `flash`, `efficient` and `math` pin one; `auto` (the default) pins cuDNN on a Blackwell training GPU
-(RTX 50, B200; ai-toolkit pins it there too) and lets PyTorch pick elsewhere. A pinned kernel that rejects a call (a
-mask or dtype it does not take) falls back to PyTorch's pick for the rest of the run with one warning. Measured on
+can); `cudnn`, `flash`, `efficient` and `math` put one first; `auto` (the default) puts cuDNN first on a Blackwell
+training GPU (RTX 50, B200; ai-toolkit uses it there too) and lets PyTorch pick elsewhere. The choice is PyTorch's
+process-wide priority order, so every other kernel stays enabled behind the chosen one and a call it does not take (a
+mask, dtype or head size) runs on the next. Until v2.3.1 the choice switched the other kernels off during each DiT call,
+which broke a VAE decode running in another thread at that moment (samples and probes split over two GPUs): Krea 2's
+fp32 VAE attention found no kernel enabled ("No available kernel"). Measured on
 the RTX 5060 Ti, 1 MP, batch 1, 20 steps (median of steps 6-20), two runs each:
 
 | model | PyTorch's pick | cuDNN | loss (both) | peak memory (both) |
