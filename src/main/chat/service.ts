@@ -10,6 +10,7 @@ import type {
 import type { InstanceManager } from '../engine/instances'
 import { fitToContext, IMAGE_TOKENS, imageCount, textOf, type ContextApi } from './context'
 import { errorFromBody, interpretChunk, SseParser, statsFromTimings, ToolCallAccumulator } from './sse'
+import { jsonifyToolCallArgs, templateStringifiesArgs } from './toolArgs'
 
 export function buildRequestBody(
   alias: string,
@@ -66,6 +67,20 @@ export class ChatService {
     /** Tool definitions (and, in on-demand mode, a system note) for a request's tool selection. */
     private readonly getTools: (req: ToolRequest) => ToolSet = () => ({ defs: [] })
   ) {}
+
+  /** Per loaded instance: does its chat template print tool-call arguments in Python form? */
+  private argQuirk = new Map<string, Promise<boolean>>()
+
+  private stringifiesArgs(instance: LoadedInstance): Promise<boolean> {
+    let p = this.argQuirk.get(instance.instanceId)
+    if (!p) {
+      p = fetch(`${this.instances.baseUrl(instance)}/props`, { signal: AbortSignal.timeout(10000) })
+        .then(async (r) => (r.ok ? templateStringifiesArgs(((await r.json()) as { chat_template?: string }).chat_template) : false))
+        .catch(() => false)
+      this.argQuirk.set(instance.instanceId, p)
+    }
+    return p
+  }
 
   private toolSet(req: ToolRequest | null | undefined): ToolSet {
     return req ? this.getTools(req) : { defs: [] }
@@ -175,6 +190,12 @@ export class ChatService {
           Math.floor(inst.contextLength / 3)
         )
         messages = await fitToContext(messages, inst.contextLength, reserve, req.overflow, api)
+      }
+
+      // Some templates print earlier tool arguments as Python lists; send them as JSON text instead
+      // so the model keeps writing JSON the server can parse.
+      if (messages.some((m) => m.tool_calls?.length) && (await this.stringifiesArgs(inst))) {
+        messages = jsonifyToolCallArgs(messages)
       }
 
       const body = buildRequestBody(inst.modelName, messages, req.sampling, req.disableThinking)

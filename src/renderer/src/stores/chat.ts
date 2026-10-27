@@ -360,6 +360,12 @@ export const useChat = create<ChatState>((set, get) => {
     return evicted
   }
 
+  /** Tool names from a list, or from text such as "a, b" or "['a', 'b']" that some models send. */
+  const toolNameList = (value: unknown): string[] => {
+    const raw = Array.isArray(value) ? value.map(String) : typeof value === 'string' ? value.split(/[\s,;]+/) : []
+    return raw.map((n) => n.replace(/^[\s[\]'"`]+|[\s[\]'"`]+$/g, '')).filter(Boolean)
+  }
+
   /** Runs one of the built-in loader tools; these change chat state only, so they need no approval. */
   const runMetaTool = (call: ToolCall): ToolResult => {
     let args: { query?: string; limit?: number; names?: unknown } = {}
@@ -380,8 +386,13 @@ export const useChat = create<ChatState>((set, get) => {
         isError: false
       }
     }
-    const names = Array.isArray(args.names) ? args.names.map(String) : typeof args.names === 'string' ? [args.names] : []
-    if (!names.length) return { text: 'Pass the tool names to load or unload in "names".', isError: true }
+    const names = toolNameList(args.names)
+    if (!names.length) {
+      return {
+        text: 'No tool names arrived: "names" was empty. Pass a JSON list with double quotes, for example ["analyze_javascript_application"].',
+        isError: true
+      }
+    }
     const resolved = names.map((n) => ({ n, t: resolveTool(tools, n) }))
     const unknown = resolved.filter((r) => !r.t).map((r) => {
       const guess = searchTools(tools, r.n, 3).map((h) => h.name)

@@ -1,3 +1,4 @@
+import { jsonifyToolCallArgs, templateStringifiesArgs } from '../src/main/chat/toolArgs'
 import { describe, expect, it } from 'vitest'
 import { DEFAULT_SAMPLING } from '@shared/defaults'
 import type { WireMessage } from '@shared/types'
@@ -64,5 +65,37 @@ describe('context fitting', () => {
     expect(fitted.map((m) => m.content)).toEqual(['sys', 'first', 'a2', 'last'])
     await expect(fitToContext(msgs, 500, 100, 'stop', api)).rejects.toBeInstanceOf(ContextFullError)
     expect(await fitToContext(msgs, 10000, 100, 'stop', api)).toBe(msgs)
+  })
+})
+
+describe('tool-call arguments for templates that print Python values', () => {
+  const qwenCoder =
+    "{{- '<parameter=' + args_name + '>\n' }}{%- set args_value = args_value if args_value is string else args_value | string %}{{- args_value }}"
+  const fixed =
+    "{{- '<parameter=' + args_name + '>\n' }}{%- set args_value = args_value | tojson | safe if args_value is mapping else args_value | string %}"
+
+  it('spots only the XML-parameter templates that use | string', () => {
+    expect(templateStringifiesArgs(qwenCoder)).toBe(true)
+    expect(templateStringifiesArgs(fixed)).toBe(false)
+    expect(templateStringifiesArgs('{{ tool_call.arguments | tojson }}')).toBe(false)
+    expect(templateStringifiesArgs(undefined)).toBe(false)
+  })
+
+  it('turns non-string values into JSON text and leaves the rest alone', () => {
+    const out = jsonifyToolCallArgs([
+      { role: 'user', content: 'hi' },
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [
+          { id: 'a', type: 'function', function: { name: 'load', arguments: '{"names":["x","y"],"deep":true,"path":"C:\\\\a"}' } },
+          { id: 'b', type: 'function', function: { name: 'bad', arguments: 'not json' } }
+        ]
+      }
+    ])
+    const calls = out[1].tool_calls!
+    expect(JSON.parse(calls[0].function.arguments)).toEqual({ names: '["x","y"]', deep: 'true', path: 'C:\\a' })
+    expect(calls[1].function.arguments).toBe('not json')
+    expect(out[0]).toEqual({ role: 'user', content: 'hi' })
   })
 })
