@@ -62,6 +62,8 @@ RACE_KEYS: dict[str, tuple[str, ...]] = {
         "network_type", "lokr_factor", "oft_block_size", "oft_constraint", "dora"),
     "Data & augmentation": ("caption_dropout", "flip_augment", "crop_augment", "crop_augment_weight", "look_warmup",
                             "look_warmup_start", "look_warmup_epochs"),
+    # read at every step: the run needs isolation on (the pairs and DOP captions are prepared once for everyone)
+    "LoRA Isolation": ("dop_weight", "dop_every"),
     "Self-training": ("selftrain", "selftrain_at", "selftrain_images", "selftrain_min_likeness", "selftrain_share",
                       "selftrain_weight"),
     # a row's own seed gives it its own LoRA initialisation, image order and noise: seed twins for a seed soup

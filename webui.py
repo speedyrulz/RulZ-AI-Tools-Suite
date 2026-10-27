@@ -2639,6 +2639,7 @@ RACE_LABELS = {
     "look_warmup": "Look warm-up", "selftrain": "Self-training", "selftrain_at": "Self-training at",
     "selftrain_images": "Self-training pictures", "selftrain_min_likeness": "Self-training likeness floor",
     "selftrain_share": "Self-training share", "selftrain_weight": "Self-training weight", "seed": "Seed",
+    "dop_weight": "DOP weight (LoRA Isolation)", "dop_every": "DOP every N steps (LoRA Isolation)",
 }
 
 

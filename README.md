@@ -1036,8 +1036,10 @@ race_configs:
 
 A configuration may change the learning rate and optimizer settings, the timestep sampling and loss settings
 (including region weights, the identity loss and the curriculum), the LoRA rank, alpha, targets, blocks and dropout,
-and caption dropout, flips and crop augmentation (the full list is `race.RACE_KEYS`); the model, quantization, GPUs,
-dataset, resolutions and probes are shared. The comparison is kept fair: every configuration starts from the same
+caption dropout, flips and crop augmentation, and LoRA Isolation's DOP weight and interval when the run has isolation
+on (the full list is `race.RACE_KEYS`, also under *What a configuration may change* in the WebUI); the model,
+quantization, GPUs, dataset, resolutions, probes, batch size and the training adapter are shared: they are set up once
+for every configuration (images, batches, model copies), so they cannot differ per row. The comparison is kept fair: every configuration starts from the same
 LoRA initialisation for its shape, sees the same images in the same order with the same noise, and is probed at the
 same own step with the same seeds. The trainer keeps one set of LoRA wrappers over every configuration's layers;
 switching parks the outgoing configuration's weights, optimizer state and weight average on the CPU, so only the
