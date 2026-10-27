@@ -1,0 +1,23 @@
+appId: com.rulz.codingagent
+productName: RulZ Coding Agent
+directories:
+  buildResources: build
+  output: dist
+files:
+  - out/**
+  - package.json
+  - '!**/*.map'
+win:
+  icon: build/icon.ico
+  target:
+    - target: nsis
+      arch: [x64]
+  artifactName: RulZ-Coding-Agent-Setup-${version}.${ext}
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  shortcutName: RulZ Coding Agent
+  uninstallDisplayName: RulZ Coding Agent
+npmRebuild: false
