@@ -18,7 +18,11 @@ describe('catalog', () => {
 
   it.each(CATALOG.map((a) => [a.id, a] as const))('%s has valid install patterns', (_id, app) => {
     const spec = app.install
-    if (spec.kind !== 'source') expect(() => new RegExp(spec.asset)).not.toThrow()
+    if (spec.kind !== 'source') {
+      // A file name built from the pattern ("[\\d.]+" -> "1.2.3") must match it; a lost backslash breaks this.
+      const sample = spec.asset.replace('[\\d.]+', '1.2.3').replace(/\\./g, '.').replace(/^\^|\$$/g, '')
+      expect(new RegExp(spec.asset, 'i').test(sample), sample).toBe(true)
+    }
     for (const c of app.components ?? []) for (const p of c.assets) expect(() => new RegExp(p)).not.toThrow()
     expect(app.launch.target).not.toMatch(/^[\\/]|^[a-z]:/i)
   })

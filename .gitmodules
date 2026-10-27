@@ -16,3 +16,6 @@
 [submodule "apps/rulz-simple-video-clip-extractor"]
 	path = apps/rulz-simple-video-clip-extractor
 	url = https://github.com/speedyrulz/rulz-simple-video-clip-extractor.git
+[submodule "apps/rulz-coding-agent"]
+	path = apps/rulz-coding-agent
+	url = https://github.com/speedyrulz/rulz-coding-agent.git

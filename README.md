@@ -21,6 +21,7 @@ click, keep it updated, and launch it, all from a single black-and-red window (o
 | [RulZ Image Organizer](https://github.com/speedyrulz/RulZ-Image-Organizer) | Offline face grouping and search for your photo library | Portable release zip |
 | [RulZ Image Tournament](https://github.com/speedyrulz/RulZ-Image-Tournament) | Finds your favorite image, two at a time | Portable release zip (a single .exe) |
 | [RulZ LLM Suite](https://github.com/speedyrulz/rulz-llm-suite) | Local LLMs with llama.cpp: models, chat, MCP tools, API server | Its setup program, run silently |
+| [RulZ Coding Agent](https://github.com/speedyrulz/rulz-coding-agent) | Describe an app in plain English and a local model builds it (works with the LLM Suite) | Its setup program, run silently |
 | [Rulz Training Captioner](https://github.com/speedyrulz/Rulz-Training-Captioner) | Captions image datasets with a local vision LLM | From source (venv), plus an optional llama.cpp CUDA build |
 | [RulZ Simple Video Clip Extractor](https://github.com/speedyrulz/rulz-simple-video-clip-extractor) | Frame-accurate clips with lossless cuts and NVENC export | Portable release zip |
 

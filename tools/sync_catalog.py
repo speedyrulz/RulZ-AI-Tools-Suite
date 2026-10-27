@@ -26,6 +26,7 @@ APPS = {
     "image-organizer": ("speedyrulz/RulZ-Image-Organizer", "main", "assets/icon.png", "assets/icon.ico"),
     "image-tournament": ("speedyrulz/RulZ-Image-Tournament", "main", "assets/app.png", "assets/app.ico"),
     "llm-suite": ("speedyrulz/rulz-llm-suite", "master", "build/icon.png", "build/icon.ico"),
+    "coding-agent": ("speedyrulz/rulz-coding-agent", "master", "build/icon.png", "build/icon.ico"),
     "training-captioner": ("speedyrulz/Rulz-Training-Captioner", "main", "assets/icon.png", "assets/icon.ico"),
     "clip-extractor": ("speedyrulz/rulz-simple-video-clip-extractor", "main", "simplecut/assets/icon256.png",
                        "simplecut/assets/icon.ico"),

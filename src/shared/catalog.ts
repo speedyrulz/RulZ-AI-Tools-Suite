@@ -94,6 +94,32 @@ export const CATALOG: CatalogApp[] = [
     highlights: ['GGUF model library', 'Chat with tools (MCP)', 'Speculative decoding', 'Local OpenAI/Anthropic API']
   },
   {
+    id: 'coding-agent',
+    name: 'RulZ Coding Agent',
+    tagline: 'Describe an app in plain English and a local AI model builds it',
+    description:
+      'Type what you want ("make a video upscaler with a drag-and-drop window") and a local model creates the files, ' +
+      'installs what is needed, runs the app, reads the errors and fixes them, asking for your OK before risky steps. ' +
+      'Every task can be undone. It talks to RulZ LLM Suite, so nothing leaves your computer.',
+    category: 'LLM',
+    repo: 'speedyrulz/rulz-coding-agent',
+    branch: 'master',
+    install: {
+      kind: 'installer',
+      asset: '^RulZ-Coding-Agent-Setup-[\\d.]+\\.exe$',
+      uninstallName: 'RulZ Coding Agent',
+      shortcutName: 'RulZ Coding Agent'
+    },
+    launch: { target: 'RulZ Coding Agent.exe' },
+    requirements: [{ id: 'git', optional: true, note: 'Lets Undo keep full restore points' }],
+    folderName: 'RulZ Coding Agent',
+    notes: [
+      'Needs a model server: in RulZ LLM Suite open the Developer page and start the server (Qwen3-Coder works best).',
+      'Installs with its own setup program (silently), and can be removed from Windows Settings too.'
+    ],
+    highlights: ['Plain-English app building', 'Asks before risky steps', 'Undo last task', 'Runs fully local']
+  },
+  {
     id: 'training-captioner',
     name: 'Rulz Training Captioner',
     tagline: 'Captions image datasets with a local vision LLM',
