@@ -989,7 +989,8 @@ from before the history existed are imported from their job folders when the tab
 
 Tick any number of runs in the table (name, start, state, steps, adapter, learning rate, last and best scores) to
 overlay them: one colour per run, solid lines for the face, dashed for the body and thick for the combined score, with
-checkboxes to show only some of the three. A race run draws each configuration's probe lines in its own colour, named
+a *Show lines (all runs)* bar of Face / Body / Combined chips above each chart: switch one off to hide that line of
+every ticked run at once, and on again to bring it back. A race run draws each configuration's probe lines in its own colour, named
 after it (`<run> lora16 - face`; the winner's after the race: `winner`); *Import old runs* adds that split to race runs
 saved before it existed, while their job folder is still there. *Rename* gives a run a name of your own and *Remove from history* deletes
 its history file only (never the job folder). A run that is still training updates live.

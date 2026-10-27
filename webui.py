@@ -1463,6 +1463,18 @@ body {
 .rz-strong { color: var(--rz-heading); }
 .rz-header-row, .rz-footer-row { color: var(--rz-text); }  /* the header and footer bars carry Quasar text-white */
 .rz-rec .q-btn { color: var(--rz-text-3); }
+/* file buttons (saved LoRAs, the likeness spreadsheet): legible text on a surface pill, the icon in red */
+.q-btn.rz-file-btn { background: var(--rz-surface-2); color: var(--rz-text); border: 1px solid var(--rz-border-strong);
+  font-size: 13px; font-weight: 600; padding: 4px 12px; min-height: 32px; }
+.q-btn.rz-file-btn .q-icon { color: var(--rz-red-bright); font-size: 18px; }
+.q-btn.rz-metric-chip { color: var(--rz-muted); border: 1px solid var(--rz-border-strong); border-radius: 999px;
+  padding: 2px 14px; min-height: 30px; font-size: 13px; }
+.q-btn.rz-metric-chip .q-btn__content { gap: 8px; flex-wrap: nowrap; }
+.q-btn.rz-metric-chip.rz-on { color: var(--rz-text); background: var(--rz-red-soft); border-color: var(--rz-red); }
+.rz-line { display: inline-block; width: 22px; border-top: 2px solid currentColor; }
+.rz-line-dashed { border-top-style: dashed; }
+.rz-line-thick { border-top-width: 4px; }
+.q-btn.rz-file-btn:hover { border-color: var(--rz-red); background: var(--rz-red-soft); }
 .rz-light-only { display: none !important; }
 html[data-theme="light"] .rz-light-only { display: inline-flex !important; }
 html[data-theme="light"] .rz-dark-only { display: none !important; }
@@ -4390,7 +4402,8 @@ def history_series(runs: list[dict], part: str, metrics: list[str]) -> list[dict
         data = r.get(part) or {}
         racers = data.get("racers") if part == "probes" else None
         # a race: each configuration's own lines in its own colour ("<run> lora16 - face"), else the run's
-        groups = [(f"{history_label(r)} {name}", d) for name, d in racers.items()] if racers else             [(history_label(r), data)]
+        groups = [(f"{history_label(r)} {name}", d) for name, d in racers.items()] if racers else \
+            [(history_label(r), data)]
         for label, d in groups:
             color = HISTORY_COLORS[n_color % len(HISTORY_COLORS)]
             n_color += 1
@@ -4402,6 +4415,41 @@ def history_series(runs: list[dict], part: str, metrics: list[str]) -> list[dict
                             "showSymbol": part == "identity", "symbolSize": 6, "itemStyle": {"color": color},
                             "lineStyle": {"color": color, "width": 2, **styles[metric]}})
     return out
+
+
+METRIC_LINE = {"face": "solid", "body": "dashed", "combined": "thick"}  # history_series' line style per metric
+
+
+class MetricChip:
+    """An on/off chip for one metric's lines on a Previous Runs chart, for every ticked run at once (`.value` like a
+    checkbox's)."""
+
+    def __init__(self, metric: str, on_change):
+        self.value = True
+        self._on_change = on_change
+        self.button = ui.button(on_click=self.toggle, color=None).props("flat no-caps").classes("rz-metric-chip")
+        with self.button:
+            ui.html(f'<span class="rz-line rz-line-{METRIC_LINE[metric]}"></span>')
+            ui.label(metric.capitalize())
+        self.button.tooltip(f"Show or hide the {metric} line of every ticked run")
+        self._paint()
+
+    def _paint(self):
+        if self.value:
+            self.button.classes(add="rz-on")
+        else:
+            self.button.classes(remove="rz-on")
+
+    def toggle(self):
+        self.value = not self.value
+        self._paint()
+        self._on_change()
+
+
+def metric_chips(metrics, on_change) -> dict[str, MetricChip]:
+    """A "Show lines (all runs)" row of MetricChips: {metric: chip}."""
+    ui.label("Show lines (all runs):").classes("text-sm font-medium")
+    return {m: MetricChip(m, on_change) for m in metrics}
 
 
 PROBE_SETTING_KEYS = ("probe_face_prompt", "probe_body_prompt", "probe_seed", "probe_size", "probe_steps", "probe_cfg",
@@ -4638,14 +4686,13 @@ def build_history_tab(charts: list):
             compare = hint("")
     with section("Identity similarity", "Mean face and mean body score of the sample images", "face"):
         with ui.row().classes("items-center gap-3"):
-            id_metrics = {m: ui.checkbox(m, value=True, on_change=lambda _: draw()) for m in ("face", "body")}
+            id_metrics = metric_chips(("face", "body"), lambda: draw())
             id_empty = hint("")
         id_chart = ui.echart(chart_options(_axis("step", min="dataMin"), _axis("similarity %", min=0), [],
                                            [])).classes("w-full h-72")
     with section("Likeness probes & controller", "Smoothed face, body and combined score of the probes", "show_chart"):
         with ui.row().classes("items-center gap-3"):
-            probe_metrics = {m: ui.checkbox(m, value=True, on_change=lambda _: draw())
-                             for m in ("face", "body", "combined")}
+            probe_metrics = metric_chips(("face", "body", "combined"), lambda: draw())
             probe_empty = hint("")
         probe_chart_h = ui.echart(chart_options(_axis("step", min="dataMin"), _axis("likeness %", min=0),
                                                 [], [])).classes("w-full h-72")
@@ -6356,7 +6403,9 @@ def build_page(local: bool = True):
                             ui.download(f"/rz-likeness-xlsx?job={quote(str(Path(_job_dir).resolve()))}",
                                         f"{Path(_job_dir).name}_likeness.xlsx")
 
-                        ui.button("Export spreadsheet", icon="table_view", on_click=export_likeness)                             .props("outline dense no-caps size=sm")                             .tooltip("Every probe's face, body and combined score so far, smoothed and per probe, as "
+                        ui.button("Export spreadsheet", icon="table_view", on_click=export_likeness, color=None) \
+                            .props("flat no-caps").classes("rz-file-btn") \
+                            .tooltip("Every probe's face, body and combined score so far, smoothed and per probe, as "
                                      "an Excel file: the scores are formulas of the raw ones and the run's scale "
                                      "(floors, references' level, span, curve, weights) on its own sheet, so you can "
                                      "rescore. In a race each configuration gets its own sheets.")
@@ -6395,7 +6444,9 @@ def build_page(local: bool = True):
                         ui.label("Download:").classes("rz-hint")
                     for p, size in rows:
                         ui.button(f"{Path(p).name} ({size / 2**20:.0f} MB)", icon="download",
-                                  on_click=lambda _, q=p: ui.download(lora_url(q), Path(q).name))                             .props("outline dense no-caps size=sm")                             .tooltip("Save this LoRA to this computer (useful when the WebUI runs remotely)")
+                                  on_click=lambda _, q=p: ui.download(lora_url(q), Path(q).name), color=None) \
+                            .props("flat no-caps").classes("rz-file-btn") \
+                            .tooltip("Save this LoRA to this computer (useful when the WebUI runs remotely)")
 
             log_state = {"job": None, "n": 0, "console_shown": False}
             show_full = image_viewer()
