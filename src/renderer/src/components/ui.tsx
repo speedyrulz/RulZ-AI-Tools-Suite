@@ -105,16 +105,19 @@ export function Switch({
   checked,
   onCheckedChange,
   disabled,
-  id
+  id,
+  label
 }: {
   checked: boolean
   onCheckedChange: (v: boolean) => void
   disabled?: boolean
   id?: string
+  label?: string
 }) {
   return (
     <SwitchPrimitive.Root
       id={id}
+      aria-label={label}
       checked={checked}
       onCheckedChange={onCheckedChange}
       disabled={disabled}

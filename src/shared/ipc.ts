@@ -4,10 +4,13 @@ import type {
   AppSettings,
   ConnectionInfo,
   FileDiff,
+  FolderListing,
   ModelActivity,
   ProjectInfo,
   ProjectState,
   PromptAnswer,
+  RemotePairing,
+  RemoteStatus,
   RunEvent,
   RunState,
   ToolServersInfo
@@ -34,12 +37,23 @@ export interface IpcInvoke {
   'dialog:pickFolder': (opts: { title?: string; defaultPath?: string }) => string | null
   'shell:showItem': (path: string) => void
   'shell:openUrl': (url: string) => void
+  /** Subfolders of a folder (the drives when `path` is empty), for choosing a folder from the phone. */
+  'fs:listFolders': (path: string) => FolderListing
+
+  /** Phone access over Tailscale (only from this computer, never from the phone). */
+  'remote:status': () => RemoteStatus
+  'remote:setEnabled': (enabled: boolean) => RemoteStatus
+  'remote:pairing': () => RemotePairing
+  /** Makes a new pairing code; phones using the old one are disconnected. */
+  'remote:newToken': () => RemotePairing
 
   /** Finds RulZ LLM Suite (current address, then 1234 / 1235) and lists its models. */
   'server:connect': () => ConnectionInfo
   'server:status': () => ConnectionInfo
 
   'projects:recent': () => ProjectInfo[]
+  /** The project open right now, if any (the phone picks up where the computer is). */
+  'projects:current': () => ProjectState | null
   'projects:create': (name: string, parentDir: string | null) => ProjectState
   'projects:open': (path: string) => ProjectState
   'projects:forget': (path: string) => ProjectInfo[]
@@ -76,6 +90,9 @@ export interface IpcEvents {
   'agent:event': AgentEvent
   'run:event': RunEvent
   'tools:changed': ToolServersInfo
+  /** The open project changed (opened, closed or undone, possibly from the phone), so every screen follows. */
+  'project:changed': ProjectState | null
+  'remote:changed': RemoteStatus
 }
 
 export type InvokeChannel = keyof IpcInvoke

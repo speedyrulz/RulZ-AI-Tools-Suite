@@ -30,6 +30,11 @@ export const useApp = create<AppState>((set, get) => ({
     applyTheme(settings.theme)
     on('server:changed', (connection) => set({ connection }))
     on('model:activity', (activity) => set({ activity }))
+    let phones = new Set<string>()
+    on('remote:changed', (status) => {
+      for (const c of status.clients) if (!phones.has(c.id)) toast.info(`${c.device} connected. It can see and control your projects.`)
+      phones = new Set(status.clients.map((c) => c.id))
+    })
     if (connection.status === 'checking') void get().reconnect()
   },
 

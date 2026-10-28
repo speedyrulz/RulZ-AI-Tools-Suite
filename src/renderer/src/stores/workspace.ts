@@ -55,8 +55,21 @@ interface WorkspaceState {
 const updateTask = (tasks: TaskRecord[], id: string, fn: (t: TaskRecord) => TaskRecord): TaskRecord[] =>
   tasks.map((t) => (t.id === id ? fn(t) : t))
 
+const CLOSED = {
+  project: null,
+  timeline: [],
+  tasks: [],
+  running: false,
+  prompt: null,
+  run: null,
+  memory: '',
+  context: null,
+  status: { phase: 'idle' }
+} satisfies Partial<WorkspaceState>
+
 export const useWorkspace = create<WorkspaceState>((set, get) => {
-  const apply = (state: ProjectState): void => {
+  /** Shows a project's state; for the project already shown, `same` keeps the selected task and the live status. */
+  const apply = (state: ProjectState, same = false): void => {
     set({
       project: state.project,
       timeline: state.timeline,
@@ -66,8 +79,8 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       runCommand: state.runCommand,
       memory: state.memory,
       context: state.context,
-      status: { phase: state.running ? 'working' : 'idle', text: 'Working…' } as AgentStatus,
-      selectedTaskId: null
+      status: same && state.running ? get().status : ({ phase: state.running ? 'working' : 'idle', text: 'Working…' } as AgentStatus),
+      selectedTaskId: same ? get().selectedTaskId : null
     })
     void invoke('run:state', state.project.path).then((run) => set({ run }), () => undefined)
   }
@@ -143,6 +156,12 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     else set((s) => (s.run ? { run: { ...s.run, output: (s.run.output + e.chunk).slice(-100_000) } } : {}))
   })
 
+  // The open project can change from the phone app (or after Undo); every screen follows it.
+  on('project:changed', (state) => {
+    if (state) apply(state, isMine(state.project.path))
+    else if (get().project) set(CLOSED)
+  })
+
   return {
     project: null,
     timeline: [],
@@ -179,7 +198,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     close: async () => {
       try {
         await invoke('projects:close')
-        set({ project: null, timeline: [], tasks: [], running: false, prompt: null, run: null, memory: '', context: null, status: { phase: 'idle' } })
+        set(CLOSED)
       } catch (e) {
         toast.error(errorMessage(e))
       }

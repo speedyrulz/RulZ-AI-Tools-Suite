@@ -1,9 +1,10 @@
 // Drives the built app with Playwright against the mock RulZ server.
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { _electron as electron, type ElectronApplication, type Page } from 'playwright-core'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { WebSocket } from 'ws'
 import { fakeToolConfig } from '../helpers/fakeTools'
 import { startMockRulz, type MockTurn } from '../helpers/mockRulz'
 
@@ -18,12 +19,13 @@ let page: Page
 let mock: Awaited<ReturnType<typeof startMockRulz>>
 
 const call = (name: string, args: unknown) => ({ name, args })
+const PHONE_PORT = 7431
 
 beforeAll(async () => {
   mkdirSync(userData, { recursive: true })
   mkdirSync(projectsDir, { recursive: true })
   mkdirSync(shots, { recursive: true })
-  writeFileSync(join(userData, 'settings.json'), JSON.stringify({ projectsDir }))
+  writeFileSync(join(userData, 'settings.json'), JSON.stringify({ projectsDir, remotePort: PHONE_PORT }))
   // The share task is answered by what it asks, not by position: the "slow" task below may be
   // stopped before its request reaches the server, which would shift every later turn.
   const shareTurns = {
@@ -64,6 +66,7 @@ beforeAll(async () => {
       RULZ_AGENT_USER_DATA: userData,
       RULZ_AGENT_CANDIDATES: mock.url,
       RULZ_AGENT_MCP_CONFIG: fakeToolConfig(base),
+      RULZ_AGENT_REMOTE_HOST: '127.0.0.1',
       ELECTRON_RENDERER_URL: ''
     }
   })
@@ -211,6 +214,47 @@ describe('RulZ Coding Agent', () => {
     const system = request.body.messages![0].content
     expect(system).toContain('Use blue, not purple.')
     expect(system).toContain('Explain things briefly.')
+  })
+
+  it('lets the phone app connect, and follows what it opens and closes', async () => {
+    await page.getByRole('button', { name: 'Settings' }).click()
+    await page.getByRole('switch', { name: 'Let my phone connect' }).click()
+    await page.getByRole('img', { name: 'QR code for pairing the phone app' }).waitFor()
+    await page.screenshot({ path: join(shots, '7-phone-access.png') })
+    const { remoteToken } = JSON.parse(readFileSync(join(userData, 'settings.json'), 'utf8')) as { remoteToken: string }
+    expect(remoteToken.length).toBeGreaterThan(20)
+
+    // A stand-in for the phone app.
+    const ws = new WebSocket(`ws://127.0.0.1:${PHONE_PORT}/rulz`)
+    const replies = new Map<string, (m: { ok: boolean; value: unknown; error?: string }) => void>()
+    let welcomed!: () => void
+    const welcome = new Promise<void>((r) => (welcomed = r))
+    ws.on('message', (d) => {
+      const m = JSON.parse(d.toString())
+      if (m.t === 'welcome') welcomed()
+      if (m.t === 'result') replies.get(m.id)?.(m)
+    })
+    await new Promise((r) => ws.once('open', r))
+    ws.send(JSON.stringify({ t: 'hello', token: remoteToken, device: 'Test Phone' }))
+    await welcome
+    let n = 0
+    const phone = (channel: string, ...args: unknown[]): Promise<{ ok: boolean; value: unknown; error?: string }> => {
+      const id = String(n++)
+      ws.send(JSON.stringify({ t: 'invoke', id, channel, args }))
+      return new Promise((r) => replies.set(id, r))
+    }
+    await page.getByText('Test Phone connected').first().waitFor()
+    await page.getByRole('dialog').getByText('Test Phone').first().waitFor()
+    await page.keyboard.press('Escape')
+
+    expect(await phone('settings:get')).toMatchObject({ ok: true, value: { remoteToken: '' } })
+    expect((await phone('projects:create', 'Phone Made', null)).ok).toBe(true)
+    await page.getByText('What should I build in “Phone Made”?').waitFor()
+    expect((await phone('projects:close')).ok).toBe(true)
+    await page.getByRole('heading', { name: 'Your projects' }).waitFor()
+    expect((await phone('projects:open', join(projectsDir, 'E2E App'))).ok).toBe(true)
+    await page.getByText('Your app is packaged:').waitFor()
+    ws.close()
   })
 
   it('switches to the light theme', async () => {

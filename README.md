@@ -64,6 +64,23 @@ The light look is one click away: use the sun/moon button in the top bar (or **S
   projects. **Show my built-in instructions** displays the fixed part they're added to (it holds the tool and
   safety rules, so it can't be replaced).
 
+## Phone access
+
+Watch and control your projects from your Android phone with
+[RulZ Coding Agent for Android](https://github.com/speedyrulz/rulz-coding-agent-android): give it tasks, answer
+approvals, follow the steps and changed files, run your app and undo, while everything still runs here.
+
+1. Install [Tailscale](https://tailscale.com) on this computer and the phone, signed in to the same account.
+2. **Settings > Phone access**: turn on **Let my phone connect**. The first time, Windows may ask whether RulZ Coding
+   Agent may use your networks: allow it.
+3. Scan the QR code with the phone's camera (or type the address, port and pairing code into the app).
+
+Settings lists the phones connected now, and this window follows what the phone opens, closes or undoes. The app
+listens only on this computer's Tailscale address (port 7420), so only your own devices can reach it; each connection
+needs the pairing code, 10 wrong codes lock a device out for 10 minutes, and **Make a new code** disconnects every
+phone using the old one. The phone can do what this window does, except change phone access, the RulZ LLM Suite
+address and API key, open dialogs, the browser or Explorer here.
+
 ## Approvals
 
 | Level | Asks before |

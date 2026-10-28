@@ -23,6 +23,11 @@ export interface AppSettings {
   /** The owner's own instructions, added to the system prompt in every project. */
   instructions: string
   firstRunDone: boolean
+  /** Lets the RulZ Coding Agent phone app connect over Tailscale. */
+  remoteEnabled: boolean
+  remotePort: number
+  /** Secret the phone sends to connect; made the first time phone access is turned on. */
+  remoteToken: string
 }
 
 // ---------- Connection to RulZ LLM Suite ----------
@@ -275,3 +280,42 @@ export interface WireMessage {
 /** Omit that works on each member of a union separately. */
 export type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never
 
+
+// ---------- Phone access (over Tailscale) ----------
+
+export interface RemoteClient {
+  id: string
+  /** What the phone calls itself, e.g. "Pixel 9". */
+  device: string
+  address: string
+  since: number
+}
+
+export interface RemoteStatus {
+  enabled: boolean
+  state: 'off' | 'starting' | 'on' | 'no-tailscale' | 'error'
+  port: number
+  /** This computer's Tailscale addresses (IPv4). */
+  addresses: string[]
+  /** This computer's Tailscale (MagicDNS) name, when known. */
+  dnsName?: string
+  clients: RemoteClient[]
+  error?: string
+}
+
+/** What the phone needs to connect: a link (also shown as a QR code) and the parts to type by hand. */
+export interface RemotePairing {
+  url: string
+  qrSvg: string
+  host: string
+  port: number
+  token: string
+}
+
+/** One folder's subfolders, for choosing a folder from the phone. */
+export interface FolderListing {
+  /** Empty for the list of drives. */
+  path: string
+  parent: string | null
+  folders: string[]
+}

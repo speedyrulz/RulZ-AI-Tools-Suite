@@ -20,7 +20,10 @@ const schema = z.object({
     .string()
     .transform((s) => s.trim().slice(0, MAX_INSTRUCTION_CHARS))
     .catch(D.instructions),
-  firstRunDone: z.boolean().catch(D.firstRunDone)
+  firstRunDone: z.boolean().catch(D.firstRunDone),
+  remoteEnabled: z.boolean().catch(D.remoteEnabled),
+  remotePort: z.number().int().min(1024).max(65535).catch(D.remotePort),
+  remoteToken: z.string().catch(D.remoteToken)
 })
 
 export function parseSettings(raw: unknown): AppSettings {

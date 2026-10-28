@@ -1,16 +1,18 @@
 import { promises as fs } from 'node:fs'
-import { basename, join, resolve } from 'node:path'
+import { hostname } from 'node:os'
+import { basename, dirname, join, resolve } from 'node:path'
 import { app, BrowserWindow, dialog, nativeTheme, shell } from 'electron'
 import { CANDIDATE_URLS } from '@shared/defaults'
-import type { ConnectionInfo, ModelActivity, ProjectInfo, ProjectState, Theme, ToolServersInfo } from '@shared/types'
+import type { ConnectionInfo, FolderListing, ModelActivity, ProjectInfo, ProjectState, Theme, ToolServersInfo } from '@shared/types'
 import { ToolServers } from './mcp/toolServers'
 import { FIX_RUN_SHOWN, fixRunTask, SHARE_SHOWN, SHARE_TASK, systemPrompt } from './agent/prompt'
 import { ProjectSession } from './agent/session'
-import { broadcast, handle } from './ipc'
+import { broadcast, handle, invokeHandler, onBroadcast } from './ipc'
 import { checkPageInWindow } from './project/pageWindow'
 import { AppRunner } from './project/runApp'
 import { CopySnapshots, GitSnapshots, gitInstalled, type Snapshotter } from './project/snapshots'
 import { ProjectStore } from './project/store'
+import { PhoneAccess } from './remote/access'
 import { findServer, normalizeUrl, RulzClient } from './rulz/client'
 import { SettingsStore } from './settings'
 
@@ -71,6 +73,25 @@ function createWindow(theme: Theme): BrowserWindow {
   if (isDev) void win.loadURL(`${process.env.ELECTRON_RENDERER_URL!}?theme=${look}`)
   else void win.loadFile(join(__dirname, '../renderer/index.html'), { query: { theme: look } })
   return win
+}
+
+/** Subfolders of a folder, or the drives for an empty path, for choosing a folder from the phone. */
+async function listFolders(path: string): Promise<FolderListing> {
+  if (!path.trim()) {
+    const letters = 'CDEFGHIJKLMNOPQRSTUVWXYZ'.split('')
+    const drives = await Promise.all(letters.map(async (l) => ((await fs.stat(`${l}:\\`).catch(() => null))?.isDirectory() ? `${l}:\\` : null)))
+    return { path: '', parent: null, folders: drives.filter((d): d is string => !!d) }
+  }
+  const abs = resolve(path)
+  const entries = await fs.readdir(abs, { withFileTypes: true }).catch(() => {
+    throw new Error(`Can't open the folder "${abs}".`)
+  })
+  const folders = entries
+    .filter((e) => e.isDirectory() && !e.name.startsWith('$') && !e.name.startsWith('.') && e.name !== 'node_modules' && e.name !== 'System Volume Information')
+    .map((e) => e.name)
+    .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }))
+  const up = dirname(abs)
+  return { path: abs, parent: up === abs ? '' : up, folders }
 }
 
 /** Folder names Windows doesn't allow. */
@@ -168,6 +189,10 @@ async function main(): Promise<void> {
     if (!session || resolve(session.root).toLowerCase() !== resolve(path).toLowerCase()) throw new Error('That project is not open.')
     return session
   }
+  const currentState = (): ProjectState | null => (session && current ? session.state(current.name, current.lastOpened) : null)
+  /** Every screen (this window and connected phones) follows the open project. */
+  const projectChanged = (): void => broadcast('project:changed', currentState())
+
   const requireRunner = (path: string): AppRunner => {
     requireSession(path)
     return runner!
@@ -210,6 +235,7 @@ async function main(): Promise<void> {
     })
     current = { path: abs, name: basename(abs), lastOpened: Date.now() }
     await store.touch(current)
+    projectChanged()
     return session.state(current.name, current.lastOpened)
   }
 
@@ -241,11 +267,26 @@ async function main(): Promise<void> {
     if (!/^https?:\/\//i.test(url)) throw new Error('Only web addresses can be opened.')
     await shell.openExternal(url)
   })
+  handle('fs:listFolders', (path) => listFolders(path))
+
+  // ---- Phone access (the RulZ Coding Agent phone app, over Tailscale) ----
+  const testHost = process.env.RULZ_AGENT_REMOTE_HOST
+  const phone = new PhoneAccess({
+    settings,
+    host: { invoke: invokeHandler, subscribe: onBroadcast, version: app.getVersion(), name: hostname() },
+    emit: (status) => broadcast('remote:changed', status),
+    ...(testHost ? { addresses: () => [testHost], dnsName: async () => undefined } : {})
+  })
+  handle('remote:status', () => phone.status())
+  handle('remote:setEnabled', (enabled) => phone.setEnabled(enabled))
+  handle('remote:pairing', () => phone.pairing())
+  handle('remote:newToken', () => phone.newToken())
 
   handle('server:connect', () => connect())
   handle('server:status', () => connection)
 
   handle('projects:recent', () => store.recent())
+  handle('projects:current', () => currentState())
   handle('projects:create', async (name, parentDir) => {
     const folder = safeFolderName(name)
     const parent = resolve(parentDir ?? settings.get().projectsDir)
@@ -259,7 +300,10 @@ async function main(): Promise<void> {
   })
   handle('projects:open', (path) => openProject(path))
   handle('projects:forget', (path) => store.forget(path))
-  handle('projects:close', () => closeProject())
+  handle('projects:close', async () => {
+    await closeProject()
+    projectChanged()
+  })
 
   handle('task:start', (path, text) => requireSession(path).start(text))
   handle('task:stop', (path) => requireSession(path).stop())
@@ -268,10 +312,14 @@ async function main(): Promise<void> {
     const s = requireSession(path)
     await runner?.stop()
     await s.undo(taskId)
+    projectChanged()
     return s.state(current!.name, current!.lastOpened)
   })
   handle('files:diff', (path, taskId, rel) => requireSession(path).diff(taskId, rel))
-  handle('project:setMemory', (path, text) => requireSession(path).setMemory(text))
+  handle('project:setMemory', async (path, text) => {
+    await requireSession(path).setMemory(text)
+    projectChanged()
+  })
 
   handle('run:state', (path) => requireRunner(path).get())
   handle('run:start', (path) => requireRunner(path).start(requireSession(path).data.runCommand))
@@ -281,6 +329,7 @@ async function main(): Promise<void> {
     s.data.runCommand = command?.trim() || null
     await s.saveNow()
     if (!s.data.runCommand) requireRunner(path).forgetCommand()
+    projectChanged()
     return requireRunner(path).get()
   })
   handle('run:askAgent', (path) => requireSession(path).start('How do I run this app?', { howToRun: true }))
@@ -305,6 +354,7 @@ async function main(): Promise<void> {
   // ---- Lifecycle ----
   mainWindow = createWindow(settings.get().theme)
   void connect()
+  void phone.start()
 
   app.on('second-instance', () => {
     if (!mainWindow) return
@@ -318,6 +368,7 @@ async function main(): Promise<void> {
     void session?.background.stopAll()
     if (session) void store.save(session.data)
     void toolServers.dispose()
+    void phone.dispose()
   })
 }
 

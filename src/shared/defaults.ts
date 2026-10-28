@@ -11,8 +11,14 @@ export const DEFAULT_SETTINGS: AppSettings = {
   theme: 'dark',
   projectsDir: 'C:\\coding',
   instructions: '',
-  firstRunDone: false
+  firstRunDone: false,
+  remoteEnabled: false,
+  remotePort: 7420,
+  remoteToken: ''
 }
+
+/** Bumped when the messages between the computer and the phone app change in a way the other side must know. */
+export const REMOTE_PROTOCOL = 1
 
 /** Owner-written instructions go with every request, so they are kept short (notes and Settings alike). */
 export const MAX_INSTRUCTION_CHARS = 4000
