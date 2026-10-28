@@ -285,6 +285,7 @@ async function main(): Promise<void> {
   handle('server:connect', () => connect())
   handle('server:status', () => connection)
   handle('models:loadSettings', (model) => client.loadSettings(model))
+  handle('models:previewLoadSettings', (model, config) => client.previewLoadSettings(model, config))
   handle('models:setLoadSettings', async (model, config) => {
     // Restarting the model would cut off the answer it is writing.
     if (session?.isRunning) throw new Error('A task is running. Wait for it to finish or press Stop, then change the load settings.')

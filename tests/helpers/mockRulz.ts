@@ -51,7 +51,30 @@ export async function startMockRulz(opts: MockOptions = {}) {
   const requests: MockRequest[] = []
   const models = opts.models ?? [{ id: 'Qwen3-Coder-30B-A3B-Instruct-Q5_K_M', state: 'loaded', loaded_context_length: 65536 }]
   let turnIndex = 0
-  const loadConfig = { contextLength: 65536, gpuLayers: 'auto', flashAttention: 'auto', cacheTypeK: 'f16', cacheTypeV: 'f16', parallel: 1, useDraft: false }
+  const loadConfig = {
+    contextLength: 65536,
+    gpuLayers: 'auto',
+    flashAttention: 'auto',
+    cacheTypeK: 'f16',
+    cacheTypeV: 'f16',
+    parallel: 1,
+    splitMode: 'auto',
+    mainGpu: 0,
+    tensorSplit: '',
+    useDraft: true,
+    draftTokens: 2,
+    draftMinTokens: null,
+    draftPMin: null,
+    draftSampling: 'auto',
+    draftGpu: 'auto',
+    draftCacheTypeK: 'f16',
+    draftCacheTypeV: 'f16'
+  }
+  const GiB = 1024 ** 3
+  const gpus = [
+    { index: 0, name: 'RTX 4090', memUsedMiB: 1024, memTotalMiB: 24576 },
+    { index: 1, name: 'RTX 3090', memUsedMiB: 512, memTotalMiB: 24576 }
+  ]
   const loadConfigPosts: unknown[] = []
   const nextTurn = (req: MockRequest): MockTurn => {
     const t = opts.turns
@@ -80,12 +103,29 @@ export async function startMockRulz(opts: MockOptions = {}) {
       })
     }
     if (opts.loadConfig && url.pathname.startsWith('/v1/models/') && url.pathname.endsWith('/load-config')) {
+      let config = loadConfig
       if (req.method === 'POST') {
-        const body = JSON.parse(await readBody(req)) as { config: object }
-        loadConfigPosts.push(body)
-        Object.assign(loadConfig, body.config)
+        const body = JSON.parse(await readBody(req)) as { config: object; dry_run?: boolean }
+        if (body.dry_run) config = { ...loadConfig, ...body.config }
+        else {
+          loadConfigPosts.push(body)
+          Object.assign(loadConfig, body.config)
+        }
       }
-      return json(200, { config: loadConfig, custom: loadConfigPosts.length > 0, max_context_length: 262144, state: 'ready', loaded_context_length: loadConfig.contextLength })
+      const gpuBytes = 18 * GiB + (config.contextLength ?? 0) * 64 * 1024
+      const shares = config.splitMode === 'custom' && config.tensorSplit ? config.tensorSplit.split(',').map(Number) : [50, 50]
+      const total = shares.reduce((a, b) => a + b, 0) || 1
+      const perGpu = gpus.map((g, i) => ({ index: g.index, name: g.name, share: shares[i] / total, bytes: (gpuBytes * shares[i]) / total, freeBytes: (g.memTotalMiB - g.memUsedMiB) * 1024 * 1024, totalBytes: g.memTotalMiB * 1024 * 1024 }))
+      return json(200, {
+        config,
+        custom: loadConfigPosts.length > 0,
+        max_context_length: 262144,
+        state: 'ready',
+        loaded_context_length: loadConfig.contextLength,
+        has_draft: true,
+        gpus,
+        estimate: { gpuBytes, totalBytes: gpuBytes, verdict: 'fits', perGpu }
+      })
     }
     if (url.pathname === '/props') {
       return json(200, { chat_template: opts.template ?? QWEN_CODER_TEMPLATE, default_generation_settings: { n_ctx: opts.nCtx ?? 65536 } })

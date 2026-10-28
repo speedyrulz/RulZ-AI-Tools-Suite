@@ -54,6 +54,8 @@ export interface IpcInvoke {
   'server:status': () => ConnectionInfo
   /** A model's load settings (context length, GPU layers…) in RulZ LLM Suite. */
   'models:loadSettings': (model: string) => ModelLoadInfo
+  /** RulZ LLM Suite's memory estimate for changed settings, without saving them. */
+  'models:previewLoadSettings': (model: string, config: Partial<LoadSettings>) => ModelLoadInfo
   /** Changes them; a loaded model restarts in RulZ LLM Suite to use them. */
   'models:setLoadSettings': (model: string, config: Partial<LoadSettings>) => ModelLoadInfo
 

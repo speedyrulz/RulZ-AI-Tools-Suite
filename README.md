@@ -61,11 +61,13 @@ The light look is one click away: use the sun/moon button in the top bar (or **S
   twice. Settings lists them and can start them; otherwise they start the first time the agent needs one. Ask for
   them by name ("use REA to study the app in C:\Apps\Viewer").
 - **Switch models from the top bar**: click the model name to pick another model (not during a task).
-  **Settings → Model settings** has two parts. **How it writes** sets temperature, top P, top K, repeat penalty
-  and the longest answer, saved per model; empty boxes use the recommended values (Qwen's for Qwen3-Coder). **How
-  it loads** sets context length, GPU layers, flash attention, KV cache types and draft-model speed-up. These are
-  saved in RulZ LLM Suite as that model's load defaults, and a loaded model restarts with them. This needs a RulZ
-  LLM Suite with the `load-config` endpoint.
+  **Settings → Model settings** has two parts. **How it writes** sets temperature, top P, top K, repeat penalty,
+  the longest answer and thinking (on/off, reasoning effort, thinking budget and its message), saved per model; empty
+  boxes use the recommended values (Qwen's for Qwen3-Coder). **How it loads** sets context length, GPU layers, flash
+  attention, KV cache types, the GPU split (all, one GPU, or a slider per GPU), and draft-model (MTP) speed-up and
+  tuning, with RulZ's memory estimate updating as you change them. These are saved in RulZ LLM Suite as that model's
+  load defaults, and a loaded model restarts with them. Load settings need RulZ LLM Suite 0.3.5 or later; the GPU
+  split, draft tuning and estimate need 0.3.7 or later.
 - **Settings → Instructions for every project** adds your own instructions to the agent's system prompt in all
   projects. **Show my built-in instructions** displays the fixed part they're added to (it holds the tool and
   safety rules, so it can't be replaced).

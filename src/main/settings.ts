@@ -1,7 +1,7 @@
 import { join } from 'node:path'
 import { z } from 'zod'
-import { DEFAULT_SETTINGS, MAX_INSTRUCTION_CHARS } from '@shared/defaults'
-import type { AppSettings } from '@shared/types'
+import { DEFAULT_SETTINGS, MAX_INSTRUCTION_CHARS, REASONING_EFFORTS } from '@shared/defaults'
+import type { AppSettings, ReasoningEffort } from '@shared/types'
 import { readJson, writeJsonAtomic } from './util/jsonFile'
 
 const D = DEFAULT_SETTINGS
@@ -19,7 +19,11 @@ const schema = z.object({
         topP: z.number().min(0).max(1).optional().catch(undefined),
         topK: z.number().int().min(0).max(1000).optional().catch(undefined),
         repeatPenalty: z.number().min(0.5).max(2).optional().catch(undefined),
-        maxOutputTokens: z.number().int().min(256).max(131072).optional().catch(undefined)
+        maxOutputTokens: z.number().int().min(256).max(131072).optional().catch(undefined),
+        thinking: z.enum(['on', 'off']).optional().catch(undefined),
+        reasoningEffort: z.enum(REASONING_EFFORTS as [ReasoningEffort, ...ReasoningEffort[]]).optional().catch(undefined),
+        thinkingBudget: z.number().int().min(0).max(131072).optional().catch(undefined),
+        thinkingBudgetMessage: z.string().max(500).optional().catch(undefined)
       })
     )
     .catch(D.modelSampling),

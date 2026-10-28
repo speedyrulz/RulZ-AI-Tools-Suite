@@ -163,10 +163,23 @@ describe('model settings', () => {
     expect(samplingRequest('gemma-4', { topP: 0.9, maxOutputTokens: 4096 })).toEqual({ top_p: 0.9 })
   })
 
+  it('sends thinking settings like RulZ LLM Suite’s chat', () => {
+    expect(samplingRequest('gemma-4', { thinking: 'on', reasoningEffort: 'high', thinkingBudget: 2048, thinkingBudgetMessage: 'Time to answer.' })).toEqual({
+      chat_template_kwargs: { enable_thinking: true },
+      reasoning_effort: 'high',
+      thinking_budget_tokens: 2048,
+      reasoning_budget_message: 'Time to answer.'
+    })
+    // Off wins over the effort and budget; no thinking setting sends nothing.
+    expect(samplingRequest('gemma-4', { thinking: 'off', reasoningEffort: 'high', thinkingBudget: 10 })).toEqual({ chat_template_kwargs: { enable_thinking: false } })
+    expect(samplingRequest('gemma-4', { reasoningEffort: 'low' })).toEqual({ reasoning_effort: 'low' })
+  })
+
   it('drops bad saved values one at a time', () => {
     const s = parseSettings({ modelSampling: { m: { temperature: 9, topK: 40, maxOutputTokens: 10 } } })
     expect(s.modelSampling).toEqual({ m: { topK: 40 } })
     expect(parseSettings({ modelSampling: 'nope' }).modelSampling).toEqual({})
+    expect(parseSettings({ modelSampling: { m: { thinking: 'maybe', reasoningEffort: 'high' } } }).modelSampling).toEqual({ m: { reasoningEffort: 'high' } })
   })
 
   it('reads load settings and explains an older RulZ LLM Suite', async () => {
@@ -174,7 +187,8 @@ describe('model settings', () => {
     expect(parseLoadInfo({ config: { contextLength: 8192 }, custom: true, state: 'ready', loaded_context_length: 8192 })).toMatchObject({
       custom: true,
       state: 'ready',
-      loadedContext: 8192
+      loadedContext: 8192,
+      gpus: []
     })
     const mock = await startMockRulz()
     try {

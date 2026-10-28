@@ -221,6 +221,11 @@ export class RulzClient {
     return this.loadConfigRequest(model, 'GET')
   }
 
+  /** The memory estimate for changed load settings, without saving them. */
+  async previewLoadSettings(model: string, config: Partial<LoadSettings>): Promise<ModelLoadInfo> {
+    return this.loadConfigRequest(model, 'POST', { config, dry_run: true })
+  }
+
   /** Saves new load settings in RulZ LLM Suite; a loaded model restarts with them. */
   async setLoadSettings(model: string, config: Partial<LoadSettings>): Promise<ModelLoadInfo> {
     const info = await this.loadConfigRequest(model, 'POST', { config, reload: true })
@@ -261,9 +266,27 @@ export class RulzClient {
 
 /** Reads a GET/POST /v1/models/{id}/load-config body. */
 export function parseLoadInfo(json: unknown): ModelLoadInfo {
-  const j = json as { config?: LoadSettings; custom?: boolean; max_context_length?: number; state?: ModelLoadInfo['state']; loaded_context_length?: number }
+  const j = json as {
+    config?: LoadSettings
+    custom?: boolean
+    max_context_length?: number
+    state?: ModelLoadInfo['state']
+    loaded_context_length?: number
+    has_draft?: boolean
+    gpus?: ModelLoadInfo['gpus']
+    estimate?: ModelLoadInfo['estimate'] | null
+  }
   if (!j?.config || typeof j.config !== 'object') throw new Error('RulZ LLM Suite sent load settings I could not read.')
-  return { config: j.config, custom: !!j.custom, maxContext: j.max_context_length, state: j.state ?? 'not-loaded', loadedContext: j.loaded_context_length }
+  return {
+    config: j.config,
+    custom: !!j.custom,
+    maxContext: j.max_context_length,
+    state: j.state ?? 'not-loaded',
+    loadedContext: j.loaded_context_length,
+    hasDraft: j.has_draft,
+    gpus: Array.isArray(j.gpus) ? j.gpus : [],
+    estimate: j.estimate ?? undefined
+  }
 }
 
 /** Plain-language explanation of a server error for the owner. */

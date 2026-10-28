@@ -1,4 +1,4 @@
-import type { AppSettings, KvCacheType, SamplingSettings } from './types'
+import type { AppSettings, KvCacheType, ReasoningEffort, SamplingSettings } from './types'
 
 export const DEFAULT_SETTINGS: AppSettings = {
   serverUrl: '',
@@ -29,15 +29,26 @@ export function recommendedSampling(model: string): SamplingSettings {
 export const DEFAULT_MAX_OUTPUT_TOKENS = 16384
 
 /** The owner's settings over the recommended ones, as request fields for /v1/chat/completions. */
-export function samplingRequest(model: string, own: SamplingSettings | undefined): Record<string, number> {
+export function samplingRequest(model: string, own: SamplingSettings | undefined): Record<string, unknown> {
   const s = { ...recommendedSampling(model), ...own }
-  const out: Record<string, number> = {}
+  const out: Record<string, unknown> = {}
   if (s.temperature !== undefined) out.temperature = s.temperature
   if (s.topP !== undefined) out.top_p = s.topP
   if (s.topK !== undefined) out.top_k = s.topK
   if (s.repeatPenalty !== undefined) out.repeat_penalty = s.repeatPenalty
+  // The same fields RulZ LLM Suite's chat sends; llama-server reads them.
+  if (s.thinking) out.chat_template_kwargs = { enable_thinking: s.thinking === 'on' }
+  if (s.thinking !== 'off') {
+    if (s.reasoningEffort) out.reasoning_effort = s.reasoningEffort
+    if (s.thinkingBudget !== undefined) {
+      out.thinking_budget_tokens = s.thinkingBudget
+      if (s.thinkingBudgetMessage?.trim()) out.reasoning_budget_message = s.thinkingBudgetMessage
+    }
+  }
   return out
 }
+
+export const REASONING_EFFORTS: ReasoningEffort[] = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']
 
 export const KV_CACHE_TYPES: KvCacheType[] = ['f16', 'bf16', 'f32', 'q8_0', 'q5_1', 'q5_0', 'q4_1', 'q4_0', 'iq4_nl']
 

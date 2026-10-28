@@ -204,11 +204,19 @@ describe('RulZ Coding Agent', () => {
     await page.screenshot({ path: join(shots, '6-settings.png') })
     await page.getByText('Model settings').click()
     await page.getByRole('spinbutton', { name: 'Creativity (temperature)' }).fill('0.3')
+    await page.getByRole('combobox', { name: 'Think before answering' }).selectOption('off')
     const context = page.getByRole('spinbutton', { name: 'Context length' })
     await expect.poll(() => context.inputValue()).toBe('65536')
     await context.fill('32768')
+    await page.getByRole('combobox', { name: 'GPU split' }).selectOption('custom')
+    await page.getByRole('slider', { name: 'Share for GPU 1' }).waitFor()
+    await page.getByRole('spinbutton', { name: 'Tokens to draft per step' }).fill('3')
+    await page.getByText(/Fits in VRAM.*with these changes/).waitFor()
+    await page.screenshot({ path: join(shots, '6-model-load-settings.png') })
     await page.getByRole('button', { name: 'Save and restart model' }).click()
-    await expect.poll(() => mock.loadConfigPosts).toEqual([{ config: expect.objectContaining({ contextLength: 32768 }), reload: true }])
+    await expect
+      .poll(() => mock.loadConfigPosts)
+      .toEqual([{ config: { contextLength: 32768, splitMode: 'custom', tensorSplit: '50,50', draftTokens: 3 }, reload: true }])
     await page.screenshot({ path: join(shots, '6-model-settings.png') })
     await page.keyboard.press('Escape')
     await page.getByRole('button', { name: 'Change the AI model' }).click()
@@ -225,7 +233,7 @@ describe('RulZ Coding Agent', () => {
 
     const request = mock.requests.find((r) => r.body.messages?.some((m) => m.role === 'user' && m.content.includes('Package this app')))!
     const system = request.body.messages![0].content
-    expect((request.body as { temperature?: number }).temperature).toBe(0.3)
+    expect(request.body).toMatchObject({ temperature: 0.3, chat_template_kwargs: { enable_thinking: false } })
     expect(system).toContain('Use blue, not purple.')
     expect(system).toContain('Explain things briefly.')
   })

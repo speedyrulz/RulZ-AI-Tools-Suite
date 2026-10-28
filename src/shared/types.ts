@@ -40,7 +40,17 @@ export interface SamplingSettings {
   repeatPenalty?: number
   /** Longest single answer, in tokens. */
   maxOutputTokens?: number
+  /** Turn the template's thinking on or off; missing = the model's default. */
+  thinking?: 'on' | 'off'
+  /** For templates that take one (reasoning_effort); missing = the template's own. */
+  reasoningEffort?: ReasoningEffort
+  /** Most tokens to spend thinking before the answer is forced; 0 = skip thinking. */
+  thinkingBudget?: number
+  /** Text added when the thinking budget runs out, e.g. "Time to answer." */
+  thinkingBudgetMessage?: string
 }
+
+export type ReasoningEffort = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 
 // ---------- Connection to RulZ LLM Suite ----------
 
@@ -85,7 +95,35 @@ export interface LoadSettings {
   cacheTypeK: KvCacheType
   cacheTypeV: KvCacheType
   parallel: number
+  /** GPU split; missing from RulZ LLM Suite before 0.3.7. */
+  splitMode?: 'auto' | 'single' | 'custom'
+  mainGpu?: number
+  /** Proportions per GPU when splitMode is 'custom', e.g. "60,40". */
+  tensorSplit?: string
   useDraft: boolean
+  /** Draft (MTP) tuning; missing from RulZ LLM Suite before 0.3.7. null = llama.cpp's default. */
+  draftTokens?: number | null
+  draftMinTokens?: number | null
+  draftPMin?: number | null
+  draftSampling?: 'auto' | 'greedy' | 'probabilistic'
+  draftGpu?: 'auto' | 'gpu' | 'cpu'
+  draftCacheTypeK?: KvCacheType
+  draftCacheTypeV?: KvCacheType
+}
+
+export interface GpuInfo {
+  index: number
+  name: string
+  memUsedMiB: number
+  memTotalMiB: number
+}
+
+/** RulZ LLM Suite's memory estimate for a load config. */
+export interface LoadEstimate {
+  gpuBytes: number
+  totalBytes: number
+  verdict: 'fits' | 'partial' | 'tight' | 'unknown'
+  perGpu: { index: number; name: string; share: number; bytes: number; freeBytes: number; totalBytes: number }[]
 }
 
 export interface ModelLoadInfo {
@@ -96,6 +134,10 @@ export interface ModelLoadInfo {
   maxContext?: number
   state: 'not-loaded' | 'loading' | 'ready' | 'stopping' | 'error'
   loadedContext?: number
+  /** Whether the model comes with a draft (MTP) head; undefined when RulZ doesn't say. */
+  hasDraft?: boolean
+  gpus: GpuInfo[]
+  estimate?: LoadEstimate
 }
 
 /** What the model is doing right now, for the top bar. */
