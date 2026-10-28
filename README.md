@@ -75,6 +75,8 @@ git tag image-organizer-v1.3.0
 git push origin image-organizer-v1.3.0
 ```
 
+Push app tags one at a time: GitHub starts no workflow for any of them when more than three tags arrive in one push.
+
 GitHub Actions (`.github/workflows/apps.yml`) builds it and publishes the release here, where the launcher picks it
 up. The tag prefixes are `rulz-trainer-v`, `image-organizer-v`, `image-tournament-v`, `llm-suite-v`, `coding-agent-v`,
 `training-captioner-v` and `clip-extractor-v`; launcher releases keep plain `v1.2.3` tags and the *Latest* badge.
