@@ -1,5 +1,24 @@
 # Real-model check, 2026-10-27
 
+## Checking pages and "Fix this"
+
+Same model and server, run with `-t "checks web pages"`; every approval was answered **Allow**.
+
+| Scenario | Result |
+| --- | --- |
+| "make a tip calculator web page" (new project) | Done in 58 s, 12 steps. The model started a local server and used `check_page` on its own to look at the page. |
+| "The Add to cart button on my shop page does nothing" (seeded bug: the script looks for `#add-button`, the button is `#add-btn`) | Done in 75 s, 21 steps. Fixed the id and confirmed with `check_page` three times. Afterwards the test clicked the button in a real window: the cart count changed and there were no page errors. |
+| Run my app crashes (`greeting` is not defined) → **Fix this** | Done in 20 s, 7 steps. The agent got the command and the error, fixed the typo and ran it; **Run my app** then printed "Hello, Ann!" … with exit code 0. |
+
+Seen along the way:
+
+- The first attempt ran `echo "Testing…"` as if it were a test; the system prompt now says that commands that only print text check nothing.
+- The model still adds things nobody asked for (a README, a demo page, leftover test files) and tried `curl -X POST` against a
+  static page. It also ran `npm install -g http-server`, which the safety rules flag as installing software for the whole computer,
+  so a real owner would have been warned before it ran.
+
+## To-do app, dark mode and undo
+
 Model: Huihui-Qwen3-Coder-30B-A3B-Instruct-abliterated (Q5_K_M, 100K context) served by RulZ LLM Suite on port 1234.
 Driven by `tests/e2e/real-model.e2e.ts`; every approval was answered **Allow** and is listed below.
 

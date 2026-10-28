@@ -1,5 +1,6 @@
-import { ChevronDown, ExternalLink, Sparkles, Square, X } from 'lucide-react'
+import { ChevronDown, ExternalLink, Sparkles, Square, Wrench, X } from 'lucide-react'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { outputLooksLikeError } from '@shared/runOutput'
 import { invoke } from '../lib/api'
 import { cn } from '../lib/format'
 import { useWorkspace } from '../stores/workspace'
@@ -11,6 +12,7 @@ export function RunPanel() {
   const running = useWorkspace((s) => s.running)
   const stopRun = useWorkspace((s) => s.stopRun)
   const askHowToRun = useWorkspace((s) => s.askHowToRun)
+  const fixRun = useWorkspace((s) => s.fixRun)
   const setRunCommand = useWorkspace((s) => s.setRunCommand)
   const startRun = useWorkspace((s) => s.startRun)
   const [hidden, setHidden] = useState(false)
@@ -78,7 +80,10 @@ export function RunPanel() {
         ? 'You stopped your app.'
         : run.exitCode === 0 || run.exitCode === null
           ? 'Your app has closed.'
-        : `Your app stopped with an error (code ${run.exitCode}). Describe what happened below and I'll fix it.`
+        : `Your app stopped with an error (code ${run.exitCode}).`
+
+  const crashed = !run.running && !!run.exitCode && !run.stoppedByOwner
+  const canFix = !run.opened && (crashed || (run.running && outputLooksLikeError(run.output)))
 
   return (
     <div className="mx-auto mb-4 w-full max-w-3xl px-6">
@@ -86,6 +91,17 @@ export function RunPanel() {
         <div className="flex items-center gap-2 border-b border-border px-3 py-2">
           <span className={cn('size-2 rounded-full', run.running ? 'bg-ok' : run.exitCode && !run.stoppedByOwner ? 'bg-danger' : 'bg-faint')} />
           <span className="min-w-0 flex-1 truncate text-[13px]">{state}</span>
+          {canFix && (
+            <Button
+              size="sm"
+              variant="primary"
+              disabled={running}
+              title={running ? 'Wait for the current task to finish' : 'Ask the AI to find and fix the error'}
+              onClick={() => void fixRun()}
+            >
+              <Wrench size={13} /> Fix this
+            </Button>
+          )}
           {run.url && (
             <Button size="sm" onClick={() => void invoke('shell:openUrl', run.url!)}>
               <ExternalLink size={13} /> Open in browser

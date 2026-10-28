@@ -4,11 +4,11 @@
 // a report to test-results/real-model.md. Approvals are allowed automatically (and recorded).
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { _electron as electron, type ElectronApplication, type Page } from 'playwright-core'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { RulzApi } from '@shared/ipc'
-import type { ProjectState } from '@shared/types'
+import type { ProjectState, RunState, TaskRecord } from '@shared/types'
 
 const appRoot = resolve(__dirname, '../..')
 const results = join(appRoot, 'test-results')
@@ -16,7 +16,7 @@ const report = join(results, 'real-model.md')
 const base = process.env.RULZ_REAL_DIR ?? mkdtempSync(join(tmpdir(), 'rulz-agent-real-'))
 const userData = join(base, 'userData')
 const projectsDir = join(base, 'projects')
-const projectPath = join(projectsDir, 'Todo App')
+let projectPath = join(projectsDir, 'Todo App')
 
 let app: ElectronApplication
 let page: Page
@@ -29,12 +29,18 @@ async function state(): Promise<ProjectState> {
 }
 
 /** Sends a task and handles approvals, questions and pauses until it ends. */
-async function runTask(text: string, label: string): Promise<void> {
-  const started = Date.now()
+async function runTask(text: string, label: string): Promise<TaskRecord> {
   log(`\n## ${label}: "${text}"\n`)
   const box = page.getByRole('textbox', { name: 'What should I build or change?' })
   await box.fill(text)
   await box.press('Enter')
+  return followTask()
+}
+
+/** Follows the running task to its end, answering like an owner who says yes to everything. */
+async function followTask(): Promise<TaskRecord> {
+  const started = Date.now()
+  const box = page.getByRole('textbox', { name: 'What should I build or change?' })
   await page.getByRole('button', { name: 'Stop', exact: true }).waitFor()
   let keepGoing = 0
   for (;;) {
@@ -61,7 +67,8 @@ async function runTask(text: string, label: string): Promise<void> {
       await box.press('Enter')
       continue
     }
-    if (!(await page.getByRole('button', { name: 'Stop', exact: true }).isVisible())) break
+    // The Stop button is hidden from the page while a dialog is open, so ask the app itself.
+    if (!(await state()).running) break
     await page.waitForTimeout(1000)
   }
   const st = await state()
@@ -73,7 +80,70 @@ async function runTask(text: string, label: string): Promise<void> {
   const said = st.timeline.filter((i) => i.kind !== 'user' && ('taskId' in i ? i.taskId === task.id : false))
   log('\nAgent messages:')
   for (const i of said) log(`> ${i.text.replace(/\n/g, '\n> ')}\n`)
+  return task
 }
+
+const runState = (): Promise<RunState> =>
+  page.evaluate((p) => (globalThis as unknown as { rulz: RulzApi }).rulz.invoke('run:state', p), projectPath)
+
+/** Goes through the first-run wizard if it is showing. */
+async function finishWizard(): Promise<void> {
+  const wizard = page.getByText('Connected to RulZ LLM Suite.')
+  const elsewhere = page.getByRole('button', { name: 'Back to your projects' }).or(page.getByPlaceholder('Project name, e.g. Video Upscaler'))
+  await wizard.or(elsewhere).first().waitFor()
+  if (!(await wizard.isVisible())) return
+  await page.getByRole('button', { name: 'Next' }).click()
+  log(`Model: ${await page.getByRole('combobox').inputValue()}`)
+  await page.getByRole('button', { name: 'Next' }).click()
+  await page.getByRole('button', { name: 'Next' }).click()
+  await page.getByRole('textbox').fill('Scratch')
+  await page.getByRole('button', { name: 'Create project' }).click()
+  await page.getByText('What should I build in “Scratch”?').waitFor()
+}
+
+/** Creates a project from the home page and fills it with starting files. */
+async function newProject(name: string, files: Record<string, string> = {}): Promise<void> {
+  await finishWizard()
+  const back = page.getByRole('button', { name: 'Back to your projects' })
+  if (await back.isVisible()) await back.click()
+  await page.getByPlaceholder('Project name, e.g. Video Upscaler').fill(name)
+  await page.getByRole('button', { name: 'Create', exact: true }).click()
+  await page.getByText(`What should I build in “${name}”?`).waitFor()
+  projectPath = join(projectsDir, name)
+  for (const [rel, text] of Object.entries(files)) {
+    mkdirSync(dirname(join(projectPath, rel)), { recursive: true })
+    writeFileSync(join(projectPath, rel), text)
+  }
+}
+
+/** Opens a page in a hidden window of the app, clicks the first button matching `button` and says whether the page changed. */
+async function clickInPage(file: string, button: RegExp): Promise<{ errors: string[]; result: string }> {
+  return app.evaluate(
+    async ({ BrowserWindow }, { file, source }) => {
+      const win = new BrowserWindow({ show: false, webPreferences: { partition: 'real-check', sandbox: true } })
+      const errors: string[] = []
+      win.webContents.on('console-message', (e) => {
+        if (e.level === 'error') errors.push(e.message)
+      })
+      await win.loadFile(file).catch(() => undefined)
+      await new Promise((r) => setTimeout(r, 800))
+      const result = (await win.webContents.executeJavaScript(`(() => {
+        const re = new RegExp(${JSON.stringify(source)}, 'i')
+        const b = [...document.querySelectorAll('button')].find((x) => re.test(x.innerText))
+        if (!b) return 'no such button'
+        const before = document.body.innerText
+        b.click()
+        return document.body.innerText !== before ? 'page changed' : 'nothing changed'
+      })()`)) as string
+      await new Promise((r) => setTimeout(r, 300))
+      win.destroy()
+      return { errors, result }
+    },
+    { file, source: button.source }
+  )
+}
+
+const checkPageSteps = (task: TaskRecord): number => task.steps.filter((s) => s.tool === 'check_page').length
 
 beforeAll(async () => {
   mkdirSync(results, { recursive: true })
@@ -132,5 +202,70 @@ describe.runIf(process.env.RULZ_REAL === '1')('real model', () => {
     await shot('4-undone')
     log(`\nFinished ${new Date().toISOString()}`)
     expect(stillThere).toHaveLength(0)
+  }, 3 * 60 * 60_000)
+
+  it('checks web pages and fixes a crash with "Fix this"', async () => {
+    log('\n# Checking pages and "Fix this"\n')
+
+    // 1. A new web page: does the model look at it with check_page on its own?
+    await newProject('Tip Calculator')
+    const tip = await runTask('make a tip calculator web page', 'Page 1 (new web page)')
+    log(`\ncheck_page used ${checkPageSteps(tip)} time(s).`)
+    await shot('5-tip')
+
+    // 2. A bug that only shows in the page: the server starts fine, but the button's script fails.
+    await newProject('Shop', {
+      'package.json': JSON.stringify({ name: 'shop', version: '1.0.0', scripts: { start: 'node server.js' } }, null, 2),
+      'server.js': [
+        "const http = require('http')",
+        "const fs = require('fs')",
+        "const path = require('path')",
+        'const port = 4310',
+        'http.createServer((req, res) => {',
+        "  const file = req.url === '/' ? 'index.html' : req.url.slice(1).split('?')[0]",
+        "  fs.readFile(path.join(__dirname, 'public', file), (err, data) => {",
+        "    if (err) { res.writeHead(404); return res.end('Not found') }",
+        "    res.writeHead(200, { 'Content-Type': file.endsWith('.js') ? 'text/javascript' : 'text/html' })",
+        '    res.end(data)',
+        '  })',
+        '}).listen(port, () => console.log(`Shop running at http://localhost:${port}`))',
+        ''
+      ].join('\n'),
+      'public/index.html':
+        '<!doctype html>\n<html>\n<head><title>Fruit Shop</title></head>\n<body>\n  <h1>Fruit Shop</h1>\n  <p>Apples: $2</p>\n' +
+        '  <button id="add-btn">Add to cart</button>\n  <p>Items in cart: <span id="cart-count">0</span></p>\n  <script src="shop.js"></script>\n</body>\n</html>\n',
+      'public/shop.js':
+        "let count = 0\ndocument.getElementById('add-button').addEventListener('click', () => {\n  count++\n  document.getElementById('cart-count').textContent = count\n})\n"
+    })
+    const shop = await runTask('The "Add to cart" button on my shop page does nothing. Please fix it.', 'Page 2 (bug only visible in the page)')
+    log(`\ncheck_page used ${checkPageSteps(shop)} time(s).`)
+    const clicked = await clickInPage(join(projectPath, 'public', 'index.html'), /add to cart/)
+    log(`Clicking "Add to cart" afterwards: ${clicked.result}; page errors: ${clicked.errors.join(' | ') || 'none'}`)
+    await shot('6-shop')
+
+    // 3. "Fix this": the app crashes when it runs.
+    await newProject('Greeter', {
+      'package.json': JSON.stringify({ name: 'greeter', version: '1.0.0', scripts: { start: 'node app.js' } }, null, 2),
+      'app.js': "const names = ['Ann', 'Bob', 'Cleo']\nfor (const name of names) console.log(greeting(name))\n\nfunction greet(name) {\n  return `Hello, ${name}!`\n}\n"
+    })
+    log('\n## Page 3 ("Fix this" after a crash)\n')
+    await page.getByRole('button', { name: 'Run my app' }).click()
+    await page.getByText(/Your app stopped with an error/).waitFor()
+    log(`Run my app: exit code ${(await runState()).exitCode}`)
+    await shot('7-crash')
+    await page.getByRole('button', { name: 'Fix this' }).click()
+    const fix = await followTask()
+    await page.getByRole('button', { name: 'Run my app' }).click()
+    await page.waitForTimeout(5000)
+    const after = await runState()
+    log(`\nRun my app after the fix: exit code ${after.exitCode ?? '-'}; output:\n\`\`\`\n${after.output.slice(-500)}\n\`\`\``)
+    await shot('8-fixed')
+    log(`\nFinished ${new Date().toISOString()}`)
+
+    expect(tip.outcome).toBe('done')
+    expect(shop.outcome).toBe('done')
+    expect(clicked).toEqual({ errors: [], result: 'page changed' })
+    expect(fix.outcome).toBe('done')
+    expect(after.output).toContain('Hello, Ann!')
   }, 3 * 60 * 60_000)
 })

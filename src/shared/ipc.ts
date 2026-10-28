@@ -51,6 +51,8 @@ export interface IpcInvoke {
   'run:setCommand': (projectPath: string, command: string | null) => RunState
   /** Starts a task that asks the agent how to run the project and saves the answer. */
   'run:askAgent': (projectPath: string) => void
+  /** Stops the app if it is still running and starts a task to fix the error it showed. */
+  'run:fix': (projectPath: string) => void
 }
 
 /** Push channels (webContents.send → ipcRenderer.on). */

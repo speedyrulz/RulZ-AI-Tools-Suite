@@ -36,6 +36,7 @@ import {
 import * as files from './fileTools'
 import type { ToolOutcome } from './fileTools'
 import { LoopGuard, type GuardTrip } from './loopGuard'
+import { formatPageReport, pageHasProblems, pageTarget, type PageReport, type PageTarget } from './pageCheck'
 import { resolveInProject } from './pathGuard'
 import { HOW_TO_RUN_TASK, parseRunLine, systemPrompt } from './prompt'
 import { approvalKey, classifyCommand, needsApproval, type ActionKind } from './safety'
@@ -59,6 +60,8 @@ export interface SessionDeps {
   refreshModels: () => void
   snapshotter: (kind: 'git' | 'copy' | 'auto') => Promise<Snapshotter>
   trash: (abs: string) => Promise<void>
+  /** Opens a page in a hidden window (check_page); missing where there is no Electron. */
+  checkPage?: (target: PageTarget, waitMs: number, signal: AbortSignal) => Promise<PageReport>
 }
 
 /** Ends the task without counting as an error (owner chose Stop in a prompt, or pressed Stop). */
@@ -75,6 +78,7 @@ function cleanContent(text: string): string {
 
 function stepDetail(name: string, args: Record<string, unknown>): string | undefined {
   if (typeof args.command === 'string') return args.command
+  if (typeof args.page === 'string') return args.page
   if (typeof args.path === 'string') return args.path
   if (typeof args.pattern === 'string') return `${args.pattern}${args.path ? ` in ${String(args.path)}` : ''}`
   if (typeof args.query === 'string') return `"${args.query}"${args.glob ? ` in ${String(args.glob)}` : ''}`
@@ -171,13 +175,15 @@ export class ProjectSession {
 
   // ---------- public actions ----------
 
-  start(text: string, opts: { howToRun?: boolean } = {}): void {
+  /** `shown` is what the conversation shows when the model gets a longer text (e.g. "Fix this"). */
+  start(text: string, opts: { howToRun?: boolean; shown?: string } = {}): void {
     const trimmed = text.trim()
     if (!trimmed) return
     if (this.running) throw new Error('A task is already running. Wait for it to finish or press Stop.')
-    const title = trimmed.split('\n')[0].slice(0, 80) + (trimmed.split('\n')[0].length > 80 ? '…' : '')
+    const visible = opts.shown?.trim() || trimmed
+    const title = visible.split('\n')[0].slice(0, 80) + (visible.split('\n')[0].length > 80 ? '…' : '')
     const task: TaskRecord = { id: randomUUID(), title: opts.howToRun ? 'Finding out how to run the app' : title, startedAt: Date.now(), outcome: 'running', steps: [], files: [] }
-    const item: TimelineItem = { id: randomUUID(), kind: 'user', text: opts.howToRun ? 'How do I run this app?' : trimmed, taskId: task.id }
+    const item: TimelineItem = { id: randomUUID(), kind: 'user', text: opts.howToRun ? 'How do I run this app?' : visible, taskId: task.id }
     this.data.tasks.push(task)
     this.data.timeline.push(item)
     this.running = true
@@ -696,6 +702,16 @@ export class ProjectSession {
       }
       case 'stop_background_command':
         return this.background.stop(String(args.id ?? ''))
+
+      case 'check_page': {
+        if (!this.deps.checkPage) return { text: 'Checking pages is not available here.', isError: true }
+        const target = await pageTarget(root, args.page ?? args.url ?? args.path).catch((e: Error) => e)
+        if (target instanceof Error) return { text: target.message, isError: true }
+        const wait = typeof args.wait_seconds === 'number' ? Math.min(30, Math.max(0, args.wait_seconds)) : 2
+        const report = await this.deps.checkPage(target, wait * 1000, signal)
+        if (signal.aborted) throw new StopTask()
+        return { text: formatPageReport(report), isError: pageHasProblems(report) }
+      }
 
       case 'ask_user': {
         const question = typeof args.question === 'string' ? args.question.trim() : ''

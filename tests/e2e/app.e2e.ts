@@ -34,6 +34,8 @@ beforeAll(async () => {
       },
       { content: "Now I'll check that it runs.", toolCalls: [call('run_command', { command: 'node app.js', summary: 'Starting your app' })] },
       { content: 'Your app is ready.\n\n**How to try it:** click **Run my app**.' },
+      { content: "I'll look at the shop page.", toolCalls: [call('check_page', { page: 'shop.html', summary: 'Looking at your shop page' })] },
+      { content: 'Fixed it.' },
       { content: 'Thinking very slowly…', delay: 15_000 }
     ]
   })
@@ -90,6 +92,32 @@ describe('RulZ Coding Agent', () => {
     expect(existsSync(join(projectsDir, 'E2E App', 'app.js'))).toBe(true)
   })
 
+  it('fixes a crash with "Fix this" and checks the page in a hidden window', async () => {
+    const dir = join(projectsDir, 'E2E App')
+    writeFileSync(join(dir, 'app.js'), "throw new Error('boom from the app')\n")
+    writeFileSync(
+      join(dir, 'shop.html'),
+      '<!doctype html><title>Shop</title><h1>Fruit shop</h1><button>Buy apples</button>' +
+        "<script>document.querySelector('#missing').addEventListener('click', () => {})</script>"
+    )
+    await page.getByRole('button', { name: 'Run my app' }).click()
+    await page.getByText(/Your app stopped with an error/).waitFor()
+    await page.screenshot({ path: join(shots, '4b-crash.png') })
+    await page.getByRole('button', { name: 'Fix this' }).click()
+    await page.getByText('Please fix the error my app showed when I ran it.').first().waitFor()
+    await page.getByText('Fixed it.').waitFor({ timeout: 30_000 })
+
+    const fixRequest = mock.requests.find((r) => r.body.messages?.some((m) => m.role === 'user' && m.content.includes('boom from the app')))
+    expect(fixRequest).toBeTruthy()
+    const last = mock.requests[mock.requests.length - 1].body.messages!
+    const result = last.filter((m) => m.role === 'tool').pop()!.content
+    expect(result).toContain('Title: "Shop"')
+    expect(result).toContain("Cannot read properties of null (reading 'addEventListener')")
+    expect(result).toContain('button "Buy apples"')
+    expect(result).toContain('Fruit shop')
+    await page.screenshot({ path: join(shots, '4c-fixed.png') })
+  })
+
   it('stops while the model is generating', async () => {
     const box = page.getByRole('textbox', { name: 'What should I build or change?' })
     await box.fill('Do something slow')
@@ -99,8 +127,8 @@ describe('RulZ Coding Agent', () => {
   })
 
   it('undoes the last finished task', async () => {
-    // The stopped task made no changes; undo it, then the build task.
-    for (let i = 0; i < 2; i++) {
+    // The stopped task made no changes; undo it, then the fix task, then the build task.
+    for (let i = 0; i < 3; i++) {
       await page.getByRole('button', { name: 'Undo last task' }).click()
       await page.getByRole('dialog').getByRole('button', { name: 'Undo' }).click()
       await page.getByText(/^Undone:/).nth(i).waitFor()

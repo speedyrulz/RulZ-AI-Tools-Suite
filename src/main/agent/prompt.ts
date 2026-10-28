@@ -26,6 +26,7 @@ export function systemPrompt(info: PromptInfo): string {
 2. Before each tool call, write one short plain sentence saying what you are about to do and why, for someone who doesn't code ("I'll create the main window of the app."). Every tool that changes something also takes a "summary": a few plain words like "Creating the main window".
 3. Make the change: write_file for new files or full rewrites, edit_file for small changes to existing files (read the file first and copy old_text exactly).
 4. Run it. After every change, install what is needed and run the app or its tests to check that it really works. For apps and servers that keep running, use start_background_command, wait with check_background_command, read the output for errors, then stop it with stop_background_command once you have checked it.
+   For websites and web apps, also open the page with check_page (the server's local address, or the HTML file): it shows errors from the page's scripts and what the owner would see. A server that starts without errors can still show a broken or empty page. Commands that only print text (echo, Write-Host) check nothing, so don't use them as tests.
 5. If something fails, read the error, find the cause and fix it, then run it again. Do not stop at the first error and do not say it works until you have seen it work.
 6. When everything works, finish with one short summary (once, as your very last message) in plain words (what you made or changed, from the owner's point of view: what they can do with it) and a "How to try it" section. The owner starts apps with the **Run my app** button at the top of this window, so How to try it says "Click **Run my app**" and then what to click or type in their app. Never tell the owner to open a terminal or type commands.
 - Write every message for someone who doesn't code: short sentences, no jargon (say "the main window", not "the main process"; "the pieces your app needs", not "dependencies"). Mention file names only when they help.`,
@@ -60,6 +61,25 @@ export const HOW_TO_RUN_TASK =
   'How do I start this app? Look at the project files and work out the exact PowerShell command that starts it from the project folder ' +
   '(install anything it needs first if that is required). Check that the command works. Then end your reply with one line in exactly this form:\n' +
   'RUN: <the command>'
+
+/** What the conversation shows when the owner clicks "Fix this". */
+export const FIX_RUN_SHOWN = 'Please fix the error my app showed when I ran it.'
+
+/** The task "Fix this" starts: the run command, how it ended and the end of its output. */
+export function fixRunTask(run: { command: string | null; exitCode?: number | null; running: boolean; output: string }): string {
+  const how = run.running
+    ? 'showed an error while it was running (I have stopped it)'
+    : run.exitCode
+      ? `stopped with an error (exit code ${run.exitCode})`
+      : 'showed an error'
+  const output = run.output.trim()
+  const tail = output.length > 6000 ? `[…earlier output omitted…]\n${output.slice(-6000)}` : output
+  return (
+    `I clicked **Run my app** and my app ${how}. Find out why, fix it, and check that it works now.\n\n` +
+    (run.command ? `Run my app runs this command in the project folder: ${run.command}\n\n` : '') +
+    `What it showed:\n\`\`\`\n${tail || '(no output)'}\n\`\`\``
+  )
+}
 
 /** Reads the "RUN: <command>" line from the agent's answer. */
 export function parseRunLine(text: string): string | null {

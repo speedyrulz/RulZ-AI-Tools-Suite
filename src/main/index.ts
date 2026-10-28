@@ -3,8 +3,10 @@ import { basename, join, resolve } from 'node:path'
 import { app, BrowserWindow, dialog, nativeTheme, shell } from 'electron'
 import { CANDIDATE_URLS } from '@shared/defaults'
 import type { ConnectionInfo, ModelActivity, ProjectInfo, ProjectState, Theme } from '@shared/types'
+import { FIX_RUN_SHOWN, fixRunTask } from './agent/prompt'
 import { ProjectSession } from './agent/session'
 import { broadcast, handle } from './ipc'
+import { checkPageInWindow } from './project/pageWindow'
 import { AppRunner } from './project/runApp'
 import { CopySnapshots, GitSnapshots, gitInstalled, type Snapshotter } from './project/snapshots'
 import { ProjectStore } from './project/store'
@@ -187,7 +189,8 @@ async function main(): Promise<void> {
       models: () => connection.models,
       refreshModels: () => void refreshModels(),
       snapshotter,
-      trash
+      trash,
+      checkPage: checkPageInWindow
     })
     runner = new AppRunner(abs, (e) => broadcast('run:event', e), async (file) => {
       const err = await shell.openPath(file)
@@ -260,6 +263,15 @@ async function main(): Promise<void> {
     return requireRunner(path).get()
   })
   handle('run:askAgent', (path) => requireSession(path).start('How do I run this app?', { howToRun: true }))
+  handle('run:fix', async (path) => {
+    const s = requireSession(path)
+    if (s.isRunning) throw new Error('A task is already running. Wait for it to finish or press Stop.')
+    const r = requireRunner(path)
+    const before = r.get()
+    // A running app holds its files open.
+    if (before.running) await r.stop()
+    s.start(fixRunTask(before), { shown: FIX_RUN_SHOWN })
+  })
 
   // ---- Lifecycle ----
   mainWindow = createWindow(settings.get().theme)

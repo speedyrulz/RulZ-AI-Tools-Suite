@@ -38,6 +38,8 @@ interface WorkspaceState {
   startRun: () => Promise<void>
   stopRun: () => Promise<void>
   askHowToRun: () => Promise<void>
+  /** "Fix this": stops the app if needed and asks the agent to fix the error it showed. */
+  fixRun: () => Promise<void>
   setRunCommand: (command: string | null) => Promise<void>
   selectTask: (id: string | null) => void
 }
@@ -226,6 +228,16 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       if (!project) return
       try {
         await invoke('run:askAgent', project.path)
+      } catch (e) {
+        toast.error(errorMessage(e))
+      }
+    },
+
+    fixRun: async () => {
+      const project = get().project
+      if (!project) return
+      try {
+        await invoke('run:fix', project.path)
       } catch (e) {
         toast.error(errorMessage(e))
       }

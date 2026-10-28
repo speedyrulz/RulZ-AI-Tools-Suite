@@ -119,6 +119,18 @@ export const TOOL_DEFS = [
     ['id']
   ),
   tool(
+    'check_page',
+    'Open a web page of the app in a hidden browser window, like the owner would see it, and report errors from its scripts, files that failed to load, ' +
+      'and the text, buttons and fields it shows. Use it to check websites and web apps after every change: a local address for a running server ' +
+      '(start it first with start_background_command), or an HTML file in the project. Only pages on this computer can be opened.',
+    {
+      page: { type: 'string', description: 'A local address like "http://localhost:5173", or an HTML file in the project like "index.html".' },
+      wait_seconds: { type: 'integer', description: 'Seconds to let the page run after it loads, 0 to 30 (default 2).' },
+      summary: summaryParam
+    },
+    ['page']
+  ),
+  tool(
     'ask_user',
     'Ask the owner a question and wait for the answer. Only for real choices that change what you build (for example two very different designs); otherwise pick a sensible default yourself.',
     { question: { type: 'string', description: 'The question, in plain words.' } },
@@ -247,6 +259,8 @@ export function describeStep(name: string, args: Record<string, unknown>): strin
       return 'Checking how it is going'
     case 'stop_background_command':
       return 'Stopping the program'
+    case 'check_page':
+      return 'Looking at the page'
     case 'ask_user':
       return 'Asking you a question'
     default:

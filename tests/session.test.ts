@@ -5,7 +5,8 @@ import { basename, join } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
 import { DEFAULT_SETTINGS } from '@shared/defaults'
 import type { AgentEvent, AppSettings, PendingPrompt, PromptAnswer, TaskRecord } from '@shared/types'
-import { ProjectSession } from '../src/main/agent/session'
+import type { PageTarget } from '../src/main/agent/pageCheck'
+import { ProjectSession, type SessionDeps } from '../src/main/agent/session'
 import { CopySnapshots, GitSnapshots, gitInstalled } from '../src/main/project/snapshots'
 import { emptyProject, ProjectStore } from '../src/main/project/store'
 import { RulzClient } from '../src/main/rulz/client'
@@ -21,13 +22,19 @@ interface Harness {
   events: AgentEvent[]
   prompts: PendingPrompt[]
   requests: Awaited<ReturnType<typeof startMockRulz>>['requests']
-  run: (text: string) => Promise<TaskRecord>
+  run: (text: string, opts?: { shown?: string }) => Promise<TaskRecord>
   close: () => Promise<void>
 }
 
 async function harness(
   turns: MockTurn[],
-  opts: { settings?: Partial<AppSettings>; answer?: (p: PendingPrompt) => PromptAnswer | null; nCtx?: number; useGit?: boolean } = {}
+  opts: {
+    settings?: Partial<AppSettings>
+    answer?: (p: PendingPrompt) => PromptAnswer | null
+    nCtx?: number
+    useGit?: boolean
+    checkPage?: SessionDeps['checkPage']
+  } = {}
 ): Promise<Harness> {
   const mock = await startMockRulz({ turns, nCtx: opts.nCtx })
   const root = join(base, `project-${++counter}`)
@@ -63,7 +70,8 @@ async function harness(
     refreshModels: () => undefined,
     snapshotter: async (kind) =>
       (kind === 'git' || (kind === 'auto' && useGit)) ? new GitSnapshots(store.snapshotDir(root), root) : new CopySnapshots(store.backupDir(root), root, trash),
-    trash
+    trash,
+    checkPage: opts.checkPage
   })
   return {
     session,
@@ -71,10 +79,10 @@ async function harness(
     events,
     prompts,
     requests: mock.requests,
-    run: (text) =>
+    run: (text, startOpts) =>
       new Promise((resolve) => {
         ended.push(resolve)
-        session.start(text)
+        session.start(text, startOpts)
       }),
     close: async () => {
       await session.close()
@@ -112,7 +120,7 @@ describe('the agent loop', () => {
       expect(results).toHaveLength(2)
       expect(results[1].content).toMatch(/^Exit code: 0/)
       expect(last[0].role).toBe('system')
-      expect(h.requests[0].body.tools).toHaveLength(12)
+      expect(h.requests[0].body.tools).toHaveLength(13)
       expect(h.events.some((e) => e.type === 'delta')).toBe(true)
 
       await h.session.undo()
@@ -281,6 +289,61 @@ describe('the agent loop', () => {
       await h.close()
     }
   }, 60_000)
+
+  it('checks pages in the project and reports their errors to the model', async () => {
+    const opened: PageTarget[] = []
+    const h = await harness(
+      [
+        { content: "I'll look at the page.", toolCalls: [call('check_page', { page: 'index.html', summary: 'Looking at your web page' })] },
+        { toolCalls: [call('check_page', { page: 'https://example.com' })] },
+        { content: 'Found the problem.' }
+      ],
+      {
+        checkPage: async (target) => {
+          opened.push(target)
+          return {
+            url: target.url,
+            title: 'Hi',
+            messages: [{ level: 'error', message: 'Uncaught ReferenceError: todos is not defined', source: target.url, line: 3 }],
+            failedRequests: [],
+            text: 'Hi',
+            controls: [],
+            visuals: 0
+          }
+        }
+      }
+    )
+    try {
+      writeFileSync(join(h.root, 'index.html'), '<h1>Hi</h1>')
+      const task = await h.run('Why is my page broken?')
+      // Read-only: no approval needed, and the internet is refused before anything opens.
+      expect(h.prompts).toEqual([])
+      expect(opened).toHaveLength(1)
+      expect(opened[0].url).toMatch(/^file:.*index\.html$/)
+      expect(task.steps.map((s) => [s.title, s.status, s.detail])).toEqual([
+        ['Looking at your web page', 'error', 'index.html'],
+        ['Looking at the page', 'error', 'https://example.com']
+      ])
+      const results = h.requests[2].body.messages!.filter((m) => m.role === 'tool')
+      expect(results[0].content).toContain('todos is not defined (index.html:3)')
+      expect(results[1].content).toMatch(/on the internet/)
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('shows the short "Fix this" request while the model gets the details', async () => {
+    const h = await harness([{ content: 'Fixed.' }])
+    try {
+      await h.run('I clicked Run my app and it crashed.\n\nWhat it showed: Error: boom', { shown: 'Please fix the error my app showed when I ran it.' })
+      expect(h.session.data.tasks[0].title).toBe('Please fix the error my app showed when I ran it.')
+      expect(h.session.data.timeline[0]).toMatchObject({ kind: 'user', text: 'Please fix the error my app showed when I ran it.' })
+      const user = h.requests[0].body.messages!.find((m) => m.role === 'user')!
+      expect(user.content).toContain('Error: boom')
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
 
   it('undoes with copied files when git is not available', async () => {
     const h = await harness(

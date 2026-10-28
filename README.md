@@ -27,6 +27,7 @@ commands. No cloud services and no accounts.
 - **Files changed**: every file the task created, changed or deleted. Click one to see what changed.
 - **Run my app** starts the project (`npm start` / `npm run dev`, `main.py`, or opens `index.html`), with its output
   in a panel and an **Open in browser** button for web servers. If it can't tell how, it asks the agent and remembers.
+  When the app crashes or prints an error, **Fix this** stops it and hands the error to the agent to find and fix.
 - **Undo last task** puts the project back exactly as it was before the last task (press again to go further back).
 
 ## Approvals
@@ -50,7 +51,12 @@ scripts unchecked. Deleted files go to the Recycle Bin.
   the first request ("Loading the model…").
 - **Agent loop**: streams `/v1/chat/completions` with tools (`list_files`, `find_files`, `search_text`, `read_file`,
   `write_file`, `edit_file`, `delete_path`, `run_command`, `start_background_command`, `check_background_command`,
-  `stop_background_command`, `ask_user`) until the model answers without a tool call.
+  `stop_background_command`, `check_page`, `ask_user`) until the model answers without a tool call.
+- **Checking pages**: `check_page` opens a local address (`localhost`) or an HTML file in the project in a hidden,
+  sandboxed window with its own throwaway storage. It reports script errors, files that failed to load, and the text,
+  buttons and fields the page shows, so the agent sees a broken or empty page that a server log wouldn't reveal.
+  Internet addresses are refused, the page can't leave its own server or the project folder, and downloads,
+  pop-ups and permission requests (camera, notifications, …) are blocked.
 - **Qwen3-Coder fix**: its original chat template prints earlier tool arguments in Python form, which the model
   then copies and llama.cpp can't parse. When `/props` shows that template, earlier arguments are re-sent as JSON
   text (shared with RulZ LLM Suite).
