@@ -19,7 +19,8 @@ function processWithMarker(marker: string): boolean {
   return Number(out.trim()) > 0
 }
 
-describe.runIf(process.platform === 'win32')('running commands', () => {
+// PowerShell can take several seconds to start on a busy machine (such as GitHub's build servers).
+describe.runIf(process.platform === 'win32')('running commands', { timeout: 30_000 }, () => {
   it('returns output and the exit code', async () => {
     const r = await runCommand('Write-Output "hello"; cmd /c exit 3', { cwd, timeoutMs: 30_000 })
     expect(r.output).toContain('hello')
