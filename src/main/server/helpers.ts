@@ -98,14 +98,43 @@ const remoteLoadPatchSchema = z
     cacheTypeK: z.enum(KV_CACHE_TYPES as [string, ...string[]]),
     cacheTypeV: z.enum(KV_CACHE_TYPES as [string, ...string[]]),
     parallel: z.number().int().min(1).max(64),
-    useDraft: z.boolean()
+    splitMode: z.enum(['auto', 'single', 'custom']),
+    mainGpu: z.number().int().min(0).max(15),
+    // Proportions per GPU, e.g. "3,1" — numbers only, so nothing else reaches the command line.
+    tensorSplit: z.string().regex(/^\s*(\d+(\.\d+)?(\s*,\s*\d+(\.\d+)?){0,15})?\s*$/, 'must be numbers separated by commas'),
+    useDraft: z.boolean(),
+    draftTokens: z.number().int().min(1).max(64).nullable(),
+    draftMinTokens: z.number().int().min(0).max(64).nullable(),
+    draftPMin: z.number().min(0).max(1).nullable(),
+    draftSampling: z.enum(['auto', 'greedy', 'probabilistic']),
+    draftGpu: z.enum(['auto', 'gpu', 'cpu']),
+    draftCacheTypeK: z.enum(KV_CACHE_TYPES as [string, ...string[]]),
+    draftCacheTypeV: z.enum(KV_CACHE_TYPES as [string, ...string[]])
   })
   .partial()
   .strict()
 
-export type RemoteLoadPatch = Partial<
-  Pick<LoadConfig, 'contextLength' | 'gpuLayers' | 'flashAttention' | 'cacheTypeK' | 'cacheTypeV' | 'parallel' | 'useDraft'>
->
+const REMOTE_LOAD_KEYS = [
+  'contextLength',
+  'gpuLayers',
+  'flashAttention',
+  'cacheTypeK',
+  'cacheTypeV',
+  'parallel',
+  'splitMode',
+  'mainGpu',
+  'tensorSplit',
+  'useDraft',
+  'draftTokens',
+  'draftMinTokens',
+  'draftPMin',
+  'draftSampling',
+  'draftGpu',
+  'draftCacheTypeK',
+  'draftCacheTypeV'
+] as const satisfies readonly (keyof LoadConfig)[]
+
+export type RemoteLoadPatch = Partial<Pick<LoadConfig, (typeof REMOTE_LOAD_KEYS)[number]>>
 
 /** Checks a load-settings change sent to the API; unlike saved settings, bad values are refused, not replaced. */
 export function parseRemoteLoadPatch(raw: unknown): { ok: true; patch: RemoteLoadPatch } | { ok: false; error: string } {
@@ -118,6 +147,5 @@ export function parseRemoteLoadPatch(raw: unknown): { ok: true; patch: RemoteLoa
 
 /** The part of a load config the API shows and accepts. */
 export function remoteLoadView(config: LoadConfig): Required<RemoteLoadPatch> {
-  const { contextLength, gpuLayers, flashAttention, cacheTypeK, cacheTypeV, parallel, useDraft } = config
-  return { contextLength, gpuLayers, flashAttention, cacheTypeK, cacheTypeV, parallel, useDraft }
+  return Object.fromEntries(REMOTE_LOAD_KEYS.map((k) => [k, config[k]])) as Required<RemoteLoadPatch>
 }

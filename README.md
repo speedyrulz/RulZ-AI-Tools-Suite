@@ -53,8 +53,10 @@ Discover/downloads, RAG and a CLI are planned.
   after an idle timeout. Optional API key, CORS, localhost-only or LAN, and a live request log with token counts.
   `GET /v1/models/{id}/load-config` returns a model's saved load settings, and `POST` with
   `{ "config": { … }, "reload": true }` changes them (other apps, like RulZ Coding Agent, use this). `POST` accepts only
-  context length, GPU layers, flash attention, KV cache types, parallel slots and draft use. File paths and extra
-  arguments stay app-only. A loaded model restarts with the new settings unless `"reload": false`.
+  context length, GPU layers, flash attention, KV cache types, parallel slots, the GPU split (mode, main GPU,
+  per-GPU proportions) and the draft (MTP) settings. File paths and extra arguments stay app-only. A loaded model
+  restarts with the new settings unless `"reload": false`; `"dry_run": true` only returns the memory estimate for the
+  changed settings. Replies include the GPUs, whether the model has a draft head, and the memory estimate.
   Default port 1234 (pick another if LM Studio is running).
 - **Dark and light themes** — dark is the default; the first launch asks which look you want ("Choose your look").
   Switch any time with the sun/moon button in the top bar or in Settings ▸ Appearance (Dark, Light or System).

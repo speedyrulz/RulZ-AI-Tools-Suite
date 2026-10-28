@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import http, { type IncomingMessage, type ServerResponse } from 'node:http'
-import type { ApiRequestLog, ApiServerSettings, ApiServerStatus, LoadConfig, LoadedInstance, ModelEntry } from '@shared/types'
+import type { ApiRequestLog, ApiServerSettings, ApiServerStatus, GpuStat, LoadConfig, LoadedInstance, MemoryEstimate, ModelEntry } from '@shared/types'
 import type { InstanceManager } from '../engine/instances'
 import { authorized, errorBody, parseRemoteLoadPatch, parseUsage, publicModelId, remoteLoadView, resolveModel } from './helpers'
 
@@ -41,6 +41,8 @@ export interface ApiServerDeps {
   /** The model's saved load defaults (what a load without explicit settings uses). */
   getLoadDefaults: (modelId: string) => { config: LoadConfig; custom: boolean }
   setLoadDefaults: (modelId: string, config: LoadConfig) => Promise<void>
+  estimate: (model: ModelEntry, config: LoadConfig) => MemoryEstimate | null
+  gpus: () => GpuStat[]
   onStatus: (s: ApiServerStatus) => void
   onRequest: (entry: ApiRequestLog) => void
 }
@@ -171,8 +173,9 @@ export class ApiServer {
       if (path.startsWith('/v1/models/') && path.endsWith(LOAD_CONFIG_SUFFIX) && (method === 'GET' || method === 'POST')) {
         const model = resolveModel(this.deps.getModels(), decodeURIComponent(path.slice('/v1/models/'.length, -LOAD_CONFIG_SUFFIX.length)))
         if (!model) return fail(404, 'Model not found.', 'not_found_error')
+        let preview: LoadConfig | undefined
         if (method === 'POST') {
-          let json: { config?: unknown; reload?: unknown }
+          let json: { config?: unknown; reload?: unknown; dry_run?: unknown }
           try {
             json = JSON.parse((await readBody(req)).toString('utf8') || '{}') as typeof json
           } catch {
@@ -180,11 +183,15 @@ export class ApiServer {
           }
           const parsed = parseRemoteLoadPatch(json.config ?? {})
           if (!parsed.ok) return fail(400, `Invalid load setting ${parsed.error}`, 'invalid_request_error')
-          const { config } = this.deps.getLoadDefaults(model.id)
-          await this.deps.setLoadDefaults(model.id, { ...config, ...parsed.patch })
-          if (json.reload !== false) this.reload(model.id)
+          const merged = { ...this.deps.getLoadDefaults(model.id).config, ...parsed.patch }
+          // dry_run only estimates memory for the changed settings, so a form can show it while editing.
+          if (json.dry_run === true) preview = merged
+          else {
+            await this.deps.setLoadDefaults(model.id, merged)
+            if (json.reload !== false) this.reload(model.id)
+          }
         }
-        res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(this.loadConfigEntry(model)))
+        res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(this.loadConfigEntry(model, preview)))
         return finish(200)
       }
       if (method === 'GET' && path.startsWith('/v1/models/')) {
@@ -401,14 +408,19 @@ export class ApiServer {
     }
   }
 
-  private loadConfigEntry(m: ModelEntry): unknown {
-    const { config, custom } = this.deps.getLoadDefaults(m.id)
+  private loadConfigEntry(m: ModelEntry, preview?: LoadConfig): unknown {
+    const saved = this.deps.getLoadDefaults(m.id)
+    const config = preview ?? saved.config
     const inst = this.deps.instances.list().find((i) => i.modelId === m.id && i.status !== 'stopping')
     return {
       id: publicModelId(m, this.deps.getModels()),
       object: 'model.load_config',
       config: remoteLoadView(config),
-      custom,
+      custom: saved.custom,
+      dry_run: preview ? true : undefined,
+      has_draft: !!m.draft?.kind,
+      gpus: this.deps.gpus().map(({ index, name, memUsedMiB, memTotalMiB }) => ({ index, name, memUsedMiB, memTotalMiB })),
+      estimate: this.deps.estimate(m, config),
       max_context_length: m.info?.contextLength,
       state: inst?.status ?? 'not-loaded',
       loaded_config: inst ? remoteLoadView(inst.config) : undefined,

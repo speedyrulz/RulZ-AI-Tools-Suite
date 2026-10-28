@@ -171,6 +171,8 @@ async function main(): Promise<void> {
     getSettings: () => settings.get().apiServer,
     getLoadDefaults: (id) => settings.getModelDefaults(id),
     setLoadDefaults: (id, config) => settings.setModelDefaults(id, config),
+    estimate,
+    gpus: () => hardware.snapshot().gpus,
     onStatus: (s) => broadcast('server:changed', s),
     onRequest: (e) => broadcast('server:request', e)
   })

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import type { LoadConfig, LoadedInstance, ModelEntry } from '@shared/types'
+import type { LoadConfig, LoadedInstance, MemoryEstimate, ModelEntry } from '@shared/types'
 import type { InstanceManager } from '../src/main/engine/instances'
 import { ApiServer } from '../src/main/server/apiServer'
 import { DEFAULT_LOAD_CONFIG } from '@shared/defaults'
@@ -84,12 +84,21 @@ describe('parseRemoteLoadPatch', () => {
     expect(parseRemoteLoadPatch({ cacheTypeV: 'q2' })).toMatchObject({ ok: false })
     expect(parseRemoteLoadPatch({ extraArgs: '--log-file x' })).toMatchObject({ ok: false })
     expect(parseRemoteLoadPatch({ chatTemplateFile: 'C:/x.jinja' })).toMatchObject({ ok: false })
+    expect(parseRemoteLoadPatch({ tensorSplit: '3,1 --log-file x' })).toMatchObject({ ok: false })
+    expect(parseRemoteLoadPatch({ draftPMin: 2 })).toMatchObject({ ok: false })
+  })
+
+  it('accepts GPU split and draft (MTP) settings', () => {
+    expect(parseRemoteLoadPatch({ splitMode: 'custom', tensorSplit: '60, 40', draftTokens: 3, draftPMin: 0.75, draftGpu: 'cpu' })).toMatchObject({ ok: true })
+    expect(parseRemoteLoadPatch({ tensorSplit: '' })).toMatchObject({ ok: true })
   })
 
   it('shows only the exposed fields', () => {
-    expect(Object.keys(remoteLoadView(DEFAULT_LOAD_CONFIG)).sort()).toEqual(
-      ['cacheTypeK', 'cacheTypeV', 'contextLength', 'flashAttention', 'gpuLayers', 'parallel', 'useDraft']
-    )
+    const keys = Object.keys(remoteLoadView(DEFAULT_LOAD_CONFIG))
+    expect(keys).toContain('tensorSplit')
+    expect(keys).toContain('draftCacheTypeV')
+    expect(keys).not.toContain('extraArgs')
+    expect(keys).not.toContain('chatTemplateFile')
   })
 })
 
@@ -113,6 +122,8 @@ describe('GET/POST /v1/models/{id}/load-config', () => {
       getSettings: () => ({ autoStart: false, port, bind: 'localhost', apiKey: '', cors: false, idleUnloadMinutes: 0, defaultModelId: '' }),
       getLoadDefaults: (id) => (saved[id] ? { config: saved[id], custom: true } : { config: DEFAULT_LOAD_CONFIG, custom: false }),
       setLoadDefaults: async (id, config) => void (saved[id] = config),
+      estimate: (_m, config) => ({ gpuBytes: config.contextLength ?? 0 }) as unknown as MemoryEstimate,
+      gpus: () => [{ index: 0, name: 'GPU A', memUsedMiB: 1, memTotalMiB: 24576, utilPct: 0 }],
       onStatus: () => undefined,
       onRequest: () => undefined
     })
@@ -127,6 +138,12 @@ describe('GET/POST /v1/models/{id}/load-config', () => {
       expect(res.status).toBe(200)
       expect(saved[models[0].id]).toMatchObject({ contextLength: 32768, gpuLayers: 'all', extraArgs: DEFAULT_LOAD_CONFIG.extraArgs })
       expect(loads).toEqual([models[0].id])
+
+      const dry = (await (await post({ config: { contextLength: 65536 }, dry_run: true })).json()) as { estimate: { gpuBytes: number }; gpus: unknown[] }
+      expect(dry.estimate.gpuBytes).toBe(65536)
+      expect(dry.gpus).toHaveLength(1)
+      expect(saved[models[0].id].contextLength).toBe(32768)
+      expect(loads).toHaveLength(1)
 
       expect((await post({ config: { extraArgs: '--log-file C:/x' } })).status).toBe(400)
       expect((await post({ config: { contextLength: 4096 }, reload: false })).status).toBe(200)
