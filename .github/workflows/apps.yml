@@ -200,7 +200,7 @@ jobs:
         if: env.TAG != ''
         shell: bash
         run: |
-          prev=$(git tag --list "${APP}-v*" --sort=-v:refname | grep -vx "$TAG" | head -1)
+          prev=$(git tag --list "${APP}-v*" --sort=-v:refname | { grep -vx "$TAG" || true; } | head -1)
           {
             echo "## Changes"
             echo
