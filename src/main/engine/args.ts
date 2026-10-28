@@ -39,12 +39,14 @@ export function buildServerArgs({ model, config: c, port, alias }: ServerArgsInp
   if (c.useMlock) args.push('--mlock')
   if (c.useMmproj && model.mmproj) args.push('--mmproj', model.mmproj.path)
   if (c.useDraft && model.draft?.kind) {
-    args.push('--spec-type', `draft-${model.draft.kind}`, '--spec-draft-model', model.draft.path)
+    // Built-in MTP layers run on the main model's weights, so there is no file and no separate offload.
+    args.push('--spec-type', `draft-${model.draft.kind}`)
+    if (!model.draft.builtIn) args.push('--spec-draft-model', model.draft.path)
     if (c.draftTokens !== null) args.push('--spec-draft-n-max', String(c.draftTokens))
     if (c.draftMinTokens !== null) args.push('--spec-draft-n-min', String(c.draftMinTokens))
     if (c.draftPMin !== null) args.push('--spec-draft-p-min', String(c.draftPMin))
     if (c.draftSampling !== 'auto') args.push('--spec-draft-sampling', c.draftSampling)
-    if (c.draftGpu !== 'auto') args.push('--spec-draft-ngl', c.draftGpu === 'gpu' ? 'all' : '0')
+    if (c.draftGpu !== 'auto' && !model.draft.builtIn) args.push('--spec-draft-ngl', c.draftGpu === 'gpu' ? 'all' : '0')
     if (c.draftCacheTypeK !== 'f16') args.push('--spec-draft-type-k', c.draftCacheTypeK)
     if (c.draftCacheTypeV !== 'f16') args.push('--spec-draft-type-v', c.draftCacheTypeV)
   }

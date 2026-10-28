@@ -1,8 +1,9 @@
 import * as Collapsible from '@radix-ui/react-collapsible'
 import { ChevronRight, FolderSearch } from 'lucide-react'
 import { useState } from 'react'
+import { draftFiles, fileName, resolveDraft } from '@shared/draft'
 import { parseTensorSplit, rebalanceSplit, toPercents } from '@shared/split'
-import { KV_CACHE_TYPES, type DraftKind, type KvCacheType, type LoadConfig, type MemoryEstimate, type ModelEntry } from '@shared/types'
+import { KV_CACHE_TYPES, type DraftKind, type KvCacheType, type LoadConfig, type MemoryEstimate, type ModelEntry, type SidecarFile } from '@shared/types'
 import { invoke } from '../../lib/api'
 import { cn, formatBytes, formatTokens } from '../../lib/format'
 import { useApp } from '../../stores/app'
@@ -11,6 +12,14 @@ import { Field, IconButton, Input, NumberInput, Select, Slider, Switch } from '.
 
 const CTX_PRESETS = [4096, 8192, 16384, 32768, 65536, 131072, 262144]
 const DRAFT_LABELS: Record<DraftKind, string> = { mtp: 'MTP', eagle3: 'EAGLE-3', dflash: 'DFlash', dspark: 'DSpark' }
+
+function draftLabel(d: SidecarFile): string {
+  return d.builtIn ? 'built-in MTP layers' : `${DRAFT_LABELS[d.kind ?? 'mtp']} draft head`
+}
+
+function folderOf(path: string): string {
+  return path.split(/[\\/]/).slice(-2, -1)[0] ?? ''
+}
 
 export function LoadSettingsForm({
   model,
@@ -26,6 +35,7 @@ export function LoadSettingsForm({
 }) {
   const engine = useApp((s) => s.engine)
   const hardware = useModels((s) => s.hardware)
+  const library = useModels((s) => s.models)
   const [advanced, setAdvanced] = useState(false)
   const set = <K extends keyof LoadConfig>(key: K, value: LoadConfig[K]): void => onChange({ ...config, [key]: value })
 
@@ -35,6 +45,9 @@ export function LoadSettingsForm({
     ? engine.devices.map((d, i) => ({ index: i, name: d.name }))
     : (hardware?.gpus.map((g) => ({ index: g.index, name: g.name })) ?? [])
   const gpuMode = config.splitMode === 'single' ? `single:${config.mainGpu}` : config.splitMode
+  const otherDrafts = draftFiles(library)
+  const draft = model ? resolveDraft(model, config, library) : undefined
+  const canDraft = model === null || !!model.draft || !!model.info?.mtpLayers || otherDrafts.length > 0
 
   return (
     <div className="space-y-4">
@@ -144,21 +157,39 @@ export function LoadSettingsForm({
       )}
 
       {/* The app-wide defaults (no model) also carry these, for models that have a draft head. */}
-      {(model === null || model.draft?.kind) && (
+      {canDraft && (
         <div className="space-y-2">
           <Field
             inline
-            label={model?.draft?.kind ? `Speculative decoding (${DRAFT_LABELS[model.draft.kind]} draft head)` : 'Speculative decoding (MTP / draft heads)'}
+            label={draft ? `Speculative decoding (${draftLabel(draft)})` : 'Speculative decoding (MTP / draft heads)'}
             hint={
-              model?.draft
-                ? `${model.draft.path.split(/[\\/]/).pop()} · drafts several tokens per step; output is unchanged`
-                : 'Used for models that come with an MTP or other draft head file'
+              model === null
+                ? 'Used for models that have MTP layers or come with a draft head file'
+                : draft
+                  ? `${draft.builtIn ? 'Inside the model file' : fileName(draft.path)} · drafts several tokens per step; output is unchanged`
+                  : 'No draft found with this model; pick one below'
             }
           >
             <Switch checked={config.useDraft} onCheckedChange={(v) => set('useDraft', v)} />
           </Field>
           {config.useDraft && (
             <div className="space-y-1 rounded-lg border border-border p-3">
+              {model && (
+                <Field inline label="Draft model" hint="Must come from the same base model as this one; a mismatched draft fails to load or only slows things down">
+                  <Select className="w-56" value={config.draftFile ?? ''} onChange={(e) => set('draftFile', e.target.value || null)}>
+                    <option value="">Automatic ({model.draft ? draftLabel(model.draft) : 'none found'})</option>
+                    {model.info?.mtpLayers && <option value="builtin">Built-in MTP layers</option>}
+                    {otherDrafts.map((d) => (
+                      <option key={d.path} value={d.path}>
+                        {fileName(d.path)} ({folderOf(d.path)})
+                      </option>
+                    ))}
+                    {config.draftFile && config.draftFile !== 'builtin' && !otherDrafts.some((d) => d.path === config.draftFile) && (
+                      <option value={config.draftFile}>{fileName(config.draftFile)} (not found)</option>
+                    )}
+                  </Select>
+                </Field>
+              )}
               <Field inline label="Draft tokens per step" hint="Most tokens drafted at once; 2 is a good default, empty = llama.cpp's 3">
                 <NumberInput value={config.draftTokens} placeholder="3" min={1} max={64} onChange={(v) => set('draftTokens', v === null ? null : Math.max(1, Math.min(64, Math.round(v))))} />
               </Field>
@@ -175,6 +206,7 @@ export function LoadSettingsForm({
                   <option value="probabilistic">Probabilistic</option>
                 </Select>
               </Field>
+              {!draft?.builtIn && (
               <Field inline label="Draft head placement" hint="CPU frees VRAM but drafts more slowly">
                 <Select className="w-36" value={config.draftGpu} onChange={(e) => set('draftGpu', e.target.value as LoadConfig['draftGpu'])}>
                   <option value="auto">Auto</option>
@@ -182,6 +214,7 @@ export function LoadSettingsForm({
                   <option value="cpu">CPU</option>
                 </Select>
               </Field>
+              )}
               <div className="grid grid-cols-2 gap-3 pt-1">
                 <Field label="Draft K cache">
                   <KvSelect value={config.draftCacheTypeK} onChange={(v) => set('draftCacheTypeK', v)} />

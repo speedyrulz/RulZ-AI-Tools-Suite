@@ -29,8 +29,9 @@ function u64(n: number): Buffer {
   return b
 }
 
-function buildGguf(kv: Record<string, Val>): Buffer {
-  const parts: Buffer[] = [u32(0x46554747), u32(3), u64(0), u64(Object.keys(kv).length)]
+function buildGguf(kv: Record<string, Val>, tensors: string[] = []): Buffer {
+  const parts: Buffer[] = [u32(0x46554747), u32(3), u64(tensors.length), u64(Object.keys(kv).length)]
+  const tensorInfos = tensors.map((name) => Buffer.concat([str(name), u32(2), u64(4096), u64(4096), u32(12), u64(0)]))
   for (const [k, val] of Object.entries(kv)) {
     parts.push(str(k))
     switch (val.t) {
@@ -61,7 +62,7 @@ function buildGguf(kv: Record<string, Val>): Buffer {
         break
     }
   }
-  return Buffer.concat(parts)
+  return Buffer.concat([...parts, ...tensorInfos])
 }
 
 describe('readGgufHeader', () => {
@@ -99,6 +100,23 @@ describe('readGgufHeader', () => {
     expect(info.keyLength).toBe(128)
     expect(info.quantization).toBe('Q4_K_M')
     expect(info.hasChatTemplate).toBe(true)
+    expect(header.hasNextn).toBe(false)
+    expect(info.mtpLayers).toBeUndefined()
+  })
+
+  it('finds built-in MTP layers only when the nextn tensors are really there', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rulz-gguf-'))
+    const kv = { 'general.architecture': { t: 'str', v: 'qwen35' }, 'qwen35.nextn_predict_layers': { t: 'u32', v: 1 } } as const
+    const withLayers = join(dir, 'with.gguf')
+    writeFileSync(withLayers, buildGguf(kv, ['blk.0.attn_q.weight', 'blk.64.nextn.eh_proj.weight']))
+    const h = readGgufHeader(withLayers)
+    expect(h.hasNextn).toBe(true)
+    expect(toGgufInfo(h.kv, 'with.gguf', h.hasNextn).mtpLayers).toBe(1)
+    // Some conversions keep the key but drop the layers.
+    const stripped = join(dir, 'stripped.gguf')
+    writeFileSync(stripped, buildGguf(kv, ['blk.0.attn_q.weight']))
+    const s = readGgufHeader(stripped)
+    expect(toGgufInfo(s.kv, 'stripped.gguf', s.hasNextn).mtpLayers).toBeUndefined()
   })
 
   it('rejects files that are not GGUF', () => {

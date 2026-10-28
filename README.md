@@ -29,6 +29,8 @@ Discover/downloads, RAG and a CLI are planned.
   live server log; several models loaded at once.
   - **Speculative decoding**: a draft-head sidecar next to the model (`mtp-*.gguf`, or eagle3/dflash/dspark) is
     detected and used automatically (`--spec-type draft-<kind>`), with a per-model switch and draft length.
+    MTP layers built into the model file (Qwen3.5+ "MTP" GGUFs) are detected too and preferred. A **Draft model**
+    picker can choose built-in layers or any draft file in the models folder instead.
 - **Chat** — streaming replies, collapsible reasoning ("thinking") blocks, Markdown with tables, LaTeX and
   highlighted code, image and text-file attachments (drag-drop / paste), edit, regenerate, continue, branch,
   delete; tok/s, time-to-first-token and token stats; context usage meter with "truncate middle" or "stop" overflow

@@ -68,4 +68,10 @@ describe('groupModels', () => {
     expect(models[3].folder).toBe('Qwen3.6/x.Q4_K_M.gguf')
     expect(models[3].mmproj).toBeUndefined()
   })
+
+  it('prefers built-in MTP layers and keeps a separate head as a choice', () => {
+    const [m] = groupModels(root, [file('Q\\q-MTP.gguf', 17, { ...info('qwen35'), mtpLayers: 1 }), file('Q\\mtp-q.gguf', 0.2)])
+    expect(m.draft).toMatchObject({ kind: 'mtp', builtIn: true, path: m.path })
+    expect(m.draftSidecar?.path).toMatch(/mtp-q\.gguf$/)
+  })
 })

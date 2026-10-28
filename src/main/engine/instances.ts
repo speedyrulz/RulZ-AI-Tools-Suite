@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { dirname } from 'node:path'
-import type { InstanceErrorEvent, LoadConfig, LoadedInstance, MemoryEstimate, ModelEntry } from '@shared/types'
+import type { InstanceErrorEvent, LoadConfig, LoadedInstance, MemoryEstimate, ModelEntry, SidecarFile } from '@shared/types'
 import { readJson, writeJsonAtomic } from '../util/jsonFile'
 import { buildServerArgs } from './args'
 import type { EngineService } from './engine'
@@ -23,6 +23,8 @@ interface Running {
 export interface InstanceManagerDeps {
   engine: EngineService
   getModel: (id: string) => ModelEntry | undefined
+  /** The draft this load uses (the chosen one, or the model's own); undefined = none. */
+  draftFor: (model: ModelEntry, cfg: LoadConfig) => SidecarFile | undefined
   getDefaults: (id: string) => LoadConfig
   unloadPreviousOnLoad: () => boolean
   estimate: (model: ModelEntry, config: LoadConfig) => MemoryEstimate | null
@@ -60,9 +62,10 @@ export class InstanceManager {
   }
 
   async load(modelId: string, config: LoadConfig | null): Promise<LoadedInstance> {
-    const model = this.deps.getModel(modelId)
-    if (!model) throw new Error(`Model not found: ${modelId}`)
+    const found = this.deps.getModel(modelId)
+    if (!found) throw new Error(`Model not found: ${modelId}`)
     const cfg = config ?? this.deps.getDefaults(modelId)
+    const model = { ...found, draft: this.deps.draftFor(found, cfg) }
 
     const existing = [...this.running.values()].find((r) => r.info.modelId === modelId && r.info.status !== 'stopping')
     if (existing && sameConfig(existing.info.config, cfg)) return existing.ready

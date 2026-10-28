@@ -103,6 +103,8 @@ export interface GgufHeader {
   version: number
   tensorCount: number
   kv: Record<string, unknown>
+  /** Whether the file holds built-in multi-token-prediction (nextn) layers. */
+  hasNextn: boolean
 }
 
 export function readGgufHeader(path: string): GgufHeader {
@@ -121,7 +123,17 @@ export function readGgufHeader(path: string): GgufHeader {
       const value = readValue(r, type)
       kv[key] = value === undefined ? null : value
     }
-    return { version, tensorCount, kv }
+    // Tensor infos follow the metadata: name, dims, type, offset.
+    let hasNextn = false
+    try {
+      for (let i = 0; i < tensorCount && !hasNextn; i++) {
+        hasNextn = r.str().includes('.nextn.')
+        r.skip(r.u32() * 8 + 4 + 8)
+      }
+    } catch {
+      // A truncated tensor table only costs the MTP check.
+    }
+    return { version, tensorCount, kv, hasNextn }
   } finally {
     closeSync(fd)
   }
@@ -155,7 +167,7 @@ function num(v: unknown, mode: 'mean' | 'max' = 'max'): number | undefined {
   return undefined
 }
 
-export function toGgufInfo(kv: Record<string, unknown>, fileName: string): GgufInfo {
+export function toGgufInfo(kv: Record<string, unknown>, fileName: string, hasNextn = false): GgufInfo {
   const arch = typeof kv['general.architecture'] === 'string' ? (kv['general.architecture'] as string) : 'unknown'
   const a = (k: string): unknown => kv[`${arch}.${k}`]
   const fileType = num(kv['general.file_type'])
@@ -185,6 +197,7 @@ export function toGgufInfo(kv: Record<string, unknown>, fileName: string): GgufI
     expertUsedCount: num(a('expert_used_count')),
     slidingWindow: num(a('attention.sliding_window')),
     slidingWindowFraction,
-    hasChatTemplate: typeof kv['tokenizer.chat_template'] === 'string'
+    hasChatTemplate: typeof kv['tokenizer.chat_template'] === 'string',
+    mtpLayers: hasNextn ? num(a('nextn_predict_layers')) || undefined : undefined
   }
 }

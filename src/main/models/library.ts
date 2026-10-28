@@ -1,6 +1,8 @@
 import { promises as fs, watch, type FSWatcher } from 'node:fs'
 import { basename, dirname, join, relative, sep } from 'node:path'
-import type { DraftKind, GgufInfo, ModelEntry, SidecarFile } from '@shared/types'
+import type { GgufInfo, ModelEntry, SidecarFile } from '@shared/types'
+import { draftKind } from '@shared/draft'
+export { draftKind }
 import { readJson, writeJsonAtomic } from '../util/jsonFile'
 import { readGgufHeader, toGgufInfo } from './gguf'
 
@@ -15,15 +17,6 @@ export interface ScannedFile {
 export type FileKind = 'model' | 'mmproj' | 'draft' | 'adapter' | 'shard'
 
 const SHARD_RE = /-(\d{5})-of-(\d{5})\.gguf$/i
-
-/** Draft heads are named after their format, e.g. "mtp-<model>.gguf" or "<model>-eagle3.gguf". */
-export function draftKind(fileName: string): DraftKind | undefined {
-  const base = fileName.replace(/\.gguf$/i, '').toLowerCase()
-  for (const kind of ['mtp', 'eagle3', 'dflash', 'dspark'] as const) {
-    if (new RegExp(`(^|[-_. ])${kind}([-_. ]|$)`).test(base)) return kind
-  }
-  return undefined
-}
 
 export function classifyFile(fileName: string, info: GgufInfo | null): FileKind {
   const shard = fileName.match(SHARD_RE)
@@ -64,7 +57,7 @@ export function groupModels(root: string, files: ScannedFile[]): ModelEntry[] {
       return out
     }
     const mmproj = sidecar('mmproj')
-    const draft = sidecar('draft')
+    const draftFile = sidecar('draft')
 
     for (const { f, kind } of kinds) {
       if (kind !== 'model') continue
@@ -89,7 +82,9 @@ export function groupModels(root: string, files: ScannedFile[]): ModelEntry[] {
         files: shardFiles.map((s) => s.path),
         sizeBytes: shardFiles.reduce((sum, s) => sum + s.sizeBytes, 0),
         mmproj,
-        draft,
+        // Built-in MTP layers were trained with the model, so they win over a separate head.
+        draft: f.info?.mtpLayers ? { path: f.path, sizeBytes: 0, kind: 'mtp', builtIn: true } : draftFile,
+        draftSidecar: draftFile,
         info: f.info,
         error: f.error,
         modifiedAt: Math.max(...shardFiles.map((s) => s.mtimeMs))
@@ -127,7 +122,7 @@ async function walk(dir: string, depth: number, out: { path: string; size: numbe
 }
 
 /** Bump when GgufInfo gains fields so cached metadata is re-read. */
-const CACHE_VERSION = 1
+const CACHE_VERSION = 2
 
 interface CacheEntry {
   v?: number
@@ -135,6 +130,11 @@ interface CacheEntry {
   mtimeMs: number
   info: GgufInfo | null
   error?: string
+}
+
+function ggufInfo(path: string): GgufInfo {
+  const header = readGgufHeader(path)
+  return toGgufInfo(header.kv, basename(path), header.hasNextn)
 }
 
 /** Scans the models folder, caches GGUF metadata, and watches for changes. */
@@ -187,7 +187,7 @@ export class ModelLibrary {
           entry = { v: CACHE_VERSION, size: f.size, mtimeMs: f.mtimeMs, info: null }
         } else {
           try {
-            entry = { v: CACHE_VERSION, size: f.size, mtimeMs: f.mtimeMs, info: toGgufInfo(readGgufHeader(f.path).kv, basename(f.path)) }
+            entry = { v: CACHE_VERSION, size: f.size, mtimeMs: f.mtimeMs, info: ggufInfo(f.path) }
           } catch (err) {
             entry = { v: CACHE_VERSION, size: f.size, mtimeMs: f.mtimeMs, info: null, error: (err as Error).message }
           }

@@ -226,7 +226,8 @@ function ModelDetails({ model, onClose }: { model: ModelEntry; onClose: () => vo
     ['Sliding window', i?.slidingWindow?.toLocaleString()],
     ['Chat template', i ? (i.hasChatTemplate ? 'Included' : 'Missing') : undefined],
     ['Vision projector', model.mmproj ? `${model.mmproj.path.split(/[\\/]/).pop()} (${formatBytes(model.mmproj.sizeBytes)})` : undefined],
-    ['Draft / MTP file', model.draft ? `${model.draft.path.split(/[\\/]/).pop()} (${formatBytes(model.draft.sizeBytes)})` : undefined],
+    ['Built-in MTP layers', model.info?.mtpLayers ? String(model.info.mtpLayers) : undefined],
+    ['Draft / MTP file', model.draftSidecar ? `${model.draftSidecar.path.split(/[\\/]/).pop()} (${formatBytes(model.draftSidecar.sizeBytes)})` : undefined],
     ['Files', model.files.length > 1 ? `${model.files.length} shards` : undefined]
   ]
 

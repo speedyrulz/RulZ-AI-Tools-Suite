@@ -28,6 +28,9 @@ export interface LoadConfig {
   useMmproj: boolean
   /** Use the model's draft sidecar (MTP etc.) for speculative decoding when one exists. */
   useDraft: boolean
+  /** Which draft to use: null = the one found with the model, 'builtin' = the model's own MTP layers,
+   *  or the path of a draft file anywhere in the models folder. */
+  draftFile: string | null
   /** Tokens to draft per step (--spec-draft-n-max); null = llama.cpp's default. */
   draftTokens: number | null
   /** Fewest tokens worth drafting (--spec-draft-n-min); null = llama.cpp's default (0). */
@@ -256,6 +259,8 @@ export interface GgufInfo {
   /** Share of layers using sliding-window attention (their KV cache is capped at the window). */
   slidingWindowFraction?: number
   hasChatTemplate: boolean
+  /** Built-in multi-token-prediction layers (nextn), usable as a draft without a separate file. */
+  mtpLayers?: number
 }
 
 /** Speculative-decoding head formats llama.cpp can load from a sidecar file. */
@@ -266,6 +271,8 @@ export interface SidecarFile {
   sizeBytes: number
   /** Set on draft sidecars; decides the --spec-type passed to llama-server. */
   kind?: DraftKind
+  /** A draft made of MTP layers inside the model file itself (path is the model; no --spec-draft-model). */
+  builtIn?: boolean
 }
 
 export interface ModelEntry {
@@ -278,7 +285,10 @@ export interface ModelEntry {
   files: string[]
   sizeBytes: number
   mmproj?: SidecarFile
+  /** The draft used by default: built-in MTP layers, or else the separate draft file. */
   draft?: SidecarFile
+  /** A separate draft file in the same folder, even when built-in layers are preferred. */
+  draftSidecar?: SidecarFile
   info: GgufInfo | null
   error?: string
   modifiedAt: number

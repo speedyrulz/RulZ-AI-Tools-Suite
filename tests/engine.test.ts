@@ -8,6 +8,7 @@ import { describeExitCode, splitArgs } from '../src/main/engine/process'
 import { LogLineSplitter, nextProgress, progressFromDots } from '../src/main/engine/progress'
 import { estimateMemory, gpuShares, kvCacheBytes } from '../src/main/models/estimate'
 import { parseTensorSplit, rebalanceSplit } from '../src/shared/split'
+import { draftFiles, resolveDraft } from '../src/shared/draft'
 
 const model: ModelEntry = {
   id: 'Qwen/q.gguf',
@@ -91,6 +92,27 @@ describe('draft head arguments', () => {
     expect(tuned).not.toContain('--spec-draft-type-v')
     const plain = buildServerArgs({ model: withDraft, config: DEFAULT_LOAD_CONFIG, port: 1, alias: 'q' }).join(' ')
     expect(plain).not.toMatch(/--spec-draft-(n-min|p-min|sampling|ngl|type-k)/)
+  })
+  it('uses built-in MTP layers without a draft file or offload flag', () => {
+    const builtIn: ModelEntry = { ...model, draft: { path: model.path, sizeBytes: 0, kind: 'mtp', builtIn: true } }
+    const args = buildServerArgs({ model: builtIn, config: { ...DEFAULT_LOAD_CONFIG, draftGpu: 'cpu' }, port: 1, alias: 'q' }).join(' ')
+    expect(args).toContain('--spec-type draft-mtp')
+    expect(args).not.toContain('--spec-draft-model')
+    expect(args).not.toContain('--spec-draft-ngl')
+  })
+  it('resolves the chosen draft: automatic, built-in, another file, or none', () => {
+    const head = { path: 'C:\\LLM\\Gemma\\Q5\\mtp-gemma.gguf', sizeBytes: 2e8, kind: 'mtp' as const }
+    const q5: ModelEntry = { ...model, id: 'q5', draft: head, draftSidecar: head }
+    const q6: ModelEntry = { ...model, id: 'q6', info: { ...model.info!, mtpLayers: 1 } }
+    const library = [q5, q6]
+    const pick = (m: ModelEntry, draftFile: string | null) => resolveDraft(m, { ...DEFAULT_LOAD_CONFIG, draftFile }, library)
+    expect(pick(q5, null)).toBe(head)
+    expect(pick(model, null)).toBeUndefined()
+    expect(pick(q6, 'builtin')).toMatchObject({ builtIn: true, path: q6.path })
+    expect(pick(q5, 'builtin')).toBeUndefined()
+    expect(pick(q6, head.path)).toBe(head)
+    expect(pick(q6, 'D:\\elsewhere\\x-eagle3.gguf')).toMatchObject({ kind: 'eagle3', sizeBytes: 0 })
+    expect(draftFiles(library)).toEqual([head])
   })
   it('skips it when disabled or when the sidecar kind is unknown', () => {
     expect(buildServerArgs({ model: withDraft, config: { ...DEFAULT_LOAD_CONFIG, useDraft: false }, port: 1, alias: 'q' }).join(' ')).not.toContain('--spec-type')

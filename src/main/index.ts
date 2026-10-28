@@ -1,5 +1,6 @@
 import { join } from 'node:path'
 import { app, BrowserWindow, dialog, Menu, nativeTheme, shell, Tray } from 'electron'
+import { resolveDraft } from '@shared/draft'
 import { META_TOOL_DEFS, toolCatalogNote } from '@shared/tools'
 import type { LoadConfig, ModelEntry, Theme } from '@shared/types'
 import { ChatService } from './chat/service'
@@ -143,11 +144,13 @@ async function main(): Promise<void> {
     }
     return { vramBytes: vram, ramBytes: snap.ramTotalBytes - snap.ramUsedBytes, gpus: all }
   }
-  const estimate = (model: ModelEntry, cfg: LoadConfig) => estimateMemory(model, cfg, freeMemory(cfg))
+  const draftFor = (model: ModelEntry, cfg: LoadConfig) => resolveDraft(model, cfg, library.list())
+  const estimate = (model: ModelEntry, cfg: LoadConfig) => estimateMemory({ ...model, draft: draftFor(model, cfg) }, cfg, freeMemory(cfg))
 
   const instances = new InstanceManager({
     engine,
     getModel: (id) => library.get(id),
+    draftFor,
     getDefaults: (id) => settings.getModelDefaults(id).config,
     unloadPreviousOnLoad: () => settings.get().unloadPreviousOnLoad,
     estimate,
