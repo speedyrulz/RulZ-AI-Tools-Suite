@@ -21,6 +21,7 @@ import type {
   WireToolCall
 } from '@shared/types'
 import { DEFAULT_MAX_OUTPUT_TOKENS, MAX_INSTRUCTION_CHARS, samplingRequest } from '@shared/defaults'
+import { splitThink } from '@shared/think'
 import { friendlyServerError, pickDefaultModel, type RulzClient, type TurnResult } from '../rulz/client'
 import type { Snapshot, Snapshotter } from '../project/snapshots'
 import type { ProjectData, ProjectStore } from '../project/store'
@@ -81,7 +82,7 @@ class StopTask extends Error {}
 class FriendlyError extends Error {}
 
 function cleanContent(text: string): string {
-  return text.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
+  return splitThink(text).answer
 }
 
 function stepDetail(name: string, args: Record<string, unknown>): string | undefined {
@@ -588,12 +589,20 @@ export class ProjectSession {
       onProgress: (done, total) => {
         if (total > 4000) this.setStatus({ phase: 'thinking', text: `Reading the project notes… ${Math.round((done / total) * 100)}%` })
       },
+      onReasoning: (text) => {
+        if (!item) {
+          item = { id: randomUUID(), kind: 'assistant', text: '', taskId: task.id }
+          this.addItem(item)
+        }
+        item.reasoning = (item.reasoning ?? '') + text
+        this.emit({ type: 'reasoning', itemId: item.id, text })
+      },
       onContent: (text) => {
         if (!item) {
           item = { id: randomUUID(), kind: 'assistant', text: '', taskId: task.id }
           this.addItem(item)
-          this.setStatus({ phase: 'thinking', text: 'Writing…' })
         }
+        if (!item.text) this.setStatus({ phase: 'thinking', text: 'Writing…' })
         item.text += text
         this.emit({ type: 'delta', itemId: item.id, text })
       },
@@ -603,8 +612,13 @@ export class ProjectSession {
     })
     const finished = item as Extract<TimelineItem, { kind: 'assistant' }> | null
     if (finished) {
-      finished.text = cleanContent(finished.text)
-      if (!finished.text || /<tool_call>|<function=/.test(finished.text)) {
+      // Inline <think> text joins the separately sent reasoning.
+      const { reasoning, answer } = splitThink(finished.text)
+      finished.text = /<tool_call>|<function=/.test(answer) ? '' : answer
+      const thinking = [finished.reasoning?.trim(), reasoning].filter(Boolean).join('\n\n')
+      if (thinking) finished.reasoning = thinking
+      else delete finished.reasoning
+      if (!finished.text && !thinking) {
         this.data.timeline = this.data.timeline.filter((i) => i.id !== finished.id)
         this.emit({ type: 'item', item: { ...finished, text: '' } })
       } else this.emit({ type: 'item', item: { ...finished } })

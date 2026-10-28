@@ -3,6 +3,8 @@ import { createServer, type IncomingMessage } from 'node:http'
 import type { AddressInfo } from 'node:net'
 
 export interface MockTurn {
+  /** Thinking sent separately, as reasoning_content, before the content. */
+  reasoning?: string
   content?: string
   toolCalls?: { name: string; args: unknown }[]
   finish?: string
@@ -143,6 +145,8 @@ export async function startMockRulz(opts: MockOptions = {}) {
         const timings = finish && opts.timings ? { timings: opts.timings(record) } : {}
         res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: finish }], ...timings })}\n\n`)
       }
+      const reasoning = turn.reasoning ?? ''
+      for (let i = 0; i < reasoning.length; i += 7) send({ reasoning_content: reasoning.slice(i, i + 7) })
       const content = turn.content ?? ''
       for (let i = 0; i < content.length; i += 7) send({ content: content.slice(i, i + 7) })
       turn.toolCalls?.forEach((c, index) => {

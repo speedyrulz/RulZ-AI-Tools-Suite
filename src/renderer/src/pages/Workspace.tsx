@@ -1,4 +1,4 @@
-import { ArrowLeft, ArrowUp, Check, ChevronDown, FolderOpen, SlidersHorizontal, History, LoaderCircle, NotebookPen, Package, Play, Settings, Square, Undo2 } from 'lucide-react'
+import { ArrowLeft, ArrowUp, Brain, Check, ChevronDown, ChevronRight, FolderOpen, SlidersHorizontal, History, LoaderCircle, NotebookPen, Package, Play, Settings, Square, Undo2 } from 'lucide-react'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { ApprovalDialog } from '../components/ApprovalDialog'
 import { ContextMeter } from '../components/ContextMeter'
@@ -16,6 +16,7 @@ import { cn } from '../lib/format'
 import { activeModelId, useApp } from '../stores/app'
 import { undoableTask, useWorkspace } from '../stores/workspace'
 import { ThemeToggle } from './Home'
+import { splitThink } from '@shared/think'
 
 const EXAMPLES = [
   'Make a simple to-do list desktop app',
@@ -280,12 +281,18 @@ function Conversation() {
             )
           }
           if (item.kind === 'assistant') {
+            const inline = splitThink(item.text)
+            const reasoning = [item.reasoning?.trim(), inline.reasoning].filter(Boolean).join('\n\n')
+            const live = running && status.phase === 'thinking' && !inline.answer && item.id === timeline[timeline.length - 1].id
             return (
               <div key={item.id} className="flex gap-3">
                 <span className="mt-1 w-6 shrink-0">
                   <LogoMark className="w-6" />
                 </span>
-                <Markdown text={item.text} className="min-w-0 flex-1 text-[14px]" />
+                <div className="min-w-0 flex-1 space-y-2">
+                  {reasoning && <ThinkingBlock text={reasoning} live={live} />}
+                  {inline.answer && <Markdown text={inline.answer} className="text-[14px]" />}
+                </div>
               </div>
             )
           }
@@ -320,6 +327,35 @@ function Conversation() {
           </div>
         )}
       </div>
+    </div>
+  )
+}
+
+/** The model's thinking above a reply: open while it streams, folded away once the answer starts. */
+function ThinkingBlock({ text, live }: { text: string; live: boolean }) {
+  const [chosen, setChosen] = useState<boolean | null>(null)
+  const open = chosen ?? live
+  const body = useRef<HTMLDivElement>(null)
+  useLayoutEffect(() => {
+    if (live && open && body.current) body.current.scrollTop = body.current.scrollHeight
+  }, [text, live, open])
+  return (
+    <div className="rounded-lg border border-border bg-panel-2/60 text-[13px]">
+      <button
+        type="button"
+        className="flex w-full items-center gap-1.5 px-3 py-1.5 text-left text-muted hover:text-text"
+        onClick={() => setChosen(!open)}
+        aria-expanded={open}
+      >
+        <ChevronRight size={13} className={cn('shrink-0 transition-transform', open && 'rotate-90')} />
+        {live ? <LoaderCircle size={13} className="animate-spin text-accent" /> : <Brain size={13} />}
+        {live ? 'Thinking…' : 'Thought process'}
+      </button>
+      {open && (
+        <div ref={body} className="max-h-72 overflow-y-auto border-t border-border px-3 py-2 whitespace-pre-wrap text-muted">
+          {text}
+        </div>
+      )}
     </div>
   )
 }

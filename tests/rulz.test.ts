@@ -1,3 +1,4 @@
+import { splitThink } from '@shared/think'
 import { afterAll, describe, expect, it } from 'vitest'
 import { samplingRequest } from '@shared/defaults'
 import { findServer, parseLoadInfo, parseModels, pickDefaultModel, RulzClient } from '../src/main/rulz/client'
@@ -197,5 +198,14 @@ describe('model settings', () => {
     } finally {
       await mock.close()
     }
+  })
+})
+
+describe('splitThink', () => {
+  it('separates inline thinking from the answer, even mid-stream', () => {
+    expect(splitThink('<think>plan</think>\nAnswer')).toEqual({ reasoning: 'plan', answer: 'Answer' })
+    expect(splitThink('<think>still going')).toEqual({ reasoning: 'still going', answer: '' })
+    expect(splitThink('opening tag was in the prompt</think>Done')).toEqual({ reasoning: 'opening tag was in the prompt', answer: 'Done' })
+    expect(splitThink('Plain reply')).toEqual({ reasoning: '', answer: 'Plain reply' })
   })
 })

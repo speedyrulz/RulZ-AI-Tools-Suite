@@ -139,6 +139,27 @@ describe('the agent loop', () => {
     }
   }, 60_000)
 
+  it("keeps the model's thinking with its reply, out of the answer and the history", async () => {
+    const h = await harness([
+      { reasoning: 'The owner wants a page. I should write index.html.', toolCalls: [call('write_file', { path: 'index.html', content: 'hi\n', summary: 'Creating the page' })] },
+      { content: '<think>Check it worked.</think>Your page is ready.' }
+    ])
+    try {
+      await h.run('Make a page')
+      const replies = h.session.data.timeline.filter((i) => i.kind === 'assistant')
+      expect(replies).toMatchObject([
+        { text: '', reasoning: 'The owner wants a page. I should write index.html.' },
+        { text: 'Your page is ready.', reasoning: 'Check it worked.' }
+      ])
+      const streamed = h.events.flatMap((e) => (e.type === 'reasoning' ? [e.text] : [])).join('')
+      expect(streamed).toBe('The owner wants a page. I should write index.html.')
+      // The thinking is never sent back to the model.
+      expect(JSON.stringify(h.requests[1].body.messages)).not.toContain('I should write')
+    } finally {
+      await h.close()
+    }
+  }, 60_000)
+
   it('respects "Don\'t allow" and explains it to the model', async () => {
     const h = await harness(
       [{ toolCalls: [call('run_command', { command: 'npm install', summary: 'Installing' })] }, { content: 'OK, skipped.' }],

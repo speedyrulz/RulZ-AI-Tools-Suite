@@ -178,7 +178,7 @@ export interface ChangedFile {
 
 export type TimelineItem =
   | { id: string; kind: 'user'; text: string; taskId: string }
-  | { id: string; kind: 'assistant'; text: string; taskId: string }
+  | { id: string; kind: 'assistant'; text: string; taskId: string; /** The model's thinking before this reply, when it sent any. */ reasoning?: string }
   | {
       id: string
       kind: 'notice'
@@ -279,6 +279,7 @@ export type AgentEvent =
   | { type: 'status'; projectPath: string; status: AgentStatus }
   | { type: 'item'; projectPath: string; item: TimelineItem }
   | { type: 'delta'; projectPath: string; itemId: string; text: string }
+  | { type: 'reasoning'; projectPath: string; itemId: string; text: string }
   | { type: 'step'; projectPath: string; step: Step }
   | { type: 'output'; projectPath: string; stepId: string; chunk: string }
   | { type: 'files'; projectPath: string; taskId: string; files: ChangedFile[] }

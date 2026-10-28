@@ -100,7 +100,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
         set((s) => {
           const i = s.timeline.findIndex((x) => x.id === e.item.id)
           if (i < 0) return { timeline: [...s.timeline, e.item] }
-          if (e.item.kind === 'assistant' && !e.item.text) return { timeline: s.timeline.filter((x) => x.id !== e.item.id) }
+          if (e.item.kind === 'assistant' && !e.item.text && !e.item.reasoning) return { timeline: s.timeline.filter((x) => x.id !== e.item.id) }
           const timeline = s.timeline.slice()
           timeline[i] = e.item
           return { timeline }
@@ -109,6 +109,13 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       case 'delta':
         set((s) => ({
           timeline: s.timeline.map((x) => (x.id === e.itemId && x.kind === 'assistant' ? { ...x, text: x.text + e.text } : x))
+        }))
+        break
+      case 'reasoning':
+        set((s) => ({
+          timeline: s.timeline.map((x) =>
+            x.id === e.itemId && x.kind === 'assistant' ? { ...x, reasoning: (x.reasoning ?? '') + e.text } : x
+          )
         }))
         break
       case 'step':

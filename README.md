@@ -56,6 +56,10 @@ The light look is one click away: use the sun/moon button in the top bar (or **S
 - **Memory** under the message box shows how full the model's context is ("23% of 100K"), using the exact token
   counts RulZ reports after each reply. When the model is loaded with 16K or less, the agent says once that bigger
   projects need a larger context length in RulZ.
+- **Thinking**: with a model that reasons before it answers (Qwen3, gpt-oss, DeepSeek-R1 and the like), each reply
+  gets a **Thinking…** box above it that fills in live as the model reasons and folds away once it starts answering.
+  Click it to open or close it again, now or later, to see why the agent did what it did. Thinking written inline
+  as `<think>…</think>` goes in the same box. It's shown only; it is never sent back to the model.
 - **Extra tools**: tool servers you set up in RulZ LLM Suite (its MCP page, saved in its `mcp.json`), such as
   [REA](https://www.npmjs.com/package/rea-agents) for reverse engineering, work here too with nothing to set up
   twice. Settings lists them and can start them; otherwise they start the first time the agent needs one. Ask for
