@@ -35,7 +35,8 @@ click, keep it updated, and launch it, all from a single black-and-red window (o
   **Desktop** and **Start Menu** shortcuts (the Start Menu ones go in a *RulZ AI Tools Suite* folder), and any
   optional parts. Progress, download speed and the setup log show on the page.
 - **Launch** starts the installed app. **Update** appears when GitHub has a newer release (or newer commits, for
-  apps installed from source; those update with `git pull` when Git is installed).
+  apps installed from source; those update with `git pull` when Git is installed). **Update all** in the top bar
+  updates every app that has one, one at a time.
 - The **⋯** menu has *Open install folder*, *Repair* (runs the setup again), *Locate an existing install* (for a
   copy you already have, e.g. a dev checkout), *View on GitHub*, the install log, and *Uninstall*.
 - **Uninstall** removes the shortcuts and moves the app's folder to the Recycle Bin (apps with a setup program run

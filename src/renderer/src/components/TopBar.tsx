@@ -1,8 +1,8 @@
-import { Moon, RefreshCw, Search, Settings, Sun, X } from 'lucide-react'
+import { ArrowUpCircle, Loader2, Moon, RefreshCw, Search, Settings, Sun, X } from 'lucide-react'
 import { cn } from '../lib/format'
 import { LOGOS } from '../lib/theme'
-import { useApps } from '../stores/apps'
-import { IconButton } from './ui'
+import { updatable, useApps } from '../stores/apps'
+import { Button, IconButton } from './ui'
 
 // The window has no native title bar; this bar is the drag area, and Windows draws the
 // minimize/maximize/close buttons over its right end (the 150px right padding keeps clear of them).
@@ -21,6 +21,9 @@ export function TopBar({
   const refresh = useApps((s) => s.refresh)
   const theme = useApps((s) => s.theme)
   const setTheme = useApps((s) => s.setTheme)
+  const updates = useApps((s) => s.apps.filter(updatable).length)
+  const updatingAll = useApps((s) => s.updatingAll)
+  const updateAll = useApps((s) => s.updateAll)
 
   return (
     <div className="drag flex h-12 shrink-0 items-center gap-4 border-b border-border bg-bg pr-[150px] pl-4">
@@ -54,6 +57,19 @@ export function TopBar({
       </div>
 
       <div className="no-drag flex items-center gap-1">
+        {(updates > 0 || updatingAll) && (
+          <Button
+            variant="outline"
+            size="sm"
+            className="mr-1"
+            disabled={updatingAll}
+            title={updatingAll ? 'Updating apps one at a time' : 'Update every installed app that has a newer release'}
+            onClick={() => void updateAll()}
+          >
+            {updatingAll ? <Loader2 className="size-3.5 animate-spin" /> : <ArrowUpCircle className="size-3.5" />}
+            {updatingAll ? 'Updating…' : `Update all (${updates})`}
+          </Button>
+        )}
         <IconButton label="Check for updates" onClick={() => void refresh()} disabled={refreshing}>
           <RefreshCw className={cn('size-4', refreshing && 'animate-spin')} />
         </IconButton>

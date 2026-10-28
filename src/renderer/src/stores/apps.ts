@@ -29,12 +29,15 @@ interface AppsState {
   /** A newer launcher release to offer, and the install progress (null before it starts, -1 on failure). */
   selfUpdate: SelfUpdate | null
   selfProgress: number | null
+  /** True while Update all works through the apps one at a time. */
+  updatingAll: boolean
 
   init: () => Promise<void>
   refresh: () => Promise<void>
   checkRequirements: (reloadPath?: boolean) => Promise<void>
   select: (id: string | null) => void
   dismissJob: (id: string) => void
+  updateAll: () => Promise<void>
   updateSettings: (patch: Partial<Settings>) => Promise<void>
   setTheme: (theme: ThemeName) => Promise<void>
 }
@@ -59,6 +62,7 @@ export const useApps = create<AppsState>((set, get) => ({
   theme: initialTheme,
   selfUpdate: null,
   selfProgress: null,
+  updatingAll: false,
 
   init: async () => {
     // StrictMode runs effects twice in development; subscribe only once.
@@ -131,6 +135,41 @@ export const useApps = create<AppsState>((set, get) => ({
       return { jobs }
     }),
 
+  updateAll: async () => {
+    if (get().updatingAll) return
+    set({ updatingAll: true })
+    // Each app is tried once, even if it fails and still shows an update.
+    const tried = new Set<string>()
+    let updated = 0
+    let failed = 0
+    try {
+      // One at a time: several setup programs running at once tend to get in each other's way.
+      for (;;) {
+        const next = get().apps.find((v) => updatable(v) && !tried.has(v.app.id) && !isActive(get().jobs[v.app.id] ?? v.job))
+        if (!next) break
+        const id = next.app.id
+        tried.add(id)
+        get().dismissJob(id)
+        try {
+          await invoke('apps:update', id)
+        } catch (e) {
+          toast.error(`${next.app.name}: ${errorMessage(e)}`)
+          failed++
+          continue
+        }
+        const phase = await waitForJob(id)
+        if (phase === 'done') updated++
+        else failed++
+        // Cancelling one update stops the rest too.
+        if (phase === 'cancelled') break
+      }
+    } finally {
+      set({ updatingAll: false })
+    }
+    if (failed) toast.warning(`Updated ${updated} of ${updated + failed} apps`)
+    else if (updated > 1) toast.success(`Updated ${updated} apps`)
+  },
+
   updateSettings: async (patch) => {
     set({ settings: await invoke('settings:update', patch) })
   },
@@ -141,6 +180,33 @@ export const useApps = create<AppsState>((set, get) => ({
     await get().updateSettings({ theme })
   }
 }))
+
+/** Installed, set up and behind its latest release. */
+export function updatable(view: AppView): boolean {
+  return view.updateAvailable && !!view.installed && !view.installed.needsSetup
+}
+
+/** Resolves with the final phase once the app's job ends. */
+function waitForJob(id: string): Promise<JobState['phase']> {
+  return new Promise((resolve) => {
+    let seen = false
+    const check = (s: AppsState): boolean => {
+      const job = s.jobs[id]
+      if (job && FINISHED.has(job.phase)) return finish(job.phase)
+      if (job) seen = true
+      // Finished jobs are dismissed after a moment; gone after being seen means it ended well.
+      else if (seen) return finish('done')
+      return false
+    }
+    const finish = (phase: JobState['phase']): true => {
+      unsubscribe?.()
+      resolve(phase)
+      return true
+    }
+    let unsubscribe: (() => void) | undefined
+    if (!check(useApps.getState())) unsubscribe = useApps.subscribe(check)
+  })
+}
 
 function notify(job: JobState, name: string): void {
   if (job.phase === 'done') toast.success(`${name} ${ACTION_DONE[job.action]}`)
