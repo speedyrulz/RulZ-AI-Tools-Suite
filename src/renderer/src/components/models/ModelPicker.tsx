@@ -182,7 +182,7 @@ function LoadPanel({ model, onDone }: { model: ModelEntry; onDone: () => void })
     <>
       <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
         {model.error && <div className="rounded-md border border-danger/40 bg-danger/10 p-2 text-xs text-danger">Could not read this file: {model.error}</div>}
-        <LoadSettingsForm model={model} config={config} onChange={setConfig} />
+        <LoadSettingsForm model={model} config={config} onChange={setConfig} estimate={estimate} />
         <EstimateView estimate={estimate} />
       </div>
       <div className="flex items-center gap-3 border-t border-border px-5 py-3">

@@ -34,7 +34,13 @@ export function buildRequestBody(
   if (s.maxTokens !== null) body.max_tokens = s.maxTokens
   if (s.stop.length) body.stop = s.stop
   if (s.seed !== null) body.seed = s.seed
-  if (disableThinking) body.chat_template_kwargs = { enable_thinking: false }
+  const thinking = disableThinking ? 'off' : s.thinking
+  if (thinking !== 'auto') body.chat_template_kwargs = { enable_thinking: thinking === 'on' }
+  if (thinking !== 'off') {
+    if (s.reasoningEffort !== 'default') body.reasoning_effort = s.reasoningEffort
+    if (s.thinkingBudget !== null) body.thinking_budget_tokens = s.thinkingBudget
+    if (s.thinkingBudget !== null && s.thinkingBudgetMessage.trim()) body.reasoning_budget_message = s.thinkingBudgetMessage
+  }
   if (s.jsonSchema.trim()) {
     body.response_format = { type: 'json_schema', json_schema: { name: 'output', schema: JSON.parse(s.jsonSchema) } }
   }

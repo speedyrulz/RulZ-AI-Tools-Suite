@@ -1,6 +1,6 @@
 import { RotateCcw, Save, Trash2 } from 'lucide-react'
 import { useState, type ReactNode } from 'react'
-import type { SamplingParams } from '@shared/types'
+import { REASONING_EFFORTS, type ReasoningEffort, type SamplingParams } from '@shared/types'
 import { useApp } from '../../stores/app'
 import { useChat } from '../../stores/chat'
 import { effectiveToolMode, findTool, tokensOf, useMcp } from '../../stores/mcp'
@@ -43,6 +43,68 @@ function Section({ title, children, action }: { title: string; children: ReactNo
       </div>
       {children}
     </section>
+  )
+}
+
+const EFFORT_LABELS: Record<ReasoningEffort, string> = {
+  default: "Model's default",
+  minimal: 'Minimal',
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  xhigh: 'Extra high',
+  max: 'Max'
+}
+
+/** Thinking-mode controls; also used for the new-chat defaults on the Settings page. */
+export function ThinkingFields({
+  sampling: s,
+  onChange
+}: {
+  sampling: SamplingParams
+  onChange: <K extends keyof SamplingParams>(key: K, value: SamplingParams[K]) => void
+}) {
+  return (
+    <>
+      <Field inline label="Thinking" hint="For reasoning models; Auto keeps the model's own behaviour">
+        <Select className="w-28" value={s.thinking} onChange={(e) => onChange('thinking', e.target.value as SamplingParams['thinking'])}>
+          <option value="auto">Auto</option>
+          <option value="on">On</option>
+          <option value="off">Off</option>
+        </Select>
+      </Field>
+      {s.thinking !== 'off' && (
+        <>
+          <Field inline label="Reasoning effort" hint="Only models whose template takes an effort level (e.g. gpt-oss)">
+            <Select className="w-32" value={s.reasoningEffort} onChange={(e) => onChange('reasoningEffort', e.target.value as ReasoningEffort)}>
+              {REASONING_EFFORTS.map((r) => (
+                <option key={r} value={r}>
+                  {EFFORT_LABELS[r]}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field inline label="Thinking budget" hint="Tokens before the answer is forced; empty = unlimited">
+            <NumberInput
+              value={s.thinkingBudget}
+              placeholder="∞"
+              min={0}
+              step={256}
+              onChange={(v) => onChange('thinkingBudget', v === null ? null : Math.max(0, Math.round(v)))}
+            />
+          </Field>
+          {s.thinkingBudget !== null && (
+            <Field label="Budget message" hint="Added when the budget runs out">
+              <Input
+                placeholder="Okay, time to give the answer."
+                value={s.thinkingBudgetMessage}
+                onChange={(e) => onChange('thinkingBudgetMessage', e.target.value)}
+              />
+            </Field>
+          )}
+        </>
+      )}
+    </>
   )
 }
 
@@ -204,6 +266,10 @@ export function InferencePanel() {
             onChange={(e) => setS('stop', e.target.value.split('\n').filter((x) => x.length > 0))}
           />
         </Field>
+      </Section>
+
+      <Section title="Thinking">
+        <ThinkingFields sampling={s} onChange={setS} />
       </Section>
 
       <ToolsSection />

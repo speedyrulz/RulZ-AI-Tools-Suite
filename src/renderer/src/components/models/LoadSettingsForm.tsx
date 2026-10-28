@@ -1,9 +1,10 @@
 import * as Collapsible from '@radix-ui/react-collapsible'
 import { ChevronRight, FolderSearch } from 'lucide-react'
 import { useState } from 'react'
-import { KV_CACHE_TYPES, type DraftKind, type KvCacheType, type LoadConfig, type ModelEntry } from '@shared/types'
+import { parseTensorSplit, rebalanceSplit, toPercents } from '@shared/split'
+import { KV_CACHE_TYPES, type DraftKind, type KvCacheType, type LoadConfig, type MemoryEstimate, type ModelEntry } from '@shared/types'
 import { invoke } from '../../lib/api'
-import { formatTokens } from '../../lib/format'
+import { cn, formatBytes, formatTokens } from '../../lib/format'
 import { useApp } from '../../stores/app'
 import { useModels } from '../../stores/models'
 import { Field, IconButton, Input, NumberInput, Select, Slider, Switch } from '../ui'
@@ -14,11 +15,14 @@ const DRAFT_LABELS: Record<DraftKind, string> = { mtp: 'MTP', eagle3: 'EAGLE-3',
 export function LoadSettingsForm({
   model,
   config,
-  onChange
+  onChange,
+  estimate
 }: {
   model: ModelEntry | null
   config: LoadConfig
   onChange: (c: LoadConfig) => void
+  /** Shown next to each GPU's split slider. */
+  estimate?: MemoryEstimate | null
 }) {
   const engine = useApp((s) => s.engine)
   const hardware = useModels((s) => s.hardware)
@@ -97,10 +101,14 @@ export function LoadSettingsForm({
           onChange={(e) => {
             const v = e.target.value
             if (v.startsWith('single:')) onChange({ ...config, splitMode: 'single', mainGpu: Number(v.slice(7)) })
-            else onChange({ ...config, splitMode: v as 'auto' | 'custom' })
+            else if (v === 'custom') {
+              // Start the sliders from an even split unless a valid one is already saved.
+              const even = toPercents(gpus.map(() => 1 / gpus.length)).join(',')
+              onChange({ ...config, splitMode: 'custom', tensorSplit: parseTensorSplit(config.tensorSplit, gpus.length) ? config.tensorSplit : even })
+            } else onChange({ ...config, splitMode: 'auto' })
           }}
         >
-          <option value="auto">{gpus.length > 1 ? 'Split across all GPUs' : 'Automatic'}</option>
+          <option value="auto">{gpus.length > 1 ? 'Split across all GPUs (by free memory)' : 'Automatic'}</option>
           {gpus.map((g) => (
             <option key={g.index} value={`single:${g.index}`}>
               Only GPU{g.index}: {g.name}
@@ -108,12 +116,8 @@ export function LoadSettingsForm({
           ))}
           {gpus.length > 1 && <option value="custom">Custom split…</option>}
         </Select>
-        {config.splitMode === 'custom' && (
-          <Input
-            placeholder={`Proportions per GPU, e.g. ${gpus.map(() => '1').join(',')}`}
-            value={config.tensorSplit}
-            onChange={(e) => set('tensorSplit', e.target.value)}
-          />
+        {config.splitMode === 'custom' && gpus.length > 1 && (
+          <GpuSplit gpus={gpus} split={config.tensorSplit} estimate={estimate} onChange={(s) => set('tensorSplit', s)} />
         )}
       </Field>
 
@@ -139,14 +143,56 @@ export function LoadSettingsForm({
         </Field>
       )}
 
-      {model?.draft?.kind && (
-        <Field
-          inline
-          label={`Speculative decoding (${DRAFT_LABELS[model.draft.kind]} draft head)`}
-          hint={`${model.draft.path.split(/[\\/]/).pop()} · drafts several tokens per step; output is unchanged`}
-        >
-          <Switch checked={config.useDraft} onCheckedChange={(v) => set('useDraft', v)} />
-        </Field>
+      {/* The app-wide defaults (no model) also carry these, for models that have a draft head. */}
+      {(model === null || model.draft?.kind) && (
+        <div className="space-y-2">
+          <Field
+            inline
+            label={model?.draft?.kind ? `Speculative decoding (${DRAFT_LABELS[model.draft.kind]} draft head)` : 'Speculative decoding (MTP / draft heads)'}
+            hint={
+              model?.draft
+                ? `${model.draft.path.split(/[\\/]/).pop()} · drafts several tokens per step; output is unchanged`
+                : 'Used for models that come with an MTP or other draft head file'
+            }
+          >
+            <Switch checked={config.useDraft} onCheckedChange={(v) => set('useDraft', v)} />
+          </Field>
+          {config.useDraft && (
+            <div className="space-y-1 rounded-lg border border-border p-3">
+              <Field inline label="Draft tokens per step" hint="Most tokens drafted at once; 2 is a good default, empty = llama.cpp's 3">
+                <NumberInput value={config.draftTokens} placeholder="3" min={1} max={64} onChange={(v) => set('draftTokens', v === null ? null : Math.max(1, Math.min(64, Math.round(v))))} />
+              </Field>
+              <Field inline label="Minimum draft tokens" hint="Skip drafting when fewer would be proposed; empty = 0">
+                <NumberInput value={config.draftMinTokens} placeholder="0" min={0} max={64} onChange={(v) => set('draftMinTokens', v === null ? null : Math.max(0, Math.min(64, Math.round(v))))} />
+              </Field>
+              <Field inline label="Minimum draft confidence" hint="Stop a draft early once its probability drops below this (0–1); empty = 0">
+                <NumberInput value={config.draftPMin} placeholder="0" min={0} max={1} step={0.05} onChange={(v) => set('draftPMin', v === null ? null : Math.max(0, Math.min(1, v)))} />
+              </Field>
+              <Field inline label="Draft sampling" hint="Greedy takes the draft's top pick; probabilistic samples and verifies by rejection">
+                <Select className="w-36" value={config.draftSampling} onChange={(e) => set('draftSampling', e.target.value as LoadConfig['draftSampling'])}>
+                  <option value="auto">Auto</option>
+                  <option value="greedy">Greedy</option>
+                  <option value="probabilistic">Probabilistic</option>
+                </Select>
+              </Field>
+              <Field inline label="Draft head placement" hint="CPU frees VRAM but drafts more slowly">
+                <Select className="w-36" value={config.draftGpu} onChange={(e) => set('draftGpu', e.target.value as LoadConfig['draftGpu'])}>
+                  <option value="auto">Auto</option>
+                  <option value="gpu">GPU</option>
+                  <option value="cpu">CPU</option>
+                </Select>
+              </Field>
+              <div className="grid grid-cols-2 gap-3 pt-1">
+                <Field label="Draft K cache">
+                  <KvSelect value={config.draftCacheTypeK} onChange={(v) => set('draftCacheTypeK', v)} />
+                </Field>
+                <Field label="Draft V cache">
+                  <KvSelect value={config.draftCacheTypeV} onChange={(v) => set('draftCacheTypeV', v)} />
+                </Field>
+              </div>
+            </div>
+          )}
+        </div>
       )}
 
       <Collapsible.Root open={advanced} onOpenChange={setAdvanced}>
@@ -155,11 +201,6 @@ export function LoadSettingsForm({
           Advanced
         </Collapsible.Trigger>
         <Collapsible.Content className="mt-3 space-y-1">
-          {model?.draft?.kind && config.useDraft && (
-            <Field inline label="Draft tokens per step" hint="2 is a good default; empty = llama.cpp's own (3)">
-              <NumberInput value={config.draftTokens} placeholder="3" min={1} max={64} onChange={(v) => set('draftTokens', v === null ? null : Math.max(1, Math.min(64, Math.round(v))))} />
-            </Field>
-          )}
           <Field inline label="CPU threads" hint="Empty = automatic">
             <NumberInput value={config.threads} placeholder="Auto" min={1} onChange={(v) => set('threads', v)} />
           </Field>
@@ -210,6 +251,45 @@ export function LoadSettingsForm({
           </div>
         </Collapsible.Content>
       </Collapsible.Root>
+    </div>
+  )
+}
+
+/** One slider per GPU; moving one rescales the others so the split always adds up to 100%. */
+function GpuSplit({
+  gpus,
+  split,
+  estimate,
+  onChange
+}: {
+  gpus: { index: number; name: string }[]
+  split: string
+  estimate?: MemoryEstimate | null
+  onChange: (split: string) => void
+}) {
+  const percents = toPercents(parseTensorSplit(split, gpus.length) ?? gpus.map(() => 1 / gpus.length))
+  return (
+    <div className="space-y-2.5 rounded-lg border border-border p-3">
+      {gpus.map((g, i) => {
+        const est = estimate?.perGpu.find((e) => e.index === g.index)
+        const over = est !== undefined && est.bytes > est.freeBytes * 0.95
+        return (
+          <div key={g.index} className="space-y-1">
+            <div className="flex items-baseline justify-between gap-2 text-xs">
+              <span className="min-w-0 truncate">
+                GPU{g.index}: {g.name}
+              </span>
+              <span className={cn('shrink-0 tabular-nums', over ? 'text-danger' : 'text-muted')}>
+                {est ? `≈ ${formatBytes(est.bytes)} of ${formatBytes(est.freeBytes)} free` : percents[i] === 0 ? 'Not used' : ''}
+              </span>
+            </div>
+            <div className="flex items-center gap-3">
+              <Slider value={percents[i]} min={0} max={100} onChange={(v) => onChange(rebalanceSplit(percents, i, v).join(','))} />
+              <span className="w-10 shrink-0 text-right text-xs tabular-nums">{percents[i]}%</span>
+            </div>
+          </div>
+        )
+      })}
     </div>
   )
 }

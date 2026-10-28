@@ -39,6 +39,32 @@ describe('buildRequestBody', () => {
     expect(body.response_format).toEqual({ type: 'json_schema', json_schema: { name: 'output', schema: { type: 'object' } } })
     expect(buildRequestBody('m', [], DEFAULT_SAMPLING)).not.toHaveProperty('max_tokens')
   })
+  it('sends thinking settings only when they differ from the model default', () => {
+    const plain = buildRequestBody('m', [], DEFAULT_SAMPLING)
+    for (const key of ['chat_template_kwargs', 'reasoning_effort', 'thinking_budget_tokens', 'reasoning_budget_message']) {
+      expect(plain).not.toHaveProperty(key)
+    }
+    const tuned = buildRequestBody('m', [], {
+      ...DEFAULT_SAMPLING,
+      thinking: 'on',
+      reasoningEffort: 'high',
+      thinkingBudget: 1024,
+      thinkingBudgetMessage: 'Time to answer.'
+    })
+    expect(tuned).toMatchObject({
+      chat_template_kwargs: { enable_thinking: true },
+      reasoning_effort: 'high',
+      thinking_budget_tokens: 1024,
+      reasoning_budget_message: 'Time to answer.'
+    })
+  })
+  it('turns thinking off, including when a handoff asks for it', () => {
+    const off = buildRequestBody('m', [], { ...DEFAULT_SAMPLING, thinking: 'off', reasoningEffort: 'high', thinkingBudget: 10 })
+    expect(off.chat_template_kwargs).toEqual({ enable_thinking: false })
+    expect(off).not.toHaveProperty('reasoning_effort')
+    expect(off).not.toHaveProperty('thinking_budget_tokens')
+    expect(buildRequestBody('m', [], { ...DEFAULT_SAMPLING, thinking: 'on' }, true).chat_template_kwargs).toEqual({ enable_thinking: false })
+  })
 })
 
 describe('context fitting', () => {

@@ -9,7 +9,7 @@ import { HardwareMonitor } from './engine/hardware'
 import { McpManager } from './mcp/manager'
 import { InstanceManager } from './engine/instances'
 import { broadcast, handle } from './ipc'
-import { estimateMemory } from './models/estimate'
+import { estimateMemory, type FreeMemory } from './models/estimate'
 import { ModelLibrary } from './models/library'
 import { ApiServer } from './server/apiServer'
 import { SettingsStore } from './settings/store'
@@ -123,16 +123,25 @@ async function main(): Promise<void> {
     (models) => broadcast('models:changed', models)
   )
 
-  const freeMemory = (cfg: LoadConfig): { vramBytes: number | null; ramBytes: number } => {
+  const freeMemory = (cfg: LoadConfig): FreeMemory => {
     const snap = hardware.snapshot()
+    // Models that will be unloaded first give their memory back.
+    const unloading = settings.get().unloadPreviousOnLoad ? instances.list() : []
+    const freed = (index: number): number =>
+      unloading.reduce((sum, i) => sum + (i.estimate?.perGpu?.find((g) => g.index === index)?.bytes ?? 0), 0)
+    const all = [...snap.gpus]
+      .sort((a, b) => a.index - b.index)
+      .map((g) => {
+        const totalBytes = g.memTotalMiB * MiB
+        return { index: g.index, name: g.name, totalBytes, freeBytes: Math.min(totalBytes, (g.memTotalMiB - g.memUsedMiB) * MiB + freed(g.index)) }
+      })
     const gpus = cfg.splitMode === 'single' ? snap.gpus.filter((g) => g.index === cfg.mainGpu) : snap.gpus
     let vram = gpus.length ? gpus.reduce((sum, g) => sum + (g.memTotalMiB - g.memUsedMiB) * MiB, 0) : null
-    // Models that will be unloaded first give their memory back.
-    if (vram !== null && settings.get().unloadPreviousOnLoad) {
-      vram += instances.list().reduce((sum, i) => sum + (i.estimate?.gpuBytes ?? 0), 0)
+    if (vram !== null && unloading.length) {
+      vram += unloading.reduce((sum, i) => sum + (i.estimate?.gpuBytes ?? 0), 0)
       vram = Math.min(vram, gpus.reduce((sum, g) => sum + g.memTotalMiB * MiB, 0))
     }
-    return { vramBytes: vram, ramBytes: snap.ramTotalBytes - snap.ramUsedBytes }
+    return { vramBytes: vram, ramBytes: snap.ramTotalBytes - snap.ramUsedBytes, gpus: all }
   }
   const estimate = (model: ModelEntry, cfg: LoadConfig) => estimateMemory(model, cfg, freeMemory(cfg))
 

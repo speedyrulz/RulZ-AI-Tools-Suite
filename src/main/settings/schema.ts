@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import { DEFAULT_LOAD_CONFIG, DEFAULT_SAMPLING, DEFAULT_SETTINGS } from '@shared/defaults'
-import { KV_CACHE_TYPES, type AppSettings, type LoadConfig, type Preset, type SamplingParams } from '@shared/types'
+import { KV_CACHE_TYPES, REASONING_EFFORTS, type AppSettings, type LoadConfig, type Preset, type SamplingParams } from '@shared/types'
 
 // Every field falls back to its default on its own, so one bad value never resets the rest.
 const L = DEFAULT_LOAD_CONFIG
@@ -24,6 +24,12 @@ export const loadConfigSchema = z.object({
   useMmproj: z.boolean().catch(L.useMmproj),
   useDraft: z.boolean().catch(L.useDraft),
   draftTokens: z.number().int().min(1).max(64).nullable().catch(L.draftTokens),
+  draftMinTokens: z.number().int().min(0).max(64).nullable().catch(L.draftMinTokens),
+  draftPMin: z.number().min(0).max(1).nullable().catch(L.draftPMin),
+  draftSampling: z.enum(['auto', 'greedy', 'probabilistic']).catch(L.draftSampling),
+  draftGpu: z.enum(['auto', 'gpu', 'cpu']).catch(L.draftGpu),
+  draftCacheTypeK: kvType.catch(L.draftCacheTypeK),
+  draftCacheTypeV: kvType.catch(L.draftCacheTypeV),
   seed: z.number().int().nullable().catch(L.seed),
   chatTemplateFile: z.string().catch(L.chatTemplateFile),
   parallel: z.number().int().min(1).max(64).catch(L.parallel),
@@ -42,7 +48,11 @@ export const samplingSchema = z.object({
   maxTokens: posIntOrNull.catch(S.maxTokens),
   stop: z.array(z.string()).catch(S.stop),
   seed: z.number().int().nullable().catch(S.seed),
-  jsonSchema: z.string().catch(S.jsonSchema)
+  jsonSchema: z.string().catch(S.jsonSchema),
+  thinking: z.enum(['auto', 'on', 'off']).catch(S.thinking),
+  reasoningEffort: z.enum(REASONING_EFFORTS as [string, ...string[]]).catch(S.reasoningEffort),
+  thinkingBudget: z.number().int().min(0).nullable().catch(S.thinkingBudget),
+  thinkingBudgetMessage: z.string().catch(S.thinkingBudgetMessage)
 })
 
 const D = DEFAULT_SETTINGS

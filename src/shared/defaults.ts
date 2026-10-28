@@ -18,6 +18,12 @@ export const DEFAULT_LOAD_CONFIG: LoadConfig = {
   useDraft: true,
   // 2 beat llama.cpp's default of 3 in every matched run on a 26B-A4B MoE with its MTP head.
   draftTokens: 2,
+  draftMinTokens: null,
+  draftPMin: null,
+  draftSampling: 'auto',
+  draftGpu: 'auto',
+  draftCacheTypeK: 'f16',
+  draftCacheTypeV: 'f16',
   seed: null,
   chatTemplateFile: '',
   parallel: 1,
@@ -35,7 +41,11 @@ export const DEFAULT_SAMPLING: SamplingParams = {
   maxTokens: null,
   stop: [],
   seed: null,
-  jsonSchema: ''
+  jsonSchema: '',
+  thinking: 'auto',
+  reasoningEffort: 'default',
+  thinkingBudget: null,
+  thinkingBudgetMessage: ''
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {

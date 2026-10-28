@@ -30,6 +30,16 @@ export interface LoadConfig {
   useDraft: boolean
   /** Tokens to draft per step (--spec-draft-n-max); null = llama.cpp's default. */
   draftTokens: number | null
+  /** Fewest tokens worth drafting (--spec-draft-n-min); null = llama.cpp's default (0). */
+  draftMinTokens: number | null
+  /** Stop drafting once the draft's confidence falls below this (--spec-draft-p-min); null = default. */
+  draftPMin: number | null
+  /** How the draft picks its tokens (--spec-draft-sampling); 'auto' = llama.cpp's default. */
+  draftSampling: 'auto' | 'greedy' | 'probabilistic'
+  /** Where the draft head runs (--spec-draft-ngl): 'gpu' = all layers, 'cpu' = none. */
+  draftGpu: 'auto' | 'gpu' | 'cpu'
+  draftCacheTypeK: KvCacheType
+  draftCacheTypeV: KvCacheType
   seed: number | null
   chatTemplateFile: string
   parallel: number
@@ -51,7 +61,19 @@ export interface SamplingParams {
   seed: number | null
   /** JSON schema text for structured output; empty = disabled. */
   jsonSchema: string
+  /** Turn the template's thinking on or off (enable_thinking); 'auto' = the model's default. */
+  thinking: 'auto' | 'on' | 'off'
+  /** Effort level for templates that take one (reasoning_effort); 'default' = the template's own. */
+  reasoningEffort: ReasoningEffort
+  /** Most tokens to spend thinking before the answer is forced; null = unlimited, 0 = skip thinking. */
+  thinkingBudget: number | null
+  /** Text added when the thinking budget runs out, e.g. "Time to answer."; empty = none. */
+  thinkingBudgetMessage: string
 }
+
+export type ReasoningEffort = 'default' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+
+export const REASONING_EFFORTS: ReasoningEffort[] = ['default', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
 
 export type ContextOverflow = 'stop' | 'truncateMiddle'
 
@@ -273,6 +295,18 @@ export interface MemoryEstimate {
   freeVramBytes: number | null
   freeRamBytes: number
   verdict: 'fits' | 'partial' | 'tight' | 'unknown'
+  /** Per-GPU breakdown of gpuBytes for the GPUs the model would use; empty when GPUs are unknown. */
+  perGpu: GpuEstimate[]
+}
+
+export interface GpuEstimate {
+  index: number
+  name: string
+  /** Fraction of the split model this GPU holds (0..1). */
+  share: number
+  bytes: number
+  freeBytes: number
+  totalBytes: number
 }
 
 // ---------- Engine and instances ----------

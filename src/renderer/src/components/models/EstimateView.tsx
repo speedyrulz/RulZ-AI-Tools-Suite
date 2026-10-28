@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
-import type { LoadConfig, MemoryEstimate } from '@shared/types'
+import type { GpuEstimate, LoadConfig, MemoryEstimate } from '@shared/types'
 import { invoke } from '../../lib/api'
-import { formatBytes } from '../../lib/format'
+import { cn, formatBytes } from '../../lib/format'
 import { Badge } from '../ui'
 
 const VERDICT = {
@@ -47,6 +47,33 @@ export function EstimateView({ estimate }: { estimate: MemoryEstimate | null }) 
           value={estimate.kvBytes !== null ? formatBytes(estimate.kvBytes) : 'auto'}
           sub={estimate.contextLength ? `${estimate.contextLength.toLocaleString()} tokens` : 'sized by llama.cpp'}
         />
+      </div>
+      {estimate.perGpu.length > 0 && (
+        <div className="mt-3 space-y-2 border-t border-border pt-2.5">
+          {estimate.perGpu.map((g) => (
+            <GpuRow key={g.index} gpu={g} />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function GpuRow({ gpu }: { gpu: GpuEstimate }) {
+  const over = gpu.bytes > gpu.freeBytes * 0.95
+  const used = gpu.freeBytes > 0 ? Math.min(1, gpu.bytes / gpu.freeBytes) : 1
+  return (
+    <div className="space-y-1 text-xs">
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="min-w-0 truncate text-muted">
+          GPU{gpu.index}: {gpu.name} · {Math.round(gpu.share * 100)}%
+        </span>
+        <span className={cn('shrink-0 tabular-nums', over && 'text-danger')}>
+          {formatBytes(gpu.bytes)} <span className="text-faint">/ {formatBytes(gpu.freeBytes)} free</span>
+        </span>
+      </div>
+      <div className="h-1 overflow-hidden rounded-full bg-track">
+        <div className={cn('h-full rounded-full', over ? 'bg-danger' : 'bg-accent')} style={{ width: `${Math.round(used * 100)}%` }} />
       </div>
     </div>
   )

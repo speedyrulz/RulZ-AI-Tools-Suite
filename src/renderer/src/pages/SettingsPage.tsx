@@ -1,6 +1,7 @@
 import { CircleAlert, CircleCheck, FolderOpen, FolderSearch, RefreshCw } from 'lucide-react'
 import { useEffect, useState, type ReactNode } from 'react'
 import type { LoadConfig, SamplingParams } from '@shared/types'
+import { ThinkingFields } from '../components/chat/InferencePanel'
 import { LoadSettingsForm } from '../components/models/LoadSettingsForm'
 import { Button, Field, Input, Kbd, Select, Switch, Textarea } from '../components/ui'
 import { SHORTCUTS } from '../hooks/useShortcuts'
@@ -43,6 +44,7 @@ export function SettingsPage() {
   const update = useApp((s) => s.updateSettings)
   const refreshEngine = useApp((s) => s.refreshEngine)
   const [loadDefaults, setLoadDefaults] = useState<LoadConfig | null>(settings?.defaultLoadConfig ?? null)
+  const [thinking, setThinking] = useState<Partial<SamplingParams>>({})
 
   if (!settings) return null
 
@@ -142,6 +144,14 @@ export function SettingsPage() {
             <NumberSetting label="Min P" value={settings.defaultSampling.minP} step={0.01} onChange={(v) => void update({ defaultSampling: withSampling(settings.defaultSampling, 'minP', v) })} />
             <NumberSetting label="Repeat penalty" value={settings.defaultSampling.repeatPenalty} step={0.01} onChange={(v) => void update({ defaultSampling: withSampling(settings.defaultSampling, 'repeatPenalty', v) })} />
           </div>
+          <ThinkingFields
+            sampling={{ ...settings.defaultSampling, ...thinking }}
+            onChange={(key, v) => {
+              // Saving is async, so typed values are kept locally to stay responsive.
+              setThinking((t) => ({ ...t, [key]: v }))
+              void update({ defaultSampling: { ...useApp.getState().settings!.defaultSampling, ...thinking, [key]: v } })
+            }}
+          />
           <Field inline label="Expand reasoning blocks by default">
             <Switch checked={settings.expandThinking} onCheckedChange={(v) => void update({ expandThinking: v })} />
           </Field>

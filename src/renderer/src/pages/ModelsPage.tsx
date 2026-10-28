@@ -260,7 +260,7 @@ function ModelDetails({ model, onClose }: { model: ModelEntry; onClose: () => vo
             <h3 className="text-[11px] font-semibold tracking-wide text-faint uppercase">Default load settings</h3>
             {custom ? <Badge tone="accent">Custom</Badge> : <Badge>App defaults</Badge>}
           </div>
-          {config && <LoadSettingsForm model={model} config={config} onChange={setConfig} />}
+          {config && <LoadSettingsForm model={model} config={config} onChange={setConfig} estimate={estimate} />}
         </div>
         <EstimateView estimate={estimate} />
       </div>
