@@ -1300,7 +1300,7 @@ class Form:
             race=bool(v("race")), race_warmup_probes=int(v("race_warmup_probes") or 0),
             race_drop_lowest=bool(v("race_drop_lowest")), race_patience_drop=bool(v("race_patience_drop")),
             race_patience=int(v("race_patience") or 3),
-            race_parallel=bool(v("race_parallel")),
+            race_parallel=bool(v("race_parallel")), race_follow=bool(v("race_follow")),
             race_configs=self.w["race_configs"].value,
             soup_files=([p.strip() for p in (v("soup_files") or "").splitlines() if p.strip()]
                         if v("soup_run") else []),
@@ -2828,6 +2828,9 @@ def race_review_line(cfg: TrainConfig) -> str:
     rows = race.variant_configs(cfg)
     racers = "; ".join(f"{n}: {race.format_overrides(o) or 'the base setup'}" for n, _, o in rows)
     rules = []
+    if cfg.race_follow:
+        return (f"{len(rows)} racers ({racers}); a relay: after each round everyone continues from the round's "
+                f"winner, and the last round's winner is the run's LoRA")
     if cfg.race_drop_lowest:
         rules.append("the lowest leaves after each round" + (f" (after {cfg.race_warmup_probes} warm-up rounds)"
                                                              if cfg.race_warmup_probes else ""))
@@ -4336,6 +4339,14 @@ class Wizard:
     # ---- race: the rules
     def step_rules(self):
         self.heading("The race's rules", "When racers leave the race, and how the winner is chosen.")
+        with self.setting(None, "Relay: everyone continues from the round's winner",
+                          "Nobody is dropped. After each round every racer takes over the round winner's LoRA "
+                          "(weights, optimizer state, weight average, likeness history) and trains on with its own "
+                          "settings, seed, image order and noise. With racers that differ only in their seed, each "
+                          "round tries a few random paths from the best LoRA so far and keeps the best one. Every "
+                          "racer trains all the steps (one run's cost per racer); the last round's winner is the run's "
+                          "LoRA. Racers must share the LoRA's shape: no rank, alpha, layer or network type rows."):
+            self.bind(ui.switch("Relay: continue from the round's winner"), "race_follow")
         with self.setting(None, "Drop the lowest racer after each round",
                           "Every racer trains until its next probe, then the next one does; after a round the one "
                           "with the lowest likeness score leaves. Fast and cheap, but a racer that learns slowly and "
@@ -4363,7 +4374,7 @@ class Wizard:
                           show_if=("multi_gpu", lambda x: x == "data_parallel")):
             self.bind(ui.switch("One racer per GPU"), "race_parallel")
         self.race_estimate = ui.label("").classes("rz-banner info")
-        for key in ("race_drop_lowest", "race_warmup_probes", "race_patience_drop", "race_patience"):
+        for key in ("race_drop_lowest", "race_warmup_probes", "race_patience_drop", "race_patience", "race_follow"):
             self.w[key].on_value_change(lambda _: self.estimate_race())
         self.nav()
 
@@ -4381,7 +4392,14 @@ class Wizard:
             self.race_estimate.text = ("Pick at least two racers." if n < 2 else
                                        "The race runs on the likeness probes: set a probe interval (Samples page).")
             return
-        est = race.estimate_steps(n, cfg.race_warmup_probes, cfg.probe_every, cfg.steps, cfg.race_drop_lowest)
+        est = race.estimate_steps(n, cfg.race_warmup_probes, cfg.probe_every, cfg.steps,
+                                  cfg.race_drop_lowest and not cfg.race_follow)
+        if cfg.race_follow:
+            self.race_estimate.text = (
+                f"{n} racers in a relay: {est['rounds']} rounds, after each one everyone continues from its winner; "
+                f"{est['total']} training steps in all ({est['ratio']:.0f}x one run)"
+                + (f". Steps must be a multiple of {cfg.probe_every}." if cfg.steps % cfg.probe_every else "."))
+            return
         if cfg.race_drop_lowest:
             text = (f"{n} racers: {est['rounds']} rounds and {est['probes']} probes, about {est['total']} training "
                     f"steps in all ({est['ratio']:.1f}x one {cfg.steps}-step run)")
@@ -6435,9 +6453,22 @@ def build_page(local: bool = True):
                              "dropped; the last one left trains until Steps, which counts its own steps, so the race "
                              "adds the others' steps on top. They all start from the same LoRA initialisation and see "
                              "the same images and noise. A configuration changes only what its row lists; everything "
-                             "else on this page is shared. Needs the likeness probes above.")
+                             "else on this page is shared. Needs the likeness probes above. Relay instead: nobody is "
+                             "dropped, and after each round every configuration continues from that round's winner "
+                             "(Add seed racers for the best of several seeds at every probe).")
                         with fields():
                             w["race"] = ui.switch("Race these configurations", value=d.race)
+                            w["race_follow"] = ui.switch("Relay: everyone continues from the round's winner",
+                                                         value=d.race_follow) \
+                                .tooltip("Nobody is dropped. After each round (every configuration probed once) the "
+                                         "others take over the winner's LoRA: its weights, optimizer state, weight "
+                                         "average and likeness history, keeping their own settings, seed, image order "
+                                         "and noise. With seed racers that is the best of several random paths at "
+                                         "every probe, instead of whole runs on different seeds. Every configuration "
+                                         "trains all the steps (one run's cost each); the last round's winner is the "
+                                         "run's LoRA, the others are saved as _final files, and the best checkpoint "
+                                         "any of them reached is <job>_best. The rows must share the LoRA's shape (no "
+                                         "rank, alpha, layer or network type rows); not with one configuration per GPU.")
                             w["race_drop_lowest"] = ui.switch("Drop the lowest after each round",
                                                               value=d.race_drop_lowest) \
                                 .tooltip("Off: nobody is dropped for being behind; every configuration trains all the "
@@ -6445,7 +6476,7 @@ def build_page(local: bool = True):
                                          "score any of them reached. Costs up to one full run per configuration.")
                             w["race_warmup_probes"] = ui.number("Warm-up probe rounds (nobody is dropped)",
                                                                 value=d.race_warmup_probes, min=0, precision=0) \
-                                .classes("w-72").bind_visibility_from(w["race_drop_lowest"], "value")
+                                .classes("w-72")
                         with fields():
                             w["race_patience_drop"] = ui.switch("Drop each one when it stops improving",
                                                                 value=d.race_patience_drop) \
@@ -6456,7 +6487,7 @@ def build_page(local: bool = True):
                                          "best checkpoint becomes <job>_best.safetensors.")
                             w["race_patience"] = ui.number("Probes without improvement", value=d.race_patience,
                                                            min=1, precision=0).classes("w-56") \
-                                .bind_visibility_from(w["race_patience_drop"], "value")
+
                             w["race_parallel"] = ui.switch("One configuration per GPU at the same time",
                                                           value=d.race_parallel) \
                                 .bind_visibility_from(w["multi_gpu"], "value", lambda x: x == "data_parallel") \
@@ -6468,6 +6499,17 @@ def build_page(local: bool = True):
                                          "images per step, the same for all. Not with the identity loss; no "
                                          "torch.compile.")
                         race_summary = hint("")
+
+                        def race_rules_visible(_=None):
+                            relay = bool(w["race_follow"].value)
+                            w["race_drop_lowest"].set_visibility(not relay)
+                            w["race_warmup_probes"].set_visibility(not relay and bool(w["race_drop_lowest"].value))
+                            w["race_patience_drop"].set_visibility(not relay)
+                            w["race_patience"].set_visibility(not relay and bool(w["race_patience_drop"].value))
+
+                        for key in ("race_follow", "race_drop_lowest", "race_patience_drop"):
+                            w[key].on_value_change(race_rules_visible)
+                        race_rules_visible()
 
                         def race_summary_update():
                             from rulztrainer import race
@@ -6483,8 +6525,15 @@ def build_page(local: bool = True):
                                 race_summary.text = ("Add at least two configurations." if len(rows) < 2 else
                                                      "Set 'Probe every N steps' above: the race runs on the probes.")
                                 return
-                            lowest = bool(w["race_drop_lowest"].value)
+                            lowest = bool(w["race_drop_lowest"].value) and not w["race_follow"].value
                             est = race.estimate_steps(len(rows), warmup, every, steps, lowest)
+                            if w["race_follow"].value:
+                                race_summary.text = (
+                                    f"Relay of {len(rows)} configurations: {est['rounds']} rounds, after each one "
+                                    f"everyone continues from its winner; {est['total']} training steps in all "
+                                    f"({est['ratio']:.0f}x the run)."
+                                    + (f" Steps must be a multiple of {every}." if steps % every else ""))
+                                return
                             patience = (f" A configuration leaves after {int(w['race_patience'].value or 0)} probes "
                                         "without improvement; the winner is the best score anyone reached."
                                         if w["race_patience_drop"].value else "")
@@ -6506,8 +6555,31 @@ def build_page(local: bool = True):
                         with ui.row().classes("items-center gap-2"):
                             ui.button("Add configuration", icon="add",
                                       on_click=lambda: w["race_configs"].add()).props("outline")
+                            race_seeds = ui.input("Seeds", value="1-4").classes("w-32") \
+                                .tooltip("Seeds for Add seed racers: 1, 2, 3 or a range 1-4")
+
+                            def add_seed_racers():
+                                from rulztrainer import race
+
+                                try:
+                                    seeds = race.parse_seeds(race_seeds.value)
+                                    rows = w["race_configs"].value
+                                except ValueError as e:
+                                    ui.notify(str(e), type="warning")
+                                    return
+                                have = {r.get("seed") for r in rows}
+                                new = [r for r in race.seed_rows(seeds) if r["seed"] not in have]
+                                w["race_configs"].value = rows + new
+                                w["race"].value = True
+                                w["race_follow"].value = True
+                                race_summary_update()
+                                ui.notify(f"Added {len(new)} seed racers; relay on", type="positive")
+
+                            ui.button("Add seed racers", icon="casino", on_click=add_seed_racers).props("outline") \
+                                .tooltip("One racer per seed, the run's settings otherwise, and the relay on: after "
+                                         "each probe round every seed continues from the one that probed best")
                         for key in ("steps", "probe_every", "race_warmup_probes", "race_drop_lowest",
-                                    "race_patience_drop", "race_patience"):
+                                    "race_patience_drop", "race_patience", "race_follow"):
                             w[key].on_value_change(lambda _: race_summary_update())
                         with advanced("What a configuration may change"):
                             from rulztrainer.race import RACE_KEYS
@@ -6986,12 +7058,16 @@ def build_page(local: bool = True):
                     running_now = _running()
                     for n in names:
                         manual = n in (rc.get("manual") or [])
+                        relay_done = rc.get("follow") and n in (rc.get("finished") or [])
                         state = ("winner" if rc.get("winner") == n else
+                                 "finished (lost the last round)" if relay_done else
                                  f"dropped by you in round {dropped[n]}" if n in dropped and manual else
                                  f"out after round {dropped[n]}" if n in dropped
                                  else "training" if (n in (rc.get("lanes") or []) or (rc.get("active") == n
                                                                                        and not rc.get("parallel")))
                                  else "waiting its turn")
+                        if rc.get("follow") and rc.get("leader") == n and not rc.get("winner"):
+                            state += " (led the last round)"
                         per_round = [(h["scores"].get(n), (h.get("steps") or {}).get(n))
                                      for h in rc.get("history") or [] if n in h["scores"]]
                         at = (rc.get("score_steps") or {}).get(n)
@@ -7005,7 +7081,12 @@ def build_page(local: bool = True):
                     race_table.rows = rows
                     race_table.update()
                     est = rc.get("estimate") or {}
-                    race_label.text = (f"{rc.get('winner')} won; it trains on to the end" if rc.get("winner") else
+                    race_label.text = (f"{rc.get('winner')} won the relay's last round; its LoRA is the run's"
+                                       if rc.get("winner") and rc.get("follow") else
+                                       f"{rc.get('winner')} won; it trains on to the end" if rc.get("winner") else
+                                       f"Relay round {rc.get('round')}: everyone continues from "
+                                       f"{rc.get('leader') or 'the round winner'} after each round, "
+                                       f"{est.get('total')} steps in all" if rc.get("follow") else
                                        f"Round {rc.get('round')}: {len(rc.get('alive') or [])} of {len(names)} "
                                        f"configurations left, about {est.get('total')} steps in all")
                 probes = st.get("probes") or []
@@ -7468,6 +7549,13 @@ continues with the run's own names, and `<job>_winner.yaml` holds its settings. 
 the race. With data parallel on 2+ GPUs, *One configuration per GPU at the same time* trains the configurations side
 by side (an odd one left over splits over the GPUs, or runs on the first). The Monitor tab shows each configuration's score per round, with a *Drop* button on each one still in: it stops
 that configuration after the current step, saves its LoRA as `_dropped` and the race goes on without it (one left wins).
+
+*Relay: everyone continues from the round's winner* drops nobody: after each round the others take over the round
+winner's LoRA, optimizer state, weight average and likeness history, and train the next round with their own settings,
+seed, image order and noise. *Add seed racers* (seeds such as `1-4`) adds one `seed=` row per seed and turns it on: the
+best of several seeds at every probe instead of separate runs. Every racer trains all the steps (N racers, N runs'
+steps); the last round's winner is the run's LoRA, the others are `_final` files, and `<job>_best` is the best any of
+them reached. Rows may not change the LoRA's shape (rank, alpha, layers, adapter); not with one configuration per GPU.
 
 ## LoRA Isolation
 *LoRA Isolation* (Train tab) keeps your subject(s) off everyone else in a picture, after Fizgig's: every caption that

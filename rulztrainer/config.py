@@ -452,6 +452,8 @@ class TrainConfig:
     race_patience_drop: bool = False  # a configuration leaves after race_patience probes of its own without
     #                                   improvement; the winner is the best score anyone reached
     race_patience: int = 3
+    race_follow: bool = False  # a relay: nobody is dropped; after each round everyone continues from its winner's
+    #                            LoRA, optimizer state and likeness history (seed rows: the best of several paths)
     race_parallel: bool = False  # data_parallel race: one configuration per GPU at the same time (an odd one out
     #                              is split over the GPUs when its step has batches enough, else it runs on the first)
     sample_model_path: str = ""  # optional different diffusion model for sampling only: .safetensors, diffusers dir or repo id

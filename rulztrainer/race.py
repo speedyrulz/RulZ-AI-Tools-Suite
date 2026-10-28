@@ -21,6 +21,12 @@ The trainer keeps one set of LoRA wrappers over the union of every configuration
 outgoing configuration's weights, optimizer state and weight average on the CPU and puts the next one's in: its
 weights (any rank), scale, dropout and enabled layers (swap_in / swap_out).
 
+race_follow (a relay) drops nobody: after each round every configuration continues from that round's winner (the
+highest smoothed score): its LoRA weights, optimizer state, weight average and likeness history, while keeping its
+own settings, seed, image order and noise. With seed rows, every round tries a few random paths from the best LoRA so
+far and keeps the one that probed best. Every configuration trains `steps` of its own (n x one run); the last round's
+winner is the run's LoRA. The configurations must share the LoRA's shape (no rank, alpha, layer or network rows).
+
 With race_parallel (data parallel, 2+ GPUs) the configurations train side by side instead: a "wave" of one
 configuration per GPU runs the same steps at the same time, each on its GPU's own model copy, and is probed at the
 end of its turn as before; an odd one left over trains alone, split over the GPUs when its step has batches enough
@@ -70,6 +76,8 @@ RACE_KEYS: dict[str, tuple[str, ...]] = {
     "Seed": ("seed",),
 }
 ALLOWED = {k for keys in RACE_KEYS.values() for k in keys}
+# what a relay (race_follow) cannot change: the winner's weights must fit every configuration's LoRA as they are
+SHAPE_KEYS = tuple(k for k in RACE_KEYS["LoRA rank & layers"] if k != "lora_dropout")
 REGION_KEYS = ("face_loss_weight", "body_loss_weight", "background_loss_weight", "face_margin", "region_feather_cells")
 NAME_RE = re.compile(r"[A-Za-z0-9_.+-]{1,40}")
 
@@ -191,6 +199,17 @@ def validate(cfg) -> None:
         raise ValueError("race_warmup_probes must be 0 or more")
     if getattr(cfg, "race_patience_drop", False) and int(cfg.race_patience) < 1:
         raise ValueError("race_patience must be 1 or more (probes without improvement before a configuration leaves)")
+    follow = bool(getattr(cfg, "race_follow", False))
+    if follow:
+        if getattr(cfg, "race_parallel", False):
+            raise ValueError("a relay race (race_follow) takes turns on the GPUs: turn race_parallel off")
+        shaped = sorted({k for r in rows if isinstance(r, dict) for k in r if k in SHAPE_KEYS})
+        if shaped:
+            raise ValueError(f"in a relay race (race_follow) every configuration continues from the round's winner, "
+                             f"so they must share the LoRA's shape: remove {', '.join(shaped)} from the rows")
+        if cfg.steps % cfg.probe_every:
+            raise ValueError(f"in a relay race every configuration trains to the last step and is probed there: make "
+                             f"steps ({cfg.steps}) a multiple of probe_every ({cfg.probe_every})")
     if getattr(cfg, "race_parallel", False):
         from .multigpu import parse_devices
 
@@ -224,11 +243,11 @@ def validate(cfg) -> None:
             vcfg.validate()
         except ValueError as e:
             raise ValueError(f"race configuration '{name}': {e}") from e
-    if not getattr(cfg, "race_drop_lowest", True) and cfg.steps % cfg.probe_every:
+    drop_lowest = getattr(cfg, "race_drop_lowest", True) and not follow
+    if not drop_lowest and cfg.steps % cfg.probe_every:
         raise ValueError(f"without dropping the lowest every configuration trains to the last step and is probed "
                          f"there: make steps ({cfg.steps}) a multiple of probe_every ({cfg.probe_every})")
-    est = estimate_steps(len(rows), cfg.race_warmup_probes, cfg.probe_every, cfg.steps,
-                         getattr(cfg, "race_drop_lowest", True))
+    est = estimate_steps(len(rows), cfg.race_warmup_probes, cfg.probe_every, cfg.steps, drop_lowest)
     if est["drop_lowest"] and cfg.steps < est["race_own_steps"]:
         raise ValueError(f"the race needs at least {est['race_own_steps']} steps ({len(rows)} configurations, "
                          f"{cfg.race_warmup_probes} warm-up probes, a probe every {cfg.probe_every} steps); raise "
@@ -265,11 +284,15 @@ class RaceSchedule:
     drop_lowest the winner is decided at the end of the run: the best score any configuration reached (champion)."""
 
     def __init__(self, names: list[str], warmup: int, drop_lowest: bool = True, patience: int = 0,
-                 total_steps: int | None = None):
+                 total_steps: int | None = None, follow: bool = False):
         self.names = list(names)
         self.warmup = int(warmup)
-        self.drop_lowest = bool(drop_lowest)
-        self.patience = max(0, int(patience))
+        # follow (a relay): nobody leaves until every one has trained total_steps; each round names a leader that
+        # the others continue from, and the last round's leader wins
+        self.follow = bool(follow)
+        self.drop_lowest = bool(drop_lowest) and not self.follow
+        self.patience = 0 if self.follow else max(0, int(patience))
+        self.leader: int | None = None  # the latest round's winner (follow)
         self.total_steps = total_steps
         self.alive = list(range(len(names)))
         self.round = 1
@@ -292,7 +315,7 @@ class RaceSchedule:
     @property
     def keeps_all(self) -> bool:
         """The winner is the best score reached by anyone, decided at the end (not the last one left)."""
-        return self.patience > 0 or not self.drop_lowest
+        return not self.follow and (self.patience > 0 or not self.drop_lowest)
 
     @property
     def done(self) -> bool:
@@ -323,7 +346,9 @@ class RaceSchedule:
         if best is not None:
             self.best[idx], self.best_step[idx] = best, best_step
         why = None
-        if self.patience and since_improve is not None and since_improve >= self.patience:
+        if self.follow:
+            pass  # a relay keeps everyone until the last round
+        elif self.patience and since_improve is not None and since_improve >= self.patience:
             why = "patience"
         elif not self.drop_lowest and self.total_steps and step is not None and step >= self.total_steps:
             why = "finished"
@@ -339,11 +364,22 @@ class RaceSchedule:
                  "steps": {self.names[i]: self.steps.get(i) for i in self.members}, "dropped": None,
                  "left": {self.names[i]: w for i, w in self.left.items()}}
         dropped = None
-        if self.drop_lowest and self.round > self.warmup and not self.done:
-            def key(i):
-                s = self.scores.get(i)
-                return (-math.inf if s is None else s, -i)
 
+        def key(i):
+            s = self.scores.get(i)
+            return (-math.inf if s is None else s, -i)
+
+        if self.follow:  # the round's highest score leads (a tie keeps the leader, else the earlier row wins)
+            self.leader = max(self.alive, key=lambda i: (key(i)[0], i == self.leader, -i))
+            entry["leader"] = self.names[self.leader]
+            if self.total_steps and all((self.steps.get(i) or 0) >= self.total_steps for i in self.alive):
+                for i in [i for i in self.alive if i != self.leader]:
+                    self.alive.remove(i)
+                    self.dropped[i] = self.round
+                    self.finished.add(i)
+                    self.just_dropped.append(i)
+                entry["final"] = True
+        elif self.drop_lowest and self.round > self.warmup and not self.done:
             dropped = min(self.alive, key=key)
             self.alive.remove(dropped)
             self.dropped[dropped] = self.round
@@ -386,9 +422,14 @@ class RaceSchedule:
             self.pending = []
             return
         if not self.pending:
-            self.history.append({"round": self.round, "scores": {self.names[i]: self.scores.get(i) for i in self.alive},
-                                 "steps": {self.names[i]: self.steps.get(i) for i in self.alive},
-                                 "dropped": self.names[idx], "manual": True})
+            entry = {"round": self.round, "scores": {self.names[i]: self.scores.get(i) for i in self.alive},
+                     "steps": {self.names[i]: self.steps.get(i) for i in self.alive},
+                     "dropped": self.names[idx], "manual": True}
+            if self.follow:  # the round still names its leader (nobody continues from it: weights stay as they are)
+                self.leader = max(self.alive, key=lambda i: (-math.inf if self.scores.get(i) is None
+                                                             else self.scores[i], -i))
+                entry["leader"] = self.names[self.leader]
+            self.history.append(entry)
             self.round += 1
             self.scores, self.steps, self.left = {}, {}, {}
             self.pending = list(self.alive)
@@ -404,7 +445,8 @@ class RaceSchedule:
                 "manual": [self.names[i] for i in sorted(self.manual)],
                 "stale": [self.names[i] for i in sorted(self.stale)],
                 "finished": [self.names[i] for i in sorted(self.finished)],
-                "drop_lowest": self.drop_lowest, "patience": self.patience,
+                "drop_lowest": self.drop_lowest, "patience": self.patience, "follow": self.follow,
+                "leader": self.names[self.leader] if self.leader is not None else None,
                 "best": {self.names[i]: b for i, b in self.best.items()},
                 "best_step": {self.names[i]: s for i, s in self.best_step.items()},
                 "last": self.names[self.alive[0]] if self.done and self.alive else None,
@@ -591,6 +633,73 @@ def onload_optimizer(opt, moved: list) -> None:
         opt.state[p][k] = opt.state[p][k].to(dev)
 
 
+def seed_rows(seeds, prefix: str = "seed") -> list[dict]:
+    """Race rows that differ only in their seed: [{"name": "seed1", "seed": 1}, ...] (duplicates dropped)."""
+    out = []
+    for s in seeds:
+        s = int(s)
+        if all(r["seed"] != s for r in out):
+            out.append({"name": f"{prefix}{s}", "seed": s})
+    return out
+
+
+def parse_seeds(text: str) -> list[int]:
+    """"1, 2, 3" or "1-4" or "7 9 11-12" -> the seeds, in order."""
+    out = []
+    for part in re.split(r"[,\s]+", (text or "").strip()):
+        if not part:
+            continue
+        lo, sep, hi = part.partition("-")
+        if sep and lo:
+            a, b = int(lo), int(hi)
+            if b < a or b - a > 63:
+                raise ValueError(f"'{part}' is not a seed range (low-high, at most 64 seeds)")
+            out.extend(range(a, b + 1))
+        else:
+            out.append(int(part))
+    return out
+
+
+@torch.no_grad()
+def follow_leader(win: Variant, v: Variant) -> list[str]:
+    """A relay race: `v` continues from the round's winner `win`, both parked (weights, optimizer state and weight
+    average on the CPU). v takes win's LoRA weights, optimizer state (when the optimizers are of one kind; else v's
+    starts over), weight average and likeness history, and keeps its own settings, seed, image order, noise,
+    learning-rate schedule and likeness lr factor and curriculum bias (they belong to its own settings and optimizer).
+    The trainer's LoRA wrappers are shared, so both optimizers key their state by the same parameters. Returns notes
+    on what could not be carried over."""
+    import copy
+
+    notes = []
+    v.weights = {name: {part: t.detach().clone() for part, t in parts.items()} for name, parts in win.weights.items()}
+    wo, vo = win.state.get("optimizer"), v.state.get("optimizer")
+    if vo is not None:
+        vo.state.clear()
+        v.offloaded = []
+        if wo is not None and type(wo) is type(vo):
+            for p, st in wo.state.items():
+                vo.state[p] = {k: t.detach().clone() if torch.is_tensor(t) else copy.deepcopy(t) for k, t in st.items()}
+            v.offloaded = list(win.offloaded)
+        else:
+            notes.append(f"{v.name}'s optimizer ({type(vo).__name__}) starts over: {win.name} uses "
+                         f"{type(wo).__name__ if wo is not None else 'none'}")
+    we, ve = win.state.get("ema"), v.state.get("ema")
+    if ve is not None:
+        if we is not None:
+            ve.shadow = [s.detach().clone() for s in we.shadow]
+            ve.images, ve.updates = we.images, we.updates
+        else:  # the average starts over from the winner's weights
+            flat = {f"{name}.{part}": t for name, parts in v.weights.items() for part, t in parts.items()}
+            ve.shadow = [flat[k].float().clone() for k in ve.keys]
+            ve.images = ve.updates = 0
+    wc, vc = win.state.get("controller"), v.state.get("controller")
+    if wc is not None and vc is not None:
+        c = copy.deepcopy(wc, {id(wc.cfg): vc.cfg})
+        c.lr_factor, c.face_bias = vc.lr_factor, vc.face_bias
+        v.state["controller"] = c
+    return notes
+
+
 def move_average(ema, to_cpu: bool) -> None:
     """Park a LoraEMA's shadow on the CPU, or bring it back to its weights' devices."""
     if ema is None:
@@ -636,6 +745,7 @@ class RaceRun:
     base_cfg: object
     estimate: dict
     active: Variant | None = None
+    best_saved: dict = dataclasses.field(default_factory=dict)  # relay: the best scores saved so far, by kind
 
     @property
     def running(self) -> bool:
@@ -647,8 +757,12 @@ def describe_round(entry: dict, schedule: RaceSchedule) -> str:
     fmt = ", ".join(f"{n} {'n/a' if s is None else f'{s:.1f}%'}" for n, s in entry["scores"].items())
     why = {"patience": f"out after {schedule.patience} probes without improvement", "finished": "finished its steps"}
     parts = [f"{n} {why[w]}" for n, w in (entry.get("left") or {}).items()]
+    if entry.get("leader") and entry.get("final"):
+        parts.append(f"{entry['leader']} wins the last round")
+    elif entry.get("leader"):
+        parts.append(f"{entry['leader']} leads: everyone continues from its LoRA")
     if entry.get("dropped"):
-        parts.append(f"{entry['dropped']} is out (lowest)")
+        parts.append(f"{entry['dropped']} is out ({'by hand' if entry.get('manual') else 'lowest'})")
     elif schedule.drop_lowest and entry["round"] <= schedule.warmup:
         parts.append("warm-up: nobody is dropped")
     return f"{entry['round']}: {fmt}" + (f" -> {'; '.join(parts)}" if parts else "")

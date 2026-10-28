@@ -1655,8 +1655,14 @@ class Trainer(RaceParallelMixin):
             log.info("Race in parallel: one configuration per GPU at the same time; a lone one left over trains over "
                      "every GPU when that is faster, else on the first (no torch.compile, no identity loss)")
         est = race_mod.estimate_steps(len(rows), cfg.race_warmup_probes, cfg.probe_every, cfg.steps,
-                                      cfg.race_drop_lowest)
-        if cfg.race_drop_lowest:
+                                      cfg.race_drop_lowest and not cfg.race_follow)
+        if cfg.race_follow:
+            log.info("Relay race: %d configurations, a probe every %d steps; after each round everyone continues from "
+                     "the round's winner (its LoRA, optimizer state, weight average and likeness history) with its "
+                     "own settings, seed, image order and noise. %d training steps in all (%.0fx one %d-step run); "
+                     "the last round's winner is the run's LoRA", len(rows), cfg.probe_every, est["total"],
+                     est["ratio"], cfg.steps)
+        elif cfg.race_drop_lowest:
             log.info("Configuration race: %d configurations, %d warm-up probe round(s), a probe every %d steps: %d "
                      "rounds and %d probes, about %d training steps in all (%.1fx one %d-step run)", len(rows),
                      cfg.race_warmup_probes, cfg.probe_every, est["rounds"], est["probes"], est["total"], est["ratio"],
@@ -1665,7 +1671,7 @@ class Trainer(RaceParallelMixin):
             log.info("Configuration race without dropping the lowest: %d configurations, a probe every %d steps; each "
                      "trains up to %d steps of its own, at most %d training steps in all (%.1fx one run)", len(rows),
                      cfg.probe_every, cfg.steps, est["total"], est["ratio"])
-        if cfg.race_patience_drop:
+        if cfg.race_patience_drop and not cfg.race_follow:
             log.info("Race: a configuration leaves after %d probes of its own without improvement; the winner is the "
                      "highest smoothed score any configuration reached", cfg.race_patience)
         for name, _, over in rows:
@@ -1711,9 +1717,10 @@ class Trainer(RaceParallelMixin):
                      name, len(names), n_w / 1e6, v.label, len(v.state["items"]))
             variants.append(v)
         est = race_mod.estimate_steps(len(variants), base.race_warmup_probes, base.probe_every, base.steps,
-                                      base.race_drop_lowest)
+                                      base.race_drop_lowest and not base.race_follow)
         sched = race_mod.RaceSchedule([v.name for v in variants], base.race_warmup_probes, base.race_drop_lowest,
-                                      base.race_patience if base.race_patience_drop else 0, base.steps)
+                                      base.race_patience if base.race_patience_drop else 0, base.steps,
+                                      follow=base.race_follow)
         self.race = race_mod.RaceRun(variants, sched, wrappers, base, est)
         if self.race_parallel:  # every configuration trains on its own parameters (race_parallel.py)
             self.race.active = variants[0]
@@ -1799,15 +1806,38 @@ class Trainer(RaceParallelMixin):
         for i in rr.schedule.just_dropped:
             self._race_drop(rr.variants[i])
         nxt = rr.variants[rr.schedule.current]
+        relay = rr.schedule.follow and len(rr.schedule.history) > rounds and not rr.schedule.done
         if nxt is not cur:
             if cur.alive:
                 self._race_park(cur)
+            if relay:
+                self._race_follow(rr.variants[rr.schedule.leader])
             self._race_activate(nxt)
             free_cuda()
         if rr.schedule.done:
             self._race_finish()
         self._race_report()
         return nxt
+
+    def _race_follow(self, win) -> None:
+        """A relay race's round is over (everyone parked): every other configuration continues from the winner."""
+        for v in self.race.variants:
+            if v is not win and v.alive and v.started:
+                for note in race_mod.follow_leader(win, v):
+                    log.warning("Relay race: %s", note)
+        log.info("Relay race: everyone continues from %s's LoRA (step %s)", win.name, win.state.get("step"))
+
+    def _race_keeps_best(self, kind: str, score) -> bool:
+        """A relay race shares one lineage, so its best checkpoints are shared too: a configuration's new best of its
+        own is saved only when it beats the best saved by any of them (kind: "" combined, "face", "body")."""
+        rr = self.race
+        if rr is None or not rr.schedule.follow or not self._race_running() or score is None:
+            return True
+        prev = rr.best_saved.get(kind)
+        if prev is not None and score <= prev:
+            return False
+        rr.best_saved[kind] = score
+        return True
 
     def _race_record(self, v, controller) -> None:
         """Record a configuration's probe in the schedule: its smoothed score, its best and its probes since the best."""
@@ -1940,6 +1970,11 @@ class Trainer(RaceParallelMixin):
                      win.name, race_mod.format_overrides(win.overrides) or "the run's own settings", cfg.steps)
             return
         win_cfg.save(self.job_dir / f"{cfg.job_name}_winner.yaml")
+        if rr.schedule.follow:
+            log.info("Relay race over: %s won the last round (%s); its LoRA is the run's, the others' are their "
+                     "_final files, and the best checkpoint any of them reached is %s_best.safetensors", win.name,
+                     race_mod.format_overrides(win.overrides) or "the run's own settings", cfg.job_name)
+            return
         log.info("Race over: %s wins (%s); it trains on to step %d with the run's own file names (its settings: %s)",
                  win.name, race_mod.format_overrides(win.overrides) or "the run's own settings", cfg.steps,
                  f"{cfg.job_name}_winner.yaml")
@@ -1979,6 +2014,12 @@ class Trainer(RaceParallelMixin):
     def _file_tag(self) -> str:
         """While a race runs, files of the training configuration carry its name; the reward stage's carry _reward."""
         return (f"_{self.race.active.name}" if self._race_running() else "") + getattr(self, "stage_tag", "")
+
+    def _best_tag(self) -> str:
+        """Best checkpoints' tag: a relay race's racers share one lineage and so one <job>_best file."""
+        if self._race_running() and self.race.schedule.follow:
+            return getattr(self, "stage_tag", "")
+        return self._file_tag()
 
     def _image_prefix(self) -> str:
         return f"{self.race.active.name}_" if self._race_running() else ""
@@ -3279,10 +3320,16 @@ class Trainer(RaceParallelMixin):
             log.info("Resolution step-up: stage %d stalled for %d probe(s) (stage best %s)", rec.stage + 1,
                      rec.stage_since_improve, fmt(rec.stage_best))
             self._enter_stage(actions["step_up"], step)
+        if actions.get("save_best") and not self._race_keeps_best("", rec.best):
+            actions["save_best"] = False  # a relay racer's best of its own, below the one already saved this round
+        for kind in ("face", "body"):
+            if actions.get(f"save_best_{kind}") and not self._race_keeps_best(kind,
+                                                                              self.controller.part_best[kind][0]):
+                actions[f"save_best_{kind}"] = False
         if actions.get("save_best") and getattr(self, "ft", None) is not None:
             path = self._finetune_save(step, True, label="_best")
         elif actions.get("save_best"):
-            path = self.job_dir / f"{cfg.job_name}{self._file_tag()}_best.safetensors"
+            path = self.job_dir / f"{cfg.job_name}{self._best_tag()}_best.safetensors"
             lora_mod.save_lora(injected, path, metadata={"ss_steps": str(step), "likeness_best": f"{rec.best:.2f}",
                                                          "modelspec.architecture": self.arch.modelspec},
                                dtype=cfg.lora_save_dtype, fmt=self.arch.lora_format)
@@ -3296,7 +3343,7 @@ class Trainer(RaceParallelMixin):
                 if getattr(self, "ft", None) is not None:
                     path = self._finetune_save(step, True, label=f"_best_{kind}")
                 else:
-                    path = self.job_dir / f"{cfg.job_name}{self._file_tag()}_best_{kind}.safetensors"
+                    path = self.job_dir / f"{cfg.job_name}{self._best_tag()}_best_{kind}.safetensors"
                     lora_mod.save_lora(injected, path, metadata={"ss_steps": str(step),
                                                                  f"likeness_best_{kind}": f"{score:.2f}",
                                                                  "modelspec.architecture": self.arch.modelspec},

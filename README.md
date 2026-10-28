@@ -1107,6 +1107,22 @@ winner. A configuration that leaves on patience is saved as `<job>_<name>_droppe
 steps as `<job>_<name>_final.safetensors`, and each keeps its `<job>_<name>_best.safetensors`. Both work with the
 round drops on (`race_drop_lowest: true`), and in parallel races.
 
+**Relay: everyone continues from the round's winner (`race_follow: true`).** Nobody is dropped. After each round
+(every configuration trained `probe_every` steps and was probed) the round's winner, the highest smoothed combined
+score, hands everything it learned to the others: its LoRA weights, optimizer state, weight average and likeness
+history (best, smoothing, patience). Each keeps its own settings, seed, image order, noise, learning-rate schedule and
+likeness lr factor, and trains the next round from there. Rows that differ only in their seed make this the best of
+several random paths at every probe, instead of whole runs on different seeds: the WebUI's **Add seed racers** button
+(seeds `1-4`, or `1, 5, 9`) adds one `seed=` row per seed and turns the relay on. Every configuration trains all the
+steps (`steps` must be a multiple of `probe_every`): N configurations cost N runs' steps. The last round's winner is the
+run's LoRA (`<job>.safetensors`, its settings `<job>_winner.yaml`), the others are saved as
+`<job>_<name>_final.safetensors`, and since they share one lineage, the best checkpoint any of them reached is
+`<job>_best.safetensors`. Rows must share the LoRA's shape (no `lora_rank`, `lora_alpha`, targets, blocks, network type
+or DoRA rows; `lora_dropout` is fine), the drop and patience rules are ignored, and it does not run with
+`race_parallel`. A configuration on another kind of optimizer than the winner's starts its optimizer state over (the
+log says so). With 4 seeds the round's best of 4 probes is somewhat lucky: the probe noise (a few points) is part of
+what picks the winner, so more probe seeds (`probe_seeds`) make the choice steadier.
+
 **One configuration per GPU (`race_parallel: true`).** With `multi_gpu: data_parallel` on two or more GPUs, the
 configurations of a round train side by side instead of in turn: each GPU's model copy trains its own configuration
 at the same moment, both run the same `probe_every` steps, and each is probed at the end of its turn as before. With
