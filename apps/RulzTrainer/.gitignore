@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+models/
+output/
+datasets/
+*.safetensors
+.cache/
+venv/
+configs/*
+!configs/example.yaml
+.webui_job.json

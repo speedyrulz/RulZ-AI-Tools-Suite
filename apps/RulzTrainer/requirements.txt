@@ -1,0 +1,20 @@
+torch>=2.9
+diffusers>=0.41
+openpyxl>=3.1
+transformers>=5.3
+accelerate>=1.10
+safetensors>=0.6
+huggingface_hub>=0.30
+Pillow>=10
+pyyaml>=6
+nicegui>=2
+bitsandbytes>=0.45
+# fused W8A8 kernels (rulztrainer/quant.py); Linux torch wheels already bundle triton
+triton-windows>=3.8; sys_platform == "win32"
+# optional: face / body similarity scoring for character LoRAs
+insightface>=0.7
+onnxruntime-gpu>=1.17
+mediapipe>=0.10
+# optional: identity loss with the arcface backend (id_loss_backend: arcface)
+onnx2torch>=1.5
+psutil>=5.9  # WebUI reattaches to a running training job
