@@ -149,3 +149,56 @@ def test_the_reward_stage_closes_with_a_likeness_probe():
     t.controller = None  # probes off: nothing to probe with
     Trainer._reward_final_probe(t, None, 1500, None, None, {})
     assert calls == [1450]
+
+
+def test_a_part_far_below_a_stranger_is_capped():
+    assert RW.clip_part(0.4) == (0.4, False)
+    assert RW.clip_part(-2.3) == (RW.PART_MIN, True)
+    assert RW.clip_part(3.0) == (RW.PART_MAX, False)
+
+
+def test_clothed_bodies_against_unclothed_references_leave_the_ranking_to_the_face():
+    """my_lora18's log: bodies 20+ raw points below the stranger level on clothed prompts made rewards of -2 and
+    worse, so the body, not the face, picked each group's winner."""
+    import logging
+
+    from rulztrainer.config import TrainConfig
+    from rulztrainer.trainer import Trainer
+
+    class Face:
+        def __init__(self, pcts):
+            self.pcts = iter(pcts)
+
+        def score(self, path, *_):
+            return type("S", (), {"percent": next(self.pcts)})()
+
+    class Body:
+        def __init__(self, pcts):
+            self.pcts = iter(pcts)
+
+        def score(self, path):
+            return next(self.pcts), 8
+
+    class Scale:
+        normalize = True
+
+        def scale(self, kind):
+            return (10.0, 80.0) if kind == "face" else (78.0, 89.0)  # the body's scale is ~6x narrower
+
+    t = Trainer.__new__(Trainer)
+    t.cfg = TrainConfig(face_weight=0.5, body_weight=0.5, reward_group=4, reward_prompts=["photo of x in a coat"])
+    faces = [70.0, 60.0, 50.0, 40.0]  # the first picture looks most like the person
+    bodies = [52.0, 56.0, 50.0, 54.0]  # all far below a stranger (78): coats against unclothed references
+    t.face_scorer, t.body_scorer = Face(faces), Body(bodies)
+    t._reward_body_seen = t._reward_body_low = 0
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    logging.getLogger("rulztrainer").addHandler(handler)
+    try:
+        rewards = [t._reward_of(f"p{k}.png", "photo of x in a coat", Scale()) for k in range(4)]
+    finally:
+        logging.getLogger("rulztrainer").removeHandler(handler)
+    assert rewards == sorted(rewards, reverse=True)  # the face decides
+    assert min(rewards) > -1.0
+    assert any("far below a stranger" in r.getMessage() for r in records)

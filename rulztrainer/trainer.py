@@ -1228,15 +1228,16 @@ class Trainer(RaceParallelMixin):
                 model.train()
             racing = self._race_running()
             final_too = self.race is not None and self.race.schedule.keeps_all  # scored at the end like the others
-            if self.controller is not None and step % cfg.probe_every == 0 and (step < cfg.steps or racing
-                                                                                 or final_too):
+            last = step >= cfg.steps and not racing  # the final LoRA's own score, whatever probe_every
+            if self.controller is not None and (step % cfg.probe_every == 0 and (step < cfg.steps or racing
+                                                                                  or final_too) or last):
                 stop = self.run_probe(model, step, optimizer, scheduler, injected)
                 model.train()
                 if racing:  # the race decides who goes on: record, maybe drop, and switch configuration
                     stop = False
                     self.race.active.state.update(step=step, losses=losses, id_losses=id_losses)
                     bind(self._race_after_probe())
-                if stop:
+                if stop and not last:
                     log.info("Likeness controller: no improvement for %d probes%s, stopping at step %d",
                              cfg.step_up_stop_patience if cfg.resolution_step_up else cfg.likeness_patience,
                              " at the highest resolution" if cfg.resolution_step_up else "", step)
@@ -2728,6 +2729,7 @@ class Trainer(RaceParallelMixin):
         kept = ckpt.kept_blocks(model)  # measured for one training image; an update's guidance pass needs more:
         ckpt.set_kept_blocks(model, [])  # every block recomputes during the stage
         history = self.status.data.get("rewards", [])
+        self._reward_body_seen = self._reward_body_low = 0  # for the clothing / framing mismatch warning
         s = probed = 0
         t0 = time.time()
         try:
@@ -2844,10 +2846,10 @@ class Trainer(RaceParallelMixin):
             p.data, other[i] = other[i], p.data
 
     def _reward_of(self, path, prompt: str, scale) -> float:
-        """A reward picture's likeness: on the probes' scale but neither clipped nor curved (0 = a stranger, 1 = the
-        references; below 0 and above 1 still count, so a weak LoRA's pictures still differ), combined with
-        face_weight / body_weight. A missing face counts -1 (every reward prompt shows one), a missing body only in a
-        full-body prompt."""
+        """A reward picture's likeness: on the probes' scale but not curved (0 = a stranger, 1 = the references;
+        below 0 and above 1 still count, so a weak LoRA's pictures still differ, each part within reward.PART_MIN ..
+        PART_MAX), combined with face_weight / body_weight. A missing face counts -1 (every reward prompt shows one),
+        a missing body only in a full-body prompt."""
         from . import reward as RW
         from .likeness import combine
 
@@ -2862,11 +2864,20 @@ class Trainer(RaceParallelMixin):
         face = body = None
         if self.face_scorer is not None and cfg.face_weight > 0:
             sc = self.face_scorer.score(path, 0, 0)
-            face = -1.0 if sc.percent is None else linear("face", sc.percent)
+            face = -1.0 if sc.percent is None else RW.clip_part(linear("face", sc.percent))[0]
         if self.body_scorer is not None and cfg.body_weight > 0:
             pct, _ = self.body_scorer.score(path)
             if pct is not None:
-                body = linear("body", pct)
+                body, low = RW.clip_part(linear("body", pct))
+                self._reward_body_seen = getattr(self, "_reward_body_seen", 0) + 1
+                self._reward_body_low = getattr(self, "_reward_body_low", 0) + int(low)
+                if (self._reward_body_seen == int(cfg.reward_group) * max(1, len(cfg.reward_prompts))
+                        and self._reward_body_low * 2 >= self._reward_body_seen):
+                    log.warning("Reward stage: %d of the first %d pictures' body scores sit far below a stranger's: "
+                                "the reward prompts and the body references probably differ in clothing or "
+                                "framing. Those body scores are capped, so the face decides; reward prompts like "
+                                "the body references (or Body weight 0) make the body count again",
+                                self._reward_body_low, self._reward_body_seen)
             elif RW.is_full_body(prompt):
                 body = -1.0
         comb = combine(face, body, cfg.face_weight, cfg.body_weight)
@@ -3264,7 +3275,7 @@ class Trainer(RaceParallelMixin):
                      "| lr x%.2f | face bias %+.2f (%.1fs)", who, step, fmt(face), fmt(body), fmt(rec.combined),
                      fmt(rec.face_ema), fmt(rec.body_ema), fmt(rec.combined_ema), fmt(rec.best), rec.best_step,
                      rec.lr_factor, rec.face_bias, time.time() - t0)
-        if "step_up" in actions:
+        if "step_up" in actions and step < cfg.steps:  # not at the end, nor in the reward stage
             log.info("Resolution step-up: stage %d stalled for %d probe(s) (stage best %s)", rec.stage + 1,
                      rec.stage_since_improve, fmt(rec.stage_best))
             self._enter_stage(actions["step_up"], step)

@@ -49,6 +49,18 @@ def default_prompts(trigger: str, face_weight: float, body_weight: float) -> lis
     return [p.format(t=t) for kind, p in DEFAULT_PROMPTS if kind in keep]
 
 
+PART_MIN, PART_MAX = -0.5, 1.5  # a part's reward on the probes' linear scale (0 = a stranger, 1 = the references)
+
+
+def clip_part(value: float) -> tuple[float, bool]:
+    """(the face or body reward kept within PART_MIN..PART_MAX, whether it fell below PART_MIN). Far below a stranger
+    says nothing about likeness: the picture differs from the references in something else (a body in a coat against
+    unclothed body references, an upper-body shot against full-body ones). Unclipped, such a score swamps the face
+    in the group's ranking (the body's scale is several times narrower than the face's), so the stage learns to
+    look like the reference photos rather than like the person."""
+    return min(PART_MAX, max(PART_MIN, value)), value < PART_MIN
+
+
 def is_full_body(prompt: str) -> bool:
     return "full body" in prompt.lower() or "full-body" in prompt.lower()
 

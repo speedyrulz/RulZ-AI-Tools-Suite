@@ -789,7 +789,8 @@ With face/body references set, `probe_every: N` renders a fixed-seed headshot (`
 full-body image (`probe_body_prompt`) every N steps at `probe_size` (the face square, the body a 2:3 portrait with the
 same pixel count) with the turbo LoRA (cheap enough to do often), scores them, and records `likeness.jsonl` plus a Monitor chart. Each probe renders `probe_seeds` seeds and averages the scores; the step-0 probe, the zero
 of the normalized scale, renders at least `probe_floor_seeds` (4). Scores are smoothed with `probe_ema`
-and only changes beyond `likeness_noise_band` count. The controller then, each individually switchable:
+and only changes beyond `likeness_noise_band` count. The last step is always probed too, whether or not
+`probe_every` divides `steps`, so the final LoRA has its own score (it can be the best). The controller then, each individually switchable:
 
 - keeps `<job>_best.safetensors` at the best smoothed combined score (`likeness_track_best`) and stops after
   `likeness_patience` probes without improvement;
@@ -977,8 +978,13 @@ most like the person. Each reward step:
    turned into an SDE with the same marginals (Flow-GRPO's step, noise level `reward_noise` 0.7), so every denoising
    move is a Gaussian with a known probability. Steps and guidance are the probes' (`reward_sample_steps` 0 =
    `probe_steps`, `probe_cfg`), with the turbo LoRA the probes use;
-2. scores each with the probes' scorers on their scale, unclipped (0 = a stranger, 1 = the references; a missing
-   face counts -1), combined with `face_weight` / `body_weight`;
+2. scores each with the probes' scorers on their scale, uncurved (0 = a stranger, 1 = the references; a missing
+   face counts -1), each part kept within -0.5 .. 1.5, combined with `face_weight` / `body_weight`. Far below a
+   stranger says nothing about likeness: it is a body in a coat against unclothed body references, or an upper-body
+   shot against full-body ones. Uncapped, such a body score (its scale several times narrower than the face's)
+   picked each group's winner, so the stage learned to look like the reference photos rather than the person. When
+   half the first round's body scores are capped, the log says so: reward prompts like the body references (or
+   `body_weight` 0) make the body count again;
 3. turns the scores into advantages within the group ((score - mean) / std: only the differences between the
    pictures count, not the prompt's difficulty);
 4. on `reward_train_steps` (4) of the denoising moves, one picture at a time, raises the log-probability of the moves
