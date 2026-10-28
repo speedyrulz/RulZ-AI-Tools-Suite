@@ -14,12 +14,14 @@
 set -eo pipefail
 
 WORKSPACE="${WORKSPACE:-/workspace}"
-REPO_URL="${RULZ_REPO:-https://github.com/speedyrulz/RulzTrainer.git}"
-BRANCH="${RULZ_BRANCH:-main}"
+REPO_URL="${RULZ_REPO:-https://github.com/speedyrulz/RulZ-AI-Tools-Suite.git}"
+BRANCH="${RULZ_BRANCH:-app/rulz-trainer}"  # RulzTrainer on its own, split from the suite's apps/RulzTrainer
 DIR="${WORKSPACE}/RulzTrainer"
 
 echo "== RulzTrainer provisioning: ${REPO_URL} (${BRANCH}) -> ${DIR}"
 if [ -d "${DIR}/.git" ]; then
+    # Checkouts of the old RulzTrainer repository move over: the branch continues its history.
+    git -C "${DIR}" remote set-url origin "${REPO_URL}"
     git -C "${DIR}" fetch --quiet origin "${BRANCH}" && git -C "${DIR}" checkout --quiet "${BRANCH}" \
         && git -C "${DIR}" pull --quiet --ff-only || echo "[WARN] could not update the existing checkout; keeping it"
 else
