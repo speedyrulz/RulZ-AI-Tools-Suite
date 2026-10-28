@@ -1,9 +1,12 @@
 name: CI
 
+# The launcher. The apps in apps/ have their own workflow (apps.yml).
 on:
   push:
     branches: [main]
+    paths-ignore: ['apps/**', '.github/workflows/apps.yml', '.github/workflows/app-branches.yml']
   pull_request:
+    paths-ignore: ['apps/**', '.github/workflows/apps.yml', '.github/workflows/app-branches.yml']
 
 jobs:
   check:
