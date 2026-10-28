@@ -1,5 +1,7 @@
 import { afterAll, describe, expect, it } from 'vitest'
-import { findServer, parseModels, pickDefaultModel, RulzClient } from '../src/main/rulz/client'
+import { samplingRequest } from '@shared/defaults'
+import { findServer, parseLoadInfo, parseModels, pickDefaultModel, RulzClient } from '../src/main/rulz/client'
+import { parseSettings } from '../src/main/settings'
 import { errorFromBody, interpretChunk, SseParser, ToolCallAccumulator } from '../src/main/rulz/sse'
 import { jsonifyToolCallArgs, templateStringifiesArgs } from '../src/main/rulz/toolArgs'
 import { QWEN_CODER_TEMPLATE, startMockRulz } from './helpers/mockRulz'
@@ -147,6 +149,37 @@ describe('RulzClient', () => {
       // The earlier call's number argument was sent as text.
       const sent = mock.requests[0].body.messages![1].tool_calls![0].function.arguments
       expect(JSON.parse(sent)).toEqual({ depth: '2' })
+    } finally {
+      await mock.close()
+    }
+  })
+})
+
+describe('model settings', () => {
+  it('lays the owner settings settings over the recommended ones', () => {
+    expect(samplingRequest('Qwen3-Coder-30B', undefined)).toEqual({ temperature: 0.7, top_p: 0.8, top_k: 20, repeat_penalty: 1.05 })
+    expect(samplingRequest('Qwen3-Coder-30B', { temperature: 0.2 })).toMatchObject({ temperature: 0.2, top_k: 20 })
+    expect(samplingRequest('gemma-4', undefined)).toEqual({})
+    expect(samplingRequest('gemma-4', { topP: 0.9, maxOutputTokens: 4096 })).toEqual({ top_p: 0.9 })
+  })
+
+  it('drops bad saved values one at a time', () => {
+    const s = parseSettings({ modelSampling: { m: { temperature: 9, topK: 40, maxOutputTokens: 10 } } })
+    expect(s.modelSampling).toEqual({ m: { topK: 40 } })
+    expect(parseSettings({ modelSampling: 'nope' }).modelSampling).toEqual({})
+  })
+
+  it('reads load settings and explains an older RulZ LLM Suite', async () => {
+    expect(() => parseLoadInfo({})).toThrow()
+    expect(parseLoadInfo({ config: { contextLength: 8192 }, custom: true, state: 'ready', loaded_context_length: 8192 })).toMatchObject({
+      custom: true,
+      state: 'ready',
+      loadedContext: 8192
+    })
+    const mock = await startMockRulz()
+    try {
+      const client = new RulzClient(() => ({ url: mock.url, apiKey: '' }))
+      await expect(client.loadSettings('m')).rejects.toThrow(/Update RulZ LLM Suite/)
     } finally {
       await mock.close()
     }

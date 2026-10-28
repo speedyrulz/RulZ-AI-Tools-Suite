@@ -5,7 +5,9 @@ import type {
   ConnectionInfo,
   FileDiff,
   FolderListing,
+  LoadSettings,
   ModelActivity,
+  ModelLoadInfo,
   ProjectInfo,
   ProjectState,
   PromptAnswer,
@@ -50,6 +52,10 @@ export interface IpcInvoke {
   /** Finds RulZ LLM Suite (current address, then 1234 / 1235) and lists its models. */
   'server:connect': () => ConnectionInfo
   'server:status': () => ConnectionInfo
+  /** A model's load settings (context length, GPU layers…) in RulZ LLM Suite. */
+  'models:loadSettings': (model: string) => ModelLoadInfo
+  /** Changes them; a loaded model restarts in RulZ LLM Suite to use them. */
+  'models:setLoadSettings': (model: string, config: Partial<LoadSettings>) => ModelLoadInfo
 
   'projects:recent': () => ProjectInfo[]
   /** The project open right now, if any (the phone picks up where the computer is). */

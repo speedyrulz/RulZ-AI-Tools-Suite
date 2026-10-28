@@ -1,10 +1,11 @@
-import type { AppSettings } from './types'
+import type { AppSettings, KvCacheType, SamplingSettings } from './types'
 
 export const DEFAULT_SETTINGS: AppSettings = {
   serverUrl: '',
   lastServerUrl: '',
   apiKey: '',
   model: '',
+  modelSampling: {},
   approval: 'balanced',
   maxSteps: 40,
   commandTimeoutMin: 10,
@@ -16,6 +17,29 @@ export const DEFAULT_SETTINGS: AppSettings = {
   remotePort: 7420,
   remoteToken: ''
 }
+
+export const isQwenCoder = (model: string): boolean => /qwen3[-_.]?coder/i.test(model)
+
+/** Qwen's published settings for Qwen3-Coder; other models use RulZ LLM Suite's own defaults. */
+export function recommendedSampling(model: string): SamplingSettings {
+  return isQwenCoder(model) ? { temperature: 0.7, topP: 0.8, topK: 20, repeatPenalty: 1.05 } : {}
+}
+
+/** Upper limit for one answer when the owner hasn't set one. */
+export const DEFAULT_MAX_OUTPUT_TOKENS = 16384
+
+/** The owner's settings over the recommended ones, as request fields for /v1/chat/completions. */
+export function samplingRequest(model: string, own: SamplingSettings | undefined): Record<string, number> {
+  const s = { ...recommendedSampling(model), ...own }
+  const out: Record<string, number> = {}
+  if (s.temperature !== undefined) out.temperature = s.temperature
+  if (s.topP !== undefined) out.top_p = s.topP
+  if (s.topK !== undefined) out.top_k = s.topK
+  if (s.repeatPenalty !== undefined) out.repeat_penalty = s.repeatPenalty
+  return out
+}
+
+export const KV_CACHE_TYPES: KvCacheType[] = ['f16', 'bf16', 'f32', 'q8_0', 'q5_1', 'q5_0', 'q4_1', 'q4_0', 'iq4_nl']
 
 /** Bumped when the messages between the computer and the phone app change in a way the other side must know. */
 export const REMOTE_PROTOCOL = 1

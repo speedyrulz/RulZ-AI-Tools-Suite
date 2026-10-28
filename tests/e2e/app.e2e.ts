@@ -48,6 +48,7 @@ beforeAll(async () => {
     { content: 'Thinking very slowly…', delay: 15_000 }
   ]
   mock = await startMockRulz({
+    loadConfig: true,
     turns: (req) => {
       const messages = req.body.messages ?? []
       if (messages.some((m) => m.role === 'user' && m.content.includes('Package this app'))) {
@@ -201,6 +202,18 @@ describe('RulZ Coding Agent', () => {
     await page.getByRole('button', { name: 'Start now' }).click()
     await expect.poll(() => server.innerText(), { timeout: 20_000 }).toMatch(/fake — running, 3 tools/)
     await page.screenshot({ path: join(shots, '6-settings.png') })
+    await page.getByText('Model settings').click()
+    await page.getByRole('spinbutton', { name: 'Creativity (temperature)' }).fill('0.3')
+    const context = page.getByRole('spinbutton', { name: 'Context length' })
+    await expect.poll(() => context.inputValue()).toBe('65536')
+    await context.fill('32768')
+    await page.getByRole('button', { name: 'Save and restart model' }).click()
+    await expect.poll(() => mock.loadConfigPosts).toEqual([{ config: expect.objectContaining({ contextLength: 32768 }), reload: true }])
+    await page.screenshot({ path: join(shots, '6-model-settings.png') })
+    await page.keyboard.press('Escape')
+    await page.getByRole('button', { name: 'Change the AI model' }).click()
+    await page.getByRole('menuitem', { name: 'Model settings…' }).waitFor()
+    await page.screenshot({ path: join(shots, '6-model-menu.png') })
     await page.keyboard.press('Escape')
 
     await page.getByRole('button', { name: 'Share my app' }).click()
@@ -212,6 +225,7 @@ describe('RulZ Coding Agent', () => {
 
     const request = mock.requests.find((r) => r.body.messages?.some((m) => m.role === 'user' && m.content.includes('Package this app')))!
     const system = request.body.messages![0].content
+    expect((request.body as { temperature?: number }).temperature).toBe(0.3)
     expect(system).toContain('Use blue, not purple.')
     expect(system).toContain('Explain things briefly.')
   })

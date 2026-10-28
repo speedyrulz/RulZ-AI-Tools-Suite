@@ -60,6 +60,12 @@ The light look is one click away: use the sun/moon button in the top bar (or **S
   [REA](https://www.npmjs.com/package/rea-agents) for reverse engineering, work here too with nothing to set up
   twice. Settings lists them and can start them; otherwise they start the first time the agent needs one. Ask for
   them by name ("use REA to study the app in C:\Apps\Viewer").
+- **Switch models from the top bar**: click the model name to pick another model (not during a task).
+  **Settings → Model settings** has two parts. **How it writes** sets temperature, top P, top K, repeat penalty
+  and the longest answer, saved per model; empty boxes use the recommended values (Qwen's for Qwen3-Coder). **How
+  it loads** sets context length, GPU layers, flash attention, KV cache types and draft-model speed-up. These are
+  saved in RulZ LLM Suite as that model's load defaults, and a loaded model restarts with them. This needs a RulZ
+  LLM Suite with the `load-config` endpoint.
 - **Settings → Instructions for every project** adds your own instructions to the agent's system prompt in all
   projects. **Show my built-in instructions** displays the fixed part they're added to (it holds the tool and
   safety rules, so it can't be replaced).

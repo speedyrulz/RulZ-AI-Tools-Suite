@@ -1,5 +1,5 @@
 // Talks to RulZ LLM Suite's local API server (OpenAI-compatible endpoints).
-import type { ConnectionInfo, ModelInfo, WireMessage, WireToolCall } from '@shared/types'
+import type { ConnectionInfo, LoadSettings, ModelInfo, ModelLoadInfo, WireMessage, WireToolCall } from '@shared/types'
 import { errorFromBody, interpretChunk, SseParser, ToolCallAccumulator } from './sse'
 import { jsonifyToolCallArgs, templateStringifiesArgs } from './toolArgs'
 
@@ -216,6 +216,34 @@ export class RulzClient {
     return { content, toolCalls: calls.result(), finishReason, usage }
   }
 
+  /** The model's load settings in RulZ LLM Suite. */
+  async loadSettings(model: string): Promise<ModelLoadInfo> {
+    return this.loadConfigRequest(model, 'GET')
+  }
+
+  /** Saves new load settings in RulZ LLM Suite; a loaded model restarts with them. */
+  async setLoadSettings(model: string, config: Partial<LoadSettings>): Promise<ModelLoadInfo> {
+    const info = await this.loadConfigRequest(model, 'POST', { config, reload: true })
+    this.props.delete(model)
+    return info
+  }
+
+  private async loadConfigRequest(model: string, method: 'GET' | 'POST', body?: unknown): Promise<ModelLoadInfo> {
+    const { url, apiKey } = this.config()
+    const res = await fetch(`${url}/v1/models/${encodeURIComponent(model)}/load-config`, {
+      method,
+      headers: headers(apiKey, !!body),
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(10_000)
+    })
+    const text = await res.text()
+    if (res.status === 404 && /Unknown endpoint/i.test(text)) {
+      throw new ServerError('This version of RulZ LLM Suite cannot change load settings from here. Update RulZ LLM Suite, or change them on its Models page.', 404)
+    }
+    if (!res.ok) throw new ServerError(errorFromBody(res.status, text), res.status)
+    return parseLoadInfo(JSON.parse(text))
+  }
+
   /** Non-streamed completion without tools (used for summaries). */
   async complete(model: string, messages: WireMessage[], maxTokens: number, signal?: AbortSignal): Promise<string> {
     const { url, apiKey } = this.config()
@@ -229,6 +257,13 @@ export class RulzClient {
     const j = (await res.json()) as { choices?: { message?: { content?: string } }[] }
     return j.choices?.[0]?.message?.content ?? ''
   }
+}
+
+/** Reads a GET/POST /v1/models/{id}/load-config body. */
+export function parseLoadInfo(json: unknown): ModelLoadInfo {
+  const j = json as { config?: LoadSettings; custom?: boolean; max_context_length?: number; state?: ModelLoadInfo['state']; loaded_context_length?: number }
+  if (!j?.config || typeof j.config !== 'object') throw new Error('RulZ LLM Suite sent load settings I could not read.')
+  return { config: j.config, custom: !!j.custom, maxContext: j.max_context_length, state: j.state ?? 'not-loaded', loadedContext: j.loaded_context_length }
 }
 
 /** Plain-language explanation of a server error for the owner. */

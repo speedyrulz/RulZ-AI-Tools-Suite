@@ -13,6 +13,8 @@ export interface AppSettings {
   apiKey: string
   /** Model id from /v1/models; empty = pick one automatically. */
   model: string
+  /** Generation settings the owner changed, per model id; anything left out uses the recommended value. */
+  modelSampling: Record<string, SamplingSettings>
   approval: ApprovalLevel
   maxSteps: number
   /** Default time limit for one command, in minutes. */
@@ -28,6 +30,16 @@ export interface AppSettings {
   remotePort: number
   /** Secret the phone sends to connect; made the first time phone access is turned on. */
   remoteToken: string
+}
+
+/** How the model writes its answers. Missing = the recommended value for that model. */
+export interface SamplingSettings {
+  temperature?: number
+  topP?: number
+  topK?: number
+  repeatPenalty?: number
+  /** Longest single answer, in tokens. */
+  maxOutputTokens?: number
 }
 
 // ---------- Connection to RulZ LLM Suite ----------
@@ -60,6 +72,30 @@ export interface ConnectionInfo {
   models: ModelInfo[]
   /** Address of the non-RulZ server that answered, for the "other-server" explanation. */
   otherUrl?: string
+}
+
+export type KvCacheType = 'f16' | 'bf16' | 'f32' | 'q8_0' | 'q5_1' | 'q5_0' | 'q4_1' | 'q4_0' | 'iq4_nl'
+
+/** The load settings RulZ LLM Suite lets other apps change (GET/POST /v1/models/{id}/load-config). */
+export interface LoadSettings {
+  /** null = as much as fits in memory. */
+  contextLength: number | null
+  gpuLayers: 'auto' | 'all' | number
+  flashAttention: 'auto' | 'on' | 'off'
+  cacheTypeK: KvCacheType
+  cacheTypeV: KvCacheType
+  parallel: number
+  useDraft: boolean
+}
+
+export interface ModelLoadInfo {
+  /** What the model loads with next time. */
+  config: LoadSettings
+  /** False while the model still uses RulZ LLM Suite's general defaults. */
+  custom: boolean
+  maxContext?: number
+  state: 'not-loaded' | 'loading' | 'ready' | 'stopping' | 'error'
+  loadedContext?: number
 }
 
 /** What the model is doing right now, for the top bar. */

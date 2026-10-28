@@ -34,6 +34,8 @@ export interface MockOptions {
   turns?: MockTurn[] | ((req: MockRequest, index: number) => MockTurn)
   /** Report exact token counts like llama.cpp (timings in the last chunk). */
   timings?: (req: MockRequest) => { cache_n: number; prompt_n: number; predicted_n: number }
+  /** Answer GET/POST /v1/models/{id}/load-config like newer RulZ LLM Suite versions. */
+  loadConfig?: boolean
 }
 
 export const QWEN_CODER_TEMPLATE =
@@ -49,6 +51,8 @@ export async function startMockRulz(opts: MockOptions = {}) {
   const requests: MockRequest[] = []
   const models = opts.models ?? [{ id: 'Qwen3-Coder-30B-A3B-Instruct-Q5_K_M', state: 'loaded', loaded_context_length: 65536 }]
   let turnIndex = 0
+  const loadConfig = { contextLength: 65536, gpuLayers: 'auto', flashAttention: 'auto', cacheTypeK: 'f16', cacheTypeV: 'f16', parallel: 1, useDraft: false }
+  const loadConfigPosts: unknown[] = []
   const nextTurn = (req: MockRequest): MockTurn => {
     const t = opts.turns
     const i = turnIndex++
@@ -74,6 +78,14 @@ export async function startMockRulz(opts: MockOptions = {}) {
             : { id: m.id, object: 'model', owned_by: 'rulz', path: `C:\\models\\${m.id}.gguf`, arch: 'qwen3moe', state: m.state ?? 'not-loaded', loaded_context_length: m.loaded_context_length, max_context_length: 262144 }
         )
       })
+    }
+    if (opts.loadConfig && url.pathname.startsWith('/v1/models/') && url.pathname.endsWith('/load-config')) {
+      if (req.method === 'POST') {
+        const body = JSON.parse(await readBody(req)) as { config: object }
+        loadConfigPosts.push(body)
+        Object.assign(loadConfig, body.config)
+      }
+      return json(200, { config: loadConfig, custom: loadConfigPosts.length > 0, max_context_length: 262144, state: 'ready', loaded_context_length: loadConfig.contextLength })
     }
     if (url.pathname === '/props') {
       return json(200, { chat_template: opts.template ?? QWEN_CODER_TEMPLATE, default_generation_settings: { n_ctx: opts.nCtx ?? 65536 } })
@@ -111,6 +123,7 @@ export async function startMockRulz(opts: MockOptions = {}) {
   return {
     url: `http://127.0.0.1:${port}`,
     requests,
+    loadConfigPosts,
     close: () => new Promise<void>((r) => server.close(() => r()))
   }
 }

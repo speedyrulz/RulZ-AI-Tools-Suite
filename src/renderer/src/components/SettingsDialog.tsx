@@ -6,6 +6,7 @@ import { invoke, on } from '../lib/api'
 import { cn, relativeTime } from '../lib/format'
 import { activeModelId, useApp } from '../stores/app'
 import { ApprovalChooser, ModelSelect } from './common'
+import { ModelSettings } from './ModelSettings'
 import { Button, Dialog, Field, Input, NumberInput, Switch, Textarea } from './ui'
 
 /** The tool servers from RulZ LLM Suite's mcp.json, and whether they are running. */
@@ -181,14 +182,27 @@ export function SettingsDialog() {
   const setTheme = useApp((s) => s.setTheme)
   const [details, setDetails] = useState(false)
   const [builtIn, setBuiltIn] = useState(false)
+  const [modelSettings, setModelSettings] = useState(false)
   if (!settings) return null
+  const modelId = activeModelId(settings, connection)
 
   return (
     <Dialog open={open} onOpenChange={setOpen} title="Settings" className="w-[min(620px,calc(100vw-32px))]">
       <div className="space-y-6 px-5 py-5">
         <Field label="AI model" hint="Models marked “ready” start right away">
           {connection.models.length ? (
-            <ModelSelect models={connection.models} value={activeModelId(settings, connection)} onChange={(model) => void update({ model })} />
+            <>
+              <ModelSelect models={connection.models} value={modelId} onChange={(model) => void update({ model })} />
+              {modelId && (
+                <>
+                  <button className="mt-1 flex items-center gap-1 text-[12px] text-muted hover:text-text" onClick={() => setModelSettings(!modelSettings)}>
+                    <ChevronDown size={13} className={cn('transition-transform', !modelSettings && '-rotate-90')} />
+                    Model settings
+                  </button>
+                  {modelSettings && <ModelSettings model={modelId} />}
+                </>
+              )}
+            </>
           ) : (
             <p className="text-[13px] text-muted">Connect to RulZ LLM Suite to see its models.</p>
           )}

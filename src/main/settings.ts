@@ -11,6 +11,18 @@ const schema = z.object({
   lastServerUrl: z.string().catch(D.lastServerUrl),
   apiKey: z.string().catch(D.apiKey),
   model: z.string().catch(D.model),
+  modelSampling: z
+    .record(
+      z.string(),
+      z.object({
+        temperature: z.number().min(0).max(2).optional().catch(undefined),
+        topP: z.number().min(0).max(1).optional().catch(undefined),
+        topK: z.number().int().min(0).max(1000).optional().catch(undefined),
+        repeatPenalty: z.number().min(0.5).max(2).optional().catch(undefined),
+        maxOutputTokens: z.number().int().min(256).max(131072).optional().catch(undefined)
+      })
+    )
+    .catch(D.modelSampling),
   approval: z.enum(['careful', 'balanced', 'handsoff']).catch(D.approval),
   maxSteps: z.number().int().min(5).max(500).catch(D.maxSteps),
   commandTimeoutMin: z.number().min(1).max(120).catch(D.commandTimeoutMin),

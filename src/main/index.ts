@@ -284,6 +284,14 @@ async function main(): Promise<void> {
 
   handle('server:connect', () => connect())
   handle('server:status', () => connection)
+  handle('models:loadSettings', (model) => client.loadSettings(model))
+  handle('models:setLoadSettings', async (model, config) => {
+    // Restarting the model would cut off the answer it is writing.
+    if (session?.isRunning) throw new Error('A task is running. Wait for it to finish or press Stop, then change the load settings.')
+    const info = await client.setLoadSettings(model, config)
+    void refreshModels()
+    return info
+  })
 
   handle('projects:recent', () => store.recent())
   handle('projects:current', () => currentState())

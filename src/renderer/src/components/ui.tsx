@@ -216,7 +216,7 @@ export function DropdownMenu({ trigger, items, align = 'end' }: { trigger: React
         <Menu.Content
           align={align}
           sideOffset={4}
-          className="z-50 min-w-44 rounded-lg border border-border bg-panel p-1 shadow-xl"
+          className="z-50 max-h-[70vh] min-w-44 overflow-y-auto rounded-lg border border-border bg-panel p-1 shadow-xl"
         >
           {items.map((item, i) =>
             item === 'sep' ? (
@@ -296,7 +296,8 @@ export function NumberInput({
   min,
   max,
   step,
-  className
+  className,
+  label
 }: {
   value: number | null
   onChange: (v: number | null) => void
@@ -305,10 +306,12 @@ export function NumberInput({
   max?: number
   step?: number
   className?: string
+  label?: string
 }) {
   return (
     <Input
       type="number"
+      aria-label={label}
       className={cn('h-7.5 w-24 text-right tabular-nums', className)}
       value={value ?? ''}
       placeholder={placeholder}

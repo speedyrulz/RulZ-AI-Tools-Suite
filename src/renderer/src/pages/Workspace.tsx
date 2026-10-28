@@ -1,4 +1,4 @@
-import { ArrowLeft, ArrowUp, FolderOpen, History, LoaderCircle, NotebookPen, Package, Play, Settings, Square, Undo2 } from 'lucide-react'
+import { ArrowLeft, ArrowUp, Check, ChevronDown, FolderOpen, SlidersHorizontal, History, LoaderCircle, NotebookPen, Package, Play, Settings, Square, Undo2 } from 'lucide-react'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { ApprovalDialog } from '../components/ApprovalDialog'
 import { ContextMeter } from '../components/ContextMeter'
@@ -10,7 +10,7 @@ import { ConnectionHelp } from '../components/NotConnected'
 import { RunPanel } from '../components/RunPanel'
 import { SidePanel } from '../components/SidePanel'
 import { modelLabel } from '../components/common'
-import { Button, Dialog, IconButton, Kbd, Textarea, Tooltip } from '../components/ui'
+import { Button, Dialog, DropdownMenu, IconButton, Kbd, Textarea, Tooltip } from '../components/ui'
 import { invoke } from '../lib/api'
 import { cn } from '../lib/format'
 import { activeModelId, useApp } from '../stores/app'
@@ -198,6 +198,8 @@ function ModelChip() {
   const connection = useApp((s) => s.connection)
   const activity = useApp((s) => s.activity)
   const setSettingsOpen = useApp((s) => s.setSettingsOpen)
+  const update = useApp((s) => s.updateSettings)
+  const running = useWorkspace((s) => s.running)
   const id = activeModelId(settings, connection)
   const model = connection.models.find((m) => m.id === id)
   const connected = connection.status === 'connected'
@@ -215,17 +217,33 @@ function ModelChip() {
     status = 'Ready'
   }
 
+  const sorted = [...connection.models].sort((a, b) => Number(b.loaded) - Number(a.loaded) || a.id.localeCompare(b.id))
   return (
-    <Tooltip content="Change the AI model in Settings">
-      <button
-        onClick={() => setSettingsOpen(true)}
-        className="ml-2 flex h-9 max-w-[340px] min-w-0 items-center gap-2 rounded-lg border border-border bg-panel-2 px-3 text-left transition-colors hover:border-accent/60"
-      >
-        {dot}
-        <span className="min-w-0 truncate text-[13px]">{id ? modelLabel(id) : 'No model'}</span>
-        <span className="shrink-0 text-[11px] text-faint">{status}</span>
-      </button>
-    </Tooltip>
+    <DropdownMenu
+      align="start"
+      trigger={
+        <button
+          aria-label="Change the AI model"
+          className="ml-2 flex h-9 max-w-[340px] min-w-0 items-center gap-2 rounded-lg border border-border bg-panel-2 px-3 text-left transition-colors hover:border-accent/60"
+        >
+          {dot}
+          <span className="min-w-0 truncate text-[13px]">{id ? modelLabel(id) : 'No model'}</span>
+          <span className="shrink-0 text-[11px] text-faint">{status}</span>
+          <ChevronDown size={13} className="shrink-0 text-faint" />
+        </button>
+      }
+      items={[
+        // Switching mid-task would change models between steps, so it waits for the task to end.
+        ...sorted.map((m) => ({
+          label: `${modelLabel(m.id)}${m.loaded ? '  (ready)' : ''}`,
+          icon: <Check size={13} className={m.id === id ? 'text-accent' : 'invisible'} />,
+          disabled: running,
+          onSelect: () => void update({ model: m.id })
+        })),
+        ...(sorted.length ? (['sep'] as const) : []),
+        { label: 'Model settings…', icon: <SlidersHorizontal size={13} />, onSelect: () => setSettingsOpen(true) }
+      ]}
+    />
   )
 }
 

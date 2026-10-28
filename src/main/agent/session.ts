@@ -20,7 +20,7 @@ import type {
   WireMessage,
   WireToolCall
 } from '@shared/types'
-import { MAX_INSTRUCTION_CHARS } from '@shared/defaults'
+import { DEFAULT_MAX_OUTPUT_TOKENS, MAX_INSTRUCTION_CHARS, samplingRequest } from '@shared/defaults'
 import { friendlyServerError, pickDefaultModel, type RulzClient, type TurnResult } from '../rulz/client'
 import type { Snapshot, Snapshotter } from '../project/snapshots'
 import type { ProjectData, ProjectStore } from '../project/store'
@@ -79,8 +79,6 @@ class StopTask extends Error {}
 
 /** An error whose message is already written for the owner. */
 class FriendlyError extends Error {}
-
-const isQwenCoder = (model: string): boolean => /qwen3[-_.]?coder/i.test(model)
 
 function cleanContent(text: string): string {
   return text.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
@@ -582,8 +580,10 @@ export class ProjectSession {
     let item: Extract<TimelineItem, { kind: 'assistant' }> | null = null
     const tools = this.toolDefs()
     const estimated = totalTokens(messages) + estimateTokens(JSON.stringify(tools))
-    const maxTokens = Math.max(1024, Math.min(16384, nCtx - Math.ceil(estimated * this.scale) - 256))
-    const sampling = isQwenCoder(model) ? { temperature: 0.7, top_p: 0.8, top_k: 20, repeat_penalty: 1.05 } : {}
+    const own = this.deps.settings().modelSampling[model]
+    const cap = own?.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS
+    const maxTokens = Math.max(Math.min(1024, cap), Math.min(cap, nCtx - Math.ceil(estimated * this.scale) - 256))
+    const sampling = samplingRequest(model, own)
     const result = await this.deps.client.streamTurn({ model, messages, tools, max_tokens: maxTokens, ...sampling }, signal, {
       onProgress: (done, total) => {
         if (total > 4000) this.setStatus({ phase: 'thinking', text: `Reading the project notes… ${Math.round((done / total) * 100)}%` })
