@@ -315,6 +315,28 @@ def test_without_dropping_the_lowest_everyone_trains_all_the_steps():
     assert R.estimate_steps(3, 0, 10, 20, drop_lowest=False)["total"] == 60
 
 
+def test_a_racer_out_of_patience_stays_while_its_likeness_rises_again():
+    s = R.RaceSchedule(["a", "b"], warmup=0, drop_lowest=False, patience=2, total_steps=100, rising=True)
+    assert s.rising and not R.RaceSchedule(["a", "b"], 0, patience=0, rising=True).rising  # needs the patience drop
+    s.record(0, 50.0, 10, best=50.0, since_improve=0)
+    s.record(1, 40.0, 10, best=40.0, since_improve=0)
+    s.record(0, 44.0, 20, best=50.0, since_improve=1)  # a dips
+    s.record(1, 41.0, 20, best=41.0, since_improve=0)
+    s.record(0, 47.0, 30, best=50.0, since_improve=2)  # out of patience, but rising from 44: it stays
+    assert s.alive == [0, 1] and s.just_dropped == []
+    s.record(1, 42.0, 30, best=42.0, since_improve=0)
+    assert s.history[-1]["spared"] == {"a": 2} and "left" in s.history[-1] and not s.history[-1]["left"]
+    assert "a stays: 2 probes without improvement but rising again" in R.describe_round(s.history[-1], s)
+    s.record(0, 49.0, 40, best=50.0, since_improve=3)  # still rising
+    s.record(1, 43.0, 40, best=43.0, since_improve=0)
+    s.record(0, 48.5, 50, best=50.0, since_improve=4)  # not rising: it leaves
+    assert s.just_dropped == [0] and s.stale == {0} and "spared" not in s.history[-1]
+    plain = R.RaceSchedule(["a", "b"], warmup=0, drop_lowest=False, patience=2, total_steps=100)
+    for i, (score, since) in enumerate([(50.0, 0), (40.0, 0), (44.0, 1), (41.0, 0), (47.0, 2)]):
+        plain.record(i % 2, score, 10 * (i // 2 + 1), since_improve=since)
+    assert plain.just_dropped == [0]  # without the rule the dip ends it
+
+
 def test_patience_and_lowest_drops_together():
     s = R.RaceSchedule(["a", "b", "c"], warmup=0, patience=1)
     s.record(0, 50.0, 10, best=50.0, since_improve=0)

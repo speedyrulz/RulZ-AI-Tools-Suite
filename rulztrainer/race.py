@@ -284,7 +284,7 @@ class RaceSchedule:
     drop_lowest the winner is decided at the end of the run: the best score any configuration reached (champion)."""
 
     def __init__(self, names: list[str], warmup: int, drop_lowest: bool = True, patience: int = 0,
-                 total_steps: int | None = None, follow: bool = False):
+                 total_steps: int | None = None, follow: bool = False, rising: bool = False):
         self.names = list(names)
         self.warmup = int(warmup)
         # follow (a relay): nobody leaves until every one has trained total_steps; each round names a leader that
@@ -292,6 +292,11 @@ class RaceSchedule:
         self.follow = bool(follow)
         self.drop_lowest = bool(drop_lowest) and not self.follow
         self.patience = 0 if self.follow else max(0, int(patience))
+        # rising: a configuration out of patience stays while its smoothed score is still going up from its last
+        # probe (coming back after a dip, not yet above its best)
+        self.rising = bool(rising) and self.patience > 0
+        self.last: dict[int, float | None] = {}  # each configuration's previous probe score
+        self.spared: dict[int, int] = {}  # this round's: index -> probes without improvement it stayed on with
         self.leader: int | None = None  # the latest round's winner (follow)
         self.total_steps = total_steps
         self.alive = list(range(len(names)))
@@ -346,10 +351,14 @@ class RaceSchedule:
         if best is not None:
             self.best[idx], self.best_step[idx] = best, best_step
         why = None
+        prev, self.last[idx] = self.last.get(idx), score
         if self.follow:
             pass  # a relay keeps everyone until the last round
         elif self.patience and since_improve is not None and since_improve >= self.patience:
-            why = "patience"
+            if self.rising and score is not None and prev is not None and score > prev:
+                self.spared[idx] = since_improve
+            else:
+                why = "patience"
         elif not self.drop_lowest and self.total_steps and step is not None and step >= self.total_steps:
             why = "finished"
         if why and len(self.alive) > 1:
@@ -363,6 +372,8 @@ class RaceSchedule:
         entry = {"round": self.round, "scores": {self.names[i]: self.scores.get(i) for i in self.members},
                  "steps": {self.names[i]: self.steps.get(i) for i in self.members}, "dropped": None,
                  "left": {self.names[i]: w for i, w in self.left.items()}}
+        if self.spared:
+            entry["spared"] = {self.names[i]: n for i, n in self.spared.items()}
         dropped = None
 
         def key(i):
@@ -387,7 +398,7 @@ class RaceSchedule:
             self.just_dropped.append(dropped)
         self.history.append(entry)
         self.round += 1
-        self.scores, self.steps, self.left = {}, {}, {}
+        self.scores, self.steps, self.left, self.spared = {}, {}, {}, {}
         self.pending = [] if self.done else list(self.alive)
         self.members = list(self.alive)
         return dropped
@@ -431,7 +442,7 @@ class RaceSchedule:
                 entry["leader"] = self.names[self.leader]
             self.history.append(entry)
             self.round += 1
-            self.scores, self.steps, self.left = {}, {}, {}
+            self.scores, self.steps, self.left, self.spared = {}, {}, {}, {}
             self.pending = list(self.alive)
             self.members = list(self.alive)
 
@@ -445,7 +456,8 @@ class RaceSchedule:
                 "manual": [self.names[i] for i in sorted(self.manual)],
                 "stale": [self.names[i] for i in sorted(self.stale)],
                 "finished": [self.names[i] for i in sorted(self.finished)],
-                "drop_lowest": self.drop_lowest, "patience": self.patience, "follow": self.follow,
+                "drop_lowest": self.drop_lowest, "patience": self.patience, "rising": self.rising,
+                "follow": self.follow,
                 "leader": self.names[self.leader] if self.leader is not None else None,
                 "best": {self.names[i]: b for i, b in self.best.items()},
                 "best_step": {self.names[i]: s for i, s in self.best_step.items()},
@@ -757,6 +769,8 @@ def describe_round(entry: dict, schedule: RaceSchedule) -> str:
     fmt = ", ".join(f"{n} {'n/a' if s is None else f'{s:.1f}%'}" for n, s in entry["scores"].items())
     why = {"patience": f"out after {schedule.patience} probes without improvement", "finished": "finished its steps"}
     parts = [f"{n} {why[w]}" for n, w in (entry.get("left") or {}).items()]
+    parts += [f"{n} stays: {k} probes without improvement but rising again" for n, k in
+              (entry.get("spared") or {}).items()]
     if entry.get("leader") and entry.get("final"):
         parts.append(f"{entry['leader']} wins the last round")
     elif entry.get("leader"):

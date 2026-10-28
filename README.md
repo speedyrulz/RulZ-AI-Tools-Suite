@@ -1105,7 +1105,10 @@ at any point. Its best checkpoint becomes `<job>_best.safetensors` and its setti
 racing trains on to the end with the run's own file names (`<job>.safetensors`), and the log says when that is not the
 winner. A configuration that leaves on patience is saved as `<job>_<name>_dropped.safetensors`, one that finished its
 steps as `<job>_<name>_final.safetensors`, and each keeps its `<job>_<name>_best.safetensors`. Both work with the
-round drops on (`race_drop_lowest: true`), and in parallel races.
+round drops on (`race_drop_lowest: true`), and in parallel races. `race_patience_rising: true` gives one a chance to
+come back after a dip: out of patience, it stays as long as each probe's smoothed likeness is higher than its previous
+probe's, and leaves at the first probe that is not (beating its best resets the count as usual). The log and Monitor
+show who stayed.
 
 **Relay: everyone continues from the round's winner (`race_follow: true`).** Nobody is dropped. After each round
 (every configuration trained `probe_every` steps and was probed) the round's winner, the highest smoothed combined

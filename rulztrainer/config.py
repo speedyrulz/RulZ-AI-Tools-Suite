@@ -452,6 +452,8 @@ class TrainConfig:
     race_patience_drop: bool = False  # a configuration leaves after race_patience probes of its own without
     #                                   improvement; the winner is the best score anyone reached
     race_patience: int = 3
+    race_patience_rising: bool = False  # with race_patience_drop: one out of patience stays while its smoothed score
+    #                                     still rises from its previous probe (a chance to come back after a dip)
     race_follow: bool = False  # a relay: nobody is dropped; after each round everyone continues from its winner's
     #                            LoRA, optimizer state and likeness history (seed rows: the best of several paths)
     race_parallel: bool = False  # data_parallel race: one configuration per GPU at the same time (an odd one out

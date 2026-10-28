@@ -1674,6 +1674,9 @@ class Trainer(RaceParallelMixin):
         if cfg.race_patience_drop and not cfg.race_follow:
             log.info("Race: a configuration leaves after %d probes of its own without improvement; the winner is the "
                      "highest smoothed score any configuration reached", cfg.race_patience)
+            if cfg.race_patience_rising:
+                log.info("Race: one out of patience stays while its smoothed score is still rising from its last "
+                         "probe")
         for name, _, over in rows:
             log.info("  %s: %s", name, race_mod.format_overrides(over) or "the run's own settings")
         return prep
@@ -1720,7 +1723,7 @@ class Trainer(RaceParallelMixin):
                                       base.race_drop_lowest and not base.race_follow)
         sched = race_mod.RaceSchedule([v.name for v in variants], base.race_warmup_probes, base.race_drop_lowest,
                                       base.race_patience if base.race_patience_drop else 0, base.steps,
-                                      follow=base.race_follow)
+                                      follow=base.race_follow, rising=base.race_patience_rising)
         self.race = race_mod.RaceRun(variants, sched, wrappers, base, est)
         if self.race_parallel:  # every configuration trains on its own parameters (race_parallel.py)
             self.race.active = variants[0]

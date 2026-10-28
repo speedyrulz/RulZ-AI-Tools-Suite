@@ -1299,7 +1299,7 @@ class Form:
             crop_augment_weight=float(v("crop_augment_weight")),
             race=bool(v("race")), race_warmup_probes=int(v("race_warmup_probes") or 0),
             race_drop_lowest=bool(v("race_drop_lowest")), race_patience_drop=bool(v("race_patience_drop")),
-            race_patience=int(v("race_patience") or 3),
+            race_patience=int(v("race_patience") or 3), race_patience_rising=bool(v("race_patience_rising")),
             race_parallel=bool(v("race_parallel")), race_follow=bool(v("race_follow")),
             race_configs=self.w["race_configs"].value,
             soup_files=([p.strip() for p in (v("soup_files") or "").splitlines() if p.strip()]
@@ -2284,7 +2284,7 @@ def build_dataset_tab(f: Form):
                           on_click=lambda: look_move()).props("unelevated")
         with ui.row().classes("w-full items-center gap-3"):
             upload = ui.upload(label="Upload images and captions (drop files here)", multiple=True, auto_upload=True,
-                               on_upload=lambda e: on_upload(e), on_multi_upload=lambda e: after_upload()) \
+                               on_multi_upload=lambda e: on_upload(e)) \
                 .props("accept=.png,.jpg,.jpeg,.webp,.bmp,.txt,.json flat bordered color=transparent") \
                 .classes("w-[36rem] max-w-full")
             ui.space()
@@ -2314,16 +2314,17 @@ def build_dataset_tab(f: Form):
             ui.notify(f"Could not save {cap.name}: {e}", type="negative")
 
     async def on_upload(e):
+        """Every file of an upload is saved before the gallery refreshes: NiceGUI runs each on_upload handler as a
+        background task and fires on_multi_upload at once, so saving there showed only the files done by then."""
+        upload.reset()
         if state["open"] is None:
             return
-        target = upload_target(Path(state["open"]), e.file.name)
-        if target is None:
-            ui.notify(f"Skipped {Path(e.file.name).name}: not an image or a .txt / .json caption", type="warning")
-            return
-        await e.file.save(target)  # streamed to disk
-
-    async def after_upload():
-        upload.reset()
+        for file in e.files:
+            target = upload_target(Path(state["open"]), file.name)
+            if target is None:
+                ui.notify(f"Skipped {Path(file.name).name}: not an image or a .txt / .json caption", type="warning")
+                continue
+            await file.save(target)  # streamed to disk
         await refresh()
         await refresh_cards()
 
@@ -2837,7 +2838,8 @@ def race_review_line(cfg: TrainConfig) -> str:
     else:
         rules.append("nobody is dropped for being behind")
     if cfg.race_patience_drop:
-        rules.append(f"a racer leaves after {cfg.race_patience} probes without improvement")
+        rules.append(f"a racer leaves after {cfg.race_patience} probes without improvement"
+                     + (" unless its likeness is rising again" if cfg.race_patience_rising else ""))
     if cfg.race_patience_drop or not cfg.race_drop_lowest:
         rules.append("the best score at any point wins")
     return f"{len(rows)} racers ({racers}); " + ", ".join(rules)
@@ -4368,13 +4370,20 @@ class Wizard:
                           "Probes in a row without a gain bigger than the noise band. 3 gives a racer a fair chance; "
                           "lower ends the race sooner.", show_if=("race_patience_drop", bool)):
             self.bind(ui.number("Probes", min=1, precision=0), "race_patience").classes("w-full")
+        with self.setting(None, "Keep it while the likeness is rising again",
+                          "A configuration out of patience is not dropped while its smoothed likeness is still going "
+                          "up from its previous probe: a chance to come back after a dip. It leaves at the first probe "
+                          "that does not rise (unless it beats its best, which resets the count).",
+                          show_if=("race_patience_drop", bool)):
+            self.bind(ui.switch("Keep a racer whose likeness is rising"), "race_patience_rising")
         with self.setting(None, "One racer per GPU at the same time",
                           "With data parallel on 2+ GPUs: each GPU trains its own racer at once instead of all of "
                           "them taking turns over every GPU. Not with the identity loss or self-training.",
                           show_if=("multi_gpu", lambda x: x == "data_parallel")):
             self.bind(ui.switch("One racer per GPU"), "race_parallel")
         self.race_estimate = ui.label("").classes("rz-banner info")
-        for key in ("race_drop_lowest", "race_warmup_probes", "race_patience_drop", "race_patience", "race_follow"):
+        for key in ("race_drop_lowest", "race_warmup_probes", "race_patience_drop", "race_patience", "race_follow",
+                    "race_patience_rising"):
             self.w[key].on_value_change(lambda _: self.estimate_race())
         self.nav()
 
@@ -4410,7 +4419,8 @@ class Wizard:
                     f"({est['ratio']:.0f}x one run)" + (f". Steps must be a multiple of {cfg.probe_every}."
                                                          if cfg.steps % cfg.probe_every else "."))
         if cfg.race_patience_drop:
-            text += f" A racer leaves after {cfg.race_patience} probes without improvement."
+            text += (f" A racer leaves after {cfg.race_patience} probes without improvement"
+                     + (", unless its likeness is rising again." if cfg.race_patience_rising else "."))
         self.race_estimate.text = text
 
     # ---- 7 review
@@ -6486,8 +6496,13 @@ def build_page(local: bool = True):
                                          "configuration whose best smoothed score was the highest at any point: its "
                                          "best checkpoint becomes <job>_best.safetensors.")
                             w["race_patience"] = ui.number("Probes without improvement", value=d.race_patience,
-                                                           min=1, precision=0).classes("w-56") \
-
+                                                           min=1, precision=0).classes("w-56")
+                            w["race_patience_rising"] = ui.switch("Keep one whose likeness is rising again",
+                                                                  value=d.race_patience_rising) \
+                                .tooltip("A configuration out of patience is not dropped while its smoothed likeness "
+                                         "is still going up from its previous probe: a chance to come back after a "
+                                         "dip. It leaves at the first probe that does not rise (unless it beats its "
+                                         "best, which resets the count).")
                             w["race_parallel"] = ui.switch("One configuration per GPU at the same time",
                                                           value=d.race_parallel) \
                                 .bind_visibility_from(w["multi_gpu"], "value", lambda x: x == "data_parallel") \
@@ -6506,6 +6521,8 @@ def build_page(local: bool = True):
                             w["race_warmup_probes"].set_visibility(not relay and bool(w["race_drop_lowest"].value))
                             w["race_patience_drop"].set_visibility(not relay)
                             w["race_patience"].set_visibility(not relay and bool(w["race_patience_drop"].value))
+                            w["race_patience_rising"].set_visibility(not relay
+                                                                     and bool(w["race_patience_drop"].value))
 
                         for key in ("race_follow", "race_drop_lowest", "race_patience_drop"):
                             w[key].on_value_change(race_rules_visible)
@@ -6535,7 +6552,9 @@ def build_page(local: bool = True):
                                     + (f" Steps must be a multiple of {every}." if steps % every else ""))
                                 return
                             patience = (f" A configuration leaves after {int(w['race_patience'].value or 0)} probes "
-                                        "without improvement; the winner is the best score anyone reached."
+                                        "without improvement" + (", unless its likeness is rising again"
+                                                                 if w["race_patience_rising"].value else "")
+                                        + "; the winner is the best score anyone reached."
                                         if w["race_patience_drop"].value else "")
                             if not lowest:
                                 race_summary.text = (
@@ -6579,7 +6598,7 @@ def build_page(local: bool = True):
                                 .tooltip("One racer per seed, the run's settings otherwise, and the relay on: after "
                                          "each probe round every seed continues from the one that probed best")
                         for key in ("steps", "probe_every", "race_warmup_probes", "race_drop_lowest",
-                                    "race_patience_drop", "race_patience", "race_follow"):
+                                    "race_patience_drop", "race_patience", "race_follow", "race_patience_rising"):
                             w[key].on_value_change(lambda _: race_summary_update())
                         with advanced("What a configuration may change"):
                             from rulztrainer.race import RACE_KEYS
@@ -7068,6 +7087,9 @@ def build_page(local: bool = True):
                                  else "waiting its turn")
                         if rc.get("follow") and rc.get("leader") == n and not rc.get("winner"):
                             state += " (led the last round)"
+                        spared = ((rc.get("history") or [{}])[-1].get("spared") or {}).get(n)
+                        if spared and n not in dropped:
+                            state += f" (kept after {spared} probes without improvement: rising again)"
                         per_round = [(h["scores"].get(n), (h.get("steps") or {}).get(n))
                                      for h in rc.get("history") or [] if n in h["scores"]]
                         at = (rc.get("score_steps") or {}).get(n)
@@ -7549,6 +7571,11 @@ continues with the run's own names, and `<job>_winner.yaml` holds its settings. 
 the race. With data parallel on 2+ GPUs, *One configuration per GPU at the same time* trains the configurations side
 by side (an odd one left over splits over the GPUs, or runs on the first). The Monitor tab shows each configuration's score per round, with a *Drop* button on each one still in: it stops
 that configuration after the current step, saves its LoRA as `_dropped` and the race goes on without it (one left wins).
+
+*Drop each one when it stops improving* drops a configuration once its own probes have not improved for *Probes without
+improvement* in a row, whatever the others score. *Keep one whose likeness is rising again* gives it a chance after a
+dip: out of patience, it stays as long as each probe's smoothed likeness is higher than its previous probe's, and
+leaves at the first one that is not (beating its best resets the count). The Monitor and log show who stayed.
 
 *Relay: everyone continues from the round's winner* drops nobody: after each round the others take over the round
 winner's LoRA, optimizer state, weight average and likeness history, and train the next round with their own settings,
