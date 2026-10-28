@@ -1,11 +1,25 @@
 import { ChevronDown, FolderOpen } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { MAX_INSTRUCTION_CHARS } from '@shared/defaults'
 import type { Theme } from '@shared/types'
 import { invoke } from '../lib/api'
 import { cn } from '../lib/format'
 import { activeModelId, useApp } from '../stores/app'
 import { ApprovalChooser, ModelSelect } from './common'
-import { Button, Dialog, Field, Input, NumberInput } from './ui'
+import { Button, Dialog, Field, Input, NumberInput, Textarea } from './ui'
+
+/** The fixed part of the system prompt, read-only, so the owner can see what their instructions add to. */
+function BuiltInPrompt() {
+  const [text, setText] = useState('')
+  useEffect(() => {
+    void invoke('settings:builtInPrompt').then(setText, () => setText('(could not load)'))
+  }, [])
+  return (
+    <pre className="mt-2 max-h-64 overflow-auto rounded-md border border-border bg-code p-3 font-mono text-[11.5px] whitespace-pre-wrap text-muted">
+      {text || 'Loading…'}
+    </pre>
+  )
+}
 
 const THEMES: { value: Theme; label: string }[] = [
   { value: 'dark', label: 'Dark' },
@@ -21,6 +35,7 @@ export function SettingsDialog() {
   const update = useApp((s) => s.updateSettings)
   const setTheme = useApp((s) => s.setTheme)
   const [details, setDetails] = useState(false)
+  const [builtIn, setBuiltIn] = useState(false)
   if (!settings) return null
 
   return (
@@ -36,6 +51,25 @@ export function SettingsDialog() {
 
         <Field label="When should I ask you first?">
           <ApprovalChooser value={settings.approval} onChange={(approval) => void update({ approval })} />
+        </Field>
+
+        <Field
+          label="Instructions for every project"
+          hint="Added to my built-in instructions in all your projects. For one project only, use Notes in that project."
+        >
+          <Textarea
+            rows={4}
+            maxLength={MAX_INSTRUCTION_CHARS}
+            aria-label="Instructions for every project"
+            placeholder={'For example:\nAlways use big, easy-to-read text.\nPrefer Python apps over websites.\nExplain things briefly.'}
+            defaultValue={settings.instructions}
+            onBlur={(e) => e.target.value.trim() !== settings.instructions && void update({ instructions: e.target.value })}
+          />
+          <button className="mt-1 flex items-center gap-1 text-[12px] text-muted hover:text-text" onClick={() => setBuiltIn(!builtIn)}>
+            <ChevronDown size={13} className={cn('transition-transform', !builtIn && '-rotate-90')} />
+            Show my built-in instructions
+          </button>
+          {builtIn && <BuiltInPrompt />}
         </Field>
 
         <Field label="Look">

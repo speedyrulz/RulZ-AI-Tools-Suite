@@ -49,6 +49,8 @@ export interface ChunkInfo {
   toolCalls?: ToolCallDelta[]
   finishReason?: string
   timings?: Timings
+  /** Exact token counts, from llama.cpp's timings or an OpenAI-style usage block. */
+  usage?: { prompt: number; completion: number }
   progress?: { processed: number; total: number }
   error?: string
 }
@@ -65,6 +67,7 @@ export function interpretChunk(json: unknown): ChunkInfo {
       finish_reason?: string | null
     }[]
     timings?: Timings
+    usage?: { prompt_tokens?: number; completion_tokens?: number } | null
     prompt_progress?: { total?: number; processed?: number; cache?: number }
     error?: { message?: string } | string
   }
@@ -86,6 +89,12 @@ export function interpretChunk(json: unknown): ChunkInfo {
   }
   if (choice?.finish_reason) out.finishReason = choice.finish_reason
   if (j.timings) out.timings = j.timings
+  if (j.timings?.prompt_n !== undefined) {
+    // prompt_n counts only the part that wasn't cached.
+    out.usage = { prompt: (j.timings.cache_n ?? 0) + j.timings.prompt_n, completion: j.timings.predicted_n ?? 0 }
+  } else if (typeof j.usage?.prompt_tokens === 'number') {
+    out.usage = { prompt: j.usage.prompt_tokens, completion: j.usage.completion_tokens ?? 0 }
+  }
   if (j.prompt_progress?.total) {
     const cache = j.prompt_progress.cache ?? 0
     out.progress = {

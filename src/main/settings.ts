@@ -1,6 +1,6 @@
 import { join } from 'node:path'
 import { z } from 'zod'
-import { DEFAULT_SETTINGS } from '@shared/defaults'
+import { DEFAULT_SETTINGS, MAX_INSTRUCTION_CHARS } from '@shared/defaults'
 import type { AppSettings } from '@shared/types'
 import { readJson, writeJsonAtomic } from './util/jsonFile'
 
@@ -16,6 +16,10 @@ const schema = z.object({
   commandTimeoutMin: z.number().min(1).max(120).catch(D.commandTimeoutMin),
   theme: z.enum(['dark', 'light', 'system']).catch(D.theme),
   projectsDir: z.string().min(1).catch(D.projectsDir),
+  instructions: z
+    .string()
+    .transform((s) => s.trim().slice(0, MAX_INSTRUCTION_CHARS))
+    .catch(D.instructions),
   firstRunDone: z.boolean().catch(D.firstRunDone)
 })
 

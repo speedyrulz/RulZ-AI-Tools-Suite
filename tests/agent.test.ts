@@ -10,10 +10,13 @@ import {
   fitMessages,
   mechanicalSummary,
   summaryRange,
+  tokenScale,
   totalTokens
 } from '../src/main/agent/context'
 import { callKey, LoopGuard } from '../src/main/agent/loopGuard'
-import { parseRunLine, systemPrompt } from '../src/main/agent/prompt'
+import { parseRunLine, parseShareLine, SHARE_TASK, systemPrompt } from '../src/main/agent/prompt'
+import { parseSettings } from '../src/main/settings'
+import { MAX_INSTRUCTION_CHARS } from '@shared/defaults'
 import { approvalKey, classifyCommand, needsApproval } from '../src/main/agent/safety'
 import { describeCommand, describeStep, parseToolArgs, TOOL_DEFS } from '../src/main/agent/tools'
 
@@ -177,6 +180,15 @@ describe('context trimming', () => {
     expect(s).toMatch(/The owner asked: build it/)
     expect(s).toMatch(/run_command/)
   })
+
+  it("corrects the estimate from the server's exact count, within limits", () => {
+    expect(tokenScale(1000, 800)).toBe(0.8)
+    expect(tokenScale(1000, 1200)).toBe(1.2)
+    expect(tokenScale(1000, 100)).toBe(0.5)
+    expect(tokenScale(1000, 9000)).toBe(1.5)
+    expect(tokenScale(0, 500)).toBe(1)
+    expect(tokenScale(500, 0)).toBe(1)
+  })
 })
 
 describe('tool arguments', () => {
@@ -227,6 +239,38 @@ describe('system prompt and run line', () => {
     expect(parseRunLine('It is an Electron app.\nRUN: npm start')).toBe('npm start')
     expect(parseRunLine('**RUN:** `python main.py`')).toBe('python main.py')
     expect(parseRunLine('no idea')).toBeNull()
+  })
+
+  it("adds the owner's instructions and project notes only when there are some", () => {
+    const base = { projectPath: ROOT, projectName: 'My App', date: 'Mon Oct 27 2026' }
+    const plain = systemPrompt(base)
+    expect(plain).not.toContain("owner's notes")
+    expect(plain).not.toContain("owner's instructions")
+    const p = systemPrompt({ ...base, instructions: '  Use big text.  ', memory: 'Use blue, not purple.\nOne window only.' })
+    expect(p).toContain("## The owner's instructions for every project")
+    expect(p).toContain('Use big text.')
+    expect(p).toContain('"Honesty and safety" rules always come first')
+    expect(p).toContain("## The owner's notes for this project")
+    expect(p).toContain('Use blue, not purple.\nOne window only.')
+    // The built-in rules stay in front of the owner's text.
+    expect(p.indexOf('## Honesty and safety')).toBeLessThan(p.indexOf("## The owner's instructions"))
+  })
+
+  it('reads the SHARE: line', () => {
+    expect(parseShareLine('Done.\nSHARE: dist/Tip Calculator.exe')).toBe('dist/Tip Calculator.exe')
+    expect(parseShareLine('**SHARE:** `dist/site.zip`')).toBe('dist/site.zip')
+    expect(parseShareLine('SHARE: "dist\\app.exe"')).toBe('dist\\app.exe')
+    expect(parseShareLine('I could not package it.')).toBeNull()
+    expect(SHARE_TASK).toMatch(/SHARE: <path/)
+  })
+})
+
+describe('owner instructions in Settings', () => {
+  it('are trimmed, capped and default to none', () => {
+    expect(parseSettings({}).instructions).toBe('')
+    expect(parseSettings({ instructions: '  Be brief.\n' }).instructions).toBe('Be brief.')
+    expect(parseSettings({ instructions: 'x'.repeat(MAX_INSTRUCTION_CHARS + 50) }).instructions).toHaveLength(MAX_INSTRUCTION_CHARS)
+    expect(parseSettings({ instructions: 42 }).instructions).toBe('')
   })
 })
 

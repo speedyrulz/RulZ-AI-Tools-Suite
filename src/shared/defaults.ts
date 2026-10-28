@@ -10,8 +10,12 @@ export const DEFAULT_SETTINGS: AppSettings = {
   commandTimeoutMin: 10,
   theme: 'dark',
   projectsDir: 'C:\\coding',
+  instructions: '',
   firstRunDone: false
 }
+
+/** Owner-written instructions go with every request, so they are kept short (notes and Settings alike). */
+export const MAX_INSTRUCTION_CHARS = 4000
 
 /** Addresses tried when finding RulZ LLM Suite (LM Studio often holds 1234, so RulZ may be on 1235). */
 export const CANDIDATE_URLS = ['http://127.0.0.1:1234', 'http://127.0.0.1:1235']

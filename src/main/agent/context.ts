@@ -10,6 +10,18 @@ export const CONTEXT_SHARE = 0.8
 
 export const estimateTokens = (text: string): number => Math.ceil(text.length / CHARS_PER_TOKEN)
 
+/** Contexts this small fill up after a few files; the owner is told how to raise it. */
+export const SMALL_CONTEXT = 16384
+
+/**
+ * How far off the estimate was, from the server's exact count of the last request. Estimates
+ * are multiplied by this; it is kept within limits so one odd request can't skew it far.
+ */
+export function tokenScale(estimated: number, actual: number): number {
+  if (!(estimated > 0) || !(actual > 0)) return 1
+  return Math.min(1.5, Math.max(0.5, actual / estimated))
+}
+
 export function messageTokens(m: WireMessage): number {
   const calls = m.tool_calls?.reduce((n, c) => n + c.function.name.length + c.function.arguments.length + 20, 0) ?? 0
   return estimateTokens(m.content) + Math.ceil(calls / CHARS_PER_TOKEN) + 8

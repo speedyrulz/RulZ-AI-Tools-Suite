@@ -2,7 +2,8 @@
 //   $env:RULZ_REAL = '1'; npx vitest run --config vitest.e2e.config.ts real-model
 // It builds a to-do app in a fresh folder, runs it, adds dark mode, then undoes that, and writes
 // a report to test-results/real-model.md. Approvals are allowed automatically (and recorded).
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { spawn, spawnSync } from 'node:child_process'
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { _electron as electron, type ElectronApplication, type Page } from 'playwright-core'
@@ -268,4 +269,76 @@ describe.runIf(process.env.RULZ_REAL === '1')('real model', () => {
     expect(fix.outcome).toBe('done')
     expect(after.output).toContain('Hello, Ann!')
   }, 3 * 60 * 60_000)
+
+  it('follows notes and instructions, shows the Memory meter, and packages apps with "Share my app"', async () => {
+    log('\n# Notes, instructions, Memory meter and "Share my app"\n')
+    await finishWizard()
+    await page.evaluate(
+      () => (globalThis as unknown as { rulz: RulzApi }).rulz.invoke('settings:update', { instructions: 'End your final summary with the line "Have a sunny day!"' })
+    )
+
+    // 1. A web page, with a project note the model has to follow.
+    await newProject('Counter')
+    await page.getByRole('button', { name: 'Notes' }).click()
+    await page.getByRole('textbox', { name: 'Things to always remember' }).fill('The app is called "Sunny Counter". Use that name as the page title and heading.')
+    await page.getByRole('dialog').getByRole('button', { name: 'Save' }).click()
+    const counter = await runTask('make a simple counter web page with + and - buttons', 'Share 1 (web page, with a note)')
+    const html = existsSync(join(projectPath, 'index.html')) ? readFileSync(join(projectPath, 'index.html'), 'utf8') : ''
+    const st = await state()
+    const lastSaid = [...st.timeline].reverse().find((i) => i.kind === 'assistant')?.text ?? ''
+    log(`\nNote followed (index.html mentions "Sunny Counter"): ${html.includes('Sunny Counter')}`)
+    log(`Instruction followed (last message ends with "Have a sunny day!"): ${/Have a sunny day!\s*$/.test(lastSaid)}`)
+    log(`Memory meter: ${JSON.stringify(st.context)}`)
+    const meter = await page.getByRole('meter').getAttribute('aria-label')
+    log(`Meter shows: ${meter}`)
+
+    log('\n## Share my app (web page)\n')
+    await page.getByRole('button', { name: 'Share my app' }).click()
+    await page.getByRole('dialog').getByRole('button', { name: 'Package it' }).click()
+    const webShare = await followTask()
+    const webFile = await sharedFile()
+    log(`\nPackaged file: ${webFile ?? 'none'}`)
+    const zipNames = webFile?.endsWith('.zip') ? readFileSync(webFile).toString('latin1') : ''
+    log(`Zip contains index.html: ${zipNames.includes('index.html')}`)
+    await shot('9-share-web')
+
+    // 2. A Python desktop app made into one .exe.
+    await newProject('Hello Window', {
+      'main.py':
+        'import tkinter as tk\n\nroot = tk.Tk()\nroot.title("Hello Window")\ntk.Label(root, text="Hello from Python!", font=("Segoe UI", 24)).pack(padx=40, pady=40)\nroot.mainloop()\n'
+    })
+    await page.evaluate((p) => (globalThis as unknown as { rulz: RulzApi }).rulz.invoke('run:setCommand', p, 'python main.py'), projectPath)
+    log('\n## Share my app (Python window app)\n')
+    await page.getByRole('button', { name: 'Share my app' }).click()
+    await page.getByRole('dialog').getByRole('button', { name: 'Package it' }).click()
+    const pyShare = await followTask()
+    const exe = await sharedFile()
+    const exeSize = exe ? statSync(exe).size : 0
+    log(`\nPackaged file: ${exe ?? 'none'} (${(exeSize / 1024 / 1024).toFixed(1)} MB)`)
+    let stillRunning = false
+    if (exe?.endsWith('.exe')) {
+      const child = spawn(exe, [], { stdio: 'ignore' })
+      await page.waitForTimeout(8000)
+      stillRunning = child.exitCode === null
+      // The whole tree: a one-file .exe starts a second copy of itself that shows the window.
+      spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' })
+    }
+    log(`The .exe was still running (its window open) after 8 s: ${stillRunning}`)
+    await shot('10-share-python')
+    log(`\nFinished ${new Date().toISOString()}`)
+
+    expect(counter.outcome).toBe('done')
+    expect(st.context?.exact).toBe(true)
+    expect(webShare.outcome).toBe('done')
+    expect(zipNames).toContain('index.html')
+    expect(pyShare.outcome).toBe('done')
+    expect(exeSize).toBeGreaterThan(1024 * 1024)
+    expect(stillRunning).toBe(true)
+  }, 3 * 60 * 60_000)
 })
+
+/** The file the last "Your app is packaged" notice points at, if any. */
+async function sharedFile(): Promise<string | null> {
+  const notice = [...(await state()).timeline].reverse().find((i) => i.kind === 'notice' && i.reveal)
+  return notice?.kind === 'notice' && notice.reveal && existsSync(notice.reveal) ? notice.reveal : null
+}

@@ -20,6 +20,8 @@ export interface AppSettings {
   theme: Theme
   /** Where "New project" creates folders. */
   projectsDir: string
+  /** The owner's own instructions, added to the system prompt in every project. */
+  instructions: string
   firstRunDone: boolean
 }
 
@@ -94,7 +96,25 @@ export interface ChangedFile {
 export type TimelineItem =
   | { id: string; kind: 'user'; text: string; taskId: string }
   | { id: string; kind: 'assistant'; text: string; taskId: string }
-  | { id: string; kind: 'notice'; text: string; tone: 'info' | 'ok' | 'warn' | 'error'; taskId?: string }
+  | {
+      id: string
+      kind: 'notice'
+      text: string
+      tone: 'info' | 'ok' | 'warn' | 'error'
+      taskId?: string
+      /** A file to show with a "Show in folder" button (e.g. the packaged app). */
+      reveal?: string
+    }
+
+/** How much of the model's context the conversation uses (the "Memory" meter). */
+export interface ContextUsage {
+  /** Tokens in the last request plus its reply. */
+  used: number
+  /** The model's context length. */
+  size: number
+  /** True when counted by the server; false when estimated. */
+  exact: boolean
+}
 
 export type TaskOutcome = 'running' | 'done' | 'stopped' | 'error'
 
@@ -119,6 +139,9 @@ export interface ProjectState {
   running: boolean
   prompt: PendingPrompt | null
   runCommand: string | null
+  /** The owner's "Things to always remember" for this project. */
+  memory: string
+  context: ContextUsage | null
 }
 
 // ---------- Questions the agent asks the owner ----------
@@ -179,6 +202,7 @@ export type AgentEvent =
   | { type: 'prompt'; projectPath: string; prompt: PendingPrompt | null }
   | { type: 'task-end'; projectPath: string; task: TaskRecord }
   | { type: 'tasks'; projectPath: string; tasks: TaskRecord[] }
+  | { type: 'context'; projectPath: string; context: ContextUsage }
 
 // ---------- Run my app ----------
 

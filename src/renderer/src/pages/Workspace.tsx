@@ -1,7 +1,9 @@
-import { ArrowLeft, ArrowUp, History, LoaderCircle, Play, Settings, Square, Undo2 } from 'lucide-react'
+import { ArrowLeft, ArrowUp, FolderOpen, History, LoaderCircle, NotebookPen, Package, Play, Settings, Square, Undo2 } from 'lucide-react'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { ApprovalDialog } from '../components/ApprovalDialog'
+import { ContextMeter } from '../components/ContextMeter'
 import { HistoryDialog } from '../components/HistoryDialog'
+import { NotesDialog } from '../components/NotesDialog'
 import { LogoMark } from '../components/Logo'
 import { Markdown } from '../components/Markdown'
 import { ConnectionHelp } from '../components/NotConnected'
@@ -9,6 +11,7 @@ import { RunPanel } from '../components/RunPanel'
 import { SidePanel } from '../components/SidePanel'
 import { modelLabel } from '../components/common'
 import { Button, Dialog, IconButton, Kbd, Textarea, Tooltip } from '../components/ui'
+import { invoke } from '../lib/api'
 import { cn } from '../lib/format'
 import { activeModelId, useApp } from '../stores/app'
 import { undoableTask, useWorkspace } from '../stores/workspace'
@@ -66,10 +69,16 @@ function TopBar() {
   const startRun = useWorkspace((s) => s.startRun)
   const stopRun = useWorkspace((s) => s.stopRun)
   const undo = useWorkspace((s) => s.undo)
+  const share = useWorkspace((s) => s.share)
+  const memory = useWorkspace((s) => s.memory)
   const setSettingsOpen = useApp((s) => s.setSettingsOpen)
   const [confirmUndo, setConfirmUndo] = useState(false)
   const [historyOpen, setHistoryOpen] = useState(false)
+  const [notesOpen, setNotesOpen] = useState(false)
+  const [confirmShare, setConfirmShare] = useState(false)
   const undoTask = undoableTask(tasks)
+  // Labels show on wide windows; narrow ones keep the icons (the aria-label names the button).
+  const label = (text: string) => <span className="hidden xl:inline">{text}</span>
 
   return (
     <header className="flex h-14 shrink-0 items-center gap-3 border-b border-border bg-panel px-3">
@@ -99,19 +108,59 @@ function TopBar() {
           <Play size={15} fill="currentColor" /> Run my app
         </Button>
       )}
+      <Tooltip content="Make your app into a file you can give to other people">
+        <span>
+          <Button className="h-9.5 px-3 text-sm" aria-label="Share my app" disabled={running} onClick={() => setConfirmShare(true)}>
+            <Package size={15} /> {label('Share my app')}
+          </Button>
+        </span>
+      </Tooltip>
       <Tooltip content={undoTask ? `Put the project back to how it was before “${undoTask.title}”` : 'Nothing to undo yet'}>
         <span>
-          <Button className="h-9.5 px-4 text-sm" disabled={!undoTask || running} onClick={() => setConfirmUndo(true)}>
-            <Undo2 size={15} /> Undo last task
+          <Button className="h-9.5 px-3 text-sm" aria-label="Undo last task" disabled={!undoTask || running} onClick={() => setConfirmUndo(true)}>
+            <Undo2 size={15} /> {label('Undo last task')}
           </Button>
         </span>
       </Tooltip>
       <Tooltip content="See every task and go back to before any of them">
-        <Button className="h-9.5 px-4 text-sm" onClick={() => setHistoryOpen(true)}>
-          <History size={15} /> History
+        <Button className="h-9.5 px-3 text-sm" aria-label="History" onClick={() => setHistoryOpen(true)}>
+          <History size={15} /> {label('History')}
+        </Button>
+      </Tooltip>
+      <Tooltip content={memory ? 'Things I always remember for this project (you have notes)' : 'Things I should always remember for this project'}>
+        <Button className={cn('h-9.5 px-3 text-sm', memory && 'border-accent/50')} aria-label="Notes" onClick={() => setNotesOpen(true)}>
+          <NotebookPen size={15} /> {label('Notes')}
         </Button>
       </Tooltip>
       <HistoryDialog open={historyOpen} onOpenChange={setHistoryOpen} />
+      <NotesDialog open={notesOpen} onOpenChange={setNotesOpen} />
+      <Dialog
+        open={confirmShare}
+        onOpenChange={setConfirmShare}
+        title="Share your app?"
+        footer={
+          <>
+            <Button onClick={() => setConfirmShare(false)}>Cancel</Button>
+            <Button
+              variant="primary"
+              onClick={() => {
+                setConfirmShare(false)
+                void share()
+              }}
+            >
+              <Package size={14} /> Package it
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-2 px-5 py-4 text-sm text-muted">
+          <p>
+            I'll package your app into one file you can give to other people: a program (<b className="text-text">.exe</b>) for desktop apps, or a{' '}
+            <b className="text-text">.zip</b> for websites. They won't need to install anything else.
+          </p>
+          <p>This can take a few minutes, and the first time I may need to download packaging tools. I'll ask before running commands, as usual.</p>
+        </div>
+      </Dialog>
       <ThemeToggle />
       <IconButton label="Settings" onClick={() => setSettingsOpen(true)}>
         <Settings size={17} />
@@ -234,6 +283,11 @@ function Conversation() {
               )}
             >
               <Markdown text={item.text} />
+              {item.reveal && (
+                <Button size="sm" className="mt-1.5" onClick={() => void invoke('shell:showItem', item.reveal!)}>
+                  <FolderOpen size={13} /> Show in folder
+                </Button>
+              )}
             </div>
           )
         })}
@@ -380,7 +434,8 @@ function Composer() {
           <span className="text-[11px] text-faint">
             <Kbd>Enter</Kbd> to send · <Kbd>Shift+Enter</Kbd> new line{running && <> · <Kbd>Esc</Kbd> to stop</>}
           </span>
-          <div className="flex gap-2">
+          <div className="flex items-center gap-3">
+            <ContextMeter />
             {running && (
               <Button variant="danger" className="h-10 px-5 text-sm" onClick={stop}>
                 <Square size={14} fill="currentColor" /> Stop

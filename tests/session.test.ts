@@ -10,7 +10,8 @@ import { ProjectSession, type SessionDeps } from '../src/main/agent/session'
 import { CopySnapshots, GitSnapshots, gitInstalled } from '../src/main/project/snapshots'
 import { emptyProject, ProjectStore } from '../src/main/project/store'
 import { RulzClient } from '../src/main/rulz/client'
-import { startMockRulz, type MockTurn } from './helpers/mockRulz'
+import { startMockRulz, type MockOptions, type MockTurn } from './helpers/mockRulz'
+import { SHARE_SHOWN, SHARE_TASK } from '../src/main/agent/prompt'
 
 const base = mkdtempSync(join(tmpdir(), 'rulz-agent-session-'))
 afterAll(() => rmSync(base, { recursive: true, force: true }))
@@ -22,7 +23,7 @@ interface Harness {
   events: AgentEvent[]
   prompts: PendingPrompt[]
   requests: Awaited<ReturnType<typeof startMockRulz>>['requests']
-  run: (text: string, opts?: { shown?: string }) => Promise<TaskRecord>
+  run: (text: string, opts?: { shown?: string; share?: boolean }) => Promise<TaskRecord>
   close: () => Promise<void>
 }
 
@@ -34,9 +35,10 @@ async function harness(
     nCtx?: number
     useGit?: boolean
     checkPage?: SessionDeps['checkPage']
+    timings?: MockOptions['timings']
   } = {}
 ): Promise<Harness> {
-  const mock = await startMockRulz({ turns, nCtx: opts.nCtx })
+  const mock = await startMockRulz({ turns, nCtx: opts.nCtx, timings: opts.timings })
   const root = join(base, `project-${++counter}`)
   mkdirSync(root, { recursive: true })
   const dataDir = join(base, `data-${counter}`)
@@ -408,6 +410,106 @@ describe('the agent loop', () => {
       }
     }, 60_000)
   }
+
+  it("fills the Memory meter from the server's exact counts, or estimates without them", async () => {
+    const h = await harness([{ content: 'Hello!' }], { timings: () => ({ cache_n: 4000, prompt_n: 1000, predicted_n: 50 }) })
+    try {
+      await h.run('Say hello')
+      expect(h.session.data.context).toEqual({ used: 5050, size: 65536, exact: true })
+      expect(h.events.filter((e) => e.type === 'context')).toHaveLength(1)
+      expect(h.session.state('x', 0).context).toEqual({ used: 5050, size: 65536, exact: true })
+    } finally {
+      await h.close()
+    }
+    const e = await harness([{ content: 'Hello!' }])
+    try {
+      await e.run('Say hello')
+      expect(e.session.data.context).toMatchObject({ size: 65536, exact: false })
+      expect(e.session.data.context!.used).toBeGreaterThan(1000) // system prompt and tools
+    } finally {
+      await e.close()
+    }
+  }, 30_000)
+
+  it('uses more of the context when the estimate turns out too high', async () => {
+    // The server counts half the estimated tokens, so the next request may hold about twice as much.
+    let estimate = 0
+    const h = await harness(
+      [
+        { toolCalls: [call('read_file', { path: 'big1.txt' })] },
+        { toolCalls: [call('read_file', { path: 'big2.txt' })] },
+        { toolCalls: [call('read_file', { path: 'big3.txt' })] },
+        { content: 'Done.' }
+      ],
+      {
+        nCtx: 32768,
+        timings: (req) => {
+          estimate = Math.ceil(JSON.stringify(req.body.messages).length / 3.2)
+          return { cache_n: 0, prompt_n: Math.ceil(estimate / 2), predicted_n: 10 }
+        }
+      }
+    )
+    try {
+      for (const n of [1, 2, 3]) writeFileSync(join(h.root, `big${n}.txt`), `file ${n} content\n`.repeat(1600))
+      await h.run('Read the three files')
+      const last = h.requests[h.requests.length - 1].body.messages!.filter((m) => m.role === 'tool')
+      // Without the correction the older files would have been shortened to fit 80% of 32K.
+      expect(last.length).toBe(3)
+      expect(last.every((m) => !m.content.includes('omitted to save space'))).toBe(true)
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('warns once when the model has a small context', async () => {
+    const h = await harness([{ content: 'One.' }, { content: 'Two.' }], { nCtx: 16384 })
+    try {
+      await h.run('First')
+      await h.run('Second')
+      const warnings = h.session.data.timeline.filter((i) => i.kind === 'notice' && /small working memory \(16K tokens\)/.test(i.text))
+      expect(warnings).toHaveLength(1)
+      expect(warnings[0]).toMatchObject({ tone: 'warn' })
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('sends the owner\'s instructions and project notes with every request, and saves the notes', async () => {
+    const h = await harness([{ content: 'OK.' }], { settings: { instructions: 'Explain things briefly.' } })
+    try {
+      await h.session.setMemory('  Use blue, not purple.  ')
+      await h.run('Make a page')
+      const system = h.requests[0].body.messages![0].content
+      expect(system).toContain('Explain things briefly.')
+      expect(system).toContain('Use blue, not purple.')
+      expect(h.session.state('x', 0).memory).toBe('Use blue, not purple.')
+      const store = new ProjectStore(join(base, `data-${counter}`))
+      expect((await store.load(h.root)).memory).toBe('Use blue, not purple.')
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('"Share my app" points the owner at the packaged file', async () => {
+    const h = await harness([
+      { toolCalls: [call('write_file', { path: 'dist/site.zip', content: 'pretend zip' })] },
+      { content: 'Packaged it.\nSHARE: dist/site.zip' },
+      { content: 'Packaged it.\nSHARE: dist/missing.zip' }
+    ])
+    try {
+      const task = await h.run(SHARE_TASK, { shown: SHARE_SHOWN, share: true })
+      expect(task.title).toBe(SHARE_SHOWN)
+      expect(h.requests[0].body.messages!.find((m) => m.role === 'user')!.content).toContain('electron-builder')
+      const ok = h.session.data.timeline.at(-1)
+      expect(ok).toMatchObject({ kind: 'notice', tone: 'ok', reveal: join(h.root, 'dist', 'site.zip') })
+      expect((ok as { text: string }).text).toMatch(/Your app is packaged: \*\*dist\/site\.zip\*\* \(1 KB\)/)
+
+      await h.run(SHARE_TASK, { shown: SHARE_SHOWN, share: true })
+      expect(h.session.data.timeline.at(-1)).toMatchObject({ kind: 'notice', tone: 'warn', text: expect.stringMatching(/couldn't find a packaged file/) })
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
 
   it('going back to an early task undoes every later one', async () => {
     const h = await harness(

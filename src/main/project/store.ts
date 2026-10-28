@@ -1,7 +1,7 @@
 // Recent projects and per-project history (conversation, tasks, steps), kept in the app's data folder.
 import { createHash } from 'node:crypto'
 import { join, resolve } from 'node:path'
-import type { ProjectInfo, TaskRecord, TimelineItem, WireMessage } from '@shared/types'
+import type { ContextUsage, ProjectInfo, TaskRecord, TimelineItem, WireMessage } from '@shared/types'
 import { readJson, writeJsonAtomic } from '../util/jsonFile'
 
 export interface ProjectData {
@@ -16,6 +16,10 @@ export interface ProjectData {
   notes: string[]
   timeline: TimelineItem[]
   tasks: TaskRecord[]
+  /** The owner's "Things to always remember", always in the system prompt. */
+  memory: string
+  /** Last measured context use, for the meter. */
+  context: ContextUsage | null
 }
 
 const MAX_TIMELINE = 600
@@ -33,7 +37,9 @@ export const emptyProject = (path: string): ProjectData => ({
   messages: [],
   notes: [],
   timeline: [],
-  tasks: []
+  tasks: [],
+  memory: '',
+  context: null
 })
 
 /** Trims what is saved: old timeline items, old tasks, long step output. */

@@ -1,5 +1,31 @@
 # Real-model check, 2026-10-27
 
+## Notes, instructions, Memory meter and "Share my app"
+
+Same model and server (Qwen3-Coder at 100K context), run with `-t "Share my app"`; every approval was answered **Allow**.
+
+| Scenario | Result |
+| --- | --- |
+| Settings instruction "End your final summary with the line "Have a sunny day!"" and project note "The app is called "Sunny Counter"" → "make a simple counter web page with + and - buttons" | Done in 34 s. The page is titled and headed "Sunny Counter", and the final message ended with "Have a sunny day!". |
+| Memory meter after that task | 6,775 of 100,352 tokens, counted by RulZ (`exact: true`); the meter read "Memory 7% full". |
+| **Share my app** on the counter page | Done in 15 s. `dist/counter-app.zip` with `index.html`, `style.css` and `script.js`; the conversation showed "Your app is packaged" with **Show in folder**. |
+| **Share my app** on a seeded Python tkinter app (no tasks yet) | Done in 57 s. PyInstaller one-file `dist/main.exe` (10.7 MB); the agent started it in the background, checked it and stopped it. The test then ran the .exe itself: its window was still open after 8 s. |
+
+It took five runs to get there. What the earlier ones showed, and what changed:
+
+- **Share my app** was greyed out in a project with files but no tasks yet (an existing folder you open). It is now enabled.
+- The model "tested" the .exe with a normal command, which waits until the window is closed, and wrapped the .exe in a .zip
+  with a README and a .bat file. The share instructions now say: one file (the .exe itself for apps, a .zip for websites),
+  no extra files, check a window app with a background command.
+- That wording first made it turn the website into an Electron .exe ("the owner wants an .exe"); it now says to keep the kind
+  of app as it is.
+- It tried to "tidy up" by deleting `dist`, the folder holding the result (it failed only because the .exe was still open).
+  The instructions now say to leave it alone.
+- **Background commands left windows open.** PowerShell doesn't wait for a program with a window, so stopping the command
+  stopped only PowerShell and the app kept running. Background commands now keep PowerShell waiting for the programs it
+  started, so **Stop** closes them (covered by a new unit test that fails without the fix).
+- PyInstaller's working files (`build/`, `main.spec`) showed up in Files changed; they now go into `.venv`.
+
 ## Checking pages and "Fix this"
 
 Same model and server, run with `-t "checks web pages"`; every approval was answered **Allow**.

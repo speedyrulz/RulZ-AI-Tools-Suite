@@ -6,6 +6,10 @@ export interface PromptInfo {
   date: string
   /** Summary of earlier work that no longer fits in the conversation. */
   summary?: string
+  /** The owner's "Things to always remember" for this project. */
+  memory?: string
+  /** The owner's instructions for every project (Settings). */
+  instructions?: string
   /** Background commands still running from earlier. */
   background?: { id: string; command: string }[]
 }
@@ -47,6 +51,16 @@ export function systemPrompt(info: PromptInfo): string {
 - Use ask_user only for genuine choices that change the result. For small details, choose a sensible default and mention it in your summary.
 - If a tool result says something was refused, explain to the owner in plain words what you wanted to do and why it matters.`
   ]
+  if (info.instructions?.trim()) {
+    parts.push(
+      `## The owner's instructions for every project\nThe owner wrote these in Settings. Follow them, together with the rules above (the "Honesty and safety" rules always come first):\n${info.instructions.trim()}`
+    )
+  }
+  if (info.memory?.trim()) {
+    parts.push(
+      `## The owner's notes for this project\nThe owner wrote these in "Things to always remember". Follow them in everything you do, unless the owner asks for something different in this task:\n${info.memory.trim()}`
+    )
+  }
   if (info.background?.length) {
     parts.push(
       `## Still running from earlier\n${info.background.map((b) => `- ${b.id}: ${b.command}`).join('\n')}\nStop these with stop_background_command before starting the same app again.`
@@ -61,6 +75,36 @@ export const HOW_TO_RUN_TASK =
   'How do I start this app? Look at the project files and work out the exact PowerShell command that starts it from the project folder ' +
   '(install anything it needs first if that is required). Check that the command works. Then end your reply with one line in exactly this form:\n' +
   'RUN: <the command>'
+
+/** What the conversation shows when the owner clicks "Share my app". */
+export const SHARE_SHOWN = 'Make my app into something I can give to other people.'
+
+/** The task "Share my app" starts. */
+export const SHARE_TASK =
+  'Package this app so the owner can give it to other people, who may not have Node.js, Python or anything else installed. ' +
+  'Look at the project first, then pick the simplest way that fits:\n' +
+  '- Electron app: add electron-builder to devDependencies and a "build" section to package.json (appId, productName, win target "portable"), ' +
+  'then run "npx electron-builder --win portable". The result is one .exe in dist/.\n' +
+  '- Python app: install PyInstaller in the project\'s .venv and run it with --onefile (add --windowed for apps with a window, not for apps that print text), ' +
+  '--distpath dist --workpath .venv\\pyinstaller-build --specpath .venv (so its working files stay out of sight). The result is one .exe in dist/.\n' +
+  '- Website made of plain HTML, CSS and JavaScript (or built with Vite: run its build first): put the files the site needs into one .zip in dist/ ' +
+  'with Compress-Archive; the person who gets it unzips it and opens index.html.\n' +
+  '- Anything else: choose the closest of these, or explain in plain words why it can\'t be packaged yet.\n' +
+  'Keep the kind of app as it is (don\'t turn a website into a desktop app), and share exactly one file: the .exe for Electron and Python apps ' +
+  '(not wrapped in a .zip), the .zip for websites. Don\'t add extra files such as a README or a .bat file, and don\'t delete anything to tidy up: ' +
+  'leave dist/ as it is. ' +
+  'Check that the packaged file really exists (and for an .exe, that its size makes sense). To check that an .exe with a window starts, run it with ' +
+  'start_background_command, look with check_background_command after a few seconds, then stop it with stop_background_command; never with run_command, ' +
+  'which would wait until someone closes the window. Then tell the owner in plain words what the file is, ' +
+  'how someone else uses it (for example: "copy the file to their PC and double-click it; Windows may warn that it doesn\'t know the app: click More info, then Run anyway"), ' +
+  'and end your reply with one line in exactly this form:\n' +
+  'SHARE: <path of the packaged file, relative to the project folder>'
+
+/** Reads the "SHARE: <path>" line from the agent's answer. */
+export function parseShareLine(text: string): string | null {
+  const m = [...text.matchAll(/^\s*\**SHARE:\**\s*`*([^`\n]+?)`*\s*$/gim)].pop()
+  return m ? m[1].trim().replace(/^["']|["']$/g, '') : null
+}
 
 /** What the conversation shows when the owner clicks "Fix this". */
 export const FIX_RUN_SHOWN = 'Please fix the error my app showed when I ran it.'

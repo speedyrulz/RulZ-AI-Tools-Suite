@@ -3,7 +3,7 @@ import { basename, join, resolve } from 'node:path'
 import { app, BrowserWindow, dialog, nativeTheme, shell } from 'electron'
 import { CANDIDATE_URLS } from '@shared/defaults'
 import type { ConnectionInfo, ModelActivity, ProjectInfo, ProjectState, Theme } from '@shared/types'
-import { FIX_RUN_SHOWN, fixRunTask } from './agent/prompt'
+import { FIX_RUN_SHOWN, fixRunTask, SHARE_SHOWN, SHARE_TASK, systemPrompt } from './agent/prompt'
 import { ProjectSession } from './agent/session'
 import { broadcast, handle } from './ipc'
 import { checkPageInWindow } from './project/pageWindow'
@@ -204,6 +204,9 @@ async function main(): Promise<void> {
   // ---- IPC ----
   handle('app:info', () => ({ version: app.getVersion(), userData, platform: process.platform, gitInstalled: hasGit }))
   handle('settings:get', () => settings.get())
+  handle('settings:builtInPrompt', () =>
+    systemPrompt({ projectPath: 'C:\\…\\your project', projectName: 'your project', date: new Date().toDateString() })
+  )
   handle('settings:update', async (patch) => {
     const before = settings.get()
     const next = await settings.update(patch)
@@ -251,6 +254,7 @@ async function main(): Promise<void> {
     return s.state(current!.name, current!.lastOpened)
   })
   handle('files:diff', (path, taskId, rel) => requireSession(path).diff(taskId, rel))
+  handle('project:setMemory', (path, text) => requireSession(path).setMemory(text))
 
   handle('run:state', (path) => requireRunner(path).get())
   handle('run:start', (path) => requireRunner(path).start(requireSession(path).data.runCommand))
@@ -271,6 +275,14 @@ async function main(): Promise<void> {
     // A running app holds its files open.
     if (before.running) await r.stop()
     s.start(fixRunTask(before), { shown: FIX_RUN_SHOWN })
+  })
+  handle('run:share', async (path) => {
+    const s = requireSession(path)
+    if (s.isRunning) throw new Error('A task is already running. Wait for it to finish or press Stop.')
+    // A running app holds its files open, and packaging rebuilds them.
+    const r = requireRunner(path)
+    if (r.get().running) await r.stop()
+    s.start(SHARE_TASK, { shown: SHARE_SHOWN, share: true })
   })
 
   // ---- Lifecycle ----

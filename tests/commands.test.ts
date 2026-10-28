@@ -80,6 +80,23 @@ describe.runIf(process.platform === 'win32')('running commands', { timeout: 30_0
     expect((await bg.stop(id)).isError).toBe(false)
     expect((await bg.check(id, 0)).isError).toBe(true)
   }, 30_000)
+
+  it('keeps track of programs PowerShell starts without waiting, and stops them', async () => {
+    // Like a packaged .exe with a window: Start-Process returns at once and PowerShell would exit.
+    const bg = new BackgroundCommands()
+    const id = bg.run("Start-Process -FilePath ping -ArgumentList '-n','60','127.0.0.57' -WindowStyle Hidden", cwd)
+    expect((await bg.check(id, 3000)).text).toMatch(/Still running/)
+    expect(processWithMarker('127.0.0.57')).toBe(true)
+    await bg.stop(id)
+    await new Promise((res) => setTimeout(res, 500))
+    expect(processWithMarker('127.0.0.57')).toBe(false)
+  })
+
+  it('still reports a finished background command as stopped, with its exit code', async () => {
+    const bg = new BackgroundCommands()
+    const id = bg.run('Write-Output done; exit 4', cwd)
+    expect((await bg.check(id, 10_000)).text).toMatch(/stopped \(exit code 4\)[\s\S]*done/)
+  })
 })
 
 describe('hints for known stumbling blocks', () => {

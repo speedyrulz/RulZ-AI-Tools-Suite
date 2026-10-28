@@ -6,6 +6,7 @@ import type {
   AgentStatus,
   AppSettings,
   ChangedFile,
+  ContextUsage,
   DistributiveOmit,
   FileDiff,
   ModelActivity,
@@ -19,6 +20,7 @@ import type {
   WireMessage,
   WireToolCall
 } from '@shared/types'
+import { MAX_INSTRUCTION_CHARS } from '@shared/defaults'
 import { friendlyServerError, pickDefaultModel, type RulzClient, type TurnResult } from '../rulz/client'
 import type { Snapshot, Snapshotter } from '../project/snapshots'
 import type { ProjectData, ProjectStore } from '../project/store'
@@ -29,8 +31,11 @@ import {
   estimateTokens,
   fitMessages,
   mechanicalSummary,
+  SMALL_CONTEXT,
   SUMMARY_PROMPT,
   summaryRange,
+  tokenScale,
+  totalTokens,
   transcript
 } from './context'
 import * as files from './fileTools'
@@ -38,7 +43,7 @@ import type { ToolOutcome } from './fileTools'
 import { LoopGuard, type GuardTrip } from './loopGuard'
 import { formatPageReport, pageHasProblems, pageTarget, type PageReport, type PageTarget } from './pageCheck'
 import { resolveInProject } from './pathGuard'
-import { HOW_TO_RUN_TASK, parseRunLine, systemPrompt } from './prompt'
+import { HOW_TO_RUN_TASK, parseRunLine, parseShareLine, systemPrompt } from './prompt'
 import { approvalKey, classifyCommand, needsApproval, type ActionKind } from './safety'
 import { describeStep, parseToolArgs, TOOL_DEFS, TOOL_NAMES } from './tools'
 
@@ -96,6 +101,9 @@ export class ProjectSession {
   private taskStart = 0
   private saveTimer: NodeJS.Timeout | null = null
   private statusNow: AgentStatus = { phase: 'idle' }
+  /** Real tokens per estimated token, learnt from the server's counts (see tokenScale). */
+  private scale = 1
+  private warnedSmallContext = false
 
   constructor(
     public data: ProjectData,
@@ -117,8 +125,16 @@ export class ProjectSession {
       tasks: this.data.tasks,
       running: this.running,
       prompt: this.pending?.request ?? null,
-      runCommand: this.data.runCommand
+      runCommand: this.data.runCommand,
+      memory: this.data.memory,
+      context: this.data.context
     }
+  }
+
+  /** Saves the owner's "Things to always remember"; the next request includes them. */
+  async setMemory(text: string): Promise<void> {
+    this.data.memory = text.trim().slice(0, MAX_INSTRUCTION_CHARS)
+    await this.saveNow()
   }
 
   get status(): AgentStatus {
@@ -142,8 +158,8 @@ export class ProjectSession {
     this.scheduleSave()
   }
 
-  private notice(text: string, tone: 'info' | 'ok' | 'warn' | 'error', taskId?: string): void {
-    this.addItem({ id: randomUUID(), kind: 'notice', text, tone, taskId })
+  private notice(text: string, tone: 'info' | 'ok' | 'warn' | 'error', taskId?: string, reveal?: string): void {
+    this.addItem({ id: randomUUID(), kind: 'notice', text, tone, taskId, ...(reveal ? { reveal } : {}) })
   }
 
   private addStep(task: TaskRecord, step: Omit<Step, 'id' | 'taskId'>): Step {
@@ -176,7 +192,7 @@ export class ProjectSession {
   // ---------- public actions ----------
 
   /** `shown` is what the conversation shows when the model gets a longer text (e.g. "Fix this"). */
-  start(text: string, opts: { howToRun?: boolean; shown?: string } = {}): void {
+  start(text: string, opts: { howToRun?: boolean; share?: boolean; shown?: string } = {}): void {
     const trimmed = text.trim()
     if (!trimmed) return
     if (this.running) throw new Error('A task is already running. Wait for it to finish or press Stop.')
@@ -189,7 +205,7 @@ export class ProjectSession {
     this.running = true
     this.abort = new AbortController()
     this.emit({ type: 'task-start', task, item })
-    void this.run(task, trimmed, opts.howToRun ?? false)
+    void this.run(task, trimmed, opts.howToRun ?? false, opts.share ?? false)
   }
 
   stop(): void {
@@ -267,7 +283,7 @@ export class ProjectSession {
 
   // ---------- the task ----------
 
-  private async run(task: TaskRecord, text: string, howToRun: boolean): Promise<void> {
+  private async run(task: TaskRecord, text: string, howToRun: boolean, share: boolean): Promise<void> {
     const signal = this.abort!.signal
     this.allowed = new Set()
     let snap: Snapshotter | null = null
@@ -300,6 +316,7 @@ export class ProjectSession {
           this.notice('Saved how to run this app. Click **Run my app** to start it.', 'ok', task.id)
         } else this.notice("I couldn't work out how to run this app.", 'warn', task.id)
       }
+      if (share) await this.reportShare(task)
     } catch (e) {
       if (e instanceof StopTask || signal.aborted) {
         task.outcome = 'stopped'
@@ -351,6 +368,20 @@ export class ProjectSession {
     return pick
   }
 
+  /** After "Share my app": points the owner at the packaged file the agent named, if it is really there. */
+  private async reportShare(task: TaskRecord): Promise<void> {
+    const last = [...this.data.messages].reverse().find((m) => m.role === 'assistant' && m.content.trim())
+    const rel = last ? parseShareLine(last.content) : null
+    const target = rel ? await resolveInProject(this.root, rel).catch(() => null) : null
+    const st = target ? await fs.stat(target.abs).catch(() => null) : null
+    if (target && st?.isFile()) {
+      const size = st.size >= 1024 * 1024 ? `${(st.size / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(st.size / 1024))} KB`
+      this.notice(`Your app is packaged: **${target.rel}** (${size}). This is the file to give to other people.`, 'ok', task.id, target.abs)
+    } else {
+      this.notice("I couldn't find a packaged file to share, so it may not have worked. Read my last message for what happened.", 'warn', task.id)
+    }
+  }
+
   /** Makes sure the model is loaded and learns its context length and chat template. */
   private async prepareModel(model: string, signal: AbortSignal): Promise<number> {
     const info = this.deps.models().find((m) => m.id === model)
@@ -369,7 +400,16 @@ export class ProjectSession {
     }
     this.deps.activity('working')
     this.deps.refreshModels()
-    return nCtx ?? info?.loadedContext ?? DEFAULT_CTX
+    const size = nCtx ?? info?.loadedContext ?? DEFAULT_CTX
+    if (size <= SMALL_CONTEXT && !this.warnedSmallContext) {
+      this.warnedSmallContext = true
+      this.notice(
+        `The model is loaded with a small working memory (${Math.round(size / 1024)}K tokens), so in bigger projects I'll have to tidy up my notes often and may forget details. ` +
+          'For bigger projects, load the model in RulZ LLM Suite with a larger context length (32K or more).',
+        'warn'
+      )
+    }
+    return size
   }
 
   private async loop(task: TaskRecord, model: string, nCtx: number, signal: AbortSignal, snap: Snapshotter | null): Promise<void> {
@@ -474,13 +514,16 @@ export class ProjectSession {
   // ---------- talking to the model ----------
 
   private async buildRequest(model: string, nCtx: number, signal: AbortSignal): Promise<WireMessage[]> {
-    const budget = Math.floor(nCtx * CONTEXT_SHARE)
+    // The budget is in estimated tokens, corrected by what the server counted last time.
+    const budget = Math.floor((nCtx * CONTEXT_SHARE) / this.scale)
     for (let attempt = 0; ; attempt++) {
       const system = systemPrompt({
         projectPath: this.root,
         projectName: this.root.split(/[\\/]/).pop() ?? this.root,
         date: new Date().toDateString(),
         summary: this.data.summary,
+        memory: this.data.memory,
+        instructions: this.deps.settings().instructions,
         background: this.background.running()
       })
       const fit = fitMessages(this.data.messages, budget, estimateTokens(system) + TOOLS_TOKENS)
@@ -520,8 +563,8 @@ export class ProjectSession {
     this.setStatus({ phase: 'thinking', text: 'Thinking…' })
     this.deps.activity('working')
     let item: Extract<TimelineItem, { kind: 'assistant' }> | null = null
-    const used = messages.reduce((n, m) => n + estimateTokens(m.content) + estimateTokens(JSON.stringify(m.tool_calls ?? '')), TOOLS_TOKENS)
-    const maxTokens = Math.max(1024, Math.min(16384, nCtx - used - 256))
+    const estimated = totalTokens(messages) + TOOLS_TOKENS
+    const maxTokens = Math.max(1024, Math.min(16384, nCtx - Math.ceil(estimated * this.scale) - 256))
     const sampling = isQwenCoder(model) ? { temperature: 0.7, top_p: 0.8, top_k: 20, repeat_penalty: 1.05 } : {}
     const result = await this.deps.client.streamTurn({ model, messages, tools: TOOL_DEFS, max_tokens: maxTokens, ...sampling }, signal, {
       onProgress: (done, total) => {
@@ -548,7 +591,23 @@ export class ProjectSession {
         this.emit({ type: 'item', item: { ...finished, text: '' } })
       } else this.emit({ type: 'item', item: { ...finished } })
     }
+    this.measure(result, estimated, nCtx)
     return result
+  }
+
+  /** Updates the Memory meter, and the estimate's correction, from the server's token counts. */
+  private measure(result: TurnResult, estimated: number, nCtx: number): void {
+    let context: ContextUsage
+    if (result.usage) {
+      this.scale = tokenScale(estimated, result.usage.prompt)
+      context = { used: result.usage.prompt + result.usage.completion, size: nCtx, exact: true }
+    } else {
+      const reply = result.content + JSON.stringify(result.toolCalls)
+      context = { used: Math.ceil((estimated + estimateTokens(reply)) * this.scale), size: nCtx, exact: false }
+    }
+    this.data.context = context
+    this.emit({ type: 'context', context })
+    this.scheduleSave()
   }
 
   // ---------- running tools ----------

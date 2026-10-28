@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { _electron as electron, type ElectronApplication, type Page } from 'playwright-core'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { startMockRulz } from '../helpers/mockRulz'
+import { startMockRulz, type MockTurn } from '../helpers/mockRulz'
 
 const appRoot = resolve(__dirname, '../..')
 const base = mkdtempSync(join(tmpdir(), 'rulz-agent-e2e-'))
@@ -23,21 +23,36 @@ beforeAll(async () => {
   mkdirSync(projectsDir, { recursive: true })
   mkdirSync(shots, { recursive: true })
   writeFileSync(join(userData, 'settings.json'), JSON.stringify({ projectsDir }))
+  // The share task is answered by what it asks, not by position: the "slow" task below may be
+  // stopped before its request reaches the server, which would shift every later turn.
+  const shareTurns = {
+    start: { content: "I'll pack the page into a zip.", toolCalls: [call('write_file', { path: 'dist/e2e-app.zip', content: 'pretend zip', summary: 'Packing your app' })] },
+    done: { content: 'Done: copy **e2e-app.zip** to their PC and unzip it.\n\nSHARE: dist/e2e-app.zip' }
+  }
+  let next = 0
+  const script: MockTurn[] = [
+    {
+      content: "I'll create a tiny app.",
+      toolCalls: [
+        call('write_file', { path: 'package.json', content: '{\n  "name": "e2e-app",\n  "scripts": { "start": "node app.js" }\n}\n', summary: 'Setting up the project' }),
+        call('write_file', { path: 'app.js', content: "console.log('Hello from the app')\n", summary: 'Creating the app' })
+      ]
+    },
+    { content: "Now I'll check that it runs.", toolCalls: [call('run_command', { command: 'node app.js', summary: 'Starting your app' })] },
+    { content: 'Your app is ready.\n\n**How to try it:** click **Run my app**.' },
+    { content: "I'll look at the shop page.", toolCalls: [call('check_page', { page: 'shop.html', summary: 'Looking at your shop page' })] },
+    { content: 'Fixed it.' },
+    { content: 'Thinking very slowly…', delay: 15_000 }
+  ]
   mock = await startMockRulz({
-    turns: [
-      {
-        content: "I'll create a tiny app.",
-        toolCalls: [
-          call('write_file', { path: 'package.json', content: '{\n  "name": "e2e-app",\n  "scripts": { "start": "node app.js" }\n}\n', summary: 'Setting up the project' }),
-          call('write_file', { path: 'app.js', content: "console.log('Hello from the app')\n", summary: 'Creating the app' })
-        ]
-      },
-      { content: "Now I'll check that it runs.", toolCalls: [call('run_command', { command: 'node app.js', summary: 'Starting your app' })] },
-      { content: 'Your app is ready.\n\n**How to try it:** click **Run my app**.' },
-      { content: "I'll look at the shop page.", toolCalls: [call('check_page', { page: 'shop.html', summary: 'Looking at your shop page' })] },
-      { content: 'Fixed it.' },
-      { content: 'Thinking very slowly…', delay: 15_000 }
-    ]
+    turns: (req) => {
+      const messages = req.body.messages ?? []
+      if (messages.some((m) => m.role === 'user' && m.content.includes('Package this app'))) {
+        return messages.at(-1)?.role === 'tool' ? shareTurns.done : shareTurns.start
+      }
+      return script[next++] ?? { content: 'All done.' }
+    },
+    timings: () => ({ cache_n: 3000, prompt_n: 1000, predicted_n: 96 })
   })
   const electronPath = (await import('electron')).default as unknown as string
   app = await electron.launch({
@@ -154,6 +169,36 @@ describe('RulZ Coding Agent', () => {
     await expect.poll(() => rows.getByRole('button', { name: 'Go back to before this' }).count()).toBe(0)
     await page.screenshot({ path: join(shots, '5-undone.png') })
     await page.keyboard.press('Escape')
+  })
+
+  it('shows the Memory meter, keeps notes and instructions, and packages the app with "Share my app"', async () => {
+    // 3000 cached + 1000 new prompt tokens + 96 written, of a 64K context.
+    await page.getByRole('meter', { name: 'Memory 6% full' }).waitFor()
+
+    await page.getByRole('button', { name: 'Notes' }).click()
+    await page.getByRole('textbox', { name: 'Things to always remember' }).fill('Use blue, not purple.')
+    await page.getByRole('dialog').getByRole('button', { name: 'Save' }).click()
+    await expect.poll(() => page.getByRole('dialog').count()).toBe(0)
+
+    await page.getByRole('button', { name: 'Settings' }).click()
+    const instructions = page.getByRole('textbox', { name: 'Instructions for every project' })
+    await instructions.fill('Explain things briefly.')
+    await page.getByText('Show my built-in instructions').click() // also saves the box (it saves when you leave it)
+    await page.getByText(/You are RulZ Coding Agent/).waitFor()
+    await page.screenshot({ path: join(shots, '6-settings.png') })
+    await page.keyboard.press('Escape')
+
+    await page.getByRole('button', { name: 'Share my app' }).click()
+    await page.getByRole('dialog').getByRole('button', { name: 'Package it' }).click()
+    await page.getByText('Your app is packaged:').waitFor({ timeout: 30_000 })
+    await page.getByRole('button', { name: 'Show in folder' }).waitFor()
+    await page.screenshot({ path: join(shots, '6-shared.png') })
+    expect(existsSync(join(projectsDir, 'E2E App', 'dist', 'e2e-app.zip'))).toBe(true)
+
+    const request = mock.requests.find((r) => r.body.messages?.some((m) => m.role === 'user' && m.content.includes('Package this app')))!
+    const system = request.body.messages![0].content
+    expect(system).toContain('Use blue, not purple.')
+    expect(system).toContain('Explain things briefly.')
   })
 
   it('switches to the light theme', async () => {

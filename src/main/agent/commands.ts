@@ -75,15 +75,29 @@ export function commandEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.Proces
   return env
 }
 
-/** PowerShell arguments for a command, passed base64-encoded so no quoting can break it. */
-export function powershellArgs(command: string): string[] {
+/**
+ * PowerShell arguments for a command, passed base64-encoded so no quoting can break it.
+ * `waitForStarted` keeps PowerShell running until the programs it started have closed: PowerShell
+ * doesn't wait for programs with a window (a packaged .exe, Start-Process), so without it "Stop"
+ * would find PowerShell already gone and leave the window open.
+ */
+export function powershellArgs(command: string, opts: { waitForStarted?: boolean } = {}): string[] {
   const script = [
     "$ProgressPreference = 'SilentlyContinue'",
     '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
     '$OutputEncoding = [System.Text.Encoding]::UTF8',
     command,
     '$__ok = $?',
-    'if ($LASTEXITCODE) { exit $LASTEXITCODE }',
+    '$__code = $LASTEXITCODE',
+    ...(opts.waitForStarted
+      ? [
+          'do {',
+          `  $__kids = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$PID" | Where-Object { $_.Name -ne 'conhost.exe' })`,
+          '  foreach ($__k in $__kids) { Wait-Process -Id $__k.ProcessId -ErrorAction SilentlyContinue }',
+          '} while ($__kids.Count)'
+        ]
+      : []),
+    'if ($__code) { exit $__code }',
     'if (-not $__ok) { exit 1 }'
   ].join('\n')
   return ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')]
@@ -107,9 +121,9 @@ export function killTree(child: ChildProcess): Promise<void> {
   })
 }
 
-export function startShell(command: string, cwd: string): ChildProcess {
+export function startShell(command: string, cwd: string, opts: { waitForStarted?: boolean } = {}): ChildProcess {
   const shell = process.platform === 'win32' ? 'powershell.exe' : 'pwsh'
-  return spawn(shell, powershellArgs(command), {
+  return spawn(shell, powershellArgs(command, opts), {
     cwd,
     env: commandEnv(),
     windowsHide: true,
@@ -238,7 +252,7 @@ export class BackgroundCommands {
 
   run(command: string, cwd: string, onOutput?: (chunk: string) => void): string {
     const id = `bg${++this.counter}`
-    const child = this.start(command, cwd)
+    const child = this.start(command, cwd, { waitForStarted: true })
     const proc: BackgroundProc = { id, command, child, output: '', seen: 0, exitCode: null, running: true }
     const take = (decoder: InstanceType<typeof TextDecoder>) => (buf: Buffer) => {
       const chunk = decoder.decode(buf, { stream: true })

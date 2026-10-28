@@ -24,6 +24,8 @@ export interface IpcInvoke {
   'app:info': () => AppInfo
   'settings:get': () => AppSettings
   'settings:update': (patch: Partial<AppSettings>) => AppSettings
+  /** The fixed part of the agent's system prompt (shown read-only in Settings). */
+  'settings:builtInPrompt': () => string
   'dialog:pickFolder': (opts: { title?: string; defaultPath?: string }) => string | null
   'shell:showItem': (path: string) => void
   'shell:openUrl': (url: string) => void
@@ -47,6 +49,8 @@ export interface IpcInvoke {
    */
   'task:undo': (projectPath: string, taskId?: string) => ProjectState
   'files:diff': (projectPath: string, taskId: string, path: string) => FileDiff
+  /** Saves the owner's "Things to always remember" for the project. */
+  'project:setMemory': (projectPath: string, text: string) => void
 
   'run:state': (projectPath: string) => RunState
   'run:start': (projectPath: string) => RunState
@@ -56,6 +60,8 @@ export interface IpcInvoke {
   'run:askAgent': (projectPath: string) => void
   /** Stops the app if it is still running and starts a task to fix the error it showed. */
   'run:fix': (projectPath: string) => void
+  /** Stops the app if it is running and starts a task that packages it to give to other people. */
+  'run:share': (projectPath: string) => void
 }
 
 /** Push channels (webContents.send → ipcRenderer.on). */

@@ -3,6 +3,7 @@ import { toast } from 'sonner'
 import type {
   AgentEvent,
   AgentStatus,
+  ContextUsage,
   PendingPrompt,
   ProjectInfo,
   ProjectState,
@@ -24,6 +25,9 @@ interface WorkspaceState {
   status: AgentStatus
   prompt: PendingPrompt | null
   runCommand: string | null
+  /** The owner's "Things to always remember". */
+  memory: string
+  context: ContextUsage | null
   run: RunState | null
   /** Task whose steps and files the side panel shows; null = the latest. */
   selectedTaskId: string | null
@@ -41,6 +45,9 @@ interface WorkspaceState {
   askHowToRun: () => Promise<void>
   /** "Fix this": stops the app if needed and asks the agent to fix the error it showed. */
   fixRun: () => Promise<void>
+  /** "Share my app": asks the agent to package the app to give to other people. */
+  share: () => Promise<void>
+  setMemory: (text: string) => Promise<boolean>
   setRunCommand: (command: string | null) => Promise<void>
   selectTask: (id: string | null) => void
 }
@@ -57,6 +64,8 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       running: state.running,
       prompt: state.prompt,
       runCommand: state.runCommand,
+      memory: state.memory,
+      context: state.context,
       status: { phase: state.running ? 'working' : 'idle', text: 'Working…' } as AgentStatus,
       selectedTaskId: null
     })
@@ -122,6 +131,9 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       case 'tasks':
         set({ tasks: e.tasks })
         break
+      case 'context':
+        set({ context: e.context })
+        break
     }
   })
 
@@ -139,6 +151,8 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     status: { phase: 'idle' },
     prompt: null,
     runCommand: null,
+    memory: '',
+    context: null,
     run: null,
     selectedTaskId: null,
 
@@ -165,7 +179,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     close: async () => {
       try {
         await invoke('projects:close')
-        set({ project: null, timeline: [], tasks: [], running: false, prompt: null, run: null, status: { phase: 'idle' } })
+        set({ project: null, timeline: [], tasks: [], running: false, prompt: null, run: null, memory: '', context: null, status: { phase: 'idle' } })
       } catch (e) {
         toast.error(errorMessage(e))
       }
@@ -241,6 +255,29 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
         await invoke('run:fix', project.path)
       } catch (e) {
         toast.error(errorMessage(e))
+      }
+    },
+
+    share: async () => {
+      const project = get().project
+      if (!project) return
+      try {
+        await invoke('run:share', project.path)
+      } catch (e) {
+        toast.error(errorMessage(e))
+      }
+    },
+
+    setMemory: async (text) => {
+      const project = get().project
+      if (!project) return false
+      try {
+        await invoke('project:setMemory', project.path, text)
+        set({ memory: text.trim() })
+        return true
+      } catch (e) {
+        toast.error(errorMessage(e))
+        return false
       }
     },
 

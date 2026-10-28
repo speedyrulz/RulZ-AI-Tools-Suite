@@ -32,6 +32,8 @@ export interface MockOptions {
   template?: string
   nCtx?: number
   turns?: MockTurn[] | ((req: MockRequest, index: number) => MockTurn)
+  /** Report exact token counts like llama.cpp (timings in the last chunk). */
+  timings?: (req: MockRequest) => { cache_n: number; prompt_n: number; predicted_n: number }
 }
 
 export const QWEN_CODER_TEMPLATE =
@@ -86,7 +88,8 @@ export async function startMockRulz(opts: MockOptions = {}) {
       if (turn.status) return json(turn.status, { error: { message: turn.error ?? 'error' } })
       res.writeHead(200, { 'Content-Type': 'text/event-stream' })
       const send = (delta: unknown, finish: string | null = null): void => {
-        res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`)
+        const timings = finish && opts.timings ? { timings: opts.timings(record) } : {}
+        res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: finish }], ...timings })}\n\n`)
       }
       const content = turn.content ?? ''
       for (let i = 0; i < content.length; i += 7) send({ content: content.slice(i, i + 7) })

@@ -107,6 +107,8 @@ export interface TurnResult {
   content: string
   toolCalls: WireToolCall[]
   finishReason: string
+  /** Exact token counts when the server reports them. */
+  usage?: { prompt: number; completion: number }
 }
 
 export interface StreamHandlers {
@@ -182,6 +184,7 @@ export class RulzClient {
     const decoder = new TextDecoder()
     let content = ''
     let finishReason = ''
+    let usage: TurnResult['usage']
     const reader = res.body.getReader()
     for (;;) {
       const { done, value } = await reader.read()
@@ -207,9 +210,10 @@ export class RulzClient {
           on.onToolDelta?.()
         }
         if (info.finishReason) finishReason = info.finishReason
+        if (info.usage) usage = info.usage
       }
     }
-    return { content, toolCalls: calls.result(), finishReason }
+    return { content, toolCalls: calls.result(), finishReason, usage }
   }
 
   /** Non-streamed completion without tools (used for summaries). */

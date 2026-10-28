@@ -14,6 +14,15 @@ describe('SseParser', () => {
     const [payload] = new SseParser().push('error: {"message":"boom"}\n')
     expect(interpretChunk(JSON.parse(payload)).error).toBe('boom')
   })
+  it('reads exact token counts from llama.cpp timings or an OpenAI usage block', () => {
+    // prompt_n is only the part that wasn't already cached.
+    expect(interpretChunk({ choices: [{ delta: {}, finish_reason: 'stop' }], timings: { cache_n: 1200, prompt_n: 34, predicted_n: 50 } }).usage).toEqual({
+      prompt: 1234,
+      completion: 50
+    })
+    expect(interpretChunk({ choices: [], usage: { prompt_tokens: 900, completion_tokens: 12 } }).usage).toEqual({ prompt: 900, completion: 12 })
+    expect(interpretChunk({ choices: [{ delta: { content: 'hi' } }] }).usage).toBeUndefined()
+  })
   it('reads error bodies', () => {
     expect(errorFromBody(400, '{"error":{"message":"context exceeded"}}')).toBe('context exceeded')
     expect(errorFromBody(500, '')).toBe('HTTP 500')

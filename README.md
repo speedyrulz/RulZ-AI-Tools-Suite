@@ -48,6 +48,17 @@ The light look is one click away: use the sun/moon button in the top bar (or **S
 - **History** lists every task in the project, newest first, with when it ran and how many files it changed.
   **Go back to before this** on any task puts the project back to how it was then, undoing that task and every
   later one in a single step (after a confirmation that lists them).
+- **Share my app** packages the project into one file to give to other people: a single `.exe` for Electron
+  apps (electron-builder, portable) and Python apps (PyInstaller, one file), or a `.zip` for websites. When it's
+  done, the conversation names the file with a **Show in folder** button. Commands ask first, as usual.
+- **Notes** ("Things to always remember") are per-project notes, such as "use blue, not purple", sent with every
+  request so they survive long conversations and summaries.
+- **Memory** under the message box shows how full the model's context is ("23% of 100K"), using the exact token
+  counts RulZ reports after each reply. When the model is loaded with 16K or less, the agent says once that bigger
+  projects need a larger context length in RulZ.
+- **Settings → Instructions for every project** adds your own instructions to the agent's system prompt in all
+  projects. **Show my built-in instructions** displays the fixed part they're added to (it holds the tool and
+  safety rules, so it can't be replaced).
 
 ## Approvals
 
@@ -83,11 +94,16 @@ scripts unchecked. Deleted files go to the Recycle Bin.
   lead out are rejected.
 - **Commands** run in `powershell.exe -NoProfile -NonInteractive` in the project folder, with Node.js, npm and
   Python folders added to `PATH`. Output streams live, each command has a time limit (10 minutes by default), and
-  Stop kills the whole process tree.
+  Stop kills the whole process tree. Background commands keep PowerShell waiting for the programs it starts (it
+  normally doesn't wait for programs with a window), so stopping one also closes the app's window.
 - **Loop guard**: the same call three times in a row, five failures in a row, or the step limit (40 by default)
   pauses the task and asks you whether to keep going, try another way, or stop.
 - **Context**: requests stay under ~80% of the model's context. Older tool results are shortened first; if that
-  isn't enough, older turns are summarised. The system prompt and the current task are never dropped.
+  isn't enough, older turns are summarised. The system prompt and the current task are never dropped. Sizes are
+  estimated at 3.2 characters per token, then corrected after every reply by the exact count llama.cpp reports
+  (`timings.cache_n + prompt_n`), so the agent uses the context it really has.
+- **System prompt**: the built-in instructions, then your Settings instructions, then the project's Notes, then a
+  summary of earlier work. The safety rules are told to come first.
 - **Undo**: before each task, the project is committed to a private git repository in the app's data folder
   (never a `.git` inside your project, so your own repositories are untouched; `node_modules`, `dist`, `.venv`
   and files over 50 MB are left out). Without Git for Windows, files are copied aside before the agent changes them.
