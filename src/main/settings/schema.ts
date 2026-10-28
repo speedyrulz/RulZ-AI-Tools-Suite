@@ -58,6 +58,8 @@ export const settingsSchema = z.object({
   contextOverflow: z.enum(['stop', 'truncateMiddle']).catch(D.contextOverflow),
   expandThinking: z.boolean().catch(D.expandThinking),
   rightPanelOpen: z.boolean().catch(D.rightPanelOpen),
+  minimizeToTray: z.boolean().catch(D.minimizeToTray),
+  closeToTray: z.boolean().catch(D.closeToTray),
   toolsEnabled: z.boolean().catch(D.toolsEnabled),
   confirmToolCalls: z.boolean().catch(D.confirmToolCalls),
   allowedTools: z.array(z.string()).catch(D.allowedTools),

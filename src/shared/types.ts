@@ -69,6 +69,10 @@ export interface AppSettings {
   contextOverflow: ContextOverflow
   expandThinking: boolean
   rightPanelOpen: boolean
+  /** Minimizing hides the window to the system tray instead of the taskbar. */
+  minimizeToTray: boolean
+  /** The close button hides the window to the system tray; Quit from the tray menu exits. */
+  closeToTray: boolean
   /** Offer MCP tools to the model in chats. */
   toolsEnabled: boolean
   /** Ask before each tool call unless the tool is in allowedTools. */

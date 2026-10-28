@@ -7,6 +7,9 @@ files:
   - out/**
   - package.json
   - '!**/*.map'
+extraResources:
+  - from: build/icon.ico
+    to: icon.ico
 win:
   icon: build/icon.ico
   target:

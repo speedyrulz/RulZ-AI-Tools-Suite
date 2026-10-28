@@ -1,5 +1,5 @@
 import { join } from 'node:path'
-import { app, BrowserWindow, dialog, nativeTheme, shell } from 'electron'
+import { app, BrowserWindow, dialog, Menu, nativeTheme, shell, Tray } from 'electron'
 import { META_TOOL_DEFS, toolCatalogNote } from '@shared/tools'
 import type { LoadConfig, ModelEntry, Theme } from '@shared/types'
 import { ChatService } from './chat/service'
@@ -21,6 +21,38 @@ const isDev = !app.isPackaged && !!process.env.ELECTRON_RENDERER_URL
 if (!app.requestSingleInstanceLock()) app.quit()
 
 let mainWindow: BrowserWindow | null = null
+let tray: Tray | null = null
+/** Set once the app is really exiting, so close-to-tray lets the window close. */
+let quitting = false
+
+function showMainWindow(): void {
+  if (!mainWindow) return
+  mainWindow.show()
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.focus()
+}
+
+/** The tray icon only exists while the window is hidden to it. */
+function ensureTray(): void {
+  if (tray) return
+  // build/ isn't packaged; electron-builder copies the icon into resources.
+  const icon = app.isPackaged ? join(process.resourcesPath, 'icon.ico') : join(__dirname, '../../build/icon.ico')
+  tray = new Tray(icon)
+  tray.setToolTip('RulZ LLM Suite')
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: 'Show RulZ LLM Suite', click: showMainWindow },
+      { type: 'separator' },
+      { label: 'Quit', click: () => app.quit() }
+    ])
+  )
+  tray.on('click', showMainWindow)
+}
+
+function destroyTray(): void {
+  tray?.destroy()
+  tray = null
+}
 
 /** Window background for a theme, so no wrong-coloured frame shows while the page loads or resizes. */
 function isDarkTheme(theme: Theme): boolean {
@@ -156,6 +188,7 @@ async function main(): Promise<void> {
     if (next.modelsDir !== before.modelsDir) void library.scan()
     if (next.enginePath !== before.enginePath) void engine.getInfo(true)
     if (next.theme !== before.theme) mainWindow?.setBackgroundColor(windowBackground(next.theme))
+    if (!next.minimizeToTray && !next.closeToTray && tray) showMainWindow()
     return next
   })
   handle('dialog:pickFolder', async ({ title, defaultPath }) => {
@@ -236,18 +269,32 @@ async function main(): Promise<void> {
 
   // ---- Lifecycle ----
   mainWindow = createWindow(settings.get().theme)
+  mainWindow.on('minimize', () => {
+    if (!settings.get().minimizeToTray) return
+    ensureTray()
+    mainWindow?.hide()
+  })
+  mainWindow.on('close', (e) => {
+    if (quitting || !settings.get().closeToTray) return
+    e.preventDefault()
+    ensureTray()
+    mainWindow?.hide()
+  })
+  // Windows logoff/shutdown must not be blocked by close-to-tray.
+  mainWindow.on('session-end', () => {
+    quitting = true
+  })
+  mainWindow.on('show', destroyTray)
   hardware.start()
   void library.scan()
   void engine.getInfo()
   if (settings.get().apiServer.autoStart) apiServer.start().catch(() => undefined)
 
-  app.on('second-instance', () => {
-    if (!mainWindow) return
-    if (mainWindow.isMinimized()) mainWindow.restore()
-    mainWindow.focus()
-  })
+  app.on('second-instance', showMainWindow)
   app.on('window-all-closed', () => app.quit())
   app.on('before-quit', () => {
+    quitting = true
+    destroyTray()
     hardware.stop()
     library.dispose()
     instances.killAllSync()

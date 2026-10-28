@@ -50,6 +50,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   contextOverflow: 'truncateMiddle',
   expandThinking: false,
   rightPanelOpen: true,
+  minimizeToTray: false,
+  closeToTray: false,
   toolsEnabled: true,
   confirmToolCalls: true,
   allowedTools: [],

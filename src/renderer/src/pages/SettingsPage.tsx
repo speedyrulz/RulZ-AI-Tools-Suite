@@ -155,6 +155,12 @@ export function SettingsPage() {
               <option value="system">System</option>
             </Select>
           </Field>
+          <Field inline label="Minimize to system tray" hint="Minimizing hides the window to the tray; loaded models and the API server keep running">
+            <Switch checked={settings.minimizeToTray} onCheckedChange={(v) => void update({ minimizeToTray: v })} />
+          </Field>
+          <Field inline label="Close to system tray" hint="The close button hides the window to the tray; use Quit in the tray menu to exit">
+            <Switch checked={settings.closeToTray} onCheckedChange={(v) => void update({ closeToTray: v })} />
+          </Field>
         </Card>
 
         <Card title="Keyboard shortcuts">
