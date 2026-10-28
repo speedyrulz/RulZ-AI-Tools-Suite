@@ -191,6 +191,22 @@ describe('model settings', () => {
       loadedContext: 8192,
       gpus: []
     })
+    expect(parseLoadInfo({ config: {} }).draftChoices).toBeUndefined()
+    const withDrafts = parseLoadInfo({
+      config: { draftFile: 'builtin' },
+      default_draft: { name: 'Built-in MTP layers', kind: 'mtp', built_in: true },
+      draft_choices: [
+        { id: 'builtin', name: 'Built-in MTP layers', folder: '', kind: 'mtp', built_in: true },
+        { id: 'Gemma/Q5/mtp-gemma.gguf', name: 'mtp-gemma.gguf', folder: 'Gemma/Q5', kind: 'mtp', built_in: false },
+        { name: 'no id' }
+      ]
+    })
+    expect(withDrafts.defaultDraft).toEqual({ name: 'Built-in MTP layers', builtIn: true })
+    expect(withDrafts.draftChoices?.map((c) => [c.id, c.builtIn])).toEqual([
+      ['builtin', true],
+      ['Gemma/Q5/mtp-gemma.gguf', false]
+    ])
+    expect(parseLoadInfo({ config: {}, default_draft: null, draft_choices: [] }).defaultDraft).toBeNull()
     const mock = await startMockRulz()
     try {
       const client = new RulzClient(() => ({ url: mock.url, apiKey: '' }))

@@ -109,6 +109,18 @@ export interface LoadSettings {
   draftGpu?: 'auto' | 'gpu' | 'cpu'
   draftCacheTypeK?: KvCacheType
   draftCacheTypeV?: KvCacheType
+  /** Which draft: null = automatic, 'builtin' = the model's own MTP layers, or a DraftChoice id.
+   *  Missing from RulZ LLM Suite before 0.3.9. */
+  draftFile?: string | null
+}
+
+/** A draft RulZ LLM Suite can use for a model: its built-in MTP layers or a draft file in the models folder. */
+export interface DraftChoice {
+  id: string
+  name: string
+  folder: string
+  kind: string
+  builtIn: boolean
 }
 
 export interface GpuInfo {
@@ -136,6 +148,10 @@ export interface ModelLoadInfo {
   loadedContext?: number
   /** Whether the model comes with a draft (MTP) head; undefined when RulZ doesn't say. */
   hasDraft?: boolean
+  /** What the automatic choice uses; null = nothing found. Undefined before RulZ LLM Suite 0.3.9. */
+  defaultDraft?: { name: string; builtIn: boolean } | null
+  /** Drafts that can be picked; undefined before RulZ LLM Suite 0.3.9. */
+  draftChoices?: DraftChoice[]
   gpus: GpuInfo[]
   estimate?: LoadEstimate
 }

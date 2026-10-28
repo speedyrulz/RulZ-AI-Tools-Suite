@@ -273,6 +273,8 @@ export function parseLoadInfo(json: unknown): ModelLoadInfo {
     state?: ModelLoadInfo['state']
     loaded_context_length?: number
     has_draft?: boolean
+    default_draft?: { name?: string; built_in?: boolean } | null
+    draft_choices?: { id?: string; name?: string; folder?: string; kind?: string; built_in?: boolean }[]
     gpus?: ModelLoadInfo['gpus']
     estimate?: ModelLoadInfo['estimate'] | null
   }
@@ -284,6 +286,12 @@ export function parseLoadInfo(json: unknown): ModelLoadInfo {
     state: j.state ?? 'not-loaded',
     loadedContext: j.loaded_context_length,
     hasDraft: j.has_draft,
+    defaultDraft: j.default_draft === undefined ? undefined : j.default_draft && { name: j.default_draft.name ?? 'draft', builtIn: !!j.default_draft.built_in },
+    draftChoices: Array.isArray(j.draft_choices)
+      ? j.draft_choices
+          .filter((c) => typeof c?.id === 'string')
+          .map((c) => ({ id: c.id!, name: c.name ?? c.id!, folder: c.folder ?? '', kind: c.kind ?? 'mtp', builtIn: !!c.built_in }))
+      : undefined,
     gpus: Array.isArray(j.gpus) ? j.gpus : [],
     estimate: j.estimate ?? undefined
   }

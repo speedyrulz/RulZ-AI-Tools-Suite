@@ -211,7 +211,7 @@ function GpuSplit({ info, draft, estimate, change }: { info: ModelLoadInfo; draf
   )
 }
 
-function DraftTuning({ draft, change }: { draft: LoadSettings; change: (p: Partial<LoadSettings>) => void }) {
+function DraftTuning({ draft, change, builtIn }: { draft: LoadSettings; change: (p: Partial<LoadSettings>) => void; builtIn: boolean }) {
   const num = (key: 'draftTokens' | 'draftMinTokens', label: string, hint: string, min: number, placeholder: string) => (
     <Field label={label} hint={hint} inline>
       <NumberInput label={label} value={draft[key] ?? null} placeholder={placeholder} min={min} max={64} onChange={(v) => (v === null || (v >= min && v <= 64)) && change({ [key]: v === null ? null : Math.round(v) })} />
@@ -232,13 +232,16 @@ function DraftTuning({ draft, change }: { draft: LoadSettings; change: (p: Parti
           <option value="probabilistic">Probabilistic</option>
         </Select>
       </Field>
-      <Field label="Run the draft on" inline>
-        <Select aria-label="Run the draft on" className="h-7.5 w-36 text-[13px]" value={draft.draftGpu} onChange={(e) => change({ draftGpu: e.target.value as LoadSettings['draftGpu'] })}>
-          <option value="auto">Auto</option>
-          <option value="gpu">GPU</option>
-          <option value="cpu">CPU</option>
-        </Select>
-      </Field>
+      {/* Built-in MTP layers run on the model's own weights, wherever those are. */}
+      {!builtIn && (
+        <Field label="Run the draft on" inline>
+          <Select aria-label="Run the draft on" className="h-7.5 w-36 text-[13px]" value={draft.draftGpu} onChange={(e) => change({ draftGpu: e.target.value as LoadSettings['draftGpu'] })}>
+            <option value="auto">Auto</option>
+            <option value="gpu">GPU</option>
+            <option value="cpu">CPU</option>
+          </Select>
+        </Field>
+      )}
       <Field label="Draft cache type (K / V)" inline>
         <div className="flex gap-1.5">
           {(['draftCacheTypeK', 'draftCacheTypeV'] as const).map((k) => (
@@ -287,7 +290,12 @@ function Loading({ model }: { model: string }) {
   const gpuMode = typeof draft.gpuLayers === 'number' ? 'number' : draft.gpuLayers
   // Older RulZ LLM Suite versions don't send these settings, so their controls stay hidden.
   const canSplit = draft.splitMode !== undefined && info.gpus.length > 1
-  const canTuneDraft = draft.draftSampling !== undefined && info.hasDraft !== false && draft.useDraft
+  const choices = info.draftChoices ?? []
+  const pickedDraft = draft.draftFile ? choices.find((c) => c.id === draft.draftFile) : undefined
+  const hasAnyDraft = info.hasDraft !== false || !!draft.draftFile
+  const canPickDraft = info.draftChoices !== undefined && draft.useDraft && (choices.length > 0 || !!info.defaultDraft)
+  const canTuneDraft = draft.draftSampling !== undefined && hasAnyDraft && draft.useDraft
+  const builtInDraft = pickedDraft ? pickedDraft.builtIn : !draft.draftFile && !!info.defaultDraft?.builtIn
 
   const save = async (): Promise<void> => {
     setSaving(true)
@@ -366,12 +374,40 @@ function Loading({ model }: { model: string }) {
           ))}
         </div>
       </Field>
-      <Field label="Speed up with a draft model" hint={info.hasDraft === false ? 'This model has no draft (MTP) head' : 'Only works if the model comes with one'} inline>
+      <Field
+        label="Speed up with a draft model"
+        hint={
+          info.defaultDraft
+            ? `Uses ${info.defaultDraft.builtIn ? 'the MTP layers built into the model' : info.defaultDraft.name} unless you pick another`
+            : hasAnyDraft
+              ? 'Only works if the model comes with one'
+              : choices.length
+                ? 'No draft found with this model; pick one below'
+                : 'This model has no draft (MTP) head'
+        }
+        inline
+      >
         <Switch checked={draft.useDraft} onCheckedChange={(v) => change({ useDraft: v })} label="Speed up with a draft model" />
       </Field>
-
       {canSplit && <GpuSplit info={info} draft={draft} estimate={estimate} change={change} />}
-      {canTuneDraft && <DraftTuning draft={draft} change={change} />}
+      {canPickDraft && (
+        <Field label="Draft model" hint="Must come from the same base model, or it won't load or will only slow things down" inline>
+          <Select
+            aria-label="Draft model"
+            className="h-7.5 w-56 text-[13px]"
+            value={draft.draftFile ?? ''}
+            onChange={(e) => change({ draftFile: e.target.value || null })}
+          >
+            <option value="">Automatic ({info.defaultDraft ? (info.defaultDraft.builtIn ? 'built-in MTP layers' : info.defaultDraft.name) : 'none found'})</option>
+            {choices.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.builtIn ? c.name : `${c.name} (${c.folder.split('/').pop() || 'models folder'})`}
+              </option>
+            ))}
+          </Select>
+        </Field>
+      )}
+      {canTuneDraft && <DraftTuning draft={draft} change={change} builtIn={builtInDraft} />}
 
       {estimate && (
         <div className="flex items-center gap-2 pt-2 text-[12px] text-muted">
