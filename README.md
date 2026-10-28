@@ -56,9 +56,12 @@ Discover/downloads, RAG and a CLI are planned.
   `GET /v1/models/{id}/load-config` returns a model's saved load settings, and `POST` with
   `{ "config": { … }, "reload": true }` changes them (other apps, like RulZ Coding Agent, use this). `POST` accepts only
   context length, GPU layers, flash attention, KV cache types, parallel slots, the GPU split (mode, main GPU,
-  per-GPU proportions) and the draft (MTP) settings. File paths and extra arguments stay app-only. A loaded model
+  per-GPU proportions) and the draft (MTP) settings, including which draft (`draftFile`: `null` for automatic,
+  `"builtin"`, or the id of one of `draft_choices`). File paths and extra arguments stay app-only. A loaded model
   restarts with the new settings unless `"reload": false`; `"dry_run": true` only returns the memory estimate for the
-  changed settings. Replies include the GPUs, whether the model has a draft head, and the memory estimate.
+  changed settings. Replies include the GPUs, whether the model has a draft head, what automatic uses
+  (`default_draft`), the drafts that can be picked (`draft_choices`, by path relative to the models folder), and the
+  memory estimate.
   Default port 1234 (pick another if LM Studio is running).
 - **Dark and light themes** — dark is the default; the first launch asks which look you want ("Choose your look").
   Switch any time with the sun/moon button in the top bar or in Settings ▸ Appearance (Dark, Light or System).

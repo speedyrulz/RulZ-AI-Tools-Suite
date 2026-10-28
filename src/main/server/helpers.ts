@@ -1,6 +1,8 @@
 // Pure helpers for the local API server (unit-tested separately from the HTTP code).
+import { sep } from 'node:path'
 import { z } from 'zod'
-import { KV_CACHE_TYPES, type LoadConfig, type ModelEntry } from '@shared/types'
+import { draftFiles, fileName } from '@shared/draft'
+import { KV_CACHE_TYPES, type DraftKind, type LoadConfig, type ModelEntry } from '@shared/types'
 
 /** The id a model is listed under in GET /v1/models: its name, or its path when names collide. */
 export function publicModelId(model: ModelEntry, all: ModelEntry[]): string {
@@ -109,7 +111,9 @@ const remoteLoadPatchSchema = z
     draftSampling: z.enum(['auto', 'greedy', 'probabilistic']),
     draftGpu: z.enum(['auto', 'gpu', 'cpu']),
     draftCacheTypeK: z.enum(KV_CACHE_TYPES as [string, ...string[]]),
-    draftCacheTypeV: z.enum(KV_CACHE_TYPES as [string, ...string[]])
+    draftCacheTypeV: z.enum(KV_CACHE_TYPES as [string, ...string[]]),
+    // null, 'builtin' or the id of one of draft_choices; checked against the library before it is used.
+    draftFile: z.string().min(1).max(1024).nullable()
   })
   .partial()
   .strict()
@@ -131,8 +135,46 @@ const REMOTE_LOAD_KEYS = [
   'draftSampling',
   'draftGpu',
   'draftCacheTypeK',
-  'draftCacheTypeV'
+  'draftCacheTypeV',
+  'draftFile'
 ] as const satisfies readonly (keyof LoadConfig)[]
+
+export interface DraftChoice {
+  /** 'builtin', or the draft file's path relative to the models folder (never an absolute path). */
+  id: string
+  name: string
+  folder: string
+  kind: DraftKind
+  built_in: boolean
+}
+
+/** The drafts a client may pick for `model`: its built-in MTP layers, then every draft file in the library. */
+export function draftChoices(model: ModelEntry, models: ModelEntry[]): DraftChoice[] {
+  const root = model.path.slice(0, model.path.length - model.id.length)
+  const out: DraftChoice[] = []
+  if (model.info?.mtpLayers) out.push({ id: 'builtin', name: 'Built-in MTP layers', folder: '', kind: 'mtp', built_in: true })
+  for (const d of draftFiles(models)) {
+    if (!d.path.startsWith(root)) continue
+    const id = d.path.slice(root.length).split(sep).join('/')
+    out.push({ id, name: fileName(d.path), folder: id.split('/').slice(0, -1).join('/'), kind: d.kind ?? 'mtp', built_in: false })
+  }
+  return out
+}
+
+/** A saved draftFile as clients see it: null, 'builtin' or a choice id. */
+export function draftFileToRemote(draftFile: string | null, model: ModelEntry): string | null {
+  if (draftFile === null || draftFile === 'builtin') return draftFile
+  const root = model.path.slice(0, model.path.length - model.id.length)
+  return draftFile.startsWith(root) ? draftFile.slice(root.length).split(sep).join('/') : fileName(draftFile)
+}
+
+/** A draftFile sent by a client, as saved: undefined when it isn't one of the model's choices. */
+export function draftFileFromRemote(value: string | null, model: ModelEntry, models: ModelEntry[]): string | null | undefined {
+  if (value === null) return null
+  const choice = draftChoices(model, models).find((c) => c.id === value)
+  if (!choice) return undefined
+  return choice.built_in ? 'builtin' : model.path.slice(0, model.path.length - model.id.length) + choice.id.split('/').join(sep)
+}
 
 export type RemoteLoadPatch = Partial<Pick<LoadConfig, (typeof REMOTE_LOAD_KEYS)[number]>>
 
@@ -146,6 +188,7 @@ export function parseRemoteLoadPatch(raw: unknown): { ok: true; patch: RemoteLoa
 }
 
 /** The part of a load config the API shows and accepts. */
-export function remoteLoadView(config: LoadConfig): Required<RemoteLoadPatch> {
-  return Object.fromEntries(REMOTE_LOAD_KEYS.map((k) => [k, config[k]])) as Required<RemoteLoadPatch>
+export function remoteLoadView(config: LoadConfig, model: ModelEntry): Required<RemoteLoadPatch> {
+  const view = Object.fromEntries(REMOTE_LOAD_KEYS.map((k) => [k, config[k]])) as Required<RemoteLoadPatch>
+  return { ...view, draftFile: draftFileToRemote(config.draftFile, model) }
 }

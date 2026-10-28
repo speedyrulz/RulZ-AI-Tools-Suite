@@ -3,7 +3,7 @@ import type { LoadConfig, LoadedInstance, MemoryEstimate, ModelEntry } from '@sh
 import type { InstanceManager } from '../src/main/engine/instances'
 import { ApiServer } from '../src/main/server/apiServer'
 import { DEFAULT_LOAD_CONFIG } from '@shared/defaults'
-import { authorized, parseRemoteLoadPatch, parseUsage, publicModelId, remoteLoadView, resolveModel } from '../src/main/server/helpers'
+import { authorized, draftChoices, draftFileFromRemote, parseRemoteLoadPatch, parseUsage, publicModelId, remoteLoadView, resolveModel } from '../src/main/server/helpers'
 
 const model = (id: string, name: string): ModelEntry => ({
   id,
@@ -94,11 +94,26 @@ describe('parseRemoteLoadPatch', () => {
   })
 
   it('shows only the exposed fields', () => {
-    const keys = Object.keys(remoteLoadView(DEFAULT_LOAD_CONFIG))
+    const keys = Object.keys(remoteLoadView(DEFAULT_LOAD_CONFIG, models[0]))
     expect(keys).toContain('tensorSplit')
     expect(keys).toContain('draftCacheTypeV')
     expect(keys).not.toContain('extraArgs')
     expect(keys).not.toContain('chatTemplateFile')
+  })
+
+  it('offers draft choices by relative id and only accepts those', () => {
+    const head = { path: 'C:\\LLM\\Gemma\\Q5\\mtp-gemma.gguf', sizeBytes: 2e8, kind: 'mtp' as const }
+    const q5 = { ...model('Gemma/Q5/gemma-Q5.gguf', 'gemma-Q5'), draft: head, draftSidecar: head }
+    const qwen = { ...model('Qwen/q-MTP.gguf', 'q-MTP'), info: { architecture: 'qwen35', hasChatTemplate: true, mtpLayers: 1 } }
+    const library = [q5, qwen]
+    expect(draftChoices(qwen, library).map((c) => c.id)).toEqual(['builtin', 'Gemma/Q5/mtp-gemma.gguf'])
+    expect(draftChoices(q5, library)).toEqual([{ id: 'Gemma/Q5/mtp-gemma.gguf', name: 'mtp-gemma.gguf', folder: 'Gemma/Q5', kind: 'mtp', built_in: false }])
+    expect(draftFileFromRemote('Gemma/Q5/mtp-gemma.gguf', qwen, library)).toBe(head.path)
+    expect(draftFileFromRemote('builtin', qwen, library)).toBe('builtin')
+    expect(draftFileFromRemote('builtin', q5, library)).toBeUndefined()
+    expect(draftFileFromRemote('../../Windows/evil.gguf', qwen, library)).toBeUndefined()
+    expect(draftFileFromRemote(null, qwen, library)).toBeNull()
+    expect(remoteLoadView({ ...DEFAULT_LOAD_CONFIG, draftFile: head.path }, qwen).draftFile).toBe('Gemma/Q5/mtp-gemma.gguf')
   })
 })
 

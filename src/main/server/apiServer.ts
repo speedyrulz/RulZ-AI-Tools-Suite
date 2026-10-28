@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto'
 import http, { type IncomingMessage, type ServerResponse } from 'node:http'
 import type { ApiRequestLog, ApiServerSettings, ApiServerStatus, GpuStat, LoadConfig, LoadedInstance, MemoryEstimate, ModelEntry } from '@shared/types'
+import { fileName } from '@shared/draft'
 import type { InstanceManager } from '../engine/instances'
-import { authorized, errorBody, parseRemoteLoadPatch, parseUsage, publicModelId, remoteLoadView, resolveModel } from './helpers'
+import { authorized, draftChoices, draftFileFromRemote, errorBody, parseRemoteLoadPatch, parseUsage, publicModelId, remoteLoadView, resolveModel } from './helpers'
 
 const MAX_BODY_BYTES = 64 * 1024 * 1024
 const MAX_LOG = 300
@@ -183,7 +184,13 @@ export class ApiServer {
           }
           const parsed = parseRemoteLoadPatch(json.config ?? {})
           if (!parsed.ok) return fail(400, `Invalid load setting ${parsed.error}`, 'invalid_request_error')
-          const merged = { ...this.deps.getLoadDefaults(model.id).config, ...parsed.patch }
+          const patch = { ...parsed.patch }
+          if (patch.draftFile !== undefined) {
+            const draftFile = draftFileFromRemote(patch.draftFile, model, this.deps.getModels())
+            if (draftFile === undefined) return fail(400, 'Invalid load setting draftFile: not one of draft_choices', 'invalid_request_error')
+            patch.draftFile = draftFile
+          }
+          const merged = { ...this.deps.getLoadDefaults(model.id).config, ...patch }
           // dry_run only estimates memory for the changed settings, so a form can show it while editing.
           if (json.dry_run === true) preview = merged
           else {
@@ -415,15 +422,18 @@ export class ApiServer {
     return {
       id: publicModelId(m, this.deps.getModels()),
       object: 'model.load_config',
-      config: remoteLoadView(config),
+      config: remoteLoadView(config, m),
       custom: saved.custom,
       dry_run: preview ? true : undefined,
       has_draft: !!m.draft?.kind,
+      // What "automatic" (draftFile null) uses, and what else can be picked.
+      default_draft: m.draft?.kind ? { name: m.draft.builtIn ? 'Built-in MTP layers' : fileName(m.draft.path), kind: m.draft.kind, built_in: !!m.draft.builtIn } : null,
+      draft_choices: draftChoices(m, this.deps.getModels()),
       gpus: this.deps.gpus().map(({ index, name, memUsedMiB, memTotalMiB }) => ({ index, name, memUsedMiB, memTotalMiB })),
       estimate: this.deps.estimate(m, config),
       max_context_length: m.info?.contextLength,
       state: inst?.status ?? 'not-loaded',
-      loaded_config: inst ? remoteLoadView(inst.config) : undefined,
+      loaded_config: inst ? remoteLoadView(inst.config, m) : undefined,
       loaded_context_length: inst?.contextLength ?? undefined
     }
   }
