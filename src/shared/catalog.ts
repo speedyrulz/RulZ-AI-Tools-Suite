@@ -1,7 +1,10 @@
 import type { CatalogApp } from './types'
 
-// The apps in the suite. Screenshots, icons and a README snapshot for each live in catalog/<id>/
-// (refresh the README copies with `npm run sync-catalog`).
+// The apps in the suite. Their source is in apps/ in the suite repository, which also hosts their releases (tagged
+// <id>-v<version>). Screenshots, icons and a README snapshot for each live in catalog/<id>/ (refresh the README
+// copies with `npm run sync-catalog`).
+
+export const SUITE_REPO = 'speedyrulz/RulZ-AI-Tools-Suite'
 
 export const CATALOG: CatalogApp[] = [
   {
@@ -12,8 +15,10 @@ export const CATALOG: CatalogApp[] = [
       'Train LoRAs for MOSS-Image, Bria FIBO 2.0 and Krea 2 from your browser. A step-by-step wizard recommends ' +
       'every setting from your GPU memory and dataset, and the finished LoRAs load straight into ComfyUI.',
     category: 'AI Training',
-    repo: 'speedyrulz/RulzTrainer',
-    branch: 'main',
+    repo: SUITE_REPO,
+    path: 'apps/RulzTrainer',
+    tagPrefix: 'rulz-trainer-v',
+    branch: 'app/rulz-trainer',
     install: {
       kind: 'source',
       setup: [{ label: 'Installing the Python environment and CUDA PyTorch', run: ['install.bat'] }]
@@ -40,7 +45,9 @@ export const CATALOG: CatalogApp[] = [
       'A photo library that works like Google Photos’ People view. Add folders and it detects every face, groups ' +
       'them by person, and lets you search by person, expression, head direction and body pose. Nothing leaves your PC.',
     category: 'Photos',
-    repo: 'speedyrulz/RulZ-Image-Organizer',
+    repo: SUITE_REPO,
+    path: 'apps/RulZ-Image-Organizer',
+    tagPrefix: 'image-organizer-v',
     branch: 'main',
     install: { kind: 'zip', asset: '^RulZ-Image-Organizer-v[\\d.]+-win64\\.zip$' },
     launch: { target: 'RulZ Image Organizer.exe' },
@@ -57,7 +64,9 @@ export const CATALOG: CatalogApp[] = [
       'A single-elimination tournament for your images. Compare two side by side or in a split view with synced ' +
       'zoom and pan, keep one, and the other goes to a Losers folder until one champion is left.',
     category: 'Photos',
-    repo: 'speedyrulz/RulZ-Image-Tournament',
+    repo: SUITE_REPO,
+    path: 'apps/RulZ-Image-Tournament',
+    tagPrefix: 'image-tournament-v',
     branch: 'main',
     install: { kind: 'zip', asset: '^RulZ-Image-Tournament-v[\\d.]+-win64\\.zip$' },
     launch: { target: 'RulZ Image Tournament.exe' },
@@ -76,8 +85,10 @@ export const CATALOG: CatalogApp[] = [
       'memory estimate, chat with streaming and reasoning blocks, use MCP tools, and serve OpenAI- and ' +
       'Anthropic-compatible APIs.',
     category: 'LLM',
-    repo: 'speedyrulz/rulz-llm-suite',
-    branch: 'master',
+    repo: SUITE_REPO,
+    path: 'apps/rulz-llm-suite',
+    tagPrefix: 'llm-suite-v',
+    branch: 'main',
     install: {
       kind: 'installer',
       asset: '^RulZ-LLM-Suite-Setup-[\\d.]+\\.exe$',
@@ -102,8 +113,10 @@ export const CATALOG: CatalogApp[] = [
       'installs what is needed, runs the app, reads the errors and fixes them, asking for your OK before risky steps. ' +
       'Every task can be undone. It talks to RulZ LLM Suite, so nothing leaves your computer.',
     category: 'LLM',
-    repo: 'speedyrulz/rulz-coding-agent',
-    branch: 'master',
+    repo: SUITE_REPO,
+    path: 'apps/rulz-coding-agent',
+    tagPrefix: 'coding-agent-v',
+    branch: 'main',
     install: {
       kind: 'installer',
       asset: '^RulZ-Coding-Agent-Setup-[\\d.]+\\.exe$',
@@ -128,8 +141,10 @@ export const CATALOG: CatalogApp[] = [
       'image, saved as .txt files next to them. Runs llama.cpp across one or more GPUs, or uses any ' +
       'OpenAI-compatible server.',
     category: 'AI Training',
-    repo: 'speedyrulz/Rulz-Training-Captioner',
-    branch: 'main',
+    repo: SUITE_REPO,
+    path: 'apps/Rulz-Training-Captioner',
+    tagPrefix: 'training-captioner-v',
+    branch: 'app/training-captioner',
     install: {
       kind: 'source',
       setup: [
@@ -169,7 +184,9 @@ export const CATALOG: CatalogApp[] = [
       'A small video trimmer: step frame by frame or keyframe by keyframe, mark In and Out, and export losslessly or ' +
       're-encoded with NVIDIA NVENC. Crop, rotate, fixed-length clips and skin-tone colour matching included.',
     category: 'Video',
-    repo: 'speedyrulz/rulz-simple-video-clip-extractor',
+    repo: SUITE_REPO,
+    path: 'apps/rulz-simple-video-clip-extractor',
+    tagPrefix: 'clip-extractor-v',
     branch: 'main',
     install: { kind: 'zip', asset: '^RulZ-Simple-Video-Clip-Extractor-v[\\d.]+-win64\\.zip$' },
     launch: { target: 'RulZ Clip Extractor.exe' },
@@ -181,6 +198,11 @@ export const CATALOG: CatalogApp[] = [
     highlights: ['Frame-accurate', 'Lossless cuts', 'NVENC export', 'Crop & colour match']
   }
 ]
+
+/** The app's folder on GitHub. */
+export function githubUrl(app: CatalogApp): string | null {
+  return app.repo ? `https://github.com/${app.repo}/tree/main/${app.path}` : null
+}
 
 export function findApp(id: string): CatalogApp | undefined {
   return CATALOG.find((a) => a.id === id)

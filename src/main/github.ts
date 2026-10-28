@@ -79,18 +79,50 @@ function toRelease(r: RawRelease): Release {
   }
 }
 
-/** The latest full release, or null when the repository has none. */
-export async function latestRelease(repo: string): Promise<Release | null> {
-  try {
-    return toRelease(await api<RawRelease>(`/repos/${repo}/releases/latest`))
-  } catch (e) {
-    if (e instanceof GitHubError && e.status === 404) {
-      // 404 means either "no releases" or "no such repository"; tell them apart.
-      await api(`/repos/${repo}`)
-      return null
-    }
-    throw e
+const RELEASE_PAGE = 100
+const RELEASE_PAGES = 5
+const PAGE_TTL_MS = 60_000
+const pageCache = new Map<string, { at: number; list: Promise<RawRelease[]> }>()
+
+/** A page of a repository's releases, newest first. Shared for a minute, so the apps' checks cost one request. */
+function releasePage(repo: string, page: number): Promise<RawRelease[]> {
+  const key = `${repo}#${page}`
+  const hit = pageCache.get(key)
+  if (hit && Date.now() - hit.at < PAGE_TTL_MS) return hit.list
+  const list = api<RawRelease[]>(`/repos/${repo}/releases?per_page=${RELEASE_PAGE}&page=${page}`)
+  pageCache.set(key, { at: Date.now(), list })
+  list.catch(() => pageCache.delete(key))
+  return list
+}
+
+/**
+ * The newest full release whose tag is `prefix` followed by a version ("v" for v1.2.0, "image-organizer-v" for
+ * image-organizer-v1.2.0), or null when there is none. One repository holds the releases of several apps.
+ */
+export async function latestRelease(repo: string, prefix = 'v'): Promise<Release | null> {
+  const matches = (r: RawRelease): boolean =>
+    !r.draft && !r.prerelease && r.tag_name.startsWith(prefix) && /^\d/.test(r.tag_name.slice(prefix.length))
+  for (let page = 1; page <= RELEASE_PAGES; page++) {
+    const list = await releasePage(repo, page)
+    const hit = list.find(matches)
+    if (hit) return toRelease(hit)
+    if (list.length < RELEASE_PAGE) break
   }
+  return null
+}
+
+/** "image-organizer-v1.2.0" → "v1.2.0", the form installed versions are kept in. */
+export function releaseVersion(tag: string, prefix: string): string {
+  return tag.startsWith(prefix) ? `v${tag.slice(prefix.length)}` : tag
+}
+
+/** How many commits on `branch` changed `path` after `since` (at most 100). */
+export async function commitsSince(repo: string, branch: string, path: string, since: string): Promise<number> {
+  const list = await api<unknown[]>(
+    `/repos/${repo}/commits?sha=${encodeURIComponent(branch)}&path=${encodeURIComponent(path)}` +
+      `&since=${encodeURIComponent(since)}&per_page=100`
+  )
+  return list.length
 }
 
 /** Recent releases, newest first, pre-releases included. */
@@ -104,14 +136,6 @@ export async function headCommit(repo: string, branch: string): Promise<Commit> 
     `/repos/${repo}/commits/${encodeURIComponent(branch)}`
   )
   return { sha: c.sha, date: c.commit.committer?.date ?? null, message: c.commit.message.split('\n')[0] }
-}
-
-/** How many commits `head` is ahead of `base` (a tag, branch or SHA). */
-export async function commitsAhead(repo: string, base: string, head: string): Promise<number> {
-  const c = await api<{ ahead_by: number }>(
-    `/repos/${repo}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`
-  )
-  return c.ahead_by
 }
 
 export async function rawFile(repo: string, branch: string, path: string): Promise<string> {

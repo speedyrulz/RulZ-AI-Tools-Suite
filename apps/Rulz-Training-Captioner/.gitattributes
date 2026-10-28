@@ -1,0 +1,3 @@
+*.bat eol=crlf
+*.png binary
+*.ico binary

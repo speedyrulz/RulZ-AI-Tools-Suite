@@ -1,0 +1,63 @@
+RulZ Simple Video Clip Extractor - third-party notices
+=======================================================
+
+The application's own source code is released under the MIT License
+(see LICENSE.txt). The RulZ name and logo are excluded from that license
+(see LOGO-NOTICE.md).
+
+This Windows build bundles the following third-party components. Each is
+distributed under its own license, unmodified, as dynamically loaded
+libraries (DLLs / Python extension modules) inside the "_internal" folder.
+They can be replaced with compatible builds of the same libraries.
+
+Python 3.12
+  License: Python Software Foundation License
+  https://www.python.org/  -  https://docs.python.org/3/license.html
+
+Qt 6 / PySide6 / Shiboken6 (6.11)
+  License: GNU Lesser General Public License v3 (LGPL-3.0-only)
+  Source: https://download.qt.io/official_releases/QtForPython/
+          https://code.qt.io/cgit/pyside/pyside-setup.git/
+  Qt Multimedia includes FFmpeg libraries (LGPL), see https://www.qt.io/
+
+PyAV 18.1
+  License: BSD-3-Clause
+  Source: https://github.com/PyAV-Org/PyAV
+  PyAV's wheels bundle FFmpeg and codec libraries (the build scripts are in
+  the PyAV repository under scripts/):
+    FFmpeg 8 libraries (libavcodec, libavformat, libavutil, libavfilter,
+      libavdevice, libswscale, libswresample)
+      License: LGPL v3 or later - https://ffmpeg.org/legal.html
+      Source: https://ffmpeg.org/download.html
+    x264   - GPL v2 or later  - https://code.videolan.org/videolan/x264
+    x265   - GPL v2 or later  - https://bitbucket.org/multicoreware/x265_git
+    libvpx - BSD-3-Clause     - https://chromium.googlesource.com/webm/libvpx
+    dav1d  - BSD-2-Clause     - https://code.videolan.org/videolan/dav1d
+    SVT-AV1 - BSD-3-Clause-Clear - https://gitlab.com/AOMediaCodec/SVT-AV1
+    Opus   - BSD-3-Clause     - https://opus-codec.org/
+    LAME (libmp3lame) - LGPL v2 or later - https://lame.sourceforge.io/
+    opencore-amr - Apache-2.0 - https://sourceforge.net/projects/opencore-amr/
+    libwebp - BSD-3-Clause    - https://chromium.googlesource.com/webm/libwebp
+    oneVPL (libvpl) - MIT     - https://github.com/intel/libvpl
+    zlib   - zlib License     - https://zlib.net/
+    libiconv - LGPL v2.1 or later - https://www.gnu.org/software/libiconv/
+    MinGW-w64 runtime (libgcc, libstdc++, libwinpthread)
+           - GPL v3 with GCC Runtime Library Exception / MIT-style
+           - https://www.mingw-w64.org/
+
+  Because x264 and x265 are licensed under the GPL, this binary
+  distribution as a whole is subject to the GPL for those components. Their
+  complete corresponding source code is available at the links above, and
+  the exact build configuration is published in the PyAV repository.
+
+NumPy 2.5
+  License: BSD-3-Clause (and bundled components under BSD/MIT/zlib licenses)
+  https://numpy.org/  -  https://github.com/numpy/numpy
+
+PyInstaller bootloader
+  License: GPL v2 with the PyInstaller bootloader exception, which allows
+  distributing the bootloader with programs under any license.
+  https://pyinstaller.org/
+
+NOT bundled: FFmpeg command-line tools (ffmpeg.exe / ffprobe.exe), which you
+install yourself (for example: winget install Gyan.FFmpeg).

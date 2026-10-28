@@ -17,13 +17,13 @@ click, keep it updated, and launch it, all from a single black-and-red window (o
 
 | App | What it does | How it installs |
 | --- | --- | --- |
-| [RulzTrainer](https://github.com/speedyrulz/RulzTrainer) | LoRA trainer for MOSS-Image, FIBO 2.0 and Krea 2, with a guided WebUI | From source, then its `install.bat` (venv + CUDA PyTorch) |
-| [RulZ Image Organizer](https://github.com/speedyrulz/RulZ-Image-Organizer) | Offline face grouping and search for your photo library | Portable release zip |
-| [RulZ Image Tournament](https://github.com/speedyrulz/RulZ-Image-Tournament) | Finds your favorite image, two at a time | Portable release zip (a single .exe) |
-| [RulZ LLM Suite](https://github.com/speedyrulz/rulz-llm-suite) | Local LLMs with llama.cpp: models, chat, MCP tools, API server | Its setup program, run silently |
-| [RulZ Coding Agent](https://github.com/speedyrulz/rulz-coding-agent) | Describe an app in plain English and a local model builds it (works with the LLM Suite) | Its setup program, run silently |
-| [Rulz Training Captioner](https://github.com/speedyrulz/Rulz-Training-Captioner) | Captions image datasets with a local vision LLM | From source (venv), plus an optional llama.cpp CUDA build |
-| [RulZ Simple Video Clip Extractor](https://github.com/speedyrulz/rulz-simple-video-clip-extractor) | Frame-accurate clips with lossless cuts and NVENC export | Portable release zip |
+| [RulzTrainer](apps/RulzTrainer) | LoRA trainer for MOSS-Image, FIBO 2.0 and Krea 2, with a guided WebUI | From source, then its `install.bat` (venv + CUDA PyTorch) |
+| [RulZ Image Organizer](apps/RulZ-Image-Organizer) | Offline face grouping and search for your photo library | Portable release zip |
+| [RulZ Image Tournament](apps/RulZ-Image-Tournament) | Finds your favorite image, two at a time | Portable release zip (a single .exe) |
+| [RulZ LLM Suite](apps/rulz-llm-suite) | Local LLMs with llama.cpp: models, chat, MCP tools, API server | Its setup program, run silently |
+| [RulZ Coding Agent](apps/rulz-coding-agent) | Describe an app in plain English and a local model builds it (works with the LLM Suite) | Its setup program, run silently |
+| [Rulz Training Captioner](apps/Rulz-Training-Captioner) | Captions image datasets with a local vision LLM | From source (venv), plus an optional llama.cpp CUDA build |
+| [RulZ Simple Video Clip Extractor](apps/rulz-simple-video-clip-extractor) | Frame-accurate clips with lossless cuts and NVENC export | Portable release zip |
 
 ## Using the launcher
 
@@ -62,16 +62,28 @@ Download `RulZ-AI-Tools-Suite-Setup-<version>.exe` from the Releases page and ru
 
 To run it from source instead, double-click `install.bat` (needs Node.js 22+), then `run.bat`.
 
-## The apps' source
+## The apps
 
-Each app lives in its own repository, included here as a git submodule in `apps/`, pinned to its current release.
-The launcher doesn't need them (it downloads apps from GitHub); they're for browsing and working on the source:
+Every app's source is in `apps/`, one folder each, imported from its former repository with the full history
+(those repositories are archived). Their guides are in the [wiki](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/wiki),
+one section per app. Each app builds and runs on its own, as before: see the README in its folder.
+
+**Releasing an app.** Bump the version in the app's source, then push a tag named after the app:
 
 ```
-git clone --recurse-submodules https://github.com/speedyrulz/RulZ-AI-Tools-Suite.git
-git submodule update --init          # in an existing clone
-git submodule update --remote        # move every app to its latest commit
+git tag image-organizer-v1.3.0
+git push origin image-organizer-v1.3.0
 ```
+
+GitHub Actions (`.github/workflows/apps.yml`) builds it and publishes the release here, where the launcher picks it
+up. The tag prefixes are `rulz-trainer-v`, `image-organizer-v`, `image-tournament-v`, `llm-suite-v`, `coding-agent-v`,
+`training-captioner-v` and `clip-extractor-v`; launcher releases keep plain `v1.2.3` tags and the *Latest* badge.
+Pushes and pull requests build every app whose folder changed, so a broken build shows up before it's tagged.
+
+**Apps installed from source** (RulzTrainer, Rulz Training Captioner) are cloned from a branch that holds just their
+folder: `app/rulz-trainer` and `app/training-captioner`, rebuilt from `main` on every change by
+`.github/workflows/app-branches.yml`. The branch continues the app's old repository commit for commit, so copies
+cloned from there update with a fast-forward (the launcher switches them over on their next update).
 
 ## Development
 
@@ -84,7 +96,7 @@ npm run typecheck
 npm run build:win    # installer → dist/RulZ-AI-Tools-Suite-Setup-<version>.exe
 ```
 
-Pushing a `v*` tag builds the installer on GitHub Actions and attaches it to a release.
+Pushing a `v*` tag builds the launcher's installer on GitHub Actions and attaches it to a release.
 
 ### Layout
 
@@ -98,23 +110,27 @@ Pushing a `v*` tag builds the installer on GitHub Actions and attaches it to a r
 | UI (React + Tailwind) | `src/renderer/src/` |
 | Logo and icon generation from `assets/logo-source.webp` | `tools/make_logo.py` |
 | How the catalog screenshots were made (demo content only) | `tools/screenshots/` |
-| The apps' repositories (submodules) | `apps/` |
+| The apps' source | `apps/` |
+| App builds and releases; the source apps' branches | `.github/workflows/apps.yml`, `app-branches.yml` |
 
 ### Adding an app
 
-1. Add an entry to `src/shared/catalog.ts`. `install.kind` is `zip` (a portable zip on the latest release),
-   `installer` (an NSIS setup .exe on the latest release) or `source` (the repository plus setup commands), and
-   `launch.target` is the program to start, relative to the install folder.
-2. Add its repository as a submodule (`git submodule add <url> apps/<repo name>`), add it to
-   `tools/sync_catalog.py`, and run `npm run sync-catalog` to copy its README, README images and icon into
-   `catalog/<id>/`. Run the same command after updating the submodules to refresh every app's README copy.
-3. Put 2–4 screenshots in `catalog/<id>/screenshots/` (`01-…` is the card thumbnail).
+1. Put its source in `apps/<folder>/` (to keep an existing repository's history:
+   `git subtree add --prefix=apps/<folder> <url> <branch>`).
+2. Add an entry to `src/shared/catalog.ts`. `install.kind` is `zip` (a portable zip on its latest release),
+   `installer` (an NSIS setup .exe on its latest release) or `source` (its `app/<id>` branch plus setup commands),
+   and `launch.target` is the program to start, relative to the install folder.
+3. Add a build for it to `.github/workflows/apps.yml` (and its tag prefix to the tag list there); a source app goes
+   in `app-branches.yml` instead.
+4. Add it to `tools/sync_catalog.py` and run `npm run sync-catalog` to copy its README, README images and icon into
+   `catalog/<id>/`. Run the same command after changing any app's README.
+5. Put 2–4 screenshots in `catalog/<id>/screenshots/` (`01-…` is the card thumbnail).
 
 The launcher shows the README from GitHub when it can, and the copy in `catalog/` when offline.
 
 ## License
 
-Open source under the [MIT License](LICENSE). Each app in `apps/` is MIT-licensed in its own repository too.
+Open source under the [MIT License](LICENSE). Each app in `apps/` carries its own MIT license file too.
 
 The RulZ name and logo are excluded from the MIT License; all rights reserved. If you fork or redistribute this
 project, remove or replace the RulZ branding. See [LOGO-NOTICE.md](LOGO-NOTICE.md).

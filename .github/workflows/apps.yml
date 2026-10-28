@@ -1,0 +1,222 @@
+name: Apps
+
+# Checks and builds the apps in apps/, and publishes their releases.
+#
+# - Pushes and pull requests build every app whose folder changed (or all of them when this file changed) and keep
+#   the result as a workflow artifact.
+# - Pushing an app tag builds that app and publishes a GitHub Release in this repository, which is where the
+#   launcher downloads it from:
+#     git tag image-organizer-v1.3.0 && git push origin image-organizer-v1.3.0
+#   The version must match the one in the app's source. App releases are never marked "Latest": that badge belongs
+#   to the launcher, whose self-update reads releases/latest.
+
+on:
+  push:
+    branches: [main]
+    paths: ['apps/**', '.github/workflows/apps.yml']
+    tags:
+      - 'rulz-trainer-v*'
+      - 'image-organizer-v*'
+      - 'image-tournament-v*'
+      - 'llm-suite-v*'
+      - 'coding-agent-v*'
+      - 'training-captioner-v*'
+      - 'clip-extractor-v*'
+  pull_request:
+    paths: ['apps/**', '.github/workflows/apps.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      apps: ${{ steps.pick.outputs.apps }}
+      tag: ${{ steps.pick.outputs.tag }}
+      version: ${{ steps.pick.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: pick
+        shell: bash
+        env:
+          BEFORE: ${{ github.event.before }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          declare -A DIRS=(
+            [rulz-trainer]=RulzTrainer [image-organizer]=RulZ-Image-Organizer
+            [image-tournament]=RulZ-Image-Tournament [llm-suite]=rulz-llm-suite [coding-agent]=rulz-coding-agent
+            [training-captioner]=Rulz-Training-Captioner [clip-extractor]=rulz-simple-video-clip-extractor
+          )
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+            id="${tag%-v*}"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            echo "version=${tag##*-v}" >> "$GITHUB_OUTPUT"
+            echo "apps=[\"$id\"]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          base="${BASE:-$BEFORE}"
+          if [[ -z "$base" || "$base" =~ ^0+$ ]] || ! git cat-file -e "$base" 2>/dev/null; then base=HEAD~1; fi
+          changed=$(git diff --name-only "$base" HEAD)
+          picked=()
+          for id in "${!DIRS[@]}"; do
+            if grep -q "^\.github/workflows/apps\.yml$" <<< "$changed" || grep -q "^apps/${DIRS[$id]}/" <<< "$changed"; then
+              picked+=("\"$id\"")
+            fi
+          done
+          echo "apps=[$(IFS=,; echo "${picked[*]}")]" >> "$GITHUB_OUTPUT"
+          echo "Building: ${picked[*]:-nothing}"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.apps != '[]'
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJSON(needs.plan.outputs.apps) }}
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      APP: ${{ matrix.app }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      TAG_VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Describe the app
+        run: |
+          $apps = @{
+            'rulz-trainer'       = @{ dir = 'RulzTrainer'; name = 'RulzTrainer'; kind = 'source' }
+            'image-organizer'    = @{ dir = 'RulZ-Image-Organizer'; name = 'RulZ Image Organizer'; kind = 'python' }
+            'image-tournament'   = @{ dir = 'RulZ-Image-Tournament'; name = 'RulZ Image Tournament'; kind = 'dotnet' }
+            'llm-suite'          = @{ dir = 'rulz-llm-suite'; name = 'RulZ LLM Suite'; kind = 'electron' }
+            'coding-agent'       = @{ dir = 'rulz-coding-agent'; name = 'RulZ Coding Agent'; kind = 'electron' }
+            'training-captioner' = @{ dir = 'Rulz-Training-Captioner'; name = 'Rulz Training Captioner'; kind = 'source' }
+            'clip-extractor'     = @{ dir = 'rulz-simple-video-clip-extractor'; name = 'RulZ Simple Video Clip Extractor'; kind = 'python' }
+          }
+          $a = $apps[$env:APP]
+          if (-not $a) { throw "Unknown app '$env:APP'" }
+          "DIR=apps/$($a.dir)" >> $env:GITHUB_ENV
+          "NAME=$($a.name)" >> $env:GITHUB_ENV
+          "KIND=$($a.kind)" >> $env:GITHUB_ENV
+
+      - name: Read the version in the source
+        id: version
+        run: |
+          $v = switch ($env:APP) {
+            'image-organizer'  { (Select-String -Path "$env:DIR/rulz/config.py" -Pattern 'APP_VERSION\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value }
+            'image-tournament' { (Select-String -Path "$env:DIR/src/Program.cs" -Pattern 'AssemblyVersion\("(\d+\.\d+\.\d+)').Matches[0].Groups[1].Value }
+            'clip-extractor'   { (Select-String -Path "$env:DIR/simplecut/__init__.py" -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value }
+            { $_ -in 'llm-suite', 'coding-agent' } { (Get-Content "$env:DIR/package.json" -Raw | ConvertFrom-Json).version }
+            default { '' }   # source apps are released from the branch; the tag is the version
+          }
+          if ($env:TAG -and $v -and $v -ne $env:TAG_VERSION) {
+            throw "The tag says $env:TAG_VERSION but $env:DIR is at $v. Bump the version in the source first."
+          }
+          if (-not $v) { $v = $env:TAG_VERSION }
+          "VERSION=$v" >> $env:GITHUB_ENV
+          "Version: $v"
+
+      # ---------- Electron apps (installer) ----------
+      - if: env.KIND == 'electron'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ${{ env.DIR }}/package-lock.json
+      - if: env.KIND == 'electron'
+        working-directory: ${{ env.DIR }}
+        run: |
+          npm ci --no-audit --no-fund
+          npm run typecheck
+          npm test
+          npm run build:win -- --publish never
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - if: env.KIND == 'electron'
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item "$env:DIR/dist/*.exe", "$env:DIR/dist/*.exe.blockmap" out/
+
+      # ---------- PyInstaller apps (portable zip) ----------
+      - if: env.KIND == 'python' || env.KIND == 'source'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - if: env.KIND == 'source'
+        name: Check the Python sources compile
+        run: python -m compileall -q $env:DIR
+      - if: env.APP == 'image-organizer'
+        working-directory: ${{ env.DIR }}
+        run: |
+          ./build.ps1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force ../../out | Out-Null
+          Push-Location dist
+          7z a -tzip -mx=9 "../../../out/RulZ-Image-Organizer-v$env:VERSION-win64.zip" "RulZ Image Organizer"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Pop-Location
+      - if: env.APP == 'clip-extractor'
+        working-directory: ${{ env.DIR }}
+        run: |
+          python -m venv .venv
+          ./.venv/Scripts/python.exe -m pip install --quiet -r requirements.txt pyinstaller
+          ./.venv/Scripts/python.exe packaging/build.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force ../../out | Out-Null
+          Copy-Item dist/*.zip ../../out/
+
+      # ---------- .NET Framework app (portable zip with one .exe) ----------
+      - if: env.KIND == 'dotnet'
+        working-directory: ${{ env.DIR }}
+        run: |
+          ./build.ps1 -Test
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $stage = "../../stage/RulZ Image Tournament"
+          New-Item -ItemType Directory -Force $stage, ../../out | Out-Null
+          Copy-Item "bin/RulZ Image Tournament.exe", README.md $stage
+          Push-Location ../../stage
+          7z a -tzip -mx=9 "../out/RulZ-Image-Tournament-v$env:VERSION-win64.zip" "RulZ Image Tournament"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Pop-Location
+
+      - if: env.KIND != 'source'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.app }}-${{ env.VERSION }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 14
+
+      # ---------- Release (tags only) ----------
+      - name: Write the release notes
+        if: env.TAG != ''
+        shell: bash
+        run: |
+          prev=$(git tag --list "${APP}-v*" --sort=-v:refname | grep -vx "$TAG" | head -1)
+          {
+            echo "## Changes"
+            echo
+            if [ -n "$prev" ]; then
+              git log --no-merges --format='- %s' "$prev..$TAG" -- "$DIR"
+            else
+              git log --no-merges --format='- %s' -20 "$TAG" -- "$DIR"
+            fi
+          } > notes.md
+          cat notes.md
+      - name: Publish the release
+        if: env.TAG != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ env.NAME }} v${{ env.VERSION }}
+          body_path: notes.md
+          files: out/*
+          fail_on_unmatched_files: false
+          make_latest: false

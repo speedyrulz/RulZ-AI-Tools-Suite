@@ -13,6 +13,8 @@ A simple diffusion-model LoRA trainer with a WebUI. Supported models:
   directly in ComfyUI with the standard *Load LoRA* node.
 - **Bria FIBO 2.0** (8B): train on dev, use on Edit Turbo ([details](#fibo-20-bria-training-on-dev-using-the-lora-on-edit-turbo)).
 - **Krea 2** (12B): train on Raw, use on Turbo ([details](#krea-2-training-on-raw-using-the-lora-on-turbo)).
+- **Qwen-Image 2.1** (7B): text-to-image LoRAs on one 16 GB card, with Fizgig's training adapter
+  ([details](#qwen-image-21)).
 
 | Dark | Light |
 | --- | --- |
@@ -56,6 +58,18 @@ every one on the page. The wizard edits the same settings as the **Train** tab, 
 topic, with rarely changed ones folded under *Advanced*. *Start training*, *Stop* and *Kill* sit in the bar at the
 bottom of the Train and Monitor tabs.
 
+**Race wizard.** For a character, the wizard's first page also asks *One run* or *Race several setups*. A race sets
+up the base racer on the usual pages, then adds two:
+
+- **Racers:** how many (2-8), which settings may differ (any setting a race configuration may change: learning rate,
+  LoRA rank, adapter, self-training, seed...), then one card per racer with a field for each, filled in with the base
+  value. Only what you change is written into that racer's row; the rest follows the base setup.
+- **Race rules:** whether the lowest racer leaves after each round and after how many warm-up rounds, and whether a
+  racer leaves when it stops improving and after how many probes, with the race's cost in training steps.
+
+The review then offers *Start the race*, or *Adjust in all settings* to fine-tune it on the Train tab (its
+Configuration race section holds the same rows).
+
 The WebUI has a dark look (the default) and a light one. The first time you open it in a browser it asks which one
 you want (*Choose your look*); the sun / moon button at the top right switches between them at any time. The choice
 is kept per browser (its local storage).
@@ -70,6 +84,17 @@ is kept per browser (its local storage).
    WebUI does not stop it, and the page reconnects to the running job (it opens on *Monitor* and loads the
    job's settings into the form). *Stop (save)* and *Kill* work on a reconnected job too.
 4. Results: `output/<job>/<job>_<step>.safetensors` (checkpoints) and `output/<job>/<job>.safetensors` (final).
+
+**Training queue.** *Add to queue* (next to *Start training*, and on the wizard's last page) saves the current
+settings as a run that starts by itself when the one running now, and every run queued before it, is done: finished,
+stopped or failed. With nothing running it starts right away. The *Queue* section on the Monitor lists the waiting
+runs (move them up or down, remove them), pauses or resumes the queue, clears it and shows the last runs it started
+(or why one could not start: that run stays first and the queue pauses). Each queued run is a full copy of the
+settings at the time you added it, so you can change the form for the next one straight away. A job name that is
+running or already queued is refused, since the later run would write over the earlier one's folder. *Kill* pauses
+the queue; *Stop* goes on to the next run. The queue is kept in `output/_queue.json`, but the WebUI is what starts
+the next run, so keep it running; a WebUI restarted with runs waiting and nothing running pauses the queue until you
+*Resume* it.
 
 *Save* / *Load* (in the *Training job* card at the top of the Train tab) store the whole form as YAML (Browse opens
 in `configs/`). Loading a config saved by
@@ -119,7 +144,7 @@ or in the web editor (Templates -> Create) with these settings:
 | Launch mode | Jupyter + SSH, direct connections |
 | On-start script | `/opt/instance-tools/bin/entrypoint.sh` |
 | Ports | `1111`, `7870`, `8080`, `22` |
-| Environment variables | `PROVISIONING_SCRIPT=https://raw.githubusercontent.com/speedyrulz/RulzTrainer/main/scripts/vast/provision.sh`<br>`PORTAL_CONFIG=localhost:1111:11111:/:Instance Portal\|localhost:7870:17870:/:RulzTrainer\|localhost:8080:18080:/:Jupyter\|localhost:8080:8080:/terminals/1:Jupyter Terminal`<br>`OPEN_BUTTON_PORT=1111` |
+| Environment variables | `PROVISIONING_SCRIPT=https://raw.githubusercontent.com/speedyrulz/RulZ-AI-Tools-Suite/app/rulz-trainer/scripts/vast/provision.sh`<br>`PORTAL_CONFIG=localhost:1111:11111:/:Instance Portal\|localhost:7870:17870:/:RulzTrainer\|localhost:8080:18080:/:Jupyter\|localhost:8080:8080:/terminals/1:Jupyter Terminal`<br>`OPEN_BUTTON_PORT=1111` |
 | Disk space | 120 GB (the base model download is about 30 GB; datasets, caches and outputs come on top) |
 
 Put `HF_TOKEN` (needed for the gated MOSS-Image repos) into your **account** environment variables
@@ -178,6 +203,31 @@ variable is then unnecessary.
   Qwen3.5-9B text encoder embeds every caption through the chat template. Both are cached under
   `<dataset>/.rulz_cache`, then the encoders are unloaded. Training only holds the DiT and the LoRA.
 - **Timesteps.** `logit_normal` (mean/std), `sigmoid` (scale) or `uniform`, with an optional `timestep_shift`.
+  `logsnr` is the style-friendly sampler ([arXiv 2411.14793](https://arxiv.org/abs/2411.14793), via musubi-tuner):
+  the log signal-to-noise ratio is drawn from N(`logsnr_mean`, `logsnr_std`), -6 and 2 as the paper recommends, so
+  most steps are very noisy (median sigma about 0.95), where a style's colours and strokes are learned. It is meant for
+  style LoRAs; RulzTrainer's `style` mode tilts the same way more gently.
+- **Clean-end share** (`clean_share`, after Fizgig's MOSS-Image "Slide"; off by default). It sets the share of
+  training steps at the clean end, where sigma is below 0.5 and faces and fine detail are refined, and it can change
+  by epoch.
+  - **Where the curve starts.** RulzTrainer's default logit-normal puts 50% of steps there, MOSS's own pretraining
+    curve (`timestep_sampling: reference`) about 11%.
+  - **How it hits the target.** The sampled curve is moved along the logit axis until the share is hit after
+    `timestep_shift`, `sigma_min` / `sigma_max` and the 1000-step grid; its shape stays. The run logs each change.
+  - **Notation** (Fizgig's; percentages, and 1-based epochs of the run's image queue):
+
+    | Value | Meaning |
+    |---|---|
+    | `40` | 40% all run |
+    | `75:5:40` | 75% for 5 epochs, then 40% |
+    | `60:7:30:15` | 60% until epoch 7, sliding in a straight line to 30% by epoch 15 |
+    | `60:7:30:15:2` | the same, plus one epoch in 2 after that back at 60% (Fizgig's MOSS default, the WebUI's *Slide* button) |
+
+  - **What Fizgig measured.** On MOSS-Image, against MOSS's own ~11% curve and on its hardest dataset, Slide was the
+    best of eight schedules. It led from epoch 12 and still held 71% likeness at epoch 60. A sudden drop from 75% to
+    40% dipped likeness two epochs later.
+  - **Unmeasured here.** RulzTrainer's default already starts at 50%, so race `clean_share: "60:7:30:15:2"` against
+    `""` on your own data. It works with every model and timestep mode.
 - **Flow matching loss.** `x_t = (1 - sigma) x0 + sigma * noise`, target `noise - x0`, timestep = `sigma * 1000`,
   sigmas snapped to the model's 1000-step training grid. Default sampling is logit-normal; `timestep_shift`
   is available.
@@ -264,16 +314,38 @@ different GPU models differ very slightly in their pixels (different kernels); t
 
 ## Model sources and quantization
 
-**Hugging Face / diffusers folder**: pick Base or SFT, or any local folder with `transformer/`, `text_encoder/`,
-`tokenizer/`, `vae/`.
+**Single safetensors files (the default, `model_source: files`)**: the model you pick comes as ComfyUI files from
+Comfy-Org's repackages on Hugging Face, downloaded on the first run (into Hugging Face's cache, reused after that; the
+WebUI's *Download now* fetches them ahead of time). `model_file_quant` and `text_encoder_file_quant` pick the format,
+`int8_convrot` by default (about half of bf16, trains as fast, under 1% error):
 
-**Single safetensors files (ComfyUI)**: point the UI at the three files you already use in ComfyUI: the diffusion
-model (`diffusion_models/`), the Qwen3.5-9B text encoder (`text_encoders/`) and the Flux2 VAE (`vae/`). Fused-qkv
-("repacked") files are split back automatically. The tokenizer is downloaded once (a few MB) if not given.
-Any file left empty is taken from the Hugging Face model instead, so you can mix (for example a ComfyUI DiT
-file with the HF text encoder). For decoding samples use the VAE that matches MOSS-Image (the FLUX.2 klein
-"small" VAE, `flux2-vae_small.safetensors` in ComfyUI); the encoder is identical across Flux2 VAEs, so caching
-latents works with either.
+| Model | Repo | Diffusion model | Text encoder | VAE |
+|---|---|---|---|---|
+| MOSS-Image Base / SFT | [Comfy-Org/MOSS-Image](https://huggingface.co/Comfy-Org/MOSS-Image) | int8_convrot 5.4 GB, bf16 10.2 GB | Qwen3.5-9B int8_convrot 9.8 GB, bf16 19.3 GB | `flux2-vae_small` |
+| Krea 2 Raw / Turbo | [Comfy-Org/Krea-2](https://huggingface.co/Comfy-Org/Krea-2) | int8_convrot 13.5 GB, fp8_scaled 13.1 GB, bf16 26.3 GB | Qwen3-VL-4B int8_convrot 4.9 GB, fp8_scaled 5.2 GB, bf16 8.9 GB | `qwen_image_vae` |
+| FIBO 2.0 dev / Edit Turbo | [Comfy-Org/Fibo-2.0](https://huggingface.co/Comfy-Org/Fibo-2.0) | int8_convrot 8.4 GB, bf16 16.5 GB | Qwen3-VL-4B, the same files as Krea 2's | `flux2-vae` |
+| Qwen-Image 2.1 / Turbo | [Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1) | int8_convrot 7.3 GB, bf16 14.2 GB | Qwen3-VL-8B int8_convrot 9.4 GB, bf16 17.5 GB | `qwen_image_2.1_vae_bf16` |
+
+To use files you already have, set `transformer_file`, `text_encoder_file` and `vae_file` (the WebUI's optional file
+fields): only the ones left empty are downloaded. Fused-qkv ("repacked") files are split back automatically. The
+tokenizer is downloaded once (a few MB) if not given. MOSS-Image only takes its own Qwen3.5 tokenizer: earlier
+versions took the first tokenizer folder under `models/`, Krea 2's when one was there, which turned every MOSS-Image
+prompt into the wrong tokens (noise in samples and in the cached training captions); those cached captions are
+encoded again automatically. For decoding MOSS-Image samples use the VAE that matches
+MOSS-Image (the FLUX.2 klein "small" VAE, `flux2-vae_small.safetensors`); the encoder is identical across Flux2
+VAEs, so caching latents works with either.
+
+**Hugging Face / diffusers folder** (`model_source: hf`): the original diffusers repos (pick Base or SFT, or any
+local folder with `transformer/`, `text_encoder/`, `tokenizer/`, `vae/`), downloaded into `models/`.
+
+**FIBO 2.0 from single files**: ComfyUI's FIBO file fuses `to_q/to_k/to_v` into `qkv`, the cross-attention and
+Perceiver `to_k/to_v` into `to_kv` and the feed-forward `w1/w3` into `w13`, and zero-pads the feed-forward width from
+9536 to 9728. On load the fused weights are split back (an int8 weight is cut by rows with its per-row scales) and the
+padding is cut off, so the model, and every LoRA trained on it, has Bria's shapes: a LoRA trained from single files
+loads in diffusers. The int8 `w2` loses its padding columns by being dequantized, cut and quantized again (its
+Hadamard rotation groups do not survive the cut), as per-row int8. Checked against Bria's weights: every split part
+and every cut, re-quantized weight matches at cosine 1.00, and every diffusers weight is present. The text encoder is
+Krea 2's Qwen3-VL-4B file (byte-identical in both repos) run text-only, the VAE MOSS-Image's Flux2 loader.
 
 **Krea 2 from single files** works the same way with ComfyUI's Krea 2 files: the diffusion model (ComfyUI's own
 `blocks.N.attn.wq` layout is renamed to ours on load; `transformer_quant: auto` keeps a quantized file's format where
@@ -285,8 +357,7 @@ converted with diffusers' converter; the latent statistics are built in). The Qw
 downloaded Krea 2 repo if there is one, else `Qwen/Qwen3-VL-4B-Instruct` (not gated, a few MB). The family is read
 from the diffusion-model file's header, so the file name does not matter. Checked against the Hugging Face model:
 the VAE file matches exactly, the int8 and scaled-fp8 text encoder files match the bf16 encoder at cosine 0.999
-(quantization noise), and ComfyUI's int8_convrot DiT file matches the HF weights quantized the same way. FIBO 2.0
-has no single-file loader.
+(quantization noise), and ComfyUI's int8_convrot DiT file matches the HF weights quantized the same way.
 
 Accepted weight formats: bf16 / fp16 / fp32, fp8 (upcast) and ComfyUI's scaled fp8 (`weight_scale` applied on load),
 ComfyUI `int8_tensorwise` with or without ConvRot (Hadamard rotation), and ComfyUI `nvfp4`. Those two quantized
@@ -446,9 +517,12 @@ samples on your own data before using it for a final run.
 ### Attention kernel (`attention_backend`)
 
 The DiT blocks run PyTorch's scaled-dot-product attention. `torch` lets PyTorch pick the kernel (flash where it
-can); `cudnn`, `flash`, `efficient` and `math` pin one; `auto` (the default) pins cuDNN on a Blackwell training GPU
-(RTX 50, B200; ai-toolkit pins it there too) and lets PyTorch pick elsewhere. A pinned kernel that rejects a call (a
-mask or dtype it does not take) falls back to PyTorch's pick for the rest of the run with one warning. Measured on
+can); `cudnn`, `flash`, `efficient` and `math` put one first; `auto` (the default) puts cuDNN first on a Blackwell
+training GPU (RTX 50, B200; ai-toolkit uses it there too) and lets PyTorch pick elsewhere. The choice is PyTorch's
+process-wide priority order, so every other kernel stays enabled behind the chosen one and a call it does not take (a
+mask, dtype or head size) runs on the next. Until v2.3.1 the choice switched the other kernels off during each DiT call,
+which broke a VAE decode running in another thread at that moment (samples and probes split over two GPUs): Krea 2's
+fp32 VAE attention found no kernel enabled ("No available kernel"). Measured on
 the RTX 5060 Ti, 1 MP, batch 1, 20 steps (median of steps 6-20), two runs each:
 
 | model | PyTorch's pick | cuDNN | loss (both) | peak memory (both) |
@@ -465,8 +539,8 @@ PyTorch's pick there. Set `cudnn` to try it on any card: the log says which kern
 0.25 to 4 MP in 0.25 steps, 1 MP = 1024x1024). Every image is bucketed to each selected area with its aspect
 ratio preserved (sides multiples of 16), and latents are cached once per image and resolution, so a second run at
 the same resolutions starts immediately. `min_bucket_side` / `max_bucket_side` now rescale the bucket uniformly
-before clamping, so a 2:3 portrait at 0.25 MP keeps its aspect ratio instead of being cropped to the minimum
-side; raise `max_bucket_side` above 2048 if you want 4 MP buckets for wide images. The old single `resolution`
+before clamping, and the minimum is capped at half the resolution, so a 0.25 MP bucket keeps ~512x512 of area
+(ai-toolkit style) instead of getting a 512 short edge, and the maximum is raised to twice the resolution so 4 MP buckets keep their area too. The old single `resolution`
 (a side length) still works when `resolutions` is empty.
 
 With several resolutions selected and *Resolution step-up* off, all of them are mixed in every epoch (one item per
@@ -497,6 +571,15 @@ states) every `save_state_every` steps (0 = with each LoRA save), keeps a rollin
 (0 = all), and always writes the final state when training ends or is stopped. Set `resume_state` to one of
 those folders to continue exactly where it stopped. `resume_from` loads only LoRA weights from any exported file.
 
+## Checkpoints to keep (`keep_checkpoints`)
+
+`save_every` writes a LoRA or LoKr file every N steps (`<job>_000250.safetensors`, and `_r<rank>` files beside it for a
+fine-tune's extra ranks). `keep_checkpoints: N` keeps only the newest N of those and deletes the oldest each time a new
+one is saved; 0 (the default) keeps them all. The final file (`<job>.safetensors`), the best-likeness file
+(`<job>_best`), a race's dropped and winner files and the training states are never deleted: states have their own
+`keep_states`. In a race each configuration keeps its own newest N. The WebUI's *Checkpoints to keep* field is in
+Saving & samples.
+
 ## Weight average (`lora_ema`)
 
 At batch size 1 each step pulls the LoRA toward the image it just saw, so a checkpoint carries the tail of the
@@ -519,7 +602,9 @@ it has not been measured on the models here.
 `sample_seed` is the seed of the first prompt; with `sample_walk_seed` each further prompt uses seed + 1.
 `sample_before_training` renders a sample set at step 0 for comparison. The log reports each prompt and the
 Monitor page shows the sampling step. The Monitor page also has per-GPU VRAM/utilization bars, an adjustable
-loss-smoothing slider and an auto-scrolling log. `compile_model` (default `auto`, see
+loss-smoothing slider, an auto-scrolling log and, under *Log and saved files*, a download button for every LoRA the run
+has saved (the checkpoints, the best and the final file), so a run on a rented or remote GPU hands its LoRAs straight to
+the browser. Only `.safetensors` files inside a run's folder are served. `compile_model` (default `auto`, see
 [torch.compile](#torchcompile-compile_model)) runs the DiT blocks through torch.compile
 (skipped with a warning if triton is not installed; `triton-windows` from requirements.txt provides it on Windows).
 No C++ compiler is needed: the blocks are compiled with Dynamo's `specialize_float` so the LoRA scale and
@@ -550,6 +635,8 @@ Monitor chart and the sample captions:
   are (20% deviation on a ratio ~ 61%). Silhouette features are only used when the skeleton confirms a full-body
   view, and samples without a usable pose get no body score. Body references should be full-body, upright,
   fairly neutral poses, and the same goes for the sample prompts you want body-scored.
+- **Body** (`body_score: skeleton3d` or `smplx`): proportions measured so that the pose does not change them, against
+  the references' own spread (details under *Body score* below).
 - **Combined**: `face_weight` x face + `body_weight` x body (defaults 0.7 / 0.3; whichever is available).
 
 Model downloads (the InsightFace pack, the MediaPipe pose model and SAM 3) happen on first use with a progress
@@ -610,6 +697,19 @@ at step 100; baseline 74.2): region-weighted loss 76.0, LoRA+ ratio 4 74.7, `ide
 settings when switched off. Suggested recipe: `region_weights: true`, `lora_plus_ratio: 4` with `adamw8bit`,
 crops only from high-resolution photos (`crop_augment_min_px: 0` means crops are never upscaled), timesteps at
 `logit_normal`; treat `identity` timesteps and the curriculum as options to A/B with the probes.
+In the Wizard, *Character / person* then asks how much of the person the likeness covers, and sets the loss weights
+(face region / person region), the score weights, the crops and the probes for it:
+
+| Focus | Loss face / person | Score face / body | Crops | Probes |
+|---|---|---|---|---|
+| Face only | 3 / 1 | 100% / 0 | face | face only (no body references) |
+| Face focus (the recipe) | 3 / 1.5 | 70% / 30% | face + bust | both |
+| Face and body | 1.5 / 1.5 | 50% / 50% | face + bust | both |
+| Body focus | 1.5 / 3 | 30% / 70% | face + bust | both |
+| Body only | 1 / 3 | 0 / 100% | none | body only (no face references) |
+
+The curriculum is on for the three in the middle. The wizard also recommends the adapter (a LoRA for every model),
+block swap for a card the model does not fit, LoRA Isolation, the look warm-up and how many checkpoints to keep.
 
 ### Experimental: direct identity loss
 
@@ -646,16 +746,64 @@ only) fell 0.88 / 0.68 / 0.54, so most of the drop is ordinary learning and the 
 this short run. Treat it as an experiment to A/B against the probes (with the facenet backend for an independent
 score), not a default.
 
+### Trigger attention and identity alignment (`attn_localize`, `id_align`)
+
+Two training-only losses that read the model's insides and reuse what the trainer already has (the region maps'
+person mask and face box, the face analysis); the saved LoRA is the same kind of file. Both are switches in the
+Region-weighted loss section (*Trigger attention and identity alignment*) and in the Wizard's Training step for a
+character, and race keys. Neither is measured for likeness yet: race them against the run's own settings.
+
+- **Attention localization** (`attn_localize`, weight `attn_localize_weight` 0.05). In a few attention layers
+  (`attn_localize_layers`; auto: a third and half of the depth, FIBO 2.0's injection blocks) every image token's
+  attention over the caption is read (softmax over the text tokens, averaged over heads) and the share that goes to
+  the trigger word's tokens forms a map over the picture. Normalized to sum 1, the loss is the part of that map off
+  the subject: 1 - share on the person mask and face box. It binds the identity to the trigger and keeps it off the
+  background and other people, the kind of positional supervision MultiCrafter (2025) put on FLUX's attention to stop
+  attributes leaking between subjects. The trigger's tokens are found in each cached caption with the model's own
+  tokenizer and prompt template (each dataset's trigger, Isolation's fused words, caption dropout's prompt); FIBO 2.0
+  condenses the caption into Perceiver gist tokens, so it is read in the cross-attention of its injection blocks.
+  Person masks are built for it even without the region-weighted loss. Needs a trigger word.
+  In LoRA Isolation's side-by-side pairs (the subject next to a generated stranger) the subject's panel is the
+  region, so the trigger's attention on the stranger counts against it: MultiCrafter's case of two subjects in one
+  picture. The step log counts the pairs it saw.
+- **Identity alignment** (`id_align`, weight `id_align_weight` 0.05, block `id_align_layer`; auto: a third of the
+  depth). After that block, the image tokens inside the face box are averaged and a small MLP (about 7M weights on
+  Krea 2, its own AdamW, never saved) maps them onto that photo's ArcFace embedding (stored with the face analysis);
+  the loss is 1 - cosine. It is REPA's representation alignment (Yu et al. 2024) pointed at identity: feedback at
+  every noise level, where the identity loss above needs a nearly clean prediction and a VAE decode.
+- **Body alignment** (`body_align`, weight `body_align_weight` 0.05, the same block). The same for the build: the
+  image tokens of the person outside the face box (the region maps' person mask) are averaged and a second small MLP
+  maps them onto that photo's DINOv2 body-window embedding, the one the body probe scores with (the neck to
+  mid-thigh, upright, cut out on grey; cached in `bodies.json`). Photos that do not show the window, or have no
+  person mask, are left out; person masks are built for it even without the region-weighted loss.
+- How it runs: the trainer arms taps on the model for a batch, the main forward records, nothing records on later
+  forwards, and a checkpointed block that recomputes in the backward computes the same tensors again (the gradients
+  match an unchecked run exactly on all three models). Tapped blocks run uncompiled. Data parallel: localization on
+  every GPU, alignment on the first (like the identity loss). Not in the parallel race or a fine-tune.
+- Checked on real models at 0.25 MP (16 GB card), both losses in one short run: Krea 2 (blocks 9 and 14; steps as
+  long as without them; the trigger's attention off the subject 0.87 -> 0.84 over 10 steps), MOSS-Image (blocks 14
+  and 21) and FIBO 2.0 (its five injection blocks). A Krea 2 race with a row for each trained, probed and dropped
+  them like any other configuration. The trigger's tokens were found in every cached caption on all three.
+
 ## Likeness probes and controller (character LoRAs)
 
 With face/body references set, `probe_every: N` renders a fixed-seed headshot (`probe_face_prompt`) and/or
 full-body image (`probe_body_prompt`) every N steps at `probe_size` (the face square, the body a 2:3 portrait with the
 same pixel count) with the turbo LoRA (cheap enough to do often), scores them, and records `likeness.jsonl` plus a Monitor chart. Each probe renders `probe_seeds` seeds and averages the scores; the step-0 probe, the zero
 of the normalized scale, renders at least `probe_floor_seeds` (4). Scores are smoothed with `probe_ema`
-and only changes beyond `likeness_noise_band` count. The controller then, each individually switchable:
+and only changes beyond `likeness_noise_band` count. The last step is always probed too, whether or not
+`probe_every` divides `steps`, so the final LoRA has its own score (it can be the best). The controller then, each individually switchable:
 
 - keeps `<job>_best.safetensors` at the best smoothed combined score (`likeness_track_best`) and stops after
   `likeness_patience` probes without improvement;
+- on their own switches (off by default), also keeps `<job>_best_face.safetensors` at the best smoothed face score
+  (`likeness_track_best_face`) and `<job>_best_body.safetensors` at the best smoothed body score
+  (`likeness_track_best_body`), whatever the other part and the combined score do then; the same noise-band rule
+  decides a new best. In a race each configuration keeps its own (`<job>_<name>_best_face.safetensors`);
+- by default replaces a best checkpoint only when the smoothed score beats it by more than the noise band, so a probe
+  can log a smoothed score a little above `best` (35.1 against best 34.1 with the 1.0 band) without a new save. With
+  *New best on any rise* (`likeness_best_any_rise`) any higher smoothed score replaces the overall, face and body
+  best files. Either way early stop and the resolution step-up count only a rise beyond the band as progress;
 - hill-climbs a bounded learning-rate multiplier (`likeness_lr_control`, `likeness_lr_min/max/step`): up while
   the smoothed score rises, down when it falls. It works with AdamW-style optimizers (through the scheduler)
   and with Automagic 3 (by scaling its adaptive lr tensors), which keeps doing its own per-step adaptation;
@@ -694,6 +842,42 @@ match of skeleton ratios (shoulder/hip width, leg/height, ...) against the refer
 silhouette widths with `body_backend: mediapipe+sam3`; proportions in a photo shift with pose and camera angle, so
 this score can fall while the image gets closer.
 
+`skeleton3d` and `smplx` measure proportions so that a bent leg is still the same leg (`bodyshape.py`):
+
+- `skeleton3d`: bone-length ratios from MediaPipe's 3D landmarks (its own depth estimate): shoulder / hip width,
+  torso / leg, thigh / shin, upper arm / forearm, arm / torso, shoulder width / torso, head / shoulder width. The
+  person mask's widths at the shoulder, waist, hip and thigh (and waist / hip) count only where the person stands
+  upright, legs straight, facing the camera, head to feet in the frame: the one view where a width is a width.
+- `smplx`: NLF (Neural Localizer Fields, Sarandi & Pons-Moll, NeurIPS 2024) fits the SMPL-X body model to the
+  person; its 10 shape parameters rebuild the body in the model's T-pose (the model ships inside NLF's file), where
+  it is measured: shoulder width, leg, torso and arm length, and the bust, waist, hip and thigh girths (the
+  perimeter of the mesh's slice, as a tape measure takes it), all over the height, plus waist / hip. A picture
+  needs the shoulders, hips and knees in the frame. NLF's shape prior is eased (`beta_regularizer` 1, NLF's default
+  10 pulls every body toward the average). NLF's weights are for noncommercial research use and are not downloaded
+  for you: put `nlf_l_multi_0.3.2.patch6.torchscript` (550 MB,
+  [isarandi/nlf v0.3.2](https://github.com/isarandi/nlf/releases/tag/v0.3.2)) in `models/nlf/` or set `nlf_model`.
+  About 0.35 s a picture on an RTX 4060 Ti; it waits on the CPU between probes and runs on `body_device`.
+
+Both compare through a calibrated profile: per measurement the references' median and their own spread (a robust
+standard deviation, at least 3% of the median), so a measurement that varies a lot between the photos of the one
+person counts for little; the score is the mean of exp(-z^2 / 2) over the shared measurements, and the references'
+own level is each reference against the others. Clothing, skin and nudity do not count, unlike `appearance`.
+
+Measured on one woman's 19 photos (14 close-ups or selfies) and the 1,160 body probes of 32 MOSS-Image runs:
+
+| Body score | Photos measured | References' own level | Stranger (step 0) | Rise with training | Noise (one seed) |
+|---|---|---|---|---|---|
+| `proportions` (2D) | 18 | 64.0 | **82.2** | +3.1 | 3.0 |
+| `skeleton3d` | 18 | 55.5 | 58.7 | +6.1 | 3.8 |
+| `smplx` | 5 (down to the knees) | 68.5 | **31.6** | **+15.8** | 5.1 |
+
+The 2D ratios score a stranger above the person's own photos; the 3D bone ratios are steadier across her photos
+(3-9% against 15-50% in 2D) but adults' bone proportions differ less than that, so a stranger still lands at her
+level. SMPL-X separates them: her photos measure a fuller build than the base model's default woman (waist / height
+0.52 against 0.38, bust 0.64 against 0.53, waist / hip 0.82 against 0.68), training moved the probes toward it
+(the best run to 0.48, 0.61 and 0.76), and limb lengths matched everywhere (they carry no identity here). Five
+photos are a thin profile, most of them sitting or kneeling: a few standing full-length photos make it sturdier.
+
 **One scale for face and body** (`likeness_normalize`, on by default). Raw, the two scores are not comparable: the
 face score is an ArcFace cosine (a stranger scores ~10-25, your references against each other ~60-80), the proportion
 body score a match where every human already scores ~80 and the references ~90-96. A run's face score moves ~60
@@ -708,10 +892,198 @@ raised to at least 10 face / 8 body points above the floor when the step-0 score
 at 100: matching the references better than a typical one of them is no more likeness (a probe that copies one
 photo reads higher). The median replaced the mean because hard references (profile views, cut-off faces) pull the
 mean below what a clean front-facing probe scores: on a real run a typical probe read 108% against the mean and
-100% against the median. The combined score, the noise band, the curriculum gap,
-the lr control, the best checkpoint, early stop and the race drops all use the normalized values; the log, the
-Monitor and `likeness.jsonl` show the raw face / body next to them (`face_norm`, `body_norm`, `scale`). Earlier runs'
-`likeness.jsonl` keep their raw combined scores.
+100% against the median.
+
+**The face scale is stretched and curved** (`face_scale_span` 1.35, `face_scale_curve` 1.5; 1 and 1 give the plain
+scale above). An ArcFace cosine saturates: a decent likeness already matches the references' best-match level, so the
+face read ~90 and then sat at 100 while the pictures still improved, and read far above the body (on a real run face 90
+against body 51 for pictures judged equally close). The face's 100 now sits `face_scale_span` times as far above the
+stranger as the references do, and the face score is its position on that scale raised to `face_scale_curve`. A face
+that read 90 now reads ~54, your references' own face level reads ~64, and the score keeps growing beyond it.
+
+**The body scale is stretched and curved the same way** (`body_scale_span` 1.35, `body_scale_curve` 1.5, since v2.2.0).
+With the face alone stretched the body read 100 while the face read 50-60: a DINOv2 body score saturates too, because a
+probe that copies the photos' outfit and setting matches them better than the references, in their varied outfits and
+poses, match each other, and where the references' own body match sits close to the base model's (a ceiling only
+`MIN_SPAN` above the floor) a few points of gain read 100. The body's ceiling now also sits at least halfway from the
+floor to a perfect match (a real run's 73.3 -> 81.3 becomes 73.3 -> 86.7 before the stretch). Now the references' own
+level reads ~64 on both scales, a
+reference-level body no longer outscores a reference-level face, and 100 is out of reach of a probe that only copies the
+photos (raw 100 reads ~84 with an ordinary scale). Set both body numbers to 1 for the old body scale. The scale in force is kept in each probe record's `scale`,
+with the curves; runs saved before these changes used the plain scales, so compare their face (before v2.0) and body
+(before v2.2.0) numbers with care. The ComfyUI
+nodes use the same scale.
+
+The combined score, the noise band, the curriculum gap,
+the lr control, the best checkpoint, early stop and the race drops all use the normalized values. The Monitor and the
+Samples tab show only the normalized scores (the log and `likeness.jsonl` keep the raw face / body next to them as
+`face`, `body`, `face_norm`, `body_norm`, `scale`); probe images carry their overall / face / body score underneath.
+In a race, the Monitor and the Samples tab put the same generation (step, prompt or probe kind, seed) of every
+configuration side by side in one row. Earlier runs' `likeness.jsonl` keep their raw combined scores.
+
+**Export spreadsheet** (Monitor, *Likeness probes & controller*, during or after a run) downloads `<job>_likeness.xlsx`,
+also written into the job folder: *Updated scores* has every probe's smoothed and per-probe face, body and combined
+score and the best smoothed combined score with its step; *Raw probe scores* the raw similarities; *Scale* the run's
+floors (the step-0 probe), its references' own levels, the span and curve of each scale, the weights and the smoothing.
+The scores are Excel formulas of the raw scores and the Scale sheet, so editing a span, a curve or a weight rescores
+the run (a run from before a scale change is shown on the span and curve its config has now). In a race each
+configuration, and the winner after the race, gets its own pair of sheets and its own Scale column. Without the WebUI:
+`python -c "from rulztrainer import likeness_export; likeness_export.export('output/<job>')"`. The Scale sheet also shows
+where your references' own face and body level land on the chosen scales.
+
+The same spreadsheet comes from **Previous Runs** too (*Export spreadsheet* under the table, one file per ticked run),
+built from the raw probe scores the run history keeps, so it works after a later run has reused the job folder. Runs
+saved before this version have those scores only if their job folder still holds the run: *Import old runs* (or
+opening the tab) adds them then.
+
+## Likeness-filtered self-training (`selftrain`)
+
+Partway through the steps the LoRA renders the subject over varied prompts; the pictures that pass a quality filter
+and look more like the person than the probes do train beside the photos, at a lower weight, for the rest of the run.
+It is reward-ranked fine-tuning (RAFT, Dong et al. 2023: sample, rank by a reward, fine-tune on the best) with the
+probes' likeness score as the reward, done inside the run: far cheaper than the reward stage below, but it learns only
+from the good pictures, not away from the bad ones. At each step of `selftrain_at` (fractions of the steps, `0.5`;
+`0.5,0.75` for two rounds):
+
+1. it renders `selftrain_images` (32) pictures with the weight average, cycling through `selftrain_prompts` (empty: the
+   reward stage's close-up, upper-body and full-body prompts from the trigger word), with the Previews' steps and
+   guidance (`sample_steps`, `sample_cfg`) at the largest training resolution, on new seeds each round;
+2. leaves out the pictures with several faces, no face (when the face counts), a face the detector is unsure of
+   (below 0.7) or the frame cuts off, and the ones far blurrier than the round's other pictures (variance of the
+   Laplacian below 0.4 x the round's median, at the training resolution; on the face when it is 64 px or larger there,
+   since a render's soft background is not blur, else on the whole picture). Renders are compared with renders: real
+   photos carry grain and texture a clean render never has, so against them every render looks soft;
+3. scores the rest like the probes (normalized face and body, combined with `face_weight` / `body_weight`) and keeps
+   those above both `selftrain_min_likeness` (60) and the probes' current smoothed score, best first, skipping
+   near-copies of a kept one (32 px thumbnails correlating above 0.95), up to `selftrain_share` (0.2) of the real
+   images (repeats counted);
+4. trains on them with their prompt as the caption at `selftrain_weight` (0.5) in place of the last round's pictures,
+   at every training resolution they are not upscaled to (region maps from their own face; no person masks).
+
+The pictures, every candidate's scores and why it was left out are in `<job>/selftrain/` (`selftrain.json`); a resumed
+run trains on with the last round's pictures. Not in a race. Training a model on its own output can amplify its own
+artifacts: LoRAs retrained on their outputs over several rounds lost quality visibly by the third (*Model Collapse in
+the Self-Consuming Chain of Diffusion Finetuning*, arXiv 2407.17493), which is why the rounds are few, replace each
+other and stay a small share. The scorer that picks the pictures is the probes' own, so judge the samples by eye too.
+
+## Seed soup (`soup_files`, `scripts/soup.py`)
+
+Train the same subject two or three times with different seeds (or keep a race's finalists, their `_best` files),
+then average what each changes in the model and save it as one LoRA: the "model soup" of Wortsman et al. (ICML 2022),
+whose greedy soup of fine-tuned models beat the best single one. What the runs agree on, likely the likeness, stays;
+what each learned on its own fades. Untested on this trainer: compare by eye too.
+
+- **What is averaged** is each layer's weight change (up @ down x alpha / rank; LoKr: kron(w1, w2)), never the
+  factors: two runs can reach the same change with entirely different factors. A layer one file does not change counts
+  as zero for it. LoRA and LoKr files of the same model (ComfyUI, PEFT or LyCORIS keys); OFT and DoRA change the
+  weights through the base weights, so they cannot be averaged from the files alone.
+- **Rank** (`soup_rank`, 32): the average of three rank-16 LoRAs has rank up to 48. `0` saves it exactly (LoRA files
+  only: the factors side by side); a rank keeps the directions the files share and drops the ones only one has (an
+  SVD, the full fine-tune's extraction). A LoKr changes nearly every direction of a layer, so a low rank keeps little
+  of it (16% at rank 32 for two LoKr factor-8 files on Krea 2): soup LoKr files at a high rank (128 or more), and
+  watch the energy share the log reports; every file is also scored through the same rank, so the comparison stays
+  fair.
+- **Strength:** where the files disagree the average is smaller than each of them, so a soup can act like a lower LoRA
+  strength. The strength is baked into the saved file.
+- **The report** says how much the files agree (the mean cosine between their changes), the soup's size against
+  theirs, and the share of the average kept at the rank.
+
+Two ways to make one (the Train tab's **Seed soup** section has both):
+
+- **Average now** (`python scripts/soup.py a.safetensors b.safetensors --out soup.safetensors --rank 32 [--weights
+  2,1] [--strength 1.1]`): every file, at strength 1, no probes; saved as `<job>_soup_plain.safetensors` from the
+  WebUI.
+- **Picked by the probes** (`soup_files: [a, b, c]` with `steps: 0`; the WebUI's *Pick the soup with the probes*
+  switch sets both): Start trains nothing. It probes the base model (the scale's zero), each file alone (the best one
+  also at every `soup_strengths`, 1.0, 1.15, 1.3, so a soup is never credited for a strength change), then adds the
+  others best-first, each at its best strength, keeping it only when the soup's probe score does not drop (the
+  greedy soup), and also scores the plain average of all for comparison. Saves `<job>_soup.safetensors` and
+  `soup/soup.json` (every trial's score, agreement and size). Uses the run's model, references and probe settings;
+  more `probe_seeds` give a steadier choice.
+
+Seed twins in one run: a race row may set its own `seed`, which gives it its own LoRA initialisation, image order and
+noise (the other rows keep sharing theirs); with `race_drop_lowest: false` every twin trains to the end and keeps its
+`_best` file.
+
+## Likeness reward fine-tuning (`reward_steps`)
+
+An optional second stage after the regular steps that trains on likeness itself, after Flow-GRPO (Liu et al., NeurIPS
+2025), the online reinforcement-learning recipe for flow-matching models. Regular training teaches the LoRA to
+rebuild the training photos; this stage asks, over prompts the photos never had, which of the LoRA's own pictures look
+most like the person. Each reward step:
+
+1. renders `reward_group` (4) pictures of one prompt from different seeds with a stochastic sampler: the usual sampler
+   turned into an SDE with the same marginals (Flow-GRPO's step, noise level `reward_noise` 0.7), so every denoising
+   move is a Gaussian with a known probability. Steps and guidance are the probes' (`reward_sample_steps` 0 =
+   `probe_steps`, `probe_cfg`), with the turbo LoRA the probes use;
+2. scores each with the probes' scorers on their scale, uncurved (0 = a stranger, 1 = the references; a missing
+   face counts -1), each part kept within -0.5 .. 1.5, combined with `face_weight` / `body_weight`. Far below a
+   stranger says nothing about likeness: it is a body in a coat against unclothed body references, or an upper-body
+   shot against full-body ones. Uncapped, such a body score (its scale several times narrower than the face's)
+   picked each group's winner, so the stage learned to look like the reference photos rather than the person. When
+   half the first round's body scores are capped, the log says so: reward prompts like the body references (or
+   `body_weight` 0) make the body count again;
+3. turns the scores into advantages within the group ((score - mean) / std: only the differences between the
+   pictures count, not the prompt's difficulty);
+4. on `reward_train_steps` (4) of the denoising moves, one picture at a time, raises the log-probability of the moves
+   behind the better pictures and lowers it for the worse (policy gradient), plus `reward_kl` (0.04) times the KL
+   divergence to the LoRA as the stage started; AdamW at `reward_lr` (2e-5), gradients clipped at 1.
+
+- **Starts from** the LoRA the steps saved (their weight average). `<job>.safetensors` stays the first stage's; the
+  stage saves `<job>_reward_<step>` every `save_every` reward steps (pruned with `keep_checkpoints`) and
+  `<job>_reward.safetensors`; its pictures are in `<job>/reward/`. Probes continue every `probe_every` reward steps:
+  a probe that beats the best of both stages saves `<job>_reward_best.safetensors`, and early stop ends the stage.
+  When the stage's last step was not probed (`probe_every` not dividing `reward_steps`, or larger than it), a closing
+  probe scores the final LoRA, so the stage always ends with its likeness on the run's scale.
+- **Measured cost:** Krea 2 (nvfp4, 16 GB RTX 4060 Ti), 4 pictures of 512 px at 4 denoising steps with guidance 5.5,
+  2 trained moves per update: about 77 s per reward step (with a turbo LoRA at guidance 1 the guidance passes go).
+- **Alone:** `steps: 0` with a LoRA in `resume_from` runs only this stage, for example on a race winner's file (it
+  does not follow a race in the same run).
+- **Prompts:** `reward_prompts`, or by default eight varied close-up, upper-body and full-body prompts with the
+  trigger word (full-body prompts dropped when the body weighs nothing, close-ups when the face does). Full-body
+  prompts render 2:3 like the body probe; LoRA Isolation's fused trigger applies.
+- **Risk:** the scorers are not differentiable here, so the LoRA cannot chase their gradients pixel by pixel, but it
+  can still learn what they like more than a person does (reward hacking). The KL penalty, the small learning rate and
+  the probes on their own fixed seeds are the guards; look at the pictures.
+- **Cost:** every step renders the group (`reward_group` x steps forward passes, x2 with guidance) and trains
+  `reward_train_steps` x `reward_group` x 2 forward passes (the policy and its reference). Every block recomputes
+  during the stage (kept activations are released). One GPU (data parallel: the first), no fine-tune.
+
+## Previous runs (run history)
+
+The **Previous Runs** tab keeps the likeness history of every run, like TensorBoard, so runs can be compared after the
+job folder has been reused. A run with likeness scores writes one small file in `output/_history/` while it trains (a
+crash keeps what was saved) and again when it ends. It keeps what the Monitor's two likeness charts plot, on the run's
+normalized scale: the **mean face and mean body** score of the sample images at each sampling step (Identity
+similarity), and the smoothed **face, body and combined** score at each probe (Likeness probes & controller). Runs
+from before the history existed are imported from their job folders when the tab first loads, or with *Import old runs*.
+
+Tick any number of runs in the table (name, start, state, steps, adapter, learning rate, last and best scores) to
+overlay them: one colour per run, solid lines for the face, dashed for the body and thick for the combined score, with
+a *Show lines (all runs)* bar of Face / Body / Combined chips above each chart: switch one off to hide that line of
+every ticked run at once, and on again to bring it back. A race run draws each configuration's probe lines in its own colour, named
+after it (`<run> lora16 - face`; the winner's after the race: `winner`); *Import old runs* adds that split to race runs
+saved before it existed, while their job folder is still there. *Rename* gives a run a name of your own and *Remove from history* deletes
+its history file only (never the job folder). *Export spreadsheet* downloads each ticked run's likeness spreadsheet (see
+*Export spreadsheet* under the likeness probes), from the raw probe scores the history keeps for it.
+
+**Compare on one scale** (above the *Likeness probes & controller* chart) rescores the ticked runs and the table on the
+same face span / curve, body span / curve and face weight, instead of each run's own settings: runs trained with
+different scale settings, or before a default changed, then compare fairly. Each run keeps its own floor (its step-0
+probe) and its references' own level; the smoothing is its own too. *Recommended* sets face 1.1 / 3, body 1 / 1 and
+80% face. Runs saved before v2.9.0 stay on their own scale unless their raw probe scores were added (*Import old
+runs*, while the job folder still holds the run); a note names them. The probe images' captions keep each run's own
+scores. A run that is still training updates live.
+
+**Probe images** (below the charts) puts the ticked runs' likeness probes side by side: pick Face or Body and a probe
+step (the arrows step through them), and each run, or each configuration of a race, shows its probe images of that
+step in one row with their overall / face / body scores. A run probed on another interval shows its latest probe before
+that step, marked. Click an image to see it full size; tick the box under any two (any run, any step) to open them
+side by side, large, with their scores (*Compare* opens them again, *Clear picks* starts over). When the ticked runs
+used different probe settings (prompts, seed, size, steps, guidance, turbo LoRA or resolutions) a note says which:
+their probes are not the same test then. The images are kept with the run, as small JPEG copies in
+`output/_history/<run id>/`, so a later run with the same job name does not replace them; *Remove from history* deletes
+them too. Runs saved before v2.4.0 get theirs from *Import old runs* while their job folder still holds that same run.
 
 ## Configuration race (`race`)
 
@@ -722,6 +1094,61 @@ of them have been probed (a round), the one with the lowest smoothed combined pr
 own steps, so the race costs extra steps: with N configurations, W warm-up rounds and a probe every P steps,
 P x (W x N + N(N+1)/2 - 1) steps of racing before the winner continues alone (10 configurations, 2 warm-up rounds, a
 probe every 100 steps and 3000 steps: about 9300 steps in all, 3.1x one run; the WebUI shows the total).
+
+**Slow starters (`race_patience_drop`, `race_drop_lowest`).** Dropping the lowest each round cuts a setting that learns
+slowly but would end higher. With `race_patience_drop: true` a configuration leaves as soon as its own probes have not
+improved (by more than `likeness_noise_band`) for `race_patience` (3) probes in a row, whatever the others score, and
+the rest race on. `race_drop_lowest: false` stops the round drops altogether: every configuration trains all the steps
+(`steps` must be a multiple of `probe_every`) unless the patience drop ends it, at up to one full run per
+configuration. Either way the winner is decided at the end: the configuration whose best smoothed score was the highest
+at any point. Its best checkpoint becomes `<job>_best.safetensors` and its settings `<job>_winner.yaml`; the last one
+racing trains on to the end with the run's own file names (`<job>.safetensors`), and the log says when that is not the
+winner. A configuration that leaves on patience is saved as `<job>_<name>_dropped.safetensors`, one that finished its
+steps as `<job>_<name>_final.safetensors`, and each keeps its `<job>_<name>_best.safetensors`. Both work with the
+round drops on (`race_drop_lowest: true`), and in parallel races. `race_patience_rising: true` gives one a chance to
+come back after a dip: out of patience, it stays as long as each probe's smoothed likeness is higher than its previous
+probe's, and leaves at the first probe that is not (beating its best resets the count as usual). The log and Monitor
+show who stayed.
+
+**Relay: everyone continues from the round's winner (`race_follow: true`).** Nobody is dropped. After each round
+(every configuration trained `probe_every` steps and was probed) the round's winner, the highest smoothed combined
+score, hands everything it learned to the others: its LoRA weights, optimizer state, weight average and likeness
+history (best, smoothing, patience). Each keeps its own settings, seed, image order, noise, learning-rate schedule and
+likeness lr factor, and trains the next round from there. Rows that differ only in their seed make this the best of
+several random paths at every probe, instead of whole runs on different seeds: the WebUI's **Add seed racers** button
+(seeds `1-4`, or `1, 5, 9`) adds one `seed=` row per seed and turns the relay on. Every configuration trains all the
+steps (`steps` must be a multiple of `probe_every`): N configurations cost N runs' steps. The last round's winner is the
+run's LoRA (`<job>.safetensors`, its settings `<job>_winner.yaml`), the others are saved as
+`<job>_<name>_final.safetensors`, and since they share one lineage, the best checkpoint any of them reached is
+`<job>_best.safetensors`. Rows must share the LoRA's shape (no `lora_rank`, `lora_alpha`, targets, blocks, network type
+or DoRA rows; `lora_dropout` is fine), the drop and patience rules are ignored, and it does not run with
+`race_parallel`. A configuration on another kind of optimizer than the winner's starts its optimizer state over (the
+log says so). With 4 seeds the round's best of 4 probes is somewhat lucky: the probe noise (a few points) is part of
+what picks the winner, so more probe seeds (`probe_seeds`) make the choice steadier.
+
+**One configuration per GPU (`race_parallel: true`).** With `multi_gpu: data_parallel` on two or more GPUs, the
+configurations of a round train side by side instead of in turn: each GPU's model copy trains its own configuration
+at the same moment, both run the same `probe_every` steps, and each is probed at the end of its turn as before. With
+an odd number left, the last one of the round trains alone over every GPU when its step has batches enough
+(`gradient_accumulation` 2 or more, the batches split by the GPUs' measured speeds) and that is faster than the first
+GPU alone (by 5%), else on the first GPU only. The winner trains on the same way. Every configuration sees
+`batch_size` x `gradient_accumulation` images per step, wherever it runs, so the comparison stays fair (plain data
+parallel gives each step that many images on every GPU). Each configuration owns its parameters, optimizer and weight
+average, parked on the CPU while it waits; the model copies carry the weights of whoever trains there. Not with the
+identity loss; `torch.compile` is off; no training states. Manual drops, the gallery and the race table work as before
+(the table marks every configuration that is training). A three-configuration test on an RTX 5060 Ti and an RTX 4060
+Ti ran two at once at about 6.6 s per step each, against about 13 s one after the other.
+
+**On the Monitor.** The *Likeness probes* chart draws every configuration's smoothed face, body and combined scores
+as its own lines, named after it (`lora16 face`, `lokr8 combined`): one colour per configuration, the combined score
+thick, the body dashed; after the race the winner's go on as `winner`.
+
+**Dropping one by hand.** The Monitor's race table has a *Drop* button on every configuration still in the race (after
+a confirmation). The trainer reads the request after the current step: the configuration stops, its LoRA is saved as
+`<job>_<name>_dropped.safetensors`, and the race goes on without it. If it was the one training, the next one takes
+over at once; a round it was the last of to be probed ends with this drop instead of dropping the lowest score as well;
+with one left, that one wins and trains on to `steps` like any winner. Without the WebUI, put the configuration's name
+in a file `RACE_DROP` in the job folder (one name per line); the trainer reads and removes it.
 
 ```yaml
 race: true
@@ -741,8 +1168,10 @@ race_configs:
 
 A configuration may change the learning rate and optimizer settings, the timestep sampling and loss settings
 (including region weights, the identity loss and the curriculum), the LoRA rank, alpha, targets, blocks and dropout,
-and caption dropout, flips and crop augmentation (the full list is `race.RACE_KEYS`); the model, quantization, GPUs,
-dataset, resolutions and probes are shared. The comparison is kept fair: every configuration starts from the same
+caption dropout, flips and crop augmentation, and LoRA Isolation's DOP weight and interval when the run has isolation
+on (the full list is `race.RACE_KEYS`, also under *What a configuration may change* in the WebUI); the model,
+quantization, GPUs, dataset, resolutions, probes, batch size and the training adapter are shared: they are set up once
+for every configuration (images, batches, model copies), so they cannot differ per row. The comparison is kept fair: every configuration starts from the same
 LoRA initialisation for its shape, sees the same images in the same order with the same noise, and is probed at the
 same own step with the same seeds. The trainer keeps one set of LoRA wrappers over every configuration's layers;
 switching parks the outgoing configuration's weights, optimizer state and weight average on the CPU, so only the
@@ -775,6 +1204,132 @@ data"; ~20% slower steps; files ~1/64 of the weights, about 400 MB on a 12B mode
 - EMA, the configuration race (one row `network_type=lokr, lokr_factor=8` against a LoRA row trains both on the same
   layers and lets the probes pick), the sampling model and data parallel all handle it.
 
+## OFT (`network_type: oft`) and DoRA (`dora`)
+
+Two more adapters to race against LoRA and LoKr. Both save files ComfyUI's LoRA loader applies as they were trained:
+its own weight-adapter code, run on the saved keys, reproduces the training forward to about 1e-7 (plain and int8
+weights, with and without the OFT constraint). diffusers has no loader for either.
+
+- **OFT** (orthogonal fine-tuning, LyCORIS diag-OFT). Instead of adding to a layer it rotates the layer's output
+  channels in blocks of `oft_block_size` (32; the largest divisor of each layer's outputs up to it), with an
+  orthogonal R from the Cayley transform of a skew-symmetric matrix, so the base model's structure (its weights'
+  norms and angles) is kept. The OFT paper reported better subject identity than LoRA (DINO 0.632 vs 0.613 on
+  DreamBooth objects with Stable Diffusion) and stable results over long runs where LoRA drifted. `oft_constraint`
+  > 0 (COFT) caps how far each layer rotates. Blocks start at zero (R = I). The rotation is applied to the frozen
+  layer's output, so it trains on int8 / nvfp4 weights as they are. Keys: `<stem>.oft_blocks` [blocks, size, size]
+  and, with a constraint, `<stem>.alpha` (ComfyUI reads it as that cap). Rank, alpha, LoRA+ and DoRA do not apply.
+- **DoRA** (weight-decomposed LoRA, on a LoRA or a LoKr). The merged weight is W' = (W + delta) * m / ||W + delta||
+  per input column: the adapter steers the direction, and a magnitude m per input channel trains on its own (it
+  starts at ||W||, so the layer is unchanged at step 0). The norm is computed every forward from the dequantized
+  weight, without gradient (the DoRA paper's memory saving), so steps cost more. Saved as `<stem>.dora_scale` [1, in]
+  next to the LoRA / LoKr keys. The input axis is deliberate: ComfyUI's `weight_decompose` normalizes the merged
+  weight on that axis, but on the output axis it divides by the original weight's norm, which would not match what
+  DoRA trains. A plain LoRA resumed with `dora: true` starts its magnitude where the loaded weights leave it.
+- In a race: rows like `network_type=oft, oft_block_size=32` or `dora=true` next to a LoKr row train on the same
+  layers from the same start, and the probes pick. EMA, the sampling model, data parallel, `resume_from` and the
+  race's saved files all handle both.
+- Measured cost, Krea 2 nvfp4 at 0.25 MP on the 16 GB RTX 4060 Ti (12-step runs, steady step time; likeness not yet
+  compared on a full run):
+
+  | Adapter | Trainable weights | Step | Blocks kept from the recompute |
+  |---|---|---|---|
+  | LoKr 8 | 195 M | 3.5 s | 2 |
+  | OFT block 32 | 58 M | 2.6 s | 4 |
+  | LoKr 8 + DoRA | 197 M | 4.9 s | 1 |
+
+  DoRA's extra time is the norm from the full (dequantized) weight in every forward and its recompute; while
+  samples and probes render it is computed once per layer per round (a probe: 14-15 s, as LoKr's). ComfyUI's own
+  loader (a 2026-10-20 build) read every key of the three race files above and merged them without errors.
+
+## LoRA Isolation (`isolation`)
+
+A character LoRA spreads its subject onto other people: strangers in the background, a friend beside them, a crowd.
+`isolation: true` keeps the subject to its trigger, after Fizgig's LoRA Isolation. Fizgig measured it on Krea 2, two
+people in one LoRA, 50 split pictures of a carefully described stranger next to the subject, each face scored with
+ArcFace:
+
+| | Normal LoRA | LoRA Isolation |
+|---|---|---|
+| Strangers that read as the subject | 48 of 50 | 0 of 50 |
+| How much the subject looks like themselves | 0.77 | 0.78 |
+
+Unmeasured here. Its parts:
+
+1. **DOP** (Differential Output Preservation, from Ostris's AI-Toolkit). Every `dop_every` steps (2), each picture whose
+   caption names a subject also trains on a freshly noised copy, with the subject swapped for its class phrase,
+   held to what the model predicts there with the LoRA at 0, at `dop_weight` (2). Without the trigger the LoRA
+   learns to change nothing. The log shows the DOP loss.
+2. **Several subjects**, one per dataset, each with its own trigger (the Dataset rows' *Trigger*, or `trigger:` on a
+   `datasets` entry). Two faces learned side by side teach the LoRA that a face belongs to one trigger, not to the
+   class, so a second person helps; Fizgig recommends one even for a LoRA of one person. `isolation_balance` repeats
+   smaller subject datasets so each trains about as often as the largest.
+3. **The fused trigger.** `gwelt, a man` trains as `gweltman` (the caption files are never changed). The plain " man"
+   token is shared by every other man; joined to the trigger it becomes a different token, so the subject's look
+   does not attach to it. **Prompt with the joined word** (`gweltman at a cafe`); the sample and probe prompts are
+   rewritten for you, and the log names the word. The class comes from the dataset's *Is a* (`class:`), else from the
+   captions' "<trigger>, a [young] man". When the tokenizer splits the joined word so the class word is no longer
+   a whole token (`zk | re | ab | oy`), the log warns: a trigger ending in a consonant cluster joins better.
+4. **Side-by-side pairs.** Each person gets `isolation_pairs` (16) 1024 x 512 pictures: one of their photos, cropped
+   around the face, next to one of 32 generated strangers (8 ethnicities, men and women, 20s to 50s;
+   ShootTheSound/fizgig-multi-person-strangers, CC BY 4.0, pinned, downloaded once into `models/`), side at random,
+   captioned stranger first: `an Indian man in his 30s on the left, and gweltman on the right, two people side by
+   side, two close-up portraits`. The text encoders are causal, so words before the trigger stay clean of it. They
+   train at `isolation_pair_weight` (2) times the loss and are never flipped (left and right are in the caption).
+5. **What a subject is** (*Kind*, `kind:`). A person gets the fused trigger and the pairs. An animal or thing
+   (`rexodog`) gets the fused trigger only. A style keeps its trigger as written and drops it from the trigger-free
+   caption, so the look appears only when called.
+
+A single `dataset_dir` uses `trigger_word`, `isolation_class` and `isolation_kind`. A dataset without any trigger
+trains as it is, not as a subject. In a short Krea 2 test on a 16 GB card a step with a DOP pass took about twice as
+long as one without (an extra forward without gradients and one with); Fizgig reports about 1.5x over a run. Not with
+a fine-tune or a `race_parallel` race.
+
+## Full fine-tune, then extract a LoRA (`finetune`)
+
+A LoRA confines every update to a few directions, so concepts compete for them and pull pose, framing and lighting
+along with the likeness. `finetune: true` trains the target layers' own weights instead (after Fizgig's fine-tune).
+Fizgig measured on Krea 2: a LoRA *extracted* from a fine-tune beat one *trained* at the same rank on the same
+dataset, and rank 64 was indistinguishable from the full 26 GB checkpoint at about 0.5 GB. The full-rank phase does
+the work; extraction is one SVD per layer. Unmeasured here.
+
+**How it fits one card.** The model stays as it was loaded (its int8 / nvfp4 trunk, or bf16). The target layers (the
+same `lora_targets` / `lora_blocks` / `train_text_embedder` as a LoRA's) are grouped into *components*, one Linear
+name across every block (every block's attention query, say), and the components are packed into *windows* of what
+the card holds. One window at a time is swapped up to fp32 weights (gradients and optimizer state only for that
+window; the forward runs in bf16), trained for `finetune_rotate_epochs` epochs, and swapped back: its update is kept
+as a bf16 *delta* in RAM, at the delta's own precision, so a small update is never rounded away, and the trunk's
+layer is re-quantized from original + delta. A *cycle* of windows trains every component once. The original
+quantized weight of every trained layer stays in RAM too, so each delta is always against the exact base the model
+loaded with and the trunk never accumulates re-quantization error.
+
+- **Held near the original** (`finetune_anchor`, 0.01). After every step the trained weights move
+  lr x `finetune_anchor` of the way back toward the original model's: w -= lr x anchor x (w - original), decoupled like
+  AdamW's weight decay. This is the bounded drift of "Preserve and Personalize" (Kim et al., ICLR 2026), whose full
+  fine-tune of Stable Diffusion 1.5 held near its base this way scored above an unheld one in likeness (DINO 0.639 vs
+  0.603) and prompt-following (CLIP-T 0.298 vs 0.279). The optimizer's own `weight_decay` is off for a fine-tune: it
+  would shrink the model's weights themselves toward zero (it did before v1.9.0). The original weights of the window
+  that trains stay on the GPU in their own format (1 byte per weight for int8, 2 for bf16; the window plan counts 2).
+  0 turns it off.
+- **Windows.** Planned at launch from the free VRAM after the model loads, less an activation reserve
+  (`finetune_reserve_gb`, default 3 GB + 3 GB per megapixel), at 10 bytes per weight with adafactor (fp32 weight,
+  gradient, bf16 copy; 18 with adamw). A component larger than a window is cut into block ranges. `finetune_window_gb`
+  sets the window size by hand. The log lists the plan.
+- **Measured here.** MOSS-Image int8 on a 16 GB RTX 4060 Ti at 0.25 MP, every target, adafactor: 4.76 B weights in 10
+  windows (q, k, v, o whole; up-gate in 4 block ranges; down in 2), 13.1 GB peak, about 1.4 s per step. RAM: about
+  2 bytes per trained weight for the deltas plus the original quantized copy (MOSS: 10 + 5 GB; Krea 2: 24 + 12 GB).
+- **Saves** extract a LoRA per rank in `finetune_extract_ranks` (default `[64]`; a second rank gets `_r<rank>`), in
+  the family's usual LoRA format with alpha = rank, at cycle boundaries (`save_every` waits for the cycle to end, so
+  every saved file has each component trained alike; the best-likeness checkpoint extracts at once). Samples and
+  probes render the fine-tuned model itself, with the turbo LoRA as usual; `sample_model_path` is ignored.
+- **The deltas.** `finetune_save_delta: true` also writes `<job>_finetune.safetensors` (bf16, 2 bytes per weight: 9.5
+  GB for all of MOSS): the fine-tune's state. `finetune_resume: <that file>` continues from it, and
+  `python -m rulztrainer.extract_finetune <that file> --rank 32 64 128` extracts at other ranks without the model.
+- **Learning rate.** The weights themselves move, not an adapter: Fizgig measured 1e-5 on Krea 2 (1e-4 trains but
+  overcooks) and 3e-5 for larger-weight models. The WebUI's switch sets 1e-5 with adafactor and warns above 5e-5.
+  Runs are long: one cycle is one true epoch of the whole model.
+- **Not with** a race, data parallel (`model_split` is fine), torch.compile, the weight average, training states,
+  `resume_from` or the region prior; rank, alpha, the adapter kind, LoRA+ and dropout do not apply.
+
 ## Sampling with a different model
 
 `sample_model_path` (a `.safetensors` file, a diffusers folder or a repo id) plus `sample_model_quant` use another
@@ -784,13 +1339,34 @@ moved to system RAM for the duration (so RAM must hold both models; quantize the
 
 ## Turbo LoRA for samples
 
-`turbo_lora` + `turbo_lora_strength` attach a ComfyUI-format LoRA (for example an 8-step distill) that is applied
-only while generating sample images, never during training steps. Set `sample_steps` to match. `sample_lora` +
-`sample_lora_strength` stack a second sampling-only LoRA (for example a style LoRA) alongside the turbo one.
-LoRA layers (`lora_down/up`, `lora_A/B`) and `diff_b` bias offsets are applied; Krea 2 LoRAs may use ComfyUI's
-module names (`blocks.N.attn.wq`) or ours. LoKr / LoHa / full-diff entries cannot be applied while sampling and are
-named in a warning. With a turbo LoRA, Krea 2 samples on its distilled schedule (fixed shift, as ComfyUI does), and
-the log warns about guidance other than CFG 1.
+Samples and probes render with a turbo (step-distilled) LoRA by default: `turbo_lora: auto` downloads the model
+family's own and the sampling defaults are the ones it is made for. It is applied only while generating sample and
+probe images, never during training steps.
+
+| Family | Turbo LoRA | Steps | CFG | Shift |
+|---|---|---|---|---|
+| MOSS-Image | lodestones' `8-steps-dmd-lora` ([lodestones/Kromoss](https://huggingface.co/lodestones/Kromoss)), Fizgig's pick, distilled from Base | 12 | 1 | 5 |
+| Krea 2 | `krea2_turbo_lora_rank_64_bf16` ([Comfy-Org/Krea-2](https://huggingface.co/Comfy-Org/Krea-2)) | 8 | 1 | from the image size |
+| FIBO 2.0 | `fibo_2.0_turbo_lora_avg_rank_270_bf16` ([Comfy-Org/Fibo-2.0](https://huggingface.co/Comfy-Org/Fibo-2.0)): Edit Turbo as a LoRA on dev | 4 | 1 | from the image size |
+| Qwen-Image 2.1 | `qwen_image_2.1_turbo_lora_avg_rank_178_bf16` ([Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1)), extracted from Qwen-Image-2.1-Turbo | 8 | 1 | the Turbo checkpoint's own sigmas |
+
+MOSS-Image renders 12 steps rather than the card's 8 because Fizgig found 12 much better; Fizgig also found that
+its turbo LoRA can understate likeness, so judge a run's likeness on full-quality samples (`turbo_lora: ""`, 20 steps,
+CFG 3). The WebUI's *Turbo LoRA* choice (the model's own, none, or a file) moves the steps and CFG between the turbo
+and the full-quality defaults while they are still at a default. `turbo_lora` can also be a path to any
+ComfyUI-format LoRA with `turbo_lora_strength`. `sample_lora` + `sample_lora_strength` stack a second sampling-only
+LoRA (for example a style LoRA) alongside the turbo one.
+LoRA layers (`lora_down/up`, `lora_A/B`), `diff_b` bias offsets and `diff` offsets of normalization weights (swapped
+in only while sampling) are applied; Krea 2 LoRAs may use ComfyUI's module names (`blocks.N.attn.wq`) or ours, and a
+FIBO 2.0 LoRA in ComfyUI's fused layout (Comfy-Org's Turbo LoRA) is split back into the model's own, and so is a
+Qwen-Image 2.1 LoRA on ComfyUI's fused feed-forward (`img_mlp.gate_up`, Comfy-Org's Turbo LoRA). LoKr / LoHa /
+full-weight diffs of linear layers cannot be applied while sampling and are named in a warning. With a turbo LoRA,
+Krea 2 samples on its distilled schedule (fixed shift, as ComfyUI does), and the log warns about guidance other than
+CFG 1.
+
+**Sample size.** The WebUI picks the sample size as an aspect ratio (1:1, 4:5, 3:4, 2:3, 9:16 and the landscape ones)
+and an area in megapixels (0.25 to 4, 1 MP = 1024 x 1024); it is stored as `sample_width` / `sample_height`,
+multiples of 16 (2:3 at 1 MP: 832 x 1248).
 
 Krea 2's previews and probes decode in 512 px VAE tiles: the Qwen-Image VAE normalizes per pixel, so the tiles give
 the full decode to 0.06 of an 8-bit level (PSNR 68 dB), at +2.0 GB instead of +7.9 GB per megapixel. The Flux2 VAE of
@@ -816,6 +1392,43 @@ dataset to open it:
   sub-folders kept; files the dataset already has are left alone.
 - The grid shows every picture with its caption, saved to the `.txt` file as you type, and the *Face ref* / *Body ref*
   ticks; *Train on this dataset* ticks the dataset for training.
+
+**Look consistency filter** (after Fizgig's), in the opened dataset: finds the pictures whose face drifts from the
+look you want.
+- **Baselines.** Tick *Baseline* on a few pictures that nail the look; 3 is a good number, since one photo would bake
+  its own angle and light into every score.
+- **Scan.** Every picture's largest face is embedded with the face model the likeness probes use (InsightFace ArcFace)
+  and scored by its mean cosine similarity to the baselines' faces, worst first.
+  - 0.45 and up is a solid match.
+  - 0.30 to 0.45 is the same person, drifting.
+  - Under 0.30 is likely off-look or someone else.
+  - Pictures without a face get no score; judge those by eye.
+- **Auto-suggest** marks the pictures under the fence: the median minus 1.5 times the interquartile range of the scores,
+  never under 0.25, and only with at least 4 faces. Baselines and faceless pictures are never marked.
+- **Move marked out** moves the marked pictures and their captions into `excluded_by_look/` inside the dataset, keeping
+  sub-folders. That folder never trains and nothing is deleted. *Move all back* restores them.
+- The scan is saved with the dataset as `look_scores.json`. Each picture in the grid shows its look score.
+
+**Body outliers.** The *Body outliers* switch above the buttons runs the same filter on the body. It has its own
+baselines (tick pictures that show the body you want), scan, marks and file (`look_scores_body.json`). The score is the
+cosine similarity of the picture's body window (the trainer's body score: neck to mid-thigh, turned upright, the person
+cut out on grey, embedded with DINOv2) to the baselines' windows, so a different build, skin, hair or outfit shows, and
+so does an unusual pose or a rear view when the baselines are all front views. DINOv2 cosines sit high and close
+together, so there are no ArcFace-style 0.45 / 0.30 rules: the colours read off the scan's median and fence, and the fence
+has no floor. A picture without shoulders and hips in the frame, or with under 60% of its window inside it (a
+portrait), gets no score. It runs on the *Body score device* (Identity similarity) and downloads the pose model and DINOv2
+once, as the trainer does. On the 60 AZav50 photos, 22 had a usable window; with three front views as baselines the
+fence flagged a pose lying on sand and two rear views. *Warm up look outliers* eases in the outliers of both scans.
+
+On a real 60-photo set with three front-facing baselines, the scan took about a minute on the CPU. The median match was
+0.60 and the fence 0.36. It flagged an extreme close-up with the eyes cropped off and a small, distant face turned away:
+real shots, just unusual.
+
+**Warm up look outliers** (`look_warmup`, Train tab, Per-image loss watch section; off by default) is for such shots when
+you keep them. The pictures under the scan's fence start at a loss weight of `look_warmup_start` (0.4) and reach full
+weight after `look_warmup_epochs` (4) epochs of their dataset, while the identity forms from the typical pictures. It
+needs a scan of the dataset (Fizgig's `fizgig_look_scores.json` is read too), works without the loss watch, and a race
+configuration may switch it.
 
 **Several datasets per run.** On the Train tab (Dataset section) tick the datasets a run trains on. Each can train at
 its own resolutions (none picked: the run's *Training resolutions*) and has *Repeats*, how many times each of its
@@ -879,8 +1492,9 @@ detected from the model; `model_arch: auto`). The repo is gated: accept its term
   edited = pipe(prompt=vgl(scene), image=source, num_inference_steps=4, guidance_scale=1.0).images[0]
   ```
 
-- **Not yet:** edit-pair training (source + target + instruction), the `text_render` text images, single-file
-  (ComfyUI) checkpoints, and a separate turbo LoRA for previews (Bria ships none; use fewer steps instead).
+- **Not yet:** edit-pair training (source + target + instruction) and the `text_render` text images. Single files
+  and the turbo LoRA for previews come from Comfy-Org (see [Model sources](#model-sources-and-quantization) and
+  [Turbo LoRA for samples](#turbo-lora-for-samples)).
 
 **Loading the LoRA in diffusers.** `BriaFibo2Pipeline` has no `load_lora_weights`; load through the transformer as
 above. On a 16 GB card the bf16 transformer needs offloading (`pipe.enable_sequential_cpu_offload()`): load the LoRA
@@ -963,6 +1577,64 @@ an exported LoRA merged into diffusers' weights). With the real Raw weights in b
 bf16 rounding (cosine 0.99999 over a 512x512 prediction), and the compact prompt features are as close to the
 pipeline's (cosine 0.99989) as the pipeline is to itself at another padding length.
 
+## Qwen-Image 2.1
+
+RulzTrainer trains text-to-image LoRAs for [Qwen/Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1), Qwen's
+7B single-stream DiT (32 blocks, one modulation shared by every block, a Qwen3-VL-8B text encoder read at its last
+layer before the final norm, and its own RGBA VAE: 16x, 64 channels). Pick **Qwen-Image-2.1** as the model. Edit LoRAs
+(before / after pairs with reference images) are not supported yet.
+
+- **Files.** By default the model comes as Comfy-Org's single files
+  ([Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1), int8 ConvRot): the diffusion model
+  (7.3 GB), the Qwen3-VL-8B text encoder (9.4 GB, used to cache the captions and then unloaded) and the VAE, so one
+  16 GB card trains it. The diffusers repo (`model_source: hf`) works too; `transformer_quant: auto` makes a bf16
+  model int8 from 11 GB and keeps bf16 from 24 GB. A file name containing "turbo" marks Qwen-Image-2.1-Turbo.
+- **Training adapter** (`training_adapter: auto`, the default). [Fizgig](https://github.com/shootthesound/Fizgig)
+  measured that Qwen-Image 2.1 LoRAs trained alone collapse into texture or wobble part-way, with nothing in the loss
+  to warn you; trained with a frozen *training adapter* (a small LoRA that is on for every training step, off for
+  samples and probes, and never saved into your file) likeness reached 77 against 56 without. `auto` downloads
+  Fizgig's ([ShootTheSound/Fizgig-Qwen-Image-2.1-Training-Adapter](https://huggingface.co/ShootTheSound/Fizgig-Qwen-Image-2.1-Training-Adapter),
+  80 MB); `""` trains without one, a path uses another, `training_adapter_strength` scales it. The other families
+  have none of their own, and a path works on them too. Not used by a full fine-tune.
+- **Recipe** (Fizgig's, which the setup wizard suggests): 0.5 MP (it keeps more of the model's sharpness than 1 MP and
+  is quicker), rank 8 at learning rate 2e-4 (rank 16 at half the rate for big or mixed datasets; 1.5e-4 for styles),
+  EMA 0.98. Fizgig found identity sits in blocks 10-14 (`lora_blocks: 10-14` trains only those).
+- **Buckets** are multiples of 32 px (the model takes its image tokens in 2x2 groups); latents are cached under their
+  own names (`_qi21vae`), region maps are shared with the other models.
+- **Attention** is block-causal as in the reference: caption tokens see only the caption before them, image tokens see
+  everything, and the caption tokens are modulated at t = 0. RoPE positions are counted per sample, so a padded batch
+  predicts exactly what each sample predicts alone.
+- **Text features** follow `QwenImage21Pipeline`: the prompt in Qwen's system/user template, the last decoder layer's
+  output before the final RMSNorm (hooked out, as the pipeline does on transformers 5), the system turn dropped. The
+  int8 text encoder runs weight-only: W8A8 moved the features 5-8% against it at the same speed.
+- **Samples** render with Comfy-Org's Turbo LoRA (8 steps, CFG 1, the Turbo checkpoint's own sigmas). Without it they
+  follow the pipeline: the dynamic exponential shift (0.5 at 256 tokens to 0.9 at 8192) with the terminal stretch to
+  0.02, 25 steps (ComfyUI's template) at CFG 1: Qwen-Image 2.1 is meant to be sampled without guidance. Sample sizes
+  are rounded down to multiples of 32. Previews decode in 512 px VAE tiles: this VAE normalizes per pixel, so they give
+  the full decode to 0.3 of an 8-bit level (PSNR 54 dB) at +1.7 GB instead of +6.6 GB at 1 MP.
+- **LoRA targets**: the usual groups map onto `attn.to_q/k/v`, `attn.to_out.0`, `img_mlp.gate_layer/proj`
+  (ffn_up_gate) and `img_mlp.out` (ffn_down); `text_in` adds the text projection and `embed` the image / timestep
+  projections, the shared modulation and the final layer.
+- **Export** is the diffusers / PEFT format (`transformer.transformer_blocks.<n>.attn.to_q.lora_A.weight`). ComfyUI's
+  LoRA loader maps these keys, `img_mlp.gate_layer` / `img_mlp.proj` onto the two halves of its fused `gate_up`;
+  keep alpha equal to rank (the default) for loaders that ignore the metadata.
+- **Measured** on an RTX 5060 Ti (16 GB), int8, 0.5 MP, rank 8, identity preset: about 2.5 s per step with
+  torch.compile, 10 of 32 blocks keeping their activations at a 13.1 GB peak.
+- **Licence**: the Qwen Research License, non-commercial use unless Qwen grants more; a shared LoRA or fine-tune must
+  say "Built with Qwen" or "Improved using Qwen".
+
+```python
+from diffusers import QwenImage21Pipeline  # needs peft for load_lora_weights
+pipe = QwenImage21Pipeline.from_pretrained("Qwen/Qwen-Image-2.1-Turbo", torch_dtype=torch.bfloat16).to("cuda")
+pipe.load_lora_weights("output/<job>/<job>.safetensors")
+image = pipe("<trigger>, ...").images[0]
+```
+
+Verified against diffusers: `tests/test_qwen21.py` checks the port against `QwenImage21Transformer2DModel` (tiny random
+weights, a padded batch against each sample alone), ComfyUI's fused single-file layout, the schedules against
+`FlowMatchEulerDiscreteScheduler`, an exported LoRA merged into diffusers' weights, the Turbo LoRA's fused feed-forward
+split onto both halves, and the training adapter (on while training, off while sampling, not saved).
+
 ## Using the LoRA in ComfyUI
 
 Recent ComfyUI builds support MOSS-Image natively (`comfy/ldm/moss_image`, CLIP type `moss_image`), so no
@@ -979,6 +1651,16 @@ diffusion_model.layers.<n>.proj.<...>.alpha
 ```
 
 These names are identical in the diffusers checkpoint and the ComfyUI plugin model, so no key conversion is needed.
+
+### Scoring likeness in ComfyUI
+
+`comfyui/rulztrainer_likeness` is a ComfyUI node pack that scores any images against a person's references with the
+trainer's own scoring code and defaults: face, body and overall on the normalized scale, averaged over one image, a
+batch or folders of images, with every image's own scores and an optional .xlsx or CSV export. References can be
+shared or separate for face and body, as in the trainer. An optional set of base-model images sets the 0 of the scale
+like the trainer's step-0 probe, and a trainer job folder can supply that run's exact scale. Link the folder into
+ComfyUI's `custom_nodes` and load `workflows/RulzTrainer Likeness Scoring.json`; its
+[README](comfyui/rulztrainer_likeness/README.md) covers installation and every input.
 
 ## VRAM guidance (16 GB cards)
 
@@ -1025,6 +1707,33 @@ is set), where freed memory stays one piece; before every sample and probe round
 gradients and returns the cached memory. Measured on Linux: the probe after two training steps starts at 8.40 GB
 allocated / 8.52 GB reserved, the one before training at 8.28 / 8.29 GB. The Windows CUDA driver has no expandable
 segments; there only the cleanup applies.
+
+### Block swap (`block_swap`)
+
+For a card the model does not fit, after musubi-tuner's block swap. `block_swap: N` keeps the frozen weights of the
+first N DiT blocks in system RAM (pinned) and streams each block's weights to the GPU just before it runs: the int8 or
+nvfp4 data, scales, biases and norms. The next block is copied in on a side CUDA stream while the current one computes.
+Frozen weights never change, so nothing is copied back. The LoRA adapters, the rest of the model and the activations
+stay on the GPU.
+
+- **Why it needs gradient checkpointing.** In training it relies on checkpointing: a checkpointed block keeps no
+  weights for its backward, its recomputation streams them in again, and they go once that block's backward is done.
+  The swapped blocks are therefore never among the blocks that keep their activations.
+- **Two blocks at most.** At most two swapped blocks' weights are on the GPU at a time. The CPU waits rather than
+  queue copies far ahead of the GPU, and a recomputation that stops early still releases its block.
+- **Measured.** Krea 2 int8 on the 16 GB RTX 4060 Ti, 0.25 MP, 14 of 28 blocks swapped (3.4 GB in pinned RAM), every
+  block checkpointed:
+
+  | | Model on the GPU | Training-step peak | Step time |
+  |---|---|---|---|
+  | No swap | 9.17 GB | 10.81 GB | 2.2-2.8 s |
+  | `block_swap: 14` | 5.74 GB | 7.66 GB | 2.6 s |
+
+  The loss matches the unswapped run. The transfers mostly hide behind the blocks' compute on this PCIe link; a
+  slower link or a smaller per-block compute shows more of them.
+- **Limits.** Single GPU only (`model_split` spreads blocks over GPUs instead). Not with data parallel or a fine-tune.
+  torch.compile is turned off. A sampling model swapped in and out keeps the split. The *Block swap* field is on the
+  Train tab's memory section.
 
 ## torch.compile (`compile_model`)
 

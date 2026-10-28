@@ -51,8 +51,13 @@ export interface CatalogApp {
   tagline: string
   description: string
   category: string
-  /** GitHub "owner/name", or null while the app is not published. */
+  /** GitHub "owner/name" (the suite repository), or null while the app is not published. */
   repo: string | null
+  /** The app's folder in the repository, e.g. apps/RulzTrainer. */
+  path: string
+  /** Its release tags are this plus the version, e.g. image-organizer-v1.2.0. */
+  tagPrefix: string
+  /** The branch a source install clones: its folder split out to the branch root (app/<id>). Otherwise main. */
   branch: string
   install: InstallSpec
   launch: LaunchSpec

@@ -1,0 +1,5 @@
+insightface
+onnxruntime
+mediapipe
+transformers
+openpyxl

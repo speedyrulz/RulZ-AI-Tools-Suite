@@ -1,0 +1,26 @@
+appId: com.rulz.llmsuite
+productName: RulZ LLM Suite
+directories:
+  buildResources: build
+  output: dist
+files:
+  - out/**
+  - package.json
+  - '!**/*.map'
+extraResources:
+  - from: build/icon.ico
+    to: icon.ico
+win:
+  icon: build/icon.ico
+  target:
+    - target: nsis
+      arch: [x64]
+  artifactName: RulZ-LLM-Suite-Setup-${version}.${ext}
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  shortcutName: RulZ LLM Suite
+  uninstallDisplayName: RulZ LLM Suite
+npmRebuild: false

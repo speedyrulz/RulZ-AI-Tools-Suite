@@ -1,0 +1,30 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "webui",
+      "runtimeExecutable": "venv\\Scripts\\python.exe",
+      "runtimeArgs": ["webui.py", "--port", "7870"],
+      "port": 7870
+    },
+    {
+      "name": "webui-test",
+      "runtimeExecutable": "venv\\Scripts\\python.exe",
+      "runtimeArgs": ["webui.py", "--port", "7871"],
+      "port": 7871
+    },
+    {
+      "name": "webui-wsl-headless",
+      "runtimeExecutable": "wsl",
+      "runtimeArgs": ["-d", "Ubuntu-24.04", "--", "env", "-u", "DISPLAY", "-u", "WAYLAND_DISPLAY",
+                      "/tmp/rulz/venv/bin/python", "/tmp/rulz/webui.py", "--port", "7872", "--host", "0.0.0.0"],
+      "port": 7872
+    },
+    {
+      "name": "webui-tailscale",
+      "runtimeExecutable": "venv\\Scripts\\python.exe",
+      "runtimeArgs": ["webui.py", "--port", "7870", "--tailscale"],
+      "port": 7870
+    }
+  ]
+}

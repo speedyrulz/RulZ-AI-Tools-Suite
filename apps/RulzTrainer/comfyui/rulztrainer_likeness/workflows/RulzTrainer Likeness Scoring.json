@@ -1,0 +1,773 @@
+{
+  "id": "960db1f5-8922-4485-9c15-bf47eaf12095",
+  "revision": 0,
+  "last_node_id": 9,
+  "last_link_id": 7,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "Note",
+      "pos": [
+        20,
+        20
+      ],
+      "size": [
+        480,
+        420
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "How to use",
+      "properties": {},
+      "widgets_values": [
+        "RulzTrainer likeness scoring: the trainer's own face / body scores on any images.\n\nReferences (what the person looks like)\n- Connect a reference image (or a batch), or type image files / folders into reference_paths, one per line.\n- For separate face and body references use face_paths / body_paths (or the face_images / body_images inputs). They replace the shared references for that score.\n\nImages to score\n- Connect an image (or a batch), and/or type files / folders into image_paths on the Score node.\n\nScale (the trainer's defaults)\n- 0 = what a stranger scores, 100 = what a typical reference scores against the others (2+ references needed for a measured 100, else a default).\n- baseline_paths / baseline_images: images from the base model without the LoRA set the 0, like the trainer's step-0 probe.\n- trainer_run: a RulzTrainer job folder uses that run's exact scale.\n\nResults\n- Summary: the averages (overall, face, body). Details: every image.\n- Turn on export_spreadsheet on the Export node for an .xlsx (Summary, Images, References sheets) or CSV files in ComfyUI's output folder.\n\nPaths are as this ComfyUI sees them: a ComfyUI in WSL reads C:\\ai as /mnt/c/ai."
+      ],
+      "widgets_values_named": {
+        "text": "RulzTrainer likeness scoring: the trainer's own face / body scores on any images.\n\nReferences (what the person looks like)\n- Connect a reference image (or a batch), or type image files / folders into reference_paths, one per line.\n- For separate face and body references use face_paths / body_paths (or the face_images / body_images inputs). They replace the shared references for that score.\n\nImages to score\n- Connect an image (or a batch), and/or type files / folders into image_paths on the Score node.\n\nScale (the trainer's defaults)\n- 0 = what a stranger scores, 100 = what a typical reference scores against the others (2+ references needed for a measured 100, else a default).\n- baseline_paths / baseline_images: images from the base model without the LoRA set the 0, like the trainer's step-0 probe.\n- trainer_run: a RulzTrainer job folder uses that run's exact scale.\n\nResults\n- Summary: the averages (overall, face, body). Details: every image.\n- Turn on export_spreadsheet on the Export node for an .xlsx (Summary, Images, References sheets) or CSV files in ComfyUI's output folder.\n\nPaths are as this ComfyUI sees them: a ComfyUI in WSL reads C:\\ai as /mnt/c/ai."
+      },
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 2,
+      "type": "LoadImage",
+      "pos": [
+        20,
+        480
+      ],
+      "size": [
+        320,
+        380
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "image",
+          "name": "image",
+          "type": "COMBO",
+          "widget": {
+            "name": "image"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "choose file to upload",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "IMAGE",
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            1
+          ]
+        },
+        {
+          "localized_name": "MASK",
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "title": "Reference image",
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "example.png",
+        "image"
+      ],
+      "widgets_values_named": {
+        "image": "example.png",
+        "upload": "image"
+      }
+    },
+    {
+      "id": 3,
+      "type": "LoadImage",
+      "pos": [
+        20,
+        900
+      ],
+      "size": [
+        320,
+        380
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "image",
+          "name": "image",
+          "type": "COMBO",
+          "widget": {
+            "name": "image"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "choose file to upload",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "IMAGE",
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            2
+          ]
+        },
+        {
+          "localized_name": "MASK",
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "title": "Image to score",
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "example.png",
+        "image"
+      ],
+      "widgets_values_named": {
+        "image": "example.png",
+        "upload": "image"
+      }
+    },
+    {
+      "id": 4,
+      "type": "RZLikenessReferences",
+      "pos": [
+        540,
+        20
+      ],
+      "size": [
+        420,
+        520
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "reference_images",
+          "name": "reference_images",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": 1
+        },
+        {
+          "localized_name": "face_images",
+          "name": "face_images",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "body_images",
+          "name": "body_images",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "reference_paths",
+          "name": "reference_paths",
+          "type": "STRING",
+          "widget": {
+            "name": "reference_paths"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "face_paths",
+          "name": "face_paths",
+          "type": "STRING",
+          "widget": {
+            "name": "face_paths"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "body_paths",
+          "name": "body_paths",
+          "type": "STRING",
+          "widget": {
+            "name": "body_paths"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "body_score",
+          "name": "body_score",
+          "type": "COMBO",
+          "widget": {
+            "name": "body_score"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "body_backend",
+          "name": "body_backend",
+          "type": "COMBO",
+          "widget": {
+            "name": "body_backend"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "body_device",
+          "name": "body_device",
+          "type": "COMBO",
+          "widget": {
+            "name": "body_device"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "face_provider",
+          "name": "face_provider",
+          "type": "COMBO",
+          "widget": {
+            "name": "face_provider"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "face_det_size",
+          "name": "face_det_size",
+          "type": "INT",
+          "widget": {
+            "name": "face_det_size"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "sam3_model",
+          "name": "sam3_model",
+          "type": "STRING",
+          "widget": {
+            "name": "sam3_model"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "references",
+          "name": "references",
+          "type": "RZ_LIKENESS_REFS",
+          "links": [
+            3
+          ]
+        },
+        {
+          "localized_name": "info",
+          "name": "info",
+          "type": "STRING",
+          "links": [
+            4
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RZLikenessReferences"
+      },
+      "widgets_values": [
+        "",
+        "",
+        "",
+        "appearance",
+        "mediapipe+sam3",
+        "cuda:0",
+        "cpu",
+        640,
+        "facebook/sam3"
+      ],
+      "widgets_values_named": {
+        "reference_paths": "",
+        "face_paths": "",
+        "body_paths": "",
+        "body_score": "appearance",
+        "body_backend": "mediapipe+sam3",
+        "body_device": "cuda:0",
+        "face_provider": "cpu",
+        "face_det_size": 640,
+        "sam3_model": "facebook/sam3"
+      }
+    },
+    {
+      "id": 5,
+      "type": "RZLikenessScore",
+      "pos": [
+        540,
+        580
+      ],
+      "size": [
+        420,
+        560
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "references",
+          "name": "references",
+          "type": "RZ_LIKENESS_REFS",
+          "link": 3
+        },
+        {
+          "localized_name": "images",
+          "name": "images",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": 2
+        },
+        {
+          "localized_name": "baseline_images",
+          "name": "baseline_images",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "image_paths",
+          "name": "image_paths",
+          "type": "STRING",
+          "widget": {
+            "name": "image_paths"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "face_weight",
+          "name": "face_weight",
+          "type": "FLOAT",
+          "widget": {
+            "name": "face_weight"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "body_weight",
+          "name": "body_weight",
+          "type": "FLOAT",
+          "widget": {
+            "name": "body_weight"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "normalize",
+          "name": "normalize",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "normalize"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "baseline_paths",
+          "name": "baseline_paths",
+          "type": "STRING",
+          "widget": {
+            "name": "baseline_paths"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "trainer_run",
+          "name": "trainer_run",
+          "type": "STRING",
+          "widget": {
+            "name": "trainer_run"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "face_floor",
+          "name": "face_floor",
+          "type": "FLOAT",
+          "widget": {
+            "name": "face_floor"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "body_floor",
+          "name": "body_floor",
+          "type": "FLOAT",
+          "widget": {
+            "name": "body_floor"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "face_ceiling",
+          "name": "face_ceiling",
+          "type": "FLOAT",
+          "widget": {
+            "name": "face_ceiling"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "body_ceiling",
+          "name": "body_ceiling",
+          "type": "FLOAT",
+          "widget": {
+            "name": "body_ceiling"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "report",
+          "name": "report",
+          "type": "RZ_LIKENESS_REPORT",
+          "links": [
+            7
+          ]
+        },
+        {
+          "localized_name": "summary",
+          "name": "summary",
+          "type": "STRING",
+          "links": [
+            5
+          ]
+        },
+        {
+          "localized_name": "details",
+          "name": "details",
+          "type": "STRING",
+          "links": [
+            6
+          ]
+        },
+        {
+          "localized_name": "overall",
+          "name": "overall",
+          "type": "FLOAT",
+          "links": null
+        },
+        {
+          "localized_name": "face",
+          "name": "face",
+          "type": "FLOAT",
+          "links": null
+        },
+        {
+          "localized_name": "body",
+          "name": "body",
+          "type": "FLOAT",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RZLikenessScore"
+      },
+      "widgets_values": [
+        "",
+        0.7,
+        0.3,
+        true,
+        "",
+        "",
+        -1,
+        -1,
+        -1,
+        -1
+      ],
+      "widgets_values_named": {
+        "image_paths": "",
+        "face_weight": 0.7,
+        "body_weight": 0.3,
+        "normalize": true,
+        "baseline_paths": "",
+        "trainer_run": "",
+        "face_floor": -1,
+        "body_floor": -1,
+        "face_ceiling": -1,
+        "body_ceiling": -1
+      }
+    },
+    {
+      "id": 6,
+      "type": "RZLikenessExport",
+      "pos": [
+        1000,
+        980
+      ],
+      "size": [
+        380,
+        160
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "report",
+          "name": "report",
+          "type": "RZ_LIKENESS_REPORT",
+          "link": 7
+        },
+        {
+          "localized_name": "export_spreadsheet",
+          "name": "export_spreadsheet",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "export_spreadsheet"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "format",
+          "name": "format",
+          "type": "COMBO",
+          "widget": {
+            "name": "format"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "filename_prefix",
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "files",
+          "name": "files",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RZLikenessExport"
+      },
+      "widgets_values": [
+        false,
+        "xlsx",
+        "likeness/likeness"
+      ],
+      "widgets_values_named": {
+        "export_spreadsheet": false,
+        "format": "xlsx",
+        "filename_prefix": "likeness/likeness"
+      }
+    },
+    {
+      "id": 7,
+      "type": "PreviewAny",
+      "pos": [
+        1000,
+        20
+      ],
+      "size": [
+        440,
+        200
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "source",
+          "name": "source",
+          "type": "*",
+          "link": 4
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "STRING",
+          "name": "STRING",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "title": "Reference info",
+      "properties": {
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": [],
+      "widgets_values_named": {}
+    },
+    {
+      "id": 8,
+      "type": "PreviewAny",
+      "pos": [
+        1000,
+        260
+      ],
+      "size": [
+        440,
+        260
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "source",
+          "name": "source",
+          "type": "*",
+          "link": 5
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "STRING",
+          "name": "STRING",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "title": "Summary",
+      "properties": {
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": [],
+      "widgets_values_named": {}
+    },
+    {
+      "id": 9,
+      "type": "PreviewAny",
+      "pos": [
+        1000,
+        560
+      ],
+      "size": [
+        440,
+        380
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "source",
+          "name": "source",
+          "type": "*",
+          "link": 6
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "STRING",
+          "name": "STRING",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "title": "Each image",
+      "properties": {
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": [],
+      "widgets_values_named": {}
+    }
+  ],
+  "links": [
+    [
+      1,
+      2,
+      0,
+      4,
+      0,
+      "IMAGE"
+    ],
+    [
+      2,
+      3,
+      0,
+      5,
+      1,
+      "IMAGE"
+    ],
+    [
+      3,
+      4,
+      0,
+      5,
+      0,
+      "RZ_LIKENESS_REFS"
+    ],
+    [
+      4,
+      4,
+      1,
+      7,
+      0,
+      "STRING"
+    ],
+    [
+      5,
+      5,
+      1,
+      8,
+      0,
+      "STRING"
+    ],
+    [
+      6,
+      5,
+      2,
+      9,
+      0,
+      "STRING"
+    ],
+    [
+      7,
+      5,
+      0,
+      6,
+      0,
+      "RZ_LIKENESS_REPORT"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.75,
+      "offset": [
+        0,
+        0
+      ]
+    }
+  },
+  "version": 0.4
+}
