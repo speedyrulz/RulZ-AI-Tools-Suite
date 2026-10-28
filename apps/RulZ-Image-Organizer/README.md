@@ -6,7 +6,7 @@ You name people and fix any mistakes; your corrections are always kept.
 
 Everything runs on your PC. No photos or face data ever leave your computer.
 
-**[Download](https://github.com/speedyrulz/RulZ-Image-Organizer/releases/latest)** · **[Wiki: guides, FAQ and troubleshooting](https://github.com/speedyrulz/RulZ-Image-Organizer/wiki)**
+**[Download](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/releases)** · **[Wiki: guides, FAQ and troubleshooting](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/wiki/Image-Organizer)**
 
 | Dark (default) | Light |
 | --- | --- |

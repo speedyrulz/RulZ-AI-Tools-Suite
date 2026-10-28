@@ -17,7 +17,7 @@ on keyframes) or **re-encoded with NVIDIA NVENC** to MP4.
 ## Download
 
 Grab the latest `RulZ-Simple-Video-Clip-Extractor-v*-win64.zip` from the
-[Releases page](https://github.com/speedyrulz/rulz-simple-video-clip-extractor/releases/latest),
+[Releases page](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/releases),
 unzip it anywhere and run `RulZ Clip Extractor.exe`. No Python is needed, but
 ffmpeg and ffprobe must be on your PATH (see below).
 

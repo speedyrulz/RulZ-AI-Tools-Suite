@@ -3,7 +3,7 @@
 A Windows desktop app for running local LLMs, modelled on LM Studio's feature set. Models run in your own
 llama.cpp build (`llama-server.exe`), one process per loaded model, bound to `127.0.0.1`.
 
-**Documentation:** setup, guides and troubleshooting are in the [wiki](https://github.com/speedyrulz/rulz-llm-suite/wiki).
+**Documentation:** setup, guides and troubleshooting are in the [wiki](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/wiki/LLM-Suite).
 Discover/downloads, RAG and a CLI are planned.
 
 | Dark (default) | Light |

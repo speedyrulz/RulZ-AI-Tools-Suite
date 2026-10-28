@@ -17,10 +17,10 @@ set -eo pipefail
 NAME="${NAME:-RulzTrainer}"
 IMAGE="${IMAGE:-vastai/pytorch:cuda-12.8.1-auto}"
 DISK="${DISK:-120}"
-REPO="${REPO:-https://github.com/speedyrulz/RulzTrainer}"
-BRANCH="${BRANCH:-main}"
+REPO="${REPO:-https://github.com/speedyrulz/RulZ-AI-Tools-Suite}"
+BRANCH="${BRANCH:-app/rulz-trainer}"  # RulzTrainer on its own, split from the suite's apps/RulzTrainer
 MODEL_BUCKET="${MODEL_BUCKET:-}"  # e.g. speedyrulz/MOSS-Image-bucket: downloaded into models/bucket on first boot
-PROVISION_URL="${PROVISION_URL:-https://raw.githubusercontent.com/speedyrulz/RulzTrainer/${BRANCH}/scripts/vast/provision.sh}"
+PROVISION_URL="${PROVISION_URL:-https://raw.githubusercontent.com/speedyrulz/RulZ-AI-Tools-Suite/${BRANCH}/scripts/vast/provision.sh}"
 PORTAL="localhost:1111:11111:/:Instance Portal|localhost:7870:17870:/:RulzTrainer|localhost:8080:18080:/:Jupyter|localhost:8080:8080:/terminals/1:Jupyter Terminal"
 ENV_OPTS="-p 1111:1111 -p 7870:7870 -p 8080:8080 -p 22:22 -e OPEN_BUTTON_PORT=1111 -e PROVISIONING_SCRIPT=${PROVISION_URL} -e RULZ_REPO=${REPO}.git -e RULZ_BRANCH=${BRANCH} -e PORTAL_CONFIG='${PORTAL}'"
 [ -n "${MODEL_BUCKET}" ] && ENV_OPTS="${ENV_OPTS} -e RULZ_MODEL_BUCKET=${MODEL_BUCKET}"

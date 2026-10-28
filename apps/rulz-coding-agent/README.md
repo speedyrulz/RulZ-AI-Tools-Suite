@@ -5,7 +5,7 @@ drag-and-drop window") and a local AI model creates the files, installs what is 
 and fixes them, asking for your OK before risky steps.
 
 Everything runs on your computer. The model is served by
-[RulZ LLM Suite](https://github.com/speedyrulz/rulz-llm-suite); this app is the "hands" that edit files and run
+[RulZ LLM Suite](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/tree/main/apps/rulz-llm-suite); this app is the "hands" that edit files and run
 commands. No cloud services and no accounts.
 
 ## Screenshots
@@ -29,7 +29,7 @@ The light look is one click away: use the sun/moon button in the top bar (or **S
 1. In **RulZ LLM Suite**, open the **Developer** page and click **Start server**. If LM Studio is also running it
    uses port 1234, so give RulZ port **1235**. This app finds either.
 2. Install and start RulZ Coding Agent (the installer from the
-   [Releases](https://github.com/speedyrulz/rulz-coding-agent/releases) page, or `install.bat` then `run.bat`).
+   [Releases](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/releases) page, or `install.bat` then `run.bat`).
 3. The first-run wizard finds the server, lets you pick a model (Qwen3-Coder works best), explains approvals and
    creates your first project.
 4. Type what you want and press **Enter**.

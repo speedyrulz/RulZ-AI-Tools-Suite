@@ -144,7 +144,7 @@ or in the web editor (Templates -> Create) with these settings:
 | Launch mode | Jupyter + SSH, direct connections |
 | On-start script | `/opt/instance-tools/bin/entrypoint.sh` |
 | Ports | `1111`, `7870`, `8080`, `22` |
-| Environment variables | `PROVISIONING_SCRIPT=https://raw.githubusercontent.com/speedyrulz/RulzTrainer/main/scripts/vast/provision.sh`<br>`PORTAL_CONFIG=localhost:1111:11111:/:Instance Portal\|localhost:7870:17870:/:RulzTrainer\|localhost:8080:18080:/:Jupyter\|localhost:8080:8080:/terminals/1:Jupyter Terminal`<br>`OPEN_BUTTON_PORT=1111` |
+| Environment variables | `PROVISIONING_SCRIPT=https://raw.githubusercontent.com/speedyrulz/RulZ-AI-Tools-Suite/app/rulz-trainer/scripts/vast/provision.sh`<br>`PORTAL_CONFIG=localhost:1111:11111:/:Instance Portal\|localhost:7870:17870:/:RulzTrainer\|localhost:8080:18080:/:Jupyter\|localhost:8080:8080:/terminals/1:Jupyter Terminal`<br>`OPEN_BUTTON_PORT=1111` |
 | Disk space | 120 GB (the base model download is about 30 GB; datasets, caches and outputs come on top) |
 
 Put `HF_TOKEN` (needed for the gated MOSS-Image repos) into your **account** environment variables

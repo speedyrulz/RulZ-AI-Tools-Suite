@@ -22,6 +22,6 @@ Settings are stored per user in the Windows registry under
 HKEY_CURRENT_USER\Software\SimpleCut. Delete that key to reset everything.
 
 Full documentation, keyboard shortcuts and source code:
-https://github.com/speedyrulz/rulz-simple-video-clip-extractor
+https://github.com/speedyrulz/RulZ-AI-Tools-Suite/tree/main/apps/rulz-simple-video-clip-extractor
 
 Licenses: see LICENSE.txt, LOGO-NOTICE.md and THIRD-PARTY-NOTICES.txt.
