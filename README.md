@@ -635,6 +635,8 @@ Monitor chart and the sample captions:
   are (20% deviation on a ratio ~ 61%). Silhouette features are only used when the skeleton confirms a full-body
   view, and samples without a usable pose get no body score. Body references should be full-body, upright,
   fairly neutral poses, and the same goes for the sample prompts you want body-scored.
+- **Body** (`body_score: skeleton3d` or `smplx`): proportions measured so that the pose does not change them, against
+  the references' own spread (details under *Body score* below).
 - **Combined**: `face_weight` x face + `body_weight` x body (defaults 0.7 / 0.3; whichever is available).
 
 Model downloads (the InsightFace pack, the MediaPipe pose model and SAM 3) happen on first use with a progress
@@ -839,6 +841,42 @@ skin and hair count, and clothing too, so vary the outfits among the references.
 match of skeleton ratios (shoulder/hip width, leg/height, ...) against the references' median, plus SAM 3
 silhouette widths with `body_backend: mediapipe+sam3`; proportions in a photo shift with pose and camera angle, so
 this score can fall while the image gets closer.
+
+`skeleton3d` and `smplx` measure proportions so that a bent leg is still the same leg (`bodyshape.py`):
+
+- `skeleton3d`: bone-length ratios from MediaPipe's 3D landmarks (its own depth estimate): shoulder / hip width,
+  torso / leg, thigh / shin, upper arm / forearm, arm / torso, shoulder width / torso, head / shoulder width. The
+  person mask's widths at the shoulder, waist, hip and thigh (and waist / hip) count only where the person stands
+  upright, legs straight, facing the camera, head to feet in the frame: the one view where a width is a width.
+- `smplx`: NLF (Neural Localizer Fields, Sarandi & Pons-Moll, NeurIPS 2024) fits the SMPL-X body model to the
+  person; its 10 shape parameters rebuild the body in the model's T-pose (the model ships inside NLF's file), where
+  it is measured: shoulder width, leg, torso and arm length, and the bust, waist, hip and thigh girths (the
+  perimeter of the mesh's slice, as a tape measure takes it), all over the height, plus waist / hip. A picture
+  needs the shoulders, hips and knees in the frame. NLF's shape prior is eased (`beta_regularizer` 1, NLF's default
+  10 pulls every body toward the average). NLF's weights are for noncommercial research use and are not downloaded
+  for you: put `nlf_l_multi_0.3.2.patch6.torchscript` (550 MB,
+  [isarandi/nlf v0.3.2](https://github.com/isarandi/nlf/releases/tag/v0.3.2)) in `models/nlf/` or set `nlf_model`.
+  About 0.35 s a picture on an RTX 4060 Ti; it waits on the CPU between probes and runs on `body_device`.
+
+Both compare through a calibrated profile: per measurement the references' median and their own spread (a robust
+standard deviation, at least 3% of the median), so a measurement that varies a lot between the photos of the one
+person counts for little; the score is the mean of exp(-z^2 / 2) over the shared measurements, and the references'
+own level is each reference against the others. Clothing, skin and nudity do not count, unlike `appearance`.
+
+Measured on one woman's 19 photos (14 close-ups or selfies) and the 1,160 body probes of 32 MOSS-Image runs:
+
+| Body score | Photos measured | References' own level | Stranger (step 0) | Rise with training | Noise (one seed) |
+|---|---|---|---|---|---|
+| `proportions` (2D) | 18 | 64.0 | **82.2** | +3.1 | 3.0 |
+| `skeleton3d` | 18 | 55.5 | 58.7 | +6.1 | 3.8 |
+| `smplx` | 5 (down to the knees) | 68.5 | **31.6** | **+15.8** | 5.1 |
+
+The 2D ratios score a stranger above the person's own photos; the 3D bone ratios are steadier across her photos
+(3-9% against 15-50% in 2D) but adults' bone proportions differ less than that, so a stranger still lands at her
+level. SMPL-X separates them: her photos measure a fuller build than the base model's default woman (waist / height
+0.52 against 0.38, bust 0.64 against 0.53, waist / hip 0.82 against 0.68), training moved the probes toward it
+(the best run to 0.48, 0.61 and 0.76), and limb lengths matched everywhere (they carry no identity here). Five
+photos are a thin profile, most of them sitting or kneeling: a few standing full-length photos make it sturdier.
 
 **One scale for face and body** (`likeness_normalize`, on by default). Raw, the two scores are not comparable: the
 face score is an ArcFace cosine (a stranger scores ~10-25, your references against each other ~60-80), the proportion

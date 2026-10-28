@@ -329,8 +329,9 @@ class BodyScorer:
             im.thumbnail((1536, 1536))
         return im
 
-    def _detect(self, im):
-        """(pts [33,2] pixels, vis [33], person mask [H, W] bool | None) or None if no person found."""
+    def _detect(self, im, world: bool = False):
+        """(pts [33,2] pixels, vis [33], person mask [H, W] bool | None) or None if no person found; world=True adds
+        the pose model's 3D landmarks [33,3] (metres around the hips: the pose's own depth estimate)."""
         arr = np.asarray(im)
         h, w = arr.shape[:2]
         pad = (-w) % getattr(self, "pad_to", 1)  # mediapipe 1.0.x only (mask_width_multiple)
@@ -346,6 +347,10 @@ class BodyScorer:
         mask = None
         if getattr(res, "segmentation_masks", None):
             mask = np.squeeze(res.segmentation_masks[0].numpy_view())[:, :w] > 0.5
+        if world:
+            wl = res.pose_world_landmarks[0] if getattr(res, "pose_world_landmarks", None) else None
+            xyz = None if wl is None else np.array([[q.x, q.y, q.z] for q in wl], dtype=np.float32)
+            return pts, vis, mask, xyz
         return pts, vis, mask
 
     def landmarks(self, path: str | Path):

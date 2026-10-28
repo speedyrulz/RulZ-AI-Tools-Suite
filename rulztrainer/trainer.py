@@ -3450,6 +3450,15 @@ class Trainer(RaceParallelMixin):
             if cfg.body_score == "appearance":
                 scorer = bodysim.AppearanceScorer(cfg.models_dir, cfg.body_device,
                                                   progress=lambda t, f: self.status.update(stage=t))
+            elif cfg.body_score == "skeleton3d":
+                from .bodyshape import Skeleton3DScorer
+
+                scorer = Skeleton3DScorer(cfg.models_dir, progress=lambda t, f: self.status.update(stage=t))
+            elif cfg.body_score == "smplx":
+                from .bodyshape import SMPLXScorer
+
+                scorer = SMPLXScorer(cfg.nlf_model, cfg.models_dir, cfg.body_device,
+                                     progress=lambda t, f: self.status.update(stage=t))
             else:
                 sil = None
                 if cfg.body_backend == "mediapipe+sam3":
@@ -3461,13 +3470,17 @@ class Trainer(RaceParallelMixin):
                                     "accept the license on huggingface.co and run 'hf auth login'.", e)
                 scorer = bodysim.BodyScorer(cfg.models_dir, silhouette=sil,
                                             progress=lambda t, f: self.status.update(stage=t))
-            scorer.set_references(cfg.body_refs)
+            if hasattr(scorer, "hold"):  # SMPL-X: keep NLF on the GPU for the whole reference batch
+                with scorer.hold():
+                    scorer.set_references(cfg.body_refs)
+            else:
+                scorer.set_references(cfg.body_refs)
         except Exception as e:  # noqa: BLE001
             log.warning("Could not initialise body scoring (%s); disabled", e)
             return None
         if not scorer.ready:
             log.warning("No usable %s in any body reference image; body scoring disabled",
-                        "person" if cfg.body_score == "appearance" else "pose")
+                        {"appearance": "person", "smplx": "body down to the knees"}.get(cfg.body_score, "pose"))
             return None
         self.status.update(body_ref_similarity=scorer.ref_self_similarity, body_refs=scorer.ref_count)
         return scorer

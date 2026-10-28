@@ -124,6 +124,9 @@ def side_to_mp(side: int) -> float:
 DATASET_KEYS = ("path", "resolutions", "repeats")
 
 
+
+BODY_SCORES = ("appearance", "proportions", "skeleton3d", "smplx")
+
 @dataclass(frozen=True)
 class DatasetSpec:
     """One dataset of a run: its folder (sub-folders included), its own training resolutions in megapixels (empty:
@@ -318,7 +321,10 @@ class TrainConfig:
     face_det_size: int = 640
     body_refs: list[str] = field(default_factory=list)  # dataset images (full body, neutral pose) for proportions
     body_score: str = "appearance"  # appearance (DINOv2 of the person crop, best match against the references) |
-    #   proportions (skeleton ratios from body_backend, + SAM 3 silhouette widths with mediapipe+sam3)
+    #   proportions (2D skeleton ratios from body_backend, + SAM 3 silhouette widths with mediapipe+sam3) |
+    #   skeleton3d (3D bone ratios, + silhouette widths where upright and frontal; bodyshape.py) |
+    #   smplx (NLF's SMPL-X body shape measured in the T-pose; its model is downloaded by hand, see nlf_model)
+    nlf_model: str = ""  # body_score smplx: NLF's TorchScript file or its folder; empty = models/nlf/
     body_backend: str = "mediapipe+sam3"  # mediapipe+sam3 (SAM 3 person masks too) | mediapipe (skeleton only)
     sam3_model: str = "facebook/sam3"  # HF repo id or local transformers-format directory
     body_device: str = "cuda:0"  # where SAM 3 runs while scoring (moved back to CPU afterwards)
@@ -495,6 +501,8 @@ class TrainConfig:
         return list(self.lora_targets) or list(ARCH_DEFAULT_TARGETS[self.arch_name()])
 
     def validate(self) -> None:
+        if self.body_score not in BODY_SCORES:
+            raise ValueError(f"body_score must be one of {BODY_SCORES}, got {self.body_score!r}")
         if min(self.face_scale_span, self.face_scale_curve, self.body_scale_span, self.body_scale_curve) < 1.0:
             raise ValueError("face_scale_span / _curve and body_scale_span / _curve must be 1 or more (1 and 1 = the "
                              "plain linear scale)")

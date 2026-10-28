@@ -630,10 +630,38 @@ def face_preview(paths: list[str], provider: str, det_size: int) -> tuple[str, l
 
 
 def body_preview(paths: list[str], backend: str = "mediapipe", sam3_model: str = "facebook/sam3",
-                 device: str = "cuda:0", body_score: str = "appearance") -> str:
+                 device: str = "cuda:0", body_score: str = "appearance", nlf_model: str = "") -> str:
     ok, msg = bodysim.available()
     if not ok:
         return msg
+    if body_score in ("skeleton3d", "smplx"):
+        from rulztrainer import bodyshape
+
+        if body_score == "smplx":
+            if bodyshape.find_nlf(nlf_model, "models") is None:
+                return bodyshape.missing_nlf_message("models")
+            scorer = bodyshape.SMPLXScorer(nlf_model, "models", device, progress=set_progress)
+        else:
+            scorer = bodyshape.Skeleton3DScorer("models", progress=set_progress)
+        set_progress("Measuring bodies...", None)
+        paths = [str(p) for p in facesim.expand_refs(paths)]
+        if not paths:
+            return "No image files found in the listed paths (folders are expanded to the images inside)."
+        if hasattr(scorer, "hold"):
+            with scorer.hold():
+                scorer.set_references(paths)
+        else:
+            scorer.set_references(paths)
+        need = "the body down to the knees" if body_score == "smplx" else "a usable pose"
+        text = f"{scorer.ref_count} of {len(paths)} body references show {need} and are measured."
+        if scorer.profile:
+            text += " Profile (median +/- the photos' own spread): " + ", ".join(
+                f"{k} {v}" for k, v in scorer.profile.describe().items())
+        if scorer.ref_self_similarity is not None:
+            text += f". The references' own level {scorer.ref_self_similarity * 100:.1f}% (the normalized 100)."
+        else:
+            text += ". Add 3+ measurable photos to measure the references' own level."
+        return text
     if body_score == "appearance":
         scorer = bodysim.AppearanceScorer("models", device, progress=set_progress)
         set_progress("Finding people...", None)
@@ -1220,7 +1248,7 @@ class Form:
             body_refs=[p.strip() for p in (v("body_refs") or "").splitlines() if p.strip()],
             face_weight=float(v("face_weight")), body_weight=float(v("body_weight")),
             body_backend=v("body_backend"), sam3_model=(v("sam3_model") or "facebook/sam3").strip(),
-            body_score=v("body_score"),
+            body_score=v("body_score"), nlf_model=s("nlf_model"),
             body_device=v("body_device"),
             probe_every=int(v("probe_every")), probe_at_start=bool(v("probe_at_start")),
             probe_face_prompt=s("probe_face_prompt"), probe_body_prompt=s("probe_body_prompt"),
@@ -5896,8 +5924,8 @@ def build_page(local: bool = True):
                         hint("Pick reference images on the Dataset tab (\"Face ref\" / \"Body ref\") or list paths "
                              "here. After each sampling pass, every sample's largest face is compared to the "
                              "reference faces with InsightFace (ArcFace; 50%+ generally means the same person), and "
-                             "its body proportions (MediaPipe pose ratios) to the body references. Body references "
-                             "should show the whole body in a fairly neutral, upright pose.")
+                             "its body to the body references with the Body score below. Body references should "
+                             "include three-quarter or full-length shots.")
                         w["face_refs"] = ui.textarea("Face reference images or folders (one path per line)") \
                             .classes("w-full")
                         with fields():
@@ -5938,13 +5966,28 @@ def build_page(local: bool = True):
                                                      "three-quarter or full-length shots)").classes("w-full")
                         with fields():
                             w["body_score"] = ui.select({"appearance": "appearance (DINOv2)",
-                                                         "proportions": "proportions (skeleton)"},
-                                                        value=d.body_score, label="Body score").classes("w-52") \
+                                                         "proportions": "proportions (2D skeleton)",
+                                                         "skeleton3d": "proportions 3D (skeleton + silhouette)",
+                                                         "smplx": "SMPL-X body shape (NLF)"},
+                                                        value=d.body_score, label="Body score").classes("w-64") \
                                 .tooltip("appearance: a DINOv2 embedding of the body from the neck to mid-thigh, "
                                          "turned upright and cut out from the background, best match against the "
                                          "reference photos that show the same part of the body (build, skin, hair; "
-                                         "clothing too, so vary the outfits). proportions: skeleton ratios against "
-                                         "the references' median, which shift with pose and camera angle.")
+                                         "clothing and nudity too, so vary the outfits). proportions (2D): skeleton "
+                                         "ratios on the flat picture, which shift with pose and camera angle more "
+                                         "than people differ. proportions 3D: bone-length ratios from the pose "
+                                         "model's 3D landmarks (the same bent or straight), plus waist, hip and thigh "
+                                         "widths where the person stands upright facing the camera. SMPL-X: NLF fits "
+                                         "the SMPL-X body model and measures it in its T-pose (bust, waist, hip, "
+                                         "thigh, limb lengths over the height); needs photos down to the knees and "
+                                         "NLF's file, downloaded by hand (noncommercial license). The last three "
+                                         "ignore clothing and skin; each compares against the references' own spread.")
+                            w["nlf_model"] = ui.input("NLF model (file or folder; empty = models/nlf)",
+                                                      value=d.nlf_model).classes("w-72") \
+                                .tooltip("SMPL-X needs NLF (noncommercial research license, not downloaded for you): "
+                                         "nlf_l_multi_0.3.2.patch6.torchscript, 550 MB, from "
+                                         "github.com/isarandi/nlf/releases (v0.3.2), into models/nlf/") \
+                                .bind_visibility_from(w["body_score"], "value", lambda x: x == "smplx")
                             w["body_backend"] = ui.select(["mediapipe", "mediapipe+sam3"], value=d.body_backend,
                                                           label="Pose / mask backend").classes("w-48") \
                                 .tooltip("mediapipe: pose landmarks (the person box, skeleton ratios, region masks). "
@@ -5953,8 +5996,16 @@ def build_page(local: bool = True):
                                 .classes("w-64") \
                                 .bind_visibility_from(w["body_backend"], "value", lambda x: x == "mediapipe+sam3")
                             w["body_device"] = ui.select(["cuda:0", "cuda:1", "cpu"], value=d.body_device,
-                                                         label="SAM 3 device").classes("w-36") \
-                                .bind_visibility_from(w["body_backend"], "value", lambda x: x == "mediapipe+sam3")
+                                                         label="SAM 3 / NLF device").classes("w-36") \
+                                .tooltip("Where SAM 3 or NLF run while scoring (back on the CPU in between)")
+
+                            def body_device_visible(_=None):
+                                w["body_device"].set_visibility(w["body_backend"].value == "mediapipe+sam3"
+                                                                or w["body_score"].value == "smplx")
+
+                            w["body_backend"].on_value_change(body_device_visible)
+                            w["body_score"].on_value_change(body_device_visible)
+                            body_device_visible()
 
                             async def on_body_preview():
                                 paths = [p.strip() for p in (w["body_refs"].value or "").splitlines() if p.strip()]
@@ -5966,7 +6017,8 @@ def build_page(local: bool = True):
                                 try:
                                     body_info.text = await run.io_bound(body_preview, paths, w["body_backend"].value,
                                                                         w["sam3_model"].value, w["body_device"].value,
-                                                                        w["body_score"].value)
+                                                                        w["body_score"].value,
+                                                                        (w["nlf_model"].value or "").strip())
                                 except Exception as e:  # noqa: BLE001
                                     body_info.text = f"Error: {e}"
                                 finally:
@@ -7391,7 +7443,11 @@ embedding of the body from the neck to mid-thigh, turned upright, cut out from t
 (the face score covers that), best match against the reference photos that show the same part of the body
 (three-quarter or full-length shots; close-ups are left out). Build, skin, hair and clothing count, so vary the
 outfits among the references. `proportions` is the older skeleton-ratio match (every human ~80, the references
-~90-96), which shifts with pose and camera angle. With *Normalize face and body scores* (default on) each is first
+~90-96), which shifts with pose and camera angle. *proportions 3D* measures bone-length ratios in 3D (the same bent
+or straight) plus waist, hip and thigh widths where the person stands facing the camera; *SMPL-X body shape* fits
+the SMPL-X body model with NLF and measures it in its T-pose (bust, waist, hip and thigh girths, limb lengths, over
+the height). Neither counts clothing or skin. SMPL-X needs NLF's file, downloaded by hand (noncommercial license):
+nlf_l_multi_0.3.2.patch6.torchscript from github.com/isarandi/nlf/releases into models/nlf/. With *Normalize face and body scores* (default on) each is first
 mapped to 0 = a stranger's score (the step-0 probe, rendered with *Step-0 seeds* seeds, so keep *Probe at start*
 on) and 100 = what a typical reference scores against the others (the median of each one's best match; faces cut
 off by the frame left out), capped at 100: matching the references better than a typical one of them is no more
