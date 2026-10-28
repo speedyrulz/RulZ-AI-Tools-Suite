@@ -140,6 +140,32 @@ export const TOOL_DEFS = [
 
 export const TOOL_NAMES = new Set(TOOL_DEFS.map((t) => t.function.name))
 
+/**
+ * Offered only when tool servers are set up in RulZ LLM Suite: the model finds and loads their
+ * tools itself, so only the descriptions it needs take up context.
+ */
+export const EXTRA_TOOL_DEFS = [
+  tool(
+    'find_tools',
+    'Search the extra tools from the tool servers set up in RulZ LLM Suite (for example REA for reverse engineering) by keywords. ' +
+      'Returns matching tool names with one-line descriptions. Load the ones you need with load_tools before calling them.',
+    {
+      query: { type: 'string', description: 'Keywords for what you need, e.g. "decompile function" or "inspect electron app".' },
+      limit: { type: 'integer', description: 'Most results to return (default 10).' }
+    },
+    ['query']
+  ),
+  tool(
+    'load_tools',
+    'Load extra tools found with find_tools so you can call them from your next step. Load only what the current step needs: ' +
+      'each loaded tool takes up space, and the oldest ones are unloaded when there is too little room.',
+    { names: { type: 'array', items: { type: 'string' }, description: 'Tool names from find_tools, e.g. ["rea__open_binary"].' } },
+    ['names']
+  )
+]
+
+export const EXTRA_TOOL_NAMES = new Set(EXTRA_TOOL_DEFS.map((t) => t.function.name))
+
 const INTEGER_ARGS = new Set(['depth', 'start_line', 'end_line', 'timeout_seconds', 'wait_seconds'])
 
 /**
@@ -263,7 +289,17 @@ export function describeStep(name: string, args: Record<string, unknown>): strin
       return 'Looking at the page'
     case 'ask_user':
       return 'Asking you a question'
-    default:
-      return name
+    case 'find_tools':
+      return `Looking for tools: "${String(args.query ?? '').slice(0, 40)}"`
+    case 'load_tools':
+      return 'Getting tools ready'
+    default: {
+      // A tool from a tool server, e.g. "rea__procedure_pseudo_code" → "Using REA: procedure pseudo code".
+      const m = /^(.+?)__(.+)$/.exec(name)
+      return m ? `Using ${serverLabel(m[1])}: ${m[2].replace(/_/g, ' ')}` : name
+    }
   }
 }
+
+/** Short server names read better in capitals ("rea" → "REA"). */
+export const serverLabel = (server: string): string => (server.length <= 4 ? server.toUpperCase() : server)

@@ -56,6 +56,10 @@ The light look is one click away: use the sun/moon button in the top bar (or **S
 - **Memory** under the message box shows how full the model's context is ("23% of 100K"), using the exact token
   counts RulZ reports after each reply. When the model is loaded with 16K or less, the agent says once that bigger
   projects need a larger context length in RulZ.
+- **Extra tools**: tool servers you set up in RulZ LLM Suite (its MCP page, saved in its `mcp.json`), such as
+  [REA](https://www.npmjs.com/package/rea-agents) for reverse engineering, work here too with nothing to set up
+  twice. Settings lists them and can start them; otherwise they start the first time the agent needs one. Ask for
+  them by name ("use REA to study the app in C:\Apps\Viewer").
 - **Settings → Instructions for every project** adds your own instructions to the agent's system prompt in all
   projects. **Show my built-in instructions** displays the fixed part they're added to (it holds the tool and
   safety rules, so it can't be replaced).
@@ -81,12 +85,20 @@ scripts unchecked. Deleted files go to the Recycle Bin.
   the first request ("Loading the model…").
 - **Agent loop**: streams `/v1/chat/completions` with tools (`list_files`, `find_files`, `search_text`, `read_file`,
   `write_file`, `edit_file`, `delete_path`, `run_command`, `start_background_command`, `check_background_command`,
-  `stop_background_command`, `check_page`, `ask_user`) until the model answers without a tool call.
+  `stop_background_command`, `check_page`, `ask_user`, plus `find_tools` and `load_tools` when tool servers are set up)
+  until the model answers without a tool call.
 - **Checking pages**: `check_page` opens a local address (`localhost`) or an HTML file in the project in a hidden,
   sandboxed window with its own throwaway storage. It reports script errors, files that failed to load, and the text,
   buttons and fields the page shows, so the agent sees a broken or empty page that a server log wouldn't reveal.
   Internet addresses are refused, the page can't leave its own server or the project folder, and downloads,
   pop-ups and permission requests (camera, notifications, …) are blocked.
+- **Tool servers (MCP)**: read from `%APPDATA%\RulZ LLM Suite\mcp.json` (the same `mcpServers` format as Cursor and
+  LM Studio). REA alone has 207 tools, about 240K tokens of descriptions, so none are sent up front: when a server
+  is set up, the model gets `find_tools` (keyword search) and `load_tools`, and loaded tools are offered from the
+  next step. Loaded tools may use 15% of the context; the oldest are unloaded first. Approvals: a server's ordinary
+  tools ask once per task (with **Allow for this task**), tools the server marks as destructive (running or
+  instrumenting programs, installing to a phone, …) ask separately, and Hands-off skips the question only for
+  ordinary ones. The servers' own advice to the model is added to the system prompt.
 - **Qwen3-Coder fix**: its original chat template prints earlier tool arguments in Python form, which the model
   then copies and llama.cpp can't parse. When `/props` shows that template, earlier arguments are re-sent as JSON
   text (shared with RulZ LLM Suite).
@@ -129,6 +141,9 @@ Real-model check (needs RulZ LLM Suite serving a model; builds a to-do app, adds
 ```
 $env:RULZ_REAL = '1'; npx vitest run --config vitest.e2e.config.ts real-model
 ```
+
+Add `$env:RULZ_REAL_REA = '1'` to also run the REA check (needs REA set up in RulZ LLM Suite): the agent studies a
+small minified app with REA and rebuilds its features.
 
 Releases: pushing a tag such as `v0.1.0` builds the installer on GitHub Actions and attaches it to a GitHub Release.
 

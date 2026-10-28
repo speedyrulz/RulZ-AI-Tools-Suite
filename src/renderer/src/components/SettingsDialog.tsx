@@ -1,12 +1,66 @@
 import { ChevronDown, FolderOpen } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { MAX_INSTRUCTION_CHARS } from '@shared/defaults'
-import type { Theme } from '@shared/types'
-import { invoke } from '../lib/api'
+import type { Theme, ToolServersInfo } from '@shared/types'
+import { invoke, on } from '../lib/api'
 import { cn } from '../lib/format'
 import { activeModelId, useApp } from '../stores/app'
 import { ApprovalChooser, ModelSelect } from './common'
 import { Button, Dialog, Field, Input, NumberInput, Textarea } from './ui'
+
+/** The tool servers from RulZ LLM Suite's mcp.json, and whether they are running. */
+function ExtraTools() {
+  const [info, setInfo] = useState<ToolServersInfo | null>(null)
+  const [starting, setStarting] = useState(false)
+  useEffect(() => {
+    void invoke('tools:status').then(setInfo, () => undefined)
+    return on('tools:changed', setInfo)
+  }, [])
+  if (!info) return <p className="text-[13px] text-faint">Loading…</p>
+  if (info.error) return <p className="text-[13px] text-danger">{info.error}</p>
+  if (!info.configured.length) {
+    return (
+      <p className="text-[13px] text-muted">
+        None yet. Tool servers you set up on RulZ LLM Suite's MCP page (like REA) appear here, and I can use them in every project.
+      </p>
+    )
+  }
+  const word = (name: string): string => {
+    const s = info.servers.find((x) => x.name === name)
+    if (!s) return 'starts when I first need it'
+    if (s.state === 'starting') return 'starting…'
+    if (s.state === 'connected') return `running, ${s.tools} tools`
+    return `couldn't start: ${s.error ?? 'unknown problem'}`
+  }
+  const allRunning = info.configured.every((n) => info.servers.find((s) => s.name === n)?.state === 'connected')
+  return (
+    <div className="space-y-2">
+      <ul className="space-y-1 text-[13px]">
+        {info.configured.map((n) => (
+          <li key={n} data-testid="tool-server">
+            <b>{n}</b> <span className={cn('text-muted', info.servers.find((s) => s.name === n)?.state === 'error' && 'text-danger')}>— {word(n)}</span>
+          </li>
+        ))}
+      </ul>
+      {!allRunning && (
+        <Button
+          size="sm"
+          disabled={starting}
+          onClick={async () => {
+            setStarting(true)
+            try {
+              setInfo(await invoke('tools:start'))
+            } finally {
+              setStarting(false)
+            }
+          }}
+        >
+          {starting ? 'Starting…' : 'Start now'}
+        </Button>
+      )}
+    </div>
+  )
+}
 
 /** The fixed part of the system prompt, read-only, so the owner can see what their instructions add to. */
 function BuiltInPrompt() {
@@ -70,6 +124,10 @@ export function SettingsDialog() {
             Show my built-in instructions
           </button>
           {builtIn && <BuiltInPrompt />}
+        </Field>
+
+        <Field label="Extra tools" hint="Tool servers set up in RulZ LLM Suite, such as REA">
+          <ExtraTools />
         </Field>
 
         <Field label="Look">

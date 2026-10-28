@@ -204,6 +204,28 @@ export type AgentEvent =
   | { type: 'tasks'; projectPath: string; tasks: TaskRecord[] }
   | { type: 'context'; projectPath: string; context: ContextUsage }
 
+// ---------- Tool servers (set up in RulZ LLM Suite) ----------
+
+export interface ToolServerStatus {
+  name: string
+  state: 'starting' | 'connected' | 'error'
+  tools: number
+  error?: string
+  /** What the server printed (its stderr), for "Show details". */
+  log: string[]
+}
+
+export interface ToolServersInfo {
+  /** RulZ LLM Suite's mcp.json. */
+  configPath: string
+  /** Problem reading it, if any. */
+  error: string | null
+  /** Servers set up there (not switched off). */
+  configured: string[]
+  /** Servers started so far (they start the first time the agent needs a tool). */
+  servers: ToolServerStatus[]
+}
+
 // ---------- Run my app ----------
 
 export interface RunState {

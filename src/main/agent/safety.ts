@@ -122,11 +122,21 @@ export function classifyCommand(command: string, root: string): CommandVerdict {
   return { verdict: 'ok' }
 }
 
-export type ActionKind = { type: 'read' } | { type: 'write' } | { type: 'delete' } | { type: 'command'; risk?: RiskKind }
+export type ActionKind =
+  | { type: 'read' }
+  | { type: 'write' }
+  | { type: 'delete' }
+  | { type: 'command'; risk?: RiskKind }
+  /** A tool from a tool server; `destructive` when the server says it may change things or run programs. */
+  | { type: 'tool'; server: string; tool: string; destructive: boolean }
 
-/** The "Allow for this task" key an action falls under. */
+/**
+ * The "Allow for this task" key an action falls under. A server's ordinary tools share one key, so
+ * one OK covers a whole analysis; each destructive tool has its own.
+ */
 export function approvalKey(action: ActionKind): string {
   if (action.type === 'command') return action.risk ? `risk:${action.risk}` : 'commands'
+  if (action.type === 'tool') return action.destructive ? `tool:${action.server}:${action.tool}` : `tool:${action.server}`
   return action.type === 'delete' ? 'delete' : 'files'
 }
 
@@ -141,5 +151,7 @@ export function needsApproval(level: ApprovalLevel, action: ActionKind, allowedF
       return level === 'careful'
     case 'command':
       return action.risk !== undefined || level !== 'handsoff'
+    case 'tool':
+      return action.destructive || level !== 'handsoff'
   }
 }

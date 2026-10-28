@@ -9,7 +9,8 @@ import type {
   ProjectState,
   PromptAnswer,
   RunEvent,
-  RunState
+  RunState,
+  ToolServersInfo
 } from './types'
 
 export interface AppInfo {
@@ -26,6 +27,10 @@ export interface IpcInvoke {
   'settings:update': (patch: Partial<AppSettings>) => AppSettings
   /** The fixed part of the agent's system prompt (shown read-only in Settings). */
   'settings:builtInPrompt': () => string
+  /** Tool servers set up in RulZ LLM Suite, and those running. */
+  'tools:status': () => ToolServersInfo
+  /** Starts the tool servers now (they otherwise start when the agent first needs one). */
+  'tools:start': () => ToolServersInfo
   'dialog:pickFolder': (opts: { title?: string; defaultPath?: string }) => string | null
   'shell:showItem': (path: string) => void
   'shell:openUrl': (url: string) => void
@@ -70,6 +75,7 @@ export interface IpcEvents {
   'model:activity': ModelActivity
   'agent:event': AgentEvent
   'run:event': RunEvent
+  'tools:changed': ToolServersInfo
 }
 
 export type InvokeChannel = keyof IpcInvoke

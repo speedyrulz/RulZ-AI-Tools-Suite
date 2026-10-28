@@ -1,5 +1,24 @@
 # Real-model check, 2026-10-27
 
+## REA from RulZ LLM Suite
+
+Run with `$env:RULZ_REAL_REA = '1'` and `-t "REA"`, using REA as set up in RulZ LLM Suite's `mcp.json`
+(`npx -y rea-agents@6.7.0 mcp`). RulZ had Qwen3.8-27B-Fable-5-Coding-Distilled (Q4_K_M) loaded for this run. Every approval
+was answered **Allow**.
+
+The task: "Use REA to study the app in …\Unit Converter (to study) and find out exactly what it does … Then build the same
+app with the same features as a web page in this project." The app lives outside the project and only has minified code
+(km ↔ miles, °C ↔ °F, rounding to 2 places, an error message, and a "Last 5 conversions" list).
+
+| What happened | Result |
+| --- | --- |
+| Finding the tools | `find_tools "inspect app decompile read files"`, then `load_tools`. REA started on demand. |
+| Using REA | `rea__analyze_javascript_application`: the first call gave a single file and REA asked for a folder; the second call, on the folder, worked. |
+| Getting the exact formulas | The model also read the two source files with PowerShell (asked first, since they are outside the project). |
+| Its findings | All four formulas, rounding to 2 places, the result wording, "Please enter a number" for bad input, and the 5-entry history (newest first): all correct. |
+| The rebuild | Done in 528 s. `index.html` + `app.js` with every feature; checked with `check_page` and a temporary test page (removed afterwards). The test found the miles factor, the Fahrenheit formula, the rounding and the 5-entry history in the code. |
+| Afterwards | REA was shut down when the app closed (no processes left over). |
+
 ## Notes, instructions, Memory meter and "Share my app"
 
 Same model and server (Qwen3-Coder at 100K context), run with `-t "Share my app"`; every approval was answered **Allow**.

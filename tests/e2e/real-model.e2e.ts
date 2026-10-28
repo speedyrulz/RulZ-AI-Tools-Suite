@@ -337,6 +337,56 @@ describe.runIf(process.env.RULZ_REAL === '1')('real model', () => {
   }, 3 * 60 * 60_000)
 })
 
+describe.runIf(process.env.RULZ_REAL === '1' && process.env.RULZ_REAL_REA === '1')('real model with REA', () => {
+  it('uses REA from RulZ LLM Suite to study an app, then rebuilds its features', async () => {
+    log('\n# REA from RulZ LLM Suite\n')
+    // The app to study lives outside the project and only has minified code.
+    const target = join(base, 'Unit Converter (to study)')
+    mkdirSync(target, { recursive: true })
+    writeFileSync(
+      join(target, 'index.html'),
+      '<!doctype html><html><head><meta charset="utf-8"><title>Unit Converter</title></head><body><div id="app"></div><script src="app.min.js"></script></body></html>\n'
+    )
+    writeFileSync(
+      join(target, 'app.min.js'),
+      '(()=>{const u={km:{mi:v=>v*.621371},mi:{km:v=>v/.621371},c:{f:v=>v*9/5+32},f:{c:v=>(v-32)*5/9}},n={km:"Kilometres",mi:"Miles",c:"Celsius",f:"Fahrenheit"},' +
+        'h=[],a=document.getElementById("app");a.innerHTML=\'<h1>Unit Converter</h1><input id="v" type="number" value="1"><select id="p">' +
+        '<option value="km:mi">Kilometres to Miles</option><option value="mi:km">Miles to Kilometres</option><option value="c:f">Celsius to Fahrenheit</option>' +
+        '<option value="f:c">Fahrenheit to Celsius</option></select><button id="go">Convert</button><p id="r"></p><h2>Last 5 conversions</h2><ol id="l"></ol>\';' +
+        'const r=document.getElementById("r"),l=document.getElementById("l");document.getElementById("go").onclick=()=>{const v=parseFloat(document.getElementById("v").value);' +
+        'if(isNaN(v)){r.textContent="Please enter a number";return}const[f,t]=document.getElementById("p").value.split(":"),o=Math.round(u[f][t](v)*100)/100,' +
+        's=`${v} ${n[f]} = ${o} ${n[t]}`;r.textContent=s;h.unshift(s);h.length>5&&h.pop();l.innerHTML=h.map(x=>`<li>${x}</li>`).join("")}})();\n'
+    )
+    await newProject('Converter Rebuild')
+    const task = await runTask(
+      `Use REA to study the app in "${target}" and find out exactly what it does: every feature, the conversions and their formulas, ` +
+        'and the rules (like rounding and the history). Then build the same app with the same features as a web page in this project.',
+      'REA 1 (study an app, then rebuild it)'
+    )
+    const reaSteps = task.steps.filter((s) => s.tool.startsWith('rea__'))
+    const okRea = reaSteps.filter((s) => s.status === 'done')
+    log(`\nREA steps: ${reaSteps.length} (${okRea.length} worked): ${[...new Set(reaSteps.map((s) => s.tool))].join(', ') || 'none'}`)
+    const html = ['index.html', 'script.js', 'app.js', 'main.js']
+      .map((f) => join(projectPath, f))
+      .filter((f) => existsSync(f))
+      .map((f) => readFileSync(f, 'utf8'))
+      .join('\n')
+    const found = {
+      milesFactor: /0\.621371|1\.609/.test(html),
+      fahrenheit: /9\s*\/\s*5|1\.8/.test(html) && /32/.test(html),
+      lastFive: /\b5\b/.test(html) && /histor|last/i.test(html),
+      rounding: /Math\.round|toFixed\(2\)/.test(html)
+    }
+    log(`Rebuilt features found in the code: ${JSON.stringify(found)}`)
+    await shot('11-rea')
+    log(`\nFinished ${new Date().toISOString()}`)
+
+    expect(task.outcome).toBe('done')
+    expect(okRea.length).toBeGreaterThan(0)
+    expect(found).toEqual({ milesFactor: true, fahrenheit: true, lastFive: true, rounding: true })
+  }, 3 * 60 * 60_000)
+})
+
 /** The file the last "Your app is packaged" notice points at, if any. */
 async function sharedFile(): Promise<string | null> {
   const notice = [...(await state()).timeline].reverse().find((i) => i.kind === 'notice' && i.reveal)

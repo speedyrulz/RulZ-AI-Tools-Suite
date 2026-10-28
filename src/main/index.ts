@@ -2,7 +2,8 @@ import { promises as fs } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
 import { app, BrowserWindow, dialog, nativeTheme, shell } from 'electron'
 import { CANDIDATE_URLS } from '@shared/defaults'
-import type { ConnectionInfo, ModelActivity, ProjectInfo, ProjectState, Theme } from '@shared/types'
+import type { ConnectionInfo, ModelActivity, ProjectInfo, ProjectState, Theme, ToolServersInfo } from '@shared/types'
+import { ToolServers } from './mcp/toolServers'
 import { FIX_RUN_SHOWN, fixRunTask, SHARE_SHOWN, SHARE_TASK, systemPrompt } from './agent/prompt'
 import { ProjectSession } from './agent/session'
 import { broadcast, handle } from './ipc'
@@ -139,6 +140,16 @@ async function main(): Promise<void> {
   }
   setInterval(() => void refreshModels(), 5000)
 
+  // ---- Tool servers (set up in RulZ LLM Suite) ----
+  const toolServers = new ToolServers(
+    process.env.RULZ_AGENT_MCP_CONFIG ? resolve(process.env.RULZ_AGENT_MCP_CONFIG) : join(app.getPath('appData'), 'RulZ LLM Suite', 'mcp.json'),
+    () => void toolsInfo().then((info) => broadcast('tools:changed', info))
+  )
+  const toolsInfo = async (): Promise<ToolServersInfo> => {
+    const configured = await toolServers.configured()
+    return { ...toolServers.status(), configured }
+  }
+
   // ---- Projects ----
   const trash = (abs: string): Promise<void> => shell.trashItem(abs)
   let session: ProjectSession | null = null
@@ -190,7 +201,8 @@ async function main(): Promise<void> {
       refreshModels: () => void refreshModels(),
       snapshotter,
       trash,
-      checkPage: checkPageInWindow
+      checkPage: checkPageInWindow,
+      toolServers
     })
     runner = new AppRunner(abs, (e) => broadcast('run:event', e), async (file) => {
       const err = await shell.openPath(file)
@@ -207,6 +219,11 @@ async function main(): Promise<void> {
   handle('settings:builtInPrompt', () =>
     systemPrompt({ projectPath: 'C:\\…\\your project', projectName: 'your project', date: new Date().toDateString() })
   )
+  handle('tools:status', () => toolsInfo())
+  handle('tools:start', async () => {
+    await toolServers.start()
+    return toolsInfo()
+  })
   handle('settings:update', async (patch) => {
     const before = settings.get()
     const next = await settings.update(patch)
@@ -300,6 +317,7 @@ async function main(): Promise<void> {
     session?.stop()
     void session?.background.stopAll()
     if (session) void store.save(session.data)
+    void toolServers.dispose()
   })
 }
 

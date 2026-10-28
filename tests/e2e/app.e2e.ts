@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { _electron as electron, type ElectronApplication, type Page } from 'playwright-core'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { fakeToolConfig } from '../helpers/fakeTools'
 import { startMockRulz, type MockTurn } from '../helpers/mockRulz'
 
 const appRoot = resolve(__dirname, '../..')
@@ -58,7 +59,13 @@ beforeAll(async () => {
   app = await electron.launch({
     executablePath: electronPath,
     args: [appRoot],
-    env: { ...process.env, RULZ_AGENT_USER_DATA: userData, RULZ_AGENT_CANDIDATES: mock.url, ELECTRON_RENDERER_URL: '' }
+    env: {
+      ...process.env,
+      RULZ_AGENT_USER_DATA: userData,
+      RULZ_AGENT_CANDIDATES: mock.url,
+      RULZ_AGENT_MCP_CONFIG: fakeToolConfig(base),
+      ELECTRON_RENDERER_URL: ''
+    }
   })
   page = await app.firstWindow()
 })
@@ -185,6 +192,11 @@ describe('RulZ Coding Agent', () => {
     await instructions.fill('Explain things briefly.')
     await page.getByText('Show my built-in instructions').click() // also saves the box (it saves when you leave it)
     await page.getByText(/You are RulZ Coding Agent/).waitFor()
+    // Tool servers from RulZ LLM Suite's mcp.json (here the fake one) start on demand.
+    const server = page.getByTestId('tool-server')
+    await expect.poll(() => server.innerText()).toMatch(/fake — starts when I first need it/)
+    await page.getByRole('button', { name: 'Start now' }).click()
+    await expect.poll(() => server.innerText(), { timeout: 20_000 }).toMatch(/fake — running, 3 tools/)
     await page.screenshot({ path: join(shots, '6-settings.png') })
     await page.keyboard.press('Escape')
 

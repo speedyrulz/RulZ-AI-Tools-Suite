@@ -45,9 +45,12 @@ import { formatPageReport, pageHasProblems, pageTarget, type PageReport, type Pa
 import { resolveInProject } from './pathGuard'
 import { HOW_TO_RUN_TASK, parseRunLine, parseShareLine, systemPrompt } from './prompt'
 import { approvalKey, classifyCommand, needsApproval, type ActionKind } from './safety'
-import { describeStep, parseToolArgs, TOOL_DEFS, TOOL_NAMES } from './tools'
+import { describeStep, EXTRA_TOOL_DEFS, EXTRA_TOOL_NAMES, parseToolArgs, serverLabel, TOOL_DEFS, TOOL_NAMES } from './tools'
+import { toolSummary } from '../mcp/config'
+import type { ToolInfo, ToolServers } from '../mcp/toolServers'
 
-const TOOLS_TOKENS = estimateTokens(JSON.stringify(TOOL_DEFS))
+/** Loaded tool-server tools may use at most this share of the context; the oldest are unloaded first. */
+const LOADED_TOOLS_SHARE = 0.15
 const DEFAULT_CTX = 32768
 const MAX_STEP_OUTPUT_LIVE = 40_000
 const MAX_DIFF_BYTES = 400 * 1024
@@ -67,6 +70,8 @@ export interface SessionDeps {
   trash: (abs: string) => Promise<void>
   /** Opens a page in a hidden window (check_page); missing where there is no Electron. */
   checkPage?: (target: PageTarget, waitMs: number, signal: AbortSignal) => Promise<PageReport>
+  /** Tool servers set up in RulZ LLM Suite (such as REA). */
+  toolServers?: Pick<ToolServers, 'configured' | 'start' | 'status' | 'find' | 'search' | 'instructions' | 'call'>
 }
 
 /** Ends the task without counting as an error (owner chose Stop in a prompt, or pressed Stop). */
@@ -82,6 +87,8 @@ function cleanContent(text: string): string {
 }
 
 function stepDetail(name: string, args: Record<string, unknown>): string | undefined {
+  // Tool-server tools: the full name and arguments.
+  if (name.includes('__')) return `${name} ${JSON.stringify(args)}`.slice(0, 400)
   if (typeof args.command === 'string') return args.command
   if (typeof args.page === 'string') return args.page
   if (typeof args.path === 'string') return args.path
@@ -104,6 +111,11 @@ export class ProjectSession {
   /** Real tokens per estimated token, learnt from the server's counts (see tokenScale). */
   private scale = 1
   private warnedSmallContext = false
+  /** Tool servers set up in RulZ LLM Suite, read at the start of each task. */
+  private extraServers: string[] = []
+  /** Tool-server tools the model has loaded, oldest first. */
+  private loaded = new Map<string, ToolInfo>()
+  private nCtx = DEFAULT_CTX
 
   constructor(
     public data: ProjectData,
@@ -299,6 +311,8 @@ export class ProjectSession {
 
       const model = this.resolveModel()
       const nCtx = await this.prepareModel(model, signal)
+      this.nCtx = nCtx
+      this.extraServers = (await this.deps.toolServers?.configured().catch(() => [])) ?? []
 
       const notes = this.data.notes.splice(0)
       const body = howToRun ? HOW_TO_RUN_TASK : text
@@ -524,9 +538,12 @@ export class ProjectSession {
         summary: this.data.summary,
         memory: this.data.memory,
         instructions: this.deps.settings().instructions,
-        background: this.background.running()
+        background: this.background.running(),
+        extraTools: this.extraServers.length
+          ? { servers: this.extraServers.map(serverLabel), advice: this.deps.toolServers?.instructions().map((i) => ({ ...i, server: serverLabel(i.server) })) ?? [] }
+          : undefined
       })
-      const fit = fitMessages(this.data.messages, budget, estimateTokens(system) + TOOLS_TOKENS)
+      const fit = fitMessages(this.data.messages, budget, estimateTokens(system) + estimateTokens(JSON.stringify(this.toolDefs())))
       const range = fit.fits || attempt >= 3 ? null : summaryRange(this.data.messages, this.taskStart)
       if (!range) return [{ role: 'system' as const, content: system }, ...fit.messages]
       await this.summarise(model, range, budget, signal)
@@ -563,10 +580,11 @@ export class ProjectSession {
     this.setStatus({ phase: 'thinking', text: 'Thinking…' })
     this.deps.activity('working')
     let item: Extract<TimelineItem, { kind: 'assistant' }> | null = null
-    const estimated = totalTokens(messages) + TOOLS_TOKENS
+    const tools = this.toolDefs()
+    const estimated = totalTokens(messages) + estimateTokens(JSON.stringify(tools))
     const maxTokens = Math.max(1024, Math.min(16384, nCtx - Math.ceil(estimated * this.scale) - 256))
     const sampling = isQwenCoder(model) ? { temperature: 0.7, top_p: 0.8, top_k: 20, repeat_penalty: 1.05 } : {}
-    const result = await this.deps.client.streamTurn({ model, messages, tools: TOOL_DEFS, max_tokens: maxTokens, ...sampling }, signal, {
+    const result = await this.deps.client.streamTurn({ model, messages, tools, max_tokens: maxTokens, ...sampling }, signal, {
       onProgress: (done, total) => {
         if (total > 4000) this.setStatus({ phase: 'thinking', text: `Reading the project notes… ${Math.round((done / total) * 100)}%` })
       },
@@ -612,6 +630,53 @@ export class ProjectSession {
 
   // ---------- running tools ----------
 
+  /** The tools offered in this request: the built-in ones, plus find/load and loaded tool-server tools when there are tool servers. */
+  private toolDefs(): unknown[] {
+    if (!this.extraServers.length) return TOOL_DEFS
+    const loaded = [...this.loaded.values()].map((t) => ({
+      type: 'function' as const,
+      function: { name: t.qualifiedName, description: t.description ?? `${t.name} (from ${t.server})`, parameters: t.inputSchema }
+    }))
+    return [...TOOL_DEFS, ...EXTRA_TOOL_DEFS, ...loaded]
+  }
+
+  /** A tool-server tool by name, starting the servers first if needed (the model may call one it remembers). */
+  private async extraTool(name: string): Promise<ToolInfo | undefined> {
+    const servers = this.deps.toolServers
+    if (!servers || !this.extraServers.length || !name.includes('__')) return undefined
+    const found = servers.find(name)
+    if (found) return found
+    await this.startToolServers()
+    return servers.find(name)
+  }
+
+  private async startToolServers(): Promise<void> {
+    const servers = this.deps.toolServers!
+    const waiting = this.extraServers.filter((n) => servers.status().servers.find((s) => s.name === n)?.state !== 'connected')
+    if (!waiting.length) return
+    this.setStatus({ phase: 'working', text: `Starting ${waiting.map(serverLabel).join(' and ')}… (the first time can take a minute)` })
+    await servers.start()
+  }
+
+  /** Adds tools to the loaded set (newest last), unloading the oldest while they take more than their share of the context. */
+  private loadTools(tools: ToolInfo[]): ToolInfo[] {
+    for (const t of tools) {
+      this.loaded.delete(t.qualifiedName)
+      this.loaded.set(t.qualifiedName, t)
+    }
+    const budget = Math.floor(this.nCtx * LOADED_TOOLS_SHARE)
+    const cost = (t: ToolInfo): number => estimateTokens(JSON.stringify({ name: t.qualifiedName, description: t.description, parameters: t.inputSchema }))
+    const unloaded: ToolInfo[] = []
+    let total = [...this.loaded.values()].reduce((n, t) => n + cost(t), 0)
+    for (const t of [...this.loaded.values()]) {
+      if (total <= budget || this.loaded.size <= 1) break
+      this.loaded.delete(t.qualifiedName)
+      unloaded.push(t)
+      total -= cost(t)
+    }
+    return unloaded
+  }
+
   private async execute(
     task: TaskRecord,
     call: WireToolCall,
@@ -638,12 +703,15 @@ export class ProjectSession {
         : ''
       return finish({ text: parsed.error + cut, isError: true })
     }
-    if (!TOOL_NAMES.has(name)) {
-      return finish({ text: `There is no tool named "${name}". The tools are: ${[...TOOL_NAMES].join(', ')}.`, isError: true })
+    const known = TOOL_NAMES.has(name) || (this.extraServers.length > 0 && EXTRA_TOOL_NAMES.has(name))
+    const extra = known ? undefined : await this.extraTool(name).catch(() => undefined)
+    if (!known && !extra) {
+      const more = this.extraServers.length ? ' Tools from the tool servers are found with find_tools and loaded with load_tools.' : ''
+      return finish({ text: `There is no tool named "${name}". The tools are: ${[...TOOL_NAMES].join(', ')}.${more}`, isError: true })
     }
 
     try {
-      const result = await this.runTool(task, step, name, args, signal, snap)
+      const result = extra ? await this.runExtraTool(step, extra, args, signal) : await this.runTool(task, step, name, args, signal, snap)
       if ('denied' in result) return finish(result.outcome, 'skipped', "You didn't allow this.")
       if ('refused' in result) return finish(result.outcome, 'refused', result.refused)
       if (result.changed?.length || name === 'run_command' || name === 'start_background_command') {
@@ -791,6 +859,49 @@ export class ProjectSession {
         return { text: formatPageReport(report), isError: pageHasProblems(report) }
       }
 
+      case 'find_tools': {
+        const servers = this.deps.toolServers
+        if (!servers) return { text: 'There are no extra tools here.', isError: true }
+        const query = typeof args.query === 'string' ? args.query.trim() : ''
+        if (!query) return { text: 'Give some keywords to search for, e.g. "decompile function".', isError: true }
+        await this.startToolServers()
+        const states = servers.status().servers.filter((s) => this.extraServers.includes(s.name))
+        const broken = states.filter((s) => s.state === 'error').map((s) => `${serverLabel(s.name)} could not start: ${s.error ?? 'unknown problem'}`)
+        const limit = typeof args.limit === 'number' ? Math.min(30, Math.max(1, Math.round(args.limit))) : 10
+        const hits = servers.search(query, limit)
+        const lines = hits.map((t) => `- ${t.qualifiedName}: ${toolSummary(t.description)}${t.destructive ? ' (can change things: the owner is asked separately)' : ''}${this.loaded.has(t.qualifiedName) ? ' [loaded]' : ''}`)
+        const running = states.filter((s) => s.state === 'connected').map((s) => `${serverLabel(s.name)} (${s.tools} tools)`)
+        const text = [
+          ...broken,
+          hits.length ? `Tools matching "${query}":\n${lines.join('\n')}\n\nLoad the ones you need with load_tools, then call them.` : `No tools matched "${query}". Try other words.`,
+          running.length ? `Tool servers running: ${running.join(', ')}.` : ''
+        ]
+          .filter(Boolean)
+          .join('\n\n')
+        return { text, isError: !hits.length && broken.length > 0 }
+      }
+
+      case 'load_tools': {
+        const servers = this.deps.toolServers
+        if (!servers) return { text: 'There are no extra tools here.', isError: true }
+        const names = (Array.isArray(args.names) ? args.names : typeof args.names === 'string' ? args.names.split(/[,\s]+/) : []).map(String).filter(Boolean)
+        if (!names.length) return { text: 'Give the tool names to load, e.g. ["rea__open_binary"].', isError: true }
+        await this.startToolServers()
+        const found = names.map((n) => ({ n, t: servers.find(n.trim()) }))
+        const tools = found.flatMap((f) => (f.t ? [f.t] : []))
+        const missing = found.filter((f) => !f.t).map((f) => f.n)
+        const unloaded = this.loadTools(tools)
+        const now = tools.filter((t) => this.loaded.has(t.qualifiedName))
+        const text = [
+          now.length ? `Loaded: ${now.map((t) => t.qualifiedName).join(', ')}. You can call them from your next step.` : '',
+          unloaded.length ? `Unloaded to make room: ${unloaded.map((t) => t.qualifiedName).join(', ')} (load them again if you need them).` : '',
+          missing.length ? `Not found: ${missing.join(', ')}. Use find_tools to get the exact names.` : ''
+        ]
+          .filter(Boolean)
+          .join('\n')
+        return { text, isError: !now.length }
+      }
+
       case 'ask_user': {
         const question = typeof args.question === 'string' ? args.question.trim() : ''
         if (!question) return { text: 'Give the question to ask.', isError: true }
@@ -802,6 +913,39 @@ export class ProjectSession {
       }
     }
     return { text: `Unknown tool "${name}".`, isError: true }
+  }
+
+  /** Runs a tool from a tool server (such as REA) after the owner's OK, loading it if the model hadn't. */
+  private async runExtraTool(
+    step: Step,
+    tool: ToolInfo,
+    args: Record<string, unknown>,
+    signal: AbortSignal
+  ): Promise<ToolOutcome | { denied: true; outcome: ToolOutcome }> {
+    const label = serverLabel(tool.server)
+    const ok = await this.approve(
+      step,
+      { type: 'tool', server: tool.server, tool: tool.name, destructive: tool.destructive },
+      {
+        action: step.title,
+        detail: `${tool.qualifiedName}\n${JSON.stringify(args, null, 2)}`.slice(0, 3000),
+        risk: tool.destructive ? `${label} marks this tool as one that can change things or run programs.` : undefined
+      },
+      signal
+    )
+    if (!ok) {
+      return {
+        denied: true,
+        outcome: {
+          text: `The owner did not allow this (${tool.qualifiedName}). Don't try the same thing another way. Continue without it if you can, or use ask_user to ask what they would like instead.`,
+          isError: true
+        }
+      }
+    }
+    if (!this.loaded.has(tool.qualifiedName)) this.loadTools([tool])
+    const result = await this.deps.toolServers!.call(tool, args, signal)
+    if (signal.aborted) throw new StopTask()
+    return { text: headTail(result.text), isError: result.isError }
   }
 
   /** Updates the task's changed-files list (from the restore point, or from what the tools changed). */

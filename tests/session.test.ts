@@ -12,6 +12,8 @@ import { emptyProject, ProjectStore } from '../src/main/project/store'
 import { RulzClient } from '../src/main/rulz/client'
 import { startMockRulz, type MockOptions, type MockTurn } from './helpers/mockRulz'
 import { SHARE_SHOWN, SHARE_TASK } from '../src/main/agent/prompt'
+import { ToolServers } from '../src/main/mcp/toolServers'
+import { fakeToolConfig } from './helpers/fakeTools'
 
 const base = mkdtempSync(join(tmpdir(), 'rulz-agent-session-'))
 afterAll(() => rmSync(base, { recursive: true, force: true }))
@@ -36,6 +38,7 @@ async function harness(
     useGit?: boolean
     checkPage?: SessionDeps['checkPage']
     timings?: MockOptions['timings']
+    toolServers?: SessionDeps['toolServers']
   } = {}
 ): Promise<Harness> {
   const mock = await startMockRulz({ turns, nCtx: opts.nCtx, timings: opts.timings })
@@ -73,7 +76,8 @@ async function harness(
     snapshotter: async (kind) =>
       (kind === 'git' || (kind === 'auto' && useGit)) ? new GitSnapshots(store.snapshotDir(root), root) : new CopySnapshots(store.backupDir(root), root, trash),
     trash,
-    checkPage: opts.checkPage
+    checkPage: opts.checkPage,
+    toolServers: opts.toolServers
   })
   return {
     session,
@@ -510,6 +514,120 @@ describe('the agent loop', () => {
       await h.close()
     }
   }, 30_000)
+
+  describe('tools from tool servers (like REA)', () => {
+    it('finds, loads and runs them, asking once per task for ordinary tools and every time for destructive ones', async () => {
+      const servers = new ToolServers(fakeToolConfig(base))
+      const h = await harness(
+        [
+          { content: "I'll look for a tool that counts letters.", toolCalls: [call('find_tools', { query: 'letters notes' })] },
+          { toolCalls: [call('load_tools', { names: ['fake__count_letters', 'nope__missing'] })] },
+          { toolCalls: [call('fake__count_letters', { text: 'hello' }), call('fake__count_letters', { text: 'hi' })] },
+          { toolCalls: [call('fake__wipe_notes', {})] },
+          { toolCalls: [call('fake__wipe_notes', {})] },
+          { content: 'Counted.' }
+        ],
+        {
+          toolServers: servers,
+          answer: (p) => (p.kind === 'approval' ? { kind: 'approval', decision: p.action.includes('count') ? 'allow-task' : 'allow' } : null)
+        }
+      )
+      try {
+        const task = await h.run('Count the letters in hello')
+        expect(task.outcome).toBe('done')
+        // The model sees find/load from the start, and a loaded tool only after loading it.
+        const names = (i: number) => (h.requests[i].body.tools as { function: { name: string } }[]).map((t) => t.function.name)
+        expect(names(0)).toContain('find_tools')
+        expect(names(0)).toHaveLength(15)
+        expect(names(2)).toContain('fake__count_letters')
+        expect(names(2)).not.toContain('fake__wipe_notes')
+        const system = h.requests[0].body.messages![0].content
+        expect(system).toContain('## Extra tools from RulZ LLM Suite (FAKE)')
+
+        const results = h.requests[5].body.messages!.filter((m) => m.role === 'tool').map((m) => m.content)
+        expect(results[0]).toMatch(/fake__count_letters: Count the letters in a text\./)
+        expect(results[0]).toMatch(/fake__wipe_notes: .*\(can change things: the owner is asked separately\)/)
+        expect(results[1]).toMatch(/Loaded: fake__count_letters[\s\S]*Not found: nope__missing/)
+        expect(results.slice(2, 4)).toEqual(['Letters: 5', 'Letters: 2'])
+        expect(results.slice(4)).toEqual(['Notes wiped.', 'Notes wiped.'])
+
+        // "Allow for this task" on an ordinary tool covers the server's ordinary tools, not its destructive
+        // ones; those were allowed just once each here, so each call asked.
+        expect(h.prompts.map((p) => (p.kind === 'approval' ? p.action : p.kind))).toEqual([
+          'Using FAKE: count letters',
+          'Using FAKE: wipe notes',
+          'Using FAKE: wipe notes'
+        ])
+        expect(h.prompts[1]).toMatchObject({ risk: expect.stringMatching(/can change things or run programs/), detail: expect.stringContaining('fake__wipe_notes') })
+        expect(task.steps.map((s) => s.title)).toEqual([
+          'Looking for tools: "letters notes"',
+          'Getting tools ready',
+          'Using FAKE: count letters',
+          'Using FAKE: count letters',
+          'Using FAKE: wipe notes',
+          'Using FAKE: wipe notes'
+        ])
+      } finally {
+        await h.close()
+        await servers.dispose()
+      }
+    }, 60_000)
+
+    it('unloads the oldest tools when loaded tools would take too much room', async () => {
+      const servers = new ToolServers(fakeToolConfig(base))
+      const h = await harness(
+        [
+          { toolCalls: [call('load_tools', { names: ['huge_tool'] })] },
+          { toolCalls: [call('load_tools', { names: ['count_letters'] })] },
+          { content: 'OK.' }
+        ],
+        { toolServers: servers, nCtx: 32768 }
+      )
+      try {
+        await h.run('Load things')
+        const results = h.requests[2].body.messages!.filter((m) => m.role === 'tool').map((m) => m.content)
+        expect(results[0]).toMatch(/^Loaded: fake__huge_tool/)
+        expect(results[1]).toMatch(/Loaded: fake__count_letters[\s\S]*Unloaded to make room: fake__huge_tool/)
+        const names = (h.requests[2].body.tools as { function: { name: string } }[]).map((t) => t.function.name)
+        expect(names).toContain('fake__count_letters')
+        expect(names).not.toContain('fake__huge_tool')
+      } finally {
+        await h.close()
+        await servers.dispose()
+      }
+    }, 60_000)
+
+    it('runs a tool called by its full name without find or load, and respects "Don\'t allow"', async () => {
+      const servers = new ToolServers(fakeToolConfig(base))
+      const h = await harness(
+        [{ toolCalls: [call('fake__count_letters', { text: 'abc' })] }, { toolCalls: [call('fake__count_letters', { text: 'abc' })] }, { content: 'OK.' }],
+        { toolServers: servers, answer: (p) => (p.kind === 'approval' ? { kind: 'approval', decision: h.prompts.length > 1 ? 'deny' : 'allow' } : null) }
+      )
+      try {
+        await h.run('Count abc')
+        const results = h.requests[2].body.messages!.filter((m) => m.role === 'tool').map((m) => m.content)
+        expect(results[0]).toBe('Letters: 3')
+        expect(results[1]).toMatch(/The owner did not allow this \(fake__count_letters\)/)
+      } finally {
+        await h.close()
+        await servers.dispose()
+      }
+    }, 60_000)
+
+    it('offers no extra tools when no tool servers are set up', async () => {
+      const empty = join(base, 'empty-mcp.json')
+      writeFileSync(empty, '{"mcpServers":{}}')
+      const h = await harness([{ toolCalls: [call('find_tools', { query: 'x' })] }, { content: 'OK.' }], { toolServers: new ToolServers(empty) })
+      try {
+        await h.run('Look for tools')
+        expect(h.requests[0].body.tools).toHaveLength(13)
+        expect(h.requests[0].body.messages![0].content).not.toContain('find_tools')
+        expect(h.requests[1].body.messages!.filter((m) => m.role === 'tool')[0].content).toMatch(/There is no tool named "find_tools"/)
+      } finally {
+        await h.close()
+      }
+    }, 30_000)
+  })
 
   it('going back to an early task undoes every later one', async () => {
     const h = await harness(
