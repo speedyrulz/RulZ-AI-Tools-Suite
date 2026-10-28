@@ -20,7 +20,7 @@ import type {
 import { exists, extractZip, findFile, flattenSingleFolder, overlay, swapInto } from './archive'
 import { download } from './download'
 import {
-  commitsAhead,
+  commitsSince,
   findAsset,
   GitHubError,
   headCommit,
@@ -28,6 +28,7 @@ import {
   latestRelease,
   rawFile,
   recentReleases,
+  releaseVersion,
   sourceArchiveUrl,
   type Release
 } from './github'
@@ -278,12 +279,15 @@ export class AppManager {
     if (!app.repo) return { info: null, error: "This app isn't published on GitHub yet.", release: null }
     try {
       if (app.install.kind === 'source') {
-        // Source installs follow the branch; the label names the latest release when there is one.
-        const [c, release] = await Promise.all([headCommit(app.repo, app.branch), latestRelease(app.repo)])
-        const ahead = release ? await commitsAhead(app.repo, release.tag, c.sha).catch(() => null) : null
+        // Source installs follow the app's branch; the label names the latest release when there is one, plus the
+        // app's commits since (counted on main, where the branch is split from).
+        const [c, release] = await Promise.all([headCommit(app.repo, app.branch), latestRelease(app.repo, app.tagPrefix)])
+        const tag = release && releaseVersion(release.tag, app.tagPrefix)
+        const ahead =
+          release?.date ? await commitsSince(app.repo, 'main', app.path, release.date).catch(() => null) : null
         let label = `${app.branch} @ ${c.sha.slice(0, 7)}`
-        if (release && ahead === 0) label = release.tag
-        else if (release && ahead) label = `${release.tag} + ${ahead} commit${ahead === 1 ? '' : 's'}`
+        if (tag && ahead === 0) label = tag
+        else if (tag && ahead) label = `${tag} + ${ahead} commit${ahead === 1 ? '' : 's'}`
         return {
           info: {
             version: c.sha,
@@ -296,13 +300,14 @@ export class AppManager {
           release: null
         }
       }
-      const release = await latestRelease(app.repo)
+      const release = await latestRelease(app.repo, app.tagPrefix)
       if (!release) return { info: null, error: 'No release has been published yet.', release: null }
       const asset = findAsset(release, app.install.asset)
+      const version = releaseVersion(release.tag, app.tagPrefix)
       return {
         info: {
-          version: release.tag,
-          label: release.tag,
+          version,
+          label: version,
           date: release.date,
           downloadSize: asset?.size ?? null,
           url: release.htmlUrl
@@ -317,15 +322,15 @@ export class AppManager {
 
   async readme(appId: string, live: boolean): Promise<ReadmeDoc> {
     const app = this.app(appId)
-    const linkBase = app.repo ? `https://github.com/${app.repo}/blob/${app.branch}/` : null
+    const linkBase = app.repo ? `https://github.com/${app.repo}/blob/main/${app.path}/` : null
     if (live && app.repo) {
       const cached = this.readmes.get(appId)
       if (cached) return cached
       try {
-        const markdown = await rawFile(app.repo, app.branch, 'README.md')
+        const markdown = await rawFile(app.repo, 'main', `${app.path}/README.md`)
         const doc: ReadmeDoc = {
           markdown,
-          assetBase: `https://raw.githubusercontent.com/${app.repo}/${app.branch}/`,
+          assetBase: `https://raw.githubusercontent.com/${app.repo}/main/${app.path}/`,
           linkBase,
           source: 'github'
         }
@@ -416,7 +421,7 @@ export class AppManager {
     }
     if (!entry.release) throw new Error(entry.error ?? 'No release found.')
     const asset = findAsset(entry.release, pattern)
-    if (!asset) throw new Error(`The ${entry.release.tag} release has no Windows download.`)
+    if (!asset) throw new Error(`The ${entry.release.name} release has no Windows download.`)
     return { release: entry.release, asset }
   }
 
@@ -498,7 +503,8 @@ export class AppManager {
     if (spec.kind === 'zip') {
       ctx.set({ phase: 'resolving', label: 'Finding the latest release…' })
       const { release, asset } = await this.requireRelease(app, spec.asset)
-      const zip = await this.fetchFile(ctx, asset.url, asset.name, asset.size, `Downloading ${release.tag}`)
+      version = releaseVersion(release.tag, app.tagPrefix)
+      const zip = await this.fetchFile(ctx, asset.url, asset.name, asset.size, `Downloading ${version}`)
       const staged = `${dir}.new`
       await rm(staged, { recursive: true, force: true })
       ctx.set({ phase: 'extracting', label: 'Extracting…', progress: 0 })
@@ -510,12 +516,12 @@ export class AppManager {
       await swapInto(staged, dir)
       await rm(zip, { force: true })
       launchPath = join(dir, rel)
-      version = release.tag
       method = 'zip'
     } else if (spec.kind === 'installer') {
       ctx.set({ phase: 'resolving', label: 'Finding the latest release…' })
       const { release, asset } = await this.requireRelease(app, spec.asset)
-      const setup = await this.fetchFile(ctx, asset.url, asset.name, asset.size, `Downloading ${release.tag}`)
+      version = releaseVersion(release.tag, app.tagPrefix)
+      const setup = await this.fetchFile(ctx, asset.url, asset.name, asset.size, `Downloading ${version}`)
       ctx.set({ phase: 'installing', label: 'Running the setup program…', progress: null })
       ctx.log(`> ${basename(setup)} /S /currentuser /D="${dir}"`)
       const code = await runSetupProgram([setup, '/S', '/currentuser', `/D="${dir}"`], ctx)
@@ -526,7 +532,6 @@ export class AppManager {
       // The setup program makes its own shortcuts; the launcher's options decide which ones exist.
       for (const lnk of foreignShortcutPaths(spec.shortcutName)) await removeShortcut(lnk)
       await rm(setup, { force: true })
-      version = release.tag
       method = 'installer'
     } else {
       const fetched = await this.fetchSource(ctx, app, dir, prev)
@@ -599,15 +604,26 @@ export class AppManager {
     const gitDir = existsSync(join(dir, '.git'))
 
     if (hasGit && (prev ? gitDir : true)) {
+      const url = `https://github.com/${app.repo}.git`
       if (prev) {
         ctx.set({ phase: 'downloading', label: 'Pulling the latest changes…', progress: null })
-        ctx.log('> git pull --ff-only')
-        const code = await runCommand(['git', 'pull', '--ff-only'], { cwd: dir, signal: ctx.signal, onLine: ctx.log })
-        if (code !== 0) throw new Error('git pull failed (local changes in the folder?). See the log for details.')
+        // Also moves clones of the app's old repository over: its branch here continues that history commit for
+        // commit, so they fast-forward. Afterwards a plain `git pull` in the folder works too.
+        const steps = [
+          ['git', 'remote', 'set-url', 'origin', url],
+          ['git', 'remote', 'set-branches', 'origin', app.branch],
+          ['git', 'fetch', '--progress', 'origin'],
+          ['git', 'merge', '--ff-only', `origin/${app.branch}`],
+          ['git', 'branch', `--set-upstream-to=origin/${app.branch}`]
+        ]
+        for (const step of steps) {
+          ctx.log(`> ${step.join(' ')}`)
+          const code = await runCommand(step, { cwd: dir, signal: ctx.signal, onLine: ctx.log })
+          if (code !== 0) throw new Error(`${step.slice(0, 2).join(' ')} failed (local changes in the folder?). See the log for details.`)
+        }
       } else {
         ctx.set({ phase: 'downloading', label: 'Cloning the repository…', progress: null })
         await mkdir(dir, { recursive: true })
-        const url = `https://github.com/${app.repo}.git`
         ctx.log(`> git clone --depth 1 --branch ${app.branch} ${url}`)
         const code = await runCommand(['git', 'clone', '--progress', '--depth', '1', '--branch', app.branch, url, '.'], {
           cwd: dir,

@@ -15,6 +15,7 @@ import {
   X
 } from 'lucide-react'
 import { useState, type ReactNode } from 'react'
+import { githubUrl } from '@shared/catalog'
 import { REQUIREMENT_GUIDES } from '@shared/requirements'
 import type { AppView } from '@shared/types'
 import { AppActions, jobDetail, useJob } from '../components/AppActions'
@@ -100,7 +101,7 @@ export function AppPage({ view, onBack, onInstall }: { view: AppView; onBack: ()
                 {app.repo && (
                   <MenuItem
                     icon={<Github />}
-                    onSelect={() => void invoke('shell:openExternal', `https://github.com/${app.repo}`)}
+                    onSelect={() => void invoke('shell:openExternal', githubUrl(app)!)}
                   >
                     View on GitHub
                   </MenuItem>
@@ -215,9 +216,9 @@ export function AppPage({ view, onBack, onInstall }: { view: AppView; onBack: ()
                 <Row label="Source">
                   <button
                     className="cursor-pointer text-left break-all text-link hover:underline"
-                    onClick={() => void invoke('shell:openExternal', `https://github.com/${app.repo}`)}
+                    onClick={() => void invoke('shell:openExternal', githubUrl(app)!)}
                   >
-                    {app.repo} <ExternalLink className="inline size-3 align-[-1px]" />
+                    {app.repo}/{app.path} <ExternalLink className="inline size-3 align-[-1px]" />
                   </button>
                 </Row>
               )}
