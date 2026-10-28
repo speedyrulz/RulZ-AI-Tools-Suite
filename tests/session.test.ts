@@ -365,4 +365,74 @@ describe('the agent loop', () => {
       await h.close()
     }
   }, 30_000)
+
+  for (const useGit of [true, false]) {
+    it(`goes back to before an earlier task from History (${useGit ? 'git' : 'copied files'})`, async () => {
+      if (useGit && !(await gitInstalled())) return
+      const h = await harness(
+        [
+          { toolCalls: [call('write_file', { path: 'a.txt', content: 'a' }), call('edit_file', { path: 'old.txt', old_text: 'one', new_text: 'two' })] },
+          { content: 'ok' },
+          { toolCalls: [call('write_file', { path: 'b.txt', content: 'b' }), call('edit_file', { path: 'old.txt', old_text: 'two', new_text: 'three' })] },
+          { content: 'ok' },
+          { toolCalls: [call('write_file', { path: 'c.txt', content: 'c' })] },
+          { content: 'ok' }
+        ],
+        { useGit }
+      )
+      try {
+        writeFileSync(join(h.root, 'old.txt'), 'one')
+        const first = await h.run('Task one')
+        const second = await h.run('Task two')
+        const third = await h.run('Task three')
+        // Undo the newest one first, then go back past the other two.
+        await h.session.undo()
+        expect(existsSync(join(h.root, 'c.txt'))).toBe(false)
+        await expect(h.session.undo(third.id)).rejects.toThrow(/already undone/)
+
+        await h.session.undo(second.id)
+        expect(existsSync(join(h.root, 'b.txt'))).toBe(false)
+        expect(readFileSync(join(h.root, 'old.txt'), 'utf8')).toBe('two')
+        expect(readFileSync(join(h.root, 'a.txt'), 'utf8')).toBe('a')
+        expect(h.session.canUndo()?.id).toBe(first.id)
+
+        expect(h.session.data.tasks.map((t) => [t.title, !!t.undone])).toEqual([
+          ['Task one', false],
+          ['Task two', true],
+          ['Task three', true]
+        ])
+        expect(h.session.data.notes.at(-1)).toMatch(/used History to go back.*before the task "Task two"/)
+        expect(h.session.data.timeline.at(-1)).toMatchObject({ kind: 'notice', text: expect.stringMatching(/^Undone: "Task two"\. /) })
+      } finally {
+        await h.close()
+      }
+    }, 60_000)
+  }
+
+  it('going back to an early task undoes every later one', async () => {
+    const h = await harness(
+      [
+        { toolCalls: [call('write_file', { path: 'a.txt', content: 'a' })] },
+        { content: 'ok' },
+        { toolCalls: [call('write_file', { path: 'b.txt', content: 'b' })] },
+        { content: 'ok' },
+        { toolCalls: [call('write_file', { path: 'c.txt', content: 'c' })] },
+        { content: 'ok' }
+      ],
+      { useGit: false }
+    )
+    try {
+      const first = await h.run('Task one')
+      await h.run('Task two')
+      await h.run('Task three')
+      await h.session.undo(first.id)
+      for (const f of ['a.txt', 'b.txt', 'c.txt']) expect(existsSync(join(h.root, f)), f).toBe(false)
+      expect(h.session.data.tasks.every((t) => t.undone)).toBe(true)
+      expect(h.session.data.notes.at(-1)).toContain('the later tasks "Task two", "Task three" were undone too')
+      expect(h.session.data.timeline.at(-1)).toMatchObject({ text: expect.stringContaining('"Task one" and 2 later tasks') })
+      expect(h.session.canUndo()).toBeUndefined()
+    } finally {
+      await h.close()
+    }
+  }, 60_000)
 })

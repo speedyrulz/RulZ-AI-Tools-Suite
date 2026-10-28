@@ -45,6 +45,9 @@ The light look is one click away: use the sun/moon button in the top bar (or **S
   in a panel and an **Open in browser** button for web servers. If it can't tell how, it asks the agent and remembers.
   When the app crashes or prints an error, **Fix this** stops it and hands the error to the agent to find and fix.
 - **Undo last task** puts the project back exactly as it was before the last task (press again to go further back).
+- **History** lists every task in the project, newest first, with when it ran and how many files it changed.
+  **Go back to before this** on any task puts the project back to how it was then, undoing that task and every
+  later one in a single step (after a confirmation that lists them).
 
 ## Approvals
 
@@ -88,6 +91,8 @@ scripts unchecked. Deleted files go to the Recycle Bin.
 - **Undo**: before each task, the project is committed to a private git repository in the app's data folder
   (never a `.git` inside your project, so your own repositories are untouched; `node_modules`, `dist`, `.venv`
   and files over 50 MB are left out). Without Git for Windows, files are copied aside before the agent changes them.
+  Going back from History resets to that task's commit; with copied files, each later task is restored in turn,
+  newest first. The agent is told what was undone at the start of its next task.
 - **Data**: `%APPDATA%\RulZ Coding Agent` holds settings, recent projects, each project's history and restore points.
 
 ## Development

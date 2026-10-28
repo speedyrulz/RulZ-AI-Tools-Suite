@@ -126,16 +126,34 @@ describe('RulZ Coding Agent', () => {
     await page.getByText(/^Stopped\./).waitFor({ timeout: 10_000 })
   })
 
-  it('undoes the last finished task', async () => {
-    // The stopped task made no changes; undo it, then the fix task, then the build task.
-    for (let i = 0; i < 3; i++) {
-      await page.getByRole('button', { name: 'Undo last task' }).click()
-      await page.getByRole('dialog').getByRole('button', { name: 'Undo' }).click()
-      await page.getByText(/^Undone:/).nth(i).waitFor()
-    }
+  it('undoes the last task, then goes back past two tasks from History', async () => {
+    // The stopped task made no changes; undo it with the button.
+    await page.getByRole('button', { name: 'Undo last task' }).click()
+    await page.getByRole('dialog').getByRole('button', { name: 'Undo' }).click()
+    await page.getByText(/^Undone: "Do something slow"/).waitFor()
+
+    await page.getByRole('button', { name: 'History' }).click()
+    const rows = page.getByTestId('history-row')
+    await expect.poll(() => rows.allInnerTexts()).toEqual([
+      expect.stringMatching(/^Do something slow[\s\S]*Undone/),
+      expect.stringContaining('Please fix the error my app showed when I ran it.'),
+      expect.stringMatching(/^Make a tiny app[\s\S]*files? changed/)
+    ])
+    await page.screenshot({ path: join(shots, '5-history.png') })
+    await rows.nth(2).getByRole('button', { name: 'Go back to before this' }).click()
+    const confirm = page.getByRole('dialog')
+    await confirm.getByText('Everything these 2 tasks added or changed will be removed').waitFor()
+    await confirm.getByRole('listitem').filter({ hasText: 'Please fix the error' }).waitFor()
+    await confirm.getByRole('button', { name: 'Go back' }).click()
+    await page.getByText(/^Undone: "Make a tiny app" and 1 later task\./).waitFor()
+
     expect(existsSync(join(projectsDir, 'E2E App', 'app.js'))).toBe(false)
+    expect(existsSync(join(projectsDir, 'E2E App', 'shop.html'))).toBe(false)
     expect(existsSync(join(projectsDir, 'E2E App', 'package.json'))).toBe(false)
+    await page.getByRole('button', { name: 'History' }).click()
+    await expect.poll(() => rows.getByRole('button', { name: 'Go back to before this' }).count()).toBe(0)
     await page.screenshot({ path: join(shots, '5-undone.png') })
+    await page.keyboard.press('Escape')
   })
 
   it('switches to the light theme', async () => {

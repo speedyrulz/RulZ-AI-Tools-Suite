@@ -34,7 +34,8 @@ interface WorkspaceState {
   send: (text: string) => Promise<void>
   stop: () => void
   answer: (answer: PromptAnswer) => void
-  undo: () => Promise<void>
+  /** Undoes the last task, or with an id goes back to before that task (undoing every later one too). */
+  undo: (taskId?: string) => Promise<void>
   startRun: () => Promise<void>
   stopRun: () => Promise<void>
   askHowToRun: () => Promise<void>
@@ -197,11 +198,11 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       void invoke('task:answer', project.path, prompt.id, answer)
     },
 
-    undo: async () => {
+    undo: async (taskId) => {
       const project = get().project
       if (!project) return
       try {
-        apply(await invoke('task:undo', project.path))
+        apply(await invoke('task:undo', project.path, taskId))
         toast.success('Undone. Your project is back to how it was.')
       } catch (e) {
         toast.error(errorMessage(e))
@@ -261,4 +262,9 @@ export function shownTask(tasks: TaskRecord[], selectedId: string | null): TaskR
 /** The task "Undo last task" would undo. */
 export function undoableTask(tasks: TaskRecord[]): TaskRecord | undefined {
   return [...tasks].reverse().find((t) => !t.undone && t.snapshot && t.outcome !== 'running')
+}
+
+/** The tasks going back to before `task` would undo: it and every later task not undone yet. */
+export function tasksUndoneBy(tasks: TaskRecord[], task: TaskRecord): TaskRecord[] {
+  return tasks.slice(tasks.indexOf(task)).filter((t) => !t.undone && t.outcome !== 'running')
 }

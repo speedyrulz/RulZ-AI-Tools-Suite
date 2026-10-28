@@ -1,6 +1,7 @@
-import { ArrowLeft, ArrowUp, LoaderCircle, Play, Settings, Square, Undo2 } from 'lucide-react'
+import { ArrowLeft, ArrowUp, History, LoaderCircle, Play, Settings, Square, Undo2 } from 'lucide-react'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { ApprovalDialog } from '../components/ApprovalDialog'
+import { HistoryDialog } from '../components/HistoryDialog'
 import { LogoMark } from '../components/Logo'
 import { Markdown } from '../components/Markdown'
 import { ConnectionHelp } from '../components/NotConnected'
@@ -67,6 +68,7 @@ function TopBar() {
   const undo = useWorkspace((s) => s.undo)
   const setSettingsOpen = useApp((s) => s.setSettingsOpen)
   const [confirmUndo, setConfirmUndo] = useState(false)
+  const [historyOpen, setHistoryOpen] = useState(false)
   const undoTask = undoableTask(tasks)
 
   return (
@@ -104,6 +106,12 @@ function TopBar() {
           </Button>
         </span>
       </Tooltip>
+      <Tooltip content="See every task and go back to before any of them">
+        <Button className="h-9.5 px-4 text-sm" onClick={() => setHistoryOpen(true)}>
+          <History size={15} /> History
+        </Button>
+      </Tooltip>
+      <HistoryDialog open={historyOpen} onOpenChange={setHistoryOpen} />
       <ThemeToggle />
       <IconButton label="Settings" onClick={() => setSettingsOpen(true)}>
         <Settings size={17} />

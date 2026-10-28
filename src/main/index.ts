@@ -244,10 +244,10 @@ async function main(): Promise<void> {
   handle('task:start', (path, text) => requireSession(path).start(text))
   handle('task:stop', (path) => requireSession(path).stop())
   handle('task:answer', (path, id, answer) => requireSession(path).answer(id, answer))
-  handle('task:undo', async (path) => {
+  handle('task:undo', async (path, taskId) => {
     const s = requireSession(path)
     await runner?.stop()
-    await s.undo()
+    await s.undo(taskId)
     return s.state(current!.name, current!.lastOpened)
   })
   handle('files:diff', (path, taskId, rel) => requireSession(path).diff(taskId, rel))

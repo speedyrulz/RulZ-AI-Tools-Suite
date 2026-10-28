@@ -41,8 +41,11 @@ export interface IpcInvoke {
   'task:start': (projectPath: string, text: string) => void
   'task:stop': (projectPath: string) => void
   'task:answer': (projectPath: string, promptId: string, answer: PromptAnswer) => void
-  /** Restores the project to how it was before the last task that wasn't undone yet. */
-  'task:undo': (projectPath: string) => ProjectState
+  /**
+   * Restores the project to how it was before the last task that wasn't undone yet, or, with a
+   * task id, to before that task (undoing it and every later task).
+   */
+  'task:undo': (projectPath: string, taskId?: string) => ProjectState
   'files:diff': (projectPath: string, taskId: string, path: string) => FileDiff
 
   'run:state': (projectPath: string) => RunState

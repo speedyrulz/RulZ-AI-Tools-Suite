@@ -210,20 +210,39 @@ export class ProjectSession {
     return [...this.data.tasks].reverse().find((t) => !t.undone && t.snapshot && t.outcome !== 'running')
   }
 
-  async undo(): Promise<void> {
+  /** "Undo last task" with no id; History's "Go back to before this" with one (that task and every later one are undone). */
+  async undo(taskId?: string): Promise<void> {
     if (this.running) throw new Error('Wait for the current task to finish (or press Stop) before undoing.')
-    const task = this.canUndo()
-    if (!task?.snapshot) throw new Error('There is nothing to undo.')
+    const target = taskId ? this.data.tasks.find((t) => t.id === taskId) : this.canUndo()
+    if (!target) throw new Error('There is nothing to undo.')
+    if (target.undone) throw new Error(`"${target.title}" is already undone.`)
+    if (!target.snapshot) throw new Error(`There is no restore point from before "${target.title}", so the project can't go back to it.`)
+    const tasks = this.data.tasks.slice(this.data.tasks.indexOf(target)).filter((t) => !t.undone && t.outcome !== 'running')
+    // A git restore point holds the whole project, so going back to it is enough. Copied files only
+    // hold what each task changed, so each later task is put back in turn, newest first.
+    const restores = target.snapshot.kind === 'git' ? [target] : tasks.slice().reverse()
+    const missing = restores.find((t) => !t.snapshot)
+    if (missing) throw new Error(`There is no restore point from before "${missing.title}", so the project can't go back past it.`)
     // Running programs can hold files open.
     await this.background.stopAll()
-    const snap = await this.deps.snapshotter(task.snapshot.kind)
-    await snap.restore(task.snapshot, task.title)
-    task.undone = true
+    for (const t of restores) {
+      const snap = await this.deps.snapshotter(t.snapshot!.kind)
+      await snap.restore(t.snapshot!, t.title)
+    }
+    for (const t of tasks) t.undone = true
+    const later = tasks.slice(1).map((t) => `"${t.title}"`)
     this.data.notes.push(
-      `The owner clicked "Undo last task", so the project files are back to how they were before the task "${task.title}". ` +
-        'Everything that task created or changed is gone; check the files again before relying on earlier results.'
+      (taskId
+        ? `The owner used History to go back, so the project files are back to how they were before the task "${target.title}"` +
+          (later.length ? ` (the later tasks ${later.join(', ')} were undone too)` : '')
+        : `The owner clicked "Undo last task", so the project files are back to how they were before the task "${target.title}"`) +
+        '. Everything those tasks created or changed is gone; check the files again before relying on earlier results.'
     )
-    this.notice(`Undone: "${task.title}". The project is back to how it was before that task.`, 'ok', task.id)
+    this.notice(
+      `Undone: "${target.title}"${later.length ? ` and ${later.length} later task${later.length > 1 ? 's' : ''}` : ''}. The project is back to how it was before that task.`,
+      'ok',
+      target.id
+    )
     this.emit({ type: 'tasks', tasks: this.data.tasks })
     await this.saveNow()
   }
