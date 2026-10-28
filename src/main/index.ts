@@ -160,6 +160,8 @@ async function main(): Promise<void> {
     instances,
     getModels: () => library.list(),
     getSettings: () => settings.get().apiServer,
+    getLoadDefaults: (id) => settings.getModelDefaults(id),
+    setLoadDefaults: (id, config) => settings.setModelDefaults(id, config),
     onStatus: (s) => broadcast('server:changed', s),
     onRequest: (e) => broadcast('server:request', e)
   })

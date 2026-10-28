@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import http, { type IncomingMessage, type ServerResponse } from 'node:http'
-import type { ApiRequestLog, ApiServerSettings, ApiServerStatus, LoadedInstance, ModelEntry } from '@shared/types'
+import type { ApiRequestLog, ApiServerSettings, ApiServerStatus, LoadConfig, LoadedInstance, ModelEntry } from '@shared/types'
 import type { InstanceManager } from '../engine/instances'
-import { authorized, errorBody, parseUsage, publicModelId, resolveModel } from './helpers'
+import { authorized, errorBody, parseRemoteLoadPatch, parseUsage, publicModelId, remoteLoadView, resolveModel } from './helpers'
 
 const MAX_BODY_BYTES = 64 * 1024 * 1024
 const MAX_LOG = 300
@@ -31,11 +31,16 @@ const PROXY_POST = new Set([
   '/rerank'
 ])
 const PROXY_GET = new Set(['/props', '/slots', '/metrics', '/lora-adapters'])
+/** GET or POST /v1/models/{id}/load-config reads or changes a model's saved load settings. */
+const LOAD_CONFIG_SUFFIX = '/load-config'
 
 export interface ApiServerDeps {
   instances: InstanceManager
   getModels: () => ModelEntry[]
   getSettings: () => ApiServerSettings
+  /** The model's saved load defaults (what a load without explicit settings uses). */
+  getLoadDefaults: (modelId: string) => { config: LoadConfig; custom: boolean }
+  setLoadDefaults: (modelId: string, config: LoadConfig) => Promise<void>
   onStatus: (s: ApiServerStatus) => void
   onRequest: (entry: ApiRequestLog) => void
 }
@@ -161,6 +166,25 @@ export class ApiServer {
       }
       if (method === 'GET' && (path === '/v1/models' || path === '/models' || path === '/api/v0/models')) {
         res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(this.listModels()))
+        return finish(200)
+      }
+      if (path.startsWith('/v1/models/') && path.endsWith(LOAD_CONFIG_SUFFIX) && (method === 'GET' || method === 'POST')) {
+        const model = resolveModel(this.deps.getModels(), decodeURIComponent(path.slice('/v1/models/'.length, -LOAD_CONFIG_SUFFIX.length)))
+        if (!model) return fail(404, 'Model not found.', 'not_found_error')
+        if (method === 'POST') {
+          let json: { config?: unknown; reload?: unknown }
+          try {
+            json = JSON.parse((await readBody(req)).toString('utf8') || '{}') as typeof json
+          } catch {
+            return fail(400, 'The request body is not valid JSON.')
+          }
+          const parsed = parseRemoteLoadPatch(json.config ?? {})
+          if (!parsed.ok) return fail(400, `Invalid load setting ${parsed.error}`, 'invalid_request_error')
+          const { config } = this.deps.getLoadDefaults(model.id)
+          await this.deps.setLoadDefaults(model.id, { ...config, ...parsed.patch })
+          if (json.reload !== false) this.reload(model.id)
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(this.loadConfigEntry(model)))
         return finish(200)
       }
       if (method === 'GET' && path.startsWith('/v1/models/')) {
@@ -312,6 +336,24 @@ export class ApiServer {
     return p
   }
 
+  /** Restarts a loaded model so new load defaults take effect; does nothing if it isn't loaded. */
+  private reload(modelId: string): void {
+    const prev = this.deps.instances.list().find((i) => i.modelId === modelId && i.status !== 'stopping')
+    if (!prev) return
+    // Keep auto-unloading a model only if the server loaded it in the first place.
+    const wasJit = this.jit.delete(prev.instanceId)
+    const p = this.deps.instances
+      .load(modelId, null)
+      .then((inst) => {
+        if (wasJit) this.jit.set(inst.instanceId, Date.now())
+        this.emit()
+        return inst
+      })
+      .finally(() => this.loading.delete(modelId))
+    p.catch(() => undefined)
+    this.loading.set(modelId, p)
+  }
+
   private touch(instanceId: string): void {
     if (this.jit.has(instanceId)) {
       this.jit.set(instanceId, Date.now())
@@ -355,6 +397,21 @@ export class ApiServer {
       quantization: m.info?.quantization,
       max_context_length: m.info?.contextLength,
       state: inst ? 'loaded' : 'not-loaded',
+      loaded_context_length: inst?.contextLength ?? undefined
+    }
+  }
+
+  private loadConfigEntry(m: ModelEntry): unknown {
+    const { config, custom } = this.deps.getLoadDefaults(m.id)
+    const inst = this.deps.instances.list().find((i) => i.modelId === m.id && i.status !== 'stopping')
+    return {
+      id: publicModelId(m, this.deps.getModels()),
+      object: 'model.load_config',
+      config: remoteLoadView(config),
+      custom,
+      max_context_length: m.info?.contextLength,
+      state: inst?.status ?? 'not-loaded',
+      loaded_config: inst ? remoteLoadView(inst.config) : undefined,
       loaded_context_length: inst?.contextLength ?? undefined
     }
   }

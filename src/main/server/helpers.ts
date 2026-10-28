@@ -1,5 +1,6 @@
 // Pure helpers for the local API server (unit-tested separately from the HTTP code).
-import type { ModelEntry } from '@shared/types'
+import { z } from 'zod'
+import { KV_CACHE_TYPES, type LoadConfig, type ModelEntry } from '@shared/types'
 
 /** The id a model is listed under in GET /v1/models: its name, or its path when names collide. */
 export function publicModelId(model: ModelEntry, all: ModelEntry[]): string {
@@ -82,4 +83,41 @@ export function authorized(apiKey: string, headers: { authorization?: string; 'x
 /** OpenAI-style error body. */
 export function errorBody(message: string, type = 'invalid_request_error'): string {
   return JSON.stringify({ error: { message, type } })
+}
+
+/**
+ * The load settings other apps may change over the API. File paths and free-form arguments are
+ * left out on purpose: the server can listen on the LAN, and those would let a client point
+ * llama-server at anything on disk.
+ */
+const remoteLoadPatchSchema = z
+  .object({
+    contextLength: z.number().int().min(512).max(4_194_304).nullable(),
+    gpuLayers: z.union([z.literal('auto'), z.literal('all'), z.number().int().min(0).max(1000)]),
+    flashAttention: z.enum(['auto', 'on', 'off']),
+    cacheTypeK: z.enum(KV_CACHE_TYPES as [string, ...string[]]),
+    cacheTypeV: z.enum(KV_CACHE_TYPES as [string, ...string[]]),
+    parallel: z.number().int().min(1).max(64),
+    useDraft: z.boolean()
+  })
+  .partial()
+  .strict()
+
+export type RemoteLoadPatch = Partial<
+  Pick<LoadConfig, 'contextLength' | 'gpuLayers' | 'flashAttention' | 'cacheTypeK' | 'cacheTypeV' | 'parallel' | 'useDraft'>
+>
+
+/** Checks a load-settings change sent to the API; unlike saved settings, bad values are refused, not replaced. */
+export function parseRemoteLoadPatch(raw: unknown): { ok: true; patch: RemoteLoadPatch } | { ok: false; error: string } {
+  const r = remoteLoadPatchSchema.safeParse(raw)
+  if (r.success) return { ok: true, patch: r.data as RemoteLoadPatch }
+  const issue = r.error.issues[0]
+  const where = issue.path.join('.') || 'config'
+  return { ok: false, error: `${where}: ${issue.message}` }
+}
+
+/** The part of a load config the API shows and accepts. */
+export function remoteLoadView(config: LoadConfig): Required<RemoteLoadPatch> {
+  const { contextLength, gpuLayers, flashAttention, cacheTypeK, cacheTypeV, parallel, useDraft } = config
+  return { contextLength, gpuLayers, flashAttention, cacheTypeK, cacheTypeV, parallel, useDraft }
 }
