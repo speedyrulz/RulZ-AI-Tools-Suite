@@ -1,6 +1,7 @@
 // Talks to RulZ LLM Suite's local API server (OpenAI-compatible endpoints).
 import type { ConnectionInfo, LoadSettings, ModelInfo, ModelLoadInfo, WireMessage, WireToolCall } from '@shared/types'
-import { errorFromBody, interpretChunk, SseParser, ToolCallAccumulator } from './sse'
+import { noDraftMsPerToken } from './draft'
+import { errorFromBody, type GenTimings, interpretChunk, SseParser, ToolCallAccumulator } from './sse'
 import { jsonifyToolCallArgs, templateStringifiesArgs } from './toolArgs'
 
 export interface ServerConfig {
@@ -109,6 +110,8 @@ export interface TurnResult {
   finishReason: string
   /** Exact token counts when the server reports them. */
   usage?: { prompt: number; completion: number }
+  /** Generation time and, when the server drafts, draft counts. */
+  gen?: GenTimings
 }
 
 export interface StreamHandlers {
@@ -130,12 +133,20 @@ export class ServerError extends Error {
 
 export class RulzClient {
   private props = new Map<string, ModelProps>()
+  /** Per model: ms per token seen in a turn without drafting, for the draft stats' time-saved estimate. */
+  private noDraftSpeed = new Map<string, number>()
 
   constructor(private readonly config: () => ServerConfig) {}
 
   /** Forgets per-model details, e.g. after the server or the model changes. */
   reset(): void {
     this.props.clear()
+    this.noDraftSpeed.clear()
+  }
+
+  /** The model's last measured ms per token without drafting, if a turn without drafting has been seen. */
+  noDraftBaseline(model: string): number | undefined {
+    return this.noDraftSpeed.get(model)
   }
 
   async listModels(): Promise<ModelInfo[]> {
@@ -185,6 +196,7 @@ export class RulzClient {
     let content = ''
     let finishReason = ''
     let usage: TurnResult['usage']
+    let gen: GenTimings | undefined
     const reader = res.body.getReader()
     for (;;) {
       const { done, value } = await reader.read()
@@ -211,9 +223,12 @@ export class RulzClient {
         }
         if (info.finishReason) finishReason = info.finishReason
         if (info.usage) usage = info.usage
+        if (info.gen) gen = info.gen
       }
     }
-    return { content, toolCalls: calls.result(), finishReason, usage }
+    const baseline = gen && noDraftMsPerToken(gen)
+    if (baseline) this.noDraftSpeed.set(body.model, baseline)
+    return { content, toolCalls: calls.result(), finishReason, usage, gen }
   }
 
   /** The model's load settings in RulZ LLM Suite. */

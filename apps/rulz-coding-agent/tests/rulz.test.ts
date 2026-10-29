@@ -1,8 +1,9 @@
 import { splitThink } from '@shared/think'
 import { afterAll, describe, expect, it } from 'vitest'
 import { samplingRequest, skipsThinking } from '@shared/defaults'
-import { findServer, parseLoadInfo, parseModels, pickDefaultModel, RulzClient } from '../src/main/rulz/client'
+import { findServer, parseLoadInfo, parseModels, pickDefaultModel, RulzClient, type TurnResult } from '../src/main/rulz/client'
 import { parseSettings } from '../src/main/settings'
+import { addDraft, noDraftMsPerToken, turnSavedMs } from '../src/main/rulz/draft'
 import { errorFromBody, interpretChunk, SseParser, ToolCallAccumulator } from '../src/main/rulz/sse'
 import { jsonifyToolCallArgs, templateStringifiesArgs } from '../src/main/rulz/toolArgs'
 import { QWEN_CODER_TEMPLATE, startMockRulz } from './helpers/mockRulz'
@@ -43,6 +44,81 @@ describe('SseParser', () => {
   it('reads error bodies', () => {
     expect(errorFromBody(400, '{"error":{"message":"context exceeded"}}')).toBe('context exceeded')
     expect(errorFromBody(500, '')).toBe('HTTP 500')
+  })
+})
+
+describe('speculative decoding (MTP) stats', () => {
+  // The last chunk from llama-server b11776 with an MTP model (RulZ LLM Suite passes it through unchanged).
+  const LAST_CHUNK = {
+    choices: [{ finish_reason: 'stop', index: 0, delta: {} }],
+    object: 'chat.completion.chunk',
+    timings: {
+      cache_n: 0,
+      prompt_n: 25,
+      prompt_ms: 267.027,
+      predicted_n: 183,
+      predicted_ms: 1766.398,
+      predicted_per_token_ms: 9.705483516483516,
+      predicted_per_second: 103.03453695033622,
+      draft_n: 126,
+      draft_n_accepted: 119
+    }
+  }
+
+  it('reads draft counts from the timings', () => {
+    expect(interpretChunk(LAST_CHUNK).gen).toEqual({ generated: 183, genMs: 1766.398, drafted: 126, accepted: 119 })
+    // Without drafting the server leaves the draft fields out.
+    expect(interpretChunk({ choices: [], timings: { prompt_n: 5, predicted_n: 40, predicted_ms: 800 } }).gen).toEqual({ generated: 40, genMs: 800 })
+    expect(interpretChunk({ choices: [{ delta: { content: 'hi' } }] }).gen).toBeUndefined()
+  })
+
+  it('estimates time saved: an upper bound from the pass time, or exact against a measured plain speed', () => {
+    const gen = interpretChunk(LAST_CHUNK).gen!
+    // 183 tokens in 183 − 119 = 64 passes of 27.6 ms; 119 accepted tokens skipped a pass each.
+    const bound = turnSavedMs(gen)
+    expect(bound.measured).toBe(false)
+    expect(bound.savedMs).toBeCloseTo(119 * (1766.398 / 64))
+    // At a measured 15 ms per token, 183 tokens would have taken 2745 ms.
+    expect(turnSavedMs(gen, 15)).toEqual({ savedMs: 183 * 15 - 1766.398, measured: true })
+    // Drafting that slowed things down shows as negative.
+    expect(turnSavedMs(gen, 5).savedMs).toBeLessThan(0)
+    expect(turnSavedMs({ generated: 10, genMs: 100, drafted: 8, accepted: 0 }).savedMs).toBe(0)
+  })
+
+  it('keeps a plain speed only from turns that did not draft and were long enough', () => {
+    expect(noDraftMsPerToken({ generated: 40, genMs: 800 })).toBe(20)
+    expect(noDraftMsPerToken({ generated: 40, genMs: 800, drafted: 0, accepted: 0 })).toBe(20)
+    expect(noDraftMsPerToken({ generated: 40, genMs: 800, drafted: 30, accepted: 20 })).toBeUndefined()
+    expect(noDraftMsPerToken({ generated: 3, genMs: 60 })).toBeUndefined()
+  })
+
+  it('adds turns up per task, skipping turns that did not draft', () => {
+    let total = addDraft(undefined, { generated: 100, genMs: 1000, drafted: 80, accepted: 60 }, 20)
+    expect(total).toEqual({ drafted: 80, accepted: 60, generated: 100, genMs: 1000, savedMs: 1000, measured: true })
+    expect(addDraft(total, { generated: 50, genMs: 900 })).toBe(total)
+    total = addDraft(total, { generated: 30, genMs: 300, drafted: 20, accepted: 10 })
+    expect(total).toMatchObject({ drafted: 100, accepted: 70, generated: 130, genMs: 1300, savedMs: 1000 + 10 * 15, measured: false })
+  })
+
+  it('remembers the plain speed per model from a streamed turn', async () => {
+    let drafting = false
+    const mock = await startMockRulz({
+      turns: [{ content: 'one' }, { content: 'two' }],
+      timings: () => ({ cache_n: 0, prompt_n: 10, predicted_n: 50, predicted_ms: 1000, ...(drafting ? { draft_n: 40, draft_n_accepted: 30 } : {}) })
+    })
+    try {
+      const client = new RulzClient(() => ({ url: mock.url, apiKey: '' }))
+      const ask = (): Promise<TurnResult> => client.streamTurn({ model: 'm', messages: [{ role: 'user', content: 'go' }] }, new AbortController().signal)
+      expect((await ask()).gen).toEqual({ generated: 50, genMs: 1000 })
+      expect(client.noDraftBaseline('m')).toBe(20)
+      drafting = true
+      expect((await ask()).gen).toEqual({ generated: 50, genMs: 1000, drafted: 40, accepted: 30 })
+      expect(client.noDraftBaseline('m')).toBe(20)
+      client.reset()
+      expect(client.noDraftBaseline('m')).toBeUndefined()
+    } finally {
+      await mock.close()
+    }
   })
 })
 

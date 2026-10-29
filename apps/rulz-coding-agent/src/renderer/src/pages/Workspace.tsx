@@ -2,6 +2,7 @@ import { ArrowLeft, ArrowUp, Brain, Check, ChevronDown, ChevronRight, FolderOpen
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { ApprovalDialog } from '../components/ApprovalDialog'
 import { ContextMeter } from '../components/ContextMeter'
+import { DraftMeter } from '../components/DraftMeter'
 import { HistoryDialog } from '../components/HistoryDialog'
 import { NotesDialog } from '../components/NotesDialog'
 import { LogoMark } from '../components/Logo'
@@ -494,6 +495,7 @@ function Composer() {
             <Kbd>Enter</Kbd> to send · <Kbd>Shift+Enter</Kbd> new line{running && <> · <Kbd>Esc</Kbd> to stop</>}
           </span>
           <div className="flex items-center gap-3">
+            <DraftMeter />
             <ContextMeter />
             {running && (
               <Button variant="danger" className="h-10 px-5 text-sm" onClick={stop}>

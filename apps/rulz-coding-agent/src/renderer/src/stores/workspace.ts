@@ -154,6 +154,9 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       case 'context':
         set({ context: e.context })
         break
+      case 'draft':
+        set((s) => ({ tasks: updateTask(s.tasks, e.taskId, (t) => ({ ...t, draft: e.draft })) }))
+        break
     }
   })
 
