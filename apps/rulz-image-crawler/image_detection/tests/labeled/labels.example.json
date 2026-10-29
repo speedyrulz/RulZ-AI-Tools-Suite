@@ -1,0 +1,17 @@
+{
+  "thresholds": {"woman_long_fingers": 0.8},
+  "images": {
+    "blonde_man_01.jpg": ["man_blonde_hair"],
+    "blonde_man_02.jpg": ["man_blonde_hair"],
+    "blonde_man_03.jpg": ["man_blonde_hair"],
+    "long_fingers_01.jpg": ["woman_long_fingers"],
+    "long_fingers_02.jpg": ["woman_long_fingers"],
+    "long_fingers_03.jpg": ["woman_long_fingers"],
+    "neg_blonde_woman.jpg": [],
+    "neg_light_brown_man.jpg": [],
+    "neg_man_in_hat.jpg": [],
+    "neg_blonde_woman_next_to_dark_haired_man.jpg": [],
+    "neg_woman_fist.jpg": [],
+    "neg_woman_long_nails.jpg": []
+  }
+}
