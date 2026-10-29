@@ -155,6 +155,9 @@ export function SettingsPage() {
           <Field inline label="Expand reasoning blocks by default">
             <Switch checked={settings.expandThinking} onCheckedChange={(v) => void update({ expandThinking: v })} />
           </Field>
+          <Field inline label="Keep reasoning open after the answer" hint="The reasoning stays open once the reply starts; you can still fold it away">
+            <Switch checked={settings.keepThinkingOpen} onCheckedChange={(v) => void update({ keepThinkingOpen: v })} />
+          </Field>
         </Card>
 
         <Card title="Appearance">

@@ -1,4 +1,4 @@
-import { splitThink } from '@shared/think'
+import { splitThink, thinkingOpen } from '@shared/think'
 import { afterAll, describe, expect, it } from 'vitest'
 import { samplingRequest, skipsThinking } from '@shared/defaults'
 import { findServer, parseLoadInfo, parseModels, pickDefaultModel, RulzClient, type TurnResult } from '../src/main/rulz/client'
@@ -44,6 +44,30 @@ describe('SseParser', () => {
   it('reads error bodies', () => {
     expect(errorFromBody(400, '{"error":{"message":"context exceeded"}}')).toBe('context exceeded')
     expect(errorFromBody(500, '')).toBe('HTTP 500')
+  })
+})
+
+describe('thinking box', () => {
+  it('folds away once the answer starts, unless kept open', () => {
+    // While thinking it is open either way.
+    expect(thinkingOpen(null, true, true, false)).toBe(true)
+    expect(thinkingOpen(null, true, true, true)).toBe(true)
+    // Once the answer starts it folds away by default, and stays open with the setting on.
+    expect(thinkingOpen(null, false, true, false)).toBe(false)
+    expect(thinkingOpen(null, false, true, true)).toBe(true)
+  })
+  it('starts folded for earlier replies that were never live', () => {
+    expect(thinkingOpen(null, false, false, true)).toBe(false)
+  })
+  it('lets the owner open or close it by hand', () => {
+    expect(thinkingOpen(false, false, true, true)).toBe(false)
+    expect(thinkingOpen(false, true, true, false)).toBe(false)
+    expect(thinkingOpen(true, false, true, false)).toBe(true)
+  })
+  it('is off by default and saved with the other settings', () => {
+    expect(parseSettings({}).keepThinkingOpen).toBe(false)
+    expect(parseSettings({ keepThinkingOpen: true }).keepThinkingOpen).toBe(true)
+    expect(parseSettings({ keepThinkingOpen: 'yes' }).keepThinkingOpen).toBe(false)
   })
 })
 

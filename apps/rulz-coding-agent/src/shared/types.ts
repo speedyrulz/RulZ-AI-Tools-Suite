@@ -30,6 +30,8 @@ export interface AppSettings {
   remotePort: number
   /** Secret the phone sends to connect; made the first time phone access is turned on. */
   remoteToken: string
+  /** Leave the thought-process box open once the answer starts, instead of folding it away. */
+  keepThinkingOpen: boolean
 }
 
 /** How the model writes its answers. Missing = the recommended value for that model. */

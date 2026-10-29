@@ -5,6 +5,8 @@ import type { WireMessage } from '@shared/types'
 import { ContextFullError, fitToContext, pinnedPrefixLength, truncateMiddle } from '../src/main/chat/context'
 import { buildRequestBody } from '../src/main/chat/service'
 import { errorFromBody, interpretChunk, SseParser, statsFromTimings } from '../src/main/chat/sse'
+import { parseSettings } from '../src/main/settings/schema'
+import { openAfterThinking } from '../src/renderer/src/lib/thinking'
 
 describe('SseParser', () => {
   it('handles payloads split across chunks', () => {
@@ -123,5 +125,23 @@ describe('tool-call arguments for templates that print Python values', () => {
     expect(JSON.parse(calls[0].function.arguments)).toEqual({ names: '["x","y"]', deep: 'true', path: 'C:\\a' })
     expect(calls[1].function.arguments).toBe('not json')
     expect(out[0]).toEqual({ role: 'user', content: 'hi' })
+  })
+})
+
+describe('reasoning block after thinking ends', () => {
+  it('folds away by default', () => {
+    expect(openAfterThinking(true, { defaultOpen: false, keepOpen: false })).toBe(false)
+  })
+  it('stays open with "Keep reasoning open after the answer" or "Expand reasoning blocks by default"', () => {
+    expect(openAfterThinking(true, { defaultOpen: false, keepOpen: true })).toBe(true)
+    expect(openAfterThinking(true, { defaultOpen: true, keepOpen: false })).toBe(true)
+  })
+  it('stays folded when the user closed it by hand', () => {
+    expect(openAfterThinking(false, { defaultOpen: false, keepOpen: true })).toBe(false)
+  })
+  it('is off by default and saved with the other settings', () => {
+    expect(parseSettings({}).keepThinkingOpen).toBe(false)
+    expect(parseSettings({ keepThinkingOpen: true }).keepThinkingOpen).toBe(true)
+    expect(parseSettings({ keepThinkingOpen: 'yes' }).keepThinkingOpen).toBe(false)
   })
 })

@@ -68,6 +68,7 @@ export const settingsSchema = z.object({
   defaultSystemPrompt: z.string().catch(D.defaultSystemPrompt),
   contextOverflow: z.enum(['stop', 'truncateMiddle']).catch(D.contextOverflow),
   expandThinking: z.boolean().catch(D.expandThinking),
+  keepThinkingOpen: z.boolean().catch(D.keepThinkingOpen),
   rightPanelOpen: z.boolean().catch(D.rightPanelOpen),
   minimizeToTray: z.boolean().catch(D.minimizeToTray),
   closeToTray: z.boolean().catch(D.closeToTray),
