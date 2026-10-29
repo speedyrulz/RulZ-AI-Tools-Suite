@@ -23,6 +23,7 @@ import type {
 import { DEFAULT_MAX_OUTPUT_TOKENS, MAX_INSTRUCTION_CHARS, samplingRequest } from '@shared/defaults'
 import { splitThink } from '@shared/think'
 import { friendlyServerError, pickDefaultModel, type RulzClient, type TurnResult } from '../rulz/client'
+import { addDraft } from '../rulz/draft'
 import type { Snapshot, Snapshotter } from '../project/snapshots'
 import type { ProjectData, ProjectStore } from '../project/store'
 import { BackgroundCommands, commandHints, commandReport, headTail, runCommand } from './commands'
@@ -624,6 +625,7 @@ export class ProjectSession {
       } else this.emit({ type: 'item', item: { ...finished } })
     }
     this.measure(result, estimated, nCtx)
+    this.countDrafts(task, model, result)
     return result
   }
 
@@ -639,6 +641,16 @@ export class ProjectSession {
     }
     this.data.context = context
     this.emit({ type: 'context', context })
+    this.scheduleSave()
+  }
+
+  /** Adds the turn's speculative-decoding numbers to the task's draft stats. */
+  private countDrafts(task: TaskRecord, model: string, result: TurnResult): void {
+    if (!result.gen) return
+    const draft = addDraft(task.draft, result.gen, this.deps.client.noDraftBaseline(model))
+    if (!draft || draft === task.draft) return
+    task.draft = draft
+    this.emit({ type: 'draft', taskId: task.id, draft })
     this.scheduleSave()
   }
 

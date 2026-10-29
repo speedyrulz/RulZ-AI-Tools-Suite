@@ -34,6 +34,18 @@ interface Timings {
   predicted_ms?: number
   predicted_per_second?: number
   cache_n?: number
+  /** Speculative decoding: tokens the draft (MTP head or draft model) proposed, and how many the model accepted. */
+  draft_n?: number
+  draft_n_accepted?: number
+}
+
+/** One turn's generation numbers, for the draft stats. */
+export interface GenTimings {
+  generated: number
+  genMs: number
+  /** Absent when the server isn't drafting. */
+  drafted?: number
+  accepted?: number
 }
 
 export interface ToolCallDelta {
@@ -51,6 +63,7 @@ export interface ChunkInfo {
   timings?: Timings
   /** Exact token counts, from llama.cpp's timings or an OpenAI-style usage block. */
   usage?: { prompt: number; completion: number }
+  gen?: GenTimings
   progress?: { processed: number; total: number }
   error?: string
 }
@@ -94,6 +107,13 @@ export function interpretChunk(json: unknown): ChunkInfo {
     out.usage = { prompt: (j.timings.cache_n ?? 0) + j.timings.prompt_n, completion: j.timings.predicted_n ?? 0 }
   } else if (typeof j.usage?.prompt_tokens === 'number') {
     out.usage = { prompt: j.usage.prompt_tokens, completion: j.usage.completion_tokens ?? 0 }
+  }
+  if (j.timings?.predicted_n !== undefined && j.timings.predicted_ms !== undefined) {
+    out.gen = { generated: j.timings.predicted_n, genMs: j.timings.predicted_ms }
+    if (j.timings.draft_n !== undefined) {
+      out.gen.drafted = j.timings.draft_n
+      out.gen.accepted = j.timings.draft_n_accepted ?? 0
+    }
   }
   if (j.prompt_progress?.total) {
     const cache = j.prompt_progress.cache ?? 0

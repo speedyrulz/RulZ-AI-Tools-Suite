@@ -215,6 +215,22 @@ export interface ContextUsage {
   exact: boolean
 }
 
+/** Speculative decoding (MTP / draft model) over a task's model turns, from llama.cpp's timings. */
+export interface DraftStats {
+  /** Tokens the draft proposed. */
+  drafted: number
+  /** Drafted tokens the model accepted. */
+  accepted: number
+  /** Tokens generated in the turns that drafted. */
+  generated: number
+  /** Generation time of those turns. */
+  genMs: number
+  /** Estimated generation time saved by drafting (negative when it slowed things down). */
+  savedMs: number
+  /** True when every turn's estimate used a measured no-drafting speed; false when some used the upper bound. */
+  measured: boolean
+}
+
 export type TaskOutcome = 'running' | 'done' | 'stopped' | 'error'
 
 export interface TaskRecord {
@@ -228,6 +244,7 @@ export interface TaskRecord {
   undone?: boolean
   steps: Step[]
   files: ChangedFile[]
+  draft?: DraftStats
 }
 
 /** Everything the workspace needs when a project opens. */
@@ -303,6 +320,7 @@ export type AgentEvent =
   | { type: 'task-end'; projectPath: string; task: TaskRecord }
   | { type: 'tasks'; projectPath: string; tasks: TaskRecord[] }
   | { type: 'context'; projectPath: string; context: ContextUsage }
+  | { type: 'draft'; projectPath: string; taskId: string; draft: DraftStats }
 
 // ---------- Tool servers (set up in RulZ LLM Suite) ----------
 
