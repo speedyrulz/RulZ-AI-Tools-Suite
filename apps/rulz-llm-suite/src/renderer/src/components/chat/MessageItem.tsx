@@ -1,4 +1,4 @@
-import { Check, Copy, FastForward, FileText, GitBranch, Pencil, RotateCcw, Trash2, TriangleAlert } from 'lucide-react'
+import { Check, Copy, CornerDownRight, FastForward, FileText, GitBranch, Pencil, RotateCcw, Trash2, TriangleAlert } from 'lucide-react'
 import { memo, useEffect, useRef, useState } from 'react'
 import type { ChatMessage, GenerationStats } from '@shared/types'
 import { cn, formatBytes, formatDuration, formatNumber } from '../../lib/format'
@@ -157,6 +157,12 @@ export const MessageItem = memo(function MessageItem({
         ))}
       {content && <Markdown text={content} />}
       {message.toolCalls?.map((c) => <ToolCallBlock key={c.id} call={c} />)}
+      {message.interrupted && (
+        <div className="mt-1 flex items-center gap-1.5 text-xs text-faint">
+          <CornerDownRight size={13} />
+          Stopped here to add your note; the model saw its thinking so far.
+        </div>
+      )}
       {message.error && (
         <div className="mt-2 flex items-start gap-2 rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger">
           <TriangleAlert size={14} className="mt-px shrink-0" />

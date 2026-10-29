@@ -43,6 +43,7 @@ import {
 import * as files from './fileTools'
 import type { ToolOutcome } from './fileTools'
 import { LoopGuard, type GuardTrip } from './loopGuard'
+import { cutTurnContent, NoteQueue, noteMessage } from './notes'
 import { formatPageReport, pageHasProblems, pageTarget, type PageReport, type PageTarget } from './pageCheck'
 import { resolveInProject } from './pathGuard'
 import { HOW_TO_RUN_TASK, parseRunLine, parseShareLine, systemPrompt } from './prompt'
@@ -116,6 +117,8 @@ export class ProjectSession {
   /** Tool-server tools the model has loaded, oldest first. */
   private loaded = new Map<string, ToolInfo>()
   private nCtx = DEFAULT_CTX
+  /** Notes the owner writes while the task runs. */
+  private notes = new NoteQueue()
 
   constructor(
     public data: ProjectData,
@@ -139,7 +142,8 @@ export class ProjectSession {
       prompt: this.pending?.request ?? null,
       runCommand: this.data.runCommand,
       memory: this.data.memory,
-      context: this.data.context
+      context: this.data.context,
+      notes: this.notes.pending
     }
   }
 
@@ -222,6 +226,22 @@ export class ProjectSession {
 
   stop(): void {
     this.abort?.abort()
+  }
+
+  /** A note for the running task; it goes in before the next step, or at once with `interrupt`. */
+  addNote(text: string, interrupt = false): void {
+    if (!this.running) throw new Error('No task is running, so send this as a new task instead.')
+    if (!this.notes.add(text, interrupt)) return
+    this.emit({ type: 'notes', notes: this.notes.pending })
+  }
+
+  cancelNote(id: string): void {
+    if (this.notes.cancel(id)) this.emit({ type: 'notes', notes: this.notes.pending })
+  }
+
+  /** Cuts the model's current reply short so waiting notes apply now. */
+  interrupt(): void {
+    if (this.notes.size) this.notes.interrupt()
   }
 
   answer(promptId: string, answer: PromptAnswer): void {
@@ -345,6 +365,11 @@ export class ProjectSession {
       }
     } finally {
       this.closeOpenCalls()
+      const unsent = this.notes.take()
+      if (unsent.length) {
+        this.notice(`Not sent, because the task ended first: ${unsent.map((n) => `"${n.text}"`).join(', ')}`, 'warn', task.id)
+        this.emit({ type: 'notes', notes: [] })
+      }
       for (const s of task.steps) if (s.status === 'running' || s.status === 'waiting') this.updateStep(s, { status: 'skipped' })
       task.endedAt = Date.now()
       if (snap) await this.refreshFiles(task, snap).catch(() => undefined)
@@ -435,8 +460,15 @@ export class ProjectSession {
 
     for (;;) {
       if (signal.aborted) throw new StopTask()
+      this.deliverNotes(task)
       const request = await this.buildRequest(model, nCtx, signal)
       const turn = await this.streamTurn(task, model, request, nCtx, signal)
+      if (turn.cut) {
+        // Keep what the model had so far, then hand it the notes along with its thinking.
+        this.data.messages.push({ role: 'assistant', content: cutTurnContent(cleanContent(turn.content)) })
+        this.deliverNotes(task, turn.cut)
+        continue
+      }
       const content = cleanContent(turn.content)
       const calls = turn.toolCalls
       this.data.messages.push({ role: 'assistant', content, ...(calls.length ? { tool_calls: calls } : {}) })
@@ -457,6 +489,8 @@ export class ProjectSession {
           })
           if (++textCalls <= MAX_TEXT_CALLS) continue
         }
+        // A note that came in during the final reply: the model gets to act on it.
+        if (this.notes.size) continue
         return
       }
 
@@ -485,6 +519,15 @@ export class ProjectSession {
         limit = steps + settings.maxSteps
       }
     }
+  }
+
+  /** Puts the waiting notes into the conversation (and the timeline, where they now apply). */
+  private deliverNotes(task: TaskRecord, cut?: { thinking: string }): void {
+    const notes = this.notes.take()
+    if (!notes.length && !cut) return
+    for (const n of notes) this.addItem({ id: randomUUID(), kind: 'user', text: n.text, taskId: task.id, note: cut ? 'cut' : 'queued' })
+    this.data.messages.push({ role: 'user', content: noteMessage(notes.map((n) => n.text), cut) })
+    this.emit({ type: 'notes', notes: this.notes.pending })
   }
 
   private async handleStuck(task: TaskRecord, message: string, reason: GuardTrip | 'limit', signal: AbortSignal): Promise<void> {
@@ -576,7 +619,14 @@ export class ProjectSession {
     if (range.to <= this.taskStart) this.taskStart -= range.to - range.from
   }
 
-  private async streamTurn(task: TaskRecord, model: string, messages: WireMessage[], nCtx: number, signal: AbortSignal): Promise<TurnResult> {
+  /** One model turn. `cut` is set when a note cut it short: the result then holds what came so far. */
+  private async streamTurn(
+    task: TaskRecord,
+    model: string,
+    messages: WireMessage[],
+    nCtx: number,
+    signal: AbortSignal
+  ): Promise<TurnResult & { cut?: { thinking: string } }> {
     const own = this.deps.settings().modelSampling[model]
     // With thinking skipped no thoughts will stream, so don't promise them.
     this.setStatus({ phase: 'thinking', text: skipsThinking(own) ? 'Working… (thinking is off in Model settings)' : 'Thinking…' })
@@ -587,31 +637,41 @@ export class ProjectSession {
     const cap = own?.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS
     const maxTokens = Math.max(Math.min(1024, cap), Math.min(cap, nCtx - Math.ceil(estimated * this.scale) - 256))
     const sampling = samplingRequest(model, own)
-    const result = await this.deps.client.streamTurn({ model, messages, tools, max_tokens: maxTokens, ...sampling }, signal, {
-      onProgress: (done, total) => {
-        if (total > 4000) this.setStatus({ phase: 'thinking', text: `Reading the project notes… ${Math.round((done / total) * 100)}%` })
-      },
-      onReasoning: (text) => {
-        if (!item) {
-          item = { id: randomUUID(), kind: 'assistant', text: '', taskId: task.id }
-          this.addItem(item)
+    let result: TurnResult & { cut?: { thinking: string } }
+    const turnSignal = this.notes.beginTurn(signal)
+    try {
+      result = await this.deps.client.streamTurn({ model, messages, tools, max_tokens: maxTokens, ...sampling }, turnSignal, {
+        onProgress: (done, total) => {
+          if (total > 4000) this.setStatus({ phase: 'thinking', text: `Reading the project notes… ${Math.round((done / total) * 100)}%` })
+        },
+        onReasoning: (text) => {
+          if (!item) {
+            item = { id: randomUUID(), kind: 'assistant', text: '', taskId: task.id }
+            this.addItem(item)
+          }
+          item.reasoning = (item.reasoning ?? '') + text
+          this.emit({ type: 'reasoning', itemId: item.id, text })
+        },
+        onContent: (text) => {
+          if (!item) {
+            item = { id: randomUUID(), kind: 'assistant', text: '', taskId: task.id }
+            this.addItem(item)
+          }
+          if (!item.text) this.setStatus({ phase: 'thinking', text: 'Writing…' })
+          item.text += text
+          this.emit({ type: 'delta', itemId: item.id, text })
+        },
+        onToolDelta: () => {
+          if (this.statusNow.phase !== 'working') this.setStatus({ phase: 'working', text: 'Preparing the next step…' })
         }
-        item.reasoning = (item.reasoning ?? '') + text
-        this.emit({ type: 'reasoning', itemId: item.id, text })
-      },
-      onContent: (text) => {
-        if (!item) {
-          item = { id: randomUUID(), kind: 'assistant', text: '', taskId: task.id }
-          this.addItem(item)
-        }
-        if (!item.text) this.setStatus({ phase: 'thinking', text: 'Writing…' })
-        item.text += text
-        this.emit({ type: 'delta', itemId: item.id, text })
-      },
-      onToolDelta: () => {
-        if (this.statusNow.phase !== 'working') this.setStatus({ phase: 'working', text: 'Preparing the next step…' })
-      }
-    })
+      })
+    } catch (e) {
+      if (!this.notes.endTurn() || signal.aborted) throw e
+      // Cut short by a note: half-made tool calls are dropped, the text and thinking so far are kept.
+      const partial = item as Extract<TimelineItem, { kind: 'assistant' }> | null
+      result = { content: partial?.text ?? '', toolCalls: [], finishReason: 'interrupted', cut: { thinking: '' } }
+    }
+    this.notes.endTurn()
     const finished = item as Extract<TimelineItem, { kind: 'assistant' }> | null
     if (finished) {
       // Inline <think> text joins the separately sent reasoning.
@@ -620,6 +680,7 @@ export class ProjectSession {
       const thinking = [finished.reasoning?.trim(), reasoning].filter(Boolean).join('\n\n')
       if (thinking) finished.reasoning = thinking
       else delete finished.reasoning
+      if (result.cut) result.cut.thinking = thinking
       if (!finished.text && !thinking) {
         this.data.timeline = this.data.timeline.filter((i) => i.id !== finished.id)
         this.emit({ type: 'item', item: { ...finished, text: '' } })

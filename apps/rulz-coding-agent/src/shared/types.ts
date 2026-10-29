@@ -195,7 +195,7 @@ export interface ChangedFile {
 }
 
 export type TimelineItem =
-  | { id: string; kind: 'user'; text: string; taskId: string }
+  | { id: string; kind: 'user'; text: string; taskId: string; /** Sent while the task ran; `cut` when it cut the model's reply short. */ note?: 'queued' | 'cut' }
   | { id: string; kind: 'assistant'; text: string; taskId: string; /** The model's thinking before this reply, when it sent any. */ reasoning?: string }
   | {
       id: string
@@ -250,6 +250,12 @@ export interface TaskRecord {
 }
 
 /** Everything the workspace needs when a project opens. */
+/** A note the owner wrote while a task runs, waiting to go in before the agent's next step. */
+export interface PendingNote {
+  id: string
+  text: string
+}
+
 export interface ProjectState {
   project: ProjectInfo
   timeline: TimelineItem[]
@@ -260,6 +266,8 @@ export interface ProjectState {
   /** The owner's "Things to always remember" for this project. */
   memory: string
   context: ContextUsage | null
+  /** Notes waiting for the agent's next step. */
+  notes: PendingNote[]
 }
 
 // ---------- Questions the agent asks the owner ----------
@@ -323,6 +331,7 @@ export type AgentEvent =
   | { type: 'tasks'; projectPath: string; tasks: TaskRecord[] }
   | { type: 'context'; projectPath: string; context: ContextUsage }
   | { type: 'draft'; projectPath: string; taskId: string; draft: DraftStats }
+  | { type: 'notes'; projectPath: string; notes: PendingNote[] }
 
 // ---------- Tool servers (set up in RulZ LLM Suite) ----------
 

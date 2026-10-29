@@ -4,6 +4,7 @@ import type {
   AgentEvent,
   AgentStatus,
   ContextUsage,
+  PendingNote,
   PendingPrompt,
   ProjectInfo,
   ProjectState,
@@ -24,6 +25,8 @@ interface WorkspaceState {
   running: boolean
   status: AgentStatus
   prompt: PendingPrompt | null
+  /** Notes waiting for the running task's next step. */
+  notes: PendingNote[]
   runCommand: string | null
   /** The owner's "Things to always remember". */
   memory: string
@@ -37,6 +40,11 @@ interface WorkspaceState {
   close: () => Promise<void>
   send: (text: string) => Promise<void>
   stop: () => void
+  /** A note for the running task: before its next step, or at once (cutting the model's reply short) with `interrupt`. */
+  addNote: (text: string, interrupt: boolean) => Promise<void>
+  cancelNote: (id: string) => void
+  /** Cuts the model's current reply short so the waiting notes apply now. */
+  interrupt: () => void
   answer: (answer: PromptAnswer) => void
   /** Undoes the last task, or with an id goes back to before that task (undoing every later one too). */
   undo: (taskId?: string) => Promise<void>
@@ -61,6 +69,7 @@ const CLOSED = {
   tasks: [],
   running: false,
   prompt: null,
+  notes: [],
   run: null,
   memory: '',
   context: null,
@@ -76,6 +85,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       tasks: state.tasks,
       running: state.running,
       prompt: state.prompt,
+      notes: state.notes ?? [],
       runCommand: state.runCommand,
       memory: state.memory,
       context: state.context,
@@ -145,7 +155,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
         set({ prompt: e.prompt })
         break
       case 'task-end':
-        set((s) => ({ tasks: updateTask(s.tasks, e.task.id, () => e.task), running: false, prompt: null, status: { phase: 'idle' } }))
+        set((s) => ({ tasks: updateTask(s.tasks, e.task.id, () => e.task), running: false, prompt: null, notes: [], status: { phase: 'idle' } }))
         void invoke('projects:open', e.projectPath).then((st) => set({ runCommand: st.runCommand }), () => undefined)
         break
       case 'tasks':
@@ -156,6 +166,9 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
         break
       case 'draft':
         set((s) => ({ tasks: updateTask(s.tasks, e.taskId, (t) => ({ ...t, draft: e.draft })) }))
+        break
+      case 'notes':
+        set({ notes: e.notes })
         break
     }
   })
@@ -179,6 +192,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     running: false,
     status: { phase: 'idle' },
     prompt: null,
+    notes: [],
     runCommand: null,
     memory: '',
     context: null,
@@ -232,6 +246,26 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     stop: () => {
       const project = get().project
       if (project) void invoke('task:stop', project.path)
+    },
+
+    addNote: async (text, interrupt) => {
+      const project = get().project
+      if (!project || !text.trim()) return
+      try {
+        await invoke('task:note', project.path, text, interrupt)
+      } catch (e) {
+        toast.error(errorMessage(e))
+      }
+    },
+
+    cancelNote: (id) => {
+      const project = get().project
+      if (project) void invoke('task:cancelNote', project.path, id)
+    },
+
+    interrupt: () => {
+      const project = get().project
+      if (project) void invoke('task:interrupt', project.path)
     },
 
     answer: (answer) => {

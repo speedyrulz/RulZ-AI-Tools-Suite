@@ -317,6 +317,9 @@ async function main(): Promise<void> {
   handle('task:start', (path, text) => requireSession(path).start(text))
   handle('task:stop', (path) => requireSession(path).stop())
   handle('task:answer', (path, id, answer) => requireSession(path).answer(id, answer))
+  handle('task:note', (path, text, interrupt) => requireSession(path).addNote(text, interrupt))
+  handle('task:cancelNote', (path, id) => requireSession(path).cancelNote(id))
+  handle('task:interrupt', (path) => requireSession(path).interrupt())
   handle('task:undo', async (path, taskId) => {
     const s = requireSession(path)
     await runner?.stop()

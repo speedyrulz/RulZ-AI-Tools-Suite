@@ -70,6 +70,11 @@ export interface IpcInvoke {
   'task:start': (projectPath: string, text: string) => void
   'task:stop': (projectPath: string) => void
   'task:answer': (projectPath: string, promptId: string, answer: PromptAnswer) => void
+  /** A note for the running task, added before its next step; `interrupt` also cuts the model's current reply short. */
+  'task:note': (projectPath: string, text: string, interrupt: boolean) => void
+  'task:cancelNote': (projectPath: string, noteId: string) => void
+  /** Cuts the model's current reply short so the waiting notes apply now (running commands go on). */
+  'task:interrupt': (projectPath: string) => void
   /**
    * Restores the project to how it was before the last task that wasn't undone yet, or, with a
    * task id, to before that task (undoing it and every later task).

@@ -416,6 +416,8 @@ export interface ChatMessage {
   error?: string
   /** Tool calls the assistant made in this turn, with their results once run. */
   toolCalls?: ToolCall[]
+  /** The user stopped this reply to add a note (Send now); the next user message carries its thinking. */
+  interrupted?: boolean
   createdAt: number
 }
 
