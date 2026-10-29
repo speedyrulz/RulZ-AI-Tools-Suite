@@ -60,6 +60,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   defaultSystemPrompt: '',
   contextOverflow: 'truncateMiddle',
   expandThinking: false,
+  keepThinkingOpen: false,
   rightPanelOpen: true,
   minimizeToTray: false,
   closeToTray: false,

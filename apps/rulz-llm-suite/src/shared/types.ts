@@ -93,6 +93,8 @@ export interface AppSettings {
   defaultSystemPrompt: string
   contextOverflow: ContextOverflow
   expandThinking: boolean
+  /** Leave a reasoning block open once the answer starts, instead of folding it away. */
+  keepThinkingOpen: boolean
   rightPanelOpen: boolean
   /** Minimizing hides the window to the system tray instead of the taskbar. */
   minimizeToTray: boolean

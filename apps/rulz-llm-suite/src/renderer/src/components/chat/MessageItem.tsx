@@ -52,6 +52,7 @@ export const MessageItem = memo(function MessageItem({
   const [editing, setEditing] = useState(false)
   const [copied, setCopied] = useState(false)
   const expandThinking = useApp((s) => s.settings?.expandThinking ?? false)
+  const keepThinkingOpen = useApp((s) => s.settings?.keepThinkingOpen ?? false)
   const busy = useChat((s) => !!s.generation)
   const { regenerate, continueMessage, deleteMessage, branchFrom } = useChat.getState()
   const isUser = message.role === 'user'
@@ -138,6 +139,7 @@ export const MessageItem = memo(function MessageItem({
           streaming={reasoningOpen}
           durationMs={message.reasoningMs}
           defaultOpen={expandThinking}
+          keepOpen={keepThinkingOpen}
         />
       )}
       {waiting &&

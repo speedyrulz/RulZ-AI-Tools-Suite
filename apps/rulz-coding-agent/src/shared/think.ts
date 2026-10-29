@@ -18,3 +18,12 @@ export function splitThink(text: string): { reasoning: string; answer: string } 
   })
   return { reasoning: parts.map((p) => p.trim()).filter(Boolean).join('\n\n'), answer: answer.trim() }
 }
+
+/**
+ * Whether a thinking box shows its thoughts. The owner's own click wins; otherwise it is open while the
+ * model thinks, and stays open afterwards only when "Keep thinking open after the answer" is on.
+ * Boxes that were never live (earlier tasks) start folded either way.
+ */
+export function thinkingOpen(chosen: boolean | null, live: boolean, wasLive: boolean, keepOpen: boolean): boolean {
+  return chosen ?? (live || (keepOpen && wasLive))
+}

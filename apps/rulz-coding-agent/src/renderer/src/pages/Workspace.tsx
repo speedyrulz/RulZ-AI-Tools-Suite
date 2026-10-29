@@ -17,7 +17,7 @@ import { cn } from '../lib/format'
 import { activeModelId, useApp } from '../stores/app'
 import { undoableTask, useWorkspace } from '../stores/workspace'
 import { ThemeToggle } from './Home'
-import { splitThink } from '@shared/think'
+import { splitThink, thinkingOpen } from '@shared/think'
 
 const EXAMPLES = [
   'Make a simple to-do list desktop app',
@@ -337,10 +337,13 @@ function Conversation() {
   )
 }
 
-/** The model's thinking above a reply: open while it streams, folded away once the answer starts. */
+/** The model's thinking above a reply: open while it streams, folded away once the answer starts (unless the owner keeps it open). */
 function ThinkingBlock({ text, live }: { text: string; live: boolean }) {
+  const keepOpen = useApp((s) => s.settings?.keepThinkingOpen ?? false)
   const [chosen, setChosen] = useState<boolean | null>(null)
-  const open = chosen ?? live
+  const [wasLive, setWasLive] = useState(live)
+  if (live && !wasLive) setWasLive(true)
+  const open = thinkingOpen(chosen, live, wasLive, keepOpen)
   const body = useRef<HTMLDivElement>(null)
   useLayoutEffect(() => {
     if (live && open && body.current) body.current.scrollTop = body.current.scrollHeight

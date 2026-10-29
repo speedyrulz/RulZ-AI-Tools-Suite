@@ -208,6 +208,10 @@ export function SettingsDialog() {
           )}
         </Field>
 
+        <Field label="Keep thinking open after the answer" hint="My thought process stays open once I start answering. You can still fold it away." inline>
+          <Switch checked={settings.keepThinkingOpen} onCheckedChange={(v) => void update({ keepThinkingOpen: v })} label="Keep thinking open after the answer" />
+        </Field>
+
         <Field label="When should I ask you first?">
           <ApprovalChooser value={settings.approval} onChange={(approval) => void update({ approval })} />
         </Field>

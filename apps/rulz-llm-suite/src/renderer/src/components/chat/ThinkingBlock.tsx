@@ -2,6 +2,7 @@ import * as Collapsible from '@radix-ui/react-collapsible'
 import { Brain, ChevronRight } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { formatDuration } from '../../lib/format'
+import { openAfterThinking } from '../../lib/thinking'
 import { Markdown } from './Markdown'
 
 /** Splits a leading <think>…</think> block out of content, for models whose reasoning isn't parsed server-side. */
@@ -15,13 +16,16 @@ export function ThinkingBlock({
   reasoning,
   streaming,
   durationMs,
-  defaultOpen
+  defaultOpen,
+  keepOpen
 }: {
   reasoning: string
   /** True while the model is still producing reasoning. */
   streaming: boolean
   durationMs?: number
   defaultOpen: boolean
+  /** Stay open after the model finishes thinking. */
+  keepOpen: boolean
 }) {
   const [open, setOpen] = useState(defaultOpen || streaming)
   const [startedAt] = useState(() => Date.now())
@@ -34,8 +38,8 @@ export function ThinkingBlock({
   }, [streaming])
 
   useEffect(() => {
-    if (!streaming && !defaultOpen) setOpen(false)
-  }, [streaming, defaultOpen])
+    if (!streaming) setOpen((o) => openAfterThinking(o, { defaultOpen, keepOpen }))
+  }, [streaming, defaultOpen, keepOpen])
 
   const label = streaming
     ? `Thinking… ${formatDuration(Date.now() - startedAt)}`
