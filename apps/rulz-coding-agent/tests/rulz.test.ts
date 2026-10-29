@@ -1,6 +1,6 @@
 import { splitThink } from '@shared/think'
 import { afterAll, describe, expect, it } from 'vitest'
-import { samplingRequest } from '@shared/defaults'
+import { samplingRequest, skipsThinking } from '@shared/defaults'
 import { findServer, parseLoadInfo, parseModels, pickDefaultModel, RulzClient, type TurnResult } from '../src/main/rulz/client'
 import { parseSettings } from '../src/main/settings'
 import { addDraft, noDraftMsPerToken, turnSavedMs } from '../src/main/rulz/draft'
@@ -26,6 +26,20 @@ describe('SseParser', () => {
     })
     expect(interpretChunk({ choices: [], usage: { prompt_tokens: 900, completion_tokens: 12 } }).usage).toEqual({ prompt: 900, completion: 12 })
     expect(interpretChunk({ choices: [{ delta: { content: 'hi' } }] }).usage).toBeUndefined()
+  })
+  it('reads thinking from every stream format', () => {
+    // llama.cpp / DeepSeek
+    expect(interpretChunk({ choices: [{ delta: { reasoning_content: 'plan' } }] })).toEqual({ reasoning: 'plan' })
+    // vLLM, LM Studio, OpenRouter
+    expect(interpretChunk({ choices: [{ delta: { reasoning: 'plan', content: null } }] })).toEqual({ reasoning: 'plan' })
+    // Anthropic-style events
+    expect(interpretChunk({ type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'plan' } })).toEqual({ reasoning: 'plan' })
+    expect(interpretChunk({ type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: 'Done' } })).toEqual({ content: 'Done' })
+    expect(interpretChunk({ type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'x' } })).toEqual({})
+    // Inline <think> tags stay in the content; splitThink separates them, also mid-stream.
+    const inline = ['<thi', 'nk>pl', 'an</think>Do', 'ne'].map((c) => interpretChunk({ choices: [{ delta: { content: c } }] }).content)
+    expect(splitThink(inline.slice(0, 2).join(''))).toEqual({ reasoning: 'pl', answer: '' })
+    expect(splitThink(inline.join(''))).toEqual({ reasoning: 'plan', answer: 'Done' })
   })
   it('reads error bodies', () => {
     expect(errorFromBody(400, '{"error":{"message":"context exceeded"}}')).toBe('context exceeded')
@@ -232,6 +246,27 @@ describe('RulzClient', () => {
   })
 })
 
+describe('RulzClient thinking', () => {
+  it('streams reasoning_content to onReasoning before the answer', async () => {
+    const mock = await startMockRulz({ turns: [{ reasoning: 'First I look at the files.', content: 'Done.' }] })
+    try {
+      const client = new RulzClient(() => ({ url: mock.url, apiKey: '' }))
+      const events: string[] = []
+      const turn = await client.streamTurn({ model: 'm', messages: [{ role: 'user', content: 'go' }] }, new AbortController().signal, {
+        onReasoning: (t) => events.push(`r:${t}`),
+        onContent: (t) => events.push(`c:${t}`)
+      })
+      const reasoning = events.filter((e) => e.startsWith('r:')).map((e) => e.slice(2))
+      expect(reasoning.length).toBeGreaterThan(1)
+      expect(reasoning.join('')).toBe('First I look at the files.')
+      expect(events.findIndex((e) => e.startsWith('c:'))).toBeGreaterThan(events.findLastIndex((e) => e.startsWith('r:')))
+      expect(turn.content).toBe('Done.')
+    } finally {
+      await mock.close()
+    }
+  })
+})
+
 describe('model settings', () => {
   it('lays the owner settings settings over the recommended ones', () => {
     expect(samplingRequest('Qwen3-Coder-30B', undefined)).toEqual({ temperature: 0.7, top_p: 0.8, top_k: 20, repeat_penalty: 1.05 })
@@ -250,6 +285,10 @@ describe('model settings', () => {
     // Off wins over the effort and budget; no thinking setting sends nothing.
     expect(samplingRequest('gemma-4', { thinking: 'off', reasoningEffort: 'high', thinkingBudget: 10 })).toEqual({ chat_template_kwargs: { enable_thinking: false } })
     expect(samplingRequest('gemma-4', { reasoningEffort: 'low' })).toEqual({ reasoning_effort: 'low' })
+    expect(skipsThinking({ thinkingBudget: 0 })).toBe(true)
+    expect(skipsThinking({ thinking: 'off' })).toBe(true)
+    expect(skipsThinking({ thinkingBudget: 2048 })).toBe(false)
+    expect(skipsThinking(undefined)).toBe(false)
   })
 
   it('drops bad saved values one at a time', () => {

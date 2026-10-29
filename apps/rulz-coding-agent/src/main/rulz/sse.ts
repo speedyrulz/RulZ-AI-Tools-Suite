@@ -68,13 +68,20 @@ export interface ChunkInfo {
   error?: string
 }
 
-/** Extracts what we need from one /v1/chat/completions stream chunk. */
+/**
+ * Extracts what we need from one /v1/chat/completions stream chunk. Thinking can arrive as
+ * reasoning_content (llama.cpp, DeepSeek), as reasoning (vLLM, LM Studio, OpenRouter), or as an
+ * Anthropic-style thinking_delta; inline <think> tags stay in the content for splitThink.
+ */
 export function interpretChunk(json: unknown): ChunkInfo {
   const j = json as {
+    type?: string
+    delta?: { type?: string; text?: string; thinking?: string }
     choices?: {
       delta?: {
         content?: string | null
         reasoning_content?: string | null
+        reasoning?: string | null
         tool_calls?: { index?: number; id?: string; function?: { name?: string; arguments?: string } }[]
       }
       finish_reason?: string | null
@@ -89,9 +96,15 @@ export function interpretChunk(json: unknown): ChunkInfo {
     out.error = typeof j.error === 'string' ? j.error : (j.error.message ?? JSON.stringify(j.error))
     return out
   }
+  if (j.type === 'content_block_delta') {
+    if (j.delta?.type === 'thinking_delta' && j.delta.thinking) out.reasoning = j.delta.thinking
+    if (j.delta?.type === 'text_delta' && j.delta.text) out.content = j.delta.text
+    return out
+  }
   const choice = j.choices?.[0]
   if (choice?.delta?.content) out.content = choice.delta.content
-  if (choice?.delta?.reasoning_content) out.reasoning = choice.delta.reasoning_content
+  const reasoning = choice?.delta?.reasoning_content || choice?.delta?.reasoning
+  if (reasoning) out.reasoning = reasoning
   if (choice?.delta?.tool_calls?.length) {
     out.toolCalls = choice.delta.tool_calls.map((t, i) => ({
       index: t.index ?? i,

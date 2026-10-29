@@ -25,6 +25,9 @@ export function recommendedSampling(model: string): SamplingSettings {
   return isQwenCoder(model) ? { temperature: 0.7, topP: 0.8, topK: 20, repeatPenalty: 1.05 } : {}
 }
 
+/** True when the owner's settings stop the model from thinking (turned off, or a budget of 0). */
+export const skipsThinking = (own: SamplingSettings | undefined): boolean => own?.thinking === 'off' || own?.thinkingBudget === 0
+
 /** Upper limit for one answer when the owner hasn't set one. */
 export const DEFAULT_MAX_OUTPUT_TOKENS = 16384
 

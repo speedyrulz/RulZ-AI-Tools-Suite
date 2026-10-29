@@ -20,7 +20,7 @@ import type {
   WireMessage,
   WireToolCall
 } from '@shared/types'
-import { DEFAULT_MAX_OUTPUT_TOKENS, MAX_INSTRUCTION_CHARS, samplingRequest } from '@shared/defaults'
+import { DEFAULT_MAX_OUTPUT_TOKENS, MAX_INSTRUCTION_CHARS, samplingRequest, skipsThinking } from '@shared/defaults'
 import { splitThink } from '@shared/think'
 import { friendlyServerError, pickDefaultModel, type RulzClient, type TurnResult } from '../rulz/client'
 import { addDraft } from '../rulz/draft'
@@ -577,12 +577,13 @@ export class ProjectSession {
   }
 
   private async streamTurn(task: TaskRecord, model: string, messages: WireMessage[], nCtx: number, signal: AbortSignal): Promise<TurnResult> {
-    this.setStatus({ phase: 'thinking', text: 'Thinking…' })
+    const own = this.deps.settings().modelSampling[model]
+    // With thinking skipped no thoughts will stream, so don't promise them.
+    this.setStatus({ phase: 'thinking', text: skipsThinking(own) ? 'Working… (thinking is off in Model settings)' : 'Thinking…' })
     this.deps.activity('working')
     let item: Extract<TimelineItem, { kind: 'assistant' }> | null = null
     const tools = this.toolDefs()
     const estimated = totalTokens(messages) + estimateTokens(JSON.stringify(tools))
-    const own = this.deps.settings().modelSampling[model]
     const cap = own?.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS
     const maxTokens = Math.max(Math.min(1024, cap), Math.min(cap, nCtx - Math.ceil(estimated * this.scale) - 256))
     const sampling = samplingRequest(model, own)
