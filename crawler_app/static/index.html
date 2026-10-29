@@ -1,0 +1,659 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RulZ Image Crawler</title>
+<link rel="icon" type="image/png" href="icon.png">
+<script>
+  // Theme before first paint: black/red by default, white if the viewer picked light mode.
+  try { document.documentElement.dataset.theme = localStorage.getItem("theme") === "light" ? "light" : "dark"; }
+  catch { document.documentElement.dataset.theme = "dark"; }
+</script>
+<style>
+  :root, :root[data-theme="dark"] {
+    --bg: #0b0b0c; --panel: #151517; --text: #f2f2f3; --muted: #a3a3a9; --border: #2c2c31;
+    --accent: #e30613; --accent-hover: #ff1f2c; --accent-text: #ffffff; --good: #4cc27f;
+    --warn-bg: #2a1a0c; --warn-border: #8a5a1f; --bad: #ff6b6b; --chip: #1f1f23;
+    --header: #000000; --shadow: none; color-scheme: dark;
+  }
+  :root[data-theme="light"] {
+    --bg: #f4f4f5; --panel: #ffffff; --text: #111113; --muted: #5f6068; --border: #dcdce0;
+    --accent: #d1000f; --accent-hover: #b0000c; --accent-text: #ffffff; --good: #1d8a4a;
+    --warn-bg: #fff4d6; --warn-border: #e8c15a; --bad: #c23b3b; --chip: #efeff1;
+    --header: #ffffff; --shadow: 0 1px 2px rgba(0,0,0,.06); color-scheme: light;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); accent-color: var(--accent);
+         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .topbar { background: var(--header); border-bottom: 3px solid var(--accent); }
+  .topbar-inner { max-width: 1200px; margin: 0 auto; padding: 12px 16px; display: flex; align-items: center; gap: 14px; }
+  .brand { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0; }
+  .brand img { height: 40px; width: auto; display: block; }
+  .logo-light { display: none !important; }
+  :root[data-theme="light"] .logo-light { display: block !important; }
+  :root[data-theme="light"] .logo-dark { display: none !important; }
+  h1 { font-size: 22px; margin: 0; font-weight: 700; letter-spacing: .02em; white-space: nowrap; }
+  @media (max-width: 460px) { .brand img { height: 30px; } h1 { font-size: 18px; } }
+  #themeBtn { white-space: nowrap; }
+  main { max-width: 1200px; margin: 0 auto; padding: 20px 16px 48px; }
+  button.primary:hover:not(:disabled), .btn.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+  button:hover:not(:disabled):not(.primary) { border-color: var(--accent); }
+  input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .panel h2 { border-left: 3px solid var(--accent); padding-left: 8px; }
+  .sub { color: var(--muted); margin: 0 0 16px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+           padding: 16px; margin-bottom: 16px; box-shadow: var(--shadow); }
+  .panel h2 { font-size: 15px; margin: 0 0 12px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+  input[type=text], input[type=number], textarea {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--bg); color: var(--text); font: inherit; }
+  textarea { min-height: 96px; resize: vertical; font-size: 14px; }
+  .row { display: grid; gap: 12px; grid-template-columns: 1fr 1fr; }
+  .row4 { display: grid; gap: 12px; grid-template-columns: repeat(4, 1fr); }
+  @media (max-width: 720px) { .row, .row4 { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 460px) { .row, .row4 { grid-template-columns: 1fr; } }
+  .field { margin-bottom: 12px; }
+  .check { display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 14px; margin-top: 26px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button, .btn { appearance: none; border: 1px solid var(--border); background: var(--panel); color: var(--text);
+                 padding: 8px 14px; border-radius: 6px; font: inherit; cursor: pointer; text-decoration: none;
+                 display: inline-block; }
+  button.primary, .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .hint { font-size: 13px; color: var(--muted); }
+  .error { color: var(--bad); font-size: 14px; margin-top: 8px; }
+  .banner { background: var(--warn-bg); border: 1px solid var(--warn-border); border-radius: 8px;
+            padding: 12px 14px; margin-bottom: 16px; }
+  .banner code { display: block; margin-top: 6px; font-size: 12.5px; overflow-x: auto; white-space: pre; }
+  .hidden { display: none !important; }
+  .status-line { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; }
+  .pill { padding: 2px 10px; border-radius: 999px; background: var(--chip); font-size: 13px; font-weight: 600; }
+  .pill.running { color: var(--accent); } .pill.paused { color: #b7871b; }
+  .pill.done { color: var(--good); } .pill.failed, .pill.cancelled { color: var(--bad); }
+  .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; margin-bottom: 12px; }
+  .stat { background: var(--chip); border-radius: 8px; padding: 8px 10px; }
+  .stat b { display: block; font-size: 20px; }
+  .stat span { font-size: 12px; color: var(--muted); }
+  .current { font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+  .folder { font-size: 13px; overflow-wrap: anywhere; }
+  .slider { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  .slider input { flex: 1; min-width: 160px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
+  .card { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--bg);
+          display: flex; flex-direction: column; }
+  .card .thumb { aspect-ratio: 4 / 3; background: var(--chip); display: block; }
+  .card img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .card .meta { padding: 8px 10px; font-size: 13px; display: flex; flex-direction: column; gap: 4px; flex: 1; }
+  .conf { font-weight: 700; }
+  .evidence { color: var(--muted); }
+  .card .links { display: flex; gap: 10px; margin-top: auto; padding-top: 4px; }
+  .card a { color: var(--accent); }
+  .empty { color: var(--muted); padding: 12px 0; }
+  .dims { font-size: 12px; color: var(--muted); }
+  .path { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+  .source { display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 12px; font-size: 14px; }
+  .source label { display: flex; align-items: center; gap: 6px; color: var(--text); font-size: 14px; margin: 0; cursor: pointer; }
+  .folder-pick { display: flex; gap: 8px; }
+  .folder-pick input { flex: 1; min-width: 0; }
+  .model-line { display: block; font-size: 13px; color: var(--good); margin-top: 2px; }
+  .results-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .results-head h2 { margin: 0; overflow-wrap: anywhere; }
+  .history { display: flex; flex-direction: column; gap: 6px; }
+  .hrow { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--border);
+          border-radius: 8px; background: var(--bg); }
+  .hinfo { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 14px; }
+  .pill.interrupted { color: #b7871b; }
+  details { margin-top: 12px; font-size: 13px; }
+  details ul { margin: 6px 0 0; padding-left: 18px; color: var(--muted); max-height: 220px; overflow: auto; }
+  details li { overflow-wrap: anywhere; }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <img class="logo-dark" src="logo-dark.png" alt="RulZ">
+      <img class="logo-light" src="logo-light.png" alt="RulZ">
+      <h1>Image Crawler</h1>
+    </div>
+    <button id="themeBtn" type="button" aria-label="Switch colour theme"></button>
+  </div>
+</header>
+<main>
+  <p class="sub">Crawl a website and keep only the images that match your description.
+    <span id="modelLine" class="model-line"></span></p>
+
+  <div id="engineBanner" class="banner hidden">
+    <strong id="engineBannerTitle">The model isn't running.</strong>
+    <div id="engineBannerText">Start it, then try again:</div>
+    <code>powershell -ExecutionPolicy Bypass -File image_detection\scripts\start_llama_server.ps1</code>
+  </div>
+
+  <section class="panel" id="setup">
+    <h2>1. What to look for</h2>
+    <div class="source" role="radiogroup" aria-label="Where to look">
+      <label><input type="radio" name="source" value="web" checked> A website</label>
+      <label><input type="radio" name="source" value="folder"> A folder on this PC</label>
+    </div>
+    <div class="row">
+      <div class="field web-only">
+        <label for="url">Website address</label>
+        <input id="url" type="text" placeholder="https://example.com" autocomplete="url">
+      </div>
+      <div class="field folder-only hidden">
+        <label for="folderPath">Folder</label>
+        <div class="folder-pick">
+          <input id="folderPath" type="text" placeholder="C:\Users\you\Pictures">
+          <button id="browseBtn" type="button">Browse…</button>
+        </div>
+        <div class="check" style="margin-top:6px"><input id="recursive" type="checkbox" checked><label for="recursive" style="margin:0;color:inherit;font-size:inherit">Include subfolders</label></div>
+      </div>
+      <div class="field">
+        <label for="prompt">Describe the images to keep</label>
+        <input id="prompt" type="text" placeholder="women with red hair">
+      </div>
+    </div>
+    <div class="actions">
+      <button id="genBtn">Generate checklist</button>
+      <span class="hint">The model turns your description into a checklist you can edit.</span>
+    </div>
+    <div id="genError" class="error hidden"></div>
+
+    <div id="rubricBox" class="hidden" style="margin-top:16px">
+      <h2>2. Check the checklist</h2>
+      <div class="field">
+        <label for="rubric">Checklist (edit it to be stricter or looser)</label>
+        <textarea id="rubric"></textarea>
+        <div class="hint">SUBJECT: who or what · REQUIRE: what must be visible · EXCLUDE: near-misses to reject · FALSE IF: when to say no</div>
+      </div>
+      <div class="row4">
+        <div class="field">
+          <label for="tagId">Tag name</label>
+          <input id="tagId" type="text">
+        </div>
+        <div class="field">
+          <label for="threshold">Save if confidence ≥</label>
+          <input id="threshold" type="number" min="0" max="1" step="0.05" value="0.7">
+        </div>
+        <div class="field web-only">
+          <label for="maxPages">Max pages</label>
+          <input id="maxPages" type="number" min="1" max="1000" value="10">
+        </div>
+        <div class="field web-only">
+          <label for="maxDepth">Max link depth</label>
+          <input id="maxDepth" type="number" min="0" max="20" value="3">
+        </div>
+        <div class="field">
+          <label for="maxImages">Max images</label>
+          <input id="maxImages" type="number" min="1" max="10000" value="300">
+        </div>
+        <div class="field web-only">
+          <label for="delay">Delay between pages (s)</label>
+          <input id="delay" type="number" min="0" max="30" step="0.5" value="1">
+        </div>
+        <div class="field">
+          <label for="minMp">Min size (megapixels, 0 = any)</label>
+          <input id="minMp" type="number" min="0" max="200" step="0.5" value="0">
+        </div>
+        <div class="field web-only">
+          <div class="check"><input id="originals" type="checkbox" checked><label for="originals" style="margin:0;color:inherit;font-size:inherit">Get full-size originals</label></div>
+        </div>
+        <div class="field web-only">
+          <div class="check"><input id="robots" type="checkbox" checked><label for="robots" style="margin:0;color:inherit;font-size:inherit">Respect robots.txt</label></div>
+        </div>
+      </div>
+      <div class="actions">
+        <button id="startBtn" class="primary">Crawl &amp; Download</button>
+        <span class="hint">Roughly 1–2 seconds per new image; repeats are instant.</span>
+      </div>
+      <div id="startError" class="error hidden"></div>
+    </div>
+  </section>
+
+  <section class="panel hidden" id="progress">
+    <h2>3. Progress</h2>
+    <div class="status-line">
+      <span id="statusPill" class="pill">starting</span>
+      <span id="statusMsg" class="hint"></span>
+    </div>
+    <div class="stats" id="stats"></div>
+    <div id="currentPage" class="current"></div>
+    <div class="actions" style="margin-top:12px">
+      <button id="pauseBtn">Pause</button>
+      <button id="resumeBtn" class="hidden">Resume</button>
+      <button id="cancelBtn">Cancel</button>
+      <button id="newBtn" class="hidden">New search</button>
+    </div>
+    <div id="runError" class="error hidden"></div>
+    <details id="errorsBox" class="hidden">
+      <summary>Problems (<span id="errorCount">0</span>)</summary>
+      <ul id="errorList"></ul>
+    </details>
+  </section>
+
+  <section class="panel hidden" id="results">
+    <div class="results-head">
+      <h2 id="resultsTitle">4. Matches</h2>
+      <button id="backToRun" class="hidden">Back to current search</button>
+    </div>
+    <div class="slider">
+      <label for="minConf" style="margin:0">Show confidence ≥ <b id="minConfVal">0.70</b></label>
+      <input id="minConf" type="range" min="0.7" max="1" step="0.01" value="0.7">
+      <span id="shownCount" class="hint"></span>
+      <a id="zipBtn" class="btn primary" href="#">Download shown as zip</a>
+    </div>
+    <div id="folder" class="folder hint"></div>
+    <div id="grid" class="grid"></div>
+    <div id="emptyMsg" class="empty">No matches yet.</div>
+  </section>
+
+  <section class="panel" id="historyPanel">
+    <div class="results-head">
+      <h2>Past searches</h2>
+      <button id="historyRefresh">Refresh</button>
+    </div>
+    <div id="historyList" class="history"></div>
+    <div id="historyEmpty" class="empty hidden">No past searches yet.</div>
+  </section>
+</main>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+
+  function paintThemeBtn() {
+    const light = document.documentElement.dataset.theme === "light";
+    $("themeBtn").textContent = light ? "☾ Dark mode" : "☀ Light mode";
+  }
+  $("themeBtn").addEventListener("click", () => {
+    const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+    document.documentElement.dataset.theme = next;
+    try { localStorage.setItem("theme", next); } catch {}
+    paintThemeBtn();
+  });
+  paintThemeBtn();
+
+  const STAT_LABELS = [
+    ["pages_crawled", "pages crawled"], ["pages_queued", "pages queued"], ["images_found", "images found"],
+    ["images_fetched", "downloaded"], ["classified", "checked by model"], ["cached", "from cache"],
+    ["matches", "matches saved"], ["originals", "full-size originals"], ["too_small_mp", "below min size"],
+    ["skipped", "too small"], ["duplicates", "duplicates"],
+    ["fetch_errors", "download errors"], ["errors", "model errors"], ["pages_failed", "pages failed"],
+  ];
+  // Shown only when non-zero.
+  const OPTIONAL_STATS = new Set(["fetch_errors", "errors", "pages_failed", "duplicates", "skipped",
+                                  "originals", "too_small_mp"]);
+  const FINAL = new Set(["done", "cancelled", "failed"]);
+  const STATUS_TEXT = { starting: "Starting", running: "Running", paused: "Paused", done: "Done",
+                        cancelled: "Cancelled", failed: "Failed" };
+
+  let runId = null, es = null, runThreshold = 0.7, status = null, liveFolder = null, runSource = "web";
+
+  function sourceMode() {
+    return document.querySelector('input[name="source"]:checked').value;
+  }
+  function applySourceMode() {
+    const folder = sourceMode() === "folder";
+    document.querySelectorAll(".web-only").forEach(e => show(e, !folder));
+    document.querySelectorAll(".folder-only").forEach(e => show(e, folder));
+    $("startBtn").textContent = folder ? "Scan & Copy matches" : "Crawl & Download";
+  }
+  document.querySelectorAll('input[name="source"]').forEach(r => r.addEventListener("change", applySourceMode));
+  const matches = new Map();  // sha256 -> match entry
+
+  // ---- helpers -----------------------------------------------------------------------
+  function show(el, on) { el.classList.toggle("hidden", !on); }
+  function setError(el, text) { el.textContent = text || ""; show(el, !!text); }
+  async function api(path, opts = {}) {
+    const res = await fetch(path, { headers: { "content-type": "application/json" }, ...opts });
+    let body = null;
+    try { body = await res.json(); } catch { /* empty body */ }
+    if (!res.ok) {
+      if (res.status === 503) engineDown(true);
+      const detail = body && (body.detail || body.error);
+      const msg = Array.isArray(detail) ? detail.map(d => d.msg.replace(/^Value error, /, "")).join("; ")
+                                        : (detail || `HTTP ${res.status}`);
+      const err = new Error(res.status === 503 ? "The model isn't running. Start it, then try again." : msg);
+      err.status = res.status;
+      throw err;
+    }
+    return body;
+  }
+  function el(tag, attrs = {}, text) {
+    const e = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  // ---- engine banner -----------------------------------------------------------------
+  function engineDown(down, title, text) {
+    show($("engineBanner"), down);
+    if (down) {
+      $("engineBannerTitle").textContent = title || "The model isn't running.";
+      $("engineBannerText").textContent = text || "Start it, then try again:";
+    }
+  }
+  async function pollHealth() {
+    try {
+      const h = await fetch("/api/health").then(r => r.json());
+      const paused = status === "paused";
+      const servers = h.servers || [];
+      const up = servers.filter(s => s.up).length;
+      $("modelLine").textContent = h.server !== "up" ? "" :
+        servers.length > 1 ? `Model ready on ${up} of ${servers.length} GPUs` : "Model ready";
+      if (h.server === "up") engineDown(false);
+      else engineDown(true, "The model isn't running.",
+                      paused ? "Your search is paused. Start the model, then press Resume:" : "Start it, then try again:");
+    } catch {
+      engineDown(true, "Can't reach the app server.", "Is the app still running?");
+    }
+  }
+  pollHealth();
+  setInterval(pollHealth, 5000);
+
+  // ---- step 1/2: rubric ----------------------------------------------------------------
+  $("genBtn").addEventListener("click", async () => {
+    const prompt = $("prompt").value.trim();
+    setError($("genError"), "");
+    if (!prompt) { setError($("genError"), "Describe the images you want first."); return; }
+    $("genBtn").disabled = true;
+    $("genBtn").textContent = "Generating…";
+    try {
+      const r = await api("/api/rubric", { method: "POST", body: JSON.stringify({ prompt }) });
+      $("rubric").value = r.rubric;
+      $("tagId").value = r.id;
+      $("threshold").value = r.suggested_threshold;
+      show($("rubricBox"), true);
+      $("rubric").focus();
+    } catch (e) {
+      setError($("genError"), e.message);
+    } finally {
+      $("genBtn").disabled = false;
+      $("genBtn").textContent = "Generate checklist";
+    }
+  });
+  $("prompt").addEventListener("keydown", (e) => { if (e.key === "Enter") $("genBtn").click(); });
+
+  // ---- step 3: start a run ---------------------------------------------------------------
+  $("startBtn").addEventListener("click", async () => {
+    setError($("startError"), "");
+    const folderMode = sourceMode() === "folder";
+    const url = $("url").value.trim(), folder = $("folderPath").value.trim();
+    if (!folderMode && !url) { setError($("startError"), "Enter a website address."); return; }
+    if (folderMode && !folder) { setError($("startError"), "Choose a folder to scan."); return; }
+    const num = (id) => Number($(id).value);
+    const body = {
+      ...(folderMode ? { folder, recursive: $("recursive").checked } : { url }),
+      tag: { id: $("tagId").value.trim(), rubric: $("rubric").value.trim() },
+      threshold: num("threshold"), max_pages: num("maxPages"), max_depth: num("maxDepth"),
+      max_images: num("maxImages"), page_delay_s: num("delay"), respect_robots: $("robots").checked,
+      prefer_originals: $("originals").checked, min_megapixels: num("minMp"),
+    };
+    $("startBtn").disabled = true;
+    try {
+      const r = await api("/api/runs", { method: "POST", body: JSON.stringify(body) });
+      runSource = folderMode ? "folder" : "web";
+      startWatching(r.run_id, body.threshold);
+    } catch (e) {
+      setError($("startError"), e.message);
+      $("startBtn").disabled = false;
+    }
+  });
+
+  function setFolder(folder) {
+    liveFolder = folder;
+    if (view.live && folder) $("folder").textContent = `Saved to: ${folder}`;
+  }
+
+  function startWatching(id, threshold) {
+    runId = id;
+    runThreshold = threshold;
+    liveFolder = null;
+    matches.clear();
+    showLive();
+    setError($("runError"), "");
+    show($("progress"), true);
+    show($("newBtn"), false);
+    $("setup").querySelectorAll("input, textarea, button").forEach(e => e.disabled = true);
+    renderStats({});
+    $("progress").scrollIntoView({ behavior: "smooth", block: "start" });
+    setTimeout(loadHistory, 1500);  // the new run's folder now exists
+
+    if (es) es.close();
+    es = new EventSource(`/api/runs/${id}/events`);
+    es.addEventListener("snapshot", (ev) => {
+      const run = JSON.parse(ev.data).run;
+      run.matches.forEach(addMatch);
+      renderStats(run.stats, run.current_page);
+      renderErrors(run.errors);
+      setFolder(run.folder);
+      setStatus(run.status, run.message);
+    });
+    es.addEventListener("stats", (ev) => {
+      const d = JSON.parse(ev.data);
+      renderStats(d.stats, d.current_page);
+    });
+    es.addEventListener("match", (ev) => addMatch(JSON.parse(ev.data).match));
+    es.addEventListener("status", (ev) => {
+      const d = JSON.parse(ev.data);
+      setStatus(d.status, d.message);
+    });
+    es.onerror = () => {
+      // The server closes the stream after a final status; EventSource would reconnect forever.
+      if (FINAL.has(status)) { es.close(); es = null; }
+    };
+  }
+
+  // ---- progress --------------------------------------------------------------------------
+  function setStatus(s, message) {
+    status = s;
+    const pill = $("statusPill");
+    pill.className = `pill ${s}`;
+    pill.textContent = STATUS_TEXT[s] || s;
+    $("statusMsg").textContent = message || "";
+    const final = FINAL.has(s);
+    show($("pauseBtn"), s === "running" || s === "starting");
+    show($("resumeBtn"), s === "paused");
+    show($("cancelBtn"), !final);
+    show($("newBtn"), final);
+    if (view.live) renderMatches();
+    if (s === "paused" && /model/i.test(message || "")) {
+      engineDown(true, "The model stopped.", "Your search is paused. Start the model, then press Resume:");
+    }
+    if (final) {
+      if (es) { es.close(); es = null; }
+      refreshSnapshot();  // pick up the final error list
+    }
+  }
+
+  async function refreshSnapshot() {
+    try {
+      const run = await api(`/api/runs/${runId}`);
+      renderErrors(run.errors);
+      renderStats(run.stats, null);
+      setFolder(run.folder);
+    } catch { /* ignore */ }
+    loadHistory();
+  }
+
+  function renderStats(stats, current) {
+    const box = $("stats");
+    const folder = runSource === "folder";
+    box.replaceChildren(...STAT_LABELS
+      .filter(([k]) => !OPTIONAL_STATS.has(k) || stats[k])
+      .filter(([k]) => !(folder && k.startsWith("pages_")))
+      .map(([k, label]) => {
+        if (folder) label = { images_found: "image files", images_fetched: "read", fetch_errors: "unreadable files" }[k] || label;
+        const d = el("div", { class: "stat" });
+        d.append(el("b", {}, String(stats[k] ?? 0)), el("span", {}, label));
+        return d;
+      }));
+    $("currentPage").textContent = current ? `Now ${runSource === "folder" ? "checking" : "reading"}: ${current}` : "";
+  }
+
+  function renderErrors(errors) {
+    show($("errorsBox"), errors.length > 0);
+    $("errorCount").textContent = errors.length;
+    $("errorList").replaceChildren(...errors.map(e => el("li", {}, e)));
+  }
+
+  async function control(action) {
+    setError($("runError"), "");
+    try {
+      const r = await api(`/api/runs/${runId}/${action}`, { method: "POST" });
+      if (r && r.status && action !== "cancel") setStatus(r.status, r.status === "paused" ? "Paused." : "");
+      if (action === "resume") engineDown(false);
+    } catch (e) {
+      setError($("runError"), e.message);
+    }
+  }
+  $("pauseBtn").addEventListener("click", () => control("pause"));
+  $("resumeBtn").addEventListener("click", () => control("resume"));
+  $("cancelBtn").addEventListener("click", () => control("cancel"));
+  $("newBtn").addEventListener("click", () => {
+    $("setup").querySelectorAll("input, textarea, button").forEach(e => e.disabled = false);
+    $("setup").scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+
+  // ---- results -----------------------------------------------------------------------------
+  // The grid shows either the current search (live) or a past one from the history list.
+  let view = { live: true, base: null, count: 0 };
+
+  function addMatch(m) {
+    if (matches.has(m.sha256)) return;
+    matches.set(m.sha256, m);
+    if (!view.live) return;
+    $("grid").append(card(m));
+    view.count = matches.size;
+    renderMatches();
+  }
+
+  function showView(v, list, threshold, title, folder) {
+    view = { ...v, count: list.length };
+    $("resultsTitle").textContent = title;
+    $("grid").replaceChildren(...list.map(card));
+    $("minConf").min = String(threshold);
+    $("minConf").value = String(threshold);
+    $("minConfVal").textContent = Number(threshold).toFixed(2);
+    $("folder").textContent = folder ? `Saved to: ${folder}` : "";
+    show($("backToRun"), !v.live && runId !== null);
+    show($("results"), true);
+    renderMatches();
+  }
+
+  function showLive() {
+    showView({ live: true, base: `/api/runs/${runId}` }, [...matches.values()], runThreshold, "4. Matches",
+             liveFolder);
+  }
+  $("backToRun").addEventListener("click", () => {
+    showLive();
+    $("results").scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+
+  function sizeText(m) {
+    if (!m.width || !m.height) return "";
+    return `${m.width}×${m.height} · ${(m.width * m.height / 1e6).toFixed(1)} MP${m.original ? " · full-size original" : ""}`;
+  }
+
+  function card(m) {
+    const fileUrl = `${view.base}/files/${encodeURIComponent(m.file)}`;
+    const c = el("div", { class: "card", "data-conf": m.confidence });
+    const thumb = el("a", { class: "thumb", href: fileUrl, target: "_blank", rel: "noopener" });
+    thumb.append(el("img", { src: fileUrl, alt: m.evidence || m.file, loading: "lazy" }));
+    const meta = el("div", { class: "meta" });
+    meta.append(el("span", { class: "conf" }, `${Math.round(m.confidence * 100)}% confident`),
+                el("span", { class: "evidence" }, m.evidence || ""));
+    if (sizeText(m)) meta.append(el("span", { class: "dims" }, sizeText(m)));
+    const links = el("div", { class: "links" });
+    links.append(el("a", { href: fileUrl, download: m.file }, "Download"));
+    if (m.url && !/^https?:|^\(inline/.test(m.url)) meta.append(el("span", { class: "path" }, `From ${m.url}`));
+    if (/^https?:/.test(m.page)) links.append(el("a", { href: m.page, target: "_blank", rel: "noopener noreferrer" }, "Source page"));
+    meta.append(links);
+    c.append(thumb, meta);
+    return c;
+  }
+
+  function renderMatches() {
+    const min = Number($("minConf").value);
+    let shown = 0;
+    for (const c of $("grid").children) {
+      const on = Number(c.dataset.conf) >= min - 1e-9;
+      show(c, on);
+      if (on) shown++;
+    }
+    $("shownCount").textContent = `${shown} of ${view.count} shown`;
+    show($("emptyMsg"), view.count === 0);
+    $("emptyMsg").textContent = !view.live || FINAL.has(status) ? "No matching images were found." : "No matches yet.";
+    const zip = $("zipBtn");
+    zip.href = view.base ? `${view.base}/zip?min_confidence=${min}` : "#";
+    show(zip, shown > 0);
+  }
+  $("minConf").addEventListener("input", () => {
+    $("minConfVal").textContent = Number($("minConf").value).toFixed(2);
+    renderMatches();
+  });
+
+  // ---- history -------------------------------------------------------------------------------
+  const HISTORY_STATUS = { ...STATUS_TEXT, interrupted: "Interrupted" };
+
+  function hostOf(url) {
+    try { return new URL(url).host; } catch { return url || "?"; }
+  }
+  function where(it) {
+    return it.source === "folder" ? `folder ${it.start_url || "?"}` : hostOf(it.start_url);
+  }
+
+  $("browseBtn").addEventListener("click", async () => {
+    $("browseBtn").disabled = true;
+    try {
+      const r = await api("/api/pick-folder", { method: "POST" });
+      if (r.folder) $("folderPath").value = r.folder;
+    } catch (e) {
+      setError($("startError"), `${e.message} Type or paste the folder path instead.`);
+    } finally {
+      $("browseBtn").disabled = false;
+    }
+  });
+
+  async function loadHistory() {
+    let items = [];
+    try { items = await api("/api/history"); } catch { return; }
+    show($("historyEmpty"), items.length === 0);
+    $("historyList").replaceChildren(...items.map((it) => {
+      const row = el("div", { class: "hrow" });
+      const when = (it.started || "").replace("T", " ").slice(0, 16);
+      const info = el("div", { class: "hinfo" });
+      info.append(el("b", {}, `${it.tag || "?"}`), el("span", { class: "hint" }, ` in ${where(it)}`),
+                  el("div", { class: "hint" }, `${when} · ${it.matches} match${it.matches === 1 ? "" : "es"}`));
+      const pill = el("span", { class: `pill ${it.status}` }, HISTORY_STATUS[it.status] || it.status);
+      const btn = el("button", {}, "View");
+      btn.addEventListener("click", () => openHistory(it));
+      row.append(info, pill, btn);
+      return row;
+    }));
+  }
+
+  async function openHistory(it) {
+    if (it.run_id && it.run_id === runId) {
+      showLive();
+    } else {
+      try {
+        const doc = await api(`/api/history/${encodeURIComponent(it.id)}`);
+        showView({ live: false, base: `/api/history/${encodeURIComponent(it.id)}` }, doc.matches,
+                 doc.threshold ?? 0, `Past search: ${it.tag || "?"} in ${where(it)}`, doc.folder);
+      } catch (e) {
+        alert(`Couldn't open that search: ${e.message}`);
+        return;
+      }
+    }
+    $("results").scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+  $("historyRefresh").addEventListener("click", loadHistory);
+  loadHistory();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+[project]
+name = "crawler-app"
+version = "0.1.0"
+description = "Local web app that crawls a site and keeps the images matching a prompt (uses image_detection)"
+requires-python = ">=3.11"
+dependencies = [
+    "image-detection",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "playwright>=1.45",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+crawler-app = "crawler_app.server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["crawler_app"]
+# This file lives inside the package folder, so map the package to it.
+package-dir = {"crawler_app" = "."}
+
+[tool.setuptools.package-data]
+crawler_app = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
