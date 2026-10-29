@@ -1,0 +1,15 @@
+# Made on the user's PC, never committed
+.venv/
+logs/
+output/
+# The model (about 9.7 GB; scripts\download_model.py fetches it) and the image cache
+image_detection/LLM/
+image_detection/data/
+# llama.cpp binaries (the launcher downloads them, or use your own build)
+llama.cpp/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/

@@ -1,6 +1,6 @@
 [project]
 name = "image-detection"
-version = "0.1.0"
+version = "1.0.0"
 description = "Local Qwen3-VL service that matches images against tag rubrics"
 requires-python = ">=3.11"
 dependencies = [

@@ -3,6 +3,28 @@
 Crawl a website and keep only the images that match a description such as "women with red hair". A local
 Qwen3-VL model judges every image; matches are saved to disk with a `matches.json` describing each one.
 
+Part of the [RulZ AI Tools Suite](https://github.com/speedyrulz/RulZ-AI-Tools-Suite): the easiest way to install
+it is the suite's launcher, which sets everything below up for you. Guide:
+[the wiki](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/wiki/Image-Crawler).
+
+## Install
+
+**With the RulZ AI Tools Suite launcher:** open *RulZ Image Crawler* and click **Install**. It installs Python if
+needed, makes a Python environment in the app folder (`.venv`), installs the app, the Chromium browser it crawls
+with and a llama.cpp CUDA build (`llama.cpp\`), and downloads the model (about 9.7 GB). Then **Launch**.
+
+**By hand:**
+
+```powershell
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -e .\image_detection -e .\crawler_app
+.venv\Scripts\python.exe -m playwright install chromium
+.venv\Scripts\python.exe image_detection\scripts\download_model.py   # about 9.7 GB; run again to resume
+```
+
+and put a [llama.cpp](https://github.com/ggml-org/llama.cpp/releases) CUDA build's files in a `llama.cpp` folder
+here (or have LM Studio installed, or set `LLAMA_SERVER_EXE`).
+
 ## Start it
 
 Double-click **`Start Image Crawler.bat`**. It:
@@ -58,10 +80,11 @@ Expect roughly 1–2 s per new image; images checked before come from the cache 
 | Path | What |
 |---|---|
 | `crawler_app/` | the app: crawler, image fetcher, run pipeline, API and the web page (`static/index.html`) |
-| `image_detection/` | the detection engine and the model files (`LLM/`); see its README for the API and tuning knobs |
+| `image_detection/` | the detection engine and the model files (`LLM/`, downloaded by `scripts/download_model.py`); see its README for the API and tuning knobs |
 | `output/` | saved matches, one folder per run |
 | `logs/` | `llama-server-gpu<N>.log(.err)` and `crawler-app.log` from the launcher |
-| `build-plan.md` | the build plan this was built from |
+| `llama.cpp/` | the llama-server build the model runs in (optional: LM Studio's is used otherwise) |
+| `.venv/` | the app's Python environment |
 
 ## Tests
 
@@ -73,5 +96,10 @@ python image_detection\scripts\eval_labeled.py   # accuracy on your labeled imag
 
 ## Requirements
 
-Python 3.11+, an NVIDIA GPU with ~16 GB, LM Studio's CUDA 12 llama.cpp backend (or set `LLAMA_SERVER_EXE`), and
-once: `pip install -e image_detection -e crawler_app` and `python -m playwright install chromium`.
+Windows, Python 3.11+, an NVIDIA GPU with ~16 GB, and a llama.cpp CUDA build: the `llama.cpp` folder here, LM
+Studio's CUDA 12 backend, or `LLAMA_SERVER_EXE`. The start script uses `.venv` when it's there, otherwise
+`python` on PATH. See [Install](#install).
+
+## License
+
+MIT, see [LICENSE](LICENSE). The RulZ name and logo are excluded; see [LOGO-NOTICE.md](LOGO-NOTICE.md).
