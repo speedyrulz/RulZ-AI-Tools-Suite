@@ -21,6 +21,7 @@ import type {
   WireToolCall
 } from '@shared/types'
 import { DEFAULT_MAX_OUTPUT_TOKENS, MAX_INSTRUCTION_CHARS, samplingRequest, skipsThinking } from '@shared/defaults'
+import { dropExchange, dropReply, forModel, requestItem, whyNotDelete, whyNotRedo } from '@shared/history'
 import { splitThink } from '@shared/think'
 import { friendlyServerError, pickDefaultModel, type RulzClient, type TurnResult } from '../rulz/client'
 import { addDraft } from '../rulz/draft'
@@ -215,6 +216,7 @@ export class ProjectSession {
     const visible = opts.shown?.trim() || trimmed
     const title = visible.split('\n')[0].slice(0, 80) + (visible.split('\n')[0].length > 80 ? '…' : '')
     const task: TaskRecord = { id: randomUUID(), title: opts.howToRun ? 'Finding out how to run the app' : title, startedAt: Date.now(), outcome: 'running', steps: [], files: [] }
+    if (opts.howToRun || opts.share || visible !== trimmed) task.request = { text: trimmed, howToRun: opts.howToRun, share: opts.share }
     const item: TimelineItem = { id: randomUUID(), kind: 'user', text: opts.howToRun ? 'How do I run this app?' : visible, taskId: task.id }
     this.data.tasks.push(task)
     this.data.timeline.push(item)
@@ -295,6 +297,46 @@ export class ProjectSession {
     await this.saveNow()
   }
 
+  /** Deletes a message: a request takes its whole exchange with it (History keeps the task), a reply only itself. */
+  async deleteItem(itemId: string): Promise<void> {
+    const why = whyNotDelete(this.data.timeline, this.data.tasks, itemId, this.running)
+    if (why) throw new Error(why)
+    const item = this.data.timeline.find((i) => i.id === itemId)!
+    if (item.kind === 'assistant') dropReply(this.data, itemId)
+    else if (item.kind === 'user') this.forgetExchange(item.taskId, item.text)
+    await this.saveNow()
+  }
+
+  /**
+   * Runs the latest request again, edited when `text` is given. Its file changes are undone first,
+   * then its exchange is replaced by the new run (History keeps the first try, marked undone).
+   */
+  async redo(taskId: string, text?: string): Promise<void> {
+    const item = requestItem(this.data.timeline, taskId)
+    const why = whyNotRedo(this.data.timeline, this.data.tasks, item?.id ?? '', this.running)
+    if (why || !item) throw new Error(why ?? 'Only a request can be run again.')
+    const task = this.data.tasks.find((t) => t.id === taskId)!
+    const changed = task.files.length > 0 && !task.undone
+    if (changed) {
+      await this.undo(task.id)
+      // The exchange goes too, so the model has nothing left to be told about.
+      this.data.notes.pop()
+    }
+    this.forgetExchange(task.id, item.text)
+    if (changed) this.notice(`Put back the files “${task.title}” changed, then ran your request again.`, 'info')
+    const edited = text?.trim()
+    if (edited && edited !== item.text) this.start(edited)
+    else if (task.request) this.start(task.request.text, { howToRun: task.request.howToRun, share: task.request.share, shown: item.text })
+    else this.start(item.text)
+  }
+
+  private forgetExchange(taskId: string, text: string): void {
+    if (!dropExchange(this.data, taskId)) {
+      // Already folded into the summary (or saved by an older version).
+      this.data.notes.push(`The owner deleted their earlier request "${text.slice(0, 200)}" and its replies from the conversation. Don't act on it any more.`)
+    }
+  }
+
   async diff(taskId: string, rel: string): Promise<FileDiff> {
     const task = this.data.tasks.find((t) => t.id === taskId)
     const target = await resolveInProject(this.root, rel)
@@ -338,7 +380,7 @@ export class ProjectSession {
       const body = howToRun ? HOW_TO_RUN_TASK : text
       const content = notes.length ? `${notes.map((n) => `[Note: ${n}]`).join('\n')}\n\n${body}` : body
       this.taskStart = this.data.messages.length
-      this.data.messages.push({ role: 'user', content })
+      this.data.messages.push({ role: 'user', content, task: task.id })
 
       await this.loop(task, model, nCtx, signal, snap)
       task.outcome = 'done'
@@ -465,13 +507,13 @@ export class ProjectSession {
       const turn = await this.streamTurn(task, model, request, nCtx, signal)
       if (turn.cut) {
         // Keep what the model had so far, then hand it the notes along with its thinking.
-        this.data.messages.push({ role: 'assistant', content: cutTurnContent(cleanContent(turn.content)) })
+        this.data.messages.push({ role: 'assistant', content: cutTurnContent(cleanContent(turn.content)), item: turn.itemId })
         this.deliverNotes(task, turn.cut)
         continue
       }
       const content = cleanContent(turn.content)
       const calls = turn.toolCalls
-      this.data.messages.push({ role: 'assistant', content, ...(calls.length ? { tool_calls: calls } : {}) })
+      this.data.messages.push({ role: 'assistant', content, item: turn.itemId, ...(calls.length ? { tool_calls: calls } : {}) })
 
       if (!calls.length) {
         // Tool calls that came through as plain text: ask for a proper call.
@@ -588,7 +630,7 @@ export class ProjectSession {
       })
       const fit = fitMessages(this.data.messages, budget, estimateTokens(system) + estimateTokens(JSON.stringify(this.toolDefs())))
       const range = fit.fits || attempt >= 3 ? null : summaryRange(this.data.messages, this.taskStart)
-      if (!range) return [{ role: 'system' as const, content: system }, ...fit.messages]
+      if (!range) return [{ role: 'system' as const, content: system }, ...forModel(fit.messages)]
       await this.summarise(model, range, budget, signal)
     }
   }
@@ -626,7 +668,7 @@ export class ProjectSession {
     messages: WireMessage[],
     nCtx: number,
     signal: AbortSignal
-  ): Promise<TurnResult & { cut?: { thinking: string } }> {
+  ): Promise<TurnResult & { cut?: { thinking: string }; itemId?: string }> {
     const own = this.deps.settings().modelSampling[model]
     // With thinking skipped no thoughts will stream, so don't promise them.
     this.setStatus({ phase: 'thinking', text: skipsThinking(own) ? 'Working… (thinking is off in Model settings)' : 'Thinking…' })
@@ -688,7 +730,7 @@ export class ProjectSession {
     }
     this.measure(result, estimated, nCtx)
     this.countDrafts(task, model, result)
-    return result
+    return { ...result, itemId: finished?.id }
   }
 
   /** Updates the Memory meter, and the estimate's correction, from the server's token counts. */

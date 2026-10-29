@@ -327,6 +327,19 @@ async function main(): Promise<void> {
     projectChanged()
     return s.state(current!.name, current!.lastOpened)
   })
+  handle('task:deleteItem', async (path, itemId) => {
+    const s = requireSession(path)
+    await s.deleteItem(itemId)
+    projectChanged()
+    return s.state(current!.name, current!.lastOpened)
+  })
+  handle('task:redo', async (path, taskId, text) => {
+    const s = requireSession(path)
+    if (s.data.tasks.at(-1)?.files.length && !s.data.tasks.at(-1)?.undone) await runner?.stop()
+    await s.redo(taskId, text)
+    projectChanged()
+    return s.state(current!.name, current!.lastOpened)
+  })
   handle('files:diff', (path, taskId, rel) => requireSession(path).diff(taskId, rel))
   handle('project:setMemory', async (path, text) => {
     await requireSession(path).setMemory(text)

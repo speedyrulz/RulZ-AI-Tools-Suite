@@ -48,6 +48,10 @@ interface WorkspaceState {
   answer: (answer: PromptAnswer) => void
   /** Undoes the last task, or with an id goes back to before that task (undoing every later one too). */
   undo: (taskId?: string) => Promise<void>
+  /** Deletes a message (a request takes its replies with it). */
+  deleteItem: (itemId: string) => Promise<void>
+  /** Runs the latest request again, edited when `text` is given, after undoing its file changes. */
+  redo: (taskId: string, text?: string) => Promise<void>
   startRun: () => Promise<void>
   stopRun: () => Promise<void>
   askHowToRun: () => Promise<void>
@@ -273,6 +277,26 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       if (!project || !prompt) return
       set({ prompt: null })
       void invoke('task:answer', project.path, prompt.id, answer)
+    },
+
+    deleteItem: async (itemId) => {
+      const project = get().project
+      if (!project) return
+      try {
+        apply(await invoke('task:deleteItem', project.path, itemId), true)
+      } catch (e) {
+        toast.error(errorMessage(e))
+      }
+    },
+
+    redo: async (taskId, text) => {
+      const project = get().project
+      if (!project) return
+      try {
+        apply(await invoke('task:redo', project.path, taskId, text), true)
+      } catch (e) {
+        toast.error(errorMessage(e))
+      }
     },
 
     undo: async (taskId) => {

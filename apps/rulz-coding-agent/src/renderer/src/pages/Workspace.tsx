@@ -1,4 +1,5 @@
-import { ArrowLeft, ArrowUp, Brain, Check, ChevronDown, ChevronRight, Clock, CornerDownRight, FolderOpen, SlidersHorizontal, History, LoaderCircle, MessageSquarePlus, NotebookPen, Package, Play, Settings, Square, Undo2, X } from 'lucide-react'
+import { ArrowLeft, ArrowUp, Brain, Check, ChevronDown, ChevronRight, Clock, Copy, CornerDownRight, FolderOpen, SlidersHorizontal, History, LoaderCircle, MessageSquarePlus, NotebookPen, Package, Pencil, Play, RotateCcw, Settings, Square, Trash2, Undo2, X } from 'lucide-react'
+import { toast } from 'sonner'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { ApprovalDialog } from '../components/ApprovalDialog'
 import { ContextMeter } from '../components/ContextMeter'
@@ -17,6 +18,8 @@ import { cn } from '../lib/format'
 import { activeModelId, useApp } from '../stores/app'
 import { undoableTask, useWorkspace } from '../stores/workspace'
 import { ThemeToggle } from './Home'
+import { whyNotDelete, whyNotRedo } from '@shared/history'
+import type { TimelineItem } from '@shared/types'
 import { splitThink, thinkingOpen } from '@shared/think'
 
 const EXAMPLES = [
@@ -255,6 +258,7 @@ function Conversation() {
   const status = useWorkspace((s) => s.status)
   const ref = useRef<HTMLDivElement>(null)
   const stick = useRef(true)
+  const [editing, setEditing] = useState<string | null>(null)
 
   useLayoutEffect(() => {
     const el = ref.current
@@ -280,8 +284,9 @@ function Conversation() {
       <div className="mx-auto max-w-3xl space-y-5 px-6 py-6">
         {timeline.map((item) => {
           if (item.kind === 'user') {
+            if (editing === item.id) return <EditRequest key={item.id} item={item} onClose={() => setEditing(null)} />
             return (
-              <div key={item.id} className="flex flex-col items-end gap-1">
+              <div key={item.id} className="group flex flex-col items-end gap-1">
                 {item.note && (
                   <span className="flex items-center gap-1 text-[11px] text-faint">
                     <CornerDownRight size={12} />
@@ -289,6 +294,7 @@ function Conversation() {
                   </span>
                 )}
                 <div className="max-w-[85%] rounded-2xl rounded-br-md bg-accent-soft px-4 py-2.5 text-[14px] whitespace-pre-wrap">{item.text}</div>
+                <MessageActions item={item} copyText={item.text} onEdit={() => setEditing(item.id)} />
               </div>
             )
           }
@@ -297,13 +303,14 @@ function Conversation() {
             const reasoning = [item.reasoning?.trim(), inline.reasoning].filter(Boolean).join('\n\n')
             const live = running && status.phase === 'thinking' && !inline.answer && item.id === timeline[timeline.length - 1].id
             return (
-              <div key={item.id} className="flex gap-3">
+              <div key={item.id} className="group flex gap-3">
                 <span className="mt-1 w-6 shrink-0">
                   <LogoMark className="w-6" />
                 </span>
                 <div className="min-w-0 flex-1 space-y-2">
                   {reasoning && <ThinkingBlock text={reasoning} live={live} />}
                   {inline.answer && <Markdown text={inline.answer} className="text-[14px]" />}
+                  {!(running && item.id === last?.id) && <MessageActions item={item} copyText={inline.answer} />}
                 </div>
               </div>
             )
@@ -338,6 +345,134 @@ function Conversation() {
             {status.text}
           </div>
         )}
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Copy, Delete, and (on the latest request) Edit and Run again. A Delete that can't be used says
+ * why when clicked, rather than being greyed out with no reason.
+ */
+function MessageActions({ item, copyText, onEdit }: { item: TimelineItem; copyText: string; onEdit?: () => void }) {
+  const timeline = useWorkspace((s) => s.timeline)
+  const tasks = useWorkspace((s) => s.tasks)
+  const running = useWorkspace((s) => s.running)
+  const deleteItem = useWorkspace((s) => s.deleteItem)
+  const redo = useWorkspace((s) => s.redo)
+  const [copied, setCopied] = useState(false)
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const isUser = item.kind === 'user'
+  const noDelete = whyNotDelete(timeline, tasks, item.id, running)
+  const canRedo = isUser && !whyNotRedo(timeline, tasks, item.id, running)
+  const task = tasks.find((t) => t.id === item.taskId)
+  const undoesFiles = !!task?.files.length && !task.undone
+
+  const copy = (): void => {
+    void navigator.clipboard.writeText(copyText)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1200)
+  }
+
+  return (
+    <div className={cn('flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100', isUser && 'justify-end')}>
+      {copyText && (
+        <IconButton size="sm" label={copied ? 'Copied' : 'Copy'} onClick={copy}>
+          {copied ? <Check size={13} /> : <Copy size={13} />}
+        </IconButton>
+      )}
+      {canRedo && onEdit && (
+        <>
+          <IconButton size="sm" label={undoesFiles ? 'Edit and run again (undoes this task’s file changes first)' : 'Edit and run again'} onClick={onEdit}>
+            <Pencil size={13} />
+          </IconButton>
+          <IconButton size="sm" label={undoesFiles ? 'Run again (undoes this task’s file changes first)' : 'Run again'} onClick={() => void redo(item.taskId)}>
+            <RotateCcw size={13} />
+          </IconButton>
+        </>
+      )}
+      <IconButton
+        size="sm"
+        label={noDelete ?? (isUser ? 'Delete this request and my replies to it' : 'Delete this reply')}
+        className={cn(noDelete && 'opacity-40')}
+        aria-disabled={!!noDelete}
+        onClick={() => (noDelete ? toast(noDelete) : setConfirmDelete(true))}
+      >
+        <Trash2 size={13} />
+      </IconButton>
+      <Dialog
+        open={confirmDelete}
+        onOpenChange={setConfirmDelete}
+        title={isUser ? 'Delete this request?' : 'Delete this reply?'}
+        footer={
+          <>
+            <Button onClick={() => setConfirmDelete(false)}>Cancel</Button>
+            <Button
+              variant="danger"
+              onClick={() => {
+                setConfirmDelete(false)
+                void deleteItem(item.id)
+              }}
+            >
+              <Trash2 size={14} /> Delete
+            </Button>
+          </>
+        }
+      >
+        <p className="text-sm text-muted">
+          {isUser
+            ? 'This removes the request, your notes and my replies to it from the conversation, and I forget them. History still lists the task and its steps. This can’t be undone.'
+            : 'This removes the reply from the conversation and I forget what it said. The steps I took stay. This can’t be undone.'}
+        </p>
+      </Dialog>
+    </div>
+  )
+}
+
+/** Edits the latest request in place; "Run again" undoes its file changes first, then runs the new text. */
+function EditRequest({ item, onClose }: { item: Extract<TimelineItem, { kind: 'user' }>; onClose: () => void }) {
+  const [text, setText] = useState(item.text)
+  const ref = useRef<HTMLTextAreaElement>(null)
+  const redo = useWorkspace((s) => s.redo)
+  const running = useWorkspace((s) => s.running)
+  const task = useWorkspace((s) => s.tasks.find((t) => t.id === item.taskId))
+  const undoesFiles = !!task?.files.length && !task.undone
+  useEffect(() => {
+    const el = ref.current
+    if (!el) return
+    el.focus()
+    el.setSelectionRange(el.value.length, el.value.length)
+  }, [])
+  const submit = (): void => {
+    if (!text.trim() || running) return
+    onClose()
+    void redo(item.taskId, text)
+  }
+  return (
+    <div className="ml-auto w-[85%] space-y-2 rounded-xl border border-accent/40 bg-panel p-3">
+      <Textarea
+        ref={ref}
+        value={text}
+        rows={Math.min(14, Math.max(3, text.split('\n').length))}
+        onChange={(e) => setText(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Escape') onClose()
+          if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) submit()
+        }}
+        aria-label="Edit your request"
+      />
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[11px] text-faint">
+          {undoesFiles ? `Running it again first undoes what “${task!.title}” changed in your files.` : 'Runs as a new task.'}
+        </span>
+        <div className="flex gap-2">
+          <Button size="sm" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button size="sm" variant="primary" disabled={!text.trim() || running} onClick={submit}>
+            <RotateCcw size={13} /> Run again
+          </Button>
+        </div>
       </div>
     </div>
   )

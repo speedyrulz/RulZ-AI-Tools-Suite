@@ -80,6 +80,10 @@ export interface IpcInvoke {
    * task id, to before that task (undoing it and every later task).
    */
   'task:undo': (projectPath: string, taskId?: string) => ProjectState
+  /** Deletes a message from the conversation (a request takes its replies with it; see shared/history). */
+  'task:deleteItem': (projectPath: string, itemId: string) => ProjectState
+  /** Runs the latest request again, edited when `text` is given, after undoing its file changes. */
+  'task:redo': (projectPath: string, taskId: string, text?: string) => ProjectState
   'files:diff': (projectPath: string, taskId: string, path: string) => FileDiff
   /** Saves the owner's "Things to always remember" for the project. */
   'project:setMemory': (projectPath: string, text: string) => void

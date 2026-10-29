@@ -94,7 +94,7 @@ export const MessageItem = memo(function MessageItem({
       <IconButton size="sm" label="Branch into a new chat" onClick={() => void branchFrom(message.id)} disabled={streaming}>
         <GitBranch size={13} />
       </IconButton>
-      <IconButton size="sm" label="Delete" onClick={() => deleteMessage(message.id)} disabled={streaming}>
+      <IconButton size="sm" label={isUser ? 'Delete with its reply' : 'Delete'} onClick={() => deleteMessage(message.id)} disabled={busy}>
         <Trash2 size={13} />
       </IconButton>
     </div>
