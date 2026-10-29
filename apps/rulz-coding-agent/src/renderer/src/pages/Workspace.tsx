@@ -262,6 +262,11 @@ function Conversation() {
 
   if (!timeline.length && !running) return <EmptyState />
 
+  // Once thoughts stream in, their own block replaces the "Thinking…" line.
+  const last = timeline[timeline.length - 1]
+  const thoughtsShown =
+    running && status.phase === 'thinking' && last?.kind === 'assistant' && !!(last.reasoning || splitThink(last.text).reasoning)
+
   return (
     <div
       ref={ref}
@@ -316,7 +321,7 @@ function Conversation() {
             </div>
           )
         })}
-        {running && status.phase !== 'idle' && (
+        {running && status.phase !== 'idle' && !thoughtsShown && (
           <div className="flex items-center gap-2.5 pl-9 text-[13px] text-muted">
             {status.phase === 'waiting' ? (
               <span className="size-2 rounded-full bg-warn" />
