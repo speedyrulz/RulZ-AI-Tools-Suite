@@ -35,7 +35,14 @@ export interface MockOptions {
   nCtx?: number
   turns?: MockTurn[] | ((req: MockRequest, index: number) => MockTurn)
   /** Report exact token counts like llama.cpp (timings in the last chunk). */
-  timings?: (req: MockRequest) => { cache_n: number; prompt_n: number; predicted_n: number }
+  timings?: (req: MockRequest) => {
+    cache_n: number
+    prompt_n: number
+    predicted_n: number
+    predicted_ms?: number
+    draft_n?: number
+    draft_n_accepted?: number
+  }
   /** Answer GET/POST /v1/models/{id}/load-config like newer RulZ LLM Suite versions. */
   loadConfig?: boolean
 }
