@@ -244,6 +244,8 @@ export interface TaskRecord {
   /** Snapshot taken before the task, for Undo. */
   snapshot?: { kind: 'git'; commit: string } | { kind: 'copy'; dir: string }
   undone?: boolean
+  /** What the model was asked when it differs from the shown request (a button's task), for running it again. */
+  request?: { text: string; howToRun?: boolean; share?: boolean }
   steps: Step[]
   files: ChangedFile[]
   draft?: DraftStats
@@ -399,6 +401,9 @@ export interface WireMessage {
   content: string
   tool_calls?: WireToolCall[]
   tool_call_id?: string
+  /** Kept here only, never sent: the task this message opens, and the timeline reply it holds. */
+  task?: string
+  item?: string
 }
 
 /** Omit that works on each member of a union separately. */

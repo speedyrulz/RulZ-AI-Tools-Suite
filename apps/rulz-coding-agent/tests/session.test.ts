@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
 import { DEFAULT_SETTINGS } from '@shared/defaults'
+import { DELETED_REPLY } from '@shared/history'
 import type { AgentEvent, AppSettings, PendingPrompt, PromptAnswer, TaskRecord } from '@shared/types'
 import type { PageTarget } from '../src/main/agent/pageCheck'
 import { ProjectSession, type SessionDeps } from '../src/main/agent/session'
@@ -26,6 +27,8 @@ interface Harness {
   prompts: PendingPrompt[]
   requests: Awaited<ReturnType<typeof startMockRulz>>['requests']
   run: (text: string, opts?: { shown?: string; share?: boolean }) => Promise<TaskRecord>
+  /** Resolves when the next task ends (for tasks started some other way, such as redo). */
+  nextEnd: () => Promise<TaskRecord>
   close: () => Promise<void>
 }
 
@@ -93,6 +96,7 @@ async function harness(
         ended.push(resolve)
         session.start(text, startOpts)
       }),
+    nextEnd: () => new Promise((resolve) => ended.push(resolve)),
     close: async () => {
       await session.close()
       await mock.close()
@@ -797,4 +801,99 @@ describe('notes while a task runs', () => {
       await h.close()
     }
   }, 30_000)
+})
+
+describe('deleting and redoing messages', () => {
+  it('deletes a request with its replies, and a single reply, from what the model sees', async () => {
+    const h = await harness([{ content: 'Hello there.' }, { content: 'Second answer.' }, { content: 'Third.' }])
+    try {
+      await h.run('First question')
+      await h.run('Second question')
+      // The links back to the timeline stay on this computer.
+      expect(h.requests[1].body.messages!.some((m) => 'task' in m || 'item' in m)).toBe(false)
+
+      const first = h.session.data.timeline.find((i) => i.kind === 'user' && i.text === 'First question')!
+      await h.session.deleteItem(first.id)
+      expect(h.session.data.timeline.some((i) => i.taskId === first.taskId)).toBe(false)
+      expect(h.session.data.messages.map((m) => m.content)).toEqual(['Second question', 'Second answer.'])
+      // History keeps the task.
+      expect(h.session.data.tasks.some((t) => t.id === first.taskId)).toBe(true)
+
+      const reply = h.session.data.timeline.find((i) => i.kind === 'assistant')!
+      await h.session.deleteItem(reply.id)
+      expect(h.session.data.timeline.some((i) => i.id === reply.id)).toBe(false)
+
+      await h.run('Third question')
+      const sent = h.requests[2].body.messages!.slice(1).map((m) => [m.role, m.content])
+      expect(sent).toEqual([
+        ['user', 'Second question'],
+        ['assistant', DELETED_REPLY],
+        ['user', 'Third question']
+      ])
+    } finally {
+      await h.close()
+    }
+  })
+
+  it("won't delete a request that changed files until it is undone", async () => {
+    const h = await harness([
+      { content: 'Writing it.', toolCalls: [call('write_file', { path: 'a.txt', content: 'one\n', summary: 'Writing a.txt' })] },
+      { content: 'Done.' }
+    ])
+    try {
+      const task = await h.run('Make a.txt')
+      const item = h.session.data.timeline.find((i) => i.kind === 'user')!
+      await expect(h.session.deleteItem(item.id)).rejects.toThrow(/changed files/)
+      await h.session.undo()
+      await h.session.deleteItem(item.id)
+      expect(h.session.data.messages.some((m) => m.task === task.id)).toBe(false)
+    } finally {
+      await h.close()
+    }
+  })
+
+  it('edits the latest request and runs it again after undoing its file changes', async () => {
+    const h = await harness([
+      { content: 'Writing it.', toolCalls: [call('write_file', { path: 'a.txt', content: 'one\n', summary: 'Writing a.txt' })] },
+      { content: 'Done.' },
+      { content: 'Writing it.', toolCalls: [call('write_file', { path: 'b.txt', content: 'two\n', summary: 'Writing b.txt' })] },
+      { content: 'Done again.' }
+    ])
+    try {
+      const first = await h.run('Make a.txt')
+      expect(existsSync(join(h.root, 'a.txt'))).toBe(true)
+      const ended = h.nextEnd()
+      await h.session.redo(first.id, 'Make b.txt instead')
+      const second = await ended
+      expect(second.outcome).toBe('done')
+      // The first try's file is gone, the second's is there.
+      expect(existsSync(join(h.root, 'a.txt'))).toBe(false)
+      expect(readFileSync(join(h.root, 'b.txt'), 'utf8')).toBe('two\n')
+      expect(h.session.data.tasks.find((t) => t.id === first.id)?.undone).toBe(true)
+      // Only the new exchange is left, and nothing tells the model about the old one.
+      expect(h.session.data.messages[0]).toMatchObject({ role: 'user', content: 'Make b.txt instead', task: second.id })
+      expect(h.session.data.messages.some((m) => m.content.includes('Make a.txt'))).toBe(false)
+      expect(h.session.data.notes).toEqual([])
+      expect(h.session.data.timeline.filter((i) => i.kind === 'user').map((i) => i.text)).toEqual(['Make b.txt instead'])
+      expect(h.session.data.timeline.some((i) => i.kind === 'notice' && /Put back the files/.test(i.text))).toBe(true)
+      // Only the latest request can be run again.
+      await expect(h.session.redo(first.id)).rejects.toThrow(/Only/)
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('runs a button task again with what the model was first asked', async () => {
+    const h = await harness([{ content: 'Packaged.' }, { content: 'Packaged again.' }])
+    try {
+      const first = await h.run(SHARE_TASK, { shown: SHARE_SHOWN, share: true })
+      const ended = h.nextEnd()
+      await h.session.redo(first.id)
+      await ended
+      expect(h.session.data.messages[0].content).toContain(SHARE_TASK)
+      expect(h.session.data.timeline.find((i) => i.kind === 'user')?.text).toBe(SHARE_SHOWN)
+    } finally {
+      await h.close()
+    }
+  })
 })

@@ -15,6 +15,7 @@ import { DEFAULT_SAMPLING } from '@shared/defaults'
 import { errorMessage, invoke, on } from '../lib/api'
 import { uid } from '../lib/format'
 import { type QueuedNote, takeQueued } from '../lib/interject'
+import { editMessages, idsToDelete, removeMessages, restoreMessages } from '../lib/messages'
 import { buildWire } from '../lib/wire'
 import { useApp } from './app'
 import { availableTools, effectiveToolMode, tokensOf, toolRequestFor } from './mcp'
@@ -687,20 +688,34 @@ export const useChat = create<ChatState>((set, get) => {
     editMessage: async (messageId, content, resend) => {
       const cur = get().current
       if (!cur) return
-      const idx = cur.messages.findIndex((m) => m.id === messageId)
-      if (idx < 0) return
-      const edited = cur.messages.map((m) => (m.id === messageId ? { ...m, content } : m))
-      if (resend && cur.messages[idx].role === 'user' && !get().generation) {
-        await startGeneration({ ...cur, messages: edited.slice(0, idx + 1) }, 'new')
+      const target = cur.messages.find((m) => m.id === messageId)
+      if (!target) return
+      if (resend && target.role === 'user' && !get().generation) {
+        await startGeneration({ ...cur, messages: editMessages(cur.messages, messageId, content, true) }, 'new')
       } else {
-        get().mutateCurrent((c) => ({ ...c, messages: edited }))
+        get().mutateCurrent((c) => ({ ...c, messages: editMessages(c.messages, messageId, content, false) }))
       }
     },
 
     deleteMessage: (messageId) => {
-      if (get().generation?.messageId === messageId) return
-      get().mutateCurrent((c) => ({ ...c, messages: c.messages.filter((m) => m.id !== messageId) }))
+      const cur = get().current
+      if (!cur) return
+      const ids = idsToDelete(cur.messages, messageId)
+      const gen = get().generation
+      if (!ids.length || (gen && ids.includes(gen.messageId))) return
+      const { kept, removed } = removeMessages(cur.messages, ids)
+      get().mutateCurrent((c) => ({ ...c, messages: kept }))
       get().refreshTokenCount()
+      toast(removed.length > 1 ? 'Deleted the message and its reply' : 'Deleted the message', {
+        action: {
+          label: 'Undo',
+          onClick: () => {
+            if (get().current?.id !== cur.id) return
+            get().mutateCurrent((c) => ({ ...c, messages: restoreMessages(c.messages, removed) }))
+            get().refreshTokenCount()
+          }
+        }
+      })
     },
 
     branchFrom: async (messageId) => {
