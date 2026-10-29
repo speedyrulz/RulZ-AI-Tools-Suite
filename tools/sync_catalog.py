@@ -27,6 +27,7 @@ APPS = {
     "coding-agent": ("rulz-coding-agent", "build/icon.png", "build/icon.ico"),
     "training-captioner": ("Rulz-Training-Captioner", "assets/icon.png", "assets/icon.ico"),
     "clip-extractor": ("rulz-simple-video-clip-extractor", "simplecut/assets/icon256.png", "simplecut/assets/icon.ico"),
+    "rulz-image-crawler": ("rulz-image-crawler", "assets/icon.png", "assets/icon.ico"),
 }
 
 IMAGE_REFS = [

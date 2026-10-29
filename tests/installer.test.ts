@@ -49,7 +49,7 @@ describe('launcher update asset', () => {
       { name: 'RulZ-AI-Tools-Suite-Setup-1.2.0.exe', size: 2, url: 'b' }
     ] }
     expect(findAsset(release, SETUP_ASSET)?.url).toBe('b')
-  })
+  }, 30_000) // importing selfUpdate (and starting PowerShell, below) can take several seconds on a cold CI runner
 })
 
 describe('launcher update helper', () => {
@@ -65,7 +65,7 @@ describe('launcher update helper', () => {
       { encoding: 'utf8' }
     )
     expect(out.trim()).toBe('0')
-  })
+  }, 30_000)
 })
 
 describe('command lines', () => {

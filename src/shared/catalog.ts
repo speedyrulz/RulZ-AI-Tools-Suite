@@ -196,6 +196,63 @@ export const CATALOG: CatalogApp[] = [
     ],
     folderName: 'RulZ Clip Extractor',
     highlights: ['Frame-accurate', 'Lossless cuts', 'NVENC export', 'Crop & colour match']
+  },
+  {
+    id: 'rulz-image-crawler',
+    name: 'RulZ Image Crawler',
+    tagline: 'Crawls a website or folder and keeps only the images that match your description',
+    description:
+      'Describe what you want ("women with red hair", "sunsets over the sea"), point it at a website or a folder, ' +
+      'and a local vision model checks every picture and saves the ones that match, full size where it can find ' +
+      'them. Runs on your own NVIDIA GPU; nothing is sent anywhere.',
+    category: 'Photos',
+    repo: SUITE_REPO,
+    path: 'apps/rulz-image-crawler',
+    tagPrefix: 'rulz-image-crawler-v',
+    branch: 'app/rulz-image-crawler',
+    install: {
+      kind: 'source',
+      setup: [
+        { label: 'Creating the Python environment', run: ['python', '-m', 'venv', '.venv'] },
+        {
+          label: 'Installing the app and its Python packages',
+          run: ['.venv\\Scripts\\python.exe', '-m', 'pip', 'install', '-e', '.\\image_detection', '-e', '.\\crawler_app']
+        },
+        {
+          label: 'Installing the browser it crawls with (Chromium)',
+          run: ['.venv\\Scripts\\python.exe', '-m', 'playwright', 'install', 'chromium']
+        },
+        {
+          label: 'Downloading the vision model (about 9.7 GB)',
+          run: ['.venv\\Scripts\\python.exe', 'image_detection\\scripts\\download_model.py']
+        }
+      ]
+    },
+    launch: { target: 'Start Image Crawler.bat', icon: 'assets\\icon.ico' },
+    requirements: [
+      { id: 'python', note: 'Python 3.11 or newer' },
+      { id: 'nvidia', note: 'NVIDIA GPU with about 16 GB of VRAM' },
+      { id: 'git', optional: true, note: 'Lets the launcher update it with git pull' }
+    ],
+    components: [
+      {
+        id: 'llama-cpp',
+        label: 'llama.cpp (CUDA 13 build)',
+        description: 'The llama-server that runs the vision model. Skip it if LM Studio is installed (it uses its llama.cpp).',
+        sizeHint: 'about 700 MB',
+        default: true,
+        repo: 'ggml-org/llama.cpp',
+        assets: ['^llama-b\\d+-bin-win-cuda-13\\.\\d+-x64\\.zip$', '^cudart-llama-bin-win-cuda-13\\.\\d+-x64\\.zip$'],
+        dest: 'llama.cpp'
+      }
+    ],
+    folderName: 'RulZ Image Crawler',
+    notes: [
+      'Setup downloads the Qwen3-VL vision model (about 9.7 GB) and a Chromium browser for crawling (about 150 MB).',
+      'Launch opens a console window and the app in your browser. Closing the console stops it.',
+      'Matched images are saved in the output folder inside the install folder.'
+    ],
+    highlights: ['Websites or folders', 'Describe it in plain words', 'Full-size originals', 'Uses every GPU']
   }
 ]
 

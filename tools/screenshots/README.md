@@ -5,7 +5,7 @@ card thumbnail.
 
 Everything shown is demo content made for the purpose: procedurally drawn pictures, header-only model files,
 fresh settings folders and blank app profiles. No real photos, faces, chats, datasets, training samples or app
-settings appear, and none of the six app repos or their `%APPDATA%`/`%LOCALAPPDATA%`/registry settings are
+settings appear, and none of the app repos or their `%APPDATA%`/`%LOCALAPPDATA%`/registry settings are
 written to. Window captures take one window only (`QWidget.grab()`, `PrintWindow`, or the DevTools protocol),
 so nothing else on the desktop can end up in a picture.
 
@@ -125,3 +125,22 @@ node cdp_capture.mjs rulz-trainer.plan.json
 Use Chrome, not Edge, for the headless browser: a new Edge profile signs itself in to the Windows account and
 starts syncing. No training run is started and no model is downloaded. Stop the server and the browser when
 done (`taskkill /PID <webui pid> /T /F`, CDP `Browser.close`).
+
+## rulz-image-crawler (FastAPI web page)
+
+The app and a model server run from a suite checkout (`apps\rulz-image-crawler`) with a venv made outside it
+(`pip install -e image_detection -e crawler_app`, `playwright install chromium`). Output and the image cache go to
+the workspace, and the model server reads an existing copy of the model, so nothing is written to an install:
+
+```bat
+IO -B make_demo_images.py R:\Pictures\Wallpapers --count 30 --seed 17 --names titles --size 1600
+powershell -ExecutionPolicy Bypass -File image_detection\scripts\start_llama_server.ps1 -ModelDir <model folder> -Gpu 1 -Port 8099
+set CRAWLER_OUTPUT=R:\Image Crawler\output
+set CACHE_PATH=R:\ic-cache.sqlite3
+set LLAMA_URL=http://127.0.0.1:8099
+VENV\python.exe -B -m crawler_app --port 8011
+VENV\python.exe -B capture_image_crawler.py --folder R:\Pictures\Wallpapers --real "%TEMP%\rulz-shots" --out R:\out\rulz-image-crawler
+```
+
+It scans the demo folder for "landscapes with mountains" with the real model: the checklist the model wrote, the
+matches grid, and the same run in light mode. Stop the app and the model server afterwards.
