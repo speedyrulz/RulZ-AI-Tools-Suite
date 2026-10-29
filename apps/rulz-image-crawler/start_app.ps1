@@ -83,7 +83,12 @@ function Get-ModelGpus([string]$spec) {
 
 $started = @()
 try {
-    if (-not (Get-Command python -ErrorAction SilentlyContinue)) { throw "Python is not on PATH." }
+    # The app's own environment (made by the RulZ AI Tools Suite launcher) when there is one, else Python on PATH.
+    $python = Join-Path $root ".venv\Scripts\python.exe"
+    if (-not (Test-Path $python)) {
+        if (-not (Get-Command python -ErrorAction SilentlyContinue)) { throw "Python is not on PATH." }
+        $python = "python"
+    }
 
     # ---- 1. model servers: one per GPU, on consecutive ports ---------------------------------
     $gpus = Get-ModelGpus $Gpu
@@ -133,7 +138,7 @@ try {
     $appLog = Join-Path $logDir "crawler-app.log"
     Write-Host "Starting the app (log: $appLog)" -NoNewline
     $env:LLAMA_URLS = ($ready | ForEach-Object { $_.Url }) -join ","
-    $app = Start-Process python -PassThru -WindowStyle Hidden -WorkingDirectory $root `
+    $app = Start-Process $python -PassThru -WindowStyle Hidden -WorkingDirectory $root `
         -RedirectStandardOutput "$appLog.out" -RedirectStandardError $appLog `
         -ArgumentList @("-m", "crawler_app", "--port", $Port)
     [LauncherJob]::Add($app.Handle)

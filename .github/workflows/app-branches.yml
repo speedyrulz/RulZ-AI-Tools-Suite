@@ -1,14 +1,18 @@
 name: App branches
 
 # The apps the launcher installs from source (git clone, then git pull to update) get a branch of their own that
-# holds just their folder at its root: app/rulz-trainer and app/training-captioner. `git subtree split` rebuilds the
+# holds just their folder at its root: app/rulz-trainer, app/training-captioner and app/rulz-image-crawler. `git subtree split` rebuilds the
 # branch from main on every change, and because the apps were imported with their history, the branch continues the
 # app's original repository commit for commit, so installs cloned from the old repository update by fast-forward.
 
 on:
   push:
     branches: [main]
-    paths: ['apps/RulzTrainer/**', 'apps/Rulz-Training-Captioner/**', '.github/workflows/app-branches.yml']
+    paths:
+      - 'apps/RulzTrainer/**'
+      - 'apps/Rulz-Training-Captioner/**'
+      - 'apps/rulz-image-crawler/**'
+      - '.github/workflows/app-branches.yml'
   workflow_dispatch:
 
 permissions:
@@ -28,7 +32,7 @@ jobs:
       - name: Split and push
         run: |
           set -e
-          for pair in RulzTrainer:rulz-trainer Rulz-Training-Captioner:training-captioner; do
+          for pair in RulzTrainer:rulz-trainer Rulz-Training-Captioner:training-captioner rulz-image-crawler:rulz-image-crawler; do
             dir="${pair%%:*}"; id="${pair##*:}"
             sha=$(git subtree split --prefix="apps/$dir" HEAD)
             echo "app/$id -> $sha"
