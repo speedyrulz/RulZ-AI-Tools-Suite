@@ -13,6 +13,8 @@ export interface MockTurn {
   error?: string
   /** Wait before answering (ms). */
   delay?: number
+  /** Wait between the reasoning and the content (ms), as a model thinking for a while. */
+  pause?: number
 }
 
 export interface MockRequest {
@@ -154,6 +156,8 @@ export async function startMockRulz(opts: MockOptions = {}) {
       }
       const reasoning = turn.reasoning ?? ''
       for (let i = 0; i < reasoning.length; i += 7) send({ reasoning_content: reasoning.slice(i, i + 7) })
+      if (turn.pause) await new Promise((r) => setTimeout(r, turn.pause))
+      if (res.destroyed) return
       const content = turn.content ?? ''
       for (let i = 0; i < content.length; i += 7) send({ content: content.slice(i, i + 7) })
       turn.toolCalls?.forEach((c, index) => {

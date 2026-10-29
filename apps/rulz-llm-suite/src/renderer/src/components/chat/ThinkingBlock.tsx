@@ -3,14 +3,9 @@ import { Brain, ChevronRight } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { formatDuration } from '../../lib/format'
 import { openAfterThinking } from '../../lib/thinking'
-import { Markdown } from './Markdown'
 
-/** Splits a leading <think>…</think> block out of content, for models whose reasoning isn't parsed server-side. */
-export function splitThink(content: string): { reasoning: string; content: string; open: boolean } | null {
-  const m = content.match(/^\s*<think>([\s\S]*?)(<\/think>|$)/)
-  if (!m) return null
-  return { reasoning: m[1].trim(), content: content.slice(m[0].length).trimStart(), open: !m[2] }
-}
+export { splitThink } from '../../lib/thinking'
+import { Markdown } from './Markdown'
 
 export function ThinkingBlock({
   reasoning,

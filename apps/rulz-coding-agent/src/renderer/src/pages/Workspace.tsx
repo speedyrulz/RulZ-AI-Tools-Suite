@@ -1,4 +1,4 @@
-import { ArrowLeft, ArrowUp, Brain, Check, ChevronDown, ChevronRight, FolderOpen, SlidersHorizontal, History, LoaderCircle, NotebookPen, Package, Play, Settings, Square, Undo2 } from 'lucide-react'
+import { ArrowLeft, ArrowUp, Brain, Check, ChevronDown, ChevronRight, Clock, CornerDownRight, FolderOpen, SlidersHorizontal, History, LoaderCircle, MessageSquarePlus, NotebookPen, Package, Play, Settings, Square, Undo2, X } from 'lucide-react'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { ApprovalDialog } from '../components/ApprovalDialog'
 import { ContextMeter } from '../components/ContextMeter'
@@ -281,7 +281,13 @@ function Conversation() {
         {timeline.map((item) => {
           if (item.kind === 'user') {
             return (
-              <div key={item.id} className="flex justify-end">
+              <div key={item.id} className="flex flex-col items-end gap-1">
+                {item.note && (
+                  <span className="flex items-center gap-1 text-[11px] text-faint">
+                    <CornerDownRight size={12} />
+                    {item.note === 'cut' ? 'Note: stopped my reply to add this' : 'Note added while I was working'}
+                  </span>
+                )}
                 <div className="max-w-[85%] rounded-2xl rounded-br-md bg-accent-soft px-4 py-2.5 text-[14px] whitespace-pre-wrap">{item.text}</div>
               </div>
             )
@@ -451,11 +457,17 @@ function Composer() {
   const prompt = useWorkspace((s) => s.prompt)
   const send = useWorkspace((s) => s.send)
   const stop = useWorkspace((s) => s.stop)
+  const notes = useWorkspace((s) => s.notes)
+  const addNote = useWorkspace((s) => s.addNote)
+  const cancelNote = useWorkspace((s) => s.cancelNote)
+  const interrupt = useWorkspace((s) => s.interrupt)
   const connected = useApp((s) => s.connection.status === 'connected')
   const [text, setText] = useState('')
   const ref = useRef<HTMLTextAreaElement>(null)
   const answering = prompt?.kind === 'question'
-  const canSend = connected && !!text.trim() && (!running || answering)
+  /** While a task runs, what's typed is a note for it (unless it is answering my question). */
+  const noting = running && !answering
+  const canSend = connected && !!text.trim()
 
   useEffect(() => {
     const fill = (e: Event): void => {
@@ -469,14 +481,33 @@ function Composer() {
     if (answering) ref.current?.focus()
   }, [answering])
 
-  const submit = (): void => {
+  /** `now` cuts the model's current reply short so the note applies at once. */
+  const submit = (now = false): void => {
     if (!canSend) return
-    void send(text)
+    if (noting) void addNote(text, now)
+    else void send(text)
     setText('')
   }
 
   return (
     <div className="mx-auto w-full max-w-3xl px-6 pt-3 pb-5">
+      {running && notes.length > 0 && (
+        <div className="mb-2 flex flex-col gap-1.5">
+          {notes.map((n) => (
+            <div key={n.id} className="flex items-center gap-2 rounded-lg border border-dashed border-border bg-panel-2 py-1 pr-1 pl-3 text-[13px]">
+              <Clock size={14} className="shrink-0 text-faint" />
+              <span className="shrink-0 text-faint">Before my next step:</span>
+              <span className="min-w-0 flex-1 truncate">{n.text}</span>
+              <IconButton size="sm" label="Send now: stop my current reply so this applies at once (running commands keep going)" onClick={interrupt}>
+                <CornerDownRight size={14} />
+              </IconButton>
+              <IconButton size="sm" label="Don't send this note" onClick={() => cancelNote(n.id)}>
+                <X size={14} />
+              </IconButton>
+            </div>
+          ))}
+        </div>
+      )}
       <div className={cn('rounded-xl border bg-panel p-2 transition-colors focus-within:border-accent', answering ? 'border-accent/60' : 'border-border')}>
         <textarea
           ref={ref}
@@ -485,28 +516,50 @@ function Composer() {
           onKeyDown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault()
-              submit()
+              submit(e.ctrlKey || e.metaKey)
             }
           }}
           rows={3}
-          placeholder={answering ? 'Type your answer…' : running ? 'I’m working on it… you can type your next idea here.' : 'What should I build or change?'}
+          placeholder={answering ? 'Type your answer…' : running ? 'I’m working on it… add a note and I’ll take it into account before my next step.' : 'What should I build or change?'}
           className="max-h-60 min-h-[76px] w-full resize-none bg-transparent px-2 py-1.5 text-[15px] leading-relaxed placeholder:text-faint focus:outline-none"
           aria-label="What should I build or change?"
         />
         <div className="flex items-center justify-between gap-2 px-1">
           <span className="text-[11px] text-faint">
-            <Kbd>Enter</Kbd> to send · <Kbd>Shift+Enter</Kbd> new line{running && <> · <Kbd>Esc</Kbd> to stop</>}
+            {noting ? (
+              <>
+                <Kbd>Enter</Kbd> add note · <Kbd>Ctrl+Enter</Kbd> send now · <Kbd>Esc</Kbd> to stop
+              </>
+            ) : (
+              <>
+                <Kbd>Enter</Kbd> to send · <Kbd>Shift+Enter</Kbd> new line{running && <> · <Kbd>Esc</Kbd> to stop</>}
+              </>
+            )}
           </span>
           <div className="flex items-center gap-3">
             <DraftMeter />
             <ContextMeter />
+            {noting && (
+              <>
+                <Tooltip content="Stop my current reply and apply this note now (running commands keep going) · Ctrl+Enter">
+                  <Button className="h-10 px-3 text-sm" disabled={!canSend} onClick={() => submit(true)} aria-label="Send now">
+                    <CornerDownRight size={15} /> Now
+                  </Button>
+                </Tooltip>
+                <Tooltip content="I'll read this before my next step · Enter">
+                  <Button variant="primary" className="h-10 px-4 text-sm" disabled={!canSend} onClick={() => submit()}>
+                    <MessageSquarePlus size={15} /> Add note
+                  </Button>
+                </Tooltip>
+              </>
+            )}
             {running && (
               <Button variant="danger" className="h-10 px-5 text-sm" onClick={stop}>
                 <Square size={14} fill="currentColor" /> Stop
               </Button>
             )}
             {(!running || answering) && (
-              <Button variant="primary" className="h-10 px-5 text-sm" disabled={!canSend} onClick={submit}>
+              <Button variant="primary" className="h-10 px-5 text-sm" disabled={!canSend} onClick={() => submit()}>
                 <ArrowUp size={16} /> {answering ? 'Answer' : 'Send'}
               </Button>
             )}

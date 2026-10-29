@@ -39,6 +39,8 @@ async function harness(
     checkPage?: SessionDeps['checkPage']
     timings?: MockOptions['timings']
     toolServers?: SessionDeps['toolServers']
+    /** Sees every event as it happens (to act mid-task, like the owner would). */
+    onEvent?: (e: AgentEvent, session: ProjectSession) => void
   } = {}
 ): Promise<Harness> {
   const mock = await startMockRulz({ turns, nCtx: opts.nCtx, timings: opts.timings })
@@ -63,6 +65,7 @@ async function harness(
     store,
     emit: (e) => {
       events.push(e)
+      opts.onEvent?.(e, session)
       if (e.type === 'prompt' && e.prompt) {
         prompts.push(e.prompt)
         const ans = opts.answer?.(e.prompt) ?? (e.prompt.kind === 'approval' ? { kind: 'approval', decision: 'allow' } : null)
@@ -676,4 +679,122 @@ describe('the agent loop', () => {
       await h.close()
     }
   }, 60_000)
+})
+
+describe('notes while a task runs', () => {
+  const userItems = (h: Harness): unknown[] =>
+    h.session.data.timeline.flatMap((i) => (i.kind === 'user' ? [{ text: i.text, note: i.note }] : []))
+
+  it('adds a note before the next step, after the running tool finishes', async () => {
+    let sent = false
+    const h = await harness(
+      [
+        { content: 'Looking.', toolCalls: [call('run_command', { command: "Start-Sleep -Milliseconds 800; 'finished'", summary: 'Waiting a bit' })] },
+        { content: 'Using blue.' }
+      ],
+      {
+        onEvent: (e, session) => {
+          if (e.type === 'step' && e.step.status === 'running' && !sent) {
+            sent = true
+            // Even "now" must not kill a running command; it only cuts the model's replies.
+            session.addNote('Make it blue', true)
+          }
+        }
+      }
+    )
+    try {
+      const task = await h.run('Make a button')
+      expect(task.outcome).toBe('done')
+      expect(task.steps[0]).toMatchObject({ status: 'done' })
+      expect(task.steps[0].output).toContain('finished')
+      expect(h.requests).toHaveLength(2)
+      const msgs = h.requests[1].body.messages!
+      expect(msgs.at(-2)?.role).toBe('tool')
+      expect(msgs.at(-1)).toMatchObject({ role: 'user' })
+      expect(msgs.at(-1)!.content).toMatch(/added a note while you were working[\s\S]*Make it blue$/)
+      expect(userItems(h)).toEqual([
+        { text: 'Make a button', note: undefined },
+        { text: 'Make it blue', note: 'queued' }
+      ])
+      expect(h.events.filter((e) => e.type === 'notes').map((e) => (e as { notes: unknown[] }).notes.length)).toEqual([1, 0])
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('cuts the model short and hands it its thinking with the note', async () => {
+    let sent = false
+    const h = await harness([{ reasoning: 'The answer is probably 7, let me check', pause: 5000, content: 'never sent' }, { content: 'It is 42.' }], {
+      onEvent: (e, session) => {
+        if (e.type === 'reasoning' && !sent) {
+          sent = true
+          setTimeout(() => session.addNote('It is 42, I already know', true), 100)
+        }
+      }
+    })
+    try {
+      const started = Date.now()
+      const task = await h.run('What is the answer?')
+      expect(Date.now() - started).toBeLessThan(4000)
+      expect(task.outcome).toBe('done')
+      const msgs = h.requests[1].body.messages!
+      expect(msgs.at(-2)).toMatchObject({ role: 'assistant', content: '(The owner stopped me before I had finished thinking.)' })
+      const note = msgs.at(-1)!
+      expect(note.role).toBe('user')
+      expect(note.content).toContain('> The answer is probably 7, let me check')
+      expect(note.content).toMatch(/It is 42, I already know$/)
+      // The cut reply stays in the conversation with its thinking, followed by the note.
+      const tl = h.session.data.timeline.filter((i) => i.kind !== 'notice')
+      expect(tl[1]).toMatchObject({ kind: 'assistant', reasoning: 'The answer is probably 7, let me check' })
+      expect(tl[2]).toMatchObject({ kind: 'user', text: 'It is 42, I already know', note: 'cut' })
+      expect(tl[3]).toMatchObject({ kind: 'assistant', text: 'It is 42.' })
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('keeps going when a note arrives during the final reply', async () => {
+    let sent = false
+    const h = await harness([{ reasoning: 'Wrapping up', pause: 300, content: 'All done.' }, { content: 'Footer added.' }], {
+      onEvent: (e, session) => {
+        if (e.type === 'reasoning' && !sent) {
+          sent = true
+          session.addNote('Also add a footer', false)
+        }
+      }
+    })
+    try {
+      const task = await h.run('Make a page')
+      expect(task.outcome).toBe('done')
+      expect(h.requests).toHaveLength(2)
+      expect(h.requests[1].body.messages!.at(-2)).toMatchObject({ role: 'assistant', content: 'All done.' })
+      expect(h.requests[1].body.messages!.at(-1)!.content).toMatch(/Also add a footer$/)
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('refuses notes when no task runs, and drops cancelled ones', async () => {
+    let id = ''
+    const h = await harness(
+      [{ content: 'One.', toolCalls: [call('run_command', { command: "Start-Sleep -Milliseconds 500; 'ok'", summary: 'Waiting' })] }, { content: 'Done.' }],
+      {
+        onEvent: (e, session) => {
+          if (e.type === 'step' && e.step.status === 'running' && !id) {
+            session.addNote('never mind', false)
+            id = session.state('p', 0).notes[0].id
+            session.cancelNote(id)
+          }
+        }
+      }
+    )
+    try {
+      expect(() => h.session.addNote('hi')).toThrow(/No task is running/)
+      await h.run('Go')
+      expect(id).not.toBe('')
+      expect(h.requests[1].body.messages!.some((m) => m.content?.includes('never mind'))).toBe(false)
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
 })

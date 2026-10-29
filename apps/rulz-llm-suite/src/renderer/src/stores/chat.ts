@@ -14,18 +14,12 @@ import type {
 import { DEFAULT_SAMPLING } from '@shared/defaults'
 import { errorMessage, invoke, on } from '../lib/api'
 import { uid } from '../lib/format'
+import { type QueuedNote, takeQueued } from '../lib/interject'
+import { buildWire } from '../lib/wire'
 import { useApp } from './app'
 import { availableTools, effectiveToolMode, tokensOf, toolRequestFor } from './mcp'
 import { readyInstance, useModels } from './models'
-import {
-  compactToolResult,
-  META_LOAD,
-  META_SEARCH,
-  META_TOOLS,
-  recentToolCallIds,
-  resolveTool,
-  searchTools
-} from '@shared/tools'
+import { META_LOAD, META_SEARCH, META_TOOLS, resolveTool, searchTools } from '@shared/tools'
 
 export const NEW_CHAT_TITLE = 'New Chat'
 
@@ -90,12 +84,21 @@ interface ChatState {
   handoffConfirm: 'manual' | 'auto' | null
   /** Tool call waiting for the user's approval. */
   toolApproval: ToolApproval | null
+  /** Notes written while a reply streamed, sent one by one as replies end. */
+  queued: QueuedNote[]
 
   init: () => Promise<void>
   newChat: () => Promise<Conversation>
   open: (id: string) => Promise<void>
   mutateCurrent: (fn: (c: Conversation) => Conversation) => void
   send: (text: string, attachments: Attachment[]) => Promise<void>
+  /** Stops the reply streaming in the current chat, keeps what it had, and sends the note right away. */
+  sendNow: (text: string, attachments: Attachment[]) => void
+  /** Queues a note to send once the current chat's reply ends. */
+  queueNote: (text: string, attachments: Attachment[]) => void
+  cancelQueued: (id: string) => void
+  /** Sends a queued note now: interrupts the reply if one is streaming. */
+  sendQueued: (id: string) => void
   regenerate: (messageId: string) => Promise<void>
   continueMessage: (messageId: string) => Promise<void>
   editMessage: (messageId: string, content: string, resend: boolean) => Promise<void>
@@ -130,54 +133,14 @@ function keepFullToolResults(): number | null {
   return s?.compactToolResults ? s.keepFullToolResults : null
 }
 
-/**
- * Converts chat history to the OpenAI message format llama-server expects. With `keepFull` set,
- * all but that many of the most recent tool results are shortened (the chat itself keeps them).
- */
+/** Converts chat history to the wire format, compacting old tool results as the settings say. */
 export function toWire(
   messages: ChatMessage[],
   systemPrompt: string,
   vision: boolean,
   keepFull: number | null = keepFullToolResults()
 ): WireMessage[] {
-  const keepIds = keepFull === null ? null : recentToolCallIds(messages, keepFull)
-  const out: WireMessage[] = []
-  if (systemPrompt.trim()) out.push({ role: 'system', content: systemPrompt })
-  for (const m of messages) {
-    if (m.role === 'assistant' && m.toolCalls?.length) {
-      // A tool-calling turn becomes the assistant's calls followed by one result message per call.
-      out.push({
-        role: 'assistant',
-        content: m.content,
-        tool_calls: m.toolCalls.map((c) => ({ id: c.id, type: 'function', function: { name: c.name, arguments: c.arguments } }))
-      })
-      for (const c of m.toolCalls) {
-        const result =
-          c.result ?? (c.status === 'denied' ? 'The user declined to run this tool.' : 'The tool did not return a result.')
-        const compact = keepIds !== null && !keepIds.has(c.id)
-        out.push({ role: 'tool', tool_call_id: c.id, content: compact ? compactToolResult(result) : result })
-      }
-      continue
-    }
-    if (m.role === 'assistant' && !m.content && m.error) continue
-    let text = m.content
-    for (const a of m.attachments ?? []) {
-      if (a.kind === 'text' && a.text !== undefined) text += `\n\n\`\`\`${a.name}\n${a.text}\n\`\`\``
-    }
-    const images = vision ? (m.attachments ?? []).filter((a) => a.kind === 'image' && a.dataUrl) : []
-    if (m.role === 'user' && images.length) {
-      out.push({
-        role: 'user',
-        content: [
-          { type: 'text', text },
-          ...images.map((i) => ({ type: 'image_url' as const, image_url: { url: i.dataUrl! } }))
-        ]
-      })
-    } else {
-      out.push({ role: m.role, content: text })
-    }
-  }
-  return out
+  return buildWire(messages, systemPrompt, vision, keepFull)
 }
 
 // ---- Persistence (debounced per conversation) ----
@@ -232,6 +195,13 @@ function flushPending(): void {
 }
 
 let tokenTimer: ReturnType<typeof setTimeout> | null = null
+
+/** A "Send now" note waiting for its interrupted reply to finish stopping. */
+let interject: { requestId: string; text: string; attachments: Attachment[] } | null = null
+
+function markInterrupted(conv: Conversation, messageId: string): Conversation {
+  return { ...conv, messages: conv.messages.map((m) => (m.id === messageId ? { ...m, interrupted: true, error: undefined } : m)) }
+}
 
 export const useChat = create<ChatState>((set, get) => {
   const handleHandoffEvent = (ho: HandoffState, e: StreamEvent): void => {
@@ -323,8 +293,15 @@ export const useChat = create<ChatState>((set, get) => {
         }))
         const conv = get().genConversation
         set({ generation: null, genConversation: null })
+        const note = interject?.requestId === gen.requestId ? interject : null
+        interject = null
+        if (conv && note) {
+          void appendAndGenerate(markInterrupted(conv, gen.messageId), note.text, note.attachments)
+          break
+        }
         if (conv) void persistNow({ ...conv, updatedAt: Date.now() })
         get().refreshTokenCount()
+        if (conv && e.type === 'done' && e.stats.stopReason !== 'stopped') sendNextQueued(conv.id)
         break
       }
     }
@@ -544,6 +521,32 @@ export const useChat = create<ChatState>((set, get) => {
     }
   }
 
+  /** Adds the user's message to `cur` and streams a reply to it. */
+  const appendAndGenerate = async (cur: Conversation, text: string, attachments: Attachment[]): Promise<void> => {
+    const msg: ChatMessage = {
+      id: uid(),
+      role: 'user',
+      content: text,
+      attachments: attachments.length ? attachments : undefined,
+      createdAt: Date.now()
+    }
+    const conv: Conversation = {
+      ...cur,
+      title: cur.title === NEW_CHAT_TITLE && cur.messages.length === 0 ? makeTitle(text || attachments[0]?.name || '') : cur.title,
+      messages: [...cur.messages, msg]
+    }
+    await startGeneration(conv, 'new')
+  }
+
+  /** Sends the next note queued for a chat whose reply just ended, if the user is still in that chat. */
+  const sendNextQueued = (conversationId: string): void => {
+    if (get().current?.id !== conversationId) return
+    const { note, rest } = takeQueued(get().queued, conversationId)
+    if (!note) return
+    set({ queued: rest })
+    void get().send(note.text, note.attachments)
+  }
+
   /** Loads a conversation (or reuses `current`), applies `fn`, saves it. */
   const withConversation = async (id: string, fn: (c: Conversation) => Conversation): Promise<void> => {
     const { current, genConversation } = get()
@@ -568,6 +571,7 @@ export const useChat = create<ChatState>((set, get) => {
     handoff: null,
     handoffConfirm: null,
     toolApproval: null,
+    queued: [],
 
     init: async () => {
       on('chat:event', handleEvent)
@@ -627,19 +631,41 @@ export const useChat = create<ChatState>((set, get) => {
     send: async (text, attachments) => {
       if (get().generation || get().autoLoadingModelId) return
       const cur = get().current ?? (await get().newChat())
-      const msg: ChatMessage = {
-        id: uid(),
-        role: 'user',
-        content: text,
-        attachments: attachments.length ? attachments : undefined,
-        createdAt: Date.now()
+      await appendAndGenerate(cur, text, attachments)
+    },
+
+    sendNow: (text, attachments) => {
+      const gen = get().generation
+      if (!gen) return void get().send(text, attachments)
+      if (gen.conversationId !== get().current?.id) return
+      // Already stopping for an earlier note: this one waits its turn.
+      if (interject) return get().queueNote(text, attachments)
+      if (gen.phase === 'tools') {
+        // Tool calls stop at once; the turn so far stays, and the note follows it.
+        get().stop()
+        const conv = get().current
+        if (conv) void appendAndGenerate(markInterrupted(conv, gen.messageId), text, attachments)
+        return
       }
-      const conv: Conversation = {
-        ...cur,
-        title: cur.title === NEW_CHAT_TITLE && cur.messages.length === 0 ? makeTitle(text || attachments[0]?.name || '') : cur.title,
-        messages: [...cur.messages, msg]
-      }
-      await startGeneration(conv, 'new')
+      // The note goes out when the stopped reply's final event arrives (see handleEvent).
+      interject = { requestId: gen.requestId, text, attachments }
+      void invoke('chat:abort', gen.requestId)
+    },
+
+    queueNote: (text, attachments) => {
+      const cur = get().current
+      if (!cur) return
+      if (!get().generation) return void get().send(text, attachments)
+      set((s) => ({ queued: [...s.queued, { id: uid(), conversationId: cur.id, text, attachments }] }))
+    },
+
+    cancelQueued: (id) => set((s) => ({ queued: s.queued.filter((q) => q.id !== id) })),
+
+    sendQueued: (id) => {
+      const note = get().queued.find((q) => q.id === id)
+      if (!note || note.conversationId !== get().current?.id || interject || get().autoLoadingModelId) return
+      set((s) => ({ queued: s.queued.filter((q) => q.id !== id) }))
+      get().sendNow(note.text, note.attachments)
     },
 
     regenerate: async (messageId) => {
@@ -699,6 +725,7 @@ export const useChat = create<ChatState>((set, get) => {
     },
 
     stop: () => {
+      interject = null
       const gen = get().generation
       if (!gen) return
       if (gen.phase !== 'tools') return void invoke('chat:abort', gen.requestId)
@@ -729,6 +756,7 @@ export const useChat = create<ChatState>((set, get) => {
 
     remove: async (id) => {
       if (get().generation?.conversationId === id) get().stop()
+      set((s) => ({ queued: s.queued.filter((q) => q.conversationId !== id) }))
       await invoke('conversations:delete', id).catch((e) => toast.error(errorMessage(e)))
       const summaries = get().summaries.filter((s) => s.id !== id)
       set({ summaries })
