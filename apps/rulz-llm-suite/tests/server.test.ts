@@ -191,3 +191,50 @@ describe('GET/POST /v1/models/{id}/load-config', () => {
     }
   })
 })
+
+describe('POST /v1/models/{id}/unload', () => {
+  it('unloads every running instance of the model and only that model', async () => {
+    let running = [
+      { instanceId: 'i1', modelId: models[0].id, status: 'ready' },
+      { instanceId: 'i2', modelId: models[0].id, status: 'loading' },
+      { instanceId: 'i3', modelId: models[1].id, status: 'ready' }
+    ] as LoadedInstance[]
+    const unloaded: string[] = []
+    const instances = {
+      list: () => running,
+      readyFor: (id: string) => running.find((i) => i.modelId === id && i.status === 'ready'),
+      unload: async (id: string) => {
+        unloaded.push(id)
+        running = running.filter((i) => i.instanceId !== id)
+      }
+    } as unknown as InstanceManager
+    const port = 41000 + Math.floor(Math.random() * 2000)
+    const server = new ApiServer({
+      instances,
+      getModels: () => models,
+      getSettings: () => ({ autoStart: false, port, bind: 'localhost', apiKey: '', cors: false, idleUnloadMinutes: 0, defaultModelId: '', unknownModelFallback: true }),
+      getLoadDefaults: () => ({ config: DEFAULT_LOAD_CONFIG, custom: false }),
+      setLoadDefaults: async () => undefined,
+      estimate: () => null,
+      gpus: () => [],
+      onStatus: () => undefined,
+      onRequest: () => undefined
+    })
+    await server.start()
+    try {
+      const unload = (id: string): Promise<Response> =>
+        fetch(`http://127.0.0.1:${port}/v1/models/${encodeURIComponent(id)}/unload`, { method: 'POST' })
+      const res = await unload('Qwen3.5-9B-Q8_0')
+      expect(res.status).toBe(200)
+      expect(await res.json()).toMatchObject({ state: 'not-loaded', unloaded: 2 })
+      expect(unloaded.sort()).toEqual(['i1', 'i2'])
+      expect(running.map((i) => i.instanceId)).toEqual(['i3'])
+
+      expect(await (await unload('Qwen3.5-9B-Q8_0')).json()).toMatchObject({ unloaded: 0 })
+      expect((await unload('nope')).status).toBe(404)
+      expect((await fetch(`http://127.0.0.1:${port}/v1/models/x/unload`)).status).toBe(404)
+    } finally {
+      await server.stop()
+    }
+  })
+})
