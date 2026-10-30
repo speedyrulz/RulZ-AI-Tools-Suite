@@ -105,6 +105,34 @@ export function authorized(apiKey: string, headers: { authorization?: string; 'x
   return bearer === apiKey || headers['x-api-key']?.trim() === apiKey
 }
 
+type TextBlock = { type: 'text'; text: string }
+
+/** An Anthropic `system` or message content as text blocks; other blocks and empty strings are dropped. */
+function textBlocks(content: unknown): TextBlock[] {
+  if (typeof content === 'string') return content ? [{ type: 'text', text: content }] : []
+  if (!Array.isArray(content)) return []
+  return content.filter((b): b is TextBlock => typeof b === 'object' && b !== null && b.type === 'text' && typeof b.text === 'string')
+}
+
+const isSystemMessage = (m: unknown): m is { content?: unknown } =>
+  typeof m === 'object' && m !== null && (m as { role?: unknown }).role === 'system'
+
+/**
+ * A /v1/messages request with its `system` messages moved onto the end of the top-level `system`,
+ * or null when it has none. Claude Code sends part of its system prompt as a system message after
+ * the first user message, and some chat templates (Qwen 3.5's) refuse a system message that isn't first.
+ */
+export function hoistSystemMessages(json: { system?: unknown; messages?: unknown }): Record<string, unknown> | null {
+  if (!Array.isArray(json.messages)) return null
+  const late = json.messages.filter(isSystemMessage)
+  if (late.length === 0) return null
+  return {
+    ...json,
+    system: [...textBlocks(json.system), ...late.flatMap((m) => textBlocks(m.content))],
+    messages: json.messages.filter((m) => !isSystemMessage(m))
+  }
+}
+
 /** OpenAI-style error body. */
 export function errorBody(message: string, type = 'invalid_request_error'): string {
   return JSON.stringify({ error: { message, type } })

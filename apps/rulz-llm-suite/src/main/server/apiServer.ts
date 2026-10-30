@@ -9,6 +9,7 @@ import {
   draftChoices,
   draftFileFromRemote,
   errorBody,
+  hoistSystemMessages,
   overrideSampling,
   parseRemoteLoadPatch,
   parseUsage,
@@ -237,9 +238,13 @@ export class ApiServer {
       if (method === 'POST' && PROXY_POST.has(path)) {
         body = await readBody(req)
         try {
-          const json = JSON.parse(body.toString('utf8')) as { model?: unknown; stream?: unknown }
+          const json = JSON.parse(body.toString('utf8')) as { model?: unknown; stream?: unknown; system?: unknown; messages?: unknown }
           if (typeof json.model === 'string') requestedModel = json.model
           stream = json.stream === true
+          if (path.startsWith('/v1/messages')) {
+            const hoisted = hoistSystemMessages(json)
+            if (hoisted) body = Buffer.from(JSON.stringify(hoisted), 'utf8')
+          }
         } catch {
           return fail(400, 'The request body is not valid JSON.')
         }
