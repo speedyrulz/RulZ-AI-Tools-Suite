@@ -48,6 +48,23 @@ export interface LoadConfig {
   parallel: number
   /** Free-form extra llama-server arguments, appended last. */
   extraArgs: string
+  /** Sampling defaults for requests that reach this model through the API server. */
+  sampling: ModelSampling
+}
+
+/**
+ * A model's own sampling defaults. Each value is passed to llama-server at load time, so a request
+ * that leaves it out gets it; null = llama.cpp's default. The app's chat sends all of its own values.
+ */
+export interface ModelSampling {
+  temperature: number | null
+  topK: number | null
+  topP: number | null
+  minP: number | null
+  repeatPenalty: number | null
+  presencePenalty: number | null
+  /** Also replace the values API requests send (e.g. Claude Code's temperature), not only fill in missing ones. */
+  override: boolean
 }
 
 export interface SamplingParams {

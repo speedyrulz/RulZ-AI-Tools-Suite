@@ -28,7 +28,16 @@ export const DEFAULT_LOAD_CONFIG: LoadConfig = {
   seed: null,
   chatTemplateFile: '',
   parallel: 1,
-  extraArgs: ''
+  extraArgs: '',
+  sampling: {
+    temperature: null,
+    topK: null,
+    topP: null,
+    minP: null,
+    repeatPenalty: null,
+    presencePenalty: null,
+    override: false
+  }
 }
 
 export const DEFAULT_SAMPLING: SamplingParams = {
