@@ -34,6 +34,8 @@ const PROXY_POST = new Set([
 const PROXY_GET = new Set(['/props', '/slots', '/metrics', '/lora-adapters'])
 /** GET or POST /v1/models/{id}/load-config reads or changes a model's saved load settings. */
 const LOAD_CONFIG_SUFFIX = '/load-config'
+/** POST /v1/models/{id}/unload stops every running instance of a model. */
+const UNLOAD_SUFFIX = '/unload'
 
 export interface ApiServerDeps {
   instances: InstanceManager
@@ -199,6 +201,13 @@ export class ApiServer {
           }
         }
         res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(this.loadConfigEntry(model, preview)))
+        return finish(200)
+      }
+      if (method === 'POST' && path.startsWith('/v1/models/') && path.endsWith(UNLOAD_SUFFIX)) {
+        const model = resolveModel(this.deps.getModels(), decodeURIComponent(path.slice('/v1/models/'.length, -UNLOAD_SUFFIX.length)))
+        if (!model) return fail(404, 'Model not found.', 'not_found_error')
+        const unloaded = await this.unloadModel(model.id)
+        res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ ...(this.modelEntry(model) as object), unloaded }))
         return finish(200)
       }
       if (method === 'GET' && path.startsWith('/v1/models/')) {
@@ -370,6 +379,15 @@ export class ApiServer {
       this.jit.set(instanceId, Date.now())
       this.emit()
     }
+  }
+
+  /** Unloads every instance of a model, loading or ready; resolves how many there were. */
+  private async unloadModel(modelId: string): Promise<number> {
+    const targets = this.deps.instances.list().filter((i) => i.modelId === modelId && i.status !== 'stopping')
+    for (const i of targets) this.jit.delete(i.instanceId)
+    await Promise.all(targets.map((i) => this.deps.instances.unload(i.instanceId)))
+    if (targets.length) this.emit()
+    return targets.length
   }
 
   private async unloadIdle(): Promise<void> {

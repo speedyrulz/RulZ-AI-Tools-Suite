@@ -61,7 +61,8 @@ Discover/downloads, RAG and a CLI are planned.
   restarts with the new settings unless `"reload": false`; `"dry_run": true` only returns the memory estimate for the
   changed settings. Replies include the GPUs, whether the model has a draft head, what automatic uses
   (`default_draft`), the drafts that can be picked (`draft_choices`, by path relative to the models folder), and the
-  memory estimate.
+  memory estimate. `POST /v1/models/{id}/unload` unloads every running instance of a model (replying with how many it
+  `unloaded`), so a client can free the memory when it is done with a model.
   Default port 1234 (pick another if LM Studio is running).
 - **Dark and light themes** — dark is the default; the first launch asks which look you want ("Choose your look").
   Switch any time with the sun/moon button in the top bar or in Settings ▸ Appearance (Dark, Light or System).
