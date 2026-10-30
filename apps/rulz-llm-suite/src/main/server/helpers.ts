@@ -30,6 +30,29 @@ export function resolveModel(models: ModelEntry[], requested: string | undefined
   )
 }
 
+/**
+ * The model a request is answered with. A named model is looked up in the library; with no name,
+ * or (when `fallback` is on) a name the library doesn't have, the single loaded model is used,
+ * then the default model. `fallback` is true when a named model was replaced.
+ */
+export function pickModel(
+  models: ModelEntry[],
+  requested: string | undefined,
+  readyModelIds: string[],
+  settings: { defaultModelId: string; unknownModelFallback: boolean }
+): { model: ModelEntry; fallback: boolean } | undefined {
+  if (requested) {
+    const named = resolveModel(models, requested)
+    if (named) return { model: named, fallback: false }
+    if (!settings.unknownModelFallback) return undefined
+  }
+  const fallback = !!requested
+  const ready = readyModelIds.length === 1 ? models.find((m) => m.id === readyModelIds[0]) : undefined
+  if (ready) return { model: ready, fallback }
+  const def = settings.defaultModelId ? models.find((m) => m.id === settings.defaultModelId) : undefined
+  return def ? { model: def, fallback } : undefined
+}
+
 export interface UsageInfo {
   promptTokens?: number
   completionTokens?: number

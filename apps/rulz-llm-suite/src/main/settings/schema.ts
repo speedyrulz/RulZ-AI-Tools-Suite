@@ -88,7 +88,8 @@ export const settingsSchema = z.object({
       apiKey: z.string().catch(D.apiServer.apiKey),
       cors: z.boolean().catch(D.apiServer.cors),
       idleUnloadMinutes: z.number().min(0).max(100000).catch(D.apiServer.idleUnloadMinutes),
-      defaultModelId: z.string().catch(D.apiServer.defaultModelId)
+      defaultModelId: z.string().catch(D.apiServer.defaultModelId),
+      unknownModelFallback: z.boolean().catch(D.apiServer.unknownModelFallback)
     })
     .catch(D.apiServer)
 })

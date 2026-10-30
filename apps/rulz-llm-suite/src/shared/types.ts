@@ -134,6 +134,11 @@ export interface ApiServerSettings {
   idleUnloadMinutes: number
   /** Model used when a request names none; empty = the loaded model, or an error. */
   defaultModelId: string
+  /**
+   * When a request names a model the library doesn't have (e.g. Claude Code asking for
+   * "claude-sonnet-…"), answer with the loaded model or the default model instead of a 404.
+   */
+  unknownModelFallback: boolean
 }
 
 export interface ApiServerStatus {
@@ -153,6 +158,8 @@ export interface ApiRequestLog {
   method: string
   path: string
   model?: string
+  /** The model name the request asked for, when the server answered with a different one. */
+  requestedModel?: string
   status?: number
   durationMs?: number
   stream?: boolean

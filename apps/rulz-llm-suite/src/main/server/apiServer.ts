@@ -3,7 +3,7 @@ import http, { type IncomingMessage, type ServerResponse } from 'node:http'
 import type { ApiRequestLog, ApiServerSettings, ApiServerStatus, GpuStat, LoadConfig, LoadedInstance, MemoryEstimate, ModelEntry } from '@shared/types'
 import { fileName } from '@shared/draft'
 import type { InstanceManager } from '../engine/instances'
-import { authorized, draftChoices, draftFileFromRemote, errorBody, parseRemoteLoadPatch, parseUsage, publicModelId, remoteLoadView, resolveModel } from './helpers'
+import { authorized, draftChoices, draftFileFromRemote, errorBody, parseRemoteLoadPatch, parseUsage, pickModel, publicModelId, remoteLoadView, resolveModel } from './helpers'
 
 const MAX_BODY_BYTES = 64 * 1024 * 1024
 const MAX_LOG = 300
@@ -226,12 +226,19 @@ export class ApiServer {
         return fail(404, `Unknown endpoint: ${method} ${path}`, 'not_found_error')
       }
 
-      const model = this.pickModel(requestedModel)
-      if (!model) {
-        const hint = requestedModel ? `Model "${requestedModel}" was not found.` : 'No "model" given and no model is loaded.'
+      const ready = this.deps.instances.list().filter((i) => i.status === 'ready').map((i) => i.modelId)
+      const picked = pickModel(this.deps.getModels(), requestedModel, ready, settings)
+      if (!picked) {
+        const hint = requestedModel
+          ? settings.unknownModelFallback
+            ? `Model "${requestedModel}" was not found, and there is no single loaded model or default model to use instead.`
+            : `Model "${requestedModel}" was not found.`
+          : 'No "model" given and no model is loaded.'
         return fail(404, `${hint} GET /v1/models lists the available ids.`, 'not_found_error')
       }
+      const model = picked.model
       entry.model = publicModelId(model, this.deps.getModels())
+      if (picked.fallback) entry.requestedModel = requestedModel
       entry.stream = stream
 
       let inst = this.deps.instances.readyFor(model.id)
@@ -323,16 +330,6 @@ export class ApiServer {
   }
 
   // ---------- models ----------
-
-  private pickModel(requested: string | undefined): ModelEntry | undefined {
-    const models = this.deps.getModels()
-    if (requested) return resolveModel(models, requested)
-    const ready = this.deps.instances.list().filter((i) => i.status === 'ready')
-    if (ready.length === 1) return models.find((m) => m.id === ready[0].modelId)
-    const def = this.deps.getSettings().defaultModelId
-    if (def) return models.find((m) => m.id === def)
-    return undefined
-  }
 
   private ensureLoaded(modelId: string): Promise<LoadedInstance> {
     let p = this.loading.get(modelId)
