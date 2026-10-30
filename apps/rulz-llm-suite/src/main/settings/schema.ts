@@ -34,7 +34,18 @@ export const loadConfigSchema = z.object({
   seed: z.number().int().nullable().catch(L.seed),
   chatTemplateFile: z.string().catch(L.chatTemplateFile),
   parallel: z.number().int().min(1).max(64).catch(L.parallel),
-  extraArgs: z.string().catch(L.extraArgs)
+  extraArgs: z.string().catch(L.extraArgs),
+  sampling: z
+    .object({
+      temperature: z.number().min(0).max(5).nullable().catch(null),
+      topK: z.number().int().min(0).nullable().catch(null),
+      topP: z.number().min(0).max(1).nullable().catch(null),
+      minP: z.number().min(0).max(1).nullable().catch(null),
+      repeatPenalty: z.number().min(0).max(5).nullable().catch(null),
+      presencePenalty: z.number().min(-2).max(2).nullable().catch(null),
+      override: z.boolean().catch(false)
+    })
+    .catch(L.sampling)
 })
 
 const S = DEFAULT_SAMPLING

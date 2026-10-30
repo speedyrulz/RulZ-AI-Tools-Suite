@@ -3,7 +3,9 @@ import type { LoadConfig, LoadedInstance, MemoryEstimate, ModelEntry } from '@sh
 import type { InstanceManager } from '../src/main/engine/instances'
 import { ApiServer } from '../src/main/server/apiServer'
 import { DEFAULT_LOAD_CONFIG } from '@shared/defaults'
-import { authorized, draftChoices, draftFileFromRemote, parseRemoteLoadPatch, parseUsage, pickModel, publicModelId, remoteLoadView, resolveModel } from '../src/main/server/helpers'
+import http from 'node:http'
+import { parseLoadConfig } from '../src/main/settings/schema'
+import { applyRemoteLoadPatch, authorized, overrideSampling, draftChoices, draftFileFromRemote, parseRemoteLoadPatch, parseUsage, pickModel, publicModelId, remoteLoadView, resolveModel } from '../src/main/server/helpers'
 
 const model = (id: string, name: string): ModelEntry => ({
   id,
@@ -235,6 +237,73 @@ describe('POST /v1/models/{id}/unload', () => {
       expect((await fetch(`http://127.0.0.1:${port}/v1/models/x/unload`)).status).toBe(404)
     } finally {
       await server.stop()
+    }
+  })
+})
+
+describe('model sampling defaults', () => {
+  const sampling = { ...DEFAULT_LOAD_CONFIG.sampling, temperature: 0.6, topK: 20, override: true }
+
+  it('gives configs saved before sampling defaults existed empty ones', () => {
+    const { sampling: _, ...old } = DEFAULT_LOAD_CONFIG
+    expect(parseLoadConfig({ ...old, contextLength: 4096 }).sampling).toEqual(DEFAULT_LOAD_CONFIG.sampling)
+    expect(parseLoadConfig({ ...old, sampling: { temperature: 99, topP: 0.9 } }).sampling).toMatchObject({ temperature: null, topP: 0.9, override: false })
+  })
+
+  it('accepts sampling changes over the API and merges them value by value', () => {
+    const parsed = parseRemoteLoadPatch({ sampling: { topP: 0.9 } })
+    expect(parsed.ok).toBe(true)
+    if (!parsed.ok) return
+    const config = { ...DEFAULT_LOAD_CONFIG, sampling }
+    expect(applyRemoteLoadPatch(config, parsed.patch).sampling).toEqual({ ...sampling, topP: 0.9 })
+    expect(parseRemoteLoadPatch({ sampling: { temperature: 9 } }).ok).toBe(false)
+    expect(parseRemoteLoadPatch({ sampling: { seed: 1 } }).ok).toBe(false)
+  })
+
+  it('overrides only the values that are set', () => {
+    expect(overrideSampling({ model: 'x', temperature: 1, top_p: 0.5 }, sampling)).toEqual({ model: 'x', temperature: 0.6, top_k: 20, top_p: 0.5 })
+  })
+
+  it('rewrites API requests for a model with override on, and leaves others alone', async () => {
+    const seen: Record<string, unknown>[] = []
+    const upstream = http.createServer((req, res) => {
+      let raw = ''
+      req.on('data', (c: Buffer) => (raw += c.toString('utf8')))
+      req.on('end', () => {
+        seen.push(JSON.parse(raw) as Record<string, unknown>)
+        res.writeHead(200, { 'Content-Type': 'application/json' }).end('{"content":[],"usage":{"input_tokens":1,"output_tokens":1}}')
+      })
+    })
+    await new Promise<void>((r) => upstream.listen(0, '127.0.0.1', () => r()))
+    const upstreamPort = (upstream.address() as { port: number }).port
+    let config = { ...DEFAULT_LOAD_CONFIG, sampling }
+    const instance = (): LoadedInstance => ({ instanceId: 'i1', modelId: models[0].id, status: 'ready', port: upstreamPort, config, contextLength: 8192 }) as unknown as LoadedInstance
+    const instances = { list: () => [instance()], readyFor: () => instance() } as unknown as InstanceManager
+    const port = 41000 + Math.floor(Math.random() * 2000)
+    const server = new ApiServer({
+      instances,
+      getModels: () => models,
+      getSettings: () => ({ autoStart: false, port, bind: 'localhost', apiKey: '', cors: false, idleUnloadMinutes: 0, defaultModelId: '', unknownModelFallback: true }),
+      getLoadDefaults: () => ({ config, custom: true }),
+      setLoadDefaults: async () => undefined,
+      estimate: () => null,
+      gpus: () => [],
+      onStatus: () => undefined,
+      onRequest: () => undefined
+    })
+    await server.start()
+    try {
+      const send = (body: unknown): Promise<Response> =>
+        fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      const request = { model: 'claude-sonnet-5-5', max_tokens: 8, temperature: 1, messages: [{ role: 'user', content: 'hi' }] }
+      expect((await send(request)).status).toBe(200)
+      expect(seen[0]).toMatchObject({ temperature: 0.6, top_k: 20, max_tokens: 8 })
+      config = { ...config, sampling: { ...sampling, override: false } }
+      await send(request)
+      expect(seen[1]).toEqual(request)
+    } finally {
+      await server.stop()
+      await new Promise<void>((r) => upstream.close(() => r()))
     }
   })
 })

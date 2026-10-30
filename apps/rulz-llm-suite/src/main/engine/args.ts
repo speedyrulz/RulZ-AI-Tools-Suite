@@ -52,6 +52,13 @@ export function buildServerArgs({ model, config: c, port, alias }: ServerArgsInp
   }
   if (c.seed !== null) args.push('--seed', String(c.seed))
   if (c.chatTemplateFile.trim()) args.push('--chat-template-file', c.chatTemplateFile.trim())
+  const s = c.sampling
+  if (s.temperature !== null) args.push('--temp', String(s.temperature))
+  if (s.topK !== null) args.push('--top-k', String(s.topK))
+  if (s.topP !== null) args.push('--top-p', String(s.topP))
+  if (s.minP !== null) args.push('--min-p', String(s.minP))
+  if (s.repeatPenalty !== null) args.push('--repeat-penalty', String(s.repeatPenalty))
+  if (s.presencePenalty !== null) args.push('--presence-penalty', String(s.presencePenalty))
   if (c.extraArgs.trim()) args.push(...splitArgs(c.extraArgs))
   return args
 }

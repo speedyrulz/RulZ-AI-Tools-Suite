@@ -3,7 +3,7 @@ import { ChevronRight, FolderSearch } from 'lucide-react'
 import { useState } from 'react'
 import { draftFiles, fileName, resolveDraft } from '@shared/draft'
 import { parseTensorSplit, rebalanceSplit, toPercents } from '@shared/split'
-import { KV_CACHE_TYPES, type DraftKind, type KvCacheType, type LoadConfig, type MemoryEstimate, type ModelEntry, type SidecarFile } from '@shared/types'
+import { KV_CACHE_TYPES, type DraftKind, type KvCacheType, type LoadConfig, type MemoryEstimate, type ModelEntry, type ModelSampling, type SidecarFile } from '@shared/types'
 import { invoke } from '../../lib/api'
 import { cn, formatBytes, formatTokens } from '../../lib/format'
 import { useApp } from '../../stores/app'
@@ -37,6 +37,10 @@ export function LoadSettingsForm({
   const hardware = useModels((s) => s.hardware)
   const library = useModels((s) => s.models)
   const [advanced, setAdvanced] = useState(false)
+  const [samplingOpen, setSamplingOpen] = useState(false)
+  const setSampling = <K extends keyof ModelSampling>(key: K, value: ModelSampling[K]): void =>
+    set('sampling', { ...config.sampling, [key]: value })
+  const samplingSet = SAMPLING_FIELDS.filter((f) => config.sampling[f.key] !== null).length
   const set = <K extends keyof LoadConfig>(key: K, value: LoadConfig[K]): void => onChange({ ...config, [key]: value })
 
   const maxCtx = model?.info?.contextLength ?? 131072
@@ -228,6 +232,38 @@ export function LoadSettingsForm({
         </div>
       )}
 
+      <Collapsible.Root open={samplingOpen} onOpenChange={setSamplingOpen}>
+        <Collapsible.Trigger className="flex items-center gap-1 text-xs font-medium text-muted hover:text-text">
+          <ChevronRight size={14} className={samplingOpen ? 'rotate-90 transition-transform' : 'transition-transform'} />
+          Sampling defaults{samplingSet > 0 && <span className="text-faint"> · {samplingSet} set{config.sampling.override ? ', override' : ''}</span>}
+        </Collapsible.Trigger>
+        <Collapsible.Content className="mt-3 space-y-1">
+          <p className="pb-1 text-[11px] text-faint">
+            Used by programs that reach this model through the API server, when a request leaves a value out. Empty = llama.cpp's
+            default. The chat in this app uses its own sampling settings.
+          </p>
+          {SAMPLING_FIELDS.map((f) => (
+            <Field key={f.key} inline label={f.label} hint={f.hint}>
+              <NumberInput
+                value={config.sampling[f.key]}
+                placeholder={f.placeholder}
+                min={f.min}
+                max={f.max}
+                step={f.step}
+                onChange={(v) => setSampling(f.key, v === null ? null : Math.max(f.min, Math.min(f.max, f.integer ? Math.round(v) : v)))}
+              />
+            </Field>
+          ))}
+          <Field
+            inline
+            label="Override what programs send"
+            hint="Use the values above even when a request sets its own, e.g. Claude Code's temperature. Empty values still keep the request's"
+          >
+            <Switch checked={config.sampling.override} onCheckedChange={(v) => setSampling('override', v)} />
+          </Field>
+        </Collapsible.Content>
+      </Collapsible.Root>
+
       <Collapsible.Root open={advanced} onOpenChange={setAdvanced}>
         <Collapsible.Trigger className="flex items-center gap-1 text-xs font-medium text-muted hover:text-text">
           <ChevronRight size={14} className={advanced ? 'rotate-90 transition-transform' : 'transition-transform'} />
@@ -287,6 +323,16 @@ export function LoadSettingsForm({
     </div>
   )
 }
+
+type SamplingKey = Exclude<keyof ModelSampling, 'override'>
+const SAMPLING_FIELDS: { key: SamplingKey; label: string; hint: string; placeholder: string; min: number; max: number; step: number; integer?: boolean }[] = [
+  { key: 'temperature', label: 'Temperature', hint: 'Higher = more varied, lower = more predictable', placeholder: '0.8', min: 0, max: 5, step: 0.05 },
+  { key: 'topK', label: 'Top K', hint: 'Pick only from this many likeliest tokens; 0 = off', placeholder: '40', min: 0, max: 1000, step: 1, integer: true },
+  { key: 'topP', label: 'Top P', hint: 'Pick from the likeliest tokens that add up to this share', placeholder: '0.95', min: 0, max: 1, step: 0.01 },
+  { key: 'minP', label: 'Min P', hint: 'Drop tokens far less likely than the top one', placeholder: '0.05', min: 0, max: 1, step: 0.01 },
+  { key: 'repeatPenalty', label: 'Repeat penalty', hint: '1 = off; higher discourages repeating recent text', placeholder: '1.0', min: 0, max: 5, step: 0.05 },
+  { key: 'presencePenalty', label: 'Presence penalty', hint: 'Above 0 nudges toward new topics', placeholder: '0', min: -2, max: 2, step: 0.1 }
+]
 
 /** One slider per GPU; moving one rescales the others so the split always adds up to 100%. */
 function GpuSplit({

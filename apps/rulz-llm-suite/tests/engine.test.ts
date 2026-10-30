@@ -62,6 +62,17 @@ describe('buildServerArgs', () => {
   })
 })
 
+describe('sampling default arguments', () => {
+  it('passes the set values and leaves the rest to llama.cpp', () => {
+    const none = buildServerArgs({ model, config: DEFAULT_LOAD_CONFIG, port: 1, alias: 'q' }).join(' ')
+    expect(none).not.toMatch(/--temp|--top-k|--top-p|--min-p|--repeat-penalty|--presence-penalty/)
+    const sampling = { ...DEFAULT_LOAD_CONFIG.sampling, temperature: 0.6, topK: 20, minP: 0 }
+    const args = buildServerArgs({ model, config: { ...DEFAULT_LOAD_CONFIG, sampling }, port: 1, alias: 'q' }).join(' ')
+    expect(args).toContain('--temp 0.6 --top-k 20 --min-p 0')
+    expect(args).not.toContain('--top-p')
+  })
+})
+
 describe('describeExitCode', () => {
   it('explains a missing DLL whether the code is signed or unsigned', () => {
     expect(describeExitCode(3221225781)).toMatch(/DLL .* could not be found/)

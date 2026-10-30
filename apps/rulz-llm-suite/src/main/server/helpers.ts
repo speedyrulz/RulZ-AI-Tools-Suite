@@ -2,7 +2,7 @@
 import { sep } from 'node:path'
 import { z } from 'zod'
 import { draftFiles, fileName } from '@shared/draft'
-import { KV_CACHE_TYPES, type DraftKind, type LoadConfig, type ModelEntry } from '@shared/types'
+import { KV_CACHE_TYPES, type DraftKind, type LoadConfig, type ModelEntry, type ModelSampling } from '@shared/types'
 
 /** The id a model is listed under in GET /v1/models: its name, or its path when names collide. */
 export function publicModelId(model: ModelEntry, all: ModelEntry[]): string {
@@ -136,7 +136,20 @@ const remoteLoadPatchSchema = z
     draftCacheTypeK: z.enum(KV_CACHE_TYPES as [string, ...string[]]),
     draftCacheTypeV: z.enum(KV_CACHE_TYPES as [string, ...string[]]),
     // null, 'builtin' or the id of one of draft_choices; checked against the library before it is used.
-    draftFile: z.string().min(1).max(1024).nullable()
+    draftFile: z.string().min(1).max(1024).nullable(),
+    // Any subset of the model's sampling defaults; null clears one.
+    sampling: z
+      .object({
+        temperature: z.number().min(0).max(5).nullable(),
+        topK: z.number().int().min(0).max(1000).nullable(),
+        topP: z.number().min(0).max(1).nullable(),
+        minP: z.number().min(0).max(1).nullable(),
+        repeatPenalty: z.number().min(0).max(5).nullable(),
+        presencePenalty: z.number().min(-2).max(2).nullable(),
+        override: z.boolean()
+      })
+      .partial()
+      .strict()
   })
   .partial()
   .strict()
@@ -159,7 +172,8 @@ const REMOTE_LOAD_KEYS = [
   'draftGpu',
   'draftCacheTypeK',
   'draftCacheTypeV',
-  'draftFile'
+  'draftFile',
+  'sampling'
 ] as const satisfies readonly (keyof LoadConfig)[]
 
 export interface DraftChoice {
@@ -199,7 +213,14 @@ export function draftFileFromRemote(value: string | null, model: ModelEntry, mod
   return choice.built_in ? 'builtin' : model.path.slice(0, model.path.length - model.id.length) + choice.id.split('/').join(sep)
 }
 
-export type RemoteLoadPatch = Partial<Pick<LoadConfig, (typeof REMOTE_LOAD_KEYS)[number]>>
+type RemoteLoadKey = (typeof REMOTE_LOAD_KEYS)[number]
+export type RemoteLoadView = Pick<LoadConfig, RemoteLoadKey>
+export type RemoteLoadPatch = Partial<Omit<RemoteLoadView, 'sampling'>> & { sampling?: Partial<ModelSampling> }
+
+/** A load config with a client's change applied; sampling is merged value by value. */
+export function applyRemoteLoadPatch(config: LoadConfig, patch: RemoteLoadPatch): LoadConfig {
+  return { ...config, ...patch, sampling: { ...config.sampling, ...patch.sampling } }
+}
 
 /** Checks a load-settings change sent to the API; unlike saved settings, bad values are refused, not replaced. */
 export function parseRemoteLoadPatch(raw: unknown): { ok: true; patch: RemoteLoadPatch } | { ok: false; error: string } {
@@ -211,7 +232,32 @@ export function parseRemoteLoadPatch(raw: unknown): { ok: true; patch: RemoteLoa
 }
 
 /** The part of a load config the API shows and accepts. */
-export function remoteLoadView(config: LoadConfig, model: ModelEntry): Required<RemoteLoadPatch> {
-  const view = Object.fromEntries(REMOTE_LOAD_KEYS.map((k) => [k, config[k]])) as Required<RemoteLoadPatch>
+export function remoteLoadView(config: LoadConfig, model: ModelEntry): RemoteLoadView {
+  const view = Object.fromEntries(REMOTE_LOAD_KEYS.map((k) => [k, config[k]])) as RemoteLoadView
   return { ...view, draftFile: draftFileToRemote(config.draftFile, model) }
+}
+
+/** Generation endpoints whose request bodies take sampling values. */
+export const SAMPLING_PATHS = new Set([
+  '/v1/chat/completions',
+  '/v1/completions',
+  '/v1/messages',
+  '/v1/responses',
+  '/completion',
+  '/completions'
+])
+
+/**
+ * A request body with the model's set sampling values written over the client's, for models whose
+ * sampling defaults have `override` on. Values left empty keep whatever the client sent.
+ */
+export function overrideSampling(body: Record<string, unknown>, s: ModelSampling): Record<string, unknown> {
+  const out = { ...body }
+  if (s.temperature !== null) out.temperature = s.temperature
+  if (s.topK !== null) out.top_k = s.topK
+  if (s.topP !== null) out.top_p = s.topP
+  if (s.minP !== null) out.min_p = s.minP
+  if (s.repeatPenalty !== null) out.repeat_penalty = s.repeatPenalty
+  if (s.presencePenalty !== null) out.presence_penalty = s.presencePenalty
+  return out
 }

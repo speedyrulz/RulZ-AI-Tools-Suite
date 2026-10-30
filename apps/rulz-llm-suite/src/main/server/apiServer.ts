@@ -3,7 +3,21 @@ import http, { type IncomingMessage, type ServerResponse } from 'node:http'
 import type { ApiRequestLog, ApiServerSettings, ApiServerStatus, GpuStat, LoadConfig, LoadedInstance, MemoryEstimate, ModelEntry } from '@shared/types'
 import { fileName } from '@shared/draft'
 import type { InstanceManager } from '../engine/instances'
-import { authorized, draftChoices, draftFileFromRemote, errorBody, parseRemoteLoadPatch, parseUsage, pickModel, publicModelId, remoteLoadView, resolveModel } from './helpers'
+import {
+  applyRemoteLoadPatch,
+  authorized,
+  draftChoices,
+  draftFileFromRemote,
+  errorBody,
+  overrideSampling,
+  parseRemoteLoadPatch,
+  parseUsage,
+  pickModel,
+  publicModelId,
+  remoteLoadView,
+  resolveModel,
+  SAMPLING_PATHS
+} from './helpers'
 
 const MAX_BODY_BYTES = 64 * 1024 * 1024
 const MAX_LOG = 300
@@ -192,7 +206,7 @@ export class ApiServer {
             if (draftFile === undefined) return fail(400, 'Invalid load setting draftFile: not one of draft_choices', 'invalid_request_error')
             patch.draftFile = draftFile
           }
-          const merged = { ...this.deps.getLoadDefaults(model.id).config, ...patch }
+          const merged = applyRemoteLoadPatch(this.deps.getLoadDefaults(model.id).config, patch)
           // dry_run only estimates memory for the changed settings, so a form can show it while editing.
           if (json.dry_run === true) preview = merged
           else {
@@ -264,6 +278,12 @@ export class ApiServer {
       this.jit.has(inst.instanceId) && this.jit.set(inst.instanceId, Date.now())
       this.emit()
 
+      if (body && inst.config.sampling.override && SAMPLING_PATHS.has(path)) {
+        const json = JSON.parse(body.toString('utf8')) as unknown
+        if (json && typeof json === 'object' && !Array.isArray(json)) {
+          body = Buffer.from(JSON.stringify(overrideSampling(json as Record<string, unknown>, inst.config.sampling)))
+        }
+      }
       await this.proxy(req, res, inst, path + url.search, body, stream, entry, finish)
     } catch (err) {
       if (!res.headersSent) fail(500, (err as Error).message, 'server_error')
