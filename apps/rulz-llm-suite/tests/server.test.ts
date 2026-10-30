@@ -3,7 +3,7 @@ import type { LoadConfig, LoadedInstance, MemoryEstimate, ModelEntry } from '@sh
 import type { InstanceManager } from '../src/main/engine/instances'
 import { ApiServer } from '../src/main/server/apiServer'
 import { DEFAULT_LOAD_CONFIG } from '@shared/defaults'
-import { authorized, draftChoices, draftFileFromRemote, parseRemoteLoadPatch, parseUsage, publicModelId, remoteLoadView, resolveModel } from '../src/main/server/helpers'
+import { authorized, draftChoices, draftFileFromRemote, parseRemoteLoadPatch, parseUsage, pickModel, publicModelId, remoteLoadView, resolveModel } from '../src/main/server/helpers'
 
 const model = (id: string, name: string): ModelEntry => ({
   id,
@@ -26,6 +26,28 @@ describe('publicModelId', () => {
   it('uses the name unless two models share it', () => {
     expect(publicModelId(models[0], models)).toBe('Qwen3.5-9B-Q8_0')
     expect(publicModelId(models[2], models)).toBe('A/same.gguf')
+  })
+})
+
+describe('pickModel', () => {
+  const on = { defaultModelId: '', unknownModelFallback: true }
+  const off = { defaultModelId: '', unknownModelFallback: false }
+  it('uses a model the library has, whatever is loaded', () => {
+    expect(pickModel(models, 'gemma', [models[0].id], on)).toEqual({ model: models[1], fallback: false })
+  })
+  it('answers an unknown name with the single loaded model when the fallback is on', () => {
+    expect(pickModel(models, 'claude-sonnet-5-5', [models[0].id], on)).toEqual({ model: models[0], fallback: true })
+    expect(pickModel(models, 'claude-sonnet-5-5', [models[0].id], off)).toBeUndefined()
+  })
+  it('falls back to the default model when none or several are loaded', () => {
+    const settings = { ...on, defaultModelId: models[1].id }
+    expect(pickModel(models, 'claude-haiku-5-5', [], settings)).toEqual({ model: models[1], fallback: true })
+    expect(pickModel(models, 'claude-haiku-5-5', [models[0].id, models[2].id], settings)?.model).toBe(models[1])
+    expect(pickModel(models, 'claude-haiku-5-5', [models[0].id, models[2].id], on)).toBeUndefined()
+  })
+  it('treats a request with no model as before, not as a fallback', () => {
+    expect(pickModel(models, undefined, [models[0].id], off)).toEqual({ model: models[0], fallback: false })
+    expect(pickModel(models, undefined, [], off)).toBeUndefined()
   })
 })
 
@@ -134,7 +156,7 @@ describe('GET/POST /v1/models/{id}/load-config', () => {
     const server = new ApiServer({
       instances,
       getModels: () => models,
-      getSettings: () => ({ autoStart: false, port, bind: 'localhost', apiKey: '', cors: false, idleUnloadMinutes: 0, defaultModelId: '' }),
+      getSettings: () => ({ autoStart: false, port, bind: 'localhost', apiKey: '', cors: false, idleUnloadMinutes: 0, defaultModelId: '', unknownModelFallback: true }),
       getLoadDefaults: (id) => (saved[id] ? { config: saved[id], custom: true } : { config: DEFAULT_LOAD_CONFIG, custom: false }),
       setLoadDefaults: async (id, config) => void (saved[id] = config),
       estimate: (_m, config) => ({ gpuBytes: config.contextLength ?? 0 }) as unknown as MemoryEstimate,

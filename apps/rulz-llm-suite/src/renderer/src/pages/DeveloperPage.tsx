@@ -165,7 +165,14 @@ export function DeveloperPage() {
                 onChange={(v) => v !== null && v >= 0 && set('idleUnloadMinutes', Math.round(v))}
               />
             </Field>
-            <Field label="Default model" hint="Used when a request names no model and nothing is loaded">
+            <Field
+              inline
+              label="Answer any model name"
+              hint="A request for a model you don't have (like Claude Code asking for a Claude model) gets the loaded model, or the default model below, instead of an error"
+            >
+              <Switch checked={s.unknownModelFallback} onCheckedChange={(v) => set('unknownModelFallback', v)} />
+            </Field>
+            <Field label="Default model" hint="Used when a request names no model, or one you don't have, and no single model is loaded">
               <Select value={s.defaultModelId} onChange={(e) => set('defaultModelId', e.target.value)}>
                 <option value="">None (use the loaded model)</option>
                 {models.map((m) => (
@@ -278,6 +285,7 @@ function RequestLog({ log, onClear }: { log: ApiRequestLog[]; onClear: () => voi
           {sel.model && (
             <div>
               <span className="text-faint">Model</span> {sel.model}
+              {sel.requestedModel && <span className="text-faint"> (asked for {sel.requestedModel})</span>}
             </div>
           )}
           {sel.status !== undefined && (

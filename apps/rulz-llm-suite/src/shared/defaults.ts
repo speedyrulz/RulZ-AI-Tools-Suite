@@ -79,6 +79,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
     apiKey: '',
     cors: true,
     idleUnloadMinutes: 10,
-    defaultModelId: ''
+    defaultModelId: '',
+    unknownModelFallback: true
   }
 }
