@@ -5,7 +5,7 @@ import { ApiServer } from '../src/main/server/apiServer'
 import { DEFAULT_LOAD_CONFIG } from '@shared/defaults'
 import http from 'node:http'
 import { parseLoadConfig } from '../src/main/settings/schema'
-import { applyRemoteLoadPatch, authorized, overrideSampling, draftChoices, draftFileFromRemote, parseRemoteLoadPatch, parseUsage, pickModel, publicModelId, remoteLoadView, resolveModel } from '../src/main/server/helpers'
+import { applyRemoteLoadPatch, authorized, overrideSampling, draftChoices, draftFileFromRemote, hoistSystemMessages, parseRemoteLoadPatch, parseUsage, pickModel, publicModelId, remoteLoadView, resolveModel } from '../src/main/server/helpers'
 
 const model = (id: string, name: string): ModelEntry => ({
   id,
@@ -91,6 +91,41 @@ describe('authorized', () => {
     expect(authorized('k', { authorization: 'Bearer k' })).toBe(true)
     expect(authorized('k', { 'x-api-key': 'k' })).toBe(true)
     expect(authorized('k', { authorization: 'Bearer nope' })).toBe(false)
+  })
+})
+
+describe('hoistSystemMessages', () => {
+  it('moves system messages onto the end of the top-level system, in order', () => {
+    const out = hoistSystemMessages({
+      model: 'm',
+      system: [{ type: 'text', text: 'core', cache_control: { type: 'ephemeral' } }],
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'system', content: [{ type: 'text', text: '# Environment' }] },
+        { role: 'assistant', content: 'hello' },
+        { role: 'system', content: 'more' }
+      ]
+    } as never)
+    expect(out).toEqual({
+      model: 'm',
+      system: [{ type: 'text', text: 'core', cache_control: { type: 'ephemeral' } }, { type: 'text', text: '# Environment' }, { type: 'text', text: 'more' }],
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: 'hello' }
+      ]
+    })
+  })
+  it('accepts a string system or none, and leaves requests without system messages alone', () => {
+    expect(hoistSystemMessages({ system: 'core', messages: [{ role: 'system', content: 'late' }, { role: 'user', content: 'hi' }] })).toEqual({
+      system: [{ type: 'text', text: 'core' }, { type: 'text', text: 'late' }],
+      messages: [{ role: 'user', content: 'hi' }]
+    })
+    expect(hoistSystemMessages({ messages: [{ role: 'user', content: 'hi' }, { role: 'system', content: 'late' }] })).toEqual({
+      system: [{ type: 'text', text: 'late' }],
+      messages: [{ role: 'user', content: 'hi' }]
+    })
+    expect(hoistSystemMessages({ system: 'core', messages: [{ role: 'user', content: 'hi' }] })).toBeNull()
+    expect(hoistSystemMessages({ prompt: 'x' } as never)).toBeNull()
   })
 })
 
