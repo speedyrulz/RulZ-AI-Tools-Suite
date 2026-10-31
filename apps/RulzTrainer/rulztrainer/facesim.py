@@ -102,8 +102,26 @@ def available() -> tuple[bool, str]:
     return True, ""
 
 
+def cuda_index(provider: str, device=None) -> int | None:
+    """The GPU InsightFace runs on: None for the CPU provider; for "cuda" the index of `device` (e.g. the trainer's
+    cuda:1) or of a "cuda:N" provider, else 0."""
+    provider = str(provider or "cpu").strip().lower()
+    if not provider.startswith("cuda"):
+        return None
+    for d in (provider, device):
+        if d is not None and str(d).startswith("cuda:"):
+            try:
+                return int(str(d).split(":", 1)[1])
+            except ValueError:
+                continue
+    return 0
+
+
 class FaceScorer:
-    def __init__(self, provider: str = "cpu", det_size: int = 640, model_name: str = "buffalo_l", progress=None):
+    def __init__(self, provider: str = "cpu", det_size: int = 640, model_name: str = "buffalo_l", progress=None,
+                 device=None):
+        """provider "cpu" or "cuda" ("cuda:N" for a GPU other than the first); device: the GPU a plain "cuda" runs
+        on (onnxruntime's device_id; prepare's ctx_id alone only told CPU from GPU, so it was always GPU 0)."""
         ok, msg = available()
         if not ok:
             raise RuntimeError(msg)
@@ -114,10 +132,12 @@ class FaceScorer:
         ensure_insightface_pack(model_name, progress=progress)
         if progress:
             progress(f"Loading face model {model_name}...", None)
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if provider == "cuda" else ["CPUExecutionProvider"]
+        index = cuda_index(provider, device)
+        providers = ([("CUDAExecutionProvider", {"device_id": index}), "CPUExecutionProvider"] if index is not None
+                     else ["CPUExecutionProvider"])
         self.app = FaceAnalysis(name=model_name, providers=providers,
                                 allowed_modules=["detection", "recognition"])
-        self.app.prepare(ctx_id=0 if provider == "cuda" else -1, det_size=(det_size, det_size))
+        self.app.prepare(ctx_id=index if index is not None else -1, det_size=(det_size, det_size))
         self.refs: list[tuple[str, np.ndarray]] = []
         self.ref_self_similarity: float | None = None
 
@@ -135,29 +155,38 @@ class FaceScorer:
                 scale = full / max(im.size)
             return np.asarray(im)[:, :, ::-1].copy(), scale
 
-    FALLBACK_PADS = (2, 4)  # the image on a canvas this many times its size, when a face fills the frame
+    FALLBACK_PADS = (2, 4)  # the image shrunk this many times on a canvas of its own size, when a face fills the frame
 
     def _detect(self, arr: np.ndarray):
         """Faces in a BGR array, with the boxes in its pixels. The detector rescales every input to det_size and its
         anchors stop at a face size relative to that frame, so a face that fills the frame (a tight headshot probe)
-        is missed whatever the image size: when nothing is found, the image is placed at the centre of a canvas 2x
-        and then 4x its size (the same face at half / a quarter of the frame, found with confidence 0.9) and the
-        boxes are shifted back."""
+        is missed whatever the image size: when nothing is found, the image is shrunk to a half and then a quarter
+        at the centre of a canvas of its own size (the same face at half / a quarter of the frame, found with
+        confidence 0.9) and the boxes are mapped back. The canvas used to be the image at full size on 2x / 4x
+        canvases (up to 16x the pixels); the detector shrinks it to det_size either way. The embedding is taken
+        again from the source pixels at the mapped-back landmarks, as on the full-size canvas before."""
         found = self.app.get(arr)
         if found:
             return found
+        import cv2
+
         h, w = arr.shape[:2]
         for k in self.FALLBACK_PADS:
-            canvas = np.full((h * k, w * k, 3), 114, dtype=arr.dtype)  # the detector's own neutral gray
-            oy, ox = (h * k - h) // 2, (w * k - w) // 2
-            canvas[oy:oy + h, ox:ox + w] = arr
+            sw, sh = max(1, round(w / k)), max(1, round(h / k))
+            canvas = np.full((h, w, 3), 114, dtype=arr.dtype)  # the detector's own neutral gray
+            oy, ox = (h - sh) // 2, (w - sw) // 2
+            canvas[oy:oy + sh, ox:ox + sw] = cv2.resize(arr, (sw, sh), interpolation=cv2.INTER_AREA)
             found = self.app.get(canvas)
             if found:
                 shift = np.array([ox, oy, ox, oy], dtype=np.float32)
+                scale = np.array([w / sw, h / sh, w / sw, h / sh], dtype=np.float32)
+                rec = getattr(self.app, "models", {}).get("recognition")
                 for f in found:
-                    f.bbox = f.bbox - shift
+                    f.bbox = (f.bbox - shift) * scale
                     if getattr(f, "kps", None) is not None:
-                        f.kps = f.kps - shift[:2]
+                        f.kps = (f.kps - shift[:2]) * scale[:2]
+                        if rec is not None:
+                            rec.get(arr, f)  # the embedding of the full-resolution face
                 return found
         return []
 

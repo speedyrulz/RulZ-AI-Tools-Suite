@@ -87,9 +87,11 @@ def is_fibo_file_state(names) -> bool:
     return "perceiver.latent_queries" in names and any(n.endswith("attention.qkv.weight") for n in names)
 
 
-def load_transformer_file(path: str | Path, device, quant: str = "auto", dtype=torch.bfloat16) -> FiboTransformer:
+def load_transformer_file(path: str | Path, device, quant: str = "auto", dtype=torch.bfloat16,
+                          quant_devices=None) -> FiboTransformer:
     """The diffusion model from a ComfyUI FIBO 2.0 file. quant "auto" keeps a quantized file's format and quantizes an
-    unquantized one for the GPU it runs on, as the diffusers path does."""
+    unquantized one for the memory it runs in, as the diffusers path does (quant_devices: the GPUs of a model
+    split)."""
     from .loading import QUANT_FILTER, resolve_quant
 
     state = sf.strip_prefix(sf.read_state(path, dtype), ("model.diffusion_model.", "diffusion_model."))
@@ -98,10 +100,10 @@ def load_transformer_file(path: str | Path, device, quant: str = "auto", dtype=t
     config = json.loads(CONFIG.read_text(encoding="utf-8"))
     state = to_diffusers_layout(state, ffn_hidden(config))
     quantized = any(isinstance(v, Q.QuantWeight) for v in state.values())
-    fmt = quant if (quant != "auto" or quantized) else resolve_quant("auto", device)
+    fmt = quant if (quant != "auto" or quantized) else resolve_quant("auto", quant_devices or device)
     with torch.device("meta"):
         model = FiboTransformer.from_config(config)
-    sf.install_state(model, state, fmt, dtype, quant_filter=QUANT_FILTER)
+    sf.install_state(model, state, fmt, dtype, quant_filter=QUANT_FILTER, **sf.quant_target(device, quant_devices))
     del state
     model = model.to(device).eval().requires_grad_(False)
     log.info("Loaded FIBO 2.0 transformer from %s: %d layers (+%d refiner), dim %d, quant=%s", Path(path).name,

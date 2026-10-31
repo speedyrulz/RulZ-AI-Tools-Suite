@@ -154,7 +154,7 @@ def load_transformer_file(path: str | Path, device, quant: str = "auto", dtype=t
              for k, v in state.items()}  # RMSNorm scales stay fp32, as diffusers keeps them
     with torch.device("meta"):
         model = Krea2Transformer.from_config(config)
-    sf.install_state(model, state, quant, dtype, quant_filter=QUANT_FILTER)
+    sf.install_state(model, state, quant, dtype, quant_filter=QUANT_FILTER, **sf.quant_target(device, quant_devices))
     del state
     model.is_distilled = "turbo" in Path(path).name.lower()
     model = model.to(device).eval().requires_grad_(False)
@@ -182,10 +182,7 @@ def load_vae_file(path: str | Path, device):
     config = json.loads((HERE / "qwen_image_vae_config.json").read_text(encoding="utf-8"))
     config["z_dim"] = state["decoder.conv_in.weight"].shape[1]
     config["base_dim"] = state["encoder.conv_in.weight"].shape[0]
-    vae = AutoencoderKLQwenImage(**config)
-    missing, unexpected = vae.load_state_dict(state, strict=False)
-    if missing or unexpected:
-        raise ValueError(f"VAE state mismatch. missing={missing[:5]} unexpected={unexpected[:5]}")
+    vae = sf.assign_on_meta(lambda: AutoencoderKLQwenImage(**config), state, Path(path).name)
     return vae.to(device, torch.float32).eval().requires_grad_(False)
 
 
@@ -197,16 +194,17 @@ TOKENIZER_REPO = "Qwen/Qwen3-VL-4B-Instruct"  # the same Qwen2 tokenizer as Krea
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt", "chat_template.json")
 
 
-def build_text_model(state: dict, quant: str = "auto", device="cpu", config: dict | None = None):
-    """Text-only Qwen3-VL from an HF- or ComfyUI-style (possibly quantized) state dict."""
+def build_text_model(state: dict, quant: str = "auto", device="cpu", config: dict | None = None, work_device=None):
+    """Text-only Qwen3-VL from an HF- or ComfyUI-style (possibly quantized) state dict, which is consumed.
+    work_device: where to quantize (moss.single_file.quant_target; the model is built on the CPU)."""
     from transformers import Qwen3VLTextConfig, Qwen3VLTextModel
 
     cfg = Qwen3VLTextConfig(**(config or json.loads((HERE / "qwen3vl_4b_text_config.json").read_text("utf-8"))))
-    state = {k: v for k, v in state.items() if not k.startswith(TE_DROP)}
+    state = sf.take_state(state, TE_DROP)
     state = sf.strip_prefix(state, TE_PREFIXES)
     with torch.device("meta"):
         model = Qwen3VLTextModel(cfg)
-    sf.install_state(model, state, quant, torch.bfloat16, ignore_missing=("inv_freq",))
+    sf.install_state(model, state, quant, torch.bfloat16, ignore_missing=("inv_freq",), work_device=work_device)
     import inspect
 
     rot_cls = type(model.rotary_emb)  # its buffers were created on the meta device: build it again for real
@@ -222,12 +220,35 @@ def load_text_encoder_file(path: str | Path, device: str = "auto", quant: str = 
     from ..fibo.loading import place_text_encoder
 
     state = sf.read_state(path, torch.bfloat16)
-    model = build_text_model(state, quant, "cpu")
+    model = build_text_model(state, quant, "cpu", work_device=sf.quant_target(device).get("work_device"))
     n_q = sum(1 for m in model.modules() if isinstance(m, Q.QuantLinear))
     log.info("Loaded Qwen3-VL text encoder from %s (%d layers%s)", Path(path).name, model.config.num_hidden_layers,
              f", {n_q} quantized Linear layers" if n_q else "")
     del state
     return place_text_encoder(model, device)
+
+
+def hf_text_config(te_dir: Path) -> dict:
+    """The language model's config from an HF text_encoder/ folder (a Qwen3-VL config.json's text_config), in the
+    names this transformers reads."""
+    config = json.loads((Path(te_dir) / "config.json").read_text(encoding="utf-8"))
+    text_cfg = dict(config.get("text_config", config))
+    rope = text_cfg.pop("rope_scaling", None)
+    if rope is not None and "rope_parameters" not in text_cfg:  # transformers 4.x names in a 5.x config
+        text_cfg["rope_parameters"] = {**rope, "rope_theta": text_cfg.pop("rope_theta", 5000000)}
+    text_cfg.pop("dtype", None)
+    return text_cfg
+
+
+def load_hf_text_model(te_dir: Path, quant: str = "none", device="auto"):
+    """The text-only Qwen3-VL language model from an HF text_encoder/ folder (Qwen3VLModel or
+    Qwen3VLForConditionalGeneration weights): the vision tower and the LM head are never loaded. Built on the CPU;
+    `device` only picks where a quantization runs."""
+    from ..moss.loading import _read_sharded
+
+    state = _read_sharded(Path(te_dir), "model")
+    return build_text_model(state, quant, "cpu", config=hf_text_config(te_dir),
+                            work_device=sf.quant_target(device).get("work_device"))
 
 
 def resolve_tokenizer(tokenizer_path: str, models_dir: str = "models") -> Path:
