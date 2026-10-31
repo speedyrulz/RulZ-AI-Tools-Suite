@@ -31,8 +31,8 @@ SHORT = {"color": "Noise", "jpeg": "JPEG", "detail": "Detail"}
 
 
 def _thumb_key(it: ImageItem, globals_: dict) -> tuple:
-    # Thumbnails are too small to show JPEG blocks or fine detail, so only color noise affects them.
-    return ("color", it.value("color", globals_))
+    # Thumbnails are too small to show JPEG blocks or fine detail, so only color noise and shadows affect them.
+    return ("color", it.value("color", globals_), it.shadow_edit())
 
 
 class CardDelegate(QStyledItemDelegate):
@@ -82,7 +82,9 @@ class CardDelegate(QStyledItemDelegate):
 
         settings = it.settings(self.win.globals)
         custom = bool(it.custom)
-        badge = "  ".join(f"{SHORT[k]} {v}" for k, v in settings.items() if v) or "No changes"
+        badge = "  ".join([f"{SHORT[k]} {v}" for k, v in settings.items() if v] +
+                          (["Shadows"] if it.shadow_edit() else [])) or "No changes"
+        custom = custom or it.shadow_edit() is not None
         if custom:
             badge = "Custom · " + badge
         f.setBold(True)
@@ -322,7 +324,7 @@ class MainWindow(QMainWindow):
             it = self._render_queue.pop(0)
             key = _thumb_key(it, self.globals)
             if it.preview_key != key:
-                img = process(it.thumb, it.settings(self.globals), full_size=False)
+                img = process(it.thumb, it.settings(self.globals), full_size=False, shadow=it.shadow_edit())
                 it.preview = QPixmap.fromImage(imageio.to_qimage(img))
                 it.preview_key = key
                 self._refresh_card(it)
@@ -470,7 +472,7 @@ class MainWindow(QMainWindow):
             f"{len(existing)} file(s) with the same name already exist in that folder. Replace them?",
         ) != QMessageBox.Yes:
             return
-        jobs = [(it.path, d, it.settings(self.globals)) for it, d in zip(self.items, dests)]
+        jobs = [(it.path, d, it.settings(self.globals), it.shadow_edit()) for it, d in zip(self.items, dests)]
 
         dlg = QProgressDialog("Saving…", "Cancel", 0, len(jobs), self)
         dlg.setWindowTitle("Save all")

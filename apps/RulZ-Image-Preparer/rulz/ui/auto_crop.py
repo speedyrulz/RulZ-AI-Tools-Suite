@@ -110,7 +110,7 @@ class CropAll(QThread):
                     empty.append(it.path.name)
                     continue
                 if cleanup is not None:
-                    img = process(img, cleanup, self.mode)
+                    img = process(img, cleanup, self.mode, shadow=it.shadow_edit())
                 x0, y0, x1, y1 = box
                 imageio.save(dst, np.ascontiguousarray(img[y0:y1, x0:x1]))
                 saved += 1
@@ -320,7 +320,7 @@ class AutoCropDialog(QDialog):
         v.addWidget(QLabel("Clean-up", objectName="Section"))
         self.cleanup = QCheckBox("Also remove noise and JPEG damage first")
         self.cleanup.setToolTip("Apply each picture's clean-up settings (color noise, JPEG artifacts, detail "
-                                "recovery) before cropping, the same way Save all does.")
+                                "recovery and painted shadow areas) before cropping, the same way Save all does.")
         v.addWidget(self.cleanup)
         self.cleanup_note = QLabel(objectName="Muted", wordWrap=True)
         v.addWidget(self.cleanup_note)
@@ -352,7 +352,10 @@ class AutoCropDialog(QDialog):
             note += f" {custom} picture{'s have' if custom != 1 else ' has'} its own settings."
         if self.mode == BEST:
             note += " JPEG uses Best quality (AI)."
-        if all(is_noop(it.settings(self.globals)) for it in self.items):
+        shadows = sum(1 for it in self.items if it.shadow_edit())
+        if shadows:
+            note += f" Shadow areas painted on {shadows} picture{'s' * (shadows != 1)} are lifted too."
+        if all(is_noop(it.settings(self.globals)) and not it.shadow_edit() for it in self.items):
             note = "Every clean-up setting is 0 for these pictures, so this changes nothing."
         self.cleanup_note.setText(note)
 
