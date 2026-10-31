@@ -21,18 +21,37 @@ from .urls import (
 
 log = logging.getLogger("crawler_app.crawler")
 
-# Scrolls one viewport at a time so lazy loaders fire; stops after the bottom is reached twice
-# (the second time lets infinite-scroll pages append one more batch), then returns to the top.
+# Scrolls one viewport at a time so lazy loaders fire. At the bottom it gives infinite-scroll pages
+# up to 600 ms to append more; when the page stops growing it stops, then returns to the top.
 SCROLL_JS = """async (maxSteps) => {
-  let atBottom = 0;
-  for (let i = 0; i < maxSteps && atBottom < 2; i++) {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const height = () => document.documentElement.scrollHeight;
+  for (let i = 0; i < maxSteps; i++) {
     window.scrollBy(0, window.innerHeight);
-    await new Promise(r => setTimeout(r, 250));
-    const bottom = window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 2;
-    atBottom = bottom ? atBottom + 1 : 0;
+    await sleep(150);
+    if (window.scrollY + window.innerHeight < height() - 2) continue;
+    const before = height();
+    let grew = false;
+    for (let t = 0; t < 6 && !grew; t++) {
+      await sleep(100);
+      grew = height() > before;
+    }
+    if (!grew) break;
   }
   window.scrollTo(0, 0);
 }"""
+
+# Waits (up to `ms`) until every <img> has loaded or failed, instead of for network idle, which pages
+# with analytics or long polling never reach.
+IMAGES_DONE_JS = """async (ms) => {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if ([...document.images].every(i => i.complete)) return true;
+    await new Promise(r => setTimeout(r, 100));
+  }
+  return false;
+}"""
+IMAGES_WAIT_MS = 1500
 
 EXTRACT_JS = r"""() => {
   const imgs = [...document.images].map(i => {
@@ -164,10 +183,7 @@ async def load_page(
                 raise PageError(f"not a web page ({ctype.split(';')[0]})")
         try:
             await page.evaluate(SCROLL_JS, max_scroll_steps)
-            try:
-                await page.wait_for_load_state("networkidle", timeout=5000)
-            except PlaywrightError:
-                pass  # pages with constant background traffic never go idle; carry on
+            await page.evaluate(IMAGES_DONE_JS, IMAGES_WAIT_MS)
             raw = await page.evaluate(EXTRACT_JS)
         except PlaywrightError as e:
             raise PageError(f"page script failed: {str(e).splitlines()[0]}") from e

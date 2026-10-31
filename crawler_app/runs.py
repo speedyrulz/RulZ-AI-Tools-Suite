@@ -170,6 +170,11 @@ class Run:
             await asyncio.sleep(0.5)
             if self._dirty:
                 self._publish(self._stats_event())
+            if self.storage is not None and self.storage.dirty:
+                try:
+                    await asyncio.to_thread(self.storage.flush)
+                except OSError as e:  # pragma: no cover - retried on the next tick
+                    log.warning("run %s: could not write matches.json: %s", self.id, e)
 
     # ---- pipeline --------------------------------------------------------------------
 
@@ -420,7 +425,7 @@ class Run:
 
     async def _classify_batch(self, batch: list[FetchedImage], tag: Tag) -> None:
         by_id = {img.sha256: img for img in batch}
-        inputs = [ImageInput(i, data_b64=img.b64, mime=img.mime) for i, img in by_id.items()]
+        inputs = [ImageInput(i, mime=img.mime, data=img.data) for i, img in by_id.items()]
         while True:
             await self._resume.wait()
             try:

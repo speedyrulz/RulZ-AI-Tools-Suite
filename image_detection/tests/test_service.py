@@ -410,3 +410,77 @@ def test_one_server_down_work_moves_to_the_other(tmp_path):
     fakes[1].down = True
     with pytest.raises(ModelServerDown):
         asyncio.run(svc.classify([ImageInput("x", data_b64=png_b64(color="blue"))], [Tag("red_disc", RUBRIC_A)]))
+
+
+# ---- raw-bytes cache, in-process bytes, faster resize -------------------------------------
+
+
+def _jpeg(size=(4000, 3000), color="red") -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", size, color).save(buf, "JPEG", quality=90)
+    return buf.getvalue()
+
+
+def test_large_jpeg_draft_still_caps_long_edge():
+    p = prepare_image(_jpeg((4000, 3000)), max_edge=1024, min_short_edge=96)
+    assert (p.width, p.height) == (1024, 768) and p.mime == "image/jpeg"
+
+
+def test_too_small_detected_without_decoding():
+    from image_detection.preprocess import ImageTooSmall
+
+    with pytest.raises(ImageTooSmall):
+        prepare_image(_jpeg((80, 2000)), 1024, 96)
+
+
+def test_cached_raw_bytes_skip_preprocessing(tmp_path, fake, monkeypatch):
+    import asyncio
+
+    from image_detection import service as service_mod
+    from image_detection.service import ImageInput, Tag
+
+    s = Settings(cache_path=tmp_path / "cache.sqlite3", llama_url="http://llama")
+    svc = DetectionService(s, llama=LlamaClient(s, httpx.AsyncClient(transport=httpx.MockTransport(fake.handler))))
+    calls = []
+    real = service_mod.prepare_image
+    monkeypatch.setattr(service_mod, "prepare_image", lambda *a, **k: calls.append(1) or real(*a, **k))
+    raw = _jpeg((2000, 1500))
+    tag = Tag("red_disc", RUBRIC_A)
+
+    first = asyncio.run(svc.classify([ImageInput("a", data=raw)], [tag]))["a"]
+    assert first["status"] == "ok" and not first["cached"] and len(calls) == 1 and len(fake.requests) == 1
+
+    # same bytes (as base64 this time): answered from the cache without decoding
+    again = asyncio.run(svc.classify([ImageInput("b", data_b64=base64.b64encode(raw).decode())], [tag]))["b"]
+    assert again["status"] == "ok" and again["cached"] and again["tags"] == first["tags"]
+    assert len(calls) == 1 and len(fake.requests) == 1
+
+    # a new tag for the same image needs the prepared image again, and only one model call
+    again = asyncio.run(svc.classify([ImageInput("c", data=raw)], [tag, Tag("blue_square", RUBRIC_B)]))["c"]
+    assert again["status"] == "ok" and not again["cached"]
+    assert len(calls) == 2 and len(fake.requests) == 2
+
+    # different MAX_EDGE: the raw-hash mapping isn't reused
+    s.max_edge = 512
+    asyncio.run(svc.classify([ImageInput("d", data=raw)], [tag]))
+    assert len(calls) == 3
+    asyncio.run(svc.aclose())
+
+
+def test_fetch_url_stops_at_max_bytes():
+    import asyncio
+
+    from image_detection.preprocess import ImageError, fetch_url
+
+    big = b"x" * 5000
+
+    def handler(request):
+        return httpx.Response(200, content=big)  # no reliable Content-Length check: body is counted
+
+    async def go(limit):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+            return await fetch_url(c, "http://img/a.jpg", 5, limit)
+
+    assert asyncio.run(go(10_000)) == big
+    with pytest.raises(ImageError, match="too large"):
+        asyncio.run(go(1000))

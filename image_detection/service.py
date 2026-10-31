@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from dataclasses import dataclass
@@ -21,8 +22,14 @@ EXPANSION_VERSION = "v2"
 # Part of the result-cache key: bump when the meaning of a cached confidence changes.
 # "p1" = confidence is the model's probability of its answer, not the number it wrote.
 SCORING_VERSION = "p1"
+# Part of the raw-bytes -> prepared-hash key: bump when prepare_image's output for the same input changes.
+PREPARE_VERSION = "r2"
 
 T = TypeVar("T")
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 log = logging.getLogger("image_detection.service")
 
@@ -33,6 +40,7 @@ class ImageInput:
     data_b64: str | None = None
     url: str | None = None
     mime: str | None = None  # informational; the decoder sniffs the real format
+    data: bytes | None = None  # raw bytes, for in-process callers (skips the base64 round trip)
 
 
 @dataclass(frozen=True)
@@ -224,15 +232,29 @@ class DetectionService:
             for c in self.llamas:
                 c._model_id = None
 
-    async def _load(self, img: ImageInput) -> PreparedImage:
+    async def _raw(self, img: ImageInput) -> bytes:
+        if img.data is not None:
+            return img.data
         if img.data_b64:
-            raw = decode_b64(img.data_b64)
-        elif img.url:
+            return decode_b64(img.data_b64)
+        if img.url:
             async with self._fetch_slots:
-                raw = await fetch_url(self._fetch, img.url, self.s.fetch_timeout_s, self.s.max_image_bytes)
-        else:
-            raise ImageError("image has neither data_b64 nor url")
-        return await asyncio.to_thread(prepare_image, raw, self.s.max_edge, self.s.min_short_edge, self.s.jpeg_quality)
+                return await fetch_url(self._fetch, img.url, self.s.fetch_timeout_s, self.s.max_image_bytes)
+        raise ImageError("image has neither data_b64 nor url")
+
+    def _prep_key(self) -> str:
+        """Everything that changes the prepared bytes for the same raw bytes."""
+        return f"{PREPARE_VERSION}|{self.s.max_edge}|{self.s.jpeg_quality}"
+
+    def _known_results(
+        self, raw_hash: str, hashes: dict[str, str], model_id: str
+    ) -> tuple[str | None, dict[str, TagResult]]:
+        """(prepared hash, cached results) for raw bytes seen before, so a fully cached image skips
+        the decode and resize."""
+        prepared_hash = self.cache.get_prepared(raw_hash, self._prep_key())
+        if prepared_hash is None:
+            return None, {}
+        return prepared_hash, self.cache.get_many(prepared_hash, hashes.values(), model_id)
 
     async def _run_chunk(self, prepared: PreparedImage, chunk: Sequence[Tag], model_id: str) -> dict[str, TagResult]:
         pairs = [(t.id, t.rubric) for t in chunk]
@@ -252,15 +274,29 @@ class DetectionService:
     async def _process_image(
         self, img: ImageInput, tags: Sequence[Tag], threshold: float, model_id: str
     ) -> dict[str, Any]:
+        hashes = {t.id: rubric_hash(t.rubric) for t in tags}
         try:
-            prepared = await self._load(img)
-        except ImageTooSmall as e:
-            return {"status": "skipped", "cached": False, "message": str(e)}
+            data = await self._raw(img)
         except ImageError as e:
             return {"status": "error", "cached": False, "message": str(e)}
 
-        hashes = {t.id: rubric_hash(t.rubric) for t in tags}
-        hits = self.cache.get_many(prepared.sha256, hashes.values(), model_id)
+        raw_hash = await asyncio.to_thread(_sha256, data)
+        known, hits = self._known_results(raw_hash, hashes, model_id)
+        if known is None or len(hits) < len(set(hashes.values())):
+            try:
+                prepared = await asyncio.to_thread(
+                    prepare_image, data, self.s.max_edge, self.s.min_short_edge, self.s.jpeg_quality
+                )
+            except ImageTooSmall as e:
+                return {"status": "skipped", "cached": False, "message": str(e)}
+            except ImageError as e:
+                return {"status": "error", "cached": False, "message": str(e)}
+            if prepared.sha256 != known:
+                self.cache.put_prepared(raw_hash, self._prep_key(), prepared.sha256)
+                hits = self.cache.get_many(prepared.sha256, hashes.values(), model_id)
+        else:
+            prepared = None  # every tag cached: no decode needed
+
         raw: dict[str, TagResult] = {t.id: hits[hashes[t.id]] for t in tags if hashes[t.id] in hits}
         todo = [t for t in tags if t.id not in raw]
 

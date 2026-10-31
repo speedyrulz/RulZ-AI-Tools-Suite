@@ -258,7 +258,8 @@ def create_app(
                     if await request.is_disconnected():
                         return
                     try:
-                        ev = await asyncio.wait_for(q.get(), 15)
+                        # short, so a closed tab is noticed (and unsubscribed) within seconds
+                        ev = await asyncio.wait_for(q.get(), 5)
                     except TimeoutError:
                         yield ": keep-alive\n\n"
                         continue

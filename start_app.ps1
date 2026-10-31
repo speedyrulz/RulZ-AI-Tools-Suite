@@ -67,7 +67,8 @@ function Wait-Url([string]$url, [int]$seconds, [System.Diagnostics.Process]$proc
     throw "$what did not become ready within $seconds s (see $log)"
 }
 
-# "all" = every NVIDIA card with room for the model (~13 GB), else a list like "0" or "0,1".
+# "all" = every NVIDIA card with room for the model (~11.5 GB with start_llama_server.ps1's default
+# -c 8192 and q8_0 KV cache), else a list like "0" or "0,1".
 function Get-ModelGpus([string]$spec) {
     if ($spec -ne "all") {
         return @($spec -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
@@ -75,7 +76,7 @@ function Get-ModelGpus([string]$spec) {
     if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) { return @("0") }
     $gpus = @(& nvidia-smi --query-gpu=index,memory.total --format=csv,noheader,nounits 2>$null | ForEach-Object {
         $idx, $mem = $_ -split ","
-        if ([int]$mem.Trim() -ge 14000) { $idx.Trim() }
+        if ([int]$mem.Trim() -ge 12000) { $idx.Trim() }
     })
     if ($gpus.Count -eq 0) { return @("0") }
     return $gpus

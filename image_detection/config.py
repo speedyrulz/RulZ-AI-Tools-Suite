@@ -25,6 +25,7 @@ class Settings:
     # Unset means just llama_url.
     llama_urls: list[str] | None = None
     # Number of slots (--parallel) per llama-server. The service runs this many model workers per server.
+    # Must match -Parallel in scripts/start_llama_server.ps1 (default 2).
     llama_parallel: int = field(default_factory=lambda: _env_int("LLAMA_PARALLEL", 2))
     # Overrides the model id used for cache keys / health; default is read from llama-server.
     model_id: str | None = field(default_factory=lambda: os.environ.get("MODEL_ID") or None)
