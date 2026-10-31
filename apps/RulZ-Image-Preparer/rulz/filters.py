@@ -16,7 +16,7 @@ BALANCED, BEST = "balanced", "best"
 
 # name: (label, default)
 ADJUSTMENTS = {
-    "color": ("Color noise removal", 50),
+    "color": ("Color noise removal", 0),
     "jpeg": ("JPEG artifact removal", 0),
     "detail": ("Detail recovery", 0),
 }
