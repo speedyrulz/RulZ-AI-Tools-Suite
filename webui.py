@@ -552,8 +552,28 @@ def read_status() -> dict | None:
         return None
     try:
         return json.loads(p.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    except (OSError, ValueError):  # locked or torn mid-write (JSON / Unicode decode errors are ValueErrors)
         return None
+
+
+def tail_lines(path: Path, n: int, chunk: int = 65536) -> list[str]:
+    """The last n lines of a text file, read from its end: a long run's train.log is not read whole on every poll."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            pos = f.tell()
+            data = b""
+            while pos > 0 and data.count(b"\n") <= n:
+                size = min(chunk, pos)
+                pos -= size
+                f.seek(pos)
+                data = f.read(size) + data
+    except OSError:
+        return []
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    if pos > 0:  # the first line read may start mid-line
+        lines = lines[1:]
+    return lines[-n:] if n > 0 else []
 
 
 def read_log_tail(n: int = 80) -> str:
@@ -562,12 +582,12 @@ def read_log_tail(n: int = 80) -> str:
     text = ""
     lp = _job_dir / "train.log"
     if lp.exists():
-        text = "\n".join(lp.read_text(encoding="utf-8", errors="replace").splitlines()[-n:])
+        text = "\n".join(tail_lines(lp, n))
     st = read_status() or {}
     if not _running() and (st.get("error") or not st.get("done")):
         cp = _job_dir / "console.log"
         if cp.exists():
-            tail = cp.read_text(encoding="utf-8", errors="replace").splitlines()[-30:]
+            tail = tail_lines(cp, 30)
             text += "\n--- console.log ---\n" + "\n".join(tail)
     return text
 

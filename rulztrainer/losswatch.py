@@ -56,6 +56,12 @@ class ImageStat:
         return self.history[-1] / self.history[-2] - 1.0
 
 
+def _flush_at_exit(ref) -> None:
+    watch = ref()
+    if watch is not None:
+        watch.flush()
+
+
 def _caption_hash(caption: str) -> str:
     return hashlib.sha1(caption.encode("utf-8")).hexdigest()[:12]
 
@@ -82,6 +88,14 @@ class LossWatch:
         import threading
 
         self._lock = threading.Lock()
+        # per_image_loss.jsonl lines of the current step, written in one go when the next step starts (one open per
+        # step instead of per sample), at an epoch's end and at exit
+        self._pending: list[str] = []
+        self._pending_step: int | None = None
+        import atexit
+        import weakref
+
+        atexit.register(_flush_at_exit, weakref.ref(self))
         self._load_exclusions()
 
     # ------------------------------------------------------------ persistence
@@ -145,13 +159,33 @@ class LossWatch:
             st.epoch_n += 1
         st.last_loss, st.last_sigma = loss, sigma
         self.epoch_obs += 1
+        if self._pending and self._pending_step != step:  # a new step: the last one's lines in one write
+            self._flush()
+        self._pending_step = step
+        self._pending.append(json.dumps({"step": step, "image": key, "loss": loss, "sigma": sigma, "bucket": b,
+                                         "expected": expected, "residual": resid}) + "\n")
+        return resid
+
+    def flush(self) -> None:
+        """Write the buffered per-sample lines to per_image_loss.jsonl (thread-safe)."""
+        with self._lock:
+            self._flush()
+
+    def __del__(self):
+        try:
+            self._flush()
+        except Exception:  # noqa: BLE001  (interpreter shutdown)
+            pass
+
+    def _flush(self) -> None:
+        if not getattr(self, "_pending", None):
+            return
+        lines, self._pending = self._pending, []
         try:
             with open(self.log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"step": step, "image": key, "loss": loss, "sigma": sigma, "bucket": b,
-                                    "expected": expected, "residual": resid}) + "\n")
+                f.write("".join(lines))
         except OSError:
             pass
-        return resid
 
     def epoch_complete(self) -> bool:
         return self.epoch_obs >= max(1, self.active_count())
@@ -160,6 +194,7 @@ class LossWatch:
     def end_epoch(self, step: int) -> dict:
         """Close the epoch: compute verdicts and multipliers. Returns a summary for logging / status."""
         cfg = self.cfg
+        self.flush()
         self.epoch += 1
         self.epoch_obs = 0
         for st in self.stats.values():

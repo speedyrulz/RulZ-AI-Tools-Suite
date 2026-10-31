@@ -235,6 +235,10 @@ class LoRALinear(nn.Module):
         self.extras: list[tuple] = []
         self.extra_biases: list[tuple[torch.Tensor, float]] = []
         self.extras_enabled = False
+        # while the extras are on: their copies on the frozen layer's device in the compute dtype (stage_extras),
+        # so a render does not upload and cast them on every forward; the CPU originals above stay as they are
+        self.staged_extras: list[tuple] | None = None
+        self.staged_biases: list[tuple[torch.Tensor, float]] | None = None
         # the training adapter (attach_training_adapter): down [r, in] and up [out, r] (its scale folded in) in the
         # compute dtype, applied while the extras are off; buffers, so moves, block swap and model splits carry it
         self.register_buffer("train_down", None, persistent=False)
@@ -343,11 +347,29 @@ class LoRALinear(nn.Module):
             cached = getattr(self, "_dora_norm", None)
             if cached is not None and cached[0] == key:
                 return self.dora_scale / cached[1]
-        with torch.no_grad():
-            w = dense_weight(self.base).to(self.dora_scale.device)
-            norm = (w + self.delta_weight()).norm(dim=0) + DORA_EPS
+        norm = self.merged_col_norm() + DORA_EPS
         self._dora_norm = (key, norm) if key is not None else None
         return self.dora_scale / norm
+
+    @torch.no_grad()
+    def merged_col_norm(self) -> torch.Tensor:
+        """||W + delta|| per input column [in] (fp32) without forming delta or W + delta: per column
+        ||W||^2 + 2 <W, delta> + ||delta||^2, the last two from the delta's factors (a LoRA's up^T W [rank, in]; a
+        LoKr's W read as [a, c, b, d] against w1 and w2). One dense fp32 weight per call instead of three."""
+        w = dense_weight(self.base).to(self.dora_scale.device)
+        w_sq = w.norm(dim=0).square()
+        s = self.scale
+        if self.kind == "lora":
+            up, down = self.lora_up.weight.float(), self.lora_down.weight.float()
+            cross = ((up.t() @ w) * down).sum(0) * s
+            d_sq = (((up.t() @ up) @ down) * down).sum(0) * (s * s)
+        else:
+            w1, w2 = self.lokr_w1.float(), self.lokr_w2.float()
+            (a, b), (c, d) = w1.shape, w2.shape
+            t = torch.einsum("ikjl,ij->kjl", w.reshape(a, c, b, d), w1)  # [c, b, d]: 1/a of the weight
+            cross = torch.einsum("kjl,kl->jl", t, w2).reshape(-1) * s
+            d_sq = torch.outer(w1.square().sum(0), w2.square().sum(0)).reshape(-1) * (s * s)
+        return (w_sq + 2.0 * cross + d_sq).clamp_min(0.0).sqrt()
 
     def _added(self, x):
         """The LoRA / LoKr output for input x (scaled, before the multiplier)."""
@@ -369,6 +391,40 @@ class LoRALinear(nn.Module):
         n, size = rot.shape[0], rot.shape[1]
         delta = torch.einsum("knm,...kn->...km", rot.to(y.dtype), yb.reshape(*yb.shape[:-1], n, size))
         return y + delta.reshape(y.shape)
+
+    @torch.no_grad()
+    def stage_extras(self) -> None:
+        """Copy the extras to where the frozen layer's weights are, in the compute dtype, once per render round (a
+        block-swapped block's weights wait in RAM: its extras stay there too, cast, and stream in with each forward)."""
+        dev, dtype = self.base.weight.device, self.compute_dtype
+        pin = dev.type == "cpu" and torch.cuda.is_available()
+
+        def place(t):
+            t = t.to(dev, dtype)
+            if pin:
+                try:
+                    t = t.pin_memory()
+                except RuntimeError:  # no pinned memory left: pageable works too
+                    pass
+            return t
+
+        self.staged_extras = [(e[0], place(e[1]), place(e[2]), e[3]) if len(e) == 4
+                              else ("lora", place(e[0]), place(e[1]), e[2]) for e in self.extras]
+        self.staged_biases = [(place(b), s) for b, s in self.extra_biases]
+
+    def unstage_extras(self) -> None:
+        self.staged_extras = self.staged_biases = None
+
+    def _live_extras(self, x):
+        """The extras a forward applies: the staged copies when they match the attached ones and sit on x's device
+        (or in RAM for a swapped block), else the originals (converted per call, as before staging)."""
+        staged, biases = self.staged_extras, self.staged_biases
+        if staged is None or len(staged) != len(self.extras) or len(biases) != len(self.extra_biases):
+            return self.extras, self.extra_biases  # attached or removed since the round started
+        ref = staged[0][1] if staged else (biases[0][0] if biases else None)
+        if ref is not None and (ref.dtype != x.dtype or (ref.device != x.device and ref.device.type != "cpu")):
+            return self.extras, self.extra_biases  # another input dtype, or the model moved since (model.to)
+        return staged, biases
 
     @property
     def weight(self):  # for code that only inspects .weight.dtype / .device
@@ -392,7 +448,7 @@ class LoRALinear(nn.Module):
         else:
             out = self.base(x) + self._added(x) * self.multiplier
         if self.extras_enabled:
-            out = _apply_extras(x, out, self.extras, self.extra_biases)
+            out = _apply_extras(x, out, *self._live_extras(x))
         elif self.train_down is not None:
             out = out + nn.functional.linear(nn.functional.linear(x, self.train_down.to(x.dtype)),
                                              self.train_up.to(x.dtype))
@@ -953,6 +1009,10 @@ def set_extras_enabled(model: nn.Module, enabled: bool) -> None:
     for m in model.modules():
         if isinstance(m, LoRALinear):
             m.extras_enabled = enabled
+            if enabled and (m.extras or m.extra_biases):
+                m.stage_extras()  # on the layer's device once, not uploaded on every forward of the round
+            else:
+                m.unstage_extras()  # the GPU copies go; the originals stay in RAM
     with torch.no_grad():  # norm weight offsets: swapped in for sampling, the original weight back for training
         for weight, original, delta in model.__dict__.get("_rz_param_diffs", []):
             if weight.device != original.device:  # the model moved since the LoRA was attached

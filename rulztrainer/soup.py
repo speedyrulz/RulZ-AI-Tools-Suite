@@ -105,7 +105,7 @@ def cook(ingredients: list[dict], weights=None, rank: int = 32, strength: float 
         parts = {"lora_down": (down * strength).contiguous().cpu(), "lora_up": up.contiguous().cpu()}
         stubs[name] = SimpleNamespace(kind="lora", alpha=float(r), rank=r, factor=8, trainable=True,
                                       adapter_params=lambda parts=parts: parts)
-        del dense, avg
+        del dense, avg, flat  # flat's views hold dense's storage too
     report = {"layers": len(stubs), "ingredients": len(ingredients), "weights": w, "rank": int(rank),
               "strength": strength, "agreement": cos_sum / cos_n if cos_n else 1.0,
               "norm_ratio": (soup_sq / ing_sq) ** 0.5 if ing_sq else 1.0,
