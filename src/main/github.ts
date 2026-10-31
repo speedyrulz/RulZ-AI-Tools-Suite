@@ -53,12 +53,52 @@ interface RawRelease {
   assets: { name: string; size: number; browser_download_url: string }[]
 }
 
-async function api<T>(path: string): Promise<T> {
+/** A GitHub answer and its ETag: asking again with If-None-Match gets a 304 when nothing changed, which is free. */
+export interface EtagEntry {
+  etag: string
+  body: unknown
+}
+
+const ETAG_LIMIT = 200
+const etags = new Map<string, EtagEntry>()
+
+/** The remembered answers, for keeping across launches. */
+export function etagSnapshot(): Record<string, EtagEntry> {
+  return Object.fromEntries(etags)
+}
+
+export function loadEtags(saved: Record<string, EtagEntry> | null | undefined): void {
+  for (const [path, e] of Object.entries(saved ?? {})) {
+    if (e && typeof e.etag === 'string' && !etags.has(path)) etags.set(path, e)
+  }
+}
+
+export function clearEtags(): void {
+  etags.clear()
+}
+
+/** `slim` keeps only what the launcher reads (release lists are large), before the answer is remembered. */
+async function api<T>(path: string, slim: (body: never) => T = (b) => b as T): Promise<T> {
+  const known = etags.get(path)
   const res = await fetchImpl(`https://api.github.com${path}`, {
-    headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'RulZ-AI-Tools-Suite' },
+    headers: {
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'RulZ-AI-Tools-Suite',
+      ...(known ? { 'If-None-Match': known.etag } : {})
+    },
     signal: AbortSignal.timeout(15_000)
   })
-  if (res.ok) return (await res.json()) as T
+  if (res.status === 304 && known) return known.body as T
+  if (res.ok) {
+    const body = slim((await res.json()) as never)
+    const etag = res.headers.get('etag')
+    if (etag) {
+      etags.delete(path)
+      etags.set(path, { etag, body })
+      while (etags.size > ETAG_LIMIT) etags.delete(etags.keys().next().value!)
+    }
+    return body
+  }
   if (res.status === 403 || res.status === 429) {
     const reset = Number(res.headers.get('x-ratelimit-reset'))
     const when = reset ? ` after ${new Date(reset * 1000).toLocaleTimeString()}` : ' later'
@@ -79,6 +119,18 @@ function toRelease(r: RawRelease): Release {
   }
 }
 
+function slimReleases(list: RawRelease[]): RawRelease[] {
+  return list.map((r) => ({
+    tag_name: r.tag_name,
+    name: r.name,
+    published_at: r.published_at,
+    prerelease: r.prerelease,
+    draft: r.draft,
+    html_url: r.html_url,
+    assets: r.assets.map((a) => ({ name: a.name, size: a.size, browser_download_url: a.browser_download_url }))
+  }))
+}
+
 const RELEASE_PAGE = 100
 const RELEASE_PAGES = 5
 const PAGE_TTL_MS = 60_000
@@ -89,7 +141,7 @@ function releasePage(repo: string, page: number): Promise<RawRelease[]> {
   const key = `${repo}#${page}`
   const hit = pageCache.get(key)
   if (hit && Date.now() - hit.at < PAGE_TTL_MS) return hit.list
-  const list = api<RawRelease[]>(`/repos/${repo}/releases?per_page=${RELEASE_PAGE}&page=${page}`)
+  const list = api(`/repos/${repo}/releases?per_page=${RELEASE_PAGE}&page=${page}`, slimReleases)
   pageCache.set(key, { at: Date.now(), list })
   list.catch(() => pageCache.delete(key))
   return list
@@ -118,24 +170,29 @@ export function releaseVersion(tag: string, prefix: string): string {
 
 /** How many commits on `branch` changed `path` after `since` (at most 100). */
 export async function commitsSince(repo: string, branch: string, path: string, since: string): Promise<number> {
-  const list = await api<unknown[]>(
+  // Only the count is kept: the commit objects are large.
+  return api(
     `/repos/${repo}/commits?sha=${encodeURIComponent(branch)}&path=${encodeURIComponent(path)}` +
-      `&since=${encodeURIComponent(since)}&per_page=100`
+      `&since=${encodeURIComponent(since)}&per_page=100`,
+    (list: unknown[]) => list.length
   )
-  return list.length
 }
 
 /** Recent releases, newest first, pre-releases included. */
 export async function recentReleases(repo: string, count = 10): Promise<Release[]> {
-  const list = await api<RawRelease[]>(`/repos/${repo}/releases?per_page=${count}`)
+  const list = await api(`/repos/${repo}/releases?per_page=${count}`, slimReleases)
   return list.filter((r) => !r.draft).map(toRelease)
 }
 
 export async function headCommit(repo: string, branch: string): Promise<Commit> {
-  const c = await api<{ sha: string; commit: { message: string; committer: { date: string } | null } }>(
-    `/repos/${repo}/commits/${encodeURIComponent(branch)}`
+  return api(
+    `/repos/${repo}/commits/${encodeURIComponent(branch)}`,
+    (c: { sha: string; commit: { message: string; committer: { date: string } | null } }): Commit => ({
+      sha: c.sha,
+      date: c.commit.committer?.date ?? null,
+      message: c.commit.message.split('\n')[0]
+    })
   )
-  return { sha: c.sha, date: c.commit.committer?.date ?? null, message: c.commit.message.split('\n')[0] }
 }
 
 export async function rawFile(repo: string, branch: string, path: string): Promise<string> {

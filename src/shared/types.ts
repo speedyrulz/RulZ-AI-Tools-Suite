@@ -139,6 +139,8 @@ export interface AppView {
   icon: string
   screenshots: string[]
   installed: InstalledInfo | null
+  /** Installed, but its program file isn't there (moved, deleted, or on a drive that isn't connected). */
+  missing: boolean
   latest: LatestInfo | null
   latestError: string | null
   updateAvailable: boolean
@@ -187,6 +189,10 @@ export interface SelfUpdate {
   size: number
   url: string
   notesUrl: string
+  /** The release's SHA256SUMS asset, when it has one (the download is checked against it). */
+  sumsUrl?: string | null
+  /** The setup's file name, as listed in SHA256SUMS. */
+  assetName?: string
 }
 
 export type ThemeName = 'dark' | 'light'

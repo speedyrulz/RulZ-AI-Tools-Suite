@@ -12,7 +12,9 @@ import { Store } from './store'
 
 const isDev = !app.isPackaged && !!process.env.ELECTRON_RENDERER_URL
 
-if (!app.requestSingleInstanceLock()) app.quit()
+// A second copy hands over to the first (see 'second-instance') and does nothing else.
+const primary = app.requestSingleInstanceLock()
+if (!primary) app.quit()
 
 // rulz://catalog/<app>/... serves the screenshots, icons and README copies shipped with the launcher.
 protocol.registerSchemesAsPrivileged([
@@ -106,8 +108,9 @@ async function main(): Promise<void> {
     iconsDir: join(userData, 'icons'),
     emitApps: (list) => broadcast('apps:changed', list),
     emitJob: (job) => broadcast('job:update', job),
-    emitLog: (line) => broadcast('job:log', line)
+    emitLog: (lines) => broadcast('job:log', lines)
   })
+  // Quick (cached answers and the bundled files); the registry search for outside installs runs once the window is up.
   await apps.init()
 
   // ---- IPC ----
@@ -169,7 +172,7 @@ async function main(): Promise<void> {
   })
   handle('requirements:check', (reloadPath) => checkRequirements(reloadPath))
   handle('requirements:install', async (id) => {
-    await installRequirement(id, (line) => broadcast('job:log', { appId: `requirement:${id}`, line }))
+    await installRequirement(id, (line) => broadcast('job:log', [{ appId: `requirement:${id}`, line }]))
     return checkRequirements()
   })
 
@@ -177,9 +180,39 @@ async function main(): Promise<void> {
   const theme = store.getSettings().theme ?? 'dark'
   applyTheme(null, theme)
   mainWindow = createWindow(theme)
-  if (store.getSettings().checkUpdatesOnStart) {
-    void apps.refreshLatest(false)
+  void apps.detectInstalls().then(() => {
+    if (store.getSettings().checkUpdatesOnStart) void apps.refreshLatest(false)
+  })
+
+  // Quitting mid-install would leave pip, git or a setup program running on their own, with a half-made install
+  // behind; ask first, and cancel the jobs properly when the answer is to quit.
+  let quitting = false
+  const confirmQuit = (): boolean => {
+    if (quitting || !apps.hasActiveJobs()) return true
+    const names = apps.activeJobNames()
+    const options: Electron.MessageBoxSyncOptions = {
+      type: 'warning',
+      title: 'RulZ AI Tools Suite',
+      message: `${names.join(', ')} ${names.length > 1 ? 'are' : 'is'} still being installed or updated.`,
+      detail: 'Quitting now cancels it. You can install or repair it again later.',
+      buttons: ['Keep installing', 'Cancel install and quit'],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true
+    }
+    const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null
+    const choice = win ? dialog.showMessageBoxSync(win, options) : dialog.showMessageBoxSync(options)
+    if (choice !== 1) return false
+    quitting = true
+    void apps.cancelAll().finally(() => app.quit())
+    return false
   }
+  mainWindow.on('close', (e) => {
+    if (!confirmQuit()) e.preventDefault()
+  })
+  app.on('before-quit', (e) => {
+    if (!confirmQuit()) e.preventDefault()
+  })
 
   app.on('second-instance', () => {
     if (!mainWindow) return
@@ -189,4 +222,4 @@ async function main(): Promise<void> {
   app.on('window-all-closed', () => app.quit())
 }
 
-void main()
+if (primary) void main()

@@ -12,7 +12,14 @@ import { HomePage } from './pages/HomePage'
 import { useApps } from './stores/apps'
 
 export function App() {
-  const { apps, loaded, selectedId, select, init, theme, settings } = useApps()
+  // One selector per field: the whole store changes with every batch of log lines.
+  const apps = useApps((s) => s.apps)
+  const loaded = useApps((s) => s.loaded)
+  const selectedId = useApps((s) => s.selectedId)
+  const select = useApps((s) => s.select)
+  const init = useApps((s) => s.init)
+  const theme = useApps((s) => s.theme)
+  const needsTheme = useApps((s) => !!s.settings && !s.settings.theme)
   const [query, setQuery] = useState('')
   const [installId, setInstallId] = useState<string | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -54,7 +61,7 @@ export function App() {
       {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
       <RequirementGuide />
       <SelfUpdateDialog />
-      {settings && !settings.theme && <ThemeChooser />}
+      {needsTheme && <ThemeChooser />}
       <Toaster
         theme={theme}
         position="bottom-right"

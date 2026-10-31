@@ -1,4 +1,4 @@
-import { ArrowUpCircle, Download, Loader2, Play, Wrench, X } from 'lucide-react'
+import { ArrowUpCircle, Download, FolderSearch, Loader2, Play, Wrench, X } from 'lucide-react'
 import type { AppView, JobState } from '@shared/types'
 import { invoke } from '../lib/api'
 import { cn, formatBytes } from '../lib/format'
@@ -89,6 +89,25 @@ export function AppActions({
       >
         <Download className={compact ? 'size-3.5' : 'size-4.5'} />
         {available ? 'Install' : 'Coming soon'}
+      </Button>
+    )
+  }
+
+  if (view.missing && !installed.managed) {
+    // The record is kept (a drive may just be disconnected): point it at the program again, or remove it from the
+    // menu. A launcher-made install keeps its buttons; Launch explains what's missing, and Uninstall cleans up.
+    return (
+      <Button
+        variant="outline"
+        size={size}
+        title={`${installed.launchPath} isn't there`}
+        onClick={(e) => {
+          e.stopPropagation()
+          void act(() => invoke('apps:locate', id))
+        }}
+      >
+        <FolderSearch className={compact ? 'size-3.5' : 'size-4.5'} />
+        Locate…
       </Button>
     )
   }

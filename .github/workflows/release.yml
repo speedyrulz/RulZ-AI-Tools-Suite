@@ -25,10 +25,20 @@ jobs:
         run: npm run build:win -- --publish never
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      # The launcher's self-update checks the downloaded setup against this (sha256sum format). GitHub renames
+      # spaces in asset names to dots, so the names are written that way.
+      - name: Write checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem dist -File | Where-Object { $_.Name -like '*.exe' -or $_.Name -like '*.exe.blockmap' } |
+            ForEach-Object { "$((Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLower())  $($_.Name -replace ' ', '.')" } |
+            Set-Content -Encoding ascii dist/SHA256SUMS
+          Get-Content dist/SHA256SUMS
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/*.exe
             dist/*.exe.blockmap
+            dist/SHA256SUMS
           generate_release_notes: true

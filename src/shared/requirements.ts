@@ -49,7 +49,7 @@ export const REQUIREMENT_GUIDES: Record<RequirementId, RequirementGuide> = {
     helpUrl: 'https://www.nvidia.com/en-us/drivers/',
     linkLabel: 'Open NVIDIA driver downloads',
     steps: [
-      'This needs an NVIDIA graphics card. If your PC has one, it needs a current NVIDIA driver.',
+      'This needs an NVIDIA graphics card from the GTX 16 or RTX 20 series or newer, with NVIDIA driver 580 or newer (the AI apps use CUDA 13). Older cards such as the GTX 10 series can\'t run them.',
       'Open NVIDIA\'s driver page, pick your card (or use the NVIDIA App to find it) and download the Game Ready or Studio driver.',
       'Run the installer and restart Windows if it asks.',
       'Come back here and click "Check again".'

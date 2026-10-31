@@ -203,6 +203,15 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           Pop-Location
 
+      # The launcher checks each download against this (sha256sum format). GitHub renames spaces in asset names
+      # to dots, so the names are written that way.
+      - if: env.KIND != 'source'
+        name: Write checksums
+        run: |
+          $sums = Get-ChildItem out -File | Where-Object Name -ne 'SHA256SUMS' |
+            ForEach-Object { "$((Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLower())  $($_.Name -replace ' ', '.')" }
+          Set-Content -Encoding ascii out/SHA256SUMS $sums
+          Get-Content out/SHA256SUMS
       - if: env.KIND != 'source'
         uses: actions/upload-artifact@v4
         with:

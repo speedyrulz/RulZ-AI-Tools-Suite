@@ -1,6 +1,6 @@
 import type { ChildProcess } from 'node:child_process'
 import { existsSync, readdirSync } from 'node:fs'
-import { copyFile, mkdir, readdir, readFile, rename, rm } from 'node:fs/promises'
+import { copyFile, mkdir, readdir, readFile, rename, rm, stat } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative } from 'node:path'
 import { shell } from 'electron'
 import { CATALOG, findApp } from '@shared/catalog'
@@ -18,32 +18,45 @@ import type {
   ShortcutOptions
 } from '@shared/types'
 import { exists, extractZip, findFile, flattenSingleFolder, overlay, swapInto } from './archive'
-import { download } from './download'
+import { download, publishedSha256 } from './download'
 import {
   commitsSince,
+  etagSnapshot,
   findAsset,
   GitHubError,
   headCommit,
   isNewer,
   latestRelease,
+  loadEtags,
   rawFile,
   recentReleases,
   releaseVersion,
   sourceArchiveUrl,
+  type EtagEntry,
   type Release
 } from './github'
 import { capture, launchDetached, runCommand } from './process'
-import { ensureRequirements, requirementLabel } from './requirements'
+import { ensureRequirements, invalidateRequirements, requirementLabel } from './requirements'
 import { createShortcut, foreignShortcutPaths, removeShortcut, shortcutPaths } from './shortcuts'
 import type { Store } from './store'
 
 const LOG_LIMIT = 3000
 const LATEST_TTL_MS = 30 * 60_000
+/** Log lines are sent to the window in batches: a pip install can print hundreds a second. */
+const LOG_FLUSH_MS = 100
+/** Leftover partial downloads (kept so a retry can resume) are deleted after this long. */
+const PART_MAX_AGE_MS = 7 * 24 * 3600_000
+/** How long quitting waits for cancelled jobs to stop their programs. */
+const CANCEL_WAIT_MS = 15_000
 
+/** The last GitHub answers per app, with when each was fetched. Older launchers wrote `at` + bare entries. */
 interface LatestCache {
-  at: number
-  entries: Record<string, LatestInfo>
+  at?: number
+  entries: Record<string, LatestInfo | { info: LatestInfo; at: number }>
 }
+
+/** The asset that lists the SHA-256 of a release's other files. */
+const SUMS_ASSET = '^SHA256SUMS$'
 const SETUP_CWD = process.env.SystemRoot ?? 'C:\\Windows'
 const IMAGE_EXT = /\.(png|jpe?g|webp|gif)$/i
 // electron-builder's NSIS setups now and then crash at startup inside their System.dll plugin
@@ -62,6 +75,29 @@ interface LatestEntry {
   info: LatestInfo | null
   error: string | null
   release: Release | null
+  /** When `info` was fetched (0 when it's unknown or the fetch failed). */
+  at?: number
+}
+
+/**
+ * The entry to keep after a fetch: a failed one (rate limit, offline) keeps the versions known before, with the
+ * error for display, and stays due for another try.
+ */
+export function mergeLatest(prev: LatestEntry | undefined, next: LatestEntry): LatestEntry {
+  if (next.info || !prev?.info) return next
+  return { info: prev.info, error: next.error, release: prev.release, at: prev.at ?? 0 }
+}
+
+/** Reads the latest-versions cache, either format. */
+export function readLatestCache(cache: LatestCache | null): Map<string, LatestEntry> {
+  const out = new Map<string, LatestEntry>()
+  if (!cache?.entries) return out
+  for (const [id, e] of Object.entries(cache.entries)) {
+    if (!e) continue
+    const entry = 'info' in e ? e : { info: e, at: cache.at ?? 0 }
+    if (entry.info) out.set(id, { info: entry.info, error: null, release: null, at: entry.at ?? 0 })
+  }
+  return out
 }
 
 export interface AppManagerOptions {
@@ -71,7 +107,8 @@ export interface AppManagerOptions {
   iconsDir: string
   emitApps: (apps: AppView[]) => void
   emitJob: (job: JobState) => void
-  emitLog: (line: LogLine) => void
+  /** Log lines in order, batched (every 100 ms at most, and before each job update). */
+  emitLog: (lines: LogLine[]) => void
 }
 
 function expandEnv(path: string): string {
@@ -116,47 +153,71 @@ async function isEmptyDir(dir: string): Promise<boolean> {
 
 /** Finds an app installed by its own setup program in the Windows "Installed apps" list. */
 async function findUninstallEntry(displayName: string): Promise<{ location: string; version: string | null } | null> {
-  for (const hive of ['HKCU', 'HKLM']) {
-    const root = `${hive}\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall`
-    const hits = await capture('reg', ['query', root, '/s', '/f', displayName, '/d', '/e'])
-    for (const key of hits?.split(/\r?\n/).filter((l) => l.startsWith('HKEY_')) ?? []) {
-      const values = await capture('reg', ['query', key.trim()])
-      const value = (name: string): string | null =>
-        new RegExp(`^\\s*${name}\\s+REG_\\w+\\s+(.*)$`, 'im').exec(values ?? '')?.[1]?.trim() ?? null
-      // electron-builder leaves InstallLocation empty here; the uninstaller sits in the install folder.
-      const uninstaller = /^"?([^"]+\.exe)/i.exec(value('UninstallString') ?? '')?.[1]
-      const location = value('InstallLocation') || (uninstaller ? dirname(uninstaller) : null)
-      if (value('DisplayName') === displayName && location) return { location, version: value('DisplayVersion') }
-    }
-  }
-  return null
+  // Both hives are searched at once; the per-user one wins when both have it.
+  const hives = await Promise.all(
+    ['HKCU', 'HKLM'].map(async (hive) => {
+      const root = `${hive}\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall`
+      const hits = await capture('reg', ['query', root, '/s', '/f', displayName, '/d', '/e'])
+      for (const key of hits?.split(/\r?\n/).filter((l) => l.startsWith('HKEY_')) ?? []) {
+        const values = await capture('reg', ['query', key.trim()])
+        const value = (name: string): string | null =>
+          new RegExp(`^\\s*${name}\\s+REG_\\w+\\s+(.*)$`, 'im').exec(values ?? '')?.[1]?.trim() ?? null
+        // electron-builder leaves InstallLocation empty here; the uninstaller sits in the install folder.
+        const uninstaller = /^"?([^"]+\.exe)/i.exec(value('UninstallString') ?? '')?.[1]
+        const location = value('InstallLocation') || (uninstaller ? dirname(uninstaller) : null)
+        if (value('DisplayName') === displayName && location) return { location, version: value('DisplayVersion') }
+      }
+      return null
+    })
+  )
+  return hives.find((h) => h) ?? null
 }
 
 /** Installs, updates, launches and removes the apps in the catalog. */
 export class AppManager {
   private latest = new Map<string, LatestEntry>()
-  private jobs = new Map<string, { state: JobState; abort: AbortController }>()
+  private jobs = new Map<string, { state: JobState; abort: AbortController; done: Promise<void> }>()
   private logs = new Map<string, string[]>()
   private running = new Map<string, ChildProcess>()
   private readmes = new Map<string, ReadmeDoc>()
   private screenshots = new Map<string, string[]>()
-  private latestAt = 0
+  /** Finding installs made outside the launcher (searches the registry); done once, after the window is up. */
+  private detected: Promise<void> = Promise.resolve()
+  private pendingLogs: LogLine[] = []
+  private logTimer: ReturnType<typeof setTimeout> | null = null
 
   constructor(private readonly o: AppManagerOptions) {}
 
+  /** Quick: everything the first window needs. The slower search for outside installs runs afterwards. */
   async init(): Promise<void> {
     for (const app of CATALOG) {
       const dir = join(this.o.catalogDir, app.id, 'screenshots')
       const files = existsSync(dir) ? readdirSync(dir).filter((f) => IMAGE_EXT.test(f)).sort() : []
       this.screenshots.set(app.id, files.map((f) => `rulz://catalog/${app.id}/screenshots/${encodeURIComponent(f)}`))
     }
-    await this.reconcileInstalls()
     // The last GitHub answers, so cards have versions at once and repeated launches don't use up the API's
-    // 60 requests an hour.
+    // 60 requests an hour; with their ETags, asking again costs nothing while nothing changed.
     const cache = await this.o.store.loadCache<LatestCache | null>('latest-cache.json', null)
-    if (cache) {
-      this.latestAt = cache.at
-      for (const [id, info] of Object.entries(cache.entries)) this.latest.set(id, { info, error: null, release: null })
+    for (const [id, entry] of readLatestCache(cache)) this.latest.set(id, entry)
+    loadEtags(await this.o.store.loadCache<Record<string, EtagEntry> | null>('github-etags.json', null))
+    void this.cleanDownloads()
+  }
+
+  /** Looks for installs made outside the launcher; the window shows them when found. */
+  detectInstalls(): Promise<void> {
+    this.detected = this.reconcileInstalls(true)
+      .catch(() => undefined)
+      .then(() => this.changed())
+    return this.detected
+  }
+
+  private async cleanDownloads(): Promise<void> {
+    const dir = this.o.downloadsDir
+    for (const name of await readdir(dir).catch(() => [] as string[])) {
+      if (!/\.part(\.json)?$/.test(name)) continue
+      const file = join(dir, name)
+      const s = await stat(file).catch(() => null)
+      if (s && Date.now() - s.mtimeMs > PART_MAX_AGE_MS) await rm(file, { force: true }).catch(() => undefined)
     }
   }
 
@@ -174,6 +235,8 @@ export class AppManager {
       icon: `rulz://catalog/${app.id}/icon.png`,
       screenshots: this.screenshots.get(app.id) ?? [],
       installed,
+      // Kept rather than forgotten: a drive that isn't connected, or a folder moved for a moment, comes back.
+      missing: !!installed && !installed.needsSetup && !existsSync(installed.launchPath),
       latest: latest?.info ?? null,
       latestError: latest?.error ?? null,
       updateAvailable: this.updateAvailable(app, installed, latest?.info ?? null),
@@ -207,31 +270,41 @@ export class AppManager {
     return app
   }
 
-  /** Drops records whose files are gone and picks up apps installed outside the launcher. */
-  private async reconcileInstalls(): Promise<void> {
-    for (const app of CATALOG) {
-      const info = this.o.store.getInstalled(app.id)
-      if (info && !existsSync(info.launchPath) && !info.needsSetup) await this.o.store.setInstalled(app.id, null)
-      if (this.o.store.getInstalled(app.id) || this.o.store.isDetectHidden(app.id)) continue
+  /**
+   * Picks up apps installed outside the launcher. Records whose files are gone are kept (the view marks them
+   * missing) instead of being forgotten with their shortcuts left behind. `registry` also searches Windows'
+   * installed-apps list, which is slow, so only the startup check does it.
+   */
+  private async reconcileInstalls(registry: boolean): Promise<void> {
+    await Promise.all(
+      CATALOG.map(async (app) => {
+        // A found install whose files are gone may have moved: look for it again.
+        const known = this.o.store.getInstalled(app.id)
+        const lost = !!known && !known.managed && !existsSync(known.launchPath)
+        if ((known && !lost) || this.o.store.isDetectHidden(app.id)) return
 
-      let launchPath: string | null = null
-      let version: string | null = null
-      for (const p of app.detect ?? []) {
-        if (existsSync(expandEnv(p))) {
-          launchPath = expandEnv(p)
-          break
+        let launchPath: string | null = null
+        let version: string | null = null
+        for (const p of app.detect ?? []) {
+          if (existsSync(expandEnv(p))) {
+            launchPath = expandEnv(p)
+            break
+          }
         }
-      }
-      if (!launchPath && app.install.kind === 'installer') {
-        const entry = await findUninstallEntry(app.install.uninstallName)
-        const exe = entry && join(entry.location, app.launch.target)
-        if (exe && existsSync(exe)) {
-          launchPath = exe
-          version = entry.version ? `v${entry.version}` : null
+        if (!launchPath && registry && app.install.kind === 'installer') {
+          const entry = await findUninstallEntry(app.install.uninstallName)
+          const exe = entry && join(entry.location, app.launch.target)
+          if (exe && existsSync(exe)) {
+            launchPath = exe
+            version = entry.version ? `v${entry.version}` : null
+          }
         }
-      }
-      if (launchPath) await this.o.store.setInstalled(app.id, this.externalInfo(app, launchPath, version))
-    }
+        // An install started while this looked doesn't get replaced.
+        if (launchPath && this.o.store.getInstalled(app.id) === known && !this.jobs.has(app.id)) {
+          await this.o.store.setInstalled(app.id, this.externalInfo(app, launchPath, version))
+        }
+      })
+    )
   }
 
   private externalInfo(app: CatalogApp, launchPath: string, version: string | null): InstalledInfo {
@@ -256,26 +329,34 @@ export class AppManager {
 
   /** Asks GitHub for the newest versions; unless `force`, answers from the last 30 minutes are reused. */
   async refreshLatest(force = true): Promise<void> {
-    await this.reconcileInstalls()
-    const fresh = Date.now() - this.latestAt < LATEST_TTL_MS && CATALOG.every((a) => this.latest.get(a.id)?.info)
-    if (force || !fresh) {
+    // Cheap: only the catalog's known program paths (the registry search ran at startup).
+    await this.reconcileInstalls(false)
+    const now = Date.now()
+    // Each app on its own: one that failed (or isn't published) doesn't make the others' answers stale.
+    const due = CATALOG.filter((a) => {
+      const e = this.latest.get(a.id)
+      return force || !e?.info || !e.at || now - e.at >= LATEST_TTL_MS
+    })
+    if (due.length) {
       await Promise.all(
-        CATALOG.map(async (app) => {
-          this.latest.set(app.id, await this.fetchLatest(app))
+        due.map(async (app) => {
+          const prev = this.latest.get(app.id)
+          this.latest.set(app.id, mergeLatest(prev, await this.fetchLatest(app, prev)))
         })
       )
-      const entries: Record<string, LatestInfo> = {}
-      for (const [id, e] of this.latest) if (e.info) entries[id] = e.info
-      // Only a complete answer counts as fresh (an error, e.g. the rate limit, should be retried).
-      if (CATALOG.every((a) => entries[a.id])) {
-        this.latestAt = Date.now()
-        await this.o.store.saveCache('latest-cache.json', { at: this.latestAt, entries } satisfies LatestCache)
-      }
+      await this.saveLatestCache()
     }
     this.changed()
   }
 
-  private async fetchLatest(app: CatalogApp): Promise<LatestEntry> {
+  private async saveLatestCache(): Promise<void> {
+    const entries: LatestCache['entries'] = {}
+    for (const [id, e] of this.latest) if (e.info) entries[id] = { info: e.info, at: e.at ?? 0 }
+    await this.o.store.saveCache('latest-cache.json', { entries } satisfies LatestCache).catch(() => undefined)
+    await this.o.store.saveCache('github-etags.json', etagSnapshot()).catch(() => undefined)
+  }
+
+  private async fetchLatest(app: CatalogApp, prev?: LatestEntry): Promise<LatestEntry> {
     if (!app.repo) return { info: null, error: "This app isn't published on GitHub yet.", release: null }
     try {
       if (app.install.kind === 'source') {
@@ -283,11 +364,17 @@ export class AppManager {
         // app's commits since (counted on main, where the branch is split from).
         const [c, release] = await Promise.all([headCommit(app.repo, app.branch), latestRelease(app.repo, app.tagPrefix)])
         const tag = release && releaseVersion(release.tag, app.tagPrefix)
-        const ahead =
-          release?.date ? await commitsSince(app.repo, 'main', app.path, release.date).catch(() => null) : null
+        // The count only changes with the app's branch, so an unchanged head keeps the label it had.
+        const old = prev?.info
+        const same = !!tag && old?.version === c.sha && (old.label === tag || old.label.startsWith(`${tag} + `))
         let label = `${app.branch} @ ${c.sha.slice(0, 7)}`
-        if (tag && ahead === 0) label = tag
-        else if (tag && ahead) label = `${tag} + ${ahead} commit${ahead === 1 ? '' : 's'}`
+        if (same && old) label = old.label
+        else {
+          const ahead =
+            release?.date ? await commitsSince(app.repo, 'main', app.path, release.date).catch(() => null) : null
+          if (tag && ahead === 0) label = tag
+          else if (tag && ahead) label = `${tag} + ${ahead} commit${ahead === 1 ? '' : 's'}`
+        }
         return {
           info: {
             version: c.sha,
@@ -297,7 +384,8 @@ export class AppManager {
             url: `https://github.com/${app.repo}/commits/${app.branch}`
           },
           error: null,
-          release: null
+          release: null,
+          at: Date.now()
         }
       }
       const release = await latestRelease(app.repo, app.tagPrefix)
@@ -313,7 +401,8 @@ export class AppManager {
           url: release.htmlUrl
         },
         error: asset ? null : 'The latest release has no Windows download.',
-        release
+        release,
+        at: Date.now()
       }
     } catch (e) {
       return { info: null, error: errorText(e), release: null }
@@ -346,10 +435,30 @@ export class AppManager {
 
   // ---------- Jobs ----------
 
+  /** Sends the log lines gathered since the last batch. */
+  private flushLogs(): void {
+    if (this.logTimer) clearTimeout(this.logTimer)
+    this.logTimer = null
+    if (!this.pendingLogs.length) return
+    const lines = this.pendingLogs
+    this.pendingLogs = []
+    this.o.emitLog(lines)
+  }
+
+  private queueLog(line: LogLine): void {
+    const last = this.pendingLogs.at(-1)
+    // A progress counter moving on within one batch only needs its newest value sent.
+    if (line.replace && last && last.appId === line.appId) this.pendingLogs[this.pendingLogs.length - 1] = { ...line, replace: last.replace }
+    else this.pendingLogs.push(line)
+    this.logTimer ??= setTimeout(() => this.flushLogs(), LOG_FLUSH_MS)
+  }
+
   private startJob(appId: string, action: JobState['action'], work: (ctx: JobContext) => Promise<void>): void {
     if (this.jobs.has(appId)) throw new Error('This app is already being installed or updated.')
     const abort = new AbortController()
-    const job = { state: { appId, action, phase: 'resolving', label: 'Starting…', progress: null } as JobState, abort }
+    let finished!: () => void
+    const done = new Promise<void>((resolve) => (finished = resolve))
+    const job = { state: { appId, action, phase: 'resolving', label: 'Starting…', progress: null } as JobState, abort, done }
     const log: string[] = []
     this.jobs.set(appId, job)
     this.logs.set(appId, log)
@@ -359,6 +468,8 @@ export class AppManager {
       signal: abort.signal,
       set: (patch) => {
         job.state = { ...job.state, ...patch }
+        // Lines logged before a state change arrive before it.
+        this.flushLogs()
         this.o.emitJob(job.state)
       },
       log: (line) => {
@@ -367,7 +478,7 @@ export class AppManager {
         if (replace) log[log.length - 1] = line
         else log.push(line)
         if (log.length > LOG_LIMIT) log.splice(0, log.length - LOG_LIMIT)
-        this.o.emitLog({ appId, line, replace })
+        this.queueLog({ appId, line, replace })
       }
     }
     this.changed()
@@ -389,8 +500,11 @@ export class AppManager {
       )
       .finally(() => {
         this.jobs.delete(appId)
+        // An install may have added a prerequisite (Python, Git…) or a GPU-using app.
+        invalidateRequirements()
         this.changed()
         for (const f of ctx.files) void rm(f, { force: true }).catch(() => undefined)
+        finished()
       })
   }
 
@@ -398,25 +512,59 @@ export class AppManager {
     this.jobs.get(appId)?.abort.abort()
   }
 
-  private async fetchFile(ctx: JobContext, url: string, name: string, size: number | null, label: string): Promise<string> {
+  /** Cancels every running job and waits (up to a limit) for their programs to stop. */
+  async cancelAll(): Promise<void> {
+    const running = [...this.jobs.values()]
+    for (const job of running) job.abort.abort()
+    await Promise.race([
+      Promise.all(running.map((j) => j.done)),
+      new Promise((r) => setTimeout(r, CANCEL_WAIT_MS))
+    ])
+    this.flushLogs()
+  }
+
+  /** Names of the apps with a running job, for the quit question. */
+  activeJobNames(): string[] {
+    return [...this.jobs.keys()].map((id) => findApp(id)?.name ?? id)
+  }
+
+  private async fetchFile(
+    ctx: JobContext,
+    url: string,
+    name: string,
+    size: number | null,
+    label: string,
+    sha256: string | null = null
+  ): Promise<string> {
     const file = join(this.o.downloadsDir, name)
     ctx.files.push(file)
     ctx.log(`Downloading ${url}`)
+    if (sha256) ctx.log(`Expecting SHA-256 ${sha256}`)
     ctx.set({ phase: 'downloading', label, progress: size ? 0 : null, bytes: 0, total: size ?? undefined })
     await download(url, file, {
       signal: ctx.signal,
       expectedSize: size,
+      sha256,
       onProgress: (p) =>
         ctx.set({ progress: p.total ? p.bytes / p.total : null, bytes: p.bytes, total: p.total ?? undefined, speed: p.speed })
     })
+    if (sha256) ctx.log('Checksum verified.')
     ctx.set({ speed: undefined })
     return file
+  }
+
+  /** The SHA-256 the release publishes for `asset` (null for releases made before SHA256SUMS was added). */
+  private async releaseSha256(ctx: JobContext, release: Release, asset: Release['assets'][number]): Promise<string | null> {
+    const sums = findAsset(release, SUMS_ASSET)
+    const hash = await publishedSha256(sums?.url, asset.name, ctx.signal)
+    if (!hash) ctx.log(sums ? `Warning: SHA256SUMS doesn't list ${asset.name}; it can't be verified.` : 'This release has no checksums to verify against.')
+    return hash
   }
 
   private async requireRelease(app: CatalogApp, pattern: string): Promise<{ release: Release; asset: Release['assets'][number] }> {
     let entry = this.latest.get(app.id)
     if (!entry?.release) {
-      entry = await this.fetchLatest(app)
+      entry = mergeLatest(entry, await this.fetchLatest(app, entry))
       this.latest.set(app.id, entry)
     }
     if (!entry.release) throw new Error(entry.error ?? 'No release found.')
@@ -429,6 +577,7 @@ export class AppManager {
 
   async install(appId: string, opts: InstallOptions): Promise<void> {
     const app = this.app(appId)
+    await this.detected
     if (this.o.store.getInstalled(appId)) throw new Error(`${app.name} is already installed.`)
     if (!isAbsolute(opts.dir) || !/^[a-z]:\\/i.test(opts.dir)) throw new Error('Choose a full folder path, such as D:\\Apps.')
     if (!(await isEmptyDir(opts.dir))) {
@@ -462,7 +611,9 @@ export class AppManager {
       launchAfter: false,
       installPrerequisites: true
     }
-    this.latest.delete(appId) // always fetch the newest release for an update
+    // Always fetch the newest release for an update (the version shown stays until then).
+    const known = this.latest.get(appId)
+    if (known) this.latest.set(appId, { ...known, release: null })
     this.startJob(appId, 'update', (ctx) => this.runInstall(ctx, app, opts, info))
   }
 
@@ -504,7 +655,8 @@ export class AppManager {
       ctx.set({ phase: 'resolving', label: 'Finding the latest release…' })
       const { release, asset } = await this.requireRelease(app, spec.asset)
       version = releaseVersion(release.tag, app.tagPrefix)
-      const zip = await this.fetchFile(ctx, asset.url, asset.name, asset.size, `Downloading ${version}`)
+      const sha256 = await this.releaseSha256(ctx, release, asset)
+      const zip = await this.fetchFile(ctx, asset.url, asset.name, asset.size, `Downloading ${version}`, sha256)
       const staged = `${dir}.new`
       await rm(staged, { recursive: true, force: true })
       ctx.set({ phase: 'extracting', label: 'Extracting…', progress: 0 })
@@ -521,7 +673,8 @@ export class AppManager {
       ctx.set({ phase: 'resolving', label: 'Finding the latest release…' })
       const { release, asset } = await this.requireRelease(app, spec.asset)
       version = releaseVersion(release.tag, app.tagPrefix)
-      const setup = await this.fetchFile(ctx, asset.url, asset.name, asset.size, `Downloading ${version}`)
+      const sha256 = await this.releaseSha256(ctx, release, asset)
+      const setup = await this.fetchFile(ctx, asset.url, asset.name, asset.size, `Downloading ${version}`, sha256)
       ctx.set({ phase: 'installing', label: 'Running the setup program…', progress: null })
       ctx.log(`> ${basename(setup)} /S /currentuser /D="${dir}"`)
       const code = await runSetupProgram([setup, '/S', '/currentuser', `/D="${dir}"`], ctx)
@@ -584,7 +737,7 @@ export class AppManager {
     )
     await this.o.store.setInstalled(app.id, info)
     ctx.log(`Installed ${app.name} ${version ?? ''} in ${dir}`)
-    const latest = await this.fetchLatest(app)
+    const latest = mergeLatest(this.latest.get(app.id), await this.fetchLatest(app, this.latest.get(app.id)))
     this.latest.set(app.id, latest)
     if (latest.info && latest.info.version === version && latest.info.label !== version) {
       await this.o.store.setInstalled(app.id, { ...info, versionLabel: latest.info.label })

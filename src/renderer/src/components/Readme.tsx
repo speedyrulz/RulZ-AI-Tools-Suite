@@ -1,5 +1,5 @@
 import { Github, Loader2 } from 'lucide-react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import rehypeRaw from 'rehype-raw'
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
@@ -52,7 +52,8 @@ function rehypeReadme(doc: ReadmeDoc) {
   }
 }
 
-export function Readme({ appId }: { appId: string }) {
+/** Memoized: parsing a long README is slow, and the app page re-renders with every install progress update. */
+export const Readme = memo(function Readme({ appId }: { appId: string }) {
   const [doc, setDoc] = useState<ReadmeDoc | null>(null)
   const [error, setError] = useState<string | null>(null)
   const root = useRef<HTMLDivElement>(null)
@@ -124,4 +125,4 @@ export function Readme({ appId }: { appId: string }) {
       )}
     </div>
   )
-}
+})
