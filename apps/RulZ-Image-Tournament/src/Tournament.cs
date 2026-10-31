@@ -16,6 +16,9 @@ namespace RulZ.ImageTournament
         List<string> _round = new List<string>();
         List<string> _winners = new List<string>();
         int _pos; // index of the left image of the current match
+        // How many times each path is still in the running (_round from _pos, plus _winners),
+        // so Contains stays O(1) for large sets. Paths compare case-insensitively.
+        Dictionary<string, int> _alive = NewAliveMap();
 
         public int Round { get; private set; }
         public int MatchesPlayed { get; private set; }
@@ -38,6 +41,7 @@ namespace RulZ.ImageTournament
             _pos = 0;
             Round = 1;
             MatchesPlayed = 0;
+            RebuildAlive();
             Advance();
         }
 
@@ -45,13 +49,17 @@ namespace RulZ.ImageTournament
         public void Add(IEnumerable<string> images)
         {
             if (IsEmpty) { Start(images); return; }
-            _round.AddRange(images);
+            foreach (var p in images)
+            {
+                _round.Add(p);
+                MarkAlive(p);
+            }
             Advance();
         }
 
         public bool Contains(string path)
         {
-            return IndexOf(_round, path, _pos) >= 0 || IndexOf(_winners, path, 0) >= 0;
+            return path != null && _alive.ContainsKey(path);
         }
 
         // Records the current match and returns the losing image's path.
@@ -63,6 +71,7 @@ namespace RulZ.ImageTournament
             _winners.Add(winner);
             _pos += 2;
             MatchesPlayed++;
+            MarkGone(loser);
             Advance();
             return loser;
         }
@@ -70,6 +79,7 @@ namespace RulZ.ImageTournament
         // Drops an image that is still in the running (e.g. its file disappeared).
         public bool Remove(string path)
         {
+            if (!Contains(path)) return false;
             int i = IndexOf(_round, path, _pos);
             if (i >= 0) _round.RemoveAt(i);
             else
@@ -78,6 +88,7 @@ namespace RulZ.ImageTournament
                 if (i < 0) return false;
                 _winners.RemoveAt(i);
             }
+            MarkGone(path);
             Advance();
             return true;
         }
@@ -101,9 +112,37 @@ namespace RulZ.ImageTournament
                 _round = new List<string>(_round),
                 _winners = new List<string>(_winners),
                 _pos = _pos,
+                _alive = new Dictionary<string, int>(_alive, _alive.Comparer),
                 Round = Round,
                 MatchesPlayed = MatchesPlayed,
             };
+        }
+
+        static Dictionary<string, int> NewAliveMap()
+        {
+            return new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        void RebuildAlive()
+        {
+            _alive = NewAliveMap();
+            foreach (var p in AliveImages()) MarkAlive(p);
+        }
+
+        void MarkAlive(string path)
+        {
+            if (path == null) return;
+            int n;
+            _alive.TryGetValue(path, out n);
+            _alive[path] = n + 1;
+        }
+
+        void MarkGone(string path)
+        {
+            int n;
+            if (path == null || !_alive.TryGetValue(path, out n)) return;
+            if (n <= 1) _alive.Remove(path);
+            else _alive[path] = n - 1;
         }
 
         void Advance()
@@ -164,6 +203,7 @@ namespace RulZ.ImageTournament
                 }
             }
             if (t._pos < 0 || t._pos > t._round.Count) return null;
+            t.RebuildAlive();
             t.Advance();
             return t;
         }

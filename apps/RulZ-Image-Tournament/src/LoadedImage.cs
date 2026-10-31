@@ -156,8 +156,10 @@ namespace RulZ.ImageTournament
             {
                 attrs.SetWrapMode(WrapMode.TileFlipXY);
                 g.CompositingMode = CompositingMode.SourceCopy;
-                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                // At exactly 2:1 with half-pixel offsets, bilinear samples the centre of each 2x2 block,
+                // i.e. a box filter: the same quality as bicubic here at a fraction of the cost.
+                g.InterpolationMode = InterpolationMode.Bilinear;
+                g.PixelOffsetMode = PixelOffsetMode.Half;
                 g.DrawImage(src, new Rectangle(0, 0, w, h), 0, 0, src.Width, src.Height, GraphicsUnit.Pixel, attrs);
             }
             return bmp;
