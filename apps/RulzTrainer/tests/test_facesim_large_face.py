@@ -1,66 +1,84 @@
 """A face that fills the frame is missed by the detector (it rescales every input to det_size, and its anchors stop
-at a face size relative to that frame); faces() then detects on a canvas 2x and 4x the image's size and shifts the
-boxes back to source pixels."""
+at a face size relative to that frame); faces() then detects on the image shrunk to a half and a quarter at the
+centre of a canvas of its own size and maps the boxes back to source pixels."""
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from rulztrainer import facesim  # noqa: E402
 
+pytest.importorskip("cv2")
+
 
 class _App:
-    """Sees the face (80% of the original image, centred) only when it covers at most 45% of the frame."""
+    """A face `frac` of the picture's width, centred, seen only when it covers at most `limit` of the frame. The
+    picture is whatever is not the canvas grey. Records each call's (frame width, picture width)."""
 
-    def __init__(self, orig: int):
-        self.orig, self.calls = orig, []
+    def __init__(self, frac: float, limit: float = 0.45):
+        self.frac, self.limit, self.calls = frac, limit, []
 
     def get(self, arr):
-        h, w = arr.shape[:2]
-        self.calls.append(w)
-        face = 0.8 * self.orig
-        if face / w > 0.45:
+        w = arr.shape[1]
+        pic = np.argwhere((arr != 114).any(-1))
+        (y0, x0), (y1, x1) = pic.min(0), pic.max(0) + 1
+        s = float(x1 - x0)
+        self.calls.append((w, int(s)))
+        if self.frac * s / w > self.limit:
             return []
-        ox, oy = (w - self.orig) / 2, (h - self.orig) / 2  # the image sits at the canvas centre
-        return [SimpleNamespace(bbox=np.array([ox + 0.1 * self.orig, oy + 0.1 * self.orig, ox + 0.9 * self.orig,
-                                               oy + 0.9 * self.orig], dtype=np.float32),
-                                kps=np.array([[ox + 0.3 * self.orig, oy + 0.4 * self.orig]], dtype=np.float32),
-                                det_score=0.9)]
+        cx, cy, half = (x0 + x1) / 2, (y0 + y1) / 2, self.frac * s / 2
+        return [SimpleNamespace(bbox=np.array([cx - half, cy - half, cx + half, cy + half], dtype=np.float32),
+                                kps=np.array([[x0 + 0.3 * s, y0 + 0.4 * s]], dtype=np.float32), det_score=0.9)]
 
 
-def _scorer(tmp_path, size, seen):
+def _scorer(tmp_path, size, frac, limit=0.45):
     from PIL import Image
 
     s = facesim.FaceScorer.__new__(facesim.FaceScorer)
-    s.app = _App(seen)
+    s.app = _App(frac, limit)
     s.refs = []
     p = tmp_path / "probe.png"
     Image.new("RGB", (size, size), (120, 90, 80)).save(p)
     return s, p
 
 
-def test_large_face_found_on_the_2x_canvas_with_boxes_in_source_pixels(tmp_path):
-    s, p = _scorer(tmp_path, 1024, 1024)
+def test_large_face_found_at_half_size_with_boxes_in_source_pixels(tmp_path):
+    s, p = _scorer(tmp_path, 1024, 0.8)
     faces = s.faces(p)
-    assert s.app.calls == [1024, 2048] and len(faces) == 1
+    assert s.app.calls == [(1024, 1024), (1024, 512)] and len(faces) == 1  # the canvas stays the image's size
     np.testing.assert_allclose(faces[0].bbox, [102.4, 102.4, 921.6, 921.6], atol=1e-3)  # 0.1..0.9 of the source
     np.testing.assert_allclose(faces[0].kps, [[307.2, 409.6]], atol=1e-3)
 
 
-def test_4x_canvas_and_the_thumbnail_scale_compose(tmp_path):
-    s, p = _scorer(tmp_path, 4096, 2048)  # thumbnailed to 2048 for the detector, which needs the 4x canvas here
-    s.app.get = lambda arr, _g=s.app.get: _g(arr) if arr.shape[1] >= 8192 or arr.shape[1] == 2048 else []
+def test_quarter_size_and_the_thumbnail_scale_compose(tmp_path):
+    s, p = _scorer(tmp_path, 4096, 0.8, limit=0.25)  # thumbnailed to 2048 for the detector; seen at a quarter
     faces = s.faces(p)
-    assert len(faces) == 1 and s.app.calls[-1] == 8192
+    assert len(faces) == 1 and s.app.calls == [(2048, 2048), (2048, 1024), (2048, 512)]
     np.testing.assert_allclose(faces[0].bbox, [409.6, 409.6, 3686.4, 3686.4], atol=1e-2)  # back in the 4096 source
 
 
+def test_the_embedding_comes_from_the_source_pixels(tmp_path):
+    s, p = _scorer(tmp_path, 1024, 0.8)
+    seen = []
+    s.app.models = {"recognition": SimpleNamespace(get=lambda img, f: seen.append((img.shape, f.kps.copy())))}
+    s.faces(p)
+    assert seen[0][0] == (1024, 1024, 3)
+    np.testing.assert_allclose(seen[0][1], [[307.2, 409.6]], atol=1e-3)
+
+
 def test_small_face_needs_no_canvas(tmp_path):
-    s, p = _scorer(tmp_path, 1024, 400)  # a face that is 32% of the frame
-    assert len(s.faces(p)) == 1 and s.app.calls == [1024]
+    s, p = _scorer(tmp_path, 1024, 0.3125)  # a face that is 31% of the frame
+    assert len(s.faces(p)) == 1 and s.app.calls == [(1024, 1024)]
+
+
+def test_insightface_runs_on_the_configured_gpu():
+    assert facesim.cuda_index("cpu", "cuda:1") is None
+    assert facesim.cuda_index("cuda", "cuda:1") == 1 and facesim.cuda_index("cuda") == 0
+    assert facesim.cuda_index("cuda:2", "cuda:1") == 2  # an explicit provider index wins
 
 
 def test_cut_off_faces_and_the_displayed_size(tmp_path):

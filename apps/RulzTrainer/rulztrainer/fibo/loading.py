@@ -43,28 +43,39 @@ def is_fibo_dir(model_dir: Path) -> bool:
         return False
 
 
-def resolve_quant(quant: str, device) -> str:
+def _gpu_gb(device) -> float:
+    dev = torch.device(device)
+    return torch.cuda.get_device_properties(dev.index or 0).total_memory / 2**30
+
+
+def resolve_quant(quant: str, devices) -> str:
+    """`auto`: int8 (W8A8) below 22 GB, else bf16, counting the memory of every GPU the model is split over (a list
+    of devices; a model_split over two 16 GB cards runs bf16). A CPU model stays bf16."""
     if quant != "auto":
         return quant
-    dev = torch.device(device)
-    if dev.type == "cuda" and torch.cuda.is_available():
-        total = torch.cuda.get_device_properties(dev.index or 0).total_memory / 2**30
+    devices = [devices] if isinstance(devices, (str, torch.device)) else list(devices)
+    gpus = [d for d in devices if torch.device(d).type == "cuda"]
+    if gpus and torch.cuda.is_available():
+        total = sum(_gpu_gb(d) for d in gpus)
         if total < AUTO_INT8_BELOW_GB:
-            log.info("FIBO 2.0 transformer: auto quantization -> int8 (W8A8) for a %.0f GB GPU", total)
+            log.info("FIBO 2.0 transformer: auto quantization -> int8 (W8A8) for %.0f GB (%s)", total,
+                     "+".join(str(d) for d in gpus))
             return "int8"
     return "none"
 
 
-def load_transformer(model_dir: Path, device, quant: str = "auto", dtype=torch.bfloat16) -> FiboTransformer:
+def load_transformer(model_dir: Path, device, quant: str = "auto", dtype=torch.bfloat16,
+                     quant_devices=None) -> FiboTransformer:
+    """quant_devices: the GPUs the model will run on, for quant "auto" (default: `device`)."""
     config = json.loads((model_dir / "transformer" / "config.json").read_text(encoding="utf-8"))
     if config.get("_class_name") not in TRANSFORMER_CLASSES:
         raise ValueError(f"Not a FIBO 2.0 transformer: {config.get('_class_name')!r}")
-    quant = resolve_quant(quant, device)
+    quant = resolve_quant(quant, quant_devices or device)
     with torch.device("meta"):
         model = FiboTransformer.from_config(config)
     state = moss_loading._read_sharded(model_dir / "transformer", "diffusion_pytorch_model")
     state = {k: v.to(dtype) for k, v in state.items()}
-    sf.install_state(model, state, quant, dtype, quant_filter=QUANT_FILTER)
+    sf.install_state(model, state, quant, dtype, quant_filter=QUANT_FILTER, **sf.quant_target(device, quant_devices))
     del state
     model = model.to(device).eval().requires_grad_(False)
     log.info("Loaded FIBO 2.0 transformer from %s: %d layers (+%d refiner), dim %d, injection blocks %s, quant=%s",
@@ -74,17 +85,19 @@ def load_transformer(model_dir: Path, device, quant: str = "auto", dtype=torch.b
 
 
 def load_text_encoder(model_dir: Path, device: str = "auto", quant: str = "auto"):
-    """Qwen3-VL (Qwen3VLForConditionalGeneration) + its processor. quant int8/int8_convrot/nvfp4 quantizes the language
-    model's Linear layers (W8A8) so the 8.9 GB encoder takes about half the memory."""
-    from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
+    """Qwen3-VL's language model + its processor: text only, from the folder's Qwen3VLForConditionalGeneration weights
+    without the vision tower and the LM head (0.8 GB that prompts never use, and the LM head computed [S, 151936]
+    logits per prompt that were thrown away). quant int8/int8_convrot/nvfp4 quantizes its Linear layers (W8A8) so the
+    8.9 GB encoder takes about half the memory."""
+    from transformers import Qwen3VLProcessor
+
+    from ..krea2.single_file import load_hf_text_model
 
     processor = Qwen3VLProcessor.from_pretrained(str(model_dir / "processor"))
-    model = Qwen3VLForConditionalGeneration.from_pretrained(str(model_dir / "text_encoder"), dtype=torch.bfloat16)
-    model.eval().requires_grad_(False)
     fmt = "none" if quant == "auto" else quant
+    model = load_hf_text_model(model_dir / "text_encoder", fmt, device)
     if fmt != "none":
-        lm = getattr(getattr(model, "model", model), "language_model", None) or model
-        n = Q.quantize_module_linears(lm, fmt, min_dim=1024)
+        n = sum(1 for m in model.modules() if isinstance(m, Q.QuantLinear))
         log.info("Text encoder: %d Linear layers quantized to %s", n, fmt)
     model = place_text_encoder(model, device)
     return model, processor
@@ -127,7 +140,8 @@ def encode_prompt(text_encoder, processor, prompt: str, max_length: int = 4096) 
     inputs = processor(text=[text], padding="longest", max_length=max_length, truncation=True, return_tensors="pt",
                        **extra)
     device = _input_device(text_encoder)
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    # the text model takes the tokens alone (a processor may add multimodal fields, all text here)
+    inputs = {k: v.to(device) for k, v in inputs.items() if k in ("input_ids", "attention_mask")}
     hidden = text_encoder(**inputs, output_hidden_states=True).hidden_states
     dtype = torch.bfloat16
     normalized = {}
@@ -179,10 +193,21 @@ def resolve_for_config(cfg: TrainConfig) -> Path | None:
 
 
 def get_transformer(cfg: TrainConfig, model_dir: Path | None, device: str | None = None) -> FiboTransformer:
-    if moss_loading._use_file(cfg, "transformer_file"):
-        from . import single_file as fsf
+    from . import single_file as fsf
 
+    use_file = moss_loading._use_file(cfg, "transformer_file")
+    if use_file:
         moss_loading._check_files(cfg, "transformer_file")
+    if cfg.multi_gpu == "model_split" and device is None:
+        # the trainer splits it right after loading: stay on the CPU (16 GB of bf16 fit no single 16 GB card) and
+        # size "auto" for all the split GPUs, as Krea 2 does
+        from ..multigpu import parse_devices
+
+        gpus = parse_devices(cfg.devices, cfg.device)
+        if use_file:
+            return fsf.load_transformer_file(cfg.transformer_file, "cpu", cfg.transformer_quant, quant_devices=gpus)
+        return load_transformer(model_dir, "cpu", cfg.transformer_quant, quant_devices=gpus)
+    if use_file:
         return fsf.load_transformer_file(cfg.transformer_file, device or cfg.device, cfg.transformer_quant)
     return load_transformer(model_dir, device or cfg.device, cfg.transformer_quant)
 

@@ -100,13 +100,19 @@ class Attention(nn.Module):
         gate = self.to_gate(x)
         if rope is not None:
             q, k = apply_rope(q, *rope), apply_rope(k, *rope)
-        if self.heads != self.kv_heads:  # repeated heads: every SDPA kernel accepts a mask then (see diffusers)
-            k = k.repeat_interleave(self.heads // self.kv_heads, dim=2)
-            v = v.repeat_interleave(self.heads // self.kv_heads, dim=2)
         tap = getattr(self, "_rz_tap", None)  # rulztrainer.alignment: the trigger's attention (training-only loss)
-        if tap is not None:
-            tap(q.transpose(1, 2), k.transpose(1, 2))
-        out = sdpa(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask)
+        if self.heads != self.kv_heads and mask is None and tap is None:
+            # grouped heads straight into SDPA: no repeated k / v saved for the backward in a kept block (Krea 2's
+            # 48 / 12 heads at 1 MP: 80 MB less per block with cuDNN, the same speed with cuDNN and PyTorch's pick)
+            out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                                                 enable_gqa=True)
+        else:
+            if self.heads != self.kv_heads:  # repeated heads: every SDPA kernel accepts a mask then (see diffusers)
+                k = k.repeat_interleave(self.heads // self.kv_heads, dim=2)
+                v = v.repeat_interleave(self.heads // self.kv_heads, dim=2)
+            if tap is not None:
+                tap(q.transpose(1, 2), k.transpose(1, 2))
+            out = sdpa(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask)
         out = out.transpose(1, 2).flatten(2, 3) * torch.sigmoid(gate)
         return self.to_out[0](out)
 
