@@ -1,6 +1,6 @@
 import { ArrowLeft, ArrowUp, Brain, Check, ChevronDown, ChevronRight, Clock, Copy, CornerDownRight, FolderOpen, SlidersHorizontal, History, LoaderCircle, MessageSquarePlus, NotebookPen, Package, Pencil, Play, RotateCcw, Settings, Square, Trash2, Undo2, X } from 'lucide-react'
 import { toast } from 'sonner'
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { ApprovalDialog } from '../components/ApprovalDialog'
 import { ContextMeter } from '../components/ContextMeter'
 import { DraftMeter } from '../components/DraftMeter'
@@ -299,21 +299,8 @@ function Conversation() {
             )
           }
           if (item.kind === 'assistant') {
-            const inline = splitThink(item.text)
-            const reasoning = [item.reasoning?.trim(), inline.reasoning].filter(Boolean).join('\n\n')
-            const live = running && status.phase === 'thinking' && !inline.answer && item.id === timeline[timeline.length - 1].id
-            return (
-              <div key={item.id} className="group flex gap-3">
-                <span className="mt-1 w-6 shrink-0">
-                  <LogoMark className="w-6" />
-                </span>
-                <div className="min-w-0 flex-1 space-y-2">
-                  {reasoning && <ThinkingBlock text={reasoning} live={live} />}
-                  {inline.answer && <Markdown text={inline.answer} className="text-[14px]" />}
-                  {!(running && item.id === last?.id) && <MessageActions item={item} copyText={inline.answer} />}
-                </div>
-              </div>
-            )
+            const streaming = running && item.id === last?.id
+            return <AssistantItem key={item.id} item={item} streaming={streaming} thinking={streaming && status.phase === 'thinking'} />
           }
           return (
             <div
@@ -351,22 +338,52 @@ function Conversation() {
 }
 
 /**
+ * One reply. Memoised: while a reply streams only that one re-renders, not the whole conversation.
+ * `streaming`: it is the reply being written now; `thinking`: the agent is still in its thinking phase.
+ */
+const AssistantItem = memo(function AssistantItem({
+  item,
+  streaming,
+  thinking
+}: {
+  item: Extract<TimelineItem, { kind: 'assistant' }>
+  streaming: boolean
+  thinking: boolean
+}) {
+  const inline = splitThink(item.text)
+  const reasoning = [item.reasoning?.trim(), inline.reasoning].filter(Boolean).join('\n\n')
+  const live = thinking && !inline.answer
+  return (
+    <div className="group flex gap-3">
+      <span className="mt-1 w-6 shrink-0">
+        <LogoMark className="w-6" />
+      </span>
+      <div className="min-w-0 flex-1 space-y-2">
+        {reasoning && <ThinkingBlock text={reasoning} live={live} />}
+        {inline.answer && <Markdown text={inline.answer} className="text-[14px]" live={streaming} />}
+        {!streaming && <MessageActions item={item} copyText={inline.answer} />}
+      </div>
+    </div>
+  )
+})
+
+/**
  * Copy, Delete, and (on the latest request) Edit and Run again. A Delete that can't be used says
  * why when clicked, rather than being greyed out with no reason.
  */
 function MessageActions({ item, copyText, onEdit }: { item: TimelineItem; copyText: string; onEdit?: () => void }) {
-  const timeline = useWorkspace((s) => s.timeline)
-  const tasks = useWorkspace((s) => s.tasks)
-  const running = useWorkspace((s) => s.running)
   const deleteItem = useWorkspace((s) => s.deleteItem)
   const redo = useWorkspace((s) => s.redo)
   const [copied, setCopied] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const isUser = item.kind === 'user'
-  const noDelete = whyNotDelete(timeline, tasks, item.id, running)
-  const canRedo = isUser && !whyNotRedo(timeline, tasks, item.id, running)
-  const task = tasks.find((t) => t.id === item.taskId)
-  const undoesFiles = !!task?.files.length && !task.undone
+  // Derived values, not the whole timeline: streamed text then doesn't re-render every message's actions.
+  const noDelete = useWorkspace((s) => whyNotDelete(s.timeline, s.tasks, item.id, s.running))
+  const canRedo = useWorkspace((s) => isUser && !whyNotRedo(s.timeline, s.tasks, item.id, s.running))
+  const undoesFiles = useWorkspace((s) => {
+    const task = s.tasks.find((t) => t.id === item.taskId)
+    return !!task?.files.length && !task.undone
+  })
 
   const copy = (): void => {
     void navigator.clipboard.writeText(copyText)
@@ -381,7 +398,7 @@ function MessageActions({ item, copyText, onEdit }: { item: TimelineItem; copyTe
           {copied ? <Check size={13} /> : <Copy size={13} />}
         </IconButton>
       )}
-      {canRedo && onEdit && (
+      {canRedo && onEdit && item.kind === 'user' && (
         <>
           <IconButton size="sm" label={undoesFiles ? 'Edit and run again (undoes this task’s file changes first)' : 'Edit and run again'} onClick={onEdit}>
             <Pencil size={13} />

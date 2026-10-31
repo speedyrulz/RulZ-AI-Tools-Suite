@@ -6,6 +6,7 @@ import { CANDIDATE_URLS } from '@shared/defaults'
 import type { ConnectionInfo, FolderListing, ModelActivity, ProjectInfo, ProjectState, Theme, ToolServersInfo } from '@shared/types'
 import { ToolServers } from './mcp/toolServers'
 import { FIX_RUN_SHOWN, fixRunTask, SHARE_SHOWN, SHARE_TASK, systemPrompt } from './agent/prompt'
+import { childPids } from './agent/childPids'
 import { ProjectSession } from './agent/session'
 import { broadcast, handle, invokeHandler, onBroadcast } from './ipc'
 import { checkPageInWindow } from './project/pageWindow'
@@ -114,6 +115,8 @@ async function main(): Promise<void> {
   await settings.init()
   const store = new ProjectStore(userData)
   const hasGit = await gitInstalled()
+  // Background commands and "Run my app" shells left running by a crash are stopped now.
+  await childPids.init(join(userData, 'child-pids.json')).catch(() => undefined)
 
   // ---- Connection to RulZ LLM Suite ----
   let connection: ConnectionInfo = { status: 'checking', url: '', models: [] }
@@ -159,7 +162,16 @@ async function main(): Promise<void> {
     activity = a
     broadcast('model:activity', a)
   }
-  setInterval(() => void refreshModels(), 5000)
+  // The model list is polled often only while someone may be looking or a task runs. (Evaluated
+  // only when the timer fires, after everything below exists.)
+  const watched = (): boolean =>
+    !!session?.isRunning ||
+    phone.status().clients.length > 0 ||
+    (!!mainWindow && mainWindow.isVisible() && !mainWindow.isMinimized() && mainWindow.isFocused())
+  const pollModels = (delayMs: number): void => {
+    setTimeout(() => void refreshModels().finally(() => pollModels(watched() ? 5000 : 30000)), delayMs)
+  }
+  pollModels(5000)
 
   // ---- Tool servers (set up in RulZ LLM Suite) ----
   const toolServers = new ToolServers(

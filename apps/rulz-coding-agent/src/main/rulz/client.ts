@@ -153,7 +153,19 @@ export class RulzClient {
     const { url, apiKey } = this.config()
     const res = await fetch(`${url}/v1/models`, { headers: headers(apiKey), signal: AbortSignal.timeout(5000) })
     if (!res.ok) throw new ServerError(errorFromBody(res.status, await res.text()), res.status)
-    return parseModels(await res.json()).models
+    const models = parseModels(await res.json()).models
+    // A model reloaded with another context (in RulZ LLM Suite, or by another app) makes the cached
+    // props stale; the list reports the context it is loaded with now.
+    for (const m of models) {
+      const cached = this.props.get(m.id)
+      if (cached && m.loadedContext && cached.nCtx !== m.loadedContext) this.props.delete(m.id)
+    }
+    return models
+  }
+
+  /** Forgets one model's cached props (chat template, context length). */
+  forgetProps(model: string): void {
+    this.props.delete(model)
   }
 
   /** Chat template and context length. Asking for an unloaded model makes RulZ load it. */

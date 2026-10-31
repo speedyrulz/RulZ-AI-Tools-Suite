@@ -1,4 +1,5 @@
-import { readdirSync, readFileSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { diffLines, withContext } from '@shared/diff'
@@ -14,7 +15,9 @@ import {
   totalTokens
 } from '../src/main/agent/context'
 import { callKey, LoopGuard } from '../src/main/agent/loopGuard'
-import { parseRunLine, parseShareLine, SHARE_TASK, systemPrompt } from '../src/main/agent/prompt'
+import { backgroundNote, parseRunLine, parseShareLine, SHARE_TASK, systemPrompt } from '../src/main/agent/prompt'
+import { withTrailingNote } from '../src/main/agent/session'
+import { ChildPids, parseShellPids } from '../src/main/agent/childPids'
 import { parseSettings } from '../src/main/settings'
 import { MAX_INSTRUCTION_CHARS } from '@shared/defaults'
 import { approvalKey, classifyCommand, needsApproval } from '../src/main/agent/safety'
@@ -223,6 +226,50 @@ describe('plain-language steps', () => {
     expect(describeCommand('npm test')).toBe('Running the tests')
     expect(describeCommand('python main.py')).toBe('Running main.py')
     expect(describeCommand('Get-Date')).toBe('Running a command')
+  })
+})
+
+describe('what changes from step to step stays out of the system prompt', () => {
+  it('puts the running background commands in a note at the end', () => {
+    expect(backgroundNote([])).toBe('')
+    const note = backgroundNote([{ id: 'bg1', command: 'npm start' }])
+    expect(note).toMatch(/^\[Note: Still running in the background: bg1 \(npm start\)/)
+    const msgs: WireMessage[] = [
+      { role: 'system', content: 'S' },
+      { role: 'user', content: 'Make it' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'a', type: 'function', function: { name: 'run_command', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'a', content: 'ok' }
+    ]
+    const out = withTrailingNote(msgs, note)
+    expect(out.slice(0, 3)).toEqual(msgs.slice(0, 3))
+    expect(out[3].content).toBe(`ok\n\n${note}`)
+    expect(msgs[3].content).toBe('ok')
+    expect(withTrailingNote(msgs, '')).toBe(msgs)
+  })
+})
+
+describe('background shells left behind by a crash', () => {
+  it('stops only recorded PIDs that are still PowerShell, then starts a fresh record', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rulz-pids-'))
+    const file = join(dir, 'child-pids.json')
+    writeFileSync(file, JSON.stringify([111, 222, 333]))
+    const killed: number[] = []
+    const pids = new ChildPids()
+    const result = await pids.init(file, (pid) => killed.push(pid), () => new Set([222, 333, 999]))
+    expect(result).toEqual([222, 333])
+    expect(killed).toEqual([222, 333])
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual([])
+    pids.add(4242)
+    await new Promise((r) => setTimeout(r, 50))
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual([4242])
+    pids.remove(4242)
+    await new Promise((r) => setTimeout(r, 50))
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual([])
+  })
+
+  it('reads PowerShell PIDs from tasklist output', () => {
+    const csv = '"powershell.exe","1200","Console","1","90,000 K"\r\n"node.exe","1300","Console","1","50,000 K"\r\n"pwsh.exe","77","Console","1","1 K"'
+    expect([...parseShellPids(csv)]).toEqual([1200, 77])
   })
 })
 

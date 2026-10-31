@@ -38,6 +38,8 @@ async function harness(
     settings?: Partial<AppSettings>
     answer?: (p: PendingPrompt) => PromptAnswer | null
     nCtx?: number
+    /** The context RulZ reports in its model list (defaults to nCtx); differs after a reload. */
+    loadedContext?: number
     useGit?: boolean
     checkPage?: SessionDeps['checkPage']
     timings?: MockOptions['timings']
@@ -46,7 +48,11 @@ async function harness(
     onEvent?: (e: AgentEvent, session: ProjectSession) => void
   } = {}
 ): Promise<Harness> {
-  const mock = await startMockRulz({ turns, nCtx: opts.nCtx, timings: opts.timings })
+  const models =
+    opts.loadedContext !== undefined
+      ? [{ id: 'Qwen3-Coder-30B-A3B-Instruct-Q5_K_M', state: 'loaded' as const, loaded_context_length: opts.loadedContext }]
+      : undefined
+  const mock = await startMockRulz({ turns, nCtx: opts.nCtx, timings: opts.timings, models })
   const root = join(base, `project-${++counter}`)
   mkdirSync(root, { recursive: true })
   const dataDir = join(base, `data-${counter}`)
@@ -488,6 +494,20 @@ describe('the agent loop', () => {
       // Without the correction the older files would have been shortened to fit 80% of 32K.
       expect(last.length).toBe(3)
       expect(last.every((m) => !m.content.includes('omitted to save space'))).toBe(true)
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('uses the context the model is loaded with now, not stale props', async () => {
+    // /props still says 64K, but RulZ LLM Suite has since reloaded the model with 8K.
+    const h = await harness([{ content: 'Done.' }], { nCtx: 65536, loadedContext: 8192 })
+    try {
+      await h.run('Hello')
+      const warning = h.session.data.timeline.find((i) => i.kind === 'notice' && /small working memory \(8K tokens\)/.test(i.text))
+      expect(warning).toBeTruthy()
+      expect(h.session.data.context?.size).toBe(8192)
+      expect(Number(h.requests.at(-1)!.body.max_tokens)).toBeLessThanOrEqual(8192)
     } finally {
       await h.close()
     }

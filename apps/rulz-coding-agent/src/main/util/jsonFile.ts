@@ -13,11 +13,12 @@ const writeQueues = new Map<string, Promise<void>>()
 
 /**
  * Writes JSON via a temp file + rename so a crash never leaves a half-written file.
- * Writes to the same path are serialized.
+ * Writes to the same path are serialized. `compact` leaves out the indentation (for big files
+ * written often, like a project's state).
  */
-export function writeJsonAtomic(path: string, data: unknown): Promise<void> {
+export function writeJsonAtomic(path: string, data: unknown, opts: { compact?: boolean } = {}): Promise<void> {
   const previous = writeQueues.get(path) ?? Promise.resolve()
-  const next = previous.catch(() => undefined).then(() => doWrite(path, data))
+  const next = previous.catch(() => undefined).then(() => doWrite(path, data, opts.compact ?? false))
   writeQueues.set(path, next)
   void next.finally(() => {
     if (writeQueues.get(path) === next) writeQueues.delete(path)
@@ -25,10 +26,10 @@ export function writeJsonAtomic(path: string, data: unknown): Promise<void> {
   return next
 }
 
-async function doWrite(path: string, data: unknown): Promise<void> {
+async function doWrite(path: string, data: unknown, compact: boolean): Promise<void> {
   await fs.mkdir(dirname(path), { recursive: true })
   const tmp = `${path}.${process.pid}.tmp`
-  await fs.writeFile(tmp, JSON.stringify(data, null, 2), 'utf8')
+  await fs.writeFile(tmp, compact ? JSON.stringify(data) : JSON.stringify(data, null, 2), 'utf8')
   // Windows can briefly lock the target (antivirus, indexer); retry a few times.
   for (let attempt = 0; ; attempt++) {
     try {

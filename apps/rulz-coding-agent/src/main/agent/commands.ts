@@ -3,6 +3,7 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync, readdirSync } from 'node:fs'
 import { delimiter, join } from 'node:path'
+import { childPids } from './childPids'
 
 /** Cap for one tool result sent to the model. */
 export const MAX_RESULT_CHARS = 20_000
@@ -253,6 +254,8 @@ export class BackgroundCommands {
   run(command: string, cwd: string, onOutput?: (chunk: string) => void): string {
     const id = `bg${++this.counter}`
     const child = this.start(command, cwd, { waitForStarted: true })
+    // Recorded so a crash doesn't leave it running for good (stopped at the next start).
+    childPids.add(child.pid)
     const proc: BackgroundProc = { id, command, child, output: '', seen: 0, exitCode: null, running: true }
     const take = (decoder: InstanceType<typeof TextDecoder>) => (buf: Buffer) => {
       const chunk = decoder.decode(buf, { stream: true })
@@ -269,10 +272,12 @@ export class BackgroundCommands {
     child.on('error', (e) => {
       proc.output += `\n${e.message}`
       proc.running = false
+      childPids.remove(child.pid)
     })
     child.on('close', (code) => {
       proc.exitCode = code
       proc.running = false
+      childPids.remove(child.pid)
     })
     this.procs.set(id, proc)
     return id

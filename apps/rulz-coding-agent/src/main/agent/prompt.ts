@@ -12,8 +12,6 @@ export interface PromptInfo {
   instructions?: string
   /** Tool servers set up in RulZ LLM Suite, and the advice they give for using their tools. */
   extraTools?: { servers: string[]; advice: { server: string; text: string }[] }
-  /** Background commands still running from earlier. */
-  background?: { id: string; command: string }[]
 }
 
 export function systemPrompt(info: PromptInfo): string {
@@ -81,13 +79,19 @@ export function systemPrompt(info: PromptInfo): string {
       `## The owner's notes for this project\nThe owner wrote these in "Things to always remember". Follow them in everything you do, unless the owner asks for something different in this task:\n${info.memory.trim()}`
     )
   }
-  if (info.background?.length) {
-    parts.push(
-      `## Still running from earlier\n${info.background.map((b) => `- ${b.id}: ${b.command}`).join('\n')}\nStop these with stop_background_command before starting the same app again.`
-    )
-  }
+  // Last, as it changes most often of these: only when the notes are tidied up.
   if (info.summary?.trim()) parts.push(`## Earlier work in this project (summary)\n${info.summary.trim()}`)
   return parts.join('\n\n')
+}
+
+/**
+ * The background commands still running, as a note at the end of the request. It changes from step
+ * to step, so it stays out of the system prompt, where it would make the server process the whole
+ * conversation again each time.
+ */
+export function backgroundNote(background: { id: string; command: string }[]): string {
+  if (!background.length) return ''
+  return `[Note: Still running in the background: ${background.map((b) => `${b.id} (${b.command})`).join('; ')}. Stop these with stop_background_command before starting the same app again.]`
 }
 
 /** Text of the special task "Run my app" starts when it can't tell how to run the project. */

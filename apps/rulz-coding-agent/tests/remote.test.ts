@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { WebSocket } from 'ws'
 import { DEFAULT_SETTINGS, REMOTE_PROTOCOL } from '../src/shared/defaults'
 import type { EventChannel } from '../src/shared/ipc'
-import { REMOTE_PATH, RemoteServer, settingsPatchFromPhone, type RemoteHost } from '../src/main/remote/server'
+import { REMOTE_PATH, RemoteServer, settingsForPhone, settingsPatchFromPhone, type RemoteHost } from '../src/main/remote/server'
 import { isTailscaleIPv4, tailscaleAddresses } from '../src/main/remote/tailscale'
 
 type Msg = Record<string, unknown>
@@ -196,6 +196,9 @@ describe('phone access helpers', () => {
   it('drops phone-access settings from changes the phone sends', () => {
     expect(settingsPatchFromPhone({ theme: 'light', remoteEnabled: true, remoteToken: 'x' })).toEqual({ theme: 'light' })
     expect(settingsPatchFromPhone(null)).toEqual({})
+    // The phone never sees the RulZ LLM Suite API key, and can't overwrite it with the blank it sees.
+    expect(settingsForPhone({ ...DEFAULT_SETTINGS, apiKey: 'secret', remoteToken: 'tok' })).toMatchObject({ apiKey: '', remoteToken: '' })
+    expect(settingsPatchFromPhone({ apiKey: '', theme: 'dark' })).toEqual({ theme: 'dark' })
   })
 
   it('finds Tailscale addresses', () => {
