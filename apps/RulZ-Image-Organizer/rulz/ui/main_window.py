@@ -20,6 +20,10 @@ from .thumbs import ThumbLoader
 from .viewer import ViewerPage
 from .worker import ScanController
 
+UI_DB_TIMEOUT = 5          # seconds a UI write waits for the scanner before saying the library is busy
+REFRESH_MS = 350           # refresh delay after a change
+SCAN_REFRESH_MS = 10_000   # at most this often while a scan is running
+
 
 class MainWindow(QMainWindow):
     PHOTOS, PEOPLE, LIBRARY = range(3)
@@ -31,11 +35,13 @@ class MainWindow(QMainWindow):
         if icon_file.exists():
             self.setWindowIcon(QIcon(str(icon_file)))
         self.setMinimumSize(980, 640)
-        self.db = Database()
+        self.db = Database(timeout=UI_DB_TIMEOUT)
         self.scanner = ScanController(self)
         self._engine: FaceEngine | None = None
         # Bumped whenever library data changes; pages use it to know when cached results are stale.
         self.data_version = 0
+        self._closing = False
+        self._scan_stats: dict | None = None  # library counts at the last refresh during a scan
 
         self.root = QStackedWidget()
         self.setCentralWidget(self.root)
@@ -57,8 +63,8 @@ class MainWindow(QMainWindow):
         self.viewer.closed.connect(self._viewer_closed)
         self.root.addWidget(self.viewer)
 
-        self._refresh_timer = QTimer(self, singleShot=True, interval=350)
-        self._refresh_timer.timeout.connect(self._refresh_visible)
+        self._refresh_timer = QTimer(self, singleShot=True, interval=REFRESH_MS)
+        self._refresh_timer.timeout.connect(self._scheduled_refresh)
         self.scanner.changed.connect(self._schedule_refresh)
         self.scanner.progress.connect(self._progress)
         self.scanner.started.connect(self._scan_started)
@@ -227,7 +233,21 @@ class MainWindow(QMainWindow):
     def _schedule_refresh(self):
         self.data_version += 1  # the scanner changed something
         ThumbLoader.instance().failed.clear()  # thumbnails that didn't exist yet may exist now
-        self._refresh_timer.start()
+        # Rebuilding the timeline is O(photos): while a scan runs, do it every few seconds at most.
+        # The first refresh of a scan stays quick so newly found photos show up right away.
+        interval = SCAN_REFRESH_MS if self.scanner.running and self._scan_stats is not None else REFRESH_MS
+        if not self._refresh_timer.isActive() or self._refresh_timer.remainingTime() > interval:
+            self._refresh_timer.start(interval)
+
+    def _scheduled_refresh(self):
+        if self.scanner.running:
+            s = self.db.stats()
+            if s == self._scan_stats:
+                return  # e.g. only expressions were filled in: nothing visible changed
+            self._scan_stats = s
+        else:
+            self._scan_stats = None
+        self._refresh_visible()
 
     def _refresh_visible(self):
         for p in (self.photos, self.people, self.library):
@@ -241,11 +261,14 @@ class MainWindow(QMainWindow):
 
     # ---- scan status -----------------------------------------------------------
     def _scan_started(self):
+        self._scan_stats = None
         self.side_progress.show()
         self.side_progress.setRange(0, 0)
         self.side_status.setText("Scanning…")
 
     def _progress(self, done: int, total: int, msg: str):
+        if self._closing:
+            return
         self.side_status.setText(msg)
         if total:
             self.side_progress.setRange(0, total)
@@ -254,10 +277,28 @@ class MainWindow(QMainWindow):
             self.side_progress.setRange(0, 0)
 
     def _scan_finished(self, msg: str):
+        if self._closing:
+            self.close()  # the scan has wound down: now the window can really close
+            return
         self.side_progress.hide()
         self._schedule_refresh()
 
     def closeEvent(self, e):
-        config.settings().setValue("geometry", self.saveGeometry())
-        self.scanner.wait(8000)
+        self.library.flush_settings()
+        if self.scanner.running:
+            # Destroying a running QThread crashes, and cutting a scan off mid-write helps no one: ask it to
+            # stop and close once it has (usually within a second or two).
+            if not self._closing:
+                self._closing = True
+                config.settings().setValue("geometry", self.saveGeometry())
+                self.scanner.stop()
+                self.setWindowTitle(f"{config.APP_NAME} – Finishing…")
+                self.side_progress.setRange(0, 0)
+                self.side_progress.show()
+                self.side_status.setText("Finishing… RulZ closes as soon as the current step is saved.")
+                self.setEnabled(False)
+            e.ignore()
+            return
+        if not self._closing:
+            config.settings().setValue("geometry", self.saveGeometry())
         super().closeEvent(e)

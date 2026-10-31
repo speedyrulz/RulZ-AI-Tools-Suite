@@ -7,6 +7,33 @@ import sys
 os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
 
 
+def _install_busy_handler() -> None:
+    """A UI edit that can't get the library's write lock in time shows a message instead of a traceback."""
+    import sqlite3
+
+    default = sys.excepthook
+    showing = False
+
+    def hook(exc_type, exc, tb):
+        nonlocal showing
+        if issubclass(exc_type, sqlite3.OperationalError) and "locked" in str(exc) and not showing:
+            from PySide6.QtWidgets import QApplication
+
+            from .ui import dialogs
+
+            showing = True
+            try:
+                dialogs.info(QApplication.activeWindow(), "Library is busy",
+                             "RulZ is saving scan results right now, so this change wasn't saved. "
+                             "Please try again in a moment.")
+            finally:
+                showing = False
+            return
+        default(exc_type, exc, tb)
+
+    sys.excepthook = hook
+
+
 def main() -> int:
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QIcon
@@ -36,6 +63,7 @@ def main() -> int:
         from .ui.dialogs import choose_theme_first_run
 
         choose_theme_first_run()
+    _install_busy_handler()
     win = MainWindow()
     win.show()
     return app.exec()

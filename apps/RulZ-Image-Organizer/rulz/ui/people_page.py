@@ -124,7 +124,8 @@ class PeopleOverview(QWidget):
         ids = self._ids()
         self.sel_bar.update_count(len(ids))
         self.merge_btn.setEnabled(len(ids) >= 2)
-        all_hidden = bool(ids) and all(self.ctx.db.person(i).hidden for i in ids if self.ctx.db.person(i))
+        rows = self.ctx.db.q(f"SELECT hidden FROM people WHERE id IN ({','.join('?' * len(ids))})", ids) if ids else []
+        all_hidden = bool(rows) and all(r["hidden"] for r in rows)
         self.hide_btn.setText("Unhide" if all_hidden else "Hide")
 
     def _merge(self):
@@ -181,7 +182,7 @@ class _PersonData:
     version: int
     photo_sections: list[Section]
     face_tiles: list[Tile]
-    suggestion_tiles: list[Tile]
+    suggestion_tiles: list[Tile] | None = None  # computed when the suggestions tab is first shown
 
 
 class PersonPage(QWidget):
@@ -194,6 +195,7 @@ class PersonPage(QWidget):
         self.person_id: int | None = None
         self._cache: OrderedDict[int, _PersonData] = OrderedDict()
         self._shown: tuple[int, int] | None = None  # (person, version) currently in the grids
+        self._shown_sug: tuple[int, int] | None = None  # same, for the suggestions grid
         self.setObjectName("Page")
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -303,9 +305,7 @@ class PersonPage(QWidget):
             data = _PersonData(
                 version,
                 month_sections(db.photos([person_id])),
-                [Tile(key=f.id, image=face_image(f.id), data=f) for f, _ in db.faces_of_person(person_id)],
-                [Tile(key=fid, image=face_image(fid), badge=f"{round(score * 100)}%")
-                 for fid, score in clustering.suggestions(db, person_id)])
+                [Tile(key=f.id, image=face_image(f.id), data=f) for f, _ in db.faces_of_person(person_id)])
             self._cache[person_id] = data
         self._cache.move_to_end(person_id)
         while len(self._cache) > self.CACHE_SIZE:
@@ -333,12 +333,31 @@ class PersonPage(QWidget):
             self._shown = (p.id, data.version)
             self.photos.set_sections(data.photo_sections, keep_scroll=not reset_scroll)
             self.faces.set_sections([Section(None, data.face_tiles)], keep_scroll=not reset_scroll)
-            self.suggest.set_sections([Section(None, data.suggestion_tiles)], keep_scroll=not reset_scroll)
-        s_tiles = data.suggestion_tiles
         self.suggest.set_empty("Nothing to review", f"There are no other unassigned faces that look like {who}.")
-        self.tabs.set_text(self.TAB_SUGGEST, f"Review suggestions ({len(s_tiles)})" if s_tiles else "Review suggestions")
+        if self.stack.currentIndex() == self.TAB_SUGGEST:
+            self._show_suggestions(reset_scroll)
+        else:
+            self._update_suggest_tab(data)
         self._update_hint()
         return True
+
+    def _show_suggestions(self, reset_scroll: bool = False):
+        """Suggestions compare against every unassigned face, so they're only worked out when looked at."""
+        if self.person_id is None:
+            return
+        data = self._data(self.person_id)
+        if data.suggestion_tiles is None:
+            data.suggestion_tiles = [Tile(key=fid, image=face_image(fid), badge=f"{round(score * 100)}%")
+                                     for fid, score in clustering.suggestions(self.ctx.db, self.person_id)]
+        if self._shown_sug != (self.person_id, data.version) or reset_scroll:
+            reset_scroll = reset_scroll or self._shown_sug is None or self._shown_sug[0] != self.person_id
+            self._shown_sug = (self.person_id, data.version)
+            self.suggest.set_sections([Section(None, data.suggestion_tiles)], keep_scroll=not reset_scroll)
+        self._update_suggest_tab(data)
+
+    def _update_suggest_tab(self, data: "_PersonData"):
+        s_tiles = data.suggestion_tiles
+        self.tabs.set_text(self.TAB_SUGGEST, f"Review suggestions ({len(s_tiles)})" if s_tiles else "Review suggestions")
 
     def _update_hint(self):
         p = self._p()
@@ -354,6 +373,8 @@ class PersonPage(QWidget):
 
     def _tab_changed(self, i: int):
         self.stack.setCurrentIndex(i)
+        if i == self.TAB_SUGGEST:
+            self._show_suggestions()
         self._update_hint()
 
     # ---- header actions -------------------------------------------------------

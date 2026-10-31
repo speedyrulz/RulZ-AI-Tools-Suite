@@ -141,9 +141,10 @@ def from_blob(blob: bytes) -> np.ndarray:
 
 
 class Database:
-    def __init__(self, path: Path | str | None = None):
+    def __init__(self, path: Path | str | None = None, timeout: float = 30):
+        # The UI passes a short timeout: a click should fail with a message, not freeze the window.
         self.path = str(path or config.db_path())
-        self.conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        self.conn = sqlite3.connect(self.path, timeout=timeout, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
@@ -291,6 +292,20 @@ class Database:
                      (photo_id, *map(float, face.box), float(face.score), to_blob(face.embedding), int(manual),
                       a.expression, a.expr_conf, a.yaw, a.pitch, a.roll, a.pose, int(a.arms_up)))
         return cur.lastrowid
+
+    def delete_faces(self, face_ids: list[int]) -> None:
+        """Delete faces and their crop files."""
+        with self.transaction():
+            for chunk in _chunks(face_ids, 500):
+                self.x(f"DELETE FROM faces WHERE id IN ({','.join('?' * len(chunk))})", chunk)
+            # Unlinked while the write lock is held, so no new face can reuse an id (and its file) meanwhile.
+            for fid in face_ids:
+                _unlink(config.face_crop_path(fid))
+
+    def clear_photo_faces(self, photo_id: int) -> None:
+        """Delete every face of a photo (it changed, or is being analyzed again), crop files included."""
+        with self.transaction():
+            self.delete_faces([r[0] for r in self.q("SELECT id FROM faces WHERE photo_id=?", (photo_id,))])
 
     def set_face_attrs(self, face_id: int, attrs: "FaceAttrs | None") -> None:
         if attrs is None:
