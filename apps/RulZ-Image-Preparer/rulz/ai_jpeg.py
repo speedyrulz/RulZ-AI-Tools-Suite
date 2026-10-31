@@ -10,8 +10,10 @@ PyTorch and the ~290 MB weights file are optional extras, set up from the app on
 """
 from __future__ import annotations
 
+import gc
 import hashlib
 import importlib.util
+import sys
 import threading
 from pathlib import Path
 
@@ -24,6 +26,9 @@ MODEL_FILE = "fbcnn_color.pth"
 MODEL_SIZE = 287755111
 MODEL_SHA256 = "8b0e4ef23d59cf7ac934a342cb31a17619e4fa4a0b3374a9d78c5174312387e8"
 TILE, OVERLAP = 768, 32  # both multiples of 8
+MIN_TILE = 128
+# Peak GPU memory per tile pixel in half precision (measured ~900-1000: ~510 MB for a 768 tile).
+BYTES_PER_PIXEL = 1024
 
 READY, NO_TORCH, NO_MODEL = "ready", "no_torch", "no_model"
 
@@ -76,7 +81,8 @@ def _build():
     from torch import nn
 
     def res_conv(nc):
-        return nn.Sequential(nn.Conv2d(nc, nc, 3, 1, 1), nn.ReLU(inplace=False), nn.Conv2d(nc, nc, 3, 1, 1))
+        # In place is safe: the ReLU's input is the first conv's own output, used nowhere else.
+        return nn.Sequential(nn.Conv2d(nc, nc, 3, 1, 1), nn.ReLU(inplace=True), nn.Conv2d(nc, nc, 3, 1, 1))
 
     class ResBlock(nn.Module):
         def __init__(self, nc):
@@ -141,6 +147,7 @@ def _build():
 
 _model = None
 _lock = threading.Lock()
+_release_pending = False
 
 
 def _load():
@@ -155,11 +162,75 @@ def _load():
         net = FBCNN()
         state = torch.load(model_path(), map_location="cpu", weights_only=True)
         net.load_state_dict(state)
+        del state
+        if dev.type == "cuda":
+            net.half()  # before moving, so only the half-size copy is ever uploaded
         net.eval().to(dev)
         if dev.type == "cuda":
-            net.half()
+            net.to(memory_format=torch.channels_last)  # ~1.3x faster half-precision convs (measured)
         _model = (net, dev)
     return _model
+
+
+def _drop() -> None:
+    """Forget the model and hand its GPU memory back (call with _lock held)."""
+    global _model, _release_pending
+    _model, _release_pending = None, False
+    gc.collect()
+    torch = sys.modules.get("torch")
+    if torch is not None and torch.cuda.is_available() and torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
+
+
+def release() -> None:
+    """Unload the model to free its (GPU) memory; the next use loads it again. Never waits: while a picture
+    is being cleaned up, the model is dropped as soon as that finishes."""
+    global _release_pending
+    if not _lock.acquire(blocking=False):
+        _release_pending = True
+        return
+    try:
+        _drop()
+    finally:
+        _lock.release()
+
+
+def _tile_size(torch, dev) -> int:
+    """Biggest tile (up to TILE) whose activations fit in the GPU memory that is free now."""
+    if dev.type != "cuda":
+        return TILE
+    free = torch.cuda.mem_get_info(dev)[0]
+    side = int((free * 0.5 / BYTES_PER_PIXEL) ** 0.5) // 64 * 64
+    return max(MIN_TILE, min(TILE, side))
+
+
+def _run(rgb: np.ndarray, damage: float, tile: int | None = None) -> np.ndarray:
+    import torch
+
+    net, dev = _load()
+    dtype = torch.float16 if dev.type == "cuda" else torch.float32
+    qf = torch.tensor([[damage]], device=dev, dtype=dtype)
+    h, w = rgb.shape[:2]
+    out = np.empty_like(rgb)
+    tile = tile or _tile_size(torch, dev)
+    step = tile - 2 * OVERLAP
+    for y0 in range(0, h, step):
+        for x0 in range(0, w, step):
+            # tile with margin, snapped to the 8x8 grid so JPEG blocks line up
+            ty0, tx0 = max(0, y0 - OVERLAP) // 8 * 8, max(0, x0 - OVERLAP) // 8 * 8
+            ty1, tx1 = min(h, y0 + step + OVERLAP), min(w, x0 + step + OVERLAP)
+            t_ = rgb[ty0:ty1, tx0:tx1]
+            th, tw = t_.shape[:2]
+            ph, pw = -th % 8, -tw % 8
+            if ph or pw:
+                t_ = np.pad(t_, ((0, ph), (0, pw), (0, 0)), mode="edge")
+            t = torch.from_numpy(np.ascontiguousarray(t_.transpose(2, 0, 1)))[None].to(dev, dtype)
+            if dev.type == "cuda":
+                t = t.contiguous(memory_format=torch.channels_last)
+            res = net(t, qf)[0, :, :th, :tw].float().clamp_(0, 1).cpu().numpy().transpose(1, 2, 0)
+            cy1, cx1 = min(h, y0 + step), min(w, x0 + step)
+            out[y0:cy1, x0:cx1] = res[y0 - ty0:cy1 - ty0, x0 - tx0:cx1 - tx0]
+    return out
 
 
 def remove_artifacts(rgb: np.ndarray, strength: float) -> np.ndarray:
@@ -169,27 +240,22 @@ def remove_artifacts(rgb: np.ndarray, strength: float) -> np.ndarray:
     # FBCNN control = 1 - JPEG quality: higher cleans harder. 100 treats it like a quality-10 JPEG.
     damage = 0.9 * min(max(strength, 0.0), 100.0) / 100.0
     with _lock, torch.inference_mode():
-        net, dev = _load()
-        dtype = torch.float16 if dev.type == "cuda" else torch.float32
-        qf = torch.tensor([[damage]], device=dev, dtype=dtype)
-        h, w = rgb.shape[:2]
-        out = np.empty_like(rgb)
-        step = TILE - 2 * OVERLAP
-        for y0 in range(0, h, step):
-            for x0 in range(0, w, step):
-                # tile with margin, snapped to the 8x8 grid so JPEG blocks line up
-                ty0, tx0 = max(0, y0 - OVERLAP) // 8 * 8, max(0, x0 - OVERLAP) // 8 * 8
-                ty1, tx1 = min(h, y0 + step + OVERLAP), min(w, x0 + step + OVERLAP)
-                tile = rgb[ty0:ty1, tx0:tx1]
-                th, tw = tile.shape[:2]
-                ph, pw = -th % 8, -tw % 8
-                if ph or pw:
-                    tile = np.pad(tile, ((0, ph), (0, pw), (0, 0)), mode="edge")
-                t = torch.from_numpy(np.ascontiguousarray(tile.transpose(2, 0, 1)))[None].to(dev, dtype)
-                res = net(t, qf)[0, :, :th, :tw].float().clamp_(0, 1).cpu().numpy().transpose(1, 2, 0)
-                cy1, cx1 = min(h, y0 + step), min(w, x0 + step)
-                out[y0:cy1, x0:cx1] = res[y0 - ty0:cy1 - ty0, x0 - tx0:cx1 - tx0]
-        return out
+        try:
+            tile = None
+            while True:
+                try:
+                    return _run(rgb, damage, tile)
+                except torch.cuda.OutOfMemoryError:
+                    if _model is None:  # not even the model fits
+                        raise
+                    # something else took the memory meanwhile: try again with smaller tiles
+                    tile = (tile or _tile_size(torch, _model[1])) // 2 // 8 * 8
+                    if tile < MIN_TILE:
+                        raise
+                torch.cuda.empty_cache()  # out here the failed attempt's tensors are gone
+        finally:
+            if _release_pending:
+                _drop()
 
 
 def warm_up() -> None:

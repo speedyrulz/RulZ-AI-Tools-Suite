@@ -8,7 +8,7 @@ import numpy as np
 from PySide6.QtCore import QObject, QRunnable, QThread, Signal
 
 from .. import config, imageio
-from ..filters import ADJUSTMENTS, process
+from ..filters import ADJUSTMENTS, process, process_cached
 from ..shadows import ShadowEdit
 
 
@@ -44,7 +44,7 @@ class ThumbLoad(QRunnable):
 
     def run(self):
         try:
-            img = imageio.shrink(imageio.load(self.item.path), config.THUMB_MAX_SIDE)
+            img = imageio.shrink(imageio.load(self.item.path, config.THUMB_MAX_SIDE), config.THUMB_MAX_SIDE)
             result = imageio.to_8bit(img)
         except Exception as e:  # noqa: BLE001 - reported on the card
             result = e
@@ -65,17 +65,21 @@ class FullLoad(QRunnable):
 
 
 class Process(QRunnable):
+    """The editor's full-size preview. Emits (result, cache): pass the cache to the next Process of the same
+    picture, so moving only the color noise or detail slider skips the JPEG and shadow steps."""
+
     def __init__(self, key, img: np.ndarray, settings: dict, mode: str, emitter: _Emitter,
-                 shadow: ShadowEdit | None = None):
+                 shadow: ShadowEdit | None = None, cache=None):
         super().__init__()
         self.key, self.img, self.settings, self.mode, self.emitter = key, img, settings, mode, emitter
-        self.shadow = shadow
+        self.shadow, self.cache = shadow, cache
 
     def run(self):
         try:
-            result = process(self.img, self.settings, self.mode, shadow=self.shadow)
+            result = process_cached(self.img, self.settings, self.mode, self.shadow, self.cache)
         except Exception as e:  # noqa: BLE001
             result = e
+        self.cache = self.img = None
         self.emitter.done.emit(self.key, result)
 
 

@@ -6,12 +6,13 @@ applied first, so one press cleans and crops every selected picture.
 from __future__ import annotations
 
 import json
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QRectF, QThread, Qt, Signal
+from PySide6.QtCore import QRectF, QRunnable, QThread, QThreadPool, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel,
@@ -19,17 +20,19 @@ from PySide6.QtWidgets import (
     QSpinBox, QVBoxLayout, QWidget,
 )
 
-from .. import ai_mask, config, imageio
+from .. import ai_jpeg, ai_mask, config, imageio
 from ..crop import ASPECT_LIMITS, CropSettings, crop_box
-from ..filters import ADJUSTMENTS, BEST, is_noop, process
+from ..filters import ADJUSTMENTS, BEST, is_noop, process_crop
 from . import theme
 from .ai_setup import ensure_ready
 from .theme import C
-from .workers import ImageItem, output_paths
+from .workers import ImageItem, make_emitter, output_paths
 
 SETTINGS_KEY = "autocrop/settings"
 DIR_KEY = "autocrop/last_dir"
 DISPLAY_MAX_SIDE = 1600
+DISPLAY_KEPT = 12  # full previews kept for going back; older ones are loaded again when shown
+OVERLAY_MAX_SIDE = 512
 REFERENCES = {"crop": "The final crop", "mask": "The found area", "image": "The whole picture"}
 
 
@@ -43,20 +46,32 @@ class FindSettings:
 
 @dataclass
 class Found:
-    mask: np.ndarray  # 0/1 float, at most ai_mask.MASK_MAX_SIDE
+    bits: np.ndarray  # the mask (at most ai_mask.MASK_MAX_SIDE), packed 8 pixels to a byte
+    shape: tuple[int, int]  # the mask's (height, width)
     scores: list[float]
     size: tuple[int, int]  # full picture (height, width)
 
+    @classmethod
+    def of(cls, mask: np.ndarray, scores: list[float], size: tuple[int, int]) -> "Found":
+        return cls(np.packbits(mask.astype(bool), axis=None), mask.shape[:2], scores, size)
 
-def _display(img: np.ndarray) -> QPixmap:
-    return QPixmap.fromImage(imageio.to_qimage(imageio.shrink(img, DISPLAY_MAX_SIDE)))
+    @property
+    def mask(self) -> np.ndarray:
+        """The bool mask."""
+        h, w = self.shape
+        return np.unpackbits(self.bits, count=h * w).reshape(h, w).view(bool)
+
+
+def _display(img: np.ndarray) -> QImage:
+    # a QImage, not a QPixmap: this runs on a worker thread
+    return imageio.to_qimage(imageio.shrink(img, DISPLAY_MAX_SIDE))
 
 
 # ---- background work --------------------------------------------------------------
 class FindAll(QThread):
     """Loads each picture and finds the prompt in it, current one first."""
 
-    found = Signal(object, object, object)  # item, Found or Exception, QPixmap or None
+    found = Signal(object, object, object)  # item, Found or Exception, QImage or None
     finished_all = Signal()
 
     def __init__(self, items: list[ImageItem], find: FindSettings):
@@ -75,10 +90,25 @@ class FindAll(QThread):
                 img = imageio.load(it.path)
                 mask, scores = ai_mask.find(img, self.find.prompt, self.find.confidence,
                                             self.find.mask_threshold, self.find.best_only)
-                self.found.emit(it, Found(mask, scores, img.shape[:2]), _display(img))
+                self.found.emit(it, Found.of(mask, scores, img.shape[:2]), _display(img))
             except Exception as e:  # noqa: BLE001 - shown for that picture
                 self.found.emit(it, e, None)
         self.finished_all.emit()
+
+
+class _DisplayLoad(QRunnable):
+    """Loads a picture's preview again after it was let go to save memory."""
+
+    def __init__(self, item: ImageItem, emitter):
+        super().__init__()
+        self.item, self.emitter = item, emitter
+
+    def run(self):
+        try:
+            image = _display(imageio.load(self.item.path, DISPLAY_MAX_SIDE))
+        except Exception:  # noqa: BLE001 - the thumbnail stays up
+            image = None
+        self.emitter.done.emit(self.item, image)
 
 
 class CropAll(QThread):
@@ -109,10 +139,13 @@ class CropAll(QThread):
                 if box is None:
                     empty.append(it.path.name)
                     continue
-                if cleanup is not None:
-                    img = process(img, cleanup, self.mode, shadow=it.shadow_edit())
-                x0, y0, x1, y1 = box
-                imageio.save(dst, np.ascontiguousarray(img[y0:y1, x0:x1]))
+                if cleanup is not None:  # only the crop (plus a margin) when that gives the same picture
+                    out = process_crop(img, box, cleanup, self.mode, shadow=it.shadow_edit())
+                else:
+                    x0, y0, x1, y1 = box
+                    out = np.ascontiguousarray(img[y0:y1, x0:x1])
+                del img
+                imageio.save(dst, out)
                 saved += 1
             except Exception as e:  # noqa: BLE001
                 errors.append((it.path.name, str(e)))
@@ -138,11 +171,14 @@ class MaskPreview(QWidget):
         self._full = found.size if found is not None else None
         self._overlay = None
         if pix is not None and found is not None and found.scores:
-            m = cv2.resize(found.mask, (pix.width(), pix.height()), interpolation=cv2.INTER_LINEAR)
-            rgba = np.zeros((pix.height(), pix.width(), 4), np.uint8)
+            # at most OVERLAY_MAX_SIDE: it's a soft tint, drawn scaled up over the picture
+            f = min(1.0, OVERLAY_MAX_SIDE / max(pix.width(), pix.height()))
+            ow, oh = max(1, round(pix.width() * f)), max(1, round(pix.height() * f))
+            m = cv2.resize(found.mask.view(np.uint8) * np.uint8(120), (ow, oh), interpolation=cv2.INTER_AREA)
+            rgba = np.zeros((oh, ow, 4), np.uint8)
             rgba[..., 0] = 237
-            rgba[..., 3] = (np.clip(m, 0, 1) * 120).astype(np.uint8)
-            q = QImage(rgba.data, rgba.shape[1], rgba.shape[0], rgba.strides[0], QImage.Format_RGBA8888)
+            rgba[..., 3] = m
+            q = QImage(rgba.data, ow, oh, rgba.strides[0], QImage.Format_RGBA8888)
             self._overlay = QPixmap.fromImage(q.copy())
         self.update()
 
@@ -200,7 +236,12 @@ class AutoCropDialog(QDialog):
         self.items, self.globals, self.mode = items, globals_, mode
         self._found: dict[int, Found | Exception] = {}  # id(item) -> result for self._found_for
         self._found_for: FindSettings | None = None
-        self._pix: dict[int, QPixmap] = {}
+        self._pix: OrderedDict[int, QPixmap] = OrderedDict()  # id(item) -> preview, last shown last
+        self._loading: set[int] = set()
+        self._pool = QThreadPool(self)
+        self._pool.setMaxThreadCount(1)
+        self._emitter = make_emitter(self)
+        self._emitter.done.connect(self._on_display)
         self._finder: FindAll | None = None
         self._cropper: CropAll | None = None
 
@@ -438,8 +479,14 @@ class AutoCropDialog(QDialog):
         fresh = self._found_for == self.find_settings()
         result = self._found.get(id(it)) if fresh else None
         pix = self._pix.get(id(it))
-        if pix is None and it.thumb is not None:
-            pix = QPixmap.fromImage(imageio.to_qimage(it.thumb))
+        if pix is not None:
+            self._pix.move_to_end(id(it))
+        else:
+            if isinstance(result, Found) and id(it) not in self._loading:  # its preview was let go
+                self._loading.add(id(it))
+                self._pool.start(_DisplayLoad(it, self._emitter))
+            if it.thumb is not None:
+                pix = QPixmap.fromImage(imageio.to_qimage(it.thumb))
         if isinstance(result, Exception):
             self.preview.show_picture(pix, None, None, f"Couldn't check this picture: {result}")
         elif result is None:
@@ -449,8 +496,9 @@ class AutoCropDialog(QDialog):
             self.preview.show_picture(pix, None, None, hint)
         elif not result.scores:
             self.preview.show_picture(pix, result, None, f"Nothing found for “{self._found_for.prompt}”")
+        elif (box := crop_box(result.mask, self.crop_settings(), *result.size)) is None:
+            self.preview.show_picture(pix, None, None, f"Nothing found for “{self._found_for.prompt}”")
         else:
-            box = crop_box(result.mask, self.crop_settings(), *result.size)
             x0, y0, x1, y1 = box
             n = len(result.scores)
             self.preview.show_picture(pix, result, box,
@@ -497,12 +545,30 @@ class AutoCropDialog(QDialog):
         self._show_current()
         self._finder.start()
 
-    def _on_found(self, it: ImageItem, result, pix):
+    def _keep_pix(self, it: ImageItem, pix: QPixmap):
+        self._pix[id(it)] = pix
+        self._pix.move_to_end(id(it))
+        cur = self._current()
+        while len(self._pix) > DISPLAY_KEPT:  # oldest first, but never the one on screen
+            oldest = next(iter(self._pix))
+            if cur is not None and oldest == id(cur):
+                self._pix.move_to_end(oldest)
+                oldest = next(iter(self._pix))
+            del self._pix[oldest]
+
+    def _on_display(self, it: ImageItem, image):
+        self._loading.discard(id(it))
+        if image is not None:
+            self._keep_pix(it, QPixmap.fromImage(image))
+            if it is self._current():
+                self._show_current()
+
+    def _on_found(self, it: ImageItem, result, image):
         if self._finder is None or self._finder.find != self._found_for:
             return
         self._found[id(it)] = result
-        if pix is not None:
-            self._pix[id(it)] = pix
+        if image is not None:
+            self._keep_pix(it, QPixmap.fromImage(image))
         if it is self._current():
             self._show_current()
         else:
@@ -553,6 +619,7 @@ class AutoCropDialog(QDialog):
 
         def finished(saved, empty, errors):
             dlg.reset()
+            ai_jpeg.release()  # Best quality's model, if the clean-up used it
             msg = f"Saved {saved} of {len(jobs)} cropped picture(s) to\n{out_dir}"
             if empty:
                 msg += f"\n\nNothing found for “{f.prompt}” in {len(empty)}, so they weren't saved:\n" + \
@@ -580,5 +647,9 @@ class AutoCropDialog(QDialog):
             if w is not None and w.isRunning():
                 w.cancel()
                 w.wait()
+        self._pool.clear()
+        self._pool.waitForDone()
+        self._pix.clear()
+        ai_mask.release()  # SAM holds ~2 GB of GPU memory; it's loaded again next time
         self._save_settings()
         super().done(r)
