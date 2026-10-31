@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, readdirSync, statSync, writeFileSync } from 'n
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { quantFromName, readGgufHeader, toGgufInfo } from '../src/main/models/gguf'
+import { quantFromName, readGgufHeader, readGgufHeaderAsync, toGgufInfo } from '../src/main/models/gguf'
 
 type Val =
   | { t: 'u32'; v: number }
@@ -117,6 +117,33 @@ describe('readGgufHeader', () => {
     writeFileSync(stripped, buildGguf(kv, ['blk.0.attn_q.weight']))
     const s = readGgufHeader(stripped)
     expect(toGgufInfo(s.kv, 'stripped.gguf', s.hasNextn).mtpLayers).toBeUndefined()
+  })
+
+  it('reads the same header asynchronously, also when it is larger than the first read', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rulz-gguf-'))
+    // About 12 MB of string arrays, more than the 8 MiB the async reader starts with.
+    const tokens = Array.from({ length: 60000 }, (_, i) => `token-${i}-${'x'.repeat(32)}`)
+    const file = join(dir, 'big.gguf')
+    writeFileSync(
+      file,
+      buildGguf(
+        {
+          'general.architecture': { t: 'str', v: 'qwen35' },
+          'tokenizer.ggml.tokens': { t: 'arr_str', v: tokens },
+          'tokenizer.ggml.merges': { t: 'arr_str', v: tokens },
+          'tokenizer.ggml.extra1': { t: 'arr_str', v: tokens },
+          'tokenizer.ggml.extra2': { t: 'arr_str', v: tokens },
+          'qwen35.block_count': { t: 'u32', v: 48 }
+        },
+        ['blk.0.attn_q.weight', 'blk.47.nextn.eh_proj.weight']
+      )
+    )
+    const sync = readGgufHeader(file)
+    const async = await readGgufHeaderAsync(file)
+    expect(async).toEqual(sync)
+    expect(async.kv['qwen35.block_count']).toBe(48)
+    expect(async.hasNextn).toBe(true)
+    await expect(readGgufHeaderAsync(join(dir, 'missing.gguf'))).rejects.toThrow()
   })
 
   it('rejects files that are not GGUF', () => {

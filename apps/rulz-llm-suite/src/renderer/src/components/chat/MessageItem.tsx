@@ -155,7 +155,7 @@ export const MessageItem = memo(function MessageItem({
             ))}
           </div>
         ))}
-      {content && <Markdown text={content} />}
+      {content && <Markdown text={content} live={streaming} />}
       {message.toolCalls?.map((c) => <ToolCallBlock key={c.id} call={c} />)}
       {message.interrupted && (
         <div className="mt-1 flex items-center gap-1.5 text-xs text-faint">

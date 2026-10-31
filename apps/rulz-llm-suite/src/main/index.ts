@@ -117,7 +117,12 @@ async function main(): Promise<void> {
   await settings.init()
 
   const engine = new EngineService(() => settings.get().enginePath)
-  const hardware = new HardwareMonitor((s) => broadcast('hardware:update', s))
+  const hardware = new HardwareMonitor(
+    (s) => broadcast('hardware:update', s),
+    () =>
+      (!!mainWindow && mainWindow.isVisible() && !mainWindow.isMinimized() && mainWindow.isFocused()) ||
+      instances.list().some((i) => i.status === 'loading')
+  )
   const library = new ModelLibrary(
     join(userData, 'gguf-cache.json'),
     () => settings.get().modelsDir,
@@ -156,7 +161,8 @@ async function main(): Promise<void> {
     estimate,
     pidFile: join(userData, 'running-pids.json'),
     onChange: (list) => broadcast('instances:changed', list),
-    onError: (e) => broadcast('instances:error', e)
+    onError: (e) => broadcast('instances:error', e),
+    onGone: (id) => chat.forget(id)
   })
   await instances.cleanupOrphans()
 
@@ -301,6 +307,7 @@ async function main(): Promise<void> {
     quitting = true
   })
   mainWindow.on('show', destroyTray)
+  mainWindow.on('focus', () => hardware.poke())
   hardware.start()
   void library.scan()
   void engine.getInfo()

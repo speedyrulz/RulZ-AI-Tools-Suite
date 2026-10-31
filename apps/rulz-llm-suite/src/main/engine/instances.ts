@@ -5,11 +5,14 @@ import type { InstanceErrorEvent, LoadConfig, LoadedInstance, MemoryEstimate, Mo
 import { readJson, writeJsonAtomic } from '../util/jsonFile'
 import { buildServerArgs } from './args'
 import type { EngineService } from './engine'
-import { describeExitCode, engineEnv, freePort, isLlamaServerPid, killTree } from './process'
+import { describeExitCode, engineEnv, freePort, isPidAlive, killTree, llamaServerPids } from './process'
 import { LogLineSplitter, nextProgress, progressFromDots } from './progress'
 
 const MAX_LOG_LINES = 3000
 const LOAD_TIMEOUT_MS = 20 * 60 * 1000
+/** How long unload() waits for llama-server to exit after the first kill, and again after a forced one. */
+const UNLOAD_WAIT_MS = 8000
+const FORCED_UNLOAD_WAIT_MS = 5000
 
 interface Running {
   info: LoadedInstance
@@ -31,6 +34,14 @@ export interface InstanceManagerDeps {
   pidFile: string
   onChange: (instances: LoadedInstance[]) => void
   onError: (event: InstanceErrorEvent) => void
+  /** Called once an instance's process is gone, so per-instance caches elsewhere can be dropped. */
+  onGone?: (instanceId: string) => void
+  /** Starts llama-server; injectable for tests. */
+  spawnServer?: (exe: string, args: string[]) => ChildProcess
+  /** Kills a server's process tree (`force` = synchronous); injectable for tests. */
+  killProcess?: (proc: ChildProcess, force: boolean) => void
+  /** Overrides the unload waits [first, after forcing] in ms; for tests. */
+  unloadWaitMs?: [number, number]
 }
 
 function sameConfig(a: LoadConfig, b: LoadConfig): boolean {
@@ -40,6 +51,11 @@ function sameConfig(a: LoadConfig, b: LoadConfig): boolean {
 /** Runs one llama-server process per loaded model, each on its own localhost port. */
 export class InstanceManager {
   private running = new Map<string, Running>()
+  /**
+   * Loads take turns from "unload the previous model" to "process registered", so two overlapping
+   * loads (UI + API) can't both pass unloadAll() and leave two models in VRAM.
+   */
+  private loadQueue: Promise<unknown> = Promise.resolve()
 
   constructor(private readonly deps: InstanceManagerDeps) {}
 
@@ -61,14 +77,27 @@ export class InstanceManager {
     return `http://127.0.0.1:${instance.port}`
   }
 
-  async load(modelId: string, config: LoadConfig | null): Promise<LoadedInstance> {
+  load(modelId: string, config: LoadConfig | null): Promise<LoadedInstance> {
+    const started = this.loadQueue.then(() => this.startLoad(modelId, config))
+    // The queue only waits for the start; a failed start must not block the next load.
+    this.loadQueue = started.catch(() => undefined)
+    // Waiting for the model to become ready happens outside the queue, so a long load can still be
+    // replaced (the next load unloads it) or cancelled.
+    return started.then((s) => s.ready)
+  }
+
+  /**
+   * Unloads what has to go and spawns the server. The ready promise is wrapped so that awaiting the
+   * start doesn't also wait for the model to load.
+   */
+  private async startLoad(modelId: string, config: LoadConfig | null): Promise<{ ready: Promise<LoadedInstance> }> {
     const found = this.deps.getModel(modelId)
     if (!found) throw new Error(`Model not found: ${modelId}`)
     const cfg = config ?? this.deps.getDefaults(modelId)
     const model = { ...found, draft: this.deps.draftFor(found, cfg) }
 
     const existing = [...this.running.values()].find((r) => r.info.modelId === modelId && r.info.status !== 'stopping')
-    if (existing && sameConfig(existing.info.config, cfg)) return existing.ready
+    if (existing && sameConfig(existing.info.config, cfg)) return { ready: existing.ready }
     if (existing) await this.unload(existing.info.instanceId)
     if (this.deps.unloadPreviousOnLoad()) await this.unloadAll()
 
@@ -76,12 +105,14 @@ export class InstanceManager {
     const port = await freePort()
     const instanceId = randomUUID()
     const args = buildServerArgs({ model, config: cfg, port, alias: model.name })
-    const proc = spawn(exe, args, {
-      cwd: dirname(exe),
-      env: engineEnv(),
-      windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe']
-    })
+    const proc = this.deps.spawnServer
+      ? this.deps.spawnServer(exe, args)
+      : spawn(exe, args, {
+          cwd: dirname(exe),
+          env: engineEnv(),
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'pipe']
+        })
 
     const info: LoadedInstance = {
       instanceId,
@@ -106,7 +137,7 @@ export class InstanceManager {
     run.ready.catch(() => undefined)
     void this.savePids()
     this.emit()
-    return run.ready
+    return { ready: run.ready }
   }
 
   private attachOutput(run: Running): void {
@@ -156,6 +187,7 @@ export class InstanceManager {
     this.running.delete(run.info.instanceId)
     void this.savePids()
     this.emit()
+    this.deps.onGone?.(run.info.instanceId)
     if (wasReady && !expected) {
       this.deps.onError({
         modelName: run.info.modelName,
@@ -218,14 +250,33 @@ export class InstanceManager {
     run.info.status = 'stopping'
     run.info.stage = 'Unloading'
     this.emit()
-    const exited = new Promise<void>((resolve) => {
-      if (run.exited) return resolve()
-      run.proc.once('exit', () => resolve())
-      setTimeout(resolve, 8000)
-    })
-    killTree(run.proc.pid)
-    await exited
+    const kill = this.deps.killProcess ?? ((proc: ChildProcess, force: boolean) => killTree(proc.pid, force))
+    kill(run.proc, false)
+    const [firstWait, forcedWait] = this.deps.unloadWaitMs ?? [UNLOAD_WAIT_MS, FORCED_UNLOAD_WAIT_MS]
+    if (!(await this.waitExit(run, firstWait)) && isPidAlive(run.proc.pid)) {
+      // Still holding its memory: force-kill the whole tree and wait again before the caller loads
+      // the next model into the same VRAM.
+      run.log.push('[did not exit in time; forcing]')
+      kill(run.proc, true)
+      await this.waitExit(run, forcedWait)
+    }
     if (!run.exited) this.onExit(run, null)
+  }
+
+  /** Resolves true once the process exits, or false after `ms`. */
+  private waitExit(run: Running, ms: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      if (run.exited) return resolve(true)
+      const timer = setTimeout(() => {
+        run.proc.off('exit', onExit)
+        resolve(false)
+      }, ms)
+      const onExit = (): void => {
+        clearTimeout(timer)
+        resolve(true)
+      }
+      run.proc.once('exit', onExit)
+    })
   }
 
   async unloadAll(): Promise<void> {
@@ -245,7 +296,11 @@ export class InstanceManager {
   /** Kills llama-server processes left behind if the app crashed last time. */
   async cleanupOrphans(): Promise<void> {
     const pids = await readJson<number[]>(this.deps.pidFile, [])
-    for (const pid of pids) if (isLlamaServerPid(pid)) killTree(pid, true)
+    if (pids.length) {
+      // One process listing for all of them; only PIDs still belonging to llama-server are killed.
+      const live = llamaServerPids()
+      for (const pid of pids) if (live.has(pid)) killTree(pid, true)
+    }
     await this.savePids()
   }
 

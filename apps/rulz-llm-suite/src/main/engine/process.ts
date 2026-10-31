@@ -91,14 +91,36 @@ export function killTree(pid: number | undefined | null, sync = false): void {
   }
 }
 
-/** True if `pid` is a running llama-server process (used to clean up after a crash). */
-export function isLlamaServerPid(pid: number): boolean {
-  if (process.platform !== 'win32') return false
-  const r = spawnSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], {
+/** PIDs of every running llama-server process, from one process listing (used to clean up after a crash). */
+export function llamaServerPids(): Set<number> {
+  if (process.platform !== 'win32') return new Set()
+  const r = spawnSync('tasklist', ['/FI', 'IMAGENAME eq llama-server.exe', '/FO', 'CSV', '/NH'], {
     windowsHide: true,
     encoding: 'utf8'
   })
-  return /llama-server/i.test(r.stdout ?? '')
+  return parseTasklistPids(r.stdout ?? '')
+}
+
+/** Reads the PID column of `tasklist /FO CSV /NH` output for llama-server rows. */
+export function parseTasklistPids(csv: string): Set<number> {
+  const pids = new Set<number>()
+  for (const line of csv.split(/\r?\n/)) {
+    const m = /^"([^"]*llama-server[^"]*)","(\d+)"/i.exec(line.trim())
+    if (m) pids.add(Number(m[2]))
+  }
+  return pids
+}
+
+/** True while a process with this PID exists. */
+export function isPidAlive(pid: number | undefined | null): boolean {
+  if (!pid) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    // EPERM: it exists but belongs to someone else.
+    return (err as NodeJS.ErrnoException).code === 'EPERM'
+  }
 }
 
 export function freePort(): Promise<number> {

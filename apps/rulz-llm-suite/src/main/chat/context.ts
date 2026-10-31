@@ -37,6 +37,21 @@ export function truncateMiddle(counts: number[], budget: number, pinned: number)
   return keep
 }
 
+/** Template tokens allowed per message (role markers, separators) and for the whole prompt. */
+const MESSAGE_OVERHEAD = 16
+const PROMPT_OVERHEAD = 64
+
+/**
+ * A count the real one can't exceed: byte-level and byte-fallback tokenizers never produce more
+ * tokens than UTF-8 bytes, plus generous template overhead and the fixed image cost.
+ */
+export function upperBoundTokens(messages: WireMessage[]): number {
+  return messages.reduce(
+    (sum, m) => sum + Buffer.byteLength(textOf(m), 'utf8') + MESSAGE_OVERHEAD + imageCount(m) * IMAGE_TOKENS,
+    PROMPT_OVERHEAD
+  )
+}
+
 export class ContextFullError extends Error {}
 
 export interface ContextApi {
@@ -55,6 +70,8 @@ export async function fitToContext(
   api: ContextApi
 ): Promise<WireMessage[]> {
   const budget = nCtx - reserve
+  // Skip the template + tokenize round trip when the chat is clearly small enough.
+  if (upperBoundTokens(messages) + ((await api.countTools?.()) ?? 0) <= budget) return messages
   const total = await api.countConversation(messages)
   if (total === null || total <= budget) return messages
   if (policy === 'stop') {

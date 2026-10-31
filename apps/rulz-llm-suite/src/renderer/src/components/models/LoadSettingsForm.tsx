@@ -2,6 +2,7 @@ import * as Collapsible from '@radix-ui/react-collapsible'
 import { ChevronRight, FolderSearch } from 'lucide-react'
 import { useState } from 'react'
 import { draftFiles, fileName, resolveDraft } from '@shared/draft'
+import { isQuantizedKv } from '@shared/kv'
 import { parseTensorSplit, rebalanceSplit, toPercents } from '@shared/split'
 import { KV_CACHE_TYPES, type DraftKind, type KvCacheType, type LoadConfig, type MemoryEstimate, type ModelEntry, type ModelSampling, type SidecarFile } from '@shared/types'
 import { invoke } from '../../lib/api'
@@ -42,6 +43,8 @@ export function LoadSettingsForm({
     set('sampling', { ...config.sampling, [key]: value })
   const samplingSet = SAMPLING_FIELDS.filter((f) => config.sampling[f.key] !== null).length
   const set = <K extends keyof LoadConfig>(key: K, value: LoadConfig[K]): void => onChange({ ...config, [key]: value })
+  const kvAll = (t: KvCacheType): boolean =>
+    config.cacheTypeK === t && config.cacheTypeV === t && config.draftCacheTypeK === t && config.draftCacheTypeV === t
 
   const maxCtx = model?.info?.contextLength ?? 131072
   const layers = model?.info?.blockCount ?? 0
@@ -149,14 +152,44 @@ export function LoadSettingsForm({
         <Field label="K cache">
           <KvSelect value={config.cacheTypeK} onChange={(v) => set('cacheTypeK', v)} />
         </Field>
-        <Field label="V cache">
+        <Field
+          label="V cache"
+          hint={config.flashAttention === 'off' && isQuantizedKv(config.cacheTypeV) ? 'F16 is used: a quantized V cache needs flash attention' : undefined}
+        >
           <KvSelect value={config.cacheTypeV} onChange={(v) => set('cacheTypeV', v)} />
         </Field>
+      </div>
+      <div className="-mt-2 flex flex-wrap items-center gap-1 text-[11px] text-faint">
+        KV cache:
+        <PresetChip
+          active={kvAll('q8_0')}
+          onClick={() => onChange({ ...config, cacheTypeK: 'q8_0', cacheTypeV: 'q8_0', draftCacheTypeK: 'q8_0', draftCacheTypeV: 'q8_0' })}
+        >
+          Save VRAM (Q8_0, about half the size)
+        </PresetChip>
+        <PresetChip
+          active={kvAll('f16')}
+          onClick={() => onChange({ ...config, cacheTypeK: 'f16', cacheTypeV: 'f16', draftCacheTypeK: 'f16', draftCacheTypeV: 'f16' })}
+        >
+          Full precision (F16)
+        </PresetChip>
       </div>
 
       {model?.mmproj && (
         <Field inline label="Vision projector" hint={model.mmproj.path.split(/[\\/]/).pop()}>
           <Switch checked={config.useMmproj} onCheckedChange={(v) => set('useMmproj', v)} />
+        </Field>
+      )}
+      {(model === null || model.mmproj) && config.useMmproj && (
+        <Field
+          inline
+          label="Keep vision projector on CPU"
+          hint={
+            'Frees its VRAM (often 0.5–1.5 GB); images are encoded more slowly. ' +
+            'For text-only chats, turning the projector off also lets llama-server reuse its prompt cache.'
+          }
+        >
+          <Switch checked={config.mmprojOnCpu} onCheckedChange={(v) => set('mmprojOnCpu', v)} />
         </Field>
       )}
 

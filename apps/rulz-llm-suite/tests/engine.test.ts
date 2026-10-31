@@ -43,6 +43,7 @@ describe('buildServerArgs', () => {
         mainGpu: 1,
         flashAttention: 'on',
         cacheTypeK: 'q8_0',
+        cacheTypeV: 'f16',
         useMmap: false,
         useMmproj: false,
         extraArgs: '--override-tensor "exps=CPU" -v'
@@ -59,6 +60,56 @@ describe('buildServerArgs', () => {
     expect(args).toContain('--no-mmap')
     expect(args).not.toContain('--mmproj')
     expect(args.endsWith('--override-tensor exps=CPU -v')).toBe(true)
+  })
+})
+
+describe('KV cache and vision projector arguments', () => {
+  const withDraft: ModelEntry = { ...model, draft: { path: 'C:\\LLM\\Qwen\\mtp-q.gguf', sizeBytes: 2e8, kind: 'mtp' } }
+  const argsFor = (config: Partial<typeof DEFAULT_LOAD_CONFIG>) =>
+    buildServerArgs({ model: withDraft, config: { ...DEFAULT_LOAD_CONFIG, ...config }, port: 1, alias: 'q' }).join(' ')
+
+  it('defaults to a q8_0 KV cache for the model and the draft', () => {
+    const args = argsFor({})
+    expect(args).toContain('--cache-type-k q8_0 --cache-type-v q8_0')
+    expect(args).toContain('--spec-draft-type-k q8_0 --spec-draft-type-v q8_0')
+    expect(args).not.toContain('--flash-attn')
+  })
+
+  it('keeps V at f16 when flash attention is off, since llama.cpp refuses a quantized V cache then', () => {
+    const args = argsFor({ flashAttention: 'off' })
+    expect(args).toContain('--flash-attn off')
+    expect(args).toContain('--cache-type-k q8_0')
+    expect(args).not.toContain('--cache-type-v')
+    expect(args).toContain('--spec-draft-type-k q8_0')
+    expect(args).not.toContain('--spec-draft-type-v')
+    expect(argsFor({ flashAttention: 'on' })).toContain('--cache-type-v q8_0')
+  })
+
+  it('leaves f16 to llama.cpp and passes other types through', () => {
+    const f16 = argsFor({ cacheTypeK: 'f16', cacheTypeV: 'f16', draftCacheTypeK: 'f16', draftCacheTypeV: 'f16' })
+    expect(f16).not.toMatch(/--cache-type-|--spec-draft-type-/)
+    expect(argsFor({ cacheTypeV: 'q4_0' })).toContain('--cache-type-v q4_0')
+  })
+
+  it('counts the f16 fallback in the memory estimate', () => {
+    const q8 = kvCacheBytes(model, { ...DEFAULT_LOAD_CONFIG }, 8192)!
+    const faOff = kvCacheBytes(model, { ...DEFAULT_LOAD_CONFIG, flashAttention: 'off' }, 8192)!
+    expect(faOff).toBeCloseTo(1024 ** 3 * ((34 / 32 + 2) / 4))
+    expect(faOff).toBeGreaterThan(q8)
+  })
+
+  it('keeps the vision projector on the CPU when asked', () => {
+    expect(argsFor({})).not.toContain('--no-mmproj-offload')
+    expect(argsFor({ mmprojOnCpu: true })).toContain('--mmproj C:\\LLM\\Qwen\\mmproj-BF16.gguf --no-mmproj-offload')
+    expect(argsFor({ mmprojOnCpu: true, useMmproj: false })).not.toMatch(/mmproj/)
+    const cfg = { ...DEFAULT_LOAD_CONFIG, contextLength: 8192 }
+    const gpu = estimateMemory(model, cfg, { vramBytes: 30e9, ramBytes: 60e9 })
+    const cpu = estimateMemory(model, { ...cfg, mmprojOnCpu: true }, { vramBytes: 30e9, ramBytes: 60e9 })
+    expect(gpu.gpuBytes - cpu.gpuBytes).toBeCloseTo(model.mmproj!.sizeBytes)
+  })
+
+  it('asks llama-server to reuse cached chunks', () => {
+    expect(argsFor({})).toContain('--cache-reuse 256')
   })
 })
 
@@ -91,7 +142,7 @@ describe('draft head arguments', () => {
   it('maps the MTP tuning settings to flags and leaves defaults out', () => {
     const tuned = buildServerArgs({
       model: withDraft,
-      config: { ...DEFAULT_LOAD_CONFIG, draftMinTokens: 1, draftPMin: 0.6, draftSampling: 'greedy', draftGpu: 'cpu', draftCacheTypeK: 'q8_0' },
+      config: { ...DEFAULT_LOAD_CONFIG, draftMinTokens: 1, draftPMin: 0.6, draftSampling: 'greedy', draftGpu: 'cpu', draftCacheTypeK: 'q8_0', draftCacheTypeV: 'f16' },
       port: 1,
       alias: 'q'
     }).join(' ')
@@ -102,7 +153,7 @@ describe('draft head arguments', () => {
     expect(tuned).toContain('--spec-draft-type-k q8_0')
     expect(tuned).not.toContain('--spec-draft-type-v')
     const plain = buildServerArgs({ model: withDraft, config: DEFAULT_LOAD_CONFIG, port: 1, alias: 'q' }).join(' ')
-    expect(plain).not.toMatch(/--spec-draft-(n-min|p-min|sampling|ngl|type-k)/)
+    expect(plain).not.toMatch(/--spec-draft-(n-min|p-min|sampling|ngl)/)
   })
   it('uses built-in MTP layers without a draft file or offload flag', () => {
     const builtIn: ModelEntry = { ...model, draft: { path: model.path, sizeBytes: 0, kind: 'mtp', builtIn: true } }
@@ -171,7 +222,7 @@ describe('load progress', () => {
 describe('estimateMemory', () => {
   it('computes KV cache from layers, heads and cache type', () => {
     // 32 layers * 8 heads * (128 + 128) * 2 bytes * 8192 tokens = 1 GiB
-    expect(kvCacheBytes(model, { ...DEFAULT_LOAD_CONFIG, contextLength: 8192 }, 8192)).toBe(1024 ** 3)
+    expect(kvCacheBytes(model, { ...DEFAULT_LOAD_CONFIG, contextLength: 8192, cacheTypeK: 'f16', cacheTypeV: 'f16' }, 8192)).toBe(1024 ** 3)
     const q8 = kvCacheBytes(model, { ...DEFAULT_LOAD_CONFIG, cacheTypeK: 'q8_0', cacheTypeV: 'q8_0' }, 8192)!
     expect(q8).toBeCloseTo(1024 ** 3 * (34 / 32 / 2))
   })
