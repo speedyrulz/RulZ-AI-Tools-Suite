@@ -23,6 +23,38 @@ JPEG artifact removal has two modes (switch next to its slider):
   app offers a one-time setup: PyTorch with CUDA (~3 GB) and the model file (288 MB, checksum
   verified), stored in `%LOCALAPPDATA%\RulZ\Image Preparer\models`.
 
+## Auto crop
+
+Crops pictures to something you describe, such as `face` or `dog`, found by AI. Select pictures
+(Ctrl+click or Shift+click; with none selected, all are used) and click **Auto crop…**:
+
+1. Type what to crop.
+2. **Preview** finds it with [SAM 3.1](https://ai.meta.com/sam3/) (Meta's Segment Anything 3.1) and
+   shows the found area in red and the crop as a dashed box. Use the strip below to check each picture.
+   Crop settings update the box straight away; changes to the words or the "Finding it" settings need
+   another Preview.
+3. **Crop…** asks for a folder, then crops every selected picture and saves it there with the same name.
+   Pictures where nothing was found are skipped and listed.
+
+| Setting | What it does |
+|---|---|
+| **Matches** | **All matches** crops to cover every match (every face); **Best match only** to the most confident one. |
+| **Confidence** | How sure SAM must be that something matches (default 0.5). Lower finds more, including wrong things. |
+| **Mask threshold** | How sure SAM must be about a pixel for it to count as part of the match (default 0.5). Lower = bigger area. |
+| **Padding** | Room left around what was found: **Same on every side** (one %) or **Each side separately** (top, bottom, left, right). Default 10%. |
+| **Measured against** | What the % is of: **The final crop** (default; what was found sits inside a border of that share), **The found area**, or **The whole picture**. |
+| **Shape limit** | Never crop narrower or wider than this shape (default 2:3 / 3:2). A too-tall crop is widened, too wide made taller; it only grows. |
+| **Divisible by** | Grow the crop so width and height are multiples of this (e.g. 64 for training). 1 = off. |
+| **Also remove noise and JPEG damage first** | Applies each picture's clean-up settings before cropping, so one press cleans and crops. |
+
+The crop follows the [RulZ Mask Intelligent Crop](https://github.com/speedyrulz/ComfyUI-RulZnodes#rulz-mask-intelligent-crop)
+ComfyUI node exactly. The first time you use Auto crop, the app offers a one-time setup: PyTorch with CUDA
+(~3 GB, shared with Best quality), Transformers and TorchVision, and the SAM 3.1 model (1.7 GB, from
+[huggingface.co/unsloth/sam3.1](https://huggingface.co/unsloth/sam3.1), no sign-in needed, checksum
+verified), stored in `%LOCALAPPDATA%\RulZ\Image Preparer\models\sam3.1`. The first Preview after starting
+the app takes up to half a minute while SAM loads; after that it's well under a second per picture on an
+NVIDIA GPU (about 2 GB of video memory).
+
 ## Using it
 
 - Add photos with **Add images** or drag photos or whole folders onto the window.
@@ -51,9 +83,14 @@ python -m venv .venv
 .venv\Scripts\python run.py
 ```
 
-(`requirements-ai.txt` is optional — only for Best quality mode.)
+(`requirements-ai.txt` is optional — only for Best quality mode and Auto crop. Auto crop also needs
+`torchvision` from the same CUDA index, then `requirements-crop.txt` from PyPI, in two separate installs:
+with both indexes in one install, pip takes PyPI's CPU-only PyTorch.)
+
+Tests: `.venv\Scripts\python -m unittest discover tests`
 
 ## License
 
 MIT for the code — see `LICENSE`. The RulZ name and logo are not covered; see `LOGO-NOTICE.md`.
-FBCNN's network design and weights are by their authors under Apache-2.0.
+FBCNN's network design and weights are by their authors under Apache-2.0. SAM 3.1 is by Meta under the
+SAM License, which comes with the model download.

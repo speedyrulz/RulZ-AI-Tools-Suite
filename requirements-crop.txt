@@ -1,0 +1,5 @@
+# Optional: Auto crop (SAM 3.1). The app offers to install this on first use, after PyTorch and
+# TorchVision from the CUDA 13 index (see requirements-ai.txt). Kept apart from that index: with both,
+# pip takes PyPI's CPU-only PyTorch.
+transformers>=5.20,<6
+pillow
