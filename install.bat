@@ -38,11 +38,24 @@ echo Upgrading pip ...
 "%PY%" -m pip install --upgrade pip wheel
 if errorlevel 1 goto :fail
 
+rem PyTorch is a ~3 GB download: keep a CUDA build of 2.9+ that is already in the venv (an update or repair
+rem would otherwise download it again). Passing an index URL always reinstalls it from there.
+if not "%~1"=="" goto :install_torch
+"%PY%" -c "import sys, torch, torchvision; v = tuple(int(x) for x in torch.__version__.split('+')[0].split('.')[:2]); sys.exit(0 if torch.version.cuda and v >= (2, 9) else 1)" >nul 2>nul
+if errorlevel 1 goto :install_torch
+echo.
+echo A CUDA build of PyTorch 2.9+ is already installed; skipping the PyTorch download.
+echo (Run install.bat with an index URL to reinstall it, e.g. install.bat https://download.pytorch.org/whl/cu130)
+goto :requirements
+
+:install_torch
 echo.
 echo Installing PyTorch (CUDA) from %TORCH_INDEX% ...
 echo (Pass a different index URL as the first argument, e.g. install.bat https://download.pytorch.org/whl/cu128)
 "%PY%" -m pip install --upgrade "torch>=2.9" torchvision --index-url %TORCH_INDEX%
 if errorlevel 1 goto :fail
+
+:requirements
 
 echo.
 echo Installing requirements ...
