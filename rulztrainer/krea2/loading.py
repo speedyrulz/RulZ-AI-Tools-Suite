@@ -99,7 +99,7 @@ def load_transformer(model_dir: Path, device, quant: str = "auto", dtype=torch.b
     state = moss_loading._read_sharded(model_dir / "transformer", "diffusion_pytorch_model")
     # like diffusers with torch_dtype=bf16: everything in bf16 except the RMSNorm scales, which stay fp32
     state = {k: v.float() if k.split(".")[-2] in NORM_NAMES else v.to(dtype) for k, v in state.items()}
-    sf.install_state(model, state, quant, dtype, quant_filter=QUANT_FILTER)
+    sf.install_state(model, state, quant, dtype, quant_filter=QUANT_FILTER, **sf.quant_target(device, quant_devices))
     del state
     model.is_distilled = bool(pipeline_config(model_dir).get("is_distilled", False))
     model = model.to(device).eval().requires_grad_(False)
@@ -117,17 +117,18 @@ def load_vae(model_dir: Path, device):
 
 
 def load_text_encoder(model_dir: Path, device: str = "auto", quant: str = "auto"):
-    """Qwen3-VL (Qwen3VLModel) + tokenizer. quant int8/int8_convrot/nvfp4 quantizes the language model's Linear layers
-    (W8A8) so the 8.9 GB encoder takes about half the memory."""
-    from transformers import AutoTokenizer, Qwen3VLModel
+    """Qwen3-VL's language model (text only: the folder's Qwen3VLModel without its vision tower, which text prompts
+    never use, 0.8 GB) + tokenizer. quant int8/int8_convrot/nvfp4 quantizes its Linear layers (W8A8) so the 8.9 GB
+    encoder takes about half the memory."""
+    from transformers import AutoTokenizer
+
+    from .single_file import load_hf_text_model
 
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir / "tokenizer"))
-    model = Qwen3VLModel.from_pretrained(str(model_dir / "text_encoder"), dtype=torch.bfloat16)
-    model.eval().requires_grad_(False)
     fmt = "none" if quant == "auto" else quant
+    model = load_hf_text_model(model_dir / "text_encoder", fmt, device)
     if fmt != "none":
-        lm = getattr(model, "language_model", None) or model
-        n = Q.quantize_module_linears(lm, fmt, min_dim=1024)
+        n = sum(1 for m in model.modules() if isinstance(m, Q.QuantLinear))
         log.info("Text encoder: %d Linear layers quantized to %s", n, fmt)
     model = place_text_encoder(model, device)
     return model, tokenizer
@@ -205,11 +206,11 @@ def encode_images(vae, images: torch.Tensor) -> torch.Tensor:
 
 
 def _decode(vae, latents: torch.Tensor) -> torch.Tensor:
-    z = latents.to(vae.device, vae.dtype)
+    z = latents.to(vae.device, torch.float32)  # the latent statistics apply in fp32 (a bf16 VAE gets the result)
     b, c, h, w = z.shape
     z = z.reshape(b, c // 4, 2, 2, h, w).permute(0, 1, 4, 2, 5, 3).reshape(b, c // 4, 2 * h, 2 * w)
     mean, std = _stats(vae, z)
-    z = z * std + mean
+    z = (z * std + mean).to(vae.dtype)
     return vae.decode(z.unsqueeze(2), return_dict=False)[0][:, :, 0]
 
 
@@ -220,14 +221,18 @@ def decode_latents(vae, latents: torch.Tensor) -> torch.Tensor:
     Decoded in 512 px tiles (384 px apart, the overlaps blended): this VAE normalizes per pixel and its convolutions
     see a few pixels around each tile, so the result is the full decode's to 0.06 of an 8-bit level on average
     (PSNR 68 dB, measured at 1024 x 1536), with a peak of +2.0 GB instead of +7.9 GB at 1 MP and +11.8 GB at 1.5 MP.
-    Encoding (the training latents) is never tiled."""
-    prev = vae.use_tiling
-    vae.enable_tiling(tile_sample_min_height=512, tile_sample_min_width=512, tile_sample_stride_height=384,
+    The tiles run on a bf16 copy of the VAE (moss.loading.decode_vae): the fp32 tiles to 0.18-0.24 of an 8-bit level
+    on average (PSNR 53-55 dB, measured at 1024 x 1024, 832 x 1248 and 1248 x 1248), with a peak of +1.3 GB instead
+    of +2.0 GB (the 240 MB copy included) and 25-35% faster. Encoding (the training latents) is never tiled and stays
+    fp32."""
+    dec = moss_loading.decode_vae(vae)
+    prev = dec.use_tiling
+    dec.enable_tiling(tile_sample_min_height=512, tile_sample_min_width=512, tile_sample_stride_height=384,
                       tile_sample_stride_width=384)
     try:
-        return _decode(vae, latents).clamp(-1, 1)
+        return _decode(dec, latents).float().clamp(-1, 1)
     finally:
-        vae.use_tiling = prev
+        dec.use_tiling = prev
 
 
 def decode_latents_grad(vae, latents: torch.Tensor) -> torch.Tensor:
@@ -237,9 +242,7 @@ def decode_latents_grad(vae, latents: torch.Tensor) -> torch.Tensor:
 
 def grad_vae(vae):
     """A bf16 copy of the VAE for decode_latents_grad (this VAE has no gradient checkpointing)."""
-    import copy
-
-    return copy.deepcopy(vae).to(torch.bfloat16).eval().requires_grad_(False)
+    return moss_loading.bf16_copy(vae)
 
 
 # ---------------------------------------------------------------- config-driven entry points

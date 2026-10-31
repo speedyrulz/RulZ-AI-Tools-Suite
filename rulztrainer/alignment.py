@@ -26,7 +26,8 @@ alignment's small projector is thrown away.
 Taps carry the side outputs. The trainer arms them for a batch with the trigger token positions of each sample,
 the model records on its main forward, recording stops before any other forward, and they are disarmed after the
 backward. A checkpointed block recomputes its forward in the backward and must save the same tensors, so armed taps
-keep computing (without recording) until then; the gradient through a recorded attention map then reaches the
+keep computing (without recording) until then, except in a forward without gradients (the prior pass), which saves
+nothing; the gradient through a recorded attention map then reaches the
 block like any other (checked against an unchecked block).
 """
 from __future__ import annotations
@@ -36,6 +37,7 @@ import logging
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 log = logging.getLogger("rulztrainer")
 
@@ -99,6 +101,8 @@ class AttnTap:
         t = self.taps
         if not (t.armed and t.attn_on) or t.layout is None:
             return
+        if not t.recording and not torch.is_grad_enabled():
+            return  # a no-grad forward after the main one (the prior pass): nothing to record, nothing to recompute
         lay = t.layout
         (i0, n_img), (t0, n_txt) = lay["img"], lay["txt"]
         if n_txt < 0:
@@ -109,13 +113,40 @@ class AttnTap:
                 t.attn.setdefault(self.layer, {})[lay["sample"] + j] = probs[j]
 
 
-def text_attention(q_img: torch.Tensor, k_txt: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-    """[B, n_img, n_txt]: each image token's attention over the text tokens (softmax over those alone, the invalid
-    ones masked), averaged over heads."""
-    logits = torch.matmul(q_img, k_txt.transpose(-1, -2)).float() * (q_img.shape[-1] ** -0.5)  # [B, H, n_img, n_txt]
+# fp32 logits per chunk of heads in text_attention (32 MB): at 1 MP (4096 image tokens, ~300 text tokens) about
+# 7 of 24-48 heads at a time instead of all of them, 100-400 MB of logits and softmax per tapped layer
+ATTN_CHUNK_ELEMENTS = 1 << 23
+
+
+def _head_probs(q_img: torch.Tensor, k_txt: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+    """The softmax over the text tokens of a chunk of heads, summed over them: [B, n_img, n_txt]."""
+    logits = torch.matmul(q_img, k_txt.transpose(-1, -2)).float() * (q_img.shape[-1] ** -0.5)  # [B, h, n_img, n_txt]
     if mask is not None:
-        logits = logits.masked_fill(~mask.to(logits.device, torch.bool)[:, None, None, :], float("-inf"))
-    return logits.softmax(-1).mean(1)
+        logits = logits.masked_fill(~mask[:, None, None, :], float("-inf"))
+    return logits.softmax(-1).sum(1)
+
+
+def text_attention(q_img: torch.Tensor, k_txt: torch.Tensor, mask: torch.Tensor | None = None,
+                   chunk_elements: int | None = None) -> torch.Tensor:
+    """[B, n_img, n_txt]: each image token's attention over the text tokens (softmax over those alone, the invalid
+    ones masked), averaged over heads. The heads go in chunks of about chunk_elements logits, so only the
+    [B, n_img, n_txt] sum outlives a chunk; with gradients each chunk is checkpointed (its softmax is recomputed in
+    the backward instead of saved), the same gradient as the whole [B, H, n_img, n_txt] at once."""
+    b, heads, n_img, _ = q_img.shape
+    n_txt = k_txt.shape[2]
+    if mask is not None:
+        mask = mask.to(q_img.device, torch.bool)
+    step = max(1, int(chunk_elements or ATTN_CHUNK_ELEMENTS) // max(1, b * n_img * n_txt))
+    grad = torch.is_grad_enabled() and (q_img.requires_grad or k_txt.requires_grad)
+    total = None
+    for s in range(0, heads, step):
+        qc, kc = q_img[:, s:s + step], k_txt[:, s:s + step]
+        if grad and step < heads:
+            part = checkpoint(_head_probs, qc, kc, mask, use_reentrant=False)
+        else:
+            part = _head_probs(qc, kc, mask)
+        total = part if total is None else total + part
+    return total / heads
 
 
 def attention_module(block: nn.Module) -> nn.Module | None:
