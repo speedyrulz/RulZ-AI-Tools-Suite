@@ -50,6 +50,7 @@ class EditorPage(QWidget):
         self.globals = {k: d for k, (_, d) in ADJUSTMENTS.items()}
         self.mode = BALANCED
         self._full = None
+        self._cache = None  # the JPEG/shadow stage of the last preview (filters.process_cached)
         self._shown_key = None
         self._running = False
         self._pool = QThreadPool(self)
@@ -279,7 +280,7 @@ class EditorPage(QWidget):
         self.globals = dict(globals_)
         self.mode = mode
         self.mode_switch.set_mode(mode)
-        self._full = None
+        self._full = self._cache = None
         self._shown_key = None
         self.message.setText("")
         self.title.setText(item.path.name)
@@ -306,8 +307,15 @@ class EditorPage(QWidget):
 
     def close_image(self):
         self.item = None
-        self._full = None
+        self._full = self._cache = None
         self.view.set_images(None, None)
+
+    def shutdown(self):
+        """Stop background work before the window goes away."""
+        self.close_image()
+        self._debounce.stop()
+        self._pool.clear()
+        self._pool.waitForDone()
 
     def _sync_controls(self):
         it = self.item
@@ -361,7 +369,8 @@ class EditorPage(QWidget):
         self.view.set_busy(True)
         if key[1] == BEST:
             self.message.setText("AI is working… a few seconds")
-        self._pool.start(Process((self.item, key), self._full, dict(key[0]), key[1], self._emitter, key[2]))
+        self._pool.start(Process((self.item, key), self._full, dict(key[0]), key[1], self._emitter, key[2],
+                                 self._cache))
 
     def _on_done(self, key, result):
         if isinstance(key, ImageItem):  # full-size load finished
@@ -383,6 +392,7 @@ class EditorPage(QWidget):
                 self.message.setText(f"Couldn't process: {result}")
                 self._shown_key = wanted  # don't retry the same failing settings in a loop
             else:
+                result, self._cache = result
                 self.message.setText("")
                 self._shown_key = wanted
                 self.view.set_processed(_pixmap(result))

@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import time
+from collections import deque
 from pathlib import Path
 
-from PySide6.QtCore import QRectF, QSize, QThreadPool, QTimer, Qt
+from PySide6.QtCore import QRectF, QSize, QThread, QThreadPool, QTimer, Qt
 from PySide6.QtGui import QColor, QFont, QKeySequence, QPainter, QPainterPath, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QListView, QListWidget, QListWidgetItem,
@@ -114,9 +115,13 @@ class MainWindow(QMainWindow):
             else BALANCED
         if self.mode == BEST:
             QThreadPool.globalInstance().start(ai_jpeg.warm_up)
-        self._render_queue: list[ImageItem] = []
+        self._cards: dict[int, QListWidgetItem] = {}  # id(item) -> its grid entry
+        self._render_queue: deque[ImageItem] = deque()
+        self._queued: set[int] = set()  # id()s in _render_queue
         self._render_timer = QTimer(self, interval=0, timeout=self._render_some)
         self._pool = QThreadPool(self)
+        # Decoding is memory-bound: more threads than this mostly fight over memory and the disk.
+        self._pool.setMaxThreadCount(max(1, min(4, QThread.idealThreadCount())))
         self._emitter = make_emitter(self)
         self._emitter.done.connect(self._on_thumb)
         self._saver: SaveAll | None = None
@@ -252,6 +257,7 @@ class MainWindow(QMainWindow):
             li.setData(ITEM_ROLE, it)
             li.setToolTip(str(path))
             self.grid.addItem(li)
+            self._cards[id(it)] = li
             self._pool.start(ThumbLoad(it, self._emitter))
             added += 1
         if added:
@@ -312,8 +318,12 @@ class MainWindow(QMainWindow):
 
     # ---- previews --------------------------------------------------------
     def _queue_render(self, items):
-        queued = set(map(id, self._render_queue))
-        self._render_queue.extend(it for it in items if it.thumb is not None and id(it) not in queued)
+        new = [it for it in items if it.thumb is not None and id(it) not in self._queued and id(it) in self._cards]
+        if len(new) > 1:  # the cards on screen first
+            view = self.grid.viewport().rect()
+            new.sort(key=lambda it: not view.intersects(self.grid.visualItemRect(self._cards[id(it)])))
+        self._render_queue.extend(new)
+        self._queued.update(map(id, new))
         if self._render_queue:
             self._render_timer.start()
 
@@ -321,7 +331,8 @@ class MainWindow(QMainWindow):
         """Re-render thumbnails a few at a time so the UI stays smooth while sliding."""
         deadline = time.perf_counter() + 0.025
         while self._render_queue and time.perf_counter() < deadline:
-            it = self._render_queue.pop(0)
+            it = self._render_queue.popleft()
+            self._queued.discard(id(it))
             key = _thumb_key(it, self.globals)
             if it.preview_key != key:
                 img = process(it.thumb, it.settings(self.globals), full_size=False, shadow=it.shadow_edit())
@@ -332,11 +343,9 @@ class MainWindow(QMainWindow):
             self._render_timer.stop()
 
     def _refresh_card(self, it: ImageItem):
-        for row in range(self.grid.count()):
-            li = self.grid.item(row)
-            if li.data(ITEM_ROLE) is it:
-                self.grid.update(self.grid.indexFromItem(li))
-                break
+        li = self._cards.get(id(it))
+        if li is not None:
+            self.grid.update(self.grid.indexFromItem(li))
 
     # ---- settings --------------------------------------------------------
     def _on_global(self, key: str, v: int):
@@ -352,6 +361,8 @@ class MainWindow(QMainWindow):
                 mode = BALANCED
             elif self.mode != BEST:
                 QThreadPool.globalInstance().start(ai_jpeg.warm_up)  # load the model before it's needed
+        if mode == BALANCED:
+            ai_jpeg.release()  # hand its GPU memory back; switching back loads it again
         self.mode = mode
         config.settings().setValue(JPEG_MODE_KEY, mode)
         self.mode_switch.set_mode(mode)
@@ -407,8 +418,10 @@ class MainWindow(QMainWindow):
         rows = sorted((self.grid.row(li) for li in self.grid.selectedItems()), reverse=True)
         for row in rows:
             it = self.grid.takeItem(row).data(ITEM_ROLE)
-            self.items.remove(it)
-        self._render_queue = [it for it in self._render_queue if it in self.items]
+            del self.items[row]  # the grid and self.items keep the same order
+            self._cards.pop(id(it), None)
+        self._render_queue = deque(it for it in self._render_queue if id(it) in self._cards)
+        self._queued = set(map(id, self._render_queue))
         self._update_counts()
 
     def _clear(self):
@@ -419,7 +432,9 @@ class MainWindow(QMainWindow):
             return
         self.grid.clear()
         self.items.clear()
+        self._cards.clear()
         self._render_queue.clear()
+        self._queued.clear()
         self._update_counts()
 
     # ---- editor ----------------------------------------------------------
@@ -485,6 +500,7 @@ class MainWindow(QMainWindow):
 
         def finished(saved, errors):
             dlg.reset()
+            ai_jpeg.release()  # Best quality's model, if it was used; the editor loads it again when needed
             msg = f"Saved {saved} of {len(jobs)} image(s) to\n{out_dir}"
             if errors:
                 msg += "\n\nProblems:\n" + "\n".join(f"• {n}: {e}" for n, e in errors[:10])
@@ -508,5 +524,8 @@ class MainWindow(QMainWindow):
         if self._saver is not None and self._saver.isRunning():
             self._saver.cancel()
             self._saver.wait()
+        self._render_timer.stop()
         self._pool.clear()
+        self._pool.waitForDone()  # running thumbnail loads finish before their receiver goes away
+        self.editor.shutdown()
         super().closeEvent(e)
