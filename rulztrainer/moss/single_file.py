@@ -61,14 +61,55 @@ def strip_prefix(state: dict, prefixes: tuple[str, ...]) -> dict:
     return state
 
 
+def _qw_to(w: Q.QuantWeight, device) -> Q.QuantWeight:
+    return Q.QuantWeight(w.fmt, w.qdata.to(device), w.scale.to(device),
+                         w.scale2.to(device) if w.scale2 is not None else None, w.orig_shape, w.group)
+
+
+def quant_target(device, quant_devices=None) -> dict:
+    """install_state's work_device / keep_on_work_device for a model loaded onto `device`: a CUDA device quantizes
+    there and keeps the result; a model staged on the CPU for a split (quant_devices: its GPUs) quantizes on the
+    first of them and comes back to the CPU; "auto" (a text encoder placed later) on the current GPU, back to the CPU.
+    Anything else (no GPU, a CPU model) quantizes on the CPU, as before."""
+    if not torch.cuda.is_available():
+        return {}
+    if device == "auto":
+        return {"work_device": torch.device("cuda", torch.cuda.current_device())}
+    if device is not None and torch.device(device).type == "cuda":
+        return {"work_device": torch.device(device), "keep_on_work_device": True}
+    gpus = [d for d in ([quant_devices] if isinstance(quant_devices, (str, torch.device)) else quant_devices or [])
+            if torch.device(d).type == "cuda"]
+    return {"work_device": torch.device(gpus[0])} if gpus else {}
+
+
 def install_state(model: nn.Module, state: dict, quant: str, dtype=torch.bfloat16, min_dim: int = 1024,
-                  ignore_missing: tuple[str, ...] = (), quant_filter=None) -> None:
+                  ignore_missing: tuple[str, ...] = (), quant_filter=None, work_device=None,
+                  keep_on_work_device: bool = False) -> None:
     """Load `state` into a meta-device model, replacing Linear layers with QuantLinear where appropriate.
 
     quant: "auto" keeps file formats (bf16 stays bf16), "none" dequantizes everything,
     int8 / int8_convrot / nvfp4 converts every eligible Linear (passing quant_filter) to that format.
+
+    `state` is consumed: each Linear's weights are popped from it as they are installed, so the caller's dict does not
+    keep the unquantized weights alive next to the quantized ones (a shallow copy here kept a bf16 Krea 2 whole beside
+    its int8 layers, about 39 GB of RAM). work_device: a CUDA device quantizes (and dequantizes) each layer there, one
+    layer at a time, seconds where the CPU's Hadamard matmuls took minutes; the result comes back to the CPU unless
+    keep_on_work_device (the model will live on that GPU). None: on the CPU, as before.
     """
-    state = dict(state)
+    work = torch.device(work_device) if work_device is not None else None
+    if work is not None and work.type != "cuda":
+        work = None
+
+    def on_work(w):
+        if work is None:
+            return w
+        return _qw_to(w, work) if isinstance(w, Q.QuantWeight) else w.to(work)
+
+    def from_work(w):
+        if work is None or keep_on_work_device:
+            return w
+        return _qw_to(w, "cpu") if isinstance(w, Q.QuantWeight) else w.to("cpu")
+
     n_quant = 0
     handled: set[str] = set()
     for name, module in list(model.named_modules()):
@@ -84,9 +125,11 @@ def install_state(model: nn.Module, state: dict, quant: str, dtype=torch.bfloat1
         if isinstance(w, Q.QuantWeight):
             target = w.fmt if quant == "auto" else quant
             if target != w.fmt:
+                w = on_work(w)
                 w = w.dequantize(torch.float32) if target == "none" else Q.quantize_weight(w.dequantize(torch.float32), target)
+                w = from_work(w.to(dtype) if target == "none" else w)
         elif quant not in ("auto", "none") and Q.can_quantize(w, quant, min_dim)                 and (quant_filter is None or quant_filter(name)):
-            w = Q.quantize_weight(w, quant)
+            w = from_work(Q.quantize_weight(on_work(w), quant))
         parent_name, _, child = name.rpartition(".")
         parent = model.get_submodule(parent_name) if parent_name else model
         if isinstance(w, Q.QuantWeight):
@@ -140,7 +183,9 @@ def unfuse_qkv(state: dict) -> None:
             state[stem + f"{n}.weight"] = p
 
 
-def load_transformer_file(path: str | Path, device, quant: str = "auto", dtype=torch.bfloat16) -> MOSSImageTransformer:
+def load_transformer_file(path: str | Path, device, quant: str = "auto", dtype=torch.bfloat16,
+                          quant_devices=None) -> MOSSImageTransformer:
+    """quant_devices: the GPUs of a model split, when the model is staged on the CPU (they quantize it)."""
     state = read_state(path, dtype)
     state = strip_prefix(state, ("model.diffusion_model.", "diffusion_model."))
     state = {k: v for k, v in state.items() if not k.endswith("comfy_attention.config")}
@@ -151,7 +196,9 @@ def load_transformer_file(path: str | Path, device, quant: str = "auto", dtype=t
     config = transformer_config_from_state(state)
     with torch.device("meta"):
         model = MOSSImageTransformer.from_config(config)
-    install_state(model, state, quant, dtype, ignore_missing=("rope.bands",), quant_filter=DIT_QUANT_FILTER)
+    install_state(model, state, quant, dtype, ignore_missing=("rope.bands",), quant_filter=DIT_QUANT_FILTER,
+                  **quant_target(device, quant_devices))
+    del state
     model.rope.bands = model.rope._default_bands(torch.device("cpu"))
     model = model.to(device).eval().requires_grad_(False)
     log.info("Loaded transformer from %s: %d layers, dim %d, quant=%s", Path(path).name, config["num_layers"],
@@ -160,14 +207,13 @@ def load_transformer_file(path: str | Path, device, quant: str = "auto", dtype=t
 
 
 def transformer_from_hf_state(state: dict[str, torch.Tensor], config: dict, device, quant: str = "none",
-                              dtype=torch.bfloat16) -> MOSSImageTransformer:
-    """Build from diffusers-layout weights (already read), optionally quantizing on load."""
+                              dtype=torch.bfloat16, quant_devices=None) -> MOSSImageTransformer:
+    """Build from diffusers-layout weights (already read; `state` is consumed), optionally quantizing on load."""
     with torch.device("meta"):
         model = MOSSImageTransformer.from_config(config)
-    state = dict(state)
     state.pop("rope.bands", None)
     install_state(model, state, "none" if quant == "auto" else quant, dtype, ignore_missing=("rope.bands",),
-                  quant_filter=DIT_QUANT_FILTER)
+                  quant_filter=DIT_QUANT_FILTER, **quant_target(device, quant_devices))
     model.rope.bands = model.rope._default_bands(torch.device("cpu"))
     return model.to(device).eval().requires_grad_(False)
 
@@ -250,12 +296,26 @@ def load_vae_file(path: str | Path, device):
 
     accepted = set(inspect.signature(AutoencoderKLFlux2.__init__).parameters)
     config = {k: v for k, v in config.items() if k in accepted}  # diffusers versions differ in accepted keys
-    vae = AutoencoderKLFlux2(**config)
-    missing, unexpected = vae.load_state_dict(state, strict=False)
-    missing = [k for k in missing if "num_batches_tracked" not in k]
-    if missing or unexpected:
-        raise ValueError(f"VAE state mismatch. missing={missing[:5]} unexpected={unexpected[:5]}")
+    vae = assign_on_meta(lambda: AutoencoderKLFlux2(**config), state, Path(path).name)
     return vae.to(device, torch.float32).eval().requires_grad_(False)
+
+
+def assign_on_meta(make, state: dict, name: str) -> nn.Module:
+    """make() built on the meta device and given `state`'s tensors (load_state_dict assign=True): no random init of
+    weights that are overwritten anyway. A BatchNorm's num_batches_tracked a file leaves out starts at 0."""
+    with torch.device("meta"):
+        module = make()
+    want = module.state_dict()
+    for k in want:
+        if k.endswith("num_batches_tracked") and k not in state:
+            state[k] = torch.zeros((), dtype=torch.long)
+    missing, unexpected = module.load_state_dict(state, strict=False, assign=True)
+    if missing or unexpected:
+        raise ValueError(f"{name}: VAE state mismatch. missing={missing[:5]} unexpected={unexpected[:5]}")
+    left = [k for k, t in (*module.named_parameters(), *module.named_buffers()) if t.device.type == "meta"]
+    if left:
+        raise ValueError(f"{name}: VAE tensors not in the file: {left[:5]}")
+    return module
 
 
 # ---------------------------------------------------------------- text encoder
@@ -266,17 +326,29 @@ TE_DROP = ("lm_head.", "visual.", "model.visual.", "mtp.", "model.mtp.", "langua
            "model.language_model.mtp.")
 
 
-def build_text_model(state: dict, quant: str = "auto", device="cpu"):
-    """Text-only Qwen3.5-9B from an HF-style (possibly prefixed, possibly quantized) state dict."""
+def take_state(state: dict, drop: tuple[str, ...]) -> dict:
+    """The entries of `state` whose key does not start with `drop`, moved out of it (the caller's dict is emptied, so
+    it does not keep the unquantized weights alive while install_state replaces them)."""
+    out = {}
+    for k in list(state):
+        v = state.pop(k)
+        if not k.startswith(drop):
+            out[k] = v
+    return out
+
+
+def build_text_model(state: dict, quant: str = "auto", device="cpu", work_device=None):
+    """Text-only Qwen3.5-9B from an HF-style (possibly prefixed, possibly quantized) state dict, which is consumed.
+    work_device: where to quantize (quant_target; the model is built on the CPU)."""
     from transformers import Qwen3_5TextConfig, Qwen3_5TextModel
 
     cfg = Qwen3_5TextConfig(**json.loads((HERE / "qwen35_9b_text_config.json").read_text()))
-    state = {k: v for k, v in state.items() if not k.startswith(TE_DROP)}
+    state = take_state(state, TE_DROP)
     state = strip_prefix(state, TE_PREFIXES)
     state = {k: v for k, v in state.items() if not k.startswith("mtp.")}
     with torch.device("meta"):
         model = Qwen3_5TextModel(cfg)
-    install_state(model, state, quant, torch.bfloat16, ignore_missing=("inv_freq",))
+    install_state(model, state, quant, torch.bfloat16, ignore_missing=("inv_freq",), work_device=work_device)
     # rotary buffers were created on the meta device; rebuild them for real (constructor signature varies by version)
     import inspect
 
@@ -291,7 +363,7 @@ def build_text_model(state: dict, quant: str = "auto", device="cpu"):
 
 def load_text_encoder_file(path: str | Path, device: str = "auto", quant: str = "auto"):
     state = read_state(path, torch.bfloat16)
-    model = build_text_model(state, quant, "cpu")
+    model = build_text_model(state, quant, "cpu", work_device=quant_target(device).get("work_device"))
     del state
     return place_text_encoder(model, device)
 

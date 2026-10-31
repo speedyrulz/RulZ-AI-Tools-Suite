@@ -99,7 +99,8 @@ def load_transformer(model_dir: Path, device, quant: str = "auto", dtype=torch.b
     state = {k: v.to(dtype) for k, v in state.items()}
     from .single_file import unfuse_mlp
 
-    sf.install_state(model, unfuse_mlp(state), quant, dtype, quant_filter=QUANT_FILTER)
+    state = unfuse_mlp(state)
+    sf.install_state(model, state, quant, dtype, quant_filter=QUANT_FILTER, **sf.quant_target(device, quant_devices))
     del state
     model.is_distilled = bool(pipeline_config(model_dir).get("sample_sigmas"))
     model = model.to(device).eval().requires_grad_(False)
@@ -122,22 +123,12 @@ def load_text_encoder(model_dir: Path, device: str = "auto", quant: str = "auto"
     from transformers import AutoTokenizer
 
     from ..fibo.loading import place_text_encoder
-    from ..krea2.single_file import build_text_model
-
-    tokenizer = AutoTokenizer.from_pretrained(str(model_dir / "processor"))
-    te_dir = model_dir / "text_encoder"
-    config = json.loads((te_dir / "config.json").read_text(encoding="utf-8"))
-    text_cfg = dict(config.get("text_config", config))
-    rope = text_cfg.pop("rope_scaling", None)
-    if rope is not None and "rope_parameters" not in text_cfg:  # transformers 4.x names in a 5.x config
-        text_cfg["rope_parameters"] = {**rope, "rope_theta": text_cfg.pop("rope_theta", 5000000)}
-    text_cfg.pop("dtype", None)
-    state = moss_loading._read_sharded(te_dir, "model")
+    from ..krea2.single_file import load_hf_text_model
     from .single_file import TE_INT8_MATMUL
 
-    model = build_text_model(state, "none" if quant == "auto" else quant, "cpu", config=text_cfg)
+    tokenizer = AutoTokenizer.from_pretrained(str(model_dir / "processor"))
+    model = load_hf_text_model(model_dir / "text_encoder", "none" if quant == "auto" else quant, device)
     Q.configure_int8(model, TE_INT8_MATMUL)
-    del state
     return place_text_encoder(model, device), tokenizer
 
 

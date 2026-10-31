@@ -644,7 +644,9 @@ bar in the UI (reference checks) and in the status line during training.
 
 Requirements: `insightface` + `onnxruntime-gpu` (face), `mediapipe` (body); `facebook/sam3` is a gated
 Hugging Face model (accept the license, then `hf auth login`), or point `sam3_model` at a local
-transformers-format folder. SAM 3 (3.4 GB) is kept in system RAM and moved to `body_device` only while scoring.
+transformers-format folder. SAM 3 is kept in system RAM and moved to `body_device` only while scoring; on a GPU it runs
+in bf16 (1.7 GB of weights instead of 3.4 GB, a 2.0 GB peak instead of 3.8 GB, person masks within IoU 0.9998 of fp32).
+An image that runs out of GPU memory is segmented on the CPU, and the next one tries the GPU again.
 
 ## Per-image loss watch and per-image learning rate
 
@@ -816,8 +818,9 @@ The scores never enter the loss; they steer data, lr and stopping. Use the same 
 whole run so the series is comparable.
 
 The face detector rescales every image to `face_det_size` and misses a face that fills the frame (a tight headshot
-probe: its box spanned 87% of the image), so when it finds nothing the image is retried at the centre of a canvas
-2x and 4x its size, where the same face is found with confidence 0.9.
+probe: its box spanned 87% of the image), so when it finds nothing the image is retried shrunk to a half and a quarter
+at the centre of a canvas of its own size, where the same face is found with confidence 0.9; the embedding is then
+taken from the full-resolution face.
 
 **Body score** (`body_score`). `appearance` (the default): a DINOv2-base embedding of the *body window*, scored
 like the face as the best cosine match against the references, in percent. The window is the body from the neck to
@@ -1371,7 +1374,9 @@ multiples of 16 (2:3 at 1 MP: 832 x 1248).
 Krea 2's previews and probes decode in 512 px VAE tiles: the Qwen-Image VAE normalizes per pixel, so the tiles give
 the full decode to 0.06 of an 8-bit level (PSNR 68 dB), at +2.0 GB instead of +7.9 GB per megapixel. The Flux2 VAE of
 MOSS-Image and FIBO is not tiled (its GroupNorm and attention see the whole image: tiles would shift tones by 4-7
-levels).
+levels). Previews and probes of all three decode on a bf16 copy of the fp32 VAE, made for the decode: 0.15-0.25 of an
+8-bit level from the fp32 decode (PSNR 53-56 dB), at +1.3 GB instead of +2.0 GB (Krea 2) and +2.55 GB instead of
++3.76 GB (Flux2) at 1 MP, and 25-40% faster. Training latents are still encoded in fp32.
 
 ## Dataset page
 

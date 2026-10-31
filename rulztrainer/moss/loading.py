@@ -59,13 +59,15 @@ def _read_sharded(directory: Path, stem: str, device="cpu") -> dict[str, torch.T
 
 
 def load_transformer(model_dir: Path, device: str | torch.device, dtype=torch.bfloat16,
-                     quant: str = "none") -> MOSSImageTransformer:
+                     quant: str = "none", quant_devices=None) -> MOSSImageTransformer:
+    """quant_devices: the GPUs of a model split, when the model is staged on the CPU (they quantize it)."""
     config = json.loads((model_dir / "transformer" / "config.json").read_text())
     if config.get("_class_name") not in ("MOSImageTransformer", "MOSSImageTransformer"):
         raise ValueError(f"Unsupported transformer class {config.get('_class_name')!r}")
     state = _read_sharded(model_dir / "transformer", "diffusion_pytorch_model")
     state = {k: v.to(dtype) for k, v in state.items()}
-    model = sf.transformer_from_hf_state(state, config, device, quant, dtype)
+    model = sf.transformer_from_hf_state(state, config, device, quant, dtype, quant_devices=quant_devices)
+    del state
     log.info("Loaded transformer: %d layers, dim %d, quant=%s", config["num_layers"], config["dim"], quant)
     return model
 
@@ -83,7 +85,8 @@ def load_text_encoder(model_dir: Path, device: str = "auto", quant: str = "auto"
 
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir / "tokenizer"))
     state = _read_sharded(model_dir / "text_encoder", "model")
-    model = sf.build_text_model(state, "none" if quant == "auto" else quant, "cpu")
+    model = sf.build_text_model(state, "none" if quant == "auto" else quant, "cpu",
+                                work_device=sf.quant_target(device).get("work_device"))
     del state
     return sf.place_text_encoder(model, device), tokenizer
 
@@ -104,9 +107,20 @@ def _use_file(cfg: TrainConfig, field: str) -> bool:
 
 
 def get_transformer(cfg: TrainConfig, model_dir: Path | None, device: str | None = None) -> MOSSImageTransformer:
-    device = device or cfg.device
-    if _use_file(cfg, "transformer_file"):
+    use_file = _use_file(cfg, "transformer_file")
+    if use_file:
         _check_files(cfg, "transformer_file")
+    if cfg.multi_gpu == "model_split" and device is None:
+        # the trainer splits it right after loading: stay on the CPU (loading it whole onto the first GPU first ran
+        # out of memory on a pair of 16 GB cards), quantizing on the split's GPUs, as Krea 2 does
+        from ..multigpu import parse_devices
+
+        gpus = parse_devices(cfg.devices, cfg.device)
+        if use_file:
+            return sf.load_transformer_file(cfg.transformer_file, "cpu", cfg.transformer_quant, quant_devices=gpus)
+        return load_transformer(model_dir, "cpu", quant=cfg.transformer_quant, quant_devices=gpus)
+    device = device or cfg.device
+    if use_file:
         return sf.load_transformer_file(cfg.transformer_file, device, cfg.transformer_quant)
     return load_transformer(model_dir, device, quant=cfg.transformer_quant)
 
@@ -171,19 +185,33 @@ def encode_images(vae, images: torch.Tensor) -> torch.Tensor:
 
 
 def _decode(vae, latents: torch.Tensor) -> torch.Tensor:
-    z = latents.to(vae.device, vae.dtype)
+    z = latents.to(vae.device, torch.float32)  # the latent statistics apply in fp32 (a bf16 VAE gets the result)
     mean = vae.bn.running_mean.view(1, -1, 1, 1).to(z)
-    std = torch.sqrt(vae.bn.running_var.view(1, -1, 1, 1) + vae.config.batch_norm_eps).to(z)
-    z = z * std + mean
+    std = torch.sqrt(vae.bn.running_var.view(1, -1, 1, 1).to(z) + vae.config.batch_norm_eps)
+    z = (z * std + mean).to(vae.dtype)
     b, c, h, w = z.shape
     z = z.reshape(b, c // 4, 2, 2, h, w).permute(0, 1, 4, 2, 5, 3).reshape(b, c // 4, 2 * h, 2 * w)
     return vae.decode(z, return_dict=False)[0]
 
 
+def decode_vae(vae):
+    """The VAE a sample / probe decode runs on: a bf16 copy of an fp32 VAE on a CUDA device (built for the decode
+    and dropped after it), else the VAE itself. Encoding (the training latents) keeps the fp32 VAE. bf16 autocast was
+    tried first: GroupNorm stays fp32 under it, and so do most activations, so it saved only 10% of the peak."""
+    if vae.dtype == torch.float32 and vae.device.type == "cuda":
+        return bf16_copy(vae)
+    return vae
+
+
 @torch.no_grad()
 def decode_latents(vae, latents: torch.Tensor) -> torch.Tensor:
-    """Inverse of encode_images. Returns images [B,3,H,W] in [-1,1]."""
-    return _decode(vae, latents).clamp(-1, 1)
+    """Inverse of encode_images. Returns images [B,3,H,W] in [-1,1].
+
+    Decoded whole (never tiled: this VAE's GroupNorm and attention see the whole image, tiles shifted tones by 4-7
+    levels) on a bf16 copy of the VAE (decode_vae): the fp32 decode to 0.16 of an 8-bit level on average (PSNR 56 dB,
+    measured at 1024 x 1024, 832 x 1248 and 1248 x 1248), with a peak of +2.55 GB instead of +3.76 GB at 1 MP and
+    +3.7 GB instead of +5.6 GB at 1.5 MP (the 160 MB copy included), and 35-40% faster."""
+    return _decode(decode_vae(vae), latents).float().clamp(-1, 1)
 
 
 def decode_latents_grad(vae, latents: torch.Tensor) -> torch.Tensor:
@@ -193,12 +221,27 @@ def decode_latents_grad(vae, latents: torch.Tensor) -> torch.Tensor:
     return _decode(vae, latents).float()
 
 
+def bf16_copy(vae):
+    """A frozen bf16 copy of a VAE, built on the meta device and filled with bf16 casts of the weights one tensor at
+    a time (a deepcopy first made a second fp32 VAE on the GPU, about 0.5 GB more for a moment). Buffers keep their
+    dtype: the Flux2 VAE's latent statistics (bn.running_mean / running_var) stay fp32."""
+    import copy
+
+    with torch.device("meta"):
+        out = type(vae).from_config(vae.config)
+    params = {k for k, _ in vae.named_parameters()}
+    state = {k: (v.to(torch.bfloat16) if k in params and v.is_floating_point() else v)
+             for k, v in vae.state_dict().items()}
+    out.load_state_dict(state, strict=True, assign=True)
+    if any(t.device.type == "meta" for t in (*out.parameters(), *out.buffers())):  # a buffer outside the state dict
+        out = copy.deepcopy(vae).to(torch.bfloat16)
+    return out.eval().requires_grad_(False)
+
+
 def grad_vae(vae):
     """A bf16 copy of the VAE with gradient checkpointing, for decode_latents_grad (the shared fp32 VAE that
     samples and probes use stays untouched)."""
-    import copy
-
-    out = copy.deepcopy(vae).to(torch.bfloat16).eval().requires_grad_(False)
+    out = bf16_copy(vae)
     out.enable_gradient_checkpointing()
     return out
 

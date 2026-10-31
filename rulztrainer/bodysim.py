@@ -60,8 +60,10 @@ class SilhouetteScorer:
         if progress:
             progress("Loading SAM 3 weights (3.4 GB)...", None)
         self.processor = Sam3Processor.from_pretrained(model_id)
-        self.model = Sam3Model.from_pretrained(model_id, dtype=torch.float32).eval()
         self.device = device if (device == "cpu" or torch.cuda.is_available()) else "cpu"
+        # bf16 on a GPU (1.7 GB instead of 3.4 GB); fp32 on the CPU, where bf16 convolutions are slow
+        self.dtype = torch.float32 if self.device == "cpu" else torch.bfloat16
+        self.model = Sam3Model.from_pretrained(model_id, dtype=self.dtype).eval()
         self.threshold = threshold
         self.held = False  # True inside hold(): the model stays on the GPU between images
         log.info("SAM 3 loaded from %s (%.1fM params), scoring on %s",
@@ -93,29 +95,45 @@ class SilhouetteScorer:
         other.processor = copy.deepcopy(self.processor)
         other.model = copy.deepcopy(self.model.to("cpu")).eval()
         other.device = device
+        other.dtype = self.torch.float32 if device == "cpu" else self.torch.bfloat16
         return other
 
+    def _segment(self, image, device: str, h: int, w: int) -> dict:
+        torch = self.torch
+        dtype = torch.float32 if device == "cpu" else getattr(self, "dtype", torch.float32)
+        inputs = self.processor(images=image, text="person", return_tensors="pt")
+        self.model.to(device, dtype)
+        inputs = {k: (v.to(device, dtype) if torch.is_tensor(v) and v.is_floating_point() else
+                      v.to(device) if hasattr(v, "to") else v) for k, v in inputs.items()}
+        with torch.no_grad():
+            out = self.model(**inputs)
+        for k, v in list(out.items()):  # post-processing (thresholds, resizing) in fp32
+            if torch.is_tensor(v) and v.is_floating_point():
+                out[k] = v.float()
+        return self.processor.post_process_instance_segmentation(out, threshold=self.threshold,
+                                                                 target_sizes=[(h, w)])[0]
+
     def person_mask(self, image) -> np.ndarray | None:
-        """Largest 'person' instance mask as a bool [H, W] array, or None."""
+        """Largest 'person' instance mask as a bool [H, W] array, or None. An image that runs out of GPU memory is
+        segmented on the CPU; the next one tries the GPU again (a transient peak, e.g. a probe beside the model,
+        used to send every later image to the CPU for the rest of the run)."""
         torch = self.torch
         arr = np.asarray(image)
         h, w = arr.shape[:2]
-        inputs = self.processor(images=image, text="person", return_tensors="pt")
+        res, oom = None, False
         try:
-            self.model.to(self.device)
-            inputs = {k: (v.to(self.device) if hasattr(v, "to") else v) for k, v in inputs.items()}
-            with torch.no_grad():
-                out = self.model(**inputs)
-            res = self.processor.post_process_instance_segmentation(out, threshold=self.threshold,
-                                                                    target_sizes=[(h, w)])[0]
+            res = self._segment(image, self.device, h, w)
         except torch.cuda.OutOfMemoryError:
-            log.warning("SAM 3 ran out of GPU memory; retrying on CPU")
-            self.device = "cpu"
-            return self.person_mask(image)
+            if self.device == "cpu":
+                raise
+            oom = True
         finally:
-            if self.device != "cpu" and not self.held:
+            if self.device != "cpu" and (oom or not self.held):
                 self.model.to("cpu")
                 torch.cuda.empty_cache()
+        if oom:  # outside the except block: its traceback no longer holds the failed attempt's GPU tensors
+            log.warning("SAM 3 ran out of GPU memory; this image is segmented on the CPU")
+            res = self._segment(image, "cpu", h, w)
         masks = res.get("masks")
         if masks is None or len(masks) == 0:
             return None
@@ -525,7 +543,8 @@ class AppearanceScorer:
         if self.progress:
             self.progress("Loading DINOv2...", None)
         self.processor = AutoImageProcessor.from_pretrained(path)
-        self.model = AutoModel.from_pretrained(path).to(self.device).eval().requires_grad_(False)
+        self.dtype = torch.float32 if self.device == "cpu" else torch.bfloat16  # bf16 on a GPU: half the memory
+        self.model = AutoModel.from_pretrained(path, dtype=self.dtype).to(self.device).eval().requires_grad_(False)
 
     def window(self, path: str | Path):
         """(body window image, coverage) of an image (body_window), or None without shoulders and hips."""
@@ -545,7 +564,7 @@ class AppearanceScorer:
         mean = np.asarray(getattr(self.processor, "image_mean", None) or _IMAGENET_MEAN, dtype=np.float32)
         std = np.asarray(getattr(self.processor, "image_std", None) or _IMAGENET_STD, dtype=np.float32)
         arr = (np.asarray(square.resize((224, 224), Image.BICUBIC), dtype=np.float32) / 255.0 - mean) / std
-        x = torch.from_numpy(arr.transpose(2, 0, 1).copy())[None].to(self.device)
+        x = torch.from_numpy(arr.transpose(2, 0, 1).copy())[None].to(self.device, self.model.dtype)
         v = self.model(pixel_values=x).last_hidden_state[:, 0].float()  # the CLS token
         return torch.nn.functional.normalize(v, dim=-1)[0].cpu().numpy()
 

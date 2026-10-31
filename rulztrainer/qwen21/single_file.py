@@ -107,7 +107,7 @@ def load_transformer_file(path: str | Path, device, quant: str = "auto", dtype=t
             quant = resolve_quant("auto", quant_devices or device)
     with torch.device("meta"):
         model = QwenImage21Transformer.from_config(config)
-    sf.install_state(model, state, quant, dtype, quant_filter=QUANT_FILTER)
+    sf.install_state(model, state, quant, dtype, quant_filter=QUANT_FILTER, **sf.quant_target(device, quant_devices))
     del state
     model.is_distilled = "turbo" in Path(path).name.lower()
     model = model.to(device).eval().requires_grad_(False)
@@ -209,7 +209,8 @@ def load_text_encoder_file(path: str | Path, device: str = "auto", quant: str = 
     from ..krea2.single_file import build_text_model
 
     state = sf.read_state(path, torch.bfloat16)
-    model = build_text_model(state, quant, "cpu", config=text_config())
+    model = build_text_model(state, quant, "cpu", config=text_config(),
+                             work_device=sf.quant_target(device).get("work_device"))
     Q.configure_int8(model, TE_INT8_MATMUL)
     n_q = sum(1 for m in model.modules() if isinstance(m, Q.QuantLinear))
     log.info("Loaded Qwen3-VL-8B text encoder from %s (%d layers%s)", Path(path).name,
