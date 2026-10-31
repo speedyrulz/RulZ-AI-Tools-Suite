@@ -92,7 +92,6 @@ QMainWindow, #Page { background: %(bg)s; }
 QSpinBox#Value { background: transparent; border: 1px solid transparent; border-radius: 6px; padding: 2px 4px; min-height: 0px; }
 QSpinBox#Value:hover { border-color: %(border)s; background: %(input)s; }
 QSpinBox#Value:focus { border-color: %(accent)s; background: %(input)s; color: %(text)s; }
-QSpinBox#Value::up-button, QSpinBox#Value::down-button { width: 0px; height: 0px; border: 0; image: none; subcontrol-origin: border; }
 #DropHint { color: %(muted)s; font-size: 15px; border: 2px dashed %(border)s; border-radius: 16px; }
 #DropHint[active="true"] { border-color: %(accent)s; color: %(text)s; background: %(select)s; }
 
@@ -138,6 +137,13 @@ QToolTip { background: %(card)s; color: %(text)s; border: 1px solid %(border)s; 
 QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox {
     background: %(input)s; border: 1px solid %(border)s; border-radius: 6px; padding: 5px 8px; min-height: 18px;
 }
+/* Every spin box in the app has no arrow buttons; without this, the styled box still reserves room for
+   them and the text field collapses to nothing. The inner text field also mustn't get the QLineEdit box. */
+QSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+    width: 0px; height: 0px; border: 0; image: none; subcontrol-origin: border;
+}
+QAbstractSpinBox QLineEdit { background: transparent; border: none; padding: 0px 7px; min-height: 0px; }
+QSpinBox#Value QLineEdit { padding: 0px; }
 QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus, QSpinBox:focus { border-color: %(accent)s; }
 QComboBox QAbstractItemView { background: %(card)s; border: 1px solid %(border)s; selection-background-color: %(hover)s; }
 QCheckBox { spacing: 8px; }
