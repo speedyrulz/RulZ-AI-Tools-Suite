@@ -23,6 +23,7 @@ on:
       - 'training-captioner-v*'
       - 'clip-extractor-v*'
       - 'rulz-image-crawler-v*'
+      - 'image-preparer-v*'
   pull_request:
     paths: ['apps/**', '.github/workflows/apps.yml']
 
@@ -50,7 +51,7 @@ jobs:
             [rulz-trainer]=RulzTrainer [image-organizer]=RulZ-Image-Organizer
             [image-tournament]=RulZ-Image-Tournament [llm-suite]=rulz-llm-suite [coding-agent]=rulz-coding-agent
             [training-captioner]=Rulz-Training-Captioner [clip-extractor]=rulz-simple-video-clip-extractor
-            [rulz-image-crawler]=rulz-image-crawler
+            [rulz-image-crawler]=rulz-image-crawler [image-preparer]=RulZ-Image-Preparer
           )
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             tag="${GITHUB_REF#refs/tags/}"
@@ -103,6 +104,7 @@ jobs:
             'training-captioner' = @{ dir = 'Rulz-Training-Captioner'; name = 'Rulz Training Captioner'; kind = 'source' }
             'clip-extractor'     = @{ dir = 'rulz-simple-video-clip-extractor'; name = 'RulZ Simple Video Clip Extractor'; kind = 'python' }
             'rulz-image-crawler' = @{ dir = 'rulz-image-crawler'; name = 'RulZ Image Crawler'; kind = 'source' }
+            'image-preparer'     = @{ dir = 'RulZ-Image-Preparer'; name = 'RulZ Image Preparer'; kind = 'source' }
           }
           $a = $apps[$env:APP]
           if (-not $a) { throw "Unknown app '$env:APP'" }
@@ -117,6 +119,7 @@ jobs:
             'image-organizer'  { (Select-String -Path "$env:DIR/rulz/config.py" -Pattern 'APP_VERSION\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value }
             'image-tournament' { (Select-String -Path "$env:DIR/src/Program.cs" -Pattern 'AssemblyVersion\("(\d+\.\d+\.\d+)').Matches[0].Groups[1].Value }
             'clip-extractor'   { (Select-String -Path "$env:DIR/simplecut/__init__.py" -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value }
+            'image-preparer'   { (Select-String -Path "$env:DIR/rulz/config.py" -Pattern 'APP_VERSION\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value }
             'rulz-image-crawler' { (Select-String -Path "$env:DIR/crawler_app/__init__.py" -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value }
             { $_ -in 'llm-suite', 'coding-agent' } { (Get-Content "$env:DIR/package.json" -Raw | ConvertFrom-Json).version }
             default { '' }   # source apps are released from the branch; the tag is the version
