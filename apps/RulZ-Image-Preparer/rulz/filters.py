@@ -3,6 +3,7 @@
 Everything works in CIE Lab: L is lightness (detail, sharpness), a/b are color. Order:
 1. JPEG artifact removal - blocking, ringing and blocky color. "Balanced" is a fast classic
    filter; "Best quality" is an AI model run on the GPU (ai_jpeg.py).
+1b. Shadow lift in painted areas (shadows.py), before the noise steps so they clean what it reveals.
 2. Color noise removal - smooths a/b only (see remove-color-noise notes below).
 3. Detail recovery - thresholded sharpening of L to win back crispness lost in step 1.
 """
@@ -111,18 +112,21 @@ def is_noop(settings: dict) -> bool:
     return not any(settings.get(k, 0) > 0 for k in ADJUSTMENTS)
 
 
-def process(img: np.ndarray, settings: dict, mode: str = BALANCED, full_size: bool = True) -> np.ndarray:
+def process(img: np.ndarray, settings: dict, mode: str = BALANCED, full_size: bool = True,
+            shadow=None) -> np.ndarray:
     """Return a cleaned copy of a BGR/BGRA/gray image (8-bit, 16-bit or float).
 
     settings maps adjustment name -> strength 0..100. full_size=False marks a shrunken preview:
     JPEG blocks and fine detail don't survive shrinking, so those two steps are skipped there.
+    shadow is the picture's shadows.ShadowEdit (painted areas to lift), or None.
     """
-    if img is None or is_noop(settings):
+    shadow = shadow if shadow is not None and shadow.active else None
+    if img is None or (is_noop(settings) and shadow is None):
         return img
     color = settings.get("color", 0)
     jpeg = settings.get("jpeg", 0) if full_size else 0
     detail = settings.get("detail", 0) if full_size else 0
-    if not (color or jpeg or detail):
+    if not (color or jpeg or detail or shadow):
         return img
 
     gray = img.ndim == 2 or img.shape[2] == 1
@@ -133,6 +137,14 @@ def process(img: np.ndarray, settings: dict, mode: str = BALANCED, full_size: bo
         f = cv2.cvtColor(f.reshape(f.shape[:2]), cv2.COLOR_GRAY2BGR)
     if jpeg and mode == BEST:
         f = np.ascontiguousarray(_jpeg_best(f, jpeg))
+    if jpeg and mode != BEST and shadow:  # lift the cleaned picture, not its JPEG blocks
+        lab = cv2.cvtColor(f, cv2.COLOR_BGR2Lab)
+        _jpeg_balanced(lab, jpeg)
+        f, jpeg = cv2.cvtColor(lab, cv2.COLOR_Lab2BGR), 0
+    if shadow:
+        from .shadows import lift_shadows
+
+        f = lift_shadows(f, shadow)
     lab = cv2.cvtColor(f, cv2.COLOR_BGR2Lab)
 
     if jpeg and mode != BEST:

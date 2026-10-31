@@ -74,19 +74,21 @@ class AdjustRow(QWidget):
     changed = Signal(str, int)  # key, value
     reset = Signal(str)
 
-    def __init__(self, key: str, with_reset: bool = False, parent=None):
+    def __init__(self, key: str, with_reset: bool = False, parent=None, label: str | None = None,
+                 tip: str | None = None):
         super().__init__(parent)
         self.key = key
+        tip = tip or TIPS[key]
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(10)
-        self.label = QLabel(ADJUSTMENTS[key][0])
+        self.label = QLabel(label or ADJUSTMENTS[key][0])
         self.label.setFixedWidth(170)
-        self.label.setToolTip(TIPS[key])
+        self.label.setToolTip(tip)
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setRange(0, 100)
         self.slider.setMinimumWidth(140)
-        self.slider.setToolTip(TIPS[key])
+        self.slider.setToolTip(tip)
         self.slider.valueChanged.connect(self._moved)
         self.value = ValueBox()
         self.value.valueChanged.connect(self.slider.setValue)

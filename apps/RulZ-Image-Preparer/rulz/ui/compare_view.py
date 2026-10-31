@@ -1,19 +1,28 @@
-"""Before/after viewer: side-by-side panes or a draggable split slider, with shared zoom and pan."""
+"""Before/after viewer: side-by-side panes or a draggable split slider, with shared zoom and pan.
+
+In paint mode, left-dragging paints (or erases) shadow areas on the picture; right- or middle-dragging
+still pans. The painted areas show as a red tint on the original.
+"""
 from __future__ import annotations
 
+import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import QWidget
 
+from ..shadows import ShadowEdit, Stroke, render_mask
 from .theme import C
 
 SIDE, SLIDER = "side", "slider"
+PAINT, ERASE = "paint", "erase"
 GAP = 6
 MIN_ZOOM, MAX_ZOOM = 0.02, 32.0
+OVERLAY_MAX_SIDE = 1024
 
 
 class CompareView(QWidget):
     zoomChanged = Signal(float)  # current scale (1.0 = 100%)
+    stroked = Signal(object)  # a finished shadows.Stroke
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -27,8 +36,15 @@ class CompareView(QWidget):
         self._zoom: float | None = None  # None = fit to window
         self._center = QPointF()  # image coordinates shown at each pane's center
         self._split = 0.5  # slider position, fraction of the width
-        self._drag: str | None = None  # "pan" or "split"
+        self._drag: str | None = None  # "pan", "split" or "paint"
         self._last = QPointF()
+        self.tool: str | None = None  # PAINT, ERASE or None
+        self.brush = 0.05  # radius as a fraction of the picture's longer side
+        self.show_areas = False
+        self._edit: ShadowEdit | None = None
+        self._overlay: QPixmap | None = None
+        self._stroke: list[QPointF] = []  # picture coordinates (pixels of the shown pixmap)
+        self._mouse: QPointF | None = None
 
     # ---- content ---------------------------------------------------------
     def set_images(self, orig: QPixmap | None, proc: QPixmap | None, keep_view: bool = False):
@@ -40,6 +56,8 @@ class CompareView(QWidget):
             self._zoom = None
             if orig is not None:
                 self._center = QPointF(orig.width() / 2, orig.height() / 2)
+        if self._edit is not None:
+            self.set_shadow(self._edit)  # the overlay follows the new picture size
         self._emit_zoom()
         self.update()
 
@@ -55,6 +73,55 @@ class CompareView(QWidget):
         self.mode = mode
         self._emit_zoom()
         self.update()
+
+    # ---- shadow painting -------------------------------------------------
+    def set_tool(self, tool: str | None):
+        self.tool = tool
+        self._stroke = []
+        if self._drag == "paint":
+            self._drag = None
+        self.setCursor(Qt.BlankCursor if tool else Qt.OpenHandCursor)
+        self.update()
+
+    def set_brush(self, fraction: float):
+        self.brush = fraction
+        self.update()
+
+    def set_show_areas(self, on: bool):
+        self.show_areas = on
+        self.update()
+
+    def set_shadow(self, edit: ShadowEdit | None):
+        """The painted areas to show; their tint is redrawn at a modest size and scaled up."""
+        self._edit = edit
+        self._overlay = None
+        if edit is not None and edit.strokes and self._orig is not None:
+            w, h = self._orig.width(), self._orig.height()
+            f = min(1.0, OVERLAY_MAX_SIDE / max(w, h))
+            ow, oh = max(1, round(w * f)), max(1, round(h * f))
+            m = render_mask(edit, oh, ow, feather=False)
+            rgba = np.zeros((oh, ow, 4), np.uint8)
+            rgba[..., 0] = 237
+            rgba[..., 3] = (m * 110).astype(np.uint8)
+            q = QImage(rgba.data, ow, oh, rgba.strides[0], QImage.Format_RGBA8888)
+            self._overlay = QPixmap.fromImage(q.copy())
+        self.update()
+
+    def _to_picture(self, pos: QPointF) -> QPointF:
+        t = self._target(self._pane_at(pos))
+        s = self.scale()
+        return QPointF((pos.x() - t.left()) / s, (pos.y() - t.top()) / s)
+
+    def _brush_px(self) -> float:
+        """Brush radius in picture pixels."""
+        return self.brush * max(self._orig.width(), self._orig.height())
+
+    def _finish_stroke(self):
+        if self._stroke and self._orig is not None:
+            w, h = self._orig.width(), self._orig.height()
+            pts = tuple((min(1.0, max(0.0, p.x() / w)), min(1.0, max(0.0, p.y() / h))) for p in self._stroke)
+            self.stroked.emit(Stroke(pts, self.brush, self.tool == ERASE))
+        self._stroke = []
 
     # ---- geometry --------------------------------------------------------
     def _panes(self) -> list[QRectF]:
@@ -138,6 +205,7 @@ class CompareView(QWidget):
         if self.mode == SIDE:
             left, right = self._panes()
             self._draw(p, left, self._orig)
+            self._areas(p, left)
             self._draw(p, right, proc)
             self._label(p, left, "Original", Qt.AlignLeft)
             self._label(p, right, "Processing…" if self._busy else "Processed", Qt.AlignLeft)
@@ -145,11 +213,46 @@ class CompareView(QWidget):
             pane = self._panes()[0]
             sx = self._split_x()
             self._draw(p, pane, proc)
-            self._draw(p, QRectF(pane.left(), pane.top(), sx - pane.left(), pane.height()), self._orig, pane)
+            orig_clip = QRectF(pane.left(), pane.top(), sx - pane.left(), pane.height())
+            self._draw(p, orig_clip, self._orig, pane)
+            self._areas(p, orig_clip, pane)
             self._label(p, pane, "Original", Qt.AlignLeft)
             self._label(p, pane, "Processing…" if self._busy else "Processed", Qt.AlignRight)
             self._divider(p, sx)
+        self._brush_cursor(p)
         p.end()
+
+    def _areas(self, p: QPainter, clip: QRectF, pane: QRectF | None = None):
+        """The painted areas (and the stroke being painted) as a red tint over the original."""
+        if not (self.show_areas or self.tool) or (self._overlay is None and not self._stroke):
+            return
+        target = self._target(pane or clip)
+        p.save()
+        p.setClipRect(clip)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        if self._overlay is not None:
+            p.drawPixmap(target, self._overlay, QRectF(self._overlay.rect()))
+        if self._stroke:
+            s = self.scale()
+            pts = [QPointF(target.left() + q.x() * s, target.top() + q.y() * s) for q in self._stroke]
+            color = QColor(0, 0, 0, 150) if self.tool == ERASE else QColor(237, 0, 13, 110)
+            p.setRenderHint(QPainter.Antialiasing, True)
+            p.setPen(QPen(color, 2 * self._brush_px() * s, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            if len(pts) == 1:
+                p.drawPoint(pts[0])
+            else:
+                p.drawPolyline(pts)
+        p.restore()
+
+    def _brush_cursor(self, p: QPainter):
+        if not self.tool or self._mouse is None or self._orig is None:
+            return
+        r = self._brush_px() * self.scale()
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setBrush(Qt.NoBrush)
+        for color, width in ((QColor(0, 0, 0, 160), 3), (QColor("#ffffff"), 1.2)):
+            p.setPen(QPen(color, width, Qt.DashLine if self.tool == ERASE else Qt.SolidLine))
+            p.drawEllipse(self._mouse, r, r)
 
     def _draw(self, p: QPainter, clip: QRectF, pm: QPixmap, pane: QRectF | None = None):
         target = self._target(pane or clip)
@@ -198,7 +301,11 @@ class CompareView(QWidget):
 
     def mousePressEvent(self, e):
         pos = e.position()
-        if e.button() == Qt.LeftButton and self._near_split(pos):
+        if e.button() == Qt.LeftButton and self.tool and self._orig is not None:
+            self._drag = "paint"
+            self._stroke = [self._to_picture(pos)]
+            self.update()
+        elif e.button() == Qt.LeftButton and self._near_split(pos):
             self._drag = "split"
         elif e.button() in (Qt.LeftButton, Qt.MiddleButton, Qt.RightButton):
             self._drag = "pan"
@@ -207,7 +314,14 @@ class CompareView(QWidget):
 
     def mouseMoveEvent(self, e):
         pos = e.position()
-        if self._drag == "split":
+        self._mouse = pos
+        if self._drag == "paint":
+            q = self._to_picture(pos)
+            # keep points a few screen pixels apart so long strokes stay light
+            if (q - self._stroke[-1]).manhattanLength() * self.scale() >= 3:
+                self._stroke.append(q)
+            self.update()
+        elif self._drag == "split":
             self._split = max(0.0, min(1.0, pos.x() / max(1, self.width())))
             self.update()
         elif self._drag == "pan" and self._orig is not None:
@@ -217,15 +331,32 @@ class CompareView(QWidget):
             self._center -= (pos - self._last) / self.scale()
             self._clamp()
             self.update()
+        elif self.tool:
+            self.setCursor(Qt.BlankCursor)
+            self.update()
         else:
             self.setCursor(Qt.SplitHCursor if self._near_split(pos) else Qt.OpenHandCursor)
         self._last = pos
 
     def mouseReleaseEvent(self, e):
+        if self._drag == "paint":
+            self._finish_stroke()
         self._drag = None
-        self.setCursor(Qt.SplitHCursor if self._near_split(e.position()) else Qt.OpenHandCursor)
+        if self.tool:
+            self.setCursor(Qt.BlankCursor)
+            self.update()
+        else:
+            self.setCursor(Qt.SplitHCursor if self._near_split(e.position()) else Qt.OpenHandCursor)
+
+    def leaveEvent(self, e):
+        self._mouse = None
+        self.update()
+        super().leaveEvent(e)
 
     def mouseDoubleClickEvent(self, e):
+        if self.tool and e.button() == Qt.LeftButton:
+            self.mousePressEvent(e)  # a quick second dab, not a zoom
+            return
         if self._near_split(e.position()):
             self._split = 0.5
             self.update()

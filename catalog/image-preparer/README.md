@@ -23,6 +23,22 @@ JPEG artifact removal has two modes (switch next to its slider):
   app offers a one-time setup: PyTorch with CUDA (~3 GB) and the model file (288 MB, checksum
   verified), stored in `%LOCALAPPDATA%\RulZ\Image Preparer\models`.
 
+## Shadow areas
+
+Open a photo and paint over a shadow to brighten it to the light level around it:
+
+- **Paint** (`B`) and **Erase** (`E`) — left-drag on the picture; right-drag still moves it.
+  **Brush** sets the size (`[` / `]`), **Undo** (`Ctrl+Z`) takes back the last stroke, **Clear**
+  removes them all. **Show areas** tints what you painted red on the original.
+- **Shadow lift** — how far the shadow is brightened (100 matches its surroundings).
+- **Edge blend** — how softly the painted area fades into the rest of the picture.
+
+It doesn't just raise brightness: the app separates the lighting from the surface detail, measures
+how deep the shadow is, and undoes it the way extra light would, so texture and contrast are kept,
+dark and bright things in the shadow keep their difference, lit parts you brush over are left alone,
+and a blue shadow tint is matched to the surroundings. Painted areas are per photo and are applied by
+**Save all** and by Auto crop's clean-up option. They aren't kept after the app closes.
+
 ## Auto crop
 
 Crops pictures to something you describe, such as `face` or `dog`, found by AI. Select pictures
@@ -62,7 +78,7 @@ NVIDIA GPU (about 2 GB of video memory).
   - **Side by side** or **Slider** (drag the divider). Press `V` to switch.
   - Scroll to zoom, drag to pan, double-click for 100% / fit. Both sides stay in sync.
   - `←` / `→` move between photos, `Esc` goes back.
-- Thumbnails only show color noise removal — JPEG blocks and fine detail are too small to see at
+- Thumbnails only show color noise removal and painted shadow areas — JPEG blocks and fine detail are too small to see at
   that size. Open a photo to judge those.
 - **Save all…** writes every image with its own settings to a folder you pick. File names and
   formats are kept; a file is never written over its own original (`_prepared` is added instead).
