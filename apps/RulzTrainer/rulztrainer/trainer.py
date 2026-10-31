@@ -131,7 +131,9 @@ def free_cuda():
 
 
 def unload_model(model) -> None:
-    """Release a model fully, including accelerate dispatch hooks, so its VRAM is returned."""
+    """Release a model fully, including accelerate dispatch hooks, so its VRAM is returned. Its tensors go to the
+    meta device (dropped, not copied to RAM first: a 19 GB text encoder would otherwise pass through system memory);
+    a model that cannot move there is moved to the CPU as before."""
     try:
         from accelerate.hooks import remove_hook_from_submodules
 
@@ -139,9 +141,12 @@ def unload_model(model) -> None:
     except Exception:  # noqa: BLE001
         pass
     try:
-        model.to("cpu")
+        model.to("meta")
     except Exception:  # noqa: BLE001
-        pass
+        try:
+            model.to("cpu")
+        except Exception:  # noqa: BLE001
+            pass
     del model
     free_cuda()
 
@@ -328,6 +333,11 @@ class Trainer(RaceParallelMixin):
         self.device = torch.device(cfg.device)
         self.arch = get_arch(cfg)  # confirmed against the model's transformer config once the model dir is resolved
         self.vae = None
+        # the sampling VAE waits in pinned RAM between rounds (_park_vae) instead of holding training memory:
+        # vae_parked is its GPU while it is parked (None while it is on it), vae_park_rows its weights' pinned copies
+        # [(module, name, is_buffer, CPU tensor)], made once (the VAE is frozen, nothing is copied back)
+        self.vae_parked: str | None = None
+        self.vae_park_rows: list | None = None
         self.kept: dict[int, list[int]] = {}  # id(model copy) -> blocks keeping their activations
         self.ema = None  # LoraEMA: the weight average saves, samples and probes use (lora_ema)
         self.resumed_ema = None  # its state from a resumed training state
@@ -429,11 +439,59 @@ class Trainer(RaceParallelMixin):
         device = norm_device(device)
         if self.vae is None:
             return None
+        if getattr(self, "vae_parked", None) == device:
+            self._unpark_vae()
         if norm_device(self.vae.device) == device:
             return self.vae
         if device not in self.vaes:
             self.vaes[device] = clone_to(self.vae, device).eval().requires_grad_(False)
         return self.vaes[device]
+
+    @torch.no_grad()
+    def _park_vae(self) -> None:
+        """The sampling VAE to pinned RAM until the next render needs it (_vae_on brings it back): it is used only
+        for samples, probes and other decodes, and on the GPU it would cost the training steps that memory. Not with
+        the identity loss (its decoder may be this VAE, used every step) or a VAE that is not on a GPU."""
+        from .blockswap import _set
+
+        if getattr(self, "vae", None) is None or getattr(self, "vae_parked", None) is not None \
+                or getattr(self, "id_loss", None) is not None:
+            return
+        home = norm_device(self.vae.device)
+        if not home.startswith("cuda"):
+            return
+        if getattr(self, "vae_park_rows", None) is None:
+            rows = []
+            for mod in self.vae.modules():
+                tensors = [(n, False, p) for n, p in mod.named_parameters(recurse=False) if p is not None]
+                tensors += [(n, True, b) for n, b in mod.named_buffers(recurse=False) if b is not None]
+                for name, is_buf, t in tensors:
+                    cpu = t.detach().to("cpu")
+                    try:
+                        cpu = cpu.pin_memory()
+                    except RuntimeError:  # no pinned memory left: pageable works, just slower to copy
+                        pass
+                    rows.append((mod, name, is_buf, cpu))
+            self.vae_park_rows = rows
+        for mod, name, is_buf, cpu in self.vae_park_rows:
+            _set(mod, name, is_buf, cpu)  # the GPU copies are freed (the allocator reuses them for training)
+        self.vae_parked = home
+
+    def _home_vae(self):
+        """The sampling VAE itself, on its own GPU (brought back from RAM if it is parked)."""
+        self._unpark_vae()
+        return self.vae
+
+    @torch.no_grad()
+    def _unpark_vae(self) -> None:
+        from .blockswap import _set
+
+        if getattr(self, "vae_parked", None) is None:
+            return
+        dev = torch.device(self.vae_parked)
+        for mod, name, is_buf, cpu in self.vae_park_rows:
+            _set(mod, name, is_buf, cpu.to(dev, non_blocking=cpu.is_pinned()))
+        self.vae_parked = None
 
     # ------------------------------------------------------------ stages
     def _needs_face_analysis(self) -> bool:
@@ -852,6 +910,7 @@ class Trainer(RaceParallelMixin):
             self.body_scorer = self._make_body_scorer()
             self.controller = self._make_controller(items)
         self.id_loss = self._make_id_loss()
+        self._park_vae()  # to RAM until the first sample or probe (kept on the GPU with the identity loss)
         if torch.cuda.is_available():
             from .multigpu import gpu_memory_summary
 
@@ -979,9 +1038,11 @@ class Trainer(RaceParallelMixin):
                     and bool(regions.prior.any())):
                 # prior preservation: keep background cells close to what the base model (LoRA off) predicts
                 lora_mod.set_multiplier(rinj, 0.0)
-                with torch.no_grad():
-                    base_pred = rmodel(noisy_in, sigma * 1000.0, embeds, mask).float()
-                lora_mod.set_multiplier(rinj, 1.0)
+                try:
+                    with torch.no_grad():
+                        base_pred = rmodel(noisy_in, sigma * 1000.0, embeds, mask).float()
+                finally:  # an out-of-memory retry must not train with the LoRA switched off
+                    lora_mod.set_multiplier(rinj, 1.0)
                 pm = regions.prior.to(rdev).float()
                 prior = ((pred - base_pred).pow(2) * pm).sum(dim=(1, 2, 3)) / (pm.sum(dim=(1, 2, 3)) * pred.shape[1]).clamp(min=1)
                 per = per + cfg.region_prior_weight * prior
@@ -1038,6 +1099,7 @@ class Trainer(RaceParallelMixin):
             nonlocal params, optimizer, scheduler
             params, optimizer, scheduler = self._finetune_rotate(cfg, at_step)
 
+        retry_jobs = None  # (per_rep, step_images) of a step that ran out of memory, trained again as they were
         while step < cfg.steps or self._race_running():
             if (self.ft is not None and step > start_step and step % self.ft_rotate_steps == 0
                     and step != self.ft_rotated_at):  # (an out-of-memory retry of a step must not rotate twice)
@@ -1060,7 +1122,10 @@ class Trainer(RaceParallelMixin):
             counts = self.balancer.counts if self.balancer is not None else [cfg.gradient_accumulation] * n_dev
             n_total = sum(counts)
             compiled_now = False
-            try:
+            if retry_jobs is not None:  # an out-of-memory retry trains the same batches with the same noise
+                per_rep, step_images = retry_jobs
+                retry_jobs = None
+            else:
                 per_rep: list[list] = [[] for _ in self.replicas]
                 for r in job_order(counts):  # every batch and its noise drawn in the main thread (shared RNG), in
                     batch = next(self.batch_iter)  # lockstep order: copy 0, copy 1, copy 0, ...
@@ -1074,6 +1139,7 @@ class Trainer(RaceParallelMixin):
                     dop = self._dop_job(cfg, batch, latents, step + 1, gen, shift, tok)  # LoRA Isolation
                     per_rep[r].append((self.replicas[r], batch, latents, embeds, mask, sigma, noise, regions, step + 1,
                                        n_total, dop))
+            try:
                 entries = list(enumerate(per_rep))
                 if self.dp is not None:
                     # torch.compile + threads: a replica tracing a graph breaks the other replica's forward, so steps
@@ -1119,6 +1185,7 @@ class Trainer(RaceParallelMixin):
                     prof.stop(None)
                 if not self._shrink_kept_blocks():
                     raise
+                retry_jobs = (per_rep, step_images)  # the same images, not the next ones from the iterator
                 free_cuda()
                 continue
             if self.dp is not None:
@@ -2191,8 +2258,10 @@ class Trainer(RaceParallelMixin):
             try:
                 yield slots
             finally:
+                slots = None
                 for (m, _), mode in zip(pairs, modes):
                     m.train(mode)
+                self._park_vae()  # back to RAM until the next round
             return
         self.status.update(stage=f"swapping in sampling model (step {step})")
         train_models = [(m, d) for m, _, d in self.replicas] or [(model, str(self.device))]
@@ -2213,6 +2282,7 @@ class Trainer(RaceParallelMixin):
             slots = None
             copies.clear()
             base.to("cpu")
+            self._park_vae()
             free_cuda()
             for m, d in train_models:
                 if getattr(m, "split_assignment", None):  # straight back to its GPUs (it may not fit one)
@@ -2800,12 +2870,15 @@ class Trainer(RaceParallelMixin):
                                                noise_level=cfg.reward_noise, seeds=seeds,
                                                shape=(model.latent_channels, h // 16, w // 16), device=dev, skip=skip)
                 rewards = []
+                vae = self._home_vae()  # parked again once the group is decoded
                 for k in range(group):
-                    img = self.arch.decode_latents(self.vae, xs[-1][k:k + 1])[0]
+                    img = self.arch.decode_latents(vae, xs[-1][k:k + 1])[0]
                     arr = ((img.permute(1, 2, 0).float().cpu().numpy() + 1) * 127.5).round().clip(0, 255)
                     path = out_dir / f"step{step0 + s:06d}_{k}.png"
                     Image.fromarray(arr.astype("uint8")).save(path)
                     rewards.append(self._reward_of(path, prompt, scale))
+                vae = None
+                self._park_vae()
                 adv = RW.advantages(rewards)
                 kl_val = None
                 if adv is not None:
@@ -3086,7 +3159,10 @@ class Trainer(RaceParallelMixin):
                                 category="selftrain", side=side, repeats=1, dataset="selftrain",
                                 loss_scale=cfg.selftrain_weight))
         if new:
-            cache_latents(new, cfg, self.vae)
+            try:
+                cache_latents(new, cfg, self._home_vae())
+            finally:
+                self._park_vae()
             if cfg.wants_regions():  # face cells and landmarks; the person-mask models were unloaded after the photos
                 analysis = R.analyze_faces(new, self._ensure_face_detector(), cache / "faces.json")
                 self.face_analysis.update(analysis)
