@@ -262,7 +262,8 @@ export const CATALOG: CatalogApp[] = [
       'Drop in a folder of training images and clean them up in one go: remove color noise, remove JPEG ' +
       'compression artifacts (a fast filter, or an AI model on your GPU for the best quality) and sharpen detail ' +
       'back up. Global sliders set every image at once, any image can be fine-tuned on its own with a side-by-side ' +
-      'or slider before/after view, and Save all writes them out. Auto crop crops pictures to whatever you ' +
+      'or slider before/after view, shadows can be painted over to brighten them to match their surroundings, and ' +
+      'Save all writes them out. Auto crop crops pictures to whatever you ' +
       'describe (a face, a dog), found by the SAM 3.1 AI model, and can clean them up in the same pass.',
     category: 'AI Training',
     repo: SUITE_REPO,
@@ -293,7 +294,7 @@ export const CATALOG: CatalogApp[] = [
       'Auto crop is optional too: the first time you use it, the app offers to install CUDA PyTorch (shared with ' +
         'Best quality), Transformers and the SAM 3.1 model (1.7 GB).'
     ],
-    highlights: ['Color noise removal', 'JPEG artifact removal (fast or AI)', 'Auto crop with SAM 3.1', 'Global + per-image']
+    highlights: ['Color noise removal', 'JPEG artifact removal (fast or AI)', 'Auto crop with SAM 3.1', 'Shadow lift', 'Global + per-image']
   }
 ]
 
