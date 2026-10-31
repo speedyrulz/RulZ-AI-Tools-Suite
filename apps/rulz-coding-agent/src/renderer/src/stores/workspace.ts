@@ -17,6 +17,8 @@ import type {
 import { errorMessage, invoke, on } from '../lib/api'
 
 const MAX_LIVE_OUTPUT = 40_000
+/** Streamed text and command output are applied at most this often: each update re-renders the reply's Markdown. */
+const FLUSH_MS = 80
 
 interface WorkspaceState {
   project: ProjectInfo | null
@@ -83,6 +85,7 @@ const CLOSED = {
 export const useWorkspace = create<WorkspaceState>((set, get) => {
   /** Shows a project's state; for the project already shown, `same` keeps the selected task and the live status. */
   const apply = (state: ProjectState, same = false): void => {
+    dropPending()
     set({
       project: state.project,
       timeline: state.timeline,
@@ -101,8 +104,61 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
 
   const isMine = (projectPath: string): boolean => get().project?.path.toLowerCase() === projectPath.toLowerCase()
 
+  // ---- Streamed text, thoughts and command output are batched, then applied in one update ----
+  let pendingText = new Map<string, { text: string; reasoning: string }>()
+  let pendingOutput = new Map<string, string>()
+  let flushTimer: ReturnType<typeof setTimeout> | null = null
+  const flush = (): void => {
+    if (flushTimer) clearTimeout(flushTimer)
+    flushTimer = null
+    if (!pendingText.size && !pendingOutput.size) return
+    const text = pendingText
+    const output = pendingOutput
+    pendingText = new Map()
+    pendingOutput = new Map()
+    set((s) => ({
+      timeline: text.size
+        ? s.timeline.map((x) => {
+            const add = text.get(x.id)
+            if (!add || x.kind !== 'assistant') return x
+            return { ...x, text: x.text + add.text, ...(add.reasoning ? { reasoning: (x.reasoning ?? '') + add.reasoning } : {}) }
+          })
+        : s.timeline,
+      tasks: output.size
+        ? s.tasks.map((t) =>
+            t.steps.some((x) => output.has(x.id))
+              ? { ...t, steps: t.steps.map((x) => (output.has(x.id) ? { ...x, output: ((x.output ?? '') + output.get(x.id)).slice(-MAX_LIVE_OUTPUT) } : x)) }
+              : t
+          )
+        : s.tasks
+    }))
+  }
+  const later = (): void => {
+    flushTimer ??= setTimeout(flush, FLUSH_MS)
+  }
+  /** Drops what was batched for a project that is no longer shown. */
+  const dropPending = (): void => {
+    if (flushTimer) clearTimeout(flushTimer)
+    flushTimer = null
+    pendingText = new Map()
+    pendingOutput = new Map()
+  }
+
   on('agent:event', (e: AgentEvent) => {
     if (!isMine(e.projectPath)) return
+    if (e.type === 'delta' || e.type === 'reasoning') {
+      const p = pendingText.get(e.itemId) ?? { text: '', reasoning: '' }
+      if (e.type === 'delta') p.text += e.text
+      else p.reasoning += e.text
+      pendingText.set(e.itemId, p)
+      return later()
+    }
+    if (e.type === 'output') {
+      pendingOutput.set(e.stepId, (pendingOutput.get(e.stepId) ?? '') + e.chunk)
+      return later()
+    }
+    // Everything else applies after the text that came before it.
+    flush()
     switch (e.type) {
       case 'task-start':
         set((s) => ({ tasks: [...s.tasks, e.task], timeline: [...s.timeline, e.item], running: true, selectedTaskId: null }))
@@ -120,18 +176,6 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
           return { timeline }
         })
         break
-      case 'delta':
-        set((s) => ({
-          timeline: s.timeline.map((x) => (x.id === e.itemId && x.kind === 'assistant' ? { ...x, text: x.text + e.text } : x))
-        }))
-        break
-      case 'reasoning':
-        set((s) => ({
-          timeline: s.timeline.map((x) =>
-            x.id === e.itemId && x.kind === 'assistant' ? { ...x, reasoning: (x.reasoning ?? '') + e.text } : x
-          )
-        }))
-        break
       case 'step':
         set((s) => ({
           tasks: updateTask(s.tasks, e.step.taskId, (t) => {
@@ -141,15 +185,6 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
             else steps[i] = { ...e.step, output: e.step.output ?? steps[i].output }
             return { ...t, steps }
           })
-        }))
-        break
-      case 'output':
-        set((s) => ({
-          tasks: s.tasks.map((t) =>
-            t.steps.some((x) => x.id === e.stepId)
-              ? { ...t, steps: t.steps.map((x) => (x.id === e.stepId ? { ...x, output: ((x.output ?? '') + e.chunk).slice(-MAX_LIVE_OUTPUT) } : x)) }
-              : t
-          )
         }))
         break
       case 'files':

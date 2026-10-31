@@ -82,7 +82,7 @@ export class ProjectStore {
   }
 
   save(data: ProjectData): Promise<void> {
-    return writeJsonAtomic(this.file(data.path), trimForSave(data))
+    return writeJsonAtomic(this.file(data.path), trimForSave(data), { compact: true })
   }
 
   async recent(): Promise<ProjectInfo[]> {

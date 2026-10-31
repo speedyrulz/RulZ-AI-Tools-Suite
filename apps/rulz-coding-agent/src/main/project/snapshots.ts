@@ -38,8 +38,11 @@ export interface Snapshotter {
   begin(taskId: string, label: string): Promise<Snapshot>
   /** Called before the agent changes a file (only the copy fallback needs it). */
   beforeChange(snapshot: Snapshot, rel: string): Promise<void>
-  /** Files changed since the snapshot, or null when only the agent's own changes are known. */
-  changedSince(snapshot: Snapshot): Promise<ChangedFile[] | null>
+  /**
+   * Files changed since the snapshot, or null when only the agent's own changes are known.
+   * `rescan` (default true) first looks for new very large files to leave out, a walk over the project.
+   */
+  changedSince(snapshot: Snapshot, opts?: { rescan?: boolean }): Promise<ChangedFile[] | null>
   /** A file's content at the snapshot: null when it didn't exist, undefined when unknown. */
   fileBefore(snapshot: Snapshot, rel: string): Promise<Buffer | null | undefined>
   restore(snapshot: Snapshot, label: string): Promise<void>
@@ -138,10 +141,11 @@ export class GitSnapshots implements Snapshotter {
 
   async beforeChange(): Promise<void> {}
 
-  async changedSince(snapshot: Snapshot): Promise<ChangedFile[]> {
+  async changedSince(snapshot: Snapshot, opts: { rescan?: boolean } = {}): Promise<ChangedFile[]> {
     if (snapshot.kind !== 'git') return []
     await this.ensure()
-    await this.writeExcludes()
+    // The exclude list was written when the restore point was made; refreshing it walks the project.
+    if (opts.rescan ?? true) await this.writeExcludes()
     const out: ChangedFile[] = []
     const diff = String(await this.git(['diff', '--name-status', '--no-renames', '-z', snapshot.commit])).split('\0')
     for (let i = 0; i + 1 < diff.length; i += 2) {
@@ -188,16 +192,19 @@ async function findBigFiles(root: string): Promise<string[]> {
       } catch {
         continue
       }
+      const filesHere: string[] = []
       for (const e of entries) {
         scanned++
         const abs = join(dir, e.name)
         if (e.isDirectory()) {
           if (!SKIP_DIRS.has(e.name.toLowerCase()) && !e.isSymbolicLink()) next.push(abs)
-        } else if (e.isFile()) {
-          const size = await fs.stat(abs).then((s) => s.size, () => 0)
-          if (size > BIG_FILE_BYTES) big.push(toRel(root, abs))
-        }
+        } else if (e.isFile()) filesHere.push(abs)
       }
+      // One folder's files are looked at together rather than one after another.
+      const sizes = await Promise.all(filesHere.map((abs) => fs.stat(abs).then((s) => s.size, () => 0)))
+      filesHere.forEach((abs, i) => {
+        if (sizes[i] > BIG_FILE_BYTES) big.push(toRel(root, abs))
+      })
     }
     level = next
   }

@@ -236,6 +236,30 @@ describe('telling RulZ apart from LM Studio', () => {
 })
 
 describe('RulzClient', () => {
+  it('drops cached props when the model list shows it reloaded with another context', async () => {
+    const models = [{ id: 'm', state: 'loaded' as const, loaded_context_length: 65536 }]
+    const opts = { models, nCtx: 65536 }
+    const mock = await startMockRulz(opts)
+    try {
+      const client = new RulzClient(() => ({ url: mock.url, apiKey: '' }))
+      expect((await client.modelProps('m')).nCtx).toBe(65536)
+      // RulZ LLM Suite reloads the model with a 16K context.
+      opts.nCtx = 16384
+      models[0].loaded_context_length = 16384
+      expect((await client.modelProps('m')).nCtx).toBe(65536)
+      await client.listModels()
+      expect((await client.modelProps('m')).nCtx).toBe(16384)
+      // An unchanged context keeps the cache.
+      opts.nCtx = 4096
+      await client.listModels()
+      expect((await client.modelProps('m')).nCtx).toBe(16384)
+      client.forgetProps('m')
+      expect((await client.modelProps('m')).nCtx).toBe(4096)
+    } finally {
+      await mock.close()
+    }
+  })
+
   it('streams text and tool calls, and applies the argument fix for Qwen3-Coder templates', async () => {
     const mock = await startMockRulz({
       turns: [{ content: 'Making it.', toolCalls: [{ name: 'write_file', args: { path: 'a.txt', content: 'hi' } }] }]

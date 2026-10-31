@@ -53,15 +53,18 @@ export function tokenMatches(given: unknown, expected: string): boolean {
   return typeof given === 'string' && !!expected && timingSafeEqual(digest(given), digest(expected))
 }
 
-/** Settings as the phone sees them: no pairing code. */
+/** Settings as the phone sees them: no pairing code, and no RulZ LLM Suite API key (the phone never needs it). */
 export function settingsForPhone(s: AppSettings): AppSettings {
-  return { ...s, remoteToken: '' }
+  return { ...s, remoteToken: '', apiKey: '' }
 }
 
-/** A settings change from the phone, without the phone-access settings (only this computer changes those). */
+/**
+ * A settings change from the phone, without the phone-access settings and the API key (only this
+ * computer changes those; the phone sees the key as empty, so it must not be able to send it back).
+ */
 export function settingsPatchFromPhone(patch: unknown): Partial<AppSettings> {
   if (!patch || typeof patch !== 'object') return {}
-  return Object.fromEntries(Object.entries(patch).filter(([k]) => !k.startsWith('remote'))) as Partial<AppSettings>
+  return Object.fromEntries(Object.entries(patch).filter(([k]) => !k.startsWith('remote') && k !== 'apiKey')) as Partial<AppSettings>
 }
 
 export class RemoteServer {
@@ -211,7 +214,8 @@ export class RemoteServer {
     try {
       if (isComputerOnly(channel)) throw new Error('That can only be done on the computer.')
       const value = await this.host.invoke(channel, channel === 'settings:update' ? [settingsPatchFromPhone(args[0])] : args)
-      reply = { t: 'result', id, ok: true, value: channel.startsWith('settings:') && value ? settingsForPhone(value as AppSettings) : value }
+      const isSettings = channel === 'settings:get' || channel === 'settings:update'
+      reply = { t: 'result', id, ok: true, value: isSettings && value ? settingsForPhone(value as AppSettings) : value }
     } catch (e) {
       reply = { t: 'result', id, ok: false, error: e instanceof Error ? e.message : String(e) }
     }

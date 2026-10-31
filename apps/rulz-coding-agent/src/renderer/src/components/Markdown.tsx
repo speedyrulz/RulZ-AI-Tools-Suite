@@ -5,19 +5,20 @@ import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { cn } from '../lib/format'
 
-function highlight(code: string, lang: string | undefined): string {
+/** `live`: the text is still streaming, so skip language detection (it tries every grammar). */
+function highlight(code: string, lang: string | undefined, live = false): string {
   try {
     if (lang && hljs.getLanguage(lang)) return hljs.highlight(code, { language: lang, ignoreIllegals: true }).value
-    if (code.length < 4000) return hljs.highlightAuto(code).value
+    if (!live && code.length < 4000) return hljs.highlightAuto(code).value
   } catch {
     // fall through to plain text
   }
   return code.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]!)
 }
 
-export function CodeBlock({ code, lang }: { code: string; lang?: string }) {
+export function CodeBlock({ code, lang, live = false }: { code: string; lang?: string; live?: boolean }) {
   const [copied, setCopied] = useState(false)
-  const html = useMemo(() => highlight(code, lang), [code, lang])
+  const html = useMemo(() => highlight(code, lang, live), [code, lang, live])
   return (
     <div className="group/code my-3 overflow-hidden rounded-lg border border-border bg-code">
       <div className="flex items-center justify-between border-b border-border px-3 py-1 text-[11px] text-faint">
@@ -41,15 +42,19 @@ export function CodeBlock({ code, lang }: { code: string; lang?: string }) {
   )
 }
 
-const components: Components = {
-  pre({ children }) {
+function makePre(live: boolean): Components['pre'] {
+  return function Pre({ children }) {
     const child = Children.toArray(children)[0]
     if (!isValidElement(child)) return <pre>{children}</pre>
     const props = (child as ReactElement<{ className?: string; children?: ReactNode }>).props
     const lang = /language-([\w+#.-]+)/.exec(props.className ?? '')?.[1]
     const code = String(Children.toArray(props.children).join('')).replace(/\n$/, '')
-    return <CodeBlock code={code} lang={lang} />
-  },
+    return <CodeBlock code={code} lang={lang} live={live} />
+  }
+}
+
+const components: Components = {
+  pre: makePre(false),
   a({ href, children }) {
     return (
       <a href={href} target="_blank" rel="noreferrer">
@@ -63,10 +68,13 @@ const components: Components = {
   }
 }
 
-export const Markdown = memo(function Markdown({ text, className }: { text: string; className?: string }) {
+const liveComponents: Components = { ...components, pre: makePre(true) }
+
+/** `live`: the text is still streaming in; unlabelled code blocks get highlighted once it is done. */
+export const Markdown = memo(function Markdown({ text, className, live = false }: { text: string; className?: string; live?: boolean }) {
   return (
     <div className={cn('md', className)}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={live ? liveComponents : components}>
         {text}
       </ReactMarkdown>
     </div>

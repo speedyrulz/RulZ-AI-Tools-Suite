@@ -3,6 +3,7 @@ import type { ChildProcess } from 'node:child_process'
 import { existsSync, promises as fs } from 'node:fs'
 import { join } from 'node:path'
 import type { RunEvent, RunState } from '@shared/types'
+import { childPids } from '../agent/childPids'
 import { cleanOutput, killTree, startShell } from '../agent/commands'
 
 /** A plain web page: opened in the browser rather than run. */
@@ -74,6 +75,7 @@ export class AppRunner {
     this.set({ command, source, running: true, output: '', exitCode: undefined, url: undefined, opened: undefined, unknown: false, stoppedByOwner: false })
     const child = startShell(command, this.root)
     this.child = child
+    childPids.add(child.pid)
     const decoder = new TextDecoder()
     const take = (buf: Buffer): void => {
       const chunk = cleanOutput(decoder.decode(buf, { stream: true }))
@@ -93,6 +95,7 @@ export class AppRunner {
       this.state.output += `\n${e.message}`
     })
     child.on('close', (code) => {
+      childPids.remove(child.pid)
       if (this.child === child) this.child = null
       this.set({ running: false, exitCode: code })
     })

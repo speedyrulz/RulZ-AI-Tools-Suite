@@ -60,7 +60,7 @@ async function readBody(req: IncomingMessage): Promise<string> {
 
 export async function startMockRulz(opts: MockOptions = {}) {
   const requests: MockRequest[] = []
-  const models = opts.models ?? [{ id: 'Qwen3-Coder-30B-A3B-Instruct-Q5_K_M', state: 'loaded', loaded_context_length: 65536 }]
+  const models = opts.models ?? [{ id: 'Qwen3-Coder-30B-A3B-Instruct-Q5_K_M', state: 'loaded', loaded_context_length: opts.nCtx ?? 65536 }]
   let turnIndex = 0
   const loadConfig = {
     contextLength: 65536,

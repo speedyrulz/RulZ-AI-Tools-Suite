@@ -47,7 +47,7 @@ import { LoopGuard, type GuardTrip } from './loopGuard'
 import { cutTurnContent, NoteQueue, noteMessage } from './notes'
 import { formatPageReport, pageHasProblems, pageTarget, type PageReport, type PageTarget } from './pageCheck'
 import { resolveInProject } from './pathGuard'
-import { HOW_TO_RUN_TASK, parseRunLine, parseShareLine, systemPrompt } from './prompt'
+import { backgroundNote, HOW_TO_RUN_TASK, parseRunLine, parseShareLine, systemPrompt } from './prompt'
 import { approvalKey, classifyCommand, needsApproval, type ActionKind } from './safety'
 import { describeStep, EXTRA_TOOL_DEFS, EXTRA_TOOL_NAMES, parseToolArgs, serverLabel, TOOL_DEFS, TOOL_NAMES } from './tools'
 import { toolSummary } from '../mcp/config'
@@ -60,6 +60,20 @@ const MAX_STEP_OUTPUT_LIVE = 40_000
 const MAX_DIFF_BYTES = 400 * 1024
 /** How many times a reply may come back as plain-text tool calls before it counts as stuck. */
 const MAX_TEXT_CALLS = 3
+/** Room kept for the reply below which the notes are tidied up first (or the output cap, if smaller). */
+const MIN_REPLY_TOKENS = 1024
+/** The smallest reply asked for when nothing more can be tidied up. */
+const LAST_RESORT_REPLY_TOKENS = 256
+/** Saves are spaced further apart while a task runs: the whole project state is written each time. */
+const SAVE_DELAY_MS = 1500
+const SAVE_DELAY_RUNNING_MS = 5000
+
+/** Appends `note` to the last message (a user or tool message when a request is made). */
+export function withTrailingNote(messages: WireMessage[], note: string): WireMessage[] {
+  const last = messages[messages.length - 1]
+  if (!note || !last || last.role === 'system' || last.role === 'assistant') return messages
+  return [...messages.slice(0, -1), { ...last, content: `${last.content}\n\n${note}` }]
+}
 
 export interface SessionDeps {
   client: RulzClient
@@ -194,10 +208,13 @@ export class ProjectSession {
 
   private scheduleSave(): void {
     if (this.saveTimer) return
-    this.saveTimer = setTimeout(() => {
-      this.saveTimer = null
-      void this.deps.store.save(this.data).catch(() => undefined)
-    }, 1500)
+    this.saveTimer = setTimeout(
+      () => {
+        this.saveTimer = null
+        void this.deps.store.save(this.data).catch(() => undefined)
+      },
+      this.running ? SAVE_DELAY_RUNNING_MS : SAVE_DELAY_MS
+    )
   }
 
   async saveNow(): Promise<void> {
@@ -414,7 +431,7 @@ export class ProjectSession {
       }
       for (const s of task.steps) if (s.status === 'running' || s.status === 'waiting') this.updateStep(s, { status: 'skipped' })
       task.endedAt = Date.now()
-      if (snap) await this.refreshFiles(task, snap).catch(() => undefined)
+      if (snap) await this.refreshFiles(task, snap, { rescan: true }).catch(() => undefined)
       this.running = false
       this.abort = null
       this.setStatus({ phase: 'idle' })
@@ -481,7 +498,18 @@ export class ProjectSession {
     }
     this.deps.activity('working')
     this.deps.refreshModels()
-    const size = nCtx ?? info?.loadedContext ?? DEFAULT_CTX
+    // RulZ LLM Suite may have reloaded the model with another context since the props were cached;
+    // its model list says what the model is loaded with now, so that wins (and stale props go).
+    const fresh = await this.deps.client
+      .listModels()
+      .then((list) => list.find((m) => m.id === model))
+      .catch(() => undefined)
+    if (fresh?.loadedContext && nCtx !== undefined && fresh.loadedContext !== nCtx) {
+      this.deps.client.forgetProps(model)
+      // Fetched again: the chat template in them decides the tool-argument fix for this task.
+      await this.deps.client.modelProps(model, signal).catch(() => undefined)
+    }
+    const size = fresh?.loadedContext ?? nCtx ?? info?.loadedContext ?? DEFAULT_CTX
     if (size <= SMALL_CONTEXT && !this.warnedSmallContext) {
       this.warnedSmallContext = true
       this.notice(
@@ -615,7 +643,12 @@ export class ProjectSession {
   private async buildRequest(model: string, nCtx: number, signal: AbortSignal): Promise<WireMessage[]> {
     // The budget is in estimated tokens, corrected by what the server counted last time.
     const budget = Math.floor((nCtx * CONTEXT_SHARE) / this.scale)
+    const cap = this.deps.settings().modelSampling[model]?.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS
+    const minReply = Math.min(MIN_REPLY_TOKENS, cap)
     for (let attempt = 0; ; attempt++) {
+      // The system prompt only changes between tasks or when the notes are tidied up, so the
+      // server's prompt cache keeps it and the history; what changes from step to step (running
+      // background commands) goes in a note at the end instead.
       const system = systemPrompt({
         projectPath: this.root,
         projectName: this.root.split(/[\\/]/).pop() ?? this.root,
@@ -623,14 +656,16 @@ export class ProjectSession {
         summary: this.data.summary,
         memory: this.data.memory,
         instructions: this.deps.settings().instructions,
-        background: this.background.running(),
         extraTools: this.extraServers.length
           ? { servers: this.extraServers.map(serverLabel), advice: this.deps.toolServers?.instructions().map((i) => ({ ...i, server: serverLabel(i.server) })) ?? [] }
           : undefined
       })
-      const fit = fitMessages(this.data.messages, budget, estimateTokens(system) + estimateTokens(JSON.stringify(this.toolDefs())))
-      const range = fit.fits || attempt >= 3 ? null : summaryRange(this.data.messages, this.taskStart)
-      if (!range) return [{ role: 'system' as const, content: system }, ...forModel(fit.messages)]
+      const note = backgroundNote(this.background.running())
+      const fit = fitMessages(this.data.messages, budget, estimateTokens(system) + estimateTokens(note) + estimateTokens(JSON.stringify(this.toolDefs())))
+      // Fitting the budget isn't enough if the reply would get less room than it needs.
+      const roomy = nCtx - Math.ceil(fit.tokens * this.scale) - 256 >= minReply
+      const range = (fit.fits && roomy) || attempt >= 3 ? null : summaryRange(this.data.messages, this.taskStart)
+      if (!range) return withTrailingNote([{ role: 'system' as const, content: system }, ...forModel(fit.messages)], note)
       await this.summarise(model, range, budget, signal)
     }
   }
@@ -677,7 +712,9 @@ export class ProjectSession {
     const tools = this.toolDefs()
     const estimated = totalTokens(messages) + estimateTokens(JSON.stringify(tools))
     const cap = own?.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS
-    const maxTokens = Math.max(Math.min(1024, cap), Math.min(cap, nCtx - Math.ceil(estimated * this.scale) - 256))
+    // buildRequest already tidied up when the reply had too little room; if nothing more could go, ask
+    // for what is left rather than more than the context holds.
+    const maxTokens = Math.max(Math.min(LAST_RESORT_REPLY_TOKENS, cap), Math.min(cap, nCtx - Math.ceil(estimated * this.scale) - 256))
     const sampling = samplingRequest(model, own)
     let result: TurnResult & { cut?: { thinking: string } }
     const turnSignal = this.notes.beginTurn(signal)
@@ -844,8 +881,11 @@ export class ProjectSession {
       const result = extra ? await this.runExtraTool(step, extra, args, signal) : await this.runTool(task, step, name, args, signal, snap)
       if ('denied' in result) return finish(result.outcome, 'skipped', "You didn't allow this.")
       if ('refused' in result) return finish(result.outcome, 'refused', result.refused)
-      if (result.changed?.length || name === 'run_command' || name === 'start_background_command') {
-        if (snap) await this.refreshFiles(task, snap, result.changed).catch(() => undefined)
+      // A command can change anything, so ask the restore point; a file tool says what it changed.
+      if (name === 'run_command' || name === 'start_background_command') {
+        if (snap) await this.refreshFiles(task, snap, { rescan: false }).catch(() => undefined)
+      } else if (result.changed?.length && snap) {
+        await this.refreshFiles(task, snap, { changed: result.changed }).catch(() => undefined)
       }
       return finish(result)
     } catch (e) {
@@ -1078,10 +1118,17 @@ export class ProjectSession {
     return { text: headTail(result.text), isError: result.isError }
   }
 
-  /** Updates the task's changed-files list (from the restore point, or from what the tools changed). */
-  private async refreshFiles(task: TaskRecord, snap: Snapshotter, changed?: ChangedFile[]): Promise<void> {
+  /**
+   * Updates the task's changed-files list. With `changed` (a file tool's own list) and a git restore
+   * point, the list is updated from it without asking git; otherwise the restore point is asked.
+   * `rescan` also looks for new very large files to leave out (a walk over the whole project), which
+   * is only worth it once at the end of a task.
+   */
+  private async refreshFiles(task: TaskRecord, snap: Snapshotter, opts: { changed?: ChangedFile[]; rescan?: boolean } = {}): Promise<void> {
+    const { changed } = opts
     let list: ChangedFile[] | null = null
-    if (task.snapshot) list = await snap.changedSince(task.snapshot)
+    const fromTool = !!changed && snap.kind === 'git'
+    if (task.snapshot && !fromTool) list = await snap.changedSince(task.snapshot, { rescan: opts.rescan ?? true })
     if (!list) {
       const map = new Map(task.files.map((f) => [f.path, f]))
       for (const c of changed ?? []) {

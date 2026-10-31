@@ -145,6 +145,11 @@ export async function listFiles(root: string, args: { path?: unknown; depth?: un
 
   const walk = async (dir: string, level: number): Promise<void> => {
     const entries = await readDir(dir)
+    // The folder's file sizes are read together rather than one after another.
+    const files = entries.filter((e) => !e.isDirectory()).slice(0, MAX_LIST_ENTRIES)
+    const sizes = new Map(
+      await Promise.all(files.map(async (e) => [e.name, await fs.stat(join(dir, e.name)).then((s) => formatSize(s.size), () => '?')] as const))
+    )
     for (const e of entries) {
       if (lines.length >= MAX_LIST_ENTRIES) {
         truncated = true
@@ -163,8 +168,7 @@ export async function listFiles(root: string, args: { path?: unknown; depth?: un
           }
         }
       } else {
-        const size = await fs.stat(full).then((s) => formatSize(s.size), () => '?')
-        lines.push(`${indent}${e.name}  (${size})`)
+        lines.push(`${indent}${e.name}  (${sizes.get(e.name) ?? '?'})`)
       }
     }
   }
@@ -223,35 +227,52 @@ export async function searchText(
   const inGlob = globMatcher(typeof args.glob === 'string' ? args.glob : undefined)
   const hits: string[] = []
 
-  const searchFile = async (abs: string): Promise<void> => {
+  /** One file's matching lines (at most MAX_SEARCH_HITS). */
+  const searchFile = async (abs: string): Promise<string[]> => {
     const rel = toRel(root, abs)
-    if (!inGlob(rel)) return
+    if (!inGlob(rel)) return []
     let buf: Buffer
     try {
       const st = await fs.stat(abs)
-      if (st.size > MAX_SEARCH_FILE_BYTES) return
+      if (st.size > MAX_SEARCH_FILE_BYTES) return []
       buf = await fs.readFile(abs)
     } catch {
-      return
+      return []
     }
-    if (looksBinary(buf)) return
+    if (looksBinary(buf)) return []
+    const found: string[] = []
     const lines = buf.toString('utf8').split(/\r?\n/)
-    for (let i = 0; i < lines.length && hits.length < MAX_SEARCH_HITS; i++) {
+    for (let i = 0; i < lines.length && found.length < MAX_SEARCH_HITS; i++) {
       if (lines[i].toLowerCase().includes(needle)) {
         const line = lines[i].length > 300 ? `${lines[i].slice(0, 300)}…` : lines[i]
-        hits.push(`${rel}:${i + 1}: ${line.trim()}`)
+        found.push(`${rel}:${i + 1}: ${line.trim()}`)
       }
+    }
+    return found
+  }
+  // Files are read a few at a time; results keep the walk's order.
+  const SEARCH_BATCH = 16
+  const searchBatch = async (batch: string[]): Promise<void> => {
+    for (const found of await Promise.all(batch.map(searchFile))) {
+      hits.push(...found.slice(0, MAX_SEARCH_HITS - hits.length))
+      if (hits.length >= MAX_SEARCH_HITS) return
     }
   }
 
   const st = await fs.stat(target.abs).catch(() => null)
   if (!st) return fail(`"${target.rel}" does not exist.`)
-  if (st.isFile()) await searchFile(target.abs)
+  if (st.isFile()) await searchBatch([target.abs])
   else {
+    let batch: string[] = []
     for await (const { abs, entry } of walkFiles(target.abs)) {
-      if (entry.isFile()) await searchFile(abs)
+      if (!entry.isFile()) continue
+      batch.push(abs)
+      if (batch.length < SEARCH_BATCH) continue
+      await searchBatch(batch)
+      batch = []
       if (hits.length >= MAX_SEARCH_HITS) break
     }
+    if (batch.length && hits.length < MAX_SEARCH_HITS) await searchBatch(batch)
   }
   if (!hits.length) return ok(`"${args.query}" was not found.`)
   const more = hits.length >= MAX_SEARCH_HITS ? `\n(Showing the first ${MAX_SEARCH_HITS} matches.)` : ''
