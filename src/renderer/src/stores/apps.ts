@@ -69,12 +69,16 @@ export const useApps = create<AppsState>((set, get) => ({
     if (initialized) return
     initialized = true
     on('apps:changed', (apps) => set({ apps }))
-    on('job:log', ({ appId, line, replace }) =>
+    // A batch of lines (pip can print hundreds a second) is one store update.
+    on('job:log', (lines) =>
       set((s) => {
-        const prev = s.logs[appId] ?? []
-        const kept = replace ? prev.slice(0, -1) : prev
-        const next = kept.length >= LOG_LIMIT ? [...kept.slice(kept.length - LOG_LIMIT + 1), line] : [...kept, line]
-        return { logs: { ...s.logs, [appId]: next } }
+        const logs = { ...s.logs }
+        for (const { appId, line, replace } of lines) {
+          const prev = logs[appId] ?? []
+          const kept = replace ? prev.slice(0, -1) : prev
+          logs[appId] = kept.length >= LOG_LIMIT ? [...kept.slice(kept.length - LOG_LIMIT + 1), line] : [...kept, line]
+        }
+        return { logs }
       })
     )
     on('job:update', (job) => {

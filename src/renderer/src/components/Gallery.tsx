@@ -8,9 +8,11 @@ export function Gallery({ images, name }: { images: string[]; name: string }) {
   const [index, setIndex] = useState(0)
   const [open, setOpen] = useState(false)
 
+  // Keyed on the list's contents: each app list update brings a new array with the same pictures.
+  const key = images.join('\n')
   useEffect(() => {
     setIndex(0)
-  }, [images])
+  }, [key])
 
   if (!images.length) {
     return (

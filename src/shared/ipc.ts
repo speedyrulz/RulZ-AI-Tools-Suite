@@ -64,7 +64,8 @@ export interface IpcEvents {
   'self:progress': number
   'apps:changed': AppView[]
   'job:update': JobState
-  'job:log': LogLine
+  /** Lines in order, sent in batches. */
+  'job:log': LogLine[]
 }
 
 export type InvokeChannel = keyof IpcInvoke

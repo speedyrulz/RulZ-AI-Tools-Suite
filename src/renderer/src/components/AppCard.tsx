@@ -1,4 +1,4 @@
-import { ArrowUpCircle, CheckCircle2, FolderSearch, Wrench } from 'lucide-react'
+import { AlertTriangle, ArrowUpCircle, CheckCircle2, FolderSearch, Wrench } from 'lucide-react'
 import type { AppView } from '@shared/types'
 import { formatVersion } from '../lib/format'
 import { AppActions } from './AppActions'
@@ -14,6 +14,12 @@ export function StatusBadge({ view }: { view: AppView }) {
     )
   }
   if (!i) return null
+  if (view.missing)
+    return (
+      <Badge tone="warn">
+        <AlertTriangle className="size-3" /> Files missing
+      </Badge>
+    )
   if (i.needsSetup)
     return (
       <Badge tone="warn">

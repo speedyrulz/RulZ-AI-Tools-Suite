@@ -1,5 +1,14 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { getFetch, latestRelease, releaseVersion, setFetch } from '../src/main/github'
+import {
+  clearEtags,
+  etagSnapshot,
+  getFetch,
+  headCommit,
+  latestRelease,
+  loadEtags,
+  releaseVersion,
+  setFetch
+} from '../src/main/github'
 
 const original = getFetch()
 afterEach(() => setFetch(original))
@@ -38,6 +47,41 @@ describe('latestRelease', () => {
     expect((await latestRelease('o/r3', 'image-tournament-v'))?.tag).toBe('image-tournament-v1.1.0')
     expect(await latestRelease('o/r3', 'clip-extractor-v')).toBeNull()
     expect(calls).toHaveLength(2)
+  })
+})
+
+describe('ETags', () => {
+  afterEach(() => clearEtags())
+
+  it('asks with If-None-Match and reuses the remembered answer on a 304', async () => {
+    const seen: (string | undefined)[] = []
+    setFetch(async (_url, init) => {
+      const tag = (init?.headers as Record<string, string>)['If-None-Match']
+      seen.push(tag)
+      if (tag === '"abc"') return new Response(null, { status: 304 })
+      const body = { sha: 'f00', commit: { message: 'Fix it\n\nmore', committer: { date: '2026-10-01' } }, files: ['big'] }
+      return new Response(JSON.stringify(body), { status: 200, headers: { etag: '"abc"' } })
+    })
+    const first = await headCommit('o/e1', 'app/x')
+    const second = await headCommit('o/e1', 'app/x')
+    expect(seen).toEqual([undefined, '"abc"'])
+    expect(second).toEqual(first)
+    expect(first).toEqual({ sha: 'f00', date: '2026-10-01', message: 'Fix it' })
+  })
+
+  it('survives a restart through the snapshot, kept slim', async () => {
+    setFetch(async () => new Response(JSON.stringify({ sha: 's', commit: { message: 'm', committer: null } }), { status: 200, headers: { etag: 'W/"1"' } }))
+    await headCommit('o/e2', 'main')
+    const saved = JSON.parse(JSON.stringify(etagSnapshot()))
+    clearEtags()
+    loadEtags(saved)
+    let asked: string | undefined
+    setFetch(async (_url, init) => {
+      asked = (init?.headers as Record<string, string>)['If-None-Match']
+      return new Response(null, { status: 304 })
+    })
+    expect((await headCommit('o/e2', 'main')).sha).toBe('s')
+    expect(asked).toBe('W/"1"')
   })
 })
 

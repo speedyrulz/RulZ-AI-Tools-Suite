@@ -13,21 +13,31 @@ export function InstallDialog({ view, onClose }: { view: AppView | null; onClose
   const [force, setForce] = useState(false)
   const requirements = useApps((s) => s.requirements)
   const app = view?.app
+  const appId = app?.id
 
+  // Keyed on the id: every app list update brings new objects, which mustn't reset what the user chose.
   useEffect(() => {
-    if (!app) return
+    const current = appId ? useApps.getState().apps.find((a) => a.app.id === appId)?.app : undefined
+    if (!current) return
+    let alive = true
     setOpts(null)
-    void invoke('apps:defaultDir', app.id).then((dir) =>
-      setOpts({
-        dir,
-        desktopShortcut: true,
-        startMenuShortcut: true,
-        components: (app.components ?? []).filter((c) => c.default).map((c) => c.id),
-        launchAfter: true,
-        installPrerequisites: true
-      })
+    setForce(false)
+    void invoke('apps:defaultDir', current.id).then(
+      (dir) =>
+        alive &&
+        setOpts({
+          dir,
+          desktopShortcut: true,
+          startMenuShortcut: true,
+          components: (current.components ?? []).filter((c) => c.default).map((c) => c.id),
+          launchAfter: true,
+          installPrerequisites: true
+        })
     )
-  }, [app])
+    return () => {
+      alive = false
+    }
+  }, [appId])
 
   if (!view || !app) return null
   // Required prerequisites that aren't installed: winget can do some, the rest need the guide.
