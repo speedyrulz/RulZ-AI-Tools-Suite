@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from bisect import bisect_left, bisect_right
 import subprocess
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -11,9 +12,13 @@ CREATE_NO_WINDOW = 0x08000000  # keep console windows from popping up on Windows
 
 
 def _run(args: list[str]) -> str:
-    return subprocess.run(
-        args, capture_output=True, text=True, check=True, creationflags=CREATE_NO_WINDOW
-    ).stdout
+    r = subprocess.run(args, capture_output=True, text=True, creationflags=CREATE_NO_WINDOW,
+                       encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        # ffprobe's own message ("Invalid data found when processing input", ...) says what's wrong
+        msg = (r.stderr or "").strip() or f"exit code {r.returncode}"
+        raise RuntimeError(f"ffprobe failed: {msg}")
+    return r.stdout
 
 
 def have_ffmpeg() -> bool:
@@ -45,31 +50,28 @@ class VideoInfo:
     def end_time(self) -> float:
         return self.start_time + self.duration
 
-    # --- keyframe helpers --------------------------------------------------
+    # --- keyframe helpers (binary search: `keyframes` is sorted) ------------
     def is_keyframe_time(self, t: float) -> bool:
-        tol = self.frame_duration / 2
-        return any(abs(k - t) <= tol for k in self.keyframes)
+        return self.keyframe_at(t) is not None
 
     def keyframe_at(self, t: float) -> float | None:
+        """The first keyframe within half a frame of t."""
         tol = self.frame_duration / 2
-        for k in self.keyframes:
-            if abs(k - t) <= tol:
-                return k
+        kfs = self.keyframes
+        i = bisect_left(kfs, t - tol)
+        if i < len(kfs) and kfs[i] <= t + tol:
+            return kfs[i]
         return None
 
     def next_keyframe(self, t: float) -> float | None:
         tol = self.frame_duration / 2
-        for k in self.keyframes:
-            if k > t + tol:
-                return k
-        return None
+        i = bisect_right(self.keyframes, t + tol)
+        return self.keyframes[i] if i < len(self.keyframes) else None
 
     def prev_keyframe(self, t: float) -> float | None:
         tol = self.frame_duration / 2
-        for k in reversed(self.keyframes):
-            if k < t - tol:
-                return k
-        return None
+        i = bisect_left(self.keyframes, t - tol)
+        return self.keyframes[i - 1] if i > 0 else None
 
 
 def probe(path: str) -> VideoInfo:

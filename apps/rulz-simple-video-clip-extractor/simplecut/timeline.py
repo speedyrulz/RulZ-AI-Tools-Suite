@@ -2,7 +2,7 @@
 selection box, and the playhead. Click/drag to seek."""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal, QRectF, QPointF
+from PySide6.QtCore import Qt, Signal, QRectF, QPointF, QLineF
 from PySide6.QtGui import QPainter, QColor, QPen
 from PySide6.QtWidgets import QWidget
 
@@ -30,6 +30,8 @@ class Timeline(QWidget):
         self.selection: tuple[float, float] | None = None  # fixed-length mode
         self._press = None  # (x, mode, offset_seconds)
         self._dragging = False
+        self._ticks: list[QLineF] = []
+        self._ticks_key = None
 
     def set_range(self, start: float, end: float):
         self.start, self.end = start, max(end, start + 1e-6)
@@ -37,6 +39,7 @@ class Timeline(QWidget):
 
     def set_keyframes(self, kfs: list[float]):
         self.keyframes = kfs
+        self._ticks_key = None
         self.update()
 
     def set_position(self, t: float):
@@ -60,6 +63,22 @@ class Timeline(QWidget):
         w = self.width() - 2 * self._pad
         frac = min(max((x - self._pad) / max(w, 1), 0.0), 1.0)
         return self.start + frac * (self.end - self.start)
+
+    def _tick_lines(self, bar_top: float) -> list[QLineF]:
+        """Keyframe tick lines, at most one per 2 px. Only rebuilt when the keyframes, range or
+        size change, not on every repaint (playback repaints per frame; a 3 h file has ~10k)."""
+        key = (self.start, self.end, self.width(), bar_top)
+        if self._ticks_key != key:
+            lines: list[QLineF] = []
+            last_x = -10.0
+            for k in self.keyframes:
+                x = self._x(k)
+                if x - last_x < 2:
+                    continue
+                last_x = x
+                lines.append(QLineF(x, bar_top, x, bar_top + 8))
+            self._ticks, self._ticks_key = lines, key
+        return self._ticks
 
     def _in_selection(self, x: float) -> bool:
         if not self.selection:
@@ -141,15 +160,10 @@ class Timeline(QWidget):
                            theme.Q_TL_INOUT)
 
         # keyframe ticks (thin out when there are too many for the width)
-        if self.keyframes:
+        ticks = self._tick_lines(bar_top)
+        if ticks:
             p.setPen(QPen(theme.Q_TL_TICK, 1))
-            last_x = -10.0
-            for k in self.keyframes:
-                x = self._x(k)
-                if x - last_x < 2:
-                    continue
-                last_x = x
-                p.drawLine(QPointF(x, bar_top), QPointF(x, bar_top + 8))
+            p.drawLines(ticks)
 
         # in/out markers (hidden in fixed-length mode)
         if not self.selection:

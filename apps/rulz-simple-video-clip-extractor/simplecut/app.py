@@ -6,6 +6,7 @@ import os
 import sys
 import traceback
 
+import numpy as np
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSettings, QRect, QEvent, QUrl, QElapsedTimer
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtGui import QImage, QKeySequence, QAction, QShortcut, QTransform
@@ -21,9 +22,9 @@ from .decoder import Decoder
 from .timeline import Timeline
 from .cropview import VideoView, even
 from .export import (ExportSettings, ExportJob, NVENC_CODECS, FPS_PRESETS, parse_fps,
-                     build_command, default_output_path, unique_path)
+                     build_commands, default_output_path, unique_path)
 from . import theme
-from .colormatch import ColorMatchDialog, apply_tables, write_cube_1d
+from .colormatch import ColorMatchDialog, apply_tables, clean_temp, write_cube_1d
 from .defaults import (ASPECT_PRESETS, PRESET_LABELS, AUDIO_LABELS, AUDIO_KEYS, settings,
                        parse_aspect, load_export_defaults, load_ui_defaults, DefaultsDialog,
                        PreferencesDialog, load_quick_defaults, prefer_lossless,
@@ -35,6 +36,15 @@ def output_dir() -> str | None:
     return d if d and os.path.isdir(d) else None
 
 
+def remove_partial(path: str | None):
+    """Delete what a cancelled export wrote, if anything."""
+    if path:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def fmt_time(t: float) -> str:
     if t < 0:
         t = 0
@@ -44,18 +54,22 @@ def fmt_time(t: float) -> str:
 
 
 class ProbeThread(QThread):
-    done = Signal(object)
-    failed = Signal(str)
+    done = Signal(object, int)   # info, token
+    failed = Signal(str, int)    # message, token
 
-    def __init__(self, path):
+    def __init__(self, path, token: int = 0):
         super().__init__()
         self.path = path
+        self.token = token  # which open_file() call this answers; a newer one makes it stale
 
     def run(self):
         try:
-            self.done.emit(probe(self.path))
+            self.done.emit(probe(self.path), self.token)
         except Exception as e:  # noqa: BLE001
-            self.failed.emit(f"{e}\n{traceback.format_exc()}")
+            self.failed.emit(f"{e}\n{traceback.format_exc()}", self.token)
+
+
+NO_FFMPEG = "ffmpeg / ffprobe were not found on PATH. Install them (e.g. `winget install Gyan.FFmpeg`)."
 
 
 # ----------------------------------------------------------------------------
@@ -180,7 +194,7 @@ class ExportDialog(QDialog):
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self.buttons.button(QDialogButtonBox.Ok).setText("Export")
         self.buttons.accepted.connect(self._export)
-        self.buttons.rejected.connect(self._cancel)
+        self.buttons.rejected.connect(self.reject)
         lay.addWidget(self.buttons)
 
         self.rb_lossless.toggled.connect(self._mode_changed)
@@ -231,17 +245,27 @@ class ExportDialog(QDialog):
         except ValueError as e:
             QMessageBox.warning(self, "Export", str(e))
             return
-        cmd = build_command(self.info, self.start, self.end, out, st)
-        self.cmd_text = " ".join(f'"{c}"' if " " in c else c for c in cmd)
-        self.job = ExportJob(cmd, self.end - self.start, self)
+        if not have_ffmpeg():
+            QMessageBox.critical(self, "Export", NO_FFMPEG)
+            return
+        self._out = out
+        self.job = ExportJob(build_commands(self.info, self.start, self.end, out, st),
+                             self.end - self.start, self)
         self.job.progress.connect(lambda f: self.progress.setValue(int(f * 1000)))
         self.job.finished.connect(self._done)
         self.progress.setVisible(True)
         self.buttons.button(QDialogButtonBox.Ok).setEnabled(False)
         self.job.start()
 
+    @property
+    def cmd_text(self) -> str:
+        return self.job.cmd_text if self.job else ""
+
     def _done(self, ok: bool, log: str):
         self.buttons.button(QDialogButtonBox.Ok).setEnabled(True)
+        if self.job is not None and self.job.cancelled:
+            remove_partial(self._out)  # cancelled: no error box, no half-written clip left behind
+            return
         if ok:
             self.progress.setValue(1000)
             self.exported.emit(self.out_path.text())
@@ -251,10 +275,12 @@ class ExportDialog(QDialog):
             QMessageBox.critical(self, "Export failed",
                                  f"ffmpeg failed.\n\nCommand:\n{self.cmd_text}\n\nLog:\n{log}")
 
-    def _cancel(self):
-        if self.job:
+    def reject(self):
+        """Cancel, Esc and the close button: stop a running export first."""
+        if self.job is not None and not self.job.done:
             self.job.cancel()
-        self.reject()
+            self.job.wait()  # delivers `finished` (-> _done, which deletes the partial file) now
+        super().reject()
 
 
 # ----------------------------------------------------------------------------
@@ -276,7 +302,10 @@ class MainWindow(QMainWindow):
         self.color_tables = None       # (3, 256) uint8 lookup tables from the skin-tone match, or None
         self.color_lut_path: str | None = None
         self.color_desc = ""
-        self._probe_thread: ProbeThread | None = None
+        self._probe_thread: ProbeThread | None = None  # the newest one
+        self._probe_threads: list[ProbeThread] = []    # every one still running, kept referenced
+        self._probe_token = 0                          # bumped per open/close; stale probe results are dropped
+        clean_temp()  # colour-match LUTs / reference images left by earlier sessions
 
         # fixed-length selection mode
         self.fixed = False
@@ -776,17 +805,35 @@ class MainWindow(QMainWindow):
         self.stop()
         self.status.showMessage(f"Probing {os.path.basename(path)}…")
         self._set_enabled(False)
-        self._probe_thread = ProbeThread(path)
-        self._probe_thread.done.connect(self._probed)
-        self._probe_thread.failed.connect(lambda msg: QMessageBox.critical(self, "Open failed", msg))
-        self._probe_thread.start()
+        self._probe_token += 1
+        t = ProbeThread(path, self._probe_token)
+        t.done.connect(self._probed)
+        t.failed.connect(self._probe_failed)
+        t.finished.connect(self._probe_thread_finished)
+        self._probe_thread = t
+        self._probe_threads.append(t)  # a QThread dropped while running crashes the app
+        t.start()
 
-    def _probed(self, info: VideoInfo):
+    def _probe_thread_finished(self):
+        self._probe_threads = [t for t in self._probe_threads if t.isRunning()]
+
+    def _probe_failed(self, msg: str, token: int):
+        if token != self._probe_token:
+            return  # another file was opened meanwhile
+        if self.info:
+            self._set_enabled(True)  # the video that was open stays usable
+        QMessageBox.critical(self, "Open failed", msg)
+
+    def _probed(self, info: VideoInfo, token: int = 0):
+        if token != self._probe_token:
+            return  # a newer open (or close) wins over this slower probe
         if self.dec:
             self.dec.close()
+            self.dec = None
         try:
             self.dec = Decoder(info.path)
         except Exception as e:  # noqa: BLE001
+            self.close_video()  # the old decoder is closed: don't leave its UI pointing at it
             QMessageBox.critical(self, "Open failed", str(e))
             return
         self.info = info
@@ -818,8 +865,7 @@ class MainWindow(QMainWindow):
     def close_video(self):
         """Unload the current video and return to the empty state."""
         self.stop()
-        if self._probe_thread and self._probe_thread.isRunning():
-            self._probe_thread.wait()
+        self._probe_token += 1  # a probe still running must not open its file afterwards
         if self.dec:
             self.dec.close()
             self.dec = None
@@ -935,15 +981,14 @@ class MainWindow(QMainWindow):
             kw.update(width=width, height=height)
         rgb = f.reformat(**kw)
         plane = rgb.planes[0]
+        # Wrap the plane's memory without copying it (no bytes(plane)); the one .copy() below
+        # gives the QImage its own pixels before the frame is freed.
+        buf = np.frombuffer(plane, dtype=np.uint8).reshape(rgb.height, plane.line_size)
         if self.color_tables is not None:
-            import numpy as np
-            buf = np.frombuffer(bytes(plane), dtype=np.uint8).reshape(rgb.height, plane.line_size)
-            arr = apply_tables(np.ascontiguousarray(buf[:, :rgb.width * 3]).reshape(rgb.height, rgb.width, 3),
-                               self.color_tables)
-            img = QImage(np.ascontiguousarray(arr).data, rgb.width, rgb.height, rgb.width * 3,
-                         QImage.Format_RGB888).copy()
+            arr = apply_tables(buf[:, :rgb.width * 3].reshape(rgb.height, rgb.width, 3), self.color_tables)
+            img = QImage(arr.data, rgb.width, rgb.height, rgb.width * 3, QImage.Format_RGB888).copy()
         else:
-            img = QImage(bytes(plane), rgb.width, rgb.height, plane.line_size, QImage.Format_RGB888).copy()
+            img = QImage(buf.data, rgb.width, rgb.height, plane.line_size, QImage.Format_RGB888).copy()
         rot = self.total_rotation
         if rot:
             img = img.transformed(QTransform().rotate(rot))
@@ -1519,6 +1564,9 @@ class MainWindow(QMainWindow):
         """Export the selection (or the whole video) with the default settings, no dialog."""
         if not self.info or self.quick_job is not None:
             return
+        if not have_ffmpeg():
+            QMessageBox.critical(self, "Quick export", NO_FFMPEG)
+            return
         self.stop()
         rng = self._export_range()
         whole = rng is None
@@ -1534,11 +1582,9 @@ class MainWindow(QMainWindow):
         s.lut_path = self.color_lut_path
         out = unique_path(default_output_path(self.info, rng[0], rng[1], mode, output_dir(),
                                               cropped=crop is not None, whole=whole))
-        cmd = build_command(self.info, rng[0], rng[1], out, s)
-        self._quick_cmd_text = " ".join(f'"{c}"' if " " in c else c for c in cmd)
         self._quick_out = out
         self._quick_cancelled = False
-        self.quick_job = ExportJob(cmd, rng[1] - rng[0], self)
+        self.quick_job = ExportJob(build_commands(self.info, rng[0], rng[1], out, s), rng[1] - rng[0], self)
         self.quick_job.progress.connect(lambda f: self.qx_progress.setValue(int(f * 1000)))
         self.quick_job.finished.connect(self._quick_done)
         self.qx_label.setText(f"Exporting {'whole video' if whole else 'clip'} \u2192 {os.path.basename(out)}")
@@ -1556,20 +1602,18 @@ class MainWindow(QMainWindow):
     def _quick_done(self, ok: bool, log: str):
         for wdg in (self.qx_label, self.qx_progress, self.qx_cancel):
             wdg.setVisible(False)
+        cmd_text = self.quick_job.cmd_text if self.quick_job else ""
         self.quick_job = None
         self.b_quick.setEnabled(self.info is not None)
         if self._quick_cancelled:
-            try:
-                os.remove(self._quick_out)
-            except OSError:
-                pass
+            remove_partial(self._quick_out)
             self.status.showMessage("Export cancelled.", 5000)
         elif ok:
             self.status.showMessage(f"Saved: {self._quick_out}", 10000)
             self._note_export(self._quick_out)
         else:
             QMessageBox.critical(self, "Quick export failed",
-                                 f"ffmpeg failed.\n\nCommand:\n{self._quick_cmd_text}\n\nLog:\n{log}")
+                                 f"ffmpeg failed.\n\nCommand:\n{cmd_text}\n\nLog:\n{log}")
 
     def export_clip(self):
         rng = self._export_range()
@@ -1585,6 +1629,12 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e):
         self.stop()
+        if self.quick_job is not None:  # don't leave ffmpeg running and a half-written clip behind
+            self._quick_cancel()
+            self.quick_job.wait()
+        self._probe_token += 1
+        for t in list(self._probe_threads):
+            t.wait()  # a QThread destroyed while running takes the process down with it
         if self.dec:
             self.dec.close()
         super().closeEvent(e)
