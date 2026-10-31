@@ -1,20 +1,36 @@
 """Single-image page: full-size before/after with its own adjustment sliders."""
 from __future__ import annotations
 
+from dataclasses import replace
+
 from PySide6.QtCore import QThreadPool, QTimer, Qt, Signal
 from PySide6.QtGui import QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QButtonGroup, QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
+    QButtonGroup, QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton, QSlider, QVBoxLayout,
+    QWidget,
 )
 
 from .. import config, imageio
 from ..filters import ADJUSTMENTS, BALANCED, BEST
+from ..shadows import ShadowEdit
 from . import theme
-from .compare_view import SIDE, SLIDER, CompareView
+from .compare_view import ERASE, PAINT, SIDE, SLIDER, CompareView
 from .controls import AdjustRow, ModeSwitch
 from .workers import FullLoad, ImageItem, Process, make_emitter
 
 VIEW_KEY = "compare_mode"
+BRUSH_KEY = "shadow_brush"
+SHOW_AREAS_KEY = "shadow_show_areas"
+SHADOW_TIPS = {
+    "strength": "How much the painted shadows are brightened. 100 matches the light around them; lower "
+                "leaves some of the shadow.",
+    "blend": "How softly the painted area's edge fades into the rest of the picture.",
+}
+
+
+def _brush_fraction(v: int) -> float:
+    """Brush slider (1-100) to a radius as a fraction of the picture's longer side: 0.3% to 20%."""
+    return 0.003 + 0.197 * (v / 100.0) ** 2
 
 
 def _pixmap(img) -> QPixmap:
@@ -117,6 +133,7 @@ class EditorPage(QWidget):
         grid.addWidget(self.use_global, len(ADJUSTMENTS) - 1, 1)
         self.message = QLabel(objectName="Muted")
         grid.addWidget(self.message, 0, 1)
+        grid.addWidget(self._build_shadow_tools(), len(ADJUSTMENTS), 0, 1, 2)
         grid.setColumnStretch(0, 1)
 
         lay = QVBoxLayout(self)
@@ -128,12 +145,123 @@ class EditorPage(QWidget):
 
         mode = str(config.settings().value(VIEW_KEY, SIDE))
         self._set_mode(mode if mode in (SIDE, SLIDER) else SIDE, save=False)
+        self.view.stroked.connect(self._on_stroke)
 
         for key, fn in (
-            (Qt.Key_Escape, self.back.emit), (Qt.Key_Left, lambda: self.navigate.emit(-1)),
+            (Qt.Key_Escape, lambda: self._set_tool(None) if self.view.tool else self.back.emit()),
+            (Qt.Key_Left, lambda: self.navigate.emit(-1)),
             (Qt.Key_Right, lambda: self.navigate.emit(1)), (Qt.Key_V, self._toggle_mode),
+            (Qt.Key_B, lambda: self._set_tool(None if self.view.tool == PAINT else PAINT)),
+            (Qt.Key_E, lambda: self._set_tool(None if self.view.tool == ERASE else ERASE)),
+            (Qt.Key_BracketLeft, lambda: self.brush.setValue(self.brush.value() - 5)),
+            (Qt.Key_BracketRight, lambda: self.brush.setValue(self.brush.value() + 5)),
         ):
             QShortcut(QKeySequence(key), self, fn, context=Qt.WidgetWithChildrenShortcut)
+        QShortcut(QKeySequence.Undo, self, self._undo_stroke, context=Qt.WidgetWithChildrenShortcut)
+
+    def _build_shadow_tools(self) -> QWidget:
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setContentsMargins(0, 6, 0, 0)
+        v.setSpacing(6)
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        title = QLabel("Shadow areas")
+        title.setFixedWidth(170)
+        title.setToolTip("Paint over shadows to brighten them to match the light around them. Texture and "
+                         "contrast are kept, the edge blends in, and a blue shadow tint is matched too.")
+        seg = QFrame(objectName="Segment")
+        sl = QHBoxLayout(seg)
+        sl.setContentsMargins(3, 3, 3, 3)
+        sl.setSpacing(2)
+        self.paint_btn = QPushButton("Paint", checkable=True)
+        self.erase_btn = QPushButton("Erase", checkable=True)
+        self.paint_btn.setToolTip("Paint over a shadow to brighten it (B). Right-drag to move the picture.")
+        self.erase_btn.setToolTip("Rub out part of what you painted (E)")
+        for b, tool in ((self.paint_btn, PAINT), (self.erase_btn, ERASE)):
+            sl.addWidget(b)
+            b.clicked.connect(lambda on, t=tool: self._set_tool(t if on else None))
+        brush_label = QLabel("Brush", objectName="Muted")
+        self.brush = QSlider(Qt.Horizontal, minimum=1, maximum=100)
+        self.brush.setFixedWidth(150)
+        self.brush.setToolTip("Brush size ([ and ] keys)")
+        self.brush.setValue(int(config.settings().value(BRUSH_KEY, 40)))
+        self.brush.valueChanged.connect(self._brush_changed)
+        self.view.set_brush(_brush_fraction(self.brush.value()))
+        self.show_areas = QCheckBox("Show areas")
+        self.show_areas.setToolTip("Tint the painted areas red on the original (always shown while painting)")
+        self.show_areas.setChecked(str(config.settings().value(SHOW_AREAS_KEY, "false")).lower() == "true")
+        self.show_areas.toggled.connect(self._show_areas_changed)
+        self.view.set_show_areas(self.show_areas.isChecked())
+        self.undo_btn = QPushButton(theme.icon("reset"), "  Undo", clicked=self._undo_stroke)
+        self.undo_btn.setToolTip("Take back the last stroke (Ctrl+Z)")
+        self.clear_btn = QPushButton(theme.icon("clear"), "  Clear", clicked=self._clear_strokes)
+        self.clear_btn.setToolTip("Remove all painted shadow areas from this picture")
+        row.addWidget(title)
+        row.addWidget(seg)
+        row.addSpacing(8)
+        row.addWidget(brush_label)
+        row.addWidget(self.brush)
+        row.addSpacing(8)
+        row.addWidget(self.show_areas)
+        row.addStretch(1)
+        row.addWidget(self.undo_btn)
+        row.addWidget(self.clear_btn)
+        v.addLayout(row)
+        sliders = QHBoxLayout()
+        sliders.setSpacing(24)
+        self.shadow_rows: dict[str, AdjustRow] = {}
+        for key, label in (("strength", "Shadow lift"), ("blend", "Edge blend")):
+            r = AdjustRow(key, label=label, tip=SHADOW_TIPS[key])
+            r.changed.connect(self._on_shadow_slider)
+            self.shadow_rows[key] = r
+            sliders.addWidget(r, 1)
+        v.addLayout(sliders)
+        return box
+
+    # ---- shadow areas ------------------------------------------------------
+    def _set_tool(self, tool: str | None):
+        self.paint_btn.setChecked(tool == PAINT)
+        self.erase_btn.setChecked(tool == ERASE)
+        self.view.set_tool(tool)
+        self.view.setFocus()
+
+    def _brush_changed(self, v: int):
+        config.settings().setValue(BRUSH_KEY, v)
+        self.view.set_brush(_brush_fraction(v))
+
+    def _show_areas_changed(self, on: bool):
+        config.settings().setValue(SHOW_AREAS_KEY, "true" if on else "false")
+        self.view.set_show_areas(on)
+
+    def _shadow(self) -> ShadowEdit:
+        return self.item.shadow if self.item.shadow is not None else ShadowEdit()
+
+    def _set_shadow(self, edit: ShadowEdit | None):
+        self.item.shadow = edit
+        self.view.set_shadow(edit)
+        self._changed()
+
+    def _on_stroke(self, stroke):
+        if self.item is None:
+            return
+        if stroke.erase and not self._shadow().strokes:
+            return  # nothing to rub out
+        edit = self._shadow()
+        self._set_shadow(replace(edit, strokes=edit.strokes + (stroke,)))
+
+    def _undo_stroke(self):
+        if self.item is not None and self._shadow().strokes:
+            edit = self._shadow()
+            self._set_shadow(replace(edit, strokes=edit.strokes[:-1]))
+
+    def _clear_strokes(self):
+        if self.item is not None and self._shadow().strokes:
+            self._set_shadow(replace(self._shadow(), strokes=()))
+
+    def _on_shadow_slider(self, key: str, v: int):
+        if self.item is not None:
+            self._set_shadow(replace(self._shadow(), **{key: v}))
 
     # ---- compare mode -----------------------------------------------------
     def _set_mode(self, mode: str, save: bool = True):
@@ -161,7 +289,9 @@ class EditorPage(QWidget):
         self.next_btn.setEnabled(index < total - 1)
         self._sync_controls()
         thumb = _pixmap(item.thumb) if item.thumb is not None else None
+        self.view.set_shadow(None)
         self.view.set_images(thumb, item.preview if item.preview_key is not None else None)
+        self.view.set_shadow(item.shadow)
         self.view.set_busy(True)
         self._pool.start(FullLoad(item, self._emitter))
         self.view.setFocus()
@@ -184,6 +314,11 @@ class EditorPage(QWidget):
         for key, row in self.rows.items():
             row.set_value(it.value(key, self.globals), key in it.custom, self.globals[key])
         self.use_global.setEnabled(bool(it.custom))
+        edit = self._shadow()
+        for key, row in self.shadow_rows.items():
+            row.set_value(getattr(edit, key))
+        self.undo_btn.setEnabled(bool(edit.strokes))
+        self.clear_btn.setEnabled(bool(edit.strokes))
 
     # ---- settings --------------------------------------------------------
     def _on_slider(self, key: str, v: int):
@@ -210,7 +345,8 @@ class EditorPage(QWidget):
     # ---- processing ------------------------------------------------------
     def _wanted(self):
         settings = self.item.settings(self.globals)
-        return tuple(sorted(settings.items())), (self.mode if settings.get("jpeg") else BALANCED)
+        return (tuple(sorted(settings.items())), (self.mode if settings.get("jpeg") else BALANCED),
+                self.item.shadow_edit())
 
     def _request(self):
         if self.item is None or self._full is None:
@@ -225,7 +361,7 @@ class EditorPage(QWidget):
         self.view.set_busy(True)
         if key[1] == BEST:
             self.message.setText("AI is working… a few seconds")
-        self._pool.start(Process((self.item, key), self._full, dict(key[0]), key[1], self._emitter))
+        self._pool.start(Process((self.item, key), self._full, dict(key[0]), key[1], self._emitter, key[2]))
 
     def _on_done(self, key, result):
         if isinstance(key, ImageItem):  # full-size load finished

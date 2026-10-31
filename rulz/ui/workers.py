@@ -9,6 +9,7 @@ from PySide6.QtCore import QObject, QRunnable, QThread, Signal
 
 from .. import config, imageio
 from ..filters import ADJUSTMENTS, process
+from ..shadows import ShadowEdit
 
 
 @dataclass(eq=False)
@@ -16,6 +17,7 @@ class ImageItem:
     path: Path
     thumb: np.ndarray | None = None  # small 8-bit copy of the original
     custom: dict[str, int] = field(default_factory=dict)  # own values; missing = follow global
+    shadow: ShadowEdit | None = None  # painted shadow areas to lift (this picture only)
     preview: object = None  # QPixmap of the processed thumbnail
     preview_key: tuple | None = None
     error: str | None = None
@@ -25,6 +27,10 @@ class ImageItem:
 
     def settings(self, globals_: dict[str, int]) -> dict[str, int]:
         return {k: self.value(k, globals_) for k in ADJUSTMENTS}
+
+    def shadow_edit(self) -> ShadowEdit | None:
+        """The shadow areas if they change anything, else None."""
+        return self.shadow if self.shadow is not None and self.shadow.active else None
 
 
 class _Emitter(QObject):
@@ -59,13 +65,15 @@ class FullLoad(QRunnable):
 
 
 class Process(QRunnable):
-    def __init__(self, key, img: np.ndarray, settings: dict, mode: str, emitter: _Emitter):
+    def __init__(self, key, img: np.ndarray, settings: dict, mode: str, emitter: _Emitter,
+                 shadow: ShadowEdit | None = None):
         super().__init__()
         self.key, self.img, self.settings, self.mode, self.emitter = key, img, settings, mode, emitter
+        self.shadow = shadow
 
     def run(self):
         try:
-            result = process(self.img, self.settings, self.mode)
+            result = process(self.img, self.settings, self.mode, shadow=self.shadow)
         except Exception as e:  # noqa: BLE001
             result = e
         self.emitter.done.emit(self.key, result)
@@ -96,9 +104,9 @@ class SaveAll(QThread):
     progress = Signal(int, str)  # index, file name
     finished_all = Signal(int, list)  # saved count, [(name, error)]
 
-    def __init__(self, jobs: list[tuple[Path, Path, dict]], mode: str):
+    def __init__(self, jobs: list[tuple[Path, Path, dict, ShadowEdit | None]], mode: str):
         super().__init__()
-        self.jobs = jobs  # (source, destination, settings)
+        self.jobs = jobs  # (source, destination, settings, shadow areas)
         self.mode = mode
         self._cancel = False
 
@@ -107,13 +115,13 @@ class SaveAll(QThread):
 
     def run(self):
         saved, errors = 0, []
-        for i, (src, dst, settings) in enumerate(self.jobs):
+        for i, (src, dst, settings, shadow) in enumerate(self.jobs):
             if self._cancel:
                 break
             self.progress.emit(i, src.name)
             try:
                 img = imageio.load(src)
-                imageio.save(dst, process(img, settings, self.mode))
+                imageio.save(dst, process(img, settings, self.mode, shadow=shadow))
                 saved += 1
             except Exception as e:  # noqa: BLE001
                 errors.append((src.name, str(e)))
