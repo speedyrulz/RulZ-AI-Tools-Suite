@@ -133,7 +133,8 @@ class FakeService:
         out = {}
         for img in images:
             self.seen_ids.append(img.id)
-            (r, g, b), (w, h) = _dominant(base64.b64decode(img.data_b64))
+            data = img.data if img.data is not None else base64.b64decode(img.data_b64)
+            (r, g, b), (w, h) = _dominant(data)
             if min(w, h) < 96:
                 out[img.id] = {"status": "skipped", "cached": False, "message": "too small"}
                 continue

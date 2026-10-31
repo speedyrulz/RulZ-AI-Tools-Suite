@@ -64,19 +64,26 @@ async def fetch_url(client: httpx.AsyncClient, url: str, timeout_s: float, max_b
     if not url.lower().startswith(("http://", "https://")):
         raise ImageError("only http(s) URLs are supported")
     try:
-        resp = await client.get(
+        async with client.stream(
+            "GET",
             url,
             timeout=timeout_s,
             follow_redirects=True,
             headers={"User-Agent": BROWSER_UA, "Accept": "image/avif,image/webp,image/*,*/*;q=0.8"},
-        )
+        ) as resp:
+            if resp.status_code >= 400:
+                raise ImageError(f"fetch failed: HTTP {resp.status_code}")
+            length = resp.headers.get("content-length", "")
+            if length.isdigit() and int(length) > max_bytes:
+                raise ImageError("image too large")
+            buf = bytearray()
+            async for chunk in resp.aiter_bytes():  # stop as soon as it's over the limit
+                buf += chunk
+                if len(buf) > max_bytes:
+                    raise ImageError("image too large")
+            return bytes(buf)
     except httpx.HTTPError as e:
         raise ImageError(f"fetch failed: {type(e).__name__}: {e}") from e
-    if resp.status_code >= 400:
-        raise ImageError(f"fetch failed: HTTP {resp.status_code}")
-    if len(resp.content) > max_bytes:
-        raise ImageError("image too large")
-    return resp.content
 
 
 def _has_transparency(img: Image.Image) -> bool:
@@ -93,18 +100,28 @@ def prepare_image(raw: bytes, max_edge: int, min_short_edge: int, jpeg_quality: 
     try:
         img = Image.open(io.BytesIO(raw))
         img.seek(0)  # first frame of animated GIF/WebP
+        w, h = img.size
+        if min(w, h) < min_short_edge:
+            raise ImageTooSmall(w, h)  # from the header: no need to decode it
+        # JPEG only: let the decoder scale by 1/2, 1/4 or 1/8 while decoding (DCT scaling, an area
+        # average). draft() never goes below the size asked for, so the LANCZOS resize below still
+        # only shrinks. EXIF rotation swaps both sides, so ask for the target in stored orientation.
+        if img.format == "JPEG" and max(w, h) >= 2 * max_edge:
+            s = max_edge / max(w, h)
+            img.draft(img.mode, (max(1, round(w * s)), max(1, round(h * s))))
         img.load()
     except (UnidentifiedImageError, OSError, ValueError) as e:
         raise ImageError(f"cannot decode image: {e}") from e
 
     img = ImageOps.exif_transpose(img)
     w, h = img.size
-    if min(w, h) < min_short_edge:
-        raise ImageTooSmall(w, h)
 
     scale = max_edge / max(w, h)
     if scale < 1:
-        img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.Resampling.LANCZOS)
+        # reducing_gap: a fast box reduce to ~3x the target first, then LANCZOS from there
+        img = img.resize(
+            (max(1, round(w * scale)), max(1, round(h * scale))), Image.Resampling.LANCZOS, reducing_gap=3.0
+        )
 
     buf = io.BytesIO()
     if _has_transparency(img):

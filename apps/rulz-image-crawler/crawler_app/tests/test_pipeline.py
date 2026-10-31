@@ -271,3 +271,34 @@ def test_api_folder_validation(tmp_path, fake_service):
         assert missing.status_code == 422 and "folder not found" in missing.text
         ok = client.post("/api/runs", json={"folder": f'"{tmp_path}"', "tag": tag})  # pasted with quotes
         assert ok.status_code == 200
+
+
+def test_storage_flushes_manifest_once_and_zips_a_snapshot(tmp_path):
+    from crawler_app.fetcher import check_image_bytes
+    from crawler_app.storage import RunStorage
+
+    from PIL import Image
+
+    def jpeg(color):
+        buf = io.BytesIO()
+        Image.new("RGB", (200, 150), color).save(buf, "JPEG")
+        return buf.getvalue()
+
+    folder = tmp_path / "run"
+    folder.mkdir()
+    st = RunStorage(folder, {"status": "running"})
+    st.write_manifest()
+    for i, c in enumerate(("red", "blue", "green")):
+        st.save(check_image_bytes(f"http://x/{c}.jpg", "http://x/", jpeg(c), 10**7), 0.5 + i * 0.2, c)
+    # saves don't rewrite matches.json each time; flush writes it once
+    assert json.loads((folder / "matches.json").read_text(encoding="utf-8"))["matches"] == []
+    assert st.dirty and st.flush() and not st.dirty and not st.flush()
+    assert len(json.loads((folder / "matches.json").read_text(encoding="utf-8"))["matches"]) == 3
+
+    st.save(check_image_bytes("http://x/w.jpg", "http://x/", jpeg("white"), 10**7), 0.95, "w")  # not flushed
+    with zipfile.ZipFile(st.build_zip(0.8)) as zf:
+        names = sorted(zf.namelist())
+        doc = json.loads(zf.read("matches.json"))
+    assert len(names) == 3 and "matches.json" in names  # green (0.9) and white (0.95) + manifest
+    assert len(doc["matches"]) == 4  # the zip's manifest is the current list, flushed or not
+    assert not list(folder.glob("*.part"))

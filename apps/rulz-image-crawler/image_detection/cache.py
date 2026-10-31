@@ -51,6 +51,15 @@ class ResultCache:
                 created_at REAL NOT NULL,
                 PRIMARY KEY (tag_text, model_id)
             );
+            -- original bytes -> the hash of what prepare_image made of them, so a cached image
+            -- doesn't have to be decoded and resized again just to find its results
+            CREATE TABLE IF NOT EXISTS prepared (
+                raw_hash      TEXT NOT NULL,
+                prep_key      TEXT NOT NULL,
+                prepared_hash TEXT NOT NULL,
+                created_at    REAL NOT NULL,
+                PRIMARY KEY (raw_hash, prep_key)
+            );
             """
         )
         self._db.commit()
@@ -76,6 +85,20 @@ class ResultCache:
             self._db.executemany(
                 "INSERT OR REPLACE INTO results VALUES (?,?,?,?,?,?,?)",
                 [(image_hash, rh, model_id, int(r.match), r.confidence, r.evidence, now) for rh, r in items.items()],
+            )
+            self._db.commit()
+
+    def get_prepared(self, raw_hash: str, prep_key: str) -> str | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT prepared_hash FROM prepared WHERE raw_hash=? AND prep_key=?", (raw_hash, prep_key)
+            ).fetchone()
+        return row[0] if row else None
+
+    def put_prepared(self, raw_hash: str, prep_key: str, prepared_hash: str) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT OR REPLACE INTO prepared VALUES (?,?,?,?)", (raw_hash, prep_key, prepared_hash, time.time())
             )
             self._db.commit()
 
