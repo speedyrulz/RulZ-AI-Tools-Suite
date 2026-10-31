@@ -15,7 +15,7 @@ C = dict(
 # Segoe Fluent Icons / Segoe MDL2 Assets code points
 GLYPH = dict(
     add="", folder="", back="", prev="", next="", save="",
-    delete="", clear="", image="", reset="", fit="", zoom="",
+    delete="", clear="", image="", reset="", fit="", zoom="", crop="",
 )
 
 
@@ -89,7 +89,7 @@ QMainWindow, #Page { background: %(bg)s; }
 #H2 { font-size: 14px; font-weight: 600; }
 #Muted { color: %(muted)s; }
 #Value { font-size: 14px; font-weight: 700; color: %(accent)s; min-width: 34px; }
-QSpinBox#Value { background: transparent; border: 1px solid transparent; border-radius: 6px; padding: 2px 4px; }
+QSpinBox#Value { background: transparent; border: 1px solid transparent; border-radius: 6px; padding: 2px 4px; min-height: 0px; }
 QSpinBox#Value:hover { border-color: %(border)s; background: %(input)s; }
 QSpinBox#Value:focus { border-color: %(accent)s; background: %(input)s; color: %(text)s; }
 QSpinBox#Value::up-button, QSpinBox#Value::down-button { width: 0px; height: 0px; border: 0; image: none; subcontrol-origin: border; }
@@ -134,4 +134,13 @@ QProgressDialog, QDialog, QMessageBox { background: %(bg)s; }
 QProgressBar { background: %(placeholder)s; border: none; border-radius: 3px; max-height: 6px; text-align: center; }
 QProgressBar::chunk { background: %(accent)s; border-radius: 3px; }
 QToolTip { background: %(card)s; color: %(text)s; border: 1px solid %(border)s; padding: 4px 8px; }
+
+QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox {
+    background: %(input)s; border: 1px solid %(border)s; border-radius: 6px; padding: 5px 8px; min-height: 18px;
+}
+QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus, QSpinBox:focus { border-color: %(accent)s; }
+QComboBox QAbstractItemView { background: %(card)s; border: 1px solid %(border)s; selection-background-color: %(hover)s; }
+QCheckBox { spacing: 8px; }
+#Section { color: %(muted)s; font-weight: 600; padding-top: 10px; }
+#PreviewPanel { background: %(surface)s; border: 1px solid %(border)s; border-radius: 10px; }
 """ % C
