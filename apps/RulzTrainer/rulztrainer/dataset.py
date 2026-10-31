@@ -298,11 +298,18 @@ def cache_latents(items: list[Item], cfg: TrainConfig, vae, progress=None, vaes:
     log.info("Caching latents: %d of %d images need encoding%s", len(todo), len(items),
              f" (split across {', '.join(str(d) for _, d in workers)})" if len(workers) > 1 else "")
 
-    @torch.no_grad()
-    def encode(worker, it):
-        v = worker[0]
+    def prepare(it):
         img = load_image_fit(it.image, it.width, it.height, it.src_box)
-        t = torch.from_numpy(np.asarray(img).copy()).permute(2, 0, 1).float() / 127.5 - 1.0
+        return torch.from_numpy(np.asarray(img).copy()).permute(2, 0, 1).float() / 127.5 - 1.0
+
+    # the next pictures are decoded and resized on CPU threads while the VAE encodes this one
+    prefetch = LatentPrefetch(todo, prepare, ahead=PREFETCH_AHEAD + len(workers))
+
+    @torch.no_grad()
+    def encode(worker, i):
+        v = worker[0]
+        it = todo[i]
+        t = prefetch.get(i)
         lat = encode_images(v, t.unsqueeze(0))[0].cpu()
         save_file({"latent": lat.contiguous()}, str(it.latent_path))
         if it.latent_flip_path:
@@ -316,7 +323,46 @@ def cache_latents(items: list[Item], cfg: TrainConfig, vae, progress=None, vaes:
         if progress:
             progress(count[0], len(todo))
 
-    run_queue(workers, todo, encode, on_done=done)
+    try:
+        run_queue(workers, list(range(len(todo))), encode, on_done=done)
+    finally:
+        prefetch.close()
+
+
+PREFETCH_AHEAD = 2  # pictures prepared ahead of the encoders, plus one per encoder
+
+
+class LatentPrefetch:
+    """`fn(items[i])` run a few items ahead on a small thread pool: get(i) returns item i's result (waiting for it
+    if needed) and queues the next ones up to `ahead` past i. The encoders take items roughly in order (several GPUs
+    pull from one queue), so a window past the latest request covers them all."""
+
+    def __init__(self, items: list, fn, ahead: int = 3, threads: int = 2):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        self.items, self.fn, self.ahead = items, fn, max(1, int(ahead))
+        self.pool = ThreadPoolExecutor(max_workers=max(1, int(threads)), thread_name_prefix="latent-prep")
+        self.futures: dict = {}
+        self.next = 0  # the first item not queued yet
+        self.lock = threading.Lock()
+
+    def get(self, i: int):
+        with self.lock:
+            while self.next < min(len(self.items), i + 1 + self.ahead):
+                self.futures[self.next] = self.pool.submit(self.fn, self.items[self.next])
+                self.next += 1
+            fut = self.futures.pop(i, None)
+        if fut is None:  # asked twice or out of the window: prepared here
+            return self.fn(self.items[i])
+        return fut.result()
+
+    def close(self) -> None:
+        with self.lock:
+            for fut in self.futures.values():
+                fut.cancel()
+            self.futures.clear()
+        self.pool.shutdown(wait=True)
 
 
 def text_jobs(items: list[Item], cfg: TrainConfig, extra_prompts: list[str] | None = None) -> tuple[dict, int]:
