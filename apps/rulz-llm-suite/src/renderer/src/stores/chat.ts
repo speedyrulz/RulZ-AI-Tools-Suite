@@ -169,7 +169,8 @@ function persistSoon(conv: Conversation): void {
   saveTimers.set(conv.id, setTimeout(() => void persistNow(conv), 500))
 }
 
-// ---- Streaming deltas are batched per animation frame ----
+// ---- Streaming deltas are batched: every update re-renders the message's Markdown, so ~11 per second ----
+const FLUSH_MS = 90
 let pending = { content: '', reasoning: '' }
 let flushQueued = false
 
@@ -280,7 +281,7 @@ export const useChat = create<ChatState>((set, get) => {
         if (gen.promptProgress !== null) set({ generation: { ...gen, promptProgress: null } })
         if (!flushQueued) {
           flushQueued = true
-          requestAnimationFrame(flushPending)
+          setTimeout(flushPending, FLUSH_MS)
         }
         break
       case 'done':

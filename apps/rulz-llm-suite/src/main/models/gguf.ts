@@ -1,4 +1,4 @@
-import { closeSync, fstatSync, openSync, readSync } from 'node:fs'
+import { closeSync, fstatSync, openSync, promises as fs, readSync } from 'node:fs'
 import type { GgufInfo } from '@shared/types'
 
 // GGUF value types (https://github.com/ggml-org/ggml/blob/master/docs/gguf.md)
@@ -7,24 +7,30 @@ const SCALAR_SIZE: Record<number, number> = { [U8]: 1, [I8]: 1, [U16]: 2, [I16]:
 const CHUNK = 1 << 20
 /** Numeric arrays up to this length are kept (per-layer head counts and similar). */
 const MAX_KEPT_ARRAY = 1024
+/** First read size for the async parser; most headers (tokenizer included) fit in a few MiB. */
+const ASYNC_FIRST_READ = 8 << 20
 
-/** Sequential reader over a file descriptor with a 1 MiB window. */
+/** Returns at least `need` bytes of the file starting at `pos` (up to `want`). */
+type Loader = (pos: number, want: number, need: number) => Buffer
+
+/** Thrown by a prefetched loader when the header runs past the bytes read so far. */
+class NeedMoreBytes extends Error {}
+
+/** Sequential reader with a sliding window over the file. */
 class Reader {
-  private buf = Buffer.alloc(0)
+  private buf: Buffer = Buffer.alloc(0)
   private start = 0
   pos = 0
 
   constructor(
-    private readonly fd: number,
+    private readonly load: Loader,
     private readonly size: number
   ) {}
 
   private view(n: number): number {
     if (this.pos < this.start || this.pos + n > this.start + this.buf.length) {
       if (this.pos + n > this.size) throw new Error('Unexpected end of GGUF header')
-      const len = Math.min(Math.max(n, CHUNK), this.size - this.pos)
-      this.buf = Buffer.allocUnsafe(len)
-      readSync(this.fd, this.buf, 0, len, this.pos)
+      this.buf = this.load(this.pos, Math.min(Math.max(n, CHUNK), this.size - this.pos), n)
       this.start = this.pos
     }
     const off = this.pos - this.start
@@ -54,6 +60,13 @@ class Reader {
     if (len > 64 * 1024 * 1024) throw new Error('GGUF string too long')
     const off = this.view(len)
     return this.buf.toString('utf8', off, off + len)
+  }
+
+  /** Skips a string without decoding it (tokenizer vocabularies hold 100k+ of them). */
+  skipStr(): void {
+    const len = this.u64()
+    if (len > 64 * 1024 * 1024) throw new Error('GGUF string too long')
+    this.skip(len)
   }
 
   skip(n: number): void {
@@ -95,7 +108,8 @@ function readValue(r: Reader, type: number): unknown {
     for (let i = 0; i < count; i++) out.push(readScalar(r, elemType))
     return out
   }
-  for (let i = 0; i < count; i++) readValue(r, elemType)
+  if (elemType === STR) for (let i = 0; i < count; i++) r.skipStr()
+  else for (let i = 0; i < count; i++) readValue(r, elemType)
   return undefined
 }
 
@@ -107,35 +121,71 @@ export interface GgufHeader {
   hasNextn: boolean
 }
 
+function parseHeader(r: Reader): GgufHeader {
+  if (r.u32() !== 0x46554747) throw new Error('Not a GGUF file')
+  const version = r.u32()
+  if (version < 2 || version > 3) throw new Error(`Unsupported GGUF version ${version}`)
+  const tensorCount = r.u64()
+  const kvCount = r.u64()
+  const kv: Record<string, unknown> = {}
+  for (let i = 0; i < kvCount; i++) {
+    const key = r.str()
+    const type = r.u32()
+    const value = readValue(r, type)
+    kv[key] = value === undefined ? null : value
+  }
+  // Tensor infos follow the metadata: name, dims, type, offset.
+  let hasNextn = false
+  try {
+    for (let i = 0; i < tensorCount && !hasNextn; i++) {
+      hasNextn = r.str().includes('.nextn.')
+      r.skip(r.u32() * 8 + 4 + 8)
+    }
+  } catch (err) {
+    if (err instanceof NeedMoreBytes) throw err
+    // A truncated tensor table only costs the MTP check.
+  }
+  return { version, tensorCount, kv, hasNextn }
+}
+
+/** Synchronous header read (tests and tools); the app uses readGgufHeaderAsync. */
 export function readGgufHeader(path: string): GgufHeader {
   const fd = openSync(path, 'r')
   try {
-    const r = new Reader(fd, fstatSync(fd).size)
-    if (r.u32() !== 0x46554747) throw new Error('Not a GGUF file')
-    const version = r.u32()
-    if (version < 2 || version > 3) throw new Error(`Unsupported GGUF version ${version}`)
-    const tensorCount = r.u64()
-    const kvCount = r.u64()
-    const kv: Record<string, unknown> = {}
-    for (let i = 0; i < kvCount; i++) {
-      const key = r.str()
-      const type = r.u32()
-      const value = readValue(r, type)
-      kv[key] = value === undefined ? null : value
+    const load: Loader = (pos, want) => {
+      const buf = Buffer.allocUnsafe(want)
+      readSync(fd, buf, 0, want, pos)
+      return buf
     }
-    // Tensor infos follow the metadata: name, dims, type, offset.
-    let hasNextn = false
-    try {
-      for (let i = 0; i < tensorCount && !hasNextn; i++) {
-        hasNextn = r.str().includes('.nextn.')
-        r.skip(r.u32() * 8 + 4 + 8)
-      }
-    } catch {
-      // A truncated tensor table only costs the MTP check.
-    }
-    return { version, tensorCount, kv, hasNextn }
+    return parseHeader(new Reader(load, fstatSync(fd).size))
   } finally {
     closeSync(fd)
+  }
+}
+
+/**
+ * Reads the header without blocking the main process on disk I/O: the start of the file is read
+ * asynchronously and parsed from memory, reading more only for unusually large headers.
+ */
+export async function readGgufHeaderAsync(path: string): Promise<GgufHeader> {
+  const fh = await fs.open(path, 'r')
+  try {
+    const size = (await fh.stat()).size
+    for (let length = Math.min(size, ASYNC_FIRST_READ); ; length = Math.min(size, length * 4)) {
+      const pre = Buffer.allocUnsafe(length)
+      const { bytesRead } = await fh.read(pre, 0, length, 0)
+      const load: Loader = (pos, want, need) => {
+        if (pos + need > bytesRead) throw new NeedMoreBytes()
+        return pre.subarray(pos, Math.min(pos + want, bytesRead))
+      }
+      try {
+        return parseHeader(new Reader(load, size))
+      } catch (err) {
+        if (!(err instanceof NeedMoreBytes) || bytesRead >= size) throw err
+      }
+    }
+  } finally {
+    await fh.close()
   }
 }
 

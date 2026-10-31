@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import type {
   ChatRequest,
   GenerationStats,
@@ -11,6 +12,44 @@ import type { InstanceManager } from '../engine/instances'
 import { fitToContext, IMAGE_TOKENS, imageCount, textOf, type ContextApi } from './context'
 import { errorFromBody, interpretChunk, SseParser, statsFromTimings, ToolCallAccumulator } from './sse'
 import { jsonifyToolCallArgs, templateStringifiesArgs } from './toolArgs'
+
+/** Streamed text is sent to the renderer at most this often (one IPC message per token is wasteful). */
+const DELTA_FLUSH_MS = 30
+
+/**
+ * Collects streamed text and sends it in batches. Anything else sent for the same request goes
+ * through `before()` first so the renderer still sees events in order.
+ */
+export class DeltaBatcher {
+  private content = ''
+  private reasoning = ''
+  private timer: ReturnType<typeof setTimeout> | null = null
+
+  constructor(
+    private readonly emit: (content: string, reasoning: string) => void,
+    private readonly intervalMs = DELTA_FLUSH_MS
+  ) {}
+
+  push(content: string | undefined, reasoning: string | undefined): void {
+    if (content) this.content += content
+    if (reasoning) this.reasoning += reasoning
+    this.timer ??= setTimeout(() => this.flush(), this.intervalMs)
+  }
+
+  flush(): void {
+    if (this.timer) clearTimeout(this.timer)
+    this.timer = null
+    if (!this.content && !this.reasoning) return
+    const { content, reasoning } = this
+    this.content = ''
+    this.reasoning = ''
+    this.emit(content, reasoning)
+  }
+}
+
+function hashOf(text: string): string {
+  return createHash('sha1').update(text).digest('hex')
+}
 
 export function buildRequestBody(
   alias: string,
@@ -77,6 +116,12 @@ export class ChatService {
   /** Per loaded instance: does its chat template print tool-call arguments in Python form? */
   private argQuirk = new Map<string, Promise<boolean>>()
 
+  /** Drops what was cached for an instance that has been unloaded. */
+  forget(instanceId: string): void {
+    this.argQuirk.delete(instanceId)
+    this.toolTokenCache.delete(instanceId)
+  }
+
   private stringifiesArgs(instance: LoadedInstance): Promise<boolean> {
     let p = this.argQuirk.get(instance.instanceId)
     if (!p) {
@@ -96,8 +141,8 @@ export class ChatService {
     this.active.get(requestId)?.abort()
   }
 
-  /** Token count of the tool definitions sent with each request, cached per model and tool set. */
-  private toolTokenCache = new Map<string, number>()
+  /** Token count of the tool definitions sent with each request: per instance, by hash of the tool set. */
+  private toolTokenCache = new Map<string, Map<string, number>>()
 
   /** `tools` are the definitions sent with the request; they take context space too. */
   contextApi(instance: LoadedInstance, tools: unknown[] = []): ContextApi {
@@ -116,11 +161,13 @@ export class ChatService {
     const toolTokens = async (): Promise<number> => {
       if (!tools.length) return 0
       const json = JSON.stringify(tools)
-      const key = `${instance.instanceId}:${json}`
-      let n = this.toolTokenCache.get(key)
+      const key = hashOf(json)
+      let perInstance = this.toolTokenCache.get(instance.instanceId)
+      if (!perInstance) this.toolTokenCache.set(instance.instanceId, (perInstance = new Map()))
+      let n = perInstance.get(key)
       if (n === undefined) {
         n = (await tokenize(json).catch(() => null)) ?? Math.ceil(json.length / 3)
-        this.toolTokenCache.set(key, n)
+        perInstance.set(key, n)
       }
       return n
     }
@@ -169,6 +216,9 @@ export class ChatService {
     let finishReason: string | undefined
     let stats: GenerationStats = {}
     let predicted = 0
+    const deltas = new DeltaBatcher((content, reasoning) =>
+      this.send({ type: 'delta', requestId, content: content || undefined, reasoning: reasoning || undefined })
+    )
 
     try {
       const inst = this.instances.readyFor(req.modelId)
@@ -231,14 +281,17 @@ export class ChatService {
           }
           const c = interpretChunk(json)
           if (c.error) throw new Error(c.error)
-          if (c.progress) this.send({ type: 'progress', requestId, ...c.progress })
+          if (c.progress) {
+            deltas.flush()
+            this.send({ type: 'progress', requestId, ...c.progress })
+          }
           if (c.reasoning || c.content) {
             const now = performance.now()
             firstTokenAt ??= now
             if (c.reasoning) reasoningStart ??= now
             if (c.content && reasoningStart !== null) reasoningEnd ??= now
             predicted++
-            this.send({ type: 'delta', requestId, content: c.content, reasoning: c.reasoning })
+            deltas.push(c.content, c.reasoning)
           }
           if (c.toolCalls) {
             firstTokenAt ??= performance.now()
@@ -249,6 +302,7 @@ export class ChatService {
         }
       }
       const calls = toolCalls.result()
+      deltas.flush()
       this.send({
         type: 'done',
         requestId,
@@ -257,6 +311,7 @@ export class ChatService {
         toolCalls: calls.length ? calls : undefined
       })
     } catch (err) {
+      deltas.flush()
       const final = this.finalStats(stats, t0, firstTokenAt, predicted, ctrl.signal.aborted ? 'stopped' : 'error')
       if (ctrl.signal.aborted) this.send({ type: 'done', requestId, stats: final, reasoningMs: reasoningMs() })
       else this.send({ type: 'error', requestId, error: (err as Error).message, stats: final })

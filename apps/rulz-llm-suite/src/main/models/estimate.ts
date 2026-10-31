@@ -1,3 +1,4 @@
+import { effectiveKvTypes } from '@shared/kv'
 import { parseTensorSplit } from '@shared/split'
 import type { KvCacheType, LoadConfig, MemoryEstimate, ModelEntry } from '@shared/types'
 
@@ -19,7 +20,8 @@ export const KV_BYTES: Record<KvCacheType, number> = {
 export function kvCacheBytes(model: ModelEntry, cfg: LoadConfig, ctx: number): number | null {
   const i = model.info
   if (!i?.blockCount || !i.headCountKv || !i.keyLength || !i.valueLength) return null
-  const perToken = i.headCountKv * (i.keyLength * KV_BYTES[cfg.cacheTypeK] + i.valueLength * KV_BYTES[cfg.cacheTypeV])
+  const kv = effectiveKvTypes(cfg)
+  const perToken = i.headCountKv * (i.keyLength * KV_BYTES[kv.k] + i.valueLength * KV_BYTES[kv.v])
   const swa = i.slidingWindow && i.slidingWindowFraction ? i.slidingWindowFraction : 0
   const swaCtx = Math.min(ctx, (i.slidingWindow ?? ctx) + (cfg.ubatchSize ?? 512))
   const tokenLayers = i.blockCount * ((1 - swa) * ctx + swa * swaCtx)
@@ -55,6 +57,8 @@ const PER_GPU_BYTES = 600 * MiB
 /** Rough memory estimate for loading `model` with `cfg`. Errs on the high side. */
 export function estimateMemory(model: ModelEntry, cfg: LoadConfig, free: FreeMemory): MemoryEstimate {
   const mmprojBytes = cfg.useMmproj && model.mmproj ? model.mmproj.sizeBytes : 0
+  // A projector kept on the CPU (--no-mmproj-offload) costs RAM, not VRAM.
+  const mmprojGpuBytes = cfg.mmprojOnCpu ? 0 : mmprojBytes
   const draftBytes = cfg.useDraft && model.draft?.kind ? model.draft.sizeBytes : 0
   const weightsBytes = model.sizeBytes + mmprojBytes + draftBytes
   const ctx = cfg.contextLength
@@ -74,13 +78,13 @@ export function estimateMemory(model: ModelEntry, cfg: LoadConfig, free: FreeMem
     index: g.index,
     name: g.name,
     share,
-    bytes: splitBytes * share + PER_GPU_BYTES + (i === 0 ? mmprojBytes : 0),
+    bytes: splitBytes * share + PER_GPU_BYTES + (i === 0 ? mmprojGpuBytes : 0),
     freeBytes: g.freeBytes,
     totalBytes: g.totalBytes
   }))
 
   const overheadBytes = PER_GPU_BYTES * Math.max(1, perGpu.length) + scaledOverhead
-  const gpuBytes = perGpu.length ? perGpu.reduce((sum, g) => sum + g.bytes, 0) : splitBytes + PER_GPU_BYTES + mmprojBytes
+  const gpuBytes = perGpu.length ? perGpu.reduce((sum, g) => sum + g.bytes, 0) : splitBytes + PER_GPU_BYTES + mmprojGpuBytes
   const totalBytes = weightsBytes + (kvBytes ?? 0) + overheadBytes
   const freeVramBytes = perGpu.length ? perGpu.reduce((sum, g) => sum + g.freeBytes, 0) : free.vramBytes
 

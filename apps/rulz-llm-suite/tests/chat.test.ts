@@ -1,9 +1,32 @@
 import { jsonifyToolCallArgs, templateStringifiesArgs } from '../src/main/chat/toolArgs'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { DEFAULT_SAMPLING } from '@shared/defaults'
 import type { WireMessage } from '@shared/types'
-import { ContextFullError, fitToContext, pinnedPrefixLength, truncateMiddle } from '../src/main/chat/context'
-import { buildRequestBody } from '../src/main/chat/service'
+import { ContextFullError, fitToContext, pinnedPrefixLength, truncateMiddle, upperBoundTokens } from '../src/main/chat/context'
+import { buildRequestBody, DeltaBatcher } from '../src/main/chat/service'
+
+describe('DeltaBatcher', () => {
+  it('sends streamed text in batches and flushes on demand', () => {
+    vi.useFakeTimers()
+    try {
+      const sent: [string, string][] = []
+      const b = new DeltaBatcher((c, r) => sent.push([c, r]), 30)
+      b.push('Hel', undefined)
+      b.push('lo', 'hmm')
+      expect(sent).toEqual([])
+      vi.advanceTimersByTime(30)
+      expect(sent).toEqual([['Hello', 'hmm']])
+      b.push(' world', undefined)
+      b.flush()
+      b.flush()
+      expect(sent).toEqual([['Hello', 'hmm'], [' world', '']])
+      vi.advanceTimersByTime(100)
+      expect(sent).toHaveLength(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
 import { errorFromBody, interpretChunk, SseParser, statsFromTimings } from '../src/main/chat/sse'
 import { parseSettings } from '../src/main/settings/schema'
 import { openAfterThinking } from '../src/renderer/src/lib/thinking'
@@ -89,10 +112,27 @@ describe('context fitting', () => {
       countConversation: async (m: WireMessage[]) => m.length * 100,
       countText: async () => 90
     }
-    const fitted = await fitToContext(msgs, 500, 100, 'truncateMiddle', api)
-    expect(fitted.map((m) => m.content)).toEqual(['sys', 'first', 'a2', 'last'])
-    await expect(fitToContext(msgs, 500, 100, 'stop', api)).rejects.toBeInstanceOf(ContextFullError)
-    expect(await fitToContext(msgs, 10000, 100, 'stop', api)).toBe(msgs)
+    // Long enough that the quick size check can't rule out an overflow.
+    const long = msgs.map((m) => ({ ...m, content: `${m.content}${' '.repeat(200)}` }))
+    const fitted = await fitToContext(long, 500, 100, 'truncateMiddle', api)
+    expect(fitted.map((m) => (m.content as string).trim())).toEqual(['sys', 'first', 'a2', 'last'])
+    await expect(fitToContext(long, 500, 100, 'stop', api)).rejects.toBeInstanceOf(ContextFullError)
+    expect(await fitToContext(long, 10000, 100, 'stop', api)).toBe(long)
+  })
+
+  it('skips counting when the chat is clearly small enough', async () => {
+    let calls = 0
+    const api = {
+      countConversation: async () => {
+        calls++
+        return 10
+      },
+      countText: async () => 1
+    }
+    expect(await fitToContext(msgs, 8192, 2048, 'stop', api)).toBe(msgs)
+    expect(calls).toBe(0)
+    // Multi-byte text is counted by UTF-8 bytes, so it is never underestimated.
+    expect(upperBoundTokens([{ role: 'user', content: '漢字' }])).toBe(64 + 16 + 6)
   })
 })
 

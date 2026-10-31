@@ -4,7 +4,7 @@ import type { GgufInfo, ModelEntry, SidecarFile } from '@shared/types'
 import { draftKind } from '@shared/draft'
 export { draftKind }
 import { readJson, writeJsonAtomic } from '../util/jsonFile'
-import { readGgufHeader, toGgufInfo } from './gguf'
+import { readGgufHeaderAsync, toGgufInfo } from './gguf'
 
 export interface ScannedFile {
   path: string
@@ -132,8 +132,8 @@ interface CacheEntry {
   error?: string
 }
 
-function ggufInfo(path: string): GgufInfo {
-  const header = readGgufHeader(path)
+async function ggufInfo(path: string): Promise<GgufInfo> {
+  const header = await readGgufHeaderAsync(path)
   return toGgufInfo(header.kv, basename(path), header.hasNextn)
 }
 
@@ -187,7 +187,7 @@ export class ModelLibrary {
           entry = { v: CACHE_VERSION, size: f.size, mtimeMs: f.mtimeMs, info: null }
         } else {
           try {
-            entry = { v: CACHE_VERSION, size: f.size, mtimeMs: f.mtimeMs, info: ggufInfo(f.path) }
+            entry = { v: CACHE_VERSION, size: f.size, mtimeMs: f.mtimeMs, info: await ggufInfo(f.path) }
           } catch (err) {
             entry = { v: CACHE_VERSION, size: f.size, mtimeMs: f.mtimeMs, info: null, error: (err as Error).message }
           }

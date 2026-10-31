@@ -24,20 +24,40 @@ export class HardwareMonitor {
   private timer: NodeJS.Timeout | null = null
   private smiAvailable = true
 
-  constructor(private readonly onUpdate: (s: HardwareSnapshot) => void) {}
+  private running = false
+
+  constructor(
+    private readonly onUpdate: (s: HardwareSnapshot) => void,
+    /** While false (window hidden or in the background, nothing loading), nvidia-smi runs less often. */
+    private readonly isActive: () => boolean = () => true
+  ) {}
 
   snapshot(): HardwareSnapshot {
     return this.latest
   }
 
-  start(intervalMs = 2000): void {
-    if (this.timer) return
-    void this.refresh()
-    this.timer = setInterval(() => void this.refresh(), intervalMs)
+  start(activeMs = 2000, idleMs = 10000): void {
+    if (this.running) return
+    this.running = true
+    const tick = async (): Promise<void> => {
+      await this.refresh()
+      if (this.running) this.timer = setTimeout(() => void tick(), this.isActive() ? activeMs : idleMs)
+    }
+    this.poke = () => {
+      if (!this.running) return
+      if (this.timer) clearTimeout(this.timer)
+      this.timer = null
+      void tick()
+    }
+    void tick()
   }
 
+  /** Refreshes now and goes back to the fast rate if active again (e.g. the window was focused). */
+  poke: () => void = () => undefined
+
   stop(): void {
-    if (this.timer) clearInterval(this.timer)
+    this.running = false
+    if (this.timer) clearTimeout(this.timer)
     this.timer = null
   }
 

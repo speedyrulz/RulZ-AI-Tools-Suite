@@ -156,6 +156,7 @@ const remoteLoadPatchSchema = z
     // Proportions per GPU, e.g. "3,1" — numbers only, so nothing else reaches the command line.
     tensorSplit: z.string().regex(/^\s*(\d+(\.\d+)?(\s*,\s*\d+(\.\d+)?){0,15})?\s*$/, 'must be numbers separated by commas'),
     useDraft: z.boolean(),
+    mmprojOnCpu: z.boolean(),
     draftTokens: z.number().int().min(1).max(64).nullable(),
     draftMinTokens: z.number().int().min(0).max(64).nullable(),
     draftPMin: z.number().min(0).max(1).nullable(),
@@ -193,6 +194,7 @@ const REMOTE_LOAD_KEYS = [
   'mainGpu',
   'tensorSplit',
   'useDraft',
+  'mmprojOnCpu',
   'draftTokens',
   'draftMinTokens',
   'draftPMin',

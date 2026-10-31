@@ -1,3 +1,4 @@
+import { effectiveKvTypes } from '@shared/kv'
 import type { LoadConfig, ModelEntry } from '@shared/types'
 import { splitArgs } from './process'
 
@@ -18,8 +19,13 @@ export function buildServerArgs({ model, config: c, port, alias }: ServerArgsInp
     '--no-webui',
     '--jinja',
     '--reasoning-format', 'deepseek',
-    '--parallel', String(c.parallel)
+    '--parallel', String(c.parallel),
+    // Reuse cached chunks after the chat's head or middle changes (dropped turns, compacted tool
+    // results) instead of processing the whole prompt again. llama-server switches it off by itself
+    // where it can't work (vision projector loaded, contexts that can't shift).
+    '--cache-reuse', '256'
   ] // prettier-ignore
+  const kv = effectiveKvTypes(c)
 
   if (c.contextLength !== null) args.push('--ctx-size', String(c.contextLength))
   if (c.gpuLayers !== 'auto') args.push('--n-gpu-layers', String(c.gpuLayers))
@@ -30,14 +36,17 @@ export function buildServerArgs({ model, config: c, port, alias }: ServerArgsInp
   }
 
   if (c.flashAttention !== 'auto') args.push('--flash-attn', c.flashAttention)
-  if (c.cacheTypeK !== 'f16') args.push('--cache-type-k', c.cacheTypeK)
-  if (c.cacheTypeV !== 'f16') args.push('--cache-type-v', c.cacheTypeV)
+  if (kv.k !== 'f16') args.push('--cache-type-k', kv.k)
+  if (kv.v !== 'f16') args.push('--cache-type-v', kv.v)
   if (c.threads !== null) args.push('--threads', String(c.threads))
   if (c.batchSize !== null) args.push('--batch-size', String(c.batchSize))
   if (c.ubatchSize !== null) args.push('--ubatch-size', String(c.ubatchSize))
   if (!c.useMmap) args.push('--no-mmap')
   if (c.useMlock) args.push('--mlock')
-  if (c.useMmproj && model.mmproj) args.push('--mmproj', model.mmproj.path)
+  if (c.useMmproj && model.mmproj) {
+    args.push('--mmproj', model.mmproj.path)
+    if (c.mmprojOnCpu) args.push('--no-mmproj-offload')
+  }
   if (c.useDraft && model.draft?.kind) {
     // Built-in MTP layers run on the main model's weights, so there is no file and no separate offload.
     args.push('--spec-type', `draft-${model.draft.kind}`)
@@ -47,8 +56,8 @@ export function buildServerArgs({ model, config: c, port, alias }: ServerArgsInp
     if (c.draftPMin !== null) args.push('--spec-draft-p-min', String(c.draftPMin))
     if (c.draftSampling !== 'auto') args.push('--spec-draft-sampling', c.draftSampling)
     if (c.draftGpu !== 'auto' && !model.draft.builtIn) args.push('--spec-draft-ngl', c.draftGpu === 'gpu' ? 'all' : '0')
-    if (c.draftCacheTypeK !== 'f16') args.push('--spec-draft-type-k', c.draftCacheTypeK)
-    if (c.draftCacheTypeV !== 'f16') args.push('--spec-draft-type-v', c.draftCacheTypeV)
+    if (kv.draftK !== 'f16') args.push('--spec-draft-type-k', kv.draftK)
+    if (kv.draftV !== 'f16') args.push('--spec-draft-type-v', kv.draftV)
   }
   if (c.seed !== null) args.push('--seed', String(c.seed))
   if (c.chatTemplateFile.trim()) args.push('--chat-template-file', c.chatTemplateFile.trim())

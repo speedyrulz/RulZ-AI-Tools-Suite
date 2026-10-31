@@ -26,6 +26,8 @@ export interface LoadConfig {
   useMmap: boolean
   useMlock: boolean
   useMmproj: boolean
+  /** Keep the vision projector in system RAM (--no-mmproj-offload): frees its VRAM, encodes images more slowly. */
+  mmprojOnCpu: boolean
   /** Use the model's draft sidecar (MTP etc.) for speculative decoding when one exists. */
   useDraft: boolean
   /** Which draft to use: null = the one found with the model, 'builtin' = the model's own MTP layers,

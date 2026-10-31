@@ -51,7 +51,7 @@ export function ThinkingBlock({
       </Collapsible.Trigger>
       <Collapsible.Content>
         <div className="mt-2 border-l-2 border-border pl-3 text-[13px] text-muted">
-          <Markdown text={reasoning || '…'} />
+          <Markdown text={reasoning || '…'} live={streaming} />
         </div>
       </Collapsible.Content>
     </Collapsible.Root>

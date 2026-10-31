@@ -22,6 +22,7 @@ export const loadConfigSchema = z.object({
   useMmap: z.boolean().catch(L.useMmap),
   useMlock: z.boolean().catch(L.useMlock),
   useMmproj: z.boolean().catch(L.useMmproj),
+  mmprojOnCpu: z.boolean().catch(L.mmprojOnCpu),
   useDraft: z.boolean().catch(L.useDraft),
   draftFile: z.string().min(1).nullable().catch(L.draftFile),
   draftTokens: z.number().int().min(1).max(64).nullable().catch(L.draftTokens),
