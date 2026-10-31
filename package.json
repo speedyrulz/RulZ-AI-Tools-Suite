@@ -1,7 +1,7 @@
 {
   "name": "rulz-ai-tools-suite",
   "productName": "RulZ AI Tools Suite",
-  "version": "1.8.0",
+  "version": "1.8.1",
   "description": "One launcher for the RulZ AI tools: browse, install, update and launch every app.",
   "main": "./out/main/index.js",
   "author": "RulZ",
