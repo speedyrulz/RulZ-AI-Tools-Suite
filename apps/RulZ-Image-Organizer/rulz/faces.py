@@ -85,12 +85,19 @@ class FaceEngine:
         yaw, pitch, roll = attributes.head_pose(row[4:14])
         return FaceAttrs(expr, conf, yaw, pitch, roll)
 
-    def find_row(self, bgr: np.ndarray, box_norm) -> np.ndarray | None:
-        """Re-detect and return the YuNet row that best matches a stored face box (IoU >= 0.3)."""
+    def detect_rows(self, bgr: np.ndarray) -> np.ndarray:
+        """Every YuNet detection (loose threshold), for matching several stored boxes with ``find_row``."""
+        return self._detect_raw(bgr, score_threshold=0.5)
+
+    def find_row(self, bgr: np.ndarray, box_norm, rows: np.ndarray | None = None) -> np.ndarray | None:
+        """Return the YuNet row that best matches a stored face box (IoU >= 0.3).
+
+        Pass ``rows`` from ``detect_rows`` to match many boxes of one photo without re-detecting each time.
+        """
         H, W = bgr.shape[:2]
         bx, by, bw, bh = box_norm[0] * W, box_norm[1] * H, box_norm[2] * W, box_norm[3] * H
         best, best_iou = None, 0.3
-        for row in self._detect_raw(bgr, score_threshold=0.5):
+        for row in (self.detect_rows(bgr) if rows is None else rows):
             x, y, w, h = (float(v) for v in row[:4])
             ix = max(0.0, min(x + w, bx + bw) - max(x, bx))
             iy = max(0.0, min(y + h, by + bh) - max(y, by))

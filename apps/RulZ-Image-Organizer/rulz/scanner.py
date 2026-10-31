@@ -5,6 +5,7 @@ UI-independent; the Qt worker in ``ui/worker.py`` drives it with callbacks.
 from __future__ import annotations
 
 import os
+import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -15,6 +16,10 @@ from .db import Database
 from .faces import FaceEngine
 
 Progress = Callable[[int, int, str], None]
+
+# Library changes are written in short transactions of this many photos, so the UI can save its own
+# edits in between instead of waiting on (or failing behind) the scanner's write lock.
+BATCH = 1000
 
 
 class Cancelled(Exception):
@@ -62,90 +67,126 @@ def sync_files(db: Database, progress: Progress, should_stop: Callable[[], bool]
 
         missing = {p: r for p, r in known.items() if p not in found}
         missing_by_fp = {r["fp"]: r for r in missing.values() if r["fp"]}
-        new_rows = []
-        with db.transaction():
-            for path, (size, mtime) in found.items():
-                row = known.get(path)
-                if row is not None:
-                    if row["size"] != size or abs((row["mtime"] or 0) - mtime) > 1:
-                        db.x("DELETE FROM faces WHERE photo_id=?", (row["id"],))
-                        db.x("UPDATE photos SET size=?, mtime=?, fp=?, faces_done=0, error=NULL WHERE id=?",
-                             (size, mtime, imaging.fingerprint(path, size), row["id"]))
-                        changed += 1
-                    continue
+        updated: list[tuple[int, int, float, str]] = []  # (photo id, size, mtime, fp) of changed files
+        moved: list[tuple[str, float, int]] = []
+        new_rows: list[tuple] = []
+
+        def flush():
+            nonlocal changed
+            if not (updated or moved or new_rows):
+                return
+            with db.transaction():
+                for photo_id, size, mtime, fp in updated:
+                    db.clear_photo_faces(photo_id)
+                    db.x("UPDATE photos SET size=?, mtime=?, fp=?, faces_done=0, error=NULL WHERE id=?",
+                         (size, mtime, fp, photo_id))
+                db.conn.executemany("UPDATE photos SET path=?, mtime=? WHERE id=?", moved)
+                db.conn.executemany("INSERT OR IGNORE INTO photos(folder_id, path, size, mtime, fp, taken_at) "
+                                    "VALUES(?,?,?,?,?,?)", new_rows)
+            changed += len(updated) + len(new_rows)
+            updated.clear()
+            moved.clear()
+            new_rows.clear()
+
+        total = len(found)
+        # Fingerprinting reads every new file, which can take minutes: it happens outside any transaction.
+        for n, (path, (size, mtime)) in enumerate(found.items(), 1):
+            if should_stop():
+                flush()  # keep what's done; the next scan carries on from here
+                raise Cancelled
+            if n % 250 == 0:
+                progress(n, total, f"Checking photos… {n:,} of {total:,}")
+            row = known.get(path)
+            if row is not None:
+                if row["size"] != size or abs((row["mtime"] or 0) - mtime) > 1:
+                    updated.append((row["id"], size, mtime, imaging.fingerprint(path, size)))
+            else:
                 fp = imaging.fingerprint(path, size)
-                moved = missing_by_fp.pop(fp, None) if fp else None
-                if moved is not None:
+                moved_row = missing_by_fp.pop(fp, None) if fp else None
+                if moved_row is not None:
                     # Same file, new name/location: keep its faces and people.
-                    db.x("UPDATE photos SET path=?, mtime=? WHERE id=?", (path, mtime, moved["id"]))
-                    missing.pop(moved["path"], None)
-                    continue
-                new_rows.append((fid, path, size, mtime, fp, mtime))
-            db.conn.executemany("INSERT OR IGNORE INTO photos(folder_id, path, size, mtime, fp, taken_at) "
-                                "VALUES(?,?,?,?,?,?)", new_rows)
-        changed += len(new_rows)
+                    moved.append((path, mtime, moved_row["id"]))
+                    missing.pop(moved_row["path"], None)
+                else:
+                    new_rows.append((fid, path, size, mtime, fp, mtime))
+            if len(updated) + len(moved) + len(new_rows) >= BATCH:
+                flush()
+        flush()
         if missing:
             db.delete_photos([r["id"] for r in missing.values()])
     db.cleanup_people()
     return changed
 
 
-def _prepare(row) -> tuple:
-    """Runs on a pool thread: decode, thumbnail, metadata."""
+_local = threading.local()
+
+
+def _prepare(row, engine_factory: Callable[[], FaceEngine]) -> tuple:
+    """Runs on a pool thread: decode, thumbnail, metadata, face detection and face crops.
+
+    Each pool thread keeps its own FaceEngine (they're not thread-safe); the scan thread only writes.
+    """
     try:
         li = imaging.load(row["path"], config.DETECT_MAX_SIDE)
         imaging.save_thumbnail(li.image, config.thumb_path(row["id"]))
-        return row, li, None
     except Exception as e:  # unreadable / corrupt / unsupported
-        return row, None, f"{type(e).__name__}: {e}"
+        return row, None, None, [], [], f"{type(e).__name__}: {e}"
+    engine = getattr(_local, "engine", None)
+    if engine is None:  # model loading errors are real failures: let them end the scan
+        engine = _local.engine = engine_factory()
+    err = None
+    try:
+        found = engine.detect(li.bgr())
+    except Exception as e:  # pragma: no cover - defensive
+        found, err = [], f"Face detection failed: {e}"
+    crops = [imaging.face_crop(li.image, f.box) for f in found]
+    return row, li.full_size, li.taken_at, found, crops, err
 
 
-def process_pending(db: Database, engine: FaceEngine, progress: Progress, changed: Callable[[], None],
-                    should_stop: Callable[[], bool]) -> int:
+def process_pending(db: Database, progress: Progress, changed: Callable[[], None],
+                    should_stop: Callable[[], bool], engine_factory: Callable[[], FaceEngine] = FaceEngine) -> int:
     pending = db.q("SELECT id, path, mtime FROM photos WHERE faces_done=0 ORDER BY id")
     total = len(pending)
     if not total:
         return 0
     last_notify = last_group = time.monotonic()
     done = 0
-    workers = max(2, min(6, (os.cpu_count() or 4) // 2))
+    # Detection runs on these threads too. OpenCV DNN already spreads each call over several cores and
+    # every thread loads its own models (~90 MB before buffers), so a handful of threads is enough.
+    workers = max(2, min(4, (os.cpu_count() or 4) // 2))
     pool = ThreadPoolExecutor(workers)
     rows = iter(pending)
     window: deque = deque()
 
     def fill():
-        # Decode a few photos ahead on the pool while this thread runs face detection.
-        while len(window) < workers * 3:
+        # Keep a few photos in flight so the pool never waits on this thread's database writes.
+        while len(window) < workers * 2:
             row = next(rows, None)
             if row is None:
                 break
-            window.append(pool.submit(_prepare, row))
+            window.append(pool.submit(_prepare, row, engine_factory))
 
     try:
         fill()
         while window:
             if should_stop():
                 raise Cancelled
-            row, li, err = window.popleft().result()
+            row, full_size, taken_at, found, crops, err = window.popleft().result()
             fill()
-            if li is None:
+            if full_size is None:
                 db.x("UPDATE photos SET faces_done=1, error=? WHERE id=?", (err, row["id"]))
             else:
-                try:
-                    found = engine.detect(li.bgr())
-                except Exception as e:  # pragma: no cover - defensive
-                    found, err = [], f"Face detection failed: {e}"
-                w, h = li.full_size
+                w, h = full_size
                 with db.transaction():
-                    db.x("DELETE FROM faces WHERE photo_id=?", (row["id"],))
-                    for f in found:
+                    db.clear_photo_faces(row["id"])
+                    for f, crop in zip(found, crops):
                         face_id = db.insert_face(row["id"], f)
                         try:
-                            imaging.save_face_crop(li.image, f.box, config.face_crop_path(face_id))
+                            imaging.save_crop(crop, config.face_crop_path(face_id))
                         except OSError:
                             pass
                     db.x("UPDATE photos SET width=?, height=?, taken_at=?, faces_done=1, error=? WHERE id=?",
-                         (w, h, li.taken_at or row["mtime"], err, row["id"]))
+                         (w, h, taken_at or row["mtime"], err, row["id"]))
             done += 1
             progress(done, total, f"Analyzing photos… {done:,} of {total:,}")
             now = time.monotonic()
@@ -185,15 +226,23 @@ def backfill_attributes(db: Database, engine: FaceEngine, progress: Progress, ch
         poses = engine.poses(bgr, [(f["x"], f["y"], f["w"], f["h"]) for f in need_pose]) if bgr is not None \
             else [None] * len(need_pose)
         pose_of = {f["id"]: body for f, body in zip(need_pose, poses)}
-        with db.transaction():
+        attrs_of = {}
+        detections = None  # detected once per photo, then matched against every stored box
+        for f in todo:
+            if f["attrs_done"]:
+                continue
+            attrs = None
+            if bgr is not None and not f["ignored"]:
+                if detections is None:
+                    detections = engine.detect_rows(bgr)
+                match = engine.find_row(bgr, (f["x"], f["y"], f["w"], f["h"]), detections)
+                if match is not None:
+                    attrs = engine.attributes_row(bgr, match)
+            attrs_of[f["id"]] = attrs
+        with db.transaction():  # only the writes hold the lock
             for f in todo:
                 if not f["attrs_done"]:
-                    attrs = None
-                    if bgr is not None and not f["ignored"]:
-                        match = engine.find_row(bgr, (f["x"], f["y"], f["w"], f["h"]))
-                        if match is not None:
-                            attrs = engine.attributes_row(bgr, match)
-                    db.set_face_attrs(f["id"], attrs)
+                    db.set_face_attrs(f["id"], attrs_of[f["id"]])
                 if want_body and not f["body_done"]:
                     body = pose_of.get(f["id"])
                     db.set_face_pose(f["id"], body.pose if body else None, bool(body and body.arms_up))
@@ -209,7 +258,7 @@ def full_scan(db: Database, engine: FaceEngine, progress: Progress, changed: Cal
     n_changed = sync_files(db, progress, should_stop)
     if n_changed:
         changed()
-    n = process_pending(db, engine, progress, changed, should_stop)
+    n = process_pending(db, progress, changed, should_stop)
     if backfill_attributes(db, engine, progress, changed, should_stop):
         changed()
     progress(0, 0, "Grouping faces…")

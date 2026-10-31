@@ -5,8 +5,8 @@ import os
 from datetime import datetime
 
 import numpy as np
-from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, QPen
+from PySide6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, QRunnable, QSize, Qt, QThreadPool, Signal
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QMenu, QScrollArea, QSizePolicy, QToolButton,
                                QVBoxLayout, QWidget)
 
@@ -24,6 +24,28 @@ def _fmt_size(n: int) -> str:
     return ""
 
 
+class _LoadSignals(QObject):
+    done = Signal(int, object, object, str)  # generation, PIL image, QImage, error
+
+
+class _LoadJob(QRunnable):
+    """Decodes a photo on a pool thread so stepping through photos never freezes the window."""
+
+    def __init__(self, gen: int, path: str, sig: _LoadSignals):
+        super().__init__()
+        self.gen, self.path, self.sig = gen, path, sig
+
+    def run(self):
+        try:
+            li = imaging.load(self.path, 2560)
+            w, h = li.image.size
+            data = li.image.tobytes()  # QImage only borrows this buffer until copy()
+            img = QImage(data, w, h, 3 * w, QImage.Format_RGB888).copy()
+            self.sig.done.emit(self.gen, li.image, img, "")
+        except Exception as e:
+            self.sig.done.emit(self.gen, None, None, str(e))
+
+
 class ImageCanvas(QWidget):
     faceClicked = Signal(object, QPoint)   # Face, global pos
     boxDrawn = Signal(QRectF)              # normalized box
@@ -33,7 +55,8 @@ class ImageCanvas(QWidget):
         super().__init__(parent)
         self.setMouseTracking(True)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.image = QImage()
+        self.image = QPixmap()  # converted once per photo; drawing a QImage converted it on every repaint
+        self._scaled = QPixmap()  # self.image at its on-screen size, so hover repaints are just a blit
         self.faces: list[Face] = []
         self.show_faces = True
         self.add_mode = False
@@ -62,6 +85,11 @@ class ImageCanvas(QWidget):
     def resizeEvent(self, e):
         self.prev_btn.move(16, self.height() // 2 - 24)
         self.next_btn.move(self.width() - 64, self.height() // 2 - 24)
+
+    def set_image(self, pm: QPixmap) -> None:
+        self.image = pm
+        self._scaled = QPixmap()
+        self.update()
 
     def image_rect(self) -> QRectF:
         if self.image.isNull():
@@ -95,7 +123,12 @@ class ImageCanvas(QWidget):
             p.drawText(self.rect(), Qt.AlignCenter, self.message or "")
             return
         ir = self.image_rect()
-        p.drawImage(ir, self.image)
+        dpr = self.devicePixelRatioF()
+        size = QSize(max(1, round(ir.width() * dpr)), max(1, round(ir.height() * dpr)))
+        if self._scaled.size() != size:
+            self._scaled = self.image.scaled(size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            self._scaled.setDevicePixelRatio(dpr)
+        p.drawPixmap(ir.topLeft(), self._scaled)
         accent = QColor(theme.BRAND_RED)
         if self.show_faces and not self.add_mode:
             f = QFont(self.font())
@@ -225,6 +258,13 @@ class ViewerPage(QWidget):
         self.index = 0
         self.pil = None
         self.changed = False
+        # Each _load bumps this; a decode that finishes after the user moved on is thrown away.
+        self._gen = 0
+        self._loading = False
+        self._pool = QThreadPool(self)
+        self._pool.setMaxThreadCount(2)
+        self._sig = _LoadSignals(self)
+        self._sig.done.connect(self._loaded)
 
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -335,30 +375,38 @@ class ViewerPage(QWidget):
     def _load(self):
         ph = self._photo()
         self.canvas.set_nav(self.index > 0, self.index < len(self.ids) - 1)
+        self._gen += 1
+        self.pil = None
         if ph is None:
-            self.canvas.image = QImage()
+            self._loading = False
+            self.unsetCursor()
             self.canvas.message = "This photo is no longer in your library."
             self.canvas.faces = []
-            self.canvas.update()
+            self.canvas.set_image(QPixmap())
             return
         self.title.setText(os.path.basename(ph.path))
         self.position.setText(f"{self.index + 1:,} of {len(self.ids):,}" if len(self.ids) > 1 else "")
-        self.setCursor(Qt.WaitCursor)
-        try:
-            li = imaging.load(ph.path, 2560)
-            self.pil = li.image
-            data = li.image.tobytes()
-            w, h = li.image.size
-            self.canvas.image = QImage(data, w, h, 3 * w, QImage.Format_RGB888).copy()
-            self.canvas.message = ""
-        except Exception as e:
-            self.pil = None
-            self.canvas.image = QImage()
-            self.canvas.message = f"Can't open this photo\n{e}"
-        finally:
-            self.unsetCursor()
+        # The previous photo stays up (without its face boxes) until this one is decoded.
+        self._loading = True
+        self.canvas.message = ""
+        self.setCursor(Qt.BusyCursor)
+        self._pool.start(_LoadJob(self._gen, ph.path, self._sig))
         self._load_faces()
         self._set_details(ph)
+
+    def _loaded(self, gen: int, pil, img, err: str):
+        if gen != self._gen:
+            return  # the user already moved on to another photo
+        self._loading = False
+        self.unsetCursor()
+        self.pil = pil
+        if img is None:
+            self.canvas.message = f"Can't open this photo\n{err}"
+            self.canvas.set_image(QPixmap())
+        else:
+            self.canvas.message = ""
+            self.canvas.set_image(QPixmap.fromImage(img))
+        self._load_faces()
 
     def _set_details(self, ph):
         taken = datetime.fromtimestamp(ph.taken_at).strftime("%A, %B %d, %Y · %I:%M %p") if ph.taken_at else "Unknown"
@@ -380,7 +428,7 @@ class ViewerPage(QWidget):
     def _load_faces(self):
         ph = self._photo()
         faces = self.ctx.db.faces_in_photo(ph.id) if ph else []
-        self.canvas.faces = faces
+        self.canvas.faces = [] if self._loading else faces  # boxes only over the photo they belong to
         self.canvas.hover = None
         self.canvas.update()
         while self.rows.count() > 1:
@@ -418,7 +466,7 @@ class ViewerPage(QWidget):
         m.addSeparator()
         if face.manual:
             m.addAction(theme.icon("delete"), "Remove this face tag", lambda: self._apply(
-                lambda: (db.x("DELETE FROM faces WHERE id=?", (face.id,)), db.cleanup_people())))
+                lambda: (db.delete_faces([face.id]), db.cleanup_people())))
         else:
             m.addAction(theme.icon("close"), "Not a face / ignore", lambda: self._apply(lambda: db.ignore_faces([face.id])))
         m.exec(pos)
@@ -456,7 +504,7 @@ class ViewerPage(QWidget):
             pass
         pid = dialogs.pick_person(self, db, title="Who is this?")
         if pid is None:
-            db.x("DELETE FROM faces WHERE id=?", (face_id,))
+            db.delete_faces([face_id])
         else:
             db.assign_faces([face_id], pid)
             self.changed = True
@@ -477,8 +525,11 @@ class ViewerPage(QWidget):
         self.info.setVisible(self.info_btn.isChecked())
 
     def close_viewer(self):
+        self._gen += 1  # ignore a decode still in flight
+        self._loading = False
+        self.unsetCursor()
         self.pil = None
-        self.canvas.image = QImage()
+        self.canvas.set_image(QPixmap())
         self.closed.emit()
 
     def keyPressEvent(self, e):

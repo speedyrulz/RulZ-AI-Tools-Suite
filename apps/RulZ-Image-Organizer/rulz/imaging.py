@@ -47,15 +47,17 @@ def load(path: str, max_side: int) -> LoadedImage:
         if orientation in (5, 6, 7, 8):
             w, h = h, w
         taken = _exif_date(exif)
-        if im.format == "JPEG":
-            # Decode at a reduced scale – much faster for big camera files.
-            im.draft("RGB", (max_side, max_side))
         if getattr(im, "n_frames", 1) > 1:
             im.seek(0)
+        if im.format in ("JPEG", "MPO"):  # MPO: JPEG with a second (3D / depth) frame, common from phones
+            # Decode at a reduced scale – much faster for big camera files.
+            im.draft("RGB", (max_side, max_side))
         im.load()
         im = ImageOps.exif_transpose(im)
         if im.mode != "RGB":
-            if im.mode in ("RGBA", "LA", "P", "PA"):
+            if im.mode in _HIGH_DEPTH:
+                im = _to_8bit(im)
+            elif im.mode in ("RGBA", "LA", "P", "PA"):
                 bg = Image.new("RGB", im.size, (255, 255, 255))
                 rgba = im.convert("RGBA")
                 bg.paste(rgba, mask=rgba.getchannel("A"))
@@ -65,6 +67,25 @@ def load(path: str, max_side: int) -> LoadedImage:
         if max(im.size) > max_side:
             im.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
         return LoadedImage(im, (w, h), taken)
+
+
+_HIGH_DEPTH = ("I;16", "I;16L", "I;16B", "I;16N", "I", "F")
+
+
+def _to_8bit(im: Image.Image) -> Image.Image:
+    """16-bit / 32-bit int / float grayscale to RGB. A plain convert() clips everything above 255 to white."""
+    a = np.asarray(im, dtype=np.float32)
+    hi = float(a.max()) if a.size else 0.0
+    if im.mode == "F" and hi <= 1.0:
+        scale = 255.0           # float images are usually 0..1
+    elif hi <= 255:
+        scale = 1.0             # 8-bit values stored in a wider mode
+    elif hi <= 65535 and im.mode != "F":
+        scale = 255.0 / 65535   # 16-bit range
+    else:
+        scale = 255.0 / hi
+    gray = np.clip(a * scale + 0.5, 0, 255).astype(np.uint8)
+    return Image.fromarray(gray, "L").convert("RGB")
 
 
 def _exif_date(exif) -> float | None:
@@ -102,6 +123,11 @@ def save_thumbnail(img: Image.Image, dest: Path) -> None:
 
 def save_face_crop(img: Image.Image, box_norm, dest: Path) -> None:
     """Save a square crop around a face (box normalized to ``img``)."""
+    save_crop(face_crop(img, box_norm), dest)
+
+
+def face_crop(img: Image.Image, box_norm) -> Image.Image:
+    """Square crop around a face (box normalized to ``img``), FACE_CROP_SIZE pixels."""
     W, H = img.size
     x, y, w, h = box_norm[0] * W, box_norm[1] * H, box_norm[2] * W, box_norm[3] * H
     cx, cy = x + w / 2, y + h / 2
@@ -109,7 +135,10 @@ def save_face_crop(img: Image.Image, box_norm, dest: Path) -> None:
     left, top = cx - side / 2, cy - side / 2
     crop = img.crop((round(left), round(top), round(left + side), round(top + side)))
     # Areas outside the image are filled black by crop(); that's fine for edge faces.
-    crop = crop.resize((config.FACE_CROP_SIZE, config.FACE_CROP_SIZE), Image.Resampling.LANCZOS)
+    return crop.resize((config.FACE_CROP_SIZE, config.FACE_CROP_SIZE), Image.Resampling.LANCZOS)
+
+
+def save_crop(crop: Image.Image, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     crop.save(dest, "JPEG", quality=88)
 

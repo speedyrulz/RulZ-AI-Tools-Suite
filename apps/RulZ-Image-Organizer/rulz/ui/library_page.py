@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtWidgets import (QFileDialog, QFrame, QHBoxLayout, QListWidget, QListWidgetItem, QProgressBar,
                                QScrollArea, QSlider, QVBoxLayout, QWidget)
 
@@ -101,6 +101,11 @@ class LibraryPage(QWidget):
         self.slider.setRange(30, 55)
         self.slider.setPageStep(2)
         self.slider.valueChanged.connect(self._slider_moved)
+        # Saved once the slider settles (or is released), not on every tick: each save is a database write.
+        self._threshold_dirty = False
+        self._save_timer = QTimer(self, singleShot=True, interval=500)
+        self._save_timer.timeout.connect(self.flush_settings)
+        self.slider.sliderReleased.connect(self.flush_settings)
         srow.addWidget(self.slider, 1)
         srow.addWidget(label("Stricter", "Muted"))
         grp.lay.addLayout(srow)
@@ -167,6 +172,7 @@ class LibraryPage(QWidget):
             it.setFlags(Qt.NoItemFlags)
             self.list.addItem(it)
         self._sel()
+        self.flush_settings()  # don't let the refresh below undo a change that hasn't been saved yet
         s = db.stats()
         self.stats.setText(f"{plural(s['photos'], 'photo')} · {plural(s['faces'], 'face')} · "
                            f"{plural(s['people'], 'person')} ({s['named']} named)")
@@ -213,9 +219,18 @@ class LibraryPage(QWidget):
         default = round(config.DEFAULT_MATCH_THRESHOLD * 100)
         self.slider_value.setText(f"Match threshold: {t:.2f}" + ("  (default)" if v == default else ""))
         if save:
-            self.ctx.db.set_setting("match_threshold", f"{t:.2f}")
+            self._threshold_dirty = True
+            self._save_timer.start()
+
+    def flush_settings(self):
+        """Save a threshold change that is still waiting for the slider to settle."""
+        if self._threshold_dirty:
+            self._threshold_dirty = False
+            self._save_timer.stop()
+            self.ctx.db.set_setting("match_threshold", f"{self.slider.value() / 100:.2f}")
 
     def _regroup(self):
+        self.flush_settings()
         self.ctx.scanner.regroup(self.slider.value() / 100)
 
     # ---- scan status -----------------------------------------------------------
