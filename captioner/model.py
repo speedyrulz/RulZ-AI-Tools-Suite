@@ -1,6 +1,7 @@
 """Image list model, lazy thumbnail loading and caption .txt persistence."""
 import os
 import re
+import threading
 from collections import OrderedDict
 from pathlib import Path
 
@@ -28,11 +29,24 @@ def caption_path(img_path):
     return str(Path(img_path).with_suffix(".txt"))
 
 
+def decode_caption(data):
+    """UTF-8 (with or without BOM); captions saved by older Windows tools in the ANSI code page
+    still read correctly instead of turning into replacement characters."""
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        pass
+    try:
+        return data.decode("cp1252")
+    except UnicodeDecodeError:
+        return data.decode("latin-1")
+
+
 def read_caption(img_path):
     cp = caption_path(img_path)
     try:
-        with open(cp, "r", encoding="utf-8", errors="replace") as f:
-            return f.read().strip("﻿"), True
+        with open(cp, "rb") as f:
+            return decode_caption(f.read()), True
     except OSError:
         return "", False
 
@@ -60,6 +74,11 @@ def collect_images(paths, recursive=False):
 class _ThumbSignals(QObject):
     done = Signal(str, QImage)
 
+    def __init__(self):
+        super().__init__()
+        self.lock = threading.Lock()
+        self.running = set()  # paths a pool thread is decoding right now
+
 
 class _ThumbJob(QRunnable):
     def __init__(self, path, signals):
@@ -67,14 +86,23 @@ class _ThumbJob(QRunnable):
         self.path, self.signals = path, signals
 
     def run(self):
+        with self.signals.lock:
+            self.signals.running.add(self.path)
+        try:
+            img = self._load()
+        finally:
+            with self.signals.lock:
+                self.signals.running.discard(self.path)
+        self.signals.done.emit(self.path, img)
+
+    def _load(self):
         r = QImageReader(self.path)
         r.setAutoTransform(True)
         sz = r.size()
         if sz.isValid() and max(sz.width(), sz.height()) > THUMB_GEN:
             sz.scale(THUMB_GEN, THUMB_GEN, Qt.KeepAspectRatio)
             r.setScaledSize(sz)
-        img = r.read()
-        self.signals.done.emit(self.path, img)
+        return r.read()
 
 
 class ImageModel(QAbstractListModel):
@@ -130,6 +158,13 @@ class ImageModel(QAbstractListModel):
         return False
 
     # -- thumbnails
+    def drop_queued_thumbs(self):
+        """Forget thumbnail jobs that haven't started (e.g. for cards scrolled past); the
+        cards now on screen ask again when they repaint."""
+        self.pool.clear()
+        with self.sig.lock:
+            self.pending = set(self.sig.running)
+
     def _thumb_ready(self, path, img):
         self.pending.discard(path)
         pm = QPixmap.fromImage(img) if not img.isNull() else QPixmap()
@@ -143,7 +178,14 @@ class ImageModel(QAbstractListModel):
 
     # -- mutation
     def add_paths(self, paths):
-        new = [p for p in dict.fromkeys(os.path.normpath(p) for p in paths) if p not in self.index_of]
+        # Windows paths are case-insensitive: C:\A\x.png and c:\a\X.PNG are the same file
+        seen = {os.path.normcase(p) for p in self.index_of}
+        new = []
+        for p in map(os.path.normpath, paths):
+            key = os.path.normcase(p)
+            if key not in seen:
+                seen.add(key)
+                new.append(p)
         if not new:
             return 0
         new.sort(key=natural_key)

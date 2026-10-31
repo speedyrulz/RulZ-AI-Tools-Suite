@@ -4,13 +4,13 @@ import threading
 
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QAction, QKeySequence
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDockWidget, QFileDialog, QFormLayout,
+from PySide6.QtWidgets import (QAbstractItemDelegate, QApplication, QCheckBox, QComboBox, QDockWidget, QFileDialog, QFormLayout,
                                QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
                                QPlainTextEdit, QProgressBar, QPushButton, QSlider, QToolBar, QVBoxLayout,
                                QWidget, QHBoxLayout)
 
 from . import config, theme
-from .backend import CaptionEngine, ServerManager, external_endpoints
+from .backend import CaptionEngine, ServerManager, StartCancelled, external_endpoints
 from .gridview import ImageGrid
 from .model import BUSY, ERROR, IDLE, QUEUED, FilterProxy, ImageModel, collect_images
 from .settings_dialog import SettingsDialog
@@ -23,6 +23,7 @@ class ServerBridge(QObject):
     log = Signal(str)
     ready = Signal(list)
     error = Signal(str)
+    cancelled = Signal()
 
 
 class MainWindow(QMainWindow):
@@ -43,6 +44,7 @@ class MainWindow(QMainWindow):
         self.starting = False
         self.pending_job = None
         self.failures = 0
+        self.snapshots = {}  # path -> caption when it was queued, to spot edits made meanwhile
 
         self.grid = ImageGrid()
         self.grid.setModel(self.proxy)
@@ -50,6 +52,8 @@ class MainWindow(QMainWindow):
         self.grid.setContextMenuPolicy(Qt.CustomContextMenu)
         self.grid.customContextMenuRequested.connect(self._context_menu)
         self.grid.error.connect(lambda m: QMessageBox.warning(self, "Save failed", m))
+        # after a fast scroll, don't decode every thumbnail scrolled past before the visible ones
+        self.grid.verticalScrollBar().valueChanged.connect(lambda _: self.model.drop_queued_thumbs())
         self.setCentralWidget(self.grid)
 
         self._build_actions()
@@ -65,6 +69,7 @@ class MainWindow(QMainWindow):
         self.bridge.log.connect(self._log)
         self.bridge.ready.connect(self._servers_ready)
         self.bridge.error.connect(self._servers_error)
+        self.bridge.cancelled.connect(self._servers_cancelled)
         self.model.stats_changed.connect(self._update_stats)
         self._update_stats()
 
@@ -367,11 +372,14 @@ class MainWindow(QMainWindow):
         self.log_dock.show()
 
         def run():
+            # start() kills what it launched if it fails or is cancelled, so no stop() here:
+            # that could kill servers a newer start already brought up
             try:
                 eps = self.servers.start(s, self.bridge.log.emit)
                 self.bridge.ready.emit(eps)
+            except StartCancelled:
+                self.bridge.cancelled.emit()
             except Exception as e:  # noqa: BLE001
-                self.servers.stop()
                 self.bridge.error.emit(str(e))
         threading.Thread(target=run, daemon=True).start()
 
@@ -379,7 +387,12 @@ class MainWindow(QMainWindow):
         self.current_settings()
         if self.s["backend"] != "managed":
             QMessageBox.information(self, "Servers", "The external backend is selected; there is nothing to start.")
-        elif not self.starting:
+        elif self.starting:
+            return
+        elif self.servers.running() and self.server_sig == self._managed_sig():
+            # same settings: reloading would only re-read the whole model from disk
+            self.statusBar().showMessage(f"{len(self.servers.endpoints)} server(s) already running", 4000)
+        else:
             self.server_sig = self._managed_sig()
             self._launch_servers()
 
@@ -406,6 +419,15 @@ class MainWindow(QMainWindow):
         self.a_stop.setEnabled(False)
         QMessageBox.critical(self, "Server failed to start", msg)
 
+    def _servers_cancelled(self):
+        self.starting = False
+        self.progress.setVisible(False)
+        self.server_sig = None
+        self._reset_queued()
+        self.pending_job = None
+        self.a_stop.setEnabled(False)
+        self.statusBar().showMessage("Server start stopped", 4000)
+
     # ------------------------------------------------------------------ captioning
     def caption(self, which):
         if self.engine.active or self.starting:
@@ -426,6 +448,7 @@ class MainWindow(QMainWindow):
             return
         for p in paths:
             self.model.set_status(p, QUEUED)
+        self.snapshots = {self.model.items[r]["path"]: self.model.items[r]["caption"] for r in rows}
         self.failures = 0
         self.a_stop.setEnabled(True)
         job = (paths, self.sys_edit.toPlainText(), self.user_edit.toPlainText().strip())
@@ -460,6 +483,17 @@ class MainWindow(QMainWindow):
     def _on_captioned(self, path, text):
         row = self.model.index_of.get(path)
         if row is None:
+            return
+        # an inline editor open on this card holds the old text: commit it now, so it can't
+        # overwrite the model's caption later and any typing in it counts as an edit below
+        ed = self.grid.indexWidget(self.proxy.mapFromSource(self.model.index(row)))
+        if ed is not None:
+            self.grid.commitData(ed)
+            self.grid.closeEditor(ed, QAbstractItemDelegate.NoHint)
+        before = self.snapshots.pop(path, None)
+        if before is not None and self.model.items[row]["caption"] != before:
+            self.model.set_status(path, IDLE)
+            self._log(f"Kept your edit of {os.path.basename(path)} (model caption not saved): {text}")
             return
         try:
             self.model.set_caption(row, text, force=True)
