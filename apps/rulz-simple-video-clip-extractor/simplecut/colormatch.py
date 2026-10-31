@@ -14,6 +14,7 @@ import hashlib
 import os
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -167,12 +168,17 @@ def write_cube_1d(tables: np.ndarray) -> str:
     for i in range(256):
         lines.append(f"{tables[0][i] / 255:.6f} {tables[1][i] / 255:.6f} {tables[2][i] / 255:.6f}")
     content = "\n".join(lines) + "\n"
-    d = os.path.join(tempfile.gettempdir(), "simplecut")
+    d = temp_dir()
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, f"match_{hashlib.md5(content.encode()).hexdigest()[:12]}.cube")
     if not os.path.exists(path):
         with open(path, "w", encoding="ascii") as f:
             f.write(content)
+    else:
+        try:
+            os.utime(path)  # in use again: clean_temp() goes by age
+        except OSError:
+            pass
     return path
 
 
@@ -189,14 +195,45 @@ def load_image(path: str) -> QImage | None:
     img = reader.read()
     if not img.isNull():
         return img
-    tmp = os.path.join(tempfile.gettempdir(), "simplecut", "ref_" + hashlib.md5(path.encode("utf-8")).hexdigest()[:12] + ".png")
+    tmp = os.path.join(temp_dir(), "ref_" + hashlib.md5(path.encode("utf-8")).hexdigest()[:12] + ".png")
     os.makedirs(os.path.dirname(tmp), exist_ok=True)
     r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", path, "-frames:v", "1", tmp],
                        capture_output=True, text=True, creationflags=0x08000000)
     if r.returncode != 0:
         return None
     img = QImage(tmp)
+    try:
+        os.remove(tmp)  # the pixels are in memory now
+    except OSError:
+        pass
     return None if img.isNull() else img
+
+
+def temp_dir() -> str:
+    return os.path.join(tempfile.gettempdir(), "simplecut")
+
+
+def clean_temp(max_age_s: float = 24 * 3600) -> int:
+    """Delete LUTs / reference images left in the temp folder by earlier sessions. Files younger
+    than max_age_s are kept: another running copy of the app may still be exporting with one."""
+    d = temp_dir()
+    removed = 0
+    now = time.time()
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return 0
+    for name in names:
+        if not (name.startswith(("match_", "ref_")) and name.endswith((".cube", ".png"))):
+            continue
+        p = os.path.join(d, name)
+        try:
+            if now - os.path.getmtime(p) > max_age_s:
+                os.remove(p)
+                removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 def downscale(img: QImage, max_side: int = WORK_MAX) -> QImage:

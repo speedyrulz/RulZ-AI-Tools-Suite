@@ -89,7 +89,9 @@ def gop_frames(info: VideoInfo, s: ExportSettings) -> int:
 
 
 def build_command(info: VideoInfo, start: float, end: float,
-                  out_path: str, s: ExportSettings) -> list[str]:
+                  out_path: str, s: ExportSettings, hwaccel: bool = False) -> list[str]:
+    """hwaccel: decode the source on the GPU (NVDEC) for re-encodes. Frames are copied back to
+    system memory, so every filter below works unchanged."""
     duration = max(end - start, 0.0)
     if s.mode == "lossless":
         # ffmpeg stops stream-copying when a packet's *decode* timestamp reaches
@@ -122,6 +124,8 @@ def build_command(info: VideoInfo, start: float, end: float,
         if k is None:
             k = info.start_time
         k = min(k, start)
+        if hwaccel:
+            cmd += ["-hwaccel", "cuda"]
         cmd += ["-ss", f"{max(k - fmt0, 0.0):.6f}", "-i", info.path,
                 "-ss", f"{max(start - k, 0.0):.6f}", "-t", f"{duration:.6f}"]
 
@@ -168,28 +172,70 @@ def build_command(info: VideoInfo, start: float, end: float,
     return cmd
 
 
+def build_commands(info: VideoInfo, start: float, end: float,
+                   out_path: str, s: ExportSettings) -> list[list[str]]:
+    """Commands to try in order: re-encodes first with GPU decoding (2-4x faster on 4K), then,
+    if that fails (no CUDA device, a format NVDEC can't take), the same without it."""
+    if s.mode == "lossless":
+        return [build_command(info, start, end, out_path, s)]
+    return [build_command(info, start, end, out_path, s, hwaccel=True),
+            build_command(info, start, end, out_path, s)]
+
+
+def command_text(cmd: list[str]) -> str:
+    return " ".join(f'"{c}"' if " " in c else c for c in cmd)
+
+
 class ExportJob(QObject):
-    """Runs ffmpeg asynchronously via QProcess and reports progress in [0,1]."""
+    """Runs ffmpeg asynchronously via QProcess and reports progress in [0,1].
+
+    `cmd` is one command or a list of them: when one fails (and wasn't cancelled) the next is
+    tried; `finished` reports the last attempt."""
     progress = Signal(float)
     finished = Signal(bool, str)   # ok, stderr tail
 
-    def __init__(self, cmd: list[str], duration: float, parent=None):
+    def __init__(self, cmd: list[str] | list[list[str]], duration: float, parent=None):
         super().__init__(parent)
-        self.cmd = cmd
+        self.cmds = [cmd] if cmd and isinstance(cmd[0], str) else list(cmd)
+        self.cmd = self.cmds[0]
         self.duration = max(duration, 1e-6)
         self.proc = QProcess(self)
         self.proc.setProcessChannelMode(QProcess.SeparateChannels)
         self.proc.readyReadStandardOutput.connect(self._on_stdout)
         self.proc.readyReadStandardError.connect(self._on_stderr)
         self.proc.finished.connect(self._on_finished)
+        self.proc.errorOccurred.connect(self._on_error)
         self._err_tail: list[str] = []
+        self._attempt = 0
+        self.cancelled = False
+        self.done = False
+
+    @property
+    def cmd_text(self) -> str:
+        """The command line of the current (or last) attempt."""
+        return command_text(self.cmd)
 
     def start(self):
+        self.cmd = self.cmds[self._attempt]
+        self._err_tail = []
         self.proc.start(self.cmd[0], self.cmd[1:])
 
     def cancel(self):
+        self.cancelled = True
         if self.proc.state() != QProcess.NotRunning:
             self.proc.kill()
+
+    def wait(self, msecs: int = 5000) -> bool:
+        """Block until the process has exited (its `finished` is emitted before this returns)."""
+        if self.proc.state() == QProcess.NotRunning:
+            return True
+        return self.proc.waitForFinished(msecs)
+
+    def _on_error(self, err):
+        # A process that never started emits no `finished`; report it here or the caller waits forever.
+        if err == QProcess.FailedToStart:
+            self._err_tail.append(f"Could not start {self.cmd[0]}: {self.proc.errorString()}")
+            self._end(False)
 
     def _on_stdout(self):
         data = bytes(self.proc.readAllStandardOutput()).decode("utf-8", "replace")
@@ -203,8 +249,20 @@ class ExportJob(QObject):
         self._err_tail.extend(data.splitlines())
         self._err_tail = self._err_tail[-40:]
 
-    def _on_finished(self, code: int, _status):
-        self.finished.emit(code == 0, "\n".join(self._err_tail))
+    def _on_finished(self, code: int, status):
+        self._end(code == 0 and status == QProcess.NormalExit)
+
+    def _end(self, ok: bool):
+        if self.done:
+            return
+        if not ok and not self.cancelled and self._attempt + 1 < len(self.cmds):
+            self._attempt += 1
+            self.progress.emit(0.0)
+            self.start()  # e.g. GPU decoding unavailable: same export, decoded on the CPU
+            self._err_tail.append("(the GPU-decoding attempt failed; this log is from the retry that decodes on the CPU)")
+            return
+        self.done = True
+        self.finished.emit(ok, "\n".join(self._err_tail))
 
 
 def default_output_path(info: VideoInfo, start: float, end: float, mode: str,
