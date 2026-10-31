@@ -25,6 +25,7 @@ click, keep it updated, and launch it, all from a single black-and-red window (o
 | [Rulz Training Captioner](apps/Rulz-Training-Captioner) | Captions image datasets with a local vision LLM | From source (venv), plus an optional llama.cpp CUDA build |
 | [RulZ Simple Video Clip Extractor](apps/rulz-simple-video-clip-extractor) | Frame-accurate clips with lossless cuts and NVENC export | Portable release zip |
 | [RulZ Image Crawler](apps/rulz-image-crawler) | Crawls a website or folder and keeps the images that match your description (local vision model) | From source (venv + Chromium), plus the model download and an optional llama.cpp CUDA build |
+| [RulZ Image Preparer](apps/RulZ-Image-Preparer) | Cleans up image datasets for training: color noise, JPEG artifacts (fast filter or GPU AI model) and detail recovery, globally or per image | From source (venv); the AI mode's PyTorch and model are set up from the app on first use |
 
 ## Using the launcher
 
@@ -80,14 +81,15 @@ Push app tags one at a time: GitHub starts no workflow for any of them when more
 
 GitHub Actions (`.github/workflows/apps.yml`) builds it and publishes the release here, where the launcher picks it
 up. The tag prefixes are `rulz-trainer-v`, `image-organizer-v`, `image-tournament-v`, `llm-suite-v`, `coding-agent-v`,
-`training-captioner-v`, `clip-extractor-v` and `rulz-image-crawler-v`; launcher releases keep plain `v1.2.3` tags and the *Latest* badge.
+`training-captioner-v`, `clip-extractor-v`, `rulz-image-crawler-v` and `image-preparer-v`; launcher releases keep plain `v1.2.3` tags and the *Latest* badge.
 Pushes and pull requests build every app whose folder changed, so a broken build shows up before it's tagged.
 
-**Apps installed from source** (RulzTrainer, Rulz Training Captioner, RulZ Image Crawler) are cloned from a branch that
-holds just their folder: `app/rulz-trainer`, `app/training-captioner` and `app/rulz-image-crawler`, rebuilt from `main` on every change by
+**Apps installed from source** (RulzTrainer, Rulz Training Captioner, RulZ Image Crawler, RulZ Image Preparer) are cloned
+from a branch that holds just their folder: `app/rulz-trainer`, `app/training-captioner`, `app/rulz-image-crawler` and
+`app/image-preparer`, rebuilt from `main` on every change by
 `.github/workflows/app-branches.yml`. The branch continues the app's old repository commit for commit, so copies
-cloned from there update with a fast-forward (the launcher switches them over on their next update). Image Crawler had
-no repository of its own, so its branch starts at its import into the suite. A tag for a source app publishes a
+cloned from there update with a fast-forward (the launcher switches them over on their next update). Image Crawler and
+Image Preparer had no repository of their own, so their branches start at their import into the suite. A tag for a source app publishes a
 release with the change notes and no files; installs still come from the branch.
 
 ## Development

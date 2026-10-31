@@ -253,6 +253,44 @@ export const CATALOG: CatalogApp[] = [
       'Matched images are saved in the output folder inside the install folder.'
     ],
     highlights: ['Websites or folders', 'Describe it in plain words', 'Full-size originals', 'Uses every GPU']
+  },
+  {
+    id: 'image-preparer',
+    name: 'RulZ Image Preparer',
+    tagline: 'Cleans up image datasets before training: color noise, JPEG artifacts and lost detail',
+    description:
+      'Drop in a folder of training images and clean them up in one go: remove color noise, remove JPEG ' +
+      'compression artifacts (a fast filter, or an AI model on your GPU for the best quality) and sharpen detail ' +
+      'back up. Global sliders set every image at once, any image can be fine-tuned on its own with a side-by-side ' +
+      'or slider before/after view, and Save all writes them out.',
+    category: 'AI Training',
+    repo: SUITE_REPO,
+    path: 'apps/RulZ-Image-Preparer',
+    tagPrefix: 'image-preparer-v',
+    branch: 'app/image-preparer',
+    install: {
+      kind: 'source',
+      setup: [
+        { label: 'Creating the Python environment', run: ['python', '-m', 'venv', '.venv'] },
+        {
+          label: 'Installing PySide6, OpenCV and NumPy',
+          run: ['.venv\\Scripts\\python.exe', '-m', 'pip', 'install', '-r', 'requirements.txt']
+        }
+      ]
+    },
+    launch: { target: '.venv\\Scripts\\pythonw.exe', args: ['run.py'], icon: 'assets\\icon.ico' },
+    requirements: [
+      { id: 'python', note: 'Python 3.10 or newer' },
+      { id: 'nvidia', optional: true, note: 'For the Best quality (AI) JPEG mode' },
+      { id: 'git', optional: true, note: 'Lets the launcher update it with git pull' }
+    ],
+    folderName: 'RulZ Image Preparer',
+    notes: [
+      'Setup installs the app’s Python packages (about 250 MB).',
+      'Best quality JPEG mode is optional: the first time you pick it, the app offers to install CUDA PyTorch ' +
+        '(about 3 GB) and download the FBCNN model (288 MB) into %LOCALAPPDATA%\\RulZ\\Image Preparer.'
+    ],
+    highlights: ['Color noise removal', 'JPEG artifact removal (fast or AI)', 'Detail recovery', 'Global + per-image']
   }
 ]
 

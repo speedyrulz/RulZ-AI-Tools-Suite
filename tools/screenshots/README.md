@@ -97,6 +97,18 @@ drag-and-drop calls). Three captions are deleted so the grid shows the "missing"
 captured with PrintWindow and composited over the main window at its real position. No llama-server is
 started.
 
+## image-preparer (PySide6)
+
+```bat
+IO -B make_demo_images.py R:\Dataset\preparer --count 12 --seed 21 --names titles --size 1600
+"C:\coding\RulZ AI Tools\RulZ Image Preparer\.venv\Scripts\python.exe" -B capture_image_preparer.py --images R:\Dataset\preparer --config R:\ip-config --out R:\out\image-preparer
+```
+
+The app runs from `apps\RulZ-Image-Preparer`. The demo pictures are copied into `--config\photos` with
+blotchy color noise added and saved as low-quality JPEGs, so there is something to clean up. The app's QSettings
+(registry) are swapped for an .ini in `--config` and `LOCALAPPDATA` points there too; Best quality (AI) mode isn't
+used, so no model is loaded. `02` and `03` open the `Hillside` picture (`--closeup`).
+
 ## clip-extractor (PySide6)
 
 ```bat
