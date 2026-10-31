@@ -1,0 +1,4 @@
+# Optional: Best quality JPEG mode (AI). The app offers to install this on first use.
+# CUDA 13 build - supports NVIDIA GeForce 20-series and newer, including RTX 50-series.
+--index-url https://download.pytorch.org/whl/cu130
+torch
