@@ -9,6 +9,8 @@ Everything works in CIE Lab: L is lightness (detail, sharpness), a/b are color. 
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import cv2
 import numpy as np
 
@@ -128,7 +130,22 @@ def process(img: np.ndarray, settings: dict, mode: str = BALANCED, full_size: bo
     detail = settings.get("detail", 0) if full_size else 0
     if not (color or jpeg or detail or shadow):
         return img
+    return _finish(_prepare(img, jpeg, mode, shadow), color, detail)
 
+
+@dataclass
+class Stage:
+    """A picture after JPEG clean-up and shadow lift (the slow part), in Lab, ready for the rest."""
+
+    lab: np.ndarray
+    gray: bool
+    alpha: np.ndarray | None
+    scale: float
+    dtype: np.dtype
+    shape: tuple
+
+
+def _prepare(img: np.ndarray, jpeg: int, mode: str, shadow) -> Stage:
     gray = img.ndim == 2 or img.shape[2] == 1
     alpha = img[:, :, 3:] if not gray and img.shape[2] == 4 else None
     src = img if gray else img[:, :, :3]
@@ -146,18 +163,59 @@ def process(img: np.ndarray, settings: dict, mode: str = BALANCED, full_size: bo
 
         f = lift_shadows(f, shadow)
     lab = cv2.cvtColor(f, cv2.COLOR_BGR2Lab)
-
     if jpeg and mode != BEST:
         _jpeg_balanced(lab, jpeg)
-    if color and not gray:  # grayscale has no color noise
+    return Stage(lab, gray, alpha, scale, img.dtype, img.shape)
+
+
+def _finish(stage: Stage, color: int, detail: int, keep: bool = False) -> np.ndarray:
+    """The rest of the pipeline; keep=True leaves stage.lab untouched so it can be used again."""
+    lab = stage.lab.copy() if keep and (color or detail) else stage.lab
+    if color and not stage.gray:  # grayscale has no color noise
         _color_noise(lab, color)
     if detail:
         _detail(lab, detail)
 
     out = np.clip(cv2.cvtColor(lab, cv2.COLOR_Lab2BGR), 0.0, 1.0)
-    if gray:
-        out = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY).reshape(img.shape)
-    out = np.round(out * scale).astype(img.dtype) if scale != 1.0 else out.astype(img.dtype)
-    if alpha is not None:
-        out = np.concatenate([out, alpha], axis=2)
+    if stage.gray:
+        out = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY).reshape(stage.shape)
+    out = np.round(out * stage.scale).astype(stage.dtype) if stage.scale != 1.0 else out.astype(stage.dtype)
+    if stage.alpha is not None:
+        out = np.concatenate([out, stage.alpha], axis=2)
     return out
+
+
+def process_cached(img: np.ndarray, settings: dict, mode: str = BALANCED, shadow=None, cache=None):
+    """process() for one picture edited again and again: when only color noise or detail changed, the JPEG
+    clean-up and shadow lift are reused from `cache` (what the last call returned). Returns (result, cache)."""
+    shadow = shadow if shadow is not None and shadow.active else None
+    if img is None or (is_noop(settings) and shadow is None):
+        return img, cache
+    jpeg = settings.get("jpeg", 0)
+    key = (jpeg, mode if jpeg else BALANCED, shadow)
+    stage = cache[1] if cache is not None and cache[0] == key else _prepare(img, jpeg, mode, shadow)
+    return _finish(stage, settings.get("color", 0), settings.get("detail", 0), keep=True), (key, stage)
+
+
+# Pixels kept around a crop when only it is cleaned up: more than every filter's reach that doesn't scale
+# with the picture (and than ai_jpeg's tile overlap), so the crop comes out as if the whole picture was done.
+REGION_MARGIN = 64
+
+
+def process_crop(img: np.ndarray, box: tuple[int, int, int, int], settings: dict, mode: str = BALANCED,
+                 shadow=None) -> np.ndarray:
+    """process(img)[box], but when it gives the same picture only the box plus a margin is cleaned up.
+
+    Color noise removal (its filter size follows the picture size) and shadow areas (measured over the
+    whole picture) need the whole picture.
+    """
+    x0, y0, x1, y1 = box
+    shadow = shadow if shadow is not None and shadow.active else None
+    if shadow is not None or settings.get("color", 0) > 0:
+        return np.ascontiguousarray(process(img, settings, mode, shadow=shadow)[y0:y1, x0:x1])
+    h, w = img.shape[:2]
+    # snapped to the 8-px grid so JPEG blocks stay where the filters expect them
+    mx0, my0 = max(0, x0 - REGION_MARGIN) // 8 * 8, max(0, y0 - REGION_MARGIN) // 8 * 8
+    mx1, my1 = min(w, x1 + REGION_MARGIN), min(h, y1 + REGION_MARGIN)
+    out = process(np.ascontiguousarray(img[my0:my1, mx0:mx1]), settings, mode)
+    return np.ascontiguousarray(out[y0 - my0:y1 - my0, x0 - mx0:x1 - mx0])

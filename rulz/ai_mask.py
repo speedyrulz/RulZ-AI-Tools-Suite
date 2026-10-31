@@ -7,8 +7,10 @@ the app on first use, like Best quality mode's FBCNN.
 """
 from __future__ import annotations
 
+import gc
 import hashlib
 import importlib.util
+import sys
 import threading
 from pathlib import Path
 
@@ -32,8 +34,9 @@ FILES = [
     ("model.safetensors", 1680935372, "28cd71c60e3034fc05ab67aa6b960d5340087fc72e456f2989b50294dd6b4dc9"),
 ]
 DOWNLOAD_SIZE = sum(size for _, size, _ in FILES)
-# SAM works at 1008 px, so bigger pictures are shrunk before masking; the mask is scaled back for the crop.
-MASK_MAX_SIDE = 2048
+# SAM works at 1008 px, so bigger pictures are shrunk to that before masking (a bigger mask would only be
+# upsampled, at a high memory cost); the mask's box is scaled back to the picture for the crop.
+MASK_MAX_SIDE = 1008
 
 READY, NO_TORCH, NO_LIBS, NO_MODEL = "ready", "no_torch", "no_libs", "no_model"
 LIBS = ("transformers", "torchvision", "PIL")
@@ -91,6 +94,7 @@ def verify_download(path: Path, size: int, sha256: str) -> bool:
 # ---- model ----------------------------------------------------------------------
 _model = None
 _lock = threading.Lock()
+_release_pending = False
 
 
 def _load():
@@ -118,37 +122,75 @@ def device_name() -> str:
     return torch.cuda.get_device_name(dev) if dev.type == "cuda" else "CPU (slow - no supported NVIDIA GPU found)"
 
 
+def _drop() -> None:
+    """Forget the model and hand its GPU memory back (call with _lock held)."""
+    global _model, _release_pending
+    _model, _release_pending = None, False
+    gc.collect()
+    torch = sys.modules.get("torch")
+    if torch is not None and torch.cuda.is_available() and torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
+
+
+def release() -> None:
+    """Unload SAM to free its (GPU) memory; the next use loads it again. Never waits: while a picture is
+    being searched, the model is dropped as soon as that finishes."""
+    global _release_pending
+    if not _lock.acquire(blocking=False):
+        _release_pending = True
+        return
+    try:
+        _drop()
+    finally:
+        _lock.release()
+
+
+def _run(rgb: np.ndarray, prompt: str, confidence: float, mask_threshold: float,
+         best_only: bool) -> tuple[np.ndarray, list[float]]:
+    from PIL import Image
+
+    h, w = rgb.shape[:2]
+    net, proc, dev, dtype = _load()
+    inputs = proc(images=Image.fromarray(rgb), text=prompt.strip(), return_tensors="pt").to(dev, dtype)
+    out = net(**inputs)
+    res = proc.post_process_instance_segmentation(
+        out, threshold=confidence, mask_threshold=mask_threshold, target_sizes=[(h, w)])[0]
+    masks = res["masks"].bool()
+    scores = [float(s) for s in res["scores"]]
+    # a match can come back with no pixel above the mask threshold: it isn't a match
+    if len(scores):
+        nonempty = masks.flatten(1).any(dim=1).tolist()
+        masks = masks[[i for i, k in enumerate(nonempty) if k]]
+        scores = [s for s, k in zip(scores, nonempty) if k]
+    if best_only and scores:
+        keep = int(np.argmax(scores))
+        masks, scores = masks[keep:keep + 1], [scores[keep]]
+    if not scores:
+        return np.zeros((h, w), bool), []
+    return masks.any(dim=0).cpu().numpy(), scores
+
+
 def find(img: np.ndarray, prompt: str, confidence: float = 0.5, mask_threshold: float = 0.5,
          best_only: bool = False) -> tuple[np.ndarray, list[float]]:
     """Mask of what `prompt` describes in a BGR/BGRA/gray image (any depth).
 
-    Returns (mask, scores): a float32 0/1 mask at MASK_MAX_SIDE or smaller, the union of every match whose
+    Returns (mask, scores): a bool mask at MASK_MAX_SIDE or smaller, the union of every match whose
     score is at least `confidence` (only the highest-scoring one with best_only), and the scores kept.
-    An empty mask means nothing was found.
+    An empty mask (and no scores) means nothing was found.
     """
     import torch
-    from PIL import Image
 
     small = imageio.to_8bit(imageio.shrink(img, MASK_MAX_SIDE))
     if small.ndim == 2 or small.shape[2] == 1:
         rgb = cv2.cvtColor(small, cv2.COLOR_GRAY2RGB)
     else:
         rgb = cv2.cvtColor(small[:, :, :3], cv2.COLOR_BGR2RGB)
-    h, w = rgb.shape[:2]
     with _lock, torch.inference_mode():
-        net, proc, dev, dtype = _load()
-        inputs = proc(images=Image.fromarray(rgb), text=prompt.strip(), return_tensors="pt").to(dev, dtype)
-        out = net(**inputs)
-        res = proc.post_process_instance_segmentation(
-            out, threshold=confidence, mask_threshold=mask_threshold, target_sizes=[(h, w)])[0]
-    scores = [float(s) for s in res["scores"]]
-    masks = res["masks"]
-    if best_only and scores:
-        keep = int(np.argmax(scores))
-        masks, scores = masks[keep:keep + 1], [scores[keep]]
-    if not scores:
-        return np.zeros((h, w), np.float32), []
-    return masks.bool().any(dim=0).cpu().numpy().astype(np.float32), scores
+        try:
+            return _run(rgb, prompt, confidence, mask_threshold, best_only)
+        finally:
+            if _release_pending:
+                _drop()
 
 
 def warm_up() -> None:
