@@ -96,7 +96,7 @@ python image_detection\scripts\eval_labeled.py   # accuracy on your labeled imag
 
 ## Requirements
 
-Windows, Python 3.11+, an NVIDIA GPU with ~16 GB, and a llama.cpp CUDA build: the `llama.cpp` folder here, LM
+Windows, Python 3.11+, an NVIDIA GPU with ~12 GB or more, and a llama.cpp CUDA build: the `llama.cpp` folder here, LM
 Studio's CUDA 12 backend, or `LLAMA_SERVER_EXE`. The start script uses `.venv` when it's there, otherwise
 `python` on PATH. See [Install](#install).
 

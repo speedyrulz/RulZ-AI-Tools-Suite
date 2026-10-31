@@ -4,15 +4,21 @@
 # Suite launcher downloads one there), or the CUDA 12 llama-server bundled with LM Studio (newest version found).
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\start_llama_server.ps1
-#   powershell -ExecutionPolicy Bypass -File scripts\start_llama_server.ps1 -Gpu 1 -Ctx 8192
+#   powershell -ExecutionPolicy Bypass -File scripts\start_llama_server.ps1 -Gpu 1 -Ctx 16384
+#
+# -c is the total context, shared by the --parallel slots: 8192 / 2 = 4096 tokens a slot, well above the ~1.6k
+# a request needs (one image of at most MAX_EDGE 1024 px is <= 1024 tokens, plus prompt, rubric and answer).
+# The KV cache is stored as q8_0 (needs flash attention, which -fa on turns on): about half the VRAM of f16.
+# If you change -Parallel, set LLAMA_PARALLEL to the same value for the service.
 
 param(
     [string]$ModelDir = (Join-Path (Split-Path $PSScriptRoot -Parent) "LLM\Qwen3-VL-8B-Instruct-abliterated.Q8_0"),
     [string]$Model    = "Qwen3-VL-8B-Instruct-abliterated.Q8_0.gguf",
     [string]$MMProj   = "Qwen3-VL-8B-Instruct-abliterated.mmproj-f16.gguf",
     [string]$Gpu      = "0",        # index as shown by nvidia-smi
-    [int]$Ctx         = 16384,
-    [int]$Parallel    = 2,
+    [int]$Ctx         = 8192,
+    [int]$Parallel    = 2,          # keep LLAMA_PARALLEL (image_detection\config.py) the same
+    [string]$KvType   = "q8_0",     # f16 for the old, larger cache
     [int]$Port        = 8080
 )
 
@@ -50,4 +56,5 @@ Write-Host "llama-server: $exe"
     --mmproj (Join-Path $ModelDir $MMProj) `
     -ngl 99 -fa on --jinja `
     -c $Ctx --parallel $Parallel `
+    -ctk $KvType -ctv $KvType `
     --host 127.0.0.1 --port $Port
