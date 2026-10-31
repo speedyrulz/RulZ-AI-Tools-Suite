@@ -49,7 +49,7 @@ class RunOptions:
     max_pages: int = 10
     max_depth: int = 3
     max_images: int = 300
-    respect_robots: bool = True
+    respect_robots: bool = False
     page_delay_s: float = 1.0
     prefer_originals: bool = True  # try each image's full-size original before the displayed copy
     min_megapixels: float = 0.0  # images smaller than this are not classified or saved (0 = no limit)

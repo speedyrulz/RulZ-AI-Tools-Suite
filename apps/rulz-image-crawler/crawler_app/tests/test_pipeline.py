@@ -48,7 +48,7 @@ async def _wait_for(pred, timeout=20.0):
 
 
 def test_full_crawl_finds_saves_and_filters(tmp_path, site_url, fake_service):
-    run = asyncio.run(_with_run(tmp_path, fake_service, _opts(site_url)))
+    run = asyncio.run(_with_run(tmp_path, fake_service, _opts(site_url, respect_robots=True)))
     assert run.status == "done", run.message
 
     files = sorted(m["file"] for m in run.matches)

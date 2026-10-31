@@ -68,7 +68,7 @@ class RunIn(BaseModel):
     max_pages: int = Field(default=10, ge=1, le=1000)
     max_depth: int = Field(default=3, ge=0, le=20)
     max_images: int = Field(default=300, ge=1, le=10000)
-    respect_robots: bool = True
+    respect_robots: bool = False
     page_delay_s: float = Field(default=1.0, ge=0.0, le=30.0)
     prefer_originals: bool = True
     min_megapixels: float = Field(default=0.0, ge=0.0, le=200.0)
