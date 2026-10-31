@@ -10,7 +10,7 @@ $wpf = "$fx\WPF"
 New-Item -ItemType Directory -Force bin | Out-Null
 
 if ($Test) {
-    & $csc /nologo /out:bin\TournamentTests.exe /r:System.Core.dll src\Tournament.cs tests\TournamentTests.cs
+    & $csc /nologo /out:bin\TournamentTests.exe /r:System.Core.dll /r:System.Windows.Forms.dll src\Tournament.cs src\KeyRouting.cs tests\TournamentTests.cs
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     & .\bin\TournamentTests.exe
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

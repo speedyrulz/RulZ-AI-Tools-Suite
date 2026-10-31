@@ -37,9 +37,11 @@ namespace RulZ.ImageTournament
         readonly Dictionary<string, Task<LoadedImage>> _cache = new Dictionary<string, Task<LoadedImage>>(StringComparer.OrdinalIgnoreCase);
         readonly Random _random = new Random();
         readonly ToolTip _tips = new ToolTip();
+        readonly Timer _saveTimer = new Timer { Interval = 750 };
+        readonly List<string> _pendingPaths = new List<string>();
         Tournament _t = new Tournament();
         int _showToken, _lastActionIndex;
-        bool _ready, _syncingMode;
+        bool _ready, _syncingMode, _collecting, _closing;
         string _shownLeft, _shownRight;
 
         Bitmap _logo;
@@ -70,6 +72,7 @@ namespace RulZ.ImageTournament
                 _settings.Save();
             }
             Theme.Current = _settings.Get("theme", "dark") == "light" ? Palette.Light : Palette.Dark;
+            _saveTimer.Tick += delegate { FlushState(); };
             BuildUi();
             ApplySettings();
             ApplyTheme();
@@ -122,6 +125,8 @@ namespace RulZ.ImageTournament
             };
             _cmbAction.Items.AddRange(LoserActionNames);
             _cmbAction.SelectedIndexChanged += OnLoserActionChanged;
+            // Like the checkboxes: once a choice is made, the wheel should zoom again, not change the action.
+            _cmbAction.DropDownClosed += delegate { BeginInvoke(new Action(() => _view.Focus())); };
             _tips.SetToolTip(_cmbAction, "What happens to the image you didn't pick");
 
             _txtLosers = new TextBox
@@ -250,6 +255,7 @@ namespace RulZ.ImageTournament
             };
             // The selected toggle is red, so its text uses the on-accent color.
             c.CheckedChanged += delegate { c.ForeColor = c.Checked ? Theme.OnAccent : Theme.Text; };
+            c.Click += delegate { _view.Focus(); };
             _toggles.Add(c);
             _tips.SetToolTip(c, tip);
             return c;
@@ -258,6 +264,8 @@ namespace RulZ.ImageTournament
         CheckBox MakeCheck(string text, string tip)
         {
             var c = new CheckBox { Text = text, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(4, 3, 0, 3) };
+            // Hand focus back to the images so the mouse wheel and shortcuts keep working.
+            c.Click += delegate { _view.Focus(); };
             _checks.Add(c);
             _tips.SetToolTip(c, tip);
             return c;
@@ -416,7 +424,8 @@ namespace RulZ.ImageTournament
             _settings.Set("viewMode", _view.Mode);
             _settings.Set("theme", Theme.IsLight ? "light" : "dark");
             _settings.Save();
-            SaveState();
+            _closing = true;
+            FlushState(); // write any pick still waiting on the save timer
         }
 
         void OfferResume()
@@ -441,6 +450,19 @@ namespace RulZ.ImageTournament
                 saved.Remove(missing);
             _t = saved;
             ShowCurrent();
+        }
+
+        // Writing the whole list on every pick is slow for big tournaments, so picks in quick
+        // succession share one write. FlushState writes immediately (used when closing).
+        void SaveStateSoon()
+        {
+            if (!_saveTimer.Enabled) _saveTimer.Start();
+        }
+
+        void FlushState()
+        {
+            _saveTimer.Stop();
+            SaveState();
         }
 
         void SaveState()
@@ -502,9 +524,37 @@ namespace RulZ.ImageTournament
             if (paths != null) BeginInvoke(new Action(() => { Activate(); AddPaths(paths); }));
         }
 
-        void AddPaths(IEnumerable<string> paths)
+        // Looks for images off the UI thread (large folders take a while), then adds them.
+        // Paths dropped while a search is running are queued and handled after it.
+        async void AddPaths(IEnumerable<string> paths)
         {
-            var found = CollectImages(paths);
+            _pendingPaths.AddRange(paths);
+            if (_collecting) return;
+            _collecting = true;
+            UseWaitCursor = true;
+            try
+            {
+                while (_pendingPaths.Count > 0 && !_closing)
+                {
+                    string[] batch = _pendingPaths.ToArray();
+                    _pendingPaths.Clear();
+                    bool subfolders = _chkSubfolders.Checked;
+                    string losersSetting = _txtLosers.Text;
+                    List<string> found = await Task.Run(() => CollectImages(batch, subfolders, losersSetting));
+                    if (_closing || IsDisposed) return;
+                    AddFound(found);
+                }
+            }
+            finally
+            {
+                _collecting = false;
+                _pendingPaths.Clear();
+                if (!IsDisposed) UseWaitCursor = false;
+            }
+        }
+
+        void AddFound(List<string> found)
+        {
             var fresh = found.Where(p => !_t.Contains(p)).ToList();
             if (fresh.Count == 0)
             {
@@ -520,11 +570,12 @@ namespace RulZ.ImageTournament
                 }
             if (_t.IsEmpty) _history.Clear();
             _t.Add(fresh);
-            SaveState();
+            SaveStateSoon();
             ShowCurrent();
         }
 
-        List<string> CollectImages(IEnumerable<string> paths)
+        // Runs on a worker thread: touches no controls; the UI settings it needs are passed in.
+        static List<string> CollectImages(IEnumerable<string> paths, bool subfolders, string losersSetting)
         {
             var result = new List<string>();
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -534,28 +585,31 @@ namespace RulZ.ImageTournament
                 try { path = Path.GetFullPath(raw); }
                 catch (ArgumentException) { continue; }
                 catch (NotSupportedException) { continue; }
-                if (Directory.Exists(path)) CollectFolder(path, result, seen);
+                if (Directory.Exists(path)) CollectFolder(path, subfolders, losersSetting, result, seen);
                 else if (File.Exists(path) && LoadedImage.IsImageFile(path) && seen.Add(path)) result.Add(path);
             }
             result.Sort(NativeMethods.StrCmpLogicalW); // natural order: 2.jpg before 10.jpg
             return result;
         }
 
-        void CollectFolder(string folder, List<string> result, HashSet<string> seen)
+        static void CollectFolder(string folder, bool subfolders, string losersSetting, List<string> result, HashSet<string> seen)
         {
             try
             {
-                foreach (var f in Directory.EnumerateFiles(folder))
-                    if (LoadedImage.IsImageFile(f) && (File.GetAttributes(f) & FileAttributes.Hidden) == 0 && seen.Add(f))
-                        result.Add(f);
-                if (!_chkSubfolders.Checked) return;
+                // FileInfo attributes come with the directory listing, so no extra call per file.
+                foreach (var f in new DirectoryInfo(folder).EnumerateFiles())
+                    if (LoadedImage.IsImageFile(f.Name) && (f.Attributes & FileAttributes.Hidden) == 0 && seen.Add(f.FullName))
+                        result.Add(f.FullName);
+                if (!subfolders) return;
+                string losers = LosersFolderFor(Path.Combine(folder, "x"), losersSetting);
                 foreach (var sub in Directory.EnumerateDirectories(folder))
-                    if (!string.Equals(sub, LosersFolderFor(Path.Combine(folder, "x")), StringComparison.OrdinalIgnoreCase))
-                        CollectFolder(sub, result, seen);
+                    if (!string.Equals(sub, losers, StringComparison.OrdinalIgnoreCase))
+                        CollectFolder(sub, subfolders, losersSetting, result, seen);
             }
             catch (UnauthorizedAccessException) { }
             catch (IOException) { }
             catch (ArgumentException) { }
+            catch (System.Security.SecurityException) { }
         }
 
         // ---------- Showing matches ----------
@@ -582,7 +636,10 @@ namespace RulZ.ImageTournament
         {
             foreach (var path in _cache.Keys.Where(k => !keep.Contains(k, StringComparer.OrdinalIgnoreCase)).ToList())
             {
-                _cache[path].ContinueWith(t => t.Result.Dispose());
+                _cache[path].ContinueWith(t =>
+                {
+                    if (t.Status == TaskStatus.RanToCompletion && t.Result != null) t.Result.Dispose();
+                });
                 _cache.Remove(path);
             }
         }
@@ -713,7 +770,7 @@ namespace RulZ.ImageTournament
             if (_history.Count > MaxUndo) _history.RemoveAt(0);
 
             _t.Choose(keepLeft);
-            SaveState();
+            SaveStateSoon();
             ShowCurrent();
         }
 
@@ -742,7 +799,12 @@ namespace RulZ.ImageTournament
 
         string LosersFolderFor(string imagePath)
         {
-            string configured = Environment.ExpandEnvironmentVariables(_txtLosers.Text.Trim().Trim('"'));
+            return LosersFolderFor(imagePath, _txtLosers.Text);
+        }
+
+        static string LosersFolderFor(string imagePath, string losersSetting)
+        {
+            string configured = Environment.ExpandEnvironmentVariables(losersSetting.Trim().Trim('"'));
             // Path.Combine returns the configured path itself when it is absolute.
             return Path.GetFullPath(Path.Combine(Path.GetDirectoryName(imagePath), configured.Length == 0 ? "Losers" : configured));
         }
@@ -779,7 +841,7 @@ namespace RulZ.ImageTournament
             }
             _history.RemoveAt(_history.Count - 1);
             _t = last.Before;
-            SaveState();
+            SaveStateSoon();
             ShowCurrent();
             _view.Focus();
         }
@@ -792,6 +854,7 @@ namespace RulZ.ImageTournament
                 return;
             _t = new Tournament();
             _history.Clear();
+            _saveTimer.Stop();
             DeleteState();
             ShowCurrent();
             _view.Focus();
@@ -836,7 +899,7 @@ namespace RulZ.ImageTournament
 
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
-            if (ActiveControl is TextBox) return base.ProcessCmdKey(ref msg, keyData);
+            if (KeyRouting.IsInputControl(ActiveControl)) return base.ProcessCmdKey(ref msg, keyData);
             switch (keyData)
             {
                 case Keys.Left:

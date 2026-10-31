@@ -94,6 +94,64 @@ static class TournamentTests
         t.Choose(true);
         Check(t.Remove("4") && t.Champion == null && t.HasMatch && t.Left == "3" && t.Right == "1", "remove re-pairs");
         Check(t.Contains("1") && !t.Contains("2") && t.Remove("1") && t.Champion == "3", "remove winner");
+        Check(!t.Remove("1") && !t.Remove("2") && !t.Contains("1") && t.Contains("3"), "remove gone image is a no-op");
+
+        // Membership is case-insensitive and follows Add, Choose, Remove, Clone and Load.
+        t.Start(new[] { @"C:\Pics\A.jpg", @"C:\Pics\B.jpg", @"C:\Pics\C.jpg" });
+        Check(t.Contains(@"c:\pics\a.JPG") && !t.Contains(@"C:\Pics\D.jpg") && !t.Contains(null), "contains ignores case");
+        t.Add(new[] { @"C:\Pics\D.jpg" });
+        Check(t.Contains(@"c:\PICS\d.jpg"), "contains after add");
+        string lost = t.Choose(true); // A beats B
+        Check(lost == @"C:\Pics\B.jpg" && !t.Contains(@"c:\pics\b.jpg") && t.Contains(@"C:\PICS\A.JPG"), "contains after choose");
+        var snapshot = t.Clone();
+        Check(t.Remove(@"c:\pics\c.jpg") && !t.Contains(@"C:\Pics\C.jpg"), "contains after remove (other case)");
+        Check(snapshot.Contains(@"C:\Pics\C.jpg") && !snapshot.Contains(@"C:\Pics\B.jpg"), "clone keeps its own membership");
+        snapshot.Add(new[] { @"C:\Pics\E.jpg" });
+        Check(snapshot.Contains(@"C:\Pics\E.jpg") && !t.Contains(@"C:\Pics\E.jpg"), "clone membership independent");
+        sw = new StringWriter();
+        snapshot.Save(sw);
+        loaded = Tournament.Load(new StringReader(sw.ToString()));
+        Check(loaded != null && loaded.Contains(@"c:\pics\a.jpg") && loaded.Contains(@"C:\PICS\C.JPG") && loaded.Contains(@"c:\pics\e.jpg")
+              && !loaded.Contains(@"C:\Pics\B.jpg"), "contains after load");
+        Check(loaded != null && loaded.AliveImages().All(p => loaded.Contains(p)) && loaded.AliveImages().Count() == loaded.Remaining,
+              "membership matches alive images after load");
+        while (loaded != null && loaded.HasMatch) loaded.Choose(false);
+        Check(loaded != null && loaded.Champion != null && loaded.Contains(loaded.Champion)
+              && loaded.AliveImages().Count() == 1, "only champion alive at the end");
+
+        // Membership stays in step with the bracket through random play, adds and removes.
+        rng = new Random(7);
+        t.Start(Images(40));
+        int nextId = 1000;
+        var gone = new HashSet<string>();
+        while (t.HasMatch)
+        {
+            int roll = rng.Next(10);
+            if (roll == 0) t.Add(new[] { (nextId++).ToString() });
+            else if (roll == 1) { string victim = t.AliveImages().First(); t.Remove(victim); gone.Add(victim); }
+            else gone.Add(t.Choose(rng.Next(2) == 0));
+            var alive = new HashSet<string>(t.AliveImages());
+            Check(alive.All(t.Contains) && !gone.Any(p => t.Contains(p) != alive.Contains(p)), "membership in step with bracket");
+        }
+
+        // Adding many images in small batches stays fast (membership used to be a linear scan).
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        t = new Tournament();
+        for (int batch = 0; batch < 200; batch++)
+        {
+            var add = Enumerable.Range(batch * 100, 100).Select(i => @"C:\Big\img" + i + ".png").Where(p => !t.Contains(p)).ToList();
+            t.Add(add);
+        }
+        Check(t.Remaining == 20000 && t.Contains(@"c:\big\IMG19999.PNG"), "large set added");
+        Check(watch.ElapsedMilliseconds < 2000, "large set add took " + watch.ElapsedMilliseconds + " ms");
+
+        // Shortcut keys stay with controls that use typing or arrows themselves.
+        Check(KeyRouting.IsInputControl(new System.Windows.Forms.TextBox()), "text box keeps keys");
+        Check(KeyRouting.IsInputControl(new System.Windows.Forms.ComboBox()), "combo box keeps keys");
+        Check(KeyRouting.IsInputControl(new System.Windows.Forms.NumericUpDown()), "number box keeps keys");
+        Check(!KeyRouting.IsInputControl(new System.Windows.Forms.Button()), "button doesn't keep keys");
+        Check(!KeyRouting.IsInputControl(new System.Windows.Forms.CheckBox()), "check box doesn't keep keys");
+        Check(!KeyRouting.IsInputControl(null), "no focused control");
 
         Console.WriteLine(_failures == 0 ? "All tournament tests passed." : _failures + " failure(s).");
         return _failures == 0 ? 0 : 1;
