@@ -7,7 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 
 APP_NAME = "RulZ Image Organizer"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 IMAGE_EXTS = {
     ".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".bmp", ".gif", ".webp",
