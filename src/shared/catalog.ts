@@ -257,12 +257,13 @@ export const CATALOG: CatalogApp[] = [
   {
     id: 'image-preparer',
     name: 'RulZ Image Preparer',
-    tagline: 'Cleans up image datasets before training: color noise, JPEG artifacts and lost detail',
+    tagline: 'Cleans up and crops image datasets before training: color noise, JPEG artifacts, lost detail',
     description:
       'Drop in a folder of training images and clean them up in one go: remove color noise, remove JPEG ' +
       'compression artifacts (a fast filter, or an AI model on your GPU for the best quality) and sharpen detail ' +
       'back up. Global sliders set every image at once, any image can be fine-tuned on its own with a side-by-side ' +
-      'or slider before/after view, and Save all writes them out.',
+      'or slider before/after view, and Save all writes them out. Auto crop crops pictures to whatever you ' +
+      'describe (a face, a dog), found by the SAM 3.1 AI model, and can clean them up in the same pass.',
     category: 'AI Training',
     repo: SUITE_REPO,
     path: 'apps/RulZ-Image-Preparer',
@@ -281,16 +282,18 @@ export const CATALOG: CatalogApp[] = [
     launch: { target: '.venv\\Scripts\\pythonw.exe', args: ['run.py'], icon: 'assets\\icon.ico' },
     requirements: [
       { id: 'python', note: 'Python 3.10 or newer' },
-      { id: 'nvidia', optional: true, note: 'For the Best quality (AI) JPEG mode' },
+      { id: 'nvidia', optional: true, note: 'For the Best quality (AI) JPEG mode and Auto crop' },
       { id: 'git', optional: true, note: 'Lets the launcher update it with git pull' }
     ],
     folderName: 'RulZ Image Preparer',
     notes: [
       'Setup installs the app’s Python packages (about 250 MB).',
       'Best quality JPEG mode is optional: the first time you pick it, the app offers to install CUDA PyTorch ' +
-        '(about 3 GB) and download the FBCNN model (288 MB) into %LOCALAPPDATA%\\RulZ\\Image Preparer.'
+        '(about 3 GB) and download the FBCNN model (288 MB) into %LOCALAPPDATA%\\RulZ\\Image Preparer.',
+      'Auto crop is optional too: the first time you use it, the app offers to install CUDA PyTorch (shared with ' +
+        'Best quality), Transformers and the SAM 3.1 model (1.7 GB).'
     ],
-    highlights: ['Color noise removal', 'JPEG artifact removal (fast or AI)', 'Detail recovery', 'Global + per-image']
+    highlights: ['Color noise removal', 'JPEG artifact removal (fast or AI)', 'Auto crop with SAM 3.1', 'Global + per-image']
   }
 ]
 

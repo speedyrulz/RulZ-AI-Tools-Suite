@@ -12,10 +12,11 @@ from PySide6.QtWidgets import (
     QStyledItemDelegate, QVBoxLayout, QWidget,
 )
 
-from .. import ai_jpeg, config, imageio
+from .. import ai_jpeg, ai_mask, config, imageio
 from ..filters import ADJUSTMENTS, BALANCED, BEST, process
 from . import theme
-from .ai_setup import ensure_ready
+from .ai_setup import ensure_crop_ready, ensure_ready
+from .auto_crop import AutoCropDialog
 from .controls import AdjustRow, ModeSwitch
 from .editor_page import EditorPage
 from .workers import ImageItem, SaveAll, ThumbLoad, make_emitter, output_paths
@@ -149,8 +150,13 @@ class MainWindow(QMainWindow):
         self.clear_btn = QPushButton(theme.icon("clear"), "  Clear", clicked=self._clear)
         self.save_btn = QPushButton(theme.icon("save", "#ffffff"), "  Save all…", clicked=self._save_all)
         self.save_btn.setProperty("primary", True)
+        self.crop_btn = QPushButton(theme.icon("crop"), "  Auto crop…", clicked=self._auto_crop)
+        self.crop_btn.setToolTip("Find something you describe (e.g. a face) in the selected pictures with AI, "
+                                 "and crop them to it.\nCtrl+click or Shift+click to select; with none "
+                                 "selected, every picture is used.")
         tl.addWidget(add)
         tl.addWidget(self.clear_btn)
+        tl.addWidget(self.crop_btn)
         tl.addWidget(self.save_btn)
 
         tools = QFrame(objectName="ToolBar")
@@ -367,6 +373,7 @@ class MainWindow(QMainWindow):
         self.body.setCurrentIndex(1 if n else 0)
         self.count_label.setText(f"{n} image{'s' * (n != 1)}" + (f"  ·  {custom} custom" if custom else ""))
         self.save_btn.setEnabled(n > 0)
+        self.crop_btn.setEnabled(n > 0)
         self.clear_btn.setEnabled(n > 0)
         self.reset_all.setEnabled(custom > 0)
 
@@ -380,6 +387,7 @@ class MainWindow(QMainWindow):
         m = QMenu(self)
         m.addAction("Open", lambda: self._open(self.grid.row(li)))
         rows = self.grid.selectedItems()
+        m.addAction(theme.icon("crop"), f"Auto crop ({len(rows)})…", self._auto_crop)
         if any(r.data(ITEM_ROLE).custom for r in rows):
             m.addAction("Use global settings", lambda: self._reset_rows(rows))
         m.addSeparator()
@@ -432,6 +440,15 @@ class MainWindow(QMainWindow):
         self.editor.close_image()
         self.stack.setCurrentIndex(0)
         self.grid.setFocus()
+
+    # ---- auto crop -------------------------------------------------------
+    def _auto_crop(self):
+        rows = sorted(self.grid.row(li) for li in self.grid.selectedItems())
+        items = [self.items[r] for r in rows] or list(self.items)
+        if not items or not ensure_crop_ready(self):
+            return
+        QThreadPool.globalInstance().start(ai_mask.warm_up)  # load the model while the screen opens
+        AutoCropDialog(items, self.globals, self.mode, self).exec()
 
     # ---- saving ----------------------------------------------------------
     def _save_all(self):
