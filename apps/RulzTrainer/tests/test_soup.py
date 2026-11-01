@@ -132,11 +132,11 @@ def test_the_greedy_soup_keeps_what_helps(tmp_path):
     tr.controller = SimpleNamespace(normalize=False, norm=lambda kind, v: v)
     tr._free_for_rendering = lambda: None
     tr._sampling_slots = lambda model, step: contextlib.nullcontext([])
-    tr._probe_with = lambda slots, step, tag="": (0.0, None, [])
+    tr._probe_with = lambda slots, step, tag="", n_seeds=None: (0.0, None, [], {"face": [0.0], "body": []})
 
     def probe(model, path, tag):  # the "likeness": how close the soup's change is to the target
         d = soup_delta(path)[NAMES[0]]
-        return 100.0 - 10.0 * float((d - target).norm() / target.norm()), None
+        return 100.0 - 10.0 * float((d - target).norm() / target.norm()), None, {}
 
     tr._soup_probe = probe
     tr._soup_stage(None)

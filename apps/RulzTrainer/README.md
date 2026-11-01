@@ -879,7 +879,11 @@ full-body image (`probe_body_prompt`) every N steps at `probe_size` (the face sq
 same pixel count) with the turbo LoRA (cheap enough to do often), scores them, and records `likeness.jsonl` plus a Monitor chart. Each probe renders `probe_seeds` seeds and averages the scores; the step-0 probe, the zero
 of the normalized scale, renders at least `probe_floor_seeds` (4). Scores are smoothed with `probe_ema`
 and only changes beyond `likeness_noise_band` count. The last step is always probed too, whether or not
-`probe_every` divides `steps`, so the final LoRA has its own score (it can be the best). The controller then, each individually switchable:
+`probe_every` divides `steps`, so the final LoRA has its own score (it can be the best). Every probe record also keeps
+each seed's own score (`face_seeds`, `body_seeds`, their normalized `face_norm_seeds` / `body_norm_seeds`, and
+`combined_seeds`, None where a render had no face or body), so `python -m rulztrainer.likeness_stats <job folder>`
+reports a finished run's probe noise: the seed-to-seed spread inside a probe and the per-seed change between
+consecutive probes (see [Probe noise check](#probe-noise-check-noise_files)). The controller then, each individually switchable:
 
 - keeps `<job>_best.safetensors` at the best smoothed combined score (`likeness_track_best`) and stops after
   `likeness_patience` probes without improvement;
@@ -1094,6 +1098,28 @@ Seed twins in one run: a race row may set its own `seed`, which gives it its own
 noise (the other rows keep sharing theirs); with `race_drop_lowest: false` every twin trains to the end and keeps its
 `_best` file.
 
+## Probe noise check (`noise_files`)
+
+A probe renders a few seeds and averages their scores, so part of every score is the seeds' luck: one seed's face is
+turned away, another's is close to a reference photo. How big that luck is decides how far apart two probe scores must
+be before the difference means anything, and nobody has measured it for diffusion renders. `noise_files` (one or more
+finished LoRA files; a mid-run checkpoint and the best one of the same run is the useful pair) with `steps: 0` trains
+nothing: it probes the base model (the normalized scale's zero) and then each file at `noise_seeds` (16) seeds, the
+same seeds for every file, and writes `noise/noise.json`:
+
+- **sigma**: how far one seed's score strays from the file's mean (per kind: face, body, combined; normalized points);
+- **rho**: how alike two files score on the same seed. Probes on shared seeds are paired, so what matters when two are
+  compared is the spread of their per-seed differences, **sd_diff** = sigma x sqrt(2 (1 - rho)), smaller than the
+  scores' own spread when rho is above 0 (with one file there is no rho, and sd_diff is taken as sigma x 1.41);
+- **seeds_needed**: the probe seeds a paired test needs to tell a 3, 5 or 8 point gap apart (one-sided, 90%
+  confidence, 80% power);
+- **suggested_noise_band**: a `likeness_noise_band` for the run's `probe_seeds` and `probe_ema` (one standard deviation
+  of the change between two smoothed probes when nothing changed).
+
+It uses the run's model, references and probe settings; each seed costs a face and a body render per file. The WebUI's
+**Probe noise check** section (Train tab) takes the files and runs it on Start. `python -m rulztrainer.likeness_stats
+<job folder>` gives the same numbers, as an upper bound, from any run's own probes when they have 2 or more seeds.
+
 ## Likeness reward fine-tuning (`reward_steps`)
 
 An optional second stage after the regular steps that trains on likeness itself, after Flow-GRPO (Liu et al., NeurIPS
@@ -1183,6 +1209,17 @@ of them have been probed (a round), the one with the lowest smoothed combined pr
 own steps, so the race costs extra steps: with N configurations, W warm-up rounds and a probe every P steps,
 P x (W x N + N(N+1)/2 - 1) steps of racing before the winner continues alone (10 configurations, 2 warm-up rounds, a
 probe every 100 steps and 3000 steps: about 9300 steps in all, 3.1x one run; the WebUI shows the total).
+
+**Drop only when the seeds agree (`race_drop_confidence`).** Every configuration is probed on the same seeds, so
+each seed compares two of them like for like. With `race_drop_confidence: 0.9` the round's lowest leaves only when a
+one-sided paired t-test on its per-seed scores (the combined, normalized, unsmoothed ones) puts it below the round's
+leader with 90% confidence. The test pools the rounds since the last drop (after the warm-up, at most the last 4), so a
+round too close to call drops nobody and the next one adds its seeds to the evidence. After `race_max_close_rounds` (3)
+such rounds in a row, or once the lowest has trained `steps` of its own, it leaves anyway, so the race still ends; the
+log says which (`b is out (lowest, below a by 4.2 points over 6 paired seeds, p 0.03)` or `too close to call ...`).
+With 1 probe seed the test needs 3 rounds of evidence; 2 or more `probe_seeds` decide sooner. 0 (the default) drops
+the lowest smoothed score however small the gap. A close call costs a round of every remaining configuration's steps,
+which the step estimate does not count.
 
 **Slow starters (`race_patience_drop`, `race_drop_lowest`).** Dropping the lowest each round cuts a setting that learns
 slowly but would end higher. With `race_patience_drop: true` a configuration leaves as soon as its own probes have not
