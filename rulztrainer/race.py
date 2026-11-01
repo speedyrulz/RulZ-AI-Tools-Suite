@@ -78,7 +78,7 @@ RACE_KEYS: dict[str, tuple[str, ...]] = {
     # read at every step: the run needs isolation on (the pairs and DOP captions are prepared once for everyone)
     "LoRA Isolation": ("dop_weight", "dop_every"),
     "Self-training": ("selftrain", "selftrain_at", "selftrain_images", "selftrain_min_likeness", "selftrain_share",
-                      "selftrain_weight"),
+                      "selftrain_weight", "copy_check", "copy_max"),
     # a row's own seed gives it its own LoRA initialisation, image order and noise: seed twins for a seed soup
     "Seed": ("seed",),
 }

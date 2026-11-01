@@ -863,6 +863,8 @@ def probe_score_line(rec: dict | None) -> str:
         face, body, gold = rec.get("face"), rec.get("body"), rec.get("gold")
     parts = [f"{label} {v:.0f}%" for label, v in (("overall", comb), ("face", face), ("FaceNet face", gold),
                                                    ("body", body)) if v is not None]
+    if rec.get("copy") is not None:  # the copy check: its closest training photo (SSCD cosine)
+        parts.append(f"copy {rec['copy']:.2f}")
     return " | ".join(parts)
 
 
@@ -1285,6 +1287,8 @@ class Form:
                                          else 60.0),
             selftrain_share=float(v("selftrain_share") or 0.2), selftrain_weight=float(v("selftrain_weight") or 0.5),
             selftrain_prompts=[p.strip() for p in (v("selftrain_prompts") or "").splitlines() if p.strip()],
+            copy_check=v("copy_check") or "auto",
+            copy_max=float(v("copy_max") if v("copy_max") is not None else 0.5),
             sample_width=aspect_size(v("sample_aspect"), v("sample_mp"))[0],
             sample_height=aspect_size(v("sample_aspect"), v("sample_mp"))[1],
             sample_steps=int(v("sample_steps")), sample_cfg=float(v("sample_cfg")),
@@ -2877,6 +2881,7 @@ RACE_LABELS = {
     "look_warmup": "Look warm-up", "selftrain": "Self-training", "selftrain_at": "Self-training at",
     "selftrain_images": "Self-training pictures", "selftrain_min_likeness": "Self-training likeness floor",
     "selftrain_share": "Self-training share", "selftrain_weight": "Self-training weight", "seed": "Seed",
+    "copy_check": "Copy check (SSCD)", "copy_max": "Copy limit",
     "dop_weight": "DOP weight (LoRA Isolation)", "dop_every": "DOP every N steps (LoRA Isolation)",
 }
 
@@ -6711,6 +6716,24 @@ def build_page(local: bool = True):
                                                                  step=0.05).classes("w-56")
                                 w["selftrain_weight"] = ui.number("Loss weight", value=d.selftrain_weight, min=0.05,
                                                                   max=1, step=0.05).classes("w-32")
+                            with fields():
+                                w["copy_check"] = ui.select({"auto": "auto (with self-training)",
+                                                             "on": "on (the probes too)", "off": "off"},
+                                                            value=d.copy_check, label="Copy check (SSCD)") \
+                                    .classes("w-56") \
+                                    .tooltip("A copy detector (SSCD, about 99 MB, downloaded once) compares every "
+                                             "self-training picture with your training photos and leaves out one that "
+                                             "copies a photo (same pose, outfit and background): training on it "
+                                             "teaches the photo again, not the person in a new scene. The probes log "
+                                             "their closest photo too (Monitor: copy). auto: on with self-training; "
+                                             "on: for any run with probes.")
+                                w["copy_max"] = ui.number("Copy limit", value=d.copy_max, min=0.05, max=1,
+                                                          step=0.05).classes("w-32") \
+                                    .bind_visibility_from(w["copy_check"], "value", backward=lambda m: m != "off") \
+                                    .tooltip("SSCD cosine above which a picture copies a photo (0.5: a likely partial "
+                                             "copy in diffusion memorization studies). Raised to the photos' own "
+                                             "typical match among themselves + 0.1 when they already look alike "
+                                             "(one shoot, one room).")
                             w["selftrain_prompts"] = ui.textarea("Self-training prompts (one per line; empty = the "
                                                                  "reward stage's varied close-up, upper-body and "
                                                                  "full-body prompts)").classes("w-full")
@@ -7870,6 +7893,15 @@ same faces against the same references on its own scale, and (*Best checkpoint, 
 default) its score replaces ArcFace's in the decisions. *auto* turns it on for those runs and for the probe noise
 check. The Monitor draws it as a dashed "face (FaceNet)" line; ArcFace pulling away from it is the warning sign, and the
 reward stage logs a warning when ArcFace runs more than 10 points further ahead than when the stage began.
+
+## Copy check (SSCD)
+A LoRA trained on a few photos can learn to redraw one of them: same pose, same outfit, same background. *Copy check*
+(Likeness-filtered self-training section) compares pictures with your training photos using SSCD, a copy detector
+(a cosine of about 0 for an unrelated picture, above 0.9 for a flipped copy). Self-training leaves out a picture above
+*Copy limit* (0.5, raised to the photos' own typical match among themselves + 0.1 when they already look alike, as in
+one shoot in one room), shown as "copies a photo" in the round's log and in `selftrain.json`. Each probe logs its
+closest training photo and score ("copy" in the Monitor's probe line, `copy` in `likeness.jsonl`); that decides
+nothing. *auto* turns it on with self-training, *on* for any run with probes.
 
 ## Previous runs (run history)
 

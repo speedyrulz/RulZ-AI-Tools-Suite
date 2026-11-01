@@ -172,6 +172,11 @@ class ProbeRecord:
     gold_norm_seeds: list = field(default_factory=list)
     gold_select: bool = False
     arc_combined_ema: float | None = None
+    # the copy check (copy_check, copycheck.py), logged only: the highest SSCD match of this probe's renders among the
+    # training photos, that photo, and the photos' own typical best match among themselves
+    copy: float | None = None
+    copy_of: str = ""
+    copy_baseline: float | None = None
 
 
 class LikenessController:

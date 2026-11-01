@@ -17,6 +17,9 @@ chains of arXiv 2407.17493 quality fell visibly by the third round of retraining
     the face when it is large enough there, since a render's soft background is not blur) is rejected: a failed
     render, not a clean one (renders are compared with renders, as photos carry grain and texture renders never
     have); near-duplicates of a kept picture are dropped;
+  - a copy check (copy_check, copycheck.py): a picture that copies one of the training photos (its SSCD match
+    above max(copy_max, the photos' own typical match + 0.1)) is left out: it would teach the photo again, not the
+    person in a new scene;
   - a bar: a picture is kept only above both selftrain_min_likeness and the probes' current smoothed score, on the
     probes' own scale, so the LoRA studies only its better-than-usual pictures.
 
@@ -38,8 +41,8 @@ SHARP_MIN_GROUP = 3  # a median needs this many pictures (fewer: no blur check f
 SHARP_SIDE = 512  # pictures are compared for sharpness at this size (square-equivalent: the training resolution)
 FACE_MIN = 64  # faces at least this large there (long edge, px) are compared alone; smaller ones go with the picture
 THUMB = 32  # side of the grayscale thumbnail the duplicate check compares
-REASONS = ("no face", "several faces", "unsure face", "face cut off", "blurry", "below the bar", "duplicate",
-           "over the cap")
+REASONS = ("no face", "several faces", "unsure face", "face cut off", "blurry", "copies a photo", "below the bar",
+           "duplicate", "over the cap")
 
 
 @dataclass
@@ -53,6 +56,8 @@ class Candidate:
     sharp: float = 0.0  # of the face when it has one, else of the picture
     face_sharp: bool = False  # sharp was measured on the face
     thumb: np.ndarray | None = field(default=None, repr=False)
+    copy: float | None = None  # its best SSCD match among the training photos (copy_check); None: not checked
+    copy_of: str = ""  # that photo
     verdict: str = ""  # "kept" or the reason it was left out
 
 
@@ -153,8 +158,10 @@ def cap_count(items, share: float) -> int:
     return int(share * sum(seen.values()))
 
 
-def reject_reason(c: Candidate, *, need_face: bool, sharp_min, bar: float) -> str | None:
-    """sharp_min: one floor, or (faces, whole pictures) as sharp_floor gives them."""
+def reject_reason(c: Candidate, *, need_face: bool, sharp_min, bar: float, copy_max: float | None = None) \
+        -> str | None:
+    """sharp_min: one floor, or (faces, whole pictures) as sharp_floor gives them; copy_max: the copy limit
+    (copycheck.copy_limit; None: no copy check)."""
     if sharp_min is None:
         sharp_min = 0.0
     if c.faces > 1:
@@ -168,21 +175,24 @@ def reject_reason(c: Candidate, *, need_face: bool, sharp_min, bar: float) -> st
     floor = sharp_min if not isinstance(sharp_min, tuple) else sharp_min[0 if c.face_sharp else 1]
     if c.sharp < floor:
         return "blurry"
+    if copy_max is not None and c.copy is not None and c.copy > copy_max:
+        return "copies a photo"
     if c.likeness is None or c.likeness < bar:
         return "below the bar"
     return None
 
 
-def select(cands: list[Candidate], *, need_face: bool, bar: float, cap: int, sharp_min=None) \
-        -> tuple[list[Candidate], Counter]:
+def select(cands: list[Candidate], *, need_face: bool, bar: float, cap: int, sharp_min=None,
+           copy_max: float | None = None) -> tuple[list[Candidate], Counter]:
     """The pictures a round keeps, best likeness first, and how many were left out for each reason. Every candidate
-    gets its verdict. sharp_min: the blur floor (default: sharp_floor of these candidates)."""
+    gets its verdict. sharp_min: the blur floor (default: sharp_floor of these candidates); copy_max: the copy limit
+    (None: no copy check)."""
     if sharp_min is None:
         sharp_min = sharp_floor(cands)
     reasons: Counter = Counter()
     passed = []
     for c in cands:
-        why = reject_reason(c, need_face=need_face, sharp_min=sharp_min, bar=bar)
+        why = reject_reason(c, need_face=need_face, sharp_min=sharp_min, bar=bar, copy_max=copy_max)
         if why:
             c.verdict = why
             reasons[why] += 1
@@ -206,9 +216,9 @@ def describe(reasons: Counter) -> str:
     return ", ".join(f"{reasons[r]} {r}" for r in REASONS if reasons.get(r)) or "none"
 
 
-def record(path: Path, rnd: int, step: int, bar: float, cands: list[Candidate]) -> None:
+def record(path: Path, rnd: int, step: int, bar: float, cands: list[Candidate], copy_max: float | None = None) -> None:
     """Append the round to selftrain.json: every candidate's scores and verdict (the kept ones rebuild the round's
-    images when a run resumes)."""
+    images when a run resumes); copy_max: the round's copy limit (None: no copy check)."""
     import json
 
     data = []
@@ -218,10 +228,14 @@ def record(path: Path, rnd: int, step: int, bar: float, cands: list[Candidate]) 
         except json.JSONDecodeError:
             data = []
     data = [r for r in data if r.get("round") != rnd]
-    data.append({"round": rnd, "step": step, "bar": round(bar, 2), "candidates": [
+    entry = {"round": rnd, "step": step, "bar": round(bar, 2)}
+    if copy_max is not None:
+        entry["copy_limit"] = round(copy_max, 3)
+    data.append({**entry, "candidates": [
         {"image": c.path, "prompt": c.prompt, "likeness": None if c.likeness is None else round(c.likeness, 2),
          "faces": c.faces, "det": round(c.det, 3), "cut_off": c.cut_off, "sharpness": round(c.sharp, 5),
          "sharpness_of": "face" if c.face_sharp else "picture",
+         **({"copy": round(c.copy, 3), "copy_of": c.copy_of} if c.copy is not None else {}),
          "verdict": c.verdict} for c in cands]})
     path.write_text(json.dumps(data, indent=1), encoding="utf-8")
 

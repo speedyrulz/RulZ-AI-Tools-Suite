@@ -354,6 +354,7 @@ class Trainer(RaceParallelMixin):
         self.id_ref = None  # this step's reference embedding
         self.id_time, self.id_count = 0.0, 0  # identity-loss seconds and samples (overhead logging)
         self.body_scorer = None
+        self.copy_checker = None  # copycheck.CopyChecker when copy_check is on
         self.controller = None
         self.batcher = None
         self.ts_logit_shift = 0.0
@@ -948,6 +949,7 @@ class Trainer(RaceParallelMixin):
                 log.info("Data parallel + compile: replicas run one after another until compilation settles "
                          "(%d steps without a new graph), then in parallel", DP_COMPILE_QUIET_STEPS)
         self.all_items = items
+        self.copy_checker = self._make_copy_checker(items)
         self.sides = cfg.training_sides()
         if cfg.resolution_step_up:
             if self.controller is None:
@@ -3096,21 +3098,34 @@ class Trainer(RaceParallelMixin):
         probe = getattr(self.controller, "arc_combined_ema", None) if self.controller is not None else None
         bar = max(cfg.selftrain_min_likeness, probe) if probe is not None else cfg.selftrain_min_likeness
         need_face = self.face_scorer is not None and cfg.face_weight > 0
-        kept, reasons = ST.select(cands, need_face=need_face, bar=bar, cap=cap)
-        ST.record(out_dir / f"{self._image_prefix()}selftrain.json", rnd, step, bar, cands)
+        copy_max = self._selftrain_copy_limit()
+        kept, reasons = ST.select(cands, need_face=need_face, bar=bar, cap=cap, copy_max=copy_max)
+        ST.record(out_dir / f"{self._image_prefix()}selftrain.json", rnd, step, bar, cands, copy_max)
         self.status.update(stage=f"self-training round {rnd}: adding {len(kept)} pictures")
         n_items = self._selftrain_add([(c.path, c.prompt) for c in kept], step)
         scores = sorted((c.likeness for c in cands if c.likeness is not None), reverse=True)
-        log.info("Self-training round %d at step %d: kept %d of %d (bar %.1f: the floor %g%s; best %s); left out: %s; "
-                 "%d training item(s) at x%g in place of the last round's (%.0fs)", rnd, step, len(kept), len(cands),
-                 bar, cfg.selftrain_min_likeness,
+        copies = sorted((c.copy for c in cands if c.copy is not None), reverse=True)
+        log.info("Self-training round %d at step %d: kept %d of %d (bar %.1f: the floor %g%s; best %s%s); left out: "
+                 "%s; %d training item(s) at x%g in place of the last round's (%.0fs)", rnd, step, len(kept),
+                 len(cands), bar, cfg.selftrain_min_likeness,
                  f", the probes' smoothed {probe:.1f}" if probe is not None else "",
-                 " / ".join(f"{s:.0f}" for s in scores[:5]) or "n/a", ST.describe(reasons), n_items,
-                 cfg.selftrain_weight, time.time() - t0)
+                 " / ".join(f"{s:.0f}" for s in scores[:5]) or "n/a",
+                 f"; copy limit {copy_max:.2f}, closest {copies[0]:.2f}" if copy_max is not None and copies else "",
+                 ST.describe(reasons), n_items, cfg.selftrain_weight, time.time() - t0)
         self.status.update(stage="training", selftrain={
             "round": rnd, "step": step, "rendered": len(cands), "kept": [c.path for c in kept], "bar": round(bar, 2),
-            "left_out": dict(reasons)})
+            "left_out": dict(reasons), "copy_limit": None if copy_max is None else round(copy_max, 3)})
         free_cuda()
+
+    def _selftrain_copy_limit(self) -> float | None:
+        """The copy score above which a self-training picture copies a photo (copycheck.copy_limit), None when this
+        configuration's copy check is off."""
+        checker = getattr(self, "copy_checker", None)
+        if checker is None or not self.cfg.copy_check_on():
+            return None
+        from .copycheck import copy_limit
+
+        return copy_limit(self.cfg.copy_max, checker.baseline)
 
     @torch.no_grad()
     def _selftrain_render(self, model, step: int, rnd: int, jobs: list) -> list[str]:
@@ -3130,7 +3145,7 @@ class Trainer(RaceParallelMixin):
 
     def _selftrain_candidate(self, path: str, prompt: str, scale, side: int = 512):
         """A rendered picture's faces, likeness on the probes' scale (None when the face, or a full-body prompt's
-        body, is missing), sharpness and thumbnail."""
+        body, is missing), sharpness, thumbnail and copy score (copy_check)."""
         from . import selftrain as ST
         from .facesim import cut_off, image_size
         from .likeness import combine
@@ -3160,6 +3175,8 @@ class Trainer(RaceParallelMixin):
             c.likeness = combine(face, body, cfg.face_weight, cfg.body_weight)
         c.face_sharp = ST.big_face(box, image_size(path), side)  # large enough at the training resolution
         c.sharp, c.thumb = ST.sharpness(path, box if c.face_sharp else None, side), ST.thumb(path)
+        if self._selftrain_copy_limit() is not None:
+            c.copy, c.copy_of = self.copy_checker.score(path)
         return c
 
     def _selftrain_add(self, kept: list[tuple[str, str]], step: int) -> int:
@@ -3483,6 +3500,7 @@ class Trainer(RaceParallelMixin):
             face, body, images, seeds = self._probe_with(slots, step)
         self.last_probe = (face, body, images, seeds)
         rec, actions = self.controller.update(step, face, body, images, seeds)
+        copy_note = self._copy_probe(rec, images)
         append_record(self.job_dir, rec)
         fmt = lambda v: "n/a" if v is None else f"{v:.1f}%"  # noqa: E731
         who = f"[{self.race.active.name}] " if self._race_running() else ""
@@ -3507,6 +3525,8 @@ class Trainer(RaceParallelMixin):
                      f" (ArcFace {arc - gold:+.1f})" if arc is not None and gold is not None else "",
                      " | the decisions follow the gold face" if rec.gold_select else "")
             self._check_gold_gap(step)
+        if copy_note:
+            log.info("%sCopy check step %d: %s", who, step, copy_note)
         if "step_up" in actions and step < cfg.steps:  # not at the end, nor in the reward stage
             log.info("Resolution step-up: stage %d stalled for %d probe(s) (stage best %s)", rec.stage + 1,
                      rec.stage_since_improve, fmt(rec.stage_best))
@@ -3571,6 +3591,61 @@ class Trainer(RaceParallelMixin):
         self.status.update(probes=probes[-500:], likeness=self.controller.state(), stage="training")
         self._save_history()
         return bool(actions.get("stop"))
+
+    def _copy_probe(self, rec, images) -> str:
+        """The probe's highest SSCD match among the training photos (copy_check), into its record; the log line
+        ("" without the copy check)."""
+        checker = getattr(self, "copy_checker", None)
+        if checker is None or not images:
+            return ""
+        from .copycheck import copy_limit
+
+        score, photo, render = checker.closest(images)
+        if score is None:
+            return ""
+        rec.copy, rec.copy_of, rec.copy_baseline = round(score, 4), photo, checker.baseline
+        limit, base = copy_limit(self.cfg.copy_max, checker.baseline), checker.baseline
+        return (f"closest training photo {score:.2f} ({Path(render).name} to {Path(photo).name}) | the photos among "
+                f"themselves {'n/a' if base is None else f'{base:.2f}'} | "
+                + (f"above the copy limit {limit:.2f}: it may copy that photo" if score > limit
+                   else f"copy limit {limit:.2f}"))
+
+    def _make_copy_checker(self, items):
+        """The SSCD copy check (copycheck.py) when the run, or any race configuration, wants it and something renders
+        pictures to check (probes or self-training): the training photos described once, on the face scorer's
+        device."""
+        cfg = self.cfg
+        cfgs = [cfg] + [c for _, c, _ in (getattr(self, "race_rows", None) or [])]
+        if not any(c.copy_check_on() for c in cfgs) or cfg.noise_files or cfg.soup_files:
+            return None
+        if self.controller is None and not any(c.selftrain for c in cfgs):
+            return None
+        if self.face_scorer is None and self.body_scorer is None:
+            return None
+        photos = [str(it.image) for it in items if it.category == "image"]
+        if not photos:
+            return None
+        from . import copycheck, facesim
+
+        index = facesim.cuda_index(cfg.face_provider)
+        dev = f"cuda:{index}" if index is not None and torch.cuda.is_available() else "cpu"
+        self.status.update(stage="loading the copy check (SSCD)")
+        t0 = time.time()
+        try:
+            checker = copycheck.CopyChecker(cfg.models_dir, dev, progress=lambda t, f: self.status.update(stage=t))
+            checker.set_photos(photos)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Could not load the copy check (%s); off", e)
+            return None
+        base = checker.baseline
+        gate = any(c.selftrain and c.copy_check_on() for c in cfgs)
+        log.info("Copy check on: SSCD described the %d training photos in %.0fs (their typical best match among "
+                 "themselves %s); %sthe probes log their closest photo", len(checker.photos), time.time() - t0,
+                 "n/a" if base is None else f"{base:.2f}",
+                 f"self-training leaves out pictures above {copycheck.copy_limit(cfg.copy_max, base):.2f}; "
+                 if gate else "")
+        self.status.update(copy_baseline=base)
+        return checker
 
     def _gold_gap(self) -> float | None:
         """ArcFace's smoothed normalized face minus the gold face's (None without both)."""

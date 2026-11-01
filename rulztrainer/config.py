@@ -489,6 +489,9 @@ class TrainConfig:
     selftrain_share: float = 0.2  # at most this share of the real images (repeats counted) per round
     selftrain_weight: float = 0.5  # their loss weight
     selftrain_prompts: list[str] = field(default_factory=list)  # empty: the reward stage's varied prompts
+    # --- copy check: SSCD similarity of renders to the training photos (copycheck.py) ---
+    copy_check: str = "auto"  # auto = on with selftrain (its gate); on = with any probes too (logged); off
+    copy_max: float = 0.5  # selftrain leaves out a picture above max(this, the photos' own best match + 0.1)
     # --- seed soup: average LoRAs of one subject, picked by the probes (soup.py; steps 0) ---
     soup_files: list[str] = field(default_factory=list)  # 2+ LoRA / LoKr files: a greedy soup instead of training
     soup_rank: int = 32  # the soup's rank (0 = exact, LoRA files only)
@@ -629,6 +632,17 @@ class TrainConfig:
             return "facenet"
         return ""
 
+    def __post_init__(self) -> None:
+        # YAML 1.1 and race rows read a bare on / off as true / false: the switches with an "off" mode take it back
+        for name in ("face_gold", "copy_check"):
+            if isinstance(getattr(self, name), bool):
+                setattr(self, name, "on" if getattr(self, name) else "off")
+
+    def copy_check_on(self) -> bool:
+        """The SSCD copy check runs: copy_check on, or auto with self-training (it gates the kept pictures)."""
+        mode = str(self.copy_check or "auto").lower()
+        return mode == "on" or (mode == "auto" and bool(self.selftrain))
+
     def resolved_lora_targets(self) -> list[str]:
         """lora_targets, or the model family's default groups when it is empty."""
         return list(self.lora_targets) or list(ARCH_DEFAULT_TARGETS[self.arch_name()])
@@ -751,6 +765,10 @@ class TrainConfig:
         if str(self.face_gold).lower() == "facenet" and self.trains_on_facenet():
             raise ValueError("face_gold facenet: the identity loss trains on FaceNet (id_loss_backend facenet), so it "
                              "is no held-out judge; use face_gold off or id_loss_backend arcface")
+        if str(self.copy_check).lower() not in ("auto", "on", "off"):
+            raise ValueError(f"copy_check must be auto, on or off, got {self.copy_check!r}")
+        if not 0.0 < self.copy_max <= 1.0:
+            raise ValueError(f"copy_max is a cosine above 0 and at most 1, got {self.copy_max!r}")
         if not 0.0 <= self.lora_ema < 1.0:
             raise ValueError(f"lora_ema must be 0 (off) or a decay below 1, got {self.lora_ema!r}")
         if self.dp_balance not in ("off", "auto", "grow"):
