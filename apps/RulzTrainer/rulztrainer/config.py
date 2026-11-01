@@ -21,6 +21,8 @@ MODEL_PRESETS = {
     "MiniMax-H3-Ref2VA": "MiniMaxAI/MiniMax-H3#ref2va",
 }
 ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21", "minimax_h3")
+OPTIMIZERS = ("adamw", "adamw8bit", "adafactor", "automagic3", "automagic4")
+AUTOMAGIC = ("automagic3", "automagic4")  # self-tuning lr: no schedule, no LoRA+, no per-image lr
 # LoRA target groups each family trains when lora_targets is empty. Krea 2 adds the attention output gate and its
 # text-fusion stack, which Fizgig measured to be under-trained by the attention + feed-forward recipe (scaling a
 # finished LoRA's text-fusion blocks x3 lifted likeness 2-7 points on several Krea 2 LoRAs).
@@ -297,14 +299,21 @@ class TrainConfig:
     batch_size: int = 1
     gradient_accumulation: int = 1
     learning_rate: float = 1e-4
-    optimizer: str = "adamw"  # adamw | adamw8bit | adafactor | automagic3
+    optimizer: str = "adamw"  # adamw | adamw8bit | adafactor | automagic3 | automagic4
     weight_decay: float = 0.01
-    automagic_min_lr: float = 1e-8  # automagic3: hard floor for the adapted lr
-    automagic_max_lr: float = 1e-3  # automagic3: hard ceiling for the adapted lr
-    automagic_polarity_history: int = 8  # automagic3: sign-history window (2-64)
-    automagic_clip_threshold: float = 1.0  # automagic3: update trust region
-    automagic_groups: str = "single"  # automagic3: single (one adaptive lr) | by_type (text / attention / feed-forward /
-    #                                   other layers each adapt their own; Fizgig's setup for Krea 2's text fusion)
+    automagic_min_lr: float = 1e-8  # automagic3/4: hard floor for the adapted lr
+    automagic_max_lr: float = 1e-3  # automagic3/4: hard ceiling for the adapted lr (about 10x the start lr)
+    automagic_polarity_history: int = 8  # automagic3/4: sign-history window (2-64)
+    automagic_clip_threshold: float = 1.0  # automagic3/4: update trust region
+    automagic_groups: str = "single"  # automagic3/4: single (one adaptive lr) | by_type (text / attention / feed-forward
+    #                                   / other layers each adapt their own; Fizgig's setup for Krea 2's text fusion)
+    automagic_sensitivity_quantile: float = 0.9  # automagic4: weights more sensitive (gradient power) than this share
+    #                                              of the LoRA's elements take a smaller step, (0, 1]
+    automagic_vote: str = "graded"  # automagic4: graded (mean update sign squared minus the flip rate, zero on noise;
+    #                                 raises the lr on a trend, lowers it on overshoot) | extremes (Automagic 3's rule,
+    #                                 a third of the gain)
+    automagic_max_lr_change: float = 0.05  # automagic4: the lr moves at most this fraction per step (0.05 = 5%): bounds
+    #                                        the climb over the sign window's lag
     lr_scheduler: str = "constant"  # constant | cosine | linear
     warmup_steps: int = 50
     max_grad_norm: float = 1.0
@@ -359,7 +368,7 @@ class TrainConfig:
     body_weight: float = 0.3
     # --- per-image loss watch ---
     loss_watch: bool = False  # track every image's timestep-normalised loss and give epoch verdicts
-    per_image_lr: bool = False  # act on verdicts: stuck x0.5/0.25/0.125, exhausted x0.6 (not with automagic3)
+    per_image_lr: bool = False  # act on verdicts: stuck x0.5/0.25/0.125, exhausted x0.6 (not with automagic3/4)
     loss_watch_buckets: int = 40  # sigma buckets for loss normalisation
     loss_watch_beta: float = 0.9  # per-image residual EMA
     loss_watch_high: float = 1.3  # residual above median x this = hard
@@ -384,7 +393,7 @@ class TrainConfig:
     sigma_min: float = 0.0  # training sigma range (rescaled after timestep_shift; 0..1)
     sigma_max: float = 1.0
     # --- identity training: LoRA+ ---
-    lora_plus_ratio: float = 0.0  # lr of lora_up = lr x ratio (0/1 = off, 16 = LoRA+ paper); not with automagic3
+    lora_plus_ratio: float = 0.0  # lr of lora_up = lr x ratio (0/1 = off, 16 = LoRA+ paper); not with automagic3/4
     network_type: str = "lora"  # lora | lokr (LyCORIS Kronecker factors: w1 up to lokr_factor square, w2 the rest) |
     #                             oft (orthogonal fine-tuning: each layer's output channels rotated in blocks)
     lokr_factor: int = 8  # LoKr: w1 is [a, b] with a, b the largest divisors of out / in <= this (8: Fizgig's default)
@@ -639,8 +648,22 @@ class TrainConfig:
             raise ValueError(f"lora_ema must be 0 (off) or a decay below 1, got {self.lora_ema!r}")
         if self.dp_balance not in ("off", "auto", "grow"):
             raise ValueError(f"dp_balance must be off, auto or grow, got {self.dp_balance!r}")
+        if self.optimizer.lower() not in OPTIMIZERS:
+            raise ValueError(f"optimizer must be one of {OPTIMIZERS}, got {self.optimizer!r}")
         if self.automagic_groups not in ("single", "by_type"):
             raise ValueError(f"automagic_groups must be single or by_type, got {self.automagic_groups!r}")
+        if self.automagic_min_lr > self.automagic_max_lr:
+            raise ValueError("automagic_min_lr must not be above automagic_max_lr")
+        if not 2 <= self.automagic_polarity_history <= 64:
+            raise ValueError("automagic_polarity_history must be between 2 and 64")
+        if self.automagic_clip_threshold <= 0:
+            raise ValueError("automagic_clip_threshold must be above 0")
+        if not 0.0 < self.automagic_sensitivity_quantile <= 1.0:
+            raise ValueError("automagic_sensitivity_quantile must be above 0 and at most 1")
+        if self.automagic_vote not in ("graded", "extremes"):
+            raise ValueError(f"automagic_vote must be graded or extremes, got {self.automagic_vote!r}")
+        if self.automagic_max_lr_change <= 0:
+            raise ValueError("automagic_max_lr_change must be above 0")
         if self.compile_model not in (True, False, "auto"):
             raise ValueError(f"compile_model must be true, false or auto, got {self.compile_model!r}")
         if self.race:
