@@ -2227,7 +2227,7 @@ class Trainer(RaceParallelMixin):
         """Warn about sample / probe settings that give unusable images: guidance on a distilled (turbo) sampler burns
         them, a few steps or no guidance without one leaves them unfinished."""
         cfg = self.cfg
-        distilled = bool(cfg.turbo_lora) or "turbo" in (cfg.sample_model_path or "").lower()
+        distilled = bool(cfg.turbo_lora) or self.arch.distilled_sample_model(cfg.sample_model_path or "")
         steps0, cfg0 = self.arch.default_sample_steps, self.arch.default_sample_cfg
         for what, steps, guidance, on in (("Samples", cfg.sample_steps, cfg.sample_cfg, bool(cfg.sample_prompts)),
                                           ("Probes", cfg.probe_steps, cfg.probe_cfg, cfg.probe_every > 0)):

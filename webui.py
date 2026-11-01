@@ -1166,9 +1166,11 @@ class Form:
             current = (int(steps.value), float(cfg.value))
         except (TypeError, ValueError):
             return
-        old = (ARCH_SAMPLE_DEFAULTS if old_turbo else ARCH_FULL_SAMPLE)[old_family]
-        if current == old:
-            steps.value, cfg.value = (ARCH_SAMPLE_DEFAULTS if new_turbo else ARCH_FULL_SAMPLE)[new_family]
+        def defaults(family, turbo):  # a family without a turbo LoRA (FLUX 3 Klein) samples at full quality
+            return ARCH_SAMPLE_DEFAULTS.get(family, ARCH_FULL_SAMPLE[family]) if turbo else ARCH_FULL_SAMPLE[family]
+
+        if current == defaults(old_family, old_turbo):
+            steps.value, cfg.value = defaults(new_family, new_turbo)
 
     def set_quant_options(self, family: str) -> None:
         """The quant choices of the single files to download follow the family (Krea 2 also has fp8)."""
