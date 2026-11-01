@@ -84,6 +84,33 @@ COMFY_TEXT_ENCODER_QUANTS = {"moss_image": ("int8_convrot", "bf16"), "krea2": ("
                              "fibo2": ("int8_convrot", "bf16"), "qwen_image21": ("int8_convrot", "bf16")}
 COMFY_VAE_FILES = {"moss_image": "vae/flux2-vae_small.safetensors", "krea2": "vae/qwen_image_vae.safetensors",
                    "fibo2": "vae/flux2-vae.safetensors", "qwen_image21": "vae/qwen_image_2.1_vae_bf16.safetensors"}
+# A text encoder file another family's repackage holds (family -> quant -> repo; the family's own COMFY_REPOS repo
+# otherwise)
+COMFY_TEXT_ENCODER_REPOS: dict[str, dict[str, str]] = {}
+
+# Ideogram 4 (ideogram-ai/ideogram-4-fp8, gated; the unsloth/ideogram-4-fp8 mirror is not): no bf16 release, the fp8
+# weights are the source. Full sampling is Ideogram's V4_DEFAULT_20 preset, 20 steps at guidance 7 (its g * cond +
+# (1 - g) * uncond is uncond + cfg * (cond - uncond) with cfg = g), the last 2 at 3; the turbo LoRA is ostris'
+# TurboTime (rank 128, 847 MB; "good quality in as little as 2 steps with no CFG and no unconditional model", its
+# samples at 8 steps), 8 steps at CFG 1. Comfy-Org's repackage: diffusion models in int8_convrot (9.58 GB), fp8_scaled
+# (9.28 GB) and nvfp4_mixed (5.49 GB), its Flux2 VAE (0.34 GB); its Qwen3-VL-8B text encoder is the same model as
+# Qwen-Image 2.1's, whose int8_convrot (9.35 GB) and bf16 (17.5 GB) files come from Comfy-Org/Qwen-Image-2.1, the
+# fp8_scaled (10.6 GB) and nvfp4 (6.3 GB) ones from Comfy-Org/Ideogram-4.
+MODEL_PRESETS["Ideogram-4"] = "ideogram-ai/ideogram-4-fp8"
+ARCH_NAMES += ("ideogram4",)
+ARCH_DEFAULT_TARGETS["ideogram4"] = _CORE_TARGETS
+ARCH_FULL_SAMPLE["ideogram4"] = (20, 7.0)
+ARCH_TURBO["ideogram4"] = {"repo": "ostris/ideogram_4_turbotime_lora", "file": "ideogram_4_turbotime_v1.safetensors",
+                           "strength": 1.0, "steps": 8, "cfg": 1.0, "shift": 5.0}
+ARCH_SAMPLE_DEFAULTS["ideogram4"] = (ARCH_TURBO["ideogram4"]["steps"], ARCH_TURBO["ideogram4"]["cfg"])
+COMFY_REPOS["ideogram4"] = "Comfy-Org/Ideogram-4"
+COMFY_DIFFUSION_FILES["ideogram-ai/ideogram-4-fp8"] = "diffusion_models/ideogram4_{quant}.safetensors"
+COMFY_DIFFUSION_FILES["unsloth/ideogram-4-fp8"] = "diffusion_models/ideogram4_{quant}.safetensors"
+COMFY_DIFFUSION_QUANTS["ideogram4"] = ("int8_convrot", "fp8_scaled", "nvfp4_mixed")
+COMFY_TEXT_ENCODER_FILES["ideogram4"] = "text_encoders/qwen3vl_8b_{quant}.safetensors"
+COMFY_TEXT_ENCODER_QUANTS["ideogram4"] = ("int8_convrot", "bf16", "fp8_scaled", "nvfp4")
+COMFY_TEXT_ENCODER_REPOS["ideogram4"] = {"int8_convrot": "Comfy-Org/Qwen-Image-2.1", "bf16": "Comfy-Org/Qwen-Image-2.1"}
+COMFY_VAE_FILES["ideogram4"] = "vae/flux2-vae.safetensors"
 
 
 # Named presets: values applied over a config (UI toggle, --preset on the CLI, or `preset:` in YAML).
@@ -498,6 +525,8 @@ class TrainConfig:
         hint = " ".join([self.model_path or "", self.transformer_file or ""]).lower()
         if "qwen-image" in hint or "qwen_image" in hint or "qwenimage" in hint:
             return "qwen_image21"
+        if "ideogram" in hint:
+            return "ideogram4"
         return "fibo2" if "fibo" in hint else "krea2" if "krea" in hint else "moss_image"
 
     def resolved_lora_targets(self) -> list[str]:

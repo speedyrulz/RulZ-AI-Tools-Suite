@@ -210,31 +210,35 @@ def _count(state: dict, pattern: str) -> int:
 
 
 def transformer_config_from_state(state: dict) -> dict:
-    """Ideogram4Transformer config from a (port-named, maybe quantized) state dict; the head size and RoPE are the
-    released model's (they leave no trace in the shapes)."""
+    """Ideogram4Transformer config from a (port-named, maybe quantized) state dict. The RoPE leaves no trace in the
+    shapes: theta and the sections are the released model's (24, 20, 20 of head_dim 256's 128 frequencies), the
+    sections scaled to another head size."""
     def shape(k):
         v = state[k]
         return tuple(v.orig_shape) if isinstance(v, Q.QuantWeight) else tuple(v.shape)
 
     head_dim = shape("layers.0.attention.norm_q.weight")[0]
     dim = shape("input_proj.weight")[0]
+    sections = [24, 20, 20] if head_dim == 256 else [max(1, round(s * head_dim / 256)) for s in (24, 20, 20)]
     return dict(in_channels=shape("input_proj.weight")[1], num_layers=_count(state, "layers.{}.attention.qkv.weight"),
                 attention_head_dim=head_dim, num_attention_heads=dim // head_dim,
                 intermediate_size=shape("layers.0.feed_forward.w1.weight")[0], adaln_dim=shape("adaln_proj.weight")[0],
-                llm_features_dim=shape("llm_cond_proj.weight")[1], rope_theta=5_000_000, mrope_section=[24, 20, 20],
+                llm_features_dim=shape("llm_cond_proj.weight")[1], rope_theta=5_000_000, mrope_section=sections,
                 norm_eps=1e-5)
 
 
 def build_transformer(state: dict, device, quant: str, dtype=torch.bfloat16, quant_devices=None,
-                      source: str = "") -> Ideogram4Transformer:
+                      source: str = "", config: dict | None = None) -> Ideogram4Transformer:
     """The port from a normalized state dict (consumed). quant "auto" keeps a ComfyUI int8 / nvfp4 file's format and
-    sizes an unquantized one (bf16, or fp8 / nf4 dequantized on load) for the memory it will run in."""
+    sizes an unquantized one (bf16, or fp8 / nf4 dequantized on load) for the memory it will run in. config: a
+    transformer/config.json's values (else read from the shapes)."""
     from .loading import QUANT_FILTER, resolve_quant
 
     if not is_ideogram4_state(state):
         raise ValueError(f"{source or 'state dict'}: not an Ideogram 4 diffusion model (no embed_image_indicator / "
                          "llm_cond_proj)")
-    config = transformer_config_from_state(state)
+    config = {**transformer_config_from_state(state),
+              **{k: v for k, v in (config or {}).items() if k in Ideogram4Transformer.CONFIG_KEYS}}
     if quant == "auto" and not any(isinstance(v, Q.QuantWeight) for v in state.values()):
         quant = resolve_quant("auto", quant_devices or device)
     with torch.device("meta"):
