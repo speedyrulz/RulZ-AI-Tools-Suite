@@ -766,21 +766,33 @@ with both of its own switches off it is Automagic 4 to the bit (a test asserts i
 - **Noise bands** (`keel_bands` 8, `keel_pair_sigma` on, `keel_band_weights`): gradient power varies a lot with the
   noise level (Min-SNR; *Addressing Negative Transfer in Diffusion Models*; EDM2's learned per-level weights), and
   one second moment per weight is set by the loudest band, usually not the one where the face forms (sigma 0.2 to
-  0.5 at 1 MP), so the quiet bands take small steps. With `keel_pair_sigma` a step's micro-batches (and its DOP
-  pass) share one sigma, so the step's gradient sits in one band; each weight tensor keeps a running mean of the
-  gradient power it sees per band (8 equal bands over logit sigma from -4 to 4, so sigma 0.02 to 0.98; the ends
-  take what lies beyond) and the step's gradient is scaled by sqrt(overall / band) before anything else, so it
-  enters the second moment at the tensor's usual scale whatever its band and every band's step is sized alike (a
-  band is trusted after 8 observations, the lift is capped at 10x, a step spanning several bands is left alone).
+  0.5 at 1 MP), so the quiet bands take small steps. Each weight tensor keeps a running mean of the gradient power
+  it sees per band (8 equal bands over logit sigma from -4 to 4, so sigma 0.02 to 0.98; the ends take what lies
+  beyond), and every micro-batch's gradient is scaled by sqrt(overall / band) as it lands (Keel's accumulation
+  hook takes each one off `p.grad` into an fp32 sum), so it enters the second moment at the tensor's usual scale
+  whatever its band and every band's step is sized alike (a band is trusted after 8 steps that saw it, the lift is
+  capped at 10x; a loop that hands the optimizer the step's sum, the parallel race, is normalised per step and
+  only within one band). `keel_pair_sigma` gives a step's micro-batches (and its DOP pass) one sigma: the
+  consensus gate below needs it.
   `keel_band_weights` then multiplies the step's update (not the decay) per band on purpose: `""` flat, `identity`
   a hump of 1.3 over sigma 0.12 to 0.5 falling to 0.5 at the ends, or 8 numbers. The measured imbalance (each
   band's gradient RMS relative to the overall, averaged over the tensors) is logged every 250 steps.
   `timestep_sampling` keeps deciding how often each band is visited; `loss_weighting` keeps changing which band's
   content the gradient carries within a step, but its scale effect is gone, which is the point.
+- **Consensus gate** (`keel_consensus` 0.5, `keel_consensus_power` 2): the AND-mask (Parascandolo et al., ICLR
+  2021). A character LoRA should learn what is true in every photo and not what varies between them, and moving a
+  weight only where the per-example gradients agree in sign keeps the shared mechanism. The hook adds the sign of
+  every gradient of the step (micro-batches, the DOP pass) into an int8 buffer per tensor; with K gradients seen,
+  the update is multiplied by `(1 - c) + c * (|agree| / K)^power` after the sensitivity balance and before the
+  sign history, so the vote sees the gated magnitude. `keel_consensus` 0 is off, 1 keeps only the unanimous
+  elements. It needs `gradient_accumulation` 2 or more (or the DOP pass); with one gradient per step it is 1, and
+  so is it in the parallel race, which hands the optimizer the step's sum. A data-parallel replica's gradient (the
+  sum over its micro-batches) joins scaled by the step's band and as one vote. The mean gate is logged every 250
+  steps; the copy check (`copy_check: on`) is where its effect on memorised backgrounds shows.
 
 All of it can be raced (`race` rows with `keel_gauge`, `keel_gauge_eps`, `keel_cautious`, `keel_pair_sigma`,
-`keel_bands`, `keel_band_weights`), and a Keel state resumes under Automagic 4 and the other way round (the band
-statistics start fresh when `keel_bands` changes). Whether Keel beats Automagic 4 or adamw8bit on the likeness probes
+`keel_bands`, `keel_band_weights`, `keel_consensus`, `keel_consensus_power`), and a Keel state resumes under
+Automagic 4 and the other way round (the band statistics start fresh when `keel_bands` changes). Whether Keel beats Automagic 4 or adamw8bit on the likeness probes
 is not measured yet: the Wizard keeps recommending adamw8bit until a race says otherwise.
 
 **MiniMax H3 and FLUX Klein** are trained in ai-toolkit, not here. `rulztrainer/optimizers/automagic4.py` depends only
@@ -816,8 +828,9 @@ Four levers change the training objective and data for likeness, all off by defa
 - **Automagic 4** (`optimizer: automagic4`): sensitivity-balanced steps (the most sensitive weights take smaller ones)
   and a learning rate that holds on noise instead of drifting up; see *Self-tuning optimizers* above.
 - **Keel** (`optimizer: keel`): Automagic 4 plus a preconditioner that keeps either LoRA factor from taking the whole
-  update, a mask against steps that point away from the gradient, and noise bands so the quiet noise levels (where
-  the face forms) step as far as the loud ones; see *Keel* above and `docs/keel-optimizer.md`.
+  update, a mask against steps that point away from the gradient, noise bands so the quiet noise levels (where the
+  face forms) step as far as the loud ones, and a consensus gate that moves a weight by how far the step's photos
+  agree on it; see *Keel* above and `docs/keel-optimizer.md`.
 
 The face analysis cache is `<dataset>/.rulz_cache/faces.json`; the Train tab has preview buttons for region
 maps and crops.

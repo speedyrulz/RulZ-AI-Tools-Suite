@@ -1,6 +1,6 @@
-"""Keel: Automagic 4 for character LoRAs (docs/keel-optimizer.md). Milestones 1 and 2 of that design: the LoRA
-gauge preconditioner, the cautious mask and the noise-band normalisation. With every switch off it is Automagic 4
-exactly (test_keel asserts it bitwise).
+"""Keel: Automagic 4 for character LoRAs (docs/keel-optimizer.md). Milestones 1 to 3 of that design: the LoRA
+gauge preconditioner, the cautious mask, the noise-band normalisation and the cross-photo consensus gate. With
+every switch off it is Automagic 4 exactly (test_keel asserts it bitwise).
 
 Gauge preconditioner (keel_gauge)
 ---------------------------------
@@ -34,23 +34,52 @@ rescale by the surviving share: the normalised step does not depend on the gradi
 survives is logged every 250 steps (cautious_share()); well under 1 means the preconditioner is fighting the
 gradient (raise keel_gauge_eps).
 
+The accumulation hook
+---------------------
+Keel takes every micro-batch's gradient as it lands (a post-accumulate-grad hook on each parameter, armed by
+zero_grad() and disarmed by step(), so a backward outside a step, or another optimizer's step on the same
+tensors in a race, is left alone): the gradient leaves p.grad for an fp32 sum in p._accum_grad (Automagic 3's
+stochastic low-precision sum for a parameter that is not fp32), so the next backward produces the next
+micro-batch's gradient on its own and the hook can look at each one: its noise band (below) and its signs (the
+consensus gate). gather() writes the sum back to p.grad; the trainer calls it after the step's last backward,
+before the replica reduce and gradient clipping, and step() does it itself otherwise. A data-parallel replica's
+parameters are not the optimizer's, so its micro-batches never reach the hook: the reduce hands their sum to
+take_replica(primary_param, grad), which scales it by the step's band (when the step sits in one band: paired
+sigma) and counts it as one vote. A loop that hands the optimizer the step's sum directly (the parallel race's
+collect_grads) never fires the hook: the bands then act per step, the gate is 1 (logged once).
+
 Noise-band normalisation (keel_bands, keel_band_weights)
 --------------------------------------------------------
 Gradient power varies a lot with the noise level sigma (Min-SNR; Addressing Negative Transfer in Diffusion
 Models; EDM2's learned per-level weights), and one second moment per weight is set by the loudest band, usually
 not the one where the face forms (sigma 0.2 to 0.5 at 1 MP): the quiet bands take small steps. Keel keeps, per
 weight tensor and per band of logit(sigma) (keel_bands equal bands over [-4, 4], the ends taking what lies
-beyond), a running mean of the gradient's power (its mean square), plus the overall one; a step whose
-micro-batches all sit in one band has its gradient scaled by sqrt(overall / band) before anything else, so it
-enters the second moment at the tensor's usual scale whatever its band and every band's step is sized alike.
-A band is trusted after BAND_MIN_OBS observations (until then the scale is 1), the lift is capped at GAIN_MAX,
-and a step whose micro-batches span several bands (keel_pair_sigma off, or batch_size > 1 with its own sigmas)
-is left alone (logged once). keel_band_weights then multiplies the step's update (not the decay) by the band's
-weight (Automagic4.update_gain): "" = 1 everywhere, "identity" = a hump over the face bands, or one number per
-band; on a mixed step the mean of its micro-batches' weights. The trainer feeds the noise levels through
-observe(sigma) before each micro-batch's backward (zero_grad() starts a new step); without those calls the
-bands do nothing. The per-band gradient RMS relative to the overall, averaged over the tensors, is logged
-every 250 steps: the measured imbalance the mechanism answers.
+beyond), a running mean of the gradient's power (its mean square), plus the overall one; each micro-batch's
+gradient is scaled by sqrt(overall / band) in the hook before it enters the sum (a loop without the hook scales
+the step's sum by its one band), so the gradient enters the second moment at the tensor's usual scale whatever
+its band and every band's step is sized alike. A band is trusted after BAND_MIN_OBS steps that saw it (until
+then the scale is 1), the lift is capped at GAIN_MAX, and a micro-batch whose images span several bands
+(batch_size > 1 with keel_pair_sigma off) is left alone. keel_band_weights then multiplies the step's update
+(not the decay) by the band's weight (Automagic4.update_gain): "" = 1 everywhere, "identity" = a hump over the
+face bands, or one number per band; the mean of the step's micro-batches' weights when they differ. The trainer
+calls observe(sigma) right before each micro-batch's backward (the CPU sigma: no sync); without those calls the
+bands do nothing. The per-band gradient RMS relative to the overall, averaged over the tensors, is logged every
+250 steps: the measured imbalance the mechanism answers.
+
+Consensus gate (keel_consensus, keel_consensus_power)
+-----------------------------------------------------
+A character LoRA should learn what is true in every photo (the face, the eyes, the hair line, the build) and
+not what varies between them (the outfit, the background, the light). The AND-mask (Parascandolo et al., ICLR
+2021) and SAND-mask show that moving a weight only where the per-example gradients agree in sign suppresses the
+per-example shortcuts and keeps the shared mechanism. The hook adds sign(g_k) of every gradient of the step
+(the DOP pass's included) into an int8 buffer per tensor (1 B/weight for the step; up to 127 gradients). With
+K gradients seen, a = |agree| / K in [0, 1] and the gate is floor + (1 - floor) a^power, floor = 1 -
+keel_consensus (0 = off, 1 = a hard AND-mask that keeps only the unanimous elements). It multiplies the update
+after the sensitivity balance and before the sign history, so the vote sees the gated magnitude (an element
+the photos disagree on carries little vote weight, like a dead one). It needs two or more gradients per step
+(gradient_accumulation >= 2, or the DOP pass); with one, a = 1 everywhere and the gate is 1. Paired sigma
+matters here: sign disagreement between micro-batches at different noise levels is mostly the noise level,
+not the content. The mean gate is logged every 250 steps.
 
 Pairs: build_optimizer passes the (lora_down, lora_up) pairs of the injected LoRA layers; LoKr, OFT and a
 fine-tune have none, and the step is then Automagic 4's. A race switching a wrapper to LoKr leaves its LoRA
@@ -59,7 +88,7 @@ tensors empty, which the step skips.
 
 import logging
 import math
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -69,8 +98,8 @@ from .automagic4 import Automagic4
 log = logging.getLogger("rulztrainer")
 
 GAUGE_FLOOR = 1e-12  # absolute floor of delta (both Grams zero: nothing to divide by, and nothing to scale)
-LOG_EVERY = 250  # steps between the periodic log lines (cautious share, band statistics)
-BAND_MIN_OBS = 8  # a band is normalised on its own statistics after this many observations
+LOG_EVERY = 250  # steps between the periodic log lines (cautious share, band statistics, consensus gate)
+BAND_MIN_OBS = 8  # a band is normalised on its own statistics after this many steps that saw it
 BAND_WINDOW = 10  # the band statistics: a running mean until this many observations, an EMA of that window after
 GAIN_MAX = 10.0  # the band scale stays within [1/GAIN_MAX, GAIN_MAX] (a 100x quieter band is lifted at most 10x)
 
@@ -103,8 +132,18 @@ def gauge_precondition(g_down: torch.Tensor, g_up: torch.Tensor, down: torch.Ten
     return new_down, new_up
 
 
+def consensus_gate(agree: torch.Tensor, votes: int, consensus: float, power: float) -> torch.Tensor:
+    """floor + (1 - floor) (|agree| / votes)^power in fp32, floor = 1 - consensus."""
+    a = agree.abs().to(torch.float32).div_(float(votes))
+    if power != 1.0:
+        a.pow_(power)
+    floor = 1.0 - consensus
+    return a.mul_(1.0 - floor).add_(floor)
+
+
 class Keel(Automagic4):
-    """Automagic 4 plus the gauge preconditioner, the cautious mask and the noise bands (module docstring).
+    """Automagic 4 plus the gauge preconditioner, the cautious mask, the noise bands and the consensus gate
+    (module docstring).
 
     Parameters (beyond Automagic 4's)
     ---------------------------------
@@ -120,11 +159,16 @@ class Keel(Automagic4):
         Noise bands over logit(sigma) for the band normalisation; 1 = off. Fed by observe(sigma).
     band_weights : [float] or None
         A multiplier on the step's update per band (config.keel_band_weights resolves the setting); None = 1.
+    consensus : float in [0, 1]
+        The consensus gate's strength: 0 = off, 1 = a hard AND-mask. Needs the accumulation hook.
+    consensus_power : float > 0
+        The exponent on the agreement share.
     """
 
     def __init__(self, params, *args, pairs: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = None,
                  gauge: bool = True, gauge_eps: float = 0.01, cautious: bool = True, bands: int = 8,
-                 band_weights: Optional[Sequence[float]] = None, **kwargs):
+                 band_weights: Optional[Sequence[float]] = None, consensus: float = 0.5,
+                 consensus_power: float = 2.0, **kwargs):
         if not gauge_eps > 0.0:
             raise ValueError(f"gauge_eps ({gauge_eps}) must be above 0")
         if int(bands) < 1:
@@ -133,20 +177,41 @@ class Keel(Automagic4):
             band_weights = [float(w) for w in band_weights]
             if len(band_weights) != int(bands) or any(not w > 0.0 for w in band_weights):
                 raise ValueError(f"band_weights must be {int(bands)} numbers above 0, got {band_weights}")
-        super().__init__(params, *args, **kwargs)
+        if not 0.0 <= consensus <= 1.0:
+            raise ValueError(f"consensus ({consensus}) must be within [0, 1]")
+        if not consensus_power > 0.0:
+            raise ValueError(f"consensus_power ({consensus_power}) must be above 0")
+        # Read by the hook (registered by the parent's constructor for low-precision parameters), so before it.
         self.gauge = bool(gauge)
         self.gauge_eps = float(gauge_eps)
         self.cautious = bool(cautious)
         self.bands = int(bands)
         self.band_weights: Optional[List[float]] = band_weights if self.bands > 1 else None
+        self.consensus = float(consensus)
+        self.consensus_power = float(consensus_power)
+        self._armed = False  # the hook takes gradients between zero_grad() and step() only
+        self._cur_band: Optional[int] = None  # the band of the micro-batch about to be backpropagated
+        self._step_bands: List[int] = []  # the bands observed since zero_grad() (one per micro-batch image)
+        self._hooked = False  # whether the hook took a gradient this step
+        self._agree: Dict[torch.Tensor, torch.Tensor] = {}  # param -> int8 sign sums of the step's gradients
+        self._votes: Dict[torch.Tensor, int] = {}  # param -> gradients seen this step
+        self._pw: Dict[torch.Tensor, torch.Tensor] = {}  # param -> [bands] fp32 power sums of the step's gradients
+        self._cnt: Dict[torch.Tensor, List[int]] = {}  # param -> gradients seen per band this step
+        self._band_gain: Dict[torch.Tensor, torch.Tensor] = {}  # param -> [bands] fp32 scale per band (statistics)
+        super().__init__(params, *args, **kwargs)
+        self._register_hooks([p for g in self.param_groups for p in g["params"]])
         self.pairs: List[Tuple[torch.Tensor, torch.Tensor]] = self._check_pairs(pairs)
         self._kept: Optional[torch.Tensor] = None  # the last step's cautious counts (kept, seen), no sync
         self._seen: Optional[torch.Tensor] = None
         self._share_sum = 0.0  # summed over the steps since the last log line
         self._share_steps = 0
+        self._gate_sum: Dict[torch.device, torch.Tensor] = {}  # the gate's element sum since the last log line
+        self._gate_n = 0
+        self._gate_votes = 0  # gradients per step, summed over the gated steps since the last log line
+        self._gate_steps = 0
         self._steps = 0
-        self._step_bands: List[int] = []  # the bands observed since zero_grad() (one per micro-batch sample)
         self._mixed_warned = False
+        self._noted: set = set()  # one-time notes already logged
         if self.gauge and not self.pairs:
             log.info("Keel: no LoRA pairs (a LoKr / OFT adapter or a fine-tune): the gauge preconditioner has nothing "
                      "to do and the step is Automagic 4's")
@@ -158,6 +223,9 @@ class Keel(Automagic4):
             log.info("Keel: %d noise bands (sigma edges %s)%s", self.bands,
                      " ".join(f"{e:.3g}" for e in edges),
                      f", update weights {self.band_weights}" if self.band_weights else "")
+        if self.consensus > 0.0:
+            log.info("Keel: consensus gate %g (power %g): floor %g on the elements the step's gradients disagree on",
+                     self.consensus, self.consensus_power, 1.0 - self.consensus)
 
     def _check_pairs(self, pairs) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         mine = {id(p) for g in self.param_groups for p in g["params"]}
@@ -172,57 +240,183 @@ class Keel(Automagic4):
             out.append((down, up))
         return out
 
+    def _note(self, key: str, msg: str, *args) -> None:
+        if key not in self._noted:
+            self._noted.add(key)
+            log.info(msg, *args)
+
+    # ------------------------------------------------------------------ the accumulation hook
+
+    def _register_hooks(self, params) -> None:
+        # The parent registered the hook for the low-precision parameters (through _make_accum_hook); the fp32 ones
+        # (every LoRA parameter) get it here. Fused mode has its own hooks and never reaches this class in the trainer.
+        if self.fused:
+            return
+        for p in params:
+            if p.requires_grad and p.dtype == torch.float32:
+                self._hook_handles.append(p.register_post_accumulate_grad_hook(self._make_accum_hook()))
+
+    def add_param_group(self, param_group: dict) -> None:
+        super().add_param_group(param_group)
+        if hasattr(self, "_hook_handles"):  # after construction (torch's constructor adds the first groups through here)
+            self._register_hooks(param_group["params"])
+
+    def _make_accum_hook(self):
+        def _hook(p: torch.Tensor) -> None:
+            if p.grad is not None and self._armed:
+                self._take(p)
+
+        return _hook
+
+    @torch.no_grad()
+    def _take(self, p: torch.Tensor) -> None:
+        """One gradient of the step for p, off p.grad: its band's power and scale, its signs, then into the sum."""
+        g = p.grad
+        p.grad = None
+        self._hooked = True
+        b = self._cur_band
+        if self.bands > 1 and b is not None:
+            g32 = g if g.dtype == torch.float32 else g.to(torch.float32)
+            pw = self._pw.get(p)
+            if pw is None:
+                pw = self._pw[p] = torch.zeros(self.bands, dtype=torch.float32, device=g.device)
+                self._cnt[p] = [0] * self.bands
+            pw[b].add_(g32.square().mean())  # the raw power, before the scale
+            self._cnt[p][b] += 1
+            gain = self._band_gain.get(p)
+            if gain is not None:
+                g = g32 * gain[b]
+        if self.consensus > 0.0:
+            self._vote(p, g)
+        acc = getattr(p, "_accum_grad", None)
+        if p.dtype == torch.float32:
+            if acc is None:
+                p._accum_grad = g if g.dtype == torch.float32 else g.to(torch.float32)  # the hook owns it now
+            else:
+                acc.add_(g)
+        elif acc is None:  # Automagic 3's stochastic low-precision sum
+            p._accum_grad = g if g.dtype == p.dtype else self._stochastic_round(g, p.dtype)
+        else:
+            self._stochastic_copy_(acc, acc.to(torch.float32).add_(g.to(torch.float32)))
+
+    def _vote(self, p: torch.Tensor, g: torch.Tensor) -> None:
+        s = g.sign().to(torch.int8)
+        agree = self._agree.get(p)
+        if agree is None:
+            self._agree[p] = s
+        else:
+            agree.add_(s)
+        self._votes[p] = self._votes.get(p, 0) + 1
+
+    @torch.no_grad()
+    def take_replica(self, p: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        """A data-parallel replica's gradient of the step for p (its micro-batches' sum; the replica's parameters are
+        not the optimizer's, so the hook never saw them), before the reduce adds it to the primary's: scaled by the
+        step's band when the step's observations sit in one band (paired sigma; a replica's share of a step that
+        spans bands joins unscaled), and one vote. The trainer passes it to DataParallelLoRA.reduce_grads."""
+        if not self._armed:
+            return g
+        bands = self._step_bands
+        if self.bands > 1 and bands and all(b == bands[0] for b in bands):
+            gain = self._band_gain.get(p)
+            if gain is not None:
+                g = g * gain[bands[0]]
+        if self.consensus > 0.0:
+            self._vote(p, g)
+        return g
+
+    @torch.no_grad()
+    def gather(self) -> None:
+        """The step's accumulated gradient back on p.grad. The trainer calls it after the step's last backward, before
+        gradient clipping and the replica reduce; step() calls it itself otherwise."""
+        for group in self.param_groups:
+            for p in group["params"]:
+                acc = getattr(p, "_accum_grad", None)
+                if acc is not None:
+                    p.grad = acc
+                    del p._accum_grad
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        # A new step: the trainer zeroes before its first micro-batch (and before an out-of-memory retry, whose
+        # partial sums must go).
+        self._armed = True
+        self._cur_band = None
+        self._step_bands = []
+        self._hooked = False
+        self._agree.clear()
+        self._votes.clear()
+        self._pw.clear()
+        self._cnt.clear()
+        for group in self.param_groups:
+            for p in group["params"]:
+                if hasattr(p, "_accum_grad"):
+                    del p._accum_grad
+        super().zero_grad(set_to_none=set_to_none)
+
     # ------------------------------------------------------------------ the trainer's feed
 
-    def observe(self, sigma) -> None:
-        """The noise level(s) of a micro-batch about to be backpropagated (a tensor of any shape, or a number); the
-        trainer calls it for every micro-batch of the step (the DOP pass included), after zero_grad(). Nothing
-        without bands."""
+    def observe(self, sigma, hook: bool = True) -> None:
+        """The noise level(s) of the micro-batch about to be backpropagated (a tensor of any shape, or a number;
+        the CPU tensor avoids a sync); the trainer calls it before every backward of the step (the DOP pass
+        included), after zero_grad(). hook=False for a micro-batch of a data-parallel replica, whose gradient
+        reaches take_replica instead of the hook: it counts toward the step's bands (the band weight, the one-band
+        check) and nothing else. Nothing without bands."""
         if self.bands <= 1:
             return
         vals = sigma.detach().flatten().tolist() if torch.is_tensor(sigma) else [float(sigma)]
-        self._step_bands.extend(band_of(v, self.bands) for v in vals)
-
-    def zero_grad(self, set_to_none: bool = True) -> None:
-        self._step_bands = []  # a new step: the trainer zeroes before its first micro-batch (and on a retry)
-        super().zero_grad(set_to_none=set_to_none)
+        bands = [band_of(v, self.bands) for v in vals]
+        self._step_bands.extend(bands)
+        if hook:
+            self._cur_band = bands[0] if bands and all(b == bands[0] for b in bands) else None
 
     # ------------------------------------------------------------------ the noise bands
 
+    def _gain_from(self, ms: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
+        """[T, bands] scale per band from stacked statistics [T, bands + 1]: sqrt(overall / band) where the band is
+        trusted, 1 elsewhere, within [1/GAIN_MAX, GAIN_MAX]."""
+        B = self.bands
+        ms_b, ms_all = ms[:, :B], ms[:, B:]
+        return torch.where((n[:, :B] >= BAND_MIN_OBS) & (ms_b > 0.0), (ms_all / ms_b.clamp(min=1e-38)).sqrt(),
+                           torch.ones_like(ms_b)).clamp_(1.0 / GAIN_MAX, GAIN_MAX)
+
     @torch.no_grad()
-    def _normalise_bands(self) -> None:
-        """Scale every gradient to the tensor's overall power from its band's (module docstring), update the band
-        statistics, and set the step's update gain from keel_band_weights. Nothing without observed sigmas."""
+    def _bands_step(self) -> None:
+        """At step(): the band weight as this step's update gain; the band statistics updated with the step's
+        observations (the hook's per-gradient power sums, or, without the hook, the accumulated gradient in the
+        step's one band, which is scaled here as the hook would have); the scale per band for the next step."""
         bands = self._step_bands
         self._step_bands = []
+        self._cur_band = None
         self.update_gain = None
-        if self.bands <= 1 or not bands:
+        if self.bands <= 1:
             return
-        B = self.bands
-        if self.band_weights is not None:
+        if bands and self.band_weights is not None:
             w = sum(self.band_weights[b] for b in bands) / len(bands)
             if w != 1.0:
                 self.update_gain = w
-        b = bands[0]
-        if any(x != b for x in bands):
-            if not self._mixed_warned:
-                log.info("Keel: a step's micro-batches span %d noise bands (keel_pair_sigma is off, or batch_size > 1 "
-                         "draws a sigma per image): band normalisation acts only on steps within one band; the band "
-                         "weight is averaged", len(set(bands)))
-                self._mixed_warned = True
-            return
+        B = self.bands
+        hooked = bool(self._pw)
+        one = None
+        if not hooked:
+            if not bands:
+                return
+            one = bands[0]
+            if any(x != one for x in bands):
+                if not self._mixed_warned:
+                    log.info("Keel: a step's gradient spans %d noise bands and reached the optimizer as one sum "
+                             "(keel_pair_sigma off, or batch_size > 1 drawing a sigma per image, in a loop that "
+                             "sums the micro-batches itself): band normalisation acts only on steps within one "
+                             "band; the band weight is averaged", len(set(bands)))
+                    self._mixed_warned = True
+                return
         self._refresh_group_lrs()
         by_dev: dict = {}  # device -> (params, grads, states): the vector work runs per device
         for gi, group in enumerate(self.param_groups):
             for p in group["params"]:
                 if not p.requires_grad:
                     continue
-                acc = getattr(p, "_accum_grad", None)  # the parent's low-precision accumulation buffer
-                if acc is not None:
-                    p.grad = acc
-                    del p._accum_grad
                 g = p.grad
-                if g is None or p.numel() == 0:
+                if g is None or p.numel() == 0 or (hooked and p not in self._pw):
                     continue
                 st = self.state[p]
                 if len(st) == 0:  # as the parent's step would (it then finds the state ready)
@@ -238,20 +432,46 @@ class Keel(Automagic4):
                 entry[1].append(g)
                 entry[2].append(st)
         for dev, (ps, gs, sts) in by_dev.items():
-            power = torch.stack(torch._foreach_norm(gs)).to(torch.float32).square_()  # [T] the gradients' mean square
-            power.div_(torch.tensor([float(p.numel()) for p in ps], device=dev))
             ms = torch.stack([st["band_ms"] for st in sts])  # [T, B + 1]
             n = torch.stack([st["band_n"] for st in sts])
-            ms_b, ms_all, n_b = ms[:, b], ms[:, B], n[:, b]
-            # the scale from the statistics before this step's observation; 1 until the band is trusted
-            gain = torch.where((n_b >= BAND_MIN_OBS) & (ms_b > 0.0), (ms_all / ms_b.clamp(min=1e-38)).sqrt(),
-                               torch.ones_like(ms_b)).clamp_(1.0 / GAIN_MAX, GAIN_MAX)
-            torch._foreach_mul_(gs, list(gain.unbind(0)))
-            for idx in (b, B):  # the band's and the overall statistics: a running mean, then an EMA
-                cnt = n[:, idx].add_(1.0)
-                ms[:, idx].add_((power - ms[:, idx]) / cnt.clamp(max=float(BAND_WINDOW)))
+            if hooked:
+                pw = torch.stack([self._pw[p] for p in ps])  # [T, B] the step's power sums per band
+                cnt = torch.tensor([self._cnt[p] for p in ps], dtype=torch.float32, device=dev)
+            else:
+                power = torch.stack(torch._foreach_norm(gs)).to(torch.float32).square_()  # [T] mean square
+                power.div_(torch.tensor([float(p.numel()) for p in ps], device=dev))
+                pw = torch.zeros(len(ps), B, dtype=torch.float32, device=dev)
+                cnt = torch.zeros_like(pw)
+                pw[:, one] = power
+                cnt[:, one] = 1.0
+                # the scale from the statistics before this step's observation, as the hook applies per gradient
+                torch._foreach_mul_(gs, list(self._gain_from(ms, n)[:, one].unbind(0)))
+            seen = cnt > 0.0
+            mean_b = pw / cnt.clamp(min=1.0)
+            n_b = n[:, :B]
+            n_b.add_(seen.to(torch.float32))
+            ms[:, :B].add_(torch.where(seen, mean_b - ms[:, :B], torch.zeros_like(mean_b))
+                           / n_b.clamp(min=1.0, max=float(BAND_WINDOW)))
+            tot = cnt.sum(1)
+            any_ = tot > 0.0
+            mean_all = pw.sum(1) / tot.clamp(min=1.0)
+            n[:, B].add_(any_.to(torch.float32))
+            ms[:, B].add_(torch.where(any_, mean_all - ms[:, B], torch.zeros_like(mean_all))
+                          / n[:, B].clamp(min=1.0, max=float(BAND_WINDOW)))
             torch._foreach_copy_([st["band_ms"] for st in sts], list(ms.unbind(0)))
             torch._foreach_copy_([st["band_n"] for st in sts], list(n.unbind(0)))
+            for p, row in zip(ps, self._gain_from(ms, n).unbind(0)):
+                self._band_gain[p] = row
+
+    def _refresh_band_gains(self) -> None:
+        """The scale per band of every tensor with statistics (after a state load)."""
+        self._band_gain.clear()
+        if self.bands <= 1:
+            return
+        for p, st in self.state.items():
+            ms, n = st.get("band_ms"), st.get("band_n")
+            if isinstance(ms, torch.Tensor) and isinstance(n, torch.Tensor) and ms.numel() == self.bands + 1:
+                self._band_gain[p] = self._gain_from(ms.unsqueeze(0), n.unsqueeze(0))[0]
 
     def band_stats(self) -> Optional[Tuple[List[float], List[int]]]:
         """(the per-band gradient RMS relative to the tensor's overall, averaged over the tensors that saw the band;
@@ -268,6 +488,42 @@ class Keel(Automagic4):
         cnt = seen.sum(0).clamp(min=1)
         return (rel.sum(0) / cnt).tolist(), n[:, :B].max(0).values.to(torch.int64).tolist()
 
+    # ------------------------------------------------------------------ the consensus gate
+
+    def _element_gain(self, p: torch.Tensor, i0: int = 0, i1: Optional[int] = None) -> Optional[torch.Tensor]:
+        agree = self._agree.get(p)
+        if agree is None:
+            return None
+        k = self._votes.get(p, 0)
+        if k < 2:
+            return None
+        gate = consensus_gate(agree if i1 is None else agree[i0:i1], k, self.consensus, self.consensus_power)
+        acc = self._gate_sum.get(gate.device)
+        s = gate.sum()
+        self._gate_sum[gate.device] = s if acc is None else acc.add_(s)
+        self._gate_n += gate.numel()
+        return gate
+
+    def gate_mean(self) -> Optional[float]:
+        """The consensus gate's mean over the elements gated since the last log line (None: none). Syncs."""
+        if not self._gate_n:
+            return None
+        return sum(float(t) for t in self._gate_sum.values()) / self._gate_n
+
+    def _consensus_step_notes(self) -> None:
+        if self.consensus <= 0.0:
+            return
+        votes = max(self._votes.values(), default=0)
+        if votes >= 2:
+            self._gate_votes += votes
+            self._gate_steps += 1
+        elif self._hooked or self._agree:
+            self._note("votes", "Keel: the consensus gate needs two or more gradients per step (gradient_accumulation "
+                       ">= 2, or the DOP pass); with one gradient the gate is 1")
+        elif any(p.grad is not None for g in self.param_groups for p in g["params"]):
+            self._note("hook", "Keel: the consensus gate sees no per-micro-batch gradients in this loop (the parallel "
+                       "race and a replica reduce hand the optimizer the step's sum): the gate is 1")
+
     # ------------------------------------------------------------------ the preconditioner
 
     @torch.no_grad()
@@ -280,7 +536,7 @@ class Keel(Automagic4):
         self._preconditioned = True
         kept = seen = None
         for down, up in self.pairs:
-            for p in (down, up):  # the parent's low-precision accumulation buffer: hand it back first
+            for p in (down, up):  # a sum the hook still holds: hand it back first
                 acc = getattr(p, "_accum_grad", None)
                 if acc is not None:
                     p.grad = acc
@@ -335,6 +591,14 @@ class Keel(Automagic4):
                 log.info("Keel bands: gradient RMS per band relative to the tensor's overall (mean over tensors) %s; "
                          "steps seen per band %s", " ".join(f"{r:.2f}" if c else "-" for r, c in zip(rel, counts)),
                          " ".join(str(c) for c in counts))
+        mean = self.gate_mean()
+        if mean is not None:
+            log.info("Keel: consensus gate mean %.3f over the last %d steps (%.1f gradients per step)", mean,
+                     self._gate_steps, self._gate_votes / max(1, self._gate_steps))
+        self._gate_sum.clear()
+        self._gate_n = 0
+        self._gate_votes = 0
+        self._gate_steps = 0
 
     # ------------------------------------------------------------------ optimizer API
 
@@ -344,13 +608,21 @@ class Keel(Automagic4):
         if closure is not None:  # the closure makes the gradients: before the preconditioner, as in the parent
             with torch.enable_grad():
                 loss = closure()
-        self._normalise_bands()
+        self.gather()
+        self._bands_step()
         self.precondition()
         self._preconditioned = False
+        self._consensus_step_notes()
         try:
             super().step()
         finally:
             self.update_gain = None
+            self._armed = False
+            self._hooked = False
+            self._agree.clear()
+            self._votes.clear()
+            self._pw.clear()
+            self._cnt.clear()
         self._steps += 1
         self._log_periodic()
         return loss
@@ -372,3 +644,4 @@ class Keel(Automagic4):
                 else:
                     st.pop("band_ms", None)
                     st.pop("band_n", None)
+        self._refresh_band_gains()

@@ -1,7 +1,7 @@
 # Keel: an identity-first optimizer for character LoRAs (design)
 
-Status: milestones 1 and 2 built (`rulztrainer/optimizers/keel.py`: E, F and B with paired sigma,
-`optimizer: keel`); the rest is design.
+Status: milestones 1 to 3 built (`rulztrainer/optimizers/keel.py`: E, F, B with paired sigma, and A with the
+accumulation hook and `gather()`, `optimizer: keel`); the rest is design.
 Working name "Keel" (the part of the boat that keeps it from drifting sideways). Every number below is a starting
 value to race, not a measured one.
 
@@ -83,28 +83,40 @@ build) and not what varies between them (the outfit, the background, the light).
 the union; the AND-mask (Parascandolo et al., ICLR 2021) and SAND-mask show that moving a weight only where
 the per-example gradients agree in sign suppresses the per-example shortcuts and keeps the shared mechanism.
 
-**Signal.** `gradient_accumulation` K >= 2 at batch size 1 (the wizard's usual character setup). The hook
-adds `sign(g_k)` into an int8 `agree` buffer (K <= 127) and accumulates the gradient itself (fp32 sum, or
-Automagic's stochastic low-precision sum), setting `p.grad = None` so the next backward produces the next
-micro-batch's gradient on its own. `gather()` writes the sum back to `p.grad` so `clip_grad_norm_` and
-`reduce_grads` see what they see today.
+**Signal (as built).** `gradient_accumulation` K >= 2 at batch size 1 (the wizard's usual character setup). A
+post-accumulate-grad hook on every parameter, armed by `zero_grad()` and disarmed by `step()` (so a backward
+outside a step, or another optimizer training the same tensors in a sequential race, is left alone), adds
+`sign(g_k)` into an int8 `agree`
+buffer per tensor (a per-step buffer on the optimizer, not state; K <= 127) and accumulates the gradient itself
+(fp32 sum in `p._accum_grad`, Automagic's stochastic low-precision sum for a parameter that is not fp32),
+setting `p.grad = None` so the next backward produces the next micro-batch's gradient on its own. Every
+backward of the step votes (the DOP pass included); K is counted per tensor. `gather()` writes the sum back to
+`p.grad`; the step loop calls it before `reduce_grads` and `clip_grad_norm_`, and `step()` does it itself
+otherwise. `observe(sigma)` moved into `work()`, right before each backward of the primary model copy (and
+before the DOP pass), so the hook knows the micro-batch's band.
 
-**Gate.** `a = |agree| / K` in [0, 1]; `gate = floor + (1 - floor) * a ** power`, with
+**Gate (as built).** `a = |agree| / K` in [0, 1]; `gate = floor + (1 - floor) * a ** power`, with
 `floor = 1 - keel_consensus` (consensus 0 = off, 1 = a hard AND-mask) and `power = keel_consensus_power` (2).
 Applied to the update after the sensitivity balance, before the sign history is written, so the vote sees the
-gated update's magnitude (a gated-off element carries no vote weight, like a dead one).
+gated update's magnitude (a gated-off element carries no vote weight, like a dead one): `Automagic4._element_gain`,
+a hook on the bucketed and the slab update that Keel fills from `agree`. K < 2 gives gate 1 (a one-time note);
+a loop that hands the optimizer the step's sum (the parallel race's `collect_grads`, a replica reduce) never
+fires the hook, so the gate is 1 there too (noted once). The mean gate is logged every 250 steps.
 
 **Paired sigma.** Sign disagreement between micro-batches at different noise levels is mostly the noise
 level, not the content. With `keel_pair_sigma` the step draws one sigma per step
 ([`sample_sigmas`](../rulztrainer/trainer.py:220) once instead of per batch) and every micro-batch uses it.
 Noise cannot be shared (buckets differ in shape); sigma is what matters.
 
-**Multi-GPU.** Replica LoRA parameters are not the optimizer's; [`reduce_grads`](../rulztrainer/multigpu.py:64)
-sums them into the primary after all backwards. Phase 1 gates on the primary's own micro-batches only;
-phase 1b lets `reduce_grads` call `optimizer.observe_grads(primary_param, replica_grad)` per replica before
-the sum, so every GPU's photos vote.
+**Multi-GPU (as built).** Replica LoRA parameters are not the optimizer's, so their micro-batches never reach
+the hook; [`reduce_grads`](../rulztrainer/multigpu.py:64) takes a `take(primary_param, replica_grad)` callback
+and the step loop passes `Keel.take_replica`: the replica's sum over its micro-batches is scaled by the step's
+band (when the step's observations sit in one band, which paired sigma guarantees; `work()` reports a replica's
+sigmas with `observe(sigma, hook=False)` so they count toward that check and the band weight) and counted as
+one vote, so every GPU's photos vote, a replica's as one.
 
-**Cost.** 1 B/weight (`agree`), no extra compute, K >= 2 required (a warning and gate 1 otherwise).
+**Cost.** 1 B/weight (`agree`, for the step), a few small elementwise kernels per tensor per gradient in the
+hook (the sign, its sum, the band's power and scale, the fp32 sum), K >= 2 required (a note and gate 1 otherwise).
 
 **Risks.** The gate also amplifies anything the dataset shares that is not the person (one photographer's
 light, a recurring outfit); the floor keeps those learnable, the copy check measures them. A hard AND-mask
@@ -125,18 +137,21 @@ attention output get different balances.
 **Mechanism (as built).** `keel_bands` (8) equal bands in logit(sigma) over [-4, 4] (sigma 0.018 to 0.982;
 the ends take what lies beyond), after the shift. Per tensor: `band_ms` [bands + 1] fp32, a running mean (10
 observations, then an EMA of that window) of the gradient's mean square per band plus the overall one, and
-`band_n` the observation counts. The trainer calls `observe(sigma)` for every micro-batch of the step (the DOP
-pass included; `zero_grad()` starts a new step). In `step()`, before the gauge: a step whose micro-batches all
-sit in one band has every gradient scaled by `sqrt(ms_all / ms_b)` (1 until the band has 8 observations, capped
-at 10x), so it enters the second moment at the tensor's usual scale whatever its band; the statistics are then
-updated with the step's power. A step spanning several bands (`keel_pair_sigma` off, or `batch_size > 1`
-drawing a sigma per image) is left alone and logged once. Then `band_weight[b]` (`keel_band_weights`: `""` = 1
-everywhere, `identity` = `0.5 + 0.8 exp(-((c + 0.7) / 1.5)^2)` at each band's logit centre `c`, about 1.3 over
-sigma 0.12 to 0.5, or 8 comma-separated numbers; the mean of the micro-batches' weights on a mixed step) multiplies
-the step's update through `Automagic4.update_gain`, a hook that scales the update after the vote and before the
-decay. Until M3's accumulation hook the normalisation is per step on the accumulated gradient, which is why paired
-sigma matters here: it is what puts the whole step in one band. The per-band gradient RMS relative to the overall
-(mean over tensors) and the steps seen per band are logged every 250 steps.
+`band_n` the observation counts (an observation is a step that saw the band). The trainer calls
+`observe(sigma)` right before every backward of the step (the DOP pass included; `zero_grad()` starts a new
+step), and the accumulation hook (A) takes each gradient as it lands: its raw power goes into the step's
+per-band sums, it is scaled by `sqrt(ms_all / ms_b)` from the statistics (1 until the band has 8 observations,
+capped at 10x; a scale per band precomputed at the end of the previous step), and the scaled gradient enters the
+fp32 sum, so it enters the second moment at the tensor's usual scale whatever its band and a step spanning
+several bands is handled per micro-batch. A micro-batch whose images span bands (`batch_size > 1` with paired
+sigma off) is left alone. A loop that hands the optimizer the step's sum (the parallel race) is normalised per
+step in `step()`, and only when the step sits in one band (logged once otherwise), as M2 built it. Then
+`band_weight[b]` (`keel_band_weights`: `""` = 1 everywhere, `identity` = `0.5 + 0.8 exp(-((c + 0.7) / 1.5)^2)`
+at each band's logit centre `c`, about 1.3 over sigma 0.12 to 0.5, or 8 comma-separated numbers; the mean of
+the micro-batches' weights when they differ) multiplies the step's update through `Automagic4.update_gain`, a
+hook that scales the update after the vote and before the decay. Paired sigma is then for the consensus gate.
+The per-band gradient RMS relative to the overall (mean over tensors) and the steps seen per band are logged
+every 250 steps.
 
 **Interplay.** This removes the band imbalance that `loss_weighting` and `clean_share` partly steer with.
 `loss_weighting` still changes which band's *content* the gradient carries within a step; its scale effect is
@@ -275,10 +290,10 @@ is fighting the gradient (raise `keel_gauge_eps`).
 | [config.py:26](../rulztrainer/config.py:26) `OPTIMIZERS`, `AUTOMAGIC` | add `keel` (it owns its lr like Automagic: no schedule, LoRA+, per-image lr) |
 | [config.py](../rulztrainer/config.py) | the `keel_*` options (section 6) and their validation |
 | [trainer.py:264](../rulztrainer/trainer.py:264) `build_optimizer` | construct `Keel(params, pairs=..., **automagic kw, **keel kw)`; pairs from the injected LoRA modules |
-| [trainer.py](../rulztrainer/trainer.py) step loop (and `race_parallel.py`'s) | `observe(sigma)` for each micro-batch of the step (built); `gather()` before `clip_grad_norm_` (M3); paired sigma through `draw_sigmas` when `keel_pair_sigma` (built; the DOP pass shares it) |
+| [trainer.py](../rulztrainer/trainer.py) step loop (and `race_parallel.py`'s) | `observe(sigma)` before each backward of the primary copy in `work()` and before the DOP pass (built; the parallel race observes per step); `gather()` before `reduce_grads` and `clip_grad_norm_` (built); paired sigma through `draw_sigmas` when `keel_pair_sigma` (built; the DOP pass shares it) |
 | [lora.py:385](../rulztrainer/lora.py:385) `_added` | the face tap (`h` save + output hook), armed per batch with the face token mask |
 | [likeness.py](../rulztrainer/likeness.py) controller / trainer probe path | `on_probe(...)` after the decision, before `likeness_track_best` saves |
-| [multigpu.py:64](../rulztrainer/multigpu.py:64) `reduce_grads` | phase 1b: `observe_grads` per replica |
+| [multigpu.py:64](../rulztrainer/multigpu.py:64) `reduce_grads` | `take=` callback: `Keel.take_replica` scales each replica's sum by the step's band and counts it as one vote (built) |
 | [race.py:58](../rulztrainer/race.py:58) | `keel_*` in the settings a race row may change |
 | [race.py:743](../rulztrainer/race.py:743) `follow_leader` | nothing: `type(wo) is type(vo)` already makes Keel its own kind; the anchor rides in `state[p]` |
 | README | a *Keel* section under *Self-tuning optimizers*, the Wizard's optimizer choice |
@@ -310,8 +325,8 @@ weights, C and D off until raced. The Wizard keeps recommending adamw8bit until 
 
 ## 7. State, resume, race
 
-- `state_dict()` adds per parameter: `agree` (int8), `band_ms` and `band_n` ([bands + 1] fp32, built), `anchor`
-  (fp32, when D is on), and `anchor_score` once. Automagic 4 resumes under Keel (the extras start empty: a measurement step for
+- `state_dict()` adds per parameter: `band_ms` and `band_n` ([bands + 1] fp32, built), `anchor` (fp32, when D
+  is on), and `anchor_score` once; `agree` (int8) is a per-step buffer on the optimizer, not state (built). Automagic 4 resumes under Keel (the extras start empty: a measurement step for
   the bands, no anchor until the next probe), and a Keel state resumes under Automagic 4 (extras ignored),
   the way Automagic 3 and 4 already resume under each other.
 - Keel hyper-parameters are not restored from a state (like Automagic's): a race may change them on resume.
@@ -351,7 +366,9 @@ the moments; `gather()` reproduces fp32 accumulation to 1 ulp.
    `tests/test_keel.py`. No trainer-loop changes. R1 is still to run.
 3. **M2** (built) `observe(sigma)`, bands, paired sigma (`draw_sigmas` in both step loops, the DOP pass),
    `Automagic4.update_gain`, config, WebUI, README, tests. R2 is still to run.
-4. **M3** the accumulation hook, `agree`, `gather()`. R3.
+4. **M3** (built) the accumulation hook (armed per step), `agree`, the gate through
+   `Automagic4._element_gain`, `gather()` in the step loop, `observe` per backward, the bands per micro-batch.
+   R3 is still to run.
 5. **M4** `on_probe`, the anchor, the EMA pull. R5.
 6. **M5** the LoRA face tap and the gain. R4.
 7. **M6** README, the Wizard recommendation (if a race earned it), phase 1b, phase 2 candidates.

@@ -218,6 +218,12 @@ class Automagic4(Automagic3):
             self._ref = ref  # an inherited reference survives (the refresh re-reads it when there is state)
             self._refresh_group_lrs()
 
+    def _element_gain(self, p: torch.Tensor, i0: int = 0, i1: Optional[int] = None) -> Optional[torch.Tensor]:
+        """An elementwise multiplier on p's update (rows i0:i1 of a 2-D tensor when given), applied after the
+        sensitivity balance and before the sign history so the vote sees the gated magnitude, or None: a hook for a
+        subclass (Keel's consensus gate)."""
+        return None
+
     def _init_state(self, p: torch.Tensor, group: dict) -> None:
         super()._init_state(p, group)
         st = self.state[p]
@@ -393,6 +399,14 @@ class Automagic4(Automagic3):
         balance = isv.mul_(kbal).clamp_(max=1.0)
         update.mul_(balance)
         del balance, isv
+        gains = [self._element_gain(p) for p in params]
+        if any(g is not None for g in gains):
+            if n == 1:
+                update[0].mul_(gains[0])
+            else:
+                update.mul_(torch.stack([g if g is not None else torch.ones(shape, device=grad.device)
+                                         for g in gains]))
+        del gains
 
         # Sign history (packed planes, stacked [N, H, W]) and the pooled vote.
         hists = [st["sign_history"] for st in states]
@@ -503,6 +517,9 @@ class Automagic4(Automagic3):
             balance = torch.mul(r[i0:i1, None] * kbal, c).clamp_(max=1.0)
             u.mul_(balance)
             del balance
+            gain = self._element_gain(p, i0, i1)
+            if gain is not None:
+                u.mul_(gain)
             w0, w1 = i0 * C // 8, i1 * C // 8
             n_el = (i1 - i0) * C
             hist[idx_old, w0:w1] = self._pack_rows(u.gt(0.0).reshape(1, -1), w1 - w0)[0]

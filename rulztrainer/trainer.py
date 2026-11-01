@@ -311,6 +311,7 @@ def build_optimizer(cfg: TrainConfig, params, pairs=None):
             return Keel(params, pairs=pairs, gauge=cfg.keel_gauge, gauge_eps=cfg.keel_gauge_eps,
                         cautious=cfg.keel_cautious, bands=cfg.keel_bands,
                         band_weights=keel_band_weights(cfg.keel_band_weights, cfg.keel_bands),
+                        consensus=cfg.keel_consensus, consensus_power=cfg.keel_consensus_power,
                         sensitivity_quantile=cfg.automagic_sensitivity_quantile, vote=cfg.automagic_vote,
                         max_vote=cfg.automagic_max_lr_change, **kw)
         if name == "automagic4":
@@ -1049,6 +1050,9 @@ class Trainer(RaceParallelMixin):
             """Forward + backward for one model copy on its device. Returns (loss value, per-image multipliers,
             (identity loss value, samples, seconds) or None)."""
             (rmodel, rinj, rdev), batch, latents, embeds, mask, sigma, noise, regions, cur_step, n_total, dop = job
+            observe = getattr(optimizer, "observe", None)
+            if observe is not None:  # Keel: this micro-batch's noise level (the CPU tensor: no sync); a replica's
+                observe(sigma, hook=rmodel is model)  # gradient reaches take_replica, not the hook
             latents = latents.to(rdev, torch.float32)
             embeds, mask, sigma, noise = embeds.to(rdev), mask.to(rdev), sigma.to(rdev), noise.to(rdev)
             s = sigma.view(-1, 1, 1, 1)
@@ -1119,6 +1123,8 @@ class Trainer(RaceParallelMixin):
                 taps.end()
             if dop is not None:  # LoRA Isolation: the trigger-free pass, after this batch's backward freed its graph
                 del pred, sq, per, noisy, noisy_in
+                if observe is not None:
+                    observe(dop[3], hook=rmodel is model)
                 self._dop_pass(rmodel, rinj, rdev, latents, len(batch), dop, n_total, cfg)
             return result
 
@@ -1177,13 +1183,6 @@ class Trainer(RaceParallelMixin):
                     dop = self._dop_job(cfg, batch, latents, step + 1, gen, shift, tok, step_sigma)  # LoRA Isolation
                     per_rep[r].append((self.replicas[r], batch, latents, embeds, mask, sigma, noise, regions, step + 1,
                                        n_total, dop))
-            observe = getattr(optimizer, "observe", None)
-            if observe is not None:  # Keel: the noise level of every micro-batch of the step (its bands)
-                for jobs in per_rep:
-                    for job in jobs:
-                        observe(job[5])
-                        if job[10] is not None:
-                            observe(job[10][3])
             try:
                 entries = list(enumerate(per_rep))
                 if self.dp is not None:
@@ -1233,8 +1232,11 @@ class Trainer(RaceParallelMixin):
                 retry_jobs = (per_rep, step_images)  # the same images, not the next ones from the iterator
                 free_cuda()
                 continue
-            if self.dp is not None:
-                self.dp.reduce_grads()
+            gather = getattr(optimizer, "gather", None)
+            if gather is not None:  # Keel: the micro-batch sums back on p.grad for the reduce and the clip
+                gather()
+            if self.dp is not None:  # (Keel scales each replica's sum by the step's band and counts its vote)
+                self.dp.reduce_grads(take=getattr(optimizer, "take_replica", None))
             if cfg.max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
             if step_lr_mult != 1.0:  # true per-image lr: scale this step only (the scheduler restores it)
