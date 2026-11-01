@@ -783,7 +783,8 @@ def test_trainer_hands_the_probe_decision_to_keel_and_syncs_the_replicas_after_a
     opt = Keel([p], lr=1e-3, fused=False, bands=1, consensus=0.0, lookahead=True, lookahead_grace=0)
     synced = []
     dp = SimpleNamespace(sync_weights=lambda: synced.append(True))
-    me = SimpleNamespace(controller=SimpleNamespace(combined_ema=50.0), cfg=_cfg(likeness_noise_band=2.0), dp=dp)
+    me = SimpleNamespace(controller=SimpleNamespace(combined_ema=50.0), cfg=_cfg(likeness_noise_band=2.0), dp=dp,
+                         ema=None)
     Trainer._keel_probe(me, opt, None, True)
     assert opt.anchor_score == 50.0 and not synced
     me.controller.combined_ema = 51.0  # within the band, but up since the previous probe: no pull
@@ -801,3 +802,30 @@ def test_trainer_hands_the_probe_decision_to_keel_and_syncs_the_replicas_after_a
     me.controller = SimpleNamespace(combined_ema=60.0)
     Trainer._keel_probe(me, plain, None, True)  # another optimizer: nothing
     assert synced == [True]
+
+
+def test_an_async_probe_anchors_the_copy_that_scored_and_pulls_the_live_weights():
+    from types import SimpleNamespace
+
+    from rulztrainer.trainer import Trainer
+
+    model, injected, params = _model(17)
+    opt = build_optimizer(_cfg(keel_lookahead=True, keel_lookahead_grace=0), params,
+                          pairs=lora_mod.lora_pairs(injected))
+    sent = lora_mod.lora_state(injected)  # what went to the probe GPU
+    with torch.no_grad():
+        for p in params:  # training went on while it rendered
+            p.add_(0.5)
+    live = [p.detach().clone() for p in params]
+    me = SimpleNamespace(controller=SimpleNamespace(combined_ema=50.0), cfg=_cfg(likeness_noise_band=1.0), dp=None,
+                         ema=None, injected=injected)
+    Trainer._keel_probe(me, opt, scored=sent)
+    assert opt.anchor_score == 50.0
+    for name, m in injected.items():
+        for part, p in m.adapter_params().items():
+            assert torch.equal(opt.state[p]["anchor"], sent[name]["params"][part].float())  # the copy, not the live
+            assert not torch.equal(opt.state[p]["anchor"], p.detach().float())
+    me.controller.combined_ema = 49.0  # a miss, grace 0: the pull moves the live weights toward the copy
+    Trainer._keel_probe(me, opt, scored=sent)
+    for p, x in zip(params, live):
+        assert torch.allclose(p.detach().float(), torch.lerp(x.float(), opt.state[p]["anchor"], 0.5), atol=1e-2)

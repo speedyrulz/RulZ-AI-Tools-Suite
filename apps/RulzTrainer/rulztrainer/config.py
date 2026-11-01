@@ -563,6 +563,8 @@ class TrainConfig:
     probe_steps: int = 8
     probe_cfg: float = 1.0
     probe_ema: float = 0.5  # smoothing of probe scores (weight on the previous value)
+    probe_async: bool = False  # render probes on a second GPU while training goes on (multi_gpu off, no race)
+    probe_device: str = ""  # probe_async's GPU; empty = the first of devices that is not the training GPU
     likeness_noise_band: float = 1.0  # percent points a change must exceed to count
     likeness_normalize: bool = True  # score face and body on one scale (0 = a stranger, 100 = the references) first
     face_scale_span: float = 1.35  # the face's 100 sits this many times as far above a stranger as the references do
@@ -821,6 +823,8 @@ class TrainConfig:
             raise ValueError(f"copy_check must be auto, on or off, got {self.copy_check!r}")
         if not 0.0 < self.copy_max <= 1.0:
             raise ValueError(f"copy_max is a cosine above 0 and at most 1, got {self.copy_max!r}")
+        if self.probe_device and not self.probe_device.strip().startswith("cuda"):
+            raise ValueError(f"probe_device is a CUDA GPU such as cuda:1, got {self.probe_device!r}")
         if not 0.0 <= self.lora_ema < 1.0:
             raise ValueError(f"lora_ema must be 0 (off) or a decay below 1, got {self.lora_ema!r}")
         if self.dp_balance not in ("off", "auto", "grow"):
