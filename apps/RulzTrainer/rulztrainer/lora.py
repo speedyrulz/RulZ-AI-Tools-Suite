@@ -13,7 +13,13 @@ Export key formats (Arch.lora_format):
     transformer.<module>.lora_B.weight          [out, rank]
     + "lora_adapter_metadata" (the PEFT LoraConfig, prefixed "transformer.") in the file metadata
 
-Effective delta = (alpha / rank) * up @ down in both.
+  folded ComfyUI's and diffusers' loaders at once, for a family whose module names are the ones ComfyUI keeps under
+         "diffusion_model." and diffusers converts (FLUX 3 Klein: BFL's names; diffusers refuses .alpha keys there)
+    diffusion_model.<module>.lora_A.weight      [rank, in]
+    diffusion_model.<module>.lora_B.weight      [out, rank], already times alpha / rank: no .alpha key
+    + "rulztrainer_lora_alpha" (JSON {module: alpha}) in the metadata, so a resume continues at the trained alpha
+
+Effective delta = (alpha / rank) * up @ down in comfy and peft; lora_B @ lora_A (scale 1) in folded.
 
 LoKr (network_type "lokr"): the delta is a Kronecker product kron(w1, w2) with w1 [a, b] small (a, b the largest
 divisors of out / in that are <= lokr_factor, the LyCORIS convention) and w2 [c, d] = [out / a, in / b] full-matrix,
@@ -54,7 +60,8 @@ log = logging.getLogger("rulztrainer")
 
 COMFY_PREFIX = "diffusion_model."
 PEFT_PREFIX = "transformer."
-LORA_FORMATS = ("comfy", "peft")
+LORA_FORMATS = ("comfy", "peft", "folded")
+FOLDED_ALPHA_KEY = "rulztrainer_lora_alpha"  # folded files: {module: alpha} the lora_B weights were multiplied by
 # peft 0.21 LoraConfig fields: diffusers rebuilds the adapter config from the file metadata with LoraConfig(**these)
 PEFT_CONFIG_TEMPLATE = {
     "alora_invocation_tokens": None,
@@ -661,6 +668,9 @@ def export_state_dict(injected: dict[str, LoRALinear], dtype=torch.bfloat16, fmt
         if fmt == "peft":
             out[f"{PEFT_PREFIX}{name}.lora_A.weight"] = down
             out[f"{PEFT_PREFIX}{name}.lora_B.weight"] = up
+        elif fmt == "folded":
+            out[f"{key}.lora_A.weight"] = down
+            out[f"{key}.lora_B.weight"] = (m.lora_up.weight.detach().float().cpu() * m.scale).to(dtype).contiguous()
         else:
             key = COMFY_PREFIX + name
             out[f"{key}.lora_down.weight"] = down
@@ -714,6 +724,9 @@ def save_lora(injected: dict[str, LoRALinear], path, metadata: dict | None = Non
         meta["rulztrainer_dora"] = "input axis: <stem>.dora_scale [1, in], ComfyUI's weight_decompose"
     if fmt == "peft" and "lora" in kinds:
         meta["lora_adapter_metadata"] = json.dumps(peft_adapter_metadata(injected), indent=2, sort_keys=True)
+    if fmt == "folded" and "lora" in kinds:
+        meta[FOLDED_ALPHA_KEY] = json.dumps({n: float(m.alpha) for n, m in injected.items()
+                                             if m.kind == "lora" and getattr(m, "trainable", True)}, sort_keys=True)
     if metadata:
         meta.update({k: (v if isinstance(v, str) else json.dumps(v)) for k, v in metadata.items()})
     save_file(export_state_dict(injected, dtype, fmt), str(path), metadata=meta)
@@ -729,11 +742,22 @@ def read_peft_metadata(path) -> dict:
     return {k.removeprefix(PEFT_PREFIX): v for k, v in json.loads(raw).items()}
 
 
+def read_folded_alpha(path) -> dict | None:
+    """A folded-format file's {module: alpha} (its lora_B already times alpha / rank), or None for another file."""
+    with safe_open(str(path), "pt") as f:
+        meta = f.metadata() or {}
+    raw = meta.get(FOLDED_ALPHA_KEY)
+    if raw is None:
+        return None
+    return {k.removeprefix(COMFY_PREFIX): float(v) for k, v in json.loads(raw).items()}
+
+
 def load_lora_weights(injected: dict[str, LoRALinear], path) -> int:
     """Load a previously exported LoRA (either format) into injected modules. Returns number of modules loaded."""
     state = load_file(str(path))
     peft = any(k.endswith(".lora_A.weight") for k in state)
     peft_meta = read_peft_metadata(path) if peft else {}
+    folded = read_folded_alpha(path) if peft else None  # a folded file: lora_B carries alpha / rank
     loaded = 0
     dora_fresh = []  # DoRA layers whose file has no magnitude: it starts where the loaded delta leaves the norm
     for name, m in injected.items():
@@ -777,7 +801,7 @@ def load_lora_weights(injected: dict[str, LoRALinear], path) -> int:
             loaded += 1
             continue
         if peft:
-            key = PEFT_PREFIX + name
+            key = stem if folded is not None and stem else PEFT_PREFIX + name
             down, up = state.get(f"{key}.lora_A.weight"), state.get(f"{key}.lora_B.weight")
         else:
             key = COMFY_PREFIX + name
@@ -786,10 +810,15 @@ def load_lora_weights(injected: dict[str, LoRALinear], path) -> int:
             continue
         if down.shape != m.lora_down.weight.shape or up.shape != m.lora_up.weight.shape:
             raise ValueError(f"Rank mismatch for {name}: file has rank {down.shape[0]}, config has {m.rank}")
+        if folded is not None:  # back to the unscaled factor at the alpha it trained with (scale 1 if none recorded)
+            alpha = float(folded.get(name, m.rank))
+            up = up.float() / (alpha / m.rank)
         with torch.no_grad():
             m.lora_down.weight.copy_(down.float())
             m.lora_up.weight.copy_(up.float())
-        if peft:
+        if folded is not None:
+            m.alpha = alpha
+        elif peft:
             alpha = (peft_meta.get("alpha_pattern") or {}).get(name, peft_meta.get("lora_alpha"))
         else:
             alpha = state.get(f"{key}.alpha")
