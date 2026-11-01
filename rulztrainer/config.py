@@ -23,8 +23,8 @@ MODEL_PRESETS = {
     "MiniMax-H3-Ref2VA": "MiniMaxAI/MiniMax-H3#ref2va",
 }
 ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21", "flux3_klein", "minimax_h3")
-OPTIMIZERS = ("adamw", "adamw8bit", "adafactor", "automagic3", "automagic4")
-AUTOMAGIC = ("automagic3", "automagic4")  # self-tuning lr: no schedule, no LoRA+, no per-image lr
+OPTIMIZERS = ("adamw", "adamw8bit", "adafactor", "automagic3", "automagic4", "keel")
+AUTOMAGIC = ("automagic3", "automagic4", "keel")  # self-tuning lr: no schedule, no LoRA+, no per-image lr
 # LoRA target groups each family trains when lora_targets is empty. Krea 2 adds the attention output gate and its
 # text-fusion stack, which Fizgig measured to be under-trained by the attention + feed-forward recipe (scaling a
 # finished LoRA's text-fusion blocks x3 lifted likeness 2-7 points on several Krea 2 LoRAs).
@@ -343,7 +343,8 @@ class TrainConfig:
     batch_size: int = 1
     gradient_accumulation: int = 1
     learning_rate: float = 1e-4
-    optimizer: str = "adamw"  # adamw | adamw8bit | adafactor | automagic3 | automagic4
+    optimizer: str = "adamw"  # adamw | adamw8bit | adafactor | automagic3 | automagic4 | keel (Automagic 4 for
+    #                           character LoRAs: docs/keel-optimizer.md)
     weight_decay: float = 0.01
     automagic_min_lr: float = 1e-8  # automagic3/4: hard floor for the adapted lr
     automagic_max_lr: float = 1e-3  # automagic3/4: hard ceiling for the adapted lr (about 10x the start lr)
@@ -358,6 +359,10 @@ class TrainConfig:
     #                                 a third of the gain)
     automagic_max_lr_change: float = 0.05  # automagic4: the lr moves at most this fraction per step (0.05 = 5%): bounds
     #                                        the climb over the sign window's lag
+    keel_gauge: bool = True  # keel: the r x r gauge preconditioner on each LoRA pair's gradient (lora_up by the down's
+    #                          Gram, lora_down by the up's), so neither factor takes the whole update
+    keel_gauge_eps: float = 0.01  # keel: the preconditioner's floor as a fraction of the larger Gram's mean diagonal
+    keel_cautious: bool = True  # keel: zero a preconditioned gradient element that points against the raw gradient
     lr_scheduler: str = "constant"  # constant | cosine | linear
     warmup_steps: int = 50
     max_grad_norm: float = 1.0
@@ -789,6 +794,8 @@ class TrainConfig:
             raise ValueError(f"automagic_vote must be graded or extremes, got {self.automagic_vote!r}")
         if self.automagic_max_lr_change <= 0:
             raise ValueError("automagic_max_lr_change must be above 0")
+        if self.keel_gauge_eps <= 0:
+            raise ValueError("keel_gauge_eps must be above 0")
         if self.compile_model not in (True, False, "auto"):
             raise ValueError(f"compile_model must be true, false or auto, got {self.compile_model!r}")
         if self.race:
