@@ -131,7 +131,13 @@ class EditorPage(QWidget):
         grid.addWidget(self.mode_switch, jpeg_row, 1)
         self.use_global = QPushButton(theme.icon("reset"), "  Use global for all", clicked=self._reset_all)
         self.use_global.setToolTip("Drop all of this image's own settings and follow the global sliders")
-        grid.addWidget(self.use_global, len(ADJUSTMENTS) - 1, 1)
+        self.zero_all = QPushButton(theme.icon("reset"), "  Set all to 0", clicked=self._zero_all)
+        self.zero_all.setToolTip("Set every slider for this image to 0 (global sliders stay as they are)")
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        buttons.addWidget(self.zero_all)
+        buttons.addWidget(self.use_global)
+        grid.addLayout(buttons, len(ADJUSTMENTS) - 1, 1)
         self.message = QLabel(objectName="Muted")
         grid.addWidget(self.message, 0, 1)
         grid.addWidget(self._build_shadow_tools(), len(ADJUSTMENTS), 0, 1, 2)
@@ -343,6 +349,11 @@ class EditorPage(QWidget):
     def _reset_all(self):
         if self.item is not None:
             self.item.custom.clear()
+            self._changed()
+
+    def _zero_all(self):
+        if self.item is not None:
+            self.item.custom.update(dict.fromkeys(ADJUSTMENTS, 0))
             self._changed()
 
     def _changed(self):
