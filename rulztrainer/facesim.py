@@ -7,6 +7,11 @@ faces cut off by the frame left out) is reported too: the realistic ceiling, the
 
 Cosine similarity for ArcFace: same identity is typically 0.5 to 0.8, different people 0.0 to 0.3.
 "percent" is the cosine similarity clipped to [0, 1] times 100 (so 50%+ generally means "same person").
+
+A second, held-out recognizer (set_gold: FaceNet, idloss.facenet_embedder) can score the same detected face, aligned
+by the same landmarks, against its own embeddings of the references: score(gold=True) fills gold_cosine /
+gold_percent, and gold_self_similarity is its reference ceiling. Nothing trains on it, so it can judge a run that
+trains against ArcFace (likeness.py).
 """
 from __future__ import annotations
 
@@ -84,6 +89,9 @@ class FaceScore:
     face_norm: float | None = None
     body_norm: float | None = None
     combined_norm: float | None = None
+    # the held-out recognizer's best cosine and percent (set_gold; None = off or no face)
+    gold_cosine: float | None = None
+    gold_percent: float | None = None
 
 
 def combine(face, body, face_weight: float, body_weight: float):
@@ -140,6 +148,11 @@ class FaceScorer:
         self.app.prepare(ctx_id=index if index is not None else -1, det_size=(det_size, det_size))
         self.refs: list[tuple[str, np.ndarray]] = []
         self.ref_self_similarity: float | None = None
+        self.ref_kps: list = []  # each reference face's landmarks (source pixels) and whether the frame cuts it off
+        self.ref_cut: list[bool] = []
+        self.gold = None  # the held-out recognizer (set_gold)
+        self.gold_refs: np.ndarray | None = None
+        self.gold_self_similarity: float | None = None
 
     # ------------------------------------------------------------ embeddings
     def _load_bgr(self, path: str | Path) -> tuple[np.ndarray, float]:
@@ -205,7 +218,7 @@ class FaceScorer:
         """Embed the largest face of each reference image. Returns per-image info for the UI."""
         from .likeness import reference_ceiling
 
-        self.refs = []
+        self.refs, self.ref_kps = [], []
         info = []
         cut = []
         paths = expand_refs(paths)
@@ -218,6 +231,7 @@ class FaceScorer:
             f = fs[0]
             off = cut_off(f.bbox, image_size(p))
             self.refs.append((str(p), f.normed_embedding.astype(np.float32)))
+            self.ref_kps.append(getattr(f, "kps", None))
             cut.append(off)
             info.append({"image": str(p), "faces": len(fs), "bbox": [float(x) for x in f.bbox],
                          "det_score": float(f.det_score), "cut_off": off})
@@ -227,13 +241,46 @@ class FaceScorer:
         # always a clean front-facing headshot
         self.ref_self_similarity = (reference_ceiling(np.stack([e for _, e in self.refs]), [not c for c in cut])
                                     if len(self.refs) >= 2 else None)
+        self.ref_cut = cut
+        if getattr(self, "gold", None) is not None:
+            self._embed_gold_refs()
         log.info("Face references: %d of %d images had a face (%d cut off by the frame, left out of the ceiling); "
                  "typical best match among them %s", len(self.refs), len(paths), sum(cut),
                  f"{self.ref_self_similarity:.3f}" if self.ref_self_similarity is not None else "n/a")
         return info
 
+    # ------------------------------------------------------------ the held-out recognizer
+    def set_gold(self, embedder) -> None:
+        """Score with a second recognizer too (an idloss.Embedder, e.g. FaceNet): the references are embedded with it
+        now (and again whenever set_references runs)."""
+        self.gold = embedder
+        self._embed_gold_refs()
+
+    def _gold_embed(self, path, kps) -> np.ndarray:
+        from .idloss import embed_image, load_rgb
+
+        return embed_image(self.gold, load_rgb(path), kps).float().cpu().numpy().astype(np.float32)
+
+    def _embed_gold_refs(self) -> None:
+        """The references' faces, at the landmarks InsightFace found, embedded by the gold recognizer; its ceiling is
+        reference_ceiling over them (the frame's cut-off faces left out, as for ArcFace)."""
+        from .likeness import reference_ceiling
+
+        embs, usable = [], []
+        for (path, _), kps, off in zip(self.refs, self.ref_kps, self.ref_cut or [False] * len(self.refs)):
+            if kps is None:
+                continue
+            embs.append(self._gold_embed(path, kps))
+            usable.append(not off)
+        self.gold_refs = np.stack(embs) if embs else None
+        self.gold_self_similarity = reference_ceiling(self.gold_refs, usable) if len(embs) >= 2 else None
+        log.info("Gold face scorer (%s): %d reference face(s); typical best match among them %s",
+                 getattr(self.gold, "name", "") or "held out", len(embs),
+                 f"{self.gold_self_similarity:.3f}" if self.gold_self_similarity is not None else "n/a")
+
     # ------------------------------------------------------------ scoring
-    def score(self, image: str | Path, step: int = 0, prompt_index: int = 0) -> FaceScore:
+    def score(self, image: str | Path, step: int = 0, prompt_index: int = 0, gold: bool = False) -> FaceScore:
+        """The largest face's best ArcFace match; gold: the held-out recognizer's too (set_gold), on the same face."""
         fs = self.faces(image)
         if not fs or not self.refs:
             return FaceScore(step, str(image), prompt_index, len(fs), None, None, None)
@@ -243,7 +290,12 @@ class FaceScorer:
             c = float(emb @ ref)
             if c > best:
                 best, best_ref = c, name
-        return FaceScore(step, str(image), prompt_index, len(fs), best, max(0.0, min(1.0, best)) * 100.0, best_ref)
+        out = FaceScore(step, str(image), prompt_index, len(fs), best, max(0.0, min(1.0, best)) * 100.0, best_ref)
+        kps = getattr(fs[0], "kps", None)
+        if gold and getattr(self, "gold", None) is not None and self.gold_refs is not None and kps is not None:
+            out.gold_cosine = float((self.gold_refs @ self._gold_embed(image, kps)).max())
+            out.gold_percent = max(0.0, min(1.0, out.gold_cosine)) * 100.0
+        return out
 
     @staticmethod
     def crop_face(path: str | Path, bbox, out: Path, pad: float = 0.25) -> Path:

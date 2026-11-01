@@ -830,7 +830,12 @@ def probe_chart_series(probes: list[dict], names: list[str]) -> tuple[list[dict]
                    "data": _probe_points(probes, "face_norm", "face"), "itemStyle": {"color": "#FB7185"}},
                   {"name": "body (probe)", "type": "scatter", "symbolSize": 5,
                    "data": _probe_points(probes, "body_norm", "body"), "itemStyle": {"color": "#A1A1AA"}}]
-        return series, list(PROBE_DEFAULT_SERIES)
+        legend = list(PROBE_DEFAULT_SERIES)
+        gold = _probe_points(probes, "gold_norm_ema", "gold_ema")
+        if gold:  # the held-out FaceNet face (face_gold): drawn next to ArcFace's, so a gap between them shows
+            series.append(_line("face (FaceNet)", "#22D3EE", lineStyle={"type": "dashed"}, data=gold))
+            legend.append("face (FaceNet)")
+        return series, legend
     by: dict[str, list[dict]] = {}
     for pr in probes:
         by.setdefault(probe_racer(pr, names), []).append(pr)
@@ -853,9 +858,11 @@ def probe_score_line(rec: dict | None) -> str:
     if not rec:
         return ""
     face, body, comb = rec.get("face_norm"), rec.get("body_norm"), rec.get("combined")
+    gold = rec.get("gold_norm")
     if face is None and body is None and not rec.get("scale"):
-        face, body = rec.get("face"), rec.get("body")
-    parts = [f"{label} {v:.0f}%" for label, v in (("overall", comb), ("face", face), ("body", body)) if v is not None]
+        face, body, gold = rec.get("face"), rec.get("body"), rec.get("gold")
+    parts = [f"{label} {v:.0f}%" for label, v in (("overall", comb), ("face", face), ("FaceNet face", gold),
+                                                   ("body", body)) if v is not None]
     return " | ".join(parts)
 
 
@@ -1305,6 +1312,7 @@ class Form:
             likeness_track_best_face=bool(v("likeness_track_best_face")),
             likeness_track_best_body=bool(v("likeness_track_best_body")),
             likeness_best_any_rise=bool(v("likeness_best_any_rise")),
+            face_gold=v("face_gold") or "auto", face_gold_select=bool(v("face_gold_select")),
             likeness_normalize=bool(v("likeness_normalize")),
             face_scale_span=float(v("face_scale_span")), face_scale_curve=float(v("face_scale_curve")),
             body_scale_span=float(v("body_scale_span")), body_scale_curve=float(v("body_scale_curve")),
@@ -6647,6 +6655,23 @@ def build_page(local: bool = True):
                                 .classes("w-96 max-w-full") \
                                 .tooltip("Not used while Resolution step-up is on (its two counts replace it).")
                         with fields():
+                            w["face_gold"] = ui.select({"auto": "auto (when training against ArcFace)", "off": "off",
+                                                        "facenet": "FaceNet, always"}, value=d.face_gold,
+                                                       label="Gold face scorer").classes("w-72") \
+                                .tooltip("A second face recognizer (FaceNet, VGGFace2, about 110 MB, downloaded once) "
+                                         "scores every probe face too. Nothing trains on it, so it can judge a run that "
+                                         "trains against the probes' own ArcFace: the reward stage, the identity loss "
+                                         "on its arcface backend, identity alignment. Those can raise the ArcFace score "
+                                         "without the face looking more like the person. auto turns it on for them "
+                                         "(and for the probe noise check); the Monitor draws it as a dashed line.")
+                            w["face_gold_select"] = ui.switch("Best checkpoint, early stop and race follow it",
+                                                              value=d.face_gold_select) \
+                                .bind_visibility_from(w["face_gold"], "value", backward=lambda m: m != "off") \
+                                .tooltip("On (default): with the gold scorer on, its face score replaces ArcFace's in "
+                                         "the combined score that keeps the best checkpoint, stops early and ranks a "
+                                         "race. The lr control and the face/body curriculum keep ArcFace. Off: it is "
+                                         "only logged and drawn next to ArcFace.")
+                        with fields():
                             w["likeness_lr_control"] = ui.switch("LR multiplier from probe trend",
                                                                  value=d.likeness_lr_control)
                             w["likeness_lr_min"] = ui.number("Min factor", value=d.likeness_lr_min, step=0.1) \
@@ -7456,7 +7481,10 @@ def build_page(local: bool = True):
                     normed = last.get("face_norm_ema") is not None or last.get("body_norm_ema") is not None
                     fe = last.get("face_norm_ema") if normed else last.get("face_ema")
                     be = last.get("body_norm_ema") if normed else last.get("body_ema")
-                    probe_label.text = (f"Probe @ step {last['step']}: face {f2(fe)} body {f2(be)}"
+                    ge = last.get("gold_norm_ema") if normed else last.get("gold_ema")
+                    gold_txt = (f" FaceNet face {f2(ge)}" + (" (in charge)" if last.get("gold_select") else "")
+                                if ge is not None else "")
+                    probe_label.text = (f"Probe @ step {last['step']}: face {f2(fe)}{gold_txt} body {f2(be)}"
                                         f" combined {f2(last.get('combined_ema'))} | best {f2(lk.get('best'))} @ step {lk.get('best_step')}"
                                         f" | {lk.get('since_improve', 0)} probe(s) since improvement | lr x{lk.get('lr_factor', 1.0):.2f}"
                                         f" | face bias {lk.get('face_bias', 0.0):+.2f}" + (" | STOPPED" if lk.get("stopped") else ""))
@@ -7833,6 +7861,15 @@ on and press Start. It trains nothing; it renders both on many seeds, the same o
 and a noise band that fits your probe settings. In a race, *Drop only when the probe seeds agree* (Configuration race)
 drops the lowest racer only when its scores, seed by seed, sit below the leader's with the confidence you set (0.9 is a
 good start); a round too close to call drops nobody, at most a few rounds in a row. Use 2 or more probe seeds with it.
+
+## Gold face scorer (FaceNet)
+The probes judge the face with ArcFace. The reward stage, the identity loss on its arcface backend and identity
+alignment train against that same ArcFace, so they can raise its score without the face looking more like the person.
+*Gold face scorer* (Likeness probes section) adds a second recognizer, FaceNet, that nothing trains on: it scores the
+same faces against the same references on its own scale, and (*Best checkpoint, early stop and race follow it*, on by
+default) its score replaces ArcFace's in the decisions. *auto* turns it on for those runs and for the probe noise
+check. The Monitor draws it as a dashed "face (FaceNet)" line; ArcFace pulling away from it is the warning sign, and the
+reward stage logs a warning when ArcFace runs more than 10 points further ahead than when the stage began.
 
 ## Previous runs (run history)
 

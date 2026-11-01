@@ -31,6 +31,14 @@ it, a DINOv2 cosine because a probe that copies the photos' outfit and setting m
 references, in their varied outfits, match each other. With the face alone stretched (until v2.1.3) the body read 100
 while the face, for pictures that looked equally close, read 50-60. The combined score, the noise band, the curriculum, the lr control and the best / stop / race decisions all run on those.
 
+Gold face score. A run that trains against ArcFace (the reward stage, the identity loss on its arcface backend,
+identity alignment) can raise the ArcFace score without raising the likeness: the score it is judged by is the one it
+optimizes. With `face_gold` the probes also score each face with FaceNet (VGGFace2), which nothing trains on, on its
+own scale (its own step-0 floor and reference ceiling, the face's span and curve). With `face_gold_select` (the
+default) the gold face takes the ArcFace face's place in the combined score that picks the best checkpoint, stops
+early, steps up the resolution and ranks a race (and in the per-seed scores paired race drops use); the lr control
+and the curriculum keep ArcFace. The records keep both, so their gap shows when ArcFace runs ahead.
+
 The controller never touches the loss; it only steers sampling, lr and when to stop.
 """
 from __future__ import annotations
@@ -53,13 +61,14 @@ def combine(face, body, face_weight: float, body_weight: float):
 
 # the raw-score scale each probe kind is normalized on: floor = a stranger's score (replaced by the step-0 probe when
 # there is one), ceiling = the references' own self-similarity (replaced by the measured one when there are 2+ refs)
-FLOOR_DEFAULT = {"face": 20.0, "body": 80.0}
-CEILING_DEFAULT = {"face": 75.0, "body": 90.0}  # body: a window's references ~85-90, proportions ~90-96
-MIN_SPAN = {"face": 10.0, "body": 8.0}  # the ceiling stays at least this far above the floor (raw points)
+FLOOR_DEFAULT = {"face": 20.0, "body": 80.0, "gold": 15.0}
+# body: a window's references ~85-90, proportions ~90-96; gold (FaceNet VGGFace2): the same person ~60-80
+CEILING_DEFAULT = {"face": 75.0, "body": 90.0, "gold": 70.0}
+MIN_SPAN = {"face": 10.0, "body": 8.0, "gold": 10.0}  # the ceiling stays at least this far above the floor (raw points)
 # ... and at least this share of the way from the floor to a perfect 100: a body ceiling (the references' typical best
 # match among themselves) that sits barely above the base model's step-0 score is no measure of a likeness, and a few
 # points of copied outfit then read 100 (a real run: floor 73.3, ceiling 81.3)
-MIN_ROOM_SHARE = {"face": 0.0, "body": 0.5}
+MIN_ROOM_SHARE = {"face": 0.0, "body": 0.5, "gold": 0.0}
 # matching the references better than a typical one of them does is no more likeness (a probe that copies one photo
 # reads higher), so the scale stops at 100
 NORM_MAX = 100.0
@@ -87,6 +96,19 @@ def reference_ceiling(embs, usable=None) -> float | None:
         if int(keep.sum()) >= 2:
             best = best[keep]
     return float(np.median(best))
+
+
+def mean_of(values) -> float | None:
+    """The mean of the scored values (None: unscored), None when there are none."""
+    vals = [v for v in values or [] if v is not None]
+    return sum(vals) / len(vals) if vals else None
+
+
+def combine_seeds(face: list, body: list, face_weight: float, body_weight: float) -> list:
+    """Each seed's face and body combined (a probe without one kind of prompt counts the other kind alone)."""
+    n = max(len(face), len(body))
+    return [combine(face[k] if k < len(face) else None, body[k] if k < len(body) else None, face_weight, body_weight)
+            for k in range(n)]
 
 
 def probe_seed_count(cfg, step: int) -> int:
@@ -140,23 +162,39 @@ class ProbeRecord:
     face_norm_seeds: list = field(default_factory=list)
     body_norm_seeds: list = field(default_factory=list)
     combined_seeds: list = field(default_factory=list)
+    # the held-out gold face score (face_gold), raw and normalized, smoothed and per seed; gold_select: it replaced
+    # ArcFace in combined / combined_ema / combined_seeds, and arc_combined_ema is the ArcFace one
+    gold: float | None = None
+    gold_ema: float | None = None
+    gold_norm: float | None = None
+    gold_norm_ema: float | None = None
+    gold_seeds: list = field(default_factory=list)
+    gold_norm_seeds: list = field(default_factory=list)
+    gold_select: bool = False
+    arc_combined_ema: float | None = None
 
 
 class LikenessController:
-    def __init__(self, cfg, face_ceiling: float | None = None, body_ceiling: float | None = None):
-        """face_ceiling / body_ceiling: the references' self-similarity in raw percent (None: the default)."""
+    def __init__(self, cfg, face_ceiling: float | None = None, body_ceiling: float | None = None,
+                 gold_ceiling: float | None = None):
+        """face_ceiling / body_ceiling / gold_ceiling: the references' self-similarity in raw percent (None: the
+        default)."""
         self.cfg = cfg
         self.normalize = bool(getattr(cfg, "likeness_normalize", True))
         self.ceiling = {"face": face_ceiling if face_ceiling is not None else CEILING_DEFAULT["face"],
-                        "body": body_ceiling if body_ceiling is not None else CEILING_DEFAULT["body"]}
-        self.floor = {"face": None, "body": None}  # None: the default, until a step-0 probe sets it
+                        "body": body_ceiling if body_ceiling is not None else CEILING_DEFAULT["body"],
+                        "gold": gold_ceiling if gold_ceiling is not None else CEILING_DEFAULT["gold"]}
+        self.floor = {"face": None, "body": None, "gold": None}  # None: the default, until a step-0 probe sets it
         self.span = {"face": float(getattr(cfg, "face_scale_span", FACE_SPAN_DEFAULT)),
                      "body": float(getattr(cfg, "body_scale_span", BODY_SPAN_DEFAULT))}
         self.curve = {"face": float(getattr(cfg, "face_scale_curve", FACE_CURVE_DEFAULT)),
                       "body": float(getattr(cfg, "body_scale_curve", BODY_CURVE_DEFAULT))}
         self.face_ema = None
         self.body_ema = None
+        self.gold_ema = None
+        self.has_gold = False  # a probe brought gold scores (the face scorer has the held-out recognizer)
         self.combined_ema = None
+        self.arc_combined_ema = None  # the combined score with the ArcFace face (= combined_ema without gold)
         self.prev_combined = None
         self.best = None
         self.best_step = None
@@ -188,6 +226,19 @@ class LikenessController:
         self.stage_since_improve = 0
 
     @property
+    def gold_select(self) -> bool:
+        """The gold face replaces ArcFace's in the decisions (face_gold_select, once probes bring gold scores)."""
+        return self.has_gold and bool(getattr(self.cfg, "face_gold_select", True))
+
+    def kinds(self) -> tuple[str, ...]:
+        return ("face", "body", "gold") if self.has_gold else ("face", "body")
+
+    def _shape(self, kind: str) -> tuple[float, float]:
+        """(span, curve) of a kind's scale: the gold face is shaped like ArcFace's face."""
+        k = "face" if kind == "gold" else kind
+        return self.span[k], self.curve[k]
+
+    @property
     def last_stage(self) -> bool:
         return self.stage >= self.n_stages - 1
 
@@ -204,57 +255,62 @@ class LikenessController:
         also at least halfway to 100, MIN_ROOM_SHARE), then the span stretched (face_scale_span / body_scale_span)."""
         floor = self.floor[kind] if self.floor[kind] is not None else FLOOR_DEFAULT[kind]
         least = max(MIN_SPAN[kind], MIN_ROOM_SHARE[kind] * (100.0 - floor))
-        return floor, floor + (max(self.ceiling[kind], floor + least) - floor) * self.span[kind]
+        return floor, floor + (max(self.ceiling[kind], floor + least) - floor) * self._shape(kind)[0]
 
     def norm(self, kind: str, value):
         """A raw score on the normalized scale (the raw score itself with likeness_normalize off)."""
         if value is None or not self.normalize:
             return value
-        return normalize(value, *self.scale(kind), self.curve[kind])
+        return normalize(value, *self.scale(kind), self._shape(kind)[1])
 
     def scale_record(self) -> dict:
         """The scale as the probe records keep it ({"face": [floor, ceiling], "body": [...], "curve": {...},
         "span": {...}}): the ceiling is the stretched one, the span what stretched it."""
-        return {**{k: list(self.scale(k)) for k in ("face", "body")}, "curve": dict(self.curve), "span": dict(self.span)}
+        return {**{k: list(self.scale(k)) for k in self.kinds()},
+                "curve": {k: self._shape(k)[1] for k in self.kinds()}, "span": {k: self._shape(k)[0] for k in self.kinds()}}
 
-    def _set_floors(self, face, body) -> None:
+    def _set_floors(self, face, body, gold=None) -> None:
         """The step-0 probe (the base model, no LoRA) is what a stranger scores: the floor of each scale, so step 0
         reads 0 by construction. A ceiling at or below it (a base model that already resembles the references, or
         a body self-similarity dragged down by the references' varied poses) is raised to floor + MIN_SPAN by
         scale(), never the floor lowered."""
-        for kind, value in (("face", face), ("body", body)):
+        for kind, value in (("face", face), ("body", body), ("gold", gold)):
             if value is not None and self.floor[kind] is None:
                 self.floor[kind] = float(value)
 
     def describe_scale(self) -> str:
         parts = []
-        for kind in ("face", "body"):
+        for kind in self.kinds():
             lo, hi = self.scale(kind)
             src = "step-0 probe" if self.floor[kind] is not None else "default"
-            parts.append(f"{kind} {lo:.1f} -> {hi:.1f} (floor: {src}"
-                         + (f", curve x{self.curve[kind]:g}" if self.curve[kind] != 1.0 else "") + ")")
+            parts.append(f"{'gold face' if kind == 'gold' else kind} {lo:.1f} -> {hi:.1f} (floor: {src}"
+                         + (f", curve x{self._shape(kind)[1]:g}" if self._shape(kind)[1] != 1.0 else "") + ")")
         return "; ".join(parts) + (" (raw percent: 0 = a stranger; body 100 = a typical reference's best match among "
                                    "the others, the face scale reaches past it)")
 
     def seed_scores(self, seeds: dict | None) -> dict:
         """A probe's per-seed raw scores ({"face": [...], "body": [...]}, seed order, None = unscored) as the record
         keeps them: raw, normalized, and each seed's face and body combined (the seeds a probe without one kind of
-        prompt renders count with the other kind alone)."""
+        prompt renders count with the other kind alone). With a "gold" list its seeds are kept too, and with
+        gold_select the gold face is the one combined."""
         cfg = self.cfg
         face = list((seeds or {}).get("face") or [])
         body = list((seeds or {}).get("body") or [])
+        gold = list((seeds or {}).get("gold") or [])
         face_n = [self.norm("face", v) for v in face]
         body_n = [self.norm("body", v) for v in body]
-        n = max(len(face_n), len(body_n))
-        comb = [combine(face_n[k] if k < len(face_n) else None, body_n[k] if k < len(body_n) else None,
-                        cfg.face_weight, cfg.body_weight) for k in range(n)]
-        return {"face_seeds": face, "body_seeds": body, "face_norm_seeds": face_n, "body_norm_seeds": body_n,
-                "combined_seeds": comb}
+        gold_n = [self.norm("gold", v) for v in gold]
+        comb = combine_seeds(gold_n if self.gold_select else face_n, body_n, cfg.face_weight, cfg.body_weight)
+        out = {"face_seeds": face, "body_seeds": body, "face_norm_seeds": face_n, "body_norm_seeds": body_n,
+               "combined_seeds": comb}
+        if self.has_gold:
+            out.update(gold_seeds=gold, gold_norm_seeds=gold_n)
+        return out
 
     def update(self, step: int, face: float | None, body: float | None, images: list[str] | None = None,
                seeds: dict | None = None):
-        """Feed one probe result (seeds: its per-seed raw scores, {"face": [...], "body": [...]}, kept in the record
-        and in last_seeds). Returns (record, actions) where actions may contain
+        """Feed one probe result (seeds: its per-seed raw scores, {"face": [...], "body": [...]} and "gold" with the
+        held-out recognizer, kept in the record and in last_seeds). Returns (record, actions) where actions may contain
         save_best (bool), save_best_face / save_best_body (bool: the smoothed face / body score beat its best by
         the noise band and its checkpoint is kept), stop (bool), lr_ratio (float, new/old), face_bias (float),
         step_up (int),
@@ -264,17 +320,27 @@ class LikenessController:
         actions: dict = {}
         self.n_probes += 1
         self.last_step = step
+        if seeds and "gold" in seeds:
+            self.has_gold = True
+        gold = mean_of((seeds or {}).get("gold"))
         if self.normalize and step == 0:
-            self._set_floors(face, body)
+            self._set_floors(face, body, gold)
         per_seed = self.seed_scores(seeds)
         self.last_seeds = per_seed["combined_seeds"]
         self.face_ema = self._ema(self.face_ema, face)
         self.body_ema = self._ema(self.body_ema, body)
-        face_n, body_n = self.norm("face", self.face_ema), self.norm("body", self.body_ema)
+        self.gold_ema = self._ema(self.gold_ema, gold)
+        face_arc, body_n = self.norm("face", self.face_ema), self.norm("body", self.body_ema)
+        gold_n = self.norm("gold", self.gold_ema) if self.has_gold else None
+        arc_comb = combine(face_arc, body_n, cfg.face_weight, cfg.body_weight)
+        self.arc_combined_ema = arc_comb
+        # the face the decisions read (best, stop, step-up, race, the identity-loss guard, the best face checkpoint):
+        # the held-out gold one when it is in charge, else ArcFace's
+        face_n, sel_raw = (gold_n, gold) if self.gold_select else (face_arc, face)
         comb = combine(face_n, body_n, cfg.face_weight, cfg.body_weight)
         self.combined_ema = comb
         band = cfg.likeness_noise_band
-        if face_n is not None and face is not None:
+        if face_n is not None and sel_raw is not None:
             if self.face_best is None or face_n > self.face_best:
                 self.face_best = face_n
             if face_n < self.face_best - 2 * band:
@@ -314,8 +380,9 @@ class LikenessController:
                     elif self.last_stage and self.stage_since_improve >= cfg.step_up_stop_patience:
                         self.stopped = True
                         actions["stop"] = True
+        if arc_comb is not None:  # the lr control reads ArcFace's combined score, gold or not
             if cfg.likeness_lr_control and self.prev_combined is not None:
-                delta = comb - self.prev_combined
+                delta = arc_comb - self.prev_combined
                 new = self.lr_factor
                 if delta > band:
                     new = min(cfg.likeness_lr_max, self.lr_factor * (1 + cfg.likeness_lr_step))
@@ -324,19 +391,24 @@ class LikenessController:
                 if abs(new - self.lr_factor) > 1e-12:
                     actions["lr_ratio"] = new / self.lr_factor
                     self.lr_factor = new
-            self.prev_combined = comb
-        if cfg.likeness_curriculum and face_n is not None and body_n is not None:
-            gap = body_n - face_n  # > 0: the face lags the body (both on the normalized scale)
+            self.prev_combined = arc_comb
+        if cfg.likeness_curriculum and face_arc is not None and body_n is not None:
+            gap = body_n - face_arc  # > 0: the face lags the body (both on the normalized scale; ArcFace's face)
             bias = max(-1.0, min(1.0, gap / 20.0)) * cfg.likeness_curriculum_strength
             if abs(bias - self.face_bias) > 0.02:
                 self.face_bias = bias
                 actions["face_bias"] = bias
+        sel_kind = "gold" if self.gold_select else "face"
         rec = ProbeRecord(step, face, body,
-                          combine(self.norm("face", face), self.norm("body", body), cfg.face_weight, cfg.body_weight),
+                          combine(self.norm(sel_kind, sel_raw), self.norm("body", body), cfg.face_weight,
+                                  cfg.body_weight),
                           self.face_ema, self.body_ema, comb, self.lr_factor, self.face_bias, self.best,
                           self.best_step, self.since_improve, list(images or []), self.stage, self.stage_best,
-                          self.stage_since_improve, self.norm("face", face), self.norm("body", body), face_n, body_n,
-                          self.scale_record() if self.normalize else {}, **per_seed)
+                          self.stage_since_improve, self.norm("face", face), self.norm("body", body), face_arc,
+                          body_n, self.scale_record() if self.normalize else {}, **per_seed)
+        if self.has_gold:
+            rec.gold, rec.gold_ema, rec.gold_norm = gold, self.gold_ema, self.norm("gold", gold)
+            rec.gold_norm_ema, rec.gold_select, rec.arc_combined_ema = gold_n, self.gold_select, arc_comb
         if "step_up" in actions:
             self.enter_stage(actions["step_up"])
         return rec, actions
@@ -350,6 +422,8 @@ class LikenessController:
                 "id_loss_vetoed": self.id_loss_vetoed, "normalize": self.normalize,
                 "part_best": {k: {"score": v, "step": s} for k, (v, s) in self.part_best.items()},
                 "face_norm_ema": self.norm("face", self.face_ema), "body_norm_ema": self.norm("body", self.body_ema),
+                "gold_ema": self.gold_ema, "gold_norm_ema": self.norm("gold", self.gold_ema) if self.has_gold else None,
+                "gold_select": self.gold_select, "arc_combined_ema": self.arc_combined_ema,
                 "scale": self.scale_record() if self.normalize else {}}
 
 

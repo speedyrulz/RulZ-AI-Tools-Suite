@@ -2868,6 +2868,7 @@ class Trainer(RaceParallelMixin):
                  cfg.reward_kl, len(cfg.reward_prompts),
                  " + ".join(k for k, s in (("face", self.face_scorer), ("body", self.body_scorer)) if s is not None))
         self.stage_tag = "_reward"
+        self._gold_gap0, self._gold_gap_warned = self._gold_gap(), False  # the gold check's starting point
         self.status.update(stage="reward fine-tuning", total=total)
         model.train()
         lora_mod.set_extras_enabled(model, True)  # the policy is the sampler the probes use: turbo LoRA included
@@ -3091,7 +3092,8 @@ class Trainer(RaceParallelMixin):
         self.status.update(stage=f"self-training round {rnd}: scoring {len(paths)} pictures")
         scale = self._likeness_scale()
         cands = [self._selftrain_candidate(p, job.prompt, scale, side) for job, p in zip(jobs, paths)]
-        probe = self.controller.combined_ema if self.controller is not None else None
+        # the candidates are scored with ArcFace: the bar is the probes' ArcFace combined score, gold face or not
+        probe = getattr(self.controller, "arc_combined_ema", None) if self.controller is not None else None
         bar = max(cfg.selftrain_min_likeness, probe) if probe is not None else cfg.selftrain_min_likeness
         need_face = self.face_scorer is not None and cfg.face_weight > 0
         kept, reasons = ST.select(cands, need_face=need_face, bar=bar, cap=cap)
@@ -3305,7 +3307,7 @@ class Trainer(RaceParallelMixin):
         import json
 
         from . import likeness_stats as LS
-        from .likeness import probe_seed_count
+        from .likeness import combine_seeds, mean_of, probe_seed_count
 
         cfg = self.cfg
         if self.controller is None:
@@ -3319,9 +3321,10 @@ class Trainer(RaceParallelMixin):
         self._free_for_rendering()
         self.status.update(stage="noise check: probing the base model")
         with lora_mod.frozen_adapters(), self._sampling_slots(model, 0) as slots:  # the base model: the scale's zero
-            face, body, _, _ = self._probe_with(slots, 0, tag="noise_base")
+            face, body, _, seeds0 = self._probe_with(slots, 0, tag="noise_base")
+        self.controller.has_gold = "gold" in seeds0
         if self.controller.normalize:
-            self.controller._set_floors(face, body)
+            self.controller._set_floors(face, body, mean_of(seeds0.get("gold")))
             log.info("Likeness scale: %s (%d seeds)", self.controller.describe_scale(), probe_seed_count(cfg, 0))
         files, raw = {}, {}
         for i, p in enumerate(cfg.noise_files):
@@ -3332,9 +3335,15 @@ class Trainer(RaceParallelMixin):
             _, _, seeds = self._soup_probe(model, p, f"noise{i + 1:02d}", n_seeds=cfg.noise_seeds)
             per = self.controller.seed_scores(seeds)
             files[name] = {"face": per["face_norm_seeds"], "body": per["body_norm_seeds"],
-                           "combined": per["combined_seeds"]}
+                           "combined": combine_seeds(per["face_norm_seeds"], per["body_norm_seeds"], cfg.face_weight,
+                                                     cfg.body_weight)}
             raw[name] = {"face": per["face_seeds"], "body": per["body_seeds"]}
-            m, sd = LS.mean_sd(per["combined_seeds"])
+            if "gold_norm_seeds" in per:  # the held-out FaceNet face, alone and combined with the body
+                files[name]["gold"] = per["gold_norm_seeds"]
+                files[name]["combined_gold"] = combine_seeds(per["gold_norm_seeds"], per["body_norm_seeds"],
+                                                             cfg.face_weight, cfg.body_weight)
+                raw[name]["gold"] = per["gold_seeds"]
+            m, sd = LS.mean_sd(files[name]["combined"])
             log.info("Noise check: %s scores %s (seeds spread %s)", name, "n/a" if m is None else f"{m:.1f}%",
                      "n/a" if sd is None else f"{sd:.1f} points")
         rep = LS.noise_report(files, cfg.probe_seeds, cfg.probe_ema)
@@ -3345,9 +3354,12 @@ class Trainer(RaceParallelMixin):
             log.info("Noise check: %s", line)
         log.info("Noise check done in %.0fs -> %s", time.time() - t0, out_dir / "noise.json")
         comb = rep["kinds"]["combined"]
-        self.status.update(stage="finished", done=True, noise={
-            "sigma": comb.get("sigma"), "sd_diff": comb.get("sd_diff"), "rho": comb.get("rho"),
-            "seeds_needed": comb.get("seeds_needed"), "suggested_noise_band": rep.get("suggested_noise_band")})
+        noise = {"sigma": comb.get("sigma"), "sd_diff": comb.get("sd_diff"), "rho": comb.get("rho"),
+                 "seeds_needed": comb.get("seeds_needed"), "suggested_noise_band": rep.get("suggested_noise_band")}
+        for kind in ("face", "gold"):
+            if kind in rep["kinds"]:
+                noise[f"{kind}_sd_diff"] = rep["kinds"][kind].get("sd_diff")
+        self.status.update(stage="finished", done=True, noise=noise)
 
     @torch.no_grad()
     def _soup_probe(self, model, path, tag: str, n_seeds: int | None = None):
@@ -3394,13 +3406,16 @@ class Trainer(RaceParallelMixin):
             sim = getattr(scorer, "ref_self_similarity", None) if scorer is not None else None
             if sim is not None:
                 out[key] = float(sim) * 100.0
+        sim = getattr(self.face_scorer, "gold_self_similarity", None) if self.face_scorer is not None else None
+        if sim is not None:
+            out["gold_ceiling"] = float(sim) * 100.0
         return out
 
     @torch.no_grad()
     def _probe_with(self, slots, step, tag: str = "", n_seeds: int | None = None):
         """Render and score one probe: (face, body, images, seeds), face / body the mean raw score over the seeds that
-        were scored, seeds each seed's own ({"face": [...], "body": [...]}, seed order, None = no face / body found).
-        n_seeds overrides probe_seeds (the noise check)."""
+        were scored, seeds each seed's own ({"face": [...], "body": [...]}, seed order, None = no face / body found;
+        "gold" too with the held-out recognizer). n_seeds overrides probe_seeds (the noise check)."""
         from .likeness import probe_body_size, probe_seed_count
 
         cfg = self.cfg
@@ -3433,10 +3448,16 @@ class Trainer(RaceParallelMixin):
             for sl in slots:
                 lora_mod.set_extras_enabled(sl.model, False)
         seeds: dict[str, list] = {"face": [], "body": []}
+        gold = self.face_scorer is not None and getattr(self.face_scorer, "gold", None) is not None
+        if gold:
+            seeds["gold"] = []
         self.status.update(stage=f"scoring probes (step {step})")
         for job, p in zip(jobs, images):  # scoring stays in this thread: the scorers are not shared across threads
             if job.kind == "face":
-                seeds["face"].append(self.face_scorer.score(p, step, 0).percent)
+                sc = self.face_scorer.score(p, step, 0, gold=True) if gold else self.face_scorer.score(p, step, 0)
+                seeds["face"].append(sc.percent)
+                if gold:
+                    seeds["gold"].append(sc.gold_percent)
             else:
                 seeds["body"].append(self.body_scorer.score(p)[0])
         face_scores = [v for v in seeds["face"] if v is not None]
@@ -3479,6 +3500,13 @@ class Trainer(RaceParallelMixin):
                      "| lr x%.2f | face bias %+.2f (%.1fs)", who, step, fmt(face), fmt(body), fmt(rec.combined),
                      fmt(rec.face_ema), fmt(rec.body_ema), fmt(rec.combined_ema), fmt(rec.best), rec.best_step,
                      rec.lr_factor, rec.face_bias, time.time() - t0)
+        if self.controller.has_gold:
+            arc, gold = rec.face_norm_ema if self.controller.normalize else rec.face_ema, rec.gold_norm_ema
+            log.info("%sGold face (FaceNet) step %d: %s (normalized %s) | ema %s vs ArcFace %s%s%s", who, step,
+                     fmt(rec.gold), fmt(rec.gold_norm), fmt(gold), fmt(arc),
+                     f" (ArcFace {arc - gold:+.1f})" if arc is not None and gold is not None else "",
+                     " | the decisions follow the gold face" if rec.gold_select else "")
+            self._check_gold_gap(step)
         if "step_up" in actions and step < cfg.steps:  # not at the end, nor in the reward stage
             log.info("Resolution step-up: stage %d stalled for %d probe(s) (stage best %s)", rec.stage + 1,
                      rec.stage_since_improve, fmt(rec.stage_best))
@@ -3518,9 +3546,12 @@ class Trainer(RaceParallelMixin):
             self.id_loss = None
             if self._race_running():
                 self.race.active.state["id_vetoed"] = True
-            log.warning("Identity loss vetoed at step %d: the smoothed face score %s fell more than %.1f points below "
-                        "its best %s for two probes in a row; the identity loss is off for the rest of the run", step,
-                        fmt(rec.face_ema), 2 * cfg.likeness_noise_band, fmt(self.controller.face_best))
+            log.warning("Identity loss vetoed at step %d: the smoothed %sface score %s fell more than %.1f points "
+                        "below its best %s for two probes in a row; the identity loss is off for the rest of the run",
+                        step, "gold " if rec.gold_select else "",
+                        fmt(rec.gold_norm_ema if rec.gold_select else rec.face_norm_ema
+                            if self.controller.normalize else rec.face_ema),
+                        2 * cfg.likeness_noise_band, fmt(self.controller.face_best))
             self.status.update(id_loss_vetoed=step)
         if "lr_ratio" in actions:
             apply_lr_ratio(optimizer, scheduler, actions["lr_ratio"])
@@ -3540,6 +3571,31 @@ class Trainer(RaceParallelMixin):
         self.status.update(probes=probes[-500:], likeness=self.controller.state(), stage="training")
         self._save_history()
         return bool(actions.get("stop"))
+
+    def _gold_gap(self) -> float | None:
+        """ArcFace's smoothed normalized face minus the gold face's (None without both)."""
+        st = self.controller.state() if self.controller is not None else {}
+        arc, gold = st.get("face_norm_ema"), st.get("gold_norm_ema")
+        return None if arc is None or gold is None else arc - gold
+
+    def _check_gold_gap(self, step: int) -> None:
+        """In the reward stage (it trains against ArcFace): warn once when ArcFace's smoothed face has run ahead of the
+        gold face by more than max(10, 3 noise bands) points beyond the gap the stage started with, the sign that
+        the reward games ArcFace rather than improving the likeness."""
+        if getattr(self, "stage_tag", "") != "_reward" or getattr(self, "_gold_gap_warned", False):
+            return
+        gap, base = self._gold_gap(), getattr(self, "_gold_gap0", None)
+        if gap is None or base is None:
+            return
+        limit = max(10.0, 3 * self.cfg.likeness_noise_band)
+        if gap - base > limit:
+            self._gold_gap_warned = True
+            log.warning("Reward stage, step %d: ArcFace's face score has run %.1f points further ahead of the gold "
+                        "(FaceNet) face than when the stage started (%+.1f -> %+.1f): the reward may be gaming "
+                        "ArcFace rather than improving the likeness. %s", step, gap - base, base, gap,
+                        "The best checkpoint follows the gold face" if self.controller.gold_select else
+                        "Compare the probes by eye; face_gold_select makes the best checkpoint follow the gold face")
+            self.status.update(gold_gap_warning=step)
 
     def _save_history(self, state: str = "running") -> None:
         """Keep this run's likeness scores in output/_history (never fails a run)."""
@@ -3614,7 +3670,45 @@ class Trainer(RaceParallelMixin):
             log.warning("No faces found in any face reference image; face scoring disabled")
             return None
         self.status.update(face_ref_similarity=scorer.ref_self_similarity, face_refs=len(scorer.refs))
+        self._setup_gold(scorer)
         return scorer
+
+    def _setup_gold(self, scorer) -> None:
+        """The held-out gold face recognizer (face_gold, likeness.py): FaceNet on the face scorer when the run, or any
+        race configuration, trains against ArcFace (or face_gold is facenet, or the noise check runs), on the face
+        scorer's device. Never when a configuration trains on FaceNet itself."""
+        cfgs = [self.cfg] + [c for _, c, _ in (getattr(self, "race_rows", None) or [])]
+        if not any(c.gold_backend() for c in cfgs):
+            scorer.gold = None
+            return
+        if any(c.trains_on_facenet() for c in cfgs):
+            log.warning("Gold face scorer off: a race configuration trains on FaceNet (id_loss_backend facenet), so "
+                        "it is no held-out judge; the probes judge with ArcFace alone")
+            scorer.gold = None
+            return
+        from . import facesim, idloss
+
+        cfg = self.cfg
+        self.status.update(stage="loading the gold face scorer (FaceNet)")
+        index = facesim.cuda_index(cfg.face_provider)
+        dev = f"cuda:{index}" if index is not None and torch.cuda.is_available() else "cpu"
+        try:
+            emb = idloss.facenet_embedder(cfg.models_dir, progress=lambda t, f: self.status.update(stage=t))
+            scorer.set_gold(emb.to(dev))
+        except Exception as e:  # noqa: BLE001
+            log.warning("Could not load the gold face scorer (%s); the probes judge with ArcFace alone", e)
+            scorer.gold = scorer.gold_refs = None
+            return
+        if scorer.gold_refs is None:
+            log.warning("Gold face scorer: no reference face with landmarks; the probes judge with ArcFace alone")
+            scorer.gold = None
+            return
+        why = ("the run trains against ArcFace" if any(c.trains_on_arcface() for c in cfgs)
+               else "the noise check measures it" if cfg.noise_files else "face_gold facenet")
+        log.info("Gold face scorer on (%s): FaceNet (VGGFace2), which nothing trains on, scores every probe face "
+                 "too; %s", why, "the best checkpoint, early stop and race ranking follow it, the lr control and "
+                 "curriculum keep ArcFace" if cfg.face_gold_select else "logged next to ArcFace (face_gold_select off)")
+        self.status.update(face_gold="facenet", face_gold_similarity=scorer.gold_self_similarity)
 
     def _make_id_loss(self):
         """The direct identity loss (experimental), or None when it is off or cannot run."""

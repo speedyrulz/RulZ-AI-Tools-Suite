@@ -1098,6 +1098,38 @@ Seed twins in one run: a race row may set its own `seed`, which gives it its own
 noise (the other rows keep sharing theirs); with `race_drop_lowest: false` every twin trains to the end and keeps its
 `_best` file.
 
+## Gold face scorer (`face_gold`)
+
+The probes judge the face with ArcFace, and three things train against that same ArcFace: the reward stage, the
+identity loss on its `arcface` backend and identity alignment (`id_align`). They can raise the ArcFace score without
+the face looking more like the person, the same trap as a reward model in RLHF: the score a run is judged by should
+not be the one it optimizes. `face_gold` adds a second recognizer that nothing trains on, FaceNet (InceptionResnetV1,
+VGGFace2; the identity loss's `facenet` backend, downloaded once to `models/facenet/`, about 110 MB):
+
+- **When:** `auto` (the default) turns it on when the run, or any race configuration, trains against ArcFace, and for
+  the probe noise check; `facenet` always; `off` never. It stays off when a configuration trains on FaceNet itself
+  (`id_loss_backend: facenet`), and `face_gold: facenet` with that backend is refused.
+- **What:** every probe face, at the landmarks InsightFace found, is embedded by FaceNet too and compared with
+  FaceNet's own embeddings of the face references. It has its own scale: the step-0 probe is its zero and the
+  references' typical best match among themselves (the cut-off faces left out) its 100, stretched and curved like
+  the face's. About 0.2 s per probe face on the CPU.
+- **Decisions:** with `face_gold_select` (the default) the gold face takes ArcFace's place in the combined score that
+  keeps the best checkpoint (and the best face checkpoint), stops early, steps up the resolution, vetoes the identity
+  loss and ranks a race, paired drops included. The lr control and the face/body curriculum keep ArcFace, and so does
+  self-training's bar (its pictures are scored with ArcFace). Off: the gold face is only logged.
+- **Records:** `likeness.jsonl` keeps both: `gold`, `gold_ema`, `gold_norm`, `gold_norm_ema`, `gold_seeds`,
+  `gold_norm_seeds`, `gold_select`, and `arc_combined_ema` (the combined score with ArcFace's face); `combined*` hold
+  the combination the decisions read. Each probe logs a "Gold face (FaceNet)" line with the gap to ArcFace, and the
+  Monitor draws it as a dashed "face (FaceNet)" line.
+- **Warning:** in the reward stage, once ArcFace's smoothed face runs more than max(10, 3 x `likeness_noise_band`)
+  points further ahead of the gold face than when the stage started, the log warns that the reward may be gaming
+  ArcFace (once).
+- **Noise:** the noise check reports the gold face (`gold`, and `combined_gold` with the body) next to ArcFace's, with
+  `suggested_noise_band_gold` for a run the gold face decides; `likeness_stats` reads `gold_norm_seeds` as well.
+
+Whether FaceNet agrees with people better than ArcFace on LoRA renders is not measured; it is there because it is
+independent of what the run optimizes.
+
 ## Probe noise check (`noise_files`)
 
 A probe renders a few seeds and averages their scores, so part of every score is the seeds' luck: one seed's face is
@@ -1158,8 +1190,9 @@ most like the person. Each reward step:
   trigger word (full-body prompts dropped when the body weighs nothing, close-ups when the face does). Full-body
   prompts render 2:3 like the body probe; LoRA Isolation's fused trigger applies.
 - **Risk:** the scorers are not differentiable here, so the LoRA cannot chase their gradients pixel by pixel, but it
-  can still learn what they like more than a person does (reward hacking). The KL penalty, the small learning rate and
-  the probes on their own fixed seeds are the guards; look at the pictures.
+  can still learn what they like more than a person does (reward hacking). The KL penalty, the small learning rate, the
+  probes on their own fixed seeds and the [gold face scorer](#gold-face-scorer-face_gold) (FaceNet, on by default here:
+  it picks the best checkpoint and warns when ArcFace runs ahead of it) are the guards; look at the pictures.
 - **Cost:** every step renders the group (`reward_group` x steps forward passes, x2 with guidance) and trains
   `reward_train_steps` x `reward_group` x 2 forward passes (the policy and its reference). Every block recomputes
   during the stage (kept activations are released). One GPU (data parallel: the first), no fine-tune.

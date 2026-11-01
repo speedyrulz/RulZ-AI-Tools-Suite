@@ -22,7 +22,14 @@ import sys
 from pathlib import Path
 from statistics import NormalDist
 
-KINDS = ("face", "body", "combined")
+# gold: the held-out FaceNet face (face_gold); combined_gold: it combined with the body, as the decisions read it then
+KINDS = ("face", "body", "combined", "gold", "combined_gold")
+GOLD_KINDS = ("gold", "combined_gold")  # only when the probes had the gold face
+LABELS = {"gold": "gold face (FaceNet)", "combined_gold": "combined with the gold face"}
+# a run's own records: where each kind's per-seed normalized scores are (combined_seeds: the combination the run's
+# decisions read, with the gold face when it was in charge)
+RECORD_KEYS = {"face": "face_norm_seeds", "body": "body_norm_seeds", "gold": "gold_norm_seeds",
+               "combined": "combined_seeds"}
 GAPS = (3.0, 5.0, 8.0)  # normalized points: the gaps the seeds-needed table answers for
 
 
@@ -131,13 +138,14 @@ def suggested_band(sd_diff: float, probe_seeds: int, probe_ema: float) -> float:
 
 def run_noise(records: list[dict]) -> dict:
     """A run's probe noise from its own probes (likeness.jsonl records with per-seed scores, normalized:
-    face_norm_seeds, body_norm_seeds, combined_seeds): sigma, the pooled seed-to-seed spread inside a probe (the step-0
-    probe left out: the base model), and sd_diff / rho, the spread of the per-seed changes between consecutive probes
-    (true learning included, so an upper bound)."""
+    face_norm_seeds, body_norm_seeds, gold_norm_seeds with the gold face, combined_seeds): sigma, the pooled
+    seed-to-seed spread inside a probe (the step-0 probe left out: the base model), and sd_diff / rho, the spread of the
+    per-seed changes between consecutive probes (true learning included, so an upper bound)."""
     out = {}
     recs = [r for r in records if r.get("step", 0) > 0]
-    for kind in KINDS:
-        key = f"{kind}_norm_seeds" if kind != "combined" else "combined_seeds"
+    for kind, key in RECORD_KEYS.items():
+        if kind == "gold" and not any(r.get(key) for r in recs):
+            continue
         variances = []
         for r in recs:
             _, sd = mean_sd(r.get(key) or [])
@@ -163,14 +171,15 @@ def noise_report(files: dict[str, dict], probe_seeds: int, probe_ema: float) -> 
     statistics and the pooled sd_diff (sigma * sqrt(2) when only one file was probed: no rho to lower it), then the
     seeds a probe needs per gap and a likeness_noise_band for probe_seeds / probe_ema."""
     names = list(files)
+    kinds = [k for k in KINDS if k not in GOLD_KINDS or any(files[n].get(k) for n in names)]
     out: dict = {"files": {}, "kinds": {}, "probe_seeds": probe_seeds, "probe_ema": probe_ema}
     for name in names:
         out["files"][name] = {}
-        for kind in KINDS:
+        for kind in kinds:
             vals = files[name].get(kind) or []
             m, sd = mean_sd(vals)
             out["files"][name][kind] = {"mean": m, "sigma": sd, "n": sum(1 for x in vals if x is not None)}
-    for kind in KINDS:
+    for kind in kinds:
         sig = [out["files"][n][kind]["sigma"] for n in names if out["files"][n][kind]["sigma"] is not None]
         sigma = math.sqrt(sum(s * s for s in sig) / len(sig)) if sig else None
         pairs = {}
@@ -189,9 +198,10 @@ def noise_report(files: dict[str, dict], probe_seeds: int, probe_ema: float) -> 
             entry["seeds_needed"] = {f"{g:g}": seeds_needed(sd_diff, g) for g in GAPS}
             entry["probe_sd"] = {str(k): sd_diff / math.sqrt(k) for k in (1, 2, 4, 8)}
         out["kinds"][kind] = entry
-    comb = out["kinds"]["combined"]
-    if comb.get("sd_diff") is not None:
-        out["suggested_noise_band"] = suggested_band(comb["sd_diff"], probe_seeds, probe_ema)
+    for kind, key in (("combined", "suggested_noise_band"), ("combined_gold", "suggested_noise_band_gold")):
+        sd = out["kinds"].get(kind, {}).get("sd_diff")
+        if sd is not None:
+            out[key] = suggested_band(sd, probe_seeds, probe_ema)
     return out
 
 
@@ -205,13 +215,16 @@ def describe(report: dict) -> list[str]:
         if e.get("sd_diff") is None:
             continue
         need = ", ".join(f"{g} points {n}" for g, n in e["seeds_needed"].items())
-        lines.append(f"{kind}: seeds spread {fmt(e['sigma'])} points around a probe's mean, alike across files rho "
-                     f"{fmt(e['rho'])}, a per-seed difference spreads {fmt(e['sd_diff'])} ({e['sd_diff_from']}); "
+        lines.append(f"{LABELS.get(kind, kind)}: seeds spread {fmt(e['sigma'])} points around a probe's mean, alike "
+                     f"across files rho {fmt(e['rho'])}, a per-seed difference spreads {fmt(e['sd_diff'])} ({e['sd_diff_from']}); "
                      f"seeds a probe needs to tell apart a gap of {need}")
     if "suggested_noise_band" in report:
         lines.append(f"likeness_noise_band {report['suggested_noise_band']:g} fits {report['probe_seeds']} probe "
                      f"seed(s) at probe_ema {report['probe_ema']:g} (one standard deviation of the change between two "
                      f"smoothed probes)")
+    if "suggested_noise_band_gold" in report:
+        lines.append(f"with the gold face in charge (face_gold_select) likeness_noise_band "
+                     f"{report['suggested_noise_band_gold']:g} fits instead")
     return lines
 
 
