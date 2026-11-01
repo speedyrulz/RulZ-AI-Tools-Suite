@@ -312,6 +312,8 @@ def build_optimizer(cfg: TrainConfig, params, pairs=None):
                         cautious=cfg.keel_cautious, bands=cfg.keel_bands,
                         band_weights=keel_band_weights(cfg.keel_band_weights, cfg.keel_bands),
                         consensus=cfg.keel_consensus, consensus_power=cfg.keel_consensus_power,
+                        lookahead=cfg.keel_lookahead, lookahead_pullback=cfg.keel_lookahead_pullback,
+                        lookahead_lr=cfg.keel_lookahead_lr, lookahead_grace=cfg.keel_lookahead_grace,
                         sensitivity_quantile=cfg.automagic_sensitivity_quantile, vote=cfg.automagic_vote,
                         max_vote=cfg.automagic_max_lr_change, **kw)
         if name == "automagic4":
@@ -1404,6 +1406,8 @@ class Trainer(RaceParallelMixin):
         budget = ft_mod.plan_budget(free, reserve, cfg.finetune_window_gb)
         bpp = ft_mod.BYTES_PER_PARAM.get(cfg.optimizer.lower(), 18) + (ft_mod.ANCHOR_BYTES if cfg.finetune_anchor > 0
                                                                         else 0)
+        if cfg.optimizer.lower() == "keel" and cfg.keel_lookahead:
+            bpp += 4  # the lookahead's fp32 anchor copy
         ft.anchored = cfg.finetune_anchor > 0
         windows = ft.plan(budget, bpp)
         per_step = cfg.batch_size * cfg.gradient_accumulation
@@ -3522,13 +3526,28 @@ class Trainer(RaceParallelMixin):
         body = sum(body_scores) / len(body_scores) if body_scores else None
         return face, body, images, seeds
 
-    def run_probe(self, model, step, optimizer, scheduler, injected) -> bool:
+    def run_probe(self, model, step, optimizer, scheduler, injected, ema=None, sync_replicas: bool = True) -> bool:
         """Render + score probes, update the controller, apply its actions. Returns True to stop training.
 
-        With a weight average the probes score it, so a best checkpoint is exactly the weights that were scored."""
+        With a weight average the probes score it, so a best checkpoint is exactly the weights that were scored; `ema`
+        is that average when it is not the trainer's own (the parallel race's configurations). A Keel optimizer's
+        probe-gated lookahead then hears the decision, with the raw weights back in place; the data-parallel copies
+        follow a pull when sync_replicas."""
         self._free_for_rendering()
         with self._averaged(replicas=True):
-            return self._run_probe(model, step, optimizer, scheduler, injected)
+            stop = self._run_probe(model, step, optimizer, scheduler, injected)
+        self._keel_probe(optimizer, self.ema if ema is None else ema, sync_replicas)
+        return stop
+
+    def _keel_probe(self, optimizer, ema, sync_replicas: bool) -> None:
+        """Keel's probe-gated lookahead (keel_lookahead): the controller's smoothed decision score and its noise band
+        to the optimizer, which anchors the weights that scored or pulls the weights back toward the anchor."""
+        on_probe = getattr(optimizer, "on_probe", None)
+        if on_probe is None or self.controller is None:
+            return
+        if on_probe(self.controller.combined_ema, self.cfg.likeness_noise_band, ema) == "pull":
+            if sync_replicas and self.dp is not None:
+                self.dp.sync_weights()
 
     def _run_probe(self, model, step, optimizer, scheduler, injected) -> bool:
         from .likeness import append_record, apply_lr_ratio, curriculum_weights, timestep_logit_shift

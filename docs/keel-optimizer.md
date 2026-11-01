@@ -1,7 +1,7 @@
 # Keel: an identity-first optimizer for character LoRAs (design)
 
-Status: milestones 1 to 3 built (`rulztrainer/optimizers/keel.py`: E, F, B with paired sigma, and A with the
-accumulation hook and `gather()`, `optimizer: keel`); the rest is design.
+Status: milestones 1 to 4 built (`rulztrainer/optimizers/keel.py`: E, F, B with paired sigma, A with the
+accumulation hook and `gather()`, and D with `on_probe`, `optimizer: keel`); the rest is design.
 Working name "Keel" (the part of the boat that keeps it from drifting sideways). Every number below is a starting
 value to race, not a measured one.
 
@@ -194,16 +194,23 @@ Blocks where every tensor has the same share get gain 1 by construction (median)
 **Idea.** The probes with the held-out FaceNet judge are the one signal nothing trains on. Lookahead (Zhang
 et al. 2019) keeps slow weights and pulls the fast weights toward them; here the probe decides.
 
-**Mechanism.** Keel keeps an anchor copy of every trained tensor in `state[p]["anchor"]` (fp32, on the
-parameter's device; parked, moved and relayed with the rest of the state). `on_probe(score, band, ema)` after
-the likeness controller's decision:
+**Mechanism (as built).** Keel keeps an anchor copy of every trained tensor in `state[p]["anchor"]` (fp32, on
+the parameter's device, with the anchor's score mirrored per tensor as `state[p]["anchor_score"]`; parked, moved
+and relayed with the rest of the state). The trainer's `run_probe` calls `on_probe(score, band, ema)` after the
+controller's decision, once the raw weights are back in the LoRA (the probe scores the weight average in it),
+with the controller's smoothed decision score (`combined_ema`: the gold face when it is in charge), the noise
+band and the average the probe scored:
 
-- accept: `score > anchor_score + band` -> anchor := the weights that scored (the EMA shadow when
-  `lora_ema` is on, else the raw weights), `anchor_score := score`.
-- reject (after `keel_lookahead_grace` probes, 2): raw weights <- anchor + (1 - pull) * (raw - anchor) with
-  `pull = keel_lookahead_pullback` (0.5); the EMA shadow the same way; every Automagic lr mirror
-  *= `keel_lookahead_lr` (0.7, clamped to the rails). The second moments and sign histories stay.
-- the step-0 probe sets the first anchor.
+- the first probe (step 0 with `probe_at_start`) sets the anchor; the state of a tensor that has not stepped yet
+  is initialised as the step would;
+- accept: `score > anchor_score + band` -> anchor := the weights that scored (the EMA shadow when `lora_ema`
+  is on, else the raw weights), `anchor_score := score`, the miss count 0;
+- a miss otherwise. No pull while the score rose since the previous probe; after more than
+  `keel_lookahead_grace` misses (2): raw weights <- anchor + (1 - pull) * (raw - anchor) with
+  `pull = keel_lookahead_pullback` (0.5), the EMA shadow the same way, every Automagic lr mirror
+  *= `keel_lookahead_lr` (0.7, clamped to the rails), and the miss count starts over. The second moments and
+  sign histories stay. The data-parallel copies are re-synced after a pull; in the parallel race the pull moves
+  the configuration's own parameters, attached at its next wave.
 
 The anchor is the weights that were actually scored, so a pull toward it is a pull toward a measured
 likeness, not toward weights 50 images younger (the EMA's lag).
@@ -292,7 +299,7 @@ is fighting the gradient (raise `keel_gauge_eps`).
 | [trainer.py:264](../rulztrainer/trainer.py:264) `build_optimizer` | construct `Keel(params, pairs=..., **automagic kw, **keel kw)`; pairs from the injected LoRA modules |
 | [trainer.py](../rulztrainer/trainer.py) step loop (and `race_parallel.py`'s) | `observe(sigma)` before each backward of the primary copy in `work()` and before the DOP pass (built; the parallel race observes per step); `gather()` before `reduce_grads` and `clip_grad_norm_` (built); paired sigma through `draw_sigmas` when `keel_pair_sigma` (built; the DOP pass shares it) |
 | [lora.py:385](../rulztrainer/lora.py:385) `_added` | the face tap (`h` save + output hook), armed per batch with the face token mask |
-| [likeness.py](../rulztrainer/likeness.py) controller / trainer probe path | `on_probe(...)` after the decision, before `likeness_track_best` saves |
+| [trainer.py](../rulztrainer/trainer.py) `run_probe` | `on_probe(score, band, ema)` after the decision, with the raw weights back (built); the parallel race passes its configuration's average |
 | [multigpu.py:64](../rulztrainer/multigpu.py:64) `reduce_grads` | `take=` callback: `Keel.take_replica` scales each replica's sum by the step's band and counts it as one vote (built) |
 | [race.py:58](../rulztrainer/race.py:58) | `keel_*` in the settings a race row may change |
 | [race.py:743](../rulztrainer/race.py:743) `follow_leader` | nothing: `type(wo) is type(vo)` already makes Keel its own kind; the anchor rides in `state[p]` |
@@ -325,10 +332,11 @@ weights, C and D off until raced. The Wizard keeps recommending adamw8bit until 
 
 ## 7. State, resume, race
 
-- `state_dict()` adds per parameter: `band_ms` and `band_n` ([bands + 1] fp32, built), `anchor` (fp32, when D
-  is on), and `anchor_score` once; `agree` (int8) is a per-step buffer on the optimizer, not state (built). Automagic 4 resumes under Keel (the extras start empty: a measurement step for
-  the bands, no anchor until the next probe), and a Keel state resumes under Automagic 4 (extras ignored),
-  the way Automagic 3 and 4 already resume under each other.
+- `state_dict()` adds per parameter: `band_ms` and `band_n` ([bands + 1] fp32, built), `anchor` and
+  `anchor_score` (fp32, when D is on, the score mirrored per tensor; built); `agree` (int8) is a per-step buffer
+  on the optimizer, not state (built). Automagic 4 resumes under Keel (the extras start empty: a measurement step
+  for the bands, no anchor until the next probe), and a Keel state resumes under Automagic 4 (extras ignored),
+  the way Automagic 3 and 4 already resume under each other; a Keel state with the lookahead off drops the anchor.
 - Keel hyper-parameters are not restored from a state (like Automagic's): a race may change them on resume.
 - In a race every configuration owns its optimizer; `follow_leader` copies the full state including the
   anchor when both are Keel, and starts over otherwise (the log says so, as today).
@@ -369,7 +377,8 @@ the moments; `gather()` reproduces fp32 accumulation to 1 ulp.
 4. **M3** (built) the accumulation hook (armed per step), `agree`, the gate through
    `Automagic4._element_gain`, `gather()` in the step loop, `observe` per backward, the bands per micro-batch.
    R3 is still to run.
-5. **M4** `on_probe`, the anchor, the EMA pull. R5.
+5. **M4** (built) `on_probe`, the anchor with its score mirrored in the state, the EMA pull, the replica sync
+   after a pull. R5 is still to run.
 6. **M5** the LoRA face tap and the gain. R4.
 7. **M6** README, the Wizard recommendation (if a race earned it), phase 1b, phase 2 candidates.
 

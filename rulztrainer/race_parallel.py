@@ -353,7 +353,8 @@ class RaceParallelMixin:
         st = v.state
         with self._rp_bound(v):
             self._rp_load_render(v)
-            stop = self.run_probe(self.replicas[0][0], st["step"], st["optimizer"], st["scheduler"], self._rp_view(v))
+            stop = self.run_probe(self.replicas[0][0], st["step"], st["optimizer"], st["scheduler"], self._rp_view(v),
+                                  ema=st.get("ema"), sync_replicas=False)  # a pull moves v's own parameters
             score = self.controller.combined_ema if self.controller is not None else None
         return score, stop
 

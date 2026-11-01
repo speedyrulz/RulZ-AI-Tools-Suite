@@ -58,7 +58,8 @@ RACE_KEYS: dict[str, tuple[str, ...]] = {
         "lora_plus_ratio", "lora_ema", "automagic_min_lr", "automagic_max_lr", "automagic_polarity_history",
         "automagic_clip_threshold", "automagic_groups", "automagic_sensitivity_quantile", "automagic_vote",
         "automagic_max_lr_change", "keel_gauge", "keel_gauge_eps", "keel_cautious", "keel_pair_sigma", "keel_bands",
-        "keel_band_weights", "keel_consensus", "keel_consensus_power"),
+        "keel_band_weights", "keel_consensus", "keel_consensus_power", "keel_lookahead", "keel_lookahead_pullback",
+        "keel_lookahead_lr", "keel_lookahead_grace"),
     "Timesteps & loss": (
         "timestep_sampling", "logit_mean", "logit_std", "sigmoid_scale", "timestep_shift", "clean_share", "logsnr_mean",
         "logsnr_std",

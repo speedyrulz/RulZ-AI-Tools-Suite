@@ -1,6 +1,6 @@
-"""Keel: Automagic 4 for character LoRAs (docs/keel-optimizer.md). Milestones 1 to 3 of that design: the LoRA
-gauge preconditioner, the cautious mask, the noise-band normalisation and the cross-photo consensus gate. With
-every switch off it is Automagic 4 exactly (test_keel asserts it bitwise).
+"""Keel: Automagic 4 for character LoRAs (docs/keel-optimizer.md). Milestones 1 to 4 of that design: the LoRA
+gauge preconditioner, the cautious mask, the noise-band normalisation, the cross-photo consensus gate and the
+probe-gated lookahead. With every switch off it is Automagic 4 exactly (test_keel asserts it bitwise).
 
 Gauge preconditioner (keel_gauge)
 ---------------------------------
@@ -80,6 +80,21 @@ the photos disagree on carries little vote weight, like a dead one). It needs tw
 (gradient_accumulation >= 2, or the DOP pass); with one, a = 1 everywhere and the gate is 1. Paired sigma
 matters here: sign disagreement between micro-batches at different noise levels is mostly the noise level,
 not the content. The mean gate is logged every 250 steps.
+
+Probe-gated lookahead (keel_lookahead, keel_lookahead_pullback, keel_lookahead_lr, keel_lookahead_grace)
+-----------------------------------------------------------------------------------------------------
+The likeness probes with the held-out judge are the one signal nothing trains on. Lookahead (Zhang et al. 2019)
+keeps slow weights and pulls the fast weights toward them; here the probe decides. Keel keeps an anchor copy of
+every trained tensor (state["anchor"], fp32, with the anchor's score mirrored per tensor as state["anchor_score"]
+so both ride the state dict, the park and the relay) and the trainer calls on_probe(score, band, ema) after each
+probe decision with the controller's smoothed decision score, its noise band and the weight average the probe
+scored: the first probe sets the anchor; a score above the anchor's by more than the band accepts (the anchor
+becomes the weights that scored: the average's shadow when lora_ema is on, the raw weights otherwise); any other
+probe is a miss, and after more than keel_lookahead_grace misses in a row the weights are pulled: raw <- anchor +
+(1 - pullback) (raw - anchor), the shadow the same way, and every lr mirror times keel_lookahead_lr (clamped to
+the rails); the second moments and the sign histories stay. No pull while the score rose since the previous
+probe (a slow climb is never pulled; an oscillating run is damped to its best), and a pull starts the miss count
+over. One fp32 copy of the LoRA; off by default until raced.
 
 Pairs: build_optimizer passes the (lora_down, lora_up) pairs of the injected LoRA layers; LoKr, OFT and a
 fine-tune have none, and the step is then Automagic 4's. A race switching a wrapper to LoKr leaves its LoRA
@@ -163,12 +178,21 @@ class Keel(Automagic4):
         The consensus gate's strength: 0 = off, 1 = a hard AND-mask. Needs the accumulation hook.
     consensus_power : float > 0
         The exponent on the agreement share.
+    lookahead : bool
+        The probe-gated lookahead (fed by on_probe).
+    lookahead_pullback : float in (0, 1]
+        How far a pull moves the weights toward the anchor.
+    lookahead_lr : float in (0, 1]
+        The lr multiplier at a pull.
+    lookahead_grace : int >= 0
+        Misses before a pull.
     """
 
     def __init__(self, params, *args, pairs: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = None,
                  gauge: bool = True, gauge_eps: float = 0.01, cautious: bool = True, bands: int = 8,
                  band_weights: Optional[Sequence[float]] = None, consensus: float = 0.5,
-                 consensus_power: float = 2.0, **kwargs):
+                 consensus_power: float = 2.0, lookahead: bool = False, lookahead_pullback: float = 0.5,
+                 lookahead_lr: float = 0.7, lookahead_grace: int = 2, **kwargs):
         if not gauge_eps > 0.0:
             raise ValueError(f"gauge_eps ({gauge_eps}) must be above 0")
         if int(bands) < 1:
@@ -181,6 +205,12 @@ class Keel(Automagic4):
             raise ValueError(f"consensus ({consensus}) must be within [0, 1]")
         if not consensus_power > 0.0:
             raise ValueError(f"consensus_power ({consensus_power}) must be above 0")
+        if not 0.0 < lookahead_pullback <= 1.0:
+            raise ValueError(f"lookahead_pullback ({lookahead_pullback}) must be within (0, 1]")
+        if not 0.0 < lookahead_lr <= 1.0:
+            raise ValueError(f"lookahead_lr ({lookahead_lr}) must be within (0, 1]")
+        if int(lookahead_grace) < 0:
+            raise ValueError(f"lookahead_grace ({lookahead_grace}) must be 0 or more")
         # Read by the hook (registered by the parent's constructor for low-precision parameters), so before it.
         self.gauge = bool(gauge)
         self.gauge_eps = float(gauge_eps)
@@ -189,6 +219,12 @@ class Keel(Automagic4):
         self.band_weights: Optional[List[float]] = band_weights if self.bands > 1 else None
         self.consensus = float(consensus)
         self.consensus_power = float(consensus_power)
+        self.lookahead = bool(lookahead)
+        self.lookahead_pullback = float(lookahead_pullback)
+        self.lookahead_lr = float(lookahead_lr)
+        self.lookahead_grace = int(lookahead_grace)
+        self._misses = 0  # probes since the last accept or pull that did not beat the anchor
+        self._last_score: Optional[float] = None  # the previous probe's score (no pull while it rises)
         self._armed = False  # the hook takes gradients between zero_grad() and step() only
         self._cur_band: Optional[int] = None  # the band of the micro-batch about to be backpropagated
         self._step_bands: List[int] = []  # the bands observed since zero_grad() (one per micro-batch image)
@@ -226,6 +262,9 @@ class Keel(Automagic4):
         if self.consensus > 0.0:
             log.info("Keel: consensus gate %g (power %g): floor %g on the elements the step's gradients disagree on",
                      self.consensus, self.consensus_power, 1.0 - self.consensus)
+        if self.lookahead:
+            log.info("Keel: probe-gated lookahead (pull-back %g, lr x%g at a pull, %d probes of grace)",
+                     self.lookahead_pullback, self.lookahead_lr, self.lookahead_grace)
 
     def _check_pairs(self, pairs) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         mine = {id(p) for g in self.param_groups for p in g["params"]}
@@ -244,6 +283,15 @@ class Keel(Automagic4):
         if key not in self._noted:
             self._noted.add(key)
             log.info(msg, *args)
+
+    def _ensure_state(self, gi: int, group: dict, p: torch.Tensor) -> dict:
+        """p's state, initialised as the parent's step would (which then finds it ready)."""
+        st = self.state[p]
+        if len(st) == 0:
+            self._init_state(p, group)
+            if self._group_lr[gi] is None:
+                self._group_lr[gi] = st["lr"]
+        return st
 
     # ------------------------------------------------------------------ the accumulation hook
 
@@ -418,11 +466,7 @@ class Keel(Automagic4):
                 g = p.grad
                 if g is None or p.numel() == 0 or (hooked and p not in self._pw):
                     continue
-                st = self.state[p]
-                if len(st) == 0:  # as the parent's step would (it then finds the state ready)
-                    self._init_state(p, group)
-                    if self._group_lr[gi] is None:
-                        self._group_lr[gi] = st["lr"]
+                st = self._ensure_state(gi, group, p)
                 ms = st.get("band_ms")
                 if not isinstance(ms, torch.Tensor) or ms.numel() != B + 1:
                     st["band_ms"] = torch.zeros(B + 1, dtype=torch.float32, device=p.device)  # [bands + overall]
@@ -523,6 +567,87 @@ class Keel(Automagic4):
         elif any(p.grad is not None for g in self.param_groups for p in g["params"]):
             self._note("hook", "Keel: the consensus gate sees no per-micro-batch gradients in this loop (the parallel "
                        "race and a replica reduce hand the optimizer the step's sum): the gate is 1")
+
+    # ------------------------------------------------------------------ the probe-gated lookahead
+
+    @property
+    def anchor_score(self) -> Optional[float]:
+        """The anchor's probe score, read from the state (None: no anchor). Syncs."""
+        for st in self.state.values():
+            s = st.get("anchor_score")
+            if isinstance(s, torch.Tensor):
+                return float(s)
+        return None
+
+    @torch.no_grad()
+    def on_probe(self, score, band: float, ema=None) -> Optional[str]:
+        """After a likeness probe's decision: `score` the controller's smoothed decision score (None: the probe found
+        no face, and nothing happens), `band` its noise band, `ema` the weight average the probe scored (a LoraEMA:
+        its shadow is the weights that scored and follows a pull; None for the raw weights). Returns what happened:
+        "anchor" (the first), "accept" (a new anchor), "rising" (no gain over the anchor, but up since the previous
+        probe: no pull), "hold" (a miss within the grace), "pull", or None with the lookahead off."""
+        if not self.lookahead or score is None:
+            return None
+        score, band = float(score), float(band)
+        last, self._last_score = self._last_score, score
+        anchored = self.anchor_score
+        if anchored is None:
+            self._set_anchor(score, ema)
+            log.info("Keel lookahead: anchor set at %.1f%% (optimizer step %d)", score, self._steps)
+            return "anchor"
+        if score > anchored + band:
+            self._set_anchor(score, ema)
+            self._misses = 0
+            log.info("Keel lookahead: accept, anchor %.1f%% -> %.1f%% (optimizer step %d)", anchored, score,
+                     self._steps)
+            return "accept"
+        self._misses += 1
+        if last is not None and score > last:
+            return "rising"
+        if self._misses <= self.lookahead_grace:
+            return "hold"
+        self._pull(ema)
+        log.info("Keel lookahead: pull toward the anchor (%.1f%%) after %d probes without a gain (score %.1f%%): "
+                 "weights %.0f%% of the way back, lr x%g (optimizer step %d)", anchored, self._misses, score,
+                 100.0 * self.lookahead_pullback, self.lookahead_lr, self._steps)
+        self._misses = 0
+        return "pull"
+
+    @torch.no_grad()
+    def _set_anchor(self, score: float, ema) -> None:
+        shadow = dict(zip(ema.params, ema.shadow)) if ema is not None else {}
+        self._refresh_group_lrs()
+        for gi, group in enumerate(self.param_groups):
+            for p in group["params"]:
+                if not p.requires_grad or p.numel() == 0:
+                    continue
+                st = self._ensure_state(gi, group, p)
+                src = shadow.get(p, p)
+                a = st.get("anchor")
+                if isinstance(a, torch.Tensor) and a.shape == p.shape and a.dtype == torch.float32:
+                    a.copy_(src)
+                else:
+                    st["anchor"] = src.detach().to(p.device, torch.float32, copy=True)
+                st["anchor_score"] = torch.tensor(score, dtype=torch.float32, device=p.device)
+
+    @torch.no_grad()
+    def _pull(self, ema) -> None:
+        pull = self.lookahead_pullback
+        shadow = dict(zip(ema.params, ema.shadow)) if ema is not None else {}
+        for group in self.param_groups:
+            lo, hi = float(group["min_lr"]), float(group["max_lr"])
+            for p in group["params"]:
+                st = self.state.get(p)
+                a = st.get("anchor") if st else None
+                if not isinstance(a, torch.Tensor):
+                    continue
+                p.copy_(torch.lerp(p.detach().to(torch.float32), a, pull))
+                s = shadow.get(p)
+                if s is not None:
+                    s.lerp_(a, pull)
+                lr = st.get("lr")
+                if isinstance(lr, torch.Tensor):
+                    lr.mul_(self.lookahead_lr).clamp_(min=lo, max=hi)
 
     # ------------------------------------------------------------------ the preconditioner
 
@@ -628,20 +753,31 @@ class Keel(Automagic4):
         return loss
 
     def load_state_dict(self, state_dict):
-        # The parent casts every fp state tensor to the param dtype: the band statistics come back from the saved
-        # fp32 values, and start fresh when their geometry no longer matches (keel_bands changed on resume).
-        exact_ms = self._saved_fp32(state_dict, "band_ms")
-        exact_n = self._saved_fp32(state_dict, "band_n")
+        # The parent casts every fp state tensor to the param dtype: the band statistics and the anchor come back
+        # from the saved fp32 values. The band statistics start fresh when their geometry no longer matches
+        # (keel_bands changed on resume); the anchor is dropped when its shape does not match or the lookahead is off.
+        exact = {k: self._saved_fp32(state_dict, k) for k in ("band_ms", "band_n", "anchor", "anchor_score")}
         super().load_state_dict(state_dict)
+        self._misses = 0
+        self._last_score = None
         for group in self.param_groups:
             for p in group["params"]:
                 st = self.state.get(p)
-                if st is None or "band_ms" not in st:
+                if st is None:
                     continue
-                ms, n = exact_ms.get(p), exact_n.get(p)
-                if ms is not None and n is not None and ms.numel() == self.bands + 1 and n.numel() == self.bands + 1:
-                    st["band_ms"], st["band_n"] = ms, n
-                else:
-                    st.pop("band_ms", None)
-                    st.pop("band_n", None)
+                if "band_ms" in st:
+                    ms, n = exact["band_ms"].get(p), exact["band_n"].get(p)
+                    if (ms is not None and n is not None and ms.numel() == self.bands + 1
+                            and n.numel() == self.bands + 1):
+                        st["band_ms"], st["band_n"] = ms, n
+                    else:
+                        st.pop("band_ms", None)
+                        st.pop("band_n", None)
+                if "anchor" in st or "anchor_score" in st:
+                    a, s = exact["anchor"].get(p), exact["anchor_score"].get(p)
+                    if self.lookahead and a is not None and s is not None and a.shape == p.shape:
+                        st["anchor"], st["anchor_score"] = a, s
+                    else:
+                        st.pop("anchor", None)
+                        st.pop("anchor_score", None)
         self._refresh_band_gains()
