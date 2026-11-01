@@ -23,8 +23,39 @@ MODEL_PRESETS = {
     "MiniMax-H3-Ref2VA": "MiniMaxAI/MiniMax-H3#ref2va",
 }
 ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21", "flux3_klein", "minimax_h3")
-OPTIMIZERS = ("adamw", "adamw8bit", "adafactor", "automagic3", "automagic4")
-AUTOMAGIC = ("automagic3", "automagic4")  # self-tuning lr: no schedule, no LoRA+, no per-image lr
+OPTIMIZERS = ("adamw", "adamw8bit", "adafactor", "automagic3", "automagic4", "keel")
+AUTOMAGIC = ("automagic3", "automagic4", "keel")  # self-tuning lr: no schedule, no LoRA+, no per-image lr
+KEEL_BAND_LOGIT_RANGE = 4.0  # Keel's noise bands span logit(sigma) in [-range, range] (sigma 0.018 to 0.982)
+
+
+def keel_band_edges(bands: int) -> list[float]:
+    """The sigma edges of Keel's noise bands: bands + 1 values from 0 to 1 (equal bands in logit sigma over
+    [-KEEL_BAND_LOGIT_RANGE, +range], the ends open)."""
+    r = KEEL_BAND_LOGIT_RANGE
+    inner = [1.0 / (1.0 + math.exp(-(-r + 2.0 * r * k / bands))) for k in range(1, bands)]
+    return [0.0] + inner + [1.0]
+
+
+def keel_band_weights(spec: str, bands: int) -> list[float] | None:
+    """keel_band_weights resolved to one multiplier per band: None (flat: "" or a single band), the identity hump
+    (0.5 + 0.8 exp(-((c + 0.7) / 1.5)^2) at each band's logit centre c: about 1.3 over sigma 0.12 to 0.5, 0.5 at the
+    ends), or the listed numbers. Raises ValueError on a bad spec."""
+    s = (spec or "").strip().lower()
+    if bands <= 1 or s in ("", "flat"):
+        return None
+    if s == "identity":
+        r = KEEL_BAND_LOGIT_RANGE
+        centres = [-r + 2.0 * r * (k + 0.5) / bands for k in range(bands)]
+        return [round(0.5 + 0.8 * math.exp(-((c + 0.7) / 1.5) ** 2), 3) for c in centres]
+    try:
+        vals = [float(x) for x in s.replace(";", ",").split(",") if x.strip()]
+    except ValueError:
+        raise ValueError(f"keel_band_weights must be empty, identity or {bands} comma-separated numbers, got {spec!r}")
+    if len(vals) != bands:
+        raise ValueError(f"keel_band_weights lists {len(vals)} numbers for keel_bands {bands}")
+    if any(not v > 0.0 for v in vals):
+        raise ValueError("keel_band_weights must all be above 0")
+    return vals
 # LoRA target groups each family trains when lora_targets is empty. Krea 2 adds the attention output gate and its
 # text-fusion stack, which Fizgig measured to be under-trained by the attention + feed-forward recipe (scaling a
 # finished LoRA's text-fusion blocks x3 lifted likeness 2-7 points on several Krea 2 LoRAs).
@@ -346,7 +377,8 @@ class TrainConfig:
     batch_size: int = 1
     gradient_accumulation: int = 1
     learning_rate: float = 1e-4
-    optimizer: str = "adamw"  # adamw | adamw8bit | adafactor | automagic3 | automagic4
+    optimizer: str = "adamw"  # adamw | adamw8bit | adafactor | automagic3 | automagic4 | keel (Automagic 4 for
+    #                           character LoRAs: docs/keel-optimizer.md)
     weight_decay: float = 0.01
     automagic_min_lr: float = 1e-8  # automagic3/4: hard floor for the adapted lr
     automagic_max_lr: float = 1e-3  # automagic3/4: hard ceiling for the adapted lr (about 10x the start lr)
@@ -361,6 +393,31 @@ class TrainConfig:
     #                                 a third of the gain)
     automagic_max_lr_change: float = 0.05  # automagic4: the lr moves at most this fraction per step (0.05 = 5%): bounds
     #                                        the climb over the sign window's lag
+    keel_gauge: bool = True  # keel: the r x r gauge preconditioner on each LoRA pair's gradient (lora_up by the down's
+    #                          Gram, lora_down by the up's), so neither factor takes the whole update
+    keel_gauge_eps: float = 0.01  # keel: the preconditioner's floor as a fraction of the larger Gram's mean diagonal
+    keel_cautious: bool = True  # keel: zero a preconditioned gradient element that points against the raw gradient
+    keel_pair_sigma: bool = True  # keel: one sigma per step for all of its micro-batches (and the DOP pass), so the
+    #                               step's gradient sits in one noise band
+    keel_bands: int = 8  # keel: noise bands over logit(sigma) in [-4, 4]; a step's gradient enters the second moment
+    #                      at the tensor's overall scale whatever its band, so the quiet bands are not drowned; 1 = off
+    keel_band_weights: str = ""  # keel: a multiplier on the step's update per band: "" = 1 everywhere, identity = a
+    #                              hump over the face bands (sigma 0.12 to 0.5), or keel_bands comma-separated numbers
+    keel_consensus: float = 0.5  # keel: the cross-photo consensus gate, 0 = off .. 1 = a hard AND-mask: the update is
+    #                              scaled by (1 - c) + c * (agreement share)^power, the share being how many of the
+    #                              step's gradients (micro-batches, the DOP pass) agree on the element's sign
+    keel_consensus_power: float = 2.0  # keel: the exponent on the agreement share
+    keel_lookahead: bool = False  # keel: probe-gated lookahead: the weights that beat the anchor's smoothed likeness
+    #                               score by the noise band become the anchor, and after keel_lookahead_grace probes
+    #                               without a gain the weights are pulled back toward it (needs likeness probes)
+    keel_lookahead_pullback: float = 0.5  # keel: how far a pull moves the weights toward the anchor (1 = all the way)
+    keel_lookahead_lr: float = 0.7  # keel: the learning-rate multiplier at each pull (within the Automagic rails)
+    keel_lookahead_grace: int = 2  # keel: probes without a gain before a pull (the count starts over after one)
+    keel_face_gain: float = 0.0  # keel: face-token gain: a LoRA pair's step is scaled by (the share of its gradient
+    #                              from the face's tokens / the median pair's share) ** this; needs region maps with
+    #                              faces (face detection); 0 = off
+    keel_face_gain_max: float = 2.0  # keel: the gain stays within [1 / max, max]
+    keel_face_gain_beta: float = 0.9  # keel: EMA of the gain over steps (one batch without a face barely moves it)
     lr_scheduler: str = "constant"  # constant | cosine | linear
     warmup_steps: int = 50
     max_grad_norm: float = 1.0
@@ -800,6 +857,27 @@ class TrainConfig:
             raise ValueError(f"automagic_vote must be graded or extremes, got {self.automagic_vote!r}")
         if self.automagic_max_lr_change <= 0:
             raise ValueError("automagic_max_lr_change must be above 0")
+        if self.keel_gauge_eps <= 0:
+            raise ValueError("keel_gauge_eps must be above 0")
+        if not 1 <= self.keel_bands <= 64:
+            raise ValueError("keel_bands must be between 1 and 64")
+        keel_band_weights(self.keel_band_weights, self.keel_bands)  # raises on a bad spec
+        if not 0 <= self.keel_consensus <= 1:
+            raise ValueError("keel_consensus must be between 0 and 1")
+        if self.keel_consensus_power <= 0:
+            raise ValueError("keel_consensus_power must be above 0")
+        if not 0 < self.keel_lookahead_pullback <= 1:
+            raise ValueError("keel_lookahead_pullback must be above 0 and at most 1")
+        if not 0 < self.keel_lookahead_lr <= 1:
+            raise ValueError("keel_lookahead_lr must be above 0 and at most 1")
+        if self.keel_lookahead_grace < 0:
+            raise ValueError("keel_lookahead_grace must be 0 or more")
+        if self.keel_face_gain < 0:
+            raise ValueError("keel_face_gain must be 0 (off) or above")
+        if self.keel_face_gain_max < 1:
+            raise ValueError("keel_face_gain_max must be 1 or more")
+        if not 0 <= self.keel_face_gain_beta < 1:
+            raise ValueError("keel_face_gain_beta must be 0 or more and below 1")
         if self.compile_model not in (True, False, "auto"):
             raise ValueError(f"compile_model must be true, false or auto, got {self.compile_model!r}")
         if self.race:
@@ -866,9 +944,9 @@ class TrainConfig:
 
     def wants_regions(self) -> bool:
         """Region maps (face cells, landmarks, the subject's cells) are needed by the region-weighted loss, the identity
-        loss, attention localization and identity alignment."""
+        loss, attention localization, identity alignment and Keel's face-token gain."""
         return bool(self.region_weights or self.id_loss_weight > 0 or self.attn_localize or self.id_align
-                    or self.body_align)
+                    or self.body_align or (self.optimizer.lower() == "keel" and self.keel_face_gain > 0))
 
     def wants_person_masks(self) -> bool:
         """Person masks in the region maps: the region-weighted loss's person weight, attention localization's

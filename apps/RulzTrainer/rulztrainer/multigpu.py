@@ -61,8 +61,10 @@ class DataParallelLoRA:
             mirror_lora(self.primary, inj)
 
     @torch.no_grad()
-    def reduce_grads(self) -> None:
-        """Sum replica LoRA grads into the primary (losses are already scaled by 1/n) and clear them."""
+    def reduce_grads(self, take=None) -> None:
+        """Sum replica LoRA grads into the primary (losses are already scaled by 1/n) and clear them. take(primary
+        param, replica grad) -> grad, when given, sees each replica's gradient before it joins (Keel's band scale and
+        consensus vote)."""
         for _, inj, _ in self.replicas:
             for name, src in self.primary.items():
                 rep = inj[name]
@@ -72,6 +74,8 @@ class DataParallelLoRA:
                     if pr.grad is None:
                         continue
                     g = pr.grad.to(ps.device, non_blocking=True)
+                    if take is not None:
+                        g = take(ps, g)
                     if ps.grad is None:
                         ps.grad = g.clone()
                     else:

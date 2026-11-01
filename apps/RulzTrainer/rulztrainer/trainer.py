@@ -26,7 +26,7 @@ from . import profiling
 from . import race as race_mod
 from .ema import LoraEMA
 from . import quant as Q
-from .config import AUTOMAGIC, TrainConfig
+from .config import AUTOMAGIC, TrainConfig, keel_band_weights
 from .config import side_to_mp
 from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, describe_sides, dropout_text_path,
                       items_for_side, load_batch,
@@ -250,6 +250,24 @@ def sample_sigmas(cfg: TrainConfig, n: int, gen: torch.Generator, logit_shift: f
     return (s * 1000).round().clamp(1, 1000) / 1000
 
 
+def pairs_sigma(cfg: TrainConfig) -> bool:
+    """Whether a step's micro-batches share one sigma (Keel's keel_pair_sigma)."""
+    return cfg.optimizer.lower() == "keel" and bool(cfg.keel_pair_sigma)
+
+
+def draw_sigmas(cfg: TrainConfig, n: int, gen: torch.Generator, shift: float, tokens: int, arch,
+                step_sigma: torch.Tensor | None):
+    """A micro-batch's sigmas: sample_sigmas, or the step's one sigma repeated when pairs_sigma(cfg) (drawn with the
+    step's first micro-batch). Returns (sigma [n], the step's sigma to carry to the next micro-batch, or None)."""
+    if step_sigma is not None:
+        return step_sigma.expand(n).clone(), step_sigma
+    sigma = sample_sigmas(cfg, n, gen, shift, tokens=tokens, arch=arch)
+    if pairs_sigma(cfg):
+        step_sigma = sigma[:1].clone()
+        return step_sigma.expand(n).clone(), step_sigma
+    return sigma, None
+
+
 def loss_weight(cfg: TrainConfig, sigma: torch.Tensor) -> torch.Tensor:
     if cfg.loss_weighting == "none":
         return torch.ones_like(sigma)
@@ -261,8 +279,9 @@ def loss_weight(cfg: TrainConfig, sigma: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Unknown loss_weighting {cfg.loss_weighting}")
 
 
-def build_optimizer(cfg: TrainConfig, params):
-    """`params` may be a list of tensors or a list of param-group dicts (LoRA+)."""
+def build_optimizer(cfg: TrainConfig, params, pairs=None):
+    """`params` may be a list of tensors or a list of param-group dicts (LoRA+). `pairs`: the (lora_down, lora_up)
+    pairs among them (lora.lora_pairs), which Keel preconditions; the other optimizers ignore them."""
     name = cfg.optimizer.lower()
     if name == "adamw":
         return torch.optim.AdamW(params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay, betas=(0.9, 0.99))
@@ -286,6 +305,19 @@ def build_optimizer(cfg: TrainConfig, params):
         kw = dict(lr=cfg.learning_rate, min_lr=cfg.automagic_min_lr, max_lr=cfg.automagic_max_lr,
                   weight_decay=cfg.weight_decay, polarity_history=cfg.automagic_polarity_history,
                   clip_threshold=cfg.automagic_clip_threshold, fused=False)
+        if name == "keel":
+            from .optimizers.keel import Keel
+
+            return Keel(params, pairs=pairs, gauge=cfg.keel_gauge, gauge_eps=cfg.keel_gauge_eps,
+                        cautious=cfg.keel_cautious, bands=cfg.keel_bands,
+                        band_weights=keel_band_weights(cfg.keel_band_weights, cfg.keel_bands),
+                        consensus=cfg.keel_consensus, consensus_power=cfg.keel_consensus_power,
+                        lookahead=cfg.keel_lookahead, lookahead_pullback=cfg.keel_lookahead_pullback,
+                        lookahead_lr=cfg.keel_lookahead_lr, lookahead_grace=cfg.keel_lookahead_grace,
+                        face_gain=cfg.keel_face_gain, face_gain_max=cfg.keel_face_gain_max,
+                        face_gain_beta=cfg.keel_face_gain_beta,
+                        sensitivity_quantile=cfg.automagic_sensitivity_quantile, vote=cfg.automagic_vote,
+                        max_vote=cfg.automagic_max_lr_change, **kw)
         if name == "automagic4":
             from .optimizers.automagic4 import Automagic4
 
@@ -943,6 +975,9 @@ class Trainer(RaceParallelMixin):
             do_compile, why = False, "a fine-tune swaps its layers in and out of the model"
         if self.block_swap is not None and do_compile:
             do_compile, why = False, "block swap streams the blocks' weights in and out"
+        if do_compile and any(c.optimizer.lower() == "keel" and c.keel_face_gain > 0 for c in
+                              ([r[1] for r in self.race_rows] if self.race_rows is not None else [cfg])):
+            do_compile, why = False, "Keel's face-token gain hooks the LoRA layers' outputs (keel_face_gain)"
         if why:
             log.info("torch.compile %s (%s)", "on" if do_compile else "off", why)
         if do_compile:
@@ -1033,6 +1068,9 @@ class Trainer(RaceParallelMixin):
             """Forward + backward for one model copy on its device. Returns (loss value, per-image multipliers,
             (identity loss value, samples, seconds) or None)."""
             (rmodel, rinj, rdev), batch, latents, embeds, mask, sigma, noise, regions, cur_step, n_total, dop = job
+            observe = getattr(optimizer, "observe", None)
+            if observe is not None:  # Keel: this micro-batch's noise level (the CPU tensor: no sync); a replica's
+                observe(sigma, hook=rmodel is model)  # gradient reaches take_replica, not the hook
             latents = latents.to(rdev, torch.float32)
             embeds, mask, sigma, noise = embeds.to(rdev), mask.to(rdev), sigma.to(rdev), noise.to(rdev)
             s = sigma.view(-1, 1, 1, 1)
@@ -1043,14 +1081,23 @@ class Trainer(RaceParallelMixin):
             use_attn = bool(cfg.attn_localize and taps is not None and regions is not None)
             use_align = bool((cfg.id_align or cfg.body_align) and taps is not None and regions is not None
                              and rmodel is model and self.id_aligner is not None)
-            if use_attn or use_align:  # this forward records the trigger's attention / the face tokens' states
-                taps.begin([self.trigger_pos.get(p, []) for p in regions.text_paths] if use_attn
+            face_sink = getattr(optimizer, "face_energy", None) if rmodel is model else None  # Keel's face gain
+            use_face = bool(face_sink is not None and taps is not None and regions is not None
+                            and any(rm.face_cells is not None for rm in regions.meta))
+            if use_attn or use_align or use_face:  # this forward records the trigger's attention / the face tokens'
+                taps.begin([self.trigger_pos.get(p, []) for p in regions.text_paths] if use_attn  # states / layout
                            else [[] for _ in batch], attention=use_attn)
+            if face_sink is not None:  # the face tap: this batch's face tokens per sample (disarmed without a face)
+                hh, ww = regions.prior.shape[-2:] if use_face else (0, 0)
+                lora_mod.arm_face_tap(rinj, [lora_mod.face_token_mask(rm.face_cells, hh, ww) for rm in regions.meta]
+                                      if use_face else None, lambda: taps.layout, face_sink)
             pred = rmodel(noisy_in, sigma * 1000.0, embeds, mask).float()
             aux = None
             if use_attn or use_align:
                 taps.stop()  # later forwards (the prior pass, the backward's recompute) record nothing
                 aux = self._alignment_losses(cfg, taps, batch, regions, use_attn, use_align)
+            elif use_face:
+                taps.stop()
             sq = (pred - target).pow(2)
             if regions is not None and cfg.region_weights:  # region-weighted loss: face > person > background (mean 1)
                 sq = sq * regions.weight.to(rdev)
@@ -1099,10 +1146,14 @@ class Trainer(RaceParallelMixin):
             if result is None:
                 loss.backward()
                 result = (report.item(), mults, None)
-            if use_attn or use_align:
+            if use_attn or use_align or use_face:
                 taps.end()
+            if face_sink is not None:
+                lora_mod.disarm_face_tap(rinj)  # the trigger-free pass and the next batch report nothing stale
             if dop is not None:  # LoRA Isolation: the trigger-free pass, after this batch's backward freed its graph
                 del pred, sq, per, noisy, noisy_in
+                if observe is not None:
+                    observe(dop[3], hook=rmodel is model)
                 self._dop_pass(rmodel, rinj, rdev, latents, len(batch), dop, n_total, cfg)
             return result
 
@@ -1148,6 +1199,7 @@ class Trainer(RaceParallelMixin):
                 retry_jobs = None
             else:
                 per_rep: list[list] = [[] for _ in self.replicas]
+                step_sigma = None  # keel_pair_sigma: the step's one sigma once drawn
                 for r in job_order(counts):  # every batch and its noise drawn in the main thread (shared RNG), in
                     batch = next(self.batch_iter)  # lockstep order: copy 0, copy 1, copy 0, ...
                     step_images += len(batch)
@@ -1155,9 +1207,9 @@ class Trainer(RaceParallelMixin):
                     tok = latents.shape[2] * latents.shape[3]
                     shift = self.ts_logit_shift + self._clean_offset(
                         cfg, step, tok, self.batcher, cfg.batch_size * cfg.gradient_accumulation * n_dev)
-                    sigma = sample_sigmas(cfg, latents.shape[0], gen, shift, tokens=tok, arch=self.arch)
+                    sigma, step_sigma = draw_sigmas(cfg, latents.shape[0], gen, shift, tok, self.arch, step_sigma)
                     noise = torch.randn(latents.shape, generator=gen)
-                    dop = self._dop_job(cfg, batch, latents, step + 1, gen, shift, tok)  # LoRA Isolation
+                    dop = self._dop_job(cfg, batch, latents, step + 1, gen, shift, tok, step_sigma)  # LoRA Isolation
                     per_rep[r].append((self.replicas[r], batch, latents, embeds, mask, sigma, noise, regions, step + 1,
                                        n_total, dop))
             try:
@@ -1209,8 +1261,11 @@ class Trainer(RaceParallelMixin):
                 retry_jobs = (per_rep, step_images)  # the same images, not the next ones from the iterator
                 free_cuda()
                 continue
-            if self.dp is not None:
-                self.dp.reduce_grads()
+            gather = getattr(optimizer, "gather", None)
+            if gather is not None:  # Keel: the micro-batch sums back on p.grad for the reduce and the clip
+                gather()
+            if self.dp is not None:  # (Keel scales each replica's sum by the step's band and counts its vote)
+                self.dp.reduce_grads(take=getattr(optimizer, "take_replica", None))
             if cfg.max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
             if step_lr_mult != 1.0:  # true per-image lr: scale this step only (the scheduler restores it)
@@ -1394,6 +1449,8 @@ class Trainer(RaceParallelMixin):
         budget = ft_mod.plan_budget(free, reserve, cfg.finetune_window_gb)
         bpp = ft_mod.BYTES_PER_PARAM.get(cfg.optimizer.lower(), 18) + (ft_mod.ANCHOR_BYTES if cfg.finetune_anchor > 0
                                                                         else 0)
+        if cfg.optimizer.lower() == "keel" and cfg.keel_lookahead:
+            bpp += 4  # the lookahead's fp32 anchor copy
         ft.anchored = cfg.finetune_anchor > 0
         windows = ft.plan(budget, bpp)
         per_step = cfg.batch_size * cfg.gradient_accumulation
@@ -1611,11 +1668,11 @@ class Trainer(RaceParallelMixin):
                 log.info("Training state was saved with %s; continuing with %s (the adapted lr and sign history carry "
                          "over%s)", saved_opt, self.cfg.optimizer,
                          "; the sensitivity reference is measured on the first step"
-                         if self.cfg.optimizer.lower() == "automagic4" else "")
+                         if self.cfg.optimizer.lower() in ("automagic4", "keel") and saved_opt == "automagic3" else "")
             else:
                 raise ValueError(f"Training state was saved with optimizer {saved_opt} but the config says "
-                                 f"{self.cfg.optimizer}; set optimizer: {saved_opt} to resume it (only Automagic 3 "
-                                 f"and 4 states convert into each other)")
+                                 f"{self.cfg.optimizer}; set optimizer: {saved_opt} to resume it (only Automagic 3, "
+                                 f"4 and Keel states convert into each other)")
         optimizer.load_state_dict(st["optimizer"])
         scheduler.load_state_dict(st["scheduler"])
         gen.set_state(st["torch_gen"])
@@ -2167,7 +2224,7 @@ class Trainer(RaceParallelMixin):
             if len(groups) > 1:
                 log.info("LoRA+: lora_up lr = %.2e (x%g), lora_down lr = %.2e", groups[1]["lr"], cfg.lora_plus_ratio,
                          groups[0]["lr"])
-        optimizer = build_optimizer(cfg, groups)
+        optimizer = build_optimizer(cfg, groups, pairs=lora_mod.lora_pairs(injected))
         return optimizer, build_scheduler(cfg, optimizer)
 
     def _make_ema(self, cfg, injected):
@@ -2555,9 +2612,10 @@ class Trainer(RaceParallelMixin):
                  n_pairs, cfg.isolation_pair_weight, n_dop, cfg.dop_every, cfg.dop_weight)
         return items
 
-    def _dop_job(self, cfg, batch, latents, cur_step: int, gen, shift: float, tokens: int):
+    def _dop_job(self, cfg, batch, latents, cur_step: int, gen, shift: float, tokens: int, step_sigma=None):
         """The step's trigger-free pass for a batch, drawn in the main thread with the run's random streams: (the
-        batch rows with a DOP caption, their text features and mask, fresh sigmas and noise), or None."""
+        batch rows with a DOP caption, their text features and mask, fresh sigmas and noise), or None. `step_sigma`:
+        the step's shared sigma (keel_pair_sigma), used instead of fresh ones."""
         if not cfg.isolation or self.isolation is None or cfg.dop_weight <= 0 or cur_step % max(1, cfg.dop_every):
             return None
         sel = [i for i, it in enumerate(batch) if it.dop_text_path is not None]
@@ -2565,7 +2623,8 @@ class Trainer(RaceParallelMixin):
             return None
         from safetensors.torch import load_file
         emb, mask = self.arch.pad_embeds([load_file(str(batch[i].dop_text_path))["embeds"] for i in sel])
-        sigma = sample_sigmas(cfg, len(sel), gen, shift, tokens=tokens, arch=self.arch)
+        sigma = (step_sigma.expand(len(sel)).clone() if step_sigma is not None
+                 else sample_sigmas(cfg, len(sel), gen, shift, tokens=tokens, arch=self.arch))
         noise = torch.randn((len(sel), *latents.shape[1:]), generator=gen)
         return sel, emb, mask, sigma, noise
 
@@ -2702,6 +2761,10 @@ class Trainer(RaceParallelMixin):
         rows = [r[1] for r in self.race_rows] if self.race_rows is not None else [cfg]
         attn, align = any(c.attn_localize for c in rows), any(c.id_align or c.body_align for c in rows)
         if not (attn or align):
+            if (any(c.optimizer.lower() == "keel" and c.keel_face_gain > 0 for c in rows) and self.ft is None
+                    and not self.race_parallel):
+                for m, _, _ in self.replicas:
+                    m._rz_taps = A.Taps()  # the token layout alone, for Keel's face tap (keel_face_gain)
             return
         if self.ft is not None:
             log.warning("Attention localization and identity alignment are adapter training losses; a fine-tune "
@@ -3527,25 +3590,50 @@ class Trainer(RaceParallelMixin):
         body = sum(body_scores) / len(body_scores) if body_scores else None
         return face, body, seeds
 
-    def run_probe(self, model, step, optimizer, scheduler, injected) -> bool:
+    def run_probe(self, model, step, optimizer, scheduler, injected, ema=None, sync_replicas: bool = True) -> bool:
         """Render + score probes, update the controller, apply its actions. Returns True to stop training.
 
-        With a weight average the probes score it, so a best checkpoint is exactly the weights that were scored.
-        With probe_async it renders here too (training waits for it anyway, and the training GPU is idle) while
-        the probe GPU finishes the probe it has, which is acted on first."""
+        With a weight average the probes score it, so a best checkpoint is exactly the weights that were scored; `ema`
+        is that average when it is not the trainer's own (the parallel race's configurations). A Keel optimizer's
+        probe-gated lookahead then hears the decision, with the raw weights back in place; the data-parallel copies
+        follow a pull when sync_replicas. With probe_async it renders here too (training waits for it anyway, and
+        the training GPU is idle) while the probe GPU finishes the probe it has, which is acted on first."""
         if self.probe_worker is not None:
             t0 = time.time()
             self._free_for_rendering()
-            with self._averaged(replicas=True), lora_mod.frozen_adapters(),                     self._sampling_slots(model, step) as slots:
+            with self._averaged(replicas=True), lora_mod.frozen_adapters(), \
+                    self._sampling_slots(model, step) as slots:
+                scored = lora_mod.lora_state(injected) if hasattr(optimizer, "on_probe") else None  # before a pull
                 face, body, images, seeds = self._probe_with(slots, step)
             took = f"{time.time() - t0:.1f}s"
             stop = self.probe_worker is not None and self._probe_async_take(step, optimizer, scheduler, wait=True)
             with self._averaged(replicas=True):
-                return self._probe_finish(step, face, body, images, seeds, took, optimizer, scheduler,
+                stop = self._probe_finish(step, face, body, images, seeds, took, optimizer, scheduler,
                                           injected) or stop
+            self._keel_probe(optimizer, ema, sync_replicas, scored)
+            return stop
         self._free_for_rendering()
         with self._averaged(replicas=True):
-            return self._run_probe(model, step, optimizer, scheduler, injected)
+            stop = self._run_probe(model, step, optimizer, scheduler, injected)
+        self._keel_probe(optimizer, ema, sync_replicas)
+        return stop
+
+    def _keel_probe(self, optimizer, ema=None, sync_replicas: bool = True, scored: dict | None = None) -> None:
+        """Keel's probe-gated lookahead (keel_lookahead): the controller's smoothed decision score and its noise band
+        to the optimizer, which anchors the weights that scored or pulls the weights back toward the anchor. The
+        weights that scored are the average's shadow (`ema`, the trainer's own when None) or the raw weights, or
+        `scored`: a lora_state of them (an async probe's, sent to the probe GPU up to probe_every steps earlier)."""
+        on_probe = getattr(optimizer, "on_probe", None)
+        if on_probe is None or self.controller is None:
+            return
+        weights = None
+        if scored is not None:
+            weights = {p: d["params"][part] for name, d in scored.items()
+                       for part, p in self.injected[name].adapter_params().items()}
+        ema = self.ema if ema is None else ema
+        if on_probe(self.controller.combined_ema, self.cfg.likeness_noise_band, ema, weights) == "pull":
+            if sync_replicas and self.dp is not None:
+                self.dp.sync_weights()
 
     def _run_probe(self, model, step, optimizer, scheduler, injected) -> bool:
         t0 = time.time()
@@ -3729,10 +3817,12 @@ class Trainer(RaceParallelMixin):
         live = lora_mod.lora_state(self.injected)
         lora_mod.mirror_lora(lora_mod.lora_snapshots(p.state), self.injected)
         try:
-            return self._probe_finish(p.step, face, body, images, seeds, took, optimizer, scheduler, self.injected,
+            stop = self._probe_finish(p.step, face, body, images, seeds, took, optimizer, scheduler, self.injected,
                                       now=now)
         finally:
             lora_mod.mirror_lora(lora_mod.lora_snapshots(live), self.injected)
+        self._keel_probe(optimizer, scored=p.state)  # the lookahead anchors the weights that scored, pulls the live ones
+        return stop
 
     def _close_probe_worker(self) -> None:
         """Stop the probe process (also after an error), freeing the probe GPU."""

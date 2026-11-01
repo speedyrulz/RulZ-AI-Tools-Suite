@@ -1269,6 +1269,14 @@ class Form:
             automagic_clip_threshold=float(v("automagic_clip_threshold")),
             automagic_sensitivity_quantile=float(v("automagic_sensitivity_quantile")), automagic_vote=v("automagic_vote"),
             automagic_max_lr_change=float(v("automagic_max_lr_change")),
+            keel_gauge=bool(v("keel_gauge")), keel_gauge_eps=float(v("keel_gauge_eps")),
+            keel_cautious=bool(v("keel_cautious")), keel_pair_sigma=bool(v("keel_pair_sigma")),
+            keel_bands=int(v("keel_bands")), keel_band_weights=str(v("keel_band_weights") or "").strip(),
+            keel_consensus=float(v("keel_consensus")), keel_consensus_power=float(v("keel_consensus_power")),
+            keel_lookahead=bool(v("keel_lookahead")), keel_lookahead_pullback=float(v("keel_lookahead_pullback")),
+            keel_lookahead_lr=float(v("keel_lookahead_lr")), keel_lookahead_grace=int(v("keel_lookahead_grace")),
+            keel_face_gain=float(v("keel_face_gain")), keel_face_gain_max=float(v("keel_face_gain_max")),
+            keel_face_gain_beta=float(v("keel_face_gain_beta")),
             timestep_shift=float(v("timestep_shift")), sigmoid_scale=float(v("sigmoid_scale")),
             logsnr_mean=float(v("logsnr_mean")), logsnr_std=float(v("logsnr_std")),
             block_swap=int(v("block_swap") or 0),
@@ -2867,6 +2875,13 @@ RACE_LABELS = {
     "automagic_polarity_history": "Automagic polarity history", "automagic_clip_threshold": "Automagic clip threshold",
     "automagic_groups": "Automagic lr groups", "automagic_sensitivity_quantile": "Automagic sensitivity quantile",
     "automagic_vote": "Automagic vote", "automagic_max_lr_change": "Automagic max lr change",
+    "keel_gauge": "Keel gauge preconditioner", "keel_gauge_eps": "Keel gauge eps", "keel_cautious": "Keel cautious mask",
+    "keel_pair_sigma": "Keel paired sigma", "keel_bands": "Keel noise bands", "keel_band_weights": "Keel band weights",
+    "keel_consensus": "Keel consensus gate", "keel_consensus_power": "Keel consensus power",
+    "keel_lookahead": "Keel lookahead", "keel_lookahead_pullback": "Keel pull-back",
+    "keel_lookahead_lr": "Keel pull lr factor", "keel_lookahead_grace": "Keel grace probes",
+    "keel_face_gain": "Keel face gain", "keel_face_gain_max": "Keel face gain limit",
+    "keel_face_gain_beta": "Keel face gain EMA",
     "lora_ema": "Weight average", "timestep_sampling": "Timestep sampling", "loss_weighting": "Loss weighting",
     "region_weights": "Region-weighted loss", "face_loss_weight": "Face loss weight",
     "body_loss_weight": "Body loss weight", "background_loss_weight": "Background loss weight",
@@ -4246,7 +4261,10 @@ class Wizard:
                           "automagic3 tunes its own learning rate from the weights' update directions. automagic4 "
                           "adds a smaller step for the most sensitive weights (timestep embedders, modulation, "
                           "attention values) and a controller whose rate holds on noise, climbs on a trend and "
-                          "comes down when it overshoots (ai-toolkit's v4 ran away; fixed here)."):
+                          "comes down when it overshoots (ai-toolkit's v4 ran away; fixed here). keel is automagic4 "
+                          "for character LoRAs: a preconditioner that keeps either LoRA factor from taking the "
+                          "whole update, and a mask that drops preconditioned elements pointing against the "
+                          "gradient (untested on likeness yet: race it against adamw8bit)."):
             self.bind(ui.select(list(OPTIMIZERS), label="Optimizer"), "optimizer") \
                 .classes("w-full")
         with self.setting("network_type", "Adapter",
@@ -6013,7 +6031,8 @@ def build_page(local: bool = True):
                                 w["optimizer"], "value", lambda x: x in AUTOMAGIC):
                             hint("Automagic tunes its own learning rate (the learning rate above is its start); LR "
                                  "schedule and warmup are ignored. Automagic 4 also caps the step of the most "
-                                 "sensitive weights and its rate holds on noise instead of drifting up.")
+                                 "sensitive weights and its rate holds on noise instead of drifting up. Keel is "
+                                 "Automagic 4 plus the LoRA gauge preconditioner and the cautious mask below.")
                             with fields():
                                 w["automagic_min_lr"] = ui.number("Min lr", value=d.automagic_min_lr, format="%.1e") \
                                     .classes("w-32")
@@ -6033,7 +6052,8 @@ def build_page(local: bool = True):
                                              "and the rest each adapt their own learning rate, so a small, slower "
                                              "group is not outvoted by the large ones. Fizgig trains Krea 2 this way, "
                                              "with a polarity history of 16.")
-                            with fields().bind_visibility_from(w["optimizer"], "value", lambda x: x == "automagic4"):
+                            with fields().bind_visibility_from(w["optimizer"], "value",
+                                                               lambda x: x in ("automagic4", "keel")):
                                 w["automagic_sensitivity_quantile"] = ui.number("Sensitivity quantile",
                                                                                 value=d.automagic_sensitivity_quantile,
                                                                                 min=0.05, max=1, step=0.05) \
@@ -6055,6 +6075,89 @@ def build_page(local: bool = True):
                                     .tooltip("The most the learning rate may move in one step (0.05 = about 5%); the "
                                              "signs that judge a step only arrive over the next polarity-history "
                                              "steps, so this bounds how far the rate can overshoot meanwhile.")
+                            with fields().bind_visibility_from(w["optimizer"], "value", lambda x: x == "keel"):
+                                w["keel_gauge"] = ui.switch("Gauge preconditioner", value=d.keel_gauge) \
+                                    .tooltip("Each LoRA pair's gradient is scaled by the other factor's r x r Gram "
+                                             "(Riemannian preconditioned LoRA), so the update does not depend on "
+                                             "how the delta is split between lora_down and lora_up and neither "
+                                             "factor takes it all. LoKr and OFT have no pairs: nothing happens.")
+                                w["keel_gauge_eps"] = ui.number("Gauge eps", value=d.keel_gauge_eps, min=0.0001,
+                                                                max=1, step=0.01, format="%.3f").classes("w-32") \
+                                    .tooltip("The preconditioner's floor as a fraction of the larger Gram's mean "
+                                             "diagonal: the still-small factor (lora_up starts at zero) is scaled "
+                                             "by about the identity until it has grown. Raise it if the cautious "
+                                             "mask's kept share in the log falls well under 1.")
+                                w["keel_cautious"] = ui.switch("Cautious mask", value=d.keel_cautious) \
+                                    .tooltip("Zero a preconditioned gradient element that points against the raw "
+                                             "gradient (Cautious Optimizers, ICLR 2026), so the step never climbs "
+                                             "the loss along a weight. The kept share is logged every 250 steps.")
+                            with fields().bind_visibility_from(w["optimizer"], "value", lambda x: x == "keel"):
+                                w["keel_pair_sigma"] = ui.switch("Paired sigma", value=d.keel_pair_sigma) \
+                                    .tooltip("One noise level per step for all of its micro-batches (and the DOP "
+                                             "pass), so the step's gradient sits in one noise band: what the band "
+                                             "normalisation needs, and what makes the micro-batches comparable.")
+                                w["keel_bands"] = ui.number("Noise bands", value=d.keel_bands, min=1, max=64,
+                                                            precision=0).classes("w-32") \
+                                    .tooltip("Bands over the noise level (logit sigma from -4 to 4, so sigma 0.02 to "
+                                             "0.98 in 8 bands). Each weight tensor keeps the gradient power it sees "
+                                             "per band, and a step's gradient enters the optimizer at the tensor's "
+                                             "overall scale whatever its band, so the quiet bands (where the face "
+                                             "forms) are not drowned by the loud ones. 1 = off. Needs paired sigma "
+                                             "or one micro-batch per step; the per-band imbalance is logged every "
+                                             "250 steps.")
+                                w["keel_band_weights"] = ui.input("Band weights", value=d.keel_band_weights,
+                                                                  placeholder="flat").classes("w-56") \
+                                    .tooltip("A multiplier on the step's update per band: empty = 1 everywhere, "
+                                             "identity = a hump over the face bands (sigma 0.12 to 0.5), or one "
+                                             "number per band, comma-separated.")
+                                w["keel_consensus"] = ui.number("Consensus gate", value=d.keel_consensus, min=0, max=1,
+                                                                step=0.1, format="%.2f").classes("w-32") \
+                                    .tooltip("Cross-photo consensus (the AND-mask, ICLR 2021): each weight's update "
+                                             "is scaled by (1 - c) + c x (agreement share)^power, the share being "
+                                             "how many of the step's gradients (micro-batches, the DOP pass) agree "
+                                             "on its sign, so what every photo shares (the face) moves and what "
+                                             "varies between them (outfit, background, light) moves less. 0 = off, "
+                                             "1 = only unanimous elements move. Needs gradient accumulation of 2 or "
+                                             "more; paired sigma keeps the noise level out of the disagreement.")
+                                w["keel_consensus_power"] = ui.number("Consensus power", value=d.keel_consensus_power,
+                                                                      min=0.1, max=8, step=0.5, format="%.1f") \
+                                    .classes("w-32") \
+                                    .tooltip("The exponent on the agreement share: higher is stricter on partial "
+                                             "agreement (2: a 3-of-4 split counts as 0.25 agreement, before the "
+                                             "floor).")
+                                w["keel_lookahead"] = ui.switch("Lookahead", value=d.keel_lookahead) \
+                                    .tooltip("Probe-gated lookahead: the weights that scored a new best likeness "
+                                             "(by the noise band) become the anchor; after the grace probes without "
+                                             "a gain the weights are pulled part of the way back toward the anchor "
+                                             "and the learning rate is cut, so a run that wanders off its best is "
+                                             "damped to it. Needs likeness probes (face refs). Off until raced.")
+                                w["keel_lookahead_pullback"] = ui.number("Pull-back", value=d.keel_lookahead_pullback,
+                                                                         min=0.05, max=1, step=0.05, format="%.2f") \
+                                    .classes("w-32") \
+                                    .tooltip("How far a pull moves the weights toward the anchor (1 = all the way).")
+                                w["keel_lookahead_lr"] = ui.number("Pull lr factor", value=d.keel_lookahead_lr,
+                                                                   min=0.1, max=1, step=0.05, format="%.2f") \
+                                    .classes("w-32") \
+                                    .tooltip("The learning-rate multiplier at each pull (within the Automagic rails).")
+                                w["keel_lookahead_grace"] = ui.number("Grace probes", value=d.keel_lookahead_grace,
+                                                                      min=0, max=20, precision=0).classes("w-32") \
+                                    .tooltip("Probes without a gain before a pull; the count starts over after a "
+                                             "pull or an accept.")
+                                w["keel_face_gain"] = ui.number("Face gain", value=d.keel_face_gain, min=0, max=4,
+                                                                step=0.25, format="%.2f").classes("w-32") \
+                                    .tooltip("Face-token gain: each LoRA pair's step is scaled by (the share of its "
+                                             "gradient that comes from the face's tokens / the median pair's share) "
+                                             "to this power, so the weights serving the face move more and the "
+                                             "background's less. Needs region maps with faces (face detection). "
+                                             "0 = off; race it at 0.5 and 1.")
+                                w["keel_face_gain_max"] = ui.number("Face gain limit", value=d.keel_face_gain_max,
+                                                                    min=1, max=10, step=0.5, format="%.1f") \
+                                    .classes("w-32").tooltip("The gain stays within [1 / limit, limit].")
+                                w["keel_face_gain_beta"] = ui.number("Face gain EMA", value=d.keel_face_gain_beta,
+                                                                     min=0, max=0.99, step=0.05, format="%.2f") \
+                                    .classes("w-32") \
+                                    .tooltip("How much of the previous gain each step keeps (0.9: one batch without "
+                                             "a face barely moves it).")
                         with advanced("Timesteps, loss weighting and gradients"):
                             with fields():
                                 w["gradient_accumulation"] = ui.number("Grad accumulation",
@@ -7870,6 +7973,23 @@ Krea 2 LoRA upstream's rate ran from 1e-4 into the 1e-3 ceiling by step 100 and 
 6e-4 and eased back to 3e-4 by step 160. On a rank-16 LoRA its step is as fast as adamw8bit's (about 3x slower at
 rank 64, 6x on a full fine-tune; Automagic 3's is about 10x slower than Automagic 4's) and its state is 1 byte per weight at the default *Polarity history* 8; which optimizer reaches likeness first is not
 measured yet, so race them.
+
+`keel` is Automagic 4 for character LoRAs (`docs/keel-optimizer.md`), with every Automagic 4 setting and two of
+its own: the *Gauge preconditioner* scales each LoRA pair's gradient by the other factor's r x r Gram (Riemannian
+preconditioned LoRA), so the update does not depend on how the delta is split between `lora_down` and `lora_up`
+and neither factor takes it all (*Gauge eps* is its floor); the *Cautious mask* drops a preconditioned gradient
+element that points against the raw gradient. LoKr and OFT have no pairs, so there Keel is Automagic 4. *Paired
+sigma* gives all of a step's micro-batches one noise level, and the *Noise bands* keep, per weight tensor, the
+gradient power seen in each band of the noise level, so a step's gradient enters at the tensor's overall scale
+whatever its band and the quiet bands (where the face forms) take steps as large as the loud ones; *Band weights*
+then emphasise bands on purpose (`identity`: a hump over sigma 0.12 to 0.5). The *Consensus gate* scales each
+weight's update by how many of the step's micro-batches agree on its sign, so what every photo shares moves and
+what varies between photos moves less (it needs gradient accumulation of 2 or more). *Lookahead* (off by default)
+anchors the weights at each probe that sets a new best likeness and, after the grace probes without a gain, pulls
+the weights part of the way back toward the anchor and cuts the learning rate. *Face gain* (off by default) scales
+each LoRA pair's step by how much of its gradient comes from the face's tokens, against the median pair, so the
+weights that serve the face move more and the background's less; it needs region maps with faces. Whether Keel
+beats adamw8bit on the likeness probes is not measured yet: race them.
 
 ## Adapters: LoRA, LoKr, OFT and DoRA
 The *Adapter* field (Train tab, LoRA section) picks what each layer learns. **LoRA**: a rank-r pair. **LoKr**: a
