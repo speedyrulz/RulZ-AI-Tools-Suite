@@ -36,12 +36,14 @@ def test_overrides_parse_and_format():
 
 def test_validation():
     race_cfg([{"name": "a"}, {"name": "b", "learning_rate": 2e-4, "lora_rank": 32}]).validate()
+    race_cfg([{"name": "a"}, {"name": "b", "optimizer": "automagic4", "automagic_max_lr_change": 0.02}]).validate()
     for rows, kw, msg in (
             ([{"name": "a"}], {}, "at least 2"),
             ([{"name": "a"}, {"name": "b", "steps": 5}], {}, "shares: steps"),
             ([{"name": "a"}, {"name": "a b"}], {}, "letters"),
             ([{"name": "a"}, {"name": "a"}], {}, "unique"),
             ([{"name": "a"}, {"name": "b", "automagic_groups": "bad"}], {}, "configuration 'b'"),
+            ([{"name": "a"}, {"name": "b", "optimizer": "automagic4", "automagic_vote": "x"}], {}, "configuration 'b'"),
             ([{"name": "a"}, {"name": "b"}], {"probe_every": 0}, "probes"),
             ([{"name": "a"}, {"name": "b"}], {"resume_state": "x"}, "starts fresh"),
             ([{"name": "a"}, {"name": "b"}, {"name": "c"}], {"steps": 15}, "at least 20 steps")):

@@ -167,9 +167,10 @@ def test_lora_plus_groups_and_resume_check():
     assert abs(opt.param_groups[1]["lr"] / opt.param_groups[0]["lr"] - 16) < 1e-6
     assert abs(current_lr(opt, sch) - 1e-4) < 1e-12
     assert len(L.lora_param_groups(inj, 1e-4, 0.0)) == 1
-    cfg2 = TrainConfig(optimizer="automagic3", learning_rate=1e-4, lora_plus_ratio=16)
-    opt2 = build_optimizer(cfg2, L.lora_param_groups(inj, 1e-4, 16))
-    assert len(opt2.param_groups) == 1  # collapsed with a warning
+    for name in ("automagic3", "automagic4"):
+        cfg2 = TrainConfig(optimizer=name, learning_rate=1e-4, lora_plus_ratio=16)
+        opt2 = build_optimizer(cfg2, L.lora_param_groups(inj, 1e-4, 16))
+        assert len(opt2.param_groups) == 1  # collapsed with a warning
 
 
 # ---------------------------------------------------------------- phase 4: crops

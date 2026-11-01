@@ -1,12 +1,17 @@
 """Automagic v3 optimizer, ported verbatim from ai-toolkit (https://github.com/ostris/ai-toolkit),
 toolkit/optimizers/automagic3.py. Copyright (c) 2024 Ostris, LLC. MIT License.
 
-RulzTrainer uses it with fused=False so gradient clipping and gradient accumulation still apply.
+RulzTrainer uses it with fused=False so gradient clipping and gradient accumulation still apply. Departures from
+upstream: get_learning_rates tolerates a group spread over several devices, and the two start-up notes go to the
+log instead of stdout.
 """
 
 
+import logging
 from typing import List
 import torch
+
+log = logging.getLogger("rulztrainer")
 
 
 class Automagic3(torch.optim.Optimizer):
@@ -198,7 +203,7 @@ class Automagic3(torch.optim.Optimizer):
         if lr > 1e-3:
             # No clamping: a too-high start just oscillates immediately and
             # the controller drives it down.
-            print(
+            log.info(
                 f"Note: start lr {lr} is high; the controller will correct it "
                 f"(the pooled vote will walk it down)."
             )
@@ -238,7 +243,7 @@ class Automagic3(torch.optim.Optimizer):
                     self._hook_handles.append(handle)
 
         total = sum(p.numel() for g in self.param_groups for p in g["params"])
-        print(f"Total training paramiters: {total:,}")
+        log.info(f"{type(self).__name__}: {total:,} training parameters")
 
     # ------------------------------------------------------------------ utils
 
@@ -375,7 +380,8 @@ class Automagic3(torch.optim.Optimizer):
         # identical multiplicative nudges, so these stay equal; storing per
         # param rides the normal state_dict machinery and tolerates
         # multi-device groups).
-        state["lr"] = torch.tensor(
+        state["lr"] = torch.full(  # (torch.full: no blocking host copy per param)
+            (),
             min(max(float(group["lr"]), group["min_lr"]), group["max_lr"]),
             dtype=torch.float32,
             device=p.device,
@@ -646,9 +652,23 @@ class Automagic3(torch.optim.Optimizer):
         lrs = self.get_learning_rates()
         return sum(lrs) / len(lrs) if lrs else float(self.defaults["lr"])
 
+    def _saved_fp32(self, state_dict, key: str) -> dict:
+        # {param: saved state[key] as fp32}, read before the parent's load
+        # casts it to the param dtype (a bf16 model's adapted lr would be
+        # rounded by up to 0.4% at every resume). Same id mapping as torch.
+        out = {}
+        saved = state_dict.get("state", {})
+        for sg, g in zip(state_dict.get("param_groups", []), self.param_groups):
+            for pid, p in zip(sg["params"], g["params"]):
+                v = saved.get(pid, {}).get(key)
+                if isinstance(v, torch.Tensor) and v.is_floating_point():
+                    out[p] = v.detach().to(p.device, torch.float32, copy=True)
+        return out
+
     def load_state_dict(self, state_dict):
-        # Parent casts every fp state tensor to param.dtype; force lr back to fp32
-        # so subsequent lr bumps aren't rounded away on bf16 weights.
+        # Parent casts every fp state tensor to param.dtype; lr is restored
+        # from the saved fp32 values so it isn't rounded on bf16 weights.
+        exact = self._saved_fp32(state_dict, "lr")
         super().load_state_dict(state_dict)
         # Hyperparameters are NOT loaded from the checkpoint: constructor args
         # always win, so any setting can be changed mid-run just by passing a
@@ -661,8 +681,11 @@ class Automagic3(torch.optim.Optimizer):
             # One lr per group: unify the restored lrs to their geometric
             # median (they are already identical for checkpoints from this
             # version; older per-tensor checkpoints land on a sane middle).
+            # (The median of the values is the geometric median, without a
+            # log/exp round trip.) A lowered max_lr / raised min_lr applies at
+            # once rather than at the first vote.
             lrs = [
-                st["lr"]
+                exact.get(p, st["lr"])
                 for p in group["params"]
                 if (st := self.state.get(p)) is not None
                 and isinstance(st.get("lr"), torch.Tensor)
@@ -672,9 +695,8 @@ class Automagic3(torch.optim.Optimizer):
                 dev = lrs[0].device
                 med = (
                     torch.stack([t.to(torch.float32).to(dev) for t in lrs])
-                    .log_()
                     .median()
-                    .exp_()
+                    .clamp_(min=group["min_lr"], max=group["max_lr"])
                 )
             for p in group["params"]:
                 st = self.state.get(p)
