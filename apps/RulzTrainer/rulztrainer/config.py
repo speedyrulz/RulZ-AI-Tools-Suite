@@ -404,6 +404,12 @@ class TrainConfig:
     #                              scaled by (1 - c) + c * (agreement share)^power, the share being how many of the
     #                              step's gradients (micro-batches, the DOP pass) agree on the element's sign
     keel_consensus_power: float = 2.0  # keel: the exponent on the agreement share
+    keel_lookahead: bool = False  # keel: probe-gated lookahead: the weights that beat the anchor's smoothed likeness
+    #                               score by the noise band become the anchor, and after keel_lookahead_grace probes
+    #                               without a gain the weights are pulled back toward it (needs likeness probes)
+    keel_lookahead_pullback: float = 0.5  # keel: how far a pull moves the weights toward the anchor (1 = all the way)
+    keel_lookahead_lr: float = 0.7  # keel: the learning-rate multiplier at each pull (within the Automagic rails)
+    keel_lookahead_grace: int = 2  # keel: probes without a gain before a pull (the count starts over after one)
     lr_scheduler: str = "constant"  # constant | cosine | linear
     warmup_steps: int = 50
     max_grad_norm: float = 1.0
@@ -844,6 +850,12 @@ class TrainConfig:
             raise ValueError("keel_consensus must be between 0 and 1")
         if self.keel_consensus_power <= 0:
             raise ValueError("keel_consensus_power must be above 0")
+        if not 0 < self.keel_lookahead_pullback <= 1:
+            raise ValueError("keel_lookahead_pullback must be above 0 and at most 1")
+        if not 0 < self.keel_lookahead_lr <= 1:
+            raise ValueError("keel_lookahead_lr must be above 0 and at most 1")
+        if self.keel_lookahead_grace < 0:
+            raise ValueError("keel_lookahead_grace must be 0 or more")
         if self.compile_model not in (True, False, "auto"):
             raise ValueError(f"compile_model must be true, false or auto, got {self.compile_model!r}")
         if self.race:

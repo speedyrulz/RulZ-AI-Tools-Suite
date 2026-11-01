@@ -1272,6 +1272,8 @@ class Form:
             keel_cautious=bool(v("keel_cautious")), keel_pair_sigma=bool(v("keel_pair_sigma")),
             keel_bands=int(v("keel_bands")), keel_band_weights=str(v("keel_band_weights") or "").strip(),
             keel_consensus=float(v("keel_consensus")), keel_consensus_power=float(v("keel_consensus_power")),
+            keel_lookahead=bool(v("keel_lookahead")), keel_lookahead_pullback=float(v("keel_lookahead_pullback")),
+            keel_lookahead_lr=float(v("keel_lookahead_lr")), keel_lookahead_grace=int(v("keel_lookahead_grace")),
             timestep_shift=float(v("timestep_shift")), sigmoid_scale=float(v("sigmoid_scale")),
             logsnr_mean=float(v("logsnr_mean")), logsnr_std=float(v("logsnr_std")),
             block_swap=int(v("block_swap") or 0),
@@ -2872,6 +2874,8 @@ RACE_LABELS = {
     "keel_gauge": "Keel gauge preconditioner", "keel_gauge_eps": "Keel gauge eps", "keel_cautious": "Keel cautious mask",
     "keel_pair_sigma": "Keel paired sigma", "keel_bands": "Keel noise bands", "keel_band_weights": "Keel band weights",
     "keel_consensus": "Keel consensus gate", "keel_consensus_power": "Keel consensus power",
+    "keel_lookahead": "Keel lookahead", "keel_lookahead_pullback": "Keel pull-back",
+    "keel_lookahead_lr": "Keel pull lr factor", "keel_lookahead_grace": "Keel grace probes",
     "lora_ema": "Weight average", "timestep_sampling": "Timestep sampling", "loss_weighting": "Loss weighting",
     "region_weights": "Region-weighted loss", "face_loss_weight": "Face loss weight",
     "body_loss_weight": "Body loss weight", "background_loss_weight": "Background loss weight",
@@ -6108,6 +6112,24 @@ def build_page(local: bool = True):
                                     .tooltip("The exponent on the agreement share: higher is stricter on partial "
                                              "agreement (2: a 3-of-4 split counts as 0.25 agreement, before the "
                                              "floor).")
+                                w["keel_lookahead"] = ui.switch("Lookahead", value=d.keel_lookahead) \
+                                    .tooltip("Probe-gated lookahead: the weights that scored a new best likeness "
+                                             "(by the noise band) become the anchor; after the grace probes without "
+                                             "a gain the weights are pulled part of the way back toward the anchor "
+                                             "and the learning rate is cut, so a run that wanders off its best is "
+                                             "damped to it. Needs likeness probes (face refs). Off until raced.")
+                                w["keel_lookahead_pullback"] = ui.number("Pull-back", value=d.keel_lookahead_pullback,
+                                                                         min=0.05, max=1, step=0.05, format="%.2f") \
+                                    .classes("w-32") \
+                                    .tooltip("How far a pull moves the weights toward the anchor (1 = all the way).")
+                                w["keel_lookahead_lr"] = ui.number("Pull lr factor", value=d.keel_lookahead_lr,
+                                                                   min=0.1, max=1, step=0.05, format="%.2f") \
+                                    .classes("w-32") \
+                                    .tooltip("The learning-rate multiplier at each pull (within the Automagic rails).")
+                                w["keel_lookahead_grace"] = ui.number("Grace probes", value=d.keel_lookahead_grace,
+                                                                      min=0, max=20, precision=0).classes("w-32") \
+                                    .tooltip("Probes without a gain before a pull; the count starts over after a "
+                                             "pull or an accept.")
                         with advanced("Timesteps, loss weighting and gradients"):
                             with fields():
                                 w["gradient_accumulation"] = ui.number("Grad accumulation",
@@ -7919,8 +7941,10 @@ gradient power seen in each band of the noise level, so a step's gradient enters
 whatever its band and the quiet bands (where the face forms) take steps as large as the loud ones; *Band weights*
 then emphasise bands on purpose (`identity`: a hump over sigma 0.12 to 0.5). The *Consensus gate* scales each
 weight's update by how many of the step's micro-batches agree on its sign, so what every photo shares moves and
-what varies between photos moves less (it needs gradient accumulation of 2 or more). Whether Keel beats adamw8bit
-on the likeness probes is not measured yet: race them.
+what varies between photos moves less (it needs gradient accumulation of 2 or more). *Lookahead* (off by default)
+anchors the weights at each probe that sets a new best likeness and, after the grace probes without a gain, pulls
+the weights part of the way back toward the anchor and cuts the learning rate. Whether Keel beats adamw8bit on the
+likeness probes is not measured yet: race them.
 
 ## Adapters: LoRA, LoKr, OFT and DoRA
 The *Adapter* field (Train tab, LoRA section) picks what each layer learns. **LoRA**: a rank-r pair. **LoKr**: a

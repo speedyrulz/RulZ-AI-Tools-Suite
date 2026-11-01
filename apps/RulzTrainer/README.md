@@ -789,10 +789,21 @@ with both of its own switches off it is Automagic 4 to the bit (a test asserts i
   so is it in the parallel race, which hands the optimizer the step's sum. A data-parallel replica's gradient (the
   sum over its micro-batches) joins scaled by the step's band and as one vote. The mean gate is logged every 250
   steps; the copy check (`copy_check: on`) is where its effect on memorised backgrounds shows.
+- **Lookahead** (`keel_lookahead` off, `keel_lookahead_pullback` 0.5, `keel_lookahead_lr` 0.7, `keel_lookahead_grace`
+  2): the likeness probes with the held-out judge are the one signal nothing trains on, and lookahead (Zhang et al.
+  2019) keeps slow weights and pulls the fast weights toward them; here the probe decides. Keel keeps an fp32 anchor
+  copy of every trained tensor in its state (parked, moved and relayed with the rest): the first probe sets it, a
+  probe that beats the anchor's smoothed score by the noise band moves it to the weights that scored (the weight
+  average when `lora_ema` is on), and after more than `keel_lookahead_grace` probes without a gain the weights are
+  pulled `keel_lookahead_pullback` of the way back toward the anchor (the average too) and every Automagic lr mirror
+  is multiplied by `keel_lookahead_lr`; the second moments and sign histories stay. No pull while the score rose
+  since the previous probe, so a slow climb is never pulled and an oscillating run is damped to its best. One fp32
+  copy of the LoRA; needs probes with face references.
 
 All of it can be raced (`race` rows with `keel_gauge`, `keel_gauge_eps`, `keel_cautious`, `keel_pair_sigma`,
-`keel_bands`, `keel_band_weights`, `keel_consensus`, `keel_consensus_power`), and a Keel state resumes under
-Automagic 4 and the other way round (the band statistics start fresh when `keel_bands` changes). Whether Keel beats Automagic 4 or adamw8bit on the likeness probes
+`keel_bands`, `keel_band_weights`, `keel_consensus`, `keel_consensus_power`, `keel_lookahead` and its three
+settings), and a Keel state resumes under Automagic 4 and the other way round (the band statistics start fresh
+when `keel_bands` changes; the anchor is dropped when the lookahead is off). Whether Keel beats Automagic 4 or adamw8bit on the likeness probes
 is not measured yet: the Wizard keeps recommending adamw8bit until a race says otherwise.
 
 **MiniMax H3 and FLUX Klein** are trained in ai-toolkit, not here. `rulztrainer/optimizers/automagic4.py` depends only
@@ -829,8 +840,9 @@ Four levers change the training objective and data for likeness, all off by defa
   and a learning rate that holds on noise instead of drifting up; see *Self-tuning optimizers* above.
 - **Keel** (`optimizer: keel`): Automagic 4 plus a preconditioner that keeps either LoRA factor from taking the whole
   update, a mask against steps that point away from the gradient, noise bands so the quiet noise levels (where the
-  face forms) step as far as the loud ones, and a consensus gate that moves a weight by how far the step's photos
-  agree on it; see *Keel* above and `docs/keel-optimizer.md`.
+  face forms) step as far as the loud ones, a consensus gate that moves a weight by how far the step's photos agree
+  on it, and a probe-gated lookahead (off by default) that pulls a run back toward its best-scoring weights; see
+  *Keel* above and `docs/keel-optimizer.md`.
 
 The face analysis cache is `<dataset>/.rulz_cache/faces.json`; the Train tab has preview buttons for region
 maps and crops.

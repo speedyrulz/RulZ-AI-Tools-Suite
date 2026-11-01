@@ -169,6 +169,10 @@ def test_keel_options_are_checked():
         Keel([down, up], lr=1e-4, fused=False, consensus=1.5)
     with pytest.raises(ValueError, match="consensus_power"):
         Keel([down, up], lr=1e-4, fused=False, consensus_power=0.0)
+    with pytest.raises(ValueError, match="lookahead_pullback"):
+        Keel([down, up], lr=1e-4, fused=False, lookahead_pullback=1.5)
+    with pytest.raises(ValueError, match="lookahead_grace"):
+        Keel([down, up], lr=1e-4, fused=False, lookahead_grace=-1)
     # no pairs (a LoKr / OFT adapter, a fine-tune): the step is Automagic 4's
     opt = Keel([down, up], lr=1e-4, fused=False)
     down.grad, up.grad = torch.randn(2, 3), torch.randn(4, 2)
@@ -376,7 +380,11 @@ def test_keel_config_race_and_wizard_wiring(tmp_path):
     from rulztrainer.finetune import BYTES_PER_PARAM
 
     keys = {"keel_gauge", "keel_gauge_eps", "keel_cautious", "keel_pair_sigma", "keel_bands", "keel_band_weights",
-            "keel_consensus", "keel_consensus_power"}
+            "keel_consensus", "keel_consensus_power", "keel_lookahead", "keel_lookahead_pullback", "keel_lookahead_lr",
+            "keel_lookahead_grace"}
+    for bad in (dict(keel_lookahead_pullback=0), dict(keel_lookahead_lr=1.5), dict(keel_lookahead_grace=-1)):
+        with pytest.raises(ValueError, match="keel_lookahead"):
+            _cfg(**bad).validate()
     with pytest.raises(ValueError, match="keel_consensus"):
         _cfg(keel_consensus=1.2).validate()
     with pytest.raises(ValueError, match="keel_consensus_power"):
@@ -385,7 +393,8 @@ def test_keel_config_race_and_wizard_wiring(tmp_path):
     TrainConfig(race=True, probe_every=10, face_refs=["ref.png"], steps=40, race_configs=[
         {"name": "a"}, {"name": "b", "optimizer": "keel", "keel_gauge_eps": 0.1, "keel_cautious": False},
         {"name": "c", "optimizer": "keel", "keel_bands": 1, "keel_pair_sigma": False, "keel_band_weights": ""},
-        {"name": "d", "optimizer": "keel", "keel_consensus": 1.0, "keel_consensus_power": 1.0}]).validate()
+        {"name": "d", "optimizer": "keel", "keel_consensus": 1.0, "keel_consensus_power": 1.0},
+        {"name": "e", "optimizer": "keel", "keel_lookahead": True, "keel_lookahead_grace": 0}]).validate()
     assert BYTES_PER_PARAM["keel"] == BYTES_PER_PARAM["automagic4"]
     import webui
 
@@ -632,3 +641,163 @@ def test_replica_gradients_join_scaled_by_the_band_and_vote():
     dp.reduce_grads(take=opt.take_replica)
     assert torch.allclose(p.grad, base * gain + base, rtol=1e-5) and opt._votes[p] == 2
     opt.step()
+
+
+# ---------------------------------------------------------------- the probe-gated lookahead
+
+
+class _Average:
+    """A LoraEMA stand-in: the parameters and their fp32 shadow."""
+
+    def __init__(self, params):
+        self.params = list(params)
+        self.shadow = [p.detach().float().clone() for p in self.params]
+
+
+def test_lookahead_anchors_accepts_holds_and_pulls():
+    torch.manual_seed(14)
+    p = torch.nn.Parameter(torch.randn(6, 5))
+    q = torch.nn.Parameter(torch.randn(3))
+    off = Keel([p, q], lr=1e-4, fused=False, bands=1, consensus=0.0)
+    assert off.on_probe(50.0, 1.0) is None and not off.state  # the lookahead off: nothing, no state
+    opt = Keel([p, q], lr=1e-3, min_lr=1e-5, fused=False, bands=1, consensus=0.0, lookahead=True,
+               lookahead_pullback=0.5, lookahead_lr=0.7, lookahead_grace=2)
+    assert opt.anchor_score is None and opt.on_probe(None, 1.0) is None  # no face found: nothing
+    assert opt.on_probe(50.0, 1.0) == "anchor" and opt.anchor_score == 50.0
+    for t in (p, q):  # the anchor: an fp32 copy of the weights; the state initialised as a step would
+        st = opt.state[t]
+        assert torch.equal(st["anchor"], t.detach()) and st["anchor"].dtype == torch.float32
+        assert st["anchor"].data_ptr() != t.data_ptr() and "lr" in st and float(st["anchor_score"]) == 50.0
+    for _ in range(2):  # the first step only measures
+        _micro_batches(p, [torch.randn(6, 5)], opt)
+        opt.step()
+    moved = p.detach().clone()
+    assert not torch.equal(moved, opt.state[p]["anchor"])  # the step moved the weights, not the anchor
+    assert opt.on_probe(51.0, 1.0) == "rising" and opt.anchor_score == 50.0  # not above the band, but up: no pull
+    assert opt.on_probe(52.0, 1.0) == "accept" and opt.anchor_score == 52.0  # beats 50 + 1: the new anchor
+    assert torch.equal(opt.state[p]["anchor"], moved)
+    anchor = moved.clone()
+    lr0 = opt.state[p]["lr"].clone()
+    kept = {k: v.clone() for k, v in opt.state[p].items()
+            if torch.is_tensor(v) and k not in ("anchor", "anchor_score", "lr")}
+    # two misses hold, a rise since the previous probe holds too (any rise), the next miss pulls
+    assert opt.on_probe(51.0, 1.0) == "hold"
+    assert opt.on_probe(50.0, 1.0) == "hold"
+    assert opt.on_probe(50.5, 1.0) == "rising"
+    with torch.no_grad():
+        p.add_(0.1)  # training wandered
+    before = p.detach().clone()
+    assert opt.on_probe(50.0, 1.0) == "pull"
+    assert torch.allclose(p.detach(), anchor + 0.5 * (before - anchor))
+    assert torch.allclose(opt.state[p]["lr"], lr0 * 0.7)
+    assert opt.anchor_score == 52.0 and torch.equal(opt.state[p]["anchor"], anchor)  # the anchor stays
+    for k, v in kept.items():
+        assert torch.equal(opt.state[p][k], v), k  # the second moments and the sign history stay
+    assert opt.on_probe(49.0, 1.0) == "hold"  # the grace count started over
+    assert opt.on_probe(48.0, 1.0) == "hold"
+    assert opt.on_probe(47.0, 1.0) == "pull"
+    # the lr factor stays within the rails
+    for st in opt.state.values():
+        st["lr"].fill_(1e-5)
+    opt._misses = 3
+    assert opt.on_probe(46.0, 1.0) == "pull" and float(opt.state[p]["lr"]) == pytest.approx(1e-5)
+
+
+def test_lookahead_follows_the_weight_average():
+    torch.manual_seed(15)
+    p = torch.nn.Parameter(torch.randn(4, 4))
+    avg = _Average([p])
+    with torch.no_grad():
+        avg.shadow[0].add_(0.25)  # the average lags the raw weights
+    opt = Keel([p], lr=1e-3, fused=False, bands=1, consensus=0.0, lookahead=True, lookahead_grace=0)
+    assert opt.on_probe(60.0, 1.0, avg) == "anchor"
+    assert torch.equal(opt.state[p]["anchor"], avg.shadow[0])  # the weights that scored: the average
+    assert opt.state[p]["anchor"].data_ptr() != avg.shadow[0].data_ptr()
+    anchor = avg.shadow[0].clone()
+    raw0 = p.detach().clone()
+    with torch.no_grad():
+        avg.shadow[0].sub_(0.1)
+    sh0 = avg.shadow[0].clone()
+    assert opt.on_probe(59.0, 1.0, avg) == "pull"  # grace 0: the first miss pulls
+    assert torch.allclose(p.detach(), anchor + 0.5 * (raw0 - anchor))
+    assert torch.allclose(avg.shadow[0], anchor + 0.5 * (sh0 - anchor))
+
+
+def test_an_anchor_before_the_first_step_leaves_training_bitwise():
+    ma, inja, pa = _model(4)
+    mb, injb, pb = _model(4)
+    oa = build_optimizer(_cfg(keel_lookahead=True), pa, pairs=lora_mod.lora_pairs(inja))
+    ob = build_optimizer(_cfg(), pb, pairs=lora_mod.lora_pairs(injb))
+    assert oa.on_probe(40.0, 1.0) == "anchor"  # probe_at_start: the state is initialised before any gradient
+    for s in range(6):
+        _step(ma, pa, oa, s)
+        _step(mb, pb, ob, s)
+        assert all(torch.equal(a, b) for a, b in zip(pa, pb)), s
+    assert oa.on_probe(45.0, 1.0) == "accept"
+    assert all(torch.equal(oa.state[a]["anchor"], a.detach()) for a in pa)
+
+
+def test_lookahead_state_round_trips_and_is_dropped_without_it():
+    ma, inja, pa = _model(3)
+    opt = build_optimizer(_cfg(keel_lookahead=True), pa, pairs=lora_mod.lora_pairs(inja))
+    for s in range(2):
+        _step(ma, pa, opt, s)
+    assert opt.on_probe(55.0, 1.0) == "anchor"
+    _step(ma, pa, opt, 2)
+    sd = opt.state_dict()
+    mb, injb, pb = _model(3)
+    with torch.no_grad():
+        for a, b in zip(pa, pb):
+            b.copy_(a)
+    ob = build_optimizer(_cfg(keel_lookahead=True), pb, pairs=lora_mod.lora_pairs(injb))
+    ob.load_state_dict(sd)
+    assert ob.anchor_score == 55.0
+    for a, b in zip(pa, pb):
+        assert torch.equal(ob.state[b]["anchor"], opt.state[a]["anchor"])
+        assert ob.state[b]["anchor"].dtype == torch.float32
+    # the restored optimizer goes on from the restored anchor
+    ob._misses = 2
+    before = [b.detach().clone() for b in pb]
+    assert ob.on_probe(54.0, 1.0) == "pull"
+    for b, x, a in zip(pb, before, pa):
+        assert torch.allclose(b.detach(), torch.lerp(x, opt.state[a]["anchor"], 0.5), atol=1e-7)
+    # the lookahead off: the anchor is dropped on load; Automagic 4 loads the state and steps
+    mc, injc, pc = _model(3)
+    oc = build_optimizer(_cfg(), pc, pairs=lora_mod.lora_pairs(injc))
+    oc.load_state_dict(sd)
+    assert all("anchor" not in oc.state[c] and "anchor_score" not in oc.state[c] for c in pc)
+    assert oc.anchor_score is None and oc.on_probe(60.0, 1.0) is None
+    md, injd, pd = _model(3)
+    od = build_optimizer(_cfg(optimizer="automagic4"), pd)
+    od.load_state_dict(sd)
+    _step(md, pd, od, 3)
+
+
+def test_trainer_hands_the_probe_decision_to_keel_and_syncs_the_replicas_after_a_pull():
+    from types import SimpleNamespace
+
+    from rulztrainer.trainer import Trainer
+
+    torch.manual_seed(16)
+    p = torch.nn.Parameter(torch.randn(4, 4))
+    opt = Keel([p], lr=1e-3, fused=False, bands=1, consensus=0.0, lookahead=True, lookahead_grace=0)
+    synced = []
+    dp = SimpleNamespace(sync_weights=lambda: synced.append(True))
+    me = SimpleNamespace(controller=SimpleNamespace(combined_ema=50.0), cfg=_cfg(likeness_noise_band=2.0), dp=dp)
+    Trainer._keel_probe(me, opt, None, True)
+    assert opt.anchor_score == 50.0 and not synced
+    me.controller.combined_ema = 51.0  # within the band, but up since the previous probe: no pull
+    Trainer._keel_probe(me, opt, None, True)
+    assert not synced
+    me.controller.combined_ema = 49.0  # a miss, and grace 0 pulls: the replicas follow
+    Trainer._keel_probe(me, opt, None, True)
+    assert synced == [True]
+    me.controller.combined_ema = 48.0
+    Trainer._keel_probe(me, opt, None, False)  # the parallel race: no sync
+    assert synced == [True]
+    me.controller = None  # no probes: nothing
+    Trainer._keel_probe(me, opt, None, True)
+    plain = Automagic4([p], lr=1e-3, fused=False)
+    me.controller = SimpleNamespace(combined_ema=60.0)
+    Trainer._keel_probe(me, plain, None, True)  # another optimizer: nothing
+    assert synced == [True]
