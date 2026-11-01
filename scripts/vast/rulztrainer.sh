@@ -8,4 +8,7 @@ utils=/opt/supervisor-scripts/utils
 
 . /venv/main/bin/activate
 cd "${WORKSPACE:-/workspace}/RulzTrainer"
+# compiled kernels on the workspace volume, so a restarted instance does not compile from scratch again
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-${WORKSPACE:-/workspace}/.cache/torchinductor}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${WORKSPACE:-/workspace}/.cache/triton}"
 exec python webui.py --host 127.0.0.1 --port "${RULZ_PORT:-17870}"

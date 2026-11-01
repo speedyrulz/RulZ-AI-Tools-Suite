@@ -417,6 +417,7 @@ class Trainer(RaceParallelMixin):
         self.ft_window = 0
         self.ft_rotated_at = -1  # the step of the last rotation
         self.compiled = False  # torch.compile active on the DiT blocks
+        self.compile_dirs: list = []  # compile_cache folders (the first is written)
         self.dp_quiet_steps = 0  # consecutive data-parallel steps without a new compile
         self.replicas: list[tuple] = []  # (model, device) for every training copy, primary first
         if cfg.multi_gpu in ("data_parallel", "model_split"):
@@ -945,6 +946,10 @@ class Trainer(RaceParallelMixin):
         if why:
             log.info("torch.compile %s (%s)", "on" if do_compile else "off", why)
         if do_compile:
+            self.compile_dirs = compiling.cache_dirs(cfg.compile_cache, cfg.models_dir)
+            got = compiling.load_cache(self.compile_dirs, self.replicas[0][2])
+            if got is not None:
+                log.info("compile_cache: loaded %s", got)
             for m, _, _ in self.replicas:
                 self.compiled = self.compile(m, fall_back=cfg.compile_model == "auto",
                                              shape_swaps=self.race_rows is not None) or self.compiled
@@ -1238,6 +1243,7 @@ class Trainer(RaceParallelMixin):
                 self._balance(step)
             if self.compiled and compute_done == 5:
                 compiling.report("after 5 steps")
+                self._save_compile_cache()
             losses.append(accum_loss)
             avg = sum(losses[-50:]) / len(losses[-50:])
             elapsed = time.time() - start
@@ -1351,6 +1357,7 @@ class Trainer(RaceParallelMixin):
             self._probe_async_take(step, optimizer, scheduler, wait=True)
         if self.compiled:
             compiling.report("end of training")
+            self._save_compile_cache()
         if self._race_running():
             log.warning("Stopped before the race was decided; the final save is %s's (the others are in race.json "
                         "and their _dropped files)", self.race.active.name)
@@ -1560,6 +1567,12 @@ class Trainer(RaceParallelMixin):
                     self.status.data["states"].remove(str(old))
         self.status.write()
         return state_dir
+
+    def _save_compile_cache(self) -> None:
+        t0 = time.time()
+        f = compiling.save_cache(self.compile_dirs, self.replicas[0][2])
+        if f is not None:
+            log.info("compile_cache: saved %s (%.1f MB, %.1fs)", f, f.stat().st_size / 2**20, time.time() - t0)
 
     def compile(self, model, fall_back: bool = False, shape_swaps: bool = False) -> bool:
         try:
@@ -1852,6 +1865,7 @@ class Trainer(RaceParallelMixin):
         if self.dp is not None:
             self.dp.sync_weights()  # replicas follow the wrappers' shapes, scale and on/off
         self.cfg = v.cfg
+        race_mod.configure_backward(v.cfg, [m for m, _, _ in self.replicas])
         st = v.state
         if not v.started:
             self._race_start_variant(v)

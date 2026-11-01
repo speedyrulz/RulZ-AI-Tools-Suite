@@ -1257,7 +1257,8 @@ class Form:
             lora_save_dtype=v("lora_save_dtype"), lora_ema=float(v("lora_ema") or 0),
             save_state=bool(v("save_state")), resume_state=s("resume_state"),
             save_state_every=int(v("save_state_every")), keep_states=int(v("keep_states")),
-            compile_model=v("compile_model"), sample_seed=int(v("sample_seed")),
+            compile_model=v("compile_model"), compile_cache=s("compile_cache") or "auto",
+            sample_seed=int(v("sample_seed")),
             sample_walk_seed=bool(v("sample_walk_seed")), sample_before_training=bool(v("sample_before_training")),
             steps=0 if v("soup_run") or v("noise_run") else int(v("steps")), batch_size=int(v("batch_size")),
             gradient_accumulation=int(v("gradient_accumulation")), learning_rate=float(v("learning_rate")),
@@ -2884,6 +2885,7 @@ RACE_LABELS = {
     "selftrain_share": "Self-training share", "selftrain_weight": "Self-training weight", "seed": "Seed",
     "copy_check": "Copy check (SSCD)", "copy_max": "Copy limit",
     "dop_weight": "DOP weight (LoRA Isolation)", "dop_every": "DOP every N steps (LoRA Isolation)",
+    "int8_backward": "int8 backward", "nvfp4_backward": "nvfp4 backward (fp4 is faster on RTX 50)",
 }
 
 
@@ -5571,6 +5573,12 @@ def build_page(local: bool = True):
                                              "per step, after a 25-40 s warm-up. auto compiles runs of 100+ steps "
                                              "(needs triton, installed with the requirements); a block that fails to "
                                              "compile then runs uncompiled.")
+                                w["compile_cache"] = ui.input("Compile cache", value=d.compile_cache) \
+                                    .classes("w-72").tooltip(
+                                        "Keeps the compiled kernels in a file so another machine with the same GPU "
+                                        "model, torch and triton skips most of the warm-up (a fresh vast.ai rental: "
+                                        "put the file in your model bucket's .rulz_compile folder). auto: "
+                                        "<models folder>/.rulz_compile; a folder; or off.")
                             with fields():
                                 w["int8_matmul"] = ui.select({True: "W8A8 int8 matmul (fast)",
                                                               False: "dequantize to bf16 (slow)"},
@@ -7786,9 +7794,9 @@ as well and multiplies on the FP4 tensor cores (about 4x faster than a bf16 matm
 dequantizing), with an exact bf16 backward. GPUs without FP4 tensor cores always dequantize (a fused kernel). Pick
 the RTX 50 card as the training GPU to use it; the log says which GPUs run native. *nvfp4 backward* `FP4` (opt-in)
 runs the gradient through those layers on the FP4 tensor cores too: about 9% faster per step on Krea 2, with
-noisier gradients (cosine 0.93-0.99 to the exact ones); `bf16` stays exact. *Attention kernel*: `auto` puts cuDNN's
-attention on Blackwell GPUs (RTX 50, B200), where it ran Krea 2 steps 15-22% faster at the same loss, and lets
-PyTorch pick elsewhere; `torch`, `cudnn`, `flash`, `efficient`, `math` put one first. The others stay enabled behind
+noisier gradients (cosine 0.93-0.99 to the exact ones); `bf16` stays exact. A configuration race can race the two
+(*nvfp4_backward* in a row). *Attention kernel*: `auto` puts cuDNN's attention first on RTX 40 (Ada) and Blackwell GPUs
+(RTX 50, B200), where it ran steps 5-22% faster at the same loss, and lets PyTorch pick elsewhere; `torch`, `cudnn`, `flash`, `efficient`, `math` put one first. The others stay enabled behind
 it: a call it cannot take runs on the next.
 
 ## Datasets
@@ -7832,6 +7840,9 @@ same step time. It needs gradient checkpointing and turns torch.compile off.
 *Compile model* (Model, Advanced; default auto): torch.compile fuses the small steps between the matrix multiplies
 into fewer GPU kernels. Measured at 1 MP on an RTX 5060 Ti: MOSS-Image 26% and Krea 2 12% faster per step, after a
 warm-up of under a minute. auto compiles runs of 100 steps or more (triton is installed with the requirements).
+*Compile cache* (next to it; default auto): the compiled kernels are also saved to one file in
+`models/.rulz_compile`, so a new machine with the same GPU model, torch and triton skips most of the warm-up (82 -> 32 s
+measured on Qwen-Image 2.1). On vast.ai, upload the file to your model bucket's `.rulz_compile` folder.
 
 ## Weight average
 *Weight average decay* (Saving & samples, default 0.98, 0 = off): checkpoints, samples and likeness probes use a

@@ -196,6 +196,12 @@ files and `RULZ_MODEL_DIR` changes the destination. A public bucket needs no tok
 from your account environment variables. The script upgrades `huggingface_hub` on the instance if its version
 has no bucket support.
 
+**Compiled kernels for every rental (`compile_cache`).** A run that compiles saves its compiled kernels to
+`models/.rulz_compile/` (one file per torch, triton and GPU model, about 18 MB for Qwen-Image 2.1). Upload that file
+to your bucket's `.rulz_compile/` folder: the next rental of the same GPU model syncs it to
+`models/bucket/.rulz_compile/` and skips most of the first compile (see [torch.compile](#torchcompile-compile_model)).
+The WebUI also keeps torch's own compile caches under `/workspace/.cache`, so a restarted instance stays warm.
+
 Service control on the instance: `supervisorctl status|restart rulztrainer`; its log is
 `/var/log/portal/rulztrainer.log`. `RULZ_REPO` / `RULZ_BRANCH` environment variables point the provisioning at a
 fork or branch. `Dockerfile` builds an image with the install baked in (`FROM vastai/pytorch:cuda-12.8.1-auto`,
@@ -530,13 +536,15 @@ ones with cosine 0.99 at sigma 0.2, 0.93-0.96 at 0.5 and 0.97-0.98 at 0.8, and a
 | **FP4** | **7.93** (-9%) | 0.0724 (every step within 0.0007) | 13.1 GB |
 
 20 steps show that training behaves the same, not what thousands of steps do with noisier gradients. Compare
-samples on your own data before using it for a final run.
+samples on your own data before using it for a final run, or race it: `int8_backward` and `nvfp4_backward` are race
+keys, so one race row with `nvfp4_backward=fp4` beside the bf16 run (and a bf16 row with its own `seed=` for the
+seed spread) shows whether FP4 keeps the likeness.
 
 ### Attention kernel (`attention_backend`)
 
 The DiT blocks run PyTorch's scaled-dot-product attention. `torch` lets PyTorch pick the kernel (flash where it
-can); `cudnn`, `flash`, `efficient` and `math` put one first; `auto` (the default) puts cuDNN first on a Blackwell
-training GPU (RTX 50, B200; ai-toolkit uses it there too) and lets PyTorch pick elsewhere. The choice is PyTorch's
+can); `cudnn`, `flash`, `efficient` and `math` put one first; `auto` (the default) puts cuDNN first on an Ada or Blackwell
+training GPU (RTX 40, RTX 50, B200; ai-toolkit uses it on Blackwell too) and lets PyTorch pick elsewhere. The choice is PyTorch's
 process-wide priority order, so every other kernel stays enabled behind the chosen one and a call it does not take (a
 mask, dtype or head size) runs on the next. Until v2.3.1 the choice switched the other kernels off during each DiT call,
 which broke a VAE decode running in another thread at that moment (samples and probes split over two GPUs): Krea 2's
@@ -548,8 +556,15 @@ the RTX 5060 Ti, 1 MP, batch 1, 20 steps (median of steps 6-20), two runs each:
 | Krea 2 nvfp4 | 9.40 / 8.56 s per step | 7.90 / 6.70 s per step (-16% / -22%) | 0.0725 | 14.3 GB |
 | MOSS-Image int8 | 6.66 / 6.65 s per step | 5.27 / 5.28 s per step (-21%) | 0.801 | 12.9 GB |
 
-The attention kernel is a fifth of the step at 1 MP; the RTX 40 series (Ada) is not measured, so `auto` leaves
-PyTorch's pick there. Set `cudnn` to try it on any card: the log says which kernel runs.
+On the RTX 4060 Ti (Ada), Qwen-Image 2.1 int8, batch 1, 25 steps uncompiled (median of steps 9-25), two runs each:
+
+| size | PyTorch's pick | cuDNN | loss (both) | peak memory (both) |
+|---|---|---|---|---|
+| 768x768 (0.6 MP) | 3.77 / 3.78 s per step | 3.56 / 3.61 s per step (-5%) | 0.2469 | 14.0 GB |
+| 1024x1024 (1 MP) | 7.86 / 7.84 s per step | 7.12 / 7.14 s per step (-9%) | 0.226 | 13.9 GB |
+
+So `auto` puts cuDNN first on Ada too (since v2.21.0). Ampere and Hopper are not measured, so `auto` leaves PyTorch's
+pick there; set `cudnn` to try it on any card: the log says which kernel runs.
 
 ## Training resolutions and resolution step-up
 
@@ -2275,7 +2290,26 @@ eager, and dynamo's warnings go to `train.log`. The log reports frames, graphs a
 the end. With `auto`, a block that fails to compile runs uncompiled instead of stopping the run. A profile of the
 compiled steps puts attention at 42-50% and the matrix multiplies at 31-38% of the GPU time; the fused kernels are
 about 10%, so removing the graph breaks (custom ops for the quantized Linears) could gain a few percent at most and
-is not done. `RULZ_PROFILE_STEP=N` writes such a profile of step N (`profile_step_N.txt` in the job folder), and
+is not done.
+
+**Compile cache (`compile_cache`, default `auto`).** torch's on-disk caches already keep compiled kernels between runs
+on one machine; a fresh machine (a new vast.ai rental) starts cold. With `auto` a compiled run also saves torch's
+"Mega-Cache" of every compile artifact to `<models_dir>/.rulz_compile/` after 5 steps and at the end, one file per
+torch / triton / GPU model, and loads a matching file (from there or from `models/bucket/.rulz_compile/`) before the
+blocks compile. A file another torch, triton or GPU made is skipped. Set a folder, or `off`. Measured on the RTX 5060
+Ti, Qwen-Image 2.1 int8 at 768x768, compile to the end of step 5, with emptied inductor and triton cache folders for
+the "new machine" runs:
+
+| start | compiling (to step 5) | file |
+|---|---|---|
+| new machine, no file | 82 s | saved: 17.4 MB |
+| new machine, with the file | **32 s** | loaded |
+| same machine, warm caches | 30 s | - |
+
+Step times and losses are the same in all three. Measured on Windows; a Linux rental compiles faster cold, so the
+saving there is smaller (not measured).
+
+`RULZ_PROFILE_STEP=N` writes such a profile of step N (`profile_step_N.txt` in the job folder), and
 `scripts/bench.py` runs the short timing runs used here (it waits for idle GPUs).
 
 ## Layout
@@ -2290,7 +2324,7 @@ rulztrainer/
   trainer.py       training loop, saving, sampling, status.json for the UI
   checkpointing.py selective gradient checkpointing (which blocks keep their activations)
   ema.py           weight average (EMA) of the LoRA for saves, samples and probes
-  compiling.py     torch.compile settings, the compile_model auto rule, compile stats
+  compiling.py     torch.compile settings, the compile_model auto rule, compile stats, the compile cache file
   profiling.py     one-step GPU profile by kernel group (RULZ_PROFILE_STEP)
   race.py          configuration race: settings, round schedule, swapping configurations' LoRAs
   train.py         CLI entry point

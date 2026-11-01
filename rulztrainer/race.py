@@ -81,6 +81,9 @@ RACE_KEYS: dict[str, tuple[str, ...]] = {
                       "selftrain_weight", "copy_check", "copy_max"),
     # a row's own seed gives it its own LoRA initialisation, image order and noise: seed twins for a seed soup
     "Seed": ("seed",),
+    # the frozen quantized layers' backward (fp4 / int8 grad_x: faster, approximate): set on the model as a
+    # configuration takes its turn
+    "Quantized backward": ("int8_backward", "nvfp4_backward"),
 }
 ALLOWED = {k for keys in RACE_KEYS.values() for k in keys}
 # what a relay (race_follow) cannot change: the winner's weights must fit every configuration's LoRA as they are
@@ -647,6 +650,15 @@ def swap_in(v: Variant, wrappers: dict) -> None:
             m.trainable = False
             for p in m.adapter_params().values():
                 p.data = torch.empty((0,) * p.dim() if p.dim() else (0,), device=dev)
+
+
+def configure_backward(cfg, models) -> None:
+    """The quantized layers' backward (int8_backward, nvfp4_backward) a configuration trains with, on each model."""
+    from . import quant as Q
+
+    for m in models:
+        Q.configure_int8(m, cfg.int8_matmul, cfg.int8_backward)
+        Q.configure_nvfp4(m, cfg.nvfp4_matmul, cfg.nvfp4_backward)
 
 
 @torch.no_grad()

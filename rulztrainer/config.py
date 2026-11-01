@@ -277,7 +277,7 @@ class TrainConfig:
     nvfp4_matmul: bool = True  # nvfp4 layers on Blackwell GPUs (RTX 50): activations to NVFP4, FP4 tensor-core matmul
     #                            (W4A4, backward exact in bf16); off, or on older GPUs: weight dequantized to bf16
     nvfp4_backward: str = "bf16"  # native nvfp4 layers' grad_x: bf16 (exact) | fp4 (FP4 tensor cores, faster, approx.)
-    attention_backend: str = "auto"  # DiT attention kernel: auto (cuDNN on RTX 50 / Blackwell, else PyTorch's pick) |
+    attention_backend: str = "auto"  # DiT attention kernel: auto (cuDNN on RTX 40 / 50 and B200, else PyTorch's pick) |
     #   torch (PyTorch picks) | cudnn | flash | efficient | math
 
     # --- dataset ---
@@ -337,6 +337,9 @@ class TrainConfig:
     resume_state: str = ""  # path to a state_XXXXXX directory to resume training from
     compile_model: bool | str = "auto"  # torch.compile the DiT blocks: true | false | auto (runs of 100+ steps on a GPU
     #                                     with triton; measured 26% faster per step on MOSS-Image, 12% on Krea 2)
+    compile_cache: str = "auto"  # compiled kernels kept across machines: auto (<models_dir>/.rulz_compile, also read
+    #                              from models/bucket/.rulz_compile) | a folder | off. Saves a fresh vast.ai rental's
+    #                              cold compile (one file per torch / triton / GPU model)
 
     # --- optimization ---
     steps: int = 2000
@@ -657,6 +660,10 @@ class TrainConfig:
                              "plain linear scale)")
         if self.model_arch not in ("auto", *ARCH_NAMES):
             raise ValueError(f"model_arch must be auto or one of {ARCH_NAMES}, got {self.model_arch!r}")
+        if self.int8_backward not in ("bf16", "int8"):
+            raise ValueError(f"int8_backward must be bf16 or int8, got {self.int8_backward!r}")
+        if self.nvfp4_backward not in ("bf16", "fp4"):
+            raise ValueError(f"nvfp4_backward must be bf16 or fp4, got {self.nvfp4_backward!r}")
         for mp in self.resolutions:
             if not (0.0 < float(mp) <= 16.0):
                 raise ValueError(f"resolutions must be megapixel values in (0, 16], got {mp!r}")

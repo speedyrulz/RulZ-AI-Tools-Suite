@@ -45,6 +45,7 @@ def test_validation():
             ([{"name": "a"}, {"name": "b", "automagic_groups": "bad"}], {}, "configuration 'b'"),
             ([{"name": "a"}, {"name": "b", "optimizer": "automagic4", "automagic_vote": "x"}], {}, "configuration 'b'"),
             ([{"name": "a"}, {"name": "b"}], {"probe_every": 0}, "probes"),
+            ([{"name": "a"}, {"name": "b", "nvfp4_backward": "fp8"}], {}, "nvfp4_backward"),
             ([{"name": "a"}, {"name": "b"}], {"resume_state": "x"}, "starts fresh"),
             ([{"name": "a"}, {"name": "b"}, {"name": "c"}], {"steps": 15}, "at least 20 steps")):
         with pytest.raises(ValueError, match=msg):
@@ -399,3 +400,17 @@ def test_trainer_reads_the_drop_request(tmp_path):
     assert drops(fake, 130, [], []) is True  # the one training now: b takes over, and as the last one it wins
     assert variants[0].state["step"] == 130 and fake.race.active is variants[1]
     assert ("activate", "b") in calls and ("finish", "b") in calls and sched.done
+
+
+def test_a_configuration_sets_the_quantized_backward_it_races():
+    import types
+
+    from rulztrainer import quant as Q
+
+    w = torch.randn(32, 64)
+    model = torch.nn.Sequential(Q.QuantLinear(Q.quantize_weight(w, "int8"), None), torch.nn.Linear(4, 4))
+    race_cfg([{"name": "a"}, {"name": "b", "int8_backward": "int8", "nvfp4_backward": "fp4"}]).validate()
+    for back in ("int8", "bf16"):
+        R.configure_backward(types.SimpleNamespace(int8_matmul=True, int8_backward=back, nvfp4_matmul=True,
+                                                          nvfp4_backward="fp4"), [model])
+        assert model[0].int8_backward == back
