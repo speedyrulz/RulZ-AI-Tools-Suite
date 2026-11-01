@@ -23,7 +23,7 @@ from pathlib import Path
 from nicegui import app, run, ui
 
 from rulztrainer.archs import get_arch
-from rulztrainer.config import (ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
+from rulztrainer.config import (AUTOMAGIC, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
                                 MODEL_PRESETS,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
 from rulztrainer import bodysim, facesim, history, lookfilter
@@ -1233,6 +1233,8 @@ class Form:
             automagic_min_lr=float(v("automagic_min_lr")), automagic_max_lr=float(v("automagic_max_lr")),
             automagic_polarity_history=int(v("automagic_polarity_history")), automagic_groups=v("automagic_groups"),
             automagic_clip_threshold=float(v("automagic_clip_threshold")),
+            automagic_sensitivity_quantile=float(v("automagic_sensitivity_quantile")), automagic_vote=v("automagic_vote"),
+            automagic_max_lr_change=float(v("automagic_max_lr_change")),
             timestep_shift=float(v("timestep_shift")), sigmoid_scale=float(v("sigmoid_scale")),
             logsnr_mean=float(v("logsnr_mean")), logsnr_std=float(v("logsnr_std")),
             block_swap=int(v("block_swap") or 0),
@@ -2808,6 +2810,10 @@ RUN_MODES = {
 RACE_LABELS = {
     "learning_rate": "Learning rate", "optimizer": "Optimizer", "weight_decay": "Weight decay",
     "lr_scheduler": "Learning rate schedule", "warmup_steps": "Warm-up steps", "lora_plus_ratio": "LoRA+ ratio",
+    "automagic_min_lr": "Automagic min lr", "automagic_max_lr": "Automagic max lr",
+    "automagic_polarity_history": "Automagic polarity history", "automagic_clip_threshold": "Automagic clip threshold",
+    "automagic_groups": "Automagic lr groups", "automagic_sensitivity_quantile": "Automagic sensitivity quantile",
+    "automagic_vote": "Automagic vote", "automagic_max_lr_change": "Automagic max lr change",
     "lora_ema": "Weight average", "timestep_sampling": "Timestep sampling", "loss_weighting": "Loss weighting",
     "region_weights": "Region-weighted loss", "face_loss_weight": "Face loss weight",
     "body_loss_weight": "Body loss weight", "background_loss_weight": "Background loss weight",
@@ -3109,7 +3115,7 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
         r["optimizer"] = ("adafactor", "Fizgig's measured optimizer for a fine-tune: a much smaller state than AdamW")
     else:
         r["optimizer"] = ("adamw8bit", "AdamW with 8-bit state: the same results as adamw with less memory")
-        if cfg.optimizer != "automagic3":  # it sets its own rate per layer type
+        if cfg.optimizer not in AUTOMAGIC:  # it sets its own rate per layer type
             r["learning_rate"] = (1e-4, "the usual LoRA learning rate; go lower (5e-5) if samples look burnt or noisy")
             if qwen and cfg.network_type == "lora":
                 r["learning_rate"] = ((1.5e-4, "Fizgig's Qwen-Image 2.1 style preset (rank 16)") if goal == "style" else
@@ -4029,8 +4035,11 @@ class Wizard:
         with self.setting("optimizer", "Optimizer",
                           "adamw8bit is AdamW with its state stored in 8 bits: the default choice. adamw keeps full "
                           "precision state (same results, more memory). adafactor is a lighter alternative. "
-                          "automagic3 tunes its own learning rate per weight."):
-            self.bind(ui.select(["adamw", "adamw8bit", "adafactor", "automagic3"], label="Optimizer"), "optimizer") \
+                          "automagic3 tunes its own learning rate from the weights' update directions. automagic4 "
+                          "adds a smaller step for the most sensitive weights (timestep embedders, modulation, "
+                          "attention values) and a controller whose rate holds on noise, climbs on a trend and "
+                          "comes down when it overshoots (ai-toolkit's v4 ran away; fixed here)."):
+            self.bind(ui.select(list(OPTIMIZERS), label="Optimizer"), "optimizer") \
                 .classes("w-full")
         with self.setting("network_type", "Adapter",
                           "LoRA: a rank-r pair of small matrices per layer. LoKr: a Kronecker pair, about 1/64 of the "
@@ -5643,7 +5652,7 @@ def build_page(local: bool = True):
                             w["lora_plus_ratio"] = ui.number("LoRA+ ratio (0 = off, 16 = paper)",
                                                              value=d.lora_plus_ratio, step=1).classes("w-60") \
                                 .bind_visibility_from(w["network_type"], "value", lambda x: x == "lora") \
-                                .tooltip("lora_up learns at lr x ratio (faster convergence); ignored by automagic3")
+                                .tooltip("lora_up learns at lr x ratio (faster convergence); ignored by automagic3/4")
                             w["lora_save_dtype"] = ui.select(["bf16", "fp16", "fp32"], value=d.lora_save_dtype,
                                                              label="Save LoRA as").classes("w-36")
                         with fields():
@@ -5758,15 +5767,17 @@ def build_page(local: bool = True):
                             w["batch_size"] = ui.number("Batch size", value=d.batch_size, precision=0).classes("w-28")
                             w["learning_rate"] = ui.number("Learning rate", value=d.learning_rate, format="%.2e",
                                                            step=1e-5).classes("w-36")
-                            w["optimizer"] = ui.select(["adamw", "adamw8bit", "adafactor", "automagic3"],
-                                                       value="adamw8bit", label="Optimizer").classes("w-40")
+                            w["optimizer"] = ui.select(list(OPTIMIZERS), value="adamw8bit", label="Optimizer") \
+                                .classes("w-40")
                             w["lr_scheduler"] = ui.select(["constant", "cosine", "linear"], value=d.lr_scheduler,
                                                           label="LR schedule").classes("w-36")
                             w["warmup_steps"] = ui.number("Warmup steps", value=d.warmup_steps, precision=0) \
                                 .classes("w-32")
                         with ui.column().classes("w-full gap-2").bind_visibility_from(
-                                w["optimizer"], "value", lambda x: x == "automagic3"):
-                            hint("Automagic v3 tunes its own learning rate; LR schedule and warmup are ignored.")
+                                w["optimizer"], "value", lambda x: x in AUTOMAGIC):
+                            hint("Automagic tunes its own learning rate (the learning rate above is its start); LR "
+                                 "schedule and warmup are ignored. Automagic 4 also caps the step of the most "
+                                 "sensitive weights and its rate holds on noise instead of drifting up.")
                             with fields():
                                 w["automagic_min_lr"] = ui.number("Min lr", value=d.automagic_min_lr, format="%.1e") \
                                     .classes("w-32")
@@ -5786,6 +5797,28 @@ def build_page(local: bool = True):
                                              "and the rest each adapt their own learning rate, so a small, slower "
                                              "group is not outvoted by the large ones. Fizgig trains Krea 2 this way, "
                                              "with a polarity history of 16.")
+                            with fields().bind_visibility_from(w["optimizer"], "value", lambda x: x == "automagic4"):
+                                w["automagic_sensitivity_quantile"] = ui.number("Sensitivity quantile",
+                                                                                value=d.automagic_sensitivity_quantile,
+                                                                                min=0.05, max=1, step=0.05) \
+                                    .classes("w-40") \
+                                    .tooltip("Weights whose gradient power is above this share of the LoRA's elements "
+                                             "take a smaller, Newton-like step (0.9: the top 10%, on Krea 2 the "
+                                             "attention values and keys of the early blocks and the timestep path).")
+                                w["automagic_vote"] = ui.select({"graded": "graded (trend minus flips)",
+                                                                 "extremes": "extremes (Automagic 3's rule)"},
+                                                                value=d.automagic_vote, label="Vote").classes("w-56") \
+                                    .tooltip("How the weights vote on the learning rate. graded: the mean update sign "
+                                             "squared minus the sign-flip rate, zero on noise, up on a trend, down on "
+                                             "overshoot (holds the rate on a noisy diffusion loss, climbs while there "
+                                             "is signal, anneals after). extremes: only unanimous windows vote up and "
+                                             "perfectly alternating ones down, as in Automagic 3.")
+                                w["automagic_max_lr_change"] = ui.number("Max lr change / step",
+                                                                         value=d.automagic_max_lr_change, min=0.001,
+                                                                         max=1, step=0.01).classes("w-40") \
+                                    .tooltip("The most the learning rate may move in one step (0.05 = about 5%); the "
+                                             "signs that judge a step only arrive over the next polarity-history "
+                                             "steps, so this bounds how far the rate can overshoot meanwhile.")
                         with advanced("Timesteps, loss weighting and gradients"):
                             with fields():
                                 w["gradient_accumulation"] = ui.number("Grad accumulation",
@@ -6210,7 +6243,7 @@ def build_page(local: bool = True):
                              "classes it as easy / healthy / suspect / stuck / exhausted. Per-image LR then throttles "
                              "stuck images (x0.5, x0.25, x0.125), eases exhausted ones (x0.6) and can exclude images "
                              "that stay stuck. A true per-image learning rate needs batch size 1 (otherwise per-sample "
-                             "loss weights). Not available with automagic3.")
+                             "loss weights). Not available with automagic3 or automagic4.")
                         with fields():
                             w["loss_watch"] = ui.switch("Loss watch (observe)", value=d.loss_watch)
                             w["per_image_lr"] = ui.switch("Per-image learning rate (act on verdicts)",
@@ -7471,6 +7504,19 @@ The trained LoRA is copied onto it before each sampling pass; the training model
 ## Turbo LoRA
 An optional ComfyUI-format LoRA (for example an 8-step distill) applied only while generating sample images,
 never during the training step. Set *Sample steps* to match it.
+
+## Optimizers
+`adamw8bit` is the default (AdamW with 8-bit state); `adamw` keeps full-precision state and `adafactor` a smaller
+one (the fine-tune choice). `automagic3` and `automagic4` tune the learning rate themselves from the weights' update
+directions (the rate you set is the start; schedule, warm-up, LoRA+ and the per-image rate do not apply; *Automagic
+lr groups* `by_type` gives the text-side, attention, feed-forward and other layers their own rate). Automagic 4 also
+takes a smaller step for the most sensitive weights (*Sensitivity quantile*) and its rate holds on a noisy loss
+instead of drifting up: ai-toolkit's v4 raised the rate 1.6% a step on gradient noise (doubling every 44 to 100
+steps) until the LoRA turned to noise, which this port fixes (*Vote* graded, *Max lr change* 5% a step). On a real
+Krea 2 LoRA upstream's rate ran from 1e-4 into the 1e-3 ceiling by step 100 and stayed there; this port's peaked at
+6e-4 and eased back to 3e-4 by step 160. On a rank-16 LoRA its step is as fast as adamw8bit's (about 3x slower at
+rank 64, 6x on a full fine-tune; Automagic 3's is about 10x slower than Automagic 4's) and its state is 1 byte per weight at the default *Polarity history* 8; which optimizer reaches likeness first is not
+measured yet, so race them.
 
 ## Adapters: LoRA, LoKr, OFT and DoRA
 The *Adapter* field (Train tab, LoRA section) picks what each layer learns. **LoRA**: a rank-r pair. **LoKr**: a
