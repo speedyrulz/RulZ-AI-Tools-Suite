@@ -5600,8 +5600,9 @@ def build_page(local: bool = True):
                                 w["compile_cache"] = ui.input("Compile cache", value=d.compile_cache) \
                                     .classes("w-72").tooltip(
                                         "Keeps the compiled kernels in a file so another machine with the same GPU "
-                                        "model, torch and triton skips most of the warm-up (a fresh vast.ai rental: "
-                                        "put the file in your model bucket's .rulz_compile folder). auto: "
+                                        "model, torch, triton, Python and operating system skips most of the "
+                                        "compiling (a fresh vast.ai rental: put a file a rental made, its name ends "
+                                        "in -linux.bin, in your model bucket's .rulz_compile folder). auto: "
                                         "<models folder>/.rulz_compile; a folder; or off.")
                             with fields():
                                 w["int8_matmul"] = ui.select({True: "W8A8 int8 matmul (fast)",
@@ -7974,8 +7975,10 @@ same step time. It needs gradient checkpointing and turns torch.compile off.
 into fewer GPU kernels. Measured at 1 MP on an RTX 5060 Ti: MOSS-Image 26% and Krea 2 12% faster per step, after a
 warm-up of under a minute. auto compiles runs of 100 steps or more (triton is installed with the requirements).
 *Compile cache* (next to it; default auto): the compiled kernels are also saved to one file in
-`models/.rulz_compile`, so a new machine with the same GPU model, torch and triton skips most of the warm-up (82 -> 32 s
-measured on Qwen-Image 2.1). On vast.ai, upload the file to your model bucket's `.rulz_compile` folder.
+`models/.rulz_compile`, so a new machine with the same GPU model, torch, triton, Python and operating system skips
+most of the compiling (Qwen-Image 2.1, to step 5: 82 -> 32 s on Windows, 52-58 -> 30-37 s on Linux). On vast.ai,
+upload a file a rental made (its name ends in -linux.bin) to your model bucket's `.rulz_compile` folder; one from a
+Windows PC does not help there.
 
 ## Weight average
 *Weight average decay* (Saving & samples, default 0.98, 0 = off): checkpoints, samples and likeness probes use a
