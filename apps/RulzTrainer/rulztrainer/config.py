@@ -557,6 +557,18 @@ class TrainConfig:
             return "ideogram4"
         return "fibo2" if "fibo" in hint else "krea2" if "krea" in hint else "moss_image"
 
+    def samples_on_distilled_model(self) -> bool:
+        """The model that renders samples and probes is a distilled checkpoint: sample_model_path, else the trained
+        model (its file when it has one), by the family's naming rule (Arch.distilled_sample_model: a "turbo" name such
+        as Krea-2-Turbo or Qwen-Image-2.1-Turbo; Klein without "base"). A turbo LoRA on top would distil it twice."""
+        from .archs import get_arch
+
+        if self.sample_model_path:
+            name = self.sample_model_path
+        else:
+            name = self.transformer_file if self.model_source == "files" and self.transformer_file else self.model_path
+        return get_arch(self).distilled_sample_model(name or "")
+
     def resolved_lora_targets(self) -> list[str]:
         """lora_targets, or the model family's default groups when it is empty."""
         return list(self.lora_targets) or list(ARCH_DEFAULT_TARGETS[self.arch_name()])

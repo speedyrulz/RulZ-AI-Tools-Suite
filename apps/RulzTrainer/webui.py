@@ -3237,6 +3237,9 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
         r["sample_steps"] = (50, "BFL samples Klein Base at 50 steps (about 2.5 min per 1 MP preview on a 16 GB card; "
                                  "the distilled Klein as the sampling model takes 16 steps)")
         r["sample_cfg"] = (3.5, "BFL's guidance 3.5 for Klein Base (the same convention here)")
+    elif cfg.samples_on_distilled_model() and fam in ARCH_TURBO:
+        r["sample_steps"] = (ARCH_TURBO[fam]["steps"], "what the model's Turbo checkpoint is distilled for")
+        r["sample_cfg"] = (1.0, "Turbo samples without guidance")
     elif cfg.turbo_lora == "auto" and fam in ARCH_TURBO:
         t = ARCH_TURBO[fam]
         r["sample_steps"] = (t["steps"], f"what {Path(t['file']).name}, the model's turbo LoRA, is made for")
@@ -3261,8 +3264,8 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
         r["sample_cfg"] = (3.0, "the reference MOSS-Image guidance scale")
     if character:
         r["probe_every"] = (25, "frequent quick checks give the best-checkpoint and early-stop decisions enough points")
-        if (cfg.turbo_lora and not (klein and cfg.turbo_lora == "auto")) or krea_turbo or klein_distilled:
-            r["probe_steps"] = (r["sample_steps"][0], "fast probes with the turbo model" if krea_turbo or klein_distilled
+        if (cfg.turbo_lora and not (klein and cfg.turbo_lora == "auto")) or cfg.samples_on_distilled_model():
+            r["probe_steps"] = (r["sample_steps"][0], "fast probes with the turbo model" if cfg.samples_on_distilled_model()
                                 else "fast probes with the turbo LoRA")
             r["probe_cfg"] = (1.0, "turbo models sample without guidance")
         else:
@@ -3292,8 +3295,8 @@ def extra_review_rows(cfg: TrainConfig) -> list[tuple[str, str]]:
     rows = [("Adapter", adapter),
             ("Memory", f"gradient checkpointing {'on' if cfg.gradient_checkpointing else 'off'}; "
                        + (f"block swap {cfg.block_swap} blocks" if cfg.block_swap else "no block swap"))]
-    if cfg.sample_model_path and "turbo" in cfg.sample_model_path.lower():
-        turbo = ", on the Turbo sampling model"
+    if cfg.samples_on_distilled_model():
+        turbo = ", on the Turbo model (no turbo LoRA on top)" if cfg.turbo_lora in ("", "auto") else             ", your turbo LoRA on the Turbo model (distils it twice)"
     elif cfg.turbo_lora == "auto" and cfg.arch_name() in ARCH_TURBO:
         turbo = ", with the model's turbo LoRA"
     elif cfg.turbo_lora and cfg.turbo_lora != "auto":
@@ -3424,7 +3427,7 @@ def review_issues(cfg: TrainConfig, goal: str | None, data: dict | None, n_gpus:
             out.append(("info", "This focus scores the face, but there are no face references: the face probe goes "
                                 "unscored (Dataset step)."))
         elif (cfg.probe_every > 0 and cfg.probe_steps <= 10
-              and not (cfg.turbo_lora or "turbo" in (cfg.sample_model_path or "").lower())):
+              and not (cfg.turbo_lora or cfg.samples_on_distilled_model())):
             out.append(("warning", f"Probes render in {cfg.probe_steps} steps without a turbo LoRA, so they come out "
                                    "unfinished and their likeness scores mean little. Set a turbo LoRA or raise the "
                                    "probe steps (Samples step)."))

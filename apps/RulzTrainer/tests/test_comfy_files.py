@@ -50,6 +50,27 @@ def test_planned_downloads_per_model_and_quant():
         CF.planned_downloads(TrainConfig(model_path="someone/other-moss-finetune"))
 
 
+def test_auto_turbo_lora_is_none_on_a_turbo_model():
+    """A Turbo (distilled) checkpoint renders the samples: turbo_lora auto adds no Raw-to-Turbo LoRA on top of it."""
+    for c in (TrainConfig(model_path="krea/Krea-2-Turbo"), TrainConfig(model_path="Qwen/Qwen-Image-2.1-Turbo"),
+              TrainConfig(model_path="krea/Krea-2-Raw", transformer_file="x/krea2_turbo_nvfp4.safetensors"),
+              TrainConfig(model_path="krea/Krea-2-Raw", sample_model_path="krea/Krea-2-Turbo")):
+        assert c.samples_on_distilled_model()
+        assert "turbo_lora" not in [f for f, _, _ in CF.planned_downloads(c)]
+    raw = TrainConfig(model_path="krea/Krea-2-Raw")
+    assert not raw.samples_on_distilled_model()
+    assert "turbo_lora" in [f for f, _, _ in CF.planned_downloads(raw)]
+    # a Raw sampling model renders a Turbo-trained LoRA on Raw: the turbo LoRA comes back
+    assert not TrainConfig(model_path="krea/Krea-2-Turbo", sample_model_path="krea/Krea-2-Raw").samples_on_distilled_model()
+    # FLUX 3 Klein names its distilled model without "base" (the family's own rule)
+    klein = "black-forest-labs/flux-3-image-klein-base"
+    assert not TrainConfig(model_arch="flux3_klein", model_path=klein).samples_on_distilled_model()
+    assert TrainConfig(model_arch="flux3_klein", model_path=klein,
+                       sample_model_path="black-forest-labs/flux-3-image-klein").samples_on_distilled_model()
+    # the HF source names the model by its repo id
+    assert TrainConfig(model_source="hf", model_path="krea/Krea-2-Turbo").samples_on_distilled_model()
+
+
 def test_resolve_downloads_sets_the_fields(monkeypatch, tmp_path):
     got = []
 
