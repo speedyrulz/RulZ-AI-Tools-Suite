@@ -96,15 +96,19 @@ def test_apply_lr_ratio_adamw_with_scheduler_and_automagic():
     opt.step()
     sch.step()
     assert abs(current_lr(opt, sch) - 1.5e-4) < 1e-12  # survives the scheduler step
-    cfg2 = TrainConfig(optimizer="automagic3", learning_rate=1e-4)
-    p2 = torch.nn.Parameter(torch.zeros(4, 4))
-    opt2 = build_optimizer(cfg2, [p2])
-    sch2 = build_scheduler(cfg2, opt2)
-    p2.grad = torch.randn_like(p2)
-    opt2.step()
-    before = current_lr(opt2, sch2)
-    L.apply_lr_ratio(opt2, sch2, 0.5)
-    assert abs(current_lr(opt2, sch2) - before * 0.5) < 1e-9
+    for name in ("automagic3", "automagic4"):
+        cfg2 = TrainConfig(optimizer=name, learning_rate=1e-4)
+        p2 = torch.nn.Parameter(torch.zeros(4, 4))
+        opt2 = build_optimizer(cfg2, [p2])
+        sch2 = build_scheduler(cfg2, opt2)
+        p2.grad = torch.randn_like(p2)
+        opt2.step()
+        before = current_lr(opt2, sch2)
+        L.apply_lr_ratio(opt2, sch2, 0.5)
+        assert abs(current_lr(opt2, sch2) - before * 0.5) < 1e-9
+        p2.grad = torch.randn_like(p2)
+        opt2.step()  # the factor survives the next step (nothing re-seeds the lr from the config)
+        assert abs(current_lr(opt2, sch2) - before * 0.5) < 1e-9
 
 
 def test_batcher_weights_and_curriculum(tmp_path):

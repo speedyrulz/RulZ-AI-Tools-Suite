@@ -90,7 +90,7 @@ def test_a_fine_tune_lokr_and_automagic_change_the_training_recommendations(tmp_
     assert "lora_rank" not in ft and "lora_alpha" not in ft and "network_type" not in ft
     lokr = rec(network_type="lokr")
     assert lokr["lokr_factor"][0] == 8 and "lora_rank" not in lokr
-    assert "learning_rate" not in rec(optimizer="automagic3")
+    assert "learning_rate" not in rec(optimizer="automagic3") and "learning_rate" not in rec(optimizer="automagic4")
     assert rec(block_swap=4)["multi_gpu"][0] == "off"
 
 
