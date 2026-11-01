@@ -520,6 +520,11 @@ class TrainConfig:
     # a best checkpoint (overall, face, body) is replaced by any higher smoothed score, not only one that beats it by
     # the noise band; whether the run still improves (early stop, step-up) still needs the band
     likeness_best_any_rise: bool = False
+    # a second, held-out face recognizer on the probes (likeness.py): auto = FaceNet whenever the run trains against
+    # ArcFace (reward_steps, id_loss_backend arcface, id_align), off, or facenet (always). Nothing ever trains on it,
+    # so with face_gold_select it, not ArcFace, picks the best checkpoint, stops early and ranks a race
+    face_gold: str = "auto"
+    face_gold_select: bool = True
     likeness_patience: int = 0  # stop after N probes without improvement; 0 = never
     likeness_lr_control: bool = False  # bounded lr multiplier driven by the probe trend
     likeness_lr_min: float = 0.5
@@ -604,6 +609,25 @@ class TrainConfig:
         else:
             name = self.transformer_file if self.model_source == "files" and self.transformer_file else self.model_path
         return get_arch(self).distilled_sample_model(name or "")
+
+    def trains_on_arcface(self) -> bool:
+        """Something optimizes the probes' own ArcFace: the reward stage, the identity loss on its arcface backend, or
+        identity alignment (it pulls the face tokens toward the photos' ArcFace embeddings)."""
+        return bool(self.reward_steps > 0 or self.id_align
+                    or (self.id_loss_weight > 0 and self.id_loss_backend == "arcface"))
+
+    def trains_on_facenet(self) -> bool:
+        return bool(self.id_loss_weight > 0 and self.id_loss_backend == "facenet")
+
+    def gold_backend(self) -> str:
+        """The held-out face recognizer the probes add ("" = none): face_gold facenet always; auto when the run trains
+        against ArcFace and not against FaceNet, and for the noise check (it measures both recognizers)."""
+        mode = str(self.face_gold or "auto").lower()
+        if mode == "facenet":
+            return "facenet"
+        if mode == "auto" and (self.trains_on_arcface() or self.noise_files) and not self.trains_on_facenet():
+            return "facenet"
+        return ""
 
     def resolved_lora_targets(self) -> list[str]:
         """lora_targets, or the model family's default groups when it is empty."""
@@ -722,6 +746,11 @@ class TrainConfig:
             raise ValueError(f"id_loss_backend must be arcface or facenet, got {self.id_loss_backend!r}")
         if self.id_loss_every < 1:
             raise ValueError("id_loss_every must be at least 1")
+        if str(self.face_gold).lower() not in ("auto", "off", "facenet"):
+            raise ValueError(f"face_gold must be auto, off or facenet, got {self.face_gold!r}")
+        if str(self.face_gold).lower() == "facenet" and self.trains_on_facenet():
+            raise ValueError("face_gold facenet: the identity loss trains on FaceNet (id_loss_backend facenet), so it "
+                             "is no held-out judge; use face_gold off or id_loss_backend arcface")
         if not 0.0 <= self.lora_ema < 1.0:
             raise ValueError(f"lora_ema must be 0 (off) or a decay below 1, got {self.lora_ema!r}")
         if self.dp_balance not in ("off", "auto", "grow"):
