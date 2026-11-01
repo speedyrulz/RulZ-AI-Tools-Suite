@@ -318,6 +318,9 @@ Text caching is only split when it pays: the first few prompts are timed on the 
 is loaded only if it saves more time than loading it takes (about 13 s for the int8 Qwen3.5-9B). Images rendered on
 different GPU models differ very slightly in their pixels (different kernels); the same seed gives the same picture.
 
+With `multi_gpu: off` the second GPU can render the likeness probes while training goes on instead: see
+[Probes on a second GPU](#probes-on-a-second-gpu-probe_async).
+
 ## Model sources and quantization
 
 **Single safetensors files (the default, `model_source: files`)**: the model you pick comes as ComfyUI files from
@@ -1131,6 +1134,37 @@ VGGFace2; the identity loss's `facenet` backend, downloaded once to `models/face
 
 Whether FaceNet agrees with people better than ArcFace on LoRA renders is not measured; it is there because it is
 independent of what the run optimizes.
+
+## Probes on a second GPU (`probe_async`)
+
+With one GPU training and the other idle (`multi_gpu: off`, which block swap also implies), `probe_async: true` starts
+a second Python process that loads a copy of the sampling model (`sample_model_path`, else the training base, with the
+same LoRA slots, the turbo/sampling LoRAs and a VAE) on the other GPU (`probe_device`, default: the first of `devices`
+that is not the training GPU). Before each probe the trainer sends it the LoRA's weights (the `lora_ema` average if
+on; a few MB) and keeps training; the probe is scored and acted on when it comes back, at most `probe_every` steps
+later. One probe renders at a time: if the next is due before the last is in, training waits for it.
+
+- **Decisions land late.** Best checkpoint, early stop, lr control, face bias and curriculum act when the probe is
+  scored. A best checkpoint still saves exactly the weights that were scored, not training's newer ones. The log shows
+  "(121.4s on cuda:0, in at step 142)".
+- **The step-0 baseline** renders on the probe GPU while training starts (its model loads there in the meantime);
+  **the final probe** renders on the training GPU, which is idle by then and usually the faster card.
+- **A separate process, not a thread**: in one process the training loop and the renders take turns at Python's
+  interpreter lock, which made training 8–35% slower than ordinary probes in tests.
+- **Not used** in a configuration race, a fine-tune or with `multi_gpu` other than `off` (the reason is logged). If the
+  probe process fails (e.g. out of memory), probes go back to the training GPU with a warning; its log is
+  `probe_worker.log` in the job folder.
+
+Measured on Qwen 2.1 int8 at 0.5 MP, training on an RTX 5060 Ti, probes on an RTX 4060 Ti (which renders them about
+1.8x slower), from start to finish:
+
+| probes | ordinary | `probe_async` |
+|---|---|---|
+| 1 seed, 512 px, every 20 steps, 100 steps | 307 s | 276 s (-10%) |
+| 3 seeds, 1024 px, every 80 steps, 320 steps | 991 s | 749 s (-24%) |
+
+It saves the most when one probe on the second GPU finishes in less time than `probe_every` training steps take; with
+3 seeds at 1024 px every 20 steps it was 28% slower (training waited for each probe). Off by default.
 
 ## Copy check (`copy_check`)
 

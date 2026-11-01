@@ -399,6 +399,7 @@ class Trainer(RaceParallelMixin):
         self.resumed_dp_counts = None  # its split from a resumed training state
         self.race = None  # race.RaceRun while a configuration race runs (and after, for its report)
         self.last_probe = None  # (face, body, images, per-seed scores) of the last probe
+        self.probe_worker = None  # probeworker.ProbeProcess: probes render on a second GPU (probe_async)
         self.race_base = None  # the run's own config when racing (the configurations change parts of it)
         self.race_rows = None  # [(name, config, overrides)] of the race
         self.race_layouts = None  # [(blocks, LoRA module names)] per configuration
@@ -751,6 +752,8 @@ class Trainer(RaceParallelMixin):
             self.status.update(stage="error", error=f"{type(e).__name__}: {e}", done=True)
             self._save_history("error")
             raise
+        finally:
+            self._close_probe_worker()
 
     def _run(self):
         cfg = self.cfg
@@ -1000,9 +1003,12 @@ class Trainer(RaceParallelMixin):
         if cfg.noise_files:  # the probes' own noise, measured on finished LoRAs instead of training
             self._noise_stage(model)
             return
+        self._setup_probe_worker()
         if cfg.sample_prompts and cfg.sample_before_training and step == 0:
             self.sample_images(model, step)
-        if self.controller is not None and cfg.probe_at_start and step == 0:
+        if self.controller is not None and cfg.probe_at_start and step == 0 and self.probe_worker is not None:
+            self._probe_async_start(step, injected)  # the baseline renders on the probe GPU while training starts
+        elif self.controller is not None and cfg.probe_at_start and step == 0:
             self.run_probe(model, step, optimizer, scheduler, injected)
             if self.race is not None:  # every configuration starts from the same base model: one baseline for all
                 for v in self.race.variants[1:]:
@@ -1306,20 +1312,32 @@ class Trainer(RaceParallelMixin):
             racing = self._race_running()
             final_too = self.race is not None and self.race.schedule.keeps_all  # scored at the end like the others
             last = step >= cfg.steps and not racing  # the final LoRA's own score, whatever probe_every
+            rounds = self._selftrain_rounds(cfg)
+            # probe_async: act on a probe the probe GPU has finished (a self-training round waits for it: its bar is
+            # the latest score)
+            stop = self.probe_worker is not None and self._probe_async_take(step, optimizer, scheduler,
+                                                                             wait=step in rounds)
             if self.controller is not None and (step % cfg.probe_every == 0 and (step < cfg.steps or racing
                                                                                   or final_too) or last):
-                stop = self.run_probe(model, step, optimizer, scheduler, injected)
-                model.train()
+                if self.probe_worker is not None and not last:
+                    stop = self._probe_async_take(step, optimizer, scheduler, wait=True) or stop
+                if self.probe_worker is not None and not last:  # queued on the probe GPU; training goes on
+                    if not stop:
+                        self._probe_async_start(step, injected)
+                        if step in rounds:
+                            stop = self._probe_async_take(step, optimizer, scheduler, wait=True)
+                else:  # (also when the probe process failed: from then on probes render here)
+                    stop = self.run_probe(model, step, optimizer, scheduler, injected)
+                    model.train()
                 if racing:  # the race decides who goes on: record, maybe drop, and switch configuration
                     stop = False
                     self.race.active.state.update(step=step, losses=losses, id_losses=id_losses)
                     bind(self._race_after_probe())
-                if stop and not last:
-                    log.info("Likeness controller: no improvement for %d probes%s, stopping at step %d",
-                             cfg.step_up_stop_patience if cfg.resolution_step_up else cfg.likeness_patience,
-                             " at the highest resolution" if cfg.resolution_step_up else "", step)
-                    break
-            rounds = self._selftrain_rounds(cfg)
+            if stop and not last:
+                log.info("Likeness controller: no improvement for %d probes%s, stopping at step %d",
+                         cfg.step_up_stop_patience if cfg.resolution_step_up else cfg.likeness_patience,
+                         " at the highest resolution" if cfg.resolution_step_up else "", step)
+                break
             if step in rounds:  # in a race, the configuration training now: its own setting and its own steps
                 self._self_train_round(model, step, rounds.index(step) + 1)
                 model.train()
@@ -1329,6 +1347,8 @@ class Trainer(RaceParallelMixin):
             if self.stop_file.exists():
                 log.info("Stop requested at step %d", step)
                 break
+        if self.probe_worker is not None:  # a probe still rendering when training stopped: its score still counts
+            self._probe_async_take(step, optimizer, scheduler, wait=True)
         if self.compiled:
             compiling.report("end of training")
         if self._race_running():
@@ -3433,13 +3453,26 @@ class Trainer(RaceParallelMixin):
         """Render and score one probe: (face, body, images, seeds), face / body the mean raw score over the seeds that
         were scored, seeds each seed's own ({"face": [...], "body": [...]}, seed order, None = no face / body found;
         "gold" too with the held-out recognizer). n_seeds overrides probe_seeds (the noise check)."""
-        from .likeness import probe_body_size, probe_seed_count
-
-        cfg = self.cfg
         for sl in slots:
             sl.model.eval()
             lora_mod.set_extras_enabled(sl.model, True)
-        neg_e, neg_m = self.arch.pad_embeds([load_text_embeds(cfg, self.negative_prompt())])
+        neg_e, neg_m = self.arch.pad_embeds([load_text_embeds(self.cfg, self.negative_prompt())])
+        jobs = self._probe_jobs(step, tag, n_seeds, len(slots))
+        title = f"probes at step {step} on {len(slots)} GPUs" if len(slots) > 1 and len(jobs) > 1 else ""
+        board = _Board(self.status, title)
+        try:
+            images = self._render_round(slots, jobs, neg_e, neg_m, board)
+        finally:
+            for sl in slots:
+                lora_mod.set_extras_enabled(sl.model, False)
+        face, body, seeds = self._score_probe(jobs, images, step)
+        return face, body, images, seeds
+
+    def _probe_jobs(self, step: int, tag: str = "", n_seeds: int | None = None, n_slots: int = 1) -> list:
+        """The probe's RenderJobs: each enabled kind (face / body) with a scorer, one per seed."""
+        from .likeness import probe_body_size, probe_seed_count
+
+        cfg = self.cfg
         out_dir = self.job_dir / "probes"
         out_dir.mkdir(exist_ok=True)
         jobs = []
@@ -3455,15 +3488,12 @@ class Trainer(RaceParallelMixin):
             for k in range(n):
                 jobs.append(RenderJob(prompt, w, h, cfg.probe_steps, cfg.probe_cfg, cfg.probe_seed + k,
                                       out_dir / f"{self._image_prefix()}{tag or f'step{step:06d}'}_{kind}_{k}.png",
-                                      f"probe {kind} seed {k + 1}/{n} at step {step}" if len(slots) == 1
+                                      f"probe {kind} seed {k + 1}/{n} at step {step}" if n_slots == 1
                                       else f"probe {kind} seed {k + 1}/{n}", kind))
-        title = f"probes at step {step} on {len(slots)} GPUs" if len(slots) > 1 and len(jobs) > 1 else ""
-        board = _Board(self.status, title)
-        try:
-            images = self._render_round(slots, jobs, neg_e, neg_m, board)
-        finally:
-            for sl in slots:
-                lora_mod.set_extras_enabled(sl.model, False)
+        return jobs
+
+    def _score_probe(self, jobs: list, images: list[str], step: int):
+        """Score a probe's rendered images: (face, body, seeds) as _probe_with returns them."""
         seeds: dict[str, list] = {"face": [], "body": []}
         gold = self.face_scorer is not None and getattr(self.face_scorer, "gold", None) is not None
         if gold:
@@ -3481,23 +3511,44 @@ class Trainer(RaceParallelMixin):
         body_scores = [v for v in seeds["body"] if v is not None]
         face = sum(face_scores) / len(face_scores) if face_scores else None
         body = sum(body_scores) / len(body_scores) if body_scores else None
-        return face, body, images, seeds
+        return face, body, seeds
 
     def run_probe(self, model, step, optimizer, scheduler, injected) -> bool:
         """Render + score probes, update the controller, apply its actions. Returns True to stop training.
 
-        With a weight average the probes score it, so a best checkpoint is exactly the weights that were scored."""
+        With a weight average the probes score it, so a best checkpoint is exactly the weights that were scored.
+        With probe_async it renders here too (training waits for it anyway, and the training GPU is idle) while
+        the probe GPU finishes the probe it has, which is acted on first."""
+        if self.probe_worker is not None:
+            t0 = time.time()
+            self._free_for_rendering()
+            with self._averaged(replicas=True), lora_mod.frozen_adapters(),                     self._sampling_slots(model, step) as slots:
+                face, body, images, seeds = self._probe_with(slots, step)
+            took = f"{time.time() - t0:.1f}s"
+            stop = self.probe_worker is not None and self._probe_async_take(step, optimizer, scheduler, wait=True)
+            with self._averaged(replicas=True):
+                return self._probe_finish(step, face, body, images, seeds, took, optimizer, scheduler,
+                                          injected) or stop
         self._free_for_rendering()
         with self._averaged(replicas=True):
             return self._run_probe(model, step, optimizer, scheduler, injected)
 
     def _run_probe(self, model, step, optimizer, scheduler, injected) -> bool:
-        from .likeness import append_record, apply_lr_ratio, curriculum_weights, timestep_logit_shift
-
-        cfg = self.cfg
         t0 = time.time()
         with lora_mod.frozen_adapters(), self._sampling_slots(model, step) as slots:
             face, body, images, seeds = self._probe_with(slots, step)
+        return self._probe_finish(step, face, body, images, seeds, f"{time.time() - t0:.1f}s", optimizer, scheduler,
+                                  injected)
+
+    def _probe_finish(self, step, face, body, images, seeds, took: str, optimizer, scheduler, injected,
+                      now: int | None = None) -> bool:
+        """Act on a scored probe: the controller's update, its record and log line, best saves (from `injected`, the
+        weights that were scored) and actions. now: the training step it is acted on at (an async probe lands
+        later than the step it scored). Returns True to stop training."""
+        from .likeness import append_record, apply_lr_ratio, curriculum_weights, timestep_logit_shift
+
+        cfg = self.cfg
+        now = step if now is None else now
         self.last_probe = (face, body, images, seeds)
         rec, actions = self.controller.update(step, face, body, images, seeds)
         copy_note = self._copy_probe(rec, images)
@@ -3508,16 +3559,15 @@ class Trainer(RaceParallelMixin):
             log.info("Likeness scale: %s", self.controller.describe_scale())
         if self.controller.normalize:
             log.info("%sProbe step %d: face %s body %s (normalized %s / %s, combined %s) | ema face %s body %s "
-                     "(normalized %s / %s, combined %s) | best %s @%s | lr x%.2f | face bias %+.2f (%.1fs)", who, step,
+                     "(normalized %s / %s, combined %s) | best %s @%s | lr x%.2f | face bias %+.2f (%s)", who, step,
                      fmt(face), fmt(body), fmt(rec.face_norm), fmt(rec.body_norm), fmt(rec.combined),
                      fmt(rec.face_ema), fmt(rec.body_ema), fmt(rec.face_norm_ema), fmt(rec.body_norm_ema),
-                     fmt(rec.combined_ema), fmt(rec.best), rec.best_step, rec.lr_factor, rec.face_bias,
-                     time.time() - t0)
+                     fmt(rec.combined_ema), fmt(rec.best), rec.best_step, rec.lr_factor, rec.face_bias, took)
         else:
             log.info("%sProbe step %d: face %s body %s combined %s | ema face %s body %s combined %s | best %s @%s "
-                     "| lr x%.2f | face bias %+.2f (%.1fs)", who, step, fmt(face), fmt(body), fmt(rec.combined),
+                     "| lr x%.2f | face bias %+.2f (%s)", who, step, fmt(face), fmt(body), fmt(rec.combined),
                      fmt(rec.face_ema), fmt(rec.body_ema), fmt(rec.combined_ema), fmt(rec.best), rec.best_step,
-                     rec.lr_factor, rec.face_bias, time.time() - t0)
+                     rec.lr_factor, rec.face_bias, took)
         if self.controller.has_gold:
             arc, gold = rec.face_norm_ema if self.controller.normalize else rec.face_ema, rec.gold_norm_ema
             log.info("%sGold face (FaceNet) step %d: %s (normalized %s) | ema %s vs ArcFace %s%s%s", who, step,
@@ -3530,7 +3580,7 @@ class Trainer(RaceParallelMixin):
         if "step_up" in actions and step < cfg.steps:  # not at the end, nor in the reward stage
             log.info("Resolution step-up: stage %d stalled for %d probe(s) (stage best %s)", rec.stage + 1,
                      rec.stage_since_improve, fmt(rec.stage_best))
-            self._enter_stage(actions["step_up"], step)
+            self._enter_stage(actions["step_up"], now)
         if actions.get("save_best") and not self._race_keeps_best("", rec.best):
             actions["save_best"] = False  # a relay racer's best of its own, below the one already saved this round
         for kind in ("face", "body"):
@@ -3591,6 +3641,94 @@ class Trainer(RaceParallelMixin):
         self.status.update(probes=probes[-500:], likeness=self.controller.state(), stage="training")
         self._save_history()
         return bool(actions.get("stop"))
+
+    # ------------------------------------------------------------ probes on a second GPU (probe_async; probeworker.py)
+    def _probe_async_device(self) -> str:
+        """The GPU that renders the probes while training goes on, or "" (the reason logged) when probe_async cannot
+        run here."""
+        cfg = self.cfg
+        if not cfg.probe_async or self.controller is None or cfg.probe_every <= 0:
+            return ""
+        from .probeworker import pick_device
+
+        why = ("a race switches configurations at each probe" if self.race_rows is not None else
+               "a fine-tune has no LoRA to copy" if self.ft is not None else
+               f"multi_gpu {cfg.multi_gpu} uses both GPUs already" if cfg.multi_gpu != "off" else "")
+        dev = ""
+        if not why:
+            dev, why = pick_device(cfg.probe_device, cfg.devices, self.device,
+                                   torch.cuda.device_count() if torch.cuda.is_available() else 0)
+        if why:
+            log.info("Probes render on the training GPU between steps (probe_async not used: %s)", why)
+        return dev
+
+    def _setup_probe_worker(self) -> None:
+        """probe_async: start the probe process, which loads a copy of the sampling model (sample_model_path, else the
+        training base) with the same LoRA slots and the sampling LoRAs on the probe GPU."""
+        from .probeworker import ProbeProcess, ProbeProcessError
+
+        dev = self._probe_async_device()
+        if not dev:
+            return
+        self.status.update(stage=f"loading the probe model on {dev}")
+        t0 = time.time()
+        try:
+            w = ProbeProcess(self.cfg.to_dict(), self.model_dir, dev, self.job_dir / "probe_worker.log")
+        except ProbeProcessError as e:
+            log.warning("probe_async: the probe process on %s failed to start, so probes render on the training GPU "
+                        "between steps: %s", dev, str(e).strip().splitlines()[-1])
+            return
+        self.probe_worker = w
+        log.info("Probes render on %s in a separate process while training goes on (probe_async; started in %.0fs, "
+                 "its model loads while training starts): each probe is acted on once it is scored, up to "
+                 "probe_every steps later; the final one renders here", dev, time.time() - t0)
+
+    @torch.no_grad()
+    def _probe_async_start(self, step: int, injected) -> None:
+        """Send the LoRA (the weight average with lora_ema) to the probe process and queue its probe there."""
+        with self._averaged():
+            state = lora_mod.lora_state(injected)
+        self.probe_worker.submit(step, self._probe_jobs(step), state)
+        self.status.update(stage=f"training; probe of step {step} rendering on {self.probe_worker.device}")
+
+    def _probe_async_take(self, now: int, optimizer, scheduler, wait: bool = False) -> bool:
+        """Score and act on the probe the probe process has rendered, if any (wait: until it is in). True to stop.
+        Best saves write the weights that were scored (swapped in for the moment), not training's newer ones."""
+        from .probeworker import ProbeProcessError
+
+        w = self.probe_worker
+        if wait and w.pending is not None and not w.ready():
+            self.status.update(stage=f"waiting for the probe of step {w.pending.step} on {w.device}")
+        lost = w.pending.step if w.pending is not None else None
+        try:
+            got = w.take(wait)
+        except ProbeProcessError as e:
+            log.warning("probe_async: the probe process on %s failed (the probe of step %s is lost), so probes render "
+                        "on the training GPU from here: %s", w.device, lost, str(e).strip().splitlines()[-1])
+            self._close_probe_worker()
+            return False
+        if got is None:
+            return False
+        p, images = got
+        face, body, seeds = self._score_probe(p.jobs, images, p.step)
+        took = f"{time.time() - p.queued:.1f}s on {w.device}" + (f", in at step {now}" if now != p.step else "")
+        live = lora_mod.lora_state(self.injected)
+        lora_mod.mirror_lora(lora_mod.lora_snapshots(p.state), self.injected)
+        try:
+            return self._probe_finish(p.step, face, body, images, seeds, took, optimizer, scheduler, self.injected,
+                                      now=now)
+        finally:
+            lora_mod.mirror_lora(lora_mod.lora_snapshots(live), self.injected)
+
+    def _close_probe_worker(self) -> None:
+        """Stop the probe process (also after an error), freeing the probe GPU."""
+        w, self.probe_worker = self.probe_worker, None
+        if w is None:
+            return
+        if w.count:
+            log.info("probe_async: %d probes rendered on %s in %.0fs; training waited %.0fs for them", w.count,
+                     w.device, w.rendered, w.waited)
+        w.close()
 
     def _copy_probe(self, rec, images) -> str:
         """The probe's highest SSCD match among the training photos (copy_check), into its record; the log line
