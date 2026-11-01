@@ -130,8 +130,11 @@ QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; }
 QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
 
 QProgressDialog, QDialog, QMessageBox { background: %(bg)s; }
-QProgressBar { background: %(placeholder)s; border: none; border-radius: 3px; max-height: 6px; text-align: center; }
-QProgressBar::chunk { background: %(accent)s; border-radius: 3px; }
+QProgressBar {
+    background: %(placeholder)s; border: none; border-radius: 6px; min-height: 18px; max-height: 18px;
+    text-align: center; color: %(text)s; font-size: 11px; font-weight: 600;
+}
+QProgressBar::chunk { background: %(accent)s; border-radius: 6px; }
 QToolTip { background: %(card)s; color: %(text)s; border: 1px solid %(border)s; padding: 4px 8px; }
 
 QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox {
