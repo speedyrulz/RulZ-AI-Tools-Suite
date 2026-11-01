@@ -141,8 +141,8 @@ def port_to_diffusers(state: dict) -> dict:
 
 def original_to_port(state: dict, interleaved: bool, heads: int, head_dim: int) -> dict:
     """An original-layout state (Comfy-Org file or MiniMaxAI shards) -> the port's: prefixes stripped, MiniMaxAI's
-    interleaved qkv de-interleaved (bf16 only: a quantized interleaved file does not exist), rope.inv_freq dropped
-    (recomputed from the config)."""
+    interleaved qkv de-interleaved (bf16 only: a quantized interleaved file does not exist). rope.inv_freq is kept for
+    config_from_state (its length and base); the loader drops it (the port recomputes it)."""
     out = {}
     for k in list(state):
         v = state.pop(k)
@@ -150,7 +150,7 @@ def original_to_port(state: dict, interleaved: bool, heads: int, head_dim: int) 
             if k.startswith(p):
                 k = k[len(p):]
                 break
-        if k == "rope.inv_freq" or k.endswith("comfy_attention.config"):
+        if k.endswith("comfy_attention.config"):
             continue
         if interleaved and k.endswith(".attn.qkv_proj.weight"):
             if isinstance(v, Q.QuantWeight):
@@ -191,6 +191,12 @@ def config_from_state(state: dict) -> dict:
         cfg.update(timestep_input_dim=shape("time_embedder.proj_in.weight")[1],
                    time_embed_hidden_size=shape("time_embedder.proj_in.weight")[0],
                    time_embed_dim=shape("time_embedder.proj_out.weight")[0])
+    if "rope.inv_freq" in keys:  # theta^(-k / F): F from its length, theta from its second value (ComfyUI reads F)
+        freq = state["rope.inv_freq"]
+        cfg["rope_inv_freq_len"] = shape("rope.inv_freq")[0]
+        if freq.device.type != "meta" and cfg["rope_inv_freq_len"] > 1 and float(freq[1]) > 0:
+            theta = float(freq[1].double() ** -cfg["rope_inv_freq_len"])
+            cfg["rope_theta"] = float(round(theta)) if abs(theta - round(theta)) < 1e-4 * theta else theta
     return cfg
 
 

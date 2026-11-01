@@ -26,7 +26,7 @@ from .config import ARCH_DEFAULT_TARGETS, ARCH_FULL_SAMPLE, TrainConfig
 
 log = logging.getLogger("rulztrainer")
 
-ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21")
+ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21", "minimax_h3")
 
 
 def _match_suffix(name: str, suffixes: Iterable[str]) -> bool:
@@ -575,7 +575,130 @@ class QwenImage21Arch(Arch):
         return time_shift(calculate_shift(tokens), s).clamp(0.0, 1.0)
 
 
-_ARCHS = {"moss_image": MossArch, "fibo2": FiboArch, "krea2": Krea2Arch, "qwen_image21": QwenImage21Arch}
+class MiniMaxH3Arch(Arch):
+    """MiniMax H3, the 33B video + audio model, trained on stills as one-frame videos (rulztrainer.h3): a 16x VAE with
+    24 channels read unpatched [B, 24, H/16, W/16] on a 32 px grid (the model patchifies 2x2), its own latents."""
+    name = "minimax_h3"
+    label = "MiniMax H3"
+    modelspec = "minimax-h3"
+    # diffusion_model.<module>.lora_A/B without alpha (alpha = rank): what ai-toolkit and diffusion-pipe write for H3
+    # and musubi-tuner, ComfyUI's loader and diffusers' MiniMaxH3LoraLoaderMixin read
+    lora_format = "comfy_ab"
+    n_blocks = 50
+    # H3 fuses q / k / v into one attn.qkv_proj: q, k or v selects it whole (one LoRA on the fused layer, the layout
+    # every published H3 LoRA and training adapter uses); fc1 holds gate and value
+    GROUPS = {"q": ("attn.qkv_proj",), "k": ("attn.qkv_proj",), "v": ("attn.qkv_proj",), "o": ("attn.out_proj",),
+              "ffn_up_gate": ("mlp.fc1",), "ffn_down": ("mlp.fc2",)}
+    target_groups = {"q": "attention q/k/v (fused in one qkv_proj: any of q, k, v trains it whole)",
+                     "k": "attention q/k/v (fused: see q)", "v": "attention q/k/v (fused: see q)",
+                     "o": "attention out", "ffn_up_gate": "feed-forward fc1 (gate and value)",
+                     "ffn_down": "feed-forward fc2",
+                     "token_refiner": "the 2 token-refiner blocks over the text (musubi-tuner leaves them out)"}
+    default_targets = ARCH_DEFAULT_TARGETS["minimax_h3"]
+    text_prefixes = ("token_refiner.",)
+    supports_single_files = True  # Comfy-Org's diffusion models, Qwen3-VL-32B text encoders and VAEs
+    default_sample_steps, default_sample_cfg = ARCH_FULL_SAMPLE["minimax_h3"]
+    latent_tag = "_h3vae"
+    size_multiple = 32
+
+    def __init__(self):
+        from .h3 import loading
+
+        self._loading = loading
+
+    def resolve_for_config(self, cfg):
+        return self._loading.resolve_for_config(cfg)
+
+    def get_transformer(self, cfg, model_dir, device=None):
+        return self._loading.get_transformer(cfg, model_dir, device)
+
+    def get_vae(self, cfg, model_dir):
+        return self._loading.get_vae(cfg, model_dir)
+
+    def get_text_encoder(self, cfg, model_dir):
+        return self._loading.get_text_encoder(cfg, model_dir)
+
+    def load_any_transformer(self, path, device, quant="auto", models_dir="models"):
+        return self._loading.load_any_transformer(path, device, quant, models_dir)
+
+    def encode_prompt(self, text_encoder, tokenizer, prompt, max_length):
+        return self._loading.encode_prompt(text_encoder, tokenizer, prompt, max_length)
+
+    def pad_embeds(self, rows):
+        return self._loading.pad_embeds(rows)
+
+    def encode_images(self, vae, images):
+        return self._loading.encode_images(vae, images)
+
+    def decode_latents(self, vae, latents):
+        return self._loading.decode_latents(vae, latents)
+
+    def decode_latents_grad(self, vae, latents):
+        return self._loading.decode_latents_grad(vae, latents)
+
+    def grad_vae(self, vae):
+        return self._loading.grad_vae(vae)
+
+    def sample(self, model, pos_e, pos_m, neg_e, neg_m, **kw):
+        from .h3.sampler import sample
+
+        return sample(model, pos_e, pos_m, neg_e, neg_m, **kw)
+
+    def sample_sigmas(self, model, steps, height, width, shift):
+        from .h3.sampler import h3_sigmas
+
+        return h3_sigmas(steps, getattr(model, "shift_video", 12.0))
+
+    @staticmethod
+    def lora_module_name(name: str) -> str:
+        """musubi-tuner's flattened names (lora_unet_blocks_0_attn_qkv_proj, the prefix already stripped) -> ours."""
+        import re
+
+        for pat, rep in ((r"^blocks_(\d+)_attn_(qkv|out)_proj$", r"blocks.\1.attn.\2_proj"),
+                         (r"^blocks_(\d+)_mlp_fc([12])$", r"blocks.\1.mlp.fc\2"),
+                         (r"^blocks_(\d+)_adaln_proj_linear$", r"blocks.\1.adaln_proj.linear"),
+                         (r"^token_refiner_blocks_(\d+)_attn_(qkv|out)_proj$", r"token_refiner.blocks.\1.attn.\2_proj"),
+                         (r"^token_refiner_blocks_(\d+)_mlp_fc([12])$", r"token_refiner.blocks.\1.mlp.fc\2")):
+            if re.match(pat, name):
+                return re.sub(pat, rep, name)
+        return name
+
+    def lora_module_names(self, model, targets, blocks, include_text_embedder=False):
+        from .lora import _is_linear_like
+
+        targets = set(targets)
+        if include_text_embedder:
+            targets.add("token_refiner")
+        block_set = None if blocks is None else {int(b) for b in blocks}
+        in_block = sorted({s for t in targets for s in self.GROUPS.get(t, ())})
+        refiner = ("attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2")
+        names = []
+        for name, module in model.named_modules():
+            if not _is_linear_like(module):
+                continue
+            if name.startswith("blocks."):
+                if block_set is not None and int(name.split(".")[1]) not in block_set:
+                    continue
+                if _match_suffix(name, in_block):
+                    names.append(name)
+            elif name.startswith("token_refiner.blocks."):
+                if "token_refiner" in targets and _match_suffix(name, refiner):
+                    names.append(name)
+        return names
+
+    def compile_blocks(self, model):
+        return list(model.blocks)
+
+    def reference_sigmas(self, n, gen, tokens):
+        # H3 (musubi-tuner's trainer, ai-toolkit's, after the released schedulers): one uniform base time per item;
+        # the video sigma is its shift-12 image (the audio sigma, shift 3, follows inside the model)
+        from .h3.model import SHIFT_VIDEO, shift_sigma
+
+        return shift_sigma(torch.rand(n, generator=gen), SHIFT_VIDEO).clamp(0.0, 1.0)
+
+
+_ARCHS = {"moss_image": MossArch, "fibo2": FiboArch, "krea2": Krea2Arch, "qwen_image21": QwenImage21Arch,
+          "minimax_h3": MiniMaxH3Arch}
 _cache: dict[str, Arch] = {}
 
 
@@ -614,6 +737,8 @@ def arch_from_transformer_file(path: str) -> str | None:
                 found = "moss_image"
             elif "perceiver.latent_queries" in names:
                 found = "fibo2"
+            elif "video_patch_proj.weight" in names and "audio_patch_proj.weight" in names:
+                found = "minimax_h3"
         except Exception:  # noqa: BLE001
             found = None
         _FILE_ARCH_CACHE[key] = found
@@ -646,7 +771,8 @@ def detect_arch(cfg: TrainConfig, model_dir: Path | None) -> Arch:
             cls = None
         found = {"BriaFibo2Transformer2DModel": "fibo2", "Krea2Transformer2DModel": "krea2",
                  "MOSImageTransformer": "moss_image", "MOSSImageTransformer": "moss_image",
-                 "QwenImage21Transformer2DModel": "qwen_image21"}.get(cls)
+                 "QwenImage21Transformer2DModel": "qwen_image21",
+                 "MiniMaxH3Transformer3DModel": "minimax_h3", "MiniMaxH3DiTModel": "minimax_h3"}.get(cls)
         if found and found != guessed:
             if cfg.model_arch not in ("", "auto"):
                 raise ValueError(f"model_arch is {cfg.model_arch!r} but {model_dir} holds a {found} transformer")

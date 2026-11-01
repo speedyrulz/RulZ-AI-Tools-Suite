@@ -24,7 +24,8 @@ def test_defaults_are_single_files_turbo_and_sam3():
     assert c.turbo_lora == "auto" and c.body_backend == "mediapipe+sam3"
     assert (c.sample_steps, c.sample_cfg, c.sample_shift) == (12, 1.0, 5.0) == (*ARCH_SAMPLE_DEFAULTS["moss_image"], 5.0)
     assert ARCH_SAMPLE_DEFAULTS == {"moss_image": (12, 1.0), "krea2": (8, 1.0), "fibo2": (4, 1.0),
-                                    "qwen_image21": (8, 1.0)}
+                                    "qwen_image21": (8, 1.0),
+                                    "minimax_h3": (8, 1.0)}
 
 
 def test_planned_downloads_per_model_and_quant():

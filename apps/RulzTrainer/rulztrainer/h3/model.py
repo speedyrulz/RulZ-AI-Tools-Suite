@@ -85,6 +85,14 @@ def audio_sigma(sigma_video, shift_video: float = SHIFT_VIDEO, shift_audio: floa
     return time_shift_sigma(sigma_video, shift_video, shift_audio)
 
 
+def timestep_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
+    """diffusers' Timesteps(dim, flip_sin_to_cos=True, downscale_freq_shift=0) on the unscaled model time, fp32."""
+    half = dim // 2
+    freqs = torch.exp(-math.log(10000.0) * torch.arange(half, dtype=torch.float32, device=t.device) / half)
+    args = t.to(torch.float32)[:, None] * freqs[None]
+    return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+
+
 def _wdtype(m: nn.Module) -> torch.dtype:
     d = getattr(m, "compute_dtype", None)
     return d if d is not None else m.weight.dtype
@@ -321,18 +329,23 @@ class MiniMaxH3Transformer(nn.Module):
     CONFIG_KEYS = ("hidden_size", "num_layers", "token_refiner_num_layers", "num_attention_heads",
                    "attention_head_dim", "ffn_hidden_size", "latents_dim", "audio_latents_dim", "patch_size",
                    "text_dim", "timestep_input_dim", "time_embed_hidden_size", "time_embed_dim", "rope_inv_freq_len",
-                   "rope_theta", "norm_eps", "qk_norm_eps", "final_norm_eps", "adaln_curve_grid")
+                   "rope_theta", "norm_eps", "qk_norm_eps", "final_norm_eps", "adaln_curve_grid", "adaln_rank")
 
     def __init__(self, hidden_size=5376, num_layers=50, token_refiner_num_layers=2, num_attention_heads=56,
                  attention_head_dim=128, ffn_hidden_size=14336, latents_dim=24, audio_latents_dim=32,
                  patch_size=(1, 2, 2), text_dim=5120, timestep_input_dim=256, time_embed_hidden_size=5376,
                  time_embed_dim=2688, rope_inv_freq_len=16, rope_theta=10000.0, norm_eps=1e-5, qk_norm_eps=1e-5,
-                 final_norm_eps=1e-5, adaln_curve_grid=None):
+                 final_norm_eps=1e-5, adaln_curve_grid=None, adaln_rank=None):
+        """adaln_curve_grid: a pruned file's curve table (Comfy-Org's *_pruned_*). adaln_rank: a full checkpoint
+        pruned on load (h3/loading.prune_adaln): the time embedder stays, its SiLU'd output is projected onto a
+        rank-r basis and the AdaLN projections read the r coefficients plus a constant channel (r + 1 wide)."""
         super().__init__()
         if tuple(patch_size) != (1, PATCH, PATCH):
             raise ValueError(f"MiniMax H3 patchifies 1x2x2, got {tuple(patch_size)}")
         if 6 * rope_inv_freq_len > attention_head_dim:
             raise ValueError("the rotary channels (6 x rope_inv_freq_len) exceed the head size")
+        if adaln_curve_grid is not None and adaln_rank is not None:
+            raise ValueError("a pruned curve table and a load-time AdaLN basis exclude each other")
         self.config = dict(hidden_size=hidden_size, num_layers=num_layers,
                            token_refiner_num_layers=token_refiner_num_layers, num_attention_heads=num_attention_heads,
                            attention_head_dim=attention_head_dim, ffn_hidden_size=ffn_hidden_size,
@@ -340,7 +353,8 @@ class MiniMaxH3Transformer(nn.Module):
                            text_dim=text_dim, timestep_input_dim=timestep_input_dim,
                            time_embed_hidden_size=time_embed_hidden_size, time_embed_dim=time_embed_dim,
                            rope_inv_freq_len=rope_inv_freq_len, rope_theta=rope_theta, norm_eps=norm_eps,
-                           qk_norm_eps=qk_norm_eps, final_norm_eps=final_norm_eps, adaln_curve_grid=adaln_curve_grid)
+                           qk_norm_eps=qk_norm_eps, final_norm_eps=final_norm_eps, adaln_curve_grid=adaln_curve_grid,
+                           adaln_rank=adaln_rank)
         self.latent_channels = latents_dim
         self.audio_channels = audio_latents_dim
         self.text_dim = text_dim
@@ -348,6 +362,7 @@ class MiniMaxH3Transformer(nn.Module):
         self.freq_dim = timestep_input_dim
         self.rope_freq_dim, self.rope_theta = rope_inv_freq_len, rope_theta
         self.pruned = adaln_curve_grid is not None
+        self.adaln_rank = adaln_rank
         self.audio_frames = ONE_FRAME_AUDIO_LATENTS
         self.shift_video, self.shift_audio = SHIFT_VIDEO, SHIFT_AUDIO
         self.gradient_checkpointing = False
@@ -356,8 +371,8 @@ class MiniMaxH3Transformer(nn.Module):
         # the loader (h3/loading.py); None: zeros (logged once)
         self.audio_silence: torch.Tensor | None = None
         self.audio_noise_seed = 0  # the placeholder's noise: a fresh draw per forward, reproducible per run
-        apply_silu = not self.pruned
-        t_dim = time_embed_dim
+        apply_silu = not self.pruned and adaln_rank is None
+        t_dim = adaln_rank + 1 if adaln_rank is not None else time_embed_dim
         video_dim = latents_dim * PATCH * PATCH
         self.video_patch_proj = nn.Linear(video_dim, hidden_size, bias=True)
         self.audio_patch_proj = nn.Linear(audio_latents_dim, hidden_size, bias=True)
@@ -369,6 +384,9 @@ class MiniMaxH3Transformer(nn.Module):
             self.time_embedder = nn.Module()
             self.time_embedder.proj_in = nn.Linear(timestep_input_dim, time_embed_hidden_size, bias=True)
             self.time_embedder.proj_out = nn.Linear(time_embed_hidden_size, time_embed_dim, bias=True)
+        if adaln_rank is not None:
+            self.register_buffer("adaln_basis", torch.zeros(time_embed_dim, adaln_rank))
+            self.register_buffer("adaln_mean", torch.zeros(time_embed_dim))
         self.token_refiner = TokenRefiner(token_refiner_num_layers, hidden_size, num_attention_heads,
                                           attention_head_dim, ffn_hidden_size, norm_eps, qk_norm_eps, final_norm_eps)
         self.blocks = nn.ModuleList([
@@ -400,19 +418,21 @@ class MiniMaxH3Transformer(nn.Module):
     def time_embedding(self, t: torch.Tensor) -> torch.Tensor:
         """[M] model times t = 1 - sigma in [0, 1] -> [M, t_dim]: the sinusoidal embedding (cos first, unscaled t, as
         diffusers' Timesteps(flip_sin_to_cos=True)) through the fp32 time MLP, or the pruned curve table, linearly
-        interpolated over 1025 points of t (ComfyUI)."""
+        interpolated over 1025 points of t (ComfyUI), or (load-time pruning) the SiLU'd embedding's coefficients on
+        the basis with a trailing constant 1 (musubi-tuner's --prune_adaln)."""
         t = t.to(torch.float32)
         if self.pruned:
             table = self.adaln_t_table.to(device=t.device, dtype=torch.float32)
             pos = t.clamp(0.0, 1.0) * (table.shape[0] - 1)
             i0 = pos.floor().long().clamp(max=table.shape[0] - 2)
             return torch.lerp(table[i0], table[i0 + 1], (pos - i0.to(pos.dtype)).unsqueeze(1))
-        half = self.freq_dim // 2
-        freqs = torch.exp(-math.log(10000.0) * torch.arange(half, dtype=torch.float32, device=t.device) / half)
-        args = t[:, None] * freqs[None]
-        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         te = self.time_embedder
-        return te.proj_out(F.silu(te.proj_in(emb.to(_wdtype(te.proj_in)))))
+        emb = te.proj_out(F.silu(te.proj_in(timestep_embedding(t, self.freq_dim).to(_wdtype(te.proj_in)))))
+        if self.adaln_rank is not None:
+            mean = self.adaln_mean.to(emb.device, torch.float32)
+            coeff = (F.silu(emb.float()) - mean) @ self.adaln_basis.to(emb.device, torch.float32)
+            return F.pad(coeff, (0, 1), value=1.0)
+        return emb
 
     # ---- layout
     def positions(self, text_lens: torch.Tensor, text_len: int, height: int, width: int) -> torch.Tensor:
