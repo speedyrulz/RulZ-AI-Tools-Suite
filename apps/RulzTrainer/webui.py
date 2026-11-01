@@ -1311,6 +1311,7 @@ class Form:
             probe_face_prompt=s("probe_face_prompt"), probe_body_prompt=s("probe_body_prompt"),
             probe_seeds=int(v("probe_seeds")), probe_seed=int(v("probe_seed")), probe_size=int(v("probe_size")),
             probe_floor_seeds=int(v("probe_floor_seeds") or 4),
+            probe_async=bool(v("probe_async")), probe_device=s("probe_device"),
             probe_steps=int(v("probe_steps")), probe_cfg=float(v("probe_cfg")), probe_ema=float(v("probe_ema")),
             likeness_noise_band=float(v("likeness_noise_band")), likeness_track_best=bool(v("likeness_track_best")),
             likeness_track_best_face=bool(v("likeness_track_best_face")),
@@ -6581,6 +6582,13 @@ def build_page(local: bool = True):
                             w["probe_every"] = ui.number("Probe every N steps (0 = off)", value=d.probe_every,
                                                          precision=0).classes("w-60")                                 .tooltip("Also probed once at the last step, so the final LoRA has its own score")
                             w["probe_at_start"] = ui.switch("Probe at step 0 (baseline)", value=d.probe_at_start)
+                            w["probe_async"] = ui.switch("Render probes on the second GPU", value=d.probe_async) \
+                                .tooltip("A copy of the model on the other GPU renders each probe while training goes "
+                                         "on, instead of training pausing for it. The decisions (best checkpoint, "
+                                         "early stop, lr control) land when the probe is scored, up to Probe every "
+                                         "steps later; a best checkpoint still saves exactly the weights that were "
+                                         "scored. Needs Multi-GPU off (data parallel already trains on both) and the "
+                                         "model to fit the second GPU; not in a configuration race.")
                         w["probe_face_prompt"] = ui.input("Face probe prompt (headshot; empty = none)") \
                             .classes("w-full")
                         w["probe_body_prompt"] = ui.input("Body probe prompt (full body, upright; empty = none)") \
@@ -6787,6 +6795,11 @@ def build_page(local: bool = True):
                                              "Seeds per probe. Costs a few extra renders once, at the start.")
                                 w["probe_seed"] = ui.number("Probe seed", value=d.probe_seed, precision=0) \
                                     .classes("w-32")
+                                w["probe_device"] = ui.input("Probe GPU", value=d.probe_device,
+                                                             placeholder="auto").classes("w-32") \
+                                    .bind_visibility_from(w["probe_async"], "value") \
+                                    .tooltip("The GPU that renders the probes (e.g. cuda:1); empty: the first of "
+                                             "Devices that is not the training GPU")
                                 w["probe_ema"] = ui.number("Score smoothing (EMA)", value=d.probe_ema, min=0,
                                                            max=0.95, step=0.05).classes("w-48")
                                 w["likeness_noise_band"] = ui.number("Noise band (% points)",
@@ -7893,6 +7906,17 @@ same faces against the same references on its own scale, and (*Best checkpoint, 
 default) its score replaces ArcFace's in the decisions. *auto* turns it on for those runs and for the probe noise
 check. The Monitor draws it as a dashed "face (FaceNet)" line; ArcFace pulling away from it is the warning sign, and the
 reward stage logs a warning when ArcFace runs more than 10 points further ahead than when the stage began.
+
+## Probes on the second GPU
+With one GPU training and the other idle (Multi-GPU off, or block swap, which turns it off), *Render probes on the
+second GPU* (Likeness probes section) starts a second process with a copy of the model there that renders the probes
+while training goes on. Training pauses only to send the LoRA across (a fraction of a second) instead of for the whole
+probe; the final probe renders on the training GPU. The probe's decisions (best checkpoint, early stop, lr control,
+curriculum) land when it is scored, up to *Probe every* steps later; a best checkpoint still saves exactly the weights
+that were scored. It pays off when one probe on the second GPU takes less time than *Probe every* training steps
+(measured 10-24% faster on Qwen 2.1); with large probes every few steps training waits for them and it is slower. The
+log shows each probe's time as "on cuda:0, in at step N", and the end of training how long training waited. Not used
+in a configuration race or a fine-tune; if the second GPU runs out of memory, probes go back to the training GPU.
 
 ## Copy check (SSCD)
 A LoRA trained on a few photos can learn to redraw one of them: same pose, same outfit, same background. *Copy check*
