@@ -163,7 +163,8 @@ def model_dim(model: nn.Module) -> int:
     """The transformer's hidden size (the width of the image tokens' states)."""
     block = model.layers[0]
     for name in ("proj.q", "attn.to_q", "attention.to_q", "q_proj",  # q_proj: FLUX 3 Klein (BFL's names)
-                 "attention.qkv"):  # Ideogram 4: fused, in = the width
+                 "attention.qkv",  # Ideogram 4: fused, in = the width
+                 "attn.qkv_proj"):  # MiniMax H3: fused too
         try:
             return int(block.get_submodule(name).in_features)
         except AttributeError:

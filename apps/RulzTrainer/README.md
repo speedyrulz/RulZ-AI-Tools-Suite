@@ -19,6 +19,8 @@ A simple diffusion-model LoRA trainer with a WebUI. Supported models:
   in int8 or bf16 ([details](#flux-3-klein)).
 - **Ideogram 4** (9.3B): LoRAs on one 16 GB card from the fp8 release, structured JSON captions or wrapped plain
   ones; non-commercial license ([details](#ideogram-4)).
+- **MiniMax H3** (33B video + audio): experimental one-frame image LoRAs for H3 video generation, as musubi-tuner
+  trains them; two 16 GB cards or one with block swap ([details](#minimax-h3)).
 
 | Dark | Light |
 | --- | --- |
@@ -331,6 +333,7 @@ WebUI's *Download now* fetches them ahead of time). `model_file_quant` and `text
 | Qwen-Image 2.1 / Turbo | [Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1) | int8_convrot 7.3 GB, bf16 14.2 GB | Qwen3-VL-8B int8_convrot 9.4 GB, bf16 17.5 GB | `qwen_image_2.1_vae_bf16` |
 | FLUX 3 Klein Base / distilled | [black-forest-labs/flux-3-image-klein-comfy](https://huggingface.co/black-forest-labs/flux-3-image-klein-comfy) (BFL's own, gated) | int8_convrot 5.8 GB, nvfp4 5.3 GB, bf16 11.1 GB (files; 5.1 / 4.8 / 9.7 GB loaded) | Qwen3-VL-4B int8_convrot 4.9 GB, bf16 8.9 GB | `flux2-vae` |
 | Ideogram 4 | [Comfy-Org/Ideogram-4](https://huggingface.co/Comfy-Org/Ideogram-4) | int8_convrot 9.6 GB, fp8_scaled 9.3 GB, nvfp4_mixed 5.5 GB (no bf16 release) | Qwen3-VL-8B: int8_convrot 9.4 GB and bf16 17.5 GB from Comfy-Org/Qwen-Image-2.1 (the same model), fp8_scaled 10.6 GB and nvfp4 6.3 GB from Comfy-Org/Ideogram-4 | `flux2-vae` |
+| MiniMax H3 FL2VA / Ref2VA | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3) | pruned_int8_convrot 21.0 GB, pruned_bf16 40.2 GB, int8_convrot 34.0 GB, bf16 66.3 GB | Qwen3-VL-32B (50 layers) int8_convrot 27.1 GB, nvfp4_awq 15.7 GB, bf16 51.5 GB | `minimax_h3_video_vae_fp16` (5.2 GB) + `minimax_h3_audio_vae_fp32` (0.6 GB) |
 
 To use files you already have, set `transformer_file`, `text_encoder_file` and `vae_file` (the WebUI's optional file
 fields): only the ones left empty are downloaded. Fused-qkv ("repacked") files are split back automatically. The
@@ -1886,6 +1889,132 @@ with the real tokenizer when one is found), an exported LoRA through diffusers' 
 weights, ai-toolkit and diffusers layout sampling LoRAs, the schedules, and the caption wrapper against the
 verifier's rules (it agrees with Ideogram's own `CaptionVerifier` on 25 of 25 cases). Not measured yet: a training
 run on a GPU.
+
+## MiniMax H3
+
+RulzTrainer trains **one-frame (image) LoRAs** for [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3),
+MiniMax's open-weight video + audio model (released 3 August 2026): the 33B dense single-stream H3-Omni-Transformer
+(50 blocks, about 13B of its parameters in the AdaLN branches), Qwen3-VL-32B read after its 50th layer, a 16x / 4x
+video VAE with 24 channels (f16t4d24) and a stereo audio VAE. Your pictures train as one-frame videos, the way
+[musubi-tuner](https://github.com/kohya-ss/musubi-tuner)'s one-frame mode does (`--task t2va --one_frame
+--video_only`, its `docs/minimax_h3_1f.md`), so a character or style LoRA trained on stills loads into H3 video
+generation in ComfyUI, diffusers or musubi-tuner. **Experimental**: musubi-tuner calls one-frame training outside the
+released training distribution, and how a stills LoRA carries into motion is not established. Pick
+**MiniMax-H3-FL2VA** (the text / first-last-frame checkpoint the released T2VA path uses). *MiniMax-H3-Ref2VA* (the
+reference-to-video checkpoint) is listed as not for training: this trainer makes text-only LoRAs, and diffusers notes
+that a LoRA for one H3 checkpoint degrades the other.
+
+**Licence.** The MiniMax H3 Community License Agreement. It excludes the USA, the EU, the UK and South Korea: users
+there must apply to MiniMax for a licence first ([application form](https://platform.minimax.io/h3-license); see the
+model card's license Q&A). Elsewhere a LoRA (a model derivative) may be shared with a copy of the agreement and the
+NOTICE file it prescribes. Only the distilled H3-Base weights are open.
+
+What is modeled on evidence, and what is not:
+
+- **The transformer** is a port of diffusers' `MiniMaxH3Transformer3DModel` with the original checkpoint's module
+  names (`blocks.N.attn.qkv_proj`, `attn.out_proj`, `mlp.fc1`, `mlp.fc2`, `adaln_proj.linear`; the token refiner
+  likewise), so Comfy-Org's files load as they are and every published H3 LoRA and training adapter fits it. One
+  packed sequence per picture, `[text | 4 audio rows | one video latent frame]`, laid out as diffusers' own pipeline
+  builds it (its `build_packed_sequence`, checked bit for bit): RoPE over (t, h, w) with the media clock at the
+  caption's length, one 1x2x2-patched latent frame (32 px buckets, 96 channels per token) and the 2 audio latent
+  frames per stereo channel a single frame needs (musubi-tuner, ComfyUI). Positions are per sample: a padded batch
+  predicts what each picture predicts alone. Verified against diffusers on a tiny random config (fp32: 1.5e-7 on
+  outputs of 0.5).
+- **Timesteps.** H3 draws one base time and derives the video and audio sigmas with their own shifts, 12 and 3 (the
+  released schedulers, ComfyUI's `MiniMaxH3SigmaShift`, musubi-tuner's training). `timestep_sampling: reference`
+  draws that base time uniformly and trains the shift-12 video sigma; the audio sigma follows inside the model in
+  closed form. The model reads t = 1 - sigma and predicts the data-ward velocity; the port returns the trainer's
+  noise-ward one. The loss is on the video only.
+- **The silent audio.** A still has no sound: the 4 audio rows are the audio VAE's posterior mode of a zero waveform
+  (normalized; musubi-tuner encodes it the same way, as zeros are not an all-zero latent), noised to the audio sigma,
+  never in the loss (`--video_only`). The audio VAE (Comfy-Org's 0.6 GB file, found next to the video VAE or
+  downloaded) is used once on the CPU; the latent is cached in `models/` and the VAE dropped. musubi-tuner's docs
+  recommend captions that state the silence (e.g. a "sound:" field describing a silent still).
+- **AdaLN.** Comfy-Org's *pruned* files replace the time embedder and the 13B AdaLN weights by an fp32 table of the
+  time-embedding curve (1025 points, 8 wide), interpolated as ComfyUI does; the LoRA's layers (attention, MLP) are the
+  full model's, so they train (DiffSynth-Studio trains the same file). Full files (and the diffusers repo) are pruned
+  the same way on load (a rank-8 basis of the curve, musubi-tuner's `--prune_adaln`; `RULZ_H3_FULL_ADALN=1` keeps
+  them full, 13B parameters more). How much the pruning changes the result is musubi-tuner's measurement (at parity
+  with the published pruned files), not RulzTrainer's.
+- **Text features** follow diffusers' `MiniMaxH3TextEncoderStep` for a T2VA prompt: the caption verbatim, no chat
+  template, no special tokens (an empty caption is a single space), the state after decoder layer 50 before any norm.
+  H3's own tokenizer is required (it adds `<d>`, `</d>`, `<|cutoff|>`, `<|lyrics_start|>`); it is downloaded from
+  MiniMaxAI/MiniMax-H3 (11 MB). The NVFP4-AWQ encoder's block-scale layout and its `pre_quant_scale` (multiplied into
+  the inputs of `o_proj` and `down_proj`) were checked on the released file: layer 0's `o_proj` read this way matches
+  the int8 file's at cosine 0.995 (0.85 with the other scale layout).
+- **The VAE.** Comfy-Org's video VAE file (the original MiniMax layout) is converted to diffusers'
+  `AutoencoderKLMiniMaxH3`; a picture encodes as one frame through the spatial encoder alone (posterior mode). A
+  single latent decodes badly on its own, so previews decode it as a 5-latent clip of copies and keep the first real
+  frame, ComfyUI's still path. The Sol VAE and the int8 VAE are not read (for a still the Sol decoder decodes as the
+  stock one does in ComfyUI).
+- **Not verified without the weights**: everything numeric about memory, speed and quality below; the turbo LoRA on
+  single frames; a whole training run.
+
+**Files.** `model_source: files` downloads from [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3)
+(sizes from the Hub): the diffusion model as `pruned_int8_convrot` (21.0 GB; the WebUI and the wizard pick it for H3),
+`pruned_bf16` (40.2 GB), `int8_convrot` (34.0 GB) or `bf16` (66.3 GB); the text encoder as `int8_convrot` (27.1 GB),
+`nvfp4_awq` (15.7 GB) or `bf16` (51.5 GB), all cut to the 50 layers H3 reads; the video VAE (5.2 GB) and the audio
+VAE (0.6 GB). `pruned_fp8_scaled` reads too (dequantized); the `w6a8` files use a format this trainer cannot read. A bf16
+source is quantized layer by layer as it is read (`transformer_quant: auto`: int8 for about 30 GB of GPUs, else nvfp4),
+so the bf16 model never sits in RAM whole. `model_source: hf` downloads only what it reads of the 498 GB repo (the
+FL2VA `transformer/` or Ref2VA `transformer_ref/` (66 GB), the text encoder's shards with layers 0-49, the tokenizer
+and the two VAEs).
+
+**Memory** (estimates from the file sizes, not measured): nothing fits one 16 GB card whole. Realistic setups:
+
+| Setup | How |
+|---|---|
+| two 16 GB cards | `multi_gpu: model_split`, pruned int8: about 10.5 GB of weights per card |
+| one 16 GB card | pruned int8 with `block_swap` (the wizard suggests about 25 of the 50 blocks: 9.7 GB pinned in system RAM, streamed every step), 64 GB of RAM advised |
+| one 16 GB card, no swap | `pruned_bf16` with `transformer_quant: nvfp4`: about 12.5 GB of weights (native FP4 matmuls on RTX 50; dequantized on older cards) |
+
+The text encoder only runs while the captions are cached, then unloads: `text_encoder_device: auto` spreads the int8
+file over two cards, or keeps what does not fit a single card in system RAM (NVFP4 on one card). CPU encoding works
+too (`text_encoder_device: cpu`), slowly.
+
+**Training adapter** (`training_adapter: auto`, the default). The released H3 is CFG-distilled; musubi-tuner found
+one-frame LoRAs trained on the plain flow loss break up within about 50 steps. `auto` downloads circlestone-labs'
+[MiniMax-H3-Image-Training-Adapter](https://huggingface.co/circlestone-labs/MiniMax-H3-Image-Training-Adapter) (rank
+64, 0.62 GB, made for image-only training on FL2VA), the first of the three adapters musubi-tuner tested; it is on
+while your LoRA trains, off for samples and probes, and never saved into your file (the Qwen-Image 2.1 mechanism).
+Alternatives as a path: [ostris/minimax_h3_training_adapter](https://huggingface.co/ostris/minimax_h3_training_adapter)
+`minimax_h3_training_adapter_v2.safetensors` (rank 32, 0.31 GB; musubi-tuner tested v2) or its `_ref2va_` adapter for
+Ref2VA. circlestone-labs advises against a guidance-preservation loss on top of it (this trainer has none). Quality with
+the adapter has not been evaluated here.
+
+**Recipe** (what the setup wizard suggests): rank 16 (musubi-tuner's examples; DiffSynth-Studio's use 32), alpha =
+rank, learning rate 1e-4 (both), `adamw8bit`, gradient checkpointing, `timestep_sampling: reference`, 1 MP buckets on
+the 32 px grid (H3's own canvas is 768 x 1344), EMA 0.98 (the trainer's default), the default targets (`qkv_proj`,
+`out_proj`, `fc1`, `fc2` in the 50 blocks: musubi-tuner's and DiffSynth-Studio's; q, k or v selects the fused
+`qkv_proj` whole; `token_refiner` adds the text refiner). Batch size 1 (musubi-tuner's H3 rule; larger batches pad the
+captions here).
+
+**Samples** render on the plain model (the adapter off) with lightx2v's FL2VA Turbo 8-step v1.0 LoRA (Comfy-Org's
+ComfyUI-layout file, 2.0 GB): 8 steps at CFG 1 on the base schedule (it was distilled at shifts 12 / 3, its model
+card); its keys map onto the port's names (checked against the file's header), but it was distilled on video and is
+not checked on stills. Without it, 30 steps at CFG 1 (H3 is guidance-distilled). The schedule is the released
+scheduler's (`linspace(1, 0, steps + 1)` through shift 12); the audio rows are denoised alongside, as in joint
+generation, and never decoded. Sample sizes are rounded down to multiples of 32.
+
+**Export**: `diffusion_model.blocks.<n>.attn.qkv_proj.lora_A.weight` / `lora_B.weight`, no alpha (alpha = rank; a
+different alpha is folded into lora_B). That is the layout ai-toolkit and diffusion-pipe write for H3 and the training
+adapters use; ComfyUI's Load LoRA reads it (its MiniMax H3 key map and `lora_A/B` support), musubi-tuner reads it
+(alpha = rank), and diffusers' `MiniMaxH3LoraLoaderMixin` converts it (checked in the tests: the converted LoRA merged
+into diffusers' model predicts what the trainer's LoRA does).
+
+```python
+from diffusers import ModularPipeline  # MiniMax H3 is a modular pipeline (diffusers 0.40+)
+pipe = ModularPipeline.from_pretrained("MiniMaxAI/MiniMax-H3")
+pipe.load_components(dtype=torch.bfloat16)
+pipe.load_lora_weights("output/<job>/<job>.safetensors")
+```
+
+Tests: `tests/test_h3.py` (weight-free) checks the port against `MiniMaxH3Transformer3DModel` on the pipeline's own
+one-frame layout (a padded batch against each sample alone, the audio rows and the placeholder), the pruned-table and
+load-time-pruned AdaLN paths, the layouts against diffusers' own checkpoint and LoRA converters and against the
+released files' headers (`tests/fixtures/minimax_h3_headers.json`: names, dtypes and shapes only), the VAE and audio-VAE
+conversions, the text encoder's layer-50 state with AWQ scales, the LoRA export and the adapter / turbo layouts, the
+sampler against the released `MiniMaxH3Scheduler` pair, and detection, caches, buckets and downloads.
 
 ## Using the LoRA in ComfyUI
 
