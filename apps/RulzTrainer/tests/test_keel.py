@@ -1,7 +1,8 @@
 """Keel (rulztrainer.optimizers.keel): Automagic 4 exactly with its switches off, the gauge preconditioner's
 invariance to a LoRA pair's reparameterisation, the cautious mask, the noise bands (observe, the per-band scale,
-the band weight through Automagic 4's update gain, paired sigma in the trainer), training and state round trips
-across the Automagic kinds, and the config / race / WebUI wiring."""
+the band weight through Automagic 4's update gain, paired sigma in the trainer), the accumulation hook with
+gather() and the consensus gate, training and state round trips across the Automagic kinds, and the config / race
+/ WebUI wiring."""
 import sys
 from pathlib import Path
 
@@ -15,7 +16,7 @@ from rulztrainer.config import AUTOMAGIC, OPTIMIZERS, TrainConfig, keel_band_edg
 from rulztrainer.moss.model import MOSSImageTransformer  # noqa: E402
 from rulztrainer.optimizers import keel as keel_mod  # noqa: E402
 from rulztrainer.optimizers.automagic4 import Automagic4  # noqa: E402
-from rulztrainer.optimizers.keel import Keel, band_of, gauge_precondition  # noqa: E402
+from rulztrainer.optimizers.keel import Keel, band_of, consensus_gate, gauge_precondition  # noqa: E402
 from rulztrainer.trainer import build_optimizer, build_scheduler, current_lr, draw_sigmas, pairs_sigma  # noqa: E402
 
 TINY = dict(dim=64, ffn_dim=128, num_heads=2, num_layers=2, text_dim=32, freq_dim=16, latent_channels=128)
@@ -39,13 +40,16 @@ def _step(model, params, opt, seed: int, sigma: float | None = None):
     if sigma is not None:  # as the trainer does: the micro-batch's noise level before its backward
         opt.observe(torch.tensor([sigma]))
     loss.backward()
+    if hasattr(opt, "gather"):  # as the trainer does: the micro-batch sums back on p.grad before the clip
+        opt.gather()
     torch.nn.utils.clip_grad_norm_(params, 1.0)
     opt.step()
     return loss.item()
 
 
 def _cfg(**kw):
-    return TrainConfig(**{**dict(optimizer="keel", learning_rate=1e-4, automagic_polarity_history=4, steps=20), **kw})
+    return TrainConfig(**{**dict(optimizer="keel", learning_rate=1e-4, automagic_polarity_history=4, steps=20,
+                                 keel_consensus=0.0), **kw})
 
 
 def test_keel_with_its_switches_off_is_automagic4_bitwise():
@@ -55,6 +59,7 @@ def test_keel_with_its_switches_off_is_automagic4_bitwise():
     assert all(torch.equal(a, b) for a, b in zip(pa, pb))
     oa = build_optimizer(_cfg(optimizer="automagic4"), pa)
     ob = build_optimizer(_cfg(keel_gauge=False), pb, pairs=lora_mod.lora_pairs(injb))  # bands on, never observed
+    assert len(ob._hook_handles) == len(pb)  # the accumulation hook is on every (fp32) parameter
     oc = build_optimizer(_cfg(keel_gauge=False, keel_bands=1), pc, pairs=lora_mod.lora_pairs(injc))
     assert isinstance(ob, Keel) and isinstance(oa, Automagic4) and not isinstance(oa, Keel)
     for i in range(6):
@@ -146,7 +151,7 @@ def test_cautious_mask_drops_elements_that_point_against_the_gradient():
     assert opt2.cautious_share() is None
 
 
-def test_keel_pairs_and_bands_are_checked():
+def test_keel_options_are_checked():
     down = torch.nn.Parameter(torch.randn(2, 3))
     up = torch.nn.Parameter(torch.randn(4, 2))
     stranger = torch.nn.Parameter(torch.randn(4, 2))
@@ -160,6 +165,10 @@ def test_keel_pairs_and_bands_are_checked():
         Keel([down, up], lr=1e-4, fused=False, bands=0)
     with pytest.raises(ValueError, match="band_weights"):
         Keel([down, up], lr=1e-4, fused=False, bands=4, band_weights=[1.0, 2.0])
+    with pytest.raises(ValueError, match="consensus"):
+        Keel([down, up], lr=1e-4, fused=False, consensus=1.5)
+    with pytest.raises(ValueError, match="consensus_power"):
+        Keel([down, up], lr=1e-4, fused=False, consensus_power=0.0)
     # no pairs (a LoKr / OFT adapter, a fine-tune): the step is Automagic 4's
     opt = Keel([down, up], lr=1e-4, fused=False)
     down.grad, up.grad = torch.randn(2, 3), torch.randn(4, 2)
@@ -230,7 +239,7 @@ def test_bands_equalise_two_noise_levels_of_different_scale():
         prime(scales[sigma])
         before = {p: opt.state[p]["band_ms"].clone() for p in (w2, w1)}
         raw = {p: p.grad.clone() for p in (w2, w1)}
-        opt._normalise_bands()
+        opt._bands_step()
         for p in (w2, w1):
             b = band_of(sigma, 8)
             expected = min(float((before[p][8] / before[p][b]).sqrt()), keel_mod.GAIN_MAX)
@@ -244,13 +253,13 @@ def test_bands_equalise_two_noise_levels_of_different_scale():
     opt.zero_grad()
     opt.observe(torch.tensor([quiet, loud]))
     prime(1.0)
-    opt._normalise_bands()
+    opt._bands_step()
     assert torch.equal(w2.grad, base[0]) and opt.update_gain == pytest.approx(1.5) and opt._mixed_warned
     # a band below BAND_MIN_OBS observations is not trusted: scale 1
     opt.zero_grad()
     opt.observe(torch.tensor([0.75]))
     prime(1.0)
-    opt._normalise_bands()
+    opt._bands_step()
     assert torch.equal(w2.grad, base[0]) and float(opt.state[w2]["band_n"][5]) == 1.0
     opt.update_gain = None
 
@@ -366,11 +375,17 @@ def test_keel_config_race_and_wizard_wiring(tmp_path):
     from rulztrainer import race as R
     from rulztrainer.finetune import BYTES_PER_PARAM
 
-    keys = {"keel_gauge", "keel_gauge_eps", "keel_cautious", "keel_pair_sigma", "keel_bands", "keel_band_weights"}
+    keys = {"keel_gauge", "keel_gauge_eps", "keel_cautious", "keel_pair_sigma", "keel_bands", "keel_band_weights",
+            "keel_consensus", "keel_consensus_power"}
+    with pytest.raises(ValueError, match="keel_consensus"):
+        _cfg(keel_consensus=1.2).validate()
+    with pytest.raises(ValueError, match="keel_consensus_power"):
+        _cfg(keel_consensus_power=0).validate()
     assert keys <= set(R.RACE_KEYS["LR & optimizer"])
     TrainConfig(race=True, probe_every=10, face_refs=["ref.png"], steps=40, race_configs=[
         {"name": "a"}, {"name": "b", "optimizer": "keel", "keel_gauge_eps": 0.1, "keel_cautious": False},
-        {"name": "c", "optimizer": "keel", "keel_bands": 1, "keel_pair_sigma": False, "keel_band_weights": ""}]).validate()
+        {"name": "c", "optimizer": "keel", "keel_bands": 1, "keel_pair_sigma": False, "keel_band_weights": ""},
+        {"name": "d", "optimizer": "keel", "keel_consensus": 1.0, "keel_consensus_power": 1.0}]).validate()
     assert BYTES_PER_PARAM["keel"] == BYTES_PER_PARAM["automagic4"]
     import webui
 
@@ -378,3 +393,242 @@ def test_keel_config_race_and_wizard_wiring(tmp_path):
     cfg = TrainConfig.from_dict({**_cfg().to_dict(), "dataset_dir": str(tmp_path), "trigger_word": "x"})
     rec = webui.wizard_recommendations(cfg, "character", [], None)
     assert "learning_rate" not in rec  # Keel sets its own rate, like Automagic
+
+
+# ---------------------------------------------------------------- the accumulation hook and the consensus gate
+
+
+def _micro_batches(p, grads, opt, sigma=None):
+    """K backwards of one step through the hook: p's gradient of micro-batch k is grads[k]."""
+    opt.zero_grad()
+    for k, g in enumerate(grads):
+        if sigma is not None:
+            opt.observe(sigma[k] if isinstance(sigma, (list, tuple)) else sigma)
+        (p * g).sum().backward()
+        assert p.grad is None  # the hook took it
+
+
+def test_hook_accumulates_the_micro_batches_and_gather_hands_the_sum_back():
+    torch.manual_seed(6)
+    p = torch.nn.Parameter(torch.randn(5, 4))
+    q = torch.nn.Parameter(torch.randn(3))
+    opt = Keel([p, q], lr=1e-4, fused=False, bands=1, consensus=0.5)
+    grads = [torch.randn(5, 4) for _ in range(3)]
+    assert not opt._armed  # the hook waits for zero_grad(): a backward outside a step is left alone
+    (p * grads[0]).sum().backward()
+    assert p.grad is not None and not hasattr(p, "_accum_grad")
+    _micro_batches(p, grads, opt)
+    assert opt._votes[p] == 3 and torch.equal(opt._agree[p], sum(g.sign() for g in grads).to(torch.int8))
+    assert q not in opt._votes  # q got no gradient
+    expected = grads[0] + grads[1] + grads[2]  # the same fp32 sum autograd would have made, in the same order
+    assert torch.equal(p._accum_grad, expected)
+    opt.gather()
+    assert torch.equal(p.grad, expected) and not hasattr(p, "_accum_grad") and q.grad is None
+    opt.gather()  # idempotent
+    assert torch.equal(p.grad, expected)
+    # disarmed after the step: a backward then leaves p.grad alone (another optimizer's step in a race)
+    opt.step()
+    assert not opt._armed and not opt._agree
+    (p * grads[0]).sum().backward()
+    assert p.grad is not None and not hasattr(p, "_accum_grad")
+    p.grad = None
+    # a zero_grad drops a failed step's partial sums (an out-of-memory retry)
+    opt.zero_grad()
+    (p * grads[0]).sum().backward()
+    assert hasattr(p, "_accum_grad")
+    opt.zero_grad()
+    assert not hasattr(p, "_accum_grad") and opt._armed
+
+
+def test_two_optimizers_on_the_same_tensors_keep_out_of_each_others_steps():
+    torch.manual_seed(7)
+    p = torch.nn.Parameter(torch.randn(4, 4))
+    a = Keel([p], lr=1e-4, fused=False, bands=1, consensus=0.5)
+    b = Keel([p], lr=1e-4, fused=False, bands=1, consensus=0.5)
+    _micro_batches(p, [torch.randn(4, 4), torch.randn(4, 4)], b)  # a never zeroed: its hook is not armed
+    assert p in b._agree and p not in a._agree and b._votes[p] == 2
+    b.step()
+    assert not hasattr(p, "_accum_grad")
+
+
+def test_consensus_gate_formula_and_fair_signs():
+    agree = torch.tensor([4, 2, 0, -2, -4], dtype=torch.int8)
+    gate = consensus_gate(agree, 4, 0.5, 2.0)
+    assert torch.allclose(gate, torch.tensor([1.0, 0.625, 0.5, 0.625, 1.0]))
+    assert torch.allclose(consensus_gate(agree, 4, 1.0, 2.0), torch.tensor([1.0, 0.25, 0.0, 0.25, 1.0]))
+    assert torch.allclose(consensus_gate(agree, 4, 1.0, 1.0), torch.tensor([1.0, 0.5, 0.0, 0.5, 1.0]))
+    assert torch.equal(consensus_gate(agree, 4, 0.0, 2.0), torch.ones(5))
+    # fair random signs over K = 4: E[gate] = floor + (1 - floor) E[a^2] = 0.5 + 0.5 x 0.25
+    torch.manual_seed(8)
+    p = torch.nn.Parameter(torch.randn(256, 256))
+    opt = Keel([p], lr=1e-4, fused=False, bands=1, consensus=0.5)
+    _micro_batches(p, [torch.randn(256, 256).sign() for _ in range(4)], opt)
+    gate = opt._element_gain(p)
+    assert gate.shape == p.shape and abs(float(gate.mean()) - 0.625) < 0.01
+    assert opt.gate_mean() == pytest.approx(float(gate.mean()))
+    rows = opt._element_gain(p, 10, 20)
+    assert torch.equal(rows, gate[10:20])
+    opt.zero_grad()
+    assert opt._element_gain(p) is None  # nothing seen this step
+
+
+def test_consensus_gate_scales_the_update_where_the_micro_batches_disagree():
+    torch.manual_seed(9)
+    p0 = torch.randn(8, 8)
+    base = torch.rand(8, 8) + 0.5
+    disagree = torch.zeros(8, 8, dtype=torch.bool)
+    disagree[:4] = True  # the top half: the two micro-batches point opposite ways (and do not cancel: a
+    g1 = base.clone()  # tensor whose gradient rows are exactly zero is a degenerate case for the factored moment)
+    g2 = torch.where(disagree, -0.5 * base, base)
+    moved = {}
+    for consensus in (0.0, 0.5, 1.0):
+        p = torch.nn.Parameter(p0.clone())
+        opt = Keel([p], lr=1e-3, fused=False, bands=1, consensus=consensus, weight_decay=0.0)
+        for _ in range(2):  # the first step only measures
+            _micro_batches(p, [g1, g2], opt)
+            opt.step()
+        moved[consensus] = (p0 - p.detach()).abs()
+    agree_rows, disagree_rows = ~disagree, disagree
+    # the agreeing half moves the same whatever the gate (it acts after the second moment and the balance); the
+    # disagreeing half moves by the floor: half as far at 0.5, not at all under the hard AND-mask
+    assert (moved[0.0] > 0).all()
+    assert torch.allclose(moved[0.5][agree_rows], moved[0.0][agree_rows], rtol=0.03, atol=2e-7)
+    assert torch.allclose(moved[1.0][agree_rows], moved[0.0][agree_rows], rtol=0.03, atol=2e-7)
+    assert torch.allclose(moved[0.5][disagree_rows], moved[0.0][disagree_rows] * 0.5, rtol=0.03, atol=2e-7)
+    assert torch.equal(moved[1.0][disagree_rows], torch.zeros_like(moved[1.0][disagree_rows]))
+    # a partial disagreement moves by the gate: 3 of 4 agree -> 0.625 of the ungated step
+    g3 = torch.where(disagree, -0.5 * base, base)
+    moved2 = {}
+    for consensus in (0.0, 0.5):
+        p = torch.nn.Parameter(p0.clone())
+        opt = Keel([p], lr=1e-3, fused=False, bands=1, consensus=consensus, weight_decay=0.0)
+        for _ in range(2):
+            _micro_batches(p, [g1, g1, g1, g3], opt)
+            opt.step()
+        moved2[consensus] = (p0 - p.detach()).abs()
+    assert torch.allclose(moved2[0.5][disagree_rows], moved2[0.0][disagree_rows] * 0.625, rtol=0.03, atol=2e-7)
+    assert torch.allclose(moved2[0.5][agree_rows], moved2[0.0][agree_rows], rtol=0.03, atol=2e-7)
+
+
+def test_consensus_gate_in_the_bucketed_and_the_slab_update():
+    torch.manual_seed(10)
+    p0 = torch.randn(64, 16)
+    base = torch.rand(64, 16) + 0.5
+    g2 = base.clone()
+    g2[:32] *= -0.5  # the top rows disagree (without cancelling: see the test above)
+    moved = {}
+    for bucket_elems in (4_000_000, 256):  # one bucket, then row slabs (bucket_elems below the tensor's size)
+        p = torch.nn.Parameter(p0.clone())
+        opt = Keel([p], lr=1e-3, fused=False, bands=1, consensus=1.0, weight_decay=0.0, bucket_elems=bucket_elems)
+        for _ in range(2):
+            _micro_batches(p, [base, g2], opt)
+            opt.step()
+        moved[bucket_elems] = (p0 - p.detach()).abs()
+    for m in moved.values():
+        assert torch.equal(m[:32], torch.zeros_like(m[:32])) and (m[32:] > 0).all()
+    assert torch.allclose(moved[256], moved[4_000_000], rtol=1e-4, atol=1e-8)
+
+
+def test_bands_scale_each_micro_batch_by_its_own_band_through_the_hook():
+    torch.manual_seed(11)
+    p = torch.nn.Parameter(torch.randn(6, 5))
+    base = torch.randn(6, 5)
+    opt = Keel([p], lr=1e-4, fused=False, bands=8, consensus=0.0, gauge=False)
+    quiet, loud = 0.3, 0.9  # bands 3 and 6; the loud band's gradients are 5x the quiet band's
+    scales = {quiet: 1.0, loud: 5.0}
+    for i in range(2 * keel_mod.BAND_MIN_OBS):
+        sigma = (quiet, loud)[i % 2]
+        _micro_batches(p, [base * scales[sigma]], opt, sigma=sigma)
+        opt.step()
+    st = opt.state[p]
+    assert st["band_n"][3] == st["band_n"][6] == keel_mod.BAND_MIN_OBS and st["band_n"][8] == 2 * keel_mod.BAND_MIN_OBS
+    assert float(st["band_ms"][6] / st["band_ms"][3]) == pytest.approx(25.0, rel=1e-3)
+    gain = opt._band_gain[p]
+    assert gain.shape == (8,) and float(gain[0]) == 1.0  # an unseen band is not scaled
+    expect = {b: min(float((st["band_ms"][8] / st["band_ms"][b]).sqrt()), keel_mod.GAIN_MAX) for b in (3, 6)}
+    assert float(gain[3]) == pytest.approx(expect[3], rel=1e-5) and float(gain[6]) == pytest.approx(expect[6], rel=1e-5)
+    assert expect[3] > 1.0 > expect[6]
+    # a mixed step through the hook: each micro-batch scaled by its own band, both bands observed
+    _micro_batches(p, [base, base * 5.0], opt, sigma=[quiet, loud])
+    assert opt._cnt[p] == [0, 0, 0, 1, 0, 0, 1, 0]
+    opt.gather()
+    assert torch.allclose(p.grad, base * expect[3] + base * 5.0 * expect[6], rtol=1e-5)
+    n_before = st["band_n"].clone()
+    opt.step()
+    assert torch.equal(st["band_n"] - n_before, torch.tensor([0, 0, 0, 1, 0, 0, 1, 0, 1], dtype=torch.float32))
+    assert not opt._mixed_warned  # the per-step note is for loops without the hook
+    # a micro-batch whose images span bands is left alone (no band, no statistics)
+    _micro_batches(p, [base], opt, sigma=torch.tensor([quiet, loud]))
+    assert opt._cur_band is None and p not in opt._pw
+    opt.gather()
+    assert torch.equal(p.grad, base)
+    opt.step()
+
+
+def test_bands_fallback_without_the_hook_is_the_per_step_path():
+    torch.manual_seed(12)
+    p = torch.nn.Parameter(torch.randn(6, 5))
+    opt = Keel([p], lr=1e-4, fused=False, bands=8, consensus=0.5, gauge=False)
+    for i in range(keel_mod.BAND_MIN_OBS + 1):  # the loop sums the micro-batches itself (the parallel race)
+        opt.zero_grad()
+        opt.observe(0.3)
+        p.grad = torch.randn(6, 5)
+        opt.step()
+    assert opt.state[p]["band_n"][3] == keel_mod.BAND_MIN_OBS + 1 and "hook" in opt._noted  # the gate note, once
+
+
+class _Wrap:
+    """A LoRA wrapper stand-in for DataParallelLoRA: adapter_params() only."""
+
+    def __init__(self, **ps):
+        self.ps = ps
+
+    def adapter_params(self):
+        return self.ps
+
+
+def test_replica_gradients_join_scaled_by_the_band_and_vote():
+    from rulztrainer.multigpu import DataParallelLoRA
+
+    torch.manual_seed(13)
+    p = torch.nn.Parameter(torch.randn(6, 5))
+    pr = torch.nn.Parameter(p.detach().clone())  # the replica's copy: not the optimizer's parameter
+    dp = DataParallelLoRA({"w": _Wrap(down=p)}, [(None, {"w": _Wrap(down=pr)}, "cpu")])
+    opt = Keel([p], lr=1e-4, fused=False, bands=8, consensus=0.5, gauge=False)
+    base = torch.randn(6, 5)
+    for i in range(2 * keel_mod.BAND_MIN_OBS):  # the band statistics, through the primary's hook
+        _micro_batches(p, [base * (1.0, 5.0)[i % 2]], opt, sigma=(0.3, 0.9)[i % 2])
+        opt.gather()
+        dp.reduce_grads(take=opt.take_replica)  # no replica gradient yet
+        opt.step()
+    gain = float(opt._band_gain[p][3])
+    assert gain > 1.0
+    # a step at sigma 0.3 (paired): one micro-batch on the primary, one on the replica, both agreeing
+    _micro_batches(p, [base], opt, sigma=0.3)
+    opt.observe(0.3, hook=False)  # the replica's micro-batch, as work() reports it
+    assert opt._cur_band == 3 and opt._step_bands == [3, 3]
+    (pr * (2.0 * base)).sum().backward()
+    opt.gather()
+    dp.reduce_grads(take=opt.take_replica)
+    assert pr.grad is None
+    assert torch.allclose(p.grad, 3.0 * base * gain, rtol=1e-5)  # both shares scaled by the band
+    assert opt._votes[p] == 2 and torch.equal(opt._element_gain(p), torch.ones(6, 5))
+    opt.step()
+    assert opt.take_replica(p, base) is base  # disarmed after the step: untouched
+    gain = float(opt._band_gain[p][3])  # the band statistics moved with the step
+    # the replica disagreeing everywhere: the gate falls to its floor
+    _micro_batches(p, [base], opt, sigma=0.3)
+    opt.observe(0.3, hook=False)
+    (pr * (-0.5 * base)).sum().backward()
+    opt.gather()
+    dp.reduce_grads(take=opt.take_replica)
+    assert torch.allclose(p.grad, 0.5 * base * gain, rtol=1e-5)
+    assert torch.equal(opt._element_gain(p), torch.full((6, 5), 0.5))
+    # a step whose observations span bands: the replica's share joins unscaled (and still votes)
+    _micro_batches(p, [base], opt, sigma=0.3)
+    opt.observe(0.9, hook=False)
+    (pr * base).sum().backward()
+    opt.gather()
+    dp.reduce_grads(take=opt.take_replica)
+    assert torch.allclose(p.grad, base * gain + base, rtol=1e-5) and opt._votes[p] == 2
+    opt.step()

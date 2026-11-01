@@ -1271,6 +1271,7 @@ class Form:
             keel_gauge=bool(v("keel_gauge")), keel_gauge_eps=float(v("keel_gauge_eps")),
             keel_cautious=bool(v("keel_cautious")), keel_pair_sigma=bool(v("keel_pair_sigma")),
             keel_bands=int(v("keel_bands")), keel_band_weights=str(v("keel_band_weights") or "").strip(),
+            keel_consensus=float(v("keel_consensus")), keel_consensus_power=float(v("keel_consensus_power")),
             timestep_shift=float(v("timestep_shift")), sigmoid_scale=float(v("sigmoid_scale")),
             logsnr_mean=float(v("logsnr_mean")), logsnr_std=float(v("logsnr_std")),
             block_swap=int(v("block_swap") or 0),
@@ -2870,6 +2871,7 @@ RACE_LABELS = {
     "automagic_vote": "Automagic vote", "automagic_max_lr_change": "Automagic max lr change",
     "keel_gauge": "Keel gauge preconditioner", "keel_gauge_eps": "Keel gauge eps", "keel_cautious": "Keel cautious mask",
     "keel_pair_sigma": "Keel paired sigma", "keel_bands": "Keel noise bands", "keel_band_weights": "Keel band weights",
+    "keel_consensus": "Keel consensus gate", "keel_consensus_power": "Keel consensus power",
     "lora_ema": "Weight average", "timestep_sampling": "Timestep sampling", "loss_weighting": "Loss weighting",
     "region_weights": "Region-weighted loss", "face_loss_weight": "Face loss weight",
     "body_loss_weight": "Body loss weight", "background_loss_weight": "Background loss weight",
@@ -6091,6 +6093,21 @@ def build_page(local: bool = True):
                                     .tooltip("A multiplier on the step's update per band: empty = 1 everywhere, "
                                              "identity = a hump over the face bands (sigma 0.12 to 0.5), or one "
                                              "number per band, comma-separated.")
+                                w["keel_consensus"] = ui.number("Consensus gate", value=d.keel_consensus, min=0, max=1,
+                                                                step=0.1, format="%.2f").classes("w-32") \
+                                    .tooltip("Cross-photo consensus (the AND-mask, ICLR 2021): each weight's update "
+                                             "is scaled by (1 - c) + c x (agreement share)^power, the share being "
+                                             "how many of the step's gradients (micro-batches, the DOP pass) agree "
+                                             "on its sign, so what every photo shares (the face) moves and what "
+                                             "varies between them (outfit, background, light) moves less. 0 = off, "
+                                             "1 = only unanimous elements move. Needs gradient accumulation of 2 or "
+                                             "more; paired sigma keeps the noise level out of the disagreement.")
+                                w["keel_consensus_power"] = ui.number("Consensus power", value=d.keel_consensus_power,
+                                                                      min=0.1, max=8, step=0.5, format="%.1f") \
+                                    .classes("w-32") \
+                                    .tooltip("The exponent on the agreement share: higher is stricter on partial "
+                                             "agreement (2: a 3-of-4 split counts as 0.25 agreement, before the "
+                                             "floor).")
                         with advanced("Timesteps, loss weighting and gradients"):
                             with fields():
                                 w["gradient_accumulation"] = ui.number("Grad accumulation",
@@ -7900,8 +7917,10 @@ element that points against the raw gradient. LoKr and OFT have no pairs, so the
 sigma* gives all of a step's micro-batches one noise level, and the *Noise bands* keep, per weight tensor, the
 gradient power seen in each band of the noise level, so a step's gradient enters at the tensor's overall scale
 whatever its band and the quiet bands (where the face forms) take steps as large as the loud ones; *Band weights*
-then emphasise bands on purpose (`identity`: a hump over sigma 0.12 to 0.5). Whether Keel beats adamw8bit on the
-likeness probes is not measured yet: race them.
+then emphasise bands on purpose (`identity`: a hump over sigma 0.12 to 0.5). The *Consensus gate* scales each
+weight's update by how many of the step's micro-batches agree on its sign, so what every photo shares moves and
+what varies between photos moves less (it needs gradient accumulation of 2 or more). Whether Keel beats adamw8bit
+on the likeness probes is not measured yet: race them.
 
 ## Adapters: LoRA, LoKr, OFT and DoRA
 The *Adapter* field (Train tab, LoRA section) picks what each layer learns. **LoRA**: a rank-r pair. **LoKr**: a

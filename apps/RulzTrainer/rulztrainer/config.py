@@ -400,6 +400,10 @@ class TrainConfig:
     #                      at the tensor's overall scale whatever its band, so the quiet bands are not drowned; 1 = off
     keel_band_weights: str = ""  # keel: a multiplier on the step's update per band: "" = 1 everywhere, identity = a
     #                              hump over the face bands (sigma 0.12 to 0.5), or keel_bands comma-separated numbers
+    keel_consensus: float = 0.5  # keel: the cross-photo consensus gate, 0 = off .. 1 = a hard AND-mask: the update is
+    #                              scaled by (1 - c) + c * (agreement share)^power, the share being how many of the
+    #                              step's gradients (micro-batches, the DOP pass) agree on the element's sign
+    keel_consensus_power: float = 2.0  # keel: the exponent on the agreement share
     lr_scheduler: str = "constant"  # constant | cosine | linear
     warmup_steps: int = 50
     max_grad_norm: float = 1.0
@@ -836,6 +840,10 @@ class TrainConfig:
         if not 1 <= self.keel_bands <= 64:
             raise ValueError("keel_bands must be between 1 and 64")
         keel_band_weights(self.keel_band_weights, self.keel_bands)  # raises on a bad spec
+        if not 0 <= self.keel_consensus <= 1:
+            raise ValueError("keel_consensus must be between 0 and 1")
+        if self.keel_consensus_power <= 0:
+            raise ValueError("keel_consensus_power must be above 0")
         if self.compile_model not in (True, False, "auto"):
             raise ValueError(f"compile_model must be true, false or auto, got {self.compile_model!r}")
         if self.race:
