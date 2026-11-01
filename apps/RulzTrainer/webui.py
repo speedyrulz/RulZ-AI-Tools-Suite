@@ -55,6 +55,10 @@ EXTRA_TARGETS = {
     "modulation": (("flux3_klein",), "the per-mode shift / scale / gate projections of the timestep"),
 }
 N_BLOCKS = {"moss_image": 42, "fibo2": 44, "krea2": 28, "qwen_image21": 32, "flux3_klein": 28}
+# Ideogram 4: 34 blocks; its per-block modulation, text projection and embedders are LoRA targets too
+N_BLOCKS["ideogram4"] = 34
+for _t in ("adaln", "text_in", "embed"):
+    EXTRA_TARGETS[_t] = (EXTRA_TARGETS[_t][0] + ("ideogram4",), EXTRA_TARGETS[_t][1])
 COMPILE_CHOICES = {"auto": "auto: runs of 100+ steps", True: "on", False: "off"}
 N_BLOCKS_MAX = max(N_BLOCKS.values())
 
@@ -72,6 +76,8 @@ MP_OPTIONS = {mp: f"{mp:g} MP ({mp_to_side(mp)}^2)" for mp in MEGAPIXEL_CHOICES}
 # the single files to download (Comfy-Org's repackages): which format
 FILE_QUANT_LABELS = {"int8_convrot": "int8 ConvRot (about half of bf16)", "fp8_scaled": "fp8 scaled",
                      "bf16": "bf16 (full size)"}
+FILE_QUANT_LABELS["nvfp4_mixed"] = "nvfp4 mixed (about a quarter of bf16)"  # Ideogram 4's
+FILE_QUANT_LABELS["nvfp4"] = "nvfp4 (about a third of bf16)"  # Ideogram 4's Qwen3-VL-8B text encoder
 TURBO_MODES = {"auto": "The model's turbo LoRA (downloaded)", "none": "None: full-quality sampling",
                "file": "A LoRA file"}
 ADAPTER_MODES = {"auto": "The model's training adapter (downloaded; Qwen-Image 2.1)", "none": "None",
@@ -599,6 +605,8 @@ def read_log_tail(n: int = 80) -> str:
 def download_model(model_path: str) -> str:
     from rulztrainer.moss.loading import resolve_model_dir
 
+    if TrainConfig(model_path=model_path).arch_name() == "ideogram4":  # without its unconditional model (9.3 GB)
+        from rulztrainer.ideogram4.loading import resolve_model_dir
     try:
         return f"Ready: {resolve_model_dir(model_path, 'models')}"
     except Exception as e:  # noqa: BLE001
@@ -2274,6 +2282,13 @@ def build_dataset_tab(f: Form):
                  "machine running RulzTrainer; on the same machine that is a plain copy. A file with the same name is "
                  "replaced. Click a picture to see it full size. Captions are saved to the image's .txt file as you "
                  "type. Face ref / Body ref pick the images that character LoRAs are scored against.")
+            hint("Ideogram 4 was trained on structured JSON captions only: a same-name .json caption in its schema "
+                 "(github.com/ideogram-oss/ideogram4, docs/prompting.md) trains it best and wins over the .txt. A "
+                 "plain .txt caption is wrapped into the smallest valid JSON caption, and the trigger word goes into "
+                 "its subject (object) element. Long JSON captions can pass 1024 tokens: raise Max caption tokens "
+                 "(Train tab) to 2048, Ideogram's limit, so they are not cut. Each cached caption keeps 104 KB per "
+                 "token (13 text encoder layers): about 4 MB for a short wrapped caption, 17-110 MB for JSON "
+                 "captions of 165-1077 tokens like Ideogram's examples.")
         with section("Look consistency filter", "Find the pictures whose face drifts from the look you want",
                      "face_retouching_natural", open_=False):
             hint("Tick Baseline on a few pictures below that nail the look (3 is a good number), then Scan: every "
@@ -2947,6 +2962,9 @@ MODEL_GB = {"moss_image": {"bf16": 10.0, "int8": 5.5, "nvfp4": 3.0}, "krea2": {"
             "fibo2": {"bf16": 16.0, "int8": 9.0, "nvfp4": 5.0},
             "qwen_image21": {"bf16": 14.2, "int8": 7.3, "nvfp4": 4.0},
             "flux3_klein": {"bf16": 9.7, "int8": 5.1, "nvfp4": 3.0}}  # Klein without its reference-image mode
+# Ideogram 4: 9.29 B weights (the release's fp8 file, 9.29 GB): bf16 about 18.6 GB; Comfy-Org's int8_convrot file
+# 9.58 GB, nvfp4_mixed 5.49 GB
+MODEL_GB["ideogram4"] = {"bf16": 18.6, "int8": 9.6, "nvfp4": 5.5}
 STEP_HEADROOM_GB = 4.5
 
 
@@ -2956,10 +2974,12 @@ def block_swap_plan(cfg: TrainConfig, vram: float, quant: str) -> tuple[int, flo
     if quant == "auto":
         if cfg.model_source == "files":
             quant = "bf16" if cfg.model_file_quant == "bf16" else "int8"
+            quant = "nvfp4" if cfg.model_file_quant == "nvfp4_mixed" else quant  # Ideogram 4's 5.5 GB file
         else:
             quant = {"krea2": "int8" if vram >= 22 else "nvfp4", "fibo2": "int8" if vram < 22 else "bf16",
                      "qwen_image21": "bf16" if vram >= 24 else "int8" if vram >= 11 else "nvfp4",
-                     "flux3_klein": "bf16" if vram >= 15 else "int8" if vram >= 9.5 else "nvfp4"}.get(fam, "bf16")
+                     "flux3_klein": "bf16" if vram >= 15 else "int8" if vram >= 9.5 else "nvfp4",
+                     "ideogram4": "bf16" if vram >= 30 else "int8" if vram >= 15 else "nvfp4"}.get(fam, "bf16")
     quant = {"int8_convrot": "int8", "none": "bf16"}.get(quant, quant)
     gb = MODEL_GB.get(fam, MODEL_GB["moss_image"]).get(quant, 10.0)
     blocks = get_arch(cfg).n_blocks or 28
@@ -3000,6 +3020,12 @@ MODEL_NOTES = {
     "FLUX-3-Klein": ("Not for training", "The 16-step distilled FLUX 3 Klein. Train on FLUX-3-Klein-Base and set this "
                                          "as the sampling model: a Base LoRA runs on it at 16 steps, CFG 1 (BFL: LoRA "
                                          "strength about 0.75)."),
+    "Ideogram-4": ("", "Ideogram 4 (9.3B), strong at typography and layout, trained on structured JSON captions. "
+                       "Comfy-Org's single files (int8, 9.6 GB, with the 9.4 GB Qwen3-VL-8B text encoder) train on "
+                       "one 16 GB card; its LoRAs load in ComfyUI and diffusers. Ideogram Non-Commercial Model "
+                       "Agreement: non-commercial use only; a LoRA trained on it is a Model Derivative under the same "
+                       "terms (share it with the agreement and its notice), and images made for revenue-generating "
+                       "uses are not allowed either."),
 }
 
 
@@ -3015,6 +3041,7 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     qwen = cfg.arch_name() == "qwen_image21"
     klein = cfg.arch_name() == "flux3_klein"
     klein_distilled = klein and get_arch(cfg).distilled_sample_model(cfg.sample_model_path or "")
+    ideo = cfg.arch_name() == "ideogram4"
     character = goal == "character"
     vram = min(g["total"] for g in gpus) / 1024 if gpus else None
     gpu_name = "your smallest GPU" if len(gpus) > 1 else "your GPU"
@@ -3048,6 +3075,10 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
             r["transformer_quant"] = ("auto", "FLUX 3 Klein picks for the memory it runs in: bf16 (9.7 GB; a 1 MP step "
                                               "peaked at 12.2 GB) on a 16 GB card, int8 (5.1 GB) from 10 GB, else "
                                               "nvfp4 (3 GB)")
+        elif ideo:
+            r["transformer_quant"] = ("auto", "Ideogram 4 (released in fp8) picks for the memory it runs in: bf16 "
+                                              "(about 18.6 GB) on 32 GB cards, int8 (9.6 GB) on 16 GB ones, else "
+                                              "nvfp4 (5.5 GB)")
         elif vram >= 22:
             r["transformer_quant"] = ("auto", f"{gpu_name} has {vram:.0f} GB, so the 10 GB bf16 model fits as it is")
         elif vram >= 11:
@@ -3057,6 +3088,7 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
             r["transformer_quant"] = ("nvfp4", f"{gpu_name} has {vram:.0f} GB: nvfp4 quarters the model so it fits "
                                                "(slower, fp4 weights are expanded every step)")
         te_gb = 9 if fibo or krea or klein else 17 if qwen else 19
+        te_gb = 17 if ideo else te_gb  # Ideogram 4's Qwen3-VL-8B (bf16 17.5 GB)
         if vram >= te_gb + 4:
             r["text_encoder_quant"] = ("auto", f"the {te_gb} GB text encoder fits on {gpu_name} as it is")
         else:
@@ -3221,6 +3253,9 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     elif qwen:
         r["sample_steps"] = (25, "ComfyUI's Qwen-Image 2.1 template (the diffusers pipeline: 40)")
         r["sample_cfg"] = (1.0, "Qwen-Image 2.1 is meant to be sampled without guidance")
+    elif ideo:
+        r["sample_steps"] = (20, "Ideogram's V4_DEFAULT_20 preset (V4_QUALITY_48 for its best)")
+        r["sample_cfg"] = (7.0, "Ideogram's guidance 7 (the last steps drop to 3 by themselves, as in its presets)")
     else:
         r["sample_steps"] = (20, "the reference MOSS-Image sampler")
         r["sample_cfg"] = (3.0, "the reference MOSS-Image guidance scale")
@@ -3832,7 +3867,7 @@ class Wizard:
                 .bind_visibility_from(self.w["model_source"], "value", lambda x: x == FILE_SOURCE):
             with self.setting(None, "File formats to download",
                               "int8 ConvRot is about half the size of bf16, trains as fast and loses under 1% "
-                              "accuracy (the default). Krea 2 also offers fp8."):
+                              "accuracy (the default). Krea 2 also offers fp8, Ideogram 4 fp8 and nvfp4."):
                 self.bind(ui.select(file_quant_options(preset_arch("MOSS-Image-Base"), "model"),
                                     label="Diffusion model"), "model_file_quant").classes("w-full")
                 self.bind(ui.select(file_quant_options(preset_arch("MOSS-Image-Base"), "text"),
@@ -3852,10 +3887,10 @@ class Wizard:
                                                                             "you already have.", "file"),
                     ("text_encoder_file", "Text encoder file (optional)", "Qwen3.5-9B for MOSS-Image, Qwen3-VL-4B for "
                                                                           "Krea 2, FIBO 2.0 and FLUX 3 Klein, "
-                                                                          "Qwen3-VL-8B for Qwen-Image 2.1.", "file"),
-                    ("vae_file", "VAE file (optional)", "The Flux2 VAE for MOSS-Image, FIBO 2.0 and FLUX 3 Klein, the "
-                                                        "Qwen-Image VAE for Krea 2, its own for Qwen-Image 2.1.",
-                     "file"),
+                                                                          "Qwen3-VL-8B for Qwen-Image 2.1 and Ideogram 4.", "file"),
+                    ("vae_file", "VAE file (optional)", "The Flux2 VAE for MOSS-Image, FIBO 2.0, FLUX 3 Klein and "
+                                                        "Ideogram 4, the Qwen-Image VAE for Krea 2, its own for "
+                                                        "Qwen-Image 2.1.", "file"),
                     ("tokenizer_path", "Tokenizer folder (optional)", "Left empty, the tokenizer is downloaded once "
                                                                       "(a few MB).", "dir")):
                 with self.setting(None, title, text + " Left empty, it is downloaded."):
@@ -4012,6 +4047,14 @@ class Wizard:
                           "after a few epochs, while the identity forms from the typical pictures.",
                           when=self.is_character):
             self.bind(ui.switch("Warm up look outliers"), "look_warmup")
+        with self.setting(None, "Ideogram 4 captions",
+                          "Ideogram 4 was trained on structured JSON captions only. A same-name .json caption in its "
+                          "schema (Ideogram's prompting guide) trains it best and wins over the .txt; a plain .txt "
+                          "caption is wrapped into the smallest valid JSON caption, with the trigger word in its "
+                          "subject element. JSON captions can be long: Max caption tokens 2048 keeps them whole.",
+                          show_if=("model_preset",
+                                   lambda p: preset_arch(p, self.w["model_path"].value) == "ideogram4")):
+            pass
         self.nav()
 
     def forget_scan(self):
@@ -4231,8 +4274,8 @@ class Wizard:
         with self.setting(None, "Turbo LoRA",
                           "A step-distilled LoRA used only while rendering samples and probes, never in training: "
                           "previews take seconds. The model's own is downloaded (MOSS-Image: 12 steps at CFG 1; "
-                          "Krea 2 and Qwen-Image 2.1: 8; FIBO 2.0: 4; FLUX 3 Klein has none) and the steps and "
-                          "guidance below follow it. "
+                          "Krea 2, Qwen-Image 2.1 and Ideogram 4: 8; FIBO 2.0: 4; FLUX 3 Klein has none) and the "
+                          "steps and guidance below follow it. "
                           "For MOSS-Image, Fizgig found it can understate likeness: judge likeness on full-quality "
                           "samples."):
             self.bind(ui.select(TURBO_MODES, label="Turbo LoRA"), "turbo_mode").classes("w-full")
@@ -5098,7 +5141,8 @@ def build_page(local: bool = True):
             ui.element("img").props('src="/assets/logo_dark.png" alt="Rulz"').classes("rz-logo rz-dark-only")
             ui.element("img").props('src="/assets/logo.png" alt="Rulz"').classes("rz-logo rz-light-only")
             ui.label("TRAINER").classes("rz-wordmark")
-            ui.label("LoRA training for MOSS-Image, Bria FIBO 2.0, Krea 2, Qwen-Image 2.1 and FLUX 3 Klein") \
+            ui.label("LoRA training for MOSS-Image, Bria FIBO 2.0, Krea 2, Qwen-Image 2.1, FLUX 3 Klein and "
+                     "Ideogram 4") \
                 .classes("rz-tagline gt-sm")
             ui.space()
             # sun in the dark look (switch to light), moon in the light look; CSS picks the icon, so it is right
@@ -5305,8 +5349,9 @@ def build_page(local: bool = True):
                                                               "now (Hugging Face's cache keeps them for later runs)")
                             files_status = hint("")
                             hint("The model picked above comes as single files from Comfy-Org's ComfyUI repackages "
-                                 "(Comfy-Org/MOSS-Image, Comfy-Org/Krea-2, Comfy-Org/Fibo-2.0, Comfy-Org/Qwen-Image-2.1; "
-                                 "FLUX 3 Klein: BFL's own black-forest-labs/flux-3-image-klein-comfy), "
+                                 "(Comfy-Org/MOSS-Image, Comfy-Org/Krea-2, Comfy-Org/Fibo-2.0, Comfy-Org/Qwen-Image-2.1, "
+                                 "Comfy-Org/Ideogram-4 (its int8 / bf16 text encoder from Qwen-Image 2.1's: the same "
+                                 "model); FLUX 3 Klein: BFL's own black-forest-labs/flux-3-image-klein-comfy), "
                                  "downloaded on the first "
                                  "run. To use files you already have, set them below: anything left empty is "
                                  "downloaded.")
@@ -5314,11 +5359,11 @@ def build_page(local: bool = True):
                                        "file", "", "w-[40rem]")
                             path_input(f, "text_encoder_file", "Text encoder file (optional; Qwen3.5-9B for MOSS-Image, "
                                                                "Qwen3-VL-4B for Krea 2, FIBO 2.0 and FLUX 3 Klein, "
-                                                               "Qwen3-VL-8B for Qwen-Image 2.1)", "file", "",
+                                                               "Qwen3-VL-8B for Qwen-Image 2.1 and Ideogram 4)", "file", "",
                                        "w-[40rem]")
-                            path_input(f, "vae_file", "VAE file (optional; Flux2 for MOSS-Image, FIBO 2.0 and FLUX 3 "
-                                                      "Klein, Qwen-Image for Krea 2, its own for Qwen-Image 2.1)",
-                                       "file", "", "w-[40rem]")
+                            path_input(f, "vae_file", "VAE file (optional; Flux2 for MOSS-Image, FIBO 2.0, FLUX 3 "
+                                                      "Klein and Ideogram 4, Qwen-Image for Krea 2, its own for "
+                                                      "Qwen-Image 2.1)", "file", "", "w-[40rem]")
                             path_input(f, "tokenizer_path", "Tokenizer folder (optional; auto-downloads if empty)",
                                        "dir", "", "w-[40rem]")
                         subhead("GPUs and memory")
@@ -5983,7 +6028,8 @@ def build_page(local: bool = True):
                                 .tooltip("A step-distilled LoRA used only while rendering samples and probes, never "
                                          "in training. The model's own: MOSS-Image lodestones' 8-step DMD LoRA (12 "
                                          "steps, CFG 1, shift 5), Krea 2 and Qwen-Image 2.1 Comfy-Org's Turbo LoRAs "
-                                         "(8 steps, CFG 1), FIBO 2.0 Comfy-Org's Turbo LoRA (4 steps, CFG 1).")
+                                         "(8 steps, CFG 1), FIBO 2.0 Comfy-Org's Turbo LoRA (4 steps, CFG 1), "
+                                         "Ideogram 4 ostris' TurboTime LoRA (8 steps, CFG 1).")
                             path_input(f, "turbo_lora", "Turbo / step-distill LoRA file", "file", "", "w-[30rem]")
                             f.w["turbo_lora"].parent_slot.parent.bind_visibility_from(w["turbo_mode"], "value",
                                                                                       lambda x: x == "file")
@@ -6020,6 +6066,15 @@ def build_page(local: bool = True):
                              "is meant to be sampled without guidance).").bind_visibility_from(
                             w["model_preset"], "value",
                             lambda p: preset_arch(p, w["model_path"].value) == "qwen_image21")
+                        hint("Ideogram 4: with ostris' TurboTime LoRA (community, 847 MB) samples render 8 steps at "
+                             "CFG 1, no unconditional pass. Without it, Ideogram's V4_DEFAULT_20: 20 steps at CFG 7, "
+                             "the last 2 at 3. Its guidance pass runs the image without text on the model you train "
+                             "(Ideogram's pipeline uses a separate unconditional model, not loaded here), so full "
+                             "samples are close to, not the same as, the official pipeline's. Prompts can be plain "
+                             "sentences (wrapped into its JSON caption) or JSON captions, which it was trained on; an "
+                             "empty negative prompt is the text-free pass.").bind_visibility_from(
+                            w["model_preset"], "value",
+                            lambda p: preset_arch(p, w["model_path"].value) == "ideogram4")
                         hint("MOSS-Image: lodestones' turbo LoRA renders 12 steps at CFG 1 on Base. Fizgig found it "
                              "can understate likeness: judge a run's likeness on full-quality samples (Turbo LoRA: "
                              "none, 20 steps, CFG 3).").bind_visibility_from(
@@ -7848,6 +7903,40 @@ image = pipe(prompt="<trigger>, <a full scene caption>", output="images")[0]
 
 BFL suggests a LoRA strength of about 0.75 on the distilled model. The FLUX Kommunity License allows non-commercial
 use, plus commercial outputs for companies under US$5M revenue; read it before you share or sell a LoRA.
+
+## Ideogram 4
+
+Pick **Ideogram-4** as the model. By default it comes as Comfy-Org's single files: the 9.3B diffusion model from
+Comfy-Org/Ideogram-4 in int8 ConvRot (9.6 GB; fp8_scaled 9.3 GB and nvfp4_mixed 5.5 GB are the other formats), the
+Flux2 VAE, and the Qwen3-VL-8B text encoder from Comfy-Org/Qwen-Image-2.1 (int8 ConvRot 9.4 GB: Ideogram 4 uses the
+same model, used for caching and then unloaded), so one 16 GB card trains it. There is no bf16 release: the
+Hugging Face source (ideogram-ai/ideogram-4-fp8, gated, or its unsloth/ideogram-4-fp8 mirror) is fp8 and is
+dequantized on load, then quantized for your GPU. Buckets are on the 16 px grid.
+
+**Captions**: Ideogram 4 was trained on structured JSON captions only (Ideogram's prompting guide has the schema). A
+same-name `.json` caption is used as it is and trains best; a plain `.txt` caption is wrapped into the smallest valid
+JSON caption, and the trigger word goes into its subject (object) element. Set *Max caption tokens* to 2048 for long
+JSON captions. Sample prompts can be plain sentences (wrapped the same way) or JSON captions.
+
+Samples render with ostris' community **TurboTime LoRA** (8 steps, CFG 1). Without it, Ideogram's V4_DEFAULT_20
+preset: 20 steps at CFG 7 with the last 2 at 3. Ideogram's pipeline guides with a second, separately trained
+*unconditional* model on the image alone; the trainer has one model, so its guidance pass runs the image without
+text on the model you train: close to, not the same as, the official pipeline's samples.
+
+LoRAs are saved with the checkpoint's own module names (`diffusion_model.layers.N.attention.qkv`, as ai-toolkit's):
+ComfyUI loads them with *LoraLoaderModelOnly* on the conditional model (ideogram4_*, not ideogram4_unconditional_*),
+and diffusers converts them itself:
+
+```python
+from diffusers import Ideogram4Pipeline
+pipe = Ideogram4Pipeline.from_pretrained("ideogram-ai/ideogram-4-nf4", torch_dtype=torch.bfloat16).to("cuda")
+pipe.load_lora_weights("output/<job>/<job>.safetensors")  # needs only the block layers (the default targets)
+image = pipe(json_caption, num_inference_steps=20, guidance_schedule=[7.0] * 18 + [3.0] * 2, std=1.75).images[0]
+```
+
+Ideogram 4 is under the Ideogram Non-Commercial Model Agreement: non-commercial use only. A LoRA trained on it is a
+Model Derivative under the same terms (share it with the agreement and its notice), and images made for
+revenue-generating uses are not allowed either.
 """
 
 

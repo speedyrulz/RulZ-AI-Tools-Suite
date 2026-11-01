@@ -28,6 +28,7 @@ from .config import ARCH_DEFAULT_TARGETS, ARCH_FULL_SAMPLE, TrainConfig
 log = logging.getLogger("rulztrainer")
 
 ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21", "flux3_klein")
+ARCH_NAMES += ("ideogram4",)
 
 
 def _match_suffix(name: str, suffixes: Iterable[str]) -> bool:
@@ -709,6 +710,151 @@ class Flux3KleinArch(Arch):
 
 _ARCHS = {"moss_image": MossArch, "fibo2": FiboArch, "krea2": Krea2Arch, "qwen_image21": QwenImage21Arch,
           "flux3_klein": Flux3KleinArch}
+class Ideogram4Arch(Arch):
+    name = "ideogram4"
+    label = "Ideogram 4"
+    modelspec = "ideogram-4"
+    # diffusion_model.<module>.lora_down/up + alpha in the checkpoint's own names (fused attention.qkv): ComfyUI has no
+    # Ideogram 4 LoRA key mapping, so it reads only its own module names (the generic diffusion_model. keys), and
+    # diffusers' Ideogram 4 loader converts this layout itself (qkv split into to_q / to_k / to_v); ai-toolkit saves
+    # the same. A PEFT file with diffusers' names would not load in ComfyUI.
+    lora_format = "comfy"
+    n_blocks = 34
+    # q, k and v share one fused Linear (as in the checkpoint, ComfyUI and ai-toolkit): any of them trains all three
+    GROUPS = {
+        "q": ("attention.qkv",), "k": ("attention.qkv",), "v": ("attention.qkv",), "o": ("attention.o",),
+        "ffn_up_gate": ("feed_forward.w1", "feed_forward.w3"), "ffn_down": ("feed_forward.w2",),
+        "adaln": ("adaln_modulation",),
+    }
+    EMBED = ("input_proj", "t_embedding", "adaln_proj", "final_layer")
+    target_groups = {"q": "attention query (q, k and v are one fused layer: any of the three trains it)",
+                     "k": "attention key (the fused qkv layer)", "v": "attention value (the fused qkv layer)",
+                     "o": "attention out", "ffn_up_gate": "feed-forward w1/w3", "ffn_down": "feed-forward w2",
+                     "adaln": "per-block modulation Linear (ai-toolkit's Ideogram 4 LoRAs train it too)",
+                     "text_in": "text projection (the 13 Qwen3-VL layers into the model)",
+                     "embed": "image / timestep projections and the final layer"}
+    default_targets = ARCH_DEFAULT_TARGETS["ideogram4"]
+    text_prefixes = ("llm_cond_proj",)
+    supports_single_files = True  # Comfy-Org's Ideogram 4 diffusion models, Qwen3-VL-8B text encoder and Flux2 VAE
+    default_sample_steps, default_sample_cfg = ARCH_FULL_SAMPLE["ideogram4"]
+    latent_tag = "_ideo4"  # the Flux2 VAE, but Ideogram's own normalization and channel order (ideogram4/loading.py)
+
+    def __init__(self):
+        from .ideogram4 import loading, prompts
+
+        self._loading, self._prompts = loading, prompts
+        self.empty_prompt = prompts.EMPTY_CAPTION  # caption dropout: the smallest valid caption, empty
+        self.default_negative = ""  # no text tokens: the pipeline's image-only unconditional branch
+
+    @staticmethod
+    def lora_module_name(name: str) -> str:
+        """diffusers' Ideogram 4 names (to_q / to_k / to_v / to_out.0) and ai-toolkit's conditional_transformer.
+        prefix -> the port's, for LoRA files made elsewhere."""
+        from .ideogram4.single_file import lora_module_name
+
+        return lora_module_name(name)
+
+    @staticmethod
+    def extra_lora_converter(state: dict) -> dict:
+        """A diffusers-layout LoRA's q / k / v parts placed in their thirds of the fused qkv rows."""
+        from .ideogram4.single_file import lora_to_fused_rows
+
+        return lora_to_fused_rows(state)
+
+    def resolve_for_config(self, cfg):
+        return self._loading.resolve_for_config(cfg)
+
+    def get_transformer(self, cfg, model_dir, device=None):
+        return self._loading.get_transformer(cfg, model_dir, device)
+
+    def get_vae(self, cfg, model_dir):
+        return self._loading.get_vae(cfg, model_dir)
+
+    def get_text_encoder(self, cfg, model_dir):
+        return self._loading.get_text_encoder(cfg, model_dir)
+
+    def load_any_transformer(self, path, device, quant="auto", models_dir="models"):
+        return self._loading.load_any_transformer(path, device, quant, models_dir)
+
+    def encode_prompt(self, text_encoder, tokenizer, prompt, max_length):
+        return self._loading.encode_prompt(text_encoder, tokenizer, prompt, max_length)
+
+    def pad_embeds(self, rows):
+        return self._loading.pad_embeds(rows)
+
+    def encode_images(self, vae, images):
+        return self._loading.encode_images(vae, images)
+
+    def decode_latents(self, vae, latents):
+        return self._loading.decode_latents(vae, latents)
+
+    def decode_latents_grad(self, vae, latents):
+        return self._loading.decode_latents_grad(vae, latents)
+
+    def grad_vae(self, vae):
+        return self._loading.grad_vae(vae)
+
+    def sample(self, model, pos_e, pos_m, neg_e, neg_m, **kw):
+        from .ideogram4.sampler import sample
+
+        return sample(model, pos_e, pos_m, neg_e, neg_m, **kw)
+
+    def sample_sigmas(self, model, steps, height, width, shift):
+        from .ideogram4.sampler import sample_sigmas
+
+        return sample_sigmas(model, steps, height, width)
+
+    def clean_prompt(self, prompt):
+        return self._prompts.clean_prompt(prompt)
+
+    def add_trigger(self, caption, trigger):
+        return self._prompts.add_trigger(caption, trigger)
+
+    def caption_file(self, image, cfg):
+        j = image.with_suffix(".json")  # a structured JSON caption wins over the plain caption file
+        return j if j.is_file() else image.with_suffix(cfg.caption_ext)
+
+    def lora_module_names(self, model, targets, blocks, include_text_embedder=False):
+        from .lora import _is_linear_like
+
+        targets = set(targets)
+        if include_text_embedder:
+            targets.add("text_in")
+        block_set = None if blocks is None else {int(b) for b in blocks}
+        in_block = sorted({s for t in targets for s in self.GROUPS.get(t, ())})
+        names = []
+        for name, module in model.named_modules():
+            if not _is_linear_like(module):
+                continue
+            if name.startswith("layers."):
+                if block_set is not None and int(name.split(".")[1]) not in block_set:
+                    continue
+                if _match_suffix(name, in_block):
+                    names.append(name)
+            elif name == "llm_cond_proj":
+                if "text_in" in targets:
+                    names.append(name)
+            elif "embed" in targets and name.split(".")[0] in self.EMBED:
+                names.append(name)
+        return names
+
+    def compile_blocks(self, model):
+        return list(model.layers)
+
+    def reference_sigmas(self, n, gen, tokens):
+        # Ideogram has not published its training noise distribution. Its documented time distribution is the
+        # logit-normal of the pipeline with the resolution-aware mean (docs/pipeline.md; the reference pipeline's
+        # defaults mu 0.5, std 1): sigma = expit(0.5 + 0.5 ln(pixels / 512^2) + N(0, 1)), clamped to the schedule's
+        # logSNR range. tokens are 16 x 16 px cells.
+        from .ideogram4.sampler import LOGSNR_MAX, LOGSNR_MIN, resolution_mean
+
+        mean = resolution_mean(0.5, 16 * int(tokens), 16)
+        s = torch.sigmoid(torch.randn(n, generator=gen) + mean)
+        t_min, t_max = 1.0 / (1.0 + math.exp(0.5 * LOGSNR_MAX)), 1.0 / (1.0 + math.exp(0.5 * LOGSNR_MIN))
+        return s.clamp(1.0 - t_max, 1.0 - t_min)
+
+
+_ARCHS["ideogram4"] = Ideogram4Arch
 _cache: dict[str, Arch] = {}
 
 
@@ -750,6 +896,8 @@ def arch_from_transformer_file(path: str) -> str | None:
             elif "early_stream_modulations.image.lin.weight" in names or \
                     "early_stream_modulations.image.linear.weight" in names:
                 found = "flux3_klein"
+            elif "embed_image_indicator.weight" in names and "llm_cond_proj.weight" in names:
+                found = "ideogram4"
         except Exception:  # noqa: BLE001
             found = None
         _FILE_ARCH_CACHE[key] = found
@@ -783,7 +931,8 @@ def detect_arch(cfg: TrainConfig, model_dir: Path | None) -> Arch:
         found = {"BriaFibo2Transformer2DModel": "fibo2", "Krea2Transformer2DModel": "krea2",
                  "MOSImageTransformer": "moss_image", "MOSSImageTransformer": "moss_image",
                  "QwenImage21Transformer2DModel": "qwen_image21",
-                 "Flux3Transformer2DModel": "flux3_klein"}.get(cls)
+                 "Flux3Transformer2DModel": "flux3_klein",
+                 "Ideogram4Transformer2DModel": "ideogram4"}.get(cls)
         if found and found != guessed:
             if cfg.model_arch not in ("", "auto"):
                 raise ValueError(f"model_arch is {cfg.model_arch!r} but {model_dir} holds a {found} transformer")
