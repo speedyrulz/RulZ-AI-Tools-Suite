@@ -197,9 +197,11 @@ from your account environment variables. The script upgrades `huggingface_hub` o
 has no bucket support.
 
 **Compiled kernels for every rental (`compile_cache`).** A run that compiles saves its compiled kernels to
-`models/.rulz_compile/` (one file per torch, triton and GPU model, about 18 MB for Qwen-Image 2.1). Upload that file
-to your bucket's `.rulz_compile/` folder: the next rental of the same GPU model syncs it to
+`models/.rulz_compile/` (one file per torch, triton, GPU model, Python and operating system, about 16-18 MB for
+Qwen-Image 2.1). Upload the file a rental made (its name ends in `-linux.bin`; one from a Windows PC is skipped on
+Linux) to your bucket's `.rulz_compile/` folder: the next rental of the same GPU model syncs it to
 `models/bucket/.rulz_compile/` and skips most of the first compile (see [torch.compile](#torchcompile-compile_model)).
+With `RULZ_MODEL_INCLUDE`, add `.rulz_compile/*` to its patterns.
 The WebUI also keeps torch's own compile caches under `/workspace/.cache`, so a restarted instance stays warm.
 
 Service control on the instance: `supervisorctl status|restart rulztrainer`; its log is
@@ -2406,19 +2408,23 @@ is not done.
 **Compile cache (`compile_cache`, default `auto`).** torch's on-disk caches already keep compiled kernels between runs
 on one machine; a fresh machine (a new vast.ai rental) starts cold. With `auto` a compiled run also saves torch's
 "Mega-Cache" of every compile artifact to `<models_dir>/.rulz_compile/` after 5 steps and at the end, one file per
-torch / triton / GPU model, and loads a matching file (from there or from `models/bucket/.rulz_compile/`) before the
-blocks compile. A file another torch, triton or GPU made is skipped. Set a folder, or `off`. Measured on the RTX 5060
-Ti, Qwen-Image 2.1 int8 at 768x768, compile to the end of step 5, with emptied inductor and triton cache folders for
-the "new machine" runs:
+torch / triton / GPU model / Python / operating system, and loads a matching file (from there or from
+`models/bucket/.rulz_compile/`) before the blocks compile. A file another torch, triton, GPU, Python or operating
+system made is skipped; when none matches, the log names the files it found. Set a folder, or `off`. Measured on the
+RTX 5060 Ti, Qwen-Image 2.1 int8 at 768x768, compile to the end of step 5, with emptied inductor and triton cache
+folders for the "new machine" runs (Linux: WSL Ubuntu 24.04, same card, torch, triton and Python; every run listed):
 
-| start | compiling (to step 5) | file |
+| start | Windows | Linux |
 |---|---|---|
-| new machine, no file | 82 s | saved: 17.4 MB |
-| new machine, with the file | **32 s** | loaded |
-| same machine, warm caches | 30 s | - |
+| new machine, no file | 82 s | 53 s, 52 s, 58 s |
+| new machine, with the file | **32 s** | **37 s, 30 s, 36 s** |
+| same machine, warm caches | 30 s | 44 s, 30 s |
+| Linux, with the file a Windows PC made | - | 51 s (no gain) |
 
-Step times and losses are the same in all three. Measured on Windows; a Linux rental compiles faster cold, so the
-saving there is smaller (not measured).
+The file is 16-18 MB. The file changes neither step time nor loss (2.06 s per step on Windows, 2.13-2.14 s on Linux,
+loss 0.2519 in every run). A file only helps where it was made: torch's cache keys hash its own binaries, which differ
+per operating system and Python version, so before the names carried them a Windows file loaded on Linux without error
+and compiled as long as cold. For vast.ai, upload a file a rental made.
 
 `RULZ_PROFILE_STEP=N` writes such a profile of step N (`profile_step_N.txt` in the job folder), and
 `scripts/bench.py` runs the short timing runs used here (it waits for idle GPUs).

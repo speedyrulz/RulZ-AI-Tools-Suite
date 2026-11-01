@@ -7,10 +7,12 @@ sampling, guidance batches, the region-prior pass and every GPU add variants. to
 a hit recompile limit) go to train.log. report() summarizes frames, graphs, graph breaks by reason and compile time.
 
 The compiled kernels persist across machines (compile_cache): torch's on-disk caches already keep them between runs
-on one machine, but a fresh vast.ai rental starts cold (Krea 2 nvfp4: 160 s of compiling instead of 36 s). Their
-"Mega-Cache" serializes every compile artifact of the process into one file per torch / triton / GPU model, saved in
-`<models_dir>/.rulz_compile` after 5 steps and at the end, and loaded before the blocks compile; a file another
-torch, triton or GPU made is skipped.
+on one machine, but a fresh vast.ai rental starts cold (Qwen-Image 2.1 on Linux: 52-58 s to step 5 instead of 30-37 s
+with the file; Krea 2 nvfp4 on Windows: 160 s of compiling instead of 36 s). Their "Mega-Cache" serializes every
+compile artifact of the process into one file per torch / triton / GPU model / Python / operating system, saved in
+`<models_dir>/.rulz_compile` after 5 steps and at the end, and loaded before the blocks compile; a file another torch,
+triton, GPU, Python or operating system made is skipped. (torch's cache keys hash its own binaries, which differ per
+Python version and operating system: a Windows file loads on Linux, same versions and GPU, but none of it is used.)
 
 RULZ_COMPILE_NESTED=1 sets nested_graph_breaks (a measurement variant: a break no longer bubbles up to the caller's
 frame); RULZ_COMPILE_THREAD_LIMITS=0 leaves torch's own limits in the other threads (the behaviour before
@@ -121,19 +123,25 @@ def cache_dirs(setting: str, models_dir) -> list[Path]:
 
 
 def cache_name(device) -> str:
-    """The cache file's name: what a cache only works with (torch, triton and the training GPU's model)."""
+    """The cache file's name: what a cache only works with (torch, triton, the training GPU's model, the Python version
+    and the operating system)."""
     import re
+    import sys
 
     import triton
 
     dev = torch.device(device)
     gpu = re.sub(r"[^A-Za-z0-9.]+", "-", torch.cuda.get_device_name(dev)).strip("-")
     major, minor = torch.cuda.get_device_capability(dev)
-    return f"torch{torch.__version__}-triton{triton.__version__}-{gpu}-sm{major}{minor}.bin".replace("+", "_")
+    py = "py%d%d" % sys.version_info[:2]
+    system = {"win32": "windows"}.get(sys.platform, sys.platform)
+    return (f"torch{torch.__version__}-triton{triton.__version__}-{gpu}-sm{major}{minor}-{py}-{system}.bin"
+            .replace("+", "_"))
 
 
 def load_cache(dirs: list[Path], device) -> Path | None:
-    """Load the first matching cache file; the file it read, or None (none there, or one torch refused)."""
+    """Load the first matching cache file; the file it read, or None (none there, or one torch refused). Files there
+    for another machine are named in the log, so an upload from the wrong machine shows up."""
     try:
         name = cache_name(device)
     except Exception:  # noqa: BLE001  (no triton or no GPU: nothing to load)
@@ -147,6 +155,10 @@ def load_cache(dirs: list[Path], device) -> Path | None:
             return f
         except Exception as e:  # noqa: BLE001
             log.warning("compile_cache: could not load %s (%s); compiling from scratch", f, e)
+    if not any((d / name).is_file() for d in dirs):
+        others = sorted(str(f) for d in dirs if d.is_dir() for f in d.glob("*.bin"))
+        if others:
+            log.info("compile_cache: no file for this machine (%s); found only %s", name, ", ".join(others))
     return None
 
 

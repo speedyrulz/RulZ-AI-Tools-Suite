@@ -391,7 +391,7 @@ class TrainConfig:
     #                                     with triton; measured 26% faster per step on MOSS-Image, 12% on Krea 2)
     compile_cache: str = "auto"  # compiled kernels kept across machines: auto (<models_dir>/.rulz_compile, also read
     #                              from models/bucket/.rulz_compile) | a folder | off. Saves a fresh vast.ai rental's
-    #                              cold compile (one file per torch / triton / GPU model)
+    #                              cold compile (one file per torch / triton / GPU model / Python / OS)
 
     # --- optimization ---
     steps: int = 2000
