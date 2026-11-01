@@ -124,6 +124,67 @@ def test_model_split_hand_off_matches():
         assert torch.equal(ours(x, 300.0, enc, None), want)
 
 
+def _alignment_grads(checkpointing: bool):
+    """Attention localization and identity alignment on the joint blocks (the trainer's taps), as test_alignment does
+    for the other families."""
+    from types import SimpleNamespace
+
+    from rulztrainer import alignment as A
+
+    torch.manual_seed(0)
+    model, _ = pair(10)
+    model.gradient_checkpointing = checkpointing
+    model.train()
+    for p in model.parameters():
+        p.requires_grad_(True)
+    taps = A.Taps([1], [0, 2])
+    model._rz_taps = taps
+    for i in (0, 2):
+        A.attention_module(model.layers[i])._rz_tap = A.AttnTap(taps, i)
+    aligner = A.IdAligner(A.model_dim(model))
+    prior = torch.ones(2, 1, 4, 6, dtype=torch.bool)
+    prior[:, :, 1:4, 1:4] = False
+    regions = SimpleNamespace(prior=prior, meta=[SimpleNamespace(prior=prior[b], face_cells=(1, 1, 3, 3),
+                                                                 has_person=True) for b in range(2)],
+                              text_paths=["0", "1"])
+    enc = torch.randn(2, 7, 24)
+    mask = torch.ones(2, 7, dtype=torch.bool)
+    mask[1, 5:] = False
+    taps.begin([[0, 1], [2]])
+    out = model(torch.randn(2, 16, 4, 6), torch.tensor([600.0, 200.0]), enc, mask)
+    taps.stop()
+    loc, n_loc = A.localization_loss(taps, regions)
+    targets = [torch.nn.functional.normalize(torch.randn(A.FACE_EMB_DIM), dim=0) for _ in range(2)]
+    ali, n_ali = aligner.loss(taps, 1, regions, targets)
+    assert n_loc == 2 and n_ali == 2 and 0 < loc.item() < 1
+    (out.float().pow(2).mean() + 0.5 * loc + 0.5 * ali).backward()
+    taps.end()
+    return [p.grad.clone() for p in list(model.parameters()) + list(aligner.parameters()) if p.grad is not None]
+
+
+def test_alignment_taps_on_the_joint_blocks_match_with_checkpointing():
+    plain, ckpt = _alignment_grads(False), _alignment_grads(True)
+    assert len(plain) == len(ckpt)
+    for a, b in zip(plain, ckpt):
+        assert torch.allclose(a, b, atol=1e-6, rtol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_block_swap_streams_the_joint_blocks():
+    from rulztrainer.blockswap import BlockSwap
+
+    ours, _ = pair(11)
+    ours = ours.to("cuda").requires_grad_(False)
+    x, enc = torch.randn(1, 16, 2, 4, device="cuda"), torch.randn(1, 5, 24, device="cuda")
+    with torch.no_grad():
+        want = ours(x, 500.0, enc, None)
+        swap = BlockSwap(ours, [0, 1], "cuda")
+        assert ours.single_blocks[0].q_proj.weight.device.type == "cpu"
+        got = ours(x, 500.0, enc, None)
+    swap.remove()
+    assert torch.allclose(got, want, atol=1e-5) and swap.bytes > 0
+
+
 def real_keys() -> dict:
     return json.loads((FIXTURES / "flux3_klein_keys.json").read_text(encoding="utf-8"))
 
