@@ -121,9 +121,10 @@ def is_gated_error(err: Exception) -> bool:
     return status in (401, 403)
 
 
-def resolve_model_dir(model_path: str, models_dir: str = "models") -> Path:
+def resolve_model_dir(model_path: str, models_dir: str = "models", patterns: list[str] | None = None) -> Path:
     """A local diffusers folder for a repo id or path, downloading the folders the trainer reads (transformer/,
-    text_encoder/, vae/ and the configs, about 20 GB; not BFL's root single files or variants/)."""
+    text_encoder/, vae/ and the configs, about 20 GB; not BFL's root single files or variants/). patterns: fewer
+    (a sampling model needs its transformer/ alone, 11 GB)."""
     p = Path(model_path).expanduser()
     if p.is_dir():
         return p.resolve()
@@ -132,9 +133,10 @@ def resolve_model_dir(model_path: str, models_dir: str = "models") -> Path:
         return local.resolve()
     from huggingface_hub import snapshot_download
 
-    log.info("Downloading %s to %s (transformer, text encoder and VAE, about 20 GB)...", model_path, local)
+    log.info("Downloading %s to %s (%s)...", model_path, local, "the transformer, about 11 GB" if patterns else
+             "transformer, text encoder and VAE, about 20 GB")
     try:
-        snapshot_download(model_path, local_dir=str(local), allow_patterns=HF_PATTERNS)
+        snapshot_download(model_path, local_dir=str(local), allow_patterns=patterns or HF_PATTERNS)
     except Exception as e:  # noqa: BLE001
         if is_gated_error(e):
             raise gated_error(model_path, e) from e
@@ -334,4 +336,5 @@ def load_any_transformer(path: str, device, quant: str = "auto", models_dir: str
         return fsf.load_transformer_file(p, device, quant)
     if p.is_dir() and (p / "transformer" / "config.json").is_file():
         return load_transformer(p, device, quant)
-    return load_transformer(resolve_model_dir(path, models_dir), device, quant)
+    return load_transformer(resolve_model_dir(path, models_dir, ["*.json", "transformer/*", "LICENSE.md"]), device,
+                            quant)
