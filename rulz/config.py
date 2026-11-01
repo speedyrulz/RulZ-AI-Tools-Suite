@@ -7,7 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 
 APP_NAME = "RulZ Image Preparer"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.4.1"
 
 THUMB_MAX_SIDE = 400
 DEFAULT_STRENGTH = 50
