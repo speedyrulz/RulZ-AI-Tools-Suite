@@ -11,7 +11,7 @@ size, turbo LoRA) and scores it against the face / body references. The controll
                                    resolution, and after `step_up_stop_patience` such probes at the highest
                                    one stop training (replaces `likeness_patience` in that mode)
   * bounded lr multiplier          hill-climb a factor on the inner optimizer's lr (works with AdamW-style
-                                   optimizers through the scheduler and with Automagic 3 through its lr tensors)
+                                   optimizers through the scheduler and with Automagic 3/4 through their lr tensors)
   * face / body curriculum         when the face lags the body (or vice versa), sample close-up dataset images
                                    more often and shift the timestep distribution toward lower (detail) or
                                    higher (structure) noise
@@ -335,8 +335,8 @@ def append_record(job_dir: Path, rec: ProbeRecord) -> None:
 
 
 def apply_lr_ratio(optimizer, scheduler, ratio: float) -> None:
-    """Multiply the effective learning rate by `ratio`, for schedulers (base lrs) and Automagic 3 (lr tensors)."""
-    if hasattr(optimizer, "get_avg_learning_rate"):  # Automagic 3: adaptive per-param lr tensors
+    """Multiply the effective learning rate by `ratio`, for schedulers (base lrs) and Automagic 3/4 (lr tensors)."""
+    if hasattr(optimizer, "get_avg_learning_rate"):  # Automagic 3/4: adaptive per-param lr tensors (group mirrors)
         for group in optimizer.param_groups:
             for p in group["params"]:
                 st = optimizer.state.get(p)

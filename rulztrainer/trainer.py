@@ -26,7 +26,7 @@ from . import profiling
 from . import race as race_mod
 from .ema import LoraEMA
 from . import quant as Q
-from .config import TrainConfig
+from .config import AUTOMAGIC, TrainConfig
 from .config import side_to_mp
 from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, describe_sides, dropout_text_path,
                       items_for_side, load_batch,
@@ -275,19 +275,25 @@ def build_optimizer(cfg: TrainConfig, params):
 
         return Adafactor(params, lr=cfg.learning_rate, scale_parameter=False, relative_step=False,
                          warmup_init=False, weight_decay=cfg.weight_decay)
-    if name == "automagic3":
-        from .optimizers.automagic3 import Automagic3
-
+    if name in AUTOMAGIC:
         if params and isinstance(params[0], dict):
             if {g.get("name") for g in params} <= {"lora", "lora_down", "lora_up"}:  # Automagic owns its lr: collapse
                 if len(params) > 1:  # the LoRA+ groups
-                    log.warning("lora_plus_ratio is ignored with automagic3 (it adapts each group's lr itself)")
+                    log.warning("lora_plus_ratio is ignored with %s (it adapts each group's lr itself)", name)
                 params = [p for g in params for p in g["params"]]
             else:  # automagic_groups: by_type, each layer type adapts its own lr from the shared start
                 params = [{"params": g["params"]} for g in params]
-        return Automagic3(params, lr=cfg.learning_rate, min_lr=cfg.automagic_min_lr, max_lr=cfg.automagic_max_lr,
-                          weight_decay=cfg.weight_decay, polarity_history=cfg.automagic_polarity_history,
-                          clip_threshold=cfg.automagic_clip_threshold, fused=False)
+        kw = dict(lr=cfg.learning_rate, min_lr=cfg.automagic_min_lr, max_lr=cfg.automagic_max_lr,
+                  weight_decay=cfg.weight_decay, polarity_history=cfg.automagic_polarity_history,
+                  clip_threshold=cfg.automagic_clip_threshold, fused=False)
+        if name == "automagic4":
+            from .optimizers.automagic4 import Automagic4
+
+            return Automagic4(params, sensitivity_quantile=cfg.automagic_sensitivity_quantile, vote=cfg.automagic_vote,
+                              max_vote=cfg.automagic_max_lr_change, **kw)
+        from .optimizers.automagic3 import Automagic3
+
+        return Automagic3(params, **kw)
     raise ValueError(f"Unknown optimizer {cfg.optimizer}")
 
 
@@ -301,7 +307,7 @@ def current_lr(optimizer, scheduler) -> float:
 def build_scheduler(cfg: TrainConfig, optimizer, offset: int = 0):
     """offset: the run's step this optimizer starts at (a fine-tune rebuilds its optimizer every window)."""
     warm = max(0, cfg.warmup_steps)
-    if cfg.optimizer.lower() == "automagic3":  # self-tuning lr: no warmup/decay from outside
+    if cfg.optimizer.lower() in AUTOMAGIC:  # self-tuning lr: no warmup/decay from outside
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
 
     def fn(step):
@@ -1097,7 +1103,7 @@ class Trainer(RaceParallelMixin):
         def ft_rotate(at_step: int) -> None:
             """A fine-tune's next window: the trained one written back, the next one up, a fresh optimizer."""
             nonlocal params, optimizer, scheduler
-            params, optimizer, scheduler = self._finetune_rotate(cfg, at_step)
+            params, optimizer, scheduler = self._finetune_rotate(cfg, at_step, optimizer)
 
         retry_jobs = None  # (per_rep, step_images) of a step that ran out of memory, trained again as they were
         while step < cfg.steps or self._race_running():
@@ -1374,23 +1380,29 @@ class Trainer(RaceParallelMixin):
         if cfg.finetune_anchor > 0:
             log.info("Fine-tune: the weights decay toward the original model's (finetune_anchor %g x lr per step), "
                      "not toward zero", cfg.finetune_anchor)
-        if cfg.learning_rate > 5e-5:
+        if cfg.learning_rate > 5e-5 and cfg.optimizer.lower() not in AUTOMAGIC:
             log.warning("Learning rate %g is high for a fine-tune (Fizgig measured 1e-5 on Krea 2; 1e-4 overcooks): "
                         "the weights themselves move, not an adapter", cfg.learning_rate)
         return self._finetune_window(cfg, 0, 0)
 
-    def _finetune_window(self, cfg, i: int, step: int):
+    def _finetune_window(self, cfg, i: int, step: int, prev=None):
         params = self.ft.activate(i)
         self.ft_window = i
+        lr = cfg.learning_rate
+        if prev is not None and hasattr(prev, "get_avg_learning_rate"):  # Automagic: the adapted lr carries over
+            lr = float(prev.get_avg_learning_rate())
+            log.info("Fine-tune: the next window starts at the adapted lr %.2e", lr)
         # the optimizer's weight decay would shrink the model's weights toward zero: off (finetune_anchor instead)
-        optimizer = build_optimizer(dataclasses.replace(cfg, weight_decay=0.0),
-                                    [{"params": params, "lr": cfg.learning_rate, "name": "finetune"}])
+        optimizer = build_optimizer(dataclasses.replace(cfg, weight_decay=0.0, learning_rate=lr),
+                                    [{"params": params, "lr": lr, "name": "finetune"}])
+        if prev is not None and hasattr(optimizer, "inherit_reference"):  # Automagic 4: the window's first step trains
+            optimizer.inherit_reference(prev)
         scheduler = build_scheduler(cfg, optimizer, offset=step)
         self.status.update(finetune={"window": i + 1, "windows": len(self.ft.windows), "cycle": self.ft.cycles + 1,
                                      "layers": len(self.ft.windows[i]), "rotate_steps": self.ft_rotate_steps})
         return params, optimizer, scheduler
 
-    def _finetune_rotate(self, cfg, step: int):
+    def _finetune_rotate(self, cfg, step: int, prev=None):
         ft = self.ft
         ft.deactivate()
         free_cuda()
@@ -1402,7 +1414,7 @@ class Trainer(RaceParallelMixin):
 
         log.info("Fine-tune: window %d of %d (%s) from step %d", nxt + 1, len(ft.windows), describe_window(ft.windows[nxt]),
                  step)
-        return self._finetune_window(cfg, nxt, step)
+        return self._finetune_window(cfg, nxt, step, prev)
 
     def _finetune_cycle_done(self, step: int) -> bool:
         """True at the steps that end a cycle (the last window's last step)."""
@@ -1556,6 +1568,17 @@ class Trainer(RaceParallelMixin):
             raise ValueError(f"Training state was saved with lora_plus_ratio={saved_cfg.get('lora_plus_ratio', 0)} "
                              f"and automagic_groups={saved_cfg.get('automagic_groups', 'single')} ({saved_groups} "
                              f"param groups); set the same values to resume")
+        saved_opt = str((st.get("config") or {}).get("optimizer", "") or "").lower()
+        if saved_opt and saved_opt != self.cfg.optimizer.lower():
+            if saved_opt in AUTOMAGIC and self.cfg.optimizer.lower() in AUTOMAGIC:
+                log.info("Training state was saved with %s; continuing with %s (the adapted lr and sign history carry "
+                         "over%s)", saved_opt, self.cfg.optimizer,
+                         "; the sensitivity reference is measured on the first step"
+                         if self.cfg.optimizer.lower() == "automagic4" else "")
+            else:
+                raise ValueError(f"Training state was saved with optimizer {saved_opt} but the config says "
+                                 f"{self.cfg.optimizer}; set optimizer: {saved_opt} to resume it (only Automagic 3 "
+                                 f"and 4 states convert into each other)")
         optimizer.load_state_dict(st["optimizer"])
         scheduler.load_state_dict(st["scheduler"])
         gen.set_state(st["torch_gen"])
@@ -2095,9 +2118,9 @@ class Trainer(RaceParallelMixin):
         return f"{self.race.active.name}_" if self._race_running() else ""
 
     def _make_optimizer(self, cfg, injected):
-        if cfg.optimizer.lower() == "automagic3" and cfg.automagic_groups == "by_type":
+        if cfg.optimizer.lower() in AUTOMAGIC and cfg.automagic_groups == "by_type":
             groups = lora_mod.lora_param_groups_by(injected, cfg.learning_rate, self.arch.param_group_of)
-            log.info("Automagic3: an adaptive lr per layer type (%s)", ", ".join(
+            log.info("%s: an adaptive lr per layer type (%s)", cfg.optimizer, ", ".join(
                 f"{g['name']} {sum(p.numel() for p in g['params']) / 1e6:.1f}M" for g in groups))
         else:
             groups = lora_mod.lora_param_groups(injected, cfg.learning_rate, cfg.lora_plus_ratio)
@@ -2351,9 +2374,9 @@ class Trainer(RaceParallelMixin):
             return None
         from .losswatch import LossWatch
 
-        if cfg.per_image_lr and cfg.optimizer.lower() == "automagic3":
-            log.warning("per_image_lr is not supported with automagic3 (its step normalisation absorbs the scaling); "
-                        "the loss watch will only observe")
+        if cfg.per_image_lr and cfg.optimizer.lower() in AUTOMAGIC:
+            log.warning("per_image_lr is not supported with %s (its step normalisation absorbs the scaling); "
+                        "the loss watch will only observe", cfg.optimizer)
             cfg.per_image_lr = False
         watch = LossWatch(cfg, items, self.job_dir, cfg.resolved_cache_dir() / "excluded.json")
         mode = ("true per-image lr" if cfg.per_image_lr and cfg.batch_size == 1 and cfg.gradient_accumulation == 1
