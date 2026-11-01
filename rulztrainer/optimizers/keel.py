@@ -1,7 +1,8 @@
 """Keel: Automagic 4 for character LoRAs (docs/keel-optimizer.md). Milestones 1 to 5 of that design: the LoRA
 gauge preconditioner, the cautious mask, the noise-band normalisation, the cross-photo consensus gate, the
-probe-gated lookahead and the face-token gain. With every switch off it is Automagic 4 exactly (test_keel asserts
-it bitwise).
+probe-gated lookahead and the face-token gain, plus the body share and the magnitude vote of the face-and-body
+version (optimizer: keel_fb, the same class with body_weight and consensus_mode="magnitude"). With every switch
+off it is Automagic 4 exactly (test_keel asserts it bitwise).
 
 Gauge preconditioner (keel_gauge)
 ---------------------------------
@@ -82,6 +83,18 @@ the photos disagree on carries little vote weight, like a dead one). It needs tw
 matters here: sign disagreement between micro-batches at different noise levels is mostly the noise level,
 not the content. The mean gate is logged every 250 steps.
 
+consensus_mode picks how the gradients vote. "sign" is the above: one vote each, 1 B/weight. "magnitude": the hook
+sums |g_k| as well (an fp32 buffer per tensor for the step, 4 B/weight), gather() turns the two sums into
+a = |sum g_k| / sum |g_k| per element (the same a when every gradient has the same size, nearly 1 where one
+gradient dwarfs the rest) and the gate is the same function of it. The sign vote gives a micro-batch that has
+little to say about a weight (a face crop, for the weights serving the body: a tiny gradient of random sign) the
+same say as one that has a lot, so in a step mixing crops and full shots the body-serving elements are pushed
+toward the floor by the crops; the magnitude vote lets each gradient weigh in by its size. A replica's sum joins
+the sums through take_replica before gather() (the step loop reduces the replicas first, then gathers), so the
+ratio is exact; a reduce after gather() carries the ratio forward instead, with the sum of sizes behind it
+recovered as |S| / a (exact unless S cancelled to exactly 0). The face-and-body version's default; plain Keel's is
+the sign vote.
+
 Probe-gated lookahead (keel_lookahead, keel_lookahead_pullback, keel_lookahead_lr, keel_lookahead_grace)
 -----------------------------------------------------------------------------------------------------
 The likeness probes with the held-out judge are the one signal nothing trains on. Lookahead (Zhang et al. 2019)
@@ -111,6 +124,17 @@ keel_face_gain_beta into state["face_gain"] (a 0-dim fp32, the pair's lora_down 
 update through _element_gain with the consensus gate. Tensors without a report keep their gain; a step without one
 changes nothing. Off by default until raced.
 
+Body share (body_weight: the face-and-body version)
+---------------------------------------------------
+With body_weight > 0 the tap also reports the energy from the body's tokens (the person's cells outside the face
+box: lora.body_token_mask, which needs the region maps' person masks) over the samples with a face or a body, and
+the gain combines the two regions' ratios against their own medians as a weighted geometric mean,
+gain = exp(face_gain (log r_face + body_weight log r_body) / (1 + body_weight)), clamped as before; a step whose
+samples report no face energy (person-only photos) moves the gain by the body ratio alone, and the other way
+round. The regions are normalised apart because the body covers many more tokens than the face and would set a
+pooled share by area alone. optimizer: keel_fb is Keel with body_weight (keel_body_weight, 1) and the magnitude
+vote: the same code, raceable as its own row.
+
 Pairs: build_optimizer passes the (lora_down, lora_up) pairs of the injected LoRA layers; LoKr, OFT and a
 fine-tune have none, and the step is then Automagic 4's. A race switching a wrapper to LoKr leaves its LoRA
 tensors empty, which the step skips.
@@ -132,6 +156,8 @@ LOG_EVERY = 250  # steps between the periodic log lines (cautious share, band st
 BAND_MIN_OBS = 8  # a band is normalised on its own statistics after this many steps that saw it
 BAND_WINDOW = 10  # the band statistics: a running mean until this many observations, an EMA of that window after
 GAIN_MAX = 10.0  # the band scale stays within [1/GAIN_MAX, GAIN_MAX] (a 100x quieter band is lifted at most 10x)
+TINY = 1e-30  # the floor under a sum of gradient sizes (fp32 normal): a ratio of two sums never divides by 0
+CONSENSUS_MODES = ("sign", "magnitude")
 
 
 def band_of(sigma: float, bands: int) -> int:
@@ -163,7 +189,8 @@ def gauge_precondition(g_down: torch.Tensor, g_up: torch.Tensor, down: torch.Ten
 
 
 def consensus_gate(agree: torch.Tensor, votes: int, consensus: float, power: float) -> torch.Tensor:
-    """floor + (1 - floor) (|agree| / votes)^power in fp32, floor = 1 - consensus."""
+    """floor + (1 - floor) (|agree| / votes)^power in fp32, floor = 1 - consensus (the magnitude vote passes its
+    ratio |sum g| / sum |g| with votes 1). A new tensor: `agree` is left as it is."""
     a = agree.abs().to(torch.float32).div_(float(votes))
     if power != 1.0:
         a.pow_(power)
@@ -193,6 +220,8 @@ class Keel(Automagic4):
         The consensus gate's strength: 0 = off, 1 = a hard AND-mask. Needs the accumulation hook.
     consensus_power : float > 0
         The exponent on the agreement share.
+    consensus_mode : "sign" | "magnitude"
+        How the step's gradients vote: one vote each by sign, or each weighted by its size (|sum g| / sum |g|).
     lookahead : bool
         The probe-gated lookahead (fed by on_probe).
     lookahead_pullback : float in (0, 1]
@@ -207,14 +236,17 @@ class Keel(Automagic4):
         The gain stays within [1 / max, max].
     face_gain_beta : float in [0, 1)
         The EMA of the gain over steps.
+    body_weight : float >= 0
+        The body tokens' weight against the face's in the gain (the face-and-body version; 0 = face only).
     """
 
     def __init__(self, params, *args, pairs: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = None,
                  gauge: bool = True, gauge_eps: float = 0.01, cautious: bool = True, bands: int = 8,
                  band_weights: Optional[Sequence[float]] = None, consensus: float = 0.5,
-                 consensus_power: float = 2.0, lookahead: bool = False, lookahead_pullback: float = 0.5,
-                 lookahead_lr: float = 0.7, lookahead_grace: int = 2, face_gain: float = 0.0,
-                 face_gain_max: float = 2.0, face_gain_beta: float = 0.9, **kwargs):
+                 consensus_power: float = 2.0, consensus_mode: str = "sign", lookahead: bool = False,
+                 lookahead_pullback: float = 0.5, lookahead_lr: float = 0.7, lookahead_grace: int = 2,
+                 face_gain: float = 0.0, face_gain_max: float = 2.0, face_gain_beta: float = 0.9,
+                 body_weight: float = 0.0, **kwargs):
         if not gauge_eps > 0.0:
             raise ValueError(f"gauge_eps ({gauge_eps}) must be above 0")
         if int(bands) < 1:
@@ -227,6 +259,8 @@ class Keel(Automagic4):
             raise ValueError(f"consensus ({consensus}) must be within [0, 1]")
         if not consensus_power > 0.0:
             raise ValueError(f"consensus_power ({consensus_power}) must be above 0")
+        if consensus_mode not in CONSENSUS_MODES:
+            raise ValueError(f"consensus_mode ({consensus_mode!r}) must be one of {', '.join(CONSENSUS_MODES)}")
         if not 0.0 < lookahead_pullback <= 1.0:
             raise ValueError(f"lookahead_pullback ({lookahead_pullback}) must be within (0, 1]")
         if not 0.0 < lookahead_lr <= 1.0:
@@ -239,6 +273,8 @@ class Keel(Automagic4):
             raise ValueError(f"face_gain_max ({face_gain_max}) must be 1 or more")
         if not 0.0 <= face_gain_beta < 1.0:
             raise ValueError(f"face_gain_beta ({face_gain_beta}) must be within [0, 1)")
+        if not body_weight >= 0.0:
+            raise ValueError(f"body_weight ({body_weight}) must be 0 (face only) or above")
         # Read by the hook (registered by the parent's constructor for low-precision parameters), so before it.
         self.gauge = bool(gauge)
         self.gauge_eps = float(gauge_eps)
@@ -247,6 +283,7 @@ class Keel(Automagic4):
         self.band_weights: Optional[List[float]] = band_weights if self.bands > 1 else None
         self.consensus = float(consensus)
         self.consensus_power = float(consensus_power)
+        self.consensus_mode = str(consensus_mode)
         self.lookahead = bool(lookahead)
         self.lookahead_pullback = float(lookahead_pullback)
         self.lookahead_lr = float(lookahead_lr)
@@ -256,14 +293,19 @@ class Keel(Automagic4):
         self.face_gain = float(face_gain)
         self.face_gain_max = float(face_gain_max)
         self.face_gain_beta = float(face_gain_beta)
-        self._face_e: Dict[torch.Tensor, List[torch.Tensor]] = {}  # per lora_up: [face, total] energy of the step
+        self.body_weight = float(body_weight)
+        self._face_e: Dict[torch.Tensor, list] = {}  # per lora_up: [face, total, body or None] energy of the step
         self._face_seen = False  # a face report has arrived at some step
+        self._body_sum: Optional[torch.Tensor] = None  # the body energy reported so far (read at the periodic log)
+        self._body_seen = False  # some body energy has arrived (else a one-time note: maps without a person)
         self._armed = False  # the hook takes gradients between zero_grad() and step() only
         self._cur_band: Optional[int] = None  # the band of the micro-batch about to be backpropagated
         self._step_bands: List[int] = []  # the bands observed since zero_grad() (one per micro-batch image)
         self._hooked = False  # whether the hook took a gradient this step
         self._agree: Dict[torch.Tensor, torch.Tensor] = {}  # param -> int8 sign sums of the step's gradients
         self._votes: Dict[torch.Tensor, int] = {}  # param -> gradients seen this step
+        self._mag: Dict[torch.Tensor, torch.Tensor] = {}  # param -> fp32 sum of |g| of the step (the magnitude
+        #                                                    vote), until gather() folds it into the ratio in _agree
         self._pw: Dict[torch.Tensor, torch.Tensor] = {}  # param -> [bands] fp32 power sums of the step's gradients
         self._cnt: Dict[torch.Tensor, List[int]] = {}  # param -> gradients seen per band this step
         self._band_gain: Dict[torch.Tensor, torch.Tensor] = {}  # param -> [bands] fp32 scale per band (statistics)
@@ -294,15 +336,16 @@ class Keel(Automagic4):
                      " ".join(f"{e:.3g}" for e in edges),
                      f", update weights {self.band_weights}" if self.band_weights else "")
         if self.consensus > 0.0:
-            log.info("Keel: consensus gate %g (power %g): floor %g on the elements the step's gradients disagree on",
-                     self.consensus, self.consensus_power, 1.0 - self.consensus)
+            log.info("Keel: consensus gate %g (power %g, %s vote): floor %g on the elements the step's gradients "
+                     "disagree on", self.consensus, self.consensus_power, self.consensus_mode, 1.0 - self.consensus)
         if self.lookahead:
             log.info("Keel: probe-gated lookahead (pull-back %g, lr x%g at a pull, %d probes of grace)",
                      self.lookahead_pullback, self.lookahead_lr, self.lookahead_grace)
         if self.face_gain > 0.0:
-            log.info("Keel: face-token gain (exponent %g, within [%.3g, %g], EMA %g) on %d LoRA pairs",
-                     self.face_gain, 1.0 / self.face_gain_max, self.face_gain_max, self.face_gain_beta,
-                     len(self.pairs))
+            log.info("Keel: %s (exponent %g, within [%.3g, %g], EMA %g) on %d LoRA pairs",
+                     f"face-and-body token gain (body weight {self.body_weight:g})" if self.body_weight > 0.0
+                     else "face-token gain", self.face_gain, 1.0 / self.face_gain_max, self.face_gain_max,
+                     self.face_gain_beta, len(self.pairs))
 
     def _check_pairs(self, pairs) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         mine = {id(p) for g in self.param_groups for p in g["params"]}
@@ -386,13 +429,36 @@ class Keel(Automagic4):
             self._stochastic_copy_(acc, acc.to(torch.float32).add_(g.to(torch.float32)))
 
     def _vote(self, p: torch.Tensor, g: torch.Tensor) -> None:
+        self._votes[p] = self._votes.get(p, 0) + 1
+        if self.consensus_mode == "magnitude":  # the sizes; the signed sum is the accumulated gradient itself
+            a = g.abs() if g.dtype == torch.float32 else g.abs().to(torch.float32)
+            mag = self._mag.get(p)
+            if mag is None:
+                self._mag[p] = a
+            else:
+                mag.add_(a)
+            return
         s = g.sign().to(torch.int8)
         agree = self._agree.get(p)
         if agree is None:
             self._agree[p] = s
         else:
             agree.add_(s)
+
+    @torch.no_grad()
+    def _vote_replica(self, p: torch.Tensor, g: torch.Tensor) -> None:
+        """The magnitude vote of a replica's sum, after gather(): the ratio so far (the primary's, with any earlier
+        replica's sum already added to p.grad by the reduce) is carried forward to |S + g| / (M + |g|), M the sum of
+        sizes behind it, recovered as |S| / ratio (exact unless a sum cancelled to exactly 0, where it reads 0)."""
         self._votes[p] = self._votes.get(p, 0) + 1
+        a = g.abs().to(torch.float32)
+        ratio, s = self._agree.get(p), p.grad
+        if ratio is None or s is None or s.shape != g.shape or ratio.dtype != torch.float32:
+            self._agree[p] = a / a.clamp(min=TINY)  # the first vote: 1 where it has a gradient
+            return
+        s32 = s.to(torch.float32)
+        mag = torch.where(ratio > 0.0, s32.abs() / ratio.clamp(min=TINY), torch.zeros_like(ratio))
+        self._agree[p] = (s32 + g.to(torch.float32)).abs_().div_(mag.add_(a).clamp_(min=TINY))
 
     @torch.no_grad()
     def take_replica(self, p: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
@@ -408,19 +474,30 @@ class Keel(Automagic4):
             if gain is not None:
                 g = g * gain[bands[0]]
         if self.consensus > 0.0:
-            self._vote(p, g)
+            if self.consensus_mode == "magnitude" and p in self._agree and p not in self._mag:
+                self._vote_replica(p, g)  # gather() has folded the sums already: carry the ratio forward
+            else:
+                self._vote(p, g)
         return g
 
     @torch.no_grad()
     def gather(self) -> None:
-        """The step's accumulated gradient back on p.grad. The trainer calls it after the step's last backward, before
-        gradient clipping and the replica reduce; step() calls it itself otherwise."""
+        """The step's accumulated gradient back on p.grad, added to what a replica reduce has put there (and, with
+        the magnitude vote, the step's sums turned into the agreement ratio |sum g| / sum |g| per element). The
+        trainer calls it after the step's last backward and the replica reduce, before gradient clipping; step()
+        calls it itself otherwise."""
         for group in self.param_groups:
             for p in group["params"]:
                 acc = getattr(p, "_accum_grad", None)
                 if acc is not None:
-                    p.grad = acc
+                    if p.grad is None:
+                        p.grad = acc
+                    else:  # the replicas' sums, reduced before the gather
+                        p.grad.add_(acc)
                     del p._accum_grad
+                mag = self._mag.pop(p, None)
+                if mag is not None and p.grad is not None:
+                    self._agree[p] = p.grad.abs().to(torch.float32).div_(mag.clamp_(min=TINY))
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         # A new step: the trainer zeroes before its first micro-batch (and before an out-of-memory retry, whose
@@ -431,6 +508,7 @@ class Keel(Automagic4):
         self._hooked = False
         self._agree.clear()
         self._votes.clear()
+        self._mag.clear()
         self._pw.clear()
         self._cnt.clear()
         for group in self.param_groups:
@@ -578,7 +656,8 @@ class Keel(Automagic4):
         gate = None
         agree = self._agree.get(p)
         if agree is not None and self._votes.get(p, 0) >= 2:
-            gate = consensus_gate(agree if i1 is None else agree[i0:i1], self._votes[p], self.consensus,
+            gate = consensus_gate(agree if i1 is None else agree[i0:i1],
+                                  1 if self.consensus_mode == "magnitude" else self._votes[p], self.consensus,
                                   self.consensus_power)
             acc = self._gate_sum.get(gate.device)
             s = gate.sum()
@@ -614,25 +693,37 @@ class Keel(Automagic4):
 
     # ------------------------------------------------------------------ the face-token gain
 
-    def face_energy(self, p: torch.Tensor, e_face: torch.Tensor, e_total: torch.Tensor) -> None:
+    def face_energy(self, p: torch.Tensor, e_face: torch.Tensor, e_total: torch.Tensor,
+                    e_body: Optional[torch.Tensor] = None) -> None:
         """The face tap's report for one micro-batch (lora.arm_face_tap): for `p` (a lora_up weight) the squared norm
-        of its gradient from the face tokens and from all tokens of the samples with a face, 0-dim tensors (no sync).
+        of its gradient from the face tokens and from all tokens of the samples with a face (or a body, when the tap
+        is armed with body masks, which then also report `e_body`, the body tokens' part), 0-dim tensors (no sync).
         Summed over the step's micro-batches; a backward outside a step is ignored."""
         if self.face_gain <= 0.0 or not self._armed:
             return
         acc = self._face_e.get(p)
+        eb = e_body.detach().to(torch.float32) if e_body is not None else None
         if acc is None:
-            self._face_e[p] = [e_face.detach().to(torch.float32), e_total.detach().to(torch.float32)]
+            self._face_e[p] = [e_face.detach().to(torch.float32), e_total.detach().to(torch.float32), eb]
         else:
             acc[0] = acc[0] + e_face.detach().to(acc[0].device, torch.float32)
             acc[1] = acc[1] + e_total.detach().to(acc[1].device, torch.float32)
+            if eb is not None:
+                acc[2] = eb.to(acc[1].device) if acc[2] is None else acc[2] + eb.to(acc[2].device)
+
+    @staticmethod
+    def _median(x: torch.Tensor, live: torch.Tensor) -> torch.Tensor:
+        """The median of x over the live entries (torch's: the lower middle of an even count), at least GAUGE_FLOOR;
+        NaN with none live (the gains are then never written: the caller keeps the old ones where live is False)."""
+        return torch.where(live, x, torch.full_like(x, float("nan"))).nanmedian().clamp(min=GAUGE_FLOOR)
 
     @torch.no_grad()
     def _face_step(self) -> None:
         """Before the step: each reported tensor's face share, its gain against the median share of the step's
         reported tensors (torch's median: the lower middle of an even count), clamped, EMA'd into state["face_gain"]
-        (the pair's lora_down the same). Tensors without a report, or whose report had no energy, keep their gain.
-        No sync."""
+        (the pair's lora_down the same). With body_weight and body reports, the body share the same way against its
+        own median and the two ratios' weighted geometric mean (a region without energy in any report this step is
+        left out of the mean). Tensors without a report, or whose report had no energy, keep their gain. No sync."""
         if self.face_gain <= 0.0 or not self._face_e:
             return
         self._face_seen = True
@@ -641,9 +732,26 @@ class Keel(Automagic4):
         ef = torch.stack([self._face_e[p][0].to(dev) for p in ups])
         et = torch.stack([self._face_e[p][1].to(dev) for p in ups])
         live = et > 0.0
-        share = ef / et.clamp(min=GAUGE_FLOOR)
-        med = torch.where(live, share, torch.full_like(share, float("nan"))).nanmedian().clamp(min=GAUGE_FLOOR)
-        gain = (share / med).pow(self.face_gain).clamp_(1.0 / self.face_gain_max, self.face_gain_max)
+        et_safe = et.clamp(min=GAUGE_FLOOR)
+        share = ef / et_safe
+        bodies = [self._face_e[p][2] for p in ups]
+        if self.body_weight > 0.0 and any(b is not None for b in bodies):
+            eb = torch.stack([b.to(dev) if b is not None else torch.zeros((), dtype=torch.float32, device=dev)
+                              for b in bodies])
+            tot = eb.sum()
+            self._body_sum = tot if self._body_sum is None else self._body_sum + tot.to(self._body_sum.device)
+            share_b = eb / et_safe
+            lf = (share / self._median(share, live)).clamp_(min=GAUGE_FLOOR).log_()
+            lb = (share_b / self._median(share_b, live)).clamp_(min=GAUGE_FLOOR).log_()
+            wf = (ef.sum() > 0.0).to(torch.float32)
+            wb = (eb.sum() > 0.0).to(torch.float32) * self.body_weight
+            lg = (wf * lf + wb * lb) / (wf + wb).clamp(min=GAUGE_FLOOR)
+            gain = lg.mul_(self.face_gain).exp_().clamp_(1.0 / self.face_gain_max, self.face_gain_max)
+            gain.nan_to_num_(nan=1.0, posinf=self.face_gain_max, neginf=1.0 / self.face_gain_max)  # (never, by the
+            live = live & ((wf + wb) > 0.0)  # clamps above; a NaN median comes with live all False)
+        else:
+            med = self._median(share, live)
+            gain = (share / med).pow(self.face_gain).clamp_(1.0 / self.face_gain_max, self.face_gain_max)
         todo: Dict[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = {}
         for p, g, ok in zip(ups, gain, live):
             todo[p] = (g, ok)
@@ -835,9 +943,17 @@ class Keel(Automagic4):
             if stats is not None:
                 lo, med, hi, n = stats
                 log.info("Keel: face-token gain over %d LoRA pairs: min %.2f median %.2f max %.2f", n, lo, med, hi)
+                if self.body_weight > 0.0 and not self._body_seen:
+                    if self._body_sum is not None and float(self._body_sum) > 0.0:
+                        self._body_seen = True
+                    else:
+                        self._note("body", "Keel: the body share has had no body energy yet (region maps without a "
+                                   "person: cached before person masks were needed? set recache, or check "
+                                   "body_backend): the gain follows the face alone")
             elif not self._face_seen:
-                self._note("face", "Keel: the face-token gain has had no face report (no region maps with a face, or "
-                           "a loop without the face tap: a replica, the parallel race): the gain is 1")
+                self._note("face", "Keel: the face-token gain has had no report (no region maps with a face%s, or a "
+                           "loop without the face tap: a replica, the parallel race): the gain is 1",
+                           " or a person" if self.body_weight > 0.0 else "")
         self._gate_sum.clear()
         self._gate_n = 0
         self._gate_votes = 0
@@ -865,6 +981,7 @@ class Keel(Automagic4):
             self._hooked = False
             self._agree.clear()
             self._votes.clear()
+            self._mag.clear()
             self._pw.clear()
             self._cnt.clear()
             self._face_e.clear()

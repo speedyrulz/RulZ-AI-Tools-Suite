@@ -760,9 +760,9 @@ carry signal the vote may pull the rate back toward its own fixed point over the
 
 ### Keel (`optimizer: keel`): Automagic 4 for character LoRAs
 
-Keel is Automagic 4 with two additions aimed at identity (the design, with the four further mechanisms planned on
-top of it and the race plan that decides them, is in `docs/keel-optimizer.md`). Every Automagic 4 setting applies;
-with both of its own switches off it is Automagic 4 to the bit (a test asserts it).
+Keel is Automagic 4 with six additions aimed at identity (the design and the race plan that decides them are in
+`docs/keel-optimizer.md`), and `keel_fb` is the same optimizer for the face and the body alike (below the list).
+Every Automagic 4 setting applies; with every switch of its own off it is Automagic 4 to the bit (a test asserts it).
 
 - **Gauge preconditioner** (`keel_gauge`, on): a LoRA's delta is `lora_up x lora_down`, and `(B S)(S^-1 A)` is the
   same delta for any invertible r x r `S`; Adam-style steps are not invariant to that split, so one factor tends to
@@ -793,7 +793,9 @@ with both of its own switches off it is Automagic 4 to the bit (a test asserts i
   only within one band). `keel_pair_sigma` gives a step's micro-batches (and its DOP pass) one sigma: the
   consensus gate below needs it.
   `keel_band_weights` then multiplies the step's update (not the decay) per band on purpose: `""` flat, `identity`
-  a hump of 1.3 over sigma 0.12 to 0.5 falling to 0.5 at the ends, or 8 numbers. The measured imbalance (each
+  a hump of 1.3 over sigma 0.12 to 0.5 falling to 0.5 at the ends, `subject` a plateau of 1.2 to 1.3 over sigma 0.18
+  to 0.82 (where the face's detail and the body's silhouette form alike) falling to 0.6, or 8 numbers. The measured
+  imbalance (each
   band's gradient RMS relative to the overall, averaged over the tensors) is logged every 250 steps.
   `timestep_sampling` keeps deciding how often each band is visited; `loss_weighting` keeps changing which band's
   content the gradient carries within a step, but its scale effect is gone, which is the point.
@@ -805,8 +807,13 @@ with both of its own switches off it is Automagic 4 to the bit (a test asserts i
   sign history, so the vote sees the gated magnitude. `keel_consensus` 0 is off, 1 keeps only the unanimous
   elements. It needs `gradient_accumulation` 2 or more (or the DOP pass); with one gradient per step it is 1, and
   so is it in the parallel race, which hands the optimizer the step's sum. A data-parallel replica's gradient (the
-  sum over its micro-batches) joins scaled by the step's band and as one vote. The mean gate is logged every 250
-  steps; the copy check (`copy_check: on`) is where its effect on memorised backgrounds shows.
+  sum over its micro-batches) joins scaled by the step's band and as one vote. `keel_consensus_mode` picks how the
+  gradients vote: `sign` (the above: one vote each, 1 byte per weight for the step) or `magnitude` (each weighted
+  by its size: the update is gated by the size of the gradients' sum over the sum of their sizes, 4 bytes per weight
+  for the step). The difference shows in a step that mixes face crops and full shots: for a weight serving the body
+  a crop's gradient is tiny with a random sign, a full vote against it under the sign rule and almost none under the
+  magnitude rule. `auto` is sign for `keel` and magnitude for `keel_fb`. The mean gate is logged every 250 steps;
+  the copy check (`copy_check: on`) is where its effect on memorised backgrounds shows.
 - **Lookahead** (`keel_lookahead` off, `keel_lookahead_pullback` 0.5, `keel_lookahead_lr` 0.7, `keel_lookahead_grace`
   2): the likeness probes with the held-out judge are the one signal nothing trains on, and lookahead (Zhang et al.
   2019) keeps slow weights and pulls the fast weights toward them; here the probe decides. Keel keeps an fp32 anchor
@@ -829,11 +836,27 @@ with both of its own switches off it is Automagic 4 to the bit (a test asserts i
   still descends the diffusion loss and cannot be gamed toward features that fool a face recognizer (what the
   identity loss can do). Pairs without a report keep their gain, so batches without a face change nothing; the
   gain's spread is logged every 250 steps. The LoRA layers' hook runs uncompiled (`compile_model` is turned off
-  with it); the parallel race and a data-parallel replica's micro-batches are not tapped.
+  with it); the parallel race and a data-parallel replica's micro-batches are not tapped. Under `keel_fb` the tap
+  also measures the body's tokens (the person's cells outside the face box, so it needs the person masks) and a
+  pair's gain combines its face share and its body share, each against its own median pair (the body covers many
+  more tokens than the face), as a geometric mean weighted by `keel_body_weight` (1 = equal); a step of person-only
+  photos moves the gain by the body alone, a step of face crops by the face alone.
+
+**Keel (face + body)** (`optimizer: keel_fb`) is the same optimizer for a LoRA that should hold the build as firmly
+as the face: the consensus gate votes by magnitude and the face-token gain measures the body's tokens too (both
+above), and `subject` band weights are its plateau over the face's and the body's noise levels. With the magnitude
+vote switched off (`keel_consensus_mode: sign`) and the gain off it is `keel` to the bit, and a `keel` state resumes
+under it and back (one class). The gain is off by default in both, so with the defaults `keel_fb` differs from `keel`
+by the vote alone: set `keel_face_gain` (0.5 or 1) to bring the body share in, which also builds the person masks
+(SAM 3 or MediaPipe) for the region maps. The probes' combined score, which the lookahead and the best / stop decisions
+follow, is weighted `face_weight` 0.7 / `body_weight` 0.3 by default: set them equal for an equal focus (the log
+says so when the lookahead is on). Race it against `keel`, then its parts one at a time (`keel_consensus_mode`,
+`keel_body_weight`, `keel_band_weights`); nothing is measured yet.
 
 All of it can be raced (`race` rows with `keel_gauge`, `keel_gauge_eps`, `keel_cautious`, `keel_pair_sigma`,
-`keel_bands`, `keel_band_weights`, `keel_consensus`, `keel_consensus_power`, `keel_lookahead` and its three
-settings, `keel_face_gain` and its two), and a Keel state resumes under Automagic 4 and the other way round (the
+`keel_bands`, `keel_band_weights`, `keel_consensus`, `keel_consensus_power`, `keel_consensus_mode`,
+`keel_lookahead` and its three settings, `keel_face_gain` and its two, `keel_body_weight`, and `optimizer` itself:
+`keel` against `keel_fb`), and a Keel state resumes under Automagic 4 and the other way round (the
 band statistics start fresh when `keel_bands` changes; the anchor is dropped when the lookahead is off, the face
 gains when the face gain is). Whether Keel beats Automagic 4 or adamw8bit on the likeness probes
 is not measured yet: the Wizard keeps recommending adamw8bit until a race says otherwise.
@@ -876,6 +899,8 @@ Four levers change the training objective and data for likeness, all off by defa
   on it, a probe-gated lookahead (off by default) that pulls a run back toward its best-scoring weights, and a
   face-token gain (off by default) that moves the weights serving the face more than the background's; see *Keel*
   above and `docs/keel-optimizer.md`.
+- **Keel (face + body)** (`optimizer: keel_fb`): the same with the body's tokens in the gain and a consensus vote
+  weighted by gradient size, for a LoRA that should hold the build as firmly as the face; see *Keel* above.
 
 The face analysis cache is `<dataset>/.rulz_cache/faces.json`; the Train tab has preview buttons for region
 maps and crops.
@@ -2282,7 +2307,7 @@ ComfyUI's `custom_nodes` and load `workflows/RulzTrainer Likeness Scoring.json`;
 |---|---|
 | Gradient checkpointing | on |
 | Batch size | 1 (use gradient accumulation instead) |
-| Optimizer | `adamw8bit`, or `automagic3` / `automagic4` (self-tuning lr, ported from ai-toolkit; 1 byte of state per weight at the default polarity history; Automagic 4's step is as fast as adamw8bit's on a rank-16 LoRA, about 3x slower at rank 64 and 6x on a full fine-tune; Automagic 3's about 10x slower than Automagic 4's), or `keel` (Automagic 4 plus a LoRA gauge preconditioner and a cautious mask, for character LoRAs; unmeasured on likeness: race it) |
+| Optimizer | `adamw8bit`, or `automagic3` / `automagic4` (self-tuning lr, ported from ai-toolkit; 1 byte of state per weight at the default polarity history; Automagic 4's step is as fast as adamw8bit's on a rank-16 LoRA, about 3x slower at rank 64 and 6x on a full fine-tune; Automagic 3's about 10x slower than Automagic 4's), or `keel` / `keel_fb` (Automagic 4 plus identity mechanisms for character LoRAs, `keel_fb` for the face and the body alike; unmeasured on likeness: race them) |
 | Resolution | 1024 |
 | Text encoder device | `auto` (spreads over all GPUs + CPU during caching only) |
 | Max caption tokens | 512 to 1024 unless you train on very long prompts |

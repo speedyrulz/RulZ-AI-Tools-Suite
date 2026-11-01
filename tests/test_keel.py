@@ -1,18 +1,22 @@
 """Keel (rulztrainer.optimizers.keel): Automagic 4 exactly with its switches off, the gauge preconditioner's
 invariance to a LoRA pair's reparameterisation, the cautious mask, the noise bands (observe, the per-band scale,
 the band weight through Automagic 4's update gain, paired sigma in the trainer), the accumulation hook with
-gather() and the consensus gate, training and state round trips across the Automagic kinds, and the config / race
-/ WebUI wiring."""
+gather() and the consensus gate, training and state round trips across the Automagic kinds, the config / race /
+WebUI wiring, and the face-and-body version (keel_fb): the magnitude vote, the body token mask and energy, the
+two-region gain."""
+import math
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from rulztrainer import lora as lora_mod  # noqa: E402
-from rulztrainer.config import AUTOMAGIC, OPTIMIZERS, TrainConfig, keel_band_edges, keel_band_weights  # noqa: E402
+from rulztrainer.config import (AUTOMAGIC, KEEL, OPTIMIZERS, TrainConfig, keel_band_edges,  # noqa: E402
+                                keel_band_weights, keel_consensus_mode)
 from rulztrainer.moss.model import MOSSImageTransformer  # noqa: E402
 from rulztrainer.optimizers import keel as keel_mod  # noqa: E402
 from rulztrainer.optimizers.automagic4 import Automagic4  # noqa: E402
@@ -196,6 +200,11 @@ def test_band_grid_and_weights():
     assert keel_band_weights("identity", 1) is None and keel_band_weights("1,2", 1) is None
     hump = keel_band_weights("identity", 8)
     assert len(hump) == 8 and max(hump) == hump[3] > hump[2] > 1.0 > hump[4] and hump[0] < 0.6 and hump[7] == 0.5
+    plateau = keel_band_weights("subject", 8)  # symmetric about sigma 0.5: the face's and the body's bands alike
+    assert plateau == plateau[::-1] and plateau[3] == plateau[4] == max(plateau) > plateau[2] == plateau[5] > 1.0
+    assert plateau[0] == plateau[7] == pytest.approx(0.6, abs=0.002) and plateau[5] > hump[5]  # the body's band lifted
+    assert keel_band_weights("subject", 1) is None
+    _cfg(keel_band_weights="subject").validate()
     assert keel_band_weights("1, 2,3,4", 4) == [1.0, 2.0, 3.0, 4.0]
     for bad in ("1,2,3", "a,b,c,d", "1,2,3,0"):
         with pytest.raises(ValueError, match="keel_band_weights"):
@@ -622,8 +631,8 @@ def test_replica_gradients_join_scaled_by_the_band_and_vote():
     opt.observe(0.3, hook=False)  # the replica's micro-batch, as work() reports it
     assert opt._cur_band == 3 and opt._step_bands == [3, 3]
     (pr * (2.0 * base)).sum().backward()
+    dp.reduce_grads(take=opt.take_replica)  # the step loop's order: the replicas first, then the gather
     opt.gather()
-    dp.reduce_grads(take=opt.take_replica)
     assert pr.grad is None
     assert torch.allclose(p.grad, 3.0 * base * gain, rtol=1e-5)  # both shares scaled by the band
     assert opt._votes[p] == 2 and torch.equal(opt._element_gain(p), torch.ones(6, 5))
@@ -634,15 +643,15 @@ def test_replica_gradients_join_scaled_by_the_band_and_vote():
     _micro_batches(p, [base], opt, sigma=0.3)
     opt.observe(0.3, hook=False)
     (pr * (-0.5 * base)).sum().backward()
-    opt.gather()
     dp.reduce_grads(take=opt.take_replica)
+    opt.gather()
     assert torch.allclose(p.grad, 0.5 * base * gain, rtol=1e-5)
     assert torch.equal(opt._element_gain(p), torch.full((6, 5), 0.5))
     # a step whose observations span bands: the replica's share joins unscaled (and still votes)
     _micro_batches(p, [base], opt, sigma=0.3)
     opt.observe(0.9, hook=False)
     (pr * base).sum().backward()
-    opt.gather()
+    opt.gather()  # the other order (a gather before the reduce) adds up the same
     dp.reduce_grads(take=opt.take_replica)
     assert torch.allclose(p.grad, base * gain + base, rtol=1e-5) and opt._votes[p] == 2
     opt.step()
@@ -1035,3 +1044,259 @@ def test_the_trainer_installs_the_layout_taps_for_the_face_gain():
     me.race_parallel = True  # the parallel race: no tap
     Trainer._setup_alignment(me, _cfg(keel_face_gain=1.0), [])
     assert not hasattr(model2, "_rz_taps")
+    model3, _, _ = _model(6)  # the face-and-body version the same
+    me.race_parallel = False
+    me.replicas = [(model3, None, None)]
+    Trainer._setup_alignment(me, _cfg(optimizer="keel_fb", keel_face_gain=1.0), [])
+    assert isinstance(model3._rz_taps, A.Taps)
+
+
+# ---------------------------------------------------------------- the face-and-body version (keel_fb)
+
+
+def test_magnitude_vote_weighs_each_gradient_by_its_size():
+    torch.manual_seed(30)
+    p = torch.nn.Parameter(torch.randn(16, 8))
+    g1 = torch.rand(16, 8) + 0.5
+    g2 = torch.where(torch.rand(16, 8) < 0.5, -1.0, 1.0) * 1e-3 * g1  # a micro-batch with little to say: tiny,
+    with pytest.raises(ValueError, match="consensus_mode"):  # random signs
+        Keel([p], lr=1e-4, fused=False, bands=1, consensus_mode="votes")
+    sign = Keel([p], lr=1e-4, fused=False, bands=1, consensus=0.5)
+    _micro_batches(p, [g1, g2], sign)
+    sign.gather()
+    gs = sign._element_gain(p)
+    sign.step()  # disarmed: its hook leaves the next optimizer's step on the same tensor alone
+    mag = Keel([p], lr=1e-4, fused=False, bands=1, consensus=0.5, consensus_mode="magnitude")
+    _micro_batches(p, [g1, g2], mag)
+    assert torch.equal(mag._mag[p], g1.abs() + g2.abs()) and p not in mag._agree  # the sizes, until gather()
+    mag.gather()
+    assert p not in mag._mag
+    ratio = (g1 + g2).abs() / (g1.abs() + g2.abs())
+    assert torch.allclose(mag._agree[p], ratio) and mag._agree[p].dtype == torch.float32
+    assert torch.equal(p.grad, g1 + g2)
+    disagree = g2 < 0
+    # the sign vote: the disagreeing elements fall to the floor; the magnitude vote: they barely move from 1
+    gm = mag._element_gain(p)
+    assert torch.equal(gs[disagree], torch.full_like(gs[disagree], 0.5))
+    assert torch.equal(gs[~disagree], torch.ones_like(gs[~disagree]))
+    assert (gm > 0.99).all() and (gm[disagree] < 1.0).all() and (gm[~disagree] == 1.0).all()  # the same way: 1
+    assert torch.allclose(gm, consensus_gate(ratio, 1, 0.5, 2.0))
+    rows = mag._element_gain(p, 4, 9)
+    assert torch.equal(rows, gm[4:9]) and torch.allclose(mag._agree[p], ratio)  # the ratio is left as it is
+    want = (float(gm.sum()) + float(gm[4:9].sum())) / (gm.numel() + 40)  # the full call and the rows, once each
+    assert mag.gate_mean() == pytest.approx(want)
+    mag.step()
+    assert not mag._mag and not mag._agree
+    # a gradient exactly 0 in every micro-batch: ratio 0 (the floor), not NaN
+    z1, z2 = g1.clone(), g1.clone()
+    z1[0], z2[0] = 0.0, 0.0
+    _micro_batches(p, [z1, z2], mag)
+    mag.gather()
+    assert torch.equal(mag._agree[p][0], torch.zeros(8)) and torch.equal(mag._agree[p][1:], torch.ones(15, 8))
+    assert torch.equal(mag._element_gain(p)[0], torch.full((8,), 0.5))
+    mag.step()
+
+
+def test_magnitude_vote_in_the_replica_path_matches_the_hook():
+    torch.manual_seed(31)
+    p = torch.nn.Parameter(torch.randn(6, 5))
+    grads = [torch.randn(6, 5) for _ in range(3)]
+    grads[1][2] = 0.0  # a row the second gradient says nothing about
+    kw = dict(lr=1e-4, fused=False, bands=1, consensus=0.5, consensus_mode="magnitude")
+    ref = Keel([p], **kw)
+    _micro_batches(p, grads, ref)  # all three through the hook
+    ref.gather()
+    ref_ratio, ref_gate = ref._agree[p].clone(), ref._element_gain(p).clone()
+    ref.step()  # disarmed: its hook leaves the next optimizer's step on the same tensor alone
+    opt = Keel([p], **kw)
+    _micro_batches(p, grads[:1], opt)  # the primary's micro-batch through the hook, the other two as replicas
+    for g in grads[1:]:  # as reduce_grads does, before the gather (the step loop's order): the sums stay open
+        g = opt.take_replica(p, g)
+        p.grad = g.clone() if p.grad is None else p.grad.add_(g)
+    assert p in opt._mag and p not in opt._agree
+    opt.gather()
+    assert opt._votes[p] == 3 and torch.allclose(p.grad, sum(grads), rtol=1e-6, atol=1e-7)
+    assert torch.allclose(opt._agree[p], ref_ratio, rtol=1e-6, atol=1e-7)  # the same sums, in another order
+    assert torch.allclose(opt._element_gain(p), ref_gate, rtol=1e-6, atol=1e-7)
+    opt.step()
+    # a reduce after the gather: the ratio is carried forward (the sum of sizes behind it recovered)
+    late = Keel([p], **kw)
+    _micro_batches(p, grads[:1], late)
+    late.gather()
+    for g in grads[1:]:
+        p.grad.add_(late.take_replica(p, g))
+    assert late._votes[p] == 3 and torch.allclose(late._agree[p], ref_ratio, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(late._element_gain(p), ref_gate, rtol=1e-5, atol=1e-6)
+    late.step()
+    # a replica's gradient for a tensor the primary never touched: one vote, 1 where it has a gradient, no gate
+    q = torch.nn.Parameter(torch.randn(3))
+    o2 = Keel([q], **kw)
+    o2.zero_grad()
+    gq = torch.tensor([1.0, 0.0, -2.0])
+    assert torch.equal(o2.take_replica(q, gq), gq) and torch.equal(o2._mag[q], gq.abs())
+    q.grad = gq.clone()  # as the reduce does
+    o2.gather()
+    assert torch.equal(o2._agree[q], torch.tensor([1.0, 0.0, 1.0])) and q not in o2._mag
+    assert o2._votes[q] == 1 and o2._element_gain(q) is None
+
+
+def test_body_token_mask_is_the_person_outside_the_face():
+    from rulztrainer import regions as RG
+
+    bw, bh = 4 * RG.CELL, 3 * RG.CELL  # a 4 x 3 cell grid
+    person = np.zeros((bh, bw), dtype=bool)
+    person[:, RG.CELL:3 * RG.CELL] = True  # the middle two columns
+    face = (RG.CELL, 0, 2 * RG.CELL, RG.CELL)  # the cell (1, 0)
+    rm = RG.build_weight_map(bw, bh, face, person, 3.0, 1.5, 0.3, face_margin=0.0, feather=0)
+    assert rm.has_person and rm.face_cells == (1, 0, 2, 1)
+    m = lora_mod.body_token_mask(rm, 3, 4)
+    assert m.shape == (12,) and m.dtype == torch.bool
+    assert m.nonzero().flatten().tolist() == [2, 5, 6, 9, 10]  # the person's cells minus the face cell (1)
+    assert lora_mod.body_token_mask(RG.uniform_region_map(bw, bh), 3, 4) is None  # no person
+    assert lora_mod.body_token_mask(rm, 4, 4) is None  # another grid: not this map
+    assert lora_mod.body_token_mask(None, 3, 4) is None
+    whole = RG.build_weight_map(bw, bh, (0, 0, bw, bh), person, 3.0, 1.5, 0.3, face_margin=0.0, feather=0)
+    assert whole.has_person and lora_mod.body_token_mask(whole, 3, 4) is None  # the face box covers the person
+    flipped = RG.flip_region_map(rm, bw)
+    assert lora_mod.body_token_mask(flipped, 3, 4).nonzero().flatten().tolist() == [1, 5, 6, 9, 10]
+
+
+def test_face_tap_reports_the_body_energy_as_a_fourth_value():
+    m = _face_pair(32)
+    got = []
+    layout = {"sample": 0, "img": (1, 3), "txt": (0, 1)}
+    face = torch.tensor([True, False, False])
+    body = torch.tensor([False, True, True])
+    lora_mod.arm_face_tap({"a": m}, [face, None, None], lambda: layout, lambda *a: got.append(a),
+                          body_masks=[body, body, None])  # sample 1: a body without a face; sample 2: neither
+    assert m.body_masks is not None
+    x = torch.randn(3, 5, 8)
+    w = torch.randn(3, 5, 6)
+    (m(x) * w).sum().backward()
+    assert len(got) == 1 and len(got[0]) == 4 and got[0][0] is m.lora_up.weight
+    h = x @ m.lora_down.weight.T
+    du = w * m.scale
+    g = du[0].T @ h[0] + du[1].T @ h[1]  # samples 0 and 1 count; 2 has neither mask
+    gf = (du[0, 1:4] * face[:, None].float()).T @ h[0, 1:4]
+    gb = sum((du[j, 1:4] * body[:, None].float()).T @ h[j, 1:4] for j in (0, 1))
+    assert torch.allclose(got[0][1], gf.pow(2).sum(), rtol=1e-4)
+    assert torch.allclose(got[0][2], g.pow(2).sum(), rtol=1e-4)
+    assert torch.allclose(got[0][3], gb.pow(2).sum(), rtol=1e-4)
+    # a batch with body masks only: the face energy reports 0, not nothing
+    got.clear()
+    lora_mod.arm_face_tap({"a": m}, [None, None, None], lambda: layout, lambda *a: got.append(a),
+                          body_masks=[body, None, None])
+    (m(x) * w).sum().backward()
+    assert len(got) == 1 and float(got[0][1]) == 0.0 and float(got[0][3]) > 0
+    assert torch.allclose(got[0][2], (du[0].T @ h[0]).pow(2).sum(), rtol=1e-4)
+    # without body masks the report has three values (the plain face tap)
+    got.clear()
+    lora_mod.arm_face_tap({"a": m}, [face, None, None], lambda: layout, lambda *a: got.append(a))
+    (m(x) * w).sum().backward()
+    assert len(got) == 1 and len(got[0]) == 3
+    lora_mod.disarm_face_tap({"a": m})
+    assert m.body_masks is None and m.face_masks is None and m.face_sink is None
+
+
+def test_face_and_body_gain_combines_the_two_shares():
+    pairs, params = _pairs(33)
+    kw = dict(lr=1e-3, fused=False, bands=1, consensus=0.0, gauge=False, cautious=False, face_gain=1.0,
+              face_gain_max=4.0, face_gain_beta=0.0)
+    with pytest.raises(ValueError, match="body_weight"):
+        Keel(params, pairs=pairs, body_weight=-1, **kw)
+    opt = Keel(params, pairs=pairs, body_weight=1.0, **kw)
+    grads = [torch.randn_like(t) for t in params]
+
+    def step(reports):
+        opt.zero_grad(set_to_none=True)
+        for (_, up), r in zip(pairs, reports):
+            opt.face_energy(up, *[torch.tensor(float(v)) for v in r])
+        for t, g in zip(params, grads):
+            t.grad = g.clone()
+        opt.step()
+        return [float(opt.state[up]["face_gain"]) for _, up in pairs]
+
+    # face shares 0.8, 0.5, 0.2 (ratios 1.6, 1, 0.4 against the median 0.5) and body shares the mirror: the
+    # geometric mean with equal weight is sqrt(1.6 x 0.4) = 0.8 for the outer pairs, 1 for the middle one
+    assert step([(0.8, 1.0, 0.2), (0.5, 1.0, 0.5), (0.2, 1.0, 0.8)]) == pytest.approx([0.8, 1.0, 0.8], rel=1e-5)
+    assert [float(opt.state[d]["face_gain"]) for d, _ in pairs] == pytest.approx([0.8, 1.0, 0.8], rel=1e-5)
+    # person-only photos (no face energy anywhere): the body ratio alone
+    assert step([(0.0, 1.0, 0.2), (0.0, 1.0, 0.5), (0.0, 1.0, 0.8)]) == pytest.approx([0.4, 1.0, 1.6], rel=1e-5)
+    # face crops (no body energy anywhere): the face ratio alone
+    assert step([(0.8, 1.0, 0.0), (0.5, 1.0, 0.0), (0.2, 1.0, 0.0)]) == pytest.approx([1.6, 1.0, 0.4], rel=1e-5)
+    # reports without a body value at all (the plain face tap): the face path
+    assert step([(0.8, 1.0), (0.5, 1.0), (0.2, 1.0)]) == pytest.approx([1.6, 1.0, 0.4], rel=1e-5)
+    # the body weight tilts the mean: weight 3 -> exp((log r_face + 3 log r_body) / 4)
+    opt.body_weight = 3.0
+    w0 = math.exp((math.log(1.6) + 3 * math.log(0.4)) / 4)
+    w2 = math.exp((math.log(0.4) + 3 * math.log(1.6)) / 4)
+    assert step([(0.8, 1.0, 0.2), (0.5, 1.0, 0.5), (0.2, 1.0, 0.8)]) == pytest.approx([w0, 1.0, w2], rel=1e-5)
+    # a pair reported without any energy keeps its gain; the others move (the median is now over the two)
+    before = [float(opt.state[up]["face_gain"]) for _, up in pairs]
+    after = step([(0.8, 1.0, 0.2), (0.0, 0.0, 0.0), (0.2, 1.0, 0.8)])
+    assert after[1] == before[1] and after[0] != before[0] and after[2] != before[2]
+    assert opt.face_gain_stats()[3] == 3 and not opt._face_e
+    # a pair with no face energy while the face is present elsewhere: its face ratio is the floor, the gain
+    # finite and clamped (shares 0, 0.5, 0.2 -> median 0.2; body 0.2, 0.5, 0.8 -> median 0.5; weight 3)
+    got = step([(0.0, 1.0, 0.2), (0.5, 1.0, 0.5), (0.2, 1.0, 0.8)])
+    assert got == pytest.approx([0.25, 2.5 ** 0.25, 1.6 ** 0.75], rel=1e-5) and all(math.isfinite(v) for v in got)
+
+
+def test_keel_fb_is_keel_with_the_body_share_and_the_magnitude_vote():
+    from rulztrainer import race as R
+    from rulztrainer.finetune import BYTES_PER_PARAM
+
+    assert "keel_fb" in OPTIMIZERS and "keel_fb" in AUTOMAGIC and KEEL == ("keel", "keel_fb")
+    assert keel_consensus_mode("auto", "keel") == "sign" and keel_consensus_mode("auto", "keel_fb") == "magnitude"
+    assert keel_consensus_mode("sign", "keel_fb") == "sign" and keel_consensus_mode("Magnitude", "keel") == "magnitude"
+    with pytest.raises(ValueError, match="keel_consensus_mode"):
+        _cfg(keel_consensus_mode="votes").validate()
+    with pytest.raises(ValueError, match="keel_body_weight"):
+        _cfg(optimizer="keel_fb", keel_body_weight=-0.5).validate()
+    _cfg(optimizer="keel_fb", keel_band_weights="subject", keel_consensus_mode="magnitude").validate()
+    # the person masks are wanted by keel_fb's gain alone
+    fb = _cfg(optimizer="keel_fb", keel_face_gain=1.0)
+    assert fb.wants_person_masks() and fb.wants_regions()
+    assert not _cfg(optimizer="keel_fb").wants_person_masks()  # the gain is off
+    assert not _cfg(optimizer="keel_fb", keel_face_gain=1.0, keel_body_weight=0).wants_person_masks()
+    assert _cfg(keel_face_gain=1.0).wants_regions() and not _cfg(keel_face_gain=1.0).wants_person_masks()  # plain
+    assert {"keel_consensus_mode", "keel_body_weight"} <= set(R.RACE_KEYS["LR & optimizer"])
+    assert BYTES_PER_PARAM["keel_fb"] == BYTES_PER_PARAM["keel"]
+    import webui
+
+    assert {"keel_consensus_mode", "keel_body_weight"} <= set(webui.RACE_LABELS)
+    TrainConfig(race=True, probe_every=10, face_refs=["ref.png"], steps=60, race_configs=[
+        {"name": "a", "optimizer": "keel"}, {"name": "b", "optimizer": "keel_fb"},
+        {"name": "c", "optimizer": "keel_fb", "keel_consensus_mode": "sign", "keel_body_weight": 0.5}]).validate()
+    # build_optimizer: one class, the vote and the body weight resolved per name
+    model, injected, params = _model(34)
+    pairs = lora_mod.lora_pairs(injected)
+    fbo = build_optimizer(_cfg(optimizer="keel_fb", keel_face_gain=1.0), params, pairs=pairs)
+    assert isinstance(fbo, Keel) and fbo.consensus_mode == "magnitude" and fbo.body_weight == 1.0
+    plain = build_optimizer(_cfg(keel_face_gain=1.0, keel_body_weight=2.0), params, pairs=pairs)
+    assert plain.consensus_mode == "sign" and plain.body_weight == 0.0  # keel_body_weight is keel_fb's
+    forced = build_optimizer(_cfg(optimizer="keel_fb", keel_consensus_mode="sign", keel_body_weight=0.5), params,
+                             pairs=pairs)
+    assert forced.consensus_mode == "sign" and forced.body_weight == 0.5
+    assert pairs_sigma(_cfg(optimizer="keel_fb")) and not pairs_sigma(_cfg(optimizer="automagic4"))
+    # a trained keel state resumes under keel_fb and back (one class)
+    for i in range(3):
+        _step(model, params, plain, i, sigma=0.3)
+    fbo.load_state_dict(plain.state_dict())
+    assert abs(current_lr(fbo, None) - current_lr(plain, None)) < 1e-12
+    _step(model, params, fbo, 3, sigma=0.3)
+    plain.load_state_dict(fbo.state_dict())
+    _step(model, params, plain, 4, sigma=0.3)
+    assert all(torch.isfinite(t).all() for t in params)
+
+
+def test_keel_fb_with_its_switches_off_is_automagic4_bitwise():
+    ma, _, pa = _model(35)
+    mb, injb, pb = _model(35)
+    oa = build_optimizer(_cfg(optimizer="automagic4"), pa)
+    ob = build_optimizer(_cfg(optimizer="keel_fb", keel_gauge=False, keel_bands=1), pb,
+                         pairs=lora_mod.lora_pairs(injb))
+    assert ob.consensus_mode == "magnitude" and ob.consensus == 0.0 and ob.body_weight == 1.0
+    for i in range(4):
+        assert _step(ma, pa, oa, i) == _step(mb, pb, ob, i)
+    assert all(torch.equal(a, b) for a, b in zip(pa, pb))

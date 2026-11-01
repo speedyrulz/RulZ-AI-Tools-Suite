@@ -23,7 +23,7 @@ from pathlib import Path
 from nicegui import app, run, ui
 
 from rulztrainer.archs import get_arch
-from rulztrainer.config import (AUTOMAGIC, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
+from rulztrainer.config import (AUTOMAGIC, KEEL, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
                                 MODEL_PRESETS,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
 from rulztrainer import bodysim, facesim, history, lookfilter
@@ -1273,10 +1273,11 @@ class Form:
             keel_cautious=bool(v("keel_cautious")), keel_pair_sigma=bool(v("keel_pair_sigma")),
             keel_bands=int(v("keel_bands")), keel_band_weights=str(v("keel_band_weights") or "").strip(),
             keel_consensus=float(v("keel_consensus")), keel_consensus_power=float(v("keel_consensus_power")),
+            keel_consensus_mode=str(v("keel_consensus_mode") or "auto"),
             keel_lookahead=bool(v("keel_lookahead")), keel_lookahead_pullback=float(v("keel_lookahead_pullback")),
             keel_lookahead_lr=float(v("keel_lookahead_lr")), keel_lookahead_grace=int(v("keel_lookahead_grace")),
             keel_face_gain=float(v("keel_face_gain")), keel_face_gain_max=float(v("keel_face_gain_max")),
-            keel_face_gain_beta=float(v("keel_face_gain_beta")),
+            keel_face_gain_beta=float(v("keel_face_gain_beta")), keel_body_weight=float(v("keel_body_weight")),
             timestep_shift=float(v("timestep_shift")), sigmoid_scale=float(v("sigmoid_scale")),
             logsnr_mean=float(v("logsnr_mean")), logsnr_std=float(v("logsnr_std")),
             block_swap=int(v("block_swap") or 0),
@@ -2878,10 +2879,11 @@ RACE_LABELS = {
     "keel_gauge": "Keel gauge preconditioner", "keel_gauge_eps": "Keel gauge eps", "keel_cautious": "Keel cautious mask",
     "keel_pair_sigma": "Keel paired sigma", "keel_bands": "Keel noise bands", "keel_band_weights": "Keel band weights",
     "keel_consensus": "Keel consensus gate", "keel_consensus_power": "Keel consensus power",
+    "keel_consensus_mode": "Keel consensus vote",
     "keel_lookahead": "Keel lookahead", "keel_lookahead_pullback": "Keel pull-back",
     "keel_lookahead_lr": "Keel pull lr factor", "keel_lookahead_grace": "Keel grace probes",
     "keel_face_gain": "Keel face gain", "keel_face_gain_max": "Keel face gain limit",
-    "keel_face_gain_beta": "Keel face gain EMA",
+    "keel_face_gain_beta": "Keel face gain EMA", "keel_body_weight": "Keel body weight",
     "lora_ema": "Weight average", "timestep_sampling": "Timestep sampling", "loss_weighting": "Loss weighting",
     "region_weights": "Region-weighted loss", "face_loss_weight": "Face loss weight",
     "body_loss_weight": "Body loss weight", "background_loss_weight": "Background loss weight",
@@ -4263,8 +4265,12 @@ class Wizard:
                           "attention values) and a controller whose rate holds on noise, climbs on a trend and "
                           "comes down when it overshoots (ai-toolkit's v4 ran away; fixed here). keel is automagic4 "
                           "for character LoRAs: a preconditioner that keeps either LoRA factor from taking the "
-                          "whole update, and a mask that drops preconditioned elements pointing against the "
-                          "gradient (untested on likeness yet: race it against adamw8bit)."):
+                          "whole update, a mask that drops preconditioned elements pointing against the gradient, "
+                          "noise bands, a cross-photo consensus gate, and (off by default) a probe-gated lookahead "
+                          "and a face-token gain. keel_fb is keel for the face and the body alike: the gain "
+                          "measures the body's tokens too and the consensus gate votes by gradient size, so face "
+                          "crops do not hold the body-serving weights back (untested on likeness yet: race them "
+                          "against adamw8bit)."):
             self.bind(ui.select(list(OPTIMIZERS), label="Optimizer"), "optimizer") \
                 .classes("w-full")
         with self.setting("network_type", "Adapter",
@@ -6053,7 +6059,7 @@ def build_page(local: bool = True):
                                              "group is not outvoted by the large ones. Fizgig trains Krea 2 this way, "
                                              "with a polarity history of 16.")
                             with fields().bind_visibility_from(w["optimizer"], "value",
-                                                               lambda x: x in ("automagic4", "keel")):
+                                                               lambda x: x in ("automagic4", *KEEL)):
                                 w["automagic_sensitivity_quantile"] = ui.number("Sensitivity quantile",
                                                                                 value=d.automagic_sensitivity_quantile,
                                                                                 min=0.05, max=1, step=0.05) \
@@ -6075,7 +6081,7 @@ def build_page(local: bool = True):
                                     .tooltip("The most the learning rate may move in one step (0.05 = about 5%); the "
                                              "signs that judge a step only arrive over the next polarity-history "
                                              "steps, so this bounds how far the rate can overshoot meanwhile.")
-                            with fields().bind_visibility_from(w["optimizer"], "value", lambda x: x == "keel"):
+                            with fields().bind_visibility_from(w["optimizer"], "value", lambda x: x in KEEL):
                                 w["keel_gauge"] = ui.switch("Gauge preconditioner", value=d.keel_gauge) \
                                     .tooltip("Each LoRA pair's gradient is scaled by the other factor's r x r Gram "
                                              "(Riemannian preconditioned LoRA), so the update does not depend on "
@@ -6091,7 +6097,7 @@ def build_page(local: bool = True):
                                     .tooltip("Zero a preconditioned gradient element that points against the raw "
                                              "gradient (Cautious Optimizers, ICLR 2026), so the step never climbs "
                                              "the loss along a weight. The kept share is logged every 250 steps.")
-                            with fields().bind_visibility_from(w["optimizer"], "value", lambda x: x == "keel"):
+                            with fields().bind_visibility_from(w["optimizer"], "value", lambda x: x in KEEL):
                                 w["keel_pair_sigma"] = ui.switch("Paired sigma", value=d.keel_pair_sigma) \
                                     .tooltip("One noise level per step for all of its micro-batches (and the DOP "
                                              "pass), so the step's gradient sits in one noise band: what the band "
@@ -6108,8 +6114,9 @@ def build_page(local: bool = True):
                                 w["keel_band_weights"] = ui.input("Band weights", value=d.keel_band_weights,
                                                                   placeholder="flat").classes("w-56") \
                                     .tooltip("A multiplier on the step's update per band: empty = 1 everywhere, "
-                                             "identity = a hump over the face bands (sigma 0.12 to 0.5), or one "
-                                             "number per band, comma-separated.")
+                                             "identity = a hump over the face bands (sigma 0.12 to 0.5), subject = "
+                                             "a plateau over the face's and the body's bands alike (sigma 0.18 to "
+                                             "0.82, for keel_fb), or one number per band, comma-separated.")
                                 w["keel_consensus"] = ui.number("Consensus gate", value=d.keel_consensus, min=0, max=1,
                                                                 step=0.1, format="%.2f").classes("w-32") \
                                     .tooltip("Cross-photo consensus (the AND-mask, ICLR 2021): each weight's update "
@@ -6125,6 +6132,17 @@ def build_page(local: bool = True):
                                     .tooltip("The exponent on the agreement share: higher is stricter on partial "
                                              "agreement (2: a 3-of-4 split counts as 0.25 agreement, before the "
                                              "floor).")
+                                w["keel_consensus_mode"] = ui.select({"auto": "auto (sign for keel, magnitude for keel_fb)",
+                                                                      "sign": "sign: one vote per gradient",
+                                                                      "magnitude": "magnitude: votes weighted by size"},
+                                                                     value=d.keel_consensus_mode,
+                                                                     label="Consensus vote").classes("w-72") \
+                                    .tooltip("How the step's gradients vote on an element. sign: each micro-batch "
+                                             "one vote (1 byte per weight for the step). magnitude: each weighted by "
+                                             "the size of its gradient (the sum's size over the sum of the sizes), so "
+                                             "a photo that says little about a weight (a face crop, for the weights "
+                                             "serving the body) barely votes instead of casting a random one (4 "
+                                             "bytes per weight for the step).")
                                 w["keel_lookahead"] = ui.switch("Lookahead", value=d.keel_lookahead) \
                                     .tooltip("Probe-gated lookahead: the weights that scored a new best likeness "
                                              "(by the noise band) become the anchor; after the grace probes without "
@@ -6149,7 +6167,8 @@ def build_page(local: bool = True):
                                              "gradient that comes from the face's tokens / the median pair's share) "
                                              "to this power, so the weights serving the face move more and the "
                                              "background's less. Needs region maps with faces (face detection). "
-                                             "0 = off; race it at 0.5 and 1.")
+                                             "0 = off; race it at 0.5 and 1. keel_fb measures the body's tokens too "
+                                             "(Body weight).")
                                 w["keel_face_gain_max"] = ui.number("Face gain limit", value=d.keel_face_gain_max,
                                                                     min=1, max=10, step=0.5, format="%.1f") \
                                     .classes("w-32").tooltip("The gain stays within [1 / limit, limit].")
@@ -6158,6 +6177,17 @@ def build_page(local: bool = True):
                                     .classes("w-32") \
                                     .tooltip("How much of the previous gain each step keeps (0.9: one batch without "
                                              "a face barely moves it).")
+                            with fields().bind_visibility_from(w["optimizer"], "value", lambda x: x == "keel_fb"):
+                                w["keel_body_weight"] = ui.number("Body weight", value=d.keel_body_weight, min=0, max=4,
+                                                                  step=0.25, format="%.2f").classes("w-32") \
+                                    .tooltip("keel_fb: the body tokens' weight against the face's in the token gain "
+                                             "(the person's cells outside the face box, from the person masks). Each "
+                                             "region's share is measured against its own median pair and the two are "
+                                             "combined as a weighted geometric mean, so a step of person-only photos "
+                                             "moves the gain by the body alone and face crops by the face alone. 1 = "
+                                             "equal; 0 = face only. Needs Face gain above 0 (off by default: then "
+                                             "keel_fb differs from keel by the consensus vote alone). Set the probes' "
+                                             "face and body weights equal too.")
                         with advanced("Timesteps, loss weighting and gradients"):
                             with fields():
                                 w["gradient_accumulation"] = ui.number("Grad accumulation",
@@ -7988,8 +8018,20 @@ what varies between photos moves less (it needs gradient accumulation of 2 or mo
 anchors the weights at each probe that sets a new best likeness and, after the grace probes without a gain, pulls
 the weights part of the way back toward the anchor and cuts the learning rate. *Face gain* (off by default) scales
 each LoRA pair's step by how much of its gradient comes from the face's tokens, against the median pair, so the
-weights that serve the face move more and the background's less; it needs region maps with faces. Whether Keel
-beats adamw8bit on the likeness probes is not measured yet: race them.
+weights that serve the face move more and the background's less; it needs region maps with faces. *Consensus vote*
+picks how the step's gradients vote: by sign (one vote each) or by magnitude (each weighted by its size, so a photo
+that says little about a weight barely votes). Whether Keel beats adamw8bit on the likeness probes is not measured
+yet: race them.
+
+`keel_fb` is Keel for the face and the body alike, for a LoRA that should hold the build as firmly as the face: the
+token gain measures the body's tokens too (the person outside the face box, from the person masks; *Body weight*
+sets their weight against the face's, each region against its own median pair) and the consensus gate votes by
+magnitude, since under the sign vote a face crop's tiny, random-signed gradient for a body-serving weight counts as
+a full vote against it; `subject` *Band weights* are its plateau over the face's and the body's noise levels. The gain
+is off by default in both, so with the defaults `keel_fb` differs from `keel` by the vote alone: set *Face gain* (0.5
+or 1) to bring the body share in. Set the probes' face and body weights (`face_weight`, `body_weight`, 0.7 / 0.3 by
+default) equal with it, since the lookahead and the best / stop decisions follow their combined score. Race it against
+`keel`: nothing is measured yet.
 
 ## Adapters: LoRA, LoKr, OFT and DoRA
 The *Adapter* field (Train tab, LoRA section) picks what each layer learns. **LoRA**: a rank-r pair. **LoKr**: a

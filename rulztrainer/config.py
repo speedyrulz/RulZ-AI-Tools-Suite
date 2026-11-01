@@ -23,8 +23,11 @@ MODEL_PRESETS = {
     "MiniMax-H3-Ref2VA": "MiniMaxAI/MiniMax-H3#ref2va",
 }
 ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21", "flux3_klein", "minimax_h3")
-OPTIMIZERS = ("adamw", "adamw8bit", "adafactor", "automagic3", "automagic4", "keel")
-AUTOMAGIC = ("automagic3", "automagic4", "keel")  # self-tuning lr: no schedule, no LoRA+, no per-image lr
+OPTIMIZERS = ("adamw", "adamw8bit", "adafactor", "automagic3", "automagic4", "keel", "keel_fb")
+AUTOMAGIC = ("automagic3", "automagic4", "keel", "keel_fb")  # self-tuning lr: no schedule, no LoRA+, no per-image lr
+KEEL = ("keel", "keel_fb")  # Keel and its face-and-body version: one class (optimizers/keel.py), keel_fb with the
+#                             body share in the token gain and the magnitude vote in the consensus gate
+KEEL_CONSENSUS_MODES = ("auto", "sign", "magnitude")
 KEEL_BAND_LOGIT_RANGE = 4.0  # Keel's noise bands span logit(sigma) in [-range, range] (sigma 0.018 to 0.982)
 
 
@@ -39,23 +42,41 @@ def keel_band_edges(bands: int) -> list[float]:
 def keel_band_weights(spec: str, bands: int) -> list[float] | None:
     """keel_band_weights resolved to one multiplier per band: None (flat: "" or a single band), the identity hump
     (0.5 + 0.8 exp(-((c + 0.7) / 1.5)^2) at each band's logit centre c: about 1.3 over sigma 0.12 to 0.5, 0.5 at the
-    ends), or the listed numbers. Raises ValueError on a bad spec."""
+    ends), the subject plateau (0.6 + 0.7 exp(-(c / 2.2)^4): about 1.2 to 1.3 over sigma 0.18 to 0.82, where the
+    face's detail and the body's silhouette form alike, 0.6 at the ends), or the listed numbers. Raises ValueError on
+    a bad spec."""
     s = (spec or "").strip().lower()
     if bands <= 1 or s in ("", "flat"):
         return None
-    if s == "identity":
+    if s in ("identity", "subject"):
         r = KEEL_BAND_LOGIT_RANGE
         centres = [-r + 2.0 * r * (k + 0.5) / bands for k in range(bands)]
-        return [round(0.5 + 0.8 * math.exp(-((c + 0.7) / 1.5) ** 2), 3) for c in centres]
+        if s == "identity":
+            return [round(0.5 + 0.8 * math.exp(-((c + 0.7) / 1.5) ** 2), 3) for c in centres]
+        return [round(0.6 + 0.7 * math.exp(-((c / 2.2) ** 4)), 3) for c in centres]
     try:
         vals = [float(x) for x in s.replace(";", ",").split(",") if x.strip()]
     except ValueError:
-        raise ValueError(f"keel_band_weights must be empty, identity or {bands} comma-separated numbers, got {spec!r}")
+        raise ValueError(f"keel_band_weights must be empty, identity, subject or {bands} comma-separated numbers, "
+                         f"got {spec!r}")
     if len(vals) != bands:
         raise ValueError(f"keel_band_weights lists {len(vals)} numbers for keel_bands {bands}")
     if any(not v > 0.0 for v in vals):
         raise ValueError("keel_band_weights must all be above 0")
     return vals
+
+
+def keel_consensus_mode(spec: str, optimizer: str) -> str:
+    """keel_consensus_mode resolved for an optimizer: auto = sign for keel, magnitude for keel_fb. Raises ValueError
+    on a bad spec."""
+    s = (spec or "auto").strip().lower()
+    if s not in KEEL_CONSENSUS_MODES:
+        raise ValueError(f"keel_consensus_mode must be auto, sign or magnitude, got {spec!r}")
+    if s == "auto":
+        return "magnitude" if (optimizer or "").lower() == "keel_fb" else "sign"
+    return s
+
+
 # LoRA target groups each family trains when lora_targets is empty. Krea 2 adds the attention output gate and its
 # text-fusion stack, which Fizgig measured to be under-trained by the attention + feed-forward recipe (scaling a
 # finished LoRA's text-fusion blocks x3 lifted likeness 2-7 points on several Krea 2 LoRAs).
@@ -378,7 +399,8 @@ class TrainConfig:
     gradient_accumulation: int = 1
     learning_rate: float = 1e-4
     optimizer: str = "adamw"  # adamw | adamw8bit | adafactor | automagic3 | automagic4 | keel (Automagic 4 for
-    #                           character LoRAs: docs/keel-optimizer.md)
+    #                           character LoRAs: docs/keel-optimizer.md) | keel_fb (Keel for the face and the body
+    #                           alike: the body share in the token gain, the magnitude vote in the consensus gate)
     weight_decay: float = 0.01
     automagic_min_lr: float = 1e-8  # automagic3/4: hard floor for the adapted lr
     automagic_max_lr: float = 1e-3  # automagic3/4: hard ceiling for the adapted lr (about 10x the start lr)
@@ -402,11 +424,16 @@ class TrainConfig:
     keel_bands: int = 8  # keel: noise bands over logit(sigma) in [-4, 4]; a step's gradient enters the second moment
     #                      at the tensor's overall scale whatever its band, so the quiet bands are not drowned; 1 = off
     keel_band_weights: str = ""  # keel: a multiplier on the step's update per band: "" = 1 everywhere, identity = a
-    #                              hump over the face bands (sigma 0.12 to 0.5), or keel_bands comma-separated numbers
+    #                              hump over the face bands (sigma 0.12 to 0.5), subject = a plateau over the face's
+    #                              and the body's bands alike (sigma 0.18 to 0.82), or keel_bands comma-separated numbers
     keel_consensus: float = 0.5  # keel: the cross-photo consensus gate, 0 = off .. 1 = a hard AND-mask: the update is
     #                              scaled by (1 - c) + c * (agreement share)^power, the share being how many of the
     #                              step's gradients (micro-batches, the DOP pass) agree on the element's sign
     keel_consensus_power: float = 2.0  # keel: the exponent on the agreement share
+    keel_consensus_mode: str = "auto"  # keel: how the step's gradients vote on an element: sign (one vote each; 1
+    #                                   byte per weight for the step) | magnitude (each weighted by its size, |sum g|
+    #                                   / sum |g|, so a photo that says little about a weight barely votes; 4 bytes
+    #                                   per weight) | auto (sign for keel, magnitude for keel_fb)
     keel_lookahead: bool = False  # keel: probe-gated lookahead: the weights that beat the anchor's smoothed likeness
     #                               score by the noise band become the anchor, and after keel_lookahead_grace probes
     #                               without a gain the weights are pulled back toward it (needs likeness probes)
@@ -418,6 +445,8 @@ class TrainConfig:
     #                              faces (face detection); 0 = off
     keel_face_gain_max: float = 2.0  # keel: the gain stays within [1 / max, max]
     keel_face_gain_beta: float = 0.9  # keel: EMA of the gain over steps (one batch without a face barely moves it)
+    keel_body_weight: float = 1.0  # keel_fb: the body tokens' weight against the face's in the token gain (the
+    #                                 person's cells outside the face box: needs person masks); 1 = equal, 0 = face only
     lr_scheduler: str = "constant"  # constant | cosine | linear
     warmup_steps: int = 50
     max_grad_norm: float = 1.0
@@ -866,6 +895,7 @@ class TrainConfig:
             raise ValueError("keel_consensus must be between 0 and 1")
         if self.keel_consensus_power <= 0:
             raise ValueError("keel_consensus_power must be above 0")
+        keel_consensus_mode(self.keel_consensus_mode, self.optimizer)  # raises on a bad spec
         if not 0 < self.keel_lookahead_pullback <= 1:
             raise ValueError("keel_lookahead_pullback must be above 0 and at most 1")
         if not 0 < self.keel_lookahead_lr <= 1:
@@ -878,6 +908,8 @@ class TrainConfig:
             raise ValueError("keel_face_gain_max must be 1 or more")
         if not 0 <= self.keel_face_gain_beta < 1:
             raise ValueError("keel_face_gain_beta must be 0 or more and below 1")
+        if self.keel_body_weight < 0:
+            raise ValueError("keel_body_weight must be 0 (face only) or above")
         if self.compile_model not in (True, False, "auto"):
             raise ValueError(f"compile_model must be true, false or auto, got {self.compile_model!r}")
         if self.race:
@@ -946,12 +978,13 @@ class TrainConfig:
         """Region maps (face cells, landmarks, the subject's cells) are needed by the region-weighted loss, the identity
         loss, attention localization, identity alignment and Keel's face-token gain."""
         return bool(self.region_weights or self.id_loss_weight > 0 or self.attn_localize or self.id_align
-                    or self.body_align or (self.optimizer.lower() == "keel" and self.keel_face_gain > 0))
+                    or self.body_align or (self.optimizer.lower() in KEEL and self.keel_face_gain > 0))
 
     def wants_person_masks(self) -> bool:
         """Person masks in the region maps: the region-weighted loss's person weight, attention localization's
-        subject."""
-        return bool(self.region_weights or self.attn_localize or self.body_align)
+        subject, body alignment, the face-and-body Keel's token gain (its body share)."""
+        return bool(self.region_weights or self.attn_localize or self.body_align
+                    or (self.optimizer.lower() == "keel_fb" and self.keel_face_gain > 0 and self.keel_body_weight > 0))
 
     def resolved_cache_dir(self) -> Path:
         """The run's cache (text embeddings, face analysis, loss-watch exclusions): cache_dir, else the first

@@ -26,7 +26,7 @@ from . import profiling
 from . import race as race_mod
 from .ema import LoraEMA
 from . import quant as Q
-from .config import AUTOMAGIC, TrainConfig, keel_band_weights
+from .config import AUTOMAGIC, KEEL, TrainConfig, keel_band_weights, keel_consensus_mode
 from .config import side_to_mp
 from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, describe_sides, dropout_text_path,
                       items_for_side, load_batch,
@@ -252,7 +252,7 @@ def sample_sigmas(cfg: TrainConfig, n: int, gen: torch.Generator, logit_shift: f
 
 def pairs_sigma(cfg: TrainConfig) -> bool:
     """Whether a step's micro-batches share one sigma (Keel's keel_pair_sigma)."""
-    return cfg.optimizer.lower() == "keel" and bool(cfg.keel_pair_sigma)
+    return cfg.optimizer.lower() in KEEL and bool(cfg.keel_pair_sigma)
 
 
 def draw_sigmas(cfg: TrainConfig, n: int, gen: torch.Generator, shift: float, tokens: int, arch,
@@ -305,19 +305,26 @@ def build_optimizer(cfg: TrainConfig, params, pairs=None):
         kw = dict(lr=cfg.learning_rate, min_lr=cfg.automagic_min_lr, max_lr=cfg.automagic_max_lr,
                   weight_decay=cfg.weight_decay, polarity_history=cfg.automagic_polarity_history,
                   clip_threshold=cfg.automagic_clip_threshold, fused=False)
-        if name == "keel":
+        if name in KEEL:
             from .optimizers.keel import Keel
 
-            return Keel(params, pairs=pairs, gauge=cfg.keel_gauge, gauge_eps=cfg.keel_gauge_eps,
-                        cautious=cfg.keel_cautious, bands=cfg.keel_bands,
-                        band_weights=keel_band_weights(cfg.keel_band_weights, cfg.keel_bands),
-                        consensus=cfg.keel_consensus, consensus_power=cfg.keel_consensus_power,
-                        lookahead=cfg.keel_lookahead, lookahead_pullback=cfg.keel_lookahead_pullback,
-                        lookahead_lr=cfg.keel_lookahead_lr, lookahead_grace=cfg.keel_lookahead_grace,
-                        face_gain=cfg.keel_face_gain, face_gain_max=cfg.keel_face_gain_max,
-                        face_gain_beta=cfg.keel_face_gain_beta,
-                        sensitivity_quantile=cfg.automagic_sensitivity_quantile, vote=cfg.automagic_vote,
-                        max_vote=cfg.automagic_max_lr_change, **kw)
+            fb = name == "keel_fb"  # the face-and-body version: the body share and the magnitude vote
+            opt = Keel(params, pairs=pairs, gauge=cfg.keel_gauge, gauge_eps=cfg.keel_gauge_eps,
+                       cautious=cfg.keel_cautious, bands=cfg.keel_bands,
+                       band_weights=keel_band_weights(cfg.keel_band_weights, cfg.keel_bands),
+                       consensus=cfg.keel_consensus, consensus_power=cfg.keel_consensus_power,
+                       consensus_mode=keel_consensus_mode(cfg.keel_consensus_mode, name),
+                       lookahead=cfg.keel_lookahead, lookahead_pullback=cfg.keel_lookahead_pullback,
+                       lookahead_lr=cfg.keel_lookahead_lr, lookahead_grace=cfg.keel_lookahead_grace,
+                       face_gain=cfg.keel_face_gain, face_gain_max=cfg.keel_face_gain_max,
+                       face_gain_beta=cfg.keel_face_gain_beta, body_weight=cfg.keel_body_weight if fb else 0.0,
+                       sensitivity_quantile=cfg.automagic_sensitivity_quantile, vote=cfg.automagic_vote,
+                       max_vote=cfg.automagic_max_lr_change, **kw)
+            if fb and cfg.keel_lookahead and cfg.face_weight != cfg.body_weight:
+                log.info("keel_fb: the lookahead follows the probes' combined score, weighted face %g / body %g "
+                         "(face_weight, body_weight); set them equal for an equal focus", cfg.face_weight,
+                         cfg.body_weight)
+            return opt
         if name == "automagic4":
             from .optimizers.automagic4 import Automagic4
 
@@ -975,7 +982,7 @@ class Trainer(RaceParallelMixin):
             do_compile, why = False, "a fine-tune swaps its layers in and out of the model"
         if self.block_swap is not None and do_compile:
             do_compile, why = False, "block swap streams the blocks' weights in and out"
-        if do_compile and any(c.optimizer.lower() == "keel" and c.keel_face_gain > 0 for c in
+        if do_compile and any(c.optimizer.lower() in KEEL and c.keel_face_gain > 0 for c in
                               ([r[1] for r in self.race_rows] if self.race_rows is not None else [cfg])):
             do_compile, why = False, "Keel's face-token gain hooks the LoRA layers' outputs (keel_face_gain)"
         if why:
@@ -1082,15 +1089,18 @@ class Trainer(RaceParallelMixin):
             use_align = bool((cfg.id_align or cfg.body_align) and taps is not None and regions is not None
                              and rmodel is model and self.id_aligner is not None)
             face_sink = getattr(optimizer, "face_energy", None) if rmodel is model else None  # Keel's face gain
+            use_body = bool(face_sink is not None and getattr(optimizer, "body_weight", 0.0) > 0)  # keel_fb
             use_face = bool(face_sink is not None and taps is not None and regions is not None
-                            and any(rm.face_cells is not None for rm in regions.meta))
+                            and any(rm.face_cells is not None or (use_body and rm.has_person) for rm in regions.meta))
             if use_attn or use_align or use_face:  # this forward records the trigger's attention / the face tokens'
                 taps.begin([self.trigger_pos.get(p, []) for p in regions.text_paths] if use_attn  # states / layout
                            else [[] for _ in batch], attention=use_attn)
-            if face_sink is not None:  # the face tap: this batch's face tokens per sample (disarmed without a face)
-                hh, ww = regions.prior.shape[-2:] if use_face else (0, 0)
+            if face_sink is not None:  # the face tap: this batch's face (and body) tokens per sample (disarmed
+                hh, ww = regions.prior.shape[-2:] if use_face else (0, 0)  # without a face or a body)
                 lora_mod.arm_face_tap(rinj, [lora_mod.face_token_mask(rm.face_cells, hh, ww) for rm in regions.meta]
-                                      if use_face else None, lambda: taps.layout, face_sink)
+                                      if use_face else None, lambda: taps.layout, face_sink,
+                                      body_masks=[lora_mod.body_token_mask(rm, hh, ww) for rm in regions.meta]
+                                      if use_face and use_body else None)
             pred = rmodel(noisy_in, sigma * 1000.0, embeds, mask).float()
             aux = None
             if use_attn or use_align:
@@ -1261,11 +1271,11 @@ class Trainer(RaceParallelMixin):
                 retry_jobs = (per_rep, step_images)  # the same images, not the next ones from the iterator
                 free_cuda()
                 continue
-            gather = getattr(optimizer, "gather", None)
-            if gather is not None:  # Keel: the micro-batch sums back on p.grad for the reduce and the clip
-                gather()
             if self.dp is not None:  # (Keel scales each replica's sum by the step's band and counts its vote)
                 self.dp.reduce_grads(take=getattr(optimizer, "take_replica", None))
+            gather = getattr(optimizer, "gather", None)
+            if gather is not None:  # Keel: the micro-batch sums join the replicas' on p.grad for the clip
+                gather()
             if cfg.max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
             if step_lr_mult != 1.0:  # true per-image lr: scale this step only (the scheduler restores it)
@@ -1449,8 +1459,10 @@ class Trainer(RaceParallelMixin):
         budget = ft_mod.plan_budget(free, reserve, cfg.finetune_window_gb)
         bpp = ft_mod.BYTES_PER_PARAM.get(cfg.optimizer.lower(), 18) + (ft_mod.ANCHOR_BYTES if cfg.finetune_anchor > 0
                                                                         else 0)
-        if cfg.optimizer.lower() == "keel" and cfg.keel_lookahead:
+        if cfg.optimizer.lower() in KEEL and cfg.keel_lookahead:
             bpp += 4  # the lookahead's fp32 anchor copy
+        if cfg.optimizer.lower() in KEEL and cfg.keel_consensus > 0:  # the consensus vote's buffer for the step
+            bpp += 4 if keel_consensus_mode(cfg.keel_consensus_mode, cfg.optimizer) == "magnitude" else 1
         ft.anchored = cfg.finetune_anchor > 0
         windows = ft.plan(budget, bpp)
         per_step = cfg.batch_size * cfg.gradient_accumulation
@@ -1668,7 +1680,7 @@ class Trainer(RaceParallelMixin):
                 log.info("Training state was saved with %s; continuing with %s (the adapted lr and sign history carry "
                          "over%s)", saved_opt, self.cfg.optimizer,
                          "; the sensitivity reference is measured on the first step"
-                         if self.cfg.optimizer.lower() in ("automagic4", "keel") and saved_opt == "automagic3" else "")
+                         if self.cfg.optimizer.lower() in ("automagic4", *KEEL) and saved_opt == "automagic3" else "")
             else:
                 raise ValueError(f"Training state was saved with optimizer {saved_opt} but the config says "
                                  f"{self.cfg.optimizer}; set optimizer: {saved_opt} to resume it (only Automagic 3, "
@@ -2761,7 +2773,7 @@ class Trainer(RaceParallelMixin):
         rows = [r[1] for r in self.race_rows] if self.race_rows is not None else [cfg]
         attn, align = any(c.attn_localize for c in rows), any(c.id_align or c.body_align for c in rows)
         if not (attn or align):
-            if (any(c.optimizer.lower() == "keel" and c.keel_face_gain > 0 for c in rows) and self.ft is None
+            if (any(c.optimizer.lower() in KEEL and c.keel_face_gain > 0 for c in rows) and self.ft is None
                     and not self.race_parallel):
                 for m, _, _ in self.replicas:
                     m._rz_taps = A.Taps()  # the token layout alone, for Keel's face tap (keel_face_gain)
