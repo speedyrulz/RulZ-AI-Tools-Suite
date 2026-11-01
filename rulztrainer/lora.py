@@ -12,6 +12,10 @@ Export key formats (Arch.lora_format):
     transformer.<module>.lora_A.weight          [rank, in]
     transformer.<module>.lora_B.weight          [out, rank]
     + "lora_adapter_metadata" (the PEFT LoraConfig, prefixed "transformer.") in the file metadata
+  comfy_ab  the alpha-less layout ai-toolkit and diffusion-pipe write for MiniMax H3 (and musubi-tuner, ComfyUI and
+         diffusers' MiniMaxH3LoraLoaderMixin read): no alpha, so alpha = rank; alpha / rank is folded into lora_B
+    diffusion_model.<module>.lora_A.weight      [rank, in]
+    diffusion_model.<module>.lora_B.weight      [out, rank]
 
   folded ComfyUI's and diffusers' loaders at once, for a family whose module names are the ones ComfyUI keeps under
          "diffusion_model." and diffusers converts (FLUX 3 Klein: BFL's names; diffusers refuses .alpha keys there)
@@ -19,7 +23,7 @@ Export key formats (Arch.lora_format):
     diffusion_model.<module>.lora_B.weight      [out, rank], already times alpha / rank: no .alpha key
     + "rulztrainer_lora_alpha" (JSON {module: alpha}) in the metadata, so a resume continues at the trained alpha
 
-Effective delta = (alpha / rank) * up @ down in comfy and peft; lora_B @ lora_A (scale 1) in folded.
+Effective delta = (alpha / rank) * up @ down in comfy and peft; lora_B @ lora_A (scale 1) in folded and comfy_ab.
 
 LoKr (network_type "lokr"): the delta is a Kronecker product kron(w1, w2) with w1 [a, b] small (a, b the largest
 divisors of out / in that are <= lokr_factor, the LyCORIS convention) and w2 [c, d] = [out / a, in / b] full-matrix,
@@ -60,7 +64,7 @@ log = logging.getLogger("rulztrainer")
 
 COMFY_PREFIX = "diffusion_model."
 PEFT_PREFIX = "transformer."
-LORA_FORMATS = ("comfy", "peft", "folded")
+LORA_FORMATS = ("comfy", "peft", "folded", "comfy_ab")
 FOLDED_ALPHA_KEY = "rulztrainer_lora_alpha"  # folded files: {module: alpha} the lora_B weights were multiplied by
 # peft 0.21 LoraConfig fields: diffusers rebuilds the adapter config from the file metadata with LoraConfig(**these)
 PEFT_CONFIG_TEMPLATE = {
@@ -671,6 +675,10 @@ def export_state_dict(injected: dict[str, LoRALinear], dtype=torch.bfloat16, fmt
         elif fmt == "folded":
             out[f"{key}.lora_A.weight"] = down
             out[f"{key}.lora_B.weight"] = (m.lora_up.weight.detach().float().cpu() * m.scale).to(dtype).contiguous()
+        elif fmt == "comfy_ab":  # read at scale 1 (alpha = rank): alpha / rank folded into lora_B
+            out[f"{COMFY_PREFIX}{name}.lora_A.weight"] = down
+            out[f"{COMFY_PREFIX}{name}.lora_B.weight"] = (m.lora_up.weight.detach().float() * m.scale).to(
+                "cpu", dtype).contiguous()
         else:
             key = COMFY_PREFIX + name
             out[f"{key}.lora_down.weight"] = down
@@ -729,6 +737,10 @@ def save_lora(injected: dict[str, LoRALinear], path, metadata: dict | None = Non
                                              if m.kind == "lora" and getattr(m, "trainable", True)}, sort_keys=True)
     if metadata:
         meta.update({k: (v if isinstance(v, str) else json.dumps(v)) for k, v in metadata.items()})
+    if fmt == "comfy_ab" and "lora" in kinds:
+        meta["rulztrainer_alpha"] = "folded into lora_B: read at alpha = rank"
+        if "ss_network_dim" in meta:
+            meta["ss_network_alpha"] = meta["ss_network_dim"]
     save_file(export_state_dict(injected, dtype, fmt), str(path), metadata=meta)
 
 
@@ -800,8 +812,9 @@ def load_lora_weights(injected: dict[str, LoRALinear], path) -> int:
                 m.lokr_w2.copy_(w2.float())
             loaded += 1
             continue
-        if peft:
-            key = stem if folded is not None and stem else PEFT_PREFIX + name
+        if peft:  # transformer.<module> (PEFT) or diffusion_model.<module> (folded; comfy_ab: alpha = rank)
+            key = stem if folded is not None and stem else next(
+                (p + name for p in (PEFT_PREFIX, COMFY_PREFIX) if f"{p}{name}.lora_A.weight" in state), PEFT_PREFIX + name)
             down, up = state.get(f"{key}.lora_A.weight"), state.get(f"{key}.lora_B.weight")
         else:
             key = COMFY_PREFIX + name
@@ -818,6 +831,11 @@ def load_lora_weights(injected: dict[str, LoRALinear], path) -> int:
             m.lora_up.weight.copy_(up.float())
         if folded is not None:
             m.alpha = alpha
+        elif peft and key.startswith(COMFY_PREFIX):
+            alpha = state.get(f"{key}.alpha")
+            if alpha is None:  # comfy_ab: the file's delta is lora_B @ lora_A at scale 1; keep the module's alpha
+                with torch.no_grad():
+                    m.lora_up.weight.mul_(1.0 / m.scale)
         elif peft:
             alpha = (peft_meta.get("alpha_pattern") or {}).get(name, peft_meta.get("lora_alpha"))
         else:

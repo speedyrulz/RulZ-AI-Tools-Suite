@@ -53,12 +53,15 @@ EXTRA_TARGETS = {
     "mode_blocks": (("flux3_klein",), "the 5 text and 5 image per-mode blocks that run before the 28 joint ones (on by "
                                       "default: the attention / feed-forward groups apply there too)"),
     "modulation": (("flux3_klein",), "the per-mode shift / scale / gate projections of the timestep"),
+    "token_refiner": (("minimax_h3",), "the 2 token-refiner blocks over the text (musubi-tuner leaves them out; the "
+                                       "training adapters train them)"),
 }
 N_BLOCKS = {"moss_image": 42, "fibo2": 44, "krea2": 28, "qwen_image21": 32, "flux3_klein": 28}
 # Ideogram 4: 34 blocks; its per-block modulation, text projection and embedders are LoRA targets too
 N_BLOCKS["ideogram4"] = 34
 for _t in ("adaln", "text_in", "embed"):
     EXTRA_TARGETS[_t] = (EXTRA_TARGETS[_t][0] + ("ideogram4",), EXTRA_TARGETS[_t][1])
+N_BLOCKS["minimax_h3"] = 50
 COMPILE_CHOICES = {"auto": "auto: runs of 100+ steps", True: "on", False: "off"}
 N_BLOCKS_MAX = max(N_BLOCKS.values())
 
@@ -82,6 +85,10 @@ TURBO_MODES = {"auto": "The model's turbo LoRA (downloaded)", "none": "None: ful
                "file": "A LoRA file"}
 ADAPTER_MODES = {"auto": "The model's training adapter (downloaded; Qwen-Image 2.1)", "none": "None",
                  "file": "A LoRA file"}
+ADAPTER_MODES["auto"] = "The model's training adapter (downloaded; Qwen-Image 2.1, MiniMax H3)"
+# MiniMax H3's Comfy-Org formats (h3/loading.py: the pruned files drop the ~13B AdaLN parameters)
+FILE_QUANT_LABELS.update({"pruned_int8_convrot": "pruned int8 ConvRot (21.0 GB, for 16 GB cards)",
+                          "pruned_bf16": "pruned bf16 (40.2 GB)", "nvfp4_awq": "NVFP4 AWQ (15.7 GB)"})
 SAMPLE_ASPECTS = {"1:1": "1:1 square", "4:5": "4:5 portrait", "3:4": "3:4 portrait", "2:3": "2:3 portrait",
                   "9:16": "9:16 portrait", "5:4": "5:4 landscape", "4:3": "4:3 landscape", "3:2": "3:2 landscape",
                   "16:9": "16:9 landscape", "21:9": "21:9 wide"}
@@ -1190,7 +1197,10 @@ class Form:
             sel = self.w.get(key)
             if sel is not None:
                 opts = file_quant_options(family, kind)
-                sel.set_options(opts, value=sel.value if sel.value in opts else "int8_convrot")
+                value = sel.value if sel.value in opts else "int8_convrot"
+                if family == "minimax_h3" and kind == "model" and value == "int8_convrot":
+                    value = "pruned_int8_convrot"  # H3: the pruned file (21 GB) instead of the full one (34 GB)
+                sel.set_options(opts, value=value)
 
     def to_config(self) -> TrainConfig:
         v = self.value
@@ -2965,6 +2975,9 @@ MODEL_GB = {"moss_image": {"bf16": 10.0, "int8": 5.5, "nvfp4": 3.0}, "krea2": {"
 # Ideogram 4: 9.29 B weights (the release's fp8 file, 9.29 GB): bf16 about 18.6 GB; Comfy-Org's int8_convrot file
 # 9.58 GB, nvfp4_mixed 5.49 GB
 MODEL_GB["ideogram4"] = {"bf16": 18.6, "int8": 9.6, "nvfp4": 5.5}
+# MiniMax H3 pruned (Comfy-Org's file sizes: bf16 40.2 GB, int8_convrot 21.0 GB; nvfp4 is an estimate: the blocks at
+# 4.5 bits per weight, 10.9 GB, and the bf16 token refiner, 1.5 GB)
+MODEL_GB["minimax_h3"] = {"bf16": 40.2, "int8": 21.0, "nvfp4": 12.5}
 STEP_HEADROOM_GB = 4.5
 
 
@@ -3026,6 +3039,18 @@ MODEL_NOTES = {
                        "Agreement: non-commercial use only; a LoRA trained on it is a Model Derivative under the same "
                        "terms (share it with the agreement and its notice), and images made for revenue-generating "
                        "uses are not allowed either."),
+    "MiniMax-H3-FL2VA": ("Experimental", "MiniMax H3 (33B video + audio), the FL2VA checkpoint (text / first-last "
+                                         "frame to video): image LoRAs train as one-frame videos, as musubi-tuner "
+                                         "does, for use in H3 video generation. Comfy-Org's pruned int8 file is "
+                                         "21.0 GB: two 16 GB cards in model split, or one with block swap (64 GB of "
+                                         "RAM advised); the Qwen3-VL-32B text encoder (27.1 GB int8, 15.7 GB NVFP4) "
+                                         "caches the captions first. MiniMax H3 Community License: users in the "
+                                         "USA, EU, UK and South Korea must apply to MiniMax first "
+                                         "(platform.minimax.io/h3-license)."),
+    "MiniMax-H3-Ref2VA": ("Not for training", "The reference-to-video H3 checkpoint (up to 9 images, 3 videos, 3 "
+                                              "audio clips as references). Train on MiniMax-H3-FL2VA: this trainer "
+                                              "trains text-only one-frame LoRAs, and a LoRA made on one H3 checkpoint "
+                                              "degrades the other (diffusers' note)."),
 }
 
 
@@ -3278,7 +3303,59 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
         r["probe_body_prompt"] = (("", "face only: each probe renders the headshot alone, in half the time")
                                   if face_only else
                                   (body_p.format(trigger=subject), "an upright full-body shot scores the build"))
+    if cfg.arch_name() == "minimax_h3":
+        h3_recommendations(cfg, r, goal, gpus, vram, character)
     return r
+
+
+def h3_recommendations(cfg: TrainConfig, r: dict, goal: str | None, gpus: list[dict], vram: float | None,
+                       character: bool) -> None:
+    """MiniMax H3's own settings over the generic ones (musubi-tuner's and DiffSynth-Studio's H3 recipes; the memory
+    figures are estimates from Comfy-Org's file sizes, not measurements)."""
+    n_gpus = len(gpus)
+    if cfg.model_source == "files":
+        r["model_file_quant"] = ("pruned_int8_convrot", "Comfy-Org's pruned int8 file (21.0 GB): the 13B AdaLN "
+                                                        "parameters are a small precomputed table, the attention and "
+                                                        "feed-forward layers the LoRA trains are the full model's")
+        r["text_encoder_file_quant"] = (("int8_convrot", "the 27.1 GB int8 Qwen3-VL-32B spreads over both cards for the "
+                                                         "caption caching, then unloads") if n_gpus >= 2 else
+                                        ("nvfp4_awq", "the 15.7 GB NVFP4 Qwen3-VL-32B: the smallest; what does not "
+                                                      "fit the card runs from system RAM while the captions cache"))
+    r["text_encoder_device"] = ("auto", "Qwen3-VL-32B is larger than one 16 GB card: auto spreads it over the GPUs "
+                                        "(and system RAM)")
+    r["transformer_quant"] = ("auto", "keeps the pruned int8 file as it is; a bf16 source is quantized for the GPUs "
+                                      "it runs on (int8 from about 30 GB, else nvfp4)")
+    if n_gpus >= 2 and not cfg.finetune:
+        r["multi_gpu"] = ("model_split", f"{n_gpus} GPUs: the 21 GB int8 model split across them (about 10.5 GB "
+                                         "each); a copy per card (data parallel) does not fit")
+        r["block_swap"] = (0, "model split holds the whole model on the GPUs")
+    elif vram is not None and not cfg.finetune:
+        resident = max(1.0, vram - 4.5 - 1.6)  # the step's memory and the non-block weights (refiner, heads)
+        swap = max(1, min(48, math.ceil(50 - resident / 0.387)))  # a pruned int8 block holds 0.387 GB
+        r["multi_gpu"] = ("off", "one GPU found")
+        r["block_swap"] = (swap, f"the 21 GB model does not fit {vram:.0f} GB: {swap} of the 50 blocks' frozen weights "
+                                 f"({swap * 0.387:.1f} GB) wait in pinned system RAM and stream in as each runs "
+                                 "(an estimate; musubi-tuner swaps up to 48)")
+    r["resolutions"] = ([1.0], "1 MP: about H3's own 768 x 1344 canvas, and 1024 video tokens a step")
+    if not cfg.finetune and cfg.network_type == "lora":
+        rank = 32 if goal == "style" else 16
+        r["lora_rank"] = (rank, "musubi-tuner's H3 examples train rank 16; DiffSynth-Studio's 32")
+        r["lora_alpha"] = (float(rank), "alpha = rank: H3 LoRAs are saved without alpha (the layout ComfyUI, diffusers "
+                                        "and musubi-tuner read at alpha = rank)")
+        if cfg.optimizer != "automagic3":
+            r["learning_rate"] = (1e-4, "musubi-tuner's and DiffSynth-Studio's H3 LoRA rate")
+    r["timestep_sampling"] = ("reference", "H3's own: one uniform base time per step, the video sigma on the shift-12 "
+                                           "curve (the audio sigma follows on shift 3), as the released schedulers "
+                                           "and musubi-tuner train")
+    if not cfg.finetune:
+        r["adapter_mode"] = ("auto", "circlestone-labs' image training adapter: H3 is CFG-distilled, and musubi-tuner "
+                                     "saw one-frame LoRAs trained without an adapter break up within about 50 steps")
+    if cfg.turbo_lora != "auto":
+        r["sample_steps"] = (30, "musubi-tuner's one-frame example (H3's pipeline: 49 evaluations)")
+        r["sample_cfg"] = (1.0, "H3 is guidance-distilled: no CFG")
+    if character:
+        r["probe_steps"] = (r["sample_steps"][0], "the probes sample as the previews do")
+        r["probe_cfg"] = (1.0, "H3 is guidance-distilled: no CFG")
 
 
 def extra_review_rows(cfg: TrainConfig) -> list[tuple[str, str]]:
@@ -3890,10 +3967,13 @@ class Wizard:
                                                                             "you already have.", "file"),
                     ("text_encoder_file", "Text encoder file (optional)", "Qwen3.5-9B for MOSS-Image, Qwen3-VL-4B for "
                                                                           "Krea 2, FIBO 2.0 and FLUX 3 Klein, "
-                                                                          "Qwen3-VL-8B for Qwen-Image 2.1 and Ideogram 4.", "file"),
+                                                                          "Qwen3-VL-8B for Qwen-Image 2.1 and Ideogram 4, "
+                                                                          "Qwen3-VL-32B (cut to 50 layers) for "
+                                                                          "MiniMax H3.", "file"),
                     ("vae_file", "VAE file (optional)", "The Flux2 VAE for MOSS-Image, FIBO 2.0, FLUX 3 Klein and "
                                                         "Ideogram 4, the Qwen-Image VAE for Krea 2, its own for "
-                                                        "Qwen-Image 2.1.", "file"),
+                                                        "Qwen-Image 2.1, the video VAE for MiniMax H3 (its audio "
+                                                        "VAE is found next to it or downloaded).", "file"),
                     ("tokenizer_path", "Tokenizer folder (optional)", "Left empty, the tokenizer is downloaded once "
                                                                       "(a few MB).", "dir")):
                 with self.setting(None, title, text + " Left empty, it is downloaded."):
@@ -4195,12 +4275,15 @@ class Wizard:
                           "Every Krea 2 attention has a sigmoid gate on its output. Krea's own LoRAs train it.",
                           show_if=is_krea):
             self.bind(ui.switch("Attention gate"), "target_attn_gate")
-        is_qwen = ("model_preset", lambda p: preset_arch(p, self.w["model_path"].value) == "qwen_image21")
+        is_qwen = ("model_preset", lambda p: preset_arch(p, self.w["model_path"].value) in ("qwen_image21",
+                                                                                              "minimax_h3"))
         with self.setting("adapter_mode", "Training adapter",
                           "A small LoRA that stays on while your LoRA trains and off for samples and probes, and is "
                           "never saved into it, so your LoRA works on the plain model. Fizgig measured on Qwen-Image "
                           "2.1: without one, LoRAs collapse into texture or wobble part-way with no warning in the "
-                          "loss; with Fizgig's adapter (downloaded, 80 MB) likeness reached 77 against 56.",
+                          "loss; with Fizgig's adapter (downloaded, 80 MB) likeness reached 77 against 56. MiniMax "
+                          "H3's is circlestone-labs' image training adapter (0.62 GB): musubi-tuner saw one-frame H3 "
+                          "LoRAs break up within about 50 steps without an adapter.",
                           show_if=is_qwen):
             self.bind(ui.select(ADAPTER_MODES, label="Training adapter"), "adapter_mode").classes("w-full")
         with self.setting("region_weights", "Region-weighted loss",
@@ -4277,8 +4360,8 @@ class Wizard:
         with self.setting(None, "Turbo LoRA",
                           "A step-distilled LoRA used only while rendering samples and probes, never in training: "
                           "previews take seconds. The model's own is downloaded (MOSS-Image: 12 steps at CFG 1; "
-                          "Krea 2, Qwen-Image 2.1 and Ideogram 4: 8; FIBO 2.0: 4; FLUX 3 Klein has none) and the "
-                          "steps and guidance below follow it. "
+                          "Krea 2, Qwen-Image 2.1, Ideogram 4 and MiniMax H3: 8; FIBO 2.0: 4; FLUX 3 Klein has "
+                          "none) and the steps and guidance below follow it. "
                           "For MOSS-Image, Fizgig found it can understate likeness: judge likeness on full-quality "
                           "samples."):
             self.bind(ui.select(TURBO_MODES, label="Turbo LoRA"), "turbo_mode").classes("w-full")
@@ -5144,8 +5227,8 @@ def build_page(local: bool = True):
             ui.element("img").props('src="/assets/logo_dark.png" alt="Rulz"').classes("rz-logo rz-dark-only")
             ui.element("img").props('src="/assets/logo.png" alt="Rulz"').classes("rz-logo rz-light-only")
             ui.label("TRAINER").classes("rz-wordmark")
-            ui.label("LoRA training for MOSS-Image, Bria FIBO 2.0, Krea 2, Qwen-Image 2.1, FLUX 3 Klein and "
-                     "Ideogram 4") \
+            ui.label("LoRA training for MOSS-Image, Bria FIBO 2.0, Krea 2, Qwen-Image 2.1, FLUX 3 Klein, "
+                     "Ideogram 4 and MiniMax H3") \
                 .classes("rz-tagline gt-sm")
             ui.space()
             # sun in the dark look (switch to light), moon in the light look; CSS picks the icon, so it is right
@@ -5362,11 +5445,13 @@ def build_page(local: bool = True):
                                        "file", "", "w-[40rem]")
                             path_input(f, "text_encoder_file", "Text encoder file (optional; Qwen3.5-9B for MOSS-Image, "
                                                                "Qwen3-VL-4B for Krea 2, FIBO 2.0 and FLUX 3 Klein, "
-                                                               "Qwen3-VL-8B for Qwen-Image 2.1 and Ideogram 4)", "file", "",
+                                                               "Qwen3-VL-8B for Qwen-Image 2.1 and Ideogram 4, "
+                                                               "Qwen3-VL-32B for MiniMax H3)", "file", "",
                                        "w-[40rem]")
                             path_input(f, "vae_file", "VAE file (optional; Flux2 for MOSS-Image, FIBO 2.0, FLUX 3 "
                                                       "Klein and Ideogram 4, Qwen-Image for Krea 2, its own for "
-                                                      "Qwen-Image 2.1)", "file", "", "w-[40rem]")
+                                                      "Qwen-Image 2.1, the video VAE for MiniMax H3)", "file", "",
+                                       "w-[40rem]")
                             path_input(f, "tokenizer_path", "Tokenizer folder (optional; auto-downloads if empty)",
                                        "dir", "", "w-[40rem]")
                         subhead("GPUs and memory")
@@ -5764,7 +5849,8 @@ def build_page(local: bool = True):
                                 .tooltip("A LoRA that stays on while your LoRA trains and off for samples and probes, "
                                          "never saved into it, so your LoRA works on the plain model. Qwen-Image "
                                          "2.1's is Fizgig's (downloaded, 80 MB): without one its LoRAs collapse "
-                                         "into texture or wobble part-way (likeness 77 with it, 56 without). The "
+                                         "into texture or wobble part-way (likeness 77 with it, 56 without). "
+                                         "MiniMax H3's is circlestone-labs' image training adapter (0.62 GB). The "
                                          "other models have none of their own; a file works on any.")
                             path_input(f, "training_adapter", "Training adapter file", "file", "", "w-[30rem]")
                             f.w["training_adapter"].parent_slot.parent.bind_visibility_from(w["adapter_mode"], "value",
@@ -6032,7 +6118,8 @@ def build_page(local: bool = True):
                                          "in training. The model's own: MOSS-Image lodestones' 8-step DMD LoRA (12 "
                                          "steps, CFG 1, shift 5), Krea 2 and Qwen-Image 2.1 Comfy-Org's Turbo LoRAs "
                                          "(8 steps, CFG 1), FIBO 2.0 Comfy-Org's Turbo LoRA (4 steps, CFG 1), "
-                                         "Ideogram 4 ostris' TurboTime LoRA (8 steps, CFG 1).")
+                                         "Ideogram 4 ostris' TurboTime LoRA (8 steps, CFG 1), MiniMax H3 "
+                                         "lightx2v's FL2VA Turbo 8-step LoRA (8 steps, CFG 1).")
                             path_input(f, "turbo_lora", "Turbo / step-distill LoRA file", "file", "", "w-[30rem]")
                             f.w["turbo_lora"].parent_slot.parent.bind_visibility_from(w["turbo_mode"], "value",
                                                                                       lambda x: x == "file")
@@ -6078,6 +6165,12 @@ def build_page(local: bool = True):
                              "empty negative prompt is the text-free pass.").bind_visibility_from(
                             w["model_preset"], "value",
                             lambda p: preset_arch(p, w["model_path"].value) == "ideogram4")
+                        hint("MiniMax H3: samples are single-frame videos on the plain model (the training adapter "
+                             "off): with lightx2v's 8-step turbo LoRA 8 steps at CFG 1, without it 30 steps at CFG 1 "
+                             "(H3 is guidance-distilled). Its shifts are its own (12 video, 3 audio): Shift is "
+                             "ignored. The turbo LoRA was distilled on video, not checked on stills."
+                             ).bind_visibility_from(w["model_preset"], "value",
+                                                    lambda p: preset_arch(p, w["model_path"].value) == "minimax_h3")
                         hint("MOSS-Image: lodestones' turbo LoRA renders 12 steps at CFG 1 on Base. Fizgig found it "
                              "can understate likeness: judge a run's likeness on full-quality samples (Turbo LoRA: "
                              "none, 20 steps, CFG 3).").bind_visibility_from(
@@ -7940,6 +8033,40 @@ image = pipe(json_caption, num_inference_steps=20, guidance_schedule=[7.0] * 18 
 Ideogram 4 is under the Ideogram Non-Commercial Model Agreement: non-commercial use only. A LoRA trained on it is a
 Model Derivative under the same terms (share it with the agreement and its notice), and images made for
 revenue-generating uses are not allowed either.
+
+## MiniMax H3
+
+MiniMax H3 is a 33B video + audio model. Pick **MiniMax-H3-FL2VA**: your pictures train as one-frame videos (one video
+latent frame and a silent audio placeholder, the loss on the video alone), as musubi-tuner's one-frame mode does, so a
+character or style LoRA trained on stills loads into H3 video generation (ComfyUI, diffusers, musubi-tuner). This is
+experimental: how well a stills LoRA carries into motion is not known yet.
+
+The single files come from Comfy-Org/MiniMax-H3: pick *pruned int8 ConvRot* (21.0 GB; the full int8 file is 34.0 GB
+and is pruned on load anyway), the Qwen3-VL-32B text encoder cut to 50 layers (int8 27.1 GB or NVFP4 15.7 GB, used
+for caching and then unloaded) and the video VAE (5.2 GB); the 0.6 GB audio VAE is fetched by itself for the silence
+placeholder. Nothing fits one 16 GB card whole. Estimates, not measured: two 16 GB cards in **model split** (about
+10.5 GB of weights each), or one card with **block swap** (about 25 of the 50 blocks in pinned system RAM; 64 GB of
+RAM advised). The text encoder spreads over the GPUs and system RAM (*Text encoder device* auto).
+
+H3 is CFG-distilled, so the **training adapter** is on by default: circlestone-labs' image training adapter, on while
+your LoRA trains, off for samples and probes, never saved into the file (musubi-tuner saw one-frame LoRAs break up
+within about 50 steps without an adapter). The setup wizard suggests the recipe musubi-tuner and DiffSynth-Studio use:
+rank 16 (32 for styles), alpha = rank, learning rate 1e-4, adamw8bit, H3's own timesteps (*reference*: one base time,
+shift 12 for video), 1 MP buckets on a 32 px grid, EMA. Samples render on the plain model with lightx2v's 8-step turbo
+LoRA (CFG 1), or 30 steps without it.
+
+LoRAs are saved as `diffusion_model.blocks.N.attn.qkv_proj.lora_A/B` without alpha (alpha = rank), the layout
+ai-toolkit and diffusion-pipe write and ComfyUI's Load LoRA, musubi-tuner and diffusers read:
+
+```python
+from diffusers import ModularPipeline
+pipe = ModularPipeline.from_pretrained("MiniMaxAI/MiniMax-H3")
+pipe.load_components(dtype=torch.bfloat16)
+pipe.load_lora_weights("output/<job>/<job>.safetensors")
+```
+
+MiniMax H3 Community License Agreement: users in the USA, EU, UK and South Korea must apply to MiniMax for a license
+first (platform.minimax.io/h3-license).
 """
 
 
