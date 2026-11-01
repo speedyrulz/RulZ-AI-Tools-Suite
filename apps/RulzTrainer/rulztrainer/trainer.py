@@ -261,8 +261,9 @@ def loss_weight(cfg: TrainConfig, sigma: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Unknown loss_weighting {cfg.loss_weighting}")
 
 
-def build_optimizer(cfg: TrainConfig, params):
-    """`params` may be a list of tensors or a list of param-group dicts (LoRA+)."""
+def build_optimizer(cfg: TrainConfig, params, pairs=None):
+    """`params` may be a list of tensors or a list of param-group dicts (LoRA+). `pairs`: the (lora_down, lora_up)
+    pairs among them (lora.lora_pairs), which Keel preconditions; the other optimizers ignore them."""
     name = cfg.optimizer.lower()
     if name == "adamw":
         return torch.optim.AdamW(params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay, betas=(0.9, 0.99))
@@ -286,6 +287,12 @@ def build_optimizer(cfg: TrainConfig, params):
         kw = dict(lr=cfg.learning_rate, min_lr=cfg.automagic_min_lr, max_lr=cfg.automagic_max_lr,
                   weight_decay=cfg.weight_decay, polarity_history=cfg.automagic_polarity_history,
                   clip_threshold=cfg.automagic_clip_threshold, fused=False)
+        if name == "keel":
+            from .optimizers.keel import Keel
+
+            return Keel(params, pairs=pairs, gauge=cfg.keel_gauge, gauge_eps=cfg.keel_gauge_eps,
+                        cautious=cfg.keel_cautious, sensitivity_quantile=cfg.automagic_sensitivity_quantile,
+                        vote=cfg.automagic_vote, max_vote=cfg.automagic_max_lr_change, **kw)
         if name == "automagic4":
             from .optimizers.automagic4 import Automagic4
 
@@ -1578,11 +1585,11 @@ class Trainer(RaceParallelMixin):
                 log.info("Training state was saved with %s; continuing with %s (the adapted lr and sign history carry "
                          "over%s)", saved_opt, self.cfg.optimizer,
                          "; the sensitivity reference is measured on the first step"
-                         if self.cfg.optimizer.lower() == "automagic4" else "")
+                         if self.cfg.optimizer.lower() in ("automagic4", "keel") and saved_opt == "automagic3" else "")
             else:
                 raise ValueError(f"Training state was saved with optimizer {saved_opt} but the config says "
-                                 f"{self.cfg.optimizer}; set optimizer: {saved_opt} to resume it (only Automagic 3 "
-                                 f"and 4 states convert into each other)")
+                                 f"{self.cfg.optimizer}; set optimizer: {saved_opt} to resume it (only Automagic 3, "
+                                 f"4 and Keel states convert into each other)")
         optimizer.load_state_dict(st["optimizer"])
         scheduler.load_state_dict(st["scheduler"])
         gen.set_state(st["torch_gen"])
@@ -2133,7 +2140,7 @@ class Trainer(RaceParallelMixin):
             if len(groups) > 1:
                 log.info("LoRA+: lora_up lr = %.2e (x%g), lora_down lr = %.2e", groups[1]["lr"], cfg.lora_plus_ratio,
                          groups[0]["lr"])
-        optimizer = build_optimizer(cfg, groups)
+        optimizer = build_optimizer(cfg, groups, pairs=lora_mod.lora_pairs(injected))
         return optimizer, build_scheduler(cfg, optimizer)
 
     def _make_ema(self, cfg, injected):

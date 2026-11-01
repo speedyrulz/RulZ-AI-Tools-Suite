@@ -620,6 +620,11 @@ def lora_parameters(injected: dict[str, LoRALinear]):
         yield from m.adapter_params().values()
 
 
+def lora_pairs(injected: dict[str, LoRALinear]) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """(lora_down, lora_up) of every LoRA-kind layer, for optimizers that precondition the pair (Keel)."""
+    return [(m.lora_down.weight, m.lora_up.weight) for m in injected.values() if m.kind == "lora"]
+
+
 def lora_param_groups(injected: dict[str, LoRALinear], lr: float, plus_ratio: float = 0.0) -> list[dict]:
     """Optimizer param groups. With LoRA+ (ratio > 1) the LoRA up matrices get lr x ratio in their own group; LoKr,
     OFT and DoRA's magnitudes stay at lr (LoRA+ is a LoRA result)."""

@@ -740,6 +740,34 @@ as text-side on Krea 2 and FIBO's timestep embedder as "other"), polarity histor
 rate multiplier scales the adapted rate; on a noise-dominated loss the vote leaves it alone, and when the gradients
 carry signal the vote may pull the rate back toward its own fixed point over the following steps.
 
+### Keel (`optimizer: keel`): Automagic 4 for character LoRAs
+
+Keel is Automagic 4 with two additions aimed at identity (the design, with the four further mechanisms planned on
+top of it and the race plan that decides them, is in `docs/keel-optimizer.md`). Every Automagic 4 setting applies;
+with both of its own switches off it is Automagic 4 to the bit (a test asserts it).
+
+- **Gauge preconditioner** (`keel_gauge`, on): a LoRA's delta is `lora_up x lora_down`, and `(B S)(S^-1 A)` is the
+  same delta for any invertible r x r `S`; Adam-style steps are not invariant to that split, so one factor tends to
+  take most of the update while the other barely moves (LoRA-RITE, ICLR 2025). Riemannian preconditioned LoRA
+  (Zhang & Pilanci, ICML 2024) restores the invariance with two r x r solves per layer before the gradient enters
+  the moments: `lora_up`'s gradient is scaled by the inverse Gram of `lora_down` and the other way round. The paper
+  reports better quality and stability on a 6-image SD 1.5 fine-tune, and that equal rates for both factors then
+  suffice (LoRA+ is not needed). `keel_gauge_eps` (0.01) is the solve's floor as a fraction of the larger Gram's
+  mean diagonal: `lora_up` starts at zero, so the still-small factor is scaled by about the identity until it has
+  grown. The solves run in `step()`, after gradient clipping; LoKr, OFT and a fine-tune have no pairs, so there Keel
+  is Automagic 4 (the log says so).
+- **Cautious mask** (`keel_cautious`, on): Cautious Optimizers (ICLR 2026) zero an update element whose sign
+  disagrees with the gradient's, so a step never climbs the loss along a weight. Every scaling in Automagic 4's step
+  is positive, so on its own its update has the gradient's sign and the mask would never fire; what can flip a
+  sign is the gauge preconditioner, which mixes the r directions of a factor. Keel therefore masks the
+  preconditioned gradient against the raw one (the same as masking the update, since everything after it is
+  positive; the masked elements also leave the second moment). The kept share is logged every 250 steps; well
+  under 100% means the preconditioner is fighting the gradient (raise `keel_gauge_eps`).
+
+Both can be raced (`race` rows with `keel_gauge`, `keel_gauge_eps`, `keel_cautious`), and a Keel state resumes under
+Automagic 4 and the other way round (the state is the same). Whether Keel beats Automagic 4 or adamw8bit on the
+likeness probes is not measured yet: the Wizard keeps recommending adamw8bit until a race says otherwise.
+
 **MiniMax H3 and FLUX Klein** are trained in ai-toolkit, not here. `rulztrainer/optimizers/automagic4.py` depends only
 on `automagic3.py` next to it and keeps ai-toolkit's constructor (`step_target` is accepted and ignored), so copying it
 over `ai-toolkit/toolkit/optimizers/automagic4.py` gives ai-toolkit the fixed controller, including in its fused mode
@@ -772,6 +800,8 @@ Four levers change the training objective and data for likeness, all off by defa
   text fusion is the slow minority), with `automagic_polarity_history: 16`. Resuming a state requires the same setting.
 - **Automagic 4** (`optimizer: automagic4`): sensitivity-balanced steps (the most sensitive weights take smaller ones)
   and a learning rate that holds on noise instead of drifting up; see *Self-tuning optimizers* above.
+- **Keel** (`optimizer: keel`): Automagic 4 plus a preconditioner that keeps either LoRA factor from taking the whole
+  update and a mask against steps that point away from the gradient; see *Keel* above and `docs/keel-optimizer.md`.
 
 The face analysis cache is `<dataset>/.rulz_cache/faces.json`; the Train tab has preview buttons for region
 maps and crops.
@@ -2147,7 +2177,7 @@ ComfyUI's `custom_nodes` and load `workflows/RulzTrainer Likeness Scoring.json`;
 |---|---|
 | Gradient checkpointing | on |
 | Batch size | 1 (use gradient accumulation instead) |
-| Optimizer | `adamw8bit`, or `automagic3` / `automagic4` (self-tuning lr, ported from ai-toolkit; 1 byte of state per weight at the default polarity history; Automagic 4's step is as fast as adamw8bit's on a rank-16 LoRA, about 3x slower at rank 64 and 6x on a full fine-tune; Automagic 3's about 10x slower than Automagic 4's) |
+| Optimizer | `adamw8bit`, or `automagic3` / `automagic4` (self-tuning lr, ported from ai-toolkit; 1 byte of state per weight at the default polarity history; Automagic 4's step is as fast as adamw8bit's on a rank-16 LoRA, about 3x slower at rank 64 and 6x on a full fine-tune; Automagic 3's about 10x slower than Automagic 4's), or `keel` (Automagic 4 plus a LoRA gauge preconditioner and a cautious mask, for character LoRAs; unmeasured on likeness: race it) |
 | Resolution | 1024 |
 | Text encoder device | `auto` (spreads over all GPUs + CPU during caching only) |
 | Max caption tokens | 512 to 1024 unless you train on very long prompts |

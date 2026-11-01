@@ -1268,6 +1268,8 @@ class Form:
             automagic_clip_threshold=float(v("automagic_clip_threshold")),
             automagic_sensitivity_quantile=float(v("automagic_sensitivity_quantile")), automagic_vote=v("automagic_vote"),
             automagic_max_lr_change=float(v("automagic_max_lr_change")),
+            keel_gauge=bool(v("keel_gauge")), keel_gauge_eps=float(v("keel_gauge_eps")),
+            keel_cautious=bool(v("keel_cautious")),
             timestep_shift=float(v("timestep_shift")), sigmoid_scale=float(v("sigmoid_scale")),
             logsnr_mean=float(v("logsnr_mean")), logsnr_std=float(v("logsnr_std")),
             block_swap=int(v("block_swap") or 0),
@@ -2865,6 +2867,7 @@ RACE_LABELS = {
     "automagic_polarity_history": "Automagic polarity history", "automagic_clip_threshold": "Automagic clip threshold",
     "automagic_groups": "Automagic lr groups", "automagic_sensitivity_quantile": "Automagic sensitivity quantile",
     "automagic_vote": "Automagic vote", "automagic_max_lr_change": "Automagic max lr change",
+    "keel_gauge": "Keel gauge preconditioner", "keel_gauge_eps": "Keel gauge eps", "keel_cautious": "Keel cautious mask",
     "lora_ema": "Weight average", "timestep_sampling": "Timestep sampling", "loss_weighting": "Loss weighting",
     "region_weights": "Region-weighted loss", "face_loss_weight": "Face loss weight",
     "body_loss_weight": "Body loss weight", "background_loss_weight": "Background loss weight",
@@ -4243,7 +4246,10 @@ class Wizard:
                           "automagic3 tunes its own learning rate from the weights' update directions. automagic4 "
                           "adds a smaller step for the most sensitive weights (timestep embedders, modulation, "
                           "attention values) and a controller whose rate holds on noise, climbs on a trend and "
-                          "comes down when it overshoots (ai-toolkit's v4 ran away; fixed here)."):
+                          "comes down when it overshoots (ai-toolkit's v4 ran away; fixed here). keel is automagic4 "
+                          "for character LoRAs: a preconditioner that keeps either LoRA factor from taking the "
+                          "whole update, and a mask that drops preconditioned elements pointing against the "
+                          "gradient (untested on likeness yet: race it against adamw8bit)."):
             self.bind(ui.select(list(OPTIMIZERS), label="Optimizer"), "optimizer") \
                 .classes("w-full")
         with self.setting("network_type", "Adapter",
@@ -6004,7 +6010,8 @@ def build_page(local: bool = True):
                                 w["optimizer"], "value", lambda x: x in AUTOMAGIC):
                             hint("Automagic tunes its own learning rate (the learning rate above is its start); LR "
                                  "schedule and warmup are ignored. Automagic 4 also caps the step of the most "
-                                 "sensitive weights and its rate holds on noise instead of drifting up.")
+                                 "sensitive weights and its rate holds on noise instead of drifting up. Keel is "
+                                 "Automagic 4 plus the LoRA gauge preconditioner and the cautious mask below.")
                             with fields():
                                 w["automagic_min_lr"] = ui.number("Min lr", value=d.automagic_min_lr, format="%.1e") \
                                     .classes("w-32")
@@ -6024,7 +6031,8 @@ def build_page(local: bool = True):
                                              "and the rest each adapt their own learning rate, so a small, slower "
                                              "group is not outvoted by the large ones. Fizgig trains Krea 2 this way, "
                                              "with a polarity history of 16.")
-                            with fields().bind_visibility_from(w["optimizer"], "value", lambda x: x == "automagic4"):
+                            with fields().bind_visibility_from(w["optimizer"], "value",
+                                                               lambda x: x in ("automagic4", "keel")):
                                 w["automagic_sensitivity_quantile"] = ui.number("Sensitivity quantile",
                                                                                 value=d.automagic_sensitivity_quantile,
                                                                                 min=0.05, max=1, step=0.05) \
@@ -6046,6 +6054,19 @@ def build_page(local: bool = True):
                                     .tooltip("The most the learning rate may move in one step (0.05 = about 5%); the "
                                              "signs that judge a step only arrive over the next polarity-history "
                                              "steps, so this bounds how far the rate can overshoot meanwhile.")
+                            with fields().bind_visibility_from(w["optimizer"], "value", lambda x: x == "keel"):
+                                w["keel_gauge"] = ui.switch("Gauge preconditioner", value=d.keel_gauge)                                     .tooltip("Each LoRA pair's gradient is scaled by the other factor's r x r Gram "
+                                             "(Riemannian preconditioned LoRA), so the update does not depend on "
+                                             "how the delta is split between lora_down and lora_up and neither "
+                                             "factor takes it all. LoKr and OFT have no pairs: nothing happens.")
+                                w["keel_gauge_eps"] = ui.number("Gauge eps", value=d.keel_gauge_eps, min=0.0001,
+                                                                max=1, step=0.01, format="%.3f").classes("w-32")                                     .tooltip("The preconditioner's floor as a fraction of the larger Gram's mean "
+                                             "diagonal: the still-small factor (lora_up starts at zero) is scaled "
+                                             "by about the identity until it has grown. Raise it if the cautious "
+                                             "mask's kept share in the log falls well under 1.")
+                                w["keel_cautious"] = ui.switch("Cautious mask", value=d.keel_cautious)                                     .tooltip("Zero a preconditioned gradient element that points against the raw "
+                                             "gradient (Cautious Optimizers, ICLR 2026), so the step never climbs "
+                                             "the loss along a weight. The kept share is logged every 250 steps.")
                         with advanced("Timesteps, loss weighting and gradients"):
                             with fields():
                                 w["gradient_accumulation"] = ui.number("Grad accumulation",
@@ -7846,6 +7867,13 @@ Krea 2 LoRA upstream's rate ran from 1e-4 into the 1e-3 ceiling by step 100 and 
 6e-4 and eased back to 3e-4 by step 160. On a rank-16 LoRA its step is as fast as adamw8bit's (about 3x slower at
 rank 64, 6x on a full fine-tune; Automagic 3's is about 10x slower than Automagic 4's) and its state is 1 byte per weight at the default *Polarity history* 8; which optimizer reaches likeness first is not
 measured yet, so race them.
+
+`keel` is Automagic 4 for character LoRAs (`docs/keel-optimizer.md`), with every Automagic 4 setting and two of
+its own: the *Gauge preconditioner* scales each LoRA pair's gradient by the other factor's r x r Gram (Riemannian
+preconditioned LoRA), so the update does not depend on how the delta is split between `lora_down` and `lora_up`
+and neither factor takes it all (*Gauge eps* is its floor); the *Cautious mask* drops a preconditioned gradient
+element that points against the raw gradient. LoKr and OFT have no pairs, so there Keel is Automagic 4. Whether it
+beats adamw8bit on the likeness probes is not measured yet: race them.
 
 ## Adapters: LoRA, LoKr, OFT and DoRA
 The *Adapter* field (Train tab, LoRA section) picks what each layer learns. **LoRA**: a rank-r pair. **LoKr**: a
