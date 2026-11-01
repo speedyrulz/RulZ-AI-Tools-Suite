@@ -1278,6 +1278,8 @@ class Trainer(RaceParallelMixin):
                 gather()
             if cfg.max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
+            step_lr_mult *= self._clean_lr_scale(  # clean_share: half the lr on the lower-share epochs
+                cfg, step, self.batcher, cfg.batch_size * cfg.gradient_accumulation * n_dev)
             if step_lr_mult != 1.0:  # true per-image lr: scale this step only (the scheduler restores it)
                 saved_lrs = [g["lr"] for g in optimizer.param_groups]
                 for g in optimizer.param_groups:
@@ -2669,18 +2671,39 @@ class Trainer(RaceParallelMixin):
             size = cache[id(batcher)] = max(1, sum(max(1, int(it.repeats or 1)) for it in batcher.items))
         return size
 
-    def _clean_offset(self, cfg, steps_done: int, tokens: int, batcher, images_per_step: int) -> float:
-        """clean_share: the logit offset that puts the epoch's clean-end share of steps below sigma 0.5 (0 when
-        unset). One schedule per configuration (a race has several)."""
+    def _clean_schedule(self, cfg, batcher, images_per_step: int):
+        """clean_share: (the configuration's schedule, the images in one of its epochs), or None when unset. One
+        schedule per configuration (a race has several). A full fine-tune counts rotations: a cycle of every window."""
         if not cfg.clean_share or batcher is None:
-            return 0.0
+            return None
         from .clean_share import CleanShare
 
         shares = self.__dict__.setdefault("_clean_shares", {})
         cs = shares.get(id(cfg))
         if cs is None:
             cs = shares[id(cfg)] = CleanShare(cfg, self.arch, log)
-        return cs.offset(steps_done * images_per_step, self._epoch_images(batcher), tokens)
+        ft = self.__dict__.get("ft")
+        if ft is not None and ft.windows:
+            cs.unit = "rotation"
+            return cs, self.ft_rotate_steps * len(ft.windows) * images_per_step
+        return cs, self._epoch_images(batcher)
+
+    def _clean_offset(self, cfg, steps_done: int, tokens: int, batcher, images_per_step: int) -> float:
+        """clean_share: the logit offset that puts the epoch's clean-end share of steps below sigma 0.5 (0 when
+        unset)."""
+        sched = self._clean_schedule(cfg, batcher, images_per_step)
+        if sched is None:
+            return 0.0
+        cs, unit_images = sched
+        return cs.offset(steps_done * images_per_step, unit_images, tokens)
+
+    def _clean_lr_scale(self, cfg, steps_done: int, batcher, images_per_step: int) -> float:
+        """clean_share: half the learning rate on the lower-share epochs after the slide, else 1."""
+        sched = self._clean_schedule(cfg, batcher, images_per_step)
+        if sched is None:
+            return 1.0
+        cs, unit_images = sched
+        return cs.lr_scale(steps_done * images_per_step, unit_images)
 
     def _look_outlier_images(self, cfg, items) -> set[str]:
         """look_warmup: the images (as the items name them) that the look consistency filter's saved scan puts under
