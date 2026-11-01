@@ -1,6 +1,7 @@
 # Keel: an identity-first optimizer for character LoRAs (design)
 
-Status: milestone 1 built (`rulztrainer/optimizers/keel.py`: E and F, `optimizer: keel`); the rest is design.
+Status: milestones 1 and 2 built (`rulztrainer/optimizers/keel.py`: E, F and B with paired sigma,
+`optimizer: keel`); the rest is design.
 Working name "Keel" (the part of the boat that keeps it from drifting sideways). Every number below is a starting
 value to race, not a measured one.
 
@@ -121,11 +122,21 @@ loudest band, usually not the band where the face forms (sigma 0.2-0.5 at 1 MP).
 weight for the same reason. Doing it in the optimizer makes it per tensor: a timestep embedder and an
 attention output get different balances.
 
-**Mechanism.** `keel_bands` (8) equal bands in logit(sigma) after the shift. Per tensor and band an EMA of the
-micro-batch gradient RMS (scalar, `keel_bands` floats per tensor). The micro-batch gradient is divided by
-`sqrt(rms[t, b])` (with the tensor's overall RMS while a band has fewer than 8 observations) before it enters
-the sum. Then `band_weight[b]` (from `keel_band_weights`: `""` = 1 everywhere, `identity` = a hump over the
-face bands, or 8 comma-separated numbers) multiplies the step's update.
+**Mechanism (as built).** `keel_bands` (8) equal bands in logit(sigma) over [-4, 4] (sigma 0.018 to 0.982;
+the ends take what lies beyond), after the shift. Per tensor: `band_ms` [bands + 1] fp32, a running mean (10
+observations, then an EMA of that window) of the gradient's mean square per band plus the overall one, and
+`band_n` the observation counts. The trainer calls `observe(sigma)` for every micro-batch of the step (the DOP
+pass included; `zero_grad()` starts a new step). In `step()`, before the gauge: a step whose micro-batches all
+sit in one band has every gradient scaled by `sqrt(ms_all / ms_b)` (1 until the band has 8 observations, capped
+at 10x), so it enters the second moment at the tensor's usual scale whatever its band; the statistics are then
+updated with the step's power. A step spanning several bands (`keel_pair_sigma` off, or `batch_size > 1`
+drawing a sigma per image) is left alone and logged once. Then `band_weight[b]` (`keel_band_weights`: `""` = 1
+everywhere, `identity` = `0.5 + 0.8 exp(-((c + 0.7) / 1.5)^2)` at each band's logit centre `c`, about 1.3 over
+sigma 0.12 to 0.5, or 8 comma-separated numbers; the mean of the micro-batches' weights on a mixed step) multiplies
+the step's update through `Automagic4.update_gain`, a hook that scales the update after the vote and before the
+decay. Until M3's accumulation hook the normalisation is per step on the accumulated gradient, which is why paired
+sigma matters here: it is what puts the whole step in one band. The per-band gradient RMS relative to the overall
+(mean over tensors) and the steps seen per band are logged every 250 steps.
 
 **Interplay.** This removes the band imbalance that `loss_weighting` and `clean_share` partly steer with.
 `loss_weighting` still changes which band's *content* the gradient carries within a step; its scale effect is
@@ -264,7 +275,7 @@ is fighting the gradient (raise `keel_gauge_eps`).
 | [config.py:26](../rulztrainer/config.py:26) `OPTIMIZERS`, `AUTOMAGIC` | add `keel` (it owns its lr like Automagic: no schedule, LoRA+, per-image lr) |
 | [config.py](../rulztrainer/config.py) | the `keel_*` options (section 6) and their validation |
 | [trainer.py:264](../rulztrainer/trainer.py:264) `build_optimizer` | construct `Keel(params, pairs=..., **automagic kw, **keel kw)`; pairs from the injected LoRA modules |
-| [trainer.py:1209](../rulztrainer/trainer.py:1209) step loop | `observe(sigma)` before each backward; `gather()` before `clip_grad_norm_`; paired sigma when `keel_pair_sigma` |
+| [trainer.py](../rulztrainer/trainer.py) step loop (and `race_parallel.py`'s) | `observe(sigma)` for each micro-batch of the step (built); `gather()` before `clip_grad_norm_` (M3); paired sigma through `draw_sigmas` when `keel_pair_sigma` (built; the DOP pass shares it) |
 | [lora.py:385](../rulztrainer/lora.py:385) `_added` | the face tap (`h` save + output hook), armed per batch with the face token mask |
 | [likeness.py](../rulztrainer/likeness.py) controller / trainer probe path | `on_probe(...)` after the decision, before `likeness_track_best` saves |
 | [multigpu.py:64](../rulztrainer/multigpu.py:64) `reduce_grads` | phase 1b: `observe_grads` per replica |
@@ -299,8 +310,8 @@ weights, C and D off until raced. The Wizard keeps recommending adamw8bit until 
 
 ## 7. State, resume, race
 
-- `state_dict()` adds per parameter: `agree` (int8), `band_rms` ([bands] fp32), `anchor` (fp32, when D is
-  on), and `anchor_score` once. Automagic 4 resumes under Keel (the extras start empty: a measurement step for
+- `state_dict()` adds per parameter: `agree` (int8), `band_ms` and `band_n` ([bands + 1] fp32, built), `anchor`
+  (fp32, when D is on), and `anchor_score` once. Automagic 4 resumes under Keel (the extras start empty: a measurement step for
   the bands, no anchor until the next probe), and a Keel state resumes under Automagic 4 (extras ignored),
   the way Automagic 3 and 4 already resume under each other.
 - Keel hyper-parameters are not restored from a state (like Automagic's): a race may change them on resume.
@@ -338,7 +349,8 @@ the moments; `gather()` reproduces fp32 accumulation to 1 ulp.
 1. **M0** R0 baseline race (no code).
 2. **M1** (built) `keel.py` = Automagic 4 + E + F, `pairs` from `build_optimizer`, config, WebUI, README,
    `tests/test_keel.py`. No trainer-loop changes. R1 is still to run.
-3. **M2** `observe(sigma)`, bands, paired sigma. R2.
+3. **M2** (built) `observe(sigma)`, bands, paired sigma (`draw_sigmas` in both step loops, the DOP pass),
+   `Automagic4.update_gain`, config, WebUI, README, tests. R2 is still to run.
 4. **M3** the accumulation hook, `agree`, `gather()`. R3.
 5. **M4** `on_probe`, the anchor, the EMA pull. R5.
 6. **M5** the LoRA face tap and the gain. R4.

@@ -1269,7 +1269,8 @@ class Form:
             automagic_sensitivity_quantile=float(v("automagic_sensitivity_quantile")), automagic_vote=v("automagic_vote"),
             automagic_max_lr_change=float(v("automagic_max_lr_change")),
             keel_gauge=bool(v("keel_gauge")), keel_gauge_eps=float(v("keel_gauge_eps")),
-            keel_cautious=bool(v("keel_cautious")),
+            keel_cautious=bool(v("keel_cautious")), keel_pair_sigma=bool(v("keel_pair_sigma")),
+            keel_bands=int(v("keel_bands")), keel_band_weights=str(v("keel_band_weights") or "").strip(),
             timestep_shift=float(v("timestep_shift")), sigmoid_scale=float(v("sigmoid_scale")),
             logsnr_mean=float(v("logsnr_mean")), logsnr_std=float(v("logsnr_std")),
             block_swap=int(v("block_swap") or 0),
@@ -2868,6 +2869,7 @@ RACE_LABELS = {
     "automagic_groups": "Automagic lr groups", "automagic_sensitivity_quantile": "Automagic sensitivity quantile",
     "automagic_vote": "Automagic vote", "automagic_max_lr_change": "Automagic max lr change",
     "keel_gauge": "Keel gauge preconditioner", "keel_gauge_eps": "Keel gauge eps", "keel_cautious": "Keel cautious mask",
+    "keel_pair_sigma": "Keel paired sigma", "keel_bands": "Keel noise bands", "keel_band_weights": "Keel band weights",
     "lora_ema": "Weight average", "timestep_sampling": "Timestep sampling", "loss_weighting": "Loss weighting",
     "region_weights": "Region-weighted loss", "face_loss_weight": "Face loss weight",
     "body_loss_weight": "Body loss weight", "background_loss_weight": "Background loss weight",
@@ -6055,18 +6057,40 @@ def build_page(local: bool = True):
                                              "signs that judge a step only arrive over the next polarity-history "
                                              "steps, so this bounds how far the rate can overshoot meanwhile.")
                             with fields().bind_visibility_from(w["optimizer"], "value", lambda x: x == "keel"):
-                                w["keel_gauge"] = ui.switch("Gauge preconditioner", value=d.keel_gauge)                                     .tooltip("Each LoRA pair's gradient is scaled by the other factor's r x r Gram "
+                                w["keel_gauge"] = ui.switch("Gauge preconditioner", value=d.keel_gauge) \
+                                    .tooltip("Each LoRA pair's gradient is scaled by the other factor's r x r Gram "
                                              "(Riemannian preconditioned LoRA), so the update does not depend on "
                                              "how the delta is split between lora_down and lora_up and neither "
                                              "factor takes it all. LoKr and OFT have no pairs: nothing happens.")
                                 w["keel_gauge_eps"] = ui.number("Gauge eps", value=d.keel_gauge_eps, min=0.0001,
-                                                                max=1, step=0.01, format="%.3f").classes("w-32")                                     .tooltip("The preconditioner's floor as a fraction of the larger Gram's mean "
+                                                                max=1, step=0.01, format="%.3f").classes("w-32") \
+                                    .tooltip("The preconditioner's floor as a fraction of the larger Gram's mean "
                                              "diagonal: the still-small factor (lora_up starts at zero) is scaled "
                                              "by about the identity until it has grown. Raise it if the cautious "
                                              "mask's kept share in the log falls well under 1.")
-                                w["keel_cautious"] = ui.switch("Cautious mask", value=d.keel_cautious)                                     .tooltip("Zero a preconditioned gradient element that points against the raw "
+                                w["keel_cautious"] = ui.switch("Cautious mask", value=d.keel_cautious) \
+                                    .tooltip("Zero a preconditioned gradient element that points against the raw "
                                              "gradient (Cautious Optimizers, ICLR 2026), so the step never climbs "
                                              "the loss along a weight. The kept share is logged every 250 steps.")
+                            with fields().bind_visibility_from(w["optimizer"], "value", lambda x: x == "keel"):
+                                w["keel_pair_sigma"] = ui.switch("Paired sigma", value=d.keel_pair_sigma) \
+                                    .tooltip("One noise level per step for all of its micro-batches (and the DOP "
+                                             "pass), so the step's gradient sits in one noise band: what the band "
+                                             "normalisation needs, and what makes the micro-batches comparable.")
+                                w["keel_bands"] = ui.number("Noise bands", value=d.keel_bands, min=1, max=64,
+                                                            precision=0).classes("w-32") \
+                                    .tooltip("Bands over the noise level (logit sigma from -4 to 4, so sigma 0.02 to "
+                                             "0.98 in 8 bands). Each weight tensor keeps the gradient power it sees "
+                                             "per band, and a step's gradient enters the optimizer at the tensor's "
+                                             "overall scale whatever its band, so the quiet bands (where the face "
+                                             "forms) are not drowned by the loud ones. 1 = off. Needs paired sigma "
+                                             "or one micro-batch per step; the per-band imbalance is logged every "
+                                             "250 steps.")
+                                w["keel_band_weights"] = ui.input("Band weights", value=d.keel_band_weights,
+                                                                  placeholder="flat").classes("w-56") \
+                                    .tooltip("A multiplier on the step's update per band: empty = 1 everywhere, "
+                                             "identity = a hump over the face bands (sigma 0.12 to 0.5), or one "
+                                             "number per band, comma-separated.")
                         with advanced("Timesteps, loss weighting and gradients"):
                             with fields():
                                 w["gradient_accumulation"] = ui.number("Grad accumulation",
@@ -7872,8 +7896,12 @@ measured yet, so race them.
 its own: the *Gauge preconditioner* scales each LoRA pair's gradient by the other factor's r x r Gram (Riemannian
 preconditioned LoRA), so the update does not depend on how the delta is split between `lora_down` and `lora_up`
 and neither factor takes it all (*Gauge eps* is its floor); the *Cautious mask* drops a preconditioned gradient
-element that points against the raw gradient. LoKr and OFT have no pairs, so there Keel is Automagic 4. Whether it
-beats adamw8bit on the likeness probes is not measured yet: race them.
+element that points against the raw gradient. LoKr and OFT have no pairs, so there Keel is Automagic 4. *Paired
+sigma* gives all of a step's micro-batches one noise level, and the *Noise bands* keep, per weight tensor, the
+gradient power seen in each band of the noise level, so a step's gradient enters at the tensor's overall scale
+whatever its band and the quiet bands (where the face forms) take steps as large as the loud ones; *Band weights*
+then emphasise bands on purpose (`identity`: a hump over sigma 0.12 to 0.5). Whether Keel beats adamw8bit on the
+likeness probes is not measured yet: race them.
 
 ## Adapters: LoRA, LoKr, OFT and DoRA
 The *Adapter* field (Train tab, LoRA section) picks what each layer learns. **LoRA**: a rank-r pair. **LoKr**: a

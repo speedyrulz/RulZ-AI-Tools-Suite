@@ -763,10 +763,25 @@ with both of its own switches off it is Automagic 4 to the bit (a test asserts i
   preconditioned gradient against the raw one (the same as masking the update, since everything after it is
   positive; the masked elements also leave the second moment). The kept share is logged every 250 steps; well
   under 100% means the preconditioner is fighting the gradient (raise `keel_gauge_eps`).
+- **Noise bands** (`keel_bands` 8, `keel_pair_sigma` on, `keel_band_weights`): gradient power varies a lot with the
+  noise level (Min-SNR; *Addressing Negative Transfer in Diffusion Models*; EDM2's learned per-level weights), and
+  one second moment per weight is set by the loudest band, usually not the one where the face forms (sigma 0.2 to
+  0.5 at 1 MP), so the quiet bands take small steps. With `keel_pair_sigma` a step's micro-batches (and its DOP
+  pass) share one sigma, so the step's gradient sits in one band; each weight tensor keeps a running mean of the
+  gradient power it sees per band (8 equal bands over logit sigma from -4 to 4, so sigma 0.02 to 0.98; the ends
+  take what lies beyond) and the step's gradient is scaled by sqrt(overall / band) before anything else, so it
+  enters the second moment at the tensor's usual scale whatever its band and every band's step is sized alike (a
+  band is trusted after 8 observations, the lift is capped at 10x, a step spanning several bands is left alone).
+  `keel_band_weights` then multiplies the step's update (not the decay) per band on purpose: `""` flat, `identity`
+  a hump of 1.3 over sigma 0.12 to 0.5 falling to 0.5 at the ends, or 8 numbers. The measured imbalance (each
+  band's gradient RMS relative to the overall, averaged over the tensors) is logged every 250 steps.
+  `timestep_sampling` keeps deciding how often each band is visited; `loss_weighting` keeps changing which band's
+  content the gradient carries within a step, but its scale effect is gone, which is the point.
 
-Both can be raced (`race` rows with `keel_gauge`, `keel_gauge_eps`, `keel_cautious`), and a Keel state resumes under
-Automagic 4 and the other way round (the state is the same). Whether Keel beats Automagic 4 or adamw8bit on the
-likeness probes is not measured yet: the Wizard keeps recommending adamw8bit until a race says otherwise.
+All of it can be raced (`race` rows with `keel_gauge`, `keel_gauge_eps`, `keel_cautious`, `keel_pair_sigma`,
+`keel_bands`, `keel_band_weights`), and a Keel state resumes under Automagic 4 and the other way round (the band
+statistics start fresh when `keel_bands` changes). Whether Keel beats Automagic 4 or adamw8bit on the likeness probes
+is not measured yet: the Wizard keeps recommending adamw8bit until a race says otherwise.
 
 **MiniMax H3 and FLUX Klein** are trained in ai-toolkit, not here. `rulztrainer/optimizers/automagic4.py` depends only
 on `automagic3.py` next to it and keeps ai-toolkit's constructor (`step_target` is accepted and ignored), so copying it
@@ -801,7 +816,8 @@ Four levers change the training objective and data for likeness, all off by defa
 - **Automagic 4** (`optimizer: automagic4`): sensitivity-balanced steps (the most sensitive weights take smaller ones)
   and a learning rate that holds on noise instead of drifting up; see *Self-tuning optimizers* above.
 - **Keel** (`optimizer: keel`): Automagic 4 plus a preconditioner that keeps either LoRA factor from taking the whole
-  update and a mask against steps that point away from the gradient; see *Keel* above and `docs/keel-optimizer.md`.
+  update, a mask against steps that point away from the gradient, and noise bands so the quiet noise levels (where
+  the face forms) step as far as the loud ones; see *Keel* above and `docs/keel-optimizer.md`.
 
 The face analysis cache is `<dataset>/.rulz_cache/faces.json`; the Train tab has preview buttons for region
 maps and crops.

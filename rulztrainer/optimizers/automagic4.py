@@ -139,6 +139,9 @@ class Automagic4(Automagic3):
         if step_target is not None:
             log.info("Automagic4: step_target %s is ignored (the vote is zero-centred; there is no target flip rate)",
                      step_target)
+        # A multiplier on this step's update (not on the weight decay), set per step by a subclass (Keel's noise-band
+        # weight) and None otherwise; applied after the vote, which a positive gain leaves unchanged.
+        self.update_gain: Optional[float] = None
         super().__init__(params, *args, **kwargs)
 
     # ------------------------------------------------------------------ bookkeeping
@@ -410,6 +413,8 @@ class Automagic4(Automagic3):
         if n > 1:
             torch._foreach_copy_(hists, list(hist.unbind(0)))
         del hist
+        if self.update_gain is not None:
+            update.mul_(self.update_gain)
 
         # p -= lr * (update + wd * p), decoupled weight decay as upstream.
         lr_t = self._group_lr[gi]
@@ -510,6 +515,8 @@ class Automagic4(Automagic3):
                 else:
                     num.add_(nm)
                     den.add_(dn)
+            if self.update_gain is not None:
+                u.mul_(self.update_gain)
             if p.dtype == torch.float32:
                 if wd != 0.0:
                     u.add_(p[i0:i1], alpha=wd)
