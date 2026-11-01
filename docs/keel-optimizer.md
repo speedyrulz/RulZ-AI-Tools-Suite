@@ -210,7 +210,9 @@ band and the average the probe scored:
   `pull = keel_lookahead_pullback` (0.5), the EMA shadow the same way, every Automagic lr mirror
   *= `keel_lookahead_lr` (0.7, clamped to the rails), and the miss count starts over. The second moments and
   sign histories stay. The data-parallel copies are re-synced after a pull; in the parallel race the pull moves
-  the configuration's own parameters, attached at its next wave.
+  the configuration's own parameters, attached at its next wave. With `probe_async` the anchor is the LoRA state
+  that was sent to the probe GPU (`on_probe`'s `weights`), and the decision lands up to `probe_every` steps later
+  on the live weights of that moment.
 
 The anchor is the weights that were actually scored, so a pull toward it is a pull toward a measured
 likeness, not toward weights 50 images younger (the EMA's lag).

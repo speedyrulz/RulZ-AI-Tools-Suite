@@ -88,8 +88,9 @@ keeps slow weights and pulls the fast weights toward them; here the probe decide
 every trained tensor (state["anchor"], fp32, with the anchor's score mirrored per tensor as state["anchor_score"]
 so both ride the state dict, the park and the relay) and the trainer calls on_probe(score, band, ema) after each
 probe decision with the controller's smoothed decision score, its noise band and the weight average the probe
-scored: the first probe sets the anchor; a score above the anchor's by more than the band accepts (the anchor
-becomes the weights that scored: the average's shadow when lora_ema is on, the raw weights otherwise); any other
+scored (or, for a probe rendered on the probe GPU from an older copy, that copy): the first probe sets the anchor;
+a score above the anchor's by more than the band accepts (the anchor becomes the weights that scored: the
+average's shadow when lora_ema is on, the raw weights otherwise, the older copy for an async probe); any other
 probe is a miss, and after more than keel_lookahead_grace misses in a row the weights are pulled: raw <- anchor +
 (1 - pullback) (raw - anchor), the shadow the same way, and every lr mirror times keel_lookahead_lr (clamped to
 the rails); the second moments and the sign histories stay. No pull while the score rose since the previous
@@ -580,10 +581,12 @@ class Keel(Automagic4):
         return None
 
     @torch.no_grad()
-    def on_probe(self, score, band: float, ema=None) -> Optional[str]:
+    def on_probe(self, score, band: float, ema=None, weights: Optional[dict] = None) -> Optional[str]:
         """After a likeness probe's decision: `score` the controller's smoothed decision score (None: the probe found
         no face, and nothing happens), `band` its noise band, `ema` the weight average the probe scored (a LoraEMA:
-        its shadow is the weights that scored and follows a pull; None for the raw weights). Returns what happened:
+        its shadow is the weights that scored and follows a pull; None for the raw weights), `weights` the weights
+        that scored when they are neither ({param: tensor}: a probe rendered elsewhere from an older copy, which a
+        pull leaves alone). Returns what happened:
         "anchor" (the first), "accept" (a new anchor), "rising" (no gain over the anchor, but up since the previous
         probe: no pull), "hold" (a miss within the grace), "pull", or None with the lookahead off."""
         if not self.lookahead or score is None:
@@ -592,11 +595,11 @@ class Keel(Automagic4):
         last, self._last_score = self._last_score, score
         anchored = self.anchor_score
         if anchored is None:
-            self._set_anchor(score, ema)
+            self._set_anchor(score, ema, weights)
             log.info("Keel lookahead: anchor set at %.1f%% (optimizer step %d)", score, self._steps)
             return "anchor"
         if score > anchored + band:
-            self._set_anchor(score, ema)
+            self._set_anchor(score, ema, weights)
             self._misses = 0
             log.info("Keel lookahead: accept, anchor %.1f%% -> %.1f%% (optimizer step %d)", anchored, score,
                      self._steps)
@@ -614,8 +617,10 @@ class Keel(Automagic4):
         return "pull"
 
     @torch.no_grad()
-    def _set_anchor(self, score: float, ema) -> None:
+    def _set_anchor(self, score: float, ema, weights: Optional[dict] = None) -> None:
         shadow = dict(zip(ema.params, ema.shadow)) if ema is not None else {}
+        if weights:
+            shadow = {**shadow, **weights}
         self._refresh_group_lrs()
         for gi, group in enumerate(self.param_groups):
             for p in group["params"]:

@@ -615,6 +615,33 @@ def mirror_lora(src: dict, dst: dict) -> None:
             d.dropout = nn.Dropout(s.dropout.p) if getattr(s.dropout, "p", 0.0) > 0 else nn.Identity()
 
 
+def lora_state(injected: dict) -> dict:
+    """Every wrapper's LoRA state as plain data on the CPU (tensors, numbers, strings: torch.load weights_only reads
+    it), what mirror_lora copies; lora_snapshots turns it back into something mirror_lora takes as a source."""
+    return {name: {"kind": m.kind, "dora": bool(getattr(m, "dora", False)), "block": m.block,
+                   "params": {k: p.detach().to("cpu", copy=True) for k, p in m.adapter_params().items()},
+                   "alpha": m.alpha, "scale": m.scale, "rank": m.rank, "factor": m.factor,
+                   "constraint": float(getattr(m, "constraint", 0.0)), "trainable": m.trainable,
+                   "dropout": float(getattr(m.dropout, "p", 0.0))} for name, m in injected.items()}
+
+
+class LoraSnapshot:
+    """One wrapper's lora_state entry, readable by mirror_lora as its source."""
+
+    def __init__(self, d: dict):
+        self.kind, self.dora, self.block, self.params = d["kind"], d["dora"], d["block"], d["params"]
+        self.alpha, self.scale, self.rank, self.factor = d["alpha"], d["scale"], d["rank"], d["factor"]
+        self.constraint, self.trainable = d["constraint"], d["trainable"]
+        self.dropout = nn.Dropout(d["dropout"]) if d["dropout"] > 0 else nn.Identity()
+
+    def adapter_params(self) -> dict:
+        return self.params
+
+
+def lora_snapshots(state: dict) -> dict:
+    return {name: LoraSnapshot(d) for name, d in state.items()}
+
+
 def lora_parameters(injected: dict[str, LoRALinear]):
     for m in injected.values():
         yield from m.adapter_params().values()
