@@ -1250,7 +1250,7 @@ class Form:
             save_state_every=int(v("save_state_every")), keep_states=int(v("keep_states")),
             compile_model=v("compile_model"), sample_seed=int(v("sample_seed")),
             sample_walk_seed=bool(v("sample_walk_seed")), sample_before_training=bool(v("sample_before_training")),
-            steps=0 if v("soup_run") else int(v("steps")), batch_size=int(v("batch_size")),
+            steps=0 if v("soup_run") or v("noise_run") else int(v("steps")), batch_size=int(v("batch_size")),
             gradient_accumulation=int(v("gradient_accumulation")), learning_rate=float(v("learning_rate")),
             optimizer=v("optimizer"), lr_scheduler=v("lr_scheduler"), warmup_steps=int(v("warmup_steps")),
             max_grad_norm=float(v("max_grad_norm")), timestep_sampling=v("timestep_sampling"),
@@ -1347,10 +1347,15 @@ class Form:
             race_drop_lowest=bool(v("race_drop_lowest")), race_patience_drop=bool(v("race_patience_drop")),
             race_patience=int(v("race_patience") or 3), race_patience_rising=bool(v("race_patience_rising")),
             race_parallel=bool(v("race_parallel")), race_follow=bool(v("race_follow")),
+            race_drop_confidence=float(v("race_drop_confidence") or 0) if v("race_paired") else 0.0,
+            race_max_close_rounds=int(v("race_max_close_rounds") or 0),
             race_configs=self.w["race_configs"].value,
             soup_files=([p.strip() for p in (v("soup_files") or "").splitlines() if p.strip()]
                         if v("soup_run") else []),
             soup_rank=int(v("soup_rank") or 0), soup_strengths=s("soup_strengths") or "1.0",
+            noise_files=([p.strip().strip('"') for p in (v("noise_files") or "").splitlines() if p.strip()]
+                         if v("noise_run") else []),
+            noise_seeds=int(v("noise_seeds") or 16),
         )
 
     def from_config(self, cfg: TrainConfig) -> None:
@@ -1359,6 +1364,9 @@ class Form:
                   "reward_prompts": "\n".join(cfg.reward_prompts),
                   "selftrain_prompts": "\n".join(cfg.selftrain_prompts),
                   "soup_files": "\n".join(cfg.soup_files), "soup_run": bool(cfg.soup_files),
+                  "noise_files": "\n".join(cfg.noise_files), "noise_run": bool(cfg.noise_files),
+                  "race_paired": cfg.race_drop_confidence > 0,
+                  "race_drop_confidence": cfg.race_drop_confidence or 0.9,
                   "face_refs": "\n".join(cfg.face_refs), "body_refs": "\n".join(cfg.body_refs),
                   "model_source": FILE_SOURCE if cfg.model_source == "files" else HF_SOURCE}
         values["datasets"] = [{"path": sp.path, "resolutions": list(sp.resolutions), "repeats": sp.repeats}
@@ -2891,7 +2899,10 @@ def race_review_line(cfg: TrainConfig) -> str:
                 f"winner, and the last round's winner is the run's LoRA")
     if cfg.race_drop_lowest:
         rules.append("the lowest leaves after each round" + (f" (after {cfg.race_warmup_probes} warm-up rounds)"
-                                                             if cfg.race_warmup_probes else ""))
+                                                             if cfg.race_warmup_probes else "")
+                     + (f" when a paired test on the probe seeds puts it below the leader with "
+                        f"{cfg.race_drop_confidence:.0%} confidence (else after {cfg.race_max_close_rounds} rounds "
+                        f"too close to call)" if cfg.race_drop_confidence > 0 else ""))
     else:
         rules.append("nobody is dropped for being behind")
     if cfg.race_patience_drop:
@@ -3396,6 +3407,9 @@ def extra_review_rows(cfg: TrainConfig) -> list[tuple[str, str]]:
         options.append(f"self-training at {cfg.selftrain_at} of the steps (x{cfg.selftrain_weight:g})")
     if cfg.soup_files:
         options.append(f"no training: a seed soup of {len(cfg.soup_files)} LoRAs picked by the probes")
+    if cfg.noise_files:
+        options.append(f"no training: a noise check of the probes on {len(cfg.noise_files)} LoRA(s), "
+                       f"{cfg.noise_seeds} seeds each")
     if cfg.reward_steps:
         options.append(f"then {cfg.reward_steps} likeness reward steps")
     if cfg.look_warmup:
@@ -4571,6 +4585,17 @@ class Wizard:
                           "Rounds before the first racer is dropped: everyone gets a few probes to get going. 1-2 is "
                           "plenty.", show_if=("race_drop_lowest", bool)):
             self.bind(ui.number("Warm-up rounds", min=0, precision=0), "race_warmup_probes").classes("w-full")
+        with self.setting(None, "Drop only when the probe seeds agree",
+                          "The racers are probed on the same seeds, so each seed compares them like for like. On: "
+                          "the lowest leaves only when its seeds put it below the round's leader with the confidence "
+                          "below (0.9 is a good start); a round too close to call drops nobody, at most a few rounds "
+                          "in a row. Off: the lowest score leaves however small the gap. Use 2 or more probe seeds.",
+                          show_if=("race_drop_lowest", bool)):
+            self.bind(ui.switch("Drop only when the seeds agree"), "race_paired")
+        with self.setting(None, "Confidence", "How sure the paired test must be that the lowest racer is behind.",
+                          show_if=("race_paired", bool)):
+            self.bind(ui.number("Confidence", min=0.5, max=0.99, step=0.05, precision=2),
+                      "race_drop_confidence").classes("w-full")
         with self.setting(None, "Drop a racer when it stops improving",
                           "A racer leaves once its own probes have not improved for a number of probes in a row, "
                           "however it compares with the others; the rest race on. Good with slow starters. With it, "
@@ -6754,6 +6779,22 @@ def build_page(local: bool = True):
                                                                 value=d.race_warmup_probes, min=0, precision=0) \
                                 .classes("w-72")
                         with fields():
+                            w["race_paired"] = ui.switch("Drop only when the probe seeds agree",
+                                                         value=d.race_drop_confidence > 0) \
+                                .tooltip("The racers are probed on the same seeds, so each seed compares them like for "
+                                         "like. On: the lowest leaves only when a paired test over its seeds (and "
+                                         "those of the rounds since the last drop) puts it below the round's leader "
+                                         "with this confidence; a round too close to call drops nobody. Use 2+ probe "
+                                         "seeds. Off: the lowest smoothed score leaves, however small the gap.")
+                            w["race_drop_confidence"] = ui.number("Confidence", value=d.race_drop_confidence or 0.9,
+                                                                  min=0.5, max=0.99, step=0.05, precision=2) \
+                                .classes("w-32")
+                            w["race_max_close_rounds"] = ui.number("Close calls before it leaves anyway",
+                                                                   value=d.race_max_close_rounds, min=0,
+                                                                   precision=0).classes("w-64") \
+                                .tooltip("Bounds the extra cost: the race keeps everyone at most this many rounds in a "
+                                         "row, and the lowest leaves anyway once it has trained all the steps.")
+                        with fields():
                             w["race_patience_drop"] = ui.switch("Drop each one when it stops improving",
                                                                 value=d.race_patience_drop) \
                                 .tooltip("A configuration leaves once its own probes have not improved (by more than "
@@ -6785,12 +6826,16 @@ def build_page(local: bool = True):
                             relay = bool(w["race_follow"].value)
                             w["race_drop_lowest"].set_visibility(not relay)
                             w["race_warmup_probes"].set_visibility(not relay and bool(w["race_drop_lowest"].value))
+                            paired_on = not relay and bool(w["race_drop_lowest"].value)
+                            w["race_paired"].set_visibility(paired_on)
+                            w["race_drop_confidence"].set_visibility(paired_on and bool(w["race_paired"].value))
+                            w["race_max_close_rounds"].set_visibility(paired_on and bool(w["race_paired"].value))
                             w["race_patience_drop"].set_visibility(not relay)
                             w["race_patience"].set_visibility(not relay and bool(w["race_patience_drop"].value))
                             w["race_patience_rising"].set_visibility(not relay
                                                                      and bool(w["race_patience_drop"].value))
 
-                        for key in ("race_follow", "race_drop_lowest", "race_patience_drop"):
+                        for key in ("race_follow", "race_drop_lowest", "race_patience_drop", "race_paired"):
                             w[key].on_value_change(race_rules_visible)
                         race_rules_visible()
 
@@ -6922,6 +6967,26 @@ def build_page(local: bool = True):
                                          "soup's probe score does not drop: the greedy soup. Saves "
                                          "<job>_soup.safetensors and soup/soup.json. Uses this page's model, "
                                          "references and probe settings; more probe seeds give a steadier choice.")
+
+                    # ---- Noise check
+                    with section("Probe noise check", "How far the likeness probes move with their seeds",
+                                 "query_stats", open_=False) as sec:
+                        nav_items.append(("Probe noise check", "query_stats", sec))
+                        hint("A probe renders a few seeds and averages their scores, so part of every score is the "
+                             "seeds' luck. This renders finished LoRAs (say a mid-run checkpoint and the best one of "
+                             "a run) on many seeds, the same ones for each, and measures that luck: how far one seed "
+                             "strays, how much of it two LoRAs share on the same seed, how many probe seeds it takes "
+                             "to tell a 3, 5 or 8 point gap apart, and a noise band that fits your probe seeds. "
+                             "Trains nothing; uses this page's model, references and probe settings. Writes "
+                             "noise/noise.json.")
+                        w["noise_files"] = ui.textarea("LoRA files (one per line; two from one run is best)") \
+                            .props("autogrow").classes("w-full")
+                        with ui.row().classes("items-center gap-3"):
+                            w["noise_seeds"] = ui.number("Seeds per file", value=d.noise_seeds, min=3, max=64,
+                                                         precision=0).classes("w-40")
+                            w["noise_run"] = ui.switch("Run the noise check when I press Start") \
+                                .tooltip("Start then trains nothing: it probes the base model (the scale's zero) and "
+                                         "each file at this many seeds (face and body: two renders per seed).")
 
                 def jump(exp):
                     exp.value = True
@@ -7759,6 +7824,15 @@ in clothing (a coat against unclothed references) can't outweigh the face. Rewar
 or Body weight 0, let the body count.
 `<job>.safetensors` stays the first stage's; the stage saves `<job>_reward.safetensors`. Steps 0 with a LoRA in
 *Resume from* runs the stage alone.
+
+## Probe noise and fair race drops
+A probe renders a few seeds and averages them, so part of every score is the seeds' luck. The **Probe noise check**
+section (Train tab) measures it: give it two finished LoRAs of one run (a middle checkpoint and the best), switch it
+on and press Start. It trains nothing; it renders both on many seeds, the same ones for each, and writes
+`noise/noise.json` with how far one seed strays, how many probe seeds it takes to tell a 3, 5 or 8 point gap apart,
+and a noise band that fits your probe settings. In a race, *Drop only when the probe seeds agree* (Configuration race)
+drops the lowest racer only when its scores, seed by seed, sit below the leader's with the confidence you set (0.9 is a
+good start); a round too close to call drops nobody, at most a few rounds in a row. Use 2 or more probe seeds with it.
 
 ## Previous runs (run history)
 

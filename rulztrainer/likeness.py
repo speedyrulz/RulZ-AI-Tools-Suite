@@ -133,6 +133,13 @@ class ProbeRecord:
     face_norm_ema: float | None = None
     body_norm_ema: float | None = None
     scale: dict = field(default_factory=dict)  # {"face": [floor, ceiling], "body": [...], "curve": {...}} raw points
+    # each seed's own score, in seed order (None: that render went unscored), raw and normalized; combined_seeds is
+    # each seed's face and body combined, unsmoothed: what paired race decisions and likeness_stats work on
+    face_seeds: list = field(default_factory=list)
+    body_seeds: list = field(default_factory=list)
+    face_norm_seeds: list = field(default_factory=list)
+    body_norm_seeds: list = field(default_factory=list)
+    combined_seeds: list = field(default_factory=list)
 
 
 class LikenessController:
@@ -160,6 +167,7 @@ class LikenessController:
         self.stopped = False
         self.n_probes = 0
         self.last_step: int | None = None  # the step of the latest probe (the configuration's own, in a race)
+        self.last_seeds: list = []  # the latest probe's combined score per seed (normalized, unsmoothed)
         # resolution step-up: stage index into cfg.training_sides(), per-stage best and stall counter
         self.step_up = bool(getattr(cfg, "resolution_step_up", False))
         self.n_stages = len(cfg.training_sides()) if hasattr(cfg, "training_sides") else 1
@@ -228,8 +236,25 @@ class LikenessController:
         return "; ".join(parts) + (" (raw percent: 0 = a stranger; body 100 = a typical reference's best match among "
                                    "the others, the face scale reaches past it)")
 
-    def update(self, step: int, face: float | None, body: float | None, images: list[str] | None = None):
-        """Feed one probe result. Returns (record, actions) where actions may contain
+    def seed_scores(self, seeds: dict | None) -> dict:
+        """A probe's per-seed raw scores ({"face": [...], "body": [...]}, seed order, None = unscored) as the record
+        keeps them: raw, normalized, and each seed's face and body combined (the seeds a probe without one kind of
+        prompt renders count with the other kind alone)."""
+        cfg = self.cfg
+        face = list((seeds or {}).get("face") or [])
+        body = list((seeds or {}).get("body") or [])
+        face_n = [self.norm("face", v) for v in face]
+        body_n = [self.norm("body", v) for v in body]
+        n = max(len(face_n), len(body_n))
+        comb = [combine(face_n[k] if k < len(face_n) else None, body_n[k] if k < len(body_n) else None,
+                        cfg.face_weight, cfg.body_weight) for k in range(n)]
+        return {"face_seeds": face, "body_seeds": body, "face_norm_seeds": face_n, "body_norm_seeds": body_n,
+                "combined_seeds": comb}
+
+    def update(self, step: int, face: float | None, body: float | None, images: list[str] | None = None,
+               seeds: dict | None = None):
+        """Feed one probe result (seeds: its per-seed raw scores, {"face": [...], "body": [...]}, kept in the record
+        and in last_seeds). Returns (record, actions) where actions may contain
         save_best (bool), save_best_face / save_best_body (bool: the smoothed face / body score beat its best by
         the noise band and its checkpoint is kept), stop (bool), lr_ratio (float, new/old), face_bias (float),
         step_up (int),
@@ -241,6 +266,8 @@ class LikenessController:
         self.last_step = step
         if self.normalize and step == 0:
             self._set_floors(face, body)
+        per_seed = self.seed_scores(seeds)
+        self.last_seeds = per_seed["combined_seeds"]
         self.face_ema = self._ema(self.face_ema, face)
         self.body_ema = self._ema(self.body_ema, body)
         face_n, body_n = self.norm("face", self.face_ema), self.norm("body", self.body_ema)
@@ -309,7 +336,7 @@ class LikenessController:
                           self.face_ema, self.body_ema, comb, self.lr_factor, self.face_bias, self.best,
                           self.best_step, self.since_improve, list(images or []), self.stage, self.stage_best,
                           self.stage_since_improve, self.norm("face", face), self.norm("body", body), face_n, body_n,
-                          self.scale_record() if self.normalize else {})
+                          self.scale_record() if self.normalize else {}, **per_seed)
         if "step_up" in actions:
             self.enter_stage(actions["step_up"])
         return rec, actions

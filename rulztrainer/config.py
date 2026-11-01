@@ -493,6 +493,9 @@ class TrainConfig:
     soup_files: list[str] = field(default_factory=list)  # 2+ LoRA / LoKr files: a greedy soup instead of training
     soup_rank: int = 32  # the soup's rank (0 = exact, LoRA files only)
     soup_strengths: str = "1.0, 1.15, 1.3"  # strengths each candidate soup is probed at (an average is weaker)
+    # --- noise check: how far the probes move with their seeds (likeness_stats.py; steps 0) ---
+    noise_files: list[str] = field(default_factory=list)  # 1+ LoRA files probed at noise_seeds seeds instead of training
+    noise_seeds: int = 16  # seeds per file (the same ones for every file: paired)
     # --- likeness probes & controller (character LoRAs) ---
     probe_every: int = 0  # steps between probe renders; 0 = off (needs face_refs and/or body_refs)
     probe_at_start: bool = True  # also probe at step 0 for a baseline
@@ -529,6 +532,10 @@ class TrainConfig:
     race_configs: list[dict] = field(default_factory=list)  # [{"name": ..., <setting>: <value>, ...}], 2 or more
     race_warmup_probes: int = 0  # probe rounds before the first configuration is dropped
     race_drop_lowest: bool = True  # after each round the lowest-scoring configuration leaves
+    race_drop_confidence: float = 0.0  # > 0 (0.9): the lowest leaves only when a paired test on the shared probe
+    #                                    seeds puts it below the leader with this confidence (race.py)
+    race_max_close_rounds: int = 3  # with race_drop_confidence: rounds in a row too close to call before the lowest
+    #                                 leaves anyway
     race_patience_drop: bool = False  # a configuration leaves after race_patience probes of its own without
     #                                   improvement; the winner is the best score anyone reached
     race_patience: int = 3
@@ -648,6 +655,17 @@ class TrainConfig:
                 raise ValueError("soup_files runs alone: steps 0, no resume_from, race, full fine-tune or separate "
                                  "sampling model")
             soup_strength_list(self.soup_strengths)  # raises on a bad list
+        if self.noise_files:
+            if not (self.face_refs or self.body_refs) or self.probe_every <= 0 \
+                    or not (self.probe_face_prompt or self.probe_body_prompt):
+                raise ValueError("noise_files measures the likeness probes: set face_refs / body_refs, probe_every "
+                                 "and a probe prompt")
+            if self.steps != 0 or self.resume_from or self.race or self.finetune or self.sample_model_path \
+                    or self.soup_files:
+                raise ValueError("noise_files runs alone: steps 0, no resume_from, race, seed soup, full fine-tune "
+                                 "or separate sampling model")
+            if not 3 <= self.noise_seeds <= 64:
+                raise ValueError("noise_seeds must be 3 to 64")
         if self.selftrain:
             if not (self.face_refs or self.body_refs):
                 raise ValueError("selftrain keeps the pictures that look most like face_refs / body_refs: set "

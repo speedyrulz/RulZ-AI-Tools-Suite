@@ -383,9 +383,8 @@ class RaceParallelMixin:
             with self._rp_bound(v0):
                 self._rp_load_render(v0)
                 self.run_probe(model, 0, None, None, self._rp_view(v0))
-            face, body, images = self.last_probe  # every configuration starts from the same base model
-            for v in rr.variants[1:]:
-                v.state["controller"].update(0, face, body, images)
+            for v in rr.variants[1:]:  # every configuration starts from the same base model
+                v.state["controller"].update(0, *self.last_probe)
         model.train()
         self.dp.train(True)
         self._setup_checkpointing(items, backprop)

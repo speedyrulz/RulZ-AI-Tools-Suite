@@ -397,7 +397,7 @@ class Trainer(RaceParallelMixin):
         self.balance_hinted = False  # the dp_balance suggestion was logged
         self.resumed_dp_counts = None  # its split from a resumed training state
         self.race = None  # race.RaceRun while a configuration race runs (and after, for its report)
-        self.last_probe = None  # (face, body, images) of the last probe
+        self.last_probe = None  # (face, body, images, per-seed scores) of the last probe
         self.race_base = None  # the run's own config when racing (the configurations change parts of it)
         self.race_rows = None  # [(name, config, overrides)] of the race
         self.race_layouts = None  # [(blocks, LoRA module names)] per configuration
@@ -910,7 +910,7 @@ class Trainer(RaceParallelMixin):
                 self._attach_sampling_loras(m)
         self._check_sample_settings()
         if cfg.sample_prompts or cfg.probe_every > 0 or cfg.id_loss_weight > 0 or cfg.reward_steps > 0 \
-                or cfg.selftrain or cfg.soup_files:
+                or cfg.selftrain or cfg.soup_files or cfg.noise_files:
             self.vae = self.arch.get_vae(cfg, self.model_dir)
             self.face_scorer = self._make_face_scorer()
             self.body_scorer = self._make_body_scorer()
@@ -995,14 +995,16 @@ class Trainer(RaceParallelMixin):
         if cfg.soup_files:  # a greedy soup of finished LoRAs instead of training
             self._soup_stage(model)
             return
+        if cfg.noise_files:  # the probes' own noise, measured on finished LoRAs instead of training
+            self._noise_stage(model)
+            return
         if cfg.sample_prompts and cfg.sample_before_training and step == 0:
             self.sample_images(model, step)
         if self.controller is not None and cfg.probe_at_start and step == 0:
             self.run_probe(model, step, optimizer, scheduler, injected)
             if self.race is not None:  # every configuration starts from the same base model: one baseline for all
-                face, body, images = self.last_probe
                 for v in self.race.variants[1:]:
-                    v.state["controller"].update(0, face, body, images)
+                    v.state["controller"].update(0, *self.last_probe)
         model.train()
         if self.dp is not None:
             self.dp.train(True)
@@ -1813,7 +1815,8 @@ class Trainer(RaceParallelMixin):
                                       base.race_drop_lowest and not base.race_follow)
         sched = race_mod.RaceSchedule([v.name for v in variants], base.race_warmup_probes, base.race_drop_lowest,
                                       base.race_patience if base.race_patience_drop else 0, base.steps,
-                                      follow=base.race_follow, rising=base.race_patience_rising)
+                                      follow=base.race_follow, rising=base.race_patience_rising,
+                                      confidence=base.race_drop_confidence, max_close=base.race_max_close_rounds)
         self.race = race_mod.RaceRun(variants, sched, wrappers, base, est)
         if self.race_parallel:  # every configuration trains on its own parameters (race_parallel.py)
             self.race.active = variants[0]
@@ -1938,7 +1941,8 @@ class Trainer(RaceParallelMixin):
         self.race.schedule.record(v.idx, c.combined_ema if c is not None else None,
                                   c.last_step if c is not None else v.state.get("step"),
                                   best=c.best if c is not None else None, best_step=c.best_step if c is not None else None,
-                                  since_improve=c.since_improve if c is not None else None)
+                                  since_improve=c.since_improve if c is not None else None,
+                                  seeds=getattr(c, "last_seeds", None))
 
     def _race_decide(self) -> None:
         """At the end of a race that keeps every configuration's chance (patience drops, or no lowest drops): the
@@ -3229,7 +3233,7 @@ class Trainer(RaceParallelMixin):
                  ", ".join(names), cfg.soup_rank or "exact", ", ".join(f"{s:g}" for s in strengths), cfg.probe_seeds)
         self._free_for_rendering()
         with lora_mod.frozen_adapters(), self._sampling_slots(model, 0) as slots:  # the base model: the scale's zero
-            face, body, _ = self._probe_with(slots, 0, tag="soup_base")
+            face, body, _, _ = self._probe_with(slots, 0, tag="soup_base")
         if self.controller.normalize:
             self.controller._set_floors(face, body)
             log.info("Likeness scale: %s (%d seeds)", self.controller.describe_scale(), probe_seed_count(cfg, 0))
@@ -3240,7 +3244,7 @@ class Trainer(RaceParallelMixin):
                                 device=self.devices[0])
             path = S.save(stubs, out_dir / "candidate.safetensors", [cfg.soup_files[i] for i in members], rep, fmt)
             self.status.update(stage=f"seed soup: probing {label}")
-            f, b = self._soup_probe(model, path, f"soup{len(trials) + 1:02d}")
+            f, b, _ = self._soup_probe(model, path, f"soup{len(trials) + 1:02d}")
             comb = combine(self.controller.norm("face", f), self.controller.norm("body", b), cfg.face_weight,
                            cfg.body_weight)
             if rep["energy"] < 0.5 and not trials:
@@ -3293,10 +3297,62 @@ class Trainer(RaceParallelMixin):
         self.status.update(stage="finished", done=True, soup={"files": [names[i] for i in soup], "strength": best_s,
                                                               "score": best, "trials": trials})
 
+    # ------------------------------------------------------------ noise check (see likeness_stats.py)
+    def _noise_stage(self, model) -> None:
+        """How far the probes move with their seeds: the base model (the normalized scale's zero), then every
+        noise_files LoRA at noise_seeds seeds, all on the same seeds. Writes noise/noise.json
+        (likeness_stats.noise_report) and logs the seeds a probe needs to tell gaps apart and a likeness_noise_band."""
+        import json
+
+        from . import likeness_stats as LS
+        from .likeness import probe_seed_count
+
+        cfg = self.cfg
+        if self.controller is None:
+            raise ValueError("The noise check measures the likeness probes, which could not be set up (references, "
+                             "probe prompts and their scoring packages)")
+        t0 = time.time()
+        out_dir = self.job_dir / "noise"
+        out_dir.mkdir(exist_ok=True)
+        log.info("Noise check: %d LoRA(s), %d probe seeds each (seeds %d-%d)", len(cfg.noise_files), cfg.noise_seeds,
+                 cfg.probe_seed, cfg.probe_seed + cfg.noise_seeds - 1)
+        self._free_for_rendering()
+        self.status.update(stage="noise check: probing the base model")
+        with lora_mod.frozen_adapters(), self._sampling_slots(model, 0) as slots:  # the base model: the scale's zero
+            face, body, _, _ = self._probe_with(slots, 0, tag="noise_base")
+        if self.controller.normalize:
+            self.controller._set_floors(face, body)
+            log.info("Likeness scale: %s (%d seeds)", self.controller.describe_scale(), probe_seed_count(cfg, 0))
+        files, raw = {}, {}
+        for i, p in enumerate(cfg.noise_files):
+            name = Path(p).name
+            if name in files:
+                name = f"{i + 1}:{name}"
+            self.status.update(stage=f"noise check: probing {name} ({i + 1}/{len(cfg.noise_files)})")
+            _, _, seeds = self._soup_probe(model, p, f"noise{i + 1:02d}", n_seeds=cfg.noise_seeds)
+            per = self.controller.seed_scores(seeds)
+            files[name] = {"face": per["face_norm_seeds"], "body": per["body_norm_seeds"],
+                           "combined": per["combined_seeds"]}
+            raw[name] = {"face": per["face_seeds"], "body": per["body_seeds"]}
+            m, sd = LS.mean_sd(per["combined_seeds"])
+            log.info("Noise check: %s scores %s (seeds spread %s)", name, "n/a" if m is None else f"{m:.1f}%",
+                     "n/a" if sd is None else f"{sd:.1f} points")
+        rep = LS.noise_report(files, cfg.probe_seeds, cfg.probe_ema)
+        rep.update(seeds=list(range(cfg.probe_seed, cfg.probe_seed + cfg.noise_seeds)), per_seed=files, raw=raw,
+                   scale=self.controller.scale_record() if self.controller.normalize else {})
+        (out_dir / "noise.json").write_text(json.dumps(rep, indent=1), encoding="utf-8")
+        for line in LS.describe(rep):
+            log.info("Noise check: %s", line)
+        log.info("Noise check done in %.0fs -> %s", time.time() - t0, out_dir / "noise.json")
+        comb = rep["kinds"]["combined"]
+        self.status.update(stage="finished", done=True, noise={
+            "sigma": comb.get("sigma"), "sd_diff": comb.get("sd_diff"), "rho": comb.get("rho"),
+            "seeds_needed": comb.get("seeds_needed"), "suggested_noise_band": rep.get("suggested_noise_band")})
+
     @torch.no_grad()
-    def _soup_probe(self, model, path, tag: str):
+    def _soup_probe(self, model, path, tag: str, n_seeds: int | None = None):
         """Probe the model with a LoRA file attached as an extra (the training adapter is untouched and still
-        zero), then take it off again. Returns the raw (face, body)."""
+        zero), then take it off again. Returns the raw (face, body, per-seed scores); n_seeds overrides probe_seeds."""
         from .lora import LoRALinear
 
         models = [m for m, _, _ in self.replicas] or [model]
@@ -3308,7 +3364,7 @@ class Trainer(RaceParallelMixin):
                                            convert=getattr(self.arch, "extra_lora_converter", None))
             self._free_for_rendering()
             with lora_mod.frozen_adapters(), self._sampling_slots(model, 0) as slots:
-                face, body, _ = self._probe_with(slots, 0, tag=tag)
+                face, body, _, seeds = self._probe_with(slots, 0, tag=tag, n_seeds=n_seeds)
         finally:
             for m in models:
                 for mod in m.modules():
@@ -3316,7 +3372,7 @@ class Trainer(RaceParallelMixin):
                         n_e, n_b = sizes.get(id(mod), (0, 0))
                         del mod.extras[n_e:]
                         del mod.extra_biases[n_b:]
-        return face, body
+        return face, body, seeds
 
     def _likeness_scale(self):
         """The scale the samples' scores are normalized on: the probe controller's (its floors from the step-0
@@ -3341,7 +3397,10 @@ class Trainer(RaceParallelMixin):
         return out
 
     @torch.no_grad()
-    def _probe_with(self, slots, step, tag: str = ""):
+    def _probe_with(self, slots, step, tag: str = "", n_seeds: int | None = None):
+        """Render and score one probe: (face, body, images, seeds), face / body the mean raw score over the seeds that
+        were scored, seeds each seed's own ({"face": [...], "body": [...]}, seed order, None = no face / body found).
+        n_seeds overrides probe_seeds (the noise check)."""
         from .likeness import probe_body_size, probe_seed_count
 
         cfg = self.cfg
@@ -3360,12 +3419,12 @@ class Trainer(RaceParallelMixin):
             if kind == "body" and self.body_scorer is None:
                 continue
             w, h = (cfg.probe_size, cfg.probe_size) if kind == "face" else probe_body_size(cfg.probe_size)
-            n_seeds = probe_seed_count(cfg, step)  # more at step 0: the normalized scale's zero
-            for k in range(n_seeds):
+            n = n_seeds or probe_seed_count(cfg, step)  # more at step 0: the normalized scale's zero
+            for k in range(n):
                 jobs.append(RenderJob(prompt, w, h, cfg.probe_steps, cfg.probe_cfg, cfg.probe_seed + k,
                                       out_dir / f"{self._image_prefix()}{tag or f'step{step:06d}'}_{kind}_{k}.png",
-                                      f"probe {kind} seed {k + 1}/{n_seeds} at step {step}" if len(slots) == 1
-                                      else f"probe {kind} seed {k + 1}/{n_seeds}", kind))
+                                      f"probe {kind} seed {k + 1}/{n} at step {step}" if len(slots) == 1
+                                      else f"probe {kind} seed {k + 1}/{n}", kind))
         title = f"probes at step {step} on {len(slots)} GPUs" if len(slots) > 1 and len(jobs) > 1 else ""
         board = _Board(self.status, title)
         try:
@@ -3373,20 +3432,18 @@ class Trainer(RaceParallelMixin):
         finally:
             for sl in slots:
                 lora_mod.set_extras_enabled(sl.model, False)
-        face_scores, body_scores = [], []
+        seeds: dict[str, list] = {"face": [], "body": []}
         self.status.update(stage=f"scoring probes (step {step})")
         for job, p in zip(jobs, images):  # scoring stays in this thread: the scorers are not shared across threads
             if job.kind == "face":
-                sc = self.face_scorer.score(p, step, 0)
-                if sc.percent is not None:
-                    face_scores.append(sc.percent)
+                seeds["face"].append(self.face_scorer.score(p, step, 0).percent)
             else:
-                pct, _ = self.body_scorer.score(p)
-                if pct is not None:
-                    body_scores.append(pct)
+                seeds["body"].append(self.body_scorer.score(p)[0])
+        face_scores = [v for v in seeds["face"] if v is not None]
+        body_scores = [v for v in seeds["body"] if v is not None]
         face = sum(face_scores) / len(face_scores) if face_scores else None
         body = sum(body_scores) / len(body_scores) if body_scores else None
-        return face, body, images
+        return face, body, images, seeds
 
     def run_probe(self, model, step, optimizer, scheduler, injected) -> bool:
         """Render + score probes, update the controller, apply its actions. Returns True to stop training.
@@ -3402,9 +3459,9 @@ class Trainer(RaceParallelMixin):
         cfg = self.cfg
         t0 = time.time()
         with lora_mod.frozen_adapters(), self._sampling_slots(model, step) as slots:
-            face, body, images = self._probe_with(slots, step)
-        self.last_probe = (face, body, images)
-        rec, actions = self.controller.update(step, face, body, images)
+            face, body, images, seeds = self._probe_with(slots, step)
+        self.last_probe = (face, body, images, seeds)
+        rec, actions = self.controller.update(step, face, body, images, seeds)
         append_record(self.job_dir, rec)
         fmt = lambda v: "n/a" if v is None else f"{v:.1f}%"  # noqa: E731
         who = f"[{self.race.active.name}] " if self._race_running() else ""

@@ -6,6 +6,12 @@ the one with the lowest smoothed combined probe score is dropped; race_warmup_pr
 drop. The last one left keeps training until `steps`, counted in its own steps, so the race adds the others' steps
 on top of a normal run (estimate_steps).
 
+race_drop_confidence (0 = off) makes that drop a paired test: the configurations are probed on the same seeds, so
+the lowest leaves only when its per-seed scores sit below the round leader's with that confidence (a one-sided paired
+t-test over the rounds since the last drop, at most POOL_ROUNDS of them, after the warm-up; likeness_stats.paired). A
+round too close to call drops nobody; after race_max_close_rounds such rounds in a row, or once the lowest has trained
+`steps` of its own, the lowest leaves anyway, so the race still ends.
+
 race_patience_drop drops a configuration instead once its own probes have not improved for race_patience in a row,
 while the others race on: a setting that learns slowly but ends higher is not cut for being behind early. With it, or
 with race_drop_lowest off (every configuration trains all the steps unless patience ends it), the winner is the one
@@ -198,6 +204,10 @@ def validate(cfg) -> None:
                          "winner's config, <job>_winner.yaml)")
     if cfg.race_warmup_probes < 0:
         raise ValueError("race_warmup_probes must be 0 or more")
+    if not 0.0 <= float(getattr(cfg, "race_drop_confidence", 0.0)) < 1.0:
+        raise ValueError("race_drop_confidence must be 0 (off) or a confidence below 1, such as 0.9")
+    if int(getattr(cfg, "race_max_close_rounds", 3)) < 0:
+        raise ValueError("race_max_close_rounds must be 0 or more")
     if getattr(cfg, "race_patience_drop", False) and int(cfg.race_patience) < 1:
         raise ValueError("race_patience must be 1 or more (probes without improvement before a configuration leaves)")
     follow = bool(getattr(cfg, "race_follow", False))
@@ -274,6 +284,8 @@ def estimate_steps(n: int, warmup: int, probe_every: int, steps: int, drop_lowes
 
 # ---------------------------------------------------------------- schedule
 
+POOL_ROUNDS = 4  # a paired drop test pools the per-seed scores of at most this many rounds (since the last drop)
+
 
 class RaceSchedule:
     """Who trains next and who is dropped. Pure bookkeeping (no torch).
@@ -285,8 +297,16 @@ class RaceSchedule:
     drop_lowest the winner is decided at the end of the run: the best score any configuration reached (champion)."""
 
     def __init__(self, names: list[str], warmup: int, drop_lowest: bool = True, patience: int = 0,
-                 total_steps: int | None = None, follow: bool = False, rising: bool = False):
+                 total_steps: int | None = None, follow: bool = False, rising: bool = False,
+                 confidence: float = 0.0, max_close: int = 3):
         self.names = list(names)
+        # confidence > 0: the lowest is dropped only when a paired test on the shared probe seeds puts it below the
+        # round leader with this confidence; max_close undecided rounds in a row (or its steps used up) drop it anyway
+        self.confidence = max(0.0, float(confidence))
+        self.max_close = max(0, int(max_close))
+        self.seeds: dict[int, dict[int, list]] = {}  # index -> {round: its probe's combined score per seed}
+        self.close = 0  # rounds in a row too close to call
+        self.last_drop_round = 0
         self.warmup = int(warmup)
         # follow (a relay): nobody leaves until every one has trained total_steps; each round names a leader that
         # the others continue from, and the last round's leader wins
@@ -338,15 +358,18 @@ class RaceSchedule:
         return [] if self.done else list(self.pending[:max(1, int(slots))])
 
     def record(self, idx: int, score: float | None, step: int | None = None, best: float | None = None,
-               best_step: int | None = None, since_improve: int | None = None) -> int | None:
-        """The probe score of `idx` after its turn this round (best / best_step / since_improve: its controller's).
-        Returns the configuration dropped as the round's lowest when this probe ended a round with a drop;
-        just_dropped lists everyone who left with this call (patience, finished, lowest). A missing score (no face
-        found) counts as the lowest; on a tie the later one goes. The last one in the race never leaves."""
+               best_step: int | None = None, since_improve: int | None = None, seeds: list | None = None) -> int | None:
+        """The probe score of `idx` after its turn this round (best / best_step / since_improve: its controller's;
+        seeds: that probe's combined score per seed, for race_drop_confidence). Returns the configuration dropped as
+        the round's lowest when this probe ended a round with a drop; just_dropped lists everyone who left with this
+        call (patience, finished, lowest). A missing score (no face found) counts as the lowest; on a tie the later
+        one goes. The last one in the race never leaves."""
         if self.done or not self.pending or idx != self.pending[0]:
             raise ValueError(f"configuration {idx} is not the one training now")
         self.pending.pop(0)
         self.scores[idx] = score
+        if seeds:
+            self.seeds.setdefault(idx, {})[self.round] = list(seeds)
         self.steps[idx] = step
         self.just_dropped = []
         if best is not None:
@@ -392,17 +415,59 @@ class RaceSchedule:
                     self.just_dropped.append(i)
                 entry["final"] = True
         elif self.drop_lowest and self.round > self.warmup and not self.done:
-            dropped = min(self.alive, key=key)
-            self.alive.remove(dropped)
-            self.dropped[dropped] = self.round
-            entry["dropped"] = self.names[dropped]
-            self.just_dropped.append(dropped)
+            lowest = min(self.alive, key=key)
+            if self._drop_verdict(lowest, key, entry):
+                dropped = lowest
+                self.alive.remove(dropped)
+                self.dropped[dropped] = self.round
+                entry["dropped"] = self.names[dropped]
+                self.just_dropped.append(dropped)
+                self.close, self.last_drop_round = 0, self.round
+            else:
+                self.close += 1
         self.history.append(entry)
         self.round += 1
         self.scores, self.steps, self.left, self.spared = {}, {}, {}, {}
         self.pending = [] if self.done else list(self.alive)
         self.members = list(self.alive)
         return dropped
+
+    def paired_test(self, leader: int, lowest: int) -> dict:
+        """leader's per-seed scores minus lowest's, pooled over the rounds since the last drop (after the warm-up, at
+        most POOL_ROUNDS): likeness_stats.paired's n, diff, sd_diff, rho and one-sided p (leader above lowest)."""
+        from .likeness_stats import paired
+
+        first = max(self.warmup + 1, self.last_drop_round + 1, self.round - POOL_ROUNDS + 1)
+        a, b = [], []
+        for r in range(first, self.round + 1):
+            sa, sb = self.seeds.get(leader, {}).get(r), self.seeds.get(lowest, {}).get(r)
+            if sa and sb:
+                n = min(len(sa), len(sb))
+                a += sa[:n]
+                b += sb[:n]
+        return paired(a, b)
+
+    def _drop_verdict(self, lowest: int, key, entry: dict) -> bool:
+        """Does the round's lowest leave? Always without race_drop_confidence; with it, when the paired test puts it
+        below the round leader with that confidence, when max_close rounds in a row were too close to call, or when
+        it has trained total_steps of its own. The test and the reason go into the round's entry."""
+        if self.confidence <= 0:
+            return True
+        leader = max((i for i in self.alive if i != lowest), key=key)
+        st = self.paired_test(leader, lowest)
+        test = {"lowest": self.names[lowest], "vs": self.names[leader], "n": st["n"], "diff": st["diff"],
+                "p": st["p"]}
+        if st["p"] is not None and st["p"] < 1.0 - self.confidence:
+            test["why"] = "paired"
+        elif self.total_steps and (self.steps.get(lowest) or 0) >= self.total_steps:
+            test["why"] = "steps"
+        elif self.close + 1 > self.max_close:
+            test["why"] = "close"
+        else:
+            entry["close"] = test
+            return False
+        entry["test"] = test
+        return True
 
     def decide(self, bests: dict[int, float | None] | None = None) -> int:
         """The winner: the last one left, or with keeps_all the highest best score any configuration reached (bests:
@@ -458,7 +523,8 @@ class RaceSchedule:
                 "stale": [self.names[i] for i in sorted(self.stale)],
                 "finished": [self.names[i] for i in sorted(self.finished)],
                 "drop_lowest": self.drop_lowest, "patience": self.patience, "rising": self.rising,
-                "follow": self.follow,
+                "follow": self.follow, "confidence": self.confidence, "max_close": self.max_close,
+                "close": self.close,
                 "leader": self.names[self.leader] if self.leader is not None else None,
                 "best": {self.names[i]: b for i, b in self.best.items()},
                 "best_step": {self.names[i]: s for i, s in self.best_step.items()},
@@ -765,6 +831,14 @@ class RaceRun:
         return not self.schedule.done
 
 
+def _gap(t: dict) -> str:
+    return "n/a" if t.get("diff") is None else f"{t['diff']:.1f} points"
+
+
+def _p(t: dict) -> str:
+    return "n/a (under 3 seeds)" if t.get("p") is None else f"{t['p']:.2f}"
+
+
 def describe_round(entry: dict, schedule: RaceSchedule) -> str:
     """A round for the log: "2: a 41.0%, b 38.5% -> b is out" (with who left on patience or finished their steps)."""
     fmt = ", ".join(f"{n} {'n/a' if s is None else f'{s:.1f}%'}" for n, s in entry["scores"].items())
@@ -777,7 +851,18 @@ def describe_round(entry: dict, schedule: RaceSchedule) -> str:
     elif entry.get("leader"):
         parts.append(f"{entry['leader']} leads: everyone continues from its LoRA")
     if entry.get("dropped"):
-        parts.append(f"{entry['dropped']} is out ({'by hand' if entry.get('manual') else 'lowest'})")
+        how = "by hand" if entry.get("manual") else "lowest"
+        t = entry.get("test")
+        if t:
+            how += {"paired": f", below {t['vs']} by {_gap(t)} over {t['n']} paired seeds, p {_p(t)}",
+                    "steps": f", its steps used up (vs {t['vs']}: {_gap(t)}, p {_p(t)})",
+                    "close": f", still too close to call after {schedule.max_close} rounds (vs {t['vs']}: "
+                             f"{_gap(t)}, p {_p(t)})"}[t["why"]]
+        parts.append(f"{entry['dropped']} is out ({how})")
+    elif entry.get("close"):
+        t = entry["close"]
+        parts.append(f"too close to call: {t['lowest']} is {_gap(t)} below {t['vs']} over {t['n']} paired seeds "
+                     f"(p {_p(t)}, needs below {1 - schedule.confidence:.2g}); nobody is dropped")
     elif schedule.drop_lowest and entry["round"] <= schedule.warmup:
         parts.append("warm-up: nobody is dropped")
     return f"{entry['round']}: {fmt}" + (f" -> {'; '.join(parts)}" if parts else "")
