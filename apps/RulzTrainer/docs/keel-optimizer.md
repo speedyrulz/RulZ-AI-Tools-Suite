@@ -1,8 +1,9 @@
 # Keel: an identity-first optimizer for character LoRAs (design)
 
 Status: milestones 1 to 5 built (`rulztrainer/optimizers/keel.py`: E, F, B with paired sigma, A with the
-accumulation hook and `gather()`, D with `on_probe`, and C with the LoRA face tap, `optimizer: keel`); milestone 6
-(the README's Wizard choice after the races, phase 1b / 2) is design.
+accumulation hook and `gather()`, D with `on_probe`, and C with the LoRA face tap, `optimizer: keel`), plus the
+face-and-body version (`optimizer: keel_fb`: the body share in C, the magnitude vote in A, the `subject` band
+preset in B; the same class); milestone 6 (the README's Wizard choice after the races, phase 1b / 2) is design.
 Working name "Keel" (the part of the boat that keeps it from drifting sideways). Every number below is a starting
 value to race, not a measured one.
 
@@ -104,6 +105,21 @@ a hook on the bucketed and the slab update that Keel fills from `agree`. K < 2 g
 a loop that hands the optimizer the step's sum (the parallel race's `collect_grads`, a replica reduce) never
 fires the hook, so the gate is 1 there too (noted once). The mean gate is logged every 250 steps.
 
+**Magnitude vote (as built, `keel_consensus_mode`).** The sign vote gives every gradient the same say. In a
+step mixing a face crop and a full-body photo, the weights that serve the body get from the crop a near-zero
+gradient of random sign, which still casts a full vote: with K = 2 half of the body-serving elements sit at the
+floor on every such step, while the face-serving elements get agreeing votes from both photos. The gate is
+therefore face-biased by construction in mixed batches, and the bias is an artefact of the vote, not a design
+choice. `magnitude` weighs each gradient by its size: the hook also sums `|g_k|` (an fp32 buffer per tensor for
+the step), `gather()` turns the two sums into `a = |sum g_k| / sum |g_k|` per element (the same `a` when every
+gradient has the same size, nearly 1 where one gradient dwarfs the rest; a sum of exactly 0 reads 0) and the gate
+is the same function of it. A replica's sum joins the sums through `take_replica` before `gather()` (the step loop
+reduces the replicas first, then gathers, since this change), so the ratio is exact; a reduce after `gather()`
+carries the ratio forward to `|S + g| / (M + |g|)` with `M` recovered as `|S| / a` (exact unless `S` cancelled to
+exactly 0). `auto` is `sign` for `keel` and `magnitude` for `keel_fb`; plain Keel keeps the sign vote so the R3
+race compares against what was built. The gain is off by default in both, so with the defaults `keel_fb` differs
+from `keel` by the vote alone.
+
 **Paired sigma.** Sign disagreement between micro-batches at different noise levels is mostly the noise
 level, not the content. With `keel_pair_sigma` the step draws one sigma per step
 ([`sample_sigmas`](../rulztrainer/trainer.py:220) once instead of per batch) and every micro-batch uses it.
@@ -116,8 +132,9 @@ band (when the step's observations sit in one band, which paired sigma guarantee
 sigmas with `observe(sigma, hook=False)` so they count toward that check and the band weight) and counted as
 one vote, so every GPU's photos vote, a replica's as one.
 
-**Cost.** 1 B/weight (`agree`, for the step), a few small elementwise kernels per tensor per gradient in the
-hook (the sign, its sum, the band's power and scale, the fp32 sum), K >= 2 required (a note and gate 1 otherwise).
+**Cost.** 1 B/weight (`agree`, for the step; 4 B/weight with the magnitude vote), a few small elementwise kernels
+per tensor per gradient in the hook (the sign or the size, its sum, the band's power and scale, the fp32 sum), K >= 2
+required (a note and gate 1 otherwise).
 
 **Risks.** The gate also amplifies anything the dataset shares that is not the person (one photographer's
 light, a recurring outfit); the floor keeps those learnable, the copy check measures them. A hard AND-mask
@@ -148,8 +165,10 @@ several bands is handled per micro-batch. A micro-batch whose images span bands 
 sigma off) is left alone. A loop that hands the optimizer the step's sum (the parallel race) is normalised per
 step in `step()`, and only when the step sits in one band (logged once otherwise), as M2 built it. Then
 `band_weight[b]` (`keel_band_weights`: `""` = 1 everywhere, `identity` = `0.5 + 0.8 exp(-((c + 0.7) / 1.5)^2)`
-at each band's logit centre `c`, about 1.3 over sigma 0.12 to 0.5, or 8 comma-separated numbers; the mean of
-the micro-batches' weights when they differ) multiplies the step's update through `Automagic4.update_gain`, a
+at each band's logit centre `c`, about 1.3 over sigma 0.12 to 0.5; `subject` = `0.6 + 0.7 exp(-(c / 2.2)^4)`, a
+plateau of 1.2 to 1.3 over sigma 0.18 to 0.82 falling to 0.6, since the body's silhouette and proportions are
+decided at high noise where the identity hump falls to 0.5; or 8 comma-separated numbers; the mean of the
+micro-batches' weights when they differ) multiplies the step's update through `Automagic4.update_gain`, a
 hook that scales the update after the vote and before the decay. Paired sigma is then for the consensus gate.
 The per-band gradient RMS relative to the overall (mean over tensors) and the steps seen per band are logged
 every 250 steps.
@@ -193,8 +212,20 @@ the consensus gate (after the balance, before the sign history). Tensors without
 step without a face changes nothing, and items without a face (`face_cells None`) contribute to neither energy.
 The gain's min / median / max over the pairs is logged every 250 steps.
 
+**Body share (as built, `keel_fb`).** The face box alone leaves the build to the background's gain. With
+`body_weight` > 0 (`keel_body_weight`, 1; `keel_fb` only, plain `keel` passes 0) the trainer also arms the tap with
+each sample's body mask ([`lora.body_token_mask`](../rulztrainer/lora.py): the region map's subject cells, the
+prior's complement, minus the face cells, so it needs the person masks, which `wants_person_masks()` requests),
+the hook forms the body part `(du * body_mask)^T h` as well, over the samples with a face or a body, and reports a
+fourth energy. The two regions cannot be pooled into one subject mask: the body covers many more tokens than the
+face and would set the share by area alone. Each region's share is normalised by its own median over the reported
+tensors and the two ratios combine as a weighted geometric mean, `gain = exp(keel_face_gain (log r_face +
+body_weight log r_body) / (1 + body_weight))`, clamped as before; a region that no sample reported this step
+(its energy 0 in every tensor: person-only photos, or face crops) is left out of the mean, so each step moves the
+gain by what it saw. One more masked rank-r product per layer and sample.
+
 **Cost.** About 5-15 % of step time (one [tokens, r] x [tokens, out] product per LoRA layer, the `h` buffers
-of a block). LoKr / OFT: gain 1.
+of a block; one more with the body share). LoKr / OFT: gain 1.
 
 **Risks.** The share is per tensor, not per element, so it cannot push background-only elements inside a
 tensor; a per-element version (factored row/col face energy, like the second moment) is a phase-2 option.
@@ -325,12 +356,14 @@ is fighting the gradient (raise `keel_gauge_eps`).
 optimizer: keel                 # Automagic 4 + the switches below; automagic_* options apply as well
 keel_consensus: 0.5             # 0 = off .. 1 = hard AND-mask; gate = (1 - c) + c * agree^power
 keel_consensus_power: 2.0
+keel_consensus_mode: auto       # sign | magnitude | auto (sign for keel, magnitude for keel_fb)
 keel_pair_sigma: true           # one sigma per step for all of its micro-batches
 keel_bands: 8                   # noise bands (logit sigma); 1 = band normalisation off
-keel_band_weights: ""           # "" = flat | identity | 8 numbers
+keel_band_weights: ""           # "" = flat | identity | subject | 8 numbers
 keel_face_gain: 0.0             # exponent on (face share / median); 0 = off
 keel_face_gain_max: 2.0         # the gain stays within [1/max, max]
 keel_face_gain_beta: 0.9
+keel_body_weight: 1.0           # keel_fb: the body share's weight against the face's in the gain (0 = face only)
 keel_lookahead: false           # needs probes with face_refs; accept / pull-back on the gold score
 keel_lookahead_pullback: 0.5
 keel_lookahead_lr: 0.7
@@ -342,6 +375,14 @@ keel_cautious: true
 
 Defaults for the first build: E and F on (cheap, well-evidenced), A at 0.5 with paired sigma, B on with flat
 weights, C and D off until raced. The Wizard keeps recommending adamw8bit until the race says otherwise.
+
+`optimizer: keel_fb` is the face-and-body version: the same class with `body_weight = keel_body_weight` and the
+magnitude vote by default, raceable as its own row against `keel`. Four of the six mechanisms lean toward the
+face in plain Keel: the gain (the face box alone), the sign vote (face crops out-vote body photos on the
+body-serving weights), the `identity` band preset (it halves the high-noise bands where the build is decided)
+and the lookahead's decision score (`face_weight` 0.7 / `body_weight` 0.3, a controller setting: set them equal
+with `keel_fb`; the log says so when the lookahead is on). The gauge preconditioner, the cautious mask, the band
+normalisation itself, paired sigma, the hook and the lookahead's mechanics are region-neutral.
 
 ## 7. State, resume, race
 
@@ -371,6 +412,7 @@ int8, one card.
 | R3 consensus | keel_consensus 0, 0.3, 0.6, 1.0 at K = 4 | A; SSCD must not rise |
 | R4 face gain | keel_face_gain 0, 0.5, 1.0 | C |
 | R5 lookahead | keel_lookahead off / on, pullback 0.3 / 0.5 | D |
+| R4b face + body | keel (R4 winner) vs keel_fb, then keel_fb with `keel_consensus_mode: sign`, `keel_body_weight: 0` and `keel_band_weights: subject` one at a time, `face_weight` = `body_weight` | the body probe must gain without the face probe losing |
 | R6 transfer | R5 winner probed on Turbo (`sample_model_path`), at strength 0.8, with a style LoRA via `sample_lora` | the goal's second half |
 
 A row wins when its smoothed gold score beats the others by more than the paired-seed noise (the
@@ -394,7 +436,10 @@ the moments; `gather()` reproduces fp32 accumulation to 1 ulp.
    after a pull. R5 is still to run.
 6. **M5** (built) the LoRA face tap, `face_energy`, the per-pair gain through `_element_gain`, the layout taps
    without an alignment loss, compile off with the gain. R4 is still to run.
-7. **M6** README, the Wizard recommendation (if a race earned it), phase 1b, phase 2 candidates.
+7. **M5b** (built) the face-and-body version: `body_token_mask`, the body energy in the tap, the two-region
+   gain, the magnitude vote with the replica path, the `subject` preset, `keel_fb` in the config, race, WebUI and
+   README. R4b is still to run.
+8. **M6** README, the Wizard recommendation (if a race earned it), phase 1b, phase 2 candidates.
 
 M1-M3 are a few hundred lines on top of Automagic 4 and touch the trainer only at the step loop; M4 and M5
 are the invasive ones (the probe path, the LoRA layer).
@@ -409,6 +454,9 @@ are the invasive ones (the probe path, the LoRA layer).
   `min_snr` needs a sentence once Keel is the recommendation.
 - Lookahead and `likeness_curriculum` both react to the same probe; a pull resets the curriculum's bias or
   leaves it? Leave it (it belongs to the data, not the weights), and say so in the log.
+- Should the magnitude vote become plain Keel's default too? It removes an artefact that also costs the face in
+  full-body shots; R3 rerun with `keel_consensus_mode: magnitude` decides. Should `keel_fb` change the probes'
+  `face_weight` / `body_weight` itself? Left to the user (they are the controller's, not the optimizer's).
 
 ## References
 
