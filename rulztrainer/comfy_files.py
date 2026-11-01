@@ -1,6 +1,6 @@
 """Single-file downloads: Comfy-Org's ComfyUI repackages for the model a config trains (model_source "files" with a
-file left empty), in the quant picked for it, the family's turbo LoRA (turbo_lora "auto") and its training adapter
-(training_adapter "auto").
+file left empty), in the quant picked for it, the family's turbo LoRA (turbo_lora "auto"; none when samples render a
+Turbo checkpoint) and its training adapter (training_adapter "auto").
 
     planned_downloads(cfg)  what a run would fetch: [(field, repo, file)]
     resolve_downloads(cfg)  a copy of cfg with those fields set to the local files, downloading what is missing
@@ -45,7 +45,7 @@ def planned_downloads(cfg: TrainConfig) -> list[tuple[str, str, str]]:
                         COMFY_TEXT_ENCODER_FILES[fam].format(quant=cfg.text_encoder_file_quant)))
         if not cfg.vae_file:
             out.append(("vae_file", repo, COMFY_VAE_FILES[fam]))
-    if cfg.turbo_lora == "auto" and fam in ARCH_TURBO:
+    if cfg.turbo_lora == "auto" and fam in ARCH_TURBO and not cfg.samples_on_distilled_model():
         out.append(("turbo_lora", ARCH_TURBO[fam]["repo"], ARCH_TURBO[fam]["file"]))
     if cfg.training_adapter == "auto" and fam in ARCH_TRAINING_ADAPTER and not cfg.finetune:
         out.append(("training_adapter", ARCH_TRAINING_ADAPTER[fam]["repo"], ARCH_TRAINING_ADAPTER[fam]["file"]))
@@ -69,7 +69,9 @@ def resolve_downloads(cfg: TrainConfig, progress=None) -> TrainConfig:
         log.info("%s: %s (%s)", field, path, repo)
         changes[field] = str(path)
     if cfg.turbo_lora == "auto" and "turbo_lora" not in changes:
-        changes["turbo_lora"] = ""  # a family without a turbo LoRA
+        if cfg.samples_on_distilled_model():
+            log.info("turbo_lora auto: none, the sampling model is already a distilled (Turbo) checkpoint")
+        changes["turbo_lora"] = ""  # a family without a turbo LoRA, or a Turbo model that needs none
     if cfg.training_adapter == "auto" and "training_adapter" not in changes:
         changes["training_adapter"] = ""  # a family without a training adapter (or a fine-tune)
     return dataclasses.replace(cfg, **changes) if changes else cfg

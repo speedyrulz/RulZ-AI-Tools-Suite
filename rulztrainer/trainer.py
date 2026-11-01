@@ -2222,12 +2222,16 @@ class Trainer(RaceParallelMixin):
                 log.info("%s %s: matched %d modules (strength %g, sampling only)", label, path, n, strength)
                 if label == "Turbo LoRA" and n:
                     model.turbo_lora_attached = True  # the Krea 2 sampler then uses the distilled schedule
+                    if getattr(model, "is_distilled", False):
+                        log.warning("Turbo LoRA %s is applied to a model that is already distilled (Turbo): it distils "
+                                    "it twice, so samples and probes do not match how the LoRA is used; set "
+                                    "turbo_lora to \"\" (auto picks none for a Turbo model)", path)
 
     def _check_sample_settings(self) -> None:
         """Warn about sample / probe settings that give unusable images: guidance on a distilled (turbo) sampler burns
         them, a few steps or no guidance without one leaves them unfinished."""
         cfg = self.cfg
-        distilled = bool(cfg.turbo_lora) or self.arch.distilled_sample_model(cfg.sample_model_path or "")
+        distilled = bool(cfg.turbo_lora) or cfg.samples_on_distilled_model()
         steps0, cfg0 = self.arch.default_sample_steps, self.arch.default_sample_cfg
         for what, steps, guidance, on in (("Samples", cfg.sample_steps, cfg.sample_cfg, bool(cfg.sample_prompts)),
                                           ("Probes", cfg.probe_steps, cfg.probe_cfg, cfg.probe_every > 0)):

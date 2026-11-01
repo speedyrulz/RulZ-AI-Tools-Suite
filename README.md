@@ -1437,6 +1437,11 @@ probe images, never during training steps.
 | Qwen-Image 2.1 | `qwen_image_2.1_turbo_lora_avg_rank_178_bf16` ([Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1)), extracted from Qwen-Image-2.1-Turbo | 8 | 1 | the Turbo checkpoint's own sigmas |
 | Ideogram 4 | `ideogram_4_turbotime_v1` ([ostris/ideogram_4_turbotime_lora](https://huggingface.co/ostris/ideogram_4_turbotime_lora), community, rank 128, 847 MB): few steps, no CFG and no unconditional model | 8 | 1 | logit-normal, mu 0, std 1.75 (ai-toolkit's sampler, its samples') |
 
+When the model that renders samples is itself a Turbo checkpoint (training on Krea-2-Turbo or Qwen-Image-2.1-Turbo,
+a file name containing "turbo", or a Turbo `sample_model_path`), `auto` adds no turbo LoRA: the Raw-to-Turbo LoRA
+on top of a Turbo model would distil it twice, so samples and probes would not show the LoRA as it is used. A turbo
+LoRA set by hand on a Turbo model logs a warning.
+
 MOSS-Image renders 12 steps rather than the card's 8 because Fizgig found 12 much better; Fizgig also found that
 its turbo LoRA can understate likeness, so judge a run's likeness on full-quality samples (`turbo_lora: ""`, 20 steps,
 CFG 3). The WebUI's *Turbo LoRA* choice (the model's own, none, or a file) moves the steps and CFG between the turbo
