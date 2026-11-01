@@ -17,10 +17,12 @@ MODEL_PRESETS = {
     "Krea-2-Turbo": "krea/Krea-2-Turbo",
     "Qwen-Image-2.1": "Qwen/Qwen-Image-2.1",
     "Qwen-Image-2.1-Turbo": "Qwen/Qwen-Image-2.1-Turbo",
+    "FLUX-3-Klein-Base": "black-forest-labs/flux-3-image-klein-base",
+    "FLUX-3-Klein": "black-forest-labs/flux-3-image-klein",
     "MiniMax-H3-FL2VA": "MiniMaxAI/MiniMax-H3",  # one repository holds both: transformer/ (FL2VA), transformer_ref/
     "MiniMax-H3-Ref2VA": "MiniMaxAI/MiniMax-H3#ref2va",
 }
-ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21", "minimax_h3")
+ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21", "flux3_klein", "minimax_h3")
 OPTIMIZERS = ("adamw", "adamw8bit", "adafactor", "automagic3", "automagic4")
 AUTOMAGIC = ("automagic3", "automagic4")  # self-tuning lr: no schedule, no LoRA+, no per-image lr
 # LoRA target groups each family trains when lora_targets is empty. Krea 2 adds the attention output gate and its
@@ -29,12 +31,14 @@ AUTOMAGIC = ("automagic3", "automagic4")  # self-tuning lr: no schedule, no LoRA
 _CORE_TARGETS = ("q", "k", "v", "o", "ffn_up_gate", "ffn_down")
 ARCH_DEFAULT_TARGETS = {"moss_image": _CORE_TARGETS, "fibo2": _CORE_TARGETS,
                         "krea2": _CORE_TARGETS + ("attn_gate", "text_fusion"), "qwen_image21": _CORE_TARGETS,
+                        "flux3_klein": _CORE_TARGETS + ("mode_blocks",),  # Klein: every block's attention + MLP
                         "minimax_h3": _CORE_TARGETS}  # H3: attn.qkv_proj, out_proj, mlp.fc1, fc2 (musubi-tuner's)
 # (sample steps, sample CFG) per family at full quality, in this trainer's guidance convention (uncond + cfg * (cond -
 # uncond), 1 = off): MOSS-Image's reference CFG 3; Bria's FIBO 2.0 pipeline, 30 steps at 5; Krea's pipeline, 28 steps
 # at its guidance_scale 4.5, which computes cond + g * (cond - uncond): cfg 5.5 here; Qwen-Image 2.1 is meant to be
 # sampled without guidance (ComfyUI's template: 25 steps at CFG 1; the diffusers pipeline 40)
-ARCH_FULL_SAMPLE = {"moss_image": (20, 3.0), "fibo2": (30, 5.0), "krea2": (28, 5.5), "qwen_image21": (25, 1.0)}
+ARCH_FULL_SAMPLE = {"moss_image": (20, 3.0), "fibo2": (30, 5.0), "krea2": (28, 5.5), "qwen_image21": (25, 1.0),
+                    "flux3_klein": (50, 3.5)}  # FLUX 3 Klein Base: BFL's 50 steps at guidance 3.5 (diffusers' CFG)
 # MiniMax H3 is guidance-distilled (no CFG); 30 steps as musubi-tuner's one-frame example (the pipeline: 49)
 ARCH_FULL_SAMPLE["minimax_h3"] = (30, 1.0)
 # Each family's turbo LoRA (turbo_lora: auto downloads it) and the sampling it is made for. The shift only matters for
@@ -77,11 +81,18 @@ ARCH_TRAINING_ADAPTER = {
 }
 # (sample steps, sample CFG) per family by default: the turbo LoRA's
 ARCH_SAMPLE_DEFAULTS = {fam: (t["steps"], t["cfg"]) for fam, t in ARCH_TURBO.items()}
+# FLUX 3 Klein has no turbo LoRA here: on 31 Oct 2026 neither BFL nor Comfy-Org publishes one, and the community's
+# need their own ComfyUI nodes (NoiseToNova's PDD, terminusresearch's flow-map extract) or call themselves a quick
+# experiment (Muinez's 4-step, shift 3). It samples at full quality, or with BFL's distilled Klein as the sampling
+# model (sample_model_path: 16 steps, CFG 1); a family without one is not in ARCH_SAMPLE_DEFAULTS (ARCH_FULL_SAMPLE's)
 
 # Single files (model_source "files") come from Comfy-Org's ComfyUI repackages when a file is left empty: the diffusion
 # model of the picked model in model_file_quant, the family's text encoder in text_encoder_file_quant, its VAE
 COMFY_REPOS = {"moss_image": "Comfy-Org/MOSS-Image", "krea2": "Comfy-Org/Krea-2", "fibo2": "Comfy-Org/Fibo-2.0",
-               "qwen_image21": "Comfy-Org/Qwen-Image-2.1"}
+               "qwen_image21": "Comfy-Org/Qwen-Image-2.1",
+               "flux3_klein": "black-forest-labs/flux-3-image-klein-comfy"}  # BFL's own ComfyUI files (gated)
+# a quant's spelling in a repo's file names where it is not the config's (BFL's files: int8-convrot)
+COMFY_QUANT_NAMES = {"flux3_klein": {"int8_convrot": "int8-convrot"}}
 COMFY_REPOS["minimax_h3"] = "Comfy-Org/MiniMax-H3"
 COMFY_DIFFUSION_FILES = {
     "OpenMOSS-Team/MOSS-Image-Base": "diffusion_models/moss_image_base_{quant}.safetensors",
@@ -92,19 +103,52 @@ COMFY_DIFFUSION_FILES = {
     "briaai/Fibo-2.0-edit-turbo": "diffusion_models/fibo2_edit_turbo_{quant}.safetensors",
     "Qwen/Qwen-Image-2.1": "diffusion_models/qwen_image_2.1_{quant}.safetensors",
     "Qwen/Qwen-Image-2.1-Turbo": "diffusion_models/qwen_image_2.1_turbo_{quant}.safetensors",
+    "black-forest-labs/flux-3-image-klein-base": "diffusion_models/flux3-image-klein-base-{quant}.safetensors",
+    "black-forest-labs/flux-3-image-klein": "diffusion_models/flux3-image-klein-{quant}.safetensors",
     "MiniMaxAI/MiniMax-H3": "diffusion_models/minimax_h3_fl2va_{quant}.safetensors",
     "MiniMaxAI/MiniMax-H3#ref2va": "diffusion_models/minimax_h3_ref2va_{quant}.safetensors",
 }
 COMFY_DIFFUSION_QUANTS = {"moss_image": ("int8_convrot", "bf16"), "krea2": ("int8_convrot", "fp8_scaled", "bf16"),
-                          "fibo2": ("int8_convrot", "bf16"), "qwen_image21": ("int8_convrot", "bf16")}
+                          "fibo2": ("int8_convrot", "bf16"), "qwen_image21": ("int8_convrot", "bf16"),
+                          "flux3_klein": ("int8_convrot", "nvfp4", "bf16")}
 COMFY_TEXT_ENCODER_FILES = {"moss_image": "text_encoders/qwen3.5_9b_{quant}.safetensors",
                             "krea2": "text_encoders/qwen3vl_4b_{quant}.safetensors",
                             "fibo2": "text_encoders/qwen3vl_4b_{quant}.safetensors",
-                            "qwen_image21": "text_encoders/qwen3vl_8b_{quant}.safetensors"}
+                            "qwen_image21": "text_encoders/qwen3vl_8b_{quant}.safetensors",
+                            "flux3_klein": "text_encoders/qwen3vl_4b_{quant}.safetensors"}
 COMFY_TEXT_ENCODER_QUANTS = {"moss_image": ("int8_convrot", "bf16"), "krea2": ("int8_convrot", "fp8_scaled", "bf16"),
-                             "fibo2": ("int8_convrot", "bf16"), "qwen_image21": ("int8_convrot", "bf16")}
+                             "fibo2": ("int8_convrot", "bf16"), "qwen_image21": ("int8_convrot", "bf16"),
+                             "flux3_klein": ("int8_convrot", "bf16")}
 COMFY_VAE_FILES = {"moss_image": "vae/flux2-vae_small.safetensors", "krea2": "vae/qwen_image_vae.safetensors",
-                   "fibo2": "vae/flux2-vae.safetensors", "qwen_image21": "vae/qwen_image_2.1_vae_bf16.safetensors"}
+                   "fibo2": "vae/flux2-vae.safetensors", "qwen_image21": "vae/qwen_image_2.1_vae_bf16.safetensors",
+                   "flux3_klein": "vae/flux2-vae.safetensors"}
+# A text encoder file another family's repackage holds (family -> quant -> repo; the family's own COMFY_REPOS repo
+# otherwise)
+COMFY_TEXT_ENCODER_REPOS: dict[str, dict[str, str]] = {}
+
+# Ideogram 4 (ideogram-ai/ideogram-4-fp8, gated; the unsloth/ideogram-4-fp8 mirror is not): no bf16 release, the fp8
+# weights are the source. Full sampling is Ideogram's V4_DEFAULT_20 preset, 20 steps at guidance 7 (its g * cond +
+# (1 - g) * uncond is uncond + cfg * (cond - uncond) with cfg = g), the last 2 at 3; the turbo LoRA is ostris'
+# TurboTime (rank 128, 847 MB; "good quality in as little as 2 steps with no CFG and no unconditional model", its
+# samples at 8 steps), 8 steps at CFG 1. Comfy-Org's repackage: diffusion models in int8_convrot (9.58 GB), fp8_scaled
+# (9.28 GB) and nvfp4_mixed (5.49 GB), its Flux2 VAE (0.34 GB); its Qwen3-VL-8B text encoder is the same model as
+# Qwen-Image 2.1's, whose int8_convrot (9.35 GB) and bf16 (17.5 GB) files come from Comfy-Org/Qwen-Image-2.1, the
+# fp8_scaled (10.6 GB) and nvfp4 (6.3 GB) ones from Comfy-Org/Ideogram-4.
+MODEL_PRESETS["Ideogram-4"] = "ideogram-ai/ideogram-4-fp8"
+ARCH_NAMES += ("ideogram4",)
+ARCH_DEFAULT_TARGETS["ideogram4"] = _CORE_TARGETS
+ARCH_FULL_SAMPLE["ideogram4"] = (20, 7.0)
+ARCH_TURBO["ideogram4"] = {"repo": "ostris/ideogram_4_turbotime_lora", "file": "ideogram_4_turbotime_v1.safetensors",
+                           "strength": 1.0, "steps": 8, "cfg": 1.0, "shift": 5.0}
+ARCH_SAMPLE_DEFAULTS["ideogram4"] = (ARCH_TURBO["ideogram4"]["steps"], ARCH_TURBO["ideogram4"]["cfg"])
+COMFY_REPOS["ideogram4"] = "Comfy-Org/Ideogram-4"
+COMFY_DIFFUSION_FILES["ideogram-ai/ideogram-4-fp8"] = "diffusion_models/ideogram4_{quant}.safetensors"
+COMFY_DIFFUSION_FILES["unsloth/ideogram-4-fp8"] = "diffusion_models/ideogram4_{quant}.safetensors"
+COMFY_DIFFUSION_QUANTS["ideogram4"] = ("int8_convrot", "fp8_scaled", "nvfp4_mixed")
+COMFY_TEXT_ENCODER_FILES["ideogram4"] = "text_encoders/qwen3vl_8b_{quant}.safetensors"
+COMFY_TEXT_ENCODER_QUANTS["ideogram4"] = ("int8_convrot", "bf16", "fp8_scaled", "nvfp4")
+COMFY_TEXT_ENCODER_REPOS["ideogram4"] = {"int8_convrot": "Comfy-Org/Qwen-Image-2.1", "bf16": "Comfy-Org/Qwen-Image-2.1"}
+COMFY_VAE_FILES["ideogram4"] = "vae/flux2-vae.safetensors"
 # MiniMax H3 (Comfy-Org/MiniMax-H3, sizes from the Hub): the pruned files replace the ~13B AdaLN parameters by a
 # precomputed curve table: pruned_int8_convrot 21.0 GB (the one for 16 GB cards), pruned_bf16 40.2 GB, int8_convrot
 # 34.0 GB, bf16 66.3 GB (full files are pruned on load, h3/loading.py); Qwen3-VL-32B cut to 50 layers: int8_convrot
@@ -202,7 +246,7 @@ class TrainConfig:
 
     # --- model ---
     model_arch: str = "auto"  # auto | moss_image | fibo2 | krea2 | qwen_image21 (auto: the model's transformer config,
-    #                           or the path)
+    #                           or the path) | flux3_klein
     model_source: str = "files"  # files: single ComfyUI-style safetensors files | hf: repo id / diffusers dir
     model_path: str = "OpenMOSS-Team/MOSS-Image-Base"  # HF repo id or local dir with transformer/ text_encoder/ vae/
     models_dir: str = "models"  # where HF repos are downloaded
@@ -534,6 +578,10 @@ class TrainConfig:
         hint = " ".join([self.model_path or "", self.transformer_file or ""]).lower()
         if "qwen-image" in hint or "qwen_image" in hint or "qwenimage" in hint:
             return "qwen_image21"
+        if any(s in hint for s in ("flux-3", "flux3", "flux_3", "flux.3")):
+            return "flux3_klein"
+        if "ideogram" in hint:
+            return "ideogram4"
         if "minimax" in hint:
             return "minimax_h3"
         return "fibo2" if "fibo" in hint else "krea2" if "krea" in hint else "moss_image"
