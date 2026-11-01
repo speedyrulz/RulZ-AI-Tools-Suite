@@ -7,6 +7,7 @@ latents in a normalized 2x2-patchified layout [B, C, H/16, W/16]. MOSS-Image and
 (C = 128); Krea 2 uses the Qwen-Image VAE (C = 64) and caches its latents under their own names (`latent_tag`).
 Qwen-Image 2.1 has its own RGBA VAE, 16x with 64 channels, read unpatched: the same [B, 64, H/16, W/16] layout, on a
 32 px grid (`size_multiple`: its image tokens come in 2x2 groups).
+FLUX 3 Klein uses the Flux2 VAE too and shares MOSS-Image's / FIBO 2.0's latents (C = 128, 16 px grid).
 
     get_arch(cfg)              the Arch for a config (model_arch, or guessed from the model path)
     detect_arch(cfg, model_dir) the Arch from a resolved model directory's transformer/config.json
@@ -26,7 +27,7 @@ from .config import ARCH_DEFAULT_TARGETS, ARCH_FULL_SAMPLE, TrainConfig
 
 log = logging.getLogger("rulztrainer")
 
-ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21")
+ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21", "flux3_klein")
 
 
 def _match_suffix(name: str, suffixes: Iterable[str]) -> bool:
@@ -90,6 +91,10 @@ class Arch:
         return grad_vae(vae)
 
     def sample(self, model, pos_e, pos_m, neg_e, neg_m, **kw) -> torch.Tensor: ...
+
+    def distilled_sample_model(self, path: str) -> bool:
+        """Does sample_model_path name a distilled (few-step, no guidance) model? By name: a turbo model."""
+        return "turbo" in (path or "").lower()
 
     def sample_sigmas(self, model, steps: int, height: int, width: int, shift: float) -> torch.Tensor:
         """The sampler's noise schedule (ending in 0) for an image of height x width pixels."""
@@ -577,7 +582,133 @@ class QwenImage21Arch(Arch):
         return time_shift(calculate_shift(tokens), s).clamp(0.0, 1.0)
 
 
-_ARCHS = {"moss_image": MossArch, "fibo2": FiboArch, "krea2": Krea2Arch, "qwen_image21": QwenImage21Arch}
+class Flux3KleinArch(Arch):
+    name = "flux3_klein"
+    label = "FLUX 3 Klein"
+    modelspec = "flux-3-image-klein"
+    # Black Forest Labs' module names under diffusion_model. (the port keeps them), lora_A / lora_B with alpha folded
+    # in: ComfyUI's loader maps them natively (and onto the fused qkv of its int8 files), and diffusers'
+    # Flux3LoraLoaderMixin converts them, which refuses .alpha keys
+    lora_format = "folded"
+    n_blocks = 28
+    GROUPS = {"q": ("q_proj",), "k": ("k_proj",), "v": ("v_proj",), "o": ("attn_out",), "ffn_up_gate": ("mlp_in",),
+              "ffn_down": ("mlp_out",)}
+    EMBED = ("emb_in", "time_in", "final_layer")
+    target_groups = {"q": "attention query", "k": "attention key", "v": "attention value", "o": "attention out",
+                     "ffn_up_gate": "feed-forward in (SwiGLU gate/up)", "ffn_down": "feed-forward out",
+                     "mode_blocks": "the 5 text and 5 image per-mode blocks before the joint ones (the groups above)",
+                     "modulation": "the per-mode shift / scale / gate projections of the timestep",
+                     "text_in": "text projection (the encoder's 8 stacked layers into the model)",
+                     "embed": "image / timestep embedders and the final layer"}
+    default_targets = ARCH_DEFAULT_TARGETS["flux3_klein"]  # + the per-mode blocks (see config.py)
+    text_prefixes = ("txt_mode_blocks.", "txt_in")
+    supports_single_files = True  # black-forest-labs/flux-3-image-klein-comfy: diffusion model, Qwen3-VL-4B, Flux2 VAE
+    default_sample_steps, default_sample_cfg = ARCH_FULL_SAMPLE["flux3_klein"]
+    # latent_tag "": the Flux2 VAE, encoded and normalized as MOSS-Image and FIBO 2.0 do, so their latents are shared
+
+    def __init__(self):
+        from .flux3 import loading
+
+        self._loading = loading
+
+    def resolve_for_config(self, cfg):
+        return self._loading.resolve_for_config(cfg)
+
+    def get_transformer(self, cfg, model_dir, device=None):
+        return self._loading.get_transformer(cfg, model_dir, device)
+
+    def get_vae(self, cfg, model_dir):
+        return self._loading.get_vae(cfg, model_dir)
+
+    def get_text_encoder(self, cfg, model_dir):
+        return self._loading.get_text_encoder(cfg, model_dir)
+
+    def load_any_transformer(self, path, device, quant="auto", models_dir="models"):
+        return self._loading.load_any_transformer(path, device, quant, models_dir)
+
+    def encode_prompt(self, text_encoder, tokenizer, prompt, max_length):
+        return self._loading.encode_prompt(text_encoder, tokenizer, prompt, max_length)
+
+    def pad_embeds(self, rows):
+        return self._loading.pad_embeds(rows)
+
+    def sample(self, model, pos_e, pos_m, neg_e, neg_m, **kw):
+        from .flux3.sampler import sample
+
+        return sample(model, pos_e, pos_m, neg_e, neg_m, **kw)
+
+    def sample_sigmas(self, model, steps, height, width, shift):
+        from .flux3.sampler import flux3_sigmas
+
+        return flux3_sigmas(steps)
+
+    def distilled_sample_model(self, path: str) -> bool:
+        """The 16-step distilled Klein (flux-3-image-klein, flux3-image-klein-<quant>.safetensors): no "base"."""
+        name = (path or "").replace("\\", "/").lower().rstrip("/").rsplit("/", 1)[-1]
+        return "klein" in name and "base" not in name
+
+    @staticmethod
+    def lora_module_name(name: str) -> str:
+        """diffusers' Flux3 module names (transformer.single_transformer_blocks.N.attn.to_q ...) -> ours, for LoRA
+        files trained in diffusers' layout."""
+        from .flux3.single_file import diffusers_module_to_bfl
+
+        return diffusers_module_to_bfl(name)
+
+    def lora_module_names(self, model, targets, blocks, include_text_embedder=False):
+        from .lora import _is_linear_like
+
+        targets = set(targets)
+        if include_text_embedder:
+            targets.add("text_in")
+        block_set = None if blocks is None else {int(b) for b in blocks}
+        in_block = [s for t in targets for s in self.GROUPS.get(t, ())]
+        names = []
+        for name, module in model.named_modules():
+            if not _is_linear_like(module):
+                continue
+            if name.startswith("single_blocks."):
+                if block_set is not None and int(name.split(".")[1]) not in block_set:
+                    continue
+                if _match_suffix(name, in_block):
+                    names.append(name)
+            elif name.startswith(("txt_mode_blocks.", "content_mode_blocks.")):
+                if "mode_blocks" in targets and _match_suffix(name, in_block):
+                    names.append(name)
+            elif name.startswith(("early_stream_modulations.", "single_stream_modulations.")):
+                if "modulation" in targets:
+                    names.append(name)
+            elif name == "txt_in":
+                if "text_in" in targets:
+                    names.append(name)
+            elif "embed" in targets and name.split(".")[0] in self.EMBED:
+                names.append(name)
+        return names
+
+    def param_group_of(self, name):
+        if name.startswith(self.text_prefixes):
+            return "text"
+        last = name.rsplit(".", 1)[-1]
+        if last in ("q_proj", "k_proj", "v_proj", "attn_out"):
+            return "attn"
+        if last in ("mlp_in", "mlp_out"):
+            return "mlp"
+        return "other"
+
+    def compile_blocks(self, model):
+        return [*model.mode_blocks, *model.single_blocks]
+
+    def reference_sigmas(self, n, gen, tokens):
+        # Black Forest Labs has not published Klein's training noise distribution. This is the usual recipe for a
+        # model sampled with a constant shift: logit-normal sigmas shifted by the sampler's own 6.93.
+        from .flux3.sampler import SHIFT
+
+        s = torch.sigmoid(torch.randn(n, generator=gen))
+        return (SHIFT * s / (1 + (SHIFT - 1) * s)).clamp(0.0, 1.0)
+
+
+_ARCHS = {"moss_image": MossArch, "fibo2": FiboArch, "krea2": Krea2Arch, "qwen_image21": QwenImage21Arch,
+          "flux3_klein": Flux3KleinArch}
 _cache: dict[str, Arch] = {}
 
 
@@ -616,6 +747,9 @@ def arch_from_transformer_file(path: str) -> str | None:
                 found = "moss_image"
             elif "perceiver.latent_queries" in names:
                 found = "fibo2"
+            elif "early_stream_modulations.image.lin.weight" in names or \
+                    "early_stream_modulations.image.linear.weight" in names:
+                found = "flux3_klein"
         except Exception:  # noqa: BLE001
             found = None
         _FILE_ARCH_CACHE[key] = found
@@ -648,7 +782,8 @@ def detect_arch(cfg: TrainConfig, model_dir: Path | None) -> Arch:
             cls = None
         found = {"BriaFibo2Transformer2DModel": "fibo2", "Krea2Transformer2DModel": "krea2",
                  "MOSImageTransformer": "moss_image", "MOSSImageTransformer": "moss_image",
-                 "QwenImage21Transformer2DModel": "qwen_image21"}.get(cls)
+                 "QwenImage21Transformer2DModel": "qwen_image21",
+                 "Flux3Transformer2DModel": "flux3_klein"}.get(cls)
         if found and found != guessed:
             if cfg.model_arch not in ("", "auto"):
                 raise ValueError(f"model_arch is {cfg.model_arch!r} but {model_dir} holds a {found} transformer")
