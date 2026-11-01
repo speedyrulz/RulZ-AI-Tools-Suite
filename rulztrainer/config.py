@@ -17,19 +17,24 @@ MODEL_PRESETS = {
     "Krea-2-Turbo": "krea/Krea-2-Turbo",
     "Qwen-Image-2.1": "Qwen/Qwen-Image-2.1",
     "Qwen-Image-2.1-Turbo": "Qwen/Qwen-Image-2.1-Turbo",
+    "MiniMax-H3-FL2VA": "MiniMaxAI/MiniMax-H3",  # one repository holds both: transformer/ (FL2VA), transformer_ref/
+    "MiniMax-H3-Ref2VA": "MiniMaxAI/MiniMax-H3#ref2va",
 }
-ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21")
+ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21", "minimax_h3")
 # LoRA target groups each family trains when lora_targets is empty. Krea 2 adds the attention output gate and its
 # text-fusion stack, which Fizgig measured to be under-trained by the attention + feed-forward recipe (scaling a
 # finished LoRA's text-fusion blocks x3 lifted likeness 2-7 points on several Krea 2 LoRAs).
 _CORE_TARGETS = ("q", "k", "v", "o", "ffn_up_gate", "ffn_down")
 ARCH_DEFAULT_TARGETS = {"moss_image": _CORE_TARGETS, "fibo2": _CORE_TARGETS,
-                        "krea2": _CORE_TARGETS + ("attn_gate", "text_fusion"), "qwen_image21": _CORE_TARGETS}
+                        "krea2": _CORE_TARGETS + ("attn_gate", "text_fusion"), "qwen_image21": _CORE_TARGETS,
+                        "minimax_h3": _CORE_TARGETS}  # H3: attn.qkv_proj, out_proj, mlp.fc1, fc2 (musubi-tuner's)
 # (sample steps, sample CFG) per family at full quality, in this trainer's guidance convention (uncond + cfg * (cond -
 # uncond), 1 = off): MOSS-Image's reference CFG 3; Bria's FIBO 2.0 pipeline, 30 steps at 5; Krea's pipeline, 28 steps
 # at its guidance_scale 4.5, which computes cond + g * (cond - uncond): cfg 5.5 here; Qwen-Image 2.1 is meant to be
 # sampled without guidance (ComfyUI's template: 25 steps at CFG 1; the diffusers pipeline 40)
 ARCH_FULL_SAMPLE = {"moss_image": (20, 3.0), "fibo2": (30, 5.0), "krea2": (28, 5.5), "qwen_image21": (25, 1.0)}
+# MiniMax H3 is guidance-distilled (no CFG); 30 steps as musubi-tuner's one-frame example (the pipeline: 49)
+ARCH_FULL_SAMPLE["minimax_h3"] = (30, 1.0)
 # Each family's turbo LoRA (turbo_lora: auto downloads it) and the sampling it is made for. The shift only matters for
 # MOSS-Image: the Krea 2 and FIBO 2.0 samplers take theirs from the image size.
 #   MOSS-Image: lodestones' 8-step DMD LoRA distilled from Base (Fizgig's pick), at 12 steps (Fizgig: much better than
@@ -48,6 +53,12 @@ ARCH_TURBO = {
     "qwen_image21": {"repo": "Comfy-Org/Qwen-Image-2.1",
                      "file": "loras/qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors", "strength": 1.0,
                      "steps": 8, "cfg": 1.0, "shift": 5.0},
+    # MiniMax H3: lightx2v's FL2VA Turbo 8-step v1.0 (ComfyUI layout, blocks.N.attn.qkv_proj..., the port's names),
+    # distilled at video shift 12 / audio 3 on 544p video: 8 steps at CFG 1 on the base schedule (its model card).
+    # Untested on single frames
+    "minimax_h3": {"repo": "Comfy-Org/MiniMax-H3",
+                   "file": "loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors", "strength": 1.0,
+                   "steps": 8, "cfg": 1.0, "shift": 12.0},
 }
 # Each family's training adapter (training_adapter: auto downloads it): a LoRA that is on while the LoRA trains and off
 # while it samples, and never saved into it, so the trained LoRA works on the plain model. Fizgig measured on
@@ -56,6 +67,11 @@ ARCH_TURBO = {
 ARCH_TRAINING_ADAPTER = {
     "qwen_image21": {"repo": "ShootTheSound/Fizgig-Qwen-Image-2.1-Training-Adapter",
                      "file": "fizgig_qwen_image_2.1_training_adapter_v2.safetensors"},
+    # MiniMax H3 (CFG-distilled: musubi-tuner saw one-frame LoRAs break up within ~50 steps without an adapter or a
+    # guidance loss): circlestone-labs' image training adapter (rank 64, made for image-only training on FL2VA,
+    # 0.62 GB), the first of the three musubi-tuner tested; ostris' v2 (rank 32) is the alternative
+    "minimax_h3": {"repo": "circlestone-labs/MiniMax-H3-Image-Training-Adapter",
+                   "file": "minimax_h3_image_training_adapter.safetensors"},
 }
 # (sample steps, sample CFG) per family by default: the turbo LoRA's
 ARCH_SAMPLE_DEFAULTS = {fam: (t["steps"], t["cfg"]) for fam, t in ARCH_TURBO.items()}
@@ -64,6 +80,7 @@ ARCH_SAMPLE_DEFAULTS = {fam: (t["steps"], t["cfg"]) for fam, t in ARCH_TURBO.ite
 # model of the picked model in model_file_quant, the family's text encoder in text_encoder_file_quant, its VAE
 COMFY_REPOS = {"moss_image": "Comfy-Org/MOSS-Image", "krea2": "Comfy-Org/Krea-2", "fibo2": "Comfy-Org/Fibo-2.0",
                "qwen_image21": "Comfy-Org/Qwen-Image-2.1"}
+COMFY_REPOS["minimax_h3"] = "Comfy-Org/MiniMax-H3"
 COMFY_DIFFUSION_FILES = {
     "OpenMOSS-Team/MOSS-Image-Base": "diffusion_models/moss_image_base_{quant}.safetensors",
     "OpenMOSS-Team/MOSS-Image-SFT": "diffusion_models/moss_image_sft_{quant}.safetensors",
@@ -73,6 +90,8 @@ COMFY_DIFFUSION_FILES = {
     "briaai/Fibo-2.0-edit-turbo": "diffusion_models/fibo2_edit_turbo_{quant}.safetensors",
     "Qwen/Qwen-Image-2.1": "diffusion_models/qwen_image_2.1_{quant}.safetensors",
     "Qwen/Qwen-Image-2.1-Turbo": "diffusion_models/qwen_image_2.1_turbo_{quant}.safetensors",
+    "MiniMaxAI/MiniMax-H3": "diffusion_models/minimax_h3_fl2va_{quant}.safetensors",
+    "MiniMaxAI/MiniMax-H3#ref2va": "diffusion_models/minimax_h3_ref2va_{quant}.safetensors",
 }
 COMFY_DIFFUSION_QUANTS = {"moss_image": ("int8_convrot", "bf16"), "krea2": ("int8_convrot", "fp8_scaled", "bf16"),
                           "fibo2": ("int8_convrot", "bf16"), "qwen_image21": ("int8_convrot", "bf16")}
@@ -84,6 +103,14 @@ COMFY_TEXT_ENCODER_QUANTS = {"moss_image": ("int8_convrot", "bf16"), "krea2": ("
                              "fibo2": ("int8_convrot", "bf16"), "qwen_image21": ("int8_convrot", "bf16")}
 COMFY_VAE_FILES = {"moss_image": "vae/flux2-vae_small.safetensors", "krea2": "vae/qwen_image_vae.safetensors",
                    "fibo2": "vae/flux2-vae.safetensors", "qwen_image21": "vae/qwen_image_2.1_vae_bf16.safetensors"}
+# MiniMax H3 (Comfy-Org/MiniMax-H3, sizes from the Hub): the pruned files replace the ~13B AdaLN parameters by a
+# precomputed curve table: pruned_int8_convrot 21.0 GB (the one for 16 GB cards), pruned_bf16 40.2 GB, int8_convrot
+# 34.0 GB, bf16 66.3 GB (full files are pruned on load, h3/loading.py); Qwen3-VL-32B cut to 50 layers: int8_convrot
+# 27.1 GB, nvfp4_awq 15.7 GB, bf16 51.5 GB; the video VAE fp16 5.2 GB (+ the audio VAE, 0.6 GB, fetched by h3/loading)
+COMFY_DIFFUSION_QUANTS["minimax_h3"] = ("pruned_int8_convrot", "pruned_bf16", "int8_convrot", "bf16")
+COMFY_TEXT_ENCODER_FILES["minimax_h3"] = "text_encoders/qwen3vl_32b_minimax_h3_{quant}.safetensors"
+COMFY_TEXT_ENCODER_QUANTS["minimax_h3"] = ("int8_convrot", "nvfp4_awq", "bf16")
+COMFY_VAE_FILES["minimax_h3"] = "vae/minimax_h3_video_vae_fp16.safetensors"
 
 
 # Named presets: values applied over a config (UI toggle, --preset on the CLI, or `preset:` in YAML).
@@ -498,6 +525,8 @@ class TrainConfig:
         hint = " ".join([self.model_path or "", self.transformer_file or ""]).lower()
         if "qwen-image" in hint or "qwen_image" in hint or "qwenimage" in hint:
             return "qwen_image21"
+        if "minimax" in hint:
+            return "minimax_h3"
         return "fibo2" if "fibo" in hint else "krea2" if "krea" in hint else "moss_image"
 
     def resolved_lora_targets(self) -> list[str]:
