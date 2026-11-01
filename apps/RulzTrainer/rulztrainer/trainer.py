@@ -314,6 +314,8 @@ def build_optimizer(cfg: TrainConfig, params, pairs=None):
                         consensus=cfg.keel_consensus, consensus_power=cfg.keel_consensus_power,
                         lookahead=cfg.keel_lookahead, lookahead_pullback=cfg.keel_lookahead_pullback,
                         lookahead_lr=cfg.keel_lookahead_lr, lookahead_grace=cfg.keel_lookahead_grace,
+                        face_gain=cfg.keel_face_gain, face_gain_max=cfg.keel_face_gain_max,
+                        face_gain_beta=cfg.keel_face_gain_beta,
                         sensitivity_quantile=cfg.automagic_sensitivity_quantile, vote=cfg.automagic_vote,
                         max_vote=cfg.automagic_max_lr_change, **kw)
         if name == "automagic4":
@@ -972,6 +974,9 @@ class Trainer(RaceParallelMixin):
             do_compile, why = False, "a fine-tune swaps its layers in and out of the model"
         if self.block_swap is not None and do_compile:
             do_compile, why = False, "block swap streams the blocks' weights in and out"
+        if do_compile and any(c.optimizer.lower() == "keel" and c.keel_face_gain > 0 for c in
+                              ([r[1] for r in self.race_rows] if self.race_rows is not None else [cfg])):
+            do_compile, why = False, "Keel's face-token gain hooks the LoRA layers' outputs (keel_face_gain)"
         if why:
             log.info("torch.compile %s (%s)", "on" if do_compile else "off", why)
         if do_compile:
@@ -1071,14 +1076,23 @@ class Trainer(RaceParallelMixin):
             use_attn = bool(cfg.attn_localize and taps is not None and regions is not None)
             use_align = bool((cfg.id_align or cfg.body_align) and taps is not None and regions is not None
                              and rmodel is model and self.id_aligner is not None)
-            if use_attn or use_align:  # this forward records the trigger's attention / the face tokens' states
-                taps.begin([self.trigger_pos.get(p, []) for p in regions.text_paths] if use_attn
+            face_sink = getattr(optimizer, "face_energy", None) if rmodel is model else None  # Keel's face gain
+            use_face = bool(face_sink is not None and taps is not None and regions is not None
+                            and any(rm.face_cells is not None for rm in regions.meta))
+            if use_attn or use_align or use_face:  # this forward records the trigger's attention / the face tokens'
+                taps.begin([self.trigger_pos.get(p, []) for p in regions.text_paths] if use_attn  # states / layout
                            else [[] for _ in batch], attention=use_attn)
+            if face_sink is not None:  # the face tap: this batch's face tokens per sample (disarmed without a face)
+                hh, ww = regions.prior.shape[-2:] if use_face else (0, 0)
+                lora_mod.arm_face_tap(rinj, [lora_mod.face_token_mask(rm.face_cells, hh, ww) for rm in regions.meta]
+                                      if use_face else None, lambda: taps.layout, face_sink)
             pred = rmodel(noisy_in, sigma * 1000.0, embeds, mask).float()
             aux = None
             if use_attn or use_align:
                 taps.stop()  # later forwards (the prior pass, the backward's recompute) record nothing
                 aux = self._alignment_losses(cfg, taps, batch, regions, use_attn, use_align)
+            elif use_face:
+                taps.stop()
             sq = (pred - target).pow(2)
             if regions is not None and cfg.region_weights:  # region-weighted loss: face > person > background (mean 1)
                 sq = sq * regions.weight.to(rdev)
@@ -1127,8 +1141,10 @@ class Trainer(RaceParallelMixin):
             if result is None:
                 loss.backward()
                 result = (report.item(), mults, None)
-            if use_attn or use_align:
+            if use_attn or use_align or use_face:
                 taps.end()
+            if face_sink is not None:
+                lora_mod.disarm_face_tap(rinj)  # the trigger-free pass and the next batch report nothing stale
             if dop is not None:  # LoRA Isolation: the trigger-free pass, after this batch's backward freed its graph
                 del pred, sq, per, noisy, noisy_in
                 if observe is not None:
@@ -2731,6 +2747,10 @@ class Trainer(RaceParallelMixin):
         rows = [r[1] for r in self.race_rows] if self.race_rows is not None else [cfg]
         attn, align = any(c.attn_localize for c in rows), any(c.id_align or c.body_align for c in rows)
         if not (attn or align):
+            if (any(c.optimizer.lower() == "keel" and c.keel_face_gain > 0 for c in rows) and self.ft is None
+                    and not self.race_parallel):
+                for m, _, _ in self.replicas:
+                    m._rz_taps = A.Taps()  # the token layout alone, for Keel's face tap (keel_face_gain)
             return
         if self.ft is not None:
             log.warning("Attention localization and identity alignment are adapter training losses; a fine-tune "

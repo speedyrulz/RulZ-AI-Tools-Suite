@@ -1274,6 +1274,8 @@ class Form:
             keel_consensus=float(v("keel_consensus")), keel_consensus_power=float(v("keel_consensus_power")),
             keel_lookahead=bool(v("keel_lookahead")), keel_lookahead_pullback=float(v("keel_lookahead_pullback")),
             keel_lookahead_lr=float(v("keel_lookahead_lr")), keel_lookahead_grace=int(v("keel_lookahead_grace")),
+            keel_face_gain=float(v("keel_face_gain")), keel_face_gain_max=float(v("keel_face_gain_max")),
+            keel_face_gain_beta=float(v("keel_face_gain_beta")),
             timestep_shift=float(v("timestep_shift")), sigmoid_scale=float(v("sigmoid_scale")),
             logsnr_mean=float(v("logsnr_mean")), logsnr_std=float(v("logsnr_std")),
             block_swap=int(v("block_swap") or 0),
@@ -2877,6 +2879,8 @@ RACE_LABELS = {
     "keel_consensus": "Keel consensus gate", "keel_consensus_power": "Keel consensus power",
     "keel_lookahead": "Keel lookahead", "keel_lookahead_pullback": "Keel pull-back",
     "keel_lookahead_lr": "Keel pull lr factor", "keel_lookahead_grace": "Keel grace probes",
+    "keel_face_gain": "Keel face gain", "keel_face_gain_max": "Keel face gain limit",
+    "keel_face_gain_beta": "Keel face gain EMA",
     "lora_ema": "Weight average", "timestep_sampling": "Timestep sampling", "loss_weighting": "Loss weighting",
     "region_weights": "Region-weighted loss", "face_loss_weight": "Face loss weight",
     "body_loss_weight": "Body loss weight", "background_loss_weight": "Background loss weight",
@@ -6131,6 +6135,21 @@ def build_page(local: bool = True):
                                                                       min=0, max=20, precision=0).classes("w-32") \
                                     .tooltip("Probes without a gain before a pull; the count starts over after a "
                                              "pull or an accept.")
+                                w["keel_face_gain"] = ui.number("Face gain", value=d.keel_face_gain, min=0, max=4,
+                                                                step=0.25, format="%.2f").classes("w-32") \
+                                    .tooltip("Face-token gain: each LoRA pair's step is scaled by (the share of its "
+                                             "gradient that comes from the face's tokens / the median pair's share) "
+                                             "to this power, so the weights serving the face move more and the "
+                                             "background's less. Needs region maps with faces (face detection). "
+                                             "0 = off; race it at 0.5 and 1.")
+                                w["keel_face_gain_max"] = ui.number("Face gain limit", value=d.keel_face_gain_max,
+                                                                    min=1, max=10, step=0.5, format="%.1f") \
+                                    .classes("w-32").tooltip("The gain stays within [1 / limit, limit].")
+                                w["keel_face_gain_beta"] = ui.number("Face gain EMA", value=d.keel_face_gain_beta,
+                                                                     min=0, max=0.99, step=0.05, format="%.2f") \
+                                    .classes("w-32") \
+                                    .tooltip("How much of the previous gain each step keeps (0.9: one batch without "
+                                             "a face barely moves it).")
                         with advanced("Timesteps, loss weighting and gradients"):
                             with fields():
                                 w["gradient_accumulation"] = ui.number("Grad accumulation",
@@ -7956,8 +7975,10 @@ then emphasise bands on purpose (`identity`: a hump over sigma 0.12 to 0.5). The
 weight's update by how many of the step's micro-batches agree on its sign, so what every photo shares moves and
 what varies between photos moves less (it needs gradient accumulation of 2 or more). *Lookahead* (off by default)
 anchors the weights at each probe that sets a new best likeness and, after the grace probes without a gain, pulls
-the weights part of the way back toward the anchor and cuts the learning rate. Whether Keel beats adamw8bit on the
-likeness probes is not measured yet: race them.
+the weights part of the way back toward the anchor and cuts the learning rate. *Face gain* (off by default) scales
+each LoRA pair's step by how much of its gradient comes from the face's tokens, against the median pair, so the
+weights that serve the face move more and the background's less; it needs region maps with faces. Whether Keel
+beats adamw8bit on the likeness probes is not measured yet: race them.
 
 ## Adapters: LoRA, LoKr, OFT and DoRA
 The *Adapter* field (Train tab, LoRA section) picks what each layer learns. **LoRA**: a rank-r pair. **LoKr**: a

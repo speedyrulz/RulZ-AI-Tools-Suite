@@ -1,7 +1,8 @@
 # Keel: an identity-first optimizer for character LoRAs (design)
 
-Status: milestones 1 to 4 built (`rulztrainer/optimizers/keel.py`: E, F, B with paired sigma, A with the
-accumulation hook and `gather()`, and D with `on_probe`, `optimizer: keel`); the rest is design.
+Status: milestones 1 to 5 built (`rulztrainer/optimizers/keel.py`: E, F, B with paired sigma, A with the
+accumulation hook and `gather()`, D with `on_probe`, and C with the LoRA face tap, `optimizer: keel`); milestone 6
+(the README's Wizard choice after the races, phase 1b / 2) is design.
 Working name "Keel" (the part of the boat that keeps it from drifting sideways). Every number below is a starting
 value to race, not a measured one.
 
@@ -166,21 +167,31 @@ the background a smaller one. Unlike the identity loss it cannot be gamed: the g
 the diffusion update, so the step still descends the diffusion loss and cannot steer toward features that
 fool a face recognizer (the failure the FaceNet gold judge exists to catch).
 
-**Signal.** In [`LoRALinear._added`](../rulztrainer/lora.py:385) (LoRA kind only): save `h = x A^T`
-([tokens, r], detached) and register a tensor hook on the LoRA output so the backward hands back the
-per-token output gradient `d` ([tokens, out]). The weight gradient of `lora_up` is `d^T h` summed over
-tokens; with the batch's face mask over tokens the face part is `d[face]^T h[face]`, one extra rank-r
-matmul per layer and no second backward. `share = ||G_face||^2 / ||G||^2` per tensor (a scalar; the
-`lora_down` of the pair gets the same share). The face mask comes from the region map's `face_cells`
-([regions.py:213](../rulztrainer/regions.py:213)) and the per-sample image token ranges the alignment
-[`Taps`](../rulztrainer/alignment.py:50) already receive (`set_layout`): one token per 16-px cell, row-major.
-Checkpointed blocks recompute the forward before their backward; the hook registered in the recompute is the
-one that fires, and the saved `h` is the recompute's (last write wins), so they agree.
+**Signal (as built).** In [`LoRALinear._added`](../rulztrainer/lora.py:385) (LoRA kind only) a tensor hook
+on the LoRA output `u = h B^T` (`h = x A^T`, kept detached) hands the backward's per-token output gradient
+`du` to `_tap_face`, which forms per sample `G = du^T h` ([out, r], `lora_up`'s gradient before the scale)
+and the face part `G_face = (du * mask)^T h` over the image tokens, summed over the samples with a face, and
+reports `||G_face||^2` and `||G||^2` to `Keel.face_energy(lora_up, ...)`: one extra rank-r product per layer and
+sample, no second backward, no sync. The trainer arms the tap per micro-batch (`lora.arm_face_tap`) with each
+sample's mask from the region map's `face_cells` ([regions.py:213](../rulztrainer/regions.py:213)), one token
+per 16-px cell, row-major (`lora.face_token_mask`), and the model's token layout from the alignment
+[`Taps`](../rulztrainer/alignment.py:50) (`set_layout`; a bare `Taps()` is installed when no alignment loss
+needs one). The image tokens are the layout's when the layer's input holds the whole sequence, all of it when
+the input is the image tokens alone (a double-stream block's image side), and a text-only input is skipped.
+The blocks checkpoint non-reentrantly, so the main forward's hook is the one that fires and the recompute's
+never does: a layer is reported once per backward (a test checks the energies match with and without
+checkpointing). The hooks are Python, so `compile_model` is off with the gain on. The primary copy's
+micro-batches only: a data-parallel replica's are not tapped (its parameters are not the optimizer's), nor the
+parallel race's.
 
-**Gain.** `gain[t] = clamp((share[t] / median_share) ** keel_face_gain, 1 / keel_face_gain_max,
-keel_face_gain_max)`, median over the live tensors of the step, EMA'd over `keel_face_gain_beta` (0.9) so one
-batch without a face does not swing it. Applied per tensor to the update, after the balance. Items without a
-face (`face_cells None`) contribute nothing to `face[t]` and are left out of that step's median.
+**Gain (as built).** Summed over the step's micro-batches, `share[t] = e_face / e_total` per reported tensor,
+`gain[t] = clamp((share[t] / median_share) ** keel_face_gain, 1 / keel_face_gain_max, keel_face_gain_max)`,
+the median over the tensors reported with energy this step, EMA'd over `keel_face_gain_beta` (0.9) into
+`state[p]["face_gain"]` (a 0-dim fp32; the pair's `lora_down` gets the same; it round-trips with the state and
+is dropped when the gain is off). Applied per tensor to the update through `Automagic4._element_gain`, next to
+the consensus gate (after the balance, before the sign history). Tensors without a report keep their gain, so a
+step without a face changes nothing, and items without a face (`face_cells None`) contribute to neither energy.
+The gain's min / median / max over the pairs is logged every 250 steps.
 
 **Cost.** About 5-15 % of step time (one [tokens, r] x [tokens, out] product per LoRA layer, the `h` buffers
 of a block). LoKr / OFT: gain 1.
@@ -300,7 +311,7 @@ is fighting the gradient (raise `keel_gauge_eps`).
 | [config.py](../rulztrainer/config.py) | the `keel_*` options (section 6) and their validation |
 | [trainer.py:264](../rulztrainer/trainer.py:264) `build_optimizer` | construct `Keel(params, pairs=..., **automagic kw, **keel kw)`; pairs from the injected LoRA modules |
 | [trainer.py](../rulztrainer/trainer.py) step loop (and `race_parallel.py`'s) | `observe(sigma)` before each backward of the primary copy in `work()` and before the DOP pass (built; the parallel race observes per step); `gather()` before `reduce_grads` and `clip_grad_norm_` (built); paired sigma through `draw_sigmas` when `keel_pair_sigma` (built; the DOP pass shares it) |
-| [lora.py:385](../rulztrainer/lora.py:385) `_added` | the face tap (`h` save + output hook), armed per batch with the face token mask |
+| [lora.py:385](../rulztrainer/lora.py:385) `_added` | the face tap (`_tap_face`: the output hook with `h` kept), armed per micro-batch by `work()` with the face token masks (built) |
 | [trainer.py](../rulztrainer/trainer.py) `run_probe` | `on_probe(score, band, ema)` after the decision, with the raw weights back (built); the parallel race passes its configuration's average |
 | [multigpu.py:64](../rulztrainer/multigpu.py:64) `reduce_grads` | `take=` callback: `Keel.take_replica` scales each replica's sum by the step's band and counts it as one vote (built) |
 | [race.py:58](../rulztrainer/race.py:58) | `keel_*` in the settings a race row may change |
@@ -381,7 +392,8 @@ the moments; `gather()` reproduces fp32 accumulation to 1 ulp.
    R3 is still to run.
 5. **M4** (built) `on_probe`, the anchor with its score mirrored in the state, the EMA pull, the replica sync
    after a pull. R5 is still to run.
-6. **M5** the LoRA face tap and the gain. R4.
+6. **M5** (built) the LoRA face tap, `face_energy`, the per-pair gain through `_element_gain`, the layout taps
+   without an alignment loss, compile off with the gain. R4 is still to run.
 7. **M6** README, the Wizard recommendation (if a race earned it), phase 1b, phase 2 candidates.
 
 M1-M3 are a few hundred lines on top of Automagic 4 and touch the trainer only at the step loop; M4 and M5

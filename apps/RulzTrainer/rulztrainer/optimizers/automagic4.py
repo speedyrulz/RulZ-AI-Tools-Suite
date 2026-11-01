@@ -219,9 +219,9 @@ class Automagic4(Automagic3):
             self._refresh_group_lrs()
 
     def _element_gain(self, p: torch.Tensor, i0: int = 0, i1: Optional[int] = None) -> Optional[torch.Tensor]:
-        """An elementwise multiplier on p's update (rows i0:i1 of a 2-D tensor when given), applied after the
-        sensitivity balance and before the sign history so the vote sees the gated magnitude, or None: a hook for a
-        subclass (Keel's consensus gate)."""
+        """An elementwise multiplier on p's update (rows i0:i1 of a 2-D tensor when given; a 0-dim tensor for the
+        whole tensor), applied after the sensitivity balance and before the sign history so the vote sees the gated
+        magnitude, or None: a hook for a subclass (Keel's consensus gate and face-token gain)."""
         return None
 
     def _init_state(self, p: torch.Tensor, group: dict) -> None:
@@ -404,8 +404,8 @@ class Automagic4(Automagic3):
             if n == 1:
                 update[0].mul_(gains[0])
             else:
-                update.mul_(torch.stack([g if g is not None else torch.ones(shape, device=grad.device)
-                                         for g in gains]))
+                update.mul_(torch.stack([(g.expand(shape) if g.dim() == 0 else g) if g is not None
+                                         else torch.ones(shape, device=grad.device) for g in gains]))
         del gains
 
         # Sign history (packed planes, stacked [N, H, W]) and the pooled vote.
