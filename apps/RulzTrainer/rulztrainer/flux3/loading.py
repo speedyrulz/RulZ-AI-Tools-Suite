@@ -55,9 +55,9 @@ SELECT_LAYERS = (4, 8, 12, 16, 20, 24, 28, 32)  # config.json text_encoder.layer
 PAD_MULTIPLE = 80  # config.json text_encoder.pad_multiple
 MAX_TOKENS = 8192  # the pipeline's max_sequence_length (the trainer's max_token_length caps it)
 HF_PATTERNS = ["*.json", "transformer/*", "text_encoder/*", "vae/*", "LICENSE.md", "NOTICE.md"]
-GATE_HELP = ("Black Forest Labs' FLUX 3 Klein repos are gated (FLUX Kommunity License, approved automatically): open "
-             "https://huggingface.co/{repo}, accept the license with your Hugging Face account, and make sure the "
-             "trainer uses that account's token (hf auth login, or the HF_TOKEN environment variable)")
+GATE_HELP = ("{what} is gated on Hugging Face{license}: open https://huggingface.co/{repo}, accept the license with "
+             "your Hugging Face account, and make sure the trainer uses that account's token (hf auth login, or the "
+             "HF_TOKEN environment variable)")
 
 
 def is_flux3_dir(model_dir: Path) -> bool:
@@ -102,7 +102,11 @@ def resolve_quant(quant: str, devices) -> str:
 
 
 def gated_error(repo: str, err: Exception) -> Exception:
-    return PermissionError(GATE_HELP.format(repo=repo) + f" ({type(err).__name__})")
+    """A PermissionError that says which license to accept where (the download's own error is only a 401 / 403)."""
+    bfl = repo.lower().startswith("black-forest-labs/")
+    text = GATE_HELP.format(what="Black Forest Labs' FLUX 3 Klein" if bfl else repo, repo=repo,
+                            license=" (FLUX Kommunity License, approved automatically)" if bfl else "")
+    return PermissionError(f"{text} ({type(err).__name__})")
 
 
 def is_gated_error(err: Exception) -> bool:

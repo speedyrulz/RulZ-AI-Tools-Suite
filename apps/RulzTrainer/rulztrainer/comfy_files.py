@@ -31,7 +31,10 @@ def planned_downloads(cfg: TrainConfig) -> list[tuple[str, str, str]]:
             if cfg.model_file_quant not in COMFY_DIFFUSION_QUANTS[fam]:
                 raise ValueError(f"model_file_quant {cfg.model_file_quant!r}: {COMFY_REPOS[fam]} has "
                                  f"{', '.join(COMFY_DIFFUSION_QUANTS[fam])}")
-            out.append(("transformer_file", repo, pattern.format(quant=cfg.model_file_quant)))
+            from .config import COMFY_QUANT_NAMES
+
+            quant = COMFY_QUANT_NAMES.get(fam, {}).get(cfg.model_file_quant, cfg.model_file_quant)
+            out.append(("transformer_file", repo, pattern.format(quant=quant)))
         if not cfg.text_encoder_file:
             if cfg.text_encoder_file_quant not in COMFY_TEXT_ENCODER_QUANTS[fam]:
                 raise ValueError(f"text_encoder_file_quant {cfg.text_encoder_file_quant!r}: {COMFY_REPOS[fam]} has "
@@ -52,7 +55,14 @@ def resolve_downloads(cfg: TrainConfig, progress=None) -> TrainConfig:
 
     changes = {}
     for field, repo, file in planned_downloads(cfg):
-        path = ensure_hf_file(repo, file, file.rsplit("/", 1)[-1], progress)
+        try:
+            path = ensure_hf_file(repo, file, file.rsplit("/", 1)[-1], progress)
+        except Exception as e:  # noqa: BLE001
+            from .flux3.loading import gated_error, is_gated_error
+
+            if is_gated_error(e):  # a gated repo (Black Forest Labs'): say what to accept, not just "401"
+                raise gated_error(repo, e) from e
+            raise
         log.info("%s: %s (%s)", field, path, repo)
         changes[field] = str(path)
     if cfg.turbo_lora == "auto" and "turbo_lora" not in changes:
