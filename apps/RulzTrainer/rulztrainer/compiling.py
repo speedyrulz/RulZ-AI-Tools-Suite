@@ -6,6 +6,12 @@ sampling, guidance batches, the region-prior pass and every GPU add variants. to
 256 across all) then run blocks eagerly without saying so; the limits are raised here, and dynamo's warnings (such as
 a hit recompile limit) go to train.log. report() summarizes frames, graphs, graph breaks by reason and compile time.
 
+The compiled kernels persist across machines (compile_cache): torch's on-disk caches already keep them between runs
+on one machine, but a fresh vast.ai rental starts cold (Krea 2 nvfp4: 160 s of compiling instead of 36 s). Their
+"Mega-Cache" serializes every compile artifact of the process into one file per torch / triton / GPU model, saved in
+`<models_dir>/.rulz_compile` after 5 steps and at the end, and loaded before the blocks compile; a file another
+torch, triton or GPU made is skipped.
+
 RULZ_COMPILE_NESTED=1 sets nested_graph_breaks (a measurement variant: a break no longer bubbles up to the caller's
 frame); RULZ_COMPILE_THREAD_LIMITS=0 leaves torch's own limits in the other threads (the behaviour before
 thread_prepare, for measuring it)."""
@@ -14,6 +20,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from pathlib import Path
 
 import torch
 
@@ -99,6 +106,67 @@ def prepare(fall_back: bool = False, shape_swaps: bool = False) -> None:
         if h not in dyn_log.handlers:
             dyn_log.addHandler(h)
     dyn_log.setLevel(min(dyn_log.level or logging.WARNING, logging.WARNING))
+
+
+def cache_dirs(setting: str, models_dir) -> list[Path]:
+    """compile_cache -> the folders to look in, the one written first; [] when off. auto: <models_dir>/.rulz_compile,
+    and a model bucket's .rulz_compile (scripts/vast/download_models.sh syncs it to models/bucket) to read from."""
+    value = str(setting or "").strip()
+    if value.lower() in ("", "off", "false", "none"):
+        return []
+    if value.lower() != "auto":
+        return [Path(value)]
+    root = Path(models_dir)
+    return [root / ".rulz_compile", root / "bucket" / ".rulz_compile"]
+
+
+def cache_name(device) -> str:
+    """The cache file's name: what a cache only works with (torch, triton and the training GPU's model)."""
+    import re
+
+    import triton
+
+    dev = torch.device(device)
+    gpu = re.sub(r"[^A-Za-z0-9.]+", "-", torch.cuda.get_device_name(dev)).strip("-")
+    major, minor = torch.cuda.get_device_capability(dev)
+    return f"torch{torch.__version__}-triton{triton.__version__}-{gpu}-sm{major}{minor}.bin".replace("+", "_")
+
+
+def load_cache(dirs: list[Path], device) -> Path | None:
+    """Load the first matching cache file; the file it read, or None (none there, or one torch refused)."""
+    try:
+        name = cache_name(device)
+    except Exception:  # noqa: BLE001  (no triton or no GPU: nothing to load)
+        return None
+    for d in dirs:
+        f = d / name
+        if not f.is_file():
+            continue
+        try:
+            torch.compiler.load_cache_artifacts(f.read_bytes())
+            return f
+        except Exception as e:  # noqa: BLE001
+            log.warning("compile_cache: could not load %s (%s); compiling from scratch", f, e)
+    return None
+
+
+def save_cache(dirs: list[Path], device) -> Path | None:
+    """Write this process's compile artifacts to the first folder (replacing the file); the file, or None."""
+    if not dirs:
+        return None
+    try:
+        got = torch.compiler.save_cache_artifacts()
+        if not got:
+            return None
+        f = dirs[0] / cache_name(device)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        tmp = f.with_suffix(".tmp")
+        tmp.write_bytes(got[0])
+        os.replace(tmp, f)
+        return f
+    except Exception as e:  # noqa: BLE001  (a cache is never worth stopping a run for)
+        log.warning("compile_cache: could not save (%s)", e)
+        return None
 
 
 def stats() -> dict:

@@ -2,8 +2,8 @@
 
 "torch" leaves scaled_dot_product_attention to pick (flash where it can, else memory-efficient, else math). "cudnn"
 puts cuDNN's fused attention first: on the RTX 5060 Ti it ran Krea 2 nvfp4 steps 15-22% faster than PyTorch's pick at
-the same loss and memory (ai-toolkit uses it for Blackwell too), so "auto" (the default) is cuDNN on a Blackwell
-training GPU and PyTorch's pick elsewhere. "flash", "efficient" and "math" put the others first.
+the same loss and memory (ai-toolkit uses it for Blackwell too), and Qwen-Image 2.1 int8 steps on the RTX 4060 Ti
+5-9% faster, so "auto" (the default) is cuDNN on an Ada or Blackwell training GPU and PyTorch's pick elsewhere. "flash", "efficient" and "math" put the others first.
 
 The choice is PyTorch's process-wide priority order, set once: the chosen backend is tried first and every other one
 stays enabled behind it, so a call it cannot take (a mask, a dtype, a head size) quietly runs on the next one. It used
@@ -28,22 +28,25 @@ _DEFAULT_ORDER = list(torch._C._get_sdp_priority_order()) if hasattr(torch._C, "
 _name = "torch"
 
 
-def is_blackwell(device) -> bool:
-    """Compute capability 10.x / 12.x (B200, RTX 50), where cuDNN attention measured 15-22% faster per step."""
+def cudnn_first(device) -> bool:
+    """Compute capability 8.9 (RTX 40, Ada) or 10.x / 12.x (B200, RTX 50), where cuDNN attention measured 5-22% faster
+    per step. Ampere and Hopper are not measured."""
     try:
         dev = torch.device(device)
-        return dev.type == "cuda" and torch.cuda.is_available() and torch.cuda.get_device_capability(dev)[0] >= 10
+        if dev.type != "cuda" or not torch.cuda.is_available():
+            return False
+        return tuple(torch.cuda.get_device_capability(dev)) == (8, 9) or torch.cuda.get_device_capability(dev)[0] >= 10
     except (RuntimeError, ValueError, AssertionError):
         return False
 
 
 def resolve(name: str, device="cuda") -> str:
-    """The backend `name` stands for: "auto" is cuDNN on a Blackwell training GPU, else PyTorch's own pick."""
+    """The backend `name` stands for: "auto" is cuDNN on an Ada or Blackwell training GPU, else PyTorch's pick."""
     key = (name or "auto").strip().lower()
     if key not in BACKENDS:
         raise ValueError(f"attention_backend {name!r}: choose one of {', '.join(BACKENDS)}")
     if key == "auto":
-        return "cudnn" if is_blackwell(device) else "torch"
+        return "cudnn" if cudnn_first(device) else "torch"
     return key
 
 

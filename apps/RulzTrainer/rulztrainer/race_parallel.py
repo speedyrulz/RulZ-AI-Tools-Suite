@@ -146,6 +146,7 @@ class RaceParallelMixin:
                     self._race_start_variant(v)
             for r in reps:
                 race_mod.swap_in(v, self.replicas[r][1])
+            race_mod.configure_backward(v.cfg, [self.replicas[r][0] for r in reps])
         self.rp_lanes = list(lanes)
 
     def _rp_park(self, v) -> None:

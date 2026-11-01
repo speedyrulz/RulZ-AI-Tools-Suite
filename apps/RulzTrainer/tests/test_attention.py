@@ -22,7 +22,7 @@ def _reset():
 def test_auto_is_cudnn_on_blackwell_only(monkeypatch):
     assert A.resolve("auto", "cpu") == "torch" and A.resolve("torch", "cpu") == "torch"
     assert A.resolve("cudnn", "cpu") == "cudnn" and A.resolve("AUTO ", "cpu") == "torch"
-    monkeypatch.setattr(A, "is_blackwell", lambda device: True)
+    monkeypatch.setattr(A, "cudnn_first", lambda device: True)
     assert A.resolve("auto", "cuda:1") == "cudnn" and A.resolve("flash", "cuda:1") == "flash"
     A.set_backend("auto", "cuda:1")
     assert A.backend_name() == "cudnn"
