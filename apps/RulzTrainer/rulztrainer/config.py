@@ -25,6 +25,37 @@ MODEL_PRESETS = {
 ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21", "flux3_klein", "minimax_h3")
 OPTIMIZERS = ("adamw", "adamw8bit", "adafactor", "automagic3", "automagic4", "keel")
 AUTOMAGIC = ("automagic3", "automagic4", "keel")  # self-tuning lr: no schedule, no LoRA+, no per-image lr
+KEEL_BAND_LOGIT_RANGE = 4.0  # Keel's noise bands span logit(sigma) in [-range, range] (sigma 0.018 to 0.982)
+
+
+def keel_band_edges(bands: int) -> list[float]:
+    """The sigma edges of Keel's noise bands: bands + 1 values from 0 to 1 (equal bands in logit sigma over
+    [-KEEL_BAND_LOGIT_RANGE, +range], the ends open)."""
+    r = KEEL_BAND_LOGIT_RANGE
+    inner = [1.0 / (1.0 + math.exp(-(-r + 2.0 * r * k / bands))) for k in range(1, bands)]
+    return [0.0] + inner + [1.0]
+
+
+def keel_band_weights(spec: str, bands: int) -> list[float] | None:
+    """keel_band_weights resolved to one multiplier per band: None (flat: "" or a single band), the identity hump
+    (0.5 + 0.8 exp(-((c + 0.7) / 1.5)^2) at each band's logit centre c: about 1.3 over sigma 0.12 to 0.5, 0.5 at the
+    ends), or the listed numbers. Raises ValueError on a bad spec."""
+    s = (spec or "").strip().lower()
+    if bands <= 1 or s in ("", "flat"):
+        return None
+    if s == "identity":
+        r = KEEL_BAND_LOGIT_RANGE
+        centres = [-r + 2.0 * r * (k + 0.5) / bands for k in range(bands)]
+        return [round(0.5 + 0.8 * math.exp(-((c + 0.7) / 1.5) ** 2), 3) for c in centres]
+    try:
+        vals = [float(x) for x in s.replace(";", ",").split(",") if x.strip()]
+    except ValueError:
+        raise ValueError(f"keel_band_weights must be empty, identity or {bands} comma-separated numbers, got {spec!r}")
+    if len(vals) != bands:
+        raise ValueError(f"keel_band_weights lists {len(vals)} numbers for keel_bands {bands}")
+    if any(not v > 0.0 for v in vals):
+        raise ValueError("keel_band_weights must all be above 0")
+    return vals
 # LoRA target groups each family trains when lora_targets is empty. Krea 2 adds the attention output gate and its
 # text-fusion stack, which Fizgig measured to be under-trained by the attention + feed-forward recipe (scaling a
 # finished LoRA's text-fusion blocks x3 lifted likeness 2-7 points on several Krea 2 LoRAs).
@@ -363,6 +394,12 @@ class TrainConfig:
     #                          Gram, lora_down by the up's), so neither factor takes the whole update
     keel_gauge_eps: float = 0.01  # keel: the preconditioner's floor as a fraction of the larger Gram's mean diagonal
     keel_cautious: bool = True  # keel: zero a preconditioned gradient element that points against the raw gradient
+    keel_pair_sigma: bool = True  # keel: one sigma per step for all of its micro-batches (and the DOP pass), so the
+    #                               step's gradient sits in one noise band
+    keel_bands: int = 8  # keel: noise bands over logit(sigma) in [-4, 4]; a step's gradient enters the second moment
+    #                      at the tensor's overall scale whatever its band, so the quiet bands are not drowned; 1 = off
+    keel_band_weights: str = ""  # keel: a multiplier on the step's update per band: "" = 1 everywhere, identity = a
+    #                              hump over the face bands (sigma 0.12 to 0.5), or keel_bands comma-separated numbers
     lr_scheduler: str = "constant"  # constant | cosine | linear
     warmup_steps: int = 50
     max_grad_norm: float = 1.0
@@ -796,6 +833,9 @@ class TrainConfig:
             raise ValueError("automagic_max_lr_change must be above 0")
         if self.keel_gauge_eps <= 0:
             raise ValueError("keel_gauge_eps must be above 0")
+        if not 1 <= self.keel_bands <= 64:
+            raise ValueError("keel_bands must be between 1 and 64")
+        keel_band_weights(self.keel_band_weights, self.keel_bands)  # raises on a bad spec
         if self.compile_model not in (True, False, "auto"):
             raise ValueError(f"compile_model must be true, false or auto, got {self.compile_model!r}")
         if self.race:

@@ -26,7 +26,7 @@ from . import profiling
 from . import race as race_mod
 from .ema import LoraEMA
 from . import quant as Q
-from .config import AUTOMAGIC, TrainConfig
+from .config import AUTOMAGIC, TrainConfig, keel_band_weights
 from .config import side_to_mp
 from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, describe_sides, dropout_text_path,
                       items_for_side, load_batch,
@@ -250,6 +250,24 @@ def sample_sigmas(cfg: TrainConfig, n: int, gen: torch.Generator, logit_shift: f
     return (s * 1000).round().clamp(1, 1000) / 1000
 
 
+def pairs_sigma(cfg: TrainConfig) -> bool:
+    """Whether a step's micro-batches share one sigma (Keel's keel_pair_sigma)."""
+    return cfg.optimizer.lower() == "keel" and bool(cfg.keel_pair_sigma)
+
+
+def draw_sigmas(cfg: TrainConfig, n: int, gen: torch.Generator, shift: float, tokens: int, arch,
+                step_sigma: torch.Tensor | None):
+    """A micro-batch's sigmas: sample_sigmas, or the step's one sigma repeated when pairs_sigma(cfg) (drawn with the
+    step's first micro-batch). Returns (sigma [n], the step's sigma to carry to the next micro-batch, or None)."""
+    if step_sigma is not None:
+        return step_sigma.expand(n).clone(), step_sigma
+    sigma = sample_sigmas(cfg, n, gen, shift, tokens=tokens, arch=arch)
+    if pairs_sigma(cfg):
+        step_sigma = sigma[:1].clone()
+        return step_sigma.expand(n).clone(), step_sigma
+    return sigma, None
+
+
 def loss_weight(cfg: TrainConfig, sigma: torch.Tensor) -> torch.Tensor:
     if cfg.loss_weighting == "none":
         return torch.ones_like(sigma)
@@ -291,8 +309,10 @@ def build_optimizer(cfg: TrainConfig, params, pairs=None):
             from .optimizers.keel import Keel
 
             return Keel(params, pairs=pairs, gauge=cfg.keel_gauge, gauge_eps=cfg.keel_gauge_eps,
-                        cautious=cfg.keel_cautious, sensitivity_quantile=cfg.automagic_sensitivity_quantile,
-                        vote=cfg.automagic_vote, max_vote=cfg.automagic_max_lr_change, **kw)
+                        cautious=cfg.keel_cautious, bands=cfg.keel_bands,
+                        band_weights=keel_band_weights(cfg.keel_band_weights, cfg.keel_bands),
+                        sensitivity_quantile=cfg.automagic_sensitivity_quantile, vote=cfg.automagic_vote,
+                        max_vote=cfg.automagic_max_lr_change, **kw)
         if name == "automagic4":
             from .optimizers.automagic4 import Automagic4
 
@@ -1144,6 +1164,7 @@ class Trainer(RaceParallelMixin):
                 retry_jobs = None
             else:
                 per_rep: list[list] = [[] for _ in self.replicas]
+                step_sigma = None  # keel_pair_sigma: the step's one sigma once drawn
                 for r in job_order(counts):  # every batch and its noise drawn in the main thread (shared RNG), in
                     batch = next(self.batch_iter)  # lockstep order: copy 0, copy 1, copy 0, ...
                     step_images += len(batch)
@@ -1151,11 +1172,18 @@ class Trainer(RaceParallelMixin):
                     tok = latents.shape[2] * latents.shape[3]
                     shift = self.ts_logit_shift + self._clean_offset(
                         cfg, step, tok, self.batcher, cfg.batch_size * cfg.gradient_accumulation * n_dev)
-                    sigma = sample_sigmas(cfg, latents.shape[0], gen, shift, tokens=tok, arch=self.arch)
+                    sigma, step_sigma = draw_sigmas(cfg, latents.shape[0], gen, shift, tok, self.arch, step_sigma)
                     noise = torch.randn(latents.shape, generator=gen)
-                    dop = self._dop_job(cfg, batch, latents, step + 1, gen, shift, tok)  # LoRA Isolation
+                    dop = self._dop_job(cfg, batch, latents, step + 1, gen, shift, tok, step_sigma)  # LoRA Isolation
                     per_rep[r].append((self.replicas[r], batch, latents, embeds, mask, sigma, noise, regions, step + 1,
                                        n_total, dop))
+            observe = getattr(optimizer, "observe", None)
+            if observe is not None:  # Keel: the noise level of every micro-batch of the step (its bands)
+                for jobs in per_rep:
+                    for job in jobs:
+                        observe(job[5])
+                        if job[10] is not None:
+                            observe(job[10][3])
             try:
                 entries = list(enumerate(per_rep))
                 if self.dp is not None:
@@ -2528,9 +2556,10 @@ class Trainer(RaceParallelMixin):
                  n_pairs, cfg.isolation_pair_weight, n_dop, cfg.dop_every, cfg.dop_weight)
         return items
 
-    def _dop_job(self, cfg, batch, latents, cur_step: int, gen, shift: float, tokens: int):
+    def _dop_job(self, cfg, batch, latents, cur_step: int, gen, shift: float, tokens: int, step_sigma=None):
         """The step's trigger-free pass for a batch, drawn in the main thread with the run's random streams: (the
-        batch rows with a DOP caption, their text features and mask, fresh sigmas and noise), or None."""
+        batch rows with a DOP caption, their text features and mask, fresh sigmas and noise), or None. `step_sigma`:
+        the step's shared sigma (keel_pair_sigma), used instead of fresh ones."""
         if not cfg.isolation or self.isolation is None or cfg.dop_weight <= 0 or cur_step % max(1, cfg.dop_every):
             return None
         sel = [i for i, it in enumerate(batch) if it.dop_text_path is not None]
@@ -2538,7 +2567,8 @@ class Trainer(RaceParallelMixin):
             return None
         from safetensors.torch import load_file
         emb, mask = self.arch.pad_embeds([load_file(str(batch[i].dop_text_path))["embeds"] for i in sel])
-        sigma = sample_sigmas(cfg, len(sel), gen, shift, tokens=tokens, arch=self.arch)
+        sigma = (step_sigma.expand(len(sel)).clone() if step_sigma is not None
+                 else sample_sigmas(cfg, len(sel), gen, shift, tokens=tokens, arch=self.arch))
         noise = torch.randn((len(sel), *latents.shape[1:]), generator=gen)
         return sel, emb, mask, sigma, noise
 

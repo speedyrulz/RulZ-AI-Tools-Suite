@@ -192,11 +192,12 @@ class RaceParallelMixin:
         """One optimizer step for every lane at the same moment: the batches of each, one model copy per GPU in
         threads, then each configuration's own optimizer step."""
         from .dataset import load_batch
-        from .trainer import current_lr, free_cuda, sample_sigmas
+        from .trainer import current_lr, draw_sigmas, free_cuda
 
         t_step = time.perf_counter()
         while True:
             entries, owners, step_images = [], [], {}
+            sigmas: dict[int, list] = {}  # lane -> its micro-batches' sigmas (Keel's observe)
             for v, reps in lanes:
                 st, cfg = v.state, v.cfg
                 counts = self._rp_counts(reps)
@@ -207,6 +208,7 @@ class RaceParallelMixin:
                         batch, step, _cfg, _b, _cfg.batch_size * _cfg.gradient_accumulation))
                 ctx = SimpleNamespace(cfg=cfg, loss_watch=st.get("loss_watch"), look=look)
                 per_rep: list[list] = [[] for _ in reps]
+                step_sigma = None  # keel_pair_sigma: the lane's one sigma this step
                 for k in job_order(counts):
                     batch = next(st["batch_iter"])
                     step_images[v.idx] = step_images.get(v.idx, 0) + len(batch)
@@ -215,7 +217,8 @@ class RaceParallelMixin:
                     shift = st["ts_logit_shift"] + (self._clean_offset(  # clean_share: the epoch's share
                         cfg, st["step"], tok, st.get("batcher"), cfg.batch_size * cfg.gradient_accumulation)
                         if cfg.clean_share else 0.0)
-                    sigma = sample_sigmas(cfg, latents.shape[0], st["gen"], shift, tokens=tok, arch=self.arch)
+                    sigma, step_sigma = draw_sigmas(cfg, latents.shape[0], st["gen"], shift, tok, self.arch, step_sigma)
+                    sigmas.setdefault(v.idx, []).append(sigma)
                     noise = torch.randn(latents.shape, generator=st["gen"])
                     per_rep[k].append((self.replicas[reps[k]], batch, latents, embeds, mask, sigma, noise, regions,
                                        st["step"] + 1, n_total, ctx))
@@ -247,6 +250,10 @@ class RaceParallelMixin:
             race_mod.collect_grads(v, [self.replicas[r][1] for r in reps])
             if cfg.max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(st["params"], cfg.max_grad_norm)
+            observe = getattr(st["optimizer"], "observe", None)
+            if observe is not None:  # Keel: the step's noise levels (its bands)
+                for s in sigmas.get(v.idx, ()):
+                    observe(s)
             st["optimizer"].step()
             st["optimizer"].zero_grad(set_to_none=True)
             if st["ema"] is not None:

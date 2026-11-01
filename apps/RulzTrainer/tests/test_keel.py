@@ -1,6 +1,7 @@
 """Keel (rulztrainer.optimizers.keel): Automagic 4 exactly with its switches off, the gauge preconditioner's
-invariance to a LoRA pair's reparameterisation, the cautious mask, training and state round trips across the
-Automagic kinds, and the config / race / WebUI wiring."""
+invariance to a LoRA pair's reparameterisation, the cautious mask, the noise bands (observe, the per-band scale,
+the band weight through Automagic 4's update gain, paired sigma in the trainer), training and state round trips
+across the Automagic kinds, and the config / race / WebUI wiring."""
 import sys
 from pathlib import Path
 
@@ -10,11 +11,12 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from rulztrainer import lora as lora_mod  # noqa: E402
-from rulztrainer.config import AUTOMAGIC, OPTIMIZERS, TrainConfig  # noqa: E402
+from rulztrainer.config import AUTOMAGIC, OPTIMIZERS, TrainConfig, keel_band_edges, keel_band_weights  # noqa: E402
 from rulztrainer.moss.model import MOSSImageTransformer  # noqa: E402
+from rulztrainer.optimizers import keel as keel_mod  # noqa: E402
 from rulztrainer.optimizers.automagic4 import Automagic4  # noqa: E402
-from rulztrainer.optimizers.keel import Keel, gauge_precondition  # noqa: E402
-from rulztrainer.trainer import build_optimizer, build_scheduler, current_lr  # noqa: E402
+from rulztrainer.optimizers.keel import Keel, band_of, gauge_precondition  # noqa: E402
+from rulztrainer.trainer import build_optimizer, build_scheduler, current_lr, draw_sigmas, pairs_sigma  # noqa: E402
 
 TINY = dict(dim=64, ffn_dim=128, num_heads=2, num_layers=2, text_dim=32, freq_dim=16, latent_channels=128)
 TARGETS = ["q", "k", "v", "o", "ffn_up_gate", "ffn_down"]
@@ -28,12 +30,14 @@ def _model(seed: int = 0):
     return model, injected, list(lora_mod.lora_parameters(injected))
 
 
-def _step(model, params, opt, seed: int):
+def _step(model, params, opt, seed: int, sigma: float | None = None):
     g = torch.Generator().manual_seed(seed)
     x = torch.randn(1, 128, 4, 4, generator=g).to(torch.bfloat16)
     c = torch.randn(1, 5, 32, generator=g).to(torch.bfloat16)
     loss = model(x, torch.tensor([300.0]), c).float().pow(2).mean()
     opt.zero_grad(set_to_none=True)
+    if sigma is not None:  # as the trainer does: the micro-batch's noise level before its backward
+        opt.observe(torch.tensor([sigma]))
     loss.backward()
     torch.nn.utils.clip_grad_norm_(params, 1.0)
     opt.step()
@@ -47,33 +51,40 @@ def _cfg(**kw):
 def test_keel_with_its_switches_off_is_automagic4_bitwise():
     ma, inja, pa = _model()
     mb, injb, pb = _model()
+    mc, injc, pc = _model()
     assert all(torch.equal(a, b) for a, b in zip(pa, pb))
     oa = build_optimizer(_cfg(optimizer="automagic4"), pa)
-    ob = build_optimizer(_cfg(keel_gauge=False), pb, pairs=lora_mod.lora_pairs(injb))
+    ob = build_optimizer(_cfg(keel_gauge=False), pb, pairs=lora_mod.lora_pairs(injb))  # bands on, never observed
+    oc = build_optimizer(_cfg(keel_gauge=False, keel_bands=1), pc, pairs=lora_mod.lora_pairs(injc))
     assert isinstance(ob, Keel) and isinstance(oa, Automagic4) and not isinstance(oa, Keel)
     for i in range(6):
-        assert _step(ma, pa, oa, i) == _step(mb, pb, ob, i)
-    assert all(torch.equal(a, b) for a, b in zip(pa, pb))
-    assert current_lr(oa, None) == current_lr(ob, None)
-    assert ob.cautious_share() is None  # nothing preconditioned, nothing masked
+        la = _step(ma, pa, oa, i)
+        assert la == _step(mb, pb, ob, i) == _step(mc, pc, oc, i, sigma=0.3)  # a single band observes nothing
+    assert all(torch.equal(a, b) and torch.equal(a, c) for a, b, c in zip(pa, pb, pc))
+    assert current_lr(oa, None) == current_lr(ob, None) == current_lr(oc, None)
+    assert ob.cautious_share() is None and ob.band_stats() is None and oc.band_stats() is None
 
 
-def test_keel_gauge_changes_the_step_and_keeps_the_rails():
+def test_keel_gauge_and_bands_change_the_step_and_keep_the_rails():
     ma, inja, pa = _model()
     mb, injb, pb = _model()
     oa = build_optimizer(_cfg(optimizer="automagic4"), pa)
-    cfg = _cfg()
+    cfg = _cfg(keel_band_weights="identity")
     ob = build_optimizer(cfg, pb, pairs=lora_mod.lora_pairs(injb))
-    assert len(ob.pairs) == len(injb)
-    for i in range(6):
+    assert len(ob.pairs) == len(injb) and ob.bands == 8 and len(ob.band_weights) == 8
+    for i in range(12):
         _step(ma, pa, oa, i)
-        _step(mb, pb, ob, i)
+        _step(mb, pb, ob, i, sigma=(0.3 if i % 2 else 0.9))  # the trainer's bucketed path, two bands
     assert any(not torch.equal(a, b) for a, b in zip(pa, pb))
     assert all(torch.isfinite(p).all() for p in pb)
     lr = current_lr(ob, None)
     assert cfg.automagic_min_lr <= lr <= cfg.automagic_max_lr
     share = ob.cautious_share()
     assert share is not None and 0.0 < share <= 1.0
+    rel, counts = ob.band_stats()
+    assert len(rel) == len(counts) == 8 and counts[band_of(0.3, 8)] == 6 and counts[band_of(0.9, 8)] == 6
+    assert all(r > 0 for b, r in enumerate(rel) if counts[b]) and all(r == 0 for b, r in enumerate(rel) if not counts[b])
+    assert ob.update_gain is None  # cleared after every step
 
 
 def _linear_grads(G, A, B):
@@ -135,7 +146,7 @@ def test_cautious_mask_drops_elements_that_point_against_the_gradient():
     assert opt2.cautious_share() is None
 
 
-def test_keel_pairs_are_checked():
+def test_keel_pairs_and_bands_are_checked():
     down = torch.nn.Parameter(torch.randn(2, 3))
     up = torch.nn.Parameter(torch.randn(4, 2))
     stranger = torch.nn.Parameter(torch.randn(4, 2))
@@ -145,11 +156,153 @@ def test_keel_pairs_are_checked():
         Keel([down, up], pairs=[(up, down)], lr=1e-4, fused=False)
     with pytest.raises(ValueError, match="gauge_eps"):
         Keel([down, up], pairs=[(down, up)], lr=1e-4, fused=False, gauge_eps=0.0)
+    with pytest.raises(ValueError, match="bands"):
+        Keel([down, up], lr=1e-4, fused=False, bands=0)
+    with pytest.raises(ValueError, match="band_weights"):
+        Keel([down, up], lr=1e-4, fused=False, bands=4, band_weights=[1.0, 2.0])
     # no pairs (a LoKr / OFT adapter, a fine-tune): the step is Automagic 4's
     opt = Keel([down, up], lr=1e-4, fused=False)
     down.grad, up.grad = torch.randn(2, 3), torch.randn(4, 2)
     opt.step()
     assert opt.cautious_share() is None
+
+
+# ---------------------------------------------------------------- the noise bands
+
+
+def test_band_grid_and_weights():
+    edges = keel_band_edges(8)
+    assert len(edges) == 9 and edges[0] == 0.0 and edges[-1] == 1.0 and abs(edges[4] - 0.5) < 1e-9
+    assert all(a < b for a, b in zip(edges, edges[1:]))
+    for b in range(8):  # band_of agrees with the edges
+        mid = (edges[b] + edges[b + 1]) / 2 if 0 < b < 7 else (edges[1] / 2 if b == 0 else (edges[7] + 1) / 2)
+        assert band_of(mid, 8) == b
+        assert band_of(edges[b + 1] - 1e-6, 8) == b
+    assert band_of(0.0, 8) == 0 and band_of(1.0, 8) == 7 and band_of(0.5, 2) == 1 and band_of(0.49, 2) == 0
+    assert keel_band_weights("", 8) is None and keel_band_weights("flat", 8) is None
+    assert keel_band_weights("identity", 1) is None and keel_band_weights("1,2", 1) is None
+    hump = keel_band_weights("identity", 8)
+    assert len(hump) == 8 and max(hump) == hump[3] > hump[2] > 1.0 > hump[4] and hump[0] < 0.6 and hump[7] == 0.5
+    assert keel_band_weights("1, 2,3,4", 4) == [1.0, 2.0, 3.0, 4.0]
+    for bad in ("1,2,3", "a,b,c,d", "1,2,3,0"):
+        with pytest.raises(ValueError, match="keel_band_weights"):
+            keel_band_weights(bad, 4)
+    with pytest.raises(ValueError, match="keel_bands"):
+        _cfg(keel_bands=0).validate()
+    with pytest.raises(ValueError, match="keel_band_weights"):
+        _cfg(keel_band_weights="1,2").validate()
+    _cfg(keel_band_weights="identity").validate()
+
+
+def test_bands_equalise_two_noise_levels_of_different_scale():
+    torch.manual_seed(3)
+    w2 = torch.nn.Parameter(torch.randn(6, 5))
+    w1 = torch.nn.Parameter(torch.randn(7))
+    base = [torch.randn(6, 5), torch.randn(7)]
+    opt = Keel([w2, w1], lr=1e-4, fused=False, bands=8, band_weights=[1, 1, 1, 2.0, 1, 1, 1, 0.5], gauge=False)
+    quiet, loud, faint = 0.3, 0.9, 0.05  # bands 3, 6 and 1: gradients at 1x, 5x and 0.01x
+    scales = {quiet: 1.0, loud: 5.0, faint: 0.01}
+    assert band_of(quiet, 8) == 3 and band_of(loud, 8) == 6 and band_of(faint, 8) == 1
+
+    def prime(scale):
+        for p, b in zip((w2, w1), base):
+            p.grad = b * scale
+
+    for i in range(3 * keel_mod.BAND_MIN_OBS):
+        sigma = (quiet, loud, faint)[i % 3]
+        opt.zero_grad()
+        opt.observe(torch.tensor([sigma]))
+        prime(scales[sigma])
+        opt.step()
+    st = opt.state[w2]
+    assert st["band_ms"].shape == (9,) and st["band_n"][3] == st["band_n"][6] == st["band_n"][1] == keel_mod.BAND_MIN_OBS
+    assert st["band_n"][8] == 3 * keel_mod.BAND_MIN_OBS and st["band_n"][0] == 0
+    assert float(st["band_ms"][6] / st["band_ms"][3]) == pytest.approx(25.0, rel=1e-3)
+    assert float(st["band_ms"][3] / st["band_ms"][1]) == pytest.approx(1e4, rel=1e-3)
+    rel, counts = opt.band_stats()
+    assert counts[1] == counts[3] == counts[6] == keel_mod.BAND_MIN_OBS and counts[0] == 0
+    assert rel[6] / rel[3] == pytest.approx(5.0, rel=1e-3) and rel[0] == 0.0
+    # the bands are trusted now: a step enters at the tensor's overall RMS (from the statistics before the step),
+    # the lift capped at GAIN_MAX, and the band weight becomes the update gain
+    for sigma, weight in ((loud, 1.0), (quiet, 2.0), (faint, 1.0)):
+        opt.zero_grad()
+        opt.observe(torch.tensor([sigma]))
+        prime(scales[sigma])
+        before = {p: opt.state[p]["band_ms"].clone() for p in (w2, w1)}
+        raw = {p: p.grad.clone() for p in (w2, w1)}
+        opt._normalise_bands()
+        for p in (w2, w1):
+            b = band_of(sigma, 8)
+            expected = min(float((before[p][8] / before[p][b]).sqrt()), keel_mod.GAIN_MAX)
+            assert float((p.grad / raw[p]).mean()) == pytest.approx(expected, rel=1e-4)
+            if sigma == faint:
+                assert expected == keel_mod.GAIN_MAX
+            else:
+                assert float(p.grad.square().mean().sqrt()) == pytest.approx(float(before[p][8].sqrt()), rel=1e-3)
+        assert opt.update_gain == (weight if weight != 1.0 else None)
+    # a step whose micro-batches span two bands is left alone; its band weight is the mean
+    opt.zero_grad()
+    opt.observe(torch.tensor([quiet, loud]))
+    prime(1.0)
+    opt._normalise_bands()
+    assert torch.equal(w2.grad, base[0]) and opt.update_gain == pytest.approx(1.5) and opt._mixed_warned
+    # a band below BAND_MIN_OBS observations is not trusted: scale 1
+    opt.zero_grad()
+    opt.observe(torch.tensor([0.75]))
+    prime(1.0)
+    opt._normalise_bands()
+    assert torch.equal(w2.grad, base[0]) and float(opt.state[w2]["band_n"][5]) == 1.0
+    opt.update_gain = None
+
+
+def test_update_gain_scales_the_step_and_not_the_decay():
+    torch.manual_seed(4)
+    p0 = torch.randn(8, 6)
+    g = torch.randn(8, 6)
+    runs = {}
+    for gain in (None, 0.5):
+        p = torch.nn.Parameter(p0.clone())
+        opt = Automagic4([p], lr=1e-3, fused=False, weight_decay=0.0)
+        for _ in range(2):  # the first step only measures
+            p.grad = g.clone()
+            opt.update_gain = gain
+            opt.step()
+        runs[gain] = p0 - p.detach()
+    # (the weights are O(1) and the steps O(1e-3): the deltas carry fp32 rounding of about 1e-7)
+    assert torch.allclose(runs[0.5], runs[None] * 0.5, rtol=0.03, atol=2e-7) and runs[None].abs().max() > 5e-4
+
+
+def test_bands_with_a_low_precision_parameter_use_the_accumulated_gradient():
+    torch.manual_seed(5)
+    p = torch.nn.Parameter(torch.randn(16, 8).to(torch.bfloat16))
+    opt = Keel([p], lr=1e-3, fused=False, bands=4)
+    x = torch.randn(8, 3).to(torch.bfloat16)
+    before = p.detach().clone()
+    for i in range(10):
+        opt.zero_grad()
+        opt.observe(0.4)
+        (p @ x).float().square().mean().backward()
+        assert p.grad is None and getattr(p, "_accum_grad", None) is not None  # Automagic 3's accumulation hook
+        opt.step()
+        assert getattr(p, "_accum_grad", None) is None
+    assert not torch.equal(before, p.detach()) and torch.isfinite(p).all()
+    assert opt.state[p]["band_n"][band_of(0.4, 4)] == 10 and opt.state[p]["band_ms"].dtype == torch.float32
+
+
+def test_draw_sigmas_pairs_the_steps_micro_batches():
+    gen = torch.Generator().manual_seed(0)
+    cfg = _cfg()
+    assert pairs_sigma(cfg) and not pairs_sigma(_cfg(keel_pair_sigma=False)) \
+        and not pairs_sigma(_cfg(optimizer="automagic4"))
+    s1, carry = draw_sigmas(cfg, 1, gen, 0.0, 16, None, None)
+    s2, carry2 = draw_sigmas(cfg, 3, gen, 0.0, 16, None, carry)
+    s3, _ = draw_sigmas(cfg, 2, gen, 0.0, 16, None, carry2)
+    assert carry is not None and carry2 is carry and s1.shape == (1,) and s2.shape == (3,) and s3.shape == (2,)
+    assert torch.equal(s2, carry.expand(3)) and torch.equal(s3, carry.expand(2)) and float(s1[0]) == float(carry[0])
+    unpaired = _cfg(keel_pair_sigma=False)
+    u1, c1 = draw_sigmas(unpaired, 2, gen, 0.0, 16, None, None)
+    u2, c2 = draw_sigmas(unpaired, 2, gen, 0.0, 16, None, c1)
+    assert c1 is None and c2 is None and u1.shape == (2,) and not torch.equal(u1, u2)
 
 
 def test_keel_trains_round_trips_and_converts_with_automagic4(tmp_path):
@@ -158,28 +311,37 @@ def test_keel_trains_round_trips_and_converts_with_automagic4(tmp_path):
     opt = build_optimizer(cfg, params, pairs=lora_mod.lora_pairs(injected))
     sched = build_scheduler(cfg, opt)
     before = [p.detach().clone() for p in params]
-    for i in range(8):
-        _step(model, params, opt, i)
+    for i in range(10):
+        _step(model, params, opt, i, sigma=0.3)
         sched.step()
     assert any(not torch.equal(a, b) for a, b in zip(before, params))
     lr = current_lr(opt, sched)
     assert abs(lr - 1e-4) > 1e-7  # the vote moved it
+    st0 = opt.state[params[0]]
+    assert st0["band_n"][band_of(0.3, 8)] == 10 and st0["band_ms"].dtype == torch.float32
     sd = opt.state_dict()
     torch.save(sd, tmp_path / "keel.pt")
     saved = torch.load(tmp_path / "keel.pt", weights_only=False)
     opt2 = build_optimizer(cfg, params, pairs=lora_mod.lora_pairs(injected))
     opt2.load_state_dict(saved)
     assert abs(current_lr(opt2, sched) - lr) < 1e-6 * lr
-    _step(model, params, opt2, 9)
-    # a Keel state under Automagic 4 and an Automagic 4 state under Keel (the same state); loaded again from disk,
-    # as a resume does (torch hands a loaded fp32 tensor to the optimizer as it is, and opt2's step moved it)
+    st2 = opt2.state[params[0]]
+    assert torch.equal(st2["band_ms"], st0["band_ms"]) and torch.equal(st2["band_n"], st0["band_n"])  # exact fp32
+    _step(model, params, opt2, 11, sigma=0.3)
+    assert opt2.state[params[0]]["band_n"][band_of(0.3, 8)] == 11
+    # a changed band count starts the statistics fresh; a Keel state under Automagic 4 and back (the same state)
+    opt4 = build_optimizer(_cfg(keel_bands=4), params, pairs=lora_mod.lora_pairs(injected))
+    opt4.load_state_dict(torch.load(tmp_path / "keel.pt", weights_only=False))
+    assert "band_ms" not in opt4.state[params[0]]
+    _step(model, params, opt4, 12, sigma=0.3)
+    assert opt4.state[params[0]]["band_ms"].shape == (5,)
     opt3 = build_optimizer(_cfg(optimizer="automagic4"), params)
     opt3.load_state_dict(torch.load(tmp_path / "keel.pt", weights_only=False))
     assert abs(current_lr(opt3, sched) - lr) < 1e-6 * lr
-    _step(model, params, opt3, 10)
-    opt4 = build_optimizer(cfg, params, pairs=lora_mod.lora_pairs(injected))
-    opt4.load_state_dict(opt3.state_dict())
-    _step(model, params, opt4, 11)
+    _step(model, params, opt3, 13)
+    opt5 = build_optimizer(cfg, params, pairs=lora_mod.lora_pairs(injected))
+    opt5.load_state_dict(opt3.state_dict())
+    _step(model, params, opt5, 14, sigma=0.3)
     assert all(torch.isfinite(p).all() for p in params)
 
 
@@ -204,13 +366,15 @@ def test_keel_config_race_and_wizard_wiring(tmp_path):
     from rulztrainer import race as R
     from rulztrainer.finetune import BYTES_PER_PARAM
 
-    assert {"keel_gauge", "keel_gauge_eps", "keel_cautious"} <= set(R.RACE_KEYS["LR & optimizer"])
+    keys = {"keel_gauge", "keel_gauge_eps", "keel_cautious", "keel_pair_sigma", "keel_bands", "keel_band_weights"}
+    assert keys <= set(R.RACE_KEYS["LR & optimizer"])
     TrainConfig(race=True, probe_every=10, face_refs=["ref.png"], steps=40, race_configs=[
-        {"name": "a"}, {"name": "b", "optimizer": "keel", "keel_gauge_eps": 0.1, "keel_cautious": False}]).validate()
+        {"name": "a"}, {"name": "b", "optimizer": "keel", "keel_gauge_eps": 0.1, "keel_cautious": False},
+        {"name": "c", "optimizer": "keel", "keel_bands": 1, "keel_pair_sigma": False, "keel_band_weights": ""}]).validate()
     assert BYTES_PER_PARAM["keel"] == BYTES_PER_PARAM["automagic4"]
     import webui
 
-    assert {"keel_gauge", "keel_gauge_eps", "keel_cautious"} <= set(webui.RACE_LABELS)
+    assert keys <= set(webui.RACE_LABELS)
     cfg = TrainConfig.from_dict({**_cfg().to_dict(), "dataset_dir": str(tmp_path), "trigger_word": "x"})
     rec = webui.wizard_recommendations(cfg, "character", [], None)
     assert "learning_rate" not in rec  # Keel sets its own rate, like Automagic
