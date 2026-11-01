@@ -15,6 +15,8 @@ A simple diffusion-model LoRA trainer with a WebUI. Supported models:
 - **Krea 2** (12B): train on Raw, use on Turbo ([details](#krea-2-training-on-raw-using-the-lora-on-turbo)).
 - **Qwen-Image 2.1** (7B): text-to-image LoRAs on one 16 GB card, with Fizgig's training adapter
   ([details](#qwen-image-21)).
+- **Ideogram 4** (9.3B): LoRAs on one 16 GB card from the fp8 release, structured JSON captions or wrapped plain
+  ones; non-commercial license ([details](#ideogram-4)).
 
 | Dark | Light |
 | --- | --- |
@@ -325,6 +327,7 @@ WebUI's *Download now* fetches them ahead of time). `model_file_quant` and `text
 | Krea 2 Raw / Turbo | [Comfy-Org/Krea-2](https://huggingface.co/Comfy-Org/Krea-2) | int8_convrot 13.5 GB, fp8_scaled 13.1 GB, bf16 26.3 GB | Qwen3-VL-4B int8_convrot 4.9 GB, fp8_scaled 5.2 GB, bf16 8.9 GB | `qwen_image_vae` |
 | FIBO 2.0 dev / Edit Turbo | [Comfy-Org/Fibo-2.0](https://huggingface.co/Comfy-Org/Fibo-2.0) | int8_convrot 8.4 GB, bf16 16.5 GB | Qwen3-VL-4B, the same files as Krea 2's | `flux2-vae` |
 | Qwen-Image 2.1 / Turbo | [Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1) | int8_convrot 7.3 GB, bf16 14.2 GB | Qwen3-VL-8B int8_convrot 9.4 GB, bf16 17.5 GB | `qwen_image_2.1_vae_bf16` |
+| Ideogram 4 | [Comfy-Org/Ideogram-4](https://huggingface.co/Comfy-Org/Ideogram-4) | int8_convrot 9.6 GB, fp8_scaled 9.3 GB, nvfp4_mixed 5.5 GB (no bf16 release) | Qwen3-VL-8B: int8_convrot 9.4 GB and bf16 17.5 GB from Comfy-Org/Qwen-Image-2.1 (the same model), fp8_scaled 10.6 GB and nvfp4 6.3 GB from Comfy-Org/Ideogram-4 | `flux2-vae` |
 
 To use files you already have, set `transformer_file`, `text_encoder_file` and `vae_file` (the WebUI's optional file
 fields): only the ones left empty are downloaded. Fused-qkv ("repacked") files are split back automatically. The
@@ -1352,6 +1355,7 @@ probe images, never during training steps.
 | Krea 2 | `krea2_turbo_lora_rank_64_bf16` ([Comfy-Org/Krea-2](https://huggingface.co/Comfy-Org/Krea-2)) | 8 | 1 | from the image size |
 | FIBO 2.0 | `fibo_2.0_turbo_lora_avg_rank_270_bf16` ([Comfy-Org/Fibo-2.0](https://huggingface.co/Comfy-Org/Fibo-2.0)): Edit Turbo as a LoRA on dev | 4 | 1 | from the image size |
 | Qwen-Image 2.1 | `qwen_image_2.1_turbo_lora_avg_rank_178_bf16` ([Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1)), extracted from Qwen-Image-2.1-Turbo | 8 | 1 | the Turbo checkpoint's own sigmas |
+| Ideogram 4 | `ideogram_4_turbotime_v1` ([ostris/ideogram_4_turbotime_lora](https://huggingface.co/ostris/ideogram_4_turbotime_lora), community, rank 128, 847 MB): few steps, no CFG and no unconditional model | 8 | 1 | logit-normal, mu 0, std 1.75 (ai-toolkit's sampler, its samples') |
 
 MOSS-Image renders 12 steps rather than the card's 8 because Fizgig found 12 much better; Fizgig also found that
 its turbo LoRA can understate likeness, so judge a run's likeness on full-quality samples (`turbo_lora: ""`, 20 steps,
@@ -1639,6 +1643,89 @@ Verified against diffusers: `tests/test_qwen21.py` checks the port against `Qwen
 weights, a padded batch against each sample alone), ComfyUI's fused single-file layout, the schedules against
 `FlowMatchEulerDiscreteScheduler`, an exported LoRA merged into diffusers' weights, the Turbo LoRA's fused feed-forward
 split onto both halves, and the training adapter (on while training, off while sampling, not saved).
+
+## Ideogram 4
+
+RulzTrainer trains LoRAs for [Ideogram 4](https://github.com/ideogram-oss/ideogram4), Ideogram's 9.3B flow-matching
+DiT: 34 single-stream blocks over one text + image sequence (width 4608, 18 heads of 256, SwiGLU 12288, a 512-wide
+AdaLN, q/k RMSNorm, 3-axis interleaved MRoPE), conditioned on 13 layers of Qwen3-VL-8B-Instruct side by side
+(53,248 features per token) and decoding through the Flux2 VAE. Pick **Ideogram-4** as the model.
+
+- **Files.** There is no bf16 release: Ideogram publishes fp8 weights (per-row scales) and nf4. By default the model
+  comes as Comfy-Org's single files ([Comfy-Org/Ideogram-4](https://huggingface.co/Comfy-Org/Ideogram-4)): the
+  diffusion model in int8 ConvRot (9.6 GB; fp8_scaled 9.3 GB and nvfp4_mixed 5.5 GB are the other formats), its Flux2
+  VAE (0.34 GB) and the Qwen3-VL-8B text encoder from [Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1)
+  (int8 ConvRot 9.4 GB): Ideogram 4 uses the same Qwen3-VL-8B (identical norms and embeddings, the projections within
+  the fp8 rounding) and the same tokenizer. Measured on 16 rows per layer against the release's fp8: the int8_convrot
+  file is within 0.9% (as the trainer's own int8 of the release), fp8_scaled 3.7-3.9% on the block layers and 19% on
+  `input_proj` (its per-tensor scale of 1 leaves the small weights in fp8's subnormal range): train from int8_convrot.
+  The Hugging Face source (`model_source: hf`) reads [ideogram-ai/ideogram-4-fp8](https://huggingface.co/ideogram-ai/ideogram-4-fp8)
+  (gated: accept the agreement and `hf auth login`) or its ungated mirror
+  [unsloth/ideogram-4-fp8](https://huggingface.co/unsloth/ideogram-4-fp8): 18.2 GB of it (transformer 9.29 GB, text
+  encoder 8.78 GB, VAE 0.17 GB), not the unconditional model or the mirror's second copy of the text encoder. The fp8
+  weights are dequantized on load (about 19 GB of RAM while loading, an estimate: 2 bytes per weight) and quantized
+  again for the GPU; `transformer_quant: auto` gives bf16 (about 18.6 GB) on 32 GB cards, int8 (9.6 GB) on 16 GB ones
+  and nvfp4 (5.5 GB) below, estimates from the file sizes, not measured runs. The nf4 repos (diffusers' attention
+  names, bitsandbytes nf4) load too, at nf4's precision (about 10% per weight).
+- **The unconditional model.** Ideogram's pipelines guide with a second transformer, `unconditional_transformer`: the
+  same architecture and size (9.29 GB), its own weights (they differ from the conditional model's by about 0.1-8%
+  per tensor, a separately trained model, not a copy), run on the image tokens alone with no text. LoRAs train on the
+  conditional model only; the unconditional one is not downloaded.
+- **Captions.** Ideogram 4 was trained on structured JSON captions only (the schema is in Ideogram's
+  [prompting guide](https://github.com/ideogram-oss/ideogram4/blob/main/docs/prompting.md); plain prompts "will not
+  work" there and are rewritten by an LLM first). A same-name `.json` caption is used as it is (compacted, key order
+  kept), and what Ideogram's caption verifier would flag is logged; a plain `.txt` caption is wrapped into the smallest
+  caption the schema allows, `{"high_level_description": <caption>, "compositional_deconstruction": {"background": "",
+  "elements": []}}`. The trigger word goes where the subject is described: in front of the first object element's
+  `desc`, or as an object element of its own. A template around a JSON caption (the crop augmentation's "close-up
+  portrait photo of {caption}") goes into its `high_level_description`. Caption dropout trains on the empty caption
+  (the same JSON, empty). The cache keeps 104 KiB per token (13 layers x 4096 bf16): 4.4 MB for a short wrapped
+  caption, 17-110 MB for JSON captions of 165-1077 tokens like the guide's examples; set `max_token_length: 2048`
+  (Ideogram's limit) for long ones.
+- **Text features** follow `Ideogram4Pipeline.encode_prompt`: the caption in Qwen3-VL's user turn, the outputs of
+  decoder layers 0, 3, ..., 33 and 35 stacked per token with the layer index fastest. The empty prompt has no tokens
+  at all: the pipeline's image-only unconditional branch.
+- **Latents** are the Flux2 VAE's, cut in 2x2 patches in Ideogram's (patch row, patch column, channel) order and
+  normalized with Ideogram's own per-channel shift and scale (its `latent_norm.py`, what its pipeline and ai-toolkit
+  use), not the VAE's batch-norm statistics of MOSS-Image and FIBO 2.0 (up to 0.4 apart in shift): they are cached
+  under their own names (`_ideo4`). diffusers' pipeline and ComfyUI decode with the bn statistics instead.
+- **Samples** render with ostris' community TurboTime LoRA (8 steps, CFG 1, no guidance pass). Without it, Ideogram's
+  presets: V4_DEFAULT_20 (20 steps at guidance 7, the last 2 at 3; mu 0, std 1.75), V4_QUALITY_48 (48, the last 3 at
+  3; std 1.5) and V4_TURBO_12 (12, the last at 3; mu 0.5): the logit-normal schedule with the resolution-aware mean,
+  checked against diffusers' and Ideogram's own. Ideogram's guidance g * cond + (1 - g) * uncond is this trainer's CFG
+  g. The trainer has no unconditional model: the guidance pass runs the image alone (the empty negative) on the model
+  you train, as ai-toolkit does, so full samples are close to, not the same as, the official pipeline's.
+- **Timesteps** (`timestep_sampling: reference`): Ideogram has not published its training distribution; the reference
+  recipe is its documented logit-normal with the resolution-aware mean at the reference pipeline's defaults (mu 0.5,
+  std 1).
+- **LoRA targets**: q, k and v are one fused layer (`attention.qkv`, as in the checkpoint, ComfyUI and ai-toolkit), so
+  any of the three trains it; `o`, `ffn_up_gate` (`feed_forward.w1` / `w3`) and `ffn_down` (`w2`) as usual. `adaln`
+  adds the per-block modulation (ai-toolkit's Ideogram LoRAs train it), `text_in` the text projection
+  (`llm_cond_proj`) and `embed` the image / timestep projections and the final layer.
+- **Export** keeps the checkpoint's module names, `diffusion_model.layers.<n>.attention.qkv.lora_down.weight` (and
+  `lora_up`, `alpha`), the layout ai-toolkit saves. ComfyUI has no Ideogram 4 key mapping, so this is the layout it
+  loads: a *LoraLoaderModelOnly* on the conditional model (`ideogram4_*`, not `ideogram4_unconditional_*`). diffusers'
+  Ideogram 4 loader converts it (q / k / v split, alpha folded) when the LoRA holds only block layers (the default
+  targets and `adaln`). Sampling-only LoRAs may also be in diffusers' layout (`attention.to_q/to_k/to_v/to_out.0`).
+- **Licence**: the Ideogram Non-Commercial Model Agreement. Non-commercial use only; a LoRA trained on Ideogram 4 is a
+  Model Derivative under the same terms (share it with the agreement and the notice it asks for), and generating
+  images for revenue-generating products is not a non-commercial purpose either.
+
+```python
+from diffusers import Ideogram4Pipeline  # needs peft for load_lora_weights
+pipe = Ideogram4Pipeline.from_pretrained("ideogram-ai/ideogram-4-nf4", torch_dtype=torch.bfloat16).to("cuda")
+pipe.load_lora_weights("output/<job>/<job>.safetensors")
+image = pipe(json_caption, num_inference_steps=20, guidance_schedule=[7.0] * 18 + [3.0] * 2, std=1.75).images[0]
+```
+
+Verified without weights: `tests/test_ideogram4.py` checks the port against diffusers' `Ideogram4Transformer2DModel`
+(tiny random weights: each sample of a padded batch alone and the pipeline's left-padded batch, and the image-only
+unconditional sequence), the release's per-row fp8 and diffusers' nf4 layouts and Comfy-Org's int8 / fp8_scaled ones
+on synthetic tensors with the real key names, the text features against diffusers' `encode_prompt` (a tiny Qwen3-VL,
+with the real tokenizer when one is found), an exported LoRA through diffusers' Ideogram 4 converter merged into its
+weights, ai-toolkit and diffusers layout sampling LoRAs, the schedules, and the caption wrapper against the
+verifier's rules (it agrees with Ideogram's own `CaptionVerifier` on 25 of 25 cases). Not measured yet: a training
+run on a GPU.
 
 ## Using the LoRA in ComfyUI
 
