@@ -410,6 +410,11 @@ class TrainConfig:
     keel_lookahead_pullback: float = 0.5  # keel: how far a pull moves the weights toward the anchor (1 = all the way)
     keel_lookahead_lr: float = 0.7  # keel: the learning-rate multiplier at each pull (within the Automagic rails)
     keel_lookahead_grace: int = 2  # keel: probes without a gain before a pull (the count starts over after one)
+    keel_face_gain: float = 0.0  # keel: face-token gain: a LoRA pair's step is scaled by (the share of its gradient
+    #                              from the face's tokens / the median pair's share) ** this; needs region maps with
+    #                              faces (face detection); 0 = off
+    keel_face_gain_max: float = 2.0  # keel: the gain stays within [1 / max, max]
+    keel_face_gain_beta: float = 0.9  # keel: EMA of the gain over steps (one batch without a face barely moves it)
     lr_scheduler: str = "constant"  # constant | cosine | linear
     warmup_steps: int = 50
     max_grad_norm: float = 1.0
@@ -860,6 +865,12 @@ class TrainConfig:
             raise ValueError("keel_lookahead_lr must be above 0 and at most 1")
         if self.keel_lookahead_grace < 0:
             raise ValueError("keel_lookahead_grace must be 0 or more")
+        if self.keel_face_gain < 0:
+            raise ValueError("keel_face_gain must be 0 (off) or above")
+        if self.keel_face_gain_max < 1:
+            raise ValueError("keel_face_gain_max must be 1 or more")
+        if not 0 <= self.keel_face_gain_beta < 1:
+            raise ValueError("keel_face_gain_beta must be 0 or more and below 1")
         if self.compile_model not in (True, False, "auto"):
             raise ValueError(f"compile_model must be true, false or auto, got {self.compile_model!r}")
         if self.race:
@@ -926,9 +937,9 @@ class TrainConfig:
 
     def wants_regions(self) -> bool:
         """Region maps (face cells, landmarks, the subject's cells) are needed by the region-weighted loss, the identity
-        loss, attention localization and identity alignment."""
+        loss, attention localization, identity alignment and Keel's face-token gain."""
         return bool(self.region_weights or self.id_loss_weight > 0 or self.attn_localize or self.id_align
-                    or self.body_align)
+                    or self.body_align or (self.optimizer.lower() == "keel" and self.keel_face_gain > 0))
 
     def wants_person_masks(self) -> bool:
         """Person masks in the region maps: the region-weighted loss's person weight, attention localization's

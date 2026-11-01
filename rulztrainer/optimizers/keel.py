@@ -1,6 +1,7 @@
-"""Keel: Automagic 4 for character LoRAs (docs/keel-optimizer.md). Milestones 1 to 4 of that design: the LoRA
-gauge preconditioner, the cautious mask, the noise-band normalisation, the cross-photo consensus gate and the
-probe-gated lookahead. With every switch off it is Automagic 4 exactly (test_keel asserts it bitwise).
+"""Keel: Automagic 4 for character LoRAs (docs/keel-optimizer.md). Milestones 1 to 5 of that design: the LoRA
+gauge preconditioner, the cautious mask, the noise-band normalisation, the cross-photo consensus gate, the
+probe-gated lookahead and the face-token gain. With every switch off it is Automagic 4 exactly (test_keel asserts
+it bitwise).
 
 Gauge preconditioner (keel_gauge)
 ---------------------------------
@@ -97,6 +98,19 @@ the rails); the second moments and the sign histories stay. No pull while the sc
 probe (a slow climb is never pulled; an oscillating run is damped to its best), and a pull starts the miss count
 over. One fp32 copy of the LoRA; off by default until raced.
 
+Face-token gain (keel_face_gain, keel_face_gain_max, keel_face_gain_beta)
+-------------------------------------------------------------------------
+Weights whose gradient mostly flows through the face's tokens take a larger step, weights serving the background a
+smaller one; a positive scalar on the diffusion update, so the step still descends the diffusion loss and cannot be
+gamed toward features that fool a face recognizer. The LoRA layers' face tap (lora.arm_face_tap, armed by the
+trainer per micro-batch with each sample's face token mask from its region map) hands face_energy(lora_up, e_face,
+e_total) the squared norm of lora_up's gradient from the face tokens and from all tokens of the samples with a face;
+summed over the step's micro-batches, share = e_face / e_total per tensor, and gain = clamp((share / median share
+over the reported tensors) ** keel_face_gain, 1 / keel_face_gain_max, keel_face_gain_max), EMA'd with
+keel_face_gain_beta into state["face_gain"] (a 0-dim fp32, the pair's lora_down the same), multiplied into the
+update through _element_gain with the consensus gate. Tensors without a report keep their gain; a step without one
+changes nothing. Off by default until raced.
+
 Pairs: build_optimizer passes the (lora_down, lora_up) pairs of the injected LoRA layers; LoKr, OFT and a
 fine-tune have none, and the step is then Automagic 4's. A race switching a wrapper to LoKr leaves its LoRA
 tensors empty, which the step skips.
@@ -187,13 +201,20 @@ class Keel(Automagic4):
         The lr multiplier at a pull.
     lookahead_grace : int >= 0
         Misses before a pull.
+    face_gain : float >= 0
+        The exponent on (face share / median share); 0 = off.
+    face_gain_max : float >= 1
+        The gain stays within [1 / max, max].
+    face_gain_beta : float in [0, 1)
+        The EMA of the gain over steps.
     """
 
     def __init__(self, params, *args, pairs: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = None,
                  gauge: bool = True, gauge_eps: float = 0.01, cautious: bool = True, bands: int = 8,
                  band_weights: Optional[Sequence[float]] = None, consensus: float = 0.5,
                  consensus_power: float = 2.0, lookahead: bool = False, lookahead_pullback: float = 0.5,
-                 lookahead_lr: float = 0.7, lookahead_grace: int = 2, **kwargs):
+                 lookahead_lr: float = 0.7, lookahead_grace: int = 2, face_gain: float = 0.0,
+                 face_gain_max: float = 2.0, face_gain_beta: float = 0.9, **kwargs):
         if not gauge_eps > 0.0:
             raise ValueError(f"gauge_eps ({gauge_eps}) must be above 0")
         if int(bands) < 1:
@@ -212,6 +233,12 @@ class Keel(Automagic4):
             raise ValueError(f"lookahead_lr ({lookahead_lr}) must be within (0, 1]")
         if int(lookahead_grace) < 0:
             raise ValueError(f"lookahead_grace ({lookahead_grace}) must be 0 or more")
+        if not face_gain >= 0.0:
+            raise ValueError(f"face_gain ({face_gain}) must be 0 (off) or above")
+        if not face_gain_max >= 1.0:
+            raise ValueError(f"face_gain_max ({face_gain_max}) must be 1 or more")
+        if not 0.0 <= face_gain_beta < 1.0:
+            raise ValueError(f"face_gain_beta ({face_gain_beta}) must be within [0, 1)")
         # Read by the hook (registered by the parent's constructor for low-precision parameters), so before it.
         self.gauge = bool(gauge)
         self.gauge_eps = float(gauge_eps)
@@ -226,6 +253,11 @@ class Keel(Automagic4):
         self.lookahead_grace = int(lookahead_grace)
         self._misses = 0  # probes since the last accept or pull that did not beat the anchor
         self._last_score: Optional[float] = None  # the previous probe's score (no pull while it rises)
+        self.face_gain = float(face_gain)
+        self.face_gain_max = float(face_gain_max)
+        self.face_gain_beta = float(face_gain_beta)
+        self._face_e: Dict[torch.Tensor, List[torch.Tensor]] = {}  # per lora_up: [face, total] energy of the step
+        self._face_seen = False  # a face report has arrived at some step
         self._armed = False  # the hook takes gradients between zero_grad() and step() only
         self._cur_band: Optional[int] = None  # the band of the micro-batch about to be backpropagated
         self._step_bands: List[int] = []  # the bands observed since zero_grad() (one per micro-batch image)
@@ -238,6 +270,7 @@ class Keel(Automagic4):
         super().__init__(params, *args, **kwargs)
         self._register_hooks([p for g in self.param_groups for p in g["params"]])
         self.pairs: List[Tuple[torch.Tensor, torch.Tensor]] = self._check_pairs(pairs)
+        self._pair_down: Dict[torch.Tensor, torch.Tensor] = {up: down for down, up in self.pairs}
         self._kept: Optional[torch.Tensor] = None  # the last step's cautious counts (kept, seen), no sync
         self._seen: Optional[torch.Tensor] = None
         self._share_sum = 0.0  # summed over the steps since the last log line
@@ -266,6 +299,10 @@ class Keel(Automagic4):
         if self.lookahead:
             log.info("Keel: probe-gated lookahead (pull-back %g, lr x%g at a pull, %d probes of grace)",
                      self.lookahead_pullback, self.lookahead_lr, self.lookahead_grace)
+        if self.face_gain > 0.0:
+            log.info("Keel: face-token gain (exponent %g, within [%.3g, %g], EMA %g) on %d LoRA pairs",
+                     self.face_gain, 1.0 / self.face_gain_max, self.face_gain_max, self.face_gain_beta,
+                     len(self.pairs))
 
     def _check_pairs(self, pairs) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         mine = {id(p) for g in self.param_groups for p in g["params"]}
@@ -536,18 +573,24 @@ class Keel(Automagic4):
     # ------------------------------------------------------------------ the consensus gate
 
     def _element_gain(self, p: torch.Tensor, i0: int = 0, i1: Optional[int] = None) -> Optional[torch.Tensor]:
+        """The consensus gate on p's update (rows i0:i1), times the face-token gain (a 0-dim tensor when there is no
+        gate), or None for neither."""
+        gate = None
         agree = self._agree.get(p)
-        if agree is None:
-            return None
-        k = self._votes.get(p, 0)
-        if k < 2:
-            return None
-        gate = consensus_gate(agree if i1 is None else agree[i0:i1], k, self.consensus, self.consensus_power)
-        acc = self._gate_sum.get(gate.device)
-        s = gate.sum()
-        self._gate_sum[gate.device] = s if acc is None else acc.add_(s)
-        self._gate_n += gate.numel()
-        return gate
+        if agree is not None and self._votes.get(p, 0) >= 2:
+            gate = consensus_gate(agree if i1 is None else agree[i0:i1], self._votes[p], self.consensus,
+                                  self.consensus_power)
+            acc = self._gate_sum.get(gate.device)
+            s = gate.sum()
+            self._gate_sum[gate.device] = s if acc is None else acc.add_(s)
+            self._gate_n += gate.numel()
+        fg = None
+        if self.face_gain > 0.0:
+            st = self.state.get(p)
+            fg = st.get("face_gain") if st else None
+        if fg is None:
+            return gate
+        return fg if gate is None else gate.mul_(fg)
 
     def gate_mean(self) -> Optional[float]:
         """The consensus gate's mean over the elements gated since the last log line (None: none). Syncs."""
@@ -568,6 +611,68 @@ class Keel(Automagic4):
         elif any(p.grad is not None for g in self.param_groups for p in g["params"]):
             self._note("hook", "Keel: the consensus gate sees no per-micro-batch gradients in this loop (the parallel "
                        "race and a replica reduce hand the optimizer the step's sum): the gate is 1")
+
+    # ------------------------------------------------------------------ the face-token gain
+
+    def face_energy(self, p: torch.Tensor, e_face: torch.Tensor, e_total: torch.Tensor) -> None:
+        """The face tap's report for one micro-batch (lora.arm_face_tap): for `p` (a lora_up weight) the squared norm
+        of its gradient from the face tokens and from all tokens of the samples with a face, 0-dim tensors (no sync).
+        Summed over the step's micro-batches; a backward outside a step is ignored."""
+        if self.face_gain <= 0.0 or not self._armed:
+            return
+        acc = self._face_e.get(p)
+        if acc is None:
+            self._face_e[p] = [e_face.detach().to(torch.float32), e_total.detach().to(torch.float32)]
+        else:
+            acc[0] = acc[0] + e_face.detach().to(acc[0].device, torch.float32)
+            acc[1] = acc[1] + e_total.detach().to(acc[1].device, torch.float32)
+
+    @torch.no_grad()
+    def _face_step(self) -> None:
+        """Before the step: each reported tensor's face share, its gain against the median share of the step's
+        reported tensors (torch's median: the lower middle of an even count), clamped, EMA'd into state["face_gain"]
+        (the pair's lora_down the same). Tensors without a report, or whose report had no energy, keep their gain.
+        No sync."""
+        if self.face_gain <= 0.0 or not self._face_e:
+            return
+        self._face_seen = True
+        ups = list(self._face_e)
+        dev = self._face_e[ups[0]][1].device
+        ef = torch.stack([self._face_e[p][0].to(dev) for p in ups])
+        et = torch.stack([self._face_e[p][1].to(dev) for p in ups])
+        live = et > 0.0
+        share = ef / et.clamp(min=GAUGE_FLOOR)
+        med = torch.where(live, share, torch.full_like(share, float("nan"))).nanmedian().clamp(min=GAUGE_FLOOR)
+        gain = (share / med).pow(self.face_gain).clamp_(1.0 / self.face_gain_max, self.face_gain_max)
+        todo: Dict[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = {}
+        for p, g, ok in zip(ups, gain, live):
+            todo[p] = (g, ok)
+            down = self._pair_down.get(p)
+            if down is not None:
+                todo[down] = (g, ok)
+        beta = self.face_gain_beta
+        for gi, group in enumerate(self.param_groups):
+            for t in group["params"]:
+                got = todo.get(t)
+                if got is None:
+                    continue
+                g, ok = got
+                st = self._ensure_state(gi, group, t)
+                fg = st.get("face_gain")
+                if fg is None:
+                    fg = st["face_gain"] = torch.ones((), dtype=torch.float32, device=t.device)
+                new = fg * beta + g.to(fg.device) * (1.0 - beta)
+                fg.copy_(torch.where(ok.to(fg.device), new, fg))
+
+    def face_gain_stats(self) -> Optional[Tuple[float, float, float, int]]:
+        """(min, median, max, tensors) of the face-token gain over the lora_up tensors that have one (None: none).
+        Syncs."""
+        downs = set(self._pair_down.values())
+        vals = [st["face_gain"] for p, st in self.state.items() if p not in downs and "face_gain" in st]
+        if not vals:
+            return None
+        t = torch.stack([v.to(vals[0].device) for v in vals])
+        return float(t.min()), float(t.median()), float(t.max()), len(vals)
 
     # ------------------------------------------------------------------ the probe-gated lookahead
 
@@ -725,6 +830,14 @@ class Keel(Automagic4):
         if mean is not None:
             log.info("Keel: consensus gate mean %.3f over the last %d steps (%.1f gradients per step)", mean,
                      self._gate_steps, self._gate_votes / max(1, self._gate_steps))
+        if self.face_gain > 0.0:
+            stats = self.face_gain_stats()
+            if stats is not None:
+                lo, med, hi, n = stats
+                log.info("Keel: face-token gain over %d LoRA pairs: min %.2f median %.2f max %.2f", n, lo, med, hi)
+            elif not self._face_seen:
+                self._note("face", "Keel: the face-token gain has had no face report (no region maps with a face, or "
+                           "a loop without the face tap: a replica, the parallel race): the gain is 1")
         self._gate_sum.clear()
         self._gate_n = 0
         self._gate_votes = 0
@@ -740,6 +853,7 @@ class Keel(Automagic4):
                 loss = closure()
         self.gather()
         self._bands_step()
+        self._face_step()
         self.precondition()
         self._preconditioned = False
         self._consensus_step_notes()
@@ -753,6 +867,7 @@ class Keel(Automagic4):
             self._votes.clear()
             self._pw.clear()
             self._cnt.clear()
+            self._face_e.clear()
         self._steps += 1
         self._log_periodic()
         return loss
@@ -761,10 +876,12 @@ class Keel(Automagic4):
         # The parent casts every fp state tensor to the param dtype: the band statistics and the anchor come back
         # from the saved fp32 values. The band statistics start fresh when their geometry no longer matches
         # (keel_bands changed on resume); the anchor is dropped when its shape does not match or the lookahead is off.
-        exact = {k: self._saved_fp32(state_dict, k) for k in ("band_ms", "band_n", "anchor", "anchor_score")}
+        exact = {k: self._saved_fp32(state_dict, k)
+                 for k in ("band_ms", "band_n", "anchor", "anchor_score", "face_gain")}
         super().load_state_dict(state_dict)
         self._misses = 0
         self._last_score = None
+        self._face_e.clear()
         for group in self.param_groups:
             for p in group["params"]:
                 st = self.state.get(p)
@@ -785,4 +902,10 @@ class Keel(Automagic4):
                     else:
                         st.pop("anchor", None)
                         st.pop("anchor_score", None)
+                if "face_gain" in st:
+                    fg = exact["face_gain"].get(p)
+                    if self.face_gain > 0.0 and fg is not None and fg.dim() == 0:
+                        st["face_gain"] = fg
+                    else:
+                        st.pop("face_gain", None)
         self._refresh_band_gains()

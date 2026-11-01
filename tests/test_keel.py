@@ -381,20 +381,25 @@ def test_keel_config_race_and_wizard_wiring(tmp_path):
 
     keys = {"keel_gauge", "keel_gauge_eps", "keel_cautious", "keel_pair_sigma", "keel_bands", "keel_band_weights",
             "keel_consensus", "keel_consensus_power", "keel_lookahead", "keel_lookahead_pullback", "keel_lookahead_lr",
-            "keel_lookahead_grace"}
+            "keel_lookahead_grace", "keel_face_gain", "keel_face_gain_max", "keel_face_gain_beta"}
     for bad in (dict(keel_lookahead_pullback=0), dict(keel_lookahead_lr=1.5), dict(keel_lookahead_grace=-1)):
         with pytest.raises(ValueError, match="keel_lookahead"):
             _cfg(**bad).validate()
+    for bad in (dict(keel_face_gain=-1), dict(keel_face_gain_max=0.5), dict(keel_face_gain_beta=1)):
+        with pytest.raises(ValueError, match="keel_face_gain"):
+            _cfg(**bad).validate()
+    assert _cfg(keel_face_gain=1.0).wants_regions() and not _cfg().wants_regions()
     with pytest.raises(ValueError, match="keel_consensus"):
         _cfg(keel_consensus=1.2).validate()
     with pytest.raises(ValueError, match="keel_consensus_power"):
         _cfg(keel_consensus_power=0).validate()
     assert keys <= set(R.RACE_KEYS["LR & optimizer"])
-    TrainConfig(race=True, probe_every=10, face_refs=["ref.png"], steps=40, race_configs=[
+    TrainConfig(race=True, probe_every=10, face_refs=["ref.png"], steps=60, race_configs=[
         {"name": "a"}, {"name": "b", "optimizer": "keel", "keel_gauge_eps": 0.1, "keel_cautious": False},
         {"name": "c", "optimizer": "keel", "keel_bands": 1, "keel_pair_sigma": False, "keel_band_weights": ""},
         {"name": "d", "optimizer": "keel", "keel_consensus": 1.0, "keel_consensus_power": 1.0},
-        {"name": "e", "optimizer": "keel", "keel_lookahead": True, "keel_lookahead_grace": 0}]).validate()
+        {"name": "e", "optimizer": "keel", "keel_lookahead": True, "keel_lookahead_grace": 0},
+        {"name": "f", "optimizer": "keel", "keel_face_gain": 0.5, "keel_face_gain_max": 3}]).validate()
     assert BYTES_PER_PARAM["keel"] == BYTES_PER_PARAM["automagic4"]
     import webui
 
@@ -829,3 +834,204 @@ def test_an_async_probe_anchors_the_copy_that_scored_and_pulls_the_live_weights(
     Trainer._keel_probe(me, opt, scored=sent)
     for p, x in zip(params, live):
         assert torch.allclose(p.detach().float(), torch.lerp(x.float(), opt.state[p]["anchor"], 0.5), atol=1e-2)
+
+
+# ---------------------------------------------------------------- the face-token gain
+
+
+def _face_pair(seed: int, n_in: int = 8, n_out: int = 6, rank: int = 4):
+    torch.manual_seed(seed)
+    m = lora_mod.LoRALinear(torch.nn.Linear(n_in, n_out), rank, float(rank))
+    for p in m.adapter_params().values():
+        torch.nn.init.normal_(p)
+    return m
+
+
+def test_face_token_mask_is_row_major_over_the_cells():
+    assert lora_mod.face_token_mask(None, 3, 4) is None
+    m = lora_mod.face_token_mask((1, 0, 3, 2), 3, 4)
+    assert m.shape == (12,) and m.dtype == torch.bool and m.nonzero().flatten().tolist() == [1, 2, 5, 6]
+
+
+def test_face_tap_reports_the_face_and_the_whole_gradient_energy():
+    m = _face_pair(20)
+    got = []
+    layout = {"sample": 0, "img": (1, 3), "txt": (0, 1)}  # tokens 1 to 3 are the image, 0 and 4 text
+    mask = torch.tensor([True, False, True])
+    lora_mod.arm_face_tap({"a": m}, [mask, None], lambda: layout, lambda p, ef, et: got.append((p, ef, et)))
+    x = torch.randn(2, 5, 8)
+    w = torch.randn(2, 5, 6)
+    (m(x) * w).sum().backward()
+    assert len(got) == 1 and got[0][0] is m.lora_up.weight
+    h = x @ m.lora_down.weight.T
+    du = w * m.scale  # the gradient of the LoRA output before its scale
+    g = du[0].T @ h[0]  # sample 0 alone: sample 1 has no face
+    gf = (du[0, 1:4] * mask[:, None].float()).T @ h[0, 1:4]
+    assert torch.allclose(got[0][2], g.pow(2).sum(), rtol=1e-4)
+    assert torch.allclose(got[0][1], gf.pow(2).sum(), rtol=1e-4)
+    assert torch.allclose(m.lora_up.weight.grad, m.scale * (g + du[1].T @ h[1]), rtol=1e-4)  # the real gradient
+    # an image-only input (a double-stream block's image side) is all image tokens; a text-only one is skipped
+    got.clear()
+    (m(x[:, 1:4]) * w[:, 1:4]).sum().backward()
+    assert len(got) == 1 and torch.allclose(got[0][2], (du[0, 1:4].T @ h[0, 1:4]).pow(2).sum(), rtol=1e-4)
+    got.clear()
+    (m(x[:, :2]) * w[:, :2]).sum().backward()
+    assert not got
+    with torch.no_grad():  # no gradient: no hook
+        m(x)
+    lora_mod.disarm_face_tap({"a": m})
+    assert m.face_sink is None and m.face_masks is None
+    (m(x) * w).sum().backward()
+    assert not got
+
+
+def test_face_tap_under_activation_checkpointing_reports_each_layer_once_with_the_same_energies():
+    from rulztrainer import alignment as A
+
+    out = {}
+    for ckpt in (False, True):
+        model, injected, params = _model(21)
+        model.gradient_checkpointing = ckpt
+        model._rz_taps = taps = A.Taps()
+        names = {m.lora_up.weight: n for n, m in injected.items()}
+        got = []
+        mask = torch.zeros(16, dtype=torch.bool)  # 4 x 4 latent cells
+        mask[5:11] = True
+        lora_mod.arm_face_tap(injected, [mask], lambda: taps.layout,
+                              lambda p, ef, et: got.append((names[p], float(ef), float(et))))
+        g = torch.Generator().manual_seed(1)
+        x = torch.randn(1, 128, 4, 4, generator=g).to(torch.bfloat16)
+        c = torch.randn(1, 5, 32, generator=g).to(torch.bfloat16)
+        taps.begin([[]], attention=False)
+        loss = model(x, torch.tensor([300.0]), c).float().pow(2).mean()
+        taps.stop()
+        loss.backward()
+        taps.end()
+        lora_mod.disarm_face_tap(injected)
+        assert sorted(n for n, _, _ in got) == sorted(injected)  # every LoRA layer once
+        assert all(0 < ef <= et * (1 + 1e-4) for _, ef, et in got)
+        out[ckpt] = {n: (ef, et) for n, ef, et in got}
+    for n in injected:
+        assert out[False][n] == pytest.approx(out[True][n], rel=1e-3), n
+
+
+def _pairs(seed: int, n: int = 3):
+    torch.manual_seed(seed)
+    pairs = [(torch.nn.Parameter(torch.randn(4, 8)), torch.nn.Parameter(torch.randn(6, 4))) for _ in range(n)]
+    return pairs, [t for pair in pairs for t in pair]
+
+
+def test_face_gain_scales_each_pair_by_its_share_against_the_median():
+    pairs, params = _pairs(22)
+    ref, rparams = _pairs(22)
+    kw = dict(lr=1e-3, fused=False, bands=1, consensus=0.0, gauge=False, cautious=False)
+    with pytest.raises(ValueError, match="face_gain_max"):
+        Keel(params, face_gain_max=0.5, **kw)
+    with pytest.raises(ValueError, match="face_gain_beta"):
+        Keel(params, face_gain_beta=1.0, **kw)
+    opt = Keel(params, pairs=pairs, face_gain=1.0, face_gain_max=2.0, face_gain_beta=0.0, **kw)
+    plain = Keel(rparams, pairs=ref, **kw)
+    grads = [torch.randn_like(t) for t in params]
+    gains = (1.6, 1.0, 0.5)  # shares 0.8, 0.5, 0.2 against the median 0.5, the last clamped at 1 / 2
+    for s in range(3):
+        deltas = []
+        for o, ps in ((opt, params), (plain, rparams)):
+            o.zero_grad(set_to_none=True)
+            if o is opt and s == 2:  # the face tap's reports, two micro-batches each: summed
+                for (_, up), share in zip(pairs, (0.8, 0.5, 0.2)):
+                    opt.face_energy(up, torch.tensor(share), torch.tensor(1.0))
+                    opt.face_energy(up, torch.tensor(share), torch.tensor(1.0))
+            before = [t.detach().clone() for t in ps]
+            for t, g in zip(ps, grads):
+                t.grad = g.clone()
+            o.step()
+            deltas.append([t.detach() - b for t, b in zip(ps, before)])
+        for i, ((down, up), gain) in enumerate(zip(pairs, gains)):
+            for k in (2 * i, 2 * i + 1):
+                if s < 2:
+                    assert torch.equal(deltas[0][k], deltas[1][k])
+                else:
+                    assert torch.allclose(deltas[0][k], gain * deltas[1][k], rtol=1e-4, atol=1e-6), (i, k)  # a few ulps of p
+            if s == 2:
+                assert float(opt.state[up]["face_gain"]) == pytest.approx(gain)
+                assert float(opt.state[down]["face_gain"]) == pytest.approx(gain)  # the pair's down the same
+    assert opt.face_gain_stats() == pytest.approx((0.5, 1.0, 1.6, 3))
+    assert not opt._face_e  # the step's reports are cleared
+    opt.face_energy(pairs[0][1], torch.tensor(1.0), torch.tensor(1.0))  # outside a step: ignored
+    assert not opt._face_e
+    # the EMA keeps most of the previous gain; a pair reported without energy keeps its gain
+    opt.face_gain_beta = 0.5
+    opt.zero_grad(set_to_none=True)
+    for (_, up), share in zip(pairs[:2], (0.8, 0.2)):
+        opt.face_energy(up, torch.tensor(share), torch.tensor(1.0))
+    opt.face_energy(pairs[2][1], torch.tensor(0.0), torch.tensor(0.0))
+    for t, g in zip(params, grads):
+        t.grad = g.clone()
+    opt.step()
+    # the median of the two reported shares is the lower middle (0.2, torch's median): gains 4 -> 2 (clamped) and 1
+    assert float(opt.state[pairs[0][1]]["face_gain"]) == pytest.approx(0.5 * 1.6 + 0.5 * 2.0)
+    assert float(opt.state[pairs[1][1]]["face_gain"]) == pytest.approx(0.5 * 1.0 + 0.5 * 1.0)
+    assert float(opt.state[pairs[2][1]]["face_gain"]) == pytest.approx(0.5)
+
+
+def test_face_gain_on_without_a_report_leaves_training_bitwise():
+    ma, inja, pa = _model(5)
+    mb, injb, pb = _model(5)
+    oa = build_optimizer(_cfg(keel_face_gain=1.0), pa, pairs=lora_mod.lora_pairs(inja))
+    ob = build_optimizer(_cfg(), pb, pairs=lora_mod.lora_pairs(injb))
+    for s in range(4):
+        _step(ma, pa, oa, s)
+        _step(mb, pb, ob, s)
+        assert all(torch.equal(a, b) for a, b in zip(pa, pb)), s
+    assert oa.face_gain_stats() is None
+
+
+def test_face_gain_state_round_trips_and_is_dropped_without_it():
+    pairs, params = _pairs(23)
+    kw = dict(lr=1e-3, fused=False, bands=1, consensus=0.0)
+    opt = Keel(params, pairs=pairs, face_gain=1.0, face_gain_beta=0.0, **kw)
+    grads = [torch.randn_like(t) for t in params]
+    for s in range(2):
+        opt.zero_grad(set_to_none=True)
+        for (_, up), share in zip(pairs, (0.9, 0.3, 0.6)):
+            opt.face_energy(up, torch.tensor(share), torch.tensor(1.0))
+        for t, g in zip(params, grads):
+            t.grad = g.clone()
+        opt.step()
+    sd = opt.state_dict()
+    for face_gain in (1.0, 0.0):
+        pairs2, params2 = _pairs(23)
+        o2 = Keel(params2, pairs=pairs2, face_gain=face_gain, **kw)
+        o2.load_state_dict(sd)
+        for a, b in zip(params, params2):
+            if face_gain > 0:
+                assert torch.equal(o2.state[b]["face_gain"], opt.state[a]["face_gain"])
+                assert o2.state[b]["face_gain"].dtype == torch.float32 and o2.state[b]["face_gain"].dim() == 0
+            else:
+                assert "face_gain" not in o2.state[b]
+    _, params3 = _pairs(23)
+    o3 = Automagic4(params3, lr=1e-3, fused=False)
+    o3.load_state_dict(sd)
+    for t, g in zip(params3, grads):
+        t.grad = g.clone()
+    o3.step()
+
+
+def test_the_trainer_installs_the_layout_taps_for_the_face_gain():
+    from types import SimpleNamespace
+
+    from rulztrainer import alignment as A
+    from rulztrainer.trainer import Trainer
+
+    model, _, _ = _model(6)
+    me = SimpleNamespace(race_rows=None, ft=None, race_parallel=False, replicas=[(model, None, None)])
+    Trainer._setup_alignment(me, _cfg(keel_face_gain=1.0), [])
+    taps = model._rz_taps
+    assert isinstance(taps, A.Taps) and not taps.hidden_layers and not taps.attn_layers
+    model2, _, _ = _model(6)
+    me.replicas = [(model2, None, None)]
+    Trainer._setup_alignment(me, _cfg(), [])
+    assert not hasattr(model2, "_rz_taps")
+    me.race_parallel = True  # the parallel race: no tap
+    Trainer._setup_alignment(me, _cfg(keel_face_gain=1.0), [])
+    assert not hasattr(model2, "_rz_taps")

@@ -803,11 +803,24 @@ with both of its own switches off it is Automagic 4 to the bit (a test asserts i
   since the previous probe, so a slow climb is never pulled and an oscillating run is damped to its best. One fp32
   copy of the LoRA; needs probes with face references. With `probe_async` the anchor is the copy that was sent to
   the probe GPU, and the decision lands up to `probe_every` steps later, on the weights of that moment.
+- **Face-token gain** (`keel_face_gain` off, `keel_face_gain_max` 2, `keel_face_gain_beta` 0.9): weights whose
+  gradient mostly flows through the face's tokens take a larger step, weights serving the background a smaller one.
+  A tap in every LoRA layer (armed per micro-batch with each sample's face box from its region map, so it needs
+  face detection, `region_weights` or not) hands the optimizer, in the backward, the squared norm of `lora_up`'s
+  gradient from the face tokens and from all tokens of the samples with a face: one extra rank-r product per layer
+  and sample, no second backward. Summed over the step's micro-batches, a pair's share of face energy against the
+  median pair's, to the power `keel_face_gain` and within `[1 / max, max]`, is EMA'd (`beta`) into a per-pair gain
+  that multiplies the update next to the consensus gate. A positive scalar on the diffusion update, so the step
+  still descends the diffusion loss and cannot be gamed toward features that fool a face recognizer (what the
+  identity loss can do). Pairs without a report keep their gain, so batches without a face change nothing; the
+  gain's spread is logged every 250 steps. The LoRA layers' hook runs uncompiled (`compile_model` is turned off
+  with it); the parallel race and a data-parallel replica's micro-batches are not tapped.
 
 All of it can be raced (`race` rows with `keel_gauge`, `keel_gauge_eps`, `keel_cautious`, `keel_pair_sigma`,
 `keel_bands`, `keel_band_weights`, `keel_consensus`, `keel_consensus_power`, `keel_lookahead` and its three
-settings), and a Keel state resumes under Automagic 4 and the other way round (the band statistics start fresh
-when `keel_bands` changes; the anchor is dropped when the lookahead is off). Whether Keel beats Automagic 4 or adamw8bit on the likeness probes
+settings, `keel_face_gain` and its two), and a Keel state resumes under Automagic 4 and the other way round (the
+band statistics start fresh when `keel_bands` changes; the anchor is dropped when the lookahead is off, the face
+gains when the face gain is). Whether Keel beats Automagic 4 or adamw8bit on the likeness probes
 is not measured yet: the Wizard keeps recommending adamw8bit until a race says otherwise.
 
 **MiniMax H3 and FLUX Klein** are trained in ai-toolkit, not here. `rulztrainer/optimizers/automagic4.py` depends only
@@ -845,8 +858,9 @@ Four levers change the training objective and data for likeness, all off by defa
 - **Keel** (`optimizer: keel`): Automagic 4 plus a preconditioner that keeps either LoRA factor from taking the whole
   update, a mask against steps that point away from the gradient, noise bands so the quiet noise levels (where the
   face forms) step as far as the loud ones, a consensus gate that moves a weight by how far the step's photos agree
-  on it, and a probe-gated lookahead (off by default) that pulls a run back toward its best-scoring weights; see
-  *Keel* above and `docs/keel-optimizer.md`.
+  on it, a probe-gated lookahead (off by default) that pulls a run back toward its best-scoring weights, and a
+  face-token gain (off by default) that moves the weights serving the face more than the background's; see *Keel*
+  above and `docs/keel-optimizer.md`.
 
 The face analysis cache is `<dataset>/.rulz_cache/faces.json`; the Train tab has preview buttons for region
 maps and crops.
