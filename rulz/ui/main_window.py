@@ -186,9 +186,15 @@ class MainWindow(QMainWindow):
         self.mode_switch.requested.connect(self._request_mode)
         self.reset_all = QPushButton(theme.icon("reset"), "  Reset all to global", clicked=self._reset_all)
         self.reset_all.setToolTip("Clear every image's own settings so all follow the global sliders")
+        self.zero_all = QPushButton(theme.icon("reset"), "  Set all to 0", clicked=self._zero_globals)
+        self.zero_all.setToolTip("Move every global slider back to 0")
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        buttons.addWidget(self.zero_all)
+        buttons.addWidget(self.reset_all)
         grid.addWidget(self.count_label, 0, 1)
         grid.addWidget(self.mode_switch, list(ADJUSTMENTS).index("jpeg"), 1)
-        grid.addWidget(self.reset_all, len(ADJUSTMENTS) - 1, 1)
+        grid.addLayout(buttons, len(ADJUSTMENTS) - 1, 1)
         grid.setColumnStretch(0, 1)
 
         self.grid = QListWidget()
@@ -352,6 +358,18 @@ class MainWindow(QMainWindow):
         self.globals[key] = v
         config.settings().setValue(f"global/{key}", v)
         self._queue_render([it for it in self.items if key not in it.custom])
+        self.grid.viewport().update()
+        self.editor.set_globals(self.globals, self.mode)
+
+    def _zero_globals(self):
+        changed = [key for key in ADJUSTMENTS if self.globals[key] != 0]
+        if not changed:
+            return
+        for key in changed:
+            self.globals[key] = 0
+            self.global_rows[key].set_value(0)
+            config.settings().setValue(f"global/{key}", 0)
+        self._queue_render([it for it in self.items if any(k not in it.custom for k in changed)])
         self.grid.viewport().update()
         self.editor.set_globals(self.globals, self.mode)
 
