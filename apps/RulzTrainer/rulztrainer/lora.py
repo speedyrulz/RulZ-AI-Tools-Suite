@@ -255,8 +255,10 @@ class LoRALinear(nn.Module):
         self.register_buffer("train_down", None, persistent=False)
         self.register_buffer("train_up", None, persistent=False)
         # Keel's face tap (arm_face_tap): per sample of the batch its face tokens' mask over the image tokens (None:
-        # no face), where the model reports the token layout, and the optimizer's sink for the energies
+        # no face), the body tokens' the same (the face-and-body version; None: not armed), where the model reports
+        # the token layout, and the optimizer's sink for the energies
         self.face_masks: list | None = None
+        self.body_masks: list | None = None
         self.face_layout = None
         self.face_sink = None
 
@@ -401,12 +403,14 @@ class LoRALinear(nn.Module):
     def _tap_face(self, h: torch.Tensor, u: torch.Tensor) -> None:
         """Keel's face-token gain: a hook on this forward's LoRA output hands the optimizer, in the backward, the
         energy of lora_up's gradient from the face tokens and from all tokens over the samples with a face (per
-        sample G = du^T h, summed; the face part over its face tokens). The image tokens are the layout's when the
-        input holds the whole sequence, all of it when it holds the image tokens alone (a double-stream block's image
-        side); a text-only input is skipped. Under activation checkpointing (non-reentrant) the main forward's hook
-        is the one that fires and the recompute's never does, so a block is reported once per backward."""
+        sample G = du^T h, summed; the face part over its face tokens) and, armed with body masks (the face-and-body
+        version), the body tokens' part as a fourth value, over the samples with a face or a body. The image tokens
+        are the layout's when the input holds the whole sequence, all of it when it holds the image tokens alone (a
+        double-stream block's image side); a text-only input is skipped. Under activation checkpointing
+        (non-reentrant) the main forward's hook is the one that fires and the recompute's never does, so a block is
+        reported once per backward."""
         lay = self.face_layout() if self.face_layout is not None else None
-        masks = self.face_masks
+        masks, bmasks = self.face_masks, self.body_masks
         if lay is None or not masks or h.ndim != 3:
             return
         i0, n_img = lay["img"]
@@ -416,24 +420,38 @@ class LoRALinear(nn.Module):
         elif n_tok < i0 + n_img:
             return
         first = lay["sample"]
-        per = [masks[first + j] if first + j < len(masks) else None for j in range(h.shape[0])]
-        per = [m if m is not None and m.numel() == n_img else None for m in per]
-        if all(m is None for m in per):
+
+        def pick(ms):
+            per = [ms[first + j] if ms is not None and first + j < len(ms) else None for j in range(h.shape[0])]
+            return [m if m is not None and m.numel() == n_img else None for m in per]
+
+        per, per_b = pick(masks), pick(bmasks)
+        if all(m is None and b is None for m, b in zip(per, per_b)):
             return
         hd, sink, p = h.detach(), self.face_sink, self.lora_up.weight
+        with_body = bmasks is not None
 
         def hook(du: torch.Tensor) -> None:
-            g = gf = None
-            for j, m in enumerate(per):
-                if m is None:
+            g = gf = gb = None
+            for j, (m, b) in enumerate(zip(per, per_b)):
+                if m is None and b is None:
                     continue
                 dj, hj = du[j].to(torch.float32), hd[j].to(torch.float32)
                 gj = dj.transpose(0, 1) @ hj  # [out, r]: the sample's gradient of lora_up (before the scale)
-                w = m.to(hj.device, torch.float32)[:, None]
-                gfj = (dj[i0:i0 + n_img] * w).transpose(0, 1) @ hj[i0:i0 + n_img]
                 g = gj if g is None else g + gj
-                gf = gfj if gf is None else gf + gfj
-            sink(p, gf.pow(2).sum(), g.pow(2).sum())
+                dimg, himg = dj[i0:i0 + n_img], hj[i0:i0 + n_img]
+                if m is not None:
+                    gfj = (dimg * m.to(hj.device, torch.float32)[:, None]).transpose(0, 1) @ himg
+                    gf = gfj if gf is None else gf + gfj
+                if b is not None:
+                    gbj = (dimg * b.to(hj.device, torch.float32)[:, None]).transpose(0, 1) @ himg
+                    gb = gbj if gb is None else gb + gbj
+            zero = g.new_zeros(())
+            ef = gf.pow(2).sum() if gf is not None else zero
+            if with_body:
+                sink(p, ef, g.pow(2).sum(), gb.pow(2).sum() if gb is not None else zero)
+            else:
+                sink(p, ef, g.pow(2).sum())
 
         u.register_hook(hook)
 
@@ -700,15 +718,31 @@ def face_token_mask(face_cells, hh: int, ww: int) -> torch.Tensor | None:
     return m.flatten()
 
 
-def arm_face_tap(injected: dict, masks: list | None, layout=None, sink=None) -> None:
+def body_token_mask(rm, hh: int, ww: int) -> torch.Tensor | None:
+    """The person's cells outside the face box (regions.RegionMap: the subject's cells are the prior's complement,
+    minus face_cells) as a mask over the image tokens, one per cell, row-major; None without a person, or when the
+    face box covers all of it. The face-and-body Keel's body share."""
+    if rm is None or not rm.has_person or rm.prior.numel() != hh * ww:
+        return None
+    m = (~rm.prior).reshape(hh, ww).clone()
+    if rm.face_cells is not None:
+        cx0, cy0, cx1, cy1 = rm.face_cells
+        m[cy0:cy1, cx0:cx1] = False
+    if not bool(m.any()):
+        return None
+    return m.flatten()
+
+
+def arm_face_tap(injected: dict, masks: list | None, layout=None, sink=None, body_masks: list | None = None) -> None:
     """Keel's face-token gain for the batch about to be forwarded: each sample's face token mask (face_token_mask;
     None: no face), `layout` a callable giving the model's token layout (the alignment Taps' `layout`) and `sink`
-    the optimizer's face_energy. masks None disarms (disarm_face_tap)."""
+    the optimizer's face_energy; `body_masks` (the face-and-body version) each sample's body token mask
+    (body_token_mask; None: no body), reported to the sink as a fourth energy. masks None disarms (disarm_face_tap)."""
     for m in injected.values():
         if masks is None:
-            m.face_masks = m.face_layout = m.face_sink = None
+            m.face_masks = m.body_masks = m.face_layout = m.face_sink = None
         else:
-            m.face_masks, m.face_layout, m.face_sink = masks, layout, sink
+            m.face_masks, m.body_masks, m.face_layout, m.face_sink = masks, body_masks, layout, sink
 
 
 def disarm_face_tap(injected: dict) -> None:
