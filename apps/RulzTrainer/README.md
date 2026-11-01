@@ -1045,7 +1045,9 @@ from the good pictures, not away from the bad ones. At each step of `selftrain_a
    (below 0.7) or the frame cuts off, and the ones far blurrier than the round's other pictures (variance of the
    Laplacian below 0.4 x the round's median, at the training resolution; on the face when it is 64 px or larger there,
    since a render's soft background is not blur, else on the whole picture). Renders are compared with renders: real
-   photos carry grain and texture a clean render never has, so against them every render looks soft;
+   photos carry grain and texture a clean render never has, so against them every render looks soft. With the
+   [copy check](#copy-check-copy_check) (on by default with self-training) it also leaves out the pictures that copy
+   one of the training photos;
 3. scores the rest like the probes (normalized face and body, combined with `face_weight` / `body_weight`) and keeps
    those above both `selftrain_min_likeness` (60) and the probes' current smoothed score, best first, skipping
    near-copies of a kept one (32 px thumbnails correlating above 0.95), up to `selftrain_share` (0.2) of the real
@@ -1054,7 +1056,7 @@ from the good pictures, not away from the bad ones. At each step of `selftrain_a
    at every training resolution they are not upscaled to (region maps from their own face; no person masks).
 
 The pictures, every candidate's scores and why it was left out are in `<job>/selftrain/` (`selftrain.json`); a resumed
-run trains on with the last round's pictures. Not in a race. Training a model on its own output can amplify its own
+run trains on with the last round's pictures. Not with `race_parallel`. Training a model on its own output can amplify its own
 artifacts: LoRAs retrained on their outputs over several rounds lost quality visibly by the third (*Model Collapse in
 the Self-Consuming Chain of Diffusion Finetuning*, arXiv 2407.17493), which is why the rounds are few, replace each
 other and stay a small share. The scorer that picks the pictures is the probes' own, so judge the samples by eye too.
@@ -1129,6 +1131,32 @@ VGGFace2; the identity loss's `facenet` backend, downloaded once to `models/face
 
 Whether FaceNet agrees with people better than ArcFace on LoRA renders is not measured; it is there because it is
 independent of what the run optimizes.
+
+## Copy check (`copy_check`)
+
+A LoRA trained on a few photos can learn to redraw one of them: the same pose, outfit and background. Self-training
+would then feed that copy back in and teach the photo again rather than the person in a new scene. The copy check
+compares pictures with the training photos using SSCD (Pizzi et al., CVPR 2022), the copy detector diffusion
+memorization studies use (Somepalli et al. 2023 read a cosine above 0.5 as a likely partial copy):
+
+- **Model:** `sscd_disc_mixup` (TorchScript, about 99 MB, downloaded once to `models/sscd/`; MIT), the whole picture
+  squeezed to 320 x 320. About 40 ms per picture on a GPU (the face scorer's), 0.2 s on the CPU. On this machine a
+  flipped copy of a photo scored 0.94, a 512 px crop of one 0.54-0.56, unrelated renders about 0.
+- **Score:** a picture's best cosine against the training photos (each photo once, whatever its resolutions). The
+  photos' own typical best match among themselves (the median, as `reference_ceiling` for likeness) is the baseline: a
+  single shoot in one room already matches itself highly, and a render that looks like one more photo from it is no
+  copy.
+- **Self-training:** a picture above `copy_max` (0.5), raised to the baseline + 0.1 when that is higher, is left out
+  as "copies a photo", after the quality filter and before the likeness bar. `selftrain.json` keeps each candidate's
+  `copy` and `copy_of` and the round's `copy_limit`.
+- **Probes:** each probe logs its closest training photo ("Copy check step N: closest training photo 0.42
+  (step000400_body_0.png to 17.jpg) | the photos among themselves 0.31 | copy limit 0.50"), and `likeness.jsonl`
+  keeps `copy`, `copy_of` and `copy_baseline`; the Monitor's probe line shows `copy`. It decides nothing.
+- **When:** `auto` (the default) with self-training (in a race: when any configuration self-trains; the gate only
+  applies to those that do), `on` for any run with probes, `off` never. Not in the noise check or a seed soup.
+
+No study calibrates SSCD on DiT LoRA renders of people, so the limit is the literature's partial-copy threshold read
+against your photos' own baseline; check a few left-out pictures by eye and raise `copy_max` if they are not copies.
 
 ## Probe noise check (`noise_files`)
 
