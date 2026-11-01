@@ -139,6 +139,9 @@ class Automagic4(Automagic3):
         if step_target is not None:
             log.info("Automagic4: step_target %s is ignored (the vote is zero-centred; there is no target flip rate)",
                      step_target)
+        # A multiplier on this step's update (not on the weight decay), set per step by a subclass (Keel's noise-band
+        # weight) and None otherwise; applied after the vote, which a positive gain leaves unchanged.
+        self.update_gain: Optional[float] = None
         super().__init__(params, *args, **kwargs)
 
     # ------------------------------------------------------------------ bookkeeping
@@ -214,6 +217,12 @@ class Automagic4(Automagic3):
             self._rebuild_group_index()
             self._ref = ref  # an inherited reference survives (the refresh re-reads it when there is state)
             self._refresh_group_lrs()
+
+    def _element_gain(self, p: torch.Tensor, i0: int = 0, i1: Optional[int] = None) -> Optional[torch.Tensor]:
+        """An elementwise multiplier on p's update (rows i0:i1 of a 2-D tensor when given; a 0-dim tensor for the
+        whole tensor), applied after the sensitivity balance and before the sign history so the vote sees the gated
+        magnitude, or None: a hook for a subclass (Keel's consensus gate and face-token gain)."""
+        return None
 
     def _init_state(self, p: torch.Tensor, group: dict) -> None:
         super()._init_state(p, group)
@@ -390,6 +399,14 @@ class Automagic4(Automagic3):
         balance = isv.mul_(kbal).clamp_(max=1.0)
         update.mul_(balance)
         del balance, isv
+        gains = [self._element_gain(p) for p in params]
+        if any(g is not None for g in gains):
+            if n == 1:
+                update[0].mul_(gains[0])
+            else:
+                update.mul_(torch.stack([(g.expand(shape) if g.dim() == 0 else g) if g is not None
+                                         else torch.ones(shape, device=grad.device) for g in gains]))
+        del gains
 
         # Sign history (packed planes, stacked [N, H, W]) and the pooled vote.
         hists = [st["sign_history"] for st in states]
@@ -410,6 +427,8 @@ class Automagic4(Automagic3):
         if n > 1:
             torch._foreach_copy_(hists, list(hist.unbind(0)))
         del hist
+        if self.update_gain is not None:
+            update.mul_(self.update_gain)
 
         # p -= lr * (update + wd * p), decoupled weight decay as upstream.
         lr_t = self._group_lr[gi]
@@ -498,6 +517,9 @@ class Automagic4(Automagic3):
             balance = torch.mul(r[i0:i1, None] * kbal, c).clamp_(max=1.0)
             u.mul_(balance)
             del balance
+            gain = self._element_gain(p, i0, i1)
+            if gain is not None:
+                u.mul_(gain)
             w0, w1 = i0 * C // 8, i1 * C // 8
             n_el = (i1 - i0) * C
             hist[idx_old, w0:w1] = self._pack_rows(u.gt(0.0).reshape(1, -1), w1 - w0)[0]
@@ -510,6 +532,8 @@ class Automagic4(Automagic3):
                 else:
                     num.add_(nm)
                     den.add_(dn)
+            if self.update_gain is not None:
+                u.mul_(self.update_gain)
             if p.dtype == torch.float32:
                 if wd != 0.0:
                     u.add_(p[i0:i1], alpha=wd)

@@ -52,7 +52,7 @@ from . import quant as Q
 log = logging.getLogger("rulztrainer")
 
 BYTES_PER_PARAM = {"adafactor": 10, "adamw8bit": 12, "adamw": 18, "automagic3": 18,  # fp32 w + grad + state + bf16
-                   "automagic4": 12}  # 1 byte of sign history per weight; its step works in bounded row slabs
+                   "automagic4": 12, "keel": 12}  # 1 byte of sign history per weight; the step works in row slabs
 ANCHOR_BYTES = 2  # the original weights kept for finetune_anchor (int8 / nvfp4 need less; bf16 needs this)
 DELTA_SUFFIX = "_finetune.safetensors"
 
