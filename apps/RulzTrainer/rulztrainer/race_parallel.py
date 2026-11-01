@@ -255,7 +255,17 @@ class RaceParallelMixin:
             if observe is not None:  # Keel: the step's noise levels (its bands)
                 for s in sigmas.get(v.idx, ()):
                     observe(s)
+            lr_mult = self._clean_lr_scale(  # clean_share: half the lr on the lower-share epochs
+                cfg, st["step"], st.get("batcher"), cfg.batch_size * cfg.gradient_accumulation) \
+                if cfg.clean_share else 1.0
+            if lr_mult != 1.0:  # this step only
+                saved_lrs = [g["lr"] for g in st["optimizer"].param_groups]
+                for g in st["optimizer"].param_groups:
+                    g["lr"] = g["lr"] * lr_mult
             st["optimizer"].step()
+            if lr_mult != 1.0:
+                for g, lr0 in zip(st["optimizer"].param_groups, saved_lrs):
+                    g["lr"] = lr0
             st["optimizer"].zero_grad(set_to_none=True)
             if st["ema"] is not None:
                 st["ema"].update(step_images[v.idx])
