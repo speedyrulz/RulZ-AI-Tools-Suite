@@ -664,8 +664,76 @@ step); otherwise it becomes a per-sample loss weight. `loss_watch_exclude_after:
 at the lowest throttle for N more epochs; exclusions are remembered in `<dataset>/.rulz_cache/excluded.json`
 and cleared by editing the image's caption. Output: `per_image_loss.jsonl` (every observation),
 `per_image_loss.json` (the table), a Monitor table and verdict badges on the Dataset tab. Not used with
-`automagic3`, whose step normalisation would absorb the per-image scaling. Verdicts need a few epochs to mean
+`automagic3` / `automagic4`, whose step normalisation would absorb the per-image scaling. Verdicts need a few epochs to mean
 anything, so this suits typical character sets trained for thousands of steps.
+
+## Self-tuning optimizers: Automagic 3 and 4 (`optimizer: automagic3 | automagic4`)
+
+Both are ported from ai-toolkit (Ostris, MIT) and run unfused, so gradient clipping and accumulation still apply. The
+learning rate you set is only the start: every weight keeps the signs of its last `automagic_polarity_history` updates
+(1 bit each), and the group's rate is nudged once per step by their pooled vote, within `automagic_min_lr` /
+`automagic_max_lr`. The LR schedule, warm-up, LoRA+ and the per-image learning rate do not apply. `automagic_groups:
+by_type` gives the text-side, attention, feed-forward and other layers their own rate (see the identity levers below).
+
+**Automagic 4** adds two things. *Sensitivity-balanced steps*: a weight's gradient power (the second moment the
+optimizer keeps anyway) measures how far one step moves the model's output; weights above the
+`automagic_sensitivity_quantile` (0.9) of the LoRA's elements take a smaller, Newton-like step, so a timestep embedder,
+a modulation projection or an early attention value (measured 3x to 135x the bulk's gradient power on Krea 2) is not
+overcooked at the rate the bulk needs. The first step only measures. *A controller that holds on noise*: ai-toolkit's
+v4 votes every weight's sign-flip rate against a neutral point above 50%, so on a noise-dominated diffusion loss (flip
+rate 0.50 on Krea 2 at batch 1) the rate climbed 1.6% per step whatever the loss did, until the LoRA blew up
+(ai-toolkit issues #1084 and #1091: 1e-4 to 5.7e-3 by step 422 on MiniMax H3, Krea 2 to noise after about 400 steps).
+This port replaces the vote (`automagic_vote: graded`) by the mean update sign squared minus the flip rate, which is
+exactly zero on noise, positive on a consistent trend and negative on overshoot, and the rate moves at most
+`automagic_max_lr_change` (5%) per step. In a LoRA least-squares simulation with diffusion-like noise the upstream vote
+took the rate from 1e-4 to 2e-3 by step 200 and 21 by step 1500 (loss 1e13); the graded vote held it at about 1e-4
+(0.96 to 1.4e-4) and reached the best constant rate's loss, raised the rate 3.3x when the gradients carried signal,
+and walked a 30x too high start down 10x in 1500 steps (Automagic 3's rule: 3x). `extremes` is Automagic 3's vote
+rule with the balance (a third of the gain, no annealing on signal). Two more upstream bugs are fixed: a group whose
+LoRA downs were 90% or more of its elements (zero gradient while the ups are zero) got a reference of 1e-15 and never
+trained, and a layer that receives its first gradient late (a relay follower, a resume) started at the configured
+rate instead of the adapted one.
+
+On a real Krea 2 rank-16 LoRA (6 images, 160 steps, `learning_rate: 1e-4`, `automagic_max_lr: 1e-3`, `by_type`, the
+same seed, nvfp4 on an RTX 5060 Ti) the rate went: upstream v4 1.8e-4 at step 20, 7.3e-4 at 70, the 1e-3 ceiling at
+100 and pinned there to the end; this port 1.7e-4, a peak of 6.0e-4 at step 70 while the fresh LoRA's gradients held
+one direction, then back down to 3.2e-4 at 160 as the signs started to alternate; Automagic 3 rose to 2.6e-4 and
+held. Losses at step 160 were within noise of each other (0.078 / 0.079 / 0.081 averaged), too short a run to rank
+likeness. A whole training step took 1.6 s with this port, 2.2 s with Automagic 3 and 2.2 to 2.9 s with upstream v4.
+
+Speed and memory (RTX 4060 Ti, a rank-16 LoRA on the attention and feed-forward layers of Krea 2's 28 blocks: 392
+tensors, 48M elements; the default targets add the attention gate and text fusion): upstream v4 594 ms per step,
+Automagic 3 511 ms, this port 48 ms (adamw8bit 47 ms, fused AdamW 9 ms): the weights of one shape are updated as one
+stacked tensor, the flip counts are read from the packed sign planes, and the reference's bookkeeping never leaves the
+GPU. Rank 64: 564 to 174 ms. For a full fine-tune the step works in row slabs, so the transient over the largest
+weight (2.8 GB for upstream v4 and 3.8 GB for Automagic 3 on a 16384x6144 Krea 2 weight) is 61 MB. With either
+Automagic the next fine-tune window starts at the adapted rate instead of the configured one, and Automagic 4 keeps
+its sensitivity reference, so the window's first step trains. Optimizer state is 1 byte per weight at the default
+polarity history of 8 (H/8 bytes in general) plus the tiny Adafactor row and column factors.
+`automagic_sensitivity_quantile`, `automagic_vote` and `automagic_max_lr_change` can be raced; a relay from a `by_type`
+winner into a single-group racer starts that racer at the median of the winner's rates. A training state saved by
+Automagic 3 resumes under Automagic 4 (one measurement-only step) and the other way round; a state of any other
+optimizer is refused with a message. Automagic hyper-parameters are not restored from a state, so the rails, quantile,
+vote and step cap can change on resume (a lowered `automagic_max_lr` applies from the first step); `automagic_groups`
+must match, and a changed polarity history restarts the sign windows. On bf16 weights (the ai-toolkit drop-in) the
+adapted rate and the reference come back exactly instead of rounded to bf16 at each resume.
+
+For character likeness the balance throttles exactly the tensors identity training leans on (on Krea 2 the attention
+values and keys of blocks 1 to 9, the text-fusion output projections, the timestep path), which is the point: they get
+a Newton-like step instead of the bulk's. Whether that beats Automagic 3 or adamw8bit on the likeness probes is not
+measured yet, so the Wizard keeps recommending adamw8bit; race them (`race` rows with `optimizer`). A reasonable
+start: `learning_rate: 1e-4` with `automagic_max_lr: 1e-3`, `automagic_groups: by_type` on Krea 2, Qwen-Image 2.1,
+MOSS-Image and FIBO (their text-side layers are a small minority that one pooled vote drowns out; `txt_in` now counts
+as text-side on Krea 2 and FIBO's timestep embedder as "other"), polarity history 8 to 16. The likeness controller's
+rate multiplier scales the adapted rate; on a noise-dominated loss the vote leaves it alone, and when the gradients
+carry signal the vote may pull the rate back toward its own fixed point over the following steps.
+
+**MiniMax H3 and FLUX Klein** are trained in ai-toolkit, not here. `rulztrainer/optimizers/automagic4.py` depends only
+on `automagic3.py` next to it and keeps ai-toolkit's constructor (`step_target` is accepted and ignored), so copying it
+over `ai-toolkit/toolkit/optimizers/automagic4.py` gives ai-toolkit the fixed controller, including in its fused mode
+(where no gradient clipping runs, so set `max_lr` about 10x the start rate). On H3, the `adaln_proj` layers call their
+raw weight, so a LoRA injected there receives no gradient (exclude them with `ignore_if_contains: ["adaln_proj"]`), and
+Fizgig's ablations put identity in blocks 20 to 49.
 
 ## Identity training: what each step teaches (character LoRAs)
 
@@ -685,11 +753,13 @@ Four levers change the training objective and data for likeness, all off by defa
   Crops are ordinary items (own latents, captions, region maps, loss-watch verdicts) and count as face-heavy for
   the curriculum; `crop_augment_weight` scales how often they are drawn.
 - **LoRA+** (`lora_plus_ratio`, 16 = paper): the `lora_up` matrices train at lr x ratio for faster convergence
-  (AdamW-style optimizers; ignored by automagic3). Resuming a state requires the same ratio.
-- **Automagic lr groups** (`automagic_groups: by_type`, automagic3 only): text-side layers (Krea's text fusion,
-  MOSS's text projection, FIBO's perceiver), attention, feed-forward and the rest each adapt their own learning
-  rate instead of one shared rate the largest group dominates. Fizgig trains Krea 2 this way (its text fusion is the
-  slow minority), with `automagic_polarity_history: 16`. Resuming a state requires the same setting.
+  (AdamW-style optimizers; ignored by automagic3/4). Resuming a state requires the same ratio.
+- **Automagic lr groups** (`automagic_groups: by_type`, Automagic 3 and 4): text-side layers (Krea's text fusion and
+  `txt_in`, MOSS's text projection, FIBO's perceiver, Qwen's `txt_in`), attention, feed-forward and the rest each adapt
+  their own learning rate instead of one shared rate the largest group dominates. Fizgig trains Krea 2 this way (its
+  text fusion is the slow minority), with `automagic_polarity_history: 16`. Resuming a state requires the same setting.
+- **Automagic 4** (`optimizer: automagic4`): sensitivity-balanced steps (the most sensitive weights take smaller ones)
+  and a learning rate that holds on noise instead of drifting up; see *Self-tuning optimizers* above.
 
 The face analysis cache is `<dataset>/.rulz_cache/faces.json`; the Train tab has preview buttons for region
 maps and crops.
@@ -811,7 +881,8 @@ and only changes beyond `likeness_noise_band` count. The last step is always pro
   best files. Either way early stop and the resolution step-up count only a rise beyond the band as progress;
 - hill-climbs a bounded learning-rate multiplier (`likeness_lr_control`, `likeness_lr_min/max/step`): up while
   the smoothed score rises, down when it falls. It works with AdamW-style optimizers (through the scheduler)
-  and with Automagic 3 (by scaling its adaptive lr tensors), which keeps doing its own per-step adaptation;
+  and with Automagic 3 and 4 (by scaling their adaptive lr tensors), which keep doing their own per-step adaptation
+  (Automagic 4's vote may pull a scaled rate back toward its own fixed point while the gradients carry signal);
 - applies a face/body curriculum (`likeness_curriculum`): when the face score lags the body score, close-up
   dataset images (largest face >= 3% of the image, classified once with the face detector) are sampled more
   often and the timestep distribution shifts toward lower noise where facial detail forms; the reverse when the
@@ -1129,7 +1200,7 @@ run's LoRA (`<job>.safetensors`, its settings `<job>_winner.yaml`), the others a
 `<job>_best.safetensors`. Rows must share the LoRA's shape (no `lora_rank`, `lora_alpha`, targets, blocks, network type
 or DoRA rows; `lora_dropout` is fine), the drop and patience rules are ignored, and it does not run with
 `race_parallel`. A configuration on another kind of optimizer than the winner's starts its optimizer state over (the
-log says so). With 4 seeds the round's best of 4 probes is somewhat lucky: the probe noise (a few points) is part of
+log says so; Automagic 3 and 4 count as different kinds). With 4 seeds the round's best of 4 probes is somewhat lucky: the probe noise (a few points) is part of
 what picks the winner, so more probe seeds (`probe_seeds`) make the choice steadier.
 
 **One configuration per GPU (`race_parallel: true`).** With `multi_gpu: data_parallel` on two or more GPUs, the
@@ -1762,7 +1833,7 @@ ComfyUI's `custom_nodes` and load `workflows/RulzTrainer Likeness Scoring.json`;
 |---|---|
 | Gradient checkpointing | on |
 | Batch size | 1 (use gradient accumulation instead) |
-| Optimizer | `adamw8bit`, or `automagic3` (self-tuning lr, ported from ai-toolkit) |
+| Optimizer | `adamw8bit`, or `automagic3` / `automagic4` (self-tuning lr, ported from ai-toolkit; 1 byte of state per weight at the default polarity history; Automagic 4's step is as fast as adamw8bit's on a rank-16 LoRA, about 3x slower at rank 64 and 6x on a full fine-tune; Automagic 3's about 10x slower than Automagic 4's) |
 | Resolution | 1024 |
 | Text encoder device | `auto` (spreads over all GPUs + CPU during caching only) |
 | Max caption tokens | 512 to 1024 unless you train on very long prompts |

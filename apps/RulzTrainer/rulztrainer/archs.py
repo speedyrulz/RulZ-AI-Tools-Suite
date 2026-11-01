@@ -125,6 +125,8 @@ class Arch:
         if name.startswith(self.text_prefixes):
             return "text"
         parts = name.split(".")
+        if {"t_embedder", "time_embed", "time_text_embed", "time_embedding"} & set(parts):
+            return "other"  # the timestep path (FIBO's t_embedder.mlp is not a feed-forward layer)
         if {"attn", "attention", "cross_attention"} & set(parts) or parts[-1] in ("q", "k", "v", "o"):
             return "attn"
         if {"ff", "feed_forward", "mlp", "img_mlp"} & set(parts) or parts[-1].startswith("ffn"):
@@ -352,7 +354,7 @@ class Krea2Arch(Arch):
                      "attn_gate": "attention output gate", "text_fusion": "text fusion blocks",
                      "embed": "image/text/timestep projections and final layer"}
     default_targets = ARCH_DEFAULT_TARGETS["krea2"]  # + attention gate and text fusion (see config.py)
-    text_prefixes = ("text_fusion.",)
+    text_prefixes = ("text_fusion.", "txt_in.")  # the text projection is text-side too
     supports_single_files = True  # ComfyUI's Krea 2 diffusion model, Qwen3-VL-4B text encoder and Qwen-Image VAE files
     default_sample_steps, default_sample_cfg = ARCH_FULL_SAMPLE["krea2"]
     latent_tag = "_qwenvae"
