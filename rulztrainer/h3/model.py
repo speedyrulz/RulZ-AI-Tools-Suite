@@ -37,7 +37,9 @@ One packed sequence per sample, [text | target audio | target video], full self-
   - AdaLN: each block has one projection giving 6 vectors per (timestep, modality) pair, modality tags 0 video, 1 text,
     2 audio (the pipeline's tags; a T2VA presentation is all text). Pruned files (Comfy-Org's *_pruned_*) replace the
     time embedder by an fp32 [1025, 8] table of the SiLU'd time-embedding curve over t, interpolated linearly, feeding
-    8-wide projections without the SiLU (ComfyUI's use_adaln_curves path; kept in fp32 as ComfyUI keeps them);
+    8-wide projections without the SiLU (ComfyUI's use_adaln_curves path; kept in fp32 as ComfyUI keeps them); full
+    checkpoints are pruned on load the same way (`adaln_rank`: the time embedder stays, its SiLU'd output goes onto a
+    rank-8 basis plus a constant channel, musubi-tuner's --prune_adaln; h3/loading.py);
   - the audio stream: an image has no sound. Without `audio_states` the 4 audio rows are the silence placeholder
     (`audio_silence`, the audio VAE's encoding of a zero waveform, set by the loader) noised to the audio sigma with
     fresh noise, as musubi's one-frame training does (--video_only: the audio rows are context, never supervised). The
@@ -45,7 +47,9 @@ One packed sequence per sample, [text | target audio | target video], full self-
     with the audio prediction (`return_audio`), as joint generation does.
 
 Gradient checkpointing (torch.utils.checkpoint), the model-split device hand-off and the alignment taps work like the
-other ports; `skip_layers` skips blocks (kept for the shared sampler signature); QuantLinear / LoRALinear replace
+other ports (the taps see each 2x2 token on its 4 latent cells, the grid of the region maps); an odd latent grid (a
+probe size that is not whole 32 px) is padded circularly and cropped back, as ComfyUI pads to the patch size;
+`skip_layers` skips blocks (kept for the shared sampler signature); QuantLinear / LoRALinear replace
 nn.Linear transparently. The fp32 islands of the checkpoint (patch projections, time embedder, output heads, the pruned
 AdaLN) stay fp32 when the loader keeps them so; the blocks run in the condition projection's dtype (bf16)."""
 from __future__ import annotations
