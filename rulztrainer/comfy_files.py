@@ -13,6 +13,7 @@ import logging
 
 from .config import (ARCH_TRAINING_ADAPTER, ARCH_TURBO, COMFY_DIFFUSION_FILES, COMFY_DIFFUSION_QUANTS, COMFY_REPOS,
                      COMFY_TEXT_ENCODER_FILES, COMFY_TEXT_ENCODER_QUANTS, COMFY_VAE_FILES, TrainConfig)
+from .config import COMFY_TEXT_ENCODER_REPOS
 
 log = logging.getLogger("rulztrainer")
 
@@ -36,7 +37,9 @@ def planned_downloads(cfg: TrainConfig) -> list[tuple[str, str, str]]:
             if cfg.text_encoder_file_quant not in COMFY_TEXT_ENCODER_QUANTS[fam]:
                 raise ValueError(f"text_encoder_file_quant {cfg.text_encoder_file_quant!r}: {COMFY_REPOS[fam]} has "
                                  f"{', '.join(COMFY_TEXT_ENCODER_QUANTS[fam])}")
-            out.append(("text_encoder_file", repo, COMFY_TEXT_ENCODER_FILES[fam].format(quant=cfg.text_encoder_file_quant)))
+            te_repo = COMFY_TEXT_ENCODER_REPOS.get(fam, {}).get(cfg.text_encoder_file_quant, repo)
+            out.append(("text_encoder_file", te_repo,
+                        COMFY_TEXT_ENCODER_FILES[fam].format(quant=cfg.text_encoder_file_quant)))
         if not cfg.vae_file:
             out.append(("vae_file", repo, COMFY_VAE_FILES[fam]))
     if cfg.turbo_lora == "auto" and fam in ARCH_TURBO:
