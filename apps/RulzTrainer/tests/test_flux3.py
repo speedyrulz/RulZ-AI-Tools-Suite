@@ -445,3 +445,34 @@ def test_prompt_template_window_and_token_positions():
         assert text == want and drop == 0 and length == ids.shape[1] and len(offsets) == n
     _, mask, _ = FL.tokenize(tok, "word " * 2000, 1024)
     assert mask.shape[1] == 1024
+
+
+def test_wizard_suggests_bfl_recipe_and_klein_sampling(tmp_path):
+    from PIL import Image
+
+    import webui
+
+    a = tmp_path / "a"
+    a.mkdir()
+    for i in range(20):
+        Image.new("RGB", (64, 48)).save(a / f"{i}.png")
+    data = webui.datasets_summary([str(a)])
+    base = dict(model_path="black-forest-labs/flux-3-image-klein-base", datasets=[{"path": str(a)}])
+    rec = webui.wizard_recommendations(TrainConfig(**base), "style", [{"total": 16000}], data)
+    assert rec["steps"][0] == 4000 and rec["lora_rank"][0] == 32 and rec["lora_alpha"][0] == 32.0
+    assert rec["learning_rate"][0] == 1e-4 and rec["warmup_steps"][0] == 200 and rec["save_every"][0] == 250
+    assert (rec["sample_steps"][0], rec["sample_cfg"][0]) == (50, 3.5)
+    distilled = TrainConfig(**base, sample_model_path="black-forest-labs/flux-3-image-klein")
+    rec = webui.wizard_recommendations(distilled, "character", [{"total": 16000}], data)
+    assert (rec["sample_steps"][0], rec["sample_cfg"][0]) == (16, 1.0) and rec["probe_cfg"][0] == 1.0
+    char = webui.wizard_recommendations(TrainConfig(**base), "character", [], data)
+    assert (char["probe_steps"][0], char["probe_cfg"][0]) == (50, 3.5)  # no turbo LoRA: full sampler probes
+    hf = TrainConfig(**base, model_source="hf")
+    assert "16 GB card" in webui.wizard_recommendations(hf, "style", [{"total": 16000}], data)["transformer_quant"][1]
+    assert webui.block_swap_plan(hf, 15.9, "auto") == (0, 0.0)  # bf16 9.7 GB + a step's memory fit a 16 GB card
+    assert webui.block_swap_plan(hf, 8.0, "auto") == (0, 0.0)  # nvfp4
+    assert webui.N_BLOCKS["flux3_klein"] == archs.arch_by_name("flux3_klein").n_blocks == 28
+    issues = dict((text, kind) for kind, text in webui.review_issues(TrainConfig(**base), "style", data, 1))
+    assert any("FLUX Kommunity License" in t and k == "info" for t, k in issues.items())
+    wrong = TrainConfig(model_path="black-forest-labs/flux-3-image-klein", datasets=[{"path": str(a)}])
+    assert any("distilled" in t and k == "warning" for k, t in webui.review_issues(wrong, "style", data, 1))

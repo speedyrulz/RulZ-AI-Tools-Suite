@@ -45,8 +45,9 @@ TRANSFORMER_CLASSES = ("Flux3Transformer2DModel",)
 # the -comfy int8-convrot file does)
 QUANT_FILTER = lambda name: name.startswith(("txt_mode_blocks.", "content_mode_blocks.", "single_blocks."))  # noqa: E731
 # "auto" by the GPU memory the model will live in (all GPUs of a model split). Without the reference-image mode the
-# port holds 4.87B parameters: bf16 9.7 GB, int8 about 5.1 GB, nvfp4 about 3 GB (from the -comfy files' headers). A
-# "16 GB" card reports 15.9 GiB, so bf16 from 15 (an estimate, not measured in a training run yet)
+# port holds 4.87B parameters (the -comfy files' headers): 9.07 GiB in bf16, 4.76 int8, 2.84 nvfp4. A rank-32 LoRA
+# step on the default targets at 1 MP (gradient checkpointing, AdamW) peaked at 12.2 / 7.8 / 6.0 GiB reserved on an
+# RTX 5060 Ti (the real shapes with random weights, not a real-weights run). A "16 GB" card reports 15.9 GiB.
 AUTO_BF16_FROM_GB, AUTO_INT8_FROM_GB = 15, 9.5
 
 PROMPT_PREFIX = "<|im_start|>user\n"
