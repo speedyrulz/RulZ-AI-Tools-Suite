@@ -504,7 +504,7 @@ def resolve_model_dir(model_path: str, models_dir: str = "models") -> Path:
         return local.resolve()
     from huggingface_hub import snapshot_download
 
-    log.info("Downloading %s (%s: about 66 GB of transformer, 52 GB of text encoder layers, 11 GB of VAEs) to %s",
+    log.info("Downloading %s (%s: about 66 GB of transformer, 54 GB of text encoder shards, 11 GB of VAEs) to %s",
              path, "Ref2VA" if ref else "FL2VA", local)
     snapshot_download(path, local_dir=str(local), allow_patterns=_allow_patterns(ref))
     return local.resolve()

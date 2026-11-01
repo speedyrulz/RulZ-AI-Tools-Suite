@@ -194,7 +194,13 @@ class Attention(nn.Module):
         q, k, v = q.transpose(1, 2), k.to(q.dtype).transpose(1, 2), v.to(q.dtype).transpose(1, 2)
         tap = getattr(self, "_rz_tap", None)  # rulztrainer.alignment: the trigger's attention (training-only loss)
         if tap is not None:
-            tap(q, k)
+            grid = getattr(self, "rz_grid", None)  # (first video row, token rows, token columns): each 2x2 token's
+            if grid is not None:  # queries stand for its 4 latent cells, the grid the region maps are on
+                v0, hp, wp = grid
+                cells = q[:, :, v0:].unflatten(2, (hp, wp)).repeat_interleave(2, 2).repeat_interleave(2, 3)
+                tap(torch.cat([q[:, :, :v0], cells.flatten(2, 3)], dim=2), k)
+            else:
+                tap(q, k)
         out = sdpa(q, k, v, attn_mask=key_mask)
         return self.out_proj(out.transpose(1, 2).flatten(2).to(x.dtype))
 
@@ -484,9 +490,11 @@ class MiniMaxH3Transformer(nn.Module):
             raise ValueError(f"hidden_states must be one frame of latents [B, {self.latent_channels}, H/16, W/16]")
         if encoder_hidden_states.ndim != 3 or encoder_hidden_states.shape[2] != self.text_dim:
             raise ValueError(f"encoder_hidden_states must be [B, S, {self.text_dim}]")
-        batch, _, height, width = hidden_states.shape
-        if height % PATCH or width % PATCH:
-            raise ValueError("MiniMax H3 latents need an even height and width (images in multiples of 32 px)")
+        batch, _, out_h, out_w = hidden_states.shape
+        if out_h % PATCH or out_w % PATCH:  # not a 32 px image (a probe size): padded to whole tokens and cropped
+            # after, as ComfyUI's pad_to_patch_size does (circular); training buckets are multiples of 32 px
+            hidden_states = F.pad(hidden_states, (0, out_w % PATCH, 0, out_h % PATCH), mode="circular")
+        height, width = hidden_states.shape[-2:]
         device = hidden_states.device
         dtype = _wdtype(self.condition_proj)
         text_len = encoder_hidden_states.shape[1]
@@ -521,9 +529,16 @@ class MiniMaxH3Transformer(nn.Module):
         x = torch.cat([txt, aud, vid], dim=1)
 
         split = getattr(self, "split_devices", None)  # blocks may live on several devices (model split)
-        taps = getattr(self, "_rz_taps", None)  # rulztrainer.alignment (training-only losses)
+        taps = getattr(self, "_rz_taps", None)  # rulztrainer.alignment (training-only losses), on the latent cells
+        hp, wp = height // PATCH, width // PATCH
+        if taps is not None:
+            for blk in self.blocks:
+                blk.attn.rz_grid = (text_len + n_audio, hp, wp)
         if taps is not None and taps.armed:
-            taps.set_layout(0, (text_len + n_audio, n_video), (0, text_len), valid)
+            taps.set_layout(0, (text_len + n_audio, height * width), (0, text_len), valid)
+
+        def cells(rows):  # [B, N, D] token states -> [B, h * w, D], each token's state on its 4 cells
+            return rows.unflatten(1, (hp, wp)).repeat_interleave(PATCH, 1).repeat_interleave(PATCH, 2).flatten(1, 2)
         for i, block in enumerate(self.blocks):
             if i in skip_layers:
                 continue
@@ -533,15 +548,15 @@ class MiniMaxH3Transformer(nn.Module):
                     x, temb, cos, sin = x.to(bdev), temb.to(bdev), cos.to(bdev), sin.to(bdev)
                     key_mask = key_mask.to(bdev) if key_mask is not None else None
             x = self._run(block, x, temb, cos, sin, key_mask, text_len, n_audio)
-            if taps is not None and taps.armed:
-                taps.record_hidden(i, x[:, text_len + n_audio:])
+            if taps is not None and taps.armed and taps.recording and i in taps.hidden_layers:
+                taps.record_hidden(i, cells(x[:, text_len + n_audio:]))
 
         if split:
             fdev = _module_device(self.final_layer)
             if fdev is not None and x.device != fdev:
                 x, temb = x.to(fdev), temb.to(fdev)
         video, audio = self.final_layer(x, temb, text_len, n_audio)
-        out = -unpatchify(video.float(), self.latent_channels, height, width).to(device)
+        out = -unpatchify(video.float(), self.latent_channels, height, width)[:, :, :out_h, :out_w].to(device)
         if return_audio:
             return out, -audio.float().to(device)
         return out

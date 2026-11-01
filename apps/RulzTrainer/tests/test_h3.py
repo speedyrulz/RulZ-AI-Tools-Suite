@@ -154,8 +154,9 @@ def test_bf16_gradients_checkpointing_and_layers():
     assert skipped.shape == out.shape
     assert m.layers is m.blocks and len(m.layers) == 2 and m.latent_channels == 24
     assert m.split_tail_modules() == [m.final_layer]
-    with pytest.raises(ValueError):
-        m(torch.randn(1, 24, 3, 4), 500.0, enc, None)  # an odd latent grid is not a 32 px image
+    with torch.no_grad():  # an odd latent grid (a probe size that is not 32 px whole) is padded and cropped back
+        odd = torch.randn(1, 24, 3, 5).to(torch.bfloat16)
+        assert m(odd, 500.0, enc, None).shape == (1, 24, 3, 5)
 
 
 def test_model_split_hand_off_matches():
@@ -167,6 +168,48 @@ def test_model_split_hand_off_matches():
         want = ours(x, 300.0, enc, None, audio_states=audio)
         split_model(ours, ["cpu", "cpu"])  # same device twice: exercises the hand-off path
         assert torch.equal(ours(x, 300.0, enc, None, audio_states=audio), want)
+
+
+def _alignment_grads(checkpointing: bool):
+    """The trainer's alignment taps on the port: H3's 2x2 tokens are read on the 16 px cells of the region maps."""
+    from types import SimpleNamespace
+
+    from rulztrainer import alignment as A
+
+    torch.manual_seed(0)
+    model, _ = pair(12)
+    model.gradient_checkpointing = checkpointing
+    model.train()
+    taps = A.Taps([0], [1])
+    model._rz_taps = taps
+    A.attention_module(model.layers[1])._rz_tap = A.AttnTap(taps, 1)
+    prior = torch.ones(2, 1, 4, 6, dtype=torch.bool)
+    prior[:, :, 1:4, 1:4] = False
+    meta = [SimpleNamespace(prior=prior[b], face_cells=(1, 1, 3, 3), has_person=True) for b in range(2)]
+    regions = SimpleNamespace(prior=prior, meta=meta, text_paths=["0", "1"])
+    aligner = A.IdAligner(A.model_dim(model))
+    targets = [torch.nn.functional.normalize(torch.randn(A.FACE_EMB_DIM), dim=0) for _ in range(2)]
+    enc = torch.randn(2, 7, 40)
+    mask = torch.ones(2, 7, dtype=torch.bool)
+    mask[1, 5:] = False
+    audio = torch.randn(2, 4, 32)
+    taps.begin([[0, 1], [2]])
+    out = model(torch.randn(2, 24, 4, 6), torch.tensor([600.0, 200.0]), enc, mask, audio_states=audio)
+    taps.stop()
+    loc, n_loc = A.localization_loss(taps, regions)
+    ali, n_ali = aligner.loss(taps, 0, regions, targets)
+    assert n_loc == 2 and n_ali == 2 and 0 < loc.item() < 1 and 0 < ali.item() < 2
+    (out.pow(2).mean() + 0.5 * loc + 0.5 * ali).backward()
+    taps.end()
+    return [p.grad.clone() for p in list(model.parameters()) + list(aligner.parameters()) if p.grad is not None], \
+        float(loc), float(ali)
+
+
+def test_alignment_taps_read_the_cells_and_match_with_checkpointing():
+    plain, loc, ali = _alignment_grads(False)
+    ckpt, loc2, ali2 = _alignment_grads(True)
+    assert abs(loc - loc2) < 1e-6 and abs(ali - ali2) < 1e-6 and len(plain) == len(ckpt)
+    assert all(torch.allclose(a, b, atol=1e-6, rtol=1e-4) for a, b in zip(plain, ckpt))
 
 
 def pruned_pair(seed=4):
@@ -343,6 +386,68 @@ def test_released_audio_vae_encoder_converts_to_diffusers():
     state = HSF.audio_original_to_diffusers(meta_state(FIXTURE["audio_vae_comfy"]), want)
     assert set(state) == set(want) - {"latents_mean", "latents_std"}
     assert all(tuple(state[k].shape) == tuple(want[k][1]) for k in state)
+
+
+class _Tok:
+    """A stand-in tokenizer: one id per character (the encode path only needs input_ids)."""
+
+    def __call__(self, text, add_special_tokens=False, truncation=False, max_length=None, return_tensors=None,
+                 return_offsets_mapping=False):
+        ids = [3 + (ord(c) % 50) for c in text][: max_length or None]
+        out = type("T", (), {})()
+        out.input_ids = torch.tensor([ids]) if return_tensors == "pt" else ids
+        if return_offsets_mapping:
+            return {"offset_mapping": [(i, i + 1) for i in range(len(text))]}
+        return out
+
+    def get_vocab(self):
+        return {t: i for i, t in enumerate(("<d>", "</d>", "<|cutoff|>", "<|lyrics_start|>"))}
+
+
+def test_text_encoder_truncated_awq_and_the_layer_50_state(monkeypatch):
+    """The text model built from a Comfy-Org-style state (model.layers.*, cut after the conditioning layer, no final
+    norm, AWQ pre_quant_scale on o_proj / down_proj) gives the full encoder's hidden_states[n] (diffusers' read of
+    hidden_states[50]), the state after layer n before any norm."""
+    from transformers import Qwen3VLTextConfig, Qwen3VLTextModel
+
+    from rulztrainer.h3 import loading as HL
+    from rulztrainer.h3 import single_file as HSF
+
+    cfg = dict(HSF.TEXT_CONFIG, hidden_size=64, intermediate_size=128, num_attention_heads=4, num_key_value_heads=2,
+               head_dim=16, num_hidden_layers=4, vocab_size=64,
+               rope_parameters={"mrope_interleaved": True, "mrope_section": [4, 2, 2], "rope_theta": 5000000,
+                                "rope_type": "default"})
+    torch.manual_seed(11)
+    full = Qwen3VLTextModel(Qwen3VLTextConfig(**cfg)).eval()
+    with torch.no_grad():
+        for p in full.parameters():
+            p.normal_(0, 0.05)
+    monkeypatch.setattr(HSF, "TE_LAYERS", 2)
+    state = {f"model.{k}": v.clone() for k, v in full.state_dict().items()
+             if not k.startswith(("layers.2.", "layers.3.", "norm."))}
+    scales = {}
+    for name in ("layers.0.self_attn.o_proj", "layers.1.mlp.down_proj"):  # AWQ: W = (W / s) diag(s)
+        w = state[f"model.{name}.weight"]
+        s = torch.rand(w.shape[1]) + 0.5
+        state[f"model.{name}.weight"] = w / s
+        state[f"model.{name}.pre_quant_scale"] = s
+        scales[name] = s
+    state["visual.patch_embed.proj.weight"] = torch.zeros(2, 2)  # the vision tower is dropped
+    te = HSF.build_text_model(state, "none", "cpu", config=cfg)
+    assert te.config.num_hidden_layers == 2 and isinstance(te.layers[0].self_attn.o_proj, HSF.PreScaled)
+    prompt = "a photo of a cat"
+    with torch.no_grad():
+        got = HL.encode_prompt(te.float(), _Tok(), prompt, 64).float()
+        ids = _Tok()(prompt, return_tensors="pt").input_ids
+        n = ids.shape[1]
+        pos = torch.arange(n).view(1, 1, n).expand(3, 1, n)
+        want = full(input_ids=ids, attention_mask=torch.ones_like(ids), position_ids=pos,
+                    output_hidden_states=True).hidden_states[2][0]
+    # bf16 weights: 4e-4 off hidden_states[2]; its neighbours (layers 1 and 3) are 1.5e-2 away
+    assert got.shape == (n, 64) and torch.allclose(got, want, atol=2e-3), float((got - want).abs().max())
+    text, offsets, drop, length = HL.prompt_tokens(_Tok(), prompt)
+    assert text == prompt and drop == 0 and length == len(prompt)
+    assert HL.encode_prompt(te.float(), _Tok(), "", 64).shape == (1, 64)  # an empty prompt is a single space
 
 
 # ---------------------------------------------------------------- VAEs on tiny random configs
@@ -702,6 +807,29 @@ def test_detection_caches_buckets_and_downloads(tmp_path):
     allow = HL._allow_patterns(False)
     assert "transformer/*" in allow and "transformer_ref/*" not in allow and \
         "text_encoder/model-00012-of-00014.safetensors" not in allow
+
+
+def test_wizard_recommends_the_h3_setup():
+    import webui
+
+    cfg = TrainConfig(model_path="MiniMaxAI/MiniMax-H3")
+    two = webui.wizard_recommendations(cfg, "character", [{"total": 16311}, {"total": 16380}], None)
+    assert two["multi_gpu"][0] == "model_split" and two["block_swap"][0] == 0
+    assert two["model_file_quant"][0] == "pruned_int8_convrot" and two["text_encoder_file_quant"][0] == "int8_convrot"
+    assert two["adapter_mode"][0] == "auto" and two["timestep_sampling"][0] == "reference"
+    assert (two["lora_rank"][0], two["lora_alpha"][0], two["learning_rate"][0]) == (16, 16.0, 1e-4)
+    assert two["sample_steps"][0] == 8 and two["sample_cfg"][0] == 1.0  # the turbo LoRA's
+    one = webui.wizard_recommendations(cfg, "style", [{"total": 16311}], None)
+    assert one["multi_gpu"][0] == "off" and 20 <= one["block_swap"][0] <= 30 and one["lora_rank"][0] == 32
+    assert one["text_encoder_file_quant"][0] == "nvfp4_awq"
+    no_turbo = webui.wizard_recommendations(TrainConfig(model_path="MiniMaxAI/MiniMax-H3", turbo_lora=""), None, [],
+                                            None)
+    assert (no_turbo["sample_steps"][0], no_turbo["sample_cfg"][0]) == (30, 1.0)
+    assert webui.N_BLOCKS["minimax_h3"] == 50 and "token_refiner" in webui.EXTRA_TARGETS
+    assert set(webui.file_quant_options("minimax_h3", "model")) == {"pruned_int8_convrot", "pruned_bf16",
+                                                                    "int8_convrot", "bf16"}
+    assert webui.preset_arch("MiniMax-H3-FL2VA") == webui.preset_arch("MiniMax-H3-Ref2VA") == "minimax_h3"
+    assert "MiniMax-H3-FL2VA" in webui.MODEL_NOTES and webui.MODEL_NOTES["MiniMax-H3-Ref2VA"][0] == "Not for training"
 
 
 def test_auto_quant_sizes_for_the_gpus(monkeypatch):
