@@ -15,6 +15,8 @@ A simple diffusion-model LoRA trainer with a WebUI. Supported models:
 - **Krea 2** (12B): train on Raw, use on Turbo ([details](#krea-2-training-on-raw-using-the-lora-on-turbo)).
 - **Qwen-Image 2.1** (7B): text-to-image LoRAs on one 16 GB card, with Fizgig's training adapter
   ([details](#qwen-image-21)).
+- **FLUX 3 Klein** (5.5B, Black Forest Labs): train on Base, use on Base or the 16-step distilled Klein; one 16 GB card
+  in int8 or bf16 ([details](#flux-3-klein)).
 - **Ideogram 4** (9.3B): LoRAs on one 16 GB card from the fp8 release, structured JSON captions or wrapped plain
   ones; non-commercial license ([details](#ideogram-4)).
 
@@ -327,6 +329,7 @@ WebUI's *Download now* fetches them ahead of time). `model_file_quant` and `text
 | Krea 2 Raw / Turbo | [Comfy-Org/Krea-2](https://huggingface.co/Comfy-Org/Krea-2) | int8_convrot 13.5 GB, fp8_scaled 13.1 GB, bf16 26.3 GB | Qwen3-VL-4B int8_convrot 4.9 GB, fp8_scaled 5.2 GB, bf16 8.9 GB | `qwen_image_vae` |
 | FIBO 2.0 dev / Edit Turbo | [Comfy-Org/Fibo-2.0](https://huggingface.co/Comfy-Org/Fibo-2.0) | int8_convrot 8.4 GB, bf16 16.5 GB | Qwen3-VL-4B, the same files as Krea 2's | `flux2-vae` |
 | Qwen-Image 2.1 / Turbo | [Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1) | int8_convrot 7.3 GB, bf16 14.2 GB | Qwen3-VL-8B int8_convrot 9.4 GB, bf16 17.5 GB | `qwen_image_2.1_vae_bf16` |
+| FLUX 3 Klein Base / distilled | [black-forest-labs/flux-3-image-klein-comfy](https://huggingface.co/black-forest-labs/flux-3-image-klein-comfy) (BFL's own, gated) | int8_convrot 5.8 GB, nvfp4 5.3 GB, bf16 11.1 GB (files; 5.1 / 4.8 / 9.7 GB loaded) | Qwen3-VL-4B int8_convrot 4.9 GB, bf16 8.9 GB | `flux2-vae` |
 | Ideogram 4 | [Comfy-Org/Ideogram-4](https://huggingface.co/Comfy-Org/Ideogram-4) | int8_convrot 9.6 GB, fp8_scaled 9.3 GB, nvfp4_mixed 5.5 GB (no bf16 release) | Qwen3-VL-8B: int8_convrot 9.4 GB and bf16 17.5 GB from Comfy-Org/Qwen-Image-2.1 (the same model), fp8_scaled 10.6 GB and nvfp4 6.3 GB from Comfy-Org/Ideogram-4 | `flux2-vae` |
 
 To use files you already have, set `transformer_file`, `text_encoder_file` and `vae_file` (the WebUI's optional file
@@ -361,6 +364,12 @@ downloaded Krea 2 repo if there is one, else `Qwen/Qwen3-VL-4B-Instruct` (not ga
 from the diffusion-model file's header, so the file name does not matter. Checked against the Hugging Face model:
 the VAE file matches exactly, the int8 and scaled-fp8 text encoder files match the bf16 encoder at cosine 0.999
 (quantization noise), and ComfyUI's int8_convrot DiT file matches the HF weights quantized the same way.
+
+**FLUX 3 Klein from single files**: BFL's files keep their own module names, which the port uses too; the int8
+ConvRot files fuse each block's q / k / v into `qkv`, split back by rows on load. The reference-image (editing) mode
+is not loaded (about 0.7 GB of an int8 file, 1.3 GB of a bf16 one), hence the smaller loaded sizes in the table. BFL's
+nvfp4 file keeps about a quarter of its block weights in bf16 (4.8 GB loaded); `transformer_quant: nvfp4` on any
+Klein file quantizes them all (3.0 GB). See [FLUX 3 Klein](#flux-3-klein).
 
 Accepted weight formats: bf16 / fp16 / fp32, fp8 (upcast) and ComfyUI's scaled fp8 (`weight_scale` applied on load),
 ComfyUI `int8_tensorwise` with or without ConvRot (Hadamard rotation), and ComfyUI `nvfp4`. Those two quantized
@@ -1715,6 +1724,79 @@ weights, a padded batch against each sample alone), ComfyUI's fused single-file 
 `FlowMatchEulerDiscreteScheduler`, an exported LoRA merged into diffusers' weights, the Turbo LoRA's fused feed-forward
 split onto both halves, and the training adapter (on while training, off while sampling, not saved).
 
+## FLUX 3 Klein
+
+RulzTrainer trains text-to-image LoRAs for Black Forest Labs' FLUX 3 Image Klein
+([black-forest-labs/flux-3-image-klein-base](https://huggingface.co/black-forest-labs/flux-3-image-klein-base)): a 5.5B
+DiT in which the caption and the image each pass through 5 blocks of their own, then 28 joint blocks over both
+(parallel attention + SwiGLU blocks, per-mode timestep modulation, 4-axis RoPE), with the Qwen3-VL-4B text encoder of
+Krea 2 / FIBO 2.0 and the Flux2 VAE of MOSS-Image / FIBO 2.0. Pick **FLUX-3-Klein-Base** as the model;
+**FLUX-3-Klein** is the 16-step distilled model (a flow map: each step also gets the timestep it jumps to), for samples
+only.
+
+- **Gated repos.** All of BFL's Klein repos (the single files too) are gated with automatic approval: accept the FLUX
+  Kommunity License on the model page once with your Hugging Face account and log in (`hf auth login`). A download
+  that is refused says so and links the page to accept.
+- **Files.** By default the model comes as BFL's own ComfyUI files
+  ([black-forest-labs/flux-3-image-klein-comfy](https://huggingface.co/black-forest-labs/flux-3-image-klein-comfy),
+  int8 ConvRot; there is no Comfy-Org repackage): the diffusion model (5.8 GB file, 5.1 GB loaded), the Qwen3-VL-4B
+  text encoder (4.9 GB, the same model Krea 2 and FIBO 2.0 load) and `flux2-vae`. The diffusers repo
+  (`model_source: hf`) works too and downloads only `transformer/`, `text_encoder/`, `vae/` and the configs (about
+  20 GB; not BFL's root single files or the fp8 / nvfp4 variants). `transformer_quant: auto` keeps a bf16 model bf16
+  on a 16 GB card, int8 from 10 GB, nvfp4 below.
+- **Memory**, measured on an RTX 5060 Ti (16 GB) with the real shapes and random weights (not yet a real-weights run):
+  a rank-32 step on the default targets at 1 MP with gradient checkpointing and AdamW peaked at 12.2 GB reserved in
+  bf16 (5.6 s per step), 7.8 GB in int8 (4.9 s) and 6.0 GB in nvfp4 (4.7 s); one sampling forward at 1 MP took 1.5 s
+  in bf16.
+- **Recipe** (BFL's, which the setup wizard suggests): about 20 images at 1 MP with a trigger word, rank 32 / alpha 32,
+  learning rate 1e-4 with 200 warm-up steps then constant, 4000 steps, a checkpoint every 250. BFL trains with AdamW
+  betas (0.9, 0.95); the trainer's AdamW uses PyTorch's (0.9, 0.999).
+- **Captions.** Klein is meant to be prompted through BFL's 9B prompt upsampler
+  ([flux-3-image-klein-pup](https://huggingface.co/black-forest-labs/flux-3-image-klein-pup)), which the trainer does
+  not run: write full scene captions (framing, subject, background, lighting), for the dataset and the sample prompts.
+- **LoRA targets**: the usual groups (`q`, `k`, `v`, `o`, `ffn_up_gate` = `mlp_in`, `ffn_down` = `mlp_out`) apply to
+  the 28 joint blocks, and with `mode_blocks` (on by default) to the 10 per-mode blocks too; `modulation` adds the
+  per-mode shift / scale / gate projections, `text_in` the text projection, `embed` the image / timestep embedders and
+  the final layer. `lora_blocks` counts the joint blocks (0-27).
+- **Text features** follow diffusers' `Flux3TextEncoderStep`: the prompt as one user turn of Qwen3-VL's chat template,
+  right-padded to a multiple of 80 tokens with the padding masked inside Qwen3-VL (its position ids set to 1), hidden
+  layers 4, 8, ..., 32 stacked per token ([S, 20480]). The model attends to that padding, so the cache keeps the whole
+  window; `max_token_length` (1024) caps it (the pipeline allows 8192).
+- **Latents** are the Flux2 VAE's, normalized as MOSS-Image and FIBO 2.0 do: they share the latent cache. Buckets are
+  multiples of 16 px.
+- **Samples.** There is no turbo LoRA: Base samples like BFL's pipeline, 50 steps at CFG 3.5 with the fixed shift 6.93
+  (about 2.5 minutes per 1 MP preview on a 16 GB card). For quick previews set the distilled
+  `black-forest-labs/flux-3-image-klein` (only its `transformer/` is downloaded, 11 GB) or a `-comfy`
+  `flux3-image-klein-*.safetensors` file as `sample_model_path` and sample 16 steps at CFG 1: the Base LoRA is copied
+  onto it. The community's few-step LoRAs for Base (31 Oct 2026)
+  need their own ComfyUI nodes or call themselves a quick experiment, so none is wired in.
+- **Export** keeps BFL's module names under `diffusion_model.` with `lora_A` / `lora_B` and the alpha folded into
+  `lora_B` (the `folded` export format, no `.alpha` keys): ComfyUI's LoRA loader maps them onto Base and the distilled model
+  (onto the fused `qkv` of the int8 files too), and diffusers' Flux3 loader converts them (it refuses `.alpha` keys).
+  The trained alpha is kept in the file's metadata, so `resume_from` continues where it left off.
+- **Licence**: the FLUX Kommunity License: non-commercial use, plus commercial use of outputs for companies under
+  US$5M revenue, with restrictions; its commercial exception does not cover every kind of fine-tuning or distribution,
+  so read it before sharing or selling a LoRA. The text encoder is Apache-2.0.
+
+```python
+import torch
+from diffusers import ModularPipeline  # needs peft for load_lora_weights
+pipe = ModularPipeline.from_pretrained("black-forest-labs/flux-3-image-klein")  # distilled: 16 steps, no CFG
+pipe.load_components(dtype=torch.bfloat16)
+pipe.to("cuda")
+pipe.load_lora_weights("output/<job>/<job>.safetensors")
+image = pipe(prompt="<trigger>, <a full scene caption>", output="images")[0]
+```
+
+Verified without the weights: `tests/test_flux3.py` checks the port against diffusers' `Flux3Transformer2DModel` (tiny
+random weights in fp32, a padded batch against each sample alone, the flow map's target timestep), the real Klein
+files' 357 key names and shapes (from their safetensors headers) against the model the port builds, the diffusers
+layout as the inverse of diffusers' own converter, ComfyUI's fused-qkv layout, an exported LoRA merged into
+diffusers' weights through diffusers' own Flux3 LoRA key conversion, the schedule against
+`FlowMatchEulerDiscreteScheduler`, the prompt template against Qwen3-VL's chat template, and the downloads. With the
+real Qwen3-VL-4B and Flux2 VAE weights (FIBO 2.0's copies), the cached text features and latents are bit for bit what
+diffusers' Flux3 pipeline computes.
+
 ## Ideogram 4
 
 RulzTrainer trains LoRAs for [Ideogram 4](https://github.com/ideogram-oss/ideogram4), Ideogram's 9.3B flow-matching
@@ -1963,7 +2045,8 @@ Dockerfile         optional vast.ai image with the install baked in
 
 ## Adding another model
 
-Model families are `Arch` classes in `rulztrainer/archs.py` (MOSS-Image, FIBO 2.0 and Krea 2 today). An Arch provides
+Model families are `Arch` classes in `rulztrainer/archs.py` (MOSS-Image, FIBO 2.0, Krea 2, Qwen-Image 2.1 and
+FLUX 3 Klein today). An Arch provides
 the loading functions (transformer, VAE, text encoder), `encode_prompt` / `pad_embeds`, `encode_images` /
 `decode_latents` for its VAE, a sampler, the LoRA module names for the target groups, the export format, and its
 reference timestep recipe. A family with a VAE of its own sets `latent_tag`, so its latents are cached under their own
