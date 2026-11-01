@@ -13,4 +13,5 @@ dependencies = [
 ]
 
 [tool.setuptools]
-packages = ["rulztrainer", "rulztrainer.moss", "rulztrainer.optimizers", "rulztrainer.h3"]
+packages = ["rulztrainer", "rulztrainer.moss", "rulztrainer.optimizers", "rulztrainer.flux3", "rulztrainer.ideogram4",
+            "rulztrainer.h3"]
