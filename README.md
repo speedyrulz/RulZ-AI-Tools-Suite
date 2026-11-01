@@ -1658,7 +1658,9 @@ AdaLN, q/k RMSNorm, 3-axis interleaved MRoPE), conditioned on 13 layers of Qwen3
   (int8 ConvRot 9.4 GB): Ideogram 4 uses the same Qwen3-VL-8B (identical norms and embeddings, the projections within
   the fp8 rounding) and the same tokenizer. Measured on 16 rows per layer against the release's fp8: the int8_convrot
   file is within 0.9% (as the trainer's own int8 of the release), fp8_scaled 3.7-3.9% on the block layers and 19% on
-  `input_proj` (its per-tensor scale of 1 leaves the small weights in fp8's subnormal range): train from int8_convrot.
+  `input_proj` (its per-tensor scale of 1 leaves the small weights in fp8's subnormal range), and nvfp4_mixed keeps
+  its non-block layers in that same fp8: train from int8_convrot (for nvfp4, `transformer_quant: nvfp4` on the
+  int8 file or the Hugging Face release keeps those layers exact).
   The Hugging Face source (`model_source: hf`) reads [ideogram-ai/ideogram-4-fp8](https://huggingface.co/ideogram-ai/ideogram-4-fp8)
   (gated: accept the agreement and `hf auth login`) or its ungated mirror
   [unsloth/ideogram-4-fp8](https://huggingface.co/unsloth/ideogram-4-fp8): 18.2 GB of it (transformer 9.29 GB, text

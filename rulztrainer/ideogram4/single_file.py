@@ -11,7 +11,8 @@ model.diffusion_model. / conditional_transformer.):
     else bf16; fp8_scaled is float8_e4m3fn with a per-tensor scale (1.0 in the file); nvfp4_mixed nvfp4 blocks and fp8
     elsewhere. Measured against the release's fp8 on 16 rows each: int8_convrot is within 0.9% (the trainer's own
     int8_convrot of the release: 0.9%), fp8_scaled 3.7-3.9% on the block layers and 19% on input_proj (its scale of 1
-    leaves the small weights in fp8's subnormal range), so int8_convrot is the file to train from.
+    leaves the small weights in fp8's subnormal range), and nvfp4_mixed has its non-block layers in that same fp8, so
+    int8_convrot is the file to train from.
   - diffusers' layout (attention.to_q / to_k / to_v / to_out.0; ideogram-ai/ideogram-4-nf4 and its unsloth mirror
     store it as bitsandbytes nf4): q / k / v are fused into qkv on load (fuse_diffusers_attention), nf4 is
     dequantized (dequantize_nf4).

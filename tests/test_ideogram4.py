@@ -461,6 +461,11 @@ def test_sampler_schedule_matches_ideograms_and_diffusers():
     r = IDEO.reference_sigmas(20000, torch.Generator().manual_seed(0), 4096)
     assert 0.0 < float(r.min()) and float(r.max()) < 1.0
     assert abs(float(torch.logit(r.double()).mean()) - S.resolution_mean(0.5, 1024, 1024)) < 0.05
+    from rulztrainer.trainer import sample_sigmas  # the trainer's timestep_sampling: reference
+
+    s = sample_sigmas(TrainConfig(model_path="ideogram-ai/ideogram-4-fp8", timestep_sampling="reference"), 64,
+                      torch.Generator().manual_seed(1), tokens=1024)
+    assert s.shape == (64,) and float(s.min()) > 0 and float(s.max()) < 1
 
 
 def test_sample_runs_cfg_against_the_text_free_pass():
