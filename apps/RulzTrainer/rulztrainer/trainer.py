@@ -217,29 +217,77 @@ def _shift_logit(s: torch.Tensor, logit_shift: float) -> torch.Tensor:
     return torch.sigmoid(torch.log(s / (1 - s)) + logit_shift)
 
 
+class TimestepStrata:
+    """timestep_buckets (musubi-tuner's num_timestep_buckets): stratified sigma draws. The unit interval is cut into N
+    equal buckets and every N draws in a row take one value from each, in a shuffled order (a fresh deck of the N
+    buckets each time one runs out), so a short run or a small dataset covers the sampling curve evenly instead of by
+    luck. The values then go through the timestep mode's own curve (its inverse CDF: a normal draw is ndtri(u)), so
+    the curve's shape is unchanged; only where on it the steps land is evened out. musubi-tuner deals the buckets per
+    epoch; here the deck runs over the whole run, so every N draws are even whatever the epoch length."""
+
+    def __init__(self, n: int):
+        self.n = int(n)
+        self.deck: list[int] = []
+
+    def uniform(self, k: int, gen: torch.Generator) -> torch.Tensor:
+        idx = []
+        for _ in range(k):
+            if not self.deck:
+                self.deck = torch.randperm(self.n, generator=gen).tolist()
+            idx.append(self.deck.pop())
+        u = (torch.tensor(idx, dtype=torch.float64) + torch.rand(k, generator=gen, dtype=torch.float64)) / self.n
+        return u.clamp(1e-6, 1 - 1e-6).float()
+
+    def state_dict(self) -> dict:
+        return {"n": self.n, "deck": list(self.deck)}
+
+    def load_state_dict(self, state: dict | None) -> None:
+        if state and int(state.get("n", 0)) == self.n:  # (another bucket count starts a fresh deck)
+            self.deck = [int(i) for i in state["deck"]]
+
+
+def make_strata(cfg: TrainConfig) -> TimestepStrata | None:
+    """The run's (or a race configuration's) bucket deck, or None when timestep_buckets is off."""
+    if cfg.timestep_buckets < 2:
+        return None
+    if cfg.timestep_sampling == "reference":
+        log.warning("timestep_buckets: the reference sampler draws the model family's own way; its draws are not "
+                    "bucketed")
+        return None
+    log.info("Timestep buckets: %d (every %d draws cover the sampling curve evenly)", cfg.timestep_buckets,
+             cfg.timestep_buckets)
+    return TimestepStrata(cfg.timestep_buckets)
+
+
 def sample_sigmas(cfg: TrainConfig, n: int, gen: torch.Generator, logit_shift: float = 0.0, tokens: int = 0,
-                  arch=None) -> torch.Tensor:
-    """tokens: the batch's image token count (H/16 x W/16), which the architectures' own recipes depend on."""
+                  arch=None, strata: TimestepStrata | None = None) -> torch.Tensor:
+    """tokens: the batch's image token count (H/16 x W/16), which the architectures' own recipes depend on. strata:
+    timestep_buckets' deck (make_strata); None draws freely, as every run without it always has."""
     mode = cfg.timestep_sampling
+    if strata is not None and mode != "reference":
+        u = strata.uniform(n, gen)
+        rand, randn = (lambda: u), (lambda: torch.special.ndtri(u))
+    else:
+        rand, randn = (lambda: torch.rand(n, generator=gen)), (lambda: torch.randn(n, generator=gen))
     if mode == "uniform":
-        s = _shift_logit(torch.rand(n, generator=gen), logit_shift)
+        s = _shift_logit(rand(), logit_shift)
     elif mode == "reference":  # the model family's own training recipe (Bria's trainer / the MOSS-Image report)
         s = _shift_logit((arch or get_arch(cfg)).reference_sigmas(n, gen, tokens), logit_shift)
     elif mode == "logit_normal":
-        s = torch.sigmoid(torch.randn(n, generator=gen) * cfg.logit_std + cfg.logit_mean + logit_shift)
+        s = torch.sigmoid(randn() * cfg.logit_std + cfg.logit_mean + logit_shift)
     elif mode == "sigmoid":
-        s = torch.sigmoid(torch.randn(n, generator=gen) * cfg.sigmoid_scale + logit_shift)
+        s = torch.sigmoid(randn() * cfg.sigmoid_scale + logit_shift)
     elif mode == "logsnr":  # style-friendly (arXiv 2411.14793): log-SNR ~ N(mean, std); SNR = ((1 - s) / s)^2
-        logsnr = torch.randn(n, generator=gen) * cfg.logsnr_std + cfg.logsnr_mean
+        logsnr = randn() * cfg.logsnr_std + cfg.logsnr_mean
         s = torch.sigmoid(-logsnr / 2 + logit_shift)
     elif mode == "identity":  # detail-heavy: logit-normal with mean -0.5 (median sigma ~0.38)
-        s = torch.sigmoid(torch.randn(n, generator=gen) * 1.0 - 0.5 + logit_shift)
+        s = torch.sigmoid(randn() * 1.0 - 0.5 + logit_shift)
     elif mode == "content":  # ai-toolkit style cubic sampling toward low noise (structure/identity)
-        s = _shift_logit(torch.rand(n, generator=gen) ** cfg.content_power, logit_shift)
+        s = _shift_logit(rand() ** cfg.content_power, logit_shift)
     elif mode == "style":  # mirror: toward high noise
-        s = _shift_logit(1 - torch.rand(n, generator=gen) ** cfg.content_power, logit_shift)
+        s = _shift_logit(1 - rand() ** cfg.content_power, logit_shift)
     elif mode == "shift":  # legacy alias: uniform + timestep_shift
-        s = _shift_logit(torch.rand(n, generator=gen), logit_shift)
+        s = _shift_logit(rand(), logit_shift)
     else:
         raise ValueError(f"Unknown timestep_sampling {mode}")
     if cfg.timestep_shift != 1.0:
@@ -256,16 +304,42 @@ def pairs_sigma(cfg: TrainConfig) -> bool:
 
 
 def draw_sigmas(cfg: TrainConfig, n: int, gen: torch.Generator, shift: float, tokens: int, arch,
-                step_sigma: torch.Tensor | None):
+                step_sigma: torch.Tensor | None, strata: TimestepStrata | None = None):
     """A micro-batch's sigmas: sample_sigmas, or the step's one sigma repeated when pairs_sigma(cfg) (drawn with the
     step's first micro-batch). Returns (sigma [n], the step's sigma to carry to the next micro-batch, or None)."""
     if step_sigma is not None:
         return step_sigma.expand(n).clone(), step_sigma
-    sigma = sample_sigmas(cfg, n, gen, shift, tokens=tokens, arch=arch)
-    if pairs_sigma(cfg):
+    if pairs_sigma(cfg):  # (a bucketed run draws the one sigma alone: the others would leave the deck unused)
+        sigma = sample_sigmas(cfg, 1 if strata is not None else n, gen, shift, tokens=tokens, arch=arch, strata=strata)
         step_sigma = sigma[:1].clone()
         return step_sigma.expand(n).clone(), step_sigma
-    return sigma, None
+    return sample_sigmas(cfg, n, gen, shift, tokens=tokens, arch=arch, strata=strata), None
+
+
+def step_grad_norm(params, max_norm: float) -> float | None:
+    """The step's gradient norm before clipping (the gradients clipped to max_norm when it is above 0), for the log and
+    the Monitor; None when it is not finite (the step's update is then garbage, and JSON has no NaN)."""
+    if max_norm > 0:
+        total = torch.nn.utils.clip_grad_norm_(params, max_norm)
+    else:
+        grads = [p.grad for p in params if p.grad is not None]
+        if not grads:
+            return None
+        total = torch.nn.utils.get_total_norm(grads)
+    value = float(total)
+    return value if math.isfinite(value) else None
+
+
+def format_grad_norm(norm: float | None, max_norm: float) -> str:
+    """The log line's gradient norm: "0.412", "3.20 (clipped)" above max_grad_norm, "nan" when not finite."""
+    if norm is None:
+        return "nan"
+    return f"{norm:.3g} (clipped)" if 0 < max_norm < norm else f"{norm:.3g}"
+
+
+def round_norms(norms: list) -> list:
+    """Gradient norms for the status file: 4 significant digits (they span decades), None kept."""
+    return [None if v is None else float(f"{v:.4g}") for v in norms]
 
 
 def loss_weight(cfg: TrainConfig, sigma: torch.Tensor) -> torch.Tensor:
@@ -397,6 +471,7 @@ class Trainer(RaceParallelMixin):
         self.controller = None
         self.batcher = None
         self.ts_logit_shift = 0.0
+        self.ts_strata: TimestepStrata | None = None  # timestep_buckets' deck (a race configuration's own)
         self.item_face_frac: dict[str, float] = {}
         self.loss_watch = None
         self.curriculum_w: dict[str, float] | None = None
@@ -801,6 +876,7 @@ class Trainer(RaceParallelMixin):
         torch.manual_seed(cfg.seed)
         rng = random.Random(cfg.seed)
         gen = torch.Generator("cpu").manual_seed(cfg.seed)
+        self.ts_strata = make_strata(cfg)
         from .comfy_files import resolve_downloads
 
         self.status.update(stage="model files")
@@ -1014,17 +1090,19 @@ class Trainer(RaceParallelMixin):
         elif len(self.sides) > 1:
             log.info("Training at %s mixed in every epoch", describe_sides(cfg))
         losses: list[float] = []
+        grad_norms: list[float | None] = []  # each step's gradient norm before clipping, beside losses
         id_losses: list[list] = []  # [step, mean id loss] for steps that had eligible samples
         n_dev = len(self.replicas)
 
         def bind(v):
             """The loop's per-configuration values from the race configuration that trains now."""
-            nonlocal cfg, injected, params, optimizer, scheduler, gen, rng, step, losses, id_losses
+            nonlocal cfg, injected, params, optimizer, scheduler, gen, rng, step, losses, grad_norms, id_losses
             nonlocal true_per_image_lr, id_w
             st = v.state
             cfg, injected, params = v.cfg, st["injected"], st["params"]
             optimizer, scheduler, gen, rng = st["optimizer"], st["scheduler"], st["gen"], st["rng"]
             step, losses, id_losses = st["step"], st["losses"], st["id_losses"]
+            grad_norms = st["grad_norms"]  # (appended in place, like losses: the state keeps the same list)
             true_per_image_lr, id_w = st["true_per_image_lr"], st["id_w"]
 
         if self.race_rows is None:
@@ -1217,7 +1295,8 @@ class Trainer(RaceParallelMixin):
                     tok = latents.shape[2] * latents.shape[3]
                     shift = self.ts_logit_shift + self._clean_offset(
                         cfg, step, tok, self.batcher, cfg.batch_size * cfg.gradient_accumulation * n_dev)
-                    sigma, step_sigma = draw_sigmas(cfg, latents.shape[0], gen, shift, tok, self.arch, step_sigma)
+                    sigma, step_sigma = draw_sigmas(cfg, latents.shape[0], gen, shift, tok, self.arch, step_sigma,
+                                                    self.ts_strata)
                     noise = torch.randn(latents.shape, generator=gen)
                     dop = self._dop_job(cfg, batch, latents, step + 1, gen, shift, tok, step_sigma)  # LoRA Isolation
                     per_rep[r].append((self.replicas[r], batch, latents, embeds, mask, sigma, noise, regions, step + 1,
@@ -1276,8 +1355,7 @@ class Trainer(RaceParallelMixin):
             gather = getattr(optimizer, "gather", None)
             if gather is not None:  # Keel: the micro-batch sums join the replicas' on p.grad for the clip
                 gather()
-            if cfg.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
+            grad_norm = step_grad_norm(params, cfg.max_grad_norm)
             if step_lr_mult != 1.0:  # true per-image lr: scale this step only (the scheduler restores it)
                 saved_lrs = [g["lr"] for g in optimizer.param_groups]
                 for g in optimizer.param_groups:
@@ -1310,6 +1388,7 @@ class Trainer(RaceParallelMixin):
                 compiling.report("after 5 steps")
                 self._save_compile_cache()
             losses.append(accum_loss)
+            grad_norms.append(grad_norm)
             avg = sum(losses[-50:]) / len(losses[-50:])
             elapsed = time.time() - start
             done_steps = max(1, compute_done)
@@ -1348,9 +1427,9 @@ class Trainer(RaceParallelMixin):
                 self.align_values["pairs"].clear()
                 last = step_times[-5:]
                 who = f"[{self.race.active.name}] " if self._race_running() else ""
-                log.info("%sstep %d/%d loss %.4f avg %.4f lr %.2e %.1fs/it (last %d steps %.2fs each)%s", who, step,
-                         cfg.steps, accum_loss, avg, lr_now, elapsed / done_steps, len(last), sum(last) / len(last),
-                         id_s)
+                log.info("%sstep %d/%d loss %.4f avg %.4f lr %.2e grad %s %.1fs/it (last %d steps %.2fs each)%s", who,
+                         step, cfg.steps, accum_loss, avg, lr_now, format_grad_norm(grad_norm, cfg.max_grad_norm),
+                         elapsed / done_steps, len(last), sum(last) / len(last), id_s)
             peak = {str(d): round(torch.cuda.max_memory_allocated(torch.device(d)) / 1e9, 2) for d in self.devices
                     if str(d).startswith("cuda")} if torch.cuda.is_available() else {}
             if self.race is not None:  # progress over every configuration's steps; the race table separately
@@ -1359,7 +1438,8 @@ class Trainer(RaceParallelMixin):
                                total=self.race.estimate["total"] if self.race is not None else cfg.steps,
                                loss=accum_loss, avg_loss=avg, elapsed=elapsed, eta=eta, lr=lr_now,
                                losses=losses[-2000:], step_times=[round(t, 3) for t in step_times[-2000:]],
-                               peak_mem=peak, **id_extra)
+                               grad_norm=grad_norm, grad_norms=round_norms(grad_norms[-2000:]),
+                               grad_clip=cfg.max_grad_norm, peak_mem=peak, **id_extra)
             if self.loss_watch is not None and self.loss_watch.epoch_complete():
                 summary = self.loss_watch.end_epoch(step)
                 log.info("Loss watch epoch %d: %s (median residual %.3f, %d/%d active)", summary["epoch"],
@@ -1618,6 +1698,7 @@ class Trainer(RaceParallelMixin):
             "step": step, "res_stage": self.res_stage, "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "torch_gen": gen.get_state(), "py_rng": rng.getstate(), "torch_rng": torch.get_rng_state(),
+            "ts_strata": getattr(self, "ts_strata", None) and self.ts_strata.state_dict(),
             "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
             "config": self.cfg.to_dict(),
             "ema": self.ema.state_dict() if self.ema is not None else None,  # lora.safetensors holds the raw weights
@@ -1688,6 +1769,8 @@ class Trainer(RaceParallelMixin):
         optimizer.load_state_dict(st["optimizer"])
         scheduler.load_state_dict(st["scheduler"])
         gen.set_state(st["torch_gen"])
+        if getattr(self, "ts_strata", None) is not None:  # (a state saved without buckets: a fresh deck)
+            self.ts_strata.load_state_dict(st.get("ts_strata"))
         rng.setstate(st["py_rng"])
         torch.set_rng_state(st["torch_rng"])
         if st.get("cuda_rng") is not None and torch.cuda.is_available():
@@ -1945,6 +2028,7 @@ class Trainer(RaceParallelMixin):
         self.ema, self.loss_watch, self.controller = st["ema"], st["loss_watch"], st["controller"]
         self.batcher, self.batch_iter = st["batcher"], st["batch_iter"]
         self.curriculum_w, self.ts_logit_shift = st["curriculum_w"], st["ts_logit_shift"]
+        self.ts_strata = st["ts_strata"]
         self.all_items, self.injected = st["items"], st["injected"]
         self.id_aligner, self.id_align_opt = st.get("id_aligner"), st.get("id_align_opt")
         for vals in self.align_values.values():  # the log reports this configuration's values only
@@ -1971,7 +2055,8 @@ class Trainer(RaceParallelMixin):
         st["optimizer"], st["scheduler"] = self._make_optimizer(cfg, st["injected"])
         st["ema"] = self._make_ema(cfg, st["injected"])
         st["rng"], st["gen"] = random.Random(cfg.seed), torch.Generator("cpu").manual_seed(cfg.seed)
-        st["step"], st["losses"], st["id_losses"] = 0, [], []
+        st["step"], st["losses"], st["grad_norms"], st["id_losses"] = 0, [], [], []
+        st["ts_strata"] = make_strata(cfg)
         st["curriculum_w"], st["ts_logit_shift"] = None, 0.0
         self.all_items, self.curriculum_w, self.ts_logit_shift, self.loss_watch = st["items"], None, 0.0, None
         self._enter_stage(0, 0, initial=True)  # its own image queue, seeded like every other configuration's

@@ -221,6 +221,18 @@ variable is then unnecessary.
   the log signal-to-noise ratio is drawn from N(`logsnr_mean`, `logsnr_std`), -6 and 2 as the paper recommends, so
   most steps are very noisy (median sigma about 0.95), where a style's colours and strokes are learned. It is meant for
   style LoRAs; RulzTrainer's `style` mode tilts the same way more gently.
+- **Timestep buckets** (`timestep_buckets`, 0 = off; after musubi-tuner's `num_timestep_buckets`). Free draws land
+  on the sampling curve by luck: 10 of them cover only about 6.5 of its 10 tenths on average, so a short run or a
+  small dataset can train some noise levels twice and miss others. With `timestep_buckets: N` the curve is cut into N
+  equal slices and every N draws in a row take one from each, in shuffled order. Each draw still goes through the
+  mode's own curve, so the curve's shape is unchanged (along with `timestep_shift`, `sigma_min` / `sigma_max` and
+  `clean_share`); only the luck is gone.
+  - **N:** 10 to 20 is a usual start. The deck runs over the whole run rather than per epoch, so every N draws are
+    even whatever the epoch length.
+  - **Combinations:** with `keel_pair_sigma` each step takes one card. The `reference` sampler draws the model
+    family's own way and is not bucketed (the run logs a warning).
+  - **Resume and race:** a training state saves the deck, so a resume continues it. It is a race setting, so race
+    `timestep_buckets: 10` against `0` on your own data; it has not been measured here.
 - **Clean-end share** (`clean_share`, after Fizgig's MOSS-Image "Slide"; off by default). It sets the share of
   training steps at the clean end, where sigma is below 0.5 and faces and fine detail are refined, and it can change
   by epoch.
@@ -646,6 +658,14 @@ No C++ compiler is needed: the blocks are compiled with Dynamo's `specialize_flo
 multiplier stay Python constants instead of becoming CPU tensors (which would make Inductor emit C++ and fail with
 "InvalidCxxCompiler: cl is not found" on a machine without MSVC on PATH), and the fused W8A8 kernels run eagerly
 behind a graph break, so int8 layers keep their fused triton path inside compiled blocks.
+
+**Gradient norm** (after musubi-tuner's `--log_grad_metrics`). Every step's gradient norm before clipping goes to the
+log line (`grad 0.412`, or `grad 3.2 (clipped)` above `max_grad_norm`) and to the Monitor's *Gradient norm* chart, with
+the clip limit as a dashed line and how many of the last 100 steps were clipped. A steady line is healthy. Spikes that
+keep growing, or a line that sits on the clip limit, mean the learning rate is too high; that usually shows here
+before the samples go bad. A step whose norm is not finite is counted (`nan` in the log) and left out of the chart. It
+is measured with or without clipping (`max_grad_norm: 0`), at no noticeable cost. A race's chart follows the
+configuration that trains.
 
 ## Identity similarity for character LoRAs (face + body)
 
@@ -1230,6 +1250,37 @@ Two ways to make one (the Train tab's **Seed soup** section has both):
 Seed twins in one run: a race row may set its own `seed`, which gives it its own LoRA initialisation, image order and
 noise (the other rows keep sharing theirs); with `race_drop_lowest: false` every twin trains to the end and keeps its
 `_best` file.
+
+## Post-hoc EMA (`scripts/posthoc_ema.py`)
+
+`lora_ema` averages the LoRA while it trains, with a decay chosen before the run. Post-hoc EMA (musubi-tuner's
+`lora_post_hoc_ema.py`) makes the same kind of average afterwards from the step checkpoints the run kept. You can then
+try a few decays on finished files and keep the one you like. Untested on this trainer: compare by eye or with the
+probes.
+
+- **Order:** the files go in step order, from their `ss_steps` metadata or the `_NNNNNN` in the name (else
+  modification time). Two files of the same step are refused, since that means two runs got mixed up.
+- **Power (EDM2)** (`--sigma_rel`, 0.05 to 0.2; the WebUI's default, at 0.15): Karras et al.'s power-function
+  average, which weighs every training step by its step number to a power. Smaller leans harder on the last steps.
+  Each checkpoint stands for the steps since the one before it, so uneven save intervals are weighed by the steps they
+  cover, and the weights do not depend on how many checkpoints there are. At 0.15, 4 checkpoints weigh 0%, 6%, 25%
+  and 69%; over 12 the last four weigh 11%, 17%, 23% and 32%.
+- **Decay per checkpoint** (`--beta`, 0.95 default as in musubi-tuner; the WebUI's starts at 0.5): avg = beta x avg +
+  (1 - beta) x next, oldest first. The oldest file starts out as the whole average, so with few checkpoints a high
+  decay leans on it: 0.9 over 4 checkpoints leaves 73% on the oldest, and over 10 still about 39%. A high decay suits
+  20 checkpoints or more; 0.5 leans on the last two or three. `--beta2` slides the decay in a straight line from
+  `--beta` to `--beta2` over the files.
+- **What is averaged** is each layer's weight change, as in the [seed soup](#seed-soup-soup_files-scriptssouppy), not
+  the factors (musubi-tuner averages the up and down matrices as they are, which is not the average of their
+  products). The result is saved at the inputs' rank, which keeps nearly all of it for checkpoints of one run (the
+  report's "kept" share). `--rank 0` saves it exactly, at the sum of the inputs' ranks. LoRA and LoKr files; not OFT or
+  DoRA. The newest file's metadata (base model, config) is kept.
+- **The report** gives each file's weight and the step the average sits near (the weighted mean step).
+
+`python scripts/posthoc_ema.py output/cat/cat_*.safetensors --out cat_ema.safetensors --sigma_rel 0.15` (or
+`--beta 0.5`). In the WebUI, the Train tab's **Post-hoc EMA** section has *Use this job's checkpoints* (the
+`<job>_<step>` files in the job's folder) and *Average now*, which saves `<job>_posthoc_ema_<setting>.safetensors`
+there. `keep_checkpoints` limits how far back it can reach.
 
 ## Gold face scorer (`face_gold`)
 
@@ -2441,6 +2492,7 @@ rulztrainer/
   trainer.py       training loop, saving, sampling, status.json for the UI
   checkpointing.py selective gradient checkpointing (which blocks keep their activations)
   ema.py           weight average (EMA) of the LoRA for saves, samples and probes
+  posthoc_ema.py   post-hoc EMA: a moving average of a finished run's checkpoints (scripts/posthoc_ema.py)
   compiling.py     torch.compile settings, the compile_model auto rule, compile stats, the compile cache file
   profiling.py     one-step GPU profile by kernel group (RULZ_PROFILE_STEP)
   race.py          configuration race: settings, round schedule, swapping configurations' LoRAs

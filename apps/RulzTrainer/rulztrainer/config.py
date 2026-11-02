@@ -457,6 +457,8 @@ class TrainConfig:
     logsnr_mean: float = -6.0  # logsnr mode (style-friendly, arXiv 2411.14793): log-SNR ~ N(mean, std), very noisy
     logsnr_std: float = 2.0  #   steps where style is learned; the paper recommends -6 and 2 or 3
     timestep_shift: float = 1.0  # sigma shift applied to sampled sigmas (training_shift is 1.0 upstream)
+    timestep_buckets: int = 0  # 0 = off; N (2+): every N sigma draws take one from each of N equal slices of the
+    #                            sampling curve (shape unchanged), so small runs cover it evenly (musubi-tuner)
     clean_share: str = ""  # share of steps below sigma 0.5 by epoch (clean_share.py): "" = the sampler's own,
     #                        "40", "75:5:40", or Fizgig's MOSS Slide "60:7:30:15:2"
     loss_weighting: str = "none"  # none | min_snr (sigma-based) | sigma_sqrt
@@ -839,6 +841,8 @@ class TrainConfig:
                                  "stay on the GPU until the backward)")
         if self.timestep_sampling == "logsnr" and self.logsnr_std <= 0:
             raise ValueError("logsnr_std must be above 0")
+        if self.timestep_buckets < 0 or self.timestep_buckets == 1:
+            raise ValueError("timestep_buckets must be 0 (off) or 2 and more")
         if self.isolation:
             if self.finetune:
                 raise ValueError("isolation and finetune cannot be combined (DOP holds the LoRA to the model without "
