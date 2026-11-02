@@ -1722,7 +1722,12 @@ body {
 .rz-kv .v { color: var(--rz-heading); font-weight: 600; font-variant-numeric: tabular-nums; }
 .rz-kv.warn { border-color: rgba(245, 158, 11, .5); }
 .rz-kv.warn .v { color: var(--rz-warn-text); }
-.rz-thumb.rz-picked { border: 2px solid var(--rz-red, #E10600); }
+/* Previous Runs: a probe image's "tick to compare" box over its corner, and the ticked ones outlined */
+.rz-shot { position: relative; }
+.rz-shot-pick { position: absolute; top: 4px; right: 4px; background: rgba(0, 0, 0, .55); color: #fff; }
+.rz-shot.rz-picked { border: 2px solid var(--rz-red, #E10600); }
+.rz-compare-half { width: 50%; }
+.rz-compare-img { height: calc(100vh - 96px); }
 .rz-ds-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; width: 100%; }
 .rz-look-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; }
 .rz-ds-card { background: var(--rz-surface-2); border: 1px solid var(--rz-border); border-radius: 12px;
@@ -1788,9 +1793,17 @@ body {
   .rz-tile { padding: 9px 12px; }
   .rz-tile-value { font-size: 17px; }
   .rz-gallery { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-  .rz-monitor .rz-section .q-item__label--caption { display: none; }
+  .rz-monitor .rz-section .q-item__label--caption, .rz-history .rz-section .q-item__label--caption { display: none; }
   .rz-kv { font-size: 12px; padding: 2px 8px; }
   .rz-step-pick { width: auto; flex: 1 1 auto; min-width: 0; }
+  .rz-grow-phone { flex: 1 1 auto; min-width: 0; }
+  /* Previous Runs: the table's less needed columns hidden, the compared images one above the other */
+  .rz-wide-col { display: none; }
+  .rz-history .q-table td { white-space: normal; }
+  .rz-history .q-table th, .rz-history .q-table td { padding-left: 6px; padding-right: 6px; }
+  .rz-compare { flex-direction: column; flex-wrap: nowrap; }
+  .rz-compare-half { width: 100%; }
+  .rz-compare-img { height: calc(50vh - 64px); }
   /* the action bar: one row of compact buttons, the secondary ones as icons (their tooltips name them) */
   .rz-footer-row { gap: 4px 8px; padding: 6px 10px; }
   .rz-footer-row > .rz-footer-msg { min-width: 0; flex-basis: 100%; }
@@ -5717,18 +5730,26 @@ class Wizard:
 
 HISTORY_COLORS = ["#FF3B30", "#60A5FA", "#34D399", "#F59E0B", "#C084FC", "#22D3EE", "#F472B6", "#A3E635", "#94A3B8",
                   "#FB923C"]
+_WIDE = {"classes": "rz-wide-col", "headerClasses": "rz-wide-col"}  # hidden on a phone (the run's name has its date)
 HISTORY_COLUMNS = [
     {"name": "run", "label": "Run", "field": "run", "align": "left", "sortable": True},
-    {"name": "started", "label": "Started", "field": "started", "align": "left", "sortable": True},
-    {"name": "state", "label": "State", "field": "state", "align": "left", "sortable": True},
+    {"name": "started", "label": "Started", "field": "started", "align": "left", "sortable": True, **_WIDE},
+    {"name": "state", "label": "State", "field": "state", "align": "left", "sortable": True, **_WIDE},
     {"name": "steps", "label": "Steps", "field": "steps", "align": "right"},
     {"name": "adapter", "label": "Adapter", "field": "adapter", "align": "left"},
-    {"name": "lr", "label": "LR", "field": "lr", "align": "right"},
-    {"name": "face", "label": "Face", "field": "face", "align": "right"},
-    {"name": "body", "label": "Body", "field": "body", "align": "right"},
+    {"name": "lr", "label": "LR", "field": "lr", "align": "right", **_WIDE},
+    {"name": "face", "label": "Face", "field": "face", "align": "right", **_WIDE},
+    {"name": "body", "label": "Body", "field": "body", "align": "right", **_WIDE},
     {"name": "combined", "label": "Combined", "field": "combined", "align": "right"},
     {"name": "best", "label": "Best", "field": "best", "align": "right"},
 ]
+# the tooltip of a Previous Runs chart: its lines share their run's name (one legend entry per run), so it names each
+# line by its id, "<run> · <metric>"
+HISTORY_TOOLTIP = ("(ps) => { ps = [].concat(ps); if (!ps.length) return ''; "
+                   "let s = 'Step ' + Math.round(ps[0].axisValue).toLocaleString('en-US'); "
+                   "for (const p of ps) { const v = Array.isArray(p.value) ? p.value[1] : p.value; "
+                   "s += '<br>' + p.marker + p.seriesId + ' <b>' + (v == null ? '-' : Number(v).toFixed(1) + '%') "
+                   "+ '</b>'; } return s; }")
 
 
 def history_label(run: dict) -> str:
@@ -5785,14 +5806,15 @@ def rescaled_runs(runs: list[dict], scale: dict | None) -> tuple[list[dict], lis
 
 def history_series(runs: list[dict], part: str, metrics: list[str]) -> list[dict]:
     """ECharts line series overlaying the chosen runs: one colour per run, one line style per metric (face solid,
-    body dashed, combined thick). part is "identity" (the sample images' means) or "probes"."""
+    body dashed, combined thick). part is "identity" (the sample images' means) or "probes". A run's lines share its
+    name, so the legend has one entry per run (a click hides all of them); each line's id is "<run> · <metric>"."""
     styles = {"face": {}, "body": {"type": "dashed"}, "combined": {"width": 3}}
     out = []
     n_color = 0
     for r in runs:
         data = r.get(part) or {}
         racers = data.get("racers") if part == "probes" else None
-        # a race: each configuration's own lines in its own colour ("<run> lora16 - face"), else the run's
+        # a race: each configuration's own lines in its own colour ("<run> lora16"), else the run's
         groups = [(f"{history_label(r)} {name}", d) for name, d in racers.items()] if racers else \
             [(history_label(r), data)]
         for label, d in groups:
@@ -5802,7 +5824,7 @@ def history_series(runs: list[dict], part: str, metrics: list[str]) -> list[dict
                 pts = d.get(metric) or []
                 if not pts:
                     continue
-                out.append({"name": f"{label} - {metric}", "type": "line", "data": pts,
+                out.append({"name": label, "id": f"{label} · {metric}", "type": "line", "data": pts,
                             "showSymbol": part == "identity", "symbolSize": 6, "itemStyle": {"color": color},
                             "lineStyle": {"color": color, "width": 2, **styles[metric]}})
     return out
@@ -5890,8 +5912,24 @@ def probe_settings_differences(runs: list[dict]) -> list[str]:
 
 
 def probe_caption(entry: dict) -> str:
-    f2 = lambda x: "-" if x is None else f"{x:.0f}"  # noqa: E731
-    return f"overall {f2(entry.get('combined'))} | face {f2(entry.get('face'))} | body {f2(entry.get('body'))}"
+    """"face 70% · body 40% · combined 61%": a kept probe image's scores (the ones it does not have left out)."""
+    return " · ".join(f"{k} {entry[k]:.0f}%" for k in ("face", "body", "combined") if entry.get(k) is not None)
+
+
+def probe_compare(groups, step: int, kind: str) -> tuple[list[str], list[tuple[str, dict, str, str]]]:
+    """(the groups without a probe of this kind by `step`, [(heading, entry, group label, note)]): the groups' probe
+    images at `step` (each group's latest before it when it has none there, noted "step N") under one heading per
+    probe image ("Face probe 1"), the groups side by side under it, so the same test picture of every run is
+    compared together."""
+    missing, by_seed = [], {}
+    for label, _, entries in groups:
+        at, imgs = probe_images_at(entries, step, kind)
+        if at is None:
+            missing.append(label)
+        for e in imgs:
+            by_seed.setdefault(e["seed"], []).append((label, e, "" if at == step else f"its latest: step {at:,}"))
+    return missing, [(f"{kind.capitalize()} probe {seed + 1}", e, label, note)
+                     for seed in sorted(by_seed) for label, e, note in by_seed[seed]]
 
 
 def build_history_tab(charts: list):
@@ -5929,7 +5967,7 @@ def build_history_tab(charts: list):
                                            ("probes", probe_chart_h, probe_metrics, probe_empty)):
             series = history_series(picked, part, [m for m, box in boxes.items() if box.value])
             chart.options["series"] = series
-            chart.options["legend"]["data"] = [sr["name"] for sr in series]
+            chart.options["legend"]["data"] = list(dict.fromkeys(sr["name"] for sr in series))
             chart.update()
             empty.text = ("Tick one or more runs above to draw them here." if not picked else
                           "" if series else "The ticked runs have no scores of this kind.")
@@ -5942,7 +5980,7 @@ def build_history_tab(charts: list):
         groups = probe_image_groups(picked)
         kind = probe_kind.value
         steps = probe_image_steps(groups, kind)
-        opts = {s: f"step {s:,}" for s in steps}
+        opts = {s: f"Step {s:,}" for s in steps}
         if probe_step.options != opts:
             probe_step.set_options(opts, value=probe_step.value if probe_step.value in opts else
                                    (steps[-1] if steps else None))
@@ -5956,7 +5994,7 @@ def build_history_tab(charts: list):
         probe_warn.text = ("Probe settings differ, so these probes are not the same test: " + "; ".join(diffs)) \
             if diffs else ""
         pick_label.text = f"{len(state['picks'])} of 2 picked" if state["picks"] else \
-            "Pick any two images (any run, any step) to compare them large"
+            "Tick any two images (any run, any step) to compare them large"
         compare_btn.enabled = len(state["picks"]) == 2
         probe_grid.clear()
         with probe_grid:
@@ -5967,30 +6005,28 @@ def build_history_tab(charts: list):
                 hint("The ticked runs have no kept probe images (runs from before RulzTrainer kept them, unless their "
                      "job folder still holds them: Import old runs adds those).")
                 return
-            for label, run, entries in groups:
-                at, imgs = probe_images_at(entries, step, kind)
-                with ui.row().classes("w-full items-start gap-2 no-wrap"):
-                    with ui.column().classes("w-44 shrink-0 gap-0"):
-                        ui.label(label).classes("text-sm font-medium break-words")
-                        if at is None:
-                            hint(f"no {kind} probe by step {step:,}")
-                        elif at != step:
-                            hint(f"its latest {kind} probe before: step {at:,}")
-                    with ui.row().classes("gap-2"):
-                        for e in imgs:
-                            path = history.HISTORY_DIR / e["file"]
-                            picked_now = str(path) in state["picks"]
-                            with ui.card().tight().classes("rz-thumb" + (" rz-picked" if picked_now else "")):
-                                ui.image(image_url(path)).props("fit=contain") \
-                                    .classes("w-48 h-48 rz-imgbg cursor-pointer") \
-                                    .on("click", lambda _, q=path: show_full(q))
-                                with ui.row().classes("w-full items-center no-wrap px-1 gap-1"):
-                                    ui.label(f"seed {e['seed'] + 1}  {probe_caption(e)}").classes("text-xs rz-hint")
-                                    ui.space()
-                                    ui.button(icon="check_box" if picked_now else "check_box_outline_blank",
-                                              on_click=lambda _, q=str(path), c=f"{label}, step {e['step']:,}, "
-                                              f"{kind} seed {e['seed'] + 1}: {probe_caption(e)}": toggle_pick(q, c)) \
-                                        .props("flat dense round size=sm").tooltip("Pick to compare")
+            missing, items = probe_compare(groups, step, kind)
+            if missing:
+                hint(f"No {kind} probe by step {step:,}: {', '.join(missing)}")
+            captions = {id(e): " · ".join(x for x in (heading, label, f"Step {e['step']:,}", probe_caption(e)) if x)
+                        for heading, e, label, _ in items}
+            view = [(history.HISTORY_DIR / e["file"], captions[id(e)]) for _, e, _, _ in items]
+            for heading in dict.fromkeys(h for h, _, _, _ in items):
+                ui.label(heading).classes("rz-subhead w-full")
+                with ui.element("div").classes("rz-gallery"):
+                    for _, e, label, note in (it for it in items if it[0] == heading):
+                        path = history.HISTORY_DIR / e["file"]
+                        picked_now = str(path) in state["picks"]
+                        with ui.column().classes("rz-shot gap-0" + (" rz-picked" if picked_now else "")):
+                            ui.image(image_url(path)).props("ratio=1 fit=contain") \
+                                .classes("w-full rz-imgbg cursor-pointer") \
+                                .on("click", lambda _, q=path: show_full(q, view))
+                            ui.button(icon="check_box" if picked_now else "check_box_outline_blank", color=None,
+                                      on_click=lambda _, q=str(path), c=captions[id(e)]: toggle_pick(q, c)) \
+                                .props("flat dense round size=sm").classes("rz-shot-pick") \
+                                .tooltip("Tick to compare with another image")
+                            ui.label(label).classes("rz-shot-title")
+                            ui.label(" · ".join(x for x in (probe_caption(e), note) if x)).classes("rz-shot-sub")
 
     def toggle_pick(path: str, caption: str):
         if path in state["picks"]:
@@ -6028,7 +6064,7 @@ def build_history_tab(charts: list):
             return
         state["sig"] = sig
         state["runs"] = history.list_runs()
-        count.text = (f"{len(state['runs'])} saved run(s) in {history.HISTORY_DIR}" if state["runs"] else
+        count.text = (f"{len(state['runs'])} saved run(s)" if state["runs"] else
                       "No saved runs yet. A run is saved while it trains once it has likeness scores.")
         apply_scale()
 
@@ -6090,15 +6126,14 @@ def build_history_tab(charts: list):
         with ui.row().classes("w-full items-center gap-4"):
             with ui.column().classes("gap-1 flex-1 min-w-[16rem]"):
                 ui.label("Previous runs").classes("rz-title")
-                hint("Every run with likeness scores is saved here while it trains, even when a later run reuses its "
-                     "job name. Tick any number of runs to overlay the mean face and body of their samples and the "
-                     "smoothed face, body and combined score of their probes, to see which setup learned the likeness "
-                     "faster or higher. Scores are on the run's own normalized scale (0 = a stranger, 100 = the "
-                     "references).")
+                hint("Every run with likeness scores is saved here while it trains. Tick runs to compare their "
+                     "likeness charts and probe images, and see which setup learned the person faster or better "
+                     "(0 = a stranger, 100 = your references).")
             ui.button("Import old runs", icon="move_to_inbox", on_click=import_old).props("outline") \
                 .tooltip("Add the runs whose job folders are in the output folder but not in this list yet")
     with card():
         count = hint("")
+        count.tooltip(f"Kept in {history.HISTORY_DIR}")
         table = ui.table(columns=HISTORY_COLUMNS, rows=[], row_key="id", selection="multiple",
                          pagination={"rowsPerPage": 10, "sortBy": "started", "descending": True},
                          on_select=lambda _: apply_scale()).props("flat dense").classes("w-full")
@@ -6114,7 +6149,7 @@ def build_history_tab(charts: list):
             ui.space()
             compare = hint("")
     with section("Saved files", "Download a ticked run's LoRAs, logs and settings", "download"):
-        files_run = ui.select({}, label="Run", on_change=lambda _: refresh_files()).classes("w-[30rem] max-w-full")
+        files_run = ui.select({}, label="Run", on_change=lambda _: refresh_files()).classes("w-full max-w-[30rem]")
         files_note = hint("")
         with ui.column().classes("w-full gap-2") as files_box:
             run_files = JobFiles()
@@ -6137,13 +6172,15 @@ def build_history_tab(charts: list):
         run_files.show(job_dir)
 
     ui.timer(5.0, refresh_files)  # a running run's new checkpoints
-    with section("Identity similarity", "Mean face and mean body score of the sample images", "face"):
+    with section("Identity similarity", "How much each run's samples looked like the person (the average of each "
+                 "sample step)", "face"):
         with ui.row().classes("items-center gap-3"):
             id_metrics = metric_chips(("face", "body"), lambda: draw())
             id_empty = hint("")
         id_chart = RzChart(chart_options(_axis("step", min="dataMin"), _axis("similarity %", min=0), [],
                                            [])).classes("w-full h-72")
-    with section("Likeness probes & controller", "Smoothed face, body and combined score of the probes", "show_chart"):
+    with section("Likeness probes & controller", "How much each run's probe images looked like the person "
+                 "(smoothed)", "show_chart"):
         with ui.row().classes("items-center gap-3"):
             probe_metrics = metric_chips(("face", "body", "combined"), lambda: draw())
             probe_empty = hint("")
@@ -6176,8 +6213,8 @@ def build_history_tab(charts: list):
         scale_note = hint("", warn=True)
         probe_chart_h = RzChart(chart_options(_axis("step", min="dataMin"), _axis("likeness %", min=0),
                                                 [], [])).classes("w-full h-72")
-    with section("Probe images", "The ticked runs' probes at the same step side by side; pick two to compare",
-                 "compare"):
+    with section("Probe images", "The ticked runs' probes at the same step, the same test picture side by side; "
+                 "tick two images to compare them large", "compare"):
         with ui.row().classes("w-full items-center gap-2"):
             probe_kind = ui.toggle({"face": "Face", "body": "Body"}, value="face",
                                    on_change=lambda _: draw_probes()).props("dense no-caps")
@@ -6188,29 +6225,33 @@ def build_history_tab(charts: list):
                     i = min(len(keys) - 1, max(0, keys.index(probe_step.value) + delta))
                     probe_step.value = keys[i]
 
-            ui.button(icon="chevron_left", on_click=lambda: step_by(-1)).props("flat dense round") \
-                .tooltip("Earlier probe")
-            probe_step = ui.select({}, label="Probe step", on_change=lambda _: draw_probes()).classes("w-40")
-            ui.button(icon="chevron_right", on_click=lambda: step_by(1)).props("flat dense round") \
-                .tooltip("Later probe")
-            ui.space()
-            pick_label = hint("")
+            with ui.row().classes("items-center gap-1 no-wrap rz-grow-phone"):
+                ui.button(icon="chevron_left", on_click=lambda: step_by(-1)).props("flat dense round") \
+                    .tooltip("Earlier probe")
+                probe_step = ui.select({}, on_change=lambda _: draw_probes()) \
+                    .props("dense options-dense outlined").classes("rz-step-pick")
+                ui.button(icon="chevron_right", on_click=lambda: step_by(1)).props("flat dense round") \
+                    .tooltip("Later probe")
+        with ui.row().classes("w-full items-center gap-2"):
+            pick_label = hint("").classes("flex-1 min-w-[10rem]")
             compare_btn = ui.button("Compare", icon="compare", on_click=open_compare).props("outline dense no-caps")
-            ui.button("Clear picks", icon="deselect", on_click=clear_picks).props("flat dense no-caps")
+            ui.button("Clear", icon="deselect", on_click=clear_picks).props("flat dense no-caps") \
+                .tooltip("Untick the picked images")
         probe_warn = hint("", warn=True)
-        probe_grid = ui.column().classes("w-full gap-3")
+        probe_grid = ui.column().classes("w-full gap-2")
     with ui.dialog().props("maximized") as cmp_dlg, ui.card().tight().classes("w-full h-full bg-black"):
         with ui.row().classes("w-full items-center justify-between px-3 py-1"):
             ui.label("Compare").classes("text-sm text-white")
             ui.button(icon="close", on_click=cmp_dlg.close).props("flat dense round color=white")
-        with ui.row().classes("w-full no-wrap gap-2 px-2"):
+        with ui.row().classes("w-full no-wrap gap-2 px-2 rz-compare"):  # one above the other on a phone
             cmp_imgs, cmp_caps = [], []
             for _ in range(2):
-                with ui.column().classes("w-1/2 items-center gap-1"):
-                    cmp_imgs.append(ui.image("").props("fit=contain").classes("w-full")
-                                    .style("height: calc(100vh - 96px)"))
+                with ui.column().classes("items-center gap-1 rz-compare-half"):
+                    cmp_imgs.append(ui.image("").props("fit=contain").classes("w-full rz-compare-img"))
                     cmp_caps.append(ui.label("").classes("text-xs text-white text-center"))
     show_full = image_viewer()
+    for chart in (id_chart, probe_chart_h):
+        chart.options["tooltip"][":formatter"] = HISTORY_TOOLTIP
     charts.extend([id_chart, probe_chart_h])
     try:
         history.import_jobs()  # the runs from before the history existed, once
@@ -8798,7 +8839,7 @@ def build_page(local: bool = True):
 
         # ------------------------------------------------------------ Previous Runs
         with ui.tab_panel(tab_history):
-            with ui.column().classes("rz-page gap-4"):
+            with ui.column().classes("rz-page gap-4 rz-history"):
                 build_history_tab(charts)
 
         # ------------------------------------------------------------ Help
@@ -9193,15 +9234,16 @@ similarity), and the smoothed **face, body and combined** score at each probe (L
 from before the history existed are imported from their job folders when the tab first loads, or with *Import old runs*.
 
 Tick any number of runs in the table (name, start, state, steps, adapter, learning rate, last and best scores) to
-overlay them: one colour per run, solid lines for the face, dashed for the body and thick for the combined score, with
-checkboxes to show only some of the three. *Rename* gives a run a name of your own and *Remove from history* deletes
+overlay them: one colour per run (one legend entry each), solid lines for the face, dashed for the body and thick for
+the combined score, with chips to show only some of the three. *Rename* gives a run a name of your own and *Remove from history* deletes
 its history file only (never the job folder). A run that is still training updates live.
 
 **Probe images** (below the charts) puts the ticked runs' likeness probes side by side: pick Face or Body and a probe
-step (the arrows step through them), and each run, or each configuration of a race, shows its probe images of that
-step in one row with their overall / face / body scores. A run probed on another interval shows its latest probe before
-that step, marked. Click an image to see it full size; tick the box under any two (any run, any step) to open them
-side by side, large, with their scores (*Compare* opens them again, *Clear picks* starts over). When the ticked runs
+step (the arrows step through them). The images are grouped by test picture (*Face probe 1*...), every run, or each
+configuration of a race, side by side under it with its face / body / combined scores. A run probed on another interval
+shows its latest probe before that step, marked. Click an image to see it full size (the arrows step through the shown
+images); tick the box in the corner of any two (any run, any step) to open them side by side, large, with their scores
+(*Compare* opens them again, *Clear* starts over). When the ticked runs
 used different probe settings (prompts, seed, size, steps, guidance, turbo LoRA or resolutions) a note says which:
 their probes are not the same test then. The images are kept with the run, as small JPEG copies in
 `output/_history/<run id>/`, so a later run with the same job name does not replace them; *Remove from history* deletes

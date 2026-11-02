@@ -1508,10 +1508,11 @@ similarity), and the smoothed **face, body and combined** score at each probe (L
 from before the history existed are imported from their job folders when the tab first loads, or with *Import old runs*.
 
 Tick any number of runs in the table (name, start, state, steps, adapter, learning rate, last and best scores) to
-overlay them: one colour per run, solid lines for the face, dashed for the body and thick for the combined score, with
-a *Show lines (all runs)* bar of Face / Body / Combined chips above each chart: switch one off to hide that line of
+overlay them: one colour per run, solid lines for the face, dashed for the body and thick for the combined score. The
+legend has one entry per run (click it to hide all of that run's lines) and the tooltip names each line (`<run> ·
+face`). Above each chart is a *Show lines (all runs)* bar of Face / Body / Combined chips above each chart: switch one off to hide that line of
 every ticked run at once, and on again to bring it back. A race run draws each configuration's probe lines in its own colour, named
-after it (`<run> lora16 - face`; the winner's after the race: `winner`); *Import old runs* adds that split to race runs
+after it (`<run> lora16`; the winner's after the race: `winner`); *Import old runs* adds that split to race runs
 saved before it existed, while their job folder is still there. *Rename* gives a run a name of your own and *Remove from history* deletes
 its history file only (never the job folder). *Export spreadsheet* downloads each ticked run's likeness spreadsheet (see
 *Export spreadsheet* under the likeness probes), from the raw probe scores the history keeps for it.
@@ -1534,14 +1535,20 @@ runs*, while the job folder still holds the run); a note names them. The probe i
 scores. A run that is still training updates live.
 
 **Probe images** (below the charts) puts the ticked runs' likeness probes side by side: pick Face or Body and a probe
-step (the arrows step through them), and each run, or each configuration of a race, shows its probe images of that
-step in one row with their overall / face / body scores. A run probed on another interval shows its latest probe before
-that step, marked. Click an image to see it full size; tick the box under any two (any run, any step) to open them
-side by side, large, with their scores (*Compare* opens them again, *Clear picks* starts over). When the ticked runs
+step (the arrows step through them). The images are grouped by test picture (*Face probe 1*, *Face probe 2*...), with
+every ticked run, or each configuration of a race, side by side under it as square thumbnails with their face / body /
+combined scores. A run probed on another interval shows its latest probe before that step, marked. Click an image to
+see it full size (its arrows, or the arrow keys, step through the shown images); tick the box in the corner of any two
+(any run, any step) to open them side by side, large, with their scores (*Compare* opens them again, *Clear* starts
+over). When the ticked runs
 used different probe settings (prompts, seed, size, steps, guidance, turbo LoRA or resolutions) a note says which:
 their probes are not the same test then. The images are kept with the run, as small JPEG copies in
 `output/_history/<run id>/`, so a later run with the same job name does not replace them; *Remove from history* deletes
 them too. Runs saved before v2.4.0 get theirs from *Import old runs* while their job folder still holds that same run.
+
+On a phone the table shows the run, steps, adapter and the combined and best scores (the rest is on a wider screen), the
+probe images sit two across, the charts grow taller for a long legend, and *Compare* puts the two images one above the
+other.
 
 ## Configuration race (`race`)
 

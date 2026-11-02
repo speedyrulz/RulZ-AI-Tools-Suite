@@ -94,7 +94,9 @@ def test_the_table_and_the_overlay_series():
     assert (rows[0]["face"], rows[0]["body"], rows[0]["combined"], rows[0]["best"]) == ("60.0%", "10.0%", "70.0%", "70.0%")
     assert rows[1]["run"] == "rank 16" and rows[1]["adapter"] == "LoRA r16" and rows[1]["best"] == "-"
     probes = webui.history_series(runs, "probes", ["face", "body", "combined"])
-    assert [s["name"].rsplit(" - ", 1)[1] for s in probes] == ["face", "body", "combined"]  # run b has no points
+    label = webui.history_label(runs[0])
+    assert [s["id"] for s in probes] == [f"{label} · {m}" for m in ("face", "body", "combined")]  # b has no points
+    assert {s["name"] for s in probes} == {label}  # one legend entry for the run
     assert probes[1]["lineStyle"]["type"] == "dashed" and probes[2]["lineStyle"]["width"] == 3
     assert all(s["itemStyle"]["color"] == webui.HISTORY_COLORS[0] for s in probes)
     both = webui.history_series(runs, "identity", ["face"])
@@ -117,8 +119,8 @@ def test_a_race_keeps_each_configuration_s_probes_apart(tmp_path):
     assert series["racers"]["winner"]["face"] == [[150, 20.0]]
     run = {"id": "r", "job": "race", "label": "my race", "probes": series, "identity": {}, "config": {"race": True}}
     lines = webui.history_series([run], "probes", ["combined"])
-    assert [s["name"] for s in lines] == ["my race lora16 - combined", "my race lokr8 - combined",
-                                          "my race winner - combined"]
+    assert [s["name"] for s in lines] == ["my race lora16", "my race lokr8", "my race winner"]
+    assert lines[0]["id"] == "my race lora16 · combined"
     assert len({s["itemStyle"]["color"] for s in lines}) == 3  # one colour per configuration
     # a race saved before the split gets it from its job folder on import
     job = tmp_path / "output" / "race"
@@ -169,7 +171,13 @@ def test_probe_images_are_kept_with_their_run_and_compared_at_the_same_step(tmp_
     assert webui.probe_images_at(groups[2][2], 200, "face") == (None, [])  # the winner only from step 300
     other = {"id": "run2", "job": "x", "label": "", "probe_images": [], "config": {"probe_size": 768}}
     assert webui.probe_settings_differences([run, other]) == ["probe_size: 512 / 768"]
-    assert webui.probe_caption({"combined": 61.4, "face": 70.0, "body": None}) == "overall 61 | face 70 | body -"
+    assert webui.probe_caption({"combined": 61.4, "face": 70.0, "body": None}) == "face 70% · combined 61%"
+    # the same probe image of every group side by side, each group's latest before the step when it has none there
+    missing, items = webui.probe_compare(groups, 200, "face")
+    assert missing == ["my race winner"]
+    assert [(h, label, note) for h, _, label, note in items] == [
+        ("Face probe 1", "my race lora16", "its latest: step 100"), ("Face probe 1", "my race lokr8", ""),
+        ("Face probe 2", "my race lora16", "its latest: step 100")]
     assert history.delete_runs(["run1"], root) == 0 and not (root / "run1").exists()  # the copies go too
 
 
