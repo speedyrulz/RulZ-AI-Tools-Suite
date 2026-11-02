@@ -23,10 +23,10 @@
       "title": "How to use",
       "properties": {},
       "widgets_values": [
-        "RulzTrainer likeness scoring: the trainer's own face / body scores on any images.\n\nReferences (what the person looks like)\n- Connect a reference image (or a batch), or type image files / folders into reference_paths, one per line.\n- For separate face and body references use face_paths / body_paths (or the face_images / body_images inputs). They replace the shared references for that score.\n\nImages to score\n- Connect an image (or a batch), and/or type files / folders into image_paths on the Score node.\n\nScale (the trainer's defaults)\n- 0 = what a stranger scores, 100 = what a typical reference scores against the others (2+ references needed for a measured 100, else a default).\n- baseline_paths / baseline_images: images from the base model without the LoRA set the 0, like the trainer's step-0 probe.\n- trainer_run: a RulzTrainer job folder uses that run's exact scale.\n\nResults\n- Summary: the averages (overall, face, body). Details: every image.\n- Turn on export_spreadsheet on the Export node for an .xlsx (Summary, Images, References sheets) or CSV files in ComfyUI's output folder.\n\nPaths are as this ComfyUI sees them: a ComfyUI in WSL reads C:\\ai as /mnt/c/ai."
+        "RulzTrainer likeness scoring: the trainer's own face / body scores on any images.\n\nReferences (what the person looks like)\n- Connect a reference image (or a batch), or type image files / folders into reference_paths, one per line.\n- For separate face and body references use face_paths / body_paths (or the face_images / body_images inputs). They replace the shared references for that score.\n\nImages to score\n- Connect an image (or a batch), and/or type files / folders into image_paths on the Score node.\n\nScale (the trainer's defaults)\n- 0 = what a stranger scores. The references' own level (2+ references needed to measure it, else a default) is stretched and curved as in the trainer, so it reads about 64; 100 is the top.\n- baseline_paths / baseline_images: images from the base model without the LoRA set the 0, like the trainer's step-0 probe.\n- trainer_run: a RulzTrainer job folder uses that run's exact scale.\n\nGold face\n- gold_face (References node): the trainer's held-out FaceNet face score, which nothing trains on. It shows when a run that trains against ArcFace raises the ArcFace face score without the likeness.\n- overall_face (Score node): gold puts it into the overall score as the trainer does when its gold scorer is on; auto follows the trainer_run, else ArcFace.\n\nResults\n- Summary: the averages (overall, face, body). Details: every image.\n- Turn on export_spreadsheet on the Export node for an .xlsx (Summary, Images, References sheets) or CSV files in ComfyUI's output folder.\n\nPaths are as this ComfyUI sees them: a ComfyUI in WSL reads C:\\ai as /mnt/c/ai."
       ],
       "widgets_values_named": {
-        "text": "RulzTrainer likeness scoring: the trainer's own face / body scores on any images.\n\nReferences (what the person looks like)\n- Connect a reference image (or a batch), or type image files / folders into reference_paths, one per line.\n- For separate face and body references use face_paths / body_paths (or the face_images / body_images inputs). They replace the shared references for that score.\n\nImages to score\n- Connect an image (or a batch), and/or type files / folders into image_paths on the Score node.\n\nScale (the trainer's defaults)\n- 0 = what a stranger scores, 100 = what a typical reference scores against the others (2+ references needed for a measured 100, else a default).\n- baseline_paths / baseline_images: images from the base model without the LoRA set the 0, like the trainer's step-0 probe.\n- trainer_run: a RulzTrainer job folder uses that run's exact scale.\n\nResults\n- Summary: the averages (overall, face, body). Details: every image.\n- Turn on export_spreadsheet on the Export node for an .xlsx (Summary, Images, References sheets) or CSV files in ComfyUI's output folder.\n\nPaths are as this ComfyUI sees them: a ComfyUI in WSL reads C:\\ai as /mnt/c/ai."
+        "text": "RulzTrainer likeness scoring: the trainer's own face / body scores on any images.\n\nReferences (what the person looks like)\n- Connect a reference image (or a batch), or type image files / folders into reference_paths, one per line.\n- For separate face and body references use face_paths / body_paths (or the face_images / body_images inputs). They replace the shared references for that score.\n\nImages to score\n- Connect an image (or a batch), and/or type files / folders into image_paths on the Score node.\n\nScale (the trainer's defaults)\n- 0 = what a stranger scores. The references' own level (2+ references needed to measure it, else a default) is stretched and curved as in the trainer, so it reads about 64; 100 is the top.\n- baseline_paths / baseline_images: images from the base model without the LoRA set the 0, like the trainer's step-0 probe.\n- trainer_run: a RulzTrainer job folder uses that run's exact scale.\n\nGold face\n- gold_face (References node): the trainer's held-out FaceNet face score, which nothing trains on. It shows when a run that trains against ArcFace raises the ArcFace face score without the likeness.\n- overall_face (Score node): gold puts it into the overall score as the trainer does when its gold scorer is on; auto follows the trainer_run, else ArcFace.\n\nResults\n- Summary: the averages (overall, face, body). Details: every image.\n- Turn on export_spreadsheet on the Export node for an .xlsx (Summary, Images, References sheets) or CSV files in ComfyUI's output folder.\n\nPaths are as this ComfyUI sees them: a ComfyUI in WSL reads C:\\ai as /mnt/c/ai."
       },
       "color": "#432",
       "bgcolor": "#653"
@@ -273,6 +273,15 @@
             "name": "sam3_model"
           },
           "link": null
+        },
+        {
+          "localized_name": "gold_face",
+          "name": "gold_face",
+          "type": "COMBO",
+          "widget": {
+            "name": "gold_face"
+          },
+          "link": null
         }
       ],
       "outputs": [
@@ -305,7 +314,8 @@
         "cuda:0",
         "cpu",
         640,
-        "facebook/sam3"
+        "facebook/sam3",
+        "facenet"
       ],
       "widgets_values_named": {
         "reference_paths": "",
@@ -316,7 +326,8 @@
         "body_device": "cuda:0",
         "face_provider": "cpu",
         "face_det_size": 640,
-        "sam3_model": "facebook/sam3"
+        "sam3_model": "facebook/sam3",
+        "gold_face": "facenet"
       }
     },
     {
@@ -443,6 +454,33 @@
             "name": "body_ceiling"
           },
           "link": null
+        },
+        {
+          "localized_name": "overall_face",
+          "name": "overall_face",
+          "type": "COMBO",
+          "widget": {
+            "name": "overall_face"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "gold_floor",
+          "name": "gold_floor",
+          "type": "FLOAT",
+          "widget": {
+            "name": "gold_floor"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "gold_ceiling",
+          "name": "gold_ceiling",
+          "type": "FLOAT",
+          "widget": {
+            "name": "gold_ceiling"
+          },
+          "link": null
         }
       ],
       "outputs": [
@@ -487,6 +525,12 @@
           "name": "body",
           "type": "FLOAT",
           "links": null
+        },
+        {
+          "localized_name": "gold_face",
+          "name": "gold_face",
+          "type": "FLOAT",
+          "links": null
         }
       ],
       "properties": {
@@ -502,7 +546,10 @@
         -1,
         -1,
         -1,
-        -1
+        -1,
+        "auto",
+        -1.0,
+        -1.0
       ],
       "widgets_values_named": {
         "image_paths": "",
@@ -514,7 +561,10 @@
         "face_floor": -1,
         "body_floor": -1,
         "face_ceiling": -1,
-        "body_ceiling": -1
+        "body_ceiling": -1,
+        "overall_face": "auto",
+        "gold_floor": -1.0,
+        "gold_ceiling": -1.0
       }
     },
     {
