@@ -25,6 +25,10 @@ def _job(tmp_path, run_id="job-1") -> Path:
     (d / "race" / "race.json").write_text("{}", encoding="utf-8")
     (d / "samples").mkdir()
     (d / "samples" / "step000100_0.png").write_bytes(b"png")
+    (d / "samples" / "lokr8_step000100_1.png").write_bytes(b"png")
+    (d / "samples" / "grid.psd").write_bytes(b"not an image")
+    (d / "probes").mkdir()
+    (d / "probes" / "step000100_face_0.png").write_bytes(b"png")
     (d / "state_000100").mkdir()
     (d / "state_000100" / "optimizer.pt").write_bytes(b"x")
     now = time.time()
@@ -42,6 +46,9 @@ def test_job_files(tmp_path):
     logs = [p.relative_to(d).as_posix() for p in webui.job_logs(d)]
     assert logs == ["config.yaml", "race/race.json", "status.json", "train.log"]  # no images, states or LoRAs
     assert webui.size_text(5 * 2**20) == "5 MB" and webui.size_text(3 * 2**30) == "3.0 GB"
+    assert [p.name for p in webui.job_images(d, "samples")] == ["lokr8_step000100_1.png", "step000100_0.png"]
+    assert [p.name for p in webui.job_images(d, "probes")] == ["step000100_face_0.png"]
+    assert webui.job_images(d, "race") == [] and webui.job_images(None, "probes") == []
 
 
 def test_job_zip_route(tmp_path):
@@ -54,6 +61,13 @@ def test_job_zip_route(tmp_path):
     r = client.get("/rz-job-zip", params={"job": str(d), "kind": "logs"})
     assert sorted(zipfile.ZipFile(io.BytesIO(r.content)).namelist()) == [
         "config.yaml", "race/race.json", "status.json", "train.log"]
+    for kind, names in (("samples", ["samples/lokr8_step000100_1.png", "samples/step000100_0.png"]),
+                        ("probes", ["probes/step000100_face_0.png"])):
+        r = client.get("/rz-job-zip", params={"job": str(d), "kind": kind})
+        assert r.status_code == 200 and sorted(zipfile.ZipFile(io.BytesIO(r.content)).namelist()) == names
+    for f in (d / "probes").iterdir():
+        f.unlink()
+    assert client.get("/rz-job-zip", params={"job": str(d), "kind": "probes"}).status_code == 404  # none yet
     assert client.get("/rz-job-zip", params={"job": str(d), "kind": "states"}).status_code == 404
     assert client.get("/rz-job-zip", params={"job": str(tmp_path), "kind": "logs"}).status_code == 404  # no job
 

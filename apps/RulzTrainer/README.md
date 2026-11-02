@@ -698,7 +698,9 @@ Monitor page shows the sampling step. The Monitor page also has per-GPU VRAM/uti
 loss-smoothing slider, an auto-scrolling log and, under *Log and saved files*, the run's downloads: pick any LoRA in
 the job folder (the checkpoints, the best and the final file, newest first) and *Download* it, *All LoRAs (.zip)* packs
 every one into one archive, and *Logs and settings (.zip)* packs `train.log`, `config.yaml`, `status.json`, the
-likeness scores and the run's other text files. So a run on a rented or remote GPU hands its LoRAs straight to the
+likeness scores and the run's other text files. *Probe images (.zip)* and *Sample images (.zip)* pack every probe
+image and every sample image of the run (every step, and each configuration of a race) as the job folder's `probes/`
+and `samples/` hold them. So a run on a rented or remote GPU hands its LoRAs straight to the
 browser. Only files inside a run's folder (one with a `status.json`) are served. Every Monitor chart folds away like
 the other sections.
 
@@ -1518,7 +1520,8 @@ its history file only (never the job folder). *Export spreadsheet* downloads eac
 *Export spreadsheet* under the likeness probes), from the raw probe scores the history keeps for it.
 
 **Saved files** (under the table) has the Monitor's downloads for a ticked run (with several ticked, pick which): one
-LoRA, all of them as a zip, or the logs and settings as a zip, so a run's files can still be fetched after the next run
+LoRA, all of them as a zip, the logs and settings as a zip, or all the probe images or all the sample images as a
+zip, so a run's files can still be fetched after the next run
 starts. They come from the run's job folder while it still holds that run: a later run of the same job name reuses the
 folder, and then the section says so (runs since v2.29.0 record their id in `status.json`; for older runs any later saved
 run of the same job name counts).
