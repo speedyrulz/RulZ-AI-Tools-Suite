@@ -20,12 +20,22 @@ def test_notation_and_shares_per_epoch():
     assert CS.parse("40") == (40.0, 0.0, 40.0, 0.0, 0)
     assert CS.parse("75:5:40") == (75.0, 5.0, 40.0, 5.0, 0)
     assert CS.parse(" 60% : 7 : 30 : 15 : 2 ") == (60.0, 7.0, 30.0, 15.0, 2)
-    slide = CS.parse(CS.SLIDE)
-    shares = [CS.share_at(slide, e) for e in range(1, 22)]
+    old = CS.parse("60:7:30:15:2")
+    shares = [CS.share_at(old, e) for e in range(1, 22)]
     assert shares[:7] == [60.0] * 7  # until epoch 7
     assert shares[7:14] == [56.25, 52.5, 48.75, 45.0, 41.25, 37.5, 33.75]  # sliding, epochs 8-14
-    assert shares[14:16] == [30.0, 30.0]  # epochs 15, 16
-    assert shares[16:] == [60.0, 30.0, 60.0, 30.0, 60.0]  # every 2nd epoch after 15 back at 60
+    assert shares[14] == 30.0  # epoch 15, the end of the slide
+    assert shares[15:] == [60.0, 30.0, 60.0, 30.0, 60.0, 30.0]  # after it the higher share, every 2nd the lower
+    slide = CS.parse(CS.SLIDE)  # 60:7:30:8:3
+    shares = [CS.share_at(slide, e) for e in range(1, 15)]
+    assert shares == [60.0] * 7 + [30.0, 60.0, 60.0, 30.0, 60.0, 60.0, 30.0]
+    lrs = [CS.lr_scale_at(slide, e) for e in range(1, 15)]
+    assert lrs == [1.0] * 10 + [0.5, 1.0, 1.0, 0.5]  # half the lr on the lower-share epochs after the slide only
+    rising = CS.parse("30:2:60:3:2")  # the lower share first: still the higher after the slide, every 2nd the lower
+    assert [CS.share_at(rising, e) for e in range(1, 8)] == [30.0, 30.0, 60.0, 60.0, 30.0, 60.0, 30.0]
+    assert CS.lr_scale_at(rising, 5) == 0.5 and CS.lr_scale_at(rising, 4) == 1.0
+    assert CS.lr_scale_at(CS.parse("40"), 9) == 1.0 and CS.lr_scale_at(None, 9) == 1.0
+    assert CS.parse(CS.FT_SLIDE) == (11.0, 4.0, 30.0, 8.0, 2)
     split = CS.parse("75:5:40")
     assert [CS.share_at(split, e) for e in (1, 5, 6, 30)] == [75.0, 75.0, 40.0, 40.0]
     assert CS.share_at(CS.parse("40"), 1) == 40.0 and CS.share_at(None, 3) is None
@@ -75,3 +85,23 @@ def test_trainer_offset_follows_the_epochs(caplog):
     assert offs == pytest.approx(want, abs=1e-6)
     assert caplog.text.count("Clean-end share:") == 3  # logged once per change
     assert tr._clean_offset(TrainConfig(), 5, 4096, batcher, 2) == 0.0  # unset: the sampler's own curve
+
+
+def test_lr_scale_and_fine_tune_rotations(caplog):
+    tr = Trainer.__new__(Trainer)
+    tr.arch = get_arch(TrainConfig())
+    batcher = SimpleNamespace(items=[SimpleNamespace(repeats=1)] * 8)  # 8 images per epoch, 4 steps of 2
+    cfg = TrainConfig(clean_share="60:1:30:2:2")  # 60, 30, then 60 with every 2nd epoch at 30 at half the lr
+    scales = [tr._clean_lr_scale(cfg, steps, batcher, 2) for steps in (0, 4, 8, 12, 16)]
+    assert scales == [1.0, 1.0, 1.0, 0.5, 1.0]  # epochs 1-5
+    with caplog.at_level(logging.INFO, logger="rulztrainer"):
+        tr._clean_offset(cfg, 12, 4096, batcher, 2)
+    assert "at half the learning rate" in caplog.text
+    # a full fine-tune of 3 windows, each 4 steps: a rotation is 12 steps = 24 images, whatever the epoch holds
+    ft = Trainer.__new__(Trainer)
+    ft.arch, ft.ft, ft.ft_rotate_steps = tr.arch, SimpleNamespace(windows=[["a"], ["b"], ["c"]]), 4
+    cfg = TrainConfig(clean_share="60:1:30:2:2")
+    assert [ft._clean_lr_scale(cfg, s, batcher, 2) for s in (0, 11, 12, 35, 36, 47)] == [1.0, 1.0, 1.0, 1.0, 0.5, 0.5]
+    with caplog.at_level(logging.INFO, logger="rulztrainer"):
+        ft._clean_offset(cfg, 12, 4096, batcher, 2)
+    assert "from rotation 2" in caplog.text

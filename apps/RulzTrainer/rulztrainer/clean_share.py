@@ -10,18 +10,30 @@ clean_share takes Fizgig's notation, percentages and 1-based epochs of the run's
   "40"              40% for the whole run
   "75:5:40"         75% for the first 5 epochs, then 40%
   "60:7:30:15"      60% until epoch 7, then down in a straight line to 30% by epoch 15, 30% after
-  "60:7:30:15:2"    the same, and every 2nd epoch after epoch 15 one epoch at 60% again (Fizgig's MOSS default, Slide)
+  "60:7:30:8:3"     60% until epoch 7, 30% at epoch 8, then the higher share (60%) with every 3rd epoch at the lower
+                    one (30%), at half the learning rate (Fizgig's MOSS default since 28 Oct 2026, Slide)
 
-Fizgig measured Slide on MOSS-Image, against MOSS's own ~11% curve, on its hardest dataset: of eight schedules it led
-from epoch 12 and still held 71% likeness at epoch 60; a sudden drop (75 to 40) dipped likeness two epochs later.
-Unmeasured here, and RulzTrainer's default already sits at 50%: race it against "" (off) on your own data."""
+With a fifth number R, every epoch after the slide trains at the higher of the two shares and every Rth one at the
+lower, whichever share comes first, at half the learning rate: those epochs reset structure, but at the full rate
+they cost likeness each time. A full fine-tune counts the epochs of the schedule in rotations (a cycle of every
+window), so each window of a rotation trains at the same share and the schedule lands at the same point of the run
+whatever the card holds; its default is "11:4:30:8:2" (the model's own ~11% until rotation 4, so body shape and what
+the model knows hold).
+
+Fizgig measured Slide on MOSS-Image, against MOSS's own ~11% curve: the first Slide (60:7:30:15:2, back to 60% every
+2nd epoch) led from epoch 12 on its hardest dataset and held 71% likeness at epoch 60; 60:7:30:8:3 then held
+likeness about 5 points over 60:7:30:15:2 from epoch 9 to 20 on a 53-photo dataset. A sudden drop (75 to 40) dipped
+likeness two epochs later. Unmeasured here, and RulzTrainer's default already sits at 50%: race it against "" (off)
+on your own data."""
 from __future__ import annotations
 
 import math
 
 import torch
 
-SLIDE = "60:7:30:15:2"  # Fizgig's MOSS-Image default
+SLIDE = "60:7:30:8:3"  # Fizgig's MOSS-Image LoRA default
+FT_SLIDE = "11:4:30:8:2"  # its full fine-tune default (in rotations)
+HALF_LR = 0.5  # the learning rate of the lower-share epochs after the slide
 CLEAN_SIGMA = 0.5
 _SOLVE_N = 16384  # draws per bisection step (fixed seed: the same offset every time)
 
@@ -34,13 +46,13 @@ def parse(spec) -> tuple | None:
     try:
         parts = [float(x) for x in text.split(":")]
     except ValueError:
-        raise ValueError(f"clean_share {spec!r}: numbers separated by ':' (40, 75:5:40, 60:7:30:15:2)") from None
+        raise ValueError(f"clean_share {spec!r}: numbers separated by ':' (40, 75:5:40, 60:7:30:8:3)") from None
     if len(parts) == 1:
         parts = [parts[0], 0.0, parts[0]]
     if len(parts) not in (3, 4, 5):
         raise ValueError(f"clean_share {spec!r}: give one share (40), share:epochs:share (75:5:40), "
                          "share:epoch:share:epoch (60:7:30:15) or with a fifth number, every how many epochs after "
-                         "the slide one epoch goes back to the first share (60:7:30:15:2)")
+                         "the slide every how many epochs train at the lower share, the rest at the higher (60:7:30:8:3)")
     first, until, rest = parts[:3]
     end = parts[3] if len(parts) >= 4 else until
     every = int(parts[4]) if len(parts) == 5 else 0
@@ -64,9 +76,21 @@ def share_at(schedule, epoch: int) -> float | None:
         share = rest
     else:
         share = first + (rest - first) * (e - until) / (end - until)
-    if every > 0 and e > end and (e - end) % every == 0:
-        share = first  # a refresh epoch at the first share
+    if every > 0 and e > end:  # after the slide: the higher share, every Nth epoch the lower one
+        share = min(first, rest) if _lower_epoch(schedule, e) else max(first, rest)
     return round(share, 2)
+
+
+def _lower_epoch(schedule, e: int) -> bool:
+    first, until, rest, end, every = schedule
+    return every > 0 and e > end and (e - end) % every == 0
+
+
+def lr_scale_at(schedule, epoch: int) -> float:
+    """The learning-rate factor for a 1-based epoch: HALF_LR on the lower-share epochs after the slide, else 1."""
+    if schedule is None or schedule[0] == schedule[2]:
+        return 1.0
+    return HALF_LR if _lower_epoch(schedule, max(1, int(epoch))) else 1.0
 
 
 def epoch_of(images_done: int, epoch_images: int) -> int:
@@ -103,13 +127,14 @@ def offset_for(cfg, share: float, tokens: int = 4096, arch=None) -> tuple[float,
 
 class CleanShare:
     """A run's (or race configuration's) schedule: the logit offset for the epoch a step falls in, solved once per
-    share and image size and kept."""
+    share and image size and kept. `unit` names what the schedule counts in the log (a fine-tune's rotations)."""
 
     def __init__(self, cfg, arch=None, log=None):
         self.cfg, self.arch, self.log = cfg, arch, log
         self.schedule = parse(cfg.clean_share)
         self._solved: dict[tuple, float] = {}
         self._last = None
+        self.unit = "epoch"
 
     @property
     def active(self) -> bool:
@@ -129,7 +154,14 @@ class CleanShare:
                 self.log.warning("clean_share: %g%% at the clean end is out of reach with these timestep settings; "
                                  "%.1f%% instead", share, got)
         if self.log and share != self._last:
-            self.log.info("Clean-end share: %g%% of steps below sigma 0.5 from epoch %d (logit offset %+.2f)", share,
-                          epoch, self._solved[key])
+            half = lr_scale_at(self.schedule, epoch) != 1.0
+            self.log.info("Clean-end share: %g%% of steps below sigma 0.5 from %s %d (logit offset %+.2f)%s", share,
+                          self.unit, epoch, self._solved[key],
+                          " - at half the learning rate (the lower share, after the slide)" if half else "")
             self._last = share
         return self._solved[key]
+
+    def lr_scale(self, images_done: int, epoch_images: int) -> float:
+        if self.schedule is None:
+            return 1.0
+        return lr_scale_at(self.schedule, epoch_of(images_done, epoch_images))
