@@ -57,24 +57,38 @@ python webui.py --port 7870
 
 Open http://127.0.0.1:7870.
 
-New to LoRA training? Start on the **Wizard** tab. It walks through a run one step at a time (goal, model, GPUs,
-dataset, training, samples, review) and explains every setting. Each one gets a recommended value based on your GPU
-memory and on the image count and size of your dataset. *Use* takes one recommendation and *Apply recommended* takes
-every one on the page. The wizard edits the same settings as the **Train** tab, which lists every option grouped by
-topic, with rarely changed ones folded under *Advanced*. *Start training*, *Stop* and *Kill* sit in the bar at the
-bottom of the Train and Monitor tabs.
+New to LoRA training? Start on the **Wizard** tab. It sets up a character / person LoRA in six short pages:
 
-**Race wizard.** For a character, the wizard's first page also asks *One run* or *Race several setups*. A race sets
-up the base racer on the usual pages, then adds two:
+1. **Start:** the job name, the trigger word, and what the likeness should cover (face focus, the recommended one;
+   face and body; face only; *Advanced* adds body focus and body only).
+2. **Model:** the base model (the ones meant for training; *Advanced* adds the rest, a custom model and the model
+   files).
+3. **Photos:** the datasets, a check of your photos and their captions. The photos also become the likeness
+   references.
+4. **Training:** steps, learning rate and LoRA rank.
+5. **Samples & probes:** sample prompts, how often to draw previews, save a checkpoint and run a likeness check.
+6. **Extras & start:** *Do you want to use any experimental settings?* No (recommended) keeps the setup as it is and
+   switches every extra off; Yes lists them by group (adapter and optimizer, likeness boosters, noise levels, the
+   configuration race). Each shows how well tested it is (*Tested by others*, *Small or mixed result*, *Only speed
+   tested*, *Not tested yet*) and has a *What is this?* button: what it does, what testing found so far with the
+   numbers, and its cost and limits. A review with any problems found, *Save config*, *Add to queue* and *Start
+   training* follow.
 
-- **Racers:** how many (2-8), which settings may differ (any setting a race configuration may change: learning rate,
-  LoRA rank, adapter, self-training, seed...), then one card per racer with a field for each, filled in with the base
-  value. Only what you change is written into that racer's row; the rest follows the base setup.
-- **Race rules:** whether the lowest racer leaves after each round and after how many warm-up rounds, and whether a
-  racer leaves when it stops improving and after how many probes, with the race's cost in training steps.
+The basics are filled in for you: the identity recipe (see [Identity training](#identity-training-what-each-step-teaches-character-loras))
+with LoRA rank 32 / alpha 32, adamw8bit at 1e-4, and recommendations worked out from your GPUs (memory) and your
+photos (count and size) for the hardware, resolution, steps and samples. *Reset* puts that setup back. **Advanced**, at
+the top of the wizard, shows every setting on every page, each with its recommendation (*Use* takes one, *Apply
+recommended* every one on the page), and the same switch on the **Train** tab shows that tab's *Advanced options*
+panels, experimental settings and tool sections (Configuration race, Seed soup, Post-hoc EMA, Probe noise check):
+with it off the Train tab keeps to the everyday settings, though an experimental setting that is switched on stays in
+view. The wizard edits the same settings as the Train tab, which is also where styles and concepts are set up.
+*Start training*, *Stop* and *Kill* sit in the bar at the bottom of the Train and Monitor tabs.
 
-The review then offers *Start the race*, or *Adjust in all settings* to fine-tune it on the Train tab (its
-Configuration race section holds the same rows).
+**Race.** Switching on *Configuration race* among the wizard's extras adds the racers (how many, 2-8, which settings
+may differ, one card per racer with a field for each, filled in with the base value; only what you change is written
+into that racer's row) and the race's rules (whether the lowest racer leaves after each round and after how many
+warm-up rounds, whether a racer leaves when it stops improving, the relay), with the race's cost in training steps.
+The start button then reads *Start the race*; the Train tab's Configuration race section holds the same rows.
 
 The WebUI has a dark look (the default) and a light one. The first time you open it in a browser it asks which one
 you want (*Choose your look*); the sun / moon button at the top right switches between them at any time. The choice
@@ -1023,8 +1037,8 @@ score), not a default.
 
 Two training-only losses that read the model's insides and reuse what the trainer already has (the region maps'
 person mask and face box, the face analysis); the saved LoRA is the same kind of file. Both are switches in the
-Region-weighted loss section (*Trigger attention and identity alignment*) and in the Wizard's Training step for a
-character, and race keys. Neither is measured for likeness yet: race them against the run's own settings.
+Region-weighted loss section (*Trigger attention and identity alignment*) and among the Wizard's experimental extras,
+and race keys. Neither is measured for likeness yet: race them against the run's own settings.
 
 - **Attention localization** (`attn_localize`, weight `attn_localize_weight` 0.05). In a few attention layers
   (`attn_localize_layers`; auto: a third and half of the depth, FIBO 2.0's injection blocks) every image token's
