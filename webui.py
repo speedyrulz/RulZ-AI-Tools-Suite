@@ -877,6 +877,73 @@ def probe_score_line(rec: dict | None) -> str:
     return " | ".join(parts)
 
 
+_PROBE_IMAGE = re.compile(r"_(face|body)_(\d+)\.png$")
+_SAMPLE_IMAGE = re.compile(r"step(\d{6})_(\d+)\.png$")
+
+
+def probe_image_title(path) -> str:
+    """"Face probe 2" for ..._face_1.png."""
+    m = _PROBE_IMAGE.search(Path(path).name)
+    return f"{m.group(1).capitalize()} probe {int(m.group(2)) + 1}" if m else Path(path).name
+
+
+def probe_steps(probes: list[dict], names: list[str]) -> dict[int, tuple[str, list]]:
+    """The Monitor's probe images by step for a StepGallery: {step: (summary, [(group, path, title, scores)])}. One
+    run: the probe's scores once as the summary, a title per image. A race: one group per probe image ("Face probe
+    1"), every configuration's image side by side, each with its own probe's scores (the winner after the race:
+    "winner")."""
+    out: dict[int, tuple[str, list]] = {}
+    for rec in probes:
+        images = rec.get("images") or []
+        if not images:
+            continue
+        line = probe_score_line(rec).replace(" | ", " · ").replace("overall", "combined")
+        if names:
+            who = probe_racer(rec, names) or "winner"
+            _, items = out.setdefault(rec["step"], ("", []))
+            items += [(probe_image_title(p), p, who, line) for p in images]
+        else:
+            out[rec["step"]] = (f"This probe: {line}" if line else "",
+                                [("", p, probe_image_title(p), "") for p in images])
+    if names:  # each group's configurations in race order
+        order = {n: i for i, n in enumerate(names)}
+        for step, (summary, items) in out.items():
+            groups = list(dict.fromkeys(g for g, *_ in items))
+            out[step] = (summary, sorted(items, key=lambda it: (groups.index(it[0]), order.get(it[2], len(order)))))
+    return out
+
+
+def sample_steps(samples: list[str], scores: list[dict], names: list[str]) -> dict[int, tuple[str, list]]:
+    """The Monitor's sample images by step for a StepGallery: one run, a title per prompt with its likeness scores and
+    the step's average as the summary; a race, one group per prompt with every configuration side by side."""
+    by_name = {Path(sc["image"]).name: sc for sc in scores}
+    out: dict[int, tuple[str, list]] = {}
+    if names:
+        for step, rest, members in group_by_generation(samples, names):
+            what = generation_label(step, rest).split(", ", 1)[-1]
+            _, items = out.setdefault(step, ("", []))
+            items += [(what[:1].upper() + what[1:], p, who or "winner", short_scores(by_name.get(Path(p).name)))
+                      for who, p in members]
+        for step, (_, items) in out.items():  # prompt 1 first
+            groups = sorted(dict.fromkeys(g for g, *_ in items), key=lambda g: (len(g), g))
+            items.sort(key=lambda it: groups.index(it[0]))
+        return out
+    for p in samples:
+        m = _SAMPLE_IMAGE.search(Path(p).name)
+        if not m:
+            continue
+        step, i = int(m.group(1)), int(m.group(2))
+        out.setdefault(step, ("", []))[1].append(("", p, f"Prompt {i + 1}", short_scores(by_name.get(Path(p).name))))
+    for step, (_, items) in list(out.items()):
+        items.sort(key=lambda it: int(it[2].split()[-1]))
+        mine = [by_name[Path(p).name] for _, p, *_ in items if Path(p).name in by_name]
+        avg = short_scores({k: sum(v) / len(v) for k in ("face_norm", "body_norm", "combined_norm", "percent",
+                                                          "body_percent", "combined_percent")
+                            if (v := [sc[k] for sc in mine if sc.get(k) is not None])}) if mine else ""
+        out[step] = (f"Average of this step's samples: {avg}" if avg else "", items)
+    return out
+
+
 def face_scores_by_image(job_dir: Path | None) -> dict[str, dict]:
     if job_dir is None:
         return {}
@@ -1635,6 +1702,26 @@ body {
 .q-uploader__header { color: var(--rz-text); border-bottom: 1px solid var(--rz-border); }
 .rz-log { background: var(--rz-deep); border: 1px solid var(--rz-border); border-radius: 10px; color: var(--rz-text-2); }
 .rz-thumb { background: var(--rz-surface-2); border: 1px solid var(--rz-border); border-radius: 10px; overflow: hidden; }
+.rz-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; width: 100%; }
+.rz-tiles .rz-tile { min-width: 0; }
+.rz-gpu { flex: 1 1 18rem; min-width: 0; }
+/* the Monitor's image galleries: square thumbnails in a grid, a title and the scores under each */
+.rz-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; width: 100%; }
+.rz-shot { background: var(--rz-surface-2); border: 1px solid var(--rz-border); border-radius: 10px; overflow: hidden;
+  min-width: 0; }
+.rz-shot:hover { border-color: var(--rz-border-strong); }
+.rz-shot-title { font-size: 12px; font-weight: 600; color: var(--rz-text); padding: 6px 8px 0; overflow-wrap: anywhere; }
+.rz-shot-sub { font-size: 11px; color: var(--rz-muted); padding: 2px 8px 7px; line-height: 1.4; }
+.rz-shot-title:last-child { padding-bottom: 7px; }
+.rz-step-pick { width: 11rem; }
+/* "label value" chips: a probe's or a sample step's scores */
+.rz-kvs { display: flex; flex-wrap: wrap; gap: 6px; }
+.rz-kv { display: inline-flex; align-items: baseline; gap: 6px; background: var(--rz-surface-2);
+  border: 1px solid var(--rz-border); border-radius: 8px; padding: 3px 10px; font-size: 13px; }
+.rz-kv .k { color: var(--rz-muted); font-size: 12px; }
+.rz-kv .v { color: var(--rz-heading); font-weight: 600; font-variant-numeric: tabular-nums; }
+.rz-kv.warn { border-color: rgba(245, 158, 11, .5); }
+.rz-kv.warn .v { color: var(--rz-warn-text); }
 .rz-thumb.rz-picked { border: 2px solid var(--rz-red, #E10600); }
 .rz-ds-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; width: 100%; }
 .rz-look-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; }
@@ -1696,6 +1783,23 @@ body {
 .rz-summary { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px 24px; width: 100%; font-size: 14px; }
 .rz-summary .k { color: var(--rz-muted); }
 .rz-summary .v { color: var(--rz-text-3); overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+  .rz-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .rz-tile { padding: 9px 12px; }
+  .rz-tile-value { font-size: 17px; }
+  .rz-gallery { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .rz-monitor .rz-section .q-item__label--caption { display: none; }
+  .rz-kv { font-size: 12px; padding: 2px 8px; }
+  .rz-step-pick { width: auto; flex: 1 1 auto; min-width: 0; }
+  /* the action bar: one row of compact buttons, the secondary ones as icons (their tooltips name them) */
+  .rz-footer-row { gap: 4px 8px; padding: 6px 10px; }
+  .rz-footer-row > .rz-footer-msg { min-width: 0; flex-basis: 100%; }
+  .rz-footer-row > .rz-footer-btns { width: 100%; justify-content: space-between; }
+  .rz-footer .q-btn { min-height: 38px; padding: 4px 10px; font-size: 13px; }
+  .rz-footer .q-btn .q-btn__content { flex-wrap: nowrap; white-space: nowrap; }
+  .rz-footer .q-btn.rz-icon-only .q-btn__content > .block { font-size: 0; max-width: 0; overflow: hidden; }
+  .rz-footer .q-btn.rz-icon-only .q-icon { margin-right: 0; }
+}
 @media (max-width: 760px) {
   .rz-setting, .rz-item { grid-template-columns: 1fr; }
   .rz-desc { padding-top: 0; }
@@ -2059,20 +2163,70 @@ def stat_tile(label: str):
 
 
 def _axis(name: str, **kw) -> dict:
+    """A value axis; labels that would overlap are left out (a step axis on a phone)."""
     return {"type": "value", "name": name, "axisLine": {"lineStyle": {"color": "#3F3F46"}},
-            "axisLabel": {"color": "#A1A1AA"}, "splitLine": {"lineStyle": {"color": "#222222"}},
+            "axisLabel": {"color": "#A1A1AA", "hideOverlap": True}, "splitLine": {"lineStyle": {"color": "#222222"}},
             "nameTextStyle": {"color": "#A1A1AA"}, **kw}
 
 
 def chart_options(x: dict, y, series: list, legend: list[str]) -> dict:
-    """ECharts options in the dark theme: transparent background, muted axes, the brand palette first."""
+    """ECharts options in the dark theme: transparent background, muted axes, the brand palette first. The legend
+    wraps onto more rows instead of paging and the step axis is named under it (fit_chart makes room for the
+    legend's rows; ECharts 6 keeps the axis labels inside the chart)."""
+    if x.get("name") == "step":
+        x = {**x, "nameLocation": "middle", "nameGap": 26}
     return {"backgroundColor": "transparent", "color": CHART_COLORS, "textStyle": {"color": "#D4D4D8"},
             "xAxis": x, "yAxis": y, "series": series,
-            "legend": {"data": legend, "type": "scroll", "top": 0, "textStyle": {"color": "#D4D4D8"},
+            "legend": {"data": legend, "type": "plain", "top": 0, "itemGap": 12, "textStyle": {"color": "#D4D4D8"},
                        "pageTextStyle": {"color": "#A1A1AA"}},
-            "tooltip": {"trigger": "axis", "backgroundColor": "#18181B", "borderColor": "#3F3F46",
+            "tooltip": {"trigger": "axis", "confine": True, "backgroundColor": "#18181B", "borderColor": "#3F3F46",
                         "textStyle": {"color": "#F4F4F5"}},
-            "grid": {"left": 60, "right": 60, "top": 40, "bottom": 40}}
+            "grid": {"left": 52, "right": 24, "top": 40, "bottom": 44}}
+
+
+def fit_chart(chart) -> None:
+    """Fit a chart_options() chart to its browser's width (chart._rz_width, the window's): the legend's rows are
+    counted the way ECharts wraps them and the plot starts below them, with smaller text and margins on a phone."""
+    width = getattr(chart, "_rz_width", 1280)
+    narrow = width < 600
+    plot = min(width, 1440) - (100 if narrow else 160)  # less the page's and the card's padding (a 375 px phone: 282)
+    legend = chart.options.get("legend") or {}
+    names = [n["name"] if isinstance(n, dict) else str(n) for n in legend.get("data") or []]
+    font, icon, gap = (11, 16, 8) if narrow else (12, 25, 12)
+    rows, used = (1 if names else 0), 0.0
+    for name in names:
+        w = icon + 5 + len(name) * font * 0.62 + gap
+        if used and used + w > plot:
+            rows, used = rows + 1, 0.0
+        used += w
+    legend.update(itemGap=gap, itemWidth=icon, textStyle={**legend.get("textStyle", {}), "fontSize": font})
+    y_axes = chart.options.get("yAxis")
+    named = any(a.get("name") for a in (y_axes if isinstance(y_axes, list) else [y_axes or {}]))
+    for i, axis in enumerate(y_axes if isinstance(y_axes, list) else [y_axes or {}]):
+        if axis.get("name"):  # the name runs inwards from the axis instead of centred on it (clipped at the edge)
+            right = axis.get("position", "right" if i else "left") == "right"  # a second axis is on the right
+            axis.setdefault("nameTextStyle", {})["align"] = "right" if right else "left"
+    # a legend row is about 25 px high, and the y axis name sits about 30 px above the plot
+    chart.options["grid"].update(top=rows * 25 + (34 if named else 10), left=40 if narrow else 52,
+                                 right=14 if narrow else 24)
+    # the chart grows by the legend's extra rows, so a long legend (a race on a phone) leaves the plot its height
+    base = next((int(c[2:]) * 4 for c in chart.classes if re.fullmatch(r"h-\d+", c)), None)
+    if base is not None:
+        extra = max(0, rows - 1) * 25
+        chart.style(replace=f"height: {base + extra}px" if extra else "")
+
+
+class RzChart(ui.echart):
+    """An ECharts chart that fits its legend and margins to the browser's width on every update."""
+
+    def update(self) -> None:
+        if "grid" in self.options and not getattr(self, "_rz_fitting", False):
+            self._rz_fitting = True  # the options are observed: changing them calls update() again
+            try:
+                fit_chart(self)
+            finally:
+                self._rz_fitting = False
+        super().update()
 
 
 def _line(name: str, color: str, **kw) -> dict:
@@ -2576,20 +2730,189 @@ def summary_thumbs(data: dict | None) -> list[Path]:
 
 
 def image_viewer():
-    """Full-window image viewer dialog. Returns show(path) callable."""
+    """Full-window image viewer dialog. Returns show(path, items=None): items, [(path, caption)], are the images its
+    arrows (and the keyboard's left and right arrows) step through, the shown one among them."""
+    state = {"items": [], "i": 0}
     with ui.dialog().props("maximized") as dlg, ui.card().tight().classes("w-full h-full bg-black"):
-        with ui.row().classes("w-full items-center justify-between px-3 py-1"):
-            title = ui.label("").classes("text-sm text-white truncate")
+        with ui.row().classes("w-full items-center no-wrap gap-1 px-3 py-1"):
+            title = ui.label("").classes("text-sm text-white truncate flex-1 min-w-0")
+            back = ui.button(icon="chevron_left", on_click=lambda: step(-1)).props("flat dense round color=white") \
+                .tooltip("Previous image")
+            count = ui.label("").classes("text-xs text-grey-5 whitespace-nowrap")
+            ahead = ui.button(icon="chevron_right", on_click=lambda: step(1)).props("flat dense round color=white") \
+                .tooltip("Next image")
             ui.button(icon="close", on_click=dlg.close).props("flat dense round color=white")
         big = ui.image("").props("fit=contain").classes("w-full").style("height: calc(100vh - 48px)")
         big.on("click", dlg.close)
 
-    def show(path: Path):
-        title.text = str(path)
+    def paint():
+        path, caption = state["items"][state["i"]]
+        title.text = caption or str(path)
         big.set_source(image_url(path))
+        many = len(state["items"]) > 1
+        back.visible = ahead.visible = count.visible = many
+        count.text = f"{state['i'] + 1} / {len(state['items'])}"
+
+    def step(delta: int):
+        if len(state["items"]) > 1:
+            state["i"] = (state["i"] + delta) % len(state["items"])
+            paint()
+
+    def key(e):
+        if dlg.value and e.action.keydown:
+            if e.key.arrow_left:
+                step(-1)
+            elif e.key.arrow_right:
+                step(1)
+
+    ui.keyboard(on_key=key, ignore=["input", "select", "button", "textarea"])
+
+    def show(path, items=None):
+        items = [(str(q), c) for q, c in (items or [(path, "")])]
+        names = [q for q, _ in items]
+        if str(path) not in names:
+            items.insert(0, (str(path), ""))
+            names.insert(0, str(path))
+        state.update(items=items, i=names.index(str(path)))
+        paint()
         dlg.open()
 
     return show
+
+
+def short_scores(sc: dict | None) -> str:
+    """"face 47% · body 17% · combined 38%": a sample's likeness for its thumbnail (normalized where it was recorded
+    on the scale, the scores themselves otherwise)."""
+    if not sc:
+        return ""
+    parts = []
+    for label, nk, rk in (("face", "face_norm", "percent"), ("body", "body_norm", "body_percent"),
+                          ("combined", "combined_norm", "combined_percent")):
+        v = sc.get(nk)
+        if v is None:
+            v = sc.get(rk)
+        if v is not None:
+            parts.append(f"{label} {v:.0f}%")
+        elif label == "face":
+            parts.append("no face")
+    return " · ".join(parts)
+
+
+def stat_chips(box, items, sig_box: dict | None = None) -> None:
+    """Fill `box` with "label value" chips, [(label, value, warn)]: easier to read than one long line of numbers, and
+    they wrap on a phone. Redrawn only when they change (sig_box remembers the last ones)."""
+    items = [(a, b, bool(w)) for a, b, w in items]
+    if sig_box is not None:
+        if sig_box.get("sig") == items:
+            return
+        sig_box["sig"] = items
+    box.clear()
+    with box:
+        for label, value, warn in items:
+            with ui.element("div").classes("rz-kv" + (" warn" if warn else "")):
+                ui.label(label).classes("k")
+                ui.label(value).classes("v")
+
+
+class StepGallery:
+    """A Monitor gallery of one kind of image (samples or likeness probes) by training step: arrows and a dropdown
+    pick the step (the newest by default; it follows new steps while it shows the newest), a summary line for the
+    step, and a grid of thumbnails, each with a title and its scores. A click opens the full-size viewer, whose
+    arrows step through the step's images."""
+
+    def __init__(self, empty: str, viewer):
+        self.viewer = viewer
+        self.empty = empty
+        self.steps: dict[int, tuple[str, list]] = {}  # step -> (summary, [(group, path, title, scores)])
+        self.step: int | None = None  # the step shown; None = the newest
+        self._quiet = False
+        with ui.row().classes("w-full items-center gap-1 no-wrap") as self.bar:
+            self.older = ui.button(icon="chevron_left", on_click=lambda: self.move(1)) \
+                .props("flat dense round").tooltip("The step before")
+            self.pick = ui.select({}, on_change=self.picked).props("dense options-dense outlined") \
+                .classes("rz-step-pick")
+            self.newer = ui.button(icon="chevron_right", on_click=lambda: self.move(-1)) \
+                .props("flat dense round").tooltip("The step after")
+            self.latest = ui.button("Newest", icon="last_page", on_click=lambda: self.go(None), color=None) \
+                .props("flat dense no-caps").tooltip("Show the newest images again (and follow new ones)")
+        self.bar.visible = False
+        self.summary = hint("").classes("w-full")
+        self.summary.visible = False
+        self.grid = ui.column().classes("w-full gap-2")
+        with self.grid:
+            hint(empty)
+
+    def order(self) -> list[int]:
+        return sorted(self.steps, reverse=True)
+
+    def set(self, steps: dict[int, tuple[str, list]]) -> None:
+        if steps == self.steps:
+            return
+        self.steps = steps
+        if self.step not in steps:
+            self.step = None
+        self._quiet = True
+        self.pick.options = {s: f"Step {s:,}" + (" (newest)" if i == 0 else "") for i, s in enumerate(self.order())}
+        self.pick.update()
+        self._quiet = False
+        self.render()
+
+    def shown(self) -> int | None:
+        order = self.order()
+        return None if not order else self.step if self.step is not None else order[0]
+
+    def go(self, step: int | None) -> None:
+        order = self.order()
+        self.step = None if (step is None or (order and step == order[0])) else step
+        self.render()
+
+    def move(self, delta: int) -> None:
+        order = self.order()
+        s = self.shown()
+        if s is not None:
+            self.go(order[min(max(order.index(s) + delta, 0), len(order) - 1)])
+
+    def picked(self, e) -> None:
+        if not self._quiet and e.value is not None and e.value != self.shown():
+            self.go(e.value)
+
+    def render(self) -> None:
+        order = self.order()
+        s = self.shown()
+        self.bar.visible = bool(order)
+        self.grid.clear()
+        if s is None:
+            self.summary.visible = False
+            with self.grid:
+                hint(self.empty)
+            return
+        i = order.index(s)
+        self._quiet = True
+        self.pick.value = s
+        self._quiet = False
+        self.older.set_enabled(i < len(order) - 1)
+        self.newer.set_enabled(i > 0)
+        self.latest.visible = i > 0
+        summary, items = self.steps[s]
+        self.summary.text = summary
+        self.summary.visible = bool(summary)
+        view = [(q, " · ".join(x for x in (f"Step {s:,}", g, title, scores) if x)) for g, q, title, scores in items]
+        groups: dict[str, list] = {}
+        for item in items:
+            groups.setdefault(item[0], []).append(item)
+        with self.grid:
+            for group, members in groups.items():
+                if group:
+                    ui.label(group).classes("rz-subhead w-full")
+                with ui.element("div").classes("rz-gallery"):
+                    for _, q, title, scores in members:
+                        with ui.column().classes("rz-shot gap-0"):
+                            ui.image(image_url(q)).props("ratio=1 fit=contain") \
+                                .classes("w-full rz-imgbg cursor-pointer") \
+                                .on("click", lambda _, q=q: self.viewer(Path(q), view))
+                            ui.label(title).classes("rz-shot-title")
+                            if scores:
+                                ui.label(scores).classes("rz-shot-sub")
 
 
 def build_dataset_tab(f: Form):
@@ -5818,7 +6141,7 @@ def build_history_tab(charts: list):
         with ui.row().classes("items-center gap-3"):
             id_metrics = metric_chips(("face", "body"), lambda: draw())
             id_empty = hint("")
-        id_chart = ui.echart(chart_options(_axis("step", min="dataMin"), _axis("similarity %", min=0), [],
+        id_chart = RzChart(chart_options(_axis("step", min="dataMin"), _axis("similarity %", min=0), [],
                                            [])).classes("w-full h-72")
     with section("Likeness probes & controller", "Smoothed face, body and combined score of the probes", "show_chart"):
         with ui.row().classes("items-center gap-3"):
@@ -5851,7 +6174,7 @@ def build_history_tab(charts: list):
                              "which moves little between runs, no longer swings the combined score")
             scale_row.bind_visibility_from(scale_on, "value")
         scale_note = hint("", warn=True)
-        probe_chart_h = ui.echart(chart_options(_axis("step", min="dataMin"), _axis("likeness %", min=0),
+        probe_chart_h = RzChart(chart_options(_axis("step", min="dataMin"), _axis("likeness %", min=0),
                                                 [], [])).classes("w-full h-72")
     with section("Probe images", "The ticked runs' probes at the same step side by side; pick two to compare",
                  "compare"):
@@ -7953,8 +8276,9 @@ def build_page(local: bool = True):
 
         # ------------------------------------------------------------ Monitor
         with ui.tab_panel(tab_monitor):
-            with ui.column().classes("rz-page gap-4"):
-                with ui.row().classes("w-full gap-3"):
+            show_full = image_viewer()
+            with ui.column().classes("rz-page gap-4 rz-monitor"):
+                with ui.element("div").classes("rz-tiles"):
                     tiles = {key: stat_tile(label) for key, label in (
                         ("state", "Status"), ("stage", "Stage"), ("step", "Step"), ("loss", "Loss"),
                         ("lr", "Learning rate"), ("eta", "Time left"))}
@@ -7982,56 +8306,6 @@ def build_page(local: bool = True):
                          "running; a WebUI restarted with runs waiting and nothing running pauses the queue until you "
                          "Resume it.")
                     queue_list = ui.column().classes("w-full gap-1")
-                with section("Loss", "Raw and smoothed training loss", "show_chart"):
-                    with ui.row().classes("w-full items-center gap-4"):
-                        ui.space()
-                        ui.label("Smoothing").classes("rz-hint")
-                        smoothing = ui.slider(min=0, max=0.98, step=0.02, value=0.8).classes("w-48")
-                        ui.label().bind_text_from(smoothing, "value", lambda x: f"{x:.2f}").classes("rz-hint w-10")
-                    loss_chart = ui.echart(chart_options(
-                        _axis("step", min="dataMin"),
-                        [_axis("loss", scale=True),
-                         _axis("id loss", scale=True, show=False, splitLine={"show": False})],
-                        [_line("raw", "#52525B", lineStyle={"width": 1}),
-                         _line("smoothed", "#FF3B30", lineStyle={"width": 2}),
-                         _line("id loss (smoothed)", "#F4F4F5", yAxisIndex=1,
-                               lineStyle={"width": 2, "type": "dashed"})],
-                        ["raw", "smoothed"])).classes("w-full h-72")
-                    charts.append(loss_chart)
-                with section("Gradient norm", "How big each step's update was before clipping", "insights") \
-                        as grad_card:
-                    grad_label = ui.label("").classes("rz-hint")
-                    hint("How big each step's update was before clipping (the loss chart's smoothing). A steady line "
-                         "is healthy; spikes that keep growing, or a line that sits on the clip limit, mean the "
-                         "learning rate is too high.")
-                    grad_chart = ui.echart(chart_options(
-                        _axis("step", min="dataMin"), [_axis("gradient norm", scale=True)],
-                        [_line("raw", "#52525B", lineStyle={"width": 1}),
-                         _line("smoothed", "#FF3B30", lineStyle={"width": 2}),
-                         _line("clip limit", "#F4F4F5", lineStyle={"width": 1, "type": "dashed"})],
-                        ["raw", "smoothed"])).classes("w-full h-48")
-                    charts.append(grad_chart)
-                grad_card.visible = False
-                with section("Identity similarity", "Face / body / combined score of every sample", "face") as face_exp:
-                    face_label = hint("")
-                    face_chart = ui.echart(chart_options(_axis("step", min="dataMin"),
-                                                         _axis("similarity %", min=0, max=100), [], [])) \
-                        .classes("w-full h-60")
-                    charts.append(face_chart)
-                face_exp.visible = False
-                with section("Per-image loss watch", "Verdict per training image", "rule") as lw_exp:
-                    lw_label = hint("")
-                    lw_table = ui.table(columns=[
-                        {"name": "image", "label": "image", "field": "image", "align": "left", "sortable": True},
-                        {"name": "verdict", "label": "verdict", "field": "verdict", "align": "left", "sortable": True},
-                        {"name": "residual", "label": "residual (epoch)", "field": "residual", "sortable": True},
-                        {"name": "ema", "label": "residual EMA", "field": "ema", "sortable": True},
-                        {"name": "trend", "label": "trend %", "field": "trend", "sortable": True},
-                        {"name": "multiplier", "label": "lr x", "field": "multiplier", "sortable": True},
-                        {"name": "seen", "label": "seen", "field": "seen", "sortable": True},
-                    ], rows=[], row_key="path", pagination=15).props("flat dense").classes("w-full text-xs")
-                lw_exp.visible = False
-                lw_state = {"sig": None}
                 with section("Configuration race", "Smoothed probe score per configuration; the lowest leaves after "
                              "every round", "emoji_events") as race_exp:
                     race_label = hint("")
@@ -8078,10 +8352,11 @@ def build_page(local: bool = True):
                     drop_go.on_click(do_drop)
                     race_table.on("drop", ask_drop)
                 race_exp.visible = False
-                with section("Likeness probes & controller", "Smoothed probe scores and controller state",
-                             "insights") as probe_exp:
-                    with ui.row().classes("w-full items-center gap-2"):
-                        probe_label = hint("").classes("flex-1")
+                with section("Likeness probes & controller", "How much the probe images look like the person "
+                             "(0 = a stranger, 100 = your references)", "insights") as probe_exp:
+                    with ui.row().classes("w-full items-start gap-2"):
+                        probe_chips = ui.row().classes("rz-kvs flex-1")
+                        probe_sig: dict = {}
 
                         def export_likeness():
                             from urllib.parse import quote
@@ -8103,21 +8378,73 @@ def build_page(local: bool = True):
                                                     "Show lines (all configurations):", "configuration")
                     race_chips_row.visible = False
                     # the normalized scores (0 = a stranger, 100 = the references): smoothed lines, per-probe dots
-                    probe_chart = ui.echart(chart_options(
+                    probe_chart = RzChart(chart_options(
                         _axis("step", min="dataMin"), _axis("likeness % (normalized)", min=0, max=100),
                         *probe_chart_series([], []))).classes("w-full h-60")
                     charts.append(probe_chart)
-                    probe_row = ui.row().classes("w-full gap-2")
+                    ui.label("Probe images").classes("rz-subhead w-full")
+                    probe_gallery = StepGallery("No probe images yet.", show_full)
                 probe_exp.visible = False
-                shown_probes: list[str] = []
-                with section("Latest samples", "Click an image to see it full size", "image"):
-                    with ui.row().classes("w-full gap-2") as samples_row:
-                        hint("No samples yet. They appear here every 'Sample every' steps.")
+                with section("Sample images", "Your sample prompts at each sample step; click an image to see it full "
+                             "size", "image"):
+                    sample_gallery = StepGallery("No samples yet. They appear here every 'Sample every' steps.",
+                                                 show_full)
+                with section("Identity similarity", "How much the samples look like the person, per sample prompt",
+                             "face") as face_exp:
+                    face_chips = ui.row().classes("rz-kvs w-full")
+                    face_sig: dict = {}
+                    face_chart = RzChart(chart_options(_axis("step", min="dataMin"),
+                                                         _axis("similarity %", min=0, max=100), [], [])) \
+                        .classes("w-full h-60")
+                    charts.append(face_chart)
+                face_exp.visible = False
+                with section("Loss", "Raw and smoothed training loss", "show_chart"):
+                    with ui.row().classes("w-full items-center gap-4"):
+                        ui.space()
+                        ui.label("Smoothing").classes("rz-hint")
+                        smoothing = ui.slider(min=0, max=0.98, step=0.02, value=0.8).classes("w-48")
+                        ui.label().bind_text_from(smoothing, "value", lambda x: f"{x:.2f}").classes("rz-hint w-10")
+                    loss_chart = RzChart(chart_options(
+                        _axis("step", min="dataMin"),
+                        [_axis("loss", scale=True),
+                         _axis("id loss", scale=True, show=False, splitLine={"show": False})],
+                        [_line("raw", "#52525B", lineStyle={"width": 1}),
+                         _line("smoothed", "#FF3B30", lineStyle={"width": 2}),
+                         _line("id loss (smoothed)", "#F4F4F5", yAxisIndex=1,
+                               lineStyle={"width": 2, "type": "dashed"})],
+                        ["raw", "smoothed"])).classes("w-full h-72")
+                    charts.append(loss_chart)
+                with section("Gradient norm", "How big each step's update was before clipping", "insights") \
+                        as grad_card:
+                    grad_label = ui.label("").classes("rz-hint")
+                    hint("How big each step's update was before clipping (the loss chart's smoothing). A steady line "
+                         "is healthy; spikes that keep growing, or a line that sits on the clip limit, mean the "
+                         "learning rate is too high.")
+                    grad_chart = RzChart(chart_options(
+                        _axis("step", min="dataMin"), [_axis("gradient norm", scale=True)],
+                        [_line("raw", "#52525B", lineStyle={"width": 1}),
+                         _line("smoothed", "#FF3B30", lineStyle={"width": 2}),
+                         _line("clip limit", "#F4F4F5", lineStyle={"width": 1, "type": "dashed"})],
+                        ["raw", "smoothed"])).classes("w-full h-48")
+                    charts.append(grad_chart)
+                grad_card.visible = False
+                with section("Per-image loss watch", "Verdict per training image", "rule") as lw_exp:
+                    lw_label = hint("")
+                    lw_table = ui.table(columns=[
+                        {"name": "image", "label": "image", "field": "image", "align": "left", "sortable": True},
+                        {"name": "verdict", "label": "verdict", "field": "verdict", "align": "left", "sortable": True},
+                        {"name": "residual", "label": "residual (epoch)", "field": "residual", "sortable": True},
+                        {"name": "ema", "label": "residual EMA", "field": "ema", "sortable": True},
+                        {"name": "trend", "label": "trend %", "field": "trend", "sortable": True},
+                        {"name": "multiplier", "label": "lr x", "field": "multiplier", "sortable": True},
+                        {"name": "seen", "label": "seen", "field": "seen", "sortable": True},
+                    ], rows=[], row_key="path", pagination=15).props("flat dense").classes("w-full text-xs")
+                lw_exp.visible = False
+                lw_state = {"sig": None}
                 with section("Log and saved files", "train.log, checkpoints and training states", "terminal"):
                     job_files = JobFiles()
                     saved_label = ui.label("").classes("rz-mono whitespace-pre-wrap")
                     log_view = ui.log(max_lines=600).classes("w-full h-80 rz-log rz-mono")
-            shown_samples: list[str] = []
             probe_view = {"probes": [], "names": []}
 
             def draw_probe_chart() -> None:
@@ -8126,7 +8453,6 @@ def build_page(local: bool = True):
                 series, legend = probe_chart_series(probe_view["probes"], probe_view["names"], shown)
                 probe_chart.options["series"] = series
                 probe_chart.options["legend"]["data"] = legend
-                probe_chart.options["grid"]["top"] = 60 if len(legend) > 5 else 40  # room for a race's legend
                 probe_chart.update()
 
             queue_shown = {"sig": None}
@@ -8171,7 +8497,6 @@ def build_page(local: bool = True):
 
             ui.timer(2.0, queue_draw)
             log_state = {"job": None, "n": 0, "console_shown": False}
-            show_full = image_viewer()
 
             def show(key: str, value: str, sub: str = ""):
                 tiles[key][0].text = value
@@ -8184,12 +8509,12 @@ def build_page(local: bool = True):
                     gpu_widgets.clear()
                     with gpu_box:
                         for _ in stats:
-                            with ui.column().classes("rz-tile gap-1 min-w-[18rem]"):
+                            with ui.column().classes("rz-tile rz-gpu gap-1"):
                                 name = ui.label("").classes("text-sm font-semibold rz-strong")
                                 bars = {}
                                 for key, color in (("vram", "primary"), ("util", "grey-5")):
                                     with ui.row().classes("w-full items-center gap-2 no-wrap"):
-                                        ui.label("VRAM" if key == "vram" else "Load").classes("rz-tile-sub w-10")
+                                        ui.label("VRAM" if key == "vram" else "Load").classes("rz-tile-sub w-12")
                                         bar = ui.linear_progress(value=0, show_value=False, size="6px",
                                                                  color=color).props("rounded") \
                                             .classes("flex-1")
@@ -8197,7 +8522,7 @@ def build_page(local: bool = True):
                                     bars[key] = (bar, text)
                             gpu_widgets.append({"name": name, **bars})
                 for st, wdg in zip(stats, gpu_widgets):
-                    wdg["name"].text = f"GPU {st['index']} · {st['name']}"
+                    wdg["name"].text = f"GPU {st['index']} · {st['name'].removeprefix('NVIDIA ')}"
                     wdg["vram"][0].value = st["used"] / max(1, st["total"])
                     wdg["vram"][1].text = f"{st['used'] / 1024:.1f} / {st['total'] / 1024:.1f} GB"
                     wdg["util"][0].value = st["util"] / 100
@@ -8278,8 +8603,7 @@ def build_page(local: bool = True):
                 show("state", state, _job_dir.name if _job_dir else "")
                 show("stage", str(st.get("stage") or "-"), f"resolution {st['resolution']}"
                      if st.get("resolution") else "")
-                show("step", f"{step:,} / {total:,}" if total else str(step),
-                     f"{step / total * 100:.0f}% done" if total else "")
+                show("step", f"{step:,}", f"of {total:,} · {step / total * 100:.0f}% done" if total else "")
                 if loss is not None:
                     show("loss", f"{loss:.4f}", f"average {st.get('avg_loss') or 0:.4f}")
                 show("lr", f"{st['lr']:.2e}" if st.get("lr") is not None else "-")
@@ -8321,24 +8645,30 @@ def build_page(local: bool = True):
                         comb = nz(sc, "combined_norm", "combined_percent")
                         if comb is not None:
                             by_prompt.setdefault(sc["prompt_index"], []).append([sc["step"], round(comb, 1)])
-                        d_ = per_step.setdefault(sc["step"], {"face": [], "body": []})
+                        d_ = per_step.setdefault(sc["step"], {"face": [], "body": [], "combined": []})
                         if nz(sc, "face_norm", "percent") is not None:
                             d_["face"].append(nz(sc, "face_norm", "percent"))
                         if nz(sc, "body_norm", "body_percent") is not None:
                             d_["body"].append(nz(sc, "body_norm", "body_percent"))
-                    series = [{"name": f"combined p{k + 1}", "type": "line", "data": v}
-                              for k, v in sorted(by_prompt.items())]
-                    for key, name in (("face", "mean face"), ("body", "mean body")):
+                        if comb is not None:
+                            d_["combined"].append(comb)
+                    series = []
+                    for key, color, style in (("combined", "#F59E0B", {"width": 3}), ("face", "#FF3B30", {"width": 2}),
+                                              ("body", "#F4F4F5", {"width": 2, "type": "dashed"})):
                         pts = [[stp, round(sum(v[key]) / len(v[key]), 1)] for stp, v in sorted(per_step.items()) if v[key]]
                         if pts:
-                            series.append({"name": name, "type": "line", "data": pts, "lineStyle": {"type": "dotted"}})
+                            series.append(_line(f"mean {key}", color, lineStyle=style, showSymbol=True, symbolSize=4,
+                                                data=pts))
+                    series += [_line(f"prompt {k + 1}", CHART_COLORS[(k + 3) % len(CHART_COLORS)],
+                                     lineStyle={"width": 1, "opacity": 0.45}, data=v)
+                               for k, v in sorted(by_prompt.items())]
                     ref_sim = st.get("face_ref_similarity")
                     if series and (normalized or ref_sim is not None):
                         xs = [pt[0] for v in by_prompt.values() for pt in v] or [0, 1]
                         level = 100.0 if normalized else ref_sim * 100  # normalized: the references are 100 as such
-                        series.append({"name": "the references" if normalized else "face reference self-similarity",
-                                       "type": "line", "showSymbol": False, "lineStyle": {"type": "dashed"},
-                                       "data": [[min(xs), level], [max(xs), level]]})
+                        series.append(_line("your references" if normalized else "face reference self-similarity",
+                                            "#34D399", lineStyle={"type": "dashed", "width": 1},
+                                            data=[[min(xs), level], [max(xs), level]]))
                     face_chart.options["legend"]["data"] = [sr["name"] for sr in series]
                     face_chart.options["series"] = series
                     face_chart.update()
@@ -8349,20 +8679,19 @@ def build_page(local: bool = True):
                           if nz(sc, "body_norm", "body_percent") is not None]
                     cv = [nz(sc, "combined_norm", "combined_percent") for sc in latest
                           if nz(sc, "combined_norm", "combined_percent") is not None]
-                    parts = [f"Step {latest_step}" + (" (normalized: 0 = a stranger, 100 = the references):"
-                                                      if normalized else ":")]
-                    parts.append(f"face {sum(fv) / len(fv):.1f}% ({len(fv)}/{len(latest)} with a face)" if fv
-                                 else f"face: none in {len(latest)} sample(s)")
-                    if st.get("body_refs"):
-                        parts.append(f"body {sum(bv) / len(bv):.1f}% ({len(bv)}/{len(latest)} with a person)" if bv
-                                     else "body: no usable person")
+                    chips = [("Step", f"{latest_step:,}", False)]
                     if cv:
-                        parts.append(f"combined {sum(cv) / len(cv):.1f}%")
+                        chips.append(("Combined", f"{sum(cv) / len(cv):.1f}%", False))
+                    chips.append(("Face", f"{sum(fv) / len(fv):.1f}% ({len(fv)} of {len(latest)} with a face)" if fv
+                                  else f"no face in {len(latest)} sample(s)", not fv))
+                    if st.get("body_refs"):
+                        chips.append(("Body", f"{sum(bv) / len(bv):.1f}% ({len(bv)} of {len(latest)} with a person)"
+                                      if bv else "no usable person", not bv))
                     if ref_sim is not None:
-                        parts.append(f"face ref self-sim {ref_sim * 100:.1f}%")
+                        chips.append(("Face refs alike", f"{ref_sim * 100:.1f}%", False))
                     if st.get("body_ref_similarity") is not None:
-                        parts.append(f"body ref self-sim {st['body_ref_similarity'] * 100:.1f}%")
-                    face_label.text = " | ".join(parts)
+                        chips.append(("Body refs alike", f"{st['body_ref_similarity'] * 100:.1f}%", False))
+                    stat_chips(face_chips, chips, face_sig)
                 lw = st.get("loss_watch")
                 if lw:
                     lw_exp.visible = True
@@ -8437,65 +8766,24 @@ def build_page(local: bool = True):
                     fe = last.get("face_norm_ema") if normed else last.get("face_ema")
                     be = last.get("body_norm_ema") if normed else last.get("body_ema")
                     ge = last.get("gold_norm_ema") if normed else last.get("gold_ema")
-                    gold_txt = (f" FaceNet face {f2(ge)}" + (" (in charge)" if last.get("gold_select") else "")
-                                if ge is not None else "")
-                    probe_label.text = (f"Probe @ step {last['step']}: face {f2(fe)}{gold_txt} body {f2(be)}"
-                                        f" combined {f2(last.get('combined_ema'))} | best {f2(lk.get('best'))} @ step {lk.get('best_step')}"
-                                        f" | {lk.get('since_improve', 0)} probe(s) since improvement | lr x{lk.get('lr_factor', 1.0):.2f}"
-                                        f" | face bias {lk.get('face_bias', 0.0):+.2f}" + (" | STOPPED" if lk.get("stopped") else ""))
-                    rec_of = {Path(p).name: pr for pr in probes for p in (pr.get("images") or [])}
+                    since = lk.get("since_improve", 0)
+                    chips = [("Step", f"{last['step']:,}", False), ("Combined", f2(last.get("combined_ema")), False),
+                             ("Face", f2(fe), False)]
+                    if ge is not None:
+                        chips.append(("FaceNet face" + (" (in charge)" if last.get("gold_select") else ""), f2(ge),
+                                      False))
+                    chips += [("Body", f2(be), False),
+                              ("Best", f"{f2(lk.get('best'))} at step {lk.get('best_step') or 0:,}"
+                               if lk.get("best") is not None else "n/a", False),
+                              ("Since best", f"{since} probe{'s' if since != 1 else ''}", False),
+                              ("Learning rate", f"x{lk.get('lr_factor', 1.0):.2f}", False),
+                              ("Face bias", f"{lk.get('face_bias', 0.0):+.2f}", False)]
+                    if lk.get("stopped"):
+                        chips.append(("Early stop", "stopped", True))
+                    stat_chips(probe_chips, chips, probe_sig)
                     rnames = (rc or {}).get("names") or []
-                    if rnames:  # a race: each probe image of every configuration side by side, newest step first
-                        shown = group_by_generation([p for pr in probes[-60:] for p in (pr.get("images") or [])],
-                                                    rnames)[:8]
-                        sig = [(st_, r_, [(w_, p_, probe_score_line(rec_of.get(Path(p_).name))) for w_, p_ in m_])
-                               for st_, r_, m_ in shown]
-                    else:
-                        sig = [(0, "", [("", p, probe_score_line(rec_of.get(Path(p).name)))])
-                               for p in list(last.get("images") or [])[:6]]
-                    if sig != shown_probes:
-                        shown_probes[:] = sig
-                        probe_row.clear()
-                        with probe_row:
-                            for st_, r_, members in sig:
-                                if rnames:
-                                    ui.label(generation_label(st_, r_)).classes("rz-subhead w-full")
-                                for who, p, line in members:
-                                    with ui.card().tight().classes("rz-thumb"):
-                                        ui.image(image_url(p)).props("fit=contain") \
-                                            .classes("w-40 h-40 rz-imgbg cursor-pointer") \
-                                            .on("click", lambda _, q=p: show_full(Path(q)))
-                                        ui.label(who or Path(p).name).classes("text-xs px-1")
-                                        if line:
-                                            ui.label(line).classes("text-xs px-1 pb-1 rz-hint")
-                score_by_name = {Path(sc["image"]).name: sc for sc in fscores}
-                rnames = (rc or {}).get("names") or []
-                samples = (st.get("samples") or [])[:max(12, 6 * len(rnames))]
-                sample_sig = [(p, score_caption(score_by_name[Path(p).name]) if Path(p).name in score_by_name else "")
-                              for p in samples]
-                if sample_sig != shown_samples:
-                    shown_samples[:] = sample_sig
-                    samples_row.clear()
-                    cap_of = dict(sample_sig)
-                    with samples_row:
-                        if not sample_sig:
-                            hint("No samples yet. They appear here every 'Sample every' steps.")
-                        if rnames:  # a race: the same generation of every configuration side by side
-                            for step_, rest_, members in group_by_generation(samples, rnames)[:6]:
-                                ui.label(generation_label(step_, rest_)).classes("rz-subhead w-full")
-                                for who, p in members:
-                                    with ui.card().tight().classes("rz-thumb"):
-                                        ui.image(image_url(p)).props("fit=contain") \
-                                            .classes("w-48 h-48 rz-imgbg cursor-pointer") \
-                                            .on("click", lambda _, q=p: show_full(Path(q)))
-                                        ui.label((who or "winner") + cap_of.get(p, "")).classes("text-xs px-1")
-                        else:
-                            for p, cap_ in sample_sig:
-                                with ui.card().tight().classes("rz-thumb"):
-                                    ui.image(image_url(p)).props("fit=contain") \
-                                        .classes("w-48 h-48 rz-imgbg cursor-pointer") \
-                                        .on("click", lambda _, q=p: show_full(Path(q)))
-                                    ui.label(Path(p).name + cap_).classes("text-xs px-1")
+                    probe_gallery.set(probe_steps(probes, rnames))
+                sample_gallery.set(sample_steps(st.get("samples") or [], fscores, (rc or {}).get("names") or []))
                 job_files.show(_job_dir)
                 states = list(st.get("states") or [])
                 saved_label.text = "Training states:\n" + "\n".join(states) if states else ""
@@ -8522,7 +8810,7 @@ def build_page(local: bool = True):
     # ---------------------------------------------------------------- action bar (Train and Monitor tabs)
     with ui.footer().classes("rz-footer") as footer:
         with ui.row().classes("rz-footer-row w-full items-center gap-3"):
-            with ui.column().classes("gap-1 min-w-[12rem] flex-1"):
+            with ui.column().classes("gap-1 min-w-[12rem] flex-1 rz-footer-msg"):
                 status_msg = ui.label("").classes("rz-status-msg")
                 with ui.row().classes("items-center gap-2 no-wrap") as task_row:
                     ui.spinner(size="sm")
@@ -8530,17 +8818,18 @@ def build_page(local: bool = True):
                     task_bar = ui.linear_progress(value=0, show_value=False, size="6px").classes("w-48") \
                         .props("rounded")
                 task_row.visible = False
-            with ui.row().classes("items-center gap-2 no-wrap"):
+            with ui.row().classes("items-center gap-2 no-wrap rz-footer-btns"):
                 queue_note = ui.label("").classes("rz-hint text-sm cursor-pointer")
                 queue_note.on("click", lambda: goto("Monitor"))
                 ui.button("Add to queue", icon="playlist_add", on_click=queue_job, color=None).props("outline") \
+                    .classes("rz-icon-only") \
                     .tooltip("Start this run after the current one (and any queued before it) is done")
                 ui.button("Start training", icon="play_arrow", on_click=start_job).props("unelevated")
                 ui.button("Stop", icon="stop", on_click=lambda: setattr(status_msg, "text", stop_training()),
                           color=None) \
                     .props("outline").tooltip("Stop after the current step and save the LoRA")
                 ui.button("Kill", icon="dangerous", on_click=lambda: setattr(status_msg, "text", kill_training())) \
-                    .props("flat color=negative").tooltip("End the process now, without a final save")
+                    .props("flat color=negative").classes("rz-icon-only")                     .tooltip("End the process now, without a final save")
     footer.bind_value_from(tabs, "value", lambda t: t in ("Train", "Monitor", tab_train, tab_monitor))
 
     def task_tick():
@@ -8650,6 +8939,19 @@ def build_page(local: bool = True):
             choose_look()
 
     ui.timer(0.05, restore_look, once=True)
+
+    def fit_charts(width) -> None:
+        for chart in charts:
+            chart._rz_width = int(width or 1280)
+            chart.update()
+
+    # charts fit the browser's width: sent once the page is connected, and again after the window is resized (a
+    # phone turned on its side)
+    ui.on("rz_width", lambda e: fit_charts(e.args))
+    ui.timer(0.1, lambda: ui.run_javascript(
+        "if (!window.rzWidthWatch) { let t; window.rzWidthWatch = true; addEventListener('resize', () => {"
+        " clearTimeout(t); t = setTimeout(() => emitEvent('rz_width', innerWidth), 300); }); }"
+        " emitEvent('rz_width', innerWidth);"), once=True)
 
     if job_running and _job_dir is not None and (_job_dir / "config.yaml").is_file():
         # reattached to a running job: show its settings instead of the defaults
