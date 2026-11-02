@@ -823,11 +823,12 @@ def _probe_points(probes: list[dict], key: str, fallback: str | None = None) -> 
 PROBE_DEFAULT_SERIES = ["face", "body", "combined", "face (probe)", "body (probe)"]
 
 
-def probe_chart_series(probes: list[dict], names: list[str]) -> tuple[list[dict], list[str]]:
+def probe_chart_series(probes: list[dict], names: list[str],
+                       shown=("combined", "face", "body")) -> tuple[list[dict], list[str]]:
     """(series, legend) of the Monitor's likeness chart. One run: the smoothed face, body and combined lines plus each
     probe's face and body dots. A race: the smoothed lines of every configuration, named after it ("lora16 face"),
-    one colour per configuration and one line style per score (combined thick, face solid, body dashed); the
-    winner's probes after the race are "winner"."""
+    one colour per configuration and one line style per score (combined thick, face solid, body dashed), only the
+    scores in `shown`; the winner's probes after the race are "winner"."""
     if not names:
         series = [_line("face", "#FF3B30", data=_probe_points(probes, "face_norm_ema", "face_ema")),
                   _line("body", "#F4F4F5", data=_probe_points(probes, "body_norm_ema", "body_ema")),
@@ -852,6 +853,8 @@ def probe_chart_series(probes: list[dict], names: list[str]) -> tuple[list[dict]
         for score, key, fallback, style in (("combined", "combined_ema", None, {"width": 3}),
                                             ("face", "face_norm_ema", "face_ema", {"width": 1.5}),
                                             ("body", "body_norm_ema", "body_ema", {"width": 1.5, "type": "dashed"})):
+            if score not in shown:
+                continue
             series.append(_line(f"{label} {score}", color, lineStyle=dict(style),
                                 data=_probe_points(by[name], key, fallback)))
             legend.append(f"{label} {score}")
@@ -2120,6 +2123,134 @@ def lora_url(path) -> str:
     from urllib.parse import quote
 
     return f"/rz-lora?path={quote(str(Path(path).resolve()))}"
+
+
+LOG_SUFFIXES = {".log", ".yaml", ".yml", ".json", ".jsonl", ".txt", ".csv"}
+
+
+def job_loras(job_dir) -> list[tuple[Path, int]]:
+    """[(file, bytes)] of the LoRA / LoKr files a job folder holds (checkpoints, best, final, a race's), newest first."""
+    rows = []
+    for p in Path(job_dir).glob("*.safetensors") if job_dir else []:
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        rows.append((p, st.st_size, st.st_mtime))
+    return [(p, size) for p, size, _ in sorted(rows, key=lambda r: r[2], reverse=True)]
+
+
+def job_logs(job_dir) -> list[Path]:
+    """A job folder's logs and settings: its own text files (train.log, config.yaml, status.json, likeness.jsonl, a
+    race's winner settings) and those of its sub-folders (race.json, soup.json, noise.json...). No images or states."""
+    d = Path(job_dir)
+    return sorted(p for pattern in ("*", "*/*") for p in d.glob(pattern)
+                  if p.is_file() and p.suffix.lower() in LOG_SUFFIXES)
+
+
+def size_text(n: int) -> str:
+    return f"{n / 2**30:.1f} GB" if n >= 2**30 else f"{n / 2**20:.0f} MB"
+
+
+@app.get("/rz-job-zip")
+def _serve_job_zip(job: str, kind: str):
+    """A zip of a job folder's (one with a status.json) LoRA files (kind "loras", stored as they are) or its logs and
+    settings (kind "logs"), built now and deleted once sent."""
+    import tempfile
+    import zipfile
+
+    from fastapi import HTTPException
+    from fastapi.responses import FileResponse
+    from starlette.background import BackgroundTask
+
+    d = Path(job)
+    if kind not in ("loras", "logs") or not (d / "status.json").is_file():
+        raise HTTPException(status_code=404, detail="Not Found")
+    files = [p for p, _ in job_loras(d)] if kind == "loras" else job_logs(d)
+    if not files:
+        raise HTTPException(status_code=404, detail="Nothing to pack")
+    fd, tmp = tempfile.mkstemp(suffix=".zip")
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED if kind == "loras" else zipfile.ZIP_DEFLATED) as z:
+            for p in files:
+                z.write(p, p.relative_to(d).as_posix())
+    except OSError as e:
+        os.unlink(tmp)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return FileResponse(tmp, filename=f"{d.name}_{kind}.zip", media_type="application/zip",
+                        background=BackgroundTask(os.unlink, tmp))
+
+
+class JobFiles:
+    """A job folder's downloads: one LoRA picked in a dropdown, every LoRA as a zip, and the logs and settings as a
+    zip (Monitor and Previous Runs)."""
+
+    def __init__(self):
+        self.job_dir: Path | None = None
+        self.shown = None
+        with ui.row().classes("w-full items-center gap-2"):
+            self.pick = ui.select({}, label="LoRA file").classes("w-[30rem] max-w-full")
+            self.one = ui.button("Download", icon="download", on_click=self.download_one, color=None) \
+                .props("flat no-caps").classes("rz-file-btn") \
+                .tooltip("Save the picked LoRA to this computer (useful when the WebUI runs remotely)")
+            self.all = ui.button("All LoRAs (.zip)", icon="folder_zip", on_click=lambda: self.download_zip("loras"),
+                                 color=None).props("flat no-caps").classes("rz-file-btn") \
+                .tooltip("Every LoRA file in the job folder in one archive")
+            self.logs = ui.button("Logs and settings (.zip)", icon="description",
+                                  on_click=lambda: self.download_zip("logs"), color=None) \
+                .props("flat no-caps").classes("rz-file-btn") \
+                .tooltip("train.log, config.yaml, status.json, the likeness scores and the run's other text files in "
+                         "one archive")
+        self.note = hint("")
+
+    def show(self, job_dir) -> None:
+        """List the files of this job folder (None: no run); cheap to call on every poll."""
+        self.job_dir = Path(job_dir) if job_dir else None
+        loras = job_loras(self.job_dir)
+        has_logs = bool(self.job_dir and (self.job_dir / "status.json").is_file())
+        sig = (str(self.job_dir), [(p.name, size) for p, size in loras], has_logs)
+        if sig == self.shown:
+            return
+        self.shown = sig
+        options = {str(p): f"{p.name}  ({size_text(size)})" for p, size in loras}
+        self.pick.set_options(options, value=self.pick.value if self.pick.value in options else
+                              (next(iter(options)) if options else None))
+        for btn in (self.one, self.all):
+            btn.enabled = bool(loras)
+        self.logs.enabled = has_logs
+        self.note.text = (f"{len(loras)} LoRA file{'s' if len(loras) != 1 else ''}, "
+                          f"{size_text(sum(s for _, s in loras))} in {self.job_dir}" if loras else
+                          "No LoRA saved yet." if has_logs else "")
+
+    def download_one(self):
+        if self.pick.value:
+            ui.download(lora_url(self.pick.value), Path(self.pick.value).name)
+
+    def download_zip(self, kind: str):
+        from urllib.parse import quote
+
+        if self.job_dir is None:
+            return
+        if kind == "loras":
+            ui.notify(f"Packing {len(self.shown[1])} LoRA files; the download starts when the archive is ready",
+                      type="info")
+        ui.download(f"/rz-job-zip?job={quote(str(self.job_dir.resolve()))}&kind={kind}",
+                    f"{self.job_dir.name}_{kind}.zip")
+
+
+def history_job_dir(rec: dict, runs: list[dict]) -> Path | None:
+    """The job folder of a Previous Runs record while it still holds that run's files: its status.json names the run
+    (runs since v2.29.0), or for older runs no later run of the same job name was saved."""
+    d = Path(rec.get("job_dir") or ROOT / "output" / (rec.get("job") or ""))
+    try:
+        status = json.loads((d / "status.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if status.get("run_id"):
+        return d if status["run_id"] == rec["id"] else None
+    later = any(r.get("job") == rec.get("job") and (r.get("started") or 0) > (rec.get("started") or 0) for r in runs)
+    return None if later else d
 
 
 def image_url(path) -> str:
@@ -5103,14 +5234,14 @@ class MetricChip:
     """An on/off chip for one metric's lines on a Previous Runs chart, for every ticked run at once (`.value` like a
     checkbox's)."""
 
-    def __init__(self, metric: str, on_change):
+    def __init__(self, metric: str, on_change, whose: str = "ticked run"):
         self.value = True
         self._on_change = on_change
         self.button = ui.button(on_click=self.toggle, color=None).props("flat no-caps").classes("rz-metric-chip")
         with self.button:
             ui.html(f'<span class="rz-line rz-line-{METRIC_LINE[metric]}"></span>')
             ui.label(metric.capitalize())
-        self.button.tooltip(f"Show or hide the {metric} line of every ticked run")
+        self.button.tooltip(f"Show or hide the {metric} line of every {whose}")
         self._paint()
 
     def _paint(self):
@@ -5125,10 +5256,11 @@ class MetricChip:
         self._on_change()
 
 
-def metric_chips(metrics, on_change) -> dict[str, MetricChip]:
+def metric_chips(metrics, on_change, title: str = "Show lines (all runs):",
+                 whose: str = "ticked run") -> dict[str, MetricChip]:
     """A "Show lines (all runs)" row of MetricChips: {metric: chip}."""
-    ui.label("Show lines (all runs):").classes("text-sm font-medium")
-    return {m: MetricChip(m, on_change) for m in metrics}
+    ui.label(title).classes("text-sm font-medium")
+    return {m: MetricChip(m, on_change, whose) for m in metrics}
 
 
 PROBE_SETTING_KEYS = ("probe_face_prompt", "probe_body_prompt", "probe_seed", "probe_size", "probe_steps", "probe_cfg",
@@ -5221,6 +5353,7 @@ def build_history_tab(charts: list):
             empty.text = ("Tick one or more runs above to draw them here." if not picked else
                           "" if series else "The ticked runs have no scores of this kind.")
         compare.text = f"{len(picked)} run(s) overlaid" if picked else ""
+        refresh_files()
         draw_probes()
 
     def draw_probes(*_):
@@ -5399,6 +5532,30 @@ def build_history_tab(charts: list):
                       on_click=lambda: (setattr(table, "selected", []), table.update(), draw())).props("flat dense")
             ui.space()
             compare = hint("")
+    with section("Saved files", "Download a ticked run's LoRAs, logs and settings", "download"):
+        files_run = ui.select({}, label="Run", on_change=lambda _: refresh_files()).classes("w-[30rem] max-w-full")
+        files_note = hint("")
+        with ui.column().classes("w-full gap-2") as files_box:
+            run_files = JobFiles()
+
+    def refresh_files():
+        """The files of the run picked among the ticked ones, while its job folder still holds them."""
+        picked = selected_runs()
+        opts = {r["id"]: history_label(r) for r in picked}
+        if files_run.options != opts:
+            files_run.set_options(opts, value=files_run.value if files_run.value in opts else
+                                  (next(iter(opts)) if opts else None))
+        files_run.visible = len(opts) > 1
+        rec = next((r for r in picked if r["id"] == files_run.value), None)
+        job_dir = history_job_dir(rec, state["runs"]) if rec else None
+        files_box.visible = job_dir is not None
+        files_note.text = ("Tick a run above to download its files." if rec is None else
+                           "" if job_dir else
+                           f"Its job folder ({rec.get('job_dir') or rec.get('job')}) is gone or now holds a later run "
+                           "of the same job name, so its files cannot be downloaded here.")
+        run_files.show(job_dir)
+
+    ui.timer(5.0, refresh_files)  # a running run's new checkpoints
     with section("Identity similarity", "Mean face and mean body score of the sample images", "face"):
         with ui.row().classes("items-center gap-3"):
             id_metrics = metric_chips(("face", "body"), lambda: draw())
@@ -7558,9 +7715,8 @@ def build_page(local: bool = True):
                          "running; a WebUI restarted with runs waiting and nothing running pauses the queue until you "
                          "Resume it.")
                     queue_list = ui.column().classes("w-full gap-1")
-                with card():
+                with section("Loss", "Raw and smoothed training loss", "show_chart"):
                     with ui.row().classes("w-full items-center gap-4"):
-                        ui.label("Loss").classes("rz-title")
                         ui.space()
                         ui.label("Smoothing").classes("rz-hint")
                         smoothing = ui.slider(min=0, max=0.98, step=0.02, value=0.8).classes("w-48")
@@ -7575,11 +7731,9 @@ def build_page(local: bool = True):
                                lineStyle={"width": 2, "type": "dashed"})],
                         ["raw", "smoothed"])).classes("w-full h-72")
                     charts.append(loss_chart)
-                with card() as grad_card:
-                    with ui.row().classes("w-full items-center gap-4"):
-                        ui.label("Gradient norm").classes("rz-title")
-                        ui.space()
-                        grad_label = ui.label("").classes("rz-hint")
+                with section("Gradient norm", "How big each step's update was before clipping", "insights") \
+                        as grad_card:
+                    grad_label = ui.label("").classes("rz-hint")
                     hint("How big each step's update was before clipping (the loss chart's smoothing). A steady line "
                          "is healthy; spikes that keep growing, or a line that sits on the clip limit, mean the "
                          "learning rate is too high.")
@@ -7677,6 +7831,10 @@ def build_page(local: bool = True):
                                      "an Excel file: the scores are formulas of the raw ones and the run's scale "
                                      "(floors, references' level, span, curve, weights) on its own sheet, so you can "
                                      "rescore. In a race each configuration gets its own sheets.")
+                    with ui.row().classes("items-center gap-3") as race_chips_row:
+                        race_metrics = metric_chips(("combined", "face", "body"), lambda: draw_probe_chart(),
+                                                    "Show lines (all configurations):", "configuration")
+                    race_chips_row.visible = False
                     # the normalized scores (0 = a stranger, 100 = the references): smoothed lines, per-probe dots
                     probe_chart = ui.echart(chart_options(
                         _axis("step", min="dataMin"), _axis("likeness % (normalized)", min=0, max=100),
@@ -7689,32 +7847,20 @@ def build_page(local: bool = True):
                     with ui.row().classes("w-full gap-2") as samples_row:
                         hint("No samples yet. They appear here every 'Sample every' steps.")
                 with section("Log and saved files", "train.log, checkpoints and training states", "terminal"):
-                    downloads_row = ui.row().classes("w-full gap-2 items-center")
+                    job_files = JobFiles()
                     saved_label = ui.label("").classes("rz-mono whitespace-pre-wrap")
                     log_view = ui.log(max_lines=600).classes("w-full h-80 rz-log rz-mono")
             shown_samples: list[str] = []
-            shown_downloads: list = []
+            probe_view = {"probes": [], "names": []}
 
-            def show_downloads(saved: list[str]) -> None:
-                """A download button per saved LoRA file that is still there (rolling saves delete old ones)."""
-                rows = []
-                for p in saved:
-                    try:
-                        rows.append((p, Path(p).stat().st_size))
-                    except OSError:
-                        continue
-                if rows == shown_downloads:
-                    return
-                shown_downloads[:] = rows
-                downloads_row.clear()
-                with downloads_row:
-                    if rows:
-                        ui.label("Download:").classes("rz-hint")
-                    for p, size in rows:
-                        ui.button(f"{Path(p).name} ({size / 2**20:.0f} MB)", icon="download",
-                                  on_click=lambda _, q=p: ui.download(lora_url(q), Path(q).name), color=None) \
-                            .props("flat no-caps").classes("rz-file-btn") \
-                            .tooltip("Save this LoRA to this computer (useful when the WebUI runs remotely)")
+            def draw_probe_chart() -> None:
+                """The likeness chart from the last poll's probes; in a race only the scores the chips leave on."""
+                shown = [m for m, chip in race_metrics.items() if chip.value]
+                series, legend = probe_chart_series(probe_view["probes"], probe_view["names"], shown)
+                probe_chart.options["series"] = series
+                probe_chart.options["legend"]["data"] = legend
+                probe_chart.options["grid"]["top"] = 60 if len(legend) > 5 else 40  # room for a race's legend
+                probe_chart.update()
 
             queue_shown = {"sig": None}
 
@@ -8014,11 +8160,9 @@ def build_page(local: bool = True):
                 probes = st.get("probes") or []
                 if probes:
                     probe_exp.visible = True
-                    series, legend = probe_chart_series(probes, (rc or {}).get("names") or [])
-                    probe_chart.options["series"] = series
-                    probe_chart.options["legend"]["data"] = legend
-                    probe_chart.options["grid"]["top"] = 60 if len(legend) > 5 else 40  # room for a race's legend
-                    probe_chart.update()
+                    probe_view["probes"], probe_view["names"] = probes, (rc or {}).get("names") or []
+                    race_chips_row.visible = bool(probe_view["names"])
+                    draw_probe_chart()
                     lk = st.get("likeness") or {}
                     last = probes[-1]
                     f2 = lambda x: "n/a" if x is None else f"{x:.1f}%"  # noqa: E731
@@ -8085,11 +8229,9 @@ def build_page(local: bool = True):
                                         .classes("w-48 h-48 rz-imgbg cursor-pointer") \
                                         .on("click", lambda _, q=p: show_full(Path(q)))
                                     ui.label(Path(p).name + cap_).classes("text-xs px-1")
-                saved = list(st.get("saved") or [])
-                show_downloads(saved)
+                job_files.show(_job_dir)
                 states = list(st.get("states") or [])
-                saved_label.text = ("Saved:\n" + "\n".join(saved) if saved else "No LoRA saved yet.") \
-                    + ("\nStates:\n" + "\n".join(states) if states else "")
+                saved_label.text = "Training states:\n" + "\n".join(states) if states else ""
                 update_log()
 
             ui.timer(2.0, poll)
