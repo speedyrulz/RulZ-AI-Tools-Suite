@@ -106,7 +106,10 @@ the queue; *Stop* goes on to the next run. The queue is kept in `output/_queue.j
 the next run, so keep it running; a WebUI restarted with runs waiting and nothing running pauses the queue until you
 *Resume* it.
 
-*Save* / *Load* (in the *Training job* card at the top of the Train tab) store the whole form as YAML (Browse opens
+The Train tab shows one section at a time: pick it in the list on the left (a *Section* dropdown on a narrow
+screen). Each setting's explanation sits beside it; click a long one to read all of it.
+
+*Save* / *Load* (in the Train tab's *Job* section) store the whole form as YAML (Browse opens
 in `configs/`). Loading a config saved by
 an older version fills every option added since with its default, appends those options to the end of the file
 (your values and comments are left as they are) and lists them under the buttons. Options a newer version no longer
@@ -959,7 +962,7 @@ maps and crops.
 Measured on a 5-image synthetic character set (120 steps, probes every 20 steps, same seeds, face likeness EMA
 at step 100; baseline 74.2): region-weighted loss 76.0, LoRA+ ratio 4 74.7, `identity` timesteps 73.9, auto crops
 65.5 (the only crops available were 300 px and had to be upscaled), everything combined with LoRA+ 16: 63.1
-(unstable, loss 40% higher). The **Identity training preset** (a switch at the top of the Train tab, `--preset identity` on the CLI, or
+(unstable, loss 40% higher). The **Identity training preset** (a switch in the Train tab's Job section, `--preset identity` on the CLI, or
 `preset: identity` recorded in the YAML) applies the whole recommendation in one go and restores your previous
 settings when switched off. Suggested recipe: `region_weights: true`, `lora_plus_ratio: 4` with `adamw8bit`,
 crops only from high-resolution photos (`crop_augment_min_px: 0` means crops are never upscaled), timesteps at
