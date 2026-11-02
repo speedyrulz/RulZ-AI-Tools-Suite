@@ -68,6 +68,22 @@ def site_key(url: str) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
+def path_scope(url: str) -> str:
+    """Folder a crawl stays inside when limited to the start page's path, always ending in "/".
+    `/gallery/cats` and `/gallery/cats/` both mean the cats folder; `/gallery/cats/index.html` too."""
+    path = urlsplit(url).path or "/"
+    if not path.endswith("/"):
+        last = path.rsplit("/", 1)[1]
+        path = path[: -len(last)] if "." in last else path + "/"
+    return path
+
+
+def in_path_scope(url: str, scope: str) -> bool:
+    """True if `url` is the scope folder itself or anything below it."""
+    path = urlsplit(url).path or "/"
+    return path.startswith(scope) or path == scope.rstrip("/")
+
+
 def looks_like_page(url: str) -> bool:
     return PurePosixPath(urlsplit(url).path.lower()).suffix not in NON_PAGE_EXTS
 

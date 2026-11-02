@@ -26,7 +26,7 @@ from .crawler import ImageCandidate, PageError, Robots, load_page
 from .fetcher import FetchedImage, FetchError, HostGate, check_image_bytes, fetch_image
 from .folder import list_image_files
 from .storage import RunStorage, make_run_dir
-from .urls import looks_like_page, normalize_page_url, site_key
+from .urls import in_path_scope, looks_like_page, normalize_page_url, path_scope, site_key
 
 log = logging.getLogger("crawler_app.runs")
 
@@ -50,6 +50,7 @@ class RunOptions:
     max_depth: int = 3
     max_images: int = 300
     respect_robots: bool = False
+    stay_in_path: bool = False  # only follow links inside the start page's folder (and below)
     page_delay_s: float = 1.0
     prefer_originals: bool = True  # try each image's full-size original before the displayed copy
     min_megapixels: float = 0.0  # images smaller than this are not classified or saved (0 = no limit)
@@ -288,6 +289,7 @@ class Run:
         seen_pages = {start}
         seen_images: set[str] = set()
         site: str | None = None
+        scope = "/"
         try:
             while queue and self.stats["pages_crawled"] < o.max_pages and self.stats["images_found"] < o.max_images:
                 await self._resume.wait()
@@ -319,6 +321,8 @@ class Run:
                 self._bump("pages_crawled")
                 if site is None:
                     site = site_key(page.url)  # the start page after redirects defines the site
+                    if o.stay_in_path:
+                        scope = path_scope(page.url)
 
                 for cand in page.images:
                     if any(u in seen_images for u in cand.urls):
@@ -334,7 +338,12 @@ class Run:
 
                 if depth < o.max_depth:
                     for link in page.links:
-                        if link not in seen_pages and site_key(link) == site and looks_like_page(link):
+                        if (
+                            link not in seen_pages
+                            and site_key(link) == site
+                            and in_path_scope(link, scope)
+                            and looks_like_page(link)
+                        ):
                             seen_pages.add(link)
                             queue.append((link, depth + 1))
                 self.stats["pages_queued"] = len(queue)

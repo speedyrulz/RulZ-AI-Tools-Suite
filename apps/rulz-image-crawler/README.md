@@ -68,6 +68,10 @@ WordPress `-300x200`, Shopify, Google/Blogger, `?w=…` CDN parameters) — and 
 At most two downloads per site run at once; if a site answers "too many requests" the app uses the page's
 copies for that site until it says to try again, and notes this under Problems.
 
+**Stay in this folder** (off by default): only follow links inside the start address's folder and below.
+Starting at `example.com/gallery/cats` (or `.../cats/`, or `.../cats/index.html`) crawls `/gallery/cats/...`
+but never `/gallery/dogs/` or the site's home page. Off, the crawler follows any link on the same site.
+
 **Confidence** is the model's own probability for its yes/no answer, so clear-cut images score ~1.00 and
 borderline ones lower; the slider is most useful for subtle prompts.
 
