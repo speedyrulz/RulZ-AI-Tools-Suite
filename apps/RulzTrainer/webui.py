@@ -2384,14 +2384,28 @@ def job_logs(job_dir) -> list[Path]:
                   if p.is_file() and p.suffix.lower() in LOG_SUFFIXES)
 
 
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+JOB_IMAGE_KINDS = {"probes": "probe", "samples": "sample"}  # the job folder's image folder -> one image's name
+
+
+def job_images(job_dir, kind: str) -> list[Path]:
+    """The images in a job folder's probes/ or samples/ folder (every step, and a race's configurations), sorted by
+    name (so by configuration, then step)."""
+    d = Path(job_dir) / kind if job_dir and kind in JOB_IMAGE_KINDS else None
+    if d is None or not d.is_dir():
+        return []
+    return sorted(p for p in d.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES)
+
+
 def size_text(n: int) -> str:
     return f"{n / 2**30:.1f} GB" if n >= 2**30 else f"{n / 2**20:.0f} MB"
 
 
 @app.get("/rz-job-zip")
 def _serve_job_zip(job: str, kind: str):
-    """A zip of a job folder's (one with a status.json) LoRA files (kind "loras", stored as they are) or its logs and
-    settings (kind "logs"), built now and deleted once sent."""
+    """A zip of a job folder's (one with a status.json) LoRA files (kind "loras"), its logs and settings ("logs"),
+    or its probe or sample images ("probes", "samples"), built now and deleted once sent. LoRAs and images are stored
+    as they are (already compressed)."""
     import tempfile
     import zipfile
 
@@ -2400,15 +2414,15 @@ def _serve_job_zip(job: str, kind: str):
     from starlette.background import BackgroundTask
 
     d = Path(job)
-    if kind not in ("loras", "logs") or not (d / "status.json").is_file():
+    if kind not in ("loras", "logs", *JOB_IMAGE_KINDS) or not (d / "status.json").is_file():
         raise HTTPException(status_code=404, detail="Not Found")
-    files = [p for p, _ in job_loras(d)] if kind == "loras" else job_logs(d)
+    files = [p for p, _ in job_loras(d)] if kind == "loras" else job_logs(d) if kind == "logs" else job_images(d, kind)
     if not files:
         raise HTTPException(status_code=404, detail="Nothing to pack")
     fd, tmp = tempfile.mkstemp(suffix=".zip")
     os.close(fd)
     try:
-        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED if kind == "loras" else zipfile.ZIP_DEFLATED) as z:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED if kind == "logs" else zipfile.ZIP_STORED) as z:
             for p in files:
                 z.write(p, p.relative_to(d).as_posix())
     except OSError as e:
@@ -2419,8 +2433,8 @@ def _serve_job_zip(job: str, kind: str):
 
 
 class JobFiles:
-    """A job folder's downloads: one LoRA picked in a dropdown, every LoRA as a zip, and the logs and settings as a
-    zip (Monitor and Previous Runs)."""
+    """A job folder's downloads: one LoRA picked in a dropdown, every LoRA as a zip, the logs and settings as a zip,
+    and every probe image and every sample image, each as a zip (Monitor and Previous Runs)."""
 
     def __init__(self):
         self.job_dir: Path | None = None
@@ -2438,6 +2452,13 @@ class JobFiles:
                 .props("flat no-caps").classes("rz-file-btn") \
                 .tooltip("train.log, config.yaml, status.json, the likeness scores and the run's other text files in "
                          "one archive")
+            self.images = {
+                kind: ui.button(f"{noun.capitalize()} images (.zip)", icon=icon,
+                                on_click=lambda _, k=kind: self.download_zip(k), color=None)
+                .props("flat no-caps").classes("rz-file-btn")
+                .tooltip(f"Every {noun} image of the run (every step, and each configuration of a race) in one "
+                         "archive, as the job folder's " + kind + "/ holds them")
+                for kind, noun, icon in (("probes", "probe", "insights"), ("samples", "sample", "photo_library"))}
         self.note = hint("")
 
     def show(self, job_dir) -> None:
@@ -2445,7 +2466,8 @@ class JobFiles:
         self.job_dir = Path(job_dir) if job_dir else None
         loras = job_loras(self.job_dir)
         has_logs = bool(self.job_dir and (self.job_dir / "status.json").is_file())
-        sig = (str(self.job_dir), [(p.name, size) for p, size in loras], has_logs)
+        images = {kind: len(job_images(self.job_dir, kind)) if has_logs else 0 for kind in JOB_IMAGE_KINDS}
+        sig = (str(self.job_dir), [(p.name, size) for p, size in loras], has_logs, images)
         if sig == self.shown:
             return
         self.shown = sig
@@ -2455,6 +2477,8 @@ class JobFiles:
         for btn in (self.one, self.all):
             btn.enabled = bool(loras)
         self.logs.enabled = has_logs
+        for kind, btn in self.images.items():
+            btn.enabled = images[kind] > 0
         self.note.text = (f"{len(loras)} LoRA file{'s' if len(loras) != 1 else ''}, "
                           f"{size_text(sum(s for _, s in loras))} in {self.job_dir}" if loras else
                           "No LoRA saved yet." if has_logs else "")
@@ -2468,9 +2492,10 @@ class JobFiles:
 
         if self.job_dir is None:
             return
-        if kind == "loras":
-            ui.notify(f"Packing {len(self.shown[1])} LoRA files; the download starts when the archive is ready",
-                      type="info")
+        n = len(self.shown[1]) if kind == "loras" else self.shown[3].get(kind, 0)
+        if kind != "logs":
+            what = "LoRA files" if kind == "loras" else f"{JOB_IMAGE_KINDS[kind]} images"
+            ui.notify(f"Packing {n} {what}; the download starts when the archive is ready", type="info")
         ui.download(f"/rz-job-zip?job={quote(str(self.job_dir.resolve()))}&kind={kind}",
                     f"{self.job_dir.name}_{kind}.zip")
 
@@ -6148,7 +6173,7 @@ def build_history_tab(charts: list):
                       on_click=lambda: (setattr(table, "selected", []), table.update(), draw())).props("flat dense")
             ui.space()
             compare = hint("")
-    with section("Saved files", "Download a ticked run's LoRAs, logs and settings", "download"):
+    with section("Saved files", "Download a ticked run's LoRAs, logs, settings and images", "download"):
         files_run = ui.select({}, label="Run", on_change=lambda _: refresh_files()).classes("w-full max-w-[30rem]")
         files_note = hint("")
         with ui.column().classes("w-full gap-2") as files_box:
@@ -8482,7 +8507,7 @@ def build_page(local: bool = True):
                     ], rows=[], row_key="path", pagination=15).props("flat dense").classes("w-full text-xs")
                 lw_exp.visible = False
                 lw_state = {"sig": None}
-                with section("Log and saved files", "train.log, checkpoints and training states", "terminal"):
+                with section("Log and saved files", "train.log and downloads: LoRAs, logs and settings, probe and sample images", "terminal"):
                     job_files = JobFiles()
                     saved_label = ui.label("").classes("rz-mono whitespace-pre-wrap")
                     log_view = ui.log(max_lines=600).classes("w-full h-80 rz-log rz-mono")
