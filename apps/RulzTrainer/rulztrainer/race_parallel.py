@@ -33,6 +33,7 @@ def forward_backward(job):
     """Forward + backward of one batch of one configuration on one model copy (the trainer's `work`, with the
     configuration's settings in the job). Returns (loss value, per-image multipliers, None)."""
     from . import lora as lora_mod
+    from .losses import elementwise_loss
     from .trainer import loss_weight
 
     (rmodel, rinj, rdev), batch, latents, embeds, mask, sigma, noise, regions, cur_step, n_total, ctx = job
@@ -44,7 +45,7 @@ def forward_backward(job):
     target = noise - latents
     noisy_in = noisy.to(torch.bfloat16)
     pred = rmodel(noisy_in, sigma * 1000.0, embeds, mask).float()
-    sq = (pred - target).pow(2)
+    sq = elementwise_loss(cfg.loss_type, pred, target, latents, noise, sigma)
     if regions is not None and cfg.region_weights:
         sq = sq * regions.weight.to(rdev)
     per = sq.mean(dim=(1, 2, 3))
@@ -255,7 +256,17 @@ class RaceParallelMixin:
             if observe is not None:  # Keel: the step's noise levels (its bands)
                 for s in sigmas.get(v.idx, ()):
                     observe(s)
+            lr_mult = self._clean_lr_scale(  # clean_share: half the lr on the lower-share epochs
+                cfg, st["step"], st.get("batcher"), cfg.batch_size * cfg.gradient_accumulation) \
+                if cfg.clean_share else 1.0
+            if lr_mult != 1.0:  # this step only
+                saved_lrs = [g["lr"] for g in st["optimizer"].param_groups]
+                for g in st["optimizer"].param_groups:
+                    g["lr"] = g["lr"] * lr_mult
             st["optimizer"].step()
+            if lr_mult != 1.0:
+                for g, lr0 in zip(st["optimizer"].param_groups, saved_lrs):
+                    g["lr"] = lr0
             st["optimizer"].zero_grad(set_to_none=True)
             if st["ema"] is not None:
                 st["ema"].update(step_images[v.idx])

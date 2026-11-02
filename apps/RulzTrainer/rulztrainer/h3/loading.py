@@ -437,19 +437,27 @@ def _input_device(model) -> torch.device:
 
 
 @torch.no_grad()
-def encode_prompt(text_encoder, tokenizer, prompt: str, max_length: int = 1024) -> torch.Tensor:
-    """Text features for one prompt: [S, 5120] bf16 on the CPU (see the module docstring)."""
-    ids = tokenizer(prompt or " ", add_special_tokens=False, truncation=True, max_length=max(8, int(max_length)),
-                    return_tensors="pt").input_ids.to(_input_device(text_encoder))
-    n = ids.shape[1]
-    position_ids = torch.arange(n, device=ids.device).view(1, 1, n).expand(3, 1, n)  # text only: t = h = w
+def encode_prompts(text_encoder, tokenizer, prompts: list[str], max_length: int = 1024) -> list[torch.Tensor]:
+    """Text features for each prompt: [S_i, 5120] bf16 on the CPU (see the module docstring), in one forward."""
+    rows = [tokenizer(prompt or " ", add_special_tokens=False, truncation=True, max_length=max(8, int(max_length)),
+                      return_tensors="pt").input_ids[0] for prompt in prompts]
+    ids, mask = moss_loading.right_pad(rows)
+    device = _input_device(text_encoder)
+    b, n = ids.shape
+    position_ids = torch.arange(n, device=device).view(1, 1, n).expand(3, b, n)  # text only: t = h = w
     norm = getattr(text_encoder, "norm", None) or text_encoder.language_model.norm
     handle = norm.register_forward_hook(lambda module, args, output: args[0])  # the state after layer 50, unnormed
     try:
-        out = text_encoder(input_ids=ids, attention_mask=torch.ones_like(ids), position_ids=position_ids)
+        out = text_encoder(input_ids=ids.to(device), attention_mask=mask.to(device), position_ids=position_ids)
     finally:
         handle.remove()
-    return out.last_hidden_state[0].to(torch.bfloat16).cpu()
+    hidden = out.last_hidden_state.to(torch.bfloat16).cpu()
+    return [hidden[i, : r.numel()].clone() for i, r in enumerate(rows)]
+
+
+def encode_prompt(text_encoder, tokenizer, prompt: str, max_length: int = 1024) -> torch.Tensor:
+    """Text features for one prompt: [S, 5120] bf16 on the CPU (see the module docstring)."""
+    return encode_prompts(text_encoder, tokenizer, [prompt], max_length)[0]
 
 
 def get_tokenizer(cfg: TrainConfig, model_dir: Path | None):

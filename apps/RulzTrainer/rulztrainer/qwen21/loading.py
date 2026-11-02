@@ -142,23 +142,32 @@ def system_tokens(tokenizer) -> int:
 
 
 @torch.no_grad()
-def encode_prompt(text_encoder, tokenizer, prompt: str, max_length: int = 1024) -> torch.Tensor:
-    """Text features for one prompt: [S, 4096] bf16 on the CPU (see the module docstring). The prompt is cut to
-    max_length tokens of user turn (the assistant header always follows)."""
+def encode_prompts(text_encoder, tokenizer, prompts: list[str], max_length: int = 1024) -> list[torch.Tensor]:
+    """Text features for each prompt: [S_i, 4096] bf16 on the CPU (see the module docstring), in one forward. A
+    prompt is cut to max_length tokens of user turn (the assistant header always follows)."""
     drop = system_tokens(tokenizer)
-    suffix = tokenizer([PROMPT_SUFFIX], add_special_tokens=False, return_tensors="pt").input_ids
-    head = tokenizer([PROMPT_PREFIX + (prompt or " ")], add_special_tokens=False, truncation=True,
-                     max_length=drop + max(8, int(max_length) - suffix.shape[1]), return_tensors="pt").input_ids
-    input_ids = torch.cat([head, suffix], dim=1).to(_input_device(text_encoder))
-    n = input_ids.shape[1]
-    position_ids = torch.arange(n, device=input_ids.device).view(1, 1, n).expand(3, 1, n)
+    suffix = tokenizer([PROMPT_SUFFIX], add_special_tokens=False, return_tensors="pt").input_ids[0]
+    rows = [torch.cat([tokenizer([PROMPT_PREFIX + (prompt or " ")], add_special_tokens=False, truncation=True,
+                                 max_length=drop + max(8, int(max_length) - suffix.numel()),
+                                 return_tensors="pt").input_ids[0], suffix]) for prompt in prompts]
+    ids, mask = moss_loading.right_pad(rows)
+    device = _input_device(text_encoder)
+    b, n = ids.shape
+    position_ids = torch.arange(n, device=device).view(1, 1, n).expand(3, b, n)
     norm = getattr(text_encoder, "norm", None) or text_encoder.language_model.norm
     handle = norm.register_forward_hook(lambda module, args, output: args[0])  # the state before the final norm
     try:
-        out = text_encoder(input_ids=input_ids, attention_mask=torch.ones_like(input_ids), position_ids=position_ids)
+        out = text_encoder(input_ids=ids.to(device), attention_mask=mask.to(device), position_ids=position_ids)
     finally:
         handle.remove()
-    return out.last_hidden_state[0, drop:].to(torch.bfloat16).cpu()
+    hidden = out.last_hidden_state.to(torch.bfloat16).cpu()
+    return [hidden[i, drop: r.numel()].clone() for i, r in enumerate(rows)]
+
+
+def encode_prompt(text_encoder, tokenizer, prompt: str, max_length: int = 1024) -> torch.Tensor:
+    """Text features for one prompt: [S, 4096] bf16 on the CPU (see the module docstring). The prompt is cut to
+    max_length tokens of user turn (the assistant header always follows)."""
+    return encode_prompts(text_encoder, tokenizer, [prompt], max_length)[0]
 
 
 def get_tokenizer(cfg: TrainConfig, model_dir: Path | None):
