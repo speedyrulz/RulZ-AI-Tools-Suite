@@ -446,6 +446,7 @@ class Trainer(RaceParallelMixin):
         cfg.save(self.job_dir / "config.yaml")
         self.status = Status(self.job_dir / "status.json")
         self.run_id = history.new_run_id(cfg.job_name)  # this run's file in output/_history (Previous Runs tab)
+        self.status.update(run_id=self.run_id)  # whose files the job folder holds (Previous Runs' downloads)
         self.run_started = time.time()
         self.stop_file = self.job_dir / "STOP"
         if self.stop_file.exists():

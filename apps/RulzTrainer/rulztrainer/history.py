@@ -223,7 +223,9 @@ def race_names(status: dict) -> list[str]:
 
 def build_record(cfg: dict, arch: str, run_id: str, started: float, status: dict, state: str,
                  updated: float | None = None) -> dict:
-    return {"version": 1, "id": run_id, "job": cfg.get("job_name", ""), "label": "", "arch": arch,
+    job_dir = Path(cfg.get("output_dir") or "output") / cfg.get("job_name", "")
+    return {"version": 1, "id": run_id, "job": cfg.get("job_name", ""), "job_dir": str(job_dir.resolve()),
+            "label": "", "arch": arch,
             "started": started, "updated": updated or time.time(), "state": state,
             "step": status.get("step") or 0, "total": status.get("total") or cfg.get("steps") or 0,
             "config": {k: cfg[k] for k in CONFIG_KEYS if k in cfg},
@@ -370,6 +372,7 @@ def import_jobs(output: Path | None = None, root: Path = HISTORY_DIR) -> int:
         started, updated = cfg_path.stat().st_mtime, status_path.stat().st_mtime
         record = build_record({**cfg, "job_name": job}, arch, new_run_id(job, started) + "-imported", started, status,
                               state, updated)
+        record["job_dir"] = str(job_dir.resolve())
         if has_data(record):
             record["probe_images"] = keep_probe_images(record["id"], status, root)
             _write(root / f"{record['id']}.json", record)
