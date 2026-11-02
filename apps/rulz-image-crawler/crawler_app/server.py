@@ -69,6 +69,7 @@ class RunIn(BaseModel):
     max_depth: int = Field(default=3, ge=0, le=20)
     max_images: int = Field(default=300, ge=1, le=10000)
     respect_robots: bool = False
+    stay_in_path: bool = False
     page_delay_s: float = Field(default=1.0, ge=0.0, le=30.0)
     prefer_originals: bool = True
     min_megapixels: float = Field(default=0.0, ge=0.0, le=200.0)
@@ -218,6 +219,7 @@ def create_app(
                 max_depth=body.max_depth,
                 max_images=body.max_images,
                 respect_robots=body.respect_robots,
+                stay_in_path=body.stay_in_path,
                 page_delay_s=body.page_delay_s,
                 prefer_originals=body.prefer_originals,
                 min_megapixels=body.min_megapixels,
