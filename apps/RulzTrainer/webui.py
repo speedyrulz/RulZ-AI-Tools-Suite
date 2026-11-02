@@ -1579,12 +1579,33 @@ body {
 .q-tooltip { background: var(--rz-tooltip-bg); border: 1px solid var(--rz-border-strong); color: var(--rz-text); font-size: 13px; max-width: 440px; line-height: 1.45; }
 .q-menu { background: var(--rz-menu-bg); border: 1px solid var(--rz-border-strong); }
 
-/* Train tab: section list on the left */
-.rz-nav { position: sticky; top: 108px; width: 210px; flex-shrink: 0; gap: 2px; }
-.rz-nav-title { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--rz-muted); padding: 2px 12px 6px; }
-.rz-nav-btn { width: 100%; color: var(--rz-text-2); font-weight: 500; }
-.rz-nav-btn .q-btn__content { justify-content: flex-start; }
-.rz-nav-btn .q-icon { color: var(--rz-red-bright); font-size: 18px; }
+/* Train tab: the section list on the left picks the one section shown on the right */
+.rz-nav { position: sticky; top: 108px; width: 230px; flex-shrink: 0; gap: 1px; }
+.rz-nav-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .1em; color: var(--rz-muted); padding: 14px 12px 6px; }
+.rz-nav-title:first-child { padding-top: 2px; }
+.rz-nav-btn { width: 100%; color: var(--rz-text-2); font-weight: 500; min-height: 36px; border-left: 3px solid transparent; border-radius: 0 9px 9px 0; }
+.rz-nav-btn .q-btn__content { justify-content: flex-start; flex-wrap: nowrap; text-align: left; }
+.rz-nav-btn .q-icon { color: var(--rz-muted); font-size: 18px; }
+.rz-nav-btn.rz-on { background: var(--rz-red-soft); color: var(--rz-heading); border-left-color: var(--rz-red); }
+.rz-nav-btn.rz-on .q-icon { color: var(--rz-red-bright); }
+.rz-pane { background: var(--rz-surface); border: 1px solid var(--rz-border); border-radius: 14px; padding: 18px 24px 14px; gap: 16px; }
+.rz-pane-head { padding-bottom: 16px; border-bottom: 1px solid var(--rz-border); }
+.rz-pane-icon { color: var(--rz-red-bright); background: var(--rz-red-soft); border-radius: 11px; font-size: 22px; width: 42px; height: 42px; flex-shrink: 0; }
+.rz-pane-title { font-size: 20px; font-weight: 700; color: var(--rz-heading); line-height: 1.25; }
+.rz-pane-caption { font-size: 13px; color: var(--rz-muted); }
+.rz-pane-foot { border-top: 1px solid var(--rz-border); padding-top: 10px; margin-top: 4px; }
+.q-btn.rz-pane-link { color: var(--rz-text-2); font-weight: 500; }
+.q-btn.rz-pane-link .q-icon { color: var(--rz-red-bright); }
+.rz-intro { background: var(--rz-surface-2); border: 1px solid var(--rz-border); border-radius: 12px; padding: 10px 14px; }
+.rz-pane > .rz-subhead { margin-top: 10px; padding-bottom: 6px; border-bottom: 1px solid var(--rz-border); width: 100%; }
+/* a setting and its description side by side; the setting fills its column */
+.rz-item { display: grid; grid-template-columns: minmax(0, 300px) minmax(0, 1fr); gap: 4px 28px; width: 100%; align-items: start; }
+.rz-pane .rz-item > .q-field, .rz-pane .rz-item > .rz-path { width: 100%; max-width: 100%; }
+.rz-desc { font-size: 13px; color: var(--rz-muted); line-height: 1.5; padding-top: 7px; max-width: 760px; }
+.rz-desc.rz-clamp { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; cursor: pointer; }
+.rz-desc.rz-clamp:hover { color: var(--rz-text-2); }
+.rz-desc.rz-clamp.rz-open { display: block; }
+.rz-pane .rz-fields { gap: 14px 16px; }
 
 /* action bar */
 .nicegui-footer.rz-footer {
@@ -1666,7 +1687,9 @@ body {
 .rz-summary .k { color: var(--rz-muted); }
 .rz-summary .v { color: var(--rz-text-3); overflow-wrap: anywhere; }
 @media (max-width: 760px) {
-  .rz-setting { grid-template-columns: 1fr; }
+  .rz-setting, .rz-item { grid-template-columns: 1fr; }
+  .rz-desc { padding-top: 0; }
+  .rz-pane { padding: 14px 14px 10px; }
   .rz-panels .q-tab-panel { padding: 14px 12px 24px; }
   .rz-footer-row, .rz-header-row { padding-left: 12px; padding-right: 12px; }
 }
@@ -1841,6 +1864,97 @@ def section(title: str, caption: str, icon: str, open_: bool = True):
     return ui.expansion(title, caption=caption, icon=icon, value=open_).classes("rz-section w-full")
 
 
+class SectionNav:
+    """The Train tab's settings sections, one shown at a time: the list on the left (a dropdown on narrow screens)
+    picks which, and each section ends with links to its neighbours."""
+
+    def __init__(self):
+        self.items: list[tuple[str, str, str, object]] = []  # (group, title, icon, section column)
+        self.buttons: list = []
+        self.picker = None
+        self.current = 0
+
+    @contextmanager
+    def section(self, group: str, title: str, caption: str, icon: str):
+        with ui.column().classes("rz-pane w-full") as box:
+            with ui.row().classes("rz-pane-head w-full items-center no-wrap gap-3"):
+                ui.icon(icon).classes("rz-pane-icon")
+                with ui.column().classes("gap-0 min-w-0"):
+                    ui.label(title).classes("rz-pane-title")
+                    ui.label(caption).classes("rz-pane-caption")
+            yield box
+        box.visible = not self.items
+        self.items.append((group, title, icon, box))
+
+    def build(self, nav, picker_row) -> None:
+        """The section list into `nav`, the narrow-screen dropdown into `picker_row`, the neighbour links into each
+        section."""
+        group = None
+        with nav:
+            for i, (grp, title, icon, _) in enumerate(self.items):
+                if grp != group:
+                    group = grp
+                    ui.label(grp).classes("rz-nav-title")
+                self.buttons.append(ui.button(title, icon=icon, on_click=lambda _, i=i: self.show(i), color=None)
+                                    .props("flat no-caps align=left").classes("rz-nav-btn"))
+        with picker_row:
+            self.picker = ui.select({i: f"{grp}: {title}" for i, (grp, title, _, _) in enumerate(self.items)},
+                                    value=0, label="Section", on_change=lambda e: self.show(e.value)) \
+                .classes("w-full")
+        for i, (_, _, _, box) in enumerate(self.items):
+            with box, ui.row().classes("rz-pane-foot w-full items-center no-wrap"):
+                if i > 0:
+                    ui.button(self.items[i - 1][1], icon="chevron_left", on_click=lambda _, i=i: self.show(i - 1),
+                              color=None) \
+                        .props("flat no-caps").classes("rz-pane-link")
+                ui.space()
+                if i + 1 < len(self.items):
+                    ui.button(self.items[i + 1][1], on_click=lambda _, i=i: self.show(i + 1), color=None) \
+                        .props("flat no-caps icon-right=chevron_right").classes("rz-pane-link")
+        self.show(0, scroll=False)
+
+    def show(self, index: int, scroll: bool = True) -> None:
+        if index is None:
+            return
+        self.current = index
+        for i, (_, _, _, box) in enumerate(self.items):
+            box.visible = i == index
+            if i == index:
+                self.buttons[i].classes(add="rz-on")
+            else:
+                self.buttons[i].classes(remove="rz-on")
+        if self.picker.value != index:
+            self.picker.value = index
+        if scroll:
+            ui.run_javascript("window.scrollTo({top: 0, behavior: 'smooth'})")
+
+
+def inline_descriptions(root) -> None:
+    """Shows the tooltip of every setting under `root` as a description beside the setting (the Train tab): the two
+    become one row, hidden together with the setting. Buttons keep their tooltips."""
+    from nicegui.elements.mixins.value_element import ValueElement
+
+    elements = {el.html_id: el for el in root.descendants(include_self=True)}
+    for tip in [el for el in elements.values() if isinstance(el, ui.tooltip)]:
+        target = tip.props.get("target")  # NiceGUI 3 places the tooltip beside its element; 2 inside it
+        target = elements.get(target.lstrip("#")) if isinstance(target, str) else tip.parent_slot.parent
+        if not isinstance(target, ValueElement):
+            continue
+        control = target.parent_slot.parent if "rz-path" in target.parent_slot.parent.classes else target
+        slot = control.parent_slot
+        text = tip.text
+        tip.delete()
+        with slot:
+            item = ui.element("div").classes("rz-item")
+        item.move(slot.parent, slot.children.index(control), target_slot=slot.name)
+        control.move(item)
+        with item:
+            desc = ui.label(text).classes("rz-desc")
+        if len(text) > 240:  # long ones show three lines until clicked
+            desc.classes("rz-clamp").on("click", js_handler="(e) => e.currentTarget.classList.toggle('rz-open')")
+        item.bind_visibility_from(control, "visible")
+
+
 def advanced(title: str = "Advanced options"):
     """Rarely changed options inside a section, folded away by default."""
     return ui.expansion(title, icon="tune").props("dense").classes("rz-advanced w-full")
@@ -1900,7 +2014,7 @@ def path_field(label: str, kind: str, value: str = "", width: str = "w-96", file
     container."""
     full = width == "w-full"
     native = _native_dialogs  # this page's viewer, read while the page is built
-    with ui.row().classes("items-center gap-1 no-wrap max-w-full" + (" w-full" if full else "")):
+    with ui.row().classes("rz-path items-center gap-1 no-wrap max-w-full" + (" w-full" if full else "")):
         inp = ui.input(label, value=value).classes("flex-grow min-w-0" if full else f"{width} min-w-0")
 
         async def browse():
@@ -5473,15 +5587,16 @@ def build_page(local: bool = True):
         with ui.tab_panel(tab_train):
             with ui.row().classes("rz-page no-wrap items-start gap-6"):
                 nav = ui.column().classes("rz-nav gt-sm")
-                with ui.column().classes("gap-4 min-w-0 flex-1"):
-                    nav_items: list[tuple[str, str, object]] = []
+                with ui.column().classes("gap-4 min-w-0 flex-1") as train_page:
+                    sections = SectionNav()
+                    picker_row = ui.row().classes("w-full lt-md")
 
-                    with card():
-                        with ui.row().classes("w-full items-center gap-4"):
-                            with ui.column().classes("gap-1 flex-1 min-w-[16rem]"):
-                                ui.label("Training job").classes("rz-title")
-                                hint("Every setting, grouped by topic; rarely changed ones are folded under Advanced. "
-                                     "New to this? The Wizard walks through the important ones with recommendations.")
+                    with sections.section("Basics", "Job", "Name, output folder, seed, preset and config file",
+                                          "work_outline"):
+                        with ui.row().classes("rz-intro w-full items-center gap-4"):
+                            hint("New to this? The Wizard walks through the important settings with "
+                                 "recommendations. Rarely changed settings are folded under Advanced in each "
+                                 "section.").classes("flex-1 min-w-[16rem]")
                             ui.button("Open the wizard", icon="auto_awesome", on_click=lambda: goto("Wizard")) \
                                 .props("outline")
                         with fields():
@@ -5573,8 +5688,7 @@ def build_page(local: bool = True):
                             ui.button("Save", icon="save", on_click=on_save).props("flat")
 
                     # ---- Model
-                    with section("Model", "Base model, model files and GPUs", "model_training") as sec:
-                        nav_items.append(("Model", "model_training", sec))
+                    with sections.section("Basics", "Model", "Base model, model files and GPUs", "model_training"):
                         w["model_source"] = ui.radio([FILE_SOURCE, HF_SOURCE], value=FILE_SOURCE).props("inline")
                         with fields():  # the model (family) in both modes: with files it is also the HF fallback
                             w["model_preset"] = ui.select(list(MODEL_PRESETS) + [CUSTOM], value="MOSS-Image-Base",
@@ -5625,19 +5739,19 @@ def build_page(local: bool = True):
                                  "downloaded on the first "
                                  "run. To use files you already have, set them below: anything left empty is "
                                  "downloaded.")
-                            path_input(f, "transformer_file", "Diffusion model file (optional; empty = download)",
-                                       "file", "", "w-[40rem]")
-                            path_input(f, "text_encoder_file", "Text encoder file (optional; Qwen3.5-9B for MOSS-Image, "
-                                                               "Qwen3-VL-4B for Krea 2, FIBO 2.0 and FLUX 3 Klein, "
-                                                               "Qwen3-VL-8B for Qwen-Image 2.1 and Ideogram 4, "
-                                                               "Qwen3-VL-32B for MiniMax H3)", "file", "",
-                                       "w-[40rem]")
-                            path_input(f, "vae_file", "VAE file (optional; Flux2 for MOSS-Image, FIBO 2.0, FLUX 3 "
-                                                      "Klein and Ideogram 4, Qwen-Image for Krea 2, its own for "
-                                                      "Qwen-Image 2.1, the video VAE for MiniMax H3)", "file", "",
-                                       "w-[40rem]")
-                            path_input(f, "tokenizer_path", "Tokenizer folder (optional; auto-downloads if empty)",
-                                       "dir", "", "w-[40rem]")
+                            path_input(f, "transformer_file", "Diffusion model file (optional)", "file", "",
+                                       "w-[40rem]").tooltip("Empty: downloaded in the format picked above.")
+                            path_input(f, "text_encoder_file", "Text encoder file (optional)", "file", "",
+                                       "w-[40rem]").tooltip("Empty: downloaded. Qwen3.5-9B for MOSS-Image; Qwen3-VL-4B "
+                                                            "for Krea 2, FIBO 2.0 and FLUX 3 Klein; Qwen3-VL-8B for "
+                                                            "Qwen-Image 2.1 and Ideogram 4; Qwen3-VL-32B for MiniMax "
+                                                            "H3.")
+                            path_input(f, "vae_file", "VAE file (optional)", "file", "", "w-[40rem]") \
+                                .tooltip("Empty: downloaded. Flux2's for MOSS-Image, FIBO 2.0, FLUX 3 Klein and "
+                                         "Ideogram 4; Qwen-Image's for Krea 2; its own for Qwen-Image 2.1; the video "
+                                         "VAE for MiniMax H3.")
+                            path_input(f, "tokenizer_path", "Tokenizer folder (optional)", "dir", "", "w-[40rem]") \
+                                .tooltip("Empty: downloaded with the model.")
                         subhead("GPUs and memory")
                         with fields():
                             w["multi_gpu"] = ui.select({"off": "single GPU",
@@ -5775,8 +5889,7 @@ def build_page(local: bool = True):
                                              "the next.")
 
                     # ---- Dataset
-                    with section("Dataset", "Images, captions and resolution", "photo_library") as sec:
-                        nav_items.append(("Dataset", "photo_library", sec))
+                    with sections.section("Basics", "Dataset", "Images, captions and resolution", "photo_library"):
                         subhead("Datasets to train on")
                         hint("Tick one or more. Each can train at its own resolutions (none picked: the Training "
                              "resolutions below) and come up several times per epoch (Repeats), to weight a small or "
@@ -5809,7 +5922,8 @@ def build_page(local: bool = True):
                                                        "this machine: it joins the list")
                         ui.timer(0.2, refresh_datasets, once=True)
                         with fields():
-                            w["trigger_word"] = ui.input("Trigger word (prepended to captions)").classes("w-64")
+                            w["trigger_word"] = ui.input("Trigger word").classes("w-64") \
+                                .tooltip("Prepended to every caption.")
 
                             async def on_scan():
                                 cfg = f.to_config()
@@ -5922,8 +6036,7 @@ def build_page(local: bool = True):
                         crop_row = ui.row().classes("w-full gap-2")
 
                     # ---- LoRA
-                    with section("LoRA", "Adapter size, layers and blocks", "hub") as sec:
-                        nav_items.append(("LoRA", "hub", sec))
+                    with sections.section("Basics", "LoRA", "Adapter size, layers and blocks", "hub"):
                         with fields():
                             w["finetune"] = ui.switch("Fine-tune the whole model, then extract a LoRA",
                                                       value=d.finetune).tooltip(
@@ -6065,11 +6178,12 @@ def build_page(local: bool = True):
                                 .tooltip("Also train the 2-block text projection inside the DiT")
                         with advanced("Blocks to train"):
                             with fields():
-                                w["lora_blocks"] = ui.input("Blocks (e.g. 0-41, 21-41, 10-31,40, even; empty = all)",
-                                                            value=d.lora_blocks).classes("w-[30rem] max-w-full")
-                            hint("Training only later blocks also skips the backward pass through earlier ones, "
-                                 "unless LoRA layers sit before the blocks (Krea's text fusion, embedders, MOSS's "
-                                 "text projection): their gradient passes through every block.")
+                                w["lora_blocks"] = ui.input("Blocks (empty = all)", value=d.lora_blocks) \
+                                    .classes("w-[30rem] max-w-full") \
+                                    .tooltip("e.g. 0-41, 21-41, 10-31,40 or even, or tick them below. Training only "
+                                             "later blocks also skips the backward pass through earlier ones, unless "
+                                             "LoRA layers sit before the blocks (Krea's text fusion, embedders, "
+                                             "MOSS's text projection): their gradient passes through every block.")
                             block_boxes: list = []
 
                             def n_blocks() -> int:
@@ -6140,8 +6254,8 @@ def build_page(local: bool = True):
                                        "dir", "", "w-[40rem]")
 
                     # ---- Optimization
-                    with section("Optimization", "Steps, learning rate, optimizer and timesteps", "speed") as sec:
-                        nav_items.append(("Optimization", "speed", sec))
+                    with sections.section("Basics", "Optimization", "Steps, learning rate, optimizer and timesteps",
+                                          "speed"):
                         with fields():
                             w["steps"] = ui.number("Steps", value=d.steps, precision=0).classes("w-28")
                             w["batch_size"] = ui.number("Batch size", value=d.batch_size, precision=0).classes("w-28")
@@ -6392,8 +6506,7 @@ def build_page(local: bool = True):
                                     w[key].on_value_change(clean_hint_update)
 
                     # ---- Saving & samples
-                    with section("Saving & samples", "Checkpoints and preview images", "save") as sec:
-                        nav_items.append(("Saving & samples", "save", sec))
+                    with sections.section("Basics", "Saving & samples", "Checkpoints and preview images", "save"):
                         with fields():
                             w["save_every"] = ui.number("Save every N steps", value=d.save_every, precision=0) \
                                 .classes("w-44")
@@ -6540,9 +6653,8 @@ def build_page(local: bool = True):
                         _task_progress.update(active=False)
 
                     # ---- Identity similarity
-                    with section("Identity similarity", "Face and body scoring for character LoRAs", "face",
-                                 open_=False) as sec:
-                        nav_items.append(("Identity similarity", "face", sec))
+                    with sections.section("Likeness", "Identity similarity",
+                                          "Face and body scoring for character LoRAs", "face"):
                         hint("Pick reference images on the Dataset tab (\"Face ref\" / \"Body ref\") or list paths "
                              "here. After each sampling pass, every sample's largest face is compared to the "
                              "reference faces with InsightFace (ArcFace; 50%+ generally means the same person), and "
@@ -6656,9 +6768,8 @@ def build_page(local: bool = True):
                                                          step=0.1, min=0).classes("w-56")
 
                     # ---- Region-weighted loss
-                    with section("Region-weighted loss", "Face, person and background weights; identity loss",
-                                 "filter_center_focus", open_=False) as sec:
-                        nav_items.append(("Region loss", "filter_center_focus", sec))
+                    with sections.section("Likeness", "Region-weighted loss",
+                                          "Face, person and background weights; identity loss", "filter_center_focus"):
                         hint("Weights each training image's loss by region: the detected face counts most, the person "
                              "silhouette next (SAM 3 or MediaPipe), the background least. Maps are built once at "
                              "cache time (16 px cells) and normalised to mean 1, so the loss scale is unchanged.")
@@ -6777,9 +6888,8 @@ def build_page(local: bool = True):
                                                                     value=d.id_loss_random_ref)
 
                     # ---- Loss watch
-                    with section("Per-image loss watch", "Per-image verdicts and learning rate", "rule",
-                                 open_=False) as sec:
-                        nav_items.append(("Loss watch", "rule", sec))
+                    with sections.section("Likeness", "Per-image loss watch", "Per-image verdicts and learning rate",
+                                          "rule"):
                         hint("Tracks every image's loss normalised by its timestep bucket and, at each epoch boundary, "
                              "classes it as easy / healthy / suspect / stuck / exhausted. Per-image LR then throttles "
                              "stuck images (x0.5, x0.25, x0.125), eases exhausted ones (x0.6) and can exclude images "
@@ -6822,9 +6932,8 @@ def build_page(local: bool = True):
                                                                          step=0.05).classes("w-40")
 
                     # ---- LoRA Isolation
-                    with section("LoRA Isolation", "Keep your subject(s) off everyone else in a picture",
-                                 "group_off", open_=False) as sec:
-                        nav_items.append(("LoRA Isolation", "group_off", sec))
+                    with sections.section("Likeness", "LoRA Isolation",
+                                          "Keep your subject(s) off everyone else in a picture", "group_off"):
                         hint("After Fizgig's LoRA Isolation. A character LoRA spreads its subject onto other people: "
                              "strangers in the background, a friend beside them. With it on: every caption that "
                              "names a subject also trains without the trigger, held to the model without the LoRA "
@@ -6859,9 +6968,8 @@ def build_page(local: bool = True):
                         iso_fields.bind_visibility_from(w["isolation"], "value")
 
                     # ---- Likeness probes
-                    with section("Likeness probes & controller", "Best checkpoint, early stop and curriculum",
-                                 "insights", open_=False) as sec:
-                        nav_items.append(("Likeness probes", "insights", sec))
+                    with sections.section("Likeness", "Likeness probes & controller",
+                                          "Best checkpoint, early stop and curriculum", "insights"):
                         hint("Renders a fixed-seed headshot and/or full-body probe every N steps (small, turbo LoRA), "
                              "scores it against the references, and lets a controller act on the smoothed scores: "
                              "keep the best checkpoint and stop early, nudge the learning rate, and weight the dataset "
@@ -7096,9 +7204,8 @@ def build_page(local: bool = True):
                                     .classes("w-48")
 
                     # ---- Configuration race
-                    with section("Configuration race", "Several configurations, the probes pick the winner",
-                                 "emoji_events", open_=False) as sec:
-                        nav_items.append(("Configuration race", "emoji_events", sec))
+                    with sections.section("Tools", "Configuration race",
+                                          "Several configurations, the probes pick the winner", "emoji_events"):
                         hint("Each configuration below trains until its next probe, then the next one does. Once all of "
                              "them have been probed (a round), the one with the lowest smoothed likeness score is "
                              "dropped; the last one left trains until Steps, which counts its own steps, so the race "
@@ -7272,9 +7379,8 @@ def build_page(local: bool = True):
                                  'sees its own image order and noise: seed twins for a seed soup.')
 
                     # ---- Seed soup
-                    with section("Seed soup", "Average finished LoRAs of one subject into one",
-                                 "blender", open_=False) as sec:
-                        nav_items.append(("Seed soup", "blender", sec))
+                    with sections.section("Tools", "Seed soup", "Average finished LoRAs of one subject into one",
+                                          "blender"):
                         hint("Train the same subject two or three times with different seeds (or keep a race's "
                              "finalists: their _best files), then average what each one changes in the model and "
                              "save it as one LoRA: the model soup of Wortsman et al. (2022). What the runs agree on, "
@@ -7319,9 +7425,9 @@ def build_page(local: bool = True):
                                          "references and probe settings; more probe seeds give a steadier choice.")
 
                     # ---- Post-hoc EMA
-                    with section("Post-hoc EMA", "Average a finished run's checkpoints, choosing the decay afterwards",
-                                 "timeline", open_=False) as sec:
-                        nav_items.append(("Post-hoc EMA", "timeline", sec))
+                    with sections.section("Tools", "Post-hoc EMA",
+                                          "Average a finished run's checkpoints, choosing the decay afterwards",
+                                          "timeline"):
                         hint("Weight average (lora_ema) smooths the LoRA while it trains, with a decay you choose "
                              "before the run. This makes the same kind of average after the run from the step "
                              "checkpoints it kept, so you can try a few decays on finished files and keep the one you "
@@ -7391,9 +7497,8 @@ def build_page(local: bool = True):
                             ui.button("Average now", icon="timeline", on_click=ema_now).props("outline")
 
                     # ---- Noise check
-                    with section("Probe noise check", "How far the likeness probes move with their seeds",
-                                 "query_stats", open_=False) as sec:
-                        nav_items.append(("Probe noise check", "query_stats", sec))
+                    with sections.section("Tools", "Probe noise check",
+                                          "How far the likeness probes move with their seeds", "query_stats"):
                         hint("A probe renders a few seeds and averages their scores, so part of every score is the "
                              "seeds' luck. This renders finished LoRAs (say a mid-run checkpoint and the best one of "
                              "a run) on many seeds, the same ones for each, and measures that luck: how far one seed "
@@ -7410,15 +7515,8 @@ def build_page(local: bool = True):
                                 .tooltip("Start then trains nothing: it probes the base model (the scale's zero) and "
                                          "each file at this many seeds (face and body: two renders per seed).")
 
-                def jump(exp):
-                    exp.value = True
-                    ui.run_javascript(f"getHtmlElement({exp.id}).scrollIntoView({{behavior: 'smooth', block: 'start'}})")
-
-                with nav:
-                    ui.label("Sections").classes("rz-nav-title")
-                    for title, icon, exp in nav_items:
-                        ui.button(title, icon=icon, on_click=lambda _, e=exp: jump(e)) \
-                            .props("flat no-caps align=left").classes("rz-nav-btn")
+                sections.build(nav, picker_row)
+                inline_descriptions(train_page)
 
         # ------------------------------------------------------------ Wizard (bound to the Train tab's widgets)
         with ui.tab_panel(tab_wizard):
