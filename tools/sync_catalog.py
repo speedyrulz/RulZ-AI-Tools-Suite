@@ -29,6 +29,7 @@ APPS = {
     "clip-extractor": ("rulz-simple-video-clip-extractor", "simplecut/assets/icon256.png", "simplecut/assets/icon.ico"),
     "rulz-image-crawler": ("rulz-image-crawler", "assets/icon.png", "assets/icon.ico"),
     "image-preparer": ("RulZ-Image-Preparer", "assets/icon.png", "assets/icon.ico"),
+    "image-grid": ("RulZ-Image-Grid", "assets/app.png", "assets/app.ico"),
 }
 
 IMAGE_REFS = [
