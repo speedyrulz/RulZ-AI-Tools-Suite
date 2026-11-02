@@ -201,6 +201,9 @@
           <div class="check"><input id="originals" type="checkbox" checked><label for="originals" style="margin:0;color:inherit;font-size:inherit">Get full-size originals</label></div>
         </div>
         <div class="field web-only">
+          <div class="check" title="Only follow links in the start address's folder and below, e.g. /gallery/cats/... but not /blog/"><input id="stayInPath" type="checkbox"><label for="stayInPath" style="margin:0;color:inherit;font-size:inherit">Stay in this folder</label></div>
+        </div>
+        <div class="field web-only">
           <div class="check"><input id="robots" type="checkbox"><label for="robots" style="margin:0;color:inherit;font-size:inherit">Respect robots.txt</label></div>
         </div>
       </div>
@@ -390,6 +393,7 @@
       tag: { id: $("tagId").value.trim(), rubric: $("rubric").value.trim() },
       threshold: num("threshold"), max_pages: num("maxPages"), max_depth: num("maxDepth"),
       max_images: num("maxImages"), page_delay_s: num("delay"), respect_robots: $("robots").checked,
+      stay_in_path: $("stayInPath").checked,
       prefer_originals: $("originals").checked, min_megapixels: num("minMp"),
     };
     $("startBtn").disabled = true;

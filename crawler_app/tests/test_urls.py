@@ -7,7 +7,9 @@ from crawler_app.urls import (
     looks_like_page,
     normalize_image_url,
     normalize_page_url,
+    in_path_scope,
     original_candidates,
+    path_scope,
     site_key,
     sniff_image,
 )
@@ -32,6 +34,24 @@ def test_image_url_keeps_query_verbatim():
 def test_site_key_treats_www_as_same_site():
     assert site_key("https://www.example.com/x") == site_key("http://example.com/") == "example.com"
     assert site_key("https://shop.example.com/") != "example.com"
+
+
+def test_path_scope_is_the_start_folder():
+    assert path_scope("https://e.com/") == "/"
+    assert path_scope("https://e.com/gallery/cats") == "/gallery/cats/"
+    assert path_scope("https://e.com/gallery/cats/") == "/gallery/cats/"
+    assert path_scope("https://e.com/gallery/cats/index.html?p=2") == "/gallery/cats/"
+
+
+def test_in_path_scope_allows_the_folder_and_deeper_only():
+    scope = path_scope("https://e.com/gallery/cats/")
+    assert in_path_scope("https://e.com/gallery/cats", scope)
+    assert in_path_scope("https://e.com/gallery/cats/", scope)
+    assert in_path_scope("https://e.com/gallery/cats/page/2?x=1", scope)
+    assert not in_path_scope("https://e.com/gallery/", scope)
+    assert not in_path_scope("https://e.com/gallery/catsup/", scope)
+    assert not in_path_scope("https://e.com/", scope)
+    assert in_path_scope("https://e.com/anything", "/")
 
 
 def test_looks_like_page():
