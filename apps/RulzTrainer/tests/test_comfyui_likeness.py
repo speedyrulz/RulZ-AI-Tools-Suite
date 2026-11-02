@@ -25,13 +25,20 @@ from rulztrainer_likeness import core, nodes  # noqa: E402
 
 FACE = {"a.png": 60.0, "b.png": 40.0, "c.png": None, "ref1.png": 70.0, "ref2.png": 66.0, "base.png": 20.0}
 BODY = {"a.png": 85.0, "b.png": None, "c.png": 83.0, "base.png": 81.0}
+GOLD = {"a.png": 50.0, "b.png": 30.0, "base.png": 10.0}  # the held-out FaceNet face (c.png has no face)
 
 
 class FakeFace:
-    """FaceScorer stand-in: the score comes from the file name."""
+    """FaceScorer stand-in: the score comes from the file name (the gold face's too, after set_gold)."""
 
     def __init__(self):
         self.refs, self.ref_self_similarity = [], None
+        self.gold = self.gold_refs = self.gold_self_similarity = None
+
+    def set_gold(self, embedder):
+        self.gold = embedder
+        self.gold_refs = np.zeros((len(self.refs), 4), np.float32)
+        self.gold_self_similarity = 0.6 if len(self.refs) >= 2 else None
 
     def set_references(self, paths):
         from rulztrainer.facesim import expand_refs
@@ -41,10 +48,14 @@ class FakeFace:
         self.ref_self_similarity = 0.68 if len(paths) >= 2 else None
         return [{"image": str(p), "faces": 1} for p in paths]
 
-    def score(self, image, step=0, prompt_index=0):
+    def score(self, image, step=0, prompt_index=0, gold=False):
         v = FACE.get(Path(image).name)
-        return FaceScore(step, str(image), prompt_index, 0 if v is None else 1, None if v is None else v / 100,
-                         v, self.refs[0][0] if v is not None else None)
+        s = FaceScore(step, str(image), prompt_index, 0 if v is None else 1, None if v is None else v / 100,
+                      v, self.refs[0][0] if v is not None else None)
+        if gold and self.gold is not None and v is not None:
+            s.gold_percent = GOLD.get(Path(image).name)
+            s.gold_cosine = None if s.gold_percent is None else s.gold_percent / 100
+        return s
 
 
 class FakeBody:
@@ -73,6 +84,7 @@ class FakeBody:
 def fakes(monkeypatch, tmp_path):
     monkeypatch.setattr(core, "face_model", lambda *a, **k: FakeFace())
     monkeypatch.setattr(core, "body_model", lambda *a, **k: FakeBody())
+    monkeypatch.setattr(core, "gold_model", lambda *a, **k: object())
     nodes.REPO_DIR = ROOT
     for name in list(FACE) + ["d.png"]:
         Image.new("RGB", (8, 8), (100, 120, 140)).save(tmp_path / name)
@@ -92,14 +104,15 @@ def test_scores_and_averages_like_the_trainer(fakes):
                                                     "cpu", "cpu", 640, "facebook/sam3")
     assert refs.face_count == 2 and refs.body_count == 2 and "2 of 2 have a face" in info
     images = "\n".join(str(fakes / n) for n in ("a.png", "b.png", "c.png")) + "\n# a comment\n"
-    report, summary, details, overall, face, body = nodes.RZLikenessScore().score(
+    report, summary, details, overall, face, body, gold = nodes.RZLikenessScore().score(
         refs, images, 0.7, 0.3, True, "", "", -1, -1, -1, -1)
     # the trainer's controller with the same ceilings and default floors gives the same numbers
     ctl = LikenessController(SimpleNamespace(likeness_normalize=True, resolution_step_up=False),
-                             face_ceiling=68.0, body_ceiling=90.0)
+                             face_ceiling=68.0, body_ceiling=90.0, gold_ceiling=60.0)
     face_mean, body_mean = (60.0 + 40.0) / 2, (85.0 + 83.0) / 2  # raw scores of the images that have one
     assert face == pytest.approx(ctl.norm("face", face_mean)) and body == pytest.approx(ctl.norm("body", body_mean))
-    assert overall == pytest.approx(combine(face, body, 0.7, 0.3))
+    assert overall == pytest.approx(combine(face, body, 0.7, 0.3))  # ArcFace's face: no run, overall_face auto
+    assert gold == pytest.approx(ctl.norm("gold", (50.0 + 30.0) / 2))  # the gold scale is shaped like the face's
     rows = report["rows"]
     assert [r["image"] for r in rows] == ["a.png", "b.png", "c.png"]
     assert rows[1]["body"] is None and rows[1]["overall"] == pytest.approx(rows[1]["face"])  # face only
@@ -126,10 +139,14 @@ def test_connected_images_and_separate_face_and_body_references(fakes):
 def test_the_scale_sources_in_order(fakes, tmp_path):
     refs, _ = nodes.RZLikenessReferences().build(str(fakes / "refs" / "ref1.png"), "", "", "appearance",
                                                  "mediapipe+sam3", "cpu", "cpu", 640, "x")
+    assert refs.has_gold and refs.gold_ceiling is None  # one reference: no measured gold ceiling either
     s = core.build_scale(refs)  # one reference: no measured ceiling
     span = FACE_SPAN_DEFAULT  # the face scale is stretched, as in the trainer
     assert s.face == (FLOOR_DEFAULT["face"], FLOOR_DEFAULT["face"] + (CEILING_DEFAULT["face"] - FLOOR_DEFAULT["face"]) * span)
-    assert s.sources["face"]["ceiling"] == "default" and s.curve == {"face": FACE_CURVE_DEFAULT, "body": BODY_CURVE_DEFAULT}
+    assert s.sources["face"]["ceiling"] == "default"
+    assert s.curve == {"face": FACE_CURVE_DEFAULT, "body": BODY_CURVE_DEFAULT, "gold": FACE_CURVE_DEFAULT}
+    gold_lo = FLOOR_DEFAULT["gold"]  # the gold face's own default scale, stretched like the face's
+    assert s.gold == (gold_lo, gold_lo + (CEILING_DEFAULT["gold"] - gold_lo) * span)
     s = core.build_scale(refs, baseline_rows=[{"face_raw": 20.0, "body_raw": 81.0}, {"face_raw": 30.0,
                                                                                      "body_raw": None}])
     assert s.face[0] == 25.0 and s.body[0] == 81.0 and s.sources["face"]["floor"] == "baseline images (2)"
@@ -144,7 +161,8 @@ def test_the_scale_sources_in_order(fakes, tmp_path):
         {"step": 60, "scale": {"face": [13.8, 69.2], "body": [73.3, 81.3]}})))
     s = core.build_scale(refs, baseline_rows=[{"face_raw": 30.0}], job=core.job_scale(job), body_floor=75.0)
     assert s.face == (13.8, 69.2) and s.sources["face"]["floor"] == "trainer run"  # the run beats the baseline
-    assert s.curve == {"face": 1.0, "body": 1.0}  # a run from before the curve was linear
+    assert s.curve["face"] == 1.0 and s.curve["body"] == 1.0  # a run from before the curve was linear
+    assert s.sources["gold"]["floor"] == "default"  # a run without the gold face: its scale from the references
     new_run = {"face": [13.8, 94.7], "body": [73.3, 81.3], "curve": {"face": 1.5, "body": 1.0}}
     s2 = core.build_scale(refs, job=new_run)
     assert s2.face == (13.8, 94.7) and s2.curve["face"] == 1.5  # the run's own numbers and curve, as logged
@@ -213,3 +231,80 @@ def test_mediapipe_1_0_mask_workaround(monkeypatch):
     scorer.pad_to = 1
     pts, vis, mask = scorer._detect(Image.new("RGB", (1233, 40)))
     assert seen["shape"][:2] == (40, 1233) and mask.shape == (40, 1233)
+
+
+def test_the_gold_face_in_the_overall_matches_the_trainer(fakes, tmp_path):
+    """overall_face gold: the held-out gold face takes ArcFace's place as the trainer's face_gold_select does; the
+    overall equals the controller's own probe record for the same raw scores, and the ArcFace overall is kept."""
+    from rulztrainer.config import TrainConfig
+
+    refs, info = nodes.RZLikenessReferences().build(str(fakes / "refs"), "", "", "appearance", "mediapipe+sam3",
+                                                    "cpu", "cpu", 640, "x")
+    assert refs.has_gold and refs.gold_ceiling == pytest.approx(60.0) and "Gold face (FaceNet" in info
+    images = "\n".join(str(fakes / n) for n in ("a.png", "b.png", "c.png"))
+    report, summary, details, overall, face, body, gold = nodes.RZLikenessScore().score(
+        refs, images, 0.7, 0.3, True, "", "", -1, -1, -1, -1, "gold")
+    ctl = LikenessController(TrainConfig(face_weight=0.7, body_weight=0.3), face_ceiling=68.0, body_ceiling=90.0,
+                             gold_ceiling=60.0)
+    rec, _ = ctl.update(10, (60.0 + 40.0) / 2, (85.0 + 83.0) / 2,
+                        seeds={"face": [60.0, 40.0, None], "body": [85.0, None, 83.0], "gold": [50.0, 30.0, None]})
+    assert rec.gold_select and overall == pytest.approx(rec.combined) and gold == pytest.approx(rec.gold_norm)
+    assert report["summary"]["overall_arcface"] == pytest.approx(combine(face, body, 0.7, 0.3))
+    assert [r["overall"] for r in report["rows"]] == pytest.approx(
+        [x for x in rec.combined_seeds])  # each image as the record's per-seed combined score
+    assert "in charge of the overall score" in summary and "Overall with ArcFace's face" in summary
+    assert "gold face" in details.splitlines()[0]
+    # a trainer run whose probes had the gold face in charge: auto follows it, with the run's gold scale
+    job = tmp_path / "job"
+    job.mkdir()
+    (job / "likeness.jsonl").write_text(json.dumps({"step": 0, "gold_select": True, "scale": {
+        "face": [13.8, 94.7], "body": [73.3, 90.0], "gold": [8.0, 80.0],
+        "curve": {"face": 1.5, "body": 1.5, "gold": 1.5}}}))
+    report2, _, _, overall2, _, _, gold2 = nodes.RZLikenessScore().score(
+        refs, images, 0.7, 0.3, True, "", str(job), -1, -1, -1, -1, "auto")
+    assert report2["scale"].gold == (8.0, 80.0) and report2["scale"].sources["gold"]["floor"] == "trainer run"
+    assert gold2 == pytest.approx(100 * ((40.0 - 8.0) / 72.0) ** 1.5)
+    assert overall2 == pytest.approx(combine(gold2, report2["summary"]["body"], 0.7, 0.3))
+    # typed in beats the run, as for the face and the body
+    report3 = nodes.RZLikenessScore().score(refs, images, 0.7, 0.3, True, "", str(job), -1, -1, -1, -1, "arcface",
+                                            10.0, 70.0)[0]
+    assert report3["scale"].gold == (10.0, 70.0) and not report3["summary"]["gold_select"]
+    assert report3["summary"]["overall"] == pytest.approx(report3["summary"]["overall_arcface"])
+    # the baseline images set the gold floor like the step-0 probe
+    s = core.build_scale(refs, baseline_rows=[{"face_raw": 20.0, "gold_raw": 12.0}])
+    assert s.gold[0] == 12.0 and s.sources["gold"]["floor"] == "baseline images (1)"
+
+
+def test_gold_face_off_or_unavailable(fakes, monkeypatch):
+    refs, info = nodes.RZLikenessReferences().build(str(fakes / "refs"), "", "", "appearance", "mediapipe+sam3",
+                                                    "cpu", "cpu", 640, "x", "off")
+    assert not refs.has_gold and "Gold face" not in info
+    report, summary, _, overall, face, body, gold = nodes.RZLikenessScore().score(
+        refs, str(fakes / "a.png"), 0.7, 0.3, True, "", "", -1, -1, -1, -1, "gold")
+    assert gold == nodes.NA and report["scale"].gold is None and "Gold face" not in summary
+    assert overall == pytest.approx(combine(face, body, 0.7, 0.3))  # no gold face: ArcFace's face is used
+
+    def broken(*a, **k):
+        raise RuntimeError("no network")
+
+    monkeypatch.setattr(core, "gold_model", broken)
+    refs, info = nodes.RZLikenessReferences().build(str(fakes / "refs"), "", "", "appearance", "mediapipe+sam3",
+                                                    "cpu", "cpu", 640, "x")
+    assert not refs.has_gold and "could not load (no network)" in info
+
+
+def test_spreadsheet_has_the_gold_face(fakes, tmp_path):
+    openpyxl = pytest.importorskip("openpyxl")
+    refs, _ = nodes.RZLikenessReferences().build(str(fakes / "refs"), "", "", "appearance", "mediapipe+sam3",
+                                                 "cpu", "cpu", 640, "x")
+    report = nodes.RZLikenessScore().score(refs, str(fakes / "a.png"), 0.7, 0.3, True, "", "", -1, -1, -1, -1,
+                                           "gold")[0]
+    wb = openpyxl.load_workbook(core.export(report["rows"], report["summary"], report["scale"], refs,
+                                            tmp_path / "lk", "xlsx")[0])
+    head = [c.value for c in wb["Images"][1]]
+    assert head[5] == "Gold face (FaceNet)" and wb["Images"].cell(2, 6).value == pytest.approx(
+        report["rows"][0]["gold"], abs=1e-3)
+    assert wb["Summary"]["E1"].value == "Gold face (FaceNet)"
+    assert wb["Summary"]["E2"].value == pytest.approx(report["summary"]["gold"], abs=1e-3)
+    labels = [r[0].value for r in wb["Summary"].iter_rows()]
+    assert "Gold face scale (raw floor, ceiling)" in labels and "Face in the overall score" in labels

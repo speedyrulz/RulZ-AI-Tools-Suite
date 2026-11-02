@@ -140,6 +140,12 @@ class RZLikenessReferences:
                                   "Face detector input size (the trainer's default is 640)."}),
                 "sam3_model": ("STRING", {"default": "facebook/sam3", "tooltip":
                                "SAM 3 repo id or local folder (proportions with mediapipe+sam3 only)."}),
+                "gold_face": (["facenet", "off"], {"default": "facenet", "tooltip":
+                              "The trainer's held-out gold face score (face_gold): FaceNet (VGGFace2), which nothing "
+                              "trains on, scores the same face against its own embeddings of the references. A run "
+                              "that trains against ArcFace (reward stage, identity loss, identity alignment) can "
+                              "raise the ArcFace face score without raising the likeness; the gold face shows it. "
+                              "Downloads the FaceNet weights into the checkout's models/ the first time."}),
             },
             "optional": {
                 "reference_images": ("IMAGE", {"tooltip": "Reference images for both scores."}),
@@ -159,7 +165,8 @@ class RZLikenessReferences:
         return _files_signature(reference_paths, face_paths, body_paths)
 
     def build(self, reference_paths, face_paths, body_paths, body_score, body_backend, body_device, face_provider,
-              face_det_size, sam3_model, reference_images=None, face_images=None, body_images=None):
+              face_det_size, sam3_model, gold_face="facenet", reference_images=None, face_images=None,
+              body_images=None):
         with tempfile.TemporaryDirectory(prefix="rz_refs_", dir=_temp_root()) as tmp:
             labels = {}
 
@@ -176,7 +183,8 @@ class RZLikenessReferences:
                 raise ValueError("No references: connect reference images or type image files / folders")
             refs = core.build_references(face, body, face_provider=face_provider, det_size=face_det_size,
                                          body_kind=body_score, body_backend=body_backend, body_device=body_device,
-                                         sam3_model=sam3_model, models_dir=str(REPO_DIR / "models"), labels=labels)
+                                         sam3_model=sam3_model, models_dir=str(REPO_DIR / "models"), labels=labels,
+                                         gold=gold_face)
         if refs.face is None and refs.body is None:
             raise ValueError("No usable reference: no face and no body was found in any of them\n" + refs.describe())
         info = refs.describe()
@@ -186,8 +194,9 @@ class RZLikenessReferences:
 
 class RZLikenessScore:
     """Scores images against the references exactly as the trainer scores its probes and samples, and averages them:
-    overall, face and body on the trainer's normalized scale (0 = a stranger, 100 = a typical reference), plus each
-    image's own scores. Connect images, or type image files / folders, or both."""
+    overall, face, body and the held-out gold face on the trainer's normalized scale (0 = a stranger; a typical
+    reference reads about 64, 100 is the top), plus each image's own scores. Connect images, or type image files /
+    folders, or both."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -201,8 +210,10 @@ class RZLikenessScore:
                 "body_weight": ("FLOAT", {"default": core.BODY_WEIGHT, "min": 0.0, "max": 1.0, "step": 0.05,
                                           "tooltip": "Weight of the body in the overall score (trainer: 0.3)."}),
                 "normalize": ("BOOLEAN", {"default": True, "tooltip":
-                              "The trainer's normalized scale (its default): 0 = what a stranger scores, 100 = what "
-                              "a typical reference scores against the others. Off: raw similarity percentages."}),
+                              "The trainer's normalized scale (its default): 0 = what a stranger scores; 100 sits "
+                              "1.35x as far above that as a typical reference's best match among the others, and "
+                              "the scale is curved (x1.5), so the references' own level reads about 64. Off: raw "
+                              "similarity percentages."}),
                 "baseline_paths": ("STRING", {"multiline": True, "default": "", "tooltip":
                                    "Optional: images from the base model without the LoRA, same prompts. Their mean "
                                    "score becomes the 0 of the scale, as the trainer's step-0 probe does (else a "
@@ -220,6 +231,18 @@ class RZLikenessScore:
                 "body_ceiling": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 100.0, "step": 0.1, "tooltip":
                                  "Raw body score that counts as 100 (-1: from the run, the references, or the "
                                  "default)."}),
+                "overall_face": (["auto", "arcface", "gold"], {"default": "auto", "tooltip":
+                                 "Which face score goes into the overall score. gold: the held-out FaceNet face, as "
+                                 "the trainer's face_gold_select does when its gold scorer is on (runs that train "
+                                 "against ArcFace). arcface: ArcFace's face, as a run without the gold scorer. auto: "
+                                 "as the trainer_run did, else ArcFace. Both overalls are in the details and the "
+                                 "spreadsheet."}),
+                "gold_floor": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 100.0, "step": 0.1, "tooltip":
+                               "Raw gold face score that counts as 0 (-1: from the run, the baseline, or the "
+                               "default)."}),
+                "gold_ceiling": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 100.0, "step": 0.1, "tooltip":
+                                 "Raw gold face score that counts as 100 (-1: from the run, the references, or the "
+                                 "default)."}),
             },
             "optional": {
                 "images": ("IMAGE", {"tooltip": "Images to score (a batch scores every image)."}),
@@ -227,11 +250,12 @@ class RZLikenessScore:
             },
         }
 
-    RETURN_TYPES = ("RZ_LIKENESS_REPORT", "STRING", "STRING", "FLOAT", "FLOAT", "FLOAT")
-    RETURN_NAMES = ("report", "summary", "details", "overall", "face", "body")
+    RETURN_TYPES = ("RZ_LIKENESS_REPORT", "STRING", "STRING", "FLOAT", "FLOAT", "FLOAT", "FLOAT")
+    RETURN_NAMES = ("report", "summary", "details", "overall", "face", "body", "gold_face")
     OUTPUT_TOOLTIPS = ("Everything, for the export node.", "The averages.", "Each image's scores.",
-                       "Average overall score (-1: none).", "Average face score (-1: no face found).",
-                       "Average body score (-1: no usable body).")
+                       "Average overall score (-1: none).", "Average ArcFace face score (-1: no face found).",
+                       "Average body score (-1: no usable body).",
+                       "Average gold face score, FaceNet (-1: off or no face found).")
     FUNCTION = "score"
     CATEGORY = CATEGORY
     DESCRIPTION = __doc__
@@ -243,7 +267,8 @@ class RZLikenessScore:
         return _files_signature(image_paths, baseline_paths) + f"|{stamp}"
 
     def score(self, references, image_paths, face_weight, body_weight, normalize, baseline_paths, trainer_run,
-              face_floor, body_floor, face_ceiling, body_ceiling, images=None, baseline_images=None):
+              face_floor, body_floor, face_ceiling, body_ceiling, overall_face="auto", gold_floor=-1.0,
+              gold_ceiling=-1.0, images=None, baseline_images=None):
         refs = references
         t0 = time.time()
         with tempfile.TemporaryDirectory(prefix="rz_score_", dir=_temp_root()) as tmp:
@@ -260,15 +285,21 @@ class RZLikenessScore:
                 if r["path"].startswith(str(tmp)):
                     r["path"] = "(connected image)"
         job = core.job_scale(trainer_run) if str(trainer_run).strip() else None
-        scale = core.build_scale(refs, normalize, base_rows, job, face_floor, body_floor, face_ceiling, body_ceiling)
-        core.apply_scale(rows, scale, face_weight, body_weight)
-        summary = core.summarize(rows, scale, face_weight, body_weight)
+        scale = core.build_scale(refs, normalize, base_rows, job, face_floor, body_floor, face_ceiling, body_ceiling,
+                                 gold_floor, gold_ceiling)
+        gold_select = bool(job and job.get("gold_select")) if overall_face == "auto" else overall_face == "gold"
+        if gold_select and not refs.has_gold:
+            log.warning("RulzTrainer likeness: the references have no gold face (gold_face off, or FaceNet found no "
+                        "reference face); the overall score uses ArcFace's face")
+        core.apply_scale(rows, scale, face_weight, body_weight, gold_select)
+        summary = core.summarize(rows, scale, face_weight, body_weight, gold_select)
         text = core.summary_text(summary, refs)
         details = core.details_text(rows)
         log.info("RulzTrainer likeness: %s | %s (%.1fs)\n%s", text.replace("\n", " | "), scale.describe(),
                  time.time() - t0, details)
         report = {"rows": rows, "summary": summary, "scale": scale, "refs": refs, "baseline": base_rows}
-        return (report, text, details, _f(summary["overall"]), _f(summary["face"]), _f(summary["body"]))
+        return (report, text, details, _f(summary["overall"]), _f(summary["face"]), _f(summary["body"]),
+                _f(summary["gold"]))
 
 
 class RZLikenessExport:
