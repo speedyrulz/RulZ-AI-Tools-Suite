@@ -193,7 +193,7 @@ class RaceParallelMixin:
         """One optimizer step for every lane at the same moment: the batches of each, one model copy per GPU in
         threads, then each configuration's own optimizer step."""
         from .dataset import load_batch
-        from .trainer import current_lr, draw_sigmas, free_cuda
+        from .trainer import current_lr, draw_sigmas, free_cuda, step_grad_norm
 
         t_step = time.perf_counter()
         while True:
@@ -218,7 +218,8 @@ class RaceParallelMixin:
                     shift = st["ts_logit_shift"] + (self._clean_offset(  # clean_share: the epoch's share
                         cfg, st["step"], tok, st.get("batcher"), cfg.batch_size * cfg.gradient_accumulation)
                         if cfg.clean_share else 0.0)
-                    sigma, step_sigma = draw_sigmas(cfg, latents.shape[0], st["gen"], shift, tok, self.arch, step_sigma)
+                    sigma, step_sigma = draw_sigmas(cfg, latents.shape[0], st["gen"], shift, tok, self.arch, step_sigma,
+                                                    st.get("ts_strata"))
                     sigmas.setdefault(v.idx, []).append(sigma)
                     noise = torch.randn(latents.shape, generator=st["gen"])
                     per_rep[k].append((self.replicas[reps[k]], batch, latents, embeds, mask, sigma, noise, regions,
@@ -249,8 +250,7 @@ class RaceParallelMixin:
         for v, reps in lanes:
             st, cfg = v.state, v.cfg
             race_mod.collect_grads(v, [self.replicas[r][1] for r in reps])
-            if cfg.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(st["params"], cfg.max_grad_norm)
+            grad_norm = step_grad_norm(st["params"], cfg.max_grad_norm)
             observe = getattr(st["optimizer"], "observe", None)
             if observe is not None:  # Keel: the step's noise levels (its bands)
                 for s in sigmas.get(v.idx, ()):
@@ -264,11 +264,14 @@ class RaceParallelMixin:
                 race_mod.attach(v, self.replicas[r][1])
             st["step"] += 1
             st["losses"].append(by_lane[v.idx])
+            st["grad_norms"].append(grad_norm)
         self.rp_done += len(lanes)
         self.rp_times.append(wall)
         self._rp_log(lanes, by_lane, current_lr)
 
     def _rp_log(self, lanes, by_lane, current_lr) -> None:
+        from .trainer import format_grad_norm, round_norms
+
         elapsed = time.time() - self.rp_t0
         total = self.race.estimate["total"]
         eta = elapsed / max(1, self.rp_done) * max(0, total - self.rp_done)
@@ -280,12 +283,14 @@ class RaceParallelMixin:
             if st["step"] % 5 == 0 or self.rp_done <= len(lanes):
                 last = self.rp_times[-5:]
                 where = "+".join(str(self.replicas[r][2]) for r in reps)
-                log.info("[%s] step %d/%d loss %.4f avg %.4f lr %.2e on %s %.1fs/it (last %d steps %.2fs each)",
-                         v.name, st["step"], v.cfg.steps, by_lane[v.idx], avg, lr_now, where,
+                log.info("[%s] step %d/%d loss %.4f avg %.4f lr %.2e grad %s on %s %.1fs/it (last %d steps %.2fs "
+                         "each)", v.name, st["step"], v.cfg.steps, by_lane[v.idx], avg, lr_now,
+                         format_grad_norm(st["grad_norms"][-1], v.cfg.max_grad_norm), where,
                          elapsed / max(1, len(self.rp_times)), len(last), sum(last) / len(last))
             if k == 0:  # the Monitor's loss chart follows the first lane
                 self.status.update(step=self.rp_done, total=total, loss=by_lane[v.idx], avg_loss=avg, elapsed=elapsed,
-                                   eta=eta, lr=lr_now, losses=losses[-2000:],
+                                   eta=eta, lr=lr_now, losses=losses[-2000:], grad_norm=st["grad_norms"][-1],
+                                   grad_norms=round_norms(st["grad_norms"][-2000:]), grad_clip=v.cfg.max_grad_norm,
                                    step_times=[round(t, 3) for t in self.rp_times[-2000:]], race=self._race_status(),
                                    race_step=st["step"])
 
