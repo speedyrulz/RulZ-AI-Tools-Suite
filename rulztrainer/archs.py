@@ -60,6 +60,15 @@ class Arch:
     def get_text_encoder(self, cfg: TrainConfig, model_dir: Path | None): ...
     def load_any_transformer(self, path: str, device, quant: str = "auto", models_dir: str = "models"): ...
     def encode_prompt(self, text_encoder, tokenizer, prompt: str, max_length: int) -> torch.Tensor: ...
+
+    def encode_prompts(self, text_encoder, tokenizer, prompts: list[str], max_length: int) -> list[torch.Tensor]:
+        """encode_prompt for several prompts in one text-encoder forward (right-padded; each row cut back to its own
+        length), when the family's loading module has a batched encoder; one prompt at a time otherwise."""
+        batched = getattr(getattr(self, "_loading", None), "encode_prompts", None)
+        if batched is None:
+            return [self.encode_prompt(text_encoder, tokenizer, p, max_length) for p in prompts]
+        return batched(text_encoder, tokenizer, prompts, max_length)
+
     def pad_embeds(self, rows: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]: ...
 
     def get_tokenizer(self, cfg: TrainConfig, model_dir: Path | None):

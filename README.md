@@ -85,7 +85,11 @@ is kept per browser (its local storage).
    "Training resolutions and resolution step-up" below.
 2. **Model**: choose `MOSS-Image-Base` or `MOSS-Image-SFT` (or a custom local directory / HF repo id).
    *Download / verify model* fetches about 30 GB into `models/`.
-3. **Start training**. The *Monitor* tab shows progress, loss curve, log tail and sample images. Training runs
+3. **Start training**. Before it starts, the Train tab lists the usual mistakes, with *Start anyway* (never a
+   block): images with no caption, captions that already hold the trigger word (it is put at the start of every
+   caption, so they would have it twice) and a learning rate well outside the usual range (a third of the lowest to
+   three times the highest of the recipes: LoRA 5e-5 to 2e-4, full fine-tune 1e-5; self-tuning optimizers are not
+   checked). The wizard's review lists the same. The *Monitor* tab shows progress, loss curve, log tail and sample images. Training runs
    as its own process: reloading or closing the page, opening it from another browser, or restarting the
    WebUI does not stop it, and the page reconnects to the running job (it opens on *Monitor* and loads the
    job's settings into the form). *Stop (save)* and *Kill* work on a reconnected job too.
@@ -216,6 +220,11 @@ variable is then unnecessary.
   latents (2x2 patchified, batch-norm normalized exactly as the reference pipeline does), and the
   Qwen3.5-9B text encoder embeds every caption through the chat template. Both are cached under
   `<dataset>/.rulz_cache`, then the encoders are unloaded. Training only holds the DiT and the LoRA.
+  Captions are encoded up to 16 at a time (after AI-Toolkit), shortest first so a batch pads little, and at most
+  about 4,000 padded tokens per pass, so long captions go fewer at a time. One prompt at a time leaves a big text
+  encoder waiting on kernel launches most of the time. Each caption is padded on the right and cut back to its own
+  length, which gives it the same features as encoding it alone (the text encoders are causal), for every model.
+  A batch that runs out of GPU memory is split in half and retried.
 - **Timesteps.** `logit_normal` (mean/std), `sigmoid` (scale) or `uniform`, with an optional `timestep_shift`.
   `logsnr` is the style-friendly sampler ([arXiv 2411.14793](https://arxiv.org/abs/2411.14793), via musubi-tuner):
   the log signal-to-noise ratio is drawn from N(`logsnr_mean`, `logsnr_std`), -6 and 2 as the paper recommends, so
@@ -240,23 +249,42 @@ variable is then unnecessary.
     curve (`timestep_sampling: reference`) about 11%.
   - **How it hits the target.** The sampled curve is moved along the logit axis until the share is hit after
     `timestep_shift`, `sigma_min` / `sigma_max` and the 1000-step grid; its shape stays. The run logs each change.
-  - **Notation** (Fizgig's; percentages, and 1-based epochs of the run's image queue):
+  - **Notation** (Fizgig's; percentages, and 1-based epochs of the run's image queue, or rotations of a full
+    fine-tune):
 
     | Value | Meaning |
     |---|---|
     | `40` | 40% all run |
     | `75:5:40` | 75% for 5 epochs, then 40% |
     | `60:7:30:15` | 60% until epoch 7, sliding in a straight line to 30% by epoch 15 |
-    | `60:7:30:15:2` | the same, plus one epoch in 2 after that back at 60% (Fizgig's MOSS default, the WebUI's *Slide* button) |
+    | `60:7:30:8:3` | 60% until epoch 7, 30% at epoch 8, then 60% with every 3rd epoch at 30% at half the learning rate (Fizgig's MOSS default, the WebUI's *Slide* button) |
+    | `11:4:30:8:2` | a full fine-tune's: the model's own ~11% until rotation 4, sliding to 30% by rotation 8, then 30% with every 2nd rotation at 11% at half the learning rate (*Slide FT*) |
+
+  - **The fifth number.** After the slide, every epoch trains at the higher of the two shares and every Nth one at
+    the lower, whichever share comes first, at half the learning rate: those epochs reset structure, but at the full
+    rate they cost likeness each time. A full fine-tune counts rotations (a cycle of every window), so each window
+    of a rotation trains at the same share whatever the card holds.
 
   - **What Fizgig measured.** On MOSS-Image, against MOSS's own ~11% curve and on its hardest dataset, Slide was the
     best of eight schedules. It led from epoch 12 and still held 71% likeness at epoch 60. A sudden drop from 75% to
-    40% dipped likeness two epochs later.
-  - **Unmeasured here.** RulzTrainer's default already starts at 50%, so race `clean_share: "60:7:30:15:2"` against
+    40% dipped likeness two epochs later. `60:7:30:8:3` then held likeness about 5 points over `60:7:30:15:2` from
+    epoch 9 to 20 on a 53-photo dataset.
+  - **Unmeasured here.** RulzTrainer's default already starts at 50%, so race `clean_share: "60:7:30:8:3"` against
     `""` on your own data. It works with every model and timestep mode.
 - **Flow matching loss.** `x_t = (1 - sigma) x0 + sigma * noise`, target `noise - x0`, timestep = `sigma * 1000`,
   sigmas snapped to the model's 1000-step training grid. Default sampling is logit-normal; `timestep_shift`
   is available.
+- **Band loss** (`loss_type: band`, experimental, after AI-Toolkit; the default is `mse`). The error is split into
+  fine-to-coarse detail bands (a Laplacian pyramid over the latent), and each band is weighted by how much of it the
+  noise left visible at that step: `snr_k / (1 + snr_k)`, where `snr_k` is the step's signal-to-noise ratio times the
+  band's power in the clean latents over its power in the noise (measured on the batch).
+  - Near sigma 0 every weight is 1, so it is plain MSE.
+  - At high sigma the fine bands the noise has buried drop out instead of adding gradient noise; coarse shapes still
+    train.
+  - It never weighs more than MSE, so the loss value runs lower (most at high noise) and is not comparable with an
+    MSE run's. Judge it by samples and probes.
+  - Unmeasured here: race `loss_type: band` against `mse` (it is a race setting). It works with region weights,
+    loss weighting and every model.
 - **LoRA** on the DiT attention and FFN projections (`q, k, v, o, ffn_up_gate, ffn_down`) in all 42 blocks, or
   only the blocks you pick (`lora_blocks`, e.g. `21-41`, `10-31,40`, `even`; the UI has a per-block toggle grid
   with presets). Blocks without LoRA get no backward pass if they sit before the first trained block, so
@@ -334,7 +362,7 @@ Measured with data parallel on an RTX 5060 Ti + RTX 4060 Ti (8 images, 512 px, 8
 | Latent cache, 8 images + flips | 5.6 s | 1.9 s |
 | SAM 3 region masks, 8 images | 16 s (was 28 s before SAM 3 stayed resident) | 9 s |
 
-Text caching is only split when it pays: the first few prompts are timed on the loaded encoder, and a second copy
+Text caching is only split when it pays: the first three batches are timed on the loaded encoder, and a second copy
 is loaded only if it saves more time than loading it takes (about 13 s for the int8 Qwen3.5-9B). Images rendered on
 different GPU models differ very slightly in their pixels (different kernels); the same seed gives the same picture.
 
@@ -2490,6 +2518,7 @@ rulztrainer/
   quant.py         int8 / int8_convrot / nvfp4 weight quantization matching comfy_kitchen, QuantLinear
   sampler.py       flow-matching Euler sampler (reference schedule)
   trainer.py       training loop, saving, sampling, status.json for the UI
+  losses.py        the per-element training loss: MSE or band loss (loss_type)
   checkpointing.py selective gradient checkpointing (which blocks keep their activations)
   ema.py           weight average (EMA) of the LoRA for saves, samples and probes
   posthoc_ema.py   post-hoc EMA: a moving average of a finished run's checkpoints (scripts/posthoc_ema.py)

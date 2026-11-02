@@ -30,15 +30,16 @@ from .config import AUTOMAGIC, KEEL, TrainConfig, keel_band_weights, keel_consen
 from .config import side_to_mp
 from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, describe_sides, dropout_text_path,
                       items_for_side, load_batch,
-                      scan_dataset, text_cache_path)
+                      scan_dataset, text_cache_path, TEXT_BATCH)
 from .archs import detect_arch, get_arch
 from .idloss import effective_weight as idloss_weight
+from .losses import elementwise_loss
 from .race_parallel import RaceParallelMixin
 from .multigpu import (Balancer, choose_counts, clone_to, compile_count, job_order, no_recompile_stance, norm_device,
                        run_queue, stance_available, step_seconds)
 log = logging.getLogger("rulztrainer")
 DP_COMPILE_QUIET_STEPS = 3  # data parallel + compile: serial steps without a new graph before going parallel
-TEXT_TIMING_PROMPTS = 4  # prompts encoded on the first copy to time it before deciding on a second copy
+TEXT_TIMING_PROMPTS = 3 * TEXT_BATCH  # prompts (three batches) timed on the first copy before deciding on a second
 
 
 @dataclass
@@ -797,7 +798,7 @@ class Trainer(RaceParallelMixin):
                     log.warning("LoRA Isolation: %s", warn)
             cache_text(items, cfg, te, tok, extra_prompts=prompts,
                        progress=lambda i, n: self.status.update(step=i, total=n),
-                       encoders=encoders if len(encoders) > 1 else None, encode_fn=self.arch.encode_prompt)
+                       encoders=encoders if len(encoders) > 1 else None, encode_batch_fn=self.arch.encode_prompts)
             log.info("Text caching took %.1fs", time.time() - t0)
             for enc in encoders:
                 unload_model(enc[0])
@@ -828,12 +829,13 @@ class Trainer(RaceParallelMixin):
             return primary
         if len(todo) <= TEXT_TIMING_PROMPTS * 2:
             return primary
-        stamps = [time.time()]
+        stamps = [(time.time(), 0)]  # (time, prompts done) after each batch
         cache_text(items, self.cfg, te, tok, extra_prompts=prompts, max_prompts=TEXT_TIMING_PROMPTS,
-                   progress=lambda i, n: (stamps.append(time.time()), self.status.update(step=i, total=len(todo))),
-                   encode_fn=self.arch.encode_prompt)
-        per_prompt = (stamps[-1] - stamps[1]) / max(1, len(stamps) - 2)  # skips the first (warm-up) prompt
-        warm_up = max(0.0, stamps[1] - stamps[0] - per_prompt)  # first-call cost, which a new copy pays again
+                   progress=lambda i, n: (stamps.append((time.time(), i)), self.status.update(step=i, total=len(todo))),
+                   encode_batch_fn=self.arch.encode_prompts)
+        (t0, _), (t1, n1), (t_end, n_end) = stamps[0], stamps[min(1, len(stamps) - 1)], stamps[-1]
+        per_prompt = (t_end - t1) / max(1, n_end - n1)  # skips the first (warm-up) batch
+        warm_up = max(0.0, t1 - t0 - per_prompt * n1)  # first-call cost, which a new copy pays again
         cost = load_seconds + warm_up
         remaining = len(todo) - TEXT_TIMING_PROMPTS
         saved = remaining * per_prompt * (1 - 1 / len(devices))
@@ -1186,7 +1188,7 @@ class Trainer(RaceParallelMixin):
                 aux = self._alignment_losses(cfg, taps, batch, regions, use_attn, use_align)
             elif use_face:
                 taps.stop()
-            sq = (pred - target).pow(2)
+            sq = elementwise_loss(cfg.loss_type, pred, target, latents, noise, sigma)
             if regions is not None and cfg.region_weights:  # region-weighted loss: face > person > background (mean 1)
                 sq = sq * regions.weight.to(rdev)
             per = sq.mean(dim=(1, 2, 3))
@@ -1356,6 +1358,8 @@ class Trainer(RaceParallelMixin):
             if gather is not None:  # Keel: the micro-batch sums join the replicas' on p.grad for the clip
                 gather()
             grad_norm = step_grad_norm(params, cfg.max_grad_norm)
+            step_lr_mult *= self._clean_lr_scale(  # clean_share: half the lr on the lower-share epochs
+                cfg, step, self.batcher, cfg.batch_size * cfg.gradient_accumulation * n_dev)
             if step_lr_mult != 1.0:  # true per-image lr: scale this step only (the scheduler restores it)
                 saved_lrs = [g["lr"] for g in optimizer.param_groups]
                 for g in optimizer.param_groups:
@@ -2754,18 +2758,39 @@ class Trainer(RaceParallelMixin):
             size = cache[id(batcher)] = max(1, sum(max(1, int(it.repeats or 1)) for it in batcher.items))
         return size
 
-    def _clean_offset(self, cfg, steps_done: int, tokens: int, batcher, images_per_step: int) -> float:
-        """clean_share: the logit offset that puts the epoch's clean-end share of steps below sigma 0.5 (0 when
-        unset). One schedule per configuration (a race has several)."""
+    def _clean_schedule(self, cfg, batcher, images_per_step: int):
+        """clean_share: (the configuration's schedule, the images in one of its epochs), or None when unset. One
+        schedule per configuration (a race has several). A full fine-tune counts rotations: a cycle of every window."""
         if not cfg.clean_share or batcher is None:
-            return 0.0
+            return None
         from .clean_share import CleanShare
 
         shares = self.__dict__.setdefault("_clean_shares", {})
         cs = shares.get(id(cfg))
         if cs is None:
             cs = shares[id(cfg)] = CleanShare(cfg, self.arch, log)
-        return cs.offset(steps_done * images_per_step, self._epoch_images(batcher), tokens)
+        ft = self.__dict__.get("ft")
+        if ft is not None and ft.windows:
+            cs.unit = "rotation"
+            return cs, self.ft_rotate_steps * len(ft.windows) * images_per_step
+        return cs, self._epoch_images(batcher)
+
+    def _clean_offset(self, cfg, steps_done: int, tokens: int, batcher, images_per_step: int) -> float:
+        """clean_share: the logit offset that puts the epoch's clean-end share of steps below sigma 0.5 (0 when
+        unset)."""
+        sched = self._clean_schedule(cfg, batcher, images_per_step)
+        if sched is None:
+            return 0.0
+        cs, unit_images = sched
+        return cs.offset(steps_done * images_per_step, unit_images, tokens)
+
+    def _clean_lr_scale(self, cfg, steps_done: int, batcher, images_per_step: int) -> float:
+        """clean_share: half the learning rate on the lower-share epochs after the slide, else 1."""
+        sched = self._clean_schedule(cfg, batcher, images_per_step)
+        if sched is None:
+            return 1.0
+        cs, unit_images = sched
+        return cs.lr_scale(steps_done * images_per_step, unit_images)
 
     def _look_outlier_images(self, cfg, items) -> set[str]:
         """look_warmup: the images (as the items name them) that the look consistency filter's saved scan puts under

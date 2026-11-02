@@ -152,3 +152,30 @@ def test_race_probe_chart_names_each_configuration():
     assert len(set(colors.values())) == 3  # one colour per configuration
     single, legend1 = webui.probe_chart_series(probes[:1], [])  # one run: the lines and the per-probe dots
     assert legend1 == ["face", "body", "combined", "face (probe)", "body (probe)"] and single[0]["data"] == [[100, 5.0]]
+
+
+def test_start_warnings(tmp_path):
+    ds = tmp_path / "anna"
+    _img(ds / "a.png", "ohwx woman, smiling")  # already holds the trigger
+    _img(ds / "b.png", "a woman in a red coat")
+    _img(ds / "c.png")  # no caption
+    cfg = TrainConfig(dataset_dir=str(ds), trigger_word="ohwx")
+    warns = webui.start_warnings(cfg)
+    assert any("1 of 3 images have no caption" in w and "trigger word alone" in w for w in warns)
+    assert any("1 of 3 captions already hold the trigger word (ohwx)" in w for w in warns)
+    assert not any("Learning rate" in w for w in warns)  # 1e-4: usual for a LoRA
+    # the trigger as a whole word only: "ohwxy" is not "ohwx"
+    (ds / "a.txt").write_text("ohwxy woman", encoding="utf-8")
+    assert not any("already hold" in w for w in webui.start_warnings(cfg))
+    # a learning rate well outside the usual range warns, a self-tuning optimizer never
+    assert any("Learning rate 0.002" in w and "burnt" in w
+               for w in webui.start_warnings(TrainConfig(dataset_dir=str(ds), learning_rate=2e-3)))
+    assert any("very slowly" in w for w in webui.start_warnings(TrainConfig(dataset_dir=str(ds), learning_rate=1e-6)))
+    assert not any("Learning rate" in w for w in webui.start_warnings(
+        TrainConfig(dataset_dir=str(ds), learning_rate=2e-3, optimizer="automagic4")))
+    assert any("a full fine-tune" in w for w in webui.start_warnings(
+        TrainConfig(dataset_dir=str(ds), finetune=True, learning_rate=1e-4)))
+    # the wizard's review lists them as warnings
+    (ds / "a.txt").write_text("ohwx woman, smiling", encoding="utf-8")
+    issues = webui.review_issues(cfg, None, {"images": 3, "captioned": 2}, 1)
+    assert sum(1 for kind, _ in issues if kind == "warning" and ("caption" in _)) >= 2

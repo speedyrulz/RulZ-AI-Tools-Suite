@@ -140,19 +140,26 @@ def _input_device(model) -> torch.device:
 
 
 @torch.no_grad()
+def encode_prompts(text_encoder, tokenizer, prompts: list[str], max_length: int = MAX_TEXT_TOKENS) -> list[torch.Tensor]:
+    """Text features for each prompt: [S_i, 12, 2560] bf16 on the CPU (see the module docstring), in one forward."""
+    length = min(int(max_length), MAX_TEXT_TOKENS)
+    suffix = tokenizer([PROMPT_SUFFIX], return_tensors="pt").input_ids[0]
+    rows = [torch.cat([tokenizer([PROMPT_PREFIX + prompt], truncation=True,
+                                 max_length=length + PREFIX_TOKENS - SUFFIX_TOKENS, return_tensors="pt").input_ids[0],
+                       suffix]) for prompt in prompts]
+    ids, mask = moss_loading.right_pad(rows)
+    device = _input_device(text_encoder)
+    b, n = ids.shape
+    position_ids = torch.arange(n, device=device).view(1, 1, n).expand(3, b, n)
+    out = text_encoder(input_ids=ids.to(device), attention_mask=mask.to(device), position_ids=position_ids,
+                       output_hidden_states=True)
+    hidden = torch.stack([out.hidden_states[i] for i in SELECT_LAYERS], dim=2).to(torch.bfloat16).cpu()
+    return [hidden[i, PREFIX_TOKENS: r.numel()].clone() for i, r in enumerate(rows)]
+
+
 def encode_prompt(text_encoder, tokenizer, prompt: str, max_length: int = MAX_TEXT_TOKENS) -> torch.Tensor:
     """Text features for one prompt: [S, 12, 2560] bf16 on the CPU (see the module docstring)."""
-    length = min(int(max_length), MAX_TEXT_TOKENS)
-    ids = tokenizer([PROMPT_PREFIX + prompt], truncation=True, max_length=length + PREFIX_TOKENS - SUFFIX_TOKENS,
-                    return_tensors="pt").input_ids
-    suffix = tokenizer([PROMPT_SUFFIX], return_tensors="pt").input_ids
-    input_ids = torch.cat([ids, suffix], dim=1).to(_input_device(text_encoder))
-    n = input_ids.shape[1]
-    position_ids = torch.arange(n, device=input_ids.device).view(1, 1, n).expand(3, 1, n)
-    out = text_encoder(input_ids=input_ids, attention_mask=torch.ones_like(input_ids), position_ids=position_ids,
-                       output_hidden_states=True)
-    hidden = torch.stack([out.hidden_states[i] for i in SELECT_LAYERS], dim=2)
-    return hidden[0, PREFIX_TOKENS:].to(torch.bfloat16).cpu()
+    return encode_prompts(text_encoder, tokenizer, [prompt], max_length)[0]
 
 
 def get_tokenizer(cfg: TrainConfig, model_dir: Path | None):

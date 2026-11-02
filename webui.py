@@ -1284,6 +1284,7 @@ class Form:
             block_swap=int(v("block_swap") or 0),
             clean_share=str(v("clean_share") or "").strip(),
             logit_mean=float(v("logit_mean")), logit_std=float(v("logit_std")), loss_weighting=v("loss_weighting"),
+            loss_type=v("loss_type") or "mse",
             save_every=int(v("save_every")), keep_checkpoints=int(v("keep_checkpoints") or 0),
             sample_every=int(v("sample_every")), sample_prompts=prompts,
             reward_steps=int(v("reward_steps") or 0), reward_lr=float(v("reward_lr") or 2e-5),
@@ -1757,7 +1758,8 @@ def theme_colors() -> None:
               positive="#22C55E", negative="#FF453A", info="#3F3F46", warning="#F59E0B")
 
 
-CLEAN_SLIDE = "60:7:30:15:2"  # Fizgig's MOSS-Image Slide (rulztrainer.clean_share.SLIDE)
+CLEAN_SLIDE = "60:7:30:8:3"  # Fizgig's MOSS-Image Slide (rulztrainer.clean_share.SLIDE)
+CLEAN_SLIDE_FT = "11:4:30:8:2"  # its full fine-tune default, in rotations (rulztrainer.clean_share.FT_SLIDE)
 
 
 def parse_ranks(text) -> list[int]:
@@ -1789,10 +1791,12 @@ def clean_share_hint(form) -> str:
     first, until, rest, end, every = schedule
     if first == rest:
         return text + f" With the schedule: {first:g}% all run."
-    plan = (f"{first:g}% until epoch {until:g}, then {rest:g}%" if end <= until else
-            f"{first:g}% until epoch {until:g}, sliding to {rest:g}% by epoch {end:g}")
-    again = (f", and after that one epoch in {every} back at {first:g}%" if every > 1 else
-             f", and after that {first:g}% again" if every == 1 else "")
+    unit = "rotation" if cfg.finetune else "epoch"
+    plan = (f"{first:g}% until {unit} {until:g}, then {rest:g}%" if end <= until else
+            f"{first:g}% until {unit} {until:g}, sliding to {rest:g}% by {unit} {end:g}")
+    hi, lo = max(first, rest), min(first, rest)
+    nth = {1: "", 2: "2nd ", 3: "3rd "}.get(every, f"{every}th ")
+    again = (f", then {hi:g}% with every {nth}{unit} at {lo:g}% at half the learning rate" if every > 0 else "")
     return text + " With the schedule: " + plan + again + "."
 
 
@@ -2886,6 +2890,7 @@ RACE_LABELS = {
     "keel_face_gain": "Keel face gain", "keel_face_gain_max": "Keel face gain limit",
     "keel_face_gain_beta": "Keel face gain EMA", "keel_body_weight": "Keel body weight",
     "lora_ema": "Weight average", "timestep_sampling": "Timestep sampling", "loss_weighting": "Loss weighting",
+    "loss_type": "Loss type",
     "region_weights": "Region-weighted loss", "face_loss_weight": "Face loss weight",
     "body_loss_weight": "Body loss weight", "background_loss_weight": "Background loss weight",
     "id_loss_weight": "Identity loss weight", "attn_localize": "Trigger attention on the subject",
@@ -3476,6 +3481,64 @@ def datasets_line(cfg: TrainConfig, data: dict | None) -> str:
             f"{data.get('captioned', '?')} captioned")
 
 
+# the usual learning rates, from the recipes the wizard recommends (LoRA: 5e-5 to 2e-4, full fine-tune: 1e-5); a third
+# of the lowest to three times the highest counts as usual (after Fizgig's Start checks)
+LR_USUAL = {"lora": (5e-5, 2e-4), "finetune": (1e-5, 1e-5)}
+
+
+def start_warnings(cfg: TrainConfig) -> list[str]:
+    """The usual mistakes, said before a run starts (never a block): images with no caption, captions that already
+    hold the trigger word (RulzTrainer puts it at the start of every caption, so it would be there twice) and a
+    learning rate well outside the model's usual range."""
+    import re
+
+    from rulztrainer.archs import get_arch
+
+    out = []
+    try:
+        arch = get_arch(cfg)
+    except (ValueError, NotImplementedError):
+        arch = None
+    missing = doubled = images = 0
+    doubled_words = set()
+    for sp in cfg.dataset_specs():
+        if not sp.path or not Path(sp.path).is_dir():
+            continue
+        trigger = (sp.trigger or cfg.trigger_word or "").strip()
+        pattern = re.compile(rf"(?<!\w){re.escape(trigger)}(?!\w)", re.IGNORECASE) if trigger else None
+        for img in list_dataset_images(sp.path):
+            images += 1
+            cap = arch.caption_file(img, cfg) if arch is not None else img.with_suffix(cfg.caption_ext)
+            if not cap.is_file():
+                missing += not _captioned(img)
+                continue
+            if pattern is not None:
+                try:
+                    text = cap.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                if pattern.search(text):
+                    doubled += 1
+                    doubled_words.add(trigger)
+    if missing:
+        out.append(f"{missing} of {images} images have no caption: they train on "
+                   + ("the trigger word alone." if cfg.trigger_word else "an empty prompt."))
+    if doubled:
+        out.append(f"{doubled} of {images} captions already hold the trigger word ({', '.join(sorted(doubled_words))}). "
+                   "RulzTrainer puts it at the start of every caption, so those captions have it twice: take it "
+                   "out of the caption files, or clear the trigger word.")
+    kind = "finetune" if cfg.finetune else "lora" if cfg.network_type == "lora" else None
+    if kind and cfg.optimizer not in AUTOMAGIC and cfg.learning_rate > 0:
+        lo, hi = LR_USUAL[kind]
+        if not lo / 3 <= cfg.learning_rate <= hi * 3:
+            usual = f"{lo:g}" if lo == hi else f"{lo:g} to {hi:g}"
+            out.append(f"Learning rate {cfg.learning_rate:g} is well outside the usual {usual} for "
+                       f"{'a full fine-tune' if cfg.finetune else 'a LoRA'}: "
+                       + ("expect burnt, noisy samples." if cfg.learning_rate > hi * 3 else
+                          "expect it to learn very slowly."))
+    return out
+
+
 def review_issues(cfg: TrainConfig, goal: str | None, data: dict | None, n_gpus: int) -> list[tuple[str, str]]:
     """What the wizard's last step points out before starting: (error | warning | info, text)."""
     out: list[tuple[str, str]] = []
@@ -3490,9 +3553,8 @@ def review_issues(cfg: TrainConfig, goal: str | None, data: dict | None, n_gpus:
     elif data is not None:
         if not data["images"]:
             out.append(("error", "The datasets have no images (png, jpg, webp or bmp)."))
-        elif data["captioned"] < data["images"] and not cfg.trigger_word:
-            out.append(("warning", f"{data['images'] - data['captioned']} of {data['images']} images have no caption "
-                                   "and there is no trigger word, so they train on an empty prompt."))
+        else:
+            out += [("warning", w) for w in start_warnings(cfg)]
     try:
         cfg.validate()
     except ValueError as e:
@@ -5335,10 +5397,26 @@ def build_page(local: bool = True):
         ui.notify(status_msg.text, type="positive" if ok else "warning")
         return ok
 
-    def start_job() -> bool:
+    async def start_job(confirm: bool = True) -> bool:
+        """Start from the form; the usual mistakes (start_warnings) first ask Start anyway, unless the caller showed
+        them already (the wizard's review)."""
         cfg = form_config()
         if cfg is None:
             return False
+        warnings = await run.io_bound(start_warnings, cfg) if confirm else []
+        if warnings:
+            with ui.dialog() as dlg, ui.card().classes("w-[36rem] max-w-full"):
+                ui.label("Before you start").classes("text-base font-medium")
+                for w in warnings:
+                    ui.label(w).classes("rz-banner warning")
+                with ui.row().classes("w-full justify-end gap-2"):
+                    ui.button("Cancel", on_click=lambda: dlg.submit(False)).props("flat")
+                    ui.button("Start anyway", icon="play_arrow", on_click=lambda: dlg.submit(True)) \
+                        .props("unelevated")
+            go = await dlg
+            dlg.delete()
+            if not go:
+                return False
         status_msg.text = start_training(cfg)
         started = status_msg.text.startswith("Started")
         ui.notify(status_msg.text, type="positive" if started else "warning")
@@ -6199,6 +6277,12 @@ def build_page(local: bool = True):
                                     .classes("w-44")
                                 w["loss_weighting"] = ui.select(["none", "min_snr", "sigma_sqrt"], value="none",
                                                                 label="Loss weighting").classes("w-40")
+                                w["loss_type"] = ui.select(["mse", "band"], value=d.loss_type, label="Loss type")                                     .classes("w-32")                                     .tooltip("mse: the plain loss. band (experimental, from AI-Toolkit): splits each "
+                                             "error into fine-to-coarse detail bands and drops the bands the noise "
+                                             "has buried at that step, so very noisy steps stop pushing on details "
+                                             "nobody could see. Near no noise it is the same as mse. Its loss value "
+                                             "runs lower than mse (most at high noise): compare runs by samples and "
+                                             "probes, not by the loss. A race can try both.")
                             with fields():
                                 w["timestep_sampling"] = ui.select(["logit_normal", "sigmoid", "uniform", "identity",
                                                                     "content", "style", "logsnr", "reference"],
@@ -6247,11 +6331,15 @@ def build_page(local: bool = True):
                                     .classes("w-64").tooltip(
                                         "The share of training steps at the clean end (noise below half), where faces "
                                         "and fine detail are refined; the sampling curve above is moved to hit it. "
-                                        "40 = 40% all run. 75:5:40 = 75% for 5 epochs, then 40%. 60:7:30:15:2 = "
-                                        "Fizgig's MOSS-Image Slide: 60% until epoch 7, down to 30% by epoch 15, and "
-                                        "every 2nd epoch after that one epoch at 60% again.")
+                                        "40 = 40% all run. 75:5:40 = 75% for 5 epochs, then 40%. 60:7:30:8:3 = "
+                                        "Fizgig's MOSS-Image Slide: 60% until epoch 7, 30% at epoch 8, then 60% with "
+                                        "every 3rd epoch at 30%, at half the learning rate. A full fine-tune counts "
+                                        "rotations instead of epochs (Slide FT: 11:4:30:8:2).")
                                 ui.button("Slide", on_click=lambda: w["clean_share"].set_value(CLEAN_SLIDE)) \
-                                    .props("flat dense").tooltip("Fizgig's MOSS-Image default, 60:7:30:15:2")
+                                    .props("flat dense").tooltip("Fizgig's MOSS-Image LoRA default, 60:7:30:8:3")
+                                ui.button("Slide FT", on_click=lambda: w["clean_share"].set_value(CLEAN_SLIDE_FT)) \
+                                    .props("flat dense").tooltip("Fizgig's MOSS-Image full fine-tune default, "
+                                                                 "11:4:30:8:2 (rotations)")
                                 clean_hint = hint("")
 
                                 def clean_hint_update(_=None):
@@ -7284,7 +7372,7 @@ def build_page(local: bool = True):
 
         # ------------------------------------------------------------ Wizard (bound to the Train tab's widgets)
         with ui.tab_panel(tab_wizard):
-            Wizard(f, gpus, start_job, goto, queue_job).build()
+            Wizard(f, gpus, lambda: start_job(confirm=False), goto, queue_job).build()  # its review lists the warnings
 
         # ------------------------------------------------------------ Dataset
         with ui.tab_panel(tab_dataset):

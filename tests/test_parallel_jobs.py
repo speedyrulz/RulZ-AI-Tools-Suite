@@ -164,17 +164,17 @@ def test_cache_text_splits_prompts_across_encoders(tmp_path, monkeypatch):
 
     used = {}
 
-    def fake_encode(te, tok, text, max_len):
-        used.setdefault(te, []).append(text)
+    def fake_encode(te, tok, texts, max_len):
+        used.setdefault(te, []).extend(texts)
         time.sleep(0.01)
-        return torch.full((2, 4096), float(len(text)), dtype=torch.bfloat16)
+        return [torch.full((2, 4096), float(len(t)), dtype=torch.bfloat16) for t in texts]
 
-    monkeypatch.setattr(loading, "encode_prompt", fake_encode)
+    monkeypatch.setattr(loading, "encode_prompts", fake_encode)
     cfg = TrainConfig(cache_dir=str(tmp_path))
     (tmp_path / "text").mkdir()  # scan_dataset creates it in a real run
     items = _items(tmp_path, 6)
     D.cache_text(items, cfg, "te0", "tok0", extra_prompts=["a probe prompt"],
-                 encoders=[("te0", "tok0", "cpu"), ("te1", "tok1", "cpu")])
+                 encoders=[("te0", "tok0", "cpu"), ("te1", "tok1", "cpu")], batch_size=2)
     assert set(used) == {"te0", "te1"}
     assert sum(len(v) for v in used.values()) == 6 + 2  # captions + empty prompt + probe prompt
     assert load_file(str(items[2].text_path))["embeds"][0, 0].item() == float(len("cap 2"))
@@ -248,7 +248,7 @@ def test_text_encoder_copy_only_when_it_pays(monkeypatch):
     loads = []
     monkeypatch.setattr(T, "cache_text", fake_cache_text)
     monkeypatch.setattr(loading, "get_text_encoder", lambda cfg, d: loads.append(cfg.text_encoder_device) or ("te2", "tok2"))
-    for n_prompts, load_s, expect in ((20, 5.0, 1), (2000, 0.1, 2)):
+    for n_prompts, load_s, expect in ((200, 5.0, 1), (2000, 0.1, 2)):
         loads.clear()
         monkeypatch.setattr(Dm, "text_jobs", lambda items, cfg, p, n=n_prompts: ({i: "x" for i in range(n)}, n))
         out = t._extra_text_encoders(te, "tok", [], [], ["cuda:0", "cuda:1"], load_s)
