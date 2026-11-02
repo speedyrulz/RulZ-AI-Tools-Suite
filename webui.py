@@ -20,7 +20,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from nicegui import app, run, ui
+from nicegui import app, background_tasks, run, ui
 
 from rulztrainer.archs import get_arch
 from rulztrainer.config import (AUTOMAGIC, KEEL, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
@@ -1586,6 +1586,7 @@ body {
 .rz-nav { position: sticky; top: 108px; width: 230px; flex-shrink: 0; gap: 1px; }
 .rz-nav-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .1em; color: var(--rz-muted); padding: 14px 12px 6px; }
 .rz-nav-title:first-child { padding-top: 2px; }
+.rz-adv-hidden { display: none !important; }
 .rz-nav-btn { width: 100%; color: var(--rz-text-2); font-weight: 500; min-height: 36px; border-left: 3px solid transparent; border-radius: 0 9px 9px 0; }
 .rz-nav-btn .q-btn__content { justify-content: flex-start; flex-wrap: nowrap; text-align: left; }
 .rz-nav-btn .q-icon { color: var(--rz-muted); font-size: 18px; }
@@ -1686,6 +1687,12 @@ body {
 .rz-choice.selected .rz-check { display: inline-flex; }
 .rz-badge { font-size: 11px; font-weight: 600; letter-spacing: .04em; padding: 1px 8px; border-radius: 999px; background: var(--rz-red); color: #fff; }
 .rz-badge.muted { background: var(--rz-badge-muted); }
+.rz-evidence { font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 999px; border: 1px solid; cursor: help; }
+.rz-evidence.others { color: var(--rz-ok-text); border-color: var(--rz-ok); }
+.rz-evidence.mixed, .rz-evidence.cost { color: var(--rz-warn-text); border-color: var(--rz-warn); }
+.rz-evidence.untested { color: var(--rz-muted); border-color: var(--rz-border-strong); }
+.rz-evidence.tool { color: var(--rz-text-2); border-color: var(--rz-border-strong); }
+.rz-exp { padding-top: 10px; padding-bottom: 10px; }
 .rz-summary { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px 24px; width: 100%; font-size: 14px; }
 .rz-summary .k { color: var(--rz-muted); }
 .rz-summary .v { color: var(--rz-text-3); overflow-wrap: anywhere; }
@@ -1876,6 +1883,7 @@ class SectionNav:
         self.buttons: list = []
         self.picker = None
         self.current = 0
+        self.group_labels: dict = {}
 
     @contextmanager
     def section(self, group: str, title: str, caption: str, icon: str):
@@ -1897,24 +1905,48 @@ class SectionNav:
             for i, (grp, title, icon, _) in enumerate(self.items):
                 if grp != group:
                     group = grp
-                    ui.label(grp).classes("rz-nav-title")
+                    self.group_labels[grp] = ui.label(grp).classes("rz-nav-title")
                 self.buttons.append(ui.button(title, icon=icon, on_click=lambda _, i=i: self.show(i), color=None)
                                     .props("flat no-caps align=left").classes("rz-nav-btn"))
         with picker_row:
             self.picker = ui.select({i: f"{grp}: {title}" for i, (grp, title, _, _) in enumerate(self.items)},
                                     value=0, label="Section", on_change=lambda e: self.show(e.value)) \
                 .classes("w-full")
-        for i, (_, _, _, box) in enumerate(self.items):
-            with box, ui.row().classes("rz-pane-foot w-full items-center no-wrap"):
-                if i > 0:
-                    ui.button(self.items[i - 1][1], icon="chevron_left", on_click=lambda _, i=i: self.show(i - 1),
-                              color=None) \
-                        .props("flat no-caps").classes("rz-pane-link")
-                ui.space()
-                if i + 1 < len(self.items):
-                    ui.button(self.items[i + 1][1], on_click=lambda _, i=i: self.show(i + 1), color=None) \
-                        .props("flat no-caps icon-right=chevron_right").classes("rz-pane-link")
+        self.foots: list = []
+        self.set_hidden(set())  # the neighbour links
         self.show(0, scroll=False)
+
+    def set_hidden(self, hidden: set[int]) -> None:
+        """Hide these sections (the Advanced switch): their list buttons, dropdown entries and the neighbour links to
+        them, which then lead to the next section shown."""
+        self.hidden = hidden
+        for i, btn in enumerate(self.buttons):
+            btn.classes(add="rz-adv-hidden") if i in hidden else btn.classes(remove="rz-adv-hidden")
+        shown = [i for i in range(len(self.items)) if i not in hidden]
+        for grp, label in self.group_labels.items():  # a group with nothing shown loses its heading too
+            if any(self.items[i][0] == grp for i in shown):
+                label.classes(remove="rz-adv-hidden")
+            else:
+                label.classes(add="rz-adv-hidden")
+        self.picker.set_options({i: f"{self.items[i][0]}: {self.items[i][1]}" for i in shown},
+                                value=self.current if self.current in shown else None)
+        for row in self.foots:
+            row.delete()
+        self.foots = []
+        for pos, i in enumerate(shown):
+            with self.items[i][3], ui.row().classes("rz-pane-foot w-full items-center no-wrap") as row:
+                if pos > 0:
+                    prev = shown[pos - 1]
+                    ui.button(self.items[prev][1], icon="chevron_left", on_click=lambda _, j=prev: self.show(j),
+                              color=None).props("flat no-caps").classes("rz-pane-link")
+                ui.space()
+                if pos + 1 < len(shown):
+                    nxt = shown[pos + 1]
+                    ui.button(self.items[nxt][1], on_click=lambda _, j=nxt: self.show(j), color=None) \
+                        .props("flat no-caps icon-right=chevron_right").classes("rz-pane-link")
+            self.foots.append(row)
+        if self.current in hidden:
+            self.show(shown[0] if shown else 0, scroll=False)
 
     def show(self, index: int, scroll: bool = True) -> None:
         if index is None:
@@ -1956,6 +1988,43 @@ def inline_descriptions(root) -> None:
         if len(text) > 240:  # long ones show three lines until clicked
             desc.classes("rz-clamp").on("click", js_handler="(e) => e.currentTarget.classList.toggle('rz-open')")
         item.bind_visibility_from(control, "visible")
+
+
+TRAIN_EXP_SECTIONS = {"LoRA Isolation": "isolation", "Configuration race": "race", "Seed soup": None,
+                      "Post-hoc EMA": None, "Probe noise check": None}  # title: the switch that keeps it shown
+TRAIN_EXP_KEYS = ("dora", "likeness_lr_control", "resolution_step_up")  # experimental rows outside an Advanced panel
+
+
+class TrainAdvanced:
+    """The Train tab's half of the Advanced switch (the wizard's is the other): off, the Advanced options panels,
+    the experimental settings and the tool sections are hidden, except those holding an experimental setting that is
+    switched on, so nothing is on out of sight."""
+
+    def __init__(self, root, sections: SectionNav, w: dict):
+        self.sections, self.w, self.on = sections, w, False
+        self.off = {ex["key"]: ex["off"] for ex in EXPERIMENTS}
+        panels = [e for e in root.descendants() if isinstance(e, ui.expansion) and "rz-advanced" in e.classes]
+        self.panels = [(p, [k for k in self.off if self.w[k] in set(p.descendants())]) for p in panels]
+        self.rows = []
+        for key in TRAIN_EXP_KEYS:
+            ctl = w[key]
+            parent = ctl.parent_slot.parent
+            self.rows.append((parent if "rz-item" in parent.classes else ctl, key))
+        for key in self.off:
+            w[key].on_value_change(lambda _: self.apply())
+
+    def is_on(self, key: str | None) -> bool:
+        return key is not None and not _same(self.w[key].value, self.off.get(key, False))
+
+    def apply(self, on: bool | None = None) -> None:
+        if on is not None:
+            self.on = bool(on)
+        for el, keep in [(p, any(self.is_on(k) for k in keys)) for p, keys in self.panels] + \
+                [(el, self.is_on(k)) for el, k in self.rows]:
+            el.classes(remove="rz-adv-hidden") if self.on or keep else el.classes(add="rz-adv-hidden")
+        self.sections.set_hidden(set() if self.on else {
+            i for i, (_, title, _, _) in enumerate(self.sections.items)
+            if title in TRAIN_EXP_SECTIONS and not self.is_on(TRAIN_EXP_SECTIONS[title])})
 
 
 def advanced(title: str = "Advanced options"):
@@ -3134,26 +3203,6 @@ def build_samples_tab(f: Form):
 
 # ---------------------------------------------------------------- wizard
 
-GOALS = {
-    "character": ("face", "Character / person",
-                  "A specific person or character. Turns on the measured identity recipe: region-weighted loss, "
-                  "close-up crops, and likeness probes that keep the best checkpoint and stop early. Then pick how "
-                  "much of the person counts: the face, the body or both."),
-    "style": ("palette", "Style",
-              "An art style, medium, lighting or look that should carry over to any subject."),
-    "concept": ("category", "Concept / object",
-                "An object, outfit, pose or idea. Also the right pick when you are not sure."),
-}
-
-# The wizard's run modes: one run, or a configuration race of several racers built on the same base setup
-RUN_MODES = {
-    "single": ("play_circle", "One run",
-               "Train the setup on these pages once."),
-    "race": ("emoji_events", "Race several setups",
-             "Train a few versions of this setup side by side, each changing only what you assign it (a learning "
-             "rate, the adapter, a seed...), and let the likeness probes pick the winner."),
-}
-
 # names for the settings a racer may change (the rest show their config name)
 RACE_LABELS = {
     "learning_rate": "Learning rate", "optimizer": "Optimizer", "weight_decay": "Weight decay",
@@ -3505,7 +3554,7 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
         subject = cfg.trigger_word or any(sp.trigger for sp in cfg.dataset_specs())
         r["isolation"] = (bool(subject), "keeps the subject's face off other people (Fizgig: strangers reading as "
                                          "the subject 48 of 50 -> 0 of 50); about 1.5-2x the training time"
-                          if subject else "needs a trigger word to isolate (Dataset step)")
+                          if subject else "needs a trigger word to isolate (Start page)")
     # training
     n = (data or {}).get("images") or 0
     if n:
@@ -3519,7 +3568,7 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
                              + (f", plus about {int(items * crops)} close-up crops" if crops else "")
                              + ("; the likeness probes can stop it earlier" if character else ""))
     else:
-        r["steps"] = (2000, "a good start; scan your dataset (Dataset step) for a number that fits it")
+        r["steps"] = (2000, "a good start; check your photos (Photos page) for a number that fits it")
     if klein and n:
         r["steps"] = (int(min(4000, max(1000, round(per_epoch * 200, -2)))),
                       f"BFL's FLUX 3 Klein recipe: 4000 steps for 20 images, about 200 epochs ({n} images here)")
@@ -3542,9 +3591,10 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
         if cfg.network_type == "lokr":
             r["lokr_factor"] = (8, "Fizgig's measured default: lower is bigger files, nothing gained above 8")
         elif cfg.network_type == "lora":
-            rank = 32 if goal == "style" else 16
-            r["lora_rank"] = (rank, "styles carry a lot of varied detail" if goal == "style"
-                              else "plenty for a character or concept; higher ranks mostly add file size")
+            rank = 32 if goal in ("style", "character") else 16
+            r["lora_rank"] = (rank, "styles carry a lot of varied detail" if goal == "style" else
+                              "the wizard's default for a person: room for a face's detail" if goal == "character"
+                              else "plenty for a concept; higher ranks mostly add file size")
             if qwen:
                 rank = 16 if goal == "style" else 8
                 r["lora_rank"] = (rank, "Fizgig's Qwen-Image 2.1 style preset" if goal == "style" else
@@ -3832,7 +3882,7 @@ def review_issues(cfg: TrainConfig, goal: str | None, data: dict | None, n_gpus:
     specs = [sp for sp in cfg.dataset_specs() if sp.path]
     missing = [sp.path for sp in specs if not Path(sp.path).is_dir()]
     if not specs:
-        out.append(("error", "No dataset picked: pick one or more (Dataset step), or create one on the Dataset tab."))
+        out.append(("error", "No dataset picked: pick one or more (Photos page), or create one on the Dataset tab."))
     elif missing:
         out.append(("error", f"Dataset folder not found: {', '.join(missing)}"))
     elif data is not None:
@@ -3890,19 +3940,19 @@ def review_issues(cfg: TrainConfig, goal: str | None, data: dict | None, n_gpus:
     if goal == "character" or cfg.preset == "identity":
         if not (cfg.face_refs or cfg.body_refs):
             out.append(("warning", "No face or body references: likeness scores, the best checkpoint and early stop "
-                                   "need them (Dataset step)."))
+                                   "need them (Photos page, Advanced)."))
         elif character_focus(cfg) != "face_only" and not cfg.body_refs:
             out.append(("info", "This focus scores the body, but there are no body references: the body probe goes "
                                 "unscored and the overall score is the face alone. Tick Body ref on full-length "
-                                "photos, or take the recommendation (Dataset step)."))
+                                "photos, or take the recommendation (Photos page, Advanced)."))
         elif character_focus(cfg) != "body_only" and not cfg.face_refs:
             out.append(("info", "This focus scores the face, but there are no face references: the face probe goes "
-                                "unscored (Dataset step)."))
+                                "unscored (Photos page, Advanced)."))
         elif (cfg.probe_every > 0 and cfg.probe_steps <= 10
               and not (cfg.turbo_lora or cfg.samples_on_distilled_model())):
             out.append(("warning", f"Probes render in {cfg.probe_steps} steps without a turbo LoRA, so they come out "
                                    "unfinished and their likeness scores mean little. Set a turbo LoRA or raise the "
-                                   "probe steps (Samples step)."))
+                                   "probe steps (Samples & probes page, Advanced)."))
     if cfg.sample_every <= 0 or not cfg.sample_prompts:
         out.append(("info", "No sample prompts (or sampling is off): there will be no preview images while training."))
     if cfg.save_every > cfg.steps:
@@ -3968,17 +4018,212 @@ def _show(widget, value) -> str:
     return text if len(text) <= 48 else text[:45] + "..."
 
 
+# The wizard's character / person setup: the focus cards shown without Advanced, the basics it puts over the identity
+# recipe, and the recommendations it takes by itself (nothing to choose: hardware, resolution, references, samples)
+WIZARD_FOCUS = ("face_focus", "face_body", "face_only")
+WIZARD_BASICS = {"network_type": "lora", "finetune": False, "lora_rank": 32, "lora_alpha": 32.0,
+                 "optimizer": "adamw8bit", "learning_rate": 1e-4}
+WIZARD_AUTO = ("multi_gpu", "dp_balance", "transformer_quant", "text_encoder_quant", "gradient_checkpointing",
+               "checkpoint_keep_blocks", "block_swap", "compile_model", "resolutions", "enable_buckets",
+               "flip_augment", "face_refs", "body_refs", "adapter_mode", "target_text_fusion", "target_attn_gate",
+               "steps", "save_every", "keep_checkpoints", "lora_ema", "sample_every", "sample_model_path",
+               "sample_steps", "sample_cfg", "probe_steps", "probe_cfg")
+
+# How well tested an experimental setting is: (badge, what the badge means)
+EVIDENCE = {
+    "others": ("Tested by others", "Someone else (usually Fizgig's likeness tests) measured a gain; RulzTrainer has "
+                                   "not repeated it yet."),
+    "mixed": ("Small or mixed result", "Measured, but the effect was small, neutral or only seen in a short test."),
+    "cost": ("Only speed tested", "Its speed and memory were measured, but not yet whether it improves the likeness."),
+    "untested": ("Not tested yet", "Built and working, but nobody has measured whether it improves the likeness. "
+                                   "A configuration race against the plain setup is the way to find out."),
+    "tool": ("Comparison tool", "Not a setting that changes the LoRA itself: a way to test settings against each "
+                                "other on your own photos."),
+}
+EXPERIMENT_GROUPS = ("Adapter and optimizer", "Likeness boosters", "How noise levels are trained",
+                     "Compare setups")
+# The experimental extras on the wizard's last page. key: the form key; off: its value with the extra off (set again
+# when the user answers No); control: switch | select (options, or None for the form's own) | number | text; evidence:
+# a key of EVIDENCE; what / tested / cost: the explanation dialog (from the README's measurements, with its numbers)
+EXPERIMENTS = [
+    {"key": "network_type", "group": "Adapter and optimizer", "title": "Adapter type", "off": "lora",
+     "control": "select", "options": {"lora": "LoRA (default)", "lokr": "LoKr", "oft": "OFT"}, "evidence": "others",
+     "short": "LoKr or OFT instead of a plain LoRA.",
+     "what": "A LoRA adds a small pair of matrices to each layer. LoKr uses a Kronecker pair instead (factor 8 by "
+             "default); OFT rotates each layer's output channels in blocks, which keeps the base model's structure.",
+     "tested": "LoKr: Fizgig measured factor 8 as 'the highest likeness we've ever measured, with noticeably more "
+               "natural skin than standard LoRA on the same data', with no gain above factor 8. Not repeated in "
+               "RulzTrainer yet. OFT: only the OFT paper's result (DINO 0.632 against 0.613 on DreamBooth objects, "
+               "Stable Diffusion); its likeness has not been compared on a full run here.",
+     "cost": "LoKr: about 20% slower steps and files of about 400 MB on a 12B model. Neither LoKr nor OFT loads in "
+             "diffusers (both load in ComfyUI). Rank, alpha and LoRA+ do not apply. OFT cannot be souped or "
+             "post-hoc averaged."},
+    {"key": "dora", "group": "Adapter and optimizer", "title": "DoRA", "off": False, "control": "switch",
+     "evidence": "cost", "when": lambda wz: wz.w["network_type"].value != "oft",
+     "short": "Trains each weight's size and direction separately.",
+     "what": "Splits every layer's weight into a direction, which the LoRA or LoKr changes, and a magnitude that "
+             "trains on its own (weight-decomposed adaptation).",
+     "tested": "Only its speed: LoKr 8 with DoRA ran 4.9 s a step against 3.5 s without. Its effect on likeness has "
+               "not been measured.",
+     "cost": "Slower steps (about 40% on Krea 2). Saved as keys ComfyUI applies; diffusers cannot read them. Cannot "
+             "be souped. Not with OFT."},
+    {"key": "optimizer", "group": "Adapter and optimizer", "title": "Optimizer", "off": "adamw8bit",
+     "control": "select", "options": {"adamw8bit": "adamw8bit (default)", "adamw": "adamw", "adafactor": "adafactor",
+                                      "automagic3": "automagic3", "automagic4": "automagic4", "keel": "keel",
+                                      "keel_fb": "keel_fb"},
+     "evidence": "cost",
+     "short": "A self-tuning optimizer instead of adamw8bit.",
+     "what": "adamw8bit is AdamW with its state in 8 bits (adamw keeps it in full precision; adafactor is lighter). "
+             "automagic3 and automagic4 tune their own learning rate as they go; automagic4 adds smaller steps for the "
+             "most sensitive weights. keel is automagic4 with extra machinery aimed at a character's identity, and "
+             "keel_fb the same for the face and the body alike.",
+     "tested": "Automagic was measured for its learning rates and speed on Krea 2 (rank 16, 6 images, 160 steps): "
+               "automagic4 rose from 1.7e-4 to a peak of 6.0e-4 and came back to 3.2e-4; the losses (0.078 / 0.079 / "
+               "0.081) were too close in so short a run to rank. Likeness against adamw8bit has not been measured for "
+               "any of them, so adamw8bit stays the default until a race says otherwise. Keel and keel_fb: nothing "
+               "measured yet. adafactor is Fizgig's pick for a full fine-tune, not tested for LoRAs.",
+     "cost": "automagic4 took 1.6 s a step against automagic3's 2.2 s. The learning-rate schedule, LoRA+ and the "
+             "per-image learning rate do not apply to the automagic family. Keel's consensus gate wants gradient "
+             "accumulation of 2 or more."},
+    {"key": "isolation", "group": "Likeness boosters", "title": "LoRA Isolation", "off": False, "control": "switch",
+     "evidence": "others",
+     "short": "Keeps the person's face off everyone else in the picture.",
+     "what": "A character LoRA tends to put its subject's face on other people. Isolation also trains every photo "
+             "without its trigger word, held to what the model draws without the LoRA; fuses the trigger into one word "
+             "(you then prompt with it joined, for example gweltman); and adds pictures of the subject next to a "
+             "generated stranger.",
+     "tested": "Fizgig, on Krea 2: strangers read as the subject in 48 of 50 pictures without it and 0 of 50 with "
+               "it, while the subject's own likeness held (0.77 to 0.78). Not measured in RulzTrainer yet.",
+     "cost": "About 1.5x the training time over a run (Fizgig; about 2x per isolation step here). Needs a trigger "
+             "word, and you must prompt with the joined word. Downloads a set of stranger pictures. Not with a full "
+             "fine-tune or a parallel race."},
+    {"key": "id_loss_weight", "group": "Likeness boosters", "title": "Direct identity loss", "off": 0.0,
+     "control": "number", "step": 0.05, "precision": 2, "hint": "0 = off; try 0.2 (at most 0.5)",
+     "evidence": "mixed",
+     "short": "Adds a face-recognition score to what training minimises.",
+     "what": "Decodes the face the model predicts during training and adds a face-recognition term, so the LoRA is "
+             "pulled straight toward your references. 0 = off; 0.2 is the tested weight.",
+     "tested": "Measured here on a short test (8 synthetic images, 512 px, rank 16, lr 2e-4, 80 steps, weight 0.2): "
+               "the identity loss fell 0.86 / 0.61 / 0.47 against 0.88 / 0.68 / 0.54 without it, roughly 0.07 better. "
+               "Too short a run to call it a likeness gain: 'treat it as an experiment, not a default'.",
+     "cost": "Peak memory 8.0 GB against 6.05 GB and about 7% slower steps. With the ArcFace backend the probes' own "
+             "scorer becomes the training target (the FaceNet backend avoids that). Needs face references. Not in a "
+             "parallel race."},
+    {"key": "attn_localize", "group": "Likeness boosters", "title": "Trigger attention on the subject", "off": False,
+     "control": "switch", "evidence": "untested",
+     "short": "Ties the trigger word to the person, not the background.",
+     "what": "Reads, inside the model, where the trigger word's attention lands in each training photo and pulls it "
+             "onto the person (their face box and silhouette). Training-only: the LoRA file is the same.",
+     "tested": "Not measured for likeness. On Krea 2 the attention off the subject went from 0.87 to 0.84 over 10 "
+               "steps, so it does what it says, at no extra step time.",
+     "cost": "Needs a trigger word. The tapped blocks run without torch.compile. Not in a parallel race or a full "
+             "fine-tune."},
+    {"key": "id_align", "group": "Likeness boosters", "title": "Identity alignment", "off": False,
+     "control": "switch", "evidence": "untested",
+     "short": "Teaches the face's tokens to carry the person's identity.",
+     "what": "A small helper network (thrown away afterwards) teaches the face's tokens inside the model to carry "
+             "that photo's ArcFace identity, giving identity feedback at every noise level. Training-only.",
+     "tested": "Not measured for likeness. Run on Krea 2, MOSS-Image and FIBO 2.0 only.",
+     "cost": "Trains against ArcFace, so the FaceNet second scorer is switched on to keep the scores honest. First GPU "
+             "only. Not in a full fine-tune or a parallel race."},
+    {"key": "body_align", "group": "Likeness boosters", "title": "Body alignment", "off": False, "control": "switch",
+     "evidence": "untested", "when": lambda wz: wz.has_body(),
+     "short": "The same for the build: the person's tokens carry their body.",
+     "what": "Teaches the person's tokens inside the model to carry that photo's body (its DINOv2 body embedding, "
+             "what the body probe scores), through a helper that is thrown away. Only photos showing the neck to "
+             "mid-thigh count.",
+     "tested": "Not measured for likeness.",
+     "cost": "Needs photos that show the body, and person masks."},
+    {"key": "selftrain", "group": "Likeness boosters", "title": "Self-training on its best pictures", "off": False,
+     "control": "switch", "evidence": "untested",
+     "short": "Halfway through, adds its own best renders to the photos.",
+     "what": "Halfway through, the LoRA draws about 30 pictures of the person in new scenes; the few that are clean, "
+             "sharp and look more like them than the probes do train beside your photos for the rest of the run, at "
+             "half weight and never more than a fifth of them.",
+     "tested": "Not measured. Research on models training on their own output (model collapse) warns that repeated "
+               "rounds can amplify the model's own flaws; this runs one round, with a copy check.",
+     "cost": "A few minutes. Can copy the model's own flaws, so judge the samples by eye. Not in a parallel race."},
+    {"key": "reward_steps", "group": "Likeness boosters", "title": "Likeness reward fine-tuning", "off": 0,
+     "control": "number", "precision": 0, "hint": "0 = off; try 100-200 steps", "evidence": "cost",
+     "short": "A second stage that rewards the most lifelike renders.",
+     "what": "After the normal steps, the LoRA renders groups of pictures for new prompts, the probes rate how much "
+             "each looks like the person, and the LoRA learns to make the better ones more likely (a Flow-GRPO "
+             "style reinforcement stage). The number is how many reward steps; 0 = off.",
+     "tested": "Only its speed: about 77 s a reward step on Krea 2 (nvfp4, 16 GB card). Its effect on likeness has "
+               "not been measured.",
+     "cost": "Slow (seconds to a minute or more a step). It can learn to please the scorer instead of the eye; the "
+             "probes keep the best checkpoint and the first stage's LoRA is kept. One GPU, not with a full "
+             "fine-tune."},
+    {"key": "likeness_lr_control", "group": "Likeness boosters", "title": "Learning rate from the likeness trend",
+     "off": False, "control": "switch", "evidence": "untested",
+     "short": "Raises the learning rate while likeness climbs, lowers it when it falls.",
+     "what": "Scales the learning rate between 0.5x and 2x by the likeness probes' trend: up while the score rises, "
+             "down when it falls.",
+     "tested": "Not measured.",
+     "cost": "Needs the likeness probes. With automagic4 its own controller may pull the rate back."},
+    {"key": "resolution_step_up", "group": "Likeness boosters", "title": "Resolution step-up", "off": False,
+     "control": "switch", "evidence": "untested",
+     "short": "Starts small and moves to a higher resolution when likeness stalls.",
+     "what": "Trains at the lowest of the run's resolutions first and moves up when the likeness score stops "
+             "improving (pick two or more resolutions under Advanced on the Photos page).",
+     "tested": "Not measured.",
+     "cost": "Needs the likeness probes; it replaces the early stop. Not in a race."},
+    {"key": "timestep_sampling", "group": "How noise levels are trained", "title": "Noise levels",
+     "off": "logit_normal", "control": "select",
+     "options": {"logit_normal": "logit_normal (default)", "identity": "identity", "content": "content"},
+     "evidence": "mixed",
+     "short": "Which noise levels the training steps practise on.",
+     "what": "logit_normal favours the middle noise levels. identity centres them lower (a median of about 0.38), "
+             "where a face's features are settled; content favours low noise, where fine detail is.",
+     "tested": "Measured here on a short 5-image test: identity scored 73.9 against 74.2 for the default, neutral. "
+               "content has not been measured.",
+     "cost": "None beyond the choice."},
+    {"key": "clean_share", "group": "How noise levels are trained", "title": "Clean-end share", "off": "",
+     "control": "text", "hint": "empty = off; Fizgig's best: 60:7:30:8:3", "evidence": "others",
+     "short": "More steps at the clean end, where faces and fine detail settle.",
+     "what": "Sets, by epoch, how many of the steps land at the clean, low-noise end of training, where faces and "
+             "fine detail are refined. Empty = off; Fizgig's best schedule is 60:7:30:8:3.",
+     "tested": "Fizgig, on MOSS-Image: 60:7:30:8:3 was the best of eight schedules, still at 71% likeness at epoch "
+               "60 and about 5 points over 60:7:30:15:2. Not measured in RulzTrainer.",
+     "cost": "None beyond the choice."},
+    {"key": "timestep_buckets", "group": "How noise levels are trained", "title": "Even noise coverage", "off": 0,
+     "control": "number", "precision": 0, "hint": "0 = off; 10-20 is the usual start", "evidence": "untested",
+     "short": "Spreads the noise levels evenly instead of at random.",
+     "what": "Every run of N steps covers the noise curve evenly instead of drawing each level at random, so no stretch "
+             "of noise levels is skipped by chance. 0 = off; 10-20 is the usual start.",
+     "tested": "Not measured.",
+     "cost": "None."},
+    {"key": "loss_type", "group": "How noise levels are trained", "title": "Band loss", "off": "mse",
+     "control": "select", "options": {"mse": "mse (default)", "band": "band"}, "evidence": "untested",
+     "short": "Ignores the detail the noise has already buried.",
+     "what": "Leaves out of the loss the fine-detail bands the noise has buried at each step, so the model is not "
+             "asked to guess detail it cannot see.",
+     "tested": "Not measured.",
+     "cost": "None."},
+    {"key": "race", "group": "Compare setups", "title": "Configuration race", "off": False, "control": "switch",
+     "evidence": "tool",
+     "short": "Trains a few versions side by side; the likeness probes pick the winner.",
+     "what": "Trains several versions of this setup on the same photos and probes, each changing only what you "
+             "assign it (a learning rate, the adapter, a seed, any of the extras above), and lets the likeness "
+             "probes drop the weakest. The way to find out whether an untested extra helps your person. The racers "
+             "and the rules appear below once it is on.",
+     "tested": "A tool rather than a result: the time is predictable, for example 10 racers take about 3.1x one run "
+               "when the lowest is dropped every round.",
+     "cost": "More training time (shown below). No resume and no resolution step-up in a race."},
+]
+
+
 class Wizard:
-    """Guided setup on its own tab: one step per topic, each setting explained, with a recommended value.
+    """Guided setup on its own tab for a character / person LoRA: six short pages with the basics filled in, every
+    other setting behind the Advanced switch, and the experimental extras offered on the last page, each with what it
+    does and what testing found.
 
     Its controls are bound to the full form's widgets (Train tab), so both views edit the same settings and a run
     started from either is the same run."""
 
-    STEPS = (("goal", "Goal", "flag"), ("model", "Model", "model_training"), ("hardware", "Hardware", "memory"),
-             ("dataset", "Dataset", "photo_library"), ("training", "Training", "school"),
-             ("samples", "Samples", "image"), ("racers", "Racers", "groups"), ("rules", "Race rules", "emoji_events"),
-             ("review", "Review & start", "rocket_launch"))
-    RACE_STEPS = ("racers", "rules")  # shown only when the run is a race
+    STEPS = (("start", "Start", "flag"), ("model", "Model", "model_training"), ("dataset", "Photos", "photo_library"),
+             ("training", "Training", "school"), ("samples", "Samples & probes", "image"),
+             ("extras", "Extras & start", "rocket_launch"))
 
     def __init__(self, f: Form, gpus: list[str], start, goto, enqueue=None):
         self.f, self.w = f, f.w
@@ -3986,19 +4231,21 @@ class Wizard:
         self.start = start  # start_job(): starts training from the form, True when it started
         self.enqueue = enqueue  # queue_job(): adds the form's run to the training queue
         self.goto = goto  # goto(tab name)
-        self.goal: str | None = "character" if self.w["preset_toggle"].value else None
-        self.focus = "face_focus"  # Character / person: a key of CHARACTER_FOCUS; follows the form (character_focus)
+        self.goal = "character"  # the wizard sets up identity runs (recommendations and review read it)
+        self.focus = "face_focus"  # a key of CHARACTER_FOCUS; follows the form (character_focus)
         self.focus_stash: dict = {}  # references and probe prompts from before a face only / body only pick
-        self.conditional: list[tuple] = []  # (box, predicate): settings shown only while the predicate holds
+        self.adv = False  # the Advanced switch: every setting on every page
+        self.conditional: list[tuple] = []  # (element, predicate): shown only while the predicate holds
+        self.watched: set[str] = set()  # form keys whose changes re-check the conditional elements
         self.smi: list[dict] = []  # nvidia-smi rows (memory per GPU)
         self.data: dict | None = None  # last dataset scan
         self.recs: dict[str, tuple] = {}
         self.rec_rows: list[tuple] = []
-        self.goal_cards: dict[str, ui.card] = {}
         self.focus_cards: dict[str, ui.card] = {}
         self.model_cards: dict[str, ui.card] = {}
-        self.mode_cards: dict[str, ui.card] = {}
+        self.extras_cards: dict[bool, ui.card] = {}
         self.steps: dict[str, ui.step] = {}
+        self.set_up = False  # the identity recipe and the wizard's basics were put in place this session
         # the race: how many racers, the settings they may differ in, and each racer's name and assigned values
         # (a value only once it is assigned: the others follow the base setup on the earlier pages)
         self.n_racers = 2
@@ -4014,21 +4261,40 @@ class Wizard:
         widget.on_value_change(lambda _: self.refresh())
         return widget
 
+    def show_when(self, element, when, adv: bool = False, show_if=None):
+        """Show an element only while `when()` holds, the Advanced switch is on (adv) and show_if=(form key,
+        predicate) holds for that widget's value."""
+        conds = [c for c in (when, (lambda: self.adv) if adv else None) if c is not None]
+        if show_if is not None:
+            key, pred = show_if
+            conds.append(lambda: pred(self.w[key].value))
+            if key not in self.watched:
+                self.watched.add(key)
+                self.w[key].on_value_change(lambda _: self.update_visibility())
+        if conds:
+            pred_all = lambda: all(c() for c in conds)  # noqa: E731
+            self.conditional.append((element, pred_all))
+            element.visible = bool(pred_all())
+        return element
+
+    def update_visibility(self):
+        for element, when in self.conditional:
+            element.visible = bool(when())
+
     @contextmanager
-    def setting(self, key: str | None, title: str, text: str, show_if=None, when=None):
+    def setting(self, key: str | None, title: str, text: str, show_if=None, when=None, adv: bool = False):
         """One setting: title, explanation and recommendation on the left, the control (built in the block) on the
         right. show_if=(form key, predicate) shows it only while the predicate holds for that widget's value; when
-        is a no-argument predicate re-read on every refresh (for conditions on more than one setting). Yields the
-        setting's box."""
+        is a no-argument predicate re-read on every refresh (for conditions on more than one setting); adv shows it
+        only with the Advanced switch on. Yields the setting's box."""
         box = ui.element("div").classes("rz-setting")
-        if when is not None:
-            self.conditional.append((box, when))
-            box.visible = bool(when())
-        if show_if is not None:
-            box.bind_visibility_from(self.w[show_if[0]], "value", show_if[1])
+        self.show_when(box, when, adv, show_if)
         with box:
             with ui.column().classes("gap-1 min-w-0"):
-                ui.label(title).classes("rz-setting-title")
+                with ui.row().classes("items-center gap-2"):
+                    ui.label(title).classes("rz-setting-title")
+                    if adv:
+                        ui.label("Advanced").classes("rz-badge muted")
                 ui.label(text).classes("rz-hint")
                 if key:
                     self.rec_row(key)
@@ -4062,8 +4328,7 @@ class Wizard:
         return bool(self.w["race"].value)
 
     def move(self, d: int):
-        """The next / previous step, skipping the race steps when the run is not a race."""
-        names = [n for n, _, _ in self.STEPS if self.racing() or n not in self.RACE_STEPS]
+        names = [n for n, _, _ in self.STEPS]
         cur = self.stepper.value if isinstance(self.stepper.value, str) else names[0]
         i = names.index(cur) if cur in names else 0
         self.stepper.value = names[max(0, min(len(names) - 1, i + d))]
@@ -4075,13 +4340,13 @@ class Wizard:
     # ------------------------------------------------------------ recommendations
 
     def is_character(self) -> bool:
-        return self.goal == "character"
+        return True
 
     def has_face(self) -> bool:
-        return self.goal == "character" and self.focus != "body_only"
+        return self.focus != "body_only"
 
     def has_body(self) -> bool:
-        return self.goal == "character" and self.focus != "face_only"
+        return self.focus != "face_only"
 
     def is_lora(self) -> bool:
         return not self.w["finetune"].value and self.w["network_type"].value == "lora"
@@ -4091,11 +4356,10 @@ class Wizard:
             cfg = self.f.to_config()
         except (TypeError, ValueError):
             return  # a field is mid-edit (e.g. an empty number); keep the last recommendations
-        if self.goal == "character":
+        if cfg.preset == "identity":
             self.focus = character_focus(cfg)
         self.mark_focus()
-        for box, when in self.conditional:
-            box.visible = bool(when())
+        self.update_visibility()
         if self.racing():
             self.estimate_race()
             self.check_race()
@@ -4115,6 +4379,13 @@ class Wizard:
                 label.text = f"Recommended: {_show(self.w[key], value)}. {reason[:1].upper()}{reason[1:]}."
             icon.name = "check_circle" if same else "lightbulb"
             btn.visible = not same
+        self.mark_extras()
+        if hasattr(self, "refs_note"):
+            n_face, n_body = len(cfg.face_refs) if self.has_face() else 0, len(cfg.body_refs) if self.has_body() else 0
+            self.refs_note.text = ("Likeness references: your photos in " + ", ".join(
+                Path(p).name for p in dict.fromkeys(cfg.face_refs + cfg.body_refs)) + ". The likeness checks compare "
+                "with them (Advanced to change them)." if n_face or n_body else
+                "Pick your photos above: they also become the likeness references the checks compare with.")
 
     def apply(self, keys: list[str]):
         for key in keys:
@@ -4123,21 +4394,49 @@ class Wizard:
                 self.w[key].value = list(rec[0]) if isinstance(rec[0], list) else rec[0]
             self.refresh()  # later recommendations can depend on earlier ones (save every on steps)
 
+    def set_up_identity(self, force: bool = False):
+        """The identity recipe and the wizard's basics (WIZARD_BASICS, the experimental extras off, the
+        recommendations that need no choosing: hardware, resolution, references, samples). Once per session unless
+        forced (Reset), and only on a form without the identity preset, so a loaded identity config is kept."""
+        if self.set_up and not force:
+            return
+        self.set_up = True
+        if self.w["preset_toggle"].value and not force:
+            self.refresh()
+            return
+        if not self.w["preset_toggle"].value:
+            self.w["preset_toggle"].value = True  # applies the identity recipe (the Train tab's switch)
+        for key, value in WIZARD_BASICS.items():
+            self.w[key].value = value
+        self.experiments_off()
+        self.apply_focus()
+        if not (self.w["sample_prompts"].value or "").strip():
+            self.w["sample_prompts"].value = "\n".join(suggested_prompts(
+                self.goal, (self.w["trigger_word"].value or "").strip(), self.focus))
+        self.refresh()
+        self.apply([k for k in WIZARD_AUTO if k in self.recs])
+        ui.notify("Set up for a character / person LoRA with the recommended settings", type="info")
+
+    def reset(self):
+        self.set_up_identity(force=True)
+        self.extras_answer(False, quiet=True)
+
     # ------------------------------------------------------------ steps
 
     def build(self):
-        names = [n for n, _, _ in self.STEPS]  # the race steps' headers, hidden while the run is not a race
-        ui.add_css(",\n".join(f".rz-norace .q-stepper__header > .q-stepper__tab:nth-child({names.index(n) + 1})"
-                             for n in self.RACE_STEPS) + " { display: none; }")
         with ui.column().classes("rz-page gap-4"):
             with card():
                 with ui.row().classes("w-full items-center gap-4"):
                     with ui.column().classes("gap-1 flex-1 min-w-[16rem]"):
-                        ui.label("Guided setup").classes("rz-title")
-                        hint("Walks through a training run one topic at a time. Every setting is explained and comes "
-                             "with a recommendation for your GPUs and dataset: click Use to take it, or Apply "
-                             "recommended for a whole page. These are the same settings as on the Train tab, which "
-                             "has every option.")
+                        ui.label("Character / person LoRA wizard").classes("rz-title")
+                        hint("Six short pages with the basics already filled in for you. Advanced shows every "
+                             "setting on every page; the last page offers the experimental extras. These are the "
+                             "same settings as the Train tab's, which has every option.")
+                    self.adv_switch = ui.switch("Advanced", value=self.adv, on_change=lambda e: self.set_adv(e.value)) \
+                        .tooltip("Show every setting on every page (for experienced users)")
+                    ui.button("Reset", icon="restart_alt", on_click=self.reset).props("flat") \
+                        .tooltip("Put the recommended setup back: the identity recipe, rank 32, adamw8bit at 1e-4, "
+                                 "experimental extras off")
                     ui.button("All settings", icon="tune", on_click=lambda: self.goto("Train")).props("outline")
             with ui.stepper(on_value_change=self.on_step).props("header-nav alternative-labels animated flat") \
                     .classes("rz-stepper w-full") as self.stepper:
@@ -4145,14 +4444,17 @@ class Wizard:
                     with ui.step(name, title=title, icon=icon).props(f"active-icon={icon}") as step:
                         self.steps[name] = step
                         getattr(self, f"step_{name}")()
-        self.w["preset_toggle"].on_value_change(lambda e: self.sync_goal(e.value))
+        self.w["preset_toggle"].on_value_change(lambda _: self.refresh())
         self.w["model_preset"].on_value_change(lambda _: (self.mark_model(), self.refresh()))
         self.w["race"].on_value_change(lambda _: (self.mark_race(), self.refresh()))
-        self.mark_goal()
         self.mark_model()
         self.mark_race()
         self.refresh()
         ui.timer(0.2, self.detect_gpus, once=True)
+
+    def set_adv(self, on: bool):
+        self.adv = bool(on)
+        self.update_visibility()
 
     async def on_step(self, e):
         name = e.value if isinstance(e.value, str) else e.value.props.get("name")
@@ -4160,86 +4462,66 @@ class Wizard:
         idx = names.index(name) if name in names else 0
         for i, n in enumerate(names):
             self.steps[n].props(add="done") if i < idx else self.steps[n].props(remove="done")
+        if name != "start":
+            self.set_up_identity()
         if name == "dataset" and self.data is None and any(Path(p).is_dir() for p in self.w["datasets"].selected):
             await self.scan()
-        if name == "racers":
+        if name == "extras":
             self.load_racers()
             self.rebuild_racers()  # the base setup may have changed on the earlier pages
-        if name == "rules":
             self.estimate_race()
-        if name == "review":
             await self.render_review()
 
-    # ---- 1 goal
-    def step_goal(self):
-        self.heading("What are you training?", "This picks the recipe for the rest of the wizard. You can change "
-                                               "anything afterwards.")
+    # ---- 1 start
+    def step_start(self):
+        self.heading("Who are you training?", "A LoRA that draws one particular person or character whenever its "
+                                               "trigger word is in the prompt. Give the run a name and a trigger "
+                                               "word, and pick what the likeness should cover.")
+        with self.setting(None, "Job name", "The name of this run. The LoRA files are saved in output/<job name>/."):
+            self.bind(ui.input("Job name"), "job_name").classes("w-full")
+        with self.setting(None, "Trigger word",
+                          "A word you put in your prompts to call the person up, added to the front of every caption. "
+                          "Pick one the model does not know, such as 'zxq woman'. Leave it empty if your captions "
+                          "already have one."):
+            self.bind(ui.input("Trigger word"), "trigger_word").classes("w-full")
+            self.w["trigger_word"].on_value_change(lambda _: self.trigger_changed())
+        ui.label("What should the likeness cover?").classes("rz-setting-title pt-2")
         with ui.element("div").classes("rz-choices"):
-            for key, (icon, title, text) in GOALS.items():
+            for key, (icon, title, text) in CHARACTER_FOCUS.items():
                 with ui.card().props("flat").classes("rz-choice") as c:
                     with ui.row().classes("w-full items-center gap-2 no-wrap"):
                         ui.icon(icon).classes("rz-choice-icon")
                         ui.label(title).classes("rz-setting-title")
+                        if key == "face_focus":
+                            ui.label("Recommended").classes("rz-badge")
                         ui.space()
                         ui.icon("check_circle").classes("rz-check")
                     ui.label(text).classes("rz-hint")
-                c.on("click", lambda _, k=key: self.set_goal(k))
-                self.goal_cards[key] = c
-        with ui.column().classes("w-full gap-2") as self.focus_box:
-            ui.label("What should the likeness cover?").classes("rz-setting-title")
-            with ui.element("div").classes("rz-choices"):
-                for key, (icon, title, text) in CHARACTER_FOCUS.items():
-                    with ui.card().props("flat").classes("rz-choice") as c:
-                        with ui.row().classes("w-full items-center gap-2 no-wrap"):
-                            ui.icon(icon).classes("rz-choice-icon")
-                            ui.label(title).classes("rz-setting-title")
-                            ui.space()
-                            ui.icon("check_circle").classes("rz-check")
-                        ui.label(text).classes("rz-hint")
-                    c.on("click", lambda _, k=key: self.set_focus(k))
-                    self.focus_cards[key] = c
-        self.goal_note = ui.label("").classes("rz-banner info")
-        with ui.column().classes("w-full gap-2") as self.mode_box:
-            ui.label("One run, or a race?").classes("rz-setting-title")
-            with ui.element("div").classes("rz-choices"):
-                for key, (icon, title, text) in RUN_MODES.items():
-                    with ui.card().props("flat").classes("rz-choice") as c:
-                        with ui.row().classes("w-full items-center gap-2 no-wrap"):
-                            ui.icon(icon).classes("rz-choice-icon")
-                            ui.label(title).classes("rz-setting-title")
-                            ui.space()
-                            ui.icon("check_circle").classes("rz-check")
-                        ui.label(text).classes("rz-hint")
-                    c.on("click", lambda _, k=key: self.set_mode(k))
-                    self.mode_cards[key] = c
-            hint("A race needs the likeness probes, so it is for a character / person. The next pages set up the "
-                 "base racer; then you pick the racers and the race's rules.")
-        with self.setting(None, "Job name", "The name of this run. Checkpoints are saved as "
-                                            "output/<job name>/<job name>_<step>.safetensors and the final LoRA as "
-                                            "output/<job name>/<job name>.safetensors."):
-            self.bind(ui.input("Job name"), "job_name").classes("w-full")
+                c.on("click", lambda _, k=key: self.set_focus(k))
+                self.show_when(c, lambda k=key: k in WIZARD_FOCUS or self.adv or k == self.focus)
+                self.focus_cards[key] = c
+        self.show_when(hint("Advanced also offers body focus and body only."), lambda: not self.adv)
         self.nav(back=False)
 
-    def set_goal(self, goal: str):
-        focus = self.focus  # the recipe below is face focus; the pick made before is put back on top of it
-        self.goal = goal
-        want = goal == "character"
-        if bool(self.w["preset_toggle"].value) != want:
-            self.w["preset_toggle"].value = want  # applies the identity recipe, or restores the settings from before
-        self.focus = focus
-        if want and focus != "face_focus":
-            self.apply_focus()
-        self.mark_goal()
-        self.refresh()
+    def trigger_changed(self):
+        """The probe prompts name the subject: follow a new trigger word while they are the recipe's own."""
+        if not self.set_up or not self.w["preset_toggle"].value:
+            return
+        face_p, body_p = PRESET_PROBE_PROMPTS["identity"]
+        for key, template in (("probe_face_prompt", face_p), ("probe_body_prompt", body_p)):
+            cur = (self.w[key].value or "").strip()
+            if cur and cur.startswith(template.split("{trigger}")[0]):
+                self.w[key].value = template.format(trigger=(self.w["trigger_word"].value or "").strip()
+                                                    or "the character")
 
     def set_focus(self, focus: str):
         """One of the five focuses: the probes, references, crops, loss weights and score weights for it."""
+        self.set_up_identity()
         for key in ("face_refs", "body_refs", "probe_face_prompt", "probe_body_prompt"):
             if (self.w[key].value or "").strip():  # what the user has, kept for when the focus needs it again
                 self.focus_stash[key] = self.w[key].value
         self.focus = focus
         self.apply_focus()
-        self.mark_goal()
         self.refresh()
 
     def apply_focus(self):
@@ -4252,216 +4534,97 @@ class Wizard:
         for key, value in values.items():
             self.w[key].value = "\n".join(value) if isinstance(value, list) else value
 
-    def sync_goal(self, preset_on: bool):
-        """The identity preset was switched elsewhere (Train tab, a loaded config)."""
-        if preset_on:
-            self.goal = "character"
-        elif self.goal == "character":
-            self.goal = None
-        self.mark_goal()
-        self.refresh()
-
-    def mark_goal(self):
-        for key, c in self.goal_cards.items():
-            c.classes(add="selected") if key == self.goal else c.classes(remove="selected")
-        self.mark_focus()
-        if self.goal == "character":
-            self.goal_note.text = ("Identity recipe, " + FOCUS_NOTES[self.focus] + "; LoRA+ 4 with adamw8bit, "
-                                   "likeness probes every 25 steps with best checkpoint and early stop, per-image "
-                                   "loss watch.")
-        elif self.goal:
-            self.goal_note.text = f"{GOALS[self.goal][1]}: general settings, tuned on the next pages."
-        else:
-            self.goal_note.text = "Pick one to get recommendations that fit it."
-
-    def set_mode(self, mode: str):
-        self.w["race"].value = mode == "race"  # mark_race follows through the switch
-
-    def mark_race(self):
-        """The run-mode cards, the race steps and the review's start button."""
-        racing = self.racing()
-        for key, c in self.mode_cards.items():
-            c.classes(add="selected") if (key == "race") == racing else c.classes(remove="selected")
-        if hasattr(self, "stepper"):  # a step's header is drawn by the stepper: hidden by its position (CSS)
-            self.stepper.classes(remove="rz-norace") if racing else self.stepper.classes(add="rz-norace")
-        if hasattr(self, "start_btn"):
-            self.start_btn.text = "Start the race" if racing else "Start training"
-
     def mark_focus(self):
-        """The focus cards."""
-        character = self.goal == "character"
-        if hasattr(self, "mode_box"):
-            self.mode_box.visible = character
-        if hasattr(self, "focus_box"):
-            self.focus_box.visible = character
         for key, c in self.focus_cards.items():
             c.classes(add="selected") if key == self.focus else c.classes(remove="selected")
 
     # ---- 2 model
     def step_model(self):
-        self.heading("Which model do you want to train on?", "The base model the LoRA is trained for.")
+        self.heading("Which model?", "The base model the LoRA is made for: it only works with that model. The files "
+                                     "download on the first run.")
+        with ui.element("div").classes("rz-choices"):
+            for name, (badge, text) in [*MODEL_NOTES.items(), (CUSTOM, ("", "Any local diffusers folder "
+                                                                             "(transformer/, text_encoder/, vae/) or "
+                                                                             "Hugging Face repo id."))]:
+                with ui.card().props("flat").classes("rz-choice") as c:
+                    with ui.row().classes("w-full items-center gap-2"):
+                        ui.label(name).classes("rz-setting-title")
+                        if badge:
+                            ui.label(badge).classes("rz-badge" + ("" if badge == "Recommended" else " muted"))
+                        ui.space()
+                        ui.icon("check_circle").classes("rz-check")
+                    ui.label(text).classes("rz-hint")
+                c.on("click", lambda _, n=name: setattr(self.w["model_preset"], "value", n))
+                if name == CUSTOM or badge == "Not for training":  # Advanced only (unless it is the one picked)
+                    self.show_when(c, lambda n=name: self.adv or self.w["model_preset"].value == n)
+                self.model_cards[name] = c
+        with self.setting(None, "Custom model", "A local folder in diffusers layout, or a Hugging Face repo id "
+                                                "such as OpenMOSS-Team/MOSS-Image-Base.",
+                          show_if=("model_preset", lambda p: p == CUSTOM)):
+            self.bind(ui.input("Path or repo id"), "model_path").classes("w-full")
         with self.setting(None, "Where the model comes from",
                           "Single files (the default) downloads Comfy-Org's ComfyUI files for the model: the diffusion "
                           "model and text encoder in the format you pick (int8 ConvRot: about half of bf16) and the "
                           "VAE, or uses files you already have. Hugging Face downloads the original diffusers repo "
-                          "into models/ instead."):
+                          "into models/ instead.", adv=True):
             self.bind(ui.radio([FILE_SOURCE, HF_SOURCE]), "model_source")
-        with ui.column().classes("w-full gap-3 pt-4"):
-            with ui.element("div").classes("rz-choices"):
-                for name, (badge, text) in [*MODEL_NOTES.items(), (CUSTOM, ("", "Any local diffusers folder "
-                                                                                 "(transformer/, text_encoder/, vae/) "
-                                                                                 "or Hugging Face repo id."))]:
-                    with ui.card().props("flat").classes("rz-choice") as c:
-                        with ui.row().classes("w-full items-center gap-2"):
-                            ui.label(name).classes("rz-setting-title")
-                            if badge:
-                                ui.label(badge).classes("rz-badge" + ("" if badge == "Recommended" else " muted"))
-                            ui.space()
-                            ui.icon("check_circle").classes("rz-check")
-                        ui.label(text).classes("rz-hint")
-                    c.on("click", lambda _, n=name: setattr(self.w["model_preset"], "value", n))
-                    self.model_cards[name] = c
-            with self.setting(None, "Custom model", "A local folder in diffusers layout, or a Hugging Face repo id "
-                                                    "such as OpenMOSS-Team/MOSS-Image-Base.",
-                              show_if=("model_preset", lambda p: p == CUSTOM)):
-                self.bind(ui.input("Path or repo id"), "model_path").classes("w-full")
-            with ui.column().classes("w-full gap-0") \
-                    .bind_visibility_from(self.w["model_source"], "value", lambda x: x == HF_SOURCE):
-                with self.setting(None, "Download and check",
-                                  "Fetches what is missing and checks the files already there. Training would also do "
-                                  "this on start, but doing it now shows problems (gated repo, no login, disk space) "
-                                  "before you start."):
-                    status = hint("")
+        with self.setting(None, "Download and check",
+                          "Fetches what is missing and checks the files already there. Training would also do this on "
+                          "start, but doing it now shows problems (gated repo, no login, disk space) before you start.",
+                          adv=True, show_if=("model_source", lambda x: x == HF_SOURCE)):
+            status = hint("")
 
-                    async def download():
-                        status.text = "Downloading / verifying... (about 30 GB on the first download)"
-                        status.text = await run.io_bound(download_model, self.f.to_config().model_path)
+            async def download():
+                status.text = "Downloading / verifying... (about 30 GB on the first download)"
+                status.text = await run.io_bound(download_model, self.f.to_config().model_path)
 
-                    ui.button("Download / verify", icon="download", on_click=download).props("outline")
-        with ui.column().classes("w-full gap-0 pt-2") \
-                .bind_visibility_from(self.w["model_source"], "value", lambda x: x == FILE_SOURCE):
-            with self.setting(None, "File formats to download",
-                              "int8 ConvRot is about half the size of bf16, trains as fast and loses under 1% "
-                              "accuracy (the default). Krea 2 also offers fp8, Ideogram 4 fp8 and nvfp4."):
-                self.bind(ui.select(file_quant_options(preset_arch("MOSS-Image-Base"), "model"),
-                                    label="Diffusion model"), "model_file_quant").classes("w-full")
-                self.bind(ui.select(file_quant_options(preset_arch("MOSS-Image-Base"), "text"),
-                                    label="Text encoder"), "text_encoder_file_quant").classes("w-full")
-            with self.setting(None, "Download now",
-                              "Training downloads the files on start; this does it now, so a problem (disk space, "
-                              "network) shows before you start. Hugging Face's cache keeps them for later runs."):
-                files_status = hint("")
+            ui.button("Download / verify", icon="download", on_click=download).props("outline")
+        with self.setting(None, "File formats to download",
+                          "int8 ConvRot is about half the size of bf16, trains as fast and loses under 1% accuracy (the "
+                          "default). Krea 2 also offers fp8, Ideogram 4 fp8 and nvfp4.",
+                          adv=True, show_if=("model_source", lambda x: x == FILE_SOURCE)):
+            self.bind(ui.select(file_quant_options(preset_arch("MOSS-Image-Base"), "model"),
+                                label="Diffusion model"), "model_file_quant").classes("w-full")
+            self.bind(ui.select(file_quant_options(preset_arch("MOSS-Image-Base"), "text"),
+                                label="Text encoder"), "text_encoder_file_quant").classes("w-full")
+        with self.setting(None, "Download now",
+                          "Training downloads the files on start; this does it now, so a problem (disk space, network) "
+                          "shows before you start. Hugging Face's cache keeps them for later runs.",
+                          adv=True, show_if=("model_source", lambda x: x == FILE_SOURCE)):
+            files_status = hint("")
 
-                async def download_now():
-                    files_status.text = "Downloading / checking the model files..."
-                    files_status.text = await run.io_bound(download_files, self.f.to_config())
+            async def download_now():
+                files_status.text = "Downloading / checking the model files..."
+                files_status.text = await run.io_bound(download_files, self.f.to_config())
 
-                ui.button("Download now", icon="download", on_click=download_now).props("outline")
-            for key, title, text, kind in (
-                    ("transformer_file", "Diffusion model file (optional)", "A ComfyUI models/diffusion_models file "
-                                                                            "you already have.", "file"),
-                    ("text_encoder_file", "Text encoder file (optional)", "Qwen3.5-9B for MOSS-Image, Qwen3-VL-4B for "
-                                                                          "Krea 2, FIBO 2.0 and FLUX 3 Klein, "
-                                                                          "Qwen3-VL-8B for Qwen-Image 2.1 and Ideogram 4, "
-                                                                          "Qwen3-VL-32B (cut to 50 layers) for "
-                                                                          "MiniMax H3.", "file"),
-                    ("vae_file", "VAE file (optional)", "The Flux2 VAE for MOSS-Image, FIBO 2.0, FLUX 3 Klein and "
-                                                        "Ideogram 4, the Qwen-Image VAE for Krea 2, its own for "
-                                                        "Qwen-Image 2.1, the video VAE for MiniMax H3 (its audio "
-                                                        "VAE is found next to it or downloaded).", "file"),
-                    ("tokenizer_path", "Tokenizer folder (optional)", "Left empty, the tokenizer is downloaded once "
-                                                                      "(a few MB).", "dir")):
-                with self.setting(None, title, text + " Left empty, it is downloaded."):
-                    self.bind(path_field(title, kind, width="w-full"), key)
+            ui.button("Download now", icon="download", on_click=download_now).props("outline")
+        for key, title, text, kind in (
+                ("transformer_file", "Diffusion model file", "A ComfyUI models/diffusion_models file you already "
+                                                             "have.", "file"),
+                ("text_encoder_file", "Text encoder file", "Qwen3.5-9B for MOSS-Image, Qwen3-VL-4B for Krea 2, FIBO 2.0 "
+                                                           "and FLUX 3 Klein, Qwen3-VL-8B for Qwen-Image 2.1 and "
+                                                           "Ideogram 4, Qwen3-VL-32B (cut to 50 layers) for MiniMax "
+                                                           "H3.", "file"),
+                ("vae_file", "VAE file", "The Flux2 VAE for MOSS-Image, FIBO 2.0, FLUX 3 Klein and Ideogram 4, the "
+                                         "Qwen-Image VAE for Krea 2, its own for Qwen-Image 2.1, the video VAE for "
+                                         "MiniMax H3 (its audio VAE is found next to it or downloaded).", "file"),
+                ("tokenizer_path", "Tokenizer folder", "Left empty, the tokenizer is downloaded once (a few MB).",
+                 "dir")):
+            with self.setting(None, title, text + " Optional: left empty, it is downloaded.", adv=True,
+                              show_if=("model_source", lambda x: x == FILE_SOURCE)):
+                self.bind(path_field(title, kind, width="w-full"), key)
         self.nav()
 
     def mark_model(self):
         for name, c in self.model_cards.items():
             c.classes(add="selected") if name == self.w["model_preset"].value else c.classes(remove="selected")
 
-    # ---- 3 hardware
-    async def detect_gpus(self):
-        self.smi = await run.io_bound(gpu_stats)
-        self.gpu_box.clear()
-        with self.gpu_box:
-            if not self.smi:
-                hint("No NVIDIA GPU found with nvidia-smi. The recommendations below assume a 16 GB+ card.", warn=True)
-            for g in self.smi:
-                with ui.column().classes("rz-tile gap-0"):
-                    ui.label(f"GPU {g['index']}").classes("rz-tile-label")
-                    ui.label(g["name"]).classes("rz-tile-value text-base")
-                    ui.label(f"{g['total'] / 1024:.0f} GB memory, {g['used'] / 1024:.1f} GB in use").classes("rz-tile-sub")
-        self.refresh()
-
-    def step_hardware(self):
-        self.heading("Your GPUs", "How the model is spread over your GPUs and how much memory it may take.")
-        self.gpu_box = ui.row().classes("w-full gap-3")
-        with self.gpu_box:
-            ui.spinner(size="sm")
-        self.apply_bar(["multi_gpu", "dp_balance", "transformer_quant", "text_encoder_quant", "gradient_checkpointing",
-                        "checkpoint_keep_blocks", "block_swap", "compile_model"])
-        with self.setting("multi_gpu", "Multi-GPU",
-                          "Data parallel puts a full model copy on each GPU, each trains its own images, and the "
-                          "results are averaged: about 1.7-2x the speed with two cards (each must fit the model). "
-                          "Model split divides the model's blocks over the GPUs: half the memory each, not faster."):
-            self.bind(ui.select(dict(self.w["multi_gpu"].options), label="Multi-GPU"), "multi_gpu").classes("w-full")
-        with self.setting(None, "Training GPU", "The GPU that trains. Pick the one with the most memory "
-                                                "(listed in CUDA order).",
-                          show_if=("multi_gpu", lambda x: x == "off")):
-            self.bind(ui.select(self.gpus, label="Training GPU"), "device").classes("w-full")
-        with self.setting(None, "GPUs to use", "Comma-separated, the first is the main GPU (it also saves and "
-                                               "samples).", show_if=("multi_gpu", lambda x: x != "off")):
-            self.bind(ui.input("Devices"), "devices").classes("w-full")
-        with self.setting("dp_balance", "Balance unequal GPUs",
-                          "With two different cards the faster one waits for the slower one every step. auto measures "
-                          "them during the first steps and splits each step's images by speed (it needs a few images "
-                          "per step: gradient accumulation 3 or more). grow lets the faster card train more images in "
-                          "the same time instead, so each step holds more images.",
-                          show_if=("multi_gpu", lambda x: x == "data_parallel")):
-            self.bind(ui.select(dict(self.w["dp_balance"].options), label="Balance"), "dp_balance").classes("w-full")
-        with self.setting("transformer_quant", "Model quantization",
-                          "Stores the frozen base model in fewer bits to save memory; the LoRA itself always trains "
-                          "in full precision. auto keeps the model as it is. int8_convrot halves it at under 1% error "
-                          "and is as fast as bf16 or faster; nvfp4 quarters it but is slower."):
-            self.bind(ui.select(QUANTS, label="Diffusion model quant"), "transformer_quant").classes("w-full")
-        with self.setting("text_encoder_quant", "Text encoder quantization",
-                          "The text encoder only runs once before training, to turn your captions into embeddings, "
-                          "and is unloaded afterwards. Quantizing it lets it fit on the GPU, so that step is quick."):
-            self.bind(ui.select(QUANTS, label="Text encoder quant"), "text_encoder_quant").classes("w-full")
-        with self.setting("gradient_checkpointing", "Gradient checkpointing",
-                          "Recomputes intermediate results during the backward pass instead of keeping them in "
-                          "memory: far less memory for some extra time per step."):
-            self.bind(ui.switch("Gradient checkpointing"), "gradient_checkpointing")
-        with self.setting("checkpoint_keep_blocks", "Blocks that skip the recompute",
-                          "Spends spare GPU memory on speed: these blocks keep their intermediate results instead of "
-                          "recomputing them, about a third faster each. -1 measures your largest images at the start "
-                          "and keeps as many as fit; 0 recomputes every block.",
-                          show_if=("gradient_checkpointing", bool)):
-            self.bind(ui.number("Kept blocks (-1 = auto)", min=-1, precision=0), "checkpoint_keep_blocks") \
-                .classes("w-full")
-        with self.setting("block_swap", "Block swap",
-                          "For a card the model does not fit: this many blocks keep their frozen weights in system "
-                          "RAM and stream to the GPU as each one runs, the next copied in while the current computes. "
-                          "Measured on Krea 2 int8 (16 GB card): 14 of 28 blocks swapped cut the step's peak from "
-                          "10.8 to 7.7 GB at about the same speed. Needs gradient checkpointing and one GPU; not "
-                          "with a fine-tune. 0 = off.",
-                          when=lambda: self.w["multi_gpu"].value == "off" and not self.w["finetune"].value):
-            self.bind(ui.number("Blocks swapped (0 = off)", min=0, precision=0), "block_swap").classes("w-full")
-        with self.setting("compile_model", "Compile the model",
-                          "torch.compile turns the small steps between the big matrix multiplies into fewer, fused GPU "
-                          "kernels: measured 26% faster per step on MOSS-Image and 12% on Krea 2, after a warm-up of "
-                          "under a minute. auto does it for runs of 100 steps or more."):
-            self.bind(ui.select(COMPILE_CHOICES, label="Compile"), "compile_model").classes("w-full")
-        self.nav()
-
-    # ---- 4 dataset
+    # ---- 3 photos
     def step_dataset(self):
-        self.heading("Your images", "One or more datasets: folders of images, each with an optional same-name .txt "
-                                    "caption. 15-50 sharp, varied images are typical for a character; styles and "
-                                    "concepts like 20-100.")
-        with self.setting(None, "Datasets", "Pick the datasets to train on. Create them, upload images and write "
-                                            "captions on the Dataset tab. Each dataset's own resolutions and repeats "
-                                            "are on the Train tab (Dataset section)."):
+        self.heading("Your photos", "15-50 sharp photos of the person, from different days, angles and distances, "
+                                    "work best. Each can have a same-name .txt caption.")
+        with self.setting(None, "Datasets", "The folders of photos to train on. Create them, upload photos and write "
+                                            "captions on the Dataset tab."):
             picker = self.w["datasets"]
 
             def choices():
@@ -4470,61 +4633,19 @@ class Wizard:
             chosen = ui.select(choices(), multiple=True, value=picker.selected, label="Datasets") \
                 .props("use-chips").classes("w-full")
             chosen.bind_value(picker, "selected")
-            chosen.on_value_change(lambda _: (self.forget_scan(), self.refresh()))
+            chosen.on_value_change(lambda _: (self.forget_scan(), self.refresh(), self.fill_refs()))
             picker.listeners.append(lambda: chosen.set_options(choices(), value=picker.selected))
             with ui.row().classes("gap-2"):
-                ui.button("Scan datasets", icon="search", on_click=self.scan).props("unelevated")
+                ui.button("Check my photos", icon="search", on_click=self.scan).props("unelevated")
                 ui.button("Dataset tab", icon="photo_library", on_click=lambda: self.goto("Dataset")).props("flat")
         self.scan_box = ui.column().classes("w-full gap-3")
-        self.apply_bar(["resolutions", "enable_buckets", "flip_augment", "crop_augment", "face_refs", "body_refs",
-                        "look_warmup"])
-        with self.setting(None, "Trigger word",
-                          "Put in front of every caption, and then used in your prompts to call up what the LoRA "
-                          "learned. Pick a word the model does not know yet, such as 'zxq woman' or 'inkwash style'. "
-                          "Leave it empty if your captions already contain one."):
-            self.bind(ui.input("Trigger word"), "trigger_word").classes("w-full")
         with self.setting(None, "Captions",
-                          "Describe in each caption what should stay changeable: clothes, background, pose, "
-                          "lighting. What you leave out is what the LoRA learns as part of the trigger word, so for a "
-                          "character do not describe the face; for a style, describe the content but not the style."):
+                          "Optional. Describe what should stay changeable: clothes, background, pose, lighting. Do not "
+                          "describe the face: what you leave out is what the trigger word learns."):
             ui.button("Edit captions", icon="edit_note", on_click=lambda: self.goto("Dataset")).props("outline")
-        with self.setting("resolutions", "Training resolution",
-                          "The image area training works at, in megapixels (1 MP = 1024x1024), with each image's "
-                          "aspect ratio kept. Higher learns finer detail but takes more memory and time. Picking "
-                          "several mixes them."):
-            self.bind(ui.select(MP_OPTIONS, multiple=True, label="Resolutions").props("use-chips"), "resolutions") \
-                .classes("w-full")
-        with self.setting("enable_buckets", "Aspect-ratio buckets",
-                          "Groups images by shape and trains each at its own aspect ratio. Off, every image is cropped "
-                          "to a square."):
-            self.bind(ui.switch("Aspect-ratio buckets"), "enable_buckets")
-        with self.setting("flip_augment", "Mirror images",
-                          "Also trains a left-right mirrored copy of every image: twice the variety, but anything "
-                          "asymmetric (a hair parting, a logo, text) gets blurred."):
-            self.bind(ui.switch("Horizontal flip"), "flip_augment")
-        with self.setting("crop_augment", "Close-up crops",
-                          "Adds crops of every image as extra training images, so the model sees the face up close "
-                          "and not only small in a full-length photo: face close-ups, and with face+bust also head "
-                          "and shoulders. Crops never upscale past the source.", when=self.is_character):
-            self.bind(ui.select(["none", "face", "face+bust"], label="Crops"), "crop_augment").classes("w-full")
-        with self.setting("face_refs", "Face references",
-                          "Images whose face is the identity to match. Samples and probes are compared with them "
-                          "(ArcFace; 50%+ generally means the same person), which picks the best checkpoint and "
-                          "stops early. A folder counts as all its images; you can also tick Face ref on the Dataset "
-                          "tab.", when=self.has_face):
-            self.bind(ui.textarea("Face references (one path per line)"), "face_refs").classes("w-full")
-        with self.setting("body_refs", "Body references",
-                          "Photos that show the person's build, from the neck to mid-thigh or more. Probes and samples "
-                          "are compared with them to score the body. A folder counts as all its images (those without "
-                          "a usable view of the body are skipped); you can also tick Body ref on the Dataset tab.",
-                          when=self.has_body):
-            self.bind(ui.textarea("Body references (one path per line)"), "body_refs").classes("w-full")
-        with self.setting("look_warmup", "Warm up look outliers",
-                          "Pictures the Dataset tab's Look consistency filter puts under its fence (they do not look "
-                          "like the rest) stay in the dataset but start at a lower loss weight and reach full weight "
-                          "after a few epochs, while the identity forms from the typical pictures.",
-                          when=self.is_character):
-            self.bind(ui.switch("Warm up look outliers"), "look_warmup")
+        refs_note = hint("")
+        self.refs_note = refs_note
+        self.show_when(refs_note, lambda: not self.adv)
         with self.setting(None, "Ideogram 4 captions",
                           "Ideogram 4 was trained on structured JSON captions only. A same-name .json caption in its "
                           "schema (Ideogram's prompting guide) trains it best and wins over the .txt; a plain .txt "
@@ -4533,7 +4654,56 @@ class Wizard:
                           show_if=("model_preset",
                                    lambda p: preset_arch(p, self.w["model_path"].value) == "ideogram4")):
             pass
+        adv_keys = ["resolutions", "enable_buckets", "flip_augment", "crop_augment", "face_refs", "body_refs",
+                    "look_warmup"]
+        self.show_when(ui.column().classes("w-full"), None, adv=True)  # keeps the bar below out of basic mode
+        with ui.column().classes("w-full gap-4") as bar:
+            self.apply_bar(adv_keys)
+        self.show_when(bar, None, adv=True)
+        with self.setting("face_refs", "Face references",
+                          "Photos whose face is the identity to match. Samples and probes are compared with them "
+                          "(ArcFace; 50%+ generally means the same person), which picks the best checkpoint and stops "
+                          "early. A folder counts as all its photos; you can also tick Face ref on the Dataset tab.",
+                          when=self.has_face, adv=True):
+            self.bind(ui.textarea("Face references (one path per line)"), "face_refs").classes("w-full")
+        with self.setting("body_refs", "Body references",
+                          "Photos that show the person's build, from the neck to mid-thigh or more. A folder counts as "
+                          "all its photos (those without a usable view of the body are skipped).",
+                          when=self.has_body, adv=True):
+            self.bind(ui.textarea("Body references (one path per line)"), "body_refs").classes("w-full")
+        with self.setting("resolutions", "Training resolution",
+                          "The image area training works at, in megapixels (1 MP = 1024x1024), with each photo's aspect "
+                          "ratio kept. Higher learns finer detail but takes more memory and time.", adv=True):
+            self.bind(ui.select(MP_OPTIONS, multiple=True, label="Resolutions").props("use-chips"), "resolutions") \
+                .classes("w-full")
+        with self.setting("enable_buckets", "Aspect-ratio buckets",
+                          "Groups photos by shape and trains each at its own aspect ratio. Off, every photo is cropped "
+                          "to a square.", adv=True):
+            self.bind(ui.switch("Aspect-ratio buckets"), "enable_buckets")
+        with self.setting("flip_augment", "Mirror images",
+                          "Also trains a mirrored copy of every photo: more variety, but anything asymmetric (a hair "
+                          "parting, a mole, a logo) gets blurred.", adv=True):
+            self.bind(ui.switch("Horizontal flip"), "flip_augment")
+        with self.setting("crop_augment", "Close-up crops",
+                          "Adds crops of every photo as extra training images, so the model sees the face up close and "
+                          "not only small in a full-length photo. Part of the measured recipe. Crops never upscale "
+                          "past the source.", adv=True):
+            self.bind(ui.select(["none", "face", "face+bust"], label="Crops"), "crop_augment").classes("w-full")
+        with self.setting("look_warmup", "Warm up look outliers",
+                          "Photos the Dataset tab's Look consistency filter puts under its fence (they do not look like "
+                          "the rest) stay in but start at a lower loss weight and reach full weight after a few epochs.",
+                          adv=True):
+            self.bind(ui.switch("Warm up look outliers"), "look_warmup")
         self.nav()
+
+    def fill_refs(self):
+        """New datasets and no references of your own yet: the datasets become the references (the photos with a
+        face, and those showing the body)."""
+        if not self.set_up:
+            return
+        keys = [k for k in ("face_refs", "body_refs") if not (self.w[k].value or "").strip() and k in self.recs
+                and self.recs[k][0]]
+        self.apply(keys)
 
     def forget_scan(self):
         if self.data is not None and self.data.get("folder") != "|".join(self.w["datasets"].selected):
@@ -4558,259 +4728,237 @@ class Wizard:
                     ui.label(f"Folder not found: {', '.join(self.data['missing'])}").classes("rz-banner error")
                 n, cap, mp = self.data["images"], self.data["captioned"], self.data["median_mp"]
                 with ui.row().classes("w-full gap-3"):
-                    for label, value, sub in (("Images", str(n), "png, jpg, webp, bmp"),
-                                              ("Captioned", f"{cap} / {n}", ".txt or .json next to the image"),
+                    for label, value, sub in (("Photos", str(n), "png, jpg, webp, bmp"),
+                                              ("Captioned", f"{cap} / {n}", ".txt or .json next to the photo"),
                                               ("Typical size", f"{mp:.2f} MP" if mp else "-", "median image area")):
                         v, s = stat_tile(label)
                         v.text, s.text = value, sub
                 if not n:
-                    ui.label("No images in these datasets yet. Add them on the Dataset tab (upload them, or copy a "
-                             "folder), then scan again.").classes("rz-banner warning")
+                    ui.label("No photos in these datasets yet. Add them on the Dataset tab (upload them, or copy a "
+                             "folder), then check again.").classes("rz-banner warning")
+                elif n < 10:
+                    ui.label(f"Only {n} photos: 15 or more, from different days and angles, give a much steadier "
+                             "likeness.").classes("rz-banner warning")
                 elif cap < n:
-                    ui.label(f"{n - cap} images have no caption yet. They train on the trigger word alone, which "
-                             "works for a quick character LoRA; captions give a more flexible one.") \
-                        .classes("rz-banner warning")
+                    ui.label(f"{n - cap} photos have no caption yet. They train on the trigger word alone, which works "
+                             "for a quick character LoRA; captions give a more flexible one.") \
+                        .classes("rz-banner info")
                 if thumbs:
                     with ui.row().classes("w-full gap-2"):
                         for t in thumbs:
                             ui.image(image_url(t)).classes("w-24 h-24 rz-thumb")
-                if self.goal == "character" and n:
+                if n:
                     with ui.row().classes("w-full items-center gap-3 no-wrap"):
                         if self.data["outliers"]:
-                            ui.label(f"The saved look scans put {self.data['outliers']} of {n} pictures under the "
-                                     "fence: they do not look like the rest. Review them on the Dataset tab "
-                                     "(Look consistency filter), or ease them in below.").classes("rz-banner warning")
+                            ui.label(f"The saved look scans put {self.data['outliers']} of {n} photos under the fence: "
+                                     "they do not look like the rest. Review them on the Dataset tab (Look consistency "
+                                     "filter).").classes("rz-banner warning")
                         elif self.data["scanned"]:
                             ui.label("The saved look scans found no outliers.").classes("rz-banner ok")
                         else:
-                            ui.label("Not scanned for look outliers yet: the Dataset tab's Look consistency filter "
-                                     "finds the pictures whose face or body does not match the rest.") \
-                                .classes("rz-banner info")
+                            ui.label("Tip: the Dataset tab's Look consistency filter finds photos whose face or body "
+                                     "does not match the rest.").classes("rz-banner info")
                         ui.button("Dataset tab", icon="photo_library", on_click=lambda: self.goto("Dataset")) \
                             .props("outline dense no-caps").classes("shrink-0")
         self.refresh()
+        self.apply([k for k in ("steps", "resolutions", "look_warmup") if k in self.recs and not self.adv])
 
-    # ---- 5 training
+    # ---- 4 training
+    async def detect_gpus(self):
+        self.smi = await run.io_bound(gpu_stats)
+        self.gpu_box.clear()
+        with self.gpu_box:
+            if not self.smi:
+                hint("No NVIDIA GPU found with nvidia-smi. The recommendations below assume a 16 GB+ card.", warn=True)
+            for g in self.smi:
+                with ui.column().classes("rz-tile gap-0"):
+                    ui.label(f"GPU {g['index']}").classes("rz-tile-label")
+                    ui.label(g["name"]).classes("rz-tile-value text-base")
+                    ui.label(f"{g['total'] / 1024:.0f} GB memory, {g['used'] / 1024:.1f} GB in use").classes("rz-tile-sub")
+        self.refresh()
+
     def step_training(self):
-        self.heading("How to train", "How long and how hard to train, and how big the LoRA is.")
-        self.apply_bar(["steps", "learning_rate", "optimizer", "network_type", "lokr_factor", "lora_rank",
-                        "lora_alpha", "timestep_sampling", "batch_size", "target_text_fusion", "target_attn_gate",
-                        "region_weights", "isolation"])
+        self.heading("How to train", "How long and how strongly to train. The values here are a good start for most "
+                                     "people; the likeness probes keep the best checkpoint either way.")
         with self.setting("steps", "Training steps",
-                          "Each step trains on one batch of images. Too few and the LoRA is weak; too many and it "
-                          "starts copying the training images (overfitting). Checkpoints are saved on the way, so "
-                          "you can always go back to an earlier one."):
+                          "Each step trains on one photo. Too few and the LoRA is weak; too many and it starts copying "
+                          "the photos. Checkpoints are saved along the way and the best one is kept, so a few too many "
+                          "is safe."):
             self.bind(ui.number("Steps", min=1, precision=0), "steps").classes("w-full")
-        with self.setting("learning_rate", "Learning rate",
-                          "How big each update is. Too high gives burnt, noisy samples; too low learns slowly. LoRAs "
-                          "use about 10x the learning rate of a full fine-tune, almost regardless of rank."):
+        with self.setting(None, "Learning rate",
+                          "How big each update is. 1e-4 (0.0001) is the wizard's default. Too high gives burnt, noisy "
+                          "samples; too low learns slowly."):
             self.bind(ui.number("Learning rate", format="%.1e", step=1e-5, min=0), "learning_rate").classes("w-full")
-        with self.setting("optimizer", "Optimizer",
-                          "adamw8bit is AdamW with its state stored in 8 bits: the default choice. adamw keeps full "
-                          "precision state (same results, more memory). adafactor is a lighter alternative. "
-                          "automagic3 tunes its own learning rate from the weights' update directions. automagic4 "
-                          "adds a smaller step for the most sensitive weights (timestep embedders, modulation, "
-                          "attention values) and a controller whose rate holds on noise, climbs on a trend and "
-                          "comes down when it overshoots (ai-toolkit's v4 ran away; fixed here). keel is automagic4 "
-                          "for character LoRAs: a preconditioner that keeps either LoRA factor from taking the "
-                          "whole update, a mask that drops preconditioned elements pointing against the gradient, "
-                          "noise bands, a cross-photo consensus gate, and (off by default) a probe-gated lookahead "
-                          "and a face-token gain. keel_fb is keel for the face and the body alike: the gain "
-                          "measures the body's tokens too and the consensus gate votes by gradient size, so face "
-                          "crops do not hold the body-serving weights back (untested on likeness yet: race them "
-                          "against adamw8bit)."):
-            self.bind(ui.select(list(OPTIMIZERS), label="Optimizer"), "optimizer") \
-                .classes("w-full")
-        with self.setting("network_type", "Adapter",
-                          "LoRA: a rank-r pair of small matrices per layer. LoKr: a Kronecker pair, about 1/64 of the "
-                          "weights at factor 8: Fizgig's measured best likeness and more natural skin, about 20% "
-                          "slower steps. OFT: rotates each layer's output channels in blocks instead of adding to the "
-                          "weights; the OFT paper found it held a subject's identity better than LoRA and stayed "
-                          "stable in long runs (not yet measured here: race it). All load in ComfyUI; diffusers has "
-                          "no LoKr or OFT loader.",
-                          when=lambda: not self.w["finetune"].value):
-            self.bind(ui.select({"lora": "LoRA", "lokr": "LoKr", "oft": "OFT"}, label="Adapter"), "network_type") \
-                .classes("w-full")
-        with self.setting(None, "DoRA",
-                          "Splits each layer's weight into a direction, which the LoRA / LoKr changes, and a "
-                          "magnitude that trains on its own (weight-decomposed adaptation). Saved as keys ComfyUI "
-                          "applies; diffusers cannot read them. Steps are somewhat slower. Race it with and without.",
-                          when=lambda: not self.w["finetune"].value and self.w["network_type"].value != "oft"):
-            self.bind(ui.switch("DoRA"), "dora")
-        with self.setting(None, "OFT block size",
-                          "Each layer's output channels rotate in blocks of this size. Larger blocks rotate more "
-                          "channels together: more freedom and more weights (32: about as many as a rank 16 LoRA).",
-                          when=lambda: not self.w["finetune"].value and self.w["network_type"].value == "oft"):
-            self.bind(ui.number("Block size", min=2, max=256, precision=0), "oft_block_size").classes("w-full")
-        with self.setting("lokr_factor", "LoKr factor",
-                          "How the Kronecker pair splits each layer: the first factor is at most this. Lower is more "
-                          "capacity and bigger files (8: about 400 MB on a 12B model, 16: about 100 MB). Fizgig found "
-                          "no gain above 8.", when=lambda: not self.w["finetune"].value
-                          and self.w["network_type"].value == "lokr"):
-            self.bind(ui.number("LoKr factor", min=1, max=64, precision=0), "lokr_factor").classes("w-full")
-        with self.setting("lora_rank", "LoRA rank",
-                          "The size of the adapter. Higher ranks can hold more detail but give bigger files and "
-                          "memorise the training images more easily.", when=self.is_lora):
-            self.bind(ui.number("Rank", min=1, max=256, precision=0), "lora_rank").classes("w-full")
-        with self.setting("lora_alpha", "LoRA alpha",
-                          "Scales the adapter's effect (alpha / rank). Keeping alpha equal to rank is the safe "
-                          "default.", when=self.is_lora):
+        with self.setting(None, "LoRA rank",
+                          "The size of the LoRA. 32 (the default) has room for a face's detail; higher mostly adds file "
+                          "size and copies the photos more easily. Alpha follows the rank unless you set it under "
+                          "Advanced.", when=self.is_lora):
+            rank = self.bind(ui.number("Rank", min=1, max=256, precision=0), "lora_rank").classes("w-full")
+            rank.on_value_change(lambda e: self.follow_rank(e.value))
+        with self.setting(None, "LoRA alpha",
+                          "Scales the LoRA's effect (alpha / rank). Equal to the rank is the safe default.",
+                          when=self.is_lora, adv=True):
             self.bind(ui.number("Alpha", min=0), "lora_alpha").classes("w-full")
-        with self.setting("timestep_sampling", "Noise levels (timestep sampling)",
-                          "Which noise levels the steps train on. logit_normal (the default) favours the middle; "
-                          "logsnr spends most steps at very high noise, where an art style is learned (use it for "
-                          "styles). The Train tab has the rest: identity, content, style, sigmoid, uniform, "
-                          "reference.", when=lambda: self.goal != "character"):
-            self.bind(ui.select(["logit_normal", "sigmoid", "uniform", "identity", "content", "style", "logsnr",
-                                 "reference"], label="Timestep sampling"), "timestep_sampling").classes("w-full")
         with self.setting("batch_size", "Batch size",
-                          "Images per step. Larger batches need more memory and, for LoRAs, rarely help."):
+                          "Photos per step. Larger batches need more memory and, for LoRAs, rarely help.", adv=True):
             self.bind(ui.number("Batch size", min=1, precision=0), "batch_size").classes("w-full")
         is_krea = ("model_preset", lambda p: preset_arch(p, self.w["model_path"].value) == "krea2")
         with self.setting("target_text_fusion", "Train Krea's text fusion",
                           "Krea 2 mixes 12 layers of its text encoder in four text-fusion blocks before the main "
-                          "model. The usual attention + feed-forward LoRA leaves them under-trained: boosting them on "
-                          "finished LoRAs lifted likeness 2-7 points in Fizgig's tests. Training them adds about 3.5M "
-                          "LoRA weights, and the backward then runs through every block.", show_if=is_krea):
+                          "model. The usual LoRA leaves them under-trained: boosting them on finished LoRAs lifted "
+                          "likeness 2-7 points in Fizgig's tests. Adds about 8.9M LoRA weights at rank 16.",
+                          show_if=is_krea, adv=True):
             self.bind(ui.switch("Text fusion"), "target_text_fusion")
         with self.setting("target_attn_gate", "Train the attention gate",
                           "Every Krea 2 attention has a sigmoid gate on its output. Krea's own LoRAs train it.",
-                          show_if=is_krea):
+                          show_if=is_krea, adv=True):
             self.bind(ui.switch("Attention gate"), "target_attn_gate")
         is_qwen = ("model_preset", lambda p: preset_arch(p, self.w["model_path"].value) in ("qwen_image21",
                                                                                               "minimax_h3"))
         with self.setting("adapter_mode", "Training adapter",
                           "A small LoRA that stays on while your LoRA trains and off for samples and probes, and is "
-                          "never saved into it, so your LoRA works on the plain model. Fizgig measured on Qwen-Image "
-                          "2.1: without one, LoRAs collapse into texture or wobble part-way with no warning in the "
-                          "loss; with Fizgig's adapter (downloaded, 80 MB) likeness reached 77 against 56. MiniMax "
-                          "H3's is circlestone-labs' image training adapter (0.62 GB): musubi-tuner saw one-frame H3 "
-                          "LoRAs break up within about 50 steps without an adapter.",
-                          show_if=is_qwen):
+                          "never saved into it. Fizgig measured on Qwen-Image 2.1: without one, LoRAs collapse into "
+                          "texture or wobble part-way; with it likeness reached 77 against 56. MiniMax H3's is "
+                          "circlestone-labs' image training adapter.", show_if=is_qwen, adv=True):
             self.bind(ui.select(ADAPTER_MODES, label="Training adapter"), "adapter_mode").classes("w-full")
-        with self.setting("region_weights", "Region-weighted loss",
-                          "Weights what the model learns by region: the face counts most, the rest of the person "
-                          "next, the background least, so the LoRA spends its capacity on the identity.",
-                          show_if=("preset_toggle", bool)):
-            self.bind(ui.switch("Region-weighted loss"), "region_weights")
-        with self.setting("isolation", "LoRA Isolation",
-                          "A character LoRA tends to put its subject's face on everyone else. Isolation trains each "
-                          "picture again without its trigger, held to what the model does without the LoRA; fuses "
-                          "the trigger into one word (prompt with it joined, e.g. gweltman); adds pictures of the "
-                          "subject next to a generated stranger; and balances several subjects. Needs a trigger "
-                          "word. About 1.5-2x the training time.", when=self.is_character):
-            self.bind(ui.switch("LoRA Isolation"), "isolation")
-        with self.setting(None, "Trigger attention on the subject",
-                          "Reads, inside the model, where the trigger word's attention lands in each training "
-                          "picture and pulls it onto the person (their face box and silhouette), so the trigger is "
-                          "bound to them and not to the background or other people. Training-only: the LoRA file is "
-                          "the same. Not yet measured: race it.", when=self.is_character):
-            self.bind(ui.switch("Keep the trigger's attention on the subject"), "attn_localize")
-        with self.setting(None, "Identity alignment",
-                          "Teaches the face's tokens inside the model to carry that photo's identity (its ArcFace "
-                          "embedding), through a small helper network that is thrown away afterwards. Identity "
-                          "feedback at every noise level. Training-only. Not yet measured: race it.",
-                          when=self.is_character):
-            self.bind(ui.switch("Align the face tokens with the identity"), "id_align")
-        with self.setting(None, "Body alignment",
-                          "The same for the build: teaches the person's tokens inside the model to carry that photo's "
-                          "body (its DINOv2 body-window embedding, what the body probe scores), through a helper that "
-                          "is thrown away. Only photos showing the neck to mid-thigh count. Not yet measured: race it.",
-                          when=self.has_body):
-            self.bind(ui.switch("Align the body tokens with the build"), "body_align")
-        hint("Schedules, LoRA layers and blocks, the full fine-tune and per-image loss watch are on the Train tab.")
+        hw = ui.column().classes("w-full gap-3 pt-2")
+        self.show_when(hw, None, adv=True)
+        with hw:
+            ui.label("Your GPUs").classes("rz-setting-title")
+            hint("Filled in from your GPUs when the wizard sets up the run; change them here if you need to.")
+            self.gpu_box = ui.row().classes("w-full gap-3")
+            with self.gpu_box:
+                ui.spinner(size="sm")
+            self.apply_bar(["multi_gpu", "dp_balance", "transformer_quant", "text_encoder_quant",
+                            "gradient_checkpointing", "checkpoint_keep_blocks", "block_swap", "compile_model"])
+        self.hardware_settings()
         self.nav()
 
-    # ---- 6 samples
+    def follow_rank(self, rank):
+        if not self.adv and rank:
+            self.w["lora_alpha"].value = float(rank)
+
+    def hardware_settings(self):
+        with self.setting("multi_gpu", "Multi-GPU",
+                          "Data parallel puts a full model copy on each GPU, each trains its own images, and the "
+                          "results are averaged: about 1.7-2x the speed with two cards (each must fit the model). "
+                          "Model split divides the model's blocks over the GPUs: half the memory each, not faster.",
+                          adv=True):
+            self.bind(ui.select(dict(self.w["multi_gpu"].options), label="Multi-GPU"), "multi_gpu").classes("w-full")
+        with self.setting(None, "Training GPU", "The GPU that trains. Pick the one with the most memory (listed in "
+                                                "CUDA order).", adv=True, show_if=("multi_gpu", lambda x: x == "off")):
+            self.bind(ui.select(self.gpus, label="Training GPU"), "device").classes("w-full")
+        with self.setting(None, "GPUs to use", "Comma-separated, the first is the main GPU (it also saves and "
+                                               "samples).", adv=True, show_if=("multi_gpu", lambda x: x != "off")):
+            self.bind(ui.input("Devices"), "devices").classes("w-full")
+        with self.setting("dp_balance", "Balance unequal GPUs",
+                          "With two different cards the faster one waits for the slower one every step. auto measures "
+                          "them during the first steps and splits each step's images by speed (it needs a few images "
+                          "per step: gradient accumulation 3 or more). grow lets the faster card train more images in "
+                          "the same time instead.", adv=True, show_if=("multi_gpu", lambda x: x == "data_parallel")):
+            self.bind(ui.select(dict(self.w["dp_balance"].options), label="Balance"), "dp_balance").classes("w-full")
+        with self.setting("transformer_quant", "Model quantization",
+                          "Stores the frozen base model in fewer bits to save memory; the LoRA itself always trains in "
+                          "full precision. auto keeps the model as it is. int8_convrot halves it at under 1% error and "
+                          "is as fast as bf16 or faster; nvfp4 quarters it but is slower.", adv=True):
+            self.bind(ui.select(QUANTS, label="Diffusion model quant"), "transformer_quant").classes("w-full")
+        with self.setting("text_encoder_quant", "Text encoder quantization",
+                          "The text encoder only runs once before training, to turn your captions into embeddings, and "
+                          "is unloaded afterwards. Quantizing it lets it fit on the GPU, so that step is quick.",
+                          adv=True):
+            self.bind(ui.select(QUANTS, label="Text encoder quant"), "text_encoder_quant").classes("w-full")
+        with self.setting("gradient_checkpointing", "Gradient checkpointing",
+                          "Recomputes intermediate results during the backward pass instead of keeping them in memory: "
+                          "far less memory for some extra time per step.", adv=True):
+            self.bind(ui.switch("Gradient checkpointing"), "gradient_checkpointing")
+        with self.setting("checkpoint_keep_blocks", "Blocks that skip the recompute",
+                          "Spends spare GPU memory on speed: these blocks keep their intermediate results instead of "
+                          "recomputing them, about a third faster each. -1 measures your largest images at the start "
+                          "and keeps as many as fit; 0 recomputes every block.",
+                          adv=True, show_if=("gradient_checkpointing", bool)):
+            self.bind(ui.number("Kept blocks (-1 = auto)", min=-1, precision=0), "checkpoint_keep_blocks") \
+                .classes("w-full")
+        with self.setting("block_swap", "Block swap",
+                          "For a card the model does not fit: this many blocks keep their frozen weights in system RAM "
+                          "and stream to the GPU as each one runs. Measured on Krea 2 int8 (16 GB card): 14 of 28 "
+                          "blocks swapped cut the step's peak from 10.8 to 7.7 GB at about the same speed. Needs "
+                          "gradient checkpointing and one GPU. 0 = off.", adv=True,
+                          when=lambda: self.w["multi_gpu"].value == "off" and not self.w["finetune"].value):
+            self.bind(ui.number("Blocks swapped (0 = off)", min=0, precision=0), "block_swap").classes("w-full")
+        with self.setting("compile_model", "Compile the model",
+                          "torch.compile fuses the small steps between the big matrix multiplies: measured 26% faster "
+                          "per step on MOSS-Image and 12% on Krea 2, after a warm-up of under a minute. auto does it "
+                          "for runs of 100 steps or more.", adv=True):
+            self.bind(ui.select(COMPILE_CHOICES, label="Compile"), "compile_model").classes("w-full")
+
+    # ---- 5 samples and probes
     def step_samples(self):
-        self.heading("Checkpoints and preview images", "What gets saved along the way, and the pictures that show "
-                                                       "how training is going.")
-        # the sampling model first: the step and guidance recommendations depend on it
-        self.apply_bar(["sample_model_path", "save_every", "keep_checkpoints", "lora_ema", "sample_every",
-                        "sample_steps", "sample_cfg", "probe_every", "probe_steps", "probe_cfg", "probe_face_prompt",
-                        "probe_body_prompt"])
-        with self.setting("save_every", "Save a checkpoint every",
-                          "Steps between saved LoRAs (output/<job>/<job>_<step>.safetensors). Several of them let you "
-                          "pick the last one before it started to overfit."):
-            self.bind(ui.number("Save every", min=1, precision=0, suffix="steps"), "save_every").classes("w-full")
-        with self.setting("keep_checkpoints", "Checkpoints to keep",
-                          "Keeps only the newest N of the step checkpoints, deleting the oldest as new ones are "
-                          "saved. The final file and the best-likeness file are never deleted. 0 keeps every one."):
-            self.bind(ui.number("Keep", min=0, precision=0), "keep_checkpoints").classes("w-full")
-        with self.setting("lora_ema", "Weight average",
-                          "Each step pulls the LoRA toward the last image it saw, so a checkpoint carries a bit of "
-                          "chance. Saving a running average of the recent steps instead (about the last 50 images at "
-                          "0.98) steadies it: checkpoints, previews and likeness probes use the average while training "
-                          "goes on as before. 0 turns it off."):
-            self.bind(ui.number("Decay", min=0, max=0.999, step=0.005, format="%.3f"), "lora_ema").classes("w-full")
-        with self.setting("sample_every", "Preview images every",
-                          "Steps between sample sets (0 = never). Training pauses while they render; they show up "
-                          "on the Monitor and Samples tabs."):
-            self.bind(ui.number("Sample every", min=0, precision=0, suffix="steps"), "sample_every").classes("w-full")
+        self.heading("Samples and likeness checks", "Preview pictures show how training is going, and quick likeness "
+                                                    "checks (probes) score each checkpoint against your photos, keep "
+                                                    "the best one and stop when it no longer improves.")
         with self.setting(None, "Sample prompts",
-                          "One prompt per line, rendered at every sample step with a fixed seed, so the pictures are "
-                          "comparable over time. Use your trigger word and vary the scene to see whether the LoRA "
-                          "carries over to new situations."):
+                          "One prompt per line, drawn at every sample step with a fixed seed, so the pictures compare "
+                          "over time. Use your trigger word and vary the scene to see that the person carries over to "
+                          "new situations."):
             self.bind(ui.textarea("Sample prompts (one per line)"), "sample_prompts").classes("w-full")
             ui.button("Suggest prompts", icon="lightbulb", on_click=self.suggest).props("flat")
-        is_krea = ("model_preset", lambda p: preset_arch(p, self.w["model_path"].value) == "krea2")
-        with self.setting("sample_model_path", "Preview with Krea 2 Turbo",
-                          "Renders previews and probes with Krea-2-Turbo carrying your LoRA, while training stays on "
-                          "Raw. That is how Krea uses LoRAs trained on Raw, and Turbo needs 8 steps without guidance "
-                          "where Raw needs 28 or more with it. Empty = preview on Raw.", show_if=is_krea):
-            self.bind(ui.input("Sampling model (repo id or folder)"), "sample_model_path").classes("w-full")
-        with self.setting(None, "Turbo LoRA",
-                          "A step-distilled LoRA used only while rendering samples and probes, never in training: "
-                          "previews take seconds. The model's own is downloaded (MOSS-Image: 12 steps at CFG 1; "
-                          "Krea 2, Qwen-Image 2.1, Ideogram 4 and MiniMax H3: 8; FIBO 2.0: 4; FLUX 3 Klein has "
-                          "none) and the steps and guidance below follow it. "
-                          "For MOSS-Image, Fizgig found it can understate likeness: judge likeness on full-quality "
-                          "samples."):
-            self.bind(ui.select(TURBO_MODES, label="Turbo LoRA"), "turbo_mode").classes("w-full")
-            self.bind(path_field("Turbo LoRA file", "file", width="w-full"), "turbo_lora") \
-                .parent_slot.parent.bind_visibility_from(self.w["turbo_mode"], "value", lambda x: x == "file")
-        with self.setting("sample_steps", "Sampling steps", "Denoising steps per preview image. More is slower and "
-                                                            "a little cleaner."):
-            self.bind(ui.number("Sample steps", min=1, precision=0), "sample_steps").classes("w-full")
-        with self.setting("sample_cfg", "Guidance (CFG)", "How strictly previews follow the prompt."):
-            self.bind(ui.number("Sample CFG", min=0, step=0.5), "sample_cfg").classes("w-full")
-        is_identity = ("preset_toggle", bool)
-        with self.setting("probe_every", "Likeness probe every",
-                          "A quick, small headshot and full-body render every N steps, scored against your "
-                          "references. The scores keep the best checkpoint (<job>_best.safetensors) and can stop "
-                          "training once it stops improving.", show_if=is_identity):
+        with self.setting("sample_every", "Preview pictures every",
+                          "Steps between sample sets (0 = never). Training pauses while they render; they show on the "
+                          "Monitor and Samples tabs."):
+            self.bind(ui.number("Sample every", min=0, precision=0, suffix="steps"), "sample_every").classes("w-full")
+        with self.setting("save_every", "Save a checkpoint every",
+                          "Steps between saved LoRAs. Several of them let you pick a different one afterwards; the best "
+                          "by likeness is saved as <job>_best.safetensors anyway."):
+            self.bind(ui.number("Save every", min=1, precision=0, suffix="steps"), "save_every").classes("w-full")
+        with self.setting("probe_every", "Likeness check every",
+                          "A quick, small headshot (and full-body shot) every N steps, scored against your photos. "
+                          "Frequent checks pick the best checkpoint more precisely; each takes a few seconds."):
             self.bind(ui.number("Probe every", min=0, precision=0, suffix="steps"), "probe_every").classes("w-full")
+        adv_keys = ["sample_model_path", "keep_checkpoints", "sample_steps", "sample_cfg", "probe_steps", "probe_cfg",
+                    "probe_face_prompt", "probe_body_prompt"]
+        with ui.column().classes("w-full") as bar:
+            self.apply_bar(adv_keys)
+        self.show_when(bar, None, adv=True)
+        with self.setting(None, "Early stop", "Stop after this many likeness checks in a row without improvement "
+                                              "(0 = never: run all the steps). The best checkpoint is kept either way.",
+                          adv=True):
+            self.bind(ui.number("Checks without improvement", min=0, precision=0), "likeness_patience") \
+                .classes("w-full")
+        with self.setting("keep_checkpoints", "Checkpoints to keep",
+                          "Keeps only the newest N of the step checkpoints, deleting the oldest as new ones are saved. "
+                          "The final file and the best-likeness file are never deleted. 0 keeps every one.", adv=True):
+            self.bind(ui.number("Keep", min=0, precision=0), "keep_checkpoints").classes("w-full")
         with self.setting("probe_face_prompt", "Face probe prompt",
-                          "A plain headshot of your character, rendered with a fixed seed. Empty = no face "
-                          "probe.", when=self.has_face):
+                          "A plain headshot of your character, rendered with a fixed seed. Empty = no face probe.",
+                          when=self.has_face, adv=True):
             self.bind(ui.textarea("Face probe prompt").props("autogrow"), "probe_face_prompt").classes("w-full")
         with self.setting("probe_body_prompt", "Body probe prompt",
                           "A full-body, upright shot, for the body score. Empty = no body probe.",
-                          when=self.has_body):
+                          when=self.has_body, adv=True):
             self.bind(ui.textarea("Body probe prompt").props("autogrow"), "probe_body_prompt").classes("w-full")
-        with self.setting("probe_steps", "Probe steps", "Denoising steps per probe.", show_if=is_identity):
+        is_krea = ("model_preset", lambda p: preset_arch(p, self.w["model_path"].value) == "krea2")
+        with self.setting("sample_model_path", "Preview with Krea 2 Turbo",
+                          "Renders previews and probes with Krea-2-Turbo carrying your LoRA, while training stays on "
+                          "Raw: Turbo needs 8 steps without guidance where Raw needs 28 or more with it. Empty = "
+                          "preview on Raw.", show_if=is_krea, adv=True):
+            self.bind(ui.input("Sampling model (repo id or folder)"), "sample_model_path").classes("w-full")
+        with self.setting(None, "Turbo LoRA",
+                          "A step-distilled LoRA used only while rendering samples and probes, never in training: "
+                          "previews take seconds. The model's own is downloaded (MOSS-Image: 12 steps at CFG 1; Krea 2, "
+                          "Qwen-Image 2.1, Ideogram 4 and MiniMax H3: 8; FIBO 2.0: 4; FLUX 3 Klein has none) and the "
+                          "steps and guidance below follow it.", adv=True):
+            self.bind(ui.select(TURBO_MODES, label="Turbo LoRA"), "turbo_mode").classes("w-full")
+            self.bind(path_field("Turbo LoRA file", "file", width="w-full"), "turbo_lora") \
+                .parent_slot.parent.bind_visibility_from(self.w["turbo_mode"], "value", lambda x: x == "file")
+        with self.setting("sample_steps", "Sampling steps", "Denoising steps per preview picture. More is slower and a "
+                                                            "little cleaner.", adv=True):
+            self.bind(ui.number("Sample steps", min=1, precision=0), "sample_steps").classes("w-full")
+        with self.setting("sample_cfg", "Guidance (CFG)", "How strictly previews follow the prompt.", adv=True):
+            self.bind(ui.number("Sample CFG", min=0, step=0.5), "sample_cfg").classes("w-full")
+        with self.setting("probe_steps", "Probe steps", "Denoising steps per likeness probe.", adv=True):
             self.bind(ui.number("Probe steps", min=1, precision=0), "probe_steps").classes("w-full")
-        with self.setting("probe_cfg", "Probe guidance (CFG)", "Guidance for the probes.", show_if=is_identity):
+        with self.setting("probe_cfg", "Probe guidance (CFG)", "Guidance for the likeness probes.", adv=True):
             self.bind(ui.number("Probe CFG", min=0, step=0.5), "probe_cfg").classes("w-full")
-        with self.setting(None, "Self-training on its best pictures",
-                          "Halfway through, the LoRA draws about 30 pictures of your person in new scenes; the few "
-                          "that are clean, sharp and look more like them than the probes do train beside your photos "
-                          "for the rest of the run, at half weight and never more than a fifth of them. Cheap (a few "
-                          "minutes), but it can copy the model's own flaws: judge the samples by eye. Not yet "
-                          "measured: race it.", show_if=is_identity):
-            self.bind(ui.switch("Self-train on its best pictures"), "selftrain")
-        with self.setting(None, "Second stage: likeness reward fine-tuning",
-                          "After the steps, the LoRA renders groups of pictures of new prompts, the probes rate how "
-                          "much each looks like your person, and the LoRA learns to make the better ones more likely. "
-                          "It aims straight at likeness, but it is slow (a few seconds to a minute a step) and can "
-                          "learn to please the scorer instead of the eye: the probes keep the best checkpoint, and "
-                          "the first stage's LoRA is kept. 0 = off; try 100-200.", show_if=is_identity):
-            self.bind(ui.number("Reward steps", min=0, precision=0), "reward_steps").classes("w-full")
-        with self.setting(None, "Early stop", "Stop after this many probes in a row without improvement (0 = never: "
-                                              "run all the steps). The best checkpoint is kept either way.",
-                          show_if=is_identity):
-            self.bind(ui.number("Probes without improvement", min=0, precision=0), "likeness_patience") \
-                .classes("w-full")
         self.nav()
 
     def suggest(self):
@@ -4820,27 +4968,211 @@ class Wizard:
         if replaced:
             ui.notify("Replaced the sample prompts with suggestions")
 
-    # ---- race: the racers
-    def step_racers(self):
-        self.heading("The racers", "Every racer starts from the setup on the earlier pages, the base racer, and "
-                                   "changes only what you assign it below. They train in turn on the same images and "
-                                   "probes, and the likeness probes pick the winner.")
+    # ---- 6 extras and start
+    def step_extras(self):
+        self.heading("Extras and start", "The run is ready. Experimental settings are optional extras that might help "
+                                         "the likeness but are not part of the recipe yet; most have not been "
+                                         "measured. You can skip them.")
+        ui.label("Do you want to use any experimental settings?").classes("rz-setting-title")
+        with ui.element("div").classes("rz-choices"):
+            for answer, icon, title, text in (
+                    (False, "verified", "No, keep it simple",
+                     "Train with the recommended setup from the earlier pages. The best choice for a first LoRA."),
+                    (True, "science", "Yes, show me",
+                     "Pick extras to switch on. Each one says what it does and what testing found so far.")):
+                with ui.card().props("flat").classes("rz-choice") as c:
+                    with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                        ui.icon(icon).classes("rz-choice-icon")
+                        ui.label(title).classes("rz-setting-title")
+                        if not answer:
+                            ui.label("Recommended").classes("rz-badge")
+                        ui.space()
+                        ui.icon("check_circle").classes("rz-check")
+                    ui.label(text).classes("rz-hint")
+                c.on("click", lambda _, a=answer: self.extras_answer(a))
+                self.extras_cards[answer] = c
+        self.extras_box = ui.column().classes("w-full gap-3")
+        self.extras_box.visible = False
+        with self.extras_box:
+            self.build_experiments()
+        ui.label("Review").classes("rz-step-title pt-4")
+        self.review_box = ui.column().classes("w-full gap-3")
+        with ui.row().classes("w-full items-center gap-3 pt-2"):
+            self.cfg_path = ui.input("Save as", value="").classes("w-80 max-w-full")
+            ui.button("Save config", icon="save", on_click=self.save).props("outline")
+            ui.space()
+            if self.enqueue is not None:
+                ui.button("Add to queue", icon="playlist_add", on_click=self.enqueue).props("outline size=lg") \
+                    .tooltip("Start this run after the current one (and any queued before it) is done")
+            self.start_btn = ui.button("Start the race" if self.racing() else "Start training", icon="play_arrow",
+                                       on_click=self.start).props("unelevated size=lg")
+        with ui.stepper_navigation():
+            ui.button("Back", icon="arrow_back", on_click=lambda: self.move(-1)).props("flat")
+
+    def experiment_on(self, ex: dict) -> bool:
+        return not _same(self.w[ex["key"]].value, ex["off"])
+
+    def experiments_off(self):
+        for ex in EXPERIMENTS:
+            self.w[ex["key"]].value = ex["off"]
+
+    def extras_answer(self, yes: bool, quiet: bool = False):
+        self.extras_yes = yes
+        if not yes:
+            changed = [ex["title"] for ex in EXPERIMENTS if self.experiment_on(ex)]
+            self.experiments_off()
+            if changed and not quiet:
+                ui.notify(f"Turned off: {', '.join(changed)}", type="info")
+        self.mark_extras()
+        self.refresh()
+        background_tasks.create(self.render_review(), name="wizard review")
+
+    def mark_extras(self):
+        if not hasattr(self, "extras_box"):
+            return
+        yes = getattr(self, "extras_yes", None)
+        if yes is None:  # not answered yet: yes when something experimental is already on (a loaded config)
+            yes = any(self.experiment_on(ex) for ex in EXPERIMENTS)
+        for answer, c in self.extras_cards.items():
+            c.classes(add="selected") if answer == yes else c.classes(remove="selected")
+        self.extras_box.visible = yes
+        for ex, badge in getattr(self, "experiment_badges", []):
+            on = self.experiment_on(ex)
+            badge.text = "On" if on else "Off"
+            badge.classes(replace="rz-badge" + ("" if on else " muted"))
+        self.race_box.visible = self.racing()
+
+    def build_experiments(self):
+        self.experiment_badges: list[tuple] = []
+        with ui.dialog() as self.info_dlg, ui.card().classes("w-[40rem] max-w-full gap-3"):
+            self.info_title = ui.label("").classes("rz-step-title")
+            self.info_body = ui.column().classes("w-full gap-3")
+            with ui.row().classes("w-full justify-end"):
+                ui.button("Close", on_click=self.info_dlg.close).props("flat")
+        for group in EXPERIMENT_GROUPS:
+            ui.label(group).classes("rz-setting-title pt-2")
+            for ex in [e for e in EXPERIMENTS if e["group"] == group]:
+                box = ui.element("div").classes("rz-setting rz-exp")
+                if ex.get("when"):
+                    self.show_when(box, lambda ex=ex: ex["when"](self))
+                with box:
+                    with ui.column().classes("gap-1 min-w-0"):
+                        with ui.row().classes("items-center gap-2"):
+                            ui.label(ex["title"]).classes("rz-setting-title")
+                            badge = ui.label("Off").classes("rz-badge muted")
+                            self.experiment_badges.append((ex, badge))
+                            ui.label(EVIDENCE[ex["evidence"]][0]).classes(f"rz-evidence {ex['evidence']}") \
+                                .tooltip(EVIDENCE[ex["evidence"]][1])
+                        ui.label(ex["short"]).classes("rz-hint")
+                    with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                        with ui.element("div").classes("flex-1 min-w-0"):
+                            self.experiment_control(ex)
+                        ui.button("What is this?", icon="help_outline", on_click=lambda _, e=ex: self.explain(e),
+                                  color=None).props("flat no-caps dense").classes("rz-file-btn shrink-0")
+        with ui.column().classes("w-full gap-3") as self.race_box:
+            self.build_racers()
+            self.build_rules()
+
+    def experiment_control(self, ex: dict):
+        key, kind = ex["key"], ex["control"]
+        if kind == "switch":
+            self.bind(ui.switch(), key)
+        elif kind == "select":  # the form's own choices (a value set on the Train tab stays valid), named by the extra
+            form = self.w[key].options
+            options = {**(form if isinstance(form, dict) else {o: o for o in form}), **ex["options"]}
+            self.bind(ui.select(options, label=ex["title"]), key).classes("w-full")
+        elif kind == "text":
+            self.bind(ui.input(ex["title"]), key).classes("w-full").tooltip(ex.get("hint", ""))
+        else:  # a number: 0 is off
+            self.bind(ui.number(ex["title"], min=0, step=ex.get("step", 1), precision=ex.get("precision")), key) \
+                .classes("w-full").tooltip(ex.get("hint", ""))
+        self.w[key].on_value_change(lambda _: background_tasks.create(self.render_review(), name="wizard review"))
+
+    def explain(self, ex: dict):
+        self.info_title.text = ex["title"]
+        self.info_body.clear()
+        with self.info_body:
+            ui.label(EVIDENCE[ex["evidence"]][0]).classes(f"rz-evidence {ex['evidence']}")
+            for heading, text in (("What it does", ex["what"]), ("Testing so far", ex["tested"]),
+                                  ("Cost and limits", ex["cost"])):
+                if text:
+                    ui.label(heading).classes("rz-setting-title")
+                    ui.label(text).classes("text-sm")
+        self.info_dlg.open()
+
+    # ---- the race (an extra): the racers and its rules
+    def build_racers(self):
+        ui.label("The racers").classes("rz-step-title pt-2")
+        hint("Every racer starts from the setup on the earlier pages and changes only what you assign it below. They "
+             "train in turn on the same photos and probes, and the likeness probes pick the winner.")
         with self.setting(None, "How many racers",
-                          "Each racer trains up to the full steps, so every one adds to the time (the rules page "
-                          "shows the total). Two to four is a good race."):
+                          "Each racer trains up to the full steps, so every one adds to the time (shown below). Two to "
+                          "four is a good race."):
             self.racer_count = ui.number("Racers", value=self.n_racers, min=2, max=8, precision=0) \
                 .classes("w-full")
             self.racer_count.on_value_change(lambda e: self.set_racer_count(e.value))
         with self.setting(None, "What differs between them",
-                          "Pick the settings the racers may change; each racer below gets a field for each, filled "
-                          "in with the base value. Common picks: learning rate, LoRA rank, adapter type, or seed (the "
-                          "same setup trained twice, for a seed soup). Everything else stays the same for all."):
+                          "Pick the settings the racers may change; each racer below gets a field for each, filled in "
+                          "with the base value. Common picks: learning rate, LoRA rank, adapter type, or seed."):
             self.race_picker = ui.select(race_choice_options(), multiple=True, value=list(self.race_keys),
                                          label="Settings", with_input=True).props("use-chips").classes("w-full")
             self.race_picker.on_value_change(lambda e: self.set_race_keys(e.value))
         self.racer_grid = ui.element("div").classes("rz-racers w-full")
         self.race_check = ui.label("").classes("rz-banner info")
-        self.nav()
+
+    def build_rules(self):
+        ui.label("The race's rules").classes("rz-step-title pt-2")
+        hint("When racers leave the race, and how the winner is chosen.")
+        with self.setting(None, "Relay: everyone continues from the round's winner",
+                          "Nobody is dropped. After each round every racer takes over the round winner's LoRA "
+                          "(weights, optimizer state, weight average, likeness history) and trains on with its own "
+                          "settings, seed, image order and noise. Every racer trains all the steps (one run's cost per "
+                          "racer); the last round's winner is the run's LoRA. Racers must share the LoRA's shape: no "
+                          "rank, alpha, layer or network type rows."):
+            self.bind(ui.switch("Relay: continue from the round's winner"), "race_follow")
+        with self.setting(None, "Drop the lowest racer after each round",
+                          "Every racer trains until its next probe, then the next one does; after a round the one with "
+                          "the lowest likeness score leaves. Fast and cheap, but a racer that learns slowly and would "
+                          "end higher can be cut early. Off: every racer can train all the steps (the steps must be a "
+                          "multiple of the probe interval)."):
+            self.bind(ui.switch("Drop the lowest after each round"), "race_drop_lowest")
+        with self.setting(None, "Warm-up probe rounds",
+                          "Rounds before the first racer is dropped: everyone gets a few probes to get going. 1-2 is "
+                          "plenty.", show_if=("race_drop_lowest", bool)):
+            self.bind(ui.number("Warm-up rounds", min=0, precision=0), "race_warmup_probes").classes("w-full")
+        with self.setting(None, "Drop only when the probe seeds agree",
+                          "The racers are probed on the same seeds, so each seed compares them like for like. On: the "
+                          "lowest leaves only when its seeds put it below the round's leader with the confidence below "
+                          "(0.9 is a good start); a round too close to call drops nobody. Use 2 or more probe seeds.",
+                          show_if=("race_drop_lowest", bool), adv=True):
+            self.bind(ui.switch("Drop only when the seeds agree"), "race_paired")
+        with self.setting(None, "Confidence", "How sure the paired test must be that the lowest racer is behind.",
+                          show_if=("race_paired", bool), adv=True):
+            self.bind(ui.number("Confidence", min=0.5, max=0.99, step=0.05, precision=2),
+                      "race_drop_confidence").classes("w-full")
+        with self.setting(None, "Drop a racer when it stops improving",
+                          "A racer leaves once its own probes have not improved for a number of probes in a row, "
+                          "however it compares with the others. Good with slow starters. The winner is then the racer "
+                          "whose score was highest at any point."):
+            self.bind(ui.switch("Drop a racer when it stops improving"), "race_patience_drop")
+        with self.setting(None, "After how many probes without improvement",
+                          "3 gives a racer a fair chance; lower ends the race sooner.",
+                          show_if=("race_patience_drop", bool)):
+            self.bind(ui.number("Probes", min=1, precision=0), "race_patience").classes("w-full")
+        with self.setting(None, "Keep it while the likeness is rising again",
+                          "A racer out of patience is not dropped while its smoothed likeness is still going up from "
+                          "its previous probe: a chance to come back after a dip.",
+                          show_if=("race_patience_drop", bool), adv=True):
+            self.bind(ui.switch("Keep a racer whose likeness is rising"), "race_patience_rising")
+        with self.setting(None, "One racer per GPU at the same time",
+                          "With data parallel on 2+ GPUs: each GPU trains its own racer at once instead of all of them "
+                          "taking turns over every GPU. Not with the identity loss or self-training.",
+                          show_if=("multi_gpu", lambda x: x == "data_parallel")):
+            self.bind(ui.switch("One racer per GPU"), "race_parallel")
+        self.race_estimate = ui.label("").classes("rz-banner info")
+        for key in ("race_drop_lowest", "race_warmup_probes", "race_patience_drop", "race_patience", "race_follow",
+                    "race_patience_rising"):
+            self.w[key].on_value_change(lambda _: self.estimate_race())
 
     def load_racers(self):
         """Read the Train tab's race rows in once (a loaded config, or rows typed there)."""
@@ -4951,66 +5283,6 @@ class Wizard:
                                 race_review_line(cfg))
         self.race_check.classes(replace=f"rz-banner {'warning' if dup else 'info'}")
 
-    # ---- race: the rules
-    def step_rules(self):
-        self.heading("The race's rules", "When racers leave the race, and how the winner is chosen.")
-        with self.setting(None, "Relay: everyone continues from the round's winner",
-                          "Nobody is dropped. After each round every racer takes over the round winner's LoRA "
-                          "(weights, optimizer state, weight average, likeness history) and trains on with its own "
-                          "settings, seed, image order and noise. With racers that differ only in their seed, each "
-                          "round tries a few random paths from the best LoRA so far and keeps the best one. Every "
-                          "racer trains all the steps (one run's cost per racer); the last round's winner is the run's "
-                          "LoRA. Racers must share the LoRA's shape: no rank, alpha, layer or network type rows."):
-            self.bind(ui.switch("Relay: continue from the round's winner"), "race_follow")
-        with self.setting(None, "Drop the lowest racer after each round",
-                          "Every racer trains until its next probe, then the next one does; after a round the one "
-                          "with the lowest likeness score leaves. Fast and cheap, but a racer that learns slowly and "
-                          "would end higher can be cut early. Off: nobody is cut for being behind and every racer "
-                          "can train all the steps (up to one full run each; the steps must be a multiple of the "
-                          "probe interval)."):
-            self.bind(ui.switch("Drop the lowest after each round"), "race_drop_lowest")
-        with self.setting(None, "Warm-up probe rounds",
-                          "Rounds before the first racer is dropped: everyone gets a few probes to get going. 1-2 is "
-                          "plenty.", show_if=("race_drop_lowest", bool)):
-            self.bind(ui.number("Warm-up rounds", min=0, precision=0), "race_warmup_probes").classes("w-full")
-        with self.setting(None, "Drop only when the probe seeds agree",
-                          "The racers are probed on the same seeds, so each seed compares them like for like. On: "
-                          "the lowest leaves only when its seeds put it below the round's leader with the confidence "
-                          "below (0.9 is a good start); a round too close to call drops nobody, at most a few rounds "
-                          "in a row. Off: the lowest score leaves however small the gap. Use 2 or more probe seeds.",
-                          show_if=("race_drop_lowest", bool)):
-            self.bind(ui.switch("Drop only when the seeds agree"), "race_paired")
-        with self.setting(None, "Confidence", "How sure the paired test must be that the lowest racer is behind.",
-                          show_if=("race_paired", bool)):
-            self.bind(ui.number("Confidence", min=0.5, max=0.99, step=0.05, precision=2),
-                      "race_drop_confidence").classes("w-full")
-        with self.setting(None, "Drop a racer when it stops improving",
-                          "A racer leaves once its own probes have not improved for a number of probes in a row, "
-                          "however it compares with the others; the rest race on. Good with slow starters. With it, "
-                          "or without dropping the lowest, the winner is the racer whose score was highest at any "
-                          "point, and its best checkpoint becomes <job>_best.safetensors."):
-            self.bind(ui.switch("Drop a racer when it stops improving"), "race_patience_drop")
-        with self.setting(None, "After how many probes without improvement",
-                          "Probes in a row without a gain bigger than the noise band. 3 gives a racer a fair chance; "
-                          "lower ends the race sooner.", show_if=("race_patience_drop", bool)):
-            self.bind(ui.number("Probes", min=1, precision=0), "race_patience").classes("w-full")
-        with self.setting(None, "Keep it while the likeness is rising again",
-                          "A configuration out of patience is not dropped while its smoothed likeness is still going "
-                          "up from its previous probe: a chance to come back after a dip. It leaves at the first probe "
-                          "that does not rise (unless it beats its best, which resets the count).",
-                          show_if=("race_patience_drop", bool)):
-            self.bind(ui.switch("Keep a racer whose likeness is rising"), "race_patience_rising")
-        with self.setting(None, "One racer per GPU at the same time",
-                          "With data parallel on 2+ GPUs: each GPU trains its own racer at once instead of all of "
-                          "them taking turns over every GPU. Not with the identity loss or self-training.",
-                          show_if=("multi_gpu", lambda x: x == "data_parallel")):
-            self.bind(ui.switch("One racer per GPU"), "race_parallel")
-        self.race_estimate = ui.label("").classes("rz-banner info")
-        for key in ("race_drop_lowest", "race_warmup_probes", "race_patience_drop", "race_patience", "race_follow",
-                    "race_patience_rising"):
-            self.w[key].on_value_change(lambda _: self.estimate_race())
-        self.nav()
-
     def estimate_race(self):
         if not hasattr(self, "race_estimate"):
             return
@@ -5023,7 +5295,7 @@ class Wizard:
         n = len(cfg.race_configs or [])
         if n < 2 or cfg.probe_every <= 0:
             self.race_estimate.text = ("Pick at least two racers." if n < 2 else
-                                       "The race runs on the likeness probes: set a probe interval (Samples page).")
+                                       "The race runs on the likeness probes: set a likeness check interval (Samples & probes page).")
             return
         est = race.estimate_steps(n, cfg.race_warmup_probes, cfg.probe_every, cfg.steps,
                                   cfg.race_drop_lowest and not cfg.race_follow)
@@ -5046,24 +5318,6 @@ class Wizard:
             text += (f" A racer leaves after {cfg.race_patience} probes without improvement"
                      + (", unless its likeness is rising again." if cfg.race_patience_rising else "."))
         self.race_estimate.text = text
-
-    # ---- 7 review
-    def step_review(self):
-        self.heading("Review and start", "A last look at the run before it starts.")
-        self.review_box = ui.column().classes("w-full gap-3")
-        with ui.row().classes("w-full items-center gap-3 pt-2"):
-            self.cfg_path = ui.input("Save as", value="").classes("w-80 max-w-full")
-            ui.button("Save config", icon="save", on_click=self.save).props("outline")
-            ui.space()
-            ui.button("Adjust in all settings", icon="tune", on_click=lambda: self.goto("Train")).props("outline") \
-                .tooltip("The Train tab has every setting, already filled in from these pages")
-            if self.enqueue is not None:
-                ui.button("Add to queue", icon="playlist_add", on_click=self.enqueue).props("outline size=lg") \
-                    .tooltip("Start this run after the current one (and any queued before it) is done")
-            self.start_btn = ui.button("Start the race" if self.racing() else "Start training", icon="play_arrow",
-                                       on_click=self.start).props("unelevated size=lg")
-        with ui.stepper_navigation():
-            ui.button("Back", icon="arrow_back", on_click=lambda: self.move(-1)).props("flat")
 
     def save(self):
         try:
@@ -5098,9 +5352,6 @@ class Wizard:
         model = (Path(cfg.transformer_file).name or "Hugging Face model") if cfg.model_source == "files" \
             else next((k for k, v in MODEL_PRESETS.items() if v == cfg.model_path), cfg.model_path)
         rows = [
-            ("Goal", (GOALS[self.goal][1] + (f": {CHARACTER_FOCUS[self.focus][1].lower()}"
-                                             if self.goal == "character" else "")) if self.goal
-             else "not chosen (general settings)"),
             ("Job", f"{cfg.job_name}  ->  {_relative(str(cfg.job_dir()))}/"),
             ("Model", f"{model} ({'single files' if cfg.model_source == 'files' else 'Hugging Face'})"),
             ("GPUs", f"{multi}; model quant {cfg.transformer_quant}, text encoder quant {cfg.text_encoder_quant}"),
@@ -5108,7 +5359,10 @@ class Wizard:
             ("Trigger word", cfg.trigger_word or "(none)"),
             ("Resolution", ", ".join(f"{mp:g} MP" for mp in cfg.resolutions)
              + (" (datasets with their own: those)" if any(sp.resolutions for sp in cfg.dataset_specs()) else "")),
-            ("Training", f"{cfg.steps} steps, batch {cfg.batch_size}, lr {cfg.learning_rate:g}, {cfg.optimizer}"),
+            ("Training", f"{cfg.steps} steps, batch {cfg.batch_size}, lr {cfg.learning_rate:g}, {cfg.optimizer}"
+                         + (f", LoRA rank {cfg.lora_rank} / alpha {cfg.lora_alpha:g}" if cfg.network_type == "lora"
+                            and not cfg.finetune else "")),
+            ("Experimental", ", ".join(ex["title"] for ex in EXPERIMENTS if self.experiment_on(ex)) or "none"),
             ("Saving", f"every {cfg.save_every} steps; samples every {cfg.sample_every} steps "
                        f"({len(cfg.sample_prompts)} prompts)"),
         ]
@@ -5130,6 +5384,10 @@ class Wizard:
                     for k, v in rows:
                         ui.label(k).classes("k")
                         ui.label(v).classes("v")
+
+    def mark_race(self):
+        if hasattr(self, "start_btn"):
+            self.start_btn.text = "Start the race" if self.racing() else "Start training"
 
 
 # ---------------------------------------------------------------- previous runs
@@ -5746,14 +6004,18 @@ def build_page(local: bool = True):
                 nav = ui.column().classes("rz-nav gt-sm")
                 with ui.column().classes("gap-4 min-w-0 flex-1") as train_page:
                     sections = SectionNav()
+                    with ui.row().classes("rz-intro w-full items-center gap-3 no-wrap"):
+                        train_adv_switch = ui.switch("Advanced", value=False)
+                        hint("Off: the everyday settings. On: every option, the Advanced panels and the experimental "
+                             "settings and tools too (an experimental setting that is switched on always shows).")                             .classes("flex-1 min-w-0")
                     picker_row = ui.row().classes("w-full lt-md")
 
                     with sections.section("Basics", "Job", "Name, output folder, seed, preset and config file",
                                           "work_outline"):
                         with ui.row().classes("rz-intro w-full items-center gap-4"):
                             hint("New to this? The Wizard walks through the important settings with "
-                                 "recommendations. Rarely changed settings are folded under Advanced in each "
-                                 "section.").classes("flex-1 min-w-[16rem]")
+                                 "recommendations. Switch on Advanced above for every option, the "
+                                 "experimental settings and the tools.").classes("flex-1 min-w-[16rem]")
                             ui.button("Open the wizard", icon="auto_awesome", on_click=lambda: goto("Wizard")) \
                                 .props("outline")
                         with fields():
@@ -7674,10 +7936,15 @@ def build_page(local: bool = True):
 
                 sections.build(nav, picker_row)
                 inline_descriptions(train_page)
+                train_adv = TrainAdvanced(train_page, sections, w)
+                train_adv_switch.on_value_change(lambda e: train_adv.apply(e.value))
+                train_adv.apply(False)
 
         # ------------------------------------------------------------ Wizard (bound to the Train tab's widgets)
         with ui.tab_panel(tab_wizard):
-            Wizard(f, gpus, lambda: start_job(confirm=False), goto, queue_job).build()  # its review lists the warnings
+            wizard = Wizard(f, gpus, lambda: start_job(confirm=False), goto, queue_job)
+            wizard.build()  # its review lists the warnings
+            wizard.adv_switch.bind_value(train_adv_switch, "value")  # one Advanced switch for both tabs
 
         # ------------------------------------------------------------ Dataset
         with ui.tab_panel(tab_dataset):
@@ -8395,11 +8662,13 @@ def build_page(local: bool = True):
 
 HELP = """
 ## Wizard
-New to LoRA training? The **Wizard** tab walks through a run one topic at a time: what you are training, the model,
-your GPUs, the dataset, the training settings and the preview images, then a review with any problems it finds.
-Every setting is explained and comes with a recommendation worked out from your GPUs (memory) and your dataset
-(image count and size): *Use* takes one, *Apply recommended* takes every one on the page. The wizard edits the same
-settings as the Train tab, so you can switch between the two at any time.
+New to LoRA training? The **Wizard** tab sets up a character / person LoRA in six short pages: who you are training
+(job name, trigger word, how much of the person counts), the model, your photos, the training, samples and likeness
+checks, then the extras and the start. The basics are filled in for you (the identity recipe with LoRA rank 32,
+adamw8bit at 1e-4, and recommendations from your GPUs and photos). **Advanced** at the top shows every setting on every
+page. The last page asks whether you want experimental settings; each one has a *What is this?* button saying what it
+does and what testing found so far. The wizard edits the same settings as the Train tab, so you can switch between the
+two at any time; styles and concepts are set up on the Train tab.
 
 ## Quick start
 1. **Datasets**: on the Dataset tab, *Create dataset*, open it and upload images with same-name `.txt` captions (or
@@ -8554,7 +8823,7 @@ direction; steps are about 40% slower on Krea 2. OFT and DoRA files load in Comf
 compare them, race rows such as `network_type=oft` or `dora=true` against a LoKr row.
 
 ## Trigger attention and identity alignment
-Two training-only losses (Train tab, Region-weighted loss section; the Wizard's Training step for a character). **Keep
+Two training-only losses (Train tab, Region-weighted loss section; the Wizard's experimental extras). **Keep
 the trigger's attention on the subject** reads, inside the model, where the trigger word's attention lands in each
 picture and pulls it onto the person (their silhouette and face box), so the trigger is bound to them and not to the
 background or other people; it needs a trigger word. **Align the face tokens with the photo's identity** teaches the
@@ -8562,7 +8831,7 @@ face's tokens after one block to carry that photo's identity (its ArcFace embedd
 that is thrown away. The LoRA file is the same either way. Not yet measured: race them.
 
 ## Likeness reward fine-tuning (second stage)
-*Reward steps* (Likeness probes section, *Second stage*; or the Wizard's Samples step) adds a stage after the steps:
+*Reward steps* (Likeness probes section, *Second stage*; or the Wizard's experimental extras) adds a stage after the steps:
 the LoRA renders groups of 4 pictures of new prompts, the probes' scorers rate their likeness, and the better ones are
 made more likely and the worse ones less (Flow-GRPO), held near the first stage's LoRA. It aims straight at likeness
 but is slow and can learn what the scorer likes more than what you see: keep the probes on and look at the pictures.
