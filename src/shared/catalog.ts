@@ -295,6 +295,27 @@ export const CATALOG: CatalogApp[] = [
         'Best quality), Transformers and the SAM 3.1 model (1.7 GB).'
     ],
     highlights: ['Color noise removal', 'JPEG artifact removal (fast or AI)', 'Auto crop with SAM 3.1', 'Shadow lift', 'Global + per-image']
+  },
+  {
+    id: 'image-grid',
+    name: 'RulZ Image Grid',
+    tagline: 'Arranges images into a labelled grid and exports it as one picture',
+    description:
+      'Drop in images or a folder and lay them out in a grid with their file names underneath and your own row and ' +
+      'column labels. Drag tiles to rearrange them, set the columns, padding, text and background, then export the ' +
+      'whole grid as one PNG or JPG at up to full resolution, with the exact size shown before you save.',
+    category: 'Photos',
+    repo: SUITE_REPO,
+    path: 'apps/RulZ-Image-Grid',
+    tagPrefix: 'image-grid-v',
+    branch: 'main',
+    install: { kind: 'zip', asset: '^RulZ-Image-Grid-v[\\d.]+-win64\\.zip$' },
+    launch: { target: 'RulZ Image Grid.exe' },
+    requirements: [{ id: 'dotnet-fx' }],
+    folderName: 'RulZ Image Grid',
+    detect: ['%LOCALAPPDATA%\\Programs\\RulZ Image Grid\\RulZ Image Grid.exe'],
+    notes: ['A single .exe. Settings are kept in %APPDATA%\\RulZ Image Grid.'],
+    highlights: ['Drag-and-drop layout', 'Row & column labels', 'Full-resolution export', 'PNG or JPG']
   }
 ]
 

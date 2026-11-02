@@ -24,6 +24,7 @@ on:
       - 'clip-extractor-v*'
       - 'rulz-image-crawler-v*'
       - 'image-preparer-v*'
+      - 'image-grid-v*'
   pull_request:
     paths: ['apps/**', '.github/workflows/apps.yml']
 
@@ -52,6 +53,7 @@ jobs:
             [image-tournament]=RulZ-Image-Tournament [llm-suite]=rulz-llm-suite [coding-agent]=rulz-coding-agent
             [training-captioner]=Rulz-Training-Captioner [clip-extractor]=rulz-simple-video-clip-extractor
             [rulz-image-crawler]=rulz-image-crawler [image-preparer]=RulZ-Image-Preparer
+            [image-grid]=RulZ-Image-Grid
           )
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             tag="${GITHUB_REF#refs/tags/}"
@@ -105,6 +107,7 @@ jobs:
             'clip-extractor'     = @{ dir = 'rulz-simple-video-clip-extractor'; name = 'RulZ Simple Video Clip Extractor'; kind = 'python' }
             'rulz-image-crawler' = @{ dir = 'rulz-image-crawler'; name = 'RulZ Image Crawler'; kind = 'source' }
             'image-preparer'     = @{ dir = 'RulZ-Image-Preparer'; name = 'RulZ Image Preparer'; kind = 'source' }
+            'image-grid'         = @{ dir = 'RulZ-Image-Grid'; name = 'RulZ Image Grid'; kind = 'dotnet' }
           }
           $a = $apps[$env:APP]
           if (-not $a) { throw "Unknown app '$env:APP'" }
@@ -117,7 +120,7 @@ jobs:
         run: |
           $v = switch ($env:APP) {
             'image-organizer'  { (Select-String -Path "$env:DIR/rulz/config.py" -Pattern 'APP_VERSION\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value }
-            'image-tournament' { (Select-String -Path "$env:DIR/src/Program.cs" -Pattern 'AssemblyVersion\("(\d+\.\d+\.\d+)').Matches[0].Groups[1].Value }
+            { $_ -in 'image-tournament', 'image-grid' } { (Select-String -Path "$env:DIR/src/Program.cs" -Pattern 'AssemblyVersion\("(\d+\.\d+\.\d+)').Matches[0].Groups[1].Value }
             'clip-extractor'   { (Select-String -Path "$env:DIR/simplecut/__init__.py" -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value }
             'image-preparer'   { (Select-String -Path "$env:DIR/rulz/config.py" -Pattern 'APP_VERSION\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value }
             'rulz-image-crawler' { (Select-String -Path "$env:DIR/crawler_app/__init__.py" -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value }
@@ -189,17 +192,19 @@ jobs:
           New-Item -ItemType Directory -Force ../../out | Out-Null
           Copy-Item dist/*.zip ../../out/
 
-      # ---------- .NET Framework app (portable zip with one .exe) ----------
+      # ---------- .NET Framework apps (portable zip with one .exe) ----------
+      # Image Tournament builds with the csc.exe in Windows (and runs its tests); Image Grid needs the newer Roslyn
+      # compiler from Visual Studio, which the runner has.
       - if: env.KIND == 'dotnet'
         working-directory: ${{ env.DIR }}
         run: |
-          ./build.ps1 -Test
+          if ($env:APP -eq 'image-tournament') { ./build.ps1 -Test } else { ./build.ps1 }
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $stage = "../../stage/RulZ Image Tournament"
+          $stage = "../../stage/$env:NAME"
           New-Item -ItemType Directory -Force $stage, ../../out | Out-Null
-          Copy-Item "bin/RulZ Image Tournament.exe", README.md $stage
+          Copy-Item "bin/$env:NAME.exe", README.md, LICENSE, LOGO-NOTICE.md $stage
           Push-Location ../../stage
-          7z a -tzip -mx=9 "../out/RulZ-Image-Tournament-v$env:VERSION-win64.zip" "RulZ Image Tournament"
+          7z a -tzip -mx=9 "../out/$($env:NAME -replace ' ', '-')-v$env:VERSION-win64.zip" "$env:NAME"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           Pop-Location
 
