@@ -2413,11 +2413,14 @@ class Trainer(RaceParallelMixin):
         cfg = self.cfg
         for label, path, strength in (("Turbo LoRA", cfg.turbo_lora, cfg.turbo_lora_strength),
                                       ("Sampling LoRA", cfg.sample_lora, cfg.sample_lora_strength)):
-            if path:
+            if path and path != "auto":  # auto: resolve_downloads picks the file (or none) before the model loads
                 n = lora_mod.attach_extra_lora(model, path, strength,
                                                rename=getattr(self.arch, "lora_module_name", None),
                                                convert=getattr(self.arch, "extra_lora_converter", None))
                 log.info("%s %s: matched %d modules (strength %g, sampling only)", label, path, n, strength)
+                if not n:  # a LoRA of another model (a Krea 2 turbo LoRA kept after switching to MOSS-Image)
+                    raise ValueError(f"The {label} {path} matches no layer of this {self.arch.label} model: pick one "
+                                     f"made for it, or set it to auto / none")
                 if label == "Turbo LoRA" and n:
                     model.turbo_lora_attached = True  # the Krea 2 sampler then uses the distilled schedule
                     if getattr(model, "is_distilled", False):

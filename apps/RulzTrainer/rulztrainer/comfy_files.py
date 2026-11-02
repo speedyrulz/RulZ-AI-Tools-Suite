@@ -1,6 +1,7 @@
 """Single-file downloads: Comfy-Org's ComfyUI repackages for the model a config trains (model_source "files" with a
 file left empty), in the quant picked for it, the family's turbo LoRA (turbo_lora "auto"; none when samples render a
-Turbo checkpoint) and its training adapter (training_adapter "auto").
+Turbo checkpoint), its sampling LoRA (sample_lora "auto": MOSS-Image Base's SFT LoRA) and its training adapter
+(training_adapter "auto").
 
     planned_downloads(cfg)  what a run would fetch: [(field, repo, file)]
     resolve_downloads(cfg)  a copy of cfg with those fields set to the local files, downloading what is missing
@@ -11,7 +12,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 
-from .config import (ARCH_TRAINING_ADAPTER, ARCH_TURBO, COMFY_DIFFUSION_FILES, COMFY_DIFFUSION_QUANTS, COMFY_REPOS,
+from .config import (ARCH_SAMPLE_LORA, ARCH_TRAINING_ADAPTER, ARCH_TURBO, COMFY_DIFFUSION_FILES, COMFY_DIFFUSION_QUANTS, COMFY_REPOS,
                      COMFY_TEXT_ENCODER_FILES, COMFY_TEXT_ENCODER_QUANTS, COMFY_VAE_FILES, TrainConfig)
 from .config import COMFY_TEXT_ENCODER_REPOS
 
@@ -47,6 +48,8 @@ def planned_downloads(cfg: TrainConfig) -> list[tuple[str, str, str]]:
             out.append(("vae_file", repo, COMFY_VAE_FILES[fam]))
     if cfg.turbo_lora == "auto" and fam in ARCH_TURBO and not cfg.samples_on_distilled_model():
         out.append(("turbo_lora", ARCH_TURBO[fam]["repo"], ARCH_TURBO[fam]["file"]))
+    if cfg.sample_lora == "auto" and fam in ARCH_SAMPLE_LORA and cfg.samples_on_base_model():
+        out.append(("sample_lora", ARCH_SAMPLE_LORA[fam]["repo"], ARCH_SAMPLE_LORA[fam]["file"]))
     if cfg.training_adapter == "auto" and fam in ARCH_TRAINING_ADAPTER and not cfg.finetune:
         out.append(("training_adapter", ARCH_TRAINING_ADAPTER[fam]["repo"], ARCH_TRAINING_ADAPTER[fam]["file"]))
     return out
@@ -72,6 +75,8 @@ def resolve_downloads(cfg: TrainConfig, progress=None) -> TrainConfig:
         if cfg.samples_on_distilled_model():
             log.info("turbo_lora auto: none, the sampling model is already a distilled (Turbo) checkpoint")
         changes["turbo_lora"] = ""  # a family without a turbo LoRA, or a Turbo model that needs none
+    if cfg.sample_lora == "auto" and "sample_lora" not in changes:
+        changes["sample_lora"] = ""  # samples render another model than the family's base checkpoint (SFT, Turbo)
     if cfg.training_adapter == "auto" and "training_adapter" not in changes:
         changes["training_adapter"] = ""  # a family without a training adapter (or a fine-tune)
     return dataclasses.replace(cfg, **changes) if changes else cfg

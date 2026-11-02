@@ -24,7 +24,7 @@ from nicegui import app, run, ui
 
 from rulztrainer.archs import get_arch
 from rulztrainer.config import (AUTOMAGIC, KEEL, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
-                                MODEL_PRESETS,
+                                MODEL_PRESETS, ARCH_SAMPLE_LORA,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
 from rulztrainer import bodysim, facesim, history, lookfilter
 from rulztrainer.train_queue import TrainQueue
@@ -83,7 +83,9 @@ FILE_QUANT_LABELS["nvfp4_mixed"] = "nvfp4 mixed (about a quarter of bf16)"  # Id
 FILE_QUANT_LABELS["nvfp4"] = "nvfp4 (about a third of bf16)"  # Ideogram 4's Qwen3-VL-8B text encoder
 TURBO_MODES = {"auto": "The model's turbo LoRA (downloaded)", "none": "None: full-quality sampling",
                "file": "A LoRA file"}
-ADAPTER_MODES = {"auto": "The model's training adapter (downloaded; Qwen-Image 2.1)", "none": "None",
+SAMPLE_LORA_MODES = {"auto": "The model's sampling LoRA (downloaded; MOSS-Image Base: the SFT LoRA)", "none": "None",
+                     "file": "A LoRA file"}
+ADAPTER_MODES = {"auto":"The model's training adapter (downloaded; Qwen-Image 2.1)", "none": "None",
                  "file": "A LoRA file"}
 ADAPTER_MODES["auto"] = "The model's training adapter (downloaded; Qwen-Image 2.1, MiniMax H3)"
 # MiniMax H3's Comfy-Org formats (h3/loading.py: the pruned files drop the ~13B AdaLN parameters)
@@ -448,6 +450,10 @@ def _start_training(cfg: TrainConfig) -> str:
     missing = [sp.path or "(none picked)" for sp in cfg.dataset_specs() if not sp.path or not Path(sp.path).is_dir()]
     if missing:
         return f"Dataset folder not found: {', '.join(missing)}"
+    foreign = cfg.foreign_sampling_files()
+    if foreign:  # TrainConfig.validate refuses it in the job too: say so here instead of in its log
+        return (f"Not started: this run trains {cfg.arch_name()}, but these settings name another model's files: "
+                f"{'; '.join(foreign)}. Clear them (or set auto).")
     if cfg.model_source == "files":
         for n in ("transformer_file", "text_encoder_file", "vae_file"):
             if getattr(cfg, n) and not Path(getattr(cfg, n)).is_file():
@@ -1174,9 +1180,36 @@ class Form:
                     self.w[f"target_{t}"].value = t in ARCH_DEFAULT_TARGETS[family]
         # the sample steps / CFG likewise: each family samples at its own (its turbo LoRA's, or full quality)
         if not self.loading:
+            self.clear_foreign_sampling_files(family)
             self.follow_sample_defaults(self.target_family, family, self.turbo_on(), self.turbo_on())
             self.set_quant_options(family)
         self.target_family = family
+
+    def clear_foreign_sampling_files(self, family: str) -> None:
+        """On a model change, empty the sampling model and set the sampling-only LoRA files back to auto when their
+        names belong to another family: the previous model's (Krea 2's krea/Krea-2-Turbo preview model, its turbo
+        LoRA) would otherwise stay in fields the new model's page hides, and its run sample on Krea 2 Turbo."""
+        from rulztrainer.config import sampling_file_family
+
+        def foreign(key):
+            value = (self.w[key].value or "").strip() if self.w.get(key) is not None else ""
+            named = sampling_file_family(key, value)
+            return named is not None and named != family
+
+        cleared = []
+        if foreign("sample_model_path"):
+            self.w["sample_model_path"].value = ""
+            cleared.append("sampling model")
+        for key, mode, label in (("turbo_lora", "turbo_mode", "turbo LoRA"),
+                                 ("sample_lora", "sample_lora_mode", "sampling LoRA"),
+                                 ("training_adapter", "adapter_mode", "training adapter")):
+            if self.w.get(mode) is not None and self.w[mode].value == "file" and foreign(key):
+                self.w[key].value = ""
+                self.w[mode].value = "auto"
+                cleared.append(label)
+        if cleared:
+            ui.notify(f"The previous model's {', '.join(cleared)} cleared (set back to auto) for the new model",
+                      type="info")
 
     def turbo_on(self) -> bool:
         mode = self.w.get("turbo_mode")
@@ -1308,7 +1341,8 @@ class Form:
             turbo_lora={"auto": "auto", "none": ""}.get(v("turbo_mode"), s("turbo_lora")),
             turbo_lora_strength=float(v("turbo_lora_strength")),
             sample_model_path=s("sample_model_path"), sample_model_quant=v("sample_model_quant"),
-            sample_lora=s("sample_lora"), sample_lora_strength=float(v("sample_lora_strength")),
+            sample_lora={"auto": "auto", "none": ""}.get(v("sample_lora_mode"), s("sample_lora")),
+            sample_lora_strength=float(v("sample_lora_strength")),
             training_adapter={"auto": "auto", "none": ""}.get(v("adapter_mode"), s("training_adapter")),
             training_adapter_strength=float(v("training_adapter_strength") if v("training_adapter_strength") is not None
                                             else 1.0),
@@ -1400,6 +1434,8 @@ class Form:
         values["turbo_mode"] = ("auto" if cfg.turbo_lora == "auto" else "file" if cfg.turbo_lora else "none")
         values["finetune_extract_ranks"] = ", ".join(str(r) for r in cfg.finetune_extract_ranks)
         values["turbo_lora"] = "" if cfg.turbo_lora == "auto" else cfg.turbo_lora
+        values["sample_lora_mode"] = ("auto" if cfg.sample_lora == "auto" else "file" if cfg.sample_lora else "none")
+        values["sample_lora"] = "" if cfg.sample_lora == "auto" else cfg.sample_lora
         values["adapter_mode"] = ("auto" if cfg.training_adapter == "auto" else "file" if cfg.training_adapter
                                   else "none")
         values["training_adapter"] = "" if cfg.training_adapter == "auto" else cfg.training_adapter
@@ -3430,6 +3466,10 @@ def extra_review_rows(cfg: TrainConfig) -> list[tuple[str, str]]:
         turbo = ", with your turbo LoRA"
     else:
         turbo = ", plain model"
+    if cfg.sample_lora == "auto" and cfg.arch_name() in ARCH_SAMPLE_LORA and cfg.samples_on_base_model():
+        turbo += " + the SFT LoRA (Base previews with SFT's look)"
+    elif cfg.sample_lora and cfg.sample_lora != "auto":
+        turbo += f" + {Path(cfg.sample_lora).name}"
     rows.append(("Previews", f"{cfg.sample_steps} steps, CFG {cfg.sample_cfg:g}{turbo}"))
     options = []
     if cfg.timestep_sampling != "logit_normal":
@@ -6451,7 +6491,9 @@ def build_page(local: bool = True):
                                                     lambda p: preset_arch(p, w["model_path"].value) == "minimax_h3")
                         hint("MOSS-Image: lodestones' turbo LoRA renders 12 steps at CFG 1 on Base. Fizgig found it "
                              "can understate likeness: judge a run's likeness on full-quality samples (Turbo LoRA: "
-                             "none, 20 steps, CFG 3).").bind_visibility_from(
+                             "none, 20 steps, CFG 3). Training on Base, the samples also carry Kijai's SFT LoRA "
+                             "(Sampling LoRA: auto, under Seeds, negative prompt and sampling models)."
+                             ).bind_visibility_from(
                             w["model_preset"], "value", lambda p: preset_arch(p, w["model_path"].value) == "moss_image")
                         hint("FLUX 3 Klein: no turbo LoRA. Base samples 50 steps at CFG 3.5 (BFL's settings, about 2.5 "
                              "min per 1 MP preview on a 16 GB card). Faster previews: set the distilled "
@@ -6477,11 +6519,19 @@ def build_page(local: bool = True):
                             hint("Use a different checkpoint (e.g. SFT) for sample images only; the trained LoRA is "
                                  "copied onto it. The training model is parked in system RAM while sampling.")
                             with fields():
-                                path_input(f, "sample_lora", "Secondary LoRA for sampling (optional, applied with the "
-                                                             "turbo LoRA)", "file", "", "w-[34rem]")
-                                w["sample_lora_strength"] = ui.number("Secondary LoRA strength",
+                                w["sample_lora_mode"] = ui.select(SAMPLE_LORA_MODES, value="auto",
+                                                                  label="Sampling LoRA").classes("w-96") \
+                                    .tooltip("A second LoRA used only while rendering samples and probes, with the "
+                                             "turbo LoRA, never in training. Auto: on MOSS-Image Base, Kijai's SFT "
+                                             "LoRA (1.2 GB, SFT minus Base), so previews show the LoRA as it looks on "
+                                             "SFT; nothing for the other models or a separate sampling model.")
+                                path_input(f, "sample_lora", "Sampling LoRA file", "file", "", "w-[34rem]")
+                                f.w["sample_lora"].parent_slot.parent.bind_visibility_from(
+                                    w["sample_lora_mode"], "value", lambda x: x == "file")
+                                w["sample_lora_strength"] = ui.number("Sampling LoRA strength",
                                                                       value=d.sample_lora_strength, step=0.05) \
-                                    .classes("w-48")
+                                    .classes("w-48") \
+                                    .bind_visibility_from(w["sample_lora_mode"], "value", lambda x: x != "none")
 
                     def _begin(text):
                         _task_progress.update(text=text, frac=None, active=True)

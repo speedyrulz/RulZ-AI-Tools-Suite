@@ -44,7 +44,7 @@ def test_planned_downloads_per_model_and_quant():
     own = TrainConfig(model_path="briaai/Fibo-2.0-dev", transformer_file="a", text_encoder_file="b", vae_file="c",
                       turbo_lora="")
     assert CF.planned_downloads(own) == []
-    assert [f for f, _, _ in CF.planned_downloads(TrainConfig(model_source="hf"))] == ["turbo_lora"]
+    assert [f for f, _, _ in CF.planned_downloads(TrainConfig(model_source="hf"))] == ["turbo_lora", "sample_lora"]
     with pytest.raises(ValueError, match="fp8_scaled"):
         CF.planned_downloads(TrainConfig(model_path="briaai/Fibo-2.0-dev", model_file_quant="fp8_scaled"))
     with pytest.raises(ValueError, match="No single-file download"):
