@@ -681,9 +681,12 @@ it has not been measured on the models here.
 `sample_seed` is the seed of the first prompt; with `sample_walk_seed` each further prompt uses seed + 1.
 `sample_before_training` renders a sample set at step 0 for comparison. The log reports each prompt and the
 Monitor page shows the sampling step. The Monitor page also has per-GPU VRAM/utilization bars, an adjustable
-loss-smoothing slider, an auto-scrolling log and, under *Log and saved files*, a download button for every LoRA the run
-has saved (the checkpoints, the best and the final file), so a run on a rented or remote GPU hands its LoRAs straight to
-the browser. Only `.safetensors` files inside a run's folder are served. `compile_model` (default `auto`, see
+loss-smoothing slider, an auto-scrolling log and, under *Log and saved files*, the run's downloads: pick any LoRA in
+the job folder (the checkpoints, the best and the final file, newest first) and *Download* it, *All LoRAs (.zip)* packs
+every one into one archive, and *Logs and settings (.zip)* packs `train.log`, `config.yaml`, `status.json`, the
+likeness scores and the run's other text files. So a run on a rented or remote GPU hands its LoRAs straight to the
+browser. Only files inside a run's folder (one with a `status.json`) are served. Every Monitor chart folds away like
+the other sections. `compile_model` (default `auto`, see
 [torch.compile](#torchcompile-compile_model)) runs the DiT blocks through torch.compile
 (skipped with a warning if triton is not installed; `triton-windows` from requirements.txt provides it on Windows).
 No C++ compiler is needed: the blocks are compiled with Dynamo's `specialize_float` so the LoRA scale and
@@ -1487,6 +1490,15 @@ after it (`<run> lora16 - face`; the winner's after the race: `winner`); *Import
 saved before it existed, while their job folder is still there. *Rename* gives a run a name of your own and *Remove from history* deletes
 its history file only (never the job folder). *Export spreadsheet* downloads each ticked run's likeness spreadsheet (see
 *Export spreadsheet* under the likeness probes), from the raw probe scores the history keeps for it.
+
+**Saved files** (under the table) has the Monitor's downloads for a ticked run (with several ticked, pick which): one
+LoRA, all of them as a zip, or the logs and settings as a zip, so a run's files can still be fetched after the next run
+starts. They come from the run's job folder while it still holds that run: a later run of the same job name reuses the
+folder, and then the section says so (runs since v2.29.0 record their id in `status.json`; for older runs any later saved
+run of the same job name counts).
+
+During a race the Monitor's *Likeness probes & controller* chart has the same chips, *Show lines (all
+configurations)*: switch Face, Body or Combined off to hide that line of every configuration at once.
 
 **Compare on one scale** (above the *Likeness probes & controller* chart) rescores the ticked runs and the table on the
 same face span / curve, body span / curve and face weight, instead of each run's own settings: runs trained with
