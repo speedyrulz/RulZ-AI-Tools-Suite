@@ -33,6 +33,7 @@ def forward_backward(job):
     """Forward + backward of one batch of one configuration on one model copy (the trainer's `work`, with the
     configuration's settings in the job). Returns (loss value, per-image multipliers, None)."""
     from . import lora as lora_mod
+    from .losses import elementwise_loss
     from .trainer import loss_weight
 
     (rmodel, rinj, rdev), batch, latents, embeds, mask, sigma, noise, regions, cur_step, n_total, ctx = job
@@ -44,7 +45,7 @@ def forward_backward(job):
     target = noise - latents
     noisy_in = noisy.to(torch.bfloat16)
     pred = rmodel(noisy_in, sigma * 1000.0, embeds, mask).float()
-    sq = (pred - target).pow(2)
+    sq = elementwise_loss(cfg.loss_type, pred, target, latents, noise, sigma)
     if regions is not None and cfg.region_weights:
         sq = sq * regions.weight.to(rdev)
     per = sq.mean(dim=(1, 2, 3))

@@ -212,15 +212,20 @@ def _prompt_ids(tokenizer, text: str, max_length: int) -> torch.Tensor:
 
 
 @torch.no_grad()
-def encode_prompt(text_encoder, tokenizer, prompt: str, max_length: int = 1024) -> torch.Tensor:
-    """Text features for one prompt: [S, 53248] bf16 on the CPU (see the module docstring); [0, 53248] for the empty
-    prompt. The prompt is cut to max_length tokens (at most 2048, the pipelines' limit) with the chat turn's end kept."""
-    text = prompts.as_caption(prompt)
-    if not text:
-        return torch.zeros(0, TEXT_DIM, dtype=torch.bfloat16)
-    input_ids = _prompt_ids(tokenizer, text, max_length).to(_input_device(text_encoder))
-    n = input_ids.shape[1]
-    position_ids = torch.arange(n, device=input_ids.device).view(1, 1, n).expand(3, 1, n)
+def encode_prompts(text_encoder, tokenizer, prompt_list: list[str], max_length: int = 1024) -> list[torch.Tensor]:
+    """Text features for each prompt: [S_i, 53248] bf16 on the CPU (see the module docstring), the non-empty ones in
+    one forward; [0, 53248] for an empty prompt. A prompt is cut to max_length tokens (at most 2048, the pipelines'
+    limit) with the chat turn's end kept."""
+    texts = [prompts.as_caption(p) for p in prompt_list]
+    out: list[torch.Tensor] = [torch.zeros(0, TEXT_DIM, dtype=torch.bfloat16) for _ in texts]
+    todo = [i for i, t in enumerate(texts) if t]
+    if not todo:
+        return out
+    rows = [_prompt_ids(tokenizer, texts[i], max_length)[0] for i in todo]
+    ids, mask = moss_loading.right_pad(rows)
+    device = _input_device(text_encoder)
+    b, n = ids.shape
+    position_ids = torch.arange(n, device=device).view(1, 1, n).expand(3, b, n)
     layers = _layers(text_encoder)
     taps: dict[int, torch.Tensor] = {}
 
@@ -231,12 +236,21 @@ def encode_prompt(text_encoder, tokenizer, prompt: str, max_length: int = 1024) 
 
     handles = [layers[i].register_forward_hook(hook(i)) for i in QWEN3_VL_ACTIVATION_LAYERS]
     try:
-        text_encoder(input_ids=input_ids, attention_mask=torch.ones_like(input_ids), position_ids=position_ids)
+        text_encoder(input_ids=ids.to(device), attention_mask=mask.to(device), position_ids=position_ids)
     finally:
         for h in handles:
             h.remove()
-    feats = torch.stack([taps[i][0].to("cpu", torch.float32) for i in QWEN3_VL_ACTIVATION_LAYERS], dim=-1)
-    return feats.reshape(n, -1).to(torch.bfloat16)  # [S, 4096, 13] -> [S, 53248], the layer index fastest
+    for row, (i, r) in enumerate(zip(todo, rows)):
+        k = r.numel()
+        feats = torch.stack([taps[j][row, :k].to("cpu", torch.float32) for j in QWEN3_VL_ACTIVATION_LAYERS], dim=-1)
+        out[i] = feats.reshape(k, -1).to(torch.bfloat16)  # [S, 4096, 13] -> [S, 53248], the layer index fastest
+    return out
+
+
+def encode_prompt(text_encoder, tokenizer, prompt: str, max_length: int = 1024) -> torch.Tensor:
+    """Text features for one prompt: [S, 53248] bf16 on the CPU (see the module docstring); [0, 53248] for the empty
+    prompt. The prompt is cut to max_length tokens (at most 2048, the pipelines' limit) with the chat turn's end kept."""
+    return encode_prompts(text_encoder, tokenizer, [prompt], max_length)[0]
 
 
 def get_tokenizer(cfg: TrainConfig, model_dir: Path | None):
