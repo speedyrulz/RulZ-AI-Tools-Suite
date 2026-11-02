@@ -1278,7 +1278,8 @@ class Form:
             keel_lookahead_lr=float(v("keel_lookahead_lr")), keel_lookahead_grace=int(v("keel_lookahead_grace")),
             keel_face_gain=float(v("keel_face_gain")), keel_face_gain_max=float(v("keel_face_gain_max")),
             keel_face_gain_beta=float(v("keel_face_gain_beta")), keel_body_weight=float(v("keel_body_weight")),
-            timestep_shift=float(v("timestep_shift")), sigmoid_scale=float(v("sigmoid_scale")),
+            timestep_shift=float(v("timestep_shift")), timestep_buckets=int(v("timestep_buckets") or 0),
+            sigmoid_scale=float(v("sigmoid_scale")),
             logsnr_mean=float(v("logsnr_mean")), logsnr_std=float(v("logsnr_std")),
             block_swap=int(v("block_swap") or 0),
             clean_share=str(v("clean_share") or "").strip(),
@@ -6316,6 +6317,14 @@ def build_page(local: bool = True):
                                                           lambda x: x == "logit_normal")
                                 w["timestep_shift"] = ui.number("Timestep shift", value=d.timestep_shift) \
                                     .classes("w-32")
+                                w["timestep_buckets"] = ui.number("Timestep buckets (0 = off)",
+                                                                  value=d.timestep_buckets, min=0, precision=0) \
+                                    .classes("w-48").tooltip(
+                                        "Cuts the sampling curve above into this many equal slices and makes every "
+                                        "that many training draws take one from each, so a short run or a small "
+                                        "dataset covers the whole curve evenly instead of by luck. The curve's shape "
+                                        "stays the same. 2 and more; 10 to 20 is a usual start (musubi-tuner's "
+                                        "num_timestep_buckets). Not with the reference sampler.")
                             with fields():
                                 w["clean_share"] = ui.input("Clean-end share (%, by epoch)", value=d.clean_share,
                                                             placeholder="empty = the sampler's own") \
@@ -7259,6 +7268,78 @@ def build_page(local: bool = True):
                                          "<job>_soup.safetensors and soup/soup.json. Uses this page's model, "
                                          "references and probe settings; more probe seeds give a steadier choice.")
 
+                    # ---- Post-hoc EMA
+                    with section("Post-hoc EMA", "Average a finished run's checkpoints, choosing the decay afterwards",
+                                 "timeline", open_=False) as sec:
+                        nav_items.append(("Post-hoc EMA", "timeline", sec))
+                        hint("Weight average (lora_ema) smooths the LoRA while it trains, with a decay you choose "
+                             "before the run. This makes the same kind of average after the run from the step "
+                             "checkpoints it kept, so you can try a few decays on finished files and keep the one you "
+                             "like (musubi-tuner's post-hoc EMA). Checkpoints of one run, in any order: they are put "
+                             "in step order. Checkpoints to keep limits how far back it can reach. LoRA and LoKr "
+                             "files; not OFT or DoRA.")
+                        ema_files = ui.textarea("Checkpoints (one per line)").props("autogrow").classes("w-full")
+                        with fields():
+                            ema_mode = ui.select({"sigma_rel": "Power (EDM2)", "beta": "Decay per checkpoint"},
+                                                 value="sigma_rel", label="Average").classes("w-56") \
+                                .tooltip("Power weighs the checkpoints by their step whatever their number. A decay "
+                                         "starts from the oldest file, so with few checkpoints it leans on it: 0.9 "
+                                         "over 4 checkpoints leaves 73% on the oldest.")
+                            ema_beta = ui.number("Decay", value=0.5, min=0, max=0.999, step=0.05).classes("w-28") \
+                                .bind_visibility_from(ema_mode, "value", lambda x: x == "beta") \
+                                .tooltip("Each newer checkpoint takes (1 - decay) of the average. 0.5 leans on the "
+                                         "last two or three; 0.9 suits 20 or more checkpoints (over 10 the oldest "
+                                         "still weighs about 39%).")
+                            ema_beta2 = ui.number("End decay (optional)", value=None, min=0, max=0.999,
+                                                  step=0.05).classes("w-44") \
+                                .bind_visibility_from(ema_mode, "value", lambda x: x == "beta") \
+                                .tooltip("Slides the decay in a straight line from Decay to this over the files; "
+                                         "empty keeps it the same.")
+                            ema_sigma = ui.number("sigma_rel", value=0.15, min=0.01, max=0.28, step=0.01) \
+                                .classes("w-28").bind_visibility_from(ema_mode, "value", lambda x: x == "sigma_rel") \
+                                .tooltip("The power-function average of Karras et al. (EDM2): every training step "
+                                         "weighs by its step number to a power. 0.05 to 0.2; smaller leans harder "
+                                         "on the last steps. 0.15 over 4 checkpoints: the newest 69%, the one before "
+                                         "25%.")
+                            ema_rank = ui.number("Rank (optional)", value=None, min=0, precision=0).classes("w-36") \
+                                .tooltip("Empty: the files' own rank, which keeps nearly all of an average of one "
+                                         "run's checkpoints. 0: exact, at the sum of their ranks (a larger file).")
+                        ema_info = ui.label("").classes("text-sm")
+
+                        def ema_fill():
+                            cfg = f.to_config()
+                            found = sorted(p for p in cfg.job_dir().glob(f"{cfg.job_name}_*.safetensors")
+                                           if re.fullmatch(rf"{re.escape(cfg.job_name)}_\d+", p.stem))
+                            ema_files.value = "\n".join(str(p) for p in found)
+                            ema_info.text = (f"{len(found)} checkpoints of {cfg.job_name}" if found else
+                                             f"No step checkpoints in {cfg.job_dir()}")
+
+                        async def ema_now():
+                            from rulztrainer.posthoc_ema import describe, make_ema
+
+                            files = [p.strip().strip('"') for p in (ema_files.value or "").splitlines() if p.strip()]
+                            cfg = f.to_config()
+                            power = ema_mode.value == "sigma_rel"
+                            tag = (f"sr{ema_sigma.value:g}" if power else f"b{ema_beta.value:g}"
+                                   + (f"-{ema_beta2.value:g}" if ema_beta2.value not in (None, "") else ""))
+                            out = cfg.job_dir() / f"{cfg.job_name}_posthoc_ema_{tag}.safetensors"
+                            ema_info.text = f"Averaging {len(files)} checkpoints..."
+                            try:
+                                rep = await run.io_bound(
+                                    make_ema, files, out, float(ema_beta.value or 0),
+                                    None if power or ema_beta2.value in (None, "") else float(ema_beta2.value),
+                                    float(ema_sigma.value) if power else None,
+                                    None if ema_rank.value in (None, "") else int(ema_rank.value))
+                            except Exception as e:  # noqa: BLE001
+                                ema_info.text = f"Could not make the average: {e}"
+                                return
+                            ema_info.text = f"{describe(rep)}. Saved {rep['out']}"
+
+                        with ui.row().classes("items-center gap-3"):
+                            ui.button("Use this job's checkpoints", icon="playlist_add", on_click=ema_fill) \
+                                .props("flat no-caps").tooltip("The <job>_<step> files in this job's output folder")
+                            ui.button("Average now", icon="timeline", on_click=ema_now).props("outline")
+
                     # ---- Noise check
                     with section("Probe noise check", "How far the likeness probes move with their seeds",
                                  "query_stats", open_=False) as sec:
@@ -7346,6 +7427,22 @@ def build_page(local: bool = True):
                                lineStyle={"width": 2, "type": "dashed"})],
                         ["raw", "smoothed"])).classes("w-full h-72")
                     charts.append(loss_chart)
+                with card() as grad_card:
+                    with ui.row().classes("w-full items-center gap-4"):
+                        ui.label("Gradient norm").classes("rz-title")
+                        ui.space()
+                        grad_label = ui.label("").classes("rz-hint")
+                    hint("How big each step's update was before clipping (the loss chart's smoothing). A steady line "
+                         "is healthy; spikes that keep growing, or a line that sits on the clip limit, mean the "
+                         "learning rate is too high.")
+                    grad_chart = ui.echart(chart_options(
+                        _axis("step", min="dataMin"), [_axis("gradient norm", scale=True)],
+                        [_line("raw", "#52525B", lineStyle={"width": 1}),
+                         _line("smoothed", "#FF3B30", lineStyle={"width": 2}),
+                         _line("clip limit", "#F4F4F5", lineStyle={"width": 1, "type": "dashed"})],
+                        ["raw", "smoothed"])).classes("w-full h-48")
+                    charts.append(grad_chart)
+                grad_card.visible = False
                 with section("Identity similarity", "Face / body / combined score of every sample", "face") as face_exp:
                     face_label = hint("")
                     face_chart = ui.echart(chart_options(_axis("step", min="dataMin"),
@@ -7571,6 +7668,38 @@ def build_page(local: bool = True):
                                 log_view.push(line)
                     log_state["console_shown"] = True
 
+            def update_grad_chart(st: dict, start: int, a: float) -> None:
+                """The gradient norm chart: one value per step beside the losses (None where it was not finite), the
+                same x and smoothing as the loss chart, and the clip limit when max_grad_norm is on."""
+                norms = st.get("grad_norms") or []
+                if not any(v is not None for v in norms):  # an older run, or no step yet
+                    grad_card.visible = False
+                    return
+                grad_card.visible = True
+                start += len(st.get("losses") or []) - len(norms)  # (aligned at the end: the last step is the same)
+                raw, sm, ema = [], [], None
+                for i, v in enumerate(norms):
+                    x = start + i + 1
+                    raw.append([x, v])
+                    if v is not None:
+                        ema = v if ema is None else a * ema + (1 - a) * v
+                        sm.append([x, ema])
+                clip = float(st.get("grad_clip") or 0)
+                clipped = sum(1 for v in norms[-100:] if v is not None and 0 < clip < v)
+                bad = sum(1 for v in norms if v is None)
+                grad_chart.options["series"][0]["data"] = raw
+                grad_chart.options["series"][1]["data"] = sm
+                grad_chart.options["series"][2]["data"] = [[raw[0][0], clip], [raw[-1][0], clip]] if clip > 0 else []
+                grad_chart.options["legend"]["data"] = ["raw", "smoothed"] + (["clip limit"] if clip > 0 else [])
+                grad_chart.update()
+                now = st.get("grad_norm")
+                parts = [f"now {now:.3g}" if now is not None else "now not finite"]
+                if clip > 0:
+                    parts.append(f"clipped in {clipped} of the last {min(100, len(norms))} steps")
+                if bad:
+                    parts.append(f"{bad} not finite")
+                grad_label.text = " · ".join(parts)
+
             def poll():
                 update_gpus()
                 st = read_status()
@@ -7618,6 +7747,7 @@ def build_page(local: bool = True):
                         loss_chart.options["yAxis"][1]["show"] = True
                         loss_chart.options["legend"]["data"] = ["raw", "smoothed", "id loss (smoothed)"]
                     loss_chart.update()
+                    update_grad_chart(st, start, a)
                 fscores = st.get("face_scores") or []
                 if fscores:
                     face_exp.visible = True

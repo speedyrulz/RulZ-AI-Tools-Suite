@@ -88,7 +88,8 @@ def _lane_setup(n_replicas=2, ga=2):
         params = [p for parts in v.weights.values() for p in parts.values()]
         v.state.update(optimizer=torch.optim.SGD(params, lr=0.05), scheduler=torch.optim.lr_scheduler.LambdaLR(
             torch.optim.SGD(params, lr=0.05), lambda s: 1.0), ema=LoraEMA(v.master, 0.9), step=0, losses=[],
-            params=params, rng=None, gen=torch.Generator().manual_seed(1), ts_logit_shift=0.0, loss_watch=None)
+            grad_norms=[], params=params, rng=None, gen=torch.Generator().manual_seed(1), ts_logit_shift=0.0,
+            loss_watch=None)
         v.state["scheduler"] = torch.optim.lr_scheduler.LambdaLR(v.state["optimizer"], lambda s: 1.0)
         v.state["batch_iter"] = iter(lambda: [SimpleNamespace(key="k")], None)
         v.started = True
@@ -106,7 +107,8 @@ def stubbed(monkeypatch):
         return torch.randn(1, 4, 1, 1, generator=g), torch.zeros(1, 2, 3), torch.ones(1, 2, dtype=torch.bool), None
 
     monkeypatch.setattr(D, "load_batch", load_batch)
-    monkeypatch.setattr(T, "sample_sigmas", lambda cfg, n, gen, shift, tokens, arch: torch.full((n,), 0.5))
+    monkeypatch.setattr(T, "sample_sigmas",
+                        lambda cfg, n, gen, shift, tokens, arch, strata=None: torch.full((n,), 0.5))
     return counter
 
 
