@@ -700,7 +700,18 @@ the job folder (the checkpoints, the best and the final file, newest first) and 
 every one into one archive, and *Logs and settings (.zip)* packs `train.log`, `config.yaml`, `status.json`, the
 likeness scores and the run's other text files. So a run on a rented or remote GPU hands its LoRAs straight to the
 browser. Only files inside a run's folder (one with a `status.json`) are served. Every Monitor chart folds away like
-the other sections. `compile_model` (default `auto`, see
+the other sections.
+
+The Monitor puts the likeness first: the race (when there is one), *Likeness probes & controller*, *Sample images* and
+*Identity similarity*, then the loss and gradient charts and the log. The probe and the identity sections lead with
+their current scores as small chips (combined, face, body, the best so far, probes since the best, the controller's
+learning-rate factor and face bias). *Probe images* and *Sample images* show one training step at a time: the arrows
+and the step list go back through every step the run kept (the newest is shown, and followed, until you pick another;
+*Newest* goes back to it), each image with a short title (*Prompt 2*, *Face probe 1*, or the configuration in a race)
+and its scores. A click opens it full size, where the arrows (or the arrow keys) step through that step's images. The
+charts' legends wrap instead of paging, and on a phone the stat tiles sit two to a row, the galleries show two images
+across, the charts grow to keep their plot below a long legend, and the bottom bar shows *Add to queue* and *Kill* as
+icons. `compile_model` (default `auto`, see
 [torch.compile](#torchcompile-compile_model)) runs the DiT blocks through torch.compile
 (skipped with a warning if triton is not installed; `triton-windows` from requirements.txt provides it on Windows).
 No C++ compiler is needed: the blocks are compiled with Dynamo's `specialize_float` so the LoRA scale and
@@ -1212,7 +1223,7 @@ the lr control, the best checkpoint, early stop and the race drops all use the n
 Samples tab show only the normalized scores (the log and `likeness.jsonl` keep the raw face / body next to them as
 `face`, `body`, `face_norm`, `body_norm`, `scale`); probe images carry their overall / face / body score underneath.
 In a race, the Monitor and the Samples tab put the same generation (step, prompt or probe kind, seed) of every
-configuration side by side in one row. Earlier runs' `likeness.jsonl` keep their raw combined scores.
+configuration side by side (on the Monitor, under a heading per prompt or probe image). Earlier runs' `likeness.jsonl` keep their raw combined scores.
 
 **Export spreadsheet** (Monitor, *Likeness probes & controller*, during or after a run) downloads `<job>_likeness.xlsx`,
 also written into the job folder: *Updated scores* has every probe's smoothed and per-probe face, body and combined
