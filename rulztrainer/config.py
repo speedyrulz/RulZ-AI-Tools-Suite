@@ -77,6 +77,31 @@ def keel_consensus_mode(spec: str, optimizer: str) -> str:
     return s
 
 
+def family_named_in(text: str) -> str | None:
+    """The model family a path, repo id or file name names (krea/Krea-2-Turbo: krea2), or None when it names none."""
+    hint = (text or "").lower()
+    if "qwen-image" in hint or "qwen_image" in hint or "qwenimage" in hint:
+        return "qwen_image21"
+    if any(s in hint for s in ("flux-3", "flux3", "flux_3", "flux.3")):
+        return "flux3_klein"
+    for word, family in (("ideogram", "ideogram4"), ("minimax", "minimax_h3"), ("fibo", "fibo2"), ("krea", "krea2"),
+                         ("moss", "moss_image")):
+        if word in hint:
+            return family
+    return None
+
+
+def sampling_file_family(key: str, value: str) -> str | None:
+    """The family a sampling model or sampling-only LoRA setting names: a LoRA by its file name only (a folder of the
+    user's, /data/krea_stuff/moss_lora, says nothing; a LoRA of another model is stopped when it matches no layer),
+    the sampling model by its name, else its whole path or repo id (a diffusers folder krea__Krea-2-Turbo/transformer).
+    None for "", auto, or a name without a family."""
+    if value in ("", "auto"):
+        return None
+    name = family_named_in(Path(value).name)
+    return name or (family_named_in(value) if key == "sample_model_path" else None)
+
+
 # LoRA target groups each family trains when lora_targets is empty. Krea 2 adds the attention output gate and its
 # text-fusion stack, which Fizgig measured to be under-trained by the attention + feed-forward recipe (scaling a
 # finished LoRA's text-fusion blocks x3 lifted likeness 2-7 points on several Krea 2 LoRAs).
@@ -130,6 +155,14 @@ ARCH_TRAINING_ADAPTER = {
     # 0.62 GB), the first of the three musubi-tuner tested; ostris' v2 (rank 32) is the alternative
     "minimax_h3": {"repo": "circlestone-labs/MiniMax-H3-Image-Training-Adapter",
                    "file": "minimax_h3_image_training_adapter.safetensors"},
+}
+# Each family's sampling LoRA (sample_lora: auto downloads it), applied with the turbo LoRA while samples render the
+# family's base checkpoint, never in training. MOSS-Image: Kijai's SFT LoRA (SFT minus Base, rank 512, blocks 3, 4
+# and 21-41 with their norms), so samples of a LoRA trained on Base show it as it looks on SFT. Kijai's card uses it
+# at -0.5 on SFT to soften SFT's banding; on Base, +1 adds SFT's look
+ARCH_SAMPLE_LORA = {
+    "moss_image": {"repo": "Kijai/MOSS-image_experimental",
+                   "file": "loras/moss_image_sft_lora_blocks_21_to_49_rank_512_bf16.safetensors", "strength": 1.0},
 }
 # (sample steps, sample CFG) per family by default: the turbo LoRA's
 ARCH_SAMPLE_DEFAULTS = {fam: (t["steps"], t["cfg"]) for fam, t in ARCH_TURBO.items()}
@@ -482,7 +515,9 @@ class TrainConfig:
     turbo_lora: str = "auto"  # a LoRA (e.g. an 8-step distill) applied only while sampling: auto = the model family's
     #                            turbo LoRA (ARCH_TURBO, downloaded), "" = none, or a .safetensors path
     turbo_lora_strength: float = 1.0
-    sample_lora: str = ""  # optional second ComfyUI-format LoRA applied only while sampling (with the turbo LoRA)
+    sample_lora: str = "auto"  # a second ComfyUI-format LoRA applied only while sampling (with the turbo LoRA): auto =
+    #   the family's (ARCH_SAMPLE_LORA, downloaded) while samples render its base checkpoint (MOSS-Image Base: the
+    #   SFT LoRA), "" = none, or a .safetensors path
     sample_lora_strength: float = 1.0
     training_adapter: str = "auto"  # a LoRA on while training and off while sampling, never saved (ARCH_TRAINING_ADAPTER;
     #   Qwen-Image 2.1: Fizgig's): auto = the model family's (downloaded; the others have none), "" = none, or a path
@@ -684,16 +719,7 @@ class TrainConfig:
         """The architecture this config trains: model_arch when set, else guessed from the model path or files."""
         if self.model_arch and self.model_arch != "auto":
             return self.model_arch
-        hint = " ".join([self.model_path or "", self.transformer_file or ""]).lower()
-        if "qwen-image" in hint or "qwen_image" in hint or "qwenimage" in hint:
-            return "qwen_image21"
-        if any(s in hint for s in ("flux-3", "flux3", "flux_3", "flux.3")):
-            return "flux3_klein"
-        if "ideogram" in hint:
-            return "ideogram4"
-        if "minimax" in hint:
-            return "minimax_h3"
-        return "fibo2" if "fibo" in hint else "krea2" if "krea" in hint else "moss_image"
+        return family_named_in(" ".join([self.model_path or "", self.transformer_file or ""])) or "moss_image"
 
     def samples_on_distilled_model(self) -> bool:
         """The model that renders samples and probes is a distilled checkpoint: sample_model_path, else the trained
@@ -706,6 +732,28 @@ class TrainConfig:
         else:
             name = self.transformer_file if self.model_source == "files" and self.transformer_file else self.model_path
         return get_arch(self).distilled_sample_model(name or "")
+
+    def samples_on_base_model(self) -> bool:
+        """Samples and probes render MOSS-Image Base (the trained model, no other sampling model), by name: what the
+        family's sampling LoRA (ARCH_SAMPLE_LORA, Base -> SFT) is made for."""
+        if self.arch_name() != "moss_image" or self.sample_model_path or self.finetune:
+            return False
+        name = (self.transformer_file if self.model_source == "files" and self.transformer_file
+                else self.model_path).lower()
+        return "base" in name and "sft" not in name
+
+    def foreign_sampling_files(self) -> list[str]:
+        """The sampling model and sampling-only LoRA files whose names belong to another model family than the one
+        trained (a Krea 2 run's krea/Krea-2-Turbo left in sample_model_path after switching to MOSS-Image): as
+        "field: value" lines."""
+        family = self.arch_name()
+        out = []
+        for key in ("sample_model_path", "turbo_lora", "sample_lora", "training_adapter"):
+            value = getattr(self, key) or ""
+            named = sampling_file_family(key, value)
+            if named is not None and named != family:
+                out.append(f"{key}: {value} (a {named} file)")
+        return out
 
     def trains_on_arcface(self) -> bool:
         """Something optimizes the probes' own ArcFace: the reward stage, the identity loss on its arcface backend, or
@@ -749,6 +797,10 @@ class TrainConfig:
                              "plain linear scale)")
         if self.model_arch not in ("auto", *ARCH_NAMES):
             raise ValueError(f"model_arch must be auto or one of {ARCH_NAMES}, got {self.model_arch!r}")
+        foreign = self.foreign_sampling_files()
+        if foreign:
+            raise ValueError(f"This run trains {self.arch_name()}, but these settings name another model's files: "
+                             f"{'; '.join(foreign)}. Clear them (or set auto) after switching models")
         if self.loss_type not in ("mse", "band"):
             raise ValueError(f"loss_type must be mse or band, got {self.loss_type!r}")
         if self.int8_backward not in ("bf16", "int8"):

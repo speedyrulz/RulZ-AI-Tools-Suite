@@ -193,6 +193,7 @@ single-file fields at the files, for example:
 | Text encoder | `models/bucket/text_encoders/qwen3.5_9b_int8_convrot.safetensors` |
 | VAE | `models/bucket/vae/flux2-vae.safetensors` |
 | Turbo LoRA (samples) | `models/bucket/MOSS-Image-Base-8-steps-dmd.safetensors` |
+| Sampling LoRA (A LoRA file) | `models/bucket/moss_image_sft_lora_blocks_21_to_49_rank_512_bf16.safetensors` (auto downloads the same file from Kijai's repo) |
 
 Rerun `bash scripts/vast/download_models.sh` (with `RULZ_MODEL_BUCKET` set) to fetch files you add to the bucket
 later; complete files are skipped. `RULZ_MODEL_INCLUDE="vae/* text_encoders/*"` limits the download to matching
@@ -1790,6 +1791,20 @@ CFG 3). The WebUI's *Turbo LoRA* choice (the model's own, none, or a file) moves
 and the full-quality defaults while they are still at a default. `turbo_lora` can also be a path to any
 ComfyUI-format LoRA with `turbo_lora_strength`. `sample_lora` + `sample_lora_strength` stack a second sampling-only
 LoRA (for example a style LoRA) alongside the turbo one.
+
+`sample_lora: auto` (the default) adds the family's own sampling LoRA while samples render its base checkpoint.
+Training MOSS-Image Base (the Base repo, or a single file with "base" in its name, and no separate sampling model)
+that is Kijai's SFT LoRA, `moss_image_sft_lora_blocks_21_to_49_rank_512_bf16`
+([Kijai/MOSS-image_experimental](https://huggingface.co/Kijai/MOSS-image_experimental), 1.2 GB: SFT minus Base,
+rank 512, on blocks 3, 4 and 21-41 with their norms) at strength 1, so previews of a Base LoRA show it with SFT's look; Kijai
+uses the same file at -0.5 on SFT to soften SFT's banding. The other models, SFT, and a run with a sampling model
+get none; `sample_lora: ""` turns it off, a path picks another file (WebUI: *Sampling LoRA*, under *Seeds, negative
+prompt and sampling models*).
+
+A run refuses to start when the sampling model or a sampling-only LoRA file names another model family than the one
+trained (for example `krea/Krea-2-Turbo`, the Krea 2 wizard's preview model, kept after switching to MOSS-Image),
+and a sampling LoRA that matches no layer of the model stops the run with its name. The WebUI clears such leftovers
+(back to auto) when the model is switched.
 LoRA layers (`lora_down/up`, `lora_A/B`), `diff_b` bias offsets and `diff` offsets of normalization weights (swapped
 in only while sampling) are applied; Krea 2 LoRAs may use ComfyUI's module names (`blocks.N.attn.wq`) or ours, and a
 FIBO 2.0 LoRA in ComfyUI's fused layout (Comfy-Org's Turbo LoRA) is split back into the model's own, and so is a
