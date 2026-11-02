@@ -133,23 +133,32 @@ def _input_device(model: nn.Module) -> torch.device:
 
 
 @torch.no_grad()
-def encode_prompt(text_encoder, processor, prompt: str, max_length: int = 4096) -> torch.Tensor:
-    """Text features for one prompt: [6, S, 7680] bf16 on the CPU (the six bundles, see the module docstring)."""
-    text = PROMPT_TEMPLATE.format(clean_prompt(prompt))
+def encode_prompts(text_encoder, processor, prompts: list[str], max_length: int = 4096) -> list[torch.Tensor]:
+    """Text features for each prompt: [6, S_i, 7680] bf16 on the CPU (the six bundles, see the module docstring), in
+    one forward."""
     extra = {"images": None} if hasattr(processor, "image_processor") else {}  # the processor, or a plain tokenizer
-    inputs = processor(text=[text], padding="longest", max_length=max_length, truncation=True, return_tensors="pt",
-                       **extra)
+    rows = []
+    for prompt in prompts:  # tokenized one by one (no padding), as a single prompt always was
+        text = PROMPT_TEMPLATE.format(clean_prompt(prompt))
+        rows.append(processor(text=[text], padding="longest", max_length=max_length, truncation=True,
+                              return_tensors="pt", **extra)["input_ids"][0])
+    ids, mask = moss_loading.right_pad(rows)
     device = _input_device(text_encoder)
-    # the text model takes the tokens alone (a processor may add multimodal fields, all text here)
-    inputs = {k: v.to(device) for k, v in inputs.items() if k in ("input_ids", "attention_mask")}
-    hidden = text_encoder(**inputs, output_hidden_states=True).hidden_states
+    hidden = text_encoder(input_ids=ids.to(device), attention_mask=mask.to(device),
+                          output_hidden_states=True).hidden_states
     dtype = torch.bfloat16
     normalized = {}
     for layer in sorted({layer for layers in TEXT_ENCODER_OUT_LAYERS for layer in layers}):
         states = hidden[layer].float()
         normalized[layer] = (states * torch.rsqrt(states.pow(2).mean(dim=-1, keepdim=True) + 1e-6)).to(dtype)
     bundles = [torch.cat([normalized[layer] for layer in layers], dim=-1) for layers in TEXT_ENCODER_OUT_LAYERS]
-    return torch.stack(bundles, dim=1)[0].cpu()  # [6, S, 7680]
+    feats = torch.stack(bundles, dim=1).cpu()  # [B, 6, S, 7680]
+    return [feats[i, :, : r.numel()].clone() for i, r in enumerate(rows)]
+
+
+def encode_prompt(text_encoder, processor, prompt: str, max_length: int = 4096) -> torch.Tensor:
+    """Text features for one prompt: [6, S, 7680] bf16 on the CPU (the six bundles, see the module docstring)."""
+    return encode_prompts(text_encoder, processor, [prompt], max_length)[0]
 
 
 def get_tokenizer(cfg: TrainConfig, model_dir: Path | None):

@@ -253,16 +253,38 @@ def _te_input_device(text_encoder) -> torch.device:
     return next(text_encoder.parameters()).device
 
 
+def right_pad(rows: list[torch.Tensor], pad_id: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+    """1-D token-id rows -> ([B, n] ids right-padded with pad_id, [B, n] attention mask of the real tokens).
+
+    Every text encoder here is a causal decoder, so a row's real tokens never see the padding after them: each row's
+    features (cut back to its length) are those of its own forward. A single row comes back unpadded, mask all ones."""
+    n = max(int(r.numel()) for r in rows)
+    ids = torch.full((len(rows), n), int(pad_id), dtype=torch.long)
+    mask = torch.zeros(len(rows), n, dtype=torch.long)
+    for i, r in enumerate(rows):
+        ids[i, : r.numel()] = r
+        mask[i, : r.numel()] = 1
+    return ids, mask
+
+
 @torch.no_grad()
+def encode_prompts(text_encoder, tokenizer, prompts: list[str], max_length: int = 4096) -> list[torch.Tensor]:
+    """last_hidden_state [S_i, 4096] (bf16) for each prompt, using the chat template, in one forward."""
+    rows = []
+    for prompt in prompts:
+        formatted = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True, enable_thinking=True)
+        rows.append(tokenizer(formatted, return_tensors="pt", truncation=True, max_length=max_length).input_ids[0])
+    ids, mask = right_pad(rows)
+    device = _te_input_device(text_encoder)
+    out = text_encoder(input_ids=ids.to(device), attention_mask=mask.to(device), use_cache=False, return_dict=True)
+    hidden = out.last_hidden_state.to(torch.bfloat16).cpu()
+    return [hidden[i, : r.numel()].clone() for i, r in enumerate(rows)]
+
+
 def encode_prompt(text_encoder, tokenizer, prompt: str, max_length: int = 4096) -> torch.Tensor:
     """Returns last_hidden_state [S, 4096] (bf16) for one prompt, using the chat template."""
-    formatted = tokenizer.apply_chat_template(
-        [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True, enable_thinking=True)
-    inputs = tokenizer(formatted, return_tensors="pt", truncation=True, max_length=max_length)
-    device = _te_input_device(text_encoder)
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    out = text_encoder(**inputs, use_cache=False, return_dict=True)
-    return out.last_hidden_state[0].to(torch.bfloat16).cpu()
+    return encode_prompts(text_encoder, tokenizer, [prompt], max_length)[0]
 
 
 def get_tokenizer(cfg: TrainConfig, model_dir: Path | None):

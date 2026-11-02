@@ -64,7 +64,7 @@ RACE_KEYS: dict[str, tuple[str, ...]] = {
     "Timesteps & loss": (
         "timestep_sampling", "logit_mean", "logit_std", "sigmoid_scale", "timestep_shift", "clean_share", "logsnr_mean",
         "logsnr_std",
-        "loss_weighting",
+        "loss_weighting", "loss_type",
         "sigma_min", "sigma_max", "content_power", "region_weights", "face_loss_weight", "body_loss_weight",
         "background_loss_weight", "face_margin", "region_feather_cells", "region_prior_weight", "id_loss_weight",
         "id_loss_sigma_max", "id_loss_every", "id_loss_margin_cells", "id_loss_min_face_cells", "id_loss_random_ref",
