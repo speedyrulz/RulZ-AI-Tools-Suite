@@ -460,6 +460,7 @@ class TrainConfig:
     clean_share: str = ""  # share of steps below sigma 0.5 by epoch (clean_share.py): "" = the sampler's own,
     #                        "40", "75:5:40", or Fizgig's MOSS Slide "60:7:30:15:2"
     loss_weighting: str = "none"  # none | min_snr (sigma-based) | sigma_sqrt
+    loss_type: str = "mse"  # mse | band (experimental, AI-Toolkit: frequency bands the noise has buried drop out)
 
     # --- saving / sampling ---
     save_every: int = 250
@@ -746,6 +747,8 @@ class TrainConfig:
                              "plain linear scale)")
         if self.model_arch not in ("auto", *ARCH_NAMES):
             raise ValueError(f"model_arch must be auto or one of {ARCH_NAMES}, got {self.model_arch!r}")
+        if self.loss_type not in ("mse", "band"):
+            raise ValueError(f"loss_type must be mse or band, got {self.loss_type!r}")
         if self.int8_backward not in ("bf16", "int8"):
             raise ValueError(f"int8_backward must be bf16 or int8, got {self.int8_backward!r}")
         if self.nvfp4_backward not in ("bf16", "fp4"):

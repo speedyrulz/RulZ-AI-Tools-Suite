@@ -1283,6 +1283,7 @@ class Form:
             block_swap=int(v("block_swap") or 0),
             clean_share=str(v("clean_share") or "").strip(),
             logit_mean=float(v("logit_mean")), logit_std=float(v("logit_std")), loss_weighting=v("loss_weighting"),
+            loss_type=v("loss_type") or "mse",
             save_every=int(v("save_every")), keep_checkpoints=int(v("keep_checkpoints") or 0),
             sample_every=int(v("sample_every")), sample_prompts=prompts,
             reward_steps=int(v("reward_steps") or 0), reward_lr=float(v("reward_lr") or 2e-5),
@@ -2888,6 +2889,7 @@ RACE_LABELS = {
     "keel_face_gain": "Keel face gain", "keel_face_gain_max": "Keel face gain limit",
     "keel_face_gain_beta": "Keel face gain EMA", "keel_body_weight": "Keel body weight",
     "lora_ema": "Weight average", "timestep_sampling": "Timestep sampling", "loss_weighting": "Loss weighting",
+    "loss_type": "Loss type",
     "region_weights": "Region-weighted loss", "face_loss_weight": "Face loss weight",
     "body_loss_weight": "Body loss weight", "background_loss_weight": "Background loss weight",
     "id_loss_weight": "Identity loss weight", "attn_localize": "Trigger attention on the subject",
@@ -6274,6 +6276,12 @@ def build_page(local: bool = True):
                                     .classes("w-44")
                                 w["loss_weighting"] = ui.select(["none", "min_snr", "sigma_sqrt"], value="none",
                                                                 label="Loss weighting").classes("w-40")
+                                w["loss_type"] = ui.select(["mse", "band"], value=d.loss_type, label="Loss type")                                     .classes("w-32")                                     .tooltip("mse: the plain loss. band (experimental, from AI-Toolkit): splits each "
+                                             "error into fine-to-coarse detail bands and drops the bands the noise "
+                                             "has buried at that step, so very noisy steps stop pushing on details "
+                                             "nobody could see. Near no noise it is the same as mse. Its loss value "
+                                             "runs lower than mse (most at high noise): compare runs by samples and "
+                                             "probes, not by the loss. A race can try both.")
                             with fields():
                                 w["timestep_sampling"] = ui.select(["logit_normal", "sigmoid", "uniform", "identity",
                                                                     "content", "style", "logsnr", "reference"],

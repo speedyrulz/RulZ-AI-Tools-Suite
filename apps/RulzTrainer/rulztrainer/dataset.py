@@ -378,16 +378,43 @@ def text_jobs(items: list[Item], cfg: TrainConfig, extra_prompts: list[str] | No
     return {k: v for k, v in jobs.items() if cfg.recache or not k.exists()}, len(jobs)
 
 
+TEXT_BATCH = 16  # prompts per text-encoder forward when caching: one at a time leaves a big encoder launch-bound
+TEXT_BATCH_CHARS = 16000  # at most this many padded caption characters per forward (~4k tokens): long captions batch less
+
+
+def text_batches(jobs: list[tuple[Path, str]], size: int = TEXT_BATCH,
+                 max_chars: int = TEXT_BATCH_CHARS) -> list[list[tuple[Path, str]]]:
+    """(path, text) jobs grouped for batched encoding: sorted by length, so a batch (right-padded to its longest
+    prompt) pads little, and cut at `size` prompts or `max_chars` padded characters, whichever comes first."""
+    out: list[list[tuple[Path, str]]] = []
+    cur: list[tuple[Path, str]] = []
+    for job in sorted(jobs, key=lambda j: len(j[1])):
+        if cur and (len(cur) >= size or (len(cur) + 1) * (len(job[1]) + 1) > max_chars):
+            out.append(cur)
+            cur = []
+        cur.append(job)
+    if cur:
+        out.append(cur)
+    return out
+
+
 def cache_text(items: list[Item], cfg: TrainConfig, text_encoder, tokenizer,
                extra_prompts: list[str] | None = None, progress=None, encoders: list | None = None,
-               max_prompts: int | None = None, encode_fn=None) -> None:
+               max_prompts: int | None = None, encode_fn=None, encode_batch_fn=None,
+               batch_size: int = TEXT_BATCH) -> None:
     """Encode and save the missing prompt embeddings. `encoders` is a list of (text_encoder, tokenizer, device),
     one per GPU, to split the prompts across GPUs (each needs its own tokenizer: fast tokenizers are not
-    thread-safe). `max_prompts` encodes only the first N missing prompts (a timing probe). `encode_fn` is the
-    architecture's encode_prompt(text_encoder, tokenizer, text, max_length)."""
+    thread-safe). `max_prompts` encodes only the first N missing prompts (a timing probe). `encode_batch_fn` is the
+    architecture's encode_prompts(text_encoder, tokenizer, texts, max_length), which encodes up to `batch_size`
+    prompts per forward; `encode_fn`, a one-prompt encode_prompt, is used one prompt at a time instead. A batch that
+    runs out of GPU memory is halved and retried; progress counts prompts."""
     from .multigpu import run_queue
 
-    encode_prompt = encode_fn or get_arch(cfg).encode_prompt
+    if encode_batch_fn is None:
+        if encode_fn is not None:
+            encode_batch_fn = lambda te, tok, texts, n: [encode_fn(te, tok, t, n) for t in texts]  # noqa: E731
+        else:
+            encode_batch_fn = get_arch(cfg).encode_prompts
 
     todo, total = text_jobs(items, cfg, extra_prompts)
     workers = encoders or [(text_encoder, tokenizer, "cpu")]
@@ -400,19 +427,30 @@ def cache_text(items: list[Item], cfg: TrainConfig, text_encoder, tokenizer,
                  f" (split across {', '.join(str(w[2]) for w in workers)})" if len(workers) > 1 else "")
 
     @torch.no_grad()
-    def encode(worker, job):
-        path, text = job
-        emb = encode_prompt(worker[0], worker[1], text, cfg.max_token_length)
-        save_file({"embeds": emb.contiguous()}, str(path), metadata={"prompt": text[:2000]})
+    def encode(worker, batch):
+        try:
+            embs = encode_batch_fn(worker[0], worker[1], [text for _, text in batch], cfg.max_token_length)
+        except torch.OutOfMemoryError:
+            if len(batch) == 1:
+                raise
+            torch.cuda.empty_cache()
+            half = len(batch) // 2
+            log.info("Text caching: a batch of %d prompts ran out of GPU memory; encoding it in halves", len(batch))
+            encode(worker, batch[:half])
+            encode(worker, batch[half:])
+            return
+        for (path, text), emb in zip(batch, embs):
+            save_file({"embeds": emb.contiguous()}, str(path), metadata={"prompt": text[:2000]})
 
     count = [0]
 
-    def done(i, job, _):
-        count[0] += 1
+    def done(i, batch, _):
+        count[0] += len(batch)
         if progress:
             progress(count[0], len(todo))
 
-    run_queue([(w, w[2]) for w in workers], list(todo.items()), lambda w, job: encode(w[0], job), on_done=done)
+    batches = text_batches(list(todo.items()), size=max(1, int(batch_size)))
+    run_queue([(w, w[2]) for w in workers], batches, lambda w, batch: encode(w[0], batch), on_done=done)
 
 
 def text_cache_path(cfg: TrainConfig, prompt: str) -> Path:

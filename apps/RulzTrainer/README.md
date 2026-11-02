@@ -220,6 +220,11 @@ variable is then unnecessary.
   latents (2x2 patchified, batch-norm normalized exactly as the reference pipeline does), and the
   Qwen3.5-9B text encoder embeds every caption through the chat template. Both are cached under
   `<dataset>/.rulz_cache`, then the encoders are unloaded. Training only holds the DiT and the LoRA.
+  Captions are encoded up to 16 at a time (after AI-Toolkit), shortest first so a batch pads little, and at most
+  about 4,000 padded tokens per pass, so long captions go fewer at a time. One prompt at a time leaves a big text
+  encoder waiting on kernel launches most of the time. Each caption is padded on the right and cut back to its own
+  length, which gives it the same features as encoding it alone (the text encoders are causal), for every model.
+  A batch that runs out of GPU memory is split in half and retried.
 - **Timesteps.** `logit_normal` (mean/std), `sigmoid` (scale) or `uniform`, with an optional `timestep_shift`.
   `logsnr` is the style-friendly sampler ([arXiv 2411.14793](https://arxiv.org/abs/2411.14793), via musubi-tuner):
   the log signal-to-noise ratio is drawn from N(`logsnr_mean`, `logsnr_std`), -6 and 2 as the paper recommends, so
@@ -257,6 +262,17 @@ variable is then unnecessary.
 - **Flow matching loss.** `x_t = (1 - sigma) x0 + sigma * noise`, target `noise - x0`, timestep = `sigma * 1000`,
   sigmas snapped to the model's 1000-step training grid. Default sampling is logit-normal; `timestep_shift`
   is available.
+- **Band loss** (`loss_type: band`, experimental, after AI-Toolkit; the default is `mse`). The error is split into
+  fine-to-coarse detail bands (a Laplacian pyramid over the latent), and each band is weighted by how much of it the
+  noise left visible at that step: `snr_k / (1 + snr_k)`, where `snr_k` is the step's signal-to-noise ratio times the
+  band's power in the clean latents over its power in the noise (measured on the batch).
+  - Near sigma 0 every weight is 1, so it is plain MSE.
+  - At high sigma the fine bands the noise has buried drop out instead of adding gradient noise; coarse shapes still
+    train.
+  - It never weighs more than MSE, so the loss value runs lower (most at high noise) and is not comparable with an
+    MSE run's. Judge it by samples and probes.
+  - Unmeasured here: race `loss_type: band` against `mse` (it is a race setting). It works with region weights,
+    loss weighting and every model.
 - **LoRA** on the DiT attention and FFN projections (`q, k, v, o, ffn_up_gate, ffn_down`) in all 42 blocks, or
   only the blocks you pick (`lora_blocks`, e.g. `21-41`, `10-31,40`, `even`; the UI has a per-block toggle grid
   with presets). Blocks without LoRA get no backward pass if they sit before the first trained block, so
@@ -334,7 +350,7 @@ Measured with data parallel on an RTX 5060 Ti + RTX 4060 Ti (8 images, 512 px, 8
 | Latent cache, 8 images + flips | 5.6 s | 1.9 s |
 | SAM 3 region masks, 8 images | 16 s (was 28 s before SAM 3 stayed resident) | 9 s |
 
-Text caching is only split when it pays: the first few prompts are timed on the loaded encoder, and a second copy
+Text caching is only split when it pays: the first three batches are timed on the loaded encoder, and a second copy
 is loaded only if it saves more time than loading it takes (about 13 s for the int8 Qwen3.5-9B). Images rendered on
 different GPU models differ very slightly in their pixels (different kernels); the same seed gives the same picture.
 
@@ -2451,6 +2467,7 @@ rulztrainer/
   quant.py         int8 / int8_convrot / nvfp4 weight quantization matching comfy_kitchen, QuantLinear
   sampler.py       flow-matching Euler sampler (reference schedule)
   trainer.py       training loop, saving, sampling, status.json for the UI
+  losses.py        the per-element training loss: MSE or band loss (loss_type)
   checkpointing.py selective gradient checkpointing (which blocks keep their activations)
   ema.py           weight average (EMA) of the LoRA for saves, samples and probes
   compiling.py     torch.compile settings, the compile_model auto rule, compile stats, the compile cache file

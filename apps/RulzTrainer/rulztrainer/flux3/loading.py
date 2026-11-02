@@ -213,14 +213,32 @@ def tokenize(tokenizer, prompt: str, max_length: int = MAX_TOKENS):
 
 
 @torch.no_grad()
-def encode_prompt(text_encoder, tokenizer, prompt: str, max_length: int = MAX_TOKENS) -> torch.Tensor:
-    """Text features for one prompt: [W, 20480] bf16 on the CPU, W the padded window (see the module docstring)."""
-    input_ids, attention_mask, position_ids = tokenize(tokenizer, prompt, max_length)
+def encode_prompts(text_encoder, tokenizer, prompts: list[str], max_length: int = MAX_TOKENS) -> list[torch.Tensor]:
+    """Text features for each prompt: [W_i, 20480] bf16 on the CPU, W_i its padded window (see the module docstring),
+    in one forward. Each row keeps its own window; the batch pads the shorter ones further, with the same masked
+    padding, which the causal encoder's earlier positions never see."""
+    parts = [tokenize(tokenizer, p, max_length) for p in prompts]
+    widths = [ids.shape[1] for ids, _, _ in parts]
+    width = max(widths)
+
+    def pad(t, value):
+        return torch.cat([t, t.new_full((1, width - t.shape[1]), value)], dim=1)
+
+    tok = getattr(tokenizer, "tokenizer", tokenizer)
+    pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+    input_ids = torch.cat([pad(ids, int(pad_id)) for ids, _, _ in parts])
+    attention_mask = torch.cat([pad(m, 0) for _, m, _ in parts])
+    position_ids = torch.cat([pad(p, 1) for _, _, p in parts])
     device = _input_device(text_encoder)
     out = text_encoder(input_ids=input_ids.to(device), attention_mask=attention_mask.to(device),
                        position_ids=position_ids.to(device), output_hidden_states=True, use_cache=False)
-    hidden = torch.stack([out.hidden_states[i].to(torch.bfloat16).cpu() for i in SELECT_LAYERS], dim=2)  # [1,W,8,D]
-    return hidden[0].reshape(hidden.shape[1], -1).contiguous()
+    hidden = torch.stack([out.hidden_states[i].to(torch.bfloat16).cpu() for i in SELECT_LAYERS], dim=2)  # [B,W,8,D]
+    return [hidden[i, :w].reshape(w, -1).clone() for i, w in enumerate(widths)]
+
+
+def encode_prompt(text_encoder, tokenizer, prompt: str, max_length: int = MAX_TOKENS) -> torch.Tensor:
+    """Text features for one prompt: [W, 20480] bf16 on the CPU, W the padded window (see the module docstring)."""
+    return encode_prompts(text_encoder, tokenizer, [prompt], max_length)[0]
 
 
 def get_tokenizer(cfg: TrainConfig, model_dir: Path | None):
