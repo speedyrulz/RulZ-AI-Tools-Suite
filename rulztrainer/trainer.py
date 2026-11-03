@@ -2158,7 +2158,7 @@ class Trainer(RaceParallelMixin):
         cfg = rr.base_cfg
         last = rr.variants[sched.alive[0]] if sched.alive else None
         best = self.job_dir / f"{cfg.job_name}_{win.name}_best.safetensors"
-        if win is not last and best.exists():
+        if best.exists():  # the last one racing kept its own best file too (_best_tag)
             shutil.copyfile(best, self.job_dir / f"{cfg.job_name}_best.safetensors")
         dataclasses.replace(win.cfg, race=False, race_configs=[], race_warmup_probes=0, race_patience_drop=False,
                             race_drop_lowest=True).save(self.job_dir / f"{cfg.job_name}_winner.yaml")
@@ -2251,9 +2251,6 @@ class Trainer(RaceParallelMixin):
         rr = self.race
         win = rr.active
         cfg = rr.base_cfg
-        best = self.job_dir / f"{cfg.job_name}_{win.name}_best.safetensors"
-        if best.exists():
-            shutil.copyfile(best, self.job_dir / f"{cfg.job_name}_best.safetensors")
         win_cfg = dataclasses.replace(win.cfg, race=False, race_configs=[], race_warmup_probes=0,
                                       race_patience_drop=False, race_drop_lowest=True)
         win.cfg = win_cfg
@@ -2262,7 +2259,10 @@ class Trainer(RaceParallelMixin):
             log.info("Race: %s is the last one racing (%s); it trains on to step %d with the run's own file names. "
                      "The winner is decided at the end: the highest smoothed score any configuration reached",
                      win.name, race_mod.format_overrides(win.overrides) or "the run's own settings", cfg.steps)
-            return
+            return  # its best file stays its own until the end decides the winner (_race_decide)
+        best = self.job_dir / f"{cfg.job_name}_{win.name}_best.safetensors"
+        if best.exists():
+            shutil.copyfile(best, self.job_dir / f"{cfg.job_name}_best.safetensors")
         win_cfg.save(self.job_dir / f"{cfg.job_name}_winner.yaml")
         if rr.schedule.follow:
             log.info("Relay race over: %s won the last round (%s); its LoRA is the run's, the others' are their "
@@ -2310,9 +2310,14 @@ class Trainer(RaceParallelMixin):
         return (f"_{self.race.active.name}" if self._race_running() else "") + getattr(self, "stage_tag", "")
 
     def _best_tag(self) -> str:
-        """Best checkpoints' tag: a relay race's racers share one lineage and so one <job>_best file."""
-        if self._race_running() and self.race.schedule.follow:
+        """Best checkpoints' tag: a relay race's racers share one lineage and so one <job>_best file. In a race decided
+        at the end, the last one racing keeps its own <job>_<name>_best until then: the winner's is copied to <job>_best."""
+        rr = self.race
+        if self._race_running() and rr.schedule.follow:
             return getattr(self, "stage_tag", "")
+        active = getattr(rr, "active", None)
+        if rr is not None and active is not None and rr.schedule.keeps_all and rr.schedule.champion is None:
+            return f"_{active.name}" + getattr(self, "stage_tag", "")
         return self._file_tag()
 
     def _image_prefix(self) -> str:

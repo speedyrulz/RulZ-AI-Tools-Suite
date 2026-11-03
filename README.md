@@ -1654,7 +1654,8 @@ the rest race on. `race_drop_lowest: false` stops the round drops altogether: ev
 configuration. Either way the winner is decided at the end: the configuration whose best smoothed score was the highest
 at any point. Its best checkpoint becomes `<job>_best.safetensors` and its settings `<job>_winner.yaml`; the last one
 racing trains on to the end with the run's own file names (`<job>.safetensors`), and the log says when that is not the
-winner. A configuration that leaves on patience is saved as `<job>_<name>_dropped.safetensors`, one that finished its
+winner; its best checkpoints stay in its own `<job>_<name>_best.safetensors` until then, so the winner's copy never
+replaces one of them. A configuration that leaves on patience is saved as `<job>_<name>_dropped.safetensors`, one that finished its
 steps as `<job>_<name>_final.safetensors`, and each keeps its `<job>_<name>_best.safetensors`. Both work with the
 round drops on (`race_drop_lowest: true`), and in parallel races. `race_patience_rising: true` gives one a chance to
 come back after a dip: out of patience, it stays as long as each probe's smoothed likeness is higher than its previous
