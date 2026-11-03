@@ -744,6 +744,10 @@ Monitor chart and the sample captions:
   the same part of the body; the best match is reported as a percent (details under *Body score* below). Body
   references should include three-quarter or full-length shots; samples that show no hips (portraits) or too
   little of the window get no body score.
+- **Body** (`body_score: anchored`): the same body window with its photographic look taken out, embedded by
+  SigLIP 2 and DINOv2, scored as how far it has moved from the base model's people (the step-0 probe's body
+  renders) toward the references: 0 = the base model, 100 = the references' mean (details under *Body score*
+  below). It needs the step-0 body probe, which it renders with 8 seeds.
 - **Body** (`body_score: proportions`): MediaPipe pose landmarks give scale-free proportion ratios (shoulder/hip
   width, torso/leg length, upper/lower leg, upper arm/forearm, head/shoulder width, leg/height...). With
   `body_backend: mediapipe+sam3`, a SAM 3 person mask adds silhouette widths at the shoulder, waist, hip and thigh
@@ -1148,6 +1152,46 @@ match of skeleton ratios (shoulder/hip width, leg/height, ...) against the refer
 silhouette widths with `body_backend: mediapipe+sam3`; proportions in a photo shift with pose and camera angle, so
 this score can fall while the image gets closer.
 
+`anchored` (`bodyanchor.py`) measures the body from the base model toward the references instead of against
+the references alone:
+
+- *window*: the `appearance` body window (neck to mid-thigh, upright, cut out on grey);
+- *canonical form*: each colour channel of the person's pixels standardised (mean 0.5, sd 0.18), then the window
+  shrunk to 72 px tall and back up, so colour grade, exposure, grain and sharpness drop out while build, shading,
+  skin, hair and the clothing's shape stay;
+- *embeddings*: SigLIP 2 (`google/siglip2-base-patch16-384`, its image half) and DINOv2-base's CLS token, each on
+  the canonical window letterboxed to a square;
+- *strangers*: the step-0 probe's body renders, the base model without the LoRA on the body probe prompt. That probe
+  renders 8 seeds for this score (it runs even with `probe_at_start` off), and its embeddings are kept in
+  `probes/body_strangers.npz` for a resumed run;
+- *score*: per model, 100 x (x - strangers' mean) . d / |d|^2 with d = references' mean - strangers' mean, the
+  two models averaged. 0 = the strangers' mean, 100 = the references' mean, linear, so it can dip below 0 or pass
+  100. On the likeness scale it stays as it is (no span, no curve: `body_scale_span` / `_curve` don't apply).
+
+Why. On a comparison of five Qwen-Image 2.1 LoRA runs of one woman (10 body photos, a body probe of one bikini
+scene, a sample every 200 steps to 2,000, and 25 base-model renders of that probe as strangers), every absolute body
+score rated her own photos against each other at or below the base model's strangers: the photos differ far more in
+pose, outfit, light and framing than the base model's woman differs from her, so the references' own level sat
+under the floor. Each score was graded on the late samples (steps 1,000 to 2,000) against the strangers:
+
+| Body score | Late samples above a stranger | Her own photo in the probe scene | Restyled strangers' rise |
+|---|---|---|---|
+| `anchored` | **96%** | **+7.0 spreads** | 0.1 spreads |
+| `anchored` on SigLIP 2 alone | 89% | +4.2 | 0.0 |
+| raw window, fitted direction (rejected) | 98% | +12.2 | **5.5** |
+| `appearance` (best match) | 80% | -3.9 | n/a |
+| `smplx` (knee check eased), `skeleton3d`, `proportions` | 34-59% | n/a | n/a |
+
+A spread is the strangers' own standard deviation. "Restyled strangers" are strangers recoloured, softened and
+grained like the references: the photos were darker, more saturated and softer than the renders, and a score fitted
+on the raw window learned that look (it ranked the softest run first); the canonical form takes it out. With 4
+strangers the ranking of the 50 samples agreed with the 25-stranger one at 0.97, with 8 at 0.98. A typical reference
+scores ~80 against the others, and her own photo in the probe scene 40: a probe in one fixed outfit and scene stays
+well below 100, so compare runs and checkpoints with each other. A LoRA also pulls the pose toward the dataset's,
+and the window keeps the pose. It is tested on one character so far, so `appearance` stays the default. The two
+models (about 1.9 GB of downloads, SigLIP 2's file holding its unused text half too; about 0.4 GB on the
+GPU) run on `body_device`.
+
 `skeleton3d` and `smplx` measure proportions so that a bent leg is still the same leg (`bodyshape.py`):
 
 - `skeleton3d`: bone-length ratios from MediaPipe's 3D landmarks (its own depth estimate): shoulder / hip width,
@@ -1193,7 +1237,9 @@ Each score is therefore mapped first onto one scale, 0 = what a stranger scores 
 scores against the others: the floor is the step-0 probe (the base model without the LoRA; `probe_at_start`,
 rendered with at least `probe_floor_seeds` seeds, default 4, for a steadier zero) or a default (face 20, body 80),
 the ceiling the median of each reference's best match among the others when two or more are given (the statistic
-a probe is scored with; faces cut off by the frame left out), or a default (face 75, body 90). The ceiling is
+a probe is scored with; faces cut off by the frame left out), or a default (face 75, body 90). The `anchored` body
+score is on this scale by construction (0 = the step-0 probe's renders, 100 = the references' mean) and is used as
+it is. The ceiling is
 raised to at least 10 face / 8 body points above the floor when the step-0 score is at or above it, and scores stop
 at 100: matching the references better than a typical one of them is no more likeness (a probe that copies one
 photo reads higher). The median replaced the mean because hard references (profile views, cut-off faces) pull the
@@ -1241,6 +1287,32 @@ The same spreadsheet comes from **Previous Runs** too (*Export spreadsheet* unde
 built from the raw probe scores the run history keeps, so it works after a later run has reused the job folder. Runs
 saved before this version have those scores only if their job folder still holds the run: *Import old runs* (or
 opening the tab) adds them then.
+
+**Score sample folders** (Previous Runs) compares finished runs from any trainer (ai-toolkit, Fizgig, OneTrainer, this
+one) on these scores, in one spreadsheet. Each run is a folder of its sample pictures, sub-folders included:
+
+- a picture whose own name or a folder name below the run folder says `face` is scored for the face, `body` for the
+  body, neither for both (the name closest to the file decides);
+- its step is the number after `step` in the file name, else the first number of 1 to 9 digits (a 13-digit
+  timestamp is skipped), else none; `--step-pattern` takes a regular expression for other names;
+- a *baseline* folder holds the base model's renders of the same prompts without a LoRA: its face pictures are the
+  face score's zero and its body pictures (4 to 8 seeds) the anchored body score's strangers.
+
+Every picture gets the face (ArcFace), the gold face (FaceNet) and the anchored body score; a checkpoint's score is
+its pictures' mean on the likeness scale (the face from the baseline to the face references' level, stretched and
+curved by the default span and curve; the anchored body as it is), combined with the face weight. The workbook:
+*Summary* (each run's late checkpoints, from half of the largest step on, its body checkpoint spread, its best
+checkpoint, and face, body and combined charts), *By step*, *Pictures* (every raw score), *Chart data*, *Scale* (the
+floors, levels, spans, curves, weights and the late step: edit them and every score follows) and *Notes*; a `.json`
+with the raw numbers goes next to it, in `output/_compare/`. Without the WebUI:
+
+```
+python -m rulztrainer.score_folders --face-refs <folder> --body-refs <folder> --baseline <folder>
+    --run "keel_fb=F:/results/rulz keel_fb" --run "Fizgig=F:/results/Fizgig" --out likeness_runs.xlsx
+```
+
+Five 2,000-step runs (10 checkpoints each, one face and one body picture per checkpoint) take about a minute and a
+half on an RTX 5060 Ti once the models are downloaded.
 
 ## Likeness-filtered self-training (`selftrain`)
 

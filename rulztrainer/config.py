@@ -283,7 +283,7 @@ DATASET_KEYS = ("path", "resolutions", "repeats")
 
 
 
-BODY_SCORES = ("appearance", "proportions", "skeleton3d", "smplx")
+BODY_SCORES = ("appearance", "anchored", "proportions", "skeleton3d", "smplx")
 
 @dataclass(frozen=True)
 class DatasetSpec:
@@ -528,6 +528,8 @@ class TrainConfig:
     face_det_size: int = 640
     body_refs: list[str] = field(default_factory=list)  # dataset images (full body, neutral pose) for proportions
     body_score: str = "appearance"  # appearance (DINOv2 of the person crop, best match against the references) |
+    #   anchored (SigLIP 2 + DINOv2 of the body window with its photographic look taken out: 0 = the step-0 probe's
+    #   base-model renders, 100 = the references' mean; bodyanchor.py) |
     #   proportions (2D skeleton ratios from body_backend, + SAM 3 silhouette widths with mediapipe+sam3) |
     #   skeleton3d (3D bone ratios, + silhouette widths where upright and frontal; bodyshape.py) |
     #   smplx (NLF's SMPL-X body shape measured in the T-pose; its model is downloaded by hand, see nlf_model)
@@ -646,6 +648,7 @@ class TrainConfig:
     face_scale_curve: float = 1.5  # the face score is its position on that scale raised to this power (1 = linear)
     body_scale_span: float = 1.35  # the same for the body: its 100 this many times as far above a stranger
     body_scale_curve: float = 1.5  # and its curve (1 and 1 = the linear body scale of v2.1.3 and before)
+    #   (both unused by body_score anchored: its scale is linear from the step-0 probe to the references' mean)
     likeness_track_best: bool = True  # keep <job>_best.safetensors at the best smoothed score
     likeness_track_best_face: bool = False  # also keep <job>_best_face.safetensors at the best smoothed face score
     likeness_track_best_body: bool = False  # and <job>_best_body.safetensors at the best smoothed body score

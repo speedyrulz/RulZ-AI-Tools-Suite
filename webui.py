@@ -707,6 +707,19 @@ def body_preview(paths: list[str], backend: str = "mediapipe", sam3_model: str =
         else:
             text += ". Add 3+ measurable photos to measure the references' own level."
         return text
+    if body_score == "anchored":
+        from rulztrainer import bodyanchor
+
+        scorer = bodyanchor.AnchoredScorer("models", device, progress=set_progress)
+        set_progress("Finding people...", None)
+        paths = [str(p) for p in facesim.expand_refs(paths)]
+        if not paths:
+            return "No image files found in the listed paths (folders are expanded to the images inside)."
+        info = scorer.set_references(paths)
+        shown = sum(1 for i in info if i.get("person"))
+        return (f"{shown} of {len(paths)} body references show shoulders and hips; {scorer.ref_count} show the body "
+                "from the neck to mid-thigh and are compared (anchored score, SigLIP 2 + DINOv2). Its zero is set "
+                "when training starts, by the step-0 probe's body renders (the base model without the LoRA).")
     if body_score == "appearance":
         scorer = bodysim.AppearanceScorer("models", device, progress=set_progress)
         set_progress("Finding people...", None)
@@ -2320,6 +2333,22 @@ def _serve_likeness_xlsx(job: str):
     except (OSError, ValueError) as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
     return FileResponse(out, filename=out.name,
+                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+COMPARE_DIR = ROOT / "output" / "_compare"  # Score sample folders' spreadsheets
+
+
+@app.get("/rz-compare-xlsx")
+def _serve_compare_xlsx(name: str):
+    """A Score sample folders spreadsheet: a file name in COMPARE_DIR only."""
+    from fastapi import HTTPException
+    from fastapi.responses import FileResponse
+
+    p = COMPARE_DIR / Path(name).name
+    if p.suffix.lower() != ".xlsx" or not p.is_file():
+        raise HTTPException(status_code=404, detail="Not Found")
+    return FileResponse(p, filename=p.name,
                         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
@@ -6264,6 +6293,68 @@ def build_history_tab(charts: list):
                 .tooltip("Untick the picked images")
         probe_warn = hint("", warn=True)
         probe_grid = ui.column().classes("w-full gap-2")
+
+    async def score_folders_ui():
+        from urllib.parse import quote
+
+        from rulztrainer import score_folders as SF
+
+        def lines(text):
+            return [x.strip().strip('"') for x in (text or "").splitlines() if x.strip()]
+
+        runs = [SF.parse_run(x) for x in lines(cmp_runs.value)]
+        if not runs:
+            ui.notify("List the runs to compare: name = folder, one per line", type="warning")
+            return
+        fw = float(cmp_fw.value if cmp_fw.value is not None else 70) / 100.0
+        out = COMPARE_DIR / f"likeness_runs_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
+        cmp_btn.disable()
+        cmp_out.text = "Scoring..."
+        _task_progress.update(text="Scoring sample folders...", frac=None, active=True)
+        cmp_tick.active = True  # this tab has no progress bar of its own
+        try:
+            result = await run.io_bound(SF.score, lines(cmp_face.value), lines(cmp_body.value),
+                                        (cmp_base.value or "").strip().strip('"') or None, runs, "models", "cuda:0",
+                                        "cpu", True, "", set_progress)
+            await run.io_bound(SF.export, result, out, fw)
+        except (OSError, ValueError, RuntimeError) as e:
+            cmp_out.text = f"Error: {e}"
+            return
+        finally:
+            cmp_tick.active = False
+            _task_progress.update(active=False)
+            cmp_btn.enable()
+        cmp_out.text = "\n".join(SF.summary_lines(result, fw)) + f"\n\nSaved {out}"
+        ui.download(f"/rz-compare-xlsx?name={quote(out.name)}", out.name)
+
+    with section("Score sample folders", "Compare finished runs from any trainer on the likeness scores, in one "
+                 "spreadsheet", "folder_open", open_=False):
+        hint("Each run is a folder of its sample pictures, sub-folders included. A file or folder name with \"face\" "
+             "marks face pictures, \"body\" body pictures (neither: both scores); the step comes from the file name "
+             "(\"step000200\", \"200.png\"). The baseline folder holds the base model's renders of the same prompts "
+             "without a LoRA: the zero of the face score and of the anchored body score (4 to 8 body seeds).")
+        with ui.row().classes("w-full gap-3"):
+            cmp_face = ui.textarea("Face references (files or folders, one per line)").props("rows=3") \
+                .classes("flex-1 min-w-[16rem]")
+            cmp_body = ui.textarea("Body references (files or folders, one per line)").props("rows=3") \
+                .classes("flex-1 min-w-[16rem]")
+        cmp_base = ui.input("Baseline folder (the base model, no LoRA)").classes("w-full")
+        cmp_runs = ui.textarea("Runs: name = folder, one per line",
+                               placeholder="keel_fb = F:/results/rulz keel_fb\nai-toolkit = F:/results/ai toolkit") \
+            .props("rows=4").classes("w-full")
+        with ui.row().classes("items-center gap-3"):
+            cmp_fw = ui.number("Face weight %", value=70, min=0, max=100, step=5).props("dense").classes("w-28")
+            cmp_btn = ui.button("Score and export", icon="table_view", on_click=score_folders_ui).props("outline") \
+                .tooltip("Scores every picture with the trainer's face scorers (ArcFace, FaceNet) and the anchored "
+                         "body score, then downloads a spreadsheet: each run's late checkpoints, its best one, charts "
+                         "and every raw score, as formulas you can rescale")
+        cmp_out = ui.label("").classes("rz-mono whitespace-pre-wrap")
+
+        def cmp_progress():
+            frac = _task_progress.get("frac")
+            cmp_out.text = (_task_progress.get("text") or "Scoring...") + (f" ({frac:.0%})" if frac else "")
+
+        cmp_tick = ui.timer(0.5, cmp_progress, active=False)
     with ui.dialog().props("maximized") as cmp_dlg, ui.card().tight().classes("w-full h-full bg-black"):
         with ui.row().classes("w-full items-center justify-between px-3 py-1"):
             ui.label("Compare").classes("text-sm text-white")
@@ -7508,6 +7599,7 @@ def build_page(local: bool = True):
                                                      "three-quarter or full-length shots)").classes("w-full")
                         with fields():
                             w["body_score"] = ui.select({"appearance": "appearance (DINOv2)",
+                                                         "anchored": "anchored (SigLIP 2 + DINOv2)",
                                                          "proportions": "proportions (2D skeleton)",
                                                          "skeleton3d": "proportions 3D (skeleton + silhouette)",
                                                          "smplx": "SMPL-X body shape (NLF)"},
@@ -7515,7 +7607,14 @@ def build_page(local: bool = True):
                                 .tooltip("appearance: a DINOv2 embedding of the body from the neck to mid-thigh, "
                                          "turned upright and cut out from the background, best match against the "
                                          "reference photos that show the same part of the body (build, skin, hair; "
-                                         "clothing and nudity too, so vary the outfits). proportions (2D): skeleton "
+                                         "clothing and nudity too, so vary the outfits). anchored: the same body "
+                                         "window with its photographic look (colour grade, exposure, sharpness, "
+                                         "grain) taken out, embedded by SigLIP 2 and DINOv2, scored as how far it "
+                                         "has moved from the base model's people (the step-0 probe's body renders, "
+                                         "8 seeds) toward the references: 0 = the base model, 100 = the references' "
+                                         "mean. On a five-run comparison it told trained samples from the base model "
+                                         "where the best match ranked the person's own photos below the base "
+                                         "model's. proportions (2D): skeleton "
                                          "ratios on the flat picture, which shift with pose and camera angle more "
                                          "than people differ. proportions 3D: bone-length ratios from the pose "
                                          "model's 3D landmarks (the same bent or straight), plus waist, hip and thigh "
@@ -9263,6 +9362,14 @@ overlay them: one colour per run (one legend entry each), solid lines for the fa
 the combined score, with chips to show only some of the three. *Rename* gives a run a name of your own and *Remove from history* deletes
 its history file only (never the job folder). A run that is still training updates live.
 
+*Score sample folders* compares finished runs from any trainer (ai-toolkit, Fizgig, OneTrainer, this one) on the
+probe scores, in one spreadsheet. List each run as `name = folder` (its sample pictures, sub-folders included): a
+file or folder name with "face" marks face pictures, "body" body pictures, and the step comes from the file name
+("step000200", "200.png"). The baseline folder holds the base model's renders of the same prompts without a LoRA,
+the zero of the face score and of the anchored body score (4 to 8 body seeds). The spreadsheet (also saved in
+`output/_compare/`) has each run's late checkpoints, its best one, charts, every raw score and the scale as formulas
+you can edit.
+
 **Probe images** (below the charts) puts the ticked runs' likeness probes side by side: pick Face or Body and a probe
 step (the arrows step through them). The images are grouped by test picture (*Face probe 1*...), every run, or each
 configuration of a race, side by side under it with its face / body / combined scores. A run probed on another interval
@@ -9313,7 +9420,12 @@ against each other ~60-80). The body score (*Body score*, Identity similarity se
 embedding of the body from the neck to mid-thigh, turned upright, cut out from the background and without the head
 (the face score covers that), best match against the reference photos that show the same part of the body
 (three-quarter or full-length shots; close-ups are left out). Build, skin, hair and clothing count, so vary the
-outfits among the references. `proportions` is the older skeleton-ratio match (every human ~80, the references
+outfits among the references. *anchored* takes the same window with its colour grade, exposure and sharpness
+normalised away, embeds it with SigLIP 2 and DINOv2, and scores how far it has moved from the base model's people
+(the step-0 probe's body renders, 8 seeds) toward the references: 0 = the base model, 100 = the references' mean.
+On a five-run comparison it told trained samples from the base model's in 96% of pairs, where the best match ranked
+the person's own photos below the base model's; a probe in one outfit and scene stays well below 100, so compare
+runs with each other. `proportions` is the older skeleton-ratio match (every human ~80, the references
 ~90-96), which shifts with pose and camera angle. *proportions 3D* measures bone-length ratios in 3D (the same bent
 or straight) plus waist, hip and thigh widths where the person stands facing the camera; *SMPL-X body shape* fits
 the SMPL-X body model with NLF and measures it in its T-pose (bust, waist, hip and thigh girths, limb lengths, over
