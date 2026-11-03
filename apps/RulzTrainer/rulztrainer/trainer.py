@@ -1038,6 +1038,7 @@ class Trainer(RaceParallelMixin):
             self.face_scorer = self._make_face_scorer()
             self.body_scorer = self._make_body_scorer()
             self.controller = self._make_controller(items)
+            self._resume_body_strangers(step)
         self.id_loss = self._make_id_loss()
         self._park_vae()  # to RAM until the first sample or probe (kept on the GPU with the identity loss)
         if torch.cuda.is_available():
@@ -1134,9 +1135,10 @@ class Trainer(RaceParallelMixin):
         self._setup_probe_worker()
         if cfg.sample_prompts and cfg.sample_before_training and step == 0:
             self.sample_images(model, step)
-        if self.controller is not None and cfg.probe_at_start and step == 0 and self.probe_worker is not None:
+        at_start = self.controller is not None and step == 0 and self._probe_at_start()
+        if at_start and self.probe_worker is not None:
             self._probe_async_start(step, injected)  # the baseline renders on the probe GPU while training starts
-        elif self.controller is not None and cfg.probe_at_start and step == 0:
+        elif at_start:
             self.run_probe(model, step, optimizer, scheduler, injected)
             if self.race is not None:  # every configuration starts from the same base model: one baseline for all
                 for v in self.race.variants[1:]:
@@ -3688,6 +3690,10 @@ class Trainer(RaceParallelMixin):
                 continue
             w, h = (cfg.probe_size, cfg.probe_size) if kind == "face" else probe_body_size(cfg.probe_size)
             n = n_seeds or probe_seed_count(cfg, step)  # more at step 0: the normalized scale's zero
+            if kind == "body" and step == 0 and getattr(self.body_scorer, "needs_strangers", False):
+                from .bodyanchor import STRANGER_SEEDS
+
+                n = max(n, STRANGER_SEEDS)  # the anchored body score's zero: the base model's renders
             for k in range(n):
                 jobs.append(RenderJob(prompt, w, h, cfg.probe_steps, cfg.probe_cfg, cfg.probe_seed + k,
                                       out_dir / f"{self._image_prefix()}{tag or f'step{step:06d}'}_{kind}_{k}.png",
@@ -3701,6 +3707,8 @@ class Trainer(RaceParallelMixin):
         gold = self.face_scorer is not None and getattr(self.face_scorer, "gold", None) is not None
         if gold:
             seeds["gold"] = []
+        if step == 0 and getattr(self.body_scorer, "needs_strangers", False):  # the first base-model probe
+            self._set_body_strangers([p for job, p in zip(jobs, images) if job.kind == "body"])
         self.status.update(stage=f"scoring probes (step {step})")
         for job, p in zip(jobs, images):  # scoring stays in this thread: the scorers are not shared across threads
             if job.kind == "face":
@@ -4197,6 +4205,11 @@ class Trainer(RaceParallelMixin):
             if cfg.body_score == "appearance":
                 scorer = bodysim.AppearanceScorer(cfg.models_dir, cfg.body_device,
                                                   progress=lambda t, f: self.status.update(stage=t))
+            elif cfg.body_score == "anchored":
+                from .bodyanchor import AnchoredScorer
+
+                scorer = AnchoredScorer(cfg.models_dir, cfg.body_device,
+                                        progress=lambda t, f: self.status.update(stage=t))
             elif cfg.body_score == "skeleton3d":
                 from .bodyshape import Skeleton3DScorer
 
@@ -4227,7 +4240,46 @@ class Trainer(RaceParallelMixin):
             return None
         if not scorer.ready:
             log.warning("No usable %s in any body reference image; body scoring disabled",
-                        {"appearance": "person", "smplx": "body down to the knees"}.get(cfg.body_score, "pose"))
+                        {"appearance": "person", "anchored": "person",
+                         "smplx": "body down to the knees"}.get(cfg.body_score, "pose"))
             return None
+        if getattr(scorer, "needs_strangers", False) and (cfg.probe_every <= 0 or not cfg.probe_body_prompt):
+            log.warning("The anchored body score takes its zero from the step-0 body probe (the base model's renders "
+                        "of the body probe prompt): with %s there is none, so nothing gets a body score this run",
+                        "probes off (probe_every 0)" if cfg.probe_every <= 0 else "no body probe prompt")
         self.status.update(body_ref_similarity=scorer.ref_self_similarity, body_refs=scorer.ref_count)
         return scorer
+
+    def _body_strangers_file(self) -> Path:
+        from .bodyanchor import STRANGERS_FILE
+
+        return self.job_dir / "probes" / STRANGERS_FILE
+
+    def _set_body_strangers(self, paths: list[str]) -> None:
+        """The anchored body score's zero: the first base-model probe's body renders (bodyanchor.py), kept in the job
+        folder for a resumed run."""
+        self.status.update(stage="body score: setting its zero from the base model's renders")
+        if self.body_scorer.set_strangers(paths) and self.body_scorer.anchored:
+            self.body_scorer.save_strangers(self._body_strangers_file())
+            self.status.update(body_ref_similarity=self.body_scorer.ref_self_similarity)
+
+    def _resume_body_strangers(self, step: int) -> None:
+        """A resumed run has no step-0 probe: the anchored body score reads the strangers the run saved at its start."""
+        if step <= 0 or not getattr(self.body_scorer, "needs_strangers", False):
+            return
+        path = self._body_strangers_file()
+        if self.body_scorer.load_strangers(path):
+            log.info("Body score (anchored): its zero from the run's step-0 probe (%s)", path)
+            self.status.update(body_ref_similarity=self.body_scorer.ref_self_similarity)
+        else:
+            log.warning("Body score (anchored): %s is missing, and its zero is the step-0 probe, which a resumed run "
+                        "does not render; nothing gets a body score this run", path)
+
+    def _probe_at_start(self) -> bool:
+        """The step-0 probe runs: probe_at_start, or always for the anchored body score, whose zero it sets."""
+        if self.cfg.probe_at_start:
+            return True
+        if getattr(self.body_scorer, "needs_strangers", False) and self.cfg.probe_body_prompt:
+            log.info("Probing at step 0 although probe_at_start is off: it sets the anchored body score's zero")
+            return True
+        return False

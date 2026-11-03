@@ -31,6 +31,11 @@ it, a DINOv2 cosine because a probe that copies the photos' outfit and setting m
 references, in their varied outfits, match each other. With the face alone stretched (until v2.1.3) the body read 100
 while the face, for pictures that looked equally close, read 50-60. The combined score, the noise band, the curriculum, the lr control and the best / stop / race decisions all run on those.
 
+Anchored body score. body_score "anchored" (bodyanchor.py) is measured from the base model toward the references
+already: 0 = the step-0 probe's body renders, 100 = the references' mean, linear. Its scale is that, as it is (floor
+0, ceiling 100, no span, no curve): it does not saturate, and a probe in one fixed outfit and scene stays well below the
+references' mean, so curving it would squash the differences between runs.
+
 Gold face score. A run that trains against ArcFace (the reward stage, the identity loss on its arcface backend,
 identity alignment) can raise the ArcFace score without raising the likeness: the score it is judged by is the one it
 optimizes. With `face_gold` the probes also score each face with FaceNet (VGGFace2), which nothing trains on, on its
@@ -76,6 +81,19 @@ NORM_MAX = 100.0
 # CURVE_DEFAULT (config: face_scale_span / _curve, body_scale_span / _curve; 1 and 1 give the plain linear scale)
 FACE_SPAN_DEFAULT = BODY_SPAN_DEFAULT = 1.35
 FACE_CURVE_DEFAULT = BODY_CURVE_DEFAULT = 1.5
+ANCHORED_BODY_SCALE = (0.0, 100.0)  # body_score anchored: (floor, ceiling) by construction, linear
+
+
+def anchored_body(cfg) -> bool:
+    return getattr(cfg, "body_score", "") == "anchored"
+
+
+def body_shape(cfg) -> tuple[float, float]:
+    """(span, curve) of the body scale: body_scale_span / _curve, or 1 and 1 for the anchored body score."""
+    if anchored_body(cfg):
+        return 1.0, 1.0
+    return (float(getattr(cfg, "body_scale_span", BODY_SPAN_DEFAULT)),
+            float(getattr(cfg, "body_scale_curve", BODY_CURVE_DEFAULT)))
 
 
 def reference_ceiling(embs, usable=None) -> float | None:
@@ -186,14 +204,16 @@ class LikenessController:
         default)."""
         self.cfg = cfg
         self.normalize = bool(getattr(cfg, "likeness_normalize", True))
+        self.anchored_body = anchored_body(cfg)
+        if self.anchored_body:  # its scale is fixed by construction (the module docstring)
+            body_ceiling = ANCHORED_BODY_SCALE[1]
         self.ceiling = {"face": face_ceiling if face_ceiling is not None else CEILING_DEFAULT["face"],
                         "body": body_ceiling if body_ceiling is not None else CEILING_DEFAULT["body"],
                         "gold": gold_ceiling if gold_ceiling is not None else CEILING_DEFAULT["gold"]}
         self.floor = {"face": None, "body": None, "gold": None}  # None: the default, until a step-0 probe sets it
-        self.span = {"face": float(getattr(cfg, "face_scale_span", FACE_SPAN_DEFAULT)),
-                     "body": float(getattr(cfg, "body_scale_span", BODY_SPAN_DEFAULT))}
-        self.curve = {"face": float(getattr(cfg, "face_scale_curve", FACE_CURVE_DEFAULT)),
-                      "body": float(getattr(cfg, "body_scale_curve", BODY_CURVE_DEFAULT))}
+        span, curve = body_shape(cfg)
+        self.span = {"face": float(getattr(cfg, "face_scale_span", FACE_SPAN_DEFAULT)), "body": span}
+        self.curve = {"face": float(getattr(cfg, "face_scale_curve", FACE_CURVE_DEFAULT)), "body": curve}
         self.face_ema = None
         self.body_ema = None
         self.gold_ema = None
@@ -258,6 +278,8 @@ class LikenessController:
     def scale(self, kind: str) -> tuple[float, float]:
         """(floor, ceiling) in raw points for "face" / "body": the ceiling at least MIN_SPAN above the floor (the body's
         also at least halfway to 100, MIN_ROOM_SHARE), then the span stretched (face_scale_span / body_scale_span)."""
+        if kind == "body" and self.anchored_body:
+            return ANCHORED_BODY_SCALE
         floor = self.floor[kind] if self.floor[kind] is not None else FLOOR_DEFAULT[kind]
         least = max(MIN_SPAN[kind], MIN_ROOM_SHARE[kind] * (100.0 - floor))
         return floor, floor + (max(self.ceiling[kind], floor + least) - floor) * self._shape(kind)[0]
@@ -288,10 +310,13 @@ class LikenessController:
         for kind in self.kinds():
             lo, hi = self.scale(kind)
             src = "step-0 probe" if self.floor[kind] is not None else "default"
+            if kind == "body" and self.anchored_body:
+                src = "anchored: the step-0 probe's renders to the references' mean"
             parts.append(f"{'gold face' if kind == 'gold' else kind} {lo:.1f} -> {hi:.1f} (floor: {src}"
                          + (f", curve x{self._shape(kind)[1]:g}" if self._shape(kind)[1] != 1.0 else "") + ")")
-        return "; ".join(parts) + (" (raw percent: 0 = a stranger; body 100 = a typical reference's best match among "
-                                   "the others, the face scale reaches past it)")
+        body = ("body 100 = the references' mean" if self.anchored_body
+                else "body 100 = a typical reference's best match among the others")
+        return "; ".join(parts) + f" (raw percent: 0 = a stranger; {body}, the face scale reaches past it)"
 
     def seed_scores(self, seeds: dict | None) -> dict:
         """A probe's per-seed raw scores ({"face": [...], "body": [...]}, seed order, None = unscored) as the record

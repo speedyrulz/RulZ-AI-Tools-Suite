@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .likeness import CEILING_DEFAULT, MIN_ROOM_SHARE, MIN_SPAN
+from .likeness import ANCHORED_BODY_SCALE, CEILING_DEFAULT, MIN_ROOM_SHARE, MIN_SPAN, anchored_body, body_shape
 
 FONT = "Arial"
 
@@ -148,9 +148,11 @@ def build_workbook_from(probes: list[dict], cfg, race_names=()):
         sa.cell(2, 2 + g, label or "run").font = bold
         sa.column_dimensions[col].width = 13
         levels = _reference_levels(rows, cfg)
+        if anchored_body(cfg):  # the anchored body score's scale is fixed: 0 to the references' mean, linear
+            levels["body"] = ANCHORED_BODY_SCALE
         values = [levels["face"][0], levels["face"][1], cfg.face_scale_span, cfg.face_scale_curve, levels["body"][0],
-                  levels["body"][1], getattr(cfg, "body_scale_span", 1.35), getattr(cfg, "body_scale_curve", 1.5),
-                  MIN_ROOM_SHARE["body"], cfg.face_weight, cfg.body_weight, cfg.probe_ema]
+                  levels["body"][1], *body_shape(cfg), 0.0 if anchored_body(cfg) else MIN_ROOM_SHARE["body"],
+                  cfg.face_weight, cfg.body_weight, cfg.probe_ema]
         for i, v in enumerate(values):
             c = sa.cell(3 + i, 2 + g, float(v))
             c.font, c.number_format = blue, "0.00"
