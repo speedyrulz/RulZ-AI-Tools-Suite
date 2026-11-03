@@ -168,7 +168,7 @@ def rescore(record: dict, face_span: float, face_curve: float, body_span: float,
     """The run's probe series (probe_series' shape) rebuilt from its raw scores on other scale settings: its own
     floors and references' levels, the given span / curve per kind and weights, its own smoothing. None for a run
     without raw scores (probe_raw)."""
-    from .likeness import MIN_ROOM_SHARE, MIN_SPAN, combine, normalize
+    from .likeness import ANCHORED_BODY_SCALE, MIN_ROOM_SHARE, MIN_SPAN, combine, normalize
     from .likeness_export import _groups, _reference_levels
 
     raw = record.get("probe_raw") or {}
@@ -177,6 +177,9 @@ def rescore(record: dict, face_span: float, face_curve: float, body_span: float,
         return None
     names = raw.get("names") or []
     a = float((record.get("config") or {}).get("probe_ema", 0.5))
+    anchored = (record.get("config") or {}).get("body_score") == "anchored"
+    if anchored:  # the anchored body score's scale is fixed: 0 to the references' mean, linear
+        body_span = body_curve = 1.0
     shape = {"face": (face_span, face_curve), "body": (body_span, body_curve)}
 
     def tops(rows: list[dict]) -> dict:
@@ -184,6 +187,8 @@ def rescore(record: dict, face_span: float, face_curve: float, body_span: float,
         for kind, (floor, ref) in _reference_levels(rows, None).items():
             least = max(MIN_SPAN[kind], MIN_ROOM_SHARE[kind] * (100.0 - floor))
             out[kind] = (floor, floor + (max(ref, floor + least) - floor) * shape[kind][0])
+        if anchored:
+            out["body"] = ANCHORED_BODY_SCALE
         return out
 
     def points(rows: list[dict]) -> list[tuple]:

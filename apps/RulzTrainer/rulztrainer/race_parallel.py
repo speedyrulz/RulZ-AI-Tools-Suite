@@ -404,7 +404,7 @@ class RaceParallelMixin:
             with self._rp_bound(v0):
                 self._rp_load_render(v0)
                 self.sample_images(model, 0)
-        if base.probe_at_start:
+        if base.probe_at_start or (getattr(self.body_scorer, "needs_strangers", False) and base.probe_body_prompt):
             with self._rp_bound(v0):
                 self._rp_load_render(v0)
                 self.run_probe(model, 0, None, None, self._rp_view(v0))
