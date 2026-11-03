@@ -378,6 +378,44 @@ def test_trainer_decides_the_winner_at_the_end(tmp_path):
     assert (tmp_path / "job_winner.yaml").exists() and sched.state()["winner"] == "a"
 
 
+def test_the_last_one_racing_keeps_its_own_best_until_the_end(tmp_path):
+    from types import SimpleNamespace
+
+    from rulztrainer import trainer as T
+
+    sched = R.RaceSchedule(["a", "b", "c"], 0, drop_lowest=False, total_steps=20)
+    for idx, score in ((0, 30.0), (1, 20.0), (2, 25.0)):
+        sched.record(idx, score, 10, best=score, best_step=10, since_improve=0)
+    for idx, score in ((0, 34.0), (1, 22.0)):
+        sched.record(idx, score, 20, best=score, best_step=20, since_improve=0)  # a and b finish: c trains on alone
+    assert sched.done and sched.alive == [2]
+    base = race_cfg([{"name": "a"}, {"name": "b"}, {"name": "c"}], job_name="job", race_drop_lowest=False)
+    ctl = {0: SimpleNamespace(best=34.0, best_step=20), 1: SimpleNamespace(best=22.0, best_step=20),
+           2: SimpleNamespace(best=33.0, best_step=20)}
+    variants = [SimpleNamespace(name=n, idx=i, cfg=base, overrides={}, state={"controller": ctl[i]})
+                for i, n in enumerate("abc")]
+    fake = SimpleNamespace(job_dir=tmp_path, cfg=base, stage_tag="", race=SimpleNamespace(
+        schedule=sched, variants=variants, base_cfg=base, active=variants[2], running=False))
+    fake._race_running = lambda: fake.race.running
+    fake._file_tag = lambda: ""
+    fake._race_report = lambda: None
+    (tmp_path / "job_c_best.safetensors").write_bytes(b"c at 10")
+    T.Trainer._race_finish(fake)
+    assert not (tmp_path / "job_best.safetensors").exists()  # nothing is the run's best before the end decides
+    assert T.Trainer._best_tag(fake) == "_c"  # c's new bests go on in its own file
+    (tmp_path / "job_c_best.safetensors").write_bytes(b"c at 20")
+    (tmp_path / "job_a_best.safetensors").write_bytes(b"a")
+    T.Trainer._race_decide(fake)
+    assert sched.champion == 0 and (tmp_path / "job_best.safetensors").read_bytes() == b"a"
+    assert (tmp_path / "job_c_best.safetensors").read_bytes() == b"c at 20"  # c's best is not overwritten
+    assert T.Trainer._best_tag(fake) == ""  # once decided, the run's own name again
+
+    ctl[2].best = 40.0  # c wins: its own best becomes the run's
+    sched.champion = None
+    T.Trainer._race_decide(fake)
+    assert sched.champion == 2 and (tmp_path / "job_best.safetensors").read_bytes() == b"c at 20"
+
+
 def test_trainer_reads_the_drop_request(tmp_path):
     from types import SimpleNamespace
 
