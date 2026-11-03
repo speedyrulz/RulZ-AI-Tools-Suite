@@ -1,6 +1,8 @@
 # Hull: a body-identity optimizer for character LoRAs (design)
 
-Status: design only; nothing is built. Every number below is a starting value to race unless it is cited, measured in
+Status: H0, the base rule, is built (`rulztrainer/optimizers/hull.py`, `tests/test_hull.py`) with `hull_metric: balanced`,
+`hull_frame: virtual` and `hull_step_scope: layer`; it has not trained a real model or been raced, and everything else
+here is design. Every number below is a starting value to race unless it is cited, measured in
 a synthetic benchmark or computed, and then it carries a tag. Working name "Hull": Keel is a ship's spine, the hull
 its whole body and skin. Hull is for any character LoRA; Qwen-Image 2.1 is the main target.
 
@@ -71,7 +73,7 @@ layer (HullLoRA) and through a few probe decisions.
 
 | call | when | what for |
 |---|---|---|
-| `Hull(params, pairs, ref_norms, **kw)` | `build_optimizer` | pairs (`lora.py:757-759`); frozen-weight norms, one per pair, looked up by module name in `_make_optimizer` (7) |
+| `Hull(params, pairs, ref_norms, scales, **kw)` | `build_optimizer` | pairs (`lora.py:757-759`); frozen-weight norms and alpha / rank, one per pair, looked up by module name in `_make_optimizer` (7) |
 | `observe(sigma, hook, kind)` | before each micro-batch and, `kind="dop"`, the DOP pass (`trainer.py:1161-1163, 1248-1249`) | the step's band, the DOP flag; locked |
 | `lora.arm_hull` / `disarm_hull` | per micro-batch in `work()`, primary copy (replicas from M2) | token gains, face mask, layout, C3's metric, the excess sink |
 | `zero_grad()` / `step()` | step start and out-of-memory retry / once per step | clears the excess and band record / H0, no host sync |
@@ -203,10 +205,14 @@ until B is non-zero ([2607.17620](https://arxiv.org/abs/2607.17620), appendix) [
 
 ### 4.6 Numerics, precision, syncs
 
+- **The roots run in fp64, not fp32 (measured while building H0).** A rank-4 update held at rank 32 at the default
+  damping has Gram eigenvalues under fp32's rounding error: an fp32 Gram has negative ones and the iteration diverges to
+  NaN or a residual of 1e8, at every held rank below 32. Grams and roots in fp64 hold a residual of 1e-9 from fp32
+  factors; T, T⁻¹ and everything after them stay fp32. The fp32 figures in 4.1 do not carry over to low-rank factors.
 - **No host sync in `step()`.** In torch 2.9.1 the docstrings of `torch.linalg.eigh`, `solve`, `inv` and `cholesky`
   state that they synchronise a CUDA device with the CPU, the `_ex` forms only with `check_errors`. The roots are
   coupled Newton-Schulz iterations (Higham, *Functions of Matrices*, ch. 6,
-  [doi:10.1137/1.9780898717778](https://doi.org/10.1137/1.9780898717778)), a fixed 30 per root in fp32, on one stacked
+  [doi:10.1137/1.9780898717778](https://doi.org/10.1137/1.9780898717778)), a fixed 30 per root in fp64 (above), on one stacked
   [n, r, r] batch per device across all shapes. [N] A rank-4 update held at rank 32 needs 30: the S error was 0.93
   after 10 iterations, 0.48 after 20, 2.4e-9 after 30.
 - **Fallback.** A pair whose residual ||T M T - N|| / ||N|| exceeds 1e-3 keeps the previous step's T (stored,
@@ -218,7 +224,11 @@ until B is non-zero ([2607.17620](https://arxiv.org/abs/2607.17620), appendix) [
 - **Hot path.** Work is stacked per (o, i, device) bucket and written back with `_foreach_copy_`, as
   `optimizers/automagic4.py:243-256` does: about 12 r x r Gram products per pair and two roots on one [224, 32, 32]
   batch, est. +25-60 ms over the 94 ms null step [H] (fused AdamW +2, foreach +21, Automagic 4 +66, bnb AdamW8bit +82
-  ms [bench]). M1a's bar: +80 ms, 0 syncs.
+  ms [bench]). M1a's bar: +80 ms, 0 syncs. **Measured on H0 (synthetic tensors at this LoRA's shapes, four buckets, the
+  cards shared with other work):** 165 ms a step against fused AdamW's 16 on the RTX 4060 Ti, about 115 against 15 on
+  the RTX 5060 Ti, 0 syncs by `set_sync_debug_mode`. So the bar is missed by roughly a factor of 2 on the 4060 Ti; of the
+  165 ms about 50 are the fp64 Grams, 30 the roots, the rest the update. The real step's +6% or less at 2.5 s or more
+  keeps it inside section 10's +10%.
 
 ### 4.7 Clipping
 
@@ -637,7 +647,8 @@ recommending `adamw8bit` until a race says otherwise.
 |---|---|---|---|
 | `m` | both factors | bf16, like p | 2 |
 | `v` | lora_up [o], lora_down [i] | fp32 | 0.125 |
-| `T`, `u`, `k`, cap and fallback counters | lora_up (`k` on both) | fp32, [r, r] or 0-dim | ~0 |
+| `T`, `Ti`, `u`, `k`, cap and fallback counters | lora_up | fp32, [r, r] or 0-dim | ~0 |
+| `dither`, the stochastic rounding's step count | the first pair's lora_up | a host integer | ~0 |
 | `lam`, the gained-raw cosine EMA | both factors, per tensor | fp32, 0-dim | ~0 |
 | `mu`, miss and accept counts, the anchor's per-seed scores | every parameter (mirrors) | fp32, 0-dim or tiny 1-D | ~0 |
 | `anchor` (lookahead) | every parameter, CPU, in `host_keys` | fp32 | 4 on the host |
@@ -886,6 +897,12 @@ E: an 80/20 stream comes out equally weighted; phases: mu never rises. Races R8-
       checks one realised multiple of rho within ±10% across ranks 4-64, not rho itself, because u realises about
       1.25-1.5 rho on a consistent layer (4.3, 4.4).
     - (j) R0a and R0b run in M0, before the A/A pilot, which needs the control's lr and sampler; M1a races R1-R2.
+    - (k) Found while building H0: the Grams and roots run in fp64, not fp32 (4.6), and step() costs more than the bar.
+    - (l) `Hull` also takes each pair's alpha / rank (`scales`), which the pairs' tensors do not carry.
+    - (m) `T⁻¹` is stored beside `T`: the fallback must keep both, and a fp32 inverse of a stored T would lose its
+      conditioning.
+    - (n) The stochastic rounding's generator is private and reseeded from a step count in the state, so the dither
+      leaves the run's noise stream alone (arms stay paired) and a relay or resume repeats it exactly.
 12. **Licences the user must settle:** the Fizgig adapter (and, if the adapter-off control collapses, whether the
     races use it) and the FaceNet VGGFace2 weights (none stated), SAM 3D Body's gated SAM License, the HBW (SHAPY) and
     3DBodyTex licence agreements (3DBodyTex's signed by the recipient's institution), and the volunteers' release
