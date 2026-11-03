@@ -354,9 +354,10 @@ def loss_weight(cfg: TrainConfig, sigma: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Unknown loss_weighting {cfg.loss_weighting}")
 
 
-def build_optimizer(cfg: TrainConfig, params, pairs=None):
+def build_optimizer(cfg: TrainConfig, params, pairs=None, ref_norms=None, scales=None):
     """`params` may be a list of tensors or a list of param-group dicts (LoRA+). `pairs`: the (lora_down, lora_up)
-    pairs among them (lora.lora_pairs), which Keel preconditions; the other optimizers ignore them."""
+    pairs among them (lora.lora_pairs), which Keel preconditions; the other optimizers ignore them. `ref_norms` and
+    `scales`: each pair's frozen-weight norm and alpha / rank, for Hull."""
     name = cfg.optimizer.lower()
     if name == "adamw":
         return torch.optim.AdamW(params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay, betas=(0.9, 0.99))
@@ -369,6 +370,22 @@ def build_optimizer(cfg: TrainConfig, params, pairs=None):
 
         return Adafactor(params, lr=cfg.learning_rate, scale_parameter=False, relative_step=False,
                          warmup_init=False, weight_decay=cfg.weight_decay)
+    if name == "hull":
+        from .optimizers.hull import Hull
+
+        if params and isinstance(params[0], dict):
+            if len(params) > 1:
+                log.warning("lora_plus_ratio is ignored with hull (its balanced frame sets both factors' steps)")
+            params = [p for g in params for p in g["params"]]
+        if cfg.weight_decay:
+            log.info("weight_decay is ignored with hull (it pulls the LoRA back toward the base model)")
+        if cfg.loss_weighting == "min_snr":
+            log.warning("loss_weighting min_snr weights sigma 0.9 at about 1/64 of sigma 0.3: hull's noise levels are "
+                        "meant to keep their natural shares")
+        return Hull(params, pairs=pairs, ref_norms=ref_norms, scales=scales, lr=cfg.hull_rho,
+                    betas=tuple(cfg.hull_betas), state_dtype=cfg.hull_state_dtype, clip=cfg.hull_clip,
+                    factor_cap=cfg.hull_factor_cap, safety_cap=cfg.hull_safety_cap, gain_max=cfg.hull_gain_max,
+                    ns_iters=cfg.hull_ns_iters, damping=cfg.hull_damping, seed=cfg.seed)
     if name in AUTOMAGIC:
         if params and isinstance(params[0], dict):
             if {g.get("name") for g in params} <= {"lora", "lora_down", "lora_up"}:  # Automagic owns its lr: collapse
@@ -409,6 +426,11 @@ def build_optimizer(cfg: TrainConfig, params, pairs=None):
 
         return Automagic3(params, **kw)
     raise ValueError(f"Unknown optimizer {cfg.optimizer}")
+
+
+def limit_step_mult(cfg: TrainConfig, mult: float) -> float:
+    """A step's lr multiplier: nothing loss-driven may raise Hull's step."""
+    return min(mult, 1.0) if cfg.optimizer.lower() == "hull" else mult
 
 
 def current_lr(optimizer, scheduler) -> float:
@@ -1360,9 +1382,10 @@ class Trainer(RaceParallelMixin):
             gather = getattr(optimizer, "gather", None)
             if gather is not None:  # Keel: the micro-batch sums join the replicas' on p.grad for the clip
                 gather()
-            grad_norm = step_grad_norm(params, cfg.max_grad_norm)
+            grad_norm = step_grad_norm(params, cfg.clip_norm)
             step_lr_mult *= self._clean_lr_scale(  # clean_share: half the lr on the lower-share epochs
                 cfg, step, self.batcher, cfg.batch_size * cfg.gradient_accumulation * n_dev)
+            step_lr_mult = limit_step_mult(cfg, step_lr_mult)
             if step_lr_mult != 1.0:  # true per-image lr: scale this step only (the scheduler restores it)
                 saved_lrs = [g["lr"] for g in optimizer.param_groups]
                 for g in optimizer.param_groups:
@@ -1435,7 +1458,7 @@ class Trainer(RaceParallelMixin):
                 last = step_times[-5:]
                 who = f"[{self.race.active.name}] " if self._race_running() else ""
                 log.info("%sstep %d/%d loss %.4f avg %.4f lr %.2e grad %s %.1fs/it (last %d steps %.2fs each)%s", who,
-                         step, cfg.steps, accum_loss, avg, lr_now, format_grad_norm(grad_norm, cfg.max_grad_norm),
+                         step, cfg.steps, accum_loss, avg, lr_now, format_grad_norm(grad_norm, cfg.clip_norm),
                          elapsed / done_steps, len(last), sum(last) / len(last), id_s)
             peak = {str(d): round(torch.cuda.max_memory_allocated(torch.device(d)) / 1e9, 2) for d in self.devices
                     if str(d).startswith("cuda")} if torch.cuda.is_available() else {}
@@ -1446,7 +1469,7 @@ class Trainer(RaceParallelMixin):
                                loss=accum_loss, avg_loss=avg, elapsed=elapsed, eta=eta, lr=lr_now,
                                losses=losses[-2000:], step_times=[round(t, 3) for t in step_times[-2000:]],
                                grad_norm=grad_norm, grad_norms=round_norms(grad_norms[-2000:]),
-                               grad_clip=cfg.max_grad_norm, peak_mem=peak, **id_extra)
+                               grad_clip=cfg.clip_norm, peak_mem=peak, **id_extra)
             if self.loss_watch is not None and self.loss_watch.epoch_complete():
                 summary = self.loss_watch.end_epoch(step)
                 log.info("Loss watch epoch %d: %s (median residual %.3f, %d/%d active)", summary["epoch"],
@@ -1523,6 +1546,7 @@ class Trainer(RaceParallelMixin):
         if self.race is not None:
             self._race_decide()
             self._race_report()
+        self._log_hull_report(optimizer)
         if cfg.reward_steps > 0 and not self.stop_file.exists():
             path = self._reward_stage(model, injected, step) or path
         self.status.update(stage="finished", done=True)
@@ -2333,8 +2357,29 @@ class Trainer(RaceParallelMixin):
             if len(groups) > 1:
                 log.info("LoRA+: lora_up lr = %.2e (x%g), lora_down lr = %.2e", groups[1]["lr"], cfg.lora_plus_ratio,
                          groups[0]["lr"])
-        optimizer = build_optimizer(cfg, groups, pairs=lora_mod.lora_pairs(injected))
+        hull = self._hull_inputs(injected) if cfg.optimizer.lower() == "hull" else {}
+        optimizer = build_optimizer(cfg, groups, pairs=lora_mod.lora_pairs(injected), **hull)
         return optimizer, build_scheduler(cfg, optimizer)
+
+    def _hull_inputs(self, injected) -> dict:
+        """Each LoRA pair's frozen-weight norm and alpha / rank, in lora_pairs' order. A race's master views have no
+        frozen layer, so the norm comes from the shared wrapper of that name."""
+        wrappers = self.race.wrappers if self.race is not None else injected
+        layers = [(name, m) for name, m in injected.items() if m.kind == "lora"]
+        return {"ref_norms": [wrappers[name].weight_col_norm().norm().item() for name, _ in layers],
+                "scales": [m.alpha / m.rank for _, m in layers]}
+
+    def _log_hull_report(self, optimizer) -> None:
+        """Hull's cap and frame rates at the end of a run, one line per race configuration still held."""
+        rows = [(f"{v.name}: ", v.state.get("optimizer")) for v in self.race.variants] if self.race is not None \
+            else [("", optimizer)]
+        for who, opt in rows:
+            report = getattr(opt, "report", None)
+            if report is not None:
+                r = report()
+                log.info("%sHull: safety cap bound on %.2f%% of layer-steps after step 20, factor cap on %.2f%% of all "
+                         "%d, %d frame fallbacks", who, 100 * r["safety_rate"], 100 * r["factor_rate"],
+                         r["layer_steps"], r["frame_fallbacks"])
 
     def _make_ema(self, cfg, injected):
         if cfg.lora_ema <= 0:

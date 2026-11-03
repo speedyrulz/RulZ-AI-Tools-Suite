@@ -60,7 +60,8 @@ RACE_KEYS: dict[str, tuple[str, ...]] = {
         "automagic_max_lr_change", "keel_gauge", "keel_gauge_eps", "keel_cautious", "keel_pair_sigma", "keel_bands",
         "keel_band_weights", "keel_consensus", "keel_consensus_power", "keel_consensus_mode", "keel_lookahead",
         "keel_lookahead_pullback", "keel_lookahead_lr", "keel_lookahead_grace", "keel_face_gain", "keel_face_gain_max",
-        "keel_face_gain_beta", "keel_body_weight"),
+        "keel_face_gain_beta", "keel_body_weight", "hull_rho", "hull_betas", "hull_state_dtype", "hull_clip",
+        "hull_factor_cap", "hull_safety_cap", "hull_gain_max", "hull_ns_iters", "hull_damping"),
     "Timesteps & loss": (
         "timestep_sampling", "logit_mean", "logit_std", "sigmoid_scale", "timestep_shift", "clean_share", "logsnr_mean",
         "logsnr_std", "timestep_buckets",

@@ -23,7 +23,7 @@ MODEL_PRESETS = {
     "MiniMax-H3-Ref2VA": "MiniMaxAI/MiniMax-H3#ref2va",
 }
 ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21", "flux3_klein", "minimax_h3")
-OPTIMIZERS = ("adamw", "adamw8bit", "adafactor", "automagic3", "automagic4", "keel", "keel_fb")
+OPTIMIZERS = ("adamw", "adamw8bit", "adafactor", "automagic3", "automagic4", "keel", "keel_fb", "hull")
 AUTOMAGIC = ("automagic3", "automagic4", "keel", "keel_fb")  # self-tuning lr: no schedule, no LoRA+, no per-image lr
 KEEL = ("keel", "keel_fb")  # Keel and its face-and-body version: one class (optimizers/keel.py), keel_fb with the
 #                             body share in the token gain and the magnitude vote in the consensus gate
@@ -478,6 +478,16 @@ class TrainConfig:
     #                              faces (face detection); 0 = off
     keel_face_gain_max: float = 2.0  # keel: the gain stays within [1 / max, max]
     keel_face_gain_beta: float = 0.9  # keel: EMA of the gain over steps (one batch without a face barely moves it)
+    hull_rho: float = 0.0  # hull (docs/hull-optimizer.md): the step, a relative change of each layer's weight per step;
+    #                        required, and the trainer's schedule acts on it (hull is not self-tuning)
+    hull_betas: list[float] = field(default_factory=lambda: [0.9, 0.99])  # hull: momentum, second moment
+    hull_state_dtype: str = "bf16"  # hull: the momentum's dtype: bf16 with stochastic rounding | fp32
+    hull_clip: float = 5.0  # hull: per-channel RMS clip in the balanced frame (it replaces max_grad_norm)
+    hull_factor_cap: float = 0.2  # hull: a step moves a factor by at most this share of its balanced norm
+    hull_safety_cap: float = 0.0  # hull: the realised step's cap in steps of rho; 0 = 2 x max(1, hull_gain_max)
+    hull_gain_max: float = 2.0  # hull: the largest region gain (only sets the safety cap until the gains are built)
+    hull_ns_iters: int = 30  # hull: Newton-Schulz iterations per matrix root
+    hull_damping: float = 1e-6  # hull: the Grams' damping, as a fraction of their mean eigenvalue
     keel_body_weight: float = 1.0  # keel_fb: the body tokens' weight against the face's in the token gain (the
     #                                 person's cells outside the face box: needs person masks); 1 = equal, 0 = face only
     lr_scheduler: str = "constant"  # constant | cosine | linear
@@ -792,7 +802,43 @@ class TrainConfig:
         """lora_targets, or the model family's default groups when it is empty."""
         return list(self.lora_targets) or list(ARCH_DEFAULT_TARGETS[self.arch_name()])
 
+    @property
+    def clip_norm(self) -> float:
+        """The gradient norm clip in force: hull only measures the norm (a clip on factor gradients is gauge-dependent;
+        it clips per channel itself)."""
+        return 0.0 if self.optimizer.lower() == "hull" else self.max_grad_norm
+
+    def validate_hull(self) -> None:
+        if not self.hull_rho > 0:
+            raise ValueError("optimizer hull needs hull_rho above 0 (a relative change of a layer's weight per step: "
+                             "docs/hull-optimizer.md section 4.8)")
+        if len(self.hull_betas) != 2 or not 0 <= self.hull_betas[0] < 1 or not 0 < self.hull_betas[1] < 1:
+            raise ValueError("hull_betas must be [momentum in 0..1, second moment in 0..1]")
+        if self.hull_state_dtype not in ("bf16", "fp32"):
+            raise ValueError(f"hull_state_dtype must be bf16 or fp32, got {self.hull_state_dtype!r}")
+        if self.hull_clip <= 0 or self.hull_factor_cap <= 0 or self.hull_safety_cap < 0 or self.hull_gain_max < 1:
+            raise ValueError("hull_clip and hull_factor_cap must be above 0, hull_safety_cap at least 0 and "
+                             "hull_gain_max at least 1")
+        if self.hull_ns_iters < 1 or self.hull_damping <= 0:
+            raise ValueError("hull_ns_iters must be at least 1 and hull_damping above 0")
+        if self.network_type != "lora" or self.dora or self.finetune:
+            raise ValueError("optimizer hull trains LoRA pairs: no LoKr, OFT, DoRA or fine-tune")
+        if self.likeness_lr_control or self.likeness_curriculum:
+            raise ValueError("optimizer hull: nothing driven by a score may raise its step, so likeness_lr_control and "
+                             "likeness_curriculum are refused")
+        if self.loss_watch_healthy_mult > 1:
+            raise ValueError("optimizer hull: per-step multipliers stay at or below 1 (loss_watch_healthy_mult)")
+        if self.id_loss_weight > 0 and self.id_loss_backend == "facenet":
+            raise ValueError("optimizer hull keeps FaceNet as a held-out judge: id_loss_backend facenet trains on it")
+        if self.reward_steps > 0 or self.selftrain:
+            raise ValueError("optimizer hull refuses reward_steps and selftrain: a judge's score must not train")
+        if self.race and (self.face_gold != "facenet" or self.copy_check != "on"):
+            raise ValueError("optimizer hull in a race needs face_gold: facenet and copy_check: on (the guards that "
+                             "decide whether a row stays)")
+
     def validate(self) -> None:
+        if self.optimizer.lower() == "hull":
+            self.validate_hull()
         if self.body_score not in BODY_SCORES:
             raise ValueError(f"body_score must be one of {BODY_SCORES}, got {self.body_score!r}")
         if min(self.face_scale_span, self.face_scale_curve, self.body_scale_span, self.body_scale_curve) < 1.0:

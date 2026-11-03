@@ -251,7 +251,7 @@ class RaceParallelMixin:
         for v, reps in lanes:
             st, cfg = v.state, v.cfg
             race_mod.collect_grads(v, [self.replicas[r][1] for r in reps])
-            grad_norm = step_grad_norm(st["params"], cfg.max_grad_norm)
+            grad_norm = step_grad_norm(st["params"], cfg.clip_norm)
             observe = getattr(st["optimizer"], "observe", None)
             if observe is not None:  # Keel: the step's noise levels (its bands)
                 for s in sigmas.get(v.idx, ()):
@@ -296,12 +296,12 @@ class RaceParallelMixin:
                 where = "+".join(str(self.replicas[r][2]) for r in reps)
                 log.info("[%s] step %d/%d loss %.4f avg %.4f lr %.2e grad %s on %s %.1fs/it (last %d steps %.2fs "
                          "each)", v.name, st["step"], v.cfg.steps, by_lane[v.idx], avg, lr_now,
-                         format_grad_norm(st["grad_norms"][-1], v.cfg.max_grad_norm), where,
+                         format_grad_norm(st["grad_norms"][-1], v.cfg.clip_norm), where,
                          elapsed / max(1, len(self.rp_times)), len(last), sum(last) / len(last))
             if k == 0:  # the Monitor's loss chart follows the first lane
                 self.status.update(step=self.rp_done, total=total, loss=by_lane[v.idx], avg_loss=avg, elapsed=elapsed,
                                    eta=eta, lr=lr_now, losses=losses[-2000:], grad_norm=st["grad_norms"][-1],
-                                   grad_norms=round_norms(st["grad_norms"][-2000:]), grad_clip=v.cfg.max_grad_norm,
+                                   grad_norms=round_norms(st["grad_norms"][-2000:]), grad_clip=v.cfg.clip_norm,
                                    step_times=[round(t, 3) for t in self.rp_times[-2000:]], race=self._race_status(),
                                    race_step=st["step"])
 
