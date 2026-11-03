@@ -1385,6 +1385,7 @@ class Form:
             automagic_clip_threshold=float(v("automagic_clip_threshold")),
             automagic_sensitivity_quantile=float(v("automagic_sensitivity_quantile")), automagic_vote=v("automagic_vote"),
             automagic_max_lr_change=float(v("automagic_max_lr_change")),
+            hull_rho=float(v("hull_rho")),
             keel_gauge=bool(v("keel_gauge")), keel_gauge_eps=float(v("keel_gauge_eps")),
             keel_cautious=bool(v("keel_cautious")), keel_pair_sigma=bool(v("keel_pair_sigma")),
             keel_bands=int(v("keel_bands")), keel_band_weights=str(v("keel_band_weights") or "").strip(),
@@ -3601,6 +3602,10 @@ RACE_LABELS = {
     "automagic_polarity_history": "Automagic polarity history", "automagic_clip_threshold": "Automagic clip threshold",
     "automagic_groups": "Automagic lr groups", "automagic_sensitivity_quantile": "Automagic sensitivity quantile",
     "automagic_vote": "Automagic vote", "automagic_max_lr_change": "Automagic max lr change",
+    "hull_rho": "Hull step", "hull_betas": "Hull betas", "hull_state_dtype": "Hull momentum dtype",
+    "hull_clip": "Hull channel clip", "hull_factor_cap": "Hull factor cap", "hull_safety_cap": "Hull safety cap",
+    "hull_gain_max": "Hull largest gain", "hull_ns_iters": "Hull matrix-root iterations",
+    "hull_damping": "Hull damping",
     "keel_gauge": "Keel gauge preconditioner", "keel_gauge_eps": "Keel gauge eps", "keel_cautious": "Keel cautious mask",
     "keel_pair_sigma": "Keel paired sigma", "keel_bands": "Keel noise bands", "keel_band_weights": "Keel band weights",
     "keel_consensus": "Keel consensus gate", "keel_consensus_power": "Keel consensus power",
@@ -7214,6 +7219,12 @@ def build_page(local: bool = True):
                                     .tooltip("The most the learning rate may move in one step (0.05 = about 5%); the "
                                              "signs that judge a step only arrive over the next polarity-history "
                                              "steps, so this bounds how far the rate can overshoot meanwhile.")
+                            with fields().bind_visibility_from(w["optimizer"], "value", lambda x: x == "hull"):
+                                w["hull_rho"] = ui.number("Hull step", value=d.hull_rho, min=0, step=0.0001,
+                                                          format="%.6f").classes("w-40") \
+                                    .tooltip("How far each step moves a layer, as a share of that layer's own weight. "
+                                             "Required: there is no default yet, and no race has measured a good value "
+                                             "(docs/hull-optimizer.md). The learning-rate schedule acts on it.")
                             with fields().bind_visibility_from(w["optimizer"], "value", lambda x: x in KEEL):
                                 w["keel_gauge"] = ui.switch("Gauge preconditioner", value=d.keel_gauge) \
                                     .tooltip("Each LoRA pair's gradient is scaled by the other factor's r x r Gram "
