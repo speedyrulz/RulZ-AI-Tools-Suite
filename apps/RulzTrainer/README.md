@@ -129,6 +129,10 @@ an older version fills every option added since with its default, appends those 
 (your values and comments are left as they are) and lists them under the buttons. Options a newer version no longer
 has are ignored instead of refusing the file. `configs/example.yaml` ships with the repo and is never modified.
 
+*Download* and *Upload*, beside them, do the same with a file on the device your browser runs on, which is the one to
+use when the WebUI runs on another computer. Every setting and the *Advanced* switch are kept as you change them
+(`.webui_form.json`), so a reload or a restarted WebUI comes back as you left it; *Reset* puts the defaults back.
+
 ### Remote access with Tailscale
 
 To use the WebUI from your other devices (laptop, phone), start it with Tailscale. On Windows, double-click

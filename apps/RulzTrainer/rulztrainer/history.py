@@ -282,8 +282,11 @@ def list_runs(root: Path = HISTORY_DIR) -> list[dict]:
 
 
 def signature(root: Path = HISTORY_DIR) -> tuple:
-    """Changes whenever a history file is added, changed or removed (the page's cheap poll)."""
-    return tuple((p.name, p.stat().st_mtime_ns) for p in sorted(root.glob("*.json"))) if root.is_dir() else ()
+    """Changes whenever a history file is added, changed or removed (the page's cheap poll). With the size too: two
+    writes can share a time stamp where the clock is coarse (Windows)."""
+    if not root.is_dir():
+        return ()
+    return tuple((p.name, st.st_mtime_ns, st.st_size) for p, st in ((p, p.stat()) for p in sorted(root.glob("*.json"))))
 
 
 def set_label(run_id: str, label: str, root: Path = HISTORY_DIR) -> bool:
