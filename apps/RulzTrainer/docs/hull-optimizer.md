@@ -158,10 +158,15 @@ leaves dW's path alone with fp32 momentum: the same step, to two decimals, over 
 steps at gradient ranks 1-16 [N]. **With bf16 momentum it does not.** X can be ill-conditioned, so m's rounding (0.4% of
 an element) is multiplied by it at every rebalance: on a rank-2 gradient ||m_A|| reached 3.9e5 against 680 at step 30
 and the step sat on the safety cap at 4 rho, along that noise [N]. An earlier check at gradient rank 16 missed this. The
-second real run (v2.36.2, bf16 momentum) gave wrong subjects by step 100 and abstract noise by step 300, with its loss
-still flat, so the trainer now always builds Hull with fp32 momentum (`hull_state_dtype: bf16` is ignored with a
-warning), at about 346 MB against 178 MB. **The rebalance does not change dW's path, so it can only remove the precision
-damage.** The first run's loss and raw gradients also
+trainer therefore always builds Hull with fp32 momentum (`hull_state_dtype: bf16` is ignored with a warning), at about
+346 MB against 178 MB. **Pairs with a rank above min(o, i) are never rebalanced.** Krea 2's `text_fusion.projector` is
+12 -> 1, so at rank 32 BtB and AAt can never meet: X stayed huge at every rebalance and multiplied itself into the
+`lora_ema` shadow. The live weights stayed healthy, so the loss stayed flat, but the shadow's dW on that layer reached
+2.5e7 x ||W0|| by step 100, and saves and probes use the shadow. That gave wrong subjects and abstract noise on v2.36.2
+and v2.36.3. Reproduced on the real model at 210 steps: faces became buildings and bodies abstract noise; with the skip
+the shadow's largest relative dW is 0.009 and the probes are sound [real run, one seed]. That pair's ||A|| still grows
+(3.7e3 against ||B|| 0.03 at step 210), as all pairs did before the rebalance.
+**The rebalance does not change dW's path, so it can only remove the precision damage.** The first run's loss and raw gradients also
 turned at about step 1250, and whether that came from the precision or from the path itself is not settled. Its
 eigendecompositions sync the host once in 10 steps (5 ms for 257 pairs at rank 32 [N]).
 
