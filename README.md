@@ -710,8 +710,8 @@ over, and the log says so. The image order, the per-image loss watch and the ide
 - **Broken gradients.** A step whose gradients hold a NaN or an infinity is left out, so nothing of it reaches the LoRA
   or the optimizer's moments; before, one such step ruined the LoRA for the rest of the run while training went on.
   It still counts as a step, and the log and the status say how many were skipped. 25 in a row end the run with an
-  error (it is diverging; its LoRA is still healthy and gets saved). In a race the run goes on: that configuration's
-  probes drop it.
+  error (it is diverging; its LoRA is still healthy and gets saved). While a race is undecided it goes on, because
+  that configuration's probes drop it; a race's winner training on alone stops like any run.
 - **A run that fails.** After an error the weights are still in memory, so the run saves them first: a normal checkpoint
   of the last finished step and a training state to resume from. A race saves the configurations training at that
   moment, with no state. A LoRA that holds non-finite weights is not saved.
@@ -2735,6 +2735,7 @@ rulztrainer/
 webui.py           NiceGUI web UI (runs training as a subprocess)
 configs/           example configs
 tests/             smoke tests (no weights needed): python -m pytest tests
+                   (CI runs them on the CPU with the versions in tests/requirements-ci.txt)
 install.bat / run_webui.bat   Windows install and start;  install.sh / run_webui.sh   the same for Linux
 scripts/vast/      vast.ai: provision.sh (PROVISIONING_SCRIPT), supervisor wrapper + conf, create_template.sh,
                    rulz_remote.py (reach an instance's runs from your computer) and its instance side rulz_agent.py

@@ -60,8 +60,15 @@ if errorlevel 1 goto :fail
 echo.
 echo Installing requirements ...
 "%PY%" -m pip install -r requirements.txt
+if not errorlevel 1 goto :check_cuda
+echo.
+echo [WARN] Some optional packages failed to install (insightface needs a C++ compiler on some setups).
+echo        Installing the core requirements only; face/body similarity scoring will be unavailable.
+findstr /v /i "insightface onnxruntime mediapipe" requirements.txt > "%TEMP%\rulz-core-req.txt"
+"%PY%" -m pip install -r "%TEMP%\rulz-core-req.txt"
 if errorlevel 1 goto :fail
 
+:check_cuda
 echo.
 echo Checking CUDA ...
 "%PY%" -c "import torch; print('torch', torch.__version__, '| CUDA available:', torch.cuda.is_available(), '| GPUs:', torch.cuda.device_count())"
