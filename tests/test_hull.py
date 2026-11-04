@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from rulztrainer import lora as L  # noqa: E402
 from rulztrainer import race as R  # noqa: E402
 from rulztrainer.config import OPTIMIZERS, AUTOMAGIC, TrainConfig  # noqa: E402
+from rulztrainer.optimizers import hull as HULL  # noqa: E402
 from rulztrainer.optimizers.hull import Hull, balance_frame, newton_schulz  # noqa: E402
 from rulztrainer import trainer as T  # noqa: E402
 
@@ -437,6 +438,82 @@ def test_no_host_sync_in_a_step():
         finally:
             torch.cuda.set_sync_debug_mode("default")
     assert b.detach().any()
+
+
+class Shadow:
+    """What a rebalance needs of a LoraEMA: its parameters and their shadow."""
+
+    def __init__(self, *params):
+        self.params = list(params)
+        self.shadow = [p.detach().clone() for p in params]
+
+
+def sizes(a, b):
+    return float(a.detach().norm()), float(b.detach().norm())
+
+
+def test_the_factors_stay_balanced_through_a_run():
+    a, b = factors(dtype=torch.float32)
+    opt = make(a, b, state_dtype="bf16")
+    run(a, b, opt, HULL.REBALANCE_EVERY * 12)  # ends on a rebalance
+    na, nb = sizes(a, b)
+    assert 0.8 < na / nb < 1.25
+
+
+def test_without_the_rebalance_the_factors_drift_apart(monkeypatch):
+    """The failure the rebalance exists for: the virtual frame alone has no restoring force on the gauge."""
+    monkeypatch.setattr(HULL, "REBALANCE_EVERY", 10 ** 9)
+    a, b = factors(dtype=torch.float32)
+    run(a, b, make(a, b, state_dtype="bf16"), 120)
+    na, nb = sizes(a, b)
+    assert na / nb > 10
+
+
+@pytest.mark.parametrize("every", [1, 7])
+def test_the_rebalance_leaves_the_path_of_dw_alone(monkeypatch, every):
+    runs = {}
+    for name, period in (("off", 10 ** 9), ("on", every)):
+        monkeypatch.setattr(HULL, "REBALANCE_EVERY", period)
+        a, b = factors()
+        run(a, b, make(a, b), 120)
+        runs[name] = (b @ a).detach()
+    assert float((runs["on"] - runs["off"]).norm() / runs["off"].norm()) < 1e-3
+
+
+def test_a_rebalance_keeps_dw_and_the_average_in_step():
+    a, b = factors()
+    opt = make(a, b)
+    run(a, b, opt, HULL.REBALANCE_EVERY - 1)
+    ema = Shadow(a, b)
+    opt.bind_ema(ema)
+    with torch.no_grad():
+        ema.shadow[0].mul_(0.97)  # an average that is not the current weights, and is unbalanced
+        ema.shadow[1].mul_(1.2)
+    average = (ema.shadow[1] @ ema.shadow[0]).clone()
+    with torch.no_grad():
+        delta = (b @ a).clone()
+    opt._rebalance((0,))
+    with torch.no_grad():
+        assert float((b @ a - delta).norm() / delta.norm()) < 1e-12
+    assert float((ema.shadow[1] @ ema.shadow[0] - average).norm() / average.norm()) < 1e-12
+    na, nb = sizes(a, b)
+    assert abs(na / nb - 1.0) < 0.05
+    assert torch.equal(opt.state[b]["T"], torch.eye(b.shape[1], dtype=b.dtype))
+
+
+def test_a_rebalance_leaves_a_pair_with_no_frame_as_it_is():
+    a, b = factors()
+    opt = make(a, b)
+    opt._init_pair(a, b)  # B is still zero
+    push(a, b, 1.0, torch.ones(b.shape[0], a.shape[1], dtype=a.dtype))
+    before = a.detach().clone()
+    opt._rebalance((0,))
+    assert torch.equal(a, before) and not b.detach().any()
+
+
+def test_the_trainer_binds_the_average():
+    source = Path(T.__file__).read_text(encoding="utf-8")
+    assert source.count("bind_ema(") == 2  # the single run and a race configuration's first turn
 
 
 def _cfg(**kw):
