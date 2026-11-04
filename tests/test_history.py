@@ -1,6 +1,7 @@
 """Run history (output/_history): the series kept from a run's scores, saving while it trains, labels, removal, importing
 earlier job folders, and the Previous Runs table and overlay series."""
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -56,6 +57,16 @@ def test_signature_changes_when_the_history_does(tmp_path):
     first = history.signature(tmp_path)
     assert first != empty
     history.set_label("a-1", "x", tmp_path)
+    assert history.signature(tmp_path) != first
+
+
+def test_signature_sees_a_change_within_one_clock_tick(tmp_path):
+    history.save_run(TrainConfig(job_name="a"), "a-1", 1.0, _status(), root=tmp_path)
+    path = tmp_path / "a-1.json"
+    stat = path.stat()
+    first = history.signature(tmp_path)
+    history.set_label("a-1", "x", tmp_path)
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))  # the time stamp of the write before
     assert history.signature(tmp_path) != first
 
 
