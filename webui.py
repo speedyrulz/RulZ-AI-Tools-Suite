@@ -144,6 +144,7 @@ _proc: subprocess.Popen | None = None  # started by this WebUI process
 _adopted = None  # psutil.Process of a job started by an earlier WebUI process (reattached from JOB_FILE)
 _job_dir: Path | None = None
 JOB_FILE = ROOT / ".webui_job.json"
+FORM_FILE = ROOT / ".webui_form.json"  # the page's settings, so a reload or a restarted WebUI keeps them
 QUEUE = TrainQueue()  # runs waiting for the current one (output/_queue.json); queue_loop() starts them in turn
 _start_lock = threading.RLock()  # the queue's thread and a page may start a run at the same moment
 
@@ -239,6 +240,34 @@ def is_local_viewer(request) -> bool:
     host = request.client.host if request.client else ""
     proxied = "tailscale-user-login" in request.headers or "x-forwarded-for" in request.headers
     return host in ("127.0.0.1", "::1", "localhost") and not proxied
+
+
+def load_form_state() -> dict | None:
+    """The settings the page last held (None: nothing saved yet, or a file that cannot be read)."""
+    try:
+        state = json.loads(FORM_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def save_form_state(text: str) -> bool:
+    """Write the file whole or not at all (a reload can read it at any moment). False: not written this time, which
+    also covers Windows briefly locking the file while another page reads it."""
+    tmp = FORM_FILE.with_name(f"{FORM_FILE.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, FORM_FILE)
+        return True
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        return False
+
+
+def config_file_name(job_name: str) -> str:
+    """A job name as a file name that is safe on every system."""
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", job_name).strip(" .")
+    return f"{name or 'config'}.yaml"
 
 
 def _is_repo_example(path: str) -> bool:
@@ -1240,6 +1269,8 @@ class Form:
 
     def __init__(self):
         self.w: dict[str, object] = {}
+        self.extras: dict[str, object] = {}  # the page's other inputs that outlive a reload but are not config options
+        self.quant_copies: dict[str, object] = {}  # the wizard's download format selects, bound to the form's
         self.preset_sync = False  # True while from_config moves the preset switch (its on_change must not re-apply)
         self.loading = False  # True while from_config fills the widgets
         self.target_family = TrainConfig().arch_name()  # the family whose default LoRA targets the boxes started from
@@ -1322,6 +1353,9 @@ class Form:
             sel = self.w.get(key)
             if sel is not None:
                 opts = file_quant_options(family, kind)
+                copy = self.quant_copies.get(key)
+                if copy is not None:  # first: a bound select that lacks the value blanks it for both
+                    copy.set_options(opts)
                 value = sel.value if sel.value in opts else "int8_convrot"
                 if family == "minimax_h3" and kind == "model" and value == "int8_convrot":
                     value = "pruned_int8_convrot"  # H3: the pruned file (21 GB) instead of the full one (34 GB)
@@ -1546,6 +1580,50 @@ class Form:
                 toggle.value = cfg.preset == "identity"
             finally:
                 self.preset_sync = False
+
+
+    def snapshot(self, previous: dict | None = None) -> dict:
+        """Every input's raw value, for restore(). Raw and not through to_config(), which needs the form valid and
+        drops what a run does not use (a half-typed number, the soup files while the soup is off). A value that cannot
+        be read right now (a race row being typed) keeps its entry in `previous`."""
+        out = dict(previous or {})
+        for key, widget in {**self.w, **self.extras}.items():
+            try:
+                out[key] = widget.value
+            except (TypeError, ValueError):
+                pass
+        return out
+
+    def restore(self, values: dict) -> None:
+        """Put a snapshot back without the side effects of a user's change, leaving alone whatever this version cannot
+        take: an option it no longer has, a choice no longer offered (a GPU that is gone)."""
+        widgets = {**self.w, **self.extras}
+        model = {k: values[k] if k in values and fits_options(self.w[k], values[k]) else self.w[k].value
+                 for k in ("model_preset", "model_path")}
+        family = preset_arch(model["model_preset"], model["model_path"])
+        self.loading = self.preset_sync = True
+        try:
+            self.set_quant_options(family)  # the saved family's download formats, before its values
+            for key, widget in widgets.items():
+                if key in values and fits_options(widget, values[key]):
+                    try:
+                        widget.value = values[key]
+                    except (TypeError, ValueError, AttributeError):
+                        pass
+        finally:
+            self.loading = self.preset_sync = False
+        self.target_family = family
+
+
+def fits_options(widget, value) -> bool:
+    """A value a choice widget can hold (setting any other raises); other widgets take anything."""
+    options = getattr(widget, "options", None)
+    if options is None or value is None:
+        return True
+    try:
+        return all(v in options for v in (value if isinstance(value, list) else [value]))
+    except TypeError:  # an unhashable value against a dict of options
+        return False
 
 
 # ---------------------------------------------------------------- look and feel
@@ -4978,10 +5056,12 @@ class Wizard:
                           "int8 ConvRot is about half the size of bf16, trains as fast and loses under 1% accuracy (the "
                           "default). Krea 2 also offers fp8, Ideogram 4 fp8 and nvfp4.",
                           adv=True, show_if=("model_source", lambda x: x == FILE_SOURCE)):
-            self.bind(ui.select(file_quant_options(preset_arch("MOSS-Image-Base"), "model"),
-                                label="Diffusion model"), "model_file_quant").classes("w-full")
-            self.bind(ui.select(file_quant_options(preset_arch("MOSS-Image-Base"), "text"),
-                                label="Text encoder"), "text_encoder_file_quant").classes("w-full")
+            self.f.quant_copies["model_file_quant"] = self.bind(
+                ui.select(file_quant_options(preset_arch("MOSS-Image-Base"), "model"), label="Diffusion model"),
+                "model_file_quant").classes("w-full")
+            self.f.quant_copies["text_encoder_file_quant"] = self.bind(
+                ui.select(file_quant_options(preset_arch("MOSS-Image-Base"), "text"), label="Text encoder"),
+                "text_encoder_file_quant").classes("w-full")
         with self.setting(None, "Download now",
                           "Training downloads the files on start; this does it now, so a problem (disk space, network) "
                           "shows before you start. Hugging Face's cache keeps them for later runs.",
@@ -6396,6 +6476,7 @@ def build_page(local: bool = True):
     ui.page_title("RulzTrainer")
     job_running = reattach_job()
     look = {"light": False}  # this browser's look, read from its localStorage once the page is connected
+    form_state: dict = {"text": "", "warned": False}  # persist()'s last saved settings; "pristine": the defaults
     charts: list = []  # ECharts to recolor when the look changes
 
     def set_look(light: bool, save: bool = True) -> None:
@@ -6590,6 +6671,67 @@ def build_page(local: bool = True):
                                 .tooltip(BROWSE_TIP[native_cfg])
                             ui.button("Load", icon="file_open", on_click=on_load).props("flat")
                             ui.button("Save", icon="save", on_click=on_save).props("flat")
+
+                            def on_download_config():
+                                try:
+                                    cfg = f.to_config()
+                                except (TypeError, ValueError) as e:
+                                    status_msg.text = f"A setting is invalid: {e}"
+                                    ui.notify(status_msg.text, type="negative")
+                                    return
+                                name = config_file_name(cfg.job_name)
+                                ui.download.content(cfg.to_yaml(), name, "application/x-yaml")
+                                status_msg.text = f"Downloaded {name}"
+
+                            async def on_upload_config(e):
+                                """Fill the form from a config file picked in the browser: it may be on another
+                                computer than the WebUI. A file the form cannot take leaves the form as it was."""
+                                upload_cfg.reset()
+                                name = e.file.name
+                                before = f.snapshot()
+                                try:
+                                    text = (await e.file.read()).decode("utf-8-sig")
+                                    cfg, missing, unknown = TrainConfig.parse_report(text, name)
+                                    f.from_config(cfg)
+                                except Exception as err:  # noqa: BLE001
+                                    f.restore(before)
+                                    status_msg.text = f"Could not load {name}: {err}"
+                                    ui.notify(status_msg.text, type="negative")
+                                    return
+                                status_msg.text = f"Loaded {name}"
+                                if missing:
+                                    status_msg.text += f". {len(missing)} newer options use their defaults"
+                                if unknown:
+                                    status_msg.text += f". Ignored options this version no longer has: {', '.join(unknown)}"
+                                ui.notify(status_msg.text, type="positive")
+
+                            upload_cfg = ui.upload(auto_upload=True, max_files=1, max_file_size=2_000_000,
+                                                   on_upload=on_upload_config,
+                                                   on_rejected=lambda: ui.notify("Pick one .yaml config file",
+                                                                                 type="warning")) \
+                                .props("accept=.yaml,.yml").classes("hidden")
+
+                            async def on_reset_form():
+                                with ui.dialog() as dlg, ui.card().classes("w-[28rem] max-w-full"):
+                                    ui.label("Reset every setting to its default?").classes("text-base font-medium")
+                                    ui.label("Config files you saved are not touched.").classes("rz-hint")
+                                    with ui.row().classes("w-full justify-end gap-2"):
+                                        ui.button("Cancel", on_click=lambda: dlg.submit(False)).props("flat")
+                                        ui.button("Reset", icon="restart_alt", color="negative",
+                                                  on_click=lambda: dlg.submit(True)).props("unelevated")
+                                go = await dlg
+                                dlg.delete()
+                                if go:
+                                    restore_page({**form_state["pristine"], "advanced": train_adv_switch.value})
+                                    status_msg.text = "Settings reset to their defaults"
+
+                            ui.button("Download", icon="file_download", on_click=on_download_config).props("flat") \
+                                .tooltip("Download these settings as a config file to this device")
+                            ui.button("Upload", icon="file_upload").props("flat") \
+                                .on("click", js_handler=f"() => runMethod({upload_cfg.id}, 'pickFiles', [])") \
+                                .tooltip("Load the settings from a config file on this device")
+                            ui.button("Reset", icon="restart_alt", on_click=on_reset_form).props("flat") \
+                                .tooltip("Put every setting back to its default")
 
                     # ---- Model
                     with sections.section("Basics", "Model", "Base model, model files and GPUs", "model_training"):
@@ -8439,12 +8581,15 @@ def build_page(local: bool = True):
                 train_adv = TrainAdvanced(train_page, sections, w)
                 train_adv_switch.on_value_change(lambda e: train_adv.apply(e.value))
                 train_adv.apply(False)
+                f.extras.update(cfg_path=cfg_path, race_seeds=race_seeds, ema_files=ema_files, ema_mode=ema_mode,
+                                ema_beta=ema_beta, ema_beta2=ema_beta2, ema_sigma=ema_sigma, ema_rank=ema_rank)
 
         # ------------------------------------------------------------ Wizard (bound to the Train tab's widgets)
         with ui.tab_panel(tab_wizard):
             wizard = Wizard(f, gpus, lambda: start_job(confirm=False), goto, queue_job)
             wizard.build()  # its review lists the warnings
             wizard.adv_switch.bind_value(train_adv_switch, "value")  # one Advanced switch for both tabs
+            f.extras["wizard_cfg_path"] = wizard.cfg_path
 
         # ------------------------------------------------------------ Dataset
         with ui.tab_panel(tab_dataset):
@@ -9130,13 +9275,56 @@ def build_page(local: bool = True):
         " clearTimeout(t); t = setTimeout(() => emitEvent('rz_width', innerWidth), 300); }); }"
         " emitEvent('rz_width', innerWidth);"), once=True)
 
-    if job_running and _job_dir is not None and (_job_dir / "config.yaml").is_file():
+    def page_state() -> dict:
+        """What a reload keeps: the form and the page's own state around it."""
+        snapshot = preset_state["snapshot"]
+        return {"form": f.snapshot(form_state.get("form")), "advanced": bool(train_adv_switch.value),
+                "wizard_set_up": wizard.set_up, "preset_note": preset_note.text,
+                "preset_snapshot": snapshot.to_dict() if snapshot is not None else None}
+
+    def restore_page(state: dict) -> None:
+        wizard.set_up = False  # its follow-the-form reactions stay out of the restoring
+        wizard.racers_loaded = False  # it reads the race rows in again
+        f.restore(state.get("form") or {})
+        train_adv_switch.value = bool(state.get("advanced"))
+        wizard.set_up = bool(state.get("wizard_set_up"))  # false would put the recipe over the form on its first page
+        preset_note.text = str(state.get("preset_note") or "")
+        try:  # switching the identity preset off still brings back the settings from before it
+            snapshot = state.get("preset_snapshot")
+            preset_state["snapshot"] = TrainConfig.from_dict(snapshot) if snapshot else None
+        except (TypeError, ValueError):
+            preset_state["snapshot"] = None
+
+    def persist() -> None:
+        """Polled, so every input counts without a hook on each one, the rows that come and go included, and a page
+        writes only what changed on it: an idle second page cannot overwrite the first page's settings."""
+        state = page_state()
+        text = json.dumps(state, indent=1, default=str)
+        if text == form_state["text"]:
+            return
+        if save_form_state(text):
+            form_state.update(text=text, form=state["form"], warned=False)
+        elif not form_state["warned"]:
+            form_state["warned"] = True
+            ui.notify("Could not save the settings for the next reload; retrying", type="warning")
+
+    form_state["pristine"] = page_state()  # what Reset puts back
+    saved = load_form_state()
+    job_config = _job_dir / "config.yaml" if job_running and _job_dir is not None else None
+    if saved is not None:  # takes the place of the running job's settings: the form may hold the next run by now
+        restore_page(saved)
+        if job_config is not None:
+            status_msg.text = f"Reconnected to the running job '{_job_dir.name}' (your settings on this page were kept)"
+    elif job_config is not None and job_config.is_file():
         # reattached to a running job: show its settings instead of the defaults
         try:
-            f.from_config(TrainConfig.load(_job_dir / "config.yaml"))
+            f.from_config(TrainConfig.load(job_config))
             status_msg.text = f"Reconnected to the running job '{_job_dir.name}' (settings loaded from its config)"
         except Exception as e:  # noqa: BLE001
             status_msg.text = f"Reconnected to the running job '{_job_dir.name}' (could not load its config: {e})"
+    state = page_state()  # the baseline: nothing is written until something changes from this
+    form_state.update(text=json.dumps(state, indent=1, default=str), form=state["form"])
+    ui.timer(0.4, persist)
 
 
 HELP = """

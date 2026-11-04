@@ -1130,9 +1130,14 @@ class TrainConfig:
         Returns (config, missing, unknown): `missing` are options added since the file was saved (they take their
         defaults), `unknown` are keys this version no longer has (ignored instead of refusing the file)."""
         with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+            return cls.parse_report(f.read(), str(path))
+
+    @classmethod
+    def parse_report(cls, text: str, source: str = "This file") -> tuple["TrainConfig", list[str], list[str]]:
+        """load_report for YAML text that is not a file on this computer (a config uploaded in the browser)."""
+        data = yaml.safe_load(text) or {}
         if not isinstance(data, dict):
-            raise ValueError(f"{path} is not a RulzTrainer config (expected a mapping of options)")
+            raise ValueError(f"{source} is not a RulzTrainer config (expected a mapping of options)")
         known = [f.name for f in dataclasses.fields(cls)]
         unknown = sorted(k for k in data if k not in known)
         missing = [k for k in known if k not in data]
@@ -1153,7 +1158,10 @@ class TrainConfig:
         with open(path, "a", encoding="utf-8", newline="\n") as f:
             f.write(f"{sep}# Options added in a newer RulzTrainer version (defaults; edit as needed):\n{block}")
 
+    def to_yaml(self) -> str:
+        return yaml.safe_dump(self.to_dict(), sort_keys=False, allow_unicode=True)
+
     def save(self, path: str | Path) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
-            yaml.safe_dump(self.to_dict(), f, sort_keys=False, allow_unicode=True)
+            f.write(self.to_yaml())
