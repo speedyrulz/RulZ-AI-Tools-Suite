@@ -176,3 +176,24 @@ def test_master_parameters_move_with_their_optimizer_state(stubbed):
     fake._rp_place([(a, [0])])  # back on a copy: the same weights
     for x, p in zip(snapshot, [p for parts in a.weights.values() for p in parts.values()]):
         assert torch.equal(x, p.detach())
+
+
+def test_a_step_with_broken_gradients_leaves_a_lane_as_it_was(stubbed, monkeypatch):
+    from rulztrainer import losses
+
+    fake, (a, _, _), _ = _lane_setup()
+    fake.bad_steps = fake.skipped_steps = 0
+    fake._skip_bad_step = T.Trainer._skip_bad_step.__get__(fake)
+    lanes = fake._rp_plan([a])
+    fake._rp_place(lanes)
+    good = losses.elementwise_loss
+    monkeypatch.setattr(losses, "elementwise_loss", lambda *x, **k: good(*x, **k) * float("nan"))
+    before = [p.detach().clone() for p in a.state["params"]]
+    fake._rp_step(lanes)
+    assert a.state["step"] == 1 and fake.skipped_steps == 1 and a.state["losses"] == [0.0]
+    assert all(torch.equal(x, y) for x, y in zip(before, a.state["params"]))
+    assert a.state["ema"].images == 0
+    monkeypatch.setattr(losses, "elementwise_loss", good)  # the next step trains as usual
+    fake._rp_step(lanes)
+    assert a.state["step"] == 2 and fake.skipped_steps == 1
+    assert any(not torch.equal(x, y) for x, y in zip(before, a.state["params"]))

@@ -16,7 +16,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
+
+from .atomic import save_safetensors
 
 log = logging.getLogger("rulztrainer")
 CELL = 16
@@ -248,7 +250,7 @@ def save_region_map(path: Path, rm: RegionMap) -> None:
     meta = {"face_cells": ",".join(map(str, rm.face_cells)) if rm.face_cells else "",
             "kps": json.dumps(rm.kps) if rm.kps else "", "has_person": "1" if rm.has_person else "0"}
     path.parent.mkdir(parents=True, exist_ok=True)
-    save_file({"weight": rm.weight, "prior": rm.prior.to(torch.uint8)}, str(path), metadata=meta)
+    save_safetensors({"weight": rm.weight, "prior": rm.prior.to(torch.uint8)}, path, metadata=meta)
 
 
 def load_region_map(path: Path) -> RegionMap | None:
