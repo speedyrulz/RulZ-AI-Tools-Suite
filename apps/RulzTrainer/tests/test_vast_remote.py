@@ -3,6 +3,7 @@ through the WebUI's queue, and the copy paths. No ssh and no GPU: the agent runs
 import base64
 import io
 import json
+import os
 import subprocess
 import sys
 import tarfile
@@ -122,7 +123,7 @@ def test_agent_commands_reach_the_agent_with_global_options_taken_out(monkeypatc
         def __init__(self, instance, key, folder):
             seen.update(instance=instance, folder=folder)
 
-        def agent(self, *args):
+        def agent(self, *args, config=None):
             seen["args"] = args
             return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
@@ -131,12 +132,28 @@ def test_agent_commands_reach_the_agent_with_global_options_taken_out(monkeypatc
     assert seen == {"instance": 5, "folder": "/w", "args": ("log", "job", "-n", "3", "--grep", "x y")}
 
 
-def test_a_local_config_goes_along_inside_the_arguments(tmp_path):
+def test_a_local_config_is_taken_out_of_the_arguments(tmp_path):
     path = tmp_path / "c.yaml"
     path.write_bytes(b"steps: 5\n")
-    out = remote.agent_args(["start", "--job", "a", "--config", str(path), "--set", "x=1"])
-    assert out[:3] == ["start", "--job", "a"] and out[3] == "--payload" and out[5:] == ["--set", "x=1"]
-    assert base64.b64decode(out[4]) == b"steps: 5\n"
+    args, config = remote.agent_args(["start", "--job", "a", "--config", str(path), "--set", "x=1"])
+    assert args == ["start", "--job", "a", "--set", "x=1"] and config == b"steps: 5\n"
+    assert remote.agent_args(["start", "--job", "a", "--from", "b"]) == (["start", "--job", "a", "--from", "b"], None)
+
+
+def test_a_config_of_any_size_stays_off_the_ssh_command_line(monkeypatch):
+    """Git for Windows' ssh cut the remote command at about 8190 characters, with exit status 0 and no error."""
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append((cmd, kw["input"]))
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(remote.subprocess, "run", fake_run)
+    monkeypatch.setattr(remote, "saved_connection", lambda wanted: {"id": 1, "host": "h", "port": 1})
+    config = b"steps: 5\n" * 20000
+    remote.Remote(None, None, "/w").agent("start", "--job", "a", config=config)
+    (cmd, stdin), = calls
+    assert sum(len(word) for word in cmd) < 1000 and base64.b64encode(config) in stdin
 
 
 def test_pull_skips_what_is_here_at_its_size(tmp_path):
@@ -385,11 +402,16 @@ def test_a_pid_reused_by_another_process_is_not_the_job(install, capsys, running
 
 
 def picks_up(ok=True, message="Started"):
-    """The WebUI's queue thread, in a moment's time."""
+    """The WebUI's queue thread, once a run waits (a first start spends seconds importing torch to validate)."""
     started = []
 
     def tick():
-        time.sleep(0.2)
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            snap = TrainQueue(agent.QUEUE_FILE).snapshot()
+            if snap["waiting"] and not snap["paused"]:
+                break
+            time.sleep(0.05)
         TrainQueue(agent.QUEUE_FILE).advance(False, lambda config: (started.append(config) or ok, message))
 
     threading.Thread(target=tick, daemon=True).start()
@@ -400,17 +422,17 @@ def test_a_run_goes_through_the_queue_with_the_config_it_was_given(install, caps
     make_job("old")
     started = picks_up()
     code, data = run_json(capsys, "start", "--job", "new", "--from", "old", "--set", "steps=50",
-                          "--set", "optimizer=hull")
+                          "--set", "optimizer=hull", "--set", "hull_rho=0.01")
     assert code == 0 and data["state"] == "running" and data["changed"]["steps"] == [2000, 50]
     assert started[0]["job_name"] == "new" and started[0]["steps"] == 50 and started[0]["optimizer"] == "hull"
     TrainConfig.from_dict(started[0])  # what the WebUI's _start_queued does with it
 
 
-def test_a_local_config_is_the_base_of_a_run(install, capsys):
+def test_a_local_config_is_the_base_of_a_run(install, capsys, monkeypatch):
     text = yaml.safe_dump({"job_name": "ignored", "dataset_dir": "datasets/set", "steps": 9})
+    monkeypatch.setattr(agent, "SENT_CONFIG", base64.b64encode(text.encode()).decode())
     started = picks_up()
-    payload = base64.b64encode(text.encode()).decode()
-    code, data = run_json(capsys, "start", "--job", "new", "--payload", payload)
+    code, data = run_json(capsys, "start", "--job", "new")
     assert code == 0 and data["steps"] == 9 and started[0]["job_name"] == "new"
 
 
@@ -428,15 +450,22 @@ def test_a_dry_run_queues_nothing_but_checks_everything(install, capsys):
     assert run(capsys, "start", "--job", "old", "--from", "old", "--dry-run")[0] == 1
 
 
+RACE_OF_HULLS = ["--set", "optimizer=hull", "--set", "hull_rho=0.01", "--set", "race=true", "--set", "probe_every=100",
+                 "--set", "face_refs=datasets/set", "--set", 'race_configs=[{"name": "a"}, {"name": "b"}]']
+
+
+@pytest.mark.parametrize("dry_run", [[], ["--dry-run"]], ids=["start", "dry-run"])
 @pytest.mark.parametrize("extra, why", [
     (["--job", "old"], "already exists"),
     (["--job", "new", "--set", "nonsense=1"], "Unknown config keys"),
     (["--job", "new", "--set", "dataset_dir=datasets/gone"], "Dataset folder not found"),
     (["--job", "new", "--set", "broken"], "Not KEY=VALUE"),
+    (["--job", "new", "--set", "loss_type=huber"], "loss_type must be"),  # refused only by validate, as training does
+    (["--job", "new", *RACE_OF_HULLS], "needs face_gold: facenet"),  # a real run's: dry-run passed, then it failed
 ])
-def test_what_a_start_refuses_queues_nothing(install, capsys, extra, why):
+def test_what_a_start_refuses_queues_nothing(install, capsys, extra, why, dry_run):
     make_job("old")
-    code, _, err = run(capsys, "start", "--from", "old", *extra)
+    code, _, err = run(capsys, "start", "--from", "old", *extra, *dry_run)
     assert code == 1 and why in err and not Path(agent.QUEUE_FILE).exists()
 
 
@@ -508,10 +537,10 @@ def test_the_queue_can_be_shown_paused_and_edited(install, capsys):
 # ---------------------------------------------------------------- the way it reaches an instance
 
 
-def piped(cwd, *args):
+def piped(cwd, *args, program=None, env=None):
     """As rulz_remote.py runs it: the script on stdin, no script file, the install as the working directory."""
-    source = (REPO / "scripts" / "vast" / "rulz_agent.py").read_bytes()
-    return subprocess.run([sys.executable, "-", *args], input=source, cwd=cwd, capture_output=True)
+    return subprocess.run([sys.executable, "-", *args], input=program or remote.agent_program(), cwd=cwd,
+                          capture_output=True, env=env)
 
 
 def test_the_agent_runs_piped_and_finds_the_repo_from_the_working_directory(install):
@@ -526,6 +555,15 @@ def test_the_agent_runs_piped_and_finds_the_repo_from_the_working_directory(inst
     assert json.loads(piped(install, "jobs").stdout)[0]["job"] == "a"
     refused = piped(install, "log", "nope")
     assert refused.returncode == 1 and b"No job named" in refused.stderr
+
+
+def test_a_config_too_long_for_a_command_line_arrives_whole(install):
+    last = yaml.safe_dump({"dataset_dir": "datasets/set", "steps": 9})  # last: a cut would lose it
+    config = ("# padding\n" * 20000 + last).encode()
+    done = piped(install, "start", "--job", "new", "--dry-run", program=remote.agent_program(config),
+                 env={**os.environ, "PYTHONPATH": str(REPO)})
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout)["steps"] == 9
 
 
 def test_the_agent_stays_ascii_for_any_locale_on_the_instance():

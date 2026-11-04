@@ -30,6 +30,7 @@ QUEUE_FILE = OUTPUT / "_queue.json"
 NOT_JOBS = {"_history", "_crops"}  # folders under output/ that are not jobs (history.SCAN_DIRS)
 LOG_SUFFIXES = {".log", ".yaml", ".yml", ".json", ".jsonl", ".txt", ".csv"}
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+SENT_CONFIG = ""  # a local config for start, base64: rulz_remote.py writes it into this line of the piped script
 START_WAIT = 12.0  # seconds a start waits to see the WebUI's queue pick the run up (it looks every 3 s)
 # status.json's per-step series: thousands of numbers, summed up instead of shown (job --full has them)
 STATUS_SERIES = ("losses", "step_times", "grad_norms", "states", "probes", "samples", "saved")
@@ -291,10 +292,10 @@ def base_config(args):
     """The config a new run starts from: a local file sent along, or an earlier job's."""
     from rulztrainer.config import TrainConfig
 
-    if args.payload:
+    if SENT_CONFIG:
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "config.yaml"
-            path.write_bytes(base64.b64decode(args.payload))
+            path.write_bytes(base64.b64decode(SENT_CONFIG))
             return TrainConfig.load_report(path)[0]
     if args.base:
         return TrainConfig.load_report(job_dir(args.base) / "config.yaml")[0]
@@ -302,7 +303,8 @@ def base_config(args):
 
 
 def cmd_start(args) -> int:
-    """Queue a run. The checks of the WebUI's queue_run, plus refusing to overwrite an earlier run's folder."""
+    """Queue a run. The checks of the WebUI's queue_run, the trainer's own validate, and refusing to overwrite an
+    earlier run's folder."""
     from rulztrainer.config import TrainConfig, apply_preset
 
     data = base_config(args).to_dict()
@@ -313,10 +315,7 @@ def cmd_start(args) -> int:
     data["job_name"] = args.job
     try:
         cfg = TrainConfig.from_dict(data)
-        if cfg.race:
-            from rulztrainer import race
-
-            race.validate(cfg)
+        cfg.validate()  # what the trainer checks first, a race's own checks included
     except (TypeError, ValueError) as e:
         raise Refused(f"A setting is invalid: {e}") from e
     q = queue()
@@ -425,7 +424,6 @@ def parser() -> argparse.ArgumentParser:
     p = command("start", cmd_start)
     p.add_argument("--job", required=True, help="the new run's job name")
     p.add_argument("--from", dest="base", metavar="JOB", help="start from this job's config")
-    p.add_argument("--payload", help=argparse.SUPPRESS)  # a local config, base64 (rulz_remote.py start --config)
     p.add_argument("--preset", default="")
     p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
     p.add_argument("--overwrite", action="store_true", help="replace an existing job folder of that name")
