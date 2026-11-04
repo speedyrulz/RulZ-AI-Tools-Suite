@@ -163,6 +163,17 @@ jobs:
       - if: env.KIND == 'source'
         name: Check the Python sources compile
         run: python -m compileall -q $env:DIR
+      # RulZ Trainer's tests run on the CPU without model weights; a failure stops the release below.
+      - if: env.APP == 'rulz-trainer'
+        name: Run the RulZ Trainer tests
+        working-directory: ${{ env.DIR }}
+        env:
+          CUDA_VISIBLE_DEVICES: ''
+        run: |
+          python -m pip install --quiet -r tests/requirements-ci.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python -m pytest -q tests
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       # Image Crawler installs from source too (its app/ branch); its tests need Chromium but no GPU or model.
       - if: env.APP == 'rulz-image-crawler'
         name: Run the Image Crawler tests

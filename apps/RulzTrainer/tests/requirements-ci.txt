@@ -1,0 +1,23 @@
+# What CI tests the trainer with (.github/workflows/apps.yml): the CPU build of PyTorch, the optional packages that
+# install without a compiler, and versions that passed, so a new upstream release cannot fail an unrelated change.
+# requirements.txt stays open-ended for real installs; raise these when a new version has been tested.
+--extra-index-url https://download.pytorch.org/whl/cpu
+accelerate==1.15.0
+diffusers==0.42.1
+huggingface_hub==2.4.0
+mediapipe==1.2.2
+nicegui==4.0.0
+numpy==2.5.4
+onnx2torch==1.5.15
+onnxruntime==1.31.1
+opencv-python-headless==5.0.0.93
+openpyxl==3.1.5
+pillow==13.0.0
+psutil==7.2.2
+pytest==9.2.0
+PyYAML==6.0.3
+safetensors==0.8.0
+torch==2.15.0+cpu
+torchvision==0.29.2+cpu
+transformers==5.22.1
+triton-windows==3.9.0.post30

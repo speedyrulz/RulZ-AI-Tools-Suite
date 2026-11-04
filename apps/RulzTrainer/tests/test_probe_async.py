@@ -71,7 +71,7 @@ def test_the_lora_state_crosses_to_another_model(kw):
 
 def test_a_failing_probe_process_is_reported(tmp_path):
     w = PW.ProbeProcess(_cfg().to_dict(), None, "cuda:99", tmp_path / "probe_worker.log")  # loads in the background
-    with pytest.raises(PW.ProbeProcessError, match="cuda:99|CUDA|Torch not compiled"):
+    with pytest.raises(PW.ProbeProcessError, match="cuda:99|CUDA|Torch not compiled|_cuda_setDevice"):
         w.wait_ready()
     w.close()
     assert (tmp_path / "probe_worker.log").exists()
