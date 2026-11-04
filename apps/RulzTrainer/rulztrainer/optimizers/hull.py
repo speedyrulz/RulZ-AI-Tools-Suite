@@ -24,7 +24,7 @@ The momenta and the lora_ema shadow move with the factors (bind_ema); v and u do
 
 The rebalance needs fp32 momentum, which is why the trainer always builds Hull with it. X can be ill-conditioned, so bf16
 momentum's rounding (0.4% of an element) is multiplied by it at every rebalance: ||m_A|| grew 1000-fold in 30 steps and
-the step sat on the safety cap at 4 rho, along that noise. That broke the second real run within 100 steps.
+the step sat on the safety cap at 4 rho, along that noise.
 
 Departure from the design (its section 4.6 runs the roots in fp32): the Grams and both roots are fp64. A rank-4 update
 held at rank 32 has Gram eigenvalues under the damping, fp32 rounding makes them negative, and the iteration diverges to
@@ -260,7 +260,8 @@ class Hull(torch.optim.Optimizer):
                 at += count
             if counter % REBALANCE_EVERY == 0:
                 for bk in buckets:
-                    self._rebalance(bk["indices"])
+                    if r <= min(bk["b"].shape[1], bk["a"].shape[2]):  # a smaller layer can never balance: _rebalance
+                        self._rebalance(bk["indices"])
         return loss
 
     def _stack(self, indices: tuple) -> dict:
@@ -381,7 +382,10 @@ class Hull(torch.optim.Optimizer):
     def _rebalance(self, indices: tuple) -> None:
         """B <- B X, A <- X^-1 A with X = T^1/2, so BtB and AAt meet and dW stays, in fp64 before the factors go back.
         The momenta are gradient-shaped and go the other way, m_B <- m_B X^-1, m_A <- X m_A; T becomes the identity. A
-        pair with no frame (B still zero, or a failed root) is left as it is."""
+        pair with no frame (B still zero, or a failed root) is left as it is. The caller skips pairs with a rank above
+        min(o, i), such as Krea 2's 12 -> 1 text_fusion.projector at rank 32: BtB and AAt can never meet there, so X stays
+        huge at every rebalance and multiplies itself into the lora_ema shadow, whose dW reached 3e6 x ||W0|| by step 100
+        while the live weights stayed healthy."""
         bk = self._stack(indices)
         a, b = bk["a"].to(torch.float64), bk["b"].to(torch.float64)
         wd = bk["b"].dtype

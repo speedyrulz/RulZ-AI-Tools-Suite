@@ -514,6 +514,24 @@ def test_a_saved_bf16_momentum_setting_builds_fp32():
     assert opt.state_dtype == "fp32"
 
 
+def test_a_layer_smaller_than_the_rank_keeps_its_average_bounded():
+    """Krea 2's text_fusion.projector: 12 -> 1 at rank 32. Rebalancing it ran the shadow's dW away, in the probes only."""
+    a, b = factors(o=1, i=12, r=32, dtype=torch.float32)
+    opt = make(a, b, rho=2e-4)
+    ema = Shadow(a, b)
+    opt.bind_ema(ema)
+    target = torch.randn(1, 12, generator=torch.Generator().manual_seed(0))
+    biggest = 0.0
+    for _ in range(120):
+        push(a, b, 1.0, target / target.norm())
+        opt.step()
+        with torch.no_grad():
+            ema.shadow[0].lerp_(a, 0.02)
+            ema.shadow[1].lerp_(b, 0.02)
+            biggest = max(biggest, float((ema.shadow[1] @ ema.shadow[0]).norm() / W0))
+    assert biggest < 0.1
+
+
 def test_a_rebalance_keeps_dw_and_the_average_in_step():
     a, b = factors()
     opt = make(a, b)
