@@ -16,12 +16,19 @@ Per LoRA pair (B = lora_up [o, r], A = lora_down [r, i], dW = s B A, s = alpha /
 At step 1 B = 0 and no frame exists: B alone moves, in the gauge-free direction (the row-normalised G P_A), by exactly
 rho_t ||W0||, and the moments start at step 2.
 
+Every REBALANCE_EVERY steps the stored factors are rebalanced in place: B <- B X, A <- X^-1 A with X = T^1/2, dW
+unchanged. The virtual frame keeps dW's path independent of the gauge but has no restoring force on the gauge itself:
+in the first real run (Krea 2, rank 32, 2000 steps) ||A|| reached 1e5 against ||B|| 0.04, so a layer's dW was 1000 times
+smaller than ||B|| ||A|| and rested on cancellation that bf16 (the saved LoRA, the forward's activations) cannot hold.
+The momenta and the lora_ema shadow move with the factors (bind_ema); v and u do not depend on the gauge.
+
 Departure from the design (its section 4.6 runs the roots in fp32): the Grams and both roots are fp64. A rank-4 update
 held at rank 32 has Gram eigenvalues under the damping, fp32 rounding makes them negative, and the iteration diverges to
 NaN or 1e8; fp64 holds a residual of 1e-9 at the same damping. Everything after the roots stays fp32 (T included).
 
-No host sync in `step()`: the roots are inverse-free Newton-Schulz iterations and the selects are device-side, so a NaN
-gradient, a failed root and the first-step branch all cost nothing on the host.
+No host sync in `step()` outside a rebalance: the roots are inverse-free Newton-Schulz iterations and the selects are
+device-side, so a NaN gradient, a failed root and the first-step branch all cost nothing on the host. A rebalance's
+eigendecompositions do sync, once in REBALANCE_EVERY steps.
 """
 
 import logging
@@ -34,6 +41,7 @@ log = logging.getLogger("rulztrainer")
 STATE_DTYPES = ("bf16", "fp32")
 FRAME_TOLERANCE = 1e-3  # ||T M T - N|| / ||N|| above this keeps the previous step's T
 CAP_REPORT_AFTER = 20  # the safety cap's bind rate counts from this step on (the M1a gate)
+REBALANCE_EVERY = 10  # steps between in-place rebalances; dW's path does not depend on it, and a pair drifts little in 10
 
 
 def _sym(a: torch.Tensor) -> torch.Tensor:
@@ -131,6 +139,13 @@ class Hull(torch.optim.Optimizer):
         self.seed = int(seed)
         self._gens: dict = {}  # device -> a private generator, reseeded each step: the dither leaves the run's RNG alone
         self._consts: dict = {}  # (device, dtype, pair indices) -> (scales, ref norms)
+        self._ema = None  # the LoraEMA whose shadow a rebalance moves with the factors
+        self._ema_slots: dict = {}  # id(parameter) -> its index in the shadow
+
+    def bind_ema(self, ema) -> None:
+        """Keep this weight average's shadow in the factors' gauge: a rebalance transports it, so its product stays."""
+        self._ema = ema
+        self._ema_slots = {id(p): i for i, p in enumerate(ema.params)} if ema is not None else {}
 
     # ------------------------------------------------------------------ state
 
@@ -239,6 +254,9 @@ class Hull(torch.optim.Optimizer):
                 self._update(bk, t[at:at + count], ti[at:at + count], good[at:at + count], n_inv[at:at + count], rho,
                              gen)
                 at += count
+            if counter % REBALANCE_EVERY == 0:
+                for bk in buckets:
+                    self._rebalance(bk["indices"])
         return loss
 
     def _stack(self, indices: tuple) -> dict:
@@ -354,6 +372,47 @@ class Hull(torch.optim.Optimizer):
         put(sts_b, "cap_factor", take(sts_b, "cap_factor") + bound_factor)
         put(sts_b, "cap_steps", take(sts_b, "cap_steps") + (ok & late))
         put(sts_b, "frame_fallback", take(sts_b, "frame_fallback") + (ok & ~good))
+
+    @torch.no_grad()
+    def _rebalance(self, indices: tuple) -> None:
+        """B <- B X, A <- X^-1 A with X = T^1/2, so BtB and AAt meet and dW stays, in fp64 before the factors go back.
+        The momenta are gradient-shaped and go the other way, m_B <- m_B X^-1, m_A <- X m_A; T becomes the identity. A
+        pair with no frame (B still zero, or a failed root) is left as it is."""
+        bk = self._stack(indices)
+        a, b = bk["a"].to(torch.float64), bk["b"].to(torch.float64)
+        wd = bk["b"].dtype
+        r = b.shape[2]
+        eye = torch.eye(r, dtype=torch.float64, device=b.device)
+        m = bk["m0"] + self.damping * (_trace(bk["m0"]) / r)[:, None, None] * eye
+        n = bk["n0"] + self.damping * (_trace(bk["n0"]) / r)[:, None, None] * eye
+        t, _, good = balance_frame(m, n, self.ns_iters)
+        lam, q = torch.linalg.eigh(_sym(torch.where(good[:, None, None], t, eye)))
+        flag = (good & (lam.amin(-1) > 0))[:, None, None]
+        root = lam.clamp_min(1e-300).sqrt()[:, None, :]
+        x = torch.where(flag, (q * root) @ q.mT, eye)
+        xi = torch.where(flag, (q / root) @ q.mT, eye)
+
+        pairs = [self.pairs[i] for i in indices]
+        sts_a = [self.state[p] for p, _ in pairs]
+        sts_b = [self.state[p] for _, p in pairs]
+        take = lambda sts, key: torch.stack([st[key] for st in sts])  # noqa: E731
+        put = lambda sts, key, value: torch._foreach_copy_([st[key] for st in sts], list(value.unbind(0)))  # noqa: E731
+        torch._foreach_copy_([p for p, _ in pairs], list((xi @ a).to(wd).unbind(0)))
+        torch._foreach_copy_([p for _, p in pairs], list((b @ x).to(wd).unbind(0)))
+        m_a, m_b = take(sts_a, "m"), take(sts_b, "m")
+        put(sts_a, "m", (x @ m_a.to(torch.float64)).to(m_a.dtype))
+        put(sts_b, "m", (m_b.to(torch.float64) @ xi).to(m_b.dtype))
+        same = eye.to(wd).expand_as(take(sts_b, "T"))
+        put(sts_b, "T", torch.where(flag, same, take(sts_b, "T")))
+        put(sts_b, "Ti", torch.where(flag, same, take(sts_b, "Ti")))
+        if self._ema is not None:
+            for j, (pa, pb) in enumerate(pairs):
+                sa = self._ema.shadow[self._ema_slots[id(pa)]]
+                sb = self._ema.shadow[self._ema_slots[id(pb)]]
+                product = xi[j].to(sa.device) @ sa.to(torch.float64)
+                sa.copy_(product.to(sa.dtype))
+                product = sb.to(torch.float64) @ x[j].to(sb.device)
+                sb.copy_(product.to(sb.dtype))
 
     @staticmethod
     def _first_step(gb, n_inv, n0, s, step) -> torch.Tensor:
