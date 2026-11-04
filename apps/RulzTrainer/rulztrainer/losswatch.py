@@ -138,7 +138,10 @@ class LossWatch:
         return (num / den) if den > 0 else None
 
     def observe(self, step: int, key: str, loss: float, sigma: float) -> float:
-        """Record one sample (thread-safe). Returns the sample's residual (loss / expected loss at that sigma)."""
+        """Record one sample (thread-safe). Returns the sample's residual (loss / expected loss at that sigma). A
+        non-finite loss (the trainer skips that step) is left out: it would stay in the running averages for good."""
+        if not math.isfinite(loss):
+            return 1.0
         with self._lock:
             return self._observe(step, key, loss, sigma)
 

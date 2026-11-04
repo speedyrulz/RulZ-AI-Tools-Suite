@@ -7147,8 +7147,9 @@ def build_page(local: bool = True):
                                        "", "w-[40rem]")
                             with fields():
                                 w["save_state"] = ui.switch("Save training state (optimizer, scheduler, RNG)",
-                                                            value=False) \
-                                    .tooltip("The final state is always saved")
+                                                            value=d.save_state) \
+                                    .tooltip("Lets a stopped or crashed run continue where it was. Each state "
+                                             "takes about 3 times the size of the LoRA in fp32")
                                 w["save_state_every"] = ui.number("State every N steps (0 = with each LoRA save)",
                                                                   value=d.save_state_every, precision=0) \
                                     .classes("w-80")
@@ -9209,8 +9210,10 @@ stops improving for *N probes* the next resolution starts, and at the highest re
 improvement end training (two separate counts, default 1 each). Step-up needs probes (face/body references).
 
 ## Training states
-Turn on *Save training state* (LoRA, Advanced) to also write `state_XXXXXX/` folders (LoRA in fp32 + optimizer +
-scheduler + RNG). Point *Resume from training state folder* at one of them to continue exactly where it stopped.
+*Save training state* (LoRA, Advanced; on by default) also writes `state_XXXXXX/` folders (LoRA in fp32 + optimizer +
+scheduler + RNG + likeness controller). Point *Resume from training state folder* at one of them to continue where it
+stopped, with the best score, patience and likeness scale it had. A run that fails on an error saves its LoRA and a
+state first; a failed sample or probe is logged and training goes on.
 
 ## Unequal GPUs
 *Data parallel balance* (Model, next to the GPU settings): in data parallel every step waits for the slowest GPU.

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import time
 from types import SimpleNamespace
 
@@ -194,7 +195,7 @@ class RaceParallelMixin:
         """One optimizer step for every lane at the same moment: the batches of each, one model copy per GPU in
         threads, then each configuration's own optimizer step."""
         from .dataset import load_batch
-        from .trainer import current_lr, draw_sigmas, free_cuda, step_grad_norm
+        from .trainer import bad_gradients, current_lr, draw_sigmas, free_cuda, step_grad_norm
 
         t_step = time.perf_counter()
         while True:
@@ -252,24 +253,29 @@ class RaceParallelMixin:
             st, cfg = v.state, v.cfg
             race_mod.collect_grads(v, [self.replicas[r][1] for r in reps])
             grad_norm = step_grad_norm(st["params"], cfg.clip_norm)
-            observe = getattr(st["optimizer"], "observe", None)
-            if observe is not None:  # Keel: the step's noise levels (its bands)
-                for s in sigmas.get(v.idx, ()):
-                    observe(s)
-            lr_mult = self._clean_lr_scale(  # clean_share: half the lr on the lower-share epochs
-                cfg, st["step"], st.get("batcher"), cfg.batch_size * cfg.gradient_accumulation) \
-                if cfg.clean_share else 1.0
-            if lr_mult != 1.0:  # this step only
-                saved_lrs = [g["lr"] for g in st["optimizer"].param_groups]
-                for g in st["optimizer"].param_groups:
-                    g["lr"] = g["lr"] * lr_mult
-            st["optimizer"].step()
-            if lr_mult != 1.0:
-                for g, lr0 in zip(st["optimizer"].param_groups, saved_lrs):
-                    g["lr"] = lr0
+            if bad_gradients(st["params"], grad_norm):  # the step counts, but nothing of it reaches the LoRA
+                self._skip_bad_step(st["step"] + 1)
+                if not math.isfinite(by_lane[v.idx]):
+                    by_lane[v.idx] = st["losses"][-1] if st["losses"] else 0.0
+            else:
+                observe = getattr(st["optimizer"], "observe", None)
+                if observe is not None:  # Keel: the step's noise levels (its bands)
+                    for s in sigmas.get(v.idx, ()):
+                        observe(s)
+                lr_mult = self._clean_lr_scale(  # clean_share: half the lr on the lower-share epochs
+                    cfg, st["step"], st.get("batcher"), cfg.batch_size * cfg.gradient_accumulation) \
+                    if cfg.clean_share else 1.0
+                if lr_mult != 1.0:  # this step only
+                    saved_lrs = [g["lr"] for g in st["optimizer"].param_groups]
+                    for g in st["optimizer"].param_groups:
+                        g["lr"] = g["lr"] * lr_mult
+                st["optimizer"].step()
+                if lr_mult != 1.0:
+                    for g, lr0 in zip(st["optimizer"].param_groups, saved_lrs):
+                        g["lr"] = lr0
+                if st["ema"] is not None:
+                    st["ema"].update(step_images[v.idx])
             st["optimizer"].zero_grad(set_to_none=True)
-            if st["ema"] is not None:
-                st["ema"].update(step_images[v.idx])
             st["scheduler"].step()
             for r in reps:
                 race_mod.attach(v, self.replicas[r][1])
@@ -325,7 +331,7 @@ class RaceParallelMixin:
         if cfg.sample_prompts and cfg.sample_every > 0 and step % cfg.sample_every == 0 and step < cfg.steps:
             with self._rp_bound(v):
                 self._rp_load_render(v)
-                self.sample_images(self.replicas[0][0], step)
+                self._side_job(f"Sampling at step {step}", lambda: self.sample_images(self.replicas[0][0], step))
             hit = True
         return hit
 
@@ -370,8 +376,9 @@ class RaceParallelMixin:
         st = v.state
         with self._rp_bound(v):
             self._rp_load_render(v)
-            stop = self.run_probe(self.replicas[0][0], st["step"], st["optimizer"], st["scheduler"], self._rp_view(v),
-                                  ema=st.get("ema"), sync_replicas=False)  # a pull moves v's own parameters
+            stop = self._side_job(f"The probe of {v.name} at step {st['step']}", lambda: self.run_probe(
+                self.replicas[0][0], st["step"], st["optimizer"], st["scheduler"], self._rp_view(v), ema=st.get("ema"),
+                sync_replicas=False), False)  # a pull moves v's own parameters
             score = self.controller.combined_ema if self.controller is not None else None
         return score, stop
 
@@ -399,6 +406,7 @@ class RaceParallelMixin:
         rr, base = self.race, self.race_base
         model = self.replicas[0][0]
         self._rp_init()
+        self.crash_save = self._rp_crash_save
         v0 = rr.variants[0]
         if base.sample_prompts and base.sample_before_training:
             with self._rp_bound(v0):
@@ -447,6 +455,7 @@ class RaceParallelMixin:
             self._race_report()
         if stopped:
             self._rp_stop_save(lanes)
+            self.crash_save = None
             self._race_report()
             self.status.update(stage="finished", done=True)
             return
@@ -456,6 +465,14 @@ class RaceParallelMixin:
         if rr.schedule.history and getattr(self, "_rp_logged_rounds", 0) < len(rr.schedule.history):
             self._rp_logged_rounds = len(rr.schedule.history)
             log.info("Race round %s", race_mod.describe_round(rr.schedule.history[-1], rr.schedule))
+
+    def _rp_crash_save(self) -> None:
+        """After an error: the configurations training now, each in its usual checkpoint file (a race keeps no
+        states)."""
+        for v, _ in self.rp_lanes:
+            if v.state["step"] > 0:
+                with self._rp_bound(v):
+                    self._emergency_save(self._rp_view(v), v.state["params"], v.state["step"])
 
     def _rp_stop_save(self, lanes) -> None:
         log.warning("Stopped before the race was decided; the final saves are the configurations that were training "
@@ -492,8 +509,9 @@ class RaceParallelMixin:
         with self._rp_bound(win):
             self._rp_load_render(win)
             path = self.save(self._rp_view(win), step, final=True)
+            self.crash_save = None
             if win.cfg.sample_prompts:
-                self.sample_images(model, step)
+                self._side_job("The final samples", lambda: self.sample_images(model, step))
         free_cuda()
         self._race_decide()
         self._race_report()

@@ -11,9 +11,10 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image, ImageOps
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
 
 from .archs import get_arch
+from .atomic import save_safetensors
 from .config import TrainConfig
 
 log = logging.getLogger("rulztrainer")
@@ -135,7 +136,10 @@ def _hash(s: str) -> str:
 
 def scan_dataset(cfg: TrainConfig) -> list[Item]:
     """Items of every dataset of the run (cfg.dataset_specs()): one per image and training resolution of its dataset,
-    carrying the dataset's repeats; latents and region maps in the dataset's own cache (cfg.dataset_cache_dir)."""
+    carrying the dataset's repeats; latents and region maps in the dataset's own cache (cfg.dataset_cache_dir), named
+    after the file's path, time and size: a picture replaced in place is encoded again."""
+    from .regions import _file_key
+
     specs = cfg.dataset_specs()
     for spec in specs:  # before any cache folder is made: making one would create a missing dataset folder
         if not Path(spec.path).is_dir():
@@ -169,7 +173,7 @@ def scan_dataset(cfg: TrainConfig) -> list[Item]:
                 if (bw, bh) in seen:  # two resolutions clamped to the same bucket: keep one copy
                     continue
                 seen.add((bw, bh))
-                stem = _hash(str(p.resolve())) + f"_{bw}x{bh}"
+                stem = _hash(_file_key(p)) + f"_{bw}x{bh}"
                 items.append(Item(
                     image=p, caption=caption, width=bw, height=bh,
                     latent_path=cache / "latents" / f"{stem}{tag}.safetensors",
@@ -206,7 +210,7 @@ def augment_items(items: list[Item], cfg: TrainConfig, analysis: dict[str, dict]
 
     Boxes are squares in source pixels around the face box, clamped into the image; items reuse the normal
     latent/text/region caches with their own stems and captions from the templates."""
-    from .regions import face_fraction
+    from .regions import _file_key, face_fraction
 
     mode = (cfg.crop_augment or "none").lower()
     if mode == "none":
@@ -244,7 +248,7 @@ def augment_items(items: list[Item], cfg: TrainConfig, analysis: dict[str, dict]
                 continue
             bw, bh = bucket_size(box[2] - box[0], box[3] - box[1], cfg, it.side or None)
             caption = crop_caption(template, it.caption, cfg)
-            stem = _hash(f"{it.image.resolve()}|crop{box[0]},{box[1]},{box[2]},{box[3]}") + f"_{bw}x{bh}"
+            stem = _hash(f"{_file_key(it.image)}|crop{box[0]},{box[1]},{box[2]},{box[3]}") + f"_{bw}x{bh}"
             tag = get_arch(cfg).latent_tag
             cache = it.latent_path.parent.parent  # the source image's dataset cache
             out.append(Item(
@@ -311,10 +315,10 @@ def cache_latents(items: list[Item], cfg: TrainConfig, vae, progress=None, vaes:
         it = todo[i]
         t = prefetch.get(i)
         lat = encode_images(v, t.unsqueeze(0))[0].cpu()
-        save_file({"latent": lat.contiguous()}, str(it.latent_path))
+        save_safetensors({"latent": lat.contiguous()}, it.latent_path)
         if it.latent_flip_path:
             lat_f = encode_images(v, t.flip(-1).unsqueeze(0))[0].cpu()
-            save_file({"latent": lat_f.contiguous()}, str(it.latent_flip_path))
+            save_safetensors({"latent": lat_f.contiguous()}, it.latent_flip_path)
 
     count = [0]
 
@@ -440,7 +444,7 @@ def cache_text(items: list[Item], cfg: TrainConfig, text_encoder, tokenizer,
             encode(worker, batch[half:])
             return
         for (path, text), emb in zip(batch, embs):
-            save_file({"embeds": emb.contiguous()}, str(path), metadata={"prompt": text[:2000]})
+            save_safetensors({"embeds": emb.contiguous()}, path, metadata={"prompt": text[:2000]})
 
     count = [0]
 
