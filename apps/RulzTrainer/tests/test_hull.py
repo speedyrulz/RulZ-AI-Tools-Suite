@@ -480,6 +480,40 @@ def test_the_rebalance_leaves_the_path_of_dw_alone(monkeypatch, every):
     assert float((runs["on"] - runs["off"]).norm() / runs["off"].norm()) < 1e-3
 
 
+def low_rank_steps(state_dtype, steps=60, o=512, i=1024, r=32):
+    """The realised step over rho on a rank-2 gradient, where a rebalance's X is ill-conditioned."""
+    a, b = factors(o=o, i=i, r=r, dtype=torch.float32)
+    rho = 2e-4
+    opt = make(a, b, rho=rho, state_dtype=state_dtype)
+    g = torch.Generator().manual_seed(0)
+    target = torch.randn(o, 2, generator=g) @ torch.randn(2, i, generator=g)
+    target = target / target.norm()
+    out = []
+    for _ in range(steps):
+        with torch.no_grad():
+            before = (b @ a).clone()
+        push(a, b, 1.0, target)
+        opt.step()
+        with torch.no_grad():
+            out.append(float((b @ a - before).norm()) / (rho * W0))
+    return out
+
+
+def test_the_step_holds_through_rebalances_on_a_low_rank_gradient():
+    assert max(low_rank_steps("fp32")) < 2.0
+
+
+def test_bf16_momentum_would_not_survive_a_rebalance():
+    """Why the trainer refuses it: a rebalance multiplies m's rounding, and the step leaves rho behind."""
+    assert max(low_rank_steps("bf16")) > 2.5
+
+
+def test_a_saved_bf16_momentum_setting_builds_fp32():
+    a, b = factors(dtype=torch.float32)
+    opt = T.build_optimizer(_cfg(hull_state_dtype="bf16"), [a, b], pairs=[(a, b)], ref_norms=[W0], scales=[1.0])
+    assert opt.state_dtype == "fp32"
+
+
 def test_a_rebalance_keeps_dw_and_the_average_in_step():
     a, b = factors()
     opt = make(a, b)

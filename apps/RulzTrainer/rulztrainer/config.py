@@ -481,7 +481,7 @@ class TrainConfig:
     hull_rho: float = 0.0  # hull (docs/hull-optimizer.md): the step, a relative change of each layer's weight per step;
     #                        required, and the trainer's schedule acts on it (hull is not self-tuning)
     hull_betas: list[float] = field(default_factory=lambda: [0.9, 0.99])  # hull: momentum, second moment
-    hull_state_dtype: str = "bf16"  # hull: the momentum's dtype: bf16 with stochastic rounding | fp32
+    hull_state_dtype: str = "fp32"  # hull: the momentum's dtype; bf16 is ignored with a warning (trainer.build_optimizer)
     hull_clip: float = 5.0  # hull: per-channel RMS clip in the balanced frame (it replaces max_grad_norm)
     hull_factor_cap: float = 0.2  # hull: a step moves a factor by at most this share of its balanced norm
     hull_safety_cap: float = 0.0  # hull: the realised step's cap in steps of rho; 0 = 2 x max(1, hull_gain_max)

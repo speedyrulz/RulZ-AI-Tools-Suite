@@ -22,6 +22,10 @@ in the first real run (Krea 2, rank 32, 2000 steps) ||A|| reached 1e5 against ||
 smaller than ||B|| ||A|| and rested on cancellation that bf16 (the saved LoRA, the forward's activations) cannot hold.
 The momenta and the lora_ema shadow move with the factors (bind_ema); v and u do not depend on the gauge.
 
+The rebalance needs fp32 momentum, which is why the trainer always builds Hull with it. X can be ill-conditioned, so bf16
+momentum's rounding (0.4% of an element) is multiplied by it at every rebalance: ||m_A|| grew 1000-fold in 30 steps and
+the step sat on the safety cap at 4 rho, along that noise. That broke the second real run within 100 steps.
+
 Departure from the design (its section 4.6 runs the roots in fp32): the Grams and both roots are fp64. A rank-4 update
 held at rank 32 has Gram eigenvalues under the damping, fp32 rounding makes them negative, and the iteration diverges to
 NaN or 1e8; fp64 holds a residual of 1e-9 at the same damping. Everything after the roots stays fp32 (T included).
@@ -100,7 +104,7 @@ class Hull(torch.optim.Optimizer):
     relay; the frame is recomputed from the factors, the stored T only seeds the fallback.
     """
 
-    def __init__(self, params, pairs, ref_norms, scales, lr: float, betas=(0.9, 0.99), state_dtype: str = "bf16",
+    def __init__(self, params, pairs, ref_norms, scales, lr: float, betas=(0.9, 0.99), state_dtype: str = "fp32",
                  clip: float = 5.0, factor_cap: float = 0.2, safety_cap: float = 0.0, gain_max: float = 2.0,
                  ns_iters: int = 30, damping: float = 1e-6, seed: int = 0):
         if not lr > 0:
