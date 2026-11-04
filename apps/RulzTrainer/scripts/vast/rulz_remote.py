@@ -44,6 +44,7 @@ PULLS = STATE / "runs"  # outside the checkout: pulled runs outlive a branch or 
 REMOTE_DIR = "/workspace/RulzTrainer"
 PYTHON = '"$(test -x /venv/main/bin/python && echo /venv/main/bin/python || echo python3)"'
 AGENT_COMMANDS = {"status", "jobs", "job", "log", "probes", "config", "start", "stop", "queue"}  # rulz_agent.py's
+CONFIG_SLOT = b'SENT_CONFIG = ""'  # the line of rulz_agent.py that takes a local config
 SSH_FAILED = 255  # ssh's own exit status: it could not connect, or the connection dropped
 SYNC_PATHS = ("rulztrainer", "webui.py", "scripts", "requirements.txt")  # what a run needs of the code
 
@@ -158,6 +159,15 @@ def saved_connection(wanted: int | None) -> dict | None:
     return conn if wanted in (None, conn.get("id")) else None
 
 
+def agent_program(config: bytes | None = None) -> bytes:
+    """rulz_agent.py as it is piped to the instance, a local config written into it. A config can't go on the command
+    line: Git for Windows' ssh cuts a command at about 8190 characters, with no error and exit status 0."""
+    source = (HERE / "rulz_agent.py").read_bytes()
+    if config is None:
+        return source
+    return source.replace(CONFIG_SLOT, b'SENT_CONFIG = "' + base64.b64encode(config) + b'"', 1)
+
+
 class Remote:
     """One instance over ssh. The route is remembered between calls, so a call costs one ssh connection and no vast
     API request; when the instance has gone or moved, the first failure looks it up again."""
@@ -178,9 +188,9 @@ class Remote:
                                   stdin=subprocess.DEVNULL if data is None else None)
         return done
 
-    def agent(self, *args: str) -> subprocess.CompletedProcess:
+    def agent(self, *args: str, config: bytes | None = None) -> subprocess.CompletedProcess:
         """rulz_agent.py on the instance: piped in, so it is always this one."""
-        return self.run(f"{PYTHON} - {shlex.join(args)}", (HERE / "rulz_agent.py").read_bytes())
+        return self.run(f"{PYTHON} - {shlex.join(args)}", agent_program(config))
 
     def agent_json(self, *args: str):
         done = self.agent(*args)
@@ -392,16 +402,15 @@ def cmd_ssh(args) -> int:
     return subprocess.call(ssh_command(args.remote.conn, args.key, batch=False))
 
 
-def agent_args(argv: list[str]) -> list[str]:
-    """A command's arguments for the agent. A local config for start goes along inside them."""
-    out, items = [], iter(argv)
+def agent_args(argv: list[str]) -> tuple[list[str], bytes | None]:
+    """A command's arguments for the agent, and the contents of a local config for start (see agent_program)."""
+    out, config, items = [], None, iter(argv)
     for item in items:
         if item == "--config":
-            payload = base64.b64encode(Path(next(items)).read_bytes()).decode("ascii")
-            out += ["--payload", payload]
+            config = Path(next(items)).read_bytes()
         else:
             out.append(item)
-    return out
+    return out, config
 
 
 def global_options() -> argparse.ArgumentParser:
@@ -456,7 +465,8 @@ def main(argv=None) -> int:
     opts, rest = global_options().parse_known_args(argv)
     try:
         if rest and rest[0] in AGENT_COMMANDS:
-            return forward(Remote(opts.instance, opts.key, opts.dir).agent(*agent_args(rest)))
+            words, config = agent_args(rest)
+            return forward(Remote(opts.instance, opts.key, opts.dir).agent(*words, config=config))
         args = parser().parse_args(argv)
         if args.func is not cmd_connect:
             args.remote = Remote(args.instance, args.key, args.dir)

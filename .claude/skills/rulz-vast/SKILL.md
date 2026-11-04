@@ -50,7 +50,8 @@ python scripts/vast/rulz_remote.py start --job NAME --from BASE_JOB --set steps=
 python scripts/vast/rulz_remote.py wait NAME
 ```
 
-- `--dry-run` shows the settings that change and queues nothing. `--config FILE` starts from a local config instead.
+- `--dry-run` shows the settings that change and queues nothing. `--config FILE` starts from a local config instead,
+  of any size. With or without `--dry-run`, settings the trainer would refuse are refused before anything is queued.
 - A run goes into the WebUI's queue, so it shows on the user's Monitor, and behind a running job it waits its turn.
 - A job name in use is refused; `--overwrite` replaces an earlier run, so ask first.
 - `queue` shows waiting runs; `queue resume`, `queue pause`, `queue remove ID` edit them. After a WebUI restart with

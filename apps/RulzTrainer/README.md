@@ -255,7 +255,7 @@ python scripts/vast/rulz_remote.py wait test1               # blocks until the r
 | `status`, `jobs`, `job NAME` | GPU, disk and queue; every run; one run's numbers |
 | `log`, `probes`, `config NAME --diff OTHER` | Logs, likeness scores, and the settings two runs differ in |
 | `pull NAME` | Copies `--what logs` (default), `probes`, `samples`, `loras`, `best` or `all`, optionally of one `--step`. Files already here at their size are skipped, so it can repeat during a run |
-| `start --job NAME` | Queues a run from `--from JOB` or a local `--config FILE`, with `--set KEY=VALUE` and `--preset`. `--dry-run` shows what would change and queues nothing. It refuses a job name in use and an existing job folder unless `--overwrite` |
+| `start --job NAME` | Queues a run from `--from JOB` or a local `--config FILE`, with `--set KEY=VALUE` and `--preset`. `--dry-run` shows what would change and queues nothing. With or without it, the settings get the trainer's full check first, so what training would refuse is refused here. It refuses a job name in use and an existing job folder unless `--overwrite` |
 | `wait NAME` | Blocks until the run ends (or `--step N`), riding out dropped connections. Exit status 0 finished, 1 failed, 2 `--timeout`, 3 unreachable |
 | `stop`, `stop --kill`, `queue` | The WebUI's Stop and Kill; the queue, with `queue pause`, `resume` and `remove ID` |
 | `sync` | Copies this checkout's code to the instance, to test a change before a release. It refuses while a job runs; `--restart-webui` restarts the WebUI on the new code. It only adds and overwrites |
