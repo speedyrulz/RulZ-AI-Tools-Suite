@@ -4,10 +4,15 @@ The queue lives in output/_queue.json (the waiting configs in full, a paused fla
 runs), so it survives a reload or a restarted WebUI. The WebUI advances it: when no job runs and the queue is not
 paused, the first waiting run starts. A WebUI that starts with runs waiting and nothing running pauses the queue
 (on_startup) instead of starting one by surprise; Resume goes on. Kill pauses it too (stopping everything is what a
-kill usually means); Stop and a failed run go on to the next."""
+kill usually means); Stop and a failed run go on to the next.
+
+Other processes edit the queue too (scripts/vast/rulz_agent.py adds runs over ssh), so a lock file beside it guards the
+file across processes: advance holds the queue while a run starts, and a run added in that moment would otherwise be
+written over and lost without a word."""
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
 import uuid
@@ -18,10 +23,57 @@ QUEUE_FILE = ROOT / "output" / "_queue.json"
 DONE_KEPT = 10  # started / failed runs kept for the queue's "recently" list
 
 
+def _lock_file(f) -> None:
+    """Wait for the OS lock on an open file. The OS drops it if the holder dies, so a crash can't leave it stuck."""
+    if sys.platform == "win32":
+        import msvcrt
+
+        while True:
+            try:
+                msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)  # gives up after 10 s
+                return
+            except OSError:
+                continue
+    else:
+        import fcntl
+
+        fcntl.flock(f, fcntl.LOCK_EX)
+
+
+class QueueLock:
+    """Re-entrant across this process's threads and exclusive across processes. A run started while it is held does
+    not inherit it: Python's files aren't passed on to child processes."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.threads = threading.RLock()
+        self.depth = 0
+        self.file = None
+
+    def __enter__(self):
+        self.threads.acquire()
+        self.depth += 1
+        if self.depth == 1:
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self.file = open(self.path, "a+b")  # noqa: SIM115
+                _lock_file(self.file)
+            except OSError:  # a read-only folder and the like: the queue's own writes will say so
+                self.file = None
+        return self
+
+    def __exit__(self, *exc):
+        self.depth -= 1
+        if self.depth == 0 and self.file is not None:
+            self.file.close()  # releases the lock
+            self.file = None
+        self.threads.release()
+
+
 class TrainQueue:
     def __init__(self, path: Path = QUEUE_FILE):
         self.path = Path(path)
-        self.lock = threading.RLock()
+        self.lock = QueueLock(self.path.with_suffix(".lock"))
 
     # ---- storage
     def _read(self) -> dict:
