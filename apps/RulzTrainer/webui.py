@@ -7171,6 +7171,12 @@ def build_page(local: bool = True):
                                                           label="LR schedule").classes("w-36")
                             w["warmup_steps"] = ui.number("Warmup steps", value=d.warmup_steps, precision=0) \
                                 .classes("w-32")
+                        with fields().bind_visibility_from(w["optimizer"], "value", lambda x: x == "hull"):
+                            w["hull_rho"] = ui.number("Hull step", value=d.hull_rho, min=0, step=0.0001,
+                                                      format="%.6f").classes("w-40") \
+                                .tooltip("How far each step moves a layer, as a share of that layer's own weight. "
+                                         "Required: there is no default yet, and no race has measured a good value "
+                                         "(docs/hull-optimizer.md). The learning-rate schedule acts on it.")
                         with ui.column().classes("w-full gap-2").bind_visibility_from(
                                 w["optimizer"], "value", lambda x: x in AUTOMAGIC):
                             hint("Automagic tunes its own learning rate (the learning rate above is its start); LR "
@@ -7219,12 +7225,6 @@ def build_page(local: bool = True):
                                     .tooltip("The most the learning rate may move in one step (0.05 = about 5%); the "
                                              "signs that judge a step only arrive over the next polarity-history "
                                              "steps, so this bounds how far the rate can overshoot meanwhile.")
-                            with fields().bind_visibility_from(w["optimizer"], "value", lambda x: x == "hull"):
-                                w["hull_rho"] = ui.number("Hull step", value=d.hull_rho, min=0, step=0.0001,
-                                                          format="%.6f").classes("w-40") \
-                                    .tooltip("How far each step moves a layer, as a share of that layer's own weight. "
-                                             "Required: there is no default yet, and no race has measured a good value "
-                                             "(docs/hull-optimizer.md). The learning-rate schedule acts on it.")
                             with fields().bind_visibility_from(w["optimizer"], "value", lambda x: x in KEEL):
                                 w["keel_gauge"] = ui.switch("Gauge preconditioner", value=d.keel_gauge) \
                                     .tooltip("Each LoRA pair's gradient is scaled by the other factor's r x r Gram "
