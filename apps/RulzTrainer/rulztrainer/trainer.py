@@ -1032,6 +1032,8 @@ class Trainer(RaceParallelMixin):
         if cfg.lora_ema > 0 and self.race_rows is None and self.ft is None:
             per_step = cfg.batch_size * cfg.gradient_accumulation * len(self.replicas)
             self.ema = self._make_ema(cfg, injected)
+            if hasattr(optimizer, "bind_ema"):
+                optimizer.bind_ema(self.ema)
             if self.resumed_ema is not None:
                 self.ema.load_state_dict(self.resumed_ema)
                 log.info("Weight average restored from the training state (%d images averaged)", self.ema.images)
@@ -2085,6 +2087,8 @@ class Trainer(RaceParallelMixin):
         st["params"] = list(lora_mod.lora_parameters(st["injected"]))
         st["optimizer"], st["scheduler"] = self._make_optimizer(cfg, st["injected"])
         st["ema"] = self._make_ema(cfg, st["injected"])
+        if hasattr(st["optimizer"], "bind_ema"):
+            st["optimizer"].bind_ema(st["ema"])
         st["rng"], st["gen"] = random.Random(cfg.seed), torch.Generator("cpu").manual_seed(cfg.seed)
         st["step"], st["losses"], st["grad_norms"], st["id_losses"] = 0, [], [], []
         st["ts_strata"] = make_strata(cfg)

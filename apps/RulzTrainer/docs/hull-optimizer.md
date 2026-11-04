@@ -1,8 +1,8 @@
 # Hull: a body-identity optimizer for character LoRAs (design)
 
 Status: H0, the base rule, is built (`rulztrainer/optimizers/hull.py`, `tests/test_hull.py`) with `hull_metric: balanced`,
-`hull_frame: virtual` and `hull_step_scope: layer`; it has not trained a real model or been raced, and everything else
-here is design. Every number below is a starting value to race unless it is cited, measured in
+`hull_frame: virtual` and `hull_step_scope: layer`, plus the periodic rebalance of section 4.1; it has trained one real
+model, unraced (section 4.1), and everything else here is design. Every number below is a starting value to race unless it is cited, measured in
 a synthetic benchmark or computed, and then it carries a tag. Working name "Hull": Keel is a ship's spine, the hull
 its whole body and skin. Hull is for any character LoRA; Qwen-Image 2.1 is the main target.
 
@@ -143,6 +143,21 @@ and the factor-average gap is no narrower (factor against product averages, deca
 explicit, 0.88-1.01% Adam at an unmatched step [N]). **Fallback** `hull_frame: explicit`: rebalance in place with
 `copy_` / `_foreach_copy_` (never rebinding `p.data`), transport `m` and the `lora_ema` shadow (bound once the EMA
 exists, 7), and test that the shadow's product is unchanged.
+
+**What the first real run showed, and the rebalance.** The buys above assumed the drift stays modest. The first real
+run (Krea 2, rank 32, 2000 steps, `hull_rho` 0.0002, H0 as built) ended with ||A|| 1e5 against ||B|| 0.04 on the worst
+layer, median ||A|| 531 against ||B|| 0.12; on a synthetic layer of the same shape ||A|| is 121-370 at step 100 against
+6-8 under AdamW [N]. The frame has no restoring force on the gauge, so nothing stops it. On that worst layer ||dW|| was
+about 1000 times smaller than ||B|| ||A||, a cancellation bf16 cannot hold: one more rounding to bf16 moved a saved dW
+by 0.3% at the median layer, 5-9% at the 90th percentile and about 100% at the worst, against 0.23% at every layer for
+the same dW balanced [N, the file's factors], and the
+forward (`_added` runs in the activations' dtype, bf16) showed the same scale. So every `REBALANCE_EVERY` = 10 steps
+Hull applies the fallback's rebalance in place: B <- B X, A <- X⁻¹ A with X = T^½, in fp64, m_B <- m_B X⁻¹, m_A <- X m_A,
+T <- I, and the shadow of a bound `lora_ema` the same way, so its product stays. v and u do not depend on the gauge. It
+leaves dW's path alone: 0.1-0.4% apart from the virtual rule over 1000 steps at rank 32 [N, fp32 with bf16 momentum].
+**It does not change that path, so it can only remove the precision damage.** That run's loss and raw gradients also
+turned at about step 1250, and whether that came from the precision or from the path itself is not settled. Its
+eigendecompositions sync the host once in 10 steps (5 ms for 257 pairs at rank 32 [N]).
 
 ### 4.2 Per-channel second moments, normalise first, then momentum
 
