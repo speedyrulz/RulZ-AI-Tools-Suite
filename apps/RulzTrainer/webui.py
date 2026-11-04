@@ -4544,7 +4544,7 @@ EXPERIMENTS = [
      "control": "select", "options": {"adamw8bit": "adamw8bit (default)", "adamw": "adamw", "adafactor": "adafactor",
                                       "automagic3": "automagic3", "automagic4": "automagic4", "keel": "keel",
                                       "keel_fb": "keel_fb"},
-     "evidence": "cost",
+     "evidence": "mixed",
      "short": "A self-tuning optimizer instead of adamw8bit.",
      "what": "adamw8bit is AdamW with its state in 8 bits (adamw keeps it in full precision; adafactor is lighter). "
              "automagic3 and automagic4 tune their own learning rate as they go; automagic4 adds smaller steps for the "
@@ -4553,8 +4553,11 @@ EXPERIMENTS = [
      "tested": "Automagic was measured for its learning rates and speed on Krea 2 (rank 16, 6 images, 160 steps): "
                "automagic4 rose from 1.7e-4 to a peak of 6.0e-4 and came back to 3.2e-4; the losses (0.078 / 0.079 / "
                "0.081) were too close in so short a run to rank. Likeness against adamw8bit has not been measured for "
-               "any of them, so adamw8bit stays the default until a race says otherwise. Keel and keel_fb: nothing "
-               "measured yet. adafactor is Fizgig's pick for a full fine-tune, not tested for LoRAs.",
+               "any of them, so adamw8bit stays the default until a race says otherwise. Keel was raced against itself "
+               "on one small body-only set: one learning rate for all layers (single) beat by_type by 4.4 body points "
+               "over 8 seeds, and Max lr at 1e-3, 5e-4 and 3e-4 tied at 1000 steps, all still improving. keel against "
+               "adamw8bit and keel_fb against keel are not measured yet. adafactor is Fizgig's pick for a full "
+               "fine-tune, not tested for LoRAs.",
      "cost": "automagic4 took 1.6 s a step against automagic3's 2.2 s. The learning-rate schedule, LoRA+ and the "
              "per-image learning rate do not apply to the automagic family. Keel's consensus gate wants gradient "
              "accumulation of 2 or more."},
@@ -7318,19 +7321,28 @@ def build_page(local: bool = True):
                             w["hull_rho"] = ui.number("Hull step", value=d.hull_rho, min=0, step=0.0001,
                                                       format="%.6f").classes("w-40") \
                                 .tooltip("How far each step moves a layer, as a share of that layer's own weight. "
-                                         "Required: there is no default yet, and no race has measured a good value "
-                                         "(docs/hull-optimizer.md). The learning-rate schedule acts on it.")
+                                         "Required: there is no default. Start at 0.0002: in races on one set it "
+                                         "matched AdamW 8-bit, and 0.0001 scored clearly lower without copying less "
+                                         "(docs/keel-test-results.md). Runs vary a lot, so watch the copy score. The "
+                                         "learning-rate schedule acts on it.")
                         with ui.column().classes("w-full gap-2").bind_visibility_from(
                                 w["optimizer"], "value", lambda x: x in AUTOMAGIC):
                             hint("Automagic tunes its own learning rate (the learning rate above is its start); LR "
                                  "schedule and warmup are ignored. Automagic 4 also caps the step of the most "
                                  "sensitive weights and its rate holds on noise instead of drifting up. Keel is "
-                                 "Automagic 4 plus the LoRA gauge preconditioner and the cautious mask below.")
+                                 "Automagic 4 plus the LoRA gauge preconditioner and the cautious mask below. "
+                                 "Keel, from real tests: use one lr for every layer; the Max lr made no measurable "
+                                 "difference from 3e-4 to 1e-3; and 1000 steps was not yet enough, so plan on more. "
+                                 "The other Keel settings are not measured yet (docs/keel-test-results.md).")
                             with fields():
                                 w["automagic_min_lr"] = ui.number("Min lr", value=d.automagic_min_lr, format="%.1e") \
                                     .classes("w-32")
                                 w["automagic_max_lr"] = ui.number("Max lr", value=d.automagic_max_lr, format="%.1e") \
-                                    .classes("w-32")
+                                    .classes("w-32") \
+                                    .tooltip("The ceiling of the self-tuned rate. Keel climbs to the default 1e-3 by "
+                                             "about step 200. In a race over 8 seeds, 1e-3, 5e-4 and 3e-4 tied at 1000 "
+                                             "steps on one body-only set, so keep the default or use 3e-4 for the "
+                                             "gentlest setting at the same score.")
                                 w["automagic_polarity_history"] = ui.number("Polarity history",
                                                                             value=d.automagic_polarity_history,
                                                                             min=2, max=64, precision=0).classes("w-36")
@@ -7344,7 +7356,8 @@ def build_page(local: bool = True):
                                     .tooltip("by_type: text-side layers (Krea's text fusion), attention, feed-forward "
                                              "and the rest each adapt their own learning rate, so a small, slower "
                                              "group is not outvoted by the large ones. Fizgig trains Krea 2 this way, "
-                                             "with a polarity history of 16.")
+                                             "with a polarity history of 16. With Keel, use one lr: it beat by_type by "
+                                             "4.4 body points over 8 seeds on one body-only set (p = 0.03).")
                             with fields().bind_visibility_from(w["optimizer"], "value",
                                                                lambda x: x in ("automagic4", *KEEL)):
                                 w["automagic_sensitivity_quantile"] = ui.number("Sensitivity quantile",
@@ -7435,7 +7448,8 @@ def build_page(local: bool = True):
                                              "(by the noise band) become the anchor; after the grace probes without "
                                              "a gain the weights are pulled part of the way back toward the anchor "
                                              "and the learning rate is cut, so a run that wanders off its best is "
-                                             "damped to it. Needs likeness probes (face refs). Off until raced.")
+                                             "damped to it. Needs likeness probes (face refs). Not measured yet: leave it "
+                                             "off, and race it as its own row.")
                                 w["keel_lookahead_pullback"] = ui.number("Pull-back", value=d.keel_lookahead_pullback,
                                                                          min=0.05, max=1, step=0.05, format="%.2f") \
                                     .classes("w-32") \
@@ -7454,8 +7468,8 @@ def build_page(local: bool = True):
                                              "gradient that comes from the face's tokens / the median pair's share) "
                                              "to this power, so the weights serving the face move more and the "
                                              "background's less. Needs region maps with faces (face detection). "
-                                             "0 = off; race it at 0.5 and 1. keel_fb measures the body's tokens too "
-                                             "(Body weight).")
+                                             "0 = off; not measured yet, so race it at 0.5 and 1. keel_fb measures the "
+                                             "body's tokens too (Body weight).")
                                 w["keel_face_gain_max"] = ui.number("Face gain limit", value=d.keel_face_gain_max,
                                                                     min=1, max=10, step=0.5, format="%.1f") \
                                     .classes("w-32").tooltip("The gain stays within [1 / limit, limit].")
@@ -7474,7 +7488,8 @@ def build_page(local: bool = True):
                                              "moves the gain by the body alone and face crops by the face alone. 1 = "
                                              "equal; 0 = face only. Needs Face gain above 0 (off by default: then "
                                              "keel_fb differs from keel by the consensus vote alone). Set the probes' "
-                                             "face and body weights equal too.")
+                                             "face and body weights equal too. Not measured yet: race keel_fb against "
+                                             "keel with gradient accumulation of 2 or more, or the two are alike.")
                         with advanced("Timesteps, loss weighting and gradients"):
                             with fields():
                                 w["gradient_accumulation"] = ui.number("Grad accumulation",
@@ -8192,7 +8207,8 @@ def build_page(local: bool = True):
                                              "copies a photo (same pose, outfit and background): training on it "
                                              "teaches the photo again, not the person in a new scene. The probes log "
                                              "their closest photo too (Monitor: copy). auto: on with self-training; "
-                                             "on: for any run with probes.")
+                                             "on: for any run with probes. Turn it on for races: in one the highest "
+                                             "score was also the only run over the copy limit, memorising one photo.")
                                 w["copy_max"] = ui.number("Copy limit", value=d.copy_max, min=0.05, max=1,
                                                           step=0.05).classes("w-32") \
                                     .bind_visibility_from(w["copy_check"], "value", backward=lambda m: m != "off") \
@@ -8245,7 +8261,10 @@ def build_page(local: bool = True):
                         with advanced("Probe scoring"):
                             with fields():
                                 w["probe_seeds"] = ui.number("Seeds per probe", value=d.probe_seeds, min=1, max=8,
-                                                             precision=0).classes("w-36")
+                                                             precision=0).classes("w-36") \
+                                    .tooltip("Use 8 for a race. Even then, gaps of about 3 body points did not hold up "
+                                             "across seeds on a varied probe, and single runs differed by up to about "
+                                             "15 points, so repeat a close race with a second training seed.")
                                 w["probe_floor_seeds"] = ui.number("Step-0 seeds", value=d.probe_floor_seeds, min=1,
                                                                    max=16, precision=0).classes("w-32") \
                                     .tooltip("The step-0 probe (the base model: the 0 of the normalized scale) renders "
@@ -9470,7 +9489,9 @@ each LoRA pair's step by how much of its gradient comes from the face's tokens, 
 weights that serve the face move more and the background's less; it needs region maps with faces. *Consensus vote*
 picks how the step's gradients vote: by sign (one vote each) or by magnitude (each weighted by its size, so a photo
 that says little about a weight barely votes). Whether Keel beats adamw8bit on the likeness probes is not measured
-yet: race them.
+yet: race them. Tested so far (`docs/keel-test-results.md`, one small body-only set, 8 seeds): one rate for every layer
+beat *by_type* by 4.4 body points, *Max lr* at 1e-3, 5e-4 and 3e-4 tied at 1000 steps, and every run was still rising
+at the end. Use one rate and plan on more than 1000 steps.
 
 `keel_fb` is Keel for the face and the body alike, for a LoRA that should hold the build as firmly as the face: the
 token gain measures the body's tokens too (the person outside the face box, from the person masks; *Body weight*
@@ -9480,7 +9501,7 @@ a full vote against it; `subject` *Band weights* are its plateau over the face's
 is off by default in both, so with the defaults `keel_fb` differs from `keel` by the vote alone: set *Face gain* (0.5
 or 1) to bring the body share in. Set the probes' face and body weights (`face_weight`, `body_weight`, 0.7 / 0.3 by
 default) equal with it, since the lookahead and the best / stop decisions follow their combined score. Race it against
-`keel`: nothing is measured yet.
+`keel`, with gradient accumulation of 2 or more: not measured yet.
 
 ## Adapters: LoRA, LoKr, OFT and DoRA
 The *Adapter* field (Train tab, LoRA section) picks what each layer learns. **LoRA**: a rank-r pair. **LoKr**: a

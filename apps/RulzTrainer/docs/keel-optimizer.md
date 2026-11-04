@@ -5,7 +5,7 @@ accumulation hook and `gather()`, D with `on_probe`, and C with the LoRA face ta
 face-and-body version (`optimizer: keel_fb`: the body share in C, the magnitude vote in A, the `subject` band
 preset in B; the same class); milestone 6 (the README's Wizard choice after the races, phase 1b / 2) is design.
 Working name "Keel" (the part of the boat that keeps it from drifting sideways). Every number below is a starting
-value to race, not a measured one.
+value to race, not a measured one. What has been measured is in [keel-test-results.md](keel-test-results.md).
 
 ## 1. Goal
 
