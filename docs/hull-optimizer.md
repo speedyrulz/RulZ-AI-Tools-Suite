@@ -154,8 +154,14 @@ the same dW balanced [N, the file's factors], and the
 forward (`_added` runs in the activations' dtype, bf16) showed the same scale. So every `REBALANCE_EVERY` = 10 steps
 Hull applies the fallback's rebalance in place: B <- B X, A <- X⁻¹ A with X = T^½, in fp64, m_B <- m_B X⁻¹, m_A <- X m_A,
 T <- I, and the shadow of a bound `lora_ema` the same way, so its product stays. v and u do not depend on the gauge. It
-leaves dW's path alone: 0.1-0.4% apart from the virtual rule over 1000 steps at rank 32 [N, fp32 with bf16 momentum].
-**It does not change that path, so it can only remove the precision damage.** That run's loss and raw gradients also
+leaves dW's path alone with fp32 momentum: the same step, to two decimals, over 64 steps at rank 32, and within 1.64 rho over 800
+steps at gradient ranks 1-16 [N]. **With bf16 momentum it does not.** X can be ill-conditioned, so m's rounding (0.4% of
+an element) is multiplied by it at every rebalance: on a rank-2 gradient ||m_A|| reached 3.9e5 against 680 at step 30
+and the step sat on the safety cap at 4 rho, along that noise [N]. An earlier check at gradient rank 16 missed this. The
+second real run (v2.36.2, bf16 momentum) gave wrong subjects by step 100 and abstract noise by step 300, with its loss
+still flat, so the trainer now always builds Hull with fp32 momentum (`hull_state_dtype: bf16` is ignored with a
+warning), at about 346 MB against 178 MB. **The rebalance does not change dW's path, so it can only remove the precision
+damage.** The first run's loss and raw gradients also
 turned at about step 1250, and whether that came from the precision or from the path itself is not settled. Its
 eigendecompositions sync the host once in 10 steps (5 ms for 257 pairs at rank 32 [N]).
 
@@ -619,7 +625,7 @@ hull_metric: balanced           # balanced (H0) | riemannian (R1b) | adam (per-e
 hull_frame: virtual             # virtual | explicit (rebalance in place; m and the lora_ema shadow transported)
 hull_step_scope: layer          # layer | global
 hull_betas: [0.9, 0.99]
-hull_state_dtype: bf16          # m: bf16 with stochastic rounding | fp32
+hull_state_dtype: fp32          # m: fp32; bf16 is ignored with a warning (section 4.1)
 hull_clip: 5.0                  # per-channel RMS clip, balanced frame
 hull_factor_cap: 0.2            # kappa_f
 hull_safety_cap: 0.0            # kappa (rho_t mu ||W0|| units); 0 = 2 max(1, hull_gain_max)
@@ -660,7 +666,7 @@ recommending `adamw8bit` until a race says otherwise.
 
 | key, per parameter | on | dtype, shape | bytes per weight, r = 32 |
 |---|---|---|---|
-| `m` | both factors | bf16, like p | 2 |
+| `m` | both factors | fp32, like p | 4 |
 | `v` | lora_up [o], lora_down [i] | fp32 | 0.125 |
 | `T`, `Ti`, `u`, `k`, cap and fallback counters | lora_up | fp32, [r, r] or 0-dim | ~0 |
 | `dither`, the stochastic rounding's step count | the first pair's lora_up | a host integer | ~0 |

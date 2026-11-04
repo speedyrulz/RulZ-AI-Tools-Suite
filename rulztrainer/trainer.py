@@ -382,8 +382,10 @@ def build_optimizer(cfg: TrainConfig, params, pairs=None, ref_norms=None, scales
         if cfg.loss_weighting == "min_snr":
             log.warning("loss_weighting min_snr weights sigma 0.9 at about 1/64 of sigma 0.3: hull's noise levels are "
                         "meant to keep their natural shares")
+        if cfg.hull_state_dtype != "fp32":  # saved configs hold bf16: a rebalance multiplied its rounding into the step
+            log.warning("hull_state_dtype %s is ignored: hull's momentum is fp32", cfg.hull_state_dtype)
         return Hull(params, pairs=pairs, ref_norms=ref_norms, scales=scales, lr=cfg.hull_rho,
-                    betas=tuple(cfg.hull_betas), state_dtype=cfg.hull_state_dtype, clip=cfg.hull_clip,
+                    betas=tuple(cfg.hull_betas), state_dtype="fp32", clip=cfg.hull_clip,
                     factor_cap=cfg.hull_factor_cap, safety_cap=cfg.hull_safety_cap, gain_max=cfg.hull_gain_max,
                     ns_iters=cfg.hull_ns_iters, damping=cfg.hull_damping, seed=cfg.seed)
     if name in AUTOMAGIC:
