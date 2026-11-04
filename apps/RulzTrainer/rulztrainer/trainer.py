@@ -497,7 +497,7 @@ class Trainer(RaceParallelMixin):
         self.resumed_ema = None  # its state from a resumed training state
         self.resumed_controller = None  # the likeness controller's, from a resumed training state
         self.crash_save = None  # while training: saves the LoRA as it stands (run() calls it after an error)
-        self.bad_steps = 0  # steps in a row left out for non-finite gradients
+        self.bad_steps = 0  # steps in a row left out for non-finite gradients (a parallel race: per configuration)
         self.skipped_steps = 0  # in the whole run
         self.vaes: dict[str, object] = {}  # VAE copies on the other GPUs (sampling / caching side jobs)
         self.sample_graphs: set = set()  # (device, shape) pairs a compiled model has already traced for sampling
@@ -1414,7 +1414,8 @@ class Trainer(RaceParallelMixin):
                 gather()
             grad_norm = step_grad_norm(params, cfg.clip_norm)
             if bad_gradients(params, grad_norm):  # the step counts, but nothing of it reaches the LoRA
-                self._skip_bad_step(step + 1)
+                self.bad_steps += 1
+                self._skip_bad_step(step + 1, self.bad_steps)
                 if not math.isfinite(accum_loss):  # (the chart and the running average stay readable)
                     accum_loss = losses[-1] if losses else 0.0
             else:
@@ -1792,17 +1793,16 @@ class Trainer(RaceParallelMixin):
         self.status.write()
         return state_dir
 
-    def _skip_bad_step(self, step: int) -> None:
-        """A step with non-finite gradients is left out. Many in a row end the run (its LoRA still healthy, which
-        run() saves); a race goes on, since the configuration's probes then drop it."""
-        self.bad_steps += 1
+    def _skip_bad_step(self, step: int, streak: int) -> None:
+        """A step with non-finite gradients is left out (streak: how many in a row, this one included). Many in a row
+        end the run (its LoRA still healthy, which run() saves), as they do a race's winner training on alone; while
+        a race is undecided it goes on, since the configuration's probes then drop it."""
         self.skipped_steps += 1
-        log.warning("Step %d left out: its gradients are not finite; the LoRA is unchanged (%d in a row)", step,
-                    self.bad_steps)
+        log.warning("Step %d left out: its gradients are not finite; the LoRA is unchanged (%d in a row)", step, streak)
         self.status.update(skipped_steps=self.skipped_steps)
-        if self.race is None and self.bad_steps >= BAD_STEP_LIMIT:
-            raise RuntimeError(f"The gradients were not finite for {self.bad_steps} steps in a row: the run is "
-                               "diverging. Try a lower learning rate or another quantized backward")
+        if streak >= BAD_STEP_LIMIT and not self._race_running():
+            raise RuntimeError(f"The gradients were not finite for {streak} steps in a row: the run is diverging. "
+                               "Try a lower learning rate or another quantized backward")
 
     def _emergency_save(self, injected, params, step: int, state: tuple | None = None) -> None:
         """The LoRA as it stands in a normal checkpoint file, and a training state to resume from when `state`

@@ -182,8 +182,7 @@ def test_a_step_with_broken_gradients_leaves_a_lane_as_it_was(stubbed, monkeypat
     from rulztrainer import losses
 
     fake, (a, _, _), _ = _lane_setup()
-    fake.bad_steps = fake.skipped_steps = 0
-    fake._skip_bad_step = T.Trainer._skip_bad_step.__get__(fake)
+    _count_bad_steps(fake)
     lanes = fake._rp_plan([a])
     fake._rp_place(lanes)
     good = losses.elementwise_loss
@@ -197,3 +196,69 @@ def test_a_step_with_broken_gradients_leaves_a_lane_as_it_was(stubbed, monkeypat
     fake._rp_step(lanes)
     assert a.state["step"] == 2 and fake.skipped_steps == 1
     assert any(not torch.equal(x, y) for x, y in zip(before, a.state["params"]))
+
+
+def _count_bad_steps(fake, racing=True):
+    fake.skipped_steps = 0
+    fake._race_running = lambda: racing
+    fake._skip_bad_step = T.Trainer._skip_bad_step.__get__(fake)
+
+
+def _break_loss(monkeypatch):
+    from rulztrainer import losses
+
+    good = losses.elementwise_loss
+    monkeypatch.setattr(losses, "elementwise_loss", lambda *x, **k: good(*x, **k) * float("nan"))
+    return lambda: monkeypatch.setattr(losses, "elementwise_loss", good)
+
+
+def test_each_lane_keeps_its_own_streak_of_broken_steps(stubbed, monkeypatch):
+    fake, (a, _, _), _ = _lane_setup()
+    _count_bad_steps(fake)
+    lanes = fake._rp_plan([a])
+    fake._rp_place(lanes)
+    heal = _break_loss(monkeypatch)
+    fake._rp_step(lanes)
+    fake._rp_step(lanes)
+    assert a.state["bad_steps"] == 2
+    heal()
+    fake._rp_step(lanes)
+    assert a.state["bad_steps"] == 0 and fake.skipped_steps == 2
+
+
+def test_a_race_goes_on_but_its_winner_stops_when_it_diverges(stubbed, monkeypatch):
+    fake, (a, _, _), _ = _lane_setup()
+    _count_bad_steps(fake)
+    a.state["bad_steps"] = T.BAD_STEP_LIMIT
+    lanes = fake._rp_plan([a])
+    fake._rp_place(lanes)
+    _break_loss(monkeypatch)
+    fake._rp_step(lanes)  # undecided: its probes will drop it
+    fake._race_running = lambda: False  # the winner, training on alone
+    with pytest.raises(RuntimeError, match="not finite"):
+        fake._rp_step(lanes)
+
+
+def test_running_out_of_memory_in_the_prior_pass_leaves_the_lora_on():
+    from rulztrainer.race_parallel import forward_backward
+
+    class Fails(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, x, t, embeds, mask):
+            self.calls += 1
+            if self.calls == 2:  # the LoRA-off pass of prior preservation
+                raise torch.OutOfMemoryError("out of memory")
+            return x
+
+    model = Tiny()
+    inj = L.inject_lora(model, 4, 4.0, [], names=["lin"])
+    regions = SimpleNamespace(weight=torch.ones(1, 1, 1, 1), prior=torch.ones(1, 1, 1, 1).bool(), meta=[])
+    ctx = SimpleNamespace(cfg=TrainConfig(region_weights=True, region_prior_weight=1.0), loss_watch=None, look=None)
+    job = ((Fails(), inj, "cpu"), [], torch.zeros(1, 4, 1, 1), torch.zeros(1, 2, 3), torch.ones(1, 2).bool(),
+           torch.full((1,), 0.5), torch.zeros(1, 4, 1, 1), regions, 1, 1, ctx)
+    with pytest.raises(torch.OutOfMemoryError):
+        forward_backward(job)
+    assert inj["lin"].multiplier == 1.0
