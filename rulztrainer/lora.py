@@ -57,8 +57,10 @@ from typing import Callable, Iterable
 
 import torch
 from safetensors import safe_open
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
 from torch import nn
+
+from .atomic import save_safetensors
 
 log = logging.getLogger("rulztrainer")
 
@@ -880,7 +882,13 @@ def save_lora(injected: dict[str, LoRALinear], path, metadata: dict | None = Non
         meta["rulztrainer_alpha"] = "folded into lora_B: read at alpha = rank"
         if "ss_network_dim" in meta:
             meta["ss_network_alpha"] = meta["ss_network_dim"]
-    save_file(export_state_dict(injected, dtype, fmt), str(path), metadata=meta)
+    save_safetensors(export_state_dict(injected, dtype, fmt), path, metadata=meta)
+
+
+def read_metadata(path) -> dict:
+    """A LoRA file's metadata ({} when it has none)."""
+    with safe_open(str(path), "pt") as f:
+        return f.metadata() or {}
 
 
 def read_peft_metadata(path) -> dict:

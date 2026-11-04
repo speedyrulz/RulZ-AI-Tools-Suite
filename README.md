@@ -659,10 +659,36 @@ resolution and stage are logged, shown in the monitor line and written to `liken
 
 ## Training states
 
-`save_state: true` writes `output/<job>/state_XXXXXX/` folders (fp32 LoRA, optimizer, LR scheduler and RNG
-states) every `save_state_every` steps (0 = with each LoRA save), keeps a rolling `keep_states` of them
-(0 = all), and always writes the final state when training ends or is stopped. Set `resume_state` to one of
-those folders to continue exactly where it stopped. `resume_from` loads only LoRA weights from any exported file.
+`save_state` (on by default) writes `output/<job>/state_XXXXXX/` folders (fp32 LoRA, optimizer, LR scheduler, RNG
+states and the likeness controller) every `save_state_every` steps (0 = with each LoRA save), keeps a rolling
+`keep_states` of them (default 1; 0 = all), and writes the final state when training ends or is stopped. A state takes
+about 3 times the size of the LoRA in fp32 with Adam. Races and full fine-tunes keep no states.
+
+Set `resume_state` to one of those folders to continue where it stopped. `resume_from` loads only LoRA weights from
+any exported file. A resumed run carries on with the likeness scale, best scores, patience, smoothing, learning-rate
+factor and face bias it had, and only a probe above the best files already in the job folder replaces them, even when
+those are newer than the state. A state saved by an older version has no controller: its scale and patience start
+over, and the log says so. The image order, the per-image loss watch and the identity-alignment head start fresh.
+
+## When something goes wrong
+
+- **Broken gradients.** A step whose gradients hold a NaN or an infinity is left out, so nothing of it reaches the LoRA
+  or the optimizer's moments; before, one such step ruined the LoRA for the rest of the run while training went on.
+  It still counts as a step, and the log and the status say how many were skipped. 25 in a row end the run with an
+  error (it is diverging; its LoRA is still healthy and gets saved). In a race the run goes on: that configuration's
+  probes drop it.
+- **A run that fails.** After an error the weights are still in memory, so the run saves them first: a normal checkpoint
+  of the last finished step and a training state to resume from. A race saves the configurations training at that
+  moment, with no state. A LoRA that holds non-finite weights is not saved.
+- **A render that fails.** A sample round, a probe or a self-training round that fails (out of memory, say) is logged
+  with its traceback and training goes on without it. A failure before the first step still stops the run: nothing is
+  lost, and it is usually a setting.
+- **Whole files.** LoRA files, training states, full fine-tune deltas, cached latents, text features and region maps
+  are written to `<name>.tmp` and moved into place, so a crash or a full disk never leaves a torn file or costs the
+  last good `<job>_best`.
+- **Changed pictures.** Cached latents and region maps are named after the picture's path, modified time and size, so a
+  picture replaced in place is encoded again instead of training on the old one. The first run after this change
+  encodes each dataset once more; the old files stay in `.rulz_cache` until you delete the folder.
 
 ## Checkpoints to keep (`keep_checkpoints`)
 
@@ -2652,6 +2678,7 @@ and compiled as long as cold. For vast.ai, upload a file a rental made.
 rulztrainer/
   config.py        TrainConfig dataclass + YAML
   dataset.py       scanning, bucketing, latent/text caching, batching
+  atomic.py        files written whole or not at all (a temporary file moved into place)
   lora.py          LoRA injection, ComfyUI-format export/import, sampling-only extra LoRAs
   quant.py         int8 / int8_convrot / nvfp4 weight quantization matching comfy_kitchen, QuantLinear
   sampler.py       flow-matching Euler sampler (reference schedule)

@@ -17,6 +17,7 @@ from pathlib import Path
 import torch
 from PIL import Image
 
+from . import atomic
 from . import attention
 from . import checkpointing as ckpt
 from . import compiling
@@ -40,6 +41,7 @@ from .multigpu import (Balancer, choose_counts, clone_to, compile_count, job_ord
 log = logging.getLogger("rulztrainer")
 DP_COMPILE_QUIET_STEPS = 3  # data parallel + compile: serial steps without a new graph before going parallel
 TEXT_TIMING_PROMPTS = 3 * TEXT_BATCH  # prompts (three batches) timed on the first copy before deciding on a second
+BAD_STEP_LIMIT = 25  # non-finite gradient steps in a row that end a run (a race's bad configuration just scores low)
 
 
 @dataclass
@@ -331,6 +333,13 @@ def step_grad_norm(params, max_norm: float) -> float | None:
     return value if math.isfinite(value) else None
 
 
+def bad_gradients(params, norm: float | None) -> bool:
+    """True when the step's gradients hold a NaN or an infinity (step_grad_norm's None, which also means no gradients
+    at all). A clip spreads one such value to every parameter, and the optimizer's moments keep it for good, so the
+    trainer leaves that step out."""
+    return norm is None and any(p.grad is not None for p in params)
+
+
 def format_grad_norm(norm: float | None, max_norm: float) -> str:
     """The log line's gradient norm: "0.412", "3.20 (clipped)" above max_grad_norm, "nan" when not finite."""
     if norm is None:
@@ -486,6 +495,10 @@ class Trainer(RaceParallelMixin):
         self.kept: dict[int, list[int]] = {}  # id(model copy) -> blocks keeping their activations
         self.ema = None  # LoraEMA: the weight average saves, samples and probes use (lora_ema)
         self.resumed_ema = None  # its state from a resumed training state
+        self.resumed_controller = None  # the likeness controller's, from a resumed training state
+        self.crash_save = None  # while training: saves the LoRA as it stands (run() calls it after an error)
+        self.bad_steps = 0  # steps in a row left out for non-finite gradients
+        self.skipped_steps = 0  # in the whole run
         self.vaes: dict[str, object] = {}  # VAE copies on the other GPUs (sampling / caching side jobs)
         self.sample_graphs: set = set()  # (device, shape) pairs a compiled model has already traced for sampling
         self.face_scorer = None
@@ -891,6 +904,7 @@ class Trainer(RaceParallelMixin):
             self._run()
         except Exception as e:  # noqa: BLE001
             log.exception("Training failed")
+            self._save_after_crash()
             self.status.update(stage="error", error=f"{type(e).__name__}: {e}", done=True)
             self._save_history("error")
             raise
@@ -1141,6 +1155,8 @@ class Trainer(RaceParallelMixin):
             true_per_image_lr = (self.loss_watch is not None and cfg.per_image_lr and cfg.batch_size == 1
                                  and cfg.gradient_accumulation == 1 and len(self.replicas) == 1)
             id_w = idloss_weight(cfg.id_loss_weight)
+            if cfg.resume_state and self.controller is not None:
+                self._resume_controller()
         else:
             self.race_id_loss = self.id_loss
             self._race_setup(injected, items)
@@ -1290,6 +1306,16 @@ class Trainer(RaceParallelMixin):
             nonlocal params, optimizer, scheduler
             params, optimizer, scheduler = self._finetune_rotate(cfg, at_step, optimizer)
 
+        def crash_save():
+            """After an error: the LoRA as it stands, with a training state to go on from where the run can have one."""
+            if compute_done > 0:
+                resumable = self.ft is None and self.race is None
+                self._emergency_save(injected, params, step, (optimizer, scheduler, gen, rng) if resumable else None)
+
+        def probe_safely(job):
+            return self._side_job(f"The probe at step {step}", job, False)
+
+        self.crash_save = crash_save
         retry_jobs = None  # (per_rep, step_images) of a step that ran out of memory, trained again as they were
         while step < cfg.steps or self._race_running():
             if (self.ft is not None and step > start_step and step % self.ft_rotate_steps == 0
@@ -1387,23 +1413,29 @@ class Trainer(RaceParallelMixin):
             if gather is not None:  # Keel: the micro-batch sums join the replicas' on p.grad for the clip
                 gather()
             grad_norm = step_grad_norm(params, cfg.clip_norm)
-            step_lr_mult *= self._clean_lr_scale(  # clean_share: half the lr on the lower-share epochs
-                cfg, step, self.batcher, cfg.batch_size * cfg.gradient_accumulation * n_dev)
-            step_lr_mult = limit_step_mult(cfg, step_lr_mult)
-            if step_lr_mult != 1.0:  # true per-image lr: scale this step only (the scheduler restores it)
-                saved_lrs = [g["lr"] for g in optimizer.param_groups]
-                for g in optimizer.param_groups:
-                    g["lr"] = g["lr"] * step_lr_mult
-            optimizer.step()
-            if self.ft is not None and cfg.finetune_anchor > 0:  # bounded drift: toward the original weights
-                self.ft.pull_to_base(current_lr(optimizer, scheduler) * cfg.finetune_anchor)
-            if self.id_align_opt is not None and (cfg.id_align or cfg.body_align):
-                self.id_align_opt.step()
-            if step_lr_mult != 1.0:
-                for g, lr0 in zip(optimizer.param_groups, saved_lrs):
-                    g["lr"] = lr0
-            if self.ema is not None:
-                self.ema.update(step_images)
+            if bad_gradients(params, grad_norm):  # the step counts, but nothing of it reaches the LoRA
+                self._skip_bad_step(step + 1)
+                if not math.isfinite(accum_loss):  # (the chart and the running average stay readable)
+                    accum_loss = losses[-1] if losses else 0.0
+            else:
+                self.bad_steps = 0
+                step_lr_mult *= self._clean_lr_scale(  # clean_share: half the lr on the lower-share epochs
+                    cfg, step, self.batcher, cfg.batch_size * cfg.gradient_accumulation * n_dev)
+                step_lr_mult = limit_step_mult(cfg, step_lr_mult)
+                if step_lr_mult != 1.0:  # true per-image lr: scale this step only (the scheduler restores it)
+                    saved_lrs = [g["lr"] for g in optimizer.param_groups]
+                    for g in optimizer.param_groups:
+                        g["lr"] = g["lr"] * step_lr_mult
+                optimizer.step()
+                if self.ft is not None and cfg.finetune_anchor > 0:  # bounded drift: toward the original weights
+                    self.ft.pull_to_base(current_lr(optimizer, scheduler) * cfg.finetune_anchor)
+                if self.id_align_opt is not None and (cfg.id_align or cfg.body_align):
+                    self.id_align_opt.step()
+                if step_lr_mult != 1.0:
+                    for g, lr0 in zip(optimizer.param_groups, saved_lrs):
+                        g["lr"] = lr0
+                if self.ema is not None:
+                    self.ema.update(step_images)
             scheduler.step()
             if retries0 is not None:
                 self._ease_memory_pressure(retries0)
@@ -1487,12 +1519,8 @@ class Trainer(RaceParallelMixin):
                     self.save(injected, step)
             elif self.ft is not None and self.ft_pending_save and self._finetune_cycle_done(step) and step < cfg.steps:
                 self.save(injected, step)
-            state_every = cfg.save_state_every or cfg.save_every
-            if (cfg.save_state and state_every > 0 and step % state_every == 0 and step < cfg.steps
-                    and not self._race_running()):
-                self.save_state(step, injected, optimizer, scheduler, gen, rng)  # (a race keeps no states)
             if cfg.sample_prompts and cfg.sample_every > 0 and step % cfg.sample_every == 0 and step < cfg.steps:
-                self.sample_images(model, step)
+                self._side_job(f"Sampling at step {step}", lambda: self.sample_images(model, step))
                 model.train()
             racing = self._race_running()
             final_too = self.race is not None and self.race.schedule.keeps_all  # scored at the end like the others
@@ -1500,19 +1528,19 @@ class Trainer(RaceParallelMixin):
             rounds = self._selftrain_rounds(cfg)
             # probe_async: act on a probe the probe GPU has finished (a self-training round waits for it: its bar is
             # the latest score)
-            stop = self.probe_worker is not None and self._probe_async_take(step, optimizer, scheduler,
-                                                                             wait=step in rounds)
+            stop = self.probe_worker is not None and probe_safely(
+                lambda: self._probe_async_take(step, optimizer, scheduler, wait=step in rounds))
             if self.controller is not None and (step % cfg.probe_every == 0 and (step < cfg.steps or racing
                                                                                   or final_too) or last):
                 if self.probe_worker is not None and not last:
-                    stop = self._probe_async_take(step, optimizer, scheduler, wait=True) or stop
+                    stop = probe_safely(lambda: self._probe_async_take(step, optimizer, scheduler, wait=True)) or stop
                 if self.probe_worker is not None and not last:  # queued on the probe GPU; training goes on
                     if not stop:
-                        self._probe_async_start(step, injected)
+                        probe_safely(lambda: self._probe_async_start(step, injected))
                         if step in rounds:
-                            stop = self._probe_async_take(step, optimizer, scheduler, wait=True)
+                            stop = probe_safely(lambda: self._probe_async_take(step, optimizer, scheduler, wait=True))
                 else:  # (also when the probe process failed: from then on probes render here)
-                    stop = self.run_probe(model, step, optimizer, scheduler, injected)
+                    stop = probe_safely(lambda: self.run_probe(model, step, optimizer, scheduler, injected))
                     model.train()
                 if racing:  # the race decides who goes on: record, maybe drop, and switch configuration
                     stop = False
@@ -1524,16 +1552,21 @@ class Trainer(RaceParallelMixin):
                          " at the highest resolution" if cfg.resolution_step_up else "", step)
                 break
             if step in rounds:  # in a race, the configuration training now: its own setting and its own steps
-                self._self_train_round(model, step, rounds.index(step) + 1)
+                self._side_job(f"The self-training round at step {step}",
+                               lambda: self._self_train_round(model, step, rounds.index(step) + 1))
                 model.train()
             if self._race_running() and self._race_manual_drops(step, losses, id_losses):
                 bind(self.race.active)  # the configuration that trained was dropped: the next one takes over
                 model.train()
+            state_every = cfg.save_state_every or cfg.save_every  # (after the probe: the state holds its result)
+            if (cfg.save_state and state_every > 0 and step % state_every == 0 and step < cfg.steps
+                    and self.race is None and self.ft is None):
+                self.save_state(step, injected, optimizer, scheduler, gen, rng)  # (a race keeps no states)
             if self.stop_file.exists():
                 log.info("Stop requested at step %d", step)
                 break
         if self.probe_worker is not None:  # a probe still rendering when training stopped: its score still counts
-            self._probe_async_take(step, optimizer, scheduler, wait=True)
+            probe_safely(lambda: self._probe_async_take(step, optimizer, scheduler, wait=True))
         if self.compiled:
             compiling.report("end of training")
             self._save_compile_cache()
@@ -1543,10 +1576,13 @@ class Trainer(RaceParallelMixin):
         if self.ft is not None:
             self.ft.deactivate()  # the last window's update into the deltas before the final extraction
         path = self.save(injected, step, final=True)
-        if cfg.save_state and not self._race_running() and self.ft is None:
+        self.crash_save = None
+        if self.skipped_steps:
+            log.warning("%d step(s) of this run were left out for non-finite gradients", self.skipped_steps)
+        if cfg.save_state and self.race is None and self.ft is None:
             self.save_state(step, injected, optimizer, scheduler, gen, rng)
         if cfg.sample_prompts:
-            self.sample_images(model, step)
+            self._side_job("The final samples", lambda: self.sample_images(model, step))
         if self.race is not None:
             self._race_decide()
             self._race_report()
@@ -1729,16 +1765,19 @@ class Trainer(RaceParallelMixin):
         state_dir = self.job_dir / f"state_{step:06d}"
         state_dir.mkdir(exist_ok=True)
         lora_mod.save_lora(injected, state_dir / "lora.safetensors", dtype=torch.float32, fmt=self.arch.lora_format)
-        torch.save({
-            "step": step, "res_stage": self.res_stage, "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "torch_gen": gen.get_state(), "py_rng": rng.getstate(), "torch_rng": torch.get_rng_state(),
-            "ts_strata": getattr(self, "ts_strata", None) and self.ts_strata.state_dict(),
-            "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-            "config": self.cfg.to_dict(),
-            "ema": self.ema.state_dict() if self.ema is not None else None,  # lora.safetensors holds the raw weights
-            "dp_counts": self.balancer.counts if self.balancer is not None else None,
-        }, state_dir / "train_state.pt")
+        controller = getattr(self, "controller", None)
+        with atomic.writing(state_dir / "train_state.pt") as tmp:  # written last: a folder that has it is complete
+            torch.save({
+                "step": step, "res_stage": self.res_stage, "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "torch_gen": gen.get_state(), "py_rng": rng.getstate(), "torch_rng": torch.get_rng_state(),
+                "ts_strata": getattr(self, "ts_strata", None) and self.ts_strata.state_dict(),
+                "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                "config": self.cfg.to_dict(),
+                "ema": self.ema.state_dict() if self.ema is not None else None,  # lora.safetensors: the raw weights
+                "dp_counts": self.balancer.counts if self.balancer is not None else None,
+                "controller": controller.resume_state() if controller is not None else None,
+            }, tmp)
         log.info("Saved training state %s", state_dir)
         self.status.data["states"].append(str(state_dir))
         if self.cfg.keep_states > 0:
@@ -1752,6 +1791,51 @@ class Trainer(RaceParallelMixin):
                     self.status.data["states"].remove(str(old))
         self.status.write()
         return state_dir
+
+    def _skip_bad_step(self, step: int) -> None:
+        """A step with non-finite gradients is left out. Many in a row end the run (its LoRA still healthy, which
+        run() saves); a race goes on, since the configuration's probes then drop it."""
+        self.bad_steps += 1
+        self.skipped_steps += 1
+        log.warning("Step %d left out: its gradients are not finite; the LoRA is unchanged (%d in a row)", step,
+                    self.bad_steps)
+        self.status.update(skipped_steps=self.skipped_steps)
+        if self.race is None and self.bad_steps >= BAD_STEP_LIMIT:
+            raise RuntimeError(f"The gradients were not finite for {self.bad_steps} steps in a row: the run is "
+                               "diverging. Try a lower learning rate or another quantized backward")
+
+    def _emergency_save(self, injected, params, step: int, state: tuple | None = None) -> None:
+        """The LoRA as it stands in a normal checkpoint file, and a training state to resume from when `state`
+        (optimizer, scheduler, generator, rng) is given."""
+        if not all(bool(torch.isfinite(p).all()) for p in params):
+            log.error("Nothing saved after the error: the LoRA holds non-finite weights at step %d", step)
+            return
+        log.info("Saved the LoRA of step %d after the error: %s", step, self.save(injected, step))
+        if state is not None:
+            log.info("To continue, resume from %s", self.save_state(step, injected, *state))
+
+    def _save_after_crash(self) -> None:
+        """The run failed: the weights are still in memory, so keep what it learned since the last save."""
+        save, self.crash_save = self.crash_save, None
+        if save is None:
+            return
+        self.status.update(stage="saving after the error")
+        try:
+            free_cuda()
+            save()
+        except Exception:  # noqa: BLE001
+            log.exception("Could not save after the error")
+
+    def _side_job(self, what: str, job, fallback=None):
+        """Run a render between training steps (samples, a probe, a self-training round): when it fails, that round is
+        lost and training goes on. The renders restore the model and the memory they took as they unwind."""
+        try:
+            return job()
+        except Exception as e:  # noqa: BLE001
+            log.exception("%s failed; training goes on without it", what)
+            self.status.update(stage="training", side_job_error=f"{what}: {type(e).__name__}: {e}")
+            free_cuda()
+            return fallback
 
     def _save_compile_cache(self) -> None:
         t0 = time.time()
@@ -1816,7 +1900,34 @@ class Trainer(RaceParallelMixin):
         self.res_stage = int(st.get("res_stage", 0))
         self.resumed_ema = st.get("ema")  # None in states saved without an average (or by an older version)
         self.resumed_dp_counts = st.get("dp_counts")
+        self.resumed_controller = st.get("controller")
         return int(st["step"])
+
+    def _resume_controller(self) -> None:
+        """A resumed run carries on with the likeness controller it had: its scale, best scores, patience, smoothing
+        and what it was doing to the run. The best files in the job folder count too, so a state saved before them
+        (or by an older version, which kept no controller) cannot replace them with a worse one."""
+        ctrl, cfg = self.controller, self.cfg
+        if self.resumed_controller:
+            ctrl.load_resume_state(self.resumed_controller)
+            if ctrl.id_loss_vetoed:
+                self.id_loss = None
+            if ctrl.face_bias:
+                self._apply_face_bias(ctrl.face_bias)
+            log.info("Likeness controller restored from the training state: %d probes, best %s at step %s", ctrl.n_probes,
+                     ctrl.best, ctrl.best_step)
+        else:
+            log.warning("This training state has no likeness controller (an older version saved it): the likeness "
+                        "scale, patience and smoothing start over")
+        for kind in ("", "face", "body"):
+            name = f"{cfg.job_name}{self._best_tag()}_best{'_' + kind if kind else ''}.safetensors"
+            key = f"likeness_best_{kind}" if kind else "likeness_best"
+            try:
+                meta = lora_mod.read_metadata(self.job_dir / name)
+                ctrl.note_saved_best(float(meta[key]), int(meta["ss_steps"]), kind)
+            except (OSError, KeyError, ValueError):  # no such file yet (or not one a probe wrote)
+                continue
+        self.status.update(likeness=ctrl.state())
 
     # ------------------------------------------------------------ sampling
     def _lora_names(self, model, blocks) -> list[str]:
@@ -3465,7 +3576,7 @@ class Trainer(RaceParallelMixin):
         picture is not upscaled to, at selftrain_weight; latents and region maps in <job>/selftrain/cache. Returns
         the items added."""
         from . import regions as R
-        from .dataset import Item, bucket_size
+        from .dataset import Item, _hash, bucket_size
         from .facesim import image_size
 
         cfg = self.cfg
@@ -3480,7 +3591,7 @@ class Trainer(RaceParallelMixin):
                 if side * side > w * h * 1.05:  # an upscaled picture teaches blur
                     continue
                 bw, bh = bucket_size(w, h, cfg, side)
-                stem = f"{p.stem}_{bw}x{bh}"
+                stem = f"{p.stem}_{_hash(R._file_key(p))}_{bw}x{bh}"  # (a job run again renders the same names)
                 new.append(Item(image=p, caption=prompt, width=bw, height=bh,
                                 latent_path=cache / f"{stem}{tag}.safetensors",
                                 latent_flip_path=(cache / f"{stem}_flip{tag}.safetensors") if cfg.flip_augment
@@ -3837,7 +3948,7 @@ class Trainer(RaceParallelMixin):
         """Act on a scored probe: the controller's update, its record and log line, best saves (from `injected`, the
         weights that were scored) and actions. now: the training step it is acted on at (an async probe lands
         later than the step it scored). Returns True to stop training."""
-        from .likeness import append_record, apply_lr_ratio, curriculum_weights, timestep_logit_shift
+        from .likeness import append_record, apply_lr_ratio
 
         cfg = self.cfg
         now = step if now is None else now
@@ -3919,13 +4030,7 @@ class Trainer(RaceParallelMixin):
             apply_lr_ratio(optimizer, scheduler, actions["lr_ratio"])
             log.info("Likeness lr control: factor now x%.2f (lr %.2e)", rec.lr_factor, current_lr(optimizer, scheduler))
         if "face_bias" in actions and self.batcher is not None:
-            bias = actions["face_bias"]
-            if self.item_face_frac:
-                self.curriculum_w = curriculum_weights(self.batcher.items, self.item_face_frac, bias)
-                self._refresh_batcher_weights()
-            self.ts_logit_shift = timestep_logit_shift(bias)
-            log.info("Curriculum: face bias %+.2f -> %s images favoured, timestep logit shift %+.2f", bias,
-                     "face-heavy" if bias > 0 else "body/other", self.ts_logit_shift)
+            self._apply_face_bias(actions["face_bias"])
         probes = self.status.data.get("probes", [])
         from dataclasses import asdict
 
@@ -3933,6 +4038,17 @@ class Trainer(RaceParallelMixin):
         self.status.update(probes=probes[-500:], likeness=self.controller.state(), stage="training")
         self._save_history()
         return bool(actions.get("stop"))
+
+    def _apply_face_bias(self, bias: float) -> None:
+        """The curriculum's face bias: which images come up more often, and the timestep shift."""
+        from .likeness import curriculum_weights, timestep_logit_shift
+
+        if self.item_face_frac:
+            self.curriculum_w = curriculum_weights(self.batcher.items, self.item_face_frac, bias)
+            self._refresh_batcher_weights()
+        self.ts_logit_shift = timestep_logit_shift(bias)
+        log.info("Curriculum: face bias %+.2f -> %s images favoured, timestep logit shift %+.2f", bias,
+                 "face-heavy" if bias > 0 else "body/other", self.ts_logit_shift)
 
     # ------------------------------------------------------------ probes on a second GPU (probe_async; probeworker.py)
     def _probe_async_device(self) -> str:

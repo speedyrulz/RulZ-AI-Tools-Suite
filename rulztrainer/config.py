@@ -416,9 +416,9 @@ class TrainConfig:
     #                                 Replaces weight_decay, which would shrink the model's own weights toward zero
     lora_save_dtype: str = "bf16"  # bf16 | fp16 | fp32 for the exported LoRA files
     lora_ema: float = 0.98  # weight average (EMA) decay per image for saves, samples and probes; 0 = off (see ema.py)
-    save_state: bool = False  # also save optimizer/scheduler/RNG state (resumable); final state always saved
+    save_state: bool = True  # also save optimizer/scheduler/RNG state (resumable), and the final state with it
     save_state_every: int = 0  # steps between state saves; 0 = same as save_every
-    keep_states: int = 3  # rolling number of state folders to keep; 0 = keep all
+    keep_states: int = 1  # rolling number of state folders to keep; 0 = keep all
     resume_state: str = ""  # path to a state_XXXXXX directory to resume training from
     compile_model: bool | str = "auto"  # torch.compile the DiT blocks: true | false | auto (runs of 100+ steps on a GPU
     #                                     with triton; measured 26% faster per step on MOSS-Image, 12% on Krea 2)

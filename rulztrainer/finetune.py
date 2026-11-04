@@ -44,10 +44,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
 from torch import nn
 
 from . import quant as Q
+from .atomic import save_safetensors
 
 log = logging.getLogger("rulztrainer")
 
@@ -341,7 +342,7 @@ class FineTuner:
             state[name + ".delta"] = d.to("cpu", torch.bfloat16).contiguous()
         meta = {"rulztrainer_finetune": "deltas", "format": "pt"}
         meta.update({k: (v if isinstance(v, str) else json.dumps(v)) for k, v in (metadata or {}).items()})
-        save_file(state, str(path), metadata=meta)
+        save_safetensors(state, path, metadata=meta)
         return Path(path)
 
     def load_delta(self, path) -> int:

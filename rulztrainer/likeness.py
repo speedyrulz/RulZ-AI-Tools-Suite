@@ -197,6 +197,13 @@ class ProbeRecord:
     copy_baseline: float | None = None
 
 
+# what a training state keeps of the controller (ceilings and shapes come back from the references and the config)
+RESUME_FIELDS = ("floor", "face_ema", "body_ema", "gold_ema", "has_gold", "combined_ema", "arc_combined_ema",
+                 "prev_combined", "best", "best_step", "since_improve", "progress", "lr_factor", "face_bias",
+                 "n_probes", "last_step", "last_seeds", "stage", "stage_best", "stage_since_improve", "face_best",
+                 "face_drop_count", "id_loss_vetoed", "part_best")
+
+
 class LikenessController:
     def __init__(self, cfg, face_ceiling: float | None = None, body_ceiling: float | None = None,
                  gold_ceiling: float | None = None):
@@ -442,6 +449,25 @@ class LikenessController:
         if "step_up" in actions:
             self.enter_stage(actions["step_up"])
         return rec, actions
+
+    def resume_state(self) -> dict:
+        """Everything a resumed run needs to carry on deciding as this one would (state() is the Monitor's view)."""
+        return {k: getattr(self, k) for k in RESUME_FIELDS}
+
+    def load_resume_state(self, saved: dict) -> None:
+        for k in RESUME_FIELDS:
+            if k in saved:
+                setattr(self, k, saved[k])
+        self.stage = min(self.stage, self.n_stages - 1)
+
+    def note_saved_best(self, score: float, step: int, kind: str = "") -> None:
+        """A best checkpoint already on disk ("", "face" or "body"), which may be newer than the training state: only
+        a higher score replaces it."""
+        if kind:
+            if kind not in self.part_best or score > self.part_best[kind][0]:
+                self.part_best[kind] = (score, step)
+        elif self.best is None or score > self.best:
+            self.best, self.best_step = score, step
 
     def state(self) -> dict:
         return {"best": self.best, "best_step": self.best_step, "since_improve": self.since_improve,
