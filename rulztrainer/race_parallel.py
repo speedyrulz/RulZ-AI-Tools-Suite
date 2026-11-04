@@ -52,9 +52,11 @@ def forward_backward(job):
     per = sq.mean(dim=(1, 2, 3))
     if regions is not None and cfg.region_weights and cfg.region_prior_weight > 0 and bool(regions.prior.any()):
         lora_mod.set_multiplier(rinj, 0.0)
-        with torch.no_grad():
-            base_pred = rmodel(noisy_in, sigma * 1000.0, embeds, mask).float()
-        lora_mod.set_multiplier(rinj, 1.0)
+        try:
+            with torch.no_grad():
+                base_pred = rmodel(noisy_in, sigma * 1000.0, embeds, mask).float()
+        finally:  # an out-of-memory retry must not train with the LoRA switched off
+            lora_mod.set_multiplier(rinj, 1.0)
         pm = regions.prior.to(rdev).float()
         prior = ((pred - base_pred).pow(2) * pm).sum(dim=(1, 2, 3)) / (pm.sum(dim=(1, 2, 3)) * pred.shape[1]).clamp(min=1)
         per = per + cfg.region_prior_weight * prior
@@ -254,10 +256,12 @@ class RaceParallelMixin:
             race_mod.collect_grads(v, [self.replicas[r][1] for r in reps])
             grad_norm = step_grad_norm(st["params"], cfg.clip_norm)
             if bad_gradients(st["params"], grad_norm):  # the step counts, but nothing of it reaches the LoRA
-                self._skip_bad_step(st["step"] + 1)
+                st["bad_steps"] = st.get("bad_steps", 0) + 1  # each configuration's own streak
+                self._skip_bad_step(st["step"] + 1, st["bad_steps"])
                 if not math.isfinite(by_lane[v.idx]):
                     by_lane[v.idx] = st["losses"][-1] if st["losses"] else 0.0
             else:
+                st["bad_steps"] = 0
                 observe = getattr(st["optimizer"], "observe", None)
                 if observe is not None:  # Keel: the step's noise levels (its bands)
                     for s in sigmas.get(v.idx, ()):
