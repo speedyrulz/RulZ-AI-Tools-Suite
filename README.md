@@ -232,6 +232,41 @@ fork or branch. `Dockerfile` builds an image with the install baked in (`FROM va
 same supervisor wiring) for faster instance starts: build, push and use it as the template image; the provisioning
 variable is then unnecessary.
 
+**Working on an instance from your own computer.** `scripts/vast/rulz_remote.py` reaches the RulzTrainer on an instance
+over ssh: its runs, logs and likeness probes, starting and stopping runs, and fetching their files. It is made for an
+AI assistant with a shell as much as for you: tell Claude Code that an instance is up and ask it to run a test, and it
+can start the run, watch it and read the probes itself. You need the `vastai` CLI with your API key and an ssh key
+added to your vast.ai account (Account -> SSH Keys); nothing has to be installed on the instance, and an instance that
+is already running works as it is.
+
+```bash
+python scripts/vast/rulz_remote.py connect                  # find the running instance, test ssh, show its state
+python scripts/vast/rulz_remote.py jobs                     # every run: step, loss, best probe
+python scripts/vast/rulz_remote.py log my_lora -n 200       # train.log; --console for tracebacks, --grep REGEX
+python scripts/vast/rulz_remote.py probes my_lora --last 5  # the likeness scores of the last probes
+python scripts/vast/rulz_remote.py pull my_lora --what logs --what probes   # to ~/.rulz_vast/runs/<instance>
+python scripts/vast/rulz_remote.py start --job test1 --from my_lora --set steps=300 --set probe_every=50
+python scripts/vast/rulz_remote.py wait test1               # blocks until the run ends
+```
+
+| Command | What it does |
+|---|---|
+| `connect` | Finds the instance with the `vastai` CLI (`--instance ID` when several run) and tries its direct port, then vast's ssh proxy. `--wait 600` waits for one still installing; `--attach-key` adds your ssh key to an instance rented before you added it to the account |
+| `status`, `jobs`, `job NAME` | GPU, disk and queue; every run; one run's numbers |
+| `log`, `probes`, `config NAME --diff OTHER` | Logs, likeness scores, and the settings two runs differ in |
+| `pull NAME` | Copies `--what logs` (default), `probes`, `samples`, `loras`, `best` or `all`, optionally of one `--step`. Files already here at their size are skipped, so it can repeat during a run |
+| `start --job NAME` | Queues a run from `--from JOB` or a local `--config FILE`, with `--set KEY=VALUE` and `--preset`. `--dry-run` shows what would change and queues nothing. It refuses a job name in use and an existing job folder unless `--overwrite` |
+| `wait NAME` | Blocks until the run ends (or `--step N`), riding out dropped connections. Exit status 0 finished, 1 failed, 2 `--timeout`, 3 unreachable |
+| `stop`, `stop --kill`, `queue` | The WebUI's Stop and Kill; the queue, with `queue pause`, `resume` and `remove ID` |
+| `sync` | Copies this checkout's code to the instance, to test a change before a release. It refuses while a job runs; `--restart-webui` restarts the WebUI on the new code. It only adds and overwrites |
+| `push PATH FOLDER`, `ssh -- COMMAND` | Copies files up (a dataset into `datasets`); runs anything in the install folder |
+
+Reading changes nothing on the instance. A run started this way goes through the WebUI's queue, so it shows on the
+Monitor like one you queued yourself and waits its turn behind a running job, and Stop on the page stops it. The tool
+never rents, stops or destroys an instance, so an instance you leave running keeps billing. Its own files (the route to
+the instance, the host keys, pulled runs) are in `~/.rulz_vast`; `RULZ_VAST_INSTANCE`, `RULZ_VAST_KEY`, `RULZ_VAST_DIR`
+and `RULZ_VAST_HOME` set the defaults. In Git Bash, set `MSYS_NO_PATHCONV=1` or paths like `/workspace/x` get rewritten.
+
 ## How it trains
 
 - **Caching first.** On the first run the Flux2 VAE encodes every image into normalized 128-channel
@@ -2674,7 +2709,8 @@ webui.py           NiceGUI web UI (runs training as a subprocess)
 configs/           example configs
 tests/             smoke tests (no weights needed): python -m pytest tests
 install.bat / run_webui.bat   Windows install and start;  install.sh / run_webui.sh   the same for Linux
-scripts/vast/      vast.ai: provision.sh (PROVISIONING_SCRIPT), supervisor wrapper + conf, create_template.sh
+scripts/vast/      vast.ai: provision.sh (PROVISIONING_SCRIPT), supervisor wrapper + conf, create_template.sh,
+                   rulz_remote.py (reach an instance's runs from your computer) and its instance side rulz_agent.py
 scripts/bench.py   short timing runs that wait for idle GPUs (s/step, warm-up, peak memory)
 Dockerfile         optional vast.ai image with the install baked in
 ```
