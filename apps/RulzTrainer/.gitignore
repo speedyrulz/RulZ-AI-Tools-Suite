@@ -9,3 +9,4 @@ venv/
 configs/*
 !configs/example.yaml
 .webui_job.json
+.webui_form.json
