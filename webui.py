@@ -1419,7 +1419,7 @@ class Form:
             automagic_clip_threshold=float(v("automagic_clip_threshold")),
             automagic_sensitivity_quantile=float(v("automagic_sensitivity_quantile")), automagic_vote=v("automagic_vote"),
             automagic_max_lr_change=float(v("automagic_max_lr_change")),
-            hull_rho=float(v("hull_rho")),
+            hull_rho=float(v("hull_rho")), hull_regions=v("hull_regions"), hull_gain_body=float(v("hull_gain_body")),
             keel_gauge=bool(v("keel_gauge")), keel_gauge_eps=float(v("keel_gauge_eps")),
             keel_cautious=bool(v("keel_cautious")), keel_pair_sigma=bool(v("keel_pair_sigma")),
             keel_bands=int(v("keel_bands")), keel_band_weights=str(v("keel_band_weights") or "").strip(),
@@ -3683,6 +3683,9 @@ RACE_LABELS = {
     "hull_rho": "Hull step", "hull_betas": "Hull betas", "hull_state_dtype": "Hull momentum dtype",
     "hull_clip": "Hull channel clip", "hull_factor_cap": "Hull factor cap", "hull_safety_cap": "Hull safety cap",
     "hull_gain_max": "Hull largest gain", "hull_ns_iters": "Hull matrix-root iterations",
+    "hull_regions": "Hull body regions", "hull_gain_body": "Hull body gain",
+    "hull_gain_background": "Hull background gain", "hull_ring_cells": "Hull outline width",
+    "hull_face_safe": "Hull face-safe excess", "hull_retreat": "Hull excess retreat",
     "hull_damping": "Hull damping",
     "keel_gauge": "Keel gauge preconditioner", "keel_gauge_eps": "Keel gauge eps", "keel_cautious": "Keel cautious mask",
     "keel_pair_sigma": "Keel paired sigma", "keel_bands": "Keel noise bands", "keel_band_weights": "Keel band weights",
@@ -7320,6 +7323,16 @@ def build_page(local: bool = True):
                                 .tooltip("How far each step moves a layer, as a share of that layer's own weight. "
                                          "Required: there is no default yet, and no race has measured a good value "
                                          "(docs/hull-optimizer.md). The learning-rate schedule acts on it.")
+                            w["hull_regions"] = ui.select({"off": "Off", "parts": "Body parts"}, value=d.hull_regions,
+                                                          label="Hull body regions").classes("w-40") \
+                                .tooltip("Experimental, not yet raced. Body parts finds skin, hair and clothes in each "
+                                         "photo and pushes the update harder on body skin and the body's outline. The "
+                                         "face keeps its own share. It scans the photos once, turns torch.compile off, "
+                                         "and refuses flip augmentation and region-weighted loss.")
+                            w["hull_gain_body"] = ui.number("Hull body gain", value=d.hull_gain_body, min=0.5, max=2,
+                                                            step=0.1).classes("w-32") \
+                                .bind_visibility_from(w["hull_regions"], "value", lambda x: x == "parts") \
+                                .tooltip("How much harder body cells push the update. 1 changes nothing.")
                         with ui.column().classes("w-full gap-2").bind_visibility_from(
                                 w["optimizer"], "value", lambda x: x in AUTOMAGIC):
                             hint("Automagic tunes its own learning rate (the learning rate above is its start); LR "
