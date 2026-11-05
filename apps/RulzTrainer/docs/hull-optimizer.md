@@ -5,13 +5,16 @@ Status: H0, the base rule, is built (`rulztrainer/optimizers/hull.py`, `tests/te
 2000 steps it ties AdamW so far: best smoothed scores 42.4, 57.2 and 40.0 against 38.8 and 45.0, the 57.2 being the one
 run that memorised a photo (SSCD 0.61), so differences of about 15 points between single runs can be chance. The first
 part of M1b is built and off by default: the parts tensor (5.2), C1 and C3 (5.1, 5.3) with the cosine retreat
-(`hull_regions: parts`, `tests/test_hull_regions.py`). Raced at gain 1.5 on H0 (Miniloona, 0.25 MP, 2000 steps, one RTX
+(`hull_regions: parts`, `tests/test_hull_regions.py`). Raced at gain 1.5 on H0 (one fictional character, 0.25 MP, 2000 steps, one RTX
 5090), it did not raise the body: best smoothed score 35.6 against 35.8 (seed 1234) and 26.3 against 41.0 (seed 42), mean
 body score from step 1000 on 14.5 against 14.5 and 14.0 against 19.6, SSCD at most 0.45, within the limit. A race whose
 two rows ran the same plain Hull, by a bug since fixed, gave 37.4 and 40.9. Two seeds fall far short of the section 11
 bar, so this does not close R3. M0(d) then showed no case for it: body gradients agree no better than face or background
 ones, and body falls below background on purity (section 5.1, first reading). So C1 stays off, and the detail gate, the
-held-out-loss retreat and G are not worth building on this evidence. Not built yet: those, the `adam` base and everything
+held-out-loss retreat and G are not worth building on this evidence. A first A/A reading (`docs/keel-test-results.md`,
+four runs each of H0 and AdamW 8-bit on one character) could not tell them apart: best smoothed score 33.5 against 33.6,
+difference -0.1 ± 6.4, body +1.8 ± 4.1, with identical runs up to 10 points apart. That shows no gain from H0 and does
+not show non-inferiority, so M1a's kill rule is still open. Not built yet: those, the `adam` base and everything
 from M2 on. Everything else here is design. Every number below is a starting value to race unless it is cited, measured in
 a synthetic benchmark or computed, and then it carries a tag. Working name "Hull": Keel is a ship's spine, the hull
 its whole body and skin. Hull is for any character LoRA; Qwen-Image 2.1 is the main target.
@@ -356,7 +359,7 @@ First reading, one RTX 5090 at 0.25 MP, one run each, same seed, steps 25-80, no
 off, +2.2% over H0 with compile on (compile itself was +6.3% here), peak memory unchanged at 23.8 GB. So the gate is
 close and unsettled: the 16 GB cards and 1 MP are unmeasured, and syncs were not counted.
 
-**First reading of M0(d)** (`scripts/hull_agreement.py`). One fictional subject (Miniloona), not the synthetic subjects
+**First reading of M0(d)** (`scripts/hull_agreement.py`). One fictional subject, not the synthetic subjects
 M0 calls for, 0.25 MP, 800 steps, seeds 42 and 1234, plain Hull, parts of G in the balanced frame with Hull's normaliser,
 unit norm per step. A random-sign copy of the body part is the control: it reads 0.228 on tensor coherence, the 0.23
 floor, and 0.24 on element purity, since real gradients are heavy tailed. Medians over the 448 of 514 tensors that see
