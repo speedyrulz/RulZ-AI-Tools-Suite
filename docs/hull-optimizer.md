@@ -9,8 +9,10 @@ part of M1b is built and off by default: the parts tensor (5.2), C1 and C3 (5.1,
 5090), it did not raise the body: best smoothed score 35.6 against 35.8 (seed 1234) and 26.3 against 41.0 (seed 42), mean
 body score from step 1000 on 14.5 against 14.5 and 14.0 against 19.6, SSCD at most 0.45, within the limit. A race whose
 two rows ran the same plain Hull, by a bug since fixed, gave 37.4 and 40.9. Two seeds fall far short of the section 11
-bar, so this does not close R3, but C1 stays off until M0's body-agreement measurement shows a reason to expect a gain. Not built yet: the detail gate, the held-out-loss retreat, the
-`adam` base and everything from M2 on. Everything else here is design. Every number below is a starting value to race unless it is cited, measured in
+bar, so this does not close R3. M0(d) then showed no case for it: body gradients agree no better than face or background
+ones, and body falls below background on purity (section 5.1, first reading). So C1 stays off, and the detail gate, the
+held-out-loss retreat and G are not worth building on this evidence. Not built yet: those, the `adam` base and everything
+from M2 on. Everything else here is design. Every number below is a starting value to race unless it is cited, measured in
 a synthetic benchmark or computed, and then it carries a tag. Working name "Hull": Keel is a ship's spine, the hull
 its whole body and skin. Hull is for any character LoRA; Qwen-Image 2.1 is the main target.
 
@@ -354,6 +356,28 @@ First reading, one RTX 5090 at 0.25 MP, one run each, same seed, steps 25-80, no
 off, +2.2% over H0 with compile on (compile itself was +6.3% here), peak memory unchanged at 23.8 GB. So the gate is
 close and unsettled: the 16 GB cards and 1 MP are unmeasured, and syncs were not counted.
 
+**First reading of M0(d)** (`scripts/hull_agreement.py`). One fictional subject (Miniloona), not the synthetic subjects
+M0 calls for, 0.25 MP, 800 steps, seeds 42 and 1234, plain Hull, parts of G in the balanced frame with Hull's normaliser,
+unit norm per step. A random-sign copy of the body part is the control: it reads 0.228 on tensor coherence, the 0.23
+floor, and 0.24 on element purity, since real gradients are heavy tailed. Medians over the 448 of 514 tensors that see
+image tokens, steps 100-800, above that control, seed 42 / 1234:
+
+| part | coherence | purity |
+|---|---|---|
+| body | +0.0037 / +0.0031 | +0.0044 / +0.0035 |
+| face | +0.0038 / +0.0039 | +0.0034 / +0.0036 |
+| background | +0.0025 / +0.0021 | +0.0055 / +0.0046 |
+| whole gradient | +0.0036 / +0.0036 | +0.0011 / +0.0007 |
+
+The region gate, body above background, fails on purity on both seeds (body led in 38% and 43% of tensors, about a third
+late on), though coherence leans the other way. G's condition, body at or above face, is a tie. The excess above the
+floor means about 0.2% of a step's gradient energy is consistent [computed], and that holds for the whole gradient too,
+so a low reading is not proof that a part carries no signal. Body parts hold about 17% of the gradient's energy, face
+26%, background 26%. Two runs of one config are not identical: one tensor's reading differed by about 0.005 between
+them over the first 40 steps. The EMA window mixes photos with noise draws and timesteps, so this cannot say which of them causes the
+disagreement, and the snapshots overlap, so differences this small are not resolved. It fits the races, where gain 1.5
+did not raise the body, but does not explain seed 42's loss.
+
 **Risks.** Body gradients that disagree across poses and outfits make the gain amplify nuisance (M0's agreement gate);
 the token path says where the LoRA acts, not which loss asked (M0 compares loss-path attribution); unarmed replicas
 dilute the gain (M2 arms them; races use one card until then).
@@ -529,7 +553,8 @@ hacked without its KL term, 10% for the full method with the KL term and its ref
   weights only where environments agree. [N] At beta 0.9 pure noise reads 0.23 and SNR 0.5 reads 0.55; an element seen
   in 30% of photos keeps its purity (0.88 -> 0.93 at SNR 1) while Adam's |m̂| / sqrt(v̂) halves (0.71 -> 0.37); one
   10-sigma photo makes 74% of noise elements read above 0.5 (7% without). **Only if M0 shows body-cell purity at or
-  above face-cell purity**; otherwise it favours the face. Stored-frame purity is not O(r)-invariant [H].
+  above face-cell purity**; otherwise it favours the face. Stored-frame purity is not O(r)-invariant [H]. First reading:
+  a tie (section 5.1).
 - **D, subject against DOP.** DOP's own backward (`trainer.py:2738-2757`) is flagged by `observe(..., kind="dop")`; a
   post-accumulate-grad hook armed only inside a step (Keel's pattern) routes it to a second accumulator (4 B/weight on
   DOP steps). Per tensor, when <G_s, G_d>_U < 0, `pcgrad` projects both, `protect_prior` the subject gradient only
