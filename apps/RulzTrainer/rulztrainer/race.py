@@ -61,7 +61,8 @@ RACE_KEYS: dict[str, tuple[str, ...]] = {
         "keel_band_weights", "keel_consensus", "keel_consensus_power", "keel_consensus_mode", "keel_lookahead",
         "keel_lookahead_pullback", "keel_lookahead_lr", "keel_lookahead_grace", "keel_face_gain", "keel_face_gain_max",
         "keel_face_gain_beta", "keel_body_weight", "hull_rho", "hull_betas", "hull_state_dtype", "hull_clip",
-        "hull_factor_cap", "hull_safety_cap", "hull_gain_max", "hull_ns_iters", "hull_damping"),
+        "hull_factor_cap", "hull_safety_cap", "hull_gain_max", "hull_ns_iters", "hull_damping", "hull_regions",
+        "hull_gain_body", "hull_gain_background", "hull_ring_cells", "hull_face_safe", "hull_retreat"),
     "Timesteps & loss": (
         "timestep_sampling", "logit_mean", "logit_std", "sigmoid_scale", "timestep_shift", "clean_share", "logsnr_mean",
         "logsnr_std", "timestep_buckets",
@@ -92,7 +93,8 @@ RACE_KEYS: dict[str, tuple[str, ...]] = {
 ALLOWED = {k for keys in RACE_KEYS.values() for k in keys}
 # what a relay (race_follow) cannot change: the winner's weights must fit every configuration's LoRA as they are
 SHAPE_KEYS = tuple(k for k in RACE_KEYS["LoRA rank & layers"] if k != "lora_dropout")
-REGION_KEYS = ("face_loss_weight", "body_loss_weight", "background_loss_weight", "face_margin", "region_feather_cells")
+REGION_KEYS = ("face_loss_weight", "body_loss_weight", "background_loss_weight", "face_margin", "region_feather_cells",
+               "hull_regions", "hull_ring_cells")
 NAME_RE = re.compile(r"[A-Za-z0-9_.+-]{1,40}")
 
 

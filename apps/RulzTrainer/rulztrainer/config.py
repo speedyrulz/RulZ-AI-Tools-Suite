@@ -485,7 +485,14 @@ class TrainConfig:
     hull_clip: float = 5.0  # hull: per-channel RMS clip in the balanced frame (it replaces max_grad_norm)
     hull_factor_cap: float = 0.2  # hull: a step moves a factor by at most this share of its balanced norm
     hull_safety_cap: float = 0.0  # hull: the realised step's cap in steps of rho; 0 = 2 x max(1, hull_gain_max)
-    hull_gain_max: float = 2.0  # hull: the largest region gain (only sets the safety cap until the gains are built)
+    hull_gain_max: float = 2.0  # hull: the largest region gain, and with it the safety cap
+    hull_regions: str = "off"  # hull: off | parts (body cells get hull_gain_body in the update: design sections 5.1-5.3)
+    hull_gain_body: float = 1.5  # hull_regions parts: body skin and the silhouette ring, flat across noise levels
+    hull_gain_background: float = 1.0  # hull_regions parts: at most 1; face, text, hair and clothing stay at 1
+    hull_ring_cells: int = 1  # hull_regions parts: the silhouette ring's half width in 16 px cells
+    hull_face_safe: bool = True  # hull_regions parts: the gained excess cannot undo the face's part of a step (C3)
+    hull_retreat: float = 0.5  # hull_regions parts: a tensor whose gains oppose its gradient for a probe interval
+    #                            has its excess multiplied by this; it never rises
     hull_ns_iters: int = 30  # hull: Newton-Schulz iterations per matrix root
     hull_damping: float = 1e-6  # hull: the Grams' damping, as a fraction of their mean eigenvalue
     keel_body_weight: float = 1.0  # keel_fb: the body tokens' weight against the face's in the token gain (the
@@ -680,6 +687,7 @@ class TrainConfig:
     # configuration race (see race.py): the configurations train in turn, are probed, and the lowest is dropped
     race: bool = False
     race_configs: list[dict] = field(default_factory=list)  # [{"name": ..., <setting>: <value>, ...}], 2 or more
+    race_prep_regions: bool = False  # set by the trainer on a race's preparation config: some configuration needs maps
     race_warmup_probes: int = 0  # probe rounds before the first configuration is dropped
     race_drop_lowest: bool = True  # after each round the lowest-scoring configuration leaves
     race_drop_confidence: float = 0.0  # > 0 (0.9): the lowest leaves only when a paired test on the shared probe
@@ -835,6 +843,20 @@ class TrainConfig:
         if self.race and (self.face_gold != "facenet" or self.copy_check != "on"):
             raise ValueError("optimizer hull in a race needs face_gold: facenet and copy_check: on (the guards that "
                              "decide whether a row stays)")
+        if self.hull_regions not in ("off", "parts"):
+            raise ValueError(f"hull_regions must be off or parts, got {self.hull_regions!r}")
+        if not 0.5 <= self.hull_gain_body <= self.hull_gain_max or not 0.5 <= self.hull_gain_background <= 1.0:
+            raise ValueError("hull_gain_body must be in 0.5..hull_gain_max and hull_gain_background in 0.5..1")
+        if self.hull_ring_cells < 0 or not 0 < self.hull_retreat < 1:
+            raise ValueError("hull_ring_cells must be at least 0 and hull_retreat between 0 and 1")
+        if self.hull_regions == "parts":
+            if self.flip_augment:
+                raise ValueError("hull_regions parts refuses flip_augment: a mirrored mole or tattoo is another body")
+            if self.region_weights:
+                raise ValueError("hull_regions parts refuses region_weights: the body's emphasis would count twice")
+            if self.multi_gpu == "data_parallel" or self.race_parallel:
+                raise ValueError("hull_regions parts runs on the primary model copy only: multi_gpu data_parallel and "
+                                 "race_parallel would dilute or skip its gains")
 
     def validate(self) -> None:
         if self.optimizer.lower() == "hull":
@@ -1086,7 +1108,12 @@ class TrainConfig:
         """Region maps (face cells, landmarks, the subject's cells) are needed by the region-weighted loss, the identity
         loss, attention localization, identity alignment and Keel's face-token gain."""
         return bool(self.region_weights or self.id_loss_weight > 0 or self.attn_localize or self.id_align
-                    or self.body_align or (self.optimizer.lower() in KEEL and self.keel_face_gain > 0))
+                    or self.body_align or (self.optimizer.lower() in KEEL and self.keel_face_gain > 0)
+                    or self.wants_parts() or self.race_prep_regions)
+
+    def wants_parts(self) -> bool:
+        """Region maps carry the parser's parts tensor: Hull's region gains."""
+        return self.optimizer.lower() == "hull" and self.hull_regions == "parts"
 
     def wants_person_masks(self) -> bool:
         """Person masks in the region maps: the region-weighted loss's person weight, attention localization's

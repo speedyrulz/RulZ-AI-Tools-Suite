@@ -204,6 +204,86 @@ def _apply_extras(x, out, extras, extra_biases):
     return out
 
 
+class HullBackward(torch.autograd.Function):
+    """The LoRA's two linears for one batch, with Hull's region gains in the backward (design section 5.1). The forward
+    and the gradients autograd gets are the plain ones; on the side the sink receives each factor's gained excess and
+    face part, sum (w - 1) d h^T and sum face d h^T over the tokens. A custom Function because its saved x and h go
+    through activation checkpointing's saved-tensor hooks like autograd's own (a backward hook on the output would
+    have to keep them alive), and because the gains are ctx attributes, so a block's recompute leaves them alone."""
+
+    @staticmethod
+    def forward(ctx, x, a, b, arm):
+        h = nn.functional.linear(x, a)
+        ctx.save_for_backward(x, h, a, b)
+        ctx.arm = arm
+        return nn.functional.linear(h, b)
+
+    @staticmethod
+    def backward(ctx, du):
+        x, h, a, b = ctx.saved_tensors
+        sink, pa, pb, extra, face = ctx.arm
+        dh = du @ b
+        grad_b = (du.mT @ h).sum(0)
+        grad_a = (dh.mT @ x).sum(0)
+        grad_x = dh @ a if ctx.needs_input_grad[0] else None
+        e = extra[:, :, None]
+        ex_b, ex_a = ((du * e).mT @ h).sum(0), ((dh * e).mT @ x).sum(0)
+        fa_b = fa_a = None
+        if face is not None:
+            f = face[:, :, None]
+            fa_b, fa_a = ((du * f).mT @ h).sum(0), ((dh * f).mT @ x).sum(0)
+        sink(pa, pb, ex_a, ex_b, fa_a, fa_b)
+        return grad_x, grad_a, grad_b, None
+
+
+class HullArm:
+    """One batch's region gains on the image tokens, one tensor per sample (None: no gains on that sample): `extra`
+    w - 1 and `face` the face tokens' mask, row-major over the cells. `layout` is the alignment Taps' current layout
+    and `sink` the optimizer's add_excess. tokens() lays them over a layer's input: text tokens get no gain, a text-only
+    input is left to plain autograd."""
+
+    def __init__(self, extra: list, face: list, layout, sink):
+        self.extra, self.face, self.layout, self.sink = extra, face, layout, sink
+        self.cache: dict = {}
+
+    def tokens(self, x: torch.Tensor):
+        lay = self.layout()
+        if lay is None or x.ndim != 3 or not torch.is_grad_enabled():
+            return None
+        i0, n_img = lay["img"]
+        count, n_tok = x.shape[:2]
+        if n_tok == n_img:
+            i0 = 0
+        elif n_tok < i0 + n_img:
+            return None
+        key = (x.device, x.dtype, lay["sample"], count, n_tok, i0)
+        if key not in self.cache:
+            self.cache[key] = self._lay(x, lay["sample"], i0, n_img)
+        return self.cache[key]
+
+    def _lay(self, x: torch.Tensor, first: int, i0: int, n_img: int):
+        count, n_tok = x.shape[:2]
+        extra, face = None, None
+        for j in range(count):
+            e = self.extra[first + j] if first + j < len(self.extra) else None
+            if e is None or e.numel() != n_img:
+                continue
+            if extra is None:
+                extra, face = x.new_zeros(count, n_tok), x.new_zeros(count, n_tok)
+            extra[j, i0:i0 + n_img] = e.to(x.device, x.dtype)
+            if self.face[first + j] is not None:
+                face[j, i0:i0 + n_img] = self.face[first + j].to(x.device, x.dtype)
+        if extra is None:
+            return None
+        return extra, face if bool(face.any()) else None
+
+
+def arm_hull(injected: dict, arm: HullArm | None) -> None:
+    """Hull's region gains for the batch about to be forwarded; None disarms."""
+    for m in injected.values():
+        m.hull_arm = arm
+
+
 class LoRALinear(nn.Module):
     """Wraps a Linear (plain or QuantLinear) with a trainable adapter in fp32: a LoRA pair (kind "lora"), a LoKr
     Kronecker pair ("lokr") or OFT rotation blocks ("oft"), with DoRA's magnitude (dora_scale) on LoRA and LoKr when
@@ -263,6 +343,7 @@ class LoRALinear(nn.Module):
         self.body_masks: list | None = None
         self.face_layout = None
         self.face_sink = None
+        self.hull_arm: HullArm | None = None  # Hull's region gains for the batch being forwarded (arm_hull)
 
     # ---- the adapter API (both kinds)
     def adapter_params(self) -> dict[str, nn.Parameter]:
@@ -395,6 +476,11 @@ class LoRALinear(nn.Module):
         """The LoRA / LoKr output for input x (scaled, before the multiplier)."""
         if self.kind == "lora":
             h = self.dropout(x)
+            tokens = self.hull_arm.tokens(h) if self.hull_arm is not None else None
+            if tokens is not None:
+                arm = (self.hull_arm.sink, self.lora_down.weight, self.lora_up.weight, *tokens)
+                return HullBackward.apply(h, self.lora_down.weight.to(h.dtype), self.lora_up.weight.to(h.dtype),
+                                          arm) * self.scale
             h = nn.functional.linear(h, self.lora_down.weight.to(h.dtype))
             u = nn.functional.linear(h, self.lora_up.weight.to(h.dtype))
             if self.face_sink is not None and u.requires_grad:
