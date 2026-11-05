@@ -396,7 +396,8 @@ def build_optimizer(cfg: TrainConfig, params, pairs=None, ref_norms=None, scales
         return Hull(params, pairs=pairs, ref_norms=ref_norms, scales=scales, lr=cfg.hull_rho,
                     betas=tuple(cfg.hull_betas), state_dtype="fp32", clip=cfg.hull_clip,
                     factor_cap=cfg.hull_factor_cap, safety_cap=cfg.hull_safety_cap, gain_max=cfg.hull_gain_max,
-                    ns_iters=cfg.hull_ns_iters, damping=cfg.hull_damping, seed=cfg.seed)
+                    ns_iters=cfg.hull_ns_iters, damping=cfg.hull_damping, seed=cfg.seed,
+                    face_safe=cfg.hull_face_safe, retreat=cfg.hull_retreat)
     if name in AUTOMAGIC:
         if params and isinstance(params[0], dict):
             if {g.get("name") for g in params} <= {"lora", "lora_down", "lora_up"}:  # Automagic owns its lr: collapse
@@ -558,6 +559,7 @@ class Trainer(RaceParallelMixin):
         self.race_layouts = None  # [(blocks, LoRA module names)] per configuration
         self.race_union_names = None  # the LoRA wrappers: every configuration's modules together
         self.race_region_dirs: dict[str, Path | None] = {}  # configuration -> its own region-map folder
+        self.hull_unarmed: set[int] = set()  # id() of the configurations warned that a batch came without parts
         self.race_id_loss = None  # the identity loss shared by the configurations that use it
         self.race_parallel = False  # race_parallel: one configuration per GPU at the same time (race_parallel.py)
         self.look_outliers: set[str] = set()  # look_warmup: the look filter's outlier images (_look_outlier_images)
@@ -741,6 +743,9 @@ class Trainer(RaceParallelMixin):
                         log.warning("No person-mask backend (mediapipe/SAM 3): body_loss_weight ignored")
                 except Exception as e:  # noqa: BLE001
                     log.warning("MediaPipe unavailable for person masks (%s); body_loss_weight ignored", e)
+            parts_fn = None
+            if any(c.wants_parts() for c in ([r[1] for r in self.race_rows] if self.race_rows is not None else [cfg])):
+                parts_fn = R.PartsParser(cfg.models_dir, progress=lambda t, f: self.status.update(stage=t))
             self.status.update(stage="building region weight maps")
             fns = None
             side = self.side_devices()
@@ -758,9 +763,15 @@ class Trainer(RaceParallelMixin):
                 for rcfg, ritems in self._region_jobs(items):
                     counts = R.cache_region_maps(ritems, rcfg, self.face_analysis, person_fn,
                                                  progress=lambda i, n: self.status.update(step=i, total=n),
-                                                 person_mask_fns=fns)
-                    log.info("Region maps ready (new this run): %s; weights face %.2g / body %.2g / background %.2g",
-                             counts, rcfg.face_loss_weight, rcfg.body_loss_weight, rcfg.background_loss_weight)
+                                                 person_mask_fns=fns,
+                                                 parts_fn=parts_fn if rcfg.wants_parts() else None)
+                    if rcfg.wants_parts():  # region_weights is refused here: Hull's gains are the only weighting
+                        log.info("Region maps ready (new this run): %s; Hull gains body %.2g / background %.2g",
+                                 counts, rcfg.hull_gain_body, rcfg.hull_gain_background)
+                    else:
+                        log.info("Region maps ready (new this run): %s; weights face %.2g / body %.2g / background "
+                                 "%.2g", counts, rcfg.face_loss_weight, rcfg.body_loss_weight,
+                                 rcfg.background_loss_weight)
             self.status.update(regions=counts)
             for obj in holder:
                 unload_model(obj.model if hasattr(obj, "model") else obj)
@@ -1105,6 +1116,9 @@ class Trainer(RaceParallelMixin):
         if do_compile and any(c.optimizer.lower() in KEEL and c.keel_face_gain > 0 for c in
                               ([r[1] for r in self.race_rows] if self.race_rows is not None else [cfg])):
             do_compile, why = False, "Keel's face-token gain hooks the LoRA layers' outputs (keel_face_gain)"
+        if do_compile and any(c.wants_parts() for c in
+                              ([r[1] for r in self.race_rows] if self.race_rows is not None else [cfg])):
+            do_compile, why = False, "Hull's region gains run a custom backward in the LoRA layers (hull_regions)"
         if why:
             log.info("torch.compile %s (%s)", "on" if do_compile else "off", why)
         if do_compile:
@@ -1217,7 +1231,9 @@ class Trainer(RaceParallelMixin):
             use_body = bool(face_sink is not None and getattr(optimizer, "body_weight", 0.0) > 0)  # keel_fb
             use_face = bool(face_sink is not None and taps is not None and regions is not None
                             and any(rm.face_cells is not None or (use_body and rm.has_person) for rm in regions.meta))
-            if use_attn or use_align or use_face:  # this forward records the trigger's attention / the face tokens'
+            hull_arm = self._hull_arm(optimizer, taps, regions) if rmodel is model else None
+            use_hull = hull_arm is not None
+            if use_attn or use_align or use_face or use_hull:  # this forward records the trigger's attention / face
                 taps.begin([self.trigger_pos.get(p, []) for p in regions.text_paths] if use_attn  # states / layout
                            else [[] for _ in batch], attention=use_attn)
             if face_sink is not None:  # the face tap: this batch's face (and body) tokens per sample (disarmed
@@ -1226,12 +1242,14 @@ class Trainer(RaceParallelMixin):
                                       if use_face else None, lambda: taps.layout, face_sink,
                                       body_masks=[lora_mod.body_token_mask(rm, hh, ww) for rm in regions.meta]
                                       if use_face and use_body else None)
+            if use_hull:
+                lora_mod.arm_hull(rinj, hull_arm)
             pred = rmodel(noisy_in, sigma * 1000.0, embeds, mask).float()
             aux = None
             if use_attn or use_align:
                 taps.stop()  # later forwards (the prior pass, the backward's recompute) record nothing
                 aux = self._alignment_losses(cfg, taps, batch, regions, use_attn, use_align)
-            elif use_face:
+            elif use_face or use_hull:
                 taps.stop()
             sq = elementwise_loss(cfg.loss_type, pred, target, latents, noise, sigma)
             if regions is not None and cfg.region_weights:  # region-weighted loss: face > person > background (mean 1)
@@ -1281,7 +1299,9 @@ class Trainer(RaceParallelMixin):
             if result is None:
                 loss.backward()
                 result = (report.item(), mults, None)
-            if use_attn or use_align or use_face:
+            if use_hull:
+                lora_mod.arm_hull(rinj, None)
+            if use_attn or use_align or use_face or use_hull:
                 taps.end()
             if face_sink is not None:
                 lora_mod.disarm_face_tap(rinj)  # the trigger-free pass and the next batch report nothing stale
@@ -2069,6 +2089,7 @@ class Trainer(RaceParallelMixin):
         crop = "face+bust" if "face+bust" in crops else ("face" if "face" in crops else "none")
         prep = dataclasses.replace(cfg, flip_augment=any(r[1].flip_augment for r in rows), crop_augment=crop,
                                    region_weights=any(r[1].region_weights for r in rows),
+                                   race_prep_regions=any(r[1].wants_regions() for r in rows),
                                    attn_localize=any(r[1].attn_localize for r in rows),
                                    id_align=any(r[1].id_align for r in rows),
                                    body_align=any(r[1].body_align for r in rows),
@@ -2488,15 +2509,20 @@ class Trainer(RaceParallelMixin):
 
     def _log_hull_report(self, optimizer) -> None:
         """Hull's cap and frame rates at the end of a run, one line per race configuration still held."""
-        rows = [(f"{v.name}: ", v.state.get("optimizer")) for v in self.race.variants] if self.race is not None \
-            else [("", optimizer)]
-        for who, opt in rows:
+        rows = [(f"{v.name}: ", v.state.get("optimizer"), v.cfg) for v in self.race.variants] \
+            if self.race is not None else [("", optimizer, self.cfg)]
+        for who, opt, rcfg in rows:
             report = getattr(opt, "report", None)
             if report is not None:
                 r = report()
                 log.info("%sHull: safety cap bound on %.2f%% of layer-steps after step 20, factor cap on %.2f%% of all "
                          "%d, %d frame fallbacks", who, 100 * r["safety_rate"], 100 * r["factor_rate"],
                          r["layer_steps"], r["frame_fallbacks"])
+                if "armed_share" in r:
+                    log.info("%sHull regions: %.1f%% of layer-steps gained, mean gain cosine %.3f, lowest excess scale "
+                             "%.3f", who, 100 * r["armed_share"], r["gain_cosine"], r["excess_scale"])
+                elif rcfg.wants_parts():
+                    log.warning("%sHull regions were on, but no step was gained: this ran as plain Hull", who)
 
     def _make_ema(self, cfg, injected):
         if cfg.lora_ema <= 0:
@@ -3056,10 +3082,10 @@ class Trainer(RaceParallelMixin):
         rows = [r[1] for r in self.race_rows] if self.race_rows is not None else [cfg]
         attn, align = any(c.attn_localize for c in rows), any(c.id_align or c.body_align for c in rows)
         if not (attn or align):
-            if (any(c.optimizer.lower() in KEEL and c.keel_face_gain > 0 for c in rows) and self.ft is None
-                    and not self.race_parallel):
+            if (any((c.optimizer.lower() in KEEL and c.keel_face_gain > 0) or c.wants_parts() for c in rows)
+                    and self.ft is None and not self.race_parallel):
                 for m, _, _ in self.replicas:
-                    m._rz_taps = A.Taps()  # the token layout alone, for Keel's face tap (keel_face_gain)
+                    m._rz_taps = A.Taps()  # the token layout alone, for Keel's face tap and Hull's region gains
             return
         if self.ft is not None:
             log.warning("Attention localization and identity alignment are adapter training losses; a fine-tune "
@@ -3918,6 +3944,32 @@ class Trainer(RaceParallelMixin):
             stop = self._run_probe(model, step, optimizer, scheduler, injected)
         self._keel_probe(optimizer, ema, sync_replicas)
         return stop
+
+    def _hull_arm(self, optimizer, taps, regions):
+        """Hull's region gains for this batch (lora.HullArm), or None: another optimizer, gains off, no parts, or every
+        gain 1 (Hull is then H0 exactly, with autograd's own backward)."""
+        from .regions import token_gains
+
+        cfg = self.cfg
+        sink = getattr(optimizer, "add_excess", None)
+        if sink is None or not cfg.wants_parts() or taps is None or regions is None:
+            return None
+        extra, face = [], []
+        for rm in regions.meta:
+            if rm.parts is None:
+                extra.append(None)
+                face.append(None)
+                continue
+            gains, mask = token_gains(rm.parts, rm.face_cells, cfg.hull_gain_body, cfg.hull_gain_background)
+            extra.append((gains - 1.0).flatten())
+            face.append(mask.flatten() if cfg.hull_face_safe and bool(mask.any()) else None)
+        if all(e is None for e in extra) and id(cfg) not in self.hull_unarmed:
+            self.hull_unarmed.add(id(cfg))
+            log.warning("Hull regions: a batch reached training without a parts map, so it trains as plain Hull; "
+                        "this warning shows once per configuration")
+        if all(e is None or not bool(e.any()) for e in extra):
+            return None
+        return lora_mod.HullArm(extra, face, lambda: taps.layout, sink)
 
     def _keel_probe(self, optimizer, ema=None, sync_replicas: bool = True, scored: dict | None = None) -> None:
         """Keel's probe-gated lookahead (keel_lookahead): the controller's smoothed decision score and its noise band

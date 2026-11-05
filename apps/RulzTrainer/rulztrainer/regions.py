@@ -210,6 +210,13 @@ def person_mask_from_landmarks(pts: np.ndarray, vis: np.ndarray, w: int, h: int,
 
 # ---------------------------------------------------------------- weight maps
 
+PARTS_MODEL_NAME = "selfie_multiclass_256x256.tflite"
+PARTS_MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/"
+                   "latest/selfie_multiclass_256x256.tflite")
+PART_CLASSES = 6  # the parser's: background, hair, body skin, face skin, clothes, others
+PART_BACKGROUND, PART_BODY_SKIN = 0, 2
+PART_RING = PART_CLASSES  # the parts tensor's last channel
+
 
 @dataclass
 class RegionMap:
@@ -218,6 +225,8 @@ class RegionMap:
     face_cells: tuple[int, int, int, int] | None
     kps: list | None  # bucket-pixel landmarks
     has_person: bool
+    parts: torch.Tensor | None = None  # [PARTS, h, w] uint8: the parser's class fractions, then the silhouette ring
+    parts_print: str = ""  # what built `parts`: a mismatch rebuilds the map
 
 
 def build_weight_map(bw: int, bh: int, face_bbox_px, person_mask: np.ndarray | None, face_w: float, body_w: float,
@@ -246,11 +255,99 @@ def build_weight_map(bw: int, bh: int, face_bbox_px, person_mask: np.ndarray | N
     return RegionMap(wmap[None].float().contiguous(), prior[None].contiguous(), face_cells, None, has_person)
 
 
+def parts_print(cfg, bw: int, bh: int) -> str:
+    """What a region map's parts tensor depends on, for its metadata: a different value rebuilds the map."""
+    return f"{PARTS_MODEL_NAME}|ring={cfg.hull_ring_cells}|margin={cfg.face_margin}|{bw}x{bh}"
+
+
+def build_parts(classes: np.ndarray, bw: int, bh: int, face_cells, ring_cells: int) -> torch.Tensor:
+    """The parts tensor from a parser's class per pixel [bh, bw]: per 16 px cell the fraction of each of the six
+    classes (uint8, 255 = all of the cell), then the silhouette ring: the person's cells (under half background)
+    dilated minus eroded by `ring_cells`, outside the face box. The ring carries widths and lengths; the face box
+    takes no gain, so a jaw line never reaches it."""
+    h, w = bh // CELL, bw // CELL
+    labels = torch.from_numpy(classes.astype(np.int64))[:h * CELL, :w * CELL]
+    hot = torch.nn.functional.one_hot(labels, PART_CLASSES).float()
+    fractions = hot.view(h, CELL, w, CELL, PART_CLASSES).mean(dim=(1, 3)).permute(2, 0, 1)
+    person = (fractions[PART_BACKGROUND] < 0.5)[None, None].float()
+    size = 2 * int(ring_cells) + 1
+    grown = torch.nn.functional.max_pool2d(person, size, stride=1, padding=int(ring_cells))
+    shrunk = -torch.nn.functional.max_pool2d(-person, size, stride=1, padding=int(ring_cells))
+    ring = (grown[0, 0] > 0) & (shrunk[0, 0] <= 0)
+    if face_cells is not None:
+        cx0, cy0, cx1, cy1 = face_cells
+        ring[cy0:cy1, cx0:cx1] = False
+    out = torch.cat([fractions, ring[None].float()])
+    return (out * 255.0).round().to(torch.uint8).contiguous()
+
+
+def token_gains(parts: torch.Tensor, face_cells, body: float, background: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """(gains, face) per cell [h, w] from a parts tensor: gains float32, face bool. Body skin takes `body`, background
+    `background`, hair, clothing, face skin and the rest exactly 1; a ring cell takes at least `body`; the face box is
+    exactly 1 whatever its cells hold."""
+    f = parts[:PART_CLASSES].to(torch.float32) / 255.0
+    gain = torch.ones(PART_CLASSES, dtype=torch.float32)
+    gain[PART_BACKGROUND], gain[PART_BODY_SKIN] = float(background), float(body)
+    base = (f * gain[:, None, None]).sum(0) / f.sum(0).clamp_min(1e-6)
+    out = torch.where(parts[PART_RING] > 0, base.clamp_min(float(body)), base)
+    face = torch.zeros_like(out, dtype=torch.bool)
+    if face_cells is not None:
+        cx0, cy0, cx1, cy1 = face_cells
+        out[cy0:cy1, cx0:cx1] = 1.0
+        face[cy0:cy1, cx0:cx1] = True
+    return out, face
+
+
+class PartsParser:
+    """MediaPipe's multiclass selfie segmenter (Apache 2.0): each pixel's class, for the parts tensor. Hull's training
+    masks only; a lock lets the region-map workers share it."""
+
+    def __init__(self, models_dir: str | Path = "models", progress=None):
+        import threading
+
+        from .bodysim import available, mask_width_multiple
+        from .downloads import download_url
+
+        ok, msg = available()
+        if not ok:
+            raise RuntimeError(msg)
+        import mediapipe as mp
+        from mediapipe.tasks.python import BaseOptions, vision
+
+        model = Path(models_dir) / PARTS_MODEL_NAME
+        if not model.exists():
+            download_url(PARTS_MODEL_URL, model, "MediaPipe multiclass segmenter", progress)
+        opts = vision.ImageSegmenterOptions(base_options=BaseOptions(model_asset_path=str(model)),
+                                            running_mode=vision.RunningMode.IMAGE, output_category_mask=True,
+                                            output_confidence_masks=False)
+        self._mp = mp
+        self.segmenter = vision.ImageSegmenter.create_from_options(opts)
+        self.pad_to = mask_width_multiple()
+        self._lock = threading.Lock()
+
+    def __call__(self, img) -> np.ndarray:
+        arr = np.asarray(img.convert("RGB"))
+        h, w = arr.shape[:2]
+        pad = (-w) % self.pad_to  # mediapipe 1.0.x only: bodysim.mask_width_multiple
+        if pad:
+            arr = np.pad(arr, ((0, 0), (0, pad), (0, 0)), mode="edge")
+        arr = np.ascontiguousarray(arr)
+        with self._lock:
+            res = self.segmenter.segment(self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=arr))
+            classes = np.array(res.category_mask.numpy_view())
+        classes = classes.reshape(h, w + pad)[:, :w]
+        return np.minimum(classes, PART_CLASSES - 1)
+
+
 def save_region_map(path: Path, rm: RegionMap) -> None:
     meta = {"face_cells": ",".join(map(str, rm.face_cells)) if rm.face_cells else "",
             "kps": json.dumps(rm.kps) if rm.kps else "", "has_person": "1" if rm.has_person else "0"}
+    tensors = {"weight": rm.weight, "prior": rm.prior.to(torch.uint8)}
+    if rm.parts is not None:
+        tensors["parts"] = rm.parts
+        meta["parts_print"] = rm.parts_print
     path.parent.mkdir(parents=True, exist_ok=True)
-    save_safetensors({"weight": rm.weight, "prior": rm.prior.to(torch.uint8)}, path, metadata=meta)
+    save_safetensors(tensors, path, metadata=meta)
 
 
 def load_region_map(path: Path) -> RegionMap | None:
@@ -261,9 +358,21 @@ def load_region_map(path: Path) -> RegionMap | None:
     with safe_open(str(path), "pt") as f:
         meta = f.metadata() or {}
         weight, prior = f.get_tensor("weight"), f.get_tensor("prior").bool()
+        parts = f.get_tensor("parts") if "parts" in f.keys() else None
     fc = tuple(int(v) for v in meta["face_cells"].split(",")) if meta.get("face_cells") else None
     kps = json.loads(meta["kps"]) if meta.get("kps") else None
-    return RegionMap(weight, prior, fc, kps, meta.get("has_person") == "1")
+    return RegionMap(weight, prior, fc, kps, meta.get("has_person") == "1", parts, meta.get("parts_print", ""))
+
+
+def _parts_stale(path: Path, want: str) -> bool:
+    """A cached map without the parts tensor this run wants, or with one built another way."""
+    from safetensors import safe_open
+
+    try:
+        with safe_open(str(path), "pt") as f:
+            return (f.metadata() or {}).get("parts_print") != want
+    except Exception:  # noqa: BLE001
+        return True
 
 
 def flip_region_map(rm: RegionMap, bw: int) -> RegionMap:
@@ -283,15 +392,18 @@ def uniform_region_map(bw: int, bh: int) -> RegionMap:
 
 
 def cache_region_maps(items, cfg, analysis: dict[str, dict], person_mask_fn=None, progress=None,
-                      person_mask_fns: list | None = None) -> dict[str, int]:
+                      person_mask_fns: list | None = None, parts_fn=None) -> dict[str, int]:
     """Write <latent stem>_regions.safetensors for every item (skips existing unless cfg.recache). Returns counts.
 
     person_mask_fns: optional list of (fn, device), one per GPU, splitting the images across GPUs (each fn is
-    only ever called from its own thread)."""
+    only ever called from its own thread). parts_fn: the parser (PartsParser), giving a map its parts tensor; a
+    cached map without the parts this run wants is rebuilt."""
     from .multigpu import run_queue
 
     counts = {"face": 0, "person": 0, "none": 0}
-    todo = [it for it in items if it.region_path is not None and (cfg.recache or not it.region_path.exists())]
+    todo = [it for it in items if it.region_path is not None and (
+        cfg.recache or not it.region_path.exists()
+        or (parts_fn is not None and _parts_stale(it.region_path, parts_print(cfg, it.width, it.height))))]
     workers = person_mask_fns or [(person_mask_fn, "cpu")]
     if len(workers) > 1:
         log.info("Region maps: %d images split across %s", len(todo), ", ".join(str(d) for _, d in workers))
@@ -303,11 +415,11 @@ def cache_region_maps(items, cfg, analysis: dict[str, dict], person_mask_fn=None
         if progress:
             progress(done_n[0], len(todo))
 
-    run_queue(workers, todo, lambda w, it: _region_map_for(it, cfg, analysis, w[0]), on_done=done)
+    run_queue(workers, todo, lambda w, it: _region_map_for(it, cfg, analysis, w[0], parts_fn), on_done=done)
     return counts
 
 
-def _region_map_for(it, cfg, analysis: dict[str, dict], person_mask_fn) -> str:
+def _region_map_for(it, cfg, analysis: dict[str, dict], person_mask_fn, parts_fn=None) -> str:
     """Build and save one item's region map; returns its kind (face | person | none)."""
     from .dataset import load_image_fit
 
@@ -327,6 +439,10 @@ def _region_map_for(it, cfg, analysis: dict[str, dict], person_mask_fn) -> str:
     rm = build_weight_map(it.width, it.height, bbox_px, mask, cfg.face_loss_weight, cfg.body_loss_weight,
                           cfg.background_loss_weight, cfg.face_margin, cfg.region_feather_cells)
     rm.kps = kps_px
+    if parts_fn is not None:
+        rm.parts = build_parts(parts_fn(load_image_fit(it.image, it.width, it.height, it.src_box)), it.width, it.height,
+                               rm.face_cells, cfg.hull_ring_cells)
+        rm.parts_print = parts_print(cfg, it.width, it.height)
     save_region_map(it.region_path, rm)
     return "face" if rm.face_cells else ("person" if rm.has_person else "none")
 

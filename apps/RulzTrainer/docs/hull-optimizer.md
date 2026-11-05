@@ -1,8 +1,16 @@
 # Hull: a body-identity optimizer for character LoRAs (design)
 
 Status: H0, the base rule, is built (`rulztrainer/optimizers/hull.py`, `tests/test_hull.py`) with `hull_metric: balanced`,
-`hull_frame: virtual` and `hull_step_scope: layer`, plus the periodic rebalance of section 4.1; it has trained one real
-model, unraced (section 4.1), and everything else here is design. Every number below is a starting value to race unless it is cited, measured in
+`hull_frame: virtual` and `hull_step_scope: layer`, plus the periodic rebalance of section 4.1. On Krea 2 at 0.25 MP and
+2000 steps it ties AdamW so far: best smoothed scores 42.4, 57.2 and 40.0 against 38.8 and 45.0, the 57.2 being the one
+run that memorised a photo (SSCD 0.61), so differences of about 15 points between single runs can be chance. The first
+part of M1b is built and off by default: the parts tensor (5.2), C1 and C3 (5.1, 5.3) with the cosine retreat
+(`hull_regions: parts`, `tests/test_hull_regions.py`). Raced at gain 1.5 on H0 (Miniloona, 0.25 MP, 2000 steps, one RTX
+5090), it did not raise the body: best smoothed score 35.6 against 35.8 (seed 1234) and 26.3 against 41.0 (seed 42), mean
+body score from step 1000 on 14.5 against 14.5 and 14.0 against 19.6, SSCD at most 0.45, within the limit. A race whose
+two rows ran the same plain Hull, by a bug since fixed, gave 37.4 and 40.9. Two seeds fall far short of the section 11
+bar, so this does not close R3, but C1 stays off until M0's body-agreement measurement shows a reason to expect a gain. Not built yet: the detail gate, the held-out-loss retreat, the
+`adam` base and everything from M2 on. Everything else here is design. Every number below is a starting value to race unless it is cited, measured in
 a synthetic benchmark or computed, and then it carries a tag. Working name "Hull": Keel is a ship's spine, the hull
 its whole body and skin. Hull is for any character LoRA; Qwen-Image 2.1 is the main target.
 
@@ -342,6 +350,9 @@ the armed share is logged. The parallel race refuses C1, C3 and band-budget rows
 1,179,648 over the 224 modules]; C1 with C3 adds two. FLOPs did not predict the memory-bound tap [bench], so C1 is
 unmeasured until M0's gate: at most +8% of whole-step time with the real model on both 16 GB cards, compile on and
 off, 0 syncs. Compile stays off while armed (`trainer.py:1065-1067`) unless a `torch.library` custom op keeps it on.
+First reading, one RTX 5090 at 0.25 MP, one run each, same seed, steps 25-80, no probes: armed +8.6% over H0 with compile
+off, +2.2% over H0 with compile on (compile itself was +6.3% here), peak memory unchanged at 23.8 GB. So the gate is
+close and unsettled: the 16 GB cards and 1 MP are unmeasured, and syncs were not counted.
 
 **Risks.** Body gradients that disagree across poses and outfits make the gain amplify nuisance (M0's agreement gate);
 the token path says where the LoRA acts, not which loss asked (M0 compares loss-path attribution); unarmed replicas
@@ -927,6 +938,11 @@ E: an 80/20 stream comes out equally weighted; phases: mu never rises. Races R8-
     - (l) `Hull` also takes each pair's alpha / rank (`scales`), which the pairs' tensors do not carry.
     - (m) `T⁻¹` is stored beside `T`: the fallback must keep both, and a fp32 inverse of a stored T would lose its
       conditioning.
+    - (o) Built M1b differs from 5.1 and 5.3 in four ways. HullBackward runs one extra GEMM per kept block instead of
+      one widened GEMM (simpler; the cost gate decides if that stays). The excess and the face part arrive in the compute
+      dtype and are summed as they are. C3 projects once in `step()` on the step's sum, with that step's D and T, not per
+      micro-batch with the previous step's; so it costs 2 B/weight more while armed. The parser is the published
+      256 x 256 multiclass model: MediaPipe's model card describes a 512 px one, which is not among its downloads.
     - (n) The stochastic rounding's generator is private and reseeded from a step count in the state, so the dither
       leaves the run's noise stream alone (arms stay paired) and a relay or resume repeats it exactly.
 12. **Licences the user must settle:** the Fizgig adapter (and, if the adapter-off control collapses, whether the

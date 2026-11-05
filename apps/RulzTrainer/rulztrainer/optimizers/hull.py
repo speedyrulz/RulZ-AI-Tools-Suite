@@ -1,5 +1,5 @@
-"""Hull: a body-identity optimizer for character LoRAs (docs/hull-optimizer.md). This file is its base rule H0 (section 4):
-written from scratch, not a subclass of Automagic 4, and not self-tuning: `group["lr"]` is the step rho_t from the
+"""Hull: a body-identity optimizer for character LoRAs (docs/hull-optimizer.md). This file is its base rule H0 (section 4)
+and the optimizer's side of the region gains (C1 and C3, sections 5.1 and 5.3): written from scratch, not a subclass of Automagic 4, and not self-tuning: `group["lr"]` is the step rho_t from the
 trainer's scheduler. H0 reads `p.grad` in `step()` with no parameter hooks and no gather, so it runs unchanged in the
 parallel race and with replica reduces, and nothing keeps a dropped optimizer alive.
 
@@ -46,6 +46,9 @@ STATE_DTYPES = ("bf16", "fp32")
 FRAME_TOLERANCE = 1e-3  # ||T M T - N|| / ||N|| above this keeps the previous step's T
 CAP_REPORT_AFTER = 20  # the safety cap's bind rate counts from this step on (the M1a gate)
 REBALANCE_EVERY = 10  # steps between in-place rebalances; dW's path does not depend on it, and a pair drifts little in 10
+COSINE_DECAY = 0.9  # the smoothed gained-to-raw cosine the retreat reads, per armed step
+REGION_STATS = ("cos", "cos_top", "armed", "interval")  # per pair, on lora_up: the region gains' records
+STATS = ("u", "k", "cap_safety", "cap_factor", "cap_steps", "frame_fallback", *REGION_STATS)
 
 
 def _sym(a: torch.Tensor) -> torch.Tensor:
@@ -106,7 +109,8 @@ class Hull(torch.optim.Optimizer):
 
     def __init__(self, params, pairs, ref_norms, scales, lr: float, betas=(0.9, 0.99), state_dtype: str = "fp32",
                  clip: float = 5.0, factor_cap: float = 0.2, safety_cap: float = 0.0, gain_max: float = 2.0,
-                 ns_iters: int = 30, damping: float = 1e-6, seed: int = 0):
+                 ns_iters: int = 30, damping: float = 1e-6, seed: int = 0, face_safe: bool = True,
+                 retreat: float = 0.5):
         if not lr > 0:
             raise ValueError(f"Hull: lr (hull_rho) must be above 0, got {lr}")
         if not 0.0 <= betas[0] < 1.0 or not 0.0 < betas[1] < 1.0:
@@ -141,6 +145,9 @@ class Hull(torch.optim.Optimizer):
         self.ns_iters = int(ns_iters)
         self.damping = float(damping)
         self.seed = int(seed)
+        self.face_safe = bool(face_safe)
+        self.retreat = float(retreat)
+        self._excess: dict = {}  # id(lora_up) -> this step's region excess: a [x_a, x_b, f_a, f_b] list (add_excess)
         self._gens: dict = {}  # device -> a private generator, reseeded each step: the dither leaves the run's RNG alone
         self._consts: dict = {}  # (device, dtype, pair indices) -> (scales, ref norms)
         self._ema = None  # the LoraEMA whose shadow a rebalance moves with the factors
@@ -162,8 +169,9 @@ class Hull(torch.optim.Optimizer):
         r = b.shape[1]
         st["T"] = torch.eye(r, dtype=b.dtype, device=b.device)
         st["Ti"] = st["T"].clone()
-        for key in ("u", "k", "cap_safety", "cap_factor", "cap_steps", "frame_fallback"):
+        for key in STATS:
             st[key] = torch.zeros((), dtype=b.dtype, device=b.device)
+        st["lam"] = torch.ones((), dtype=b.dtype, device=b.device)
 
     def _moment_dtype(self, p: torch.Tensor) -> torch.dtype:
         return torch.bfloat16 if self.state_dtype == "bf16" and p.dtype == torch.float32 else p.dtype
@@ -173,6 +181,10 @@ class Hull(torch.optim.Optimizer):
         for p, st in self.state.items():
             if "m" in st:
                 st["m"] = st["m"].to(self._moment_dtype(p))
+            if "T" in st:  # a state from before the region gains
+                for key in REGION_STATS:
+                    st.setdefault(key, torch.zeros_like(st["u"]))
+                st.setdefault("lam", torch.ones_like(st["u"]))
 
     def report(self) -> dict:
         """The caps' bind rates and the frame fallback count, for the log (a host sync: call it between steps). The
@@ -185,8 +197,42 @@ class Hull(torch.optim.Optimizer):
                 for key in totals:
                     totals[key] += float(st[key])
         late = max(totals["cap_steps"], 1.0)
-        return {"safety_rate": totals["cap_safety"] / late, "factor_rate": totals["cap_factor"] / max(totals["k"], 1.0),
-                "frame_fallbacks": int(totals["frame_fallback"]), "layer_steps": int(totals["k"])}
+        out = {"safety_rate": totals["cap_safety"] / late, "factor_rate": totals["cap_factor"] / max(totals["k"], 1.0),
+               "frame_fallbacks": int(totals["frame_fallback"]), "layer_steps": int(totals["k"])}
+        armed = [self.state[b] for _, b in self.pairs if float(self.state.get(b, {}).get("armed", 0.0)) > 0]
+        if armed:
+            out["armed_share"] = sum(float(st["armed"]) for st in armed) / max(totals["k"], 1.0)
+            out["gain_cosine"] = sum(float(st["cos"]) for st in armed) / len(armed)
+            out["excess_scale"] = min(float(st["lam"]) for st in armed)
+        return out
+
+    # ------------------------------------------------------------------ region gains
+
+    def add_excess(self, pa, pb, x_a, x_b, f_a, f_b) -> None:
+        """A LoRA backward's region excess and face part (lora.HullBackward), summed over a step's micro-batches."""
+        buf = self._excess.get(id(pb))
+        new = [x_a, x_b, f_a, f_b]
+        if buf is None:
+            self._excess[id(pb)] = new
+            return
+        for i, value in enumerate(new):
+            if value is not None:
+                buf[i] = value if buf[i] is None else buf[i] + value
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        self._excess.clear()
+        super().zero_grad(set_to_none=set_to_none)
+
+    def on_probe(self, score, band, ema=None, weights=None) -> None:
+        """The cosine retreat: a tensor whose smoothed cosine between gained and raw gradients stayed below 0 over the
+        whole probe interval has its excess scale lam multiplied by `retreat` (it never rises)."""
+        for _, b in self.pairs:
+            st = self.state.get(b)
+            if not st or "interval" not in st:
+                continue
+            if bool(st["interval"] > 0) and bool(st["cos_top"] < 0):
+                st["lam"].mul_(self.retreat)
+            st["interval"].zero_()
 
     # ------------------------------------------------------------------ helpers
 
@@ -264,14 +310,47 @@ class Hull(torch.optim.Optimizer):
                         self._rebalance(bk["indices"])
         return loss
 
-    def _stack(self, indices: tuple) -> dict:
+    def _stack(self, indices: tuple, region: bool = True) -> dict:
         """One shape's pairs as [n, ...] tensors, with their fp64 Grams."""
         pairs = [self.pairs[i] for i in indices]
         a = torch.stack([p for p, _ in pairs])
         b = torch.stack([p for _, p in pairs])
         ad, bd = a.to(torch.float64), b.to(torch.float64)
-        return dict(indices=indices, a=a, b=b, ga=torch.stack([p.grad for p, _ in pairs]),
-                    gb=torch.stack([p.grad for _, p in pairs]), m0=bd.mT @ bd, n0=ad @ ad.mT)
+        out = dict(indices=indices, a=a, b=b, ga=torch.stack([p.grad for p, _ in pairs]),
+                   gb=torch.stack([p.grad for _, p in pairs]), m0=bd.mT @ bd, n0=ad @ ad.mT, region=None)
+        found = [self._excess.get(id(p)) for _, p in pairs] if region else []
+        if any(x is not None for x in found):
+            def part(i, like):
+                return torch.stack([x[i].to(like.dtype) if x is not None and x[i] is not None
+                                    else torch.zeros_like(like) for x in found])
+
+            armed = torch.tensor([x is not None for x in found], device=b.device)
+            out["region"] = (part(0, a[0]), part(1, b[0]), part(2, a[0]), part(3, b[0]), armed)
+        return out
+
+    def _gained(self, bk: dict, ga, gb, gb_ti, t, ti, d_a, d_b, lam, old, seen) -> tuple:
+        """(gradient for m on A, on B, new smoothed cosine, armed): the raw gradient plus lam X, X projected off the face
+        where it opposes it (C3, in the metric of the normalised update), and the balanced-frame cosine between gained
+        and raw normalised gradients on lora_up, which the retreat reads. Gains never reach v, u or the step size."""
+        x_a, x_b, f_a, f_b, armed = bk["region"]
+        db, da = d_b[:, :, None], d_a[:, None, :]
+        if self.face_safe:
+            over_b = (f_b * (db * (x_b @ ti))).sum((1, 2))
+            self_b = (f_b * (db * (f_b @ ti))).sum((1, 2))
+            x_b = x_b - (over_b / self_b.clamp_min(1e-30)).clamp_max(0.0)[:, None, None] * f_b
+            over_a = (f_a * ((t @ x_a) * da)).sum((1, 2))
+            self_a = (f_a * ((t @ f_a) * da)).sum((1, 2))
+            x_a = x_a - (over_a / self_a.clamp_min(1e-30)).clamp_max(0.0)[:, None, None] * f_a
+        mult = lam[:, None, None]
+        full_a, full_b = ga + mult * x_a, gb + mult * x_b
+        raw_ti = db * gb_ti
+        full_ti = db * (full_b @ ti)
+        inner = ((db * full_b) * raw_ti).sum((1, 2))
+        raw2 = ((db * gb) * raw_ti).sum((1, 2)).clamp_min(1e-30)
+        full2 = ((db * full_b) * full_ti).sum((1, 2)).clamp_min(1e-30)
+        cosine = inner / (raw2 * full2).sqrt()
+        smoothed = torch.where(seen, COSINE_DECAY * old + (1.0 - COSINE_DECAY) * cosine, cosine)
+        return full_a, full_b, smoothed, armed & torch.isfinite(smoothed)
 
     def _update(self, bk: dict, t64, ti64, good, n_inv, rho: float, gen) -> None:
         a, b, ga, gb = bk["a"], bk["b"], bk["ga"], bk["gb"]
@@ -309,8 +388,13 @@ class Hull(torch.optim.Optimizer):
         # per-channel clip at RMS `clip`, measured in the balanced frame: a channel's RMS after D is sqrt(q) D
         clipped_b = (self.clip / (q_b.sqrt() * d_b).clamp_min(1e-30)).clamp_max(1.0) * d_b
         clipped_a = (self.clip / (q_a.sqrt() * d_a).clamp_min(1e-30)).clamp_max(1.0) * d_a
-        m_b_new = m_b.to(wd, copy=True).mul_(self.b1).add_(clipped_b[:, :, None] * gb, alpha=1.0 - self.b1)
-        m_a_new = m_a.to(wd, copy=True).mul_(self.b1).add_(ga * clipped_a[:, None, :], alpha=1.0 - self.b1)
+        full_a, full_b, region = ga, gb, None  # what m averages: the raw gradient, plus the region excess while armed
+        if bk["region"] is not None:
+            full_a, full_b, cos_new, used = self._gained(bk, ga, gb, gb_ti, t, ti, d_a, d_b, take(sts_b, "lam"),
+                                                         take(sts_b, "cos"), take(sts_b, "armed") > 0)
+            region = (cos_new, used)
+        m_b_new = m_b.to(wd, copy=True).mul_(self.b1).add_(clipped_b[:, :, None] * full_b, alpha=1.0 - self.b1)
+        m_a_new = m_a.to(wd, copy=True).mul_(self.b1).add_(full_a * clipped_a[:, None, :], alpha=1.0 - self.b1)
         u_b = m_b_new @ ti  # the balanced update, before the momentum's bias correction `lift`
         u_a = t @ m_a_new
         lift = 1.0 / unbias1
@@ -341,6 +425,7 @@ class Hull(torch.optim.Optimizer):
 
         started = b.flatten(1).any(1)
         finite = (torch.isfinite(ga.flatten(1).sum(1)) & torch.isfinite(gb.flatten(1).sum(1))
+                  & torch.isfinite(full_a.flatten(1).sum(1)) & torch.isfinite(full_b.flatten(1).sum(1))
                   & torch.isfinite(eta_final) & torch.isfinite(d1))
         ok = started & finite
         ok_row, ok_m = ok[:, None], ok[:, None, None]
@@ -377,6 +462,14 @@ class Hull(torch.optim.Optimizer):
         put(sts_b, "cap_factor", take(sts_b, "cap_factor") + bound_factor)
         put(sts_b, "cap_steps", take(sts_b, "cap_steps") + (ok & late))
         put(sts_b, "frame_fallback", take(sts_b, "frame_fallback") + (ok & ~good))
+        if region is not None:
+            used = region[1] & ok
+            put(sts_b, "cos", torch.where(used, region[0], take(sts_b, "cos")))
+            put(sts_b, "armed", take(sts_b, "armed") + used)
+            count = take(sts_b, "interval")
+            top = torch.where(count > 0, take(sts_b, "cos_top"), -torch.ones_like(count))
+            put(sts_b, "cos_top", torch.where(used, torch.maximum(top, region[0]), top))
+            put(sts_b, "interval", count + used)
 
     @torch.no_grad()
     def _rebalance(self, indices: tuple) -> None:
@@ -386,7 +479,7 @@ class Hull(torch.optim.Optimizer):
         min(o, i), such as Krea 2's 12 -> 1 text_fusion.projector at rank 32: BtB and AAt can never meet there, so X stays
         huge at every rebalance and multiplies itself into the lora_ema shadow, whose dW reached 3e6 x ||W0|| by step 100
         while the live weights stayed healthy."""
-        bk = self._stack(indices)
+        bk = self._stack(indices, region=False)
         a, b = bk["a"].to(torch.float64), bk["b"].to(torch.float64)
         wd = bk["b"].dtype
         r = b.shape[2]
