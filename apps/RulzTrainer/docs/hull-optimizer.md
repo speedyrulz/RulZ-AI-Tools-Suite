@@ -14,7 +14,8 @@ ones, and body falls below background on purity (section 5.1, first reading). So
 held-out-loss retreat and G are not worth building on this evidence. A first A/A reading (`docs/keel-test-results.md`,
 four runs each of H0 and AdamW 8-bit on one character) could not tell them apart: best smoothed score 33.5 against 33.6,
 difference -0.1 ± 6.4, body +1.8 ± 4.1, with identical runs up to 10 points apart. That shows no gain from H0 and does
-not show non-inferiority, so M1a's kill rule is still open. Not built yet: those, the `adam` base and everything
+not show non-inferiority, so M1a's kill rule is still open. Development is paused here (2026-11-05): H0 stays an experimental option until a new
+idea or a larger test gives a reason to spend more on it. Not built yet: those, the `adam` base and everything
 from M2 on. Everything else here is design. Every number below is a starting value to race unless it is cited, measured in
 a synthetic benchmark or computed, and then it carries a tag. Working name "Hull": Keel is a ship's spine, the hull
 its whole body and skin. Hull is for any character LoRA; Qwen-Image 2.1 is the main target.
