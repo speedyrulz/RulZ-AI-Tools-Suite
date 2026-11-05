@@ -1004,7 +1004,8 @@ by the vote alone: set `keel_face_gain` (0.5 or 1) to bring the body share in, w
 (SAM 3 or MediaPipe) for the region maps. The probes' combined score, which the lookahead and the best / stop decisions
 follow, is weighted `face_weight` 0.7 / `body_weight` 0.3 by default: set them equal for an equal focus (the log
 says so when the lookahead is on). Race it against `keel`, then its parts one at a time (`keel_consensus_mode`,
-`keel_body_weight`, `keel_band_weights`); nothing is measured yet.
+`keel_body_weight`, `keel_band_weights`); not measured yet. Use gradient accumulation of 2 or more, or the vote has
+nothing to compare.
 
 All of it can be raced (`race` rows with `keel_gauge`, `keel_gauge_eps`, `keel_cautious`, `keel_pair_sigma`,
 `keel_bands`, `keel_band_weights`, `keel_consensus`, `keel_consensus_power`, `keel_consensus_mode`,
@@ -1013,6 +1014,11 @@ All of it can be raced (`race` rows with `keel_gauge`, `keel_gauge_eps`, `keel_c
 band statistics start fresh when `keel_bands` changes; the anchor is dropped when the lookahead is off, the face
 gains when the face gain is). Whether Keel beats Automagic 4 or adamw8bit on the likeness probes
 is not measured yet: the Wizard keeps recommending adamw8bit until a race says otherwise.
+
+What is measured so far is in `docs/keel-test-results.md`. On one small body-only set, over 8 seeds, one rate for every
+layer (`automagic_groups: single`) beat `by_type` by 4.4 body points (p = 0.03), and `automagic_max_lr` at 1e-3, 5e-4
+and 3e-4 tied at 1000 steps with every racer still improving. Use `single`, keep or lower the ceiling as you prefer, and
+plan on more than 1000 steps. The other Keel settings have no results yet.
 
 **MiniMax H3 and FLUX Klein** are trained in ai-toolkit, not here. `rulztrainer/optimizers/automagic4.py` depends only
 on `automagic3.py` next to it and keeps ai-toolkit's constructor (`step_target` is accepted and ignored), so copying it
