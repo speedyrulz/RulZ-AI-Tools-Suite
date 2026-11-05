@@ -7,7 +7,7 @@ page. Datasets are described only as far as a result needs: no names, prompts or
 Scores are on the trainer's normalized scale, where 0 is the base model and 100 is the mean of the references. Numbers
 from different runs are not comparable when their probes, scale or weights differ.
 
-## Where things stand (2026-11-04)
+## Where things stand (2026-11-05)
 
 | Question | Answer | Strength |
 |---|---|---|
@@ -16,6 +16,7 @@ from different runs are not comparable when their probes, scale or weights diffe
 | Does the body carry to a pose and scene unlike the data? | Yes, at 1000 steps, all three ceilings | One set, by eye and by score |
 | Is 2000 steps too many? | Not shown: scores were still rising near the end | One set |
 | Keel against AdamW 8-bit | **Not measured** | |
+| Hull against AdamW 8-bit | No measurable difference | One set, 4 runs each |
 | `keel_fb` against `keel` | **Not measured** | |
 | Face gain, consensus gate and vote, lookahead, band weights | **Not measured** | |
 | Gauge preconditioner, cautious mask, paired sigma, each alone | **Not measured** | |
@@ -96,10 +97,43 @@ second face scorer and the copy check on. A race of two rows took about 80 minut
 - **Hull against AdamW.** Without the flagged run, the two are level.
 - **Watermarks.** A mark in the training images came through in some probes. Remove marks before a final LoRA.
 
+### Repeat runs: 4 of Hull, 4 of AdamW (2026-11-05)
+
+Same setup and character as above, with Hull's step at 2e-4 and AdamW's learning rate at 1e-4. These were separate runs,
+not race rows, all on one RTX PRO 5000 (48 GB), at about an hour a run. Each optimizer ran seeds 42 and 1234 twice, with
+Hull and AdamW alternating in the queue.
+
+Best smoothed score, the highest smoothed combined score at any probe:
+
+| Optimizer | Seed 42 | Seed 1234 |
+|---|---|---|
+| Hull | 32.5, 29.3 | 32.9, 39.3 |
+| AdamW | 37.3, 32.3 | 30.2, 34.7 |
+
+Means over the 4 runs, standard deviation in brackets, with the difference's approximate 95% range:
+
+| Measure | Hull | AdamW | Hull minus AdamW |
+|---|---|---|---|
+| Best smoothed score | 33.5 (4.2) | 33.6 (3.1) | -0.1 ± 6.4 |
+| Combined score from step 1000 on | 30.6 (5.5) | 30.9 (1.5) | -0.3 ± 7.0 |
+| Body score from step 1000 on | 16.4 (2.0) | 14.6 (2.7) | +1.8 ± 4.1 |
+| Face score from step 1000 on | 59.5 (5.5) | 60.8 (2.6) | -1.3 ± 7.5 |
+| Peak copy score | 0.45 (0.07) | 0.41 (0.03) | +0.03 ± 0.09 |
+
+- **Hull against AdamW.** A tie on every measure. This shows no gain from Hull, but it does not show the two are equal:
+  a true gap of about 6 points either way would still fit these runs.
+- **Identical runs differ.** The same settings and seed gave gaps of 3.2 to 6.4 points in best score, and up to 11.3 on
+  the combined score from step 1000 on. Hull's four runs covered 10 points. Changing the seed added no visible spread
+  beyond that, though only two seeds ran. Training does not repeat exactly on one card, and the cause is not known.
+- **Copying.** The highest-scoring Hull run was the only one over the copy limit, 0.55 at step 1400, back to 0.40 by step
+  2000. That is the second time Hull's top run has crossed the limit, so read a high Hull score with its copy score.
+- **Test size.** The two spreads pool to about 3.7 points. To catch a true 5-point gap 4 times in 5 would take about 9
+  runs of each row, and a 3-point gap about 24 [computed]. Single pairs of runs can't settle gaps that small.
+
 ## How to run the next tests
 
 - Compare rows in a race, on 8 probe seeds, and repeat with a second training seed before believing a gap under about
-  15 points.
+  15 points. Identical runs differed by up to 10 points, so plan on several runs of each row for smaller gaps.
 - Use a probe unlike the data as well as one like it: the first shows whether the subject carries over, and the second
   alone can reward memorising.
 - Read the copy score beside the likeness score. A best file flagged by the copy check is not a clean win.
