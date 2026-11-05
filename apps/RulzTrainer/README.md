@@ -106,7 +106,8 @@ is kept per browser (its local storage).
    checked). The wizard's review lists the same. The *Monitor* tab shows progress, loss curve, log tail and sample images. Training runs
    as its own process: reloading or closing the page, opening it from another browser, or restarting the
    WebUI does not stop it, and the page reconnects to the running job (it opens on *Monitor* and loads the
-   job's settings into the form). *Stop (save)* and *Kill* work on a reconnected job too.
+   job's settings into the form). *Stop (save)* and *Kill* work on a reconnected job too. Switching to another tab
+   and back does not reload the page: it stays as you left it for up to an hour away, then catches up.
 4. Results: `output/<job>/<job>_<step>.safetensors` (checkpoints) and `output/<job>/<job>.safetensors` (final).
 
 **Training queue.** *Add to queue* (next to *Start training*, and on the wizard's last page) saves the current
