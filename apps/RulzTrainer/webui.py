@@ -146,6 +146,10 @@ _adopted = None  # psutil.Process of a job started by an earlier WebUI process (
 _job_dir: Path | None = None
 JOB_FILE = ROOT / ".webui_job.json"
 FORM_FILE = ROOT / ".webui_form.json"  # the page's settings, so a reload or a restarted WebUI keeps them
+# How long the server keeps a page whose browser went away. Browsers suspend background tabs, which drops the page's
+# connection; NiceGUI's default of 3 s then deletes the page and the browser reloads it on return. Only this page's
+# wait is raised, not ui.run's: there it also scales the connection's pings, so a dead link would go unnoticed for ages.
+PAGE_KEEP_SECONDS = 3600.0
 QUEUE = TrainQueue()  # runs waiting for the current one (output/_queue.json); queue_loop() starts them in turn
 _start_lock = threading.RLock()  # the queue's thread and a page may start a run at the same moment
 
@@ -2079,6 +2083,14 @@ def clean_share_hint(form) -> str:
     return text + " With the schedule: " + plan + again + "."
 
 
+def while_connected(callback):
+    """A ui.timer callback that rests while its page has no browser connected. A page is kept for PAGE_KEEP_SECONDS
+    after its browser goes away, so a closed or reloaded one must not go on reading files and redrawing all that time;
+    the first tick after a reconnect brings a page back up to date."""
+    client = ui.context.client
+    return lambda: callback() if client.has_socket_connection else None
+
+
 def section(title: str, caption: str, icon: str, open_: bool = True):
     """A collapsible settings card (Train and Monitor tabs)."""
     return ui.expansion(title, caption=caption, icon=icon, value=open_).classes("rz-section w-full")
@@ -3667,7 +3679,7 @@ def build_samples_tab(f: Form):
                     ui.label(label).classes("text-xs px-2 py-1")
 
     columns.on_value_change(lambda e: (state.__setitem__("files", []), refresh()))
-    ui.timer(3.0, refresh)
+    ui.timer(3.0, while_connected(refresh))
     refresh()
 
 
@@ -6366,7 +6378,7 @@ def build_history_tab(charts: list):
                            "of the same job name, so its files cannot be downloaded here.")
         run_files.show(job_dir)
 
-    ui.timer(5.0, refresh_files)  # a running run's new checkpoints
+    ui.timer(5.0, while_connected(refresh_files))  # a running run's new checkpoints
     with section("Identity similarity", "How much each run's samples looked like the person (the average of each "
                  "sample step)", "face"):
         with ui.row().classes("items-center gap-3"):
@@ -6515,7 +6527,7 @@ def build_history_tab(charts: list):
     except Exception:  # noqa: BLE001
         pass
     reload(True)
-    ui.timer(4.0, reload)
+    ui.timer(4.0, while_connected(reload))
 
 
 # ---------------------------------------------------------------- page
@@ -8913,7 +8925,7 @@ def build_page(local: bool = True):
                         text = (f"started {when}" if r.get("started") else f"could not start: {r.get('error')}")
                         hint(f"{r.get('job')}: {text}", warn=bool(r.get("error")))
 
-            ui.timer(2.0, queue_draw)
+            ui.timer(2.0, while_connected(queue_draw))
             log_state = {"job": None, "n": 0, "console_shown": False}
 
             def show(key: str, value: str, sub: str = ""):
@@ -9210,7 +9222,7 @@ def build_page(local: bool = True):
                 saved_label.text = "Training states:\n" + "\n".join(states) if states else ""
                 update_log()
 
-            ui.timer(2.0, poll)
+            ui.timer(2.0, while_connected(poll))
 
         # ------------------------------------------------------------ Samples
         with ui.tab_panel(tab_samples):
@@ -9278,8 +9290,8 @@ def build_page(local: bool = True):
         else:
             pill_text.text = {"error": "Last run failed", "done": "Last run finished"}.get(state, "Idle")
 
-    ui.timer(0.5, task_tick)
-    ui.timer(2.0, pill_tick)
+    ui.timer(0.5, while_connected(task_tick))
+    ui.timer(2.0, while_connected(pill_tick))
     pill_tick()
 
     tab_names = ("Wizard", "Train", "Dataset", "Monitor", "Samples", "Help")
@@ -9423,7 +9435,7 @@ def build_page(local: bool = True):
             status_msg.text = f"Reconnected to the running job '{_job_dir.name}' (could not load its config: {e})"
     state = page_state()  # the baseline: nothing is written until something changes from this
     form_state.update(text=json.dumps(state, indent=1, default=str), form=state["form"])
-    ui.timer(0.4, persist)
+    ui.timer(0.4, while_connected(persist))
 
 
 HELP = """
@@ -10111,7 +10123,7 @@ if __name__ in {"__main__", "__mp_main__"}:
 
     app.on_startup(lambda: threading.Thread(target=queue_loop, name="rulz-queue", daemon=True).start())
 
-    @ui.page("/")
+    @ui.page("/", reconnect_timeout=PAGE_KEEP_SECONDS)
     def index(request: Request):
         # A real page function, not NiceGUI's script mode: script mode re-executes this file for every page load,
         # which reset the job globals, so a reload lost the running job.
