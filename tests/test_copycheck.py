@@ -131,6 +131,94 @@ def test_the_trainer_loads_the_check_only_when_wanted(monkeypatch):
     assert tr._selftrain_copy_limit() == pytest.approx(0.7)  # max(0.5, the photos' 0.6 + 0.1)
 
 
+def test_near_duplicates_are_the_pairs_above_the_limit():
+    cc = _checker()
+    assert [(a, b) for a, b, _ in cc.near_duplicates(0.5)] == [("a.png", "b.png")]
+    assert cc.near_duplicates(0.5)[0][2] == pytest.approx(0.6)
+    assert cc.near_duplicates(0.7) == []
+    assert CC.CopyChecker.with_embedder(lambda p: None).near_duplicates(0.5) == []  # no photos
+    far = {**VECS, "a2.png": _unit(0.99, 0.1, 0)}  # the closest pair comes first
+    cc = CC.CopyChecker.with_embedder(lambda p: far[p])
+    cc.set_photos(["a.png", "b.png", "a2.png"])
+    assert [(a, b) for a, b, _ in cc.near_duplicates(0.5)][0] == ("a.png", "a2.png")
+    assert len(cc.near_duplicates(0.5)) == 3
+
+
+def _photos():
+    return [SimpleNamespace(image=p, category="image") for p in ("a.png", "b.png", "c.png")]
+
+
+def _fake_checker(monkeypatch, fail=False):
+    made = []
+
+    class Fake(CC.CopyChecker):
+        def __init__(self, models_dir, device, progress=None):
+            made.append(device)
+            self.photos, self.descs, self.baseline, self.model = [], None, None, "loaded"
+
+        def embed(self, path):
+            if fail:
+                raise OSError("no network")
+            return VECS[path]
+
+    monkeypatch.setattr(CC, "CopyChecker", Fake)
+    return made
+
+
+def test_the_near_duplicate_check_runs_at_auto_and_warns_only(monkeypatch, caplog):
+    made = _fake_checker(monkeypatch)
+    tr, status = _trainer(_cfg(face_provider="cpu"))  # auto, no self-training: the run keeps no checker
+    tr.copy_checker = None
+    tr._check_near_duplicates(_photos())
+    assert made == ["cpu"] and tr.copy_checker is None  # short-lived: nothing stays for the probes
+    # the photos' own median match is 0.6 here, so the limit rises to 0.7 and a shoot's usual likeness is not flagged
+    assert "near_duplicates" not in status
+    vecs = {"a.png": _unit(1, 0, 0), "b.png": _unit(0.9, 0.1, 0), "c.png": _unit(0, 0, 1), "d.png": _unit(0, 1, 1)}
+    cc = CC.CopyChecker.with_embedder(lambda p: vecs[p])
+    cc.set_photos(list(vecs))
+    tr.copy_checker = cc
+    items = [SimpleNamespace(image=p, category="image") for p in vecs]
+    with caplog.at_level("WARNING", logger="rulztrainer"):
+        tr._check_near_duplicates(items)
+    assert len(made) == 1  # the run's own checker is reused
+    found = status["near_duplicates"]
+    assert found["count"] == 1 and found["pairs"][0][:2] == ["a.png", "b.png"]
+    assert "a.png and b.png" in caplog.text
+
+
+def test_the_near_duplicate_check_stays_out_of_the_way(monkeypatch, caplog):
+    made = _fake_checker(monkeypatch)
+    for cfg in (_cfg(copy_check="off"), _cfg(noise_files=["x.safetensors"]), _cfg(soup_files=["x", "y"])):
+        tr, _ = _trainer(cfg)
+        tr.copy_checker = None
+        tr._check_near_duplicates(_photos())
+    tr, _ = _trainer(_cfg())
+    tr.copy_checker = None
+    tr._check_near_duplicates(_photos()[:1])  # one photo: nothing to compare
+    assert made == []
+    # a race row that keeps the check on is enough
+    tr, _ = _trainer(_cfg(copy_check="off", face_provider="cpu"))
+    tr.copy_checker, tr.race_rows = None, [("a", _cfg(copy_check="on"), {})]
+    tr._check_near_duplicates(_photos())
+    assert len(made) == 1
+    # a failure warns and the run goes on
+    _fake_checker(monkeypatch, fail=True)
+    tr, status = _trainer(_cfg(face_provider="cpu"))
+    tr.copy_checker = None
+    with caplog.at_level("WARNING", logger="rulztrainer"):
+        tr._check_near_duplicates(_photos())
+    assert "no network" in caplog.text and "near_duplicates" not in status
+
+
+def test_the_monitor_names_near_duplicate_photos():
+    import webui
+
+    assert webui.near_duplicate_note(None) == ""
+    note = webui.near_duplicate_note({"limit": 0.5, "count": 3, "pairs": [["a.png", "b.png", 0.725]]})
+    assert "a.png and b.png (0.72)" in note or "a.png and b.png (0.73)" in note
+    assert "limit 0.50" in note and "and 2 more" in note
+
+
 def test_a_probe_logs_its_closest_photo():
     from rulztrainer.likeness import ProbeRecord
 

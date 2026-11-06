@@ -16,7 +16,10 @@ Uses:
   - selftrain: a picture above the limit is left out ("copies a photo"): training on the LoRA's own near-copies of a
     photo teaches the copy, not the person in new scenes;
   - probes: every probe's highest copy score (and the photo it matches) is logged and kept in likeness.jsonl; it
-    decides nothing.
+    decides nothing;
+  - near-duplicate photos: two training photos that already match each other above the limit are named before training
+    starts. The median baseline does not show such a pair. A pair is trained about twice as often as one photo, and on
+    the set this was found on, every probe above the limit matched one of its two pairs. It only warns.
 
 Model: sscd_disc_mixup (TorchScript, about 99 MB, downloaded once to <models>/sscd/; MIT), 320 x 320 input with
 ImageNet normalization, as the SSCD repo's evaluation. No source calibrates SSCD on DiT LoRA renders of people, so
@@ -97,6 +100,15 @@ class CopyChecker:
         self.photos = list(dict.fromkeys(str(p) for p in paths))
         self.descs = np.stack([self.embed(p) for p in self.photos]) if self.photos else None
         self.baseline = reference_ceiling(self.descs) if self.descs is not None else None
+
+    def near_duplicates(self, limit: float) -> list[tuple[str, str, float]]:
+        """The pairs of training photos that match each other above limit: (photo, photo, cosine), closest first."""
+        if not self.ready or len(self.photos) < 2:
+            return []
+        sims = self.descs @ self.descs.T
+        pairs = [(self.photos[i], self.photos[j], float(sims[i, j]))
+                 for i, j in zip(*np.triu_indices(len(self.photos), k=1)) if sims[i, j] > limit]
+        return sorted(pairs, key=lambda p: -p[2])
 
     @property
     def ready(self) -> bool:
