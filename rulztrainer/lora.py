@@ -18,7 +18,7 @@ Export key formats (Arch.lora_format):
     diffusion_model.<module>.lora_B.weight      [out, rank]
 
   folded ComfyUI's and diffusers' loaders at once, for a family whose module names are the ones ComfyUI keeps under
-         "diffusion_model." and diffusers converts (FLUX 3 Klein: BFL's names; diffusers refuses .alpha keys there)
+         "diffusion_model." and diffusers converts (FLUX 3 Klein and FLUX.2 Klein: BFL's names; diffusers refuses .alpha keys there)
     diffusion_model.<module>.lora_A.weight      [rank, in]
     diffusion_model.<module>.lora_B.weight      [out, rank], already times alpha / rank: no .alpha key
     + "rulztrainer_lora_alpha" (JSON {module: alpha}) in the metadata, so a resume continues at the trained alpha

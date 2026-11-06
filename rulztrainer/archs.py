@@ -1,4 +1,4 @@
-"""Model architectures the trainer can train: MOSS-Image, Bria FIBO 2.0, Krea 2 and Qwen-Image 2.1.
+"""Model architectures the trainer can train: MOSS-Image, Bria FIBO 2.0, Krea 2, Qwen-Image 2.1 and the others below.
 
 Everything the training loop, sampler, caches and LoRA export need to know about a model family lives in an `Arch`.
 All families share the training loss (flow matching, velocity target), the 16-pixel latent cell (so region maps and
@@ -7,7 +7,7 @@ latents in a normalized 2x2-patchified layout [B, C, H/16, W/16]. MOSS-Image and
 (C = 128); Krea 2 uses the Qwen-Image VAE (C = 64) and caches its latents under their own names (`latent_tag`).
 Qwen-Image 2.1 has its own RGBA VAE, 16x with 64 channels, read unpatched: the same [B, 64, H/16, W/16] layout, on a
 32 px grid (`size_multiple`: its image tokens come in 2x2 groups).
-FLUX 3 Klein uses the Flux2 VAE too and shares MOSS-Image's / FIBO 2.0's latents (C = 128, 16 px grid).
+FLUX 3 Klein and FLUX.2 Klein 9B use the Flux2 VAE too and share MOSS-Image's / FIBO 2.0's latents (C = 128, 16 px grid).
 
     get_arch(cfg)              the Arch for a config (model_arch, or guessed from the model path)
     detect_arch(cfg, model_dir) the Arch from a resolved model directory's transformer/config.json
@@ -28,6 +28,7 @@ from .config import ARCH_DEFAULT_TARGETS, ARCH_FULL_SAMPLE, TrainConfig
 log = logging.getLogger("rulztrainer")
 
 ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21", "flux3_klein")
+ARCH_NAMES += ("flux2_klein",)
 ARCH_NAMES += ("ideogram4",)
 ARCH_NAMES += ("minimax_h3",)
 
@@ -722,6 +723,127 @@ _ARCHS = {"moss_image": MossArch, "fibo2": FiboArch, "krea2": Krea2Arch, "qwen_i
           "flux3_klein": Flux3KleinArch}
 
 
+class Flux2KleinArch(Arch):
+    name = "flux2_klein"
+    label = "FLUX.2 Klein 9B"
+    modelspec = "Flux.2-klein-9b"
+    # BFL's module names under diffusion_model. (the port keeps them), lora_A / lora_B with alpha folded in: what
+    # ai-toolkit saves for Klein, what ComfyUI's generic diffusion_model. keys read, what diffusers converts
+    lora_format = "folded"
+    n_blocks = 32  # 8 double + 24 single, one list in `model.layers` (double_blocks.N = N, single_blocks.N = 8 + N)
+    # q, k and v share one fused Linear, and a single block fuses its attention and MLP projections into linear1 and
+    # linear2 (as in the checkpoint, ai-toolkit and Fizgig): any group that names a part trains the fused layer
+    GROUPS = {"q": ("img_attn.qkv", "txt_attn.qkv", "linear1"), "k": ("img_attn.qkv", "txt_attn.qkv", "linear1"),
+              "v": ("img_attn.qkv", "txt_attn.qkv", "linear1"), "o": ("img_attn.proj", "txt_attn.proj", "linear2"),
+              "ffn_up_gate": ("img_mlp.0", "txt_mlp.0", "linear1"), "ffn_down": ("img_mlp.2", "txt_mlp.2", "linear2")}
+    EMBED = ("img_in", "time_in", "final_layer")
+    MODULATION = ("double_stream_modulation_img", "double_stream_modulation_txt", "single_stream_modulation")
+    target_groups = {"q": "attention query (double blocks: the fused qkv; single blocks: the fused linear1)",
+                     "k": "attention key (the same fused layers as q)", "v": "attention value (the same fused layers)",
+                     "o": "attention out (double blocks: proj; single blocks: the fused linear2)",
+                     "ffn_up_gate": "feed-forward in (double blocks: *_mlp.0; single blocks: the fused linear1)",
+                     "ffn_down": "feed-forward out (double blocks: *_mlp.2; single blocks: the fused linear2)",
+                     "modulation": "the shift / scale / gate projections of the timestep",
+                     "text_in": "text projection (the encoder's 3 stacked layers into the model)",
+                     "embed": "image / timestep embedders and the final layer"}
+    default_targets = ARCH_DEFAULT_TARGETS["flux2_klein"]
+    text_prefixes = ("txt_in",)
+    supports_single_files = True  # BFL's fp8 / bf16 files; Comfy-Org's Qwen3-8B and Flux2 VAE
+    default_sample_steps, default_sample_cfg = ARCH_FULL_SAMPLE["flux2_klein"]
+    # latent_tag "": the Flux2 VAE, encoded and normalized as MOSS-Image and FIBO 2.0 do, so their latents are shared
+
+    def __init__(self):
+        from .flux2 import loading
+
+        self._loading = loading
+
+    def resolve_for_config(self, cfg):
+        return self._loading.resolve_for_config(cfg)
+
+    def get_transformer(self, cfg, model_dir, device=None):
+        return self._loading.get_transformer(cfg, model_dir, device)
+
+    def get_vae(self, cfg, model_dir):
+        return self._loading.get_vae(cfg, model_dir)
+
+    def get_text_encoder(self, cfg, model_dir):
+        return self._loading.get_text_encoder(cfg, model_dir)
+
+    def load_any_transformer(self, path, device, quant="auto", models_dir="models"):
+        return self._loading.load_any_transformer(path, device, quant, models_dir)
+
+    def encode_prompt(self, text_encoder, tokenizer, prompt, max_length):
+        return self._loading.encode_prompt(text_encoder, tokenizer, prompt, max_length)
+
+    def pad_embeds(self, rows):
+        return self._loading.pad_embeds(rows)
+
+    def sample(self, model, pos_e, pos_m, neg_e, neg_m, **kw):
+        from .flux2.sampler import sample
+
+        return sample(model, pos_e, pos_m, neg_e, neg_m, **kw)
+
+    def sample_sigmas(self, model, steps, height, width, shift):
+        from .flux2.sampler import model_sigmas
+
+        return model_sigmas(model, steps, max(1, height // 16) * max(1, width // 16))
+
+    def distilled_sample_model(self, path: str) -> bool:
+        """The 4-step distilled Klein (FLUX.2-klein-9B, flux-2-klein-9b*.safetensors): no "base"."""
+        from .flux2.single_file import is_distilled_name
+
+        return is_distilled_name(path)
+
+    def lora_module_names(self, model, targets, blocks, include_text_embedder=False):
+        from .lora import _is_linear_like
+
+        targets = set(targets)
+        if include_text_embedder:
+            targets.add("text_in")
+        block_set = None if blocks is None else {int(b) for b in blocks}
+        in_block = sorted({s for t in targets for s in self.GROUPS.get(t, ())})
+        n_double = len(model.double_blocks)
+        names = []
+        for name, module in model.named_modules():
+            if not _is_linear_like(module):
+                continue
+            head = name.split(".")[0]
+            if head in ("double_blocks", "single_blocks"):
+                block = int(name.split(".")[1]) + (n_double if head == "single_blocks" else 0)
+                if (block_set is None or block in block_set) and _match_suffix(name, in_block):
+                    names.append(name)
+            elif head in self.MODULATION:
+                if "modulation" in targets:
+                    names.append(name)
+            elif name == "txt_in":
+                if "text_in" in targets:
+                    names.append(name)
+            elif "embed" in targets and head in self.EMBED:
+                names.append(name)
+        return names
+
+    def param_group_of(self, name):
+        parts = name.split(".")
+        if name.startswith(self.text_prefixes) or {"txt_attn", "txt_mlp"} & set(parts):
+            return "text"
+        if "img_mlp" in parts or parts[-1] == "linear2":
+            return "mlp"  # linear2 ends both streams of a single block; most of its width is the MLP's
+        if "img_attn" in parts or parts[-1] == "linear1":
+            return "attn"
+        return "other"
+
+    def reference_sigmas(self, n, gen, tokens):
+        # flux2_shift, as Fizgig trains Klein: logit-normal sigmas, shifted by exp(mu), mu linear in the latent token
+        # count from 0.5 at 256 tokens to 1.15 at 4096
+        slope = (1.15 - 0.5) / (4096 - 256)
+        shift = math.exp(slope * tokens + 0.5 - slope * 256)
+        s = torch.sigmoid(torch.randn(n, generator=gen))
+        return (shift * s / (1 + (shift - 1) * s)).clamp(0.0, 1.0)
+
+
+_ARCHS["flux2_klein"] = Flux2KleinArch
+
+
 class Ideogram4Arch(Arch):
     name = "ideogram4"
     label = "Ideogram 4"
@@ -1033,6 +1155,9 @@ def arch_from_transformer_file(path: str) -> str | None:
             elif "early_stream_modulations.image.lin.weight" in names or \
                     "early_stream_modulations.image.linear.weight" in names:
                 found = "flux3_klein"
+            elif "double_stream_modulation_img.lin.weight" in names or \
+                    "double_stream_modulation_img.linear.weight" in names:
+                found = "flux2_klein"
             elif "embed_image_indicator.weight" in names and "llm_cond_proj.weight" in names:
                 found = "ideogram4"
             elif "video_patch_proj.weight" in names and "audio_patch_proj.weight" in names:
@@ -1070,7 +1195,7 @@ def detect_arch(cfg: TrainConfig, model_dir: Path | None) -> Arch:
         found = {"BriaFibo2Transformer2DModel": "fibo2", "Krea2Transformer2DModel": "krea2",
                  "MOSImageTransformer": "moss_image", "MOSSImageTransformer": "moss_image",
                  "QwenImage21Transformer2DModel": "qwen_image21",
-                 "Flux3Transformer2DModel": "flux3_klein",
+                 "Flux3Transformer2DModel": "flux3_klein", "Flux2Transformer2DModel": "flux2_klein",
                  "Ideogram4Transformer2DModel": "ideogram4",
                  "MiniMaxH3Transformer3DModel": "minimax_h3", "MiniMaxH3DiTModel": "minimax_h3"}.get(cls)
         if found and found != guessed:
