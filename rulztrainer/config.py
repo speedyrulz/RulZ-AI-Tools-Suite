@@ -148,6 +148,12 @@ ARCH_TURBO = {
     "minimax_h3": {"repo": "Comfy-Org/MiniMax-H3",
                    "file": "loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors", "strength": 1.0,
                    "steps": 8, "cfg": 1.0, "shift": 12.0},
+    # FLUX.2 Klein 9B: vafipas663's rank 256 LoRA, Klein 9B extracted against Base (kohya names). 4 steps at CFG 1 on
+    # the distilled model's schedule. Its card reports static noise above strength 0.5, sometimes needing as low as
+    # 0.1; strength 1 is the project owner's choice. Not yet tried on real weights here
+    "flux2_klein": {"repo": "vafipas663/flux2-klein-base-9b-distill-lora",
+                    "file": "flux-2-klein-9b_extracted_lora_rank_256-bf16.safetensors", "strength": 1.0,
+                    "steps": 4, "cfg": 1.0, "shift": 2.02},
 }
 # Each family's training adapter (training_adapter: auto downloads it): a LoRA that is on while the LoRA trains and off
 # while it samples, and never saved into it, so the trained LoRA works on the plain model. Fizgig measured on

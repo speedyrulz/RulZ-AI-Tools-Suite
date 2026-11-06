@@ -2,7 +2,7 @@
 ComfyUI's Flux2Scheduler compute the same one): sigmas evenly spaced from 1 to 0, time-shifted by the empirical mu of
 the token count and step count, sampled with classifier-free guidance only (Klein has no guidance embedding). The
 4-step distilled Klein samples without guidance on ComfyUI's Euler simple schedule at shift 2.02, as Fizgig's previews
-do, so samples look like ComfyUI's output.
+do, so samples look like ComfyUI's output. Base with its turbo LoRA takes the same schedule.
 
 Guidance follows the trainer's convention for every family: uncond + cfg * (cond - uncond), cfg 1 = off."""
 from __future__ import annotations
@@ -42,8 +42,19 @@ def distilled_sigmas(steps: int = DISTILLED_STEPS, shift: float = DISTILLED_SHIF
     return _shifted(steps, shift)
 
 
+def uses_distilled_schedule(model) -> bool:
+    """The distilled model, or Base with its turbo LoRA attached and switched on for this sampling."""
+    if getattr(model, "is_distilled", False):
+        return True
+    if getattr(model, "turbo_lora_attached", False):
+        from ..lora import extras_active
+
+        return extras_active(model)
+    return False
+
+
 def model_sigmas(model, steps: int, tokens: int) -> torch.Tensor:
-    return distilled_sigmas(steps) if getattr(model, "is_distilled", False) else flux2_sigmas(steps, tokens)
+    return distilled_sigmas(steps) if uses_distilled_schedule(model) else flux2_sigmas(steps, tokens)
 
 
 @torch.no_grad()
