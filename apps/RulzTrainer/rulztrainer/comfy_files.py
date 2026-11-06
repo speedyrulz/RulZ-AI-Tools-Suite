@@ -14,9 +14,14 @@ import logging
 
 from .config import (ARCH_SAMPLE_LORA, ARCH_TRAINING_ADAPTER, ARCH_TURBO, COMFY_DIFFUSION_FILES, COMFY_DIFFUSION_QUANTS, COMFY_REPOS,
                      COMFY_TEXT_ENCODER_FILES, COMFY_TEXT_ENCODER_QUANTS, COMFY_VAE_FILES, TrainConfig)
-from .config import COMFY_TEXT_ENCODER_REPOS
+from .config import COMFY_DEFAULT_QUANT, COMFY_TEXT_ENCODER_REPOS
 
 log = logging.getLogger("rulztrainer")
+
+
+def _file_quant(fam: str, quant: str) -> str:
+    """The format to fetch: the config's default names the family's own default where it has no int8 file."""
+    return COMFY_DEFAULT_QUANT.get(fam, quant) if quant == "int8_convrot" else quant
 
 
 def planned_downloads(cfg: TrainConfig) -> list[tuple[str, str, str]]:
@@ -30,20 +35,26 @@ def planned_downloads(cfg: TrainConfig) -> list[tuple[str, str, str]]:
             if pattern is None:
                 raise ValueError(f"No single-file download for {cfg.model_path}: pick one of the listed models, set the "
                                  "diffusion model file, or use the Hugging Face source")
-            if cfg.model_file_quant not in COMFY_DIFFUSION_QUANTS[fam]:
+            model_quant = _file_quant(fam, cfg.model_file_quant)
+            if model_quant not in COMFY_DIFFUSION_QUANTS[fam]:
                 raise ValueError(f"model_file_quant {cfg.model_file_quant!r}: {COMFY_REPOS[fam]} has "
                                  f"{', '.join(COMFY_DIFFUSION_QUANTS[fam])}")
             from .config import COMFY_QUANT_NAMES
 
-            quant = COMFY_QUANT_NAMES.get(fam, {}).get(cfg.model_file_quant, cfg.model_file_quant)
-            out.append(("transformer_file", repo, pattern.format(quant=quant)))
+            quant = COMFY_QUANT_NAMES.get(fam, {}).get(model_quant, model_quant)
+            if isinstance(pattern, dict):  # one repo per format (FLUX.2 Klein's)
+                out.append(("transformer_file", *pattern[quant]))
+            else:
+                out.append(("transformer_file", repo, pattern.format(quant=quant)))
         if not cfg.text_encoder_file:
-            if cfg.text_encoder_file_quant not in COMFY_TEXT_ENCODER_QUANTS[fam]:
+            te_quant = _file_quant(fam, cfg.text_encoder_file_quant)
+            if te_quant not in COMFY_TEXT_ENCODER_QUANTS[fam]:
                 raise ValueError(f"text_encoder_file_quant {cfg.text_encoder_file_quant!r}: {COMFY_REPOS[fam]} has "
                                  f"{', '.join(COMFY_TEXT_ENCODER_QUANTS[fam])}")
-            te_repo = COMFY_TEXT_ENCODER_REPOS.get(fam, {}).get(cfg.text_encoder_file_quant, repo)
+            te_repo = COMFY_TEXT_ENCODER_REPOS.get(fam, {}).get(te_quant, repo)
+            te_file = COMFY_TEXT_ENCODER_FILES[fam]
             out.append(("text_encoder_file", te_repo,
-                        COMFY_TEXT_ENCODER_FILES[fam].format(quant=cfg.text_encoder_file_quant)))
+                        te_file[te_quant] if isinstance(te_file, dict) else te_file.format(quant=te_quant)))
         if not cfg.vae_file:
             out.append(("vae_file", repo, COMFY_VAE_FILES[fam]))
     if cfg.turbo_lora == "auto" and fam in ARCH_TURBO and not cfg.samples_on_distilled_model():

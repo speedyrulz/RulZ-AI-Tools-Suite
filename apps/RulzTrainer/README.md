@@ -17,6 +17,8 @@ A simple diffusion-model LoRA trainer with a WebUI. Supported models:
   ([details](#qwen-image-21)).
 - **FLUX 3 Klein** (5.5B, Black Forest Labs): train on Base, use on Base or the 16-step distilled Klein; one 16 GB card
   in int8 or bf16 ([details](#flux-3-klein)).
+- **FLUX.2 Klein 9B** (9B, Black Forest Labs): text-to-image LoRAs; train on Base, use on Base or the 4-step distilled
+  Klein ([details](#flux2-klein-9b)).
 - **Ideogram 4** (9.3B): LoRAs on one 16 GB card from the fp8 release, structured JSON captions or wrapped plain
   ones; non-commercial license ([details](#ideogram-4)).
 - **MiniMax H3** (33B video + audio): experimental one-frame image LoRAs for H3 video generation, as musubi-tuner
@@ -439,6 +441,7 @@ WebUI's *Download now* fetches them ahead of time). `model_file_quant` and `text
 | Krea 2 Raw / Turbo | [Comfy-Org/Krea-2](https://huggingface.co/Comfy-Org/Krea-2) | int8_convrot 13.5 GB, fp8_scaled 13.1 GB, bf16 26.3 GB | Qwen3-VL-4B int8_convrot 4.9 GB, fp8_scaled 5.2 GB, bf16 8.9 GB | `qwen_image_vae` |
 | FIBO 2.0 dev / Edit Turbo | [Comfy-Org/Fibo-2.0](https://huggingface.co/Comfy-Org/Fibo-2.0) | int8_convrot 8.4 GB, bf16 16.5 GB | Qwen3-VL-4B, the same files as Krea 2's | `flux2-vae` |
 | Qwen-Image 2.1 / Turbo | [Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1) | int8_convrot 7.3 GB, bf16 14.2 GB | Qwen3-VL-8B int8_convrot 9.4 GB, bf16 17.5 GB | `qwen_image_2.1_vae_bf16` |
+| FLUX.2 Klein 9B Base / distilled | BFL's [FLUX.2-klein-base-9b-fp8](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9b-fp8) and [-9b-fp8](https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8) (gated); bf16 in FLUX.2-klein-base-9B and -9B | fp8 8.9 GB, bf16 16.9 GB (read up to bf16, then quantized for your GPU) | [Comfy-Org/Flux-2-Klein-9B](https://huggingface.co/Comfy-Org/Flux-2-Klein-9B) Qwen3-8B fp8 mixed 8.1 GB, bf16 15.3 GB | `flux2-vae` |
 | FLUX 3 Klein Base / distilled | [black-forest-labs/flux-3-image-klein-comfy](https://huggingface.co/black-forest-labs/flux-3-image-klein-comfy) (BFL's own, gated) | int8_convrot 5.8 GB, nvfp4 5.3 GB, bf16 11.1 GB (files; 5.1 / 4.8 / 9.7 GB loaded) | Qwen3-VL-4B int8_convrot 4.9 GB, bf16 8.9 GB | `flux2-vae` |
 | Ideogram 4 | [Comfy-Org/Ideogram-4](https://huggingface.co/Comfy-Org/Ideogram-4) | int8_convrot 9.6 GB, fp8_scaled 9.3 GB, nvfp4_mixed 5.5 GB (no bf16 release) | Qwen3-VL-8B: int8_convrot 9.4 GB and bf16 17.5 GB from Comfy-Org/Qwen-Image-2.1 (the same model), fp8_scaled 10.6 GB and nvfp4 6.3 GB from Comfy-Org/Ideogram-4 | `flux2-vae` |
 | MiniMax H3 FL2VA / Ref2VA | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3) | pruned_int8_convrot 21.0 GB, pruned_bf16 40.2 GB, int8_convrot 34.0 GB, bf16 66.3 GB | Qwen3-VL-32B (50 layers) int8_convrot 27.1 GB, nvfp4_awq 15.7 GB, bf16 51.5 GB | `minimax_h3_video_vae_fp16` (5.2 GB) + `minimax_h3_audio_vae_fp32` (0.6 GB) |
@@ -1020,7 +1023,7 @@ layer (`automagic_groups: single`) beat `by_type` by 4.4 body points (p = 0.03),
 and 3e-4 tied at 1000 steps with every racer still improving. Use `single`, keep or lower the ceiling as you prefer, and
 plan on more than 1000 steps. The other Keel settings have no results yet.
 
-**MiniMax H3 and FLUX Klein** are trained in ai-toolkit, not here. `rulztrainer/optimizers/automagic4.py` depends only
+**MiniMax H3 and FLUX Klein** are trained in ai-toolkit, not here (RulzTrainer's own ports came later). `rulztrainer/optimizers/automagic4.py` depends only
 on `automagic3.py` next to it and keeps ai-toolkit's constructor (`step_target` is accepted and ignored), so copying it
 over `ai-toolkit/toolkit/optimizers/automagic4.py` gives ai-toolkit the fixed controller, including in its fused mode
 (where no gradient clipping runs, so set `max_lr` about 10x the start rate). On H3, the `adaln_proj` layers call their
@@ -2279,6 +2282,47 @@ Verified against diffusers: `tests/test_qwen21.py` checks the port against `Qwen
 weights, a padded batch against each sample alone), ComfyUI's fused single-file layout, the schedules against
 `FlowMatchEulerDiscreteScheduler`, an exported LoRA merged into diffusers' weights, the Turbo LoRA's fused feed-forward
 split onto both halves, and the training adapter (on while training, off while sampling, not saved).
+
+## FLUX.2 Klein 9B
+
+RulzTrainer trains text-to-image LoRAs for Black Forest Labs' FLUX.2 Klein 9B
+([black-forest-labs/FLUX.2-klein-base-9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B)): 9B weights,
+8 double and 24 single blocks, the Qwen3-8B text encoder and the Flux2 VAE of MOSS-Image / FIBO 2.0 / FLUX 3 Klein. Pick
+**FLUX-2-Klein-9B-Base** as the model; **FLUX-2-Klein-9B** is the 4-step distilled model, for samples. Its keys are the
+same as Base's, so it is told apart by its name: the trainer warns on a file named as distilled, and a renamed Base
+file should keep "base" in its name. Training image editing is out of scope: a LoRA trained here still loads for editing.
+FLUX.2 dev and Klein 4B are not supported (another text encoder) and are refused on load.
+
+- **Gated repos.** BFL's repos are gated with automatic approval: accept the FLUX Non-Commercial License on
+  [FLUX.2-klein-base-9b-fp8](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9b-fp8) (and on
+  [FLUX.2-klein-9b-fp8](https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8) for distilled samples) and log in
+  with `hf auth login`. The default `files` source takes BFL's fp8 file with
+  [Comfy-Org/Flux-2-Klein-9B](https://huggingface.co/Comfy-Org/Flux-2-Klein-9B)'s text encoder and VAE (not gated). The
+  `hf` source reads BFL's root `flux-2-klein-base-9b.safetensors`, `text_encoder/`, `tokenizer/` and `vae/`, about 32 GB;
+  a diffusers `transformer/` folder also loads.
+- **Memory.** No int8 release exists: the fp8 file is read up to bf16 (Fizgig's fp8-resident mode is not ported) and
+  `transformer_quant: auto` quantizes it: nvfp4 below 18 GB, int8 from 18 GB, bf16 from 30 GB, counting all GPUs of a
+  model split. These thresholds come from Fizgig's measurements on its own code (a rank-32 LoRA: int8 17.1 GB, 4-bit
+  9.9 GB at 1 MP), not from runs of this port. `text_encoder_quant: auto` keeps Qwen3-8B in bf16 from 19.5 GB, else
+  int8 ConvRot.
+- **Text features.** Layers 9, 18 and 27 of Qwen3-8B, right-padded to 512 tokens with thinking off in the chat template,
+  as ComfyUI, diffusers and ai-toolkit do. Fizgig also runs these layers through Qwen3's final RMSNorm; ComfyUI does
+  not, so this port does not. Each cached caption takes about 12.6 MB (the padding rows are part of the recipe).
+- **Training.** `timestep_sampling: reference` is Fizgig's flux2_shift. The default targets are the Linears of all 32
+  blocks, as ai-toolkit and Fizgig train. Fizgig's 1 / 1000 timestep offset is a leftover of its old trainer that
+  sampling does not share, so it is left out here.
+- **Blocks.** `model.layers` runs double then single: blocks 0-7 are `double_blocks`, 8-31 are `single_blocks`, for
+  `lora_blocks`, block swap, the model split and attention localization.
+- **Samples.** No turbo LoRA. Base samples 20 steps at CFG 3.5 on BFL's empirical-mu schedule. With a distilled model as
+  `sample_model_path`: 4 steps at CFG 1 on ComfyUI's simple schedule at shift 2.02, as Fizgig's previews.
+- **LoRAs** are saved under BFL's module names (`diffusion_model.<module>.lora_A / lora_B`, alpha folded in), the layout
+  ai-toolkit writes, for ComfyUI's Load LoRA node and diffusers' `Flux2KleinPipeline.load_lora_weights`.
+
+What is tested without weights (`tests/test_flux2.py`): the port against diffusers' `Flux2Transformer2DModel` with
+random weights, the key layouts both ways, the sampler against diffusers' scheduler, the LoRA export through diffusers'
+converter. A one-off check on CPU also read BFL's real `flux-2-klein-9b-fp8.safetensors`: every key matches the port, the
+file loads and a forward pass gives finite output. **Not run yet: a training run on real Klein weights, the real
+Qwen3-8B encoder, and a trained LoRA in ComfyUI.**
 
 ## FLUX 3 Klein
 

@@ -19,10 +19,12 @@ MODEL_PRESETS = {
     "Qwen-Image-2.1-Turbo": "Qwen/Qwen-Image-2.1-Turbo",
     "FLUX-3-Klein-Base": "black-forest-labs/flux-3-image-klein-base",
     "FLUX-3-Klein": "black-forest-labs/flux-3-image-klein",
+    "FLUX-2-Klein-9B-Base": "black-forest-labs/FLUX.2-klein-base-9B",
+    "FLUX-2-Klein-9B": "black-forest-labs/FLUX.2-klein-9B",
     "MiniMax-H3-FL2VA": "MiniMaxAI/MiniMax-H3",  # one repository holds both: transformer/ (FL2VA), transformer_ref/
     "MiniMax-H3-Ref2VA": "MiniMaxAI/MiniMax-H3#ref2va",
 }
-ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21", "flux3_klein", "minimax_h3")
+ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21", "flux3_klein", "flux2_klein", "minimax_h3")
 OPTIMIZERS = ("adamw", "adamw8bit", "adafactor", "automagic3", "automagic4", "keel", "keel_fb", "hull")
 AUTOMAGIC = ("automagic3", "automagic4", "keel", "keel_fb")  # self-tuning lr: no schedule, no LoRA+, no per-image lr
 KEEL = ("keel", "keel_fb")  # Keel and its face-and-body version: one class (optimizers/keel.py), keel_fb with the
@@ -84,6 +86,8 @@ def family_named_in(text: str) -> str | None:
         return "qwen_image21"
     if any(s in hint for s in ("flux-3", "flux3", "flux_3", "flux.3")):
         return "flux3_klein"
+    if any(s in hint for s in ("flux-2", "flux2", "flux_2", "flux.2")):
+        return "flux2_klein"
     for word, family in (("ideogram", "ideogram4"), ("minimax", "minimax_h3"), ("fibo", "fibo2"), ("krea", "krea2"),
                          ("moss", "moss_image")):
         if word in hint:
@@ -109,6 +113,7 @@ _CORE_TARGETS = ("q", "k", "v", "o", "ffn_up_gate", "ffn_down")
 ARCH_DEFAULT_TARGETS = {"moss_image": _CORE_TARGETS, "fibo2": _CORE_TARGETS,
                         "krea2": _CORE_TARGETS + ("attn_gate", "text_fusion"), "qwen_image21": _CORE_TARGETS,
                         "flux3_klein": _CORE_TARGETS + ("mode_blocks",),  # Klein: every block's attention + MLP
+                        "flux2_klein": _CORE_TARGETS,  # every block's attention + MLP, as ai-toolkit and Fizgig train
                         "minimax_h3": _CORE_TARGETS}  # H3: attn.qkv_proj, out_proj, mlp.fc1, fc2 (musubi-tuner's)
 # (sample steps, sample CFG) per family at full quality, in this trainer's guidance convention (uncond + cfg * (cond -
 # uncond), 1 = off): MOSS-Image's reference CFG 3; Bria's FIBO 2.0 pipeline, 30 steps at 5; Krea's pipeline, 28 steps
@@ -118,6 +123,7 @@ ARCH_FULL_SAMPLE = {"moss_image": (20, 3.0), "fibo2": (30, 5.0), "krea2": (28, 5
                     "flux3_klein": (50, 3.5)}  # FLUX 3 Klein Base: BFL's 50 steps at guidance 3.5 (diffusers' CFG)
 # MiniMax H3 is guidance-distilled (no CFG); 30 steps as musubi-tuner's one-frame example (the pipeline: 49)
 ARCH_FULL_SAMPLE["minimax_h3"] = (30, 1.0)
+ARCH_FULL_SAMPLE["flux2_klein"] = (20, 3.5)  # FLUX.2 Klein Base: BFL's defaults (no guidance embedding, CFG only)
 # Each family's turbo LoRA (turbo_lora: auto downloads it) and the sampling it is made for. The shift only matters for
 # MOSS-Image: the Krea 2 and FIBO 2.0 samplers take theirs from the image size.
 #   MOSS-Image: lodestones' 8-step DMD LoRA distilled from Base (Fizgig's pick), at 12 steps (Fizgig: much better than
@@ -210,6 +216,24 @@ COMFY_VAE_FILES = {"moss_image": "vae/flux2-vae_small.safetensors", "krea2": "va
 # A text encoder file another family's repackage holds (family -> quant -> repo; the family's own COMFY_REPOS repo
 # otherwise)
 COMFY_TEXT_ENCODER_REPOS: dict[str, dict[str, str]] = {}
+# FLUX.2 Klein 9B: no int8 release. BFL's own fp8 and bf16 files of the diffusion model live in one gated repo per
+# format ({quant: (repo, file)}); Comfy-Org's repo holds the text encoder and the VAE, ungated. An fp8 file is read up
+# to bf16 and quantized for the memory it runs in (transformer_quant), as any float file.
+COMFY_REPOS["flux2_klein"] = "Comfy-Org/Flux-2-Klein-9B"
+_BFL = "black-forest-labs/FLUX.2-klein"
+COMFY_DIFFUSION_FILES["black-forest-labs/FLUX.2-klein-base-9B"] = {
+    "fp8_scaled": (f"{_BFL}-base-9b-fp8", "flux-2-klein-base-9b-fp8.safetensors"),
+    "bf16": (f"{_BFL}-base-9B", "flux-2-klein-base-9b.safetensors")}
+COMFY_DIFFUSION_FILES["black-forest-labs/FLUX.2-klein-9B"] = {
+    "fp8_scaled": (f"{_BFL}-9b-fp8", "flux-2-klein-9b-fp8.safetensors"),
+    "bf16": (f"{_BFL}-9B", "flux-2-klein-9b.safetensors")}
+COMFY_DIFFUSION_QUANTS["flux2_klein"] = ("fp8_scaled", "bf16")
+COMFY_TEXT_ENCODER_FILES["flux2_klein"] = {"fp8_scaled": "split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors",
+                                           "bf16": "split_files/text_encoders/qwen_3_8b.safetensors"}
+COMFY_TEXT_ENCODER_QUANTS["flux2_klein"] = ("fp8_scaled", "bf16")
+COMFY_VAE_FILES["flux2_klein"] = "split_files/vae/flux2-vae.safetensors"
+# The format the config's default (int8_convrot) means for a family that has no such file
+COMFY_DEFAULT_QUANT = {"flux2_klein": "fp8_scaled"}
 
 # Ideogram 4 (ideogram-ai/ideogram-4-fp8, gated; the unsloth/ideogram-4-fp8 mirror is not): no bf16 release, the fp8
 # weights are the source. Full sampling is Ideogram's V4_DEFAULT_20 preset, 20 steps at guidance 7 (its g * cond +
