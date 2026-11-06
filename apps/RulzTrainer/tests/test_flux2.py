@@ -363,8 +363,15 @@ def test_text_features_are_layers_9_18_27_right_padded():
     assert text == FL.chat_text("a cat") and drop == 0 and length == 512 and len(offsets) == len(text)
 
 
-def test_text_model_builds_from_the_real_key_layout():
-    """Comfy-Org's qwen_3_8b.safetensors: model.* with an lm_head to leave out."""
+@pytest.mark.parametrize("rotary_takes_device", [True, False])
+def test_text_model_builds_from_the_real_key_layout(monkeypatch, rotary_takes_device):
+    """Comfy-Org's qwen_3_8b.safetensors: model.* with an lm_head to leave out. Some transformers
+    releases dropped the device argument of the rotary embedding."""
+    if not rotary_takes_device:
+        from transformers.models.qwen3 import modeling_qwen3 as M
+
+        original = M.Qwen3RotaryEmbedding.__init__
+        monkeypatch.setattr(M.Qwen3RotaryEmbedding, "__init__", lambda self, config: original(self, config))
     te = tiny_qwen3()
     state = {f"model.{k}": v.clone() for k, v in te.state_dict().items()}
     state["lm_head.weight"] = state["model.embed_tokens.weight"]

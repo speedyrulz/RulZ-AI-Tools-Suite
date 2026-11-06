@@ -11,6 +11,7 @@ The text encoder is plain Qwen3-8B (Qwen3ForCausalLM's `model.*`): built as a te
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import re
 from pathlib import Path
@@ -180,8 +181,9 @@ def build_text_model(state: dict, quant: str = "none", work_device=None):
     with torch.device("meta"):
         model = Qwen3Model(cfg)
     sf.install_state(model, state, quant, torch.bfloat16, ignore_missing=("inv_freq",), work_device=work_device)
-    # rotary buffers were created on the meta device; rebuild them for real
-    model.rotary_emb = type(model.rotary_emb)(config=cfg, device="cpu")
+    rot_cls = type(model.rotary_emb)  # its buffers were created on the meta device: build it again for real
+    kwargs = {"device": "cpu"} if "device" in inspect.signature(rot_cls.__init__).parameters else {}
+    model.rotary_emb = rot_cls(config=cfg, **kwargs)
     for name, p in model.named_parameters():
         if p.device.type == "meta":
             raise ValueError(f"Text encoder parameter {name} was not loaded")
