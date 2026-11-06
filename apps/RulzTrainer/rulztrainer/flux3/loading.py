@@ -105,8 +105,10 @@ def resolve_quant(quant: str, devices) -> str:
 def gated_error(repo: str, err: Exception) -> Exception:
     """A PermissionError that says which license to accept where (the download's own error is only a 401 / 403)."""
     bfl = repo.lower().startswith("black-forest-labs/")
-    text = GATE_HELP.format(what="Black Forest Labs' FLUX 3 Klein" if bfl else repo, repo=repo,
-                            license=" (FLUX Kommunity License, approved automatically)" if bfl else "")
+    flux2 = bfl and "flux.2" in repo.lower()
+    what = "Black Forest Labs' FLUX.2 Klein" if flux2 else "Black Forest Labs' FLUX 3 Klein" if bfl else repo
+    terms = "FLUX Non-Commercial License" if flux2 else "FLUX Kommunity License"
+    text = GATE_HELP.format(what=what, repo=repo, license=f" ({terms}, approved automatically)" if bfl else "")
     return PermissionError(f"{text} ({type(err).__name__})")
 
 

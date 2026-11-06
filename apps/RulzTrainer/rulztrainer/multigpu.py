@@ -355,7 +355,8 @@ def apply_assignment(model: nn.Module, assignment: list[str], primary: str | Non
     primary = primary or getattr(model, "split_primary", None) or assignment[0]
     tail = model.split_tail_modules() if hasattr(model, "split_tail_modules") else [
         model.final_norm_video, model.final_linear_video]  # MOSS-Image
-    placed = {id(model.layers), *(id(m) for m in tail)}
+    lists = model.split_block_lists() if hasattr(model, "split_block_lists") else []  # FLUX.2 Klein: two block lists
+    placed = {id(model.layers), *(id(m) for m in tail), *(id(m) for m in lists)}
     for child in model.children():
         if id(child) not in placed:
             child.to(primary)
