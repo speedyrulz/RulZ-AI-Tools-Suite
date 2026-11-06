@@ -1573,8 +1573,14 @@ memorization studies use (Somepalli et al. 2023 read a cosine above 0.5 as a lik
 - **Probes:** each probe logs its closest training photo ("Copy check step N: closest training photo 0.42
   (step000400_body_0.png to 17.jpg) | the photos among themselves 0.31 | copy limit 0.50"), and `likeness.jsonl`
   keeps `copy`, `copy_of` and `copy_baseline`; the Monitor's probe line shows `copy`. It decides nothing.
+- **Near-duplicate photos:** before training, unless `copy_check` is `off`, any two training photos that match each
+  other above the limit are named in the log and on the Monitor. Such a pair is trained about twice as often as one
+  photo, and the median baseline does not show it. It only warns: remove one photo of the pair and start again. On one
+  set, every probe above the limit across 18 logs matched one of its two near-duplicate pairs; that is one set, so treat
+  it as a lead.
 - **When:** `auto` (the default) with self-training (in a race: when any configuration self-trains; the gate only
-  applies to those that do), `on` for any run with probes, `off` never. Not in the noise check or a seed soup.
+  applies to those that do), `on` for any run with probes, `off` never. Not in the noise check or a seed soup. The
+  near-duplicate check runs at both `auto` and `on`, so `auto` downloads the model on any run with two or more photos.
 
 No study calibrates SSCD on DiT LoRA renders of people, so the limit is the literature's partial-copy threshold read
 against your photos' own baseline; check a few left-out pictures by eye and raise `copy_max` if they are not copies.

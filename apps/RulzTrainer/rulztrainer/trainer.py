@@ -41,6 +41,7 @@ from .multigpu import (Balancer, choose_counts, clone_to, compile_count, job_ord
 log = logging.getLogger("rulztrainer")
 DP_COMPILE_QUIET_STEPS = 3  # data parallel + compile: serial steps without a new graph before going parallel
 TEXT_TIMING_PROMPTS = 3 * TEXT_BATCH  # prompts (three batches) timed on the first copy before deciding on a second
+NEAR_DUPLICATES_SHOWN = 20  # pairs of near-identical training photos named in the log and on the Monitor
 BAD_STEP_LIMIT = 25  # non-finite gradient steps in a row that end a run (a race's bad configuration just scores low)
 
 
@@ -1134,6 +1135,7 @@ class Trainer(RaceParallelMixin):
                          "(%d steps without a new graph), then in parallel", DP_COMPILE_QUIET_STEPS)
         self.all_items = items
         self.copy_checker = self._make_copy_checker(items)
+        self._check_near_duplicates(items)
         self.sides = cfg.training_sides()
         if cfg.resolution_step_up:
             if self.controller is None:
@@ -4210,6 +4212,55 @@ class Trainer(RaceParallelMixin):
                 + (f"above the copy limit {limit:.2f}: it may copy that photo" if score > limit
                    else f"copy limit {limit:.2f}"))
 
+    def _copy_device(self) -> str:
+        """The copy check's device: the face scorer's."""
+        from . import facesim
+
+        index = facesim.cuda_index(self.cfg.face_provider)
+        return f"cuda:{index}" if index is not None and torch.cuda.is_available() else "cpu"
+
+    def _check_near_duplicates(self, items) -> None:
+        """Name the training photos that already match each other above the copy limit (copycheck.py). Runs unless
+        copy_check is off, with its own short-lived checker when the run keeps none; it warns and never stops a run."""
+        cfg = self.cfg
+        cfgs = [cfg] + [c for _, c, _ in (getattr(self, "race_rows", None) or [])]
+        photos = list(dict.fromkeys(str(it.image) for it in items if it.category == "image"))
+        if (len(photos) < 2 or cfg.noise_files or cfg.soup_files
+                or all(str(c.copy_check).lower() == "off" for c in cfgs)):
+            return
+        from . import copycheck
+
+        checker = getattr(self, "copy_checker", None)
+        try:
+            if checker is None:
+                self.status.update(stage="checking the photos for near-duplicates (SSCD)")
+                checker = copycheck.CopyChecker(cfg.models_dir, self._copy_device(),
+                                                progress=lambda t, f: self.status.update(stage=t))
+                checker.set_photos(photos)
+            limit = copycheck.copy_limit(cfg.copy_max, checker.baseline)
+            pairs = checker.near_duplicates(limit)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Could not check the photos for near-duplicates (%s); skipped", e)
+            return
+        finally:
+            if checker is not None and checker is not getattr(self, "copy_checker", None):
+                checker.model = None
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        if not pairs:
+            log.info("Near-duplicate check: no two of the %d training photos match above %.2f", len(photos), limit)
+            return
+        log.warning("Near-duplicate check: %d pair(s) of training photos match above the copy limit %.2f. A pair is "
+                    "trained about twice as often as one photo and is the likeliest to be memorised; consider "
+                    "removing one photo of each", len(pairs), limit)
+        for a, b, score in pairs[:NEAR_DUPLICATES_SHOWN]:
+            log.warning("  %.2f: %s and %s", score, Path(a).name, Path(b).name)
+        if len(pairs) > NEAR_DUPLICATES_SHOWN:
+            log.warning("  and %d more", len(pairs) - NEAR_DUPLICATES_SHOWN)
+        self.status.update(near_duplicates={
+            "limit": limit, "count": len(pairs),
+            "pairs": [[Path(a).name, Path(b).name, round(score, 3)] for a, b, score in pairs[:NEAR_DUPLICATES_SHOWN]]})
+
     def _make_copy_checker(self, items):
         """The SSCD copy check (copycheck.py) when the run, or any race configuration, wants it and something renders
         pictures to check (probes or self-training): the training photos described once, on the face scorer's
@@ -4225,10 +4276,9 @@ class Trainer(RaceParallelMixin):
         photos = [str(it.image) for it in items if it.category == "image"]
         if not photos:
             return None
-        from . import copycheck, facesim
+        from . import copycheck
 
-        index = facesim.cuda_index(cfg.face_provider)
-        dev = f"cuda:{index}" if index is not None and torch.cuda.is_available() else "cpu"
+        dev = self._copy_device()
         self.status.update(stage="loading the copy check (SSCD)")
         t0 = time.time()
         try:

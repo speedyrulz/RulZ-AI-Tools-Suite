@@ -3719,6 +3719,17 @@ RACE_LABELS = {
 }
 
 
+def near_duplicate_note(found: dict | None) -> str:
+    """The Monitor's warning about training photos that nearly match each other; "" with none."""
+    if not found:
+        return ""
+    shown = found.get("pairs") or []
+    pairs = "; ".join(f"{a} and {b} ({score:.2f})" for a, b, score in shown)
+    more = found.get("count", len(shown)) - len(shown)
+    return (f"Near-duplicate photos above the copy limit {found.get('limit', 0):.2f}: {pairs}"
+            + (f"; and {more} more" if more > 0 else "") + ". Consider removing one photo of each pair.")
+
+
 def race_choice_options() -> dict[str, str]:
     """{setting: "group: name"} of everything a racer may change, for the wizard's picker."""
     from rulztrainer.race import RACE_KEYS
@@ -8711,6 +8722,8 @@ def build_page(local: bool = True):
                          "running; a WebUI restarted with runs waiting and nothing running pauses the queue until you "
                          "Resume it.")
                     queue_list = ui.column().classes("w-full gap-1")
+                near_dup_label = ui.label("").classes("w-full text-sm text-orange-8")
+                near_dup_label.visible = False
                 with section("Configuration race", "Smoothed probe score per configuration; the lowest leaves after "
                              "every round", "emoji_events") as race_exp:
                     race_label = hint("")
@@ -9110,6 +9123,9 @@ def build_page(local: bool = True):
                                          if med is not None else f"Epoch {lw.get('epoch')}: waiting for the first epoch")
                         lw_table.rows = lw.get("rows") or []
                         lw_table.update()
+                dup_note = near_duplicate_note(st.get("near_duplicates"))
+                near_dup_label.visible = bool(dup_note)
+                near_dup_label.text = dup_note
                 rc = st.get("race")
                 race_exp.visible = bool(rc)
                 if rc:
@@ -9624,6 +9640,12 @@ that were scored. It pays off when one probe on the second GPU takes less time t
 (measured 10-24% faster on Qwen 2.1); with large probes every few steps training waits for them and it is slower. The
 log shows each probe's time as "on cuda:0, in at step N", and the end of training how long training waited. Not used
 in a configuration race or a fine-tune; if the second GPU runs out of memory, probes go back to the training GPU.
+
+## Near-duplicate photos
+Before training, unless *Copy check* is off, SSCD compares your training photos with each other (it is about 99 MB,
+downloaded once) and names any two that match above *Copy limit*. Such a pair is nearly one picture shown twice, so it
+is trained about twice as often as one photo and is the likeliest to be memorised. The Monitor shows the pairs, and
+the log lists them. It only warns: to act on it, remove one photo of each pair and start again.
 
 ## Copy check (SSCD)
 A LoRA trained on a few photos can learn to redraw one of them: same pose, same outfit, same background. *Copy check*
