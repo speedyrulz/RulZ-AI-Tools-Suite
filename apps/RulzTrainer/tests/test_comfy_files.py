@@ -26,7 +26,7 @@ def test_defaults_are_single_files_turbo_and_sam3():
     assert ARCH_SAMPLE_DEFAULTS == {"moss_image": (12, 1.0), "krea2": (8, 1.0), "fibo2": (4, 1.0),
                                     "qwen_image21": (8, 1.0),
                                     "ideogram4": (8, 1.0),
-                                    "minimax_h3": (8, 1.0)}
+                                    "minimax_h3": (8, 1.0), "flux2_klein": (4, 1.0)}
 
 
 def test_planned_downloads_per_model_and_quant():

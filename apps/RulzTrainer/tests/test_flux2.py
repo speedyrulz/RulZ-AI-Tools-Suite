@@ -414,14 +414,17 @@ def test_detection_caches_buckets_and_downloads(tmp_path):
     assert plan == {
         "transformer_file": ("black-forest-labs/FLUX.2-klein-base-9b-fp8", "flux-2-klein-base-9b-fp8.safetensors"),
         "text_encoder_file": (comfy, "split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors"),
-        "vae_file": (comfy, "split_files/vae/flux2-vae.safetensors")}  # no turbo LoRA, no training adapter
+        "vae_file": (comfy, "split_files/vae/flux2-vae.safetensors"),
+        "turbo_lora": (ARCH_TURBO["flux2_klein"]["repo"], ARCH_TURBO["flux2_klein"]["file"])}  # no training adapter
     plan = {f: (r, n) for f, r, n in planned_downloads(TrainConfig(model_path=DISTILLED, model_file_quant="bf16",
                                                                    text_encoder_file_quant="bf16"))}
     assert plan["transformer_file"] == ("black-forest-labs/FLUX.2-klein-9B", "flux-2-klein-9b.safetensors")
     assert plan["text_encoder_file"][1] == "split_files/text_encoders/qwen_3_8b.safetensors"
     with pytest.raises(ValueError, match="model_file_quant"):
         planned_downloads(TrainConfig(model_path=BASE, model_file_quant="nvfp4"))
-    assert "flux2_klein" not in ARCH_TURBO and "flux2_klein" not in ARCH_SAMPLE_DEFAULTS
+    assert ARCH_SAMPLE_DEFAULTS["flux2_klein"] == (4, 1.0) and ARCH_TURBO["flux2_klein"]["strength"] == 1.0
+    on_distilled = TrainConfig(model_path=BASE, sample_model_path=DISTILLED)
+    assert "turbo_lora" not in {f for f, _, _ in planned_downloads(on_distilled)}
 
 
 def test_distilled_naming_and_gated_help():
@@ -463,9 +466,12 @@ def test_wizard_review_and_block_swap(tmp_path):
     base = dict(model_path=BASE, datasets=[{"path": str(a)}])
     rec = webui.wizard_recommendations(TrainConfig(**base), "character", [{"total": 24000}], data)
     assert rec["lora_rank"][0] == 16 and rec["lora_alpha"][0] == 16.0 and rec["learning_rate"][0] == 1e-4
-    assert (rec["sample_steps"][0], rec["sample_cfg"][0]) == (20, 3.5)
-    assert (rec["probe_steps"][0], rec["probe_cfg"][0]) == (20, 3.5)
+    assert (rec["sample_steps"][0], rec["sample_cfg"][0]) == (4, 1.0)
+    assert (rec["probe_steps"][0], rec["probe_cfg"][0]) == (4, 1.0)
     assert "int8" in rec["transformer_quant"][1]
+    no_turbo = webui.wizard_recommendations(TrainConfig(**base, turbo_lora=""), "character", [{"total": 24000}], data)
+    assert (no_turbo["sample_steps"][0], no_turbo["sample_cfg"][0]) == (20, 3.5)
+    assert (no_turbo["probe_steps"][0], no_turbo["probe_cfg"][0]) == (20, 3.5)
     distilled = TrainConfig(**base, sample_model_path=DISTILLED)
     rec = webui.wizard_recommendations(distilled, "character", [{"total": 24000}], data)
     assert (rec["sample_steps"][0], rec["sample_cfg"][0]) == (4, 1.0) and rec["probe_cfg"][0] == 1.0
@@ -476,3 +482,39 @@ def test_wizard_review_and_block_swap(tmp_path):
     wrong = TrainConfig(model_path=DISTILLED, datasets=[{"path": str(a)}])
     assert any("distilled" in t and k == "warning" for k, t in webui.review_issues(wrong, "style", data, 1))
     assert set(webui.file_quant_options("flux2_klein", "model")) == {"fp8_scaled", "bf16"}
+
+
+def test_kohya_turbo_lora_attaches_and_takes_the_distilled_schedule(tmp_path):
+    """The real file's layout: lora_unet_ names with underscores, lora_down / lora_up and alpha."""
+    from safetensors.torch import save_file
+
+    from rulztrainer import lora as L
+    from rulztrainer.flux2 import sampler as S
+
+    torch.manual_seed(1)
+    model = Flux2KleinTransformer(**TINY).float()
+    arch = archs.arch_by_name("flux2_klein")
+    state = {}
+    for name in ("double_blocks.0.img_attn.qkv", "double_blocks.0.txt_attn.proj", "double_blocks.0.img_mlp.0",
+                 "double_blocks.0.txt_mlp.2", "single_blocks.0.linear1", "single_blocks.0.linear2"):
+        m = model.get_submodule(name)
+        stem = "lora_unet_" + name.replace(".", "_")
+        state[stem + ".lora_down.weight"] = torch.randn(2, m.in_features) * 0.1
+        state[stem + ".lora_up.weight"] = torch.randn(m.out_features, 2) * 0.1
+        state[stem + ".alpha"] = torch.tensor(2.0)
+    path = tmp_path / "turbo.safetensors"
+    save_file(state, path)
+    x, enc = torch.randn(1, 16, 2, 2), torch.randn(1, 4, 24)
+    with torch.no_grad():
+        before = model(x, 500.0, enc)
+    assert S.model_sigmas(model, 4, 256).tolist() == S.flux2_sigmas(4, 256).tolist()
+    assert L.attach_extra_lora(model, path, 0.5, rename=arch.lora_module_name) == 6
+    model.turbo_lora_attached = True
+    L.set_extras_enabled(model, True)
+    assert S.model_sigmas(model, 4, 256).tolist() == S.distilled_sigmas(4).tolist()
+    with torch.no_grad():
+        assert not torch.equal(model(x, 500.0, enc), before)
+    L.set_extras_enabled(model, False)
+    assert S.model_sigmas(model, 4, 256).tolist() == S.flux2_sigmas(4, 256).tolist()
+    with torch.no_grad():
+        assert torch.allclose(model(x, 500.0, enc), before)

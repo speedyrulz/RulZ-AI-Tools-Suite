@@ -4142,7 +4142,7 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     elif klein2_distilled:
         r["sample_steps"] = (4, "the distilled FLUX.2 Klein (your sampling model) is a 4-step model")
         r["sample_cfg"] = (1.0, "the distilled Klein samples without guidance")
-    elif klein2 and cfg.turbo_lora in ("auto", ""):  # no turbo LoRA for Klein
+    elif klein2 and not cfg.turbo_lora:  # the turbo LoRA switched off
         r["sample_steps"] = (20, "BFL's default for Klein Base (the distilled Klein as the sampling model takes 4)")
         r["sample_cfg"] = (3.5, "BFL's guidance for Klein Base; it has no guidance embedding, CFG is all that steers it")
     elif klein and cfg.turbo_lora in ("auto", ""):  # no turbo LoRA for Klein
@@ -4176,7 +4176,7 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
         r["sample_cfg"] = (3.0, "the reference MOSS-Image guidance scale")
     if character:
         r["probe_every"] = (25, "frequent quick checks give the best-checkpoint and early-stop decisions enough points")
-        if (cfg.turbo_lora and not ((klein or klein2) and cfg.turbo_lora == "auto")) or cfg.samples_on_distilled_model():
+        if (cfg.turbo_lora and not (klein and cfg.turbo_lora == "auto")) or cfg.samples_on_distilled_model():
             r["probe_steps"] = (r["sample_steps"][0], "fast probes with the turbo model" if cfg.samples_on_distilled_model()
                                 else "fast probes with the turbo LoRA")
             r["probe_cfg"] = (1.0, "turbo models sample without guidance")
@@ -7738,10 +7738,12 @@ def build_page(local: bool = True):
                              "the sampling model below and sample 16 steps at CFG 1.").bind_visibility_from(
                             w["model_preset"], "value",
                             lambda p: preset_arch(p, w["model_path"].value) == "flux3_klein")
-                        hint("FLUX.2 Klein 9B: no turbo LoRA. Base samples 20 steps at CFG 3.5; it has no guidance "
-                             "embedding, so CFG is all that steers it. Faster previews: set the distilled "
-                             "black-forest-labs/FLUX.2-klein-9B (or a flux-2-klein-9b*.safetensors file) as the "
-                             "sampling model below and sample 4 steps at CFG 1.").bind_visibility_from(
+                        hint("FLUX.2 Klein 9B: Base samples with vafipas663's turbo LoRA (1.2 GB) at 4 steps, CFG 1. "
+                             "Its author reports static noise above strength 0.5, sometimes needing as low as 0.1: "
+                             "lower the strength if previews come out noisy. Without it, Base samples 20 steps at "
+                             "CFG 3.5; the distilled "
+                             "black-forest-labs/FLUX.2-klein-9B as the sampling model takes 4 steps at CFG 1 and "
+                             "needs no turbo LoRA.").bind_visibility_from(
                             w["model_preset"], "value",
                             lambda p: preset_arch(p, w["model_path"].value) == "flux2_klein")
                         with advanced("Seeds, negative prompt and sampling models"):
@@ -9868,8 +9870,10 @@ The wizard suggests Fizgig's full-model recipe: rank 16, alpha 16, learning rate
 blocks. Fizgig finds style and composition mostly in blocks 0-9 and identity in 9-24. q, k and v are one fused layer, and
 a single block fuses its attention and feed-forward projections, so those target groups overlap there.
 
-There is no turbo LoRA: Base samples 20 steps at CFG 3.5. For quick previews set the distilled
-black-forest-labs/FLUX.2-klein-9B as the sampling model and sample 4 steps at CFG 1. LoRAs are saved under BFL's module
+Previews on Base use vafipas663's turbo LoRA (extracted from the distilled model, 1.2 GB) at 4 steps, CFG 1, strength 1.
+Its author reports static noise above strength 0.5, sometimes needing as low as 0.1: lower it if previews are noisy. Turn it off
+for Base's own 20 steps at CFG 3.5, or set the distilled black-forest-labs/FLUX.2-klein-9B as the sampling model, which
+needs no turbo LoRA (4 steps, CFG 1). LoRAs are saved under BFL's module
 names (`diffusion_model.<module>.lora_A / lora_B`, the alpha folded in), the layout ai-toolkit writes, which ComfyUI's
 Load LoRA node reads for Base and the distilled model and diffusers' Flux2KleinPipeline converts. The FLUX
 Non-Commercial License covers non-commercial use: read it before you share or sell a LoRA.

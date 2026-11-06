@@ -794,6 +794,18 @@ class Flux2KleinArch(Arch):
 
         return is_distilled_name(path)
 
+    @staticmethod
+    def lora_module_name(name: str) -> str:
+        """kohya's flattened names (double_blocks_0_img_attn_qkv, the lora_unet_ prefix already stripped) -> ours."""
+        import re
+
+        for pat, rep in ((r"^double_blocks_(\d+)_(img|txt)_attn_(qkv|proj)$", r"double_blocks.\1.\2_attn.\3"),
+                         (r"^double_blocks_(\d+)_(img|txt)_mlp_(\d+)$", r"double_blocks.\1.\2_mlp.\3"),
+                         (r"^single_blocks_(\d+)_(linear[12])$", r"single_blocks.\1.\2")):
+            if re.match(pat, name):
+                return re.sub(pat, rep, name)
+        return name
+
     def lora_module_names(self, model, targets, blocks, include_text_embedder=False):
         from .lora import _is_linear_like
 

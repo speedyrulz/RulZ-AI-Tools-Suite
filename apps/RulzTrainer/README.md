@@ -2313,8 +2313,12 @@ FLUX.2 dev and Klein 4B are not supported (another text encoder) and are refused
   sampling does not share, so it is left out here.
 - **Blocks.** `model.layers` runs double then single: blocks 0-7 are `double_blocks`, 8-31 are `single_blocks`, for
   `lora_blocks`, block swap, the model split and attention localization.
-- **Samples.** No turbo LoRA. Base samples 20 steps at CFG 3.5 on BFL's empirical-mu schedule. With a distilled model as
-  `sample_model_path`: 4 steps at CFG 1 on ComfyUI's simple schedule at shift 2.02, as Fizgig's previews.
+- **Samples.** `turbo_lora: auto` downloads vafipas663's
+  [flux2-klein-base-9b-distill-lora](https://huggingface.co/vafipas663/flux2-klein-base-9b-distill-lora) (rank 256,
+  1.2 GB), extracted from the distilled model, and samples 4 steps at CFG 1 on ComfyUI's simple schedule at shift 2.02.
+  `turbo_lora_strength` stays 1. Its author reports static noise above strength 0.5, sometimes needing as low as 0.1, so
+  lower it if previews are noisy. Not tried on real weights here yet. With `turbo_lora: ""`, Base samples 20 steps at CFG 3.5 on BFL's empirical-mu schedule. A
+  distilled model as `sample_model_path` needs no turbo LoRA: the same 4 steps, CFG 1 and schedule, as Fizgig's previews.
 - **LoRAs** are saved under BFL's module names (`diffusion_model.<module>.lora_A / lora_B`, alpha folded in), the layout
   ai-toolkit writes, for ComfyUI's Load LoRA node and diffusers' `Flux2KleinPipeline.load_lora_weights`.
 
