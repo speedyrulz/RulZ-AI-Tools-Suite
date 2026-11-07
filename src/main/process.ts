@@ -1,6 +1,7 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 
 /** Quotes one argument the way CommandLineToArgvW (and so most Windows programs) reads it back. */
 export function quoteArg(arg: string): string {
@@ -42,6 +43,21 @@ export interface RunOptions {
   gui?: boolean
 }
 
+/**
+ * Turns a stream's chunks into lines (\n, \r\n, or a lone \r as progress bars use), blank ones skipped. The decoder
+ * keeps a character whose bytes are split across two chunks whole; `end` passes on the line left without a break.
+ */
+export function lineSplitter(onLine?: (line: string) => void): { write: (chunk: Buffer) => void; end: () => void } {
+  const decoder = new StringDecoder('utf8')
+  let rest = ''
+  const take = (text: string, last: boolean): void => {
+    const parts = (rest + text).split(/\r\n|\r|\n/)
+    rest = last ? '' : (parts.pop() ?? '')
+    for (const p of parts) if (p.trim()) onLine?.(p)
+  }
+  return { write: (chunk) => take(decoder.write(chunk), false), end: () => take(decoder.end(), true) }
+}
+
 /** Runs a command to completion, streaming its output line by line. Resolves with the exit code. */
 export function runCommand(run: string[], opts: RunOptions): Promise<number> {
   const program = resolveProgram(run[0], opts.cwd)
@@ -67,21 +83,18 @@ export function runCommand(run: string[], opts: RunOptions): Promise<number> {
     const onAbort = (): void => killTree(child.pid)
     opts.signal?.addEventListener('abort', onAbort, { once: true })
 
-    const splitter = (): ((chunk: Buffer) => void) => {
-      let rest = ''
-      return (chunk) => {
-        const parts = (rest + chunk.toString('utf8')).split(/\r\n|\r|\n/)
-        rest = parts.pop() ?? ''
-        for (const p of parts) if (p.trim()) opts.onLine?.(p)
-      }
-    }
-    child.stdout?.on('data', splitter())
-    child.stderr?.on('data', splitter())
+    const out = lineSplitter(opts.onLine)
+    const err = lineSplitter(opts.onLine)
+    child.stdout?.on('data', out.write)
+    child.stderr?.on('data', err.write)
     child.on('error', (e) => {
       opts.signal?.removeEventListener('abort', onAbort)
       reject(new Error(`Couldn't run ${run[0]}: ${e.message}`))
     })
     child.on('close', (code) => {
+      // The last line often has no line break (a final error message); it counts too.
+      out.end()
+      err.end()
       opts.signal?.removeEventListener('abort', onAbort)
       if (opts.signal?.aborted) reject(new Error('Cancelled'))
       else resolve(code ?? 1)

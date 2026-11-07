@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -49,5 +49,35 @@ describe('Store', () => {
     const again = new Store(dir)
     await again.init()
     for (const n of [1, 2, 3, 4]) expect(again.getInstalled(`app${n}`)?.dir).toBe(`C:\\a${n}`)
+  })
+
+  it('falls back to the last good list when installed.json is damaged, keeping the damaged file', async () => {
+    const store = new Store(dir)
+    await store.init()
+    await store.setInstalled('app1', {
+      dir: 'C:\\a1',
+      launchPath: 'C:\\a1\\a.exe',
+      launchArgs: [],
+      version: 'v1.0.0',
+      method: 'zip',
+      managed: true,
+      installedAt: '',
+      shortcuts: { desktop: null, startMenu: null },
+      components: [],
+      needsSetup: false
+    })
+    // A launch reads it and keeps a copy; then a save is cut short.
+    await new Store(dir).init()
+    await writeFile(join(dir, 'installed.json'), '')
+    const after = new Store(dir)
+    await after.init()
+    expect(after.getInstalled('app1')?.version).toBe('v1.0.0')
+    expect(await readFile(join(dir, 'installed.json.damaged'), 'utf8')).toBe('')
+  })
+
+  it('starts empty on the first run', async () => {
+    const store = new Store(dir)
+    await store.init()
+    expect(store.getInstalled('app1')).toBeNull()
   })
 })

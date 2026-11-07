@@ -19,6 +19,20 @@ export interface DownloadOptions {
   expectedSize?: number | null
   /** Hex SHA-256 the file must have; checked while it streams, and the file is deleted when it doesn't match. */
   sha256?: string | null
+  /** Stops the download when no data arrives for this long (default STALL_MS). */
+  stallMs?: number
+}
+
+/**
+ * A download that receives nothing for this long is stopped. Nothing else would: a connection that dies without
+ * closing (Wi-Fi dropping, say) leaves the job waiting forever, its speed frozen at the last value.
+ */
+export const STALL_MS = 60_000
+/** The SHA256SUMS file is a few lines: it gets this long in all. */
+const SUMS_TIMEOUT_MS = 30_000
+
+function either(a: AbortSignal | undefined, b: AbortSignal): AbortSignal {
+  return a ? AbortSignal.any([a, b]) : b
 }
 
 /** What a .part file was downloaded from, so a later attempt can ask the server for the rest of the same file. */
@@ -48,6 +62,35 @@ async function hashFile(path: string, hash: Hash): Promise<void> {
  * part way is resumed from where it got to (HTTP Range), when the server says the file hasn't changed since.
  */
 export async function download(url: string, dest: string, opts: DownloadOptions = {}): Promise<void> {
+  const stallMs = opts.stallMs ?? STALL_MS
+  const stalled = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const alive = (): void => {
+    clearTimeout(timer)
+    timer = setTimeout(() => stalled.abort(), stallMs)
+  }
+  alive()
+  try {
+    await fetchTo(url, dest, opts, either(opts.signal, stalled.signal), alive)
+  } catch (e) {
+    if (stalled.signal.aborted && !opts.signal?.aborted) {
+      // The part file is kept (when the server named the file's version), so trying again carries on from here.
+      throw new Error(`The download stopped: nothing arrived for ${Math.round(stallMs / 1000)} seconds. Check the connection and try again.`)
+    }
+    throw e
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** The download itself; `alive` is called whenever data arrives, and `signal` also fires when it stalls. */
+async function fetchTo(
+  url: string,
+  dest: string,
+  opts: DownloadOptions,
+  signal: AbortSignal,
+  alive: () => void
+): Promise<void> {
   await mkdir(dirname(dest), { recursive: true })
   const part = `${dest}.part`
   const metaPath = `${part}.json`
@@ -59,12 +102,12 @@ export async function download(url: string, dest: string, opts: DownloadOptions 
     headers.Range = `bytes=${have}-`
     headers['If-Range'] = meta.validator
   }
-  let res = await getFetch()(url, { headers, signal: opts.signal, redirect: 'follow' })
+  let res = await getFetch()(url, { headers, signal, redirect: 'follow' })
   // 416: the part is no use (already the whole file, or bigger than it now); start over.
   if (res.status === 416) {
     await res.body?.cancel().catch(() => undefined)
     await rm(part, { force: true })
-    res = await getFetch()(url, { headers: { 'User-Agent': 'RulZ-AI-Tools-Suite' }, signal: opts.signal, redirect: 'follow' })
+    res = await getFetch()(url, { headers: { 'User-Agent': 'RulZ-AI-Tools-Suite' }, signal, redirect: 'follow' })
   }
   if (!res.ok || !res.body) throw new Error(`Download failed: ${res.status} ${res.statusText}`)
 
@@ -74,7 +117,7 @@ export async function download(url: string, dest: string, opts: DownloadOptions 
     await res.body.cancel().catch(() => undefined)
     await rm(part, { force: true })
     await rm(metaPath, { force: true })
-    return download(url, dest, opts)
+    return fetchTo(url, dest, opts, signal, alive)
   }
   const length = Number(res.headers.get('content-length')) || 0
   const total = (length ? resumeAt + length : 0) || opts.expectedSize || null
@@ -84,12 +127,15 @@ export async function download(url: string, dest: string, opts: DownloadOptions 
 
   const hash = opts.sha256 ? createHash('sha256') : null
   if (hash && resumeAt) await hashFile(part, hash)
+  // Reading a large part file back for the hash isn't the connection stalling.
+  alive()
 
   let bytes = resumeAt
   let lastEmit = 0
   const samples: { t: number; bytes: number }[] = [{ t: Date.now(), bytes }]
   const counter = new Transform({
     transform(chunk: Buffer, _enc, done) {
+      alive()
       bytes += chunk.length
       hash?.update(chunk)
       const now = Date.now()
@@ -109,7 +155,7 @@ export async function download(url: string, dest: string, opts: DownloadOptions 
   const keepPart = !!validator
   try {
     await pipeline(Readable.fromWeb(res.body as never), counter, createWriteStream(part, { flags: resumeAt ? 'a' : 'w' }), {
-      signal: opts.signal
+      signal
     })
   } catch (e) {
     if (!keepPart) await rm(part, { force: true })
@@ -154,7 +200,11 @@ export async function publishedSha256(
   signal?: AbortSignal
 ): Promise<string | null> {
   if (!sumsUrl) return null
-  const res = await getFetch()(sumsUrl, { headers: { 'User-Agent': 'RulZ-AI-Tools-Suite' }, signal, redirect: 'follow' })
+  const res = await getFetch()(sumsUrl, {
+    headers: { 'User-Agent': 'RulZ-AI-Tools-Suite' },
+    signal: either(signal, AbortSignal.timeout(SUMS_TIMEOUT_MS)),
+    redirect: 'follow'
+  })
   if (!res.ok) throw new Error(`Couldn't fetch the release's checksums (${res.status}).`)
   return parseSha256Sums(await res.text()).get(assetName) ?? null
 }

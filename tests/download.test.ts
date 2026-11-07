@@ -99,6 +99,34 @@ describe('download', () => {
     await download('https://x/a.zip', dest, { expectedSize: DATA.length, sha256: sha(DATA) })
     expect(await readFile(dest)).toEqual(DATA)
   })
+
+  it('stops a download that stalls, and the next try carries on from the part file', async () => {
+    // 100 bytes, then nothing: the connection stays open and silent.
+    setFetch(async () => {
+      const body = new ReadableStream({ start: (c) => c.enqueue(new Uint8Array(DATA.subarray(0, 100))) })
+      return new Response(body, { status: 200, headers: { etag: '"v1"', 'content-length': String(DATA.length) } })
+    })
+    const dest = join(dir, 'a.zip')
+    await expect(download('https://x/a.zip', dest, { stallMs: 300 })).rejects.toThrow(/nothing arrived for 0 seconds/)
+    expect((await readFile(`${dest}.part`)).length).toBe(100)
+    const { requests } = serve(DATA)
+    await download('https://x/a.zip', dest, { sha256: sha(DATA) })
+    expect(requests[0].Range).toBe('bytes=100-')
+    expect(await readFile(dest)).toEqual(DATA)
+  })
+
+  it('reports a cancel as a cancel, not as a stall', async () => {
+    setFetch(async (_url, init) => {
+      const body = new ReadableStream({ start: (c) => c.enqueue(new Uint8Array(DATA.subarray(0, 10))) })
+      expect(init?.signal).toBeDefined()
+      return new Response(body, { status: 200, headers: { etag: '"v1"' } })
+    })
+    const abort = new AbortController()
+    setTimeout(() => abort.abort(), 100)
+    const err = await download('https://x/a.zip', join(dir, 'a.zip'), { signal: abort.signal, stallMs: 10_000 }).catch((e) => e)
+    expect(err).toBeInstanceOf(Error)
+    expect((err as Error).message).not.toMatch(/nothing arrived/)
+  })
 })
 
 describe('SHA256SUMS', () => {

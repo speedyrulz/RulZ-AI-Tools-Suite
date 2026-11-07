@@ -1,7 +1,7 @@
 import type { ChildProcess } from 'node:child_process'
 import { existsSync, readdirSync } from 'node:fs'
 import { copyFile, mkdir, readdir, readFile, rename, rm, stat } from 'node:fs/promises'
-import { basename, dirname, isAbsolute, join, relative } from 'node:path'
+import { basename, dirname, join, relative } from 'node:path'
 import { shell } from 'electron'
 import { CATALOG, findApp } from '@shared/catalog'
 import type { LogLine } from '@shared/ipc'
@@ -17,7 +17,7 @@ import type {
   RequirementId,
   ShortcutOptions
 } from '@shared/types'
-import { exists, extractZip, findFile, flattenSingleFolder, overlay, swapInto } from './archive'
+import { exists, extractZip, findFile, flattenSingleFolder, installFolder, overlay, swapInto } from './archive'
 import { download, publishedSha256 } from './download'
 import {
   commitsSince,
@@ -41,11 +41,20 @@ import { createShortcut, foreignShortcutPaths, removeShortcut, shortcutPaths } f
 import type { Store } from './store'
 
 const LOG_LIMIT = 3000
+/** A log is cut back to LOG_LIMIT lines once it is this many longer, not on every line (each cut moves every line). */
+const LOG_SLACK = 500
 const LATEST_TTL_MS = 30 * 60_000
+/** After a README can't be fetched from GitHub (offline, say), the bundled copy is shown at once for this long. */
+const README_RETRY_MS = 5 * 60_000
 /** Log lines are sent to the window in batches: a pip install can print hundreds a second. */
 const LOG_FLUSH_MS = 100
 /** Leftover partial downloads (kept so a retry can resume) are deleted after this long. */
 const PART_MAX_AGE_MS = 7 * 24 * 3600_000
+/**
+ * Any other file in the downloads folder is left over (a finished download is deleted when its job ends, so only a
+ * crash leaves one; launcher setups from before the updater deleted them) and is deleted after this long.
+ */
+const LEFTOVER_MAX_AGE_MS = 3600_000
 /** How long quitting waits for cancelled jobs to stop their programs. */
 const CANCEL_WAIT_MS = 15_000
 
@@ -146,11 +155,6 @@ function errorText(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
 }
 
-async function isEmptyDir(dir: string): Promise<boolean> {
-  const entries = await readdir(dir).catch(() => null)
-  return entries === null || entries.length === 0
-}
-
 /** Finds an app installed by its own setup program in the Windows "Installed apps" list. */
 async function findUninstallEntry(displayName: string): Promise<{ location: string; version: string | null } | null> {
   // Both hives are searched at once; the per-user one wins when both have it.
@@ -185,6 +189,12 @@ export class AppManager {
   private detected: Promise<void> = Promise.resolve()
   private pendingLogs: LogLine[] = []
   private logTimer: ReturnType<typeof setTimeout> | null = null
+  /** When each app's README last failed to come from GitHub. */
+  private readmeFailed = new Map<string, number>()
+  /** The GitHub check in progress, shared by calls made while it runs. */
+  private refreshing: { force: boolean; done: Promise<void> } | null = null
+  /** Set once quitting has begun: no new jobs. */
+  private closing = false
 
   constructor(private readonly o: AppManagerOptions) {}
 
@@ -214,10 +224,11 @@ export class AppManager {
   private async cleanDownloads(): Promise<void> {
     const dir = this.o.downloadsDir
     for (const name of await readdir(dir).catch(() => [] as string[])) {
-      if (!/\.part(\.json)?$/.test(name)) continue
       const file = join(dir, name)
       const s = await stat(file).catch(() => null)
-      if (s && Date.now() - s.mtimeMs > PART_MAX_AGE_MS) await rm(file, { force: true }).catch(() => undefined)
+      if (!s?.isFile()) continue
+      const maxAge = /\.part(\.json)?$/.test(name) ? PART_MAX_AGE_MS : LEFTOVER_MAX_AGE_MS
+      if (Date.now() - s.mtimeMs > maxAge) await rm(file, { force: true }).catch(() => undefined)
     }
   }
 
@@ -261,7 +272,7 @@ export class AppManager {
   }
 
   getLog(appId: string): string[] {
-    return this.logs.get(appId) ?? []
+    return (this.logs.get(appId) ?? []).slice(-LOG_LIMIT)
   }
 
   private app(appId: string): CatalogApp {
@@ -327,8 +338,26 @@ export class AppManager {
 
   // ---------- GitHub ----------
 
-  /** Asks GitHub for the newest versions; unless `force`, answers from the last 30 minutes are reused. */
-  async refreshLatest(force = true): Promise<void> {
+  /**
+   * Asks GitHub for the newest versions; unless `force`, answers from the last 30 minutes are reused. A call made while
+   * a check runs shares it (the startup check and a click on Refresh), except that a forced one asks again after an
+   * unforced one, which may have reused answers.
+   */
+  refreshLatest(force = true): Promise<void> {
+    const running = this.refreshing
+    if (running && (running.force || !force)) return running.done
+    const done = (running?.done ?? Promise.resolve()).catch(() => undefined).then(() => this.checkLatest(force))
+    const entry = { force, done }
+    this.refreshing = entry
+    void done
+      .catch(() => undefined)
+      .then(() => {
+        if (this.refreshing === entry) this.refreshing = null
+      })
+    return done
+  }
+
+  private async checkLatest(force: boolean): Promise<void> {
     // Cheap: only the catalog's known program paths (the registry search ran at startup).
     await this.reconcileInstalls(false)
     const now = Date.now()
@@ -415,18 +444,23 @@ export class AppManager {
     if (live && app.repo) {
       const cached = this.readmes.get(appId)
       if (cached) return cached
-      try {
-        const markdown = await rawFile(app.repo, 'main', `${app.path}/README.md`)
-        const doc: ReadmeDoc = {
-          markdown,
-          assetBase: `https://raw.githubusercontent.com/${app.repo}/main/${app.path}/`,
-          linkBase,
-          source: 'github'
+      // A recent failure isn't retried at once: on a bad connection each page would wait for the timeout first.
+      if (Date.now() - (this.readmeFailed.get(appId) ?? 0) >= README_RETRY_MS) {
+        try {
+          const markdown = await rawFile(app.repo, 'main', `${app.path}/README.md`)
+          const doc: ReadmeDoc = {
+            markdown,
+            assetBase: `https://raw.githubusercontent.com/${app.repo}/main/${app.path}/`,
+            linkBase,
+            source: 'github'
+          }
+          this.readmes.set(appId, doc)
+          this.readmeFailed.delete(appId)
+          return doc
+        } catch {
+          // Offline or not published: the copy shipped with the launcher.
+          this.readmeFailed.set(appId, Date.now())
         }
-        this.readmes.set(appId, doc)
-        return doc
-      } catch {
-        // Offline or not published: the copy shipped with the launcher.
       }
     }
     const markdown = await readFile(join(this.o.catalogDir, appId, 'README.md'), 'utf8').catch(() => `# ${app.name}\n\n${app.description}`)
@@ -454,6 +488,7 @@ export class AppManager {
   }
 
   private startJob(appId: string, action: JobState['action'], work: (ctx: JobContext) => Promise<void>): void {
+    if (this.closing) throw new Error('The launcher is closing.')
     if (this.jobs.has(appId)) throw new Error('This app is already being installed or updated.')
     const abort = new AbortController()
     let finished!: () => void
@@ -477,7 +512,7 @@ export class AppManager {
         const replace = !!key && log.length > 0 && progressKey(log[log.length - 1]) === key
         if (replace) log[log.length - 1] = line
         else log.push(line)
-        if (log.length > LOG_LIMIT) log.splice(0, log.length - LOG_LIMIT)
+        if (log.length > LOG_LIMIT + LOG_SLACK) log.splice(0, log.length - LOG_LIMIT)
         this.queueLog({ appId, line, replace })
       }
     }
@@ -512,8 +547,10 @@ export class AppManager {
     this.jobs.get(appId)?.abort.abort()
   }
 
-  /** Cancels every running job and waits (up to a limit) for their programs to stop. */
+  /** Cancels every running job and waits (up to a limit) for their programs to stop. Called when quitting. */
   async cancelAll(): Promise<void> {
+    // The window stays usable while this waits; an install started now would be cut off by the quit.
+    this.closing = true
     const running = [...this.jobs.values()]
     for (const job of running) job.abort.abort()
     await Promise.race([
@@ -575,14 +612,11 @@ export class AppManager {
 
   // ---------- Install / update ----------
 
-  async install(appId: string, opts: InstallOptions): Promise<void> {
+  async install(appId: string, options: InstallOptions): Promise<void> {
     const app = this.app(appId)
     await this.detected
     if (this.o.store.getInstalled(appId)) throw new Error(`${app.name} is already installed.`)
-    if (!isAbsolute(opts.dir) || !/^[a-z]:\\/i.test(opts.dir)) throw new Error('Choose a full folder path, such as D:\\Apps.')
-    if (!(await isEmptyDir(opts.dir))) {
-      throw new Error(`Choose an empty folder: ${opts.dir} already has files in it.`)
-    }
+    const opts: InstallOptions = { ...options, dir: await installFolder(options.dir) }
     await this.o.store.setDetectHidden(appId, false)
     this.startJob(appId, 'install', async (ctx) => {
       try {
@@ -899,6 +933,8 @@ export class AppManager {
     const app = this.app(appId)
     const info = this.o.store.getInstalled(appId)
     if (!info) throw new Error(`${app.name} isn't installed.`)
+    // A running job writes the shortcuts it started with when it ends, which would undo this change.
+    if (this.jobs.has(appId)) throw new Error(`Wait for ${app.name} to finish installing, updating or uninstalling.`)
     const shortcuts = await this.applyShortcuts(app, info, opts)
     await this.o.store.setInstalled(appId, { ...info, shortcuts })
     this.changed()
@@ -936,9 +972,7 @@ export class AppManager {
     if (!info) throw new Error(`${app.name} isn't installed.`)
     if (info.managed && this.running.has(appId)) throw new Error(`Close ${app.name} first, then uninstall it.`)
     this.startJob(appId, 'uninstall', async (ctx) => {
-      ctx.set({ phase: 'removing', label: 'Removing shortcuts…' })
-      await removeShortcut(info.shortcuts.desktop)
-      await removeShortcut(info.shortcuts.startMenu)
+      ctx.set({ phase: 'removing', label: 'Removing…' })
       if (info.managed) {
         if (app.install.kind === 'installer') {
           const uninstaller = join(info.dir, `Uninstall ${app.install.uninstallName}.exe`)
@@ -960,6 +994,10 @@ export class AppManager {
           }
         }
       }
+      // Only once the files are gone: when they can't be removed, the app stays as it was, shortcuts included.
+      ctx.set({ label: 'Removing shortcuts…' })
+      await removeShortcut(info.shortcuts.desktop)
+      await removeShortcut(info.shortcuts.startMenu)
       await this.o.store.setInstalled(appId, null)
       // Removing a found install only forgets it; don't find it again on the next refresh.
       if (!info.managed) await this.o.store.setDetectHidden(appId, true)

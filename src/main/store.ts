@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { InstalledInfo, Settings } from '@shared/types'
 
@@ -58,6 +58,26 @@ export function writeJson(path: string, data: unknown): Promise<void> {
   return next
 }
 
+/**
+ * Reads the list of installed apps. Each launch that reads it keeps a copy (.bak). A damaged file (a save cut short by
+ * a power cut, say) is moved aside instead of being overwritten by the next save, and that copy is used instead:
+ * forgetting the list would leave every app installed but unknown to the launcher.
+ */
+export async function readInstalled(path: string): Promise<Record<string, InstalledInfo>> {
+  const backup = `${path}.bak`
+  const text = await readFile(path, 'utf8').catch(() => null)
+  if (text === null) return {}
+  try {
+    const list: unknown = JSON.parse(text)
+    if (!list || typeof list !== 'object' || Array.isArray(list)) throw new Error('not a list of apps')
+    await copyFile(path, backup).catch(() => undefined)
+    return list as Record<string, InstalledInfo>
+  } catch {
+    await rename(path, `${path}.damaged`).catch(() => undefined)
+    return readJson(backup, {})
+  }
+}
+
 /** Settings and the list of installed apps, kept as JSON in the launcher's data folder. */
 export class Store {
   private settings: Settings = defaultSettings()
@@ -70,7 +90,7 @@ export class Store {
   async init(): Promise<void> {
     await mkdir(this.dir, { recursive: true })
     this.settings = { ...defaultSettings(), ...(await readJson<Partial<Settings>>(join(this.dir, 'settings.json'), {})) }
-    this.installed = await readJson(join(this.dir, 'installed.json'), {})
+    this.installed = await readInstalled(join(this.dir, 'installed.json'))
     this.detectHidden = await readJson(join(this.dir, 'detect-hidden.json'), [])
   }
 

@@ -46,30 +46,60 @@ async function lookUp(): Promise<SelfUpdate | null> {
 
 // Runs in PowerShell after the launcher quits: the silent setup over the current install (retrying its occasional
 // startup crash, 0xC0000005), then the launcher again. It can't be the launcher's own program: the setup stops every
-// running copy of it. The log goes next to the settings.
+// running copy of it. So it waits for the launcher to be gone first (quitting can take a while when it cancels an
+// install), and gives up rather than stop a launcher that is still running. The log goes next to the settings.
 export const HELPER = `
-param([string]$Setup, [string]$Dir, [string]$Exe, [string]$Log)
+param([string]$Setup, [string]$Dir, [string]$Exe, [string]$Log, [int]$LauncherPid)
 function Note($m) { try { Add-Content -LiteralPath $Log -Value ((Get-Date -Format o) + ' ' + $m) } catch {} }
 Note 'updater running'
-Start-Sleep -Seconds 2
+if ($LauncherPid) {
+  try { Wait-Process -Id $LauncherPid -Timeout 300 -ErrorAction Stop } catch {}
+  if (Get-Process -Id $LauncherPid -ErrorAction SilentlyContinue) {
+    Note 'the launcher is still running after 5 minutes; not updating'
+    exit 1
+  }
+}
+Start-Sleep -Seconds 1
 for ($i = 1; $i -le 3; $i++) {
   Note "setup attempt $i"
   $p = Start-Process -FilePath $Setup -ArgumentList ('/S /currentuser /D="' + $Dir + '"') -WorkingDirectory $env:SystemRoot -Wait -PassThru
   Note "exit $($p.ExitCode)"
   if ($p.ExitCode -ne -1073741819) { break }
 }
+Remove-Item -LiteralPath $Setup -Force -ErrorAction SilentlyContinue
 # Through WMI as well, so the launcher isn't a child of this script (which ends right here).
 $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = ('"' + $Exe + '"'); CurrentDirectory = $Dir }
 Note ('relaunched, WMI result ' + $r.ReturnValue)
 `
 
-/** Downloads the installer, then hands over to the helper and quits so the files can be replaced. */
-export async function installSelfUpdate(u: SelfUpdate, onProgress: (fraction: number) => void): Promise<void> {
+/** Why the launcher can't update now (an app install it would cut off), or null when it can. */
+export function busyReason(names: string[]): string | null {
+  if (!names.length) return null
+  const many = names.length > 1
+  return `${names.join(', ')} ${many ? 'are' : 'is'} still being installed or updated. Update the launcher when ${many ? 'they finish' : 'it finishes'}.`
+}
+
+/**
+ * Downloads the installer, then hands over to the helper and quits so the files can be replaced. `activeJobs` names
+ * the apps being installed: the setup would stop the launcher in the middle of them, so the update waits for them.
+ */
+export async function installSelfUpdate(
+  u: SelfUpdate,
+  onProgress: (fraction: number) => void,
+  activeJobs: () => string[]
+): Promise<void> {
+  const refuse = (): void => {
+    const reason = busyReason(activeJobs())
+    if (reason) throw new Error(reason)
+  }
+  refuse()
   const dl = join(app.getPath('temp'), 'RulZ AI Tools Suite')
   const setup = join(dl, `RulZ-AI-Tools-Suite-Setup-${u.version}.exe`)
   // Releases since SHA256SUMS was added are checked against it; older ones (and old cached answers) aren't.
   const sha256 = u.assetName ? await publishedSha256(u.sumsUrl, u.assetName) : null
   await download(u.url, setup, { expectedSize: u.size, sha256, onProgress: (p) => p.total && onProgress(p.bytes / p.total) })
+  // Asked again: an install may have been started while the update downloaded.
+  refuse()
   const helper = join(app.getPath('userData'), 'self-update.ps1')
   await mkdir(dirname(helper), { recursive: true })
   // A BOM makes Windows PowerShell 5.1 read the file as UTF-8 (install paths can have non-ASCII characters).
@@ -84,7 +114,8 @@ export async function installSelfUpdate(u: SelfUpdate, onProgress: (fraction: nu
     quote(setup),
     quote(dirname(process.execPath)),
     quote(process.execPath),
-    quote(log)
+    quote(log),
+    String(process.pid)
   ].join(' ')
   await execFileAsync(
     'powershell.exe',

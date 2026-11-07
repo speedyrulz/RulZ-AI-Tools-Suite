@@ -164,7 +164,7 @@ async function main(): Promise<void> {
   handle('self:check', (force) => checkSelfUpdate(store, !!force).catch(() => null))
   handle('self:install', async (u) => {
     try {
-      await installSelfUpdate(u, (f) => broadcast('self:progress', f))
+      await installSelfUpdate(u, (f) => broadcast('self:progress', f), () => apps.activeJobNames())
     } catch (e) {
       broadcast('self:progress', -1)
       throw e

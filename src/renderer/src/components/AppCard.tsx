@@ -48,7 +48,8 @@ export function StatusBadge({ view }: { view: AppView }) {
 /** Cover image for a card or header: the first screenshot, or the icon on a red-tinted backdrop. */
 export function Cover({ view, className }: { view: AppView; className?: string }) {
   const shot = view.screenshots[0]
-  if (shot) return <img src={shot} alt="" draggable={false} className={className} />
+  // Full-size screenshots: decoded off the main thread, and only once the card is near the screen.
+  if (shot) return <img src={shot} alt="" draggable={false} loading="lazy" decoding="async" className={className} />
   return (
     <div className={`${className} hero flex items-center justify-center`}>
       <img src={view.icon} alt="" draggable={false} className="size-24 opacity-90 drop-shadow-[0_10px_30px_rgb(237_0_13/0.4)]" />
