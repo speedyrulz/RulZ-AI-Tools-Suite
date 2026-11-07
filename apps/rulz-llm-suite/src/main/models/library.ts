@@ -4,7 +4,7 @@ import type { GgufInfo, ModelEntry, SidecarFile } from '@shared/types'
 import { draftKind } from '@shared/draft'
 export { draftKind }
 import { readJson, writeJsonAtomic } from '../util/jsonFile'
-import { readGgufHeaderAsync, toGgufInfo } from './gguf'
+import { QUANT_TAGS, readGgufHeaderAsync, toGgufInfo } from './gguf'
 
 export interface ScannedFile {
   path: string
@@ -36,6 +36,39 @@ function toId(root: string, path: string): string {
   return relative(root, path).split(sep).join('/')
 }
 
+/** Words that name a file's role or precision rather than the model it belongs to. */
+const NOT_MODEL_WORDS = new Set(['mmproj', 'mtp', 'eagle3', 'dflash', 'dspark', 'draft', 'model', 'i1', 'f16', 'f32', 'bf16', 'fp16', 'fp32', 'fp8'])
+
+/**
+ * The model a file belongs to, as name tokens: "mmproj-gemma-3-12b-it-f16" and
+ * "gemma-3-12b-it-Q4_K_M" both give gemma/3/12b/it. Empty for generic names like "mmproj-BF16".
+ */
+export function modelTokens(fileName: string): string[] {
+  const base = displayName(fileName)
+    .replace(/\s*\(\d+\)$/, '') // "(1)" left by a repeated download
+    .replace(QUANT_TAGS, '')
+    .toLowerCase()
+  return base.split(/[^a-z0-9]+/).filter((t) => t && !NOT_MODEL_WORDS.has(t))
+}
+
+const isPrefix = (a: string[], b: string[]): boolean => a.length <= b.length && a.every((t, i) => t === b[i])
+
+/** How well a sidecar's name fits a model: 2 = same model, 0 = says nothing, -1 = another model. */
+function nameFit(sidecar: ScannedFile, model: ScannedFile): number {
+  const s = modelTokens(basename(sidecar.path))
+  const m = modelTokens(basename(model.path))
+  // Projectors converted with their model usually carry its general.name, even when the file is just "mmproj-F16".
+  const sameName = !!sidecar.info?.name && sidecar.info.name.toLowerCase() === model.info?.name?.toLowerCase()
+  if ((s.length && (isPrefix(s, m) || isPrefix(m, s))) || sameName) return 2
+  return s.length ? -1 : 0
+}
+
+/** True when every model base name extends another, as with several quants of one model in its own folder. */
+function oneModelFamily(models: ScannedFile[]): boolean {
+  const bases = models.map((f) => modelTokens(basename(f.path))).sort((a, b) => a.length - b.length)
+  return bases.every((b, i) => i === 0 || isPrefix(bases[i - 1], b))
+}
+
 /** Groups scanned files into models with their shards and same-folder sidecars. Pure; unit-tested. */
 export function groupModels(root: string, files: ScannedFile[]): ModelEntry[] {
   const byDir = new Map<string, ScannedFile[]>()
@@ -46,21 +79,30 @@ export function groupModels(root: string, files: ScannedFile[]): ModelEntry[] {
 
   const models: ModelEntry[] = []
   for (const [dir, dirFiles] of byDir) {
-    const kinds = dirFiles.map((f) => ({ f, kind: classifyFile(basename(f.path), f.info) }))
-    const sidecar = (kind: FileKind): SidecarFile | undefined => {
-      const hit = kinds
-        .filter((k) => k.kind === kind)
-        .sort((a, b) => basename(a.f.path).localeCompare(basename(b.f.path)))[0]
-      if (!hit) return undefined
-      const out: SidecarFile = { path: hit.f.path, sizeBytes: hit.f.sizeBytes }
-      if (kind === 'draft') out.kind = draftKind(basename(hit.f.path))
+    const kinds = dirFiles
+      .map((f) => ({ f, kind: classifyFile(basename(f.path), f.info) }))
+      .sort((a, b) => basename(a.f.path).localeCompare(basename(b.f.path)))
+    const modelFiles = kinds.filter((k) => k.kind === 'model').map((k) => k.f)
+    // Generic sidecars ("mmproj-BF16") only go with a folder that holds one model. In a shared
+    // folder such as a flat C:\LLM they could belong to any model, and a wrong projector fails the load.
+    const anyFits = oneModelFamily(modelFiles)
+    const sidecar = (kind: FileKind, model: ScannedFile): SidecarFile | undefined => {
+      let best: { f: ScannedFile; fit: number } | undefined
+      for (const k of kinds) {
+        if (k.kind !== kind) continue
+        const fit = nameFit(k.f, model)
+        if (!best || fit > best.fit) best = { f: k.f, fit }
+      }
+      if (!best || (best.fit < 2 && !anyFits)) return undefined
+      const out: SidecarFile = { path: best.f.path, sizeBytes: best.f.sizeBytes }
+      if (kind === 'draft') out.kind = draftKind(basename(best.f.path))
       return out
     }
-    const mmproj = sidecar('mmproj')
-    const draftFile = sidecar('draft')
 
     for (const { f, kind } of kinds) {
       if (kind !== 'model') continue
+      const mmproj = sidecar('mmproj', f)
+      const draftFile = sidecar('draft', f)
       const name = basename(f.path)
       const shardMatch = name.match(SHARD_RE)
       let shardFiles = [f]
@@ -121,8 +163,8 @@ async function walk(dir: string, depth: number, out: { path: string; size: numbe
   }
 }
 
-/** Bump when GgufInfo gains fields so cached metadata is re-read. */
-const CACHE_VERSION = 2
+/** Bump when GgufInfo gains fields or its derivation changes, so cached metadata is re-read. */
+const CACHE_VERSION = 3
 
 interface CacheEntry {
   v?: number
@@ -130,12 +172,50 @@ interface CacheEntry {
   mtimeMs: number
   info: GgufInfo | null
   error?: string
+  /** For a split model's first shard: sizes and dates of the other shards when it was read. */
+  shards?: string
 }
 
-async function ggufInfo(path: string): Promise<GgufInfo> {
-  const header = await readGgufHeaderAsync(path)
-  return toGgufInfo(header.kv, basename(path), header.hasNextn)
+interface FoundFile {
+  path: string
+  size: number
+  mtimeMs: number
 }
+
+const SHARD_TAIL = /^-(\d{5})-of-(\d{5})\.gguf$/i
+
+/** The other files of a split model, for its first shard (the one with the metadata). */
+export function otherShards<T extends { path: string }>(path: string, found: T[]): T[] {
+  const m = basename(path).match(SHARD_RE)
+  if (!m || Number(m[1]) !== 1) return []
+  const prefix = path.slice(0, path.length - m[0].length)
+  return found
+    .filter((o) => o.path !== path && o.path.startsWith(prefix) && SHARD_TAIL.exec(o.path.slice(prefix.length))?.[2] === m[2])
+    .sort((a, b) => a.path.localeCompare(b.path))
+}
+
+/** Split shards only hold a short header and their tensor list, so a small first read covers them. */
+const SHARD_FIRST_READ = 1 << 20
+
+async function ggufInfo(path: string, shards: string[]): Promise<GgufInfo> {
+  const header = await readGgufHeaderAsync(path)
+  let hasNextn = header.hasNextn
+  // Split models keep their MTP (nextn) layers at the end, in the last shard. The other tensor
+  // lists are only read when the metadata says the model has such layers.
+  if (!hasNextn && shards.length && toGgufInfo(header.kv, basename(path), true).mtpLayers) {
+    for (const s of [...shards].reverse()) {
+      hasNextn = await readGgufHeaderAsync(s, SHARD_FIRST_READ).then(
+        (h) => h.hasNextn,
+        () => false // a shard still downloading only costs the MTP check
+      )
+      if (hasNextn) break
+    }
+  }
+  return toGgufInfo(header.kv, basename(path), hasNextn)
+}
+
+/** Files that downloaders and editors write before or while saving the real one. */
+const TEMP_FILE = /(\.(part|partial|tmp|temp|crdownload|download|incomplete|aria2)|~)$/i
 
 /** Scans the models folder, caches GGUF metadata, and watches for changes. */
 export class ModelLibrary {
@@ -145,7 +225,7 @@ export class ModelLibrary {
   private watcher: FSWatcher | null = null
   private watchedDir = ''
   private debounce: NodeJS.Timeout | null = null
-  private scanning: Promise<ModelEntry[]> | null = null
+  private scanning: { root: string; promise: Promise<ModelEntry[]> } | null = null
 
   constructor(
     private readonly cachePath: string,
@@ -162,17 +242,30 @@ export class ModelLibrary {
   }
 
   scan(): Promise<ModelEntry[]> {
-    this.scanning ??= this.doScan().finally(() => (this.scanning = null))
-    return this.scanning
+    const root = this.getRoot()
+    if (this.scanning?.root === root) return this.scanning.promise
+    // A scan of the previous folder may still be running; this one starts after it, so the
+    // new folder's models are the ones that end up shown.
+    const before = this.scanning?.promise.catch(() => undefined) ?? Promise.resolve()
+    const run = { root, promise: before.then(() => this.doScan(root)) }
+    this.scanning = run
+    const done = (): void => {
+      if (this.scanning !== run) return
+      this.scanning = null
+      // The folder changed during the scan without anyone asking for a new one.
+      if (this.getRoot() !== root) void this.scan().catch(() => undefined)
+    }
+    void run.promise.then(done, done)
+    return run.promise
   }
 
-  private async doScan(): Promise<ModelEntry[]> {
+  private async doScan(root: string): Promise<ModelEntry[]> {
     if (!this.cacheLoaded) {
-      this.cache = await readJson(this.cachePath, {})
+      // Only a cache: if it can't be read, the headers are read again and the file rewritten.
+      this.cache = await readJson<Record<string, CacheEntry>>(this.cachePath, {}).catch(() => ({}))
       this.cacheLoaded = true
     }
-    const root = this.getRoot()
-    const found: { path: string; size: number; mtimeMs: number }[] = []
+    const found: FoundFile[] = []
     await walk(root, 0, found)
 
     let dirty = false
@@ -181,15 +274,24 @@ export class ModelLibrary {
     for (const f of found) {
       seen.add(f.path)
       let entry = this.cache[f.path]
-      if (!entry || entry.v !== CACHE_VERSION || entry.size !== f.size || entry.mtimeMs !== f.mtimeMs) {
+      const shards = otherShards(f.path, found)
+      const shardSig = shards.length ? shards.map((s) => `${s.size}:${s.mtimeMs}`).join(',') : undefined
+      if (
+        !entry ||
+        entry.v !== CACHE_VERSION ||
+        entry.size !== f.size ||
+        entry.mtimeMs !== f.mtimeMs ||
+        entry.shards !== shardSig
+      ) {
         const shard = basename(f.path).match(SHARD_RE)
         if (shard && Number(shard[1]) !== 1) {
           entry = { v: CACHE_VERSION, size: f.size, mtimeMs: f.mtimeMs, info: null }
         } else {
+          const base = { v: CACHE_VERSION, size: f.size, mtimeMs: f.mtimeMs, shards: shardSig }
           try {
-            entry = { v: CACHE_VERSION, size: f.size, mtimeMs: f.mtimeMs, info: await ggufInfo(f.path) }
+            entry = { ...base, info: await ggufInfo(f.path, shards.map((s) => s.path)) }
           } catch (err) {
-            entry = { v: CACHE_VERSION, size: f.size, mtimeMs: f.mtimeMs, info: null, error: (err as Error).message }
+            entry = { ...base, info: null, error: (err as Error).message }
           }
         }
         this.cache[f.path] = entry
@@ -206,7 +308,10 @@ export class ModelLibrary {
     }
     if (dirty) await writeJsonAtomic(this.cachePath, this.cache)
 
-    this.models = groupModels(root, files)
+    const models = groupModels(root, files)
+    // The models folder changed while this scan ran; the scan of the new folder publishes instead.
+    if (this.getRoot() !== root) return models
+    this.models = models
     this.ensureWatcher(root)
     this.onChange(this.models)
     return this.models
@@ -219,11 +324,12 @@ export class ModelLibrary {
     this.watchedDir = root
     try {
       this.watcher = watch(root, { recursive: true }, (_event, file) => {
-        // Ignore non-GGUF files (partial downloads, notes); folders have no extension.
+        // Partial downloads change constantly; the finished file's rename triggers the scan.
+        // Anything else counts, including folders with dots in their names ("Qwen3.5").
         const name = String(file ?? '')
-        if (name && !/\.gguf$/i.test(name) && /\.[a-z0-9]{1,10}$/i.test(name)) return
+        if (name && TEMP_FILE.test(name)) return
         if (this.debounce) clearTimeout(this.debounce)
-        this.debounce = setTimeout(() => void this.scan(), 2000)
+        this.debounce = setTimeout(() => void this.scan().catch(() => undefined), 2000)
       })
       this.watcher.on('error', () => {
         this.watcher?.close()

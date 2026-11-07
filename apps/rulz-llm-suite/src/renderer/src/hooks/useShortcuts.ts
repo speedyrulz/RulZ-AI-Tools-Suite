@@ -16,12 +16,30 @@ export const SHORTCUTS: [string, string][] = [
 
 const PAGE_KEYS: Record<string, Page> = { '1': 'chat', '2': 'models', '3': 'mcp', '4': 'developer', '5': 'settings' }
 
+/**
+ * Esc stops the reply only when nothing else used the key: closing a dialog or menu, or
+ * cancelling an edit, must not also end the reply (or, on the approval dialog, the tool turn).
+ */
+function escapeStopsReply(e: KeyboardEvent): boolean {
+  // Radix dialogs and menus call preventDefault when Esc closes them. Tooltips do too, but
+  // closing a hover tooltip shouldn't keep the reply running.
+  if (e.defaultPrevented && !document.querySelector('[role="tooltip"]')) return false
+  if (document.querySelector('[role="dialog"], [role="alertdialog"], [role="menu"]')) return false
+  // Fields use Esc to cancel their edit; only the message box stops the reply.
+  const el = e.target instanceof Element ? e.target : null
+  if (el?.closest('input, textarea, select, [contenteditable="true"]') && !el.closest('[data-composer]')) return false
+  return true
+}
+
 export function useShortcuts(): void {
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
       const app = useApp.getState()
-      if (e.key === 'Escape' && useChat.getState().generation && !app.pickerOpen) {
-        useChat.getState().stop()
+      if (e.key === 'Escape') {
+        const chat = useChat.getState()
+        // Only the reply of the chat on screen, where its Stop button is; one in the background stays.
+        const shown = chat.generation && chat.generation.conversationId === chat.current?.id
+        if (shown && !app.pickerOpen && escapeStopsReply(e)) chat.stop()
         return
       }
       if (!e.ctrlKey || e.altKey) return

@@ -55,6 +55,12 @@ describe('toolCatalogNote', () => {
     expect(note).toContain('Loaded tools: rea__open_binary.')
     expect(note).toContain('- rea: open_binary, procedure_pseudo_code, batch_decompile')
   })
+  it('stays the same when only the order of use changes, so the prompt cache still matches', () => {
+    const a = toolCatalogNote(tools, ['rea__open_binary', 'files__read_text_file'])
+    const b = toolCatalogNote(tools, ['files__read_text_file', 'rea__open_binary'])
+    expect(a).toBe(b)
+    expect(a).toContain('Loaded tools: files__read_text_file, rea__open_binary.')
+  })
   it('caps a huge catalog and points to search', () => {
     const many = Array.from({ length: 800 }, (_, i) => tool(`s${i % 4}`, `some_long_tool_name_${i}`, 'x'))
     const note = toolCatalogNote(many, [])

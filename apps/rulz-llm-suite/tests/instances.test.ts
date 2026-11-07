@@ -116,3 +116,92 @@ describe('parseTasklistPids', () => {
     expect(parseTasklistPids('INFO: No tasks are running which match the specified criteria.').size).toBe(0)
   })
 })
+
+describe('InstanceManager.ensure', () => {
+  it('uses a loading instance whatever its settings, and says it did not start it', async () => {
+    const events: string[] = []
+    const mgr = manager(events)
+    const custom = { ...DEFAULT_LOAD_CONFIG, contextLength: 4096 }
+    mgr.load('a', custom).catch(() => undefined)
+    // Queued behind the UI's load, so it finds that instance instead of replacing it.
+    const ensured = mgr.ensure('a')
+    ensured.catch(() => undefined)
+    await vi.waitFor(() => expect(mgr.list()).toHaveLength(1))
+    await new Promise((r) => setTimeout(r, 20))
+    expect(events).toEqual(['spawn a'])
+    expect(mgr.list()[0].config.contextLength).toBe(4096)
+    await mgr.unloadAll()
+    await expect(ensured).rejects.toThrow(/cancelled/)
+  })
+})
+
+describe('InstanceManager in-use tracking', () => {
+  it('reports no idle time while an instance is loading or in use, and counts from the last release', async () => {
+    const events: string[] = []
+    const mgr = manager(events)
+    mgr.load('a', null).catch(() => undefined)
+    await vi.waitFor(() => expect(mgr.list()).toHaveLength(1))
+    const id = mgr.list()[0].instanceId
+    expect(mgr.idleSince(id)).toBeNull()
+    // Pretend it finished loading.
+    ;(mgr as unknown as { running: Map<string, { info: { status: string } }> }).running.get(id)!.info.status = 'ready'
+    expect(mgr.idleSince(id)).not.toBeNull()
+    const releaseA = mgr.acquire(id)
+    const releaseB = mgr.acquire(id)
+    expect(mgr.idleSince(id)).toBeNull()
+    releaseA()
+    releaseA()
+    expect(mgr.idleSince(id)).toBeNull()
+    const before = Date.now()
+    releaseB()
+    expect(mgr.idleSince(id)).toBeGreaterThanOrEqual(before)
+    expect(mgr.acquire('gone')).toBeTypeOf('function')
+    expect(mgr.idleSince('gone')).toBeNull()
+    await mgr.unloadAll()
+  })
+})
+
+describe('InstanceManager shutdown and cancelled loads', () => {
+  it('never starts a server once the app is quitting, even for a load already queued', async () => {
+    const events: string[] = []
+    let finishResolve: (exe: string) => void = () => undefined
+    const mgr = manager(events, {
+      engine: { resolveExe: () => new Promise<string>((r) => (finishResolve = r)) } as unknown as EngineService
+    })
+    const load = mgr.load('a', null)
+    load.catch(() => undefined)
+    await new Promise((r) => setTimeout(r, 10))
+    mgr.killAllSync()
+    finishResolve('C:\llama\llama-server.exe')
+    await expect(load).rejects.toThrow(/closing/)
+    await expect(mgr.load('b', null)).rejects.toThrow(/closing/)
+    expect(events).toEqual([])
+  })
+
+  it('a model unloaded while its final check is running is reported as cancelled, not ready or crashed', async () => {
+    const events: string[] = []
+    const errors: unknown[] = []
+    let releaseProps: () => void = () => undefined
+    vi.stubGlobal('fetch', async (url: string) => {
+      if (String(url).endsWith('/health')) return new Response('{}', { status: 200 })
+      await new Promise<void>((r) => (releaseProps = r))
+      return new Response('{"default_generation_settings":{"n_ctx":4096}}', { status: 200 })
+    })
+    try {
+      const mgr = manager(events, { onError: (e) => errors.push(e) })
+      const load = mgr.load('a', null)
+      load.catch(() => undefined)
+      await vi.waitFor(() => expect(mgr.list()).toHaveLength(1))
+      // Wait until /props is being read, then unload.
+      await new Promise((r) => setTimeout(r, 30))
+      const unloading = mgr.unload(mgr.list()[0].instanceId)
+      releaseProps()
+      await expect(load).rejects.toThrow(/cancelled/)
+      await unloading
+      expect(errors).toEqual([])
+      expect(mgr.list()).toEqual([])
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+})

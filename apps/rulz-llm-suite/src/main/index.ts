@@ -13,13 +13,17 @@ import { broadcast, handle } from './ipc'
 import { estimateMemory, type FreeMemory } from './models/estimate'
 import { ModelLibrary } from './models/library'
 import { ApiServer } from './server/apiServer'
+import { parseLoadConfig } from './settings/schema'
 import { SettingsStore } from './settings/store'
 import { FILE_TOOLS_SERVER } from './files/fileTools'
 
 const MiB = 1024 * 1024
 const isDev = !app.isPackaged && !!process.env.ELECTRON_RENDERER_URL
 
-if (!app.requestSingleInstanceLock()) app.quit()
+// A second copy only hands over to the first (second-instance shows its window). It must not run
+// main(): its startup cleanup would kill the first copy's models.
+const isPrimaryInstance = app.requestSingleInstanceLock()
+if (!isPrimaryInstance) app.quit()
 
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
@@ -211,6 +215,16 @@ async function main(): Promise<void> {
     if (next.enginePath !== before.enginePath) void engine.getInfo(true)
     if (next.theme !== before.theme) mainWindow?.setBackgroundColor(windowBackground(next.theme))
     if (!next.minimizeToTray && !next.closeToTray && tray) showMainWindow()
+    // The key, CORS and model settings are read per request; the address needs a new listener, or
+    // switching from the network to this computer only would leave it reachable from the network.
+    const api = (s: typeof next): string => `${s.apiServer.bind}:${s.apiServer.port}`
+    if (api(next) !== api(before) && apiServer.getStatus().running) {
+      // A failure (port in use) shows in the server status, not as a failed settings save.
+      await apiServer
+        .stop()
+        .then(() => apiServer.start())
+        .catch(() => undefined)
+    }
     return next
   })
   handle('dialog:pickFolder', async ({ title, defaultPath }) => {
@@ -247,7 +261,13 @@ async function main(): Promise<void> {
   })
 
   handle('instances:list', () => instances.list())
-  handle('instances:load', (modelId, config) => instances.load(modelId, config))
+  handle('instances:load', async (modelId, config) => {
+    // Checked like saved settings, so a bad value from the page can't reach the command line.
+    const inst = await instances.load(modelId, config ? parseLoadConfig(config) : null)
+    // Loading it yourself makes it yours, even if the API server started it: no idle-unload.
+    apiServer.forget(inst.instanceId)
+    return inst
+  })
   handle('instances:unload', (id) => {
     apiServer.forget(id)
     return instances.unload(id)
@@ -264,6 +284,7 @@ async function main(): Promise<void> {
     void chat.start(req)
   })
   handle('chat:abort', (id) => chat.abort(id))
+  handle('chat:releaseTurn', (id) => chat.releaseTurn(id))
   handle('chat:countTokens', (modelId, messages, tools) => chat.countTokens(modelId, messages, tools))
 
   handle('conversations:list', () => conversations.list())
@@ -277,7 +298,20 @@ async function main(): Promise<void> {
   handle('mcp:saveConfig', (text) => mcp.saveConfig(text))
   handle('mcp:status', () => mcp.status())
   handle('mcp:restart', (name) => mcp.restart(name))
-  handle('mcp:callTool', (name, args) => mcp.callTool({ name, arguments: args }))
+  // Running tool calls by the renderer's key, so Stop can cancel the one in progress.
+  const toolCalls = new Map<string, AbortController>()
+  handle('mcp:callTool', async (name, args, callKey) => {
+    const ctrl = new AbortController()
+    if (callKey) toolCalls.set(callKey, ctrl)
+    try {
+      return await mcp.callTool({ name, arguments: args }, ctrl.signal)
+    } finally {
+      if (callKey) toolCalls.delete(callKey)
+    }
+  })
+  handle('mcp:cancelTool', (callKey) => {
+    toolCalls.get(callKey)?.abort()
+  })
 
   handle('server:status', () => apiServer.getStatus())
   handle('server:start', () => apiServer.start())
@@ -326,4 +360,4 @@ async function main(): Promise<void> {
   })
 }
 
-void main()
+if (isPrimaryInstance) void main()

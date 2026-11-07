@@ -24,6 +24,11 @@ describe('file tool helpers', () => {
     expect(() => expandPath('relative\\path', {})).toThrow(/absolute/)
     expect(() => expandPath('', {})).toThrow()
   })
+  it('refuses network shares and device paths, including ones a variable expands to', () => {
+    for (const p of ['\\\\server\\share\\x', '//server/share', '\\\\?\\UNC\\server\\share', '\\\\.\\pipe\\x', '\\\\?\\C:\\x', '%SHARE%\\x']) {
+      expect(() => expandPath(p, { SHARE: '\\\\evil\\s' })).toThrow(/Network and device paths/)
+    }
+  })
   it('formats sizes', () => {
     expect(formatSize(512)).toBe('512 B')
     expect(formatSize(2048)).toBe('2.0 KB')

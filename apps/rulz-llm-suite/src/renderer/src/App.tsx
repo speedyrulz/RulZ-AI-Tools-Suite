@@ -6,6 +6,7 @@ import { TopBar } from './components/shell/TopBar'
 import { ThemeChooser } from './components/shell/ThemeChooser'
 import { ModelPicker } from './components/models/ModelPicker'
 import { LogDialog } from './components/models/LogDialog'
+import { ToolApprovalDialog } from './components/chat/ToolCalls'
 import { ChatPage } from './pages/ChatPage'
 import { ModelsPage } from './pages/ModelsPage'
 import { McpPage } from './pages/McpPage'
@@ -26,6 +27,7 @@ export function App() {
   useShortcuts()
 
   useEffect(() => {
+    // Each init runs once even though StrictMode runs this effect twice in development.
     let cancelled = false
     void (async () => {
       await useApp.getState().init()
@@ -62,6 +64,8 @@ export function App() {
       </div>
       <ModelPicker />
       <LogDialog />
+      {/* Here rather than in the chat, so a tool waiting for approval is seen on every page. */}
+      <ToolApprovalDialog />
       <ThemeChooser />
       <Toaster
         theme={theme === 'light' ? 'light' : theme === 'system' ? 'system' : 'dark'}

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import type { McpServerConfig } from '@shared/types'
 
 export const EMPTY_CONFIG = '{\n  "mcpServers": {}\n}\n'
@@ -52,10 +53,44 @@ export function parseMcpConfig(text: string): Record<string, McpServerConfig> {
   return out
 }
 
+const cleanName = (s: string): string => s.replace(/[^A-Za-z0-9_-]/g, '_')
+const shortHash = (s: string): string => createHash('sha1').update(s).digest('hex').slice(0, 6)
+
 /** Tool name shown to the model; OpenAI-style names allow [A-Za-z0-9_-]{1,64}. */
 export function qualifyToolName(server: string, tool: string): string {
-  const clean = (s: string): string => s.replace(/[^A-Za-z0-9_-]/g, '_')
-  return `${clean(server)}__${clean(tool)}`.slice(0, 64)
+  return `${cleanName(server)}__${cleanName(tool)}`.slice(0, 64)
+}
+
+/**
+ * Qualified names for one server's tools, kept unique when cleaning or shortening would make two
+ * look alike (calls are routed by this name, so a clash would run the wrong tool). Of names that
+ * clash, the one that needed no change keeps it and the others get a short hash of their real name.
+ * Settings remember tools by this name (disabled, always allowed), so the choice never depends on
+ * the order servers connect or list their tools in, and names that don't clash stay exactly as
+ * qualifyToolName makes them.
+ */
+export function qualifyToolNames(server: string, tools: string[], allServers: string[]): string[] {
+  const mine = cleanName(server)
+  const clashes = allServers.some((s) => {
+    if (s === server) return false
+    const other = cleanName(s)
+    // Same cleaned name: a server whose real name is already clean keeps it.
+    if (other === mine) return mine !== server
+    // "a__b" + "c" and "a" + "b__c" would both read a__b__c; the longer server name gives way.
+    return mine.startsWith(`${other}__`)
+  })
+  const prefix = clashes ? `${mine}_${shortHash(server)}` : mine
+  const base = tools.map((t) => `${prefix}__${cleanName(t)}`.slice(0, 64))
+  const count = new Map<string, number>()
+  for (const q of base) count.set(q, (count.get(q) ?? 0) + 1)
+  return tools.map((t, i) => {
+    const q = base[i]
+    if (count.get(q) === 1) return q
+    // Only a tool whose name came through unchanged (clean, not cut short) can keep it, and tool
+    // names are unique on a server, so at most one does.
+    const unchanged = q === `${prefix}__${t}`
+    return unchanged ? q : `${q.slice(0, 57)}_${shortHash(t)}`
+  })
 }
 
 /** Flattens MCP tool-call content into text for the model. */

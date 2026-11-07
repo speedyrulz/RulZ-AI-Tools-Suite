@@ -6,21 +6,26 @@ import { useApp } from '../../stores/app'
 import { useModels } from '../../stores/models'
 import { Button, Dialog } from '../ui'
 
+const NO_LINES: string[] = []
+
 /** Live llama-server output for one instance (polled while open). */
 export function LogDialog() {
   const id = useApp((s) => s.logInstanceId)
   const showLog = useApp((s) => s.showLog)
   const inst = useModels((s) => s.instances.find((i) => i.instanceId === id))
-  const [lines, setLines] = useState<string[]>([])
+  // Kept with the id it belongs to, so opening another model's log never shows the previous one.
+  const [log, setLog] = useState<{ id: string | null; lines: string[] }>({ id: null, lines: [] })
+  const lines = log.id === id ? log.lines : NO_LINES
   const bottom = useRef<HTMLDivElement>(null)
   const stick = useRef(true)
 
   useEffect(() => {
     if (!id) return
+    stick.current = true
     let alive = true
     const tick = async (): Promise<void> => {
       const l = await invoke('instances:log', id).catch(() => null)
-      if (alive && l && l.length) setLines(l)
+      if (alive && l && l.length) setLog({ id, lines: l })
     }
     void tick()
     const t = setInterval(tick, 1000)

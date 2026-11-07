@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import { toolTokens } from '@shared/tools'
 import type { McpConfigState, McpServerStatus, McpToolInfo, ToolRequest } from '@shared/types'
 import { invoke, on } from '../lib/api'
+import { once } from '../lib/once'
 import { useApp } from './app'
 
 interface McpState {
@@ -14,12 +15,12 @@ interface McpState {
 export const useMcp = create<McpState>((set) => ({
   servers: [],
   config: null,
-  init: async () => {
+  init: once(async () => {
     on('mcp:changed', (servers) => set({ servers }))
     on('mcp:config', (config) => set({ config }))
     const [servers, config] = await Promise.all([invoke('mcp:status'), invoke('mcp:getConfig')])
     set({ servers, config })
-  }
+  })
 }))
 
 export function findTool(qualifiedName: string): McpToolInfo | undefined {

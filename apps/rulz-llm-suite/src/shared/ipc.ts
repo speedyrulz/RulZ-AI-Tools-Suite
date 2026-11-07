@@ -75,7 +75,11 @@ export interface IpcInvoke {
   'mcp:saveConfig': (text: string) => McpServerStatus[]
   'mcp:status': () => McpServerStatus[]
   'mcp:restart': (name: string | null) => void
-  'mcp:callTool': (name: string, args: string) => ToolResult
+  /** `callKey` lets `mcp:cancelTool` stop this call while it runs. */
+  'mcp:callTool': (name: string, args: string, callKey?: string) => ToolResult
+  'mcp:cancelTool': (callKey: string) => void
+  /** The tool round asked for by `requestId` is over (next round started, or the turn ended). */
+  'chat:releaseTurn': (requestId: string) => void
 
   'server:status': () => ApiServerStatus
   'server:start': () => ApiServerStatus

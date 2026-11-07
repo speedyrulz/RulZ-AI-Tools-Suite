@@ -149,8 +149,9 @@ export function McpPage() {
                 className="w-28"
                 value={settings.toolBudgetTokens}
                 min={500}
+                max={200000}
                 step={500}
-                onChange={(v) => v !== null && v >= 500 && void update({ toolBudgetTokens: Math.round(v) })}
+                onChange={(v) => v !== null && void update({ toolBudgetTokens: Math.max(500, Math.min(200000, Math.round(v))) })}
               />
             </Field>
             <Field
@@ -171,7 +172,7 @@ export function McpPage() {
                   value={settings.keepFullToolResults}
                   min={0}
                   max={100}
-                  onChange={(v) => v !== null && v >= 0 && void update({ keepFullToolResults: Math.round(v) })}
+                  onChange={(v) => v !== null && void update({ keepFullToolResults: Math.max(0, Math.min(100, Math.round(v))) })}
                 />
               </Field>
             )}

@@ -16,6 +16,7 @@ import { errorMessage, invoke, on } from '../lib/api'
 import { uid } from '../lib/format'
 import { type QueuedNote, takeQueued } from '../lib/interject'
 import { editMessages, idsToDelete, removeMessages, restoreMessages } from '../lib/messages'
+import { once } from '../lib/once'
 import { buildWire } from '../lib/wire'
 import { useApp } from './app'
 import { availableTools, effectiveToolMode, tokensOf, toolRequestFor } from './mcp'
@@ -146,27 +147,43 @@ export function toWire(
 
 // ---- Persistence (debounced per conversation) ----
 const saveTimers = new Map<string, ReturnType<typeof setTimeout>>()
+/** Chats deleted this session. A reply or tool call still finishing in one must not save it back. */
+const deletedIds = new Set<string>()
 
 function upsertSummary(list: ConversationSummary[], s: ConversationSummary): ConversationSummary[] {
   return [s, ...list.filter((x) => x.id !== s.id)].sort((a, b) => b.updatedAt - a.updatedAt)
 }
 
-async function persistNow(conv: Conversation): Promise<void> {
-  const t = saveTimers.get(conv.id)
+function cancelSave(id: string): void {
+  const t = saveTimers.get(id)
   if (t) clearTimeout(t)
-  saveTimers.delete(conv.id)
+  saveTimers.delete(id)
+}
+
+async function persistNow(conv: Conversation): Promise<void> {
+  cancelSave(conv.id)
+  if (deletedIds.has(conv.id)) return
   try {
     const summary = await invoke('conversations:save', conv)
+    // Deleted while the save was in flight: keep it out of the list.
+    if (deletedIds.has(conv.id)) return
     useChat.setState((s) => ({ summaries: upsertSummary(s.summaries, summary) }))
   } catch (e) {
+    // Main refuses saves of deleted chats; that's the intended outcome, not a failure to report.
+    if (deletedIds.has(conv.id)) return
     toast.error(`Could not save chat: ${errorMessage(e)}`)
   }
 }
 
 function persistSoon(conv: Conversation): void {
-  const t = saveTimers.get(conv.id)
-  if (t) clearTimeout(t)
+  if (deletedIds.has(conv.id)) return
+  cancelSave(conv.id)
   saveTimers.set(conv.id, setTimeout(() => void persistNow(conv), 500))
+}
+
+/** A reply is streaming, running tools, or waiting for its model to load. */
+export function isChatBusy(s: { generation: unknown; autoLoadingModelId: string | null }): boolean {
+  return !!s.generation || !!s.autoLoadingModelId
 }
 
 // ---- Streaming deltas are batched: every update re-renders the message's Markdown, so ~11 per second ----
@@ -254,10 +271,18 @@ export const useChat = create<ChatState>((set, get) => {
   }
 
   const handleEvent = (e: StreamEvent): void => {
+    // Main keeps the model in use after a reply that asked for tools; a reply whose tools won't
+    // run here lets it go at once.
+    const releaseUnused = (): void => {
+      if (e.type === 'done' && e.toolCalls?.length) void invoke('chat:releaseTurn', e.requestId)
+    }
     const ho = get().handoff
-    if (ho && e.requestId === ho.requestId) return handleHandoffEvent(ho, e)
+    if (ho && e.requestId === ho.requestId) {
+      releaseUnused()
+      return handleHandoffEvent(ho, e)
+    }
     const gen = get().generation
-    if (!gen || e.requestId !== gen.requestId) return
+    if (!gen || e.requestId !== gen.requestId) return releaseUnused()
     if (e.type === 'done' && e.toolCalls?.length && e.stats.stopReason !== 'stopped') {
       flushPending()
       const calls: ToolCall[] = e.toolCalls.map((c) => ({
@@ -311,6 +336,9 @@ export const useChat = create<ChatState>((set, get) => {
 
   const updateCall = (id: string, patch: Partial<ToolCall>): void =>
     applyToGenMessage((m) => ({ ...m, toolCalls: m.toolCalls?.map((c) => (c.id === id ? { ...c, ...patch } : c)) }))
+
+  /** Keys (`requestId:callId`) of MCP tool calls in flight, so Stop can cancel them in main. */
+  const runningToolCalls = new Set<string>()
 
   /** True while the tool phase started by `requestId` is still the active one (not stopped). */
   const inToolPhase = (requestId: string): boolean => {
@@ -395,6 +423,15 @@ export const useChat = create<ChatState>((set, get) => {
 
   /** Approves and runs each tool call, then continues the reply with the results. */
   const runTools = async (requestId: string, calls: ToolCall[]): Promise<void> => {
+    try {
+      await runToolRound(requestId, calls)
+    } finally {
+      // By now the next round has started (and holds the model itself) or the turn has ended.
+      void invoke('chat:releaseTurn', requestId)
+    }
+  }
+
+  const runToolRound = async (requestId: string, calls: ToolCall[]): Promise<void> => {
     for (let call of calls) {
       if (!inToolPhase(requestId)) return
       if (META_TOOLS.has(call.name)) {
@@ -422,6 +459,8 @@ export const useChat = create<ChatState>((set, get) => {
         if (!inToolPhase(requestId)) return
         if (decision === 'always' && s) {
           await useApp.getState().updateSettings({ allowedTools: [...new Set([...s.allowedTools, call.name])] })
+          // Stop may have been pressed while that saved; the tool must not run after it.
+          if (!inToolPhase(requestId)) return
         }
         approved = decision !== 'deny'
       }
@@ -430,7 +469,11 @@ export const useChat = create<ChatState>((set, get) => {
         continue
       }
       updateCall(call.id, { status: 'running' })
-      const r = await invoke('mcp:callTool', call.name, call.arguments).catch((e) => ({ text: errorMessage(e), isError: true }))
+      const callKey = `${requestId}:${call.id}`
+      runningToolCalls.add(callKey)
+      const r = await invoke('mcp:callTool', call.name, call.arguments, callKey)
+        .catch((e) => ({ text: errorMessage(e), isError: true }))
+        .finally(() => runningToolCalls.delete(callKey))
       if (!inToolPhase(requestId)) return
       updateCall(call.id, { status: r.isError ? 'error' : 'done', result: r.text })
     }
@@ -438,7 +481,8 @@ export const useChat = create<ChatState>((set, get) => {
     const conv = get().genConversation
     set({ generation: null, genConversation: null })
     if (!conv) return
-    await persistNow(conv)
+    // Not awaited: the next round must start before anything else (a Resend, say) can slip in.
+    void persistNow(conv)
 
     let rounds = 0
     for (let i = conv.messages.length - 1; i >= 0 && conv.messages[i].role === 'assistant'; i--) {
@@ -451,11 +495,14 @@ export const useChat = create<ChatState>((set, get) => {
     await startGeneration(conv, 'new')
   }
 
+  /** Shows `conv` if it is the chat on screen. A chat replying in the background stays there. */
+  const showIfCurrent = (conv: Conversation): Partial<ChatState> => (get().current?.id === conv.id ? { current: conv } : {})
+
   /** Ensures a model is ready, then streams a reply into `conv`. */
   const startGeneration = async (conv: Conversation, mode: 'new' | 'continue'): Promise<void> => {
     const settings = useApp.getState().settings
     const modelId = useModels.getState().activeModelId ?? conv.modelId
-    set({ current: conv })
+    set(showIfCurrent(conv))
     if (!modelId) {
       void persistNow(conv)
       toast('Load a model to start chatting')
@@ -478,7 +525,7 @@ export const useChat = create<ChatState>((set, get) => {
       set({ autoLoadingModelId: modelId })
       inst = (await useModels.getState().load(modelId, null)) ?? undefined
       set({ autoLoadingModelId: null })
-      if (!inst) return
+      if (!inst || deletedIds.has(conv.id)) return
       const latest = get().current
       if (latest?.id === conv.id) conv = latest
     }
@@ -508,7 +555,7 @@ export const useChat = create<ChatState>((set, get) => {
 
     const requestId = uid()
     pending = { content: '', reasoning: '' }
-    set({ current: conv, genConversation: conv, generation: { requestId, conversationId: conv.id, messageId, promptProgress: null } })
+    set({ ...showIfCurrent(conv), genConversation: conv, generation: { requestId, conversationId: conv.id, messageId, promptProgress: null } })
     try {
       await invoke('chat:start', {
         requestId,
@@ -549,10 +596,20 @@ export const useChat = create<ChatState>((set, get) => {
     void get().send(note.text, note.attachments)
   }
 
+  /**
+   * Reads a saved chat. null: it no longer exists. undefined: it exists but couldn't be read
+   * (locked by another program, say); that is reported here and the chat stays in the list.
+   */
+  const readConversation = (id: string): Promise<Conversation | null | undefined> =>
+    invoke('conversations:get', id).catch((e) => {
+      toast.error(`Could not open chat: ${errorMessage(e)}`)
+      return undefined
+    })
+
   /** Loads a conversation (or reuses `current`), applies `fn`, saves it. */
   const withConversation = async (id: string, fn: (c: Conversation) => Conversation): Promise<void> => {
     const { current, genConversation } = get()
-    const base = current?.id === id ? current : genConversation?.id === id ? genConversation : await invoke('conversations:get', id)
+    const base = current?.id === id ? current : genConversation?.id === id ? genConversation : await readConversation(id)
     if (!base) return
     const next = fn(base)
     if (get().current?.id === id) set({ current: next })
@@ -575,7 +632,7 @@ export const useChat = create<ChatState>((set, get) => {
     toolApproval: null,
     queued: [],
 
-    init: async () => {
+    init: once(async () => {
       on('chat:event', handleEvent)
       const [summaries, folders, presets] = await Promise.all([
         invoke('conversations:list'),
@@ -584,7 +641,7 @@ export const useChat = create<ChatState>((set, get) => {
       ])
       set({ summaries, folders, presets, loaded: true })
       if (summaries[0]) await get().open(summaries[0].id)
-    },
+    }),
 
     newChat: async () => {
       const { current } = get()
@@ -612,7 +669,8 @@ export const useChat = create<ChatState>((set, get) => {
     open: async (id) => {
       if (get().current?.id === id) return
       const gen = get().genConversation
-      const conv = gen?.id === id ? gen : await invoke('conversations:get', id)
+      const conv = gen?.id === id ? gen : await readConversation(id)
+      if (conv === undefined) return
       if (!conv) {
         set((s) => ({ summaries: s.summaries.filter((x) => x.id !== id) }))
         return
@@ -631,7 +689,7 @@ export const useChat = create<ChatState>((set, get) => {
     },
 
     send: async (text, attachments) => {
-      if (get().generation || get().autoLoadingModelId) return
+      if (isChatBusy(get())) return
       const cur = get().current ?? (await get().newChat())
       await appendAndGenerate(cur, text, attachments)
     },
@@ -672,7 +730,7 @@ export const useChat = create<ChatState>((set, get) => {
 
     regenerate: async (messageId) => {
       const cur = get().current
-      if (!cur || get().generation) return
+      if (!cur || isChatBusy(get())) return
       const idx = cur.messages.findIndex((m) => m.id === messageId)
       if (idx < 0) return
       const keep = cur.messages[idx].role === 'assistant' ? idx : idx + 1
@@ -681,9 +739,12 @@ export const useChat = create<ChatState>((set, get) => {
 
     continueMessage: async (messageId) => {
       const cur = get().current
-      if (!cur || get().generation) return
-      if (cur.messages.at(-1)?.id !== messageId || cur.messages.at(-1)?.role !== 'assistant') return
-      await startGeneration(cur, 'continue')
+      if (!cur || isChatBusy(get())) return
+      const last = cur.messages.at(-1)
+      if (last?.id !== messageId || last.role !== 'assistant') return
+      // A turn that called tools is complete; writing more into it would mix new calls with the
+      // old results. Continuing means the model's next turn, after those results.
+      await startGeneration(cur, last.toolCalls?.length ? 'new' : 'continue')
     },
 
     editMessage: async (messageId, content, resend) => {
@@ -691,7 +752,7 @@ export const useChat = create<ChatState>((set, get) => {
       if (!cur) return
       const target = cur.messages.find((m) => m.id === messageId)
       if (!target) return
-      if (resend && target.role === 'user' && !get().generation) {
+      if (resend && target.role === 'user' && !isChatBusy(get())) {
         await startGeneration({ ...cur, messages: editMessages(cur.messages, messageId, content, true) }, 'new')
       } else {
         get().mutateCurrent((c) => ({ ...c, messages: editMessages(c.messages, messageId, content, false) }))
@@ -745,7 +806,8 @@ export const useChat = create<ChatState>((set, get) => {
       const gen = get().generation
       if (!gen) return
       if (gen.phase !== 'tools') return void invoke('chat:abort', gen.requestId)
-      // Stopping during the tool phase: skip the remaining calls and end the turn here.
+      // Stopping during the tool phase: cancel the running call, skip the rest and end the turn here.
+      for (const key of runningToolCalls) void invoke('mcp:cancelTool', key)
       get().toolApproval?.resolve('deny')
       applyToGenMessage((m) => ({
         ...m,
@@ -763,7 +825,7 @@ export const useChat = create<ChatState>((set, get) => {
     moveToFolder: (id, folder) => withConversation(id, (c) => ({ ...c, folder })),
 
     duplicate: async (id) => {
-      const src = get().current?.id === id ? get().current : await invoke('conversations:get', id)
+      const src = get().current?.id === id ? get().current : await readConversation(id)
       if (!src) return
       const now = Date.now()
       const copy: Conversation = { ...src, id: uid(), title: `${src.title} (copy)`, pinned: false, createdAt: now, updatedAt: now }
@@ -771,9 +833,21 @@ export const useChat = create<ChatState>((set, get) => {
     },
 
     remove: async (id) => {
+      // Mark it first: a reply stopped here still sends a final event, which would save the chat again.
+      deletedIds.add(id)
+      cancelSave(id)
       if (get().generation?.conversationId === id) get().stop()
       set((s) => ({ queued: s.queued.filter((q) => q.conversationId !== id) }))
-      await invoke('conversations:delete', id).catch((e) => toast.error(errorMessage(e)))
+      try {
+        await invoke('conversations:delete', id)
+      } catch (e) {
+        deletedIds.delete(id)
+        toast.error(errorMessage(e))
+        // The chat is still there; keep what was on screen, including a reply that ended meanwhile.
+        const cur = get().current
+        if (cur?.id === id) void persistNow(cur)
+        return
+      }
       const summaries = get().summaries.filter((s) => s.id !== id)
       set({ summaries })
       if (get().current?.id === id) {
@@ -785,16 +859,28 @@ export const useChat = create<ChatState>((set, get) => {
     addFolder: async (name) => {
       const n = name.trim()
       if (!n || get().folders.includes(n)) return
-      const folders = [...get().folders, n].sort((a, b) => a.localeCompare(b))
+      const before = get().folders
+      const folders = [...before, n].sort((a, b) => a.localeCompare(b))
       set({ folders })
-      await invoke('folders:save', folders)
+      try {
+        await invoke('folders:save', folders)
+      } catch (e) {
+        set({ folders: before })
+        toast.error(`Could not save folders: ${errorMessage(e)}`)
+      }
     },
 
     removeFolder: async (name) => {
-      for (const s of get().summaries.filter((x) => x.folder === name)) await get().moveToFolder(s.id, null)
       const folders = get().folders.filter((f) => f !== name)
+      // Saved first: if the list can't be saved, the chats stay in the folder too.
+      try {
+        await invoke('folders:save', folders)
+      } catch (e) {
+        toast.error(`Could not save folders: ${errorMessage(e)}`)
+        return
+      }
       set({ folders })
-      await invoke('folders:save', folders)
+      for (const s of get().summaries.filter((x) => x.folder === name)) await get().moveToFolder(s.id, null)
     },
 
     savePreset: async (name) => {

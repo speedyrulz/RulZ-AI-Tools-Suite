@@ -167,11 +167,11 @@ export function readGgufHeader(path: string): GgufHeader {
  * Reads the header without blocking the main process on disk I/O: the start of the file is read
  * asynchronously and parsed from memory, reading more only for unusually large headers.
  */
-export async function readGgufHeaderAsync(path: string): Promise<GgufHeader> {
+export async function readGgufHeaderAsync(path: string, firstRead = ASYNC_FIRST_READ): Promise<GgufHeader> {
   const fh = await fs.open(path, 'r')
   try {
     const size = (await fh.stat()).size
-    for (let length = Math.min(size, ASYNC_FIRST_READ); ; length = Math.min(size, length * 4)) {
+    for (let length = Math.min(size, firstRead); ; length = Math.min(size, length * 4)) {
       const pre = Buffer.allocUnsafe(length)
       const { bytesRead } = await fh.read(pre, 0, length, 0)
       const load: Loader = (pos, want, need) => {
@@ -199,6 +199,8 @@ const FILE_TYPES: Record<number, string> = {
 } // prettier-ignore
 
 const QUANT_IN_NAME = /(?:^|[-_.])((?:UD-)?(?:I?Q\d+(?:_[A-Z0-9]+)*|BF16|F16|F32|MXFP4(?:_MOE)?))(?=$|[-_.])/i
+/** Every quantization tag in a name, with its leading separator, for stripping it. */
+export const QUANT_TAGS = new RegExp(QUANT_IN_NAME.source, 'gi')
 
 export function quantFromName(fileName: string): string | undefined {
   const base = fileName.replace(/\.gguf$/i, '').replace(/-\d{5}-of-\d{5}$/i, '')
@@ -217,6 +219,37 @@ function num(v: unknown, mode: 'mean' | 'max' = 'max'): number | undefined {
   return undefined
 }
 
+/**
+ * Sliding-window layouts llama.cpp hard-codes per architecture (src/models/*.cpp, load_swa_pattern),
+ * used when the GGUF has no attention.sliding_window_pattern key: every n-th layer is full attention.
+ */
+const SWA_PATTERNS: Record<string, number> = {
+  gemma2: 2, 'gpt-oss': 2,
+  cohere2: 4, cohere2moe: 4, llama4: 4, exaone4: 4, 'exaone-moe': 4, afmoe: 4, laguna: 4, limite: 4,
+  mellum: 4, 'muse-glimmer': 4, olmo2: 4, smallthinker: 4,
+  gemma3n: 5, ricursive: 5,
+  gemma3: 6, 'gemma-embedding': 6, 'gemma-embedding2': 6,
+  plamo3: 8
+} // prettier-ignore
+
+/** The window llama.cpp actually uses: some architectures default it or override the GGUF's value. */
+function swaWindow(arch: string, window: number | undefined, blocks: number | undefined): number | undefined {
+  switch (arch) {
+    case 'gemma2':
+      return window ?? 4096
+    case 'exaone-moe':
+      return window ?? 128
+    case 'exaone4':
+      return blocks === 64 ? (window ?? 4096) : undefined // only the 32B has sliding layers
+    case 'llama4':
+      return window === 0 ? 0 : 8192 // chunked attention; a 0 in the file turns it off
+    case 'smallthinker':
+      return window ? 4096 : window
+    default:
+      return window
+  }
+}
+
 export function toGgufInfo(kv: Record<string, unknown>, fileName: string, hasNextn = false): GgufInfo {
   const arch = typeof kv['general.architecture'] === 'string' ? (kv['general.architecture'] as string) : 'unknown'
   const a = (k: string): unknown => kv[`${arch}.${k}`]
@@ -224,7 +257,8 @@ export function toGgufInfo(kv: Record<string, unknown>, fileName: string, hasNex
   const str = (k: string): string | undefined => (typeof kv[k] === 'string' ? (kv[k] as string) : undefined)
   const headCount = num(a('attention.head_count'))
   const embeddingLength = num(a('embedding_length'))
-  const pattern = a('attention.sliding_window_pattern')
+  const blockCount = num(a('block_count'))
+  const pattern = a('attention.sliding_window_pattern') ?? SWA_PATTERNS[arch]
   let slidingWindowFraction: number | undefined
   if (Array.isArray(pattern) && pattern.length) slidingWindowFraction = pattern.filter(Boolean).length / pattern.length
   else if (typeof pattern === 'number' && pattern > 1) slidingWindowFraction = (pattern - 1) / pattern
@@ -236,7 +270,7 @@ export function toGgufInfo(kv: Record<string, unknown>, fileName: string, hasNex
     fileType,
     quantization: quantFromName(fileName) ?? (fileType !== undefined ? FILE_TYPES[fileType] : undefined),
     contextLength: num(a('context_length')),
-    blockCount: num(a('block_count')),
+    blockCount,
     embeddingLength,
     headCount,
     // Per-layer arrays: hybrid models have 0 KV heads on recurrent layers, so the mean gives the right total.
@@ -245,7 +279,7 @@ export function toGgufInfo(kv: Record<string, unknown>, fileName: string, hasNex
     valueLength: num(a('attention.value_length')) ?? (headCount && embeddingLength ? embeddingLength / headCount : undefined),
     expertCount: num(a('expert_count')),
     expertUsedCount: num(a('expert_used_count')),
-    slidingWindow: num(a('attention.sliding_window')),
+    slidingWindow: swaWindow(arch, num(a('attention.sliding_window')), blockCount),
     slidingWindowFraction,
     hasChatTemplate: typeof kv['tokenizer.chat_template'] === 'string',
     mtpLayers: hasNextn ? num(a('nextn_predict_layers')) || undefined : undefined
