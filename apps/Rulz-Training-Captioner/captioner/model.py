@@ -1,4 +1,5 @@
 """Image list model, lazy thumbnail loading and caption .txt persistence."""
+import functools
 import os
 import re
 import threading
@@ -15,14 +16,36 @@ PathRole = Qt.UserRole + 1
 StatusRole = Qt.UserRole + 2
 HasFileRole = Qt.UserRole + 3
 THUMB_GEN = 256
-CACHE_MAX = 1500
+# Thumbnails kept in memory, by size: 192 MB holds ~770 square 256 px thumbnails (non-square ones are
+# smaller), several screens' worth even at the smallest card size on a 4K monitor. A count limit
+# let 1500 of them reach ~390 MB.
+CACHE_BYTES = 192 * 1024 * 1024
 
 # status values
 IDLE, QUEUED, BUSY, ERROR = "idle", "queued", "busy", "error"
 
 
+def _natural(s):
+    # re.split with a group alternates text and digit runs, so odd positions are always digits.
+    # str.isdigit() isn't a safe test: it is true for "²", which int() rejects.
+    return [int(t) if i % 2 else t.lower() for i, t in enumerate(re.split(r"(\d+)", s))]
+
+
 def natural_key(p):
-    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", os.path.basename(p))]
+    """Sort key for a file name: img2 before img10."""
+    return _natural(os.path.basename(p))
+
+
+@functools.lru_cache(maxsize=4096)
+def _folder_key(folder):
+    return tuple(tuple(_natural(part)) for part in Path(folder).parts)  # once per folder, not per file
+
+
+def sort_key(p):
+    """Sort key for a path: folder by folder, then the file name, so a folder's subfolders don't
+    interleave (b\\1, a\\1, a\\2 became a\\1, a\\2, b\\1)."""
+    folder, name = os.path.split(p)
+    return _folder_key(folder), tuple(_natural(name))
 
 
 def caption_path(img_path):
@@ -64,19 +87,76 @@ def write_caption(img_path, text):
         f.write(text)
 
 
-def collect_images(paths, recursive=False):
+def _is_image(name):
+    return os.path.splitext(name)[1].lower() in IMAGE_EXTS
+
+
+def collect_images(paths, recursive=False, unreadable=None, listing=None):
+    """Image files in `paths` (files, or folders and optionally their subfolders). Folders that can't
+    be listed are skipped and appended to `unreadable` when given. When `listing` is a dict, it gets
+    {normcase(folder): normcase'd names of the files in it} for every folder listed, which
+    load_entries() uses to skip opening caption files that don't exist."""
     out = []
+    folders = []
     for p in paths:
         if os.path.isdir(p):
-            if recursive:
-                for root, _, files in os.walk(p):
-                    out += [os.path.join(root, f) for f in files if Path(f).suffix.lower() in IMAGE_EXTS]
-            else:
-                out += [os.path.join(p, f) for f in os.listdir(p)
-                        if Path(f).suffix.lower() in IMAGE_EXTS and os.path.isfile(os.path.join(p, f))]
-        elif Path(p).suffix.lower() in IMAGE_EXTS and os.path.isfile(p):
+            folders.append(p)
+        elif _is_image(p) and os.path.isfile(p):
             out.append(p)
+    while folders:
+        d = folders.pop()
+        names = set()
+        try:
+            with os.scandir(d) as it:  # on Windows the listing already says file or folder: no stat per file
+                for e in it:
+                    try:
+                        if e.is_file():
+                            names.add(os.path.normcase(e.name))
+                            if _is_image(e.name):
+                                out.append(e.path)
+                        elif recursive and e.is_dir(follow_symlinks=False):
+                            folders.append(e.path)
+                    except OSError:
+                        pass
+        except OSError:
+            if unreadable is not None:
+                unreadable.append(d)
+            continue
+        if listing is not None:
+            listing[os.path.normcase(os.path.normpath(d))] = names
     return out
+
+
+def unique_new(paths, known=()):
+    """`paths` normalised, without duplicates or paths already in `known` (normcase'd keys). Windows
+    paths are case-insensitive: C:\\A\\x.png and c:\\a\\X.PNG are the same file."""
+    seen = set(known)
+    new = []
+    for p in map(os.path.normpath, paths):
+        key = os.path.normcase(p)
+        if key not in seen:
+            seen.add(key)
+            new.append(p)
+    return new
+
+
+def load_entries(paths, progress=None, listing=None):
+    """List entries for `paths`, sorted, with their captions read. Touches only the disk, so it can
+    run off the UI thread; progress(n) is called now and then with the number read so far. With the
+    `listing` collect_images() filled in, captions its folders don't have aren't opened at all: a
+    failed open costs about as much as reading a caption, and new datasets have none."""
+    entries = []
+    for i, p in enumerate(sorted(paths, key=sort_key), 1):
+        folder, name = os.path.split(caption_path(p))
+        names = listing.get(os.path.normcase(folder)) if listing else None
+        if names is not None and os.path.normcase(name) not in names:
+            cap, has = "", False
+        else:
+            cap, has = read_caption(p)
+        entries.append({"path": p, "caption": cap, "has_file": has, "status": IDLE})
+        if progress and i % 500 == 0:
+            progress(i)
+    return entries
 
 
 class _ThumbSignals(QObject):
@@ -120,7 +200,8 @@ class ImageModel(QAbstractListModel):
         super().__init__()
         self.items = []          # dicts: path, caption, has_file, status
         self.index_of = {}       # path -> row
-        self.cache = OrderedDict()
+        self.cache = OrderedDict()  # path -> thumbnail QPixmap, least recently drawn first
+        self.cache_bytes = 0
         self.pending = set()
         self.pool = QThreadPool()
         self.pool.setMaxThreadCount(4)
@@ -173,34 +254,44 @@ class ImageModel(QAbstractListModel):
         with self.sig.lock:
             self.pending = set(self.sig.running)
 
+    @staticmethod
+    def _pixmap_bytes(pm):
+        return pm.width() * pm.height() * max(1, pm.depth()) // 8
+
+    def _uncache(self, path):
+        pm = self.cache.pop(path, None)
+        if pm is not None:
+            self.cache_bytes -= self._pixmap_bytes(pm)
+
     def _thumb_ready(self, path, img):
         self.pending.discard(path)
+        if path not in self.index_of:
+            return  # removed from the list while it was decoding
         pm = QPixmap.fromImage(img) if not img.isNull() else QPixmap()
+        self._uncache(path)
         self.cache[path] = pm
-        while len(self.cache) > CACHE_MAX:
-            self.cache.popitem(last=False)
-        row = self.index_of.get(path)
-        if row is not None:
-            i = self.index(row)
-            self.dataChanged.emit(i, i, [Qt.DecorationRole])
+        self.cache_bytes += self._pixmap_bytes(pm)
+        while self.cache_bytes > CACHE_BYTES and len(self.cache) > 1:
+            self._uncache(next(iter(self.cache)))
+        i = self.index(self.index_of[path])
+        self.dataChanged.emit(i, i, [Qt.DecorationRole])
 
     # -- mutation
-    def add_paths(self, paths):
-        # Windows paths are case-insensitive: C:\A\x.png and c:\a\X.PNG are the same file
-        seen = {os.path.normcase(p) for p in self.index_of}
-        new = []
-        for p in map(os.path.normpath, paths):
-            key = os.path.normcase(p)
-            if key not in seen:
-                seen.add(key)
-                new.append(p)
-        if not new:
+    def known_keys(self):
+        return {os.path.normcase(p) for p in self.index_of}
+
+    def add_entries(self, entries):
+        """Append entries from load_entries(), skipping images already in the list. Returns how many."""
+        known = self.known_keys()
+        fresh = []
+        for e in entries:
+            key = os.path.normcase(e["path"])
+            if key not in known:  # another add may have listed it since this batch was scanned
+                known.add(key)
+                fresh.append(e)
+        entries = fresh
+        if not entries:
             return 0
-        new.sort(key=natural_key)
-        entries = []
-        for p in new:
-            cap, has = read_caption(p)
-            entries.append({"path": p, "caption": cap, "has_file": has, "status": IDLE})
         start = len(self.items)
         self.beginInsertRows(QModelIndex(), start, start + len(entries) - 1)
         for e in entries:
@@ -210,12 +301,25 @@ class ImageModel(QAbstractListModel):
         self.stats_changed.emit()
         return len(entries)
 
+    def add_paths(self, paths):
+        """Add image files now, on this thread (the window scans folders in the background instead)."""
+        return self.add_entries(load_entries(unique_new(paths, self.known_keys())))
+
     def remove_rows(self, rows):
-        for r in sorted(set(rows), reverse=True):
-            self.beginRemoveRows(QModelIndex(), r, r)
-            self.cache.pop(self.items[r]["path"], None)
-            del self.items[r]
+        # contiguous runs, last first, so each run is one removal instead of one per row
+        rows = sorted(set(rows), reverse=True)
+        k = 0
+        while k < len(rows):
+            hi = lo = rows[k]
+            while k + 1 < len(rows) and rows[k + 1] == lo - 1:
+                k += 1
+                lo = rows[k]
+            self.beginRemoveRows(QModelIndex(), lo, hi)
+            for it in self.items[lo:hi + 1]:
+                self._uncache(it["path"])
+            del self.items[lo:hi + 1]
             self.endRemoveRows()
+            k += 1
         self.index_of = {it["path"]: i for i, it in enumerate(self.items)}
         self.stats_changed.emit()
 
@@ -223,6 +327,7 @@ class ImageModel(QAbstractListModel):
         self.beginResetModel()
         self.items, self.index_of = [], {}
         self.cache.clear()
+        self.cache_bytes = 0
         self.endResetModel()
         self.stats_changed.emit()
 

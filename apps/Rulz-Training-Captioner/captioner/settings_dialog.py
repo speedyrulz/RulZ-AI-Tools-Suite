@@ -87,9 +87,18 @@ class SettingsDialog(QDialog):
         self.gpu_checks = []
         for idx, name, mem in self.gpus:
             c = QCheckBox(f"GPU {idx}: {name}  ({mem / 1024:.0f} GB)")
-            c.setChecked(idx in s["gpus"] or (not s["gpus"]))
+            # Show what will run. These used to all show ticked when none were saved, but no GPU saved
+            # runs one llama-server that picks its own GPUs, and pressing OK then saved them all ticked,
+            # quietly switching to one server per GPU in Parallel mode.
+            c.setChecked(idx in s["gpus"])
+            c.toggled.connect(self._gpu_note_update)
             self.gpu_checks.append((idx, c))
             v.addWidget(c)
+        self.gpu_note = QLabel("No GPU ticked: one llama-server starts and picks the GPUs itself (it spreads "
+                               "one copy of the model over all of them). Tick GPUs to choose.")
+        self.gpu_note.setWordWrap(True)
+        v.addWidget(self.gpu_note)
+        self._gpu_note_update()
         self.m_parallel = QRadioButton("Parallel — one model copy per GPU, images are shared out between them (fastest; model must fit on one card)")
         self.m_split = QRadioButton("Split — one model spread across the selected GPUs (for models too big for one card)")
         self.m_parallel.setChecked(s["gpu_mode"] != "split")
@@ -143,6 +152,9 @@ class SettingsDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.addWidget(tabs)
         lay.addWidget(bb)
+
+    def _gpu_note_update(self, *_):
+        self.gpu_note.setVisible(bool(self.gpu_checks) and not any(c.isChecked() for _, c in self.gpu_checks))
 
     def result_settings(self):
         s = dict(self.s)
