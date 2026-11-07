@@ -1,10 +1,11 @@
+import { existsSync } from 'node:fs'
 import { mkdtemp, mkdir, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { findFile, flattenSingleFolder, swapInto } from '../src/main/archive'
-import { findAsset, isNewer, type Release } from '../src/main/github'
-import { quoteArg, resolveProgram, spawnArgs } from '../src/main/process'
+import { findFile, flattenSingleFolder, installFolder, swapInto } from '../src/main/archive'
+import { findAsset, getFetch, isNewer, setFetch, type Release } from '../src/main/github'
+import { lineSplitter, quoteArg, resolveProgram, runCommand, spawnArgs } from '../src/main/process'
 
 let dir: string
 afterEach(async () => {
@@ -65,6 +66,88 @@ describe('launcher update helper', () => {
       { encoding: 'utf8' }
     )
     expect(out.trim()).toBe('0')
+  }, 30_000)
+
+  it("won't start while an app is being installed (the setup would stop the launcher halfway)", async () => {
+    const { busyReason, installSelfUpdate } = await import('../src/main/selfUpdate')
+    expect(busyReason([])).toBeNull()
+    expect(busyReason(['RulZ LLM Suite', 'RulzTrainer'])).toMatch(/^RulZ LLM Suite, RulzTrainer are still being installed/)
+    const original = getFetch()
+    let fetched = false
+    setFetch(async () => {
+      fetched = true
+      return new Response('')
+    })
+    try {
+      const u = { version: '9.9.9', tag: 'v9.9.9', size: 1, url: 'https://x/setup.exe', notesUrl: '' }
+      await expect(installSelfUpdate(u, () => undefined, () => ['RulZ LLM Suite'])).rejects.toThrow(/is still being installed/)
+      expect(fetched).toBe(false)
+    } finally {
+      setFetch(original)
+    }
+  })
+})
+
+describe('install folder', () => {
+  it('tidies the path: trailing backslash, forward slashes and Explorer quotes', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'rulz-test-'))
+    const target = join(dir, 'Grid')
+    expect(await installFolder(`${target}\\`)).toBe(target)
+    expect(await installFolder(target.replace(/\\/g, '/'))).toBe(target)
+    expect(await installFolder(`"${target}"`)).toBe(target)
+    expect(await installFolder(`  ${target}  `)).toBe(target)
+  })
+
+  it('accepts an empty folder', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'rulz-test-'))
+    expect(await installFolder(dir)).toBe(dir)
+  })
+
+  it('refuses a folder with files in it', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'rulz-test-'))
+    await writeFile(join(dir, 'mine.txt'), '')
+    await expect(installFolder(dir)).rejects.toThrow(/empty folder/)
+  })
+
+  it('refuses a file instead of treating it as an empty folder, and leaves it alone', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'rulz-test-'))
+    const file = join(dir, 'notes.txt')
+    await writeFile(file, 'important')
+    await expect(installFolder(file)).rejects.toThrow(/is a file/)
+    expect(existsSync(file)).toBe(true)
+  })
+
+  it('refuses relative paths and whole drives', async () => {
+    await expect(installFolder('Apps\\Grid')).rejects.toThrow(/full folder path/)
+    await expect(installFolder('\\Apps')).rejects.toThrow(/full folder path/)
+    await expect(installFolder('C:\\')).rejects.toThrow(/whole drive/)
+  })
+})
+
+describe('program output', () => {
+  it('keeps characters whose bytes arrive in two chunks whole', () => {
+    const lines: string[] = []
+    const s = lineSplitter((l) => lines.push(l))
+    s.write(Buffer.from([0x63, 0x61, 0x66, 0xc3])) // "caf" + the first byte of é
+    s.write(Buffer.from([0xa9, 0x0a]))
+    expect(lines).toEqual(['café'])
+  })
+
+  it('passes on the last line even without a line break', () => {
+    const lines: string[] = []
+    const s = lineSplitter((l) => lines.push(l))
+    s.write(Buffer.from('one\r\ntwo\rthree\n\nERROR: no break'))
+    expect(lines).toEqual(['one', 'two', 'three'])
+    s.end()
+    expect(lines).toEqual(['one', 'two', 'three', 'ERROR: no break'])
+  })
+
+  it('logs the final line of a program that ends without a line break', async () => {
+    const lines: string[] = []
+    const script = "process.stdout.write('first\\n'); setTimeout(() => process.stderr.write('ERROR: final message'), 50)"
+    const code = await runCommand([process.execPath, '-e', script], { cwd: tmpdir(), onLine: (l) => lines.push(l) })
+    expect(code).toBe(0)
+    expect(lines).toEqual(['first', 'ERROR: final message'])
   }, 30_000)
 })
 

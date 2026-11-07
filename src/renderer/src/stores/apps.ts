@@ -1,5 +1,6 @@
 import { toast } from 'sonner'
 import { create } from 'zustand'
+import { appendLogLines } from '@shared/log'
 import type { AppView, JobState, SelfUpdate, RequirementId, RequirementStatus, Settings, ThemeName } from '@shared/types'
 import { errorMessage, invoke, on } from '../lib/api'
 import { applyThemeClass, initialTheme } from '../lib/theme'
@@ -70,17 +71,7 @@ export const useApps = create<AppsState>((set, get) => ({
     initialized = true
     on('apps:changed', (apps) => set({ apps }))
     // A batch of lines (pip can print hundreds a second) is one store update.
-    on('job:log', (lines) =>
-      set((s) => {
-        const logs = { ...s.logs }
-        for (const { appId, line, replace } of lines) {
-          const prev = logs[appId] ?? []
-          const kept = replace ? prev.slice(0, -1) : prev
-          logs[appId] = kept.length >= LOG_LIMIT ? [...kept.slice(kept.length - LOG_LIMIT + 1), line] : [...kept, line]
-        }
-        return { logs }
-      })
-    )
+    on('job:log', (lines) => set((s) => ({ logs: appendLogLines(s.logs, lines, LOG_LIMIT) })))
     on('job:update', (job) => {
       const prev = get().jobs[job.appId]
       // A new job starts with a fresh log.

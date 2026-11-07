@@ -56,7 +56,14 @@ export function Gallery({ images, name }: { images: string[]; name: string }) {
                 i === index ? 'border-accent' : 'border-transparent opacity-55 hover:opacity-100'
               )}
             >
-              <img src={src} alt="" className="h-full w-full object-cover object-top" draggable={false} />
+              <img
+                src={src}
+                alt=""
+                loading="lazy"
+                decoding="async"
+                className="h-full w-full object-cover object-top"
+                draggable={false}
+              />
             </button>
           ))}
         </div>

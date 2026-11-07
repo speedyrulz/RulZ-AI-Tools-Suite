@@ -1,6 +1,7 @@
 import { CheckCircle2, ExternalLink, Loader2, RefreshCw, XCircle } from 'lucide-react'
 import { useState } from 'react'
 import { REQUIREMENT_GUIDES } from '@shared/requirements'
+import type { RequirementId } from '@shared/types'
 import { invoke } from '../lib/api'
 import { useApps } from '../stores/apps'
 import { Button, Dialog } from './ui'
@@ -9,28 +10,31 @@ import { Button, Dialog } from './ui'
 export function RequirementGuide() {
   const id = useApps((s) => s.guideId)
   const status = useApps((s) => s.requirements.find((r) => r.id === id))
-  const close = (): void => useApps.setState({ guideId: null })
   const [checking, setChecking] = useState(false)
-  const [checked, setChecked] = useState(false)
+  // The guide that "Check again" was used in: this component stays mounted, so a plain flag would carry an old
+  // "Still not found" over to the next guide opened.
+  const [checkedId, setCheckedId] = useState<RequirementId | null>(null)
+  const close = (): void => {
+    useApps.setState({ guideId: null })
+    setCheckedId(null)
+  }
 
   if (!id) return null
   const guide = REQUIREMENT_GUIDES[id]
+  const checked = checkedId === id
 
   const checkAgain = async (): Promise<void> => {
     setChecking(true)
     await useApps.getState().checkRequirements(true)
     setChecking(false)
-    setChecked(true)
+    setCheckedId(id)
   }
 
   return (
     <Dialog
       open
       onOpenChange={(o) => {
-        if (!o) {
-          close()
-          setChecked(false)
-        }
+        if (!o) close()
       }}
       title={`Install ${guide.label}`}
       description="Follow these steps, then check again."

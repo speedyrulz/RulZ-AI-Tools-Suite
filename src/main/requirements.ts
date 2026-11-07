@@ -177,12 +177,36 @@ async function runChecks(): Promise<RequirementStatus[]> {
   )
 }
 
-/** Installs a requirement with winget (Windows may ask for permission), then reloads PATH. */
-export async function installRequirement(
-  id: RequirementId,
-  onLine: (line: string) => void,
-  signal?: AbortSignal
-): Promise<void> {
+/** winget installs in progress: Install can be clicked in several places, and two installs of one package clash. */
+const installing = new Map<RequirementId, Promise<void>>()
+
+/** Resolves or rejects with `p`, or rejects as soon as `signal` is aborted (`p` itself carries on). */
+function untilAborted(p: Promise<void>, signal?: AbortSignal): Promise<void> {
+  if (!signal) return p
+  if (signal.aborted) return Promise.reject(new Error('Cancelled'))
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => reject(new Error('Cancelled'))
+    signal.addEventListener('abort', onAbort, { once: true })
+    p.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort))
+  })
+}
+
+/**
+ * Installs a requirement with winget (Windows may ask for permission), then reloads PATH. A second call for the same
+ * requirement while it installs waits for that install instead of starting winget again.
+ */
+export function installRequirement(id: RequirementId, onLine: (line: string) => void, signal?: AbortSignal): Promise<void> {
+  const running = installing.get(id)
+  if (running) {
+    onLine(`${DEFS[id].label} is already being installed; waiting for it to finish.`)
+    return untilAborted(running, signal)
+  }
+  const p = wingetInstall(id, onLine, signal).finally(() => installing.delete(id))
+  installing.set(id, p)
+  return p
+}
+
+async function wingetInstall(id: RequirementId, onLine: (line: string) => void, signal?: AbortSignal): Promise<void> {
   const def = DEFS[id]
   if (!def.winget) throw new Error(`${def.label} can't be installed automatically.`)
   const code = await runCommand(

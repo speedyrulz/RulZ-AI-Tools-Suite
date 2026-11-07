@@ -227,8 +227,8 @@ export function AppPage({ view, onBack, onInstall }: { view: AppView; onBack: ()
 
           {installed && (
             <SideCard title="Shortcuts">
-              <ShortcutRow view={view} where="desktop" label="Desktop" />
-              <ShortcutRow view={view} where="startMenu" label="Start Menu" />
+              <ShortcutRow view={view} where="desktop" label="Desktop" busy={busy} />
+              <ShortcutRow view={view} where="startMenu" label="Start Menu" busy={busy} />
             </SideCard>
           )}
 
@@ -315,7 +315,18 @@ function Row({ label, children }: { label: string; children: ReactNode }) {
   )
 }
 
-function ShortcutRow({ view, where, label }: { view: AppView; where: 'desktop' | 'startMenu'; label: string }) {
+function ShortcutRow({
+  view,
+  where,
+  label,
+  busy
+}: {
+  view: AppView
+  where: 'desktop' | 'startMenu'
+  label: string
+  /** A job is running: it sets the shortcuts it started with when it ends, so a change now would be undone. */
+  busy: boolean
+}) {
   const sc = view.installed!.shortcuts
   const on = !!sc[where]
   return (
@@ -323,7 +334,7 @@ function ShortcutRow({ view, where, label }: { view: AppView; where: 'desktop' |
       <span>{label}</span>
       <Switch
         checked={on}
-        disabled={!!view.installed?.needsSetup}
+        disabled={busy || !!view.installed?.needsSetup}
         onChange={(v) =>
           void act(() =>
             invoke('apps:setShortcuts', view.app.id, {

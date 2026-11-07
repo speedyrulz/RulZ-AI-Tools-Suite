@@ -1,6 +1,30 @@
 import { cp, mkdir, readdir, rename, rm, stat } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import extract from 'extract-zip'
+
+/**
+ * The folder to install into, tidied up ("D:/Apps/X\" and Explorer's quoted "Copy as path" both give D:\Apps\X). It
+ * must be a full path below a drive, and either not exist yet or be an empty folder: a failed install deletes the
+ * folder again, so it must not hold anything of the user's. A file there is refused, not replaced.
+ */
+export async function installFolder(raw: string): Promise<string> {
+  const input = raw.trim().replace(/^"(.*)"$/, '$1')
+  if (!isAbsolute(input) || !/^[a-z]:[\\/]/i.test(input)) throw new Error('Choose a full folder path, such as D:\\Apps.')
+  // Also drops a trailing backslash, which would put the staging folder (<dir>.new) inside the install folder.
+  const dir = resolve(input)
+  if (dirname(dir) === dir) throw new Error('Choose a folder, not a whole drive, such as D:\\Apps.')
+  let entries: string[]
+  try {
+    entries = await readdir(dir)
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code
+    if (code === 'ENOENT') return dir
+    if (code === 'ENOTDIR') throw new Error(`${dir} is a file. Choose a folder.`)
+    throw new Error(`Can't use ${dir}: ${e instanceof Error ? e.message : String(e)}`)
+  }
+  if (entries.length) throw new Error(`Choose an empty folder: ${dir} already has files in it.`)
+  return dir
+}
 
 /** Extracts a zip, reporting progress as a 0..1 fraction of entries. */
 export async function extractZip(zip: string, dest: string, onProgress?: (fraction: number) => void): Promise<void> {
