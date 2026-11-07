@@ -34,7 +34,7 @@ async def create_dialog(namespaces: list[str], default_namespace: str = '', defa
         note = ui.label('Buckets are S3-like storage: no git history, fast server-side copies and sync.') \
             .classes('text-xs rulz-muted')
         note.bind_visibility_from(kind, 'value', value='bucket')
-        error = ui.label().classes('text-negative text-sm')
+        error = ui.label().classes('rz-err text-sm')
 
         async def create() -> None:
             repo_id = f'{ns.value}/{(name.value or "").strip()}'

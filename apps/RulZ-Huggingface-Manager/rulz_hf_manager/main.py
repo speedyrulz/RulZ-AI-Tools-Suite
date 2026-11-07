@@ -8,7 +8,6 @@ import logging
 import socket
 import sys
 import urllib.request
-from pathlib import Path
 
 from . import APP_NAME, __version__, config
 from .platform_utils import is_wsl, open_url, platform_label
@@ -66,7 +65,9 @@ def main(argv: list[str] | None = None) -> None:
 
     from nicegui import app, ui
 
-    from .ui import browser, dashboard, settings_page  # noqa: F401  (registers the pages)
+    from .ui import browser, dashboard, settings_page, theme  # noqa: F401  (registers the pages)
+
+    theme.setup()
 
     @app.get(PING_PATH)
     def ping() -> dict:
@@ -86,8 +87,8 @@ def main(argv: list[str] | None = None) -> None:
         host=host,
         port=port,
         title=APP_NAME,
-        favicon=Path(__file__).parent / 'static' / 'favicon.svg',
-        dark=None,
+        favicon=theme.FAVICON,
+        dark=theme.saved_dark(),  # pages start in the saved look; theme.save_look() keeps this up to date
         reload=False,
         show=show,
         show_welcome_message=False,

@@ -34,7 +34,6 @@ if TYPE_CHECKING:
 KINDS = ('model', 'dataset', 'space', 'bucket')
 KIND_LABEL = {'model': 'Model', 'dataset': 'Dataset', 'space': 'Space', 'bucket': 'Bucket'}
 KIND_ICON = {'model': 'view_in_ar', 'dataset': 'dataset', 'space': 'rocket_launch', 'bucket': 'inventory_2'}
-KIND_COLOR = {'model': 'indigo', 'dataset': 'teal', 'space': 'deep-purple', 'bucket': 'orange'}
 SPACE_SDKS = ['gradio', 'docker', 'static']
 _URI_PREFIX = {'model': '', 'dataset': 'datasets/', 'space': 'spaces/', 'bucket': 'buckets/'}
 _URL_PREFIX_TO_KIND = {'datasets': 'dataset', 'spaces': 'space', 'buckets': 'bucket', 'models': 'model'}

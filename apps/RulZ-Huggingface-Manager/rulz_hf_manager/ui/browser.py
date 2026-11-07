@@ -110,7 +110,7 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
             # Wrapping row: on narrow windows the action buttons drop below the title instead of overlapping it.
             with ui.row().classes('w-full items-center gap-3'):
                 with ui.row().classes('items-center gap-3 no-wrap min-w-0 flex-1').style('flex-basis: 320px'):
-                    ui.icon(hub.KIND_ICON[kind], size='36px', color=hub.KIND_COLOR[kind])
+                    ui.icon(hub.KIND_ICON[kind], size='28px').classes('rz-kind-tile')
                     with ui.column().classes('gap-0 min-w-0 flex-1'):
                         ui.label(hub.KIND_LABEL[kind]).classes('text-xs uppercase rulz-muted tracking-wider')
                         with ui.row().classes('items-center gap-1 no-wrap min-w-0 w-full'):
@@ -123,8 +123,8 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
                     if not is_bucket:
                         branch_select = ui.select([fs.revision or 'main'], value=fs.revision or 'main',
                                                   label='Branch').props('outlined dense options-dense').classes('w-40')
-                    fav = ui.button(icon='star' if settings.is_favorite(kind, repo_id) else 'star_outline') \
-                        .props('flat round color=amber').tooltip('Favorite')
+                    fav = ui.button(icon='star' if settings.is_favorite(kind, repo_id) else 'star_outline',
+                                    color=None).props('flat round').classes('rz-kind-icon').tooltip('Favorite')
                     ui.button('Open on HF', icon='open_in_new',
                               on_click=lambda: ui.navigate.to(hub.web_url(kind, repo_id, revision=fs.revision),
                                                               new_tab=True)).props('flat no-caps') \
@@ -152,7 +152,7 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
         # ---------------------------------------------------------------- tabs
         tabs = None
         if not is_bucket:
-            with ui.tabs().props('dense align=left no-caps inline-label').classes('w-full') as tabs:
+            with ui.tabs().props('dense align=left no-caps inline-label').classes('w-full rz-tabs') as tabs:
                 ui.tab('files', 'Files', icon='folder')
                 ui.tab('history', 'History', icon='history')
         panels = ui.tab_panels(tabs, value='files', animated=False).classes('w-full bg-transparent')
@@ -212,8 +212,7 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
                     with ui.row().classes('w-full items-center gap-0 px-1 rulz-crumb no-wrap') as crumbs:
                         pass
 
-                virtual_note = ui.row().classes('w-full items-center gap-2 px-3 py-2 rounded bg-amber-1 '
-                                                'text-amber-10 text-sm')
+                virtual_note = ui.row().classes('w-full items-center gap-2 no-wrap rz-banner info')
                 with virtual_note:
                     ui.icon('info')
                     ui.label('This folder is new. It will appear on the Hub as soon as you upload files into it.')
@@ -242,10 +241,10 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
                       <div class="row items-center no-wrap q-gutter-x-sm cursor-pointer rulz-name"
                            @click="$parent.$emit('open_entry', props.row)">
                         <q-icon :name="props.row.icon" size="20px"
-                                :color="props.row.is_dir ? 'amber-8' : (props.row.icon === 'memory' ? 'indigo-4' : 'blue-grey-5')"/>
+                                :class="props.row.is_dir ? 'rz-ic-dir' : (props.row.icon === 'memory' ? 'rz-ic-weight' : 'rz-ic-file')"/>
                         <span :class="props.row.is_dir ? 'text-weight-medium' : ''">{{ props.row.name }}</span>
-                        <q-badge v-if="props.row.storage" outline color="grey-6" :label="props.row.storage"/>
-                        <q-badge v-if="props.row.virtual" outline color="amber-9" label="new"/>
+                        <q-badge v-if="props.row.storage" class="rz-badge" :label="props.row.storage"/>
+                        <q-badge v-if="props.row.virtual" class="rz-badge rz-new" label="new"/>
                       </div>
                     </q-td>''')
                 table.add_slot('body-cell-modified', r'''
@@ -403,9 +402,9 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
         badges.clear()
         with badges:
             private = s.get('private')
-            ui.chip('private' if private else 'public', icon='lock' if private else 'public',
-                    color='orange-1' if private else 'green-1',
-                    text_color='orange-10' if private else 'green-9').props('dense square')
+            with ui.element('span').classes('rz-vis ' + ('private' if private else 'public')):
+                ui.icon('lock' if private else 'public')
+                ui.label('private' if private else 'public')
             if s.get('size') is not None:
                 ui.chip(hub.human_size(s['size']), icon='sd_storage').props('dense square outline')
             if s.get('files') is not None:
@@ -514,16 +513,16 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
             ui.label('Upload').classes('text-lg font-semibold')
             ui.label(f'{len(pairs)} file(s), {hub.human_size(total)} from {source_label}')
             ui.label(f'Destination: {repo_id} / {dest}').classes('rulz-mono text-sm')
-            with ui.scroll_area().classes('max-h-48 w-full border rounded'):
+            with ui.scroll_area().classes('max-h-48 w-full rz-box'):
                 for _, d in pairs[:300]:
                     with ui.row().classes('items-center gap-2 no-wrap'):
                         ui.icon('sync_problem' if d in conflicts else 'add', size='xs',
-                                color='orange' if d in conflicts else 'positive')
+                                color='warning' if d in conflicts else 'positive')
                         ui.label(d).classes('rulz-mono text-sm')
                 if len(pairs) > 300:
                     ui.label(f'... and {len(pairs) - 300} more').classes('text-sm rulz-muted')
             if conflicts:
-                with ui.row().classes('items-center gap-2 text-orange-9 no-wrap'):
+                with ui.row().classes('items-center gap-2 rz-warn no-wrap'):
                     ui.icon('warning')
                     ui.label(f'{len(conflicts)} file(s) already exist and will be overwritten.')
             msg, pr = commit_fields(fs, f'Upload {len(pairs)} file(s)' if len(pairs) > 1 else
@@ -678,9 +677,9 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
                         {'name': 'reason', 'label': 'Why', 'field': 'reason', 'align': 'left'},
                     ], rows=[{'id': i, 'action': op.action, 'path': op.path, 'size': op.size, 'reason': op.reason}
                              for i, op in enumerate(ops)], row_key='id', pagination={'rowsPerPage': 8}) \
-                        .props('flat dense bordered').classes('w-full')
+                        .props('flat dense bordered').classes('w-full rulz-table')
                 else:
-                    ui.label('Everything is already in sync.').classes('text-positive')
+                    ui.label('Everything is already in sync.').classes('rz-ok')
             plan_state['file'] = plan_file if ops else None
             run_btn.set_enabled(bool(ops))
 
@@ -819,16 +818,16 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
             ui.label(title).classes('text-lg font-semibold')
             ui.label(f'{len(plan)} file(s) will be {"copied" if copy else "moved"}'
                      + (' server-side (no download / re-upload).' if is_bucket else ' in one commit.'))
-            with ui.scroll_area().classes('max-h-56 w-full border rounded'):
+            with ui.scroll_area().classes('max-h-56 w-full rz-box'):
                 for f, d in plan[:300]:
                     with ui.row().classes('items-center gap-1 no-wrap text-sm rulz-mono'):
                         ui.label(f.path).classes('rulz-muted')
                         ui.icon('arrow_forward', size='xs')
-                        ui.label(d).classes('text-orange-9' if d in conflicts else '')
+                        ui.label(d).classes('rz-warn' if d in conflicts else '')
                 if len(plan) > 300:
                     ui.label(f'... and {len(plan) - 300} more').classes('text-sm rulz-muted')
             if conflicts:
-                with ui.row().classes('items-center gap-2 text-orange-9 no-wrap'):
+                with ui.row().classes('items-center gap-2 rz-warn no-wrap'):
                     ui.icon('warning')
                     ui.label(f'{len(conflicts)} destination file(s) already exist and will be overwritten.')
             msg, pr = commit_fields(fs, title)
@@ -912,13 +911,13 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
         items = [f'{e.path}/' if e.is_dir else e.path for e in entries]
         with ui.dialog() as dialog, ui.card().classes('rulz-card w-[560px] max-w-[95vw] gap-3'):
             ui.label(f'Delete {len(entries)} item(s)?').classes('text-lg font-semibold')
-            with ui.scroll_area().classes('max-h-48 w-full border rounded'):
+            with ui.scroll_area().classes('max-h-48 w-full rz-box'):
                 for it in items:
                     ui.label(it).classes('rulz-mono text-sm')
             if any(e.is_dir for e in entries):
-                ui.label('Folders are deleted with everything inside them.').classes('text-sm text-orange-9')
+                ui.label('Folders are deleted with everything inside them.').classes('text-sm rz-warn')
             if is_bucket:
-                ui.label('Buckets have no history: deleted files cannot be recovered.').classes('text-sm text-negative')
+                ui.label('Buckets have no history: deleted files cannot be recovered.').classes('text-sm rz-err')
             else:
                 ui.label('Old versions stay in the git history of the repo.').classes('text-sm rulz-muted')
             msg, pr = commit_fields(fs, f'Delete {items[0]}' if len(items) == 1 else f'Delete {len(items)} items')
@@ -990,7 +989,7 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
             content = data.decode('utf-8')
         except UnicodeDecodeError:
             content = data.decode('latin-1')
-        dark = config.get().dark_mode == 'dark'
+        dark = config.get().dark_mode != 'light'
         lang = LANGUAGE.get(suffix) or ('Markdown' if entry.name.lower().startswith('readme') else None)
         editor_state: dict = {'editor': None}
 
