@@ -484,3 +484,60 @@ def test_fetch_url_stops_at_max_bytes():
     assert asyncio.run(go(10_000)) == big
     with pytest.raises(ImageError, match="too large"):
         asyncio.run(go(1000))
+
+
+# ---- one bad image never fails the others ------------------------------------------------
+
+
+def test_image_too_large_to_open_fails_only_itself(client, monkeypatch):
+    # Pillow refuses images over 2 x MAX_IMAGE_PIXELS with DecompressionBombError, which is not an
+    # OSError; it used to escape and fail the whole request.
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 50_000)  # 400x300 is now "too large"
+    images = [{"id": "huge", "data_b64": png_b64((400, 300))}, {"id": "ok", "data_b64": png_b64((200, 150))}]
+    res = classify(client, images, TAGS).json()["results"]
+    assert res["huge"]["status"] == "error" and "too large" in res["huge"]["message"]
+    assert res["ok"]["status"] == "ok"
+
+
+def test_unexpected_error_fails_only_that_image(tmp_path, fake, monkeypatch):
+    import asyncio
+
+    from image_detection import service as service_mod
+    from image_detection.service import ImageInput, Tag
+
+    s = Settings(cache_path=tmp_path / "cache.sqlite3", llama_url="http://llama")
+    svc = DetectionService(s, llama=LlamaClient(s, httpx.AsyncClient(transport=httpx.MockTransport(fake.handler))))
+    bad, good = _jpeg((400, 300), "blue"), _jpeg((400, 300), "red")
+    real = service_mod.prepare_image
+
+    def prepare(raw, *a, **k):
+        if raw == bad:
+            raise RuntimeError("a bug in a decoder")
+        return real(raw, *a, **k)
+
+    monkeypatch.setattr(service_mod, "prepare_image", prepare)
+    out = asyncio.run(svc.classify([ImageInput("bad", data=bad), ImageInput("ok", data=good)], [Tag("red_disc", RUBRIC_A)]))
+    assert out["bad"]["status"] == "error" and "RuntimeError" in out["bad"]["message"]
+    assert out["ok"]["status"] == "ok"
+    asyncio.run(svc.aclose())
+
+
+def test_caller_supplied_hash_is_not_computed_again(tmp_path, fake, monkeypatch):
+    import asyncio
+    import hashlib
+
+    from image_detection import service as service_mod
+    from image_detection.service import ImageInput, Tag
+
+    s = Settings(cache_path=tmp_path / "cache.sqlite3", llama_url="http://llama")
+    svc = DetectionService(s, llama=LlamaClient(s, httpx.AsyncClient(transport=httpx.MockTransport(fake.handler))))
+    hashed = []
+    monkeypatch.setattr(service_mod, "_sha256", lambda d: hashed.append(1) or hashlib.sha256(d).hexdigest())
+    raw = _jpeg((400, 300))
+    tag = Tag("red_disc", RUBRIC_A)
+    first = asyncio.run(svc.classify([ImageInput("a", data=raw, sha256=hashlib.sha256(raw).hexdigest())], [tag]))["a"]
+    assert first["status"] == "ok" and hashed == []
+    # the same bytes without a hash are hashed, and find the cached answer under the same key
+    again = asyncio.run(svc.classify([ImageInput("b", data=raw)], [tag]))["b"]
+    assert again["cached"] and hashed == [1]
+    asyncio.run(svc.aclose())

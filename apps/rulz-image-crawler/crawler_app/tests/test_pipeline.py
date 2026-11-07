@@ -14,9 +14,11 @@ from crawler_app.config import AppSettings
 from crawler_app.runs import Run, RunOptions
 from crawler_app.server import create_app
 
+LOCAL = "http://127.0.0.1:8000"  # the app only answers to this PC's own names
+
 
 def _settings(tmp_path) -> AppSettings:
-    return AppSettings(output_dir=tmp_path / "out", chunk_wait_s=0.1, fetch_concurrency=3, max_scroll_steps=15)
+    return AppSettings(output_dir=tmp_path / "out", fetch_concurrency=3, max_scroll_steps=15)
 
 
 def _opts(site_url: str, **kw) -> RunOptions:
@@ -135,7 +137,7 @@ def test_api_end_to_end(tmp_path, site_url, fake_service):
     from fastapi.testclient import TestClient
 
     app = create_app(_settings(tmp_path), service=fake_service)
-    with TestClient(app) as client:
+    with TestClient(app, base_url=LOCAL) as client:
         assert client.get("/api/health").json()["server"] == "up"
 
         r = client.post("/api/rubric", json={"prompt": "red hands"}).json()
@@ -234,7 +236,7 @@ def test_folder_scan(tmp_path, fake_service):
         async with async_playwright() as pw:
             browser = await pw.chromium.launch()
             try:
-                s = AppSettings(output_dir=settings_out, chunk_wait_s=0.1)
+                s = AppSettings(output_dir=settings_out)
                 run = Run("f1", opts, s, fake_service, browser)
                 run.start()
                 await asyncio.wait_for(run.wait(), 60)
@@ -263,7 +265,7 @@ def test_api_folder_validation(tmp_path, fake_service):
 
     app = create_app(_settings(tmp_path), service=fake_service)
     tag = {"id": "x", "rubric": "x"}
-    with TestClient(app) as client:
+    with TestClient(app, base_url=LOCAL) as client:
         assert client.post("/api/runs", json={"tag": tag}).status_code == 422  # neither
         both = {"url": "https://a.com", "folder": str(tmp_path), "tag": tag}
         assert client.post("/api/runs", json=both).status_code == 422
@@ -296,9 +298,10 @@ def test_storage_flushes_manifest_once_and_zips_a_snapshot(tmp_path):
     assert len(json.loads((folder / "matches.json").read_text(encoding="utf-8"))["matches"]) == 3
 
     st.save(check_image_bytes("http://x/w.jpg", "http://x/", jpeg("white"), 10**7), 0.95, "w")  # not flushed
-    with zipfile.ZipFile(st.build_zip(0.8)) as zf:
+    zips = tmp_path / "zips"
+    with zipfile.ZipFile(st.build_zip(0.8, zips)) as zf:
         names = sorted(zf.namelist())
         doc = json.loads(zf.read("matches.json"))
     assert len(names) == 3 and "matches.json" in names  # green (0.9) and white (0.95) + manifest
     assert len(doc["matches"]) == 4  # the zip's manifest is the current list, flushed or not
-    assert not list(folder.glob("*.part"))
+    assert not list(folder.glob("*.part")) and not list(folder.glob("*.zip"))  # nothing left in the run folder

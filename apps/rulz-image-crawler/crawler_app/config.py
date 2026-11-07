@@ -23,12 +23,9 @@ def _env_float(name: str, default: float) -> float:
 class AppSettings:
     # Where each run's matched images go: <output_dir>/<run folder>/
     output_dir: Path = field(default_factory=lambda: Path(os.environ.get("CRAWLER_OUTPUT", REPO_ROOT / "output")))
-    # Images per DetectionService.classify call. Small chunks put results on screen sooner.
-    classify_chunk: int = field(default_factory=lambda: _env_int("CLASSIFY_CHUNK", 8))
-    # Chunks being classified at once. Keeps all model slots busy (2 per llama-server).
-    classify_batches: int = field(default_factory=lambda: _env_int("CLASSIFY_BATCHES", 3))
-    # How long the classifier waits to fill a chunk before sending a partial one.
-    chunk_wait_s: float = field(default_factory=lambda: _env_float("CHUNK_WAIT_S", 0.5))
+    # Images being prepared or judged by the model at once. 0 = three per model slot (2 slots per
+    # llama-server), which keeps every slot busy with the next image already decoded.
+    classify_in_flight: int = field(default_factory=lambda: _env_int("CLASSIFY_IN_FLIGHT", 0))
     fetch_concurrency: int = field(default_factory=lambda: _env_int("CRAWLER_FETCH_CONCURRENCY", 6))
     fetch_timeout_s: float = field(default_factory=lambda: _env_float("CRAWLER_FETCH_TIMEOUT_S", 20.0))
     max_image_bytes: int = field(default_factory=lambda: _env_int("CRAWLER_MAX_IMAGE_BYTES", 40 * 1024 * 1024))

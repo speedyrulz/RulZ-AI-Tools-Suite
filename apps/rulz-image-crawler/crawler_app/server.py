@@ -9,10 +9,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import threading
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -20,16 +24,20 @@ from fastapi.staticfiles import StaticFiles
 from image_detection import DetectionService, ModelError, ModelServerDown
 from image_detection.rubrics import TAG_ID_RE
 from pydantic import BaseModel, Field, field_validator, model_validator
+from starlette.background import BackgroundTask
 
 from .config import AppSettings
 from .folder import pick_folder
 from .runs import FINAL_STATUSES, Run, RunManager, RunOptions
-from .storage import RunStorage
+from .storage import RunStorage, sweep_zips
 from .urls import normalize_page_url
 
 log = logging.getLogger("crawler_app.server")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+# Zips being downloaded are built here (inside the output folder, so on the same drive) and deleted once sent.
+ZIP_DIR_NAME = ".zips"
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 # The spec: the model is overconfident on small regions, so body-detail tags default to 0.8.
 _BODY_DETAIL = re.compile(
@@ -107,36 +115,100 @@ class RunIn(BaseModel):
 _FOLDER_RE = re.compile(r"^[\w.-]{1,200}$")
 
 
-def scan_history(output_dir: Path, limit: int = 300) -> list[dict[str, Any]]:
-    """Summaries of the run folders under output_dir (those with a matches.json), newest first."""
-    items: list[dict[str, Any]] = []
-    if not output_dir.is_dir():
-        return items
-    for folder in output_dir.iterdir():
-        manifest = folder / "matches.json"
-        if not manifest.is_file():
-            continue
-        try:
-            doc = json.loads(manifest.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        tag = doc.get("tag") or {}
-        items.append(
-            {
-                "id": folder.name,
-                "started": doc.get("started"),
-                "finished": doc.get("finished"),
-                "start_url": doc.get("start_url"),
-                "source": doc.get("source", "web"),
-                "tag": tag.get("id"),
-                "threshold": doc.get("threshold"),
-                "status": doc.get("status", "done"),
-                "matches": len(doc.get("matches") or []),
-                "stats": doc.get("stats"),
-            }
-        )
-    items.sort(key=lambda i: (i["started"] or "", i["id"]), reverse=True)
-    return items[:limit]
+def _summary(name: str, doc: dict[str, Any]) -> dict[str, Any]:
+    tag = doc.get("tag") or {}
+    return {
+        "id": name,
+        "started": doc.get("started"),
+        "finished": doc.get("finished"),
+        "start_url": doc.get("start_url"),
+        "source": doc.get("source", "web"),
+        "tag": tag.get("id"),
+        "threshold": doc.get("threshold"),
+        "status": doc.get("status", "done"),
+        "matches": len(doc.get("matches") or []),
+        "stats": doc.get("stats"),
+    }
+
+
+def _stamp(manifest: Path) -> tuple[int, int]:
+    st = manifest.stat()
+    return st.st_mtime_ns, st.st_size
+
+
+class HistoryIndex:
+    """The run folders under output_dir, read from disk and cached until their matches.json changes:
+    a past search with thousands of matches is parsed once, not once per thumbnail, and the history
+    list only re-reads the runs that changed."""
+
+    def __init__(self, output_dir: Path, keep_runs: int = 16):
+        self.output_dir = output_dir
+        self.keep_runs = keep_runs
+        self._lock = threading.Lock()
+        self._runs: OrderedDict[str, tuple[tuple[int, int], RunStorage]] = OrderedDict()
+        self._summaries: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
+
+    def storage(self, name: str) -> RunStorage:
+        """Raises FileNotFoundError if the folder has no matches.json, ValueError if it is unreadable."""
+        folder = self.output_dir / name
+        stamp = _stamp(folder / "matches.json")
+        with self._lock:
+            hit = self._runs.get(name)
+            if hit is not None and hit[0] == stamp:
+                self._runs.move_to_end(name)
+                return hit[1]
+        st = RunStorage.load(folder)
+        with self._lock:
+            self._runs[name] = (stamp, st)
+            self._runs.move_to_end(name)
+            while len(self._runs) > self.keep_runs:
+                self._runs.popitem(last=False)
+        return st
+
+    def summaries(self, limit: int = 300) -> list[dict[str, Any]]:
+        """One summary per run folder (those with a matches.json), newest first."""
+        items: list[dict[str, Any]] = []
+        found: set[str] = set()
+        if self.output_dir.is_dir():
+            for folder in self.output_dir.iterdir():
+                manifest = folder / "matches.json"
+                try:
+                    stamp = _stamp(manifest)
+                except OSError:
+                    continue
+                found.add(folder.name)
+                with self._lock:
+                    hit = self._summaries.get(folder.name)
+                if hit is None or hit[0] != stamp:
+                    try:
+                        doc = json.loads(manifest.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        continue
+                    if not isinstance(doc, dict):
+                        continue
+                    hit = (stamp, _summary(folder.name, doc))
+                    with self._lock:
+                        self._summaries[folder.name] = hit
+                items.append(dict(hit[1]))  # a copy: callers add the live run's state to it
+        with self._lock:
+            for gone in set(self._summaries) - found:
+                del self._summaries[gone]
+        items.sort(key=lambda i: (i["started"] or "", i["id"]), reverse=True)
+        return items[:limit]
+
+
+def _host_name(host_header: str) -> str:
+    try:
+        return (urlsplit("//" + host_header).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _remove(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:  # pragma: no cover - swept on the next download or start
+        pass
 
 
 def _sse(event: dict[str, Any]) -> str:
@@ -147,12 +219,21 @@ def create_app(
     settings: AppSettings | None = None,
     service: DetectionService | None = None,
     browser: Any | None = None,
+    allowed_hosts: Iterable[str] | None = None,
 ) -> FastAPI:
-    """`service` and `browser` can be injected (tests); otherwise the real engine and Chromium are started."""
+    """`service` and `browser` can be injected (tests); otherwise the real engine and Chromium are started.
+    `allowed_hosts`: host names the app answers to besides this PC's own (127.0.0.1, localhost, ::1);
+    "*" allows any. Default: CRAWLER_ALLOWED_HOSTS, comma-separated."""
     settings = settings or AppSettings()
+    if allowed_hosts is None:
+        allowed_hosts = os.environ.get("CRAWLER_ALLOWED_HOSTS", "").split(",")
+    hosts = LOOPBACK_HOSTS | {h.strip().lower() for h in allowed_hosts if h.strip()}
+    history = HistoryIndex(settings.output_dir)
+    zip_dir = settings.output_dir / ZIP_DIR_NAME
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        await asyncio.to_thread(sweep_zips, zip_dir, 0)  # no download is running yet
         svc = service or DetectionService()
         pw = None
         b = browser
@@ -173,6 +254,21 @@ def create_app(
                 await svc.aclose()
 
     app = FastAPI(title="RulZ Image Crawler", lifespan=lifespan)
+
+    @app.middleware("http")
+    async def _this_pc_only(request: Request, call_next):
+        """Only pages served by this app may use it. The Host check stops DNS rebinding (a web page whose
+        domain is switched to 127.0.0.1 to read the API and start folder scans); the Origin check stops
+        other sites' pages from sending POSTs (starting runs, opening the folder picker)."""
+        if "*" not in hosts:
+            host = request.headers.get("host", "")
+            if _host_name(host) not in hosts:
+                return JSONResponse(status_code=403, content={"error": "unknown host"})
+            origin = request.headers.get("origin")
+            if origin is not None and request.method not in ("GET", "HEAD", "OPTIONS"):
+                if urlsplit(origin).netloc.lower() != host.lower():
+                    return JSONResponse(status_code=403, content={"error": "cross-site request refused"})
+        return await call_next(request)
 
     def _manager(request: Request) -> RunManager:
         return request.app.state.manager
@@ -299,13 +395,22 @@ def create_app(
         await run.wait()
         return {"status": run.status}
 
+    async def _send_zip(st: RunStorage, min_confidence: float) -> FileResponse:
+        await asyncio.to_thread(sweep_zips, zip_dir)  # leftovers of downloads that were cut off
+        path = await asyncio.to_thread(st.build_zip, min_confidence, zip_dir)
+        return FileResponse(
+            path,
+            media_type="application/zip",
+            filename=f"{st.folder.name}.zip",
+            background=BackgroundTask(_remove, path),  # each download gets its own file, deleted once sent
+        )
+
     @app.get("/api/runs/{run_id}/zip")
     async def download_zip(run_id: str, request: Request, min_confidence: float = 0.0):
         run = _run(request, run_id)
         if run.storage is None:
             raise HTTPException(409, "run has no output yet")
-        path = await asyncio.to_thread(run.storage.build_zip, min_confidence)
-        return FileResponse(path, media_type="application/zip", filename=f"{run.storage.folder.name}.zip")
+        return await _send_zip(run.storage, min_confidence)
 
     @app.get("/api/runs/{run_id}/files/{name}")
     async def download_file(run_id: str, name: str, request: Request):
@@ -313,23 +418,26 @@ def create_app(
         # Only names this run saved are served, so no path can escape the run folder.
         if run.storage is None or not run.storage.has_file(name):
             raise HTTPException(404, "no such file")
+        if not await asyncio.to_thread((run.storage.folder / name).is_file):  # deleted by hand
+            raise HTTPException(404, "no such file")
         return FileResponse(run.storage.folder / name)
 
     # ---- history: every run folder on disk, including ones from before this app was started ----
 
     def _history_storage(name: str) -> RunStorage:
-        folder = settings.output_dir / name
-        if not _FOLDER_RE.match(name) or name.strip(".") == "" or not (folder / "matches.json").is_file():
+        if not _FOLDER_RE.match(name) or name.strip(".") == "":
             raise HTTPException(404, "no such run folder")
         try:
-            return RunStorage.load(folder)
+            return history.storage(name)
+        except FileNotFoundError:
+            raise HTTPException(404, "no such run folder")
         except (OSError, ValueError) as e:
             raise HTTPException(500, f"could not read matches.json: {e}")
 
     @app.get("/api/history")
-    async def history(request: Request):
+    async def history_list(request: Request):
         live = {r.storage.folder.name: r for r in _manager(request).runs.values() if r.storage}
-        items = await asyncio.to_thread(scan_history, settings.output_dir)
+        items = await asyncio.to_thread(history.summaries)
         for item in items:
             run = live.get(item["id"])
             if run is not None:
@@ -346,15 +454,16 @@ def create_app(
     @app.get("/api/history/{name}/files/{file}")
     async def history_file(name: str, file: str):
         st = await asyncio.to_thread(_history_storage, name)
-        if not st.has_file(file):  # only names listed in matches.json, so no path can escape
+        # Only names listed in matches.json, so no path can escape; the listing is cached, so check
+        # the file is still there (it may have been deleted by hand since).
+        if not st.has_file(file) or not await asyncio.to_thread((st.folder / file).is_file):
             raise HTTPException(404, "no such file")
         return FileResponse(st.folder / file)
 
     @app.get("/api/history/{name}/zip")
     async def history_zip(name: str, min_confidence: float = 0.0):
         st = await asyncio.to_thread(_history_storage, name)
-        path = await asyncio.to_thread(st.build_zip, min_confidence)
-        return FileResponse(path, media_type="application/zip", filename=f"{name}.zip")
+        return await _send_zip(st, min_confidence)
 
     if (STATIC_DIR / "index.html").exists():
         app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
@@ -380,7 +489,12 @@ def main() -> None:
     logging.basicConfig(level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     # The UI polls /api/health every 5 s; don't log every llama-server request that causes.
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    uvicorn.run(create_app(), host=args.host, port=args.port, log_level=args.log_level)
+    # Listening on another address means the person wants to reach it by that name (or, for 0.0.0.0,
+    # from anywhere on the network): let those requests through the host check.
+    extra = os.environ.get("CRAWLER_ALLOWED_HOSTS", "").split(",")
+    if args.host not in LOOPBACK_HOSTS:
+        extra.append("*" if args.host in ("0.0.0.0", "::") else args.host)
+    uvicorn.run(create_app(allowed_hosts=extra), host=args.host, port=args.port, log_level=args.log_level)
 
 
 if __name__ == "__main__":

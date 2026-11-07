@@ -48,6 +48,15 @@ public static class LauncherJob {
 }
 "@
 
+# Stops a process this launcher started, and its children first: llama-server runs as a child of the
+# PowerShell wrapper, and stopping only the wrapper would leave it holding the card's memory.
+function Stop-Started([System.Diagnostics.Process]$p) {
+    if (-not $p -or $p.HasExited) { return }
+    Get-CimInstance Win32_Process -Filter "ParentProcessId=$($p.Id)" -ErrorAction SilentlyContinue |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+}
+
 function Test-Url([string]$url) {
     try { return (Invoke-WebRequest $url -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200 } catch { return $false }
 }
@@ -123,7 +132,7 @@ try {
             if ($servers.Count -eq 1) { throw }
             # e.g. the card is busy with another program: carry on with the others
             Write-Host "`nGPU $($s.Gpu) is not available ($($_.Exception.Message)); continuing without it." -ForegroundColor Yellow
-            if ($s.Proc -and -not $s.Proc.HasExited) { Stop-Process -Id $s.Proc.Id -Force -ErrorAction SilentlyContinue }
+            Stop-Started $s.Proc
         }
     }
     if ($ready.Count -eq 0) { throw "No model server could be started." }
@@ -157,11 +166,5 @@ try {
 }
 finally {
     # Normal exit / Ctrl+C. (If the window is closed instead, the job object does the same.)
-    foreach ($p in $started) {
-        if (-not $p.HasExited) {
-            Get-CimInstance Win32_Process -Filter "ParentProcessId=$($p.Id)" -ErrorAction SilentlyContinue |
-                ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-        }
-    }
+    foreach ($p in $started) { Stop-Started $p }
 }
