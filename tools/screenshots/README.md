@@ -156,3 +156,21 @@ VENV\python.exe -B capture_image_crawler.py --folder R:\Pictures\Wallpapers --re
 
 It scans the demo folder for "landscapes with mountains" with the real model: the checklist the model wrote, the
 matches grid, and the same run in light mode. Stop the app and the model server afterwards.
+
+## hf-manager (NiceGUI)
+
+`capture_hf_manager.py` runs the app from the suite checkout on a made-up account: who the token belongs to, the
+namespace listing, repo summaries, branches, history and file listings are replaced with "demo-user" (organization
+"demo-lab") and its repos, so nothing reaches huggingface.co. Settings go to the workspace with a fake token, and
+`HF_TOKEN` and the hf CLI login are hidden, so no real token or account is read. Any venv with the app's
+requirements works (`nicegui`, `huggingface_hub`):
+
+```bat
+start "" VENV\python.exe -B capture_hf_manager.py --app "<suite>\apps\RulZ-Huggingface-Manager" --data R:\hf-data --port 8799 --choose-look
+start "" "C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu --hide-scrollbars --no-first-run --disable-sync --disable-extensions --remote-debugging-port=9351 --user-data-dir=R:\chrome-profile --window-size=1600,1000 http://127.0.0.1:8799/
+node cdp_capture.mjs hf-manager.plan.json
+```
+
+`--choose-look` starts it as a first run, so the plan can capture the "Choose your look" dialog before it picks
+Dark; it ends by switching to the light look. Copy `01-my-hub.png` to the app's `docs/screenshots/` too (its README
+shows it). Stop the server and the browser when done.

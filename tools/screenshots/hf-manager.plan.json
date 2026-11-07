@@ -1,0 +1,65 @@
+{
+  "port": 9351,
+  "match": "127.0.0.1:8799",
+  "width": 1600,
+  "height": 960,
+  "outDir": "R:/out/hf-manager",
+  "startWaitMs": 500,
+  "shots": [
+    {
+      "name": "start",
+      "js": "location.href = '/', 'loading'",
+      "waitMs": 3500
+    },
+    {
+      "name": "05-choose-your-look.png",
+      "waitMs": 300,
+      "check": "document.body.innerText.includes('Choose your look') ? 'first-start dialog' : 'NO DIALOG (start the harness with --choose-look)'"
+    },
+    {
+      "name": "dark",
+      "js": "[...document.querySelectorAll('.q-btn')].find(b => b.querySelector('.block')?.textContent.trim() === 'Continue').click(), 'ok'",
+      "waitMs": 1200
+    },
+    {
+      "name": "01-my-hub.png",
+      "waitMs": 300,
+      "check": "document.body.className"
+    },
+    {
+      "name": "browse",
+      "js": "location.href = '/browse/model/demo-user/watercolor-sdxl-lora', 'loading'",
+      "waitMs": 3000
+    },
+    {
+      "name": "02-file-browser.png",
+      "js": "(() => { const boxes = [...document.querySelectorAll('tbody .q-checkbox')]; boxes[4].click(); boxes[5].click(); return boxes.length + ' rows' })()",
+      "waitMs": 800
+    },
+    {
+      "name": "browse-again",
+      "js": "location.reload(), 'loading'",
+      "waitMs": 3000
+    },
+    {
+      "name": "03-preview.png",
+      "js": "[...document.querySelectorAll('.rulz-name span')].find(s => s.textContent.trim() === 'README.md').click(), 'ok'",
+      "waitMs": 2000
+    },
+    {
+      "name": "hub",
+      "js": "location.href = '/', 'loading'",
+      "waitMs": 3000
+    },
+    {
+      "name": "light",
+      "js": "[...document.querySelectorAll('.q-btn')].find(b => b.querySelector('.q-icon')?.textContent.trim() === 'light_mode').click(), 'ok'",
+      "waitMs": 1000
+    },
+    {
+      "name": "04-light.png",
+      "waitMs": 300,
+      "check": "document.body.className"
+    }
+  ]
+}

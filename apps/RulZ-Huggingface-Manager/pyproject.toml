@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rulz-hf-manager"
+version = "1.1.0"
+description = "RulZ Huggingface Manager: a friendly local web app to browse and manage your Hugging Face models, datasets, spaces and buckets."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "nicegui>=4.0,<5",
+    "huggingface_hub>=2.4,<3",
+]
+
+[project.scripts]
+rulz-hf-manager = "rulz_hf_manager.main:main"
+
+[tool.setuptools.packages.find]
+include = ["rulz_hf_manager*"]
+
+[tool.setuptools.package-data]
+rulz_hf_manager = ["static/*"]

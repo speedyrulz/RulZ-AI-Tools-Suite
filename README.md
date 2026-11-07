@@ -27,6 +27,7 @@ click, keep it updated, and launch it, all from a single black-and-red window (o
 | [RulZ Image Crawler](apps/rulz-image-crawler) | Crawls a website or folder and keeps the images that match your description (local vision model) | From source (venv + Chromium), plus the model download and an optional llama.cpp CUDA build |
 | [RulZ Image Preparer](apps/RulZ-Image-Preparer) | Cleans up image datasets for training: color noise, JPEG artifacts (fast filter or GPU AI model) and detail recovery, globally or per image; Auto crop crops pictures to something you describe, found with SAM 3.1 | From source (venv); the AI features' PyTorch and models are set up from the app on first use |
 | [RulZ Image Grid](apps/RulZ-Image-Grid) | Arranges images into a labelled grid (file names, row and column labels) and exports it as one PNG or JPG | Portable release zip (a single .exe) |
+| [RulZ Huggingface Manager](apps/RulZ-Huggingface-Manager) | Manages your Hugging Face models, datasets, spaces and buckets: browse, upload, download, move, copy and rename files from one page | From source (venv) |
 
 ## Using the launcher
 
@@ -68,7 +69,7 @@ To run it from source instead, double-click `install.bat` (needs Node.js 22+), t
 ## The apps
 
 Every app's source is in `apps/`, one folder each, imported from its former repository with the full history
-(those repositories are archived; RulZ Image Crawler, RulZ Image Preparer and RulZ Image Grid never had one). Their guides are in the [wiki](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/wiki),
+(those repositories are archived; RulZ Image Crawler, RulZ Image Preparer, RulZ Image Grid and RulZ Huggingface Manager never had one). Their guides are in the [wiki](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/wiki),
 one section per app. Each app builds and runs on its own, as before: see the README in its folder.
 
 **Releasing an app.** Bump the version in the app's source, then push a tag named after the app:
@@ -82,15 +83,15 @@ Push app tags one at a time: GitHub starts no workflow for any of them when more
 
 GitHub Actions (`.github/workflows/apps.yml`) builds it and publishes the release here, where the launcher picks it
 up. The tag prefixes are `rulz-trainer-v`, `image-organizer-v`, `image-tournament-v`, `llm-suite-v`, `coding-agent-v`,
-`training-captioner-v`, `clip-extractor-v`, `rulz-image-crawler-v`, `image-preparer-v` and `image-grid-v`; launcher releases keep plain `v1.2.3` tags and the *Latest* badge.
+`training-captioner-v`, `clip-extractor-v`, `rulz-image-crawler-v`, `image-preparer-v`, `image-grid-v` and `hf-manager-v`; launcher releases keep plain `v1.2.3` tags and the *Latest* badge.
 Pushes and pull requests build every app whose folder changed, so a broken build shows up before it's tagged.
 
-**Apps installed from source** (RulzTrainer, Rulz Training Captioner, RulZ Image Crawler, RulZ Image Preparer) are cloned
-from a branch that holds just their folder: `app/rulz-trainer`, `app/training-captioner`, `app/rulz-image-crawler` and
-`app/image-preparer`, rebuilt from `main` on every change by
+**Apps installed from source** (RulzTrainer, Rulz Training Captioner, RulZ Image Crawler, RulZ Image Preparer, RulZ
+Huggingface Manager) are cloned from a branch that holds just their folder: `app/rulz-trainer`, `app/training-captioner`,
+`app/rulz-image-crawler`, `app/image-preparer` and `app/hf-manager`, rebuilt from `main` on every change by
 `.github/workflows/app-branches.yml`. The branch continues the app's old repository commit for commit, so copies
-cloned from there update with a fast-forward (the launcher switches them over on their next update). Image Crawler and
-Image Preparer had no repository of their own, so their branches start at their import into the suite. A tag for a source app publishes a
+cloned from there update with a fast-forward (the launcher switches them over on their next update). Image Crawler,
+Image Preparer and Huggingface Manager had no repository of their own, so their branches start at their import into the suite. A tag for a source app publishes a
 release with the change notes and no files; installs still come from the branch.
 
 ## Development

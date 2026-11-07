@@ -1,0 +1,8 @@
+.venv/
+.venv-linux/
+__pycache__/
+*.pyc
+.nicegui/
+*.egg-info/
+build/
+dist/

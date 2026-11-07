@@ -25,6 +25,7 @@ on:
       - 'rulz-image-crawler-v*'
       - 'image-preparer-v*'
       - 'image-grid-v*'
+      - 'hf-manager-v*'
   pull_request:
     paths: ['apps/**', '.github/workflows/apps.yml']
 
@@ -53,7 +54,7 @@ jobs:
             [image-tournament]=RulZ-Image-Tournament [llm-suite]=rulz-llm-suite [coding-agent]=rulz-coding-agent
             [training-captioner]=Rulz-Training-Captioner [clip-extractor]=rulz-simple-video-clip-extractor
             [rulz-image-crawler]=rulz-image-crawler [image-preparer]=RulZ-Image-Preparer
-            [image-grid]=RulZ-Image-Grid
+            [image-grid]=RulZ-Image-Grid [hf-manager]=RulZ-Huggingface-Manager
           )
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             tag="${GITHUB_REF#refs/tags/}"
@@ -108,6 +109,7 @@ jobs:
             'rulz-image-crawler' = @{ dir = 'rulz-image-crawler'; name = 'RulZ Image Crawler'; kind = 'source' }
             'image-preparer'     = @{ dir = 'RulZ-Image-Preparer'; name = 'RulZ Image Preparer'; kind = 'source' }
             'image-grid'         = @{ dir = 'RulZ-Image-Grid'; name = 'RulZ Image Grid'; kind = 'dotnet' }
+            'hf-manager'         = @{ dir = 'RulZ-Huggingface-Manager'; name = 'RulZ Huggingface Manager'; kind = 'source' }
           }
           $a = $apps[$env:APP]
           if (-not $a) { throw "Unknown app '$env:APP'" }
@@ -124,6 +126,7 @@ jobs:
             'clip-extractor'   { (Select-String -Path "$env:DIR/simplecut/__init__.py" -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value }
             'image-preparer'   { (Select-String -Path "$env:DIR/rulz/config.py" -Pattern 'APP_VERSION\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value }
             'rulz-image-crawler' { (Select-String -Path "$env:DIR/crawler_app/__init__.py" -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value }
+            'hf-manager'       { (Select-String -Path "$env:DIR/rulz_hf_manager/__init__.py" -Pattern "__version__\s*=\s*'([^']+)'").Matches[0].Groups[1].Value }
             { $_ -in 'llm-suite', 'coding-agent' } { (Get-Content "$env:DIR/package.json" -Raw | ConvertFrom-Json).version }
             default { '' }   # source apps are released from the branch; the tag is the version
           }
