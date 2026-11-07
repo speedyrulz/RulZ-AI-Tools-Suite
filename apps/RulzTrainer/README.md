@@ -298,7 +298,7 @@ and `RULZ_VAST_HOME` set the defaults. In Git Bash, set `MSYS_NO_PATHCONV=1` or 
   - **Combinations:** with `keel_pair_sigma` each step takes one card. The `reference` sampler draws the model
     family's own way and is not bucketed (the run logs a warning).
   - **Resume and race:** a training state saves the deck, so a resume continues it. It is a race setting, so race
-    `timestep_buckets: 10` against `0` on your own data; it has not been measured here.
+    `timestep_buckets: 10` against `0` on your own data; 16 buckets scored below plain on one seed of one set.
 - **Clean-end share** (`clean_share`, after Fizgig's MOSS-Image "Slide"; off by default). It sets the share of
   training steps at the clean end, where sigma is below 0.5 and faces and fine detail are refined, and it can change
   by epoch.
@@ -1012,8 +1012,9 @@ All of it can be raced (`race` rows with `keel_gauge`, `keel_gauge_eps`, `keel_c
 `keel_lookahead` and its three settings, `keel_face_gain` and its two, `keel_body_weight`, and `optimizer` itself:
 `keel` against `keel_fb`), and a Keel state resumes under Automagic 4 and the other way round (the
 band statistics start fresh when `keel_bands` changes; the anchor is dropped when the lookahead is off, the face
-gains when the face gain is). Whether Keel beats Automagic 4 or adamw8bit on the likeness probes
-is not measured yet: the Wizard keeps recommending adamw8bit until a race says otherwise.
+gains when the face gain is). Against adamw8bit on one small Krea 2 set, Keel repeated a face gain on two seeds but not
+a body gain, so the Wizard keeps recommending adamw8bit. [Results](docs/experimental-test-results.md) for this and the
+other experimental settings.
 
 What is measured so far is in `docs/keel-test-results.md`. On one small body-only set, over 8 seeds, one rate for every
 layer (`automagic_groups: single`) beat `by_type` by 4.4 body points (p = 0.03), and `automagic_max_lr` at 1e-3, 5e-4

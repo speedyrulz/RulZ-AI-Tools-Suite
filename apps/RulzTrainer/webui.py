@@ -1872,8 +1872,8 @@ body {
 .rz-badge { font-size: 11px; font-weight: 600; letter-spacing: .04em; padding: 1px 8px; border-radius: 999px; background: var(--rz-red); color: #fff; }
 .rz-badge.muted { background: var(--rz-badge-muted); }
 .rz-evidence { font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 999px; border: 1px solid; cursor: help; }
-.rz-evidence.others { color: var(--rz-ok-text); border-color: var(--rz-ok); }
-.rz-evidence.mixed, .rz-evidence.cost { color: var(--rz-warn-text); border-color: var(--rz-warn); }
+.rz-evidence.others, .rz-evidence.measured { color: var(--rz-ok-text); border-color: var(--rz-ok); }
+.rz-evidence.mixed, .rz-evidence.cost, .rz-evidence.worse { color: var(--rz-warn-text); border-color: var(--rz-warn); }
 .rz-evidence.untested { color: var(--rz-muted); border-color: var(--rz-border-strong); }
 .rz-evidence.tool { color: var(--rz-text-2); border-color: var(--rz-border-strong); }
 .rz-exp { padding-top: 10px; padding-bottom: 10px; }
@@ -4507,6 +4507,8 @@ WIZARD_AUTO = ("multi_gpu", "dp_balance", "transformer_quant", "text_encoder_qua
 
 # How well tested an experimental setting is: (badge, what the badge means)
 EVIDENCE = {
+    "measured": ("Measured gain", "RulzTrainer measured a gain on more than one seed, on one set so far."),
+    "worse": ("Looked worse here", "Measured here and scored below the plain setup, on one seed of one set so far."),
     "others": ("Tested by others", "Someone else (usually Fizgig's likeness tests) measured a gain; RulzTrainer has "
                                    "not repeated it yet."),
     "mixed": ("Small or mixed result", "Measured, but the effect was small, neutral or only seen in a short test."),
@@ -4523,26 +4525,28 @@ EXPERIMENT_GROUPS = ("Adapter and optimizer", "Likeness boosters", "How noise le
 # a key of EVIDENCE; what / tested / cost: the explanation dialog (from the README's measurements, with its numbers)
 EXPERIMENTS = [
     {"key": "network_type", "group": "Adapter and optimizer", "title": "Adapter type", "off": "lora",
-     "control": "select", "options": {"lora": "LoRA (default)", "lokr": "LoKr", "oft": "OFT"}, "evidence": "others",
+     "control": "select", "options": {"lora": "LoRA (default)", "lokr": "LoKr", "oft": "OFT"}, "evidence": "measured",
      "short": "LoKr or OFT instead of a plain LoRA.",
      "what": "A LoRA adds a small pair of matrices to each layer. LoKr uses a Kronecker pair instead (factor 8 by "
              "default); OFT rotates each layer's output channels in blocks, which keeps the base model's structure.",
-     "tested": "LoKr: Fizgig measured factor 8 as 'the highest likeness we've ever measured, with noticeably more "
-               "natural skin than standard LoRA on the same data', with no gain above factor 8. Not repeated in "
-               "RulzTrainer yet. OFT: only the OFT paper's result (DINO 0.632 against 0.613 on DreamBooth objects, "
-               "Stable Diffusion); its likeness has not been compared on a full run here.",
-     "cost": "LoKr: about 20% slower steps and files of about 400 MB on a 12B model. Neither LoKr nor OFT loads in "
-             "diffusers (both load in ComfyUI). Rank, alpha and LoRA+ do not apply. OFT cannot be souped or "
-             "post-hoc averaged."},
+     "tested": "OFT is the one confirmed gain in RulzTrainer's tests: 43.4 and 42.9 combined on two seeds, 14 to 15 "
+               "points over its own base rows on face and body, on all 8 probe seeds, and still rising at step 2000. "
+               "One small set of a generated character on Krea 2; the copy check crossed its limit once (0.59 at the "
+               "last probe on one seed), so check the pictures. LoKr factor 8 tied plain here (29.5, one seed) with "
+               "the lowest body score of the adapters, unlike Fizgig, who measured it as 'the highest likeness we've "
+               "ever measured, with noticeably more natural skin than standard LoRA on the same data'.",
+     "cost": "OFT: about 25% slower steps on Krea 2. LoKr: about 20% slower steps and files of about 400 MB on a 12B "
+             "model. Neither loads in diffusers (both load in ComfyUI). Rank, alpha and LoRA+ do not apply. OFT "
+             "cannot be souped or post-hoc averaged."},
     {"key": "dora", "group": "Adapter and optimizer", "title": "DoRA", "off": False, "control": "switch",
-     "evidence": "cost", "when": lambda wz: wz.w["network_type"].value != "oft",
+     "evidence": "mixed", "when": lambda wz: wz.w["network_type"].value != "oft",
      "short": "Trains each weight's size and direction separately.",
      "what": "Splits every layer's weight into a direction, which the LoRA or LoKr changes, and a magnitude that "
              "trains on its own (weight-decomposed adaptation).",
-     "tested": "Only its speed: LoKr 8 with DoRA ran 4.9 s a step against 3.5 s without. Its effect on likeness has "
-               "not been measured.",
-     "cost": "Slower steps (about 40% on Krea 2). Saved as keys ComfyUI applies; diffusers cannot read them. Cannot "
-             "be souped. Not with OFT."},
+     "tested": "35.1 combined on one seed against about 31 for plain AdamW, a gap too small to count on one run (one "
+               "small set on Krea 2). Speed: LoKr 8 with DoRA ran 4.9 s a step against 3.5 s without.",
+     "cost": "Slower steps (about 30 to 40% on Krea 2). Saved as keys ComfyUI applies; diffusers cannot read them. "
+             "Cannot be souped. Not with OFT."},
     {"key": "optimizer", "group": "Adapter and optimizer", "title": "Optimizer", "off": "adamw8bit",
      "control": "select", "options": {"adamw8bit": "adamw8bit (default)", "adamw": "adamw", "adafactor": "adafactor",
                                       "automagic3": "automagic3", "automagic4": "automagic4", "keel": "keel",
@@ -4553,99 +4557,109 @@ EXPERIMENTS = [
              "automagic3 and automagic4 tune their own learning rate as they go; automagic4 adds smaller steps for the "
              "most sensitive weights. keel is automagic4 with extra machinery aimed at a character's identity, and "
              "keel_fb the same for the face and the body alike.",
-     "tested": "Automagic was measured for its learning rates and speed on Krea 2 (rank 16, 6 images, 160 steps): "
-               "automagic4 rose from 1.7e-4 to a peak of 6.0e-4 and came back to 3.2e-4; the losses (0.078 / 0.079 / "
-               "0.081) were too close in so short a run to rank. Likeness against adamw8bit has not been measured for "
-               "any of them, so adamw8bit stays the default until a race says otherwise. Keel was raced against itself "
-               "on one small body-only set: one learning rate for all layers (single) beat by_type by 4.4 body points "
-               "over 8 seeds, and Max lr at 1e-3, 5e-4 and 3e-4 tied at 1000 steps, all still improving. keel against "
-               "adamw8bit and keel_fb against keel are not measured yet. adafactor is Fizgig's pick for a full "
-               "fine-tune, not tested for LoRAs.",
+     "tested": "keel against adamw8bit, two seeds on one small set on Krea 2 at gradient accumulation 1: a repeated "
+               "face gain (FaceNet 52.7 and 54.3 against 44 to 49), no repeated body gain, and faces very alike "
+               "across seeds. keel_fb tied keel on one seed. On a body-only set, single learning-rate groups beat "
+               "by_type by 4.4 body points over 8 seeds, and Max lr at 1e-3, 5e-4 and 3e-4 tied at 1000 steps. "
+               "Automagic was measured for learning rates and speed only, so adamw8bit stays the default. adafactor "
+               "is Fizgig's pick for a full fine-tune, not tested for LoRAs.",
      "cost": "automagic4 took 1.6 s a step against automagic3's 2.2 s. The learning-rate schedule, LoRA+ and the "
              "per-image learning rate do not apply to the automagic family. Keel's consensus gate wants gradient "
              "accumulation of 2 or more."},
     {"key": "isolation", "group": "Likeness boosters", "title": "LoRA Isolation", "off": False, "control": "switch",
-     "evidence": "others",
+     "evidence": "mixed",
      "short": "Keeps the person's face off everyone else in the picture.",
      "what": "A character LoRA tends to put its subject's face on other people. Isolation also trains every photo "
              "without its trigger word, held to what the model draws without the LoRA; fuses the trigger into one word "
              "(you then prompt with it joined, for example gweltman); and adds pictures of the subject next to a "
              "generated stranger.",
      "tested": "Fizgig, on Krea 2: strangers read as the subject in 48 of 50 pictures without it and 0 of 50 with "
-               "it, while the subject's own likeness held (0.77 to 0.78). Not measured in RulzTrainer yet.",
+               "it, while the subject's own likeness held (0.77 to 0.78). In RulzTrainer the strangers test was not "
+               "repeated. Its likeness was unsettled on one small set: 54.5 then 32.0 combined on two seeds, against "
+               "about 31 plain. Copy reached 0.68, and headshots came back in a training photo's room on both seeds, "
+               "so check for memorising.",
      "cost": "About 1.5x the training time over a run (Fizgig; about 2x per isolation step here). Needs a trigger "
              "word, and you must prompt with the joined word. Downloads a set of stranger pictures. Not with a full "
              "fine-tune or a parallel race."},
     {"key": "id_loss_weight", "group": "Likeness boosters", "title": "Direct identity loss", "off": 0.0,
      "control": "number", "step": 0.05, "precision": 2, "hint": "0 = off; try 0.2 (at most 0.5)",
-     "evidence": "mixed",
+     "evidence": "worse",
      "short": "Adds a face-recognition score to what training minimises.",
      "what": "Decodes the face the model predicts during training and adds a face-recognition term, so the LoRA is "
              "pulled straight toward your references. 0 = off; 0.2 is the tested weight.",
-     "tested": "Measured here on a short test (8 synthetic images, 512 px, rank 16, lr 2e-4, 80 steps, weight 0.2): "
-               "the identity loss fell 0.86 / 0.61 / 0.47 against 0.88 / 0.68 / 0.54 without it, roughly 0.07 better. "
-               "Too short a run to call it a likeness gain: 'treat it as an experiment, not a default'.",
+     "tested": "It hurt on a full run: weight 0.2 gave 27.5 combined against about 31 plain and 37.1 for its own "
+               "base, on one seed of one small Krea 2 set. ArcFace, its training target, read 7.7 points over the "
+               "held-out FaceNet, the body fell to 8.7, and the guard switched it off at step 2000. An earlier short "
+               "test only showed the loss falling.",
      "cost": "Peak memory 8.0 GB against 6.05 GB and about 7% slower steps. With the ArcFace backend the probes' own "
              "scorer becomes the training target (the FaceNet backend avoids that). Needs face references. Not in a "
              "parallel race."},
     {"key": "attn_localize", "group": "Likeness boosters", "title": "Trigger attention on the subject", "off": False,
-     "control": "switch", "evidence": "untested",
+     "control": "switch", "evidence": "mixed",
      "short": "Ties the trigger word to the person, not the background.",
      "what": "Reads, inside the model, where the trigger word's attention lands in each training photo and pulls it "
              "onto the person (their face box and silhouette). Training-only: the LoRA file is the same.",
-     "tested": "Not measured for likeness. On Krea 2 the attention off the subject went from 0.87 to 0.84 over 10 "
-               "steps, so it does what it says, at no extra step time.",
+     "tested": "Speeds up the start: steps 200 to 800 averaged 34.5 and 28.2 combined against 19.5 to 24.1 plain, on "
+               "two seeds of one small Krea 2 set. Late gains were small (39.0 and 33.6 against about 31), and its "
+               "body gain did not repeat. Adding it to OFT gave no gain and raised copy to 0.49.",
      "cost": "Needs a trigger word. The tapped blocks run without torch.compile. Not in a parallel race or a full "
              "fine-tune."},
     {"key": "id_align", "group": "Likeness boosters", "title": "Identity alignment", "off": False,
-     "control": "switch", "evidence": "untested",
+     "control": "switch", "evidence": "mixed",
      "short": "Teaches the face's tokens to carry the person's identity.",
      "what": "A small helper network (thrown away afterwards) teaches the face's tokens inside the model to carry "
              "that photo's ArcFace identity, giving identity feedback at every noise level. Training-only.",
-     "tested": "Not measured for likeness. Run on Krea 2, MOSS-Image and FIBO 2.0 only.",
+     "tested": "No gain: 29.3 combined and 45.0 FaceNet on one seed of one small Krea 2 set, below its own base "
+               "(37.1) and about level with plain overall.",
      "cost": "Trains against ArcFace, so the FaceNet second scorer is switched on to keep the scores honest. First GPU "
              "only. Not in a full fine-tune or a parallel race."},
     {"key": "body_align", "group": "Likeness boosters", "title": "Body alignment", "off": False, "control": "switch",
-     "evidence": "untested", "when": lambda wz: wz.has_body(),
+     "evidence": "mixed", "when": lambda wz: wz.has_body(),
      "short": "The same for the build: the person's tokens carry their body.",
      "what": "Teaches the person's tokens inside the model to carry that photo's body (its DINOv2 body embedding, "
              "what the body probe scores), through a helper that is thrown away. Only photos showing the neck to "
              "mid-thigh count.",
-     "tested": "Not measured for likeness.",
+     "tested": "No gain shown: 34.2 combined on one seed of one small Krea 2 set, body 19.1 against 18.2 for its own "
+               "base.",
      "cost": "Needs photos that show the body, and person masks."},
     {"key": "selftrain", "group": "Likeness boosters", "title": "Self-training on its best pictures", "off": False,
-     "control": "switch", "evidence": "untested",
+     "control": "switch", "evidence": "mixed",
      "short": "Halfway through, adds its own best renders to the photos.",
      "what": "Halfway through, the LoRA draws about 30 pictures of the person in new scenes; the few that are clean, "
              "sharp and look more like them than the probes do train beside your photos for the rest of the run, at "
              "half weight and never more than a fifth of them.",
-     "tested": "Not measured. Research on models training on their own output (model collapse) warns that repeated "
-               "rounds can amplify the model's own flaws; this runs one round, with a copy check.",
+     "tested": "Barely tested: on one small Krea 2 set it kept 2 of 32 pictures at its bar of 60, so it changed "
+               "little (34.4 combined, one seed). Research on models training on their own output (model collapse) "
+               "warns that repeated rounds can amplify the model's own flaws; this runs one round, with a copy "
+               "check.",
      "cost": "A few minutes. Can copy the model's own flaws, so judge the samples by eye. Not in a parallel race."},
     {"key": "reward_steps", "group": "Likeness boosters", "title": "Likeness reward fine-tuning", "off": 0,
-     "control": "number", "precision": 0, "hint": "0 = off; try 100-200 steps", "evidence": "cost",
+     "control": "number", "precision": 0, "hint": "0 = off; try 100-200 steps", "evidence": "mixed",
      "short": "A second stage that rewards the most lifelike renders.",
      "what": "After the normal steps, the LoRA renders groups of pictures for new prompts, the probes rate how much "
              "each looks like the person, and the LoRA learns to make the better ones more likely (a Flow-GRPO "
              "style reinforcement stage). The number is how many reward steps; 0 = off.",
-     "tested": "Only its speed: about 77 s a reward step on Krea 2 (nvfp4, 16 GB card). Its effect on likeness has "
-               "not been measured.",
+     "tested": "No visible gain: 150 steps went from 29.0 to 27.9 combined on one seed of one small Krea 2 set, with "
+               "one probe after the stage. About 80 to 100 s a reward step on a 48 GB card, 3.5 hours for the stage; "
+               "about 77 s on a 16 GB card with nvfp4.",
      "cost": "Slow (seconds to a minute or more a step). It can learn to please the scorer instead of the eye; the "
              "probes keep the best checkpoint and the first stage's LoRA is kept. One GPU, not with a full "
              "fine-tune."},
     {"key": "likeness_lr_control", "group": "Likeness boosters", "title": "Learning rate from the likeness trend",
-     "off": False, "control": "switch", "evidence": "untested",
+     "off": False, "control": "switch", "evidence": "mixed",
      "short": "Raises the learning rate while likeness climbs, lowers it when it falls.",
      "what": "Scales the learning rate between 0.5x and 2x by the likeness probes' trend: up while the score rises, "
              "down when it falls.",
-     "tested": "Not measured.",
+     "tested": "No gain: the rate climbed to 2x, and it read 30.4 combined on one seed of one small Krea 2 set, "
+               "level with plain and below its own base.",
      "cost": "Needs the likeness probes. With automagic4 its own controller may pull the rate back."},
     {"key": "resolution_step_up", "group": "Likeness boosters", "title": "Resolution step-up", "off": False,
      "control": "switch", "evidence": "untested",
      "short": "Starts small and moves to a higher resolution when likeness stalls.",
      "what": "Trains at the lowest of the run's resolutions first and moves up when the likeness score stops "
              "improving (pick two or more resolutions under Advanced on the Photos page).",
-     "tested": "Not measured.",
+     "tested": "Not settled: one run on one small Krea 2 set stalled at 0.25 MP until step 1600, so most of it was a "
+               "plain run. Nothing clearly moved after 0.5 MP began, and steps took twice as long.",
      "cost": "Needs the likeness probes; it replaces the early stop. Not in a race."},
     {"key": "timestep_sampling", "group": "How noise levels are trained", "title": "Noise levels",
      "off": "logit_normal", "control": "select",
@@ -4654,30 +4668,34 @@ EXPERIMENTS = [
      "short": "Which noise levels the training steps practise on.",
      "what": "logit_normal favours the middle noise levels. identity centres them lower (a median of about 0.38), "
              "where a face's features are settled; content favours low noise, where fine detail is.",
-     "tested": "Measured here on a short 5-image test: identity scored 73.9 against 74.2 for the default, neutral. "
-               "content has not been measured.",
+     "tested": "Tied plain on one small Krea 2 set: identity 33.2 combined on one seed; content 34.9 and 27.3 on two "
+               "seeds, a slow start and a late climb that did not repeat. A short 5-image test had identity at 73.9 "
+               "against 74.2.",
      "cost": "None beyond the choice."},
     {"key": "clean_share", "group": "How noise levels are trained", "title": "Clean-end share", "off": "",
-     "control": "text", "hint": "empty = off; Fizgig's best: 60:7:30:8:3", "evidence": "others",
+     "control": "text", "hint": "empty = off; Fizgig's best: 60:7:30:8:3", "evidence": "mixed",
      "short": "More steps at the clean end, where faces and fine detail settle.",
      "what": "Sets, by epoch, how many of the steps land at the clean, low-noise end of training, where faces and "
              "fine detail are refined. Empty = off; Fizgig's best schedule is 60:7:30:8:3.",
      "tested": "Fizgig, on MOSS-Image: 60:7:30:8:3 was the best of eight schedules, still at 71% likeness at epoch "
-               "60 and about 5 points over 60:7:30:15:2. Not measured in RulzTrainer.",
+               "60 and about 5 points over 60:7:30:15:2. On Krea 2 here it tied plain: 31.2 combined, one seed of "
+               "one small set.",
      "cost": "None beyond the choice."},
     {"key": "timestep_buckets", "group": "How noise levels are trained", "title": "Even noise coverage", "off": 0,
-     "control": "number", "precision": 0, "hint": "0 = off; 10-20 is the usual start", "evidence": "untested",
+     "control": "number", "precision": 0, "hint": "0 = off; 10-20 is the usual start", "evidence": "worse",
      "short": "Spreads the noise levels evenly instead of at random.",
      "what": "Every run of N steps covers the noise curve evenly instead of drawing each level at random, so no stretch "
              "of noise levels is skipped by chance. 0 = off; 10-20 is the usual start.",
-     "tested": "Not measured.",
+     "tested": "Lost here: 16 buckets read 26.8 combined and 10 FaceNet points under its own base on all 8 seeds, on "
+               "one seed of one small Krea 2 set. Unexplained and not repeated.",
      "cost": "None."},
     {"key": "loss_type", "group": "How noise levels are trained", "title": "Band loss", "off": "mse",
-     "control": "select", "options": {"mse": "mse (default)", "band": "band"}, "evidence": "untested",
+     "control": "select", "options": {"mse": "mse (default)", "band": "band"}, "evidence": "worse",
      "short": "Ignores the detail the noise has already buried.",
      "what": "Leaves out of the loss the fine-detail bands the noise has buried at each step, so the model is not "
              "asked to guess detail it cannot see.",
-     "tested": "Not measured.",
+     "tested": "Poor at 1e-4: 19.0 combined and body 4.8 on one seed of one small Krea 2 set, still rising at step "
+               "2000 (24), so it may want a higher learning rate.",
      "cost": "None."},
     {"key": "race", "group": "Compare setups", "title": "Configuration race", "off": False, "control": "switch",
      "evidence": "tool",
@@ -9523,7 +9541,7 @@ Kronecker pair (factor 8 is Fizgig's best measured likeness). **OFT**: rotates e
 (*OFT block size*, 32) instead of adding to the weights, which keeps the base model's structure; the OFT paper found
 better subject identity than LoRA and stable long runs. *OFT constraint* > 0 caps how far a layer rotates. **DoRA**
 (a switch for LoRA and LoKr): a magnitude per input channel trains on its own while the adapter steers the
-direction; steps are about 40% slower on Krea 2. OFT and DoRA files load in ComfyUI exactly as trained (not in diffusers). To
+direction; steps are about 30 to 40% slower on Krea 2. OFT and DoRA files load in ComfyUI exactly as trained (not in diffusers). To
 compare them, race rows such as `network_type=oft` or `dora=true` against a LoKr row.
 
 ## Trigger attention and identity alignment
@@ -9532,7 +9550,7 @@ the trigger's attention on the subject** reads, inside the model, where the trig
 picture and pulls it onto the person (their silhouette and face box), so the trigger is bound to them and not to the
 background or other people; it needs a trigger word. **Align the face tokens with the photo's identity** teaches the
 face's tokens after one block to carry that photo's identity (its ArcFace embedding) through a small helper network
-that is thrown away. The LoRA file is the same either way. Not yet measured: race them.
+that is thrown away. The LoRA file is the same either way. On one small Krea 2 set trigger attention sped up the start with little late gain, and identity alignment showed no gain.
 
 ## Likeness reward fine-tuning (second stage)
 *Reward steps* (Likeness probes section, *Second stage*; or the Wizard's experimental extras) adds a stage after the steps:

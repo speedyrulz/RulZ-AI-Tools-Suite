@@ -377,7 +377,8 @@ def test_files_pick_by_kind_and_step(install, capsys):
 def test_files_report_the_folder_they_are_under(install, capsys):
     make_job("a")
     data = run_json(capsys, "files", "a")[1]
-    assert Path(data["base"]) == Path("output") and data["files"][0]["path"].startswith("a/")
+    base = Path(data["base"])
+    assert base.is_absolute() and base.name == "output" and data["files"][0]["path"].startswith("a/")
 
 
 def test_poll_says_how_a_job_stands(install, capsys, running_job):
