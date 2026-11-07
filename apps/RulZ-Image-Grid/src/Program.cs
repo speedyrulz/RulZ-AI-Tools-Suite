@@ -3,8 +3,8 @@ using System.Windows;
 
 [assembly: System.Reflection.AssemblyTitle("RulZ Image Grid")]
 [assembly: System.Reflection.AssemblyProduct("RulZ Image Grid")]
-[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.1.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.1.1.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.1.1.0")]
 
 namespace RulZImageGrid
 {
