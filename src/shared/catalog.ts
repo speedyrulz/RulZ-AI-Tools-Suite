@@ -316,6 +316,44 @@ export const CATALOG: CatalogApp[] = [
     detect: ['%LOCALAPPDATA%\\Programs\\RulZ Image Grid\\RulZ Image Grid.exe'],
     notes: ['A single .exe. Settings are kept in %APPDATA%\\RulZ Image Grid.'],
     highlights: ['Drag-and-drop layout', 'Row & column labels', 'Full-resolution export', 'PNG or JPG']
+  },
+  {
+    id: 'hf-manager',
+    name: 'RulZ Huggingface Manager',
+    tagline: 'Manage your Hugging Face models, datasets, spaces and buckets from one page',
+    description:
+      'Every repo and storage bucket in your Hugging Face account in one table, with sizes and visibility. Open one ' +
+      'to browse its files, then upload, download, rename, move, copy or delete them with a click: changes to a repo ' +
+      'go into one commit (or a pull request), bucket moves run on the Hub, and big uploads are read straight from ' +
+      'disk. Runs in your browser on this computer; your token stays here.',
+    category: 'AI Training',
+    repo: SUITE_REPO,
+    path: 'apps/RulZ-Huggingface-Manager',
+    tagPrefix: 'hf-manager-v',
+    branch: 'app/hf-manager',
+    install: {
+      kind: 'source',
+      setup: [
+        { label: 'Creating the Python environment', run: ['python', '-m', 'venv', '.venv'] },
+        {
+          label: 'Installing NiceGUI and huggingface_hub',
+          run: ['.venv\\Scripts\\python.exe', '-m', 'pip', 'install', '-r', 'requirements.txt']
+        }
+      ]
+    },
+    launch: { target: 'start-windows.bat', icon: 'assets\\icon.ico' },
+    requirements: [
+      { id: 'python', note: 'Python 3.10 or newer' },
+      { id: 'git', optional: true, note: 'Lets the launcher update it with git pull' }
+    ],
+    folderName: 'RulZ Huggingface Manager',
+    notes: [
+      'Setup installs the app’s Python packages (about 110 MB).',
+      'Launch opens a console window and the app in your browser. Closing the console stops it.',
+      'Add a Hugging Face access token (Write) under Settings. It is kept in %APPDATA%\\RulZ-HF-Manager, ' +
+        'separate from the program.'
+    ],
+    highlights: ['Repos and buckets in one table', 'Move, copy, rename in one commit', 'Big uploads from disk', 'Bucket sync']
   }
 ]
 

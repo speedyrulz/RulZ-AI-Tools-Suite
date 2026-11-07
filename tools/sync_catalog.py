@@ -30,6 +30,7 @@ APPS = {
     "rulz-image-crawler": ("rulz-image-crawler", "assets/icon.png", "assets/icon.ico"),
     "image-preparer": ("RulZ-Image-Preparer", "assets/icon.png", "assets/icon.ico"),
     "image-grid": ("RulZ-Image-Grid", "assets/app.png", "assets/app.ico"),
+    "hf-manager": ("RulZ-Huggingface-Manager", "assets/icon.png", "assets/icon.ico"),
 }
 
 IMAGE_REFS = [
