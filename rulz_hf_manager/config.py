@@ -15,7 +15,8 @@ from .platform_utils import IS_WINDOWS, config_dir, default_download_dir
 class Settings:
     token: str = ''
     download_dir: str = ''
-    dark_mode: str = 'auto'  # 'auto' | 'light' | 'dark'
+    dark_mode: str = 'dark'  # 'dark' | 'light' ('auto', from older versions, follows the system)
+    look_chosen: bool = False  # False until the first-start "Choose your look" dialog was answered
     show_hidden: bool = True
     load_last_modified: bool = False  # slower: asks the Hub for the last commit of every file
     page_size: int = 100

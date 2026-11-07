@@ -101,7 +101,7 @@ async def pick_local(mode: str = 'any', title: str | None = None, start: str | P
                     <q-td :props="props">
                       <div class="row items-center no-wrap q-gutter-x-sm cursor-pointer rulz-name"
                            @click="$parent.$emit('enter', props.row)">
-                        <q-icon :name="props.row.icon" size="20px" :color="props.row.is_dir ? 'amber-8' : 'blue-grey-5'"/>
+                        <q-icon :name="props.row.icon" size="20px" :class="props.row.is_dir ? 'rz-ic-dir' : 'rz-ic-file'"/>
                         <span>{{ props.row.name }}</span>
                       </div>
                     </q-td>''')
@@ -220,7 +220,7 @@ async def pick_remote_folder(fs: hub.RemoteFS, start: str = '', title: str = 'Ch
                 blocked = f in disabled or any(f.startswith(d + '/') for d in disabled)
                 with ui.item(on_click=(lambda f=f: show(f)) if not blocked else None).classes('rounded'):
                     with ui.item_section().props('avatar'):
-                        ui.icon('folder', color='grey' if blocked else 'amber-8')
+                        ui.icon('folder').classes('rz-ic-muted' if blocked else 'rz-ic-dir')
                     with ui.item_section():
                         ui.item_label(f.rsplit('/', 1)[-1]).classes('rulz-muted' if blocked else '')
         blocked_here = folder in disabled or any(folder.startswith(d + '/') for d in disabled)

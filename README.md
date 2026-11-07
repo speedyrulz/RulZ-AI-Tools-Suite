@@ -6,7 +6,18 @@ built with [NiceGUI](https://nicegui.io) and the official `huggingface_hub` libr
 Moving, renaming, uploading and downloading files is much quicker than on the website or with the CLI:
 select files in a table, click a button, done.
 
+Part of the [RulZ AI Tools Suite](https://github.com/speedyrulz/RulZ-AI-Tools-Suite): the easiest way to install
+it is the suite's launcher. Guide: [the wiki](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/wiki/HF-Manager).
+
+![My Hub in the dark look](docs/screenshots/01-my-hub.png)
+
 ## Quick start
+
+### With the RulZ AI Tools Suite launcher
+
+Open *RulZ Huggingface Manager* in the launcher and click **Install**. It installs Python if needed, makes a
+Python environment in the app folder (`.venv`) and installs the app's two packages. Then **Launch**: a console
+window opens and the app opens in your browser. Closing the console stops it.
 
 ### Windows
 
@@ -19,7 +30,7 @@ in your browser at <http://localhost:8765>. You need Python 3.10 or newer
 ### WSL / Ubuntu
 
 ```bash
-cd "/mnt/c/coding/RulZ Huggingface Manager"   # or wherever you put the folder
+cd "/mnt/c/path/to/RulZ-Huggingface-Manager"   # wherever the folder is
 ./start-linux.sh
 ```
 
@@ -98,6 +109,9 @@ Windows and WSL keep separate settings, so add the token once in each.
 **Activity panel**: uploads, downloads and moves run in the background with progress; the panel lists every
 job with its result, errors in plain language, and an **Open folder** button for downloads.
 
+**Dark or light**: the RulZ look, black and red (the default) or white and red. The first start asks which one you
+want; switch any time with the sun / moon button at the top right or under Settings ▸ Appearance.
+
 ## Notes
 
 - The app listens on `127.0.0.1` only by default, so only your own computer can reach it.
@@ -118,6 +132,13 @@ rulz_hf_manager/
   jobs.py            background jobs with progress
   platform_utils.py  Windows / WSL / Linux helpers
   ui/                NiceGUI pages: dashboard, browser, settings, pickers, dialogs
+  ui/theme.py        the RulZ look (colors, dark / light, "Choose your look")
+  static/            the RulZ logo (dark and light) and the browser-tab icon
+assets/              app icon (.png, .ico) for shortcuts
 start-windows.bat    Windows launcher
 start-linux.sh       Ubuntu / WSL launcher
 ```
+
+## License
+
+MIT (see `LICENSE`), except the RulZ name and logo: see `LOGO-NOTICE.md`.

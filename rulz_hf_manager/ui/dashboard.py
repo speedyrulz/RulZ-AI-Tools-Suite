@@ -56,16 +56,16 @@ async def dashboard_page() -> None:
             <q-td :props="props">
               <div class="row items-center no-wrap q-gutter-x-sm cursor-pointer rulz-name"
                    @click="$parent.$emit('browse', props.row)">
-                <q-icon :name="props.row.icon" :color="props.row.color" size="22px"/>
+                <q-icon :name="props.row.icon" class="rz-kind-icon" size="22px"/>
                 <span class="text-weight-medium">{{ props.row.id }}</span>
-                <q-icon v-if="props.row.favorite" name="star" color="amber" size="16px"/>
+                <q-icon v-if="props.row.favorite" name="star" class="rz-kind-icon" size="16px"/>
               </div>
             </q-td>''')
         table.add_slot('body-cell-visibility', r'''
             <q-td :props="props">
-              <q-chip dense square :color="props.row.visibility === 'public' ? 'green-1' : 'orange-1'"
-                      :text-color="props.row.visibility === 'public' ? 'green-9' : 'orange-10'"
-                      :icon="props.row.visibility === 'public' ? 'public' : 'lock'" :label="props.row.visibility"/>
+              <span class="rz-vis" :class="props.row.visibility">
+                <q-icon :name="props.row.visibility === 'public' ? 'public' : 'lock'"/>{{ props.row.visibility }}
+              </span>
             </q-td>''')
         table.add_slot('body-cell-updated', r'''
             <q-td :props="props"><span :title="props.row.updated">{{ props.row.updated_ago }}</span></q-td>''')
@@ -109,7 +109,7 @@ async def dashboard_page() -> None:
             bits.append(f'{r.files:,} files')
         return {
             'key': f'{r.kind}:{r.id}', 'id': r.id, 'kind': r.kind, 'kind_label': hub.KIND_LABEL[r.kind],
-            'icon': hub.KIND_ICON[r.kind], 'color': hub.KIND_COLOR[r.kind], 'visibility': r.visibility,
+            'icon': hub.KIND_ICON[r.kind], 'visibility': r.visibility,
             'size': r.size, 'updated': fmt_date(r.updated), 'updated_ago': fmt_ago(r.updated),
             'stats': ' / '.join(bits), 'favorite': settings.is_favorite(r.kind, r.id),
         }
@@ -123,13 +123,14 @@ async def dashboard_page() -> None:
             for k in hub.KINDS:
                 items = [r for r in state['rows'] if r.kind == k]
                 total = sum(r.size or 0 for r in items)
-                with ui.card().props('flat bordered').classes('rulz-card rulz-stat p-3 gap-0 cursor-pointer') \
-                        .on('click', lambda k=k: kind_toggle.set_value(k)):
-                    with ui.row().classes('items-center gap-2 no-wrap'):
-                        ui.icon(hub.KIND_ICON[k], color=hub.KIND_COLOR[k])
+                # Click a tile to show only that type, click it again to show everything.
+                with ui.row().classes('rulz-stat items-center gap-3 no-wrap' + (' rz-on' if kind == k else '')) \
+                        .on('click', lambda k=k: kind_toggle.set_value('all' if kind_toggle.value == k else k)):
+                    ui.icon(hub.KIND_ICON[k]).classes('rz-sec-icon')
+                    with ui.column().classes('gap-0'):
                         ui.label(f'{len(items)} {hub.KIND_LABEL[k]}{"s" if len(items) != 1 else ""}') \
-                            .classes('font-semibold')
-                    ui.label(hub.human_size(total) if total else '-').classes('text-xs rulz-muted')
+                            .classes('rz-stat-value')
+                        ui.label(hub.human_size(total) if total else '-').classes('rz-stat-sub')
 
     kind_toggle.on_value_change(apply_filter)
 
@@ -142,14 +143,14 @@ async def dashboard_page() -> None:
             for label, icon, items in (('Favorites', 'star', favs), ('Recent', 'history', recent)):
                 if not items:
                     continue
-                ui.icon(icon, color='amber' if icon == 'star' else 'grey').classes('ml-1')
+                ui.icon(icon).classes('ml-1 ' + ('rz-kind-icon' if icon == 'star' else 'rz-ic-muted'))
                 ui.label(label).classes('text-xs uppercase rulz-muted mr-1')
                 for it in items:
                     if it.get('kind') not in hub.KIND_ICON:
                         continue
-                    ui.chip(it['id'], icon=hub.KIND_ICON[it['kind']], color='white',
+                    ui.chip(it['id'], icon=hub.KIND_ICON[it['kind']],
                             on_click=lambda it=it: ui.navigate.to(browse_url(it['kind'], it['id']))) \
-                        .props('clickable outline dense').classes('text-sm')
+                        .props('clickable outline dense').classes('text-sm rz-shortcut')
 
     async def load() -> None:
         global _last_namespace
@@ -204,11 +205,10 @@ async def dashboard_page() -> None:
         else:
             new_btn.disable()
             with welcome:
-                with ui.card().classes('rulz-card w-full p-6 gap-2 bg-gradient-to-r from-indigo-50 to-amber-50 '
-                                       'dark:from-indigo-950 dark:to-amber-950'):
-                    with ui.row().classes('items-center gap-3'):
-                        ui.icon('waving_hand', size='lg', color='amber')
-                        ui.label('Welcome to RulZ Huggingface Manager').classes('text-2xl font-semibold')
+                with ui.card().classes('rulz-card rz-welcome w-full p-6 gap-2'):
+                    with ui.row().classes('items-center gap-3 no-wrap'):
+                        ui.icon('waving_hand').classes('rz-sec-icon')
+                        ui.label('Welcome to RulZ Huggingface Manager').classes('rz-page-title')
                     ui.label('Add your Hugging Face access token to see and manage your own models, datasets, '
                              'spaces and buckets. Without a token you can still browse public repos: type a '
                              'username in "Namespace" or paste any repo link in the search box at the top.')

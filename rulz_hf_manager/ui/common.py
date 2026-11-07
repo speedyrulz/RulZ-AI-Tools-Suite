@@ -15,41 +15,9 @@ from nicegui import Client, run, ui
 from .. import APP_NAME, config, hub
 from ..jobs import Job, manager
 from ..platform_utils import open_folder
+from .theme import LOGO_DARK, LOGO_LIGHT, PageLook, choose_look
 
 log = logging.getLogger('rulz_hf_manager')
-
-LOGO_SVG = '''
-<svg width="34" height="34" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
-  <defs><linearGradient id="rg" x1="0" y1="0" x2="1" y2="1">
-    <stop offset="0" stop-color="#FBBF24"/><stop offset="1" stop-color="#F97316"/></linearGradient></defs>
-  <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#rg)"/>
-  <path d="M20 46V18h13.5c6.4 0 10.5 3.6 10.5 9.1 0 4.1-2.3 7.1-6 8.3L45 46h-7.6l-6.3-10H27v10h-7zm7-16h6.2c2.6 0 4.1-1.3 4.1-3.4s-1.5-3.4-4.1-3.4H27V30z" fill="#1E1B4B"/>
-</svg>
-'''
-
-CSS = '''
-:root { --rulz-radius: 14px; }
-.body--light { background: #f4f5fb; }
-.body--dark { background: #0c0f16; }
-.rulz-header { background: linear-gradient(90deg, #1e1b4b 0%, #3730a3 50%, #6d28d9 100%) !important; }
-.rulz-card { border-radius: var(--rulz-radius) !important; }
-.body--dark .rulz-card, .body--dark .q-table__card { background: #151a24 !important; }
-.q-table__card { border-radius: var(--rulz-radius) !important; }
-.rulz-table thead tr th { font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; opacity: .75; }
-.rulz-table tbody tr { cursor: default; }
-.rulz-table .rulz-name:hover span { text-decoration: underline; }
-.rulz-muted { opacity: .65; }
-.rulz-crumb .q-btn { text-transform: none; }
-.rulz-open-input .q-field__control { background: rgba(255,255,255,.12); border-radius: 10px; }
-.rulz-open-input input { color: white !important; }
-.rulz-open-input input::placeholder { color: rgba(255,255,255,.7) !important; }
-.rulz-drop .q-uploader { width: 100%; }
-.rulz-mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
-.rulz-stat { min-width: 150px; }
-'''
-
-DARK_VALUE = {'auto': None, 'light': False, 'dark': True}
-
 
 # --------------------------------------------------------------------------------------------------
 # Formatting
@@ -158,13 +126,13 @@ async def confirm(title: str, message: str = '', *, ok_label: str = 'OK', ok_col
         if message:
             ui.label(message).classes('whitespace-pre-line')
         if items:
-            with ui.scroll_area().classes('max-h-48 w-full border rounded'):
+            with ui.scroll_area().classes('max-h-48 w-full rz-box'):
                 for it in items[:200]:
                     ui.label(it).classes('rulz-mono text-sm')
                 if len(items) > 200:
                     ui.label(f'... and {len(items) - 200} more').classes('text-sm rulz-muted')
         if warning:
-            with ui.row().classes('items-center gap-2 text-orange-8 no-wrap'):
+            with ui.row().classes('items-center gap-2 rz-warn no-wrap'):
                 ui.icon('warning')
                 ui.label(warning).classes('text-sm')
         typed = None
@@ -186,7 +154,7 @@ async def prompt(title: str, label: str = '', value: str = '', *, ok_label: str 
         inp = ui.input(label, value=value).props('outlined autofocus').classes('w-full')
         if hint:
             ui.label(hint).classes('text-xs rulz-muted')
-        error = ui.label().classes('text-negative text-sm')
+        error = ui.label().classes('rz-err text-sm')
 
         def submit() -> None:
             v = (inp.value or '').strip()
@@ -221,13 +189,6 @@ def commit_fields(fs: hub.RemoteFS, default_message: str) -> tuple[ui.input | No
 # Page frame
 # --------------------------------------------------------------------------------------------------
 
-def apply_theme() -> ui.dark_mode:
-    ui.colors(primary='#4F46E5', secondary='#F59E0B', accent='#DB2777', positive='#16A34A',
-              negative='#DC2626', warning='#F59E0B', info='#0EA5E9')
-    ui.add_css(CSS)
-    return ui.dark_mode(DARK_VALUE.get(config.get().dark_mode))
-
-
 async def open_location(text: str) -> None:
     try:
         kind, repo_id, path = hub.parse_location(text)
@@ -245,13 +206,15 @@ def _job_list() -> None:
             ui.label('No activity yet')
         return
     for job in manager.jobs:
-        color = {'done': 'positive', 'error': 'negative', 'running': 'primary', 'queued': 'grey'}[job.status]
-        with ui.card().classes('w-full rulz-card p-3 gap-1').props('flat bordered'):
+        with ui.card().classes('w-full rulz-card rz-job p-3 gap-1').props('flat'):
             with ui.row().classes('w-full items-center no-wrap gap-2'):
                 if job.status == 'running':
                     ui.spinner(size='sm', color='primary')
+                elif job.status == 'queued':
+                    ui.icon('schedule').classes('rz-ic-muted')
                 else:
-                    ui.icon({'done': 'check_circle', 'error': 'error', 'queued': 'schedule'}[job.status], color=color)
+                    ui.icon('check_circle' if job.status == 'done' else 'error',
+                            color='positive' if job.status == 'done' else 'negative')
                 ui.label(job.title).classes('text-sm font-medium flex-1 ellipsis')
                 ui.label(fmt_duration(job.elapsed) if job.started else 'queued').classes('text-xs rulz-muted')
             if job.status == 'running':
@@ -262,7 +225,7 @@ def _job_list() -> None:
             if job.message or job.detail:
                 ui.label(' / '.join(x for x in (job.message, job.detail) if x)).classes('text-xs rulz-muted ellipsis')
             if job.error:
-                ui.label(job.error).classes('text-xs text-negative whitespace-pre-line')
+                ui.label(job.error).classes('text-xs rz-err whitespace-pre-line')
             if job.status == 'done' and isinstance(job.result, Path) and job.result.is_dir():
                 result = job.result
                 with ui.row().classes('items-center gap-1'):
@@ -273,44 +236,52 @@ def _job_list() -> None:
 
 
 @contextmanager
-def frame(active: str = '') -> Iterator[None]:
-    """Header + activity drawer + centered content column."""
-    apply_theme()
+def frame(active: str = '') -> Iterator[PageLook]:
+    """Header + activity drawer + centered content column. Yields the tab's look (dark or light)."""
+    look = PageLook()
     ui.page_title(APP_NAME)
 
     with ui.right_drawer(value=False, fixed=True).props('width=400 bordered').classes('p-3 gap-3') as drawer:
-        with ui.row().classes('w-full items-center'):
-            ui.icon('pending_actions', size='sm')
-            ui.label('Activity').classes('text-lg font-semibold')
+        with ui.row().classes('w-full items-center no-wrap gap-2'):
+            ui.icon('pending_actions').classes('rz-sec-icon')
+            ui.label('Activity').classes('rz-title')
             ui.space()
-            ui.button('Clear finished', on_click=manager.clear_finished).props('flat dense no-caps size=sm')
-            ui.button(icon='close', on_click=drawer.hide).props('flat round dense')
+            ui.button('Clear finished', on_click=manager.clear_finished, color=None) \
+                .props('flat dense no-caps size=sm').classes('rz-icon-btn')
+            ui.button(icon='close', on_click=drawer.hide, color=None).props('flat round dense').classes('rz-icon-btn')
         jobs_view = ui.refreshable(_job_list)
         jobs_view()
 
-    with ui.header(elevated=True).classes('rulz-header items-center px-4 py-2 gap-2 no-wrap'):
-        with ui.link(target='/').classes('row items-center gap-2 no-underline text-white no-wrap'):
-            ui.html(LOGO_SVG, sanitize=False)
-            with ui.column().classes('gap-0 leading-none gt-xs'):
-                ui.label('RulZ').classes('text-lg font-black tracking-wide leading-none')
-                ui.label('Huggingface Manager').classes('text-xs font-light opacity-90 leading-none')
-        ui.element('div').classes('w-4')
-        for label, icon, target, key in (('My Hub', 'space_dashboard', '/', 'hub'),
-                                         ('Settings', 'settings', '/settings', 'settings')):
-            btn = ui.button(label, icon=icon, on_click=lambda t=target: ui.navigate.to(t)) \
-                .props('flat no-caps color=white').classes('gt-sm')
-            if key == active:
-                btn.classes('bg-white/20')
-        ui.space()
-        open_input = ui.input(placeholder='Open repo / bucket / URL ...') \
-            .props('dense borderless clearable dark').classes('rulz-open-input w-[340px] max-w-[45vw] px-2')
-        with open_input.add_slot('prepend'):
-            ui.icon('search', color='white')
-        open_input.on('keydown.enter', lambda: open_location(open_input.value or ''))
-        with ui.button(icon='pending_actions', on_click=drawer.toggle).props('flat round color=white'):
-            badge = ui.badge('', color='orange').props('floating rounded')
-            ui.tooltip('Activity (uploads, downloads, moves...)')
-        avatar_slot = ui.row().classes('items-center')
+    with ui.header().classes('rz-header'):
+        with ui.row().classes('rz-header-row items-center gap-2 no-wrap'):
+            with ui.link(target='/').classes('rz-brand row items-center gap-3 no-wrap'):
+                ui.element('img').props(f'src="{LOGO_DARK}" alt="RulZ"').classes('rz-logo rz-dark-only')
+                ui.element('img').props(f'src="{LOGO_LIGHT}" alt="RulZ"').classes('rz-logo rz-light-only')
+                ui.label('HUGGINGFACE MANAGER').classes('rz-wordmark gt-xs')
+            ui.element('div').classes('w-3')
+            for label, icon, target, key in (('My Hub', 'space_dashboard', '/', 'hub'),
+                                             ('Settings', 'settings', '/settings', 'settings')):
+                btn = ui.button(label, icon=icon, on_click=lambda t=target: ui.navigate.to(t), color=None) \
+                    .props('flat no-caps dense').classes('rz-nav-btn gt-sm')
+                if key == active:
+                    btn.classes('rz-on')
+            ui.space()
+            open_input = ui.input(placeholder='Open repo / bucket / URL ...') \
+                .props('dense outlined clearable').classes('rz-open-input w-[340px] max-w-[40vw]')
+            with open_input.add_slot('prepend'):
+                ui.icon('search')
+            open_input.on('keydown.enter', lambda: open_location(open_input.value or ''))
+            with ui.button(icon='pending_actions', on_click=drawer.toggle, color=None) \
+                    .props('flat round').classes('rz-icon-btn'):
+                badge = ui.badge('', color='primary').props('floating rounded')
+                ui.tooltip('Activity (uploads, downloads, moves...)')
+            # The sun shows in the dark look (switch to light), the moon in the light look. CSS picks the icon,
+            # so it is right from the first paint.
+            with ui.button(on_click=look.toggle, color=None).props('flat round').classes('rz-icon-btn'):
+                ui.icon('light_mode').classes('rz-dark-only')
+                ui.icon('dark_mode').classes('rz-light-only')
+                ui.tooltip('Switch between the dark and the light look')
+            avatar_slot = ui.row().classes('items-center')
 
     state = {'version': -1, 'active': 0}
 
@@ -336,11 +307,11 @@ def frame(active: str = '') -> Iterator[None]:
         avatar_slot.clear()
         with avatar_slot:
             if ident:
-                with ui.button().props('flat round dense'):
+                with ui.button(color=None).props('flat round dense').classes('rz-icon-btn'):
                     if ident.avatar:
                         ui.image(ident.avatar).classes('w-8 h-8 rounded-full')
                     else:
-                        ui.icon('account_circle', color='white', size='md')
+                        ui.icon('account_circle', size='md')
                     with ui.menu():
                         with ui.column().classes('p-3 gap-0'):
                             ui.label(ident.fullname or ident.name).classes('font-semibold')
@@ -357,8 +328,11 @@ def frame(active: str = '') -> Iterator[None]:
                                      on_click=lambda: ui.navigate.to(f'{hub.endpoint()}/{ident.name}', new_tab=True))
             else:
                 ui.button('Add token', icon='key', on_click=lambda: ui.navigate.to('/settings')) \
-                    .props('unelevated color=orange no-caps dense')
+                    .props('unelevated color=primary no-caps dense').classes('px-3')
     ui.timer(0.01, load_identity, once=True)
 
+    if not config.get().look_chosen:
+        ui.timer(0.2, lambda: choose_look(look), once=True)
+
     with ui.column().classes('w-full max-w-[1400px] mx-auto p-4 gap-4'):
-        yield
+        yield look

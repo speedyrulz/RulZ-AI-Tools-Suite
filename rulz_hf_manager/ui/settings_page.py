@@ -6,13 +6,13 @@ from nicegui import run, ui
 
 from .. import __version__, config, hub
 from ..platform_utils import open_folder, platform_label, to_local_path
-from .common import DARK_VALUE, frame, notify_error, notify_ok
+from .common import frame, notify_error, notify_ok
 from .pickers import pick_local
 
 TOKEN_SOURCES = {
     'app': ('key', 'positive', 'Using the token saved in this app.'),
-    'env': ('terminal', 'info', 'Using the HF_TOKEN environment variable (no token saved in this app).'),
-    'cli': ('terminal', 'info', 'Using the token from your "hf auth login" (no token saved in this app).'),
+    'env': ('terminal', 'grey-6', 'Using the HF_TOKEN environment variable (no token saved in this app).'),
+    'cli': ('terminal', 'grey-6', 'Using the token from your "hf auth login" (no token saved in this app).'),
     'none': ('key_off', 'warning', 'No token yet: you can only browse public repos.'),
 }
 
@@ -21,14 +21,14 @@ TOKEN_SOURCES = {
 async def settings_page() -> None:
     s = config.get()
 
-    with frame('settings'):
-        ui.label('Settings').classes('text-2xl font-semibold')
+    with frame('settings') as look:
+        ui.label('Settings').classes('rz-page-title')
 
         # ------------------------------------------------------------------ token
         with ui.card().classes('rulz-card w-full p-5 gap-3'):
-            with ui.row().classes('items-center gap-2'):
-                ui.icon('key', color='primary', size='sm')
-                ui.label('Hugging Face access token').classes('text-lg font-semibold')
+            with ui.row().classes('items-center gap-3 no-wrap'):
+                ui.icon('key').classes('rz-sec-icon')
+                ui.label('Hugging Face access token').classes('rz-title')
             ui.markdown('Create one at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens). '
                         'Choose **Write** access (or a fine-grained token with write permissions on your repos) '
                         'so you can upload, move and delete files. The token is stored only on this computer '
@@ -65,21 +65,21 @@ async def settings_page() -> None:
                 ident = await run.io_bound(hub.whoami, True)
             except Exception as e:  # noqa: BLE001
                 result.clear()
-                with result, ui.row().classes('items-center gap-2 text-negative'):
+                with result, ui.row().classes('items-center gap-2 rz-err'):
                     ui.icon('error')
                     ui.label(hub.friendly_error(e))
                 return
             result.clear()
             with result:
                 if not ident:
-                    ui.label('No token configured.').classes('text-orange-9')
+                    ui.label('No token configured.').classes('rz-warn')
                     return
                 with ui.row().classes('items-center gap-3'):
                     if ident.avatar:
                         ui.image(ident.avatar).classes('w-10 h-10 rounded-full')
                     with ui.column().classes('gap-0'):
                         ui.label(f'Signed in as {ident.fullname or ident.name} (@{ident.name})') \
-                            .classes('font-semibold text-positive')
+                            .classes('font-semibold rz-ok')
                         if ident.is_oauth:
                             until = f', valid until {ident.expires:%d %b %Y}' if ident.expires else ''
                             ui.label(f'Temporary login token from "hf auth login" (OAuth){until}') \
@@ -90,13 +90,13 @@ async def settings_page() -> None:
                         if ident.orgs:
                             ui.label('Organizations: ' + ', '.join(ident.orgs)).classes('text-sm rulz-muted')
                 if ident.is_oauth:
-                    with ui.row().classes('items-center gap-2 text-orange-9 no-wrap'):
+                    with ui.row().classes('items-center gap-2 rz-warn no-wrap'):
                         ui.icon('schedule')
                         ui.label('This login token expires on its own. For a token that keeps working, create an '
                                  'access token with Write permission at huggingface.co/settings/tokens and save it '
                                  'here.')
                 if ident.token_role == 'read':
-                    with ui.row().classes('items-center gap-2 text-orange-9'):
+                    with ui.row().classes('items-center gap-2 rz-warn'):
                         ui.icon('warning')
                         ui.label('This is a read-only token: browsing and downloading work, but uploads, moves, '
                                  'renames and deletes will fail.')
@@ -126,9 +126,9 @@ async def settings_page() -> None:
 
         # ------------------------------------------------------------------ downloads
         with ui.card().classes('rulz-card w-full p-5 gap-3'):
-            with ui.row().classes('items-center gap-2'):
-                ui.icon('download', color='primary', size='sm')
-                ui.label('Downloads').classes('text-lg font-semibold')
+            with ui.row().classes('items-center gap-3 no-wrap'):
+                ui.icon('download').classes('rz-sec-icon')
+                ui.label('Downloads').classes('rz-title')
             ui.label('"Download to my download folder" saves files here, keeping the repo folder structure '
                      '(<folder>/<type>s/<owner>/<name>/...).').classes('text-sm rulz-muted')
             with ui.row().classes('w-full items-center gap-2 no-wrap'):
@@ -164,19 +164,16 @@ async def settings_page() -> None:
 
         # ------------------------------------------------------------------ appearance & behaviour
         with ui.card().classes('rulz-card w-full p-5 gap-3'):
-            with ui.row().classes('items-center gap-2'):
-                ui.icon('tune', color='primary', size='sm')
-                ui.label('Appearance & behaviour').classes('text-lg font-semibold')
-            dark = ui.dark_mode(DARK_VALUE.get(s.dark_mode))
-
-            def set_theme(e) -> None:
-                s.dark_mode = e.value
-                config.save()
-                dark.set_value(DARK_VALUE[e.value])
+            with ui.row().classes('items-center gap-3 no-wrap'):
+                ui.icon('tune').classes('rz-sec-icon')
+                ui.label('Appearance & behaviour').classes('rz-title')
             with ui.row().classes('items-center gap-3'):
-                ui.label('Theme')
-                ui.toggle({'auto': 'System', 'light': 'Light', 'dark': 'Dark'}, value=s.dark_mode,
-                          on_change=set_theme).props('no-caps unelevated toggle-color=primary')
+                ui.label('Look')
+                look_toggle = ui.toggle({'dark': 'Dark', 'light': 'Light'}, value='light' if look.light else 'dark',
+                                        on_change=lambda e: e.value and look.set(e.value == 'light')) \
+                    .props('no-caps unelevated toggle-color=primary')
+                ui.label('Also with the sun / moon button at the top right.').classes('text-xs rulz-muted')
+            look.on_change(lambda light: look_toggle.set_value('light' if light else 'dark'))
 
             def set_flag(name: str, value) -> None:
                 setattr(s, name, value)
@@ -193,9 +190,9 @@ async def settings_page() -> None:
 
         # ------------------------------------------------------------------ server
         with ui.card().classes('rulz-card w-full p-5 gap-3'):
-            with ui.row().classes('items-center gap-2'):
-                ui.icon('dns', color='primary', size='sm')
-                ui.label('Server').classes('text-lg font-semibold')
+            with ui.row().classes('items-center gap-3 no-wrap'):
+                ui.icon('dns').classes('rz-sec-icon')
+                ui.label('Server').classes('rz-title')
             ui.label('Changes here apply the next time you start the app.').classes('text-sm rulz-muted')
             with ui.row().classes('items-center gap-3'):
                 port = ui.number('Port', value=s.port, min=1024, max=65535, precision=0) \
