@@ -123,7 +123,7 @@ namespace RulZImageGrid
             var resStack = new StackPanel();
             resStack.Children.Add(Ui.Dim(new TextBlock { Text = "Output resolution", FontSize = 12 }));
             resText = new TextBlock { FontSize = 22, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 2, 0, 2) };
-            detailText = Ui.Dim(new TextBlock { FontSize = 12 });
+            detailText = Ui.Dim(new TextBlock { FontSize = 12, TextWrapping = TextWrapping.Wrap }); // big sizes need two lines
             resStack.Children.Add(resText);
             resStack.Children.Add(detailText);
             resBox.Child = resStack;
