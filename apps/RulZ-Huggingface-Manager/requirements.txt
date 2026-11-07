@@ -1,0 +1,2 @@
+nicegui>=4.0,<5
+huggingface_hub>=2.4,<3
