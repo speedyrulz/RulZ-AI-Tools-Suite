@@ -37,6 +37,7 @@ class CardDelegate(QStyledItemDelegate):
     def paint(self, p, option, index):
         p.save()
         p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)  # thumbnails are 256 px, drawn at the slider size
         pal = option.palette
         card = option.rect.adjusted(2, 2, -2, -2)
         sel = bool(option.state & QStyle.State_Selected)

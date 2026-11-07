@@ -3,7 +3,7 @@ import sys
 
 from PySide6.QtWidgets import QApplication
 
-from captioner import config, theme
+from captioner import backend, config, theme
 from captioner.look_dialog import ChooseLookDialog
 from captioner.main_window import MainWindow
 
@@ -16,6 +16,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Rulz Training Captioner")
     app.setWindowIcon(theme.icon())
+    backend.allow_large_images()
     s = config.load_settings()
     if s.get("theme") in (theme.DARK, theme.LIGHT):
         theme.apply(app, s["theme"])

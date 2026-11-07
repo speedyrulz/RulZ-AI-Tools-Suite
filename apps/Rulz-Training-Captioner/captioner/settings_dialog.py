@@ -130,7 +130,8 @@ class SettingsDialog(QDialog):
         self.budget.setSuffix(" tokens")
         self.budget.setValue(s["thinking_budget"])
         self.budget.setToolTip("Maximum tokens the model may spend thinking before it must answer.\n"
-                               "Added on top of 'Max new tokens'. Enforced by the managed llama-server.")
+                               "Added on top of 'Max new tokens'. Enforced by the managed llama-server.\n"
+                               "Unlimited: no token cap at all; only the context size limits the reply.")
         self.budget.setEnabled(not s["disable_thinking"])
         self.nothink.toggled.connect(lambda on: self.budget.setEnabled(not on))
         f.addRow("Thinking limit", self.budget)
