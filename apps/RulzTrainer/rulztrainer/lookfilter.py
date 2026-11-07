@@ -108,13 +108,23 @@ def _rel(folder: Path, p) -> str:
         return Path(p).name
 
 
+def _stamp(p) -> list[int] | None:
+    """An image's [modification time in ns, size]: a file replaced under the same name no longer matches its score."""
+    try:
+        st = Path(p).stat()
+    except OSError:
+        return None
+    return [st.st_mtime_ns, st.st_size]
+
+
 def save_scores(folder, baselines, scores, kind: str = "face") -> Path:
     """<folder>/look_scores.json (body: look_scores_body.json): the baselines, the fence and every image's score,
-    keyed by its path inside the dataset folder (the file travels with the dataset)."""
+    keyed by its path inside the dataset folder (the file travels with the dataset), with each image's stamp."""
     folder = Path(folder)
     med, cut = fence(scores, kind)
     payload = {"baselines": [_rel(folder, b) for b in baselines], "median": med, "cutoff": cut,
-               "scores": {_rel(folder, p): s for p, s in scores.items()}}
+               "scores": {_rel(folder, p): s for p, s in scores.items()},
+               "stamps": {_rel(folder, p): _stamp(p) for p in scores}}
     path = folder / scores_file(kind)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return path
@@ -140,25 +150,30 @@ def load_scores(folder, kind: str = "face") -> dict | None:
             stems = {q.stem: q for q in folder.iterdir() if q.is_file() and q.suffix.lower() in IMAGE_EXTS}
             scores = {str(stems[k]): v for k, v in scores.items() if k in stems}
             base = [str(folder / b) for b in data.get("baselines") or []]
+            stamps = {}
         else:
             scores = {str(folder / k): v for k, v in scores.items()}
             base = [str(folder / b) for b in data.get("baselines") or []]
+            stamps = {str(folder / k): v for k, v in (data.get("stamps") or {}).items()}
         return {"baselines": base, "cutoff": data.get("cutoff"), "median": data.get("median"), "scores": scores,
-                "file": str(p)}
+                "stamps": stamps, "file": str(p)}
     return None
 
 
 def outliers(folder, kinds=KINDS) -> set[str]:
     """Resolved paths of the images of a dataset folder that its saved scans (face and / or body) put under their
-    fence (and that are still there): the ones the look warm-up eases in."""
+    fence (and that are still there, the same file: one replaced or re-cropped under its name since the scan is not
+    the image that scored low): the ones the look warm-up eases in."""
     out: set[str] = set()
     for kind in kinds:
         data = load_scores(folder, kind)
         if not data or data.get("cutoff") is None:
             continue
         cut = float(data["cutoff"])
+        stamps = data.get("stamps") or {}
         out |= {str(Path(p).resolve()) for p, s in data["scores"].items()
-                if isinstance(s, (int, float)) and s < cut and Path(p).is_file()}
+                if isinstance(s, (int, float)) and s < cut and Path(p).is_file()
+                and (p not in stamps or stamps[p] == _stamp(p))}
     return out
 
 

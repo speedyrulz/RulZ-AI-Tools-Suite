@@ -33,6 +33,7 @@ import torch
 
 from .. import quant as Q
 from ..config import TrainConfig
+from ..downloads import component_ready
 from ..fibo.loading import place_text_encoder
 from ..moss import loading as moss_loading
 from ..moss import single_file as sf
@@ -131,8 +132,8 @@ def resolve_model_dir(model_path: str, models_dir: str = "models", patterns: lis
     if p.is_dir():
         return p.resolve()
     local = Path(models_dir) / model_path.replace("/", "__")
-    if (local / "transformer" / "config.json").is_file():
-        return local.resolve()
+    if component_ready(local / "transformer") and (patterns or component_ready(local / "text_encoder")):
+        return local.resolve()  # (an interrupted download, or a sampling model's transformer alone: fetched below)
     from huggingface_hub import snapshot_download
 
     log.info("Downloading %s to %s (%s)...", model_path, local, "the transformer, about 11 GB" if patterns else

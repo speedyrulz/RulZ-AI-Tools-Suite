@@ -26,6 +26,7 @@ import torch
 
 from .. import quant as Q
 from ..config import TrainConfig
+from ..downloads import component_ready
 from ..fibo.loading import place_text_encoder
 from ..flux3.loading import _gpu_gb, gated_error, is_gated_error, pad_embeds  # noqa: F401 (pad_embeds: the same batch)
 from ..moss import loading as moss_loading
@@ -99,7 +100,7 @@ def resolve_model_dir(model_path: str, models_dir: str = "models", patterns: lis
         return p.resolve()
     local = Path(models_dir) / model_path.replace("/", "__")
     want_rest = patterns is None
-    if root_file(local) is not None and (not want_rest or (local / "text_encoder" / "config.json").is_file()):
+    if root_file(local) is not None and (not want_rest or component_ready(local / "text_encoder")):
         return local.resolve()
     from huggingface_hub import snapshot_download
 

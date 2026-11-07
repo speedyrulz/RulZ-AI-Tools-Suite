@@ -330,7 +330,13 @@ def side_to_mp(side: int) -> float:
     return round(side * side / (1024 * 1024), 2)
 
 
-DATASET_KEYS = ("path", "resolutions", "repeats")
+DATASET_KEYS = ("path", "resolutions", "repeats", "trigger", "class", "kind")
+# the values the trainer acts on (trainer.build_scheduler, sample_sigmas, loss_weight): anything else is refused at
+# start, not taken as constant / failing at step 1 after the caching
+LR_SCHEDULERS = ("constant", "cosine", "linear")
+TIMESTEP_SAMPLINGS = ("logit_normal", "sigmoid", "uniform", "identity", "content", "style", "logsnr", "reference",
+                      "shift")
+LOSS_WEIGHTINGS = ("none", "min_snr", "sigma_sqrt")
 
 
 
@@ -925,6 +931,15 @@ class TrainConfig:
                              f"{'; '.join(foreign)}. Clear them (or set auto) after switching models")
         if self.loss_type not in ("mse", "band"):
             raise ValueError(f"loss_type must be mse or band, got {self.loss_type!r}")
+        for key, allowed in (("lr_scheduler", LR_SCHEDULERS), ("timestep_sampling", TIMESTEP_SAMPLINGS),
+                             ("loss_weighting", LOSS_WEIGHTINGS)):
+            if getattr(self, key) not in allowed:
+                raise ValueError(f"{key} must be one of {', '.join(allowed)}, got {getattr(self, key)!r}")
+        if int(self.batch_size) < 1 or int(self.gradient_accumulation) < 1:
+            raise ValueError("batch_size and gradient_accumulation must be 1 or more (gradient_accumulation 0 would "
+                             "train no image and save the LoRA untrained)")
+        if not 0.0 <= float(self.caption_dropout) <= 1.0:
+            raise ValueError(f"caption_dropout is a share of the steps, 0 to 1, got {self.caption_dropout!r}")
         if self.int8_backward not in ("bf16", "int8"):
             raise ValueError(f"int8_backward must be bf16 or int8, got {self.int8_backward!r}")
         if self.nvfp4_backward not in ("bf16", "fp4"):

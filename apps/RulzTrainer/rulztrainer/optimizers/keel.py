@@ -443,6 +443,8 @@ class Keel(Automagic4):
         if agree is None:
             self._agree[p] = s
         else:
+            if agree.dtype == torch.int8 and self._votes[p] > 127:  # the 128th vote could pass int8's 127: widen
+                agree = self._agree[p] = agree.to(torch.int16)  # (gradient accumulation 128, or 64 with DOP)
             agree.add_(s)
 
     @torch.no_grad()
@@ -511,11 +513,19 @@ class Keel(Automagic4):
         self._mag.clear()
         self._pw.clear()
         self._cnt.clear()
+        self._face_e.clear()  # (an out-of-memory retry re-runs the micro-batches whose energies were reported)
         for group in self.param_groups:
             for p in group["params"]:
                 if hasattr(p, "_accum_grad"):
                     del p._accum_grad
         super().zero_grad(set_to_none=set_to_none)
+
+    def disarm(self) -> None:
+        """A step that never reaches step() (left out for non-finite gradients): its sums go and the gradient hooks
+        stop taking gradients until the next zero_grad, so an optimizer built on the same tensors after the run (the
+        reward stage's) gets its gradients on p.grad."""
+        self.zero_grad(set_to_none=True)
+        self._armed = False
 
     # ------------------------------------------------------------------ the trainer's feed
 
@@ -731,7 +741,7 @@ class Keel(Automagic4):
         dev = self._face_e[ups[0]][1].device
         ef = torch.stack([self._face_e[p][0].to(dev) for p in ups])
         et = torch.stack([self._face_e[p][1].to(dev) for p in ups])
-        live = et > 0.0
+        live = (et > 0.0) & torch.isfinite(et) & torch.isfinite(ef)  # (non-finite: never EMA'd into the gain)
         et_safe = et.clamp(min=GAUGE_FLOOR)
         share = ef / et_safe
         bodies = [self._face_e[p][2] for p in ups]

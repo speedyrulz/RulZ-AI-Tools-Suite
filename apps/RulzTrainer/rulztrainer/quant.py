@@ -163,7 +163,8 @@ def quantize_nvfp4(w: torch.Tensor, per_tensor_scale: torch.Tensor | None = None
         w = nn.functional.pad(w, (0, pc - cols, 0, pr - rows))
     if per_tensor_scale is None:
         per_tensor_scale = w.abs().amax() / (F8_E4M3_MAX * F4_E2M1_MAX)
-    per_tensor_scale = torch.as_tensor(per_tensor_scale, dtype=torch.float32, device=w.device)
+    # an all-zero weight (a zero-initialised layer) would divide 0 by 0: every block then NaN
+    per_tensor_scale = torch.as_tensor(per_tensor_scale, dtype=torch.float32, device=w.device).clamp(min=1e-12)
     x = w.reshape(pr, -1, 16)
     block_scale = x.abs().amax(dim=-1) / F4_E2M1_MAX
     scaled = (block_scale / per_tensor_scale).clamp(max=F8_E4M3_MAX)

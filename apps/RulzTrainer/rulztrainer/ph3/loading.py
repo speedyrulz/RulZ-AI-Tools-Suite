@@ -32,6 +32,7 @@ from torch import nn
 
 from .. import quant as Q
 from ..config import TrainConfig
+from ..downloads import component_ready
 from ..h3 import loading as HL
 from ..h3 import single_file as hsf
 from ..moss import loading as moss_loading
@@ -83,7 +84,7 @@ def resolve_model_dir(model_path: str, models_dir: str = "models") -> Path:
     if p.is_dir():
         return p.resolve()
     local = Path(models_dir) / path.replace("/", "__")
-    if (local / "transformer" / "config.json").is_file() and (local / "text_connector" / "config.json").is_file():
+    if component_ready(local / "transformer") and component_ready(local / "text_connector"):  # (else: resumed)
         return local.resolve()
     from huggingface_hub import snapshot_download
 

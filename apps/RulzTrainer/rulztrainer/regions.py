@@ -227,25 +227,29 @@ class RegionMap:
     has_person: bool
     parts: torch.Tensor | None = None  # [PARTS, h, w] uint8: the parser's class fractions, then the silhouette ring
     parts_print: str = ""  # what built `parts`: a mismatch rebuilds the map
+    weights_print: str = ""  # what built `weight` and `prior` (weights_print): a mismatch rebuilds the map
 
 
 def build_weight_map(bw: int, bh: int, face_bbox_px, person_mask: np.ndarray | None, face_w: float, body_w: float,
                      bg_w: float, face_margin: float = 0.25, feather: int = 1) -> RegionMap:
     h, w = bh // CELL, bw // CELL
     wmap = torch.full((h, w), float(bg_w))
+    subject = torch.zeros((h, w), dtype=torch.bool)  # the person's and the face's cells, whatever their weights
     has_person = False
     if person_mask is not None and person_mask.shape == (bh, bw):
         m = torch.from_numpy(person_mask.astype(np.float32)).view(h, CELL, w, CELL).mean(dim=(1, 3)) >= 0.5
         if m.any():
             wmap[m] = float(body_w)
+            subject |= m
             has_person = True
     face_cells = None
     if face_bbox_px is not None:
         cx0, cy0, cx1, cy1 = to_cells(dilate_bbox(face_bbox_px, face_margin, bw, bh), bw, bh)
         if cx1 > cx0 and cy1 > cy0:
             wmap[cy0:cy1, cx0:cx1] = float(face_w)
+            subject[cy0:cy1, cx0:cx1] = True
             face_cells = (cx0, cy0, cx1, cy1)
-    prior = wmap == float(bg_w)
+    prior = ~subject  # not wmap == bg_w: a body (or face) weighted like the background is still the subject
     for _ in range(max(0, int(feather))):
         wmap = torch.nn.functional.avg_pool2d(wmap[None, None], 3, stride=1, padding=1, count_include_pad=False)[0, 0]
     if wmap.sum() > 0:
@@ -253,6 +257,13 @@ def build_weight_map(bw: int, bh: int, face_bbox_px, person_mask: np.ndarray | N
     else:
         wmap = torch.ones(h, w)
     return RegionMap(wmap[None].float().contiguous(), prior[None].contiguous(), face_cells, None, has_person)
+
+
+def weights_print(cfg, person: bool) -> str:
+    """What a region map's weight and prior depend on, for its metadata: a different value rebuilds the map (a run with
+    other region weights, or person masks where the cached map was built without them)."""
+    return (f"face={cfg.face_loss_weight!r}|body={cfg.body_loss_weight!r}|bg={cfg.background_loss_weight!r}"
+            f"|margin={cfg.face_margin!r}|feather={cfg.region_feather_cells!r}|person={int(bool(person))}")
 
 
 def parts_print(cfg, bw: int, bh: int) -> str:
@@ -346,6 +357,8 @@ def save_region_map(path: Path, rm: RegionMap) -> None:
     if rm.parts is not None:
         tensors["parts"] = rm.parts
         meta["parts_print"] = rm.parts_print
+    if rm.weights_print:
+        meta["weights_print"] = rm.weights_print
     path.parent.mkdir(parents=True, exist_ok=True)
     save_safetensors(tensors, path, metadata=meta)
 
@@ -361,18 +374,24 @@ def load_region_map(path: Path) -> RegionMap | None:
         parts = f.get_tensor("parts") if "parts" in f.keys() else None
     fc = tuple(int(v) for v in meta["face_cells"].split(",")) if meta.get("face_cells") else None
     kps = json.loads(meta["kps"]) if meta.get("kps") else None
-    return RegionMap(weight, prior, fc, kps, meta.get("has_person") == "1", parts, meta.get("parts_print", ""))
+    return RegionMap(weight, prior, fc, kps, meta.get("has_person") == "1", parts, meta.get("parts_print", ""),
+                     meta.get("weights_print", ""))
 
 
-def _parts_stale(path: Path, want: str) -> bool:
-    """A cached map without the parts tensor this run wants, or with one built another way."""
+def _stale(path: Path, key: str, want: str) -> bool:
+    """A cached map whose metadata `key` is not `want` (built another way, or before the map recorded it)."""
     from safetensors import safe_open
 
     try:
         with safe_open(str(path), "pt") as f:
-            return (f.metadata() or {}).get("parts_print") != want
+            return (f.metadata() or {}).get(key) != want
     except Exception:  # noqa: BLE001
         return True
+
+
+def _parts_stale(path: Path, want: str) -> bool:
+    """A cached map without the parts tensor this run wants, or with one built another way."""
+    return _stale(path, "parts_print", want)
 
 
 def flip_region_map(rm: RegionMap, bw: int) -> RegionMap:
@@ -401,10 +420,11 @@ def cache_region_maps(items, cfg, analysis: dict[str, dict], person_mask_fn=None
     from .multigpu import run_queue
 
     counts = {"face": 0, "person": 0, "none": 0}
-    todo = [it for it in items if it.region_path is not None and (
-        cfg.recache or not it.region_path.exists()
-        or (parts_fn is not None and _parts_stale(it.region_path, parts_print(cfg, it.width, it.height))))]
     workers = person_mask_fns or [(person_mask_fn, "cpu")]
+    wprint = weights_print(cfg, any(fn is not None for fn, _ in workers))
+    todo = [it for it in items if it.region_path is not None and (
+        cfg.recache or not it.region_path.exists() or _stale(it.region_path, "weights_print", wprint)
+        or (parts_fn is not None and _parts_stale(it.region_path, parts_print(cfg, it.width, it.height))))]
     if len(workers) > 1:
         log.info("Region maps: %d images split across %s", len(todo), ", ".join(str(d) for _, d in workers))
     done_n = [0]
@@ -415,11 +435,11 @@ def cache_region_maps(items, cfg, analysis: dict[str, dict], person_mask_fn=None
         if progress:
             progress(done_n[0], len(todo))
 
-    run_queue(workers, todo, lambda w, it: _region_map_for(it, cfg, analysis, w[0], parts_fn), on_done=done)
+    run_queue(workers, todo, lambda w, it: _region_map_for(it, cfg, analysis, w[0], parts_fn, wprint), on_done=done)
     return counts
 
 
-def _region_map_for(it, cfg, analysis: dict[str, dict], person_mask_fn, parts_fn=None) -> str:
+def _region_map_for(it, cfg, analysis: dict[str, dict], person_mask_fn, parts_fn=None, wprint: str = "") -> str:
     """Build and save one item's region map; returns its kind (face | person | none)."""
     from .dataset import load_image_fit
 
@@ -439,6 +459,7 @@ def _region_map_for(it, cfg, analysis: dict[str, dict], person_mask_fn, parts_fn
     rm = build_weight_map(it.width, it.height, bbox_px, mask, cfg.face_loss_weight, cfg.body_loss_weight,
                           cfg.background_loss_weight, cfg.face_margin, cfg.region_feather_cells)
     rm.kps = kps_px
+    rm.weights_print = wprint
     if parts_fn is not None:
         rm.parts = build_parts(parts_fn(load_image_fit(it.image, it.width, it.height, it.src_box)), it.width, it.height,
                                rm.face_cells, cfg.hull_ring_cells)

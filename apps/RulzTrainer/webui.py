@@ -7,6 +7,8 @@ reloaded page, a second browser or a restarted WebUI reattaches to it.
 from __future__ import annotations
 
 import argparse
+import copy
+import dataclasses
 import json
 import math
 import os
@@ -200,10 +202,20 @@ def reattach_job() -> bool:
     """Pick up the last job from JOB_FILE when this process has none. Returns True if that job is still running.
 
     The job dir is adopted even when the process has ended, so the monitor shows the last run's final status.
-    The pid only counts as the same job when its create time matches (pids get reused)."""
-    global _adopted, _job_dir
+    The pid only counts as the same job when its create time matches (pids get reused). Once this process's job has
+    ended, a newer job in JOB_FILE (another WebUI on this install started it, from its queue) is picked up: this
+    one's queue must not see "nothing runs" and start a second job on the same GPU."""
+    global _proc, _adopted, _job_dir
     if _proc is not None or _adopted is not None:
-        return _running()
+        if _running():
+            return True
+        try:
+            data = json.loads(JOB_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if int(data.get("pid") or 0) == (_proc.pid if _proc is not None else _adopted.pid):
+            return False  # still the last job: it has ended
+        _proc = _adopted = None
     try:
         data = json.loads(JOB_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -498,22 +510,22 @@ def _start_training(cfg: TrainConfig) -> str:
     _job_dir.mkdir(parents=True, exist_ok=True)
     cfg_path = _job_dir / "config.yaml"
     cfg.save(cfg_path)
-    for stale in ("status.json", "STOP"):
+    for stale in ("status.json", "STOP", "RACE_DROP"):  # (a drop asked of an earlier run of this job name)
         p = _job_dir / stale
         if p.exists():
             p.unlink()
     (_job_dir / "train.log").write_text("", encoding="utf-8")
     env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
-    console = open(_job_dir / "console.log", "w", encoding="utf-8")  # noqa: SIM115
     # detached from the WebUI (own process group / session, no console): closing or restarting the WebUI leaves the
     # job running, and the next WebUI reattaches to it through JOB_FILE
     if sys.platform == "win32":
         detach = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
     else:
         detach = {"start_new_session": True}
-    _proc = subprocess.Popen([sys.executable, "-m", "rulztrainer.train", "--config", str(cfg_path)],
-                             cwd=str(ROOT), env=env, stdout=console, stderr=subprocess.STDOUT,
-                             stdin=subprocess.DEVNULL, **detach)
+    with open(_job_dir / "console.log", "w", encoding="utf-8") as console:  # the job keeps its own handle
+        _proc = subprocess.Popen([sys.executable, "-m", "rulztrainer.train", "--config", str(cfg_path)],
+                                 cwd=str(ROOT), env=env, stdout=console, stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL, **detach)
     _adopted = None
     _record_job(_proc.pid, _job_dir)
     return f"Started job '{cfg.job_name}' (pid {_proc.pid}). Config saved to {cfg_path}"
@@ -537,12 +549,16 @@ def kill_training() -> str:
     reattach_job()
     if not _running():
         return "No job running."
+    # a kill usually means "stop everything": the queued runs wait for Resume (paused first, so the queue's next tick
+    # cannot start one between the kill and the pause)
+    paused = bool(QUEUE.snapshot()["waiting"])
+    if paused:
+        QUEUE.set_paused(True)
     if _proc is not None:
         _proc.kill()
     else:
         _adopted.kill()
-    if QUEUE.snapshot()["waiting"]:  # a kill usually means "stop everything": the queued runs wait for Resume
-        QUEUE.set_paused(True)
+    if paused:
         return "Process killed (no final save). The queue is paused: Resume it on the Monitor to go on."
     return "Process killed (no final save)."
 
@@ -562,6 +578,8 @@ def _start_queued(config: dict) -> tuple[bool, str]:
         msg = start_training(validated_config(TrainConfig.from_dict(config)))
     except (TypeError, ValueError) as e:
         return False, f"A setting is invalid: {e}"
+    except Exception as e:  # noqa: BLE001 - a full disk, a folder it cannot write: recorded, the queue pauses
+        return False, f"Could not start: {type(e).__name__}: {e}"
     return msg.startswith("Started"), msg
 
 
@@ -583,9 +601,11 @@ def queue_run(cfg: TrainConfig) -> tuple[bool, str]:
 
 
 def queue_tick() -> None:
-    """One step of the queue: start the next waiting run when the job has ended."""
-    reattach_job()
-    done = QUEUE.advance(_running(), _start_queued)
+    """One step of the queue: start the next waiting run when the job has ended (under the start lock, so a run the
+    page starts in between is seen as running, not failed as "already running" with the queue paused)."""
+    with _start_lock:
+        reattach_job()
+        done = QUEUE.advance(_running(), _start_queued)
     if done is not None:
         print(f"[queue] {done.get('job')}: {done.get('message')}", flush=True)
 
@@ -1374,7 +1394,7 @@ class Form:
         model_path = (v("model_path") or "").strip() if preset == CUSTOM else MODEL_PRESETS[preset]
         prompts = [p.strip() for p in (v("sample_prompts") or "").splitlines() if p.strip()]
         s = lambda k: (v(k) or "").strip()  # noqa: E731
-        return TrainConfig(
+        kw = dict(
             preset="identity" if self.w.get("preset_toggle") is not None and self.w["preset_toggle"].value else "",
             job_name=s("job_name") or "my_lora", output_dir=s("output_dir") or "output", seed=int(v("seed")),
             model_source="files" if v("model_source") == FILE_SOURCE else "hf",
@@ -1541,8 +1561,17 @@ class Form:
                          if v("noise_run") else []),
             noise_seeds=int(v("noise_seeds") or 16),
         )
+        # the settings without a field on this page (weight_decay, lora_dropout, the hull_* tuning, cache_dir, ...)
+        # stay as the loaded or uploaded config had them, not the defaults: Load then Start (or Save) keeps them
+        # (model_arch: auto, so the family follows the model picked here)
+        base = getattr(self, "_base", None)
+        if base is not None:
+            kw = {**{f.name: copy.deepcopy(getattr(base, f.name)) for f in dataclasses.fields(TrainConfig)
+                     if f.name not in kw and f.name != "model_arch"}, **kw}
+        return TrainConfig(**kw)
 
     def from_config(self, cfg: TrainConfig) -> None:
+        self._base = copy.deepcopy(cfg)  # what to_config keeps of the settings this page has no field for
         preset = next((k for k, v in MODEL_PRESETS.items() if v == cfg.model_path), CUSTOM)
         values = {**cfg.to_dict(), "model_preset": preset, "sample_prompts": "\n".join(cfg.sample_prompts),
                   "reward_prompts": "\n".join(cfg.reward_prompts),
@@ -1553,7 +1582,8 @@ class Form:
                   "race_drop_confidence": cfg.race_drop_confidence or 0.9,
                   "face_refs": "\n".join(cfg.face_refs), "body_refs": "\n".join(cfg.body_refs),
                   "model_source": FILE_SOURCE if cfg.model_source == "files" else HF_SOURCE}
-        values["datasets"] = [{"path": sp.path, "resolutions": list(sp.resolutions), "repeats": sp.repeats}
+        values["datasets"] = [{"path": sp.path, "resolutions": list(sp.resolutions), "repeats": sp.repeats,
+                               "trigger": sp.trigger, "class": sp.subject_class, "kind": sp.subject_kind}
                               for sp in cfg.dataset_specs() if sp.path]  # a single-folder config: that folder
         values["sample_aspect"], values["sample_mp"] = size_aspect(cfg.sample_width, cfg.sample_height)
         values["turbo_mode"] = ("auto" if cfg.turbo_lora == "auto" else "file" if cfg.turbo_lora else "none")
@@ -2453,21 +2483,27 @@ def _serve_history_xlsx(run: str):
 
     from fastapi import HTTPException
     from fastapi.responses import FileResponse
+    from starlette.background import BackgroundTask
 
     from rulztrainer import likeness_export
 
     rec = next((r for r in history.list_runs() if r["id"] == run), None)
     if rec is None:
         raise HTTPException(status_code=404, detail="No such run in the history")
-    out = Path(tempfile.gettempdir()) / f"{history_file_name(rec)}_likeness.xlsx"
+    # a temporary file of its own, removed once sent (two runs of one name exported at once never share one)
+    fd, tmp = tempfile.mkstemp(suffix=".xlsx")
+    os.close(fd)
     try:
-        likeness_export.export_run(rec, out)
+        likeness_export.export_run(rec, Path(tmp))
     except FileNotFoundError as e:
+        os.unlink(tmp)
         raise HTTPException(status_code=404, detail=str(e)) from e
     except (OSError, ValueError) as e:
+        os.unlink(tmp)
         raise HTTPException(status_code=500, detail=str(e)) from e
-    return FileResponse(out, filename=out.name,
-                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    return FileResponse(tmp, filename=f"{history_file_name(rec)}_likeness.xlsx",
+                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        background=BackgroundTask(os.unlink, tmp))
 
 
 def history_file_name(rec: dict) -> str:

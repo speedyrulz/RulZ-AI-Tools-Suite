@@ -41,6 +41,7 @@ import torch.nn.functional as F
 
 from .. import quant as Q
 from ..config import TrainConfig
+from ..downloads import component_ready
 from ..moss import loading as moss_loading
 from ..moss import single_file as sf
 from . import convert as C
@@ -510,7 +511,7 @@ def resolve_model_dir(model_path: str, models_dir: str = "models") -> Path:
         return p.resolve()
     local = Path(models_dir) / path.replace("/", "__")
     tdir = local / ("transformer_ref" if ref else "transformer")
-    if (tdir / "config.json").is_file() and (local / "text_encoder" / "config.json").is_file():
+    if component_ready(tdir) and component_ready(local / "text_encoder"):  # (an interrupted download: resumed)
         return local.resolve()
     from huggingface_hub import snapshot_download
 

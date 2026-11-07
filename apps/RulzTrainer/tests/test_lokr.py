@@ -109,7 +109,15 @@ def test_lokr_file_as_a_sampling_extra_matches_the_merged_weight(tmp_path):
                "diffusion_model.0.lokr_w2_b": w2b, "diffusion_model.0.alpha": torch.tensor(1.0)},
               str(tmp_path / "dec.safetensors"))
     entries = L.parse_comfy_lora(load_file(str(tmp_path / "dec.safetensors")))
-    assert entries["0"][0] == "lokr" and torch.allclose(entries["0"][2], (w2a @ w2b) * 0.5)
+    kind, f1, f2, scale = entries["0"]
+    assert kind == "lokr" and torch.allclose(torch.kron(f1, f2) * scale, torch.kron(w1, w2a @ w2b) * 0.5)
+    # both decomposed (LyCORIS decompose_both): alpha / rank scales the product once, not each factor
+    w1a, w1b = torch.randn(2, 2), torch.randn(2, 4)
+    save_file({"diffusion_model.0.lokr_w1_a": w1a, "diffusion_model.0.lokr_w1_b": w1b,
+               "diffusion_model.0.lokr_w2_a": w2a, "diffusion_model.0.lokr_w2_b": w2b,
+               "diffusion_model.0.alpha": torch.tensor(1.0)}, str(tmp_path / "both.safetensors"))
+    kind, f1, f2, scale = L.parse_comfy_lora(load_file(str(tmp_path / "both.safetensors")))["0"]
+    assert torch.allclose(torch.kron(f1, f2) * scale, torch.kron(w1a @ w1b, w2a @ w2b) * 0.5)
 
 
 def test_mirror_between_kinds_and_ema_over_lokr():

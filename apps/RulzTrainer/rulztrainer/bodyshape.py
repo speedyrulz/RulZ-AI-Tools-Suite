@@ -46,14 +46,21 @@ class Profile:
     """The references' measurements: per key the median and a robust spread (1.4826 x the median absolute deviation,
     at least MIN_REL of the median; DEFAULT_REL with fewer than MIN_REFS references)."""
 
-    def __init__(self, samples: list[dict[str, float]]):
+    def __init__(self, samples: list[dict[str, float]], spread: dict[str, float] | None = None):
+        """spread: the spread to use for a measurement fewer than MIN_REFS samples have, in place of DEFAULT_REL (a
+        leave-one-out profile takes the whole set's, which may have enough)."""
         self.median: dict[str, float] = {}
         self.sd: dict[str, float] = {}
         self.count: dict[str, int] = {}
         for k in sorted({k for s in samples for k in s}):
             vals = np.array([s[k] for s in samples if k in s], dtype=np.float64)
             med = float(np.median(vals))
-            sd = 1.4826 * float(np.median(np.abs(vals - med))) if len(vals) >= MIN_REFS else DEFAULT_REL * abs(med)
+            if len(vals) >= MIN_REFS:
+                sd = 1.4826 * float(np.median(np.abs(vals - med)))
+            elif spread is not None and k in spread:
+                sd = spread[k]
+            else:
+                sd = DEFAULT_REL * abs(med)
             self.median[k], self.sd[k], self.count[k] = med, max(sd, MIN_REL * abs(med), 1e-6), len(vals)
 
     def similarity(self, sample: dict[str, float], min_keys: int = MIN_KEYS) -> tuple[float | None, int]:
@@ -66,13 +73,16 @@ class Profile:
 
     @staticmethod
     def self_similarity(samples: list[dict[str, float]]) -> float | None:
-        """The references' own level, 0..1: each scored against a profile of the others."""
+        """The references' own level, 0..1: each scored against a profile of the others. A measurement the others have
+        too few of for their own spread takes the whole set's, the spread a picture is scored with (with 3 references
+        the others' loose DEFAULT_REL would put the level above what a copy of a reference scores)."""
+        full = Profile(samples)
         sims = []
         for i, s in enumerate(samples):
             others = samples[:i] + samples[i + 1:]
             if len(others) < 2:
                 continue
-            pct, _ = Profile(others).similarity(s)
+            pct, _ = Profile(others, spread=full.sd).similarity(s)
             if pct is not None:
                 sims.append(pct)
         return float(np.mean(sims)) / 100.0 if sims else None
