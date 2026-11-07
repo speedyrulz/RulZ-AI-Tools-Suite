@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -49,6 +51,20 @@ namespace RulZImageGrid
             c.RowLabels = new List<string>(RowLabels);
             return c;
         }
+
+        /// <summary>
+        /// The settings as saved. The editor keeps room for faint "Column 1" / "Row 1" placeholders, but a label
+        /// set with nothing typed for any of the grid's columns (or rows) takes no space in the saved image.
+        /// </summary>
+        public GridSettings ForExport(int imageCount)
+        {
+            var c = Clone();
+            int cols = Math.Max(1, Columns);
+            int rows = Math.Max(1, (int)Math.Ceiling(imageCount / (double)cols));
+            if (!Enumerable.Range(0, cols).Any(i => ColLabel(i).Length > 0)) c.ShowColLabels = false;
+            if (!Enumerable.Range(0, rows).Any(i => RowLabel(i).Length > 0)) c.ShowRowLabels = false;
+            return c;
+        }
     }
 
     public class ImageItem
@@ -81,10 +97,44 @@ namespace RulZImageGrid
         public static readonly string[] Extensions =
             { ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".webp", ".heic", ".heif", ".jfif", ".ico" };
 
+        /// <summary>
+        /// Longest side of the preview kept in memory for each image. The editor loads sharper copies of the
+        /// tiles on screen when they're shown bigger than this, so it can stay small.
+        /// </summary>
+        public const int ThumbSide = 512;
+
         public static bool IsImage(string path) =>
             Extensions.Contains(System.IO.Path.GetExtension(path).ToLowerInvariant());
 
         static bool Rotated90(int o) => o >= 5 && o <= 8;
+
+        /// <summary>
+        /// Reads many images on several background threads at once. Results keep the order of <paramref name="files"/>.
+        /// <paramref name="progress"/> is called from the worker threads with the number of files done so far.
+        /// </summary>
+        public static async Task<(List<ImageItem> ok, List<string> failed)> ReadInfoMany(IList<string> files, Action<int> progress)
+        {
+            var results = new ImageItem[files.Count];
+            var errors = new string[files.Count];
+            int next = -1, done = 0;
+            // A few threads give most of the speed-up; more would mostly add memory for big PNGs decoded at once.
+            int workers = Math.Max(1, Math.Min(Math.Min(Environment.ProcessorCount, 6), files.Count));
+            var tasks = new Task<bool>[workers];
+            for (int w = 0; w < workers; w++)
+                tasks[w] = Renderer.RunSta(() =>
+                {
+                    int i;
+                    while ((i = Interlocked.Increment(ref next)) < files.Count)
+                    {
+                        try { results[i] = ReadInfo(files[i]); }
+                        catch (Exception ex) { errors[i] = $"{System.IO.Path.GetFileName(files[i])}: {ex.Message}"; }
+                        progress?.Invoke(Interlocked.Increment(ref done));
+                    }
+                    return true;
+                });
+            await Task.WhenAll(tasks);
+            return (results.Where(r => r != null).ToList(), errors.Where(e => e != null).ToList());
+        }
 
         /// <summary>Reads dimensions and EXIF orientation, then loads a small thumbnail.</summary>
         public static ImageItem ReadInfo(string path)
@@ -128,7 +178,7 @@ namespace RulZImageGrid
                 PixelH = h,
                 Orientation = orient,
             };
-            double s = Math.Min(1.0, 800.0 / Math.Max(w, h));
+            double s = Math.Min(1.0, (double)ThumbSide / Math.Max(w, h));
             item.Thumb = Load(path, orient, s < 1 ? Math.Max(1, (int)Math.Round(w * s)) : 0);
             return item;
         }

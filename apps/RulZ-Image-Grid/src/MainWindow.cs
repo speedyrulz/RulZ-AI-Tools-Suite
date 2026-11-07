@@ -3,11 +3,14 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Media.Imaging;
 using System.Windows.Shapes;
+using System.Windows.Threading;
 using Microsoft.Win32;
 
 namespace RulZImageGrid
@@ -31,8 +34,13 @@ namespace RulZImageGrid
         readonly TextBlock statusText = Ui.Dim(new TextBlock { Margin = new Thickness(12, 5, 12, 5), TextTrimming = TextTrimming.CharacterEllipsis });
         readonly Image logoImage = new Image { Height = 22, Margin = new Thickness(2, 0, 10, 0), VerticalAlignment = VerticalAlignment.Center };
         readonly List<Image> tileImages = new List<Image>();
-        Rectangle selRect, dropMarker;
+        Rectangle selRect, dropMarker, fileDropMarker;
         Image ghost;
+
+        // Sharper copies of the tiles on screen, for when they're shown bigger than their small preview.
+        readonly Dictionary<ImageItem, BitmapSource> sharp = new Dictionary<ImageItem, BitmapSource>();
+        readonly DispatcherTimer sharpenTimer;
+        CancellationTokenSource sharpenCancel;
 
         // settings controls
         IntBox columnsBox, paddingBox, captionFontBox, labelFontBox;
@@ -42,7 +50,7 @@ namespace RulZImageGrid
 
         // state
         int selected = -1;
-        bool autoFit = true, suppressZoom, userSized;
+        bool autoFit = true, suppressZoom, userSized, rebuildPending;
         int dragIndex = -1;
         bool dragging;
         Point dragStart;
@@ -160,6 +168,10 @@ namespace RulZImageGrid
             scroller.SetResourceReference(BackgroundProperty, "Workspace");
             scroller.SizeChanged += (s, e) => { if (autoFit) FitZoom(); };
             scroller.PreviewMouseWheel += Scroller_PreviewMouseWheel;
+            sharpenTimer = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(200) };
+            sharpenTimer.Tick += (s, e) => RefreshSharpness();
+            scroller.ScrollChanged += (s, e) => ScheduleSharpen(); // scrolling, zooming and resizing all land here
+            DpiChanged += (s, e) => ScheduleSharpen();
 
             // A dashed drop zone with the logo, shown until images are added.
             var dash = new Rectangle { StrokeThickness = 2, StrokeDashArray = new DoubleCollection { 4, 3 }, RadiusX = 12, RadiusY = 12 };
@@ -194,10 +206,16 @@ namespace RulZImageGrid
             canvas.LostMouseCapture += (s, e) => { if (dragIndex >= 0) EndDrag(); };
 
             DragOver += Window_DragOver;
+            DragLeave += (s, e) => ShowFileDropMarker(-1);
             Drop += Window_Drop;
             PreviewKeyDown += Window_PreviewKeyDown;
             Theme.Changed += OnThemeChanged;
-            Closed += (s, e) => Theme.Changed -= OnThemeChanged;
+            Closed += (s, e) =>
+            {
+                Theme.Changed -= OnThemeChanged;
+                sharpenTimer.Stop();
+                sharpenCancel?.Cancel();
+            };
 
             SetZoom(1, false);
             Rebuild();
@@ -225,10 +243,10 @@ namespace RulZImageGrid
 
             p.Children.Add(Ui.Section("Grid"));
             columnsBox = new IntBox(S.Columns, 1, 100);
-            columnsBox.ValueChanged += v => { S.Columns = v; Rebuild(); };
+            columnsBox.ValueChanged += v => { S.Columns = v; RequestRebuild(); };
             p.Children.Add(Ui.Row("Columns", columnsBox));
             paddingBox = new IntBox(S.Padding, 0, 5000, 2);
-            paddingBox.ValueChanged += v => { S.Padding = v; userSized = true; Rebuild(); };
+            paddingBox.ValueChanged += v => { S.Padding = v; userSized = true; RequestRebuild(); };
             p.Children.Add(Ui.Row("Padding (px)", paddingBox));
 
             bgCombo = new ComboBox { Width = 150 };
@@ -239,52 +257,52 @@ namespace RulZImageGrid
                 var b = Backgrounds[bgCombo.SelectedIndex];
                 S.Background = b.Color;
                 S.Transparent = b.Transparent;
-                Rebuild();
+                RequestRebuild();
             };
             p.Children.Add(Ui.Row("Background", bgCombo));
 
             textColorCombo = new ComboBox { Width = 150 };
             foreach (var t in new[] { "Auto", "Black", "White", "Gray" }) textColorCombo.Items.Add(t);
             textColorCombo.SelectedIndex = 0;
-            textColorCombo.SelectionChanged += (s, e) => { S.TextColorMode = textColorCombo.SelectedIndex; Rebuild(); };
+            textColorCombo.SelectionChanged += (s, e) => { S.TextColorMode = textColorCombo.SelectedIndex; RequestRebuild(); };
             p.Children.Add(Ui.Row("Text color", textColorCombo));
 
-            upscaleCheck = Check("Enlarge smaller images to fill tiles", S.Upscale, v => { S.Upscale = v; Rebuild(); });
+            upscaleCheck = Check("Enlarge smaller images to fill tiles", S.Upscale, v => { S.Upscale = v; RequestRebuild(); });
             p.Children.Add(upscaleCheck);
 
             p.Children.Add(Ui.Section("File names"));
-            captionsCheck = Check("Show file name under each image", S.ShowCaptions, v => { S.ShowCaptions = v; Rebuild(); });
+            captionsCheck = Check("Show file name under each image", S.ShowCaptions, v => { S.ShowCaptions = v; RequestRebuild(); });
             p.Children.Add(captionsCheck);
             captionFontBox = new IntBox((int)S.CaptionFont, 4, 2000, 2);
-            captionFontBox.ValueChanged += v => { S.CaptionFont = v; userSized = true; Rebuild(); };
+            captionFontBox.ValueChanged += v => { S.CaptionFont = v; userSized = true; RequestRebuild(); };
             p.Children.Add(Ui.Row("File name size (px)", captionFontBox));
 
             p.Children.Add(Ui.Section("Row & column labels"));
-            colLabelsCheck = Check("Show column labels", S.ShowColLabels, v => { S.ShowColLabels = v; Rebuild(); });
+            colLabelsCheck = Check("Show column labels", S.ShowColLabels, v => { S.ShowColLabels = v; RequestRebuild(); });
             p.Children.Add(colLabelsCheck);
-            rowLabelsCheck = Check("Show row labels", S.ShowRowLabels, v => { S.ShowRowLabels = v; Rebuild(); });
+            rowLabelsCheck = Check("Show row labels", S.ShowRowLabels, v => { S.ShowRowLabels = v; RequestRebuild(); });
             p.Children.Add(rowLabelsCheck);
             labelFontBox = new IntBox((int)S.LabelFont, 4, 2000, 2);
-            labelFontBox.ValueChanged += v => { S.LabelFont = v; userSized = true; Rebuild(); };
+            labelFontBox.ValueChanged += v => { S.LabelFont = v; userSized = true; RequestRebuild(); };
             p.Children.Add(Ui.Row("Label size (px)", labelFontBox));
 
             p.Children.Add(new TextBlock { Text = "Column labels (one per line, left → right)", Margin = new Thickness(0, 8, 0, 3) });
             colLabelsBox = LabelsBox();
-            colLabelsBox.TextChanged += (s, e) => { S.ColLabels = SplitLines(colLabelsBox.Text); Rebuild(); };
+            colLabelsBox.TextChanged += (s, e) => { S.ColLabels = SplitLines(colLabelsBox.Text); RequestRebuild(); };
             p.Children.Add(colLabelsBox);
             p.Children.Add(new TextBlock { Text = "Row labels (one per line, top → bottom)", Margin = new Thickness(0, 8, 0, 3) });
             rowLabelsBox = LabelsBox();
-            rowLabelsBox.TextChanged += (s, e) => { S.RowLabels = SplitLines(rowLabelsBox.Text); Rebuild(); };
+            rowLabelsBox.TextChanged += (s, e) => { S.RowLabels = SplitLines(rowLabelsBox.Text); RequestRebuild(); };
             p.Children.Add(rowLabelsBox);
             p.Children.Add(Ui.Dim(new TextBlock
             {
-                Text = "Tip: double-click a label on the grid to edit it.",
+                Text = "Tip: double-click a label on the grid to edit it. Labels left empty take no space in the saved image.",
                 FontSize = 12,
                 Margin = new Thickness(0, 4, 0, 0),
                 TextWrapping = TextWrapping.Wrap,
             }));
 
-            var auto = Ui.Button("Auto-size text & padding", (s, e) => { AutoSize(); Rebuild(); });
+            var auto = Ui.Button("Auto-size text & padding", (s, e) => { AutoSize(); RequestRebuild(); });
             auto.Margin = new Thickness(0, 14, 0, 0);
             p.Children.Add(auto);
 
@@ -328,14 +346,27 @@ namespace RulZImageGrid
 
         // ───────────────────────── rendering the editor ─────────────────────────
 
+        /// <summary>
+        /// Rebuilds once pending input has been handled, so typing in a label box or holding a spin button on a
+        /// big grid runs one rebuild for the burst instead of one per keystroke.
+        /// </summary>
+        void RequestRebuild()
+        {
+            if (rebuildPending) return;
+            rebuildPending = true;
+            Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() => { if (rebuildPending) Rebuild(); }));
+        }
+
         void Rebuild()
         {
             if (canvasHolder == null) return; // still constructing
+            rebuildPending = false;
             layout = GridLayout.Compute(S, items.Select(i => new Size(i.PixelW, i.PixelH)).ToList());
             canvas.Children.Clear();
             tileImages.Clear();
-            selRect = dropMarker = null;
+            selRect = dropMarker = fileDropMarker = null;
             ghost = null;
+            ScheduleSharpen();
 
             bool empty = items.Count == 0;
             emptyHint.Visibility = empty ? Visibility.Visible : Visibility.Collapsed;
@@ -353,7 +384,7 @@ namespace RulZImageGrid
             {
                 var it = items[i];
                 var r = layout.ImageRect(i, it.PixelW, it.PixelH);
-                var img = new Image { Source = it.Thumb, Width = r.Width, Height = r.Height, Stretch = Stretch.Fill };
+                var img = new Image { Source = SourceFor(it), Width = r.Width, Height = r.Height, Stretch = Stretch.Fill };
                 RenderOptions.SetBitmapScalingMode(img, BitmapScalingMode.HighQuality);
                 Place(img, r.X, r.Y);
                 tileImages.Add(img);
@@ -470,10 +501,12 @@ namespace RulZImageGrid
                 infoText.Text = "No images yet.";
                 return;
             }
+            // The saved image can be smaller than the editor's canvas: empty label sets take no space in it.
+            var saved = GridLayout.Compute(S.ForExport(items.Count), items.Select(i => new Size(i.PixelW, i.PixelH)).ToList());
             infoText.Text =
                 $"{items.Count} image{(items.Count == 1 ? "" : "s")} · {layout.Cols} × {layout.Rows} grid\n" +
                 $"Tile: {layout.CellW:0} × {layout.CellH:0} px\n" +
-                $"Full-size output: {Math.Round(layout.Width):N0} × {Math.Round(layout.Height):N0} px";
+                $"Full-size output: {Math.Round(saved.Width):N0} × {Math.Round(saved.Height):N0} px";
         }
 
         // ───────────────────────── zoom ─────────────────────────
@@ -490,6 +523,7 @@ namespace RulZImageGrid
             zoomText.Text = $"{z * 100:0.#}%";
             if (fromUser) autoFit = false;
             UpdateStrokes();
+            ScheduleSharpen();
         }
 
         void FitZoom()
@@ -517,6 +551,87 @@ namespace RulZImageGrid
                 PositionOutline(selRect, selected, t);
             }
             if (dropMarker != null) dropMarker.StrokeThickness = t;
+        }
+
+        // ───────────────────────── sharper tiles when zoomed in ─────────────────────────
+        // Each image keeps only a small preview (ImageLoader.ThumbSide). Tiles near the visible area that are shown
+        // bigger than their preview get a sharper copy loaded in the background; the copy is dropped again when
+        // the tile scrolls away or shrinks, so memory stays around one screenful.
+
+        BitmapSource SourceFor(ImageItem it) => sharp.TryGetValue(it, out var b) ? b : it.Thumb;
+
+        void ScheduleSharpen()
+        {
+            if (sharpenTimer == null) return; // still constructing
+            sharpenTimer.Stop();
+            sharpenTimer.Start();
+        }
+
+        void SetTileSource(ImageItem it, BitmapSource src)
+        {
+            int i = items.IndexOf(it);
+            if (i >= 0 && i < tileImages.Count) tileImages[i].Source = src;
+        }
+
+        void RefreshSharpness()
+        {
+            sharpenTimer.Stop();
+            var want = new Dictionary<ImageItem, int>(); // tile → on-screen width in device pixels
+            if (layout != null && items.Count > 0 && canvasHolder.IsVisible && scroller.ViewportWidth > 0)
+            {
+                Rect view;
+                try
+                {
+                    view = scroller.TransformToDescendant(canvas)
+                        .TransformBounds(new Rect(0, 0, scroller.ViewportWidth, scroller.ViewportHeight));
+                }
+                catch (InvalidOperationException) { return; }
+                view.Inflate(view.Width * 0.25, view.Height * 0.25); // load a little ahead of scrolling
+                double dpi = VisualTreeHelper.GetDpi(this).DpiScaleX;
+                for (int i = 0; i < items.Count; i++)
+                {
+                    var it = items[i];
+                    var r = layout.ImageRect(i, it.PixelW, it.PixelH);
+                    if (!r.IntersectsWith(view) || it.Thumb == null || it.Thumb.PixelWidth >= it.PixelW) continue;
+                    int need = (int)Math.Ceiling(r.Width * Zoom * dpi);
+                    if (need > it.Thumb.PixelWidth) want[it] = need;
+                }
+            }
+
+            foreach (var it in sharp.Keys.Where(k => !want.ContainsKey(k)).ToList())
+            {
+                sharp.Remove(it);
+                SetTileSource(it, it.Thumb);
+            }
+
+            // Load with headroom so the next few zoom steps don't each need a reload; swap a copy that's far bigger
+            // than needed (after zooming out a lot) for a smaller one.
+            var jobs = want
+                .Where(kv => !sharp.TryGetValue(kv.Key, out var b) || b.PixelWidth < kv.Value || b.PixelWidth > kv.Value * 4)
+                .Select(kv => (item: kv.Key, width: Math.Min(kv.Key.PixelW, (int)Math.Ceiling(kv.Value * 1.5))))
+                .ToList();
+            sharpenCancel?.Cancel();
+            sharpenCancel = null;
+            if (jobs.Count == 0) return;
+            var cts = sharpenCancel = new CancellationTokenSource();
+            var cancel = cts.Token;
+            Renderer.RunSta(() =>
+            {
+                foreach (var (item, width) in jobs)
+                {
+                    if (cancel.IsCancellationRequested) break;
+                    BitmapSource bmp;
+                    try { bmp = ImageLoader.Load(item.Path, item.Orientation, width >= item.PixelW ? 0 : width); }
+                    catch (Exception) { continue; } // moved or unreadable since it was added: keep the preview
+                    Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        if (cancel.IsCancellationRequested || !items.Contains(item)) return;
+                        sharp[item] = bmp;
+                        SetTileSource(item, bmp);
+                    }));
+                }
+                return true;
+            });
         }
 
         // ───────────────────────── selection ─────────────────────────
@@ -605,7 +720,17 @@ namespace RulZImageGrid
             Panel.SetZIndex(ghost, 100);
             canvas.Children.Add(ghost);
 
-            dropMarker = new Rectangle
+            dropMarker = NewDropMarker();
+            canvas.Children.Add(dropMarker);
+            tileImages[dragIndex].Opacity = 0.3;
+            if (selRect != null) selRect.Visibility = Visibility.Collapsed;
+            Cursor = Cursors.SizeAll;
+        }
+
+        /// <summary>The dashed red slot outline shown where a dragged tile or dropped files will go.</summary>
+        Rectangle NewDropMarker()
+        {
+            var r = new Rectangle
             {
                 Stroke = Ui.Red,
                 StrokeThickness = 3 / Zoom,
@@ -613,11 +738,8 @@ namespace RulZImageGrid
                 Fill = Ui.Frozen(Color.FromArgb(0x30, 237, 0, 13)),
                 IsHitTestVisible = false,
             };
-            Panel.SetZIndex(dropMarker, 90);
-            canvas.Children.Add(dropMarker);
-            tileImages[dragIndex].Opacity = 0.3;
-            if (selRect != null) selRect.Visibility = Visibility.Collapsed;
-            Cursor = Cursors.SizeAll;
+            Panel.SetZIndex(r, 90);
+            return r;
         }
 
         void AutoScroll(Point p)
@@ -692,26 +814,56 @@ namespace RulZImageGrid
 
         void Window_DragOver(object sender, DragEventArgs e)
         {
-            e.Effects = e.Data.GetDataPresent(DataFormats.FileDrop) ? DragDropEffects.Copy : DragDropEffects.None;
+            bool files = e.Data.GetDataPresent(DataFormats.FileDrop);
+            e.Effects = files ? DragDropEffects.Copy : DragDropEffects.None;
             e.Handled = true;
+            ShowFileDropMarker(files ? FileDropIndex(e) : -1);
         }
 
         void Window_Drop(object sender, DragEventArgs e)
         {
+            ShowFileDropMarker(-1);
             if (!(e.Data.GetData(DataFormats.FileDrop) is string[] paths)) return;
-            int insertAt = -1;
-            if (items.Count > 0 && canvas.IsMouseOver)
-                insertAt = layout.DropIndex(e.GetPosition(canvas), items.Count);
-            AddFiles(paths, insertAt);
+            AddFiles(paths, FileDropIndex(e));
+        }
+
+        /// <summary>
+        /// The grid slot dropped files go into, or -1 (the end) when they aren't dropped on the grid. Uses the
+        /// element the drop lands on: IsMouseOver isn't updated while files are dragged in from another app.
+        /// </summary>
+        int FileDropIndex(DragEventArgs e)
+        {
+            if (items.Count == 0 || layout == null || !(e.OriginalSource is Visual v)) return -1;
+            if (v != canvas && !canvas.IsAncestorOf(v)) return -1;
+            return layout.DropIndex(e.GetPosition(canvas), items.Count);
+        }
+
+        void ShowFileDropMarker(int idx)
+        {
+            if (idx < 0)
+            {
+                if (fileDropMarker != null) fileDropMarker.Visibility = Visibility.Collapsed;
+                return;
+            }
+            if (fileDropMarker == null)
+            {
+                fileDropMarker = NewDropMarker();
+                canvas.Children.Add(fileDropMarker);
+            }
+            fileDropMarker.Visibility = Visibility.Visible;
+            fileDropMarker.StrokeThickness = 3 / Zoom;
+            PositionOutline(fileDropMarker, idx, fileDropMarker.StrokeThickness);
         }
 
         public async void AddFiles(IEnumerable<string> paths, int insertAt = -1)
         {
+            var natural = new NaturalComparer();
             var files = new List<string>();
             foreach (var p in paths)
             {
                 if (Directory.Exists(p))
-                    files.AddRange(Directory.GetFiles(p).Where(ImageLoader.IsImage).OrderBy(f => f, StringComparer.CurrentCultureIgnoreCase));
+                    files.AddRange(Directory.GetFiles(p).Where(ImageLoader.IsImage)
+                        .OrderBy(f => System.IO.Path.GetFileName(f), natural)); // img2 before img10, like Sort A–Z
                 else if (File.Exists(p) && ImageLoader.IsImage(p))
                     files.Add(p);
             }
@@ -723,16 +875,11 @@ namespace RulZImageGrid
 
             statusText.Text = $"Loading {files.Count} image{(files.Count == 1 ? "" : "s")}…";
             Cursor = Cursors.Wait;
-            var result = await Renderer.RunSta(() =>
+            int step = Math.Max(1, files.Count / 50); // about 50 progress updates at most
+            var result = await ImageLoader.ReadInfoMany(files, done =>
             {
-                var ok = new List<ImageItem>();
-                var failed = new List<string>();
-                foreach (var f in files)
-                {
-                    try { ok.Add(ImageLoader.ReadInfo(f)); }
-                    catch (Exception ex) { failed.Add($"{System.IO.Path.GetFileName(f)}: {ex.Message}"); }
-                }
-                return (ok, failed);
+                if (done % step == 0 && done < files.Count)
+                    Dispatcher.BeginInvoke(new Action(() => statusText.Text = $"Loading images… {done} of {files.Count}"));
             });
             Cursor = null;
 
@@ -791,7 +938,7 @@ namespace RulZImageGrid
                 MessageBox.Show(this, "Add some images first.", "RulZ Image Grid", MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
             }
-            var win = new ExportWindow(this, S.Clone(), items.ToList());
+            var win = new ExportWindow(this, S.ForExport(items.Count), items.ToList());
             if (win.ShowDialog() == true)
                 statusText.Text = $"Saved {win.SavedSize} image to {win.SavedPath}";
         }

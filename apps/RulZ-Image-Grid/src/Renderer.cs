@@ -7,14 +7,19 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 
 namespace RulZImageGrid
 {
     public static class Renderer
     {
-        /// <summary>Renders the grid to a bitmap. Loads each source image at exactly the size it needs.</summary>
+        /// <summary>
+        /// Renders the grid to a bitmap. Loads each source image at exactly the size it needs, or with
+        /// <paramref name="useThumbs"/> uses the in-memory preview of any image whose preview is big enough
+        /// (for the export dialog's preview, so it doesn't re-read every file).
+        /// </summary>
         public static BitmapSource Render(GridSettings s, IList<ImageItem> items, double scale, bool forceOpaque,
-            Action<string> progress)
+            Action<string> progress, bool useThumbs = false, CancellationToken cancel = default)
         {
             var layout = GridLayout.Compute(s, items.Select(i => new Size(i.PixelW, i.PixelH)).ToList());
             int w = Math.Max(1, (int)Math.Round(layout.Width * scale));
@@ -31,11 +36,14 @@ namespace RulZImageGrid
 
                 for (int i = 0; i < items.Count; i++)
                 {
+                    cancel.ThrowIfCancellationRequested();
                     progress?.Invoke($"Loading image {i + 1} of {items.Count}…");
                     var it = items[i];
                     var r = layout.ImageRect(i, it.PixelW, it.PixelH);
                     int target = Math.Max(1, (int)Math.Ceiling(r.Width * scale));
-                    var bmp = ImageLoader.Load(it.Path, it.Orientation, target < it.PixelW ? target : 0);
+                    var bmp = useThumbs && it.Thumb != null && it.Thumb.PixelWidth >= target
+                        ? it.Thumb
+                        : ImageLoader.Load(it.Path, it.Orientation, target < it.PixelW ? target : 0);
                     dc.DrawImage(bmp, r);
 
                     if (s.ShowCaptions)
@@ -101,10 +109,29 @@ namespace RulZImageGrid
                                     : new FormatConvertedBitmap(bmp, PixelFormats.Bgr24, null, 0);
                 enc.Frames.Add(BitmapFrame.Create(src));
             }
+            // Write to a temporary file first so a failed save never leaves a half-written image, and swap it in
+            // with File.Replace so an existing file is only replaced once the new one is complete.
             var tmp = path + ".tmp";
-            using (var fs = File.Create(tmp)) enc.Save(fs);
-            if (File.Exists(path)) File.Delete(path);
-            File.Move(tmp, path);
+            try
+            {
+                using (var fs = File.Create(tmp)) enc.Save(fs);
+                if (!File.Exists(path)) File.Move(tmp, path);
+                else
+                {
+                    try { File.Replace(tmp, path, null, true); }
+                    catch (IOException) // e.g. a file system without ReplaceFile support
+                    {
+                        File.Delete(path);
+                        File.Move(tmp, path);
+                    }
+                }
+            }
+            finally
+            {
+                try { if (File.Exists(tmp)) File.Delete(tmp); }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
         }
 
         static SolidColorBrush Frozen(Color c)
@@ -122,6 +149,9 @@ namespace RulZImageGrid
             {
                 try { tcs.SetResult(work()); }
                 catch (Exception ex) { tcs.SetException(ex); }
+                // WPF gives the thread a dispatcher (with a hidden window and render resources) the first time it
+                // touches WPF objects. Shut it down, or every call leaks about a dozen handles and some memory.
+                finally { Dispatcher.FromThread(Thread.CurrentThread)?.InvokeShutdown(); }
             });
             t.SetApartmentState(ApartmentState.STA);
             t.IsBackground = true;

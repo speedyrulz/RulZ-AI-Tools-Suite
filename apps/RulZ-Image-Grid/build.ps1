@@ -1,5 +1,7 @@
 # Builds "RulZ Image Grid.exe" into .\bin using the Roslyn C# compiler that ships with
 # Visual Studio / Build Tools, targeting the .NET Framework 4.8 built into Windows 10/11.
+# Pass -Test to also build and run the tests in tests\ first.
+param([switch]$Test)
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 
@@ -30,6 +32,15 @@ $refs = @(
 ) | ForEach-Object { "-r:$_" }
 $sources = Get-ChildItem (Join-Path $root 'src') -Filter *.cs | ForEach-Object { $_.FullName }
 $exe = Join-Path $out 'RulZ Image Grid.exe'
+
+if ($Test) {
+    $testExe = Join-Path $out 'ImageGridTests.exe'
+    & $csc -nologo -target:exe -platform:anycpu -optimize+ -langversion:latest -main:ImageGridTests `
+        "-out:$testExe" $refs $sources (Join-Path $root 'tests\ImageGridTests.cs')
+    if ($LASTEXITCODE -ne 0) { throw "Test build failed ($LASTEXITCODE)" }
+    & $testExe
+    if ($LASTEXITCODE -ne 0) { throw "Tests failed ($LASTEXITCODE)" }
+}
 
 $assets = Join-Path $root 'assets'
 $resources = @(
