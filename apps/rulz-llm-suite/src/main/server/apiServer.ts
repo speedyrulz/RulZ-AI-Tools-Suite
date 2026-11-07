@@ -12,17 +12,16 @@ import {
   hoistSystemMessages,
   overrideSampling,
   parseRemoteLoadPatch,
-  parseUsage,
   pickModel,
   publicModelId,
   remoteLoadView,
   resolveModel,
-  SAMPLING_PATHS
+  SAMPLING_PATHS,
+  UsageReader
 } from './helpers'
 
 const MAX_BODY_BYTES = 64 * 1024 * 1024
 const MAX_LOG = 300
-const USAGE_TAIL_BYTES = 16 * 1024
 const IDLE_CHECK_MS = 15_000
 
 /** Paths proxied to a model's llama-server as-is. Everything else under /v1 is rejected. */
@@ -74,7 +73,8 @@ export class ApiServer {
   private server: http.Server | null = null
   private status: ApiServerStatus = { running: false, host: '127.0.0.1', port: 1234, requestCount: 0, jitInstances: [] }
   private log: ApiRequestLog[] = []
-  private jit = new Map<string, number>() // instanceId → last used
+  /** Instances the server loaded itself (and so may unload when idle) → when it last used them. */
+  private jit = new Map<string, number>()
   private idleTimer: NodeJS.Timeout | null = null
   private loading = new Map<string, Promise<LoadedInstance>>()
 
@@ -163,7 +163,9 @@ export class ApiServer {
 
     const entry: ApiRequestLog = { id: randomUUID(), at: Date.now(), method, path, phase: 'running' }
     this.status.requestCount++
+    // The first outcome sticks: an upstream error that follows a client disconnect stays a 499.
     const finish = (status: number, error?: string): void => {
+      if (entry.phase === 'done') return
       entry.status = status
       entry.durationMs = Date.now() - entry.at
       entry.error = error
@@ -178,6 +180,16 @@ export class ApiServer {
     if (!authorized(settings.apiKey, req.headers as Record<string, string>)) {
       return fail(401, 'Invalid API key.', 'authentication_error')
     }
+
+    // Watched from the start, so a client that leaves while its model loads is noticed too.
+    let clientGone = false
+    let onClientGone: (() => void) | null = null
+    res.on('close', () => {
+      if (res.writableFinished) return
+      clientGone = true
+      finish(499, 'Client disconnected')
+      onClientGone?.()
+    })
 
     try {
       if (method === 'GET' && (path === '/' || path === '/health')) {
@@ -233,20 +245,29 @@ export class ApiServer {
       }
 
       let body: Buffer | null = null
+      // The body parsed once; written back to `body` only if something in it was changed.
+      let json: Record<string, unknown> | null = null
+      let rewritten = false
       let requestedModel: string | undefined
       let stream = false
       if (method === 'POST' && PROXY_POST.has(path)) {
         body = await readBody(req)
+        let parsed: unknown
         try {
-          const json = JSON.parse(body.toString('utf8')) as { model?: unknown; stream?: unknown; system?: unknown; messages?: unknown }
-          if (typeof json.model === 'string') requestedModel = json.model
-          stream = json.stream === true
-          if (path.startsWith('/v1/messages')) {
-            const hoisted = hoistSystemMessages(json)
-            if (hoisted) body = Buffer.from(JSON.stringify(hoisted), 'utf8')
-          }
+          parsed = JSON.parse(body.toString('utf8'))
         } catch {
           return fail(400, 'The request body is not valid JSON.')
+        }
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return fail(400, 'The request body must be a JSON object.')
+        json = parsed as Record<string, unknown>
+        if (typeof json.model === 'string') requestedModel = json.model
+        stream = json.stream === true
+        if (path.startsWith('/v1/messages')) {
+          const hoisted = hoistSystemMessages(json)
+          if (hoisted) {
+            json = hoisted
+            rewritten = true
+          }
         }
       } else if (method === 'GET' && PROXY_GET.has(path)) {
         requestedModel = url.searchParams.get('model') ?? undefined
@@ -276,20 +297,31 @@ export class ApiServer {
         try {
           inst = await this.ensureLoaded(model.id)
         } catch (err) {
+          if (clientGone) return
           return fail(503, `Could not load ${model.name}: ${(err as Error).message}`, 'server_error')
         }
+        // Nobody is waiting for the answer any more; don't make the model generate it.
+        if (clientGone) return
         entry.phase = 'running'
       }
-      this.jit.has(inst.instanceId) && this.jit.set(inst.instanceId, Date.now())
-      this.emit()
+      if (clientGone) return
 
-      if (body && inst.config.sampling.override && SAMPLING_PATHS.has(path)) {
-        const json = JSON.parse(body.toString('utf8')) as unknown
-        if (json && typeof json === 'object' && !Array.isArray(json)) {
-          body = Buffer.from(JSON.stringify(overrideSampling(json as Record<string, unknown>, inst.config.sampling)))
-        }
+      if (json && inst.config.sampling.override && SAMPLING_PATHS.has(path)) {
+        json = overrideSampling(json, inst.config.sampling)
+        rewritten = true
       }
-      await this.proxy(req, res, inst, path + url.search, body, stream, entry, finish)
+      if (json && rewritten) body = Buffer.from(JSON.stringify(json), 'utf8')
+
+      // Held for the whole request, however long the stream runs, so idle-unload can't stop the model under it.
+      const release = this.deps.instances.acquire(inst.instanceId)
+      if (this.jit.has(inst.instanceId)) this.jit.set(inst.instanceId, Date.now())
+      this.emit()
+      try {
+        await this.proxy(req, res, inst, path + url.search, body, entry, finish, (abort) => (onClientGone = abort))
+      } finally {
+        release()
+        this.touch(inst.instanceId)
+      }
     } catch (err) {
       if (!res.headersSent) fail(500, (err as Error).message, 'server_error')
       else finish(res.statusCode, (err as Error).message)
@@ -302,9 +334,10 @@ export class ApiServer {
     inst: LoadedInstance,
     pathWithQuery: string,
     body: Buffer | null,
-    stream: boolean,
     entry: ApiRequestLog,
-    finish: (status: number, error?: string) => void
+    finish: (status: number, error?: string) => void,
+    /** Registers what to do if the client disconnects mid-request. */
+    onClientGone: (abort: () => void) => void
   ): Promise<void> {
     return new Promise((resolve) => {
       const headers: Record<string, string> = { host: `127.0.0.1:${inst.port}` }
@@ -321,18 +354,17 @@ export class ApiServer {
             if (v !== undefined && !['connection', 'keep-alive', 'transfer-encoding', 'access-control-allow-origin'].includes(k)) out[k] = v
           }
           res.writeHead(ures.statusCode ?? 502, out)
-          // Keep the tail of the response to read token usage from it.
-          let tail = ''
+          // What the model server sent decides how usage is read: an error to a streamed request is plain JSON.
+          const sse = /text\/event-stream/i.test(String(ures.headers['content-type'] ?? ''))
+          const usage = new UsageReader(sse)
           ures.on('data', (chunk: Buffer) => {
             res.write(chunk)
-            tail = (tail + chunk.toString('utf8')).slice(-USAGE_TAIL_BYTES)
-            if (stream && typeof (res as { flush?: () => void }).flush === 'function') (res as { flush?: () => void }).flush?.()
+            usage.push(chunk)
           })
           ures.on('end', () => {
             res.end()
-            Object.assign(entry, parseUsage(tail, stream))
-            this.touch(inst.instanceId)
-            finish(ures.statusCode ?? 502, ures.statusCode && ures.statusCode >= 400 ? errorMessageFrom(tail) : undefined)
+            Object.assign(entry, usage.end())
+            finish(ures.statusCode ?? 502, ures.statusCode && ures.statusCode >= 400 ? errorMessageFrom(usage.text()) : undefined)
             resolve()
           })
           ures.on('error', (err) => {
@@ -349,14 +381,9 @@ export class ApiServer {
         resolve()
       })
       // A client that disconnects mid-stream stops generation on the model server too.
-      res.on('close', () => {
-        if (!res.writableFinished) {
-          upstream.destroy()
-          if (entry.phase !== 'done') {
-            finish(499, 'Client disconnected')
-            resolve()
-          }
-        }
+      onClientGone(() => {
+        upstream.destroy()
+        resolve()
       })
       if (body) upstream.end(body)
       else upstream.end()
@@ -365,15 +392,22 @@ export class ApiServer {
 
   // ---------- models ----------
 
+  /**
+   * The model's instance for a request. One that is already loaded or loading (by the UI, say) is
+   * used as it is, whatever its settings, and stays the user's: only a load started here is
+   * unloaded again when idle.
+   */
   private ensureLoaded(modelId: string): Promise<LoadedInstance> {
     let p = this.loading.get(modelId)
     if (!p) {
       p = this.deps.instances
-        .load(modelId, null)
-        .then((inst) => {
-          this.jit.set(inst.instanceId, Date.now())
-          this.emit()
-          return inst
+        .ensure(modelId)
+        .then(({ instance, started }) => {
+          if (started) {
+            this.jit.set(instance.instanceId, Date.now())
+            this.emit()
+          }
+          return instance
         })
         .finally(() => this.loading.delete(modelId))
       this.loading.set(modelId, p)
@@ -420,17 +454,21 @@ export class ApiServer {
     if (!minutes) return
     const cutoff = Date.now() - minutes * 60_000
     const live = new Set(this.deps.instances.list().map((i) => i.instanceId))
-    for (const [instanceId, lastUsed] of [...this.jit]) {
+    let changed = false
+    for (const instanceId of [...this.jit.keys()]) {
       if (!live.has(instanceId)) {
-        this.jit.delete(instanceId)
+        changed = this.jit.delete(instanceId) || changed
         continue
       }
-      if (lastUsed < cutoff) {
-        this.jit.delete(instanceId)
-        await this.deps.instances.unload(instanceId)
-      }
+      // Idle time counts from the last use by anyone (API requests and in-app chats alike); an
+      // instance in use right now is never idle.
+      const since = this.deps.instances.idleSince(instanceId)
+      if (since === null || since >= cutoff) continue
+      this.jit.delete(instanceId)
+      changed = true
+      await this.deps.instances.unload(instanceId)
     }
-    this.emit()
+    if (changed) this.emit()
   }
 
   private listModels(): unknown {

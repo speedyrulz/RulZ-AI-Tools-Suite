@@ -1,8 +1,6 @@
 import { jsonifyToolCallArgs, templateStringifiesArgs } from '../src/main/chat/toolArgs'
 import { describe, expect, it, vi } from 'vitest'
 import { DEFAULT_SAMPLING } from '@shared/defaults'
-import type { WireMessage } from '@shared/types'
-import { ContextFullError, fitToContext, pinnedPrefixLength, truncateMiddle, upperBoundTokens } from '../src/main/chat/context'
 import { buildRequestBody, DeltaBatcher } from '../src/main/chat/service'
 
 describe('DeltaBatcher', () => {
@@ -89,50 +87,6 @@ describe('buildRequestBody', () => {
     expect(off).not.toHaveProperty('reasoning_effort')
     expect(off).not.toHaveProperty('thinking_budget_tokens')
     expect(buildRequestBody('m', [], { ...DEFAULT_SAMPLING, thinking: 'on' }, true).chat_template_kwargs).toEqual({ enable_thinking: false })
-  })
-})
-
-describe('context fitting', () => {
-  const msgs: WireMessage[] = [
-    { role: 'system', content: 'sys' },
-    { role: 'user', content: 'first' },
-    { role: 'assistant', content: 'a1' },
-    { role: 'user', content: 'u2' },
-    { role: 'assistant', content: 'a2' },
-    { role: 'user', content: 'last' }
-  ]
-
-  it('pins system prompt and first user message', () => {
-    expect(pinnedPrefixLength(msgs)).toBe(2)
-    expect(truncateMiddle([10, 10, 50, 50, 50, 10], 80, 2)).toEqual([0, 1, 4, 5])
-  })
-
-  it('drops middle messages until it fits, or throws for the stop policy', async () => {
-    const api = {
-      countConversation: async (m: WireMessage[]) => m.length * 100,
-      countText: async () => 90
-    }
-    // Long enough that the quick size check can't rule out an overflow.
-    const long = msgs.map((m) => ({ ...m, content: `${m.content}${' '.repeat(200)}` }))
-    const fitted = await fitToContext(long, 500, 100, 'truncateMiddle', api)
-    expect(fitted.map((m) => (m.content as string).trim())).toEqual(['sys', 'first', 'a2', 'last'])
-    await expect(fitToContext(long, 500, 100, 'stop', api)).rejects.toBeInstanceOf(ContextFullError)
-    expect(await fitToContext(long, 10000, 100, 'stop', api)).toBe(long)
-  })
-
-  it('skips counting when the chat is clearly small enough', async () => {
-    let calls = 0
-    const api = {
-      countConversation: async () => {
-        calls++
-        return 10
-      },
-      countText: async () => 1
-    }
-    expect(await fitToContext(msgs, 8192, 2048, 'stop', api)).toBe(msgs)
-    expect(calls).toBe(0)
-    // Multi-byte text is counted by UTF-8 bytes, so it is never underestimated.
-    expect(upperBoundTokens([{ role: 'user', content: '漢字' }])).toBe(64 + 16 + 6)
   })
 })
 

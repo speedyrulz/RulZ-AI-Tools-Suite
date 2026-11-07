@@ -1,6 +1,6 @@
 import * as Collapsible from '@radix-ui/react-collapsible'
 import { ChevronRight, Copy, Ellipsis, Folder, FolderInput, FolderPlus, Pencil, Pin, PinOff, Plus, Search, Trash2 } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import type { ConversationSummary } from '@shared/types'
 import { cn, relativeTime } from '../../lib/format'
 import { useChat } from '../../stores/chat'
@@ -133,6 +133,7 @@ function ChatRow({ summary, folders }: { summary: ConversationSummary; folders: 
   const generatingId = useChat((s) => s.generation?.conversationId)
   const { open, rename, togglePin, duplicate, remove } = useChat.getState()
   const [renaming, setRenaming] = useState(false)
+  const cancelRename = useRef(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [moving, setMoving] = useState(false)
   const active = currentId === summary.id
@@ -167,12 +168,18 @@ function ChatRow({ summary, folders }: { summary: ConversationSummary; folders: 
             className="h-6 min-w-0 flex-1 rounded border border-accent bg-panel-2 px-1.5 text-[13px] focus:outline-none"
             onClick={(e) => e.stopPropagation()}
             onBlur={(e) => {
-              void rename(summary.id, e.target.value)
+              if (!cancelRename.current) void rename(summary.id, e.target.value)
+              cancelRename.current = false
               setRenaming(false)
             }}
             onKeyDown={(e) => {
               if (e.key === 'Enter') e.currentTarget.blur()
-              if (e.key === 'Escape') setRenaming(false)
+              if (e.key === 'Escape') {
+                // Handled here: Esc cancels the rename, it doesn't stop a reply.
+                e.preventDefault()
+                cancelRename.current = true
+                e.currentTarget.blur()
+              }
             }}
           />
         ) : (

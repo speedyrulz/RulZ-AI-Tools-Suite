@@ -4,8 +4,9 @@ import * as SliderPrimitive from '@radix-ui/react-slider'
 import * as SwitchPrimitive from '@radix-ui/react-switch'
 import * as TooltipPrimitive from '@radix-ui/react-tooltip'
 import { X } from 'lucide-react'
-import { forwardRef, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type SelectHTMLAttributes, type TextareaHTMLAttributes } from 'react'
+import { forwardRef, useEffect, useRef, useState, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type SelectHTMLAttributes, type TextareaHTMLAttributes } from 'react'
 import { cn } from '../lib/format'
+import { parseNumberDraft } from '../lib/input'
 
 type Variant = 'primary' | 'secondary' | 'ghost' | 'danger'
 
@@ -319,7 +320,10 @@ export function Field({ label, hint, children, inline }: { label: ReactNode; hin
   )
 }
 
-/** Number input that allows an empty value (mapped to null). */
+/**
+ * Number input that allows an empty value (mapped to null). Typing is kept as a draft and applied on
+ * blur or Enter, so a caller that clamps (say, to at least 512) doesn't rewrite the first digit.
+ */
 export function NumberInput({
   value,
   onChange,
@@ -337,20 +341,34 @@ export function NumberInput({
   step?: number
   className?: string
 }) {
+  // null while not editing: the field then shows `value`, so outside changes (sliders, presets) show at once.
+  const [draft, setDraft] = useState<string | null>(null)
+  // Read by the unmount cleanup, which only sees the first render's values.
+  const latest = useRef({ draft, value, onChange })
+  latest.current = { draft, value, onChange }
+  const commit = (): void => {
+    const { draft: d, value: v, onChange: apply } = latest.current
+    if (d === null) return
+    latest.current.draft = null
+    setDraft(null)
+    const next = parseNumberDraft(d, v)
+    if (next !== undefined) apply(next)
+  }
+  // Switching page (Ctrl+1…5) removes the field without a blur; keep what was typed.
+  useEffect(() => () => commit(), [])
   return (
     <Input
       type="number"
       className={cn('h-7.5 w-24 text-right tabular-nums', className)}
-      value={value ?? ''}
+      value={draft ?? value ?? ''}
       placeholder={placeholder}
       min={min}
       max={max}
       step={step}
-      onChange={(e) => {
-        const raw = e.target.value
-        if (raw === '') return onChange(null)
-        const n = Number(raw)
-        if (Number.isFinite(n)) onChange(n)
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') commit()
       }}
     />
   )

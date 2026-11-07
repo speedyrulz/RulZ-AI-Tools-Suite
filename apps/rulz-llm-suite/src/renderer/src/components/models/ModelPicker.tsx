@@ -46,7 +46,8 @@ function PickerBody({ preselect, onDone }: { preselect: string | null; onDone: (
   const [query, setQuery] = useState('')
   const [selectedId, setSelectedId] = useState<string | null>(preselect ?? activeModelId ?? null)
   const filtered = useMemo(() => models.filter((m) => matches(m, query)), [models, query])
-  const selected = models.find((m) => m.id === selectedId) ?? filtered[0] ?? null
+  // Only from the visible list: Enter must not load a model the search has hidden.
+  const selected = filtered.find((m) => m.id === selectedId) ?? filtered[0] ?? null
   const searchRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {

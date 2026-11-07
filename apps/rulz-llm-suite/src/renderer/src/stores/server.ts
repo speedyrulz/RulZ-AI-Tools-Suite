@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import { toast } from 'sonner'
 import type { ApiRequestLog, ApiServerStatus } from '@shared/types'
 import { errorMessage, invoke, on } from '../lib/api'
+import { once } from '../lib/once'
 
 const MAX_LOG = 300
 
@@ -19,7 +20,7 @@ export const useServer = create<ServerState>((set, get) => ({
   status: null,
   log: [],
   busy: false,
-  init: async () => {
+  init: once(async () => {
     on('server:changed', (status) => set({ status }))
     on('server:request', (entry) => {
       const log = get().log
@@ -29,7 +30,7 @@ export const useServer = create<ServerState>((set, get) => ({
     })
     const [status, log] = await Promise.all([invoke('server:status'), invoke('server:log')])
     set({ status, log })
-  },
+  }),
   start: async () => {
     set({ busy: true })
     try {

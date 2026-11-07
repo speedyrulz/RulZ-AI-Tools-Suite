@@ -25,6 +25,9 @@ export class HardwareMonitor {
   private smiAvailable = true
 
   private running = false
+  /** Bumped by start(), so a refresh still finishing from before a stop() can't restart its chain. */
+  private generation = 0
+  private pending: Promise<HardwareSnapshot> | null = null
 
   constructor(
     private readonly onUpdate: (s: HardwareSnapshot) => void,
@@ -39,12 +42,25 @@ export class HardwareMonitor {
   start(activeMs = 2000, idleMs = 10000): void {
     if (this.running) return
     this.running = true
+    const generation = ++this.generation
+    let ticking = false
+    // Only one chain of ticks may exist: a poke while nvidia-smi is running would otherwise start a
+    // second one, and every later poke another.
     const tick = async (): Promise<void> => {
-      await this.refresh()
-      if (this.running) this.timer = setTimeout(() => void tick(), this.isActive() ? activeMs : idleMs)
+      if (ticking) return
+      ticking = true
+      try {
+        await this.refresh()
+      } finally {
+        ticking = false
+      }
+      if (this.running && generation === this.generation) {
+        this.timer = setTimeout(() => void tick(), this.isActive() ? activeMs : idleMs)
+      }
     }
     this.poke = () => {
-      if (!this.running) return
+      // A refresh already running reschedules itself, at the fast rate if now active.
+      if (!this.running || ticking) return
       if (this.timer) clearTimeout(this.timer)
       this.timer = null
       void tick()
@@ -61,7 +77,13 @@ export class HardwareMonitor {
     this.timer = null
   }
 
-  async refresh(): Promise<HardwareSnapshot> {
+  /** Refreshes now; calls made while a refresh is running share it instead of starting nvidia-smi again. */
+  refresh(): Promise<HardwareSnapshot> {
+    this.pending ??= this.doRefresh().finally(() => (this.pending = null))
+    return this.pending
+  }
+
+  private async doRefresh(): Promise<HardwareSnapshot> {
     const gpus = this.smiAvailable ? await this.queryGpus() : []
     const total = totalmem()
     this.latest = { gpus, ramUsedBytes: total - freemem(), ramTotalBytes: total, at: Date.now() }

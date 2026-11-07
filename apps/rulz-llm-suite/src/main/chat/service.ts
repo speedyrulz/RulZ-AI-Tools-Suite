@@ -51,6 +51,33 @@ function hashOf(text: string): string {
   return createHash('sha1').update(text).digest('hex')
 }
 
+/** Message token counts remembered per loaded instance, so a long chat isn't re-tokenized every round. */
+const COUNT_CACHE_SIZE = 4000
+/** /tokenize requests in flight at once per instance; a long chat would otherwise send hundreds together. */
+const TOKENIZE_CONCURRENCY = 4
+/** Longest a model stays held between tool rounds without hearing from the renderer. */
+const TURN_HOLD_MAX_MS = 30 * 60_000
+
+type Limiter = <T>(task: () => Promise<T>) => Promise<T>
+
+/** Runs at most `n` tasks at once; the rest wait their turn. */
+export function limiter(n: number): Limiter {
+  let running = 0
+  const waiting: (() => void)[] = []
+  return async (task) => {
+    if (running < n) running++
+    else await new Promise<void>((r) => waiting.push(r))
+    try {
+      return await task()
+    } finally {
+      // Hand the slot straight to the next task, so a newcomer can't slip in between.
+      const next = waiting.shift()
+      if (next) next()
+      else running--
+    }
+  }
+}
+
 export function buildRequestBody(
   alias: string,
   messages: WireMessage[],
@@ -105,6 +132,8 @@ export function withSystemNote(messages: WireMessage[], note: string | undefined
 /** Streams chat completions from a loaded instance and forwards them to the renderer. */
 export class ChatService {
   private active = new Map<string, AbortController>()
+  /** Releases for models kept in use between tool rounds, by the request that asked for the tools. */
+  private turnHolds = new Map<string, () => void>()
 
   constructor(
     private readonly instances: InstanceManager,
@@ -120,6 +149,32 @@ export class ChatService {
   forget(instanceId: string): void {
     this.argQuirk.delete(instanceId)
     this.toolTokenCache.delete(instanceId)
+    this.countCache.delete(instanceId)
+    this.tokenizeLimits.delete(instanceId)
+  }
+
+  private countCache = new Map<string, Map<string, Promise<number | null>>>()
+  private tokenizeLimits = new Map<string, Limiter>()
+
+  /** Token count of `text` on an instance, remembered (least recently used goes first). */
+  private cachedCount(instanceId: string, text: string, count: () => Promise<number | null>): Promise<number | null> {
+    let cache = this.countCache.get(instanceId)
+    if (!cache) this.countCache.set(instanceId, (cache = new Map()))
+    const key = hashOf(text)
+    const hit = cache.get(key)
+    if (hit) {
+      cache.delete(key)
+      cache.set(key, hit)
+      return hit
+    }
+    const p: Promise<number | null> = count().then((n) => {
+      // Failures aren't remembered; the next round asks again.
+      if (n === null && cache.get(key) === p) cache.delete(key)
+      return n
+    })
+    cache.set(key, p)
+    if (cache.size > COUNT_CACHE_SIZE) cache.delete(cache.keys().next().value!)
+    return p
   }
 
   private stringifiesArgs(instance: LoadedInstance): Promise<boolean> {
@@ -137,6 +192,28 @@ export class ChatService {
     return req ? this.getTools(req) : { defs: [] }
   }
 
+  /**
+   * Keeps a model in use between tool rounds: the renderer runs the tools and may wait on the
+   * user's approval, and an idle-unload then would force a full reload for the next round. The
+   * renderer calls releaseTurn once the next round has started or the turn ended; the timer
+   * covers a renderer that never does (reloaded mid-turn).
+   */
+  private holdTurn(requestId: string, release: () => void): void {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const done = (): void => {
+      clearTimeout(timer)
+      this.turnHolds.delete(requestId)
+      release()
+    }
+    timer = setTimeout(done, TURN_HOLD_MAX_MS)
+    timer.unref?.()
+    this.turnHolds.set(requestId, done)
+  }
+
+  releaseTurn(requestId: string): void {
+    this.turnHolds.get(requestId)?.()
+  }
+
   abort(requestId: string): void {
     this.active.get(requestId)?.abort()
   }
@@ -147,17 +224,20 @@ export class ChatService {
   /** `tools` are the definitions sent with the request; they take context space too. */
   contextApi(instance: LoadedInstance, tools: unknown[] = []): ContextApi {
     const base = this.instances.baseUrl(instance)
-    const tokenize = async (content: string): Promise<number | null> => {
-      const res = await fetch(`${base}/tokenize`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content, add_special: true }),
-        signal: AbortSignal.timeout(15000)
+    const limit = this.tokenizeLimits.get(instance.instanceId) ?? limiter(TOKENIZE_CONCURRENCY)
+    this.tokenizeLimits.set(instance.instanceId, limit)
+    const tokenize = (content: string): Promise<number | null> =>
+      limit(async () => {
+        const res = await fetch(`${base}/tokenize`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content, add_special: true }),
+          signal: AbortSignal.timeout(15000)
+        })
+        if (!res.ok) return null
+        const j = (await res.json()) as { tokens?: unknown[] }
+        return j.tokens?.length ?? null
       })
-      if (!res.ok) return null
-      const j = (await res.json()) as { tokens?: unknown[] }
-      return j.tokens?.length ?? null
-    }
     const toolTokens = async (): Promise<number> => {
       if (!tools.length) return 0
       const json = JSON.stringify(tools)
@@ -173,7 +253,7 @@ export class ChatService {
     }
     return {
       countTools: toolTokens,
-      countText: (text) => tokenize(text).catch(() => null),
+      countText: (text) => this.cachedCount(instance.instanceId, text, () => tokenize(text).catch(() => null)),
       countConversation: async (messages) => {
         try {
           // Images are replaced by a placeholder for counting; /apply-template only needs text.
@@ -219,10 +299,13 @@ export class ChatService {
     const deltas = new DeltaBatcher((content, reasoning) =>
       this.send({ type: 'delta', requestId, content: content || undefined, reasoning: reasoning || undefined })
     )
+    let release: (() => void) | undefined
 
     try {
       const inst = this.instances.readyFor(req.modelId)
       if (!inst) throw new Error('The model for this chat is not loaded.')
+      // Marks the model in use, so the API server's idle-unload leaves it alone while this reply runs.
+      release = this.instances.acquire(inst.instanceId)
       stats.modelName = inst.modelName
 
       const set = this.toolSet(req.tools)
@@ -302,6 +385,11 @@ export class ChatService {
         }
       }
       const calls = toolCalls.result()
+      if (calls.length && release) {
+        // The turn goes on after the tools run, so the model stays in use until then.
+        this.holdTurn(requestId, release)
+        release = undefined
+      }
       deltas.flush()
       this.send({
         type: 'done',
@@ -316,6 +404,7 @@ export class ChatService {
       if (ctrl.signal.aborted) this.send({ type: 'done', requestId, stats: final, reasoningMs: reasoningMs() })
       else this.send({ type: 'error', requestId, error: (err as Error).message, stats: final })
     } finally {
+      release?.()
       this.active.delete(requestId)
     }
 

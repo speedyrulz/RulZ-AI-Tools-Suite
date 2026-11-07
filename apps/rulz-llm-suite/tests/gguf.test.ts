@@ -2,7 +2,11 @@ import { existsSync, mkdtempSync, readdirSync, statSync, writeFileSync } from 'n
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { DEFAULT_LOAD_CONFIG } from '@shared/defaults'
+import type { ModelEntry } from '@shared/types'
+import { kvCacheBytes } from '../src/main/models/estimate'
 import { quantFromName, readGgufHeader, readGgufHeaderAsync, toGgufInfo } from '../src/main/models/gguf'
+import { ModelLibrary } from '../src/main/models/library'
 
 type Val =
   | { t: 'u32'; v: number }
@@ -151,6 +155,87 @@ describe('readGgufHeader', () => {
     const file = join(dir, 'bad.gguf')
     writeFileSync(file, Buffer.from('not a gguf file at all'))
     expect(() => readGgufHeader(file)).toThrow(/Not a GGUF/)
+  })
+})
+
+describe('sliding-window layouts llama.cpp hard-codes', () => {
+  const kv = (arch: string, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
+    'general.architecture': arch,
+    [`${arch}.block_count`]: 48,
+    [`${arch}.attention.head_count`]: 16,
+    [`${arch}.attention.head_count_kv`]: 8,
+    [`${arch}.attention.key_length`]: 256,
+    [`${arch}.attention.value_length`]: 256,
+    ...extra
+  })
+
+  it('fills in the pattern when the file has no pattern key', () => {
+    const g3 = toGgufInfo(kv('gemma3', { 'gemma3.attention.sliding_window': 1024 }), 'g3.gguf')
+    expect(g3.slidingWindowFraction).toBeCloseTo(5 / 6)
+    expect(g3.slidingWindow).toBe(1024)
+    expect(toGgufInfo(kv('gpt-oss', { 'gpt-oss.attention.sliding_window': 128 }), 'o.gguf').slidingWindowFraction).toBe(0.5)
+    expect(toGgufInfo(kv('cohere2', { 'cohere2.attention.sliding_window': 4096 }), 'c.gguf').slidingWindowFraction).toBe(0.75)
+    expect(toGgufInfo(kv('gemma3n', { 'gemma3n.attention.sliding_window': 512 }), 'n.gguf').slidingWindowFraction).toBe(0.8)
+    // A pattern stored in the file still wins.
+    const own = toGgufInfo(kv('gemma3', { 'gemma3.attention.sliding_window': 1024, 'gemma3.attention.sliding_window_pattern': 4 }), 'g.gguf')
+    expect(own.slidingWindowFraction).toBe(0.75)
+    expect(toGgufInfo(kv('llama'), 'l.gguf').slidingWindowFraction).toBeUndefined()
+  })
+
+  it('uses the window llama.cpp uses', () => {
+    expect(toGgufInfo(kv('gemma2'), 'g2.gguf').slidingWindow).toBe(4096) // its default when the key is missing
+    expect(toGgufInfo(kv('llama4', { 'llama4.attention.sliding_window': 1234 }), 'l4.gguf').slidingWindow).toBe(8192)
+    expect(toGgufInfo(kv('llama4', { 'llama4.attention.sliding_window': 0 }), 'l4.gguf').slidingWindow).toBe(0)
+    // Only the 64-layer EXAONE 4 has sliding layers.
+    expect(toGgufInfo(kv('exaone4', { 'exaone4.attention.sliding_window': 4096 }), 'e.gguf').slidingWindow).toBeUndefined()
+    // Gemma 3 without a window has no sliding layers at all.
+    expect(toGgufInfo(kv('gemma3'), 'g3.gguf').slidingWindow).toBeUndefined()
+  })
+
+  it('shrinks the KV estimate for long contexts accordingly', () => {
+    const model = (info: ReturnType<typeof toGgufInfo>): ModelEntry => ({
+      id: 'm',
+      name: 'm',
+      folder: '',
+      path: 'm.gguf',
+      files: ['m.gguf'],
+      sizeBytes: 1e9,
+      info,
+      modifiedAt: 0
+    })
+    const cfg = { ...DEFAULT_LOAD_CONFIG, cacheTypeK: 'f16' as const, cacheTypeV: 'f16' as const, ubatchSize: 512 }
+    const ctx = 131072
+    const full = kvCacheBytes(model(toGgufInfo(kv('llama'), 'l.gguf')), cfg, ctx)!
+    const gemma3 = kvCacheBytes(model(toGgufInfo(kv('gemma3', { 'gemma3.attention.sliding_window': 1024 }), 'g.gguf')), cfg, ctx)!
+    // 1 in 6 layers keeps the whole context; the rest keep window + ubatch.
+    expect(gemma3 / full).toBeCloseTo(1 / 6 + (5 / 6) * ((1024 + 512) / ctx), 5)
+    expect(full / gemma3).toBeGreaterThan(5)
+  })
+})
+
+describe('built-in MTP layers in split models', () => {
+  it('finds nextn tensors that sit in the last shard', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rulz-split-'))
+    const kv = {
+      'general.architecture': { t: 'str', v: 'qwen35' },
+      'qwen35.block_count': { t: 'u32', v: 64 },
+      'qwen35.nextn_predict_layers': { t: 'u32', v: 1 }
+    } as const
+    const split = (n: number): Record<string, Val> => ({ 'split.no': { t: 'u32', v: n } })
+    writeFileSync(join(dir, 'q-MTP-00001-of-00003.gguf'), buildGguf(kv, ['blk.0.attn_q.weight']))
+    writeFileSync(join(dir, 'q-MTP-00002-of-00003.gguf'), buildGguf(split(1), ['blk.30.attn_q.weight']))
+    writeFileSync(join(dir, 'q-MTP-00003-of-00003.gguf'), buildGguf(split(2), ['blk.63.attn_q.weight', 'blk.64.nextn.eh_proj.weight']))
+    // A split model without the key stays plain.
+    writeFileSync(join(dir, 'plain-00001-of-00002.gguf'), buildGguf({ 'general.architecture': { t: 'str', v: 'llama' } }, ['blk.0.attn_q.weight']))
+    writeFileSync(join(dir, 'plain-00002-of-00002.gguf'), buildGguf(split(1), ['blk.1.attn_q.weight']))
+
+    const lib = new ModelLibrary(join(dir, 'cache.json'), () => dir, () => undefined)
+    const models = await lib.scan()
+    lib.dispose()
+    expect(models.map((m) => m.name)).toEqual(['plain', 'q-MTP'])
+    expect(models[1].info?.mtpLayers).toBe(1)
+    expect(models[1].draft).toMatchObject({ kind: 'mtp', builtIn: true })
+    expect(models[0].info?.mtpLayers).toBeUndefined()
   })
 })
 

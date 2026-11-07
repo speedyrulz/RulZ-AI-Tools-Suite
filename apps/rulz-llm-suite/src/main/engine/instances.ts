@@ -21,6 +21,10 @@ interface Running {
   ready: Promise<LoadedInstance>
   exited: boolean
   exitCode: number | null
+  /** Requests or chats using the instance right now; idle-unload leaves it alone while above 0. */
+  users: number
+  /** When it became ready or was last released by a user. */
+  lastUsedAt: number
 }
 
 export interface InstanceManagerDeps {
@@ -56,6 +60,8 @@ export class InstanceManager {
    * loads (UI + API) can't both pass unloadAll() and leave two models in VRAM.
    */
   private loadQueue: Promise<unknown> = Promise.resolve()
+  /** Set when the app is quitting; no server may be started after that. */
+  private disposed = false
 
   constructor(private readonly deps: InstanceManagerDeps) {}
 
@@ -78,31 +84,86 @@ export class InstanceManager {
   }
 
   load(modelId: string, config: LoadConfig | null): Promise<LoadedInstance> {
-    const started = this.loadQueue.then(() => this.startLoad(modelId, config))
+    return this.queueLoad(modelId, config, false).then((r) => r.instance)
+  }
+
+  /**
+   * The model's running or loading instance whatever its settings, or else a new one with its saved
+   * defaults; `started` says whether this call started it. It takes its turn in the load queue, so
+   * a load the UI has already queued is found rather than replaced.
+   */
+  ensure(modelId: string): Promise<{ instance: LoadedInstance; started: boolean }> {
+    return this.queueLoad(modelId, null, true)
+  }
+
+  private queueLoad(
+    modelId: string,
+    config: LoadConfig | null,
+    reuseAny: boolean
+  ): Promise<{ instance: LoadedInstance; started: boolean }> {
+    const started = this.loadQueue.then(() => this.startLoad(modelId, config, reuseAny))
     // The queue only waits for the start; a failed start must not block the next load.
     this.loadQueue = started.catch(() => undefined)
     // Waiting for the model to become ready happens outside the queue, so a long load can still be
     // replaced (the next load unloads it) or cancelled.
-    return started.then((s) => s.ready)
+    return started.then(async (s) => ({ instance: await s.ready, started: s.started }))
+  }
+
+  /**
+   * Marks an instance as in use until the returned function is called, so idle-unload leaves it
+   * alone however long the use takes (a long stream, a chat turn with tool calls). Calling the
+   * returned function more than once is harmless.
+   */
+  acquire(instanceId: string): () => void {
+    const run = this.running.get(instanceId)
+    if (!run) return () => undefined
+    run.users++
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      run.users--
+      run.lastUsedAt = Date.now()
+    }
+  }
+
+  /** When a ready instance was last used; null while it is in use, loading or gone. */
+  idleSince(instanceId: string): number | null {
+    const run = this.running.get(instanceId)
+    if (!run || run.users > 0 || run.info.status !== 'ready') return null
+    return run.lastUsedAt
+  }
+
+  private checkDisposed(): void {
+    if (this.disposed) throw new Error('The app is closing.')
   }
 
   /**
    * Unloads what has to go and spawns the server. The ready promise is wrapped so that awaiting the
    * start doesn't also wait for the model to load.
    */
-  private async startLoad(modelId: string, config: LoadConfig | null): Promise<{ ready: Promise<LoadedInstance> }> {
+  private async startLoad(
+    modelId: string,
+    config: LoadConfig | null,
+    reuseAny: boolean
+  ): Promise<{ ready: Promise<LoadedInstance>; started: boolean }> {
+    this.checkDisposed()
     const found = this.deps.getModel(modelId)
     if (!found) throw new Error(`Model not found: ${modelId}`)
     const cfg = config ?? this.deps.getDefaults(modelId)
     const model = { ...found, draft: this.deps.draftFor(found, cfg) }
 
     const existing = [...this.running.values()].find((r) => r.info.modelId === modelId && r.info.status !== 'stopping')
-    if (existing && sameConfig(existing.info.config, cfg)) return { ready: existing.ready }
+    if (existing && (reuseAny || sameConfig(existing.info.config, cfg))) return { ready: existing.ready, started: false }
+    // Quitting during any of these waits must not leave a llama-server running after the app is gone.
     if (existing) await this.unload(existing.info.instanceId)
+    this.checkDisposed()
     if (this.deps.unloadPreviousOnLoad()) await this.unloadAll()
-
+    this.checkDisposed()
     const exe = await this.deps.engine.resolveExe()
+    this.checkDisposed()
     const port = await freePort()
+    this.checkDisposed()
     const instanceId = randomUUID()
     const args = buildServerArgs({ model, config: cfg, port, alias: model.name })
     const proc = this.deps.spawnServer
@@ -129,7 +190,16 @@ export class InstanceManager {
       hasVision: false,
       estimate: this.deps.estimate(model, cfg)
     }
-    const run: Running = { info, proc, log: [`$ llama-server ${args.join(' ')}`], ready: null!, exited: false, exitCode: null }
+    const run: Running = {
+      info,
+      proc,
+      log: [`$ llama-server ${args.join(' ')}`],
+      ready: null!,
+      exited: false,
+      exitCode: null,
+      users: 0,
+      lastUsedAt: Date.now()
+    }
     this.running.set(instanceId, run)
     this.attachOutput(run)
     run.ready = this.waitReady(run)
@@ -137,7 +207,7 @@ export class InstanceManager {
     run.ready.catch(() => undefined)
     void this.savePids()
     this.emit()
-    return { ready: run.ready }
+    return { ready: run.ready, started: true }
   }
 
   private attachOutput(run: Running): void {
@@ -200,21 +270,18 @@ export class InstanceManager {
   private async waitReady(run: Running): Promise<LoadedInstance> {
     const base = this.baseUrl(run.info)
     const deadline = Date.now() + LOAD_TIMEOUT_MS
-    while (Date.now() < deadline) {
-      if (run.exited) {
-        if (run.info.status === 'stopping') throw new Error('Load cancelled')
-        throw new Error(this.failureMessage(run))
-      }
-      if (run.info.status === 'stopping') throw new Error('Load cancelled')
+    let healthy = false
+    while (!healthy && Date.now() < deadline) {
+      this.checkStillLoading(run)
       try {
         const res = await fetch(`${base}/health`, { signal: AbortSignal.timeout(2000) })
-        if (res.ok) break
+        healthy = res.ok
       } catch {
         // not listening yet
       }
-      await new Promise((r) => setTimeout(r, 400))
+      if (!healthy) await new Promise((r) => setTimeout(r, 400))
     }
-    if (Date.now() >= deadline) {
+    if (!healthy) {
       await this.unload(run.info.instanceId)
       throw new Error('Timed out waiting for the model to load.')
     }
@@ -230,11 +297,20 @@ export class InstanceManager {
     } catch {
       // props are informational only
     }
+    // An unload (or a crash) while /props was being read: report that, not a ready model, or the
+    // exit that follows would look like an unexpected stop.
+    this.checkStillLoading(run)
     run.info.status = 'ready'
     run.info.progress = 1
     run.info.stage = 'Ready'
+    run.lastUsedAt = Date.now()
     this.emit()
     return { ...run.info }
+  }
+
+  private checkStillLoading(run: Running): void {
+    if (run.info.status === 'stopping') throw new Error('Load cancelled')
+    if (run.exited) throw new Error(this.failureMessage(run))
   }
 
   private failureMessage(run: Running): string {
@@ -283,8 +359,9 @@ export class InstanceManager {
     await Promise.all([...this.running.keys()].map((id) => this.unload(id)))
   }
 
-  /** Synchronous kill for app shutdown. */
+  /** Synchronous kill for app shutdown; loads that are still starting are refused from here on. */
   killAllSync(): void {
+    this.disposed = true
     for (const run of this.running.values()) {
       run.info.status = 'stopping'
       killTree(run.proc.pid, true)
@@ -295,7 +372,8 @@ export class InstanceManager {
 
   /** Kills llama-server processes left behind if the app crashed last time. */
   async cleanupOrphans(): Promise<void> {
-    const pids = await readJson<number[]>(this.deps.pidFile, [])
+    // A locked PID file mustn't stop the app from starting; orphans then wait for the next start.
+    const pids = await readJson<number[]>(this.deps.pidFile, []).catch(() => [] as number[])
     if (pids.length) {
       // One process listing for all of them; only PIDs still belonging to llama-server are killed.
       const live = llamaServerPids()

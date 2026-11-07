@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import type { McpConfigState, WireMessage } from '@shared/types'
 import { pairToolMessages } from '../src/main/chat/context'
 import { interpretChunk, ToolCallAccumulator } from '../src/main/chat/sse'
-import { contentToText, EMPTY_CONFIG, parseMcpConfig, qualifyToolName, readMcpConfigFile } from '../src/main/mcp/config'
+import { contentToText, EMPTY_CONFIG, parseMcpConfig, qualifyToolName, qualifyToolNames, readMcpConfigFile } from '../src/main/mcp/config'
 import { McpManager } from '../src/main/mcp/manager'
 
 describe('parseMcpConfig', () => {
@@ -27,6 +27,32 @@ describe('tool names and results', () => {
   it('qualifies names safely', () => {
     expect(qualifyToolName('my server', 'read.file')).toBe('my_server__read_file')
     expect(qualifyToolName('s', 'x'.repeat(100))).toHaveLength(64)
+  })
+  it('keeps names unique when cleaning or shortening makes them look alike', () => {
+    // No clash: the same names as before.
+    expect(qualifyToolNames('rea', ['open_binary'], ['rulz', 'rea', 'files'])).toEqual(['rea__open_binary'])
+    // Two tools on one server: the one whose name needed no cleaning keeps it, in either order.
+    const [a, b] = qualifyToolNames('s', ['read.file', 'read_file'], ['s'])
+    expect(a).toMatch(/^s__read_file_[0-9a-f]{6}$/)
+    expect(b).toBe('s__read_file')
+    expect(qualifyToolNames('s', ['read_file', 'read.file'], ['s'])).toEqual([b, a])
+    // Long names that share their first 64 characters.
+    const long = qualifyToolNames('s', ['x'.repeat(70) + 'a', 'x'.repeat(70) + 'b'], ['s'])
+    expect(new Set(long).size).toBe(2)
+    expect(long.every((n) => n.length <= 64)).toBe(true)
+    // Two servers whose names clean to the same text, and the a__b + c / a + b__c case.
+    const all = ['my server', 'my_server', 'a__b', 'a']
+    const names = [
+      ...qualifyToolNames('my server', ['t'], all),
+      ...qualifyToolNames('my_server', ['t'], all),
+      ...qualifyToolNames('a__b', ['c'], all),
+      ...qualifyToolNames('a', ['b__c'], all)
+    ]
+    expect(new Set(names).size).toBe(4)
+    expect(names.every((n) => /^[A-Za-z0-9_-]{1,64}$/.test(n))).toBe(true)
+    // Adding a clashing server never renames the tools of one whose name was already clean.
+    expect(names[1]).toBe('my_server__t')
+    expect(names[3]).toBe('a__b__c')
   })
   it('flattens MCP content', () => {
     expect(

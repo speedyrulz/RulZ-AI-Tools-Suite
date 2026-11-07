@@ -1,5 +1,7 @@
 // Pure helpers for the local API server (unit-tested separately from the HTTP code).
+import { createHash, timingSafeEqual } from 'node:crypto'
 import { sep } from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 import { z } from 'zod'
 import { draftFiles, fileName } from '@shared/draft'
 import { KV_CACHE_TYPES, type DraftKind, type LoadConfig, type ModelEntry, type ModelSampling } from '@shared/types'
@@ -59,50 +61,140 @@ export interface UsageInfo {
   tokensPerSecond?: number
 }
 
-/** Reads token usage from a completion response body, or from the tail of an SSE stream. */
-export function parseUsage(text: string, stream: boolean): UsageInfo {
-  const out: UsageInfo = {}
-  const apply = (j: unknown): void => {
-    const o = j as {
-      usage?: { prompt_tokens?: number; completion_tokens?: number; input_tokens?: number; output_tokens?: number }
-      timings?: { prompt_n?: number; predicted_n?: number; predicted_per_second?: number; cache_n?: number }
-    }
-    if (o?.usage) {
-      out.promptTokens = o.usage.prompt_tokens ?? o.usage.input_tokens ?? out.promptTokens
-      out.completionTokens = o.usage.completion_tokens ?? o.usage.output_tokens ?? out.completionTokens
-    }
-    if (o?.timings) {
-      if (o.timings.prompt_n !== undefined) out.promptTokens = o.timings.prompt_n + (o.timings.cache_n ?? 0)
-      if (o.timings.predicted_n !== undefined) out.completionTokens = o.timings.predicted_n
-      if (o.timings.predicted_per_second !== undefined) out.tokensPerSecond = o.timings.predicted_per_second
-    }
+/** Non-streamed bodies are kept up to this size to read usage and error messages from. */
+const MAX_USAGE_BODY_CHARS = 8 * 1024 * 1024
+/** A single SSE line longer than this is skipped rather than kept in memory. */
+const MAX_SSE_LINE_CHARS = 8 * 1024 * 1024
+
+type UsageFields = { prompt_tokens?: number; completion_tokens?: number; input_tokens?: number; output_tokens?: number }
+
+function applyUsage(out: UsageInfo, j: unknown): void {
+  const o = j as {
+    usage?: UsageFields
+    // Responses API `response.completed` and Anthropic `message_start` nest it one level down.
+    response?: { usage?: UsageFields }
+    message?: { usage?: UsageFields }
+    timings?: { prompt_n?: number; predicted_n?: number; predicted_per_second?: number; cache_n?: number }
   }
-  if (!stream) {
-    try {
-      apply(JSON.parse(text))
-    } catch {
-      // not JSON
-    }
-    return out
+  if (!o || typeof o !== 'object') return
+  for (const u of [o.response?.usage, o.message?.usage, o.usage]) {
+    if (!u || typeof u !== 'object') continue
+    out.promptTokens = u.prompt_tokens ?? u.input_tokens ?? out.promptTokens
+    out.completionTokens = u.completion_tokens ?? u.output_tokens ?? out.completionTokens
   }
-  for (const line of text.split(/\r?\n/)) {
-    if (!line.startsWith('data:')) continue
+  if (o.timings) {
+    if (o.timings.prompt_n !== undefined) out.promptTokens = o.timings.prompt_n + (o.timings.cache_n ?? 0)
+    if (o.timings.predicted_n !== undefined) out.completionTokens = o.timings.predicted_n
+    if (o.timings.predicted_per_second !== undefined) out.tokensPerSecond = o.timings.predicted_per_second
+  }
+}
+
+/**
+ * Reads token usage from a response as it is passed through. An SSE stream is read event by event
+ * (usage can come early, as in Anthropic's message_start, or in one large final event, as in the
+ * Responses API), so nothing depends on the end of the stream fitting in a buffer. A plain body is
+ * kept whole, up to a cap, and parsed at the end.
+ */
+export class UsageReader {
+  private readonly out: UsageInfo = {}
+  private readonly decoder = new StringDecoder('utf8')
+  private body = ''
+  private bodyOverflow = false
+  private line: string[] = []
+  private lineChars = 0
+  private skippingLine = false
+
+  constructor(private readonly sse: boolean) {}
+
+  push(chunk: Buffer | string): void {
+    const text = typeof chunk === 'string' ? chunk : this.decoder.write(chunk)
+    if (!this.sse) {
+      if (this.bodyOverflow) return
+      if (this.body.length + text.length > MAX_USAGE_BODY_CHARS) this.bodyOverflow = true
+      else this.body += text
+      return
+    }
+    let start = 0
+    for (let nl = text.indexOf('\n'); nl >= 0; nl = text.indexOf('\n', start)) {
+      this.addToLine(text.slice(start, nl))
+      this.endLine()
+      start = nl + 1
+    }
+    this.addToLine(text.slice(start))
+  }
+
+  /** Usage read so far; call after the last chunk. */
+  end(): UsageInfo {
+    const rest = this.decoder.end()
+    if (rest) this.push(rest)
+    if (this.sse) this.endLine()
+    else if (!this.bodyOverflow) {
+      try {
+        applyUsage(this.out, JSON.parse(this.body))
+      } catch {
+        // not JSON
+      }
+    }
+    return { ...this.out }
+  }
+
+  /** The plain body, for reading an error message from; empty for a stream or an oversized body. */
+  text(): string {
+    return this.bodyOverflow ? '' : this.body
+  }
+
+  private addToLine(part: string): void {
+    if (!part || this.skippingLine) return
+    if (this.lineChars + part.length > MAX_SSE_LINE_CHARS) {
+      this.skippingLine = true
+      this.line = []
+      this.lineChars = 0
+      return
+    }
+    this.line.push(part)
+    this.lineChars += part.length
+  }
+
+  private endLine(): void {
+    const line = this.line.join('')
+    const skipped = this.skippingLine
+    this.line = []
+    this.lineChars = 0
+    this.skippingLine = false
+    if (skipped || !line.startsWith('data:')) return
     const payload = line.slice(5).trim()
-    if (!payload || payload === '[DONE]') continue
+    // Most events are token deltas; only parse the ones that can carry usage.
+    if (!payload || payload === '[DONE]' || (!payload.includes('"usage"') && !payload.includes('"timings"'))) return
     try {
-      apply(JSON.parse(payload))
+      applyUsage(this.out, JSON.parse(payload))
     } catch {
-      // partial line at the start of the tail buffer
+      // a cut-off or non-JSON line
     }
   }
-  return out
+}
+
+/** Reads token usage from a whole completion response body, or from SSE text. */
+export function parseUsage(text: string, stream: boolean): UsageInfo {
+  const reader = new UsageReader(stream)
+  reader.push(text)
+  return reader.end()
+}
+
+const keyDigest = (s: string): Buffer => createHash('sha256').update(s, 'utf8').digest()
+
+/** Constant-time comparison, so response timing doesn't reveal how much of a guessed key was right. */
+function sameKey(given: string | undefined, apiKey: string): boolean {
+  return given !== undefined && timingSafeEqual(keyDigest(given), keyDigest(apiKey))
 }
 
 /** True when the request's credentials match the configured key (any key passes when none is set). */
 export function authorized(apiKey: string, headers: { authorization?: string; 'x-api-key'?: string }): boolean {
   if (!apiKey) return true
   const bearer = headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim()
-  return bearer === apiKey || headers['x-api-key']?.trim() === apiKey
+  // Both are checked every time, so which header was used doesn't change the timing either.
+  const viaBearer = sameKey(bearer, apiKey)
+  const viaHeader = sameKey(headers['x-api-key']?.trim(), apiKey)
+  return viaBearer || viaHeader
 }
 
 type TextBlock = { type: 'text'; text: string }
@@ -153,8 +245,13 @@ const remoteLoadPatchSchema = z
     parallel: z.number().int().min(1).max(64),
     splitMode: z.enum(['auto', 'single', 'custom']),
     mainGpu: z.number().int().min(0).max(15),
-    // Proportions per GPU, e.g. "3,1" — numbers only, so nothing else reaches the command line.
-    tensorSplit: z.string().regex(/^\s*(\d+(\.\d+)?(\s*,\s*\d+(\.\d+)?){0,15})?\s*$/, 'must be numbers separated by commas'),
+    // Proportions per GPU, e.g. "3,1" — numbers only, so nothing else reaches the command line. The
+    // length check runs first and stops there; the pattern has no overlapping repeats, so even a
+    // long near-miss is rejected in linear time.
+    tensorSplit: z
+      .string()
+      .max(256, { abort: true })
+      .regex(/^\s*(?:\d+(?:\.\d+)?(?:\s*,\s*\d+(?:\.\d+)?){0,15}\s*)?$/, 'must be numbers separated by commas'),
     useDraft: z.boolean(),
     mmprojOnCpu: z.boolean(),
     draftTokens: z.number().int().min(1).max(64).nullable(),

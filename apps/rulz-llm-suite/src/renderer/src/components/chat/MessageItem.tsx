@@ -3,7 +3,7 @@ import { memo, useEffect, useRef, useState } from 'react'
 import type { ChatMessage, GenerationStats } from '@shared/types'
 import { cn, formatBytes, formatDuration, formatNumber } from '../../lib/format'
 import { useApp } from '../../stores/app'
-import { useChat } from '../../stores/chat'
+import { isChatBusy, useChat } from '../../stores/chat'
 import { Button, IconButton, ProgressBar, Textarea, Tooltip } from '../ui'
 import { Markdown } from './Markdown'
 import { splitThink, ThinkingBlock } from './ThinkingBlock'
@@ -53,7 +53,8 @@ export const MessageItem = memo(function MessageItem({
   const [copied, setCopied] = useState(false)
   const expandThinking = useApp((s) => s.settings?.expandThinking ?? false)
   const keepThinkingOpen = useApp((s) => s.settings?.keepThinkingOpen ?? false)
-  const busy = useChat((s) => !!s.generation)
+  // Also while a model auto-loads for a send: a second reply would start alongside it.
+  const busy = useChat(isChatBusy)
   const { regenerate, continueMessage, deleteMessage, branchFrom } = useChat.getState()
   const isUser = message.role === 'user'
 
@@ -179,7 +180,7 @@ function EditBox({ message, onClose }: { message: ChatMessage; onClose: () => vo
   const [text, setText] = useState(message.content)
   const ref = useRef<HTMLTextAreaElement>(null)
   const editMessage = useChat((s) => s.editMessage)
-  const busy = useChat((s) => !!s.generation)
+  const busy = useChat(isChatBusy)
   useEffect(() => {
     const el = ref.current
     if (!el) return
@@ -194,7 +195,11 @@ function EditBox({ message, onClose }: { message: ChatMessage; onClose: () => vo
         rows={Math.min(16, Math.max(3, text.split('\n').length))}
         onChange={(e) => setText(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === 'Escape') onClose()
+          if (e.key === 'Escape') {
+            // Handled here: Esc cancels the edit, it doesn't stop a reply.
+            e.preventDefault()
+            onClose()
+          }
         }}
       />
       <div className="flex justify-end gap-2">

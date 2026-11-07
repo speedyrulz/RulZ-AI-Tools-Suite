@@ -1,5 +1,6 @@
 import { ArrowDown, Forward, PanelRight, PanelRightClose, Upload } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
+import { useFileDrop } from '../../hooks/useFileDrop'
 import { cn, formatCompact, formatTokens } from '../../lib/format'
 import { useApp } from '../../stores/app'
 import { useChat } from '../../stores/chat'
@@ -8,7 +9,6 @@ import { LogoWordmark } from '../Logo'
 import { IconButton, Tooltip } from '../ui'
 import { Composer, type ComposerHandle } from './Composer'
 import { HandoffDialogs, useHandoffTrigger } from './Handoff'
-import { ToolApprovalDialog } from './ToolCalls'
 import { MessageItem } from './MessageItem'
 
 export function ChatView() {
@@ -24,8 +24,9 @@ export function ChatView() {
   const scroller = useRef<HTMLDivElement>(null)
   const pinned = useRef(true)
   const [showJump, setShowJump] = useState(false)
-  const [dragging, setDragging] = useState(false)
+  const drag = useFileDrop((files) => void composer.current?.addFiles(files))
   const [editingTitle, setEditingTitle] = useState(false)
+  const cancelRename = useRef(false)
 
   const streamingId = generation && generation.conversationId === current?.id ? generation.messageId : null
 
@@ -55,23 +56,7 @@ export function ChatView() {
   }
 
   return (
-    <div
-      className="relative flex h-full min-w-0 flex-col"
-      onDragOver={(e) => {
-        if (e.dataTransfer.types.includes('Files')) {
-          e.preventDefault()
-          setDragging(true)
-        }
-      }}
-      onDragLeave={(e) => {
-        if (e.currentTarget === e.target) setDragging(false)
-      }}
-      onDrop={(e) => {
-        e.preventDefault()
-        setDragging(false)
-        void composer.current?.addFiles([...e.dataTransfer.files])
-      }}
-    >
+    <div className="relative flex h-full min-w-0 flex-col" {...drag.handlers}>
       <div className="flex h-12 shrink-0 items-center gap-3 border-b border-border px-5">
         {editingTitle ? (
           <input
@@ -79,12 +64,18 @@ export function ChatView() {
             defaultValue={current.title}
             className="h-8 flex-1 rounded-md border border-accent bg-panel-2 px-2 text-sm focus:outline-none"
             onBlur={(e) => {
-              void rename(current.id, e.target.value)
+              if (!cancelRename.current) void rename(current.id, e.target.value)
+              cancelRename.current = false
               setEditingTitle(false)
             }}
             onKeyDown={(e) => {
               if (e.key === 'Enter') e.currentTarget.blur()
-              if (e.key === 'Escape') setEditingTitle(false)
+              if (e.key === 'Escape') {
+                // Handled here: Esc cancels the rename, it doesn't stop a reply.
+                e.preventDefault()
+                cancelRename.current = true
+                e.currentTarget.blur()
+              }
             }}
           />
         ) : (
@@ -150,9 +141,8 @@ export function ChatView() {
 
       <Composer ref={composer} />
       <HandoffDialogs />
-      <ToolApprovalDialog />
 
-      {dragging && (
+      {drag.active && (
         <div className="pointer-events-none absolute inset-3 flex flex-col items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-accent bg-bg/85 text-accent">
           <Upload size={28} />
           <div className="text-sm font-medium">Drop images or text files to attach</div>

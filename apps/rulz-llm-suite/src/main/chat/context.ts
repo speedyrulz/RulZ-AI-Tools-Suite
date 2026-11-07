@@ -14,27 +14,52 @@ export function imageCount(m: WireMessage): number {
   return typeof m.content === 'string' ? 0 : m.content.filter((p) => p.type === 'image_url').length
 }
 
-/** Messages that always stay: leading system messages plus the first user message. */
-export function pinnedPrefixLength(messages: WireMessage[]): number {
+/**
+ * Splits the chat after the leading system messages into turns: a user message plus the
+ * assistant and tool messages after it. Anything before the first user message (a greeting)
+ * is a turn of its own. Returns each turn's message indices.
+ */
+export function chatTurns(messages: WireMessage[]): number[][] {
   let i = 0
   while (i < messages.length && messages[i].role === 'system') i++
-  return i < messages.length - 1 ? i + 1 : i
+  const turns: number[][] = []
+  for (; i < messages.length; i++) {
+    if (messages[i].role === 'user' || !turns.length) turns.push([i])
+    else turns[turns.length - 1].push(i)
+  }
+  return turns
+}
+
+/** A turn's steps: each message on its own, except that tool results stay with their call. */
+function turnSteps(messages: WireMessage[], turn: number[]): number[][] {
+  const steps: number[][] = []
+  for (const i of turn) {
+    if (messages[i].role === 'tool' && steps.length) steps[steps.length - 1].push(i)
+    else steps.push([i])
+  }
+  return steps
 }
 
 /**
- * Drops the oldest unpinned messages until `counts` (tokens per message) fit in `budget`.
- * The last message is always kept. Returns the kept indices.
+ * What "Truncate middle" may remove, in the order it removes it. Whole turns go, so user and
+ * assistant messages still alternate (Gemma 3's template raises an error otherwise) and every
+ * tool call keeps its result:
+ * 1. turns between the first and the current one, oldest first;
+ * 2. the first turn, which usually sets up the task, once nothing else is left;
+ * 3. older tool steps of the current turn, keeping its question and latest step, so a long tool
+ *    loop can go on.
+ * The system prompt, the current question and the latest step always stay; if they alone don't
+ * fit, the request goes out as it is and llama-server reports the overflow.
  */
-export function truncateMiddle(counts: number[], budget: number, pinned: number): number[] {
-  const keep = counts.map((_, i) => i)
-  let total = counts.reduce((a, b) => a + b, 0)
-  let cursor = pinned
-  while (total > budget && cursor < counts.length - 1) {
-    total -= counts[cursor]
-    keep.splice(keep.indexOf(cursor), 1)
-    cursor++
-  }
-  return keep
+export function dropOrder(messages: WireMessage[]): number[][] {
+  const turns = chatTurns(messages)
+  if (!turns.length) return []
+  const earlier = turns.slice(0, -1)
+  const first = earlier.findIndex((t) => messages[t[0]].role === 'user')
+  const units = earlier.filter((_, k) => k !== first)
+  if (first >= 0) units.push(earlier[first])
+  units.push(...turnSteps(messages, turns[turns.length - 1]).slice(1, -1))
+  return units
 }
 
 /** Template tokens allowed per message (role markers, separators) and for the whole prompt. */
@@ -55,11 +80,22 @@ export function upperBoundTokens(messages: WireMessage[]): number {
 export class ContextFullError extends Error {}
 
 export interface ContextApi {
+  /** Tokens of the whole prompt as sent, tool definitions included. */
   countConversation: (messages: WireMessage[]) => Promise<number | null>
   countText: (text: string) => Promise<number | null>
   /** Tokens used by the tool definitions sent alongside the chat. */
   countTools?: () => Promise<number>
 }
+
+/** Rough cost of one message: its text, a few template tokens, and its images. */
+async function messageTokens(m: WireMessage, api: ContextApi): Promise<number> {
+  const text = textOf(m)
+  const n = await api.countText(text).catch(() => null)
+  return (n ?? text.length / 3) + 8 + imageCount(m) * IMAGE_TOKENS
+}
+
+/** How many removal units ahead to count while trimming, so counting overlaps a little. */
+const COUNT_AHEAD = 4
 
 /** Applies the overflow policy so the prompt plus `reserve` tokens fits in `nCtx`. */
 export async function fitToContext(
@@ -80,17 +116,32 @@ export async function fitToContext(
         'Load the model with a larger context, start a new chat, or switch the overflow policy to "Truncate middle".'
     )
   }
-  const counts = await Promise.all(
-    messages.map(async (m) => ((await api.countText(textOf(m))) ?? textOf(m).length / 3) + 8 + imageCount(m) * IMAGE_TOKENS)
-  )
-  let kept = pairToolMessages(truncateMiddle(counts, budget, pinnedPrefixLength(messages)).map((i) => messages[i]))
-  // Per-message counts ignore template overhead; re-check and trim further if needed.
-  for (let guard = 0; guard < 20; guard++) {
+  const units = dropOrder(messages)
+  // Only the messages that may go are counted, a few units ahead of where trimming has got to.
+  const costs: Promise<number>[] = []
+  const costOf = (k: number): Promise<number> => {
+    for (let j = k; j < Math.min(units.length, k + COUNT_AHEAD); j++) {
+      costs[j] ??= Promise.all(units[j].map((i) => messageTokens(messages[i], api))).then((n) => n.reduce((a, b) => a + b, 0))
+    }
+    return costs[k]
+  }
+  const dropped = new Set<number>()
+  let next = 0
+  // The measured total includes tool definitions and template overhead, so the overshoot is
+  // what has to go; dropping a message frees at least its own count.
+  let over = total - budget
+  let kept = messages
+  while (next < units.length) {
+    let freed = 0
+    while (next < units.length && freed < over) {
+      freed += await costOf(next)
+      for (const i of units[next++]) dropped.add(i)
+    }
+    kept = pairToolMessages(messages.filter((_, i) => !dropped.has(i)))
+    if (next >= units.length) break
     const now = await api.countConversation(kept)
     if (now === null || now <= budget) break
-    const pinned = pinnedPrefixLength(kept)
-    if (pinned >= kept.length - 1) break
-    kept = pairToolMessages([...kept.slice(0, pinned), ...kept.slice(pinned + 1)])
+    over = now - budget
   }
   return kept
 }

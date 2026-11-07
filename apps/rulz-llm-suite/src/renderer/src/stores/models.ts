@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import { toast } from 'sonner'
 import type { HardwareSnapshot, LoadConfig, LoadedInstance, ModelEntry } from '@shared/types'
 import { errorMessage, invoke, on } from '../lib/api'
+import { once } from '../lib/once'
 
 interface ModelsState {
   models: ModelEntry[]
@@ -25,7 +26,7 @@ export const useModels = create<ModelsState>((set, get) => ({
   hardware: null,
   activeModelId: null,
 
-  init: async () => {
+  init: once(async () => {
     on('models:changed', (models) => set({ models, scanned: true }))
     on('instances:changed', (instances) => {
       const active = get().activeModelId
@@ -43,13 +44,18 @@ export const useModels = create<ModelsState>((set, get) => ({
       invoke('hardware:snapshot')
     ])
     set((s) => ({ models: s.models.length ? s.models : models, scanned: s.scanned || models.length > 0, instances, hardware }))
-  },
+    // An empty (or missing) folder scans so fast that its result can arrive before the listener
+    // above, leaving "Scanning models…" up for good. Ask for the scan's result directly.
+    if (!get().scanned) void get().rescan()
+  }),
 
   rescan: async () => {
     try {
-      set({ models: await invoke('models:rescan'), scanned: true })
+      set({ models: await invoke('models:rescan') })
     } catch (e) {
       toast.error(errorMessage(e))
+    } finally {
+      set({ scanned: true })
     }
   },
 

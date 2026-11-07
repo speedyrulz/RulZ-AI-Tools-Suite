@@ -155,7 +155,9 @@ export function toolCatalogNote(available: McpToolInfo[], active: string[]): str
     if (catalog.length + line.length > CATALOG_CHAR_LIMIT) omitted += names.length
     else catalog += line
   }
-  const loaded = active.length ? active.join(', ') : 'none'
+  // Sorted: the caller keeps `active` in least-recently-used order, and a line that changed with
+  // every tool call would make llama-server re-read the whole chat instead of reusing its cache.
+  const loaded = active.length ? [...active].sort().join(', ') : 'none'
   return [
     'You can use tools from connected MCP servers, but only loaded tools can be called.',
     `Loaded tools: ${loaded}.`,

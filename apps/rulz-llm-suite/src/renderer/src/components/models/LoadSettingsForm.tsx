@@ -313,7 +313,7 @@ export function LoadSettingsForm({
             <NumberInput value={config.ubatchSize} placeholder="512" min={1} onChange={(v) => set('ubatchSize', v)} />
           </Field>
           <Field inline label="Parallel slots" hint="Concurrent requests sharing the context">
-            <NumberInput value={config.parallel} min={1} max={64} onChange={(v) => set('parallel', Math.max(1, v ?? 1))} />
+            <NumberInput value={config.parallel} min={1} max={64} onChange={(v) => set('parallel', Math.max(1, Math.min(64, Math.round(v ?? 1))))} />
           </Field>
           <Field inline label="Seed" hint="Empty = random">
             <NumberInput value={config.seed} placeholder="Random" onChange={(v) => set('seed', v === null ? null : Math.round(v))} />

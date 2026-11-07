@@ -126,6 +126,7 @@ export const Composer = forwardRef<ComposerHandle>(function Composer(_props, ref
         )}
         <textarea
           ref={textRef}
+          data-composer
           rows={1}
           value={text}
           placeholder={replyingHere ? 'Add a note while it replies…' : 'Send a message…'}
@@ -138,6 +139,8 @@ export const Composer = forwardRef<ComposerHandle>(function Composer(_props, ref
             }
           }}
           onPaste={(e) => {
+            // Spreadsheet cells come with a picture of the cells as well; the text is what's wanted.
+            if (e.clipboardData.getData('text/plain')) return
             const files = [...e.clipboardData.files]
             if (files.length) {
               e.preventDefault()

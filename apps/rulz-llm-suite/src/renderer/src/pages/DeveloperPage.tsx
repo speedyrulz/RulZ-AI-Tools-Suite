@@ -48,6 +48,29 @@ function Snippet({ title, code }: { title: string; code: string }) {
   )
 }
 
+/** Text field that saves on blur or Enter, so a save in flight can't drop characters being typed. */
+function DraftInput({ value, placeholder, onCommit }: { value: string; placeholder?: string; onCommit: (v: string) => void }) {
+  // null while not editing: the field then shows `value`, so a generated key appears at once.
+  const [draft, setDraft] = useState<string | null>(null)
+  const commit = (): void => {
+    if (draft === null) return
+    setDraft(null)
+    if (draft.trim() !== value) onCommit(draft.trim())
+  }
+  return (
+    <Input
+      className="font-mono text-xs"
+      value={draft ?? value}
+      placeholder={placeholder}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') commit()
+      }}
+    />
+  )
+}
+
 function newApiKey(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(24))
   return 'rulz-' + Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
@@ -116,7 +139,7 @@ export function DeveloperPage() {
             <Field inline label="Start the server when the app starts">
               <Switch checked={s.autoStart} onCheckedChange={(v) => set('autoStart', v)} />
             </Field>
-            <Field inline label="Port" hint={running ? 'Restart the server to apply' : 'LM Studio also uses 1234'}>
+            <Field inline label="Port" hint={running ? 'Applying restarts the server' : 'LM Studio also uses 1234'}>
               <NumberInput
                 className="w-24"
                 value={draftPort}
@@ -140,7 +163,7 @@ export function DeveloperPage() {
             </Field>
             <Field label="API key" hint="Empty = no authentication. Sent as Authorization: Bearer or x-api-key.">
               <div className="flex gap-1.5">
-                <Input className="font-mono text-xs" value={s.apiKey} placeholder="None" onChange={(e) => set('apiKey', e.target.value.trim())} />
+                <DraftInput value={s.apiKey} placeholder="None" onCommit={(v) => set('apiKey', v)} />
                 <Button onClick={() => set('apiKey', newApiKey())}>
                   <RefreshCw size={13} /> Generate
                 </Button>
@@ -232,10 +255,12 @@ export function DeveloperPage() {
 function RequestLog({ log, onClear }: { log: ApiRequestLog[]; onClear: () => void }) {
   const bottom = useRef<HTMLDivElement>(null)
   const [selected, setSelected] = useState<string | null>(null)
+  // Keyed on the newest entry: the log is capped, so its length stops changing once it is full.
   // Block body: scrollIntoView returns a Promise in current Chromium, which React would treat as a cleanup.
+  const newest = log.at(-1)?.id
   useEffect(() => {
     bottom.current?.scrollIntoView({ block: 'end' })
-  }, [log.length])
+  }, [newest])
   const sel = log.find((e) => e.id === selected)
   return (
     <aside className="flex w-[440px] shrink-0 flex-col border-l border-border bg-panel">

@@ -48,15 +48,26 @@ const MAX_LIST_ENTRIES = 500
 const MAX_SCANNED = 200_000
 const SEARCH_TIME_MS = 15_000
 
-/** Expands %VAR% and checks the path is absolute. */
+/**
+ * Network shares (\\host\share, //host) and device paths (\\?\, \\.\). Opening a share makes
+ * Windows sign in to that host with the user's NTLM credentials, so a model told to read one
+ * could leak them; these tools are for this computer's own files.
+ */
+const NETWORK_OR_DEVICE = /^[\\/]{2}/
+
+/** Expands %VAR% and checks the path is absolute and on this computer. */
 export function expandPath(input: unknown, env: NodeJS.ProcessEnv = process.env): string {
   if (typeof input !== 'string' || !input.trim()) throw new Error('A path is required.')
   const expanded = input.trim().replace(/^["']|["']$/g, '').replace(/%([^%]+)%/g, (m, name: string) => {
     const key = Object.keys(env).find((k) => k.toLowerCase() === name.toLowerCase())
     return key ? (env[key] ?? m) : m
   })
+  const local = `Network and device paths such as "\\\\server\\share" can't be used; give a folder on this computer, not "${input}".`
+  if (NETWORK_OR_DEVICE.test(expanded)) throw new Error(local)
   if (!isAbsolute(expanded)) throw new Error(`Use an absolute path (for example "C:\\Program Files\\..."), not "${input}".`)
-  return resolve(expanded)
+  const full = resolve(expanded)
+  if (NETWORK_OR_DEVICE.test(full)) throw new Error(local)
+  return full
 }
 
 /** Wildcard (* and ?) or plain-text name matcher, case-insensitive. */
@@ -85,9 +96,22 @@ const clampInt = (v: unknown, def: number, min: number, max: number): number => 
   return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : def
 }
 
+/** One shared collator: localeCompare per comparison is far slower on big folders. "file2" sorts before "file10". */
+const collator = new Intl.Collator(undefined, { numeric: true })
+/** Above this many entries the names are left in the order Windows returns them (alphabetical on NTFS). */
+const MAX_SORTED = 5000
+
+/** Folders first, then by name. */
 async function readDir(dir: string): Promise<Dirent[]> {
   const entries = await fs.readdir(dir, { withFileTypes: true })
-  return entries.sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name))
+  const dirs = entries.filter((e) => e.isDirectory())
+  const files = entries.filter((e) => !e.isDirectory())
+  if (entries.length <= MAX_SORTED) {
+    const byName = (a: Dirent, b: Dirent): number => collator.compare(a.name, b.name)
+    dirs.sort(byName)
+    files.sort(byName)
+  }
+  return [...dirs, ...files]
 }
 
 async function sizeOf(path: string): Promise<string> {
@@ -152,12 +176,15 @@ export async function listDirectory(args: { path?: unknown; depth?: unknown }): 
   return { text: `${root}\n${lines.join('\n')}${note}`, isError: false }
 }
 
-export async function findFiles(args: {
-  root?: unknown
-  pattern?: unknown
-  max_depth?: unknown
-  limit?: unknown
-}): Promise<{ text: string; isError: boolean }> {
+export async function findFiles(
+  args: {
+    root?: unknown
+    pattern?: unknown
+    max_depth?: unknown
+    limit?: unknown
+  },
+  signal?: AbortSignal
+): Promise<{ text: string; isError: boolean }> {
   let root: string
   try {
     root = expandPath(args.root)
@@ -186,6 +213,7 @@ export async function findFiles(args: {
   for (let d = 1; d <= maxDepth && level.length && !stopped; d++) {
     const next: string[] = []
     for (const dir of level) {
+      if (signal?.aborted) stopped = 'the call was stopped'
       if (stopped) break
       let entries: Dirent[]
       try {
@@ -222,8 +250,12 @@ export async function findFiles(args: {
   return { text: `Under ${root}:\n${hits.join('\n')}${tail}`, isError: false }
 }
 
-export function runFileTool(name: string, args: Record<string, unknown>): Promise<{ text: string; isError: boolean }> {
+export function runFileTool(
+  name: string,
+  args: Record<string, unknown>,
+  signal?: AbortSignal
+): Promise<{ text: string; isError: boolean }> {
   if (name === 'list_directory') return listDirectory(args)
-  if (name === 'find_files') return findFiles(args)
+  if (name === 'find_files') return findFiles(args, signal)
   return Promise.resolve({ text: `Unknown tool "${name}".`, isError: true })
 }
