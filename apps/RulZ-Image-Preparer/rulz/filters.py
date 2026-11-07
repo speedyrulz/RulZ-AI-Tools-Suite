@@ -51,13 +51,26 @@ def _smooth_chroma(lab: np.ndarray, radius: int, eps: float, mix: float) -> None
         chroma_s = cv2.resize(lab[:, :, 1:], size, interpolation=cv2.INTER_AREA)
     else:
         lum_s, chroma_s = lum, lab[:, :, 1:]
-    r_s = max(1, radius // step)
+    r = max(1, radius // step)
+    # _guided_coeffs for each color channel, with the guide's own statistics worked out once for both
+    mean_i = _box(lum_s, r)
+    denom = _box(lum_s * lum_s, r) - mean_i * mean_i + eps
     for c in range(2):
-        a, b = _guided_coeffs(lum_s, np.ascontiguousarray(chroma_s[:, :, c]), r_s, eps)
+        src = np.ascontiguousarray(chroma_s[:, :, c])
+        mean_p = _box(src, r)
+        a = (_box(lum_s * src, r) - mean_i * mean_p) / denom
+        b = mean_p - a * mean_i
+        a, b = _box(a, r), _box(b, r)
         if step > 1:
             a = cv2.resize(a, (w, h), interpolation=cv2.INTER_LINEAR)
             b = cv2.resize(b, (w, h), interpolation=cv2.INTER_LINEAR)
-        lab[:, :, 1 + c] += mix * (a * lum + b - lab[:, :, 1 + c])
+        ch = np.ascontiguousarray(lab[:, :, 1 + c])
+        a *= lum  # in place: a full-size picture's worth of temporaries less per step
+        a += b
+        a -= ch
+        a *= np.float32(mix)
+        ch += a
+        lab[:, :, 1 + c] = ch
 
 
 # ---- the three adjustments (all in place on a float32 Lab image) ------------------
@@ -92,22 +105,24 @@ def _jpeg_best(bgr: np.ndarray, strength: float) -> np.ndarray:
 def _detail(lab: np.ndarray, strength: float) -> None:
     """Two-scale unsharp mask on lightness; small differences (leftover noise) are not boosted."""
     d = strength / 100.0
-    lum = lab[:, :, 0]
+    lum = np.ascontiguousarray(lab[:, :, 0])
     out = lum.copy()
     for sigma, amount, thresh in ((0.8, 1.6, 0.6), (2.0, 0.7, 0.8)):
-        hp = lum - cv2.GaussianBlur(lum, (0, 0), sigma)
-        hp = np.sign(hp) * np.maximum(np.abs(hp) - thresh, 0.0)
-        out += d * amount * hp
+        hp = cv2.GaussianBlur(lum, (0, 0), sigma)
+        np.subtract(lum, hp, out=hp)
+        hp -= np.clip(hp, -thresh, thresh)  # = sign(hp) * max(|hp| - thresh, 0), with fewer passes
+        out += np.float32(d * amount) * hp
     lab[:, :, 0] = np.clip(out, 0.0, 100.0)
 
 
 # ---- pipeline -------------------------------------------------------------------
+def _scale(dtype) -> float:
+    return 255.0 if dtype == np.uint8 else 65535.0 if dtype == np.uint16 else 1.0
+
+
 def _to_float(img: np.ndarray) -> tuple[np.ndarray, float]:
-    if img.dtype == np.uint8:
-        return img.astype(np.float32) / 255.0, 255.0
-    if img.dtype == np.uint16:
-        return img.astype(np.float32) / 65535.0, 65535.0
-    return img.astype(np.float32), 1.0
+    scale = _scale(img.dtype)
+    return (img.astype(np.float32) / scale if scale != 1.0 else img.astype(np.float32)), scale
 
 
 def is_noop(settings: dict) -> bool:
@@ -130,7 +145,7 @@ def process(img: np.ndarray, settings: dict, mode: str = BALANCED, full_size: bo
     detail = settings.get("detail", 0) if full_size else 0
     if not (color or jpeg or detail or shadow):
         return img
-    return _finish(_prepare(img, jpeg, mode, shadow), color, detail)
+    return _finish(_prepare(img, jpeg, mode, shadow)[0], color, detail)
 
 
 @dataclass
@@ -145,27 +160,37 @@ class Stage:
     shape: tuple
 
 
-def _prepare(img: np.ndarray, jpeg: int, mode: str, shadow) -> Stage:
+def _float_bgr(img: np.ndarray, gray: bool) -> np.ndarray:
+    f, _ = _to_float(img if gray else img[:, :, :3])
+    return cv2.cvtColor(f.reshape(f.shape[:2]), cv2.COLOR_GRAY2BGR) if gray else f
+
+
+def _prepare(img: np.ndarray, jpeg: int, mode: str, shadow, cleaned: np.ndarray | None = None):
+    """(Stage, cleaned): the picture after JPEG clean-up and shadow lift, plus the picture after JPEG
+    clean-up alone when it was made in BGR on the way (Best quality, or Balanced before a shadow lift), else
+    None. Pass that back as `cleaned` for the same picture, jpeg and mode to skip the JPEG step."""
     gray = img.ndim == 2 or img.shape[2] == 1
     alpha = img[:, :, 3:] if not gray and img.shape[2] == 4 else None
-    src = img if gray else img[:, :, :3]
-    f, scale = _to_float(src)
-    if gray:
-        f = cv2.cvtColor(f.reshape(f.shape[:2]), cv2.COLOR_GRAY2BGR)
-    if jpeg and mode == BEST:
-        f = np.ascontiguousarray(_jpeg_best(f, jpeg))
-    if jpeg and mode != BEST and shadow:  # lift the cleaned picture, not its JPEG blocks
-        lab = cv2.cvtColor(f, cv2.COLOR_BGR2Lab)
-        _jpeg_balanced(lab, jpeg)
-        f, jpeg = cv2.cvtColor(lab, cv2.COLOR_Lab2BGR), 0
+    if jpeg and (mode == BEST or shadow):  # lift the cleaned picture, not its JPEG blocks
+        if cleaned is None:
+            f = _float_bgr(img, gray)
+            if mode == BEST:
+                cleaned = np.ascontiguousarray(_jpeg_best(f, jpeg))
+            else:
+                lab = cv2.cvtColor(f, cv2.COLOR_BGR2Lab)
+                _jpeg_balanced(lab, jpeg)
+                cleaned = cv2.cvtColor(lab, cv2.COLOR_Lab2BGR)
+        f, jpeg = cleaned, 0
+    else:
+        f, cleaned = _float_bgr(img, gray), None
     if shadow:
         from .shadows import lift_shadows
 
-        f = lift_shadows(f, shadow)
+        f = lift_shadows(f, shadow)  # a new picture: `cleaned` is never changed
     lab = cv2.cvtColor(f, cv2.COLOR_BGR2Lab)
-    if jpeg and mode != BEST:
+    if jpeg:  # Balanced without shadow areas: straight in Lab
         _jpeg_balanced(lab, jpeg)
-    return Stage(lab, gray, alpha, scale, img.dtype, img.shape)
+    return Stage(lab, gray, alpha, _scale(img.dtype), img.dtype, img.shape), cleaned
 
 
 def _finish(stage: Stage, color: int, detail: int, keep: bool = False) -> np.ndarray:
@@ -186,15 +211,22 @@ def _finish(stage: Stage, color: int, detail: int, keep: bool = False) -> np.nda
 
 
 def process_cached(img: np.ndarray, settings: dict, mode: str = BALANCED, shadow=None, cache=None):
-    """process() for one picture edited again and again: when only color noise or detail changed, the JPEG
-    clean-up and shadow lift are reused from `cache` (what the last call returned). Returns (result, cache)."""
+    """process() for one picture edited again and again, reusing `cache` (what the last call returned):
+    when only color noise or detail changed, the JPEG clean-up and shadow lift are reused; when only the
+    shadow areas changed, the JPEG clean-up is, so a brush stroke doesn't wait for it again.
+    Returns (result, cache); the cache is (key, Stage, picture after JPEG clean-up or None)."""
     shadow = shadow if shadow is not None and shadow.active else None
     if img is None or (is_noop(settings) and shadow is None):
         return img, cache
     jpeg = settings.get("jpeg", 0)
     key = (jpeg, mode if jpeg else BALANCED, shadow)
-    stage = cache[1] if cache is not None and cache[0] == key else _prepare(img, jpeg, mode, shadow)
-    return _finish(stage, settings.get("color", 0), settings.get("detail", 0), keep=True), (key, stage)
+    if cache is not None and cache[0] == key:
+        _, stage, cleaned = cache
+    else:
+        reuse = cache[2] if cache is not None and cache[0][:2] == key[:2] else None
+        stage, cleaned = _prepare(img, jpeg, mode, shadow, reuse)
+        cleaned = reuse if cleaned is None else cleaned  # kept for when shadow areas come back (Undo)
+    return _finish(stage, settings.get("color", 0), settings.get("detail", 0), keep=True), (key, stage, cleaned)
 
 
 # Pixels kept around a crop when only it is cleaned up: more than every filter's reach that doesn't scale

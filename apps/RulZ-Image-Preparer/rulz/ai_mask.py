@@ -115,6 +115,11 @@ def _load():
     return _model
 
 
+def loaded() -> bool:
+    """True while SAM is in memory, so a search starts straight away."""
+    return _model is not None
+
+
 def device_name() -> str:
     import torch
 
