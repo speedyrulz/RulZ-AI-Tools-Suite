@@ -142,7 +142,8 @@ class ServerManager:
                 p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                      stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW,
                                      cwd=os.path.dirname(exe) or None)
-                if not winjob.adopt(p.pid):
+                p.job = winjob.adopt(p.pid)
+                if p.job is None:
                     log(f"{tag} note: couldn't tie llama-server to the app; if the app crashes, end it in Task Manager")
                 tail = []
                 procs.append((p, tail))
@@ -202,14 +203,23 @@ class ServerManager:
     @staticmethod
     def _kill(procs):
         for p in procs:
-            if p.poll() is None:
+            job = getattr(p, "job", None)
+            if job is not None and job.terminate():
+                continue  # the server and anything it started, at once
+            if p.poll() is None:  # not in a job: taskkill finds its child processes itself (~0.75 s)
                 subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)],
                                capture_output=True, creationflags=CREATE_NO_WINDOW)
+        deadline = time.monotonic() + 10
         for p in procs:  # its port and VRAM are only free once it has exited; a restart needs both
             try:
-                p.wait(timeout=10)
+                p.wait(timeout=max(0.1, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
                 pass
+            job = getattr(p, "job", None)
+            if job is not None:
+                # and so has anything it started: a .cmd wrapper exits before the server inside it
+                job.wait(max(0.1, deadline - time.monotonic()))
+                job.close()
 
     def stop(self):
         with self._lock:
@@ -245,15 +255,17 @@ def encode_image(path, max_side):
         raise RuntimeError("Could not read image: " + r.errorString())
     if max(img.width(), img.height()) > max_side:
         img = img.scaled(max_side, max_side, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-    flat = QImage(img.size(), QImage.Format_RGB32)
-    flat.fill(QColor("white"))
-    pt = QPainter(flat)
-    pt.drawImage(0, 0, img)
-    pt.end()
+    if img.hasAlphaChannel():  # JPEG has no transparency: show see-through parts as white, not black
+        flat = QImage(img.size(), QImage.Format_RGB32)
+        flat.fill(QColor("white"))
+        pt = QPainter(flat)
+        pt.drawImage(0, 0, img)
+        pt.end()
+        img = flat
     ba = QByteArray()
     buf = QBuffer(ba)
     buf.open(QIODevice.WriteOnly)
-    flat.save(buf, "JPEG", 92)
+    img.save(buf, "JPEG", 92)
     return base64.b64encode(bytes(ba)).decode("ascii")
 
 
@@ -268,6 +280,9 @@ CUT_OFF = ("Caption cut off at 'Max new tokens' and saved as it is. Raise the li
 
 MAX_ATTEMPTS = 4          # one try plus three retries
 RETRY_STATUSES = {408, 429}  # plus every 5xx
+# (connect, read) seconds. Connecting to a running server is instant; a reply can take minutes on a
+# slow model, so only the read gets the long limit.
+REQUEST_TIMEOUT = (10, 900)
 
 
 class EndpointDown(RuntimeError):
@@ -286,9 +301,12 @@ class HTTPStatusError(RuntimeError):
 
 
 def is_retryable(exc):
-    """Connection problems, timeouts, 408/429 and 5xx are worth another go; other errors are not."""
+    """Connection problems, 408/429 and 5xx are worth another go; other errors are not. Neither is a
+    reply that took the whole 15-minute read timeout: three more tries could hold one image for an hour."""
     if isinstance(exc, HTTPStatusError):
         return exc.status in RETRY_STATUSES or 500 <= exc.status <= 599
+    if isinstance(exc, requests.ReadTimeout):
+        return False
     return isinstance(exc, requests.RequestException)
 
 
@@ -337,7 +355,7 @@ def request_caption(ep, image_b64, system, user, s, session):
         body["max_tokens"] = int(s["max_tokens"]) + budget  # leave room for the answer after the thinking
     # else unlimited thinking: no cap at all, or the thinking would use up 'Max new tokens' by itself
     # (the context size still bounds the reply)
-    r = session.post(ep["url"] + "/chat/completions", json=body, headers=headers, timeout=900)
+    r = session.post(ep["url"] + "/chat/completions", json=body, headers=headers, timeout=REQUEST_TIMEOUT)
     if r.status_code != 200:
         raise HTTPStatusError(r.status_code, r.text[:300], r.headers.get("Retry-After"))
     choice = r.json()["choices"][0]
@@ -367,6 +385,8 @@ def request_with_retry(ep, image_b64, system, user, s, session, wait=time.sleep)
 
 
 class CaptionEngine(QObject):
+    started = Signal(str)          # path: its request is on its way to a server
+    requeued = Signal(str)         # path: handed back to the queue (its server stopped responding)
     captioned = Signal(str, str)   # path, caption
     failed = Signal(str, str)      # path, error
     warning = Signal(str, str)     # path ("" = about the whole job), message; not a failure
@@ -453,6 +473,7 @@ class CaptionEngine(QObject):
             nxt = self._take(pool, max_side)  # encode the next image while this one is in flight
             try:
                 b64 = fut.result()
+                self.started.emit(path)
                 raw, finish = request_with_retry(ep, b64, system, user, s, session, wait=self._cancel.wait)
                 self.captioned.emit(path, clean_caption(raw, s))
                 if finish == "length":
@@ -485,6 +506,9 @@ class CaptionEngine(QObject):
             self._cancel.set()
             return False
         held = [path] + ([nxt[0]] if nxt is not None else [])
+        # before the hand-back: once it is back in the queue another worker can report it started, and
+        # a later "requeued" would arrive after that (the prefetched one never showed as started)
+        self.requeued.emit(path)
         if self._retire(held):
             if nxt is not None:
                 nxt[1].cancel()

@@ -37,6 +37,8 @@ Double-click `run.bat` (creates a venv and installs PySide6 + requests on first 
 - *Split*: needed when the model doesn't fit on one card. Use *Tensor split* for uneven ratios (e.g. `16,16`).
 - *Concurrent requests per server* adds batching on a server at the cost of VRAM (context is multiplied).
 - GPU numbers match `nvidia-smi`, so ticking GPU 1 uses the card `nvidia-smi` calls GPU 1, even on mixed cards.
+- With no GPU ticked, one llama-server starts and picks the GPUs itself (one copy of the model spread over all
+  of them).
 - If one server stops responding during a run, the other servers take over its images. If none respond,
   captioning stops and the remaining images stay uncaptioned (not failed).
 - The servers close with the app, even if it crashes, so they never keep holding VRAM.
@@ -50,6 +52,8 @@ Double-click `run.bat` (creates a venv and installs PySide6 + requests on first 
   when you add them: rename or remove one of each pair.
 - A caption cut off by *Max new tokens* is still saved, with a warning in the log.
 - "Skip images that already have a caption" applies to *Caption All*; *Caption Selected* always overwrites.
+- Big folders are added in the background, so the window stays usable while they load. Images in subfolders
+  stay grouped by folder.
 - The log (View ▸ Log) shows llama-server output, useful if a model fails to load.
 
 ## Settings folder
