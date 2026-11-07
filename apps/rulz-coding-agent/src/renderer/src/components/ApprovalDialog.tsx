@@ -5,35 +5,49 @@ import { useWorkspace } from '../stores/workspace'
 import { Markdown } from './Markdown'
 import { Button, Dialog } from './ui'
 
+/** The buttons ignore presses this long after a question appears or changes, so a key meant for something else can't answer it. */
+const ARM_MS = 600
+
 export function ApprovalDialog() {
   const prompt = useWorkspace((s) => s.prompt)
   const answer = useWorkspace((s) => s.answer)
   const [details, setDetails] = useState(false)
-  useEffect(() => setDetails(false), [prompt?.id])
+  const [armed, setArmed] = useState(false)
+  useEffect(() => {
+    setDetails(false)
+    setArmed(false)
+    const t = setTimeout(() => setArmed(true), ARM_MS)
+    return () => clearTimeout(t)
+  }, [prompt?.id])
 
   const open = prompt?.kind === 'approval'
   const req = open ? prompt : null
-  const decide = (decision: 'allow' | 'allow-task' | 'deny'): void => answer({ kind: 'approval', decision })
+  const decide = (decision: 'allow' | 'allow-task' | 'deny'): void => {
+    if (armed) answer({ kind: 'approval', decision })
+  }
 
   return (
     <Dialog
       open={open}
-      onOpenChange={(o) => !o && decide('deny')}
+      // Closing (Esc, the X) always means no, at once.
+      onOpenChange={(o) => !o && answer({ kind: 'approval', decision: 'deny' })}
       title="Is this OK?"
       className="w-[min(600px,calc(100vw-32px))]"
       keepOnFocusOutside
       footer={
-        <>
-          <Button className="h-10 px-4 text-sm" onClick={() => decide('deny')}>
+        // Focus starts on "Don't allow": a space or Enter meant for the message box must never approve.
+        // (aria-disabled, not disabled, so focus can still start there.)
+        <div className={cn('flex gap-2 transition-opacity', !armed && 'opacity-60')}>
+          <Button className="h-10 px-4 text-sm" onClick={() => decide('deny')} aria-disabled={!armed} autoFocus>
             Don’t allow
           </Button>
-          <Button className="h-10 px-4 text-sm" onClick={() => decide('allow-task')}>
+          <Button className="h-10 px-4 text-sm" onClick={() => decide('allow-task')} aria-disabled={!armed}>
             Allow for this task
           </Button>
-          <Button variant="primary" className="h-10 px-5 text-sm" onClick={() => decide('allow')} autoFocus>
+          <Button variant="primary" className="h-10 px-5 text-sm" onClick={() => decide('allow')} aria-disabled={!armed}>
             Allow
           </Button>
-        </>
+        </div>
       }
     >
       {req && (

@@ -106,9 +106,16 @@ address and API key, open dialogs, the browser or Explorer here.
 
 At every level it always asks before deleting, installing software for the whole computer, using admin rights,
 touching anything outside the project folder, changing Windows settings, closing other programs, or sending
-anything to the internet (`git push`, publishing). It always refuses, with an explanation, to format disks, delete
-outside the project, edit the registry, turn off security software, shut down the PC, or download and run
-scripts unchecked. Deleted files go to the Recycle Bin.
+anything to the internet (`git push`, publishing). A command with several of these risks names them all, and
+**Allow for this task** covers only those. Code that is hidden or put together while it runs (an encoded
+script, `Invoke-Expression`, a downloaded program) is asked about every time. It always refuses, with an
+explanation, to format disks, delete outside the project, edit the registry, turn off security software, shut
+down the PC, or download and run scripts unchecked, however the command is written (quotes, escape characters,
+aliases, line breaks and encoded scripts are all seen through). Deleted files go to the Recycle Bin.
+
+The question starts on **Don't allow**, and its buttons wait a moment before they work, so a key pressed while
+typing can never approve anything. `Esc` in a dialog or menu only closes it; it stops the task only when nothing
+else is open.
 
 ## How it works
 
@@ -139,7 +146,9 @@ scripts unchecked. Deleted files go to the Recycle Bin.
 - **Commands** run in `powershell.exe -NoProfile -NonInteractive` in the project folder, with Node.js, npm and
   Python folders added to `PATH`. Output streams live, each command has a time limit (10 minutes by default), and
   Stop kills the whole process tree. Background commands keep PowerShell waiting for the programs it starts (it
-  normally doesn't wait for programs with a window), so stopping one also closes the app's window.
+  normally doesn't wait for programs with a window), so stopping one also closes the app's window. If PowerShell
+  finishes but a program it started keeps its output open (`Start-Process -NoNewWindow`), that program is stopped
+  after a few seconds and the agent is told to use a background command instead, so a command can't hang.
 - **Loop guard**: the same call three times in a row, five failures in a row, or the step limit (40 by default)
   pauses the task and asks you whether to keep going, try another way, or stop.
 - **Context**: requests stay under ~80% of the model's context. Older tool results are shortened first; if that
@@ -149,8 +158,12 @@ scripts unchecked. Deleted files go to the Recycle Bin.
 - **System prompt**: the built-in instructions, then your Settings instructions, then the project's Notes, then a
   summary of earlier work. The safety rules are told to come first.
 - **Undo**: before each task, the project is committed to a private git repository in the app's data folder
-  (never a `.git` inside your project, so your own repositories are untouched; `node_modules`, `dist`, `.venv`
-  and files over 50 MB are left out). Without Git for Windows, files are copied aside before the agent changes them.
+  (never a `.git` inside your project, so your own repositories are untouched; `node_modules`, `dist`, `.venv`,
+  `target` and files over 50 MB are left out). The project's own `.gitignore` doesn't decide what is kept, because
+  it often lists files that matter (`.env`, a data folder); only a whole ignored folder with more than 1,000 files
+  or 100 MB (build output) stays out. Files are kept byte for byte (`.gitattributes` doesn't change line endings),
+  and folders with a git repository of their own (`git init web`, `cargo new app`) are kept file by file, leaving
+  their own `.git` alone. Without Git for Windows, files are copied aside before the agent changes them.
   Going back from History resets to that task's commit; with copied files, each later task is restored in turn,
   newest first. The agent is told what was undone at the start of its next task.
 - **Data**: `%APPDATA%\RulZ Coding Agent` holds settings, recent projects, each project's history and restore points.

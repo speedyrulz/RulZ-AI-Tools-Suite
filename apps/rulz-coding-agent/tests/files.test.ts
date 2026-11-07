@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -46,6 +46,20 @@ describe('path guard', () => {
   it('protects .git folders and the project folder itself from writes', async () => {
     await expect(resolveInProject(root, '.git/config', { write: true })).rejects.toThrow(/\.git/)
     await expect(resolveInProject(root, '.', { write: true })).rejects.toThrow(/not the project folder/)
+    await expect(resolveInProject(root, '.git./config', { write: true })).rejects.toThrow(/\.git/)
+  })
+
+  it('protects .git from writes through its short (8.3) name', async () => {
+    mkdirSync(join(root, '.git'), { recursive: true })
+    writeFileSync(join(root, '.git', 'config'), '[core]\n')
+    try {
+      // Only where the drive makes short names (most system drives do).
+      if (!existsSync(join(root, 'GIT~1', 'config'))) return
+      await expect(resolveInProject(root, 'GIT~1/config', { write: true })).rejects.toThrow(/\.git/)
+      await expect(resolveInProject(root, 'git~1/hooks/pre-commit', { write: true })).rejects.toThrow(/\.git/)
+    } finally {
+      rmSync(join(root, '.git'), { recursive: true, force: true })
+    }
   })
 
   it('compares paths without regard to case on Windows', () => {

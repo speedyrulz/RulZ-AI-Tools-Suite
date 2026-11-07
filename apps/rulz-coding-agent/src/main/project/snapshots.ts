@@ -27,8 +27,30 @@ export const SNAPSHOT_EXCLUDES = [
   '.mypy_cache/',
   '*.log',
   'Thumbs.db',
-  '.DS_Store'
+  '.DS_Store',
+  // Big build folders their tools rebuild. Restore points don't follow the project's own
+  // .gitignore (it often lists files that matter, like .env), so these are named here.
+  'target/',
+  '.gradle/',
+  '.tox/',
+  '.nox/',
+  '.turbo/',
+  '.svelte-kit/',
+  '.nuxt/',
+  '.angular/',
+  '.terraform/'
 ]
+
+/** Folder names the project walk doesn't go into: the excluded folders above. */
+const EXCLUDED_DIRS = new Set([...SKIP_DIRS, ...SNAPSHOT_EXCLUDES.filter((p) => p.endsWith('/')).map((p) => p.slice(0, -1).toLowerCase())])
+
+const splitZ = (out: string | Buffer): string[] => String(out).split('\0').filter(Boolean)
+
+/**
+ * Attributes for every file, ahead of the project's own .gitattributes: files are stored and put
+ * back byte for byte (no line-ending changes, no LFS or other filters).
+ */
+const PLAIN_ATTRIBUTES = '* -text -eol -filter -ident -working-tree-encoding\n'
 
 /** Files bigger than this (videos, models…) are left out of restore points. */
 const BIG_FILE_BYTES = 50 * 1024 * 1024
@@ -66,7 +88,7 @@ export class GitSnapshots implements Snapshotter {
     private readonly workTree: string
   ) {}
 
-  private git(args: string[], opts: { buffer?: boolean } = {}): Promise<string | Buffer> {
+  private git(args: string[], opts: { buffer?: boolean; input?: string } = {}): Promise<string | Buffer> {
     const full = [
       '--git-dir',
       this.gitDir,
@@ -89,7 +111,7 @@ export class GitSnapshots implements Snapshotter {
       ...args
     ]
     return new Promise((resolve, reject) => {
-      execFile(
+      const child = execFile(
         'git',
         full,
         { cwd: this.workTree, windowsHide: true, maxBuffer: 256 * 1024 * 1024, encoding: opts.buffer ? 'buffer' : 'utf8' },
@@ -98,7 +120,12 @@ export class GitSnapshots implements Snapshotter {
           else resolve(stdout)
         }
       )
+      if (opts.input !== undefined) child.stdin?.end(opts.input)
     })
+  }
+
+  private get specPath(): string {
+    return join(this.gitDir, 'info', 'rulz-add-pathspec')
   }
 
   private ensure(): Promise<void> {
@@ -119,19 +146,72 @@ export class GitSnapshots implements Snapshotter {
     return this.ready
   }
 
-  /** Writes the exclude list, adding any very large files found in the project. */
-  private async writeExcludes(): Promise<void> {
-    const big = await findBigFiles(this.workTree)
+  /**
+   * Walks the project and writes our own exclude list (with the very large files it found), the
+   * attributes that keep files byte for byte, and the pathspecs `git add` uses (the whole project
+   * apart from folders with a repository of their own, which it returns).
+   */
+  private async writeExcludes(): Promise<{ nested: string[] }> {
+    const { big, nested } = await scanProject(this.workTree)
     const lines = ['# Managed by RulZ Coding Agent', ...SNAPSHOT_EXCLUDES, ...big.map((p) => `/${p.replace(/([*?[\]!#])/g, '\\$1')}`)]
+    const spec = ['.', ...nested.map((p) => `:(exclude,literal)${p}`)]
     await fs.mkdir(join(this.gitDir, 'info'), { recursive: true })
     await fs.writeFile(join(this.gitDir, 'info', 'exclude'), lines.join('\n') + '\n', 'utf8')
+    await fs.writeFile(join(this.gitDir, 'info', 'attributes'), PLAIN_ATTRIBUTES, 'utf8')
+    await fs.writeFile(this.specPath, spec.join('\n') + '\n', 'utf8')
+    return { nested }
   }
 
   private async commitAll(message: string): Promise<string> {
-    await this.writeExcludes()
-    await this.git(['add', '--all', '--ignore-errors', '.']).catch(() => this.git(['add', '--all', '.']))
+    const { nested } = await this.writeExcludes()
+    // Everything git takes by itself: changed and deleted files, and new ones neither the
+    // project's .gitignore nor our list leaves out. (Folders with a repository of their own are
+    // left out here: git refuses one without commits and stores one with commits as a bare link.)
+    const add = ['add', '--all', `--pathspec-from-file=${this.specPath}`]
+    await this.git([...add.slice(0, 2), '--ignore-errors', ...add.slice(2)]).catch(() => this.git(add))
+    // Then the rest, file by file: new files only the project's .gitignore leaves out, and the
+    // files of those folders (their own .git is never touched).
+    const inNested = (await Promise.all(nested.map((rel) => filesUnder(this.workTree, rel)))).flatMap((f) => f ?? [])
+    const tracked = nested.length ? splitZ(await this.git(['ls-files', '-z', '--', ...nested.map((rel) => `:(literal)${rel}`)])) : []
+    const paths = [...new Set([...(await this.ignoredKept()), ...inNested, ...tracked])]
+    if (paths.length) await this.git(['update-index', '--add', '--remove', '-z', '--stdin'], { input: paths.join('\0') + '\0' })
     await this.git(['commit', '--quiet', '--allow-empty', '--no-verify', '-m', message])
     return String(await this.git(['rev-parse', 'HEAD'])).trim()
+  }
+
+  /**
+   * New files the project's own .gitignore leaves out but restore points keep, because that list
+   * often names files that matter (.env, a data folder). Only our own list counts for leaving
+   * things out, except that a whole ignored folder that is big (build output such as bin/ or
+   * Library/) stays out, as before.
+   */
+  private async ignoredKept(): Promise<string[]> {
+    const ignored = splitZ(await this.git(['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z']))
+    const big = await this.bigFiles()
+    const out: string[] = []
+    for (const entry of ignored) {
+      const parts = entry.replace(/\/$/, '').split('/')
+      // Left out by our own list (git doesn't say which list ignored it).
+      if (parts.slice(0, entry.endsWith('/') ? undefined : -1).some((p) => EXCLUDED_DIRS.has(p.toLowerCase()))) continue
+      if (!entry.endsWith('/')) {
+        if (!big.has(entry) && !EXCLUDED_FILES.some((re) => re.test(parts[parts.length - 1]))) out.push(entry)
+        continue
+      }
+      const files = await filesUnder(this.workTree, entry.slice(0, -1), { maxFiles: KEPT_DIR_MAX_FILES, maxBytes: KEPT_DIR_MAX_BYTES })
+      if (files) out.push(...files)
+    }
+    return out
+  }
+
+  /** The very large files the last walk found (written into the exclude list). */
+  private async bigFiles(): Promise<Set<string>> {
+    const text = await fs.readFile(join(this.gitDir, 'info', 'exclude'), 'utf8').catch(() => '')
+    return new Set(
+      text
+        .split('\n')
+        .filter((l) => l.startsWith('/'))
+        .map((l) => l.slice(1).replace(/\\([*?[\]!#])/g, '$1'))
+    )
   }
 
   async begin(_taskId: string, label: string): Promise<Snapshot> {
@@ -154,8 +234,13 @@ export class GitSnapshots implements Snapshotter {
       if (!path) continue
       out.push({ path, change: status.startsWith('D') ? 'deleted' : status.startsWith('A') ? 'created' : 'changed' })
     }
-    const untracked = String(await this.git(['ls-files', '--others', '--exclude-standard', '-z'])).split('\0').filter(Boolean)
-    for (const path of untracked) out.push({ path, change: 'created' })
+    const created = splitZ(await this.git(['ls-files', '--others', '--exclude-standard', '-z']))
+    for (const path of created) {
+      // A new folder with a repository of its own is listed as just the folder: list its files.
+      if (path.endsWith('/')) for (const p of (await filesUnder(this.workTree, path.slice(0, -1))) ?? []) out.push({ path: p, change: 'created' })
+      else out.push({ path, change: 'created' })
+    }
+    for (const path of await this.ignoredKept()) out.push({ path, change: 'created' })
     return out.sort((a, b) => a.path.localeCompare(b.path))
   }
 
@@ -179,8 +264,14 @@ export class GitSnapshots implements Snapshotter {
   }
 }
 
-async function findBigFiles(root: string): Promise<string[]> {
+/**
+ * Walks the project (not the excluded folders): files too big for restore points, and folders
+ * other than the project itself that hold a git repository of their own (a .git folder, or a .git
+ * file as in submodules and worktrees).
+ */
+async function scanProject(root: string): Promise<{ big: string[]; nested: string[] }> {
   const big: string[] = []
+  const nested: string[] = []
   let level = [root]
   let scanned = 0
   while (level.length && scanned < 50_000) {
@@ -196,8 +287,10 @@ async function findBigFiles(root: string): Promise<string[]> {
       for (const e of entries) {
         scanned++
         const abs = join(dir, e.name)
-        if (e.isDirectory()) {
-          if (!SKIP_DIRS.has(e.name.toLowerCase()) && !e.isSymbolicLink()) next.push(abs)
+        if (e.name.toLowerCase() === '.git') {
+          if (dir !== root) nested.push(toRel(root, dir))
+        } else if (e.isDirectory()) {
+          if (!EXCLUDED_DIRS.has(e.name.toLowerCase()) && !e.isSymbolicLink()) next.push(abs)
         } else if (e.isFile()) filesHere.push(abs)
       }
       // One folder's files are looked at together rather than one after another.
@@ -208,7 +301,54 @@ async function findBigFiles(root: string): Promise<string[]> {
     }
     level = next
   }
-  return big
+  return { big, nested }
+}
+
+/** Excluded file names (`*.log`, `Thumbs.db`, …) as tests. */
+const EXCLUDED_FILES = SNAPSHOT_EXCLUDES.filter((p) => !p.endsWith('/')).map(
+  (p) => new RegExp(`^${p.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*')}$`, 'i')
+)
+
+/** A folder the project's .gitignore leaves out as a whole is kept in restore points only up to this size. */
+const KEPT_DIR_MAX_FILES = 1000
+const KEPT_DIR_MAX_BYTES = 100 * 1024 * 1024
+
+/**
+ * Every file under a project folder (relative to the project), leaving out .git, the excluded
+ * folders and files, and very large files. Null when the folder is over the given limits.
+ */
+async function filesUnder(root: string, rel: string, limits: { maxFiles?: number; maxBytes?: number } = {}): Promise<string[] | null> {
+  const out: string[] = []
+  let bytes = 0
+  const over = (): boolean => out.length > (limits.maxFiles ?? Infinity) || bytes > (limits.maxBytes ?? Infinity)
+  const walk = async (dir: string): Promise<void> => {
+    let entries: Dirent[]
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    const files: string[] = []
+    const dirs: string[] = []
+    for (const e of entries) {
+      const abs = join(dir, e.name)
+      if (e.isDirectory()) {
+        if (!EXCLUDED_DIRS.has(e.name.toLowerCase()) && !e.isSymbolicLink()) dirs.push(abs)
+      } else if (e.isFile() && !EXCLUDED_FILES.some((re) => re.test(e.name))) files.push(abs)
+    }
+    const sizes = await Promise.all(files.map((abs) => fs.stat(abs).then((s) => s.size, () => 0)))
+    files.forEach((abs, i) => {
+      if (sizes[i] > BIG_FILE_BYTES) return
+      out.push(toRel(root, abs))
+      bytes += sizes[i]
+    })
+    for (const d of dirs) {
+      if (over()) return
+      await walk(d)
+    }
+  }
+  await walk(join(root, rel))
+  return over() ? null : out
 }
 
 interface CopyManifest {

@@ -68,6 +68,31 @@ describe.runIf(process.platform === 'win32')('running commands', { timeout: 30_0
     expect(commandReport(r, 60_000).text).toMatch(/owner stopped/)
   }, 30_000)
 
+  it('does not hang when PowerShell exits but a program it started keeps its output open', async () => {
+    // Start-Process -NoNewWindow hands the program PowerShell's output: it used to keep the command
+    // "running" until the program ended, and neither Stop nor the time limit could end it.
+    const started = Date.now()
+    const r = await runCommand("Start-Process -NoNewWindow ping -ArgumentList '-n','60','127.0.0.78'; Write-Output started", { cwd, timeoutMs: 120_000 })
+    expect(Date.now() - started).toBeLessThan(20_000)
+    expect(r.exitCode).toBe(0)
+    expect(r.output).toMatch(/started/)
+    expect(r.output).toMatch(/kept running, so it was stopped[\s\S]*start_background_command/i)
+    await new Promise((res) => setTimeout(res, 500))
+    expect(processWithMarker('127.0.0.78')).toBe(false)
+  }, 40_000)
+
+  it('Stop ends such a command at once, too', async () => {
+    const ctrl = new AbortController()
+    const started = Date.now()
+    const running = runCommand("Start-Process -NoNewWindow ping -ArgumentList '-n','60','127.0.0.79'", { cwd, timeoutMs: 120_000, signal: ctrl.signal })
+    setTimeout(() => ctrl.abort(), 2500)
+    const r = await running
+    expect(r.stopped).toBe(true)
+    expect(Date.now() - started).toBeLessThan(20_000)
+    await new Promise((res) => setTimeout(res, 500))
+    expect(processWithMarker('127.0.0.79')).toBe(false)
+  }, 40_000)
+
   it('runs, checks and stops background commands', async () => {
     const bg = new BackgroundCommands()
     const id = bg.run('Write-Output "server ready"; Start-Sleep -Seconds 60', cwd)

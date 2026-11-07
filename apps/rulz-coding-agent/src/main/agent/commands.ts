@@ -1,6 +1,6 @@
 // Runs PowerShell commands in the project folder: streamed output, time limits, and killing the
 // whole process tree on Stop.
-import { spawn, type ChildProcess } from 'node:child_process'
+import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { existsSync, readdirSync } from 'node:fs'
 import { delimiter, join } from 'node:path'
 import { childPids } from './childPids'
@@ -122,6 +122,63 @@ export function killTree(child: ChildProcess): Promise<void> {
   })
 }
 
+/** Kills one process and everything it started; resolves when taskkill is done. */
+function killPid(pid: number): Promise<void> {
+  return new Promise((resolve) => {
+    const p = spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
+    p.on('error', () => resolve())
+    p.on('exit', () => resolve())
+  })
+}
+
+/**
+ * Programs that `pid` started which are still running after it exited (Windows keeps their parent
+ * id). Only those started at or after `since` count, so a reused process id can't pick up strangers.
+ */
+export async function leftoverChildren(pid: number, since: number): Promise<{ pid: number; name: string }[]> {
+  if (process.platform !== 'win32') return []
+  const script =
+    `Get-CimInstance Win32_Process -Filter "ParentProcessId=${pid}" | ` +
+    `ForEach-Object { '{0} {1} {2}' -f $_.ProcessId, ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds(), $_.Name }`
+  const out = await new Promise<string>((resolve) =>
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, timeout: 20_000 }, (_err, stdout) =>
+      resolve(String(stdout ?? ''))
+    )
+  )
+  return out.split(/\r?\n/).flatMap((line) => {
+    const m = /^(\d+) (\d+) (.+)$/.exec(line.trim())
+    if (!m || Number(m[2]) < since - 1000 || /^conhost\.exe$/i.test(m[3])) return []
+    return [{ pid: Number(m[1]), name: m[3] }]
+  })
+}
+
+/**
+ * What a PowerShell that has already exited left running and holding its output open (such as
+ * `Start-Process -NoNewWindow`), with a note for the model about it.
+ */
+async function findLeftovers(child: ChildProcess, since: number): Promise<{ kids: { pid: number; name: string }[]; note: string }> {
+  const kids = child.pid === undefined ? [] : await leftoverChildren(child.pid, since)
+  if (!kids.length) {
+    return {
+      kids,
+      note: '\n[PowerShell finished, but a program it started is still running and holding on to its output, so it was left running. Use start_background_command for programs that keep running.]'
+    }
+  }
+  const names = [...new Set(kids.map((k) => k.name))].join(', ')
+  return { kids, note: `\n[PowerShell finished, but a program it started (${names}) kept running, so it was stopped. Use start_background_command for programs that keep running.]` }
+}
+
+/** Stops the leftovers, then lets go of the output (anything that couldn't be found isn't waited for). */
+async function endLeftovers(child: ChildProcess, kids: { pid: number }[]): Promise<void> {
+  await Promise.all(kids.map((k) => killPid(k.pid)))
+  await new Promise((r) => setTimeout(r, 500))
+  child.stdout?.destroy()
+  child.stderr?.destroy()
+}
+
+/** How long an exited PowerShell's output may stay open (a program it started holds it) before that program is stopped. */
+export const EXIT_GRACE_MS = 3000
+
 export function startShell(command: string, cwd: string, opts: { waitForStarted?: boolean } = {}): ChildProcess {
   const shell = process.platform === 'win32' ? 'powershell.exe' : 'pwsh'
   return spawn(shell, powershellArgs(command, opts), {
@@ -148,7 +205,14 @@ export function runCommand(
     let output = ''
     let timedOut = false
     let stopped = false
+    let settled = false
+    let note = ''
+    let exited = false
+    let exitCode: number | null = null
+    let graceTimer: NodeJS.Timeout | undefined
+    let cleaning: Promise<void> | null = null
     let child: ChildProcess
+    const startedAt = Date.now()
     try {
       child = (opts.start ?? startShell)(command, opts.cwd)
     } catch (e) {
@@ -166,24 +230,47 @@ export function runCommand(
     child.stdout?.on('data', take(new TextDecoder()))
     child.stderr?.on('data', take(new TextDecoder()))
 
+    const finish = (code: number | null, extra = ''): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      clearTimeout(graceTimer)
+      opts.signal?.removeEventListener('abort', onAbort)
+      resolve({ exitCode: code, output: cleanOutput(output + extra + note), timedOut, stopped })
+    }
+    // Once PowerShell has exited, its output closing is all that is left to wait for; a program it
+    // started can hold that open for good, and killing PowerShell's tree can't reach it any more.
+    const cleanUpAfterExit = (): Promise<void> =>
+      (cleaning ??= (async () => {
+        const found = await findLeftovers(child, startedAt)
+        if (settled) return
+        // Set before the output closes, so the report that follows includes it.
+        note = found.note
+        await endLeftovers(child, found.kids)
+        finish(exitCode)
+      })())
+    const stopAll = (): void => {
+      if (exited) void cleanUpAfterExit()
+      else void killTree(child)
+    }
     const timer = setTimeout(() => {
       timedOut = true
-      void killTree(child)
+      stopAll()
     }, opts.timeoutMs)
     const onAbort = (): void => {
       stopped = true
-      void killTree(child)
+      stopAll()
     }
     if (opts.signal?.aborted) onAbort()
     else opts.signal?.addEventListener('abort', onAbort, { once: true })
 
-    const finish = (exitCode: number | null, extra = ''): void => {
-      clearTimeout(timer)
-      opts.signal?.removeEventListener('abort', onAbort)
-      resolve({ exitCode, output: cleanOutput(output + extra), timedOut, stopped })
-    }
     child.on('error', (e) => finish(null, `\n${e.message}`))
-    child.on('close', (code) => finish(code))
+    child.on('exit', (code) => {
+      exited = true
+      exitCode = code
+      if (!settled) graceTimer = setTimeout(() => void cleanUpAfterExit(), EXIT_GRACE_MS)
+    })
+    child.on('close', (code) => finish(code ?? exitCode))
   })
 }
 
@@ -242,6 +329,7 @@ interface BackgroundProc {
   seen: number
   exitCode: number | null
   running: boolean
+  startedAt: number
 }
 
 /** Long-running commands (apps, dev servers) the agent starts and checks on later. */
@@ -256,7 +344,7 @@ export class BackgroundCommands {
     const child = this.start(command, cwd, { waitForStarted: true })
     // Recorded so a crash doesn't leave it running for good (stopped at the next start).
     childPids.add(child.pid)
-    const proc: BackgroundProc = { id, command, child, output: '', seen: 0, exitCode: null, running: true }
+    const proc: BackgroundProc = { id, command, child, output: '', seen: 0, exitCode: null, running: true, startedAt: Date.now() }
     const take = (decoder: InstanceType<typeof TextDecoder>) => (buf: Buffer) => {
       const chunk = decoder.decode(buf, { stream: true })
       proc.output += chunk
@@ -303,7 +391,13 @@ export class BackgroundCommands {
     const proc = this.procs.get(id)
     if (!proc) return { text: `There is no background command "${id}".`, isError: true }
     this.procs.delete(id)
-    if (proc.running) await killTree(proc.child)
+    const { child } = proc
+    if (proc.running && (child.exitCode !== null || child.signalCode !== null)) {
+      // PowerShell is gone but its output is still open: what it started (e.g. through
+      // Start-Process -NoNewWindow) is still running, and killing PowerShell's tree can't reach it.
+      await endLeftovers(child, (await findLeftovers(child, proc.startedAt)).kids)
+      proc.running = false
+    } else if (proc.running) await killTree(child)
     return { text: `Stopped ${id} (${proc.command}).`, isError: false }
   }
 

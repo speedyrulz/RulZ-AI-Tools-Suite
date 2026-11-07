@@ -274,7 +274,7 @@ export interface ProjectState {
 
 // ---------- Questions the agent asks the owner ----------
 
-export type RiskKind = 'install-global' | 'admin' | 'outside-project' | 'system-settings' | 'internet' | 'delete' | 'stop-programs'
+export type RiskKind = 'install-global' | 'admin' | 'outside-project' | 'system-settings' | 'internet' | 'delete' | 'stop-programs' | 'hidden'
 
 export interface ApprovalRequest {
   id: string

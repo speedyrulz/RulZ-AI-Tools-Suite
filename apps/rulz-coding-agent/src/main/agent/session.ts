@@ -617,6 +617,9 @@ export class ProjectSession {
   }
 
   private ask(req: DistributiveOmit<PendingPrompt, 'id'>, signal: AbortSignal): Promise<PromptAnswer | null> {
+    // Stop pressed while this step was getting ready (e.g. starting a tool server): its 'abort'
+    // event has already fired, so a question now could never be ended by Stop.
+    if (signal.aborted) return Promise.resolve(null)
     const request = { ...req, id: randomUUID() } as PendingPrompt
     const previous = this.statusNow
     return new Promise<PromptAnswer | null>((resolve) => {
@@ -808,21 +811,32 @@ export class ProjectSession {
   }
 
   /** A tool-server tool by name, starting the servers first if needed (the model may call one it remembers). */
-  private async extraTool(name: string): Promise<ToolInfo | undefined> {
+  private async extraTool(name: string, signal: AbortSignal): Promise<ToolInfo | undefined> {
     const servers = this.deps.toolServers
     if (!servers || !this.extraServers.length || !name.includes('__')) return undefined
     const found = servers.find(name)
     if (found) return found
-    await this.startToolServers()
+    await this.startToolServers(signal)
     return servers.find(name)
   }
 
-  private async startToolServers(): Promise<void> {
+  /** Starts the tool servers that aren't running; Stop ends the wait at once (they keep starting, for next time). */
+  private async startToolServers(signal: AbortSignal): Promise<void> {
     const servers = this.deps.toolServers!
     const waiting = this.extraServers.filter((n) => servers.status().servers.find((s) => s.name === n)?.state !== 'connected')
     if (!waiting.length) return
     this.setStatus({ phase: 'working', text: `Starting ${waiting.map(serverLabel).join(' and ')}… (the first time can take a minute)` })
-    await servers.start()
+    if (signal.aborted) throw new StopTask()
+    let onAbort = (): void => undefined
+    const stopped = new Promise<never>((_, reject) => {
+      onAbort = () => reject(new StopTask())
+      signal.addEventListener('abort', onAbort, { once: true })
+    })
+    try {
+      await Promise.race([servers.start(), stopped])
+    } finally {
+      signal.removeEventListener('abort', onAbort)
+    }
   }
 
   /** Adds tools to the loaded set (newest last), unloading the oldest while they take more than their share of the context. */
@@ -871,7 +885,15 @@ export class ProjectSession {
       return finish({ text: parsed.error + cut, isError: true })
     }
     const known = TOOL_NAMES.has(name) || (this.extraServers.length > 0 && EXTRA_TOOL_NAMES.has(name))
-    const extra = known ? undefined : await this.extraTool(name).catch(() => undefined)
+    const extra = known
+      ? undefined
+      : await this.extraTool(name, signal).catch(() => {
+          if (signal.aborted) {
+            this.updateStep(step, { status: 'skipped' })
+            throw new StopTask()
+          }
+          return undefined
+        })
     if (!known && !extra) {
       const more = this.extraServers.length ? ' Tools from the tool servers are found with find_tools and loaded with load_tools.' : ''
       return finish({ text: `There is no tool named "${name}". The tools are: ${[...TOOL_NAMES].join(', ')}.${more}`, isError: true })
@@ -897,14 +919,20 @@ export class ProjectSession {
     }
   }
 
-  /** Asks the owner when the approval level requires it. */
+  /**
+   * Asks the owner when the approval level requires it. A command with several risks passes one
+   * action per risk: it is asked about unless every one of them is allowed, and "Allow for this
+   * task" then covers all of them.
+   */
   private async approve(
     step: Step,
-    action: ActionKind,
+    actions: ActionKind | ActionKind[],
     what: { action: string; detail: string; risk?: string },
     signal: AbortSignal
   ): Promise<boolean> {
-    if (!needsApproval(this.deps.settings().approval, action, this.allowed)) return true
+    const list = Array.isArray(actions) ? actions : [actions]
+    const level = this.deps.settings().approval
+    if (!list.some((a) => needsApproval(level, a, this.allowed))) return true
     this.updateStep(step, { status: 'waiting' })
     const lastText = [...this.data.messages].reverse().find((m) => m.role === 'assistant')?.content.trim() ?? ''
     const why = lastText ? (lastText.length > 500 ? `${lastText.slice(0, 500)}…` : lastText) : `${step.title}.`
@@ -912,7 +940,7 @@ export class ProjectSession {
     if (!answer) throw new StopTask()
     this.updateStep(step, { status: 'running' })
     if (answer.kind !== 'approval' || answer.decision === 'deny') return false
-    if (answer.decision === 'allow-task') this.allowed.add(approvalKey(action))
+    if (answer.decision === 'allow-task') for (const a of list) this.allowed.add(approvalKey(a))
     return true
   }
 
@@ -984,11 +1012,15 @@ export class ProjectSession {
             }
           }
         }
-        const risk = verdict.verdict === 'ask' ? verdict.kind : undefined
+        const risks = verdict.verdict === 'ask' ? verdict.risks : []
         const ok = await this.approve(
           step,
-          { type: 'command', risk },
-          { action: name === 'start_background_command' ? `${step.title} (keeps running in the background)` : step.title, detail: command, risk: verdict.verdict === 'ask' ? verdict.reason : undefined },
+          risks.length ? risks.map((r): ActionKind => ({ type: 'command', risk: r.kind })) : { type: 'command' },
+          {
+            action: name === 'start_background_command' ? `${step.title} (keeps running in the background)` : step.title,
+            detail: command,
+            risk: risks.length ? risks.map((r) => r.reason).join(' ') : undefined
+          },
           signal
         )
         if (!ok) return denied(`run "${command}"`)
@@ -1034,7 +1066,7 @@ export class ProjectSession {
         if (!servers) return { text: 'There are no extra tools here.', isError: true }
         const query = typeof args.query === 'string' ? args.query.trim() : ''
         if (!query) return { text: 'Give some keywords to search for, e.g. "decompile function".', isError: true }
-        await this.startToolServers()
+        await this.startToolServers(signal)
         const states = servers.status().servers.filter((s) => this.extraServers.includes(s.name))
         const broken = states.filter((s) => s.state === 'error').map((s) => `${serverLabel(s.name)} could not start: ${s.error ?? 'unknown problem'}`)
         const limit = typeof args.limit === 'number' ? Math.min(30, Math.max(1, Math.round(args.limit))) : 10
@@ -1056,7 +1088,7 @@ export class ProjectSession {
         if (!servers) return { text: 'There are no extra tools here.', isError: true }
         const names = (Array.isArray(args.names) ? args.names : typeof args.names === 'string' ? args.names.split(/[,\s]+/) : []).map(String).filter(Boolean)
         if (!names.length) return { text: 'Give the tool names to load, e.g. ["rea__open_binary"].', isError: true }
-        await this.startToolServers()
+        await this.startToolServers(signal)
         const found = names.map((n) => ({ n, t: servers.find(n.trim()) }))
         const tools = found.flatMap((f) => (f.t ? [f.t] : []))
         const missing = found.filter((f) => !f.t).map((f) => f.n)

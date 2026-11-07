@@ -917,3 +917,62 @@ describe('deleting and redoing messages', () => {
     }
   })
 })
+
+describe('stopping and approving safely', () => {
+  it('Stop while tool servers start ends the task at once, with no question afterwards', async () => {
+    const tool = { qualifiedName: 'rea__open_binary', server: 'rea', name: 'open_binary', inputSchema: { type: 'object' }, destructive: false }
+    let started = false
+    const servers: SessionDeps['toolServers'] = {
+      configured: async () => ['rea'],
+      status: () => ({ configPath: '', error: null, servers: [{ name: 'rea', state: started ? 'connected' : 'stopped', tools: 1, log: [] } as never] }),
+      // Slow, like REA's first start.
+      start: async () => {
+        await new Promise((r) => setTimeout(r, 3000))
+        started = true
+      },
+      find: (name: string) => (started && name === tool.qualifiedName ? tool : undefined),
+      search: () => [],
+      instructions: () => [],
+      call: async () => ({ text: 'ran', isError: false })
+    }
+    let stoppedAt = 0
+    const h = await harness([{ toolCalls: [call('rea__open_binary', { path: 'x.exe' })] }, { content: 'never reached' }], {
+      toolServers: servers,
+      answer: () => null,
+      onEvent: (e, s) => {
+        if (!stoppedAt && e.type === 'status' && 'text' in e.status && e.status.text.startsWith('Starting')) {
+          stoppedAt = Date.now()
+          setTimeout(() => s.stop(), 50)
+        }
+      }
+    })
+    try {
+      const task = await h.run('Open it with REA')
+      expect(task.outcome).toBe('stopped')
+      expect(Date.now() - stoppedAt).toBeLessThan(2000)
+      // The server finishing its start later must not bring up a question.
+      await new Promise((r) => setTimeout(r, 3500))
+      expect(h.prompts).toEqual([])
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('asks about every risk in a command, even when one of them was allowed for the task', async () => {
+    const h = await harness(
+      [
+        { toolCalls: [call('run_command', { command: "Write-Output 'npm i -g typescript'", summary: 'One' })] },
+        { toolCalls: [call('run_command', { command: "Write-Output 'npm i -g typescript'; Write-Output 'rm old.txt'", summary: 'Two' })] },
+        { content: 'Done.' }
+      ],
+      { settings: { approval: 'handsoff' }, answer: (p) => (p.kind === 'approval' ? { kind: 'approval', decision: 'allow-task' } : null) }
+    )
+    try {
+      await h.run('Install it')
+      expect(h.prompts).toHaveLength(2)
+      expect(h.prompts[1]).toMatchObject({ kind: 'approval', risk: expect.stringMatching(/whole computer[\s\S]*deletes files/) })
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+})
