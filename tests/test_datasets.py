@@ -42,6 +42,9 @@ def test_dataset_specs_fall_back_to_dataset_dir_and_sides_are_the_union():
 
 def test_dataset_list_validation(tmp_path):
     TrainConfig(datasets=[{"path": "a"}, {"path": "b", "repeats": 2, "resolutions": [0.5]}]).validate()
+    # each dataset's own trigger and LoRA Isolation subject: what the WebUI's dataset picker writes
+    TrainConfig(datasets=[{"path": "a", "trigger": "ohwx", "class": "man", "kind": "person"},
+                          {"path": "b", "trigger": "sks", "class": "woman"}]).validate()
     for bad, msg in (([{"path": "a"}, {"path": "./a"}], "listed twice"),
                      ([{"path": str(tmp_path)}, {"path": str(tmp_path / "sub")}], "lies inside"),
                      ([{"path": "a", "repeats": 0}], "repeats"),
@@ -72,6 +75,34 @@ def test_scan_each_dataset_at_its_resolutions_with_its_repeats_and_cache(tmp_pat
         D.scan_dataset(TrainConfig(datasets=[{"path": str(a)}, {"path": str(tmp_path / "empty")}]))
     with pytest.raises(FileNotFoundError):
         D.scan_dataset(TrainConfig(datasets=[{"path": str(tmp_path / "missing")}]))
+
+
+def test_weighted_epochs_draw_each_image_its_share_and_skip_a_bucket_weighted_out(tmp_path):
+    """Sampling weights set each image's count per epoch to the floor or the ceiling of its expected count (not draws
+    with replacement, which skip some images every epoch); a bucket whose every image weighs 0 is left out, not an
+    error (loss watch excluding the one image of its aspect ratio)."""
+    def item(i, w, h):
+        return D.Item(image=tmp_path / f"{i}.png", caption="", width=w, height=h, latent_path=tmp_path / "l",
+                      latent_flip_path=None, text_path=tmp_path / "t")
+
+    square = [item(i, 512, 512) for i in range(20)]
+    wide = [item(99, 768, 384)]
+    batcher = D.BucketBatcher(square + wide, batch_size=1, seed=0)
+    weights = {it.key: 1.0 for it in square}
+    weights.update({square[0].key: 0.0, square[1].key: 3.0, wide[0].key: 0.0})
+    batcher.set_weights(weights)
+    total = sum(weights[it.key] for it in square)
+    for _ in range(10):
+        counts: dict[str, int] = {}
+        for batch in batcher.epoch():
+            for it in batch:
+                counts[it.key] = counts.get(it.key, 0) + 1
+        assert sum(counts.values()) == 20 and wide[0].key not in counts and square[0].key not in counts
+        for it in square[1:]:
+            expected = 20 * weights[it.key] / total
+            assert int(expected) <= counts.get(it.key, 0) <= int(expected) + 1
+    batcher.set_weights({it.key: 1.0 for it in square + wide})  # equal weights: every image once, like a shuffle
+    assert sorted(x.key for b in batcher.epoch() for x in b) == sorted(it.key for it in square + wide)
 
 
 def test_repeats_in_the_batcher_and_crop_items(tmp_path):

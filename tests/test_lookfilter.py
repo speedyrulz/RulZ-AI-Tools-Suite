@@ -61,6 +61,10 @@ def test_save_load_and_outliers(tmp_path):
     assert data["scores"] == {str(root / k): v for k, v in saved["scores"].items()}
     assert data["cutoff"] == pytest.approx(LF.fence(scores)[1])
     assert LF.outliers(root) == {str((root / "sub" / "f.png").resolve())}
+    # an image replaced under the same name since the scan is not the one that scored low
+    f = root / "sub" / "f.png"
+    f.write_bytes(f.read_bytes() + b"\0")
+    assert LF.outliers(root) == set()
     # Fizgig's file (scores by stem) is read when there is none of ours
     (root / LF.SCORES_FILE).unlink()
     (root / LF.FIZGIG_FILE).write_text(json.dumps({"baselines": ["a.png"], "cutoff": 0.5,

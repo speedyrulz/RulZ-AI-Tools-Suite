@@ -165,3 +165,36 @@ def test_parse_report_refuses_what_is_not_a_config():
                                            ("  ..", "config.yaml"), ("", "config.yaml")])
 def test_config_file_name(job, name):
     assert webui.config_file_name(job) == name
+
+
+class _DatasetBox(Box):
+    selected: list = []
+
+
+def _filled_form(cfg: TrainConfig) -> webui.Form:
+    """A form with a widget for every value from_config fills, filled from `cfg`."""
+    keys = set(cfg.to_dict()) | {"model_preset", "soup_run", "noise_run", "race_paired", "sample_aspect", "sample_mp",
+                                 "turbo_mode", "sample_lora_mode", "adapter_mode"}
+    keys |= {f"target_{t}" for t in webui.TARGETS + list(webui.EXTRA_TARGETS)}
+    f = webui.Form()
+    f.w = {k: Box() for k in keys}
+    f.w["datasets"] = _DatasetBox()
+    f.set_quant_options = lambda *a: None
+    f.from_config(cfg)
+    return f
+
+
+def test_loaded_settings_without_a_field_survive_to_config():
+    """weight_decay, lora_dropout, the hull_* tuning, cache_dir...: no field on the Train page, so a loaded config's
+    values are kept (Load then Start or Save), not replaced by the defaults; model_arch goes back to auto, the family
+    following the model picked on the page. Each dataset keeps its own trigger, class and kind."""
+    loaded = TrainConfig(weight_decay=0.0, lora_dropout=0.1, hull_clip=3.0, cache_dir="mycache", model_arch="krea2",
+                         datasets=[{"path": "a", "trigger": "ohwx", "class": "man", "kind": "person"}])
+    f = _filled_form(loaded)
+    assert f.w["datasets"].value[0] == {"path": "a", "resolutions": [], "repeats": 1, "trigger": "ohwx",
+                                        "class": "man", "kind": "person"}
+    f.w["datasets"].value = loaded.datasets  # (the picker's own getter rebuilds these from its rows)
+    out = f.to_config()
+    assert (out.weight_decay, out.lora_dropout, out.hull_clip, out.cache_dir) == (0.0, 0.1, 3.0, "mycache")
+    assert out.model_arch == "auto" and out.datasets[0]["trigger"] == "ohwx"
+    assert webui.Form().w == {}  # (a fresh page without a loaded config: the defaults, as before)

@@ -59,6 +59,10 @@ def test_to_cells_and_weight_map_and_flip():
     raw_face, raw_bg = w[0, 2], w[0, 0]
     assert raw_face > w[2, 3] > raw_bg  # face > person > background after normalisation
     assert rm.prior[0, 0, 0] and not rm.prior[0, 0, 3]
+    # the background is where neither the person nor the face is, whatever their weights (body weighted like the
+    # background is still the subject)
+    same = R.build_weight_map(128, 64, (40.0, 8.0, 56.0, 24.0), mask, 3.0, 1.0, 1.0, face_margin=0.0, feather=0)
+    assert torch.equal(same.prior, rm.prior) and same.prior[0, 0, 0] and not same.prior[0, 3, 3]
     fl = R.flip_region_map(rm, 128)
     assert fl.face_cells == (4, 0, 6, 2) and torch.equal(fl.weight, rm.weight.flip(-1))
     uni = R.uniform_region_map(128, 64)

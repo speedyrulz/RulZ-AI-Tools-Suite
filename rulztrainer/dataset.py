@@ -110,6 +110,16 @@ def describe_sides(cfg: TrainConfig) -> str:
     return ", ".join(f"{side_to_mp(s):g} MP" for s in cfg.training_sides())
 
 
+def upright_size(path: Path) -> tuple[int, int]:
+    """(width, height) as ImageOps.exif_transpose turns the picture, from the header alone: transposing decodes the
+    whole image, which a scan of every training photo at every start does not need."""
+    with Image.open(path) as im:
+        w, h = im.size
+        if im.getexif().get(0x0112, 1) in (5, 6, 7, 8):  # Orientation: the rotations by 90 degrees
+            w, h = h, w
+    return w, h
+
+
 def load_image_fit(path: Path, w: int, h: int, src_box=None) -> Image.Image:
     img = Image.open(path)
     img = ImageOps.exif_transpose(img).convert("RGB")
@@ -160,8 +170,7 @@ def scan_dataset(cfg: TrainConfig) -> list[Item]:
             if p.suffix.lower() not in IMAGE_EXTS or skipped(p, root):
                 continue
             try:
-                with Image.open(p) as im:
-                    w, h = ImageOps.exif_transpose(im).size
+                w, h = upright_size(p)
             except Exception as e:  # noqa: BLE001
                 log.warning("Skipping unreadable image %s: %s", p, e)
                 continue
@@ -487,15 +496,34 @@ class BucketBatcher:
         """Per-image sampling weights keyed by item.key; None restores uniform shuffling."""
         self.weights = weights
 
+    def _resample(self, group: list[Item], ws: list[float]) -> list[Item]:
+        """len(group) draws in proportion to the weights, systematically: each item comes up the floor or the ceiling
+        of its expected count (independent draws with replacement skip some images every epoch and repeat others,
+        even where every weight is equal). Zero weights: never; all zero: an empty bucket."""
+        total = sum(ws)
+        if total <= 0:
+            return []
+        n = len(group)
+        step = total / n
+        pos = self.rng.random() * step
+        out, cum = [], 0.0
+        for it, w in zip(group, ws):
+            cum += w
+            while pos < cum and len(out) < n:
+                out.append(it)
+                pos += step
+        last = next(it for it, w in zip(reversed(group), reversed(ws)) if w > 0)
+        out += [last] * (n - len(out))  # floating-point shortfall at the very end
+        return out
+
     def epoch(self):
         batches = []
         for group in self.buckets.values():
             if self.weights:
-                ws = [self.weights.get(it.key, 1.0) for it in group]
-                group = self.rng.choices(group, weights=ws, k=len(group))
+                group = self._resample(group, [max(0.0, float(self.weights.get(it.key, 1.0))) for it in group])
             else:
                 group = group[:]
-                self.rng.shuffle(group)
+            self.rng.shuffle(group)
             for i in range(0, len(group), self.batch_size):
                 batches.append(group[i:i + self.batch_size])
         self.rng.shuffle(batches)

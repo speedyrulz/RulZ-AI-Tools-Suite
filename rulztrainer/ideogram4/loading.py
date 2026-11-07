@@ -33,6 +33,7 @@ from pathlib import Path
 import torch
 
 from ..config import TrainConfig
+from ..downloads import component_ready
 from ..moss import loading as moss_loading
 from . import prompts
 from . import single_file as isf
@@ -140,7 +141,7 @@ def resolve_model_dir(model_path: str, models_dir: str = "models", download: boo
     if p.is_dir():
         return p.resolve()
     local = Path(models_dir) / model_path.replace("/", "__")
-    if (local / "transformer" / "config.json").is_file():
+    if component_ready(local / "transformer"):  # (an interrupted download is resumed below)
         return local.resolve()
     if not download:
         raise FileNotFoundError(f"Model not found locally: {model_path} (looked in {local})")

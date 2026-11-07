@@ -5,8 +5,10 @@ size is unknown or the step is not a download (e.g. "loading weights").
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+import shutil
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -48,6 +50,27 @@ def download_url(url: str, dest: Path, label: str, progress: ProgressFn | None =
     return dest
 
 
+def component_ready(folder: Path) -> bool:
+    """A model component folder (transformer/, text_encoder/, ...) is wholly downloaded: its config.json, and every
+    shard its *.safetensors.index.json names (or a .safetensors file when it is not sharded). snapshot_download fetches
+    the small files first, so an interrupted download leaves the configs and indexes without some shards; the hub
+    moves each file into place only once it is complete."""
+    folder = Path(folder)
+    if not (folder / "config.json").is_file():
+        return False
+    indexes = list(folder.glob("*.safetensors.index.json"))
+    if not indexes:
+        return any(folder.glob("*.safetensors"))
+    for index in indexes:
+        try:
+            shards = set(json.loads(index.read_text(encoding="utf-8")).get("weight_map", {}).values())
+        except (OSError, ValueError):
+            return False
+        if not shards or any(not (folder / s).is_file() for s in shards):
+            return False
+    return True
+
+
 def ensure_insightface_pack(name: str = "buffalo_l", root: str = "~/.insightface",
                             progress: ProgressFn | None = None) -> Path:
     """Fetch the InsightFace model pack (about 300 MB for buffalo_l) the same way insightface does, with progress."""
@@ -61,9 +84,17 @@ def ensure_insightface_pack(name: str = "buffalo_l", root: str = "~/.insightface
     zip_path = root_dir / "models" / f"{name}.zip"
     download_url(url, zip_path, f"InsightFace model pack {name}", progress)
     _report(progress, f"Extracting {name}...", None)
-    pack_dir.mkdir(parents=True, exist_ok=True)
+    # into a side folder first, renamed when whole: an interrupted extraction must not leave a pack that looks
+    # installed (some .onnx files) and fails later on a missing detection or recognition model
+    tmp = pack_dir.with_name(pack_dir.name + ".extracting")
+    shutil.rmtree(tmp, ignore_errors=True)
     with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(pack_dir)
+        zf.extractall(tmp)
+    inner = tmp / name  # (a pack zipped with its folder inside)
+    src = inner if inner.is_dir() and not any(tmp.glob("*.onnx")) else tmp
+    shutil.rmtree(pack_dir, ignore_errors=True)
+    src.replace(pack_dir)
+    shutil.rmtree(tmp, ignore_errors=True)
     return pack_dir
 
 

@@ -205,12 +205,14 @@ def build_workbook_from(probes: list[dict], cfg, race_names=()):
             r, rr = 5 + i, 2 + i
             face, body = f"'{rname}'!B{rr}", f"'{rname}'!C{rr}"
             ws.cell(r, 1, f"='{rname}'!A{rr}").font = green
+            # the controller's smoothing: a probe without that score is skipped, the first one with it seeds it (a bare
+            # reference to an empty cell reads 0 in Excel and LibreOffice, so each one checks for "" first)
             if i == 0:
-                ws.cell(r, 9, f"={face}")
-                ws.cell(r, 10, f"={body}")
-            else:  # the controller's smoothing, skipping a probe without that score
-                ws.cell(r, 9, f'=IF({face}="",I{r - 1},{s(14)}*I{r - 1}+(1-{s(14)})*{face})')
-                ws.cell(r, 10, f'=IF({body}="",J{r - 1},{s(14)}*J{r - 1}+(1-{s(14)})*{body})')
+                ws.cell(r, 9, f'=IF({face}="","",{face})')
+                ws.cell(r, 10, f'=IF({body}="","",{body})')
+            else:
+                ws.cell(r, 9, f'=IF({face}="",I{r - 1},IF(I{r - 1}="",{face},{s(14)}*I{r - 1}+(1-{s(14)})*{face}))')
+                ws.cell(r, 10, f'=IF({body}="",J{r - 1},IF(J{r - 1}="",{body},{s(14)}*J{r - 1}+(1-{s(14)})*{body}))')
             ws.cell(r, 2, f'=IF(I{r}="","",{nrm(f"I{r}", 3, 15, 6)})')
             ws.cell(r, 3, f'=IF(J{r}="","",{nrm(f"J{r}", 7, 16, 10)})')
             ws.cell(r, 5, f'=IF({face}="","",{nrm(face, 3, 15, 6)})')

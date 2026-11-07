@@ -486,6 +486,8 @@ class Trainer(RaceParallelMixin):
         self.stop_file = self.job_dir / "STOP"
         if self.stop_file.exists():
             self.stop_file.unlink()
+        # a drop asked of an earlier run of this job name (Drop, then Kill or a crash) must not drop this run's row
+        (self.job_dir / "RACE_DROP").unlink(missing_ok=True)
         self.device = torch.device(cfg.device)
         self.arch = get_arch(cfg)  # confirmed against the model's transformer config once the model dir is resolved
         self.vae = None
@@ -757,6 +759,7 @@ class Trainer(RaceParallelMixin):
                     self.status.update(stage=f"copying SAM 3 to {d}")
                     holder.append(holder[0].clone(d))
                 fns = [(h.person_mask, h.device) for h in holder]
+            counts = {}  # (a race whose every configuration turns the maps off has no job)
             with contextlib.ExitStack() as stack:
                 if sam_gpu:  # keep SAM 3 resident for the whole batch instead of moving it per image
                     for h in holder:
@@ -1436,6 +1439,9 @@ class Trainer(RaceParallelMixin):
                 gather()
             grad_norm = step_grad_norm(params, cfg.clip_norm)
             if bad_gradients(params, grad_norm):  # the step counts, but nothing of it reaches the LoRA
+                disarm = getattr(optimizer, "disarm", None)
+                if disarm is not None:  # Keel: no step() to end its accumulation (zero_grad arms it again)
+                    disarm()
                 self.bad_steps += 1
                 self._skip_bad_step(step + 1, self.bad_steps)
                 if not math.isfinite(accum_loss):  # (the chart and the running average stay readable)
@@ -2970,6 +2976,10 @@ class Trainer(RaceParallelMixin):
         cs = shares.get(id(cfg))
         if cs is None:
             cs = shares[id(cfg)] = CleanShare(cfg, self.arch, log)
+            if cfg.optimizer.lower() in AUTOMAGIC:  # (as per_image_lr: its own per-parameter lr ignores group["lr"])
+                log.warning("clean_share with %s: its lower-share epochs train at the full learning rate, not half "
+                            "(the optimizer sets its own per-parameter rate); the shares of steps still apply",
+                            cfg.optimizer)
         ft = self.__dict__.get("ft")
         if ft is not None and ft.windows:
             cs.unit = "rotation"

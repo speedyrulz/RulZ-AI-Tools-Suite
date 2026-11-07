@@ -68,6 +68,10 @@ COMFY_PREFIX = "diffusion_model."
 PEFT_PREFIX = "transformer."
 LORA_FORMATS = ("comfy", "peft", "folded", "comfy_ab")
 FOLDED_ALPHA_KEY = "rulztrainer_lora_alpha"  # folded files: {module: alpha} the lora_B weights were multiplied by
+# the metadata save_lora writes from the tensors it saves (kind, alpha, layout): a caller's copy of another file's
+# description (post-hoc EMA keeps the newest checkpoint's) never carries these over
+FORMAT_META_KEYS = ("rulztrainer_network", "ss_network_module", "ss_network_args", "rulztrainer_dora",
+                    "lora_adapter_metadata", FOLDED_ALPHA_KEY, "rulztrainer_alpha")
 # peft 0.21 LoraConfig fields: diffusers rebuilds the adapter config from the file metadata with LoraConfig(**these)
 PEFT_CONFIG_TEMPLATE = {
     "alora_invocation_tokens": None,
@@ -194,13 +198,15 @@ def _apply_extras(x, out, extras, extra_biases):
             kind, first, second, scale = "lora", *e
         else:
             kind, first, second, scale = e
+        # non_blocking: a block-swapped layer's extras wait in pinned RAM (stage_extras); a blocking upload would sync
+        # the stream once per tensor per layer per denoising step
+        first, second = first.to(x.device, x.dtype, non_blocking=True), second.to(x.device, x.dtype, non_blocking=True)
         if kind == "lora":
-            h = nn.functional.linear(x, first.to(x.device, x.dtype))
-            out = out + nn.functional.linear(h, second.to(x.device, x.dtype)) * scale
+            out = out + nn.functional.linear(nn.functional.linear(x, first), second) * scale
         else:
-            out = out + lokr_update(x, first.to(x.device, x.dtype), second.to(x.device, x.dtype)) * scale
+            out = out + lokr_update(x, first, second) * scale
     for bias, scale in extra_biases:
-        out = out + bias.to(out.device, out.dtype) * scale
+        out = out + bias.to(out.device, out.dtype, non_blocking=True) * scale
     return out
 
 
@@ -884,8 +890,10 @@ def export_state_dict(injected: dict[str, LoRALinear], dtype=torch.bfloat16, fmt
             continue  # a race's switched-off layer (empty tensors)
         parts = {k: v.detach().to("cpu", dtype).contiguous() for k, v in m.adapter_params().items()}
         key = (PEFT_PREFIX if fmt == "peft" else COMFY_PREFIX) + name  # ComfyUI maps "transformer." for Krea 2
-        if "dora_scale" in parts:  # DoRA on the input axis: [1, in] (see the module docstring)
-            out[f"{key}.dora_scale"] = parts.pop("dora_scale").reshape(1, -1)
+        if "dora_scale" in parts:  # DoRA on the input axis: [1, in] (see the module docstring); always fp32: it holds
+            parts.pop("dora_scale")  # the column norms whole, and bf16's 0.4% steps are as large as what training moves
+            out[f"{key}.dora_scale"] = m.adapter_params()["dora_scale"].detach().to(
+                "cpu", torch.float32).reshape(1, -1).contiguous()
         if m.kind == "oft":  # LyCORIS diag-OFT keys; .alpha is the COFT norm cap (absent: none)
             out[f"{key}.oft_blocks"] = parts["oft_blocks"]
             if getattr(m, "constraint", 0.0) > 0:
@@ -896,16 +904,20 @@ def export_state_dict(injected: dict[str, LoRALinear], dtype=torch.bfloat16, fmt
             out[f"{key}.alpha"] = torch.tensor(1.0, dtype=torch.float32)  # full factors: no scaling
             continue
         down, up = parts["lora_down"], parts["lora_up"]
+        if fmt in ("folded", "comfy_ab"):
+            # alpha / rank folded into lora_B, from the full-precision weight; the stubs a fine-tune extraction, a race
+            # configuration or a weight average save have only adapter_params, alpha and rank
+            raw = m.adapter_params()["lora_up"].detach().to("cpu", torch.float32)
+            up = (raw * getattr(m, "scale", m.alpha / m.rank)).to(dtype).contiguous()
         if fmt == "peft":
             out[f"{PEFT_PREFIX}{name}.lora_A.weight"] = down
             out[f"{PEFT_PREFIX}{name}.lora_B.weight"] = up
         elif fmt == "folded":
             out[f"{key}.lora_A.weight"] = down
-            out[f"{key}.lora_B.weight"] = (m.lora_up.weight.detach().float().cpu() * m.scale).to(dtype).contiguous()
+            out[f"{key}.lora_B.weight"] = up
         elif fmt == "comfy_ab":  # read at scale 1 (alpha = rank): alpha / rank folded into lora_B
             out[f"{COMFY_PREFIX}{name}.lora_A.weight"] = down
-            out[f"{COMFY_PREFIX}{name}.lora_B.weight"] = (m.lora_up.weight.detach().float() * m.scale).to(
-                "cpu", dtype).contiguous()
+            out[f"{COMFY_PREFIX}{name}.lora_B.weight"] = up
         else:
             key = COMFY_PREFIX + name
             out[f"{key}.lora_down.weight"] = down
@@ -937,6 +949,10 @@ def save_lora(injected: dict[str, LoRALinear], path, metadata: dict | None = Non
     if isinstance(dtype, str):
         dtype = SAVE_DTYPES[dtype]
     meta = {"format": "pt", "rulztrainer_version": "0.1.0"}
+    if metadata:
+        meta.update({k: (v if isinstance(v, str) else json.dumps(v)) for k, v in metadata.items()})
+    for k in FORMAT_META_KEYS:  # describe these tensors, never the ones a copied description came with
+        meta.pop(k, None)
     kinds = network_kinds(injected)
     live = [m for m in injected.values() if getattr(m, "trainable", True)]
     dora = any(getattr(m, "dora", False) for m in live)
@@ -962,13 +978,25 @@ def save_lora(injected: dict[str, LoRALinear], path, metadata: dict | None = Non
     if fmt == "folded" and "lora" in kinds:
         meta[FOLDED_ALPHA_KEY] = json.dumps({n: float(m.alpha) for n, m in injected.items()
                                              if m.kind == "lora" and getattr(m, "trainable", True)}, sort_keys=True)
-    if metadata:
-        meta.update({k: (v if isinstance(v, str) else json.dumps(v)) for k, v in metadata.items()})
     if fmt == "comfy_ab" and "lora" in kinds:
         meta["rulztrainer_alpha"] = "folded into lora_B: read at alpha = rank"
         if "ss_network_dim" in meta:
             meta["ss_network_alpha"] = meta["ss_network_dim"]
     save_safetensors(export_state_dict(injected, dtype, fmt), path, metadata=meta)
+
+
+def file_format(path) -> str:
+    """The layout a LoRA file is saved in (one of LORA_FORMATS), for writing a file made from it the same way: peft
+    (transformer.<module>.lora_A/B), folded or comfy_ab (diffusion_model.<module>.lora_A/B, alpha folded into lora_B;
+    folded keeps the alphas in its metadata), else comfy (lora_down/up, or LoKr)."""
+    with safe_open(str(path), "pt") as f:
+        keys = [k for k in f.keys() if k.endswith(".lora_A.weight")]
+        meta = f.metadata() or {}
+    if not keys:
+        return "comfy"
+    if any(k.startswith(PEFT_PREFIX) for k in keys):
+        return "peft"
+    return "folded" if FOLDED_ALPHA_KEY in meta else "comfy_ab"
 
 
 def read_metadata(path) -> dict:
@@ -1111,6 +1139,7 @@ def parse_comfy_lora(state: dict[str, torch.Tensor], default_alpha: float | None
             continue
         alpha = state.get(f"{stem}.alpha")
         alpha = float(alpha) if alpha is not None else None
+        dims = []  # the rank of each factor stored as a low-rank pair
 
         def factor_of(part):
             w = state.get(f"{stem}.{part}")
@@ -1119,13 +1148,16 @@ def parse_comfy_lora(state: dict[str, torch.Tensor], default_alpha: float | None
             wa, wb = state.get(f"{stem}.{part}_a"), state.get(f"{stem}.{part}_b")
             if wa is None or wb is None:
                 return None
-            rank = wb.shape[0]
-            return (wa.float() @ wb.float()) * ((alpha / rank) if alpha is not None else 1.0)
+            dims.append(wb.shape[0])
+            return wa.float() @ wb.float()
 
         w1, w2 = factor_of("lokr_w1"), factor_of("lokr_w2")
         if w1 is None or w2 is None:
             continue
-        out[_module_name(stem)] = ("lokr", w1, w2, 1.0)  # full factors carry no alpha scaling (ComfyUI likewise)
+        # alpha / rank scales the Kronecker product once, the last decomposed factor's rank (ComfyUI and LyCORIS
+        # likewise; with both factors decomposed, scaling each would apply it twice); full factors: no scaling
+        scale = alpha / dims[-1] if dims and alpha is not None else 1.0
+        out[_module_name(stem)] = ("lokr", w1, w2, scale)
     for stem in stems:
         down = state.get(f"{stem}.lora_down.weight", state.get(f"{stem}.lora_A.weight"))
         up = state.get(f"{stem}.lora_up.weight", state.get(f"{stem}.lora_B.weight"))
