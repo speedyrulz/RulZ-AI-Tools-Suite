@@ -266,7 +266,7 @@ def cmd_files(args) -> int:
         picked += [p for p in loras if tag is None or tag in p.name]
     elif "best" in what:
         picked += [p for p in loras if p.stem.endswith("_best")]
-    show({"base": str(d.parent), "files": [{"path": p.relative_to(d.parent).as_posix(), "size": p.stat().st_size}
+    show({"base": str(d.parent.resolve()), "files": [{"path": p.relative_to(d.parent).as_posix(), "size": p.stat().st_size}
                                            for p in dict.fromkeys(picked)]})
     return 0
 

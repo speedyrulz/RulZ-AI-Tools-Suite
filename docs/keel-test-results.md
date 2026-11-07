@@ -7,7 +7,7 @@ page. Datasets are described only as far as a result needs: no names, prompts or
 Scores are on the trainer's normalized scale, where 0 is the base model and 100 is the mean of the references. Numbers
 from different runs are not comparable when their probes, scale or weights differ.
 
-## Where things stand (2026-11-05)
+## Where things stand (2026-11-06)
 
 | Question | Answer | Strength |
 |---|---|---|
@@ -15,12 +15,11 @@ from different runs are not comparable when their probes, scale or weights diffe
 | `automagic_max_lr` for Keel: 1e-3, 5e-4 or 3e-4? | No measurable difference at 1000 steps | One set, 8 seeds |
 | Does the body carry to a pose and scene unlike the data? | Yes, at 1000 steps, all three ceilings | One set, by eye and by score |
 | Is 2000 steps too many? | Not shown: scores were still rising near the end | One set |
-| Keel against AdamW 8-bit | **Not measured** | |
+| Keel against AdamW 8-bit | Repeated face gain (about 5 to 9 FaceNet points), no repeated body gain | One set, 2 seeds, [details](experimental-test-results.md) |
 | Hull against AdamW 8-bit | No measurable difference | One set, 4 runs each |
-| `keel_fb` against `keel` | **Not measured** | |
+| `keel_fb` against `keel` | Tie | One set, 1 seed |
 | Face gain, consensus gate and vote, lookahead, band weights | **Not measured** | |
 | Gauge preconditioner, cautious mask, paired sigma, each alone | **Not measured** | |
-| Keel on face likeness | **Not measured** | |
 
 The Wizard keeps recommending AdamW 8-bit until a race on a suitable set says otherwise.
 
