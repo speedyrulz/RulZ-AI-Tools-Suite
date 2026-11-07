@@ -29,6 +29,14 @@ def caption_path(img_path):
     return str(Path(img_path).with_suffix(".txt"))
 
 
+def caption_clashes(paths):
+    """Groups of images that share one caption file, e.g. photo.png and photo.jpg -> photo.txt."""
+    groups = {}
+    for p in paths:
+        groups.setdefault(os.path.normcase(caption_path(p)), []).append(p)
+    return [g for g in groups.values() if len(g) > 1]
+
+
 def decode_caption(data):
     """UTF-8 (with or without BOM); captions saved by older Windows tools in the ANSI code page
     still read correctly instead of turning into replacement characters."""
