@@ -13,7 +13,7 @@ from . import config, theme
 from .backend import CaptionEngine, ServerManager, StartCancelled, external_endpoints
 from .gridview import ImageGrid
 from .model import (BUSY, ERROR, IDLE, QUEUED, FilterProxy, ImageModel, caption_clashes, caption_path,
-                    collect_images)
+                    collect_images, load_entries, unique_new)
 from .settings_dialog import SettingsDialog
 
 MANAGED_KEYS = ("llama_server", "model", "mmproj", "gpus", "gpu_mode", "tensor_split", "ctx_size", "ngl",
@@ -25,6 +25,11 @@ class ServerBridge(QObject):
     ready = Signal(list)
     error = Signal(str)
     cancelled = Signal()
+
+
+class AddBridge(QObject):
+    progress = Signal(int)   # images read so far
+    done = Signal(object)    # (generation, entries, unreadable folders, error or "")
 
 
 class MainWindow(QMainWindow):
@@ -42,6 +47,9 @@ class MainWindow(QMainWindow):
         self.server_sig = None
         self.engine = CaptionEngine()
         self.bridge = ServerBridge()
+        self.adder = AddBridge()
+        self.adding = 0    # folder scans running in the background
+        self.add_gen = 0   # bumped by Clear List, so a scan that finishes afterwards adds nothing
         self.starting = False
         self.pending_job = None
         self.failures = 0
@@ -65,6 +73,8 @@ class MainWindow(QMainWindow):
         self._build_log_dock()
         self._build_status()
 
+        self.engine.started.connect(lambda p: self.model.set_status(p, BUSY))
+        self.engine.requeued.connect(lambda p: self.model.set_status(p, QUEUED))
         self.engine.captioned.connect(self._on_captioned)
         self.engine.failed.connect(self._on_failed)
         self.engine.warning.connect(self._on_warning)
@@ -74,6 +84,8 @@ class MainWindow(QMainWindow):
         self.bridge.ready.connect(self._servers_ready)
         self.bridge.error.connect(self._servers_error)
         self.bridge.cancelled.connect(self._servers_cancelled)
+        self.adder.progress.connect(lambda n: self.statusBar().showMessage(f"Adding images… {n:,} read"))
+        self.adder.done.connect(self._added)
         self.model.stats_changed.connect(self._update_stats)
         self._update_stats()
 
@@ -280,14 +292,42 @@ class MainWindow(QMainWindow):
             self._add([d], recursive)
 
     def _add(self, paths, recursive=False):
+        """List the images in `paths`. Finding them and reading their captions happens on a background
+        thread, so a big folder (or a slow network drive) doesn't freeze the window."""
+        paths = [p for p in paths if p]
+        if not paths:
+            return
+        gen, known = self.add_gen, self.model.known_keys()
+        self.adding += 1
+        self.statusBar().showMessage("Adding images…")
+
+        def run():
+            unreadable, listing = [], {}
+            try:
+                new = unique_new(collect_images(paths, recursive, unreadable, listing), known)
+                result = (gen, load_entries(new, self.adder.progress.emit, listing), unreadable, "")
+            except Exception as e:  # noqa: BLE001
+                result = (gen, [], unreadable, str(e))
+            self.adder.done.emit(result)
+        threading.Thread(target=run, daemon=True).start()
+
+    def _added(self, result):
+        gen, entries, unreadable, err = result
+        self.adding -= 1
+        if gen != self.add_gen:
+            return  # the list was cleared while this was scanning
         known = set(self.model.index_of)
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            n = self.model.add_paths(collect_images(paths, recursive))
-            clashes = [g for g in caption_clashes(self.model.index_of) if not known.issuperset(g)] if n else []
-        finally:
-            QApplication.restoreOverrideCursor()
-        self.statusBar().showMessage(f"Added {n} image(s)", 4000)
+        n = self.model.add_entries(entries)
+        clashes = [g for g in caption_clashes(self.model.index_of) if not known.issuperset(g)] if n else []
+        msg = f"Added {n:,} image(s)"
+        if unreadable:
+            msg += f"; {len(unreadable)} folder(s) couldn't be read (see log)"
+            for d in unreadable:
+                self._log(f"Couldn't read folder: {d}")
+        if err:
+            self._log(f"Adding images failed: {err}")
+            QMessageBox.warning(self, "Add images", f"Adding images failed:\n\n{err}")
+        self.statusBar().showMessage(msg, 4000)
         if clashes:
             self._warn_clashes(clashes)
 
@@ -324,7 +364,8 @@ class MainWindow(QMainWindow):
             self.model.remove_rows(rows)
 
     def clear_list(self):
-        if self.model.items and QMessageBox.question(self, "Clear list", "Remove all images from the list?\n(Files on disk are not touched.)") == QMessageBox.Yes:
+        if (self.model.items or self.adding) and QMessageBox.question(self, "Clear list", "Remove all images from the list?\n(Files on disk are not touched.)") == QMessageBox.Yes:
+            self.add_gen += 1  # images still being scanned are dropped too
             self.model.clear()
 
     def _thumb_size(self, v):
@@ -534,8 +575,9 @@ class MainWindow(QMainWindow):
             return
         try:
             self.model.set_caption(row, text, force=True)
-        except RuntimeError as e:
-            self._log(str(e))
+        except RuntimeError as e:  # captioned, but the .txt couldn't be written: that image failed
+            self.failures += 1
+            self._log(f"FAILED {os.path.basename(path)}: {e}")
 
     def _on_failed(self, path, err):
         self.failures += 1

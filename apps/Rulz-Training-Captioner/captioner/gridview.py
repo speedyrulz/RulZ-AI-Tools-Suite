@@ -1,6 +1,6 @@
 """Thumbnail grid with an inline editable caption box under every image."""
 from PySide6.QtCore import QRect, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFontMetrics, QPainter, QPen, QTextCursor, QTextOption
+from PySide6.QtGui import QColor, QFontMetrics, QPainter, QPen, QTextCursor
 from PySide6.QtWidgets import (QAbstractItemView, QListView, QPlainTextEdit, QStyle,
                                QStyledItemDelegate)
 
@@ -10,6 +10,9 @@ from .model import BUSY, ERROR, QUEUED, StatusRole
 PAD = 8
 NAME_H = 18
 CAPTION_H = 96
+# The caption box shows about six lines of ~45 characters at the largest card size. Laying out a
+# whole long tag list on every repaint made scrolling slow, so only this much is drawn.
+PAINT_CHARS = 600
 
 
 class CaptionEditor(QPlainTextEdit):
@@ -90,10 +93,8 @@ class CardDelegate(QStyledItemDelegate):
         inner = cr.adjusted(4, 3, -4, -3)
         if text.strip():
             p.setPen(pal.text().color())
-            opt = QTextOption()
-            opt.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
             p.setClipRect(inner)
-            p.drawText(inner, int(Qt.AlignTop | Qt.AlignLeft | Qt.TextWordWrap), text)
+            p.drawText(inner, int(Qt.AlignTop | Qt.AlignLeft | Qt.TextWordWrap), text[:PAINT_CHARS])
         else:
             p.setPen(pal.placeholderText().color())
             p.drawText(inner, int(Qt.AlignTop | Qt.AlignLeft | Qt.TextWordWrap), "Click to add caption…")
