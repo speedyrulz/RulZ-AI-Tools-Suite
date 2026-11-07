@@ -100,6 +100,11 @@ def test_adapter_timesteps_and_isolation_recommendations(tmp_path):
     assert char["network_type"][0] == "lora" and char["isolation"][0] is True and "timestep_sampling" not in char
     fibo = TrainConfig.from_dict({**cfg.to_dict(), "model_path": "Bria/FIBO-2.0-dev"})
     assert webui.wizard_recommendations(fibo, "character", [], None)["network_type"][0] == "lora"  # no LoKr loader
+    krea = TrainConfig.from_dict({**cfg.to_dict(), "model_path": "krea/Krea-2"})
+    assert webui.wizard_recommendations(krea, "character", [], None)["network_type"][0] == "oft"
+    assert webui.wizard_recommendations(krea, "style", [], None)["network_type"][0] == "lora"
+    oft = TrainConfig.from_dict({**krea.to_dict(), "network_type": "oft"})
+    assert webui.wizard_recommendations(oft, "character", [], None)["isolation"][0] is False
     no_trigger = TrainConfig.from_dict({**cfg.to_dict(), "trigger_word": ""})
     assert webui.wizard_recommendations(no_trigger, "character", [], None)["isolation"][0] is False
     style = webui.wizard_recommendations(cfg, "style", [], None)
