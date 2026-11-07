@@ -23,6 +23,8 @@ A simple diffusion-model LoRA trainer with a WebUI. Supported models:
   ones; non-commercial license ([details](#ideogram-4)).
 - **MiniMax H3** (33B video + audio): experimental one-frame image LoRAs for H3 video generation, as musubi-tuner
   trains them; two 16 GB cards or one with block swap ([details](#minimax-h3)).
+- **P-H3-Image** (33B, PrunaAI): experimental text-to-image LoRAs for PrunaAI's 8-step, guidance-free H3 image model,
+  with ostris' P-H3-Image training adapter; two 16 GB cards or one with block swap ([details](#p-h3-image)).
 
 | Dark | Light |
 | --- | --- |
@@ -446,6 +448,7 @@ WebUI's *Download now* fetches them ahead of time). `model_file_quant` and `text
 | FLUX 3 Klein Base / distilled | [black-forest-labs/flux-3-image-klein-comfy](https://huggingface.co/black-forest-labs/flux-3-image-klein-comfy) (BFL's own, gated) | int8_convrot 5.8 GB, nvfp4 5.3 GB, bf16 11.1 GB (files; 5.1 / 4.8 / 9.7 GB loaded) | Qwen3-VL-4B int8_convrot 4.9 GB, bf16 8.9 GB | `flux2-vae` |
 | Ideogram 4 | [Comfy-Org/Ideogram-4](https://huggingface.co/Comfy-Org/Ideogram-4) | int8_convrot 9.6 GB, fp8_scaled 9.3 GB, nvfp4_mixed 5.5 GB (no bf16 release) | Qwen3-VL-8B: int8_convrot 9.4 GB and bf16 17.5 GB from Comfy-Org/Qwen-Image-2.1 (the same model), fp8_scaled 10.6 GB and nvfp4 6.3 GB from Comfy-Org/Ideogram-4 | `flux2-vae` |
 | MiniMax H3 FL2VA / Ref2VA | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3) | pruned_int8_convrot 21.0 GB, pruned_bf16 40.2 GB, int8_convrot 34.0 GB, bf16 66.3 GB | Qwen3-VL-32B (50 layers) int8_convrot 27.1 GB, nvfp4_awq 15.7 GB, bf16 51.5 GB | `minimax_h3_video_vae_fp16` (5.2 GB) + `minimax_h3_audio_vae_fp32` (0.6 GB) |
+| P-H3-Image | [PrunaAI/P-H3-Image-Comfy](https://huggingface.co/PrunaAI/P-H3-Image-Comfy) | int8_convrot 21.2 GB, bf16 40.5 GB (both pruned; w4a8 is not read) | Qwen3-VL-4B + text connector int8_convrot 5.1 GB, bf16 9.1 GB | `p-h3-image_vae_bf16` (5.6 GB) |
 
 To use files you already have, set `transformer_file`, `text_encoder_file` and `vae_file` (the WebUI's optional file
 fields): only the ones left empty are downloaded. Fused-qkv ("repacked") files are split back automatically. The
@@ -2619,6 +2622,66 @@ load-time-pruned AdaLN paths, the layouts against diffusers' own checkpoint and 
 released files' headers (`tests/fixtures/minimax_h3_headers.json`: names, dtypes and shapes only), the VAE and audio-VAE
 conversions, the text encoder's layer-50 state with AWQ scales, the LoRA export and the adapter / turbo layouts, the
 sampler against the released `MiniMaxH3Scheduler` pair, and detection, caches, buckets and downloads.
+
+## P-H3-Image
+
+RulzTrainer trains **text-to-image LoRAs** for [PrunaAI/P-H3-Image](https://huggingface.co/PrunaAI/P-H3-Image):
+PrunaAI's fine-tune of MiniMax H3 for stills, which renders in 8 steps with no guidance (released November 2026). It
+is H3's 33B transformer (with Pruna's LoRA merged in), a Qwen3-VL-4B text encoder with a learned text connector, and
+a VAE that decodes one frame. Pick the **P-H3-Image** preset. Experimental: nothing has been measured on it yet, and
+edit training (P-H3's image editing with up to 8 input pictures) is not supported here, only text-to-image.
+
+**Licence.** The MiniMax H3 Community License Agreement (the Qwen parts: Apache 2.0). It excludes the USA, the EU,
+the UK and South Korea unless you hold a licence from MiniMax, and products built on it must show "Powered by MiniMax
+H3".
+
+**What differs from MiniMax H3** (`rulztrainer/ph3/`; checked against diffusers' `p_h3_image` modular pipeline and
+ai-toolkit's `p_h3_image.py`):
+
+- **The transformer** is H3's port as it is (`rulztrainer/h3/model.py`). PrunaAI's files are pruned like Comfy-Org's
+  H3 files, with a wider AdaLN curve table ([4097, 16] where H3's is [1025, 8]), which the port reads from the file.
+  The diffusers `transformer/` (full AdaLN) is pruned on load to rank 16. Two settings differ: the audio rows run at
+  the video sigma (both of P-H3's schedulers sample the same sigmas, no shift-3 remap), and the audio placeholder is
+  noised zeros (P-H3 ships no audio VAE; ai-toolkit trains on zeros too).
+- **Text features** follow diffusers' `PH3ImageTextEncoderStep`: the caption verbatim (no chat template, no special
+  tokens) through Qwen3-VL-4B; the connector concatenates `hidden_states[13, 19, 25, 31, 36]` (the last is the final
+  normed state), standardizes, projects to 5120, rescales, and replaces token 0 by its sink embedding. The connector
+  stays fp32. The tokenizer comes from PrunaAI/P-H3-Image's `tokenizer/` (11 MB).
+- **The VAE** is H3's encoder with a single-frame ViT decoder (`patch_size_t` 1, one fixed rotary time coordinate,
+  no mask token). It is built on the H3 classes diffusers 0.40+ ships, with the decoder swapped, so no newer diffusers
+  is needed. A latent decodes straight to one image.
+- **Sampling** uses the checkpoint's own 8-sigma grid (1.0, 0.985, 0.968, 0.952, 0.925, 0.882, 0.810, 0.529, 0) at
+  CFG 1; other step counts fall back to H3's shift-12 grid. No turbo LoRA: the model is already the 8-step one. It is
+  tuned for 4-8 MP output: 1 MP previews show more artifacts in faces, hands and small details than full-size images.
+
+**Files.** `model_source: files` downloads from
+[PrunaAI/P-H3-Image-Comfy](https://huggingface.co/PrunaAI/P-H3-Image-Comfy): the transformer as `int8_convrot` (21.2 GB,
+the default) or `bf16` (40.5 GB), the text encoder with its connector as `int8_convrot` (5.1 GB) or `bf16` (9.1 GB), and
+the VAE (5.6 GB; its int8 file loads too, dequantized). The `w4a8` files use a format this trainer cannot read. The
+Hugging Face source (`model_source: hf`) fetches PrunaAI/P-H3-Image without its 19 GB prompt upsampler. Memory is as for
+MiniMax H3 (the same 21 GB transformer): two 16 GB cards in `model_split`, or one with `block_swap`; the text encoder
+fits one card while the captions cache.
+
+**Training adapter** (`training_adapter: auto`, the default):
+[ostris/minimax_h3_training_adapter](https://huggingface.co/ostris/minimax_h3_training_adapter)
+`p_h3_image_training_adapter_v1.safetensors` (rank 16, 0.16 GB, `diffusion_model.*.lora_A/B`, no alpha), the adapter
+ai-toolkit trains P-H3-Image with by default. The model is step- and guidance-distilled, so a LoRA trained on it bare
+drifts. The adapter is on while your LoRA trains, off for samples and probes, and never saved into your file. Quality
+with it has not been evaluated here.
+
+**Recipe** (what the setup wizard suggests): H3's (rank 16, 32 for styles, alpha = rank, learning rate 1e-4,
+`timestep_sampling: reference`, 1 MP buckets on the 32 px grid, the default `qkv_proj` / `out_proj` / `fc1` / `fc2`
+targets), with the int8 files, the adapter on, and samples and probes at 8 steps, CFG 1.
+
+**Export**: H3's layout (`diffusion_model.blocks.<n>.attn.qkv_proj.lora_A/B`, alpha = rank), which ComfyUI's Load LoRA
+reads on PrunaAI's P-H3-Image files.
+
+Tests: `tests/test_ph3.py` (weight-free) checks the released files' headers against the port
+(`tests/fixtures/p_h3_image_headers.json`: names, dtypes and shapes only: transformer, text encoder and connector, VAE,
+training adapter), the connector and prompt encoding against diffusers' math (a padded batch against each prompt alone),
+the single-frame decoder against diffusers' `PH3ImageViTDecoder` forward (fp32 exact, bf16 close), the audio stream at
+the video sigma, the 8-step sampler, the adapter in its published layout, and detection, downloads, caches and the
+wizard.
 
 ## Using the LoRA in ComfyUI
 
