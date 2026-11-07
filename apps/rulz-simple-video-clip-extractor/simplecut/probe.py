@@ -11,14 +11,19 @@ from fractions import Fraction
 CREATE_NO_WINDOW = 0x08000000  # keep console windows from popping up on Windows
 
 
-def _run(args: list[str]) -> str:
-    r = subprocess.run(args, capture_output=True, text=True, creationflags=CREATE_NO_WINDOW,
-                       encoding="utf-8", errors="replace")
-    if r.returncode != 0:
+def _run(args: list[str], on_start=None) -> str:
+    """Run ffprobe and return its output. on_start(proc) receives the process, so another thread
+    can kill a long scan; a killed scan raises RuntimeError like any failure."""
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            creationflags=CREATE_NO_WINDOW, encoding="utf-8", errors="replace")
+    if on_start is not None:
+        on_start(proc)
+    out, err = proc.communicate()
+    if proc.returncode != 0:
         # ffprobe's own message ("Invalid data found when processing input", ...) says what's wrong
-        msg = (r.stderr or "").strip() or f"exit code {r.returncode}"
+        msg = (err or "").strip() or f"exit code {proc.returncode}"
         raise RuntimeError(f"ffprobe failed: {msg}")
-    return r.stdout
+    return out
 
 
 def have_ffmpeg() -> bool:
@@ -39,6 +44,7 @@ class VideoInfo:
     has_audio: bool = False
     audio_codec: str = ""
     rotation: int = 0              # clockwise degrees the source asks players to apply
+    has_b_frames: int = 0          # decoder reorder delay (frames); 0 = no B-frames
     keyframes: list[float] = field(default_factory=list)  # sorted pts seconds
     keyframe_dts: dict[float, float] = field(default_factory=dict)  # pts -> dts seconds
 
@@ -75,6 +81,15 @@ class VideoInfo:
 
 
 def probe(path: str) -> VideoInfo:
+    """Stream info and keyframes. The app calls the two halves separately so the video can be
+    shown before the (slower) keyframe scan finishes."""
+    info = probe_streams(path)
+    info.keyframes, info.keyframe_dts = scan_keyframes(path)
+    return info
+
+
+def probe_streams(path: str) -> VideoInfo:
+    """Container and stream info (fast: reads the header only)."""
     info = VideoInfo(path=path)
 
     fmt = json.loads(_run([
@@ -98,6 +113,7 @@ def probe(path: str) -> VideoInfo:
     info.width = int(vstream.get("width", 0))
     info.height = int(vstream.get("height", 0))
     info.codec = vstream.get("codec_name", "")
+    info.has_b_frames = int(vstream.get("has_b_frames", 0) or 0)
     rate = vstream.get("avg_frame_rate") or vstream.get("r_frame_rate") or "30/1"
     try:
         fr = Fraction(rate)
@@ -111,22 +127,32 @@ def probe(path: str) -> VideoInfo:
         if "rotation" in sd:
             # ffprobe reports counter-clockwise-positive; we keep clockwise.
             info.rotation = int(round(-float(sd["rotation"]))) % 360
+    return info
 
-    # Keyframe timestamps: walk the packets of the first video stream.
+
+def scan_keyframes(path: str, on_start=None) -> tuple[list[float], dict[float, float]]:
+    """Keyframe timestamps: walk the packets of the first video stream (reads the whole file).
+
+    Returns the sorted keyframe pts and a pts -> dts map. -fflags +genpts fills in pts that the
+    container doesn't store (AVI with B-frames), the same way the decoder labels those frames;
+    files that do store pts give the same list either way.
+    """
     out = _run([
-        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "ffprobe", "-v", "error", "-fflags", "+genpts", "-select_streams", "v:0",
         "-show_entries", "packet=pts_time,dts_time,flags",
         "-of", "csv=p=0", path,
-    ])
+    ], on_start)
     kfs: dict[float, float] = {}
     for line in out.splitlines():
         parts = line.strip().split(",")
         if len(parts) < 3:
             continue
         pts, dts, flags = parts[0], parts[1], parts[2]
-        if "K" in flags and pts not in ("", "N/A"):
-            p = float(pts)
-            kfs[p] = float(dts) if dts not in ("", "N/A") else p
-    info.keyframes = sorted(kfs)
-    info.keyframe_dts = kfs
-    return info
+        if "K" not in flags:
+            continue
+        has_pts, has_dts = pts not in ("", "N/A"), dts not in ("", "N/A")
+        if not (has_pts or has_dts):
+            continue
+        p = float(pts) if has_pts else float(dts)
+        kfs[p] = float(dts) if has_dts else p
+    return sorted(kfs), kfs

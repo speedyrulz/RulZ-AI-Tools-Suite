@@ -17,12 +17,12 @@ from PySide6.QtWidgets import (
     QProgressBar, QStyle, QFrame, QSlider,
 )
 
-from .probe import VideoInfo, probe, have_ffmpeg
-from .decoder import Decoder
+from .probe import VideoInfo, probe_streams, scan_keyframes, have_ffmpeg
+from .decoder import Decoder, rgb_reformat_args
 from .timeline import Timeline
 from .cropview import VideoView, even
 from .export import (ExportSettings, ExportJob, NVENC_CODECS, FPS_PRESETS, parse_fps,
-                     build_commands, default_output_path, unique_path)
+                     build_commands, command_cwd, default_output_path, unique_path)
 from . import theme
 from .colormatch import ColorMatchDialog, apply_tables, clean_temp, write_cube_1d
 from .defaults import (ASPECT_PRESETS, PRESET_LABELS, AUDIO_LABELS, AUDIO_KEYS, settings,
@@ -34,6 +34,17 @@ def output_dir() -> str | None:
     """User-chosen default folder for clips and images, or None for 'next to the source'."""
     d = settings().value("output_dir", "", type=str)
     return d if d and os.path.isdir(d) else None
+
+
+def same_file(a: str, b: str) -> bool:
+    """True when the two paths name one file. Windows paths ignore letter case, and links or
+    short (8.3) names can differ in spelling, so plain string comparison is not enough."""
+    try:
+        if os.path.exists(a) and os.path.exists(b):
+            return os.path.samefile(a, b)
+    except OSError:
+        pass
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
 
 def remove_partial(path: str | None):
@@ -54,19 +65,52 @@ def fmt_time(t: float) -> str:
 
 
 class ProbeThread(QThread):
-    done = Signal(object, int)   # info, token
-    failed = Signal(str, int)    # message, token
+    """Reads the stream info (fast) and reports it, then scans the keyframes (reads the whole
+    file: about a second per 400 MB) and reports those, so the video shows before the scan ends."""
+    done = Signal(object, int)                # info, token
+    failed = Signal(str, int)                 # message, token
+    keyframes = Signal(object, object, int)   # sorted keyframe pts, pts -> dts, token
+    keyframes_failed = Signal(str, int)       # message, token
 
     def __init__(self, path, token: int = 0):
         super().__init__()
         self.path = path
         self.token = token  # which open_file() call this answers; a newer one makes it stale
+        self._proc = None
+        self._cancelled = False
+
+    def cancel(self):
+        """Stop the keyframe scan (another file was opened, or the app closes)."""
+        self._cancelled = True
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+    def _started(self, proc):
+        self._proc = proc
+        if self._cancelled:
+            self.cancel()
 
     def run(self):
         try:
-            self.done.emit(probe(self.path), self.token)
+            info = probe_streams(self.path)
         except Exception as e:  # noqa: BLE001
             self.failed.emit(f"{e}\n{traceback.format_exc()}", self.token)
+            return
+        self.done.emit(info, self.token)
+        if self._cancelled:
+            return
+        try:
+            kfs, dts = scan_keyframes(self.path, self._started)
+        except Exception as e:  # noqa: BLE001
+            if not self._cancelled:
+                self.keyframes_failed.emit(str(e), self.token)
+            return
+        if not self._cancelled:
+            self.keyframes.emit(kfs, dts, self.token)
 
 
 NO_FFMPEG = "ffmpeg / ffprobe were not found on PATH. Install them (e.g. `winget install Gyan.FFmpeg`)."
@@ -200,6 +244,7 @@ class ExportDialog(QDialog):
         self.rb_lossless.toggled.connect(self._mode_changed)
         self._mode_changed()
         self.job: ExportJob | None = None
+        self._replace_ok: str | None = None
         self.resize(560, self.sizeHint().height())
 
     def _mode(self) -> str:
@@ -208,14 +253,16 @@ class ExportDialog(QDialog):
     def _mode_changed(self):
         mode = self._mode()
         self.form_widget.setEnabled(mode == "nvenc")
-        self.out_path.setText(default_output_path(self.info, self.start, self.end, mode,
-                                                  output_dir(), cropped=self.crop is not None))
+        # never suggest the name of a clip exported earlier: ffmpeg runs with -y
+        self.out_path.setText(unique_path(default_output_path(self.info, self.start, self.end, mode,
+                                                              output_dir(), cropped=self.crop is not None)))
 
     def _browse(self):
         filt = "MP4 video (*.mp4)" if self._mode() == "nvenc" else "Video (*.*)"
         p, _ = QFileDialog.getSaveFileName(self, "Save clip as", self.out_path.text(), filt)
         if p:
             self.out_path.setText(p)
+            self._replace_ok = p  # the save dialog has asked about replacing it already
 
     def settings(self) -> ExportSettings:
         s = ExportSettings(mode=self._mode())
@@ -237,9 +284,14 @@ class ExportDialog(QDialog):
         if not out:
             QMessageBox.warning(self, "Export", "Choose an output file.")
             return
-        if os.path.abspath(out) == os.path.abspath(self.info.path):
+        if same_file(out, self.info.path):
             QMessageBox.warning(self, "Export", "Output must differ from the source file.")
             return
+        if os.path.exists(out) and out != self._replace_ok:
+            if QMessageBox.question(self, "Export", f"{out}\n\nalready exists. Replace it?",
+                                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                return
+            self._replace_ok = out
         try:
             st = self.settings()
         except ValueError as e:
@@ -250,7 +302,7 @@ class ExportDialog(QDialog):
             return
         self._out = out
         self.job = ExportJob(build_commands(self.info, self.start, self.end, out, st),
-                             self.end - self.start, self)
+                             self.end - self.start, self, cwd=command_cwd(st))
         self.job.progress.connect(lambda f: self.progress.setValue(int(f * 1000)))
         self.job.finished.connect(self._done)
         self.progress.setVisible(True)
@@ -338,6 +390,8 @@ class MainWindow(QMainWindow):
         self.timeline = Timeline()
         self.timeline.seekRequested.connect(self.seek_to)
         self.timeline.selectionMoveRequested.connect(self._move_selection)
+        self.timeline.scrubFinished.connect(self._scrub_finished)
+        self._scrub_t: float | None = None  # exact position still owed after a fast scrub
 
         self.time_label = QLabel("--:--:--.--- / --:--:--.---")
         self.frame_label = QLabel("")
@@ -805,14 +859,21 @@ class MainWindow(QMainWindow):
         self.stop()
         self.status.showMessage(f"Probing {os.path.basename(path)}…")
         self._set_enabled(False)
+        self._cancel_probes()
         self._probe_token += 1
         t = ProbeThread(path, self._probe_token)
         t.done.connect(self._probed)
         t.failed.connect(self._probe_failed)
+        t.keyframes.connect(self._keyframes_found)
+        t.keyframes_failed.connect(self._keyframes_failed)
         t.finished.connect(self._probe_thread_finished)
         self._probe_thread = t
         self._probe_threads.append(t)  # a QThread dropped while running crashes the app
         t.start()
+
+    def _cancel_probes(self):
+        for t in self._probe_threads:
+            t.cancel()
 
     def _probe_thread_finished(self):
         self._probe_threads = [t for t in self._probe_threads if t.isRunning()]
@@ -831,7 +892,7 @@ class MainWindow(QMainWindow):
             self.dec.close()
             self.dec = None
         try:
-            self.dec = Decoder(info.path)
+            self.dec = Decoder(info.path, info.keyframes)
         except Exception as e:  # noqa: BLE001
             self.close_video()  # the old decoder is closed: don't leave its UI pointing at it
             QMessageBox.critical(self, "Open failed", str(e))
@@ -853,18 +914,39 @@ class MainWindow(QMainWindow):
         self.timeline.set_range(info.start_time, info.end_time)
         self.timeline.set_keyframes(info.keyframes)
         self.setWindowTitle(f"{os.path.basename(info.path)} — {theme.APP_NAME}")
-        self.status.showMessage(
-            f"{info.width}x{info.height}  {info.fps:.3f} fps  {info.codec}  "
-            f"{len(info.keyframes)} keyframes  audio: {info.audio_codec or 'none'}")
+        self._show_info_status("finding keyframes…")
         self._set_enabled(True)
         self._sync_length_boxes()
         self.dec.seek(info.start_time)
         self._show_current()
         self.view.setFocus()
 
+    def _show_info_status(self, keyframes: str):
+        info = self.info
+        self.status.showMessage(
+            f"{info.width}x{info.height}  {info.fps:.3f} fps  {info.codec}  "
+            f"{keyframes}  audio: {info.audio_codec or 'none'}")
+
+    def _keyframes_found(self, kfs: list, dts: dict, token: int):
+        if token != self._probe_token or not self.info:
+            return
+        self.info.keyframes, self.info.keyframe_dts = kfs, dts
+        if self.dec:
+            self.dec.keyframes = kfs
+        self.timeline.set_keyframes(kfs)
+        self._show_info_status(f"{len(kfs)} keyframes")
+        self._selection_changed()  # lossless export may be possible now
+        self._show_current()       # keyframe label
+
+    def _keyframes_failed(self, msg: str, token: int):
+        if token == self._probe_token and self.info:
+            last = msg.strip().splitlines()[-1] if msg.strip() else "scan failed"
+            self._show_info_status(f"keyframes unknown ({last})")
+
     def close_video(self):
         """Unload the current video and return to the empty state."""
         self.stop()
+        self._cancel_probes()
         self._probe_token += 1  # a probe still running must not open its file afterwards
         if self.dec:
             self.dec.close()
@@ -976,7 +1058,7 @@ class MainWindow(QMainWindow):
 
     def _frame_image(self, f, width: int | None = None, height: int | None = None) -> QImage:
         """Convert a decoded frame to a QImage, optionally scaled, with rotation applied."""
-        kw = {"format": "rgb24"}
+        kw = {"format": "rgb24", **rgb_reformat_args(f)}
         if width and height:
             kw.update(width=width, height=height)
         rgb = f.reformat(**kw)
@@ -1269,7 +1351,7 @@ class MainWindow(QMainWindow):
         self._selection_changed()
         if seek and self.dec:
             self.stop()
-            self.dec.seek(self.sel_start)
+            self._decoder_seek(self.sel_start)
             self._show_current()
 
     def _move_selection(self, start: float):
@@ -1288,8 +1370,10 @@ class MainWindow(QMainWindow):
         if not self.dec or self.dec.current is None:
             return
         f = self.dec.current
-        # Scale in the decoder (swscale) so we never push huge RGB buffers to Qt.
-        vw, vh = max(self.view.width(), 64), max(self.view.height(), 64)
+        # Scale in the decoder (swscale) so we never push huge RGB buffers to Qt. The target is
+        # in device pixels, so the picture stays sharp with display scaling above 100%.
+        dpr = self.view.devicePixelRatioF()
+        vw, vh = max(self.view.width(), 64) * dpr, max(self.view.height(), 64) * dpr
         if self.total_rotation in (90, 270):
             vw, vh = vh, vw
         scale = min(vw / f.width, vh / f.height, 1.0)
@@ -1318,6 +1402,10 @@ class MainWindow(QMainWindow):
             if self.dec.time < self.sel_start - eps or self._at_selection_end():
                 self.dec.seek(self.sel_start)
                 self._show_current()
+        elif self._is_last_frame(self.dec.time):
+            # on the last frame: play from the start (fixed-length mode replays the clip the same way)
+            self.dec.seek(self.info.start_time)
+            self._show_current()
         self._start_clock(self.dec.time)
         # tick at twice the frame rate so frames land close to the audio clock
         self.play_timer.start(max(int(500 / self.info.fps), 4))
@@ -1399,8 +1487,24 @@ class MainWindow(QMainWindow):
         self.stop()
         if self.fixed:
             t = self._clamp_to_selection(t)
-        self.dec.seek(t)
+        self._decoder_seek(t)
         self._show_current()
+
+    def _decoder_seek(self, t: float):
+        """Seek for the timeline. While the mouse drags it, video whose exact seeks are slow (4K)
+        shows the keyframe at or before t; the exact frame follows when the mouse is released."""
+        if self.timeline.scrubbing:
+            _, exact = self.dec.scrub(t)
+            self._scrub_t = None if exact else t
+        else:
+            self._scrub_t = None
+            self.dec.seek(t)
+
+    def _scrub_finished(self):
+        t, self._scrub_t = self._scrub_t, None
+        if t is not None and self.dec:
+            self.dec.seek(t)
+            self._show_current()
 
     def step_forward(self):
         if not self.dec:
@@ -1584,7 +1688,8 @@ class MainWindow(QMainWindow):
                                               cropped=crop is not None, whole=whole))
         self._quick_out = out
         self._quick_cancelled = False
-        self.quick_job = ExportJob(build_commands(self.info, rng[0], rng[1], out, s), rng[1] - rng[0], self)
+        self.quick_job = ExportJob(build_commands(self.info, rng[0], rng[1], out, s), rng[1] - rng[0], self,
+                                   cwd=command_cwd(s))
         self.quick_job.progress.connect(lambda f: self.qx_progress.setValue(int(f * 1000)))
         self.quick_job.finished.connect(self._quick_done)
         self.qx_label.setText(f"Exporting {'whole video' if whole else 'clip'} \u2192 {os.path.basename(out)}")
@@ -1633,6 +1738,7 @@ class MainWindow(QMainWindow):
             self._quick_cancel()
             self.quick_job.wait()
         self._probe_token += 1
+        self._cancel_probes()
         for t in list(self._probe_threads):
             t.wait()  # a QThread destroyed while running takes the process down with it
         if self.dec:

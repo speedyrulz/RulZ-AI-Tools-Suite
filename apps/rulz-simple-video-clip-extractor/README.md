@@ -87,6 +87,16 @@ keyframes. A red "● keyframe" tag shows next to the time when the current
 frame is a keyframe. The In/Out range is shaded dark red, with a white IN and
 a red OUT marker.
 
+A video shows as soon as it opens; the keyframes are found in the background
+(about a second per 400 MB) and the status bar says "finding keyframes…" until
+then. Keyframe stepping and lossless export become available when the scan is
+done. On video where an exact seek is slow (typically 4K), dragging along the
+timeline or dragging the fixed-length box shows the nearest earlier keyframe
+while the mouse moves and the exact frame as soon as you let go.
+
+The preview converts colours the way players do: with the video's own colour
+matrix, and BT.709 for untagged video from 720 lines up.
+
 ## Saving a frame
 
 Press **S** (or the "Save frame PNG" button) to write the current frame at
@@ -255,11 +265,17 @@ path; that file is used instead.
   boundary. Pressing O on the very last frame includes it (Out = end of video).
 - If In and Out are both keyframes (or the start/end of the file), the export
   dialog offers **Lossless**: all streams are stream-copied with no
-  re-encoding, into the same container type as the source.
+  re-encoding, into the same container type as the source. Cuts land exactly
+  on In and Out in MP4, MOV, MKV, WebM, MPEG-TS, FLV and AVI. HEVC encoded with
+  open GOPs (x265's default) can lose the last few frames before Out, because
+  the frames just before a keyframe there depend on that keyframe.
 - Otherwise the export re-encodes with **NVENC** (h264, hevc, or av1) to MP4.
   Cut points are frame-accurate. Audio is copied when MP4-compatible,
   otherwise converted to AAC. Quality is controlled by the CQ value
   (lower = better; default 18, 18–24 is typical).
+- The export dialog suggests a file name that is not taken yet, asks before
+  replacing an existing file, and refuses to write over the source video
+  (also when the path differs only in letter case).
 - The NVENC options also include a **Frame rate** box, which defaults to
   **24**. "Same as source" keeps the original timing; picking or typing a rate
   (24, 30, 60, 24000/1001, 48, ...) resamples the clip by duplicating or

@@ -88,10 +88,28 @@ def gop_frames(info: VideoInfo, s: ExportSettings) -> int:
     return max(1, round(fps))
 
 
+# Demuxers that seek by decode timestamp (no AVFMT_SEEK_TO_PTS). For them ffmpeg aims an input
+# -ss 3/23 s early whenever the video has B-frames, which lands on the keyframe before In.
+DTS_SEEKING_FORMATS = ("matroska", "flv", "avi")
+DTS_SEEK_HEURISTIC = 3 / 23
+
+
+def lossless_seek_nudge(info: VideoInfo) -> float:
+    """Seconds to add to a lossless input -ss (and take off -t) so ffmpeg's own early aim
+    lands on the In keyframe again. 1 ms extra keeps it from falling just short of it."""
+    if info.has_b_frames and any(f in info.container.split(",") for f in DTS_SEEKING_FORMATS):
+        return DTS_SEEK_HEURISTIC + 0.001
+    return 0.0
+
+
 def build_command(info: VideoInfo, start: float, end: float,
                   out_path: str, s: ExportSettings, hwaccel: bool = False) -> list[str]:
     """hwaccel: decode the source on the GPU (NVDEC) for re-encodes. Frames are copied back to
-    system memory, so every filter below works unchanged."""
+    system memory, so every filter below works unchanged.
+
+    Paths are made absolute: with a colour LUT ffmpeg runs in the LUT's folder (command_cwd)."""
+    src = os.path.abspath(info.path)
+    out_path = os.path.abspath(out_path)
     duration = max(end - start, 0.0)
     if s.mode == "lossless":
         # ffmpeg stops stream-copying when a packet's *decode* timestamp reaches
@@ -99,7 +117,13 @@ def build_command(info: VideoInfo, start: float, end: float,
         # pts, so cut at the keyframe's dts to end exactly before it.
         k = info.keyframe_at(end)
         if k is not None and end < info.end_time - 1e-4:
-            duration = max(info.keyframe_dts.get(k, k) - start, 0.0)
+            cut = info.keyframe_dts.get(k, k)
+            if "avi" in info.container.split(","):
+                # AVI stores no pts; ffmpeg's running dts there is a frame later than the
+                # index says, so the keyframe's own dts still lets it through. Half a frame
+                # earlier ends before it and keeps the frame before.
+                cut -= info.frame_duration / 2
+            duration = max(cut - start, 0.0)
     cmd = ["ffmpeg", "-y", "-hide_banner", "-nostats", "-progress", "pipe:1"]
     total_rot = (info.rotation + s.rotation) % 360
     if s.mode == "lossless" and s.rotation:
@@ -111,7 +135,15 @@ def build_command(info: VideoInfo, start: float, end: float,
     fmt0 = info.fmt_start_time
     if s.mode == "lossless":
         # start is on a keyframe (or the file start): the input seek lands exactly there
-        cmd += ["-ss", f"{start - fmt0:.6f}", "-i", info.path, "-t", f"{duration:.6f}"]
+        ss = start - fmt0
+        if start <= info.start_time + 1e-4:
+            # From the first frame: no seek at all. (An FLV seek to its start can land on the
+            # second keyframe.) Without -ss the output clock starts at the file start, so -t
+            # grows by the same amount.
+            cmd += ["-i", src, "-t", f"{duration + max(ss, 0.0):.6f}"]
+        else:
+            nudge = lossless_seek_nudge(info)
+            cmd += ["-ss", f"{ss + nudge:.6f}", "-i", src, "-t", f"{duration - nudge:.6f}"]
     else:
         # Seek the input only to the keyframe at/before the start (fast), then trim
         # precisely on the output side. Trimming on the output side also drops
@@ -126,7 +158,7 @@ def build_command(info: VideoInfo, start: float, end: float,
         k = min(k, start)
         if hwaccel:
             cmd += ["-hwaccel", "cuda"]
-        cmd += ["-ss", f"{max(k - fmt0, 0.0):.6f}", "-i", info.path,
+        cmd += ["-ss", f"{max(k - fmt0, 0.0):.6f}", "-i", src,
                 "-ss", f"{max(start - k, 0.0):.6f}", "-t", f"{duration:.6f}"]
 
     if s.mode == "lossless":
@@ -139,24 +171,7 @@ def build_command(info: VideoInfo, start: float, end: float,
                 "-g", str(gop_frames(info, s))]
         if s.codec == "hevc_nvenc":
             cmd += ["-tag:v", "hvc1"]
-        # ffmpeg auto-applies the source's own rotation flag when re-encoding,
-        # so only the app-chosen rotation needs a filter.
-        filters = []
-        if s.rotation:
-            filters.append(ROTATE_FILTERS[s.rotation])
-        if s.hflip:
-            filters.append("hflip")
-        if s.lut_path:
-            from .colormatch import ffmpeg_lut_filter
-            filters.append(ffmpeg_lut_filter(s.lut_path))
-        if s.crop:
-            x, y, w, h = s.crop
-            filters.append(f"crop={w}:{h}:{x}:{y}")
-        if s.out_size:
-            w, h = s.out_size
-            filters.append(f"scale={w}:{h}:flags=lanczos")
-        if s.fps:
-            filters.append(f"fps={s.fps}")
+        filters = video_filters(info, s)
         if filters:
             cmd += ["-vf", ",".join(filters)]
         if s.audio == "none" or not info.has_audio:
@@ -172,6 +187,43 @@ def build_command(info: VideoInfo, start: float, end: float,
     return cmd
 
 
+def video_filters(info: VideoInfo, s: ExportSettings) -> list[str]:
+    """The re-encode filter chain. Cheap steps go first so the costly ones see fewer pixels:
+    crop, and dropping frames when the rate goes down, run before the colour LUT (an RGB
+    round trip per pixel) and the lanczos scale. Every step works on single frames, so the
+    order doesn't change the pixels (4K60 cropped to 1080x1920 at 24 fps with a LUT: 4.3 s of
+    filtering became 0.9 s)."""
+    # ffmpeg auto-applies the source's own rotation flag when re-encoding,
+    # so only the app-chosen rotation needs a filter.
+    filters = []
+    if s.rotation:
+        filters.append(ROTATE_FILTERS[s.rotation])
+    if s.hflip:
+        filters.append("hflip")
+    if s.crop:
+        x, y, w, h = s.crop
+        filters.append(f"crop={w}:{h}:{x}:{y}")
+    fps_early = False
+    if s.fps:
+        try:
+            fps_early = float(Fraction(s.fps)) < info.fps - 1e-3
+        except (ValueError, ZeroDivisionError):
+            pass
+        if fps_early:
+            filters.append(f"fps={s.fps}")
+    if s.lut_path:
+        # (Untagged HD is left alone: tagging it BT.709 here with setparams made ffmpeg convert
+        # back to YUV with a different matrix than the tag says, shifting greens by ~20 levels.)
+        from .colormatch import ffmpeg_lut_filter
+        filters.append(ffmpeg_lut_filter(s.lut_path))
+    if s.out_size:
+        w, h = s.out_size
+        filters.append(f"scale={w}:{h}:flags=lanczos")
+    if s.fps and not fps_early:
+        filters.append(f"fps={s.fps}")
+    return filters
+
+
 def build_commands(info: VideoInfo, start: float, end: float,
                    out_path: str, s: ExportSettings) -> list[list[str]]:
     """Commands to try in order: re-encodes first with GPU decoding (2-4x faster on 4K), then,
@@ -180,6 +232,13 @@ def build_commands(info: VideoInfo, start: float, end: float,
         return [build_command(info, start, end, out_path, s)]
     return [build_command(info, start, end, out_path, s, hwaccel=True),
             build_command(info, start, end, out_path, s)]
+
+
+def command_cwd(s: ExportSettings) -> str | None:
+    """Folder ffmpeg has to run in: the colour LUT is passed by file name only."""
+    if s.mode != "lossless" and s.lut_path:
+        return os.path.dirname(os.path.abspath(s.lut_path))
+    return None
 
 
 def command_text(cmd: list[str]) -> str:
@@ -194,12 +253,15 @@ class ExportJob(QObject):
     progress = Signal(float)
     finished = Signal(bool, str)   # ok, stderr tail
 
-    def __init__(self, cmd: list[str] | list[list[str]], duration: float, parent=None):
+    def __init__(self, cmd: list[str] | list[list[str]], duration: float, parent=None,
+                 cwd: str | None = None):
         super().__init__(parent)
         self.cmds = [cmd] if cmd and isinstance(cmd[0], str) else list(cmd)
         self.cmd = self.cmds[0]
         self.duration = max(duration, 1e-6)
         self.proc = QProcess(self)
+        if cwd:
+            self.proc.setWorkingDirectory(cwd)  # see command_cwd()
         self.proc.setProcessChannelMode(QProcess.SeparateChannels)
         self.proc.readyReadStandardOutput.connect(self._on_stdout)
         self.proc.readyReadStandardError.connect(self._on_stderr)
