@@ -244,6 +244,7 @@ class AutoCropDialog(QDialog):
         self._emitter.done.connect(self._on_display)
         self._finder: FindAll | None = None
         self._cropper: CropAll | None = None
+        self._starting = ""  # note shown while SAM loads for a Preview
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(16, 16, 16, 16)
@@ -507,6 +508,9 @@ class AutoCropDialog(QDialog):
         self._update_info()
 
     def _update_info(self):
+        if self._finder is not None and not self._found:
+            self.info.setText(self._starting)
+            return
         if self._found_for != self.find_settings() or not self._found:
             self.info.setText("")
             return
@@ -536,8 +540,8 @@ class AutoCropDialog(QDialog):
         if not todo:
             self._show_current()
             return
-        if not self._pix:
-            self.info.setText("Starting SAM 3.1… the first time takes up to half a minute.")
+        # shown by _update_info until the first result is in
+        self._starting = "" if ai_mask.loaded() else "Starting SAM 3.1… the first time takes up to half a minute."
         self._finder = FindAll(todo, f)
         self._finder.found.connect(self._on_found)
         self._finder.finished_all.connect(self._finder_done)

@@ -53,10 +53,18 @@ class EditorPage(QWidget):
         self._cache = None  # the JPEG/shadow stage of the last preview (filters.process_cached)
         self._shown_key = None
         self._running = False
+        # Bumped whenever the picture changes: results of work for a picture left since are dropped.
+        self._gen = 0
+        # Loading has its own thread, so the next picture shows at full size straight away instead of
+        # waiting for the last one's processing (seconds with a big photo) to finish.
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(1)
+        self._loader = QThreadPool(self)
+        self._loader.setMaxThreadCount(1)
         self._emitter = make_emitter(self)
         self._emitter.done.connect(self._on_done)
+        self._load_emitter = make_emitter(self)
+        self._load_emitter.done.connect(self._on_loaded)
         self._debounce = QTimer(self, singleShot=True, interval=60, timeout=self._request)
 
         # top bar
@@ -286,7 +294,7 @@ class EditorPage(QWidget):
         self.globals = dict(globals_)
         self.mode = mode
         self.mode_switch.set_mode(mode)
-        self._full = self._cache = None
+        self._leave()
         self._shown_key = None
         self.message.setText("")
         self.title.setText(item.path.name)
@@ -300,7 +308,7 @@ class EditorPage(QWidget):
         self.view.set_images(thumb, item.preview if item.preview_key is not None else None)
         self.view.set_shadow(item.shadow)
         self.view.set_busy(True)
-        self._pool.start(FullLoad(item, self._emitter))
+        self._loader.start(FullLoad(item, self._load_emitter, (self._gen, item)))
         self.view.setFocus()
 
     def set_globals(self, globals_: dict, mode: str):
@@ -313,15 +321,25 @@ class EditorPage(QWidget):
 
     def close_image(self):
         self.item = None
-        self._full = self._cache = None
+        self._leave()
         self.view.set_images(None, None)
+
+    def _leave(self):
+        """Forget the current picture's work: what's queued for it is dropped, and what's running is ignored
+        when it ends (it can't be stopped halfway), so the next picture's work goes first."""
+        self._gen += 1
+        self._running = False
+        self._full = self._cache = None
+        self._loader.clear()
+        self._pool.clear()
 
     def shutdown(self):
         """Stop background work before the window goes away."""
         self.close_image()
         self._debounce.stop()
-        self._pool.clear()
-        self._pool.waitForDone()
+        for pool in (self._loader, self._pool):
+            pool.clear()
+            pool.waitForDone()
 
     def _sync_controls(self):
         it = self.item
@@ -380,25 +398,28 @@ class EditorPage(QWidget):
         self.view.set_busy(True)
         if key[1] == BEST:
             self.message.setText("AI is working… a few seconds")
-        self._pool.start(Process((self.item, key), self._full, dict(key[0]), key[1], self._emitter, key[2],
+        self._pool.start(Process((self._gen, key), self._full, dict(key[0]), key[1], self._emitter, key[2],
                                  self._cache))
 
-    def _on_done(self, key, result):
-        if isinstance(key, ImageItem):  # full-size load finished
-            if key is not self.item:
-                return
-            if isinstance(result, Exception):
-                self.view.set_busy(False)
-                self.message.setText(f"Couldn't open: {result}")
-                return
-            self._full = result
-            self.view.set_images(_pixmap(result), None)
-            self.view.set_busy(True)
-            self._request()
+    def _on_loaded(self, key, result):
+        gen, _item = key
+        if gen != self._gen:
+            return  # a picture left since
+        if isinstance(result, Exception):
+            self.view.set_busy(False)
+            self.message.setText(f"Couldn't open: {result}")
             return
-        item, wanted = key
+        self._full = result
+        self.view.set_images(_pixmap(result), None)
+        self.view.set_busy(True)
+        self._request()
+
+    def _on_done(self, key, result):
+        gen, wanted = key
+        if gen != self._gen:
+            return  # for a picture left since; this one's own work is already queued or running
         self._running = False
-        if item is self.item and self._full is not None:
+        if self.item is not None and self._full is not None:
             if isinstance(result, Exception):
                 self.message.setText(f"Couldn't process: {result}")
                 self._shown_key = wanted  # don't retry the same failing settings in a loop

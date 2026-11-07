@@ -142,23 +142,38 @@ def original_candidates(url: str) -> list[str]:
     return out
 
 
-_SRCSET_ENTRY = re.compile(r"\s*(\S+?)(?:\s+(\d+(?:\.\d+)?)([wxh]))?\s*(?:,\s*|$)")
+_DESCRIPTOR = re.compile(r"^(\d+(?:\.\d+)?)([wx])$")
 
 
 def parse_srcset(srcset: str) -> list[tuple[str, float]]:
-    """[(url, score)]. A `w` descriptor scores its width; an `x` descriptor scores 1000 px per x,
-    so mixed sets still rank sensibly. No descriptor counts as 1x."""
+    """[(url, score)], split the way the HTML standard does it: a URL runs up to the next whitespace, so
+    commas inside it (Cloudinary's `c_scale,w_800`, data: URLs) belong to it, and only trailing commas
+    end it; its descriptors run up to the next comma. A `w` descriptor scores its width; an `x`
+    descriptor scores 1000 px per x, so mixed sets still rank sensibly. No descriptor counts as 1x."""
     out: list[tuple[str, float]] = []
-    for m in _SRCSET_ENTRY.finditer(srcset or ""):
-        url, value, unit = m.group(1), m.group(2), m.group(3)
+    s = srcset or ""
+    i, n = 0, len(s)
+    while i < n:
+        while i < n and (s[i].isspace() or s[i] == ","):
+            i += 1
+        start = i
+        while i < n and not s[i].isspace():
+            i += 1
+        url = s[start:i]
+        descriptors = ""
+        if url.endswith(","):
+            url = url.rstrip(",")
+        else:
+            end = s.find(",", i)
+            end = n if end == -1 else end
+            descriptors, i = s[i:end], end + 1
         if not url:
             continue
-        if unit == "w":
-            score = float(value)
-        elif unit == "x":
-            score = float(value) * 1000
-        else:
-            score = 1000.0
+        score = 1000.0
+        for d in descriptors.split():
+            if m := _DESCRIPTOR.match(d.lower()):
+                score = float(m.group(1)) * (1 if m.group(2) == "w" else 1000)
+                break
         out.append((url, score))
     return out
 
@@ -180,9 +195,19 @@ def css_urls(value: str) -> list[str]:
     return [m.group(2) for m in _CSS_URL.finditer(value or "") if m.group(2)]
 
 
+def _ftyp_brands(data: bytes) -> set[bytes]:
+    """Major and compatible brands of an ISO-BMFF (AVIF/HEIF) file's ftyp box."""
+    size = int.from_bytes(data[:4], "big")
+    end = min(len(data), size if 16 <= size <= 1024 else 64)
+    return {data[8:12]} | {data[k : k + 4] for k in range(16, end - 3, 4)}
+
+
 # Formats Pillow (the engine) can decode. SVG and ICO are deliberately not here.
-def sniff_image(data: bytes, heif_ok: bool = False) -> tuple[str, str] | None:
-    """(extension, mime) from the file's leading bytes, or None if the engine can't decode it."""
+def sniff_image(data: bytes, heif_ok: bool = False, avif_ok: bool | None = None) -> tuple[str, str] | None:
+    """(extension, mime) from the file's leading bytes, or None if the engine can't decode it.
+    AVIF needs Pillow's own AVIF support or pillow-heif (`avif_ok`, default: same as heif_ok); HEIC
+    needs pillow-heif (`heif_ok`)."""
+    avif_ok = heif_ok if avif_ok is None else avif_ok
     if data[:3] == b"\xff\xd8\xff":
         return ".jpg", "image/jpeg"
     if data[:8] == b"\x89PNG\r\n\x1a\n":
@@ -193,11 +218,12 @@ def sniff_image(data: bytes, heif_ok: bool = False) -> tuple[str, str] | None:
         return ".webp", "image/webp"
     if data[:2] == b"BM":
         return ".bmp", "image/bmp"
-    if heif_ok and data[4:8] == b"ftyp":
-        brand = data[8:12]
-        if brand in (b"avif", b"avis"):
-            return ".avif", "image/avif"
-        if brand in (b"heic", b"heix", b"mif1", b"msf1", b"heim", b"heis"):
+    if data[4:8] == b"ftyp":
+        brands = _ftyp_brands(data)
+        # An AVIF file may carry "mif1" as its major brand and "avif" only among the compatible ones.
+        if brands & {b"avif", b"avis"}:
+            return (".avif", "image/avif") if avif_ok else None
+        if heif_ok and brands & {b"heic", b"heix", b"mif1", b"msf1", b"heim", b"heis"}:
             return ".heic", "image/heic"
     return None
 

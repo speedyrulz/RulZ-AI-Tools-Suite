@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
-import hashlib
-import asyncio
 import dataclasses
+import hashlib
 import io
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Callable
 from urllib.parse import urlsplit
 
-from PIL import Image
+from PIL import Image, features
 
 from playwright.async_api import BrowserContext
 from playwright.async_api import Error as PlaywrightError
@@ -29,6 +30,22 @@ except Exception:  # pragma: no cover
     HEIF_OK = False
 
 
+def _pillow_reads_avif() -> bool:
+    # Pillow 11.2+ reads AVIF by itself; an older one only warns that the feature is unknown.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            return bool(features.check("avif"))
+        except Exception:  # noqa: BLE001 - pragma: no cover
+            return False
+
+
+AVIF_OK = _pillow_reads_avif()
+# Only ask servers for AVIF when the engine can read it: CDNs that pick the format from this header
+# would otherwise send every image in a format that is then thrown away.
+ACCEPT = ("image/avif," if AVIF_OK else "") + "image/webp,image/*,*/*;q=0.8"
+
+
 class FetchError(Exception):
     """The image could not be fetched or is not a type the engine can read. Fails only that image."""
 
@@ -40,15 +57,18 @@ class RateLimited(FetchError):
 
 
 class HostGate:
-    """Per-host politeness for image downloads: at most `per_host` requests at once, and after a 429
-    that host's guessed originals are skipped (the page's own copy is fetched instead) until its
-    Retry-After has passed, instead of hammering a site that asked us to slow down."""
+    """Per-host politeness for image downloads: at most `per_host` requests at once. After a 429 on a
+    guessed original, that host's guesses are skipped (the page's own copy is fetched instead) until
+    its Retry-After has passed. After a 429 on a page's own copy, every download from that host waits
+    that long and the copy is tried once more, instead of hammering a site that asked us to slow down.
+    `on_limited(host, seconds, held)` is told once per cool-down (`held`: downloads are waiting)."""
 
-    def __init__(self, per_host: int = 2, on_limited: Callable[[str, float], None] | None = None):
+    def __init__(self, per_host: int = 2, on_limited: Callable[[str, float, bool], None] | None = None):
         self.per_host = per_host
         self.on_limited = on_limited
         self._slots: dict[str, asyncio.Semaphore] = {}
-        self._cool_until: dict[str, float] = {}
+        self._cool_until: dict[str, float] = {}  # guesses are skipped until then
+        self._hold_until: dict[str, float] = {}  # every download waits until then
 
     def slot(self, host: str) -> asyncio.Semaphore:
         if host not in self._slots:
@@ -58,11 +78,21 @@ class HostGate:
     def cooling(self, host: str) -> bool:
         return self._cool_until.get(host, 0.0) > time.monotonic()
 
-    def limited(self, host: str, retry_after_s: float) -> None:
-        first = not self.cooling(host)
-        self._cool_until[host] = time.monotonic() + retry_after_s
+    def holding(self, host: str) -> bool:
+        return self._hold_until.get(host, 0.0) > time.monotonic()
+
+    def limited(self, host: str, retry_after_s: float, hold: bool = False) -> None:
+        first = not (self.holding(host) if hold else self.cooling(host))
+        until = time.monotonic() + retry_after_s
+        self._cool_until[host] = max(self._cool_until.get(host, 0.0), until)
+        if hold:
+            self._hold_until[host] = max(self._hold_until.get(host, 0.0), until)
         if first and self.on_limited:
-            self.on_limited(host, retry_after_s)
+            self.on_limited(host, retry_after_s, hold)
+
+    async def wait_hold(self, host: str) -> None:
+        while (left := self._hold_until.get(host, 0.0) - time.monotonic()) > 0:
+            await asyncio.sleep(left)
 
 
 def _retry_after(value: str | None) -> float:
@@ -88,10 +118,6 @@ class FetchedImage:
     def megapixels(self) -> float | None:
         return self.width * self.height / 1e6 if self.width and self.height else None
 
-    @property
-    def b64(self) -> str:
-        return base64.b64encode(self.data).decode("ascii")
-
 
 def _decode_data_url(url: str) -> bytes:
     header, _, payload = url.partition(",")
@@ -108,14 +134,19 @@ def _dimensions(data: bytes) -> tuple[int | None, int | None]:
     try:
         with Image.open(io.BytesIO(data)) as im:
             return im.size
+    except Image.DecompressionBombError as e:
+        # Pillow refuses to open it at all, so the engine couldn't check it either.
+        limit = f" (over {2 * Image.MAX_IMAGE_PIXELS / 1e6:.0f} megapixels)" if Image.MAX_IMAGE_PIXELS else ""
+        raise FetchError(f"image too large to check{limit}") from e
     except Exception:  # noqa: BLE001 - unknown size just means no megapixel check
         return None, None
 
 
 def check_image_bytes(url: str, page: str, data: bytes, max_bytes: int) -> FetchedImage:
+    """Type, size and hash of downloaded bytes. CPU-bound for big files: call it in a worker thread."""
     if len(data) > max_bytes:
         raise FetchError("image too large")
-    kind = sniff_image(data, HEIF_OK)
+    kind = sniff_image(data, HEIF_OK, AVIF_OK)
     if kind is None:
         raise FetchError("unsupported image type (SVG, ICO or not an image)")
     ext, mime = kind
@@ -123,39 +154,46 @@ def check_image_bytes(url: str, page: str, data: bytes, max_bytes: int) -> Fetch
     return FetchedImage(url, page, data, ext, mime, hashlib.sha256(data).hexdigest(), w, h)
 
 
+def check_data_url(url: str, page: str, max_bytes: int) -> FetchedImage:
+    return check_image_bytes(url, page, _decode_data_url(url), max_bytes)
+
+
 async def fetch_image(
     context: BrowserContext, cand: ImageCandidate, timeout_s: float, max_bytes: int, gate: HostGate | None = None
 ) -> FetchedImage:
-    """Tries cand.url, then each fallback; the error reported is the last URL's (the displayed image)."""
+    """Tries each of cand.urls in turn; the error reported is the last one's."""
     gate = gate or HostGate()
     err: FetchError | None = None
     for n, url in enumerate(cand.urls):
-        guess = n < len(cand.fallbacks)  # anything but the last URL is a guessed original
+        guess = n < cand.guesses
         host = urlsplit(url).hostname or ""
         if guess and gate.cooling(host):
             continue
-        try:
-            async with gate.slot(host):
-                img = await _fetch_one(context, url, cand.page, timeout_s, max_bytes)
-        except RateLimited as e:
-            gate.limited(host, e.retry_after_s)
-            err = e
-            continue
-        except FetchError as e:
-            err = e
-            continue
-        return dataclasses.replace(img, is_original=True) if guess else img
-    assert err is not None
-    raise err
+        for attempt in (1, 2):
+            await gate.wait_hold(host)
+            try:
+                async with gate.slot(host):
+                    img = await _fetch_one(context, url, cand.page, timeout_s, max_bytes)
+            except RateLimited as e:
+                gate.limited(host, e.retry_after_s, hold=not guess)
+                err = e
+                if guess or attempt == 2:
+                    break
+                continue  # the page's own copy: wait out Retry-After, then one more try
+            except FetchError as e:
+                err = e
+                break
+            return dataclasses.replace(img, is_original=True) if guess else img
+    raise err or FetchError("no address to fetch")
 
 
 async def _fetch_one(context: BrowserContext, url: str, page: str, timeout_s: float, max_bytes: int) -> FetchedImage:
     if url[:5].lower() == "data:":
-        return check_image_bytes(url, page, _decode_data_url(url), max_bytes)
+        return await asyncio.to_thread(check_data_url, url, page, max_bytes)
     try:
         resp = await context.request.get(
             url,
-            headers={"Referer": page, "Accept": "image/avif,image/webp,image/*,*/*;q=0.8"},
+            headers={"Referer": page, "Accept": ACCEPT},
             timeout=timeout_s * 1000,
             fail_on_status_code=False,
         )
@@ -176,6 +214,10 @@ async def _fetch_one(context: BrowserContext, url: str, page: str, timeout_s: fl
             data = await resp.body()
         except PlaywrightError as e:
             raise FetchError(f"fetch failed: {str(e).splitlines()[0]}") from e
-        return check_image_bytes(url, page, data, max_bytes)
     finally:
-        await resp.dispose()
+        try:
+            await resp.dispose()
+        except PlaywrightError:  # pragma: no cover - the context is already closing
+            pass
+    # Hashing and reading the header of a large file takes a while: keep it off the event loop.
+    return await asyncio.to_thread(check_image_bytes, url, page, data, max_bytes)

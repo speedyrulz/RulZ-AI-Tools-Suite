@@ -110,6 +110,9 @@ def prepare_image(raw: bytes, max_edge: int, min_short_edge: int, jpeg_quality: 
             s = max_edge / max(w, h)
             img.draft(img.mode, (max(1, round(w * s)), max(1, round(h * s))))
         img.load()
+    except Image.DecompressionBombError as e:
+        # Not an OSError: without this, one huge map or scan would end the caller's whole batch.
+        raise ImageError(f"image too large to decode safely: {e}") from e
     except (UnidentifiedImageError, OSError, ValueError) as e:
         raise ImageError(f"cannot decode image: {e}") from e
 

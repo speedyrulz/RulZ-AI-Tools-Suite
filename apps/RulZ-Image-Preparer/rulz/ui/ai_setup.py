@@ -88,6 +88,7 @@ class _SetupDialog(QDialog):
         self._proc: QProcess | None = None
         self._dl: _Download | None = None
         self._pip: list[list[str]] = []
+        self._stopped = False
 
         intro = QLabel(self.intro + "\n\n" + "\n".join(f"• {s}" for s in self.steps()) +
                        "\n\nFiles are stored on this PC; nothing is uploaded.")
@@ -104,7 +105,7 @@ class _SetupDialog(QDialog):
         self.buttons.button(QDialogButtonBox.Ok).setText("Set up")
         self.buttons.button(QDialogButtonBox.Ok).setProperty("primary", True)
         self.buttons.accepted.connect(self._start)
-        self.buttons.rejected.connect(self._cancel)
+        self.buttons.rejected.connect(self.reject)
 
         lay = QVBoxLayout(self)
         lay.setSpacing(12)
@@ -134,6 +135,8 @@ class _SetupDialog(QDialog):
         self._next()
 
     def _next(self):
+        if self._stopped:
+            return
         importlib.invalidate_caches()
         if self.packages_needed():
             if getattr(sys, "frozen", False):
@@ -161,6 +164,8 @@ class _SetupDialog(QDialog):
 
     def _install_done(self, code, _status):
         self._proc = None
+        if self._stopped:
+            return
         if code != 0:
             self._fail(f"Installing {self.packages_label} failed - see the messages above.")
             return
@@ -195,14 +200,17 @@ class _SetupDialog(QDialog):
         ok.setText("Try again")
         ok.setEnabled(True)
 
-    def _cancel(self):
+    def reject(self):
+        """Cancel, Esc and the window's close button all come here: stop pip or the download first, so
+        nothing carries on hidden (and a later try doesn't race it for the same files)."""
+        self._stopped = True  # a step that finishes right now mustn't start the next one
         if self._proc is not None:
             self._proc.kill()
             self._proc.waitForFinished(3000)
         if self._dl is not None and self._dl.isRunning():
             self._dl.cancel()
             self._dl.wait()
-        self.reject()
+        super().reject()
 
 
 class AISetupDialog(_SetupDialog):

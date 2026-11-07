@@ -191,12 +191,12 @@ def test_rate_limited_host_falls_back_and_skips_originals_while_cooling():
         request = Request()
 
     notices = []
-    gate = HostGate(on_limited=lambda host, s: notices.append((host, s)))
-    cand = lambda i: ImageCandidate(f"https://s.com/orig/{i}.jpg", "https://s.com/", None, (f"https://s.com/t/{i}.jpg",))
+    gate = HostGate(on_limited=lambda host, s, held: notices.append((host, s, held)))
+    cand = lambda i: ImageCandidate(f"https://s.com/orig/{i}.jpg", "https://s.com/", None, (f"https://s.com/t/{i}.jpg",), 1)
 
     first = asyncio.run(fetch_image(Context(), cand(1), 5, 10**7, gate))
     assert first.url == "https://s.com/t/1.jpg" and not first.is_original
-    assert notices == [("s.com", 120.0)]
+    assert notices == [("s.com", 120.0, False)]  # a guess was refused: no waiting
     second = asyncio.run(fetch_image(Context(), cand(2), 5, 10**7, gate))
     assert second.url == "https://s.com/t/2.jpg"
     assert "https://s.com/orig/2.jpg" not in calls  # not even tried while the host cools down

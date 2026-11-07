@@ -65,8 +65,10 @@ powershell -ExecutionPolicy Bypass -File start_app.ps1 -Gpu 1 -NoBrowser
 **Full-size originals** (on by default): for each picture the app first tries the full-size original — the
 image file a thumbnail links to, or the address with the site's resize markers removed (Wikimedia,
 WordPress `-300x200`, Shopify, Google/Blogger, `?w=…` CDN parameters) — and falls back to the page's own copy.
-At most two downloads per site run at once; if a site answers "too many requests" the app uses the page's
-copies for that site until it says to try again, and notes this under Problems.
+At most two downloads per site run at once. If a site answers "too many requests" to a guessed original, the
+app uses the page's copies for that site until it says to try again; if it says so for the page's own copy,
+downloads from that site wait as long as it asks, then try once more. Either way it's noted under Problems.
+Pictures served as AVIF are kept like any other format.
 
 **Stay in this folder** (off by default): only follow links inside the start address's folder and below.
 Starting at `example.com/gallery/cats` (or `.../cats/`, or `.../cats/index.html`) crawls `/gallery/cats/...`
@@ -93,8 +95,8 @@ Expect roughly 1–2 s per new image; images checked before come from the cache 
 ## Tests
 
 ```powershell
-python -m pytest crawler_app        # 23 tests, real Chromium + a fake model; no GPU needed
-python -m pytest image_detection    # 37 engine tests, no GPU needed
+python -m pytest crawler_app        # 40 tests, real Chromium + a fake model; no GPU needed
+python -m pytest image_detection    # 44 engine tests, no GPU needed
 python image_detection\scripts\eval_labeled.py   # accuracy on your labeled images (see image_detection\README.md)
 ```
 

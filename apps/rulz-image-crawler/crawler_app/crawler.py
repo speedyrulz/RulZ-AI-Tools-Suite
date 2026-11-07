@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Callable
 from urllib.parse import urlsplit
 from urllib.robotparser import RobotFileParser
 
@@ -88,14 +89,24 @@ class PageError(Exception):
 
 @dataclass(frozen=True)
 class ImageCandidate:
+    """`urls` is tried in order: guessed full-size originals first (`guesses` of them), then the address
+    the page uses, then possibly the copy the browser actually showed, as a backup."""
+
     url: str  # absolute http(s) or data: URL
     page: str  # page it was found on (used as Referer)
     short_edge: int | None = None  # rendered natural size if known, for skipping tiny images early
-    fallbacks: tuple[str, ...] = ()  # tried in order if `url` fails; `url` may be a guessed original
+    fallbacks: tuple[str, ...] = ()  # tried in order if `url` fails
+    guesses: int = 0  # how many of `urls`, from the front, are guessed originals the page never used
 
     @property
     def urls(self) -> tuple[str, ...]:
         return (self.url, *self.fallbacks)
+
+    @property
+    def ids(self) -> tuple[str, ...]:
+        """The guesses and the page's own address: what makes two candidates the same image. The backup
+        is left out, since unrelated images can share one (a lazy loader's placeholder)."""
+        return self.urls[: self.guesses + 1]
 
 
 @dataclass
@@ -105,18 +116,21 @@ class PageResult:
     links: list[str]  # normalized absolute page URLs, not yet filtered for site/robots
 
 
-def _pick_img(i: dict, base: str) -> tuple[str | None, int | None]:
-    """Largest srcset candidate, else the lazy-load attribute, else what the browser shows.
-    The natural size is only a reliable hint when the shown image is the one we picked."""
+def _pick_img(i: dict, base: str) -> tuple[str | None, int | None, str | None]:
+    """(url, size hint, backup): the largest srcset candidate, else the lazy-load attribute, else what
+    the browser shows. The natural size is only a reliable hint when the shown image is the one we
+    picked. When it isn't, the shown copy is the backup if the browser really loaded it (bigger than a
+    1x1 placeholder), in case the picked URL turns out to be broken or in a format we can't read."""
+    shown = normalize_image_url(i.get("current") or i.get("src") or "", base)
     sets = [s for s in (i.get("dsrcset"), i.get("srcset"), *i.get("pic", [])) if s]
-    best = best_from_srcsets(sets)
-    if best:
-        return normalize_image_url(best, base), None
-    if i.get("dsrc"):
-        return normalize_image_url(i["dsrc"], base), None
-    url = normalize_image_url(i.get("current") or i.get("src") or "", base)
-    hint = min(i["nw"], i["nh"]) if i.get("nw") and i.get("nh") else None
-    return url, hint
+    picked = best_from_srcsets(sets) or i.get("dsrc")
+    url = normalize_image_url(picked, base) if picked else None
+    if not url:
+        hint = min(i["nw"], i["nh"]) if i.get("nw") and i.get("nh") else None
+        return shown, hint, None
+    loaded = (i.get("nw") or 0) > 1 and (i.get("nh") or 0) > 1
+    backup = shown if shown and shown != url and loaded and not shown.startswith("data:") else None
+    return url, None, backup
 
 
 def extract_candidates(
@@ -128,7 +142,7 @@ def extract_candidates(
     seen: set[str] = set()
     images: list[ImageCandidate] = []
 
-    def add(url: str | None, hint: int | None = None, link: str | None = None) -> None:
+    def add(url: str | None, hint: int | None = None, link: str | None = None, backup: str | None = None) -> None:
         if not url or url in seen:
             return
         guesses: list[str] = []
@@ -137,19 +151,20 @@ def extract_candidates(
             guesses = original_candidates(url)
             if link and link != url and link not in guesses and looks_like_image_file(link):
                 guesses.append(link)
+        backups = (backup,) if backup and backup != url and backup not in guesses else ()
         if guesses:
             # The displayed size says nothing about the original's, so don't skip on it.
-            cand = ImageCandidate(guesses[0], page_url, None, (*guesses[1:], url))
+            cand = ImageCandidate(guesses[0], page_url, None, (*guesses[1:], url, *backups), len(guesses))
         else:
-            cand = ImageCandidate(url, page_url, hint)
+            cand = ImageCandidate(url, page_url, hint, backups)
         if cand.url in seen:
             return
-        seen.update(cand.urls)
+        seen.update(cand.ids)
         images.append(cand)
 
     for i in raw.get("imgs", []):
-        url, hint = _pick_img(i, base)
-        add(url, hint, normalize_image_url(i["link"], base) if i.get("link") else None)
+        url, hint, backup = _pick_img(i, base)
+        add(url, hint, normalize_image_url(i["link"], base) if i.get("link") else None, backup)
     for bg in raw.get("bgs", []):
         for u in css_urls(bg):
             add(normalize_image_url(u, base))
@@ -195,12 +210,14 @@ async def load_page(
 
 
 class Robots:
-    """robots.txt per origin, fetched through the run's browser context. Missing or broken
-    robots.txt means everything is allowed."""
+    """robots.txt per origin, fetched through the run's browser context. A missing robots.txt (4xx) or
+    one that can't be fetched means everything is allowed. A server error (5xx) means nothing is, as
+    RFC 9309 asks; `on_note` is told so once per site."""
 
-    def __init__(self, context: BrowserContext, timeout_s: float):
+    def __init__(self, context: BrowserContext, timeout_s: float, on_note: Callable[[str], None] | None = None):
         self._context = context
         self._timeout_ms = timeout_s * 1000
+        self._on_note = on_note
         self._parsers: dict[str, RobotFileParser | None] = {}
 
     async def _parser(self, url: str) -> RobotFileParser | None:
@@ -213,6 +230,14 @@ class Robots:
                 if resp.ok:
                     parser = RobotFileParser()
                     parser.parse((await resp.text()).splitlines())
+                elif resp.status >= 500:
+                    parser = RobotFileParser()
+                    parser.disallow_all = True
+                    if self._on_note:
+                        self._on_note(
+                            f"robots.txt on {origin} answered HTTP {resp.status}, so the site counts as closed to "
+                            "crawlers; turn off Respect robots.txt to crawl it anyway"
+                        )
                 await resp.dispose()
             except PlaywrightError as e:
                 log.info("robots.txt unavailable for %s: %s", origin, str(e).splitlines()[0])
