@@ -115,9 +115,7 @@ def make_ema(paths: list, out, beta: float = 0.95, beta2: float | None = None, s
              rank: int | None = None, device="cpu", fmt: str | None = None) -> dict:
     """Read one run's checkpoints, average them with EMA weights and save one LoRA. rank None: the inputs' rank; 0:
     exact (the factors side by side). Returns the report (soup.cook's, plus the steps, weights and "out")."""
-    from safetensors.torch import load_file
-
-    from .lora import save_lora
+    from .lora import file_format, save_lora
 
     if len(paths) < 2:
         raise ValueError("post-hoc EMA needs 2 or more checkpoints of one run")
@@ -130,7 +128,7 @@ def make_ema(paths: list, out, beta: float = 0.95, beta2: float | None = None, s
     if not stubs:
         raise ValueError("the average has no layers (the checkpoints' changes were empty)")
     if fmt is None:
-        fmt = "peft" if any(k.endswith(".lora_A.weight") for k in load_file(str(files[-1]))) else "comfy"
+        fmt = file_format(files[-1])
     how = (f"sigma_rel {sigma_rel:g}" if sigma_rel is not None
            else f"beta {beta:g}" + (f" to {beta2:g}" if beta2 is not None and beta2 != beta else ""))
     with safe_open(str(files[-1]), "pt") as f:  # the newest file's description (base model, config, steps)

@@ -140,8 +140,11 @@ def make_soup(paths: list, out, rank: int = 32, weights=None, strength: float = 
     if len(paths) < 2:
         raise ValueError("a soup needs 2 or more LoRA files")
     ingredients = [read_ingredient(p) for p in paths]
-    if fmt is None:
-        fmt = "peft" if any(any(k.endswith(".lora_A.weight") for k in load_file(str(p))) for p in paths) else "comfy"
+    if fmt is None:  # the ingredients' own layout (one model's LoRAs share it)
+        from .lora import file_format
+
+        formats = [file_format(p) for p in paths]
+        fmt = next((f for f in ("peft", "folded", "comfy_ab") if f in formats), "comfy")
     stubs, report = cook(ingredients, weights, rank, strength, device)
     report["out"] = str(save(stubs, out, paths, report, fmt))
     return report

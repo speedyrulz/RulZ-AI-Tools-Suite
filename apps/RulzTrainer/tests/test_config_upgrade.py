@@ -121,3 +121,14 @@ def test_compile_auto_rule():
     assert not compiling.decide("auto", 5000, ["cpu"])[0]
     pytest.importorskip("triton")
     assert compiling.decide("auto", 5000, ["cuda:1", "cuda:0"]) == (True, "compile_model auto: 5000 steps to go")
+
+
+@pytest.mark.parametrize("bad, msg", [
+    (dict(gradient_accumulation=0), "gradient_accumulation"), (dict(batch_size=0), "batch_size"),
+    (dict(caption_dropout=5.0), "caption_dropout"), (dict(lr_scheduler="cosin"), "lr_scheduler"),
+    (dict(timestep_sampling="logit"), "timestep_sampling"), (dict(loss_weighting="snr"), "loss_weighting")])
+def test_settings_the_trainer_cannot_act_on_are_refused_at_start(bad, msg):
+    """Refused before the caching and the model load: gradient_accumulation 0 trained no image and saved the LoRA
+    untrained, an lr_scheduler typo ran constant, a timestep_sampling typo failed at step 1."""
+    with pytest.raises(ValueError, match=msg):
+        TrainConfig(**bad).validate()

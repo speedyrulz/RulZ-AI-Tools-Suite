@@ -307,6 +307,9 @@ def test_likeness_spreadsheet_export(tmp_path):
     assert [raw.cell(r, 1).value for r in range(2, 5)] == [0, 100, 200] and raw["C4"].value is None
     assert ws["B6"].value.startswith('=IF(I6="","",MIN(100,100*MAX(0,(I6-Scale!$B$3)')
     assert ws["D9"].value == "=MAX(D5:D7)" and "INDEX(A5:A7" in ws["D10"].value
+    # a probe without a score never seeds the smoothing: an empty cell reads 0 in a spreadsheet, so each checks for ""
+    assert ws["J5"].value == """=IF('Raw probe scores'!C2="","",'Raw probe scores'!C2)"""
+    assert ws["J7"].value.startswith("""=IF('Raw probe scores'!C4="",J6,IF(J6="",'Raw probe scores'!C4,""")
     assert wb.calculation.fullCalcOnLoad
 
     race = tmp_path / "race"

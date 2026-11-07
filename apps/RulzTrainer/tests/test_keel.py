@@ -463,6 +463,52 @@ def test_hook_accumulates_the_micro_batches_and_gather_hands_the_sum_back():
     assert not hasattr(p, "_accum_grad") and opt._armed
 
 
+def test_a_left_out_step_disarms_and_a_retry_drops_the_face_reports():
+    """A step left out for non-finite gradients never reaches step(): disarm() ends its accumulation, so an optimizer
+    built on the same tensors afterwards (the reward stage's AdamW) gets its gradients; and zero_grad drops the face
+    reports of micro-batches an out-of-memory retry runs again (and an inf report never reaches the gain)."""
+    torch.manual_seed(8)
+    pairs, params = _pairs(4)
+    opt = Keel(params, pairs=pairs, lr=1e-3, fused=False, bands=1, consensus=0.0, gauge=False, cautious=False,
+               face_gain=1.0, face_gain_max=2.0, face_gain_beta=0.0)
+    opt.zero_grad(set_to_none=True)
+    up = pairs[0][1]
+    opt.face_energy(up, torch.tensor(float("inf")), torch.tensor(float("inf")))
+    (up * torch.randn_like(up)).sum().backward()
+    assert hasattr(up, "_accum_grad") and opt._face_e
+    opt.zero_grad(set_to_none=True)  # the retry: the failed attempt's reports go too
+    assert not opt._face_e and not hasattr(up, "_accum_grad") and opt._armed
+    opt.face_energy(up, torch.tensor(float("inf")), torch.tensor(float("inf")))
+    opt.disarm()  # the step was left out
+    assert not opt._armed and not opt._face_e
+    adamw = torch.optim.AdamW(params, lr=1e-3)
+    (up * torch.randn_like(up)).sum().backward()
+    assert up.grad is not None and not hasattr(up, "_accum_grad")  # AdamW sees it
+    adamw.zero_grad(set_to_none=True)
+    opt.zero_grad(set_to_none=True)
+    for (_, u), e in zip(pairs, (float("inf"), 0.5, 0.5, 0.5)):
+        opt.face_energy(u, torch.tensor(e), torch.tensor(float("inf") if e == float("inf") else 1.0))
+    for t in params:
+        t.grad = torch.randn_like(t)
+    opt.step()
+    assert all(torch.isfinite(t).all() for t in params)
+    assert all(torch.isfinite(opt.state[u]["face_gain"]).all() for _, u in pairs if "face_gain" in opt.state[u])
+
+
+def test_more_than_127_votes_do_not_wrap_the_sign_sum():
+    """The sign vote's sum starts in int8: past 127 votes (gradient accumulation 128, or 64 with the DOP pass) it
+    widens instead of wrapping to -128, which flipped the gate's sign (power 1) or made it NaN."""
+    p = torch.nn.Parameter(torch.zeros(3))
+    opt = Keel([p], lr=1e-4, fused=False, bands=1, consensus=0.5)
+    opt.zero_grad()
+    g = torch.ones(3)
+    for _ in range(200):
+        opt._vote(p, g)
+    assert opt._votes[p] == 200 and torch.equal(opt._agree[p].long(), torch.full((3,), 200))
+    gate = consensus_gate(opt._agree[p], opt._votes[p], 0.5, 1.0)
+    assert torch.allclose(gate, torch.ones(3))
+
+
 def test_two_optimizers_on_the_same_tensors_keep_out_of_each_others_steps():
     torch.manual_seed(7)
     p = torch.nn.Parameter(torch.randn(4, 4))

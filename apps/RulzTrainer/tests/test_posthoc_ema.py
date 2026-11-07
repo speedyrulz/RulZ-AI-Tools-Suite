@@ -18,7 +18,7 @@ OUT, IN, RANK = 24, 20, 4
 NAMES = ("layers.0.attn.q", "layers.0.attn.k")
 
 
-def checkpoint(path, step: int | None, seed: int, meta: dict | None = None) -> dict:
+def checkpoint(path, step: int | None, seed: int, meta: dict | None = None, fmt: str = "comfy") -> dict:
     """A rank-4 LoRA checkpoint (ss_steps = step when given); returns its weight changes."""
     g = torch.Generator().manual_seed(seed)
     stubs, out = {}, {}
@@ -30,7 +30,7 @@ def checkpoint(path, step: int | None, seed: int, meta: dict | None = None) -> d
     metadata = dict(meta or {})
     if step is not None:
         metadata["ss_steps"] = str(step)
-    save_lora(stubs, path, metadata=metadata, dtype=torch.float32)
+    save_lora(stubs, path, metadata=metadata, dtype=torch.float32, fmt=fmt)
     return out
 
 
@@ -83,6 +83,22 @@ def test_the_average_of_the_changes_in_step_order(tmp_path):
     assert meta["ss_base_model"] == "base.safetensors" and "beta 0.5" in meta["rulztrainer_posthoc_ema"]
     assert rep["effective_step"] == pytest.approx(225.0)
     assert "3 checkpoints (steps 100-300)" in P.describe(rep)
+
+
+@pytest.mark.parametrize("fmt", ["comfy", "peft", "folded", "comfy_ab"])
+def test_the_average_keeps_the_layout_and_describes_its_own_alpha(tmp_path, fmt):
+    """The output is written in the checkpoints' layout, and the alpha in its metadata is the average's own (alpha =
+    rank), not the newest checkpoint's copied over it (a PEFT file then loaded at alpha / rank of its strength)."""
+    from rulztrainer.lora import file_format
+
+    files = [tmp_path / f"run_{s:06d}.safetensors" for s in (100, 200)]
+    deltas = [checkpoint(p, (i + 1) * 100, i, fmt=fmt) for i, p in enumerate(files)]
+    assert file_format(files[0]) == fmt
+    rep = P.make_ema(files, tmp_path / "ema.safetensors", beta=0.0, rank=0)  # beta 0: the newest file alone
+    assert file_format(rep["out"]) == fmt
+    got = {n: S.delta_of(e) for n, e in S.read_ingredient(rep["out"]).items()}
+    for name in NAMES:
+        assert torch.allclose(got[name], deltas[-1][name], rtol=0.02, atol=0.02)
 
 
 def test_default_rank_is_the_inputs(tmp_path):

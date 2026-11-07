@@ -189,7 +189,7 @@ def vae_class():
     try:
         from diffusers import AutoencoderKLMiniMaxH3
     except ImportError as e:
-        raise ImportError("MiniMax H3's VAE needs diffusers 0.40 or later: run the installer again (or pip install -U "
+        raise ImportError("MiniMax H3's VAE needs diffusers 0.41 or later: run the installer again (or pip install -U "
                           "diffusers)") from e
     return AutoencoderKLMiniMaxH3
 
@@ -300,7 +300,7 @@ def load_audio_encoder_file(path: str | Path, config: dict | None = None):
     try:
         from diffusers import AutoencoderKLMiniMaxH3Audio
     except ImportError as e:
-        raise ImportError("MiniMax H3's audio VAE needs diffusers 0.40 or later") from e
+        raise ImportError("MiniMax H3's audio VAE needs diffusers 0.41 or later") from e
     state = read_state(path, torch.float32)
     meta = file_metadata(path).get("minimax_h3_audio_vae")
     mean = state.pop("latents_mean", None)

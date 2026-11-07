@@ -111,6 +111,7 @@ def test_export_keys_and_metadata(tmp_path):
     state = L.export_state_dict({"a": oft, "b": dora}, torch.bfloat16, "comfy")
     assert state["diffusion_model.a.oft_blocks"].shape == (4, 16, 16) and abs(float(state["diffusion_model.a.alpha"]) - 0.02) < 1e-6
     assert state["diffusion_model.b.dora_scale"].shape == (1, 32)
+    assert state["diffusion_model.b.dora_scale"].dtype == torch.float32  # the column norms whole, whatever the dtype
     assert {k.rsplit(".", 1)[-1] for k in state if k.startswith("diffusion_model.b.")} == {"weight", "alpha", "dora_scale"}
     peft = L.export_state_dict({"b": dora}, torch.bfloat16, "peft")
     assert "transformer.b.dora_scale" in peft and "transformer.b.lora_A.weight" in peft
@@ -219,3 +220,22 @@ def test_dora_keeps_its_norm_through_a_render_round(monkeypatch):
     with L.frozen_adapters():
         m(x).sum().backward()  # gradients on: training forwards always recompute
     assert len(calls) == 6
+
+
+@pytest.mark.parametrize("fmt", ["folded", "comfy_ab"])
+def test_folded_formats_save_module_like_stubs(fmt):
+    """A fine-tune extraction, a race configuration's view and a weight average save stubs with only adapter_params,
+    alpha and rank: the formats that fold alpha / rank into lora_B take it from those, as from a LoRALinear."""
+    torch.manual_seed(0)
+    m = L.LoRALinear(nn.Linear(32, 64), 8, 4.0, kind="lora")
+    with torch.no_grad():
+        m.lora_up.weight.normal_()
+    stub = SimpleNamespace(kind="lora", alpha=m.alpha, rank=m.rank, trainable=True,
+                           adapter_params=lambda: {k: v.detach().clone() for k, v in m.adapter_params().items()})
+    want = L.export_state_dict({"b": m}, torch.float32, fmt)
+    got = L.export_state_dict({"b": stub}, torch.float32, fmt)
+    assert want.keys() == got.keys()
+    for k in want:
+        assert torch.equal(want[k], got[k]), k
+    b = next(v for k, v in got.items() if k.endswith("lora_B.weight"))
+    assert torch.allclose(b, m.lora_up.weight.detach() * 0.5)  # alpha 4 / rank 8 folded in

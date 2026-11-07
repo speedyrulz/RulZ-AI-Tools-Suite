@@ -7,7 +7,7 @@ safetensors>=0.6
 huggingface_hub>=0.30
 Pillow>=10
 pyyaml>=6
-nicegui>=2
+nicegui>=3  # the upload events webui.py reads (e.file, e.files) are NiceGUI 3's
 bitsandbytes>=0.45
 # fused W8A8 kernels (rulztrainer/quant.py); Linux torch wheels already bundle triton
 triton-windows>=3.8; sys_platform == "win32"

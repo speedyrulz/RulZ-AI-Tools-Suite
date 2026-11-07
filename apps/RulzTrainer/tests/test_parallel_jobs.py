@@ -203,6 +203,12 @@ def test_cache_region_maps_splits_images_across_mask_fns(tmp_path):
     assert all(it.region_path.exists() for it in items)
     # the single-function path still works and skips cached maps
     assert R.cache_region_maps(items, cfg, {}, person_mask_fn=mask_fn("a")) == {"face": 0, "person": 0, "none": 0}
+    # other region weights, or no person masks this time, rebuild them: the weights are baked into the map
+    heavier = TrainConfig(cache_dir=str(tmp_path), region_weights=True, body_loss_weight=cfg.body_loss_weight * 2)
+    assert R.cache_region_maps(items, heavier, {}, person_mask_fn=mask_fn("a"))["person"] == 6
+    assert R.load_region_map(items[0].region_path).weights_print == R.weights_print(heavier, True)
+    assert R.cache_region_maps(items, heavier, {}, person_mask_fn=mask_fn("a"))["person"] == 0
+    assert R.cache_region_maps(items, heavier, {}) == {"face": 0, "person": 0, "none": 6}
 
 
 def test_side_devices_follow_multi_gpu_and_switch():

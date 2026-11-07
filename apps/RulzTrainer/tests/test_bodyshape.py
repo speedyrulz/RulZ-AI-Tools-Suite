@@ -29,6 +29,20 @@ def test_the_references_own_level_leaves_each_one_out():
     assert BS.Profile.self_similarity(refs[:2]) is None  # one other picture is no profile
 
 
+def test_three_references_level_uses_the_spread_a_picture_is_scored_with():
+    """With 3 references each leave-one-out profile has 2, too few for a spread of its own: it takes the whole set's
+    (the one a picture is scored with), not the loose DEFAULT_REL, which put the level above a copy of a reference."""
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        refs = [{k: 1.0 + 0.03 * rng.standard_normal() for k in "abcde"} for _ in range(3)]
+        prof = BS.Profile(refs)
+        copies = np.mean([prof.similarity(r)[0] for r in refs]) / 100.0
+        assert BS.Profile.self_similarity(refs) < copies
+    four = [{k: 1.0 + 0.03 * rng.standard_normal() for k in "abcde"} for _ in range(4)]
+    loo = [BS.Profile(four[:i] + four[i + 1:]).similarity(r)[0] for i, r in enumerate(four)]
+    assert BS.Profile.self_similarity(four) == pytest.approx(np.mean(loo) / 100.0)  # 4 or more: as before
+
+
 def _standing() -> tuple[np.ndarray, np.ndarray]:
     """A 3D skeleton (y up here, metres) standing straight: [33, 3] and all visible."""
     xyz = np.zeros((33, 3), dtype=np.float64)

@@ -34,7 +34,7 @@ def decoder_class():
     try:
         from diffusers.models.autoencoders.autoencoder_kl_minimax_h3 import MiniMaxH3VideoViTDecoder3d
     except ImportError as e:
-        raise ImportError("P-H3-Image's VAE needs diffusers 0.40 or later: run the installer again (or pip install -U "
+        raise ImportError("P-H3-Image's VAE needs diffusers 0.41 or later: run the installer again (or pip install -U "
                           "diffusers)") from e
 
     class PH3ImageViTDecoder(MiniMaxH3VideoViTDecoder3d):

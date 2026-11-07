@@ -38,6 +38,8 @@ def test_nvfp4_roundtrip():
     # exact codes must be representable: requantizing a dequantized tensor is a fixed point
     qw2 = Q.quantize_weight(d, "nvfp4")
     assert (qw2.dequantize(torch.float32) - d).abs().max() < 1e-6
+    # an all-zero weight (a zero-initialised layer) stays zero, not 0 / 0 = NaN in every block
+    assert torch.equal(Q.quantize_weight(torch.zeros(64, 64), "nvfp4").dequantize(torch.float32), torch.zeros(64, 64))
 
 
 def test_quant_linear_forward_backward_matches_dense():
