@@ -41,6 +41,7 @@ class ImageInput:
     url: str | None = None
     mime: str | None = None  # informational; the decoder sniffs the real format
     data: bytes | None = None  # raw bytes, for in-process callers (skips the base64 round trip)
+    sha256: str | None = None  # SHA-256 hex of `data` if the caller already has it (saves hashing it again)
 
 
 @dataclass(frozen=True)
@@ -274,13 +275,29 @@ class DetectionService:
     async def _process_image(
         self, img: ImageInput, tags: Sequence[Tag], threshold: float, model_id: str
     ) -> dict[str, Any]:
+        """Anything but ModelServerDown fails only this image: one bad file must never take the rest of
+        the request (and a crawler's whole run) down with it."""
+        try:
+            return await self._process_image_unguarded(img, tags, threshold, model_id)
+        except ModelServerDown:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.exception("unexpected error preparing or classifying %s", img.id)
+            return {"status": "error", "cached": False, "message": f"internal error: {type(e).__name__}: {e}"}
+
+    async def _process_image_unguarded(
+        self, img: ImageInput, tags: Sequence[Tag], threshold: float, model_id: str
+    ) -> dict[str, Any]:
         hashes = {t.id: rubric_hash(t.rubric) for t in tags}
         try:
             data = await self._raw(img)
         except ImageError as e:
             return {"status": "error", "cached": False, "message": str(e)}
 
-        raw_hash = await asyncio.to_thread(_sha256, data)
+        if img.sha256 and img.data is not None:
+            raw_hash = img.sha256
+        else:
+            raw_hash = await asyncio.to_thread(_sha256, data)
         known, hits = self._known_results(raw_hash, hashes, model_id)
         if known is None or len(hits) < len(set(hashes.values())):
             try:

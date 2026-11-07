@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import threading
+import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -22,11 +24,13 @@ def make_run_dir(
     base = f"{now:%Y-%m-%d_%H%M}_{slug(label or site_key(start_url), 40)}_{slug(tag_id, 30)}"
     path = output_dir / base
     n = 2
-    while path.exists():
-        path = output_dir / f"{base}-{n}"
-        n += 1
-    path.mkdir(parents=True)
-    return path
+    while True:
+        try:
+            path.mkdir(parents=True)  # not exist_ok: two runs started together get a folder each
+            return path
+        except FileExistsError:
+            path = output_dir / f"{base}-{n}"
+            n += 1
 
 
 class RunStorage:
@@ -105,23 +109,41 @@ class RunStorage:
     def has_file(self, name: str) -> bool:
         return name in self._names
 
-    def build_zip(self, min_confidence: float = 0.0) -> Path:
-        """Zip of saved files at or above min_confidence, plus matches.json. Images are already
-        compressed, so they are stored as-is."""
+    def build_zip(self, min_confidence: float, dest_dir: Path) -> Path:
+        """Zip of saved files at or above min_confidence, plus matches.json, as a new file in dest_dir
+        that the caller deletes once it is sent. Never in the run folder: a fixed name there can't be
+        replaced while an earlier download still has it open (Windows), and every slider position
+        would leave another full copy of the matches behind. Images are already compressed, so they
+        are stored as-is."""
         # Snapshot under the lock, zip outside it: saves (and the manifest flush) carry on meanwhile.
         # Saved image files are never rewritten, so reading them unlocked is safe.
         with self._lock:
             doc = self._doc()
-        target = self.folder / f"matches_{round(min_confidence * 100):03d}.zip"
-        tmp = self.folder / f"{target.stem}.{threading.get_ident()}.zip.part"  # two downloads at once don't collide
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix=f"{self.folder.name[:80]}_", suffix=".zip", dir=dest_dir)
+        os.close(fd)
+        target = Path(name)
         try:
-            with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_STORED) as zf:
+            with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_STORED) as zf:
                 for e in doc["matches"]:
-                    if e["confidence"] >= min_confidence:
-                        zf.write(self.folder / e["file"], e["file"])
+                    path = self.folder / e["file"]
+                    if e["confidence"] >= min_confidence and path.is_file():  # skip files deleted by hand
+                        zf.write(path, e["file"])
                 zf.writestr("matches.json", json.dumps(doc, indent=2, ensure_ascii=False))
-            os.replace(tmp, target)
         except BaseException:
-            tmp.unlink(missing_ok=True)
+            target.unlink(missing_ok=True)
             raise
         return target
+
+
+def sweep_zips(zip_dir: Path, older_than_s: float = 3600.0) -> None:
+    """Deletes zips left behind in zip_dir (a download that was cut off never runs its cleanup)."""
+    if not zip_dir.is_dir():
+        return
+    cutoff = time.time() - older_than_s
+    for p in zip_dir.glob("*.zip"):
+        try:
+            if p.stat().st_mtime <= cutoff:
+                p.unlink()
+        except OSError:  # still being sent, or already gone
+            pass
