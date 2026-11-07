@@ -4,6 +4,7 @@ import unittest
 import cv2
 import numpy as np
 
+from rulz import shadows
 from rulz.filters import process
 from rulz.shadows import ShadowEdit, Stroke, lift_shadows, render_mask
 
@@ -68,6 +69,28 @@ class ShadowTests(unittest.TestCase):
         self.assertLess(m[100, 150], 0.01)
         self.assertEqual(m[10, 10], 0.0)
         self.assertFalse(ShadowEdit((erase,)).active)
+
+    def test_working_in_the_painted_box_changes_nothing(self):
+        """Full-size steps run only around the painting; the result must match working on the whole picture."""
+        shot, _, _, _ = _scene(500, 900)
+        shot[0, 0] = 1.2  # out of range, as a Lab round trip can give
+        whole = lambda m: (slice(0, m.shape[0]), slice(0, m.shape[1]))  # noqa: E731
+        for edit in (ShadowEdit((Stroke(((0.2, 0.47), (0.33, 0.52)), 0.04),)),  # small, over the shadow's edge
+                     ShadowEdit((Stroke(((0.0, 0.5), (0.45, 0.5)), 0.05),), 80, 100),  # off the picture's edge
+                     _over_shadow(500, 900)):
+            got = lift_shadows(shot, edit)
+            self.assertIsNot(got, shot)  # it found a shadow to lift
+            saved = shadows._extent
+            shadows._extent = whole
+            try:
+                want = lift_shadows(shot, edit)
+            finally:
+                shadows._extent = saved
+            np.testing.assert_allclose(got, want, rtol=0, atol=2e-6)
+            box = shadows._extent(render_mask(edit, *shot.shape[:2]))
+            outside = np.ones(shot.shape[:2], bool)
+            outside[box] = False
+            np.testing.assert_array_equal(got[outside], np.clip(shot, 0, 1)[outside])
 
     def test_round_trip_and_pipeline(self):
         edit = ShadowEdit((Stroke(((0.1, 0.2), (0.3, 0.4)), 0.05), Stroke(((0.5, 0.5),), 0.02, True)), 40, 70)

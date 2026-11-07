@@ -84,6 +84,34 @@ class OrientationTests(unittest.TestCase):
         img = _picture()
         np.testing.assert_array_equal(imageio.load(self._save("o6.tif", img, 6)), imageio.orient(img, 6))
 
+    def test_straight_alpha_tiff_keeps_its_colors(self):
+        """Pillow (like Photoshop and GIMP) stores straight alpha; OpenCV hands it back multiplied by alpha."""
+        img = _picture(channels=4)
+        for o in (1, 6):
+            got = imageio.load(self._save(f"sa{o}.tif", img, o)).astype(int)
+            want = imageio.orient(img, o).astype(int)
+            np.testing.assert_array_equal(got[..., 3], want[..., 3])
+            a = want[..., 3]
+            err = np.abs(got[..., :3] - want[..., :3]).max(axis=2)
+            # what multiplying by alpha rounded away can't come back: at most about 255 / (2 * alpha)
+            self.assertTrue(np.all(err[a > 0] <= 255 / (2 * a[a > 0]) + 1), f"orientation {o}")
+            self.assertTrue(np.all(err[a >= 128] <= 1), f"orientation {o}")
+            self.assertLess(err.mean(), 3.0)  # multiplied by alpha, this random picture is off by 63 on average
+
+    def test_can_copy_unchanged(self):
+        img = cv2.resize(_picture(), (600, 400), interpolation=cv2.INTER_CUBIC)
+        self.assertTrue(imageio.can_copy_unchanged(self._save("plain.jpg", img, 1, quality=90)))
+        self.assertFalse(imageio.can_copy_unchanged(self._save("o6.jpg", img, 6, quality=90)))  # rotation to bake in
+        self.assertTrue(imageio.can_copy_unchanged(self._save("plain.png", img, 1)))
+        self.assertFalse(imageio.can_copy_unchanged(self._save("o6.png", img, 6)))
+        self.assertFalse(imageio.can_copy_unchanged(self._save("o8.tif", img, 8)))
+        cmyk = self.tmp / "cmyk.jpg"
+        Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)).convert("CMYK").save(cmyk, quality=90)
+        self.assertFalse(imageio.can_copy_unchanged(cmyk))  # load() turns CMYK into RGB
+        no_exif = self.tmp / "no_exif.jpg"
+        cv2.imwrite(str(no_exif), img)
+        self.assertTrue(imageio.can_copy_unchanged(no_exif))
+
 
 class DepthTests(unittest.TestCase):
     def setUp(self):
@@ -127,6 +155,19 @@ class DepthTests(unittest.TestCase):
         path.write_bytes(b"\xff\xd8not a picture")
         with self.assertRaises(ValueError):
             imageio.load(path)
+
+    def test_empty_file_gives_a_plain_message(self):
+        for name in ("empty.jpg", "empty.png"):
+            path = self.tmp / name
+            path.write_bytes(b"")
+            with self.assertRaises(ValueError) as cm:
+                imageio.load(path)
+            self.assertEqual(str(cm.exception), f"Can't read {name}: the file is empty")
+
+    def test_8_bit_rgba_tiff_from_opencv_round_trips(self):
+        """OpenCV writes no alpha type: that must not be taken for straight alpha."""
+        bgra = np.random.default_rng(4).integers(0, 256, (30, 50, 4), dtype=np.uint8)
+        np.testing.assert_array_equal(self._roundtrip("a8.tif", bgra), bgra)
 
     def test_to_qimage_bgr(self):
         img = np.zeros((4, 6, 3), np.uint8)
