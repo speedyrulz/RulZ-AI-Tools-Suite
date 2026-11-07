@@ -88,6 +88,8 @@ def family_named_in(text: str) -> str | None:
         return "flux3_klein"
     if any(s in hint for s in ("flux-2", "flux2", "flux_2", "flux.2")):
         return "flux2_klein"
+    if "p-h3" in hint or "p_h3" in hint:  # PrunaAI/P-H3-Image, p-h3-image_bf16.safetensors (before "minimax")
+        return "p_h3_image"
     for word, family in (("ideogram", "ideogram4"), ("minimax", "minimax_h3"), ("fibo", "fibo2"), ("krea", "krea2"),
                          ("moss", "moss_image")):
         if word in hint:
@@ -272,6 +274,25 @@ COMFY_DIFFUSION_QUANTS["minimax_h3"] = ("pruned_int8_convrot", "pruned_bf16", "i
 COMFY_TEXT_ENCODER_FILES["minimax_h3"] = "text_encoders/qwen3vl_32b_minimax_h3_{quant}.safetensors"
 COMFY_TEXT_ENCODER_QUANTS["minimax_h3"] = ("int8_convrot", "nvfp4_awq", "bf16")
 COMFY_VAE_FILES["minimax_h3"] = "vae/minimax_h3_video_vae_fp16.safetensors"
+
+# P-H3-Image (PrunaAI): MiniMax H3 fine-tuned into an 8-step, guidance-free text-to-image model (rulztrainer.ph3).
+# PrunaAI/P-H3-Image-Comfy (sizes from the Hub): the pruned transformer with Pruna's LoRA merged, int8_convrot 21.2 GB,
+# bf16 40.5 GB (w4a8, 13.4 GB, is a format this trainer cannot read); the Qwen3-VL-4B text encoder with its text
+# connector, int8_convrot 5.1 GB, bf16 9.1 GB; the single-frame VAE, bf16 5.6 GB (its int8 file, 3.1 GB, is read too).
+# Training adapter: ostris' P-H3-Image adapter (rank 16, 0.16 GB), what ai-toolkit trains P-H3-Image with by default:
+# the model is step- and guidance-distilled, so a LoRA trained on it bare drifts the way H3's do
+MODEL_PRESETS["P-H3-Image"] = "PrunaAI/P-H3-Image"
+ARCH_NAMES += ("p_h3_image",)
+ARCH_DEFAULT_TARGETS["p_h3_image"] = _CORE_TARGETS
+ARCH_FULL_SAMPLE["p_h3_image"] = (8, 1.0)  # the checkpoint's own 8-sigma grid, no guidance (no turbo LoRA needed)
+ARCH_TRAINING_ADAPTER["p_h3_image"] = {"repo": "ostris/minimax_h3_training_adapter",
+                                       "file": "p_h3_image_training_adapter_v1.safetensors"}
+COMFY_REPOS["p_h3_image"] = "PrunaAI/P-H3-Image-Comfy"
+COMFY_DIFFUSION_FILES["PrunaAI/P-H3-Image"] = "diffusion_models/p-h3-image_{quant}.safetensors"
+COMFY_DIFFUSION_QUANTS["p_h3_image"] = ("int8_convrot", "bf16")
+COMFY_TEXT_ENCODER_FILES["p_h3_image"] = "text_encoders/p-h3-image_text_encoder_{quant}.safetensors"
+COMFY_TEXT_ENCODER_QUANTS["p_h3_image"] = ("int8_convrot", "bf16")
+COMFY_VAE_FILES["p_h3_image"] = "vae/p-h3-image_vae_bf16.safetensors"
 
 
 # Named presets: values applied over a config (UI toggle, --preset on the CLI, or `preset:` in YAML).
