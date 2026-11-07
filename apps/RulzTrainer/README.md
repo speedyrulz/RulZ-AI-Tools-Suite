@@ -1088,7 +1088,7 @@ In the Wizard, *Character / person* then asks how much of the person the likenes
 | Body focus | 1.5 / 3 | 30% / 70% | face + bust | both |
 | Body only | 1 / 3 | 0 / 100% | none | body only (no face references) |
 
-The curriculum is on for the three in the middle. The wizard also recommends the adapter (a LoRA for every model),
+The curriculum is on for the three in the middle. The wizard also recommends the adapter (OFT for a person on Krea 2, a LoRA otherwise),
 block swap for a card the model does not fit, LoRA Isolation, the look warm-up and how many checkpoints to keep.
 
 ### Experimental: direct identity loss

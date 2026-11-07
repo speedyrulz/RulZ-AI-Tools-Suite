@@ -4068,9 +4068,14 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
                                          "dataset but start at a lower loss weight" if n_out else
                             "no outliers in the saved look scans (scan on the Dataset tab, Look consistency filter)")
         subject = cfg.trigger_word or any(sp.trigger for sp in cfg.dataset_specs())
-        r["isolation"] = (bool(subject), "keeps the subject's face off other people (Fizgig: strangers reading as "
-                                         "the subject 48 of 50 -> 0 of 50); about 1.5-2x the training time"
-                          if subject else "needs a trigger word to isolate (Start page)")
+        if subject and krea and cfg.network_type == "oft":
+            r["isolation"] = (False, "with OFT on Krea 2 it added no likeness and went over the copy limit (one seed); "
+                                     "turn it on if other people in your pictures pick up the subject's face")
+        else:
+            r["isolation"] = (bool(subject), "keeps the subject's face off other people (Fizgig: strangers reading as "
+                                             "the subject 48 of 50 -> 0 of 50); about 1.5-2x the training time, and "
+                                             "watch for memorised photos" if subject else
+                              "needs a trigger word to isolate (Start page)")
     # training
     n = (data or {}).get("images") or 0
     if n:
@@ -4104,7 +4109,10 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
                 r["warmup_steps"] = (200, "BFL's FLUX 3 Klein recipe")
             if klein2 and cfg.network_type == "lora":
                 r["learning_rate"] = (1e-4, "Fizgig's Klein 9B full-model recipe (\"Old Reliable\")")
-        r["network_type"] = ("lora", "reached likeness much sooner than LoKr in RulzTrainer's tests so far, and "
+        r["network_type"] = ("oft", "14 to 15 points over a plain LoRA on two seeds of one small set, face and body; "
+                                    "loads in ComfyUI, not diffusers; not tested with the identity recipe's extras"
+                             ) if character and krea else (
+                             "lora", "reached likeness much sooner than LoKr in RulzTrainer's tests so far, and "
                                      "loads everywhere (ComfyUI and diffusers)")
         if cfg.network_type == "lokr":
             r["lokr_factor"] = (8, "Fizgig's measured default: lower is bigger files, nothing gained above 8")
