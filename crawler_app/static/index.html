@@ -463,7 +463,7 @@
     show($("resumeBtn"), s === "paused");
     show($("cancelBtn"), !final);
     show($("newBtn"), final);
-    if (view.live) renderMatches();
+    if (view.live) renderCounts();
     if (s === "paused" && /model/i.test(message || "")) {
       engineDown(true, "The model stopped.", "Your search is paused. Start the model, then press Resume:");
     }
@@ -524,19 +524,25 @@
 
   // ---- results -----------------------------------------------------------------------------
   // The grid shows either the current search (live) or a past one from the history list.
-  let view = { live: true, base: null, count: 0 };
+  let view = { live: true, base: null, count: 0, shown: 0 };
 
   function addMatch(m) {
     if (matches.has(m.sha256)) return;
     matches.set(m.sha256, m);
     if (!view.live) return;
-    $("grid").append(card(m));
+    // Only the new card is checked against the slider: re-checking every card for each new match
+    // made a big run's page slower with every match.
+    const c = card(m);
+    const on = passes(c, Number($("minConf").value));
+    show(c, on);
+    $("grid").append(c);
     view.count = matches.size;
-    renderMatches();
+    if (on) view.shown++;
+    renderCounts();
   }
 
   function showView(v, list, threshold, title, folder) {
-    view = { ...v, count: list.length };
+    view = { ...v, count: list.length, shown: 0 };
     $("resultsTitle").textContent = title;
     $("grid").replaceChildren(...list.map(card));
     $("minConf").min = String(threshold);
@@ -580,20 +586,29 @@
     return c;
   }
 
+  function passes(c, min) { return Number(c.dataset.conf) >= min - 1e-9; }
+
+  // The slider moved or the view changed: re-check every card.
   function renderMatches() {
     const min = Number($("minConf").value);
     let shown = 0;
     for (const c of $("grid").children) {
-      const on = Number(c.dataset.conf) >= min - 1e-9;
+      const on = passes(c, min);
       show(c, on);
       if (on) shown++;
     }
-    $("shownCount").textContent = `${shown} of ${view.count} shown`;
+    view.shown = shown;
+    renderCounts();
+  }
+
+  function renderCounts() {
+    const min = Number($("minConf").value);
+    $("shownCount").textContent = `${view.shown} of ${view.count} shown`;
     show($("emptyMsg"), view.count === 0);
     $("emptyMsg").textContent = !view.live || FINAL.has(status) ? "No matching images were found." : "No matches yet.";
     const zip = $("zipBtn");
     zip.href = view.base ? `${view.base}/zip?min_confidence=${min}` : "#";
-    show(zip, shown > 0);
+    show(zip, view.shown > 0);
   }
   $("minConf").addEventListener("input", () => {
     $("minConfVal").textContent = Number($("minConf").value).toFixed(2);
