@@ -14,6 +14,7 @@ DRAG_THRESHOLD = 3
 class Timeline(QWidget):
     seekRequested = Signal(float)           # seconds
     selectionMoveRequested = Signal(float)  # new selection start, seconds
+    scrubFinished = Signal()                # mouse released after dragging (see `scrubbing`)
 
     _pad = 8
 
@@ -80,6 +81,12 @@ class Timeline(QWidget):
             self._ticks, self._ticks_key = lines, key
         return self._ticks
 
+    @property
+    def scrubbing(self) -> bool:
+        """The mouse is held down and dragging the playhead or the clip box (not a plain click).
+        Requests sent meanwhile may be answered approximately; scrubFinished follows."""
+        return self._press is not None and self._dragging
+
     def _in_selection(self, x: float) -> bool:
         if not self.selection:
             return False
@@ -111,6 +118,7 @@ class Timeline(QWidget):
         x = e.position().x()
         px, mode, offset = self._press
         if mode == "seek":
+            self._dragging = True
             self.seekRequested.emit(self._t(x))
             return
         if not self._dragging and abs(x - px) < DRAG_THRESHOLD:
@@ -124,8 +132,11 @@ class Timeline(QWidget):
         x, mode, _ = self._press
         if mode == "box" and not self._dragging:
             self.seekRequested.emit(self._t(e.position().x()))
+        dragged = self._dragging
         self._press = None
         self._dragging = False
+        if dragged:
+            self.scrubFinished.emit()
 
     def paintEvent(self, _):
         p = QPainter(self)

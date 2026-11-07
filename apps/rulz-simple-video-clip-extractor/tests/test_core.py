@@ -274,3 +274,67 @@ def test_clean_temp_removes_only_old_files(tmp_path, monkeypatch):
     os.utime(other, (past, past))
     assert colormatch.clean_temp() == 1
     assert not old.exists() and new.exists() and other.exists()
+
+
+# ------------------------------------------------------------------ timeline dragging
+def _mouse(widget, kind, x, held):
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    types = {"press": QEvent.MouseButtonPress, "move": QEvent.MouseMove, "release": QEvent.MouseButtonRelease}
+    pos = QPointF(x, 30)
+    ev = QMouseEvent(types[kind], pos, widget.mapToGlobal(pos), Qt.LeftButton if kind != "move" else Qt.NoButton,
+                     Qt.LeftButton if held else Qt.NoButton, Qt.NoModifier)
+    QApplication.sendEvent(widget, ev)
+
+
+def test_timeline_reports_drags_but_not_clicks():
+    tl = Timeline()
+    tl.resize(600, 56)
+    tl.set_range(0.0, 100.0)
+    seen, ends = [], []
+    tl.seekRequested.connect(lambda t: seen.append(tl.scrubbing))
+    tl.scrubFinished.connect(lambda: ends.append(True))
+    _mouse(tl, "press", 100, True)
+    _mouse(tl, "release", 100, False)
+    assert seen == [False] and ends == []  # a click asks for one exact frame
+    _mouse(tl, "press", 100, True)
+    _mouse(tl, "move", 140, True)
+    _mouse(tl, "move", 180, True)
+    _mouse(tl, "release", 180, False)
+    assert seen == [False, False, True, True] and ends == [True] and not tl.scrubbing
+
+
+# ------------------------------------------------------------------ export dialog
+def test_export_dialog_suggests_a_name_that_is_not_taken(tmp_path):
+    from simplecut.app import ExportDialog
+    from simplecut.export import default_output_path
+    src = tmp_path / "v.mp4"
+    src.write_bytes(b"x")
+    info = VideoInfo(path=str(src), width=160, height=96, fps=25.0, duration=10.0)
+    taken = default_output_path(info, 1.0, 2.0, "nvenc")
+    open(taken, "wb").close()
+    dlg = ExportDialog(info, 1.0, 2.0, lossless_ok=False)
+    try:
+        suggested = dlg.out_path.text()
+        assert suggested != taken and not os.path.exists(suggested)
+        assert os.path.dirname(suggested) == os.path.dirname(taken)
+    finally:
+        dlg.deleteLater()
+
+
+# ------------------------------------------------------------------ opening a file
+def test_probe_reports_the_video_before_its_keyframes(videos):
+    from simplecut.app import ProbeThread
+    got = []
+    t = ProbeThread(videos[0], token=7)
+    t.done.connect(lambda info, tok: got.append(("info", tok, len(info.keyframes))))
+    t.keyframes.connect(lambda kfs, dts, tok: got.append(("keyframes", tok, len(kfs))))
+    t.failed.connect(lambda msg, tok: got.append(("failed", msg)))
+    t.start()
+    end = time.time() + 30
+    while len(got) < 2 and time.time() < end:
+        APP.processEvents()
+        time.sleep(0.01)
+    t.wait()
+    assert [g[:2] for g in got] == [("info", 7), ("keyframes", 7)]
+    assert got[0][2] == 0 and got[1][2] > 1  # the info arrives without keyframes; they follow

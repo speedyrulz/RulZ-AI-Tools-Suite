@@ -183,9 +183,11 @@ def write_cube_1d(tables: np.ndarray) -> str:
 
 
 def ffmpeg_lut_filter(path: str) -> str:
-    """lut1d filter string with the path escaped for ffmpeg's filtergraph parser."""
-    p = path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
-    return f"lut1d=file='{p}':interp=linear"
+    """lut1d filter for the LUT at `path`, naming the file only: ffmpeg must run in the LUT's
+    folder (export.command_cwd). No escaping of a full path survives ffmpeg's filtergraph
+    parser when it holds an apostrophe (C:\\Users\\O'Brien\\AppData\\Local\\Temp\\...), while
+    the name written by write_cube_1d is always match_<hex>.cube."""
+    return f"lut1d=file='{os.path.basename(path)}':interp=linear"
 
 
 def load_image(path: str) -> QImage | None:
