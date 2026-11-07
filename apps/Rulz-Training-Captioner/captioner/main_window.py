@@ -12,7 +12,8 @@ from PySide6.QtWidgets import (QAbstractItemDelegate, QApplication, QCheckBox, Q
 from . import config, theme
 from .backend import CaptionEngine, ServerManager, StartCancelled, external_endpoints
 from .gridview import ImageGrid
-from .model import BUSY, ERROR, IDLE, QUEUED, FilterProxy, ImageModel, collect_images
+from .model import (BUSY, ERROR, IDLE, QUEUED, FilterProxy, ImageModel, caption_clashes, caption_path,
+                    collect_images)
 from .settings_dialog import SettingsDialog
 
 MANAGED_KEYS = ("llama_server", "model", "mmproj", "gpus", "gpu_mode", "tensor_split", "ctx_size", "ngl",
@@ -44,6 +45,8 @@ class MainWindow(QMainWindow):
         self.starting = False
         self.pending_job = None
         self.failures = 0
+        self.warnings = 0
+        self.run_managed = False  # the current job runs on the app's own llama-servers
         self.snapshots = {}  # path -> caption when it was queued, to spot edits made meanwhile
 
         self.grid = ImageGrid()
@@ -64,6 +67,7 @@ class MainWindow(QMainWindow):
 
         self.engine.captioned.connect(self._on_captioned)
         self.engine.failed.connect(self._on_failed)
+        self.engine.warning.connect(self._on_warning)
         self.engine.progress.connect(self._on_progress)
         self.engine.finished.connect(self._on_finished)
         self.bridge.log.connect(self._log)
@@ -276,12 +280,32 @@ class MainWindow(QMainWindow):
             self._add([d], recursive)
 
     def _add(self, paths, recursive=False):
+        known = set(self.model.index_of)
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             n = self.model.add_paths(collect_images(paths, recursive))
+            clashes = [g for g in caption_clashes(self.model.index_of) if not known.issuperset(g)] if n else []
         finally:
             QApplication.restoreOverrideCursor()
         self.statusBar().showMessage(f"Added {n} image(s)", 4000)
+        if clashes:
+            self._warn_clashes(clashes)
+
+    def _warn_clashes(self, groups):
+        """photo.png and photo.jpg both read and write photo.txt: say so before one overwrites the other."""
+        def line(g):
+            return " + ".join(os.path.basename(p) for p in g) + "  →  " + os.path.basename(caption_path(g[0]))
+        for g in groups:
+            self._log("Shared caption file: " + " + ".join(g) + "  →  " + caption_path(g[0]))
+        shown = "\n".join(line(g) for g in groups[:10])
+        if len(groups) > 10:
+            shown += f"\n…and {len(groups) - 10} more (see View ▸ Log)"
+        QMessageBox.warning(
+            self, "Images share a caption file",
+            f"{len(groups)} set(s) of images have the same name with different extensions, so each set "
+            f"shares one caption file:\n\n{shown}\n\nCaptioning or editing one image overwrites the caption "
+            "of the other, and a trainer can't tell which image the caption belongs to. Rename or remove "
+            "the duplicates.")
 
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
@@ -389,6 +413,9 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Servers", "The external backend is selected; there is nothing to start.")
         elif self.starting:
             return
+        elif self.engine.active and self.run_managed:
+            # a restart would kill the servers the job is using and fail every image left
+            self.statusBar().showMessage("Captioning is using the servers: stop it first", 4000)
         elif self.servers.running() and self.server_sig == self._managed_sig():
             # same settings: reloading would only re-read the whole model from disk
             self.statusBar().showMessage(f"{len(self.servers.endpoints)} server(s) already running", 4000)
@@ -397,6 +424,11 @@ class MainWindow(QMainWindow):
             self._launch_servers()
 
     def stop_servers(self):
+        if self.engine.active and self.run_managed:
+            if QMessageBox.question(self, "Stop servers", "Captioning is running on these servers. "
+                                    "Stop captioning and the servers?") != QMessageBox.Yes:
+                return
+            self.engine.cancel()  # first, so the dropped connections count as stopped, not failed
         self.servers.cancel()
         self.servers.stop()
         self.server_sig = None
@@ -449,7 +481,8 @@ class MainWindow(QMainWindow):
         for p in paths:
             self.model.set_status(p, QUEUED)
         self.snapshots = {self.model.items[r]["path"]: self.model.items[r]["caption"] for r in rows}
-        self.failures = 0
+        self.failures = self.warnings = 0
+        self.run_managed = s["backend"] == "managed"
         self.a_stop.setEnabled(True)
         job = (paths, self.sys_edit.toPlainText(), self.user_edit.toPlainText().strip())
         if s["backend"] == "external":
@@ -468,6 +501,10 @@ class MainWindow(QMainWindow):
         workers = sum(e["slots"] for e in eps)
         self._log(f"Captioning {len(paths)} image(s) with {workers} worker(s) on {len(eps)} endpoint(s)")
         self.engine.start(paths, eps, system, user, self.s)
+        if not self.engine.active:  # no endpoints: nothing ran
+            self._on_finished()
+            return
+        self.a_start_srv.setEnabled(not self.run_managed)
 
     def stop_caption(self):
         self.engine.cancel()
@@ -505,6 +542,10 @@ class MainWindow(QMainWindow):
         self.model.set_status(path, ERROR)
         self._log(f"FAILED {os.path.basename(path)}: {err}")
 
+    def _on_warning(self, path, msg):
+        self.warnings += 1
+        self._log(f"WARNING {os.path.basename(path)}: {msg}" if path else f"WARNING: {msg}")
+
     def _on_progress(self, done, total):
         self.progress.setRange(0, total)
         self.progress.setValue(done)
@@ -514,10 +555,18 @@ class MainWindow(QMainWindow):
         self._reset_queued()
         self.progress.setVisible(False)
         self.a_stop.setEnabled(False)
-        msg = "Captioning finished" + (f" — {self.failures} failed (see log)" if self.failures else "")
+        self.a_start_srv.setEnabled(True)
+        notes = [f"{self.failures} failed"] if self.failures else []
+        notes += [f"{self.warnings} warning(s)"] if self.warnings else []
+        reason = self.engine.stop_reason
+        msg = ("Captioning stopped: no server responding" if reason else "Captioning finished") + \
+            (f" — {', '.join(notes)} (see log)" if notes else "")
         self.statusBar().showMessage(msg, 8000)
-        if self.failures:
+        if notes or reason:
             self.log_dock.show()
+        if reason:
+            self._log(reason.replace("\n\n", " "))
+            QMessageBox.warning(self, "Captioning stopped", reason)
 
     def closeEvent(self, e):
         if self.engine.active and QMessageBox.question(self, "Quit", "Captioning is in progress. Quit anyway?") != QMessageBox.Yes:

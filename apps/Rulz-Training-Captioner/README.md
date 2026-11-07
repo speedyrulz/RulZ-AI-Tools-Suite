@@ -36,11 +36,19 @@ Double-click `run.bat` (creates a venv and installs PySide6 + requests on first 
 - *Parallel*: fastest when the model + context fits on each card. Mixed cards are fine; each gets its own server.
 - *Split*: needed when the model doesn't fit on one card. Use *Tensor split* for uneven ratios (e.g. `16,16`).
 - *Concurrent requests per server* adds batching on a server at the cost of VRAM (context is multiplied).
+- GPU numbers match `nvidia-smi`, so ticking GPU 1 uses the card `nvidia-smi` calls GPU 1, even on mixed cards.
+- If one server stops responding during a run, the other servers take over its images. If none respond,
+  captioning stops and the remaining images stay uncaptioned (not failed).
+- The servers close with the app, even if it crashes, so they never keep holding VRAM.
 
 ## Tips
 - Keep **Disable thinking** on (Settings ▸ Generation) for reasoning models like Qwen3.5/3.6 and Gemma 4, otherwise
   they spend the whole token budget thinking and return nothing.
-- Prefix/suffix fields add a trigger word or fixed text to every generated caption.
+- Prefix/suffix fields add a trigger word or fixed text to every generated caption. An empty reply or
+  unfinished thinking counts as a failure, so a caption is never just the prefix.
+- Images that share a name (`photo.png` and `photo.jpg`) share one caption file, `photo.txt`. The app warns
+  when you add them: rename or remove one of each pair.
+- A caption cut off by *Max new tokens* is still saved, with a warning in the log.
 - "Skip images that already have a caption" applies to *Caption All*; *Caption Selected* always overwrites.
 - The log (View ▸ Log) shows llama-server output, useful if a model fails to load.
 
