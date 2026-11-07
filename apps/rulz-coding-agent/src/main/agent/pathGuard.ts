@@ -67,7 +67,10 @@ export async function resolveInProject(
 
   const rel = toRel(root, abs)
   if (opts.write) {
-    const parts = rel.toLowerCase().split('/')
+    // Checked on the real path too: Windows also knows ".git" by its short name (GIT~1), which only
+    // resolving the path reveals, and drops dots and spaces at the end of a name.
+    const realRel = toRel(realRoot, real)
+    const parts = [...rel.split('/'), ...realRel.split('/')].map((p) => p.toLowerCase().replace(/[. ]+$/, ''))
     if (parts.includes('.git')) throw new PathError('Files inside .git folders are managed by git and must not be edited directly.')
     if (rel === '') throw new PathError('Give a file path inside the project, not the project folder itself.')
   }

@@ -34,10 +34,12 @@ export function Workspace() {
   const prompt = useWorkspace((s) => s.prompt)
   const stop = useWorkspace((s) => s.stop)
 
-  // Esc stops the task (dialogs handle their own Esc).
+  // Esc stops the task. Dialogs and menus handle their own Esc first: Radix closes the layer and
+  // marks the key as handled, and by the time it gets here the dialog may already be gone.
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape' && running && prompt?.kind !== 'approval' && !document.querySelector('[role="dialog"]')) stop()
+      if (e.key !== 'Escape' || e.defaultPrevented) return
+      if (running && prompt?.kind !== 'approval' && !document.querySelector('[role="dialog"], [role="menu"]')) stop()
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)

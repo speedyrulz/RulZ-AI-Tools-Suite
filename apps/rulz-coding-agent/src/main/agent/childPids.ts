@@ -29,7 +29,7 @@ export class ChildPids {
    * are touched, so a PID Windows has since given to another program is left alone.
    */
   async init(file: string, kill: (pid: number) => void = killTreeSync, shells: () => Set<number> = runningShells): Promise<number[]> {
-    const left = await readJson<number[]>(file, [])
+    const left = await readJson<number[]>(file, []).catch((): number[] => [])
     const live = Array.isArray(left) && left.length ? shells() : new Set<number>()
     const killed = (Array.isArray(left) ? left : []).filter((pid) => typeof pid === 'number' && live.has(pid))
     for (const pid of killed) kill(pid)

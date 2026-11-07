@@ -56,8 +56,17 @@ export class SettingsStore {
     this.path = join(dir, 'settings.json')
   }
 
+  /** The file was there but couldn't be read: it is read again before the next save, so that save can't wipe it. */
+  private unread = false
+
   async init(): Promise<void> {
-    this.settings = parseSettings(await readJson(this.path, {}))
+    try {
+      this.settings = parseSettings(await readJson(this.path, {}))
+      this.unread = false
+    } catch {
+      // Start with the defaults rather than not at all.
+      this.unread = true
+    }
   }
 
   get(): AppSettings {
@@ -65,6 +74,7 @@ export class SettingsStore {
   }
 
   async update(patch: Partial<AppSettings>): Promise<AppSettings> {
+    if (this.unread) await this.init()
     this.settings = parseSettings({ ...this.settings, ...patch })
     await writeJsonAtomic(this.path, this.settings)
     return this.settings
