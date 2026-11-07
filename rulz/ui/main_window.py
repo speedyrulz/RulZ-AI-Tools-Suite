@@ -1,6 +1,7 @@
 """Main window: image grid with the global adjustment sliders, plus the per-image editor page."""
 from __future__ import annotations
 
+import math
 import time
 from collections import deque
 from pathlib import Path
@@ -24,11 +25,21 @@ from .workers import ImageItem, SaveAll, ThumbLoad, make_emitter, output_paths
 
 ITEM_ROLE = Qt.UserRole + 1
 CARD_W, CARD_H, PAD = 220, 250, 10
+PIC_W, PIC_H = CARD_W - 10 - 2 * PAD, CARD_H - 10 - 2 * PAD - 44  # a card's picture area (see CardDelegate.paint)
 JPEG_MODE_KEY = "jpeg_mode"
 OPEN_DIR_KEY = "last_open_dir"
 SAVE_DIR_KEY = "last_save_dir"
 FILE_FILTER = "Images (" + " ".join(f"*{e}" for e in sorted(imageio.IMAGE_EXTS)) + ")"
 SHORT = {"color": "Noise", "jpeg": "JPEG", "detail": "Detail"}
+
+
+def _thumb_side() -> int:
+    """Longest side a grid thumbnail needs: a card's picture area in the sharpest screen's pixels. At 100%
+    scaling that's under half of THUMB_MAX_SIDE, so a long list takes about a quarter of the memory."""
+    from PySide6.QtWidgets import QApplication
+
+    dpr = max((s.devicePixelRatio() for s in QApplication.screens()), default=1.0)
+    return max(64, min(config.THUMB_MAX_SIDE, math.ceil(max(PIC_W, PIC_H) * dpr)))
 
 
 def _thumb_key(it: ImageItem, globals_: dict) -> tuple:
@@ -116,6 +127,7 @@ class MainWindow(QMainWindow):
         if self.mode == BEST:
             QThreadPool.globalInstance().start(ai_jpeg.warm_up)
         self._cards: dict[int, QListWidgetItem] = {}  # id(item) -> its grid entry
+        self._known: dict[str, ImageItem] = {}  # resolved, lower-case path -> its picture, to skip repeats
         self._render_queue: deque[ImageItem] = deque()
         self._queued: set[int] = set()  # id()s in _render_queue
         self._render_timer = QTimer(self, interval=0, timeout=self._render_some)
@@ -124,6 +136,7 @@ class MainWindow(QMainWindow):
         self._pool.setMaxThreadCount(max(1, min(4, QThread.idealThreadCount())))
         self._emitter = make_emitter(self)
         self._emitter.done.connect(self._on_thumb)
+        self._thumb_side = _thumb_side()
         self._saver: SaveAll | None = None
 
         self.stack = QStackedWidget()
@@ -250,21 +263,20 @@ class MainWindow(QMainWindow):
             self.add_paths(files)
 
     def add_paths(self, paths):
-        known = {str(it.path.resolve()).lower() for it in self.items}
         added = 0
         for path in self._expand(paths):
-            key = str(path.resolve()).lower()
-            if key in known:
+            key = str(path.resolve()).lower()  # only new paths: resolving is slow on Windows
+            if key in self._known:
                 continue
-            known.add(key)
             it = ImageItem(path)
             self.items.append(it)
+            self._known[key] = it
             li = QListWidgetItem()
             li.setData(ITEM_ROLE, it)
             li.setToolTip(str(path))
             self.grid.addItem(li)
             self._cards[id(it)] = li
-            self._pool.start(ThumbLoad(it, self._emitter))
+            self._pool.start(ThumbLoad(it, self._emitter, self._thumb_side))
             added += 1
         if added:
             self._update_counts()
@@ -438,6 +450,7 @@ class MainWindow(QMainWindow):
             it = self.grid.takeItem(row).data(ITEM_ROLE)
             del self.items[row]  # the grid and self.items keep the same order
             self._cards.pop(id(it), None)
+        self._known = {k: it for k, it in self._known.items() if id(it) in self._cards}
         self._render_queue = deque(it for it in self._render_queue if id(it) in self._cards)
         self._queued = set(map(id, self._render_queue))
         self._update_counts()
@@ -451,6 +464,7 @@ class MainWindow(QMainWindow):
         self.grid.clear()
         self.items.clear()
         self._cards.clear()
+        self._known.clear()
         self._render_queue.clear()
         self._queued.clear()
         self._update_counts()
@@ -472,6 +486,11 @@ class MainWindow(QMainWindow):
             self._open(row)
 
     def _show_library(self):
+        # Opening a picture selects it (the click that opens it, and the arrow keys in the editor). Left that
+        # way, Auto crop would only take that one picture instead of all of them with nothing selected.
+        selected = self.grid.selectedItems()
+        if len(selected) == 1 and selected[0].data(ITEM_ROLE) is self.editor.item:
+            self.grid.clearSelection()
         self.editor.close_image()
         self.stack.setCurrentIndex(0)
         self.grid.setFocus()

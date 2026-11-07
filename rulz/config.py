@@ -9,7 +9,7 @@ from pathlib import Path
 APP_NAME = "RulZ Image Preparer"
 APP_VERSION = "0.4.1"
 
-THUMB_MAX_SIDE = 400
+THUMB_MAX_SIDE = 400  # the most a grid thumbnail is made (the card at 200%+ screen scaling)
 DEFAULT_STRENGTH = 50
 
 

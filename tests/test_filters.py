@@ -4,6 +4,7 @@ import unittest
 import cv2
 import numpy as np
 
+from rulz import filters
 from rulz.filters import BALANCED, process, process_cached, process_crop
 from rulz.shadows import ShadowEdit, Stroke
 
@@ -85,6 +86,34 @@ class ProcessCachedTests(unittest.TestCase):
         self.assertIsNot(stages[2], stages[3])  # shadow areas changed
         self.assertIs(stages[3], stages[4])
         self.assertIsNot(stages[4], stages[5])  # JPEG changed
+
+    def test_brush_strokes_reuse_the_jpeg_clean_up(self):
+        img = _jpeg_picture(200, 260)
+        one = ShadowEdit((Stroke(((0.3, 0.3), (0.6, 0.6)), 0.15),))
+        two = ShadowEdit(one.strokes + (Stroke(((0.2, 0.7),), 0.1),))
+        settings = {"color": 20, "jpeg": 50, "detail": 30}
+        steps = (None, one, two, None, two)  # no painting, a stroke, another, Clear, Undo
+        wanted = [process(img, settings, BALANCED, shadow=sh) for sh in steps]
+        calls = []
+        saved = filters._jpeg_balanced
+        filters._jpeg_balanced = lambda lab, s: (calls.append(s), saved(lab, s))
+        try:
+            cache = None
+            cleaned = []
+            for sh, want in zip(steps, wanted):
+                out, cache = process_cached(img, settings, BALANCED, sh, cache)
+                np.testing.assert_array_equal(out, want)
+                cleaned.append(cache[2])
+        finally:
+            filters._jpeg_balanced = saved
+        # in Lab without shadow areas (at the start and after Clear), and once in BGR for the first stroke;
+        # the second stroke and Undo reuse that
+        self.assertEqual(len(calls), 3)
+        self.assertIsNone(cleaned[0])
+        self.assertIs(cleaned[1], cleaned[2])
+        self.assertIs(cleaned[2], cleaned[4])
+        out, cache = process_cached(img, {**settings, "jpeg": 60}, BALANCED, two, cache)
+        self.assertIsNot(cache[2], cleaned[4])  # JPEG changed: done again
 
     def test_noop(self):
         img = _jpeg_picture(64, 64)

@@ -130,17 +130,47 @@ def _lighting(log_y: np.ndarray) -> np.ndarray:
     return a * log_y + b
 
 
+def _extent(m: np.ndarray) -> tuple[slice, slice] | None:
+    """Rows and columns of the smallest box holding every pixel where m isn't 0, or None when there's none."""
+    x, y, bw, bh = cv2.boundingRect((m > 0).view(np.uint8))
+    return (slice(y, y + bh), slice(x, x + bw)) if bw and bh else None
+
+
+def _grow(box: tuple[slice, slice], by: int, h: int, w: int) -> tuple[slice, slice]:
+    rows, cols = box
+    return slice(max(0, rows.start - by), min(h, rows.stop + by)), slice(max(0, cols.start - by), min(w, cols.stop + by))
+
+
+def _within(inner: tuple[slice, slice], outer: tuple[slice, slice]) -> tuple[slice, slice]:
+    """inner's place in an array cut out at outer."""
+    return tuple(slice(i.start - o.start, i.stop - o.start) for i, o in zip(inner, outer))
+
+
+def _pasted(part: np.ndarray, box: tuple[slice, slice], h: int, w: int) -> np.ndarray:
+    """An h x w picture that is `part` in box and 0 elsewhere."""
+    full = np.zeros((h, w) + part.shape[2:], part.dtype)
+    full[box] = part
+    return full
+
+
 def lift_shadows(bgr: np.ndarray, edit: ShadowEdit) -> np.ndarray:
-    """bgr: float32 HxWx3 in 0..1 (gamma-encoded). Returns the picture with the painted shadows lifted."""
+    """bgr: float32 HxWx3 in 0..1 (gamma-encoded). Returns the picture with the painted shadows lifted.
+
+    The lighting and the light level around the painting are measured on the whole picture, but every
+    full-size step after that is worked out only where it can change something: inside the painted area
+    (where the mask isn't 0), plus a margin where how far the shadow reaches is measured. So the cost
+    follows the size of the painting, and the result is the same as working out the whole picture."""
     if not edit.active:
         return bgr
     h, w = bgr.shape[:2]
     s = edit.strength / 100.0
     m = render_mask(edit, h, w)
-    if not m.any():
+    box = _extent(m)
+    if box is None:
         return bgr
 
-    lin = np.power(np.clip(bgr, 0.0, 1.0), GAMMA)
+    result = np.clip(bgr, 0.0, 1.0).astype(np.float32, copy=False)  # the painted box is replaced at the end
+    lin = cv2.pow(result, GAMMA)
     y = lin @ np.array([0.0722, 0.7152, 0.2126], np.float32)
     log_y = np.log(y + 1e-4)
     light = _lighting(log_y)
@@ -161,8 +191,14 @@ def lift_shadows(bgr: np.ndarray, edit: ShadowEdit) -> np.ndarray:
     # dark tyre isn't pushed up to a bright car's level, and a bright object in the shadow gets the full lift.
     # The depth is the median over painted pixels clearly darker than their surroundings, so lit bits painted
     # over don't water it down. With hardly any of those, there's no shadow to lift.
-    gap = around - light
-    painted_px = m > 0.5
+    # From here on, full-size work is done in the painted area's box (outside it the mask is 0, so nothing
+    # changes there), and in a wider box for the shadow's reach (`part`), which is blurred at the small size:
+    # wide enough for that blur (radius 12 there) and the resizing on either side of it.
+    reach = _grow(box, int(np.ceil(16 * max(w / fs[0], h / fs[1]))) + 2, h, w)
+    inner = _within(box, reach)
+    gap_r = around[reach] - light[reach]
+    gap, mb = gap_r[inner], m[box]
+    painted_px = mb > 0.5
     dark = gap[painted_px & (gap > 0.3)]
     if dark.size < max(16, 0.1 * painted_px.sum()):
         return bgr
@@ -175,13 +211,14 @@ def lift_shadows(bgr: np.ndarray, edit: ShadowEdit) -> np.ndarray:
     band = max(1.0, 0.35 * radius)
     inside = cv2.distanceTransform((m_s > 0.5).astype(np.uint8), cv2.DIST_L2, 3)
     deep = np.clip((inside - band) / band, 0.0, 1.0)
-    deep = cv2.resize(cv2.GaussianBlur(deep, (0, 0), 1.0), (w, h), interpolation=cv2.INTER_LINEAR)
-    part = np.clip(gap / depth, 0.0, 1.0)
-    part_s = cv2.GaussianBlur(cv2.resize(part, fs, interpolation=cv2.INTER_AREA), (0, 0), 3.0)
-    not_lit = cv2.resize(np.clip((part_s - 0.1) / 0.25, 0.0, 1.0), (w, h), interpolation=cv2.INTER_LINEAR)
-    share = np.maximum(part, deep * not_lit)
-    lift = depth * share * (s * m)
-    out = lin * np.exp(lift)[..., None]
+    deep = cv2.resize(cv2.GaussianBlur(deep, (0, 0), 1.0), (w, h), interpolation=cv2.INTER_LINEAR)[box]
+    part_r = np.clip(gap_r / depth, 0.0, 1.0)
+    part_s = cv2.GaussianBlur(cv2.resize(_pasted(part_r, reach, h, w), fs, interpolation=cv2.INTER_AREA),
+                              (0, 0), 3.0)
+    not_lit = cv2.resize(np.clip((part_s - 0.1) / 0.25, 0.0, 1.0), (w, h), interpolation=cv2.INTER_LINEAR)[box]
+    share = np.maximum(part_r[inner], deep * not_lit)
+    lift = depth * share * (s * mb)
+    out = lin[box] * np.exp(lift)[..., None]
 
     # Match the shadow's tint (often blue from the sky) to the surroundings. It's measured in a band on
     # each side of the edge (inside the shadow, and outside the painting), where the surface is usually
@@ -190,7 +227,7 @@ def lift_shadows(bgr: np.ndarray, edit: ShadowEdit) -> np.ndarray:
     lin_s = cv2.resize(lin, fs, interpolation=cv2.INTER_AREA)
     y_s = cv2.resize(y, fs, interpolation=cv2.INTER_AREA)
     tint = np.log(lin_s + 1e-4) - np.log(y_s + 1e-4)[..., None]
-    lift_s = cv2.resize(lift, fs, interpolation=cv2.INTER_AREA)
+    lift_s = cv2.resize(_pasted(lift, box, h, w), fs, interpolation=cv2.INTER_AREA)
     k = np.ones((2 * max(2, round(max(fs) * 0.06)) + 1,) * 2, np.uint8)
     painted = (m_s > 0.02).astype(np.uint8)
     ring = (cv2.dilate(painted, k) > 0) & (outside > 0)
@@ -208,4 +245,5 @@ def lift_shadows(bgr: np.ndarray, edit: ShadowEdit) -> np.ndarray:
     k = np.divide(soft, peak, out=np.ones_like(peak), where=peak > 1e-6)
     k = 1.0 + (k - 1.0) * np.clip(lift / 0.1, 0.0, 1.0)  # only where something was lifted
     out *= k[..., None]
-    return np.power(np.clip(out, 0.0, 1.0), 1.0 / GAMMA).astype(np.float32)
+    result[box] = cv2.pow(np.clip(out, 0.0, 1.0), 1.0 / GAMMA)
+    return result

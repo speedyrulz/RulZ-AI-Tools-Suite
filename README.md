@@ -81,9 +81,11 @@ NVIDIA GPU (about 2 GB of video memory).
 - Thumbnails only show color noise removal and painted shadow areas — JPEG blocks and fine detail are too small to see at
   that size. Open a photo to judge those.
 - **Save all…** writes every image with its own settings to a folder you pick. File names and
-  formats are kept; a file is never written over its own original (`_prepared` is added instead).
+  formats are kept; a file is never written over any picture in the list (`_prepared` is added instead).
+  Pictures with nothing to change are copied as they are, so they lose nothing to re-compression.
 
-Supported: JPG, PNG, WebP, BMP, TIFF (8- and 16-bit, transparency kept for PNG/WebP/TIFF).
+Supported: JPG, PNG, WebP, BMP, TIFF (8- and 16-bit, transparency kept for PNG/WebP/TIFF; a gray TIFF
+with transparency loses it when it's cleaned up).
 
 ## Running
 

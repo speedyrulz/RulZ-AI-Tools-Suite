@@ -2,6 +2,7 @@
 (QT_QPA_PLATFORM=offscreen python -m unittest discover tests). Settings go to a temporary file."""
 import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -93,6 +94,54 @@ class WindowTests(unittest.TestCase):
         self.assertEqual([w.grid.item(r).data(ITEM_ROLE) for r in range(w.grid.count())], w.items)
         w._on_global("color", 0)
 
+    def test_repeats_are_skipped_and_removed_pictures_can_come_back(self):
+        w = self.win
+        self.assertEqual(w.add_paths([str(self.paths[2]), str(self.paths[2].parent)]), 0)
+        w.grid.item(2).setSelected(True)
+        w._remove_selected()
+        self.assertEqual(w.add_paths([str(self.paths[2]), str(self.paths[0])]), 1)
+        self.assertEqual(len(w.items), len(self.paths))
+        self.assertLessEqual(max(w.items[0].thumb.shape[:2]), config.THUMB_MAX_SIDE)
+
+    def test_opening_a_picture_leaves_nothing_selected(self):
+        """The click that opens a picture selects it; left selected, Auto crop would take only that one."""
+        w = self.win
+        w.grid.item(2).setSelected(True)  # what that click does
+        w._open(2)
+        w.editor.navigate.emit(1)  # arrow keys move the selection along
+        w._show_library()
+        self.assertEqual(w.grid.selectedItems(), [])
+        for r in (1, 3):  # a selection made on purpose stays
+            w.grid.item(r).setSelected(True)
+        w._show_library()
+        self.assertEqual(len(w.grid.selectedItems()), 2)
+
+    def test_next_picture_loads_while_the_last_one_is_still_processing(self):
+        from rulz.ui import workers
+
+        saved = workers.process_cached
+        gate = threading.Event()
+
+        def slow(*args, **kw):
+            gate.wait(20)
+            return saved(*args, **kw)
+
+        workers.process_cached = slow
+        try:
+            w = self.win
+            ed = w.editor
+            w._open(0)
+            _wait(lambda: ed._full is not None and ed._running)  # picture 0's processing is now held up
+            w._open(1)
+            _wait(lambda: ed._full is not None, timeout=5)  # yet picture 1 is loaded
+            self.assertFalse(gate.is_set())
+            gate.set()
+            _wait(lambda: not ed._running and ed._shown_key == ed._wanted())
+            self.assertIs(ed.item, w.items[1])
+        finally:
+            gate.set()
+            workers.process_cached = saved
+
     def test_editor_reuses_the_slow_stage(self):
         w = self.win
         w._open(0)
@@ -159,6 +208,16 @@ class AutoCropTests(unittest.TestCase):
         self.assertEqual(self.calls["release"], 1)
         self.assertEqual(len(dlg._pix), 0)
 
+    def test_starting_note_shows_until_the_first_result(self):
+        dlg = AutoCropDialog(self.items[:2], {"color": 0, "jpeg": 0, "detail": 0}, "balanced")
+        dlg.show()
+        dlg.prompt.setText("thing")
+        dlg._preview()
+        self.assertIn("Starting SAM", dlg.info.text())  # SAM isn't loaded in these tests
+        _wait(lambda: dlg._finder is None)
+        self.assertTrue(dlg.info.text().startswith("Checked 2 of 2"), dlg.info.text())
+        dlg.reject()
+
     def test_crop_all_writes_crops(self):
         out = Path(self.dir.name) / "out"
         out.mkdir()
@@ -175,6 +234,81 @@ class AutoCropTests(unittest.TestCase):
         self.assertEqual(done, {"saved": 2, "empty": [], "errors": []})
         img = cv2.imread(str(out / self.items[0].path.name))
         self.assertEqual(img.shape[:2], (200, 200))  # the mask's box, scaled from 400 x 300 to 800 x 600
+
+
+class SaveTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.tmp = Path(self.dir.name)
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_output_never_lands_on_any_source(self):
+        from rulz.ui.workers import ImageItem, output_paths
+
+        x, y = self.tmp / "X", self.tmp / "Y"
+        x.mkdir()
+        y.mkdir()
+        srcs = [x / "a.jpg", x / "b.jpg", y / "a.jpg", y / "A_prepared.jpg"]
+        for p in srcs:
+            p.write_bytes(b"")
+        dests = output_paths([ImageItem(p) for p in srcs], x)
+        self.assertFalse({d.resolve() for d in dests} & {p.resolve() for p in srcs})
+        self.assertEqual(len({d.name.lower() for d in dests}), len(dests))
+        self.assertEqual([d.name for d in dests], ["a_prepared.jpg", "b_prepared.jpg", "a_prepared_2.jpg",
+                                                   "A_prepared_prepared.jpg"])
+
+    def test_unchanged_pictures_are_copied_not_re_encoded(self):
+        from rulz.ui.workers import SaveAll
+
+        src = _pictures(self.tmp, 1)[0]
+        empty = self.tmp / "empty.jpg"
+        empty.write_bytes(b"")
+        out = self.tmp / "out"
+        out.mkdir()
+        zero = {"color": 0, "jpeg": 0, "detail": 0}
+        empty2 = self.tmp / "empty2.jpg"
+        empty2.write_bytes(b"")
+        jobs = [(empty2, out / "empty2.jpg", zero, None), (src, out / "same.jpg", zero, None),
+                (src, out / "cleaned.jpg", {**zero, "color": 40}, None), (empty, out / "empty.jpg", zero, None)]
+        done = {}
+        saver = SaveAll(jobs, "balanced")
+        saver.finished_all.connect(lambda s, err: done.update(saved=s, errors=err))
+        saver.run()  # on this thread
+        self.assertEqual(done["saved"], 2)
+        # reported, not copied, in list order although two pictures are saved at a time
+        self.assertEqual([n for n, _ in done["errors"]], ["empty2.jpg", "empty.jpg"])
+        self.assertEqual(SaveAll(jobs, "best").workers(), 1)
+        self.assertFalse((out / "empty.jpg").exists())
+        self.assertEqual((out / "same.jpg").read_bytes(), src.read_bytes())
+        self.assertNotEqual((out / "cleaned.jpg").read_bytes(), src.read_bytes())
+
+
+class SetupDialogTests(unittest.TestCase):
+    def test_esc_and_close_button_stop_the_download(self):
+        from rulz.ui.ai_setup import AISetupDialog
+
+        class Download:
+            cancelled = False
+
+            def isRunning(self):
+                return True
+
+            def cancel(self):
+                self.cancelled = True
+
+            def wait(self):
+                pass
+
+        dlg = AISetupDialog()
+        dlg._dl = dl = Download()
+        dlg.show()
+        dlg.reject()  # Esc and the window's close button land here, like Cancel
+        self.assertTrue(dl.cancelled)
+        dlg._next()  # a step finishing just then starts nothing
+        self.assertIs(dlg._dl, dl)
+        self.assertIsNone(dlg._proc)
 
 
 if __name__ == "__main__":
