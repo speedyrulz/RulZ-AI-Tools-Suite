@@ -135,11 +135,13 @@ def prune_weight(w, projection: torch.Tensor, work=None) -> torch.Tensor:
 
 def build_transformer(reader, device, quant: str = "auto", dtype=torch.bfloat16, quant_devices=None, source: str = "",
                       quantized: bool = False, source_bytes: int = 0,
-                      config_overrides: dict | None = None) -> MiniMaxH3Transformer:
+                      config_overrides: dict | None = None, prune_rank: int | None = None) -> MiniMaxH3Transformer:
     """The port from a reader of port-named (key, value) pairs (reader(want) yields the keys `want` accepts, by the
     source's own key names): read once for the time embedder when a full-AdaLN source is pruned on load, then once
     more for everything, each block Linear quantized as it arrives when the target is a quant format (the bf16 model
-    never sits in RAM whole). quant "auto": loading.resolve_quant."""
+    never sits in RAM whole). quant "auto": loading.resolve_quant. prune_rank: the basis a full-AdaLN source is pruned
+    to (default PRUNE_RANK, 8, musubi-tuner's; P-H3-Image's own pruned file is 16 wide)."""
+    prune_rank = PRUNE_RANK if prune_rank is None else prune_rank
     target = sf.quant_target(device, quant_devices)
     work = target.get("work_device")
     quant = resolve_quant(quant, quant_devices or device, source_bytes / 2**30, quantized)
@@ -150,7 +152,7 @@ def build_transformer(reader, device, quant: str = "auto", dtype=torch.bfloat16,
     projection = basis = mean = None
     if prune:
         freq_dim = time_state["time_embedder.proj_in.weight"].shape[1]
-        basis, mean = adaln_basis(time_state, freq_dim, PRUNE_RANK, PRUNE_GRID)
+        basis, mean = adaln_basis(time_state, freq_dim, prune_rank, PRUNE_GRID)
         projection = torch.cat([basis, mean[:, None]], dim=1)
 
     state = {}
@@ -170,13 +172,13 @@ def build_transformer(reader, device, quant: str = "auto", dtype=torch.bfloat16,
     config = {**C.config_from_state(state), **(config_overrides or {})}
     state.pop("rope.inv_freq", None)  # recomputed from rope_inv_freq_len / rope_theta
     if prune:
-        config["adaln_rank"] = PRUNE_RANK
+        config["adaln_rank"] = prune_rank
     with torch.device("meta"):
         model = MiniMaxH3Transformer.from_config(config)
     install(model, state, quant, dtype, **target)
     model = model.to(device).eval().requires_grad_(False)
     adaln = ("pruned file (curve table)" if model.pruned else
-             f"AdaLN pruned on load (rank {PRUNE_RANK})" if prune else "full AdaLN")
+             f"AdaLN pruned on load (rank {prune_rank})" if prune else "full AdaLN")
     log.info("Loaded MiniMax H3 transformer from %s: %d blocks, dim %d, %s, quant=%s", source, config["num_layers"],
              config["hidden_size"], adaln, quant)
     return model
@@ -231,7 +233,7 @@ def _shard_reader(tdir: Path, stem: str, dtype, rename):
 
 
 def load_transformer(model_dir: Path, device, quant: str = "auto", dtype=torch.bfloat16, quant_devices=None,
-                     ref: bool = False) -> MiniMaxH3Transformer:
+                     ref: bool = False, prune_rank: int | None = None) -> MiniMaxH3Transformer:
     """The FL2VA (or Ref2VA) transformer of a downloaded MiniMaxAI/MiniMax-H3 (transformer/ or transformer_ref/), or
     of a folder in MiniMaxAI's original layout (FL2VA/transformer, per-head interleaved qkv)."""
     sub = "transformer_ref" if ref and (Path(model_dir) / "transformer_ref").is_dir() else "transformer"
@@ -250,7 +252,7 @@ def load_transformer(model_dir: Path, device, quant: str = "auto", dtype=torch.b
         raise ValueError(f"Not a MiniMax H3 transformer: {cls!r}")
     overrides.pop("adaln_curve_grid", None)
     return build_transformer(reader, device, quant, dtype, quant_devices, source=f"{Path(model_dir).name}/{sub}",
-                             quantized=False, source_bytes=size, config_overrides=overrides)
+                             quantized=False, source_bytes=size, config_overrides=overrides, prune_rank=prune_rank)
 
 
 # ---------------------------------------------------------------- the silence placeholder

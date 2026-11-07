@@ -34,15 +34,17 @@ def uses_distilled_schedule(model) -> bool:
 
 @torch.no_grad()
 def sample(model, pos_embeds, pos_mask, neg_embeds, neg_mask, *, width, height, steps=30, cfg=1.0, shift=None,
-           seed=0, skip_layer=-1, device="cuda", progress=None) -> torch.Tensor:
+           seed=0, skip_layer=-1, device="cuda", progress=None, sigmas=None) -> torch.Tensor:
     """Returns normalized latents [1, 24, H/16, W/16] (fp32), the trainer's layout. `shift` (the trainer's sample_shift)
     and `skip_layer` are accepted for the shared signature and ignored: H3's shifts are its own (12 video, 3 audio).
-    Width and height are rounded down to whole 32 px (each token covers 2 x 2 latent cells)."""
+    Width and height are rounded down to whole 32 px (each token covers 2 x 2 latent cells). sigmas: the video schedule
+    (ending in 0) instead of h3_sigmas(steps) (P-H3-Image's own 8-step grid)."""
     gen = torch.Generator("cpu").manual_seed(seed)
     h, w = max(2, height // 32 * 2), max(2, width // 32 * 2)
     latents = torch.randn((1, model.latent_channels, h, w), generator=gen).to(device)
     audio = torch.randn((1, model.audio_frames * AUDIO_CHANNELS, model.audio_channels), generator=gen).to(device)
-    sigmas = h3_sigmas(steps, model.shift_video).to(device)
+    sigmas = (h3_sigmas(steps, model.shift_video) if sigmas is None else torch.as_tensor(sigmas, dtype=torch.float32))
+    sigmas = sigmas.to(device)
     pos_embeds, pos_mask = pos_embeds.to(device), pos_mask.to(device)
     if neg_embeds is not None:
         neg_embeds, neg_mask = neg_embeds.to(device), neg_mask.to(device)

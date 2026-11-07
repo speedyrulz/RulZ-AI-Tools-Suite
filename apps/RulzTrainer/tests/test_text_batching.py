@@ -57,6 +57,7 @@ def _families():
     from rulztrainer.ideogram4 import loading as ideogram4
     from rulztrainer.krea2 import loading as krea2
     from rulztrainer.moss import loading as moss
+    from rulztrainer.ph3 import loading as ph3
     from rulztrainer.qwen21 import loading as qwen21
 
     return [
@@ -67,7 +68,20 @@ def _families():
         ("ideogram4", ideogram4, lambda: _qwen3vl(36), 1024),
         ("flux3", flux3, lambda: _qwen3vl(33), 1024),
         ("fibo", fibo, lambda: _qwen3vl(36), 4096),
+        ("ph3", ph3, _ph3, 1024),
     ]
+
+
+def _ph3():
+    """P-H3-Image's encoder: Qwen3-VL (36 layers) with a random text connector over its 5 hidden states."""
+    from rulztrainer.ph3 import loading as ph3
+
+    model = _qwen3vl(36)
+    g = torch.Generator().manual_seed(0)
+    conn = {"input_mean": torch.randn(80, generator=g), "input_std": torch.rand(80, generator=g) + 0.5,
+            "proj.weight": torch.randn(24, 80, generator=g) * 0.1, "output_mean": torch.randn(24, generator=g),
+            "output_std": torch.rand(24, generator=g) + 0.5, "sink_embedding": torch.randn(24, generator=g)}
+    return ph3.attach_connector(model, ph3.build_connector(conn))
 
 
 @pytest.mark.parametrize("name", [f[0] for f in _families()])

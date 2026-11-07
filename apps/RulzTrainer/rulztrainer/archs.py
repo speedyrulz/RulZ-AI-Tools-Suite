@@ -31,6 +31,7 @@ ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21", "flux3_klein")
 ARCH_NAMES += ("flux2_klein",)
 ARCH_NAMES += ("ideogram4",)
 ARCH_NAMES += ("minimax_h3",)
+ARCH_NAMES += ("p_h3_image",)
 
 
 def _match_suffix(name: str, suffixes: Iterable[str]) -> bool:
@@ -1126,6 +1127,39 @@ class MiniMaxH3Arch(Arch):
 
 
 _ARCHS["minimax_h3"] = MiniMaxH3Arch
+
+
+class PH3ImageArch(MiniMaxH3Arch):
+    """P-H3-Image (PrunaAI): MiniMax H3 fine-tuned into an 8-step, guidance-free text-to-image model (rulztrainer.ph3).
+    H3's transformer, LoRA names and one-frame layout; its own Qwen3-VL-4B text encoder + connector, single-frame VAE
+    decoder and 8-sigma grid. Its latents are cached apart from H3's (the VAE file is its own)."""
+    name = "p_h3_image"
+    label = "P-H3-Image"
+    modelspec = "p-h3-image"
+    default_targets = ARCH_DEFAULT_TARGETS["p_h3_image"]
+    default_sample_steps, default_sample_cfg = ARCH_FULL_SAMPLE["p_h3_image"]
+    latent_tag = "_ph3vae"
+
+    def __init__(self):
+        from .ph3 import loading
+
+        self._loading = loading
+
+    def sample(self, model, pos_e, pos_m, neg_e, neg_m, **kw):
+        from .ph3.sampler import sample
+
+        return sample(model, pos_e, pos_m, neg_e, neg_m, **kw)
+
+    def sample_sigmas(self, model, steps, height, width, shift):
+        from .ph3.sampler import ph3_sigmas
+
+        return ph3_sigmas(steps)
+
+    def distilled_sample_model(self, path: str) -> bool:
+        return True  # the released model is the 8-step distilled one: no turbo LoRA on top
+
+
+_ARCHS["p_h3_image"] = PH3ImageArch
 _cache: dict[str, Arch] = {}
 
 
@@ -1173,11 +1207,29 @@ def arch_from_transformer_file(path: str) -> str | None:
             elif "embed_image_indicator.weight" in names and "llm_cond_proj.weight" in names:
                 found = "ideogram4"
             elif "video_patch_proj.weight" in names and "audio_patch_proj.weight" in names:
-                found = "minimax_h3"
+                found = "p_h3_image" if _is_ph3_dit(p) else "minimax_h3"
         except Exception:  # noqa: BLE001
             found = None
         _FILE_ARCH_CACHE[key] = found
     return _FILE_ARCH_CACHE[key]
+
+
+PH3_ADALN_TABLE = (4097, 16)  # P-H3-Image's pruned AdaLN curve table (Comfy-Org's H3 files: [1025, 8])
+
+
+def _is_ph3_dit(path: Path) -> bool:
+    """An H3-layout diffusion model that is P-H3-Image's: named so, or with its [4097, 16] AdaLN table."""
+    from safetensors import safe_open
+
+    from .config import family_named_in
+
+    if family_named_in(path.name) == "p_h3_image":
+        return True
+    with safe_open(str(path), "pt") as f:
+        for k in f.keys():
+            if k.split("diffusion_model.", 1)[-1] == "adaln_t_table":
+                return tuple(f.get_slice(k).get_shape()) == PH3_ADALN_TABLE
+    return False
 
 
 def guess_arch_name(cfg: TrainConfig) -> str:
@@ -1210,6 +1262,11 @@ def detect_arch(cfg: TrainConfig, model_dir: Path | None) -> Arch:
                  "Flux3Transformer2DModel": "flux3_klein", "Flux2Transformer2DModel": "flux2_klein",
                  "Ideogram4Transformer2DModel": "ideogram4",
                  "MiniMaxH3Transformer3DModel": "minimax_h3", "MiniMaxH3DiTModel": "minimax_h3"}.get(cls)
+        if found == "minimax_h3":
+            from .ph3.loading import is_ph3_dir
+
+            if is_ph3_dir(Path(model_dir)):
+                found = "p_h3_image"  # the same transformer class: the pipeline index tells them apart
         if found and found != guessed:
             if cfg.model_arch not in ("", "auto"):
                 raise ValueError(f"model_arch is {cfg.model_arch!r} but {model_dir} holds a {found} transformer")
