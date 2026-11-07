@@ -204,12 +204,12 @@ jobs:
           Copy-Item dist/*.zip ../../out/
 
       # ---------- .NET Framework apps (portable zip with one .exe) ----------
-      # Image Tournament builds with the csc.exe in Windows (and runs its tests); Image Grid needs the newer Roslyn
-      # compiler from Visual Studio, which the runner has.
+      # Image Tournament builds with the csc.exe in Windows; Image Grid needs the newer Roslyn compiler from Visual
+      # Studio, which the runner has. Both run their tests first (-Test); a failure stops the release.
       - if: env.KIND == 'dotnet'
         working-directory: ${{ env.DIR }}
         run: |
-          if ($env:APP -eq 'image-tournament') { ./build.ps1 -Test } else { ./build.ps1 }
+          ./build.ps1 -Test
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $stage = "../../stage/$env:NAME"
           New-Item -ItemType Directory -Force $stage, ../../out | Out-Null

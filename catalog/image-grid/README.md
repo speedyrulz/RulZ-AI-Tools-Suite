@@ -10,10 +10,11 @@ Install it from the RulZ AI Tools Suite launcher, or download `RulZ-Image-Grid-v
 
 ## Features
 
-- **Add images**: click *Add Images…* (Ctrl+O), or drag files/folders onto the window. Dropping onto the grid inserts them at that spot.
+- **Add images**: click *Add Images…* (Ctrl+O), or drag files/folders onto the window. A folder's images are added in name order (img2 before img10). Dropping onto the grid inserts them at the slot marked in red. Big batches load several images at once, with progress in the status bar.
 - **Rearrange**: drag a tile to a new slot. Right-click a tile to remove it or show it in Explorer; Delete removes the selected tile. *Sort A–Z* sorts by file name (img2 comes before img10).
+- **Zoom**: Ctrl+mouse wheel, the zoom slider, *Fit* or *100%*. Tiles shown bigger than their small preview load a sharper copy in the background, so 100% shows the real detail.
 - **File names**: shown under each image without the extension. Turn them off with *Show file name under each image*.
-- **Row/column labels**: type them in the side panel (one per line), or double-click a header on the grid. Each set can be turned off.
+- **Row/column labels**: type them in the side panel (one per line), or double-click a header on the grid. Each set can be turned off. Labels you leave empty take no space in the saved image; the faint *Column 1* / *Row 1* placeholders only show in the editor.
 - **Layout**: columns, padding, text sizes, background (white/gray/black/transparent), text color, and whether smaller images are enlarged to fill their tile.
 - **Dark or light look**: black and red (the default) or white and red, matching the other RulZ apps. You choose on first launch; switch any time with the *Light mode* checkbox at the right end of the toolbar. The choice is saved in `%APPDATA%\RulZ Image Grid\settings.ini`.
 - **Export** (Ctrl+E): set a scale from 1–200% of full resolution and see the exact output size in pixels before saving. Save as PNG or JPG (with a quality setting). There's a live preview.
@@ -26,7 +27,7 @@ Sizes (padding, text) are in output pixels at 100%, so what you see on screen is
 .\build.ps1
 ```
 
-Needs Visual Studio 2022 or Build Tools for Visual Studio (for the Roslyn `csc.exe` compiler). No NuGet packages or .NET SDK needed. The .exe lands in `bin\`.
+Needs Visual Studio 2022 or Build Tools for Visual Studio (for the Roslyn `csc.exe` compiler). No NuGet packages or .NET SDK needed. The .exe lands in `bin\`. `.\build.ps1 -Test` also builds and runs the tests in `tests\` first (export layout, saving, loading, previews and background threads); the release workflow does this.
 
 ## Source
 
@@ -40,6 +41,7 @@ Needs Visual Studio 2022 or Build Tools for Visual Studio (for the Roslyn `csc.e
 | `src/Theme.xaml` | Control styles (buttons, inputs, sliders, scroll bars, menus) for both looks |
 | `src/ChooseLook.cs` | First-run "Choose your look" dialog |
 | `src/Ui.cs` | Small UI helpers (number box, input dialog, section headings) |
+| `tests/ImageGridTests.cs` | Tests run by `build.ps1 -Test` |
 
 `build.ps1` embeds the logos, icon and `Theme.xaml` in the .exe, so it runs as a single file.
 

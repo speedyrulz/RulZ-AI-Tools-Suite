@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -28,10 +29,15 @@ namespace RulZImageGrid
         readonly FrameworkElement qualityRow;
         readonly Image previewImg;
         readonly Button saveBtn, cancelBtn;
+        readonly Panel presets;
         readonly DispatcherTimer previewTimer;
         double percent = 100;
-        int previewToken;
         bool busy, syncing;
+
+        // The preview only changes when its drawing scale (or, for a transparent background, the format) changes.
+        string previewKey;               // what the preview shows, or is being rendered to show
+        bool previewPending;
+        CancellationTokenSource previewCancel;
 
         public string SavedPath { get; private set; }
         public string SavedSize { get; private set; }
@@ -95,7 +101,7 @@ namespace RulZImageGrid
             opts.Children.Add(Ui.Row("Scale (% of original)", new Border()));
             opts.Children.Add(scaleRow);
 
-            var presets = new WrapPanel { Margin = new Thickness(0, 8, 0, 0) };
+            presets = new WrapPanel { Margin = new Thickness(0, 8, 0, 0) };
             foreach (var p in new[] { 100, 75, 50, 25, 10 })
             {
                 var b = Ui.Button(p + "%", (s, e) => SetPercent(p, false));
@@ -195,6 +201,9 @@ namespace RulZImageGrid
             FormatChanged();
             UpdateResolution();
             Loaded += (s, e) => RenderPreview();
+            // Closing mid-save would leave the save running with nowhere to report back to.
+            Closing += (s, e) => { if (busy) e.Cancel = true; };
+            Closed += (s, e) => { previewTimer.Stop(); previewCancel?.Cancel(); };
         }
 
         bool IsJpg => jpgRadio.IsChecked == true;
@@ -238,7 +247,8 @@ namespace RulZImageGrid
             int w = OutW, h = OutH;
             double mp = (double)w * h / 1e6;
             resText.Text = $"{w:N0} × {h:N0} px";
-            detailText.Text = $"{mp:0.0} megapixels · about {(double)w * h * 4 / 1048576:N0} MB in memory while saving";
+            // Drawing needs the finished image plus a full-size working copy: measured at about twice the image.
+            detailText.Text = $"{mp:0.0} megapixels · about {(double)w * h * 8 / 1048576:N0} MB in memory while saving";
 
             var warnings = new List<string>();
             bool blocked = false;
@@ -262,26 +272,46 @@ namespace RulZImageGrid
             saveBtn.IsEnabled = !blocked && !busy;
         }
 
+        double PreviewScale => Math.Min(Scale, Math.Min(900 / layout.Width, 700 / layout.Height));
+
+        string PreviewNoteText() => PreviewScale < Scale
+            ? $"Preview (reduced to fit — the saved file will be {OutW:N0} × {OutH:N0} px)"
+            : "Preview (actual size)";
+
         async void RenderPreview()
         {
             if (!IsLoaded) return;
-            double fit = Math.Min(900 / layout.Width, 700 / layout.Height);
-            double pscale = Math.Min(Scale, fit);
-            int token = ++previewToken;
-            bool jpg = IsJpg;
+            double pscale = PreviewScale;
+            bool opaque = IsJpg && S.Transparent; // JPG only changes the picture when the background is transparent
+            string key = pscale.ToString("R", CultureInfo.InvariantCulture) + (opaque ? "|opaque" : "");
+            if (key == previewKey)
+            {
+                // Same picture as the one shown (e.g. any scale above the fit size): just refresh the size note.
+                if (!previewPending) previewNote.Text = PreviewNoteText();
+                return;
+            }
+
+            previewKey = key;
+            previewCancel?.Cancel();
+            var cts = previewCancel = new CancellationTokenSource();
+            previewPending = true;
             previewNote.Text = "Rendering preview…";
             try
             {
-                var bmp = await Renderer.RunSta(() => Renderer.Render(S, items, pscale, jpg, null));
-                if (token != previewToken) return;
+                var bmp = await Renderer.RunSta(() =>
+                    Renderer.Render(S, items, pscale, opaque, null, useThumbs: true, cancel: cts.Token));
+                if (cts != previewCancel) return; // a newer preview has started
+                previewPending = false;
                 previewImg.Source = bmp;
-                previewNote.Text = pscale < Scale
-                    ? $"Preview (reduced to fit — the saved file will be {OutW:N0} × {OutH:N0} px)"
-                    : "Preview (actual size)";
+                previewNote.Text = PreviewNoteText();
             }
+            catch (OperationCanceledException) { }
             catch (Exception ex)
             {
-                if (token == previewToken) previewNote.Text = "Preview failed: " + ex.Message;
+                if (cts != previewCancel) return;
+                previewPending = false;
+                previewKey = null; // try again on the next change
+                previewNote.Text = "Preview failed: " + ex.Message;
             }
         }
 
@@ -302,6 +332,7 @@ namespace RulZImageGrid
 
             string path = dlg.FileName;
             double scale = Scale;
+            string size = $"{OutW:N0} × {OutH:N0}";
             int quality = (int)qualitySlider.Value;
             bool keepAlpha = S.Transparent && !jpg;
             SetBusy(true);
@@ -315,7 +346,8 @@ namespace RulZImageGrid
                     return true;
                 });
                 SavedPath = path;
-                SavedSize = $"{OutW:N0} × {OutH:N0}";
+                SavedSize = size;
+                busy = false; // let the window close
                 DialogResult = true;
             }
             catch (Exception ex)
@@ -337,6 +369,7 @@ namespace RulZImageGrid
             Cursor = on ? System.Windows.Input.Cursors.Wait : null;
             cancelBtn.IsEnabled = !on;
             scaleSlider.IsEnabled = scaleBox.IsEnabled = pngRadio.IsEnabled = jpgRadio.IsEnabled = !on;
+            presets.IsEnabled = qualitySlider.IsEnabled = !on;
             UpdateResolution();
         }
     }
