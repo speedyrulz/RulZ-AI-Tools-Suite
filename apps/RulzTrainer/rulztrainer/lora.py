@@ -853,19 +853,44 @@ def lora_pairs(injected: dict[str, LoRALinear]) -> list[tuple[torch.Tensor, torc
     return [(m.lora_down.weight, m.lora_up.weight) for m in injected.values() if m.kind == "lora"]
 
 
-def lora_param_groups(injected: dict[str, LoRALinear], lr: float, plus_ratio: float = 0.0) -> list[dict]:
+OFT_LR_REFERENCE_BLOCK = 32  # oft_scaled_lr keeps this block size's lr (the default oft_block_size)
+
+
+def oft_lr_scale(block: int) -> float:
+    """oft_scaled_lr's lr factor for an OFT layer with blocks of `block` channels: sqrt(31 / (block - 1)), 1 at 32.
+
+    Q = blocks - blocks^T, so an Adam-type step moves each of a block's b - 1 off-diagonal pairs by about 2 x lr and
+    each output channel's rotation by about 2 x lr x sqrt(b - 1) (Muon's step grows the same way): at one lr a block
+    of 64 moves about twice as far as a block of 16. Scaled OFT (OneTrainer #1315) divides Q by 2 x sqrt(b - 1) for
+    that; under Adam an lr factor is the same thing, and the saved oft_blocks stay what ComfyUI reads."""
+    return math.sqrt((OFT_LR_REFERENCE_BLOCK - 1) / max(int(block) - 1, 1))
+
+
+def lora_param_groups(injected: dict[str, LoRALinear], lr: float, plus_ratio: float = 0.0,
+                      oft_scaled: bool = False) -> list[dict]:
     """Optimizer param groups. With LoRA+ (ratio > 1) the LoRA up matrices get lr x ratio in their own group; LoKr,
-    OFT and DoRA's magnitudes stay at lr (LoRA+ is a LoRA result)."""
+    OFT and DoRA's magnitudes stay at lr (LoRA+ is a LoRA result). With oft_scaled, OFT's rotation blocks go in one
+    group per block size at lr x oft_lr_scale(block) (named oft_b<size>; the biggest group first)."""
     downs = [m.lora_down.weight for m in injected.values() if m.kind == "lora"]
     ups = [m.lora_up.weight for m in injected.values() if m.kind == "lora"]
-    lokr = [p for m in injected.values() for part, p in m.adapter_params().items()
-            if part not in ("lora_down", "lora_up")]
+    lokr, oft = [], {}
+    for m in injected.values():
+        for part, p in m.adapter_params().items():
+            if part in ("lora_down", "lora_up"):
+                continue
+            if oft_scaled and part == "oft_blocks":
+                oft.setdefault(int(p.shape[-1]), []).append(p)
+            else:
+                lokr.append(p)
+    scaled = [{"params": ps, "lr": lr * oft_lr_scale(b), "name": f"oft_b{b}"}
+              for b, ps in sorted(oft.items(), key=lambda kv: (-sum(p.numel() for p in kv[1]), kv[0]))]
     if plus_ratio and plus_ratio > 1.0 and ups:
         groups = [{"params": downs, "lr": lr, "name": "lora_down"}, {"params": ups, "lr": lr * plus_ratio, "name": "lora_up"}]
         if lokr:
             groups.append({"params": lokr, "lr": lr, "name": "lora"})
-        return groups
-    return [{"params": downs + ups + lokr, "lr": lr, "name": "lora"}]
+        return groups + scaled
+    base = downs + ups + lokr
+    return ([{"params": base, "lr": lr, "name": "lora"}] if base or not scaled else []) + scaled
 
 
 def lora_param_groups_by(injected: dict[str, LoRALinear], lr: float, group_of) -> list[dict]:

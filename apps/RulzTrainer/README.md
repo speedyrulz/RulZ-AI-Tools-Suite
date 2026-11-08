@@ -41,7 +41,12 @@ index URL as the first argument, e.g. `install.bat https://download.pytorch.org/
 Then double-click `run_webui.bat` to start the UI and open it in your browser (optional first argument: port).
 
 **Linux:** `./install.sh` does the same (`venv/`, cu128 PyTorch wheels by default, pass another index URL as the
-first argument, or `system` to keep an already installed torch), then `./run_webui.sh [port] [host]`. On a headless
+first argument, or `system` to keep an already installed torch), then `./run_webui.sh [port] [host]`.
+
+**Old NVIDIA drivers.** A CUDA build of PyTorch newer than the driver supports installs without error and then sees
+no GPU. Without an index URL, both installers read the CUDA version the driver supports from `nvidia-smi`
+(`scripts/torch_index.py`) and install the newest of cu130, cu128 and cu126 it runs, never newer than their default,
+with a warning to update the driver (after OneTrainer). On a headless
 box (no display) the WebUI has no native Browse dialogs: type paths, or upload datasets on the Dataset tab.
 Cloud GPUs: see [Running on vast.ai](#running-on-vastai).
 
@@ -51,12 +56,16 @@ Cloud GPUs: see [Running on vast.ai](#running-on-vastai).
 pip install -r requirements.txt
 ```
 
-Requires a CUDA build of PyTorch 2.9+, diffusers 0.38+ and transformers 5.3+ (Qwen3.5 support).
+Requires a CUDA build of PyTorch 2.9+, diffusers 0.41+ and transformers 5.3+ (Qwen3.5 support).
 
 **No telemetry.** Importing RulzTrainer sets `ORT_DISABLE_TELEMETRY=1` and `HF_HUB_DISABLE_TELEMETRY=1` before
 anything loads onnxruntime or Hugging Face's libraries, so the WebUI and every job it starts inherit them, and it
 calls onnxruntime's own switch on Windows where InsightFace loads. onnxruntime's Linux builds from 1.29 otherwise
 report a device ID and machine details to Microsoft (found by Fizgig). A value you set yourself wins.
+
+**Downloads.** Hugging Face's hf_xet raises its parallel connections up to 64 while a model file downloads, which
+saturates a home connection; RulzTrainer sets `HF_XET_FIXED_DOWNLOAD_CONCURRENCY=8` (found by OneTrainer), which
+still fills a fast link. Set the variable yourself for another number.
 
 ## Run the WebUI
 
@@ -273,7 +282,7 @@ python scripts/vast/rulz_remote.py wait test1               # blocks until the r
 | `wait NAME` | Blocks until the run ends (or `--step N`), riding out dropped connections. Exit status 0 finished, 1 failed, 2 `--timeout`, 3 unreachable |
 | `stop`, `stop --kill`, `queue` | The WebUI's Stop and Kill; the queue, with `queue pause`, `resume` and `remove ID` |
 | `sync` | Copies this checkout's code to the instance, to test a change before a release. It refuses while a job runs; `--restart-webui` restarts the WebUI on the new code. It only adds and overwrites |
-| `push PATH FOLDER`, `ssh -- COMMAND` | Copies files up (a dataset into `datasets`); runs anything in the install folder |
+| `push PATH FOLDER`, `ssh -- COMMAND` | Copies files up (a dataset into `datasets`); runs anything in the install folder. A pushed folder's hidden files and folders stay here, its `.rulz_cache` of latents and text features among them (it can be gigabytes, and the instance encodes its own); `--with-cache` sends them too |
 
 Reading changes nothing on the instance. A run started this way goes through the WebUI's queue, so it shows on the
 Monitor like one you queued yourself and waits its turn behind a running job, and Stop on the page stops it. The tool
@@ -292,6 +301,8 @@ and `RULZ_VAST_HOME` set the defaults. In Git Bash, set `MSYS_NO_PATHCONV=1` or 
   encoder waiting on kernel launches most of the time. Each caption is padded on the right and cut back to its own
   length, which gives it the same features as encoding it alone (the text encoders are causal), for every model.
   A batch that runs out of GPU memory is split in half and retried.
+- **Hidden files and folders** in a dataset never train: a name starting with "." (a NAS's `.thumbnails` or
+  `.@__thumb`, macOS's `._` copies, a tool's cache), like `.rulz_cache` and `excluded_by_look` (after OneTrainer).
 - **Transparent pictures** (cut-out PNGs) are laid on white wherever a picture is read: training, face and body
   scoring, region maps, Isolation's side-by-side pictures, the copy check and thumbnails (after Fizgig 9.0.3). A
   plain conversion to RGB kept whatever colour the transparent pixels store, often black, so the LoRA learned a
@@ -890,6 +901,18 @@ trains every picture model's LoRA presets on these settings since 6 Nov 2026.
   as with AdamW, and a full fine-tune can use it too (untested there; Fizgig keeps Adafactor for fine-tunes).
 - **Resume.** The state is one `momentum_buffer` per weight, as in `torch.optim.Muon`; a state of another optimizer is
   refused with a message.
+- **Embedders and the final layer.** Muon's authors, Moonshot and OneTrainer keep the layers outside the blocks
+  (image / timestep embedders, the timestep modulation, the text projection, the final layer) on AdamW. RulzTrainer
+  only trains them when `lora_targets` names `embed`, `modulation` or `text_in`, and then orthogonalizes them like the
+  rest, with a warning in the log: race it against the same run without them if they matter.
+
+**NorMuon (`optimizer: normuon`, experimental, untested).** Muon's orthogonalized update still gives some rows of a
+matrix far bigger steps than others. NorMuon (Li et al. 2025) keeps a running mean of each row's squared update
+(beta2 0.95), divides the rows by its square root and scales each matrix back to the size it had, so the step size
+stays Muon's. The rows run along the longer side (as in modded-nanogpt: an orthogonalized matrix's short side is
+already even), so a LoRA's `lora_down` is evened out per input feature and `lora_up` per output channel; a square OFT
+block stays about as it was. OneTrainer's Muon has it on by default. Costs one more fp32 number per row next to the
+momentum. Never run in a real training here: race `normuon` against `muon` and `adamw8bit` before relying on it.
 
 ## Self-tuning optimizers: Automagic 3 and 4 (`optimizer: automagic3 | automagic4`)
 
@@ -1896,6 +1919,15 @@ weights, with and without the OFT constraint). diffusers has no loader for eithe
   next to the LoRA / LoKr keys. The input axis is deliberate: ComfyUI's `weight_decompose` normalizes the merged
   weight on that axis, but on the output axis it divides by the original weight's norm, which would not match what
   DoRA trains. A plain LoRA resumed with `dora: true` starts its magnitude where the loaded weights leave it.
+- **Scaled OFT lr (`oft_scaled_lr`, experimental, untested).** OFT trains a skew-symmetric Q = B - B^T per block,
+  so an Adam-type step moves each of a block's b - 1 off-diagonal pairs by about 2 x lr and each output channel's
+  rotation by about 2 x lr x sqrt(b - 1) (Muon's step grows the same way): at one learning rate a block of 64 moves
+  about twice as far as a block of 16, so a race of block sizes also races step sizes. `oft_scaled_lr: true` gives
+  each block size its own learning rate, `learning_rate x sqrt(31 / (b - 1))`, so every size moves about as far as a
+  block of 32 (the default: unchanged). OneTrainer's Scaled OFT divides Q by 2 x sqrt(b - 1) in the forward for the
+  same reason; as a learning-rate factor it is the same under Adam and the saved `oft_blocks` stay what ComfyUI reads.
+  Layers whose outputs do not divide by `oft_block_size` get smaller blocks and so a higher rate. Ignored by the
+  self-tuning optimizers and Hull. A race key.
 - In a race: rows like `network_type=oft, oft_block_size=32` or `dora=true` next to a LoKr row train on the same
   layers from the same start, and the probes pick. EMA, the sampling model, data parallel, `resume_from` and the
   race's saved files all handle both.
@@ -2750,7 +2782,7 @@ ComfyUI's `custom_nodes` and load `workflows/RulzTrainer Likeness Scoring.json`;
 |---|---|
 | Gradient checkpointing | on |
 | Batch size | 1 (use gradient accumulation instead) |
-| Optimizer | `adamw8bit`, or `automagic3` / `automagic4` (self-tuning lr, ported from ai-toolkit; 1 byte of state per weight at the default polarity history; Automagic 4's step is as fast as adamw8bit's on a rank-16 LoRA, about 3x slower at rank 64 and 6x on a full fine-tune; Automagic 3's about 10x slower than Automagic 4's), or `keel` / `keel_fb` (Automagic 4 plus identity mechanisms for character LoRAs, `keel_fb` for the face and the body alike; unmeasured on likeness: race them), or `muon` (orthogonalized momentum at AdamW's learning rates, Fizgig's default since Nov 2026; one fp32 state per weight; unmeasured here: race it) |
+| Optimizer | `adamw8bit`, or `automagic3` / `automagic4` (self-tuning lr, ported from ai-toolkit; 1 byte of state per weight at the default polarity history; Automagic 4's step is as fast as adamw8bit's on a rank-16 LoRA, about 3x slower at rank 64 and 6x on a full fine-tune; Automagic 3's about 10x slower than Automagic 4's), or `keel` / `keel_fb` (Automagic 4 plus identity mechanisms for character LoRAs, `keel_fb` for the face and the body alike; unmeasured on likeness: race them), or `muon` (orthogonalized momentum at AdamW's learning rates, Fizgig's default since Nov 2026; one fp32 state per weight; unmeasured here: race it), or `normuon` (Muon with each row's step evened out; experimental, untested) |
 | Resolution | 1024 |
 | Text encoder device | `auto` (spreads over all GPUs + CPU during caching only) |
 | Max caption tokens | 512 to 1024 unless you train on very long prompts |
@@ -2790,6 +2822,24 @@ gradients and returns the cached memory. Measured on Linux: the probe after two 
 allocated / 8.52 GB reserved, the one before training at 8.28 / 8.29 GB. The Windows CUDA driver has no expandable
 segments; there only the cleanup applies.
 
+### Activation offloading (`activation_offload`, experimental, untested)
+
+A checkpointed block keeps only its inputs for the backward, but every checkpointed block's inputs stay on the GPU
+from its forward until the backward reaches it: about tokens x hidden x 2 bytes each, roughly 0.8 GB over MiniMax H3's
+50 blocks at 1 MP and 3 GB at 4 MP (estimates, not measured). `activation_offload: true` copies them to pinned RAM on
+a side CUDA stream as the forward saves them and gives their GPU memory back once the copy is done; in the backward
+each block's inputs are copied back just before its recomputation, the next two streaming in while it runs. Only
+tensors that need a gradient and hold 1 MB or more move (the hidden states, not the rotary tables and timestep vectors
+every block shares). The freed memory goes to `checkpoint_keep_blocks: -1`, which measures with it on, or lets
+`block_swap` swap fewer blocks. It costs the same bytes over the PCIe link twice per step, next to block swap's own
+traffic. The log reports how much went to RAM in steps 1 and 3.
+
+How: torch's non-reentrant checkpoint saves a block's inputs before it installs its own hooks for the block's insides,
+so saved-tensor hooks around the `checkpoint()` call (`checkpointing.checkpointed`, used by every model family) see
+exactly those inputs; unlike torch's `save_on_cpu` the copy out does not stop the CPU. After OneTrainer's activation
+offloading. Needs gradient checkpointing. **Never run in a real training here:** compare the step time and peak VRAM
+with a run without it before relying on it.
+
 ### Block swap (`block_swap`)
 
 For a card the model does not fit, after musubi-tuner's block swap. `block_swap: N` keeps the frozen weights of the
@@ -2814,8 +2864,15 @@ stay on the GPU.
   The loss matches the unswapped run. The transfers mostly hide behind the blocks' compute on this PCIe link; a
   slower link or a smaller per-block compute shows more of them.
 - **Limits.** Single GPU only (`model_split` spreads blocks over GPUs instead). Not with data parallel or a fine-tune.
-  torch.compile is turned off. A sampling model swapped in and out keeps the split. The *Block swap* field is on the
-  Train tab's memory section.
+  torch.compile is turned off unless `block_swap_compile` is on. A sampling model swapped in and out keeps the split.
+  The *Block swap* field is on the Train tab's memory section.
+- **Compile with block swap (`block_swap_compile`, experimental, untested).** `block.compile()` compiles a block's
+  whole call, its hooks included, so dynamo would trace block swap's streaming (CUDA streams, events, weights swapped
+  in and out); that is why block swap turns compile off. With `block_swap_compile: true` the swapped blocks compile
+  their forward only and the swap hooks run eagerly around it, as OneTrainer compiles its offloaded blocks; the other
+  blocks compile as usual. It could bring compile's 12-26% to runs that swap, such as H3 and P-H3 on one card, but the
+  faster compute also leaves less time to hide the transfers. **Never run in a real training here:** check the compile
+  report for recompiles and compare the step time with a run without it.
 
 ## torch.compile (`compile_model`)
 
@@ -2870,6 +2927,13 @@ and compiled as long as cold. For vast.ai, upload a file a rental made.
 `RULZ_PROFILE_STEP=N` writes such a profile of step N (`profile_step_N.txt` in the job folder), and
 `scripts/bench.py` runs the short timing runs used here (it waits for idle GPUs).
 
+**Peak RAM and memory snapshots** (after OneTrainer). Every run samples its own private RAM twice a second (Linux:
+`RssAnon`, so pinned buffers and block swap's copies count but not the page cache or memory-mapped model files;
+Windows: private bytes) and logs the peak at the end; `status.json` carries it as `peak_ram` (GB). The RAM advice for
+block swap above was estimated; this measures it. `RULZ_MEMORY_SNAPSHOT_STEP=N` records every CUDA allocation of step
+N with its Python stack and writes `memory_snapshot_step_N.pickle` to the job folder (`_oom` added when that step ran
+out of memory), to open on https://pytorch.org/memory_viz. Recording slows that step.
+
 ## Layout
 
 ```
@@ -2882,11 +2946,12 @@ rulztrainer/
   sampler.py       flow-matching Euler sampler (reference schedule)
   trainer.py       training loop, saving, sampling, status.json for the UI
   losses.py        the per-element training loss: MSE or band loss (loss_type)
-  checkpointing.py selective gradient checkpointing (which blocks keep their activations)
+  checkpointing.py selective gradient checkpointing (which blocks keep their activations), checkpointed()
+  actoffload.py    activation offloading: checkpointed blocks' saved inputs in pinned RAM (experimental)
   ema.py           weight average (EMA) of the LoRA for saves, samples and probes
   posthoc_ema.py   post-hoc EMA: a moving average of a finished run's checkpoints (scripts/posthoc_ema.py)
   compiling.py     torch.compile settings, the compile_model auto rule, compile stats, the compile cache file
-  profiling.py     one-step GPU profile by kernel group (RULZ_PROFILE_STEP)
+  profiling.py     one-step GPU profile by kernel group (RULZ_PROFILE_STEP), peak RAM, memory snapshots
   race.py          configuration race: settings, round schedule, swapping configurations' LoRAs
   train.py         CLI entry point
   moss/model.py    MOSS-Image DiT (vendored, Apache-2.0, OpenMOSS)

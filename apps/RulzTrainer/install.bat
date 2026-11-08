@@ -30,7 +30,7 @@ if exist "venv\Scripts\python.exe" (
 )
 
 set PY=venv\Scripts\python.exe
-set "TORCH_INDEX=https://download.pytorch.org/whl/cu130"
+set "TORCH_INDEX="
 if not "%~1"=="" set "TORCH_INDEX=%~1"
 
 echo.
@@ -49,6 +49,10 @@ echo (Run install.bat with an index URL to reinstall it, e.g. install.bat https:
 goto :requirements
 
 :install_torch
+rem No index URL given: the newest CUDA build (cu130, cu128 or cu126) the NVIDIA driver runs, since a newer one
+rem installs but sees no GPU. scripts\torch_index.py reads nvidia-smi and warns when the driver is old.
+if "%TORCH_INDEX%"=="" for /f "delims=" %%u in ('%PY% scripts\torch_index.py') do set "TORCH_INDEX=%%u"
+if "%TORCH_INDEX%"=="" set "TORCH_INDEX=https://download.pytorch.org/whl/cu130"
 echo.
 echo Installing PyTorch (CUDA) from %TORCH_INDEX% ...
 echo (Pass a different index URL as the first argument, e.g. install.bat https://download.pytorch.org/whl/cu128)

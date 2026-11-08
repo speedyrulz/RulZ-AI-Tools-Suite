@@ -32,9 +32,9 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.utils.checkpoint import checkpoint
 
 from ..attention import sdpa
+from ..checkpointing import checkpointed
 from ..compiling import thread_prepare
 
 ROPE_THETA = 10000
@@ -276,7 +276,7 @@ class QwenImage21Transformer(nn.Module):
         thread_prepare()  # dynamo's limits in this thread (autograd recompute, data-parallel workers)
         if (self.gradient_checkpointing and self.training and torch.is_grad_enabled()
                 and not getattr(block, "keep_activations", False)):  # see rulztrainer.checkpointing
-            return checkpoint(block, *args, use_reentrant=False)
+            return checkpointed(self, block, *args)
         return block(*args)
 
     @staticmethod
