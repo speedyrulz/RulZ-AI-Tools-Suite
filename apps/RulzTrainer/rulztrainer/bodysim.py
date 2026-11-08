@@ -340,9 +340,10 @@ class BodyScorer:
     def _image(path: str | Path):
         """The image as RGB, EXIF-rotated, longest side at most 1536 (the size landmarks are found on)."""
         from PIL import Image, ImageOps
+        from .pictures import to_rgb
 
         with Image.open(path) as im:
-            im = ImageOps.exif_transpose(im).convert("RGB")
+            im = to_rgb(ImageOps.exif_transpose(im))
         if max(im.size) > 1536:
             im.thumbnail((1536, 1536))
         return im
@@ -391,9 +392,10 @@ class BodyScorer:
             out.update(proportion_ratios(lm[0], lm[1], self.min_visibility))
         if self.silhouette is not None:
             from PIL import Image, ImageOps
+            from .pictures import to_rgb
 
             with Image.open(path) as im:
-                im = ImageOps.exif_transpose(im).convert("RGB")
+                im = to_rgb(ImageOps.exif_transpose(im))
                 if max(im.size) > 1536:
                     im.thumbnail((1536, 1536))
                 mask = self.silhouette.person_mask(im)  # same 1536-capped size as the landmarks

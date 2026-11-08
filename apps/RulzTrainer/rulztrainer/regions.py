@@ -337,7 +337,9 @@ class PartsParser:
         self._lock = threading.Lock()
 
     def __call__(self, img) -> np.ndarray:
-        arr = np.asarray(img.convert("RGB"))
+        from .pictures import to_rgb
+
+        arr = np.asarray(to_rgb(img))
         h, w = arr.shape[:2]
         pad = (-w) % self.pad_to  # mediapipe 1.0.x only: bodysim.mask_width_multiple
         if pad:
@@ -471,10 +473,11 @@ def _region_map_for(it, cfg, analysis: dict[str, dict], person_mask_fn, parts_fn
 def render_overlay(img, rm: RegionMap, bw: int, bh: int):
     """Colour overlay of a weight map on a PIL image (for the UI preview)."""
     from PIL import Image
+    from .pictures import to_rgb
 
     w = rm.weight[0]
     norm = (w - w.min()) / max(1e-6, float(w.max() - w.min()))
     heat = (norm.numpy() * 255).astype(np.uint8)
     heat_img = Image.fromarray(heat, "L").resize((bw, bh), Image.Resampling.NEAREST)
     red = Image.merge("RGB", (heat_img, Image.new("L", (bw, bh), 0), Image.new("L", (bw, bh), 0)))
-    return Image.blend(img.convert("RGB").resize((bw, bh)), red, 0.45)
+    return Image.blend(to_rgb(img).resize((bw, bh)), red, 0.45)

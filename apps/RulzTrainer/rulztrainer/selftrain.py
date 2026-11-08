@@ -95,9 +95,10 @@ def _scale(size, side: int) -> float:
 def _gray(path, side: int, box=None) -> np.ndarray:
     """The picture in grayscale at the training resolution (area side x side), or the padded face box in it."""
     from PIL import Image, ImageOps
+    from .pictures import to_rgb
 
     with Image.open(path) as im:
-        im = ImageOps.exif_transpose(im).convert("L")
+        im = to_rgb(ImageOps.exif_transpose(im)).convert("L")
         k = _scale(im.size, side)
         im = im.resize((max(3, round(im.width * k)), max(3, round(im.height * k))), Image.Resampling.BILINEAR)
         if box is not None:  # a face, padded by a quarter, at the size training sees it
@@ -122,9 +123,10 @@ def sharpness(path, box=None, side: int = SHARP_SIDE) -> float:
 def thumb(path) -> np.ndarray:
     """A zero-mean, unit-length THUMB x THUMB grayscale thumbnail: near-duplicates correlate near 1."""
     from PIL import Image, ImageOps
+    from .pictures import to_rgb
 
     with Image.open(path) as im:
-        g = np.asarray(ImageOps.exif_transpose(im).convert("L").resize((THUMB, THUMB), Image.Resampling.BILINEAR),
+        g = np.asarray(to_rgb(ImageOps.exif_transpose(im)).convert("L").resize((THUMB, THUMB), Image.Resampling.BILINEAR),
                        dtype=np.float32).ravel()
     g = g - g.mean()
     n = float(np.linalg.norm(g))

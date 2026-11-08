@@ -53,7 +53,8 @@ from .atomic import save_safetensors
 log = logging.getLogger("rulztrainer")
 
 BYTES_PER_PARAM = {"adafactor": 10, "adamw8bit": 12, "adamw": 18, "automagic3": 18,  # fp32 w + grad + state + bf16
-                   "automagic4": 12, "keel": 12, "keel_fb": 12}  # 1 byte of sign history per weight; row slabs
+                   "automagic4": 12, "keel": 12, "keel_fb": 12,  # 1 byte of sign history per weight; row slabs
+                   "muon": 14}  # one fp32 momentum; Newton-Schulz works on a bounded batch at a time
 ANCHOR_BYTES = 2  # the original weights kept for finetune_anchor (int8 / nvfp4 need less; bf16 needs this)
 DELTA_SUFFIX = "_finetune.safetensors"
 

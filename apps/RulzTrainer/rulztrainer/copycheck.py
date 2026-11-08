@@ -48,9 +48,10 @@ def copy_limit(copy_max: float, baseline: float | None) -> float:
 def load_image(path) -> np.ndarray:
     """[3, SIDE, SIDE] float32, normalized: the whole picture squeezed to a square (SSCD's 320 x 320 evaluation)."""
     from PIL import Image, ImageOps
+    from .pictures import to_rgb
 
     with Image.open(path) as im:
-        im = ImageOps.exif_transpose(im).convert("RGB").resize((SIDE, SIDE), Image.Resampling.BILINEAR)
+        im = to_rgb(ImageOps.exif_transpose(im)).resize((SIDE, SIDE), Image.Resampling.BILINEAR)
         arr = np.asarray(im, dtype=np.float32) / 255.0
     return ((arr - np.asarray(_MEAN, dtype=np.float32)) / np.asarray(_STD, dtype=np.float32)).transpose(2, 0, 1)
 

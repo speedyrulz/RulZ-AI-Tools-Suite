@@ -204,6 +204,7 @@ def build_pairs(subject: Subject, photos: list[Path], out_dir: Path, people, n: 
                 analysis: dict | None = None) -> list[tuple[Path, str]]:
     """The subject's n side-by-side pictures: [(png, caption)]. Rebuilt only when what they come from changes."""
     from PIL import Image, ImageOps
+    from .pictures import to_rgb
 
     photos = sorted(photos)
     if not photos or not people or n <= 0:
@@ -230,10 +231,10 @@ def build_pairs(subject: Subject, photos: list[Path], out_dir: Path, people, n: 
         mine = rng.choice(photos)
         left = rng.random() < 0.5
         with Image.open(mine) as im:
-            im = ImageOps.exif_transpose(im).convert("RGB")
+            im = to_rgb(ImageOps.exif_transpose(im))
             a = _square(im, face_box((analysis or {}).get(str(mine.resolve()))))
         with Image.open(path) as im:
-            b = _square(im.convert("RGB"))
+            b = _square(to_rgb(im))
         sheet = Image.new("RGB", (2 * PANEL, PANEL))
         sheet.paste(a if left else b, (0, 0))
         sheet.paste(b if left else a, (PANEL, 0))
