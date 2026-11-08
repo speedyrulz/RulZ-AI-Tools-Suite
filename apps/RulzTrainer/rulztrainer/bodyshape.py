@@ -369,10 +369,11 @@ class SMPLXScorer(_ProfileScorer):
         """The SMPL-X betas [10] of the picture's main person, or None without one whose body (shoulders, hips and
         knees) is in the frame: a close-up's shape would be the model's guess, not the person's."""
         from PIL import Image, ImageOps
+        from .pictures import to_rgb
 
         torch = self.torch
         with Image.open(path) as im:
-            im = ImageOps.exif_transpose(im).convert("RGB")
+            im = to_rgb(ImageOps.exif_transpose(im))
         if max(im.size) > 1536:
             im.thumbnail((1536, 1536))
         w, h = im.size

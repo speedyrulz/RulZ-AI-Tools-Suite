@@ -16,6 +16,7 @@ from safetensors.torch import load_file
 from .archs import get_arch
 from .atomic import save_safetensors
 from .config import TrainConfig
+from .pictures import file_has_alpha, has_alpha, to_rgb
 
 log = logging.getLogger("rulztrainer")
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
@@ -110,19 +111,35 @@ def describe_sides(cfg: TrainConfig) -> str:
     return ", ".join(f"{side_to_mp(s):g} MP" for s in cfg.training_sides())
 
 
-def upright_size(path: Path) -> tuple[int, int]:
-    """(width, height) as ImageOps.exif_transpose turns the picture, from the header alone: transposing decodes the
-    whole image, which a scan of every training photo at every start does not need."""
+def upright_header(path: Path) -> tuple[int, int, bool]:
+    """(width, height, transparent?) as ImageOps.exif_transpose turns the picture, from the header alone: transposing
+    decodes the whole image, which a scan of every training photo at every start does not need."""
     with Image.open(path) as im:
         w, h = im.size
         if im.getexif().get(0x0112, 1) in (5, 6, 7, 8):  # Orientation: the rotations by 90 degrees
             w, h = h, w
-    return w, h
+        return w, h, has_alpha(im)
+
+
+def upright_size(path: Path) -> tuple[int, int]:
+    """(width, height) as ImageOps.exif_transpose turns the picture (upright_header without the transparency)."""
+    return upright_header(path)[:2]
+
+
+def latent_key(path: Path, transparent: bool | None = None) -> str:
+    """What a picture's cached latents are named after: the file (path, date, size), and for a picture with
+    transparency the white it is laid on, so latents cached before that (on the colour under its transparent pixels)
+    are encoded again once."""
+    from .regions import _file_key
+
+    if transparent is None:
+        transparent = file_has_alpha(path)
+    return _file_key(path) + ("|on-white" if transparent else "")
 
 
 def load_image_fit(path: Path, w: int, h: int, src_box=None) -> Image.Image:
     img = Image.open(path)
-    img = ImageOps.exif_transpose(img).convert("RGB")
+    img = to_rgb(ImageOps.exif_transpose(img))
     if src_box is not None:
         img = img.crop(tuple(int(round(v)) for v in src_box))
     return ImageOps.fit(img, (w, h), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
@@ -148,8 +165,6 @@ def scan_dataset(cfg: TrainConfig) -> list[Item]:
     """Items of every dataset of the run (cfg.dataset_specs()): one per image and training resolution of its dataset,
     carrying the dataset's repeats; latents and region maps in the dataset's own cache (cfg.dataset_cache_dir), named
     after the file's path, time and size: a picture replaced in place is encoded again."""
-    from .regions import _file_key
-
     specs = cfg.dataset_specs()
     for spec in specs:  # before any cache folder is made: making one would create a missing dataset folder
         if not Path(spec.path).is_dir():
@@ -170,7 +185,7 @@ def scan_dataset(cfg: TrainConfig) -> list[Item]:
             if p.suffix.lower() not in IMAGE_EXTS or skipped(p, root):
                 continue
             try:
-                w, h = upright_size(p)
+                w, h, transparent = upright_header(p)
             except Exception as e:  # noqa: BLE001
                 log.warning("Skipping unreadable image %s: %s", p, e)
                 continue
@@ -182,7 +197,7 @@ def scan_dataset(cfg: TrainConfig) -> list[Item]:
                 if (bw, bh) in seen:  # two resolutions clamped to the same bucket: keep one copy
                     continue
                 seen.add((bw, bh))
-                stem = _hash(_file_key(p)) + f"_{bw}x{bh}"
+                stem = _hash(latent_key(p, transparent)) + f"_{bw}x{bh}"
                 items.append(Item(
                     image=p, caption=caption, width=bw, height=bh,
                     latent_path=cache / "latents" / f"{stem}{tag}.safetensors",
@@ -219,7 +234,7 @@ def augment_items(items: list[Item], cfg: TrainConfig, analysis: dict[str, dict]
 
     Boxes are squares in source pixels around the face box, clamped into the image; items reuse the normal
     latent/text/region caches with their own stems and captions from the templates."""
-    from .regions import _file_key, face_fraction
+    from .regions import face_fraction
 
     mode = (cfg.crop_augment or "none").lower()
     if mode == "none":
@@ -257,7 +272,7 @@ def augment_items(items: list[Item], cfg: TrainConfig, analysis: dict[str, dict]
                 continue
             bw, bh = bucket_size(box[2] - box[0], box[3] - box[1], cfg, it.side or None)
             caption = crop_caption(template, it.caption, cfg)
-            stem = _hash(f"{_file_key(it.image)}|crop{box[0]},{box[1]},{box[2]},{box[3]}") + f"_{bw}x{bh}"
+            stem = _hash(f"{latent_key(it.image)}|crop{box[0]},{box[1]},{box[2]},{box[3]}") + f"_{bw}x{bh}"
             tag = get_arch(cfg).latent_tag
             cache = it.latent_path.parent.parent  # the source image's dataset cache
             out.append(Item(

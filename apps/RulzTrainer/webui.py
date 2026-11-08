@@ -31,6 +31,7 @@ from rulztrainer.config import (AUTOMAGIC, KEEL, OPTIMIZERS, ARCH_DEFAULT_TARGET
 from rulztrainer import bodysim, facesim, history, lookfilter
 from rulztrainer.train_queue import TrainQueue
 from rulztrainer.dataset import skipped as dataset_skipped
+from rulztrainer.pictures import to_rgb
 from rulztrainer.losswatch import read_verdicts
 
 ROOT = Path(__file__).resolve().parent
@@ -2726,11 +2727,12 @@ def make_thumbs(images: list[Path], root: Path) -> list[Path]:
     for img in images:
         try:
             st = img.stat()
-            key = hashlib.sha1(f"{img.resolve()}|{st.st_mtime_ns}|{st.st_size}|sq".encode()).hexdigest()[:16]
+            # (|white: thumbnails made before transparency was laid on white are made again once)
+            key = hashlib.sha1(f"{img.resolve()}|{st.st_mtime_ns}|{st.st_size}|sq|white".encode()).hexdigest()[:16]
             t = tdir / f"{key}.jpg"
             if not t.exists():
                 with Image.open(img) as im:
-                    im = ImageOps.exif_transpose(im).convert("RGB")
+                    im = to_rgb(ImageOps.exif_transpose(im))
                     im = ImageOps.fit(im, (THUMB_SIZE, THUMB_SIZE), Image.Resampling.LANCZOS)  # square center crop
                     im.save(t, "JPEG", quality=85)
             out.append(t)
@@ -4693,22 +4695,27 @@ EXPERIMENTS = [
     {"key": "optimizer", "group": "Adapter and optimizer", "title": "Optimizer", "off": "adamw8bit",
      "control": "select", "options": {"adamw8bit": "adamw8bit (default)", "adamw": "adamw", "adafactor": "adafactor",
                                       "automagic3": "automagic3", "automagic4": "automagic4", "keel": "keel",
-                                      "keel_fb": "keel_fb"},
+                                      "keel_fb": "keel_fb", "muon": "muon"},
      "evidence": "mixed",
-     "short": "A self-tuning optimizer instead of adamw8bit.",
+     "short": "Muon or a self-tuning optimizer instead of adamw8bit.",
      "what": "adamw8bit is AdamW with its state in 8 bits (adamw keeps it in full precision; adafactor is lighter). "
-             "automagic3 and automagic4 tune their own learning rate as they go; automagic4 adds smaller steps for the "
-             "most sensitive weights. keel is automagic4 with extra machinery aimed at a character's identity, and "
-             "keel_fb the same for the face and the body alike.",
+             "muon steps each weight matrix as a whole, evening out the update across all its directions, at AdamW's "
+             "learning rates. automagic3 and automagic4 tune their own learning rate as they go; automagic4 adds "
+             "smaller steps for the most sensitive weights. keel is automagic4 with extra machinery aimed at a "
+             "character's identity, and keel_fb the same for the face and the body alike.",
      "tested": "keel against adamw8bit, two seeds on one small set on Krea 2 at gradient accumulation 1: a repeated "
                "face gain (FaceNet 52.7 and 54.3 against 44 to 49), no repeated body gain, and faces very alike "
                "across seeds. keel_fb tied keel on one seed. On a body-only set, single learning-rate groups beat "
                "by_type by 4.4 body points over 8 seeds, and Max lr at 1e-3, 5e-4 and 3e-4 tied at 1000 steps. "
                "Automagic was measured for learning rates and speed only, so adamw8bit stays the default. adafactor "
-               "is Fizgig's pick for a full fine-tune, not tested for LoRAs.",
+               "is Fizgig's pick for a full fine-tune, not tested for LoRAs. muon: Fizgig measured it level with "
+               "AdamW on likeness (Qwen-Image 2.1, rank 8, 20 epochs) and made it every picture model's LoRA default "
+               "for sharper fine detail by eye; a study of Muon on LoRA factors for language models found no gain "
+               "over Adam. Not raced here yet.",
      "cost": "automagic4 took 1.6 s a step against automagic3's 2.2 s. The learning-rate schedule, LoRA+ and the "
              "per-image learning rate do not apply to the automagic family. Keel's consensus gate wants gradient "
-             "accumulation of 2 or more."},
+             "accumulation of 2 or more. muon keeps one full-precision number per weight (less than adamw, a "
+             "little more than adamw8bit) and takes AdamW's learning rate as it is."},
     {"key": "isolation", "group": "Likeness boosters", "title": "LoRA Isolation", "off": False, "control": "switch",
      "evidence": "mixed",
      "short": "Keeps the person's face off everyone else in the picture.",
@@ -9674,6 +9681,13 @@ Krea 2 LoRA upstream's rate ran from 1e-4 into the 1e-3 ceiling by step 100 and 
 6e-4 and eased back to 3e-4 by step 160. On a rank-16 LoRA its step is as fast as adamw8bit's (about 3x slower at
 rank 64, 6x on a full fine-tune; Automagic 3's is about 10x slower than Automagic 4's) and its state is 1 byte per weight at the default *Polarity history* 8; which optimizer reaches likeness first is not
 measured yet, so race them.
+
+`muon` steps each weight matrix as a whole: its momentum is replaced by the nearest orthogonal matrix, so every
+direction of the update gets about the same step and fine detail does not wait behind the broad shapes. Its step size
+is matched to AdamW's, so AdamW's learning rates apply as they are (1e-4 for a LoRA), and the schedule, warm-up, LoRA+
+and the per-image rate work as with AdamW. Fizgig trains every picture model's LoRAs on it since November 2026 (level
+with AdamW on likeness in its test, sharper detail by eye); it is not raced here yet. One full-precision number of
+state per weight.
 
 `keel` is Automagic 4 for character LoRAs (`docs/keel-optimizer.md`), with every Automagic 4 setting and two of
 its own: the *Gauge preconditioner* scales each LoRA pair's gradient by the other factor's r x r Gram (Riemannian

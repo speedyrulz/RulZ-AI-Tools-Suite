@@ -126,10 +126,11 @@ def keep_probe_images(run_id: str, status: dict, root: Path = HISTORY_DIR) -> li
                     continue
                 try:
                     from PIL import Image
+                    from .pictures import to_rgb
 
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     with Image.open(src) as im:
-                        im = im.convert("RGB")
+                        im = to_rgb(im)
                         im.thumbnail((PROBE_THUMB_PX, PROBE_THUMB_PX))
                         im.save(dest, quality=90)
                 except OSError:

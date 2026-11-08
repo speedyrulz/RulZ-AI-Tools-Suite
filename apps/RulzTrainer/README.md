@@ -53,6 +53,11 @@ pip install -r requirements.txt
 
 Requires a CUDA build of PyTorch 2.9+, diffusers 0.38+ and transformers 5.3+ (Qwen3.5 support).
 
+**No telemetry.** Importing RulzTrainer sets `ORT_DISABLE_TELEMETRY=1` and `HF_HUB_DISABLE_TELEMETRY=1` before
+anything loads onnxruntime or Hugging Face's libraries, so the WebUI and every job it starts inherit them, and it
+calls onnxruntime's own switch on Windows where InsightFace loads. onnxruntime's Linux builds from 1.29 otherwise
+report a device ID and machine details to Microsoft (found by Fizgig). A value you set yourself wins.
+
 ## Run the WebUI
 
 ```bash
@@ -287,6 +292,11 @@ and `RULZ_VAST_HOME` set the defaults. In Git Bash, set `MSYS_NO_PATHCONV=1` or 
   encoder waiting on kernel launches most of the time. Each caption is padded on the right and cut back to its own
   length, which gives it the same features as encoding it alone (the text encoders are causal), for every model.
   A batch that runs out of GPU memory is split in half and retried.
+- **Transparent pictures** (cut-out PNGs) are laid on white wherever a picture is read: training, face and body
+  scoring, region maps, Isolation's side-by-side pictures, the copy check and thumbnails (after Fizgig 9.0.3). A
+  plain conversion to RGB kept whatever colour the transparent pixels store, often black, so the LoRA learned a
+  background nobody sees. A transparent picture's latents are named apart from those cached before, so they are
+  encoded again once.
 - **Timesteps.** `logit_normal` (mean/std), `sigmoid` (scale) or `uniform`, with an optional `timestep_shift`.
   `logsnr` is the style-friendly sampler ([arXiv 2411.14793](https://arxiv.org/abs/2411.14793), via musubi-tuner):
   the log signal-to-noise ratio is drawn from N(`logsnr_mean`, `logsnr_std`), -6 and 2 as the paper recommends, so
@@ -856,6 +866,30 @@ and cleared by editing the image's caption. Output: `per_image_loss.jsonl` (ever
 `per_image_loss.json` (the table), a Monitor table and verdict badges on the Dataset tab. Not used with
 `automagic3` / `automagic4`, whose step normalisation would absorb the per-image scaling. Verdicts need a few epochs to mean
 anything, so this suits typical character sets trained for thousands of steps.
+
+## Muon (`optimizer: muon`)
+
+Muon steps each weight matrix as a whole: its momentum is replaced by the nearest orthogonal matrix (five
+Newton-Schulz iterations in bf16), so every direction of the update gets about the same step and fine detail does not
+wait behind the broad shapes. The update is PyTorch's `torch.optim.Muon` with momentum 0.95, Nesterov and decoupled
+weight decay (`weight_decay`), and Moonshot's `match_rms_adamw` step size, so the update's RMS is about AdamW's and
+**AdamW's learning rates apply as they are** (1e-4 for a LoRA). [Fizgig](https://github.com/shootthesound/Fizgig)
+trains every picture model's LoRA presets on these settings since 6 Nov 2026.
+
+- **Evidence.** Fizgig measured Muon level with AdamW on likeness (Qwen-Image 2.1, rank 8, 20 epochs) and moved its
+  presets to it for sharper fine detail by eye (skin, hair, fabric). Against it, PoLoRA found Muon on LoRA factors
+  does not beat Adam on language models ([keel-optimizer.md](docs/keel-optimizer.md)). Not measured here yet, so the
+  Wizard keeps recommending adamw8bit; race it (`race` rows with `optimizer: muon`).
+- **Memory.** One fp32 momentum per weight: less than `adamw`, a little more than `adamw8bit`. Matrices of the same
+  shape are orthogonalized together in batched multiplies (a LoRA's hundreds of small matrices one at a time made
+  the optimizer step the slow part), at most `2^26` numbers at a time, so a full fine-tune's large matrices go a few
+  at a time.
+- **Every adapter.** LoRA and LoKr factors are matrices; OFT's rotation blocks are orthogonalized one block at a
+  time; DoRA's magnitude vectors take their momentum scaled to the RMS a matrix gets (0.2 x lr). LoRA+ keeps its
+  meaning (`lora_up` steps `lora_plus_ratio` times further), the schedule, warm-up and per-image learning rate apply
+  as with AdamW, and a full fine-tune can use it too (untested there; Fizgig keeps Adafactor for fine-tunes).
+- **Resume.** The state is one `momentum_buffer` per weight, as in `torch.optim.Muon`; a state of another optimizer is
+  refused with a message.
 
 ## Self-tuning optimizers: Automagic 3 and 4 (`optimizer: automagic3 | automagic4`)
 
@@ -2716,7 +2750,7 @@ ComfyUI's `custom_nodes` and load `workflows/RulzTrainer Likeness Scoring.json`;
 |---|---|
 | Gradient checkpointing | on |
 | Batch size | 1 (use gradient accumulation instead) |
-| Optimizer | `adamw8bit`, or `automagic3` / `automagic4` (self-tuning lr, ported from ai-toolkit; 1 byte of state per weight at the default polarity history; Automagic 4's step is as fast as adamw8bit's on a rank-16 LoRA, about 3x slower at rank 64 and 6x on a full fine-tune; Automagic 3's about 10x slower than Automagic 4's), or `keel` / `keel_fb` (Automagic 4 plus identity mechanisms for character LoRAs, `keel_fb` for the face and the body alike; unmeasured on likeness: race them) |
+| Optimizer | `adamw8bit`, or `automagic3` / `automagic4` (self-tuning lr, ported from ai-toolkit; 1 byte of state per weight at the default polarity history; Automagic 4's step is as fast as adamw8bit's on a rank-16 LoRA, about 3x slower at rank 64 and 6x on a full fine-tune; Automagic 3's about 10x slower than Automagic 4's), or `keel` / `keel_fb` (Automagic 4 plus identity mechanisms for character LoRAs, `keel_fb` for the face and the body alike; unmeasured on likeness: race them), or `muon` (orthogonalized momentum at AdamW's learning rates, Fizgig's default since Nov 2026; one fp32 state per weight; unmeasured here: race it) |
 | Resolution | 1024 |
 | Text encoder device | `auto` (spreads over all GPUs + CPU during caching only) |
 | Max caption tokens | 512 to 1024 unless you train on very long prompts |
