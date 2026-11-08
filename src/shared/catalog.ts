@@ -182,7 +182,9 @@ export const CATALOG: CatalogApp[] = [
     tagline: 'Frame-accurate clip extraction with lossless cuts and NVENC export',
     description:
       'A small video trimmer: step frame by frame or keyframe by keyframe, mark In and Out, and export losslessly or ' +
-      're-encoded with NVIDIA NVENC. Crop, rotate, fixed-length clips and skin-tone colour matching included.',
+      're-encoded with NVIDIA NVENC. Crop, rotate, fixed-length clips and skin-tone colour matching included, plus a ' +
+      'Distortion repair window (lens, perspective, horizon, reshape and miniature effect) applied to the preview, ' +
+      'frame PNGs and every export.',
     category: 'Video',
     repo: SUITE_REPO,
     path: 'apps/rulz-simple-video-clip-extractor',
@@ -195,7 +197,7 @@ export const CATALOG: CatalogApp[] = [
       { id: 'nvidia', optional: true, note: 'For NVENC export' }
     ],
     folderName: 'RulZ Clip Extractor',
-    highlights: ['Frame-accurate', 'Lossless cuts', 'NVENC export', 'Crop & colour match']
+    highlights: ['Frame-accurate', 'Lossless cuts', 'NVENC export', 'Crop & colour match', 'Distortion repair']
   },
   {
     id: 'rulz-image-crawler',
