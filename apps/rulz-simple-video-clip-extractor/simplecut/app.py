@@ -22,9 +22,17 @@ from .decoder import Decoder, rgb_reformat_args
 from .timeline import Timeline
 from .cropview import VideoView, even
 from .export import (ExportSettings, ExportJob, NVENC_CODECS, FPS_PRESETS, parse_fps,
-                     build_commands, command_cwd, default_output_path, unique_path)
+                     make_export_job, default_output_path, unique_path)
 from . import theme
 from .colormatch import ColorMatchDialog, apply_tables, clean_temp, write_cube_1d
+try:
+    from .repair.export import RepairExport
+    from .repair.pipeline import RepairSettings, RepairState, describe as describe_repair, orient
+    REPAIR_UNAVAILABLE = ""
+except ImportError as _e:  # OpenCV missing (a source install whose .venv predates it): the rest still works
+    RepairExport = RepairSettings = RepairState = describe_repair = orient = None
+    REPAIR_UNAVAILABLE = (f"Distortion repair needs OpenCV ({_e}). Install it with:\n"
+                          f"    .venv\\Scripts\\python -m pip install -r requirements.txt")
 from .defaults import (ASPECT_PRESETS, PRESET_LABELS, AUDIO_LABELS, AUDIO_KEYS, settings,
                        parse_aspect, load_export_defaults, load_ui_defaults, DefaultsDialog,
                        PreferencesDialog, load_quick_defaults, prefer_lossless,
@@ -123,7 +131,7 @@ class ExportDialog(QDialog):
                  lossless_ok: bool, rotation: int = 0,
                  crop: tuple[int, int, int, int] | None = None,
                  out_size: tuple[int, int] | None = None, hflip: bool = False,
-                 lut_path: str | None = None, parent=None):
+                 lut_path: str | None = None, parent=None, repair: RepairExport | None = None):
         super().__init__(parent)
         self.setWindowTitle("Export clip")
         self.info, self.start, self.end = info, start, end
@@ -132,7 +140,9 @@ class ExportDialog(QDialog):
         self.crop = crop
         self.out_size = out_size
         self.lut_path = lut_path
-        needs_reencode = crop is not None or out_size is not None or hflip or lut_path is not None
+        self.repair = repair
+        needs_reencode = (crop is not None or out_size is not None or hflip or lut_path is not None
+                          or repair is not None)
         self.lossless_ok = lossless_ok and not needs_reencode
 
         lay = QVBoxLayout(self)
@@ -156,7 +166,9 @@ class ExportDialog(QDialog):
             (self.rb_lossless if prefer_lossless() else self.rb_nvenc).setChecked(True)
         else:
             self.rb_nvenc.setChecked(True)
-            if lut_path:
+            if repair is not None:
+                why = "distortion repair requires re-encoding"
+            elif lut_path:
                 why = "colour correction requires re-encoding"
             elif hflip:
                 why = "horizontal flip requires re-encoding"
@@ -171,6 +183,11 @@ class ExportDialog(QDialog):
             note.setObjectName("note")
             lay.addWidget(note)
         lay.addWidget(self.rb_nvenc)
+        if repair is not None:
+            note = QLabel("      Distortion repair is applied (each frame is corrected, so this export is slower).")
+            note.setObjectName("note")
+            note.setToolTip(describe_repair(repair.state.settings.corrections))
+            lay.addWidget(note)
         if lut_path:
             note = QLabel("      Skin-tone colour correction is applied.")
             note.setObjectName("note")
@@ -255,7 +272,8 @@ class ExportDialog(QDialog):
         self.form_widget.setEnabled(mode == "nvenc")
         # never suggest the name of a clip exported earlier: ffmpeg runs with -y
         self.out_path.setText(unique_path(default_output_path(self.info, self.start, self.end, mode,
-                                                              output_dir(), cropped=self.crop is not None)))
+                                                              output_dir(), cropped=self.crop is not None,
+                                                              repaired=self.repair is not None)))
 
     def _browse(self):
         filt = "MP4 video (*.mp4)" if self._mode() == "nvenc" else "Video (*.*)"
@@ -277,6 +295,7 @@ class ExportDialog(QDialog):
             s.fps = parse_fps(self.fps.currentText())
             s.crop = self.crop
             s.out_size = self.out_size
+            s.repair = self.repair
         return s
 
     def _export(self):
@@ -301,8 +320,11 @@ class ExportDialog(QDialog):
             QMessageBox.critical(self, "Export", NO_FFMPEG)
             return
         self._out = out
-        self.job = ExportJob(build_commands(self.info, self.start, self.end, out, st),
-                             self.end - self.start, self, cwd=command_cwd(st))
+        try:
+            self.job = make_export_job(self.info, self.start, self.end, out, st, self)
+        except ValueError as e:
+            QMessageBox.warning(self, "Export", str(e))
+            return
         self.job.progress.connect(lambda f: self.progress.setValue(int(f * 1000)))
         self.job.finished.connect(self._done)
         self.progress.setVisible(True)
@@ -354,6 +376,9 @@ class MainWindow(QMainWindow):
         self.color_tables = None       # (3, 256) uint8 lookup tables from the skin-tone match, or None
         self.color_lut_path: str | None = None
         self.color_desc = ""
+        # Distortion repair adjustments saved for the open video (None = off). Screen transform
+        # with them = D o corrections o base orientation; see repair/pipeline.py.
+        self.repair: RepairState | None = None
         self._probe_thread: ProbeThread | None = None  # the newest one
         self._probe_threads: list[ProbeThread] = []    # every one still running, kept referenced
         self._probe_token = 0                          # bumped per open/close; stale probe results are dropped
@@ -500,6 +525,16 @@ class MainWindow(QMainWindow):
         self.b_match_clear.setEnabled(False)
         self.color_label = QLabel("")
         self.color_label.setObjectName("accent")
+        self.b_repair = btn("Distortion repair…  [D]", "Open the RulZ Image Distortion Repair adjustments "
+                            "(lens distortion, perspective, horizon, reshape, crop, miniature effect) on this "
+                            "frame. Saved adjustments apply to the preview, frame PNGs and every export.",
+                            self.open_repair)
+        if REPAIR_UNAVAILABLE:
+            self.b_repair.setToolTip(REPAIR_UNAVAILABLE)
+        self.b_repair_clear = btn("Clear", "Remove the distortion repair adjustments", self.clear_repair)
+        self.b_repair_clear.setEnabled(False)
+        self.repair_label = QLabel("")
+        self.repair_label.setObjectName("accent")
         self.crop_label = QLabel("")
 
         # fixed-length controls
@@ -599,6 +634,10 @@ class MainWindow(QMainWindow):
         crop_row.addSpacing(12)
         crop_row.addWidget(self.crop_label)
         crop_row.addStretch(1)
+        crop_row.addWidget(self.b_repair)
+        crop_row.addWidget(self.repair_label)
+        crop_row.addWidget(self.b_repair_clear)
+        crop_row.addSpacing(12)
         crop_row.addWidget(self.b_match)
         crop_row.addWidget(self.color_label)
         crop_row.addWidget(self.b_match_clear)
@@ -679,7 +718,7 @@ class MainWindow(QMainWindow):
             ("Home", self.go_start), ("End", self.go_end),
             ("I", self.set_in), ("O", self.set_out), ("S", self.save_frame), ("R", self.rotate),
             ("F", self.flip_h), ("M", lambda: self.b_mute.toggle()),
-            ("Ctrl+Shift+E", self.quick_export), ("B", self.match_color),
+            ("Ctrl+Shift+E", self.quick_export), ("B", self.match_color), ("D", self.open_repair),
             ("Ctrl+Left", lambda: self.sel_move_frames(-1)), ("Ctrl+Right", lambda: self.sel_move_frames(1)),
             ("Ctrl+Shift+Left", lambda: self.sel_move_keyframe(-1)),
             ("Ctrl+Shift+Right", lambda: self.sel_move_keyframe(1)),
@@ -735,6 +774,7 @@ class MainWindow(QMainWindow):
             b.setEnabled(on)
         self.b_quick.setEnabled(on and self.quick_job is None)
         self.b_match.setEnabled(on)
+        self.b_repair.setEnabled(on and not REPAIR_UNAVAILABLE)
         self.a_close.setEnabled(on)
 
     # ----------------------------------------------------------- colour match
@@ -766,6 +806,62 @@ class MainWindow(QMainWindow):
         if self.dec is not None and self.dec.current is not None:
             self._show_current()
         self._selection_changed()
+
+    # -------------------------------------------------------- distortion repair
+    def open_repair(self):
+        """Open the Distortion repair window on the current frame; Save applies the adjustments."""
+        if not self.dec or self.dec.current is None or not self.info:
+            return
+        if REPAIR_UNAVAILABLE:
+            QMessageBox.information(self, "Distortion repair", REPAIR_UNAVAILABLE)
+            return
+        from .repair.window import AdjustmentsWindow  # the editor's widgets load on first use
+        self.stop()
+        if self.repair is not None:
+            # edit the saved adjustments on the frame as it was when they were made
+            settings = self.repair.settings
+            rot, flip, corrections = settings.base_rotation, settings.base_flip, settings.corrections
+        else:
+            rot, flip, corrections = self.rotation, self.flip, None
+        f = self.dec.current
+        rgb = np.ascontiguousarray(orient(self._frame_rgb(f), (self.info.rotation + rot) % 360, flip))
+        t = (f.time or 0.0) - self.info.start_time
+        note = (f"Frame {fmt_time(t)}. Saved adjustments apply to the whole video: the preview, "
+                f"frame PNGs and every export.")
+        if self.repair is not None and (rot, flip) != (self.rotation, self.flip):
+            note += (" The frame is shown the way it was turned when you made them; "
+                     "the rotation or flip you added since is applied after them.")
+        dlg = AdjustmentsWindow(rgb, corrections, note, self)
+        if dlg.exec() == QDialog.Accepted and dlg.result is not None:
+            self._set_repair(RepairSettings(dlg.result, rot, flip))
+            if self.repair is not None:
+                self.status.showMessage("Distortion repair saved; the preview, frame PNGs and exports use it.", 6000)
+            else:
+                self.status.showMessage("Distortion repair is off: the saved adjustments change nothing.", 6000)
+        self.view.setFocus()
+
+    def clear_repair(self):
+        self._set_repair(None)
+
+    def _set_repair(self, settings: RepairSettings | None):
+        state = None
+        if settings is not None and self.info:
+            state = RepairState.build(settings, self.info.width, self.info.height, self.info.rotation)
+            if state.pipeline.changes_nothing:
+                state = None
+        self.repair = state
+        self.repair_label.setText("distortion repaired" if state else "")
+        self.repair_label.setToolTip(describe_repair(state.settings.corrections) if state else "")
+        self.b_repair_clear.setEnabled(state is not None)
+        if self.dec is not None and self.dec.current is not None:
+            self._show_current()   # the frame size can change (the repair's crop): the crop box refits
+        self._crop_changed()
+
+    def _repair_export(self) -> RepairExport | None:
+        if self.repair is None or not self.info:
+            return None
+        return RepairExport(self.repair, self.rotation, self.flip, self.info.rotation,
+                            (self.info.width, self.info.height))
 
     # --------------------------------------------------------------- defaults
     def edit_preferences(self, start_tab: int = 0):
@@ -901,6 +997,7 @@ class MainWindow(QMainWindow):
         self.rotation = 0
         self.flip = False
         self._set_color(None, "")
+        self._set_repair(None)
         self._update_rot_label()
         self.view.crop = None
         if self.b_crop.isChecked():
@@ -958,6 +1055,7 @@ class MainWindow(QMainWindow):
         self.rotation = 0
         self.flip = False
         self._set_color(None, "")
+        self._set_repair(None)
         self.mark_in = self.mark_out = None
         self.fixed = False
         for b in (self.b_crop, self.b_fixed):
@@ -1056,8 +1154,27 @@ class MainWindow(QMainWindow):
             parts.append(f"(source {self.info.rotation}°)")
         self.rot_label.setText(" ".join(parts))
 
+    def _frame_rgb(self, f, width: int | None = None, height: int | None = None) -> np.ndarray:
+        """A decoded frame as an RGB array (not rotated), optionally scaled, colour correction applied."""
+        kw = {"format": "rgb24", **rgb_reformat_args(f)}
+        if width and height:
+            kw.update(width=width, height=height)
+        rgb = f.reformat(**kw)
+        plane = rgb.planes[0]
+        buf = np.frombuffer(plane, dtype=np.uint8).reshape(rgb.height, plane.line_size)
+        arr = buf[:, :rgb.width * 3].reshape(rgb.height, rgb.width, 3)
+        if self.color_tables is not None:
+            return apply_tables(arr, self.color_tables)
+        return arr.copy()
+
     def _frame_image(self, f, width: int | None = None, height: int | None = None) -> QImage:
-        """Convert a decoded frame to a QImage, optionally scaled, with rotation applied."""
+        """Convert a decoded frame to a QImage, optionally scaled, with rotation applied
+        (and the distortion repair, when it is on: full quality when not scaled)."""
+        if self.repair is not None:
+            out = self.repair.screen_frame(self._frame_rgb(f, width, height), self.info.rotation,
+                                           self.rotation, self.flip, full=not (width and height))
+            h, w = out.shape[:2]
+            return QImage(out.data, w, h, w * 3, QImage.Format_RGB888).copy()
         kw = {"format": "rgb24", **rgb_reformat_args(f)}
         if width and height:
             kw.update(width=width, height=height)
@@ -1079,6 +1196,9 @@ class MainWindow(QMainWindow):
         return img
 
     def _rotated_frame_size(self) -> tuple[int, int]:
+        """Full-resolution size of the frame as shown: the crop box works in these pixels."""
+        if self.repair is not None:
+            return self.repair.output_size(self.rotation, self.flip)
         w, h = self.info.width, self.info.height
         return (h, w) if self.total_rotation in (90, 270) else (w, h)
 
@@ -1617,7 +1737,8 @@ class MainWindow(QMainWindow):
 
     def _lossless_possible(self) -> bool:
         rng = self._export_range()
-        if not rng or not self.info or self.view.crop_rect_int() or self.flip or self.color_tables is not None:
+        if (not rng or not self.info or self.view.crop_rect_int() or self.flip or self.color_tables is not None
+                or self.repair is not None):
             return False
         return self._on_keyframe_or_edge(rng[0]) and self._on_keyframe_or_edge(rng[1])
 
@@ -1656,7 +1777,8 @@ class MainWindow(QMainWindow):
         stem = os.path.splitext(os.path.basename(self.info.path))[0]
         t = (f.time or 0.0) - self.info.start_time
         frame_no = round(t * self.info.fps)
-        name = f"{stem}_{fmt_time(t).replace(':', '-')}_f{frame_no}{'_crop' if crop else ''}.png"
+        tags = ("_repair" if self.repair is not None else "") + ("_crop" if crop else "")
+        name = f"{stem}_{fmt_time(t).replace(':', '-')}_f{frame_no}{tags}.png"
         path = unique_path(os.path.join(self._effective_output_dir(), name))
         if img.save(path, "PNG"):
             self.status.showMessage(f"Saved frame: {path}", 6000)
@@ -1679,17 +1801,22 @@ class MainWindow(QMainWindow):
         crop, out_size = self._export_geometry()
         s = load_quick_defaults()
         lossless = (quick_lossless_when_possible() and crop is None and out_size is None
-                    and not self.flip and self.color_lut_path is None
+                    and not self.flip and self.color_lut_path is None and self.repair is None
                     and self._on_keyframe_or_edge(rng[0]) and self._on_keyframe_or_edge(rng[1]))
         mode = "lossless" if lossless else "nvenc"
         s.mode, s.rotation, s.hflip, s.crop, s.out_size = mode, self.rotation, self.flip, crop, out_size
         s.lut_path = self.color_lut_path
+        s.repair = self._repair_export() if mode == "nvenc" else None
         out = unique_path(default_output_path(self.info, rng[0], rng[1], mode, output_dir(),
-                                              cropped=crop is not None, whole=whole))
+                                              cropped=crop is not None, whole=whole,
+                                              repaired=s.repair is not None))
         self._quick_out = out
         self._quick_cancelled = False
-        self.quick_job = ExportJob(build_commands(self.info, rng[0], rng[1], out, s), rng[1] - rng[0], self,
-                                   cwd=command_cwd(s))
+        try:
+            self.quick_job = make_export_job(self.info, rng[0], rng[1], out, s, self)
+        except ValueError as e:
+            QMessageBox.warning(self, "Quick export", str(e))
+            return
         self.quick_job.progress.connect(lambda f: self.qx_progress.setValue(int(f * 1000)))
         self.quick_job.finished.connect(self._quick_done)
         self.qx_label.setText(f"Exporting {'whole video' if whole else 'clip'} \u2192 {os.path.basename(out)}")
@@ -1728,7 +1855,8 @@ class MainWindow(QMainWindow):
         self.stop()
         crop, out_size = self._export_geometry()
         dlg = ExportDialog(self.info, rng[0], rng[1], self._lossless_possible(),
-                           self.rotation, crop, out_size, self.flip, self.color_lut_path, self)
+                           self.rotation, crop, out_size, self.flip, self.color_lut_path, self,
+                           repair=self._repair_export())
         dlg.exported.connect(self._note_export)
         dlg.exec()
 

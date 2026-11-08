@@ -45,6 +45,12 @@ class VideoInfo:
     audio_codec: str = ""
     rotation: int = 0              # clockwise degrees the source asks players to apply
     has_b_frames: int = 0          # decoder reorder delay (frames); 0 = no B-frames
+    rate: str = ""                 # exact frame rate as ffprobe gives it, e.g. "30000/1001"
+    pix_fmt: str = ""
+    color_space: str = ""          # colour tags ("" when the file has none), ffmpeg names
+    color_range: str = ""
+    color_primaries: str = ""
+    color_transfer: str = ""
     keyframes: list[float] = field(default_factory=list)  # sorted pts seconds
     keyframe_dts: dict[float, float] = field(default_factory=dict)  # pts -> dts seconds
 
@@ -118,8 +124,13 @@ def probe_streams(path: str) -> VideoInfo:
     try:
         fr = Fraction(rate)
         info.fps = float(fr) if fr > 0 else 30.0
+        info.rate = f"{fr.numerator}/{fr.denominator}" if fr > 0 else ""
     except (ValueError, ZeroDivisionError):
         info.fps = 30.0
+    info.pix_fmt = vstream.get("pix_fmt", "") or ""
+    for key in ("color_space", "color_range", "color_primaries", "color_transfer"):
+        v = vstream.get(key, "") or ""
+        setattr(info, key, "" if v in ("unknown", "reserved", "unspecified") else v)
     if vstream.get("duration"):
         info.duration = float(vstream["duration"])
     info.start_time = float(vstream.get("start_time", 0) or 0)
