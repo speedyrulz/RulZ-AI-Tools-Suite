@@ -24,14 +24,17 @@ SKIP_DIRS = {".rulz_cache", "excluded_by_look"}  # folders inside a dataset that
 
 
 def skipped(path: Path, root: Path | None = None) -> bool:
-    """True for a file inside a folder that never trains (SKIP_DIRS), below `root` when given."""
-    parts = path.parts
-    if root is not None:
-        try:
-            parts = path.relative_to(root).parts
-        except ValueError:
-            pass
-    return any(p in SKIP_DIRS for p in parts)
+    """True for a file that never trains, below `root` when given: one inside SKIP_DIRS, and any hidden file or
+    folder (a name starting with "."): a NAS's .thumbnails or .@__thumb, a tool's own cache, macOS's ._ copies.
+    (OneTrainer skips hidden folders too, #1303.) Without a root only SKIP_DIRS count, as the dataset's own parent
+    folders may be hidden."""
+    if root is None:
+        return any(p in SKIP_DIRS for p in path.parts)
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        return any(p in SKIP_DIRS for p in path.parts)
+    return any(p in SKIP_DIRS or p.startswith(".") for p in parts)
 
 
 @dataclass

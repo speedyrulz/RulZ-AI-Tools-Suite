@@ -19,8 +19,9 @@ their activations, rulztrainer.checkpointing, are the last ones). The prefetch f
 forward up, the backward's recomputation down.
 
 Costs: the swapped weights in RAM (pinned), and their transfer twice per step (forward and recomputation), mostly
-hidden behind the blocks' compute when the PCIe link keeps up. Not with model_split, data parallel, torch.compile or a
-full fine-tune."""
+hidden behind the blocks' compute when the PCIe link keeps up. Not with model_split, data parallel or a full fine-tune;
+torch.compile only with block_swap_compile (experimental: the swapped blocks compile their forward only, so these
+hooks run eagerly around it)."""
 from __future__ import annotations
 
 import collections

@@ -1,7 +1,8 @@
 """Muon (rulztrainer.optimizers.muon): torch.optim.Muon's update on 2-D weights with match_rms_adamw, the same result
 batched by shape and in small chunks, an update RMS about AdamW's, OFT's blocks as separate matrices, vectors at RMS
 0.2 x lr, LoRA+ groups, weight decay, a resumed state, a trained LoRA, and the config / trainer / fine-tune / WebUI
-wiring."""
+wiring; NorMuon (optimizer normuon): rows evened out with the size kept, its state, resume, and the edge-layer
+warning."""
 import sys
 from pathlib import Path
 
@@ -12,7 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from rulztrainer import lora as lora_mod  # noqa: E402
 from rulztrainer.config import AUTOMAGIC, OPTIMIZERS, TrainConfig  # noqa: E402
-from rulztrainer.optimizers.muon import Muon, adjusted_lr, zeropower_batched  # noqa: E402
+from rulztrainer.optimizers.muon import (Muon, adjusted_lr, normuon_scale, normuon_state_shape,  # noqa: E402
+                                         zeropower_batched)
 from rulztrainer.trainer import build_optimizer, build_scheduler  # noqa: E402
 
 SHAPES = [(8, 32), (8, 32), (32, 8), (16, 16), (8, 32), (24, 40)]
@@ -171,3 +173,56 @@ def test_wiring():
 
     (ex,) = [e for e in webui.EXPERIMENTS if e["key"] == "optimizer"]
     assert "muon" in ex["options"] and "muon" in ex["tested"]
+    assert "normuon" in OPTIMIZERS and "normuon" not in AUTOMAGIC and "normuon" in ex["options"]
+    assert BYTES_PER_PARAM["normuon"] == BYTES_PER_PARAM["muon"]
+
+
+def test_normuon_evens_rows_and_keeps_each_matrix_size():
+    torch.manual_seed(0)
+    o = torch.randn(2, 64, 8) * torch.linspace(0.1, 3.0, 64).view(1, 64, 1)  # tall: rows along the long side
+    v = torch.zeros(normuon_state_shape(2, 64, 8))
+    assert v.shape == (2, 64, 1) and normuon_state_shape(1, 8, 64) == (1, 1, 64)
+    out = normuon_scale(o, v, beta2=0.0)
+    rms = out.square().mean(-1).sqrt()  # [matrix, row]
+    assert (rms.amax(-1) / rms.amin(-1)).max().item() < 1.01  # 30x apart before, within each matrix
+    torch.testing.assert_close(out.norm(dim=(-2, -1)), o.norm(dim=(-2, -1)))
+    wide = torch.randn(1, 8, 64) * torch.linspace(0.1, 3.0, 64).view(1, 1, 64)
+    out = normuon_scale(wide, torch.zeros(1, 1, 64), beta2=0.0)
+    cols = out.square().mean(-2).sqrt()
+    assert (cols.max() / cols.min()).item() < 1.01
+
+
+def test_normuon_steps_state_and_resume():
+    ref, nor = _params(SHAPES + [(4, 6, 6), (16,)]), _params(SHAPES + [(4, 6, 6), (16,)])
+    _run(Muon(ref, lr=1e-2), ref, 3)
+    opt = Muon(nor, lr=1e-2, normuon=True)
+    _run(opt, nor, 3)
+    assert any((a - b).abs().max() > 1e-6 for a, b in zip(ref, nor))  # it changes the update
+    shapes = {tuple(p.shape): tuple(opt.state[p]["normuon_v"].shape) for p in nor if "normuon_v" in opt.state[p]}
+    assert shapes[(8, 32)] == (1, 1, 32) and shapes[(32, 8)] == (1, 32, 1) and shapes[(4, 6, 6)] == (4, 6, 1)
+    assert (16,) not in shapes  # vectors keep muon's rule
+    for p in nor:  # step size: about muon's (the rescale keeps each matrix's size)
+        assert torch.isfinite(p).all()
+    straight, resumed = _params(SHAPES), _params(SHAPES)
+    _run(Muon(straight, lr=1e-2, normuon=True), straight, 4)
+    first = Muon(resumed, lr=1e-2, normuon=True)
+    _run(first, resumed, 2)
+    second = Muon(resumed, lr=1e-2, normuon=True)
+    second.load_state_dict(first.state_dict())
+    _run(second, resumed, 2, first=2)
+    for a, b in zip(straight, resumed):
+        torch.testing.assert_close(a, b)
+
+
+def test_normuon_from_build_optimizer_and_the_edge_layer_warning(caplog):
+    (p,) = _params([(16, 32)])
+    opt = build_optimizer(TrainConfig(optimizer="normuon"), [p])
+    assert isinstance(opt, Muon) and opt.param_groups[0]["normuon"]
+    assert not build_optimizer(TrainConfig(optimizer="muon"), [p]).param_groups[0]["normuon"]
+    with caplog.at_level("WARNING", logger="rulztrainer"):
+        build_optimizer(TrainConfig(optimizer="muon", lora_targets=["q", "embed"]), [p])
+    assert "embed" in caplog.text and "AdamW" in caplog.text
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="rulztrainer"):
+        build_optimizer(TrainConfig(optimizer="muon"), [p])
+    assert "AdamW" not in caplog.text

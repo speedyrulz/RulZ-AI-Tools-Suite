@@ -60,9 +60,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.utils.checkpoint import checkpoint
 
 from ..attention import sdpa
+from ..checkpointing import checkpointed
 from ..compiling import thread_prepare
 
 VIDEO_TAG, TEXT_TAG, AUDIO_TAG = 0, 1, 2  # the pipeline's modality tags (they index the AdaLN table)
@@ -421,7 +421,7 @@ class MiniMaxH3Transformer(nn.Module):
         thread_prepare()  # dynamo's limits in this thread (autograd recompute, data-parallel workers)
         if (self.gradient_checkpointing and self.training and torch.is_grad_enabled()
                 and not getattr(block, "keep_activations", False)):  # see rulztrainer.checkpointing
-            return checkpoint(block, *args, use_reentrant=False)
+            return checkpointed(self, block, *args)
         return block(*args)
 
     # ---- time

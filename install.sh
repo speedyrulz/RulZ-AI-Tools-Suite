@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # RulzTrainer installer for Linux (desktop or server). Creates ./venv, installs CUDA PyTorch and the requirements.
-#   ./install.sh                                        # cu128 wheels (RTX 30/40/50 series, driver >= 570)
+#   ./install.sh                                        # cu128 wheels (RTX 30/40/50 series, driver >= 570);
+#                                                       # cu126 when the driver is older (scripts/torch_index.py)
 #   ./install.sh https://download.pytorch.org/whl/cu130 # another PyTorch index
 #   ./install.sh system                                 # keep the torch already installed in the active Python
 #                                                       # (e.g. vast.ai / cloud images with /venv/main)
 set -eo pipefail
 cd "$(dirname "$0")"
-TORCH_INDEX="${1:-https://download.pytorch.org/whl/cu128}"
+TORCH_INDEX="${1:-}"
+if [ -z "$TORCH_INDEX" ]; then  # a newer CUDA build than the driver runs installs but sees no GPU
+    TORCH_INDEX="$(python3 scripts/torch_index.py --default cu128 || echo https://download.pytorch.org/whl/cu128)"
+fi
 
 if [ "$TORCH_INDEX" = "system" ]; then
     PY="$(command -v python3 || command -v python)"

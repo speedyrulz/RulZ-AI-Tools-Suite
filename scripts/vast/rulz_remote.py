@@ -307,14 +307,25 @@ def tar_info_for_instance(info: tarfile.TarInfo) -> tarfile.TarInfo:
     return info
 
 
-def send(remote: Remote, items: list[tuple[Path, str]], target: str) -> None:
-    """Stream local paths, each with its name in the archive, into a folder on the instance."""
+def without_hidden(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+    """tar_info_for_instance, leaving out anything below the sent item whose name starts with "." (a hidden folder
+    is skipped whole): a dataset's .rulz_cache of latents and text features, which can be gigabytes, and a NAS's
+    .thumbnails. The instance encodes its own cache."""
+    if any(part.startswith(".") for part in info.name.split("/")[1:]):
+        return None
+    return tar_info_for_instance(info)
+
+
+def send(remote: Remote, items: list[tuple[Path, str]], target: str, hidden: bool = True) -> None:
+    """Stream local paths, each with its name in the archive, into a folder on the instance; hidden=False leaves
+    out hidden files and folders below each item."""
     quoted = shlex.quote(target)
     proc = subprocess.Popen(remote.command(f"mkdir -p {quoted} && tar -xf - -C {quoted}"), stdin=subprocess.PIPE)
+    keep = tar_info_for_instance if hidden else without_hidden
     try:
         with tarfile.open(fileobj=proc.stdin, mode="w|") as tar:
             for path, name in items:
-                tar.add(path, arcname=name, filter=tar_info_for_instance)
+                tar.add(path, arcname=name, filter=keep)
         proc.stdin.close()
     except OSError:  # the other end went away: its exit status says so below
         pass
@@ -323,12 +334,13 @@ def send(remote: Remote, items: list[tuple[Path, str]], target: str) -> None:
 
 
 def cmd_push(args) -> int:
-    """Copy a local file or folder to a folder on the instance, relative to the install: a dataset, say."""
+    """Copy a local file or folder to a folder on the instance, relative to the install: a dataset, say. Hidden files
+    and folders inside it (its .rulz_cache) stay here unless --with-cache."""
     source = Path(args.source)
     if not source.exists():
         print(f"{source} does not exist", file=sys.stderr)
         return 1
-    send(args.remote, [(source, source.resolve().name)], args.target)
+    send(args.remote, [(source, source.resolve().name)], args.target, hidden=args.with_cache)
     print(f"{source} -> {args.target}/{source.resolve().name}")
     return 0
 
@@ -446,6 +458,8 @@ def parser() -> argparse.ArgumentParser:
     p = command("push", cmd_push)
     p.add_argument("source")
     p.add_argument("target", help="folder on the instance, relative to the install: datasets, say")
+    p.add_argument("--with-cache", action="store_true",
+                   help="also send hidden files and folders, the dataset's .rulz_cache among them")
     p = command("sync", cmd_sync)
     p.add_argument("--force", action="store_true", help="even while a job runs")
     p.add_argument("--restart-webui", action="store_true", help="restart the WebUI on the new code")

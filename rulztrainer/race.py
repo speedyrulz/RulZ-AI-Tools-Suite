@@ -77,7 +77,7 @@ RACE_KEYS: dict[str, tuple[str, ...]] = {
         "loss_watch_healthy_mult", "loss_watch_exclude_after"),
     "LoRA rank & layers": (
         "lora_rank", "lora_alpha", "lora_targets", "lora_blocks", "train_text_embedder", "lora_dropout",
-        "network_type", "lokr_factor", "oft_block_size", "oft_constraint", "dora"),
+        "network_type", "lokr_factor", "oft_block_size", "oft_constraint", "oft_scaled_lr", "dora"),
     "Data & augmentation": ("caption_dropout", "flip_augment", "crop_augment", "crop_augment_weight", "look_warmup",
                             "look_warmup_start", "look_warmup_epochs"),
     # read at every step: the run needs isolation on (the pairs and DOP captions are prepared once for everyone)
