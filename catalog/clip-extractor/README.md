@@ -4,7 +4,10 @@
 
 A small Windows video trimmer: frame-accurate stepping, keyframe navigation,
 In/Out marks, and export either **lossless** (stream copy, when In and Out are
-on keyframes) or **re-encoded with NVIDIA NVENC** to MP4.
+on keyframes) or **re-encoded with NVIDIA NVENC** to MP4. The
+[Distortion repair](#distortion-repair) window brings the lens, perspective and
+horizon corrections of RulZ Image Distortion Repair to every clip and frame you
+export.
 
 | Dark | Light |
 | --- | --- |
@@ -37,7 +40,9 @@ To build that zip yourself:
 ## Run
 
 Double-click `run.bat`. It creates a `.venv` on first run, installs the
-dependencies from `requirements.txt` (PySide6, PyAV, numpy), and starts the app.
+dependencies from `requirements.txt` (PySide6, PyAV, numpy, OpenCV), and starts
+the app. When `requirements.txt` changes (an update added a package), the next
+start installs it.
 You can also pass a video: `run.bat "C:\path\to\video.mp4"`.
 
 Manual alternative:
@@ -73,6 +78,7 @@ python -m venv .venv
 | Toggle crop box     |        | C             |
 | Toggle fixed length |        | L             |
 | Match colour to reference photo | | B        |
+| Distortion repair   |        | D             |
 | Move clip box (fixed length) |  | Ctrl + the playback keys |
 | Next clip (fixed length) |   | N             |
 
@@ -86,6 +92,16 @@ Click or drag on the timeline to seek. Light ticks on the timeline are
 keyframes. A red "● keyframe" tag shows next to the time when the current
 frame is a keyframe. The In/Out range is shaded dark red, with a white IN and
 a red OUT marker.
+
+A video shows as soon as it opens; the keyframes are found in the background
+(about a second per 400 MB) and the status bar says "finding keyframes…" until
+then. Keyframe stepping and lossless export become available when the scan is
+done. On video where an exact seek is slow (typically 4K), dragging along the
+timeline or dragging the fixed-length box shows the nearest earlier keyframe
+while the mouse moves and the exact frame as soon as you let go.
+
+The preview converts colours the way players do: with the video's own colour
+matrix, and BT.709 for untagged video from 720 lines up.
 
 ## Saving a frame
 
@@ -173,6 +189,62 @@ video starts clean. The last reference photo is remembered.
 `samples/skin_cast.mp4` is a deliberately blue, under-exposed version of
 `samples/skin_reference.png`; matching the two recovers the original skin tone.
 
+## Distortion repair
+
+Press **D** (or "Distortion repair…" on the crop row) to open the adjustments
+of RulZ Image Distortion Repair in their own window, on the frame you are
+looking at. The window has that app's correction palette, canvas tools and
+layout:
+
+![The Distortion repair window: Auto perspective has straightened a building's leaning sides and the automatic crop has removed the empty corners](docs/screenshots/distortion-repair.png)
+
+| Panel | What it does |
+|---|---|
+| Distortion | Manual barrel / pincushion / fisheye correction, intensity 0–100 |
+| Volume deformation | Wide-angle stretch correction: horizontal/vertical (cylindrical) or diagonal (spherical) |
+| Perspective | Auto (verticals & horizontals, verticals only, horizontals only), or draw 2 verticals, 2 horizontals, a rectangle or 8 points; intensity, up/down, left/right and H/V ratio |
+| Reshape | Mesh warp on a 4×4 to 32×32 grid: free transform, perspective and anamorphosis modes |
+| Horizon | Auto, or draw a line that should be level (or upright); angle −90° to 90° |
+| Crop | Automatic crop to the largest area without empty corners (on by default), or a manual crop with an aspect ratio |
+| Miniature effect | Tilt-shift blur with a draggable sharp band, blur intensity and bokeh shape |
+
+The header switch turns a panel on or off and ↺ resets it; **Reset all**
+clears everything. Canvas tools (perspective lines, horizon line, reshape grid,
+crop, miniature band) show their options along the bottom: **Enter** or Apply
+keeps the change, **Esc** or Reset drops it. Ctrl+Z / Ctrl+Y undo and redo,
+"Show original" compares, Fit / 1:1 / Grid help you look closely. Double-click
+a slider to restore its default.
+
+**Save** closes the window and makes the adjustments part of the view: the
+preview (also while playing), frame PNGs and every export use them, and a red
+"distortion repaired" label appears (its tooltip lists what is on). Open the
+window again to change them, or press **Clear** to remove them. **Cancel** (or
+Esc) closes without saving and asks first if you changed anything. Opening
+another video starts clean.
+
+- **Reuse**: "Save to file…" writes the adjustments to a `.json` file and
+  "Load from file…" reads one back. "Use last saved" loads whatever you saved
+  most recently, from any video (a lens correction for your camera, say).
+- **Crop box**: the main window's crop box works on the corrected picture.
+  When the repair crops away empty corners, the frame gets a little smaller and
+  the crop box is fitted inside it.
+- **Rotation and flip**: the adjustments stay on the picture they were drawn
+  on. Rotating or flipping afterwards turns the corrected picture as a whole,
+  and reopening the window shows the frame the way it was turned when you made
+  them.
+- **Exports**: re-encode only (lossless is unavailable while the repair is
+  on). ffmpeg decodes the clip, every frame is corrected in Python, and a
+  second ffmpeg encodes it with NVENC; cuts, audio, crop, scale, colour match
+  and frame rate work as in any NVENC export. It is slower than a plain export
+  (about 10 frames a second for 4K on a fast CPU). The output keeps the
+  source's colour tags. Variable-frame-rate video comes out at a constant rate
+  (the source's average when the frame rate is "Same as source").
+- File names get `_repair`: `<video>_clip_1_00-3_00_repair.mp4`,
+  `<video>_<time>_f123_repair.png`.
+
+Automatic lens-profile correction is not available (video has no lens data);
+use the manual Distortion panel.
+
 ## Fixed-length clips
 
 Press **L** (or the Fixed length button) to pick a clip by length instead of
@@ -230,7 +302,7 @@ window without choosing keeps Dark.
   Untick "Use the same settings as Export" to give it its own codec, CQ,
   preset, audio and frame rate. "Cut losslessly … when the clip allows it"
   makes Quick export stream-copy instead of re-encoding when the selection is
-  keyframe-aligned and no crop, flip or colour match is active.
+  keyframe-aligned and no crop, flip, colour match or distortion repair is active.
 - **Crop & clip**: the aspect ratio the crop box starts locked to, and the
   default fixed clip length in seconds or frames.
 - **Output**: save next to the source video or to a chosen folder.
@@ -255,11 +327,17 @@ path; that file is used instead.
   boundary. Pressing O on the very last frame includes it (Out = end of video).
 - If In and Out are both keyframes (or the start/end of the file), the export
   dialog offers **Lossless**: all streams are stream-copied with no
-  re-encoding, into the same container type as the source.
+  re-encoding, into the same container type as the source. Cuts land exactly
+  on In and Out in MP4, MOV, MKV, WebM, MPEG-TS, FLV and AVI. HEVC encoded with
+  open GOPs (x265's default) can lose the last few frames before Out, because
+  the frames just before a keyframe there depend on that keyframe.
 - Otherwise the export re-encodes with **NVENC** (h264, hevc, or av1) to MP4.
   Cut points are frame-accurate. Audio is copied when MP4-compatible,
   otherwise converted to AAC. Quality is controlled by the CQ value
   (lower = better; default 18, 18–24 is typical).
+- The export dialog suggests a file name that is not taken yet, asks before
+  replacing an existing file, and refuses to write over the source video
+  (also when the path differs only in letter case).
 - The NVENC options also include a **Frame rate** box, which defaults to
   **24**. "Same as source" keeps the original timing; picking or typing a rate
   (24, 30, 60, 24000/1001, 48, ...) resamples the clip by duplicating or
@@ -305,6 +383,10 @@ clips exported before this fix, this repairs one without touching the video:
 - `simplecut/assets/` — logo, icon and theme images
 - `packaging/` — Windows release build script and the notices shipped in the zip
 - `simplecut/colormatch.py` — skin-tone matching maths and dialog
+- `simplecut/repair/` — Distortion repair: `core/` and `ui/` are copies of RulZ
+  Image Distortion Repair's modules (same file names), `window.py` the
+  adjustments window, `pipeline.py` applies saved adjustments to frames,
+  `export.py` the decode → correct → encode export
 
 ## License
 

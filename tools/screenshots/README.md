@@ -115,7 +115,8 @@ used, so no model is loaded. `02` and `03` open the `Hillside` picture (`--close
 "C:\simplest-video-edit\.venv\Scripts\python.exe" -B capture_clip_extractor.py --config R:\ce-config --out R:\out\clip-extractor
 ```
 
-`01-crop-and-fixed-length.png` is the repo's `docs\screenshot.png`, copied. The others use the repo's own
+`01-crop-and-fixed-length.png` is the repo's `docs\screenshot.png`, copied, and `05-distortion-repair.png` is the
+repo's `docs\screenshots\distortion-repair.png`, re-saved (a drawn building facade, no real footage). The others use the repo's own
 `samples\test_pattern_10s.mp4` and `samples\skin_cast.mp4` + `skin_reference.png` (a drawn cartoon face). The
 app's QSettings (registry) are swapped for an .ini in `--config`, so default preferences are shown and the
 registry is left alone. Modal dialogs are captured from a timer inside their own event loop and then
