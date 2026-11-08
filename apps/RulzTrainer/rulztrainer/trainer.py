@@ -27,7 +27,7 @@ from . import profiling
 from . import race as race_mod
 from .ema import LoraEMA
 from . import quant as Q
-from .config import AUTOMAGIC, KEEL, TrainConfig, keel_band_weights, keel_consensus_mode
+from .config import AUTOMAGIC, KEEL, MUON_EDGE_TARGETS, TrainConfig, keel_band_weights, keel_consensus_mode
 from .config import side_to_mp
 from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, describe_sides, dropout_text_path,
                       items_for_side, load_batch,
@@ -375,10 +375,17 @@ def build_optimizer(cfg: TrainConfig, params, pairs=None, ref_norms=None, scales
         import bitsandbytes as bnb
 
         return bnb.optim.AdamW8bit(params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay, betas=(0.9, 0.99))
-    if name == "muon":  # LoRA+ groups keep their own lr: lora_up's step is ratio x lora_down's, as under AdamW
+    if name in ("muon", "normuon"):  # LoRA+ groups keep their own lr: lora_up's step is ratio x lora_down's
         from .optimizers.muon import Muon
 
-        return Muon(params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+        edge = sorted(set(cfg.resolved_lora_targets()) & set(MUON_EDGE_TARGETS))
+        if edge:
+            log.warning("%s orthogonalizes the %s layers like the blocks' (untested): Muon's authors, Moonshot and "
+                        "OneTrainer keep embedders, the timestep modulation, the text projection and the final layer "
+                        "on AdamW. Race it against %s without them if they matter.", name, ", ".join(edge), name)
+        if name == "normuon":
+            log.info("normuon is experimental and untested in RulzTrainer")
+        return Muon(params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay, normuon=name == "normuon")
     if name == "adafactor":
         from transformers.optimization import Adafactor
 
@@ -574,6 +581,7 @@ class Trainer(RaceParallelMixin):
         self.dop_values: list[float] = []  # DOP losses since the last log line
         self.ft = None  # finetune.FineTuner while a full fine-tune runs
         self.block_swap = None  # blockswap.BlockSwap when block_swap is on
+        self.act_offload: list = []  # actoffload.ActivationOffload per model copy when activation_offload is on
         self.ft_rotate_steps = 1
         self.ft_pending_save = False
         self.ft_window = 0
@@ -1045,6 +1053,15 @@ class Trainer(RaceParallelMixin):
             log.info("Resumed %d LoRA modules from %s", n, cfg.resume_from)
         if cfg.block_swap > 0:
             self._setup_block_swap(cfg, model)
+        self.act_offload = []
+        if cfg.activation_offload:
+            from .actoffload import ActivationOffload
+
+            for m, _, _ in self.replicas:
+                m.activation_offload = ActivationOffload()
+                self.act_offload.append(m.activation_offload)
+            log.warning("activation_offload is experimental and untested: checkpointed blocks' inputs wait in pinned "
+                        "RAM until the backward. Check the step time and peak VRAM against a run without it")
         if self.ft is not None:
             params, optimizer, scheduler = self._finetune_setup(cfg, items)
         elif self.race_rows is None:
@@ -1119,8 +1136,13 @@ class Trainer(RaceParallelMixin):
             do_compile, why = False, "race_parallel trains the model copies in threads at once"
         if self.ft is not None and do_compile:
             do_compile, why = False, "a fine-tune swaps its layers in and out of the model"
-        if self.block_swap is not None and do_compile:
-            do_compile, why = False, "block swap streams the blocks' weights in and out"
+        if self.block_swap is not None and do_compile and not cfg.block_swap_compile:
+            do_compile, why = False, ("block swap streams the blocks' weights in and out (block_swap_compile: true "
+                                      "compiles with it, experimental)")
+        elif self.block_swap is not None and do_compile:
+            log.warning("block_swap_compile is experimental and untested: each block's forward is compiled, the swap "
+                        "hooks run outside it. Check the compile report for recompiles and the step time against a "
+                        "run without it")
         if do_compile and any(c.optimizer.lower() in KEEL and c.keel_face_gain > 0 for c in
                               ([r[1] for r in self.race_rows] if self.race_rows is not None else [cfg])):
             do_compile, why = False, "Keel's face-token gain hooks the LoRA layers' outputs (keel_face_gain)"
@@ -1218,6 +1240,8 @@ class Trainer(RaceParallelMixin):
         compute_done = 0  # optimizer steps of every configuration (a race trains several)
         step_times: list[float] = []  # seconds per optimizer step, training only (no saves, samples or probes)
         profile_at = profiling.requested_step()
+        snapshot_at = profiling.requested_step("RULZ_MEMORY_SNAPSHOT_STEP")
+        peak_ram = profiling.PeakRam().start()
 
         def work(job):
             """Forward + backward for one model copy on its device. Returns (loss value, per-image multipliers,
@@ -1354,6 +1378,9 @@ class Trainer(RaceParallelMixin):
             prof = profiling.StepProfile(self.job_dir, step + 1, self.devices) if step + 1 == profile_at else None
             if prof is not None:
                 prof.start()
+            snap = profiling.MemorySnapshot(self.job_dir, step + 1) if step + 1 == snapshot_at else None
+            if snap is not None:
+                snap.start()
             optimizer.zero_grad(set_to_none=True)
             if self.id_align_opt is not None:
                 self.id_align_opt.zero_grad(set_to_none=True)
@@ -1431,6 +1458,8 @@ class Trainer(RaceParallelMixin):
                     self.dp.zero_grads()  # the replicas' too: reduce_grads never ran for this step
                 if prof is not None:
                     prof.stop(None)
+                if snap is not None:
+                    snap.stop("_oom")
                 if not self._shrink_kept_blocks():
                     raise
                 retry_jobs = (per_rep, step_images)  # the same images, not the next ones from the iterator
@@ -1476,8 +1505,16 @@ class Trainer(RaceParallelMixin):
                 self.dp.sync_weights()
             step += 1
             compute_done += 1
+            if self.act_offload and compute_done in (1, 3):  # step 1 may include the checkpoint calibration
+                log.info("Activation offload: %.2f GB of block inputs sent to RAM in step %d",
+                         sum(o.take_bytes() for o in self.act_offload) / 1e9, step)
+            elif self.act_offload:
+                for o in self.act_offload:
+                    o.take_bytes()
             if prof is not None:
                 prof.stop(time.perf_counter() - t_step)
+            if snap is not None:
+                snap.stop()
             step_times.append(time.perf_counter() - t_step)
             if self.balancer is not None:
                 if compute_done > 2 and not compiled_now:  # warm-up and compiling steps are not the GPUs' speed
@@ -1538,7 +1575,7 @@ class Trainer(RaceParallelMixin):
                                loss=accum_loss, avg_loss=avg, elapsed=elapsed, eta=eta, lr=lr_now,
                                losses=losses[-2000:], step_times=[round(t, 3) for t in step_times[-2000:]],
                                grad_norm=grad_norm, grad_norms=round_norms(grad_norms[-2000:]),
-                               grad_clip=cfg.clip_norm, peak_mem=peak, **id_extra)
+                               grad_clip=cfg.clip_norm, peak_mem=peak, peak_ram=peak_ram.peak_gb(), **id_extra)
             if self.loss_watch is not None and self.loss_watch.epoch_complete():
                 summary = self.loss_watch.end_epoch(step)
                 log.info("Loss watch epoch %d: %s (median residual %.3f, %d/%d active)", summary["epoch"],
@@ -1620,6 +1657,9 @@ class Trainer(RaceParallelMixin):
             self._race_decide()
             self._race_report()
         self._log_hull_report(optimizer)
+        peak_ram.stop()
+        log.info("Peak RAM: %.1f GB (this process's private memory, block swap and caches included; the system and "
+                 "the page cache need more)", peak_ram.peak_gb())
         if cfg.reward_steps > 0 and not self.stop_file.exists():
             path = self._reward_stage(model, injected, step) or path
         self.status.update(stage="finished", done=True)
@@ -1884,9 +1924,17 @@ class Trainer(RaceParallelMixin):
         try:
             compiling.prepare(fall_back, shape_swaps)  # raised recompile limits, dynamo warnings in train.log
             blocks = [b for b in self.arch.compile_blocks(model) if not getattr(b, "_rz_tapped", False)]
+            swapped = 0
             for block in blocks:
-                block.compile(backend="inductor", dynamic=True)
-            log.info("Compiled %d DiT blocks with torch.compile (first steps will be slow)", len(blocks))
+                if hasattr(block, "_rz_swap_index"):
+                    # block swap's hooks (CUDA streams, events, weights swapped in and out) must run eagerly:
+                    # block.compile() would trace them with the forward, so only the forward is compiled
+                    block.forward = torch.compile(block.forward, backend="inductor", dynamic=True)
+                    swapped += 1
+                else:
+                    block.compile(backend="inductor", dynamic=True)
+            log.info("Compiled %d DiT blocks with torch.compile (first steps will be slow)%s", len(blocks),
+                     f"; {swapped} swapped blocks: their forward only" if swapped else "")
             return True
         except Exception as e:  # noqa: BLE001
             log.warning("torch.compile failed (%s); running without compile", e)
@@ -2503,10 +2551,18 @@ class Trainer(RaceParallelMixin):
             log.info("%s: an adaptive lr per layer type (%s)", cfg.optimizer, ", ".join(
                 f"{g['name']} {sum(p.numel() for p in g['params']) / 1e6:.1f}M" for g in groups))
         else:
-            groups = lora_mod.lora_param_groups(injected, cfg.learning_rate, cfg.lora_plus_ratio)
-            if len(groups) > 1:
-                log.info("LoRA+: lora_up lr = %.2e (x%g), lora_down lr = %.2e", groups[1]["lr"], cfg.lora_plus_ratio,
-                         groups[0]["lr"])
+            oft_scaled = bool(cfg.oft_scaled_lr) and cfg.optimizer.lower() not in AUTOMAGIC + ("hull",)
+            if cfg.oft_scaled_lr and not oft_scaled and cfg.network_type == "oft":
+                log.warning("oft_scaled_lr is ignored with %s (it sets its own step sizes)", cfg.optimizer)
+            groups = lora_mod.lora_param_groups(injected, cfg.learning_rate, cfg.lora_plus_ratio, oft_scaled=oft_scaled)
+            named = {g["name"]: g for g in groups}
+            if "lora_up" in named:
+                log.info("LoRA+: lora_up lr = %.2e (x%g), lora_down lr = %.2e", named["lora_up"]["lr"],
+                         cfg.lora_plus_ratio, named["lora_down"]["lr"])
+            oft_groups = [g for g in groups if g["name"].startswith("oft_b")]
+            if oft_groups:
+                log.info("Scaled OFT (experimental): %s", ", ".join(
+                    f"block {g['name'][5:]} lr {g['lr']:.2e} ({len(g['params'])} layers)" for g in oft_groups))
         hull = self._hull_inputs(injected) if cfg.optimizer.lower() == "hull" else {}
         optimizer = build_optimizer(cfg, groups, pairs=lora_mod.lora_pairs(injected), **hull)
         return optimizer, build_scheduler(cfg, optimizer)

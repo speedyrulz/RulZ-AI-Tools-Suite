@@ -9,6 +9,10 @@ __version__ = "0.1.0"
 # them; a value already set wins. (Found by Fizgig, 9.2.0.)
 _os.environ.setdefault("ORT_DISABLE_TELEMETRY", "1")
 _os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+# Hugging Face downloads: hf_xet raises its number of parallel connections up to 64 while a file downloads, which
+# saturates a home connection (everything else on it stalls). A fixed 8 stops that and still fills a fast link; set
+# HF_XET_FIXED_DOWNLOAD_CONCURRENCY yourself for another value. (Found by OneTrainer, #1656.)
+_os.environ.setdefault("HF_XET_FIXED_DOWNLOAD_CONCURRENCY", "8")
 
 
 def onnxruntime_telemetry_off() -> None:

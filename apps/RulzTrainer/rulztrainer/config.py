@@ -25,7 +25,11 @@ MODEL_PRESETS = {
     "MiniMax-H3-Ref2VA": "MiniMaxAI/MiniMax-H3#ref2va",
 }
 ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21", "flux3_klein", "flux2_klein", "minimax_h3")
-OPTIMIZERS = ("adamw", "adamw8bit", "adafactor", "automagic3", "automagic4", "keel", "keel_fb", "hull", "muon")
+OPTIMIZERS = ("adamw", "adamw8bit", "adafactor", "automagic3", "automagic4", "keel", "keel_fb", "hull", "muon",
+              "normuon")
+# Layer groups Muon's authors, Moonshot and OneTrainer keep on AdamW (embedders, modulation, text projection, final
+# layer): RulzTrainer's muon / normuon orthogonalize them too and warn when they are trained.
+MUON_EDGE_TARGETS = ("embed", "modulation", "text_in")
 AUTOMAGIC = ("automagic3", "automagic4", "keel", "keel_fb")  # self-tuning lr: no schedule, no LoRA+, no per-image lr
 KEEL = ("keel", "keel_fb")  # Keel and its face-and-body version: one class (optimizers/keel.py), keel_fb with the
 #                             body share in the token gain and the magnitude vote in the consensus gate
@@ -404,6 +408,12 @@ class TrainConfig:
     multi_gpu: str = "off"  # off | data_parallel (model copy per GPU, faster) | model_split (blocks across GPUs, memory only)
     devices: str = "cuda:0,cuda:1"  # GPUs for multi_gpu; the first is the primary
     block_swap: int = 0  # DiT blocks whose frozen weights stay in RAM and stream to the GPU as they run (blockswap.py)
+    # torch.compile with block swap (experimental, untested): each block's forward is compiled and the swap hooks run
+    # outside it, as OneTrainer does with its offloading. Off: block swap turns compile off.
+    block_swap_compile: bool = False
+    # checkpointed blocks' saved inputs wait in pinned RAM until the backward (experimental, untested; actoffload.py):
+    # frees about tokens x hidden x 2 bytes per checkpointed block for more kept blocks or less block swap
+    activation_offload: bool = False
     split_plan: str = ""  # model_split: manual block plan e.g. "cuda:0=0-25;cuda:1=26-41"; empty = auto-balance
     parallel_jobs: bool = True  # multi_gpu: split samples, probes, latent/text caching and SAM 3 masks across the GPUs
     dp_balance: str = "auto"  # data_parallel batches per GPU and step by measured speed: off (lockstep) | auto (same
@@ -492,6 +502,7 @@ class TrainConfig:
     #                           character LoRAs: docs/keel-optimizer.md) | keel_fb (Keel for the face and the body
     #                           alike: the body share in the token gain, the magnitude vote in the consensus gate)
     #                           | hull | muon (orthogonalized momentum, step matched to AdamW's: AdamW's rates apply)
+    #                           | normuon (muon with each row's step evened out; experimental, untested)
     weight_decay: float = 0.01
     automagic_min_lr: float = 1e-8  # automagic3/4: hard floor for the adapted lr
     automagic_max_lr: float = 1e-3  # automagic3/4: hard ceiling for the adapted lr (about 10x the start lr)
@@ -647,6 +658,10 @@ class TrainConfig:
     lokr_factor: int = 8  # LoKr: w1 is [a, b] with a, b the largest divisors of out / in <= this (8: Fizgig's default)
     oft_block_size: int = 32  # OFT: rotation block size (the largest divisor of each layer's outputs <= this)
     oft_constraint: float = 0.0  # OFT: cap on the rotation's size (COFT; the file's .alpha); 0 = none
+    # OFT: an lr per block size, sqrt(31 / (block - 1)) x learning_rate, so a block of any size moves about as far per
+    # step as a block of 32 (OneTrainer's Scaled OFT, as an lr factor: the saved file is unchanged). Off: one lr, and
+    # bigger blocks step further (64: about 2x 16's). Experimental; not with the self-tuning optimizers or hull.
+    oft_scaled_lr: bool = False
     dora: bool = False  # DoRA on a LoRA or LoKr: the weight split into a trained magnitude and a direction
     # --- identity training: automatic crops ---
     crop_augment: str = "none"  # none | face | face+bust: add face / bust crops of each image as extra items
@@ -1032,6 +1047,9 @@ class TrainConfig:
             if not self.gradient_checkpointing:
                 raise ValueError("block_swap needs gradient_checkpointing (without it every swapped block's weights "
                                  "stay on the GPU until the backward)")
+        if self.activation_offload and not self.gradient_checkpointing:
+            raise ValueError("activation_offload moves checkpointed blocks' inputs to RAM: it needs "
+                             "gradient_checkpointing")
         if self.timestep_sampling == "logsnr" and self.logsnr_std <= 0:
             raise ValueError("logsnr_std must be above 0")
         if self.timestep_buckets < 0 or self.timestep_buckets == 1:

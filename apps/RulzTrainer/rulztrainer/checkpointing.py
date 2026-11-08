@@ -15,8 +15,20 @@ from __future__ import annotations
 from typing import Iterable
 
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 GB = 1024 ** 3
+
+
+def checkpointed(owner: nn.Module, fn, *args):
+    """checkpoint(fn, *args), non-reentrant, as every family's block runner calls it; with an ActivationOffload on
+    `owner.activation_offload` (activation_offload: true, rulztrainer.actoffload) the inputs it saves for the backward
+    wait in RAM."""
+    off = getattr(owner, "activation_offload", None)
+    if off is None or not off.enabled:
+        return checkpoint(fn, *args, use_reentrant=False)
+    with off.hooks():
+        return checkpoint(fn, *args, use_reentrant=False)
 
 
 def set_kept_blocks(model: nn.Module, indices: Iterable[int]) -> int:

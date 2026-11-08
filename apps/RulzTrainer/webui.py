@@ -1422,6 +1422,7 @@ class Form:
             lora_rank=int(v("lora_rank")), lora_alpha=float(v("lora_alpha")),
             network_type=v("network_type"), lokr_factor=int(v("lokr_factor") or 8),
             oft_block_size=int(v("oft_block_size") or 32), oft_constraint=float(v("oft_constraint") or 0.0),
+            oft_scaled_lr=bool(v("oft_scaled_lr")),
             dora=bool(v("dora")),
             finetune=bool(v("finetune")), finetune_rotate_epochs=float(v("finetune_rotate_epochs") or 1),
             finetune_window_gb=float(v("finetune_window_gb") or 0), finetune_reserve_gb=float(v("finetune_reserve_gb") or 0),
@@ -1460,7 +1461,8 @@ class Form:
             timestep_shift=float(v("timestep_shift")), timestep_buckets=int(v("timestep_buckets") or 0),
             sigmoid_scale=float(v("sigmoid_scale")),
             logsnr_mean=float(v("logsnr_mean")), logsnr_std=float(v("logsnr_std")),
-            block_swap=int(v("block_swap") or 0),
+            block_swap=int(v("block_swap") or 0), block_swap_compile=bool(v("block_swap_compile")),
+            activation_offload=bool(v("activation_offload")),
             clean_share=str(v("clean_share") or "").strip(),
             logit_mean=float(v("logit_mean")), logit_std=float(v("logit_std")), loss_weighting=v("loss_weighting"),
             loss_type=v("loss_type") or "mse",
@@ -4695,12 +4697,13 @@ EXPERIMENTS = [
     {"key": "optimizer", "group": "Adapter and optimizer", "title": "Optimizer", "off": "adamw8bit",
      "control": "select", "options": {"adamw8bit": "adamw8bit (default)", "adamw": "adamw", "adafactor": "adafactor",
                                       "automagic3": "automagic3", "automagic4": "automagic4", "keel": "keel",
-                                      "keel_fb": "keel_fb", "muon": "muon"},
+                                      "keel_fb": "keel_fb", "muon": "muon", "normuon": "normuon (untested)"},
      "evidence": "mixed",
      "short": "Muon or a self-tuning optimizer instead of adamw8bit.",
      "what": "adamw8bit is AdamW with its state in 8 bits (adamw keeps it in full precision; adafactor is lighter). "
              "muon steps each weight matrix as a whole, evening out the update across all its directions, at AdamW's "
-             "learning rates. automagic3 and automagic4 tune their own learning rate as they go; automagic4 adds "
+             "learning rates; normuon (untested) is muon with each row's step evened out, OneTrainer's default "
+             "Muon. automagic3 and automagic4 tune their own learning rate as they go; automagic4 adds "
              "smaller steps for the most sensitive weights. keel is automagic4 with extra machinery aimed at a "
              "character's identity, and keel_fb the same for the face and the body alike.",
      "tested": "keel against adamw8bit, two seeds on one small set on Krea 2 at gradient accumulation 1: a repeated "
@@ -4711,11 +4714,23 @@ EXPERIMENTS = [
                "is Fizgig's pick for a full fine-tune, not tested for LoRAs. muon: Fizgig measured it level with "
                "AdamW on likeness (Qwen-Image 2.1, rank 8, 20 epochs) and made it every picture model's LoRA default "
                "for sharper fine detail by eye; a study of Muon on LoRA factors for language models found no gain "
-               "over Adam. Not raced here yet.",
+               "over Adam. Not raced here yet. normuon has never run in a real training here.",
      "cost": "automagic4 took 1.6 s a step against automagic3's 2.2 s. The learning-rate schedule, LoRA+ and the "
              "per-image learning rate do not apply to the automagic family. Keel's consensus gate wants gradient "
              "accumulation of 2 or more. muon keeps one full-precision number per weight (less than adamw, a "
-             "little more than adamw8bit) and takes AdamW's learning rate as it is."},
+             "little more than adamw8bit) and takes AdamW's learning rate as it is; normuon the same plus one "
+             "number per row."},
+    {"key": "oft_scaled_lr", "group": "Adapter and optimizer", "title": "Scaled OFT learning rate", "off": False,
+     "control": "switch", "evidence": "untested", "when": lambda wz: wz.w["network_type"].value == "oft",
+     "short": "Every OFT block size steps about as far as a block of 32.",
+     "what": "OFT rotates each layer's outputs in blocks, and at one learning rate a bigger block moves further per "
+             "step (a block of 64 about twice as far as one of 16). This gives each block size its own rate, "
+             "sqrt(31 / (size - 1)) times yours, so block 32 is unchanged and a race of block sizes compares the "
+             "sizes, not step sizes (OneTrainer's Scaled OFT, as a learning-rate factor).",
+     "tested": "Never run in a real training here. The scaling is worked out from how OFT's blocks train, not "
+               "measured.",
+     "cost": "None in speed or memory. Layers whose outputs do not divide by the block size get smaller blocks and "
+             "so a higher rate. Ignored by the self-tuning optimizers and hull."},
     {"key": "isolation", "group": "Likeness boosters", "title": "LoRA Isolation", "off": False, "control": "switch",
      "evidence": "mixed",
      "short": "Keeps the person's face off everyone else in the picture.",
@@ -7045,7 +7060,24 @@ def build_page(local: bool = True):
                                          "the next one copied in while the current one computes. Saves about the "
                                          "blocks' share of the model in VRAM for some speed, depending on the PCIe "
                                          "link. Needs gradient checkpointing; single GPU only; turns torch.compile "
-                                         "off.")
+                                         "off unless the next switch is on.")
+                            w["block_swap_compile"] = ui.switch("Compile with block swap (experimental)",
+                                                                value=d.block_swap_compile) \
+                                .bind_visibility_from(w["multi_gpu"], "value", lambda x: x == "off") \
+                                .tooltip("torch.compile the blocks even with block swap: each block's forward is "
+                                         "compiled and the swap's streaming runs outside it (OneTrainer compiles its "
+                                         "offloaded blocks this way). Could bring compile's 12-26% to runs that swap; "
+                                         "untested in RulzTrainer, so compare the step time and the compile report "
+                                         "with a run without it.")
+                            w["activation_offload"] = ui.switch("Activation offloading (experimental)",
+                                                                value=d.activation_offload) \
+                                .bind_visibility_from(w["gradient_checkpointing"], "value") \
+                                .tooltip("Checkpointed blocks keep their inputs for the backward on the GPU: about "
+                                         "tokens x hidden x 2 bytes each, 0.8 GB over H3's 50 blocks at 1 MP "
+                                         "(estimate). This sends them to RAM during the forward and streams them "
+                                         "back ahead of each block's recomputation, so more blocks can keep their "
+                                         "activations or fewer need swapping, for extra PCIe traffic. Untested in "
+                                         "RulzTrainer.")
                         with advanced():
                             with fields():
                                 w["text_encoder_device"] = ui.select(["auto"] + gpus + ["cpu"], value="auto",
@@ -7355,6 +7387,12 @@ def build_page(local: bool = True):
                                 .tooltip("COFT: caps how far each layer may rotate away from the base model (the "
                                          "norm of its rotation generator), saved as the file's alpha, which ComfyUI "
                                          "applies the same way. 0 = no cap.")
+                            w["oft_scaled_lr"] = ui.checkbox("Scaled OFT lr (experimental)", value=d.oft_scaled_lr) \
+                                .bind_visibility_from(w["network_type"], "value", lambda x: x == "oft") \
+                                .tooltip("An lr per block size, so every block size moves about as far per step as "
+                                         "a block of 32 (OneTrainer's Scaled OFT). Off, a block of 64 steps about "
+                                         "twice as far as one of 16 at the same lr, which skews a race of block "
+                                         "sizes. Block 32 is unchanged. Untested in RulzTrainer.")
                             w["lokr_factor"] = ui.number("LoKr factor", value=d.lokr_factor, min=1, max=64,
                                                          precision=0).classes("w-32") \
                                 .bind_visibility_from(w["network_type"], "value", lambda x: x == "lokr") \
@@ -9643,7 +9681,13 @@ the steps to match. The log says what was measured and chosen.
 *Block swap* (Train tab, memory section; single GPU) keeps the frozen weights of that many DiT blocks in system RAM and
 streams each block's weights to the GPU just before it runs, the next one copied in while the current one computes.
 Measured on Krea 2 int8 with 14 of 28 blocks swapped: the training step's peak went from 10.8 to 7.7 GB at about the
-same step time. It needs gradient checkpointing and turns torch.compile off.
+same step time. It needs gradient checkpointing and turns torch.compile off, unless *Compile with block swap*
+(experimental, untested) is on: then the swapped blocks compile their forward only and the swap runs outside it.
+
+*Activation offloading* (next to gradient checkpointing; experimental, untested) sends each checkpointed block's
+saved inputs to RAM during the forward and streams them back just before that block's recomputation: about 0.8 GB
+less on H3 at 1 MP (estimate), for more kept blocks or less block swap, at the cost of PCIe traffic. Compare the step
+time and peak memory with a run without it. The log ends every run with its peak RAM.
 
 ## Compile
 *Compile model* (Model, Advanced; default auto): torch.compile fuses the small steps between the matrix multiplies
@@ -9687,7 +9731,9 @@ direction of the update gets about the same step and fine detail does not wait b
 is matched to AdamW's, so AdamW's learning rates apply as they are (1e-4 for a LoRA), and the schedule, warm-up, LoRA+
 and the per-image rate work as with AdamW. Fizgig trains every picture model's LoRAs on it since November 2026 (level
 with AdamW on likeness in its test, sharper detail by eye); it is not raced here yet. One full-precision number of
-state per weight.
+state per weight. With *lora_targets* `embed`, `modulation` or `text_in` it warns: Muon's authors and OneTrainer keep
+those layers on AdamW. `normuon` (experimental, never run in a real training here) is Muon with each row's step
+evened out by a running mean of its size (NorMuon, OneTrainer's default Muon): race it before relying on it.
 
 `keel` is Automagic 4 for character LoRAs (`docs/keel-optimizer.md`), with every Automagic 4 setting and two of
 its own: the *Gauge preconditioner* scales each LoRA pair's gradient by the other factor's r x r Gram (Riemannian
@@ -9724,7 +9770,9 @@ default) equal with it, since the lookahead and the best / stop decisions follow
 The *Adapter* field (Train tab, LoRA section) picks what each layer learns. **LoRA**: a rank-r pair. **LoKr**: a
 Kronecker pair (factor 8 is Fizgig's best measured likeness). **OFT**: rotates each layer's output channels in blocks
 (*OFT block size*, 32) instead of adding to the weights, which keeps the base model's structure; the OFT paper found
-better subject identity than LoRA and stable long runs. *OFT constraint* > 0 caps how far a layer rotates. **DoRA**
+better subject identity than LoRA and stable long runs. *OFT constraint* > 0 caps how far a layer rotates.
+*Scaled OFT lr* (experimental, untested) gives each block size its own learning rate so every size moves about as far
+per step as a block of 32 (block 32 itself unchanged). **DoRA**
 (a switch for LoRA and LoKr): a magnitude per input channel trains on its own while the adapter steers the
 direction; steps are about 30 to 40% slower on Krea 2. OFT and DoRA files load in ComfyUI exactly as trained (not in diffusers). To
 compare them, race rows such as `network_type=oft` or `dora=true` against a LoKr row.

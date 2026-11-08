@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import torch
 from torch import nn
-from torch.utils.checkpoint import checkpoint
 
 from ..attention import sdpa
+from ..checkpointing import checkpointed
 from ..compiling import thread_prepare
 
 
@@ -188,7 +188,7 @@ class MOSSImageTransformer(nn.Module):
         thread_prepare()  # dynamo's limits in this thread (autograd recompute, data-parallel workers)
         if (self.gradient_checkpointing and self.training and torch.is_grad_enabled()
                 and not getattr(layer, "keep_activations", False)):  # see rulztrainer.checkpointing
-            return checkpoint(layer, x, rope, mod, use_reentrant=False)
+            return checkpointed(self, layer, x, rope, mod)
         return layer(x, rope, mod)
 
     def forward(self, hidden_states, timestep, encoder_hidden_states, encoder_attention_mask=None,

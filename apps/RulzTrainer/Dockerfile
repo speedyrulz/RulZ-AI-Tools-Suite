@@ -8,6 +8,10 @@
 # cuda-12.8.1-auto = current torch on CUDA 12.8: runs on RTX 30 / 40 / 50 series hosts with driver >= 570.
 FROM vastai/pytorch:cuda-12.8.1-auto
 
+# The build writes to /etc/supervisor and /opt: as root, whatever user the base image ends on (OneTrainer needed this
+# on the same image, #1277; a no-op if it is root already).
+USER root
+
 # the code lands in /opt/workspace-internal and is copied to ${WORKSPACE} (/workspace) on first boot
 COPY . /opt/workspace-internal/RulzTrainer
 RUN . /venv/main/bin/activate && cd /opt/workspace-internal/RulzTrainer \
