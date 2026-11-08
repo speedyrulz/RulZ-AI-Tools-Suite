@@ -151,9 +151,10 @@ def facenet_embedder(models_dir: str | Path = "models", progress=None) -> Embedd
 def load_rgb(path) -> torch.Tensor:
     """[1,3,H,W] in [-1, 1] at full resolution (EXIF-rotated, matching FaceScorer.faces' coordinates)."""
     from PIL import Image, ImageOps
+    from .pictures import to_rgb
 
     with Image.open(path) as im:
-        arr = np.asarray(ImageOps.exif_transpose(im).convert("RGB"), dtype=np.float32)
+        arr = np.asarray(to_rgb(ImageOps.exif_transpose(im)), dtype=np.float32)
     return torch.from_numpy(arr).permute(2, 0, 1)[None] / 127.5 - 1.0
 
 

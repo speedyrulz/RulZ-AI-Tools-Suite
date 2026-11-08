@@ -375,6 +375,10 @@ def build_optimizer(cfg: TrainConfig, params, pairs=None, ref_norms=None, scales
         import bitsandbytes as bnb
 
         return bnb.optim.AdamW8bit(params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay, betas=(0.9, 0.99))
+    if name == "muon":  # LoRA+ groups keep their own lr: lora_up's step is ratio x lora_down's, as under AdamW
+        from .optimizers.muon import Muon
+
+        return Muon(params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
     if name == "adafactor":
         from transformers.optimization import Adafactor
 

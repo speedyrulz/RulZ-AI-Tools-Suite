@@ -25,7 +25,7 @@ MODEL_PRESETS = {
     "MiniMax-H3-Ref2VA": "MiniMaxAI/MiniMax-H3#ref2va",
 }
 ARCH_NAMES = ("moss_image", "fibo2", "krea2", "qwen_image21", "flux3_klein", "flux2_klein", "minimax_h3")
-OPTIMIZERS = ("adamw", "adamw8bit", "adafactor", "automagic3", "automagic4", "keel", "keel_fb", "hull")
+OPTIMIZERS = ("adamw", "adamw8bit", "adafactor", "automagic3", "automagic4", "keel", "keel_fb", "hull", "muon")
 AUTOMAGIC = ("automagic3", "automagic4", "keel", "keel_fb")  # self-tuning lr: no schedule, no LoRA+, no per-image lr
 KEEL = ("keel", "keel_fb")  # Keel and its face-and-body version: one class (optimizers/keel.py), keel_fb with the
 #                             body share in the token gain and the magnitude vote in the consensus gate
@@ -491,6 +491,7 @@ class TrainConfig:
     optimizer: str = "adamw"  # adamw | adamw8bit | adafactor | automagic3 | automagic4 | keel (Automagic 4 for
     #                           character LoRAs: docs/keel-optimizer.md) | keel_fb (Keel for the face and the body
     #                           alike: the body share in the token gain, the magnitude vote in the consensus gate)
+    #                           | hull | muon (orthogonalized momentum, step matched to AdamW's: AdamW's rates apply)
     weight_decay: float = 0.01
     automagic_min_lr: float = 1e-8  # automagic3/4: hard floor for the adapted lr
     automagic_max_lr: float = 1e-3  # automagic3/4: hard ceiling for the adapted lr (about 10x the start lr)

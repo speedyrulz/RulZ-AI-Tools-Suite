@@ -133,6 +133,9 @@ class FaceScorer:
         ok, msg = available()
         if not ok:
             raise RuntimeError(msg)
+        from . import onnxruntime_telemetry_off
+
+        onnxruntime_telemetry_off()  # the Windows builds' switch (the Linux ones read the package's variable)
         from insightface.app import FaceAnalysis
 
         from .downloads import ensure_insightface_pack
@@ -158,9 +161,10 @@ class FaceScorer:
     def _load_bgr(self, path: str | Path) -> tuple[np.ndarray, float]:
         """BGR array for the detector (thumbnailed to 2048 px) and the scale back to source pixels."""
         from PIL import Image, ImageOps
+        from .pictures import to_rgb
 
         with Image.open(path) as im:
-            im = ImageOps.exif_transpose(im).convert("RGB")
+            im = to_rgb(ImageOps.exif_transpose(im))
             scale = 1.0
             if max(im.size) > 2048:  # detector input is resized anyway; keep memory sane
                 full = max(im.size)
@@ -301,9 +305,10 @@ class FaceScorer:
     def crop_face(path: str | Path, bbox, out: Path, pad: float = 0.25) -> Path:
         """Save a padded crop of a bbox (for the reference preview in the UI)."""
         from PIL import Image, ImageOps
+        from .pictures import to_rgb
 
         with Image.open(path) as im:
-            im = ImageOps.exif_transpose(im).convert("RGB")
+            im = to_rgb(ImageOps.exif_transpose(im))
             x0, y0, x1, y1 = bbox
             w, h = x1 - x0, y1 - y0
             box = (max(0, int(x0 - pad * w)), max(0, int(y0 - pad * h)),
