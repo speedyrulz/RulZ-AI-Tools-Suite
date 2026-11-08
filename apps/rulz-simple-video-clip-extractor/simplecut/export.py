@@ -71,6 +71,9 @@ class ExportSettings:
     crop: tuple[int, int, int, int] | None = None   # (x, y, w, h) in the rotated frame
     out_size: tuple[int, int] | None = None         # scale the (cropped) video to (w, h)
     lut_path: str | None = None                     # 1D .cube colour correction (skin-tone match)
+    # Distortion repair (simplecut.repair.export.RepairExport), re-encode only. With it the export
+    # runs through Python (make_export_job), and crop is in the corrected frame.
+    repair: object | None = None
 
 
 def gop_frames(info: VideoInfo, s: ExportSettings) -> int:
@@ -100,6 +103,16 @@ def lossless_seek_nudge(info: VideoInfo) -> float:
     if info.has_b_frames and any(f in info.container.split(",") for f in DTS_SEEKING_FORMATS):
         return DTS_SEEK_HEURISTIC + 0.001
     return 0.0
+
+
+def seek_keyframe(info: VideoInfo, start: float) -> float:
+    """Where a re-encode seeks the input: the keyframe at or before the clip start."""
+    k = info.keyframe_at(start)
+    if k is None:
+        k = info.prev_keyframe(start)
+    if k is None:
+        k = info.start_time
+    return min(k, start)
 
 
 def build_command(info: VideoInfo, start: float, end: float,
@@ -150,12 +163,7 @@ def build_command(info: VideoInfo, start: float, end: float,
         # stream-copied audio packets before the start; an input-only seek would
         # keep every audio packet from the keyframe onward and hide them with an
         # edit list, which some players (MPC-HC, Explorer) report as extra length.
-        k = info.keyframe_at(start)
-        if k is None:
-            k = info.prev_keyframe(start)
-        if k is None:
-            k = info.start_time
-        k = min(k, start)
+        k = seek_keyframe(info, start)
         if hwaccel:
             cmd += ["-hwaccel", "cuda"]
         cmd += ["-ss", f"{max(k - fmt0, 0.0):.6f}", "-i", src,
@@ -245,6 +253,154 @@ def command_text(cmd: list[str]) -> str:
     return " ".join(f'"{c}"' if " " in c else c for c in cmd)
 
 
+# ------------------------------------------------------------- piped export (distortion repair)
+# Distortion repair is a per-pixel remap (plus an optional blur) that ffmpeg's filters can't do,
+# so those exports run two ffmpeg processes with Python in between:
+#   decoder  seek and trim exactly like the NVENC command, the base rotation/flip, the frame
+#            rate, then raw RGB on stdout
+#   Python   the corrections and any later rotation/flip on every frame (repair/export.py)
+#   encoder  raw RGB on stdin plus the source's audio -> crop, colour LUT, scale -> NVENC MP4
+
+# ffprobe colour_space tag -> swscale matrix name
+SWS_MATRIX = {"bt709": "bt709", "smpte170m": "bt601", "bt470bg": "bt601", "bt2020nc": "bt2020",
+              "bt2020c": "bt2020", "smpte240m": "smpte240m", "fcc": "fcc"}
+
+
+def colour_matrix(info: VideoInfo) -> str:
+    """The YUV<->RGB matrix for the RGB round trip: the file's own tag, else what players
+    assume for untagged video (BT.709 from 720 lines up). The preview uses the same rule."""
+    return SWS_MATRIX.get(info.color_space) or ("bt709" if info.height >= 720 else "bt601")
+
+
+def full_range(info: VideoInfo) -> bool:
+    return info.color_range == "pc" or info.pix_fmt.startswith("yuvj")
+
+
+def output_rate(info: VideoInfo, s: ExportSettings) -> str:
+    """Exact frame rate of the exported clip. 'Same as source' becomes the source's average
+    rate here: raw frames carry no timestamps, so variable-rate video comes out constant-rate."""
+    if s.fps:
+        return s.fps
+    if info.rate:
+        return info.rate
+    fr = Fraction(info.fps).limit_denominator(1001)
+    return f"{fr.numerator}/{fr.denominator}"
+
+
+def colour_tags(info: VideoInfo) -> list[str]:
+    """Tag the output like the source. Untagged in, untagged out (as the plain NVENC export)."""
+    if info.color_space not in SWS_MATRIX:
+        return []
+    tags = ["-colorspace", info.color_space, "-color_range", "tv"]
+    if info.color_primaries:
+        tags += ["-color_primaries", info.color_primaries]
+    if info.color_transfer:
+        tags += ["-color_trc", info.color_transfer]
+    return tags
+
+
+def encoder_filters(s: ExportSettings, matrix: str) -> list[str]:
+    """The piped encoder's chain on the corrected RGB frames: crop, LUT, scale, back to YUV."""
+    filters = []
+    if s.crop:
+        x, y, w, h = s.crop
+        filters.append(f"crop={w}:{h}:{x}:{y}")
+    if s.lut_path:
+        from .colormatch import ffmpeg_lut_filter
+        filters.append(ffmpeg_lut_filter(s.lut_path))
+    # accurate_rnd: swscale's fast rounding darkens an RGB round trip by up to ~1.6 levels (green)
+    to_yuv = f"out_color_matrix={matrix}:out_range=limited"
+    if s.out_size:
+        w, h = s.out_size
+        filters.append(f"scale={w}:{h}:flags=lanczos+accurate_rnd+full_chroma_int:{to_yuv}")
+    else:
+        filters.append(f"scale=flags=accurate_rnd+full_chroma_int:{to_yuv}")
+    filters.append("format=yuv420p")
+    return filters
+
+
+def build_piped_commands(info: VideoInfo, start: float, end: float, out_path: str, s: ExportSettings,
+                         base_rotation: int, base_flip: bool, in_size: tuple[int, int],
+                         out_size: tuple[int, int]) -> list[tuple[list[str], list[str]]]:
+    """(decoder, encoder) command pairs to try in order: GPU decoding first, then without.
+
+    base_rotation/base_flip: the orientation the repair adjustments were made in (the decoder
+    applies it; Python applies the corrections and anything rotated or flipped since).
+    in_size: the decoder's frame size; out_size: the corrected frames Python writes."""
+    src = os.path.abspath(info.path)
+    out_path = os.path.abspath(out_path)
+    duration = max(end - start, 0.0)
+    k = seek_keyframe(info, start)
+    fmt0 = info.fmt_start_time
+    offset = max(start - k, 0.0)
+    rate = output_rate(info, s)
+    matrix = colour_matrix(info)
+
+    dec_filters = []
+    if base_rotation:
+        dec_filters.append(ROTATE_FILTERS[base_rotation])
+    if base_flip:
+        dec_filters.append("hflip")
+    dec_filters.append(f"fps={rate}")
+    # The explicit size makes the raw frames exactly what Python expects to read.
+    dec_filters.append(f"scale={in_size[0]}:{in_size[1]}:flags=accurate_rnd+full_chroma_int"
+                       f":in_color_matrix={matrix}:in_range={'full' if full_range(info) else 'limited'}"
+                       f":out_range=full")
+    dec_filters.append("format=rgb24")
+
+    def decoder(hwaccel: bool) -> list[str]:
+        cmd = ["ffmpeg", "-hide_banner", "-nostats", "-loglevel", "error"]
+        if hwaccel:
+            cmd += ["-hwaccel", "cuda"]
+        cmd += ["-ss", f"{max(k - fmt0, 0.0):.6f}", "-i", src, "-ss", f"{offset:.6f}", "-t", f"{duration:.6f}",
+                "-map", "0:v:0", "-vf", ",".join(dec_filters), "-fps_mode", "passthrough",
+                "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+        return cmd
+
+    w, h = in_size
+    ow, oh = out_size
+    if (w, h) == (0, 0):
+        raise ValueError("unknown frame size")
+    audio = s.audio != "none" and info.has_audio
+    enc = ["ffmpeg", "-y", "-hide_banner", "-nostats", "-loglevel", "error",
+           "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{ow}x{oh}", "-framerate", rate]
+    if audio:
+        # The source's audio is seeked to the decoder's keyframe and trimmed on the output side,
+        # like build_command does (so copied audio holds only the clip). The video already starts
+        # exactly at the clip start, so it is shifted to begin where that trim begins; the extra
+        # half millisecond keeps its first frame from rounding to just before the trim point.
+        enc += ["-itsoffset", f"{offset + 0.0005:.6f}"]
+    enc += ["-i", "pipe:0"]
+    if audio:
+        enc += ["-ss", f"{max(k - fmt0, 0.0):.6f}", "-i", src, "-ss", f"{offset:.6f}", "-t", f"{duration:.6f}"]
+    enc += ["-map", "0:v:0", "-c:v", s.codec, "-preset", s.preset,
+            "-rc", "vbr", "-cq", str(s.cq), "-b:v", "0", "-pix_fmt", "yuv420p",
+            "-g", str(gop_frames(info, s))]
+    if s.codec == "hevc_nvenc":
+        enc += ["-tag:v", "hvc1"]
+    enc += ["-vf", ",".join(encoder_filters(s, matrix))]
+    enc += colour_tags(info)
+    if audio:
+        enc += ["-map", "1:a:0?"]
+        if s.audio == "copy" and info.audio_codec in COPYABLE_AUDIO_IN_MP4:
+            enc += ["-c:a", "copy"]
+        else:
+            enc += ["-c:a", "aac", "-b:a", "192k"]
+    else:
+        enc += ["-an"]
+    enc += ["-movflags", "+faststart", out_path]
+    return [(decoder(True), enc), (decoder(False), enc)]
+
+
+def make_export_job(info: VideoInfo, start: float, end: float, out_path: str, s: ExportSettings,
+                    parent=None):
+    """The job for one export: ffmpeg alone, or the piped job when distortion repair is on."""
+    if s.mode != "lossless" and s.repair is not None:
+        from .repair.export import PipedExportJob
+        return PipedExportJob(info, start, end, out_path, s, parent)
+    return ExportJob(build_commands(info, start, end, out_path, s), end - start, parent, cwd=command_cwd(s))
+
+
 class ExportJob(QObject):
     """Runs ffmpeg asynchronously via QProcess and reports progress in [0,1].
 
@@ -329,13 +485,15 @@ class ExportJob(QObject):
 
 def default_output_path(info: VideoInfo, start: float, end: float, mode: str,
                         out_dir: str | None = None, cropped: bool = False,
-                        whole: bool = False) -> str:
+                        whole: bool = False, repaired: bool = False) -> str:
     """Default clip path: <out_dir or source folder>/<source name>_clip_<in>-<out>.<ext>
-    (or _clip_full for the whole video)."""
+    (or _clip_full for the whole video), plus _repair / _crop when those are on."""
     base, ext = os.path.splitext(info.path)
     if out_dir:
         base = os.path.join(out_dir, os.path.basename(base))
     tag = "full" if whole else f"{start:.2f}-{end:.2f}".replace(".", "_")
+    if repaired:
+        tag += "_repair"
     if cropped:
         tag += "_crop"
     if mode == "lossless":

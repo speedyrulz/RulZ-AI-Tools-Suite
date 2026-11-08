@@ -54,6 +54,11 @@ NumPy 2.5
   License: BSD-3-Clause (and bundled components under BSD/MIT/zlib licenses)
   https://numpy.org/  -  https://github.com/numpy/numpy
 
+OpenCV (opencv-python-headless 4.x)
+  License: Apache License 2.0 (and bundled components under BSD/MIT-style licenses)
+  https://opencv.org/  -  https://github.com/opencv/opencv-python
+  Used by Distortion repair for the per-pixel corrections.
+
 PyInstaller bootloader
   License: GPL v2 with the PyInstaller bootloader exception, which allows
   distributing the bootloader with programs under any license.

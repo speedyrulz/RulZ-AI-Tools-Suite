@@ -7,6 +7,7 @@ Output: dist\\RulZ-Simple-Video-Clip-Extractor-v<version>-win64.zip
 """
 from __future__ import annotations
 
+import glob
 import os
 import re
 import shutil
@@ -50,6 +51,10 @@ def main():
     ])
 
     out = os.path.join(ROOT, "dist", EXE_NAME)
+    # OpenCV's FFmpeg plugin (~30 MB) only serves cv2.VideoCapture/VideoWriter, which the app never
+    # uses (PyAV and the ffmpeg command line handle video); OpenCV loads it on demand, so it can go.
+    for dll in glob.glob(os.path.join(out, "_internal", "cv2", "opencv_videoio_ffmpeg*.dll")):
+        os.remove(dll)
     shutil.copy(os.path.join(ROOT, "LICENSE"), os.path.join(out, "LICENSE.txt"))
     shutil.copy(os.path.join(ROOT, "simplecut", "assets", "LOGO-NOTICE.md"), os.path.join(out, "LOGO-NOTICE.md"))
     shutil.copy(os.path.join(PKG, "THIRD-PARTY-NOTICES.txt"), out)
