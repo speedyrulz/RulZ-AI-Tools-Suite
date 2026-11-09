@@ -13,7 +13,7 @@ Windows desktop app for captioning image datasets with a local vision LLM.
 - Add images, folders (or drag & drop). Thumbnail grid with an editable caption box under every image.
 - Captions live in `image.txt` next to `image.png`. Editing a box (adding or removing text) writes the file, creating it if needed.
 - Save/edit/delete your own system prompts (stored in `%APPDATA%\RulzCaptioner\prompts.json`).
-- Multi-GPU: **Parallel** (one model copy per GPU, images shared out) or **Split** (one model spread across GPUs via `--tensor-split`).
+- Multi-GPU: **Parallel** (one model copy per GPU, images shared out) or **Split** (one model spread across GPUs with `--split-mode layer`, plus `--tensor-split` when you give ratios).
 - Works with any OpenAI-compatible server too (LM Studio, Ollama, vLLM…); list several URLs to caption in parallel.
 - Dark (default) or light theme: the first launch asks which look you want; switch any time with **View ▸ Light mode**.
 

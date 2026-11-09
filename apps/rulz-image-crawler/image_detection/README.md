@@ -16,10 +16,11 @@ app/extension ──POST /classify──▶ image_detection (127.0.0.1:8090) ─
    powershell -ExecutionPolicy Bypass -File scripts\start_llama_server.ps1
    ```
 
-   By default this uses the newest CUDA 12 `llama-server.exe` bundled with LM Studio and loads
+   It uses `$env:LLAMA_SERVER_EXE` when set, otherwise the llama.cpp build the launcher puts in the app's
+   `llama.cpp\` folder, otherwise the newest CUDA 12 `llama-server.exe` bundled with LM Studio, and loads
    `image_detection\LLM\Qwen3-VL-8B-Instruct-abliterated.Q8_0\` with `-ngl 99 -fa on --jinja -c 8192 --parallel 2 -ctk q8_0 -ctv q8_0` (4096 tokens a slot, a q8_0 KV cache:
    about 1.8 GB less VRAM than the spec's `-c 16384` with an f16 cache; a request needs ~1.6k tokens).
-   Options: `-Gpu 1` (index as in `nvidia-smi`), `-Ctx 16384`, `-Parallel 1`, `-KvType f16`. Set `$env:LLAMA_SERVER_EXE` to use an official llama.cpp build instead.
+   Options: `-Gpu 1` (index as in `nvidia-smi`), `-Ctx 16384`, `-Parallel 1`, `-KvType f16`.
 
 2. **Start the service:**
 

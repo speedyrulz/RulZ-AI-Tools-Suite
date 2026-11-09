@@ -17,6 +17,14 @@ A Windows app that finds your favorite image by single-elimination tournament. I
 |---|---|
 | ![Split view](docs/screenshots/03-split-view.png) | ![Both images zoomed to the same spot](docs/screenshots/04-synced-zoom.png) |
 
+## Get it
+
+The easiest way is the [RulZ AI Tools Suite](https://github.com/speedyrulz/RulZ-AI-Tools-Suite) launcher: find
+RulZ Image Tournament under **Photos** and click **Install**. Without the launcher, download
+`RulZ-Image-Tournament-v<version>-win64.zip` from the newest `image-tournament-v…` release on the suite's
+[Releases page](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/releases), unzip it anywhere and run
+`RulZ Image Tournament.exe`. To run it from this source folder instead, read on.
+
 ## Run
 
 Double-click **`launch.bat`**. It builds the app first if needed. You can also drop images or folders onto `launch.bat` to start a tournament with them.

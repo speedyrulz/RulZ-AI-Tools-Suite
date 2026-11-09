@@ -59,12 +59,19 @@ export function settingsForPhone(s: AppSettings): AppSettings {
 }
 
 /**
- * A settings change from the phone, without the phone-access settings and the API key (only this
- * computer changes those; the phone sees the key as empty, so it must not be able to send it back).
+ * Settings only this computer changes, besides the phone-access ones: the RulZ LLM Suite API key and
+ * the addresses it is sent to. The phone sees the key as empty, so it must not be able to send it back;
+ * and an address set from the phone would make this computer send the key to that server (the saved
+ * and the last-used address are both tried with the key when connecting).
  */
+const COMPUTER_ONLY_SETTINGS: ReadonlySet<string> = new Set<keyof AppSettings>(['apiKey', 'serverUrl', 'lastServerUrl'])
+
+/** A settings change from the phone, without the settings only this computer changes. */
 export function settingsPatchFromPhone(patch: unknown): Partial<AppSettings> {
   if (!patch || typeof patch !== 'object') return {}
-  return Object.fromEntries(Object.entries(patch).filter(([k]) => !k.startsWith('remote') && k !== 'apiKey')) as Partial<AppSettings>
+  return Object.fromEntries(
+    Object.entries(patch).filter(([k]) => !k.startsWith('remote') && !COMPUTER_ONLY_SETTINGS.has(k))
+  ) as Partial<AppSettings>
 }
 
 export class RemoteServer {

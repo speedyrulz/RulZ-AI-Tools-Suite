@@ -166,6 +166,9 @@ describe('RemoteServer', () => {
     expect((got.value as { remoteToken: string }).remoteToken).toBe('')
     await p.invoke('settings:update', { approval: 'careful', remoteEnabled: false, remoteToken: 'mine', remotePort: 80 })
     expect(t.calls.at(-1)).toEqual({ channel: 'settings:update', args: [{ approval: 'careful' }] })
+    // Nor the RulZ LLM Suite address or API key: this computer would send its key to that server.
+    await p.invoke('settings:update', { maxSteps: 60, serverUrl: 'http://100.64.0.9:1234', lastServerUrl: 'http://100.64.0.9:1234', apiKey: 'x' })
+    expect(t.calls.at(-1)).toEqual({ channel: 'settings:update', args: [{ maxSteps: 60 }] })
   })
 
   it('passes events on to paired phones, except phone-access status', async () => {
@@ -199,6 +202,15 @@ describe('phone access helpers', () => {
     // The phone never sees the RulZ LLM Suite API key, and can't overwrite it with the blank it sees.
     expect(settingsForPhone({ ...DEFAULT_SETTINGS, apiKey: 'secret', remoteToken: 'tok' })).toMatchObject({ apiKey: '', remoteToken: '' })
     expect(settingsPatchFromPhone({ apiKey: '', theme: 'dark' })).toEqual({ theme: 'dark' })
+  })
+
+  it("doesn't let the phone change the RulZ LLM Suite address", () => {
+    // This computer sends its API key to the saved and the last-used address, so neither comes from the phone.
+    expect(settingsPatchFromPhone({ serverUrl: 'http://100.64.0.9:1234', theme: 'light' })).toEqual({ theme: 'light' })
+    expect(settingsPatchFromPhone({ lastServerUrl: 'http://100.64.0.9:1234', maxSteps: 50 })).toEqual({ maxSteps: 50 })
+    // What the phone app's own settings page changes still gets through.
+    const fromPhoneApp = { model: 'qwen3-coder', approval: 'balanced', instructions: 'Be brief.', maxSteps: 80, commandTimeoutMin: 10, projectsDir: 'D:\\code', keepThinkingOpen: true }
+    expect(settingsPatchFromPhone(fromPhoneApp)).toEqual(fromPhoneApp)
   })
 
   it('finds Tailscale addresses', () => {

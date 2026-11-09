@@ -60,7 +60,7 @@ Starting the app a second time just opens the already-running instance.
 1. Create a token at <https://huggingface.co/settings/tokens>. Pick **Write** access (or a fine-grained token
    with write permission on your repos), otherwise you can only browse and download.
 2. In the app, open **Settings**, paste the token and click **Save & test**.
-   If you already ran `hf auth login`, the app uses that login automatically (or click **Import** to save it).
+   If you already ran `hf auth login`, the app uses that login automatically (or click **Import from "hf auth login" / HF_TOKEN** to save it).
    Note: recent `hf` versions log in through the browser with a *temporary* OAuth token that expires after a
    few weeks; Settings shows the expiry date. For a setup that keeps working, save a regular access token.
 3. Pick a **download folder** (default: `Downloads/HuggingFace`; under WSL this is your Windows Downloads folder).
@@ -110,7 +110,7 @@ Windows and WSL keep separate settings, so add the token once in each.
 job with its result, errors in plain language, and an **Open folder** button for downloads.
 
 **Dark or light**: the RulZ look, black and red (the default) or white and red. The first start asks which one you
-want; switch any time with the sun / moon button at the top right or under Settings ▸ Appearance.
+want; switch any time with the sun / moon button at the top right or under Settings ▸ Appearance & behaviour.
 
 ## Notes
 

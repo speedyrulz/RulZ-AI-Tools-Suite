@@ -12,7 +12,8 @@ export const CATALOG: CatalogApp[] = [
     name: 'RulzTrainer',
     tagline: 'LoRA trainer for diffusion models, with a guided WebUI',
     description:
-      'Train LoRAs for MOSS-Image, Bria FIBO 2.0 and Krea 2 from your browser. A step-by-step wizard recommends ' +
+      'Train LoRAs for nine image models (MOSS-Image, Bria FIBO 2.0, Krea 2, Qwen-Image 2.1, FLUX 3 Klein, ' +
+      'FLUX.2 Klein 9B, Ideogram 4, MiniMax H3 and P-H3-Image) from your browser. A step-by-step wizard recommends ' +
       'every setting from your GPU memory and dataset, and the finished LoRAs load straight into ComfyUI.',
     category: 'AI Training',
     repo: SUITE_REPO,
@@ -32,10 +33,10 @@ export const CATALOG: CatalogApp[] = [
     folderName: 'RulzTrainer',
     notes: [
       'Setup downloads CUDA PyTorch and the training libraries (about 4 GB).',
-      'Base models (about 30 GB each) are downloaded later from the WebUI, into this folder.',
+      'Base models (about 10 to 20 GB each, up to 50 GB for the biggest) are downloaded later from the WebUI, into this folder.',
       'Launch opens a console window and the WebUI in your browser. Closing the console stops it.'
     ],
-    highlights: ['MOSS-Image, FIBO 2.0, Krea 2', 'Wizard with recommended settings', 'Multi-GPU', 'ComfyUI-ready LoRAs']
+    highlights: ['Nine image models', 'Wizard with recommended settings', 'Multi-GPU', 'ComfyUI-ready LoRAs']
   },
   {
     id: 'image-organizer',
@@ -233,7 +234,7 @@ export const CATALOG: CatalogApp[] = [
     launch: { target: 'Start Image Crawler.bat', icon: 'assets\\icon.ico' },
     requirements: [
       { id: 'python', note: 'Python 3.11 or newer' },
-      { id: 'nvidia', note: 'NVIDIA GPU with about 16 GB of VRAM' },
+      { id: 'nvidia', note: 'NVIDIA GPU with about 12 GB of VRAM or more' },
       { id: 'git', optional: true, note: 'Lets the launcher update it with git pull' }
     ],
     components: [

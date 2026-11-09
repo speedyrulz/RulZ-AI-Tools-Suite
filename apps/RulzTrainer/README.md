@@ -115,8 +115,9 @@ is kept per browser (its local storage).
 1. **Dataset**: a folder of images. Each image may have a same-name `.txt` caption. Use *Scan dataset*
    to see the aspect-ratio buckets. Pick one or more *Training resolutions* (megapixels); see
    "Training resolutions and resolution step-up" below.
-2. **Model**: choose `MOSS-Image-Base` or `MOSS-Image-SFT` (or a custom local directory / HF repo id).
-   *Download / verify model* fetches about 30 GB into `models/`.
+2. **Model**: choose one of the nine base models (or a custom local directory / HF repo id).
+   *Download / verify model* fetches its files into `models/`: about 10 to 20 GB for most, about 32 GB for
+   P-H3-Image and over 50 GB for MiniMax H3.
 3. **Start training**. Before it starts, the Train tab lists the usual mistakes, with *Start anyway* (never a
    block): images with no caption, captions that already hold the trigger word (it is put at the start of every
    caption, so they would have it twice) and a learning rate well outside the usual range (a third of the lowest to
@@ -195,9 +196,9 @@ or in the web editor (Templates -> Create) with these settings:
 | On-start script | `/opt/instance-tools/bin/entrypoint.sh` |
 | Ports | `1111`, `7870`, `8080`, `22` |
 | Environment variables | `PROVISIONING_SCRIPT=https://raw.githubusercontent.com/speedyrulz/RulZ-AI-Tools-Suite/app/rulz-trainer/scripts/vast/provision.sh`<br>`PORTAL_CONFIG=localhost:1111:11111:/:Instance Portal\|localhost:7870:17870:/:RulzTrainer\|localhost:8080:18080:/:Jupyter\|localhost:8080:8080:/terminals/1:Jupyter Terminal`<br>`OPEN_BUTTON_PORT=1111` |
-| Disk space | 120 GB (the base model download is about 30 GB; datasets, caches and outputs come on top) |
+| Disk space | 120 GB (a base model download is about 10 to 20 GB, over 50 GB for MiniMax H3; datasets, caches and outputs come on top) |
 
-Put `HF_TOKEN` (needed for the gated MOSS-Image repos) into your **account** environment variables
+Put `HF_TOKEN` (needed for gated repos, such as BFL's FLUX 3 Klein and FLUX.2 Klein 9B files) into your **account** environment variables
 (cloud.vast.ai -> Account -> Environment Variables), never into the template: account variables are injected into
 every instance and land in `/etc/environment`, where the WebUI and the training subprocess read them.
 
@@ -2788,7 +2789,8 @@ ComfyUI's `custom_nodes` and load `workflows/RulzTrainer Likeness Scoring.json`;
 | Max caption tokens | 512 to 1024 unless you train on very long prompts |
 
 The DiT in bf16 is about 10 GB. The text encoder is about 18 GB in bf16, so it is loaded only for caching
-with `device_map="auto"`; pick `8bit` / `4bit` quantization if you want it on a single GPU.
+with `device_map="auto"`; set `text_encoder_quant` to `int8`, `int8_convrot` or `nvfp4` if you want it on a single
+GPU.
 
 ### Selective checkpointing (`checkpoint_keep_blocks`)
 

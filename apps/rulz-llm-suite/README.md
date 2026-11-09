@@ -58,7 +58,8 @@ Discover/downloads, RAG and a CLI are planned.
   `{ "config": { … }, "reload": true }` changes them (other apps, like RulZ Coding Agent, use this). `POST` accepts only
   context length, GPU layers, MoE expert offload (`cpuMoe`: `"off"`, `"all"` or a layer count), flash attention,
   KV cache types, parallel slots, the GPU split (mode, main GPU,
-  per-GPU proportions) and the draft (MTP) settings, including which draft (`draftFile`: `null` for automatic,
+  per-GPU proportions), whether the vision projector runs on the CPU (`mmprojOnCpu`), the model's sampling
+  defaults (`sampling`: any subset, merged value by value; `null` clears one) and the draft (MTP) settings, including which draft (`draftFile`: `null` for automatic,
   `"builtin"`, or the id of one of `draft_choices`). File paths and extra arguments stay app-only. A loaded model
   restarts with the new settings unless `"reload": false`; `"dry_run": true` only returns the memory estimate for the
   changed settings. Replies include the GPUs, `moe_layers` (layers with experts; `null` for dense models), whether the model has a draft head, what automatic uses
@@ -122,12 +123,17 @@ cmake -S C:\coding\llama.cpp -B C:\coding\llama.cpp\build-cuda -G "Visual Studio
 cmake --build C:\coding\llama.cpp\build-cuda --config Release --target llama-server -j
 ```
 
-The app auto-detects `C:\coding\llama.cpp\build-cuda\bin\Release`; any other folder containing `llama-server.exe`
-can be set in Settings. Child processes get `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so GPU numbers match nvidia-smi.
+The app auto-detects `llama-server.exe` in `C:\coding\llama.cpp\build-cuda\bin\Release`, `build-cuda\bin`,
+`build\bin\Release` or `build\bin`; any other folder containing `llama-server.exe` can be set in Settings. Child processes get `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so GPU numbers match nvidia-smi.
 
 ## Development
 
+The source lives in `apps/rulz-llm-suite` of the [RulZ AI Tools Suite](https://github.com/speedyrulz/RulZ-AI-Tools-Suite)
+repository:
+
 ```
+git clone https://github.com/speedyrulz/RulZ-AI-Tools-Suite.git
+cd RulZ-AI-Tools-Suite\apps\rulz-llm-suite
 npm install
 node node_modules/electron/install.js   # first time only: Electron downloads its binary lazily
 npm run dev          # run with hot reload

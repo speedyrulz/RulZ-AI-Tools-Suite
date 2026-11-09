@@ -107,9 +107,10 @@ matrix, and BT.709 for untagged video from 720 lines up.
 
 Press **S** (or the "Save frame PNG" button) to write the current frame at
 full source resolution as a PNG. It saves immediately, with no dialog, as
-`<video name>_<timecode>_f<frame>.png` in the output folder; an existing
-name gets a `_1`, `_2`, ... suffix instead of being overwritten. The status
-bar shows the saved path.
+`<video name>_<timecode>_f<frame>.png` in the output folder (with `_repair`
+added while a distortion repair is on, and `_crop` while the crop is on); an
+existing name gets a `_1`, `_2`, ... suffix instead of being overwritten. The
+status bar shows the saved path.
 
 ## Rotation and flip
 
@@ -141,8 +142,8 @@ out if that file no longer exists.
 ## Close video
 
 **File → Close video** (Ctrl+W) unloads the current file and returns the app
-to its empty state: marks, crop, fixed-length selection, rotation and flip are
-all cleared.
+to its empty state: marks, crop, fixed-length selection, rotation, flip, colour
+match and distortion repair are all cleared.
 
 ## Crop
 
@@ -161,7 +162,9 @@ rotation) are shown above the box and in the crop panel.
   becomes 9:16).
 - Crop and scale need re-encoding, so the export dialog only offers NVENC
   while the crop is on. Frame PNGs are cropped (and scaled) too.
-- The filter order on export is rotate, crop, scale, then frame-rate change.
+- The filter order on export is rotate, flip, crop, colour match, scale, then
+  frame-rate change. A lower frame rate runs right after the crop instead, so
+  the later steps see fewer frames.
 
 ## Match colour to a reference photo
 
@@ -277,7 +280,8 @@ While fixed length is on:
 - **Playhead to clip start** (Home) jumps the playhead back to the first
   frame of the selection without moving the selection.
 - Export uses the selection. Lossless is still offered if both ends happen to
-  land on keyframes (and no crop is active); otherwise NVENC.
+  land on keyframes (and no crop, flip, colour match or distortion repair is
+  active); otherwise NVENC.
 - Crop works at the same time.
 
 Turning fixed length off restores your In/Out marks.
@@ -351,7 +355,8 @@ selection (In/Out marks or the fixed-length box), or the **whole video** when
 nothing is selected, straight to the output folder using the default NVENC
 settings from Preferences (out of the box: H.264, CQ 18, preset p5, 24 fps,
 audio copied when MP4-compatible).
-The current rotation, flip, crop and scale are applied. It re-encodes unless the
+The current rotation, flip, crop, scale, colour match and distortion repair are
+applied. It re-encodes unless the
 Quick export tab in Preferences allows lossless cuts and the clip qualifies. Progress and a Cancel button appear in the status bar, the file
 is named like a normal export (`_clip_full` for the whole video), and an
 existing name gets a numeric suffix rather than being overwritten.

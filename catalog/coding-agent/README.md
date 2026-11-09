@@ -41,8 +41,11 @@ The light look is one click away: use the sun/moon button in the top bar (or **S
 - **Steps** on the right: each thing the agent does ("Installing the pieces your app needs") with a status icon.
   Click a step to see the exact command and its output.
 - **Files changed**: every file the task created, changed or deleted. Click one to see what changed.
-- **Run my app** starts the project (`npm start` / `npm run dev`, `main.py`, or opens `index.html`), with its output
-  in a panel and an **Open in browser** button for web servers. If it can't tell how, it asks the agent and remembers.
+- **Run my app** starts the project (`npm start` / `npm run dev`, after `npm install` when `node_modules` is missing;
+  `main.py`, `app.py`, `gui.py` or `run.py` with the project's `.venv` when it has one; or opens `index.html`,
+  `public/index.html` or `src/index.html`), with its output in a panel and an **Open in browser** button for web
+  servers. If it can't tell how, **Ask the AI to work it out** finds the command and remembers it, or
+  **I know the command** lets you type it; **Show details → Reset how to run** forgets the saved command.
   When the app crashes or prints an error, **Fix this** stops it and hands the error to the agent to find and fix.
 - **Undo last task** puts the project back exactly as it was before the last task (press again to go further back).
 - **History** lists every task in the project, newest first, with when it ran and how many files it changed.
@@ -58,22 +61,38 @@ The light look is one click away: use the sun/moon button in the top bar (or **S
   projects need a larger context length in RulZ.
 - **Thinking**: with a model that reasons before it answers (Qwen3, gpt-oss, DeepSeek-R1 and the like), each reply
   gets a **Thinking…** box above it that fills in live as the model reasons and folds away once it starts answering.
-  Click it to open or close it again, now or later, to see why the agent did what it did. Thinking written inline
+  Click it to open or close it again, now or later, to see why the agent did what it did. Turn on **Keep thinking
+  open after the answer** in Settings to leave it open instead (you can still fold it by hand). Thinking written inline
   as `<think>…</think>` goes in the same box. It's shown only; it is never sent back to the model.
 - **Extra tools**: tool servers you set up in RulZ LLM Suite (its MCP page, saved in its `mcp.json`), such as
   [REA](https://www.npmjs.com/package/rea-agents) for reverse engineering, work here too with nothing to set up
   twice. Settings lists them and can start them; otherwise they start the first time the agent needs one. Ask for
   them by name ("use REA to study the app in C:\Apps\Viewer").
+- **Settings → Record tasks for reverse-engineering training** (off by default): RulZ LLM Suite records each task as
+  a reverse-engineering session, exactly as the model saw it. The sessions show on the Suite's Reverse Engineering
+  page, labelled RulZ Coding Agent, where you grade them and export the good ones as `train.jsonl` for fine-tuning.
+  Each model turn carries an `x-rulz-re-session: agent-<task id>` header, and the task's title, project folder and
+  request are sent once to `POST /v1/re/sessions/{id}`. Needs RulZ LLM Suite 0.13.0 or later; older versions ignore it.
+- **Reverse engineering** (top bar, and a card on a new project's first screen): the tasks RulZ LLM Suite's Reverse
+  Engineering page offers, run by the agent in the open project. **Start a task** analyses a program or folder with
+  the Suite's question templates (Overview, License check, Network, …) or **clones** it: specific pieces (file format,
+  protocol, algorithm, …) or the whole program, as new code in the language you pick, written into the project.
+  **Practice** lists the training kit's tasks with how often each was tried and solved; **Start** has the Suite copy
+  the task's program into a fresh work folder, and when the agent finishes, its `ANSWER:` line is checked and the
+  result shows in the chat. **Done** lists every RE session the Suite knows (its own chats and other apps' tasks) with
+  its grade. With **Record for training** on (the default), these tasks are recorded in the Suite even when the
+  setting above is off, and practice tasks are graded there automatically. Needs RulZ LLM Suite 0.15.0 or later.
 - **Switch models from the top bar**: click the model name to pick another model (not during a task).
   **Settings → Model settings** has two parts. **How it writes** sets temperature, top P, top K, repeat penalty,
   the longest answer and thinking (on/off, reasoning effort, thinking budget and its message), saved per model; empty
-  boxes use the recommended values (Qwen's for Qwen3-Coder). **How it loads** sets context length, GPU layers, flash
+  boxes use the recommended values (Qwen's for Qwen3-Coder). **How it loads** sets context length, GPU layers, expert
+  offload for mixture-of-experts models (all experts, or those of the first N layers, kept in system RAM), flash
   attention, KV cache types, the GPU split (all, one GPU, or a slider per GPU), and draft-model (MTP) speed-up and
   tuning, with RulZ's memory estimate updating as you change them. **Draft model** picks which draft to use:
   automatic, the MTP layers built into the model, or any draft file in RulZ's models folder (for example another
   quantization's `mtp-*.gguf`). These are saved in RulZ LLM Suite as that model's load defaults, and a loaded model
   restarts with them. Load settings need RulZ LLM Suite 0.3.5 or later; the GPU split, draft tuning and estimate need
-  0.3.7 or later, and the draft model choice needs 0.3.9 or later.
+  0.3.7 or later, the draft model choice needs 0.3.9 or later, and expert offload needs 0.14.0 or later.
 - **Settings → Instructions for every project** adds your own instructions to the agent's system prompt in all
   projects. **Show my built-in instructions** displays the fixed part they're added to (it holds the tool and
   safety rules, so it can't be replaced).
@@ -107,9 +126,18 @@ address and API key, open dialogs, the browser or Explorer here.
 
 At every level it always asks before deleting, installing software for the whole computer, using admin rights,
 touching anything outside the project folder, changing Windows settings, closing other programs, or sending
-anything to the internet (`git push`, publishing). It always refuses, with an explanation, to format disks, delete
-outside the project, edit the registry, turn off security software, shut down the PC, or download and run
-scripts unchecked. Deleted files go to the Recycle Bin.
+anything to the internet (`git push`, publishing). A command with several of these risks names them all, and
+**Allow for this task** covers only those. Code that is hidden or put together while it runs (an encoded
+script that can't be decoded, `Invoke-Expression`, a downloaded program) is asked about every time; an encoded
+script that can be decoded is checked as what it really runs. It always refuses, with an explanation, to format
+or repartition disks, delete outside the project, edit the registry, turn off security software, shut down,
+restart or sign out of the PC, change its user accounts, or download and run scripts unchecked, however the
+command is written (quotes, escape characters,
+aliases, line breaks and encoded scripts are all seen through). Deleted files go to the Recycle Bin.
+
+The question starts on **Don't allow**, and its buttons wait a moment before they work, so a key pressed while
+typing can never approve anything. `Esc` in a dialog or menu only closes it; it stops the task only when nothing
+else is open.
 
 ## How it works
 
@@ -140,9 +168,12 @@ scripts unchecked. Deleted files go to the Recycle Bin.
 - **Commands** run in `powershell.exe -NoProfile -NonInteractive` in the project folder, with Node.js, npm and
   Python folders added to `PATH`. Output streams live, each command has a time limit (10 minutes by default), and
   Stop kills the whole process tree. Background commands keep PowerShell waiting for the programs it starts (it
-  normally doesn't wait for programs with a window), so stopping one also closes the app's window.
+  normally doesn't wait for programs with a window), so stopping one also closes the app's window. If PowerShell
+  finishes but a program it started keeps its output open (`Start-Process -NoNewWindow`), that program is stopped
+  after a few seconds and the agent is told to use a background command instead, so a command can't hang.
 - **Loop guard**: the same call three times in a row, five failures in a row, or the step limit (40 by default)
-  pauses the task and asks you whether to keep going, try another way, or stop.
+  pauses the task and asks you whether to keep going, try another way, or stop (at the step limit only keep
+  going or stop).
 - **Context**: requests stay under ~80% of the model's context. Older tool results are shortened first; if that
   isn't enough, older turns are summarised. The system prompt and the current task are never dropped. Sizes are
   estimated at 3.2 characters per token, then corrected after every reply by the exact count llama.cpp reports
@@ -150,8 +181,12 @@ scripts unchecked. Deleted files go to the Recycle Bin.
 - **System prompt**: the built-in instructions, then your Settings instructions, then the project's Notes, then a
   summary of earlier work. The safety rules are told to come first.
 - **Undo**: before each task, the project is committed to a private git repository in the app's data folder
-  (never a `.git` inside your project, so your own repositories are untouched; `node_modules`, `dist`, `.venv`
-  and files over 50 MB are left out). Without Git for Windows, files are copied aside before the agent changes them.
+  (never a `.git` inside your project, so your own repositories are untouched; `node_modules`, `dist`, `.venv`,
+  `target` and files over 50 MB are left out). The project's own `.gitignore` doesn't decide what is kept, because
+  it often lists files that matter (`.env`, a data folder); only a whole ignored folder with more than 1,000 files
+  or 100 MB (build output) stays out. Files are kept byte for byte (`.gitattributes` doesn't change line endings),
+  and folders with a git repository of their own (`git init web`, `cargo new app`) are kept file by file, leaving
+  their own `.git` alone. Without Git for Windows, files are copied aside before the agent changes them.
   Going back from History resets to that task's commit; with copied files, each later task is restored in turn,
   newest first. The agent is told what was undone at the start of its next task.
 - **Data**: `%APPDATA%\RulZ Coding Agent` holds settings, recent projects, each project's history and restore points.
@@ -178,7 +213,8 @@ $env:RULZ_REAL = '1'; npx vitest run --config vitest.e2e.config.ts real-model
 Add `$env:RULZ_REAL_REA = '1'` to also run the REA check (needs REA set up in RulZ LLM Suite): the agent studies a
 small minified app with REA and rebuilds its features.
 
-Releases: pushing a tag such as `v0.1.0` builds the installer on GitHub Actions and attaches it to a GitHub Release.
+Releases: pushing a `coding-agent-v<version>` tag to the suite repository (the version must match `package.json`)
+runs the suite's Apps workflow, which builds the installer and attaches it to a GitHub Release there.
 
 ## Later
 
