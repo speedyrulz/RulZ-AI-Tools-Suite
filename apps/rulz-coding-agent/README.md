@@ -41,8 +41,11 @@ The light look is one click away: use the sun/moon button in the top bar (or **S
 - **Steps** on the right: each thing the agent does ("Installing the pieces your app needs") with a status icon.
   Click a step to see the exact command and its output.
 - **Files changed**: every file the task created, changed or deleted. Click one to see what changed.
-- **Run my app** starts the project (`npm start` / `npm run dev`, `main.py`, or opens `index.html`), with its output
-  in a panel and an **Open in browser** button for web servers. If it can't tell how, it asks the agent and remembers.
+- **Run my app** starts the project (`npm start` / `npm run dev`, after `npm install` when `node_modules` is missing;
+  `main.py`, `app.py`, `gui.py` or `run.py` with the project's `.venv` when it has one; or opens `index.html`,
+  `public/index.html` or `src/index.html`), with its output in a panel and an **Open in browser** button for web
+  servers. If it can't tell how, **Ask the AI to work it out** finds the command and remembers it, or
+  **I know the command** lets you type it; **Show details → Reset how to run** forgets the saved command.
   When the app crashes or prints an error, **Fix this** stops it and hands the error to the agent to find and fix.
 - **Undo last task** puts the project back exactly as it was before the last task (press again to go further back).
 - **History** lists every task in the project, newest first, with when it ran and how many files it changed.
@@ -123,9 +126,11 @@ At every level it always asks before deleting, installing software for the whole
 touching anything outside the project folder, changing Windows settings, closing other programs, or sending
 anything to the internet (`git push`, publishing). A command with several of these risks names them all, and
 **Allow for this task** covers only those. Code that is hidden or put together while it runs (an encoded
-script, `Invoke-Expression`, a downloaded program) is asked about every time. It always refuses, with an
-explanation, to format disks, delete outside the project, edit the registry, turn off security software, shut
-down the PC, or download and run scripts unchecked, however the command is written (quotes, escape characters,
+script that can't be decoded, `Invoke-Expression`, a downloaded program) is asked about every time; an encoded
+script that can be decoded is checked as what it really runs. It always refuses, with an explanation, to format
+or repartition disks, delete outside the project, edit the registry, turn off security software, shut down,
+restart or sign out of the PC, change its user accounts, or download and run scripts unchecked, however the
+command is written (quotes, escape characters,
 aliases, line breaks and encoded scripts are all seen through). Deleted files go to the Recycle Bin.
 
 The question starts on **Don't allow**, and its buttons wait a moment before they work, so a key pressed while
@@ -165,7 +170,8 @@ else is open.
   finishes but a program it started keeps its output open (`Start-Process -NoNewWindow`), that program is stopped
   after a few seconds and the agent is told to use a background command instead, so a command can't hang.
 - **Loop guard**: the same call three times in a row, five failures in a row, or the step limit (40 by default)
-  pauses the task and asks you whether to keep going, try another way, or stop.
+  pauses the task and asks you whether to keep going, try another way, or stop (at the step limit only keep
+  going or stop).
 - **Context**: requests stay under ~80% of the model's context. Older tool results are shortened first; if that
   isn't enough, older turns are summarised. The system prompt and the current task are never dropped. Sizes are
   estimated at 3.2 characters per token, then corrected after every reply by the exact count llama.cpp reports
@@ -205,7 +211,8 @@ $env:RULZ_REAL = '1'; npx vitest run --config vitest.e2e.config.ts real-model
 Add `$env:RULZ_REAL_REA = '1'` to also run the REA check (needs REA set up in RulZ LLM Suite): the agent studies a
 small minified app with REA and rebuilds its features.
 
-Releases: pushing a tag such as `v0.1.0` builds the installer on GitHub Actions and attaches it to a GitHub Release.
+Releases: pushing a `coding-agent-v<version>` tag to the suite repository (the version must match `package.json`)
+runs the suite's Apps workflow, which builds the installer and attaches it to a GitHub Release there.
 
 ## Later
 

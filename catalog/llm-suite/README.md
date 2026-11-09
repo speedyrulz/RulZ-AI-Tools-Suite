@@ -23,8 +23,9 @@ Discover/downloads, RAG and a CLI are planned.
 - **My Models** — scans a folder (default `C:\LLM`) for `.gguf` files, reads GGUF metadata (architecture,
   parameters, quantization, trained context, layers), pairs vision projectors (`mmproj`) and MTP draft files with
   their model, joins split shards, and watches the folder for changes.
-- **Model loading** (`Ctrl+L`) — context length, GPU offload (auto-fit / all / N layers), single-GPU or split
-  across GPUs, flash attention, KV cache quantization, threads, batch sizes, mmap/mlock, chat template override and
+- **Model loading** (`Ctrl+L`) — context length, GPU offload (auto-fit / all / N layers), MoE expert offload
+  (`--cpu-moe` / `--n-cpu-moe`: keep all experts, or those of the first N layers, in system RAM while attention stays
+  on the GPU) and custom tensor overrides (`--override-tensor`), single-GPU or split across GPUs, flash attention, KV cache quantization, threads, batch sizes, mmap/mlock, chat template override and
   extra arguments; per-model saved defaults; memory estimate with a fits/partial/likely-OOM verdict; load progress;
   live server log; several models loaded at once.
   - **Speculative decoding**: a draft-head sidecar next to the model (`mtp-*.gguf`, or eagle3/dflash/dspark) is
@@ -55,14 +56,60 @@ Discover/downloads, RAG and a CLI are planned.
   after an idle timeout. Optional API key, CORS, localhost-only or LAN, and a live request log with token counts.
   `GET /v1/models/{id}/load-config` returns a model's saved load settings, and `POST` with
   `{ "config": { … }, "reload": true }` changes them (other apps, like RulZ Coding Agent, use this). `POST` accepts only
-  context length, GPU layers, flash attention, KV cache types, parallel slots, the GPU split (mode, main GPU,
-  per-GPU proportions) and the draft (MTP) settings, including which draft (`draftFile`: `null` for automatic,
+  context length, GPU layers, MoE expert offload (`cpuMoe`: `"off"`, `"all"` or a layer count), flash attention,
+  KV cache types, parallel slots, the GPU split (mode, main GPU,
+  per-GPU proportions), whether the vision projector runs on the CPU (`mmprojOnCpu`), the model's sampling
+  defaults (`sampling`: any subset, merged value by value; `null` clears one) and the draft (MTP) settings, including which draft (`draftFile`: `null` for automatic,
   `"builtin"`, or the id of one of `draft_choices`). File paths and extra arguments stay app-only. A loaded model
   restarts with the new settings unless `"reload": false`; `"dry_run": true` only returns the memory estimate for the
-  changed settings. Replies include the GPUs, whether the model has a draft head, what automatic uses
+  changed settings. Replies include the GPUs, `moe_layers` (layers with experts; `null` for dense models), whether the model has a draft head, what automatic uses
   (`default_draft`), the drafts that can be picked (`draft_choices`, by path relative to the models folder), and the
-  memory estimate.
+  memory estimate. `POST /v1/models/{id}/unload` unloads every running instance of a model (replying with how many it
+  `unloaded`), so a client can free the memory when it is done with a model.
   Default port 1234 (pick another if LM Studio is running).
+- **Reverse Engineering mode** (`Ctrl+6`) — runs a local model as a reverse engineer with the REA MCP tools, and
+  collects fine-tuning data while it works. Tuned first for Ornith 1.5 35B-A3B (Heretic MTP APEX I-Mini).
+  - **Sessions**: pick a program, library, package or folder and a goal (overview, license check, network, config,
+    crypto, hidden strings, or your own). The chat gets an RE system prompt, thinking sampling for Qwen3.5-family models
+    (temperature 0.6, top-k 20, no repeat penalty), REA's core tools preloaded, up to 80 tool rounds per reply, and the
+    model's thinking sent back within a tool loop (interleaved thinking, as the template expects). Tools are on even if
+    chats have them off. Static-analysis tools (decompile, search, list, annotate) run without asking; tools that run the
+    target, attach debuggers or reach devices still ask.
+  - **calc**: the RE training kit's sandboxed calculator runs as a built-in MCP server (`calc__calc`) when Python 3 is
+    on PATH, so the model computes hash rounds and XOR decoding instead of doing 32-bit math in its head.
+  - **Recording**: every finished round is saved as llama-server received it (system prompt with the tool catalog,
+    tool definitions, every turn) in `%APPDATA%\RulZ LLM Suite\re-data\<chat id>\`. A chat's data goes to the Recycle
+    Bin with the chat.
+  - **Grading**: Solved / Partial / Failed in the chat's RE strip or on the Reverse Engineering page.
+  - **Practice tasks**: reads `build/tasks.jsonl` from the RE training kit (`C:\coding\Trainers\re-training-kit`),
+    copies a task's binary to a fresh work folder, and checks the final `ANSWER:` line automatically (a port of the
+    kit's `verify.py`).
+  - **Export**: writes `train.jsonl` in the kit's format (OpenAI / Hugging Face chat: `messages`, `tools`, `meta`;
+    thinking in `reasoning_content`) plus `manifest.json`, from solved sessions by default, at most N per practice task
+    (fewest tool rounds first), leaving out sessions whose context was trimmed. Email addresses are replaced.
+  - **Clone**: the New session card switches between **Analyse** and **Clone**. A clone session rebuilds either
+    **specific pieces** of the target (presets for a file format, network protocol, algorithm, license logic, config and
+    command line, or one function, or your own description) or **the whole program**, as new readable source code in
+    the language you pick (or the original's). It writes only into the **output folder** you choose, with two built-in
+    tools that exist only in clone sessions: `write_file` (inside the output folder, never over the target) and
+    `read_file` (the output folder and the target's folder). The model keeps `NOTES.md` (so it can pick up after the
+    context is trimmed) and a `README.md` saying how to build it and what is and isn't reproduced. Clone sessions may
+    run up to **400** tool rounds (an option), are recorded and graded like other sessions, and exported samples carry
+    `meta.kind` (`clone-pieces` or `clone-full`).
+  - **Sessions from other apps**: a `/v1/chat/completions` request with an `x-rulz-re-session: <id>` header (letters,
+    digits, `_` and `-`, up to 56) is recorded as part of that RE session, with its reply. `POST /v1/re/sessions/{id}`
+    with `client`, `title`, `target`, `goal` describes the session, and with `outcome` (`unrated`, `solved`, `partial`,
+    `failed`) grades it; `GET` reads it back, and the reply's `recording` says whether recording is on. Such sessions are
+    listed, graded, deleted and exported on the Reverse Engineering page like chats, labelled with the app's name.
+    RulZ Coding Agent 0.16.0 sends these when its **Record tasks for reverse-engineering training** setting is on. Since
+    the other app fits its own context, a request with fewer messages than the one before marks the session as
+    trimmed. Turn it off with **Record sessions from other apps** in the page's options.
+    `GET /v1/re/overview` lists every RE session (chats here and other apps' sessions, newest first, with kind, grade
+    and tool rounds), the practice tasks with how often each was tried and solved (never their answers), and the
+    question, clone-piece and language templates. `POST /v1/re/practice/{task}/prepare` copies a task's program into a
+    fresh work folder and returns its path and prompt; `POST /v1/re/practice/{task}/grade` with `target` and `text`
+    checks the reply's `ANSWER:` line and returns `answer`, `passed` and `expected`. Session descriptions also take
+    `kind` and `practice`. RulZ Coding Agent 0.18.0 and its phone app use these to show and start RE tasks.
 - **Dark and light themes** — dark is the default; the first launch asks which look you want ("Choose your look").
   Switch any time with the sun/moon button in the top bar or in Settings ▸ Appearance (Dark, Light or System).
 - GPU/RAM meters (nvidia-smi), keyboard shortcuts (see Settings).
@@ -76,12 +123,17 @@ cmake -S C:\coding\llama.cpp -B C:\coding\llama.cpp\build-cuda -G "Visual Studio
 cmake --build C:\coding\llama.cpp\build-cuda --config Release --target llama-server -j
 ```
 
-The app auto-detects `C:\coding\llama.cpp\build-cuda\bin\Release`; any other folder containing `llama-server.exe`
-can be set in Settings. Child processes get `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so GPU numbers match nvidia-smi.
+The app auto-detects `llama-server.exe` in `C:\coding\llama.cpp\build-cuda\bin\Release`, `build-cuda\bin`,
+`build\bin\Release` or `build\bin`; any other folder containing `llama-server.exe` can be set in Settings. Child processes get `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so GPU numbers match nvidia-smi.
 
 ## Development
 
+The source lives in `apps/rulz-llm-suite` of the [RulZ AI Tools Suite](https://github.com/speedyrulz/RulZ-AI-Tools-Suite)
+repository:
+
 ```
+git clone https://github.com/speedyrulz/RulZ-AI-Tools-Suite.git
+cd RulZ-AI-Tools-Suite\apps\rulz-llm-suite
 npm install
 node node_modules/electron/install.js   # first time only: Electron downloads its binary lazily
 npm run dev          # run with hot reload

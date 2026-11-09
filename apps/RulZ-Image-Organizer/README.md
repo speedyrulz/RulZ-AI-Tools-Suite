@@ -6,7 +6,7 @@ You name people and fix any mistakes; your corrections are always kept.
 
 Everything runs on your PC. No photos or face data ever leave your computer.
 
-**[Download](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/releases)** · **[Wiki: guides, FAQ and troubleshooting](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/wiki/Image-Organizer)**
+**[Download](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/releases)** (or install it from the [RulZ AI Tools Suite](https://github.com/speedyrulz/RulZ-AI-Tools-Suite) launcher, under **Photos**) · **[Wiki: guides, FAQ and troubleshooting](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/wiki/Image-Organizer)**
 
 | Dark (default) | Light |
 | --- | --- |
@@ -22,7 +22,8 @@ Everything runs on your PC. No photos or face data ever leave your computer.
 
 - **Library**: add any number of folders (subfolders included). Scans run in the background on startup,
   or when you click **Scan now** (F5). New, changed, deleted and *moved/renamed* photos are picked up;
-  moved files keep their face tags.
+  files moved or renamed within the same library folder keep their face tags (a move to another library
+  folder counts as a deletion plus a new photo).
 - **Photos**: a timeline of all photos grouped by month (from EXIF date taken). Ctrl + mouse wheel zooms
   the grid. Search by person, facial expression, head direction and body pose. Words in one
   comma-separated group describe one person:
@@ -43,9 +44,9 @@ Everything runs on your PC. No photos or face data ever leave your computer.
   The **Filters** button shows the same options as clickable chips; they apply to the people you searched
   for, or to anyone if the search box is empty. The photo viewer lists each face's expression, direction
   and pose. These are estimated automatically and won't always be right (a smirk may read as a smile, and
-  up/down is less reliable than left/right). Pose is only decided when the person's lower legs are in the
-  photo, so head-and-shoulders and waist-up shots get no pose, and only people whose face was found are
-  covered.
+  up/down is less reliable than left/right). Standing and sitting are only decided when the person's ankles
+  are in the photo, so head-and-shoulders and waist-up shots never get those; lying down and arms raised
+  need only the upper body. Only people whose face was found are covered.
 - **People**: automatic face groups. Click a group to name it. Select several groups (hover → tick the
   circle) and **Merge** them. Naming a group with an existing name offers to merge them. Hide people you
   don't care about. **Ungroup** dissolves a wrong group.

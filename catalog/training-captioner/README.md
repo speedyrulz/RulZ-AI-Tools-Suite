@@ -13,7 +13,7 @@ Windows desktop app for captioning image datasets with a local vision LLM.
 - Add images, folders (or drag & drop). Thumbnail grid with an editable caption box under every image.
 - Captions live in `image.txt` next to `image.png`. Editing a box (adding or removing text) writes the file, creating it if needed.
 - Save/edit/delete your own system prompts (stored in `%APPDATA%\RulzCaptioner\prompts.json`).
-- Multi-GPU: **Parallel** (one model copy per GPU, images shared out) or **Split** (one model spread across GPUs via `--tensor-split`).
+- Multi-GPU: **Parallel** (one model copy per GPU, images shared out) or **Split** (one model spread across GPUs with `--split-mode layer`, plus `--tensor-split` when you give ratios).
 - Works with any OpenAI-compatible server too (LM Studio, Ollama, vLLM…); list several URLs to caption in parallel.
 - Dark (default) or light theme: the first launch asks which look you want; switch any time with **View ▸ Light mode**.
 
@@ -36,12 +36,24 @@ Double-click `run.bat` (creates a venv and installs PySide6 + requests on first 
 - *Parallel*: fastest when the model + context fits on each card. Mixed cards are fine; each gets its own server.
 - *Split*: needed when the model doesn't fit on one card. Use *Tensor split* for uneven ratios (e.g. `16,16`).
 - *Concurrent requests per server* adds batching on a server at the cost of VRAM (context is multiplied).
+- GPU numbers match `nvidia-smi`, so ticking GPU 1 uses the card `nvidia-smi` calls GPU 1, even on mixed cards.
+- With no GPU ticked, one llama-server starts and picks the GPUs itself (one copy of the model spread over all
+  of them).
+- If one server stops responding during a run, the other servers take over its images. If none respond,
+  captioning stops and the remaining images stay uncaptioned (not failed).
+- The servers close with the app, even if it crashes, so they never keep holding VRAM.
 
 ## Tips
 - Keep **Disable thinking** on (Settings ▸ Generation) for reasoning models like Qwen3.5/3.6 and Gemma 4, otherwise
   they spend the whole token budget thinking and return nothing.
-- Prefix/suffix fields add a trigger word or fixed text to every generated caption.
+- Prefix/suffix fields add a trigger word or fixed text to every generated caption. An empty reply or
+  unfinished thinking counts as a failure, so a caption is never just the prefix.
+- Images that share a name (`photo.png` and `photo.jpg`) share one caption file, `photo.txt`. The app warns
+  when you add them: rename or remove one of each pair.
+- A caption cut off by *Max new tokens* is still saved, with a warning in the log.
 - "Skip images that already have a caption" applies to *Caption All*; *Caption Selected* always overwrites.
+- Big folders are added in the background, so the window stays usable while they load. Images in subfolders
+  stay grouped by folder.
 - The log (View ▸ Log) shows llama-server output, useful if a model fails to load.
 
 ## Settings folder
