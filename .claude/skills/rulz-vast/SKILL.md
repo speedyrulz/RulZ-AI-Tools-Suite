@@ -33,7 +33,7 @@ before the ssh key was added to the account.
 | `log [NAME] -n 200` | `train.log`; `--console` for tracebacks and stdout; `--grep REGEX` |
 | `probes [NAME] --last 5` | likeness scores per probe; `--full` for per-seed scores and image paths |
 | `config NAME --diff OTHER` | the settings that differ between two runs |
-| `pull NAME --what logs --what probes --step 1800` | copies files to `~/.rulz_vast/runs/<instance>/NAME/`; `--what` is also `samples`, `loras`, `best`, `all` |
+| `pull NAME --what logs --what probes --step 1800` | copies files to `~/.rulz_vast/runs/<instance>/NAME/`; `--what` is also `samples`, `maps` (training maps), `loras`, `best`, `all` |
 | `ssh -- COMMAND` | anything else, in `/workspace/RulzTrainer` |
 
 No NAME means the running or last job. `pull` skips files already here at their size, so repeat it during a run. Then

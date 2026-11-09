@@ -919,8 +919,15 @@ with the RNG put back, and with compiled blocks run eagerly. RulZ Trainer's trig
 tokens (`attn_localize`'s own measure), Fizgig's over every token, so their values differ. A full fine-tune has no
 *Where the LoRA acts* map (no adapter to switch off); a configuration race has no maps. A failed capture turns the maps
 off for the rest of the run and training goes on. Output, in the job folder: `training_maps/probes.json`,
-`training_maps/probe_<n>.jpg` and `training_maps/maps.jsonl` (one line per capture). **Untested in a real training
-run so far.**
+`training_maps/probe_<n>.jpg` and `training_maps/maps.jsonl` (one line per capture).
+
+**Measured on one real run** (Krea 2 Raw int8, LoRA rank 32 at 0.25 MP, `torch.compile` on, one RTX 5090, a set of 62
+photos, 2000 steps, 35 captures of 3 pictures): a capture took about 2.2 s (4.5 s the first), about 6% of the training
+time at one capture per epoch; no memory showed beyond training's own peak; the compiled blocks recompiled 0 times;
+`maps.jsonl` reached 7.9 MB. Loss over the watched pictures fell steadily (about 20% by step 2000) while *Where the
+LoRA acts* grew from the face and hair outwards. On that set the *Trigger word* map sat on the clothing more than on
+the face from the first epoch to the last, and the full-body probes' clothes moved towards the set's dark tops and
+sweaters as training went on. Not yet run on the other model families or on a fine-tune.
 
 ## Muon (`optimizer: muon`)
 
