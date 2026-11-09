@@ -24,7 +24,7 @@ class Reader {
 
   constructor(
     private readonly load: Loader,
-    private readonly size: number
+    readonly size: number
   ) {}
 
   private view(n: number): number {
@@ -119,6 +119,27 @@ export interface GgufHeader {
   kv: Record<string, unknown>
   /** Whether the file holds built-in multi-token-prediction (nextn) layers. */
   hasNextn: boolean
+  /** Bytes of routed-expert weights in this file per layer index (0 where a layer has none);
+   *  undefined when the file has no expert tensors or its tensor list could not be read. */
+  expertBytes?: number[]
+}
+
+/** The tensors llama.cpp's --cpu-moe / --n-cpu-moe move to the CPU (LLM_FFN_EXPS_REGEX). */
+const EXPERT_TENSOR = /^blk\.(\d+)\.ffn_(?:up|down|gate|gate_up)_(?:ch)?exps\b/
+
+/** Adds up expert tensor sizes per layer; each tensor runs up to the next one's offset in the data section. */
+function expertBytesByLayer(tensors: { name: string; offset: number }[], dataBytes: number): number[] | undefined {
+  const sorted = [...tensors].sort((a, b) => a.offset - b.offset)
+  const out: number[] = []
+  sorted.forEach((t, i) => {
+    const m = EXPERT_TENSOR.exec(t.name)
+    if (!m) return
+    const end = i + 1 < sorted.length ? sorted[i + 1].offset : dataBytes
+    const layer = Number(m[1])
+    while (out.length <= layer) out.push(0)
+    out[layer] += Math.max(0, end - t.offset)
+  })
+  return out.length ? out : undefined
 }
 
 function parseHeader(r: Reader): GgufHeader {
@@ -134,18 +155,25 @@ function parseHeader(r: Reader): GgufHeader {
     const value = readValue(r, type)
     kv[key] = value === undefined ? null : value
   }
-  // Tensor infos follow the metadata: name, dims, type, offset.
+  // Tensor infos follow the metadata: name, dims, type, offset (relative to the aligned data section).
   let hasNextn = false
+  let expertBytes: number[] | undefined
   try {
-    for (let i = 0; i < tensorCount && !hasNextn; i++) {
-      hasNextn = r.str().includes('.nextn.')
-      r.skip(r.u32() * 8 + 4 + 8)
+    const tensors: { name: string; offset: number }[] = []
+    for (let i = 0; i < tensorCount; i++) {
+      const name = r.str()
+      if (name.includes('.nextn.')) hasNextn = true
+      r.skip(r.u32() * 8 + 4)
+      tensors.push({ name, offset: r.u64() })
     }
+    const align = typeof kv['general.alignment'] === 'number' && kv['general.alignment'] > 0 ? (kv['general.alignment'] as number) : 32
+    const dataStart = Math.ceil(r.pos / align) * align
+    expertBytes = expertBytesByLayer(tensors, r.size - dataStart)
   } catch (err) {
     if (err instanceof NeedMoreBytes) throw err
-    // A truncated tensor table only costs the MTP check.
+    // A truncated tensor table only costs the MTP check and the expert sizes.
   }
-  return { version, tensorCount, kv, hasNextn }
+  return { version, tensorCount, kv, hasNextn, expertBytes }
 }
 
 /** Synchronous header read (tests and tools); the app uses readGgufHeaderAsync. */
@@ -250,7 +278,7 @@ function swaWindow(arch: string, window: number | undefined, blocks: number | un
   }
 }
 
-export function toGgufInfo(kv: Record<string, unknown>, fileName: string, hasNextn = false): GgufInfo {
+export function toGgufInfo(kv: Record<string, unknown>, fileName: string, hasNextn = false, expertBytes?: number[]): GgufInfo {
   const arch = typeof kv['general.architecture'] === 'string' ? (kv['general.architecture'] as string) : 'unknown'
   const a = (k: string): unknown => kv[`${arch}.${k}`]
   const fileType = num(kv['general.file_type'])
@@ -279,6 +307,7 @@ export function toGgufInfo(kv: Record<string, unknown>, fileName: string, hasNex
     valueLength: num(a('attention.value_length')) ?? (headCount && embeddingLength ? embeddingLength / headCount : undefined),
     expertCount: num(a('expert_count')),
     expertUsedCount: num(a('expert_used_count')),
+    expertBytesByLayer: expertBytes?.length ? expertBytes : undefined,
     slidingWindow: swaWindow(arch, num(a('attention.sliding_window')), blockCount),
     slidingWindowFraction,
     hasChatTemplate: typeof kv['tokenizer.chat_template'] === 'string',

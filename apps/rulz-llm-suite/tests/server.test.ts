@@ -210,6 +210,11 @@ describe('parseRemoteLoadPatch', () => {
 
   it('accepts GPU split and draft (MTP) settings', () => {
     expect(parseRemoteLoadPatch({ splitMode: 'custom', tensorSplit: '60, 40', draftTokens: 3, draftPMin: 0.75, draftGpu: 'cpu' })).toMatchObject({ ok: true })
+    expect(parseRemoteLoadPatch({ cpuMoe: 'all' })).toMatchObject({ ok: true })
+    expect(parseRemoteLoadPatch({ cpuMoe: 20 })).toMatchObject({ ok: true })
+    expect(parseRemoteLoadPatch({ cpuMoe: 0 })).toMatchObject({ ok: false })
+    // Raw tensor rules reach the command line, so clients can't set them.
+    expect(parseRemoteLoadPatch({ overrideTensors: 'exps=CPU' })).toMatchObject({ ok: false })
     expect(parseRemoteLoadPatch({ tensorSplit: '' })).toMatchObject({ ok: true })
   })
 

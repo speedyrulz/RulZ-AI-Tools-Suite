@@ -336,6 +336,7 @@ export function parseLoadInfo(json: unknown): ModelLoadInfo {
     default_draft?: { name?: string; built_in?: boolean } | null
     draft_choices?: { id?: string; name?: string; folder?: string; kind?: string; built_in?: boolean }[]
     gpus?: ModelLoadInfo['gpus']
+    moe_layers?: number | null
     estimate?: ModelLoadInfo['estimate'] | null
   }
   if (!j?.config || typeof j.config !== 'object') throw new Error('RulZ LLM Suite sent load settings I could not read.')
@@ -352,6 +353,7 @@ export function parseLoadInfo(json: unknown): ModelLoadInfo {
           .filter((c) => typeof c?.id === 'string')
           .map((c) => ({ id: c.id!, name: c.name ?? c.id!, folder: c.folder ?? '', kind: c.kind ?? 'mtp', builtIn: !!c.built_in }))
       : undefined,
+    moeLayers: typeof j.moe_layers === 'number' && j.moe_layers > 0 ? j.moe_layers : j.moe_layers === undefined ? undefined : null,
     gpus: Array.isArray(j.gpus) ? j.gpus : [],
     estimate: j.estimate ?? undefined
   }

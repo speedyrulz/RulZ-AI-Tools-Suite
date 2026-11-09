@@ -298,6 +298,9 @@ function Loading({ model }: { model: string }) {
   const gpuMode = typeof draft.gpuLayers === 'number' ? 'number' : draft.gpuLayers
   // Older RulZ LLM Suite versions don't send these settings, so their controls stay hidden.
   const canSplit = draft.splitMode !== undefined && info.gpus.length > 1
+  const moeLayers = info.moeLayers ?? 0
+  const canOffloadMoe = draft.cpuMoe !== undefined && moeLayers > 0
+  const moeMode = typeof draft.cpuMoe === 'number' ? 'number' : (draft.cpuMoe ?? 'off')
   const choices = info.draftChoices ?? []
   const pickedDraft = draft.draftFile ? choices.find((c) => c.id === draft.draftFile) : undefined
   const hasAnyDraft = info.hasDraft !== false || !!draft.draftFile
@@ -362,6 +365,39 @@ function Loading({ model }: { model: string }) {
           )}
         </div>
       </Field>
+      {canOffloadMoe && (
+        <Field
+          label="Expert offload (MoE)"
+          hint="Keeps the model's expert weights in system RAM and the rest on the graphics card: a big MoE model runs much faster this way than with fewer GPU layers. Pair it with GPU layers All."
+          inline
+        >
+          <div className="flex items-center gap-1.5">
+            <Select
+              aria-label="Expert offload"
+              className="h-7.5 w-36 text-[13px]"
+              value={moeMode}
+              onChange={(e) => {
+                const m = e.target.value
+                change({ cpuMoe: m === 'number' ? (typeof draft.cpuMoe === 'number' ? draft.cpuMoe : Math.max(1, Math.round(moeLayers / 2))) : (m as 'off' | 'all') })
+              }}
+            >
+              <option value="off">Off</option>
+              <option value="all">All experts on CPU</option>
+              <option value="number">First N layers…</option>
+            </Select>
+            {moeMode === 'number' && (
+              <NumberInput
+                label="Layers with experts on CPU"
+                className="w-20"
+                value={draft.cpuMoe as number}
+                min={1}
+                max={moeLayers}
+                onChange={(v) => v !== null && v >= 1 && change({ cpuMoe: Math.round(v) })}
+              />
+            )}
+          </div>
+        </Field>
+      )}
       <Field label="Flash attention" hint="Faster and uses less memory on most GPUs" inline>
         <Select className="h-7.5 w-28 text-[13px]" value={draft.flashAttention} onChange={(e) => change({ flashAttention: e.target.value as LoadSettings['flashAttention'] })}>
           <option value="auto">Auto</option>

@@ -51,6 +51,14 @@ export function gpuShares(cfg: LoadConfig, gpus: GpuFree[]): number[] {
   return gpus.map((g) => (free > 0 ? g.freeBytes / free : 1 / gpus.length))
 }
 
+/** Expert weights that --cpu-moe / --n-cpu-moe keep in system RAM; 0 when unknown or off. */
+export function cpuExpertBytes(model: ModelEntry, cfg: LoadConfig): number {
+  const layers = model.info?.expertBytesByLayer
+  if (!layers || cfg.cpuMoe === 'off') return 0
+  const upTo = cfg.cpuMoe === 'all' ? layers.length : Math.min(cfg.cpuMoe, layers.length)
+  return layers.slice(0, upTo).reduce((sum, b) => sum + b, 0)
+}
+
 /** Each GPU in use pays this much for its CUDA context and compute buffers. */
 const PER_GPU_BYTES = 600 * MiB
 
@@ -64,12 +72,14 @@ export function estimateMemory(model: ModelEntry, cfg: LoadConfig, free: FreeMem
   const ctx = cfg.contextLength
   const kvBytes = ctx ? kvCacheBytes(model, cfg, ctx) : null
   const scaledOverhead = model.sizeBytes * 0.03
+  const expertCpuBytes = Math.min(cpuExpertBytes(model, cfg), model.sizeBytes)
 
   const layers = model.info?.blockCount
   const fraction =
     typeof cfg.gpuLayers === 'number' ? (layers ? Math.min(1, cfg.gpuLayers / (layers + 1)) : 1) : 1
   // The part that is divided between GPUs; the vision projector stays whole on the first one.
-  const splitBytes = (model.sizeBytes + (kvBytes ?? 0)) * fraction + scaledOverhead + (cfg.draftGpu === 'cpu' ? 0 : draftBytes)
+  // Experts kept on the CPU leave the GPU share; the rest of each layer still follows gpuLayers.
+  const splitBytes = (model.sizeBytes - expertCpuBytes + (kvBytes ?? 0)) * fraction + scaledOverhead + (cfg.draftGpu === 'cpu' ? 0 : draftBytes)
 
   const gpus = free.gpus ?? []
   const shares = gpuShares(cfg, gpus)
@@ -91,7 +101,10 @@ export function estimateMemory(model: ModelEntry, cfg: LoadConfig, free: FreeMem
   let verdict: MemoryEstimate['verdict'] = 'unknown'
   if (freeVramBytes !== null) {
     const fits = perGpu.length ? perGpu.every((g) => g.bytes <= g.freeBytes * 0.95) : gpuBytes <= freeVramBytes * 0.95
-    if (fits) verdict = 'fits'
+    // CPU-held experts must fit in RAM too (mmap can page them from disk, but slowly).
+    const ramOk = expertCpuBytes <= free.ramBytes * 0.8
+    if (!ramOk) verdict = 'tight'
+    else if (fits) verdict = 'fits'
     else if (cfg.gpuLayers === 'auto' && totalBytes <= freeVramBytes + free.ramBytes * 0.8) verdict = 'partial'
     else verdict = 'tight'
   }
@@ -106,6 +119,7 @@ export function estimateMemory(model: ModelEntry, cfg: LoadConfig, free: FreeMem
     freeVramBytes,
     freeRamBytes: free.ramBytes,
     verdict,
-    perGpu
+    perGpu,
+    cpuExpertBytes: expertCpuBytes
   }
 }

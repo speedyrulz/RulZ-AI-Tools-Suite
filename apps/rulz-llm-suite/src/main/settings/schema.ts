@@ -10,6 +10,8 @@ const posIntOrNull = z.number().int().positive().nullable()
 export const loadConfigSchema = z.object({
   contextLength: posIntOrNull.catch(L.contextLength),
   gpuLayers: z.union([z.literal('auto'), z.literal('all'), z.number().int().min(0)]).catch(L.gpuLayers),
+  cpuMoe: z.union([z.literal('off'), z.literal('all'), z.number().int().min(1)]).catch(L.cpuMoe),
+  overrideTensors: z.string().catch(L.overrideTensors),
   splitMode: z.enum(['auto', 'single', 'custom']).catch(L.splitMode),
   mainGpu: z.number().int().min(0).catch(L.mainGpu),
   tensorSplit: z.string().catch(L.tensorSplit),

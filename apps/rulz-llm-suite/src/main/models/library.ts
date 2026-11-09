@@ -164,7 +164,7 @@ async function walk(dir: string, depth: number, out: { path: string; size: numbe
 }
 
 /** Bump when GgufInfo gains fields or its derivation changes, so cached metadata is re-read. */
-const CACHE_VERSION = 3
+const CACHE_VERSION = 4
 
 interface CacheEntry {
   v?: number
@@ -200,18 +200,24 @@ const SHARD_FIRST_READ = 1 << 20
 async function ggufInfo(path: string, shards: string[]): Promise<GgufInfo> {
   const header = await readGgufHeaderAsync(path)
   let hasNextn = header.hasNextn
-  // Split models keep their MTP (nextn) layers at the end, in the last shard. The other tensor
-  // lists are only read when the metadata says the model has such layers.
-  if (!hasNextn && shards.length && toGgufInfo(header.kv, basename(path), true).mtpLayers) {
-    for (const s of [...shards].reverse()) {
-      hasNextn = await readGgufHeaderAsync(s, SHARD_FIRST_READ).then(
-        (h) => h.hasNextn,
-        () => false // a shard still downloading only costs the MTP check
-      )
-      if (hasNextn) break
+  const meta = toGgufInfo(header.kv, basename(path), true)
+  // Split models keep their MTP (nextn) layers at the end, in the last shard, and spread their
+  // experts over every shard. The other tensor lists are only read when the metadata says the
+  // model has such layers or experts.
+  if (!shards.length || (!meta.mtpLayers && !meta.expertCount)) return toGgufInfo(header.kv, basename(path), hasNextn, header.expertBytes)
+  const experts = [...(header.expertBytes ?? [])]
+  let complete = true
+  for (const s of shards) {
+    const h = await readGgufHeaderAsync(s, SHARD_FIRST_READ).catch(() => null) // a shard still downloading
+    if (!h) {
+      complete = false
+      continue
     }
+    hasNextn ||= h.hasNextn
+    h.expertBytes?.forEach((b, i) => (experts[i] = (experts[i] ?? 0) + b))
   }
-  return toGgufInfo(header.kv, basename(path), hasNextn)
+  const expertBytes = complete && experts.length ? Array.from(experts, (b) => b ?? 0) : undefined
+  return toGgufInfo(header.kv, basename(path), hasNextn, expertBytes)
 }
 
 /** Files that downloaders and editors write before or while saving the real one. */
