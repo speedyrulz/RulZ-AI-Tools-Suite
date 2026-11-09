@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The app talks to RulZ Coding Agent on the computer with ws:// over Tailscale, which encrypts the
+     connection itself (WireGuard). Tailscale addresses (100.x.y.z) can't be listed here as a range, so
+     plain connections are allowed; the app only ever opens them to computers the owner paired. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
