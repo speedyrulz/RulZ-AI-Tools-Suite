@@ -450,8 +450,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--attach-key", action="store_true", help="add your ssh key to the instance (rented before it)")
     p = command("pull", cmd_pull)
     p.add_argument("name", nargs="?", help="job name; default: the running or last job")
-    p.add_argument("--what", action="append", choices=("logs", "probes", "samples", "loras", "best", "all"),
-                   help="repeatable; default logs")
+    p.add_argument("--what", action="append", choices=("logs", "probes", "samples", "maps", "loras", "best", "all"),
+                   help="repeatable; default logs; maps: the training_maps folder")
     p.add_argument("--step", type=int, help="only this step's images and LoRA")
     p.add_argument("--dest", help="default: ~/.rulz_vast/runs/<instance>")
     p.add_argument("--show", type=int, default=20, help="how many fetched file names to list")

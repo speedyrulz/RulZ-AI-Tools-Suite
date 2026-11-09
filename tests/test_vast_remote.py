@@ -374,6 +374,17 @@ def test_files_pick_by_kind_and_step(install, capsys):
     assert len(paths("--what", "all")) == 4 + 2 + 3
 
 
+def test_files_maps_fetch_the_training_maps_folder(install, capsys):
+    d = make_job("a")
+    (d / "training_maps").mkdir()
+    for name in ("maps.jsonl", "probes.json", "probe_0.jpg", "probe_1.jpg"):
+        (d / "training_maps" / name).write_bytes(b"x")
+    data = run_json(capsys, "files", "a", "--what", "maps", "--step", "100")[1]
+    assert sorted(f["path"] for f in data["files"]) == [
+        "a/training_maps/maps.jsonl", "a/training_maps/probe_0.jpg", "a/training_maps/probe_1.jpg",
+        "a/training_maps/probes.json"]
+
+
 def test_files_report_the_folder_they_are_under(install, capsys):
     make_job("a")
     data = run_json(capsys, "files", "a")[1]
