@@ -6,6 +6,7 @@ import type { ThemeName } from '@shared/types'
 import { AppManager } from './apps'
 import { setFetch } from './github'
 import { broadcast, handle } from './ipc'
+import { latestPhoneApp } from './phoneApp'
 import { checkRequirements, installRequirement } from './requirements'
 import { checkSelfUpdate, installSelfUpdate } from './selfUpdate'
 import { Store } from './store'
@@ -160,6 +161,8 @@ async function main(): Promise<void> {
   handle('apps:setShortcuts', (id, opts) => apps.setShortcuts(id, opts))
   handle('apps:openFolder', (id) => apps.openFolder(id))
   handle('apps:log', (id) => apps.getLog(id))
+
+  handle('phone:latest', () => latestPhoneApp())
 
   handle('self:check', (force) => checkSelfUpdate(store, !!force).catch(() => null))
   handle('self:install', async (u) => {

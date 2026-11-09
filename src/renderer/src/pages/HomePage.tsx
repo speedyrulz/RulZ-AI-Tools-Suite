@@ -2,6 +2,7 @@ import { SearchX } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import type { AppView } from '@shared/types'
 import { AppCard } from '../components/AppCard'
+import { PhoneAppQr } from '../components/PhoneAppQr'
 import { cn } from '../lib/format'
 import { LOGOS } from '../lib/theme'
 import { useApps } from '../stores/apps'
@@ -49,7 +50,8 @@ export function HomePage({
               Local AI and media tools for Windows. Install, update and launch every app from one place.
             </p>
           </div>
-          <div className="flex gap-3">
+          <div className="flex flex-wrap items-end gap-3">
+            <PhoneAppQr variant="hero" />
             <Stat value={apps.length} label="Apps" />
             <Stat value={installedCount} label="Installed" />
             <Stat value={updates} label={updates === 1 ? 'Update' : 'Updates'} highlight={updates > 0} />

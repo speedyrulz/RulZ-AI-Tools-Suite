@@ -1,6 +1,6 @@
 # RulZ Coding Agent for Android
 
-Watch and control [RulZ Coding Agent](https://github.com/speedyrulz/rulz-coding-agent) on your computer from your
+Watch and control [RulZ Coding Agent](../rulz-coding-agent) on your computer from your
 Android phone. Give it tasks, answer its "Is this OK?" questions, follow its steps, look at the files it changed,
 run your app, undo, all from the phone, while the AI and your projects stay on the computer.
 
@@ -12,7 +12,11 @@ anything to the internet.
 1. Install Tailscale on the computer and on the phone, and sign in to the same account on both.
 2. On the computer, update RulZ Coding Agent to **0.6.0** or later, open **Settings** and turn on **Phone access**.
    The first time, Windows may ask whether RulZ Coding Agent may use your networks: allow it.
-3. Install this app on the phone (`app-debug.apk`, see *Building* below).
+3. Install this app on the phone: scan the QR code on the **RulZ AI Tools Suite** launcher's home page (or the
+   RulZ Coding Agent page there) with the phone's camera, download the APK and open it (allow installing from that
+   source). The QR code always points at the newest release; the APKs are also on the suite's
+   [Releases](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/releases) page, tagged `coding-agent-android-v<version>`.
+   Or build it yourself, see *Building* below.
 4. Scan the QR code from the computer's Settings with the phone's camera and tap the link, or tap **No camera? Type it
    in instead** and type the address, port and pairing code shown under the QR code.
 
@@ -90,8 +94,8 @@ computer → phone   { t: 'welcome', protocol, version, name }  |  { t: 'denied'
                    { t: 'event', channel, payload }
 ```
 
-`src/shared/` is copied from the desktop app (`npm run sync-shared`, which looks for it in
-`../RulZ AI Tools Suite/apps/rulz-coding-agent`); `protocol` tells the two apps apart when they
+`src/shared/` is copied from the desktop app (`npm run sync-shared`, which looks for it next to this folder, in
+`apps/rulz-coding-agent`); `protocol` tells the two apps apart when they
 don't match.
 
 The app is React, Tailwind and zustand (like the desktop app) in a [Capacitor](https://capacitorjs.com) shell.
@@ -110,6 +114,21 @@ from that source), or with the phone plugged in and USB debugging on: `adb insta
 
 Set `ANDROID_HOME` to the SDK folder, or create `android/local.properties` with `sdk.dir=C:\\Users\\you\\AppData\\Local\\Android\\Sdk`.
 To work on it in Android Studio: `npx cap open android`.
+
+## Releasing
+
+The app lives in `apps/rulz-coding-agent-android` of the RulZ AI Tools Suite repository. Bump `version` in
+`package.json` and `versionName` (and `versionCode`, by one) in `android/app/build.gradle`, then push a tag:
+
+```
+git tag coding-agent-android-v0.6.0 && git push origin coding-agent-android-v0.6.0
+```
+
+The suite's Apps workflow checks the versions match, runs the tests, builds the APK and publishes it as
+`RulZ-Agent-<version>.apk` in a release. The launcher picks the new release up and its QR code then points at it.
+The APK is signed with the debug key kept in the `ANDROID_DEBUG_KEYSTORE` repository secret (the base64 of
+`%USERPROFILE%\.android\debug.keystore`); it must stay the same key, or Android refuses to install an update over
+an installed copy.
 
 ## Development
 

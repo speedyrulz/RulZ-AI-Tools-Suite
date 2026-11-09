@@ -195,6 +195,18 @@ export interface SelfUpdate {
   assetName?: string
 }
 
+/** The newest RulZ Coding Agent for Android release with an APK, for the launcher's download QR code. */
+export interface PhoneApp {
+  /** "v0.5.0" */
+  version: string
+  tag: string
+  /** Direct download link of the APK (what the QR code holds). */
+  url: string
+  size: number
+  date: string | null
+  releaseUrl: string
+}
+
 export type ThemeName = 'dark' | 'light'
 
 export interface Settings {

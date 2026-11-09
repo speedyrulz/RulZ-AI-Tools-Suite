@@ -22,6 +22,7 @@ click, keep it updated, and launch it, all from a single black-and-red window (o
 | [RulZ Image Tournament](apps/RulZ-Image-Tournament) | Finds your favorite image, two at a time | Portable release zip (a single .exe) |
 | [RulZ LLM Suite](apps/rulz-llm-suite) | Local LLMs with llama.cpp: models, chat, MCP tools, API server | Its setup program, run silently |
 | [RulZ Coding Agent](apps/rulz-coding-agent) | Describe an app in plain English and a local model builds it (works with the LLM Suite) | Its setup program, run silently |
+| [RulZ Coding Agent for Android](apps/rulz-coding-agent-android) | Watch and control RulZ Coding Agent from an Android phone, over Tailscale | Not by the launcher: scan the QR code on its home page (or the Coding Agent page) with the phone to download the newest APK |
 | [Rulz Training Captioner](apps/Rulz-Training-Captioner) | Captions image datasets with a local vision LLM | From source (venv), plus an optional llama.cpp CUDA build |
 | [RulZ Simple Video Clip Extractor](apps/rulz-simple-video-clip-extractor) | Frame-accurate clips with lossless cuts and NVENC export | Portable release zip |
 | [RulZ Image Crawler](apps/rulz-image-crawler) | Crawls a website or folder and keeps the images that match your description (local vision model) | From source (venv + Chromium), plus the model download and an optional llama.cpp CUDA build |
@@ -79,6 +80,11 @@ git tag image-organizer-v1.3.0
 git push origin image-organizer-v1.3.0
 ```
 
+The Android app's tag is `coding-agent-android-v<version>` (its version is in `package.json` and, as `versionName`,
+in `android/app/build.gradle`). Its release holds `RulZ-Agent-<version>.apk`, signed with the debug key in the
+`ANDROID_DEBUG_KEYSTORE` secret so it installs over the copy already on a phone. The launcher's QR code switches to
+the new APK by itself: it looks for the newest release when it starts, every 30 minutes and on **Check for updates**.
+
 Push app tags one at a time: GitHub starts no workflow for any of them when more than three tags arrive in one push.
 
 GitHub Actions (`.github/workflows/apps.yml`) builds it and publishes the release here, where the launcher picks it
@@ -119,6 +125,7 @@ Pushing a `v*` tag builds the launcher's installer on GitHub Actions and attache
 | UI (React + Tailwind) | `src/renderer/src/` |
 | Logo and icon generation from `assets/logo-source.webp` | `tools/make_logo.py` |
 | How the catalog screenshots were made (demo content only) | `tools/screenshots/` |
+| The Android app's download QR code (newest `coding-agent-android-v*` release) | `src/main/phoneApp.ts`, `src/renderer/src/components/PhoneAppQr.tsx` |
 | The apps' source | `apps/` |
 | App builds and releases; the source apps' branches | `.github/workflows/apps.yml`, `app-branches.yml` |
 
