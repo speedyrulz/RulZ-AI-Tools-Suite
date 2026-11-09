@@ -16,7 +16,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   remoteEnabled: false,
   remotePort: 7420,
   remoteToken: '',
-  keepThinkingOpen: false
+  keepThinkingOpen: false,
+  reRecording: false
 }
 
 export const isQwenCoder = (model: string): boolean => /qwen3[-_.]?coder/i.test(model)

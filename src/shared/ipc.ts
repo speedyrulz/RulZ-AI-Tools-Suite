@@ -11,6 +11,8 @@ import type {
   ProjectInfo,
   ProjectState,
   PromptAnswer,
+  ReOverview,
+  ReStartRequest,
   RemotePairing,
   RemoteStatus,
   RunEvent,
@@ -37,6 +39,7 @@ export interface IpcInvoke {
   /** Starts the tool servers now (they otherwise start when the agent first needs one). */
   'tools:start': () => ToolServersInfo
   'dialog:pickFolder': (opts: { title?: string; defaultPath?: string }) => string | null
+  'dialog:pickFile': (opts: { title?: string; defaultPath?: string }) => string | null
   'shell:showItem': (path: string) => void
   'shell:openUrl': (url: string) => void
   /** Subfolders of a folder (the drives when `path` is empty), for choosing a folder from the phone. */
@@ -70,12 +73,26 @@ export interface IpcInvoke {
   'task:start': (projectPath: string, text: string) => void
   'task:stop': (projectPath: string) => void
   'task:answer': (projectPath: string, promptId: string, answer: PromptAnswer) => void
+  /** A note for the running task, added before its next step; `interrupt` also cuts the model's current reply short. */
+  'task:note': (projectPath: string, text: string, interrupt: boolean) => void
+  'task:cancelNote': (projectPath: string, noteId: string) => void
+  /** Cuts the model's current reply short so the waiting notes apply now (running commands go on). */
+  'task:interrupt': (projectPath: string) => void
   /**
    * Restores the project to how it was before the last task that wasn't undone yet, or, with a
    * task id, to before that task (undoing it and every later task).
    */
   'task:undo': (projectPath: string, taskId?: string) => ProjectState
+  /** Deletes a message from the conversation (a request takes its replies with it; see shared/history). */
+  'task:deleteItem': (projectPath: string, itemId: string) => ProjectState
+  /** Runs the latest request again, edited when `text` is given, after undoing its file changes. */
+  'task:redo': (projectPath: string, taskId: string, text?: string) => ProjectState
   'files:diff': (projectPath: string, taskId: string, path: string) => FileDiff
+
+  /** RulZ LLM Suite's RE sessions, practice tasks and templates (needs RulZ LLM Suite 0.15.0). */
+  're:overview': () => ReOverview
+  /** Starts a reverse-engineering task (analyse, practice or clone) in the open project. */
+  're:start': (projectPath: string, req: ReStartRequest) => void
   /** Saves the owner's "Things to always remember" for the project. */
   'project:setMemory': (projectPath: string, text: string) => void
 

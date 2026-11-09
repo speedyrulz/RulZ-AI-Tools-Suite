@@ -28,6 +28,7 @@ describe('thinking and drafts from the computer', () => {
       timeline: [],
       tasks: [{ id: 't1', title: 'T', startedAt: 0, outcome: 'running', steps: [], files: [] }],
       running: true,
+      notes: [],
       prompt: null,
       runCommand: null,
       memory: '',

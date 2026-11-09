@@ -54,6 +54,12 @@ The app remembers the computer and reconnects by itself, also after the phone sl
   file in RulZ's models folder) and draft (MTP) tuning, with RulZ's memory estimate as you change them; saving
   restarts a loaded model. This needs RulZ Coding Agent 0.8.0 on the computer; the GPU split, draft tuning and
   estimate need RulZ LLM Suite 0.3.7, and the draft model choice needs RulZ Coding Agent 0.9.2 and RulZ LLM Suite 0.3.9.
+- **Reverse engineering** (⋮ menu, and a card on a new project's first screen): start the tasks RulZ LLM Suite's
+  Reverse Engineering page offers, run on the computer in the open project: analyse a program or folder with the
+  Suite's question templates, clone pieces of it or all of it as new code, or start one of the training kit's
+  **Practice** tasks (with how often each was solved; the answer is checked when the agent finishes). **Done** lists
+  every RE session with its grade. **Record for training** records them in RulZ LLM Suite. Needs RulZ Coding Agent
+  0.18.0 and RulZ LLM Suite 0.15.0 on the computer.
 - **Settings**: the AI model, keeping thinking open, approval level, instructions and extra tools (these change the
   computer's settings);
   this phone's look and name; switch or forget computers. The RulZ LLM Suite address and API key, and phone access

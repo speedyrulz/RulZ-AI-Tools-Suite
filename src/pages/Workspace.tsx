@@ -1,10 +1,11 @@
-import { ArrowLeft, ArrowUp, Brain, Check, ChevronDown, ChevronRight, EllipsisVertical, SlidersHorizontal, History, LoaderCircle, NotebookPen, Package, Play, Settings, Square, Undo2 } from 'lucide-react'
+import { ArrowLeft, ArrowUp, Binary, Brain, Check, ChevronDown, ChevronRight, EllipsisVertical, SlidersHorizontal, History, LoaderCircle, NotebookPen, Package, Play, Settings, Square, Undo2 } from 'lucide-react'
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { splitThink, thinkingOpen } from '@shared/think'
 import { modelLabel } from '../components/common'
 import { LogoMark } from '../components/Logo'
 import { Markdown } from '../components/Markdown'
 import { HistorySheet, NotesSheet } from '../components/ProjectSheets'
+import { ReSheet, useReOverview, type ReTab } from '../components/ReSheet'
 import { RunView } from '../components/RunView'
 import { DraftReadout, FileCount, FileList, StepList, TaskPicker } from '../components/TaskViews'
 import { Button, IconButton, Sheet, Textarea, TopBar } from '../components/ui'
@@ -201,7 +202,7 @@ function MoreSheet({ open, onOpenChange }: { open: boolean; onOpenChange: (open:
   const share = useWorkspace((s) => s.share)
   const go = useUi((s) => s.go)
   const setTab = useUi((s) => s.setTab)
-  const [sheet, setSheet] = useState<'undo' | 'share' | 'history' | 'notes' | null>(null)
+  const [sheet, setSheet] = useState<'undo' | 'share' | 'history' | 'notes' | 're' | null>(null)
   const undoTask = undoableTask(tasks)
 
   const row = (icon: ReactNode, label: string, onClick: () => void, opts: { disabled?: boolean; hint?: string } = {}) => (
@@ -233,11 +234,13 @@ function MoreSheet({ open, onOpenChange }: { open: boolean; onOpenChange: (open:
               }, { disabled: running })}
           {row(<Package size={19} />, 'Share my app', () => setSheet('share'), { disabled: running, hint: 'Make it one file to give to other people' })}
           {row(<Undo2 size={19} />, 'Undo last task', () => setSheet('undo'), { disabled: !undoTask || running, hint: undoTask ? `“${undoTask.title}”` : 'Nothing to undo yet' })}
+          {row(<Binary size={19} />, 'Reverse engineering', () => setSheet('re'), { hint: 'Analyse or clone a program, practice tasks, sessions done' })}
           {row(<History size={19} />, 'History', () => setSheet('history'))}
           {row(<NotebookPen size={19} />, 'Notes', () => setSheet('notes'), { hint: memory ? 'You have notes for this project' : 'Things I should always remember' })}
           {row(<Settings size={19} />, 'Settings', () => go('settings'))}
         </div>
       </Sheet>
+      <ReSheet open={sheet === 're'} onOpenChange={(o) => setSheet(o ? 're' : null)} />
       <HistorySheet open={sheet === 'history'} onOpenChange={(o) => setSheet(o ? 'history' : null)} />
       <NotesSheet open={sheet === 'notes'} onOpenChange={(o) => setSheet(o ? 'notes' : null)} />
       <Sheet
@@ -406,6 +409,13 @@ function ThinkingBox({ text, live }: { text: string; live: boolean }) {
 
 function EmptyState() {
   const project = useWorkspace((s) => s.project)!
+  const connected = useApp((s) => s.connection.status === 'connected')
+  const re = useReOverview(connected)
+  const [reOpen, setReOpen] = useState<ReTab | null>(null)
+  const done = re.data?.sessions.length ?? 0
+  const solved = re.data?.sessions.filter((s) => s.outcome === 'solved').length ?? 0
+  const practice = re.data?.practice.tasks.length ?? 0
+  const unsolved = re.data?.practice.tasks.filter((t) => t.solved === 0).length ?? 0
   return (
     <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto p-6">
       <div className="max-w-md text-center">
@@ -423,6 +433,28 @@ function EmptyState() {
             </button>
           ))}
         </div>
+        {re.data && (
+          <div className="mt-5 rounded-xl border border-border bg-panel p-4 text-left">
+            <div className="flex items-center gap-2 text-[15px] font-semibold">
+              <Binary size={16} className="text-accent" /> Or reverse-engineer a program
+            </div>
+            <div className="mt-1 text-[13px] text-muted">
+              {done} session{done === 1 ? '' : 's'} done ({solved} solved) · {practice} practice task{practice === 1 ? '' : 's'} ({unsolved} not solved)
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <Button size="sm" onClick={() => setReOpen('start')}>
+                Analyse or clone
+              </Button>
+              <Button size="sm" onClick={() => setReOpen('practice')} disabled={!practice}>
+                Practice
+              </Button>
+              <Button size="sm" onClick={() => setReOpen('sessions')} disabled={!done}>
+                Done
+              </Button>
+            </div>
+          </div>
+        )}
+        <ReSheet open={!!reOpen} onOpenChange={(o) => !o && setReOpen(null)} initialTab={reOpen ?? 'start'} />
       </div>
     </div>
   )

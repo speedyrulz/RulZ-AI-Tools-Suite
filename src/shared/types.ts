@@ -32,6 +32,11 @@ export interface AppSettings {
   remoteToken: string
   /** Leave the thought-process box open once the answer starts, instead of folding it away. */
   keepThinkingOpen: boolean
+  /**
+   * Have RulZ LLM Suite record each task as a reverse-engineering session (on its Reverse
+   * Engineering page, where it is graded and exported for fine-tuning).
+   */
+  reRecording: boolean
 }
 
 /** How the model writes its answers. Missing = the recommended value for that model. */
@@ -114,6 +119,9 @@ export interface LoadSettings {
   /** Which draft: null = automatic, 'builtin' = the model's own MTP layers, or a DraftChoice id.
    *  Missing from RulZ LLM Suite before 0.3.9. */
   draftFile?: string | null
+  /** MoE expert offload: 'all' keeps every expert in system RAM, N the experts of the first N layers.
+   *  Missing from RulZ LLM Suite before 0.14.0. */
+  cpuMoe?: 'off' | 'all' | number
 }
 
 /** A draft RulZ LLM Suite can use for a model: its built-in MTP layers or a draft file in the models folder. */
@@ -154,6 +162,8 @@ export interface ModelLoadInfo {
   defaultDraft?: { name: string; builtIn: boolean } | null
   /** Drafts that can be picked; undefined before RulZ LLM Suite 0.3.9. */
   draftChoices?: DraftChoice[]
+  /** Layers with experts for a mixture-of-experts model; null for a dense one, undefined before RulZ LLM Suite 0.14.0. */
+  moeLayers?: number | null
   gpus: GpuInfo[]
   estimate?: LoadEstimate
 }
@@ -195,7 +205,7 @@ export interface ChangedFile {
 }
 
 export type TimelineItem =
-  | { id: string; kind: 'user'; text: string; taskId: string }
+  | { id: string; kind: 'user'; text: string; taskId: string; /** Sent while the task ran; `cut` when it cut the model's reply short. */ note?: 'queued' | 'cut' }
   | { id: string; kind: 'assistant'; text: string; taskId: string; /** The model's thinking before this reply, when it sent any. */ reasoning?: string }
   | {
       id: string
@@ -244,12 +254,22 @@ export interface TaskRecord {
   /** Snapshot taken before the task, for Undo. */
   snapshot?: { kind: 'git'; commit: string } | { kind: 'copy'; dir: string }
   undone?: boolean
+  /** What the model was asked when it differs from the shown request (a button's task), for running it again. */
+  request?: { text: string; howToRun?: boolean; share?: boolean }
+  /** Set for a reverse-engineering task (from the RE panel). */
+  re?: ReTaskInfo
   steps: Step[]
   files: ChangedFile[]
   draft?: DraftStats
 }
 
 /** Everything the workspace needs when a project opens. */
+/** A note the owner wrote while a task runs, waiting to go in before the agent's next step. */
+export interface PendingNote {
+  id: string
+  text: string
+}
+
 export interface ProjectState {
   project: ProjectInfo
   timeline: TimelineItem[]
@@ -260,11 +280,13 @@ export interface ProjectState {
   /** The owner's "Things to always remember" for this project. */
   memory: string
   context: ContextUsage | null
+  /** Notes waiting for the agent's next step. */
+  notes: PendingNote[]
 }
 
 // ---------- Questions the agent asks the owner ----------
 
-export type RiskKind = 'install-global' | 'admin' | 'outside-project' | 'system-settings' | 'internet' | 'delete' | 'stop-programs'
+export type RiskKind = 'install-global' | 'admin' | 'outside-project' | 'system-settings' | 'internet' | 'delete' | 'stop-programs' | 'hidden'
 
 export interface ApprovalRequest {
   id: string
@@ -323,6 +345,7 @@ export type AgentEvent =
   | { type: 'tasks'; projectPath: string; tasks: TaskRecord[] }
   | { type: 'context'; projectPath: string; context: ContextUsage }
   | { type: 'draft'; projectPath: string; taskId: string; draft: DraftStats }
+  | { type: 'notes'; projectPath: string; notes: PendingNote[] }
 
 // ---------- Tool servers (set up in RulZ LLM Suite) ----------
 
@@ -390,6 +413,9 @@ export interface WireMessage {
   content: string
   tool_calls?: WireToolCall[]
   tool_call_id?: string
+  /** Kept here only, never sent: the task this message opens, and the timeline reply it holds. */
+  task?: string
+  item?: string
 }
 
 /** Omit that works on each member of a union separately. */
@@ -433,4 +459,63 @@ export interface FolderListing {
   path: string
   parent: string | null
   folders: string[]
+}
+// ---------- Reverse engineering (RE mode in RulZ LLM Suite) ----------
+
+export type ReOutcome = 'unrated' | 'solved' | 'partial' | 'failed'
+export type ReKind = 'analyse' | 'practice' | 'clone-pieces' | 'clone-full'
+
+/** One RE session RulZ LLM Suite knows about (its own or another app's). */
+export interface ReSessionSummary {
+  id: string
+  title: string
+  /** "RulZ LLM Suite", or the app that ran it. */
+  source: string
+  kind: ReKind
+  target: string
+  goal: string
+  outcome: ReOutcome
+  practice?: { taskId: string; family: string; tier: string; answer?: string; expected?: string }
+  responses: number
+  toolRounds: number
+  updatedAt: number
+}
+
+export interface RePracticeTaskStats {
+  id: string
+  family: string
+  tier: string
+  binary: string
+  /** The task's question; {exe} stands for the program's path. */
+  prompt: string
+  attempts: number
+  solved: number
+}
+
+/** RulZ LLM Suite's RE sessions, practice tasks and prompt templates (GET /v1/re/overview). */
+export interface ReOverview {
+  recording: boolean
+  sessions: ReSessionSummary[]
+  practice: { kitDir: string; error?: string; tasks: RePracticeTaskStats[] }
+  /** {target} is replaced by the target path. */
+  goals: { label: string; text: string }[]
+  clonePieces: { label: string; text: string }[]
+  /** '' = the same language as the original. */
+  cloneLanguages: string[]
+}
+
+/** An RE task to start in the open project. `record` (default true) records it in RulZ LLM Suite. */
+export type ReStartRequest =
+  | { kind: 'analyse'; target: string; goal: string; record?: boolean }
+  | { kind: 'practice'; taskId: string; record?: boolean }
+  | { kind: 'clone'; target: string; scope: 'pieces' | 'full'; details: string; language: string; record?: boolean }
+
+/** What a task started as an RE task was (kept on the task for recording and grading). */
+export interface ReTaskInfo {
+  kind: ReKind
+  target: string
+  goal: string
+  record: boolean
+  language?: string
+  practice?: { taskId: string; family: string; tier: string; answer?: string | null; expected?: string; passed?: boolean }
 }
