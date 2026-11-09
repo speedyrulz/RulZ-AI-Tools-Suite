@@ -7,6 +7,7 @@ import { getDefaultEnvironment, StdioClientTransport } from '@modelcontextprotoc
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import type { McpConfigState, McpServerConfig, McpServerStatus, McpToolInfo, ToolResult, WireToolCall } from '@shared/types'
 import { FILE_TOOL_DEFS, FILE_TOOLS_SERVER, runFileTool } from '../files/fileTools'
+import type { FileToolScope } from '@shared/types'
 import { contentToText, EMPTY_CONFIG, parseMcpConfig, qualifyToolName, qualifyToolNames, readMcpConfigFile } from './config'
 
 const MAX_LOG = 200
@@ -322,7 +323,7 @@ export class McpManager {
   }
 
   /** Runs a tool. Aborting `signal` stops the call and tells the server it was cancelled. */
-  async callTool(call: Pick<WireToolCall['function'], 'name' | 'arguments'>, signal?: AbortSignal): Promise<ToolResult> {
+  async callTool(call: Pick<WireToolCall['function'], 'name' | 'arguments'>, signal?: AbortSignal, files?: FileToolScope): Promise<ToolResult> {
     const stopped: ToolResult = { text: 'The tool call was stopped.', isError: true }
     if (signal?.aborted) return stopped
     const found = this.findTool(call.name)
@@ -333,7 +334,7 @@ export class McpManager {
       } catch {
         return { text: `The tool arguments were not valid JSON: ${call.arguments}`, isError: true }
       }
-      const res = await runFileTool(found.tool.name, args, signal)
+      const res = await runFileTool(found.tool.name, args, signal, files)
       if (signal?.aborted) return stopped
       return res.text.length > MAX_RESULT_CHARS
         ? { ...res, text: `${res.text.slice(0, MAX_RESULT_CHARS)}\n…[truncated ${res.text.length - MAX_RESULT_CHARS} characters]` }

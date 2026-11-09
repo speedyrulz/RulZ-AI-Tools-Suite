@@ -7,6 +7,15 @@ import http from 'node:http'
 import { parseLoadConfig } from '../src/main/settings/schema'
 import { applyRemoteLoadPatch, authorized, overrideSampling, draftChoices, draftFileFromRemote, hoistSystemMessages, parseRemoteLoadPatch, parseUsage, pickModel, publicModelId, remoteLoadView, resolveModel, UsageReader } from '../src/main/server/helpers'
 
+/** A port the OS says is free right now (random ones sometimes clash with something already listening). */
+const freePort = async (): Promise<number> => {
+  const s = http.createServer()
+  await new Promise<void>((r) => s.listen(0, '127.0.0.1', () => r()))
+  const port = (s.address() as { port: number }).port
+  await new Promise<void>((r) => s.close(() => r()))
+  return port
+}
+
 const model = (id: string, name: string): ModelEntry => ({
   id,
   name,
@@ -255,7 +264,7 @@ describe('GET/POST /v1/models/{id}/load-config', () => {
         return { ...ready, instanceId: 'i2', config: saved[id] }
       }
     } as unknown as InstanceManager
-    const port = 41000 + Math.floor(Math.random() * 2000)
+    const port = await freePort()
     const server = new ApiServer({
       instances,
       getModels: () => models,
@@ -311,7 +320,7 @@ describe('POST /v1/models/{id}/unload', () => {
         running = running.filter((i) => i.instanceId !== id)
       }
     } as unknown as InstanceManager
-    const port = 41000 + Math.floor(Math.random() * 2000)
+    const port = await freePort()
     const server = new ApiServer({
       instances,
       getModels: () => models,
@@ -380,7 +389,7 @@ describe('model sampling defaults', () => {
     let config = { ...DEFAULT_LOAD_CONFIG, sampling }
     const instance = (): LoadedInstance => ({ instanceId: 'i1', modelId: models[0].id, status: 'ready', port: upstreamPort, config, contextLength: 8192 }) as unknown as LoadedInstance
     const instances = { list: () => [instance()], readyFor: () => instance(), acquire: () => () => undefined } as unknown as InstanceManager
-    const port = 41000 + Math.floor(Math.random() * 2000)
+    const port = await freePort()
     const server = new ApiServer({
       instances,
       getModels: () => models,
@@ -437,7 +446,7 @@ describe('API server requests and model lifetimes', () => {
     await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()))
     return { server, port: (server.address() as { port: number }).port }
   }
-  const randomPort = (): number => 43000 + Math.floor(Math.random() * 2000)
+  // (ports come from freePort, at the top)
   const post = (port: number, body: unknown): http.ClientRequest => {
     const req = http.request({ host: '127.0.0.1', port, method: 'POST', path: '/v1/chat/completions', headers: { 'Content-Type': 'application/json' } })
     req.on('error', () => undefined)
@@ -460,7 +469,7 @@ describe('API server requests and model lifetimes', () => {
       acquire: () => () => undefined
     }
     const log: ApiRequestLog[] = []
-    const port = randomPort()
+    const port = await freePort()
     const server = makeServer(instances, port, log)
     await server.start()
     try {
@@ -498,7 +507,7 @@ describe('API server requests and model lifetimes', () => {
       }
     }
     const log: ApiRequestLog[] = []
-    const port = randomPort()
+    const port = await freePort()
     const server = makeServer(instances, port, log)
     await server.start()
     try {
@@ -526,7 +535,7 @@ describe('API server requests and model lifetimes', () => {
         return { instance: { instanceId: id, modelId }, started: started.get(id) }
       }
     }
-    const server = makeServer(instances, randomPort())
+    const server = makeServer(instances, await freePort())
     const ensureLoaded = (id: string): Promise<LoadedInstance> =>
       (server as unknown as { ensureLoaded: (id: string) => Promise<LoadedInstance> }).ensureLoaded(id)
     await ensureLoaded(models[0].id)
@@ -542,7 +551,7 @@ describe('API server requests and model lifetimes', () => {
       idleSince: () => idleSince,
       unload: async (id: string) => void unloaded.push(id)
     }
-    const server = makeServer(instances, randomPort(), [], 1)
+    const server = makeServer(instances, await freePort(), [], 1)
     const internals = server as unknown as { jit: Map<string, number>; unloadIdle: () => Promise<void> }
     // Last used by the API long ago, but in use now (a long stream, or a chat in the app).
     internals.jit.set('i1', 0)

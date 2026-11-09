@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { toolTokens } from '@shared/tools'
-import type { McpConfigState, McpServerStatus, McpToolInfo, ToolRequest } from '@shared/types'
+import { CLONE_FILE_TOOLS } from '@shared/re'
+import type { FileToolScope, McpConfigState, McpServerStatus, McpToolInfo, ToolRequest } from '@shared/types'
 import { invoke, on } from '../lib/api'
 import { once } from '../lib/once'
 import { useApp } from './app'
@@ -32,8 +33,10 @@ export function findTool(qualifiedName: string): McpToolInfo | undefined {
 }
 
 /** Connected tools the user has not switched off. */
-export function availableTools(): McpToolInfo[] {
+/** Connected, switched-on tools. The write/read file tools are included only for clone sessions. */
+export function availableTools(opts: { clone?: boolean } = {}): McpToolInfo[] {
   const disabled = new Set(useApp.getState().settings?.disabledTools ?? [])
+  if (!opts.clone) for (const n of CLONE_FILE_TOOLS) disabled.add(n)
   return useMcp
     .getState()
     .servers.filter((s) => s.state === 'connected')
@@ -51,6 +54,8 @@ export function tokensOf(names: string[]): number {
 /** Tool options of an RE session: tools are on even when chats have them off, with the RE budget. */
 export interface ToolOptions {
   re?: boolean
+  /** Clone sessions: where the write/read file tools may work. */
+  files?: FileToolScope
 }
 
 /** Token budget for loaded tool descriptions. */
@@ -63,7 +68,7 @@ export function toolBudget(opts: ToolOptions = {}): number {
 export function effectiveToolMode(opts: ToolOptions = {}): 'all' | 'dynamic' | null {
   const s = useApp.getState().settings
   if (!s || (!s.toolsEnabled && !opts.re)) return null
-  const tools = availableTools()
+  const tools = availableTools({ clone: !!opts.files })
   if (!tools.length) return null
   if (s.toolMode !== 'auto') return s.toolMode
   return tools.reduce((sum, t) => sum + toolTokens(t), 0) > toolBudget(opts) ? 'dynamic' : 'all'
@@ -73,6 +78,10 @@ export function effectiveToolMode(opts: ToolOptions = {}): 'all' | 'dynamic' | n
 export function toolRequestFor(activeTools: string[] | undefined, opts: ToolOptions = {}): ToolRequest | undefined {
   const mode = effectiveToolMode(opts)
   if (!mode) return undefined
-  const available = new Set(availableTools().map((t) => t.qualifiedName))
-  return { mode, active: mode === 'dynamic' ? (activeTools ?? []).filter((n) => available.has(n)) : [] }
+  const available = new Set(availableTools({ clone: !!opts.files }).map((t) => t.qualifiedName))
+  return {
+    mode,
+    active: mode === 'dynamic' ? (activeTools ?? []).filter((n) => available.has(n)) : [],
+    ...(opts.files ? { files: opts.files } : {})
+  }
 }

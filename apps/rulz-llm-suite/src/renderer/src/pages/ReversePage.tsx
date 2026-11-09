@@ -1,8 +1,8 @@
 import { Download, FileSearch, FolderOpen, GraduationCap, LoaderCircle, MessageSquare, Play, RefreshCw, Trash2 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { toast } from 'sonner'
-import { RE_DEFAULT_MODEL_ID, RE_GOALS } from '@shared/re'
-import type { ReOutcome, RePracticeInfo, ReSettings, ReTraceInfo } from '@shared/types'
+import { CLONE_LANGUAGES, CLONE_PIECES, RE_DEFAULT_MODEL_ID, RE_GOALS } from '@shared/re'
+import type { ReClone, ReOutcome, RePracticeInfo, ReSettings, ReTraceInfo } from '@shared/types'
 import { OutcomeButtons } from '../components/chat/ReBanner'
 import { Badge, Button, Field, IconButton, Input, NumberInput, Select, Switch, Textarea, Tooltip } from '../components/ui'
 import { errorMessage, invoke, on } from '../lib/api'
@@ -71,6 +71,11 @@ export function ReversePage() {
           <Field inline label="Most tool rounds per reply" hint="An RE answer often takes 20–60 tool calls.">
             <div className="w-24">
               <NumberInput value={re.maxToolRounds} min={1} max={500} onChange={(v) => setRe('maxToolRounds', v ?? 80)} />
+            </div>
+          </Field>
+          <Field inline label="Most tool rounds in a clone session" hint="Rebuilding a program takes many more rounds: studying it, then writing each file.">
+            <div className="w-24">
+              <NumberInput value={re.cloneMaxToolRounds} min={1} max={2000} onChange={(v) => setRe('cloneMaxToolRounds', v ?? 400)} />
             </div>
           </Field>
           <Field inline label="Tool description budget (tokens)" hint="How many tool descriptions stay loaded at once in on-demand mode.">
@@ -153,6 +158,26 @@ function ModelSelect() {
   )
 }
 
+/** A row of preset buttons that fill a text box; the one matching the text is highlighted. */
+function ChipRow({ items, value, onPick }: { items: { label: string; text: string }[]; value: string; onPick: (text: string) => void }) {
+  return (
+    <div className="mb-1.5 flex flex-wrap gap-1">
+      {items.map((g) => (
+        <button
+          key={g.label}
+          onClick={() => onPick(g.text)}
+          className={cn(
+            'rounded-md border px-2 py-0.5 text-[11.5px] transition-colors',
+            value === g.text ? 'border-accent/50 bg-accent-soft text-accent' : 'border-border text-muted hover:bg-hover hover:text-text'
+          )}
+        >
+          {g.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
 function NewSession({ re }: { re: ReSettings }) {
   const startRe = useChat((s) => s.startRe)
   const busy = useChat((s) => isChatBusy(s))
@@ -160,6 +185,23 @@ function NewSession({ re }: { re: ReSettings }) {
   const [goal, setGoal] = useState(RE_GOALS[0].text)
   const [collect, setCollect] = useState(re.collect)
   useEffect(() => setCollect(re.collect), [re.collect])
+  const [mode, setMode] = useState<'analyse' | 'clone'>('analyse')
+  const [scope, setScope] = useState<ReClone['scope']>('pieces')
+  const [pieces, setPieces] = useState(CLONE_PIECES[0].text)
+  const [fullNotes, setFullNotes] = useState('')
+  const [language, setLanguage] = useState('')
+  const [outputDir, setOutputDir] = useState('')
+  const pickOutput = async (): Promise<void> => {
+    const p = await invoke('dialog:pickFolder', { title: 'Folder for the cloned code' })
+    if (p) setOutputDir(p)
+  }
+  const sameFolder = !!outputDir.trim() && !!target.trim() && outputDir.trim().replace(/[\\/]+$/, '').toLowerCase() === target.trim().replace(/[\\/]+$/, '').toLowerCase()
+  const cloneReady = !!outputDir.trim() && !sameFolder && (scope === 'full' || !!pieces.trim())
+  const start = (): void => {
+    const clone: ReClone | undefined =
+      mode === 'clone' ? { scope, details: scope === 'full' ? fullNotes : pieces, language, outputDir: outputDir.trim() } : undefined
+    void startRe({ target: target.trim(), goal: clone ? `Clone (${scope === 'full' ? 'whole program' : 'pieces'})` : goal, collect, modelId: re.modelId || null, clone })
+  }
 
   const pickFile = async (): Promise<void> => {
     const p = await invoke('dialog:pickFile', {
@@ -198,23 +240,81 @@ function NewSession({ re }: { re: ReSettings }) {
           <Button onClick={() => void pickFolder()}>Folder…</Button>
         </div>
       </Field>
-      <Field label="What to find out" hint="{target} is replaced by the path.">
-        <div className="mb-1.5 flex flex-wrap gap-1">
-          {RE_GOALS.map((g) => (
+      <div className="flex gap-1 rounded-lg border border-border bg-panel-2/50 p-0.5 text-[12.5px]">
+        {(
+          [
+            ['analyse', 'Analyse', 'Explain what it does and find specific answers'],
+            ['clone', 'Clone', 'Rebuild pieces of it, or all of it, as new source code']
+          ] as const
+        ).map(([value, label, hint]) => (
+          <Tooltip key={value} content={hint}>
             <button
-              key={g.label}
-              onClick={() => setGoal(g.text)}
-              className={cn(
-                'rounded-md border px-2 py-0.5 text-[11.5px] transition-colors',
-                goal === g.text ? 'border-accent/50 bg-accent-soft text-accent' : 'border-border text-muted hover:bg-hover hover:text-text'
-              )}
+              onClick={() => setMode(value)}
+              className={cn('flex-1 rounded-md px-3 py-1 transition-colors', mode === value ? 'bg-accent-soft text-accent' : 'text-muted hover:bg-hover hover:text-text')}
             >
-              {g.label}
+              {label}
             </button>
-          ))}
-        </div>
-        <Textarea rows={3} value={goal} onChange={(e) => setGoal(e.target.value)} />
-      </Field>
+          </Tooltip>
+        ))}
+      </div>
+      {mode === 'analyse' ? (
+        <Field label="What to find out" hint="{target} is replaced by the path.">
+          <ChipRow items={RE_GOALS} value={goal} onPick={setGoal} />
+          <Textarea rows={3} value={goal} onChange={(e) => setGoal(e.target.value)} />
+        </Field>
+      ) : (
+        <>
+          <Field label="What to clone">
+            <div className="mb-1.5 flex gap-4 text-[12.5px]">
+              {(
+                [
+                  ['pieces', 'Specific pieces'],
+                  ['full', 'The whole program']
+                ] as const
+              ).map(([value, label]) => (
+                <label key={value} className="flex items-center gap-1.5">
+                  <input type="radio" name="clone-scope" checked={scope === value} onChange={() => setScope(value)} />
+                  {label}
+                </label>
+              ))}
+            </div>
+            {scope === 'pieces' ? (
+              <>
+                <ChipRow items={CLONE_PIECES} value={pieces} onPick={setPieces} />
+                <Textarea rows={3} value={pieces} placeholder="Which parts to rebuild, as exactly as you can say it" onChange={(e) => setPieces(e.target.value)} />
+              </>
+            ) : (
+              <Textarea
+                rows={2}
+                value={fullNotes}
+                placeholder="Optional: anything to keep, change or leave out (for example: no auto-updater, command-line only)"
+                onChange={(e) => setFullNotes(e.target.value)}
+              />
+            )}
+          </Field>
+          <div className="grid grid-cols-[10rem_1fr] gap-4">
+            <Field label="Language">
+              <Select value={language} onChange={(e) => setLanguage(e.target.value)}>
+                {CLONE_LANGUAGES.map((l) => (
+                  <option key={l} value={l}>
+                    {l || 'Same as the original'}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Output folder" hint={sameFolder ? 'Pick a different folder from the target.' : 'The session can write only here.'}>
+              <div className="flex gap-2">
+                <Input className="font-mono text-xs" value={outputDir} placeholder="C:\path\to\clone" onChange={(e) => setOutputDir(e.target.value)} />
+                <Button onClick={() => void pickOutput()}>Folder…</Button>
+              </div>
+            </Field>
+          </div>
+          <div className="text-[11.5px] text-faint">
+            Clone sessions can run up to {re.cloneMaxToolRounds} tool rounds and keep NOTES.md and README.md in the output folder. Only clone software
+            you have the right to.
+          </div>
+        </>
+      )}
       <div className="grid grid-cols-[1fr_auto] items-end gap-4">
         <ModelSelect />
         <label className="flex h-8.5 items-center gap-2 text-[13px]">
@@ -225,10 +325,10 @@ function NewSession({ re }: { re: ReSettings }) {
       <div className="flex justify-end">
         <Button
           variant="primary"
-          disabled={!target.trim() || !goal.trim() || busy}
-          onClick={() => void startRe({ target: target.trim(), goal, collect, modelId: re.modelId || null })}
+          disabled={!target.trim() || busy || (mode === 'analyse' ? !goal.trim() : !cloneReady)}
+          onClick={start}
         >
-          <Play size={14} /> Start session
+          <Play size={14} /> {mode === 'clone' ? 'Start cloning' : 'Start session'}
         </Button>
       </div>
     </Card>

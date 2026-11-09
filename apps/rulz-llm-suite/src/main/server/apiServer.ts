@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import http, { type IncomingMessage, type ServerResponse } from 'node:http'
-import type { ApiReSession, ApiRequestLog, ApiServerSettings, ApiServerStatus, GpuStat, LoadConfig, LoadedInstance, MemoryEstimate, ModelEntry } from '@shared/types'
+import type { ApiReSession, ReOverview, ApiRequestLog, ApiServerSettings, ApiServerStatus, GpuStat, LoadConfig, LoadedInstance, MemoryEstimate, ModelEntry } from '@shared/types'
 import { fileName } from '@shared/draft'
 import { API_RE_ID, RE_OUTCOMES, RE_SESSION_HEADER } from '@shared/re'
 import type { RecordedRound } from '../chat/service'
@@ -55,6 +55,11 @@ const LOAD_CONFIG_SUFFIX = '/load-config'
 const UNLOAD_SUFFIX = '/unload'
 /** GET or POST /v1/re/sessions/{id} reads or describes and grades an RE session another app runs. */
 const RE_SESSIONS_PREFIX = '/v1/re/sessions/'
+/** GET /v1/re/overview: every RE session, the practice tasks and the prompt templates. */
+const RE_OVERVIEW = '/v1/re/overview'
+/** POST /v1/re/practice/{task}/prepare copies a task's binary into a work folder; .../grade checks an answer. */
+const RE_PRACTICE_PREFIX = '/v1/re/practice/'
+const PRACTICE_ID = /^[\w-]{1,80}$/
 
 export interface ApiServerDeps {
   instances: InstanceManager
@@ -73,6 +78,9 @@ export interface ApiServerDeps {
     record: (id: string, round: RecordedRound) => void
     session: (id: string) => Promise<ApiReSession | null>
     update: (id: string, patch: Partial<ApiReSession>) => Promise<ApiReSession>
+    overview: () => Promise<ReOverview>
+    preparePractice: (taskId: string) => Promise<{ target: string; prompt: string; family: string; tier: string }>
+    gradePractice: (taskId: string, target: string, text: string) => Promise<{ answer: string | null; passed: boolean; expected: string }>
   }
 }
 
@@ -247,6 +255,37 @@ export class ApiServer {
         if (!model) return fail(404, 'Model not found.', 'not_found_error')
         const unloaded = await this.unloadModel(model.id)
         res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ ...(this.modelEntry(model) as object), unloaded }))
+        return finish(200)
+      }
+      if (path === RE_OVERVIEW && method === 'GET') {
+        if (!this.deps.re) return fail(404, `Unknown endpoint: ${method} ${path}`, 'not_found_error')
+        res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(await this.deps.re.overview()))
+        return finish(200)
+      }
+      if (path.startsWith(RE_PRACTICE_PREFIX) && method === 'POST') {
+        const re = this.deps.re
+        if (!re) return fail(404, `Unknown endpoint: ${method} ${path}`, 'not_found_error')
+        const [rawId, action, ...rest] = path.slice(RE_PRACTICE_PREFIX.length).split('/')
+        const taskId = decodeURIComponent(rawId ?? '')
+        if (rest.length || (action !== 'prepare' && action !== 'grade')) return fail(404, `Unknown endpoint: ${method} ${path}`, 'not_found_error')
+        if (!PRACTICE_ID.test(taskId)) return fail(400, 'Practice task ids are 1-80 letters, digits, _ or -.', 'invalid_request_error')
+        let json: Record<string, unknown>
+        try {
+          json = JSON.parse((await readBody(req)).toString('utf8') || '{}') as Record<string, unknown>
+        } catch {
+          return fail(400, 'The request body is not valid JSON.')
+        }
+        let out: unknown
+        try {
+          if (action === 'prepare') out = await re.preparePractice(taskId)
+          else {
+            if (typeof json.target !== 'string' || typeof json.text !== 'string') return fail(400, 'target and text must be strings.', 'invalid_request_error')
+            out = await re.gradePractice(taskId, json.target, json.text.slice(-20000))
+          }
+        } catch (e) {
+          return fail(400, e instanceof Error ? e.message : String(e), 'invalid_request_error')
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(out))
         return finish(200)
       }
       if (path.startsWith(RE_SESSIONS_PREFIX) && (method === 'GET' || method === 'POST')) {
@@ -630,6 +669,23 @@ export function parseReSessionPatch(json: Record<string, unknown>): Partial<ApiR
   if (json.outcome !== undefined) {
     if (!(RE_OUTCOMES as readonly unknown[]).includes(json.outcome)) return `outcome must be one of ${RE_OUTCOMES.join(', ')}.`
     patch.outcome = json.outcome as ApiReSession['outcome']
+  }
+  if (json.kind !== undefined) {
+    if (!['analyse', 'practice', 'clone-pieces', 'clone-full'].includes(json.kind as string)) return 'kind must be analyse, practice, clone-pieces or clone-full.'
+    patch.kind = json.kind as ApiReSession['kind']
+  }
+  if (json.practice !== undefined) {
+    const p = json.practice as Record<string, unknown> | null
+    const str = (v: unknown, max: number): boolean => typeof v === 'string' && v.length <= max
+    if (!p || typeof p !== 'object' || !str(p.taskId, 80) || !str(p.family, 80) || !str(p.tier, 40)) return 'practice needs taskId, family and tier strings.'
+    if ((p.answer !== undefined && !str(p.answer, 4000)) || (p.expected !== undefined && !str(p.expected, 4000))) return 'practice answer and expected must be strings.'
+    patch.practice = {
+      taskId: p.taskId as string,
+      family: p.family as string,
+      tier: p.tier as string,
+      ...(p.answer !== undefined ? { answer: p.answer as string } : {}),
+      ...(p.expected !== undefined ? { expected: p.expected as string } : {})
+    }
   }
   return patch
 }

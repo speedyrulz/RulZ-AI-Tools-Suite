@@ -70,6 +70,15 @@ The light look is one click away: use the sun/moon button in the top bar (or **S
   page, labelled RulZ Coding Agent, where you grade them and export the good ones as `train.jsonl` for fine-tuning.
   Each model turn carries an `x-rulz-re-session: agent-<task id>` header, and the task's title, project folder and
   request are sent once to `POST /v1/re/sessions/{id}`. Needs RulZ LLM Suite 0.13.0 or later; older versions ignore it.
+- **Reverse engineering** (top bar, and a card on a new project's first screen): the tasks RulZ LLM Suite's Reverse
+  Engineering page offers, run by the agent in the open project. **Start a task** analyses a program or folder with
+  the Suite's question templates (Overview, License check, Network, …) or **clones** it: specific pieces (file format,
+  protocol, algorithm, …) or the whole program, as new code in the language you pick, written into the project.
+  **Practice** lists the training kit's tasks with how often each was tried and solved; **Start** has the Suite copy
+  the task's program into a fresh work folder, and when the agent finishes, its `ANSWER:` line is checked and the
+  result shows in the chat. **Done** lists every RE session the Suite knows (its own chats and other apps' tasks) with
+  its grade. With **Record for training** on (the default), these tasks are recorded in the Suite even when the
+  setting above is off, and practice tasks are graded there automatically. Needs RulZ LLM Suite 0.15.0 or later.
 - **Switch models from the top bar**: click the model name to pick another model (not during a task).
   **Settings → Model settings** has two parts. **How it writes** sets temperature, top P, top K, repeat penalty,
   the longest answer and thinking (on/off, reasoning effort, thinking budget and its message), saved per model; empty

@@ -164,6 +164,20 @@ export interface ReSettings {
   toolBudgetTokens: number
   /** Record API requests that other apps (RulZ Coding Agent) mark as RE sessions. */
   recordApi: boolean
+  /** Rounds of tool calls a clone session may make (rebuilding takes far more than answering). */
+  cloneMaxToolRounds: number
+}
+
+/** A clone session rebuilds part or all of the target as new source code in `outputDir`. */
+export interface ReClone {
+  /** 'pieces': chosen parts only; 'full': the whole program. */
+  scope: 'pieces' | 'full'
+  /** What to rebuild (pieces), or what to keep or leave out (full). */
+  details: string
+  /** Language for the new code; '' = the model picks (usually the original's). */
+  language: string
+  /** Folder the new code is written to; the only place the session's write tool may write. */
+  outputDir: string
 }
 
 export type ReOutcome = 'unrated' | 'solved' | 'partial' | 'failed'
@@ -181,6 +195,8 @@ export interface ReSession {
   notes?: string
   /** Practice task from the RE training kit. */
   practice?: { taskId: string; family: string; tier: string; answer?: string; expected?: string }
+  /** Set for a clone session. */
+  clone?: ReClone
 }
 
 /** One RE session's recorded data, as listed on the Reverse Engineering page. */
@@ -208,6 +224,50 @@ export interface ApiReSession {
   outcome: ReOutcome
   notes?: string
   createdAt: number
+  /** What kind of RE task it was; absent = analyse. */
+  kind?: ReKind
+  /** A practice task from the training kit, with the answer given and the expected one once graded. */
+  practice?: { taskId: string; family: string; tier: string; answer?: string; expected?: string }
+}
+
+export type ReKind = 'analyse' | 'practice' | 'clone-pieces' | 'clone-full'
+
+/** One RE session as other apps see it (GET /v1/re/overview). */
+export interface ReSessionSummary {
+  /** Conversation id here, or api-<id> for a session another app ran. */
+  id: string
+  title: string
+  /** "RulZ LLM Suite", or the app that ran it. */
+  source: string
+  kind: ReKind
+  target: string
+  goal: string
+  outcome: ReOutcome
+  practice?: { taskId: string; family: string; tier: string; answer?: string; expected?: string }
+  /** Recorded model responses and tool rounds (0 when nothing was recorded). */
+  responses: number
+  toolRounds: number
+  updatedAt: number
+}
+
+/** A practice task with how often it was tried and solved. */
+export interface RePracticeTaskStats extends RePracticeTask {
+  attempts: number
+  solved: number
+}
+
+/** Everything other apps need to show and start RE tasks (GET /v1/re/overview). */
+export interface ReOverview {
+  object: 're.overview'
+  /** Whether requests marked as RE sessions are recorded. */
+  recording: boolean
+  /** Newest first. */
+  sessions: ReSessionSummary[]
+  practice: { kitDir: string; error?: string; tasks: RePracticeTaskStats[] }
+  /** Prompt templates; {target} is replaced by the target path. */
+  goals: { label: string; text: string }[]
+  clonePieces: { label: string; text: string }[]
+  cloneLanguages: string[]
 }
 
 export interface RePracticeTask {
@@ -306,6 +366,16 @@ export interface ToolRequest {
   mode: 'all' | 'dynamic'
   /** Loaded tools (qualified names) in dynamic mode. */
   active: string[]
+  /** Clone sessions: offer the write/read file tools, limited to this scope. */
+  files?: FileToolScope
+}
+
+/** Where the built-in write_file and read_file tools may work (clone sessions only). */
+export interface FileToolScope {
+  /** The only folder write_file may write in. */
+  writeRoot: string
+  /** The analysed file or folder; read_file may read it too, and write_file never touches it. */
+  target: string
 }
 
 export interface ToolSearchHit {

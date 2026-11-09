@@ -8,6 +8,7 @@ import { ToolServers } from './mcp/toolServers'
 import { FIX_RUN_SHOWN, fixRunTask, SHARE_SHOWN, SHARE_TASK, systemPrompt } from './agent/prompt'
 import { childPids } from './agent/childPids'
 import { ProjectSession } from './agent/session'
+import { practiceTask, reTask } from './agent/reTasks'
 import { broadcast, handle, invokeHandler, onBroadcast } from './ipc'
 import { checkPageInWindow } from './project/pageWindow'
 import { AppRunner } from './project/runApp'
@@ -274,6 +275,10 @@ async function main(): Promise<void> {
     const r = await dialog.showOpenDialog(mainWindow!, { title, defaultPath, properties: ['openDirectory', 'createDirectory'] })
     return r.canceled ? null : (r.filePaths[0] ?? null)
   })
+  handle('dialog:pickFile', async ({ title, defaultPath }) => {
+    const r = await dialog.showOpenDialog(mainWindow!, { title, defaultPath, properties: ['openFile'] })
+    return r.canceled ? null : (r.filePaths[0] ?? null)
+  })
   handle('shell:showItem', (path) => shell.showItemInFolder(path))
   handle('shell:openUrl', async (url) => {
     if (!/^https?:\/\//i.test(url)) throw new Error('Only web addresses can be opened.')
@@ -328,6 +333,16 @@ async function main(): Promise<void> {
 
   handle('task:start', (path, text) => requireSession(path).start(text))
   handle('task:stop', (path) => requireSession(path).stop())
+  handle('re:overview', () => client.reOverview())
+  handle('re:start', async (path, req) => {
+    const s = requireSession(path)
+    if (s.isRunning) throw new Error('A task is already running. Wait for it to finish or press Stop.')
+    const t =
+      req.kind === 'practice'
+        ? practiceTask(await client.preparePractice(req.taskId), req.taskId, req.record !== false)
+        : reTask(req, s.root)
+    s.start(t.text, { shown: t.shown, re: t.info })
+  })
   handle('task:answer', (path, id, answer) => requireSession(path).answer(id, answer))
   handle('task:note', (path, text, interrupt) => requireSession(path).addNote(text, interrupt))
   handle('task:cancelNote', (path, id) => requireSession(path).cancelNote(id))

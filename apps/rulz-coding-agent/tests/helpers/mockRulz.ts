@@ -144,6 +144,25 @@ export async function startMockRulz(opts: MockOptions = {}) {
         estimate: { gpuBytes, totalBytes: gpuBytes, verdict: 'fits', perGpu }
       })
     }
+    if (url.pathname === '/v1/re/overview' && !opts.lmStudio) {
+      return json(200, {
+        object: 're.overview',
+        recording: true,
+        sessions: [],
+        practice: { kitDir: 'k', tasks: [{ id: 'xor-1', family: 'xor', tier: 't1', binary: 'xor.exe', prompt: 'Key of {exe}?', attempts: 0, solved: 0 }] },
+        goals: [{ label: 'Overview', text: 'Analyze {target}.' }],
+        clonePieces: [],
+        cloneLanguages: ['']
+      })
+    }
+    if (url.pathname === '/v1/re/practice/xor-1/prepare' && req.method === 'POST' && !opts.lmStudio) {
+      return json(200, { target: 'C:\\work\\xor-1\\1\\xor.exe', prompt: 'What is the key in C:\\work\\xor-1\\1\\xor.exe?', family: 'xor', tier: 't1' })
+    }
+    if (url.pathname === '/v1/re/practice/xor-1/grade' && req.method === 'POST' && !opts.lmStudio) {
+      const body = JSON.parse(await readBody(req)) as { text: string }
+      const m = /ANSWER:\s*(\S+)/.exec(body.text)
+      return json(200, { answer: m?.[1] ?? null, passed: m?.[1] === '42', expected: '42' })
+    }
     if (url.pathname.startsWith('/v1/re/sessions/') && req.method === 'POST' && !opts.lmStudio) {
       const id = decodeURIComponent(url.pathname.slice('/v1/re/sessions/'.length))
       const body = JSON.parse(await readBody(req)) as Record<string, unknown>

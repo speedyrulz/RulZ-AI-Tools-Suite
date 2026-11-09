@@ -1,6 +1,6 @@
 // Reverse engineering mode: the system prompt, which tools it starts with, and which of them may
 // run without asking.
-import type { ReSettings, SamplingParams } from './types'
+import type { ReClone, ReSettings, SamplingParams } from './types'
 
 /** The model RE mode was first tuned for (id relative to the models folder). */
 export const RE_DEFAULT_MODEL_ID = 'Ornith 1.5 35B/Ornith-1.5-35B-A3B-Heretic-MTP-APEX-I-Mini.gguf'
@@ -12,7 +12,8 @@ export const DEFAULT_RE_SETTINGS: ReSettings = {
   autoApproveStatic: true,
   maxToolRounds: 80,
   toolBudgetTokens: 16000,
-  recordApi: true
+  recordApi: true,
+  cloneMaxToolRounds: 400
 }
 
 /**
@@ -72,6 +73,52 @@ export const RE_GOALS: { label: string; text: string }[] = [
   { label: 'Crypto & encoding', text: 'Analyze {target}: which hashing, encryption or encoding routines does it contain? Identify each algorithm and where it is used.' },
   { label: 'Hidden strings', text: 'Analyze {target}: find strings that are obfuscated or built at run time and decode them.' }
 ]
+
+// ---------- Clone sessions ----------
+
+/** Built-in tools only clone sessions get (they write and read in the output folder). */
+export const CLONE_FILE_TOOLS = ['rulz__write_file', 'rulz__read_file']
+
+/** Starting points for "Specific pieces"; the text fills the details box. */
+export const CLONE_PIECES: { label: string; text: string }[] = [
+  { label: 'File format', text: 'The code that reads and writes its data/save files: a reader and writer that produce byte-identical files.' },
+  { label: 'Network protocol', text: 'Its network protocol: a client that sends and parses the same messages, with the same framing, encoding and checks.' },
+  { label: 'Algorithm', text: 'Its core algorithm (hashing, checksum, compression, encryption or key derivation), giving the same output for the same input.' },
+  { label: 'License logic', text: 'Its license or serial-number validation, reimplemented with the same accept/reject behaviour.' },
+  { label: 'Config & CLI', text: 'How it reads its configuration files, registry keys, environment variables and command-line switches, and what each one changes.' },
+  { label: 'One function', text: 'The function at address 0x… (or named …), with everything it calls that is needed for the same results.' }
+]
+
+/** Languages offered for the new code; '' lets the model pick. */
+export const CLONE_LANGUAGES = ['', 'C', 'C++', 'C#', 'Rust', 'Go', 'Python', 'TypeScript', 'Java']
+
+/** Added to the RE system prompt in a clone session. */
+export function clonePrompt(c: ReClone): string {
+  const lang = c.language || 'the language the original was written in, if you can tell (otherwise the one that fits best)'
+  const what =
+    c.scope === 'full'
+      ? 'the whole program: the same features, inputs, outputs, file formats and behaviour, organised as a real project you would hand to another developer'
+      : 'only the pieces the user names, as a small standalone project with a public interface the rest of an application could call'
+  return `This is a clone session. Besides explaining the target, you rebuild ${what}. Write it in ${lang}.
+
+How to clone:
+- Study first. Find the code behind each behaviour you will rebuild and note its inputs, outputs, constants, formats, error cases and edge cases. rea__build_reconstruction_obligation_ledger lists what a faithful rebuild must cover.
+- Write new, readable source code that behaves the same: clear names, comments where the logic is not obvious, a normal project layout. Do not paste decompiler output; rewrite it as a person would.
+- Write files only with rulz__write_file, using paths relative to the output folder (${c.outputDir}). rulz__read_file reads back what you wrote. Write large files in parts with append.
+- Keep NOTES.md in the output folder up to date as you go: what you found (with addresses), what is done, what is left. Your earlier messages may be shortened when the context fills up; NOTES.md is how you keep track.
+- Add a README.md that says how to build and run the clone, which behaviours are reproduced, and which are guesses or not done. Add tests or test vectors (inputs with the original's outputs) where you found them.
+- Where the evidence runs out, say so in the code and README instead of inventing behaviour.
+
+When you are done, do not write an ANSWER line. Summarise what you built (the files and what each does), how faithful it is, and what is still missing.`
+}
+
+/** First user message of a clone session. */
+export function cloneFirstMessage(c: ReClone, target: string): string {
+  const details = c.details.trim()
+  const head = c.scope === 'full' ? `Fully clone ${target}.` : `Clone these pieces of ${target}:`
+  const body = c.scope === 'full' ? (details ? `\n\nNotes: ${details}` : '') : `\n\n${details}`
+  return `${head}${body}\n\nWrite the new code into ${c.outputDir}${c.language ? `, in ${c.language}` : ''}.`
+}
 
 /** Tools loaded at the start of an RE session (on-demand mode), so the model starts with REA in hand. */
 export const RE_STARTER_TOOLS = [
@@ -133,6 +180,9 @@ export function extractAnswer(text: string): string | null {
   while (answer.length >= 2 && answer[0] === answer.at(-1) && '`\'"'.includes(answer[0])) answer = answer.slice(1, -1).trim()
   return answer || null
 }
+
+/** Tools a clone session starts with, on top of RE_STARTER_TOOLS. */
+export const CLONE_STARTER_TOOLS = ['rea__build_reconstruction_obligation_ledger', 'rea__evaluate_reconstruction_coverage', ...CLONE_FILE_TOOLS]
 
 /** First user message of an RE session. */
 export function reFirstMessage(goal: string, target: string): string {

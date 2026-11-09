@@ -15,6 +15,7 @@ import type {
   ProjectState,
   PromptAnswer,
   Step,
+  ReTaskInfo,
   TaskRecord,
   TimelineItem,
   WireMessage,
@@ -228,7 +229,7 @@ export class ProjectSession {
   // ---------- public actions ----------
 
   /** `shown` is what the conversation shows when the model gets a longer text (e.g. "Fix this"). */
-  start(text: string, opts: { howToRun?: boolean; share?: boolean; shown?: string } = {}): void {
+  start(text: string, opts: { howToRun?: boolean; share?: boolean; shown?: string; re?: ReTaskInfo } = {}): void {
     const trimmed = text.trim()
     if (!trimmed) return
     if (this.running) throw new Error('A task is already running. Wait for it to finish or press Stop.')
@@ -236,6 +237,7 @@ export class ProjectSession {
     const title = visible.split('\n')[0].slice(0, 80) + (visible.split('\n')[0].length > 80 ? '…' : '')
     const task: TaskRecord = { id: randomUUID(), title: opts.howToRun ? 'Finding out how to run the app' : title, startedAt: Date.now(), outcome: 'running', steps: [], files: [] }
     if (opts.howToRun || opts.share || visible !== trimmed) task.request = { text: trimmed, howToRun: opts.howToRun, share: opts.share }
+    if (opts.re) task.re = { ...opts.re, practice: opts.re.practice && { taskId: opts.re.practice.taskId, family: opts.re.practice.family, tier: opts.re.practice.tier } }
     const item: TimelineItem = { id: randomUUID(), kind: 'user', text: opts.howToRun ? 'How do I run this app?' : visible, taskId: task.id }
     this.data.tasks.push(task)
     this.data.timeline.push(item)
@@ -345,7 +347,7 @@ export class ProjectSession {
     if (changed) this.notice(`Put back the files “${task.title}” changed, then ran your request again.`, 'info')
     const edited = text?.trim()
     if (edited && edited !== item.text) this.start(edited)
-    else if (task.request) this.start(task.request.text, { howToRun: task.request.howToRun, share: task.request.share, shown: item.text })
+    else if (task.request) this.start(task.request.text, { howToRun: task.request.howToRun, share: task.request.share, shown: item.text, re: task.re })
     else this.start(item.text)
   }
 
@@ -412,6 +414,7 @@ export class ProjectSession {
         } else this.notice("I couldn't work out how to run this app.", 'warn', task.id)
       }
       if (share) await this.reportShare(task)
+      if (task.re?.practice) await this.gradePractice(task)
     } catch (e) {
       if (e instanceof StopTask || signal.aborted) {
         task.outcome = 'stopped'
@@ -649,16 +652,50 @@ export class ProjectSession {
    * With "Record tasks for reverse-engineering training" on, each task is an RE session in RulZ LLM
    * Suite: its model turns carry the session header, and the Suite is told once what it is about.
    */
+  /** Tasks from the RE panel are recorded when they ask to be; others when "Record tasks" is on. */
+  private recorded(task: TaskRecord): boolean {
+    return task.re ? task.re.record : this.deps.settings().reRecording
+  }
+
   private reRecording(task: TaskRecord): Record<string, string> {
-    if (!this.deps.settings().reRecording) return {}
+    if (!this.recorded(task)) return {}
     const id = `agent-${task.id}`
     if (!this.reDescribed.has(task.id)) {
       this.reDescribed.add(task.id)
+      const re = task.re
       const asked = this.data.timeline.find((i) => i.kind === 'user' && i.taskId === task.id)
-      const goal = task.request?.text ?? (asked?.kind === 'user' ? asked.text : task.title)
-      void this.deps.client.describeReSession(id, { client: 'RulZ Coding Agent', title: task.title, target: this.root, goal: goal.slice(0, 4000) })
+      const goal = re?.goal ?? task.request?.text ?? (asked?.kind === 'user' ? asked.text : task.title)
+      void this.deps.client.describeReSession(id, {
+        client: 'RulZ Coding Agent',
+        title: task.title,
+        target: re?.target ?? this.root,
+        goal: goal.slice(0, 4000),
+        ...(re ? { kind: re.kind } : {}),
+        ...(re?.practice ? { practice: { taskId: re.practice.taskId, family: re.practice.family, tier: re.practice.tier } } : {})
+      })
     }
     return { [RE_SESSION_HEADER]: id }
+  }
+
+  /** Checks a practice task's answer with RulZ LLM Suite and grades the recorded session. */
+  private async gradePractice(task: TaskRecord): Promise<void> {
+    const p = task.re!.practice!
+    const last = [...this.data.messages].reverse().find((m) => m.role === 'assistant' && m.content.trim())
+    try {
+      const r = await this.deps.client.gradePractice(p.taskId, task.re!.target, last?.content ?? '')
+      Object.assign(p, { answer: r.answer, expected: r.expected, passed: r.passed })
+      if (r.passed) this.notice(`✅ Practice solved: **${r.answer}** is right.`, 'ok', task.id)
+      else if (!r.answer) this.notice(`❌ No \`ANSWER:\` line in the reply, so the practice task counts as failed. The answer was **${r.expected}**.`, 'warn', task.id)
+      else this.notice(`❌ Practice failed: the answer given was **${r.answer}**, the right one is **${r.expected}**.`, 'warn', task.id)
+      if (this.recorded(task)) {
+        await this.deps.client.describeReSession(`agent-${task.id}`, {
+          outcome: r.passed ? 'solved' : 'failed',
+          practice: { taskId: p.taskId, family: p.family, tier: p.tier, ...(r.answer ? { answer: r.answer } : {}), expected: r.expected }
+        })
+      }
+    } catch (e) {
+      this.notice(`I couldn't check the practice answer with RulZ LLM Suite: ${(e as Error).message}`, 'warn', task.id)
+    }
   }
 
   private async buildRequest(model: string, nCtx: number, signal: AbortSignal): Promise<WireMessage[]> {

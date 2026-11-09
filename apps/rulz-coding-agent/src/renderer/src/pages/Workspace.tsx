@@ -1,4 +1,4 @@
-import { ArrowLeft, ArrowUp, Brain, Check, ChevronDown, ChevronRight, Clock, Copy, CornerDownRight, FolderOpen, SlidersHorizontal, History, LoaderCircle, MessageSquarePlus, NotebookPen, Package, Pencil, Play, RotateCcw, Settings, Square, Trash2, Undo2, X } from 'lucide-react'
+import { ArrowLeft, ArrowUp, Binary, Brain, Check, ChevronDown, ChevronRight, Clock, Copy, CornerDownRight, FolderOpen, SlidersHorizontal, History, LoaderCircle, MessageSquarePlus, NotebookPen, Package, Pencil, Play, RotateCcw, Settings, Square, Trash2, Undo2, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { ApprovalDialog } from '../components/ApprovalDialog'
@@ -6,6 +6,7 @@ import { ContextMeter } from '../components/ContextMeter'
 import { DraftMeter } from '../components/DraftMeter'
 import { HistoryDialog } from '../components/HistoryDialog'
 import { NotesDialog } from '../components/NotesDialog'
+import { ReDialog, useReOverview } from '../components/ReDialog'
 import { LogoMark } from '../components/Logo'
 import { Markdown } from '../components/Markdown'
 import { ConnectionHelp } from '../components/NotConnected'
@@ -82,6 +83,7 @@ function TopBar() {
   const [confirmUndo, setConfirmUndo] = useState(false)
   const [historyOpen, setHistoryOpen] = useState(false)
   const [notesOpen, setNotesOpen] = useState(false)
+  const [reOpen, setReOpen] = useState(false)
   const [confirmShare, setConfirmShare] = useState(false)
   const undoTask = undoableTask(tasks)
   // Labels show on wide windows; narrow ones keep the icons (the aria-label names the button).
@@ -139,6 +141,12 @@ function TopBar() {
           <NotebookPen size={15} /> {label('Notes')}
         </Button>
       </Tooltip>
+      <Tooltip content="Reverse engineering: analyse or clone a program, practice tasks, and the sessions done so far">
+        <Button className="h-9.5 px-3 text-sm" aria-label="Reverse engineering" onClick={() => setReOpen(true)}>
+          <Binary size={15} /> {label('Reverse engineering')}
+        </Button>
+      </Tooltip>
+      <ReDialog open={reOpen} onOpenChange={setReOpen} />
       <HistoryDialog open={historyOpen} onOpenChange={setHistoryOpen} />
       <NotesDialog open={notesOpen} onOpenChange={setNotesOpen} />
       <Dialog
@@ -531,6 +539,13 @@ function ThinkingBlock({ text, live }: { text: string; live: boolean }) {
 
 function EmptyState() {
   const project = useWorkspace((s) => s.project)!
+  const connected = useApp((s) => s.connection.status === 'connected')
+  const re = useReOverview(connected)
+  const [reOpen, setReOpen] = useState<null | 'start' | 'practice' | 'sessions'>(null)
+  const done = re.data?.sessions.length ?? 0
+  const solved = re.data?.sessions.filter((s) => s.outcome === 'solved').length ?? 0
+  const practice = re.data?.practice.tasks.length ?? 0
+  const unsolved = re.data?.practice.tasks.filter((t) => t.solved === 0).length ?? 0
   return (
     <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto p-8">
       <div className="max-w-lg text-center">
@@ -548,6 +563,26 @@ function EmptyState() {
             </button>
           ))}
         </div>
+        {re.data && (
+          <div className="mt-6 rounded-lg border border-border bg-panel p-4 text-left">
+            <div className="flex items-center gap-2 text-sm font-semibold">
+              <Binary size={15} className="text-accent" /> Or reverse-engineer a program
+            </div>
+            <div className="mt-1 text-[12.5px] text-muted">
+              {done} session{done === 1 ? '' : 's'} done ({solved} solved) · {practice} practice task{practice === 1 ? '' : 's'} ({unsolved} not solved yet)
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <Button onClick={() => setReOpen('start')}>Analyse or clone…</Button>
+              <Button onClick={() => setReOpen('practice')} disabled={!practice}>
+                Practice tasks
+              </Button>
+              <Button onClick={() => setReOpen('sessions')} disabled={!done}>
+                Sessions done
+              </Button>
+            </div>
+          </div>
+        )}
+        <ReDialog open={!!reOpen} onOpenChange={(o) => !o && setReOpen(null)} initialTab={reOpen ?? 'start'} />
       </div>
     </div>
   )

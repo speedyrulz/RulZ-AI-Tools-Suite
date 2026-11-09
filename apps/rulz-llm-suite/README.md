@@ -86,6 +86,15 @@ Discover/downloads, RAG and a CLI are planned.
   - **Export**: writes `train.jsonl` in the kit's format (OpenAI / Hugging Face chat: `messages`, `tools`, `meta`;
     thinking in `reasoning_content`) plus `manifest.json`, from solved sessions by default, at most N per practice task
     (fewest tool rounds first), leaving out sessions whose context was trimmed. Email addresses are replaced.
+  - **Clone**: the New session card switches between **Analyse** and **Clone**. A clone session rebuilds either
+    **specific pieces** of the target (presets for a file format, network protocol, algorithm, license logic, config and
+    command line, or one function, or your own description) or **the whole program**, as new readable source code in
+    the language you pick (or the original's). It writes only into the **output folder** you choose, with two built-in
+    tools that exist only in clone sessions: `write_file` (inside the output folder, never over the target) and
+    `read_file` (the output folder and the target's folder). The model keeps `NOTES.md` (so it can pick up after the
+    context is trimmed) and a `README.md` saying how to build it and what is and isn't reproduced. Clone sessions may
+    run up to **400** tool rounds (an option), are recorded and graded like other sessions, and exported samples carry
+    `meta.kind` (`clone-pieces` or `clone-full`).
   - **Sessions from other apps**: a `/v1/chat/completions` request with an `x-rulz-re-session: <id>` header (letters,
     digits, `_` and `-`, up to 56) is recorded as part of that RE session, with its reply. `POST /v1/re/sessions/{id}`
     with `client`, `title`, `target`, `goal` describes the session, and with `outcome` (`unrated`, `solved`, `partial`,
@@ -94,6 +103,12 @@ Discover/downloads, RAG and a CLI are planned.
     RulZ Coding Agent 0.16.0 sends these when its **Record tasks for reverse-engineering training** setting is on. Since
     the other app fits its own context, a request with fewer messages than the one before marks the session as
     trimmed. Turn it off with **Record sessions from other apps** in the page's options.
+    `GET /v1/re/overview` lists every RE session (chats here and other apps' sessions, newest first, with kind, grade
+    and tool rounds), the practice tasks with how often each was tried and solved (never their answers), and the
+    question, clone-piece and language templates. `POST /v1/re/practice/{task}/prepare` copies a task's program into a
+    fresh work folder and returns its path and prompt; `POST /v1/re/practice/{task}/grade` with `target` and `text`
+    checks the reply's `ANSWER:` line and returns `answer`, `passed` and `expected`. Session descriptions also take
+    `kind` and `practice`. RulZ Coding Agent 0.18.0 and its phone app use these to show and start RE tasks.
 - **Dark and light themes** — dark is the default; the first launch asks which look you want ("Choose your look").
   Switch any time with the sun/moon button in the top bar or in Settings ▸ Appearance (Dark, Light or System).
 - GPU/RAM meters (nvidia-smi), keyboard shortcuts (see Settings).
