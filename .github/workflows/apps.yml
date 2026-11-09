@@ -26,6 +26,7 @@ on:
       - 'image-preparer-v*'
       - 'image-grid-v*'
       - 'hf-manager-v*'
+      - 'coding-agent-android-v*'
   pull_request:
     paths: ['apps/**', '.github/workflows/apps.yml']
 
@@ -55,6 +56,7 @@ jobs:
             [training-captioner]=Rulz-Training-Captioner [clip-extractor]=rulz-simple-video-clip-extractor
             [rulz-image-crawler]=rulz-image-crawler [image-preparer]=RulZ-Image-Preparer
             [image-grid]=RulZ-Image-Grid [hf-manager]=RulZ-Huggingface-Manager
+            [coding-agent-android]=rulz-coding-agent-android
           )
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             tag="${GITHUB_REF#refs/tags/}"
@@ -110,6 +112,7 @@ jobs:
             'image-preparer'     = @{ dir = 'RulZ-Image-Preparer'; name = 'RulZ Image Preparer'; kind = 'source' }
             'image-grid'         = @{ dir = 'RulZ-Image-Grid'; name = 'RulZ Image Grid'; kind = 'dotnet' }
             'hf-manager'         = @{ dir = 'RulZ-Huggingface-Manager'; name = 'RulZ Huggingface Manager'; kind = 'source' }
+            'coding-agent-android' = @{ dir = 'rulz-coding-agent-android'; name = 'RulZ Coding Agent for Android'; kind = 'android' }
           }
           $a = $apps[$env:APP]
           if (-not $a) { throw "Unknown app '$env:APP'" }
@@ -127,8 +130,13 @@ jobs:
             'image-preparer'   { (Select-String -Path "$env:DIR/rulz/config.py" -Pattern 'APP_VERSION\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value }
             'rulz-image-crawler' { (Select-String -Path "$env:DIR/crawler_app/__init__.py" -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value }
             'hf-manager'       { (Select-String -Path "$env:DIR/rulz_hf_manager/__init__.py" -Pattern "__version__\s*=\s*'([^']+)'").Matches[0].Groups[1].Value }
-            { $_ -in 'llm-suite', 'coding-agent' } { (Get-Content "$env:DIR/package.json" -Raw | ConvertFrom-Json).version }
+            { $_ -in 'llm-suite', 'coding-agent', 'coding-agent-android' } { (Get-Content "$env:DIR/package.json" -Raw | ConvertFrom-Json).version }
             default { '' }   # source apps are released from the branch; the tag is the version
+          }
+          # The phone shows versionName; package.json and build.gradle must agree.
+          if ($env:APP -eq 'coding-agent-android') {
+            $gradle = (Select-String -Path "$env:DIR/android/app/build.gradle" -Pattern 'versionName\s+"([^"]+)"').Matches[0].Groups[1].Value
+            if ($gradle -ne $v) { throw "package.json says $v but android/app/build.gradle's versionName is $gradle." }
           }
           if ($env:TAG -and $v -and $v -ne $env:TAG_VERSION) {
             throw "The tag says $env:TAG_VERSION but $env:DIR is at $v. Bump the version in the source first."
@@ -157,6 +165,48 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force out | Out-Null
           Copy-Item "$env:DIR/dist/*.exe", "$env:DIR/dist/*.exe.blockmap" out/
+
+      # ---------- Android app (APK) ----------
+      # A debug build, like the APKs built by hand before. Android only installs an update signed with the same key
+      # as the installed copy, so releases are signed with the debug key kept in the ANDROID_DEBUG_KEYSTORE secret
+      # (base64). Pull requests and branch builds without it use a throwaway key; their APK is only a check.
+      - if: env.KIND == 'android'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ${{ env.DIR }}/package-lock.json
+      - if: env.KIND == 'android'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - if: env.KIND == 'android'
+        name: Put the signing key in place
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_DEBUG_KEYSTORE }}
+        run: |
+          if (-not $env:KEYSTORE) {
+            if ($env:TAG) { throw 'The ANDROID_DEBUG_KEYSTORE secret is missing. A release signed with another key would not install over the app already on phones.' }
+            'No ANDROID_DEBUG_KEYSTORE secret: Gradle makes a throwaway debug key.'
+            exit 0
+          }
+          $dir = Join-Path $env:USERPROFILE '.android'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          [IO.File]::WriteAllBytes((Join-Path $dir 'debug.keystore'), [Convert]::FromBase64String($env:KEYSTORE))
+      - if: env.KIND == 'android'
+        working-directory: ${{ env.DIR }}
+        run: |
+          npm ci --no-audit --no-fund
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm run typecheck
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm test
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm run android:apk
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force ../../out | Out-Null
+          Copy-Item android/app/build/outputs/apk/debug/app-debug.apk "../../out/RulZ-Agent-$env:VERSION.apk"
 
       # ---------- PyInstaller apps (portable zip) ----------
       - if: env.KIND == 'python' || env.KIND == 'source'

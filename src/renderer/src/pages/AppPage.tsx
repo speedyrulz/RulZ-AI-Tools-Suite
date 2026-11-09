@@ -22,6 +22,7 @@ import { AppActions, jobDetail, useJob } from '../components/AppActions'
 import { StatusBadge } from '../components/AppCard'
 import { Gallery } from '../components/Gallery'
 import { LogDialog } from '../components/LogDialog'
+import { PhoneAppQr } from '../components/PhoneAppQr'
 import { Readme } from '../components/Readme'
 import { RequirementList } from '../components/Requirements'
 import { Badge, Button, Dialog, Menu, MenuContent, MenuItem, MenuSeparator, MenuTrigger, Switch } from '../components/ui'
@@ -224,6 +225,12 @@ export function AppPage({ view, onBack, onInstall }: { view: AppView; onBack: ()
               )}
             </dl>
           </SideCard>
+
+          {app.id === 'coding-agent' && (
+            <SideCard title="Phone app">
+              <PhoneAppQr variant="card" />
+            </SideCard>
+          )}
 
           {installed && (
             <SideCard title="Shortcuts">

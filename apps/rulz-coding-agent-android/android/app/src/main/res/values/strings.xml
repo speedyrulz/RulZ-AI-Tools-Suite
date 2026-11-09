@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">RulZ Agent</string>
+    <string name="title_activity_main">RulZ Agent</string>
+    <string name="package_name">com.rulz.codingagent.android</string>
+    <string name="custom_url_scheme">com.rulz.codingagent.android</string>
+</resources>

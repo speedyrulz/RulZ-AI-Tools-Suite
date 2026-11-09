@@ -3,6 +3,7 @@ import type {
   AppView,
   InstallOptions,
   JobState,
+  PhoneApp,
   ReadmeDoc,
   SelfUpdate,
   RequirementId,
@@ -49,6 +50,9 @@ export interface IpcInvoke {
   'apps:setShortcuts': (appId: string, opts: ShortcutOptions) => void
   'apps:openFolder': (appId: string) => void
   'apps:log': (appId: string) => string[]
+
+  /** The newest Android app release with an APK (null when there is none or GitHub was never reached). */
+  'phone:latest': () => PhoneApp | null
 
   /** `reloadPath` re-reads PATH first, to find programs installed since the launcher started. */
   /** `force` skips the 30-minute cache. */
