@@ -81,8 +81,14 @@ export class McpManager {
   constructor(
     private readonly configPath: string,
     private readonly onChange: (status: McpServerStatus[]) => void,
-    private readonly onConfig: (config: McpConfigState) => void = () => undefined
+    private readonly onConfig: (config: McpConfigState) => void = () => undefined,
+    /** Servers the app provides itself (the RE calculator). A server of the same name in mcp.json wins. */
+    private readonly appServers: () => Record<string, McpServerConfig> = () => ({})
   ) {}
+
+  private withAppServers(servers: Record<string, McpServerConfig>): Record<string, McpServerConfig> {
+    return { ...this.appServers(), ...servers }
+  }
 
   private allConnections(): Connection[] {
     return [this.builtin, ...this.connections.values()]
@@ -102,7 +108,7 @@ export class McpManager {
 
   /** Validates and saves mcp.json, then reconnects every server. */
   async saveConfig(text: string): Promise<McpServerStatus[]> {
-    const servers = parseMcpConfig(text)
+    const servers = this.withAppServers(parseMcpConfig(text))
     await fs.writeFile(this.configPath, text, 'utf8')
     this.configText = text
     this.configError = null
@@ -129,7 +135,7 @@ export class McpManager {
     this.configError = read.error
     if (read.text !== null) {
       try {
-        servers = parseMcpConfig(read.text)
+        servers = this.withAppServers(parseMcpConfig(read.text))
       } catch (e) {
         this.configError = (e as Error).message
       }

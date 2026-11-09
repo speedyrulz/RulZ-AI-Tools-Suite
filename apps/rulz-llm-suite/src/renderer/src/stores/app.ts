@@ -5,7 +5,7 @@ import type { AppSettings, EngineInfo } from '@shared/types'
 import { errorMessage, invoke } from '../lib/api'
 import { once } from '../lib/once'
 
-export type Page = 'chat' | 'models' | 'mcp' | 'settings' | 'discover' | 'developer'
+export type Page = 'chat' | 're' | 'models' | 'mcp' | 'settings' | 'discover' | 'developer'
 
 interface AppState {
   page: Page

@@ -354,7 +354,7 @@ export function NumberInput({
     const next = parseNumberDraft(d, v)
     if (next !== undefined) apply(next)
   }
-  // Switching page (Ctrl+1…5) removes the field without a blur; keep what was typed.
+  // Switching page (Ctrl+1…6) removes the field without a blur; keep what was typed.
   useEffect(() => () => commit(), [])
   return (
     <Input

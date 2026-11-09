@@ -15,7 +15,8 @@ function summarize(c: Conversation): ConversationSummary {
     pinned: c.pinned,
     updatedAt: c.updatedAt,
     messageCount: c.messages.length,
-    modelId: c.modelId
+    modelId: c.modelId,
+    ...(c.re ? { reOutcome: c.re.outcome, reTarget: c.re.target, rePracticeTask: c.re.practice?.taskId } : {})
   }
 }
 
@@ -30,7 +31,8 @@ interface IndexFile {
   entries: Record<string, IndexEntry>
 }
 
-const INDEX_VERSION = 1
+// 2: summaries carry the RE session fields.
+const INDEX_VERSION = 2
 
 export class DeletedConversationError extends Error {
   constructor() {

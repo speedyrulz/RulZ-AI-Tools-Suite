@@ -1,4 +1,4 @@
-import { CodeXml, FolderOpen, MessageSquare, Plug, Search, Settings } from 'lucide-react'
+import { Binary, CodeXml, FolderOpen, MessageSquare, Plug, Search, Settings } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { cn } from '../../lib/format'
 import { useApp, type Page } from '../../stores/app'
@@ -7,6 +7,7 @@ import { Tooltip } from '../ui'
 
 const ITEMS: { page: Page; label: string; icon: ReactNode; soon?: boolean }[] = [
   { page: 'chat', label: 'Chat', icon: <MessageSquare size={19} /> },
+  { page: 're', label: 'Reverse Engineering', icon: <Binary size={19} /> },
   { page: 'models', label: 'My Models', icon: <FolderOpen size={19} /> },
   { page: 'mcp', label: 'MCP Tools', icon: <Plug size={19} /> },
   { page: 'discover', label: 'Discover (coming soon)', icon: <Search size={19} />, soon: true },

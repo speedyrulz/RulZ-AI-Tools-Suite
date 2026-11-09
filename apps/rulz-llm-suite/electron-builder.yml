@@ -10,6 +10,8 @@ files:
 extraResources:
   - from: build/icon.ico
     to: icon.ico
+  - from: resources/calc_mcp.py
+    to: calc_mcp.py
 win:
   icon: build/icon.ico
   target:

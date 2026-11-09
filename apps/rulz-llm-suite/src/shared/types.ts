@@ -136,6 +136,87 @@ export interface AppSettings {
   /** How many of the most recent tool results are always sent in full. */
   keepFullToolResults: number
   apiServer: ApiServerSettings
+  /** Reverse engineering mode. */
+  re: ReSettings
+}
+
+// ---------- Reverse engineering mode ----------
+
+export interface ReSettings {
+  /** Model used for new RE sessions (id relative to the models folder); empty = the loaded model. */
+  modelId: string
+  /** RE training kit folder (build/tasks.jsonl and build/bin/<task>/) for practice tasks. */
+  kitDir: string
+  /** Record what the model sees and writes in RE sessions, for fine-tuning. */
+  collect: boolean
+  /** Run REA's static-analysis tools (and calc) without asking. Tools that run or attach to programs still ask. */
+  autoApproveStatic: boolean
+  /** Rounds of tool calls an RE session may make before it has to answer. */
+  maxToolRounds: number
+  /** Token budget for loaded tool descriptions in RE sessions (on-demand tool loading). */
+  toolBudgetTokens: number
+}
+
+export type ReOutcome = 'unrated' | 'solved' | 'partial' | 'failed'
+
+/** Set on a conversation that is a reverse-engineering session. */
+export interface ReSession {
+  /** File or folder being analysed. */
+  target: string
+  goal: string
+  /** Record this session's requests for training. */
+  collect: boolean
+  outcome: ReOutcome
+  /** The outcome came from a practice task's automatic check, not the user. */
+  autoGraded?: boolean
+  notes?: string
+  /** Practice task from the RE training kit. */
+  practice?: { taskId: string; family: string; tier: string; answer?: string; expected?: string }
+}
+
+/** One RE session's recorded data, as listed on the Reverse Engineering page. */
+export interface ReTraceInfo {
+  conversationId: string
+  /** Model responses recorded. */
+  responses: number
+  /** Responses that asked for tools. */
+  toolRounds: number
+  /** Context was trimmed at some point, so the sample lacks part of the session. */
+  trimmed: boolean
+  bytes: number
+  updatedAt: number
+}
+
+export interface RePracticeTask {
+  id: string
+  family: string
+  tier: string
+  binary: string
+  /** Prompt with {exe} filled in for the task's work folder. */
+  prompt: string
+}
+
+export interface RePracticeInfo {
+  kitDir: string
+  error?: string
+  tasks: RePracticeTask[]
+}
+
+export interface ReExportOptions {
+  outDir: string
+  /** Outcomes to include; 'solved' only is rejection sampling (train on verified successes). */
+  outcomes: ReOutcome[]
+  /** Leave out sessions whose context was trimmed. */
+  skipTrimmed: boolean
+  /** Practice tasks: keep at most this many sessions per task (fewest tool rounds first). */
+  maxPerTask: number
+}
+
+export interface ReExportResult {
+  outDir: string
+  kept: number
+  dropped: Record<string, number>
+  files: string[]
 }
 
 // ---------- Local API server ----------
@@ -463,6 +544,8 @@ export interface Conversation {
   handoffPrompted?: boolean
   /** Tools the model has loaded in on-demand mode, least recently used first. */
   activeTools?: string[]
+  /** Reverse-engineering session details; absent for ordinary chats. */
+  re?: ReSession
 }
 
 export interface ConversationSummary {
@@ -473,6 +556,10 @@ export interface ConversationSummary {
   updatedAt: number
   messageCount: number
   modelId: string | null
+  /** Outcome of an RE session; absent for ordinary chats. */
+  reOutcome?: ReOutcome
+  reTarget?: string
+  rePracticeTask?: string
 }
 
 export interface Preset {
@@ -497,6 +584,8 @@ export interface WireToolCall {
 export interface WireMessage {
   role: Role | 'tool'
   content: string | WireContentPart[]
+  /** Assistant thinking sent back to the template (RE sessions, within the current tool loop). */
+  reasoning_content?: string
   tool_calls?: WireToolCall[]
   tool_call_id?: string
 }
@@ -511,6 +600,8 @@ export interface ChatRequest {
   disableThinking?: boolean
   /** Tools to offer the model; omitted = no tools. */
   tools?: ToolRequest
+  /** Record the request and reply for this conversation's RE training data. */
+  record?: { conversationId: string }
 }
 
 export type StreamEvent =

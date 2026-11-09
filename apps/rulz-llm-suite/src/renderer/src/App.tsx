@@ -9,6 +9,7 @@ import { LogDialog } from './components/models/LogDialog'
 import { ToolApprovalDialog } from './components/chat/ToolCalls'
 import { ChatPage } from './pages/ChatPage'
 import { ModelsPage } from './pages/ModelsPage'
+import { ReversePage } from './pages/ReversePage'
 import { McpPage } from './pages/McpPage'
 import { DeveloperPage } from './pages/DeveloperPage'
 import { useMcp } from './stores/mcp'
@@ -54,6 +55,7 @@ export function App() {
           <TopBar />
           <main className="min-h-0 flex-1">
             {page === 'chat' && <ChatPage />}
+            {page === 're' && <ReversePage />}
             {page === 'models' && <ModelsPage />}
             {page === 'mcp' && <McpPage />}
             {page === 'settings' && <SettingsPage />}

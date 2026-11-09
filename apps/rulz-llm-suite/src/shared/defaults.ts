@@ -1,3 +1,4 @@
+import { DEFAULT_RE_SETTINGS } from './re'
 import type { AppSettings, LoadConfig, SamplingParams } from './types'
 
 export const DEFAULT_LOAD_CONFIG: LoadConfig = {
@@ -93,5 +94,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
     idleUnloadMinutes: 10,
     defaultModelId: '',
     unknownModelFallback: true
-  }
+  },
+  re: DEFAULT_RE_SETTINGS
 }

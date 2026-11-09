@@ -6,7 +6,7 @@ import { useModels } from '../stores/models'
 export const SHORTCUTS: [string, string][] = [
   ['Ctrl+L', 'Open the model picker'],
   ['Ctrl+N', 'New chat'],
-  ['Ctrl+1 … 5', 'Chat / My Models / MCP Tools / Developer / Settings'],
+  ['Ctrl+1 … 6', 'Chat / My Models / MCP Tools / Developer / Settings / Reverse Engineering'],
   ['Ctrl+E', 'Eject all models'],
   ['Ctrl+B', 'Toggle the chat settings panel'],
   ['Enter / Shift+Enter', 'Send / new line'],
@@ -14,7 +14,7 @@ export const SHORTCUTS: [string, string][] = [
   ['F12', 'Developer tools']
 ]
 
-const PAGE_KEYS: Record<string, Page> = { '1': 'chat', '2': 'models', '3': 'mcp', '4': 'developer', '5': 'settings' }
+const PAGE_KEYS: Record<string, Page> = { '1': 'chat', '2': 'models', '3': 'mcp', '4': 'developer', '5': 'settings', '6': 're' }
 
 /**
  * Esc stops the reply only when nothing else used the key: closing a dialog or menu, or

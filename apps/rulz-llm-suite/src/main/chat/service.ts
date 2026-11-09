@@ -6,7 +6,8 @@ import type {
   SamplingParams,
   StreamEvent,
   ToolRequest,
-  WireMessage
+  WireMessage,
+  WireToolCall
 } from '@shared/types'
 import type { InstanceManager } from '../engine/instances'
 import { fitToContext, IMAGE_TOKENS, imageCount, textOf, type ContextApi } from './context'
@@ -129,6 +130,26 @@ export function withSystemNote(messages: WireMessage[], note: string | undefined
   return [{ role: 'system', content: note }, ...messages]
 }
 
+/** One model round of an RE session, as recorded for training data. */
+export interface RecordedRound {
+  requestId: string
+  at: number
+  model: string
+  /** Exactly what llama-server received (after the tool note, context fitting and argument fixes). */
+  messages: WireMessage[]
+  tools: unknown[]
+  /** The context was trimmed to fit, so `messages` lacks part of the session. */
+  trimmed: boolean
+  response: {
+    content: string
+    reasoning: string
+    toolCalls: WireToolCall[]
+    finishReason?: string
+  }
+}
+
+export type RoundRecorder = (conversationId: string, round: RecordedRound) => void
+
 /** Streams chat completions from a loaded instance and forwards them to the renderer. */
 export class ChatService {
   private active = new Map<string, AbortController>()
@@ -139,7 +160,9 @@ export class ChatService {
     private readonly instances: InstanceManager,
     private readonly send: (event: StreamEvent) => void,
     /** Tool definitions (and, in on-demand mode, a system note) for a request's tool selection. */
-    private readonly getTools: (req: ToolRequest) => ToolSet = () => ({ defs: [] })
+    private readonly getTools: (req: ToolRequest) => ToolSet = () => ({ defs: [] }),
+    /** Receives finished rounds of requests that ask to be recorded (RE sessions). */
+    private readonly recorder?: RoundRecorder
   ) {}
 
   /** Per loaded instance: does its chat template print tool-call arguments in Python form? */
@@ -296,6 +319,9 @@ export class ChatService {
     let finishReason: string | undefined
     let stats: GenerationStats = {}
     let predicted = 0
+    // The whole reply, for recording.
+    let fullContent = ''
+    let fullReasoning = ''
     const deltas = new DeltaBatcher((content, reasoning) =>
       this.send({ type: 'delta', requestId, content: content || undefined, reasoning: reasoning || undefined })
     )
@@ -311,6 +337,7 @@ export class ChatService {
       const set = this.toolSet(req.tools)
       const tools = set.defs
       let messages = withSystemNote(req.messages, set.note)
+      let trimmed = false
       if (inst.contextLength) {
         const api = this.contextApi(inst, tools)
         // Tool definitions are resent with every message; if they alone eat most of the context,
@@ -328,7 +355,9 @@ export class ChatService {
           req.sampling.maxTokens ?? Math.min(2048, Math.floor(inst.contextLength / 4)),
           Math.floor(inst.contextLength / 3)
         )
-        messages = await fitToContext(messages, inst.contextLength, reserve, req.overflow, api)
+        const fitted = await fitToContext(messages, inst.contextLength, reserve, req.overflow, api)
+        trimmed = fitted !== messages
+        messages = fitted
       }
 
       // Some templates print earlier tool arguments as Python lists; send them as JSON text instead
@@ -374,6 +403,8 @@ export class ChatService {
             if (c.reasoning) reasoningStart ??= now
             if (c.content && reasoningStart !== null) reasoningEnd ??= now
             predicted++
+            if (c.content) fullContent += c.content
+            if (c.reasoning) fullReasoning += c.reasoning
             deltas.push(c.content, c.reasoning)
           }
           if (c.toolCalls) {
@@ -385,6 +416,22 @@ export class ChatService {
         }
       }
       const calls = toolCalls.result()
+      if (req.record && this.recorder) {
+        try {
+          this.recorder(req.record.conversationId, {
+            requestId,
+            at: Date.now(),
+            model: inst.modelName,
+            messages,
+            tools,
+            trimmed,
+            response: { content: fullContent, reasoning: fullReasoning, toolCalls: calls, finishReason }
+          })
+        } catch (err) {
+          // Recording is a side job; it must never fail the reply.
+          console.error('Could not record the RE round:', err)
+        }
+      }
       if (calls.length && release) {
         // The turn goes on after the tools run, so the model stays in use until then.
         this.holdTurn(requestId, release)

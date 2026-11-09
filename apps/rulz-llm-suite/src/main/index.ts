@@ -1,8 +1,9 @@
+import { promises as fs } from 'node:fs'
 import { join } from 'node:path'
 import { app, BrowserWindow, dialog, Menu, nativeTheme, shell, Tray } from 'electron'
 import { resolveDraft } from '@shared/draft'
 import { META_TOOL_DEFS, toolCatalogNote } from '@shared/tools'
-import type { LoadConfig, ModelEntry, Theme } from '@shared/types'
+import type { LoadConfig, McpServerConfig, ModelEntry, Theme } from '@shared/types'
 import { ChatService } from './chat/service'
 import { ConversationStore } from './chat/conversations'
 import { EngineService } from './engine/engine'
@@ -16,6 +17,10 @@ import { ApiServer } from './server/apiServer'
 import { parseLoadConfig } from './settings/schema'
 import { SettingsStore } from './settings/store'
 import { FILE_TOOLS_SERVER } from './files/fileTools'
+import { extractAnswer } from '@shared/re'
+import { gradePractice, listPractice, preparePractice } from './re/practice'
+import { findPython, type PythonCommand } from './re/python'
+import { exportDataset, TraceStore } from './re/traces'
 
 const MiB = 1024 * 1024
 const isDev = !app.isPackaged && !!process.env.ELECTRON_RENDERER_URL
@@ -171,12 +176,23 @@ async function main(): Promise<void> {
   await instances.cleanupOrphans()
 
   const mcpConfigPath = join(userData, 'mcp.json')
+  // The RE calculator (a sandboxed Python MCP server from the RE training kit) runs when Python 3 is installed.
+  const calcScript = app.isPackaged ? join(process.resourcesPath, 'calc_mcp.py') : join(__dirname, '../../resources/calc_mcp.py')
+  let python: PythonCommand | null = null
   const mcp = new McpManager(
     mcpConfigPath,
     (s) => broadcast('mcp:changed', s),
-    (c) => broadcast('mcp:config', c)
+    (c) => broadcast('mcp:config', c),
+    (): Record<string, McpServerConfig> =>
+      python ? { calc: { command: python.command, args: [...python.args, '-I', calcScript] } } : {}
   )
-  void mcp.init()
+  void findPython()
+    .then((p) => {
+      python = p
+    })
+    .finally(() => void mcp.init())
+  const traces = new TraceStore(join(userData, 're-data'))
+  const practiceRoot = join(userData, 're-practice')
 
   const apiServer = new ApiServer({
     instances,
@@ -202,7 +218,7 @@ async function main(): Promise<void> {
       defs: [...META_TOOL_DEFS, ...mcp.toolDefinitions(disabled, new Set(active))],
       note: available.length ? toolCatalogNote(available, active) : undefined
     }
-  })
+  }, (conversationId, round) => void traces.record(conversationId, round))
   const conversations = new ConversationStore(join(userData, 'conversations'))
 
   // ---- IPC ----
@@ -290,7 +306,12 @@ async function main(): Promise<void> {
   handle('conversations:list', () => conversations.list())
   handle('conversations:get', (id) => conversations.get(id))
   handle('conversations:save', (c) => conversations.save(c))
-  handle('conversations:delete', (id) => conversations.delete(id))
+  handle('conversations:delete', async (id) => {
+    await conversations.delete(id)
+    // Its recorded RE data goes too (to the Recycle Bin, like the chat).
+    const dir = join(userData, 're-data', id)
+    await shell.trashItem(dir).catch(() => traces.delete(id).catch(() => undefined))
+  })
   handle('folders:list', () => conversations.listFolders())
   handle('folders:save', (f) => conversations.saveFolders(f))
 
@@ -318,6 +339,34 @@ async function main(): Promise<void> {
   handle('server:stop', () => apiServer.stop())
   handle('server:log', () => apiServer.getLog())
   handle('server:clearLog', () => apiServer.clearLog())
+
+  handle('re:traces', () => traces.list())
+  handle('re:deleteTrace', (id) => traces.delete(id))
+  handle('re:dataFolder', async () => {
+    const dir = join(userData, 're-data')
+    await fs.mkdir(dir, { recursive: true })
+    return dir
+  })
+  handle('re:calcStatus', () => ({ available: !!python, python: python ? `${python.command} ${python.version}` : null }))
+  handle('re:export', async (opts) => {
+    const sessions = []
+    for (const s of await conversations.list()) {
+      if (!s.reOutcome) continue
+      const c = await conversations.get(s.id).catch(() => null)
+      if (c?.re) sessions.push(c)
+    }
+    return exportDataset(traces, sessions, opts)
+  })
+  handle('re:practiceList', (kitDir) => listPractice(kitDir))
+  handle('re:practicePrepare', async (kitDir, taskId) => {
+    const { target, prompt, task } = await preparePractice(kitDir, practiceRoot, taskId)
+    return { target, prompt, family: task.family, tier: task.tier }
+  })
+  handle('re:practiceGrade', async (kitDir, taskId, target, finalText) => {
+    const answer = extractAnswer(finalText)
+    const { passed, expected } = await gradePractice(kitDir, practiceRoot, taskId, target, answer)
+    return { answer, passed, expected }
+  })
 
   handle('presets:list', () => settings.listPresets())
   handle('presets:save', (p) => settings.savePreset(p))

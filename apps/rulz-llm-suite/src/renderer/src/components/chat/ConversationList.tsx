@@ -187,6 +187,17 @@ function ChatRow({ summary, folders }: { summary: ConversationSummary; folders: 
             <div className={cn('truncate text-[13px]', active ? 'text-text' : 'text-text/85')}>{summary.title}</div>
             <div className="flex items-center gap-1 text-[10.5px] text-faint">
               {generatingId === summary.id && <span className="size-1.5 animate-pulse rounded-full bg-accent" />}
+              {summary.reOutcome && (
+                <span
+                  className={cn(
+                    'rounded px-1 font-semibold',
+                    summary.reOutcome === 'solved' ? 'bg-ok/15 text-ok' : summary.reOutcome === 'failed' ? 'bg-danger/15 text-danger' : 'bg-accent-soft text-accent'
+                  )}
+                  title={`Reverse engineering session (${summary.reOutcome})`}
+                >
+                  RE
+                </span>
+              )}
               {relativeTime(summary.updatedAt)} · {summary.messageCount} msgs
             </div>
           </div>
