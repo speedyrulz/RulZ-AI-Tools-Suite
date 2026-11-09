@@ -256,6 +256,8 @@ export interface TaskRecord {
   undone?: boolean
   /** What the model was asked when it differs from the shown request (a button's task), for running it again. */
   request?: { text: string; howToRun?: boolean; share?: boolean }
+  /** Set for a reverse-engineering task (from the RE panel). */
+  re?: ReTaskInfo
   steps: Step[]
   files: ChangedFile[]
   draft?: DraftStats
@@ -457,4 +459,63 @@ export interface FolderListing {
   path: string
   parent: string | null
   folders: string[]
+}
+// ---------- Reverse engineering (RE mode in RulZ LLM Suite) ----------
+
+export type ReOutcome = 'unrated' | 'solved' | 'partial' | 'failed'
+export type ReKind = 'analyse' | 'practice' | 'clone-pieces' | 'clone-full'
+
+/** One RE session RulZ LLM Suite knows about (its own or another app's). */
+export interface ReSessionSummary {
+  id: string
+  title: string
+  /** "RulZ LLM Suite", or the app that ran it. */
+  source: string
+  kind: ReKind
+  target: string
+  goal: string
+  outcome: ReOutcome
+  practice?: { taskId: string; family: string; tier: string; answer?: string; expected?: string }
+  responses: number
+  toolRounds: number
+  updatedAt: number
+}
+
+export interface RePracticeTaskStats {
+  id: string
+  family: string
+  tier: string
+  binary: string
+  /** The task's question; {exe} stands for the program's path. */
+  prompt: string
+  attempts: number
+  solved: number
+}
+
+/** RulZ LLM Suite's RE sessions, practice tasks and prompt templates (GET /v1/re/overview). */
+export interface ReOverview {
+  recording: boolean
+  sessions: ReSessionSummary[]
+  practice: { kitDir: string; error?: string; tasks: RePracticeTaskStats[] }
+  /** {target} is replaced by the target path. */
+  goals: { label: string; text: string }[]
+  clonePieces: { label: string; text: string }[]
+  /** '' = the same language as the original. */
+  cloneLanguages: string[]
+}
+
+/** An RE task to start in the open project. `record` (default true) records it in RulZ LLM Suite. */
+export type ReStartRequest =
+  | { kind: 'analyse'; target: string; goal: string; record?: boolean }
+  | { kind: 'practice'; taskId: string; record?: boolean }
+  | { kind: 'clone'; target: string; scope: 'pieces' | 'full'; details: string; language: string; record?: boolean }
+
+/** What a task started as an RE task was (kept on the task for recording and grading). */
+export interface ReTaskInfo {
+  kind: ReKind
+  target: string
+  goal: string
+  record: boolean
+  language?: string
+  practice?: { taskId: string; family: string; tier: string; answer?: string | null; expected?: string; passed?: boolean }
 }

@@ -4,6 +4,8 @@ import type {
   Attachment,
   ChatMessage,
   Conversation,
+  FileToolScope,
+  ReClone,
   ConversationSummary,
   Preset,
   ReOutcome,
@@ -22,7 +24,17 @@ import { once } from '../lib/once'
 import { buildWire } from '../lib/wire'
 import { useApp } from './app'
 import { availableTools, effectiveToolMode, tokensOf, toolBudget, toolRequestFor } from './mcp'
-import { isStaticReTool, RE_MIN_CONTEXT, RE_STARTER_TOOLS, RE_SYSTEM_PROMPT, reFirstMessage, reSampling } from '@shared/re'
+import {
+  CLONE_STARTER_TOOLS,
+  cloneFirstMessage,
+  clonePrompt,
+  isStaticReTool,
+  RE_MIN_CONTEXT,
+  RE_STARTER_TOOLS,
+  RE_SYSTEM_PROMPT,
+  reFirstMessage,
+  reSampling
+} from '@shared/re'
 import { readyInstance, useModels } from './models'
 import { META_LOAD, META_SEARCH, META_TOOLS, resolveTool, searchTools } from '@shared/tools'
 
@@ -133,6 +145,8 @@ interface ChatState {
 
 export interface StartReOptions {
   target: string
+  /** Rebuild part or all of the target as new code (a clone session). */
+  clone?: ReClone
   /** First message; {target} is replaced by the target path. */
   goal: string
   collect: boolean
@@ -162,6 +176,18 @@ export function toWire(
   keepReasoning = false
 ): WireMessage[] {
   return buildWire(messages, systemPrompt, vision, keepFull, keepReasoning)
+}
+
+/** Where a clone session's write/read file tools may work; undefined for other chats. */
+export function fileScope(c: Conversation | null | undefined): FileToolScope | undefined {
+  const clone = c?.re?.clone
+  return clone?.outputDir ? { writeRoot: clone.outputDir, target: c!.re!.target } : undefined
+}
+
+/** Tool options for a chat: RE sessions use the RE budget, clone sessions get the file tools. */
+function toolOpts(c: Conversation | null | undefined): { re: boolean; files?: FileToolScope } {
+  const files = fileScope(c)
+  return { re: !!c?.re, ...(files ? { files } : {}) }
 }
 
 /** A copy of an RE session's details for a new chat (branch, copy, handoff): it needs grading again. */
@@ -414,7 +440,7 @@ export const useChat = create<ChatState>((set, get) => {
     } catch {
       return { text: `The arguments were not valid JSON: ${call.arguments}`, isError: true }
     }
-    const tools = availableTools()
+    const tools = availableTools({ clone: !!fileScope(get().genConversation) })
     const active = new Set(get().genConversation?.activeTools ?? [])
     if (call.name === META_SEARCH) {
       const hits = searchTools(tools, String(args.query ?? ''), Number(args.limit) || 10)
@@ -473,7 +499,8 @@ export const useChat = create<ChatState>((set, get) => {
         continue
       }
       // The model may call a tool by its bare name; map it to the real one.
-      const target = resolveTool(availableTools(), call.name)
+      const scope = fileScope(get().genConversation)
+      const target = resolveTool(availableTools({ clone: !!scope }), call.name)
       if (!target) {
         updateCall(call.id, { status: 'error', result: `Tool "${call.name}" is not available or is switched off.` })
         continue
@@ -484,7 +511,7 @@ export const useChat = create<ChatState>((set, get) => {
       }
       const isRe = !!get().genConversation?.re
       // Calling a tool keeps it loaded and marks it recently used.
-      if (effectiveToolMode({ re: isRe }) === 'dynamic') loadTools([target.qualifiedName])
+      if (effectiveToolMode({ re: isRe, files: scope }) === 'dynamic') loadTools([target.qualifiedName])
       const s = useApp.getState().settings
       let approved =
         !s?.confirmToolCalls ||
@@ -509,7 +536,7 @@ export const useChat = create<ChatState>((set, get) => {
       updateCall(call.id, { status: 'running' })
       const callKey = `${requestId}:${call.id}`
       runningToolCalls.add(callKey)
-      const r = await invoke('mcp:callTool', call.name, call.arguments, callKey)
+      const r = await invoke('mcp:callTool', call.name, call.arguments, callKey, scope)
         .catch((e) => ({ text: errorMessage(e), isError: true }))
         .finally(() => runningToolCalls.delete(callKey))
       if (!inToolPhase(requestId)) return
@@ -526,7 +553,8 @@ export const useChat = create<ChatState>((set, get) => {
     for (let i = conv.messages.length - 1; i >= 0 && conv.messages[i].role === 'assistant'; i--) {
       if (conv.messages[i].toolCalls?.length) rounds++
     }
-    const maxRounds = conv.re ? (useApp.getState().settings?.re.maxToolRounds ?? 80) : MAX_TOOL_ROUNDS
+    const reSettings = useApp.getState().settings?.re
+    const maxRounds = conv.re ? ((conv.re.clone ? reSettings?.cloneMaxToolRounds : reSettings?.maxToolRounds) ?? 80) : MAX_TOOL_ROUNDS
     if (rounds >= maxRounds) {
       toast.warning(`Stopped after ${maxRounds} rounds of tool calls without a final answer.`)
       return
@@ -608,7 +636,7 @@ export const useChat = create<ChatState>((set, get) => {
         messages: toWire(history, conv.systemPrompt, inst.hasVision, undefined, !!conv.re),
         sampling: conv.sampling,
         overflow: settings?.contextOverflow ?? 'truncateMiddle',
-        tools: toolRequestFor(conv.activeTools, { re: !!conv.re }),
+        tools: toolRequestFor(conv.activeTools, toolOpts(conv)),
         record: conv.re?.collect ? { conversationId: conv.id } : undefined
       })
     } catch (e) {
@@ -1061,31 +1089,31 @@ export const useChat = create<ChatState>((set, get) => {
       const modelId = opts.modelId && models.models.some((m) => m.id === opts.modelId) ? opts.modelId : models.activeModelId
       // Messages go to the active model, so the session's model becomes it (loaded on send if needed).
       if (modelId) models.setActive(modelId)
-      const available = availableTools()
-      const starter = RE_STARTER_TOOLS.flatMap((n) => {
+      const available = availableTools({ clone: !!opts.clone })
+      const starter = [...RE_STARTER_TOOLS, ...(opts.clone ? CLONE_STARTER_TOOLS : [])].flatMap((n) => {
         const t = resolveTool(available, n)
         return t ? [t.qualifiedName] : []
       })
       const now = Date.now()
       const conv: Conversation = {
         id: uid(),
-        title: (opts.title ?? `RE: ${baseName(opts.target)}`).slice(0, 60),
+        title: (opts.title ?? `${opts.clone ? 'Clone' : 'RE'}: ${baseName(opts.target)}`).slice(0, 60),
         folder: null,
         pinned: false,
         createdAt: now,
         updatedAt: now,
         modelId,
-        systemPrompt: RE_SYSTEM_PROMPT,
+        systemPrompt: opts.clone ? `${RE_SYSTEM_PROMPT}\n\n${clonePrompt(opts.clone)}` : RE_SYSTEM_PROMPT,
         sampling: reSampling(s?.defaultSampling ?? DEFAULT_SAMPLING),
         presetId: null,
         activeTools: starter,
-        re: { target: opts.target, goal: opts.goal, collect: opts.collect, outcome: 'unrated', practice: opts.practice },
+        re: { target: opts.target, goal: opts.goal, collect: opts.collect, outcome: 'unrated', practice: opts.practice, clone: opts.clone },
         messages: []
       }
       set({ current: conv, tokenCount: null })
       await persistNow(conv)
       useApp.getState().setPage('chat')
-      await appendAndGenerate(conv, reFirstMessage(opts.goal, opts.target), [])
+      await appendAndGenerate(conv, opts.clone ? cloneFirstMessage(opts.clone, opts.target) : reFirstMessage(opts.goal, opts.target), [])
     },
 
     setReOutcome: (id, outcome, notes) =>
@@ -1100,7 +1128,7 @@ export const useChat = create<ChatState>((set, get) => {
         const modelId = useModels.getState().activeModelId ?? conv?.modelId ?? null
         const inst = readyInstance(modelId)
         if (!conv || !inst) return set({ tokenCount: null })
-        const tools = toolRequestFor(conv.activeTools, { re: !!conv.re }) ?? null
+        const tools = toolRequestFor(conv.activeTools, toolOpts(conv)) ?? null
         const wire = toWire(conv.messages, conv.systemPrompt, inst.hasVision, undefined, !!conv.re)
         const n = await invoke('chat:countTokens', inst.modelId, wire, tools).catch(
           () => null

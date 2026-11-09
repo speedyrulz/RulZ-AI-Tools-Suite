@@ -5,10 +5,11 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { DEFAULT_LOAD_CONFIG } from '@shared/defaults'
 import { API_RE_PREFIX, RE_SESSION_HEADER } from '@shared/re'
-import type { LoadedInstance, ModelEntry } from '@shared/types'
+import type { LoadedInstance, ModelEntry, ReOverview, ReSession } from '@shared/types'
 import type { RecordedRound } from '../src/main/chat/service'
 import type { InstanceManager } from '../src/main/engine/instances'
 import { exportDataset, TraceStore } from '../src/main/re/traces'
+import { buildOverview } from '../src/main/re/overview'
 import { ApiServer, parseReSessionPatch } from '../src/main/server/apiServer'
 import { ChatReplyCapture } from '../src/main/server/reCapture'
 
@@ -108,7 +109,13 @@ describe('recording RE sessions from the API server', () => {
         enabled: () => enabled,
         record: (id: string, round: RecordedRound) => void recorded.push(traces.record(API_RE_PREFIX + id, round, { shrinkIsTrim: true })),
         session: (id: string) => traces.apiSession(API_RE_PREFIX + id),
-        update: (id: string, patch) => traces.updateApiSession(API_RE_PREFIX + id, patch)
+        update: (id: string, patch) => traces.updateApiSession(API_RE_PREFIX + id, patch),
+        overview: async () => buildOverview({ chats: [], traces: await traces.list(), practice: { kitDir: 'k', tasks: [] }, recording: enabled }),
+        preparePractice: async (taskId: string) => {
+          if (taskId !== 'xor-1') throw new Error('No such task.')
+          return { target: 'C:\\w\\xor.exe', prompt: 'Find the key in C:\\w\\xor.exe', family: 'xor', tier: 't1' }
+        },
+        gradePractice: async (_taskId: string, _target: string, text: string) => ({ answer: text.includes('ANSWER: 7') ? '7' : null, passed: text.includes('ANSWER: 7'), expected: '7' })
       }
     })
     await server.start()
@@ -143,6 +150,16 @@ describe('recording RE sessions from the API server', () => {
       expect((await (await fetch(`${base}/v1/re/sessions/task-1`, { method: 'POST', body: '{"outcome":"solved"}' })).json()) as object).toMatchObject({ outcome: 'solved', recording: false })
       expect((await fetch(`${base}/v1/re/sessions/task-2`, { method: 'POST', body: '{"title":"x"}' })).status).toBe(200)
       expect(await traces.apiSession(API_RE_PREFIX + 'task-2')).toBeNull()
+
+      const overview = (await (await fetch(`${base}/v1/re/overview`)).json()) as ReOverview
+      expect(overview.sessions).toMatchObject([{ id: 'api-task-1', source: 'RulZ Coding Agent', kind: 'analyse', outcome: 'solved', toolRounds: 1 }])
+      const prep = await fetch(`${base}/v1/re/practice/xor-1/prepare`, { method: 'POST' })
+      expect(await prep.json()).toMatchObject({ target: 'C:\\w\\xor.exe', family: 'xor' })
+      expect((await fetch(`${base}/v1/re/practice/nope/prepare`, { method: 'POST' })).status).toBe(400)
+      expect((await fetch(`${base}/v1/re/practice/xor-1/run`, { method: 'POST' })).status).toBe(404)
+      const grade = await fetch(`${base}/v1/re/practice/xor-1/grade`, { method: 'POST', body: JSON.stringify({ target: 'C:\\w\\xor.exe', text: 'so\nANSWER: 7' }) })
+      expect(await grade.json()).toEqual({ answer: '7', passed: true, expected: '7' })
+      expect((await fetch(`${base}/v1/re/practice/xor-1/grade`, { method: 'POST', body: '{}' })).status).toBe(400)
 
       const api = (await traces.apiSession(API_RE_PREFIX + 'task-1'))!
       const r = await exportDataset(traces, [{ id: API_RE_PREFIX + 'task-1', source: api.client, re: { target: api.target, goal: api.goal, collect: true, outcome: api.outcome } }], {
@@ -184,5 +201,50 @@ describe('recording RE sessions from the API server', () => {
     await traces.record('chat', round(5))
     await traces.record('chat', round(2))
     expect((await traces.info('chat'))?.trimmed).toBe(false)
+  })
+})
+
+describe('RE overview', () => {
+  const re = (extra: Partial<ReSession> = {}): ReSession => ({ target: 'C:\\a.exe', goal: 'g', collect: true, outcome: 'unrated', ...extra })
+  it('lists chats and API sessions newest first, with practice counts', () => {
+    const o = buildOverview({
+      chats: [
+        { id: 'c1', title: 'RE: a', updatedAt: 10, re: re({ outcome: 'solved', practice: { taskId: 'xor-1', family: 'xor', tier: 't1', answer: '7', expected: '7' } }) },
+        { id: 'c2', title: 'Clone: a', updatedAt: 30, re: re({ clone: { scope: 'full', details: '', language: 'C', outputDir: 'D:\\o' } }) }
+      ],
+      traces: [
+        { conversationId: 'c1', responses: 4, toolRounds: 3, trimmed: false, bytes: 1, updatedAt: 12 },
+        {
+          conversationId: 'api-agent-1',
+          responses: 2,
+          toolRounds: 1,
+          trimmed: false,
+          bytes: 1,
+          updatedAt: 20,
+          api: { client: 'RulZ Coding Agent', title: 'x', target: 't', goal: 'g', outcome: 'failed', createdAt: 1, practice: { taskId: 'xor-1', family: 'xor', tier: 't1' } }
+        }
+      ],
+      practice: { kitDir: 'k', tasks: [{ id: 'xor-1', family: 'xor', tier: 't1', binary: 'xor.exe', prompt: 'p' }, { id: 'xor-2', family: 'xor', tier: 't2', binary: 'b.exe', prompt: 'q' }] },
+      recording: true
+    })
+    expect(o.sessions.map((s) => [s.id, s.kind, s.source])).toEqual([
+      ['c2', 'clone-full', 'RulZ LLM Suite'],
+      ['api-agent-1', 'practice', 'RulZ Coding Agent'],
+      ['c1', 'practice', 'RulZ LLM Suite']
+    ])
+    expect(o.sessions[2]).toMatchObject({ responses: 4, toolRounds: 3, updatedAt: 12 })
+    expect(o.practice.tasks.map((t) => [t.id, t.attempts, t.solved])).toEqual([
+      ['xor-1', 2, 1],
+      ['xor-2', 0, 0]
+    ])
+    expect(o.goals.length).toBeGreaterThan(0)
+  })
+  it('accepts kind and practice in a session description', () => {
+    expect(parseReSessionPatch({ kind: 'practice', practice: { taskId: 'a', family: 'f', tier: 't', answer: '1' } })).toEqual({
+      kind: 'practice',
+      practice: { taskId: 'a', family: 'f', tier: 't', answer: '1' }
+    })
+    expect(parseReSessionPatch({ kind: 'other' })).toMatch(/kind/)
+    expect(parseReSessionPatch({ practice: { taskId: 1 } })).toMatch(/practice/)
   })
 })

@@ -17,7 +17,7 @@ import type { AppSettings, RemoteClient } from '@shared/types'
 export const REMOTE_PATH = '/rulz'
 
 /** Requests that only make sense on this computer (dialogs, its own browser and Explorer, phone access itself). */
-const COMPUTER_ONLY = new Set(['dialog:pickFolder', 'shell:showItem', 'shell:openUrl'])
+const COMPUTER_ONLY = new Set(['dialog:pickFolder', 'dialog:pickFile', 'shell:showItem', 'shell:openUrl'])
 const isComputerOnly = (channel: string): boolean => COMPUTER_ONLY.has(channel) || channel.startsWith('remote:')
 
 /** Events the phone doesn't get. */

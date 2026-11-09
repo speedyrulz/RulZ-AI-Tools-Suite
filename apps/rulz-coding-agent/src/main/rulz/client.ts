@@ -1,5 +1,5 @@
 // Talks to RulZ LLM Suite's local API server (OpenAI-compatible endpoints).
-import type { ConnectionInfo, LoadSettings, ModelInfo, ModelLoadInfo, WireMessage, WireToolCall } from '@shared/types'
+import type { ConnectionInfo, LoadSettings, ModelInfo, ModelLoadInfo, ReKind, ReOutcome, ReOverview, WireMessage, WireToolCall } from '@shared/types'
 import { noDraftMsPerToken } from './draft'
 import { errorFromBody, type GenTimings, interpretChunk, SseParser, ToolCallAccumulator } from './sse'
 import { jsonifyToolCallArgs, templateStringifiesArgs } from './toolArgs'
@@ -14,10 +14,14 @@ export const RE_SESSION_HEADER = 'x-rulz-re-session'
 
 /** What RulZ LLM Suite shows for a recorded RE session. */
 export interface ReSessionInfo {
-  client: string
-  title: string
-  target: string
-  goal: string
+  client?: string
+  title?: string
+  target?: string
+  goal?: string
+  kind?: ReKind
+  outcome?: ReOutcome
+  notes?: string
+  practice?: { taskId: string; family: string; tier: string; answer?: string; expected?: string }
 }
 
 const headers = (apiKey: string, json = false): Record<string, string> => ({
@@ -307,6 +311,34 @@ export class RulzClient {
     } catch {
       return false
     }
+  }
+
+  private async reJson<T>(path: string, body?: unknown, timeoutMs = 15000): Promise<T> {
+    const { url, apiKey } = this.config()
+    const res = await fetch(`${url}${path}`, {
+      method: body === undefined ? 'GET' : 'POST',
+      headers: headers(apiKey, body !== undefined),
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(timeoutMs)
+    })
+    if (res.status === 404) throw new ServerError('This needs RulZ LLM Suite 0.15.0 or later. Update RulZ LLM Suite and try again.', 404)
+    if (!res.ok) throw new ServerError(errorFromBody(res.status, await res.text()), res.status)
+    return (await res.json()) as T
+  }
+
+  /** RE sessions, practice tasks and prompt templates from RulZ LLM Suite. */
+  reOverview(): Promise<ReOverview> {
+    return this.reJson<ReOverview>('/v1/re/overview')
+  }
+
+  /** Has RulZ LLM Suite copy a practice task's program into a fresh work folder. */
+  preparePractice(taskId: string): Promise<{ target: string; prompt: string; family: string; tier: string }> {
+    return this.reJson(`/v1/re/practice/${encodeURIComponent(taskId)}/prepare`, {})
+  }
+
+  /** Checks a practice task's final reply (its ANSWER line) against the task's answer. */
+  gradePractice(taskId: string, target: string, text: string): Promise<{ answer: string | null; passed: boolean; expected: string }> {
+    return this.reJson(`/v1/re/practice/${encodeURIComponent(taskId)}/grade`, { target, text }, 60000)
   }
 
   /** Non-streamed completion without tools (used for summaries). */

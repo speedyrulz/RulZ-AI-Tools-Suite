@@ -1,6 +1,7 @@
 import { Binary, CircleDot } from 'lucide-react'
 import type { Conversation, ReOutcome } from '@shared/types'
 import { cn } from '../../lib/format'
+import { invoke } from '../../lib/api'
 import { useChat } from '../../stores/chat'
 import { Badge, Tooltip } from '../ui'
 
@@ -62,6 +63,14 @@ export function ReBanner({ conv }: { conv: Conversation }) {
         <Badge tone="accent">
           Practice {p.family} · {p.tier}
         </Badge>
+      )}
+      {re.clone && (
+        <Tooltip content={`Writing the ${re.clone.scope === 'full' ? 'whole-program' : 'piece'} clone${re.clone.language ? ` (${re.clone.language})` : ''} here. Click to open.`}>
+          <button className="flex min-w-0 items-center gap-1 text-muted hover:text-text" onClick={() => void invoke('shell:openPath', re.clone!.outputDir)}>
+            <Badge tone="accent">Clone</Badge>
+            <span className="truncate font-mono">→ {re.clone.outputDir}</span>
+          </button>
+        </Tooltip>
       )}
       {p?.answer !== undefined && (
         <span className="text-faint">

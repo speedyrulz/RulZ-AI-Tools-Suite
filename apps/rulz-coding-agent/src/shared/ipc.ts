@@ -11,6 +11,8 @@ import type {
   ProjectInfo,
   ProjectState,
   PromptAnswer,
+  ReOverview,
+  ReStartRequest,
   RemotePairing,
   RemoteStatus,
   RunEvent,
@@ -37,6 +39,7 @@ export interface IpcInvoke {
   /** Starts the tool servers now (they otherwise start when the agent first needs one). */
   'tools:start': () => ToolServersInfo
   'dialog:pickFolder': (opts: { title?: string; defaultPath?: string }) => string | null
+  'dialog:pickFile': (opts: { title?: string; defaultPath?: string }) => string | null
   'shell:showItem': (path: string) => void
   'shell:openUrl': (url: string) => void
   /** Subfolders of a folder (the drives when `path` is empty), for choosing a folder from the phone. */
@@ -85,6 +88,11 @@ export interface IpcInvoke {
   /** Runs the latest request again, edited when `text` is given, after undoing its file changes. */
   'task:redo': (projectPath: string, taskId: string, text?: string) => ProjectState
   'files:diff': (projectPath: string, taskId: string, path: string) => FileDiff
+
+  /** RulZ LLM Suite's RE sessions, practice tasks and templates (needs RulZ LLM Suite 0.15.0). */
+  're:overview': () => ReOverview
+  /** Starts a reverse-engineering task (analyse, practice or clone) in the open project. */
+  're:start': (projectPath: string, req: ReStartRequest) => void
   /** Saves the owner's "Things to always remember" for the project. */
   'project:setMemory': (projectPath: string, text: string) => void
 

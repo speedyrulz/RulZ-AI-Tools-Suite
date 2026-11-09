@@ -17,8 +17,9 @@ import { ApiServer } from './server/apiServer'
 import { parseLoadConfig } from './settings/schema'
 import { SettingsStore } from './settings/store'
 import { FILE_TOOLS_SERVER } from './files/fileTools'
-import { API_RE_PREFIX, extractAnswer } from '@shared/re'
+import { API_RE_PREFIX, CLONE_FILE_TOOLS, extractAnswer } from '@shared/re'
 import { gradePractice, listPractice, preparePractice } from './re/practice'
+import { buildOverview, MAX_OVERVIEW_SESSIONS } from './re/overview'
 import { findPython, type PythonCommand } from './re/python'
 import { exportDataset, TraceStore, type ExportSession } from './re/traces'
 
@@ -222,12 +223,33 @@ async function main(): Promise<void> {
         const s = await traces.updateApiSession(apiRe(id), patch)
         broadcast('re:changed', undefined)
         return s
+      },
+      overview: async () => {
+        const chats = []
+        const reSummaries = (await conversations.list()).filter((s) => s.reOutcome).slice(0, MAX_OVERVIEW_SESSIONS)
+        for (const s of reSummaries) {
+          const c = await conversations.get(s.id).catch(() => null)
+          if (c?.re) chats.push({ id: c.id, title: c.title, updatedAt: c.updatedAt, re: c.re })
+        }
+        const re = settings.get().re
+        return buildOverview({ chats, traces: await traces.list(), practice: await listPractice(re.kitDir), recording: re.recordApi })
+      },
+      preparePractice: async (taskId) => {
+        const { target, prompt, task } = await preparePractice(settings.get().re.kitDir, practiceRoot, taskId)
+        return { target, prompt, family: task.family, tier: task.tier }
+      },
+      gradePractice: async (taskId, target, text) => {
+        const answer = extractAnswer(text)
+        const { passed, expected } = await gradePractice(settings.get().re.kitDir, practiceRoot, taskId, target, answer)
+        return { answer, passed, expected }
       }
     }
   })
 
   const chat = new ChatService(instances, (e) => broadcast('chat:event', e), (req) => {
     const disabled = new Set(settings.get().disabledTools)
+    // The write/read file tools exist only in clone sessions.
+    if (!req.files) for (const n of CLONE_FILE_TOOLS) disabled.add(n)
     if (req.mode === 'all') return { defs: mcp.toolDefinitions(disabled) }
     // On demand: the three loader tools, the loaded tools' full descriptions, and a name catalog.
     const available = mcp.availableTools(disabled)
@@ -341,11 +363,11 @@ async function main(): Promise<void> {
   handle('mcp:restart', (name) => mcp.restart(name))
   // Running tool calls by the renderer's key, so Stop can cancel the one in progress.
   const toolCalls = new Map<string, AbortController>()
-  handle('mcp:callTool', async (name, args, callKey) => {
+  handle('mcp:callTool', async (name, args, callKey, files) => {
     const ctrl = new AbortController()
     if (callKey) toolCalls.set(callKey, ctrl)
     try {
-      return await mcp.callTool({ name, arguments: args }, ctrl.signal)
+      return await mcp.callTool({ name, arguments: args }, ctrl.signal, files)
     } finally {
       if (callKey) toolCalls.delete(callKey)
     }

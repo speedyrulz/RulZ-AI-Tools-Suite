@@ -293,7 +293,8 @@ export async function exportDataset(
       ...(c.source ? { source: c.source } : {}),
       outcome: re.outcome,
       graded: re.autoGraded ? 'auto' : 'user',
-      ...(re.practice ? { task: re.practice.taskId, family: re.practice.family, tier: re.practice.tier } : {})
+      ...(re.practice ? { task: re.practice.taskId, family: re.practice.family, tier: re.practice.tier } : {}),
+      ...(re.clone ? { kind: re.clone.scope === 'full' ? 'clone-full' : 'clone-pieces', ...(re.clone.language ? { language: re.clone.language } : {}) } : {})
     }
     const sample = buildSample(data.request, data.responses, data.tools, meta)
     if (typeof sample === 'string') {

@@ -18,6 +18,7 @@ import type {
   Preset,
   ReExportOptions,
   ReOutcome,
+  FileToolScope,
   ReExportResult,
   RePracticeInfo,
   ReTraceInfo,
@@ -81,7 +82,8 @@ export interface IpcInvoke {
   'mcp:status': () => McpServerStatus[]
   'mcp:restart': (name: string | null) => void
   /** `callKey` lets `mcp:cancelTool` stop this call while it runs. */
-  'mcp:callTool': (name: string, args: string, callKey?: string) => ToolResult
+  /** `files` lets the built-in write/read file tools work (clone sessions). */
+  'mcp:callTool': (name: string, args: string, callKey?: string, files?: FileToolScope) => ToolResult
   'mcp:cancelTool': (callKey: string) => void
   /** The tool round asked for by `requestId` is over (next round started, or the turn ended). */
   'chat:releaseTurn': (requestId: string) => void

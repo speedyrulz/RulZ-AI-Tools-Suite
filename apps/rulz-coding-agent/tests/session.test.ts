@@ -5,7 +5,8 @@ import { basename, join } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
 import { DEFAULT_SETTINGS } from '@shared/defaults'
 import { DELETED_REPLY } from '@shared/history'
-import type { AgentEvent, AppSettings, PendingPrompt, PromptAnswer, TaskRecord } from '@shared/types'
+import type { AgentEvent, AppSettings, PendingPrompt, PromptAnswer, ReTaskInfo, TaskRecord } from '@shared/types'
+import { practiceTask } from '../src/main/agent/reTasks'
 import type { PageTarget } from '../src/main/agent/pageCheck'
 import { ProjectSession, type SessionDeps } from '../src/main/agent/session'
 import { CopySnapshots, GitSnapshots, gitInstalled } from '../src/main/project/snapshots'
@@ -27,7 +28,7 @@ interface Harness {
   prompts: PendingPrompt[]
   requests: Awaited<ReturnType<typeof startMockRulz>>['requests']
   reSessions: Awaited<ReturnType<typeof startMockRulz>>['reSessions']
-  run: (text: string, opts?: { shown?: string; share?: boolean }) => Promise<TaskRecord>
+  run: (text: string, opts?: { shown?: string; share?: boolean; re?: ReTaskInfo }) => Promise<TaskRecord>
   /** Resolves when the next task ends (for tasks started some other way, such as redo). */
   nextEnd: () => Promise<TaskRecord>
   close: () => Promise<void>
@@ -726,6 +727,34 @@ describe('recording for reverse-engineering training', () => {
         { id: `agent-${first.id}`, body: { client: 'RulZ Coding Agent', title: 'What is the key in a.exe?', target: h.root, goal: 'What is the key in a.exe?' } },
         { id: `agent-${second.id}`, body: { client: 'RulZ Coding Agent', title: 'And the other one?', target: h.root, goal: 'And the other one?' } }
       ])
+    } finally {
+      await h.close()
+    }
+  })
+
+  it('records and grades a practice task from the RE panel, with recording off for other tasks', async () => {
+    const h = await harness([{ content: 'It XORs with 0x2a.\nANSWER: 42' }, { content: 'Guess.\nANSWER: 7' }])
+    try {
+      const prep = await h.session['deps'].client.preparePractice('xor-1')
+      const t = practiceTask(prep, 'xor-1', true)
+      expect(t.text).toContain('What is the key in C:\\work\\xor-1\\1\\xor.exe?')
+      expect(t.text).toContain('ANSWER: <value>')
+      const task = await h.run(t.text, { shown: t.shown, re: t.info })
+      expect(task.re?.practice).toMatchObject({ answer: '42', expected: '42', passed: true })
+      expect(h.session.data.timeline.some((i) => i.kind === 'notice' && i.text.includes('Practice solved'))).toBe(true)
+      const id = `agent-${task.id}`
+      expect(h.requests.filter((r) => r.body.stream).map((r) => r.reSession)).toEqual([id])
+      expect(h.reSessions).toEqual([
+        { id, body: { client: 'RulZ Coding Agent', title: t.shown, target: prep.target, goal: prep.prompt, kind: 'practice', practice: { taskId: 'xor-1', family: 'xor', tier: 't1' } } },
+        { id, body: { outcome: 'solved', practice: { taskId: 'xor-1', family: 'xor', tier: 't1', answer: '42', expected: '42' } } }
+      ])
+
+      // Not recorded: graded, but nothing is sent to the Suite's session.
+      const off = practiceTask(prep, 'xor-1', false)
+      const second = await h.run(off.text, { shown: off.shown, re: off.info })
+      expect(second.re?.practice).toMatchObject({ answer: '7', passed: false })
+      expect(h.reSessions).toHaveLength(2)
+      expect(h.session.data.timeline.some((i) => i.kind === 'notice' && i.text.includes('the right one is **42**'))).toBe(true)
     } finally {
       await h.close()
     }
