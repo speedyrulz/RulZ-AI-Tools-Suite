@@ -1,4 +1,36 @@
 import type { WireMessage } from '@shared/types'
+import { parseToolArgs } from '../agent/tools'
+
+/**
+ * Makes every earlier tool call's arguments a JSON object. llama.cpp parses them to fill in the
+ * chat template and rejects the whole request when one doesn't parse, so a single call the model
+ * cut off mid-string (a reply that ran out of tokens or was interrupted) would fail every later
+ * turn of the task. Python-style arguments are converted; arguments that can't be read become {}
+ * (the tool's result already told the model they were invalid).
+ */
+export function validToolCallArgs(messages: WireMessage[]): WireMessage[] {
+  let changed = false
+  const out = messages.map((m) => {
+    if (!m.tool_calls?.length) return m
+    let fixed = false
+    const calls = m.tool_calls.map((c) => {
+      const raw = c.function.arguments ?? ''
+      try {
+        const v: unknown = JSON.parse(raw)
+        if (v && typeof v === 'object' && !Array.isArray(v)) return c
+      } catch {
+        // repaired below
+      }
+      const parsed = parseToolArgs(raw)
+      fixed = true
+      return { ...c, function: { ...c.function, arguments: 'args' in parsed ? JSON.stringify(parsed.args) : '{}' } }
+    })
+    if (!fixed) return m
+    changed = true
+    return { ...m, tool_calls: calls }
+  })
+  return changed ? out : messages
+}
 
 /**
  * True for chat templates that write each tool-call argument as an XML-style `<parameter=…>` block

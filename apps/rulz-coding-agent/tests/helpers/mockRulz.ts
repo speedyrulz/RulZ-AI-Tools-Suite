@@ -177,6 +177,16 @@ export async function startMockRulz(opts: MockOptions = {}) {
       const reSession = req.headers['x-rulz-re-session']
       const record: MockRequest = { path: url.pathname, body, ...(typeof reSession === 'string' ? { reSession } : {}) }
       requests.push(record)
+      // Like llama.cpp: earlier tool calls' arguments must parse as JSON, or the request fails.
+      for (const m of body.messages ?? []) {
+        for (const c of m.tool_calls ?? []) {
+          try {
+            JSON.parse(c.function.arguments)
+          } catch {
+            return json(500, { error: { code: 500, message: 'Failed to parse tool call arguments as JSON: [json.exception.parse_error.101] parse error', type: 'server_error' } })
+          }
+        }
+      }
       if (!body.stream) return json(200, { choices: [{ message: { role: 'assistant', content: 'Summary: the owner asked for things and they were built.' } }] })
       const turn = nextTurn(record)
       if (turn.delay) await new Promise((r) => setTimeout(r, turn.delay))
