@@ -16,6 +16,10 @@ import type {
   MemoryEstimate,
   ModelEntry,
   Preset,
+  ReExportOptions,
+  ReExportResult,
+  RePracticeInfo,
+  ReTraceInfo,
   StreamEvent,
   ToolRequest,
   ToolResult,
@@ -86,6 +90,25 @@ export interface IpcInvoke {
   'server:stop': () => ApiServerStatus
   'server:log': () => ApiRequestLog[]
   'server:clearLog': () => void
+
+  /** Recorded training data of every RE session. */
+  're:traces': () => ReTraceInfo[]
+  're:deleteTrace': (conversationId: string) => void
+  /** Writes graded RE sessions as train.jsonl. */
+  're:export': (opts: ReExportOptions) => ReExportResult
+  're:dataFolder': () => string
+  /** Whether the built-in calc server can run (it needs Python 3). */
+  're:calcStatus': () => { available: boolean; python: string | null }
+  're:practiceList': (kitDir: string) => RePracticeInfo
+  /** Copies a practice task's binary into a fresh work folder. */
+  're:practicePrepare': (kitDir: string, taskId: string) => { target: string; prompt: string; family: string; tier: string }
+  /** Checks a practice session's final reply against the task's answer. */
+  're:practiceGrade': (
+    kitDir: string,
+    taskId: string,
+    target: string,
+    finalText: string
+  ) => { answer: string | null; passed: boolean; expected: string }
 
   'presets:list': () => Preset[]
   'presets:save': (preset: Preset) => Preset[]

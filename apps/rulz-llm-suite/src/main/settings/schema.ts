@@ -103,7 +103,17 @@ export const settingsSchema = z.object({
       defaultModelId: z.string().catch(D.apiServer.defaultModelId),
       unknownModelFallback: z.boolean().catch(D.apiServer.unknownModelFallback)
     })
-    .catch(D.apiServer)
+    .catch(D.apiServer),
+  re: z
+    .object({
+      modelId: z.string().catch(D.re.modelId),
+      kitDir: z.string().catch(D.re.kitDir),
+      collect: z.boolean().catch(D.re.collect),
+      autoApproveStatic: z.boolean().catch(D.re.autoApproveStatic),
+      maxToolRounds: z.number().int().min(1).max(500).catch(D.re.maxToolRounds),
+      toolBudgetTokens: z.number().int().min(500).max(200000).catch(D.re.toolBudgetTokens)
+    })
+    .catch(D.re)
 })
 
 export const presetSchema = z.object({

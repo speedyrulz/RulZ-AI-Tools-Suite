@@ -10,9 +10,17 @@ export function buildWire(
   messages: ChatMessage[],
   systemPrompt: string,
   vision: boolean,
-  keepFull: number | null
+  keepFull: number | null,
+  /** Send the thinking of assistant turns since the last user message back (interleaved thinking in a tool loop). */
+  keepReasoning = false
 ): WireMessage[] {
   const keepIds = keepFull === null ? null : recentToolCallIds(messages, keepFull)
+  let lastUser = -1
+  messages.forEach((m, i) => {
+    if (m.role === 'user') lastUser = i
+  })
+  const reasoningOf = (m: ChatMessage, i: number): { reasoning_content?: string } =>
+    keepReasoning && i > lastUser && m.reasoning?.trim() ? { reasoning_content: m.reasoning } : {}
   const out: WireMessage[] = []
   if (systemPrompt.trim()) out.push({ role: 'system', content: systemPrompt })
   messages.forEach((m, i) => {
@@ -22,6 +30,7 @@ export function buildWire(
       out.push({
         role: 'assistant',
         content: m.content,
+        ...reasoningOf(m, i),
         tool_calls: m.toolCalls.map((c) => ({ id: c.id, type: 'function', function: { name: c.name, arguments: c.arguments } }))
       })
       for (const c of m.toolCalls) {

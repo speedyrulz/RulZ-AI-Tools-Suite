@@ -10,6 +10,7 @@ import { IconButton, Tooltip } from '../ui'
 import { Composer, type ComposerHandle } from './Composer'
 import { HandoffDialogs, useHandoffTrigger } from './Handoff'
 import { MessageItem } from './MessageItem'
+import { ReBanner } from './ReBanner'
 
 export function ChatView() {
   const current = useChat((s) => s.current)
@@ -99,6 +100,8 @@ export function ChatView() {
           {panelOpen ? <PanelRightClose size={17} /> : <PanelRight size={17} />}
         </IconButton>
       </div>
+
+      <ReBanner conv={current} />
 
       <div
         ref={scroller}

@@ -64,6 +64,26 @@ Discover/downloads, RAG and a CLI are planned.
   memory estimate. `POST /v1/models/{id}/unload` unloads every running instance of a model (replying with how many it
   `unloaded`), so a client can free the memory when it is done with a model.
   Default port 1234 (pick another if LM Studio is running).
+- **Reverse Engineering mode** (`Ctrl+6`) — runs a local model as a reverse engineer with the REA MCP tools, and
+  collects fine-tuning data while it works. Tuned first for Ornith 1.5 35B-A3B (Heretic MTP APEX I-Mini).
+  - **Sessions**: pick a program, library, package or folder and a goal (overview, license check, network, config,
+    crypto, hidden strings, or your own). The chat gets an RE system prompt, thinking sampling for Qwen3.5-family models
+    (temperature 0.6, top-k 20, no repeat penalty), REA's core tools preloaded, up to 80 tool rounds per reply, and the
+    model's thinking sent back within a tool loop (interleaved thinking, as the template expects). Tools are on even if
+    chats have them off. Static-analysis tools (decompile, search, list, annotate) run without asking; tools that run the
+    target, attach debuggers or reach devices still ask.
+  - **calc**: the RE training kit's sandboxed calculator runs as a built-in MCP server (`calc__calc`) when Python 3 is
+    on PATH, so the model computes hash rounds and XOR decoding instead of doing 32-bit math in its head.
+  - **Recording**: every finished round is saved as llama-server received it (system prompt with the tool catalog,
+    tool definitions, every turn) in `%APPDATA%\RulZ LLM Suite\re-data\<chat id>\`. A chat's data goes to the Recycle
+    Bin with the chat.
+  - **Grading**: Solved / Partial / Failed in the chat's RE strip or on the Reverse Engineering page.
+  - **Practice tasks**: reads `build/tasks.jsonl` from the RE training kit (`C:\coding\Trainers\re-training-kit`),
+    copies a task's binary to a fresh work folder, and checks the final `ANSWER:` line automatically (a port of the
+    kit's `verify.py`).
+  - **Export**: writes `train.jsonl` in the kit's format (OpenAI / Hugging Face chat: `messages`, `tools`, `meta`;
+    thinking in `reasoning_content`) plus `manifest.json`, from solved sessions by default, at most N per practice task
+    (fewest tool rounds first), leaving out sessions whose context was trimmed. Email addresses are replaced.
 - **Dark and light themes** — dark is the default; the first launch asks which look you want ("Choose your look").
   Switch any time with the sun/moon button in the top bar or in Settings ▸ Appearance (Dark, Light or System).
 - GPU/RAM meters (nvidia-smi), keyboard shortcuts (see Settings).

@@ -6,6 +6,8 @@ import type {
   Conversation,
   ConversationSummary,
   Preset,
+  ReOutcome,
+  ReSession,
   StreamEvent,
   ToolCall,
   ToolResult,
@@ -19,7 +21,8 @@ import { editMessages, idsToDelete, removeMessages, restoreMessages } from '../l
 import { once } from '../lib/once'
 import { buildWire } from '../lib/wire'
 import { useApp } from './app'
-import { availableTools, effectiveToolMode, tokensOf, toolRequestFor } from './mcp'
+import { availableTools, effectiveToolMode, tokensOf, toolBudget, toolRequestFor } from './mcp'
+import { isStaticReTool, RE_MIN_CONTEXT, RE_STARTER_TOOLS, RE_SYSTEM_PROMPT, reFirstMessage, reSampling } from '@shared/re'
 import { readyInstance, useModels } from './models'
 import { META_LOAD, META_SEARCH, META_TOOLS, resolveTool, searchTools } from '@shared/tools'
 
@@ -122,6 +125,21 @@ interface ChatState {
   dismissHandoffPrompt: () => void
   startHandoff: () => Promise<void>
   cancelHandoff: () => void
+  /** Starts a reverse-engineering session in a new chat and sends its first message. */
+  startRe: (opts: StartReOptions) => Promise<void>
+  setReOutcome: (id: string, outcome: ReOutcome, notes?: string) => Promise<void>
+  setReCollect: (id: string, collect: boolean) => Promise<void>
+}
+
+export interface StartReOptions {
+  target: string
+  /** First message; {target} is replaced by the target path. */
+  goal: string
+  collect: boolean
+  /** Model to run it on; null = the loaded model. */
+  modelId: string | null
+  practice?: ReSession['practice']
+  title?: string
 }
 
 function makeTitle(text: string): string {
@@ -140,9 +158,20 @@ export function toWire(
   messages: ChatMessage[],
   systemPrompt: string,
   vision: boolean,
-  keepFull: number | null = keepFullToolResults()
+  keepFull: number | null = keepFullToolResults(),
+  keepReasoning = false
 ): WireMessage[] {
-  return buildWire(messages, systemPrompt, vision, keepFull)
+  return buildWire(messages, systemPrompt, vision, keepFull, keepReasoning)
+}
+
+/** A copy of an RE session's details for a new chat (branch, copy, handoff): it needs grading again. */
+function reCopy(re: ReSession | undefined): ReSession | undefined {
+  return re ? { ...re, outcome: 'unrated', autoGraded: undefined } : undefined
+}
+
+/** Last part of a path. */
+function baseName(path: string): string {
+  return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path
 }
 
 // ---- Persistence (debounced per conversation) ----
@@ -261,6 +290,7 @@ export const useChat = create<ChatState>((set, get) => {
       sampling: src.sampling,
       presetId: src.presetId,
       activeTools: src.activeTools,
+      re: reCopy(src.re),
       messages: []
     }
     await withConversation(src.id, (c) => ({ ...c, handoffPrompted: true }))
@@ -328,7 +358,10 @@ export const useChat = create<ChatState>((set, get) => {
         }
         if (conv) void persistNow({ ...conv, updatedAt: Date.now() })
         get().refreshTokenCount()
-        if (conv && e.type === 'done' && e.stats.stopReason !== 'stopped') sendNextQueued(conv.id)
+        if (conv && e.type === 'done' && e.stats.stopReason !== 'stopped') {
+          if (conv.re?.practice) void gradePractice(conv, gen.messageId)
+          sendNextQueued(conv.id)
+        }
         break
       }
     }
@@ -356,7 +389,7 @@ export const useChat = create<ChatState>((set, get) => {
 
   /** Marks tools as loaded and most recently used, then evicts the least recently used over budget. */
   const loadTools = (names: string[]): string[] => {
-    const budget = useApp.getState().settings?.toolBudgetTokens ?? 6000
+    const budget = toolBudget({ re: !!get().genConversation?.re })
     let evicted: string[] = []
     setActiveTools((active) => {
       const next = [...active.filter((n) => !names.includes(n)), ...names]
@@ -449,10 +482,15 @@ export const useChat = create<ChatState>((set, get) => {
         call = { ...call, name: target.qualifiedName }
         updateCall(call.id, { name: call.name })
       }
+      const isRe = !!get().genConversation?.re
       // Calling a tool keeps it loaded and marks it recently used.
-      if (effectiveToolMode() === 'dynamic') loadTools([target.qualifiedName])
+      if (effectiveToolMode({ re: isRe }) === 'dynamic') loadTools([target.qualifiedName])
       const s = useApp.getState().settings
-      let approved = !s?.confirmToolCalls || s.allowedTools.includes(call.name)
+      let approved =
+        !s?.confirmToolCalls ||
+        s.allowedTools.includes(call.name) ||
+        // RE sessions make dozens of read-only analysis calls; those run without asking.
+        (isRe && s.re.autoApproveStatic && isStaticReTool(target.server, target.name))
       if (!approved) {
         const decision = await new Promise<ToolDecision>((resolve) => set({ toolApproval: { call, resolve } }))
         set({ toolApproval: null })
@@ -488,8 +526,9 @@ export const useChat = create<ChatState>((set, get) => {
     for (let i = conv.messages.length - 1; i >= 0 && conv.messages[i].role === 'assistant'; i--) {
       if (conv.messages[i].toolCalls?.length) rounds++
     }
-    if (rounds >= MAX_TOOL_ROUNDS) {
-      toast.warning(`Stopped after ${MAX_TOOL_ROUNDS} rounds of tool calls without a final answer.`)
+    const maxRounds = conv.re ? (useApp.getState().settings?.re.maxToolRounds ?? 80) : MAX_TOOL_ROUNDS
+    if (rounds >= maxRounds) {
+      toast.warning(`Stopped after ${maxRounds} rounds of tool calls without a final answer.`)
       return
     }
     await startGeneration(conv, 'new')
@@ -547,6 +586,12 @@ export const useChat = create<ChatState>((set, get) => {
     }
     conv = { ...conv, modelId, updatedAt: Date.now() }
 
+    if (conv.re && inst.contextLength && inst.contextLength < RE_MIN_CONTEXT && !history.some((m) => m.role === 'assistant')) {
+      toast.warning(
+        `${inst.modelName} is loaded with a ${inst.contextLength.toLocaleString()}-token context. RE sessions fill that after a few decompiled functions; ${RE_MIN_CONTEXT.toLocaleString()} or more works much better (Load settings, Context length).`,
+        { duration: 12000 }
+      )
+    }
     const hasImages = history.some((m) => m.attachments?.some((a) => a.kind === 'image'))
     if (hasImages && !inst.hasVision) toast.warning(`${inst.modelName} has no vision projector loaded; images are ignored.`)
 
@@ -560,10 +605,11 @@ export const useChat = create<ChatState>((set, get) => {
       await invoke('chat:start', {
         requestId,
         modelId,
-        messages: toWire(history, conv.systemPrompt, inst.hasVision),
+        messages: toWire(history, conv.systemPrompt, inst.hasVision, undefined, !!conv.re),
         sampling: conv.sampling,
         overflow: settings?.contextOverflow ?? 'truncateMiddle',
-        tools: toolRequestFor(conv.activeTools)
+        tools: toolRequestFor(conv.activeTools, { re: !!conv.re }),
+        record: conv.re?.collect ? { conversationId: conv.id } : undefined
       })
     } catch (e) {
       handleEvent({ type: 'error', requestId, error: errorMessage(e) })
@@ -605,6 +651,37 @@ export const useChat = create<ChatState>((set, get) => {
       toast.error(`Could not open chat: ${errorMessage(e)}`)
       return undefined
     })
+
+  /** Checks a practice session's final reply against the task's answer and records the outcome. */
+  const gradePractice = async (conv: Conversation, messageId: string): Promise<void> => {
+    const re = conv.re
+    const practice = re?.practice
+    // A session the user graded by hand keeps their grade.
+    if (!re || !practice || (re.outcome !== 'unrated' && !re.autoGraded)) return
+    const text = conv.messages.find((m) => m.id === messageId)?.content ?? ''
+    const kitDir = useApp.getState().settings?.re.kitDir ?? ''
+    try {
+      const r = await invoke('re:practiceGrade', kitDir, practice.taskId, re.target, text)
+      await withConversation(conv.id, (c) =>
+        c.re
+          ? {
+              ...c,
+              re: {
+                ...c.re,
+                outcome: r.passed ? 'solved' : 'failed',
+                autoGraded: true,
+                practice: { ...practice, answer: r.answer ?? undefined, expected: r.expected }
+              }
+            }
+          : c
+      )
+      if (r.passed) toast.success(`Practice ${practice.taskId}: solved (${r.answer})`)
+      else if (!r.answer) toast.warning(`Practice ${practice.taskId}: no ANSWER line in the final reply, graded as failed.`)
+      else toast.warning(`Practice ${practice.taskId}: wrong answer (${r.answer}; expected ${r.expected}).`)
+    } catch (e) {
+      toast.error(`Could not grade practice ${practice.taskId}: ${errorMessage(e)}`)
+    }
+  }
 
   /** Loads a conversation (or reuses `current`), applies `fn`, saves it. */
   const withConversation = async (id: string, fn: (c: Conversation) => Conversation): Promise<void> => {
@@ -791,6 +868,7 @@ export const useChat = create<ChatState>((set, get) => {
         id: uid(),
         title: `${cur.title} (branch)`,
         pinned: false,
+        re: reCopy(cur.re),
         createdAt: now,
         updatedAt: now,
         messages: cur.messages.slice(0, idx + 1).map((m) => ({ ...m, id: uid() }))
@@ -828,7 +906,15 @@ export const useChat = create<ChatState>((set, get) => {
       const src = get().current?.id === id ? get().current : await readConversation(id)
       if (!src) return
       const now = Date.now()
-      const copy: Conversation = { ...src, id: uid(), title: `${src.title} (copy)`, pinned: false, createdAt: now, updatedAt: now }
+      const copy: Conversation = {
+        ...src,
+        id: uid(),
+        title: `${src.title} (copy)`,
+        pinned: false,
+        createdAt: now,
+        updatedAt: now,
+        re: reCopy(src.re)
+      }
       await persistNow(copy)
     },
 
@@ -965,6 +1051,48 @@ export const useChat = create<ChatState>((set, get) => {
       set({ handoff: null })
     },
 
+    startRe: async (opts) => {
+      if (isChatBusy(get()) || get().handoff) {
+        toast('Wait for the current reply to finish first.')
+        return
+      }
+      const s = useApp.getState().settings
+      const models = useModels.getState()
+      const modelId = opts.modelId && models.models.some((m) => m.id === opts.modelId) ? opts.modelId : models.activeModelId
+      // Messages go to the active model, so the session's model becomes it (loaded on send if needed).
+      if (modelId) models.setActive(modelId)
+      const available = availableTools()
+      const starter = RE_STARTER_TOOLS.flatMap((n) => {
+        const t = resolveTool(available, n)
+        return t ? [t.qualifiedName] : []
+      })
+      const now = Date.now()
+      const conv: Conversation = {
+        id: uid(),
+        title: (opts.title ?? `RE: ${baseName(opts.target)}`).slice(0, 60),
+        folder: null,
+        pinned: false,
+        createdAt: now,
+        updatedAt: now,
+        modelId,
+        systemPrompt: RE_SYSTEM_PROMPT,
+        sampling: reSampling(s?.defaultSampling ?? DEFAULT_SAMPLING),
+        presetId: null,
+        activeTools: starter,
+        re: { target: opts.target, goal: opts.goal, collect: opts.collect, outcome: 'unrated', practice: opts.practice },
+        messages: []
+      }
+      set({ current: conv, tokenCount: null })
+      await persistNow(conv)
+      useApp.getState().setPage('chat')
+      await appendAndGenerate(conv, reFirstMessage(opts.goal, opts.target), [])
+    },
+
+    setReOutcome: (id, outcome, notes) =>
+      withConversation(id, (c) => (c.re ? { ...c, re: { ...c.re, outcome, autoGraded: false, notes: notes ?? c.re.notes } } : c)),
+
+    setReCollect: (id, collect) => withConversation(id, (c) => (c.re ? { ...c, re: { ...c.re, collect } } : c)),
+
     refreshTokenCount: () => {
       if (tokenTimer) clearTimeout(tokenTimer)
       tokenTimer = setTimeout(async () => {
@@ -972,8 +1100,9 @@ export const useChat = create<ChatState>((set, get) => {
         const modelId = useModels.getState().activeModelId ?? conv?.modelId ?? null
         const inst = readyInstance(modelId)
         if (!conv || !inst) return set({ tokenCount: null })
-        const tools = toolRequestFor(conv.activeTools) ?? null
-        const n = await invoke('chat:countTokens', inst.modelId, toWire(conv.messages, conv.systemPrompt, inst.hasVision), tools).catch(
+        const tools = toolRequestFor(conv.activeTools, { re: !!conv.re }) ?? null
+        const wire = toWire(conv.messages, conv.systemPrompt, inst.hasVision, undefined, !!conv.re)
+        const n = await invoke('chat:countTokens', inst.modelId, wire, tools).catch(
           () => null
         )
         if (get().current?.id === conv.id) set({ tokenCount: n })

@@ -48,19 +48,30 @@ export function tokensOf(names: string[]): number {
   }, 0)
 }
 
-/** 'all' or 'dynamic' after resolving 'auto' against the budget; null when tools are off or none exist. */
-export function effectiveToolMode(): 'all' | 'dynamic' | null {
+/** Tool options of an RE session: tools are on even when chats have them off, with the RE budget. */
+export interface ToolOptions {
+  re?: boolean
+}
+
+/** Token budget for loaded tool descriptions. */
+export function toolBudget(opts: ToolOptions = {}): number {
   const s = useApp.getState().settings
-  if (!s?.toolsEnabled) return null
+  return (opts.re ? s?.re.toolBudgetTokens : s?.toolBudgetTokens) ?? 6000
+}
+
+/** 'all' or 'dynamic' after resolving 'auto' against the budget; null when tools are off or none exist. */
+export function effectiveToolMode(opts: ToolOptions = {}): 'all' | 'dynamic' | null {
+  const s = useApp.getState().settings
+  if (!s || (!s.toolsEnabled && !opts.re)) return null
   const tools = availableTools()
   if (!tools.length) return null
   if (s.toolMode !== 'auto') return s.toolMode
-  return tools.reduce((sum, t) => sum + toolTokens(t), 0) > s.toolBudgetTokens ? 'dynamic' : 'all'
+  return tools.reduce((sum, t) => sum + toolTokens(t), 0) > toolBudget(opts) ? 'dynamic' : 'all'
 }
 
 /** The tool selection to send with a chat request. */
-export function toolRequestFor(activeTools: string[] | undefined): ToolRequest | undefined {
-  const mode = effectiveToolMode()
+export function toolRequestFor(activeTools: string[] | undefined, opts: ToolOptions = {}): ToolRequest | undefined {
+  const mode = effectiveToolMode(opts)
   if (!mode) return undefined
   const available = new Set(availableTools().map((t) => t.qualifiedName))
   return { mode, active: mode === 'dynamic' ? (activeTools ?? []).filter((n) => available.has(n)) : [] }

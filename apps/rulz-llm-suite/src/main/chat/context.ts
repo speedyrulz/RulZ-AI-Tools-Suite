@@ -7,7 +7,9 @@ export function textOf(m: WireMessage): string {
   const text =
     typeof m.content === 'string' ? m.content : m.content.map((p) => (p.type === 'text' ? p.text : '')).join('\n')
   const calls = m.tool_calls?.map((c) => `${c.function.name}(${c.function.arguments})`).join('\n')
-  return calls ? `${text}\n${calls}` : text
+  // Thinking sent back to the template (RE sessions) takes context space too.
+  const full = m.reasoning_content ? `${m.reasoning_content}\n${text}` : text
+  return calls ? `${full}\n${calls}` : full
 }
 
 export function imageCount(m: WireMessage): number {
