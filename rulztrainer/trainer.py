@@ -524,6 +524,7 @@ class Trainer(RaceParallelMixin):
         self.copy_checker = None  # copycheck.CopyChecker when copy_check is on
         self.controller = None
         self.batcher = None
+        self.maps = None  # trainmaps.TrainingMaps when training_maps is on
         self.ts_logit_shift = 0.0
         self.ts_strata: TimestepStrata | None = None  # timestep_buckets' deck (a race configuration's own)
         self.item_face_frac: dict[str, float] = {}
@@ -1220,6 +1221,9 @@ class Trainer(RaceParallelMixin):
             self._noise_stage(model)
             return
         self._setup_probe_worker()
+        self._setup_maps(cfg, step)
+        if self.maps is not None and self.maps.due(step):  # the baseline (or a resumed run's starting point)
+            self._side_job(f"Training maps at step {step}", lambda: self._capture_maps(model, injected, step))
         if cfg.sample_prompts and cfg.sample_before_training and step == 0:
             self.sample_images(model, step)
         at_start = self.controller is not None and step == 0 and self._probe_at_start()
@@ -1591,6 +1595,9 @@ class Trainer(RaceParallelMixin):
                 self.save(injected, step)
             if cfg.sample_prompts and cfg.sample_every > 0 and step % cfg.sample_every == 0 and step < cfg.steps:
                 self._side_job(f"Sampling at step {step}", lambda: self.sample_images(model, step))
+                model.train()
+            if self.maps is not None and self.maps.due(step, last=step >= cfg.steps):
+                self._side_job(f"Training maps at step {step}", lambda: self._capture_maps(model, injected, step))
                 model.train()
             racing = self._race_running()
             final_too = self.race is not None and self.race.schedule.keeps_all  # scored at the end like the others
@@ -3248,6 +3255,107 @@ class Trainer(RaceParallelMixin):
         log.info("Body alignment: %d of %d source images show the body from the neck to mid-thigh", len(self.body_embs),
                  len(found))
 
+    def _trigger_words(self, rows) -> list[str]:
+        """Every trigger word training reads: the run's, each dataset's, LoRA Isolation's fused words."""
+        triggers = {c.trigger_word for c in rows} | {sp.trigger for sp in self.cfg.dataset_specs()}
+        for s in self.isolation or []:
+            triggers |= {getattr(s, "fused", ""), getattr(s, "trigger", "")}
+        return sorted(t for t in triggers if t)
+
+    # ------------------------------------------------------------ training maps (trainmaps.py)
+    def _maps_epoch_steps(self) -> tuple[int, int]:
+        """(steps in one epoch, images per step) for the batcher training reads now."""
+        cfg = self.cfg
+        per_step = max(1, cfg.batch_size * cfg.gradient_accumulation * len(self.replicas))
+        images = sum(len(v) for v in self.batcher.buckets.values()) if self.batcher is not None else 0
+        return max(1, -(-images // per_step)), per_step
+
+    def _map_triggers(self, cfg, items) -> dict[str, dict[str, list[int]]]:
+        """{item key: {trigger word: its token positions in that item's cached text}} for the map pictures whose
+        caption names a trigger; {} when none does or the tokenizer can't be read (the other maps go on)."""
+        from . import alignment as A
+
+        words = self._trigger_words([cfg])
+        if not words:
+            return {}
+        try:
+            tok = self.arch.get_tokenizer(cfg, self.model_dir)
+            out = {}
+            for it in items:
+                text, offsets, drop, length = self.arch.prompt_tokens(tok, it.caption)
+                cached = self._cached_text_length(it.text_path)
+                if cached is not None and cached != length:
+                    continue  # the cache was made another way: positions would point at the wrong tokens
+                per = {}
+                for w in words:
+                    pos = [p for p in A.token_positions(text, offsets, [w], drop) if p < length]
+                    if pos:
+                        per[w] = pos
+                if per:
+                    out[str(it.key)] = per
+            return out
+        except Exception as e:  # noqa: BLE001
+            log.warning("Training maps: no trigger-word map for this run (%s: %s)", type(e).__name__, str(e)[:160])
+            return {}
+
+    def _setup_maps(self, cfg, step: int) -> None:
+        """The map pictures (their latents, texts, trigger positions and bucket crops), or nothing when training
+        maps are off or this run can't have them."""
+        from safetensors.torch import load_file
+
+        from . import trainmaps
+        from .dataset import load_image_fit
+
+        self.maps = None
+        if not cfg.training_maps:
+            return
+        if self.race_rows is not None:
+            log.info("Training maps are off for a race (its configurations take turns on one model)")
+            return
+        if self.batcher is None:
+            return
+        try:
+            chosen = trainmaps.pick_items(self.batcher.items, cfg.training_maps_images)
+            triggers = self._map_triggers(cfg, chosen)
+            probes, pictures = [], {}
+            for n, it in enumerate(chosen):
+                pid = str(n)
+                latents = load_file(str(it.latent_path))["latent"][None].float()
+                embeds, mask = self.arch.pad_embeds([load_file(str(it.text_path))["embeds"]])
+                probes.append({"id": pid, "item": it, "latents": latents, "embeds": embeds, "mask": mask,
+                               "trigger": triggers.get(str(it.key), {})})
+                try:
+                    pictures[pid] = load_image_fit(Path(it.image), it.width, it.height, it.src_box)
+                except OSError:
+                    log.warning("Training maps: could not read %s for the viewer", it.image)
+            if not probes:
+                log.warning("Training maps: no whole photos to map in this dataset")
+                return
+            every = cfg.training_maps_every or self._maps_epoch_steps()[0]
+            self.maps = trainmaps.TrainingMaps(self.job_dir, probes, every)
+            self.maps.start(step, resume=bool(cfg.resume_state) and step > 0, pictures=pictures,
+                            words=self._trigger_words([cfg]))
+            if self.ft is not None:
+                log.info("Training maps: a fine-tune has no adapter to switch off, so no 'Where the LoRA acts' map")
+        except Exception as e:  # noqa: BLE001
+            self.maps = None
+            log.warning("Training maps could not start; training goes on without them (%s: %s)", type(e).__name__,
+                        str(e)[:200])
+
+    def _capture_maps(self, model, injected, step: int) -> None:
+        if self.maps is None:
+            return
+        steps, per_step = self._maps_epoch_steps()
+        epoch = step / steps
+        self.status.update(stage=f"training maps (step {step})")
+        self._free_for_rendering()
+        try:
+            self.maps.capture(step, epoch, model, injected, norm_device(self.replicas[0][2]),
+                              averaged=self._averaged)
+        finally:
+            free_cuda()
+            self.status.update(stage="training", training_maps=self.maps.last_step)
+
     def _trigger_positions(self, items, rows) -> dict[str, list[int]]:
         """{cached text path: the trigger's token positions in it} for every caption training reads (each dataset's
         trigger, LoRA Isolation's fused words, caption dropout's prompt)."""
@@ -3255,10 +3363,7 @@ class Trainer(RaceParallelMixin):
         from .dataset import dropout_prompt, text_cache_path
 
         cfg = self.cfg
-        triggers = {c.trigger_word for c in rows} | {sp.trigger for sp in cfg.dataset_specs()}
-        for s in self.isolation or []:
-            triggers |= {getattr(s, "fused", ""), getattr(s, "trigger", "")}
-        triggers = [t for t in triggers if t]
+        triggers = self._trigger_words(rows)
         captions = {str(text_cache_path(cfg, it.caption)): it.caption for it in items}
         for c in rows:
             captions[str(text_cache_path(c, dropout_prompt(c)))] = dropout_prompt(c)

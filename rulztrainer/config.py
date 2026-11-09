@@ -635,6 +635,10 @@ class TrainConfig:
     loss_watch_improve_tol: float = 0.03  # relative epoch-to-epoch drop that counts as improving
     loss_watch_healthy_mult: float = 1.0  # lr multiplier for the healthy cohort (Fizgig uses 1.1)
     loss_watch_exclude_after: int = 0  # epochs at the lowest throttle before an image is excluded; 0 = never
+    # --- training maps (trainmaps.py): heatmaps over a few training pictures, before training and about each epoch ---
+    training_maps: bool = False  # observe only: nothing about training changes
+    training_maps_images: int = 3  # pictures (at least one per dataset, so more with several datasets)
+    training_maps_every: int = 0  # steps between captures; 0 = one epoch's worth of steps
     # --- look consistency filter (Dataset tab): ease the scan's outliers in ---
     look_warmup: bool = False  # images under the look filter's fence (look_scores.json) start at a lower loss weight
     look_warmup_start: float = 0.4  # their loss weight at the start, rising linearly to 1
@@ -941,6 +945,10 @@ class TrainConfig:
                              "plain linear scale)")
         if self.model_arch not in ("auto", *ARCH_NAMES):
             raise ValueError(f"model_arch must be auto or one of {ARCH_NAMES}, got {self.model_arch!r}")
+        if self.training_maps and not 1 <= self.training_maps_images <= 12:
+            raise ValueError("training_maps_images must be 1 to 12 (each picture adds 3-9 forwards per capture)")
+        if self.training_maps_every < 0:
+            raise ValueError("training_maps_every must be 0 (once an epoch) or a number of steps")
         foreign = self.foreign_sampling_files()
         if foreign:
             raise ValueError(f"This run trains {self.arch_name()}, but these settings name another model's files: "
