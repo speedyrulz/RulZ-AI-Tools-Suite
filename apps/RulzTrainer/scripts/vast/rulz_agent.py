@@ -249,7 +249,7 @@ def cmd_poll(args) -> int:
 
 def cmd_files(args) -> int:
     """A job's files to fetch: {"base": folder, "files": [{"path" under base, "size"}]}. --what picks logs (default),
-    probes, samples, loras, best or all; --step keeps that step's images and LoRA."""
+    probes, samples, maps (the training_maps folder), loras, best or all; --step keeps that step's images and LoRA."""
     d = job_dir(args.name)
     tag = f"{args.step:06d}" if args.step is not None else None
     what = set(args.what or ["logs"])
@@ -261,6 +261,8 @@ def cmd_files(args) -> int:
         if what & {kind, "all"}:
             picked += [p for p in sorted((d / kind).glob("*")) if p.suffix.lower() in IMAGE_SUFFIXES
                        and (tag is None or tag in p.name)]
+    if what & {"maps", "all"}:  # training maps: the picture crops, probes.json and maps.jsonl (all captures, any --step)
+        picked += sorted(p for p in (d / "training_maps").glob("*") if p.is_file())
     loras = sorted(d.glob("*.safetensors"))
     if what & {"loras", "all"}:
         picked += [p for p in loras if tag is None or tag in p.name]
@@ -419,7 +421,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--diff", metavar="OTHER_JOB", help="only the settings that differ, as {key: [this, other]}")
     command("poll", cmd_poll, True)
     p = command("files", cmd_files, True)
-    p.add_argument("--what", action="append", choices=("logs", "probes", "samples", "loras", "best", "all"))
+    p.add_argument("--what", action="append", choices=("logs", "probes", "samples", "maps", "loras", "best", "all"))
     p.add_argument("--step", type=int, help="only this step's images and LoRA")
     p = command("start", cmd_start)
     p.add_argument("--job", required=True, help="the new run's job name")
