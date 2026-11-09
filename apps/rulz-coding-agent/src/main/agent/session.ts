@@ -23,7 +23,7 @@ import type {
 import { DEFAULT_MAX_OUTPUT_TOKENS, MAX_INSTRUCTION_CHARS, samplingRequest, skipsThinking } from '@shared/defaults'
 import { dropExchange, dropReply, forModel, requestItem, whyNotDelete, whyNotRedo } from '@shared/history'
 import { splitThink } from '@shared/think'
-import { friendlyServerError, pickDefaultModel, type RulzClient, type TurnResult } from '../rulz/client'
+import { friendlyServerError, pickDefaultModel, RE_SESSION_HEADER, type RulzClient, type TurnResult } from '../rulz/client'
 import { addDraft } from '../rulz/draft'
 import type { Snapshot, Snapshotter } from '../project/snapshots'
 import type { ProjectData, ProjectStore } from '../project/store'
@@ -120,6 +120,8 @@ export class ProjectSession {
   private abort: AbortController | null = null
   private pending: { request: PendingPrompt; resolve: (a: PromptAnswer | null) => void } | null = null
   private allowed = new Set<string>()
+  /** Tasks already described to RulZ LLM Suite as RE sessions. */
+  private reDescribed = new Set<string>()
   /** Index in data.messages of the current task's first message. */
   private taskStart = 0
   private saveTimer: NodeJS.Timeout | null = null
@@ -643,6 +645,22 @@ export class ProjectSession {
 
   // ---------- talking to the model ----------
 
+  /**
+   * With "Record tasks for reverse-engineering training" on, each task is an RE session in RulZ LLM
+   * Suite: its model turns carry the session header, and the Suite is told once what it is about.
+   */
+  private reRecording(task: TaskRecord): Record<string, string> {
+    if (!this.deps.settings().reRecording) return {}
+    const id = `agent-${task.id}`
+    if (!this.reDescribed.has(task.id)) {
+      this.reDescribed.add(task.id)
+      const asked = this.data.timeline.find((i) => i.kind === 'user' && i.taskId === task.id)
+      const goal = task.request?.text ?? (asked?.kind === 'user' ? asked.text : task.title)
+      void this.deps.client.describeReSession(id, { client: 'RulZ Coding Agent', title: task.title, target: this.root, goal: goal.slice(0, 4000) })
+    }
+    return { [RE_SESSION_HEADER]: id }
+  }
+
   private async buildRequest(model: string, nCtx: number, signal: AbortSignal): Promise<WireMessage[]> {
     // The budget is in estimated tokens, corrected by what the server counted last time.
     const budget = Math.floor((nCtx * CONTEXT_SHARE) / this.scale)
@@ -719,6 +737,7 @@ export class ProjectSession {
     // for what is left rather than more than the context holds.
     const maxTokens = Math.max(Math.min(LAST_RESORT_REPLY_TOKENS, cap), Math.min(cap, nCtx - Math.ceil(estimated * this.scale) - 256))
     const sampling = samplingRequest(model, own)
+    const reHeaders = this.reRecording(task)
     let result: TurnResult & { cut?: { thinking: string } }
     const turnSignal = this.notes.beginTurn(signal)
     try {
@@ -746,7 +765,7 @@ export class ProjectSession {
         onToolDelta: () => {
           if (this.statusNow.phase !== 'working') this.setStatus({ phase: 'working', text: 'Preparing the next step…' })
         }
-      })
+      }, reHeaders)
     } catch (e) {
       if (!this.notes.endTurn() || signal.aborted) throw e
       // Cut short by a note: half-made tool calls are dropped, the text and thinking so far are kept.

@@ -84,6 +84,14 @@ Discover/downloads, RAG and a CLI are planned.
   - **Export**: writes `train.jsonl` in the kit's format (OpenAI / Hugging Face chat: `messages`, `tools`, `meta`;
     thinking in `reasoning_content`) plus `manifest.json`, from solved sessions by default, at most N per practice task
     (fewest tool rounds first), leaving out sessions whose context was trimmed. Email addresses are replaced.
+  - **Sessions from other apps**: a `/v1/chat/completions` request with an `x-rulz-re-session: <id>` header (letters,
+    digits, `_` and `-`, up to 56) is recorded as part of that RE session, with its reply. `POST /v1/re/sessions/{id}`
+    with `client`, `title`, `target`, `goal` describes the session, and with `outcome` (`unrated`, `solved`, `partial`,
+    `failed`) grades it; `GET` reads it back, and the reply's `recording` says whether recording is on. Such sessions are
+    listed, graded, deleted and exported on the Reverse Engineering page like chats, labelled with the app's name.
+    RulZ Coding Agent 0.16.0 sends these when its **Record tasks for reverse-engineering training** setting is on. Since
+    the other app fits its own context, a request with fewer messages than the one before marks the session as
+    trimmed. Turn it off with **Record sessions from other apps** in the page's options.
 - **Dark and light themes** — dark is the default; the first launch asks which look you want ("Choose your look").
   Switch any time with the sun/moon button in the top bar or in Settings ▸ Appearance (Dark, Light or System).
 - GPU/RAM meters (nvidia-smi), keyboard shortcuts (see Settings).

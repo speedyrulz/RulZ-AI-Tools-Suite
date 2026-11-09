@@ -32,6 +32,11 @@ export interface AppSettings {
   remoteToken: string
   /** Leave the thought-process box open once the answer starts, instead of folding it away. */
   keepThinkingOpen: boolean
+  /**
+   * Have RulZ LLM Suite record each task as a reverse-engineering session (on its Reverse
+   * Engineering page, where it is graded and exported for fine-tuning).
+   */
+  reRecording: boolean
 }
 
 /** How the model writes its answers. Missing = the recommended value for that model. */

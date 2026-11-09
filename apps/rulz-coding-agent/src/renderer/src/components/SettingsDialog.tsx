@@ -212,6 +212,14 @@ export function SettingsDialog() {
           <Switch checked={settings.keepThinkingOpen} onCheckedChange={(v) => void update({ keepThinkingOpen: v })} label="Keep thinking open after the answer" />
         </Field>
 
+        <Field
+          label="Record tasks for reverse-engineering training"
+          hint="RulZ LLM Suite saves each task as a reverse-engineering session on its Reverse Engineering page, where you grade it and export the good ones to fine-tune the model. Needs RulZ LLM Suite 0.13 or newer. Leave it off for normal coding."
+          inline
+        >
+          <Switch checked={settings.reRecording} onCheckedChange={(v) => void update({ reRecording: v })} label="Record tasks for reverse-engineering training" />
+        </Field>
+
         <Field label="When should I ask you first?">
           <ApprovalChooser value={settings.approval} onChange={(approval) => void update({ approval })} />
         </Field>

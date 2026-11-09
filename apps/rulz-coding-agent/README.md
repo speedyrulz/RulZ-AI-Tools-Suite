@@ -65,6 +65,11 @@ The light look is one click away: use the sun/moon button in the top bar (or **S
   [REA](https://www.npmjs.com/package/rea-agents) for reverse engineering, work here too with nothing to set up
   twice. Settings lists them and can start them; otherwise they start the first time the agent needs one. Ask for
   them by name ("use REA to study the app in C:\Apps\Viewer").
+- **Settings → Record tasks for reverse-engineering training** (off by default): RulZ LLM Suite records each task as
+  a reverse-engineering session, exactly as the model saw it. The sessions show on the Suite's Reverse Engineering
+  page, labelled RulZ Coding Agent, where you grade them and export the good ones as `train.jsonl` for fine-tuning.
+  Each model turn carries an `x-rulz-re-session: agent-<task id>` header, and the task's title, project folder and
+  request are sent once to `POST /v1/re/sessions/{id}`. Needs RulZ LLM Suite 0.13.0 or later; older versions ignore it.
 - **Switch models from the top bar**: click the model name to pick another model (not during a task).
   **Settings → Model settings** has two parts. **How it writes** sets temperature, top P, top K, repeat penalty,
   the longest answer and thinking (on/off, reasoning effort, thinking budget and its message), saved per model; empty

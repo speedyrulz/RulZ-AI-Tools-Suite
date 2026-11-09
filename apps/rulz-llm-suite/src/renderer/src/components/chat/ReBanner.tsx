@@ -11,14 +11,26 @@ export const OUTCOMES: { value: Exclude<ReOutcome, 'unrated'>; label: string; to
 ]
 
 /** Grade buttons; clicking the current grade clears it. */
-export function OutcomeButtons({ id, outcome, size = 'md' }: { id: string; outcome: ReOutcome; size?: 'sm' | 'md' }) {
+export function OutcomeButtons({
+  id,
+  outcome,
+  size = 'md',
+  onChange
+}: {
+  id: string
+  outcome: ReOutcome
+  size?: 'sm' | 'md'
+  /** Grades something other than a chat (an API session); chats are graded through the chat store. */
+  onChange?: (outcome: ReOutcome) => void
+}) {
   const setReOutcome = useChat((s) => s.setReOutcome)
+  const set = (o: ReOutcome): void => (onChange ? onChange(o) : void setReOutcome(id, o))
   return (
     <div className="flex items-center gap-1">
       {OUTCOMES.map((o) => (
         <button
           key={o.value}
-          onClick={() => void setReOutcome(id, outcome === o.value ? 'unrated' : o.value)}
+          onClick={() => set(outcome === o.value ? 'unrated' : o.value)}
           className={cn(
             'rounded border font-medium transition-colors',
             size === 'sm' ? 'px-1.5 py-px text-[10.5px]' : 'px-2 py-0.5 text-[11px]',

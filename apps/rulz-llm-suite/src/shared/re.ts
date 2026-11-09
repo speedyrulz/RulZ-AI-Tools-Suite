@@ -11,8 +11,20 @@ export const DEFAULT_RE_SETTINGS: ReSettings = {
   collect: true,
   autoApproveStatic: true,
   maxToolRounds: 80,
-  toolBudgetTokens: 16000
+  toolBudgetTokens: 16000,
+  recordApi: true
 }
+
+/**
+ * Header another app sends on /v1/chat/completions to have the request recorded as part of an RE
+ * session (its value is the session id, letters, digits, _ and -). POST /v1/re/sessions/{id}
+ * describes the session (target, goal, title, client) and grades it (outcome).
+ */
+export const RE_SESSION_HEADER = 'x-rulz-re-session'
+/** Session ids from the API; their data folder is `api-<id>`, apart from chat ids. */
+export const API_RE_ID = /^[\w-]{1,56}$/
+export const API_RE_PREFIX = 'api-'
+export const RE_OUTCOMES = ['unrated', 'solved', 'partial', 'failed'] as const
 
 /** Below this context an RE session runs out of room after a few decompiled functions. */
 export const RE_MIN_CONTEXT = 65536

@@ -111,7 +111,8 @@ export const settingsSchema = z.object({
       collect: z.boolean().catch(D.re.collect),
       autoApproveStatic: z.boolean().catch(D.re.autoApproveStatic),
       maxToolRounds: z.number().int().min(1).max(500).catch(D.re.maxToolRounds),
-      toolBudgetTokens: z.number().int().min(500).max(200000).catch(D.re.toolBudgetTokens)
+      toolBudgetTokens: z.number().int().min(500).max(200000).catch(D.re.toolBudgetTokens),
+      recordApi: z.boolean().catch(D.re.recordApi)
     })
     .catch(D.re)
 })

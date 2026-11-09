@@ -26,6 +26,7 @@ interface Harness {
   events: AgentEvent[]
   prompts: PendingPrompt[]
   requests: Awaited<ReturnType<typeof startMockRulz>>['requests']
+  reSessions: Awaited<ReturnType<typeof startMockRulz>>['reSessions']
   run: (text: string, opts?: { shown?: string; share?: boolean }) => Promise<TaskRecord>
   /** Resolves when the next task ends (for tasks started some other way, such as redo). */
   nextEnd: () => Promise<TaskRecord>
@@ -97,6 +98,7 @@ async function harness(
     events,
     prompts,
     requests: mock.requests,
+    reSessions: mock.reSessions,
     run: (text, startOpts) =>
       new Promise((resolve) => {
         ended.push(resolve)
@@ -703,6 +705,42 @@ describe('the agent loop', () => {
       await h.close()
     }
   }, 60_000)
+})
+
+describe('recording for reverse-engineering training', () => {
+  it('marks every model turn of a task as one RE session and describes it once', async () => {
+    const h = await harness(
+      [
+        { content: 'Looking.', toolCalls: [call('list_files', { path: '.', summary: 'Looking around' })] },
+        { content: 'ANSWER: 42' },
+        { content: 'Second answer.' }
+      ],
+      { settings: { reRecording: true } }
+    )
+    try {
+      const first = await h.run('What is the key in a.exe?')
+      const second = await h.run('And the other one?')
+      const turns = h.requests.filter((r) => r.body.stream)
+      expect(turns.map((r) => r.reSession)).toEqual([`agent-${first.id}`, `agent-${first.id}`, `agent-${second.id}`])
+      expect(h.reSessions).toEqual([
+        { id: `agent-${first.id}`, body: { client: 'RulZ Coding Agent', title: 'What is the key in a.exe?', target: h.root, goal: 'What is the key in a.exe?' } },
+        { id: `agent-${second.id}`, body: { client: 'RulZ Coding Agent', title: 'And the other one?', target: h.root, goal: 'And the other one?' } }
+      ])
+    } finally {
+      await h.close()
+    }
+  })
+
+  it('sends nothing extra with the switch off', async () => {
+    const h = await harness([{ content: 'Hi.' }])
+    try {
+      await h.run('Hello')
+      expect(h.requests.some((r) => r.reSession)).toBe(false)
+      expect(h.reSessions).toEqual([])
+    } finally {
+      await h.close()
+    }
+  })
 })
 
 describe('notes while a task runs', () => {

@@ -2,7 +2,7 @@
 // and graded sessions are exported as chat samples for fine-tuning.
 import { promises as fs } from 'node:fs'
 import { join } from 'node:path'
-import type { Conversation, ReExportOptions, ReExportResult, ReTraceInfo, WireMessage } from '@shared/types'
+import type { ApiReSession, ReExportOptions, ReExportResult, ReSession, ReTraceInfo, WireMessage } from '@shared/types'
 import type { RecordedRound } from '../chat/service'
 
 const ID_RE = /^[\w-]{1,64}$/
@@ -52,7 +52,11 @@ export class TraceStore {
     return join(this.dir, id)
   }
 
-  record(conversationId: string, round: RecordedRound): Promise<void> {
+  /**
+   * Records a finished round. With `shrinkIsTrim` (API sessions, where the other app fits its own
+   * context), a request with fewer messages than the one before counts as trimmed.
+   */
+  record(conversationId: string, round: RecordedRound, opts: { shrinkIsTrim?: boolean } = {}): Promise<void> {
     const dir = this.folder(conversationId)
     const prev = this.queues.get(conversationId) ?? Promise.resolve()
     const next = prev
@@ -65,7 +69,7 @@ export class TraceStore {
           model: round.model,
           messages: round.messages,
           tools: round.tools,
-          trimmedEver: round.trimmed || !!old?.trimmedEver
+          trimmedEver: round.trimmed || !!old?.trimmedEver || (!!opts.shrinkIsTrim && !!old && round.messages.length < old.messages.length)
         }
         const tools = await readJsonFile<Record<string, unknown>>(join(dir, 'tools.json'), {})
         let toolsChanged = false
@@ -87,6 +91,30 @@ export class TraceStore {
     return next
   }
 
+  /** The description of a session another app ran through the API server, if it has one. */
+  apiSession(id: string): Promise<ApiReSession | null> {
+    return readJsonFile<ApiReSession | null>(join(this.folder(id), 'session.json'), null)
+  }
+
+  /** Creates or updates an API session's description; queued with its rounds. */
+  updateApiSession(id: string, patch: Partial<ApiReSession>): Promise<ApiReSession> {
+    const dir = this.folder(id)
+    const prev = this.queues.get(id) ?? Promise.resolve()
+    let result!: ApiReSession
+    const next = prev.then(async () => {
+      await fs.mkdir(dir, { recursive: true })
+      const old = await readJsonFile<ApiReSession | null>(join(dir, 'session.json'), null)
+      const defined = Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined)) as Partial<ApiReSession>
+      result = { client: '', title: '', target: '', goal: '', outcome: 'unrated', createdAt: Date.now(), ...old, ...defined }
+      await writeFileAtomic(join(dir, 'session.json'), JSON.stringify(result))
+    })
+    this.queues.set(
+      id,
+      next.catch(() => undefined)
+    )
+    return next.then(() => result)
+  }
+
   async info(conversationId: string): Promise<ReTraceInfo | null> {
     const dir = this.folder(conversationId)
     const lines = await this.responses(conversationId)
@@ -94,7 +122,9 @@ export class TraceStore {
     const req = await readJsonFile<RequestFile | null>(join(dir, 'request.json'), null)
     let bytes = 0
     for (const f of ['request.json', 'responses.jsonl', 'tools.json']) bytes += (await fs.stat(join(dir, f)).catch(() => null))?.size ?? 0
+    const api = await this.apiSession(conversationId)
     return {
+      ...(api ? { api } : {}),
       conversationId,
       responses: lines.length,
       toolRounds: lines.filter((l) => l.toolCalls?.length).length,
@@ -222,10 +252,17 @@ export function scrub(line: string): string {
   return line.replace(EMAIL_RE, 'user@example.com')
 }
 
+/** A session to export: a chat with its RE details, or an API session (`source` names the app). */
+export interface ExportSession {
+  id: string
+  re?: ReSession
+  source?: string
+}
+
 /** Writes graded RE sessions as train.jsonl (plus a manifest) in `opts.outDir`. */
 export async function exportDataset(
   traces: TraceStore,
-  sessions: Conversation[],
+  sessions: ExportSession[],
   opts: ReExportOptions
 ): Promise<ReExportResult> {
   const dropped: Record<string, number> = {}
@@ -253,6 +290,7 @@ export async function exportDataset(
     }
     const meta: Record<string, unknown> = {
       conversation: c.id,
+      ...(c.source ? { source: c.source } : {}),
       outcome: re.outcome,
       graded: re.autoGraded ? 'auto' : 'user',
       ...(re.practice ? { task: re.practice.taskId, family: re.practice.family, tier: re.practice.tier } : {})
