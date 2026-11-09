@@ -760,6 +760,24 @@ describe('recording for reverse-engineering training', () => {
     }
   })
 
+  it('keeps going after the model cuts off a tool call mid-argument', async () => {
+    const h = await harness([
+      { content: 'Looking at the evidence.', toolCalls: [{ name: 'read_file', args: '{"path": "ev_cb182786e2ee0cb6da9e480c8598faa' }], finish: 'length' },
+      { content: 'Done.' }
+    ])
+    try {
+      const task = await h.run('Study it')
+      expect(task.outcome).toBe('done')
+      const second = h.requests.filter((r) => r.body.stream)[1]
+      const sent = second.body.messages!.find((m) => m.tool_calls)!
+      expect(sent.tool_calls![0].function.arguments).toBe('{}')
+      // The saved conversation keeps what the model wrote.
+      expect(h.session.data.messages.find((m) => m.tool_calls)!.tool_calls![0].function.arguments).toContain('ev_cb')
+    } finally {
+      await h.close()
+    }
+  })
+
   it('sends nothing extra with the switch off', async () => {
     const h = await harness([{ content: 'Hi.' }])
     try {

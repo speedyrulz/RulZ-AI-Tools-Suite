@@ -5,7 +5,7 @@ import { findServer, parseLoadInfo, parseModels, pickDefaultModel, RulzClient, t
 import { parseSettings } from '../src/main/settings'
 import { addDraft, noDraftMsPerToken, turnSavedMs } from '../src/main/rulz/draft'
 import { errorFromBody, interpretChunk, SseParser, ToolCallAccumulator } from '../src/main/rulz/sse'
-import { jsonifyToolCallArgs, templateStringifiesArgs } from '../src/main/rulz/toolArgs'
+import { jsonifyToolCallArgs, templateStringifiesArgs, validToolCallArgs } from '../src/main/rulz/toolArgs'
 import { QWEN_CODER_TEMPLATE, startMockRulz } from './helpers/mockRulz'
 
 describe('SseParser', () => {
@@ -186,6 +186,27 @@ describe('Qwen3-Coder argument fix', () => {
     expect(JSON.parse(calls[0].function.arguments)).toEqual({ names: '["x","y"]', deep: 'true', path: 'C:\\a' })
     expect(calls[1].function.arguments).toBe('not json')
     expect(out[0]).toEqual({ role: 'user', content: 'hi' })
+  })
+})
+
+describe('unreadable tool-call arguments', () => {
+  const call = (id: string, args: string) => ({ id, type: 'function' as const, function: { name: 'rea__get_evidence_bundle', arguments: args } })
+  it('repairs Python-style arguments, blanks cut-off ones and keeps good ones', () => {
+    const good = call('a', '{"path":"C:\\\\a.exe"}')
+    const msgs = [
+      { role: 'user' as const, content: 'hi' },
+      { role: 'assistant' as const, content: '', tool_calls: [good, call('b', "{'deep': True}"), call('c', '{"bundle_id": "ev_cb182786e2ee0cb6da9e480c8598faa')] }
+    ]
+    const out = validToolCallArgs(msgs)
+    const calls = out[1].tool_calls!
+    expect(calls[0]).toBe(good)
+    expect(JSON.parse(calls[1].function.arguments)).toEqual({ deep: true })
+    expect(calls[2].function.arguments).toBe('{}')
+    expect(msgs[1].tool_calls![2].function.arguments).toContain('ev_cb')
+  })
+  it('returns the same array when nothing needs fixing', () => {
+    const msgs = [{ role: 'assistant' as const, content: '', tool_calls: [call('a', '{}')] }]
+    expect(validToolCallArgs(msgs)).toBe(msgs)
   })
 })
 

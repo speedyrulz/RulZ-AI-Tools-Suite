@@ -2,7 +2,7 @@
 import type { ConnectionInfo, LoadSettings, ModelInfo, ModelLoadInfo, ReKind, ReOutcome, ReOverview, WireMessage, WireToolCall } from '@shared/types'
 import { noDraftMsPerToken } from './draft'
 import { errorFromBody, type GenTimings, interpretChunk, SseParser, ToolCallAccumulator } from './sse'
-import { jsonifyToolCallArgs, templateStringifiesArgs } from './toolArgs'
+import { jsonifyToolCallArgs, templateStringifiesArgs, validToolCallArgs } from './toolArgs'
 
 export interface ServerConfig {
   url: string
@@ -196,9 +196,10 @@ export class RulzClient {
     return props
   }
 
-  /** Applies the Qwen3-Coder argument fix when the model's template needs it. */
+  /** Repairs unreadable tool-call arguments, and applies the Qwen3-Coder argument fix when the model's template needs it. */
   prepareMessages(model: string, messages: WireMessage[]): WireMessage[] {
-    return templateStringifiesArgs(this.props.get(model)?.chatTemplate) ? jsonifyToolCallArgs(messages) : messages
+    const valid = validToolCallArgs(messages)
+    return templateStringifiesArgs(this.props.get(model)?.chatTemplate) ? jsonifyToolCallArgs(valid) : valid
   }
 
   /** One streamed /v1/chat/completions turn. */
