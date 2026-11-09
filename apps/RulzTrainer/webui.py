@@ -1525,6 +1525,8 @@ class Form:
             loss_watch_improve_tol=float(v("loss_watch_improve_tol")),
             loss_watch_healthy_mult=float(v("loss_watch_healthy_mult")),
             loss_watch_exclude_after=int(v("loss_watch_exclude_after")),
+            training_maps=bool(v("training_maps")), training_maps_images=int(v("training_maps_images") or 3),
+            training_maps_every=int(v("training_maps_every") or 0),
             isolation=bool(v("isolation")), isolation_class=s("isolation_class"),
             isolation_kind=v("isolation_kind") or "auto", dop_weight=float(v("dop_weight")),
             dop_every=int(v("dop_every") or 1), isolation_pairs=int(v("isolation_pairs") or 0),
@@ -3723,6 +3725,207 @@ def build_samples_tab(f: Form):
     columns.on_value_change(lambda e: (state.__setitem__("files", []), refresh()))
     ui.timer(3.0, while_connected(refresh))
     refresh()
+
+
+MAP_HINTS = {
+    "learned": "Green: the model got better on this part of the picture since the first capture. Magenta: it got "
+               "worse. Read this one first; magenta after green means the LoRA is overwriting something it had right "
+               "(an earlier save may be better).",
+    "loss": "Where the model still misses the picture: red most, then yellow, blue least. Fine detail always looks "
+            "warmer, so watch how it changes. A face that stays warm while the rest cools is slow likeness: check the "
+            "face is large enough in the photos.",
+    "effect": "Where the LoRA changes the prediction. For a person it should sit on the face and body; spreading onto "
+              "a recurring background, jacket or prop means the LoRA is learning that too (vary it, caption it, or "
+              "use the region-weighted loss).",
+    "attn": "How much attention each area gives the trigger word. It should sit on the subject; on a logo, watermark "
+            "or object means the trigger is tied to that.",
+}
+
+
+def map_picture(data: dict, probe: dict):
+    """A map picture as training saw it (probe_<n>.jpg), or None."""
+    from PIL import Image
+
+    try:
+        with Image.open(Path(data["dir"]) / probe["image"]) as im:
+            return im.convert("RGB")
+    except (OSError, KeyError):
+        return None
+
+
+def map_data_url(img, quality: int = 88) -> str:
+    import base64
+    import io
+
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def build_maps_tab(f: Form):
+    """Training maps: heatmaps over a few training pictures, capture by capture (rulztrainer/trainmaps.py)."""
+    from rulztrainer import trainmaps as TM
+
+    state = {"sig": None, "data": None, "view": None, "series": [], "top": 1.0, "pics": {}}
+    with card():
+        hint("Turn on Training maps (Train tab, Likeness section) before a run. A few training pictures are checked before "
+             "training and about once an epoch at three fixed noise levels, so only the LoRA changes between "
+             "captures. They only observe: training is the same with them on.")
+        with fields():
+            folder = ui.input("Job folder (output/<job>)", value="").classes("w-96 max-w-full")
+            native = _native_dialogs
+
+            async def browse():
+                picked = await pick_path("dir", folder.value or str(ROOT / "output"), native=native)
+                if picked:
+                    follow.value = False
+                    folder.value = _relative(picked)
+                    refresh(force=True)
+
+            ui.button(icon="folder_open", on_click=browse).props("flat dense round").tooltip(BROWSE_TIP[native])
+            follow = ui.switch("Follow current job", value=True)
+            info = ui.label("").classes("rz-hint")
+        with fields():
+            pick = ui.select({}, label="Picture").classes("w-72 max-w-full")
+            kind = ui.select({k: v for k, v in TM.MAP_KINDS.items()}, value="learned", label="Map").classes("w-64")
+            level = ui.select({"all": "All levels", **{f"{s:g}": TM.sigma_label(f"{s:g}") for s in TM.SIGMAS}},
+                              value="all", label="Noise").classes("w-52")
+        with fields():
+            play = ui.button(icon="play_arrow").props("flat dense round").tooltip("Play through the captures")
+            at = ui.slider(min=0, max=0, step=1, value=0).classes("w-80 max-w-full")
+            at_label = ui.label("").classes("text-sm whitespace-nowrap")
+        with fields():
+            smooth = ui.switch("Smooth", value=True)
+            colour = ui.switch("Colour picture", value=False)
+            ui.label("Map opacity").classes("text-sm")
+            opacity = ui.slider(min=0, max=1, step=0.05, value=1.0).classes("w-40")
+        meaning = ui.label("").classes("rz-hint")
+    view = ui.image("").props("fit=contain").classes("w-full max-w-3xl rz-imgbg")
+    view.set_visibility(False)
+
+    def job_dir() -> Path | None:
+        if follow.value:
+            jd = _job_dir or (Path(f.w["output_dir"].value or "output") / (f.w["job_name"].value or "my_lora"))
+            rel = _relative(str(jd))
+            if folder.value != rel:
+                folder.value = rel
+        return Path(folder.value) if folder.value else None
+
+    def kind_options(data: dict) -> dict:
+        opts = {k: v for k, v in TM.MAP_KINDS.items()}
+        words = data.get("words") or []
+        if len(words) > 1:  # each word on its own besides all of them together
+            opts["attn"] = "Trigger word: all"
+            for w in words:
+                opts[f"attn:{w}"] = f"Trigger word: {w}"
+        return opts
+
+    def rebuild():
+        """The series for the chosen picture / map / noise level, and its one colour scale."""
+        data = state["data"]
+        if not data or not pick.value:
+            state["series"], state["view"] = [], None
+            return
+        k, word = (kind.value or "learned"), ""
+        if k.startswith("attn:"):
+            k, word = "attn", k[5:]
+        state["series"] = TM.series(data, pick.value, k, level.value or "all", word)
+        state["top"] = TM.scale(state["series"], k)
+        state["view"] = k
+
+    def draw():
+        data, caps = state["data"], (state["data"] or {}).get("captures") or []
+        if not data or not caps:
+            view.set_source("")
+            view.set_visibility(False)
+            at_label.text = ""
+            return
+        i = max(0, min(int(at.value or 0), len(caps) - 1))
+        at_label.text = f"{TM.capture_label(caps[i])} ({i + 1} of {len(caps)})"
+        probe = next((p for p in data["probes"] if p["id"] == pick.value), None)
+        if probe is None:
+            return
+        pic = state["pics"].get(probe["id"])
+        if pic is None:
+            pic = state["pics"][probe["id"]] = map_picture(data, probe)
+        if pic is None:
+            view.set_source("")
+            view.set_visibility(False)
+            info.text = f"{probe['image']} is missing from {data['dir']}"
+            return
+        a = state["series"][i] if i < len(state["series"]) else None
+        meaning.text = MAP_HINTS.get(state["view"] or "", "")
+        if a is None and state["view"] == "attn":
+            meaning.text = "No trigger-word map for this picture: its caption doesn't name the trigger."
+        elif a is None and state["view"] == "effect" and i == 0:
+            meaning.text = "Before training the LoRA changes nothing yet; this map starts at the next capture."
+        img = TM.render_overlay(pic, a, state["view"] or "loss", state["top"], float(opacity.value or 0),
+                                bool(smooth.value), bool(colour.value))
+        view.set_source(map_data_url(img))
+        view.set_visibility(True)
+
+    def refresh(force: bool = False):
+        jd = job_dir()
+        d = TM.maps_dir(jd) if jd else None
+        sig = None
+        if d is not None:
+            sig = tuple((p.name, p.stat().st_mtime_ns) for p in (d / "probes.json", d / "maps.jsonl") if p.exists())
+        if sig == state["sig"] and not force:
+            return
+        state["sig"] = sig
+        was_last = bool(state["data"]) and int(at.value or 0) >= len(state["data"]["captures"]) - 1
+        data = TM.read(jd) if jd else None
+        if data is None or not data["probes"]:
+            state["data"], state["series"] = None, []
+            info.text = f"No training maps in {jd}" if jd else "No job selected"
+            pick.set_options({})
+            view.set_source("")
+            view.set_visibility(False)
+            at_label.text = ""
+            return
+        if state["data"] is None or state["data"].get("dir") != data["dir"]:
+            state["pics"] = {}
+        state["data"] = data
+        info.text = f"{len(data['captures'])} capture(s) of {len(data['probes'])} picture(s) in {data['dir']}"
+        pick.set_options({p["id"]: f"{int(p['id']) + 1}. {Path(p['source']).name}"
+                          + (" (side-by-side pair)" if p.get("pair") else "") for p in data["probes"]})
+        if pick.value not in {p["id"] for p in data["probes"]}:
+            pick.value = data["probes"][0]["id"]
+        opts = kind_options(data)
+        kind.set_options(opts)
+        if kind.value not in opts:
+            kind.value = "learned"
+        n = len(data["captures"])
+        at.props["max"] = max(0, n - 1)  # (an observable dict: the browser gets the new end)
+        if was_last or force or state["view"] is None:
+            at.value = max(0, n - 1)  # auto-refresh: a new capture shows as it lands
+        rebuild()
+        draw()
+
+    def advance():
+        caps = (state["data"] or {}).get("captures") or []
+        if not caps:
+            return
+        nxt = int(at.value or 0) + 1
+        if nxt >= len(caps):
+            nxt = 0
+        at.value = nxt
+
+    timer_play = ui.timer(0.8, advance, active=False)
+
+    def toggle_play():
+        timer_play.active = not timer_play.active
+        play.props(f"icon={'pause' if timer_play.active else 'play_arrow'}")
+
+    play.on_click(toggle_play)
+    for wd in (pick, kind, level):
+        wd.on_value_change(lambda _: (rebuild(), draw()))
+    for wd in (at, smooth, colour, opacity):
+        wd.on_value_change(lambda _: draw())
+    folder.on("keydown.enter", lambda _: (follow.set_value(False), refresh(force=True)))
+    follow.on_value_change(lambda _: refresh(force=True))
+    ui.timer(3.0, while_connected(refresh))
+    refresh(force=True)
 
 
 # ---------------------------------------------------------------- wizard
@@ -6704,6 +6907,7 @@ def build_page(local: bool = True):
             tab_dataset = ui.tab("Dataset", icon="photo_library")
             tab_monitor = ui.tab("Monitor", icon="show_chart")
             tab_samples = ui.tab("Samples", icon="collections")
+            tab_maps = ui.tab("Training maps", icon="layers")
             tab_history = ui.tab("Previous Runs", icon="history")
             tab_help = ui.tab("Help", icon="help_outline")
 
@@ -8250,6 +8454,25 @@ def build_page(local: bool = True):
                                                                          value=d.loss_watch_healthy_mult,
                                                                          step=0.05).classes("w-40")
 
+                    # ---- Training maps
+                    with sections.section("Likeness", "Training maps", "Heatmaps of what training changes, picture "
+                                          "by picture", "layers"):
+                        hint("After Fizgig's training maps. A few training pictures (at least one per dataset) are "
+                             "checked before training and about once an epoch at three fixed noise levels with fixed "
+                             "noise, so only the LoRA changes between captures: what it has learned since the start, "
+                             "what it still misses, where it acts, and where the trigger word's attention lands. "
+                             "Observe only, a few seconds per capture; see them on the Training maps tab. Not in a "
+                             "configuration race.")
+                        with fields():
+                            w["training_maps"] = ui.switch("Training maps", value=d.training_maps)
+                            w["training_maps_images"] = ui.number("Pictures", value=d.training_maps_images, min=1,
+                                                                  max=12, precision=0).classes("w-28") \
+                                .bind_visibility_from(w["training_maps"], "value")
+                            w["training_maps_every"] = ui.number("Every N steps (0 = each epoch)",
+                                                                 value=d.training_maps_every, min=0,
+                                                                 precision=0).classes("w-56") \
+                                .bind_visibility_from(w["training_maps"], "value")
+
                     # ---- LoRA Isolation
                     with sections.section("Likeness", "LoRA Isolation",
                                           "Keep your subject(s) off everyone else in a picture", "group_off"):
@@ -9385,6 +9608,11 @@ def build_page(local: bool = True):
             with ui.column().classes("rz-page gap-4"):
                 build_samples_tab(f)
 
+        # ------------------------------------------------------------ Training maps
+        with ui.tab_panel(tab_maps):
+            with ui.column().classes("rz-page gap-4"):
+                build_maps_tab(f)
+
         # ------------------------------------------------------------ Previous Runs
         with ui.tab_panel(tab_history):
             with ui.column().classes("rz-page gap-4 rz-history"):
@@ -9450,7 +9678,7 @@ def build_page(local: bool = True):
     ui.timer(2.0, while_connected(pill_tick))
     pill_tick()
 
-    tab_names = ("Wizard", "Train", "Dataset", "Monitor", "Samples", "Help")
+    tab_names = ("Wizard", "Train", "Dataset", "Monitor", "Samples", "Training maps", "Help")
 
     def remember_tab(e):
         name = e.value if isinstance(e.value, str) else e.value.props.get("name")
@@ -9840,6 +10068,14 @@ A LoRA trained on a few photos can learn to redraw one of them: same pose, same 
 one shoot in one room), shown as "copies a photo" in the round's log and in `selftrain.json`. Each probe logs its
 closest training photo and score ("copy" in the Monitor's probe line, `copy` in `likeness.jsonl`); that decides
 nothing. *auto* turns it on with self-training, *on* for any run with probes.
+
+## Training maps
+After Fizgig's training maps. With *Training maps* on (Likeness section), a few training pictures are checked before
+training and about once an epoch at three fixed noise levels with fixed noise, so only the LoRA changes between
+captures. The **Training maps** tab draws them over each picture: *Learned since the start* (green better, magenta
+worse; read it first), *Not learned yet* (red misses most), *Where the LoRA acts* (should sit on the subject; on a
+recurring background or prop the LoRA learns that too) and *Trigger word* (should sit on the subject, not on a logo,
+watermark or object). They only observe, a few seconds per capture; not in a configuration race.
 
 ## Previous runs (run history)
 
