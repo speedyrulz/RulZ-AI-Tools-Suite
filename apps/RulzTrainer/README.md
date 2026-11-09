@@ -879,6 +879,49 @@ and cleared by editing the image's caption. Output: `per_image_loss.jsonl` (ever
 `automagic3` / `automagic4`, whose step normalisation would absorb the per-image scaling. Verdicts need a few epochs to mean
 anything, so this suits typical character sets trained for thousands of steps.
 
+## Training maps (`training_maps`)
+
+Heatmaps over a few training pictures that show where training is going right or wrong, capture by capture. A
+port of [Fizgig's training maps](https://github.com/shootthesound/Fizgig/blob/master/docs/TRAINING_MAPS.md)
+(Apache-2.0). They only observe: nothing about training changes with them on.
+
+Turn on **Training maps** (Train tab, Likeness section, or `training_maps: true`). `training_maps_images` pictures
+(3 by default; at least one per dataset, plus one of LoRA Isolation's side-by-side pairs when the run has them,
+always the same ones for the same dataset) are checked before training and then every `training_maps_every`
+steps (0, the default: one epoch's worth of steps), and at the last step. Each picture is checked at three noise
+levels (sigma 0.25 detail, 0.5, 0.75 layout) with the same fixed noise every time, so between captures only the
+LoRA changes. Each capture runs 2 forwards per picture and level (the trigger map rides on the first; one before
+training, with nothing to compare yet): a few seconds.
+
+The **Training maps** tab shows them over the picture as training saw it (the bucket crop):
+
+| Map | Shows |
+| --- | --- |
+| Learned since the start | Green where the model got better than at the first capture, magenta where it got worse. Read this one first. |
+| Not learned yet | Where the prediction still misses (red most, then yellow, then blue). Fine detail always looks warmer. |
+| Where the LoRA acts | How much the LoRA changes the prediction (the same prediction with the LoRA switched off). |
+| Trigger word | The trigger word's share of each area's attention over the caption, averaged over heads and every block. With several trigger words in a caption, each word on its own too. |
+
+Pick the picture, the map, the noise level (All levels is the mean of the three) and the capture; Play steps
+through the captures. Each map keeps one colour scale across all captures so they compare. How to read them:
+
+- a face that stays warm on *Not learned yet* while the rest cools: likeness is slow; check the face is large enough
+  in the photos;
+- *Where the LoRA acts* spreading onto a recurring background, jacket or prop: the LoRA learns that too; vary it,
+  caption it or use the region-weighted loss;
+- magenta after green on *Learned since the start*: the LoRA is overwriting something it had right; an earlier save
+  may be better;
+- *Trigger word* centred on something other than the subject (a logo, a watermark, an object): the trigger is tied
+  to that.
+
+Details: the maps use the weight average (`lora_ema`) as samples and probes do, run without gradients in eval mode
+with the RNG put back, and with compiled blocks run eagerly. RulZ Trainer's trigger map normalises over the caption's
+tokens (`attn_localize`'s own measure), Fizgig's over every token, so their values differ. A full fine-tune has no
+*Where the LoRA acts* map (no adapter to switch off); a configuration race has no maps. A failed capture turns the maps
+off for the rest of the run and training goes on. Output, in the job folder: `training_maps/probes.json`,
+`training_maps/probe_<n>.jpg` and `training_maps/maps.jsonl` (one line per capture). **Untested in a real training
+run so far.**
+
 ## Muon (`optimizer: muon`)
 
 Muon steps each weight matrix as a whole: its momentum is replaced by the nearest orthogonal matrix (five
