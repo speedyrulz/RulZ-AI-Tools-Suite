@@ -119,6 +119,9 @@ export interface LoadSettings {
   /** Which draft: null = automatic, 'builtin' = the model's own MTP layers, or a DraftChoice id.
    *  Missing from RulZ LLM Suite before 0.3.9. */
   draftFile?: string | null
+  /** MoE expert offload: 'all' keeps every expert in system RAM, N the experts of the first N layers.
+   *  Missing from RulZ LLM Suite before 0.14.0. */
+  cpuMoe?: 'off' | 'all' | number
 }
 
 /** A draft RulZ LLM Suite can use for a model: its built-in MTP layers or a draft file in the models folder. */
@@ -159,6 +162,8 @@ export interface ModelLoadInfo {
   defaultDraft?: { name: string; builtIn: boolean } | null
   /** Drafts that can be picked; undefined before RulZ LLM Suite 0.3.9. */
   draftChoices?: DraftChoice[]
+  /** Layers with experts for a mixture-of-experts model; null for a dense one, undefined before RulZ LLM Suite 0.14.0. */
+  moeLayers?: number | null
   gpus: GpuInfo[]
   estimate?: LoadEstimate
 }

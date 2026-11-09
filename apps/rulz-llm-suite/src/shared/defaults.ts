@@ -4,6 +4,8 @@ import type { AppSettings, LoadConfig, SamplingParams } from './types'
 export const DEFAULT_LOAD_CONFIG: LoadConfig = {
   contextLength: 8192,
   gpuLayers: 'auto',
+  cpuMoe: 'off',
+  overrideTensors: '',
   splitMode: 'auto',
   mainGpu: 0,
   tensorSplit: '',

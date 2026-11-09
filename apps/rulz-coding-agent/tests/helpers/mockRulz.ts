@@ -81,7 +81,8 @@ export async function startMockRulz(opts: MockOptions = {}) {
     draftSampling: 'auto',
     draftGpu: 'auto',
     draftCacheTypeK: 'f16',
-    draftCacheTypeV: 'f16'
+    draftCacheTypeV: 'f16',
+    cpuMoe: 'off' as 'off' | 'all' | number
   }
   const GiB = 1024 ** 3
   const gpus = [
@@ -138,6 +139,7 @@ export async function startMockRulz(opts: MockOptions = {}) {
         state: 'ready',
         loaded_context_length: loadConfig.contextLength,
         has_draft: true,
+        moe_layers: 48,
         gpus,
         estimate: { gpuBytes, totalBytes: gpuBytes, verdict: 'fits', perGpu }
       })

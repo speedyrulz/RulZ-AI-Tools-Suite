@@ -2,6 +2,14 @@ import { effectiveKvTypes } from '@shared/kv'
 import type { LoadConfig, ModelEntry } from '@shared/types'
 import { splitArgs } from './process'
 
+/** "pattern=buffer" rules from the settings text: one per line or comma (llama.cpp splits on commas too), blanks dropped. */
+export function overrideTensorRules(text: string): string[] {
+  return text
+    .split(/[\r\n,]+/)
+    .map((l) => l.trim())
+    .filter((l) => l.includes('='))
+}
+
 export interface ServerArgsInput {
   model: ModelEntry
   config: LoadConfig
@@ -29,6 +37,11 @@ export function buildServerArgs({ model, config: c, port, alias }: ServerArgsInp
 
   if (c.contextLength !== null) args.push('--ctx-size', String(c.contextLength))
   if (c.gpuLayers !== 'auto') args.push('--n-gpu-layers', String(c.gpuLayers))
+
+  if (c.cpuMoe === 'all') args.push('--cpu-moe')
+  else if (typeof c.cpuMoe === 'number') args.push('--n-cpu-moe', String(c.cpuMoe))
+  const rules = overrideTensorRules(c.overrideTensors)
+  if (rules.length) args.push('--override-tensor', rules.join(','))
 
   if (c.splitMode === 'single') args.push('--split-mode', 'none', '--main-gpu', String(c.mainGpu))
   else if (c.splitMode === 'custom' && c.tensorSplit.trim()) {

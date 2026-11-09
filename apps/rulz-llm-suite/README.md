@@ -23,8 +23,9 @@ Discover/downloads, RAG and a CLI are planned.
 - **My Models** — scans a folder (default `C:\LLM`) for `.gguf` files, reads GGUF metadata (architecture,
   parameters, quantization, trained context, layers), pairs vision projectors (`mmproj`) and MTP draft files with
   their model, joins split shards, and watches the folder for changes.
-- **Model loading** (`Ctrl+L`) — context length, GPU offload (auto-fit / all / N layers), single-GPU or split
-  across GPUs, flash attention, KV cache quantization, threads, batch sizes, mmap/mlock, chat template override and
+- **Model loading** (`Ctrl+L`) — context length, GPU offload (auto-fit / all / N layers), MoE expert offload
+  (`--cpu-moe` / `--n-cpu-moe`: keep all experts, or those of the first N layers, in system RAM while attention stays
+  on the GPU) and custom tensor overrides (`--override-tensor`), single-GPU or split across GPUs, flash attention, KV cache quantization, threads, batch sizes, mmap/mlock, chat template override and
   extra arguments; per-model saved defaults; memory estimate with a fits/partial/likely-OOM verdict; load progress;
   live server log; several models loaded at once.
   - **Speculative decoding**: a draft-head sidecar next to the model (`mtp-*.gguf`, or eagle3/dflash/dspark) is
@@ -55,11 +56,12 @@ Discover/downloads, RAG and a CLI are planned.
   after an idle timeout. Optional API key, CORS, localhost-only or LAN, and a live request log with token counts.
   `GET /v1/models/{id}/load-config` returns a model's saved load settings, and `POST` with
   `{ "config": { … }, "reload": true }` changes them (other apps, like RulZ Coding Agent, use this). `POST` accepts only
-  context length, GPU layers, flash attention, KV cache types, parallel slots, the GPU split (mode, main GPU,
+  context length, GPU layers, MoE expert offload (`cpuMoe`: `"off"`, `"all"` or a layer count), flash attention,
+  KV cache types, parallel slots, the GPU split (mode, main GPU,
   per-GPU proportions) and the draft (MTP) settings, including which draft (`draftFile`: `null` for automatic,
   `"builtin"`, or the id of one of `draft_choices`). File paths and extra arguments stay app-only. A loaded model
   restarts with the new settings unless `"reload": false`; `"dry_run": true` only returns the memory estimate for the
-  changed settings. Replies include the GPUs, whether the model has a draft head, what automatic uses
+  changed settings. Replies include the GPUs, `moe_layers` (layers with experts; `null` for dense models), whether the model has a draft head, what automatic uses
   (`default_draft`), the drafts that can be picked (`draft_choices`, by path relative to the models folder), and the
   memory estimate. `POST /v1/models/{id}/unload` unloads every running instance of a model (replying with how many it
   `unloaded`), so a client can free the memory when it is done with a model.

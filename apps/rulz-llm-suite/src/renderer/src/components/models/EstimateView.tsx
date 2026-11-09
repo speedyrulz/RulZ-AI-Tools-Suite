@@ -41,7 +41,11 @@ export function EstimateView({ estimate }: { estimate: MemoryEstimate | null }) 
       </div>
       <div className="grid grid-cols-3 gap-2 text-xs">
         <Stat label="GPU" value={formatBytes(estimate.gpuBytes)} sub={estimate.freeVramBytes !== null ? `${formatBytes(estimate.freeVramBytes)} free` : undefined} />
-        <Stat label="Weights" value={formatBytes(estimate.weightsBytes)} />
+        <Stat
+          label="Weights"
+          value={formatBytes(estimate.weightsBytes)}
+          sub={estimate.cpuExpertBytes > 0 ? `${formatBytes(estimate.cpuExpertBytes)} experts in RAM` : undefined}
+        />
         <Stat
           label="KV cache"
           value={estimate.kvBytes !== null ? formatBytes(estimate.kvBytes) : 'auto'}

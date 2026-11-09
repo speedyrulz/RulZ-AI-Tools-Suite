@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { DEFAULT_LOAD_CONFIG } from '@shared/defaults'
 import type { ModelEntry } from '@shared/types'
 import { buildServerArgs } from '../src/main/engine/args'
+import { parseLoadConfig } from '../src/main/settings/schema'
 import { parseDevices, parseVersion } from '../src/main/engine/engine'
 import { parseNvidiaSmi } from '../src/main/engine/hardware'
 import { describeExitCode, splitArgs } from '../src/main/engine/process'
@@ -106,6 +107,36 @@ describe('KV cache and vision projector arguments', () => {
     const gpu = estimateMemory(model, cfg, { vramBytes: 30e9, ramBytes: 60e9 })
     const cpu = estimateMemory(model, { ...cfg, mmprojOnCpu: true }, { vramBytes: 30e9, ramBytes: 60e9 })
     expect(gpu.gpuBytes - cpu.gpuBytes).toBeCloseTo(model.mmproj!.sizeBytes)
+  })
+
+  it('keeps MoE experts on the CPU when asked', () => {
+    expect(argsFor({})).not.toMatch(/cpu-moe|override-tensor/)
+    expect(argsFor({ cpuMoe: 'all' })).toContain('--cpu-moe')
+    expect(argsFor({ cpuMoe: 12 })).toContain('--n-cpu-moe 12')
+    expect(argsFor({ overrideTensors: ' blk\\.1\\.ffn_.*_exps=CPU \r\n\nexps=CUDA0, junk' })).toContain(
+      '--override-tensor blk\\.1\\.ffn_.*_exps=CPU,exps=CUDA0'
+    )
+    expect(parseLoadConfig({ cpuMoe: 0 }).cpuMoe).toBe('off')
+    expect(parseLoadConfig({ cpuMoe: 4 }).cpuMoe).toBe(4)
+  })
+
+  it('takes CPU-held experts off the GPU estimate', () => {
+    const moe: ModelEntry = { ...model, mmproj: undefined, info: { ...model.info!, expertCount: 8, expertBytesByLayer: [0, 2e9, 2e9, 2e9] } }
+    const cfg = { ...DEFAULT_LOAD_CONFIG, contextLength: 8192 }
+    const free = { vramBytes: 30e9, ramBytes: 60e9 }
+    const base = estimateMemory(moe, cfg, free)
+    expect(base.cpuExpertBytes).toBe(0)
+    const all = estimateMemory(moe, { ...cfg, cpuMoe: 'all' }, free)
+    expect(all.cpuExpertBytes).toBe(6e9)
+    expect(base.gpuBytes - all.gpuBytes).toBeCloseTo(6e9)
+    expect(all.totalBytes).toBe(base.totalBytes)
+    // The first two layers: a dense one and one with experts.
+    expect(estimateMemory(moe, { ...cfg, cpuMoe: 2 }, free).cpuExpertBytes).toBe(2e9)
+    expect(estimateMemory(moe, { ...cfg, cpuMoe: 99 }, free).cpuExpertBytes).toBe(6e9)
+    // Without measured expert sizes nothing is moved, so the estimate stays on the high side.
+    expect(estimateMemory(model, { ...cfg, cpuMoe: 'all' }, free).cpuExpertBytes).toBe(0)
+    // Experts that don't fit in RAM make the load tight.
+    expect(estimateMemory(moe, { ...cfg, cpuMoe: 'all' }, { vramBytes: 30e9, ramBytes: 4e9 }).verdict).toBe('tight')
   })
 
   it('asks llama-server to reuse cached chunks', () => {

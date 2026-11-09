@@ -12,6 +12,13 @@ export interface LoadConfig {
   contextLength: number | null
   /** 'auto' lets llama.cpp fit layers to free memory; 'all' forces everything onto the GPU. */
   gpuLayers: 'auto' | 'all' | number
+  /**
+   * Mixture-of-experts offload: keep expert weights in system RAM while attention and shared
+   * weights stay on the GPU. 'all' = --cpu-moe, a number N = --n-cpu-moe N (experts of the first N layers).
+   */
+  cpuMoe: 'off' | 'all' | number
+  /** Custom tensor placement rules (--override-tensor), one "pattern=buffer" per line, e.g. "exps=CPU". */
+  overrideTensors: string
   splitMode: 'auto' | 'single' | 'custom'
   /** GPU index used when splitMode is 'single'. */
   mainGpu: number
@@ -380,6 +387,8 @@ export interface GgufInfo {
   valueLength?: number
   expertCount?: number
   expertUsedCount?: number
+  /** Bytes of routed-expert weights per layer (all shards), for the MoE offload estimate. */
+  expertBytesByLayer?: number[]
   slidingWindow?: number
   /** Share of layers using sliding-window attention (their KV cache is capped at the window). */
   slidingWindowFraction?: number
@@ -432,6 +441,8 @@ export interface MemoryEstimate {
   verdict: 'fits' | 'partial' | 'tight' | 'unknown'
   /** Per-GPU breakdown of gpuBytes for the GPUs the model would use; empty when GPUs are unknown. */
   perGpu: GpuEstimate[]
+  /** Expert weights the MoE offload setting keeps in system RAM (0 when off or unknown). */
+  cpuExpertBytes: number
 }
 
 export interface GpuEstimate {

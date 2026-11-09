@@ -243,6 +243,7 @@ const remoteLoadPatchSchema = z
     cacheTypeK: z.enum(KV_CACHE_TYPES as [string, ...string[]]),
     cacheTypeV: z.enum(KV_CACHE_TYPES as [string, ...string[]]),
     parallel: z.number().int().min(1).max(64),
+    cpuMoe: z.union([z.literal('off'), z.literal('all'), z.number().int().min(1).max(1000)]),
     splitMode: z.enum(['auto', 'single', 'custom']),
     mainGpu: z.number().int().min(0).max(15),
     // Proportions per GPU, e.g. "3,1" — numbers only, so nothing else reaches the command line. The
@@ -287,6 +288,7 @@ const REMOTE_LOAD_KEYS = [
   'cacheTypeK',
   'cacheTypeV',
   'parallel',
+  'cpuMoe',
   'splitMode',
   'mainGpu',
   'tensorSplit',

@@ -9,7 +9,7 @@ import { invoke } from '../../lib/api'
 import { cn, formatBytes, formatTokens } from '../../lib/format'
 import { useApp } from '../../stores/app'
 import { useModels } from '../../stores/models'
-import { Field, IconButton, Input, NumberInput, Select, Slider, Switch } from '../ui'
+import { Field, IconButton, Input, NumberInput, Select, Slider, Switch, Textarea } from '../ui'
 
 const CTX_PRESETS = [4096, 8192, 16384, 32768, 65536, 131072, 262144]
 const DRAFT_LABELS: Record<DraftKind, string> = { mtp: 'MTP', eagle3: 'EAGLE-3', dflash: 'DFlash', dspark: 'DSpark' }
@@ -54,6 +54,9 @@ export function LoadSettingsForm({
   const gpuMode = config.splitMode === 'single' ? `single:${config.mainGpu}` : config.splitMode
   const otherDrafts = draftFiles(library)
   const draft = model ? resolveDraft(model, config, library) : undefined
+  // Shown for MoE models, and on the defaults page where there is no model yet.
+  const isMoe = model === null || !!model.info?.expertCount
+  const moeLayers = model?.info?.expertBytesByLayer?.length ?? layers
   const canDraft = model === null || !!model.draft || !!model.info?.mtpLayers || otherDrafts.length > 0
 
   return (
@@ -114,6 +117,47 @@ export function LoadSettingsForm({
           )}
         </div>
       </Field>
+
+      {isMoe && (
+        <Field
+          label="MoE expert offload"
+          hint={
+            config.cpuMoe === 'off'
+              ? 'Experts follow GPU offload'
+              : estimate?.cpuExpertBytes
+                ? `${formatBytes(estimate.cpuExpertBytes)} of experts in RAM`
+                : 'Expert weights stay in system RAM'
+          }
+        >
+          <div className="flex items-center gap-2">
+            <Select
+              className="w-40"
+              aria-label="MoE expert offload"
+              value={typeof config.cpuMoe === 'number' ? 'custom' : config.cpuMoe}
+              onChange={(e) => {
+                const v = e.target.value
+                set('cpuMoe', v === 'custom' ? Math.max(1, Math.round(moeLayers / 2)) : (v as 'off' | 'all'))
+              }}
+            >
+              <option value="off">Off</option>
+              <option value="all">All experts on CPU</option>
+              <option value="custom">Experts of first N layers</option>
+            </Select>
+            {typeof config.cpuMoe === 'number' && (
+              <>
+                <Slider value={config.cpuMoe} min={1} max={Math.max(1, moeLayers)} onChange={(v) => set('cpuMoe', Math.max(1, v))} />
+                <NumberInput className="w-16" value={config.cpuMoe} min={1} onChange={(v) => set('cpuMoe', Math.max(1, Math.round(v ?? 1)))} />
+              </>
+            )}
+          </div>
+          {config.cpuMoe !== 'off' && (
+            <p className="text-[11px] text-faint">
+              Attention and shared weights stay on the GPU, so a big MoE runs far faster than with fewer GPU layers. Set GPU offload to
+              All layers to use the freed VRAM.
+            </p>
+          )}
+        </Field>
+      )}
 
       <Field label="GPUs">
         <Select
@@ -342,10 +386,19 @@ export function LoadSettingsForm({
                 </IconButton>
               </div>
             </Field>
+            <Field label="Tensor overrides" hint="--override-tensor; one pattern=buffer rule per line, e.g. blk\.(3[0-9])\.ffn_.*_exps=CPU">
+              <Textarea
+                className="font-mono text-xs"
+                rows={2}
+                placeholder="exps=CPU"
+                value={config.overrideTensors}
+                onChange={(e) => set('overrideTensors', e.target.value)}
+              />
+            </Field>
             <Field label="Extra llama-server arguments">
               <Input
                 className="font-mono text-xs"
-                placeholder="--override-tensor exps=CPU"
+                placeholder="--no-warmup"
                 value={config.extraArgs}
                 onChange={(e) => set('extraArgs', e.target.value)}
               />

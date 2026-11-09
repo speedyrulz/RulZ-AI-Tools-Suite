@@ -33,9 +33,13 @@ function u64(n: number): Buffer {
   return b
 }
 
-function buildGguf(kv: Record<string, Val>, tensors: string[] = []): Buffer {
+/** Tensors are names (offset 0) or [name, offset]; dataBytes adds an aligned data section of that size. */
+function buildGguf(kv: Record<string, Val>, tensors: (string | [string, number])[] = [], dataBytes = 0): Buffer {
   const parts: Buffer[] = [u32(0x46554747), u32(3), u64(tensors.length), u64(Object.keys(kv).length)]
-  const tensorInfos = tensors.map((name) => Buffer.concat([str(name), u32(2), u64(4096), u64(4096), u32(12), u64(0)]))
+  const tensorInfos = tensors.map((t) => {
+    const [name, offset] = typeof t === 'string' ? [t, 0] : t
+    return Buffer.concat([str(name), u32(2), u64(4096), u64(4096), u32(12), u64(offset)])
+  })
   for (const [k, val] of Object.entries(kv)) {
     parts.push(str(k))
     switch (val.t) {
@@ -66,7 +70,9 @@ function buildGguf(kv: Record<string, Val>, tensors: string[] = []): Buffer {
         break
     }
   }
-  return Buffer.concat([...parts, ...tensorInfos])
+  const header = Buffer.concat([...parts, ...tensorInfos])
+  if (!dataBytes) return header
+  return Buffer.concat([header, Buffer.alloc((32 - (header.length % 32)) % 32), Buffer.alloc(dataBytes)])
 }
 
 describe('readGgufHeader', () => {
@@ -272,5 +278,57 @@ describe.runIf(existsSync(LIB))('real GGUF files', () => {
       const h = readGgufHeader(f)
       expect(typeof h.kv['general.architecture']).toBe('string')
     }
+  })
+})
+
+describe('MoE expert sizes', () => {
+  const moeKv = {
+    'general.architecture': { t: 'str', v: 'qwen3moe' },
+    'qwen3moe.block_count': { t: 'u32', v: 2 },
+    'qwen3moe.expert_count': { t: 'u32', v: 8 }
+  } as const
+
+  it('adds up the routed-expert tensors of each layer from the tensor offsets', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rulz-moe-'))
+    const path = join(dir, 'moe.gguf')
+    // Listed out of order on purpose: sizes come from the next tensor by offset, the last runs to the end.
+    writeFileSync(
+      path,
+      buildGguf(
+        moeKv,
+        [
+          ['blk.1.ffn_down_exps.weight', 1600],
+          ['blk.0.attn_q.weight', 0],
+          ['blk.0.ffn_up_exps.weight', 100],
+          ['blk.0.ffn_gate_exps.weight', 400],
+          ['blk.0.ffn_down_shexp.weight', 700],
+          ['blk.1.ffn_gate_up_exps.weight', 800]
+        ],
+        2000
+      )
+    )
+    const h = readGgufHeader(path)
+    // Layer 0: up 300 + gate 300; the shared expert stays on the GPU. Layer 1: fused gate_up 800 +
+    // down 400 (Gemma 4 style), which llama.cpp's --cpu-moe pattern covers too.
+    expect(h.expertBytes).toEqual([600, 1200])
+    expect(toGgufInfo(h.kv, 'moe.gguf', h.hasNextn, h.expertBytes).expertBytesByLayer).toEqual([600, 1200])
+  })
+
+  it('sums experts over every shard of a split model', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rulz-moe-split-'))
+    const split = (n: number): Record<string, Val> => ({ 'split.no': { t: 'u32', v: n } })
+    writeFileSync(join(dir, 'm-00001-of-00002.gguf'), buildGguf(moeKv, [['blk.0.ffn_up_exps.weight', 0]], 500))
+    writeFileSync(join(dir, 'm-00002-of-00002.gguf'), buildGguf(split(1), [['blk.1.ffn_up_exps.weight', 0]], 700))
+    const lib = new ModelLibrary(join(dir, 'cache.json'), () => dir, () => undefined)
+    const models = await lib.scan()
+    lib.dispose()
+    expect(models[0].info?.expertBytesByLayer).toEqual([500, 700])
+  })
+
+  it('leaves dense models without expert sizes', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rulz-dense-'))
+    const path = join(dir, 'dense.gguf')
+    writeFileSync(path, buildGguf({ 'general.architecture': { t: 'str', v: 'llama' } }, [['blk.0.ffn_up.weight', 0]], 64))
+    expect(readGgufHeader(path).expertBytes).toBeUndefined()
   })
 })

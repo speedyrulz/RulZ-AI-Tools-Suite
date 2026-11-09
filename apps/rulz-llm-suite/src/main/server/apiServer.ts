@@ -577,6 +577,8 @@ export class ApiServer {
       gpus: this.deps.gpus().map(({ index, name, memUsedMiB, memTotalMiB }) => ({ index, name, memUsedMiB, memTotalMiB })),
       estimate: this.deps.estimate(m, config),
       max_context_length: m.info?.contextLength,
+      // Layers whose experts cpuMoe can keep on the CPU; null for dense models.
+      moe_layers: m.info?.expertCount ? (m.info.expertBytesByLayer?.length ?? m.info.blockCount ?? null) : null,
       state: inst?.status ?? 'not-loaded',
       loaded_config: inst ? remoteLoadView(inst.config, m) : undefined,
       loaded_context_length: inst?.contextLength ?? undefined

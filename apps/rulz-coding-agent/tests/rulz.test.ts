@@ -370,6 +370,11 @@ describe('model settings', () => {
       ['Gemma/Q5/mtp-gemma.gguf', false]
     ])
     expect(parseLoadInfo({ config: {}, default_draft: null, draft_choices: [] }).defaultDraft).toBeNull()
+    // MoE layers: a count for MoE models, null for dense ones, undefined from older RulZ LLM Suites.
+    expect(parseLoadInfo({ config: { cpuMoe: 'all' }, moe_layers: 48 })).toMatchObject({ moeLayers: 48, config: { cpuMoe: 'all' } })
+    expect(parseLoadInfo({ config: {}, moe_layers: null }).moeLayers).toBeNull()
+    expect(parseLoadInfo({ config: {}, moe_layers: 0 }).moeLayers).toBeNull()
+    expect(parseLoadInfo({ config: {} }).moeLayers).toBeUndefined()
     const mock = await startMockRulz()
     try {
       const client = new RulzClient(() => ({ url: mock.url, apiKey: '' }))
