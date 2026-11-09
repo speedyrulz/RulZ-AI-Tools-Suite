@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto'
 import http, { type IncomingMessage, type ServerResponse } from 'node:http'
-import type { ApiRequestLog, ApiServerSettings, ApiServerStatus, GpuStat, LoadConfig, LoadedInstance, MemoryEstimate, ModelEntry } from '@shared/types'
+import type { ApiReSession, ApiRequestLog, ApiServerSettings, ApiServerStatus, GpuStat, LoadConfig, LoadedInstance, MemoryEstimate, ModelEntry } from '@shared/types'
 import { fileName } from '@shared/draft'
+import { API_RE_ID, RE_OUTCOMES, RE_SESSION_HEADER } from '@shared/re'
+import type { RecordedRound } from '../chat/service'
 import type { InstanceManager } from '../engine/instances'
 import {
   applyRemoteLoadPatch,
@@ -19,6 +21,7 @@ import {
   SAMPLING_PATHS,
   UsageReader
 } from './helpers'
+import { ChatReplyCapture } from './reCapture'
 
 const MAX_BODY_BYTES = 64 * 1024 * 1024
 const MAX_LOG = 300
@@ -50,6 +53,8 @@ const PROXY_GET = new Set(['/props', '/slots', '/metrics', '/lora-adapters'])
 const LOAD_CONFIG_SUFFIX = '/load-config'
 /** POST /v1/models/{id}/unload stops every running instance of a model. */
 const UNLOAD_SUFFIX = '/unload'
+/** GET or POST /v1/re/sessions/{id} reads or describes and grades an RE session another app runs. */
+const RE_SESSIONS_PREFIX = '/v1/re/sessions/'
 
 export interface ApiServerDeps {
   instances: InstanceManager
@@ -62,6 +67,13 @@ export interface ApiServerDeps {
   gpus: () => GpuStat[]
   onStatus: (s: ApiServerStatus) => void
   onRequest: (entry: ApiRequestLog) => void
+  /** RE sessions other apps run through the server (ids as the app sent them). */
+  re?: {
+    enabled: () => boolean
+    record: (id: string, round: RecordedRound) => void
+    session: (id: string) => Promise<ApiReSession | null>
+    update: (id: string, patch: Partial<ApiReSession>) => Promise<ApiReSession>
+  }
 }
 
 /**
@@ -153,7 +165,7 @@ export class ApiServer {
 
     if (settings.cors) {
       res.setHeader('Access-Control-Allow-Origin', '*')
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta')
+      res.setHeader('Access-Control-Allow-Headers', `Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta, ${RE_SESSION_HEADER}`)
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
     }
     if (method === 'OPTIONS') {
@@ -237,6 +249,29 @@ export class ApiServer {
         res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ ...(this.modelEntry(model) as object), unloaded }))
         return finish(200)
       }
+      if (path.startsWith(RE_SESSIONS_PREFIX) && (method === 'GET' || method === 'POST')) {
+        const re = this.deps.re
+        if (!re) return fail(404, `Unknown endpoint: ${method} ${path}`, 'not_found_error')
+        const id = decodeURIComponent(path.slice(RE_SESSIONS_PREFIX.length))
+        if (!API_RE_ID.test(id)) return fail(400, 'Session ids are 1-56 letters, digits, _ or -.', 'invalid_request_error')
+        let session: ApiReSession | null
+        if (method === 'POST') {
+          let json: Record<string, unknown>
+          try {
+            json = JSON.parse((await readBody(req)).toString('utf8') || '{}') as Record<string, unknown>
+          } catch {
+            return fail(400, 'The request body is not valid JSON.')
+          }
+          const patch = parseReSessionPatch(json)
+          if (typeof patch === 'string') return fail(400, patch, 'invalid_request_error')
+          session = re.enabled() || patch.outcome ? await re.update(id, patch) : await re.session(id)
+        } else {
+          session = await re.session(id)
+          if (!session) return fail(404, 'No such RE session.', 'not_found_error')
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ id, object: 're.session', recording: re.enabled(), ...session }))
+        return finish(200)
+      }
       if (method === 'GET' && path.startsWith('/v1/models/')) {
         const model = resolveModel(this.deps.getModels(), decodeURIComponent(path.slice('/v1/models/'.length)))
         if (!model) return fail(404, 'Model not found.', 'not_found_error')
@@ -312,12 +347,32 @@ export class ApiServer {
       }
       if (json && rewritten) body = Buffer.from(JSON.stringify(json), 'utf8')
 
+      // An RE session another app runs: record the request and its reply, like an in-app round.
+      let capture: ((reply: RecordedRound['response']) => void) | undefined
+      const reId = req.headers[RE_SESSION_HEADER]
+      const re = this.deps.re
+      if (re && json && path === '/v1/chat/completions' && typeof reId === 'string' && API_RE_ID.test(reId) && re.enabled()) {
+        const requestJson = json
+        const at = Date.now()
+        const model = entry.model
+        capture = (response) =>
+          re.record(reId, {
+            requestId: entry.id,
+            at,
+            model,
+            messages: Array.isArray(requestJson.messages) ? (requestJson.messages as RecordedRound['messages']) : [],
+            tools: Array.isArray(requestJson.tools) ? requestJson.tools : [],
+            trimmed: false,
+            response
+          })
+      }
+
       // Held for the whole request, however long the stream runs, so idle-unload can't stop the model under it.
       const release = this.deps.instances.acquire(inst.instanceId)
       if (this.jit.has(inst.instanceId)) this.jit.set(inst.instanceId, Date.now())
       this.emit()
       try {
-        await this.proxy(req, res, inst, path + url.search, body, entry, finish, (abort) => (onClientGone = abort))
+        await this.proxy(req, res, inst, path + url.search, body, entry, finish, (abort) => (onClientGone = abort), capture)
       } finally {
         release()
         this.touch(inst.instanceId)
@@ -337,7 +392,9 @@ export class ApiServer {
     entry: ApiRequestLog,
     finish: (status: number, error?: string) => void,
     /** Registers what to do if the client disconnects mid-request. */
-    onClientGone: (abort: () => void) => void
+    onClientGone: (abort: () => void) => void,
+    /** Receives the reply of a successful chat completion (RE recording). */
+    capture?: (reply: RecordedRound['response']) => void
   ): Promise<void> {
     return new Promise((resolve) => {
       const headers: Record<string, string> = { host: `127.0.0.1:${inst.port}` }
@@ -357,12 +414,22 @@ export class ApiServer {
           // What the model server sent decides how usage is read: an error to a streamed request is plain JSON.
           const sse = /text\/event-stream/i.test(String(ures.headers['content-type'] ?? ''))
           const usage = new UsageReader(sse)
+          const reply = capture && ures.statusCode === 200 ? new ChatReplyCapture(sse) : null
           ures.on('data', (chunk: Buffer) => {
             res.write(chunk)
             usage.push(chunk)
+            reply?.push(chunk)
           })
           ures.on('end', () => {
             res.end()
+            const r = reply?.result()
+            if (r && capture) {
+              try {
+                capture(r)
+              } catch (err) {
+                console.error('Could not record an RE round:', err)
+              }
+            }
             Object.assign(entry, usage.end())
             finish(ures.statusCode ?? 502, ures.statusCode && ures.statusCode >= 400 ? errorMessageFrom(usage.text()) : undefined)
             resolve()
@@ -547,6 +614,22 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
     req.on('end', () => resolve(Buffer.concat(chunks)))
     req.on('error', reject)
   })
+}
+
+/** Checks the body of POST /v1/re/sessions/{id}; returns the problem as text. */
+export function parseReSessionPatch(json: Record<string, unknown>): Partial<ApiReSession> | string {
+  const patch: Partial<ApiReSession> = {}
+  for (const k of ['client', 'title', 'target', 'goal', 'notes'] as const) {
+    const v = json[k]
+    if (v === undefined) continue
+    if (typeof v !== 'string' || v.length > 4000) return `${k} must be a string of at most 4000 characters.`
+    patch[k] = v
+  }
+  if (json.outcome !== undefined) {
+    if (!(RE_OUTCOMES as readonly unknown[]).includes(json.outcome)) return `outcome must be one of ${RE_OUTCOMES.join(', ')}.`
+    patch.outcome = json.outcome as ApiReSession['outcome']
+  }
+  return patch
 }
 
 function errorMessageFrom(text: string): string | undefined {

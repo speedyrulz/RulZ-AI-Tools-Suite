@@ -5,7 +5,7 @@ import { RE_DEFAULT_MODEL_ID, RE_GOALS } from '@shared/re'
 import type { ReOutcome, RePracticeInfo, ReSettings, ReTraceInfo } from '@shared/types'
 import { OutcomeButtons } from '../components/chat/ReBanner'
 import { Badge, Button, Field, IconButton, Input, NumberInput, Select, Switch, Textarea, Tooltip } from '../components/ui'
-import { errorMessage, invoke } from '../lib/api'
+import { errorMessage, invoke, on } from '../lib/api'
 import { cn, formatBytes, relativeTime } from '../lib/format'
 import { useApp } from '../stores/app'
 import { isChatBusy, useChat } from '../stores/chat'
@@ -60,6 +60,13 @@ export function ReversePage() {
             hint="REA tools that only read the target (decompile, search, list, annotate), plus calc and the file tools. Tools that run programs, attach debuggers or reach devices still ask."
           >
             <Switch checked={re.autoApproveStatic} onCheckedChange={(v) => setRe('autoApproveStatic', v)} />
+          </Field>
+          <Field
+            inline
+            label="Record sessions from other apps"
+            hint="RulZ Coding Agent (with its reverse-engineering training switch on) marks its requests to the API server; they are recorded here and listed under Sessions for grading."
+          >
+            <Switch checked={re.recordApi} onCheckedChange={(v) => setRe('recordApi', v)} />
           </Field>
           <Field inline label="Most tool rounds per reply" hint="An RE answer often takes 20–60 tool calls.">
             <div className="w-24">
@@ -362,6 +369,17 @@ function Practice({ re, setRe }: { re: ReSettings; setRe: <K extends keyof ReSet
   )
 }
 
+interface SessionRow {
+  id: string
+  title: string
+  target: string
+  updatedAt: number
+  outcome: ReOutcome
+  trace?: ReTraceInfo
+  /** The app that ran it through the API server; unset for chats here. */
+  client?: string
+}
+
 const OUTCOME_LABEL: Record<ReOutcome, string> = { unrated: 'Not graded', solved: 'Solved', partial: 'Partial', failed: 'Failed' }
 
 function Sessions() {
@@ -380,13 +398,28 @@ function Sessions() {
       .then((list) => setTraces(new Map(list.map((t) => [t.conversationId, t]))))
       .catch(() => undefined)
   }, [])
-  // Summaries change as sessions run, so the recorded counts follow them.
+  // Summaries change as sessions run, so the recorded counts follow them; other apps' sessions
+  // announce themselves.
   useEffect(refresh, [refresh, summaries])
+  useEffect(() => on('re:changed', refresh), [refresh])
 
-  const sessions = summaries.filter((s) => s.reOutcome && (filter === 'all' || s.reOutcome === filter))
-  const all = summaries.filter((s) => s.reOutcome)
-  const count = (o: ReOutcome): number => all.filter((s) => s.reOutcome === o).length
-  const exportable = all.filter((s) => outcomes.includes(s.reOutcome!) && traces.has(s.id)).length
+  // Chats with RE details, then sessions other apps ran through the API server.
+  const all: SessionRow[] = [
+    ...summaries
+      .filter((s) => s.reOutcome)
+      .map((s) => ({ id: s.id, title: s.title, target: s.reTarget ?? '', updatedAt: s.updatedAt, outcome: s.reOutcome!, trace: traces.get(s.id) })),
+    ...[...traces.values()]
+      .filter((t) => t.api)
+      .map((t) => ({ id: t.conversationId, title: t.api!.title || t.api!.goal || 'Untitled session', target: t.api!.target, updatedAt: t.updatedAt, outcome: t.api!.outcome, trace: t, client: t.api!.client }))
+  ]
+  const sessions = all.filter((s) => filter === 'all' || s.outcome === filter)
+  const count = (o: ReOutcome): number => all.filter((s) => s.outcome === o).length
+  const exportable = all.filter((s) => outcomes.includes(s.outcome) && s.trace).length
+  const gradeApi = (id: string, outcome: ReOutcome): void => {
+    void invoke('re:setApiOutcome', id, outcome)
+      .then(refresh)
+      .catch((e) => toast.error(errorMessage(e)))
+  }
 
   const doExport = async (): Promise<void> => {
     const dir = await invoke('dialog:pickFolder', { title: 'Folder for train.jsonl' })
@@ -445,13 +478,16 @@ function Sessions() {
             </thead>
             <tbody>
               {sessions.map((s) => {
-                const t = traces.get(s.id)
+                const t = s.trace
                 return (
                   <tr key={s.id} className="border-t border-border/60 hover:bg-hover/40">
                     <td className="max-w-0 px-3 py-1.5">
-                      <div className="truncate">{s.title}</div>
-                      <div className="truncate font-mono text-[10.5px] text-faint" title={s.reTarget}>
-                        {s.reTarget ? baseName(s.reTarget) : ''} · {relativeTime(s.updatedAt)}
+                      <div className="flex items-center gap-1.5">
+                        <span className="truncate">{s.title}</span>
+                        {s.client && <Badge tone="accent">{s.client}</Badge>}
+                      </div>
+                      <div className="truncate font-mono text-[10.5px] text-faint" title={s.target}>
+                        {s.target ? baseName(s.target) : ''} · {relativeTime(s.updatedAt)}
                       </div>
                     </td>
                     <td className="px-2 py-1.5 text-right whitespace-nowrap text-muted tabular-nums">
@@ -466,23 +502,25 @@ function Sessions() {
                       )}
                     </td>
                     <td className="px-2 py-1.5">
-                      <OutcomeButtons id={s.id} outcome={s.reOutcome!} size="sm" />
+                      <OutcomeButtons id={s.id} outcome={s.outcome} size="sm" onChange={s.client !== undefined ? (o) => gradeApi(s.id, o) : undefined} />
                     </td>
                     <td className="px-2 py-1.5">
                       <div className="flex justify-end gap-0.5">
+                        {s.client === undefined && (
+                          <IconButton
+                            size="sm"
+                            label="Open in chat"
+                            onClick={async () => {
+                              await open(s.id)
+                              setPage('chat')
+                            }}
+                          >
+                            <MessageSquare size={13} />
+                          </IconButton>
+                        )}
                         <IconButton
                           size="sm"
-                          label="Open in chat"
-                          onClick={async () => {
-                            await open(s.id)
-                            setPage('chat')
-                          }}
-                        >
-                          <MessageSquare size={13} />
-                        </IconButton>
-                        <IconButton
-                          size="sm"
-                          label="Delete recorded data (keeps the chat)"
+                          label={s.client === undefined ? 'Delete recorded data (keeps the chat)' : 'Delete this session and its recorded data'}
                           disabled={!t}
                           onClick={async () => {
                             await invoke('re:deleteTrace', s.id).catch((e) => toast.error(errorMessage(e)))

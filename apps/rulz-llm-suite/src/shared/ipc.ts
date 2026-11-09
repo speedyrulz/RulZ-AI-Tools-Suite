@@ -17,6 +17,7 @@ import type {
   ModelEntry,
   Preset,
   ReExportOptions,
+  ReOutcome,
   ReExportResult,
   RePracticeInfo,
   ReTraceInfo,
@@ -94,6 +95,8 @@ export interface IpcInvoke {
   /** Recorded training data of every RE session. */
   're:traces': () => ReTraceInfo[]
   're:deleteTrace': (conversationId: string) => void
+  /** Grades a session another app ran through the API server (id as listed, with its api- prefix). */
+  're:setApiOutcome': (id: string, outcome: ReOutcome) => void
   /** Writes graded RE sessions as train.jsonl. */
   're:export': (opts: ReExportOptions) => ReExportResult
   're:dataFolder': () => string
@@ -126,6 +129,8 @@ export interface IpcEvents {
   'mcp:config': McpConfigState
   'server:changed': ApiServerStatus
   'server:request': ApiRequestLog
+  /** An app recorded or described an RE session through the API server. */
+  're:changed': undefined
 }
 
 export type InvokeChannel = keyof IpcInvoke

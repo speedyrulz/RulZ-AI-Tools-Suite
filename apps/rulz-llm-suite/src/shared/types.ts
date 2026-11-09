@@ -155,6 +155,8 @@ export interface ReSettings {
   maxToolRounds: number
   /** Token budget for loaded tool descriptions in RE sessions (on-demand tool loading). */
   toolBudgetTokens: number
+  /** Record API requests that other apps (RulZ Coding Agent) mark as RE sessions. */
+  recordApi: boolean
 }
 
 export type ReOutcome = 'unrated' | 'solved' | 'partial' | 'failed'
@@ -185,6 +187,20 @@ export interface ReTraceInfo {
   trimmed: boolean
   bytes: number
   updatedAt: number
+  /** Set for a session another app ran through the API server (it has no chat here). */
+  api?: ApiReSession
+}
+
+/** An RE session recorded from the API server, described by the app that ran it. */
+export interface ApiReSession {
+  /** The app that ran it, e.g. "RulZ Coding Agent". */
+  client: string
+  title: string
+  target: string
+  goal: string
+  outcome: ReOutcome
+  notes?: string
+  createdAt: number
 }
 
 export interface RePracticeTask {

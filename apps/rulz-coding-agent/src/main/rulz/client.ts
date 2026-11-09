@@ -9,6 +9,17 @@ export interface ServerConfig {
   apiKey: string
 }
 
+/** RulZ LLM Suite records requests carrying this header as part of the named RE session. */
+export const RE_SESSION_HEADER = 'x-rulz-re-session'
+
+/** What RulZ LLM Suite shows for a recorded RE session. */
+export interface ReSessionInfo {
+  client: string
+  title: string
+  target: string
+  goal: string
+}
+
 const headers = (apiKey: string, json = false): Record<string, string> => ({
   ...(json ? { 'Content-Type': 'application/json' } : {}),
   ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {})
@@ -190,12 +201,14 @@ export class RulzClient {
   async streamTurn(
     body: { model: string; messages: WireMessage[]; tools?: unknown[]; [k: string]: unknown },
     signal: AbortSignal,
-    on: StreamHandlers = {}
+    on: StreamHandlers = {},
+    /** Extra request headers, e.g. the RE session to record this turn in. */
+    extra: Record<string, string> = {}
   ): Promise<TurnResult> {
     const { url, apiKey } = this.config()
     const res = await fetch(`${url}/v1/chat/completions`, {
       method: 'POST',
-      headers: headers(apiKey, true),
+      headers: { ...headers(apiKey, true), ...extra },
       body: JSON.stringify({ ...body, messages: this.prepareMessages(body.model, body.messages), stream: true }),
       signal
     })
@@ -274,6 +287,26 @@ export class RulzClient {
     }
     if (!res.ok) throw new ServerError(errorFromBody(res.status, text), res.status)
     return parseLoadInfo(JSON.parse(text))
+  }
+
+  /**
+   * Describes an RE session RulZ LLM Suite records. Resolves whether the Suite records it: false for
+   * a Suite that is too old or has recording from other apps turned off. Never throws.
+   */
+  async describeReSession(id: string, info: ReSessionInfo): Promise<boolean> {
+    const { url, apiKey } = this.config()
+    try {
+      const res = await fetch(`${url}/v1/re/sessions/${encodeURIComponent(id)}`, {
+        method: 'POST',
+        headers: headers(apiKey, true),
+        body: JSON.stringify(info),
+        signal: AbortSignal.timeout(5000)
+      })
+      if (!res.ok) return false
+      return ((await res.json()) as { recording?: boolean }).recording === true
+    } catch {
+      return false
+    }
   }
 
   /** Non-streamed completion without tools (used for summaries). */

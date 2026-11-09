@@ -17,10 +17,10 @@ import { ApiServer } from './server/apiServer'
 import { parseLoadConfig } from './settings/schema'
 import { SettingsStore } from './settings/store'
 import { FILE_TOOLS_SERVER } from './files/fileTools'
-import { extractAnswer } from '@shared/re'
+import { API_RE_PREFIX, extractAnswer } from '@shared/re'
 import { gradePractice, listPractice, preparePractice } from './re/practice'
 import { findPython, type PythonCommand } from './re/python'
-import { exportDataset, TraceStore } from './re/traces'
+import { exportDataset, TraceStore, type ExportSession } from './re/traces'
 
 const MiB = 1024 * 1024
 const isDev = !app.isPackaged && !!process.env.ELECTRON_RENDERER_URL
@@ -193,6 +193,7 @@ async function main(): Promise<void> {
     .finally(() => void mcp.init())
   const traces = new TraceStore(join(userData, 're-data'))
   const practiceRoot = join(userData, 're-practice')
+  const apiRe = (id: string): string => API_RE_PREFIX + id
 
   const apiServer = new ApiServer({
     instances,
@@ -203,7 +204,26 @@ async function main(): Promise<void> {
     estimate,
     gpus: () => hardware.snapshot().gpus,
     onStatus: (s) => broadcast('server:changed', s),
-    onRequest: (e) => broadcast('server:request', e)
+    onRequest: (e) => broadcast('server:request', e),
+    re: {
+      enabled: () => settings.get().re.recordApi,
+      record: (id, round) => {
+        const dir = apiRe(id)
+        // A session the app never described still gets an entry, so it shows on the page.
+        void traces
+          .apiSession(dir)
+          .then((s) => (s ? undefined : traces.updateApiSession(dir, { client: 'Another app', title: id })))
+          .then(() => traces.record(dir, round, { shrinkIsTrim: true }))
+          .then(() => broadcast('re:changed', undefined))
+          .catch((err) => console.error('Could not record an RE round:', err))
+      },
+      session: (id) => traces.apiSession(apiRe(id)),
+      update: async (id, patch) => {
+        const s = await traces.updateApiSession(apiRe(id), patch)
+        broadcast('re:changed', undefined)
+        return s
+      }
+    }
   })
 
   const chat = new ChatService(instances, (e) => broadcast('chat:event', e), (req) => {
@@ -342,6 +362,10 @@ async function main(): Promise<void> {
 
   handle('re:traces', () => traces.list())
   handle('re:deleteTrace', (id) => traces.delete(id))
+  handle('re:setApiOutcome', async (id, outcome) => {
+    if (!id.startsWith(API_RE_PREFIX) || !(await traces.apiSession(id))) throw new Error('Not an API session.')
+    await traces.updateApiSession(id, { outcome })
+  })
   handle('re:dataFolder', async () => {
     const dir = join(userData, 're-data')
     await fs.mkdir(dir, { recursive: true })
@@ -349,11 +373,16 @@ async function main(): Promise<void> {
   })
   handle('re:calcStatus', () => ({ available: !!python, python: python ? `${python.command} ${python.version}` : null }))
   handle('re:export', async (opts) => {
-    const sessions = []
+    const sessions: ExportSession[] = []
     for (const s of await conversations.list()) {
       if (!s.reOutcome) continue
       const c = await conversations.get(s.id).catch(() => null)
-      if (c?.re) sessions.push(c)
+      if (c?.re) sessions.push({ id: c.id, re: c.re })
+    }
+    // Sessions other apps ran through the API server.
+    for (const t of await traces.list()) {
+      if (!t.api) continue
+      sessions.push({ id: t.conversationId, source: t.api.client, re: { target: t.api.target, goal: t.api.goal, collect: true, outcome: t.api.outcome, notes: t.api.notes } })
     }
     return exportDataset(traces, sessions, opts)
   })

@@ -19,6 +19,8 @@ export interface MockTurn {
 
 export interface MockRequest {
   path: string
+  /** The RE session header RulZ LLM Suite records requests by, if sent. */
+  reSession?: string
   body: {
     model?: string
     stream?: boolean
@@ -87,6 +89,8 @@ export async function startMockRulz(opts: MockOptions = {}) {
     { index: 1, name: 'RTX 3090', memUsedMiB: 512, memTotalMiB: 24576 }
   ]
   const loadConfigPosts: unknown[] = []
+  /** POST /v1/re/sessions/{id} bodies, as newer RulZ LLM Suite versions take them. */
+  const reSessions: { id: string; body: Record<string, unknown> }[] = []
   const nextTurn = (req: MockRequest): MockTurn => {
     const t = opts.turns
     const i = turnIndex++
@@ -138,12 +142,19 @@ export async function startMockRulz(opts: MockOptions = {}) {
         estimate: { gpuBytes, totalBytes: gpuBytes, verdict: 'fits', perGpu }
       })
     }
+    if (url.pathname.startsWith('/v1/re/sessions/') && req.method === 'POST' && !opts.lmStudio) {
+      const id = decodeURIComponent(url.pathname.slice('/v1/re/sessions/'.length))
+      const body = JSON.parse(await readBody(req)) as Record<string, unknown>
+      reSessions.push({ id, body })
+      return json(200, { id, object: 're.session', recording: true, outcome: 'unrated', ...body })
+    }
     if (url.pathname === '/props') {
       return json(200, { chat_template: opts.template ?? QWEN_CODER_TEMPLATE, default_generation_settings: { n_ctx: opts.nCtx ?? 65536 } })
     }
     if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
       const body = JSON.parse(await readBody(req)) as MockRequest['body']
-      const record: MockRequest = { path: url.pathname, body }
+      const reSession = req.headers['x-rulz-re-session']
+      const record: MockRequest = { path: url.pathname, body, ...(typeof reSession === 'string' ? { reSession } : {}) }
       requests.push(record)
       if (!body.stream) return json(200, { choices: [{ message: { role: 'assistant', content: 'Summary: the owner asked for things and they were built.' } }] })
       const turn = nextTurn(record)
@@ -179,6 +190,7 @@ export async function startMockRulz(opts: MockOptions = {}) {
     url: `http://127.0.0.1:${port}`,
     requests,
     loadConfigPosts,
+    reSessions,
     close: () => new Promise<void>((r) => server.close(() => r()))
   }
 }
