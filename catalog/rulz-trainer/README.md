@@ -936,12 +936,13 @@ own setting and is off at 0:
 | `region_steer_boost` | 0 (never raise) | All pictures together: a face, hair or skin lagging the subject as a whole by more than a tenth is raised, up to this weight (1.5, say). Off by default: a region that stays hard is often a bad picture. |
 | `region_steer_prior` | 0 | While the background is past its cap, its prediction is also pulled towards the base model's, with up to this weight. Needs the cap rule and the background among the steered regions; one more forward pass a step while it acts; not for a fine-tune. |
 | `region_steer_holdout` | 0 | Needs [held-out photos](#region-sweeps-and-held-out-photos-experimental): a region memorised on the training pictures is turned down in every picture. |
+| `region_steer_subject_ahead` | 0 | Needs [sweeps](#region-sweeps-and-held-out-photos-experimental) of the training pictures. One picture at a time: its face, hair or skin is turned down in that picture when the sweeps show it with less than this x the median picture's error left (0.7, say). |
 
 And the limits they share:
 
 | Setting | Default | |
 | --- | --- | --- |
-| `region_steer_regions` | `background,clothes` | What the cap and ahead rules may turn down: `background`, `clothes` or both. The face, hair and skin are never turned down. |
+| `region_steer_regions` | `background,clothes` | What the cap and ahead rules may turn down: `background`, `clothes` or both. The face, hair and skin are turned down only by the two rules made for them, `region_steer_holdout` and `region_steer_subject_ahead`. |
 | `region_steer_min` | 0.3 | A region's lowest weight. 0 lets steering mask a region out of a picture: the model is then free to do anything there. |
 | `region_steer_step` | 0.2 | The most a weight moves per epoch, as a share of itself; back up half as fast. |
 | `region_steer_strength` | 1.0 | How hard a rule pulls: the weight aimed for is (share within the limit) ^ (2 x this). |
@@ -975,7 +976,8 @@ between two sweeps only the weights change and a picture's learned share is meas
 | `holdout_track_best` | off | Saves `<job>_holdout_best.safetensors` at each new best of the held-out subject score (face, hair and skin together). |
 | `holdout_patience` | 0 (never) | Stops training after this many sweeps without a better held-out subject score. |
 | `region_steer_signal` | `steps` | With region steering: `sweep` makes the per-picture rules read the sweeps' contrast, not the training steps'. |
-| `region_steer_holdout` | 0 (off) | With region steering and held-out photos: a region learned this much further on the training pictures than on the held-out ones, and no better on those for two sweeps, is turned down in every picture. The one rule that may turn the face, hair or skin down. |
+| `region_steer_holdout` | 0 (off) | With region steering and held-out photos: a region learned this much further on the training pictures than on the held-out ones, and no better on those for two sweeps, is turned down in every picture. It may turn the face, hair or skin down. |
+| `region_steer_subject_ahead` | 0 (off) | With region steering and sweeps of the training pictures: a picture's face, hair or skin with less than this x the median picture's error left is turned down in that picture alone. The training steps have no clean reading of one picture's subject; the sweeps do. Needs at least 4 swept pictures with that region. |
 
 **Cost.** 3 forward passes per picture per sweep. Sweeping every training picture every epoch about doubles the
 training time (an epoch trains each picture once, at about 3 forward passes' worth of time); every 4th epoch adds about
