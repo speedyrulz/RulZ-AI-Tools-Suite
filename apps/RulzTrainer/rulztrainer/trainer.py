@@ -1738,6 +1738,19 @@ class Trainer(RaceParallelMixin):
         self.status.update(stage="finished", done=True)
         self._save_history("finished" if step >= cfg.steps else "stopped")
         log.info("Done. Final LoRA: %s", path)
+        if cfg.run_report:
+            self._run_report()
+
+    def _run_report(self) -> None:
+        """run_report: the run's summary picture and PDF into its job folder. Never fails the run."""
+        try:
+            from . import runreport
+
+            done = runreport.generate(self.job_dir)
+            log.info("Run report: %s", ", ".join(str(p) for p in done.values()))
+        except Exception as e:  # noqa: BLE001
+            log.warning("Run report not written (%s: %s). It can be made later: python -m rulztrainer.runreport %s",
+                        type(e).__name__, e, self.job_dir)
 
     # ------------------------------------------------------------ full fine-tune (see finetune.py)
     def _finetune_setup(self, cfg, items):
