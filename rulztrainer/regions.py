@@ -404,7 +404,8 @@ def flip_region_map(rm: RegionMap, bw: int) -> RegionMap:
         kps = [[bw - x, y] for x, y in rm.kps]
         if len(kps) == 5:  # mirrored face: the left eye / mouth corner is now the right one (keeps 5-point order)
             kps = [kps[1], kps[0], kps[2], kps[4], kps[3]]
-    return RegionMap(rm.weight.flip(-1), rm.prior.flip(-1), fc, kps, rm.has_person)
+    return RegionMap(rm.weight.flip(-1), rm.prior.flip(-1), fc, kps, rm.has_person,
+                     None if rm.parts is None else rm.parts.flip(-1), rm.parts_print, rm.weights_print)
 
 
 def uniform_region_map(bw: int, bh: int) -> RegionMap:

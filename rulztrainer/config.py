@@ -635,6 +635,9 @@ class TrainConfig:
     loss_watch_improve_tol: float = 0.03  # relative epoch-to-epoch drop that counts as improving
     loss_watch_healthy_mult: float = 1.0  # lr multiplier for the healthy cohort (Fizgig uses 1.1)
     loss_watch_exclude_after: int = 0  # epochs at the lowest throttle before an image is excluded; 0 = never
+    # --- region watch (regionwatch.py): how far the face, hair, skin, clothes and background have been learned ---
+    region_watch: bool = False  # observe only: the training steps' own losses split by region (needs mediapipe; not
+    #                             in a race)
     # --- training maps (trainmaps.py): heatmaps over a few training pictures, before training and about each epoch ---
     training_maps: bool = False  # observe only: nothing about training changes
     training_maps_images: int = 3  # pictures (at least one per dataset, so more with several datasets)
@@ -1202,11 +1205,16 @@ class TrainConfig:
         loss, attention localization, identity alignment and Keel's face-token gain."""
         return bool(self.region_weights or self.id_loss_weight > 0 or self.attn_localize or self.id_align
                     or self.body_align or (self.optimizer.lower() in KEEL and self.keel_face_gain > 0)
-                    or self.wants_parts() or self.race_prep_regions)
+                    or self.wants_part_maps() or self.race_prep_regions)
 
     def wants_parts(self) -> bool:
         """Region maps carry the parser's parts tensor: Hull's region gains."""
         return self.optimizer.lower() == "hull" and self.hull_regions == "parts"
+
+    def wants_part_maps(self) -> bool:
+        """Region maps carry the parser's parts tensor: Hull's region gains, or the region watch (which, unlike
+        wants_parts, changes nothing about the training step)."""
+        return self.wants_parts() or bool(self.region_watch)
 
     def wants_person_masks(self) -> bool:
         """Person masks in the region maps: the region-weighted loss's person weight, attention localization's

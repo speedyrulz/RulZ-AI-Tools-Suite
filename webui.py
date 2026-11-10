@@ -33,6 +33,7 @@ from rulztrainer.train_queue import TrainQueue
 from rulztrainer.dataset import skipped as dataset_skipped
 from rulztrainer.pictures import to_rgb
 from rulztrainer.losswatch import read_verdicts
+from rulztrainer.regionwatch import describe as region_watch_line
 
 ROOT = Path(__file__).resolve().parent
 os.chdir(ROOT)
@@ -1525,6 +1526,7 @@ class Form:
             loss_watch_improve_tol=float(v("loss_watch_improve_tol")),
             loss_watch_healthy_mult=float(v("loss_watch_healthy_mult")),
             loss_watch_exclude_after=int(v("loss_watch_exclude_after")),
+            region_watch=bool(v("region_watch")),
             training_maps=bool(v("training_maps")), training_maps_images=int(v("training_maps_images") or 3),
             training_maps_every=int(v("training_maps_every") or 0),
             isolation=bool(v("isolation")), isolation_class=s("isolation_class"),
@@ -3962,6 +3964,7 @@ RACE_LABELS = {
     "id_align_weight": "Identity alignment weight", "body_align": "Body alignment",
     "body_align_weight": "Body alignment weight", "likeness_curriculum": "Face/body curriculum",
     "likeness_lr_control": "Likeness lr control", "loss_watch": "Per-image loss watch",
+    "region_watch": "Region watch",
     "per_image_lr": "Per-image learning rate", "lora_rank": "LoRA rank", "lora_alpha": "LoRA alpha",
     "lora_targets": "LoRA layers", "lora_blocks": "LoRA blocks", "lora_dropout": "LoRA dropout",
     "network_type": "Adapter type", "lokr_factor": "LoKr factor", "oft_block_size": "OFT block size",
@@ -8433,6 +8436,14 @@ def build_page(local: bool = True):
                                                                       "(0 = never)", value=d.loss_watch_exclude_after,
                                                                       precision=0).classes("w-96 max-w-full")
                         with fields():
+                            w["region_watch"] = ui.switch("Region watch (observe)", value=d.region_watch).tooltip(
+                                "Splits every training step's loss by the picture's face, hair, skin, clothes and "
+                                "background, and reports once an epoch how much of each region's starting error is "
+                                "gone, and per picture whether its background or clothes are being learned faster "
+                                "than its subject. Costs no extra model calls; changes nothing about training. Needs "
+                                "MediaPipe for the parts maps (built once, before training). Not in a configuration "
+                                "race. New and not yet run in a real training here.")
+                        with fields():
                             w["look_warmup"] = ui.switch("Warm up look outliers", value=d.look_warmup).tooltip(
                                 "Images the look consistency filter (Dataset tab) put under its fence, real but "
                                 "unusual shots such as tight angles and profiles, start at a lower loss weight and "
@@ -9257,6 +9268,22 @@ def build_page(local: bool = True):
                     ], rows=[], row_key="path", pagination=15).props("flat dense").classes("w-full text-xs")
                 lw_exp.visible = False
                 lw_state = {"sig": None}
+                with section("Region watch", "How far each part of the pictures has been learned", "grid_view") as rw_exp:
+                    rw_label = hint("")
+                    hint("Contrast: a picture's background (or clothes) loss against its subject's, relative to its "
+                         "own start. Under 1 = that region is being learned faster than the subject in this picture. "
+                         "One training sample per picture per epoch is a noisy reading, so read it as a trend.")
+                    rw_table = ui.table(columns=[
+                        {"name": "image", "label": "image", "field": "image", "align": "left", "sortable": True},
+                        {"name": "background", "label": "background vs subject", "field": "background",
+                         "sortable": True},
+                        {"name": "clothes", "label": "clothes vs subject", "field": "clothes", "sortable": True},
+                        {"name": "cells", "label": "cells: face / hair / skin / clothes / background",
+                         "field": "cells", "align": "left"},
+                        {"name": "seen", "label": "seen", "field": "seen", "sortable": True},
+                    ], rows=[], row_key="path", pagination=15).props("flat dense").classes("w-full text-xs")
+                rw_exp.visible = False
+                rw_state = {"sig": None}
                 with section("Log and saved files", "train.log and downloads: LoRAs, logs and settings, probe and sample images", "terminal"):
                     job_files = JobFiles()
                     saved_label = ui.label("").classes("rz-mono whitespace-pre-wrap")
@@ -9521,6 +9548,15 @@ def build_page(local: bool = True):
                                          if med is not None else f"Epoch {lw.get('epoch')}: waiting for the first epoch")
                         lw_table.rows = lw.get("rows") or []
                         lw_table.update()
+                rw = st.get("region_watch")
+                if rw:
+                    rw_exp.visible = True
+                    sig = (rw.get("epoch"), rw.get("step"))
+                    if sig != rw_state["sig"]:
+                        rw_state["sig"] = sig
+                        rw_label.text = f"Epoch {rw.get('epoch')} (step {rw.get('step')}): {region_watch_line(rw)}"
+                        rw_table.rows = rw.get("rows") or []
+                        rw_table.update()
                 dup_note = near_duplicate_note(st.get("near_duplicates"))
                 near_dup_label.visible = bool(dup_note)
                 near_dup_label.text = dup_note

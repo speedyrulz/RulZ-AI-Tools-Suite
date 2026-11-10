@@ -35,6 +35,7 @@ from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, d
 from .archs import detect_arch, get_arch
 from .idloss import effective_weight as idloss_weight
 from .losses import elementwise_loss
+from . import regionwatch
 from .race_parallel import RaceParallelMixin
 from .multigpu import (Balancer, choose_counts, clone_to, compile_count, job_order, no_recompile_stance, norm_device,
                        run_queue, stance_available, step_seconds)
@@ -529,6 +530,8 @@ class Trainer(RaceParallelMixin):
         self.ts_strata: TimestepStrata | None = None  # timestep_buckets' deck (a race configuration's own)
         self.item_face_frac: dict[str, float] = {}
         self.loss_watch = None
+        self.region_watch = None  # regionwatch.RegionWatch when region_watch is on
+        self.region_watch_off = ""  # why it cannot run (no parser), when it cannot
         self.curriculum_w: dict[str, float] | None = None
         self.all_items: list = []
         self.sides: list[int] = []
@@ -760,8 +763,16 @@ class Trainer(RaceParallelMixin):
                 except Exception as e:  # noqa: BLE001
                     log.warning("MediaPipe unavailable for person masks (%s); body_loss_weight ignored", e)
             parts_fn = None
+            watching = bool(cfg.region_watch and self.race_rows is None)  # (a race has no region watch)
             if any(c.wants_parts() for c in ([r[1] for r in self.race_rows] if self.race_rows is not None else [cfg])):
                 parts_fn = R.PartsParser(cfg.models_dir, progress=lambda t, f: self.status.update(stage=t))
+            elif watching:
+                try:
+                    parts_fn = R.PartsParser(cfg.models_dir, progress=lambda t, f: self.status.update(stage=t))
+                except Exception as e:  # noqa: BLE001
+                    self.region_watch_off = f"{type(e).__name__}: {str(e)[:200]}"
+                    log.warning("Region watch is off: the picture parser could not start (%s); training goes on "
+                                "without it", self.region_watch_off)
             self.status.update(stage="building region weight maps")
             fns = None
             side = self.side_devices()
@@ -781,7 +792,7 @@ class Trainer(RaceParallelMixin):
                     counts = R.cache_region_maps(ritems, rcfg, self.face_analysis, person_fn,
                                                  progress=lambda i, n: self.status.update(step=i, total=n),
                                                  person_mask_fns=fns,
-                                                 parts_fn=parts_fn if rcfg.wants_parts() else None)
+                                                 parts_fn=parts_fn if rcfg.wants_parts() or watching else None)
                     if rcfg.wants_parts():  # region_weights is refused here: Hull's gains are the only weighting
                         log.info("Region maps ready (new this run): %s; Hull gains body %.2g / background %.2g",
                                  counts, rcfg.hull_gain_body, rcfg.hull_gain_background)
@@ -1198,6 +1209,7 @@ class Trainer(RaceParallelMixin):
         if self.race_rows is None:
             self._enter_stage(self.res_stage, step, initial=True)
             self.loss_watch = self._make_loss_watch(items, optimizer)
+            self.region_watch = self._make_region_watch(items, step)
             true_per_image_lr = (self.loss_watch is not None and cfg.per_image_lr and cfg.batch_size == 1
                                  and cfg.gradient_accumulation == 1 and len(self.replicas) == 1)
             id_w = idloss_weight(cfg.id_loss_weight)
@@ -1289,6 +1301,9 @@ class Trainer(RaceParallelMixin):
             elif use_face or use_hull:
                 taps.stop()
             sq = elementwise_loss(cfg.loss_type, pred, target, latents, noise, sigma)
+            region_obs = None
+            if self.region_watch is not None and regions is not None:  # read before any region weighting
+                region_obs = regionwatch.region_losses(sq, [rm.parts for rm in regions.meta])
             if regions is not None and cfg.region_weights:  # region-weighted loss: face > person > background (mean 1)
                 sq = sq * regions.weight.to(rdev)
             per = sq.mean(dim=(1, 2, 3))
@@ -1317,6 +1332,9 @@ class Trainer(RaceParallelMixin):
                     mults.append(self.loss_watch.multiplier(it.key))
                 if cfg.per_image_lr and not true_per_image_lr:
                     weights = weights * torch.tensor(mults, device=weights.device, dtype=weights.dtype)
+            if region_obs is not None:  # a dropped caption's loss is another quantity: counted, not read
+                self.region_watch.observe([it.key for it in batch], sigma.detach().cpu().tolist(), *region_obs,
+                                          skip=[str(it.text_path) != tp for it, tp in zip(batch, regions.text_paths)])
             if any(it.loss_scale != 1.0 for it in batch):  # LoRA Isolation's side-by-side pairs
                 weights = weights * torch.tensor([it.loss_scale for it in batch], device=weights.device,
                                                  dtype=weights.dtype)
@@ -1586,6 +1604,10 @@ class Trainer(RaceParallelMixin):
                          summary["counts"], summary["median"] or 0.0, summary["active"], summary["total"])
                 self.status.update(loss_watch=summary)
                 self._refresh_batcher_weights()
+            if self.region_watch is not None and self.region_watch.epoch_complete():
+                watched = self.region_watch.end_epoch(step)
+                log.info("Region watch epoch %d: %s", watched["epoch"], regionwatch.describe(watched))
+                self.status.update(region_watch=watched)
             if cfg.save_every > 0 and step % cfg.save_every == 0 and step < cfg.steps:  # 0: the final save only
                 if self.ft is not None and not self._finetune_cycle_done(step):
                     self.ft_pending_save = True  # saved at the end of the cycle: every window trained alike
@@ -2861,6 +2883,21 @@ class Trainer(RaceParallelMixin):
                  cfg.loss_watch_buckets, mode, cfg.loss_watch_exclude_after or "never")
         if watch.active_count() < len(items):
             self._refresh_batcher_weights()
+        return watch
+
+    def _make_region_watch(self, items, step: int):
+        """The region watch (observe only), or None: off, a race, or no parser for the parts maps."""
+        cfg = self.cfg
+        if not cfg.region_watch:
+            return None
+        if self.race_rows is not None:
+            log.info("Region watch is off for a race (its configurations take turns on one model)")
+            return None
+        if self.region_watch_off:
+            return None
+        watch = regionwatch.RegionWatch(items, self.job_dir, resume=bool(cfg.resume_state) and step > 0)
+        log.info("Region watch on: %d pictures, the loss per region read from the training steps (observe only)%s",
+                 len(watch.stats), "; no saved state for this resume, so it counts from here" if watch.late else "")
         return watch
 
     # ------------------------------------------------------------ training resolutions
