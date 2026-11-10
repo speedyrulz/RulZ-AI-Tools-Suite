@@ -234,3 +234,12 @@ def test_the_monitor_names_check_images_and_shows_the_kept_share():
     assert "on-prompt" not in webui.probe_score_line(rec)
     assert webui.probe_score_line({**rec, "prompt_check": {"kept_share": 0.375}}).endswith("| on-prompt 38%")
     assert "on-prompt" not in webui.probe_score_line({**rec, "prompt_check": {"kept_share": None}})  # the step-0 probe
+
+
+def test_likeness_framing_is_on_by_default_and_goes_to_the_page_and_back():
+    plain = _filled_form(TrainConfig(datasets=[{"path": "a"}]))
+    plain.w["datasets"].value = [{"path": "a"}]
+    assert plain.w["likeness_framing"].value is True and plain.to_config().likeness_framing is True
+    off = _filled_form(TrainConfig(likeness_framing=False, datasets=[{"path": "a"}]))
+    off.w["datasets"].value = [{"path": "a"}]
+    assert off.w["likeness_framing"].value is False and off.to_config().likeness_framing is False

@@ -4501,17 +4501,22 @@ class Trainer(RaceParallelMixin):
         if self.controller.normalize:
             log.info("%sProbe step %d: face %s body %s (normalized %s / %s, combined %s) | ema face %s body %s "
                      "(normalized %s / %s, combined %s) | best %s @%s | lr x%.2f | face bias %+.2f (%s)", who, step,
-                     fmt(face), fmt(body), fmt(rec.face_norm), fmt(rec.body_norm), fmt(rec.combined),
+                     fmt(face), fmt(rec.body), fmt(rec.face_norm), fmt(rec.body_norm), fmt(rec.combined),
                      fmt(rec.face_ema), fmt(rec.body_ema), fmt(rec.face_norm_ema), fmt(rec.body_norm_ema),
                      fmt(rec.combined_ema), fmt(rec.best), rec.best_step, rec.lr_factor, rec.face_bias, took)
         else:
             log.info("%sProbe step %d: face %s body %s combined %s | ema face %s body %s combined %s | best %s @%s "
-                     "| lr x%.2f | face bias %+.2f (%s)", who, step, fmt(face), fmt(body), fmt(rec.combined),
+                     "| lr x%.2f | face bias %+.2f (%s)", who, step, fmt(face), fmt(rec.body), fmt(rec.combined),
                      fmt(rec.face_ema), fmt(rec.body_ema), fmt(rec.combined_ema), fmt(rec.best), rec.best_step,
                      rec.lr_factor, rec.face_bias, took)
         if rec.body_missing:  # the framing: a body was asked for and the render shows none to measure
+            counted = ""  # likeness_framing: the lost renders are in the body score
+            if getattr(self.controller, "framing", False):
+                counted = "; renders lost since the first probe count as zero in the body score"
+                if rec.body_measured is not None:
+                    counted += f" ({fmt(rec.body_measured)} on the renders that still show one)"
             log.info("%sBody probe framing step %d: %d of %d renders show no measurable body (a closer framing than "
-                     "the prompt asks for)", who, step, rec.body_missing, rec.body_probes)
+                     "the prompt asks for)%s", who, step, rec.body_missing, rec.body_probes, counted)
         if rec.prompt_check:  # the prompt check: which renders still show the frame their prompt asks for
             from . import promptcheck
 

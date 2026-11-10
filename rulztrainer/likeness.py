@@ -199,6 +199,9 @@ class ProbeRecord:
     # nothing from shoulders to hips: a head-and-shoulders picture where a body was asked for)
     body_probes: int = 0
     body_missing: int = 0
+    # likeness_framing: `body` counts the renders that lost their body as zero; this is what the body scorer measured
+    # on the renders that do show one (None: nothing was lost and nothing capped, the two are the same)
+    body_measured: float | None = None
     # the prompt check (promptcheck.tally): per checked prompt how many renders kept its frame and how many drifted
     # from the step-0 probe's, and the kept / drift share of the prompt that drifted most ({}: nothing was checked)
     prompt_check: dict = field(default_factory=dict)
@@ -209,7 +212,8 @@ class ProbeRecord:
 RESUME_FIELDS = ("floor", "face_ema", "body_ema", "gold_ema", "has_gold", "combined_ema", "arc_combined_ema",
                  "prev_combined", "best", "best_step", "since_improve", "progress", "lr_factor", "face_bias",
                  "n_probes", "last_step", "last_seeds", "stage", "stage_best", "stage_since_improve", "face_best",
-                 "face_drop_count", "id_loss_vetoed", "part_best", "check_ref", "last_drift", "last_kept")
+                 "face_drop_count", "id_loss_vetoed", "part_best", "check_ref", "last_drift", "last_kept",
+                 "body_ref_share")
 
 
 class LikenessController:
@@ -263,6 +267,10 @@ class LikenessController:
         self.check_ref: dict = {}
         self.last_drift: float | None = None
         self.last_kept: float | None = None
+        # likeness_framing: the share of the body probe's renders that showed a measurable body at the first probe
+        # that had any (later probes are counted against it), None until then
+        self.framing = bool(getattr(cfg, "likeness_framing", True))
+        self.body_ref_share: float | None = None
 
     def prompt_check(self, step: int, seeds: dict | None) -> dict:
         """The prompt check of one probe from its renders' frames (seeds["frames"], promptcheck.frame_of per render):
@@ -375,6 +383,32 @@ class LikenessController:
             out.update(gold_seeds=gold, gold_norm_seeds=gold_n)
         return out
 
+    def framed_body(self, body, renders: list):
+        """likeness_framing: the body score with the renders that lost their body counted as zero. `body` is the mean
+        over the renders the body scorer could measure, `renders` their raw scores (None: no measurable body, a
+        head-and-shoulders picture where a body was asked for). A lost render counts as the scale's zero, against the
+        share that showed a body at the first probe (so a prompt or a scorer that only ever measures some of its
+        renders is not marked down for that), and one render's score stops at the scale's top (matching the
+        references better than they match each other is a copy, not more likeness). Without it the few renders that
+        still show a body, or a smoothed score left over from when some did, can set a best checkpoint. Returns
+        `body` itself when the setting is off, when there are no per-render scores, and while nothing was lost."""
+        if not self.framing or not renders:
+            return body
+        measured = [float(v) for v in renders if v is not None]
+        share = len(measured) / len(renders)
+        if self.body_ref_share is None:
+            if not measured:
+                return body  # the body scorer has not measured a render yet: nothing to count against
+            self.body_ref_share = share
+        floor, top = self.scale("body") if self.normalize else (0.0, 100.0)
+        if not measured:
+            return floor
+        rel = min(1.0, share / self.body_ref_share)
+        if rel >= 1.0 and max(measured) <= top:
+            return body
+        mean = sum(min(v, top) for v in measured) / len(measured)
+        return floor + (mean - floor) * rel
+
     def update(self, step: int, face: float | None, body: float | None, images: list[str] | None = None,
                seeds: dict | None = None):
         """Feed one probe result (seeds: its per-seed raw scores, {"face": [...], "body": [...]} and "gold" with the
@@ -395,6 +429,10 @@ class LikenessController:
             self._set_floors(face, body, gold)
         per_seed = self.seed_scores(seeds)
         self.last_seeds = per_seed["combined_seeds"]
+        # likeness_framing: from here on `body` counts the renders that lost their body as zero
+        body_renders = list((seeds or {}).get("body") or [])
+        body_missing = sum(1 for v in body_renders if v is None)
+        body_measured, body = body, self.framed_body(body, body_renders)
         self.face_ema = self._ema(self.face_ema, face)
         self.body_ema = self._ema(self.body_ema, body)
         self.gold_ema = self._ema(self.gold_ema, gold)
@@ -471,10 +509,9 @@ class LikenessController:
                     actions["lr_ratio"] = new / self.lr_factor
                     self.lr_factor = new
             self.prev_combined = arc_comb
-        body_renders = list((seeds or {}).get("body") or [])
-        body_missing = sum(1 for v in body_renders if v is None)
         body_cur = body_n  # the body the curriculum reads
-        if cfg.likeness_curriculum_framing > 0 and body_renders and body_missing:
+        if not self.framing and cfg.likeness_curriculum_framing > 0 and body_renders and body_missing:
+            # (with likeness_framing on the body score already counts them: nothing more to do here)
             # framing: renders without a measurable body count against it, so a body probe that has turned into
             # portraits pulls the curriculum towards the full-body photos instead of leaving it on a stale score
             body_cur = (body_n or 0.0) * (1.0 - cfg.likeness_curriculum_framing * body_missing / len(body_renders))
@@ -492,7 +529,8 @@ class LikenessController:
                           self.best_step, self.since_improve, list(images or []), self.stage, self.stage_best,
                           self.stage_since_improve, self.norm("face", face), self.norm("body", body), face_arc,
                           body_n, self.scale_record() if self.normalize else {}, **per_seed,
-                          body_probes=len(body_renders), body_missing=body_missing, prompt_check=check,
+                          body_probes=len(body_renders), body_missing=body_missing,
+                          body_measured=None if body_measured == body else body_measured, prompt_check=check,
                           best_held=best_held)
         if self.has_gold:
             rec.gold, rec.gold_ema, rec.gold_norm = gold, self.gold_ema, self.norm("gold", gold)
