@@ -285,3 +285,34 @@ def test_trainer_sweeps_only_what_is_asked_and_stays_off_when_it_cannot(tmp_path
     t.cfg.region_sweep_every = 0
     t._setup_sweep(t.cfg, 0)
     assert t.sweep is None and t._split_holdout(t.cfg, items) == items
+
+
+def test_the_monitor_charts_the_sweeps(tmp_path):
+    import webui
+
+    def row(step, train, held):
+        regions = ("face", "hair", "skin", "clothes", "background", "subject")
+        return {"step": step, "train": {c: train for c in regions}, "held": {c: held for c in regions}}
+
+    history = [row(0, 0.0, 0.0), row(50, 0.2, 0.15), row(100, 0.4, 0.2)]
+    series, legend = webui.sweep_chart_series(history, best=[0.2, 100])
+    assert legend[:6] == ["face", "hair", "skin", "clothes", "background", "subject"]
+    assert legend[6:] == [n + " (held-out)" for n in legend[:6]]
+    by = {s["name"]: s for s in series}
+    assert by["face"]["data"] == [[0, 0.0], [50, 20.0], [100, 40.0]]
+    assert by["subject (held-out)"]["data"][-1] == [100, 20.0]
+    assert by["subject (held-out)"]["lineStyle"]["type"] == "dashed" and "type" not in by["face"]["lineStyle"]
+    assert by["subject (held-out)"]["markPoint"]["data"] == [{"coord": [100, 20.0]}]
+    assert by["subject"]["lineStyle"]["width"] > by["face"]["lineStyle"]["width"]
+    # held-out pictures only (region_sweep_pictures -1): no training lines; a region no picture has: no line
+    only = [{"step": 0, "train": {"face": None}, "held": {"face": 0.0, "hair": None}},
+            {"step": 50, "train": {"face": None}, "held": {"face": 0.1, "hair": None}}]
+    assert webui.sweep_chart_series(only)[1] == ["face (held-out)"]
+    assert webui.sweep_chart_series([]) == ([], [])
+    # the status's own list, else the job folder's file (a broken line skipped), else nothing
+    assert webui.sweep_history({"history": history}, tmp_path) == history
+    assert webui.sweep_history({"step": 100}, tmp_path) == []
+    (tmp_path / "region_sweep.jsonl").write_text(json.dumps(history[0]) + "\n{broken\n" + json.dumps(history[1]) + "\n",
+                                                 encoding="utf-8")
+    assert webui.sweep_history({"step": 100}, tmp_path) == history[:2]
+    assert webui.sweep_history(None, tmp_path) == []
