@@ -512,6 +512,7 @@ class Fleet:
         if inst.pop("down", None):
             inst.pop("error", None)
             self.event(st, "instance_up", instance=int(iid))
+        first_look = not inst.get("last_seen")
         inst["last_seen"] = now
         if not inst.get("gpu") and snap.get("gpus"):
             inst["gpu"] = snap["gpus"][0].get("name")
@@ -525,13 +526,18 @@ class Fleet:
             rec, state = known.get(key), line.get("state") or "ended"
             before = json.dumps(rec, sort_keys=True, default=str) if rec else ""
             if rec is None:
+                # a finished run nobody saw running: there before this instance was first looked at (taken into the
+                # history as it is), or started and ended between two looks (a run like any other: it is closed)
+                ours = first_look is False or line.get("job") in (inst.get("pending") or {})
                 rec = {"key": key, "instance": int(iid), "job": line.get("job"), "run_id": line.get("run_id"),
                        "gpu": inst.get("gpu"), "dph": inst.get("dph"), "first_seen": now, "state": state, "fill": True,
-                       "imported": state != "running"}
-                if state == "running":
+                       "imported": state != "running" and not ours}
+                if state == "running" or ours:
                     rec["started"] = now - float(line.get("elapsed") or 0)
                     rec.update((inst.get("pending") or {}).pop(line.get("job"), {}))
                     self.event(st, "run_started", instance=int(iid), job=rec["job"], run=key, group=rec.get("group"))
+                if state != "running" and ours:
+                    self._close(st, rec, state, line)
             elif rec.get("state") == "running" and state != "running":
                 self._close(st, rec, state, line)
             for field in ("step", "total", "avg_loss", "elapsed", "best", "best_step", "error", "modified"):
