@@ -972,8 +972,11 @@ anything, so this suits typical character sets trained for thousands of steps.
 
 ## Region watch (`region_watch`)
 
-**New in 2.49.0 and not yet run in a real training here:** the arithmetic is unit-tested, its readings on a real model
-are not.
+**First run on a real model in November 2026** (a Qwen-Image 2.1 fine-tune, 59 training pictures, 2000 steps). It added
+no measurable time to a step and ranked the regions as the fixed-noise sweeps did (face first, background last), about
+5 points lower. Its numbers jump from epoch to epoch: the background-to-subject ratio was unusable before about step
+900, and per picture it agreed only moderately with the sweeps (correlation 0.47). Take it as a free first look, and
+read the [sweeps](#region-sweeps-and-held-out-photos-experimental) before acting on anything.
 
 `region_watch: true` (Train tab, next to the loss watch) reports how far each part of the training pictures has been
 learned: **face, hair, body skin, clothes and background**. Every training step already has its picture's error per
@@ -1007,9 +1010,23 @@ three pictures. The watch reads every picture from the training steps instead, s
 
 ## Region class weights and region steering (experimental)
 
-**Neither has run in a real training here.** Their arithmetic is unit-tested; their defaults are uncalibrated and no
-benefit is claimed. Both use the parts maps of the [region watch](#region-watch-region_watch) (MediaPipe), are off by
-default, and refuse `hull_regions: parts`.
+**First measured in November 2026, one run each, and neither helped.** The test was a Qwen-Image 2.1 fine-tune with 59
+training pictures and 3 held out, 2000 steps, against the same run without them, read with the
+[sweeps](#region-sweeps-and-held-out-photos-experimental):
+
+- **Class weights** `face=3, hair=1.5, skin=1.5, clothes=0.5, background=0.3` did what they say on the training
+  pictures (face learned 47% against 30%, background 9% against 15%) and made the result worse on the held-out photos:
+  the face ended at 7% against 12%, the gap between training and held-out pictures at 22 points against 16, and the
+  full-body probe lost its framing 200 steps sooner. Likeness on the probes was level. The heavier face weight
+  memorised the training faces faster.
+- **Region steering** at its defaults left every reading within about half a point of the plain run. It was gentle
+  (clothes turned down on 49 of 59 pictures, typically to 0.82; background on 34, typically to 0.91), and a region's
+  loss follows its own weight only weakly. Read from the training steps, the cap rule switched on and off through its
+  first four epochs; `region_steer_signal: sweep` steadied it.
+- **The per-picture rules** had nothing to act on: no picture came near the 0.7 threshold.
+
+No benefit is claimed for either, and the defaults are uncalibrated. Both use the parts maps of the
+[region watch](#region-watch-region_watch) (MediaPipe), are off by default, and refuse `hull_regions: parts`.
 
 **`region_class_weights`** is the plain one: a fixed loss weight per region for the whole run, such as
 `face=3, hair=1.5, skin=1.5, clothes=0.5, background=0.3`. A region left out stays at 1, `0` masks one out, and the
@@ -1052,8 +1069,24 @@ same settings and seed have differed by up to 15 points here, so one run of each
 
 ## Region sweeps and held-out photos (experimental)
 
-**Never run in a real training here.** The arithmetic is unit-tested on a toy model; on a real one it follows the
-training maps' capture, which has run on Krea 2 and Qwen-Image 2.1.
+**Measured in November 2026** on a Qwen-Image 2.1 fine-tune: four 2000-step runs, 59 training pictures, 3 held out. A
+sweep of all 62 pictures took 24 seconds on an RTX 5090.
+
+- **A much quieter reading than the probes.** Three runs that were still training alike read 8.5, 8.4 and 8.2% on the
+  held-out subject at their first sweep; their combined probe scores at that point were 41.9, 31.5 and 38.3.
+- **The held-out photos showed when learning the person stopped.** The held-out subject reached 8.5% by the first sweep
+  (step 236), peaked at 9.0% at step 944 and fell to 5.8% by step 2000, while the training pictures kept improving (9%
+  to 21%). FaceNet on the probes peaked in the same stretch. The combined likeness score chose step 1400 instead, on a
+  body score that by then came from 2 of 8 renders, so `holdout_track_best` kept an earlier checkpoint than the
+  likeness best: compare the two by eye.
+- **`region_steer_holdout` cancelled itself.** Every part overfitted together, so the rule turned all five down by
+  about the same amount (0.78 to 0.87), and with weights rescaled to mean 1 per picture that changes almost nothing.
+  The run ended where the plain one did.
+- **A held-out photo can have a near-duplicate in the training set**, which flatters its reading: compare the held-out
+  names in the log with the start-up near-duplicate list.
+
+One run per setting and three held-out photos: take the sizes as indications. The table is in
+[docs/experimental-test-results.md](docs/experimental-test-results.md).
 
 The region watch reads each picture once an epoch from its own training step, at a random noise level: free, but
 noisy. A **sweep** runs the model again on a picture at three fixed noise levels (0.25, 0.5, 0.75) with fixed noise, so
@@ -1124,14 +1157,17 @@ through the captures. Each map keeps one colour scale across all captures so the
 - *Trigger word* centred on something other than the subject (a logo, a watermark, an object): the trigger is tied
   to that.
 
-**The trigger-off pass (`training_maps_trigger_off`, new and not yet run in a real training here).** Each map picture
+**The trigger-off pass (`training_maps_trigger_off`).** Each map picture
 is also run with the trigger word taken out of its caption (whole words, any case; the caption is otherwise the same),
 with the LoRA on and off. *Where the LoRA acts without the trigger word* shows what the LoRA changes when it was not
 asked for, and the log gives one number per capture, the **bleed**: the mean of that map over the mean of *Where the
 LoRA acts* (`bleed` in `maps.jsonl`). Near 0, the LoRA is tied to its trigger word; near 1, it acts the same whatever
 the caption says, which is how a LoRA ends up changing every person the model draws. It costs two more forward passes
 per picture and noise level, and the trigger-free captions are encoded with the other texts before training. A
-picture whose caption has no trigger word has no such map, and neither has a fine-tune.
+picture whose caption has no trigger word has no such map, and neither has a fine-tune. **In its first real run** (a
+Qwen-Image 2.1 fine-tune, long captions that describe the person) **the bleed stayed at 0.98-0.99 at every noise level
+from start to finish and told nothing:** with the person described in the caption and visible in the noisy picture,
+taking the trigger word out changes almost nothing. Expect it to mean something only with short captions.
 
 Details: the maps use the weight average (`lora_ema`) as samples and probes do, run without gradients in eval mode
 with the RNG put back, and with compiled blocks run eagerly. RulZ Trainer's trigger map normalises over the caption's
@@ -1547,7 +1583,10 @@ keeps it (`body_probes`, `body_missing`). `likeness_curriculum_framing` (0 = off
 training) lets the curriculum read it: a render without a body counts against the body, so a body probe that has
 turned into portraits pulls the sampling towards the full-body photos instead of leaving the curriculum on a stale
 body score. At 1 a probe with no body in any render reads as a body score of 0. It was added after five Qwen-Image
-2.1 runs lost the body probe's framing in this way with nothing reacting to it.
+2.1 runs lost the body probe's framing in this way with nothing reacting to it. On a Qwen-Image 2.1 fine-tune the count
+read 2 of 8 at step 600, 4 at step 1000 and 8 of 8 from step 1600, a thousand steps before the body score itself went
+missing. With most renders gone, the few that are left can lift the combined score (62.5 from 2 renders), so look at
+the count before trusting a late best.
 
 The scores never enter the loss; they steer data, lr and stopping. Use the same reference set and prompts for a
 whole run so the series is comparable.
