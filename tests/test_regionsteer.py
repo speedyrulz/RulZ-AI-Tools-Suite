@@ -203,7 +203,7 @@ def test_config_checks_the_region_settings():
     assert cfg.wants_region_watch() and cfg.wants_part_maps() and not cfg.wants_parts()
     assert cfg.region_steer_settings() == {"regions": ("background", "clothes"), "cap": 0.6, "ahead": 0.7,
                                            "boost": 0.0, "prior": 0.0, "holdout": 0.0, "signal": "steps",
-                                           "min": 0.3, "step": 0.2, "strength": 1.0}
+                                           "subject_ahead": 0.0, "min": 0.3, "step": 0.2, "strength": 1.0}
     assert TrainConfig().region_steer_settings() is None
     assert TrainConfig(region_steer=True, region_steer_regions="clothes").region_steer_list() == ("clothes",)
     for bad in (dict(region_steer_regions="face"), dict(region_steer_regions=""), dict(region_steer_cap=3.0),
@@ -330,3 +330,45 @@ def test_config_checks_the_sweep_and_holdout_settings():
                 dict(region_steer=True, region_steer_holdout=1.0, holdout_images=2)):
         with pytest.raises(ValueError):
             TrainConfig(**bad).validate_region_actions()
+
+
+def test_subject_ahead_turns_one_picture_down_by_the_sweeps(tmp_path):
+    watch, items, rng, state = _watch(tmp_path, cap=0.0, ahead=0.0, subject_ahead=0.7)
+    flat = lambda i, e: {}  # noqa: E731
+    _run(watch, items, 3, flat, rng, state)
+    assert not watch.steering  # no sweeps yet: nothing to compare
+    # by the sweeps picture 2 has learned 80% of its face where the others have learned 30%
+    learned = {it.key: {"face": 0.8 if i == 2 else 0.3, "hair": 0.3, "background": 0.9} for i, it in enumerate(items)}
+    watch.set_sweep({}, learned=learned)
+    summary = _run(watch, items, 1, flat, rng, state)
+    assert watch.stats[items[2].key].gain == {"face": pytest.approx(0.8)}  # a step at a time
+    summary = _run(watch, items, 12, flat, rng, state)
+    # 20% of its error left against a median of 70%: under half, so the share is held at the spread, 0.5 / 0.7
+    assert watch.stats[items[2].key].gain == {"face": pytest.approx((0.5 / 0.7) ** 2, abs=0.01)}
+    assert all(not watch.stats[it.key].gain for i, it in enumerate(items) if i != 2)  # nobody else, no other region
+    assert summary["steer"]["face"] == {"lowered": 1, "lowest": pytest.approx((0.5 / 0.7) ** 2, abs=0.01)}
+    assert summary["steer"]["hair"]["lowered"] == 0 and "background" in summary["steer"]
+    assert "steering: face turned down on 1 pictures" in RW.describe(summary)
+    assert summary["rows"] and any(r["weights"].startswith("face x0.") for r in summary["rows"])
+    assert watch.gains([items[2].key]) == [{"face": pytest.approx((0.5 / 0.7) ** 2, abs=0.01)}]
+    # the others catch up: the weight returns
+    watch.set_sweep({}, learned={it.key: {"face": 0.8} for it in items})
+    _run(watch, items, 12, flat, rng, state)
+    assert not watch.steering
+    # too few swept pictures to call one of them ahead
+    few, items2, rng2, state2 = _watch(tmp_path / "few", cap=0.0, ahead=0.0, subject_ahead=0.7)
+    few.set_sweep({}, learned={items2[i].key: {"face": 0.9 if i == 0 else 0.1} for i in range(3)})
+    _run(few, items2, 4, flat, rng2, state2)
+    assert not few.steering
+
+
+def test_config_checks_the_subject_ahead_rule():
+    ok = TrainConfig(region_steer=True, region_steer_cap=0, region_steer_ahead=0, region_steer_subject_ahead=0.7,
+                     region_sweep_every=1)
+    ok.validate_region_actions()
+    assert ok.region_steer_settings()["subject_ahead"] == 0.7
+    for bad in (dict(region_steer_subject_ahead=0.7),  # no sweeps to read
+                dict(region_steer_subject_ahead=0.7, holdout_images=2, region_sweep_pictures=-1),
+                dict(region_steer_subject_ahead=1.0, region_sweep_every=1)):
+        with pytest.raises(ValueError):
+            TrainConfig(region_steer=True, **bad).validate_region_actions()

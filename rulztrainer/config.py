@@ -655,6 +655,9 @@ class TrainConfig:
     region_steer_strength: float = 1.0  # how hard a rule pulls: the weight aimed for is (share within limit) ^ (2 x this)
     region_steer_signal: str = "steps"  # what the cap rule's per-picture share and the ahead rule read: steps (the
     #                                     training steps' own, noisy) | sweep (the fixed-noise sweeps')
+    region_steer_subject_ahead: float = 0.0  # per-picture rule, needs sweeps of the training pictures: a picture's
+    #                                          face / hair / skin with less than this x the median picture's error
+    #                                          left (0.7, say) is turned down in that picture; 0 = off
     region_steer_holdout: float = 0.0  # cohort rule, needs holdout_images: a region learned this much further on the
     #                                    training pictures than on the held-out ones (0.15, say), and no longer
     #                                    improving on those, is turned down in every picture; 0 = off
@@ -999,8 +1002,11 @@ class TrainConfig:
         if self.region_steer_signal == "sweep" and (not self.wants_region_sweep() or self.region_sweep_pictures < 0):
             raise ValueError("region_steer_signal sweep reads the sweeps of the training pictures: set "
                              "region_sweep_every (and region_sweep_pictures 0 or more)")
-        if not 0.0 <= self.region_steer_holdout < 1.0:
-            raise ValueError("region_steer_holdout must be 0 (off) to under 1")
+        if not 0.0 <= self.region_steer_holdout < 1.0 or not 0.0 <= self.region_steer_subject_ahead < 1.0:
+            raise ValueError("region_steer_holdout and region_steer_subject_ahead must be 0 (off) to under 1")
+        if self.region_steer_subject_ahead > 0 and (not self.wants_region_sweep() or self.region_sweep_pictures < 0):
+            raise ValueError("region_steer_subject_ahead reads the sweeps of the training pictures: set "
+                             "region_sweep_every (and region_sweep_pictures 0 or more)")
         if self.region_steer_holdout > 0 and (self.holdout_images <= 0 or self.region_sweep_pictures < 0):
             raise ValueError("region_steer_holdout compares training pictures with held-out ones: set holdout_images "
                              "and sweep the training pictures too (region_sweep_pictures 0 or more)")
@@ -1019,9 +1025,9 @@ class TrainConfig:
         if self.region_steer_prior > 0 and self.finetune:
             raise ValueError("region_steer_prior needs an adapter to switch off: not with a full fine-tune")
         if not (self.region_steer_cap > 0 or self.region_steer_ahead > 0 or self.region_steer_boost > 0
-                or self.region_steer_holdout > 0):
+                or self.region_steer_holdout > 0 or self.region_steer_subject_ahead > 0):
             raise ValueError("region_steer has every rule at 0: set region_steer_cap, region_steer_ahead, "
-                             "region_steer_boost or region_steer_holdout")
+                             "region_steer_boost, region_steer_holdout or region_steer_subject_ahead")
         if not 0.0 <= self.region_steer_min < 1.0:
             raise ValueError("region_steer_min must be 0 to under 1")
         if not 0.0 < self.region_steer_step <= 0.5 or not 0.0 < self.region_steer_strength <= 4.0:
@@ -1336,6 +1342,7 @@ class TrainConfig:
         return {"regions": self.region_steer_list(), "cap": self.region_steer_cap, "ahead": self.region_steer_ahead,
                 "boost": self.region_steer_boost, "prior": self.region_steer_prior,
                 "holdout": self.region_steer_holdout, "signal": self.region_steer_signal,
+                "subject_ahead": self.region_steer_subject_ahead,
                 "min": self.region_steer_min, "step": self.region_steer_step, "strength": self.region_steer_strength}
 
     def wants_person_masks(self) -> bool:

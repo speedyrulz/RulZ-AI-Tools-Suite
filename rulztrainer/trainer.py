@@ -3023,7 +3023,8 @@ class Trainer(RaceParallelMixin):
                                          "history": [{k: r[k] for k in ("step", "train", "held")}
                                                      for r in self.sweep.history[-200:]]})
         if self.region_watch is not None:
-            self.region_watch.set_sweep(self.sweep.contrasts(), row["gap"], row["flat"])
+            self.region_watch.set_sweep(self.sweep.contrasts(), row["gap"], row["flat"],
+                                        learned=regionsweep.learned_by_picture(self.sweep))
         if row["new_best"] and cfg.holdout_track_best:
             self._save_holdout_best(injected, step, row["best"][0])
         if row["stop"]:
@@ -3064,6 +3065,7 @@ class Trainer(RaceParallelMixin):
             (f"cap {steer['cap']:g}", steer["cap"] > 0), (f"ahead {steer['ahead']:g}", steer["ahead"] > 0),
             (f"boost {steer['boost']:g}", steer["boost"] > 0), (f"prior {steer['prior']:g}", steer["prior"] > 0),
             (f"holdout {steer['holdout']:g}", steer["holdout"] > 0),
+            (f"subject ahead {steer['subject_ahead']:g}", steer["subject_ahead"] > 0),
             ("reading the sweeps", steer["signal"] == "sweep")) if on]
         log.info("Region watch on: %d pictures, the loss per region read from the training steps (%s)%s",
                  len(watch.stats),
