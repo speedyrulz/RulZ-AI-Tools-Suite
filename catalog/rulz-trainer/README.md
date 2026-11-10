@@ -1978,7 +1978,8 @@ weights, with and without the OFT constraint). diffusers has no loader for eithe
   and, with a constraint, `<stem>.alpha` (ComfyUI reads it as that cap). Rank, alpha, LoRA+ and DoRA do not apply.
   Measured here: the one confirmed gain on Krea 2 at lr 1e-4, but on Qwen-Image 2.1 at the same lr it overtrained
   with adamw8bit and with Muon (fast early gains, then face likeness below the untrained model's, training-photo
-  backgrounds in the probes, copy over 0.6 by step 200). On Qwen-Image 2.1 start lower or with `oft_constraint`
+  backgrounds in the probes, copy over 0.6 by step 200). At 5e-5 it held the face and was the only run that kept
+  the full-body framing, second to Keel on likeness: on Qwen-Image 2.1 use about half Krea 2's lr
   ([test results](docs/experimental-test-results.md#qwen-image-21-optimizers-and-oft)).
 - **DoRA** (weight-decomposed LoRA, on a LoRA or a LoKr). The merged weight is W' = (W + delta) * m / ||W + delta||
   per input column: the adapter steers the direction, and a magnitude m per input channel trains on its own (it
