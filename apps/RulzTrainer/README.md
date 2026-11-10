@@ -1586,7 +1586,9 @@ body score. At 1 a probe with no body in any render reads as a body score of 0. 
 2.1 runs lost the body probe's framing in this way with nothing reacting to it. On a Qwen-Image 2.1 fine-tune the count
 read 2 of 8 at step 600, 4 at step 1000 and 8 of 8 from step 1600, a thousand steps before the body score itself went
 missing. With most renders gone, the few that are left can lift the combined score (62.5 from 2 renders), so look at
-the count before trusting a late best.
+the count before trusting a late best. The
+[prompt check](#probe-prompt-presets-and-the-prompt-check) counts the same drift against the step-0 probe, for any
+probe prompt, and `likeness_best_min_kept` holds such a best back.
 
 The scores never enter the loss; they steer data, lr and stopping. Use the same reference set and prompts for a
 whole run so the series is comparable.
@@ -2000,6 +2002,105 @@ It uses the run's model, references and probe settings; each seed costs a face a
 **Probe noise check** section (Train tab) takes the files and runs it on Start. `python -m rulztrainer.likeness_stats
 <job folder>` gives the same numbers, as an upper bound, from any run's own probes when they have 2 or more seeds.
 
+## Probe prompt presets and the prompt check
+
+**New in 3.2.0.** The check itself was set and verified on the probe renders of real runs (the table in
+[docs/experimental-test-results.md](docs/experimental-test-results.md)); the two settings that act on it,
+`likeness_best_min_kept` and `race_drop_drift`, are unit-tested only and have not decided a real run yet.
+
+A LoRA that overtrains on its photos' framing stops following the prompt: a full-body prompt comes back as a
+head-and-shoulders portrait. The likeness scores do not see that, since a closer face scores no worse. The **prompt
+check** does. It reads the framing of every probe render from what the scorers already find in it, the face scorer's
+face boxes and the body scorer's pose landmarks, and sorts the render into one of three frames:
+
+| Frame | What the render shows |
+| --- | --- |
+| `headshot` | a close face: the largest face is at least 34% of the picture's height |
+| `full` | the body at least down to the hips (both hips in the picture), with a face of at most 24% of the height |
+| `upper` | in between: waist-up, bust |
+
+`full` does not ask for the feet. The models draw a "full body" prompt from head to thigh as often as from head to
+toe, and knees and ankles come and go with the pose, so they would report drift where the framing has not changed. A
+second face of comparable size never keeps a one-person prompt. Without a body scorer the face's size alone decides,
+without a face scorer the hips do; a render with neither a face nor a pose counts as unclear.
+
+**Drift is counted against the base model, not against the words.** The step-0 probe of the same prompt and seed is
+the reference. A render that showed its prompt's frame at step 0 and does not now has *drifted*. A seed the base
+model itself got wrong is left out, so a prompt the base model ignores cannot count against the LoRA. With
+`probe_at_start` off there is no reference and the count is kept / not kept. The log says, per probe:
+
+```
+Prompt check step 1400: face probe 8/8 kept; body probe 2/8 kept (6 drifted) | drift 75% (the body probe, the one that drifted most)
+```
+
+The **drift share** is that of the prompt that drifted most, not of all renders pooled: a face probe that stays a
+headshot must not halve the drift of a body probe that has turned into portraits. `likeness.jsonl` keeps the counts
+per prompt (`prompt_check`), the Monitor shows the kept share next to the scores (`on-prompt 25%`), and the race table
+has an *Off-prompt now* column.
+
+**What each probe should show** (`probe_face_expect`, `probe_body_expect`; Train tab, under the probe prompts): empty
+guesses from the prompt's words (full-body, head to toe, waist-up, headshot, close-up...), `none` switches the check
+off for that probe, or name the frame. A prompt whose frame is not known is not read and costs nothing. The check
+adds a face detection and a pose detection per body render: about 0.3 s a render on a CPU, less on a GPU.
+
+**Preset prompts for a character LoRA.** The Train tab has a preset list beside each probe prompt. Picking one writes
+the prompt into the field with your trigger word and the **subject** (`probe_subject`, a few words such as "a young
+woman with long dark brown hair"; empty = the dataset's class from LoRA Isolation, else "a person") and sets what it
+should show. The prompt stays editable.
+
+| Preset | Probe | Shows |
+| --- | --- | --- |
+| `portrait_plain` Portrait, plain background (classic) | face | headshot |
+| `standing_plain` Standing, plain background (classic) | body | full |
+| `headshot_neutral` Headshot, neutral, studio | face | headshot |
+| `headshot_outdoor` Headshot, three-quarter view, outdoors | face | headshot |
+| `full_studio` Full body, standing, studio | body | full |
+| `full_walking` Full body, walking outdoors | body | full |
+| `full_sitting` Full body, sitting indoors | body | full |
+| `upper_cafe` Waist-up, at a cafe table | body | upper |
+
+The two classic ones are the identity recipe's prompts, unchanged. The others are long natural-language prompts, the
+way the current models are captioned, and name plain everyday clothes. Changing a probe prompt changes what the
+likeness score measures, so keep one pair for runs you want to compare.
+
+**Extra prompts to check (`probe_checks`).** Presets (or prompts of your own) rendered at every probe and read by the
+check, **without entering the likeness score**, so its scale stays as it is. They cover poses and framings the two
+likeness prompts do not: a LoRA can keep a sitting full-body prompt and lose a walking one. Each costs
+`probe_check_seeds` (4) renders per probe, on the first of the probe seeds. In the config file an entry is a preset
+key or a mapping:
+
+```yaml
+probe_subject: a young woman with long dark brown hair
+probe_checks:
+  - full_walking
+  - upper_cafe
+  - {name: beach, prompt: "tok, a full-body photo of a woman on a beach", expect: full, kind: body}
+probe_check_seeds: 4
+```
+
+`kind` is the probe it renders like (`face`: square, `body`: 2:3 portrait). The images are saved with the probes as
+`step000600_check-full_walking_0.png`. The copy check keeps reading the likeness renders alone.
+
+**Acting on it (both experimental, off by default, unit-tested only):**
+
+- **`likeness_best_min_kept`** (0 = off; try 0.5): a probe at which less than this share of the renders keep their
+  frame cannot set a new best checkpoint, overall, face or body. It was added because the best landed late on a body
+  score taken from the 2 renders of 8 that still showed a body.
+- **`race_drop_drift`** (0 = off; try 0.5) with `race_drop_drift_probes` (2): in a
+  [configuration race](#configuration-race-race), a configuration whose drift share is at or over the threshold for
+  that many of its own probes in a row leaves at the end of the round. The last one never leaves; when every one left
+  is over it, the least drifted stays. A dropped one cannot win on an earlier best score. Not in a relay race.
+
+**Racing seeds for prompt adherence.** How well a LoRA keeps following the prompt turned out to depend on the training
+seed: with nothing else changed, one seed lost every full-body render by step 1600 and another kept all eight. To let
+the trainer choose, race seeds (`race_configs: [{name: s1, seed: 1}, {name: s2, seed: 2}]`), turn `race_drop_lowest`
+off (score gaps between seeds are mostly noise) and set `race_drop_drift: 0.5`. The drift showed late in those runs
+(from step 1200 of 2000), so expect the race to cost most of a second run.
+
+**Limits.** The check sees framing and the number of faces. It does not see clothing, setting, pose or expression.
+Its thresholds come from one model family and one dataset. With 1 probe seed a prompt's drift is 0 or 100%: use 4 or
+more `probe_seeds` before acting on it.
+
 ## Likeness reward fine-tuning (`reward_steps`)
 
 An optional second stage after the regular steps that trains on likeness itself, after Flow-GRPO (Liu et al., NeurIPS
@@ -2118,6 +2219,14 @@ log says which (`b is out (lowest, below a by 4.2 points over 6 paired seeds, p 
 With 1 probe seed the test needs 3 rounds of evidence; 2 or more `probe_seeds` decide sooner. 0 (the default) drops
 the lowest smoothed score however small the gap. A close call costs a round of every remaining configuration's steps,
 which the step estimate does not count.
+
+**A configuration that leaves the prompt (`race_drop_drift`, experimental).** With the
+[prompt check](#probe-prompt-presets-and-the-prompt-check) reading the probes, `race_drop_drift: 0.5` drops a
+configuration whose renders have left their prompt's frame in at least half of the prompt that drifted most, for
+`race_drop_drift_probes` (2) of its own probes in a row, after the warm-up. The last one never leaves, and when every
+one left is over the threshold the least drifted stays. A round that drops for drift drops nobody for the score as
+well, and a configuration dropped this way cannot win on an earlier best score. It works with `race_drop_lowest` on or
+off; for seed rows turn it off. Unit-tested only.
 
 **Slow starters (`race_patience_drop`, `race_drop_lowest`).** Dropping the lowest each round cuts a setting that learns
 slowly but would end higher. With `race_patience_drop: true` a configuration leaves as soon as its own probes have not
@@ -3290,6 +3399,7 @@ rulztrainer/
   compiling.py     torch.compile settings, the compile_model auto rule, compile stats, the compile cache file
   profiling.py     one-step GPU profile by kernel group (RULZ_PROFILE_STEP), peak RAM, memory snapshots
   race.py          configuration race: settings, round schedule, swapping configurations' LoRAs
+  promptcheck.py   probe prompt presets, and the prompt check: a probe render's frame against its prompt's
   train.py         CLI entry point
   moss/model.py    MOSS-Image DiT (vendored, Apache-2.0, OpenMOSS)
   moss/loading.py  download + load (HF layout or single files), quant dispatch, encode helpers

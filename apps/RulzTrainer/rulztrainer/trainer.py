@@ -835,7 +835,10 @@ class Trainer(RaceParallelMixin):
         cfg = self.cfg
         prompts = list(cfg.sample_prompts) + ([self.negative_prompt()] if cfg.sample_prompts else [])
         if cfg.probe_every > 0:
+            from . import promptcheck
+
             prompts += [p for p in (cfg.probe_face_prompt, cfg.probe_body_prompt) if p] + [self.negative_prompt()]
+            prompts += [c.prompt for c in promptcheck.extra_checks(cfg)]  # probe_checks: rendered, never scored
         if cfg.reward_steps > 0:
             prompts += list(cfg.reward_prompts) + [self.negative_prompt()]
         if cfg.selftrain:
@@ -2300,7 +2303,12 @@ class Trainer(RaceParallelMixin):
         sched = race_mod.RaceSchedule([v.name for v in variants], base.race_warmup_probes, base.race_drop_lowest,
                                       base.race_patience if base.race_patience_drop else 0, base.steps,
                                       follow=base.race_follow, rising=base.race_patience_rising,
-                                      confidence=base.race_drop_confidence, max_close=base.race_max_close_rounds)
+                                      confidence=base.race_drop_confidence, max_close=base.race_max_close_rounds,
+                                      drift=base.race_drop_drift, drift_probes=base.race_drop_drift_probes)
+        if sched.drift > 0:
+            log.info("Race: a configuration whose probes leave their prompts' frame (prompt check drift at or over "
+                     "%.0f%%) for %d of its own probes in a row is dropped; the last one never is",
+                     100 * sched.drift, sched.drift_probes)
         self.race = race_mod.RaceRun(variants, sched, wrappers, base, est)
         if self.race_parallel:  # every configuration trains on its own parameters (race_parallel.py)
             self.race.active = variants[0]
@@ -2431,7 +2439,7 @@ class Trainer(RaceParallelMixin):
                                   c.last_step if c is not None else v.state.get("step"),
                                   best=c.best if c is not None else None, best_step=c.best_step if c is not None else None,
                                   since_improve=c.since_improve if c is not None else None,
-                                  seeds=getattr(c, "last_seeds", None))
+                                  seeds=getattr(c, "last_seeds", None), drift=getattr(c, "last_drift", None))
 
     def _race_decide(self) -> None:
         """At the end of a race that keeps every configuration's chance (patience drops, or no lowest drops): the
@@ -2519,7 +2527,9 @@ class Trainer(RaceParallelMixin):
             lora_mod.save_lora(v.view(use_average=True), path, metadata=meta, dtype=cfg.lora_save_dtype,
                                fmt=self.arch.lora_format)
         why = (" (by hand)" if v.idx in sched.manual else
-               f" ({sched.patience} probes without improvement)" if v.idx in sched.stale else "")
+               f" ({sched.patience} probes without improvement)" if v.idx in sched.stale else
+               f" (its probes left their prompts' frame {sched.drift_probes} probes in a row)"
+               if v.idx in sched.drifted else "")
         if finished:
             log.info("Race: %s finished its %d steps in round %d -> %s", v.name, v.state.get("step", 0),
                      sched.dropped[v.idx], path.name)
@@ -2585,6 +2595,8 @@ class Trainer(RaceParallelMixin):
                 continue
             out["face"][v.name] = [c.norm("face", c.face_ema), c.face_ema]
             out["body"][v.name] = [c.norm("body", c.body_ema), c.body_ema]
+        # the prompt check's latest drift share per configuration (None: nothing counted)
+        out["prompt_drift"] = {v.name: getattr(v.state.get("controller"), "last_drift", None) for v in rr.variants}
         out["settings"] = {v.name: race_mod.format_overrides(v.overrides) for v in rr.variants}
         out["estimate"] = rr.estimate
         return out
@@ -3189,6 +3201,12 @@ class Trainer(RaceParallelMixin):
         cfg.sample_prompts = [iso.fuse(p, rules) for p in cfg.sample_prompts]
         cfg.probe_face_prompt = iso.fuse(cfg.probe_face_prompt, rules)
         cfg.probe_body_prompt = iso.fuse(cfg.probe_body_prompt, rules)
+        if cfg.probe_checks:  # the extra prompts of the prompt check, written out so the fused words stay in them
+            from . import promptcheck
+
+            cfg.probe_checks = [{**row, "prompt": iso.fuse(row["prompt"], rules)} for row in
+                                promptcheck.normalize_checks(cfg.probe_checks, cfg.trigger_word,
+                                                             promptcheck.subject_of(cfg))]
         cfg.reward_prompts = [iso.fuse(p, rules) for p in cfg.reward_prompts]
         cfg.selftrain_prompts = [iso.fuse(p, rules) for p in cfg.selftrain_prompts]
         self.isolation = subjects
@@ -4278,11 +4296,14 @@ class Trainer(RaceParallelMixin):
         finally:
             for sl in slots:
                 lora_mod.set_extras_enabled(sl.model, False)
-        face, body, seeds = self._score_probe(jobs, images, step)
+        face, body, seeds = self._score_probe(jobs, images, step, check=not tag and n_seeds is None)
         return face, body, images, seeds
 
     def _probe_jobs(self, step: int, tag: str = "", n_seeds: int | None = None, n_slots: int = 1) -> list:
-        """The probe's RenderJobs: each enabled kind (face / body) with a scorer, one per seed."""
+        """The probe's RenderJobs: each enabled kind (face / body) with a scorer, one per seed; then the extra prompts
+        of the prompt check (probe_checks), which are rendered and looked at but never scored. A probe with a tag or
+        its own seed count (the soup's base, the noise check) renders the likeness prompts alone."""
+        from . import promptcheck
         from .likeness import probe_body_size, probe_seed_count
 
         cfg = self.cfg
@@ -4307,10 +4328,54 @@ class Trainer(RaceParallelMixin):
                                       out_dir / f"{self._image_prefix()}{tag or f'step{step:06d}'}_{kind}_{k}.png",
                                       f"probe {kind} seed {k + 1}/{n} at step {step}" if n_slots == 1
                                       else f"probe {kind} seed {k + 1}/{n}", kind))
+        if tag or n_seeds or (self.face_scorer is None and self.body_scorer is None):
+            return jobs
+        n = max(1, int(cfg.probe_check_seeds))
+        for c in promptcheck.extra_checks(cfg):
+            w, h = (cfg.probe_size, cfg.probe_size) if c.kind == "face" else probe_body_size(cfg.probe_size)
+            for k in range(n):
+                jobs.append(RenderJob(c.prompt, w, h, cfg.probe_steps, cfg.probe_cfg, cfg.probe_seed + k,
+                                      out_dir / f"{self._image_prefix()}step{step:06d}_check-{c.name}_{k}.png",
+                                      f"prompt check {c.name} seed {k + 1}/{n} at step {step}" if n_slots == 1
+                                      else f"prompt check {c.name} seed {k + 1}/{n}", f"check:{c.name}"))
         return jobs
 
-    def _score_probe(self, jobs: list, images: list[str], step: int):
-        """Score a probe's rendered images: (face, body, seeds) as _probe_with returns them."""
+    def _probe_frame(self, path, expect: str) -> dict | None:
+        """One probe render's frame for the prompt check (promptcheck.frame_of), from the scorers that are there: the
+        face scorer's boxes (the ones its score was just taken from, when it scored this render) and the body
+        scorer's pose landmarks. A headshot needs the face alone. None when nothing can be told; never raises (a
+        probe must not fail on the check)."""
+        from . import promptcheck
+        from .facesim import image_size
+
+        try:
+            size = image_size(path)
+            faces = pose = None
+            if self.face_scorer is not None and hasattr(self.face_scorer, "boxes"):
+                faces = self.face_scorer.boxes(path)
+            source = getattr(self.body_scorer, "pose", self.body_scorer)  # the anchored scorers keep the pose model
+            if (expect != "headshot" or faces is None) and hasattr(source, "landmarks"):
+                found = source.landmarks(path)
+                if found is not None:
+                    scale = max(size) / 1536.0 if max(size) > 1536 else 1.0  # landmarks are found on a 1536 thumbnail
+                    pose = (found[0] * scale, found[1])
+            if faces is None and pose is None:
+                return None
+            return promptcheck.frame_of(size, faces, pose)
+        except Exception as e:  # noqa: BLE001
+            if not getattr(self, "_frame_warned", False):
+                self._frame_warned = True
+                log.warning("Prompt check: could not read a probe render's framing (%s: %s); such renders count as "
+                            "unclear. This warning shows once", type(e).__name__, e)
+            return None
+
+    def _score_probe(self, jobs: list, images: list[str], step: int, check: bool = True):
+        """Score a probe's rendered images: (face, body, seeds) as _probe_with returns them. check: also read each
+        checked prompt's renders for the prompt check, into seeds["frames"] ({prompt name: [frame per seed]})."""
+        from . import promptcheck
+
+        specs = {c.name: c for c in promptcheck.checks(self.cfg)} if check else {}
+        frames: dict[str, list] = {}
         seeds: dict[str, list] = {"face": [], "body": []}
         gold = self.face_scorer is not None and getattr(self.face_scorer, "gold", None) is not None
         if gold:
@@ -4324,8 +4389,13 @@ class Trainer(RaceParallelMixin):
                 seeds["face"].append(sc.percent)
                 if gold:
                     seeds["gold"].append(sc.gold_percent)
-            else:
+            elif job.kind == "body":
                 seeds["body"].append(self.body_scorer.score(p)[0])
+            spec = specs.get(job.kind[6:] if job.kind.startswith("check:") else job.kind)
+            if spec is not None and spec.expect:
+                frames.setdefault(spec.name, []).append(self._probe_frame(p, spec.expect))
+        if any(f is not None for group in frames.values() for f in group):
+            seeds["frames"] = frames
         face_scores = [v for v in seeds["face"] if v is not None]
         body_scores = [v for v in seeds["body"] if v is not None]
         face = sum(face_scores) / len(face_scores) if face_scores else None
@@ -4421,7 +4491,8 @@ class Trainer(RaceParallelMixin):
         now = step if now is None else now
         self.last_probe = (face, body, images, seeds)
         rec, actions = self.controller.update(step, face, body, images, seeds)
-        copy_note = self._copy_probe(rec, images)
+        # the copy check reads the likeness renders alone, so its number does not depend on the extra prompts
+        copy_note = self._copy_probe(rec, [p for p in images if "_check-" not in Path(p).name])
         append_record(self.job_dir, rec)
         fmt = lambda v: "n/a" if v is None else f"{v:.1f}%"  # noqa: E731
         who = f"[{self.race.active.name}] " if self._race_running() else ""
@@ -4441,6 +4512,14 @@ class Trainer(RaceParallelMixin):
         if rec.body_missing:  # the framing: a body was asked for and the render shows none to measure
             log.info("%sBody probe framing step %d: %d of %d renders show no measurable body (a closer framing than "
                      "the prompt asks for)", who, step, rec.body_missing, rec.body_probes)
+        if rec.prompt_check:  # the prompt check: which renders still show the frame their prompt asks for
+            from . import promptcheck
+
+            log.info("%sPrompt check step %d: %s", who, step, promptcheck.describe(rec.prompt_check))
+        if rec.best_held:
+            log.info("%sBest checkpoint held back at step %d: %.0f%% of the probe's renders keep their prompt's "
+                     "frame, under likeness_best_min_kept %.0f%%", who, step, 100 * (self.controller.last_kept or 0.0),
+                     100 * cfg.likeness_best_min_kept)
         if self.controller.has_gold:
             arc, gold = rec.face_norm_ema if self.controller.normalize else rec.face_ema, rec.gold_norm_ema
             log.info("%sGold face (FaceNet) step %d: %s (normalized %s) | ema %s vs ArcFace %s%s%s", who, step,

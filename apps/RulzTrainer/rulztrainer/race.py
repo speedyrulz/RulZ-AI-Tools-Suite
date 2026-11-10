@@ -220,6 +220,9 @@ def validate(cfg) -> None:
     if getattr(cfg, "race_patience_drop", False) and int(cfg.race_patience) < 1:
         raise ValueError("race_patience must be 1 or more (probes without improvement before a configuration leaves)")
     follow = bool(getattr(cfg, "race_follow", False))
+    if follow and float(getattr(cfg, "race_drop_drift", 0.0) or 0.0) > 0:
+        raise ValueError("a relay race (race_follow) keeps every configuration to the last round: set race_drop_drift "
+                         "to 0")
     if follow:
         if getattr(cfg, "race_parallel", False):
             raise ValueError("a relay race (race_follow) takes turns on the GPUs: turn race_parallel off")
@@ -307,8 +310,17 @@ class RaceSchedule:
 
     def __init__(self, names: list[str], warmup: int, drop_lowest: bool = True, patience: int = 0,
                  total_steps: int | None = None, follow: bool = False, rising: bool = False,
-                 confidence: float = 0.0, max_close: int = 3):
+                 confidence: float = 0.0, max_close: int = 3, drift: float = 0.0, drift_probes: int = 2):
         self.names = list(names)
+        # drift > 0 (race_drop_drift): a configuration whose probes have left their prompts' frame (the prompt check's
+        # drift share at or above it) for drift_probes of its own probes in a row leaves at the end of that round,
+        # after the warm-up. When every one left is over it, the least drifted stays. It cannot win afterwards
+        # (decide), whatever its best score was: it is out for what its LoRA does, not for being behind
+        self.drift = 0.0 if follow else max(0.0, float(drift))
+        self.drift_probes = max(1, int(drift_probes))
+        self.drift_last: dict[int, float | None] = {}  # each configuration's latest drift share
+        self.drift_run: dict[int, int] = {}  # its probes in a row at or above the threshold
+        self.drifted: set[int] = set()  # left for drift
         # confidence > 0: the lowest is dropped only when a paired test on the shared probe seeds puts it below the
         # round leader with this confidence; max_close undecided rounds in a row (or its steps used up) drop it anyway
         self.confidence = max(0.0, float(confidence))
@@ -367,16 +379,21 @@ class RaceSchedule:
         return [] if self.done else list(self.pending[:max(1, int(slots))])
 
     def record(self, idx: int, score: float | None, step: int | None = None, best: float | None = None,
-               best_step: int | None = None, since_improve: int | None = None, seeds: list | None = None) -> int | None:
+               best_step: int | None = None, since_improve: int | None = None, seeds: list | None = None,
+               drift: float | None = None) -> int | None:
         """The probe score of `idx` after its turn this round (best / best_step / since_improve: its controller's;
-        seeds: that probe's combined score per seed, for race_drop_confidence). Returns the configuration dropped as
-        the round's lowest when this probe ended a round with a drop; just_dropped lists everyone who left with this
-        call (patience, finished, lowest). A missing score (no face found) counts as the lowest; on a tie the later
-        one goes. The last one in the race never leaves."""
+        seeds: that probe's combined score per seed, for race_drop_confidence; drift: that probe's drift share from
+        the prompt check, None when it counted nothing). Returns the configuration dropped as the round's lowest
+        when this probe ended a round with a drop; just_dropped lists everyone who left with this call (patience,
+        finished, drift, lowest). A missing score (no face found) counts as the lowest; on a tie the later one goes.
+        The last one in the race never leaves."""
         if self.done or not self.pending or idx != self.pending[0]:
             raise ValueError(f"configuration {idx} is not the one training now")
         self.pending.pop(0)
         self.scores[idx] = score
+        self.drift_last[idx] = drift
+        if self.drift > 0 and drift is not None:  # a probe that counted nothing neither adds to the run nor ends it
+            self.drift_run[idx] = self.drift_run.get(idx, 0) + 1 if drift >= self.drift else 0
         if seeds:
             self.seeds.setdefault(idx, {})[self.round] = list(seeds)
         self.steps[idx] = step
@@ -402,11 +419,17 @@ class RaceSchedule:
             self.just_dropped.append(idx)
         if self.pending and not self.done:
             return None
+        drift_stay = self._drift_drops()
         entry = {"round": self.round, "scores": {self.names[i]: self.scores.get(i) for i in self.members},
                  "steps": {self.names[i]: self.steps.get(i) for i in self.members}, "dropped": None,
                  "left": {self.names[i]: w for i, w in self.left.items()}}
         if self.spared:
             entry["spared"] = {self.names[i]: n for i, n in self.spared.items()}
+        if self.drift > 0:
+            entry["drift"] = {self.names[i]: self.drift_last.get(i) for i in self.members}
+        if drift_stay is not None:
+            entry["drift_stay"] = self.names[drift_stay]
+        drift_round = any(w == "drift" for w in self.left.values()) or drift_stay is not None
         dropped = None
 
         def key(i):
@@ -423,7 +446,8 @@ class RaceSchedule:
                     self.finished.add(i)
                     self.just_dropped.append(i)
                 entry["final"] = True
-        elif self.drop_lowest and self.round > self.warmup and not self.done:
+        elif self.drop_lowest and self.round > self.warmup and not self.done and not drift_round:
+            # (a round that dropped for drift, or kept its least drifted, drops nobody for the score as well)
             lowest = min(self.alive, key=key)
             if self._drop_verdict(lowest, key, entry):
                 dropped = lowest
@@ -440,6 +464,31 @@ class RaceSchedule:
         self.pending = [] if self.done else list(self.alive)
         self.members = list(self.alive)
         return dropped
+
+    def _drift_drops(self) -> int | None:
+        """At the end of a round, after the warm-up: everyone whose probes were at or over the drift threshold for
+        drift_probes in a row leaves (left: "drift"). When that is everyone still racing, the least drifted stays
+        (a tie: the higher score, then the earlier row) and is returned; else None."""
+        if self.drift <= 0 or self.round <= self.warmup or len(self.alive) <= 1:
+            return None
+        over = [i for i in self.alive if self.drift_run.get(i, 0) >= self.drift_probes]
+        if not over:
+            return None
+        stay = None
+        if len(over) == len(self.alive):
+            def least(i):
+                d, s = self.drift_last.get(i), self.scores.get(i)
+                return (1.0 if d is None else d, -(-math.inf if s is None else s), i)
+
+            stay = min(over, key=least)
+            over.remove(stay)
+        for i in over:
+            self.alive.remove(i)
+            self.dropped[i] = self.round
+            self.drifted.add(i)
+            self.left[i] = "drift"
+            self.just_dropped.append(i)
+        return stay
 
     def paired_test(self, leader: int, lowest: int) -> dict:
         """leader's per-seed scores minus lowest's, pooled over the rounds since the last drop (after the warm-up, at
@@ -488,7 +537,8 @@ class RaceSchedule:
             self.champion = self.alive[0]
             return self.champion
         last = self.alive[0] if self.alive else None
-        self.champion = max(self.best, key=lambda i: (self.best[i], i == last, -i))
+        pool = {i: b for i, b in self.best.items() if i not in self.drifted} or self.best  # drifted ones cannot win
+        self.champion = max(pool, key=lambda i: (pool[i], i == last, -i))
         return self.champion
 
     def drop(self, idx: int) -> None:
@@ -531,6 +581,10 @@ class RaceSchedule:
                 "manual": [self.names[i] for i in sorted(self.manual)],
                 "stale": [self.names[i] for i in sorted(self.stale)],
                 "finished": [self.names[i] for i in sorted(self.finished)],
+                "drifted": [self.names[i] for i in sorted(self.drifted)],
+                "drift": self.drift, "drift_probes": self.drift_probes,
+                "drift_last": {self.names[i]: d for i, d in self.drift_last.items()},
+                "drift_run": {self.names[i]: n for i, n in self.drift_run.items()},
                 "drop_lowest": self.drop_lowest, "patience": self.patience, "rising": self.rising,
                 "follow": self.follow, "confidence": self.confidence, "max_close": self.max_close,
                 "close": self.close,
@@ -860,8 +914,12 @@ def _p(t: dict) -> str:
 def describe_round(entry: dict, schedule: RaceSchedule) -> str:
     """A round for the log: "2: a 41.0%, b 38.5% -> b is out" (with who left on patience or finished their steps)."""
     fmt = ", ".join(f"{n} {'n/a' if s is None else f'{s:.1f}%'}" for n, s in entry["scores"].items())
-    why = {"patience": f"out after {schedule.patience} probes without improvement", "finished": "finished its steps"}
+    why = {"patience": f"out after {schedule.patience} probes without improvement", "finished": "finished its steps",
+           "drift": f"out: its probes left their prompts' frame {getattr(schedule, 'drift_probes', 2)} probes in a row "
+                    f"(drift at or over {100 * getattr(schedule, 'drift', 0.0):.0f}%)"}
     parts = [f"{n} {why[w]}" for n, w in (entry.get("left") or {}).items()]
+    if entry.get("drift_stay"):
+        parts.append(f"{entry['drift_stay']} stays although over the drift limit: the least drifted of those left")
     parts += [f"{n} stays: {k} probes without improvement but rising again" for n, k in
               (entry.get("spared") or {}).items()]
     if entry.get("leader") and entry.get("final"):
