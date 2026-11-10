@@ -5287,7 +5287,8 @@ EXPERIMENTS = [
                "stayed within about half a point of the plain run, on the training pictures and on held-out photos. "
                "It turned the clothes down on 49 pictures, typically to 0.82, and no picture triggered the "
                "per-picture rule. Read from the training steps the cap rule flickered at first; reading the sweeps "
-               "steadied it. No benefit shown.",
+               "steadied it. Four seeds of the plain run differ from each other by as much: no effect, and no "
+               "benefit shown.",
      "cost": "No extra model calls, except one more forward pass a step while the background prior acts. Needs "
              "MediaPipe for the parts maps. Not in a configuration race, not with Hull's region gains."},
     {"key": "holdout_images", "group": "Likeness boosters", "title": "Held-out photos", "off": 0,
@@ -5316,7 +5317,8 @@ EXPERIMENTS = [
      "tested": "Measured once, on a Qwen-Image 2.1 fine-tune with face 3, hair 1.5, skin 1.5, clothes 0.5, background "
                "0.3: the training faces were learned much further (47% of their error gone against 30%), but held-out "
                "faces ended worse (7% against 12%), the full-body probe lost its framing sooner and likeness was "
-               "level. It memorised the training faces faster.",
+               "level. It memorised the training faces faster. Turning only the background down to 0.3 did the same "
+               "in a milder form. Both ended well outside the spread of four seeds of the plain run.",
      "cost": "None per step. Needs MediaPipe for the parts maps. Not together with the region-weighted loss, so not "
              "with the identity recipe as it is, and not with Hull's region gains."},
     {"key": "clean_share", "group": "How noise levels are trained", "title": "Clean-end share", "off": "",
