@@ -829,6 +829,11 @@ class TrainConfig:
     # body, so the last few of them, or a score left over from when some did, can set a best checkpoint (the
     # behaviour before 3.4.0; it happened in 8 of 9 test runs)
     likeness_framing: bool = True
+    # when the training ends, write a report of it into the job folder's report/: a summary picture (settings, scores,
+    # probe renders through the run with the best checkpoint marked, dataset examples, training maps) and a longer
+    # PDF (runreport.py; needs matplotlib). Any earlier run: python -m rulztrainer.runreport output/<job>, or the
+    # Previous Runs tab
+    run_report: bool = False
     # experimental, unit-tested only: a probe whose renders keep their prompt's frame in less than this share (the
     # prompt check's kept share, against the step-0 probe) cannot set a new best checkpoint. 0 = off
     likeness_best_min_kept: float = 0.0
