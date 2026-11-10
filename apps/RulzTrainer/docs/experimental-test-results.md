@@ -112,6 +112,7 @@ was 0.54 before any training: on these runs copy over 0.50 means little until it
 | Keel, LoRA | **44.7 (1400)** | **38.2** | **87.9** | 72.0 | 3 of 6 | 0.61 | 0.67 |
 | Muon, OFT | 51.4 (1200), see below | 19.3 | 85.7 | 64.5 | 1 of 6 | 0.61 | 0.45 |
 | AdamW 8-bit, OFT | 45.9 (1200), see below | 16.9 | 83.5 | 62.7 | 3 of 6 | 0.64 | 0.45 |
+| AdamW 8-bit, OFT, lr 5e-5 | 34.2 (1200) | 33.9 | 87.0 | 71.3 | **6 of 6** | 0.62 | 0.45 |
 
 - **Keel led clearly**: 12 to 15 points over AdamW and Muon from step 1000, the best FaceNet at every probe from step 800,
   and still rising at step 1400. That repeats Keel's FaceNet gain on Krea 2. Its lr climbed to the 1e-3 ceiling by step
@@ -123,7 +124,12 @@ was 0.54 before any training: on these runs copy over 0.50 means little until it
   about 60) and FaceNet slid from step 1200. Training photos' backgrounds and outdoor scenes leaked into the probes,
   headshots included. Both OFT rows' best scores come from one probe seed rendering a standing full-body pose like the
   training photos' (body 97-107), not the seated scene asked for: read them by their means, not their bests. On Krea 2
-  OFT was the one confirmed gain; on this model try a lower lr or `oft_constraint` first.
+  OFT was the one confirmed gain; on this model it needs a lower lr (next point).
+- **OFT at half the lr (5e-5) fixed most of that.** Second to Keel from step 1000 (33.9 against 38.2), FaceNet 87.0,
+  ArcFace held at 70-73 instead of falling, and the only row whose body probe kept its framing: scored at all six late
+  probes, with five or six of eight seeds in the outfit the prompt named, where every LoRA row had gone to portraits.
+  No training-photo backgrounds in the headshots. Copy still touched 0.62 once (step 1800), on the same face seed and
+  near-duplicate photo as Keel's 0.61, and the scene drifted from the prompt's to rooms like the training photos'. One run.
 - **Every row lost the full-body framing**: the body probe went to waist-up and then head-and-shoulders portraits by
   step 1000-1600, so the body score could not be read at several probes. Its outfit followed the set's tops, not the
   prompt's. That happened with every optimizer and both adapters, so it is not the optimizer's doing.
