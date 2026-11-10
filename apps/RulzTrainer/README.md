@@ -259,8 +259,8 @@ files, and every download button hands the file to your browser.
 *Queue* section has the switch *Stop this vast.ai instance when the runs are done*: three minutes after the last run
 ends (finished, stopped or failed) with nothing left in the queue, the instance stops itself. The GPU's billing ends,
 the disk and its storage charge stay, and *Start* on vast.ai brings it back with every file. The run strip counts the
-three minutes down; switching it off or starting a run cancels, and runs waiting in a paused queue keep the instance
-running. It waits for a run to have run since you switched it on, so it never stops an instance you have only just
+three minutes down; switching it off or starting a run cancels, **Kill** switches it off, and runs waiting in a paused
+queue keep the instance running. It waits for a run to have run since you switched it on, so it never stops an instance you have only just
 opened. *Stop the instance now* does the same at once, after a confirmation. Both use `CONTAINER_API_KEY`, the key
 vast.ai gives every instance for itself (start, stop and destroy of that one instance); the WebUI only ever sends
 "stop". The switch is kept in `output/_autostop.json` and is switched off before the stop is sent, so a restarted

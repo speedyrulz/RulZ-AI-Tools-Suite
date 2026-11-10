@@ -561,9 +561,13 @@ def kill_training() -> str:
         _proc.kill()
     else:
         _adopted.kill()
+    note = ""
+    if AUTOSTOP.armed:  # a kill means "let me look": the rented instance must not stop under that
+        AUTOSTOP.disarm("switched off by Kill")
+        note = " Stopping the instance when the runs are done is switched off."
     if paused:
-        return "Process killed (no final save). The queue is paused: Resume it on the Monitor to go on."
-    return "Process killed (no final save)."
+        return "Process killed (no final save). The queue is paused: Resume it on the Monitor to go on." + note
+    return "Process killed (no final save)." + note
 
 
 def validated_config(cfg: TrainConfig) -> TrainConfig:
@@ -9514,7 +9518,8 @@ def build_page(local: bool = True):
                                 "stopped or failed) with nothing left in the queue, the instance stops itself: the "
                                 "GPU's billing ends, the disk and its storage charge stay, and Start on vast.ai brings "
                                 "it back with every file. Runs waiting in a paused queue keep it running, and so does "
-                                "starting a run in those minutes. It needs a run to have run since you switched it on.")
+                                "starting a run in those minutes; Kill switches this off. It needs a run to have run "
+                                "since you switched it on.")
                 near_dup_label = ui.label("").classes("w-full text-sm text-orange-8")
                 near_dup_label.visible = False
                 with section("Configuration race", "Smoothed probe score per configuration; the lowest leaves after "
@@ -10464,8 +10469,8 @@ Red marks the one main action of a view and whatever is switched on; every other
   *Queue* section has the switch *Stop this vast.ai instance when the runs are done*: three minutes after the last run
   ends (finished, stopped or failed) with nothing left in the queue, the instance stops itself. The GPU's billing ends,
   the disk and its storage charge stay, and *Start* on vast.ai brings it back with every file. The run strip counts
-  the three minutes down; switching it off or starting a run cancels. Runs waiting in a paused queue keep the
-  instance running. *Stop the instance now* beside it does the same at once. It uses the key vast.ai gives every
+  the three minutes down; switching it off or starting a run cancels, and **Kill** switches it off. Runs waiting in
+  a paused queue keep the instance running. *Stop the instance now* beside it does the same at once. It uses the key vast.ai gives every
   instance for itself (start, stop and destroy of that instance only); nothing here can rent or destroy anything.
 - **Model download**: while the first-boot download of your model bucket is still going, the Monitor says so and how
   much has arrived.
