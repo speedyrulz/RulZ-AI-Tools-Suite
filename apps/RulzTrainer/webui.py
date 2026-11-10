@@ -28,7 +28,7 @@ from rulztrainer.archs import get_arch
 from rulztrainer.config import (AUTOMAGIC, KEEL, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
                                 MODEL_PRESETS, ARCH_SAMPLE_LORA,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
-from rulztrainer import __version__, bodysim, facesim, history, lookfilter, machine
+from rulztrainer import __version__, bodysim, facesim, history, lookfilter, machine, promptcheck
 from rulztrainer.train_queue import TrainQueue
 from rulztrainer.dataset import skipped as dataset_skipped
 from rulztrainer.pictures import to_rgb
@@ -971,17 +971,24 @@ def probe_score_line(rec: dict | None) -> str:
                                                    ("body", body)) if v is not None]
     if rec.get("copy") is not None:  # the copy check: its closest training photo (SSCD cosine)
         parts.append(f"copy {rec['copy']:.2f}")
+    kept = (rec.get("prompt_check") or {}).get("kept_share")
+    if kept is not None:  # the prompt check: the share of renders still in their prompt's frame (the worst prompt)
+        parts.append(f"on-prompt {100 * kept:.0f}%")
     return " | ".join(parts)
 
 
 _PROBE_IMAGE = re.compile(r"_(face|body)_(\d+)\.png$")
+_CHECK_IMAGE = re.compile(r"_check-([A-Za-z0-9_.+-]+)_(\d+)\.png$")  # an extra prompt of the prompt check
 _SAMPLE_IMAGE = re.compile(r"step(\d{6})_(\d+)\.png$")
 
 
 def probe_image_title(path) -> str:
-    """"Face probe 2" for ..._face_1.png."""
+    """"Face probe 2" for ..._face_1.png; "Prompt check full_walking 1" for ..._check-full_walking_0.png."""
     m = _PROBE_IMAGE.search(Path(path).name)
-    return f"{m.group(1).capitalize()} probe {int(m.group(2)) + 1}" if m else Path(path).name
+    if m:
+        return f"{m.group(1).capitalize()} probe {int(m.group(2)) + 1}"
+    m = _CHECK_IMAGE.search(Path(path).name)
+    return f"Prompt check {m.group(1)} {int(m.group(2)) + 1}" if m else Path(path).name
 
 
 def probe_steps(probes: list[dict], names: list[str]) -> dict[int, tuple[str, list]]:
@@ -1530,6 +1537,13 @@ class Form:
             body_device=v("body_device"),
             probe_every=int(v("probe_every")), probe_at_start=bool(v("probe_at_start")),
             probe_face_prompt=s("probe_face_prompt"), probe_body_prompt=s("probe_body_prompt"),
+            probe_subject=s("probe_subject"), probe_face_expect=v("probe_face_expect") or "",
+            probe_body_expect=v("probe_body_expect") or "",
+            # the presets picked on the page, then the prompts of one's own the config file holds (no field for them)
+            probe_checks=list(v("probe_checks") or []) + [
+                e for e in getattr(getattr(self, "_base", None), "probe_checks", []) if isinstance(e, dict)],
+            probe_check_seeds=int(v("probe_check_seeds") or 4),
+            likeness_best_min_kept=float(v("likeness_best_min_kept") or 0),
             probe_seeds=int(v("probe_seeds")), probe_seed=int(v("probe_seed")), probe_size=int(v("probe_size")),
             probe_floor_seeds=int(v("probe_floor_seeds") or 4),
             probe_async=bool(v("probe_async")), probe_device=s("probe_device"),
@@ -1603,6 +1617,8 @@ class Form:
             race_parallel=bool(v("race_parallel")), race_follow=bool(v("race_follow")),
             race_drop_confidence=float(v("race_drop_confidence") or 0) if v("race_paired") else 0.0,
             race_max_close_rounds=int(v("race_max_close_rounds") or 0),
+            race_drop_drift=float(v("race_drop_drift") or 0),
+            race_drop_drift_probes=int(v("race_drop_drift_probes") or 2),
             race_configs=self.w["race_configs"].value,
             soup_files=([p.strip() for p in (v("soup_files") or "").splitlines() if p.strip()]
                         if v("soup_run") else []),
@@ -1631,6 +1647,9 @@ class Form:
                   "race_paired": cfg.race_drop_confidence > 0,
                   "race_drop_confidence": cfg.race_drop_confidence or 0.9,
                   "face_refs": "\n".join(cfg.face_refs), "body_refs": "\n".join(cfg.body_refs),
+                  # the page lists the presets; a prompt of one's own stays in the config (to_config keeps it)
+                  "probe_checks": [e for e in cfg.probe_checks if isinstance(e, str)
+                                   and any(p.key == e for p in promptcheck.PRESETS)],
                   "model_source": FILE_SOURCE if cfg.model_source == "files" else HF_SOURCE}
         values["datasets"] = [{"path": sp.path, "resolutions": list(sp.resolutions), "repeats": sp.repeats,
                                "trigger": sp.trigger, "class": sp.subject_class, "kind": sp.subject_kind}
@@ -4181,6 +4200,9 @@ def race_review_line(cfg: TrainConfig) -> str:
     if cfg.race_patience_drop:
         rules.append(f"a racer leaves after {cfg.race_patience} probes without improvement"
                      + (" unless its likeness is rising again" if cfg.race_patience_rising else ""))
+    if cfg.race_drop_drift > 0:
+        rules.append(f"a racer whose probes leave their prompts' frame ({cfg.race_drop_drift:.0%} or more off-prompt, "
+                     f"{cfg.race_drop_drift_probes} probes in a row) is dropped")
     if cfg.race_patience_drop or not cfg.race_drop_lowest:
         rules.append("the best score at any point wins")
     return f"{len(rows)} racers ({racers}); " + ", ".join(rules)
@@ -9587,6 +9609,61 @@ def build_page(local: bool = True):
                             .classes("w-full")
                         w["probe_body_prompt"] = ui.input("Body probe prompt (full body, upright; empty = none)") \
                             .classes("w-full")
+                        # preset prompts for a character LoRA, and what each probe's renders should show (the
+                        # prompt check, promptcheck.py)
+                        expect_options = {"": "guess from the prompt", "none": "do not check",
+                                          **promptcheck.EXPECT_LABELS}
+                        with fields():
+                            w["probe_subject"] = ui.input("Subject (for preset prompts)", value=d.probe_subject,
+                                                          placeholder="a young woman with long dark brown hair") \
+                                .classes("w-[26rem] max-w-full").tooltip(
+                                "What the preset prompts call the person, next to the trigger word: a few words "
+                                "such as 'a young woman with long dark brown hair'. Empty = a dataset's class (LoRA "
+                                "Isolation), else 'a person'. Only the presets read it.")
+                            face_preset = ui.select({p.key: p.label for p in promptcheck.presets_of("face")},
+                                                    label="Face probe preset", clearable=True).classes("w-72") \
+                                .tooltip("Writes a ready-made headshot prompt, with your trigger word and subject, "
+                                         "into the face probe prompt above and sets what it should show. Pick one, "
+                                         "then edit the prompt freely.")
+                            body_preset = ui.select({p.key: p.label for p in promptcheck.presets_of("body")},
+                                                    label="Body probe preset", clearable=True).classes("w-72") \
+                                .tooltip("The same for the body probe prompt: full-body and waist-up prompts.")
+                        with fields():
+                            w["probe_face_expect"] = ui.select(expect_options, value=d.probe_face_expect,
+                                                               label="Face probe should show").classes("w-72") \
+                                .tooltip("The prompt check: every probe render is read for its framing (from the "
+                                         "face's size and whether the hips are in the picture) and compared with "
+                                         "the step-0 probe of the same seed. The log and the Monitor then say how "
+                                         "many renders still keep their prompt's frame, and how many drifted (a "
+                                         "full-body prompt coming back as a portrait). It only reports, unless the "
+                                         "best guard below or the race's drift drop act on it. It sees framing and "
+                                         "the number of faces, not clothing or setting.")
+                            w["probe_body_expect"] = ui.select(expect_options, value=d.probe_body_expect,
+                                                               label="Body probe should show").classes("w-72") \
+                                .tooltip("Full body means the body at least down to the hips with a small face; "
+                                         "the models draw 'full body' from head to thigh as often as head to toe. "
+                                         "Guess from the prompt reads words such as full-body, waist-up, headshot "
+                                         "and close-up.")
+                            w["probe_checks"] = ui.select({p.key: p.label for p in promptcheck.PRESETS},
+                                                          value=[], multiple=True,
+                                                          label="Extra prompts to check (rendered, never scored)") \
+                                .classes("w-[28rem] max-w-full").props("use-chips").tooltip(
+                                "Preset prompts rendered at every probe and read by the prompt check, without "
+                                "entering the likeness score (its scale stays as it is). Use them to watch poses "
+                                "and framings the two likeness prompts do not cover. Each costs its seeds in "
+                                "renders per probe. Prompts of your own go into the config file (probe_checks).")
+                            w["probe_check_seeds"] = ui.number("Seeds per extra prompt", value=d.probe_check_seeds,
+                                                               min=1, max=16, precision=0).classes("w-48")
+
+                        def use_preset(e, key: str) -> None:
+                            if not e.value:
+                                return
+                            w[f"probe_{key}_prompt"].value = promptcheck.build(
+                                e.value, w["trigger_word"].value or "", w["probe_subject"].value or "")
+                            w[f"probe_{key}_expect"].value = promptcheck.preset(e.value).expect
+
+                        face_preset.on_value_change(lambda e: use_preset(e, "face"))
+                        body_preset.on_value_change(lambda e: use_preset(e, "body"))
                         with fields():
                             w["probe_steps"] = ui.number("Probe steps", value=d.probe_steps, precision=0) \
                                 .classes("w-32")
@@ -9657,6 +9734,15 @@ def build_page(local: bool = True):
                                          "higher smoothed score replaces it, so the file is always the highest score "
                                          "seen, even by a hair. Either way early stop and the resolution step-up "
                                          "only count a rise beyond the noise band as progress.")
+                            w["likeness_best_min_kept"] = ui.number(
+                                "No new best under this share on-prompt (0 = off)", value=d.likeness_best_min_kept,
+                                min=0, max=1, step=0.05).classes("w-80").tooltip(
+                                "Experimental, unit-tested only. Reads the prompt check: a probe whose renders keep "
+                                "their prompt's frame in less than this share (in the prompt that drifted most, "
+                                "against the step-0 probe) cannot set a new best checkpoint, overall, face or body. "
+                                "It stops a best from resting on a body score taken from the two renders of eight "
+                                "that still show a body. 0.5 = at least half the renders must still be on-prompt. "
+                                "Needs a probe whose frame is known (Face / Body probe should show).")
                             w["likeness_patience"] = ui.number("Early stop after N probes w/o improvement (0 = never)",
                                                                value=d.likeness_patience, precision=0) \
                                 .classes("w-96 max-w-full") \
@@ -9861,6 +9947,20 @@ def build_page(local: bool = True):
                                 .tooltip("Bounds the extra cost: the race keeps everyone at most this many rounds in a "
                                          "row, and the lowest leaves anyway once it has trained all the steps.")
                         with fields():
+                            w["race_drop_drift"] = ui.number("Drop one that leaves the prompt: drift share (0 = off)",
+                                                             value=d.race_drop_drift, min=0, max=1, step=0.05) \
+                                .classes("w-96").tooltip(
+                                "Experimental, unit-tested only. Reads the prompt check: a configuration whose probe "
+                                "renders have left their prompt's frame (a full-body prompt coming back as a "
+                                "portrait) in at least this share, in the prompt that drifted most and against the "
+                                "step-0 probe, for the number of its own probes beside this, leaves the race. The "
+                                "last one never leaves; when all of them are over it the least drifted stays. A "
+                                "dropped one cannot win on an earlier best score. For racing seeds, turn Drop the "
+                                "lowest off (score gaps between seeds are mostly noise) and set this to 0.5. It "
+                                "sees framing only. Not in a relay race.")
+                            w["race_drop_drift_probes"] = ui.number("Probes in a row", value=d.race_drop_drift_probes,
+                                                                    min=1, precision=0).classes("w-40")
+                        with fields():
                             w["race_patience_drop"] = ui.switch("Drop each one when it stops improving",
                                                                 value=d.race_patience_drop) \
                                 .tooltip("A configuration leaves once its own probes have not improved (by more than "
@@ -9891,7 +9991,11 @@ def build_page(local: bool = True):
                         def race_rules_visible(_=None):
                             relay = bool(w["race_follow"].value)
                             w["race_drop_lowest"].set_visibility(not relay)
-                            w["race_warmup_probes"].set_visibility(not relay and bool(w["race_drop_lowest"].value))
+                            drift_on = not relay and float(w["race_drop_drift"].value or 0) > 0
+                            w["race_drop_drift"].set_visibility(not relay)
+                            w["race_drop_drift_probes"].set_visibility(drift_on)
+                            w["race_warmup_probes"].set_visibility(not relay and (bool(w["race_drop_lowest"].value)
+                                                                                  or drift_on))
                             paired_on = not relay and bool(w["race_drop_lowest"].value)
                             w["race_paired"].set_visibility(paired_on)
                             w["race_drop_confidence"].set_visibility(paired_on and bool(w["race_paired"].value))
@@ -9901,7 +10005,8 @@ def build_page(local: bool = True):
                             w["race_patience_rising"].set_visibility(not relay
                                                                      and bool(w["race_patience_drop"].value))
 
-                        for key in ("race_follow", "race_drop_lowest", "race_patience_drop", "race_paired"):
+                        for key in ("race_follow", "race_drop_lowest", "race_patience_drop", "race_paired",
+                                    "race_drop_drift"):
                             w[key].on_value_change(race_rules_visible)
                         race_rules_visible()
 
@@ -10235,6 +10340,7 @@ def build_page(local: bool = True):
                         {"name": "score", "label": "Score now", "field": "score"},
                         {"name": "face", "label": "Face now", "field": "face"},
                         {"name": "body", "label": "Body now", "field": "body"},
+                        {"name": "drift", "label": "Off-prompt now", "field": "drift"},
                         {"name": "rounds", "label": "Score after each round", "field": "rounds", "align": "left"},
                         {"name": "settings", "label": "Settings", "field": "settings", "align": "left"},
                         {"name": "drop", "label": "", "field": "can_drop"}],
@@ -10798,6 +10904,8 @@ def build_page(local: bool = True):
                         state = ("winner" if rc.get("winner") == n else
                                  "finished (lost the last round)" if relay_done else
                                  f"dropped by you in round {dropped[n]}" if n in dropped and manual else
+                                 f"out after round {dropped[n]} (its probes left their prompts' frame)"
+                                 if n in dropped and n in (rc.get("drifted") or []) else
                                  f"out after round {dropped[n]}" if n in dropped
                                  else "training" if (n in (rc.get("lanes") or []) or (rc.get("active") == n
                                                                                        and not rc.get("parallel")))
@@ -10810,9 +10918,11 @@ def build_page(local: bool = True):
                         per_round = [(h["scores"].get(n), (h.get("steps") or {}).get(n))
                                      for h in rc.get("history") or [] if n in h["scores"]]
                         at = (rc.get("score_steps") or {}).get(n)
+                        drift = (rc.get("prompt_drift") or {}).get(n)  # the prompt check's latest drift share
                         rows.append({"name": n, "state": state, "at": "-" if at is None else f"step {at}",
                                      "score": f1((rc.get("scores") or {}).get(n)),
                                      "face": part("face", n), "body": part("body", n),
+                                     "drift": "-" if drift is None else f"{100 * drift:.0f}%",
                                      "rounds": " / ".join(f1(s) + ("" if st is None else f" @{st}")
                                                           for s, st in per_round) or "-",
                                      "settings": (rc.get("settings") or {}).get(n) or "the page's own settings",
@@ -11454,6 +11564,19 @@ A LoRA trained on a few photos can learn to redraw one of them: same pose, same 
 one shoot in one room), shown as "copies a photo" in the round's log and in `selftrain.json`. Each probe logs its
 closest training photo and score ("copy" in the Monitor's probe line, `copy` in `likeness.jsonl`); that decides
 nothing. *auto* turns it on with self-training, *on* for any run with probes.
+
+## Probe prompt presets and the prompt check
+An overtrained LoRA stops following the prompt's framing: a full-body prompt comes back as a portrait, and the
+likeness scores do not notice. The **prompt check** reads every probe render's frame (a close face, waist-up, or the
+body down to the hips) from the face's size and the pose, and compares it with the step-0 probe of the same seed: a
+render that showed its prompt's frame then and does not now has *drifted*. The log has a "Prompt check" line per
+probe and the Monitor shows "on-prompt" beside the scores. *Face / Body probe should show* (under the probe prompts)
+says what each probe asks for; empty guesses it from the prompt's words. The **preset** lists beside them write a
+ready-made prompt with your trigger word and *Subject* into the field. *Extra prompts to check* renders more presets
+at every probe without scoring them, to watch framings the two likeness prompts do not cover. It only reports unless
+you set *No new best under this share on-prompt* (a drifted probe cannot set a best checkpoint) or, in a race, *Drop
+one that leaves the prompt* (both experimental, unit-tested only). It sees framing and the number of faces, not
+clothing or setting.
 
 ## Training maps
 After Fizgig's training maps. With *Training maps* on (Likeness section), a few training pictures are checked before

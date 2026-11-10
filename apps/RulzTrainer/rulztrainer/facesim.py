@@ -218,6 +218,20 @@ class FaceScorer:
                     f.kps = f.kps * scale
         return sorted(found, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]), reverse=True)
 
+    def _remember(self, path, faces) -> list[tuple]:
+        """Keep the boxes of the image just looked at (boxes() hands them back without detecting again)."""
+        boxes = [tuple(float(x) for x in f.bbox) for f in faces]
+        self._last_boxes = (str(path), boxes)
+        return boxes
+
+    def boxes(self, path: str | Path) -> list[tuple]:
+        """The face boxes of an image (x0, y0, x1, y1 in source pixels), largest first. The image score() looked at
+        last costs nothing: the prompt check reads the framing of the render the score was just taken from."""
+        last = getattr(self, "_last_boxes", None)
+        if last is not None and last[0] == str(path):
+            return last[1]
+        return self._remember(path, self.faces(path))
+
     def set_references(self, paths: list[str | Path]) -> list[dict]:
         """Embed the largest face of each reference image. Returns per-image info for the UI."""
         from .likeness import reference_ceiling
@@ -286,6 +300,7 @@ class FaceScorer:
     def score(self, image: str | Path, step: int = 0, prompt_index: int = 0, gold: bool = False) -> FaceScore:
         """The largest face's best ArcFace match; gold: the held-out recognizer's too (set_gold), on the same face."""
         fs = self.faces(image)
+        self._remember(image, fs)
         if not fs or not self.refs:
             return FaceScore(step, str(image), prompt_index, len(fs), None, None, None)
         emb = fs[0].normed_embedding.astype(np.float32)

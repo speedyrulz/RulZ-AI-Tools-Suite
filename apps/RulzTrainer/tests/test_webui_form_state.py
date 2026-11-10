@@ -198,3 +198,39 @@ def test_loaded_settings_without_a_field_survive_to_config():
     assert (out.weight_decay, out.lora_dropout, out.hull_clip, out.cache_dir) == (0.0, 0.1, 3.0, "mycache")
     assert out.model_arch == "auto" and out.datasets[0]["trigger"] == "ohwx"
     assert webui.Form().w == {}  # (a fresh page without a loaded config: the defaults, as before)
+
+
+def test_the_prompt_check_settings_round_trip_through_the_page():
+    """The probe presets' subject, each probe's expected frame, the extra prompts and the two settings that act on
+    the check go to the page and back; a prompt of one's own (a mapping in the config file) has no field and is
+    kept beside the presets picked on the page."""
+    own = {"name": "beach", "prompt": "tok on a beach, full body", "expect": "full"}
+    loaded = TrainConfig(probe_subject="a tall woman", probe_face_expect="headshot", probe_body_expect="none",
+                         probe_checks=["full_walking", own, "upper_cafe"], probe_check_seeds=2,
+                         likeness_best_min_kept=0.5, race_drop_drift=0.4, race_drop_drift_probes=3,
+                         datasets=[{"path": "a"}])
+    f = _filled_form(loaded)
+    assert f.w["probe_checks"].value == ["full_walking", "upper_cafe"]  # the page lists the presets
+    assert (f.w["probe_subject"].value, f.w["probe_face_expect"].value, f.w["race_drop_drift"].value) == \
+        ("a tall woman", "headshot", 0.4)
+    f.w["datasets"].value = loaded.datasets
+    f.w["probe_checks"].value = ["full_sitting"]  # the user changes the presets on the page
+    out = f.to_config()
+    assert out.probe_checks == ["full_sitting", own]
+    assert (out.probe_subject, out.probe_face_expect, out.probe_body_expect) == ("a tall woman", "headshot", "none")
+    assert (out.probe_check_seeds, out.likeness_best_min_kept, out.race_drop_drift, out.race_drop_drift_probes) == \
+        (2, 0.5, 0.4, 3)
+    # the defaults: nothing checked beyond the guess, nothing acts
+    plain = _filled_form(TrainConfig(datasets=[{"path": "a"}]))
+    plain.w["datasets"].value = [{"path": "a"}]
+    d = plain.to_config()
+    assert (d.probe_checks, d.probe_face_expect, d.likeness_best_min_kept, d.race_drop_drift) == ([], "", 0.0, 0.0)
+
+
+def test_the_monitor_names_check_images_and_shows_the_kept_share():
+    assert webui.probe_image_title("probes/step000600_face_1.png") == "Face probe 2"
+    assert webui.probe_image_title("probes/s43_step000600_check-full_walking_0.png") == "Prompt check full_walking 1"
+    rec = {"face_norm": 47.0, "body_norm": 17.0, "combined": 32.0, "scale": {"face": [0, 1]}}
+    assert "on-prompt" not in webui.probe_score_line(rec)
+    assert webui.probe_score_line({**rec, "prompt_check": {"kept_share": 0.375}}).endswith("| on-prompt 38%")
+    assert "on-prompt" not in webui.probe_score_line({**rec, "prompt_check": {"kept_share": None}})  # the step-0 probe
