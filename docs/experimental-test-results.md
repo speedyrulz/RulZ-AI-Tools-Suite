@@ -173,3 +173,51 @@ skin together.
 Not settled: one run per row, one seed, three held-out photos (at least one with a near-duplicate still in training),
 one learning rate. A second seed of the plain row would give the noise between seeds; background-only weights would
 separate the heavier face from the lighter background.
+
+## Probe prompt check: the framing by training seed
+
+November 2026. The Qwen-Image 2.1 fine-tune, set and settings of the section above, plain training (no region
+weighting), with **only the training seed changed**: 42, 43 and 44. The probe seeds are the same in every run, and the
+step-0 probes are identical. The prompt check of 3.2.0 (`rulztrainer/promptcheck.py`) was run afterwards on the saved
+probe renders, 8 seeds of a headshot face probe and 8 of a sitting full-body body probe per step, with the trainer's
+own face and pose detectors on a CPU. No run was repeated and nothing acted on the check.
+
+Body probe renders that still show the full-body frame, of the 8 the base model drew that way:
+
+| Step | Seed 42 | Seed 43 | Seed 44 |
+| --- | --- | --- | --- |
+| 0 (base model) | 8 of 8 | 8 of 8 | 8 of 8 |
+| 200 | 8 of 8 | 8 of 8 | 8 of 8 |
+| 400 | 8 of 8 | 8 of 8 | 8 of 8 |
+| 600 | 7 of 8 | 7 of 8 | 8 of 8 |
+| 800 | 7 of 8 | 7 of 8 | 8 of 8 |
+| 1000 | 6 of 8 | 7 of 8 | 7 of 8 |
+| 1200 | 3 of 8 | 7 of 8 | 6 of 8 |
+| 1400 | 2 of 8 | 8 of 8 | 7 of 8 |
+| 1600 | 0 of 8 | 8 of 8 | 3 of 8 |
+| 1800 | 0 of 8 | 8 of 8 | 2 of 8 |
+| 2000 | 0 of 8 | 8 of 8 | 0 of 8 |
+
+- **The face probe stayed a headshot in all 8 renders of every probe of every seed** (the largest face 38% to 62% of
+  the picture's height against a threshold of 34%). Every render had one face, and the pose model found a person in
+  every one of the 528.
+- **The body probe's drift depends on the seed.** Seed 42 lost most of its full-body renders by step 1200 and all of
+  them by step 1600. Seed 44 held until step 1400 and lost all of them by step 2000. Seed 43 kept all 8 from step 1400
+  to the end; one of its renders had moved closer from step 600 to 1200 and came back. The region sweeps read seeds
+  42 and 43 as fitting the photos about equally (the same gap between training and held-out pictures), so those two
+  differ in how the LoRA treats the prompt, not in how much it has learned.
+- **The check agrees with the body scorer's own count** of renders without a measurable body (seed 42: 2, 2, 4, 5, 6,
+  8, 8, 8 at steps 600 to 2000 against 1, 1, 2, 5, 6, 8, 8, 8 drifted here; seed 44: 1, 1, 2, 4, 6 at steps 1000 to
+  1800 against 1, 2, 1, 5, 6). It differs by a render or two because it reads the framing (face size and hips), not
+  whether enough of the body can be measured to score it.
+- **At step 0 every body render reads as full body** with a face of 16% to 20% of the height and both hips in the
+  picture, but knees in only half of them and feet in none: the base model draws this sitting "full-body" prompt from
+  head to thigh. That is why `full` asks for the hips and not for the feet.
+- **As a race** (the three runs fed to the race schedule as seed rows, `race_drop_drift: 0.5` over 2 probes,
+  `race_drop_lowest` off): seed 42 leaves after the step-1400 probe, seed 44 after the step-1800 probe, and seed 43 is
+  the one left. This replays the recorded probes through the schedule's code; no race was trained.
+
+Not settled: the thresholds (34% and 24% of the picture's height) were set on these same renders, so the agreement
+above is a fit, not a test; other models, sets and prompts may sit elsewhere. Three seeds on one set do not say how
+often a seed drifts. `race_drop_drift` and `likeness_best_min_kept` are unit-tested and have not decided a real run.
+The extra prompts (`probe_checks`) have not been rendered in a real run.

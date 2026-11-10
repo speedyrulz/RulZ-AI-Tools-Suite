@@ -199,13 +199,17 @@ class ProbeRecord:
     # nothing from shoulders to hips: a head-and-shoulders picture where a body was asked for)
     body_probes: int = 0
     body_missing: int = 0
+    # the prompt check (promptcheck.tally): per checked prompt how many renders kept its frame and how many drifted
+    # from the step-0 probe's, and the kept / drift share of the prompt that drifted most ({}: nothing was checked)
+    prompt_check: dict = field(default_factory=dict)
+    best_held: bool = False  # likeness_best_min_kept kept this probe from setting a new best
 
 
 # what a training state keeps of the controller (ceilings and shapes come back from the references and the config)
 RESUME_FIELDS = ("floor", "face_ema", "body_ema", "gold_ema", "has_gold", "combined_ema", "arc_combined_ema",
                  "prev_combined", "best", "best_step", "since_improve", "progress", "lr_factor", "face_bias",
                  "n_probes", "last_step", "last_seeds", "stage", "stage_best", "stage_since_improve", "face_best",
-                 "face_drop_count", "id_loss_vetoed", "part_best")
+                 "face_drop_count", "id_loss_vetoed", "part_best", "check_ref", "last_drift", "last_kept")
 
 
 class LikenessController:
@@ -254,6 +258,29 @@ class LikenessController:
         self.id_loss_vetoed = False
         # best face / body checkpoints (likeness_track_best_face / _body): {kind: (smoothed score, step)}
         self.part_best: dict[str, tuple[float, int]] = {}
+        # the prompt check: the step-0 probe's verdicts per checked prompt (the reference later probes are compared
+        # with), and the latest probe's drift and kept share (None: nothing counted)
+        self.check_ref: dict = {}
+        self.last_drift: float | None = None
+        self.last_kept: float | None = None
+
+    def prompt_check(self, step: int, seeds: dict | None) -> dict:
+        """The prompt check of one probe from its renders' frames (seeds["frames"], promptcheck.frame_of per render):
+        the step-0 probe becomes the reference, every later one is counted against it. {} without frames."""
+        from . import promptcheck
+
+        frames = (seeds or {}).get("frames") or {}
+        if not frames:
+            self.last_drift = self.last_kept = None
+            return {}
+        specs = promptcheck.checks(self.cfg)
+        if step == 0 and not self.check_ref:
+            self.check_ref = promptcheck.reference(specs, frames)
+            check = promptcheck.tally(specs, frames, None, base=True)
+        else:
+            check = promptcheck.tally(specs, frames, self.check_ref or None)
+        self.last_drift, self.last_kept = check.get("drift_share"), check.get("kept_share")
+        return check
 
     def enter_stage(self, stage: int) -> None:
         """Start a resolution stage: the next probe becomes that stage's baseline."""
@@ -392,16 +419,27 @@ class LikenessController:
                     and self.face_drop_count >= 2):
                 self.id_loss_vetoed = True
                 actions["id_loss_veto"] = True
+        # the prompt check: a probe whose renders have left their prompts' frame cannot set a new best
+        # (likeness_best_min_kept), so a best never rests on a body score from the few renders that still show one
+        check = self.prompt_check(step, seeds)
+        min_kept = float(getattr(cfg, "likeness_best_min_kept", 0.0) or 0.0)
+        held = min_kept > 0 and self.last_kept is not None and self.last_kept < min_kept
         # a new best must beat the old one by the noise band, or with likeness_best_any_rise by any amount
         best_margin = 0.0 if getattr(cfg, "likeness_best_any_rise", False) else band
+        best_held = False
         for kind, value in (("face", face_n), ("body", body_n)):
             prev = self.part_best.get(kind)
             if value is not None and (prev is None or value > prev[0] + best_margin):
+                if held:
+                    best_held = True
+                    continue
                 self.part_best[kind] = (value, step)
                 if getattr(cfg, f"likeness_track_best_{kind}", False):
                     actions[f"save_best_{kind}"] = True
         if comb is not None:
-            if self.best is None or comb > self.best + best_margin:
+            if (self.best is None or comb > self.best + best_margin) and held:
+                best_held = True
+            elif self.best is None or comb > self.best + best_margin:
                 self.best, self.best_step = comb, step
                 actions["save_best"] = cfg.likeness_track_best
             if self.progress is None or comb > self.progress + band:  # progress always needs the band
@@ -454,7 +492,8 @@ class LikenessController:
                           self.best_step, self.since_improve, list(images or []), self.stage, self.stage_best,
                           self.stage_since_improve, self.norm("face", face), self.norm("body", body), face_arc,
                           body_n, self.scale_record() if self.normalize else {}, **per_seed,
-                          body_probes=len(body_renders), body_missing=body_missing)
+                          body_probes=len(body_renders), body_missing=body_missing, prompt_check=check,
+                          best_held=best_held)
         if self.has_gold:
             rec.gold, rec.gold_ema, rec.gold_norm = gold, self.gold_ema, self.norm("gold", gold)
             rec.gold_norm_ema, rec.gold_select, rec.arc_combined_ema = gold_n, self.gold_select, arc_comb

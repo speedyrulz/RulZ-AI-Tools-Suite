@@ -8,6 +8,8 @@ from pathlib import Path
 
 import yaml
 
+from . import promptcheck as _promptcheck
+
 MODEL_PRESETS = {
     "MOSS-Image-Base": "OpenMOSS-Team/MOSS-Image-Base",
     "MOSS-Image-SFT": "OpenMOSS-Team/MOSS-Image-SFT",
@@ -315,10 +317,11 @@ PRESETS: dict[str, dict] = {
         "loss_watch": True, "per_image_lr": True,
     },
 }
+# the probe prompts a preset fills in when the config has none: (face, body) templates with {trigger}, taken from the
+# probe prompt presets (promptcheck.PRESETS, where the Train tab's preset lists come from too)
 PRESET_PROBE_PROMPTS = {
-    "identity": ("close-up portrait photo of {trigger}, neutral background, soft light",
-                 "full body photo of {trigger} standing straight facing the camera, arms at sides, plain background, "
-                 "whole body visible head to feet"),
+    "identity": (_promptcheck.preset(_promptcheck.CLASSIC["face"]).template,
+                 _promptcheck.preset(_promptcheck.CLASSIC["body"]).template),
 }
 
 
@@ -771,6 +774,15 @@ class TrainConfig:
     probe_ema: float = 0.5  # smoothing of probe scores (weight on the previous value)
     probe_async: bool = False  # render probes on a second GPU while training goes on (multi_gpu off, no race)
     probe_device: str = ""  # probe_async's GPU; empty = the first of devices that is not the training GPU
+    # the prompt check (promptcheck.py): does a probe render still show the frame its prompt asks for? Observe only
+    # unless likeness_best_min_kept or race_drop_drift act on it
+    probe_subject: str = ""  # what the preset prompts call the person ("a young woman with long dark brown hair");
+    #                          empty = a dataset's subject_class, else "a person"
+    probe_face_expect: str = ""  # the face probe's frame: "" = guessed from the prompt | none | headshot | upper | full
+    probe_body_expect: str = ""  # the body probe's, the same way
+    probe_checks: list = field(default_factory=list)  # extra prompts rendered and checked at every probe, never
+    #                 scored: a preset key (promptcheck.PRESETS) or {"name", "prompt", "expect", "kind": face | body}
+    probe_check_seeds: int = 4  # seeds per extra prompt (the first of the probe seeds)
     likeness_noise_band: float = 1.0  # percent points a change must exceed to count
     likeness_normalize: bool = True  # score face and body on one scale (0 = a stranger, 100 = the references) first
     face_scale_span: float = 1.35  # the face's 100 sits this many times as far above a stranger as the references do
@@ -784,6 +796,9 @@ class TrainConfig:
     # a best checkpoint (overall, face, body) is replaced by any higher smoothed score, not only one that beats it by
     # the noise band; whether the run still improves (early stop, step-up) still needs the band
     likeness_best_any_rise: bool = False
+    # experimental, unit-tested only: a probe whose renders keep their prompt's frame in less than this share (the
+    # prompt check's kept share, against the step-0 probe) cannot set a new best checkpoint. 0 = off
+    likeness_best_min_kept: float = 0.0
     # a second, held-out face recognizer on the probes (likeness.py): auto = FaceNet whenever the run trains against
     # ArcFace (reward_steps, id_loss_backend arcface, id_align), off, or facenet (always). Nothing ever trains on it,
     # so with face_gold_select it, not ArcFace, picks the best checkpoint, stops early and ranks a race
@@ -814,6 +829,11 @@ class TrainConfig:
     race_patience: int = 3
     race_patience_rising: bool = False  # with race_patience_drop: one out of patience stays while its smoothed score
     #                                     still rises from its previous probe (a chance to come back after a dip)
+    # experimental, unit-tested only: a configuration whose probes have drifted from their prompts' frame (the prompt
+    # check's drift share at or above this) for race_drop_drift_probes of its own probes in a row leaves the race.
+    # 0 = off. The last one never leaves; when all of them are over it, the least drifted stays
+    race_drop_drift: float = 0.0
+    race_drop_drift_probes: int = 2
     race_follow: bool = False  # a relay: nobody is dropped; after each round everyone continues from its winner's
     #                            LoRA, optimizer state and likeness history (seed rows: the best of several paths)
     race_parallel: bool = False  # data_parallel race: one configuration per GPU at the same time (an odd one out
@@ -1034,6 +1054,34 @@ class TrainConfig:
             raise ValueError("region_steer_step must be above 0 and at most 0.5, region_steer_strength above 0 and at "
                              "most 4")
 
+    def validate_prompt_check(self) -> None:
+        """The prompt check's settings (promptcheck.py): the probes' expected frames, the extra prompts, and the two
+        settings that act on it."""
+        allowed = ("", "none", *_promptcheck.EXPECTS)
+        for key in ("probe_face_expect", "probe_body_expect"):
+            if str(getattr(self, key) or "").strip().lower() not in allowed:
+                raise ValueError(f"{key} must be empty (guess from the prompt), none, or one of "
+                                 f"{', '.join(_promptcheck.EXPECTS)}, got {getattr(self, key)!r}")
+        if not 1 <= int(self.probe_check_seeds) <= 16:
+            raise ValueError("probe_check_seeds must be 1 to 16")
+        if not 0.0 <= self.likeness_best_min_kept <= 1.0:
+            raise ValueError("likeness_best_min_kept must be 0 (off) to 1")
+        if not 0.0 <= self.race_drop_drift <= 1.0:
+            raise ValueError("race_drop_drift must be 0 (off) to 1")
+        if int(self.race_drop_drift_probes) < 1:
+            raise ValueError("race_drop_drift_probes must be 1 or more")
+        _promptcheck.normalize_checks(self.probe_checks, self.trigger_word, _promptcheck.subject_of(self))
+        probing = self.probe_every > 0 and bool(self.face_refs or self.body_refs)
+        if self.probe_checks and not probing:
+            raise ValueError("probe_checks are rendered with the likeness probes and read by their scorers: set "
+                             "probe_every > 0 and face_refs and/or body_refs")
+        acting = [k for k, on in (("likeness_best_min_kept", self.likeness_best_min_kept > 0),
+                                  ("race_drop_drift", self.race and self.race_drop_drift > 0)) if on]
+        if acting and not (probing and _promptcheck.wanted(self)):
+            raise ValueError(f"{' and '.join(acting)} read the prompt check, which has nothing to check here: it "
+                             f"needs likeness probes (probe_every, face_refs and/or body_refs) and a probe prompt "
+                             f"whose frame is known (set probe_face_expect / probe_body_expect, or add probe_checks)")
+
     def validate(self) -> None:
         if self.optimizer.lower() == "hull":
             self.validate_hull()
@@ -1051,6 +1099,7 @@ class TrainConfig:
             raise ValueError("training_maps_every must be 0 (once an epoch) or a number of steps")
         if not 0.0 <= self.likeness_curriculum_framing <= 1.0:
             raise ValueError("likeness_curriculum_framing must be 0 (off) to 1")
+        self.validate_prompt_check()
         foreign = self.foreign_sampling_files()
         if foreign:
             raise ValueError(f"This run trains {self.arch_name()}, but these settings name another model's files: "
