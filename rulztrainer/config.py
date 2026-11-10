@@ -669,6 +669,8 @@ class TrainConfig:
     training_maps: bool = False  # observe only: nothing about training changes
     training_maps_images: int = 3  # pictures (at least one per dataset, so more with several datasets)
     training_maps_every: int = 0  # steps between captures; 0 = one epoch's worth of steps
+    training_maps_trigger_off: bool = False  # also map each picture with the trigger word taken out of its caption:
+    #                                          what the LoRA changes unasked ("bleed"; 2 more forwards per noise level)
     # --- look consistency filter (Dataset tab): ease the scan's outliers in ---
     look_warmup: bool = False  # images under the look filter's fence (look_scores.json) start at a lower loss weight
     look_warmup_start: float = 0.4  # their loss weight at the start, rising linearly to 1
@@ -791,6 +793,9 @@ class TrainConfig:
     likeness_lr_step: float = 0.1  # relative change per decision
     likeness_curriculum: bool = False  # face/body dataset weighting + timestep bias from the score gap
     likeness_curriculum_strength: float = 1.0
+    likeness_curriculum_framing: float = 0.0  # experimental, untested: a body probe render with no measurable body
+    #                                           counts against the body for the curriculum, by this much (0 = off,
+    #                                           1 = a probe where no render shows a body reads as a body score of 0)
     # configuration race (see race.py): the configurations train in turn, are probed, and the lowest is dropped
     race: bool = False
     race_configs: list[dict] = field(default_factory=list)  # [{"name": ..., <setting>: <value>, ...}], 2 or more
@@ -1038,6 +1043,8 @@ class TrainConfig:
             raise ValueError("training_maps_images must be 1 to 12 (each picture adds 3-9 forwards per capture)")
         if self.training_maps_every < 0:
             raise ValueError("training_maps_every must be 0 (once an epoch) or a number of steps")
+        if not 0.0 <= self.likeness_curriculum_framing <= 1.0:
+            raise ValueError("likeness_curriculum_framing must be 0 (off) to 1")
         foreign = self.foreign_sampling_files()
         if foreign:
             raise ValueError(f"This run trains {self.arch_name()}, but these settings name another model's files: "

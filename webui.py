@@ -1520,6 +1520,7 @@ class Form:
             likeness_lr_min=float(v("likeness_lr_min")), likeness_lr_max=float(v("likeness_lr_max")),
             likeness_lr_step=float(v("likeness_lr_step")), likeness_curriculum=bool(v("likeness_curriculum")),
             likeness_curriculum_strength=float(v("likeness_curriculum_strength")),
+            likeness_curriculum_framing=float(v("likeness_curriculum_framing") or 0),
             loss_watch=bool(v("loss_watch")), per_image_lr=bool(v("per_image_lr")),
             loss_watch_buckets=int(v("loss_watch_buckets")), loss_watch_beta=float(v("loss_watch_beta")),
             loss_watch_high=float(v("loss_watch_high")), loss_watch_low=float(v("loss_watch_low")),
@@ -1543,6 +1544,7 @@ class Form:
             holdout_patience=int(v("holdout_patience") or 0),
             training_maps=bool(v("training_maps")), training_maps_images=int(v("training_maps_images") or 3),
             training_maps_every=int(v("training_maps_every") or 0),
+            training_maps_trigger_off=bool(v("training_maps_trigger_off")),
             isolation=bool(v("isolation")), isolation_class=s("isolation_class"),
             isolation_kind=v("isolation_kind") or "auto", dop_weight=float(v("dop_weight")),
             dop_every=int(v("dop_every") or 1), isolation_pairs=int(v("isolation_pairs") or 0),
@@ -3753,6 +3755,9 @@ MAP_HINTS = {
     "effect": "Where the LoRA changes the prediction. For a person it should sit on the face and body; spreading onto "
               "a recurring background, jacket or prop means the LoRA is learning that too (vary it, caption it, or "
               "use the region-weighted loss).",
+    "effect_off": "The same picture and noise with the trigger word taken out of the caption: where the LoRA still "
+                  "changes the prediction. Little here means the LoRA is tied to its trigger; as much as with the "
+                  "trigger means it acts whatever the caption says (it has bled into the model's idea of a person).",
     "attn": "How much attention each area gives the trigger word. It should sit on the subject; on a logo, watermark "
             "or object means the trigger is tied to that.",
 }
@@ -3977,6 +3982,8 @@ RACE_LABELS = {
     "attn_localize_weight": "Trigger attention weight", "id_align": "Identity alignment",
     "id_align_weight": "Identity alignment weight", "body_align": "Body alignment",
     "body_align_weight": "Body alignment weight", "likeness_curriculum": "Face/body curriculum",
+    "likeness_curriculum_framing": "Curriculum: count lost framing",
+    "training_maps_trigger_off": "Training maps: trigger-off pass",
     "likeness_lr_control": "Likeness lr control", "loss_watch": "Per-image loss watch",
     "region_watch": "Region watch", "region_class_weights": "Region class weights",
     "region_steer": "Region steering", "region_steer_regions": "Region steering: regions",
@@ -8660,6 +8667,15 @@ def build_page(local: bool = True):
                                                                  value=d.training_maps_every, min=0,
                                                                  precision=0).classes("w-56") \
                                 .bind_visibility_from(w["training_maps"], "value")
+                            w["training_maps_trigger_off"] = ui.switch("Trigger-off pass",
+                                                                       value=d.training_maps_trigger_off) \
+                                .bind_visibility_from(w["training_maps"], "value").tooltip(
+                                "Also maps each picture with the trigger word taken out of its caption: where the "
+                                "LoRA changes the prediction although it was not asked for. The log gives one "
+                                "number per capture, the bleed: how much the LoRA acts without the trigger word "
+                                "against with it (near 0 = tied to its trigger, near 1 = acts the same either way). "
+                                "Two more forward passes per picture and noise level. New and not yet run in a real "
+                                "training here.")
 
                     # ---- LoRA Isolation
                     with sections.section("Likeness", "LoRA Isolation",
@@ -8827,6 +8843,14 @@ def build_page(local: bool = True):
                                                                           value=d.likeness_curriculum_strength,
                                                                           min=0, max=1, step=0.1).classes("w-28") \
                                 .bind_visibility_from(w["likeness_curriculum"], "value")
+                            w["likeness_curriculum_framing"] = ui.number(
+                                "Count lost framing (0 = off)", value=d.likeness_curriculum_framing, min=0, max=1,
+                                step=0.1).classes("w-56").bind_visibility_from(w["likeness_curriculum"], "value") \
+                                .tooltip("Experimental, untested. A body probe render that shows no measurable body "
+                                         "(a head-and-shoulders picture where a body was asked for) counts against "
+                                         "the body for the curriculum, so a body probe turning into portraits pulls "
+                                         "training towards the full-body photos. 1 = a probe with no body in any "
+                                         "render reads as a body score of 0. The log reports the count either way.")
                         with advanced("Likeness-filtered self-training"):
                             hint("Partway through the steps the LoRA renders pictures of new prompts (Previews' steps "
                                  "and guidance, the largest training resolution). Those with one confident, uncut "

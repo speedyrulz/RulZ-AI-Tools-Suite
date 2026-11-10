@@ -415,3 +415,88 @@ def test_trainer_maps_off_in_a_race_and_when_disabled(tmp_path):
     t.cfg.training_maps = False
     t._setup_maps(t.cfg, 0)
     assert t.maps is None
+
+
+# ---------------------------------------------------------------- the trigger-off pass
+
+
+class TriggerToy(ToyModel):
+    """As ToyModel, with a 'LoRA' that acts in proportion to the caption's mean feature: what a trigger word does."""
+
+    def forward(self, latents, t, embeds, mask):
+        self.calls += 1
+        return latents.float() * 0.5 + self.lora_delta * self.lora.multiplier * embeds.float().mean()
+
+
+def test_strip_trigger_takes_the_word_out_and_tidies_what_is_left():
+    words = ["ohwx", "ohwx woman"]
+    assert TM.strip_trigger("photo of ohwx, a woman in a cafe", words) == "photo of, a woman in a cafe"
+    assert TM.strip_trigger("OHWX woman standing", words) == "standing"  # the longer trigger first, any case
+    assert TM.strip_trigger("a woman, ohwx, smiling.", words) == "a woman, smiling."
+    assert TM.strip_trigger("ohwxman at the beach", words) == "ohwxman at the beach"  # whole words only
+    assert TM.strip_trigger("no trigger here", words) == "no trigger here"
+    assert TM.strip_trigger("ohwx", words) == "" and TM.strip_trigger("a cat", []) == "a cat"
+
+
+def test_bleed_is_the_effect_without_the_trigger_over_the_effect_with_it():
+    g = lambda *v: {"w": len(v), "h": 1, "v": list(v)}  # noqa: E731
+    maps = {"0": {"0.5": {"effect": g(1.0, 3.0), "effect_off": g(0.5, 0.5)}, "0.75": {"effect": g(2.0, 2.0)}},
+            "1": {"0.5": {"effect": g(4.0), "effect_off": g(3.0)}, "0.25": {"loss": g(1.0)}}}
+    assert TM.bleed(maps) == pytest.approx((0.25 + 0.75) / 2)  # per picture and level that has both, then the mean
+    assert TM.bleed({"0": {"0.5": {"effect": g(1.0)}}}) is None and TM.bleed({}) is None
+    assert TM.bleed({"0": {"0.5": {"effect": g(0.0), "effect_off": g(1.0)}}}) is None  # nothing to divide by
+
+
+def test_trigger_off_pass_writes_its_map_and_the_bleed(tmp_path):
+    model = TriggerToy()
+    model.train()
+    injected = {"l": model.lora}
+    probes = _probes()
+    probes[0]["embeds"] = torch.ones(1, 5, 4)
+    probes[0]["off"] = {"embeds": torch.full((1, 3, 4), 0.25), "mask": torch.ones(1, 3, dtype=torch.bool)}
+    maps = TM.TrainingMaps(tmp_path, probes, every=10)
+    maps.start(0, resume=False)
+    maps.capture(0, 0.0, model, injected, "cpu")
+    assert maps.last_bleed is None and "bleed" not in _lines(tmp_path)[0]  # no effect map before training
+    calls = model.calls
+    maps.capture(10, 1.0, model, injected, "cpu")
+    assert model.calls - calls == 3 * 4  # per noise level: with and without the LoRA, each with and without the word
+    row = _lines(tmp_path)[1]
+    level = row["maps"]["0"]["0.5"]
+    assert level["effect"]["v"] == pytest.approx([0.5] * 12, abs=1e-3)
+    assert level["effect_off"]["v"] == pytest.approx([0.125] * 12, abs=1e-3)  # a quarter of the caption feature
+    assert row["bleed"] == pytest.approx(0.25, abs=1e-3) and maps.last_bleed == row["bleed"]
+    assert model.training and model.lora.multiplier == 1.0
+    data = TM.read(tmp_path)
+    assert data["captures"][1]["bleed"] == row["bleed"] and data["captures"][0]["bleed"] is None
+    assert data["probes"][0]["trigger_off"] is True and "effect_off" in TM.MAP_KINDS
+    assert TM.level_map(data["captures"][1], "0", "effect_off").mean() == pytest.approx(0.125, abs=1e-3)
+    plain = TM.TrainingMaps(tmp_path / "plain", _probes(), every=10)  # no trigger-off pass: nothing changes
+    plain.start(0, resume=False)
+    plain.capture(0, 0.0, ToyModel(), injected, "cpu")
+    plain.capture(10, 1.0, ToyModel(), injected, "cpu")
+    assert "effect_off" not in _lines(tmp_path / "plain")[1]["maps"]["0"]["0.5"] and plain.last_bleed is None
+
+
+def test_trainer_caches_the_trigger_free_captions_and_hands_them_to_the_maps(tmp_path):
+    from safetensors.torch import save_file
+
+    from rulztrainer.dataset import text_cache_path
+
+    t, model = _stub_trainer(tmp_path, ["ohwx a man in a hat", "a red car on a street", "ohwx b man and dog"],
+                             trigger_word="ohwx", training_maps_images=3, training_maps_trigger_off=True,
+                             cache_dir=str(tmp_path / "cache"))
+    t.holdout_items = []
+    prompts = t._trigger_off_prompts(t.cfg, t.batcher.items)
+    assert prompts == ["a man in a hat", "b man and dog"]  # the caption without a trigger has nothing to strip
+    t.cfg.training_maps_trigger_off = False
+    assert t._trigger_off_prompts(t.cfg, t.batcher.items) == []
+    t.cfg.training_maps_trigger_off = True
+    cached = text_cache_path(t.cfg, "a man in a hat")  # one of the two was cached, the other not
+    cached.parent.mkdir(parents=True)
+    save_file({"embeds": torch.randn(5, 4)}, str(cached))
+    t._setup_maps(t.cfg, 0)
+    assert [bool(pr.get("off")) for pr in t.maps.probes] == [True, False, False]  # (the pictures sorted by name)
+    assert t.maps.probes[0]["off"]["embeds"].shape == (1, 5, 4)
+    t.race_rows = [("a", t.cfg)]
+    assert t._trigger_off_prompts(t.cfg, t.batcher.items) == []

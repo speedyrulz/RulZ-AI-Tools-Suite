@@ -1016,6 +1016,7 @@ The **Training maps** tab shows them over the picture as training saw it (the bu
 | Learned since the start | Green where the model got better than at the first capture, magenta where it got worse. Read this one first. |
 | Not learned yet | Where the prediction still misses (red most, then yellow, then blue). Fine detail always looks warmer. |
 | Where the LoRA acts | How much the LoRA changes the prediction (the same prediction with the LoRA switched off). |
+| Where the LoRA acts without the trigger word | With `training_maps_trigger_off`: the same, with the trigger word taken out of the caption. |
 | Trigger word | The trigger word's share of each area's attention over the caption, averaged over heads and every block. With several trigger words in a caption, each word on its own too. |
 
 Pick the picture, the map, the noise level (All levels is the mean of the three) and the capture; Play steps
@@ -1029,6 +1030,15 @@ through the captures. Each map keeps one colour scale across all captures so the
   may be better;
 - *Trigger word* centred on something other than the subject (a logo, a watermark, an object): the trigger is tied
   to that.
+
+**The trigger-off pass (`training_maps_trigger_off`, new and not yet run in a real training here).** Each map picture
+is also run with the trigger word taken out of its caption (whole words, any case; the caption is otherwise the same),
+with the LoRA on and off. *Where the LoRA acts without the trigger word* shows what the LoRA changes when it was not
+asked for, and the log gives one number per capture, the **bleed**: the mean of that map over the mean of *Where the
+LoRA acts* (`bleed` in `maps.jsonl`). Near 0, the LoRA is tied to its trigger word; near 1, it acts the same whatever
+the caption says, which is how a LoRA ends up changing every person the model draws. It costs two more forward passes
+per picture and noise level, and the trigger-free captions are encoded with the other texts before training. A
+picture whose caption has no trigger word has no such map, and neither has a fine-tune.
 
 Details: the maps use the weight average (`lora_ema`) as samples and probes do, run without gradients in eval mode
 with the RNG put back, and with compiled blocks run eagerly. RulZ Trainer's trigger map normalises over the caption's
@@ -1436,6 +1446,15 @@ consecutive probes (see [Probe noise check](#probe-noise-check-noise_files)). Th
   dataset images (largest face >= 3% of the image, classified once with the face detector) are sampled more
   often and the timestep distribution shifts toward lower noise where facial detail forms; the reverse when the
   body lags. Strength 0..1.
+
+**The body probe's framing.** A body probe render in which the body scorer finds no body to measure (a
+head-and-shoulders picture where a body was asked for) used to show only as a missing score. The log now says how many
+renders of a probe that is (`Body probe framing step N: 5 of 8 renders show no measurable body`), and `likeness.jsonl`
+keeps it (`body_probes`, `body_missing`). `likeness_curriculum_framing` (0 = off, experimental and never run in a real
+training) lets the curriculum read it: a render without a body counts against the body, so a body probe that has
+turned into portraits pulls the sampling towards the full-body photos instead of leaving the curriculum on a stale
+body score. At 1 a probe with no body in any render reads as a body score of 0. It was added after five Qwen-Image
+2.1 runs lost the body probe's framing in this way with nothing reacting to it.
 
 The scores never enter the loss; they steer data, lr and stopping. Use the same reference set and prompts for a
 whole run so the series is comparable.
