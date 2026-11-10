@@ -1169,13 +1169,15 @@ measured against a first sweep at one resolution, so not with `resolution_step_u
 `region_sweep.jsonl` (one line per sweep), the Monitor's Region watch section (a sweep line, and the sweeps' contrast
 beside the training steps' in the table).
 
-**The sweep chart** (Monitor, Details view, Region watch section, from 3.6.0) draws every sweep of the run: per
-region the share of its starting error that is gone, in percent, against the step. One colour per region, solid lines
-for the training pictures and dashed ones for the held-out photos, the subject (face, hair and skin together) thicker,
-and a pin on the held-out subject's best sweep. Training lines that keep rising while the held-out ones flatten or
-fall is the model memorising the photos. A click on a name in the legend hides or shows its line. It needs no new
-setting: it appears with a run's second sweep, and for a run with sweeps but no region watch the section shows the
-chart without the per-picture table.
+**The sweep charts** (Monitor, Details view, Region watch section; one chart in 3.6.0, split up in 3.6.1) draw every
+sweep of the run against the step. On top is **the gap chart**: per region, how many points further it has been
+learned on the training pictures than on the held-out photos, one line per region, the subject (face, hair and skin
+together) thicker. A line that keeps rising is that region being memorised rather than learned. It needs held-out
+photos and sweeps of the training pictures. Under it each region has **its own chart**: the share of its starting
+error that is gone, in percent, on the training pictures (the region's colour) and on the held-out photos (grey,
+dashed), with a pin on the held-out subject's best sweep. A click on a name in a legend hides or shows its line. They
+need no new setting: they appear with a run's second sweep, and for a run with sweeps but no region watch the section
+shows the charts without the per-picture table.
 
 ## Training maps (`training_maps`)
 

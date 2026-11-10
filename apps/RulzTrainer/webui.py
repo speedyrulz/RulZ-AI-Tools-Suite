@@ -986,26 +986,42 @@ def sweep_history(sweep: dict | None, job_dir=None) -> list[dict]:
     return rows[-400:]
 
 
-def sweep_chart_series(history: list[dict], best=None) -> tuple[list[dict], list[str]]:
-    """(series, legend) of the Monitor's region sweep chart: per region the share of its starting error that is gone,
-    in percent, at every sweep. One colour per region, the training pictures solid and the held-out ones dashed
-    ("face (held-out)"), the subject (face, hair and skin together) thicker. A set of pictures that was not swept
-    has no lines. best: (score, step) of the held-out subject's best sweep, marked on its line."""
+def sweep_gap_series(history: list[dict]) -> tuple[list[dict], list[str]]:
+    """(series, legend) of the Monitor's sweep gap chart: per region, the training pictures' learned share less the
+    held-out pictures', in points, at every sweep both were read. One line per region in its own colour, the subject
+    (face, hair and skin together) thicker. Empty without held-out pictures (or with them only)."""
     series, legend = [], []
-    for key, suffix, style in (("train", "", {}), ("held", " (held-out)", {"type": "dashed"})):
-        for region, color in SWEEP_COLORS.items():
-            pts = [[int(r["step"]), round(100 * (r.get(key) or {})[region], 1)] for r in history
-                   if (r.get(key) or {}).get(region) is not None]
-            if not pts:
-                continue
-            line = _line(region + suffix, color, data=pts, showSymbol=len(pts) < 60, symbolSize=4,
-                         lineStyle={"width": 3 if region == "subject" else 1.5, **style})
-            if key == "held" and region == "subject" and best:
-                line["markPoint"] = {"symbol": "pin", "symbolSize": 34, "itemStyle": {"color": "#F59E0B"},
-                                     "label": {"formatter": "best", "color": "#0A0A0A", "fontSize": 9},
-                                     "data": [{"coord": [int(best[1]), round(100 * float(best[0]), 1)]}]}
-            series.append(line)
-            legend.append(region + suffix)
+    for region, color in SWEEP_COLORS.items():
+        pts = [[int(r["step"]), round(100 * ((r.get("train") or {})[region] - (r.get("held") or {})[region]), 1)]
+               for r in history
+               if (r.get("train") or {}).get(region) is not None and (r.get("held") or {}).get(region) is not None]
+        if not pts:
+            continue
+        series.append(_line(region, color, data=pts, showSymbol=len(pts) < 60, symbolSize=4,
+                            lineStyle={"width": 3 if region == "subject" else 1.5}))
+        legend.append(region)
+    return series, legend
+
+
+def sweep_region_series(history: list[dict], region: str, best=None) -> tuple[list[dict], list[str]]:
+    """(series, legend) of one region's sweep chart: the share of its starting error that is gone, in percent, at
+    every sweep, on the training pictures (the region's colour) and on the held-out ones (grey, dashed). A set of
+    pictures that was not swept has no line. best: (score, step) of the held-out subject's best sweep, marked on the
+    subject's held-out line."""
+    series, legend = [], []
+    for key, name, color, style in (("train", "training", SWEEP_COLORS[region], {}),
+                                    ("held", "held-out", "#A1A1AA", {"type": "dashed"})):
+        pts = [[int(r["step"]), round(100 * (r.get(key) or {})[region], 1)] for r in history
+               if (r.get(key) or {}).get(region) is not None]
+        if not pts:
+            continue
+        line = _line(name, color, data=pts, showSymbol=len(pts) < 60, symbolSize=4, lineStyle={"width": 2, **style})
+        if key == "held" and region == "subject" and best:
+            line["markPoint"] = {"symbol": "pin", "symbolSize": 34, "itemStyle": {"color": "#F59E0B"},
+                                 "label": {"formatter": "best", "color": "#0A0A0A", "fontSize": 9},
+                                 "data": [{"coord": [int(best[1]), round(100 * float(best[0]), 1)]}]}
+        series.append(line)
+        legend.append(name)
     return series, legend
 
 
@@ -10627,15 +10643,29 @@ def build_page(local: bool = True):
                     rw_label = hint("")
                     rs_label = hint("")
                     with ui.column().classes("w-full gap-1") as rs_box:
-                        hint("Region sweeps: how much of each region's starting error is gone, sweep by sweep (0% = "
-                             "as at the first sweep). Solid lines are the training pictures, dashed ones the "
-                             "held-out photos; the subject is face, hair and skin together. Training lines that "
-                             "keep rising while the held-out ones flatten or fall is the model memorising the "
-                             "photos. Click a name in the legend to hide or show its line.")
-                        rs_chart = RzChart(chart_options(
-                            _axis("step", min="dataMin"), _axis("% of the starting error gone", scale=True),
-                            [], [])).classes("w-full h-72")
-                        charts.append(rs_chart)
+                        with ui.column().classes("w-full gap-1") as rs_gap_box:
+                            hint("Gap between the training pictures and the held-out photos, sweep by sweep: how "
+                                 "many points further each region has been learned on the pictures the model "
+                                 "trains on than on the photos kept out of training. A line that keeps rising is "
+                                 "that region being memorised rather than learned. The subject is face, hair and "
+                                 "skin together. Click a name in the legend to hide or show its line.")
+                            rs_gap_chart = RzChart(chart_options(
+                                _axis("step", min="dataMin"),
+                                _axis("training minus held-out (points)", scale=True), [], [])).classes("w-full h-72")
+                            charts.append(rs_gap_chart)
+                        hint("Each region on its own: how much of its starting error is gone (0% = as at the first "
+                             "sweep), on the training pictures and on the held-out photos (grey, dashed).")
+                        rs_region: dict = {}  # region -> (its cell, its chart)
+                        with ui.element("div").classes("w-full grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3"):
+                            for region in SWEEP_COLORS:
+                                with ui.column().classes("w-full gap-0 min-w-0") as cell:
+                                    ui.label(region.capitalize() + (" (face, hair and skin)" if region == "subject"
+                                                                    else "")).classes("text-sm font-medium")
+                                    chart = RzChart(chart_options(
+                                        _axis("step", min="dataMin"), _axis("% gone", scale=True), [], [])) \
+                                        .classes("w-full h-52")
+                                    charts.append(chart)
+                                rs_region[region] = (cell, chart)
                     rs_box.visible = False
                     rw_note = hint("Contrast: a picture's background (or clothes) loss against its subject's, "
                                    "relative to its own start. Under 1 = that region is being learned faster than "
@@ -11057,11 +11087,21 @@ def build_page(local: bool = True):
                     sig = (str(_job_dir), rs.get("step"), len(rs.get("history") or []))
                     if sig != rw_state["sweep"]:
                         rw_state["sweep"] = sig
-                        series, legend = sweep_chart_series(sweep_history(rs, _job_dir), rs.get("best"))
-                        rs_chart.options["series"] = series
-                        rs_chart.options["legend"]["data"] = legend
-                        rs_chart.update()
-                        rs_box.visible = any(len(sr["data"]) > 1 for sr in series)
+                        history = sweep_history(rs, _job_dir)
+                        series, legend = sweep_gap_series(history)
+                        rs_gap_chart.options["series"] = series
+                        rs_gap_chart.options["legend"]["data"] = legend
+                        rs_gap_chart.update()
+                        rs_gap_box.visible = any(len(sr["data"]) > 1 for sr in series)
+                        drawn = False
+                        for region, (cell, chart) in rs_region.items():
+                            series, legend = sweep_region_series(history, region, rs.get("best"))
+                            chart.options["series"] = series
+                            chart.options["legend"]["data"] = legend
+                            chart.update()
+                            cell.visible = any(len(sr["data"]) > 1 for sr in series)
+                            drawn = drawn or cell.visible
+                        rs_box.visible = drawn
                 else:
                     rs_box.visible = False
                 dup_note = near_duplicate_note(st.get("near_duplicates"))
@@ -11456,7 +11496,7 @@ is. The chip at the top right is the machine: the free space of the drive with y
 
 The **Monitor** shows one view at a time: **Overview** (GPUs, disk and memory, the queue, the race, the likeness chart
 and the loss), **Images** (the probe images and your samples, a race's configurations side by side), **Details** (the
-samples' identity similarity, gradient norm, per-image loss watch and region watch with the region sweeps' chart,
+samples' identity similarity, gradient norm, per-image loss watch and region watch with the region sweeps' charts,
 each when the run has it) and
 **Log & files** (the downloads and train.log). The numbers above the views stay put.
 
