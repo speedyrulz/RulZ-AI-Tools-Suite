@@ -47,6 +47,20 @@ import rulz_remote as remote  # noqa: E402
 
 from rulztrainer.train_queue import QueueLock  # noqa: E402  (standard library only)
 
+
+def config_bytes(config: dict) -> bytes:
+    """A run's config as the instance reads it: YAML. It was sent as JSON, which the instance's YAML loader reads
+    too, except that JSON writes a small float as `1e-08` and YAML takes an exponent without a decimal point for
+    text, so every config with such a default was refused ("'>' not supported between 'str' and 'float'"). YAML's
+    own writer puts the point in. Without PyYAML (it comes with the trainer) the JSON goes out as before, and a
+    trainer from 3.4.1 reads its numbers back."""
+    try:
+        import yaml
+    except ImportError:
+        return json.dumps(config).encode("utf-8")
+    return yaml.safe_dump(config, sort_keys=False, allow_unicode=True).encode("utf-8")
+
+
 DOWNLOAD_KINDS = {"logs": "Logs and settings", "probes": "Probe images", "samples": "Sample images",
                   "maps": "Training maps", "best": "Best LoRA", "loras": "Every LoRA / checkpoint"}
 DOWNLOAD_MODES = {"off": "Never", "end": "When the run ends", "during": "While it runs"}
@@ -811,7 +825,7 @@ class Fleet:
             for path in entry.get("push") or []:
                 if Path(path).name not in (snap.get("datasets") or []):
                     self.send(target, [(Path(path), Path(path).name)], "datasets", hidden=False)
-            done = target.agent(*self.start_args(entry), config=json.dumps(entry["config"]).encode("utf-8"))
+            done = target.agent(*self.start_args(entry), config=config_bytes(entry["config"]))
             try:
                 reply = json.loads(done.stdout or b"{}")
             except ValueError:
@@ -1185,7 +1199,7 @@ def check_entries(fleet: Fleet, entries: list[dict]) -> list[dict]:
             continue
         inst = pool[0]
         done = fleet.remote_for(inst).agent(*fleet.start_args(entry, dry_run=True),
-                                            config=json.dumps(entry["config"]).encode("utf-8"))
+                                            config=config_bytes(entry["config"]))
         if done.returncode == 0:
             plan = json.loads(done.stdout)
             plans.append({"job": entry["job"], "checked": inst["id"], "arch": plan.get("arch"),
