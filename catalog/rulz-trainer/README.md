@@ -879,6 +879,41 @@ and cleared by editing the image's caption. Output: `per_image_loss.jsonl` (ever
 `automagic3` / `automagic4`, whose step normalisation would absorb the per-image scaling. Verdicts need a few epochs to mean
 anything, so this suits typical character sets trained for thousands of steps.
 
+## Region watch (`region_watch`)
+
+**New in 2.49.0 and not yet run in a real training here:** the arithmetic is unit-tested, its readings on a real model
+are not.
+
+`region_watch: true` (Train tab, next to the loss watch) reports how far each part of the training pictures has been
+learned: **face, hair, body skin, clothes and background**. Every training step already has its picture's error per
+16 px cell; the watch splits that by the picture's parts map (MediaPipe's multiclass selfie segmenter, run once per
+picture before training and cached with the region maps), so it costs no extra model calls and changes nothing about
+training. The loss is read before any region weighting.
+
+Once an epoch the log, the Monitor and `region_watch.jsonl` get:
+
+- **Learned per region.** The region's loss over a frozen baseline of the run's own start (the mean loss per noise level
+  over the first epoch, or the first 64 samples of a smaller set), averaged over the epoch's pictures. `face 37%` means
+  37% of the face's starting error is gone. It reads a few points low, because the model already learns during the
+  baseline epoch. A face well ahead of the background is the healthy pattern; the background catching up is the set
+  being memorised.
+- **Contrast per picture** (the Monitor's table, lowest first). That picture's background (or clothes) loss against its
+  subject's (face, hair and skin together) in the same step, relative to the picture's own first three readings. `1.00`
+  is as at the start; under 1, this picture's background is being learned faster than its subject. One training sample
+  per picture per epoch at a random noise level is a noisy reading, smoothed over about five epochs: read it as a
+  trend.
+
+Not read: a region under 2 cells in a picture (the face of a small full-body shot may be), a sample whose caption was
+dropped, and LoRA Isolation's side-by-side pairs. A resumed run reads its saved state back (`region_watch.json`);
+without one it takes a new baseline, says so, and counts from the resume. Needs MediaPipe, as body likeness does:
+without it the watch turns itself off with one log line and training goes on. Not in a configuration race.
+
+Where it comes from: offline, the same split of the training maps of four Qwen-Image 2.1 runs showed every run learning
+the face about three times as fast as the background at step 1000, the gap closing by step 2000, and the run that fit
+its set hardest removing 44% of the background's error
+([test results](docs/experimental-test-results.md#qwen-image-21-optimizers-and-oft)). Those were fixed-noise maps of
+three pictures. The watch reads every picture from the training steps instead, so its numbers will not match them.
+
 ## Training maps (`training_maps`)
 
 Heatmaps over a few training pictures that show where training is going right or wrong, capture by capture. A
