@@ -250,6 +250,22 @@ Linux) to your bucket's `.rulz_compile/` folder: the next rental of the same GPU
 With `RULZ_MODEL_INCLUDE`, add `.rulz_compile/*` to its patterns.
 The WebUI also keeps torch's own compile caches under `/workspace/.cache`, so a restarted instance stays warm.
 
+**In the WebUI on an instance.** The chip at the top right shows the instance number and the free disk space, and
+the Monitor's *Disk* tile and a warning banner tell you before a rental's fixed-size disk fills up. While the bucket
+download is still going, the Monitor says so and how much has arrived. Browse buttons open a browser of the instance's
+files, and every download button hands the file to your browser.
+
+**Stop the instance when the runs are done.** An instance bills while it sits idle. On an instance the Monitor's
+*Queue* section has the switch *Stop this vast.ai instance when the runs are done*: three minutes after the last run
+ends (finished, stopped or failed) with nothing left in the queue, the instance stops itself. The GPU's billing ends,
+the disk and its storage charge stay, and *Start* on vast.ai brings it back with every file. The run strip counts the
+three minutes down; switching it off or starting a run cancels, and runs waiting in a paused queue keep the instance
+running. It waits for a run to have run since you switched it on, so it never stops an instance you have only just
+opened. *Stop the instance now* does the same at once, after a confirmation. Both use `CONTAINER_API_KEY`, the key
+vast.ai gives every instance for itself (start, stop and destroy of that one instance); the WebUI only ever sends
+"stop". The switch is kept in `output/_autostop.json` and is switched off before the stop is sent, so a restarted
+instance does not stop again. The queue and the switch work with no browser open.
+
 Service control on the instance: `supervisorctl status|restart rulztrainer`; its log is
 `/var/log/portal/rulztrainer.log`. `RULZ_REPO` / `RULZ_BRANCH` environment variables point the provisioning at a
 fork or branch. `Dockerfile` builds an image with the install baked in (`FROM vastai/pytorch:cuda-12.8.1-auto`,
@@ -788,8 +804,19 @@ it has not been measured on the models here.
 
 `sample_seed` is the seed of the first prompt; with `sample_walk_seed` each further prompt uses seed + 1.
 `sample_before_training` renders a sample set at step 0 for comparison. The log reports each prompt and the
-Monitor page shows the sampling step. The Monitor page also has per-GPU VRAM/utilization bars, an adjustable
-loss-smoothing slider, an auto-scrolling log and, under *Log and saved files*, the run's downloads: pick any LoRA in
+Monitor page shows the sampling step.
+
+The Monitor shows one view at a time, under the run's numbers (status, stage, step, loss, learning rate, time left):
+**Overview** (per-GPU VRAM and load, disk and memory, the queue, a race's table, the likeness chart and the loss with
+its smoothing slider), **Images** (the probe images and the samples by step; a race's configurations side by side),
+**Details** (the samples' identity similarity, the gradient norm, the per-image loss watch and the region watch, each
+when the run has it) and **Log & files**. The view you used last opens again. A **run strip** under the tabs shows
+the state, job, step, progress and time left on every tab, and the browser tab's title carries the progress, so a
+background tab still tells you how far the run is. The chip at the top right shows the free space of the drive with
+your runs and models: amber under 15 GB, red under 5 GB, with a banner on the Monitor (a save that does not fit ends
+the run).
+
+*Log & files* has an auto-scrolling log and, under *Saved files*, the run's downloads: pick any LoRA in
 the job folder (the checkpoints, the best and the final file, newest first) and *Download* it, *All LoRAs (.zip)* packs
 every one into one archive, and *Logs and settings (.zip)* packs `train.log`, `config.yaml`, `status.json`, the
 likeness scores and the run's other text files. *Probe images (.zip)* and *Sample images (.zip)* pack every probe
