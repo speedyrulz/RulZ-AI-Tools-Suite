@@ -973,6 +973,36 @@ and cleared by editing the image's caption. Output: `per_image_loss.jsonl` (ever
 `automagic3` / `automagic4`, whose step normalisation would absorb the per-image scaling. Verdicts need a few epochs to mean
 anything, so this suits typical character sets trained for thousands of steps.
 
+## Run report (`run_report`)
+
+A report of a training run, made from the files the run leaves in its job folder: a **summary picture** to look at or
+pass on, and a longer **PDF**.
+
+- **When a run ends:** `run_report: true` (Train tab > Saving & samples > *Run report when training ends*) writes both
+  into `output/<job>/report/` as `<job>_report.png` and `<job>_report.pdf`. It takes about half a minute and never
+  fails a run: if it cannot be written, the log says so and gives the command below.
+- **For an earlier run:** on the **Previous Runs** tab, tick the runs and press **Make report**; the files are written
+  to the run's job folder and downloaded. This needs the job folder to still hold that run's files (a later run with
+  the same job name replaces them). From a terminal: `python -m rulztrainer.runreport output/<job>` (`--pdf` or
+  `--image` for one of the two, `--out FOLDER` to write elsewhere).
+
+**The summary picture** shows the settings, the time and the best score; the likeness scores over the run with the best
+checkpoint marked; the **probe renders at up to six points of the run**, the same seeds in every row, with the best
+checkpoint's row framed in gold and the top-scoring render of each row outlined, and each render's own score under it
+(*no body* where a full-body render lost its body); examples of the dataset; the training maps of the last capture
+(or the held-out sweeps, or the loss, whichever the run has); and a short result list: the best checkpoint, lost
+framing, a rising copy score, near-duplicate photos, where the held-out photos peaked, a race's winner.
+
+**The PDF** adds every setting that differs from the defaults, a table of every probe, the loss, the region sweeps
+table, a race's configurations with who left when and why, **every probe step's renders** with their scores, 24
+dataset images with three captions, the maps at the start, the middle and the end of the run, the saved files, and the
+log's warnings and errors.
+
+A part whose files are missing is left out, so a run without probes or maps still gets a report. The pictures in it
+are the run's own (dataset photos and probe renders); it is written next to the run and sent nowhere. Needs
+matplotlib, which `requirements.txt` installs; an install from before 3.5.0 gets it with `pip install matplotlib`.
+In a race the summary shows the winner's renders and the PDF every configuration's.
+
 ## Region watch (`region_watch`)
 
 **First run on a real model in November 2026** (a Qwen-Image 2.1 fine-tune, 59 training pictures, 2000 steps). It added

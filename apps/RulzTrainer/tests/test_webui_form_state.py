@@ -243,3 +243,12 @@ def test_likeness_framing_is_on_by_default_and_goes_to_the_page_and_back():
     off = _filled_form(TrainConfig(likeness_framing=False, datasets=[{"path": "a"}]))
     off.w["datasets"].value = [{"path": "a"}]
     assert off.w["likeness_framing"].value is False and off.to_config().likeness_framing is False
+
+
+def test_the_run_report_switch_goes_to_the_page_and_back():
+    plain = _filled_form(TrainConfig(datasets=[{"path": "a"}]))
+    plain.w["datasets"].value = [{"path": "a"}]
+    assert plain.w["run_report"].value is False and plain.to_config().run_report is False
+    on = _filled_form(TrainConfig(run_report=True, datasets=[{"path": "a"}]))
+    on.w["datasets"].value = [{"path": "a"}]
+    assert on.to_config().run_report is True

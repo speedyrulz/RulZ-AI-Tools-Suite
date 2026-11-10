@@ -1504,6 +1504,7 @@ class Form:
             clean_share=str(v("clean_share") or "").strip(),
             logit_mean=float(v("logit_mean")), logit_std=float(v("logit_std")), loss_weighting=v("loss_weighting"),
             loss_type=v("loss_type") or "mse",
+            run_report=bool(v("run_report")),
             save_every=int(v("save_every")), keep_checkpoints=int(v("keep_checkpoints") or 0),
             sample_every=int(v("sample_every")), sample_prompts=prompts,
             reward_steps=int(v("reward_steps") or 0), reward_lr=float(v("reward_lr") or 2e-5),
@@ -6965,11 +6966,41 @@ def build_history_tab(charts: list):
                 .tooltip("The ticked runs' likeness spreadsheets (one file each), the same as the Monitor's: every "
                          "probe's face, body and combined score as formulas of the raw scores and the run's scale, "
                          "editable on the Scale sheet. Works after the job folder is gone or reused.")
+            ui.button("Make report", icon="summarize", on_click=lambda: make_reports()).props("flat dense") \
+                .tooltip("A summary picture and a PDF of each ticked run (settings, scores, probe renders through "
+                         "the run, dataset examples, training maps), written into its job folder's report/ and "
+                         "downloaded here. Needs the run's job folder to still hold its files.")
             ui.button("Remove from history", icon="delete", on_click=delete).props("flat dense color=negative")
             ui.button("Clear ticks", icon="deselect",
                       on_click=lambda: (setattr(table, "selected", []), table.update(), draw())).props("flat dense")
             ui.space()
             compare = hint("")
+    async def make_reports():
+        """The run report (runreport.py) of every ticked run whose job folder still holds its files."""
+        from rulztrainer import runreport
+
+        picked = selected_runs()
+        if not picked:
+            ui.notify("Tick a run first.", type="warning")
+            return
+        for rec in picked:
+            job_dir = history_job_dir(rec, state["runs"])
+            name = history_label(rec)
+            if job_dir is None:
+                ui.notify(f"{name}: its job folder is gone or holds a later run, so there is nothing to make a "
+                          f"report from.", type="warning")
+                continue
+            ui.notify(f"Making the report of {name}...")
+            try:
+                done = await run.io_bound(runreport.generate, job_dir)
+            except Exception as e:  # noqa: BLE001
+                ui.notify(f"{name}: no report ({e})", type="negative")
+                continue
+            for path in done.values():
+                ui.download(path)
+            ui.notify(f"Report of {name} written to {next(iter(done.values())).parent}", type="positive")
+        refresh_files()
+
     with section("Saved files", "Download a ticked run's LoRAs, logs, settings and images", "download"):
         files_run = ui.select({}, label="Run", on_change=lambda _: refresh_files()).classes("w-full max-w-[30rem]")
         files_note = hint("")
@@ -9006,6 +9037,12 @@ def build_page(local: bool = True):
                     # ---- Saving & samples
                     with sections.section("Basics", "Saving & samples", "Checkpoints and preview images", "save"):
                         with fields():
+                            w["run_report"] = ui.switch("Run report when training ends", value=d.run_report).tooltip(
+                                "Writes a report of the run into its job folder (report/): a summary picture with the "
+                                "settings, the scores, the probe renders at several points of the run with the best "
+                                "checkpoint marked, examples of the dataset and the training maps; and a longer PDF with "
+                                "every probe step, every changed setting, captions and the log's warnings. Takes about "
+                                "half a minute at the end. Previous Runs makes the same for an earlier run.")
                             w["save_every"] = ui.number("Save every N steps", value=d.save_every, precision=0) \
                                 .classes("w-44")
                             w["keep_checkpoints"] = ui.number("Checkpoints to keep (0 = all)",
