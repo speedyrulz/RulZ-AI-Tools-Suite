@@ -935,6 +935,7 @@ own setting and is off at 0:
 | `region_steer_ahead` | 0.7 | One picture at a time: its region is turned down when its contrast is under this x the median picture's, whatever the cohort does. It reads one noisy training sample per picture per epoch. |
 | `region_steer_boost` | 0 (never raise) | All pictures together: a face, hair or skin lagging the subject as a whole by more than a tenth is raised, up to this weight (1.5, say). Off by default: a region that stays hard is often a bad picture. |
 | `region_steer_prior` | 0 | While the background is past its cap, its prediction is also pulled towards the base model's, with up to this weight. Needs the cap rule and the background among the steered regions; one more forward pass a step while it acts; not for a fine-tune. |
+| `region_steer_holdout` | 0 | Needs [held-out photos](#region-sweeps-and-held-out-photos-experimental): a region memorised on the training pictures is turned down in every picture. |
 
 And the limits they share:
 
@@ -944,6 +945,7 @@ And the limits they share:
 | `region_steer_min` | 0.3 | A region's lowest weight. 0 lets steering mask a region out of a picture: the model is then free to do anything there. |
 | `region_steer_step` | 0.2 | The most a weight moves per epoch, as a share of itself; back up half as fast. |
 | `region_steer_strength` | 1.0 | How hard a rule pulls: the weight aimed for is (share within the limit) ^ (2 x this). |
+| `region_steer_signal` | `steps` | What the per-picture rules read: the training steps' own contrast, or `sweep`, the [fixed-noise sweeps'](#region-sweeps-and-held-out-photos-experimental). |
 
 How it acts: the weight of each region of each picture is 1 until a rule says otherwise, moves a step an epoch towards
 its target and returns when the cause is gone. The weights are rescaled to mean 1 per picture, so what is taken from
@@ -955,6 +957,43 @@ shows each picture's steered weights, and the log line says how many pictures ar
 
 What to compare it against: the same run with `region_class_weights`, and the same run with neither. Runs with the
 same settings and seed have differed by up to 15 points here, so one run of each shows little.
+
+## Region sweeps and held-out photos (experimental)
+
+**Never run in a real training here.** The arithmetic is unit-tested on a toy model; on a real one it follows the
+training maps' capture, which has run on Krea 2 and Qwen-Image 2.1.
+
+The region watch reads each picture once an epoch from its own training step, at a random noise level: free, but
+noisy. A **sweep** runs the model again on a picture at three fixed noise levels (0.25, 0.5, 0.75) with fixed noise, so
+between two sweeps only the weights change and a picture's learned share is measured against its own first sweep.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `region_sweep_every` | 0 (off) | Epochs between sweeps of the training pictures. With `holdout_images` a sweep runs every epoch unless this says otherwise. |
+| `region_sweep_pictures` | 0 | Training pictures per sweep: 0 = all, K = K in turn, -1 = none (the held-out photos only). The first sweep always takes all of them. |
+| `holdout_images` | 0 | Photos kept out of training (with every crop made from them) and swept every time. |
+| `holdout_track_best` | off | Saves `<job>_holdout_best.safetensors` at each new best of the held-out subject score (face, hair and skin together). |
+| `holdout_patience` | 0 (never) | Stops training after this many sweeps without a better held-out subject score. |
+| `region_steer_signal` | `steps` | With region steering: `sweep` makes the per-picture rules read the sweeps' contrast, not the training steps'. |
+| `region_steer_holdout` | 0 (off) | With region steering and held-out photos: a region learned this much further on the training pictures than on the held-out ones, and no better on those for two sweeps, is turned down in every picture. The one rule that may turn the face, hair or skin down. |
+
+**Cost.** 3 forward passes per picture per sweep. Sweeping every training picture every epoch about doubles the
+training time (an epoch trains each picture once, at about 3 forward passes' worth of time); every 4th epoch adds about
+a quarter; 8 pictures in turn of a set of 62 about an eighth; the held-out photos alone next to nothing.
+
+**Held-out photos** are picked by file name, evenly through the set, so the same set always holds out the same ones
+and a resumed run keeps them. A set needs at least 10 photos and at most a fifth may be held out. What the model
+learns on photos it never trained on, it has learned of the subject and not of those photos; the log line gives the
+learned share per region for the training pictures and the held-out ones, and the subject's gap between them. Two
+limits: with two or three held-out photos the score rests on very few pictures, and a held-out photo that nearly
+matches a training photo (the near-duplicate check names such pairs before training) is not unseen.
+
+Like the training maps, a sweep changes nothing about training (no gradients, eval mode and back, the RNG restored, the
+weight average used), a failed sweep turns the sweeps off for the rest of the run, and a race has none. They are
+measured against a first sweep at one resolution, so not with `resolution_step_up`. A resumed run reads
+`region_sweep.json` back; without one its first sweep is of the already trained model and the log says so. Output:
+`region_sweep.jsonl` (one line per sweep), the Monitor's Region watch section (a sweep line, and the sweeps' contrast
+beside the training steps' in the table).
 
 ## Training maps (`training_maps`)
 
