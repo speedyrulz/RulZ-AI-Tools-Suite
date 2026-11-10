@@ -763,16 +763,16 @@ class Trainer(RaceParallelMixin):
                 except Exception as e:  # noqa: BLE001
                     log.warning("MediaPipe unavailable for person masks (%s); body_loss_weight ignored", e)
             parts_fn = None
-            watching = bool(cfg.region_watch and self.race_rows is None)  # (a race has no region watch)
-            if any(c.wants_parts() for c in ([r[1] for r in self.race_rows] if self.race_rows is not None else [cfg])):
+            rows_cfg = [r[1] for r in self.race_rows] if self.race_rows is not None else [cfg]
+            if any(c.wants_parts() for c in rows_cfg):
                 parts_fn = R.PartsParser(cfg.models_dir, progress=lambda t, f: self.status.update(stage=t))
-            elif watching:
+            elif any(c.wants_part_maps() for c in rows_cfg):  # the region watch, steering, fixed class weights
                 try:
                     parts_fn = R.PartsParser(cfg.models_dir, progress=lambda t, f: self.status.update(stage=t))
                 except Exception as e:  # noqa: BLE001
                     self.region_watch_off = f"{type(e).__name__}: {str(e)[:200]}"
-                    log.warning("Region watch is off: the picture parser could not start (%s); training goes on "
-                                "without it", self.region_watch_off)
+                    log.warning("The region watch, region steering and region_class_weights are off: the picture "
+                                "parser could not start (%s); training goes on without them", self.region_watch_off)
             self.status.update(stage="building region weight maps")
             fns = None
             side = self.side_devices()
@@ -792,7 +792,7 @@ class Trainer(RaceParallelMixin):
                     counts = R.cache_region_maps(ritems, rcfg, self.face_analysis, person_fn,
                                                  progress=lambda i, n: self.status.update(step=i, total=n),
                                                  person_mask_fns=fns,
-                                                 parts_fn=parts_fn if rcfg.wants_parts() or watching else None)
+                                                 parts_fn=parts_fn if rcfg.wants_part_maps() else None)
                     if rcfg.wants_parts():  # region_weights is refused here: Hull's gains are the only weighting
                         log.info("Region maps ready (new this run): %s; Hull gains body %.2g / background %.2g",
                                  counts, rcfg.hull_gain_body, rcfg.hull_gain_background)
@@ -1301,24 +1301,49 @@ class Trainer(RaceParallelMixin):
             elif use_face or use_hull:
                 taps.stop()
             sq = elementwise_loss(cfg.loss_type, pred, target, latents, noise, sigma)
-            region_obs = None
-            if self.region_watch is not None and regions is not None:  # read before any region weighting
-                region_obs = regionwatch.region_losses(sq, [rm.parts for rm in regions.meta])
+            region_obs = class_w = None
+            watch = self.region_watch
+            parts = [rm.parts for rm in regions.meta] if regions is not None else None
+            if watch is not None and parts is not None:  # read before any region weighting
+                region_obs = regionwatch.region_losses(sq, parts)
+            if parts is not None and not self.region_watch_off:  # fixed class weights and this epoch's steered ones
+                fixed = regionwatch.parse_class_weights(cfg.region_class_weights)
+                steered = watch.gains([it.key for it in batch]) if watch is not None and watch.steering else None
+                if fixed or steered:
+                    class_w = regionwatch.weight_maps(
+                        parts, [regionwatch.merge_gains(fixed, g) for g in steered or [None] * len(batch)], sq)
             if regions is not None and cfg.region_weights:  # region-weighted loss: face > person > background (mean 1)
-                sq = sq * regions.weight.to(rdev)
+                wmap = regions.weight.to(rdev)
+                if class_w is not None:  # with steering: multiplied, then back to mean 1 per sample
+                    wmap = wmap * class_w
+                    wmap = wmap / wmap.mean(dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
+                sq = sq * wmap
+            elif class_w is not None:
+                sq = sq * class_w
             per = sq.mean(dim=(1, 2, 3))
-            if (regions is not None and cfg.region_weights and cfg.region_prior_weight > 0
-                    and bool(regions.prior.any())):
-                # prior preservation: keep background cells close to what the base model (LoRA off) predicts
+            base_pred = None
+
+            def lora_off_pred():
                 lora_mod.set_multiplier(rinj, 0.0)
                 try:
                     with torch.no_grad():
-                        base_pred = rmodel(noisy_in, sigma * 1000.0, embeds, mask).float()
+                        return rmodel(noisy_in, sigma * 1000.0, embeds, mask).float()
                 finally:  # an out-of-memory retry must not train with the LoRA switched off
                     lora_mod.set_multiplier(rinj, 1.0)
+
+            if (regions is not None and cfg.region_weights and cfg.region_prior_weight > 0
+                    and bool(regions.prior.any())):
+                # prior preservation: keep background cells close to what the base model (LoRA off) predicts
+                base_pred = lora_off_pred()
                 pm = regions.prior.to(rdev).float()
                 prior = ((pred - base_pred).pow(2) * pm).sum(dim=(1, 2, 3)) / (pm.sum(dim=(1, 2, 3)) * pred.shape[1]).clamp(min=1)
                 per = per + cfg.region_prior_weight * prior
+            if watch is not None and watch.prior_weight > 0 and parts is not None and self.ft is None:
+                bg = regionwatch.background_mask(parts, sq)  # region steering's prior: the parser's background cells
+                if bg is not None:
+                    base_pred = lora_off_pred() if base_pred is None else base_pred
+                    prior = ((pred - base_pred).pow(2) * bg).sum(dim=(1, 2, 3)) / (bg.sum(dim=(1, 2, 3)) * pred.shape[1]).clamp(min=1)
+                    per = per + watch.prior_weight * prior
             weights = loss_weight(cfg, sigma)
             look = self._look_factors(batch, cur_step, cfg, self.batcher,
                                       cfg.batch_size * cfg.gradient_accumulation * len(self.replicas))
@@ -2888,16 +2913,30 @@ class Trainer(RaceParallelMixin):
     def _make_region_watch(self, items, step: int):
         """The region watch (observe only), or None: off, a race, or no parser for the parts maps."""
         cfg = self.cfg
-        if not cfg.region_watch:
+        fixed = regionwatch.parse_class_weights(cfg.region_class_weights)
+        if fixed and not self.region_watch_off:
+            log.info("Region class weights on: %s (mean 1 per picture; a region left out stays at 1)",
+                     ", ".join(f"{r} x{w:g}" for r, w in fixed.items()))
+        if not cfg.wants_region_watch():
             return None
         if self.race_rows is not None:
-            log.info("Region watch is off for a race (its configurations take turns on one model)")
+            log.info("Region watch%s is off for a race (its configurations take turns on one model)",
+                     " and region steering" if cfg.region_steer else "")
             return None
         if self.region_watch_off:
             return None
-        watch = regionwatch.RegionWatch(items, self.job_dir, resume=bool(cfg.resume_state) and step > 0)
-        log.info("Region watch on: %d pictures, the loss per region read from the training steps (observe only)%s",
-                 len(watch.stats), "; no saved state for this resume, so it counts from here" if watch.late else "")
+        steer = cfg.region_steer_settings()
+        watch = regionwatch.RegionWatch(items, self.job_dir, resume=bool(cfg.resume_state) and step > 0, steer=steer)
+        rules = [] if not watch.steer else [text for text, on in (
+            (f"cap {steer['cap']:g}", steer["cap"] > 0), (f"ahead {steer['ahead']:g}", steer["ahead"] > 0),
+            (f"boost {steer['boost']:g}", steer["boost"] > 0), (f"prior {steer['prior']:g}", steer["prior"] > 0)) if on]
+        log.info("Region watch on: %d pictures, the loss per region read from the training steps (%s)%s",
+                 len(watch.stats),
+                 f"steering {' and '.join(steer['regions'])}: {', '.join(rules)}, lowest weight {steer['min']:g}, "
+                 f"step {steer['step']:g}" if watch.steer else "observe only",
+                 "; no saved state for this resume, so it counts from here" if watch.late else "")
+        if watch.steer_off:
+            log.warning("Region steering is off for this run (%s): the watch still observes", watch.steer_off)
         return watch
 
     # ------------------------------------------------------------ training resolutions

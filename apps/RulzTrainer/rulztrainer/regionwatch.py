@@ -13,9 +13,24 @@ clothes, background - at no extra model call. Two things are read from it:
     by the baseline's ratio at that noise level and by the picture's own first START_OBS readings, then smoothed. 1 =
     as at the start; under 1 = that region is being learned faster than the subject in this picture.
 
-It only observes: the loss is read before any region weighting, and nothing about training changes. One training
-sample per picture per epoch at a random noise level is a noisy reading, so the per-picture contrast is a smoothed
-trend, not a measurement, and a region of fewer than MIN_CELLS cells is left out.
+The watch only observes: the loss is read before any region weighting. One training sample per picture per epoch at a
+random noise level is a noisy reading, so the per-picture contrast is a smoothed trend, not a measurement, and a
+region of fewer than MIN_CELLS cells is left out.
+
+Two ways to act on the parts maps, both off by default and neither run in a real training yet:
+
+  * region_class_weights: one fixed loss weight per region for the whole run (parse_class_weights, weight_maps).
+  * region steering (region_steer): once an epoch the watch moves loss weights a step, each rule on its own switch:
+      - cap    (cohort): the background's / the clothes' learned share may be at most `cap` x the subject's. Past it,
+               that region is turned down in every picture, further in the pictures where it runs further ahead.
+      - ahead  (per picture): a picture whose region's contrast is under `ahead` x the median picture's is turned
+               down in that picture alone, whatever the cohort does.
+      - boost  (cohort): a subject region (face, hair, skin) lagging the subject as a whole is raised, up to `boost`.
+               Off unless asked for: a region that stays hard is often a bad picture.
+      - prior  (cohort): while the background is past its cap, a prior-preservation term pulls the background's
+               prediction towards the base model's, up to `prior`.
+    A weight moves at most `step` an epoch (back up half as fast), never under `min`, and returns when its cause is
+    gone. Weights are renormalised to mean 1 per sample: what is taken from a region goes to the rest of the picture.
 
 Output in the job folder: region_watch.jsonl (one line per epoch) and region_watch.json (the whole state: a resumed
 run reads it back, because a baseline taken from an already trained model would be wrong).
@@ -40,10 +55,16 @@ COLUMNS = REGIONS + (SUBJECT,)
 CHANNELS = {"face": (3,), "hair": (1,), "skin": (2,), "clothes": (4, 5), "background": (0,), SUBJECT: (1, 2, 3)}
 MIN_CELLS = 2.0  # a region smaller than this in a picture is not read
 BUCKETS = 12  # noise levels for the baseline curves
-KERNEL = 1.5  # buckets: the curves are smoothed over their neighbours
+KERNEL = 1.5  # buckets: the ratio curves are smoothed over their neighbours (one odd picture must not dent them)
 BASELINE_MIN = 64  # samples before the baseline freezes (whole epochs: a small set takes several)
 START_OBS = 3  # a picture's first readings set its own starting contrast
 BETA = 0.8  # the per-picture contrast's smoothing (about 5 epochs)
+SUBJECT_REGIONS = ("face", "hair", "skin")
+MIN_SUBJECT_LEARNED = 0.05  # steering waits until the cohort's subject has learned this much: ratios mean little before
+LEARNED_BETA = 0.5  # the cohort's learned shares, smoothed over about two epochs, are what steering reads
+SPREAD = (0.5, 2.0)  # how far a picture's own contrast may move its share of a cohort-wide cut
+BOOST_MARGIN = 0.1  # a subject region is lagging when it is this far (as a share) behind the subject as a whole
+SNAP = 0.02  # a weight this close to its target lands on it
 STATE_FILE, LOG_FILE = "region_watch.json", "region_watch.jsonl"
 
 
@@ -71,6 +92,77 @@ def region_losses(sq, parts: list):
     return out_l, out_c
 
 
+def parse_class_weights(spec: str) -> dict[str, float]:
+    """region_class_weights as {region: weight}: "face=3, hair=1.5, background=0.3" (a region left out stays at 1; ""
+    is {}). Raises ValueError with what to change."""
+    out: dict[str, float] = {}
+    for part in str(spec or "").replace(";", ",").split(","):
+        if not part.strip():
+            continue
+        name, sep, value = part.partition("=")
+        name = name.strip().lower()
+        try:
+            weight = float(value)
+        except ValueError:
+            weight = float("nan")
+        if not sep or name not in REGIONS or not 0.0 <= weight <= 10.0:
+            raise ValueError(f"region_class_weights: {part.strip()!r} must be <region>=<weight from 0 to 10>, the "
+                             f"region one of {', '.join(REGIONS)}")
+        out[name] = weight
+    if out and len(out) == len(REGIONS) and not any(w > 0 for w in out.values()):
+        raise ValueError("region_class_weights: at least one region needs a weight above 0")
+    return out
+
+
+def merge_gains(*gains: dict | None) -> dict:
+    """Several {region: weight} multiplied together (a region left out of one is 1 there)."""
+    out: dict[str, float] = {}
+    for gain in gains:
+        for region, value in (gain or {}).items():
+            out[region] = out.get(region, 1.0) * float(value)
+    return out
+
+
+def weight_maps(parts: list, gains: list, like):
+    """Per sample the loss weight per cell from a weight per region: [B, 1, h, w] with mean 1 per sample, on like's
+    device and type (like: a tensor with the loss's grid). gains: per sample {region: weight} (left out = 1) or None.
+    None when no sample has both a parts map of this grid and a weight other than 1."""
+    import torch
+
+    h, w = like.shape[-2:]
+    out = None
+    for i, gain in enumerate(gains):
+        p = parts[i]
+        if not gain or p is None or tuple(p.shape[-2:]) != (h, w) or all(abs(v - 1.0) < 1e-6 for v in gain.values()):
+            continue
+        if out is None:
+            out = torch.ones(len(gains), 1, h, w, device=like.device, dtype=like.dtype)
+        f = p[:6].to(like.device, torch.float32) / 255.0
+        per_class = torch.ones(6, device=like.device)
+        for region, value in gain.items():
+            per_class[list(CHANNELS[region])] = float(value)
+        wmap = (f * per_class[:, None, None]).sum(dim=0) + (1.0 - f.sum(dim=0)).clamp_min(0.0)  # (uint8 rounding)
+        mean = wmap.mean()  # (a picture that is all weight 0 keeps weight 1: nothing to renormalise to)
+        out[i, 0] = torch.where(mean > 1e-6, wmap / mean.clamp_min(1e-6), torch.ones_like(wmap)).to(like.dtype)
+    return out
+
+
+def background_mask(parts: list, like):
+    """Per sample the background's share of each cell, [B, 1, h, w] float on like's device (0 for a sample without a
+    parts map of this grid), or None when no sample has one."""
+    import torch
+
+    h, w = like.shape[-2:]
+    out = None
+    for i, p in enumerate(parts):
+        if p is None or tuple(p.shape[-2:]) != (h, w):
+            continue
+        if out is None:
+            out = torch.zeros(len(parts), 1, h, w, device=like.device, dtype=torch.float32)
+        out[i, 0] = p[list(CHANNELS["background"])].to(like.device, torch.float32).sum(dim=0) / 255.0
+    return out
+
+
 def tracked(item) -> bool:
     """A picture the watch reads: not one of LoRA Isolation's side-by-side pairs (two people in one frame)."""
     return not getattr(item, "pair_side", "")
@@ -84,41 +176,89 @@ class PictureStat:
     start_log: dict = field(default_factory=dict)  # protected region -> sum of log(reading) so far
     contrast_log: dict = field(default_factory=dict)  # protected region -> smoothed log contrast since its start
     cells: dict = field(default_factory=dict)  # region -> cells at the last reading
+    gain: dict = field(default_factory=dict)  # protected region -> its loss weight under steering (absent = 1)
 
     def contrast(self, region: str) -> float | None:
         v = self.contrast_log.get(region)
         return None if v is None else math.exp(v)
 
 
-class Curve:
-    """A mean per noise-level bucket, read smoothed over the neighbouring buckets."""
-
-    def __init__(self, sums: list[float] | None = None, counts: list[float] | None = None):
-        self.sums = list(sums) if sums else [0.0] * BUCKETS
-        self.counts = list(counts) if counts else [0.0] * BUCKETS
-
-    def add(self, b: int, value: float) -> None:
-        self.sums[b] += value
-        self.counts[b] += 1.0
-
-    def at(self, b: int) -> float | None:
-        num = den = 0.0
-        for k in range(BUCKETS):
-            if self.counts[k] <= 0:
-                continue
-            w = math.exp(-((k - b) ** 2) / (2 * KERNEL ** 2))
-            num += w * self.sums[k]
-            den += w * self.counts[k]
-        return (num / den) if den > 0 else None
-
-
 def bucket(sigma: float) -> int:
     return min(BUCKETS - 1, max(0, int(float(sigma) * BUCKETS)))
 
 
+class Curve:
+    """A value against the noise level: per bucket the mean noise level and the mean value of what was added, read
+    by straight lines between the buckets' points (and along the nearest line outside them). The loss changes fastest
+    at low noise, where reading a bucket's mean for every noise level inside it would be far off."""
+
+    def __init__(self, sums: list[float] | None = None, counts: list[float] | None = None,
+                 sigmas: list[float] | None = None):
+        self.sums = list(sums) if sums else [0.0] * BUCKETS
+        self.counts = list(counts) if counts else [0.0] * BUCKETS
+        self.sigmas = list(sigmas) if sigmas else [0.0] * BUCKETS  # the sum of the noise levels per bucket
+
+    def add(self, sigma: float, value: float) -> None:
+        b = bucket(sigma)
+        self.sums[b] += value
+        self.counts[b] += 1.0
+        self.sigmas[b] += float(sigma)
+
+    def points(self, smooth: float = 0.0) -> list[tuple[float, float]]:
+        """(noise level, value) per bucket with something in it; smooth: each over its neighbours, by a kernel that
+        many buckets wide."""
+        full = [k for k in range(BUCKETS) if self.counts[k] > 0]
+        if smooth <= 0:
+            return [(self.sigmas[k] / self.counts[k], self.sums[k] / self.counts[k]) for k in full]
+        pts = []
+        for k in full:
+            w = [math.exp(-((j - k) ** 2) / (2 * smooth ** 2)) for j in full]
+            n = sum(wj * self.counts[j] for wj, j in zip(w, full))
+            pts.append((sum(wj * self.sigmas[j] for wj, j in zip(w, full)) / n,
+                        sum(wj * self.sums[j] for wj, j in zip(w, full)) / n))
+        return pts
+
+    def at(self, sigma: float, positive: bool = False, smooth: float = 0.0) -> float | None:
+        """The curve at a noise level, or None with nothing added. positive: a loss curve, kept above a quarter of
+        its nearest point when a line runs outside the buckets. smooth: see points."""
+        pts = self.points(smooth)
+        if not pts:
+            return None
+        if len(pts) == 1:
+            return pts[0][1]
+        s = float(sigma)
+        hi = next((j for j, (x, _) in enumerate(pts) if x >= s), len(pts) - 1)
+        hi = max(1, hi)
+        (x0, y0), (x1, y1) = pts[hi - 1], pts[hi]
+        y = y0 if x1 <= x0 else y0 + (y1 - y0) * (s - x0) / (x1 - x0)
+        if positive:
+            y = max(y, 0.25 * (y0 if abs(s - x0) < abs(s - x1) else y1))
+        return y
+
+
+def _move(g: float, target: float, step: float, lo: float, hi: float) -> float:
+    """A weight one epoch nearer its target: down by at most `step` of itself, up half as fast (and by at least a
+    little, so a weight at 0 can come back)."""
+    if target < g:
+        g = max(target, g * (1.0 - step))
+    elif target > g:
+        g = min(target, max(g * (1.0 + step / 2), g + step / 4))
+    if abs(g - target) < SNAP:
+        g = target
+    return min(hi, max(lo, g))
+
+
 class RegionWatch:
-    def __init__(self, items, job_dir, resume: bool = False):
+    def __init__(self, items, job_dir, resume: bool = False, steer: dict | None = None):
+        """steer: None (observe only) or the steering settings {"regions": names from PROTECTED, "cap", "ahead",
+        "boost", "prior", "min", "step", "strength"} (a rule at 0 is off)."""
         self.job_dir = Path(job_dir)
+        self.steer = dict(steer) if steer else None
+        self.steer_off = ""  # why steering cannot act this run, when it cannot
+        self.steering = False  # some weight is away from 1 right now (or the steered prior is on)
+        self.learned_ema: dict[str, float] = {}
+        self.class_gain: dict[str, float] = {}  # boost: a subject region's weight in every picture (absent = 1)
+        self.prior_weight = 0.0  # the steered prior-preservation weight on the background
         self.per_epoch = max(1, len(items))  # every sample counts towards the epoch, read or not
         self.stats: dict[str, PictureStat] = {str(it.key): PictureStat(str(it.key)) for it in items if tracked(it)}
         self.epoch = 0
@@ -135,6 +275,8 @@ class RegionWatch:
         self._lock = threading.Lock()
         if resume:
             self.late = not self._load()
+            if self.late and self.steer:  # its baseline would be an already trained model's
+                self.steer, self.steer_off = None, "a resume without a saved region watch state"
         else:  # a fresh run of the same job starts its files again
             for name in (STATE_FILE, LOG_FILE):
                 try:
@@ -153,24 +295,36 @@ class RegionWatch:
         try:
             self.loss_curves = {c: Curve(**data["loss_curves"][c]) for c in COLUMNS}
             self.ratio_curves = {p: Curve(**data["ratio_curves"][p]) for p in PROTECTED}
+            if any("sigmas" not in rec for rec in (*data["loss_curves"].values(), *data["ratio_curves"].values())):
+                return False  # a state saved by 2.49.0, whose curves were read another way
             for key, rec in (data.get("pictures") or {}).items():
                 if key in self.stats:
                     self.stats[key] = PictureStat(key, int(rec.get("seen", 0)), dict(rec.get("start_n") or {}),
                                                   dict(rec.get("start_log") or {}), dict(rec.get("contrast_log") or {}),
-                                                  dict(rec.get("cells") or {}))
+                                                  dict(rec.get("cells") or {}),
+                                                  dict(rec.get("gain") or {}) if self.steer else {})
             self.epoch, self.late = int(data.get("epoch", 0)), bool(data.get("late"))
             self.history = list(data.get("history") or [])
+            self.learned_ema = {str(k): float(v) for k, v in (data.get("learned_ema") or {}).items()}
+            if self.steer:
+                self.class_gain = {str(k): float(v) for k, v in (data.get("class_gain") or {}).items()}
+                self.prior_weight = float(data.get("prior_weight") or 0.0)
         except (KeyError, TypeError, ValueError):
             return False
         self.frozen = True
+        self._flag()
         return True
 
     def _save(self) -> None:
         data = {"epoch": self.epoch, "frozen": self.frozen, "late": self.late, "history": self.history[-400:],
-                "loss_curves": {c: {"sums": v.sums, "counts": v.counts} for c, v in self.loss_curves.items()},
-                "ratio_curves": {p: {"sums": v.sums, "counts": v.counts} for p, v in self.ratio_curves.items()},
+                "learned_ema": self.learned_ema, "class_gain": self.class_gain, "prior_weight": self.prior_weight,
+                "loss_curves": {c: {"sums": v.sums, "counts": v.counts, "sigmas": v.sigmas}
+                                for c, v in self.loss_curves.items()},
+                "ratio_curves": {p: {"sums": v.sums, "counts": v.counts, "sigmas": v.sigmas}
+                                 for p, v in self.ratio_curves.items()},
                 "pictures": {k: {"seen": st.seen, "start_n": st.start_n, "start_log": st.start_log,
-                                 "contrast_log": st.contrast_log, "cells": st.cells} for k, st in self.stats.items()}}
+                                 "contrast_log": st.contrast_log, "cells": st.cells, "gain": st.gain}
+                             for k, st in self.stats.items()}}
         try:
             (self.job_dir / STATE_FILE).write_text(json.dumps(data), encoding="utf-8")
         except OSError:
@@ -201,10 +355,9 @@ class RegionWatch:
                     self.buffer.append((st.key, float(sigmas[i]), list(row), list(size)))
 
     def _ingest(self, st: PictureStat, sigma: float, row: list[float], size: list[float]) -> None:
-        b = bucket(sigma)
         loss = {c: row[j] for j, c in enumerate(COLUMNS) if size[j] >= MIN_CELLS}
         for c, v in loss.items():
-            base = self.loss_curves[c].at(b)
+            base = self.loss_curves[c].at(sigma, positive=True)
             if base and base > 0:
                 self.epoch_sum[c] += v / base
                 self.epoch_n[c] += 1
@@ -212,7 +365,7 @@ class RegionWatch:
         if not subject or subject <= 0:
             return
         for p in PROTECTED:
-            base = self.ratio_curves[p].at(b)
+            base = self.ratio_curves[p].at(sigma, smooth=KERNEL)
             if p not in loss or loss[p] <= 0 or base is None:
                 continue
             reading = math.log(loss[p] / subject) - base
@@ -229,16 +382,15 @@ class RegionWatch:
     def _freeze(self) -> None:
         """The baseline curves from everything read so far, then those readings again as the first ones."""
         for key, sigma, row, size in self.buffer:
-            b = bucket(sigma)
             for j, c in enumerate(COLUMNS):
                 if size[j] >= MIN_CELLS:
-                    self.loss_curves[c].add(b, row[j])
+                    self.loss_curves[c].add(sigma, row[j])
             subject = row[COLUMNS.index(SUBJECT)]
             if size[COLUMNS.index(SUBJECT)] >= MIN_CELLS and subject > 0:
                 for p in PROTECTED:
                     j = COLUMNS.index(p)
                     if size[j] >= MIN_CELLS and row[j] > 0:
-                        self.ratio_curves[p].add(b, math.log(row[j] / subject))
+                        self.ratio_curves[p].add(sigma, math.log(row[j] / subject))
         self.frozen = True
         buffered, self.buffer = self.buffer, []
         for key, sigma, row, size in buffered:
@@ -262,7 +414,13 @@ class RegionWatch:
             learned = {c: (round(1.0 - self.epoch_sum[c] / self.epoch_n[c], 4) if self.epoch_n[c] else None)
                        for c in COLUMNS}
             self.epoch_sum, self.epoch_n = {c: 0.0 for c in COLUMNS}, {c: 0 for c in COLUMNS}
+            for c, v in learned.items():
+                if v is not None:
+                    prev = self.learned_ema.get(c)
+                    self.learned_ema[c] = v if prev is None else LEARNED_BETA * prev + (1 - LEARNED_BETA) * v
             row = {"epoch": self.epoch, "step": int(step), "learned": learned, "contrast": self.contrasts()}
+            if self.steer:
+                row["steer"] = self._steer(row["contrast"])
             self.history.append(row)
             try:
                 with open(self.job_dir / LOG_FILE, "a", encoding="utf-8") as f:
@@ -271,6 +429,77 @@ class RegionWatch:
                 pass
             self._save()
             return self.summary(step, unread=unread)
+
+    # ------------------------------------------------------------ steering
+    def _flag(self) -> None:
+        self.steering = bool(self.class_gain or self.prior_weight > 0 or any(st.gain for st in self.stats.values()))
+
+    def _steer(self, contrasts: dict) -> dict:
+        """This epoch's weights, each a step towards its target. Returns per steered region {"cohort": how far the
+        cohort is past its cap (1 = within it), "lowered": pictures turned down, "lowest": the lowest weight}, plus
+        "boost" (the raised subject regions) and "prior" (the steered prior weight)."""
+        cfg, out = self.steer, {}
+        step, lo, strength = float(cfg["step"]), float(cfg["min"]), float(cfg["strength"])
+        subject = self.learned_ema.get(SUBJECT)
+        ready = subject is not None and subject >= MIN_SUBJECT_LEARNED
+        cohorts = {}
+        for p in cfg["regions"]:
+            cohort = 1.0
+            learned = self.learned_ema.get(p)
+            if float(cfg["cap"]) > 0 and ready and learned is not None:
+                floor = 1.0 - float(cfg["cap"]) * subject  # the least error the region may have left
+                cohort = min(1.0, max(0.0, (1.0 - learned) / floor)) if floor > 0 else 1.0
+            cohorts[p] = cohort
+            median = (contrasts.get(p) or {}).get("median")
+            lowered, lowest = 0, 1.0
+            for st in self.stats.values():
+                if float(st.cells.get(p, 0.0)) < MIN_CELLS:
+                    st.gain.pop(p, None)
+                    continue
+                want, own = cohort, st.contrast(p)
+                if own is not None and median:
+                    rel = min(SPREAD[1], max(SPREAD[0], own / median))
+                    if cohort < 1.0:
+                        want = cohort * rel
+                    if float(cfg["ahead"]) > 0:
+                        want = min(want, rel / float(cfg["ahead"]))
+                target = max(lo, min(1.0, want) ** (2.0 * strength)) if want < 1.0 else 1.0
+                g = _move(float(st.gain.get(p, 1.0)), target, step, lo, 1.0)
+                if g >= 1.0 - 1e-6:
+                    st.gain.pop(p, None)
+                else:
+                    st.gain[p] = round(g, 4)
+                    lowered, lowest = lowered + 1, min(lowest, g)
+            out[p] = {"cohort": round(cohort, 4), "lowered": lowered, "lowest": round(lowest, 4)}
+        boost = float(cfg.get("boost") or 0.0)
+        for region in SUBJECT_REGIONS:  # a lagging subject region, raised in every picture
+            target = 1.0
+            learned = self.learned_ema.get(region)
+            if boost > 1.0 and ready and learned is not None:
+                lag = (subject - learned) / subject
+                target = min(boost, 1.0 + strength * max(0.0, lag - BOOST_MARGIN))
+            g = _move(float(self.class_gain.get(region, 1.0)), target, step, 1.0, max(1.0, boost))
+            if g <= 1.0 + 1e-6:
+                self.class_gain.pop(region, None)
+            else:
+                self.class_gain[region] = round(g, 4)
+        top = float(cfg.get("prior") or 0.0)
+        if top > 0 and "background" in cohorts:  # full strength once the background is half its allowed error past
+            target = top * min(1.0, 2.0 * (1.0 - cohorts["background"]))
+            now = self.prior_weight
+            now = max(target, now - step * top) if target < now else min(target, now + step * top / 2)
+            self.prior_weight = round(now, 5) if now > 1e-6 else 0.0
+        else:
+            self.prior_weight = 0.0
+        out["boost"], out["prior"] = dict(self.class_gain), self.prior_weight
+        self._flag()
+        return out
+
+    def gains(self, keys: list) -> list[dict]:
+        """Per sample of a batch its steered {region: weight} (thread-safe; {} for a picture at weight 1)."""
+        with self._lock:
+            return [merge_gains(self.class_gain, st.gain if st is not None else None)
+                    for st in (self.stats.get(str(k)) for k in keys)]
 
     def contrasts(self) -> dict:
         """Per protected region: the median contrast over the pictures that have one, and how many do."""
@@ -290,6 +519,7 @@ class RegionWatch:
             rows.append({"image": Path(st.key).name, "path": st.key, "seen": st.seen,
                          "background": None if bg is None else round(bg, 3),
                          "clothes": None if cl is None else round(cl, 3),
+                         "weights": " / ".join(f"{p} x{st.gain[p]:.2f}" for p in PROTECTED if p in st.gain),
                          "cells": " / ".join(f"{st.cells.get(c, 0):.0f}" for c in REGIONS)})
         rows.sort(key=lambda r: (r["background"] is None, r["background"] if r["background"] is not None else 0.0))
         return rows[:limit]
@@ -299,6 +529,7 @@ class RegionWatch:
         return {"epoch": self.epoch, "step": int(step), "frozen": self.frozen, "late": self.late,
                 "baseline": len(self.buffer), "baseline_min": BASELINE_MIN, "learned": last.get("learned") or {},
                 "contrast": last.get("contrast") or {}, "pictures": len(self.stats), "unread": unread,
+                "steer": (last.get("steer") or {}) if self.steer else None, "steer_off": self.steer_off,
                 "rows": self.rows(), "history": [{"step": r["step"], "learned": r["learned"]}
                                                 for r in self.history[-200:]]}
 
@@ -316,6 +547,14 @@ def describe(summary: dict) -> str:
     bg = (summary.get("contrast") or {}).get("background") or {}
     if bg.get("median") is not None:
         text += f" | background against subject x{bg['median']:.2f} (median of {bg['pictures']} pictures)"
+    steer = summary.get("steer") or {}
+    for p in PROTECTED:
+        if (steer.get(p) or {}).get("lowered"):
+            text += f" | steering: {p} turned down on {steer[p]['lowered']} pictures (lowest x{steer[p]['lowest']:.2f})"
+    if steer.get("boost"):
+        text += " | raised: " + ", ".join(f"{r} x{v:.2f}" for r, v in steer["boost"].items())
+    if steer.get("prior"):
+        text += f" | background prior {steer['prior']:.3f}"
     if summary.get("late"):
         text += " | baseline taken after a resume, so this counts from there"
     if summary.get("unread"):

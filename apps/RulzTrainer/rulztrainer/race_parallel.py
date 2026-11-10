@@ -49,6 +49,13 @@ def forward_backward(job):
     sq = elementwise_loss(cfg.loss_type, pred, target, latents, noise, sigma)
     if regions is not None and cfg.region_weights:
         sq = sq * regions.weight.to(rdev)
+    elif regions is not None and cfg.region_class_weights:  # fixed class weights (no watch or steering in a race)
+        from . import regionwatch
+
+        fixed = regionwatch.parse_class_weights(cfg.region_class_weights)
+        class_w = regionwatch.weight_maps([rm.parts for rm in regions.meta], [fixed] * len(batch), sq) if fixed else None
+        if class_w is not None:
+            sq = sq * class_w
     per = sq.mean(dim=(1, 2, 3))
     if regions is not None and cfg.region_weights and cfg.region_prior_weight > 0 and bool(regions.prior.any()):
         lora_mod.set_multiplier(rinj, 0.0)
