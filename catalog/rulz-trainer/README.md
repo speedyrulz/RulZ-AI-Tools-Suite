@@ -1022,10 +1022,15 @@ training pictures and 3 held out, 2000 steps, against the same run without them,
   the face ended at 7% against 12%, the gap between training and held-out pictures at 22 points against 16, and the
   full-body probe lost its framing 200 steps sooner. Likeness on the probes was level. The heavier face weight
   memorised the training faces faster.
+  Turning only the background down (`background=0.3`, the face left at 1) was worse too, in a milder form: what is
+  taken from the background goes to the person, the training faces were fitted further (37% against 29 to 30%), the
+  held-out subject ended at 4.7% against 5.8 to 6.7%, and the framing went sooner.
 - **Region steering** at its defaults left every reading within about half a point of the plain run. It was gentle
   (clothes turned down on 49 of 59 pictures, typically to 0.82; background on 34, typically to 0.91), and a region's
   loss follows its own weight only weakly. Read from the training steps, the cap rule switched on and off through its
   first four epochs; `region_steer_signal: sweep` steadied it.
+  Four seeds of the plain run differ from each other by as much, so this is no effect; both fixed weights lie well
+  outside that spread.
 - **The per-picture rules** had nothing to act on: no picture came near the 0.7 threshold.
 
 No benefit is claimed for either, and the defaults are uncalibrated. Both use the parts maps of the
@@ -1077,11 +1082,20 @@ sweep of all 62 pictures took 24 seconds on an RTX 5090.
 
 - **A much quieter reading than the probes.** Three runs that were still training alike read 8.5, 8.4 and 8.2% on the
   held-out subject at their first sweep; their combined probe scores at that point were 41.9, 31.5 and 38.3.
+  Four seeds of the plain run agreed within a standard deviation of 0.2 to 0.7 points on the held-out subject at
+  every sweep, and all four peaked at steps 708 to 944; their combined probe scores at step 1000 ranged from 47.6 to
+  63.9.
 - **The held-out photos showed when learning the person stopped.** The held-out subject reached 8.5% by the first sweep
   (step 236), peaked at 9.0% at step 944 and fell to 5.8% by step 2000, while the training pictures kept improving (9%
   to 21%). FaceNet on the probes peaked in the same stretch. The combined likeness score chose step 1400 instead, on a
   body score that by then came from 2 of 8 renders, so `holdout_track_best` kept an earlier checkpoint than the
   likeness best: compare the two by eye.
+- **Half the learning rate held the level.** At lr 5e-5 the held-out subject peaked later (step 1180), at the same
+  height, and still read 8.2% at step 2000, where the four seeds at 1e-4 had fallen to 5.8 to 6.7%. The gap ended at 8
+  points against 14 to 16, and the probes' face scores were no lower. One run.
+- **A best checkpoint on a probe that has lost its body renders is common.** In 8 of 9 runs the likeness best was set
+  at a probe where at least half the full-body renders showed no body. See `likeness_best_min_kept` under
+  [the prompt check](#probe-prompt-presets-and-the-prompt-check).
 - **`region_steer_holdout` cancelled itself.** Every part overfitted together, so the rule turned all five down by
   about the same amount (0.78 to 0.87), and with weights rescaled to mean 1 per picture that changes almost nothing.
   The run ended where the plain one did.
