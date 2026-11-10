@@ -865,3 +865,14 @@ def test_settings_that_point_into_a_pushed_folder_point_at_its_place_on_the_inst
     assert entry["config"] == dict(config, dataset_dir="datasets/anna", face_refs="datasets/anna/refs",
                                    datasets=[{"path": "datasets/anna"}])
     assert world.fleet.plan("q", config)[0]["config"] == config
+
+
+def test_a_run_that_started_and_ended_between_two_looks_is_still_closed_and_downloaded(world):
+    world.fleet.set_instance(2, enabled=False)
+    world.tick()  # the instance has been looked at: what appears from now on ran in the fleet's time
+    world.machines["1"].run("quick")
+    world.machines["1"].finish(best=40.0)
+    world.tick()
+    assert [e["kind"] for e in world.kinds("run_started", "run_done")] == ["run_started", "run_done"]
+    rec = world.fleet.find_run("quick")
+    assert not rec["imported"] and rec["downloaded"] and rec["state"] == "done"
