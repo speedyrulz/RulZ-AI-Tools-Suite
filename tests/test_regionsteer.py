@@ -202,7 +202,8 @@ def test_config_checks_the_region_settings():
     cfg.validate_region_actions()
     assert cfg.wants_region_watch() and cfg.wants_part_maps() and not cfg.wants_parts()
     assert cfg.region_steer_settings() == {"regions": ("background", "clothes"), "cap": 0.6, "ahead": 0.7,
-                                           "boost": 0.0, "prior": 0.0, "min": 0.3, "step": 0.2, "strength": 1.0}
+                                           "boost": 0.0, "prior": 0.0, "holdout": 0.0, "signal": "steps",
+                                           "min": 0.3, "step": 0.2, "strength": 1.0}
     assert TrainConfig().region_steer_settings() is None
     assert TrainConfig(region_steer=True, region_steer_regions="clothes").region_steer_list() == ("clothes",)
     for bad in (dict(region_steer_regions="face"), dict(region_steer_regions=""), dict(region_steer_cap=3.0),
@@ -275,3 +276,57 @@ def test_a_race_step_applies_the_fixed_class_weights():
 
     plain, weighted = loss(""), loss("face=3,background=1")
     assert weighted == pytest.approx(plain * 1.5, rel=1e-4)  # face cells at 3 / mean 2 = 1.5x, where all the error is
+
+
+def test_sweep_signal_drives_the_ahead_rule_from_the_fixed_noise_readings(tmp_path):
+    watch, items, rng, state = _watch(tmp_path, cap=0.0, signal="sweep")
+    _run(watch, items, 6, lambda i, e: dict(background=0.3) if i == 0 else {}, rng, state)
+    assert not watch.steering  # the steps say picture 0 runs ahead, but this run reads the sweeps: none yet
+    watch.set_sweep({items[i].key: {"background": 0.4 if i == 3 else 1.0, "clothes": 1.0} for i in range(20)})
+    summary = _run(watch, items, 3, lambda i, e: {}, rng, state)
+    assert list(watch.stats[items[3].key].gain) == ["background"]
+    assert not watch.stats[items[0].key].gain  # the steps' own reading is not what steers here
+    assert summary["rows"][0]["sweep_background"] in (0.4, 1.0)  # the table shows both readings
+    assert watch.contrasts("sweep")["background"] == {"median": 1.0, "pictures": 20}
+
+
+def test_holdout_rule_turns_a_memorised_region_down_in_every_picture(tmp_path):
+    watch, items, rng, state = _watch(tmp_path, cap=0.0, ahead=0.0, holdout=0.15, min=0.3)
+    learned = lambda i, e: dict(face=0.5, hair=0.5, skin=0.5, background=0.7)  # noqa: E731
+    watch.set_sweep({}, gap={"face": 0.35, "background": 0.05, "clothes": None}, flat={"face": 1, "background": 5})
+    _run(watch, items, 3, learned, rng, state)
+    assert watch.class_gain == {}  # the face's held-out reading is still improving (1 flat sweep): not yet
+    watch.set_sweep({}, gap={"face": 0.35, "background": 0.05}, flat={"face": 2, "background": 5})
+    summary = _run(watch, items, 1, learned, rng, state)
+    assert watch.class_gain == {"face": pytest.approx(0.8)}  # the one rule that may turn the face down, a step a time
+    summary = _run(watch, items, 12, learned, rng, state)
+    target = (1 - (0.35 - 0.15) / (1 - 0.15)) ** 2
+    assert watch.class_gain["face"] == pytest.approx(target, abs=0.01) and "background" not in watch.class_gain
+    assert summary["steer"]["held"] == {"face": pytest.approx(target, abs=0.01)} and summary["steer"]["boost"] == {}
+    assert "turned down for the held-out gap: face" in RW.describe(summary)
+    assert watch.gains([items[5].key]) == [{"face": pytest.approx(target, abs=0.01)}]
+    watch.set_sweep({}, gap={"face": 0.1}, flat={"face": 0})  # the gap closed
+    _run(watch, items, 14, learned, rng, state)
+    assert watch.class_gain == {} and not watch.steering
+
+
+def test_config_checks_the_sweep_and_holdout_settings():
+    ok = TrainConfig(region_steer=True, region_sweep_every=2, region_steer_signal="sweep", holdout_images=3,
+                     region_steer_holdout=0.15, holdout_track_best=True, holdout_patience=4)
+    ok.validate_region_actions()
+    assert ok.wants_region_sweep() and ok.wants_part_maps() and ok.sweep_every_epochs() == 2
+    assert ok.region_steer_settings()["signal"] == "sweep" and ok.region_steer_settings()["holdout"] == 0.15
+    assert TrainConfig(holdout_images=2).sweep_every_epochs() == 1 and TrainConfig(holdout_images=2).wants_regions()
+    assert not TrainConfig().wants_region_sweep()
+    TrainConfig(region_steer=True, region_steer_cap=0, region_steer_ahead=0, region_steer_holdout=0.2,
+                holdout_images=2).validate_region_actions()  # the holdout rule alone is a rule
+    for bad in (dict(region_sweep_every=-1), dict(region_sweep_pictures=-2), dict(holdout_images=-1),
+                dict(holdout_track_best=True), dict(holdout_patience=2), dict(region_sweep_pictures=-1),
+                dict(holdout_images=2, resolution_step_up=True), dict(region_steer_signal="maps"),
+                dict(region_steer=True, region_steer_signal="sweep"),  # no sweeps to read
+                dict(region_steer=True, region_steer_signal="sweep", holdout_images=2, region_sweep_pictures=-1),
+                dict(region_steer=True, region_steer_holdout=0.2),  # nothing held out
+                dict(region_steer=True, region_steer_holdout=0.2, holdout_images=2, region_sweep_pictures=-1),
+                dict(region_steer=True, region_steer_holdout=1.0, holdout_images=2)):
+        with pytest.raises(ValueError):
+            TrainConfig(**bad).validate_region_actions()

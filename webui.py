@@ -1535,6 +1535,12 @@ class Form:
             region_steer_prior=float(v("region_steer_prior") or 0),
             region_steer_min=float(v("region_steer_min") or 0), region_steer_step=float(v("region_steer_step")),
             region_steer_strength=float(v("region_steer_strength")),
+            region_steer_signal=str(v("region_steer_signal") or "steps"),
+            region_steer_holdout=float(v("region_steer_holdout") or 0),
+            region_sweep_every=int(v("region_sweep_every") or 0),
+            region_sweep_pictures=int(v("region_sweep_pictures") or 0),
+            holdout_images=int(v("holdout_images") or 0), holdout_track_best=bool(v("holdout_track_best")),
+            holdout_patience=int(v("holdout_patience") or 0),
             training_maps=bool(v("training_maps")), training_maps_images=int(v("training_maps_images") or 3),
             training_maps_every=int(v("training_maps_every") or 0),
             isolation=bool(v("isolation")), isolation_class=s("isolation_class"),
@@ -3977,7 +3983,10 @@ RACE_LABELS = {
     "region_steer_cap": "Region steering: cap", "region_steer_ahead": "Region steering: ahead",
     "region_steer_boost": "Region steering: boost", "region_steer_prior": "Region steering: background prior",
     "region_steer_min": "Region steering: lowest weight", "region_steer_step": "Region steering: step",
-    "region_steer_strength": "Region steering: strength",
+    "region_steer_strength": "Region steering: strength", "region_steer_signal": "Region steering: reading",
+    "region_steer_holdout": "Region steering: held-out gap", "region_sweep_every": "Region sweep every (epochs)",
+    "region_sweep_pictures": "Region sweep: pictures per sweep", "holdout_images": "Held-out photos",
+    "holdout_track_best": "Held-out best checkpoint", "holdout_patience": "Held-out stop patience",
     "per_image_lr": "Per-image learning rate", "lora_rank": "LoRA rank", "lora_alpha": "LoRA alpha",
     "lora_targets": "LoRA layers", "lora_blocks": "LoRA blocks", "lora_dropout": "LoRA dropout",
     "network_type": "Adapter type", "lokr_factor": "LoKr factor", "oft_block_size": "OFT block size",
@@ -5078,6 +5087,20 @@ EXPERIMENTS = [
                "the likeness or how well prompts are followed is not measured.",
      "cost": "No extra model calls, except one more forward pass a step while the background prior acts. Needs "
              "MediaPipe for the parts maps. Not in a configuration race, not with Hull's region gains."},
+    {"key": "holdout_images", "group": "Likeness boosters", "title": "Held-out photos", "off": 0,
+     "control": "number", "precision": 0, "hint": "0 = none; 2 or 3 of a set of 20 or more", "evidence": "untested",
+     "short": "Keeps a few photos out of training to see what was learned of the person, not of the photos.",
+     "what": "N photos, spread evenly through the set by file name, never train. Once an epoch the model is run on "
+             "them at three fixed noise levels, and how much of their face, hair, skin, clothes and background error "
+             "is gone is compared with the same reading on the training pictures. Learning that shows on unseen "
+             "photos is the subject; the gap is memorising. The Train tab can also keep a checkpoint at the best "
+             "held-out score, stop on it, and let region steering act on the gap.",
+     "tested": "Never run in a real training. The same reading on training pictures (the training maps) showed "
+               "what a run fits, and missed a face getting worse on new prompts, which is what held-out photos are "
+               "meant to catch.",
+     "cost": "The held-out photos do not train. 3 forward passes per held-out photo per sweep, plus the same per "
+             "training picture swept. Needs at least 10 photos and MediaPipe. Not in a race, not with the "
+             "resolution step-up."},
     {"key": "region_class_weights", "group": "Likeness boosters", "title": "Region class weights", "off": "",
      "control": "text", "hint": "empty = off; face=3, hair=1.5, skin=1.5, clothes=0.5, background=0.3",
      "evidence": "untested",
@@ -8545,6 +8568,51 @@ def build_page(local: bool = True):
                                                                    min=0.1, max=4, step=0.1).classes("w-32").tooltip(
                                 "How hard a rule pulls: the weight aimed for is (share within the limit) to the "
                                 "power of 2 x this.")
+                            w["region_steer_signal"] = ui.select(
+                                {"steps": "training steps (free, noisy)", "sweep": "sweeps (fixed noise)"},
+                                label="Per-picture reading", value=d.region_steer_signal if d.region_steer_signal in (
+                                    "steps", "sweep") else "steps").classes("w-64").tooltip(
+                                "What the cap rule's per-picture share and the ahead rule read: each picture's one "
+                                "training step per epoch, or its fixed-noise sweep (set the sweeps below). A sweep is "
+                                "a cleaner reading, as fresh as that picture's last sweep.")
+                            w["region_steer_holdout"] = ui.number("Held-out gap over (0 = off)",
+                                                                  value=d.region_steer_holdout, min=0, max=0.95,
+                                                                  step=0.05).classes("w-56").tooltip(
+                                "Needs held-out photos. A region learned this much further on the training pictures "
+                                "than on the held-out ones (0.15 = 15 points), and no better on those for two sweeps, "
+                                "is turned down in every picture. The one rule that may turn the face, hair or skin "
+                                "down.")
+                        with fields():
+                            w["region_sweep_every"] = ui.number("Region sweep every N epochs (0 = off)",
+                                                                value=d.region_sweep_every, min=0, precision=0) \
+                                .classes("w-72").tooltip(
+                                "Experimental, never run in a real training. Runs the model again on the training "
+                                "pictures at three fixed noise levels with fixed noise, so a picture's learned share "
+                                "is measured against its own first sweep: a clean reading where the region watch's "
+                                "is a noisy one. 3 forward passes per picture per sweep, so sweeping every picture "
+                                "every epoch about doubles the training time; the first sweep always takes all of "
+                                "them. Not in a race, not with the resolution step-up.")
+                            w["region_sweep_pictures"] = ui.number("Pictures per sweep (0 = all, -1 = held-out only)",
+                                                                   value=d.region_sweep_pictures, min=-1,
+                                                                   precision=0).classes("w-80").tooltip(
+                                "How many training pictures a sweep takes: all of them, this many in turn, or none "
+                                "(only the held-out photos, the cheapest).")
+                            w["holdout_images"] = ui.number("Hold out N photos (0 = none)", value=d.holdout_images,
+                                                            min=0, precision=0).classes("w-56").tooltip(
+                                "Experimental. Keeps N photos (and every crop made from them) out of training, "
+                                "spread evenly through the set by file name, and sweeps them: what the model learns "
+                                "on photos it never trained on, it has learned of the subject and not of the photos. "
+                                "The gap to the training pictures is memorising. Needs at least 10 photos, at most a "
+                                "fifth held out. A held-out photo that nearly matches a training photo is not "
+                                "unseen. Sweeps every epoch unless set otherwise.")
+                            w["holdout_track_best"] = ui.switch("Keep the held-out best", value=d.holdout_track_best) \
+                                .tooltip("Saves <job>_holdout_best.safetensors whenever the held-out photos' subject "
+                                         "score (face, hair and skin together) reaches a new best.")
+                            w["holdout_patience"] = ui.number("Stop after N sweeps without a better score (0 = never)",
+                                                              value=d.holdout_patience, min=0, precision=0) \
+                                .classes("w-96 max-w-full").tooltip(
+                                "Ends training when the held-out subject score has not improved for this many sweeps "
+                                "in a row. With two or three held-out photos that score rests on very few pictures.")
                         with fields():
                             w["look_warmup"] = ui.switch("Warm up look outliers", value=d.look_warmup).tooltip(
                                 "Images the look consistency filter (Dataset tab) put under its fence, real but "
@@ -9372,6 +9440,7 @@ def build_page(local: bool = True):
                 lw_state = {"sig": None}
                 with section("Region watch", "How far each part of the pictures has been learned", "grid_view") as rw_exp:
                     rw_label = hint("")
+                    rs_label = hint("")
                     hint("Contrast: a picture's background (or clothes) loss against its subject's, relative to its "
                          "own start. Under 1 = that region is being learned faster than the subject in this picture. "
                          "One training sample per picture per epoch is a noisy reading, so read it as a trend.")
@@ -9380,6 +9449,10 @@ def build_page(local: bool = True):
                         {"name": "background", "label": "background vs subject", "field": "background",
                          "sortable": True},
                         {"name": "clothes", "label": "clothes vs subject", "field": "clothes", "sortable": True},
+                        {"name": "sweep_background", "label": "background (sweep)", "field": "sweep_background",
+                         "sortable": True},
+                        {"name": "sweep_clothes", "label": "clothes (sweep)", "field": "sweep_clothes",
+                         "sortable": True},
                         {"name": "weights", "label": "steered weights", "field": "weights", "align": "left"},
                         {"name": "cells", "label": "cells: face / hair / skin / clothes / background",
                          "field": "cells", "align": "left"},
@@ -9660,6 +9733,10 @@ def build_page(local: bool = True):
                         rw_label.text = f"Epoch {rw.get('epoch')} (step {rw.get('step')}): {region_watch_line(rw)}"
                         rw_table.rows = rw.get("rows") or []
                         rw_table.update()
+                rs = st.get("region_sweep")
+                if rs:
+                    rw_exp.visible = True
+                    rs_label.text = f"Sweep at step {rs.get('step')}: {rs.get('line') or ''}"
                 dup_note = near_duplicate_note(st.get("near_duplicates"))
                 near_dup_label.visible = bool(dup_note)
                 near_dup_label.text = dup_note
