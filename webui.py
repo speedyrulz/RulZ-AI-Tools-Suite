@@ -1527,6 +1527,14 @@ class Form:
             loss_watch_healthy_mult=float(v("loss_watch_healthy_mult")),
             loss_watch_exclude_after=int(v("loss_watch_exclude_after")),
             region_watch=bool(v("region_watch")),
+            region_class_weights=str(v("region_class_weights") or "").strip(),
+            region_steer=bool(v("region_steer")),
+            region_steer_regions=str(v("region_steer_regions") or "background,clothes"),
+            region_steer_cap=float(v("region_steer_cap") or 0), region_steer_ahead=float(v("region_steer_ahead") or 0),
+            region_steer_boost=float(v("region_steer_boost") or 0),
+            region_steer_prior=float(v("region_steer_prior") or 0),
+            region_steer_min=float(v("region_steer_min") or 0), region_steer_step=float(v("region_steer_step")),
+            region_steer_strength=float(v("region_steer_strength")),
             training_maps=bool(v("training_maps")), training_maps_images=int(v("training_maps_images") or 3),
             training_maps_every=int(v("training_maps_every") or 0),
             isolation=bool(v("isolation")), isolation_class=s("isolation_class"),
@@ -3964,7 +3972,12 @@ RACE_LABELS = {
     "id_align_weight": "Identity alignment weight", "body_align": "Body alignment",
     "body_align_weight": "Body alignment weight", "likeness_curriculum": "Face/body curriculum",
     "likeness_lr_control": "Likeness lr control", "loss_watch": "Per-image loss watch",
-    "region_watch": "Region watch",
+    "region_watch": "Region watch", "region_class_weights": "Region class weights",
+    "region_steer": "Region steering", "region_steer_regions": "Region steering: regions",
+    "region_steer_cap": "Region steering: cap", "region_steer_ahead": "Region steering: ahead",
+    "region_steer_boost": "Region steering: boost", "region_steer_prior": "Region steering: background prior",
+    "region_steer_min": "Region steering: lowest weight", "region_steer_step": "Region steering: step",
+    "region_steer_strength": "Region steering: strength",
     "per_image_lr": "Per-image learning rate", "lora_rank": "LoRA rank", "lora_alpha": "LoRA alpha",
     "lora_targets": "LoRA layers", "lora_blocks": "LoRA blocks", "lora_dropout": "LoRA dropout",
     "network_type": "Adapter type", "lokr_factor": "LoKr factor", "oft_block_size": "OFT block size",
@@ -5050,6 +5063,33 @@ EXPERIMENTS = [
                "seeds, a slow start and a late climb that did not repeat. A short 5-image test had identity at 73.9 "
                "against 74.2.",
      "cost": "None beyond the choice."},
+    {"key": "region_steer", "group": "Likeness boosters", "title": "Region steering", "off": False,
+     "control": "switch", "evidence": "untested",
+     "short": "Turns a picture's background or clothes down when they are learned faster than the person.",
+     "what": "The region watch reads every training step's loss for the face, hair, skin, clothes and background. "
+             "Region steering acts on it once an epoch, by rules that are each on their own setting on the Train "
+             "tab: a cap on how far the background and clothes may be learned compared with the subject, a "
+             "per-picture rule for pictures whose scenery runs ahead of the others', and, off unless asked for, a "
+             "raise for a lagging face, hair or skin and a pull of the background towards the base model. What it "
+             "takes from a region goes to the rest of that picture.",
+     "tested": "Never run in a real training, and its defaults are uncalibrated. Offline, splitting the training "
+               "maps of four Qwen-Image 2.1 runs the same way showed the face learned about three times as fast as "
+               "the background at step 1000 and the gap closing by step 2000. Whether steering on that improves "
+               "the likeness or how well prompts are followed is not measured.",
+     "cost": "No extra model calls, except one more forward pass a step while the background prior acts. Needs "
+             "MediaPipe for the parts maps. Not in a configuration race, not with Hull's region gains."},
+    {"key": "region_class_weights", "group": "Likeness boosters", "title": "Region class weights", "off": "",
+     "control": "text", "hint": "empty = off; face=3, hair=1.5, skin=1.5, clothes=0.5, background=0.3",
+     "evidence": "untested",
+     "short": "One fixed loss weight each for the face, hair, skin, clothes and background.",
+     "what": "Weights the training loss by what each part of a picture shows, for the whole run: the picture is "
+             "split into face, hair, skin, clothes and background, and each takes the weight given here (1 when "
+             "left out, 0 to mask it out), rescaled to mean 1 per picture. The plain alternative to region steering.",
+     "tested": "Never run in a real training. The region-weighted loss of the identity recipe (face 3, person 1.5, "
+               "background 0.3, from a face box and a silhouette) is its nearest relative; this one can weight the "
+               "clothes and the hair on their own.",
+     "cost": "None per step. Needs MediaPipe for the parts maps. Not together with the region-weighted loss, so not "
+             "with the identity recipe as it is, and not with Hull's region gains."},
     {"key": "clean_share", "group": "How noise levels are trained", "title": "Clean-end share", "off": "",
      "control": "text", "hint": "empty = off; Fizgig's best: 60:7:30:8:3", "evidence": "mixed",
      "short": "More steps at the clean end, where faces and fine detail settle.",
@@ -8443,6 +8483,68 @@ def build_page(local: bool = True):
                                 "than its subject. Costs no extra model calls; changes nothing about training. Needs "
                                 "MediaPipe for the parts maps (built once, before training). Not in a configuration "
                                 "race. New and not yet run in a real training here.")
+                            w["region_class_weights"] = ui.input(
+                                "Region class weights (experimental)", value=d.region_class_weights,
+                                placeholder="face=3, hair=1.5, skin=1.5, clothes=0.5, background=0.3") \
+                                .classes("w-[32rem] max-w-full").tooltip(
+                                "One fixed loss weight per region for the whole run, from the same parts maps: face, "
+                                "hair, skin, clothes, background. A region left out stays at 1, 0 masks one out, and "
+                                "the weights are rescaled to mean 1 per picture. Empty = off. The plain alternative "
+                                "to region steering, and the one to compare it against. Not together with the "
+                                "region-weighted loss (face / person / background) or Hull's region gains. Never "
+                                "run in a real training here.")
+                        with fields():
+                            w["region_steer"] = ui.switch("Region steering (experimental, untested)",
+                                                          value=d.region_steer).tooltip(
+                                "Acts on the region watch (and turns it on): once an epoch it moves loss weights a "
+                                "step, by the rules beside it. Each rule is off at 0. What is taken from a region "
+                                "goes to the rest of that picture. Works with every optimizer; not in a race. Never "
+                                "run in a real training here and its defaults are uncalibrated: no benefit is "
+                                "claimed.")
+                            w["region_steer_regions"] = ui.select(
+                                {"background,clothes": "background and clothes", "background": "background only",
+                                 "clothes": "clothes only"}, label="May be turned down",
+                                value=d.region_steer_regions if d.region_steer_regions in (
+                                    "background,clothes", "background", "clothes") else "background,clothes") \
+                                .classes("w-56").bind_visibility_from(w["region_steer"], "value")
+                        with fields().bind_visibility_from(w["region_steer"], "value"):
+                            w["region_steer_cap"] = ui.number("Cap (x subject learned, 0 = off)",
+                                                              value=d.region_steer_cap, min=0, max=2, step=0.05) \
+                                .classes("w-60").tooltip(
+                                "All pictures together: a steered region may be learned at most this share of what "
+                                "the subject (face, hair, skin) has been learned. Past it the region is turned down "
+                                "in every picture, further where it runs further ahead. Lower = stricter.")
+                            w["region_steer_ahead"] = ui.number("Ahead (x median contrast, 0 = off)",
+                                                                value=d.region_steer_ahead, min=0, max=0.95,
+                                                                step=0.05).classes("w-64").tooltip(
+                                "One picture at a time: its region is turned down when its contrast (the Region "
+                                "watch table) is under this share of the median picture's, whatever the others do. "
+                                "It reads one noisy training sample per picture per epoch.")
+                            w["region_steer_boost"] = ui.number("Boost up to (0 = never raise)",
+                                                                value=d.region_steer_boost, min=0, max=3, step=0.1) \
+                                .classes("w-56").tooltip(
+                                "All pictures together: a face, hair or skin that lags the subject as a whole by "
+                                "more than a tenth is raised, up to this weight (1.5, say). Off by default: a "
+                                "region that stays hard is often a bad picture, and raising it trains on that.")
+                            w["region_steer_prior"] = ui.number("Background prior up to (0 = off)",
+                                                                value=d.region_steer_prior, min=0, max=2, step=0.05) \
+                                .classes("w-60").tooltip(
+                                "While the background is past its cap, also pull the background's prediction "
+                                "towards the base model's, with up to this weight. Needs the cap rule and the "
+                                "background among the steered regions. One more forward pass a step while it acts.")
+                        with fields().bind_visibility_from(w["region_steer"], "value"):
+                            w["region_steer_min"] = ui.number("Lowest weight (0 = mask out)",
+                                                              value=d.region_steer_min, min=0, max=0.95, step=0.05) \
+                                .classes("w-52").tooltip(
+                                "A steered region's weight never goes under this. 0 lets steering mask a region out "
+                                "of a picture altogether: the model is then free to do anything there.")
+                            w["region_steer_step"] = ui.number("Step per epoch", value=d.region_steer_step,
+                                                               min=0.01, max=0.5, step=0.01).classes("w-40").tooltip(
+                                "The most a weight moves in one epoch, as a share of itself. Back up half as fast.")
+                            w["region_steer_strength"] = ui.number("Strength", value=d.region_steer_strength,
+                                                                   min=0.1, max=4, step=0.1).classes("w-32").tooltip(
+                                "How hard a rule pulls: the weight aimed for is (share within the limit) to the "
+                                "power of 2 x this.")
                         with fields():
                             w["look_warmup"] = ui.switch("Warm up look outliers", value=d.look_warmup).tooltip(
                                 "Images the look consistency filter (Dataset tab) put under its fence, real but "
@@ -9278,6 +9380,7 @@ def build_page(local: bool = True):
                         {"name": "background", "label": "background vs subject", "field": "background",
                          "sortable": True},
                         {"name": "clothes", "label": "clothes vs subject", "field": "clothes", "sortable": True},
+                        {"name": "weights", "label": "steered weights", "field": "weights", "align": "left"},
                         {"name": "cells", "label": "cells: face / hair / skin / clothes / background",
                          "field": "cells", "align": "left"},
                         {"name": "seen", "label": "seen", "field": "seen", "sortable": True},

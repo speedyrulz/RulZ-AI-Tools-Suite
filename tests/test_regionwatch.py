@@ -128,7 +128,7 @@ def test_small_regions_dropped_captions_and_pairs_are_not_read(tmp_path):
     cells[FACE] = 1.0  # under MIN_CELLS
     watch.frozen = True
     for c in RW.COLUMNS:
-        watch.loss_curves[c].add(RW.bucket(0.5), 1.0)
+        watch.loss_curves[c].add(0.5, 1.0)
     watch.observe([items[0].key, items[1].key, items[4].key], [0.5, 0.5, 0.5], [losses, losses, losses],
                   [cells, cells, cells], skip=[False, True, False])
     assert watch.epoch_obs == 3

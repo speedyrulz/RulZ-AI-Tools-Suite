@@ -914,6 +914,48 @@ its set hardest removing 44% of the background's error
 ([test results](docs/experimental-test-results.md#qwen-image-21-optimizers-and-oft)). Those were fixed-noise maps of
 three pictures. The watch reads every picture from the training steps instead, so its numbers will not match them.
 
+## Region class weights and region steering (experimental)
+
+**Neither has run in a real training here.** Their arithmetic is unit-tested; their defaults are uncalibrated and no
+benefit is claimed. Both use the parts maps of the [region watch](#region-watch-region_watch) (MediaPipe), are off by
+default, and refuse `hull_regions: parts`.
+
+**`region_class_weights`** is the plain one: a fixed loss weight per region for the whole run, such as
+`face=3, hair=1.5, skin=1.5, clothes=0.5, background=0.3`. A region left out stays at 1, `0` masks one out, and the
+weights are rescaled to mean 1 per picture. It is applied from the parts map at each step, so it can be a
+configuration-race row. Not together with `region_weights` (the face box / silhouette weighting of the identity
+recipe): they are two fixed weightings of the same loss.
+
+**`region_steer: true`** lets the region watch (turned on with it) move loss weights once an epoch. Each rule has its
+own setting and is off at 0:
+
+| Setting | Default | Rule |
+| --- | --- | --- |
+| `region_steer_cap` | 0.6 | All pictures together: a steered region's learned share may be at most this x the subject's (face, hair and skin). Past it the region is turned down in every picture, further where its contrast is lower. |
+| `region_steer_ahead` | 0.7 | One picture at a time: its region is turned down when its contrast is under this x the median picture's, whatever the cohort does. It reads one noisy training sample per picture per epoch. |
+| `region_steer_boost` | 0 (never raise) | All pictures together: a face, hair or skin lagging the subject as a whole by more than a tenth is raised, up to this weight (1.5, say). Off by default: a region that stays hard is often a bad picture. |
+| `region_steer_prior` | 0 | While the background is past its cap, its prediction is also pulled towards the base model's, with up to this weight. Needs the cap rule and the background among the steered regions; one more forward pass a step while it acts; not for a fine-tune. |
+
+And the limits they share:
+
+| Setting | Default | |
+| --- | --- | --- |
+| `region_steer_regions` | `background,clothes` | What the cap and ahead rules may turn down: `background`, `clothes` or both. The face, hair and skin are never turned down. |
+| `region_steer_min` | 0.3 | A region's lowest weight. 0 lets steering mask a region out of a picture: the model is then free to do anything there. |
+| `region_steer_step` | 0.2 | The most a weight moves per epoch, as a share of itself; back up half as fast. |
+| `region_steer_strength` | 1.0 | How hard a rule pulls: the weight aimed for is (share within the limit) ^ (2 x this). |
+
+How it acts: the weight of each region of each picture is 1 until a rule says otherwise, moves a step an epoch towards
+its target and returns when the cause is gone. The weights are rescaled to mean 1 per picture, so what is taken from
+the background goes to the rest of that picture. With `region_weights` on, the two are multiplied and rescaled again.
+The watch keeps reading the unweighted loss, so its numbers stay comparable. Steering waits until the subject has
+learned 5%, is off in a configuration race, and after a resume without a saved `region_watch.json` it stays off for
+that run (its baseline would be an already trained model's) while the watch observes. The Monitor's Region watch table
+shows each picture's steered weights, and the log line says how many pictures are turned down.
+
+What to compare it against: the same run with `region_class_weights`, and the same run with neither. Runs with the
+same settings and seed have differed by up to 15 points here, so one run of each shows little.
+
 ## Training maps (`training_maps`)
 
 Heatmaps over a few training pictures that show where training is going right or wrong, capture by capture. A
