@@ -297,6 +297,12 @@ class RegionSweep:
                 if not p["held"] and p["key"] in self.latest and self.latest[p["key"]]["contrast"]}
 
 
+def learned_by_picture(sweep: "RegionSweep") -> dict[str, dict[str, float]]:
+    """key -> {region: learned share since its first sweep} for the training pictures swept so far."""
+    return {p["key"]: {c: v for c, v in sweep.latest[p["key"]]["learned"].items() if c in REGIONS}
+            for p in sweep.probes if not p["held"] and p["key"] in sweep.latest}
+
+
 def describe(row: dict) -> str:
     """One line for the log and the WebUI from a sweep's summary."""
     def shares(d):

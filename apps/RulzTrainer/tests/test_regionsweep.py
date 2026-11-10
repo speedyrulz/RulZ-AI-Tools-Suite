@@ -242,7 +242,8 @@ def test_trainer_holds_photos_out_sweeps_them_keeps_the_best_and_stops(tmp_path)
     t.replicas = [(model, {}, "cpu")]
     saved, watched = [], []
     t._save_holdout_best = lambda injected, step, score: saved.append((step, round(score, 3)))
-    t.region_watch = type("W", (), {"set_sweep": lambda self, c, gap, flat: watched.append((len(c), gap["face"]))})()
+    t.region_watch = type("W", (), {"set_sweep": lambda self, c, gap, flat, learned=None: watched.append(
+        (len(c), gap["face"], len(learned)))})()
     t._setup_sweep(t.cfg, 0)
     assert t.sweep is not None and t.sweep.every == 10  # 10 training pictures, one a step: one epoch
     assert len(t.sweep.probes) == 12 and sum(p["held"] for p in t.sweep.probes) == 2
@@ -253,7 +254,8 @@ def test_trainer_holds_photos_out_sweeps_them_keeps_the_best_and_stops(tmp_path)
     with torch.no_grad():
         model.gain.fill_(0.5)
     t._run_sweep(model, {}, 10)
-    assert saved == [(10, 0.75)] and not t.holdout_stop and watched[-1] == (10, pytest.approx(0.0, abs=1e-3))
+    assert saved == [(10, 0.75)] and not t.holdout_stop
+    assert watched[-1] == (10, pytest.approx(0.0, abs=1e-3), 10)  # contrasts, the gap, each picture learned share
     t._run_sweep(model, {}, 20)  # no better: with a patience of 1 the run is told to stop
     assert saved == [(10, 0.75)] and t.holdout_stop
     assert json.loads((t.job_dir / "status.json").read_text(encoding="utf-8"))["region_sweep"]["stop"] is True

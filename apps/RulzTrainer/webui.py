@@ -1538,6 +1538,7 @@ class Form:
             region_steer_strength=float(v("region_steer_strength")),
             region_steer_signal=str(v("region_steer_signal") or "steps"),
             region_steer_holdout=float(v("region_steer_holdout") or 0),
+            region_steer_subject_ahead=float(v("region_steer_subject_ahead") or 0),
             region_sweep_every=int(v("region_sweep_every") or 0),
             region_sweep_pictures=int(v("region_sweep_pictures") or 0),
             holdout_images=int(v("holdout_images") or 0), holdout_track_best=bool(v("holdout_track_best")),
@@ -3992,6 +3993,7 @@ RACE_LABELS = {
     "region_steer_min": "Region steering: lowest weight", "region_steer_step": "Region steering: step",
     "region_steer_strength": "Region steering: strength", "region_steer_signal": "Region steering: reading",
     "region_steer_holdout": "Region steering: held-out gap", "region_sweep_every": "Region sweep every (epochs)",
+    "region_steer_subject_ahead": "Region steering: subject ahead",
     "region_sweep_pictures": "Region sweep: pictures per sweep", "holdout_images": "Held-out photos",
     "holdout_track_best": "Held-out best checkpoint", "holdout_patience": "Held-out stop patience",
     "per_image_lr": "Per-image learning rate", "lora_rank": "LoRA rank", "lora_alpha": "LoRA alpha",
@@ -8589,6 +8591,14 @@ def build_page(local: bool = True):
                                 "than on the held-out ones (0.15 = 15 points), and no better on those for two sweeps, "
                                 "is turned down in every picture. The one rule that may turn the face, hair or skin "
                                 "down.")
+                            w["region_steer_subject_ahead"] = ui.number(
+                                "Subject ahead (x median left, 0 = off)", value=d.region_steer_subject_ahead, min=0,
+                                max=0.95, step=0.05).classes("w-72").tooltip(
+                                "Needs sweeps of the training pictures. One picture at a time: its face, hair or "
+                                "skin is turned down in that picture when the sweeps show it with less than this "
+                                "share of the median picture's error left (0.7, say): that one photo's face is "
+                                "being learned far ahead of the others'. The only per-picture rule for the person "
+                                "themselves.")
                         with fields():
                             w["region_sweep_every"] = ui.number("Region sweep every N epochs (0 = off)",
                                                                 value=d.region_sweep_every, min=0, precision=0) \

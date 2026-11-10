@@ -32,6 +32,9 @@ Two ways to act on the parts maps, both off by default and neither run in a real
       - holdout (cohort, needs held-out pictures and regionsweep.py): a region learned `holdout` further on the
                training pictures than on the held-out ones, and no longer improving on those, is turned down in
                every picture. The one rule that may turn the face, hair or skin down.
+      - subject_ahead (per picture, needs sweeps of the training pictures): a picture whose face, hair or skin has
+               less than `subject_ahead` x the median picture's error left, by the sweeps, is turned down in that
+               picture alone. The steps have no clean reading of one picture's subject; the sweeps do.
     `signal` chooses what the cap rule's per-picture share and the ahead rule read: the training steps' own contrast
     ("steps"), or the fixed-noise sweeps' ("sweep": cleaner, but only as fresh as the last sweep of that picture).
     A weight moves at most `step` an epoch (back up half as fast), never under `min`, and returns when its cause is
@@ -71,6 +74,7 @@ SPREAD = (0.5, 2.0)  # how far a picture's own contrast may move its share of a 
 BOOST_MARGIN = 0.1  # a subject region is lagging when it is this far (as a share) behind the subject as a whole
 SNAP = 0.02  # a weight this close to its target lands on it
 HOLDOUT_FLAT = 2  # sweeps without a better held-out reading before the holdout rule acts on a region
+MIN_PICTURES = 4  # the subject_ahead rule needs this many swept pictures with the region before it compares them
 STATE_FILE, LOG_FILE = "region_watch.json", "region_watch.jsonl"
 
 
@@ -268,6 +272,7 @@ class RegionWatch:
         self.sweep_contrast: dict[str, dict] = {}  # key -> {protected region: contrast} from the last sweeps
         self.holdout_gap: dict[str, float] = {}  # region -> learned on training pictures minus on held-out ones
         self.holdout_flat: dict[str, int] = {}  # region -> sweeps without a better held-out reading
+        self.sweep_learned: dict[str, dict] = {}  # key -> {region: learned share since its first sweep}
         self.per_epoch = max(1, len(items))  # every sample counts towards the epoch, read or not
         self.stats: dict[str, PictureStat] = {str(it.key): PictureStat(str(it.key)) for it in items if tracked(it)}
         self.epoch = 0
@@ -446,11 +451,14 @@ class RegionWatch:
     def _signal(self) -> str:
         return "sweep" if self.steer and self.steer.get("signal") == "sweep" else "steps"
 
-    def set_sweep(self, contrasts: dict, gap: dict | None = None, flat: dict | None = None) -> None:
-        """The latest fixed-noise readings (regionsweep.RegionSweep): per training picture its contrasts, and with
-        held-out pictures the gap per region and how long each has gone without a better held-out reading."""
+    def set_sweep(self, contrasts: dict, gap: dict | None = None, flat: dict | None = None,
+                  learned: dict | None = None) -> None:
+        """The latest fixed-noise readings (regionsweep.RegionSweep): per training picture its contrasts and its
+        learned share per region, and with held-out pictures the gap per region and how long each has gone without a
+        better held-out reading."""
         with self._lock:
             self.sweep_contrast = {str(k): dict(v) for k, v in (contrasts or {}).items()}
+            self.sweep_learned = {str(k): dict(v) for k, v in (learned or {}).items()}
             self.holdout_gap = {str(k): float(v) for k, v in (gap or {}).items() if v is not None}
             self.holdout_flat = {str(k): int(v) for k, v in (flat or {}).items()}
 
@@ -496,6 +504,24 @@ class RegionWatch:
                     st.gain[p] = round(g, 4)
                     lowered, lowest = lowered + 1, min(lowest, g)
             out[p] = {"cohort": round(cohort, 4), "lowered": lowered, "lowest": round(lowest, 4)}
+        ahead = float(cfg.get("subject_ahead") or 0.0)
+        for region in SUBJECT_REGIONS:  # one picture's face / hair / skin far ahead of the other pictures', by sweeps
+            left = {k: 1.0 - v[region] for k, v in self.sweep_learned.items() if region in v} if ahead > 0 else {}
+            median = statistics.median(left.values()) if len(left) >= MIN_PICTURES else None
+            lowered, lowest = 0, 1.0
+            for st in self.stats.values():
+                target = 1.0
+                if median and median > 0 and st.key in left:
+                    want = min(SPREAD[1], max(SPREAD[0], left[st.key] / median)) / ahead
+                    target = max(lo, want ** (2.0 * strength)) if want < 1.0 else 1.0
+                g = _move(float(st.gain.get(region, 1.0)), target, step, lo, 1.0)
+                if g >= 1.0 - 1e-6:
+                    st.gain.pop(region, None)
+                else:
+                    st.gain[region] = round(g, 4)
+                    lowered, lowest = lowered + 1, min(lowest, g)
+            if ahead > 0:
+                out[region] = {"lowered": lowered, "lowest": round(lowest, 4)}
         boost, holdout = float(cfg.get("boost") or 0.0), float(cfg.get("holdout") or 0.0)
         for region in REGIONS:  # a weight for the region in every picture
             target = 1.0
@@ -555,7 +581,7 @@ class RegionWatch:
                          "clothes": None if cl is None else round(cl, 3),
                          "sweep_background": None if swept.get("background") is None else round(swept["background"], 3),
                          "sweep_clothes": None if swept.get("clothes") is None else round(swept["clothes"], 3),
-                         "weights": " / ".join(f"{p} x{st.gain[p]:.2f}" for p in PROTECTED if p in st.gain),
+                         "weights": " / ".join(f"{r} x{st.gain[r]:.2f}" for r in REGIONS if r in st.gain),
                          "cells": " / ".join(f"{st.cells.get(c, 0):.0f}" for c in REGIONS)})
         rows.sort(key=lambda r: (r["background"] is None, r["background"] if r["background"] is not None else 0.0))
         return rows[:limit]
@@ -584,7 +610,7 @@ def describe(summary: dict) -> str:
     if bg.get("median") is not None:
         text += f" | background against subject x{bg['median']:.2f} (median of {bg['pictures']} pictures)"
     steer = summary.get("steer") or {}
-    for p in PROTECTED:
+    for p in (*PROTECTED, *SUBJECT_REGIONS):
         if (steer.get(p) or {}).get("lowered"):
             text += f" | steering: {p} turned down on {steer[p]['lowered']} pictures (lowest x{steer[p]['lowest']:.2f})"
     if steer.get("boost"):
