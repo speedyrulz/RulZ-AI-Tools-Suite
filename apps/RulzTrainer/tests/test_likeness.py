@@ -330,3 +330,27 @@ def test_likeness_spreadsheet_export(tmp_path):
     assert wb["Raw probe scores lokr8"].max_row == 3
     with pytest.raises(FileNotFoundError):
         X.build_workbook(tmp_path / "empty")
+
+
+def test_framing_counts_renders_without_a_body_and_can_pull_the_curriculum():
+    seeds = {"face": [60.0, 60.0, 60.0, 60.0], "body": [70.0, None, None, None]}
+    plain = L.LikenessController(_cfg(likeness_lr_control=False))
+    rec, _ = plain.update(0, 60.0, 70.0, seeds=seeds)
+    assert (rec.body_probes, rec.body_missing) == (4, 3)  # recorded whatever the setting
+    assert plain.face_bias == pytest.approx(0.5)  # body 70 against face 60: the face lags, as before
+    framed = L.LikenessController(_cfg(likeness_lr_control=False, likeness_curriculum_framing=1.0))
+    rec, act = framed.update(0, 60.0, 70.0, seeds=seeds)
+    # three of four renders show no body: the body counts as 70 x 1/4 = 17.5 against the face at 60
+    assert framed.face_bias == pytest.approx(-1.0) and act["face_bias"] == pytest.approx(-1.0)
+    assert rec.body_ema == 70.0  # the record keeps the measured body; only the curriculum reads the framing
+    half = L.LikenessController(_cfg(likeness_lr_control=False, likeness_curriculum_framing=0.5))
+    half.update(0, 60.0, 70.0, seeds={"face": [60.0] * 4, "body": [70.0, 70.0, None, None]})
+    assert half.face_bias == pytest.approx((70.0 * 0.75 - 60.0) / 20.0)
+    gone = L.LikenessController(_cfg(likeness_lr_control=False, likeness_curriculum_framing=1.0))
+    rec, _ = gone.update(0, 60.0, None, seeds={"face": [60.0] * 2, "body": [None, None]})
+    assert gone.face_bias == pytest.approx(-1.0) and rec.body_missing == 2  # no body at all: the full pull
+    whole = L.LikenessController(_cfg(likeness_lr_control=False, likeness_curriculum_framing=1.0))
+    whole.update(0, 60.0, 70.0, seeds={"face": [60.0] * 2, "body": [70.0, 70.0]})
+    assert whole.face_bias == pytest.approx(0.5)  # every render shows a body: nothing changes
+    with pytest.raises(ValueError):
+        TrainConfig(likeness_curriculum_framing=1.5).validate()
