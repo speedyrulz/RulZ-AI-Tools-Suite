@@ -962,6 +962,53 @@ def probe_chart_series(probes: list[dict], names: list[str],
     return series, legend
 
 
+SWEEP_COLORS = {"face": "#FF3B30", "hair": "#F59E0B", "skin": "#FB7185", "clothes": "#60A5FA",
+                "background": "#34D399", "subject": "#F4F4F5"}
+
+
+def sweep_history(sweep: dict | None, job_dir=None) -> list[dict]:
+    """A run's sweeps, oldest first, for the Monitor's chart: the status's own list, else (a status written without
+    one) the job folder's region_sweep.jsonl."""
+    rows = list((sweep or {}).get("history") or [])
+    if rows or not sweep or job_dir is None:
+        return rows
+    try:
+        with open(Path(job_dir) / "region_sweep.jsonl", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict) and "step" in row:
+                    rows.append(row)
+    except OSError:
+        return []
+    return rows[-400:]
+
+
+def sweep_chart_series(history: list[dict], best=None) -> tuple[list[dict], list[str]]:
+    """(series, legend) of the Monitor's region sweep chart: per region the share of its starting error that is gone,
+    in percent, at every sweep. One colour per region, the training pictures solid and the held-out ones dashed
+    ("face (held-out)"), the subject (face, hair and skin together) thicker. A set of pictures that was not swept
+    has no lines. best: (score, step) of the held-out subject's best sweep, marked on its line."""
+    series, legend = [], []
+    for key, suffix, style in (("train", "", {}), ("held", " (held-out)", {"type": "dashed"})):
+        for region, color in SWEEP_COLORS.items():
+            pts = [[int(r["step"]), round(100 * (r.get(key) or {})[region], 1)] for r in history
+                   if (r.get(key) or {}).get(region) is not None]
+            if not pts:
+                continue
+            line = _line(region + suffix, color, data=pts, showSymbol=len(pts) < 60, symbolSize=4,
+                         lineStyle={"width": 3 if region == "subject" else 1.5, **style})
+            if key == "held" and region == "subject" and best:
+                line["markPoint"] = {"symbol": "pin", "symbolSize": 34, "itemStyle": {"color": "#F59E0B"},
+                                     "label": {"formatter": "best", "color": "#0A0A0A", "fontSize": 9},
+                                     "data": [{"coord": [int(best[1]), round(100 * float(best[0]), 1)]}]}
+            series.append(line)
+            legend.append(region + suffix)
+    return series, legend
+
+
 def probe_score_line(rec: dict | None) -> str:
     """"overall 38% | face 47% | body 17%": one probe's normalized scores (the scores themselves with normalization
     off)."""
@@ -10579,9 +10626,22 @@ def build_page(local: bool = True):
                 with section("Region watch", "How far each part of the pictures has been learned", "grid_view") as rw_exp:
                     rw_label = hint("")
                     rs_label = hint("")
-                    hint("Contrast: a picture's background (or clothes) loss against its subject's, relative to its "
-                         "own start. Under 1 = that region is being learned faster than the subject in this picture. "
-                         "One training sample per picture per epoch is a noisy reading, so read it as a trend.")
+                    with ui.column().classes("w-full gap-1") as rs_box:
+                        hint("Region sweeps: how much of each region's starting error is gone, sweep by sweep (0% = "
+                             "as at the first sweep). Solid lines are the training pictures, dashed ones the "
+                             "held-out photos; the subject is face, hair and skin together. Training lines that "
+                             "keep rising while the held-out ones flatten or fall is the model memorising the "
+                             "photos. Click a name in the legend to hide or show its line.")
+                        rs_chart = RzChart(chart_options(
+                            _axis("step", min="dataMin"), _axis("% of the starting error gone", scale=True),
+                            [], [])).classes("w-full h-72")
+                        charts.append(rs_chart)
+                    rs_box.visible = False
+                    rw_note = hint("Contrast: a picture's background (or clothes) loss against its subject's, "
+                                   "relative to its own start. Under 1 = that region is being learned faster than "
+                                   "the subject in this picture. One training sample per picture per epoch is a "
+                                   "noisy reading, so read it as a trend.")
+                    rw_note.visible = False
                     rw_table = ui.table(columns=[
                         {"name": "image", "label": "image", "field": "image", "align": "left", "sortable": True},
                         {"name": "background", "label": "background vs subject", "field": "background",
@@ -10596,8 +10656,10 @@ def build_page(local: bool = True):
                          "field": "cells", "align": "left"},
                         {"name": "seen", "label": "seen", "field": "seen", "sortable": True},
                     ], rows=[], row_key="path", pagination=15).props("flat dense").classes("w-full text-xs")
+                    rw_table.visible = False  # (the per-picture table is the region watch's: a run with sweeps only
+                    # has none)
                 rw_exp.visible = False
-                rw_state = {"sig": None}
+                rw_state = {"sig": None, "sweep": None}
                 with section("Saved files", "Download the run's LoRAs, logs and settings, probe and sample images",
                              "download") as files_exp:
                     job_files = JobFiles()
@@ -10979,6 +11041,7 @@ def build_page(local: bool = True):
                         lw_table.rows = lw.get("rows") or []
                         lw_table.update()
                 rw = st.get("region_watch")
+                rw_note.visible = rw_table.visible = bool(rw)
                 if rw:
                     rw_exp.visible = True
                     sig = (rw.get("epoch"), rw.get("step"))
@@ -10991,6 +11054,16 @@ def build_page(local: bool = True):
                 if rs:
                     rw_exp.visible = True
                     rs_label.text = f"Sweep at step {rs.get('step')}: {rs.get('line') or ''}"
+                    sig = (str(_job_dir), rs.get("step"), len(rs.get("history") or []))
+                    if sig != rw_state["sweep"]:
+                        rw_state["sweep"] = sig
+                        series, legend = sweep_chart_series(sweep_history(rs, _job_dir), rs.get("best"))
+                        rs_chart.options["series"] = series
+                        rs_chart.options["legend"]["data"] = legend
+                        rs_chart.update()
+                        rs_box.visible = any(len(sr["data"]) > 1 for sr in series)
+                else:
+                    rs_box.visible = False
                 dup_note = near_duplicate_note(st.get("near_duplicates"))
                 near_dup_label.visible = bool(dup_note)
                 near_dup_label.text = dup_note
@@ -11383,7 +11456,8 @@ is. The chip at the top right is the machine: the free space of the drive with y
 
 The **Monitor** shows one view at a time: **Overview** (GPUs, disk and memory, the queue, the race, the likeness chart
 and the loss), **Images** (the probe images and your samples, a race's configurations side by side), **Details** (the
-samples' identity similarity, gradient norm, per-image loss watch and region watch, each when the run has it) and
+samples' identity similarity, gradient norm, per-image loss watch and region watch with the region sweeps' chart,
+each when the run has it) and
 **Log & files** (the downloads and train.log). The numbers above the views stay put.
 
 Red marks the one main action of a view and whatever is switched on; every other button is plain text with a red icon.
