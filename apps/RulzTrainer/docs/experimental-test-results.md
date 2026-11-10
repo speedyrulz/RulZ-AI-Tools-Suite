@@ -95,3 +95,36 @@ Mean from step 1000 on. Peak copy is the highest at any probe.
 - **Resolution step-up** reached 0.5 MP only at step 1600, then nothing clearly moved and steps took twice as long.
   Nothing can be credited to it. A fair test has to reach the higher resolution much earlier.
 - **Reward fine-tuning** has one probe after its stage, 1 point lower. 150 steps took about 3.5 hours, 80 to 100 s each.
+
+## Qwen-Image 2.1: optimizers and OFT
+
+Measured in November 2026 on a different set from the Krea 2 rows above: 62 generated photos of one fictional
+character at 0.25 MP, with long captions that name the scene, pose, lighting and clothing. Qwen-Image 2.1 Base int8
+with its turbo LoRA for probes and Fizgig's training adapter, rank 32, 2000 steps, seed 42, 8 probe seeds, lr 1e-4
+(Keel's and Automagic's start). Each row is **one separate run** (not a race, so training maps could run). The probe
+prompts describe the character, so the step-0 probes already scored high (raw ArcFace 64.5 of a ceiling of 78) and copy
+was 0.54 before any training: on these runs copy over 0.50 means little until it climbs well past 0.54.
+
+| Row | Best smoothed combined | Combined from step 1000 | FaceNet from step 1000 | ArcFace from step 1000 | Body probes scored from step 1000 | Peak copy | s/step |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| AdamW 8-bit, LoRA | 28.0 (step 1000) | 23.3 | 86.2 | 73.0 | 4 of 6 | 0.59 | 0.42 |
+| Muon, LoRA | 29.2 (1000) | 25.9 | 86.1 | 72.4 | 3 of 6 | 0.57 | 0.8 |
+| Keel, LoRA | **44.7 (1400)** | **38.2** | **87.9** | 72.0 | 3 of 6 | 0.61 | 0.67 |
+| Muon, OFT | 51.4 (1200), see below | 19.3 | 85.7 | 64.5 | 1 of 6 | 0.61 | 0.45 |
+| AdamW 8-bit, OFT | 45.9 (1200), see below | 16.9 | 83.5 | 62.7 | 3 of 6 | 0.64 | 0.45 |
+
+- **Keel led clearly**: 12 to 15 points over AdamW and Muon from step 1000, the best FaceNet at every probe from step 800,
+  and still rising at step 1400. That repeats Keel's FaceNet gain on Krea 2. Its lr climbed to the 1e-3 ceiling by step
+  500. One run; a second seed should confirm it. Its loss over the watched training pictures fell 44% against 15-17% for
+  AdamW and Muon, and its copy rose to 0.61 against one photo of a near-duplicate pair, so it fits the set hardest.
+- **Muon tied AdamW** on every score at twice the time per step. By step 2000 most of its faces had broad smiles.
+- **OFT overtrained on Qwen-Image 2.1 at lr 1e-4, with either optimizer.** Combined jumped early (20-31 at step 200
+  against 9-14 for LoRA) and copy reached 0.61-0.64 at step 200, then ArcFace fell below the untrained model's (to
+  about 60) and FaceNet slid from step 1200. Training photos' backgrounds and outdoor scenes leaked into the probes,
+  headshots included. Both OFT rows' best scores come from one probe seed rendering a standing full-body pose like the
+  training photos' (body 97-107), not the seated scene asked for: read them by their means, not their bests. On Krea 2
+  OFT was the one confirmed gain; on this model try a lower lr or `oft_constraint` first.
+- **Every row lost the full-body framing**: the body probe went to waist-up and then head-and-shoulders portraits by
+  step 1000-1600, so the body score could not be read at several probes. Its outfit followed the set's tops, not the
+  prompt's. That happened with every optimizer and both adapters, so it is not the optimizer's doing.
+- **Training maps** ran on all five: about 2.5 s a capture on LoRA, 3.4-3.5 s on OFT.

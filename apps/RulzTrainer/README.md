@@ -951,8 +951,10 @@ trains every picture model's LoRA presets on these settings since 6 Nov 2026.
 
 - **Evidence.** Fizgig measured Muon level with AdamW on likeness (Qwen-Image 2.1, rank 8, 20 epochs) and moved its
   presets to it for sharper fine detail by eye (skin, hair, fabric). Against it, PoLoRA found Muon on LoRA factors
-  does not beat Adam on language models ([keel-optimizer.md](docs/keel-optimizer.md)). Not measured here yet, so the
-  Wizard keeps recommending adamw8bit; race it (`race` rows with `optimizer: muon`).
+  does not beat Adam on language models ([keel-optimizer.md](docs/keel-optimizer.md)). Measured here once, on
+  Qwen-Image 2.1 with a rank-32 LoRA: level with adamw8bit on every likeness score at about twice the time per step
+  ([test results](docs/experimental-test-results.md#qwen-image-21-optimizers-and-oft)), so the Wizard keeps
+  recommending adamw8bit.
 - **Memory.** One fp32 momentum per weight: less than `adamw`, a little more than `adamw8bit`. Matrices of the same
   shape are orthogonalized together in batched multiplies (a LoRA's hundreds of small matrices one at a time made
   the optimizer step the slow part), at most `2^26` numbers at a time, so a full fine-tune's large matrices go a few
@@ -1974,6 +1976,10 @@ weights, with and without the OFT constraint). diffusers has no loader for eithe
   > 0 (COFT) caps how far each layer rotates. Blocks start at zero (R = I). The rotation is applied to the frozen
   layer's output, so it trains on int8 / nvfp4 weights as they are. Keys: `<stem>.oft_blocks` [blocks, size, size]
   and, with a constraint, `<stem>.alpha` (ComfyUI reads it as that cap). Rank, alpha, LoRA+ and DoRA do not apply.
+  Measured here: the one confirmed gain on Krea 2 at lr 1e-4, but on Qwen-Image 2.1 at the same lr it overtrained
+  with adamw8bit and with Muon (fast early gains, then face likeness below the untrained model's, training-photo
+  backgrounds in the probes, copy over 0.6 by step 200). On Qwen-Image 2.1 start lower or with `oft_constraint`
+  ([test results](docs/experimental-test-results.md#qwen-image-21-optimizers-and-oft)).
 - **DoRA** (weight-decomposed LoRA, on a LoRA or a LoKr). The merged weight is W' = (W + delta) * m / ||W + delta||
   per input column: the adapter steers the direction, and a magnitude m per input channel trains on its own (it
   starts at ||W||, so the layer is unchanged at step 0). The norm is computed every forward from the dequantized
@@ -2844,7 +2850,7 @@ ComfyUI's `custom_nodes` and load `workflows/RulzTrainer Likeness Scoring.json`;
 |---|---|
 | Gradient checkpointing | on |
 | Batch size | 1 (use gradient accumulation instead) |
-| Optimizer | `adamw8bit`, or `automagic3` / `automagic4` (self-tuning lr, ported from ai-toolkit; 1 byte of state per weight at the default polarity history; Automagic 4's step is as fast as adamw8bit's on a rank-16 LoRA, about 3x slower at rank 64 and 6x on a full fine-tune; Automagic 3's about 10x slower than Automagic 4's), or `keel` / `keel_fb` (Automagic 4 plus identity mechanisms for character LoRAs, `keel_fb` for the face and the body alike; unmeasured on likeness: race them), or `muon` (orthogonalized momentum at AdamW's learning rates, Fizgig's default since Nov 2026; one fp32 state per weight; unmeasured here: race it), or `normuon` (Muon with each row's step evened out; experimental, untested) |
+| Optimizer | `adamw8bit`, or `automagic3` / `automagic4` (self-tuning lr, ported from ai-toolkit; 1 byte of state per weight at the default polarity history; Automagic 4's step is as fast as adamw8bit's on a rank-16 LoRA, about 3x slower at rank 64 and 6x on a full fine-tune; Automagic 3's about 10x slower than Automagic 4's), or `keel` / `keel_fb` (Automagic 4 plus identity mechanisms for character LoRAs, `keel_fb` for the face and the body alike; ahead on FaceNet in races on Krea 2 and Qwen-Image 2.1, see the test results), or `muon` (orthogonalized momentum at AdamW's learning rates, Fizgig's default since Nov 2026; one fp32 state per weight; level with adamw8bit on Qwen-Image 2.1 at twice the step time), or `normuon` (Muon with each row's step evened out; experimental, untested) |
 | Resolution | 1024 |
 | Text encoder device | `auto` (spreads over all GPUs + CPU during caching only) |
 | Max caption tokens | 512 to 1024 unless you train on very long prompts |
