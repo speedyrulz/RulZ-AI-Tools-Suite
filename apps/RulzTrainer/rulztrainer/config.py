@@ -1450,12 +1450,34 @@ class TrainConfig:
         return dataclasses.asdict(self)
 
     @classmethod
+    def numbers(cls, data: dict) -> dict:
+        """`data` with the number options that arrived as text turned back into numbers. YAML reads `1e-4` and
+        `1e-08` (an exponent without a decimal point) as text, in a hand-written file and in a config that was sent
+        as JSON alike, and a text learning rate then fails in a comparison with a message that names no setting.
+        Text that is no number is left for validate to refuse."""
+        kinds = {f.name: str(f.type) for f in dataclasses.fields(cls)}
+        out = dict(data)
+        for key, value in data.items():
+            if not isinstance(value, str) or kinds.get(key) not in ("float", "int"):
+                continue
+            try:
+                number = float(value.strip())
+            except ValueError:
+                continue
+            if kinds[key] == "int":
+                if number != int(number):
+                    continue
+                number = int(number)
+            out[key] = number
+        return out
+
+    @classmethod
     def from_dict(cls, data: dict) -> "TrainConfig":
         known = {f.name for f in dataclasses.fields(cls)}
         unknown = set(data) - known
         if unknown:
             raise ValueError(f"Unknown config keys: {sorted(unknown)}")
-        return cls(**data)
+        return cls(**cls.numbers(data))
 
     @classmethod
     def load(cls, path: str | Path) -> "TrainConfig":
@@ -1480,7 +1502,7 @@ class TrainConfig:
         known = [f.name for f in dataclasses.fields(cls)]
         unknown = sorted(k for k in data if k not in known)
         missing = [k for k in known if k not in data]
-        return cls(**{k: v for k, v in data.items() if k in known}), missing, unknown
+        return cls(**cls.numbers({k: v for k, v in data.items() if k in known})), missing, unknown
 
     @staticmethod
     def append_missing(path: str | Path, cfg: "TrainConfig", missing: list[str]) -> None:

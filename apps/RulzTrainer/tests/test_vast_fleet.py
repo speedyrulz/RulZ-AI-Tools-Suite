@@ -91,7 +91,7 @@ class Machine:
                 return 1, b"", f"[refused] {self.refuse}".encode()
             if "--dry-run" in args:
                 return 0, {"job": name, "dry_run": True, "steps": 100, "arch": "krea2", "changed": {}}, b""
-            self.configs[name] = json.loads(config)
+            self.configs[name] = __import__("yaml").safe_load(config)  # the instance reads it as YAML
             self.run(name)
             return 0, {"job": name, "state": "running"}, b""
         if command == "record":
@@ -876,3 +876,34 @@ def test_a_run_that_started_and_ended_between_two_looks_is_still_closed_and_down
     assert [e["kind"] for e in world.kinds("run_started", "run_done")] == ["run_started", "run_done"]
     rec = world.fleet.find_run("quick")
     assert not rec["imported"] and rec["downloaded"] and rec["state"] == "done"
+
+
+def test_a_sent_config_keeps_its_small_numbers():
+    """The fleet sent a config as JSON, and the instance's YAML loader read JSON's `1e-08` back as text: every
+    dispatch was refused with "'>' not supported between instances of 'str' and 'float'"."""
+    import json
+    import tempfile
+
+    import yaml
+
+    from rulztrainer.config import TrainConfig
+
+    cfg = TrainConfig(datasets=[{"path": "a"}], learning_rate=5e-05)
+    sent = fleet_module.config_bytes(cfg.to_dict())
+    back = yaml.safe_load(sent.decode("utf-8"))
+    assert back == cfg.to_dict()  # every number a number again
+    assert isinstance(back["automagic_min_lr"], float) and back["learning_rate"] == 5e-05
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "config.yaml"
+        path.write_bytes(sent)
+        TrainConfig.load_report(path)[0].validate()
+        # and a trainer reads the old JSON form, or a hand-written `1e-4`, as numbers too
+        path.write_text(json.dumps(cfg.to_dict()), encoding="utf-8")
+        assert isinstance(yaml.safe_load(path.read_text(encoding="utf-8"))["automagic_min_lr"], str)  # the trap
+        old = TrainConfig.load_report(path)[0]
+        old.validate()
+        assert old.automagic_min_lr == 1e-08 and old.learning_rate == 5e-05
+    by_hand = TrainConfig.from_dict({"datasets": [{"path": "a"}], "learning_rate": "1e-4", "steps": "2000",
+                                     "lora_rank": " 16 ", "job_name": "1e-4"})
+    assert (by_hand.learning_rate, by_hand.steps, by_hand.lora_rank, by_hand.job_name) == (1e-4, 2000, 16, "1e-4")
+    assert TrainConfig.numbers({"steps": "2.5", "learning_rate": "fast"}) == {"steps": "2.5", "learning_rate": "fast"}

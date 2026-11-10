@@ -1,7 +1,7 @@
 """RulzTrainer: a simple diffusion LoRA trainer with a WebUI."""
 import os as _os
 
-__version__ = "3.4.0"
+__version__ = "3.4.1"
 
 # No telemetry. onnxruntime's Linux builds (1.29 and later, loaded for InsightFace's face scoring) report a device ID
 # and machine details to Microsoft unless ORT_DISABLE_TELEMETRY is set, and Hugging Face's libraries send usage pings
