@@ -4358,6 +4358,10 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
             if qwen and cfg.network_type == "lora":
                 r["learning_rate"] = ((1.5e-4, "Fizgig's Qwen-Image 2.1 style preset (rank 16)") if goal == "style" else
                                       (2e-4, "Fizgig's fastest-to-likeness Qwen-Image 2.1 recipe: rank 8 from 2e-4"))
+            if qwen and cfg.network_type == "oft":
+                r["learning_rate"] = (5e-5, "OFT on Qwen-Image 2.1 overtrained at 1e-4 with adamw8bit and with muon "
+                                            "(copy over 0.6 by step 200, face likeness below the untrained model's); "
+                                            "at 5e-5 it held the face and the full-body framing (one run each)")
             if klein and cfg.network_type == "lora":
                 r["learning_rate"] = (1e-4, "BFL's FLUX 3 Klein recipe: 1e-4, constant after 200 warm-up steps")
                 r["lr_scheduler"] = ("constant", "BFL's FLUX 3 Klein recipe")
@@ -4917,7 +4921,10 @@ EXPERIMENTS = [
                "is Fizgig's pick for a full fine-tune, not tested for LoRAs. muon: Fizgig measured it level with "
                "AdamW on likeness (Qwen-Image 2.1, rank 8, 20 epochs) and made it every picture model's LoRA default "
                "for sharper fine detail by eye; a study of Muon on LoRA factors for language models found no gain "
-               "over Adam. Not raced here yet. normuon has never run in a real training here.",
+               "over Adam. On Qwen-Image 2.1 (rank 32 at 1e-4, one run each on one set of 62 photos): keel led "
+               "adamw8bit and muon by 12 to 15 combined points with the best FaceNet, but the highest copy score of "
+               "the three (0.61); muon tied adamw8bit at about twice the time a step. normuon has never run in a real "
+               "training here.",
      "cost": "automagic4 took 1.6 s a step against automagic3's 2.2 s. The learning-rate schedule, LoRA+ and the "
              "per-image learning rate do not apply to the automagic family. Keel's consensus gate wants gradient "
              "accumulation of 2 or more. muon keeps one full-precision number per weight (less than adamw, a "
