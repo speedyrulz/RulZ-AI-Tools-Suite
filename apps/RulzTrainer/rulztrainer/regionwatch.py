@@ -29,6 +29,11 @@ Two ways to act on the parts maps, both off by default and neither run in a real
                Off unless asked for: a region that stays hard is often a bad picture.
       - prior  (cohort): while the background is past its cap, a prior-preservation term pulls the background's
                prediction towards the base model's, up to `prior`.
+      - holdout (cohort, needs held-out pictures and regionsweep.py): a region learned `holdout` further on the
+               training pictures than on the held-out ones, and no longer improving on those, is turned down in
+               every picture. The one rule that may turn the face, hair or skin down.
+    `signal` chooses what the cap rule's per-picture share and the ahead rule read: the training steps' own contrast
+    ("steps"), or the fixed-noise sweeps' ("sweep": cleaner, but only as fresh as the last sweep of that picture).
     A weight moves at most `step` an epoch (back up half as fast), never under `min`, and returns when its cause is
     gone. Weights are renormalised to mean 1 per sample: what is taken from a region goes to the rest of the picture.
 
@@ -65,6 +70,7 @@ LEARNED_BETA = 0.5  # the cohort's learned shares, smoothed over about two epoch
 SPREAD = (0.5, 2.0)  # how far a picture's own contrast may move its share of a cohort-wide cut
 BOOST_MARGIN = 0.1  # a subject region is lagging when it is this far (as a share) behind the subject as a whole
 SNAP = 0.02  # a weight this close to its target lands on it
+HOLDOUT_FLAT = 2  # sweeps without a better held-out reading before the holdout rule acts on a region
 STATE_FILE, LOG_FILE = "region_watch.json", "region_watch.jsonl"
 
 
@@ -251,14 +257,17 @@ def _move(g: float, target: float, step: float, lo: float, hi: float) -> float:
 class RegionWatch:
     def __init__(self, items, job_dir, resume: bool = False, steer: dict | None = None):
         """steer: None (observe only) or the steering settings {"regions": names from PROTECTED, "cap", "ahead",
-        "boost", "prior", "min", "step", "strength"} (a rule at 0 is off)."""
+        "boost", "prior", "holdout", "signal", "min", "step", "strength"} (a rule at 0 is off)."""
         self.job_dir = Path(job_dir)
         self.steer = dict(steer) if steer else None
         self.steer_off = ""  # why steering cannot act this run, when it cannot
         self.steering = False  # some weight is away from 1 right now (or the steered prior is on)
         self.learned_ema: dict[str, float] = {}
-        self.class_gain: dict[str, float] = {}  # boost: a subject region's weight in every picture (absent = 1)
+        self.class_gain: dict[str, float] = {}  # boost / holdout: a region's weight in every picture (absent = 1)
         self.prior_weight = 0.0  # the steered prior-preservation weight on the background
+        self.sweep_contrast: dict[str, dict] = {}  # key -> {protected region: contrast} from the last sweeps
+        self.holdout_gap: dict[str, float] = {}  # region -> learned on training pictures minus on held-out ones
+        self.holdout_flat: dict[str, int] = {}  # region -> sweeps without a better held-out reading
         self.per_epoch = max(1, len(items))  # every sample counts towards the epoch, read or not
         self.stats: dict[str, PictureStat] = {str(it.key): PictureStat(str(it.key)) for it in items if tracked(it)}
         self.epoch = 0
@@ -420,7 +429,7 @@ class RegionWatch:
                     self.learned_ema[c] = v if prev is None else LEARNED_BETA * prev + (1 - LEARNED_BETA) * v
             row = {"epoch": self.epoch, "step": int(step), "learned": learned, "contrast": self.contrasts()}
             if self.steer:
-                row["steer"] = self._steer(row["contrast"])
+                row["steer"] = self._steer(self.contrasts(self._signal()))
             self.history.append(row)
             try:
                 with open(self.job_dir / LOG_FILE, "a", encoding="utf-8") as f:
@@ -433,6 +442,22 @@ class RegionWatch:
     # ------------------------------------------------------------ steering
     def _flag(self) -> None:
         self.steering = bool(self.class_gain or self.prior_weight > 0 or any(st.gain for st in self.stats.values()))
+
+    def _signal(self) -> str:
+        return "sweep" if self.steer and self.steer.get("signal") == "sweep" else "steps"
+
+    def set_sweep(self, contrasts: dict, gap: dict | None = None, flat: dict | None = None) -> None:
+        """The latest fixed-noise readings (regionsweep.RegionSweep): per training picture its contrasts, and with
+        held-out pictures the gap per region and how long each has gone without a better held-out reading."""
+        with self._lock:
+            self.sweep_contrast = {str(k): dict(v) for k, v in (contrasts or {}).items()}
+            self.holdout_gap = {str(k): float(v) for k, v in (gap or {}).items() if v is not None}
+            self.holdout_flat = {str(k): int(v) for k, v in (flat or {}).items()}
+
+    def _contrast(self, st: PictureStat, region: str, signal: str = "steps") -> float | None:
+        if signal == "sweep":
+            return (self.sweep_contrast.get(st.key) or {}).get(region)
+        return st.contrast(region)
 
     def _steer(self, contrasts: dict) -> dict:
         """This epoch's weights, each a step towards its target. Returns per steered region {"cohort": how far the
@@ -456,7 +481,7 @@ class RegionWatch:
                 if float(st.cells.get(p, 0.0)) < MIN_CELLS:
                     st.gain.pop(p, None)
                     continue
-                want, own = cohort, st.contrast(p)
+                want, own = cohort, self._contrast(st, p, self._signal())
                 if own is not None and median:
                     rel = min(SPREAD[1], max(SPREAD[0], own / median))
                     if cohort < 1.0:
@@ -471,15 +496,20 @@ class RegionWatch:
                     st.gain[p] = round(g, 4)
                     lowered, lowest = lowered + 1, min(lowest, g)
             out[p] = {"cohort": round(cohort, 4), "lowered": lowered, "lowest": round(lowest, 4)}
-        boost = float(cfg.get("boost") or 0.0)
-        for region in SUBJECT_REGIONS:  # a lagging subject region, raised in every picture
+        boost, holdout = float(cfg.get("boost") or 0.0), float(cfg.get("holdout") or 0.0)
+        for region in REGIONS:  # a weight for the region in every picture
             target = 1.0
             learned = self.learned_ema.get(region)
-            if boost > 1.0 and ready and learned is not None:
-                lag = (subject - learned) / subject
+            if region in SUBJECT_REGIONS and boost > 1.0 and ready and learned is not None:
+                lag = (subject - learned) / subject  # boost: a subject region lagging the subject as a whole
                 target = min(boost, 1.0 + strength * max(0.0, lag - BOOST_MARGIN))
-            g = _move(float(self.class_gain.get(region, 1.0)), target, step, 1.0, max(1.0, boost))
-            if g <= 1.0 + 1e-6:
+            gap = self.holdout_gap.get(region)
+            if holdout > 0 and gap is not None and gap > holdout and self.holdout_flat.get(region, 0) >= HOLDOUT_FLAT:
+                over = min(1.0, (gap - holdout) / max(1e-6, 1.0 - holdout))  # holdout: memorised, not learned
+                target = max(lo, (1.0 - over) ** (2.0 * strength))
+            g = _move(float(self.class_gain.get(region, 1.0)), target, step, lo if holdout > 0 else 1.0,
+                      max(1.0, boost))
+            if abs(g - 1.0) <= 1e-6:
                 self.class_gain.pop(region, None)
             else:
                 self.class_gain[region] = round(g, 4)
@@ -491,7 +521,9 @@ class RegionWatch:
             self.prior_weight = round(now, 5) if now > 1e-6 else 0.0
         else:
             self.prior_weight = 0.0
-        out["boost"], out["prior"] = dict(self.class_gain), self.prior_weight
+        out["boost"] = {r: g for r, g in self.class_gain.items() if g > 1.0}
+        out["held"] = {r: g for r, g in self.class_gain.items() if g < 1.0}
+        out["prior"] = self.prior_weight
         self._flag()
         return out
 
@@ -501,11 +533,12 @@ class RegionWatch:
             return [merge_gains(self.class_gain, st.gain if st is not None else None)
                     for st in (self.stats.get(str(k)) for k in keys)]
 
-    def contrasts(self) -> dict:
-        """Per protected region: the median contrast over the pictures that have one, and how many do."""
+    def contrasts(self, signal: str = "steps") -> dict:
+        """Per protected region: the median contrast over the pictures that have one, and how many do. signal: the
+        training steps' reading, or the sweeps'."""
         out = {}
         for p in PROTECTED:
-            vals = [v for v in (st.contrast(p) for st in self.stats.values()) if v is not None]
+            vals = [v for v in (self._contrast(st, p, signal) for st in self.stats.values()) if v is not None]
             out[p] = {"median": round(statistics.median(vals), 4) if vals else None, "pictures": len(vals)}
         return out
 
@@ -516,9 +549,12 @@ class RegionWatch:
             if not st.seen:
                 continue
             bg, cl = st.contrast("background"), st.contrast("clothes")
+            swept = self.sweep_contrast.get(st.key) or {}
             rows.append({"image": Path(st.key).name, "path": st.key, "seen": st.seen,
                          "background": None if bg is None else round(bg, 3),
                          "clothes": None if cl is None else round(cl, 3),
+                         "sweep_background": None if swept.get("background") is None else round(swept["background"], 3),
+                         "sweep_clothes": None if swept.get("clothes") is None else round(swept["clothes"], 3),
                          "weights": " / ".join(f"{p} x{st.gain[p]:.2f}" for p in PROTECTED if p in st.gain),
                          "cells": " / ".join(f"{st.cells.get(c, 0):.0f}" for c in REGIONS)})
         rows.sort(key=lambda r: (r["background"] is None, r["background"] if r["background"] is not None else 0.0))
@@ -553,6 +589,8 @@ def describe(summary: dict) -> str:
             text += f" | steering: {p} turned down on {steer[p]['lowered']} pictures (lowest x{steer[p]['lowest']:.2f})"
     if steer.get("boost"):
         text += " | raised: " + ", ".join(f"{r} x{v:.2f}" for r, v in steer["boost"].items())
+    if steer.get("held"):
+        text += " | turned down for the held-out gap: " + ", ".join(f"{r} x{v:.2f}" for r, v in steer["held"].items())
     if steer.get("prior"):
         text += f" | background prior {steer['prior']:.3f}"
     if summary.get("late"):

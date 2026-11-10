@@ -35,7 +35,7 @@ from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, d
 from .archs import detect_arch, get_arch
 from .idloss import effective_weight as idloss_weight
 from .losses import elementwise_loss
-from . import regionwatch
+from . import regionsweep, regionwatch
 from .race_parallel import RaceParallelMixin
 from .multigpu import (Balancer, choose_counts, clone_to, compile_count, job_order, no_recompile_stance, norm_device,
                        run_queue, stance_available, step_seconds)
@@ -531,6 +531,9 @@ class Trainer(RaceParallelMixin):
         self.item_face_frac: dict[str, float] = {}
         self.loss_watch = None
         self.region_watch = None  # regionwatch.RegionWatch when region_watch is on
+        self.sweep = None  # regionsweep.RegionSweep when sweeps or held-out pictures are on
+        self.holdout_items: list = []  # the photos kept out of training (holdout_images)
+        self.holdout_stop = False  # the held-out subject score went holdout_patience sweeps without a new best
         self.region_watch_off = ""  # why it cannot run (no parser), when it cannot
         self.curriculum_w: dict[str, float] | None = None
         self.all_items: list = []
@@ -986,10 +989,11 @@ class Trainer(RaceParallelMixin):
         log.info("Dataset: %d images in %s", len({it.image for it in items}),
                  ", ".join(spec.path for spec in cfg.dataset_specs()))
         items = self.analyze_dataset(items)
+        items = self._split_holdout(cfg, items)
         self.look_outliers = self._look_outlier_images(cfg, items)
         if cfg.isolation:
             items = self._isolation_prepare(cfg, items)
-        self.prepare_cache(items)
+        self.prepare_cache(items + self.holdout_items)  # (the held-out photos need latents and texts for their sweeps)
 
         self.status.update(stage="loading transformer", step=0, total=cfg.steps)
         # block swap: loaded in RAM, the swapped blocks' frozen weights stay there and the rest moves to the GPU
@@ -1236,6 +1240,9 @@ class Trainer(RaceParallelMixin):
         self._setup_maps(cfg, step)
         if self.maps is not None and self.maps.due(step):  # the baseline (or a resumed run's starting point)
             self._side_job(f"Training maps at step {step}", lambda: self._capture_maps(model, injected, step))
+        self._setup_sweep(cfg, step)
+        if self.sweep is not None and self.sweep.due(step):  # the first sweep: what every later one is measured from
+            self._side_job(f"Region sweep at step {step}", lambda: self._run_sweep(model, injected, step))
         if cfg.sample_prompts and cfg.sample_before_training and step == 0:
             self.sample_images(model, step)
         at_start = self.controller is not None and step == 0 and self._probe_at_start()
@@ -1646,6 +1653,9 @@ class Trainer(RaceParallelMixin):
             if self.maps is not None and self.maps.due(step, last=step >= cfg.steps):
                 self._side_job(f"Training maps at step {step}", lambda: self._capture_maps(model, injected, step))
                 model.train()
+            if self.sweep is not None and self.sweep.due(step, last=step >= cfg.steps):
+                self._side_job(f"Region sweep at step {step}", lambda: self._run_sweep(model, injected, step))
+                model.train()
             racing = self._race_running()
             final_too = self.race is not None and self.race.schedule.keeps_all  # scored at the end like the others
             last = step >= cfg.steps and not racing  # the final LoRA's own score, whatever probe_every
@@ -1686,6 +1696,11 @@ class Trainer(RaceParallelMixin):
             if (cfg.save_state and state_every > 0 and step % state_every == 0 and step < cfg.steps
                     and self.race is None and self.ft is None):
                 self.save_state(step, injected, optimizer, scheduler, gen, rng)  # (a race keeps no states)
+            if self.holdout_stop and step < cfg.steps:
+                best = self.sweep.best if self.sweep is not None and self.sweep.best else (0.0, 0)
+                log.info("Held-out pictures: no better subject score for %d sweeps (best %.1f%% at step %d), stopping "
+                         "at step %d", cfg.holdout_patience, 100 * best[0], best[1], step)
+                break
             if self.stop_file.exists():
                 log.info("Stop requested at step %d", step)
                 break
@@ -2910,6 +2925,123 @@ class Trainer(RaceParallelMixin):
             self._refresh_batcher_weights()
         return watch
 
+    def _split_holdout(self, cfg, items) -> list:
+        """holdout_images: the photos kept out of training leave `items` (with everything made from them) and wait in
+        self.holdout_items for the sweeps. Raises ValueError when the set is too small for it."""
+        self.holdout_items = []
+        if cfg.holdout_images <= 0:
+            return items
+        if self.race_rows is not None:
+            log.info("Held-out pictures are off for a race (its configurations take turns on one model)")
+            return items
+        if self.region_watch_off:
+            log.warning("Held-out pictures are off: no parts maps (%s); every photo trains", self.region_watch_off)
+            return items
+        regionsweep.check_holdout(len({str(it.image) for it in items if regionsweep.whole_photo(it)}),
+                                  cfg.holdout_images)
+        train, held = regionsweep.split_holdout(items, cfg.holdout_images)
+        self.holdout_items = held
+        names = sorted({Path(str(it.image)).name for it in held})
+        log.info("Held out of training: %d photos (%s), with %d items made from them; %d items train", len(names),
+                 ", ".join(names), len(items) - len(train) - len(held), len(train))
+        return train
+
+    def _setup_sweep(self, cfg, step: int) -> None:
+        """The region sweep over the training pictures and the held-out ones, or nothing when it is off or cannot
+        run."""
+        from safetensors.torch import load_file
+
+        from .regions import load_region_map
+
+        self.sweep = None
+        if not cfg.wants_region_sweep():
+            return
+        if self.race_rows is not None:
+            log.info("Region sweeps are off for a race (its configurations take turns on one model)")
+            return
+        if self.region_watch_off or self.batcher is None:
+            return
+        try:
+            def probe(it, held: bool) -> dict:
+                rm = load_region_map(it.region_path) if it.region_path is not None else None
+
+                def load(it=it):
+                    latents = load_file(str(it.latent_path))["latent"][None].float()
+                    embeds, mask = self.arch.pad_embeds([load_file(str(it.text_path))["embeds"]])
+                    return latents, embeds, mask
+
+                return {"key": str(it.key), "held": held, "parts": None if rm is None else rm.parts, "load": load}
+
+            def unique(pictures) -> list:
+                seen, out = set(), []
+                for it in pictures:
+                    if regionsweep.whole_photo(it) and str(it.key) not in seen:
+                        seen.add(str(it.key))
+                        out.append(it)
+                return out
+
+            train = [] if cfg.region_sweep_pictures < 0 else unique(self.batcher.items)
+            side = train[0].side if train else (self.batcher.items[0].side if self.batcher.items else 0)
+            held = unique([it for it in self.holdout_items if it.side == side] or self.holdout_items)
+            probes = [probe(it, False) for it in train] + [probe(it, True) for it in held]
+            every = cfg.sweep_every_epochs() * self._maps_epoch_steps()[0]
+            self.sweep = regionsweep.RegionSweep(self.job_dir, probes, every, rotate=max(0, cfg.region_sweep_pictures),
+                                                 resume=bool(cfg.resume_state) and step > 0,
+                                                 patience=cfg.holdout_patience)
+            missing = len(probes) - len(self.sweep.probes)
+            log.info("Region sweep on: %d training pictures%s and %d held-out, every %d steps at %d fixed noise "
+                     "levels%s%s", len([p for p in self.sweep.probes if not p["held"]]),
+                     f" ({cfg.region_sweep_pictures} in turn per sweep)" if cfg.region_sweep_pictures > 0 else "",
+                     len([p for p in self.sweep.probes if p["held"]]), every, len(regionsweep.SIGMAS),
+                     f"; {missing} without a parts map left out" if missing else "",
+                     "; no saved state for this resume, so it counts from here" if self.sweep.late else "")
+            if not self.sweep.probes:
+                self.sweep = None
+        except Exception as e:  # noqa: BLE001
+            self.sweep = None
+            log.warning("Region sweeps could not start; training goes on without them (%s: %s)", type(e).__name__,
+                        str(e)[:200])
+
+    def _run_sweep(self, model, injected, step: int) -> None:
+        """One sweep, then what follows from it: the watch's sweep readings, the held-out best file, the stop."""
+        if self.sweep is None:
+            return
+        cfg = self.cfg
+        self.status.update(stage=f"region sweep (step {step})")
+        self._free_for_rendering()
+        try:
+            row = self.sweep.run(step, step / self._maps_epoch_steps()[0], model, norm_device(self.replicas[0][2]),
+                                 averaged=self._averaged)
+        finally:
+            free_cuda()
+            self.status.update(stage="training")
+        if row is None:
+            return
+        log.info("Region sweep at step %d: %s", step, regionsweep.describe(row))
+        self.status.update(region_sweep={**row, "line": regionsweep.describe(row),
+                                         "history": [{k: r[k] for k in ("step", "train", "held")}
+                                                     for r in self.sweep.history[-200:]]})
+        if self.region_watch is not None:
+            self.region_watch.set_sweep(self.sweep.contrasts(), row["gap"], row["flat"])
+        if row["new_best"] and cfg.holdout_track_best:
+            self._save_holdout_best(injected, step, row["best"][0])
+        if row["stop"]:
+            self.holdout_stop = True
+
+    def _save_holdout_best(self, injected, step: int, score: float) -> None:
+        cfg = self.cfg
+        if getattr(self, "ft", None) is not None:
+            path = self._finetune_save(step, True, label="_holdout_best")
+        else:
+            path = self.job_dir / f"{cfg.job_name}_holdout_best.safetensors"
+            with self._averaged():
+                lora_mod.save_lora(injected, path, metadata={"ss_steps": str(step), "holdout_best": f"{score:.4f}",
+                                                             "modelspec.architecture": self.arch.modelspec},
+                                   dtype=cfg.lora_save_dtype, fmt=self.arch.lora_format)
+        log.info("New best held-out subject score %.1f%% at step %d -> %s", 100 * score, step, path)
+        if str(path) not in self.status.data["saved"]:
+            self.status.data["saved"].append(str(path))
+
     def _make_region_watch(self, items, step: int):
         """The region watch (observe only), or None: off, a race, or no parser for the parts maps."""
         cfg = self.cfg
@@ -2929,7 +3061,9 @@ class Trainer(RaceParallelMixin):
         watch = regionwatch.RegionWatch(items, self.job_dir, resume=bool(cfg.resume_state) and step > 0, steer=steer)
         rules = [] if not watch.steer else [text for text, on in (
             (f"cap {steer['cap']:g}", steer["cap"] > 0), (f"ahead {steer['ahead']:g}", steer["ahead"] > 0),
-            (f"boost {steer['boost']:g}", steer["boost"] > 0), (f"prior {steer['prior']:g}", steer["prior"] > 0)) if on]
+            (f"boost {steer['boost']:g}", steer["boost"] > 0), (f"prior {steer['prior']:g}", steer["prior"] > 0),
+            (f"holdout {steer['holdout']:g}", steer["holdout"] > 0),
+            ("reading the sweeps", steer["signal"] == "sweep")) if on]
         log.info("Region watch on: %d pictures, the loss per region read from the training steps (%s)%s",
                  len(watch.stats),
                  f"steering {' and '.join(steer['regions'])}: {', '.join(rules)}, lowest weight {steer['min']:g}, "

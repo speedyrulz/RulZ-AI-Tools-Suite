@@ -653,6 +653,18 @@ class TrainConfig:
     region_steer_min: float = 0.3  # a region's lowest loss weight (0 = it may be masked out altogether)
     region_steer_step: float = 0.2  # the most a weight moves per epoch, as a share of itself (back up half as fast)
     region_steer_strength: float = 1.0  # how hard a rule pulls: the weight aimed for is (share within limit) ^ (2 x this)
+    region_steer_signal: str = "steps"  # what the cap rule's per-picture share and the ahead rule read: steps (the
+    #                                     training steps' own, noisy) | sweep (the fixed-noise sweeps')
+    region_steer_holdout: float = 0.0  # cohort rule, needs holdout_images: a region learned this much further on the
+    #                                    training pictures than on the held-out ones (0.15, say), and no longer
+    #                                    improving on those, is turned down in every picture; 0 = off
+    # --- region sweep (regionsweep.py): the loss per region at fixed noise, and photos kept out of training.
+    #     Experimental, never run in a real training; 3 forward passes per picture per sweep ---
+    region_sweep_every: int = 0  # epochs between sweeps; 0 = off (with holdout_images: every epoch)
+    region_sweep_pictures: int = 0  # training pictures per sweep: 0 = all, K = K in turn, -1 = none (held-out only)
+    holdout_images: int = 0  # photos kept out of training and swept: what is learned of the subject, not of the photos
+    holdout_track_best: bool = False  # keep <job>_holdout_best.safetensors at the best held-out subject score
+    holdout_patience: int = 0  # stop after this many sweeps without a better held-out subject score; 0 = never
     # --- training maps (trainmaps.py): heatmaps over a few training pictures, before training and about each epoch ---
     training_maps: bool = False  # observe only: nothing about training changes
     training_maps_images: int = 3  # pictures (at least one per dataset, so more with several datasets)
@@ -963,9 +975,30 @@ class TrainConfig:
                                  "use one")
             if self.wants_parts():
                 raise ValueError("region_class_weights refuses hull_regions parts: Hull's gains are its only weighting")
+        if self.region_sweep_every < 0 or self.region_sweep_pictures < -1 or self.holdout_images < 0 \
+                or self.holdout_patience < 0:
+            raise ValueError("region_sweep_every, holdout_images and holdout_patience must be 0 or more, "
+                             "region_sweep_pictures -1 or more")
+        if (self.holdout_track_best or self.holdout_patience > 0) and self.holdout_images <= 0:
+            raise ValueError("holdout_track_best and holdout_patience need holdout_images above 0")
+        if self.region_sweep_pictures < 0 and self.holdout_images <= 0:
+            raise ValueError("region_sweep_pictures -1 sweeps the held-out pictures only: set holdout_images")
+        if self.wants_region_sweep() and self.resolution_step_up:
+            raise ValueError("region sweeps and held-out pictures are measured against a first sweep at one "
+                             "resolution: not with resolution_step_up")
+        if self.region_steer_signal not in ("steps", "sweep"):
+            raise ValueError(f"region_steer_signal must be steps or sweep, got {self.region_steer_signal!r}")
         if not self.region_steer:
             return
         self.region_steer_list()
+        if self.region_steer_signal == "sweep" and (not self.wants_region_sweep() or self.region_sweep_pictures < 0):
+            raise ValueError("region_steer_signal sweep reads the sweeps of the training pictures: set "
+                             "region_sweep_every (and region_sweep_pictures 0 or more)")
+        if not 0.0 <= self.region_steer_holdout < 1.0:
+            raise ValueError("region_steer_holdout must be 0 (off) to under 1")
+        if self.region_steer_holdout > 0 and (self.holdout_images <= 0 or self.region_sweep_pictures < 0):
+            raise ValueError("region_steer_holdout compares training pictures with held-out ones: set holdout_images "
+                             "and sweep the training pictures too (region_sweep_pictures 0 or more)")
         if self.wants_parts():
             raise ValueError("region_steer refuses hull_regions parts: Hull's region gains are its only weighting")
         if not 0.0 <= self.region_steer_cap <= 2.0 or not 0.0 <= self.region_steer_ahead < 1.0:
@@ -980,9 +1013,10 @@ class TrainConfig:
                              "and keep background in region_steer_regions")
         if self.region_steer_prior > 0 and self.finetune:
             raise ValueError("region_steer_prior needs an adapter to switch off: not with a full fine-tune")
-        if not (self.region_steer_cap > 0 or self.region_steer_ahead > 0 or self.region_steer_boost > 0):
-            raise ValueError("region_steer has every rule at 0: set region_steer_cap, region_steer_ahead or "
-                             "region_steer_boost")
+        if not (self.region_steer_cap > 0 or self.region_steer_ahead > 0 or self.region_steer_boost > 0
+                or self.region_steer_holdout > 0):
+            raise ValueError("region_steer has every rule at 0: set region_steer_cap, region_steer_ahead, "
+                             "region_steer_boost or region_steer_holdout")
         if not 0.0 <= self.region_steer_min < 1.0:
             raise ValueError("region_steer_min must be 0 to under 1")
         if not 0.0 < self.region_steer_step <= 0.5 or not 0.0 < self.region_steer_strength <= 4.0:
@@ -1266,7 +1300,15 @@ class TrainConfig:
     def wants_part_maps(self) -> bool:
         """Region maps carry the parser's parts tensor: Hull's region gains, or the region watch (which, unlike
         wants_parts, changes nothing about the training step)."""
-        return self.wants_parts() or self.wants_region_watch() or bool(str(self.region_class_weights or "").strip())
+        return (self.wants_parts() or self.wants_region_watch() or self.wants_region_sweep()
+                or bool(str(self.region_class_weights or "").strip()))
+
+    def wants_region_sweep(self) -> bool:
+        """Fixed-noise sweeps run: asked for, or needed by held-out pictures."""
+        return self.region_sweep_every > 0 or self.holdout_images > 0
+
+    def sweep_every_epochs(self) -> int:
+        return max(1, int(self.region_sweep_every))
 
     def wants_region_watch(self) -> bool:
         """The region watch runs: asked for, or needed by region steering."""
@@ -1285,8 +1327,9 @@ class TrainConfig:
         if not self.region_steer:
             return None
         return {"regions": self.region_steer_list(), "cap": self.region_steer_cap, "ahead": self.region_steer_ahead,
-                "boost": self.region_steer_boost, "prior": self.region_steer_prior, "min": self.region_steer_min,
-                "step": self.region_steer_step, "strength": self.region_steer_strength}
+                "boost": self.region_steer_boost, "prior": self.region_steer_prior,
+                "holdout": self.region_steer_holdout, "signal": self.region_steer_signal,
+                "min": self.region_steer_min, "step": self.region_steer_step, "strength": self.region_steer_strength}
 
     def wants_person_masks(self) -> bool:
         """Person masks in the region maps: the region-weighted loss's person weight, attention localization's
