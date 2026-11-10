@@ -823,6 +823,12 @@ class TrainConfig:
     # a best checkpoint (overall, face, body) is replaced by any higher smoothed score, not only one that beats it by
     # the noise band; whether the run still improves (early stop, step-up) still needs the band
     likeness_best_any_rise: bool = False
+    # a body probe render that no longer shows a body (the scorer finds none: a head-and-shoulders picture where a body
+    # was asked for) counts as zero in the body score, against the share that showed one at the first probe, and one
+    # render's score stops at the top of the scale. Off: the body score is the mean of the renders that still show a
+    # body, so the last few of them, or a score left over from when some did, can set a best checkpoint (the
+    # behaviour before 3.4.0; it happened in 8 of 9 test runs)
+    likeness_framing: bool = True
     # experimental, unit-tested only: a probe whose renders keep their prompt's frame in less than this share (the
     # prompt check's kept share, against the step-0 probe) cannot set a new best checkpoint. 0 = off
     likeness_best_min_kept: float = 0.0

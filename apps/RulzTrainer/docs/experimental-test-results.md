@@ -213,6 +213,32 @@ half the learning rate on one seed only; why one seed keeps its framing. Whether
 on another set is not tested and not expected: the seed fixes the order of the photos and the noise drawn for them,
 which change with the set.
 
+### The best checkpoint with lost renders counted as zero (3.4.0), replayed
+
+The nine runs' recorded probes, fed through the likeness controller again: with `likeness_framing` off (the rule the
+runs trained with; it reproduces their recorded bests to the decimal) and on (a body render without a measurable body
+counts as zero against the first probe, a render stops at the top of the scale).
+
+| Row | Best as the run recorded it | Best with lost renders counted | Held-out subject peaked at |
+| --- | --- | --- | --- |
+| Plain, seed 42 | 50.0 at step 1400 | 39.0 at step 800 | step 944 |
+| Class weights: face 3 to background 0.3 | 52.9 at step 1400 | 34.2 at step 400 | step 472 |
+| Region steering, defaults | 46.3 at step 1600 | 30.9 at step 1000 | step 472 |
+| Region steering read from the sweeps | 52.3 at step 1400 | 42.8 at step 1400 | step 944 |
+| Plain, seed 43 (kept its framing) | 52.6 at step 1800 | 52.4 at step 1800 | step 708 |
+| Plain, seed 44 | 73.6 at step 1800 | 51.6 at step 1600 | step 708 |
+| Plain, seed 45 | 70.3 at step 1800 | 44.1 at step 1200 | step 708 |
+| Class weights: background 0.3 only | 77.8 at step 1800 | 41.6 at step 1000 | step 944 |
+| Learning rate 5e-5 | 38.7 at step 2000 | 32.5 at step 1200 | step 1180 |
+
+- Seven bests move earlier, to probes where most of the body renders still showed a body; the run that kept its framing
+  is unchanged, so the rule costs nothing where nothing was lost.
+- Two still land on a probe with half the renders gone (seed 44 at step 1600, steering from the sweeps at step
+  1400): the four renders that were left each scored at the top of the scale, which is what a copy of a training
+  photo does.
+  `likeness_best_min_kept` is the stricter guard for that.
+- This is a replay. The rule did not act on these runs, and it has not yet decided a training.
+
 ## Probe prompt check: the framing by training seed
 
 November 2026. The Qwen-Image 2.1 fine-tune, set and settings of the section above, plain training (no region

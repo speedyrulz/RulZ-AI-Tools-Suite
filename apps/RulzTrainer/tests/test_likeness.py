@@ -333,24 +333,131 @@ def test_likeness_spreadsheet_export(tmp_path):
 
 
 def test_framing_counts_renders_without_a_body_and_can_pull_the_curriculum():
+    # (likeness_curriculum_framing on its own, with likeness_framing off: the body score stays the measured one)
     seeds = {"face": [60.0, 60.0, 60.0, 60.0], "body": [70.0, None, None, None]}
-    plain = L.LikenessController(_cfg(likeness_lr_control=False))
+    plain = L.LikenessController(_cfg(likeness_lr_control=False, likeness_framing=False))
     rec, _ = plain.update(0, 60.0, 70.0, seeds=seeds)
     assert (rec.body_probes, rec.body_missing) == (4, 3)  # recorded whatever the setting
     assert plain.face_bias == pytest.approx(0.5)  # body 70 against face 60: the face lags, as before
-    framed = L.LikenessController(_cfg(likeness_lr_control=False, likeness_curriculum_framing=1.0))
+    framed = L.LikenessController(_cfg(likeness_lr_control=False, likeness_framing=False,
+                                         likeness_curriculum_framing=1.0))
     rec, act = framed.update(0, 60.0, 70.0, seeds=seeds)
     # three of four renders show no body: the body counts as 70 x 1/4 = 17.5 against the face at 60
     assert framed.face_bias == pytest.approx(-1.0) and act["face_bias"] == pytest.approx(-1.0)
     assert rec.body_ema == 70.0  # the record keeps the measured body; only the curriculum reads the framing
-    half = L.LikenessController(_cfg(likeness_lr_control=False, likeness_curriculum_framing=0.5))
+    half = L.LikenessController(_cfg(likeness_lr_control=False, likeness_framing=False,
+                                       likeness_curriculum_framing=0.5))
     half.update(0, 60.0, 70.0, seeds={"face": [60.0] * 4, "body": [70.0, 70.0, None, None]})
     assert half.face_bias == pytest.approx((70.0 * 0.75 - 60.0) / 20.0)
-    gone = L.LikenessController(_cfg(likeness_lr_control=False, likeness_curriculum_framing=1.0))
+    gone = L.LikenessController(_cfg(likeness_lr_control=False, likeness_framing=False,
+                                       likeness_curriculum_framing=1.0))
     rec, _ = gone.update(0, 60.0, None, seeds={"face": [60.0] * 2, "body": [None, None]})
     assert gone.face_bias == pytest.approx(-1.0) and rec.body_missing == 2  # no body at all: the full pull
-    whole = L.LikenessController(_cfg(likeness_lr_control=False, likeness_curriculum_framing=1.0))
+    whole = L.LikenessController(_cfg(likeness_lr_control=False, likeness_framing=False,
+                                        likeness_curriculum_framing=1.0))
     whole.update(0, 60.0, 70.0, seeds={"face": [60.0] * 2, "body": [70.0, 70.0]})
     assert whole.face_bias == pytest.approx(0.5)  # every render shows a body: nothing changes
     with pytest.raises(ValueError):
         TrainConfig(likeness_curriculum_framing=1.5).validate()
+
+
+def _plain(**kw):
+    """A controller on the raw scores with nothing else acting: no smoothing, no lr control, no curriculum."""
+    return L.LikenessController(_cfg(likeness_lr_control=False, likeness_curriculum=False, likeness_patience=0, **kw))
+
+
+def test_lost_body_renders_count_as_zero_and_cannot_set_a_best():
+    """likeness_framing (on by default): the one render that still shows a body, scoring high, is one render of
+    four. Before, its score alone was the body score and set a best checkpoint."""
+    faces = {"face": [60.0] * 4}
+    c = _plain()
+    rec, act = c.update(0, 60.0, 20.0, seeds={**faces, "body": [20.0] * 4})
+    assert (rec.body, rec.body_measured, c.body_ref_share) == (20.0, None, 1.0) and act["save_best"]
+    rec, act = c.update(10, 60.0, 80.0, seeds={**faces, "body": [80.0, None, None, None]})
+    assert rec.body == pytest.approx(20.0) and rec.body_measured == 80.0  # 80 on one render of four
+    assert (rec.body_probes, rec.body_missing) == (4, 3)
+    assert rec.body_ema == pytest.approx(20.0) and not act.get("save_best") and c.best_step == 0
+    old = _plain(likeness_framing=False)
+    old.update(0, 60.0, 20.0, seeds={**faces, "body": [20.0] * 4})
+    rec, act = old.update(10, 60.0, 80.0, seeds={**faces, "body": [80.0, None, None, None]})
+    assert rec.body == 80.0 and rec.body_measured is None and act["save_best"] and old.best_step == 10
+
+
+def test_a_body_score_no_render_backs_fades_instead_of_staying():
+    """Before, a probe without a measurable body left the smoothed body score where it was, so a rising face kept
+    setting new bests on a body nobody had measured. Now the body reads zero and the smoothed score falls."""
+    seeds = lambda body: {"face": [60.0] * 2, "body": body}  # noqa: E731
+    c = _plain(probe_ema=0.5)
+    c.update(0, 50.0, 40.0, seeds=seeds([40.0, 40.0]))
+    rec, _ = c.update(10, 50.0, 90.0, seeds=seeds([90.0, 90.0]))
+    best = c.best
+    rec, act = c.update(20, 58.0, None, seeds=seeds([None, None]))
+    assert rec.body == 0.0 and rec.body_ema == pytest.approx(32.5) and not act.get("save_best")
+    rec, act = c.update(30, 66.0, None, seeds=seeds([None, None]))
+    assert rec.body_ema == pytest.approx(16.25) and not act.get("save_best") and c.best == best and c.best_step == 10
+    old = _plain(probe_ema=0.5, likeness_framing=False)
+    old.update(0, 50.0, 40.0, seeds=seeds([40.0, 40.0]))
+    old.update(10, 50.0, 90.0, seeds=seeds([90.0, 90.0]))
+    old.update(20, 58.0, None, seeds=seeds([None, None]))
+    rec, act = old.update(30, 66.0, None, seeds=seeds([None, None]))
+    assert rec.body is None and rec.body_ema == pytest.approx(65.0) and act["save_best"] and old.best_step == 30
+
+
+def test_framing_is_counted_against_the_first_probe_and_a_render_stops_at_the_top():
+    faces = {"face": [60.0] * 4}
+    # a body probe of which the scorer only ever measures half is not marked down for that
+    c = _plain()
+    rec, _ = c.update(0, 60.0, 50.0, seeds={**faces, "body": [50.0, 50.0, None, None]})
+    assert rec.body == 50.0 and c.body_ref_share == 0.5
+    rec, _ = c.update(10, 60.0, 50.0, seeds={**faces, "body": [None, 50.0, None, 50.0]})
+    assert rec.body == 50.0 and rec.body_measured is None
+    rec, _ = c.update(20, 60.0, 50.0, seeds={**faces, "body": [50.0, None, None, None]})
+    assert rec.body == pytest.approx(25.0) and rec.body_measured == 50.0  # half of those that showed one are gone
+    rec, _ = c.update(30, 60.0, 50.0, seeds={**faces, "body": [50.0, 50.0, 50.0, None]})
+    assert rec.body == 50.0  # more than at the first probe: nothing is added for it
+    # a render above the top of the scale counts as the top (a copy of a training photo scores above 100)
+    top = _plain()
+    top.update(0, 60.0, 30.0, seeds={**faces, "body": [30.0] * 4})
+    rec, _ = top.update(10, 60.0, 75.0, seeds={**faces, "body": [120.0, 110.0, 30.0, 40.0]})
+    assert rec.body == pytest.approx(67.5) and rec.body_measured == 75.0
+    # nothing measured yet: nothing to count against, the body stays unknown until a probe measures one
+    late = _plain()
+    rec, _ = late.update(0, 60.0, None, seeds={**faces, "body": [None] * 4})
+    assert rec.body is None and late.body_ref_share is None
+    rec, _ = late.update(10, 60.0, 40.0, seeds={**faces, "body": [40.0, None, None, None]})
+    assert rec.body == 40.0 and late.body_ref_share == 0.25
+    # a caller without per-render scores: the body as given
+    bare = _plain()
+    rec, _ = bare.update(0, 60.0, 130.0)
+    assert rec.body == 130.0 and bare.body_ref_share is None
+
+
+def test_framing_on_a_normalized_scale_pulls_towards_its_floor():
+    c = L.LikenessController(_cfg(likeness_lr_control=False, likeness_curriculum=False, likeness_normalize=True))
+    faces = {"face": [60.0] * 4}
+    c.update(0, 60.0, 82.0, seeds={**faces, "body": [82.0] * 4})
+    floor, top = c.scale("body")
+    assert floor == pytest.approx(82.0) and top > floor
+    rec, _ = c.update(10, 60.0, 88.0, seeds={**faces, "body": [88.0, 88.0, None, None]})
+    assert rec.body == pytest.approx(floor + (88.0 - floor) * 0.5) and rec.body_measured == 88.0
+    rec, _ = c.update(20, 60.0, None, seeds={**faces, "body": [None] * 4})
+    assert rec.body == pytest.approx(floor) and rec.body_norm == 0.0  # no body at all: the scale's zero
+    rec, _ = c.update(30, 60.0, top + 5.0, seeds={**faces, "body": [top + 5.0] * 4})
+    assert rec.body == pytest.approx(top) and rec.body_norm == pytest.approx(100.0)
+
+
+def test_framing_reaches_the_curriculum_and_survives_a_resume():
+    faces = {"face": [60.0] * 4}
+    c = L.LikenessController(_cfg(likeness_lr_control=False, likeness_curriculum_framing=1.0))
+    c.update(0, 60.0, 70.0, seeds={**faces, "body": [70.0] * 4})
+    assert c.face_bias == pytest.approx(0.5)  # body 70 against face 60
+    rec, act = c.update(10, 60.0, 70.0, seeds={**faces, "body": [70.0, 70.0, None, None]})
+    # two of four lost: the body reads 35 once (likeness_curriculum_framing does not count them a second time)
+    assert rec.body == pytest.approx(35.0) and c.face_bias == pytest.approx(-1.0)
+    saved = json.loads(json.dumps(c.resume_state()))
+    assert saved["body_ref_share"] == 1.0
+    again = L.LikenessController(_cfg(likeness_lr_control=False))
+    again.load_resume_state(saved)
+    rec, _ = again.update(20, 60.0, 70.0, seeds={**faces, "body": [70.0, None, None, None]})
+    assert rec.body == pytest.approx(17.5)  # still counted against the first probe of the run, not of this session
+    assert TrainConfig().likeness_framing is True

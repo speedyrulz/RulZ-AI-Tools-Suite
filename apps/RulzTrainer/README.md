@@ -1096,6 +1096,7 @@ sweep of all 62 pictures took 24 seconds on an RTX 5090.
 - **A best checkpoint on a probe that has lost its body renders is common.** In 8 of 9 runs the likeness best was set
   at a probe where at least half the full-body renders showed no body. See `likeness_best_min_kept` under
   [the prompt check](#probe-prompt-presets-and-the-prompt-check).
+  Since 3.4.0 the body score counts the lost renders as zero (`likeness_framing`), which moves those bests back.
 - **`region_steer_holdout` cancelled itself.** Every part overfitted together, so the rule turned all five down by
   about the same amount (0.78 to 0.87), and with weights rescaled to mean 1 per picture that changes almost nothing.
   The run ended where the plain one did.
@@ -1604,6 +1605,19 @@ body score. At 1 a probe with no body in any render reads as a body score of 0. 
 read 2 of 8 at step 600, 4 at step 1000 and 8 of 8 from step 1600, a thousand steps before the body score itself went
 missing. With most renders gone, the few that are left can lift the combined score (62.5 from 2 renders), so look at
 the count before trusting a late best. The
+
+**Lost renders count against the body score (`likeness_framing`, on by default since 3.4.0).** A body probe render with
+no measurable body counts as zero in the body score, against the share that showed one at the first probe, and one
+render's score stops at the top of the scale. Before, the body score was the mean of the renders that still showed a
+body and stayed where it was when none did. In nine runs on a Qwen-Image 2.1 fine-tune that put the best checkpoint
+on a probe that had lost at least half its body renders in eight: a body score of 94 from three renders, 114 from one,
+and new bests at probes with no body at all. Fed through the new rule, the same probes move those bests from steps
+1400 to 2000 back to steps 400 to 1200, where the held-out photos and FaceNet peak, and leave the one run that kept
+its framing where it was ([the table](docs/experimental-test-results.md)). The log's framing line gives the measured
+score beside the counted one, and `likeness.jsonl` keeps it (`body_measured`). Everything that reads the body score
+follows: the best checkpoints, early stop, the lr control, a race's scores and the curriculum (so
+`likeness_curriculum_framing` has nothing left to add while this is on). `likeness_framing: false` brings the old score
+back. The rule was replayed on recorded probes; it has not yet decided a training.
 [prompt check](#probe-prompt-presets-and-the-prompt-check) counts the same drift against the step-0 probe, for any
 probe prompt, and `likeness_best_min_kept` holds such a best back.
 
