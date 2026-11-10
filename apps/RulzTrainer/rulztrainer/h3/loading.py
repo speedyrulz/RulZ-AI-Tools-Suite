@@ -168,7 +168,7 @@ def build_transformer(reader, device, quant: str = "auto", dtype=torch.bfloat16,
         state[k] = v
     if prune:
         state["adaln_basis"], state["adaln_mean"] = basis, mean
-    if not C.is_h3_state(state):
+    if not (C.is_h3_state(state) or C.is_h3_image_state(state)):
         raise ValueError(f"{source}: not a MiniMax H3 transformer")
     config = {**C.config_from_state(state), **(config_overrides or {})}
     state.pop("rope.inv_freq", None)  # recomputed from rope_inv_freq_len / rope_theta
@@ -180,7 +180,8 @@ def build_transformer(reader, device, quant: str = "auto", dtype=torch.bfloat16,
     model = model.to(device).eval().requires_grad_(False)
     adaln = ("pruned file (curve table)" if model.pruned else
              f"AdaLN pruned on load (rank {prune_rank})" if prune else "full AdaLN")
-    log.info("Loaded MiniMax H3 transformer from %s: %d blocks, dim %d, %s, quant=%s", source, config["num_layers"],
+    kind = "MiniMax H3" if model.has_audio else f"MiniMax-H3-Image (no audio stream, {model.pdd_steps} output heads)"
+    log.info("Loaded %s transformer from %s: %d blocks, dim %d, %s, quant=%s", kind, source, config["num_layers"],
              config["hidden_size"], adaln, quant)
     return model
 

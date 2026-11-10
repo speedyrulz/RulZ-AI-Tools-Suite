@@ -53,9 +53,60 @@ def is_h3_state(keys) -> bool:
     return all(m in keys for m in MARKERS)
 
 
+def is_h3_image_state(keys) -> bool:
+    """A MiniMax-H3-Image diffusion model: H3's layout without the audio stream (ComfyUI's model_detection rule)."""
+    keys = set(keys)
+    return ("video_patch_proj.weight" in keys and "condition_proj.weight" in keys
+            and "audio_patch_proj.weight" not in keys)
+
+
 def is_diffusers_state(keys) -> bool:
     keys = set(keys)
     return "proj_in.weight" in keys and "audio_proj_in.weight" in keys and "context_embedder.weight" in keys
+
+
+# ---------------------------------------------------------------- MiniMax-H3-Image's per-step (PDD) output heads
+# Three layouts of the same heads (compared on the released bytes, 10 Nov 2026):
+#   fused      MiniMaxAI's pdd_fused_heads.safetensors: video_out.weight [n, 96, hidden], video_out.bias [n, 96], each a
+#              full head (they replace transformer/'s own final_layer.video_out, which is none of them)
+#   diffusers  pdd_proj_out.k.weight / .bias = fused head k
+#   stacked    Comfy-Org's final_layer.video_out [n * 96, hidden]: block 0 = head 0, block k = head k - head 0 (the port)
+
+PDD_HEAD = re.compile(r"^pdd_proj_out\.(\d+)\.(weight|bias)$")
+
+
+def stack_pdd_heads(weight: torch.Tensor, bias: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Full heads [n, out, hidden] / [n, out] -> the stacked bank [n * out, hidden] / [n * out] (fp32)."""
+    w, b = weight.float().clone(), bias.float().clone()
+    w[1:] -= w[:1]
+    b[1:] -= b[:1]
+    return w.flatten(0, 1).contiguous(), b.flatten(0, 1).contiguous()
+
+
+def unstack_pdd_heads(weight: torch.Tensor, bias: torch.Tensor, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """The stacked bank -> full heads [n, out, hidden] / [n, out] (the inverse of stack_pdd_heads)."""
+    w, b = weight.float().unflatten(0, (n, -1)).clone(), bias.float().unflatten(0, (n, -1)).clone()
+    w[1:] += w[:1]
+    b[1:] += b[:1]
+    return w, b
+
+
+def fold_diffusers_pdd_heads(state: dict) -> dict:
+    """diffusers' pdd_proj_out.k.* of a MiniMaxH3ImageTransformer2DModel state -> final_layer.video_out.* (stacked),
+    in place; a state without them is returned as it is."""
+    heads: dict[int, dict[str, torch.Tensor]] = {}
+    for k in [k for k in state if PDD_HEAD.match(k)]:
+        m = PDD_HEAD.match(k)
+        heads.setdefault(int(m.group(1)), {})[m.group(2)] = state.pop(k)
+    if not heads:
+        return state
+    order = sorted(heads)
+    if order != list(range(len(order))) or any(set(h) != {"weight", "bias"} for h in heads.values()):
+        raise ValueError(f"pdd_proj_out: incomplete output heads {order}")
+    w, b = stack_pdd_heads(torch.stack([heads[i]["weight"] for i in order]),
+                           torch.stack([heads[i]["bias"] for i in order]))
+    state["final_layer.video_out.weight"], state["final_layer.video_out.bias"] = w, b
+    return state
 
 
 def swap_halves(w):
@@ -176,14 +227,17 @@ def config_from_state(state: dict) -> dict:
 
     keys = set(state)
     head_dim = shape("blocks.0.attn.q_norm.weight")[0]
-    hidden = shape("video_patch_proj.weight")[0]
+    hidden, patch_dim = shape("video_patch_proj.weight")
+    # a token is a 1x2x2 patch of the latent, in and out: more output rows than that are stacked per-step (PDD) heads
+    pdd_steps = max(1, shape("final_layer.video_out.weight")[0] // patch_dim)
     cfg = dict(hidden_size=hidden, num_layers=_count(keys, "blocks.{}.norm1.weight"),
                token_refiner_num_layers=_count(keys, "token_refiner.blocks.{}.norm1.weight"),
                attention_head_dim=head_dim, num_attention_heads=shape("blocks.0.attn.qkv_proj.weight")[0] // (3 * head_dim),
                ffn_hidden_size=shape("blocks.0.mlp.fc1.weight")[0] // 2,
-               latents_dim=shape("final_layer.video_out.weight")[0] // 4,
-               audio_latents_dim=shape("final_layer.audio_out.weight")[0],
-               text_dim=shape("condition_proj.weight")[1])
+               latents_dim=patch_dim // 4,
+               audio_latents_dim=(shape("final_layer.audio_out.weight")[0] if "final_layer.audio_out.weight" in keys
+                                  else None),  # None: no audio stream (MiniMax-H3-Image)
+               text_dim=shape("condition_proj.weight")[1], pdd_steps=pdd_steps)
     if "adaln_t_table" in keys:
         grid, t_dim = shape("adaln_t_table")
         cfg.update(adaln_curve_grid=grid, time_embed_dim=t_dim)
@@ -200,13 +254,16 @@ def config_from_state(state: dict) -> dict:
     return cfg
 
 
-def diffusers_config_to_port(config: dict) -> dict:
-    """diffusers' MiniMaxH3Transformer3DModel config.json -> the port's config."""
+def diffusers_config_to_port(config: dict, audio: bool = True) -> dict:
+    """diffusers' MiniMaxH3Transformer3DModel config.json -> the port's config (audio False: its
+    MiniMaxH3ImageTransformer2DModel, which has no audio stream and num_pdd_heads output heads)."""
     return dict(hidden_size=config.get("hidden_size", 5376), num_layers=config.get("num_layers", 50),
                 token_refiner_num_layers=config.get("num_refiner_layers", 2),
                 num_attention_heads=config.get("num_attention_heads", 56),
                 attention_head_dim=config.get("attention_head_dim", 128), ffn_hidden_size=config.get("ffn_dim", 14336),
-                latents_dim=config.get("in_channels", 24), audio_latents_dim=config.get("audio_in_channels", 32),
+                latents_dim=config.get("in_channels", 24),
+                audio_latents_dim=config.get("audio_in_channels", 32) if audio else None,
+                pdd_steps=1 if audio else int(config.get("num_pdd_heads", 1)),
                 patch_size=list(config.get("patch_size", (1, 2, 2))), text_dim=config.get("text_dim", 5120),
                 timestep_input_dim=config.get("freq_dim", 256),
                 time_embed_hidden_size=config.get("time_embed_hidden_dim", 5376),
