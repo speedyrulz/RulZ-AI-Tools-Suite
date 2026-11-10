@@ -1,6 +1,6 @@
 ---
 name: rulz-vast
-description: Reach a RulzTrainer running on a vast.ai instance from this computer - connect, read its runs, logs and likeness probes, fetch probe images and LoRAs, start and stop training runs, test local code changes on the instance. Use when the user asks about their vast.ai instance or rental, or wants a training run, test or experiment run on a cloud GPU, or says something like "I started an instance", "check my run", "run a test on vast".
+description: Reach RulzTrainer on one or several vast.ai instances from this computer - connect, read runs, logs and likeness probes, fetch probe images and LoRAs, start and stop training runs, queue runs over several instances, split a race over them, set watches that wake you when a number crosses a value, test local code changes on the instance. Use when the user asks about their vast.ai instance or rental, or wants a training run, test or experiment run on a cloud GPU, or says something like "I started an instance", "check my run", "run a test on vast".
 ---
 
 # RulzTrainer on vast.ai
@@ -73,6 +73,61 @@ job runs. The next run uses the new code. `--restart-webui` also restarts the We
 adds and overwrites but deletes nothing, and the instance's git checkout shows the files as changed.
 
 `push LOCAL_PATH datasets` copies a dataset or other files up.
+
+## Several instances: the fleet
+
+`scripts/vast/rulz_fleet.py` works on every running instance at once: one status for all, a queue whose next run goes
+to the first idle instance, a history of every run, automatic downloads and watches. Its state is in
+`~/.rulz_vast/fleet`. `rulz_remote.py --instance ID ...` still does everything for one instance.
+
+```bash
+python scripts/vast/rulz_fleet.py instances --refresh   # running RulzTrainer instances join the fleet
+python scripts/vast/rulz_fleet.py status                # instances, their runs and metrics, queue, watches
+```
+
+**Something must keep looking.** The queue, the downloads and the watches only work while one process looks: the
+WebUI on this computer, `daemon`, or a `wait` while it blocks. `status` says `"looking": true` when one does. If none
+does, start `python scripts/vast/rulz_fleet.py daemon` as a background command and leave it running; it prints each
+event as a JSON line.
+
+**Queue a run** (it starts by itself on the first idle instance; starting runs spends the rental, so only what the
+user asked for):
+
+```bash
+python scripts/vast/rulz_fleet.py queue add --job NAME --from BASE_JOB --set steps=300
+python scripts/vast/rulz_fleet.py queue add --job NAME --config FILE --push LOCAL_DATASET_FOLDER --instance ID
+python scripts/vast/rulz_fleet.py queue add --job RACE --config race.yaml --split   # one part per instance
+```
+
+`queue add` runs the trainer's checks on an instance first and refuses what training would refuse. `--from JOB` takes
+the newest run of that name on record, `--from JOB@INSTANCE` asks that instance. `--split` deals a race's
+configurations over the instances (not a relay); `group RACE` then compares the parts by best likeness. `queue`,
+`queue remove ID`, `queue move ID --delta -1`, `queue pause|resume|clear` edit it.
+
+**Watches: get woken instead of checking.** Set the lines you care about, then block on `wait` in the background:
+
+```bash
+python scripts/vast/rulz_fleet.py metrics                                   # the names, and the values now
+python scripts/vast/rulz_fleet.py watch add avg_loss above 0.5 --by claude --note "diverging?"
+python scripts/vast/rulz_fleet.py watch add since_improve above 3 --job "keel_*" --by claude
+python scripts/vast/rulz_fleet.py watch add disk_free_gb below 15 --by claude
+python scripts/vast/rulz_fleet.py wait --timeout 3600                       # run in the background
+```
+
+`wait` exits 0 and prints the events when a watch fires, a run finishes, fails or ends early, a dispatch fails, an
+instance drops out or the queue runs empty; exit 2 at the timeout. Every event is given once, so start `wait` again
+after handling one. A watch fires once per run (`--repeat`: every time the number comes back to that side). Remove
+your watches when the work is done (`watch list`, `watch remove ID`). A watch is not a replacement for the regular
+updates the user wants on a run: it catches the moments between them.
+
+**History and files.** `runs` lists every run seen on any instance, `run NAME` one of them with its last probes
+(`--full` adds settings and loss). `download` shows the per-kind rules (`logs`, `probes`, `samples`, `maps`, `best`,
+`loras`, each `off`, `end` or `during`); change them only when the user asks, or for one run with
+`download KIND=RULE --run NAME`. `pull NAME --what KIND` downloads now. Files land in
+`~/.rulz_vast/runs/<instance>/<job>`.
+
+`stop NAME` is the WebUI's Stop on whichever instance runs that job. The fleet never rents, stops or destroys an
+instance either.
 
 ## What it does not do
 

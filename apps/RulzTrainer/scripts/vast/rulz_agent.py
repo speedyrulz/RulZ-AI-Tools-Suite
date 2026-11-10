@@ -34,6 +34,8 @@ SENT_CONFIG = ""  # a local config for start, base64: rulz_remote.py writes it i
 START_WAIT = 12.0  # seconds a start waits to see the WebUI's queue pick the run up (it looks every 3 s)
 # status.json's per-step series: thousands of numbers, summed up instead of shown (job --full has them)
 STATUS_SERIES = ("losses", "step_times", "grad_norms", "states", "probes", "samples", "saved")
+SERIES_POINTS = 150  # the loss series sent with a snapshot, for rulz_fleet.py's small charts
+SERIES_PROBES = 60  # and the probes sent with it
 PROBE_COLUMNS = ("step", "face", "body", "combined", "face_ema", "body_ema", "combined_ema", "face_norm_ema",
                  "body_norm_ema", "best", "best_step", "since_improve", "lr_factor", "stage", "gold_ema", "copy")
 
@@ -145,7 +147,7 @@ def job_line(d: Path, active: Path | None) -> dict:
 # ---------------------------------------------------------------- read
 
 
-def cmd_status(args) -> int:
+def machine_status() -> dict:
     gpus = []
     try:
         out = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.used,memory.total,utilization.gpu,temperature.gpu",
@@ -159,10 +161,14 @@ def cmd_status(args) -> int:
     disk = shutil.disk_usage(".")
     active = running_dir()
     datasets = Path("datasets")
-    data = {"root": str(Path.cwd()), "webui_running": webui_running(), "gpus": gpus,
+    return {"root": str(Path.cwd()), "webui_running": webui_running(), "gpus": gpus,
             "disk_free_gb": round(disk.free / 1e9, 1), "disk_total_gb": round(disk.total / 1e9, 1),
             "datasets": sorted(p.name for p in datasets.iterdir() if p.is_dir()) if datasets.is_dir() else [],
             "job_running": active is not None, "queue": queue_view()}
+
+
+def cmd_status(args) -> int:
+    data = machine_status()
     current = current_job_dir()
     if current is not None:
         data["job"] = dict(status_brief(read_json(current / "status.json", {}) or {}), job=current.name)
@@ -170,11 +176,85 @@ def cmd_status(args) -> int:
     return 0
 
 
-def cmd_jobs(args) -> int:
-    active = running_dir()
+def thin(values: list, limit: int = SERIES_POINTS) -> list[list]:
+    """A per-step series as at most about `limit` [step, value] points, the last one always among them."""
+    n = len(values)
+    if n == 0:
+        return []
+    stride = max(1, -(-n // limit))
+    picked = list(range(stride - 1, n, stride))
+    if picked[-1:] != [n - 1]:
+        picked.append(n - 1)
+    return [[i + 1, round(float(values[i]), 5)] for i in picked if values[i] is not None]
+
+
+def probe_rows(rows: list[dict], last: int = 0) -> list[dict]:
+    """The probes' scores without their per-seed lists and image paths."""
+    rows = rows[-last:] if last > 0 else rows
+    return [{k: (round(r[k], 3) if isinstance(r[k], float) else r[k]) for k in PROBE_COLUMNS if r.get(k) is not None}
+            for r in rows]
+
+
+def job_dirs() -> list[Path]:
+    """Every job folder, newest first."""
     dirs = [d for d in OUTPUT.iterdir() if d.is_dir() and d.name not in NOT_JOBS
             and (d / "status.json").is_file()] if OUTPUT.is_dir() else []
-    show([job_line(d, active) for d in sorted(dirs, key=lambda d: d.stat().st_mtime, reverse=True)])
+    return sorted(dirs, key=lambda d: d.stat().st_mtime, reverse=True)
+
+
+def job_state(status: dict, running: bool) -> str:
+    """running, done, error, or ended: the process is gone without finishing (killed)."""
+    if running:
+        return "running"
+    if status.get("error"):
+        return "error"
+    return "done" if status.get("done") else "ended"
+
+
+def cmd_jobs(args) -> int:
+    active = running_dir()
+    show([job_line(d, active) for d in job_dirs()])
+    return 0
+
+
+def cmd_snapshot(args) -> int:
+    """Everything rulz_fleet.py reads in one look: the machine, every job with its state and run id, and the current
+    job's numbers with its loss and probe series thinned for a small chart."""
+    data = machine_status()
+    active = running_dir()
+    jobs = []
+    for d in job_dirs()[:args.jobs]:
+        status = read_json(d / "status.json", {}) or {}
+        running = active is not None and d.resolve() == active.resolve()
+        jobs.append(dict(job_line(d, active), run_id=status.get("run_id"), state=job_state(status, running)))
+    data["jobs"] = jobs
+    current = current_job_dir()
+    if current is not None:
+        status = read_json(current / "status.json", {}) or {}
+        times = [t for t in (status.get("step_times") or [])[-20:] if t]
+        data["job"] = dict(status_brief(status), job=current.name, running=active is not None,
+                           step_time=round(sum(times) / len(times), 3) if times else None)
+        data["series"] = {"losses": thin(status.get("losses") or []),
+                          "probes": probe_rows(status.get("probes") or [], SERIES_PROBES)}
+    show(data)
+    return 0
+
+
+def cmd_record(args) -> int:
+    """One run for rulz_fleet.py's history: its settings, its numbers, every probe's scores and the thinned loss."""
+    d = job_dir(args.name)
+    status = read_json(d / "status.json", {}) or {}
+    config = {}
+    try:
+        import yaml
+
+        config = yaml.safe_load((d / "config.yaml").read_text(encoding="utf-8")) or {}
+    except (ImportError, OSError, ValueError):
+        pass  # no config kept: the record goes without
+    active = running_dir()
+    show({"job": d.name, "run_id": status.get("run_id"), "config": config, "status": status_brief(status),
+          "state": job_state(status, active is not None and d.resolve() == active.resolve()),
+          "probes": probe_rows(status.get("probes") or []), "losses": thin(status.get("losses") or [])})
     return 0
 
 
@@ -216,10 +296,14 @@ def cmd_probes(args) -> int:
 
 def cmd_config(args) -> int:
     d = job_dir(args.name)
-    if not args.diff:
+    if not args.diff and not args.json:
         print((d / "config.yaml").read_text(encoding="utf-8"))
         return 0
     import yaml
+
+    if not args.diff:
+        show(yaml.safe_load((d / "config.yaml").read_text(encoding="utf-8")) or {})
+        return 0
 
     ours = yaml.safe_load((d / "config.yaml").read_text(encoding="utf-8")) or {}
     theirs = yaml.safe_load((job_dir(args.diff) / "config.yaml").read_text(encoding="utf-8")) or {}
@@ -304,6 +388,29 @@ def base_config(args):
     raise Refused("Say what to start from: --from JOB or --config FILE.")
 
 
+def race_rows(data: dict, wanted: list[str]) -> dict:
+    """A race's config narrowed to the named configurations, for a race split over several machines: two or more
+    stay a race among themselves, one alone becomes a plain run with that row's settings (the trainer's own
+    variant_configs, so its values are read the way the race reads them)."""
+    from rulztrainer.config import TrainConfig
+
+    rows = data.get("race_configs") or []
+    named = {str(row.get("name") or f"c{i + 1}"): row for i, row in enumerate(rows)}
+    missing = [n for n in wanted if n not in named]
+    if not data.get("race") or missing or not wanted:
+        raise Refused(f"No race configuration named {', '.join(missing) or '(none given)'}: this config has "
+                      f"{', '.join(named) if data.get('race') and named else 'no race'}.")
+    if data.get("race_follow"):
+        raise Refused("A relay (race_follow) continues every configuration from each round's winner: it can't be "
+                      "split over machines.")
+    picked = [dict(named[n], name=n) for n in wanted]
+    if len(picked) > 1:
+        return dict(data, race_configs=picked)
+    from rulztrainer import race
+
+    return race.variant_configs(TrainConfig.from_dict(dict(data, race_configs=picked)))[0][1].to_dict()
+
+
 def cmd_start(args) -> int:
     """Queue a run. The checks of the WebUI's queue_run, the trainer's own validate, and refusing to overwrite an
     earlier run's folder."""
@@ -314,6 +421,11 @@ def cmd_start(args) -> int:
     if args.preset:
         data = apply_preset(data, args.preset)
     data.update(parse_overrides(args.set))
+    if args.race_rows:
+        try:
+            data = race_rows(data, [n for n in args.race_rows.split(",") if n])
+        except (TypeError, ValueError) as e:
+            raise Refused(f"A setting is invalid: {e}") from e
     data["job_name"] = args.job
     try:
         cfg = TrainConfig.from_dict(data)
@@ -419,6 +531,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--full", action="store_true", help="every field, per-seed scores and image paths included")
     p = command("config", cmd_config, True)
     p.add_argument("--diff", metavar="OTHER_JOB", help="only the settings that differ, as {key: [this, other]}")
+    p.add_argument("--json", action="store_true", help="the settings as JSON")
+    p = command("snapshot", cmd_snapshot)
+    p.add_argument("--jobs", type=int, default=100, help="how many jobs to list, newest first")
+    command("record", cmd_record, True)
     command("poll", cmd_poll, True)
     p = command("files", cmd_files, True)
     p.add_argument("--what", action="append", choices=("logs", "probes", "samples", "maps", "loras", "best", "all"))
@@ -428,6 +544,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--from", dest="base", metavar="JOB", help="start from this job's config")
     p.add_argument("--preset", default="")
     p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
+    p.add_argument("--race-rows", default="", metavar="NAME[,NAME]",
+                   help="of a race config, keep only these configurations (one alone: a plain run with its settings)")
     p.add_argument("--overwrite", action="store_true", help="replace an existing job folder of that name")
     p.add_argument("--dry-run", action="store_true", help="check everything, show the plan, queue nothing")
     p.add_argument("--resume-queue", action="store_true", help="also resume the queue when it is paused")

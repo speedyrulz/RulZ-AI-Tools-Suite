@@ -43,7 +43,8 @@ CONNECTION = STATE / "connection.json"
 PULLS = STATE / "runs"  # outside the checkout: pulled runs outlive a branch or a worktree
 REMOTE_DIR = "/workspace/RulzTrainer"
 PYTHON = '"$(test -x /venv/main/bin/python && echo /venv/main/bin/python || echo python3)"'
-AGENT_COMMANDS = {"status", "jobs", "job", "log", "probes", "config", "start", "stop", "queue"}  # rulz_agent.py's
+AGENT_COMMANDS = {"status", "jobs", "job", "log", "probes", "config", "start", "stop", "queue", "snapshot",
+                  "record"}  # rulz_agent.py's
 CONFIG_SLOT = b'SENT_CONFIG = ""'  # the line of rulz_agent.py that takes a local config
 SSH_FAILED = 255  # ssh's own exit status: it could not connect, or the connection dropped
 SYNC_PATHS = ("rulztrainer", "webui.py", "scripts", "requirements.txt")  # what a run needs of the code
@@ -135,8 +136,9 @@ def reachable(conn: dict, key: str | None) -> bool:
     return done.returncode == 0 and "rulz-ok" in done.stdout
 
 
-def find_connection(wanted: int | None, key: str | None) -> dict:
-    """Ask vast for the instance, try its routes, remember the one that works."""
+def find_connection(wanted: int | None, key: str | None, remember: bool = True) -> dict:
+    """Ask vast for the instance, try its routes, remember the one that works (remember=False only returns it:
+    rulz_fleet.py keeps a route per instance of its own)."""
     inst = pick_instance(list_instances(), wanted)
     tried = routes(inst)
     if not tried:
@@ -144,8 +146,9 @@ def find_connection(wanted: int | None, key: str | None) -> dict:
     for route in tried:
         conn = {"id": inst["id"], "gpu": inst.get("gpu_name"), "dollars_per_hour": inst.get("dph_total"), **route}
         if reachable(conn, key):
-            STATE.mkdir(parents=True, exist_ok=True)
-            CONNECTION.write_text(json.dumps(conn, indent=1), encoding="utf-8")
+            if remember:
+                STATE.mkdir(parents=True, exist_ok=True)
+                CONNECTION.write_text(json.dumps(conn, indent=1), encoding="utf-8")
             return conn
     raise Unreachable(f"Instance {inst['id']} refused ssh on {', '.join(r['route'] for r in tried)}. If it was rented "
                       "before your ssh key was added, run connect --attach-key; a new instance needs a minute first.")
@@ -172,9 +175,11 @@ class Remote:
     """One instance over ssh. The route is remembered between calls, so a call costs one ssh connection and no vast
     API request; when the instance has gone or moved, the first failure looks it up again."""
 
-    def __init__(self, instance: int | None, key: str | None, folder: str):
-        self.instance, self.key, self.folder = instance, key, folder
-        self.conn = saved_connection(instance) or find_connection(instance, key)
+    def __init__(self, instance: int | None, key: str | None, folder: str, conn: dict | None = None,
+                 remember: bool = True):
+        self.instance, self.key, self.folder, self.remember = instance, key, folder, remember
+        self.conn = conn or (saved_connection(instance) if remember else None) \
+            or find_connection(instance, key, remember)
 
     def command(self, shell: str, in_folder: bool = True) -> list[str]:
         return ssh_command(self.conn, self.key) + [f"cd {shlex.quote(self.folder)} && {shell}" if in_folder else shell]
@@ -183,7 +188,7 @@ class Remote:
         done = subprocess.run(self.command(shell, in_folder), input=data, capture_output=True,
                               stdin=subprocess.DEVNULL if data is None else None)
         if done.returncode == SSH_FAILED:
-            self.conn = find_connection(self.instance, self.key)
+            self.conn = find_connection(self.instance, self.key, self.remember)
             done = subprocess.run(self.command(shell, in_folder), input=data, capture_output=True,
                                   stdin=subprocess.DEVNULL if data is None else None)
         return done

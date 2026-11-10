@@ -1923,6 +1923,8 @@ html[data-theme="light"] .q-btn.rz-danger, html[data-theme="light"] .q-btn.rz-da
 .rz-group { min-width: 0; display: flex; flex-direction: column; gap: 8px; }
 .rz-groups .rz-gallery { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
 .rz-log-tall { height: min(68vh, 760px); }
+.rz-fleet-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 400px), 1fr)); gap: 14px; }
+.rz-fleet-card { gap: 8px; min-width: 0; }
 .rz-tile { background: var(--rz-surface); border: 1px solid var(--rz-border); border-radius: 12px; padding: 12px 16px; min-width: 150px; flex: 1 1 150px; }
 .rz-tile-label { font-size: 12px; color: var(--rz-muted); text-transform: uppercase; letter-spacing: .08em; }
 .rz-tile-value { font-size: 20px; font-weight: 600; color: var(--rz-heading); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
@@ -7067,6 +7069,699 @@ def build_history_tab(charts: list):
 # ---------------------------------------------------------------- page
 
 
+# ---------------------------------------------------------------- Fleet: several vast.ai instances from this computer
+
+_FLEET = None
+_FLEET_LOCK = threading.Lock()
+# an instance's state -> (what the card says, the dot's class)
+FLEET_STATES = {"running": ("Training", "live"), "starting": ("Starting a run", "live"), "idle": ("Idle", "done"),
+                "unreachable": ("Out of reach", "error"), "gone": ("Stopped or destroyed", ""),
+                "off": ("Not watched", ""), "new": ("Not looked at yet", "")}
+FLEET_RUN_COLUMNS = [
+    {"name": "job", "label": "Run", "field": "job", "align": "left", "sortable": True},
+    {"name": "state", "label": "State", "field": "state", "align": "left", "sortable": True},
+    {"name": "where", "label": "Instance", "field": "where", "align": "left", "sortable": True, **_WIDE},
+    {"name": "steps", "label": "Steps", "field": "steps", "align": "right"},
+    {"name": "loss", "label": "Loss", "field": "loss", "align": "right", **_WIDE},
+    {"name": "best", "label": "Best likeness", "field": "best", "align": "right", "sortable": True},
+    {"name": "time", "label": "Time", "field": "time", "align": "right", **_WIDE},
+    {"name": "cost", "label": "Cost", "field": "cost", "align": "right", **_WIDE},
+    {"name": "ended", "label": "Last seen", "field": "ended", "align": "left", "sortable": True, **_WIDE},
+    {"name": "group", "label": "Split race", "field": "group", "align": "left", "sortable": True, **_WIDE},
+    {"name": "files", "label": "Downloaded", "field": "files", "align": "left", **_WIDE},
+]
+FLEET_SOURCES = {"form": "The Train tab's settings", "file": "A config file on this computer",
+                 "run": "A past run's settings"}
+
+
+def fleet():
+    """rulz_fleet.py's Fleet for this WebUI: one for the whole process, as it holds the lock of the one that looks."""
+    global _FLEET
+    with _FLEET_LOCK:
+        if _FLEET is None:
+            vast = str(ROOT / "scripts" / "vast")
+            if vast not in sys.path:
+                sys.path.insert(0, vast)
+            import rulz_fleet
+
+            _FLEET = rulz_fleet.Fleet()
+    return _FLEET
+
+
+def fleet_loop() -> None:
+    """Look at the fleet's instances while there are any (rulz_fleet's step: the queue moves on, due files come
+    down, the watches are checked). A daemon or a wait started elsewhere may hold the looking instead; then this
+    only waits for its turn."""
+    while True:
+        try:
+            fleet().step()
+        except Exception as e:  # noqa: BLE001  (the loop must outlive one bad look)
+            print(f"[fleet] {e!r}", flush=True)
+        time.sleep(2.0)
+
+
+def fleet_num(value, digits: int = 1) -> str:
+    return f"{value:,.{digits}f}" if isinstance(value, (int, float)) and not isinstance(value, bool) else "-"
+
+
+def fleet_probe_text(probe: dict | None) -> str:
+    """The last likeness probe in a line: "step 1,400: face 73.6 · body 48.2 · combined 47.0 · best 50.0 at 1,400"."""
+    if not probe:
+        return ""
+    parts = [f"{name} {probe[key]:.1f}" for name, key in (("face", "face_ema"), ("body", "body_ema"),
+                                                         ("combined", "combined_ema")) if probe.get(key) is not None]
+    if probe.get("best") is not None:
+        parts.append(f"best {probe['best']:.1f}" + (f" at {probe['best_step']:,}" if probe.get("best_step") else ""))
+    return (f"step {probe['step']:,}: " if probe.get("step") is not None else "") + " · ".join(parts)
+
+
+def fleet_job_line(inst: dict) -> str:
+    """The run's numbers on an instance's card."""
+    job, metrics = inst.get("job") or {}, inst.get("metrics") or {}
+    if not job:
+        return ""
+    parts = [f"step {job.get('step') or 0:,} / {job.get('total') or 0:,}"]
+    if job.get("avg_loss") is not None:
+        parts.append(f"loss {job['avg_loss']:.4f}")
+    if job.get("running"):
+        if job.get("eta"):
+            parts.append(f"{eta_text(job['eta'])} left")
+        if metrics.get("cost") is not None:
+            parts.append(f"${metrics['cost']:.2f} so far")
+    else:
+        parts.append("failed" if job.get("error") else "finished" if job.get("done") else "ended early")
+    return " · ".join(parts)
+
+
+def fleet_machine_line(inst: dict) -> str:
+    parts = []
+    if inst.get("disk_free_gb") is not None:
+        parts.append(f"disk {inst['disk_free_gb']:.0f} GB free of {inst.get('disk_total_gb') or 0:.0f}")
+    for gpu in inst.get("gpus") or []:
+        parts.append(f"GPU {gpu.get('utilization', 0)}% · {gpu.get('temperature', 0)}°C · "
+                     f"{gpu.get('memory_used_mb', 0) / 1024:.1f} / {gpu.get('memory_total_mb', 0) / 1024:.0f} GB")
+    if inst.get("age") is not None:
+        parts.append(f"seen {inst['age']} s ago" if inst["age"] < 120 else f"seen {eta_text(inst['age'])} ago")
+    return " · ".join(parts)
+
+
+def fleet_event_text(e: dict) -> str:
+    """An event as a sentence for the Fleet tab's list."""
+    kind, job, on = e.get("kind"), e.get("job"), f"instance {e.get('instance')}"
+    if kind == "watch":
+        text = f"{e.get('metric')} went {e.get('op')} {e.get('value'):g}: now {e.get('actual'):g}"
+        text += f" ({job} on {on}" + (f", step {e['step']:,.0f})" if e.get("step") is not None else ")") \
+            if job else f" ({on})"
+        return text + (f" · {e['note']}" if e.get("note") else "")
+    if kind == "run_done":
+        best = f", best likeness {e['best']:.1f}" if isinstance(e.get("best"), (int, float)) else ""
+        return f"{job} finished on {on}{best}"
+    table = {"run_started": f"{job} started on {on}", "run_failed": f"{job} failed on {on}: {e.get('error')}",
+             "run_ended": f"{job} ended early on {on} at step {e.get('step')}",
+             "run_lost": f"{job} was lost with {on}", "dispatched": f"{job} sent to {on}",
+             "dispatch_failed": f"{job} could not start on {on}: {e.get('error')}",
+             "instance_down": f"{on} is out of reach: {e.get('error')}", "instance_up": f"{on} is back",
+             "instance_gone": f"{on} is {e.get('status')}", "instance_added": f"{on} joined the fleet",
+             "download_failed": f"{job}'s files could not be downloaded from {on}: {e.get('error')}",
+             "queue_empty": "The fleet's queue is empty"}
+    return table.get(kind, str(kind))
+
+
+def fleet_run_rows(runs: list[dict]) -> list[dict]:
+    """The past runs as table rows."""
+    rows = []
+    for r in runs:
+        when = r.get("ended") or r.get("modified") or r.get("first_seen")
+        rows.append({
+            "key": r["key"], "job": r.get("job") or "", "state": r.get("state") or "",
+            "where": f"{r.get('instance')} · {r.get('gpu') or '?'}",
+            "steps": f"{r.get('step') or 0:,} / {r.get('total') or 0:,}",
+            "loss": f"{r['avg_loss']:.4f}" if isinstance(r.get("avg_loss"), (int, float)) else "",
+            "best": round(r["best"], 1) if isinstance(r.get("best"), (int, float)) else None,
+            "time": eta_text(r.get("elapsed")) if r.get("elapsed") else "",
+            "cost": f"${r['cost']:.2f}" if isinstance(r.get("cost"), (int, float)) else "",
+            "ended": time.strftime("%Y-%m-%d %H:%M", time.localtime(when)) if when else "",
+            "group": r.get("group") or "", "files": ", ".join(r.get("downloaded") or [])})
+    return rows
+
+
+def fleet_spark(series: dict | None) -> dict:
+    """A small chart for a card or a past run: the loss, and the probes' combined likeness on a second axis."""
+    series = series or {}
+    probes = [[p["step"], p.get("combined_ema", p.get("combined"))] for p in series.get("probes") or []
+              if p.get("step") is not None and p.get("combined_ema", p.get("combined")) is not None]
+    axis = {"type": "value", "scale": True, "splitLine": {"show": False},
+            "axisLabel": {"color": "#8E8E96", "fontSize": 10, "hideOverlap": True}}
+    return {"backgroundColor": "transparent", "animation": False,
+            "grid": {"left": 44, "right": 40 if probes else 12, "top": 22, "bottom": 22},
+            "legend": {"top": 0, "right": 0, "itemWidth": 14, "itemHeight": 8,
+                       "textStyle": {"color": "#8E8E96", "fontSize": 11}},
+            "tooltip": {"trigger": "axis", "confine": True},
+            "xAxis": {**axis, "min": 0}, "yAxis": [dict(axis), dict(axis)],
+            "series": [{"name": "loss", "type": "line", "showSymbol": False, "data": series.get("losses") or [],
+                        "lineStyle": {"width": 1.5, "color": "#FF3B30"}, "itemStyle": {"color": "#FF3B30"}},
+                       {"name": "likeness", "type": "line", "yAxisIndex": 1, "data": probes, "symbolSize": 5,
+                        "lineStyle": {"width": 1.5, "color": "#60A5FA"}, "itemStyle": {"color": "#60A5FA"}}]}
+
+
+def build_fleet_tab(form_config=None):
+    """Fleet: every vast.ai instance's run on one page, a queue whose next run goes to the first idle instance,
+    the download rules, the watches, and every run on record. All of it is scripts/vast/rulz_fleet.py's Fleet;
+    this page draws its state and calls it."""
+    fl = fleet()
+    import rulz_fleet
+
+    state: dict = {"shape": None, "cards": {}, "seen": {}, "dl": {}, "accept": {}}
+
+    async def act(func, *args, ok: str = "", **kw):
+        """A fleet call off the page's thread (most of them go over ssh); a refusal becomes a notice."""
+        try:
+            result = await run.io_bound(func, *args, **kw)
+        except (rulz_fleet.Refused, rulz_fleet.remote.Unreachable, SystemExit, OSError) as e:
+            ui.notify(str(e) or "That did not work.", type="warning", multi_line=True)
+            return None
+        if ok:
+            ui.notify(ok, type="positive")
+        refresh(force=True)
+        return True if result is None else result
+
+    async def find():
+        note = await run.io_bound(fl.discover)
+        ui.notify(note or "Asked vast.ai for the running instances", type="warning" if note else "positive",
+                  multi_line=True)
+        refresh(force=True)
+
+    def look_once():
+        if not fl.hold():
+            return "Another program (a daemon or a wait) is doing the looking: this page shows what it sees."
+        fl.tick()
+        return ""
+
+    async def look_now():
+        note = await run.io_bound(look_once)
+        if note:
+            ui.notify(note, type="info", multi_line=True)
+        refresh(force=True)
+
+    with card():
+        with ui.row().classes("w-full items-center gap-3"):
+            with ui.column().classes("gap-0"):
+                ui.label("vast.ai fleet").classes("text-base font-medium")
+                look_line = hint("")
+            ui.space()
+            ui.button("Find instances", icon="travel_explore", on_click=find, color=None) \
+                .props("outline dense no-caps").tooltip("Ask vast.ai which instances are running: new RulzTrainer "
+                                                        "instances join, stopped and destroyed ones are marked")
+            ui.button("Look now", icon="refresh", on_click=look_now, color=None).props("flat dense no-caps")
+        vast_note = ui.label("").classes("rz-banner warning")
+        vast_note.visible = False
+        hint("Your vast.ai instances from this computer, over ssh (the vastai CLI with your API key, and your ssh "
+             "key on your vast.ai account). This WebUI looks at them every few seconds while it runs; closed, "
+             "nothing moves the queue, downloads files or checks the watches unless "
+             "python scripts/vast/rulz_fleet.py daemon runs instead. Nothing here rents, stops or destroys an "
+             "instance.")
+    grid = ui.element("div").classes("rz-fleet-grid w-full")
+    no_instances = hint("No instances in the fleet yet. Rent one from your RulzTrainer template on vast.ai, then "
+                        "Find instances.")
+
+    # ------------------------------------------------------------ instances
+    async def stop_run(iid: int, job: str):
+        with ui.dialog() as dlg, ui.card().classes("w-[30rem] max-w-full"):
+            ui.label(f"Stop {job} on instance {iid}?").classes("text-base font-medium")
+            hint("The trainer saves the LoRA after the current step, then ends. The queue's next run for this "
+                 "instance starts after it.")
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("Cancel", on_click=lambda: dlg.submit(False)).props("flat")
+                ui.button("Stop the run", icon="stop", on_click=lambda: dlg.submit(True)).props("unelevated")
+        go = await dlg
+        dlg.delete()
+        if go:
+            await act(fl.stop_run, str(iid), ok=f"{job} is stopping")
+
+    def make_card(inst: dict) -> dict:
+        iid = inst["id"]
+        w: dict = {}
+        with ui.card().props("flat").classes("rz-card rz-fleet-card"):
+            with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                w["dot"] = ui.element("span").classes("rz-dot")
+                ui.label(inst.get("label") or f"Instance {iid}").classes("text-base font-medium")
+                w["gpu"] = hint("")
+                ui.space()
+                w["state"] = ui.label("").classes("text-sm font-medium")
+            w["error"] = ui.label("").classes("rz-banner warning")
+            w["job"] = ui.label("").classes("text-sm font-medium")
+            w["bar"] = ui.linear_progress(value=0, show_value=False, size="6px").props("rounded").classes("w-full")
+            w["line"] = hint("")
+            w["probe"] = hint("")
+            w["chart"] = ui.echart(fleet_spark(None)).classes("w-full h-36")
+            w["machine"] = hint("")
+            w["theirs"] = hint("")
+            with ui.row().classes("w-full items-center gap-2"):
+                w["stop"] = ui.button("Stop run", icon="stop", color=None).props("outline dense no-caps")
+                w["accept"] = ui.switch("Takes queued runs", value=inst.get("accept", True),
+                                        on_change=lambda e, i=iid: act(fl.set_instance, i, accept=bool(e.value))
+                                        if e.value != state["accept"].get(i, True) else None)
+                ui.space()
+                with ui.button(icon="more_vert", color=None).props("flat dense round"):
+                    with ui.menu():
+                        w["watch_item"] = ui.menu_item("")
+                        ui.menu_item("Remove from the fleet", on_click=lambda i=iid: act(
+                            fl.remove_instance, i, ok=f"Instance {i} removed; its runs stay on record"))
+        return w
+
+    def fill_card(w: dict, inst: dict) -> None:
+        iid, job = inst["id"], inst.get("job") or {}
+        text, dot = FLEET_STATES.get(inst["state"], (inst["state"], ""))
+        w["dot"].classes(replace=f"rz-dot {dot}")
+        w["state"].text = text
+        price = f" · ${inst['dph']:.2f}/h" if isinstance(inst.get("dph"), (int, float)) else ""
+        w["gpu"].text = f"{inst.get('gpu') or ''}{price}" + (f" · {iid}" if inst.get("label") else "")
+        w["error"].text = inst.get("error") or ""
+        w["error"].visible = inst["state"] == "unreachable" and bool(inst.get("error"))
+        running = bool(job.get("running"))
+        w["job"].text = (job.get("job") or "") + (f" · {job['stage']}" if running and job.get("stage") else "")
+        w["job"].visible = bool(job)
+        w["bar"].value = (job.get("step") or 0) / max(1, job.get("total") or 1)
+        w["bar"].visible = running
+        w["line"].text = fleet_job_line(inst) or ("Nothing has run here yet." if inst["state"] == "idle" else "")
+        w["probe"].text = ("Last probe, " + fleet_probe_text(job.get("last_probe"))) if job.get("last_probe") else ""
+        w["probe"].visible = bool(w["probe"].text)
+        series = inst.get("series") or {}
+        w["chart"].visible = bool(job) and len(series.get("losses") or []) > 1
+        if w["chart"].visible:
+            w["chart"].options.clear()
+            w["chart"].options.update(fleet_spark(series))
+            w["chart"].update()
+        w["machine"].text = fleet_machine_line(inst)
+        theirs = inst.get("queue") or []
+        w["theirs"].text = ("Its own queue: " + ", ".join(e.get("job") or "?" for e in theirs)) if theirs else \
+            ("Its WebUI is not running, so it cannot start a run." if inst.get("webui_running") is False else "")
+        w["theirs"].visible = bool(w["theirs"].text)
+        w["stop"].visible = running
+        w["stop_target"] = (iid, job.get("job") or "")
+        state["accept"][iid] = inst.get("accept", True)
+        if w["accept"].value != inst.get("accept", True):
+            w["accept"].value = inst.get("accept", True)
+        w["accept"].visible = inst["state"] not in ("gone", "off")
+        off = inst["state"] == "off"
+        w["watch_item"].text = "Watch it again" if off else "Stop watching it"
+        w["watch_target"] = (iid, off)
+
+    def draw_instances(view: dict) -> None:
+        instances = view["instances"]
+        shape = [(i["id"], i.get("label")) for i in instances]
+        if shape != state["shape"]:
+            state["shape"], state["cards"] = shape, {}
+            grid.clear()
+            with grid:
+                for inst in instances:
+                    w = state["cards"][inst["id"]] = make_card(inst)
+                    w["stop"].on_click(lambda _, w=w: stop_run(*w["stop_target"]))
+                    w["watch_item"].on_click(lambda _, w=w: act(fl.set_instance, w["watch_target"][0],
+                                                                enabled=w["watch_target"][1]))
+        for inst in instances:
+            fill_card(state["cards"][inst["id"]], inst)
+        no_instances.visible = not instances
+
+    # ------------------------------------------------------------ the queue
+    with section("Fleet queue", "Runs waiting for an instance", "queue", open_=True) as queue_exp:
+        with ui.row().classes("w-full items-center gap-2"):
+            queue_state = ui.label("").classes("text-sm font-medium")
+            ui.space()
+            queue_pause = ui.button("", color=None, on_click=lambda: act(
+                fl.queue_edit, "resume" if fl.read()["queue"]["paused"] else "pause")).props("outline dense no-caps")
+            ui.button("Clear queue", icon="clear_all", color=None, on_click=lambda: act(fl.queue_edit, "clear")) \
+                .props("flat dense no-caps")
+        hint("The first waiting run goes to the first instance that has nothing running and nothing waiting in its "
+             "own queue; when an instance finishes its run, it takes the next one. A run an instance refuses (its "
+             "dataset is not there, a job folder of that name exists) is offered to the others.")
+        queue_list = ui.column().classes("w-full gap-1")
+        subhead("Add a run")
+        with fields():
+            q_job = ui.input("Job name").classes("w-56")
+            q_source = ui.select(FLEET_SOURCES if form_config else {k: v for k, v in FLEET_SOURCES.items()
+                                                                    if k != "form"},
+                                 value="form" if form_config else "file", label="Settings from").classes("w-72")
+            q_instance = ui.select({0: "The first idle instance"}, value=0, label="Send to").classes("w-56")
+        with fields():
+            q_file = path_field("Config file (YAML or JSON)", "file", "", "w-96",
+                                [("config", "*.yaml *.yml *.json"), ("all files", "*.*")])
+            q_run = ui.select({}, label="Past run", with_input=True).classes("w-96")
+        q_file.parent_slot.parent.bind_visibility_from(q_source, "value", value="file")
+        q_run.bind_visibility_from(q_source, "value", value="run")
+        with fields():
+            q_sets = ui.input("Changes", placeholder="steps=300 probe_every=50").classes("w-96") \
+                .tooltip("KEY=VALUE pairs parted by spaces, applied on top of the settings")
+            q_push = path_field("Dataset folder to send first (optional)", "dir", "", "w-96")
+        hint("The settings are read on the instance: a dataset must be in its datasets folder (name a local folder "
+             "to send first and the settings' paths into it are pointed there), and model files left empty are "
+             "downloaded there.")
+        with ui.row().classes("w-full items-center gap-3"):
+            q_split = ui.switch("Split a race over the instances")
+            q_parts = ui.number("Parts (0: one per instance)", value=0, min=0, max=32, precision=0).classes("w-56")
+            q_parts.bind_visibility_from(q_split, "value")
+            ui.space()
+            q_add = ui.button("Add to the fleet queue", icon="playlist_add").props("unelevated no-caps")
+        hint("A split race deals its configurations over the instances: each part trains on its own instance (a "
+             "part with one configuration as a plain run, with more as a race among them), and the parts are "
+             "compared by their best likeness under Past runs. A relay (race_follow) cannot be split.")
+
+    def queue_config() -> tuple[dict | None, str]:
+        """The settings the Add form names, and the job name they carry."""
+        if q_source.value == "form":
+            cfg = form_config() if form_config else None
+            return (cfg.to_dict(), cfg.job_name) if cfg is not None else (None, "")
+        if q_source.value == "file":
+            if not q_file.value:
+                raise rulz_fleet.Refused("Pick the config file.")
+            data = rulz_fleet.load_config(q_file.value)
+            return data, str(data.get("job_name") or "")
+        rec = fl.load_run(q_run.value or "") or {}
+        if not rec.get("config"):
+            raise rulz_fleet.Refused("Pick a past run whose settings are on record.")
+        return rec["config"], ""
+
+    def queue_plan(job: str, config: dict, sets: list[str], instance, push: list[str], split: int):
+        entries = fl.plan(job, config, sets=sets, instance=instance or None, push=push, split=split)
+        checks = rulz_fleet.check_entries(fl, entries)
+        fl.enqueue(entries=entries)
+        return [c.get("note") for c in checks if c.get("note")]
+
+    async def queue_add():
+        try:
+            config, name = queue_config()
+        except (rulz_fleet.Refused, OSError, ValueError) as e:
+            ui.notify(str(e), type="warning", multi_line=True)
+            return
+        if config is None:
+            return  # the form said why
+        split = 0
+        if q_split.value:
+            split = int(q_parts.value or 0) or len([i for i in fl.read()["instances"].values()
+                                                    if i.get("enabled", True) and not i.get("gone")])
+        q_add.disable()
+        try:
+            notes = await act(queue_plan, (q_job.value or name or "").strip(), config, (q_sets.value or "").split(),
+                              q_instance.value, [q_push.value] if q_push.value else [], split)
+        finally:
+            q_add.enable()
+        if notes is not None:
+            ui.notify("Added to the fleet queue" + (": " + "; ".join(notes) if notes and notes is not True else ""),
+                      type="positive", multi_line=True)
+
+    q_add.on_click(queue_add)
+
+    def draw_queue(view: dict) -> None:
+        q = view["queue"]
+        n = len(q["waiting"])
+        queue_state.text = (f"{n} run{'s' if n != 1 else ''} waiting" if n else "Nothing queued") + \
+            (" · paused" if q["paused"] else "")
+        queue_exp.props["caption"] = queue_state.text
+        queue_exp.update()
+        queue_pause.text = "Resume queue" if q["paused"] else "Pause queue"
+        queue_pause.props(f"icon={'play_arrow' if q['paused'] else 'pause'}")
+        ids = {0: "The first idle instance", **{i["id"]: f"{i.get('label') or i['id']} · {i.get('gpu') or '?'}"
+                                                for i in view["instances"] if i["state"] not in ("gone", "off")}}
+        if ids != q_instance.options:
+            q_instance.set_options(ids, value=q_instance.value if q_instance.value in ids else 0)
+        queue_list.clear()
+        with queue_list:
+            for e in q["starting"]:
+                hint(f"{e['job']}: being sent to instance {e.get('sent_to')}")
+            for i, e in enumerate(q["waiting"]):
+                what = ", ".join(x for x in (
+                    f"{e['steps']:,} steps" if isinstance(e.get("steps"), int) else "",
+                    f"race part of {e['group']}: {', '.join(e['race_rows'])}" if e.get("race_rows") else "",
+                    f"only instance {e['instance']}" if e.get("instance") else "",
+                    " ".join(e.get("set") or []),
+                    f"refused by {', '.join(e['refused_by'])}" if e.get("refused_by") else "") if x)
+                with ui.row().classes("w-full items-center gap-2 no-wrap rz-queue-row"):
+                    ui.label(f"#{i + 1}").classes("rz-hint w-8")
+                    ui.label(e["job"]).classes("text-sm font-medium")
+                    hint(what)
+                    ui.space()
+                    ui.button(icon="arrow_upward", on_click=lambda _, k=e["id"]: act(fl.queue_edit, "move", k, -1)) \
+                        .props("flat dense round size=sm").tooltip("Earlier")
+                    ui.button(icon="arrow_downward", on_click=lambda _, k=e["id"]: act(fl.queue_edit, "move", k, 1)) \
+                        .props("flat dense round size=sm").tooltip("Later")
+                    ui.button(icon="close", on_click=lambda _, k=e["id"]: act(fl.queue_edit, "remove", k)) \
+                        .props("flat dense round size=sm color=negative").tooltip("Remove from the queue")
+            for r in q["recent"][:5]:
+                when = time.strftime("%b %d %H:%M", time.localtime(r.get("time") or 0))
+                hint(f"{r.get('job')}: " + (f"could not start on instance {r.get('instance')}: {r['error']}"
+                                            if r.get("error") else f"sent to instance {r.get('instance')} {when}"),
+                     warn=bool(r.get("error")))
+
+    # ------------------------------------------------------------ downloads
+    with section("Automatic downloads", "What comes down from the instances, each kind by its own rule",
+                 "cloud_download", open_=False):
+        hint(f"Files land in {fl.pulls} (one folder per instance and job) and are fetched only once at their "
+             "size. An instance's disk goes with the instance: what is not downloaded when it is destroyed is gone.")
+        dl_selects: dict = {}
+        with fields():
+            for kind, label in rulz_fleet.DOWNLOAD_KINDS.items():
+                dl_selects[kind] = ui.select(rulz_fleet.DOWNLOAD_MODES, label=label, value="off",
+                                             on_change=lambda e, k=kind: e.value != state["dl"].get(k) and
+                                             fl.set_download({k: e.value})).classes("w-56")
+            dl_every = ui.number("Seconds between downloads during a run", value=300, min=30, step=30, precision=0,
+                                 on_change=lambda e: e.value and int(e.value) != state["dl"].get("every") and
+                                 fl.set_download({}, every=int(e.value))).classes("w-72")
+        hint("A LoRA is about 230 MB and a run keeps many: Every LoRA / checkpoint while it runs fills this "
+             "computer's disk quickly. Best LoRA is the <job>_best file alone.")
+
+    def draw_downloads(view: dict) -> None:
+        settings = view["settings"]
+        for kind, select in dl_selects.items():
+            state["dl"][kind] = settings["download"].get(kind, "off")
+            if select.value != state["dl"][kind]:
+                select.value = state["dl"][kind]
+        state["dl"]["every"] = settings["download_every"]
+        if dl_every.value != settings["download_every"]:
+            dl_every.value = settings["download_every"]
+
+    # ------------------------------------------------------------ watches and events
+    with section("Watches and events", "Get told when a number goes above or below a value", "notifications_active",
+                 open_=False) as watch_exp:
+        hint("A watch raises an event the moment a run's number is on the wrong side of a value: once per run, or "
+             "with Repeat every time it comes back there. The numbers are the run's (while it trains), its last "
+             "likeness probe's, and the machine's. An AI assistant sets the same watches from the command line "
+             "(rulz_fleet.py watch add ...) and is woken by rulz_fleet.py wait.")
+        with fields():
+            w_metric = ui.select(list(rulz_fleet.METRICS), value="avg_loss", label="Number", with_input=True) \
+                .classes("w-52")
+            w_op = ui.select({"above": "goes above", "below": "goes below"}, value="above", label="When it") \
+                .classes("w-40")
+            w_value = ui.number("Value", value=None, format="%g").classes("w-36")
+            w_job = ui.input("Only jobs named (optional, * allowed)").classes("w-64")
+            w_note = ui.input("Note (optional)").classes("w-64")
+            w_repeat = ui.checkbox("Repeat")
+
+        async def watch_add():
+            if w_value.value is None:
+                ui.notify("Give the value.", type="warning")
+                return
+            await act(fl.add_watch, w_metric.value, w_op.value, float(w_value.value), job=w_job.value or "",
+                      repeat=bool(w_repeat.value), note=w_note.value or "", by="webui", ok="Watch added")
+
+        ui.button("Add watch", icon="add_alert", on_click=watch_add, color=None).props("outline dense no-caps")
+        watch_list = ui.column().classes("w-full gap-1")
+        subhead("What happened")
+        event_list = ui.column().classes("w-full gap-0")
+
+    def draw_watches(view: dict) -> None:
+        watches = view["watches"]
+        watch_exp.props["caption"] = (f"{len(watches)} watch{'es' if len(watches) != 1 else ''} set" if watches
+                                      else "Get told when a number goes above or below a value")
+        watch_exp.update()
+        watch_list.clear()
+        with watch_list:
+            for watch in watches:
+                scope = ", ".join(x for x in (f"jobs {watch['job']}" if watch.get("job") else "",
+                                              f"instance {watch['instance']}" if watch.get("instance") else "",
+                                              "repeats" if watch.get("repeat") else "",
+                                              f"set by {watch['by']}" if watch.get("by") else "",
+                                              watch.get("note") or "") if x)
+                with ui.row().classes("w-full items-center gap-2 no-wrap rz-queue-row"):
+                    ui.label(f"{watch['metric']} {watch['op']} {watch['value']:g}").classes("text-sm font-medium")
+                    hint(scope)
+                    ui.space()
+                    hint(f"fired {watch.get('fired', 0)}x")
+                    ui.button(icon="close", on_click=lambda _, k=watch["id"]: act(fl.remove_watch, k)) \
+                        .props("flat dense round size=sm color=negative").tooltip("Remove this watch")
+
+    def draw_events() -> None:
+        events = fl.events(last=14)
+        if not changed("events", events[-1]["seq"] if events else 0):
+            return
+        event_list.clear()
+        with event_list:
+            for e in reversed(events):
+                bad = e["kind"] in ("watch", "run_failed", "run_lost", "dispatch_failed", "instance_down",
+                                    "instance_gone", "download_failed")
+                hint(time.strftime("%b %d %H:%M:%S  ", time.localtime(e.get("time") or 0)) + fleet_event_text(e),
+                     warn=bad)
+            if not events:
+                hint("Nothing yet.")
+
+    # ------------------------------------------------------------ past runs
+    with section("Past runs", "Every run the fleet has seen, on any instance", "history", open_=True):
+        with ui.row().classes("w-full items-center gap-3"):
+            run_filter = ui.input("Filter", placeholder="job, instance, state, split race").classes("w-72") \
+                .props("clearable")
+            run_count = hint("")
+        run_table = ui.table(columns=FLEET_RUN_COLUMNS, rows=[], row_key="key", selection="single",
+                             pagination={"rowsPerPage": 12, "sortBy": "ended", "descending": True},
+                             on_select=lambda _: show_run()).props("flat dense").classes("w-full")
+        run_filter.bind_value_to(run_table, "filter")
+        hint("Kept on this computer, so a run stays here after its instance is destroyed. Runs that were already "
+             "on an instance when it joined are listed too. Tick a run for its numbers, charts and files.")
+        with ui.column().classes("w-full gap-3") as run_detail:
+            run_title = ui.label("").classes("text-base font-medium")
+            run_facts = hint("")
+            run_group = hint("")
+            run_chart = ui.echart(fleet_spark(None)).classes("w-full h-56")
+            run_settings = hint("")
+            run_folder = hint("")
+            run_images = ui.row().classes("w-full gap-2")
+            with ui.row().classes("w-full items-center gap-2"):
+                run_kinds = ui.select(rulz_fleet.DOWNLOAD_KINDS, value=["logs", "probes"], multiple=True,
+                                      label="Download now").classes("w-72").props("use-chips")
+                run_pull = ui.button("Download", icon="cloud_download", color=None).props("outline dense no-caps")
+                ui.space()
+                run_forget = ui.button("Forget this run", icon="delete_outline", color=None) \
+                    .props("flat dense no-caps").tooltip("Drop it from this list. Downloaded files stay.")
+        run_detail.visible = False
+
+    def picked_run() -> dict | None:
+        key = run_table.selected[0]["key"] if run_table.selected else None
+        return fl.load_run(key) if key else None
+
+    def show_run() -> None:
+        rec = picked_run()
+        run_detail.visible = rec is not None
+        if rec is None:
+            return
+        cfg = rec.get("config") or {}
+        run_title.text = f"{rec.get('job')} · {rec.get('state')}"
+        facts = [f"instance {rec.get('instance')} ({rec.get('gpu') or '?'})",
+                 f"step {rec.get('step') or 0:,} / {rec.get('total') or 0:,}"]
+        if isinstance(rec.get("avg_loss"), (int, float)):
+            facts.append(f"loss {rec['avg_loss']:.4f}")
+        if isinstance(rec.get("best"), (int, float)):
+            facts.append(f"best likeness {rec['best']:.1f}"
+                         + (f" at step {rec['best_step']:,}" if rec.get("best_step") else ""))
+        if rec.get("elapsed"):
+            facts.append(eta_text(rec["elapsed"]))
+        if isinstance(rec.get("cost"), (int, float)):
+            facts.append(f"${rec['cost']:.2f}")
+        if rec.get("error"):
+            facts.append(f"error: {rec['error']}")
+        run_facts.text = " · ".join(facts)
+        run_group.text = ""
+        if rec.get("group"):
+            try:
+                group = fl.group(rec["group"])
+                run_group.text = f"Split race {rec['group']}: " + ", ".join(
+                    f"{p['job']} {fleet_num(p.get('best'))}" for p in group["parts"]) + \
+                    ("" if group["finished"] else " (still going)")
+            except rulz_fleet.Refused:
+                pass
+        run_group.visible = bool(run_group.text)
+        run_chart.options.clear()
+        run_chart.options.update(fleet_spark(rec))
+        run_chart.update()
+        run_chart.visible = len(rec.get("losses") or []) > 1
+        keys = [k for k in history.CONFIG_KEYS if k in cfg and cfg[k] not in (None, "", [], False)
+                and not k.startswith("probe_") and k != "job_name"][:18]
+        run_settings.text = ("Settings: " + ", ".join(f"{k} {cfg[k]}" for k in keys)) if keys else \
+            "Its settings are not on record yet."
+        folder = Path(rec["folder"]) if rec.get("folder") else None
+        run_folder.text = (f"Files: {folder} ({rec.get('downloaded_mb', 0)} MB: "
+                           f"{', '.join(rec.get('downloaded') or [])})" if folder else "No files downloaded.") + \
+            (f" · last download failed: {rec['pull_error']}" if rec.get("pull_error") else "")
+        run_images.clear()
+        images = sorted((folder / "probes").glob("*.png"))[-8:] if folder and (folder / "probes").is_dir() else []
+        with run_images:
+            for img in images:
+                ui.image(image_url(img)).classes("w-40 rounded").tooltip(img.name)
+        run_forget.visible = rec.get("state") != "running"
+
+    async def pull_run():
+        rec = picked_run()
+        if rec is None or not run_kinds.value:
+            return
+        run_pull.disable()
+        try:
+            result = await act(lambda: fl.pull(fl.instance(rec["instance"]), rec["key"], list(run_kinds.value)))
+        finally:
+            run_pull.enable()
+        if isinstance(result, dict):
+            ui.notify(result.get("error") or f"{result['fetched']} files, {result['mb']} MB",
+                      type="warning" if result.get("error") else "positive", multi_line=True)
+            show_run()
+
+    async def forget_run():
+        rec = picked_run()
+        if rec is not None and await act(fl.forget_run, rec["key"], ok=f"{rec['job']} dropped from the list"):
+            run_table.selected = []
+            show_run()
+
+    run_pull.on_click(pull_run)
+    run_forget.on_click(forget_run)
+
+    def draw_runs() -> None:
+        if not changed("runs", fl.runs_signature()):  # the record files as they are on disk: no run is read for it
+            return
+        runs = fl.runs()
+        keep = {row["key"] for row in run_table.selected}
+        run_table.rows = fleet_run_rows(runs)
+        run_table.selected = [row for row in run_table.rows if row["key"] in keep]
+        run_table.update()
+        run_count.text = f"{len(runs)} run{'s' if len(runs) != 1 else ''} on record"
+        options = {r["key"]: f"{r.get('job')} · {r.get('instance')}" for r in runs if r.get("config")}
+        if options != q_run.options:
+            q_run.set_options(options, value=q_run.value if q_run.value in options else None)
+        if keep:
+            show_run()
+
+    def changed(name: str, value) -> bool:
+        """Whether a part of the page differs from what is drawn (and remember it as drawn)."""
+        sig = json.dumps(value, sort_keys=True, default=str)
+        if sig == state["seen"].get(name):
+            return False
+        state["seen"][name] = sig
+        return True
+
+    def refresh(force: bool = False) -> None:
+        """Redraw the parts that changed since the last look at the fleet's files (every 3 s, and after an action)."""
+        if force:
+            state["seen"] = {}
+        view = fl.overview()
+        looked = view.get("looked")
+        look_line.text = ("Nothing in the fleet to look at." if not view["instances"] and not view["queue"]["waiting"]
+                          else f"Last look {looked} s ago" if looked is not None and looked < 600 else
+                          "No look for a while: is this WebUI or a daemon doing the looking?") +             ("" if fl.ticker is not None or not view["looking"] else " · another program is doing the looking")
+        vast_note.text = f"vast.ai could not be asked: {view.get('discover_error')}"
+        vast_note.visible = bool(view.get("discover_error"))
+        instances = view["instances"]
+        if changed("instances", [{k: v for k, v in i.items() if k != "age"} for i in instances]):
+            draw_instances(view)
+        else:  # only the "seen 12 s ago" moved on
+            for inst in instances:
+                state["cards"][inst["id"]]["machine"].text = fleet_machine_line(inst)
+        if changed("queue", [view["queue"], [(i["id"], i.get("label"), i.get("gpu"), i["state"]) for i in instances]]):
+            draw_queue(view)
+        if changed("settings", view["settings"]):
+            draw_downloads(view)
+        if changed("watches", view["watches"]):
+            draw_watches(view)
+        draw_events()
+        draw_runs()
+
+    refresh(force=True)
+    ui.timer(3.0, while_connected(refresh))
+
+
 def build_page(local: bool = True):
     global _native_dialogs
     _native_dialogs = HAS_DISPLAY and local  # read while the widgets are built below
@@ -7104,6 +7799,8 @@ def build_page(local: bool = True):
                 tab_samples = ui.tab("Samples", icon="collections")
                 tab_maps = ui.tab("Training maps", icon="layers")
                 tab_history = ui.tab("Previous Runs", icon="history")
+                # several vast.ai instances from this computer; an instance itself has no fleet to show
+                tab_fleet = ui.tab("Fleet", icon="dns") if VAST_INSTANCE is None else None
                 ui.element("span").classes("rz-tab-sep")
                 tab_help = ui.tab("Help", icon="help_outline")
             with ui.row().classes("rz-header-tools items-center no-wrap gap-1"):
@@ -10180,6 +10877,12 @@ def build_page(local: bool = True):
             with ui.column().classes("rz-page gap-4 rz-history"):
                 build_history_tab(charts)
 
+        # ------------------------------------------------------------ Fleet
+        if tab_fleet is not None:
+            with ui.tab_panel(tab_fleet):
+                with ui.column().classes("rz-page gap-4"):
+                    build_fleet_tab(form_config)
+
         # ------------------------------------------------------------ Help
         with ui.tab_panel(tab_help):
             with ui.column().classes("rz-page"):
@@ -10300,7 +11003,8 @@ def build_page(local: bool = True):
     pill_tick()
     machine_tick()
 
-    tab_names = ("Wizard", "Train", "Dataset", "Monitor", "Samples", "Training maps", "Previous Runs", "Help")
+    tab_names = ("Wizard", "Train", "Dataset", "Monitor", "Samples", "Training maps", "Previous Runs", "Fleet",
+                 "Help")
 
     def remember_tab(e):
         name = e.value if isinstance(e.value, str) else e.value.props.get("name")
@@ -10478,6 +11182,26 @@ Red marks the one main action of a view and whatever is switched on; every other
   download button hands the file to your browser.
 - The page reconnects by itself after a dropped connection; a run does not depend on the page being open, and
   neither do the queue and the stop switch.
+
+## Fleet: several vast.ai instances
+The **Fleet** tab (on your own computer, not on an instance) shows every vast.ai instance you have running on one
+page, over ssh: it needs the `vastai` CLI with your API key and your ssh key on your vast.ai account. **Find
+instances** asks vast.ai which are running. Each instance's card has its run, progress, loss, time left, cost so far,
+the last likeness probe and a small chart.
+
+**Fleet queue**: a run added here goes to the first instance with nothing running and nothing waiting, and an
+instance that finishes takes the next one. The settings come from the Train tab, a config file or a past run; a
+local dataset folder can be sent first. **Split a race over the instances** deals a race's configurations over the
+instances, one part each; the parts are compared by best likeness under Past runs (a relay cannot be split).
+
+**Automatic downloads**: logs, probe images, sample images, training maps, the best LoRA and every LoRA each have
+their own rule: never, when the run ends, or while it runs. **Watches** raise an event when a number goes above or
+below a value (loss, a probe score, free disk, ...). **Past runs** keeps every run the fleet has seen, also after its
+instance is gone.
+
+The WebUI does the looking while it runs. Closed, run `python scripts/vast/rulz_fleet.py daemon` instead, or nothing
+moves the queue, downloads files or checks the watches. The same file is the command line for all of this
+(`rulz_fleet.py --help`). Nothing here rents, stops or destroys an instance.
 
 ## Wizard
 New to LoRA training? The **Wizard** tab sets up a character / person LoRA in six short pages: who you are training
@@ -11210,6 +11934,8 @@ if __name__ in {"__main__", "__mp_main__"}:
         on_exit_signals(park)
 
     app.on_startup(lambda: threading.Thread(target=queue_loop, name="rulz-queue", daemon=True).start())
+    if VAST_INSTANCE is None:  # this computer looks after the vast.ai instances; an instance looks after itself
+        app.on_startup(lambda: threading.Thread(target=fleet_loop, name="rulz-fleet", daemon=True).start())
 
     @ui.page("/", reconnect_timeout=PAGE_KEEP_SECONDS)
     def index(request: Request):
