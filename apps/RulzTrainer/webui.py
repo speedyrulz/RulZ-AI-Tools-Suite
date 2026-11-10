@@ -28,7 +28,7 @@ from rulztrainer.archs import get_arch
 from rulztrainer.config import (AUTOMAGIC, KEEL, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
                                 MODEL_PRESETS, ARCH_SAMPLE_LORA,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
-from rulztrainer import bodysim, facesim, history, lookfilter
+from rulztrainer import __version__, bodysim, facesim, history, lookfilter, machine
 from rulztrainer.train_queue import TrainQueue
 from rulztrainer.dataset import skipped as dataset_skipped
 from rulztrainer.pictures import to_rgb
@@ -158,6 +158,7 @@ FORM_FILE = ROOT / ".webui_form.json"  # the page's settings, so a reload or a r
 PAGE_KEEP_SECONDS = 3600.0
 QUEUE = TrainQueue()  # runs waiting for the current one (output/_queue.json); queue_loop() starts them in turn
 _start_lock = threading.RLock()  # the queue's thread and a page may start a run at the same moment
+AUTOSTOP = machine.AutoStop()  # "stop this instance when the runs are done" (a vast.ai rental), queue_loop()
 
 
 # ---------------------------------------------------------------- backend helpers
@@ -560,9 +561,13 @@ def kill_training() -> str:
         _proc.kill()
     else:
         _adopted.kill()
+    note = ""
+    if AUTOSTOP.armed:  # a kill means "let me look": the rented instance must not stop under that
+        AUTOSTOP.disarm("switched off by Kill")
+        note = " Stopping the instance when the runs are done is switched off."
     if paused:
-        return "Process killed (no final save). The queue is paused: Resume it on the Monitor to go on."
-    return "Process killed (no final save)."
+        return "Process killed (no final save). The queue is paused: Resume it on the Monitor to go on." + note
+    return "Process killed (no final save)." + note
 
 
 def validated_config(cfg: TrainConfig) -> TrainConfig:
@@ -622,6 +627,12 @@ def queue_loop() -> None:
             queue_tick()
         except Exception as e:  # noqa: BLE001  (a bad tick must not end the queue)
             print(f"[queue] {e}", flush=True)
+        try:
+            stopped = AUTOSTOP.tick(_running(), len(QUEUE.snapshot()["waiting"]))
+            if stopped is not None:
+                print(f"[autostop] {stopped[1]}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[autostop] {e}", flush=True)
         time.sleep(3.0)
 
 
@@ -698,6 +709,21 @@ def scan_dataset(cfg: TrainConfig):
 
 
 _task_progress = {"text": "", "frac": None, "active": False}
+
+
+def eta_text(seconds: float | None) -> str:
+    """ "3 h 05 min", "42 min" or "under a minute" for a time left in seconds; "-" for none."""
+    if not seconds or seconds <= 0:
+        return "-"
+    minutes = int(round(seconds / 60))
+    if minutes < 1:
+        return "under a minute"
+    if minutes < 60:
+        return f"{minutes} min"
+    return f"{minutes // 60} h {minutes % 60:02d} min"
+
+
+VAST_INSTANCE = machine.vast_instance()  # None unless this is a vast.ai instance
 
 
 def set_progress(text: str, frac=None) -> None:
@@ -1698,7 +1724,7 @@ THEME_CSS = """
   --rz-red: #E10600; --rz-red-bright: #FF3B30; --rz-red-soft: rgba(225, 6, 0, 0.14);
   --rz-bg: #0A0A0A; --rz-surface: #131313; --rz-surface-2: #1A1A1A;
   --rz-border: #262626; --rz-border-strong: #3A3A3A;
-  --rz-text: #EDEDED; --rz-muted: #A1A1AA; --rz-ok: #22C55E;
+  --rz-text: #EDEDED; --rz-muted: #B4B4BD; --rz-ok: #22C55E;
   --rz-heading: #FFFFFF; --rz-text-2: #D4D4D8; --rz-text-3: #E4E4E7; --rz-tagline: #71717A;
   --rz-header-bg: #000000; --rz-footer-bg: rgba(0, 0, 0, .94); --rz-pill-bg: #0D0D0D; --rz-hover-border: #52525B;
   --rz-scroll: #2A2A2A; --rz-tooltip-bg: #1F1F1F; --rz-menu-bg: #161616; --rz-deep: #050505; --rz-thumb-bg: #0E0E0E;
@@ -1709,7 +1735,7 @@ THEME_CSS = """
 html[data-theme="light"] {
   --rz-bg: #FFFFFF; --rz-surface: #F5F5F7; --rz-surface-2: #EBEBEF;
   --rz-border: #D9D9DE; --rz-border-strong: #C4C4CC;
-  --rz-text: #111114; --rz-muted: #5F6068; --rz-ok: #16A34A;
+  --rz-text: #111114; --rz-muted: #55565E; --rz-ok: #16A34A;
   --rz-heading: #111114; --rz-text-2: #2E2E33; --rz-text-3: #1F1F23; --rz-tagline: #6B6B73;
   --rz-header-bg: #FFFFFF; --rz-footer-bg: rgba(255, 255, 255, .94); --rz-pill-bg: #F5F5F7; --rz-hover-border: #A1A1AA;
   --rz-scroll: #C9C9CF; --rz-tooltip-bg: #FFFFFF; --rz-menu-bg: #FFFFFF; --rz-deep: #F5F5F7; --rz-thumb-bg: #E4E4E8;
@@ -1727,29 +1753,51 @@ body {
 ::-webkit-scrollbar-thumb { background: var(--rz-scroll); border-radius: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
 
-/* header: logo, status pill, tabs */
+/* header: logo and version, the tabs in their three groups, the machine chip; under it the run strip */
 .nicegui-header.rz-header {
   background: var(--rz-header-bg); border-bottom: 1px solid var(--rz-border); padding: 0; gap: 0;
   flex-direction: column; align-items: stretch;
 }
-.rz-header-row { max-width: 1440px; margin: 0 auto; padding: 12px 20px 2px; }
-.rz-logo { height: 30px; width: auto; display: block; }
-.rz-wordmark { letter-spacing: .34em; font-weight: 600; font-size: 12px; color: var(--rz-muted); padding-top: 7px; }
-.rz-tagline { color: var(--rz-tagline); font-size: 13px; padding-top: 6px; margin-left: 8px; }
-.rz-tabs { max-width: 1440px; margin: 0 auto; width: 100%; padding: 0 8px; }
-.rz-tabs .q-tab { color: var(--rz-muted); min-height: 44px; padding: 0 14px; }
-.rz-tabs .q-tab__label { font-weight: 500; font-size: 14px; }
+.rz-header-row { max-width: 1440px; margin: 0 auto; padding: 4px 20px 0; gap: 0 18px; flex-wrap: wrap; }
+.rz-brand { padding: 6px 0; flex-shrink: 0; }
+.rz-logo { height: 26px; width: auto; display: block; }
+.rz-wordmark { letter-spacing: .34em; font-weight: 600; font-size: 12px; color: var(--rz-muted); padding-top: 5px; }
+.rz-version {
+  font-size: 11px; font-weight: 600; color: var(--rz-muted); border: 1px solid var(--rz-border-strong);
+  border-radius: 999px; padding: 0 8px; margin-top: 4px; font-variant-numeric: tabular-nums;
+}
+.rz-tabs { flex: 1 1 0; min-width: 0; }
+.rz-tabs .q-tab { color: var(--rz-muted); min-height: 46px; padding: 0 10px; }
+.rz-tabs .q-tab__label { font-weight: 500; font-size: 15px; }
 .rz-tabs .q-tab__icon { font-size: 19px; }
+.rz-tabs .q-tab:hover { color: var(--rz-text); }
 .rz-tabs .q-tab--active { color: var(--rz-heading); }
+.rz-tabs .q-tab--active .q-tab__label { font-weight: 600; }
 .rz-tabs .q-tab--active .q-tab__icon { color: var(--rz-red-bright); }
 .rz-tabs .q-tab__indicator { background: var(--rz-red); height: 3px; border-radius: 3px 3px 0 0; }
-.rz-pill {
-  border: 1px solid var(--rz-border-strong); border-radius: 999px; padding: 4px 12px; font-size: 13px;
-  background: var(--rz-pill-bg); cursor: pointer; max-width: 320px;
+.rz-tab-sep { width: 1px; height: 20px; background: var(--rz-border-strong); margin: 0 6px; align-self: center; flex-shrink: 0; }
+.rz-header-tools { margin-left: auto; flex-shrink: 0; }
+.rz-chip {
+  border: 1px solid var(--rz-border-strong); border-radius: 999px; padding: 3px 12px; font-size: 13px;
+  background: var(--rz-pill-bg); cursor: pointer; color: var(--rz-text-2); white-space: nowrap;
 }
-.rz-pill:hover { border-color: var(--rz-hover-border); }
-.rz-pill-text { color: var(--rz-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.rz-dot { width: 8px; height: 8px; border-radius: 50%; background: #52525B; display: inline-block; flex-shrink: 0; }
+.rz-chip:hover { border-color: var(--rz-hover-border); }
+.rz-chip .q-icon { font-size: 16px; color: var(--rz-muted); }
+.rz-chip-text { font-variant-numeric: tabular-nums; }
+.rz-chip.warning { border-color: rgba(245, 158, 11, .6); color: var(--rz-warn-text); }
+.rz-chip.critical { border-color: rgba(255, 59, 48, .7); color: var(--rz-err-text); }
+.rz-chip.warning .q-icon, .rz-chip.critical .q-icon { color: inherit; }
+.rz-run { border-top: 1px solid var(--rz-border); background: var(--rz-surface); cursor: pointer; }
+.rz-run:hover { background: var(--rz-surface-2); }
+.rz-run-row { max-width: 1440px; margin: 0 auto; padding: 6px 20px; gap: 12px; min-height: 36px; color: var(--rz-text); }
+.rz-run-state { font-weight: 600; font-size: 14px; color: var(--rz-heading); white-space: nowrap; }
+.rz-run-job { font-size: 14px; color: var(--rz-text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 30ch; }
+.rz-run-step { font-size: 13px; color: var(--rz-muted); white-space: nowrap; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; }
+.rz-run-bar { flex: 1 1 80px; min-width: 48px; max-width: 420px; }
+.rz-run-note { margin-left: auto; font-size: 13px; color: var(--rz-text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rz-run-note.rz-warn { color: var(--rz-warn-text); font-weight: 600; }
+.rz-run-go { color: var(--rz-muted); font-size: 18px; }
+.rz-dot { width: 9px; height: 9px; border-radius: 50%; background: #52525B; display: inline-block; flex-shrink: 0; }
 .rz-dot.live { background: var(--rz-red-bright); animation: rz-pulse 1.6s infinite; }
 .rz-dot.done { background: var(--rz-ok); }
 .rz-dot.error { background: #F59E0B; }
@@ -1776,7 +1824,7 @@ body {
 }
 .rz-section > .q-expansion-item__container > .q-item .q-item__label { font-size: 16px; font-weight: 600; color: var(--rz-heading); }
 .rz-section > .q-expansion-item__container > .q-item .q-item__label--caption {
-  font-size: 13px; color: var(--rz-muted); font-weight: 400; margin-top: 2px;
+  font-size: 14px; color: var(--rz-muted); font-weight: 400; margin-top: 2px;
 }
 .rz-section .nicegui-expansion-content { padding: 2px 18px 20px; gap: 14px; }
 .rz-advanced { border-top: 1px dashed var(--rz-border); }
@@ -1786,28 +1834,50 @@ body {
 .rz-section .rz-advanced .nicegui-expansion-content { padding: 8px 0 6px; gap: 14px; }
 .rz-title { font-size: 16px; font-weight: 600; color: var(--rz-heading); }
 .rz-step-title { font-size: 20px; font-weight: 700; color: var(--rz-heading); }
-.rz-subhead { font-size: 12px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--rz-muted); margin-top: 4px; }
-.rz-hint { font-size: 13px; color: var(--rz-muted); line-height: 1.55; max-width: 980px; }
+.rz-subhead { font-size: 12.5px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; color: var(--rz-muted); margin-top: 4px; }
+.rz-hint { font-size: 14px; color: var(--rz-muted); line-height: 1.55; max-width: 980px; }
 .rz-warn { color: var(--rz-warn); }
 .rz-fields { gap: 14px 16px; align-items: center; flex-wrap: wrap; }
 
 /* form fields and buttons */
 .q-field--outlined .q-field__control { border-radius: 9px; }
+.q-field--dense .q-field__control, .q-field--dense .q-field__marginal { height: 46px; }
+.q-field--dense.q-field--auto-height .q-field__control, .q-field--dense.q-textarea .q-field__control { height: auto; min-height: 46px; }
+.q-field--dense .q-field__label { font-size: 15px; top: 13px; }
+.q-field--dense.q-field--float .q-field__label { transform: translateY(-46%) scale(.8); }
+.q-field--dense .q-field__native, .q-field--dense .q-field__input, .q-field--dense .q-field__prefix, .q-field--dense .q-field__suffix { font-size: 15px; }
+.q-field--dense.q-field--labeled .q-field__native, .q-field--dense.q-field--labeled .q-field__input { padding-top: 17px; padding-bottom: 3px; }
+.q-field--dense.q-field--auto-height.q-field--labeled .q-field__control-container { padding-top: 18px; }
+.q-field--dense.q-field--auto-height.q-field--labeled .q-field__native { padding-top: 0; padding-bottom: 2px; min-height: 26px; }
 .q-field--outlined.q-field--dark .q-field__control:before { border-color: var(--rz-border-strong); }
 .q-field__label { color: var(--rz-label); }
 .q-field--dark .q-field__native, .q-field--dark .q-field__input, .q-field--dark .q-select__dropdown-icon { color: #F4F4F5; }
 .q-field--outlined:not(.q-field--dark) .q-field__control:before { border-color: var(--rz-border-strong); }
-.q-btn { text-transform: none; font-weight: 600; letter-spacing: .01em; border-radius: 9px; }
+.q-btn { text-transform: none; font-weight: 600; letter-spacing: .01em; border-radius: 9px; font-size: 14px; }
+/* red is the one main action of a view and what is switched on: every other button is plain text with a red icon */
+/* (Quasar's color classes are !important in a later cascade layer: their variable is set instead) */
+.q-btn--flat.text-primary, .q-btn--outline.text-primary { --q-primary: var(--rz-text); }
+.q-btn--flat.text-primary .q-icon, .q-btn--outline.text-primary .q-icon { color: var(--rz-red-bright); }
+.q-btn--flat.text-primary:hover, .q-btn--outline.text-primary:hover { --q-primary: var(--rz-heading); }
+.q-btn--outline.text-primary::before { border-color: var(--rz-border-strong); }
+.q-btn--outline.text-primary:hover::before { border-color: var(--rz-red); }
+.q-btn.rz-danger, .q-btn.rz-danger .q-icon { color: #FF453A; }
+html[data-theme="light"] .q-btn.rz-danger, html[data-theme="light"] .q-btn.rz-danger .q-icon { color: #C8000B; }
+.q-btn.disabled { opacity: .38 !important; }
+.q-table th { font-size: 13px; color: var(--rz-muted); font-weight: 600; }
+.q-table td { font-size: 14px; }
+.q-table.text-xs td { font-size: 13px; }
 .q-toggle__label, .q-checkbox__label, .q-radio__label { color: var(--rz-text-3); }
-.q-tooltip { background: var(--rz-tooltip-bg); border: 1px solid var(--rz-border-strong); color: var(--rz-text); font-size: 13px; max-width: 440px; line-height: 1.45; }
+.q-tooltip { background: var(--rz-tooltip-bg); border: 1px solid var(--rz-border-strong); color: var(--rz-text); font-size: 14px; max-width: 460px; line-height: 1.5; padding: 8px 12px; }
 .q-menu { background: var(--rz-menu-bg); border: 1px solid var(--rz-border-strong); }
 
 /* Train tab: the section list on the left picks the one section shown on the right */
-.rz-nav { position: sticky; top: 108px; width: 230px; flex-shrink: 0; gap: 1px; }
-.rz-nav-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .1em; color: var(--rz-muted); padding: 14px 12px 6px; }
+.rz-nav { position: sticky; top: 108px; width: 236px; flex-shrink: 0; gap: 1px; }
+@media (max-width: 1400px) { .rz-nav { top: 152px; } }
+.rz-nav-title { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .1em; color: var(--rz-muted); padding: 14px 12px 6px; }
 .rz-nav-title:first-child { padding-top: 2px; }
 .rz-adv-hidden { display: none !important; }
-.rz-nav-btn { width: 100%; color: var(--rz-text-2); font-weight: 500; min-height: 36px; border-left: 3px solid transparent; border-radius: 0 9px 9px 0; }
+.rz-nav-btn { width: 100%; color: var(--rz-text-2); font-weight: 500; min-height: 38px; font-size: 14.5px; border-left: 3px solid transparent; border-radius: 0 9px 9px 0; }
 .rz-nav-btn .q-btn__content { justify-content: flex-start; flex-wrap: nowrap; text-align: left; }
 .rz-nav-btn .q-icon { color: var(--rz-muted); font-size: 18px; }
 .rz-nav-btn.rz-on { background: var(--rz-red-soft); color: var(--rz-heading); border-left-color: var(--rz-red); }
@@ -1816,7 +1886,7 @@ body {
 .rz-pane-head { padding-bottom: 16px; border-bottom: 1px solid var(--rz-border); }
 .rz-pane-icon { color: var(--rz-red-bright); background: var(--rz-red-soft); border-radius: 11px; font-size: 22px; width: 42px; height: 42px; flex-shrink: 0; }
 .rz-pane-title { font-size: 20px; font-weight: 700; color: var(--rz-heading); line-height: 1.25; }
-.rz-pane-caption { font-size: 13px; color: var(--rz-muted); }
+.rz-pane-caption { font-size: 14px; color: var(--rz-muted); }
 .rz-pane-foot { border-top: 1px solid var(--rz-border); padding-top: 10px; margin-top: 4px; }
 .q-btn.rz-pane-link { color: var(--rz-text-2); font-weight: 500; }
 .q-btn.rz-pane-link .q-icon { color: var(--rz-red-bright); }
@@ -1825,7 +1895,7 @@ body {
 /* a setting and its description side by side; the setting fills its column */
 .rz-item { display: grid; grid-template-columns: minmax(0, 300px) minmax(0, 1fr); gap: 4px 28px; width: 100%; align-items: start; }
 .rz-pane .rz-item > .q-field, .rz-pane .rz-item > .rz-path { width: 100%; max-width: 100%; }
-.rz-desc { font-size: 13px; color: var(--rz-muted); line-height: 1.5; padding-top: 7px; max-width: 760px; }
+.rz-desc { font-size: 14px; color: var(--rz-muted); line-height: 1.5; padding-top: 9px; max-width: 760px; }
 .rz-desc.rz-clamp { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; cursor: pointer; }
 .rz-desc.rz-clamp:hover { color: var(--rz-text-2); }
 .rz-desc.rz-clamp.rz-open { display: block; }
@@ -1837,15 +1907,26 @@ body {
 }
 .rz-footer-row { max-width: 1440px; margin: 0 auto; padding: 10px 20px; }
 .rz-status-msg {
-  font-size: 13px; color: var(--rz-text-2); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  font-size: 14px; color: var(--rz-text-2); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
   overflow: hidden;
 }
 
 /* Monitor */
+.rz-views { background: var(--rz-surface); border: 1px solid var(--rz-border); border-radius: 12px; padding: 4px; gap: 4px; }
+.rz-views .q-btn { border-radius: 8px; padding: 6px 20px; font-size: 14.5px; font-weight: 500; color: var(--rz-text-2); min-height: 38px; }
+.rz-views .q-btn .q-icon { color: var(--rz-muted); font-size: 18px; }
+.rz-views .q-btn.rz-on { background: var(--rz-red-soft); color: var(--rz-heading); font-weight: 600; box-shadow: inset 0 0 0 1px var(--rz-red); }
+.rz-views .q-btn.rz-on .q-icon { color: var(--rz-red-bright); }
+.rz-machine { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; width: 100%; }
+.rz-machine-gpus, .rz-machine-sys { display: contents; }
+.rz-groups { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, var(--rz-group-min, 336px)), 1fr)); gap: 18px 16px; width: 100%; }
+.rz-group { min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+.rz-groups .rz-gallery { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+.rz-log-tall { height: min(68vh, 760px); }
 .rz-tile { background: var(--rz-surface); border: 1px solid var(--rz-border); border-radius: 12px; padding: 12px 16px; min-width: 150px; flex: 1 1 150px; }
-.rz-tile-label { font-size: 11px; color: var(--rz-muted); text-transform: uppercase; letter-spacing: .08em; }
+.rz-tile-label { font-size: 12px; color: var(--rz-muted); text-transform: uppercase; letter-spacing: .08em; }
 .rz-tile-value { font-size: 20px; font-weight: 600; color: var(--rz-heading); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
-.rz-tile-sub { font-size: 12px; color: var(--rz-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+.rz-tile-sub { font-size: 13px; color: var(--rz-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
 .rz-banner { border-radius: 10px; padding: 10px 14px; font-size: 14px; width: 100%; }
 .rz-banner.error { background: rgba(225, 6, 0, .12); border: 1px solid rgba(255, 59, 48, .45); color: var(--rz-err-text); }
 .rz-banner.warning { background: rgba(245, 158, 11, .10); border: 1px solid rgba(245, 158, 11, .40); color: var(--rz-warn-text); }
@@ -1863,8 +1944,8 @@ body {
 .rz-shot { background: var(--rz-surface-2); border: 1px solid var(--rz-border); border-radius: 10px; overflow: hidden;
   min-width: 0; }
 .rz-shot:hover { border-color: var(--rz-border-strong); }
-.rz-shot-title { font-size: 12px; font-weight: 600; color: var(--rz-text); padding: 6px 8px 0; overflow-wrap: anywhere; }
-.rz-shot-sub { font-size: 11px; color: var(--rz-muted); padding: 2px 8px 7px; line-height: 1.4; }
+.rz-shot-title { font-size: 13px; font-weight: 600; color: var(--rz-text); padding: 6px 8px 0; overflow-wrap: anywhere; }
+.rz-shot-sub { font-size: 12px; color: var(--rz-muted); padding: 2px 8px 7px; line-height: 1.4; }
 .rz-shot-title:last-child { padding-bottom: 7px; }
 .rz-step-pick { width: 11rem; }
 /* "label value" chips: a probe's or a sample step's scores */
@@ -1890,7 +1971,7 @@ body {
 .rz-ds-thumbs { display: grid; grid-template-columns: repeat(4, 1fr); gap: 2px; background: var(--rz-thumb-bg); }
 .rz-ds-empty { display: flex; align-items: center; justify-content: center; aspect-ratio: 4 / 1;
   color: var(--rz-muted); font-size: 13px; background: var(--rz-thumb-bg); }
-.rz-mono { font-family: ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace; font-size: 12px; color: var(--rz-text-2); }
+.rz-mono { font-family: ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace; font-size: 13px; line-height: 1.5; color: var(--rz-text-2); }
 
 /* Wizard */
 .rz-stepper { background: transparent; box-shadow: none; }
@@ -1907,7 +1988,7 @@ body {
   padding: 18px 0; border-bottom: 1px solid var(--rz-border); align-items: start;
 }
 .rz-setting-title { font-weight: 600; font-size: 15px; color: var(--rz-heading); }
-.rz-rec { font-size: 13px; color: var(--rz-rec); margin-top: 2px; }
+.rz-rec { font-size: 14px; color: var(--rz-rec); margin-top: 2px; }
 .rz-rec .q-icon { color: var(--rz-red-bright); font-size: 17px; }
 .rz-rec.ok { color: var(--rz-ok-text); }
 .rz-rec.ok .q-icon { color: var(--rz-ok); }
@@ -1966,7 +2047,18 @@ body {
   .rz-footer .q-btn.rz-icon-only .q-btn__content > .block { font-size: 0; max-width: 0; overflow: hidden; }
   .rz-footer .q-btn.rz-icon-only .q-icon { margin-right: 0; }
 }
+@media (max-width: 1560px) { .rz-wordmark { display: none; } }
+@media (max-width: 1400px) { .rz-tabs { order: 3; flex-basis: 100%; margin: 0 -8px; } .rz-wordmark { display: block; } }
 @media (max-width: 760px) {
+  .rz-wordmark { display: none; }
+  .rz-views { flex-wrap: nowrap; }
+  .rz-views .q-btn .q-icon { display: none; }
+  .rz-run-row { padding-left: 12px; padding-right: 12px; gap: 8px; }
+  .rz-run-job, .rz-run-go { display: none; }
+  .rz-run-bar { min-width: 32px; }
+  .rz-views { width: 100%; }
+  .rz-views .q-btn { flex: 1 1 auto; padding: 6px 6px; font-size: 14px; white-space: nowrap; }
+  .rz-chip { padding: 3px 9px; }
   .rz-setting, .rz-item { grid-template-columns: 1fr; }
   .rz-desc { padding-top: 0; }
   .rz-pane { padding: 14px 14px 10px; }
@@ -2268,6 +2360,8 @@ def inline_descriptions(root) -> None:
         item.bind_visibility_from(control, "visible")
 
 
+MONITOR_VIEWS = {"overview": ("Overview", "dashboard"), "images": ("Images", "photo_library"),
+                 "details": ("Details", "query_stats"), "log": ("Log & files", "terminal")}
 TRAIN_EXP_SECTIONS = {"LoRA Isolation": "isolation", "Configuration race": "race", "Seed soup": None,
                       "Post-hoc EMA": None, "Probe noise check": None}  # title: the switch that keeps it shown
 TRAIN_EXP_KEYS = ("dora", "likeness_lr_control", "resolution_step_up")  # experimental rows outside an Advanced panel
@@ -2303,6 +2397,28 @@ class TrainAdvanced:
         self.sections.set_hidden(set() if self.on else {
             i for i, (_, title, _, _) in enumerate(self.sections.items)
             if title in TRAIN_EXP_SECTIONS and not self.is_on(TRAIN_EXP_SECTIONS[title])})
+
+
+class ViewSwitch:
+    """A row of buttons that shows one view of a tab at a time (the Monitor's): {key: (label, icon)}. on_change(key)
+    is called when another is picked."""
+
+    def __init__(self, views: dict, value: str):
+        self.value, self.on_change, self.buttons = value, None, {}
+        with ui.row().classes("rz-views items-center"):
+            for key, (label, icon) in views.items():
+                self.buttons[key] = ui.button(label, icon=icon, on_click=lambda _, k=key: self.pick(k), color=None) \
+                    .props("flat no-caps")
+        self.buttons[value].classes(add="rz-on")
+
+    def pick(self, key: str) -> None:
+        if key == self.value or key not in self.buttons:
+            return
+        self.buttons[self.value].classes(remove="rz-on")
+        self.buttons[key].classes(add="rz-on")
+        self.value = key
+        if self.on_change is not None:
+            self.on_change(key)
 
 
 def advanced(title: str = "Advanced options"):
@@ -3122,19 +3238,26 @@ class StepGallery:
         groups: dict[str, list] = {}
         for item in items:
             groups.setdefault(item[0], []).append(item)
+        named = any(groups)
+        widest = max((len(m) for m in groups.values()), default=1)
         with self.grid:
-            for group, members in groups.items():
-                if group:
-                    ui.label(group).classes("rz-subhead w-full")
-                with ui.element("div").classes("rz-gallery"):
-                    for _, q, title, scores in members:
-                        with ui.column().classes("rz-shot gap-0"):
-                            ui.image(image_url(q)).props("ratio=1 fit=contain") \
-                                .classes("w-full rz-imgbg cursor-pointer") \
-                                .on("click", lambda _, q=q: self.viewer(Path(q), view))
-                            ui.label(title).classes("rz-shot-title")
-                            if scores:
-                                ui.label(scores).classes("rz-shot-sub")
+            # named groups (a race: one per probe or prompt, its configurations side by side) share the rows, each
+            # as wide as up to four of its pictures; one unnamed group fills the width
+            with ui.element("div").classes("rz-groups" if named else "w-full") \
+                    .style(f"--rz-group-min: {min(widest, 4) * 168}px" if named else ""):
+                for group, members in groups.items():
+                    with ui.element("div").classes("rz-group" if named else "w-full"):
+                        if group:
+                            ui.label(group).classes("rz-subhead w-full")
+                        with ui.element("div").classes("rz-gallery"):
+                            for _, q, title, scores in members:
+                                with ui.column().classes("rz-shot gap-0"):
+                                    ui.image(image_url(q)).props("ratio=1 fit=contain") \
+                                        .classes("w-full rz-imgbg cursor-pointer") \
+                                        .on("click", lambda _, q=q: self.viewer(Path(q), view))
+                                    ui.label(title).classes("rz-shot-title")
+                                    if scores:
+                                        ui.label(scores).classes("rz-shot-sub")
 
 
 def build_dataset_tab(f: Form):
@@ -6965,33 +7088,48 @@ def build_page(local: bool = True):
             recolor_chart(chart, light)
 
     with ui.header().classes("rz-header"):
-        with ui.row().classes("rz-header-row w-full items-center no-wrap gap-2"):
-            ui.element("img").props('src="/assets/logo_dark.png" alt="Rulz"').classes("rz-logo rz-dark-only")
-            ui.element("img").props('src="/assets/logo.png" alt="Rulz"').classes("rz-logo rz-light-only")
-            ui.label("TRAINER").classes("rz-wordmark")
-            ui.label("LoRA training for MOSS-Image, Bria FIBO 2.0, Krea 2, Qwen-Image 2.1, FLUX 3 Klein, FLUX.2 Klein, "
-                     "Ideogram 4, MiniMax H3 and P-H3-Image") \
-                .classes("rz-tagline gt-sm")
-            ui.space()
-            # sun in the dark look (switch to light), moon in the light look; CSS picks the icon, so it is right
-            # from the first paint
-            with ui.button(on_click=lambda: set_look(not look["light"]), color=None) \
-                    .props("flat round dense").classes("rz-theme-btn") as theme_btn:
-                ui.icon("light_mode").classes("rz-dark-only")
-                ui.icon("dark_mode").classes("rz-light-only")
-            theme_btn.tooltip("Switch between the dark and the light look")
-            with ui.row().classes("rz-pill items-center gap-2 no-wrap") as pill:
+        with ui.row().classes("rz-header-row w-full items-center"):
+            with ui.row().classes("rz-brand items-center no-wrap gap-2"):
+                ui.element("img").props('src="/assets/logo_dark.png" alt="Rulz"').classes("rz-logo rz-dark-only")
+                ui.element("img").props('src="/assets/logo.png" alt="Rulz"').classes("rz-logo rz-light-only")
+                ui.label("TRAINER").classes("rz-wordmark")
+                ui.label(f"v{__version__}").classes("rz-version")
+            # the tabs in the order of the work: set a run up, watch it, look back. Thin rules part the three groups.
+            with ui.tabs().props("inline-label no-caps align=left dense outside-arrows mobile-arrows")                     .classes("rz-tabs") as tabs:
+                tab_wizard = ui.tab("Wizard", icon="auto_awesome")
+                tab_train = ui.tab("Train", icon="tune")
+                tab_dataset = ui.tab("Dataset", icon="photo_library")
+                ui.element("span").classes("rz-tab-sep")
+                tab_monitor = ui.tab("Monitor", icon="show_chart")
+                tab_samples = ui.tab("Samples", icon="collections")
+                tab_maps = ui.tab("Training maps", icon="layers")
+                tab_history = ui.tab("Previous Runs", icon="history")
+                ui.element("span").classes("rz-tab-sep")
+                tab_help = ui.tab("Help", icon="help_outline")
+            with ui.row().classes("rz-header-tools items-center no-wrap gap-1"):
+                # the machine: its free disk space, and which vast.ai instance this is on a rental
+                with ui.row().classes("rz-chip items-center gap-2 no-wrap") as machine_chip:
+                    machine_icon = ui.icon("storage")
+                    machine_text = ui.label("").classes("rz-chip-text")
+                    machine_tip = ui.tooltip("")
+                # sun in the dark look (switch to light), moon in the light look; CSS picks the icon, so it is right
+                # from the first paint
+                with ui.button(on_click=lambda: set_look(not look["light"]), color=None)                         .props("flat round dense").classes("rz-theme-btn") as theme_btn:
+                    ui.icon("light_mode").classes("rz-dark-only")
+                    ui.icon("dark_mode").classes("rz-light-only")
+                theme_btn.tooltip("Switch between the dark and the light look")
+        # the run strip: what the trainer is doing, on every tab. A click opens the Monitor.
+        with ui.element("div").classes("rz-run") as run_strip:
+            with ui.row().classes("rz-run-row items-center no-wrap"):
                 pill_dot = ui.element("span").classes("rz-dot")
-                pill_text = ui.label("Idle").classes("rz-pill-text")
-        with ui.tabs().props("inline-label no-caps align=left dense").classes("rz-tabs") as tabs:
-            tab_wizard = ui.tab("Wizard", icon="auto_awesome")
-            tab_train = ui.tab("Train", icon="tune")
-            tab_dataset = ui.tab("Dataset", icon="photo_library")
-            tab_monitor = ui.tab("Monitor", icon="show_chart")
-            tab_samples = ui.tab("Samples", icon="collections")
-            tab_maps = ui.tab("Training maps", icon="layers")
-            tab_history = ui.tab("Previous Runs", icon="history")
-            tab_help = ui.tab("Help", icon="help_outline")
+                run_state = ui.label("Idle").classes("rz-run-state")
+                run_job = ui.label("").classes("rz-run-job")
+                run_step = ui.label("").classes("rz-run-step")
+                run_bar = ui.linear_progress(value=0, show_value=False, size="6px").props("rounded")                     .classes("rz-run-bar")
+                run_eta = ui.label("").classes("rz-run-step")
+                run_note = ui.label("").classes("rz-run-note")
+                ui.icon("chevron_right").classes("rz-run-go")
+        run_strip.tooltip("Open the Monitor")
 
     def goto(name: str):
         tabs.value = name
@@ -7039,8 +7177,8 @@ def build_page(local: bool = True):
             tabs.value = tab_monitor
         return started
 
-    pill.on("click", lambda: goto("Monitor"))
-    pill.tooltip("Open the Monitor")
+    run_strip.on("click", lambda: goto("Monitor"))
+    machine_chip.on("click", lambda: goto("Monitor"))
 
     with ui.tab_panels(tabs, value=tab_monitor if job_running else tab_wizard).classes("w-full rz-panels") \
             .props("keep-alive"):
@@ -9315,10 +9453,19 @@ def build_page(local: bool = True):
                     .props("rounded")
                 error_box = ui.label("").classes("rz-banner error")
                 error_box.visible = False
-                gpu_box = ui.row().classes("w-full gap-3")
+                disk_box = ui.label("").classes("rz-banner warning")
+                disk_box.visible = False
+                bucket_box = ui.label("").classes("rz-banner info")
+                bucket_box.visible = False
+                # one part of the run at a time instead of one long page
+                monitor_view = ViewSwitch(MONITOR_VIEWS, "overview")
+                with ui.element("div").classes("rz-machine") as machine_row:
+                    gpu_box = ui.element("div").classes("rz-machine-gpus")
+                    sys_box = ui.element("div").classes("rz-machine-sys")
                 gpu_widgets: list[dict] = []
+                sys_widgets: dict = {}
                 with section("Queue", "Runs that start one after another when the current one is done",
-                             "queue") as queue_exp:
+                             "queue", open_=False) as queue_exp:
                     with ui.row().classes("w-full items-center gap-2"):
                         queue_state = ui.label("").classes("text-sm font-medium")
                         ui.space()
@@ -9335,6 +9482,44 @@ def build_page(local: bool = True):
                          "running; a WebUI restarted with runs waiting and nothing running pauses the queue until you "
                          "Resume it.")
                     queue_list = ui.column().classes("w-full gap-1")
+                    autostop_switch = None
+                    if VAST_INSTANCE is not None and VAST_INSTANCE["can_stop"]:
+                        # a rental bills while it sits idle: let it stop itself after the last run
+                        def set_autostop(e):
+                            if bool(e.value) != AUTOSTOP.armed:
+                                AUTOSTOP.arm(_running()) if e.value else AUTOSTOP.disarm()
+
+                        async def stop_now():
+                            with ui.dialog() as dlg, ui.card().classes("w-[30rem] max-w-full"):
+                                ui.label(f"Stop vast.ai instance {VAST_INSTANCE['id']} now?").classes("rz-setting-title")
+                                ui.label("A running job ends without a final save, and this page goes away with the "
+                                         "instance. The disk is kept (its storage charge goes on) and Start on "
+                                         "vast.ai brings the instance back with everything on it.").classes("rz-hint")
+                                with ui.row().classes("w-full justify-end gap-2"):
+                                    ui.button("Keep it running", on_click=lambda: dlg.submit(False)).props("flat")
+                                    ui.button("Stop the instance", icon="power_settings_new", color="negative",
+                                              on_click=lambda: dlg.submit(True)).props("unelevated")
+                            go = await dlg
+                            dlg.delete()
+                            if go:
+                                AUTOSTOP.disarm("stopped from the Monitor")
+                                ok, message = await run.io_bound(machine.stop_instance)
+                                ui.notify(message, type="positive" if ok else "negative", timeout=0 if not ok else 8000)
+
+                        with ui.column().classes("rz-intro w-full gap-2"):
+                            with ui.row().classes("w-full items-center gap-3"):
+                                autostop_switch = ui.switch("Stop this vast.ai instance when the runs are done",
+                                                            value=AUTOSTOP.armed, on_change=set_autostop)
+                                ui.space()
+                                ui.button("Stop the instance now", icon="power_settings_new", on_click=stop_now,
+                                          color=None).props("flat dense no-caps").classes("rz-danger")
+                            hint(
+                                f"{int(machine.STOP_GRACE_SECONDS // 60)} minutes after the last run ends (finished, "
+                                "stopped or failed) with nothing left in the queue, the instance stops itself: the "
+                                "GPU's billing ends, the disk and its storage charge stay, and Start on vast.ai brings "
+                                "it back with every file. Runs waiting in a paused queue keep it running, and so does "
+                                "starting a run in those minutes; Kill switches this off. It needs a run to have run "
+                                "since you switched it on.")
                 near_dup_label = ui.label("").classes("w-full text-sm text-orange-8")
                 near_dup_label.visible = False
                 with section("Configuration race", "Smoothed probe score per configuration; the lowest leaves after "
@@ -9413,11 +9598,13 @@ def build_page(local: bool = True):
                         _axis("step", min="dataMin"), _axis("likeness % (normalized)", min=0, max=100),
                         *probe_chart_series([], []))).classes("w-full h-60")
                     charts.append(probe_chart)
-                    ui.label("Probe images").classes("rz-subhead w-full")
-                    probe_gallery = StepGallery("No probe images yet.", show_full)
                 probe_exp.visible = False
+                with section("Probe images", "What the likeness probes rendered at each probe step, with their scores; "
+                             "click an image to see it full size", "face_retouching_natural") as probe_img_exp:
+                    probe_gallery = StepGallery("No probe images yet.", show_full)
+                probe_img_exp.visible = False
                 with section("Sample images", "Your sample prompts at each sample step; click an image to see it full "
-                             "size", "image"):
+                             "size", "image") as sample_exp:
                     sample_gallery = StepGallery("No samples yet. They appear here every 'Sample every' steps.",
                                                  show_full)
                 with section("Identity similarity", "How much the samples look like the person, per sample prompt",
@@ -9429,7 +9616,7 @@ def build_page(local: bool = True):
                         .classes("w-full h-60")
                     charts.append(face_chart)
                 face_exp.visible = False
-                with section("Loss", "Raw and smoothed training loss", "show_chart"):
+                with section("Loss", "Raw and smoothed training loss", "show_chart") as loss_exp:
                     with ui.row().classes("w-full items-center gap-4"):
                         ui.space()
                         ui.label("Smoothing").classes("rz-hint")
@@ -9494,10 +9681,46 @@ def build_page(local: bool = True):
                     ], rows=[], row_key="path", pagination=15).props("flat dense").classes("w-full text-xs")
                 rw_exp.visible = False
                 rw_state = {"sig": None}
-                with section("Log and saved files", "train.log and downloads: LoRAs, logs and settings, probe and sample images", "terminal"):
+                with section("Saved files", "Download the run's LoRAs, logs and settings, probe and sample images",
+                             "download") as files_exp:
                     job_files = JobFiles()
                     saved_label = ui.label("").classes("rz-mono whitespace-pre-wrap")
-                    log_view = ui.log(max_lines=600).classes("w-full h-80 rz-log rz-mono")
+                with section("Log", "train.log as it is written", "terminal") as log_exp:
+                    log_view = ui.log(max_lines=600).classes("w-full rz-log rz-log-tall rz-mono")
+                # the views: each section into its view's column, in this order
+                view_boxes: dict = {}
+                for name, members, empty in (
+                        ("overview", (machine_row, queue_exp, near_dup_label, race_exp, probe_exp, loss_exp), ""),
+                        ("images", (probe_img_exp, sample_exp), ""),
+                        ("details", (face_exp, grad_card, lw_exp, rw_exp),
+                         "Nothing here for this run yet. This view fills in with what the run has switched on: the "
+                         "samples' identity similarity, the gradient norm, the per-image loss watch and the region "
+                         "watch."),
+                        ("log", (files_exp, log_exp), "")):
+                    with ui.column().classes("w-full gap-4 rz-view") as box:
+                        note = hint(empty)
+                    note.visible = False
+                    for member in members:
+                        member.move(box)
+                    box.visible = name == "overview"
+                    view_boxes[name] = (box, members, note if empty else None)
+
+                def show_view(name: str) -> None:
+                    for key, (box, _, _) in view_boxes.items():
+                        box.visible = key == name
+                    ui.run_javascript(f"try {{ localStorage.setItem('rulz.monitor', {json.dumps(name)}) }} catch (e) {{}}")
+
+                monitor_view.on_change = show_view
+
+                async def restore_view():
+                    try:
+                        name = await ui.run_javascript("localStorage.getItem('rulz.monitor')", timeout=3)
+                    except Exception:  # noqa: BLE001  (storage blocked, slow client)
+                        return
+                    if name in MONITOR_VIEWS:
+                        monitor_view.pick(name)
+
+                ui.timer(0.05, restore_view, once=True)
             probe_view = {"probes": [], "names": []}
 
             def draw_probe_chart() -> None:
@@ -9522,6 +9745,12 @@ def build_page(local: bool = True):
                     (" · paused" if q["paused"] else "")
                 queue_note.text = (f"Queue: {n} waiting" + (", paused" if q["paused"] else "")) if n else ""
                 queue_pause.text = "Resume queue" if q["paused"] else "Pause queue"
+                queue_exp.props["caption"] = (f"{n} waiting" + (", paused" if q["paused"] else "")) if n else \
+                    "Nothing queued. Runs added with Add to queue start one after another"
+                queue_exp.update()
+                if n and queue_shown.get("n") != n:
+                    queue_exp.value = True
+                queue_shown["n"] = n
                 queue_pause.props(f"icon={'play_arrow' if q['paused'] else 'pause'}")
                 queue_list.clear()
                 with queue_list:
@@ -9548,7 +9777,16 @@ def build_page(local: bool = True):
                         text = (f"started {when}" if r.get("started") else f"could not start: {r.get('error')}")
                         hint(f"{r.get('job')}: {text}", warn=bool(r.get("error")))
 
+            def autostop_draw():
+                if autostop_switch is None:
+                    return
+                if autostop_switch.value != AUTOSTOP.armed:
+                    autostop_switch.value = AUTOSTOP.armed
+                if AUTOSTOP.seconds_left() is not None:  # counting down: the switch that cancels it in view
+                    queue_exp.value = True
+
             ui.timer(2.0, while_connected(queue_draw))
+            ui.timer(2.0, while_connected(autostop_draw))
             log_state = {"job": None, "n": 0, "console_shown": False}
 
             def show(key: str, value: str, sub: str = ""):
@@ -9580,6 +9818,62 @@ def build_page(local: bool = True):
                     wdg["vram"][1].text = f"{st['used'] / 1024:.1f} / {st['total'] / 1024:.1f} GB"
                     wdg["util"][0].value = st["util"] / 100
                     wdg["util"][1].text = f"{st['util']}%"
+
+            def bar_tile(title: str):
+                """A machine tile with one bar: (title label, bar, text)."""
+                with ui.column().classes("rz-tile rz-gpu gap-1"):
+                    name = ui.label(title).classes("text-sm font-semibold rz-strong")
+                    with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                        bar = ui.linear_progress(value=0, show_value=False, size="6px", color="grey-5") \
+                            .props("rounded").classes("flex-1")
+                        text = ui.label("").classes("rz-tile-sub text-right")
+                return name, bar, text
+
+            machine_state = {"at": 0.0}
+
+            def update_machine():
+                """Disk and memory beside the GPUs (every 10 s), the low-disk warning and the model download."""
+                if time.time() - machine_state["at"] < 10:
+                    return
+                machine_state["at"] = time.time()
+                rows = machine.disks({"runs": ROOT / (w["output_dir"].value or "output"), "models": ROOT / "models"})
+                mem = machine.memory()
+                keys = [f"disk{i}" for i in range(len(rows))] + (["mem"] if mem else [])
+                if list(sys_widgets) != keys:
+                    sys_box.clear()
+                    sys_widgets.clear()
+                    with sys_box:
+                        for key in keys:
+                            sys_widgets[key] = bar_tile("")
+                for i, r in enumerate(rows):
+                    name, bar, text = sys_widgets[f"disk{i}"]
+                    name.text = f"Disk · {r['label']}"
+                    bar.value = r["used"] / max(1e-9, r["total"])
+                    bar.props(f"color={ {'ok': 'grey-5', 'warning': 'warning', 'critical': 'negative'}[r['level']] }")
+                    text.text = f"{r['free']:.0f} GB free of {r['total']:.0f}"
+                if mem:
+                    name, bar, text = sys_widgets["mem"]
+                    name.text = "Memory"
+                    bar.value = mem["used"] / max(1e-9, mem["total"])
+                    text.text = f"{mem['used']:.0f} / {mem['total']:.0f} GB"
+                low = [r for r in rows if r["level"] != "ok"]
+                disk_box.visible = bool(low)
+                if low:
+                    worst = min(low, key=lambda r: r["free"])
+                    disk_box.classes(replace=f"rz-banner {'error' if worst['level'] == 'critical' else 'warning'}")
+                    disk_box.text = (f"Only {worst['free']:.1f} GB free on the drive with the {worst['label']} "
+                                     f"({worst['path']}). A save that does not fit ends the run: download and remove "
+                                     "old runs (Previous Runs), or keep fewer checkpoints (Train > Saving & samples).")
+                dl = machine.bucket_download(ROOT / "models")
+                bucket_box.visible = bool(dl) and dl["state"] != "done"
+                if dl and dl["state"] == "running":
+                    bucket_box.text = (f"Your model files are still downloading into models/bucket ({dl['gb']:.1f} GB "
+                                       "so far). A run that needs a file that is not there yet fails at loading; the "
+                                       "log is models/bucket_download.log.")
+                elif dl and dl["state"] == "failed":
+                    bucket_box.classes(replace="rz-banner warning")
+                    bucket_box.text = ("The model download did not finish (models/bucket_download.log). Run it again "
+                                       "in a terminal: bash scripts/vast/download_models.sh")
 
             def update_log():
                 if _job_dir is None:
@@ -9639,8 +9933,16 @@ def build_page(local: bool = True):
                     parts.append(f"{bad} not finite")
                 grad_label.text = " · ".join(parts)
 
+            def view_notes():
+                """A view whose sections are all hidden says so instead of showing an empty page."""
+                for _, members, note in view_boxes.values():
+                    if note is not None:
+                        note.visible = not any(m.visible for m in members)
+
             def poll():
                 update_gpus()
+                update_machine()
+                view_notes()
                 st = read_status()
                 running = _running()
                 if st is None:
@@ -9660,10 +9962,11 @@ def build_page(local: bool = True):
                 if loss is not None:
                     show("loss", f"{loss:.4f}", f"average {st.get('avg_loss') or 0:.4f}")
                 show("lr", f"{st['lr']:.2e}" if st.get("lr") is not None else "-")
-                show("eta", f"{eta / 60:.1f} min" if eta and running else "-")
+                show("eta", eta_text(eta) if running else "-")
                 error_box.text = f"Error: {st['error']}" if st.get("error") else ""
                 error_box.visible = bool(st.get("error"))
                 job_bar.value = (step / total) if total else 0
+                job_bar.props(f"color={'primary' if running else 'warning' if st.get('error') else 'positive' if st.get('done') else 'grey-6'}")
                 losses = st.get("losses") or []
                 if losses:
                     start = max(0, step - len(losses))
@@ -9851,7 +10154,9 @@ def build_page(local: bool = True):
                         chips.append(("Early stop", "stopped", True))
                     stat_chips(probe_chips, chips, probe_sig)
                     rnames = (rc or {}).get("names") or []
-                    probe_gallery.set(probe_steps(probes, rnames))
+                    by_step = probe_steps(probes, rnames)
+                    probe_img_exp.visible = bool(by_step)
+                    probe_gallery.set(by_step)
                 sample_gallery.set(sample_steps(st.get("samples") or [], fscores, (rc or {}).get("names") or []))
                 job_files.show(_job_dir)
                 states = list(st.get("states") or [])
@@ -9898,12 +10203,14 @@ def build_page(local: bool = True):
                 ui.button("Add to queue", icon="playlist_add", on_click=queue_job, color=None).props("outline") \
                     .classes("rz-icon-only") \
                     .tooltip("Start this run after the current one (and any queued before it) is done")
-                ui.button("Start training", icon="play_arrow", on_click=start_job).props("unelevated")
-                ui.button("Stop", icon="stop", on_click=lambda: setattr(status_msg, "text", stop_training()),
-                          color=None) \
+                start_btn = ui.button("Start training", icon="play_arrow", on_click=start_job).props("unelevated")
+                stop_btn = ui.button("Stop", icon="stop",
+                                     on_click=lambda: setattr(status_msg, "text", stop_training()), color=None) \
                     .props("outline").tooltip("Stop after the current step and save the LoRA")
-                ui.button("Kill", icon="dangerous", on_click=lambda: setattr(status_msg, "text", kill_training())) \
-                    .props("flat color=negative").classes("rz-icon-only")                     .tooltip("End the process now, without a final save")
+                kill_btn = ui.button("Kill", icon="dangerous",
+                                     on_click=lambda: setattr(status_msg, "text", kill_training())) \
+                    .props("flat color=negative").classes("rz-icon-only rz-danger") \
+                    .tooltip("End the process now, without a final save")
     footer.bind_value_from(tabs, "value", lambda t: t in ("Train", "Monitor", tab_train, tab_monitor))
 
     def task_tick():
@@ -9916,26 +10223,84 @@ def build_page(local: bool = True):
         task_bar.visible = frac is not None
         task_bar.value = frac or 0
 
+    strip_shown = {"title": "RulzTrainer", "running": None}
+
     def pill_tick():
+        """The run strip (every tab), the action bar's buttons and the browser tab's title."""
         st = read_status() or {}
         running = _running()
         state = "live" if running else "error" if st.get("error") else "done" if st.get("done") else ""
         pill_dot.classes(replace=f"rz-dot {state}")
+        job = _job_dir.name if _job_dir is not None and (running or st) else ""
+        step, total = int(st.get("step") or 0), int(st.get("total") or 0)
+        frac = min(1.0, step / total) if total else 0.0
+        title = "RulzTrainer"
         if running:
             stage = str(st.get("stage") or "starting")
             ft = st.get("finetune") or {}
             ft_text = (f" · fine-tune window {ft['window']}/{ft['windows']}, cycle {ft['cycle']}"
                        if ft.get("windows") else "")
-            pill_text.text = (f"Training · step {st.get('step', 0):,} / {st.get('total') or 0:,}{ft_text}"
-                              if stage == "training" else stage[:1].upper() + stage[1:])
+            run_state.text = stage[:1].upper() + stage[1:]
+            run_step.text = f"step {step:,} / {total:,} · {frac * 100:.0f}%{ft_text}" if total else ""
+            eta = st.get("eta")
+            run_eta.text = f"{eta_text(eta)} left" if eta and stage == "training" else ""
+            title = f"{frac * 100:.0f}% · {job} · RulzTrainer" if total else f"{run_state.text} · {job} · RulzTrainer"
         else:
-            pill_text.text = {"error": "Last run failed", "done": "Last run finished"}.get(state, "Idle")
+            run_state.text = {"error": "Failed", "done": "Finished"}.get(state, "Stopped" if st else "Idle")
+            run_step.text = (f"step {step:,} / {total:,}" if total else "") if st else \
+                "No run yet: set one up in the Wizard or on the Train tab"
+            run_eta.text = ""
+            if state:
+                title = f"{run_state.text} · {job} · RulzTrainer"
+        run_job.text = job
+        run_bar.props(f"color={'positive' if state == 'done' else 'warning' if state == 'error' else 'primary'}")
+        run_bar.value = frac
+        run_bar.visible = bool(total)
+        left = AUTOSTOP.seconds_left()
+        waiting = len(QUEUE.snapshot()["waiting"])
+        notes = [f"{waiting} queued"] if waiting else []
+        if left is not None:
+            notes.append(f"this instance stops in {int(left) // 60}:{int(left) % 60:02d}")
+        elif AUTOSTOP.armed:
+            notes.append("the instance stops when the runs are done")
+        run_note.text = " · ".join(notes)
+        run_note.classes(add="rz-warn") if left is not None else run_note.classes(remove="rz-warn")
+        if title != strip_shown["title"]:  # a background browser tab shows how far the run is
+            strip_shown["title"] = title
+            ui.page_title(title)
+        if running != strip_shown["running"]:
+            strip_shown["running"] = running
+            start_btn.set_enabled(not running)
+            stop_btn.set_enabled(running)
+            kill_btn.set_enabled(running)
+
+    def machine_tick():
+        """The header's machine chip: the least free space of the drives the runs and the models are on."""
+        rows = machine.disks({"runs": ROOT / (w["output_dir"].value or "output"), "models": ROOT / "models"})
+        inst = VAST_INSTANCE
+        if not rows:
+            machine_chip.visible = inst is not None
+            machine_text.text = "vast.ai" if inst else ""
+            return
+        low = min(rows, key=lambda r: r["free"])
+        machine_text.text = ("vast.ai · " if inst else "") + f"{low['free']:.0f} GB free"
+        machine_icon.props(f"name={'cloud' if inst else 'storage'}")
+        machine_chip.classes(remove="ok warning critical", add=low["level"])
+        lines = [f"{r['label']}: {r['free']:.1f} GB free of {r['total']:.0f} GB ({r['path']})" for r in rows]
+        if low["level"] != "ok":
+            lines.append("Low: a save that does not fit ends the run. Download and delete old runs (Previous Runs), "
+                         "or keep fewer checkpoints.")
+        if inst:
+            lines.append(f"vast.ai instance {inst['id']}: it bills while it is running, with or without a job.")
+        machine_tip.text = " | ".join(lines)
 
     ui.timer(0.5, while_connected(task_tick))
     ui.timer(2.0, while_connected(pill_tick))
+    ui.timer(10.0, while_connected(machine_tick))
     pill_tick()
+    machine_tick()
 
-    tab_names = ("Wizard", "Train", "Dataset", "Monitor", "Samples", "Training maps", "Help")
+    tab_names = ("Wizard", "Train", "Dataset", "Monitor", "Samples", "Training maps", "Previous Runs", "Help")
 
     def remember_tab(e):
         name = e.value if isinstance(e.value, str) else e.value.props.get("name")
@@ -10080,6 +10445,40 @@ def build_page(local: bool = True):
 
 
 HELP = """
+## Finding your way around
+The tabs follow the work, in three groups: **Wizard, Train, Dataset** set a run up, **Monitor, Samples, Training maps,
+Previous Runs** watch it and look back, and **Help** is this page. The **run strip** under the tabs is on every tab: what
+the trainer is doing, the job, the step, a progress bar, the time left and the number of queued runs. Click it for the
+Monitor. The browser tab's title carries the progress too, so a tab in the background still tells you how far the run
+is. The chip at the top right is the machine: the free space of the drive with your runs and models (amber under
+15 GB, red under 5 GB), and the instance number on a vast.ai rental.
+
+The **Monitor** shows one view at a time: **Overview** (GPUs, disk and memory, the queue, the race, the likeness chart
+and the loss), **Images** (the probe images and your samples, a race's configurations side by side), **Details** (the
+samples' identity similarity, gradient norm, per-image loss watch and region watch, each when the run has it) and
+**Log & files** (the downloads and train.log). The numbers above the views stay put.
+
+Red marks the one main action of a view and whatever is switched on; every other button is plain text with a red icon.
+**Start training** is greyed out while a run is on, **Stop** and **Kill** while none is.
+
+## On a rented GPU (vast.ai)
+- **Disk**: a rental's disk has a fixed size, and a save that does not fit ends the run. The chip at the top right and
+  the Monitor's *Disk* tile show what is free; a banner on the Monitor warns under 15 GB. Download what you want to
+  keep (Monitor > Log & files, or Previous Runs > Saved files) and remove old runs.
+- **Stop the instance when the runs are done**: an instance bills while it sits idle. On an instance, the Monitor's
+  *Queue* section has the switch *Stop this vast.ai instance when the runs are done*: three minutes after the last run
+  ends (finished, stopped or failed) with nothing left in the queue, the instance stops itself. The GPU's billing ends,
+  the disk and its storage charge stay, and *Start* on vast.ai brings it back with every file. The run strip counts
+  the three minutes down; switching it off or starting a run cancels, and **Kill** switches it off. Runs waiting in
+  a paused queue keep the instance running. *Stop the instance now* beside it does the same at once. It uses the key vast.ai gives every
+  instance for itself (start, stop and destroy of that instance only); nothing here can rent or destroy anything.
+- **Model download**: while the first-boot download of your model bucket is still going, the Monitor says so and how
+  much has arrived.
+- **Files**: Browse buttons open a browser of the instance's files, datasets upload from the Dataset tab, and every
+  download button hands the file to your browser.
+- The page reconnects by itself after a dropped connection; a run does not depend on the page being open, and
+  neither do the queue and the stop switch.
+
 ## Wizard
 New to LoRA training? The **Wizard** tab sets up a character / person LoRA in six short pages: who you are training
 (job name, trigger word, how much of the person counts), the model, your photos, the training, samples and likeness
@@ -10466,7 +10865,7 @@ likeness unchanged. Training takes about 1.5-2x as long.
 instead of an adapter, after Fizgig's fine-tune: the model stays as loaded (int8 / nvfp4 / bf16), the layers are
 grouped into windows of what the card holds, and one window at a time is held in fp32 and trained for *Epochs per
 window*, then written back as a bf16 delta in RAM and re-quantized; a cycle trains every window once (the log lists
-the plan, the status pill shows the window). Every save extracts a LoRA of the rank(s) you set from the deltas, at the
+the plan, the run strip shows the window). Every save extracts a LoRA of the rank(s) you set from the deltas, at the
 end of a cycle, so each saved file has every layer trained alike; samples and probes render the fine-tuned model
 itself. *Also save the deltas* writes `<job>_finetune.safetensors` (2 bytes per weight), to continue from (*Continue
 from deltas*) or to extract at other ranks later with `python -m rulztrainer.extract_finetune`. Fizgig measured: a LoRA
