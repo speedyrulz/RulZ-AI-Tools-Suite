@@ -638,6 +638,21 @@ class TrainConfig:
     # --- region watch (regionwatch.py): how far the face, hair, skin, clothes and background have been learned ---
     region_watch: bool = False  # observe only: the training steps' own losses split by region (needs mediapipe; not
     #                             in a race)
+    # --- acting on the parts maps: experimental, never run in a real training (regionwatch.py) ---
+    region_class_weights: str = ""  # one fixed loss weight per region, "face=3,hair=1.5,skin=1.5,clothes=0.5,
+    #                                 background=0.3" (left out = 1; mean 1 per sample); "" = off. Not with
+    #                                 region_weights or hull_regions parts
+    region_steer: bool = False  # region steering: the region watch (turned on with it) moves loss weights once an
+    #                             epoch by the rules below, each off at 0. Not in a race
+    region_steer_regions: str = "background,clothes"  # what the cap and ahead rules may turn down
+    region_steer_cap: float = 0.6  # cohort rule: a steered region's learned share, at most this x the subject's
+    region_steer_ahead: float = 0.7  # per-picture rule: turned down when its contrast is under this x the median
+    region_steer_boost: float = 0.0  # cohort rule: a lagging face / hair / skin may be raised up to this (1.5, say)
+    region_steer_prior: float = 0.0  # cohort rule: while the background is past its cap, pull its prediction towards
+    #                                  the base model's with up to this weight (one more forward a step while it acts)
+    region_steer_min: float = 0.3  # a region's lowest loss weight (0 = it may be masked out altogether)
+    region_steer_step: float = 0.2  # the most a weight moves per epoch, as a share of itself (back up half as fast)
+    region_steer_strength: float = 1.0  # how hard a rule pulls: the weight aimed for is (share within limit) ^ (2 x this)
     # --- training maps (trainmaps.py): heatmaps over a few training pictures, before training and about each epoch ---
     training_maps: bool = False  # observe only: nothing about training changes
     training_maps_images: int = 3  # pictures (at least one per dataset, so more with several datasets)
@@ -938,9 +953,46 @@ class TrainConfig:
                 raise ValueError("hull_regions parts runs on the primary model copy only: multi_gpu data_parallel and "
                                  "race_parallel would dilute or skip its gains")
 
+    def validate_region_actions(self) -> None:
+        """region_class_weights and region steering: raises ValueError with what to change."""
+        from .regionwatch import parse_class_weights
+
+        if parse_class_weights(self.region_class_weights):
+            if self.region_weights:
+                raise ValueError("region_class_weights and region_weights are two fixed weightings of the same loss: "
+                                 "use one")
+            if self.wants_parts():
+                raise ValueError("region_class_weights refuses hull_regions parts: Hull's gains are its only weighting")
+        if not self.region_steer:
+            return
+        self.region_steer_list()
+        if self.wants_parts():
+            raise ValueError("region_steer refuses hull_regions parts: Hull's region gains are its only weighting")
+        if not 0.0 <= self.region_steer_cap <= 2.0 or not 0.0 <= self.region_steer_ahead < 1.0:
+            raise ValueError("region_steer_cap must be 0 (off) to 2 and region_steer_ahead 0 (off) to under 1")
+        if self.region_steer_boost != 0 and not 1.0 < self.region_steer_boost <= 3.0:
+            raise ValueError("region_steer_boost must be 0 (off) or above 1 and at most 3")
+        if not 0.0 <= self.region_steer_prior <= 2.0:
+            raise ValueError("region_steer_prior must be 0 (off) to 2")
+        if self.region_steer_prior > 0 and (self.region_steer_cap <= 0
+                                            or "background" not in self.region_steer_list()):
+            raise ValueError("region_steer_prior follows the cap rule on the background: set region_steer_cap above 0 "
+                             "and keep background in region_steer_regions")
+        if self.region_steer_prior > 0 and self.finetune:
+            raise ValueError("region_steer_prior needs an adapter to switch off: not with a full fine-tune")
+        if not (self.region_steer_cap > 0 or self.region_steer_ahead > 0 or self.region_steer_boost > 0):
+            raise ValueError("region_steer has every rule at 0: set region_steer_cap, region_steer_ahead or "
+                             "region_steer_boost")
+        if not 0.0 <= self.region_steer_min < 1.0:
+            raise ValueError("region_steer_min must be 0 to under 1")
+        if not 0.0 < self.region_steer_step <= 0.5 or not 0.0 < self.region_steer_strength <= 4.0:
+            raise ValueError("region_steer_step must be above 0 and at most 0.5, region_steer_strength above 0 and at "
+                             "most 4")
+
     def validate(self) -> None:
         if self.optimizer.lower() == "hull":
             self.validate_hull()
+        self.validate_region_actions()
         if self.body_score not in BODY_SCORES:
             raise ValueError(f"body_score must be one of {BODY_SCORES}, got {self.body_score!r}")
         if min(self.face_scale_span, self.face_scale_curve, self.body_scale_span, self.body_scale_curve) < 1.0:
@@ -1214,7 +1266,27 @@ class TrainConfig:
     def wants_part_maps(self) -> bool:
         """Region maps carry the parser's parts tensor: Hull's region gains, or the region watch (which, unlike
         wants_parts, changes nothing about the training step)."""
-        return self.wants_parts() or bool(self.region_watch)
+        return self.wants_parts() or self.wants_region_watch() or bool(str(self.region_class_weights or "").strip())
+
+    def wants_region_watch(self) -> bool:
+        """The region watch runs: asked for, or needed by region steering."""
+        return bool(self.region_watch or self.region_steer)
+
+    def region_steer_list(self) -> tuple[str, ...]:
+        """region_steer_regions as names, in a fixed order. Raises ValueError on an unknown one or none at all."""
+        names = [n.strip().lower() for n in str(self.region_steer_regions or "").split(",") if n.strip()]
+        if not names or any(n not in ("background", "clothes") for n in names):
+            raise ValueError(f"region_steer_regions must list background, clothes or both, got "
+                             f"{self.region_steer_regions!r}")
+        return tuple(n for n in ("background", "clothes") if n in names)
+
+    def region_steer_settings(self) -> dict | None:
+        """The region watch's steering settings, or None with steering off."""
+        if not self.region_steer:
+            return None
+        return {"regions": self.region_steer_list(), "cap": self.region_steer_cap, "ahead": self.region_steer_ahead,
+                "boost": self.region_steer_boost, "prior": self.region_steer_prior, "min": self.region_steer_min,
+                "step": self.region_steer_step, "strength": self.region_steer_strength}
 
     def wants_person_masks(self) -> bool:
         """Person masks in the region maps: the region-weighted loss's person weight, attention localization's
