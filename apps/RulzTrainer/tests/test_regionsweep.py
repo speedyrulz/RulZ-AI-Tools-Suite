@@ -295,20 +295,31 @@ def test_the_monitor_charts_the_sweeps(tmp_path):
         return {"step": step, "train": {c: train for c in regions}, "held": {c: held for c in regions}}
 
     history = [row(0, 0.0, 0.0), row(50, 0.2, 0.15), row(100, 0.4, 0.2)]
-    series, legend = webui.sweep_chart_series(history, best=[0.2, 100])
-    assert legend[:6] == ["face", "hair", "skin", "clothes", "background", "subject"]
-    assert legend[6:] == [n + " (held-out)" for n in legend[:6]]
+    # the gap chart: training less held-out, in points, one line per region
+    series, legend = webui.sweep_gap_series(history)
+    assert legend == ["face", "hair", "skin", "clothes", "background", "subject"]
     by = {s["name"]: s for s in series}
-    assert by["face"]["data"] == [[0, 0.0], [50, 20.0], [100, 40.0]]
-    assert by["subject (held-out)"]["data"][-1] == [100, 20.0]
-    assert by["subject (held-out)"]["lineStyle"]["type"] == "dashed" and "type" not in by["face"]["lineStyle"]
-    assert by["subject (held-out)"]["markPoint"]["data"] == [{"coord": [100, 20.0]}]
+    assert by["face"]["data"] == [[0, 0.0], [50, 5.0], [100, 20.0]]
     assert by["subject"]["lineStyle"]["width"] > by["face"]["lineStyle"]["width"]
-    # held-out pictures only (region_sweep_pictures -1): no training lines; a region no picture has: no line
+    # one region's chart: its training line and its held-out line (dashed), the best sweep on the subject's only
+    series, legend = webui.sweep_region_series(history, "subject", best=[0.2, 100])
+    assert legend == ["training", "held-out"]
+    by = {s["name"]: s for s in series}
+    assert by["training"]["data"] == [[0, 0.0], [50, 20.0], [100, 40.0]]
+    assert by["held-out"]["data"][-1] == [100, 20.0]
+    assert by["held-out"]["lineStyle"]["type"] == "dashed" and "type" not in by["training"]["lineStyle"]
+    assert by["held-out"]["markPoint"]["data"] == [{"coord": [100, 20.0]}]
+    face = webui.sweep_region_series(history, "face", best=[0.2, 100])[0]
+    assert all("markPoint" not in s for s in face) and face[0]["itemStyle"]["color"] == webui.SWEEP_COLORS["face"]
+    # held-out pictures only (region_sweep_pictures -1): no training line and no gap; a region no picture has: nothing
     only = [{"step": 0, "train": {"face": None}, "held": {"face": 0.0, "hair": None}},
             {"step": 50, "train": {"face": None}, "held": {"face": 0.1, "hair": None}}]
-    assert webui.sweep_chart_series(only)[1] == ["face (held-out)"]
-    assert webui.sweep_chart_series([]) == ([], [])
+    assert webui.sweep_region_series(only, "face")[1] == ["held-out"]
+    assert webui.sweep_region_series(only, "hair") == ([], [])
+    assert webui.sweep_gap_series(only) == ([], [])
+    # training pictures only (no held-out photos): no gap either
+    assert webui.sweep_gap_series([{"step": 0, "train": {"face": 0.0}, "held": {"face": None}}]) == ([], [])
+    assert webui.sweep_gap_series([]) == ([], []) and webui.sweep_region_series([], "face") == ([], [])
     # the status's own list, else the job folder's file (a broken line skipped), else nothing
     assert webui.sweep_history({"history": history}, tmp_path) == history
     assert webui.sweep_history({"step": 100}, tmp_path) == []
