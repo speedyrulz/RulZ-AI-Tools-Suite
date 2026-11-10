@@ -320,3 +320,23 @@ def test_comfy_vae_converts_to_diffusers_and_round_trips():
         assert lat.shape == (1, 64, 8, 8) and 0.3 < lat.std() < 3.0  # normalized
         back = QL.decode_latents(vae, lat)
     assert back.shape == img.shape and (back - img).pow(2).mean() < 1e-3
+
+
+def test_wizard_recommends_half_lr_for_oft_on_qwen21(tmp_path):
+    """OFT on Qwen-Image 2.1 overtrained at 1e-4: the wizard suggests 5e-5 for it, and keeps the LoRA recipe's rate."""
+    from PIL import Image
+
+    webui = pytest.importorskip("webui")
+    a = tmp_path / "a"
+    a.mkdir()
+    for i in range(20):
+        Image.new("RGB", (64, 48)).save(a / f"{i}.png")
+    data = webui.datasets_summary([str(a)])
+    base = dict(model_path="Qwen/Qwen-Image-2.1", datasets=[{"path": str(a)}])
+    oft = webui.wizard_recommendations(TrainConfig(**base, network_type="oft"), "character", [{"total": 32000}], data)
+    assert oft["learning_rate"][0] == 5e-5
+    lora = webui.wizard_recommendations(TrainConfig(**base), "character", [{"total": 32000}], data)
+    assert lora["learning_rate"][0] == 2e-4
+    self_tuning = webui.wizard_recommendations(TrainConfig(**base, network_type="oft", optimizer="keel"), "character",
+                                               [{"total": 32000}], data)
+    assert "learning_rate" not in self_tuning
