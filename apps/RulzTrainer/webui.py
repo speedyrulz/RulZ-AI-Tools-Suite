@@ -1556,6 +1556,7 @@ class Form:
             likeness_track_best_face=bool(v("likeness_track_best_face")),
             likeness_track_best_body=bool(v("likeness_track_best_body")),
             likeness_best_any_rise=bool(v("likeness_best_any_rise")),
+            likeness_framing=bool(v("likeness_framing")),
             face_gold=v("face_gold") or "auto", face_gold_select=bool(v("face_gold_select")),
             likeness_normalize=bool(v("likeness_normalize")),
             face_scale_span=float(v("face_scale_span")), face_scale_curve=float(v("face_scale_curve")),
@@ -9795,6 +9796,15 @@ def build_page(local: bool = True):
                                          "higher smoothed score replaces it, so the file is always the highest score "
                                          "seen, even by a hair. Either way early stop and the resolution step-up "
                                          "only count a rise beyond the noise band as progress.")
+                            w["likeness_framing"] = ui.switch("Lost body renders count as zero",
+                                                              value=d.likeness_framing) \
+                                .tooltip("On (default): a full-body probe render that no longer shows a body counts as "
+                                         "zero in the body score, against how many showed one at the first probe, and "
+                                         "one render's score stops at the top of the scale. Off: the body score is the "
+                                         "average of the renders that still show a body, so the last few of them, or a "
+                                         "score left over from when some did, can set a best checkpoint (in a test of "
+                                         "nine runs that happened in eight). The 'Body probe framing' log line gives "
+                                         "the count either way.")
                             w["likeness_best_min_kept"] = ui.number(
                                 "No new best under this share on-prompt (0 = off)", value=d.likeness_best_min_kept,
                                 min=0, max=1, step=0.05).classes("w-80").tooltip(
