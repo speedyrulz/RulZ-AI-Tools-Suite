@@ -51,7 +51,16 @@ other ports (the taps see each 2x2 token on its 4 latent cells, the grid of the 
 probe size that is not whole 32 px) is padded circularly and cropped back, as ComfyUI pads to the patch size;
 `skip_layers` skips blocks (kept for the shared sampler signature); QuantLinear / LoRALinear replace
 nn.Linear transparently. The fp32 islands of the checkpoint (patch projections, time embedder, output heads, the pruned
-AdaLN) stay fp32 when the loader keeps them so; the blocks run in the condition projection's dtype (bf16)."""
+AdaLN) stay fp32 when the loader keeps them so; the blocks run in the condition projection's dtype (bf16).
+
+MiniMax-H3-Image (rulztrainer.h3image) is the same stack without the audio stream (`audio_latents_dim=None`, diffusers'
+MiniMaxH3ImageTransformer2DModel, ComfyUI's MiniMaxH3ImageModel): the sequence is [text | target image], one time for
+both, the image at t = L. It is step-distilled with one output head per sampling step ("PDD", `pdd_steps` heads on the
+sigma grid `pdd_sigmas`): final_layer.video_out holds them stacked by rows as Comfy-Org's files do, block 0 a full
+head and blocks 1.. offsets from it (checked on the released bytes: block k = head k - head 0 of MiniMaxAI's
+pdd_fused_heads.safetensors, whose heads are diffusers' pdd_proj_out.k). A training forward uses the head of the grid
+interval that holds its sigma (ai-toolkit's rule for PDD checkpoints); a sampling step passes `sigma_next` and gets
+the step-size-weighted mean of the heads it spans (ComfyUI's _pdd_head)."""
 from __future__ import annotations
 
 import math
@@ -87,6 +96,52 @@ def time_shift_sigma(sigma, from_shift: float, to_shift: float):
 
 def audio_sigma(sigma_video, shift_video: float = SHIFT_VIDEO, shift_audio: float = SHIFT_AUDIO):
     return time_shift_sigma(sigma_video, shift_video, shift_audio)
+
+
+# ---------------------------------------------------------------- PDD output heads (one per distilled sampling step)
+
+PDD_EPS = 1e-5  # a sigma this close under a grid point still starts that point's interval (fp32 timesteps)
+# MiniMax-H3-Image's grid: its 6 heads' sigmas (MiniMaxAI/MiniMax-H3-Image pdd_config.json, the "config" metadata of
+# Comfy-Org's files and diffusers' sample_sigmas, all the same numbers)
+H3_IMAGE_PDD_SIGMAS = (1.0, 0.9675236940383911, 0.8875485062599182, 0.75, 0.5327739119529724, 0.23200887441635132, 0.0)
+
+
+def pdd_grid(n: int, shift: float) -> list[float]:
+    """The sigma grid of n PDD heads distilled on the uniform base grid under a flow shift (ComfyUI's pdd_grid; the
+    video checkpoints'). MiniMax-H3-Image ships its own grid (h3image.loading.PDD_SIGMAS)."""
+    return [float(shift_sigma(k / n, float(shift))) for k in range(n, -1, -1)]
+
+
+def pdd_span(grid, sigma: float, sigma_next: float | None = None) -> tuple[int, int]:
+    """The head intervals [start, stop) a forward at `sigma` uses on a decreasing grid of n + 1 sigmas (interval k runs
+    from grid[k] down to grid[k + 1]). Training (no sigma_next): the one interval that holds sigma, a grid point
+    opening its own (ai-toolkit's pdd_span). Sampling: from the grid point nearest sigma to the one nearest
+    sigma_next, at least one interval (ComfyUI's FinalLayer)."""
+    n = len(grid) - 1
+    if sigma_next is None:
+        start = sum(1 for k in range(1, n) if grid[k] >= sigma - PDD_EPS)
+        return start, start + 1
+
+    def nearest(s: float) -> int:
+        return min(range(n + 1), key=lambda k: abs(grid[k] - s))
+
+    start = min(nearest(sigma), n - 1)
+    return start, max(nearest(sigma_next), start + 1)
+
+
+def pdd_head_weights(grid, start: int, stop: int) -> torch.Tensor:
+    """[n] fp32 weights over the stacked head blocks for a step spanning intervals [start, stop): block 0 (the full
+    head) at 1, each offset block k >= 1 at its share of the step, dt_k / sum(dt). The step-size-weighted mean of the
+    full heads head_k = block_0 + block_k (ComfyUI's _pdd_head, ai-toolkit's pdd_head_weights)."""
+    n = len(grid) - 1
+    dt = [grid[k] - grid[k + 1] for k in range(start, stop)]
+    total = sum(dt)
+    w = torch.zeros(n, dtype=torch.float32)
+    w[0] = 1.0
+    for j, k in enumerate(range(start, stop)):
+        if k >= 1:
+            w[k] = dt[j] / total
+    return w
 
 
 def timestep_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
@@ -297,12 +352,18 @@ class DiTBlock(nn.Module):
         self.adaln_proj = AdalnProj(t_dim, hidden, 6, MODALITIES, apply_silu)
 
     def forward(self, x, temb, cos, sin, key_mask, n_text: int, n_audio: int):
-        """temb [2B, t_dim]: the video time's embeddings, then the audio time's."""
+        """temb [2B, t_dim]: the video time's embeddings, then the audio time's ([B, t_dim], the one time, for a model
+        without an audio stream: n_audio 0)."""
         batch = x.shape[0]
         mod = self.adaln_proj(temb)  # [2B, 3, 6, hidden]: shift, scale, gate (attention), shift, scale, gate (MLP)
-        mv, ma = mod[:batch], mod[batch:]
-        mods = (mv[:, TEXT_TAG], ma[:, AUDIO_TAG], mv[:, VIDEO_TAG])
-        bounds = ((0, n_text), (n_text, n_text + n_audio), (n_text + n_audio, x.shape[1]))
+        mv = mod[:batch]
+        if n_audio:
+            ma = mod[batch:]
+            mods = (mv[:, TEXT_TAG], ma[:, AUDIO_TAG], mv[:, VIDEO_TAG])
+            bounds = ((0, n_text), (n_text, n_text + n_audio), (n_text + n_audio, x.shape[1]))
+        else:
+            mods = (mv[:, TEXT_TAG], mv[:, VIDEO_TAG])
+            bounds = ((0, n_text), (n_text, x.shape[1]))
         h = _modulate(self.norm1(x), bounds, mods, 1, 0)
         x = _gated(x, self.attn(h, cos, sin, key_mask), bounds, mods, 2)
         h = _modulate(self.norm2(x), bounds, mods, 4, 3)
@@ -310,18 +371,27 @@ class DiTBlock(nn.Module):
 
 
 class FinalLayer(nn.Module):
-    """RMSNorm, shift / scale from the time embedding (no modality axis), and the two fp32 heads."""
+    """RMSNorm, shift / scale from the time embedding (no modality axis), and the fp32 heads: video, and audio when
+    the model has that stream. pdd_steps > 1: video_out holds that many heads stacked by rows (block 0 a full head,
+    the others offsets from it) and the forward blends them by `pdd_weights`."""
 
-    def __init__(self, hidden: int, t_dim: int, video_dim: int, audio_dim: int, eps: float, apply_silu: bool = True):
+    def __init__(self, hidden: int, t_dim: int, video_dim: int, audio_dim: int | None, eps: float,
+                 apply_silu: bool = True, pdd_steps: int = 1):
         super().__init__()
+        self.video_dim, self.pdd_steps = video_dim, int(pdd_steps)
         self.norm = RMSNorm(hidden, eps)
         self.adaln_proj = AdalnProj(t_dim, hidden, 2, 1, apply_silu)
-        self.video_out = nn.Linear(hidden, video_dim, bias=True)
-        self.audio_out = nn.Linear(hidden, audio_dim, bias=True)
+        self.video_out = nn.Linear(hidden, video_dim * self.pdd_steps, bias=True)
+        if audio_dim:
+            self.audio_out = nn.Linear(hidden, audio_dim, bias=True)
+        else:
+            self.audio_out = None
 
-    def forward(self, x, temb, n_text: int, n_audio: int):
+    def forward(self, x, temb, n_text: int, n_audio: int, pdd_weights: torch.Tensor | None = None):
+        """pdd_weights: [B, pdd_steps] over the stacked heads (pdd_head_weights). Returns (video rows, audio rows or
+        None)."""
         batch = x.shape[0]
-        mod = self.adaln_proj(temb)[:, 0]  # [2B, 2, hidden]: shift, scale
+        mod = self.adaln_proj(temb)[:, 0]  # [2B, 2, hidden]: shift, scale ([B, 2, hidden] without audio)
         a0, v0 = n_text, n_text + n_audio
 
         def head(rows, m, out):
@@ -329,7 +399,14 @@ class FinalLayer(nn.Module):
             h = h * (1.0 + m[:, 1, None].to(h.dtype)) + m[:, 0, None].to(h.dtype)
             return out(h.to(_wdtype(out)))
 
-        return head(x[:, v0:], mod[:batch], self.video_out), head(x[:, a0:v0], mod[batch:], self.audio_out)
+        video = head(x[:, v0:], mod[:batch], self.video_out)
+        if self.pdd_steps > 1:
+            if pdd_weights is None:
+                raise ValueError("the PDD output heads need the weights of the step's heads")
+            stacked = video.unflatten(-1, (self.pdd_steps, self.video_dim))  # [B, N, heads, video_dim]
+            video = torch.einsum("bnkd,bk->bnd", stacked, pdd_weights.to(stacked.device, stacked.dtype))
+        audio = head(x[:, a0:v0], mod[batch:], self.audio_out) if n_audio else None
+        return video, audio
 
 
 class MiniMaxH3Transformer(nn.Module):
@@ -339,16 +416,20 @@ class MiniMaxH3Transformer(nn.Module):
     CONFIG_KEYS = ("hidden_size", "num_layers", "token_refiner_num_layers", "num_attention_heads",
                    "attention_head_dim", "ffn_hidden_size", "latents_dim", "audio_latents_dim", "patch_size",
                    "text_dim", "timestep_input_dim", "time_embed_hidden_size", "time_embed_dim", "rope_inv_freq_len",
-                   "rope_theta", "norm_eps", "qk_norm_eps", "final_norm_eps", "adaln_curve_grid", "adaln_rank")
+                   "rope_theta", "norm_eps", "qk_norm_eps", "final_norm_eps", "adaln_curve_grid", "adaln_rank",
+                   "pdd_steps", "pdd_sigmas")
 
     def __init__(self, hidden_size=5376, num_layers=50, token_refiner_num_layers=2, num_attention_heads=56,
                  attention_head_dim=128, ffn_hidden_size=14336, latents_dim=24, audio_latents_dim=32,
                  patch_size=(1, 2, 2), text_dim=5120, timestep_input_dim=256, time_embed_hidden_size=5376,
                  time_embed_dim=2688, rope_inv_freq_len=16, rope_theta=10000.0, norm_eps=1e-5, qk_norm_eps=1e-5,
-                 final_norm_eps=1e-5, adaln_curve_grid=None, adaln_rank=None):
+                 final_norm_eps=1e-5, adaln_curve_grid=None, adaln_rank=None, pdd_steps=1, pdd_sigmas=None):
         """adaln_curve_grid: a pruned file's curve table (Comfy-Org's *_pruned_*). adaln_rank: a full checkpoint
         pruned on load (h3/loading.prune_adaln): the time embedder stays, its SiLU'd output is projected onto a
-        rank-r basis and the AdaLN projections read the r coefficients plus a constant channel (r + 1 wide)."""
+        rank-r basis and the AdaLN projections read the r coefficients plus a constant channel (r + 1 wide).
+        audio_latents_dim None: no audio stream (MiniMax-H3-Image). pdd_steps / pdd_sigmas: the stacked per-step
+        output heads and the pdd_steps + 1 decreasing sigmas they were distilled on (default: MiniMax-H3-Image's
+        released grid for 6 heads, else the uniform base grid under the video shift, ComfyUI's)."""
         super().__init__()
         if tuple(patch_size) != (1, PATCH, PATCH):
             raise ValueError(f"MiniMax H3 patchifies 1x2x2, got {tuple(patch_size)}")
@@ -356,6 +437,20 @@ class MiniMaxH3Transformer(nn.Module):
             raise ValueError("the rotary channels (6 x rope_inv_freq_len) exceed the head size")
         if adaln_curve_grid is not None and adaln_rank is not None:
             raise ValueError("a pruned curve table and a load-time AdaLN basis exclude each other")
+        pdd_steps = int(pdd_steps or 1)
+        audio_latents_dim = audio_latents_dim or None
+        if pdd_steps > 1 and audio_latents_dim is not None:
+            raise ValueError("a MiniMax H3 video + audio checkpoint with per-step (PDD) output heads, such as FastH3 "
+                             "Omni, is not supported: only MiniMax-H3-Image's")
+        if pdd_steps > 1:
+            if pdd_sigmas is None:  # a file without the grid in its metadata: the released one for the released heads
+                pdd_sigmas = (H3_IMAGE_PDD_SIGMAS if pdd_steps == len(H3_IMAGE_PDD_SIGMAS) - 1
+                              else pdd_grid(pdd_steps, SHIFT_VIDEO))
+            pdd_sigmas = [float(s) for s in pdd_sigmas]
+            if len(pdd_sigmas) != pdd_steps + 1 or any(a <= b for a, b in zip(pdd_sigmas, pdd_sigmas[1:])):
+                raise ValueError(f"pdd_sigmas must be {pdd_steps + 1} decreasing sigmas, got {pdd_sigmas}")
+        else:
+            pdd_sigmas = None
         self.config = dict(hidden_size=hidden_size, num_layers=num_layers,
                            token_refiner_num_layers=token_refiner_num_layers, num_attention_heads=num_attention_heads,
                            attention_head_dim=attention_head_dim, ffn_hidden_size=ffn_hidden_size,
@@ -364,17 +459,19 @@ class MiniMaxH3Transformer(nn.Module):
                            time_embed_hidden_size=time_embed_hidden_size, time_embed_dim=time_embed_dim,
                            rope_inv_freq_len=rope_inv_freq_len, rope_theta=rope_theta, norm_eps=norm_eps,
                            qk_norm_eps=qk_norm_eps, final_norm_eps=final_norm_eps, adaln_curve_grid=adaln_curve_grid,
-                           adaln_rank=adaln_rank)
+                           adaln_rank=adaln_rank, pdd_steps=pdd_steps, pdd_sigmas=pdd_sigmas)
         self.latent_channels = latents_dim
-        self.audio_channels = audio_latents_dim
+        self.has_audio = audio_latents_dim is not None
+        self.audio_channels = audio_latents_dim or 0
         self.text_dim = text_dim
         self.hidden_size = hidden_size
         self.freq_dim = timestep_input_dim
         self.rope_freq_dim, self.rope_theta = rope_inv_freq_len, rope_theta
         self.pruned = adaln_curve_grid is not None
         self.adaln_rank = adaln_rank
-        self.audio_frames = ONE_FRAME_AUDIO_LATENTS
+        self.audio_frames = ONE_FRAME_AUDIO_LATENTS if self.has_audio else 0
         self.shift_video, self.shift_audio = SHIFT_VIDEO, SHIFT_AUDIO
+        self.pdd_steps, self.pdd_sigmas = pdd_steps, pdd_sigmas
         self.gradient_checkpointing = False
         self.is_distilled = True  # the released checkpoints are CFG-distilled (no guidance: sample at CFG 1)
         # the audio VAE's encoding of 1600 zero samples, normalized: [4, 32] rows (left f0, f1, right f0, f1). Set by
@@ -385,7 +482,8 @@ class MiniMaxH3Transformer(nn.Module):
         t_dim = adaln_rank + 1 if adaln_rank is not None else time_embed_dim
         video_dim = latents_dim * PATCH * PATCH
         self.video_patch_proj = nn.Linear(video_dim, hidden_size, bias=True)
-        self.audio_patch_proj = nn.Linear(audio_latents_dim, hidden_size, bias=True)
+        if self.has_audio:
+            self.audio_patch_proj = nn.Linear(audio_latents_dim, hidden_size, bias=True)
         self.condition_proj = nn.Linear(text_dim, hidden_size, bias=True)
         if self.pruned:
             self.register_buffer("adaln_t_table", torch.zeros(adaln_curve_grid, time_embed_dim))
@@ -402,7 +500,8 @@ class MiniMaxH3Transformer(nn.Module):
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size, t_dim, norm_eps,
                      qk_norm_eps, apply_silu) for _ in range(num_layers)])
-        self.final_layer = FinalLayer(hidden_size, t_dim, video_dim, audio_latents_dim, final_norm_eps, apply_silu)
+        self.final_layer = FinalLayer(hidden_size, t_dim, video_dim, audio_latents_dim, final_norm_eps, apply_silu,
+                                      pdd_steps)
 
     @property
     def layers(self) -> nn.ModuleList:
@@ -446,7 +545,9 @@ class MiniMaxH3Transformer(nn.Module):
 
     # ---- layout
     def positions(self, text_lens: torch.Tensor, text_len: int, height: int, width: int) -> torch.Tensor:
-        """[B, S + 4 + N, 3] float64 RoPE positions of [text | audio | video] (see the module docstring)."""
+        """[B, S + 4 + N, 3] float64 RoPE positions of [text | audio | video] (see the module docstring); without an
+        audio stream [B, S + N, 3] of [text | image], diffusers' build_image_packed_sequence for a text-to-image
+        request."""
         batch = text_lens.shape[0]
         frames = self.audio_frames
         n_audio = frames * AUDIO_CHANNELS
@@ -456,9 +557,10 @@ class MiniMaxH3Transformer(nn.Module):
         pos[:, :text_len, 0] = torch.arange(text_len, dtype=torch.float64)
         cursor = text_lens.detach().to("cpu", torch.float64).view(batch, 1)
         a0, v0 = text_len, text_len + n_audio
-        pos[:, a0:v0, 0] = cursor + torch.arange(frames, dtype=torch.float64).repeat(AUDIO_CHANNELS)[None]
-        pos[:, a0:v0, 2] = torch.cat([torch.full((frames,), float(w_axis[0]), dtype=torch.float64),
-                                      torch.full((frames,), float(w_axis[-1]), dtype=torch.float64)])[None]
+        if n_audio:
+            pos[:, a0:v0, 0] = cursor + torch.arange(frames, dtype=torch.float64).repeat(AUDIO_CHANNELS)[None]
+            pos[:, a0:v0, 2] = torch.cat([torch.full((frames,), float(w_axis[0]), dtype=torch.float64),
+                                          torch.full((frames,), float(w_axis[-1]), dtype=torch.float64)])[None]
         pos[:, v0:, 0] = cursor
         pos[:, v0:, 1:] = grid[None]
         return pos
@@ -483,12 +585,26 @@ class MiniMaxH3Transformer(nn.Module):
         s = sigma_a.to(device, torch.float32).view(-1, 1, 1)
         return (1.0 - s) * silence + s * noise.to(device, torch.float32)
 
+    def pdd_weights(self, sigma: torch.Tensor, sigma_next=None) -> torch.Tensor | None:
+        """[B, pdd_steps] head weights for a forward at `sigma` [B] (None without PDD heads): the interval holding each
+        sigma (training), or the intervals the step to sigma_next spans (sampling; a number or [B])."""
+        if self.pdd_steps <= 1:
+            return None
+        sig = sigma.detach().float().reshape(-1).tolist()
+        if sigma_next is None:
+            nxt = [None] * len(sig)
+        else:
+            nxt = torch.as_tensor(sigma_next, dtype=torch.float32).reshape(-1).expand(len(sig)).tolist()
+        return torch.stack([pdd_head_weights(self.pdd_sigmas, *pdd_span(self.pdd_sigmas, s, n))
+                            for s, n in zip(sig, nxt)])
+
     def forward(self, hidden_states: torch.Tensor, timestep, encoder_hidden_states: torch.Tensor,
                 encoder_attention_mask: torch.Tensor | None = None, skip_layers=None,
-                audio_states: torch.Tensor | None = None, return_audio: bool = False):
+                audio_states: torch.Tensor | None = None, return_audio: bool = False, sigma_next=None):
         """timestep: the video noise level in 0..1000 (sigma * 1000). audio_states: [B, 4, 32] audio rows at the
         matching audio sigma (None: the noised silence placeholder). Returns the noise-ward velocity [B, 24, h, w]
-        (fp32), and with return_audio also the audio rows' [B, 4, 32]."""
+        (fp32), and with return_audio also the audio rows' [B, 4, 32]. sigma_next (PDD heads only): the sigma a
+        sampling step goes to, for the heads it spans; None is a training forward."""
         skip_layers = frozenset(skip_layers or ())
         if hidden_states.ndim != 4 or hidden_states.shape[1] != self.latent_channels:
             raise ValueError(f"hidden_states must be one frame of latents [B, {self.latent_channels}, H/16, W/16]")
@@ -505,12 +621,17 @@ class MiniMaxH3Transformer(nn.Module):
         n_audio = self.audio_frames * AUDIO_CHANNELS
 
         sigma_v = torch.as_tensor(timestep, device=device, dtype=torch.float32).reshape(-1).expand(batch) / 1000.0
-        sigma_a = audio_sigma(sigma_v, self.shift_video, self.shift_audio)
-        temb = self.time_embedding(torch.cat([1.0 - sigma_v, 1.0 - sigma_a]))  # [2B, t_dim]: video, then audio
-        if audio_states is None:
-            audio_states = self.audio_placeholder(sigma_a, batch, device)
-        if audio_states.shape != (batch, n_audio, self.audio_channels):
-            raise ValueError(f"audio_states must be [B, {n_audio}, {self.audio_channels}]")
+        if self.has_audio:
+            sigma_a = audio_sigma(sigma_v, self.shift_video, self.shift_audio)
+            temb = self.time_embedding(torch.cat([1.0 - sigma_v, 1.0 - sigma_a]))  # [2B, t_dim]: video, then audio
+            if audio_states is None:
+                audio_states = self.audio_placeholder(sigma_a, batch, device)
+            if audio_states.shape != (batch, n_audio, self.audio_channels):
+                raise ValueError(f"audio_states must be [B, {n_audio}, {self.audio_channels}]")
+        else:
+            if audio_states is not None or return_audio:
+                raise ValueError("this model has no audio stream (MiniMax-H3-Image)")
+            temb = self.time_embedding(1.0 - sigma_v)  # [B, t_dim]: text and image rows run at the one time
 
         if encoder_attention_mask is not None:
             valid = encoder_attention_mask.to(device=device, dtype=torch.bool)
@@ -529,8 +650,11 @@ class MiniMaxH3Transformer(nn.Module):
 
         txt = self.token_refiner(self.condition_proj(encoder_hidden_states.to(device, dtype)), txt_mask)
         vid = self.video_patch_proj(patchify(hidden_states).to(_wdtype(self.video_patch_proj))).to(txt.dtype)
-        aud = self.audio_patch_proj(audio_states.to(device, _wdtype(self.audio_patch_proj))).to(txt.dtype)
-        x = torch.cat([txt, aud, vid], dim=1)
+        if self.has_audio:
+            aud = self.audio_patch_proj(audio_states.to(device, _wdtype(self.audio_patch_proj))).to(txt.dtype)
+            x = torch.cat([txt, aud, vid], dim=1)
+        else:
+            x = torch.cat([txt, vid], dim=1)
 
         split = getattr(self, "split_devices", None)  # blocks may live on several devices (model split)
         taps = getattr(self, "_rz_taps", None)  # rulztrainer.alignment (training-only losses), on the latent cells
@@ -559,7 +683,7 @@ class MiniMaxH3Transformer(nn.Module):
             fdev = _module_device(self.final_layer)
             if fdev is not None and x.device != fdev:
                 x, temb = x.to(fdev), temb.to(fdev)
-        video, audio = self.final_layer(x, temb, text_len, n_audio)
+        video, audio = self.final_layer(x, temb, text_len, n_audio, self.pdd_weights(sigma_v, sigma_next))
         out = -unpatchify(video.float(), self.latent_channels, height, width)[:, :, :out_h, :out_w].to(device)
         if return_audio:
             return out, -audio.float().to(device)

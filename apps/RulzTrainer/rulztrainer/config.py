@@ -96,6 +96,10 @@ def family_named_in(text: str) -> str | None:
         return "flux2_klein"
     if "p-h3" in hint or "p_h3" in hint:  # PrunaAI/P-H3-Image, p-h3-image_bf16.safetensors (before "minimax")
         return "p_h3_image"
+    # MiniMaxAI/MiniMax-H3-Image, minimax_h3_image_pruned_bf16.safetensors (before "minimax"). Not a training adapter
+    # of that name: circlestone-labs' MiniMax-H3-Image-Training-Adapter is an image adapter for H3 itself
+    if ("minimax-h3-image" in hint or "minimax_h3_image" in hint) and "adapter" not in hint:
+        return "minimax_h3_image"
     for word, family in (("ideogram", "ideogram4"), ("minimax", "minimax_h3"), ("fibo", "fibo2"), ("krea", "krea2"),
                          ("moss", "moss_image")):
         if word in hint:
@@ -283,8 +287,9 @@ COMFY_VAE_FILES["minimax_h3"] = "vae/minimax_h3_video_vae_fp16.safetensors"
 
 # P-H3-Image (PrunaAI): MiniMax H3 fine-tuned into an 8-step, guidance-free text-to-image model (rulztrainer.ph3).
 # PrunaAI/P-H3-Image-Comfy (sizes from the Hub): the pruned transformer with Pruna's LoRA merged, int8_convrot 21.2 GB,
-# bf16 40.5 GB (w4a8, 13.4 GB, is a format this trainer cannot read); the Qwen3-VL-4B text encoder with its text
-# connector, int8_convrot 5.1 GB, bf16 9.1 GB; the single-frame VAE, bf16 5.6 GB (its int8 file, 3.1 GB, is read too).
+# bf16 40.5 GB (w4a8, 13.4 GB, reads as a file you set: decoded to int8, rulztrainer.quant); the Qwen3-VL-4B text
+# encoder with its text connector, int8_convrot 5.1 GB, bf16 9.1 GB; the single-frame VAE, bf16 5.6 GB (its int8 file,
+# 3.1 GB, is read too).
 # Training adapter: ostris' P-H3-Image adapter (rank 16, 0.16 GB), what ai-toolkit trains P-H3-Image with by default:
 # the model is step- and guidance-distilled, so a LoRA trained on it bare drifts the way H3's do
 MODEL_PRESETS["P-H3-Image"] = "PrunaAI/P-H3-Image"
@@ -299,6 +304,28 @@ COMFY_DIFFUSION_QUANTS["p_h3_image"] = ("int8_convrot", "bf16")
 COMFY_TEXT_ENCODER_FILES["p_h3_image"] = "text_encoders/p-h3-image_text_encoder_{quant}.safetensors"
 COMFY_TEXT_ENCODER_QUANTS["p_h3_image"] = ("int8_convrot", "bf16")
 COMFY_VAE_FILES["p_h3_image"] = "vae/p-h3-image_vae_bf16.safetensors"
+
+# MiniMax-H3-Image (MiniMaxAI, November 2026): H3's transformer without the audio stream, distilled to 6 steps with one
+# output head per step and no guidance, with its own image VAE (rulztrainer.h3image). Comfy-Org/MiniMax-H3-Image
+# (sizes from the Hub): the pruned transformer as int8_convrot 21.0 GB, bf16 40.2 GB or w4a8 12.5 GB (ComfyUI's 4-bit
+# format, decoded on read to the int8 weight it stands for: a smaller download, int8's memory); the image VAE fp16
+# 1.2 GB. The text encoder is MiniMax H3's, the same files byte for byte (the Hub's sha256), so they come from
+# Comfy-Org/MiniMax-H3 and a copy already downloaded for H3 is reused. No training adapter exists for it yet
+# (10 Nov 2026): training_adapter auto resolves to none.
+MODEL_PRESETS["MiniMax-H3-Image"] = "MiniMaxAI/MiniMax-H3-Image"
+ARCH_NAMES += ("minimax_h3_image",)
+ARCH_DEFAULT_TARGETS["minimax_h3_image"] = _CORE_TARGETS
+ARCH_FULL_SAMPLE["minimax_h3_image"] = (6, 1.0)  # the checkpoint's own 6 sigmas and heads, no guidance
+COMFY_REPOS["minimax_h3_image"] = "Comfy-Org/MiniMax-H3-Image"
+COMFY_DIFFUSION_FILES["MiniMaxAI/MiniMax-H3-Image"] = "diffusion_models/minimax_h3_image_{quant}.safetensors"
+COMFY_DIFFUSION_QUANTS["minimax_h3_image"] = ("int8_convrot", "bf16", "w4a8")
+COMFY_QUANT_NAMES["minimax_h3_image"] = {"int8_convrot": "pruned_int8_convrot", "bf16": "pruned_bf16",
+                                         "w4a8": "pruned_w4a8"}  # every file of it is the pruned-AdaLN one
+COMFY_TEXT_ENCODER_FILES["minimax_h3_image"] = COMFY_TEXT_ENCODER_FILES["minimax_h3"]
+COMFY_TEXT_ENCODER_QUANTS["minimax_h3_image"] = COMFY_TEXT_ENCODER_QUANTS["minimax_h3"]
+COMFY_TEXT_ENCODER_REPOS["minimax_h3_image"] = {q: COMFY_REPOS["minimax_h3"]
+                                                for q in COMFY_TEXT_ENCODER_QUANTS["minimax_h3"]}
+COMFY_VAE_FILES["minimax_h3_image"] = "vae/minimax_h3_image_vae_fp16.safetensors"
 
 
 # Named presets: values applied over a config (UI toggle, --preset on the CLI, or `preset:` in YAML).

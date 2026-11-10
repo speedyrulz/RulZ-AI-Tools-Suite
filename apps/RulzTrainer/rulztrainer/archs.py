@@ -32,6 +32,7 @@ ARCH_NAMES += ("flux2_klein",)
 ARCH_NAMES += ("ideogram4",)
 ARCH_NAMES += ("minimax_h3",)
 ARCH_NAMES += ("p_h3_image",)
+ARCH_NAMES += ("minimax_h3_image",)
 
 
 def _match_suffix(name: str, suffixes: Iterable[str]) -> bool:
@@ -1160,6 +1161,51 @@ class PH3ImageArch(MiniMaxH3Arch):
 
 
 _ARCHS["p_h3_image"] = PH3ImageArch
+
+
+class MiniMaxH3ImageArch(MiniMaxH3Arch):
+    """MiniMax-H3-Image (MiniMaxAI): H3's transformer without the audio stream, distilled to 6 sampling steps with one
+    output head per step and no guidance (rulztrainer.h3image). H3's LoRA names, text encoder and latent layout; its
+    own image VAE (H3's encoder, a 2D ViT decoder), cached apart from H3's (the VAE file is its own)."""
+    name = "minimax_h3_image"
+    label = "MiniMax-H3-Image"
+    modelspec = "minimax-h3-image"
+    default_targets = ARCH_DEFAULT_TARGETS["minimax_h3_image"]
+    default_sample_steps, default_sample_cfg = ARCH_FULL_SAMPLE["minimax_h3_image"]
+    latent_tag = "_h3ivae"
+
+    def __init__(self):
+        from .h3image import loading
+
+        self._loading = loading
+
+    def sample(self, model, pos_e, pos_m, neg_e, neg_m, **kw):
+        from .h3image.sampler import sample
+
+        return sample(model, pos_e, pos_m, neg_e, neg_m, **kw)
+
+    def sample_sigmas(self, model, steps, height, width, shift):
+        from .h3image.sampler import h3image_sigmas
+
+        return h3image_sigmas(steps, getattr(model, "pdd_sigmas", None))
+
+    def distilled_sample_model(self, path: str) -> bool:
+        return True  # the released model is the 6-step distilled one: no turbo LoRA on top
+
+    def reference_sigmas(self, n, gen, tokens):
+        # MiniMax has not published H3-Image's training noise distribution. This is the trainer's choice: the sampler's
+        # own, a position drawn uniformly along the 6-interval sigma grid (the grid read piecewise-linearly in its
+        # index, as ComfyUI's sampling does), so each output head trains on an equal share of the steps and on the
+        # sigmas its sampling step covers
+        from .h3image.loading import PDD_SIGMAS
+
+        grid = torch.tensor(PDD_SIGMAS, dtype=torch.float32)
+        pos = torch.rand(n, generator=gen) * (grid.numel() - 1)
+        i = pos.floor().long().clamp(max=grid.numel() - 2)
+        return torch.lerp(grid[i], grid[i + 1], pos - i).clamp(0.0, 1.0)
+
+
+_ARCHS["minimax_h3_image"] = MiniMaxH3ImageArch
 _cache: dict[str, Arch] = {}
 
 
@@ -1208,6 +1254,8 @@ def arch_from_transformer_file(path: str) -> str | None:
                 found = "ideogram4"
             elif "video_patch_proj.weight" in names and "audio_patch_proj.weight" in names:
                 found = "p_h3_image" if _is_ph3_dit(p) else "minimax_h3"
+            elif "video_patch_proj.weight" in names and "condition_proj.weight" in names:
+                found = "minimax_h3_image"  # H3's layout without the audio stream (ComfyUI's detection rule)
         except Exception:  # noqa: BLE001
             found = None
         _FILE_ARCH_CACHE[key] = found
@@ -1261,7 +1309,15 @@ def detect_arch(cfg: TrainConfig, model_dir: Path | None) -> Arch:
                  "QwenImage21Transformer2DModel": "qwen_image21",
                  "Flux3Transformer2DModel": "flux3_klein", "Flux2Transformer2DModel": "flux2_klein",
                  "Ideogram4Transformer2DModel": "ideogram4",
-                 "MiniMaxH3Transformer3DModel": "minimax_h3", "MiniMaxH3DiTModel": "minimax_h3"}.get(cls)
+                 "MiniMaxH3Transformer3DModel": "minimax_h3", "MiniMaxH3DiTModel": "minimax_h3",
+                 "MiniMaxH3ImageTransformer2DModel": "minimax_h3_image"}.get(cls)
+        if found in (None, "minimax_h3"):
+            from .h3image.loading import is_h3_image_dir
+
+            if is_h3_image_dir(Path(model_dir)):
+                # MiniMaxAI's transformer/ is H3's own class (MiniMaxH3DiTModel) with audio_enabled false; a folder
+                # with only transformer_diffusers/ has no transformer/config.json at all
+                found = "minimax_h3_image"
         if found == "minimax_h3":
             from .ph3.loading import is_ph3_dir
 

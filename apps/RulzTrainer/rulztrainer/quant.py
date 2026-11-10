@@ -1072,4 +1072,75 @@ def quant_weight_from_comfy(meta: dict, weight: torch.Tensor, scale: torch.Tenso
         if shape is None:
             shape = (weight.shape[0], weight.shape[1] * 2)
         return QuantWeight("nvfp4", weight, scale, scale2.float(), tuple(shape))
+    if fmt in GROUPED_INT_FORMATS:
+        raise ValueError(f"ComfyUI quantization format '{fmt}' is only read for MiniMax H3 family diffusion models")
     raise ValueError(f"Unsupported ComfyUI quantization format '{fmt}'. Supported: int8_tensorwise (convrot), nvfp4.")
+
+
+# ---------------------------------------------------------------- ComfyUI's grouped-scale integer weights (W4A8, W6A8)
+# comfy-kitchen's AsymW4A8Int8Layout (comfy_kitchen/tensor/w4a8_packed.py, backends/eager/w4a8_int8.py, 0.2.41): a
+# ConvRot int8 weight stored below 8 bits. `weight` is int8 [N, K * bits / 8]: K / 2 bytes of nibbles (the even column
+# in the low nibble) and, at 6 bits, K / 4 more bytes holding each code's top 2 bits (column c in byte c // 4 at bit
+# 2 * (c % 4)). A 4-bit code indexes the 16-level `weight_codebook` (without one it is the uniform code - 8), a 6-bit
+# code is the uniform code - 32; times the fp8 scale of its 16-column group (`weight_s_rel` [N, K / 16]), rounded and
+# clamped to +-127, that is the int8 grid ComfyUI's GEMM multiplies with, with `weight_s_channel` [N] as its per-row
+# scale and the usual ConvRot rotation. Decoding to that int8 weight on read loses nothing against what ComfyUI
+# computes; it holds 8 bits a weight in memory where the file holds 4 or 6.
+GROUPED_INT_FORMATS = {"asym_w4a8_int8": 4, "w6a8_int8": 6}
+
+
+def unpack_grouped_codes(qdata: torch.Tensor, k: int, bits: int) -> torch.Tensor:
+    """The packed storage -> unsigned codes [N, K] (uint8)."""
+    packed = qdata.contiguous().view(torch.uint8)
+    low = packed[:, : k // 2]
+    codes = torch.empty(qdata.shape[0], k, dtype=torch.uint8, device=qdata.device)
+    codes[:, 0::2] = low & 0xF
+    codes[:, 1::2] = low >> 4
+    if bits == 6:
+        high = packed[:, k // 2:]
+        for j in range(4):
+            codes[:, j::4] |= ((high >> (2 * j)) & 0x3) << 4
+    return codes
+
+
+def decode_grouped_int8(qdata: torch.Tensor, s_rel: torch.Tensor, codebook: torch.Tensor | None = None,
+                        group_size: int = 16, rows: int = 2048) -> torch.Tensor:
+    """A W4A8 / W6A8 weight -> the int8 [N, K] grid it stands for (comfy-kitchen's _dequant_int4_grouped_to_int8),
+    `rows` output rows at a time."""
+    if qdata.ndim != 2 or qdata.dtype != torch.int8 or s_rel.ndim != 2 or s_rel.shape[0] != qdata.shape[0]:
+        raise ValueError("a grouped-scale weight is int8 [N, K * bits / 8] with scales [N, K / group]")
+    n, cols = qdata.shape
+    k = s_rel.shape[1] * group_size
+    bits = cols * 8 // k if k else 0
+    if bits not in (4, 6) or k * bits != cols * 8:
+        raise ValueError(f"packed row width {cols} does not match K={k} at 4 or 6 bits")
+    if bits == 6 and codebook is not None:
+        raise ValueError("6-bit storage is uniform: it has no codebook")
+    if codebook is not None and codebook.numel() != 16:
+        raise ValueError("a 4-bit codebook has 16 levels")
+    levels = codebook.float().reshape(-1) if codebook is not None else None
+    out = torch.empty(n, k, dtype=torch.int8)
+    for a in range(0, n, rows):
+        codes = unpack_grouped_codes(qdata[a:a + rows], k, bits).long()
+        values = levels.to(codes.device)[codes] if levels is not None else codes.float() - float(1 << (bits - 1))
+        values = values.unflatten(1, (k // group_size, group_size)) * s_rel[a:a + rows].float().unsqueeze(-1)
+        out[a:a + rows] = values.flatten(1).round().clamp_(-127, 127).to(torch.int8)
+    return out
+
+
+def quant_weight_from_grouped(meta: dict, weight: torch.Tensor, s_rel: torch.Tensor, s_channel: torch.Tensor,
+                              codebook: torch.Tensor | None = None) -> QuantWeight:
+    """A ComfyUI asym_w4a8_int8 / w6a8_int8 weight as the int8 ConvRot weight it decodes to."""
+    fmt = meta.get("format")
+    if fmt not in GROUPED_INT_FORMATS:
+        raise ValueError(f"not a grouped-scale integer format: {fmt!r}")
+    params = meta.get("params") if isinstance(meta.get("params"), dict) else {}
+    group = int(meta.get("group_size", params.get("group_size", 16)))
+    convrot = int(meta.get("convrot_groupsize", params.get("convrot_groupsize", 256)))
+    q = decode_grouped_int8(weight, s_rel, codebook, group)
+    if weight.shape[1] * 8 // q.shape[1] != GROUPED_INT_FORMATS[fmt]:
+        raise ValueError(f"{fmt}: the packed width {weight.shape[1]} is not {GROUPED_INT_FORMATS[fmt]} bits a weight")
+    if s_channel.numel() != q.shape[0] or q.shape[1] % convrot:
+        raise ValueError(f"{fmt}: {s_channel.numel()} row scales for {q.shape[0]} rows, or K={q.shape[1]} is not a "
+                         f"multiple of the rotation group {convrot}")
+    return QuantWeight("int8_convrot", q, s_channel.float().reshape(-1, 1), None, tuple(q.shape), convrot)

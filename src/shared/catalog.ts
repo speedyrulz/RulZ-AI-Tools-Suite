@@ -12,9 +12,10 @@ export const CATALOG: CatalogApp[] = [
     name: 'RulzTrainer',
     tagline: 'LoRA trainer for diffusion models, with a guided WebUI',
     description:
-      'Train LoRAs for nine image models (MOSS-Image, Bria FIBO 2.0, Krea 2, Qwen-Image 2.1, FLUX 3 Klein, ' +
-      'FLUX.2 Klein 9B, Ideogram 4, MiniMax H3 and P-H3-Image) from your browser. A step-by-step wizard recommends ' +
-      'every setting from your GPU memory and dataset, and the finished LoRAs load straight into ComfyUI.',
+      'Train LoRAs for ten image models (MOSS-Image, Bria FIBO 2.0, Krea 2, Qwen-Image 2.1, FLUX 3 Klein, ' +
+      'FLUX.2 Klein 9B, Ideogram 4, MiniMax H3, P-H3-Image and MiniMax-H3-Image) from your browser. A step-by-step ' +
+      'wizard recommends every setting from your GPU memory and dataset, and the finished LoRAs load straight into ' +
+      'ComfyUI.',
     category: 'AI Training',
     repo: SUITE_REPO,
     path: 'apps/RulzTrainer',

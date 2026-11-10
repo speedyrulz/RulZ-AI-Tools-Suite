@@ -25,6 +25,8 @@ A simple diffusion-model LoRA trainer with a WebUI. Supported models:
   trains them; two 16 GB cards or one with block swap ([details](#minimax-h3)).
 - **P-H3-Image** (33B, PrunaAI): experimental text-to-image LoRAs for PrunaAI's 8-step, guidance-free H3 image model,
   with ostris' P-H3-Image training adapter; two 16 GB cards or one with block swap ([details](#p-h3-image)).
+- **MiniMax-H3-Image** (33B, MiniMax): experimental text-to-image LoRAs for MiniMax's own 6-step, guidance-free image
+  model (4 to 20 MP); two 16 GB cards or one with block swap ([details](#minimax-h3-image)).
 
 | Dark | Light |
 | --- | --- |
@@ -115,9 +117,9 @@ is kept per browser (its local storage).
 1. **Dataset**: a folder of images. Each image may have a same-name `.txt` caption. Use *Scan dataset*
    to see the aspect-ratio buckets. Pick one or more *Training resolutions* (megapixels); see
    "Training resolutions and resolution step-up" below.
-2. **Model**: choose one of the nine base models (or a custom local directory / HF repo id).
+2. **Model**: choose one of the ten base models (or a custom local directory / HF repo id).
    *Download / verify model* fetches its files into `models/`: about 10 to 20 GB for most, about 32 GB for
-   P-H3-Image and over 50 GB for MiniMax H3.
+   P-H3-Image, about 50 GB for MiniMax-H3-Image and over 50 GB for MiniMax H3.
 3. **Start training**. Before it starts, the Train tab lists the usual mistakes, with *Start anyway* (never a
    block): images with no caption, captions that already hold the trigger word (it is put at the start of every
    caption, so they would have it twice) and a learning rate well outside the usual range (a third of the lowest to
@@ -550,7 +552,8 @@ WebUI's *Download now* fetches them ahead of time). `model_file_quant` and `text
 | FLUX 3 Klein Base / distilled | [black-forest-labs/flux-3-image-klein-comfy](https://huggingface.co/black-forest-labs/flux-3-image-klein-comfy) (BFL's own, gated) | int8_convrot 5.8 GB, nvfp4 5.3 GB, bf16 11.1 GB (files; 5.1 / 4.8 / 9.7 GB loaded) | Qwen3-VL-4B int8_convrot 4.9 GB, bf16 8.9 GB | `flux2-vae` |
 | Ideogram 4 | [Comfy-Org/Ideogram-4](https://huggingface.co/Comfy-Org/Ideogram-4) | int8_convrot 9.6 GB, fp8_scaled 9.3 GB, nvfp4_mixed 5.5 GB (no bf16 release) | Qwen3-VL-8B: int8_convrot 9.4 GB and bf16 17.5 GB from Comfy-Org/Qwen-Image-2.1 (the same model), fp8_scaled 10.6 GB and nvfp4 6.3 GB from Comfy-Org/Ideogram-4 | `flux2-vae` |
 | MiniMax H3 FL2VA / Ref2VA | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3) | pruned_int8_convrot 21.0 GB, pruned_bf16 40.2 GB, int8_convrot 34.0 GB, bf16 66.3 GB | Qwen3-VL-32B (50 layers) int8_convrot 27.1 GB, nvfp4_awq 15.7 GB, bf16 51.5 GB | `minimax_h3_video_vae_fp16` (5.2 GB) + `minimax_h3_audio_vae_fp32` (0.6 GB) |
-| P-H3-Image | [PrunaAI/P-H3-Image-Comfy](https://huggingface.co/PrunaAI/P-H3-Image-Comfy) | int8_convrot 21.2 GB, bf16 40.5 GB (both pruned; w4a8 is not read) | Qwen3-VL-4B + text connector int8_convrot 5.1 GB, bf16 9.1 GB | `p-h3-image_vae_bf16` (5.6 GB) |
+| P-H3-Image | [PrunaAI/P-H3-Image-Comfy](https://huggingface.co/PrunaAI/P-H3-Image-Comfy) | int8_convrot 21.2 GB, bf16 40.5 GB (both pruned; the w4a8 file reads when you set it yourself) | Qwen3-VL-4B + text connector int8_convrot 5.1 GB, bf16 9.1 GB | `p-h3-image_vae_bf16` (5.6 GB) |
+| MiniMax-H3-Image | [Comfy-Org/MiniMax-H3-Image](https://huggingface.co/Comfy-Org/MiniMax-H3-Image) | int8_convrot 21.0 GB, bf16 40.2 GB, w4a8 12.5 GB (all pruned; w4a8 holds int8 weights once read) | MiniMax H3's Qwen3-VL-32B files, from Comfy-Org/MiniMax-H3 (the same bytes) | `minimax_h3_image_vae_fp16` (1.2 GB) |
 
 To use files you already have, set `transformer_file`, `text_encoder_file` and `vae_file` (the WebUI's optional file
 fields): only the ones left empty are downloaded. Fused-qkv ("repacked") files are split back automatically. The
@@ -3072,7 +3075,9 @@ What is modeled on evidence, and what is not:
 (sizes from the Hub): the diffusion model as `pruned_int8_convrot` (21.0 GB; the WebUI and the wizard pick it for H3),
 `pruned_bf16` (40.2 GB), `int8_convrot` (34.0 GB) or `bf16` (66.3 GB); the text encoder as `int8_convrot` (27.1 GB),
 `nvfp4_awq` (15.7 GB) or `bf16` (51.5 GB), all cut to the 50 layers H3 reads; the video VAE (5.2 GB) and the audio
-VAE (0.6 GB). `pruned_fp8_scaled` reads too (dequantized); the `w6a8` files use a format this trainer cannot read. A bf16
+VAE (0.6 GB). `pruned_fp8_scaled` reads too (dequantized), and so do the `w6a8` files when you set one yourself: ComfyUI's
+6-bit weights are decoded on read to the int8 ConvRot weights they stand for, so they take int8's memory (the reader is
+[MiniMax-H3-Image's](#minimax-h3-image); not tried on a real w6a8 file). A bf16
 source is quantized layer by layer as it is read (`transformer_quant: auto`: int8 for about 30 GB of GPUs, else nvfp4),
 so the bf16 model never sits in RAM whole. `model_source: hf` downloads only what it reads of the 498 GB repo (the
 FL2VA `transformer/` or Ref2VA `transformer_ref/` (66 GB), the text encoder's shards with layers 0-49, the tokenizer
@@ -3168,7 +3173,8 @@ ai-toolkit's `p_h3_image.py`):
 **Files.** `model_source: files` downloads from
 [PrunaAI/P-H3-Image-Comfy](https://huggingface.co/PrunaAI/P-H3-Image-Comfy): the transformer as `int8_convrot` (21.2 GB,
 the default) or `bf16` (40.5 GB), the text encoder with its connector as `int8_convrot` (5.1 GB) or `bf16` (9.1 GB), and
-the VAE (5.6 GB; its int8 file loads too, dequantized). The `w4a8` files use a format this trainer cannot read. The
+the VAE (5.6 GB; its int8 file loads too, dequantized). The `w4a8` file reads when you set it yourself (decoded on read to
+int8 weights, as [MiniMax-H3-Image's](#minimax-h3-image); not tried on PrunaAI's file). The
 Hugging Face source (`model_source: hf`) fetches PrunaAI/P-H3-Image without its 19 GB prompt upsampler. Memory is as for
 MiniMax H3 (the same 21 GB transformer): two 16 GB cards in `model_split`, or one with `block_swap`; the text encoder
 fits one card while the captions cache.
@@ -3193,6 +3199,106 @@ training adapter), the connector and prompt encoding against diffusers' math (a 
 the single-frame decoder against diffusers' `PH3ImageViTDecoder` forward (fp32 exact, bf16 close), the audio stream at
 the video sigma, the 8-step sampler, the adapter in its published layout, and detection, downloads, caches and the
 wizard.
+
+## MiniMax-H3-Image
+
+RulzTrainer trains **text-to-image LoRAs** for
+[MiniMaxAI/MiniMax-H3-Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image), MiniMax's own image model (released
+10 November 2026): the H3 transformer (33B, 50 blocks) without its audio stream, distilled to render in 6 steps with
+no guidance, at 4 to 20 megapixels. It keeps H3's Qwen3-VL-32B text encoder unchanged and has its own image VAE (16x,
+24 channels; a token is a 2x2 patch, 32 x 32 px). Pick the **MiniMax-H3-Image** preset. Experimental; edit training
+(its image editing with up to 16 reference pictures) is not supported here, only text-to-image.
+
+**Licence.** The MiniMax-H3-Image Community License Agreement, which is not H3's. It excludes the USA, the EU, the UK
+and South Korea unless MiniMax authorizes the use ([application form](https://platform.minimax.io/license)), and it
+requires the same separate authorization above 1 million USD of annual revenue or to offer the model as a hosted
+service. A LoRA is a Model Derivative: share it with a copy of the agreement and the NOTICE file it prescribes. Model
+outputs may not be used to train other AI models.
+
+**What it is, and how it is checked** (`rulztrainer/h3image/`, the transformer in `rulztrainer/h3/model.py`; read
+from diffusers' `minimax_h3_image` modular pipeline, ComfyUI's `MiniMaxH3ImageModel` and the released files):
+
+- **The transformer** is H3's port with `audio_latents_dim=None`: one packed sequence `[text | image]`, the image one
+  frame at rotary time = the caption's length, text and image rows at the one time t = 1 - sigma (diffusers'
+  `build_image_packed_sequence` for a text-to-image request). H3's module names, so Comfy-Org's files load as they are
+  and LoRAs use H3's layout. Verified against diffusers' `MiniMaxH3ImageTransformer2DModel.forward`, written out in
+  the tests on diffusers' own H3 blocks (tiny random config, fp32, a padded batch against each sample alone).
+- **Six output heads.** The model is step-distilled with one output head per sampling step ("PDD"), on the sigma grid
+  1, 0.968, 0.888, 0.75, 0.533, 0.232, 0 (`pdd_config.json`, the Comfy-Org files' metadata, diffusers'
+  `sample_sigmas`: the same numbers). The three released layouts hold the same heads, compared on the released bytes:
+  MiniMaxAI's `pdd_fused_heads.safetensors` and diffusers' `pdd_proj_out.0-5` are full heads, bit for bit the same;
+  Comfy-Org stacks them in `final_layer.video_out` as head 0 followed by each head's difference from head 0. The port
+  holds Comfy-Org's layout. MiniMaxAI's `transformer/` also carries a single `final_layer.video_out` that is none of
+  the six; it is not used. A **sampling step** uses the head of its own step (other step counts: the
+  step-size-weighted mean of the heads a step spans, ComfyUI's rule). A **training step** uses the head of the grid
+  interval that holds its sigma, ai-toolkit's rule for checkpoints with such heads. The heads are close to each other
+  (each differs from head 0 by about 2% of its norm).
+- **Timesteps.** MiniMax has not published how the model was trained. `timestep_sampling: reference` here is the
+  trainer's own choice: a position drawn uniformly along the 6-interval grid (read piecewise-linearly in its index,
+  as ComfyUI's sampling reads it), so each head trains on an equal share of the steps and on the sigmas its sampling
+  step covers. The other samplers (logit-normal and so on) work as for any model.
+- **No training adapter.** The model is step- and guidance-distilled, and on 10 November 2026 nobody has published
+  a training adapter for it (circlestone-labs' *MiniMax-H3-Image-Training-Adapter* is an image adapter for H3 itself,
+  despite its name, and is refused here). `training_adapter: auto` resolves to none, so a LoRA trains on the
+  distilled model as it is. The siblings suggest what to watch for: LoRAs trained bare on H3 and P-H3-Image drift.
+  Set an adapter file once one exists.
+- **Text features** are MiniMax H3's, byte for byte the same tokenizer (the Hub's blob ids agree) and the same
+  recipe: the caption verbatim, no chat template, the state after decoder layer 50 (diffusers'
+  `MiniMaxH3ImageTextEncoderStep`).
+- **The VAE** encodes with H3's video encoder run over one frame (Comfy-Org's image and video VAE files hold the
+  same encoder weights, compared on four tensors, and the same latent statistics) and decodes with its own 2D ViT
+  (24 blocks at width 1024, rotary positions over height and width only), one 16 x 16 pixel block per latent cell,
+  in 256 px tiles blended over their overlaps as released. It is built on the H3 classes diffusers 0.40+ ships, with
+  the decoder swapped, so no newer diffusers is needed. The decoder is checked against diffusers'
+  `MiniMaxH3ImageViTDecoder2d.forward`, written out in the tests (fp32 exact, tiles included).
+- **Resolution.** The model is made for 4 to 20 MP; MiniMax's pipeline renders anything smaller on a 4 MP canvas and
+  scales it down. Here training, samples and probes run at the sizes you set. 1 MP training is 1024 image tokens a
+  step; 4 MP is 4096, the cost of 1 MP on a model with 16 px tokens. Set the sample resolution to 4 MP to judge a LoRA
+  at the model's real quality. The VAE also keeps less of a small picture: on three 768 x 1152 portraits of a
+  generated character, encoding and decoding gave 28.8 to 36.6 dB (mean 32.5) at their own size, with fine facial
+  detail visibly redrawn, and 35.6 to 40.4 dB (mean 38.0) when the same photos were encoded at twice the size and
+  scaled back. Whether training above 1 MP gives a better LoRA has not been measured.
+- **Run on the real weights so far** (10 November 2026): the VAE round trip above and the w4a8 reader below, on the
+  released files. **Not yet run**: the transformer on its real weights, a sample, or a training step. Its forward is
+  checked against the reference math on tiny random weights only, so treat a first run as the test.
+
+**Files.** `model_source: files` downloads from
+[Comfy-Org/MiniMax-H3-Image](https://huggingface.co/Comfy-Org/MiniMax-H3-Image) (sizes from the Hub): the transformer
+as `int8_convrot` (21.0 GB, the default), `bf16` (40.2 GB) or `w4a8` (12.5 GB), all with the pruned AdaLN table of
+Comfy-Org's H3 files, and the image VAE (1.2 GB). The text encoder is MiniMax H3's file (`int8_convrot` 27.1 GB,
+`nvfp4_awq` 15.7 GB or `bf16` 51.5 GB), the same bytes in both of Comfy-Org's repos (the Hub's sha256), so it is
+fetched from Comfy-Org/MiniMax-H3 and a copy already downloaded for H3 is used again. `model_source: hf` downloads
+what it reads of MiniMaxAI/MiniMax-H3-Image (about 125 GB): `transformer/` in MiniMaxAI's own layout (per-head
+interleaved qkv, full AdaLN, pruned on load to rank 8), `pdd_fused_heads.safetensors`, `pdd_config.json`, the text
+encoder's first 11 shards (layers 0-49), the tokenizer and `vae/`. A folder that holds only diffusers'
+`transformer_diffusers/` and `vae_diffusers/` loads too.
+
+**The w4a8 file** is ComfyUI's 4-bit format (`asym_w4a8_int8`, comfy-kitchen's `AsymW4A8Int8Layout`): each weight a
+4-bit index into a 16-level codebook, times an fp8 scale per 16 columns, which ComfyUI rounds onto an int8 grid before
+it multiplies. The trainer decodes it to that int8 ConvRot weight as it reads the file. Nothing is lost against what
+ComfyUI computes, but the model then takes int8's memory (21 GB, not 12.5): it is a smaller download, at lower
+precision than the int8 file. Checked on the released files: four layers decoded from the w4a8 file match the same
+layers of the int8 file at cosine 0.997 (a relative error of 7.4%, the 4-bit format's own; with the nibbles swapped
+the cosine is 0, without the codebook 0.86). The same reader takes the 6-bit `w6a8_int8` files of H3 and
+P-H3-Image's `w4a8`, whose headers declare the same layout (not tried on those files).
+
+**Memory** is as for [MiniMax H3](#minimax-h3) (the same 21 GB transformer, less the audio projections): two 16 GB
+cards in `multi_gpu: model_split`, one 16 GB card with `block_swap`, or one 24-32 GB card whole.
+
+**Recipe** (what the setup wizard suggests): H3's (rank 16, 32 for styles, alpha = rank, learning rate 1e-4,
+`adamw8bit`, the default `qkv_proj` / `out_proj` / `fc1` / `fc2` targets), `timestep_sampling: reference`, no training
+adapter, 1 MP buckets on the 32 px grid, and samples and probes at 6 steps, CFG 1. These are starting values taken
+from the siblings, not measurements.
+
+**Export**: H3's layout (`diffusion_model.blocks.<n>.attn.qkv_proj.lora_A/B`, alpha = rank), which ComfyUI's Load
+LoRA reads on the MiniMax-H3-Image files. The output heads are never a LoRA target.
+
+Tests: `tests/test_h3image.py` (weight-free) checks the port against the reference forward on the packed image
+layout, the heads in their three layouts and which heads a training or sampling forward uses, the released files'
+headers against the port (`tests/fixtures/minimax_h3_image_headers.json`: names, dtypes and shapes only: the three
+diffusion models, both VAE layouts, the heads file, the first and last shard of both folder layouts), the 4-bit and
+6-bit weights against comfy-kitchen's packing, a single file and both folder layouts loading the same model, the VAE
+decoder and its tiling, the sampler, and detection, downloads, caches and the wizard.
 
 ## Using the LoRA in ComfyUI
 

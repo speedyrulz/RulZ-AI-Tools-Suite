@@ -68,7 +68,9 @@ for _t in ("adaln", "text_in", "embed"):
     EXTRA_TARGETS[_t] = (EXTRA_TARGETS[_t][0] + ("ideogram4",), EXTRA_TARGETS[_t][1])
 N_BLOCKS["minimax_h3"] = 50
 N_BLOCKS["p_h3_image"] = 50  # P-H3-Image: H3's transformer
-EXTRA_TARGETS["token_refiner"] = (("minimax_h3", "p_h3_image"), EXTRA_TARGETS["token_refiner"][1])
+N_BLOCKS["minimax_h3_image"] = 50  # MiniMax-H3-Image: H3's transformer without the audio stream
+EXTRA_TARGETS["token_refiner"] = (("minimax_h3", "p_h3_image", "minimax_h3_image"),
+                                  EXTRA_TARGETS["token_refiner"][1])
 COMPILE_CHOICES = {"auto": "auto: runs of 100+ steps", True: "on", False: "off"}
 N_BLOCKS_MAX = max(N_BLOCKS.values())
 
@@ -98,6 +100,8 @@ ADAPTER_MODES["auto"] = "The model's training adapter (downloaded; Qwen-Image 2.
 # MiniMax H3's Comfy-Org formats (h3/loading.py: the pruned files drop the ~13B AdaLN parameters)
 FILE_QUANT_LABELS.update({"pruned_int8_convrot": "pruned int8 ConvRot (21.0 GB, for 16 GB cards)",
                           "pruned_bf16": "pruned bf16 (40.2 GB)", "nvfp4_awq": "NVFP4 AWQ (15.7 GB)"})
+# MiniMax-H3-Image's 4-bit file (ComfyUI's asym_w4a8_int8): decoded on read to the int8 weight it stands for
+FILE_QUANT_LABELS["w4a8"] = "w4a8 (4-bit file, 12.5 GB to download; int8 in memory)"
 SAMPLE_ASPECTS = {"1:1": "1:1 square", "4:5": "4:5 portrait", "3:4": "3:4 portrait", "2:3": "2:3 portrait",
                   "9:16": "9:16 portrait", "5:4": "5:4 landscape", "4:3": "4:3 landscape", "3:2": "3:2 landscape",
                   "16:9": "16:9 landscape", "21:9": "21:9 wide"}
@@ -4288,6 +4292,9 @@ MODEL_GB["ideogram4"] = {"bf16": 18.6, "int8": 9.6, "nvfp4": 5.5}
 MODEL_GB["minimax_h3"] = {"bf16": 40.2, "int8": 21.0, "nvfp4": 12.5}
 # P-H3-Image: the same pruned transformer (PrunaAI/P-H3-Image-Comfy: bf16 40.5 GB, int8_convrot 21.2 GB)
 MODEL_GB["p_h3_image"] = {"bf16": 40.5, "int8": 21.2, "nvfp4": 12.5}
+# MiniMax-H3-Image: the same pruned transformer less the audio projections (Comfy-Org/MiniMax-H3-Image: bf16 40.2 GB,
+# int8_convrot 21.0 GB; the 12.5 GB w4a8 file holds int8 weights once it is read)
+MODEL_GB["minimax_h3_image"] = {"bf16": 40.2, "int8": 21.0, "nvfp4": 12.5}
 STEP_HEADROOM_GB = 4.5
 
 
@@ -4373,6 +4380,17 @@ MODEL_NOTES = {
                                    "only here (no edit training). MiniMax H3 Community License: users in the USA, EU, "
                                    "UK and South Korea need a license from MiniMax first; products show 'Powered by "
                                    "MiniMax H3'."),
+    "MiniMax-H3-Image": ("Experimental", "MiniMax's own image model (33B): the H3 transformer without its audio "
+                                         "stream, made to render in 6 steps with no guidance, at 4 to 20 megapixels. "
+                                         "Trains on Comfy-Org's files (int8 21.0 GB, the same size as H3's: two 16 GB "
+                                         "cards in model split, or one with block swap) with H3's Qwen3-VL-32B text "
+                                         "encoder (27.1 GB int8, 15.7 GB NVFP4; an H3 download is reused) and a small "
+                                         "image VAE (1.2 GB). No training adapter exists for it yet, so it trains on "
+                                         "the distilled model as it is. Text-to-image only here (no edit training). "
+                                         "MiniMax-H3-Image Community License: it excludes the USA, EU, UK and South "
+                                         "Korea unless MiniMax authorizes it (platform.minimax.io/license), which "
+                                         "is also required above 1 million USD of annual revenue or to offer it as "
+                                         "a hosted service."),
     "MiniMax-H3-Ref2VA": ("Not for training", "The reference-to-video H3 checkpoint (up to 9 images, 3 videos, 3 "
                                               "audio clips as references). Train on MiniMax-H3-FL2VA: this trainer "
                                               "trains text-only one-frame LoRAs, and a LoRA made on one H3 checkpoint "
@@ -4665,7 +4683,35 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
         h3_recommendations(cfg, r, goal, gpus, vram, character)
     elif cfg.arch_name() == "p_h3_image":
         ph3_recommendations(cfg, r, goal, gpus, vram, character)
+    elif cfg.arch_name() == "minimax_h3_image":
+        h3image_recommendations(cfg, r, goal, gpus, vram, character)
     return r
+
+
+def h3image_recommendations(cfg: TrainConfig, r: dict, goal: str | None, gpus: list[dict], vram: float | None,
+                            character: bool) -> None:
+    """MiniMax-H3-Image: H3's recipe and memory plan (the same pruned 21 GB transformer and the same text encoder),
+    with its own files, no training adapter (none exists yet) and its 6-step sampling. Estimates, not measurements:
+    nothing has been trained on it here."""
+    h3_recommendations(cfg, r, goal, gpus, vram, character)
+    if cfg.model_source == "files":
+        r["model_file_quant"] = ("int8_convrot", "Comfy-Org's pruned int8 file (21.0 GB): the attention and "
+                                                 "feed-forward layers the LoRA trains are the full model's (the 4-bit "
+                                                 "w4a8 file is a smaller download that takes the same memory, at "
+                                                 "lower precision)")
+    r["resolutions"] = ([1.0], "1 MP: 1024 image tokens a step (a token covers 32 x 32 px). The model itself renders "
+                               "at 4 MP and up, 4096 tokens a step: train higher if your photos are that large")
+    r["timestep_sampling"] = ("reference", "a position drawn evenly along the model's own 6-step noise schedule, so "
+                                           "each of its 6 output heads gets an equal share of the steps (this "
+                                           "trainer's choice: MiniMax has not published how it was trained)")
+    if not cfg.finetune:
+        r["adapter_mode"] = ("none", "no training adapter exists for MiniMax-H3-Image yet. It is step- and "
+                                     "guidance-distilled, so a LoRA trained on it bare may drift: watch the samples")
+    r["sample_steps"] = (6, "MiniMax-H3-Image's own 6-step schedule (one output head per step)")
+    r["sample_cfg"] = (1.0, "MiniMax-H3-Image is guidance-distilled: no CFG")
+    if character:
+        r["probe_steps"] = (6, "the probes sample as the previews do")
+        r["probe_cfg"] = (1.0, "MiniMax-H3-Image is guidance-distilled: no CFG")
 
 
 def ph3_recommendations(cfg: TrainConfig, r: dict, goal: str | None, gpus: list[dict], vram: float | None,
@@ -5705,12 +5751,14 @@ class Wizard:
                                                            "and FLUX 3 Klein, Qwen3-8B for FLUX.2 Klein 9B, "
                                                            "Qwen3-VL-8B for Qwen-Image 2.1 and "
                                                            "Ideogram 4, Qwen3-VL-32B (cut to 50 layers) for MiniMax "
-                                                           "H3, P-H3-Image's Qwen3-VL-4B with its text connector for "
-                                                           "P-H3-Image.", "file"),
+                                                           "H3 and MiniMax-H3-Image (the same file), P-H3-Image's "
+                                                           "Qwen3-VL-4B with its text connector for P-H3-Image.",
+                 "file"),
                 ("vae_file", "VAE file", "The Flux2 VAE for MOSS-Image, FIBO 2.0, both Kleins and Ideogram 4, the "
                                          "Qwen-Image VAE for Krea 2, its own for Qwen-Image 2.1, the video VAE for "
                                          "MiniMax H3 (its audio VAE is found next to it or downloaded), its own "
-                                         "single-frame VAE for P-H3-Image.", "file"),
+                                         "single-frame VAE for P-H3-Image, its own image VAE for MiniMax-H3-Image.",
+                 "file"),
                 ("tokenizer_path", "Tokenizer folder", "Left empty, the tokenizer is downloaded once (a few MB).",
                  "dir")):
             with self.setting(None, title, text + " Optional: left empty, it is downloaded.", adv=True,
@@ -5918,12 +5966,14 @@ class Wizard:
             self.bind(ui.switch("Attention gate"), "target_attn_gate")
         is_qwen = ("model_preset", lambda p: preset_arch(p, self.w["model_path"].value) in ("qwen_image21",
                                                                                               "minimax_h3",
-                                                                                              "p_h3_image"))
+                                                                                              "p_h3_image",
+                                                                                              "minimax_h3_image"))
         with self.setting("adapter_mode", "Training adapter",
                           "A small LoRA that stays on while your LoRA trains and off for samples and probes, and is "
                           "never saved into it. Fizgig measured on Qwen-Image 2.1: without one, LoRAs collapse into "
                           "texture or wobble part-way; with it likeness reached 77 against 56. MiniMax H3's is "
-                          "circlestone-labs' image training adapter, P-H3-Image's ostris' (the one ai-toolkit uses).",
+                          "circlestone-labs' image training adapter, P-H3-Image's ostris' (the one ai-toolkit uses). "
+                          "MiniMax-H3-Image has none yet: pick a file once one is published.",
                           show_if=is_qwen, adv=True):
             self.bind(ui.select(ADAPTER_MODES, label="Training adapter"), "adapter_mode").classes("w-full")
         hw = ui.column().classes("w-full gap-3 pt-2")
@@ -8135,11 +8185,11 @@ def build_page(local: bool = True):
                                                             "for Krea 2, FIBO 2.0 and FLUX 3 Klein; Qwen3-8B for "
                                                             "FLUX.2 Klein; Qwen3-VL-8B for "
                                                             "Qwen-Image 2.1 and Ideogram 4; Qwen3-VL-32B for MiniMax "
-                                                            "H3.")
+                                                            "H3 and MiniMax-H3-Image.")
                             path_input(f, "vae_file", "VAE file (optional)", "file", "", "w-[40rem]") \
                                 .tooltip("Empty: downloaded. Flux2's for MOSS-Image, FIBO 2.0, both Kleins and "
                                          "Ideogram 4; Qwen-Image's for Krea 2; its own for Qwen-Image 2.1; the video "
-                                         "VAE for MiniMax H3.")
+                                         "VAE for MiniMax H3; its own image VAE for MiniMax-H3-Image.")
                             path_input(f, "tokenizer_path", "Tokenizer folder (optional)", "dir", "", "w-[40rem]") \
                                 .tooltip("Empty: downloaded with the model.")
                         subhead("GPUs and memory")
@@ -8569,7 +8619,8 @@ def build_page(local: bool = True):
                                          "into texture or wobble part-way (likeness 77 with it, 56 without). "
                                          "MiniMax H3's is circlestone-labs' image training adapter (0.62 GB), "
                                          "P-H3-Image's ostris' P-H3-Image adapter (0.16 GB). The "
-                                         "other models have none of their own; a file works on any.")
+                                         "other models have none of their own (MiniMax-H3-Image: none exists "
+                                         "yet); a file works on any.")
                             path_input(f, "training_adapter", "Training adapter file", "file", "", "w-[30rem]")
                             f.w["training_adapter"].parent_slot.parent.bind_visibility_from(w["adapter_mode"], "value",
                                                                                             lambda x: x == "file")
@@ -9052,6 +9103,14 @@ def build_page(local: bool = True):
                              "size.").bind_visibility_from(w["model_preset"], "value",
                                                            lambda p: preset_arch(p, w["model_path"].value) ==
                                                            "p_h3_image")
+                        hint("MiniMax-H3-Image: samples render its own 6 steps at CFG 1, each step through the "
+                             "output head made for it; Shift is ignored and no turbo LoRA applies. The model is made "
+                             "for 4 to 20 MP: MiniMax's own pipeline renders anything smaller on a 4 MP canvas and "
+                             "scales it down. Here a preview renders at the size you set, so set Resolution to 4 MP "
+                             "to see the LoRA at the model's real quality (4096 tokens a step, about four times a "
+                             "1 MP preview's time).").bind_visibility_from(
+                            w["model_preset"], "value",
+                            lambda p: preset_arch(p, w["model_path"].value) == "minimax_h3_image")
                         hint("MOSS-Image: lodestones' turbo LoRA renders 12 steps at CFG 1 on Base. Fizgig found it "
                              "can understate likeness: judge a run's likeness on full-quality samples (Turbo LoRA: "
                              "none, 20 steps, CFG 3). Training on Base, the samples also carry Kijai's SFT LoRA "
@@ -11953,6 +12012,36 @@ Load LoRA reads on PrunaAI's P-H3-Image files.
 
 P-H3-Image is under the MiniMax H3 Community License Agreement (its Qwen parts under Apache 2.0): users in the USA, EU,
 UK and South Korea need a license from MiniMax first, and products built on it show "Powered by MiniMax H3".
+
+## MiniMax-H3-Image
+
+MiniMax-H3-Image is MiniMax's own image model: the H3 transformer (33B) without its audio stream, made to render in
+6 steps with no guidance, at 4 to 20 megapixels (a token covers 32 x 32 px). Pick **MiniMax-H3-Image**: it trains
+text-to-image LoRAs (edit training with reference images is not supported here) that load in ComfyUI on Comfy-Org's
+files. This is experimental: nothing has been trained on it here yet.
+
+The single files come from Comfy-Org/MiniMax-H3-Image: the transformer in *int8 ConvRot* (21.0 GB, already pruned),
+*bf16* (40.2 GB) or *w4a8* (12.5 GB: ComfyUI's 4-bit file, read into the int8 weights it stands for, so it is a smaller
+download that takes the same memory as int8), and the image VAE (1.2 GB). The text encoder is MiniMax H3's own
+Qwen3-VL-32B file (int8 27.1 GB or NVFP4 15.7 GB), so a copy downloaded for H3 is used again. Memory is as for
+MiniMax H3: two 16 GB cards in **model split**, or one with **block swap**.
+
+The model has one output head for each of its 6 sampling steps. Training sends every step through the head whose
+part of the noise schedule it falls in, and *reference* timesteps (the wizard's suggestion) give each head an equal
+share. It is step- and guidance-distilled and **no training adapter exists for it yet**, so it trains on the distilled
+model as it is: watch the samples for drift, and switch an adapter on (Training adapter: a file) once one is published.
+
+Samples render its own 6 steps at CFG 1. MiniMax's pipeline renders anything under 4 MP on a 4 MP canvas and scales
+it down; here a preview renders at the size you set, so set the sample resolution to 4 MP to judge the LoRA at the
+model's real quality.
+
+LoRAs are saved in H3's layout (`diffusion_model.blocks.N.attn.qkv_proj.lora_A/B`, alpha = rank), which ComfyUI's
+Load LoRA reads on the MiniMax-H3-Image files.
+
+MiniMax-H3-Image is under the MiniMax-H3-Image Community License Agreement: it excludes the USA, EU, UK and South
+Korea unless MiniMax authorizes it (platform.minimax.io/license), which is also required above 1 million USD of
+annual revenue or to offer the model as a hosted service. A LoRA is a Model Derivative: share it with a copy of the
+agreement and its NOTICE file.
 """
 
 
