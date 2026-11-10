@@ -307,6 +307,70 @@ never rents, stops or destroys an instance, so an instance you leave running kee
 the instance, the host keys, pulled runs) are in `~/.rulz_vast`; `RULZ_VAST_INSTANCE`, `RULZ_VAST_KEY`, `RULZ_VAST_DIR`
 and `RULZ_VAST_HOME` set the defaults. In Git Bash, set `MSYS_NO_PATHCONV=1` or paths like `/workspace/x` get rewritten.
 
+### Several instances at once: the fleet
+
+`scripts/vast/rulz_fleet.py` and the WebUI's **Fleet** tab treat every instance you have running as one fleet, from
+your own computer. Run the WebUI here (`python webui.py`, no GPU needed for this tab) or the command line; both read
+and write the same files in `~/.rulz_vast/fleet`.
+
+![The Fleet tab: two instances, the fleet queue](docs/screenshots/06-fleet.png)
+
+- **One page for every instance.** Each instance has a card: its run, progress, loss, time left, cost so far, the last
+  likeness probe, a small loss and likeness chart, disk and GPU. *Find instances* asks vast.ai which instances are
+  running; new RulzTrainer ones join by themselves, stopped and destroyed ones are marked.
+- **A queue over the instances.** A queued run goes to the first instance with nothing running and nothing waiting in
+  its own queue, and when an instance finishes its run it takes the next one. A run can be tied to one instance. A local
+  dataset folder can be sent first when the instance does not have it; the settings' paths into that folder are pointed
+  at `datasets/<name>` there. A run an instance refuses is offered to the others, and one refused by all is set aside
+  with the reason.
+- **A race split over instances.** `--split` (the tab's *Split a race over the instances*) deals a race's
+  configurations over the instances, one part each. A part with one configuration trains as a plain run with that
+  row's settings, a part with several as a race among them; the parts form a group that is compared by best likeness
+  (`group NAME`, or the run's details on the tab). Each part is a full run, so nothing is dropped across instances.
+  A relay (`race_follow`) cannot be split: every configuration continues from each round's winner.
+- **Every run on record.** Each run seen on any instance is kept with its settings, numbers, probe scores, thinned
+  loss, time and cost, also after the instance is destroyed. Runs already on an instance when it joins are listed too.
+- **Downloads, each kind by its own rule.** Logs and settings, probe images, sample images, training maps, the best
+  LoRA and every LoRA / checkpoint each have a rule: *never*, *when the run ends* or *while it runs* (every 300 s by
+  default). A single run can have its own rules. Files land in `~/.rulz_vast/runs/<instance>/<job>`, each fetched once
+  at its size. The defaults: logs and probes while it runs; samples, maps and the best LoRA at the end; every LoRA never.
+- **Watches.** A watch raises an event when a number goes above or below a value: a run's (`step`, `progress`, `loss`,
+  `avg_loss`, `lr`, `grad_norm`, `eta`, `elapsed`, `step_time`, `cost`), its last probe's (`face`, `body`, `combined`
+  and their `_ema`, `best`, `since_improve`, `copy`, ...) or the machine's (`disk_free_gb`, `gpu_temp`, `gpu_util`,
+  `gpu_mem_mb`). It fires once per run, or with `--repeat` every time the number comes back to that side. `wait`
+  blocks until a watch fires or a run ends and prints the events, so an AI assistant sets its lines, starts `wait` in
+  the background and is woken by the event instead of checking by hand.
+
+```bash
+python scripts/vast/rulz_fleet.py instances --refresh      # find the running instances
+python scripts/vast/rulz_fleet.py status                   # every instance, its run, the queue, the watches
+python scripts/vast/rulz_fleet.py queue add --job t1 --from my_lora --set steps=300
+python scripts/vast/rulz_fleet.py queue add --job race1 --config race.yaml --split --push C:\sets\anna
+python scripts/vast/rulz_fleet.py download probes=during loras=end --every 300
+python scripts/vast/rulz_fleet.py watch add avg_loss above 0.5 --note "diverging?"
+python scripts/vast/rulz_fleet.py daemon                   # keeps looking (or keep the WebUI open)
+python scripts/vast/rulz_fleet.py wait                     # blocks until a watch fires or a run ends
+python scripts/vast/rulz_fleet.py runs --last 20           # past runs; run KEY for one, group NAME for a split race
+```
+
+| Command | What it does |
+|---|---|
+| `instances --refresh`, `add ID`, `remove ID` | The fleet's instances. `disable` / `enable ID` stop and resume looking at one; `hold` / `accept ID` keep the queue's runs off it or let them back |
+| `status`, `metrics` | Everything in one look; the numbers a watch can read, with each instance's values now |
+| `queue`, `queue add`, `queue remove ID`, `queue move ID --delta N`, `queue pause` / `resume` / `clear` | The fleet's queue. `add` takes `--job`, `--config FILE` or `--from JOB[@INSTANCE]`, `--set KEY=VALUE`, `--preset`, `--instance ID`, `--push FOLDER`, `--split [PARTS]`, `--download KIND=RULE`, `--overwrite`. It runs the trainer's own checks on a reachable instance first (`--no-check` skips them) |
+| `runs`, `run NAME`, `group NAME` | The history (`--state`, `--job`, `--instance`, `--group`); one run (`--full` with settings and loss, `--forget` drops it); a split race's parts, best first |
+| `download [KIND=RULE ...]`, `pull NAME --what KIND` | The download rules (`off`, `end`, `during`; kinds `logs`, `probes`, `samples`, `maps`, `best`, `loras`), for all runs or `--run NAME`; a download now |
+| `watch add METRIC above/below VALUE`, `watch list`, `watch remove ID` (or `all`) | Watches, with `--job PATTERN`, `--instance ID`, `--repeat`, `--note` |
+| `wait`, `events` | Blocks until an event that needs a look (`--on KIND` picks others, `--timeout S` exits 2); the list of what happened. Each reader (`--reader NAME`) is given every event once |
+| `daemon`, `tick` | The loop that does the work; one look |
+| `stop NAME`, `stop NAME --kill` | The WebUI's Stop or Kill on the instance that runs that job |
+
+Something has to keep looking for the queue, the downloads and the watches to work: the WebUI on your computer,
+`daemon`, or a `wait` while it blocks. Only one of them looks at a time (a lock file); the others read what it wrote.
+Like `rulz_remote.py`, the fleet never rents, stops or destroys an instance, a run it starts goes through that
+instance's own WebUI queue, and an instance left running keeps billing. An instance's disk goes with the instance:
+what the rules have not downloaded by then is gone.
+
 ## How it trains
 
 - **Caching first.** On the first run the Flux2 VAE encodes every image into normalized 128-channel
