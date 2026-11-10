@@ -5207,7 +5207,7 @@ EXPERIMENTS = [
                "against 74.2.",
      "cost": "None beyond the choice."},
     {"key": "region_steer", "group": "Likeness boosters", "title": "Region steering", "off": False,
-     "control": "switch", "evidence": "untested",
+     "control": "switch", "evidence": "mixed",
      "short": "Turns a picture's background or clothes down when they are learned faster than the person.",
      "what": "The region watch reads every training step's loss for the face, hair, skin, clothes and background. "
              "Region steering acts on it once an epoch, by rules that are each on their own setting on the Train "
@@ -5215,36 +5215,40 @@ EXPERIMENTS = [
              "per-picture rule for pictures whose scenery runs ahead of the others', and, off unless asked for, a "
              "raise for a lagging face, hair or skin and a pull of the background towards the base model. What it "
              "takes from a region goes to the rest of that picture.",
-     "tested": "Never run in a real training, and its defaults are uncalibrated. Offline, splitting the training "
-               "maps of four Qwen-Image 2.1 runs the same way showed the face learned about three times as fast as "
-               "the background at step 1000 and the gap closing by step 2000. Whether steering on that improves "
-               "the likeness or how well prompts are followed is not measured.",
+     "tested": "Measured once, on a Qwen-Image 2.1 fine-tune (59 pictures, 2000 steps): at its defaults every reading "
+               "stayed within about half a point of the plain run, on the training pictures and on held-out photos. "
+               "It turned the clothes down on 49 pictures, typically to 0.82, and no picture triggered the "
+               "per-picture rule. Read from the training steps the cap rule flickered at first; reading the sweeps "
+               "steadied it. No benefit shown.",
      "cost": "No extra model calls, except one more forward pass a step while the background prior acts. Needs "
              "MediaPipe for the parts maps. Not in a configuration race, not with Hull's region gains."},
     {"key": "holdout_images", "group": "Likeness boosters", "title": "Held-out photos", "off": 0,
-     "control": "number", "precision": 0, "hint": "0 = none; 2 or 3 of a set of 20 or more", "evidence": "untested",
+     "control": "number", "precision": 0, "hint": "0 = none; 2 or 3 of a set of 20 or more", "evidence": "tool",
      "short": "Keeps a few photos out of training to see what was learned of the person, not of the photos.",
      "what": "N photos, spread evenly through the set by file name, never train. Once an epoch the model is run on "
              "them at three fixed noise levels, and how much of their face, hair, skin, clothes and background error "
              "is gone is compared with the same reading on the training pictures. Learning that shows on unseen "
              "photos is the subject; the gap is memorising. The Train tab can also keep a checkpoint at the best "
              "held-out score, stop on it, and let region steering act on the gap.",
-     "tested": "Never run in a real training. The same reading on training pictures (the training maps) showed "
-               "what a run fits, and missed a face getting worse on new prompts, which is what held-out photos are "
-               "meant to catch.",
+     "tested": "Measured on four Qwen-Image 2.1 fine-tune runs with 3 photos held out. The held-out reading peaked at "
+               "step 944 of 2000 and then fell while the training pictures kept improving, in step with FaceNet on the "
+               "probes; the combined likeness score chose step 1400. Runs that trained alike read within half a point "
+               "of each other, where their probe scores differed by 10. The steering rule that acts on the gap "
+               "changed nothing.",
      "cost": "The held-out photos do not train. 3 forward passes per held-out photo per sweep, plus the same per "
              "training picture swept. Needs at least 10 photos and MediaPipe. Not in a race, not with the "
              "resolution step-up."},
     {"key": "region_class_weights", "group": "Likeness boosters", "title": "Region class weights", "off": "",
      "control": "text", "hint": "empty = off; face=3, hair=1.5, skin=1.5, clothes=0.5, background=0.3",
-     "evidence": "untested",
+     "evidence": "worse",
      "short": "One fixed loss weight each for the face, hair, skin, clothes and background.",
      "what": "Weights the training loss by what each part of a picture shows, for the whole run: the picture is "
              "split into face, hair, skin, clothes and background, and each takes the weight given here (1 when "
              "left out, 0 to mask it out), rescaled to mean 1 per picture. The plain alternative to region steering.",
-     "tested": "Never run in a real training. The region-weighted loss of the identity recipe (face 3, person 1.5, "
-               "background 0.3, from a face box and a silhouette) is its nearest relative; this one can weight the "
-               "clothes and the hair on their own.",
+     "tested": "Measured once, on a Qwen-Image 2.1 fine-tune with face 3, hair 1.5, skin 1.5, clothes 0.5, background "
+               "0.3: the training faces were learned much further (47% of their error gone against 30%), but held-out "
+               "faces ended worse (7% against 12%), the full-body probe lost its framing sooner and likeness was "
+               "level. It memorised the training faces faster.",
      "cost": "None per step. Needs MediaPipe for the parts maps. Not together with the region-weighted loss, so not "
              "with the identity recipe as it is, and not with Hull's region gains."},
     {"key": "clean_share", "group": "How noise levels are trained", "title": "Clean-end share", "off": "",
@@ -9349,7 +9353,8 @@ def build_page(local: bool = True):
                                 "gone, and per picture whether its background or clothes are being learned faster "
                                 "than its subject. Costs no extra model calls; changes nothing about training. Needs "
                                 "MediaPipe for the parts maps (built once, before training). Not in a configuration "
-                                "race. New and not yet run in a real training here.")
+                                "race. On its first real runs it added no time to a step. Its numbers jump from "
+                                "epoch to epoch: read the sweeps before acting on them.")
                             w["region_class_weights"] = ui.input(
                                 "Region class weights (experimental)", value=d.region_class_weights,
                                 placeholder="face=3, hair=1.5, skin=1.5, clothes=0.5, background=0.3") \
@@ -9358,16 +9363,17 @@ def build_page(local: bool = True):
                                 "hair, skin, clothes, background. A region left out stays at 1, 0 masks one out, and "
                                 "the weights are rescaled to mean 1 per picture. Empty = off. The plain alternative "
                                 "to region steering, and the one to compare it against. Not together with the "
-                                "region-weighted loss (face / person / background) or Hull's region gains. Never "
-                                "run in a real training here.")
+                                "region-weighted loss (face / person / background) or Hull's region gains. Measured "
+                                "once on Qwen-Image 2.1 with the example weights: the training faces were learned "
+                                "faster and held-out faces ended worse.")
                         with fields():
-                            w["region_steer"] = ui.switch("Region steering (experimental, untested)",
+                            w["region_steer"] = ui.switch("Region steering (experimental)",
                                                           value=d.region_steer).tooltip(
                                 "Acts on the region watch (and turns it on): once an epoch it moves loss weights a "
                                 "step, by the rules beside it. Each rule is off at 0. What is taken from a region "
-                                "goes to the rest of that picture. Works with every optimizer; not in a race. Never "
-                                "run in a real training here and its defaults are uncalibrated: no benefit is "
-                                "claimed.")
+                                "goes to the rest of that picture. Works with every optimizer; not in a race. "
+                                "Measured once on Qwen-Image 2.1 at its defaults: no difference from the plain run. "
+                                "No benefit is claimed.")
                             w["region_steer_regions"] = ui.select(
                                 {"background,clothes": "background and clothes", "background": "background only",
                                  "clothes": "clothes only"}, label="May be turned down",
@@ -9438,7 +9444,7 @@ def build_page(local: bool = True):
                             w["region_sweep_every"] = ui.number("Region sweep every N epochs (0 = off)",
                                                                 value=d.region_sweep_every, min=0, precision=0) \
                                 .classes("w-72").tooltip(
-                                "Experimental, never run in a real training. Runs the model again on the training "
+                                "Experimental. Runs the model again on the training "
                                 "pictures at three fixed noise levels with fixed noise, so a picture's learned share "
                                 "is measured against its own first sweep: a clean reading where the region watch's "
                                 "is a noisy one. 3 forward passes per picture per sweep, so sweeping every picture "
@@ -9519,8 +9525,8 @@ def build_page(local: bool = True):
                                 "LoRA changes the prediction although it was not asked for. The log gives one "
                                 "number per capture, the bleed: how much the LoRA acts without the trigger word "
                                 "against with it (near 0 = tied to its trigger, near 1 = acts the same either way). "
-                                "Two more forward passes per picture and noise level. New and not yet run in a real "
-                                "training here.")
+                                "Two more forward passes per picture and noise level. On its first real run, with long "
+                                "captions that describe the person, it read 0.98-0.99 all run and told nothing.")
 
                     # ---- LoRA Isolation
                     with sections.section("Likeness", "LoRA Isolation",

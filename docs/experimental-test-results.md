@@ -134,3 +134,42 @@ was 0.54 before any training: on these runs copy over 0.50 means little until it
   step 1000-1600, so the body score could not be read at several probes. Its outfit followed the set's tops, not the
   prompt's. That happened with every optimizer and both adapters, so it is not the optimizer's doing.
 - **Training maps** ran on all five: about 2.5 s a capture on LoRA, 3.4-3.5 s on OFT.
+
+## Qwen-Image 2.1 fine-tune: region weighting, steering and held-out photos
+
+November 2026, one RTX 5090: a community fine-tune of Qwen-Image 2.1 (int8) with the family's turbo LoRA and training
+adapter, the 62-picture set with long captions (59 train, 3 held out with `holdout_images: 3`), AdamW 8-bit at lr 1e-4,
+rank 32, 0.25 MP, seed 42, 2000 steps, 8 probe seeds, a region sweep every 4 epochs. Each row is **one run**. *Learned*
+is the share of a region's starting error that is gone at fixed noise (the region sweep); *subject* is face, hair and
+skin together.
+
+| Row | Training pictures learned: subject / face / background | Held-out subject, best (step) | Held-out at step 2000: subject / face | Gap at step 2000 | Best smoothed combined | FaceNet from step 1000 | Peak copy | All 8 body renders lost from |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Plain | 21.4 / 30.3 / 15.0 | 9.0 (944) | 5.8 / 11.8 | +15.6 | 50.0 (1400) | 87.5 | 0.63 | step 1600 |
+| Class weights: face 3, hair 1.5, skin 1.5, clothes 0.5, background 0.3 | 26.5 / 46.7 / 9.3 | 8.6 (472) | 4.4 / 7.0 | +22.1 | 52.9 (1400) | 87.9 | 0.64 | step 1400 |
+| Region steering, defaults | 21.7 / 31.6 / 15.0 | 8.8 (472) | 6.0 / 13.2 | +15.7 | 46.3 (1600) | 87.8 | 0.70 | step 1600 |
+| Region steering read from the sweeps, held-out rule 0.05 | 21.3 / 30.3 / 14.9 | 9.0 (944) | 5.8 / 12.0 | +15.5 | 52.3 (1400) | 88.7 | 0.63 | step 1600 |
+
+- **The measuring side worked and is cheap.** The region watch added no measurable time to a step (0.39 s). A sweep of
+  all 62 pictures took 24 s. Runs that were still training alike read within half a point of each other on the sweeps
+  (held-out subject 8.5, 8.4, 8.2 at step 236) while their combined probe scores differed by 10 (41.9, 31.5, 38.3 at
+  step 400): same-seed runs are not identical, and the sweeps see through that where one probe does not.
+- **The held-out photos showed where learning the person stopped.** Most of it was there by step 236, it peaked at step
+  944 and then fell in every run, while the training pictures kept improving. FaceNet on the probes peaked at steps
+  600 to 1000. The combined score's best came later (step 1400 in three runs) on a body score from 2 to 4 of the 8
+  renders, after the framing had mostly gone: a late best on few renders is not to be trusted.
+- **Fixed class weights memorised faster.** The training faces were learned to 47% against 30%, the held-out faces ended
+  at 7% against 12%, the framing went 200 steps sooner and likeness was level.
+- **Region steering changed nothing measurable**, read from the steps or from the sweeps. Its weights were mild (clothes
+  typically 0.82, background 0.91), no picture triggered a per-picture rule, and a region's loss followed its own
+  weight only weakly (clothes at 0.5 beside a face at 3 still learned 22% against 24%).
+- **The held-out rule cancelled itself.** All five parts overfitted together, so it turned all of them down alike (0.78
+  to 0.87), which a per-picture mean of 1 turns back into nearly nothing.
+- **The bleed number told nothing here**: 0.98-0.99 at every noise level all run, because the long captions describe the
+  person with or without the trigger word.
+- **None of the four kept the full-body framing**: 2 to 4 of 8 renders lost by step 600 to 1000, all 8 by step 1400 to
+  1600.
+
+Not settled: one run per row, one seed, three held-out photos (at least one with a near-duplicate still in training),
+one learning rate. A second seed of the plain row would give the noise between seeds; background-only weights would
+separate the heavier face from the lighter background.
