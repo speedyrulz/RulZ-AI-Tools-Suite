@@ -170,9 +170,48 @@ skin together.
 - **None of the four kept the full-body framing**: 2 to 4 of 8 renders lost by step 600 to 1000, all 8 by step 1400 to
   1600.
 
-Not settled: one run per row, one seed, three held-out photos (at least one with a near-duplicate still in training),
-one learning rate. A second seed of the plain row would give the noise between seeds; background-only weights would
-separate the heavier face from the lighter background.
+### Five more runs: three more seeds, a background-only weight, half the learning rate
+
+Same day, same model, set, settings and held-out photos. Each row changes **one thing** from the plain row above (seed
+42, lr 1e-4), which is repeated here.
+
+| Row | Training pictures learned: subject / face / background | Held-out subject, best (step) | Held-out at step 2000: subject / face | Gap at step 2000 | FaceNet from step 1000 | Copy at step 2000 | Body renders without a body, of 8, at steps 800 / 1200 / 1600 / 2000 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Plain, seed 42 | 21.4 / 30.3 / 15.0 | 9.0 (944) | 5.8 / 11.8 | +15.6 | 87.5 | 0.63 | 2 / 5 / 8 / 8 |
+| Plain, seed 43 | 20.6 / 28.8 / 14.5 | 9.0 (708) | 5.8 / 12.2 | +14.8 | 89.1 | 0.55 | 1 / 1 / 0 / 0 |
+| Plain, seed 44 | 20.5 / 28.7 / 14.4 | 8.8 (708) | 6.6 / 14.0 | +13.9 | 89.3 | 0.64 | 0 / 1 / 4 / 8 |
+| Plain, seed 45 | 20.6 / 30.1 / 14.5 | 9.4 (708) | 6.7 / 13.0 | +14.0 | 88.2 | 0.60 | 4 / 3 / 8 / 8 |
+| Class weights: background 0.3 only | 25.1 / 36.8 / 10.7 | 8.7 (944) | 4.7 / 11.9 | +20.4 | 88.6 | 0.60 | 2 / 8 / 7 / 8 |
+| Learning rate 5e-5 | 16.3 / 22.5 / 10.7 | 8.9 (1180) | 8.2 / 14.3 | +8.1 | 88.3 | 0.58 | 0 / 0 / 8 / 8 |
+
+- **The sweeps repeat across seeds; single probes do not.** Over the four plain seeds the held-out subject differed by
+  a standard deviation of 0.2 to 0.7 points at every sweep and the training subject by 0.1 to 0.4. All four peaked on
+  the held-out photos at steps 708 to 944 (8.8 to 9.4%) and fell to 5.8 to 6.7% by step 2000. Their combined probe score
+  at step 1000 read 48.5, 47.6, 49.5 and 63.9; FaceNet from step 1000 spread over 1.8 points. That spread is the
+  yardstick for everything else on this page's Qwen-Image 2.1 rows.
+- **Against that yardstick both fixed weights are worse and steering is nothing.** Face 3 and background-only 0.3 end
+  the held-out subject at 4.4 and 4.7% (seeds 5.8 to 6.7) with gaps of 22 and 20 points (seeds 14 to 16); the two
+  steering runs sit inside the seeds on every reading. Turning only the background down still fitted the training
+  faces further (37% against 29 to 30%): what is taken from the background goes to the person.
+- **Half the learning rate was the one change that helped.** The held-out subject peaked later, at the same height, and
+  held (8.2% at step 2000); the gap ended at 8 points; FaceNet and ArcFace on the probes stayed inside the seeds' range,
+  so no likeness was lost. Rank 32 at 1e-4 is twice the rate of the Qwen-Image 2.1 recipe scaled to that rank, which
+  fits. One run.
+- **Whether the body probe keeps following its prompt depends on the seed.** Seed 43 kept all eight full-body renders
+  to the end, seeds 42 and 45 had lost all eight by step 1600, seed 44 by step 2000. The seeds fit the photos equally
+  (the sweeps agree), so the difference is in what the LoRA does to the prompt, not in how much it learned.
+- **At half the learning rate the same seed lost its framing at the same step, all at once**: none of 8 through step
+  1200, 2 at step 1400, all 8 at step 1600 (seen in the renders: full-body pictures at step 1400, head-and-shoulders
+  portraits in different clothes at step 1600). A lower rate did not prevent it and did not move it.
+- **The best checkpoint was chosen on a probe that had lost at least half its body renders in 8 of the 9 runs**, the
+  seed-43 run being the exception: a body score from one to four renders (62 to 94), a normalized body score above 100
+  (104 to 115), and a smoothed body score that stays where it was when no render shows a body, so a rising face score
+  keeps setting new bests. `likeness_best_min_kept` guards against this; it is off by default.
+
+Not settled: three held-out photos (at least one with a near-duplicate still in training), one set, one model family;
+half the learning rate on one seed only; why one seed keeps its framing. Whether a seed that does well here does well
+on another set is not tested and not expected: the seed fixes the order of the photos and the noise drawn for them,
+which change with the set.
 
 ## Probe prompt check: the framing by training seed
 
