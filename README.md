@@ -921,13 +921,24 @@ tokens (`attn_localize`'s own measure), Fizgig's over every token, so their valu
 off for the rest of the run and training goes on. Output, in the job folder: `training_maps/probes.json`,
 `training_maps/probe_<n>.jpg` and `training_maps/maps.jsonl` (one line per capture).
 
-**Measured on one real run** (Krea 2 Raw int8, LoRA rank 32 at 0.25 MP, `torch.compile` on, one RTX 5090, a set of 62
-photos, 2000 steps, 35 captures of 3 pictures): a capture took about 2.2 s (4.5 s the first), about 6% of the training
-time at one capture per epoch; no memory showed beyond training's own peak; the compiled blocks recompiled 0 times;
-`maps.jsonl` reached 7.9 MB. Loss over the watched pictures fell steadily (about 20% by step 2000) while *Where the
-LoRA acts* grew from the face and hair outwards. On that set the *Trigger word* map sat on the clothing more than on
-the face from the first epoch to the last, and the full-body probes' clothes moved towards the set's dark tops and
-sweaters as training went on. Not yet run on the other model families or on a fine-tune.
+**Measured on two real runs**, both a LoRA rank 32 at 0.25 MP with `torch.compile` on, one RTX 5090, a set of 62
+photos, 2000 steps and 34 captures of 3 pictures:
+
+| | Krea 2 Raw int8, short captions | Qwen-Image 2.1 int8, long captions naming the clothing |
+| --- | --- | --- |
+| Time per capture | about 2.2 s (4.5 s the first) | about 2.5 s (4.5 s the first) |
+| Share of training time at one capture per epoch | about 6% | about 9% |
+| Memory beyond training's own peak | none seen | none seen |
+| Recompiles of the compiled blocks | 0 | 0 |
+| `maps.jsonl` | 7.9 MB | 8.2 MB |
+| Loss over the watched pictures by step 2000 | down about 20% | down about 15% |
+
+On both, *Where the LoRA acts* grew from the face and hair outwards. On Krea 2 with short captions the *Trigger word*
+map sat on the clothing more than on the face from the first epoch to the last, and the full-body probes' clothes
+moved towards the set's dark tops. On Qwen-Image 2.1 with long captions it sat on no one part and was much weaker
+(a single word among about 60 caption tokens takes a smaller share of the attention), so its values do not compare
+across caption lengths or models; read where it points within one run. Not yet run on FIBO 2.0, MiniMax H3, FLUX or a
+fine-tune.
 
 ## Muon (`optimizer: muon`)
 
