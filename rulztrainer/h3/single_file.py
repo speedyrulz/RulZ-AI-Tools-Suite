@@ -4,8 +4,10 @@ text_encoders, vae).
 Diffusion model: the original module names (h3/convert.py), [q; k; v] stacked; bf16, ComfyUI int8_tensorwise with
 ConvRot (int8_convrot, group 256; group 64 on the full files' AdaLN), or the scaled fp8 file (dequantized on read). The
 fp32 islands of the checkpoint (patch projections, time embedder, output heads, rope.inv_freq) stay fp32 and the
-pruned files' F16 AdaLN projections are read as fp32, as ComfyUI keeps them. The w6a8 files use a format this trainer
-cannot read. Full-AdaLN files (no adaln_t_table) are pruned on load to a rank-8 basis (h3/loading.prune_adaln, as
+pruned files' F16 AdaLN projections are read as fp32, as ComfyUI keeps them. ComfyUI's grouped-scale integer files
+(w6a8_int8: H3's *_w6a8 files; asym_w4a8_int8: P-H3-Image's and MiniMax-H3-Image's *_w4a8 files) are decoded on read to
+the int8 ConvRot weights they stand for (rulztrainer.quant): 8 bits a weight in memory, whatever the file holds.
+Full-AdaLN files (no adaln_t_table) are pruned on load to a rank-8 basis (h3/loading.prune_adaln, as
 musubi-tuner's --prune_adaln), unless RULZ_H3_FULL_ADALN=1: about 13B of the 33B parameters live in the AdaLN
 projections.
 
@@ -50,6 +52,8 @@ AUDIO_VAE_FILE = "vae/minimax_h3_audio_vae_fp32.safetensors"
 TOKENIZER_REPO = "MiniMaxAI/MiniMax-H3"  # its tokenizer/ (Qwen2 + H3's added tokens; upstream Qwen3-VL's lacks them)
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt")
 H3_TOKENS = ("<d>", "</d>", "<|cutoff|>", "<|lyrics_start|>")  # added by H3's tokenizer (ComfyUI: fixed ids 151669+)
+# the side tensors of a grouped-scale integer weight (ComfyUI's asym_w4a8_int8 / w6a8_int8, rulztrainer.quant)
+GROUPED_PARTS = (".weight_s_rel", ".weight_s_channel", ".weight_codebook", ".weight_correction")
 
 
 def iter_state(path: str | Path, dtype=torch.bfloat16, keep_fp32=lambda key: False, want=lambda key: True):
@@ -61,11 +65,20 @@ def iter_state(path: str | Path, dtype=torch.bfloat16, keep_fp32=lambda key: Fal
         quant_meta = {k[: -len(".comfy_quant")]: Q.parse_comfy_quant(f.get_tensor(k))
                       for k in keys if k.endswith(".comfy_quant")}
         for k in sorted(keys):
-            if k.endswith((".comfy_quant", ".weight_scale", ".weight_scale_2", ".input_scale")) or not want(k):
+            if k.endswith((".comfy_quant", ".weight_scale", ".weight_scale_2", ".input_scale", *GROUPED_PARTS)) \
+                    or not want(k):
                 continue
             t = f.get_tensor(k)
             base = k[: -len(".weight")] if k.endswith(".weight") else None
             fmt = quant_meta.get(base, {}).get("format") if base is not None else None
+            if fmt in Q.GROUPED_INT_FORMATS:  # w4a8 / w6a8: decoded to the int8 ConvRot weight they stand for
+                if f"{base}.weight_correction" in keys:
+                    raise ValueError(f"{Path(path).name}: {base} carries a w4a8 correction term, which this trainer "
+                                     "does not read")
+                codebook = f.get_tensor(f"{base}.weight_codebook") if f"{base}.weight_codebook" in keys else None
+                yield k, Q.quant_weight_from_grouped(quant_meta[base], t, f.get_tensor(f"{base}.weight_s_rel"),
+                                                     f.get_tensor(f"{base}.weight_s_channel"), codebook)
+                continue
             if fmt is not None and not str(fmt).startswith("float8"):
                 s2 = f.get_tensor(f"{base}.weight_scale_2") if f"{base}.weight_scale_2" in keys else None
                 yield k, Q.quant_weight_from_comfy(quant_meta[base], t, f.get_tensor(f"{base}.weight_scale"), s2)
@@ -116,16 +129,34 @@ def load_transformer_file(path: str | Path, device, quant: str = "auto", dtype=t
     from . import loading as L
 
     if not is_h3_file(path):
+        if is_h3_image_file(path):
+            raise ValueError(f"{Path(path).name} is a MiniMax-H3-Image diffusion model (H3's layout without the audio "
+                             "stream): pick the MiniMax-H3-Image model for it")
         raise ValueError(f"{Path(path).name}: not a MiniMax H3 diffusion model (no video_patch_proj / "
                          "audio_patch_proj / condition_proj)")
-    keep = lambda k: ".adaln_proj.linear." in k  # noqa: E731 - a pruned file's F16 AdaLN, kept fp32 as ComfyUI does
+    return L.build_transformer(file_reader(path, dtype), device, quant, dtype, quant_devices, source=Path(path).name,
+                               quantized=is_quantized_file(path), source_bytes=Path(path).stat().st_size)
+
+
+def file_reader(path: str | Path, dtype=torch.bfloat16):
+    """loading.build_transformer's reader over a Comfy-Org-layout file ([q; k; v] stacked): a pruned file's F16 AdaLN
+    read as fp32, as ComfyUI keeps it."""
+    keep = lambda k: ".adaln_proj.linear." in k  # noqa: E731
 
     def reader(want):
         for k, v in iter_state(path, dtype, keep, want):
-            yield from C.original_to_port({k: v}, interleaved=False, heads=0, head_dim=0).items()  # [q; k; v]
+            yield from C.original_to_port({k: v}, interleaved=False, heads=0, head_dim=0).items()
+    return reader
 
-    return L.build_transformer(reader, device, quant, dtype, quant_devices, source=Path(path).name,
-                               quantized=is_quantized_file(path), source_bytes=Path(path).stat().st_size)
+
+def is_h3_image_file(path: str | Path) -> bool:
+    """A cheap look at a safetensors header: does this file hold a MiniMax-H3-Image diffusion model?"""
+    try:
+        with safe_open(str(path), "pt") as f:
+            keys = list(f.keys())
+    except Exception:  # noqa: BLE001
+        return False
+    return any(C.is_h3_image_state(k[len(p):] for k in keys if k.startswith(p)) for p in ("", *C.DIT_PREFIXES))
 
 
 # ---------------------------------------------------------------- video VAE
@@ -424,9 +455,10 @@ def check_tokenizer(tokenizer) -> None:
                          "MiniMaxAI/MiniMax-H3's tokenizer/ folder (upstream Qwen3-VL-32B files are not the same)")
 
 
-def resolve_tokenizer(tokenizer_path: str, models_dir: str = "models") -> Path:
+def resolve_tokenizer(tokenizer_path: str, models_dir: str = "models", repo: str = TOKENIZER_REPO) -> Path:
     """H3's tokenizer folder: the given one, a downloaded MiniMaxAI/MiniMax-H3's tokenizer/, or its four tokenizer
-    files downloaded once (about 11 MB)."""
+    files downloaded once (about 11 MB). repo: where to download them from (MiniMaxAI/MiniMax-H3-Image holds the same
+    four files, byte for byte: the Hub's blob ids agree)."""
     if tokenizer_path:
         p = Path(tokenizer_path).expanduser()
         for cand in (p, p / "tokenizer"):
@@ -439,10 +471,10 @@ def resolve_tokenizer(tokenizer_path: str, models_dir: str = "models") -> Path:
     if not all((local / f).is_file() for f in TOKENIZER_FILES):
         from huggingface_hub import hf_hub_download
 
-        log.info("Downloading the MiniMax H3 tokenizer to %s", local)
+        log.info("Downloading the MiniMax H3 tokenizer (%s) to %s", repo, local)
         local.mkdir(parents=True, exist_ok=True)
         for f in TOKENIZER_FILES:
-            src = Path(hf_hub_download(TOKENIZER_REPO, f"tokenizer/{f}"))
+            src = Path(hf_hub_download(repo, f"tokenizer/{f}"))
             (local / f).write_bytes(src.read_bytes())
     return local
 
