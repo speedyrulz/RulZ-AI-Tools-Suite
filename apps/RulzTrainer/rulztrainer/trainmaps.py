@@ -8,6 +8,9 @@ only the LoRA changes), one value per latent cell:
   * "loss"   - (prediction - target)^2, the mean over channels: what training still gets wrong ("Not learned yet");
   * "effect" - |prediction with the LoRA - prediction with it switched off| ("Where the LoRA acts"; not for a full
                fine-tune, which has no adapter to switch off);
+  * "effect_off" - the same as "effect" with the trigger word taken out of the caption (training_maps_trigger_off):
+               what the LoRA changes when it was not asked for. Its mean over the mean of "effect" is the capture's
+               "bleed": near 0, the LoRA is tied to its trigger; near 1, it acts the same without it;
   * "attn"   - the trigger word's share of each image token's attention over the caption (softmax over the text
                keys, mean over heads and over every block with a text attention): rulztrainer.alignment's own
                measure, so it differs a little from Fizgig's, which normalises over every key. Per word too
@@ -60,6 +63,35 @@ def pick_keys(keys, n: int) -> list[str]:
     if n == 1:
         return [keys[len(keys) // 2]]
     return [keys[round(i * (len(keys) - 1) / (n - 1))] for i in range(n)]
+
+
+def strip_trigger(caption: str, words) -> str:
+    """The caption without its trigger word(s): each whole-word occurrence taken out (any case), the punctuation and
+    spaces it leaves tidied. The caption itself when none occurs."""
+    import re
+
+    out = str(caption)
+    for w in sorted({str(w) for w in words if w}, key=len, reverse=True):
+        out = re.sub(rf"(?<!\w){re.escape(w)}(?!\w)", "", out, flags=re.IGNORECASE)
+    if out == caption:
+        return caption
+    out = re.sub(r"\s+([,.;:])", r"\1", out)
+    out = re.sub(r"([,;:])(\s*[,;:])+", r"\1", out)
+    return re.sub(r"\s{2,}", " ", out).strip(" ,;:")
+
+
+def bleed(maps: dict) -> float | None:
+    """A capture's bleed: over every picture and noise level with both maps, the mean of "effect_off" over the mean of
+    "effect" (None without a trigger-off pass)."""
+    ratios = []
+    for per in (maps or {}).values():
+        for level in (per or {}).values():
+            on, off = (level or {}).get("effect"), (level or {}).get("effect_off")
+            if on and off and on.get("v") and off.get("v"):
+                base = sum(on["v"]) / len(on["v"])
+                if base > 0:
+                    ratios.append((sum(off["v"]) / len(off["v"])) / base)
+    return round(sum(ratios) / len(ratios), 4) if ratios else None
 
 
 def eligible(item) -> bool:
@@ -232,7 +264,8 @@ def eager_stance():
 
 class TrainingMaps:
     """The run's map pictures and their captures. `probes`: [{"id", "item", "latents", "embeds", "mask",
-    "trigger": {word: token positions}}] built by the trainer (see Trainer._setup_maps)."""
+    "trigger": {word: token positions}, "off": {"embeds", "mask"} of the caption without its trigger word, when the
+    trigger-off pass is on}] built by the trainer (see Trainer._setup_maps)."""
 
     def __init__(self, job_dir, probes: list[dict], every: int, sigmas=SIGMAS, seed: int = SEED):
         self.dir = maps_dir(job_dir)
@@ -242,6 +275,7 @@ class TrainingMaps:
         self.seed = int(seed)
         self.failed = False
         self.last_step: int | None = None
+        self.last_bleed: float | None = None
         self.next_step = 0
 
     def start(self, step: int, resume: bool, pictures: dict[str, object] | None = None,
@@ -263,7 +297,7 @@ class TrainingMaps:
             meta.append({"id": pr["id"], "key": str(it.key), "image": name, "source": str(it.image),
                          "dataset": str(getattr(it, "dataset", "") or ""),
                          "pair": bool(getattr(it, "pair_side", "")),
-                         "words": [w for w in pr.get("trigger", {}) if w],
+                         "words": [w for w in pr.get("trigger", {}) if w], "trigger_off": bool(pr.get("off")),
                          "size": [int(it.width), int(it.height)]})
         with open(self.dir / "probes.json", "w", encoding="utf-8") as f:
             json.dump({"probes": meta, "sigmas": list(self.sigmas), "every": self.every, "words": words or []}, f,
@@ -295,9 +329,15 @@ class TrainingMaps:
         finally:
             self.last_step = step
             self.next_step = step + self.every
+        row = {"step": int(step), "epoch": round(float(epoch), 3), "maps": out}
+        self.last_bleed = bleed(out)
+        if self.last_bleed is not None:
+            row["bleed"] = self.last_bleed
         with open(self.dir / "maps.jsonl", "a", encoding="utf-8") as f:
-            f.write(json.dumps({"step": int(step), "epoch": round(float(epoch), 3), "maps": out}) + "\n")
-        log.info("Training maps at step %d: %d picture(s), %.1fs", step, len(self.probes), time.time() - t0)
+            f.write(json.dumps(row) + "\n")
+        log.info("Training maps at step %d: %d picture(s), %.1fs%s", step, len(self.probes), time.time() - t0,
+                 "" if self.last_bleed is None else
+                 f"; without the trigger word the LoRA acts x{self.last_bleed:.2f} as much")
 
     def noise(self, j: int, i: int, shape):
         """The fixed noise of picture j at noise level i (its own generator: the global RNG is never drawn from)."""
@@ -350,6 +390,17 @@ class TrainingMaps:
                                 lora_mod.set_multiplier(injected, 1.0)
                             maps["effect"] = grid(to_map((pred - base).abs(), latents))
                             del base
+                            off = pr.get("off")
+                            if off is not None:  # the trigger-off pass: the same picture, noise and LoRA, asked without
+                                e_off, m_off = off["embeds"].to(device), off["mask"].to(device)  # its trigger word
+                                asked = model(noisy, sigma, e_off, m_off).float()
+                                lora_mod.set_multiplier(injected, 0.0)
+                                try:
+                                    plain = model(noisy, sigma, e_off, m_off).float()
+                                finally:
+                                    lora_mod.set_multiplier(injected, 1.0)
+                                maps["effect_off"] = grid(to_map((asked - plain).abs(), latents))
+                                del asked, plain, e_off, m_off
                         per[f"{s:g}"] = maps
                         del noise, noisy, target, pred
                     out[pr["id"]] = per
@@ -386,13 +437,15 @@ def read(job_dir) -> dict | None:
         pass
     return {"probes": meta.get("probes") or [], "sigmas": meta.get("sigmas") or list(SIGMAS),
             "words": meta.get("words") or [], "dir": str(d),
-            "captures": [{"step": s, "epoch": by[s].get("epoch"), "maps": by[s].get("maps") or {}} for s in sorted(by)]}
+            "captures": [{"step": s, "epoch": by[s].get("epoch"), "maps": by[s].get("maps") or {},
+                          "bleed": by[s].get("bleed")} for s in sorted(by)]}
 
 
 MAP_KINDS = {
     "learned": "Learned since the start",
     "loss": "Not learned yet",
     "effect": "Where the LoRA acts",
+    "effect_off": "Where the LoRA acts without the trigger word",
     "attn": "Trigger word",
 }
 

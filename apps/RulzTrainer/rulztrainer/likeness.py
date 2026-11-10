@@ -195,6 +195,10 @@ class ProbeRecord:
     copy: float | None = None
     copy_of: str = ""
     copy_baseline: float | None = None
+    # the body probe's framing: its renders, and how many of them showed no measurable body (the body scorer found
+    # nothing from shoulders to hips: a head-and-shoulders picture where a body was asked for)
+    body_probes: int = 0
+    body_missing: int = 0
 
 
 # what a training state keeps of the controller (ceilings and shapes come back from the references and the config)
@@ -429,8 +433,15 @@ class LikenessController:
                     actions["lr_ratio"] = new / self.lr_factor
                     self.lr_factor = new
             self.prev_combined = arc_comb
-        if cfg.likeness_curriculum and face_arc is not None and body_n is not None:
-            gap = body_n - face_arc  # > 0: the face lags the body (both on the normalized scale; ArcFace's face)
+        body_renders = list((seeds or {}).get("body") or [])
+        body_missing = sum(1 for v in body_renders if v is None)
+        body_cur = body_n  # the body the curriculum reads
+        if cfg.likeness_curriculum_framing > 0 and body_renders and body_missing:
+            # framing: renders without a measurable body count against it, so a body probe that has turned into
+            # portraits pulls the curriculum towards the full-body photos instead of leaving it on a stale score
+            body_cur = (body_n or 0.0) * (1.0 - cfg.likeness_curriculum_framing * body_missing / len(body_renders))
+        if cfg.likeness_curriculum and face_arc is not None and body_cur is not None:
+            gap = body_cur - face_arc  # > 0: the face lags the body (both on the normalized scale; ArcFace's face)
             bias = max(-1.0, min(1.0, gap / 20.0)) * cfg.likeness_curriculum_strength
             if abs(bias - self.face_bias) > 0.02:
                 self.face_bias = bias
@@ -442,7 +453,8 @@ class LikenessController:
                           self.face_ema, self.body_ema, comb, self.lr_factor, self.face_bias, self.best,
                           self.best_step, self.since_improve, list(images or []), self.stage, self.stage_best,
                           self.stage_since_improve, self.norm("face", face), self.norm("body", body), face_arc,
-                          body_n, self.scale_record() if self.normalize else {}, **per_seed)
+                          body_n, self.scale_record() if self.normalize else {}, **per_seed,
+                          body_probes=len(body_renders), body_missing=body_missing)
         if self.has_gold:
             rec.gold, rec.gold_ema, rec.gold_norm = gold, self.gold_ema, self.norm("gold", gold)
             rec.gold_norm_ema, rec.gold_select, rec.arc_combined_ema = gold_n, self.gold_select, arc_comb

@@ -840,6 +840,7 @@ class Trainer(RaceParallelMixin):
             prompts += list(cfg.reward_prompts) + [self.negative_prompt()]
         if cfg.selftrain:
             prompts += list(cfg.selftrain_prompts) + [self.negative_prompt()]
+        prompts += self._trigger_off_prompts(cfg, items)
         need_latents = cfg.recache or any(
             not it.latent_path.exists() or (it.latent_flip_path and not it.latent_flip_path.exists()) for it in items)
         need_text = cfg.recache or not dropout_text_path(cfg).exists() or any(
@@ -3508,6 +3509,19 @@ class Trainer(RaceParallelMixin):
             log.warning("Training maps: no trigger-word map for this run (%s: %s)", type(e).__name__, str(e)[:160])
             return {}
 
+    def _trigger_off_prompts(self, cfg, items) -> list[str]:
+        """training_maps_trigger_off: the map pictures' captions without their trigger word, to be cached with the
+        other texts (the text encoder is gone by the time the maps are set up)."""
+        from . import trainmaps
+
+        if not (cfg.training_maps and cfg.training_maps_trigger_off) or self.race_rows is not None:
+            return []
+        words = self._trigger_words([cfg])
+        held = {str(it.key) for it in self.holdout_items}
+        chosen = trainmaps.pick_items([it for it in items if str(it.key) not in held], cfg.training_maps_images)
+        return sorted({s for s, it in ((trainmaps.strip_trigger(it.caption, words), it) for it in chosen)
+                       if s and s != it.caption})
+
     def _setup_maps(self, cfg, step: int) -> None:
         """The map pictures (their latents, texts, trigger positions and bucket crops), or nothing when training
         maps are off or this run can't have them."""
@@ -3534,6 +3548,12 @@ class Trainer(RaceParallelMixin):
                 embeds, mask = self.arch.pad_embeds([load_file(str(it.text_path))["embeds"]])
                 probes.append({"id": pid, "item": it, "latents": latents, "embeds": embeds, "mask": mask,
                                "trigger": triggers.get(str(it.key), {})})
+                if cfg.training_maps_trigger_off and self.ft is None:  # the same caption without its trigger word
+                    plain = trainmaps.strip_trigger(it.caption, self._trigger_words([cfg]))
+                    cached = text_cache_path(cfg, plain)
+                    if plain and plain != it.caption and cached.exists():
+                        e_off, m_off = self.arch.pad_embeds([load_file(str(cached))["embeds"]])
+                        probes[-1]["off"] = {"embeds": e_off, "mask": m_off}
                 try:
                     pictures[pid] = load_image_fit(Path(it.image), it.width, it.height, it.src_box)
                 except OSError:
@@ -3547,6 +3567,11 @@ class Trainer(RaceParallelMixin):
                             words=self._trigger_words([cfg]))
             if self.ft is not None:
                 log.info("Training maps: a fine-tune has no adapter to switch off, so no 'Where the LoRA acts' map")
+            elif cfg.training_maps_trigger_off:
+                n_off = sum(1 for pr in probes if pr.get("off"))
+                log.info("Training maps: the trigger-off pass on %d of %d picture(s)%s", n_off, len(probes),
+                         "" if n_off == len(probes) else " (the others' captions have no trigger word, or its text "
+                                                         "was not cached)")
         except Exception as e:  # noqa: BLE001
             self.maps = None
             log.warning("Training maps could not start; training goes on without them (%s: %s)", type(e).__name__,
@@ -3564,7 +3589,8 @@ class Trainer(RaceParallelMixin):
                               averaged=self._averaged)
         finally:
             free_cuda()
-            self.status.update(stage="training", training_maps=self.maps.last_step)
+            self.status.update(stage="training", training_maps=self.maps.last_step,
+                               training_maps_bleed=self.maps.last_bleed)
 
     def _trigger_positions(self, items, rows) -> dict[str, list[int]]:
         """{cached text path: the trigger's token positions in it} for every caption training reads (each dataset's
@@ -4410,6 +4436,9 @@ class Trainer(RaceParallelMixin):
                      "| lr x%.2f | face bias %+.2f (%s)", who, step, fmt(face), fmt(body), fmt(rec.combined),
                      fmt(rec.face_ema), fmt(rec.body_ema), fmt(rec.combined_ema), fmt(rec.best), rec.best_step,
                      rec.lr_factor, rec.face_bias, took)
+        if rec.body_missing:  # the framing: a body was asked for and the render shows none to measure
+            log.info("%sBody probe framing step %d: %d of %d renders show no measurable body (a closer framing than "
+                     "the prompt asks for)", who, step, rec.body_missing, rec.body_probes)
         if self.controller.has_gold:
             arc, gold = rec.face_norm_ema if self.controller.normalize else rec.face_ema, rec.gold_norm_ema
             log.info("%sGold face (FaceNet) step %d: %s (normalized %s) | ema %s vs ArcFace %s%s%s", who, step,
