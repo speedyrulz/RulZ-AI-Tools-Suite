@@ -777,6 +777,14 @@ On the RTX 4060 Ti (Ada), Qwen-Image 2.1 int8, batch 1, 25 steps uncompiled (med
 So `auto` puts cuDNN first on Ada too (since v2.21.0). Ampere and Hopper are not measured, so `auto` leaves PyTorch's
 pick there; set `cudnn` to try it on any card: the log says which kernel runs.
 
+cuDNN's kernel can also fail while it runs, which PyTorch does not catch (seen on MiniMax-H3: `Expected
+mha_graph.execute(...).is_good() to be true, but got false`). Since v3.6.2 the trainer then switches cuDNN attention
+off for the rest of the run, drops the compiled blocks (their graphs call cuDNN's kernel by name) and trains the step
+again on PyTorch's pick; the log says so. Set `attention_backend: torch` to skip the detour on the next run. This
+covers training steps only: a sample or probe render that hits the error still fails. The backend's name is also part
+of torch.compile's cache keys from v3.6.2 on, so a run with another backend never gets the first one's graphs back
+from the compile cache (older cache files compile once more).
+
 ## Training resolutions and resolution step-up
 
 *Training resolutions* is a list of megapixel values (`resolutions: [0.25, 1.0, 4.0]` in YAML; the WebUI offers
