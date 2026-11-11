@@ -96,10 +96,12 @@ def family_named_in(text: str) -> str | None:
         return "flux2_klein"
     if "p-h3" in hint or "p_h3" in hint:  # PrunaAI/P-H3-Image, p-h3-image_bf16.safetensors (before "minimax")
         return "p_h3_image"
-    # MiniMaxAI/MiniMax-H3-Image, minimax_h3_image_pruned_bf16.safetensors (before "minimax"). Not a training adapter
-    # of that name: circlestone-labs' MiniMax-H3-Image-Training-Adapter is an image adapter for H3 itself
-    if ("minimax-h3-image" in hint or "minimax_h3_image" in hint) and "adapter" not in hint:
-        return "minimax_h3_image"
+    # MiniMaxAI/MiniMax-H3-Image, minimax_h3_image_pruned_bf16.safetensors (before "minimax"), and ostris' versioned
+    # adapter for it, minimax_h3_image_training_adapter_v1.safetensors. Not the unversioned adapter of that name:
+    # circlestone-labs' MiniMax-H3-Image-Training-Adapter is an image adapter for H3 itself
+    if "minimax-h3-image" in hint or "minimax_h3_image" in hint:
+        if "adapter" not in hint or "minimax_h3_image_training_adapter_v" in hint:
+            return "minimax_h3_image"
     for word, family in (("ideogram", "ideogram4"), ("minimax", "minimax_h3"), ("fibo", "fibo2"), ("krea", "krea2"),
                          ("moss", "moss_image")):
         if word in hint:
@@ -310,12 +312,16 @@ COMFY_VAE_FILES["p_h3_image"] = "vae/p-h3-image_vae_bf16.safetensors"
 # (sizes from the Hub): the pruned transformer as int8_convrot 21.0 GB, bf16 40.2 GB or w4a8 12.5 GB (ComfyUI's 4-bit
 # format, decoded on read to the int8 weight it stands for: a smaller download, int8's memory); the image VAE fp16
 # 1.2 GB. The text encoder is MiniMax H3's, the same files byte for byte (the Hub's sha256), so they come from
-# Comfy-Org/MiniMax-H3 and a copy already downloaded for H3 is reused. No training adapter exists for it yet
-# (10 Nov 2026): training_adapter auto resolves to none.
+# Comfy-Org/MiniMax-H3 and a copy already downloaded for H3 is reused.
+# Training adapter: ostris' MiniMax-H3-Image adapter (rank 16, 0.16 GB, the port's names, no alpha), what ai-toolkit
+# trains the model with by default since its commit 5b1670a (10 Nov 2026): the model is step- and guidance-distilled.
+# ai-toolkit trains it on the 6 sampling sigmas only (archs.MiniMaxH3ImageArch.reference_sigmas)
 MODEL_PRESETS["MiniMax-H3-Image"] = "MiniMaxAI/MiniMax-H3-Image"
 ARCH_NAMES += ("minimax_h3_image",)
 ARCH_DEFAULT_TARGETS["minimax_h3_image"] = _CORE_TARGETS
 ARCH_FULL_SAMPLE["minimax_h3_image"] = (6, 1.0)  # the checkpoint's own 6 sigmas and heads, no guidance
+ARCH_TRAINING_ADAPTER["minimax_h3_image"] = {"repo": "ostris/minimax_h3_training_adapter",
+                                             "file": "minimax_h3_image_training_adapter_v1.safetensors"}
 COMFY_REPOS["minimax_h3_image"] = "Comfy-Org/MiniMax-H3-Image"
 COMFY_DIFFUSION_FILES["MiniMaxAI/MiniMax-H3-Image"] = "diffusion_models/minimax_h3_image_{quant}.safetensors"
 COMFY_DIFFUSION_QUANTS["minimax_h3_image"] = ("int8_convrot", "bf16", "w4a8")

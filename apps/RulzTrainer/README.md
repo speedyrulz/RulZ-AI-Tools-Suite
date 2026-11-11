@@ -26,7 +26,8 @@ A simple diffusion-model LoRA trainer with a WebUI. Supported models:
 - **P-H3-Image** (33B, PrunaAI): experimental text-to-image LoRAs for PrunaAI's 8-step, guidance-free H3 image model,
   with ostris' P-H3-Image training adapter; two 16 GB cards or one with block swap ([details](#p-h3-image)).
 - **MiniMax-H3-Image** (33B, MiniMax): experimental text-to-image LoRAs for MiniMax's own 6-step, guidance-free image
-  model (4 to 20 MP); two 16 GB cards or one with block swap ([details](#minimax-h3-image)).
+  model (4 to 20 MP), with ostris' MiniMax-H3-Image training adapter; two 16 GB cards or one with block swap
+  ([details](#minimax-h3-image)).
 
 | Dark | Light |
 | --- | --- |
@@ -3309,15 +3310,26 @@ from diffusers' `minimax_h3_image` modular pipeline, ComfyUI's `MiniMaxH3ImageMo
   step-size-weighted mean of the heads a step spans, ComfyUI's rule). A **training step** uses the head of the grid
   interval that holds its sigma, ai-toolkit's rule for checkpoints with such heads. The heads are close to each other
   (each differs from head 0 by about 2% of its norm).
-- **Timesteps.** MiniMax has not published how the model was trained. `timestep_sampling: reference` here is the
-  trainer's own choice: a position drawn uniformly along the 6-interval grid (read piecewise-linearly in its index,
-  as ComfyUI's sampling reads it), so each head trains on an equal share of the steps and on the sigmas its sampling
-  step covers. The other samplers (logit-normal and so on) work as for any model.
-- **No training adapter.** The model is step- and guidance-distilled, and on 10 November 2026 nobody has published
-  a training adapter for it (circlestone-labs' *MiniMax-H3-Image-Training-Adapter* is an image adapter for H3 itself,
-  despite its name, and is refused here). `training_adapter: auto` resolves to none, so a LoRA trains on the
-  distilled model as it is. The siblings suggest what to watch for: LoRAs trained bare on H3 and P-H3-Image drift.
-  Set an adapter file once one exists.
+- **Timesteps.** MiniMax has not published how the model was trained. `timestep_sampling: reference` is ai-toolkit's
+  rule for the model (its `fixed_train_sigmas`, commit 5b1670a of 10 November 2026) since v3.7.0: a step trains at
+  one of the 6 sigmas the model samples at (1, 0.968, 0.888, 0.75, 0.533, 0.232), picked evenly, through that
+  sigma's own head. Each head was distilled at its one sigma, so nothing trains in between. The sigmas are used as
+  drawn: `timestep_shift`, `sigma_min` / `sigma_max`, `clean_share` and `timestep_buckets` do not move them (the log
+  says so), and they are not rounded to the 1000-step grid, where 0.968, 0.888 and 0.533 would land above their grid
+  points and train the head before. Before v3.7.0 `reference` drew a position anywhere along the grid, so a head also
+  trained on sigmas between its step and the next. The other samplers (logit-normal and so on) still work as for any
+  model and still do that; the log warns when one is set.
+- **Training adapter.** The model is step- and guidance-distilled, so `training_adapter: auto` downloads ostris'
+  [minimax_h3_training_adapter](https://huggingface.co/ostris/minimax_h3_training_adapter)
+  `minimax_h3_image_training_adapter_v1.safetensors` (rank 16, 0.16 GB, `diffusion_model.*.lora_A/B`, no alpha, on
+  the 200 block layers and the 8 token-refiner layers), the adapter ai-toolkit trains MiniMax-H3-Image with by
+  default (since v3.7.0; before, none existed). It is on while the LoRA trains and off for samples and probes, and
+  never saved. Its header is checked against the port's module names and shapes; it has not been run here.
+  circlestone-labs' *MiniMax-H3-Image-Training-Adapter* (`minimax_h3_image_training_adapter.safetensors`, no version
+  in the name) is an image adapter for H3 itself, despite its name, and is refused here.
+- **What ai-toolkit does that this trainer does not**: edit training (reference images, labelled `Picture 1: ` and
+  so on in the text encoder's input, kept at their own size with the short edge between 1024 and 2048 px), a
+  4096-token caption cap, and LoRA layers on the token refiner by default (here an optional target).
 - **Text features** are MiniMax H3's, byte for byte the same tokenizer (the Hub's blob ids agree) and the same
   recipe: the caption verbatim, no chat template, the state after decoder layer 50 (diffusers'
   `MiniMaxH3ImageTextEncoderStep`).
@@ -3362,9 +3374,10 @@ P-H3-Image's `w4a8`, whose headers declare the same layout (not tried on those f
 cards in `multi_gpu: model_split`, one 16 GB card with `block_swap`, or one 24-32 GB card whole.
 
 **Recipe** (what the setup wizard suggests): H3's (rank 16, 32 for styles, alpha = rank, learning rate 1e-4,
-`adamw8bit`, the default `qkv_proj` / `out_proj` / `fc1` / `fc2` targets), `timestep_sampling: reference`, no training
-adapter, 1 MP buckets on the 32 px grid, and samples and probes at 6 steps, CFG 1. These are starting values taken
-from the siblings, not measurements.
+`adamw8bit`, the default `qkv_proj` / `out_proj` / `fc1` / `fc2` targets), `timestep_sampling: reference`, the
+training adapter on (`auto`), 1 MP buckets on the 32 px grid, and samples and probes at 6 steps, CFG 1. Rank 16 with
+alpha 16, the adapter and the 6 training sigmas are ai-toolkit's defaults for the model; the rest are starting values
+taken from the siblings. None of it is measured here.
 
 **Export**: H3's layout (`diffusion_model.blocks.<n>.attn.qkv_proj.lora_A/B`, alpha = rank), which ComfyUI's Load
 LoRA reads on the MiniMax-H3-Image files. The output heads are never a LoRA target.
@@ -3374,7 +3387,8 @@ layout, the heads in their three layouts and which heads a training or sampling 
 headers against the port (`tests/fixtures/minimax_h3_image_headers.json`: names, dtypes and shapes only: the three
 diffusion models, both VAE layouts, the heads file, the first and last shard of both folder layouts), the 4-bit and
 6-bit weights against comfy-kitchen's packing, a single file and both folder layouts loading the same model, the VAE
-decoder and its tiling, the sampler, and detection, downloads, caches and the wizard.
+decoder and its tiling, the sampler, the training sigmas and the head each one uses, the released training adapter's
+header against the port, and detection, downloads, caches and the wizard.
 
 ## Using the LoRA in ComfyUI
 

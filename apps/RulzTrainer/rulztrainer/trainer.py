@@ -269,6 +269,10 @@ def sample_sigmas(cfg: TrainConfig, n: int, gen: torch.Generator, logit_shift: f
     """tokens: the batch's image token count (H/16 x W/16), which the architectures' own recipes depend on. strata:
     timestep_buckets' deck (make_strata); None draws freely, as every run without it always has."""
     mode = cfg.timestep_sampling
+    if mode == "reference":
+        arch = arch or get_arch(cfg)
+        if arch.reference_sigmas_exact:  # a step-distilled model's own sampling sigmas, used as drawn
+            return arch.reference_sigmas(n, gen, tokens)
     if strata is not None and mode != "reference":
         u = strata.uniform(n, gen)
         rand, randn = (lambda: u), (lambda: torch.special.ndtri(u))
@@ -1039,6 +1043,16 @@ class Trainer(RaceParallelMixin):
         if not injected and not cfg.finetune:
             raise ValueError("No LoRA modules selected: check lora_targets / lora_blocks")
         self._attach_training_adapter(model, log_it=True)
+        if self.arch.reference_sigmas_exact:
+            if cfg.timestep_sampling != "reference":
+                log.warning("%s has one output head per sampling step, each distilled at its one noise level. "
+                            "timestep_sampling: %s trains at noise levels between them, which sampling never uses; "
+                            "timestep_sampling: reference trains on the sampling steps themselves (ai-toolkit's "
+                            "rule)", self.arch.label, cfg.timestep_sampling)
+            elif cfg.timestep_shift != 1.0 or cfg.sigma_min > 0.0 or cfg.sigma_max < 1.0 or cfg.clean_share:
+                log.warning("timestep_sampling: reference trains %s on its own sampling noise levels only: "
+                            "timestep_shift, sigma_min / sigma_max and clean_share do not move them",
+                            self.arch.label)
         self.replicas = [(model, injected, self.devices[0])]
         if cfg.multi_gpu == "data_parallel":
             from .multigpu import DataParallelLoRA

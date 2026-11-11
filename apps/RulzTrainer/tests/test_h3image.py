@@ -268,6 +268,27 @@ def test_released_dit_headers_fit_the_port():
     assert len([k for k in HEADERS["dit_w4a8"] if k.endswith(".weight_s_rel")]) == 200  # the 50 blocks' 4 Linears
 
 
+def test_released_training_adapter_fits_the_port_names():
+    """ostris' minimax_h3_image_training_adapter_v1 (what ai-toolkit trains the model with): every layer it names is
+    a Linear of the port with those shapes, in the layout attach_training_adapter reads."""
+    state = C.original_to_port(meta_state({k: v for k, v in HEADERS["dit_bf16"].items()}), interleaved=False,
+                               heads=0, head_dim=0)
+    with torch.device("meta"):
+        model = MiniMaxH3Transformer.from_config(C.config_from_state(state))
+    modules = dict(model.named_modules())
+    adapter = HEADERS["adapter"]
+    names = {k.split(".lora_")[0][len("diffusion_model."):] for k in adapter}
+    assert len(names) == 208 and len(adapter) == 416  # 50 blocks + 2 token-refiner blocks, 4 Linears each
+    assert sum(n.startswith("token_refiner.") for n in names) == 8 and not any("final_layer" in n for n in names)
+    for name in names:
+        m = modules[name]
+        down = tuple(adapter[f"diffusion_model.{name}.lora_A.weight"][1])
+        up = tuple(adapter[f"diffusion_model.{name}.lora_B.weight"][1])
+        assert down == (16, m.in_features) and up == (m.out_features, 16), name
+        assert ARCH.lora_module_name(name) == name
+    assert all(".alpha" not in k for k in adapter)  # alpha = rank: the adapter applies at scale 1
+
+
 def test_released_folder_shards_map_onto_the_port():
     """MiniMaxAI's transformer/ (original names, full AdaLN, its own single output head) and transformer_diffusers/
     (pdd_proj_out.0-5), by the first and last shard of each, and pdd_fused_heads.safetensors."""
@@ -737,13 +758,36 @@ def test_sampler_steps_the_released_grid_through_its_heads():
     assert calls == [(1, 2), (2, 2)] and lat2.shape == (1, 24, 4, 4) and torch.isfinite(lat2).all()
 
 
-def test_reference_timesteps_cover_every_head_equally():
+def test_reference_timesteps_are_the_six_sampling_sigmas_each_through_its_own_head():
+    """ai-toolkit's rule (fixed_train_sigmas): only the sigmas the model samples at, evenly, used as drawn."""
+    from rulztrainer.trainer import make_strata, sample_sigmas
+
+    grid = torch.tensor(H3_IMAGE_PDD_SIGMAS, dtype=torch.float32)
     s = ARCH.reference_sigmas(60000, torch.Generator().manual_seed(0), 4096)
-    assert s.min() >= 0 and s.max() <= 1
-    grid = list(H3_IMAGE_PDD_SIGMAS)
-    share = [float(((s <= grid[k]) & (s > grid[k + 1])).float().mean()) for k in range(6)]
+    assert ARCH.reference_sigmas_exact and not archs.arch_by_name("minimax_h3").reference_sigmas_exact
+    assert sorted(set(s.tolist()), reverse=True) == grid[:-1].tolist()  # never 0, never between two grid points
+    share = [float((s == g).float().mean()) for g in grid[:-1]]
     assert all(abs(x - 1 / 6) < 0.01 for x in share), share
-    assert abs(float(s.mean()) - sum((a + b) / 2 for a, b in zip(grid[:-1], grid[1:])) / 6) < 0.01
+    # the trainer leaves them alone: no shift, no range, no rounding to the 1000-step grid, no buckets
+    cfg = TrainConfig(model_path="MiniMaxAI/MiniMax-H3-Image", timestep_sampling="reference", timestep_shift=3.0,
+                      sigma_min=0.2, sigma_max=0.9, timestep_buckets=8)
+    assert make_strata(cfg) is None
+    drawn = sample_sigmas(cfg, 4000, torch.Generator().manual_seed(1), logit_shift=-1.5, tokens=4096)
+    assert set(drawn.tolist()) == set(grid[:-1].tolist())
+    # each one reaches the head of its own sampling step, through the trainer's t = sigma * 1000 and back
+    for k, g in enumerate(grid[:-1]):
+        back = float((g * 1000.0) / 1000.0)
+        assert pdd_span(H3_IMAGE_PDD_SIGMAS, back) == (k, k + 1)
+    # rounded to the 1000-step grid three of them would use the head before: why they are kept exact
+    rounded = [pdd_span(H3_IMAGE_PDD_SIGMAS, round(float(g) * 1000) / 1000)[0] for g in grid[:-1]]
+    assert rounded == [0, 0, 1, 3, 3, 5]
+    six = MiniMaxH3Transformer(**{**TINY, "pdd_steps": 6, "pdd_sigmas": None})
+    weights = six.pdd_weights(grid[:-1])
+    assert weights[:, 0].tolist() == [1.0] * 6  # block 0 is the full head, block k >= 1 head k's offset from it
+    assert weights[:, 1:].tolist() == torch.eye(6)[:, 1:].tolist()
+    # the other samplers still draw anywhere, on the 1000-step grid
+    free = sample_sigmas(TrainConfig(model_path="MiniMaxAI/MiniMax-H3-Image"), 2000, torch.Generator().manual_seed(2))
+    assert len(set(free.tolist())) > 100
     assert ARCH.size_multiple == 32 and ARCH.latent_tag == "_h3ivae" and ARCH.block_token_px == 16
     assert ARCH.lora_format == "comfy_ab" and ARCH.n_blocks == 50 and ARCH.modelspec == "minimax-h3-image"
 
@@ -784,6 +828,14 @@ def test_detection_downloads_and_caches(tmp_path):
     # circlestone-labs' image training adapter is H3's own, whatever its name
     assert family_named_in("circlestone-labs/MiniMax-H3-Image-Training-Adapter") == "minimax_h3"
     assert family_named_in("minimax_h3_image_training_adapter.safetensors") == "minimax_h3"
+    # ostris' adapter for MiniMax-H3-Image carries a version, and is this model's
+    assert family_named_in("minimax_h3_image_training_adapter_v1.safetensors") == "minimax_h3_image"
+    assert family_named_in("ostris/minimax_h3_training_adapter") == "minimax_h3"
+    TrainConfig(model_path="MiniMaxAI/MiniMax-H3-Image",
+                training_adapter="D:/loras/minimax_h3_image_training_adapter_v1.safetensors").validate()
+    with pytest.raises(ValueError, match="another model's files"):
+        TrainConfig(model_path="MiniMaxAI/MiniMax-H3",
+                    training_adapter="D:/loras/minimax_h3_image_training_adapter_v1.safetensors").validate()
     TrainConfig(model_path="MiniMaxAI/MiniMax-H3",
                 training_adapter="D:/loras/minimax_h3_image_training_adapter.safetensors").validate()
     with pytest.raises(ValueError, match="another model's files"):
@@ -800,8 +852,13 @@ def test_detection_downloads_and_caches(tmp_path):
                              "diffusion_models/minimax_h3_image_pruned_int8_convrot.safetensors"),
         # MiniMax H3's own text encoder file (the same bytes in both repos): one download serves both models
         "text_encoder_file": ("Comfy-Org/MiniMax-H3", "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"),
-        "vae_file": ("Comfy-Org/MiniMax-H3-Image", "vae/minimax_h3_image_vae_fp16.safetensors")}
-    assert "minimax_h3_image" not in ARCH_TURBO and "minimax_h3_image" not in ARCH_TRAINING_ADAPTER
+        "vae_file": ("Comfy-Org/MiniMax-H3-Image", "vae/minimax_h3_image_vae_fp16.safetensors"),
+        # ostris' adapter, what ai-toolkit trains the model with
+        "training_adapter": ("ostris/minimax_h3_training_adapter", "minimax_h3_image_training_adapter_v1.safetensors")}
+    assert "minimax_h3_image" not in ARCH_TURBO
+    assert ARCH_TRAINING_ADAPTER["minimax_h3_image"]["file"] in HEADERS["source"]  # the file the header test reads
+    assert "training_adapter" not in {f for f, _, _ in planned_downloads(TrainConfig(
+        model_path="MiniMaxAI/MiniMax-H3-Image", training_adapter=""))}
     other = {f: n for f, _, n in planned_downloads(TrainConfig(
         model_path="MiniMaxAI/MiniMax-H3-Image", model_file_quant="w4a8", text_encoder_file_quant="nvfp4_awq"))}
     assert other["transformer_file"].endswith("minimax_h3_image_pruned_w4a8.safetensors")
@@ -827,7 +884,7 @@ def test_wizard_recommends_the_h3_image_setup():
     two = webui.wizard_recommendations(cfg, "character", [{"total": 16311}, {"total": 16380}], None)
     assert two["multi_gpu"][0] == "model_split" and two["block_swap"][0] == 0
     assert two["model_file_quant"][0] == "int8_convrot" and two["text_encoder_file_quant"][0] == "int8_convrot"
-    assert two["adapter_mode"][0] == "none" and "no training adapter" in two["adapter_mode"][1]
+    assert two["adapter_mode"][0] == "auto" and "ostris" in two["adapter_mode"][1]
     assert two["timestep_sampling"][0] == "reference" and two["resolutions"][0] == [1.0]
     assert (two["lora_rank"][0], two["lora_alpha"][0], two["learning_rate"][0]) == (16, 16.0, 1e-4)
     assert (two["sample_steps"][0], two["sample_cfg"][0]) == (6, 1.0)
