@@ -36,6 +36,9 @@ def test_notation_and_shares_per_epoch():
     assert CS.lr_scale_at(rising, 5) == 0.5 and CS.lr_scale_at(rising, 4) == 1.0
     assert CS.lr_scale_at(CS.parse("40"), 9) == 1.0 and CS.lr_scale_at(None, 9) == 1.0
     assert CS.parse(CS.FT_SLIDE) == (11.0, 4.0, 30.0, 8.0, 2)
+    muon = CS.parse(CS.SLIDE_MUON)  # 11:7:40:8:3: the lower share first
+    assert [CS.share_at(muon, e) for e in range(1, 15)] == [11.0] * 7 + [40.0, 40.0, 40.0, 11.0, 40.0, 40.0, 11.0]
+    assert [CS.lr_scale_at(muon, e) for e in range(1, 15)] == [1.0] * 10 + [0.5, 1.0, 1.0, 0.5]
     split = CS.parse("75:5:40")
     assert [CS.share_at(split, e) for e in (1, 5, 6, 30)] == [75.0, 75.0, 40.0, 40.0]
     assert CS.share_at(CS.parse("40"), 1) == 40.0 and CS.share_at(None, 3) is None

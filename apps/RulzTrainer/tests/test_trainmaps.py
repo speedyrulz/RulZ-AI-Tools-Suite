@@ -295,11 +295,63 @@ def test_series_learned_levels_and_scale(tmp_path):
     assert mean[0].tolist() == [[2, 2]] and mean[1].tolist() == [[0.75, 3.5]]
     eff = TM.series(data, "0", "effect", "all")
     assert eff[0] is None and eff[1][0].tolist() == pytest.approx([0.1, 0.2])
-    assert TM.series(data, "0", "attn", "0.25", "ohwx")[1][0].tolist() == pytest.approx([0.3, 0.1])
+    # the trigger map counts from its quietest share up: the 2nd percentile of [0.1, 0.3] is 0.104
+    assert TM.series(data, "0", "attn", "0.25", "ohwx")[1][0].tolist() == pytest.approx([0.196, 0.0])
     one = {"captures": [{"step": 0, "maps": {"0": {"0.25": {"attn": _g([0.4, 0.2])}}}}]}
-    assert TM.series(one, "0", "attn", "0.25", "ohwx")[0][0].tolist() == pytest.approx([0.4, 0.2])  # one word
+    assert TM.series(one, "0", "attn", "0.25", "ohwx")[0][0].tolist() == pytest.approx([0.196, 0.0])  # one word
     assert TM.scale(learned, "learned") == pytest.approx(np.percentile([0, 0, 0.5, 1], 99))
     assert TM.scale([None], "loss") == 1.0 and TM.scale([np.zeros((1, 2))], "loss") == 1.0
+
+
+def test_learned_as_a_share_of_each_cells_own_start(tmp_path):
+    """Share: the loss gone over the cell's own starting loss, per noise level against that level's start, then the
+    mean of the levels; a nearly clean cell's start is floored; "fixed" is the same series on one scale."""
+    _write(tmp_path, [
+        {"step": 0, "maps": {"0": {"0.25": {"loss": _g([1, 1])}, "0.5": {"loss": _g([3, 3])}}}},
+        {"step": 4, "maps": {"0": {"0.25": {"loss": _g([0.5, 2])}, "0.5": {"loss": _g([1, 5])}}}}])
+    data = TM.read(tmp_path)
+    low = TM.series(data, "0", "learned", "0.25", learned_as="share")
+    assert low[0].tolist() == [[0, 0]] and low[1][0].tolist() == pytest.approx([0.5, -1.0])
+    both = TM.series(data, "0", "learned", "all", learned_as="share")
+    assert both[1][0].tolist() == pytest.approx([(0.5 + 2 / 3) / 2, (-1 - 2 / 3) / 2])  # each level counts the same
+    # by amount the high-noise level's larger loss decides; the default is unchanged
+    assert TM.series(data, "0", "learned", "all")[1][0].tolist() == pytest.approx([1.25, -1.5])
+    fixed = TM.series(data, "0", "learned", "all", learned_as="fixed")
+    assert fixed[1].tolist() == both[1].tolist()
+    assert TM.scale(fixed, "learned", "fixed") == TM.FIXED_SHARE_TOP == 0.5
+    assert TM.scale(both, "learned", "share") == pytest.approx(np.percentile(np.abs(np.concatenate(
+        [a.ravel() for a in both])), 99))
+    assert set(TM.LEARNED_AS) == {"amount", "share", "fixed"}
+    # a nearly clean cell: its start is floored at the picture's 10th percentile, so a tiny change is a small share
+    start = [1e-6] + [1.0] * 19
+    now = [2e-6] + [0.5] * 19
+    flat = {"captures": [{"step": 0, "maps": {"0": {"0.25": {"loss": {"w": 20, "h": 1, "v": start}}}}},
+                         {"step": 4, "maps": {"0": {"0.25": {"loss": {"w": 20, "h": 1, "v": now}}}}}]}
+    share = TM.series(flat, "0", "learned", "0.25", learned_as="share")[1][0]
+    assert share[1] == pytest.approx(0.5) and abs(share[0]) < 1e-5  # unfloored it would read -1 (twice as wrong)
+    # a capture without that picture's maps stays None
+    gap = {"captures": [flat["captures"][0], {"step": 2, "maps": {}}, flat["captures"][1]]}
+    assert TM.series(gap, "0", "learned", "all", learned_as="share")[1] is None
+
+
+def test_trigger_map_counts_from_the_quietest_capture_up():
+    """An evenly spread trigger map: from zero every cell sits high on the scale; from the floor (the lowest 2nd
+    percentile of any capture) the range is used, and every capture shares that floor so they still compare."""
+    rng = np.random.default_rng(0)
+    early = (0.08 + 0.01 * rng.random(200)).tolist()
+    late = (0.08 + 0.01 * rng.random(200)).tolist()
+    late[:20] = [0.14] * 20  # the word found its place
+    data = {"captures": [{"step": 0, "maps": {"0": {"0.5": {"attn": {"w": 20, "h": 10, "v": early}}}}},
+                         {"step": 9, "maps": {"0": {"0.5": {"attn": {"w": 20, "h": 10, "v": late}}}}}]}
+    raw = [TM.level_map(c, "0", "attn", "0.5") for c in data["captures"]]
+    assert min(a.min() for a in raw) / TM.scale(raw, "attn") > 0.5  # from zero: nothing under half of full scale
+    maps = TM.series(data, "0", "attn", "0.5")
+    top = TM.scale(maps, "attn")
+    low = min(np.percentile(a, 2) for a in raw)
+    assert maps[0] == pytest.approx(np.maximum(raw[0] - low, 0), abs=1e-7)
+    assert maps[1] == pytest.approx(np.maximum(raw[1] - low, 0), abs=1e-7)  # one floor for every capture
+    assert np.median(maps[1]) / top < 0.2 and maps[1].ravel()[:20].min() / top > 0.9
+    assert min(a.min() for a in maps) >= 0
 
 
 def test_colorize_and_render_overlay():
