@@ -55,6 +55,26 @@ class SampleSlot:
     compiled: bool = False  # the model's blocks are torch.compiled (graph tracing must not overlap)
 
 
+def render_frames(trainer, what: str = "still") -> int:
+    """Frames of a sample ("sample") or probe ("probe") render: above 1 on a video model with sample_frames /
+    probe_frames set, as many as its VAE gives back (4k + 1); 1 for everything else."""
+    cfg = getattr(trainer, "cfg", None)
+    asked = {"sample": getattr(cfg, "sample_frames", 1), "probe": getattr(cfg, "probe_frames", 1)}.get(what, 1)
+    arch = getattr(trainer, "arch", None)
+    return arch.snap_frames(asked) if asked > 1 and getattr(arch, "supports_video", False) else 1
+
+
+def render_prompt(trainer, prompt: str, what: str = "still") -> str:
+    """The prompt as a sample / probe render reads it and the text cache holds it (a clip's carries its length)."""
+    frames = render_frames(trainer, what)
+    return trainer.arch.render_prompt(prompt, frames) if frames > 1 and prompt else prompt
+
+
+def render_negative(trainer, what: str = "still") -> str:
+    """trainer.negative_prompt for a render of that kind (a stand-in without the argument gives its one negative)."""
+    return trainer.negative_prompt(what) if render_frames(trainer, what) > 1 else trainer.negative_prompt()
+
+
 @dataclass
 class RenderJob:
     prompt: str
@@ -66,10 +86,12 @@ class RenderJob:
     out_path: Path
     label: str  # e.g. "sample 2/4" or "probe face seed 1/2"
     kind: str = "sample"  # sample | face | body
+    frames: int = 1  # above 1: a clip (a video model), saved beside out_path, which is its middle frame
+    shown: str = ""  # the prompt as the user wrote it, for the log (a clip's prompt is wrapped with its length)
 
     @property
     def shape_key(self):
-        return (self.width, self.height, self.cfg_scale != 1.0)
+        return (self.width, self.height, self.cfg_scale != 1.0, self.frames)
 
 
 class _Board:
@@ -613,9 +635,19 @@ class Trainer(RaceParallelMixin):
             self.device = torch.device(cfg.device)
         self.model_dir: Path | None = None
 
-    def negative_prompt(self) -> str:
-        """The sample / probe negative prompt: the config's, or the architecture's default (FIBO 2.0: the null caption)."""
-        return self.cfg.sample_negative or self.arch.default_negative
+    def render_frames(self, what: str = "still") -> int:
+        return render_frames(self, what)
+
+    def render_prompt(self, prompt: str, what: str = "still") -> str:
+        return render_prompt(self, prompt, what)
+
+    def negative_prompt(self, what: str = "still") -> str:
+        """The sample / probe negative prompt: the config's, or the architecture's default (FIBO 2.0: the null
+        caption; PAN 2: its structured negative for the render's length)."""
+        if self.cfg.sample_negative:
+            return self.cfg.sample_negative
+        frames = render_frames(self, what)
+        return self.arch.render_negative(frames) if frames > 1 else self.arch.default_negative
 
     def side_devices(self) -> list[str]:
         """GPUs that side jobs (samples, probes, caching, SAM 3 masks) are split across."""
@@ -837,12 +869,15 @@ class Trainer(RaceParallelMixin):
 
     def prepare_cache(self, items):
         cfg = self.cfg
-        prompts = list(cfg.sample_prompts) + ([self.negative_prompt()] if cfg.sample_prompts else [])
+        prompts = [render_prompt(self, p, "sample") for p in cfg.sample_prompts] \
+            + ([render_negative(self, "sample")] if cfg.sample_prompts else [])
         if cfg.probe_every > 0:
             from . import promptcheck
 
-            prompts += [p for p in (cfg.probe_face_prompt, cfg.probe_body_prompt) if p] + [self.negative_prompt()]
-            prompts += [c.prompt for c in promptcheck.extra_checks(cfg)]  # probe_checks: rendered, never scored
+            prompts += [render_prompt(self, p, "probe") for p in (cfg.probe_face_prompt, cfg.probe_body_prompt) if p]
+            prompts += [render_negative(self, "probe"), self.negative_prompt()]
+            # probe_checks: rendered, never scored
+            prompts += [render_prompt(self, c.prompt, "probe") for c in promptcheck.extra_checks(cfg)]
         if cfg.reward_steps > 0:
             prompts += list(cfg.reward_prompts) + [self.negative_prompt()]
         if cfg.selftrain:
@@ -2925,18 +2960,26 @@ class Trainer(RaceParallelMixin):
             emb = load_text_embeds(cfg, job.prompt)
             pos_e, pos_m = self.arch.pad_embeds([emb])
             log.info("%s on %s (seed %d, %d steps, %dx%d): %s", job.label[:1].upper() + job.label[1:], slot.device,
-                     job.seed, job.steps, job.width, job.height, job.prompt[:80])
+                     job.seed, job.steps, job.width, job.height, (job.shown or job.prompt)[:80])
             board.set(slot.device, f"{job.label} | step 0/{job.steps}")
 
             def on_progress(k, total, _slot=slot, _job=job):
                 board.set(_slot.device, f"{_job.label} | step {k}/{total}")
 
+            clip = {"frames": job.frames} if job.frames > 1 else {}
             lat = self.arch.sample(slot.model, pos_e, pos_m, neg_e, neg_m, width=job.width, height=job.height,
                                    steps=job.steps, cfg=job.cfg_scale, shift=cfg.sample_shift, seed=job.seed,
-                                   skip_layer=cfg.sample_skip_layer, device=slot.device, progress=on_progress)
-            img = self.arch.decode_latents(slot.vae, lat)[0]
-            arr = ((img.permute(1, 2, 0).float().cpu().numpy() + 1) * 127.5).round().clip(0, 255).astype("uint8")
-            Image.fromarray(arr).save(job.out_path)
+                                   skip_layer=cfg.sample_skip_layer, device=slot.device, progress=on_progress, **clip)
+            if clip:  # the clip beside its middle frame, which is the picture everything else reads
+                from . import clips
+
+                frames = clips.to_uint8(self.arch.decode_video(slot.vae, lat))
+                clips.save_clip(clips.clip_path(job.out_path), frames, self.arch.video_fps)  # first: the gallery
+                Image.fromarray(frames[clips.still_index(len(frames))]).save(job.out_path)  # watches the stills
+            else:
+                img = self.arch.decode_latents(slot.vae, lat)[0]
+                arr = ((img.permute(1, 2, 0).float().cpu().numpy() + 1) * 127.5).round().clip(0, 255).astype("uint8")
+                Image.fromarray(arr).save(job.out_path)
             board.set(slot.device, f"{job.label} done")
             return str(job.out_path)
 
@@ -4336,7 +4379,7 @@ class Trainer(RaceParallelMixin):
         for sl in slots:
             sl.model.eval()
             lora_mod.set_extras_enabled(sl.model, True)
-        neg_e, neg_m = self.arch.pad_embeds([load_text_embeds(self.cfg, self.negative_prompt())])
+        neg_e, neg_m = self.arch.pad_embeds([load_text_embeds(self.cfg, render_negative(self, "probe"))])
         jobs = self._probe_jobs(step, tag, n_seeds, len(slots))
         title = f"probes at step {step} on {len(slots)} GPUs" if len(slots) > 1 and len(jobs) > 1 else ""
         board = _Board(self.status, title)
@@ -4373,20 +4416,24 @@ class Trainer(RaceParallelMixin):
 
                 n = max(n, STRANGER_SEEDS)  # the anchored body score's zero: the base model's renders
             for k in range(n):
-                jobs.append(RenderJob(prompt, w, h, cfg.probe_steps, cfg.probe_cfg, cfg.probe_seed + k,
+                jobs.append(RenderJob(render_prompt(self, prompt, "probe"), w, h, cfg.probe_steps, cfg.probe_cfg,
+                                      cfg.probe_seed + k,
                                       out_dir / f"{self._image_prefix()}{tag or f'step{step:06d}'}_{kind}_{k}.png",
                                       f"probe {kind} seed {k + 1}/{n} at step {step}" if n_slots == 1
-                                      else f"probe {kind} seed {k + 1}/{n}", kind))
+                                      else f"probe {kind} seed {k + 1}/{n}", kind, frames=render_frames(self, "probe"),
+                                      shown=prompt))
         if tag or n_seeds or (self.face_scorer is None and self.body_scorer is None):
             return jobs
         n = max(1, int(cfg.probe_check_seeds))
         for c in promptcheck.extra_checks(cfg):
             w, h = (cfg.probe_size, cfg.probe_size) if c.kind == "face" else probe_body_size(cfg.probe_size)
             for k in range(n):
-                jobs.append(RenderJob(c.prompt, w, h, cfg.probe_steps, cfg.probe_cfg, cfg.probe_seed + k,
+                jobs.append(RenderJob(render_prompt(self, c.prompt, "probe"), w, h, cfg.probe_steps, cfg.probe_cfg,
+                                      cfg.probe_seed + k,
                                       out_dir / f"{self._image_prefix()}step{step:06d}_check-{c.name}_{k}.png",
                                       f"prompt check {c.name} seed {k + 1}/{n} at step {step}" if n_slots == 1
-                                      else f"prompt check {c.name} seed {k + 1}/{n}", f"check:{c.name}"))
+                                      else f"prompt check {c.name} seed {k + 1}/{n}", f"check:{c.name}",
+                                      frames=render_frames(self, "probe"), shown=c.prompt))
         return jobs
 
     def _probe_frame(self, path, expect: str) -> dict | None:
@@ -4885,15 +4932,16 @@ class Trainer(RaceParallelMixin):
             sl.model.eval()
             lora_mod.set_extras_enabled(sl.model, True)
         self.status.update(stage=f"sampling (step {step})")
-        neg_e, neg_m = self.arch.pad_embeds([load_text_embeds(cfg, self.negative_prompt())])
+        neg_e, neg_m = self.arch.pad_embeds([load_text_embeds(cfg, render_negative(self, "sample"))])
         out_dir = self.job_dir / "samples"
         out_dir.mkdir(exist_ok=True)
         n_prompts = len(cfg.sample_prompts)
-        jobs = [RenderJob(prompt, cfg.sample_width, cfg.sample_height, cfg.sample_steps, cfg.sample_cfg,
-                          cfg.sample_seed + (i if cfg.sample_walk_seed else 0),
+        frames = render_frames(self, "sample")
+        jobs = [RenderJob(render_prompt(self, prompt, "sample"), cfg.sample_width, cfg.sample_height, cfg.sample_steps,
+                          cfg.sample_cfg, cfg.sample_seed + (i if cfg.sample_walk_seed else 0),
                           out_dir / f"{self._image_prefix()}step{step:06d}_{i}.png",
                           f"sampling {i + 1}/{n_prompts} at step {step}" if len(slots) == 1
-                          else f"sample {i + 1}/{n_prompts}")
+                          else f"sample {i + 1}/{n_prompts}", frames=frames, shown=prompt)
                 for i, prompt in enumerate(cfg.sample_prompts)]
         title = f"sampling at step {step} on {len(slots)} GPUs" if len(slots) > 1 and n_prompts > 1 else ""
         board = _Board(self.status, title)

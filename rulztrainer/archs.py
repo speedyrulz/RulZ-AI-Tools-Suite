@@ -49,6 +49,8 @@ class Arch:
     target_groups: dict[str, str] = {}  # lora_targets name -> description (for the UI)
     default_targets: tuple[str, ...] = ()
     supports_single_files = False
+    supports_video = False  # samples and probes can be clips (sample_frames / probe_frames above 1)
+    video_fps = 24
     empty_prompt = ""  # what caption dropout trains on
     default_negative = ""  # negative prompt for samples/probes when none is given
     default_sample_steps = 20
@@ -1239,6 +1241,7 @@ class Pan2Arch(Arch):
     default_sample_steps, default_sample_cfg = ARCH_FULL_SAMPLE["pan2"]
     latent_tag = "_wan22vae"
     size_multiple = 32
+    supports_video = True
 
     def __init__(self):
         from .pan2 import loading
@@ -1283,6 +1286,26 @@ class Pan2Arch(Arch):
         from .pan2.sampler import sample
 
         return sample(model, pos_e, pos_m, neg_e, neg_m, **kw)
+
+    def snap_frames(self, frames):
+        from .pan2.sampler import snap_frames
+
+        return snap_frames(frames)
+
+    def render_prompt(self, prompt, frames=1):
+        """A clip's prompt carries the clip's length in its time ranges, so a plain one is wrapped here, ahead of
+        the text cache; a still's is wrapped when it is encoded (0 seconds), and JSON stays as it is."""
+        if frames <= 1:
+            return prompt
+        return self._loading.structured(prompt, seconds=(frames - 1) / self.video_fps)
+
+    def render_negative(self, frames=1):
+        if frames <= 1:
+            return self.default_negative
+        return self._loading.default_negative((frames - 1) / self.video_fps)
+
+    def decode_video(self, vae, latents):
+        return self._loading.decode_video(vae, latents)
 
     def sample_sigmas(self, model, steps, height, width, shift):
         from .pan2.sampler import pan2_sigmas

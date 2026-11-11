@@ -197,6 +197,16 @@ def decode_latents(vae, latents: torch.Tensor) -> torch.Tensor:
     return _decode(vae, latents).clamp(-1, 1)
 
 
+@torch.no_grad()
+def decode_video(vae, latents: torch.Tensor) -> torch.Tensor:
+    """A clip's latents [1, 48, T, h, w] -> its frames [(T - 1) * 4 + 1, 3, H, W] in [-1, 1]."""
+    z = latents.to(vae.device, torch.float32)
+    mean = torch.tensor(vae.config.latents_mean, device=z.device, dtype=torch.float32).view(1, -1, 1, 1, 1)
+    std = torch.tensor(vae.config.latents_std, device=z.device, dtype=torch.float32).view(1, -1, 1, 1, 1)
+    out = vae.decode((z * std + mean).to(_vae_dtype(vae)), return_dict=False)[0]  # [1, 3, F, H, W]
+    return out[0].transpose(0, 1).float().clamp(-1, 1)
+
+
 def decode_latents_grad(vae, latents: torch.Tensor) -> torch.Tensor:
     """decode_latents with gradients to `latents` (identity loss on a face crop), not clamped."""
     return _decode(vae, latents)
