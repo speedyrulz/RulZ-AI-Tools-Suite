@@ -903,6 +903,10 @@ class TrainConfig:
     race_drop_drift_probes: int = 2
     race_follow: bool = False  # a relay: nobody is dropped; after each round everyone continues from its winner's
     #                            LoRA, optimizer state and likeness history (seed rows: the best of several paths)
+    race_pick: bool = False  # relay only: after each round the run waits for you to pick (Monitor) which racer
+    #                          everyone continues from, instead of the highest likeness score
+    race_pick_minutes: float = 30.0  # race_pick: how long a round waits for the pick before the highest score leads
+    #                                  (0 = until you pick; the GPUs sit idle meanwhile)
     race_parallel: bool = False  # data_parallel race: one configuration per GPU at the same time (an odd one out
     #                              is split over the GPUs when its step has batches enough, else it runs on the first)
     sample_model_path: str = ""  # optional different diffusion model for sampling only: .safetensors, diffusers dir or repo id

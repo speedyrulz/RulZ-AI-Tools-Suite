@@ -528,7 +528,7 @@ def _start_training(cfg: TrainConfig, recovery_note: str | None = None) -> str:
         oom_recovery.reset(_job_dir)
     cfg_path = _job_dir / "config.yaml"
     cfg.save(cfg_path)
-    for stale in ("status.json", "STOP", "RACE_DROP"):  # (a drop asked of an earlier run of this job name)
+    for stale in ("status.json", "STOP", "RACE_DROP", "RACE_PICK"):  # (a drop or pick asked of an earlier run)
         p = _job_dir / stale
         if p.exists():
             p.unlink()
@@ -553,6 +553,12 @@ def request_race_drop(job_dir: Path, name: str) -> None:
     """Ask the running trainer to drop a race configuration (it reads RACE_DROP after every step)."""
     with open(Path(job_dir) / "RACE_DROP", "a", encoding="utf-8") as f:
         f.write(name.strip() + "\n")
+
+
+def request_race_pick(job_dir: Path, name: str) -> None:
+    """Tell a relay race waiting for your pick which racer everyone continues from (it reads RACE_PICK every few
+    seconds while it waits)."""
+    (Path(job_dir) / "RACE_PICK").write_text(name.strip() + "\n", encoding="utf-8")
 
 
 def stop_training() -> str:
@@ -1777,6 +1783,8 @@ class Form:
             race_drop_lowest=bool(v("race_drop_lowest")), race_patience_drop=bool(v("race_patience_drop")),
             race_patience=int(v("race_patience") or 3), race_patience_rising=bool(v("race_patience_rising")),
             race_parallel=bool(v("race_parallel")), race_follow=bool(v("race_follow")),
+            race_pick=bool(v("race_pick")) and bool(v("race_follow")),
+            race_pick_minutes=float(v("race_pick_minutes") or 0),
             race_drop_confidence=float(v("race_drop_confidence") or 0) if v("race_paired") else 0.0,
             race_max_close_rounds=int(v("race_max_close_rounds") or 0),
             race_drop_drift=float(v("race_drop_drift") or 0),
@@ -4368,6 +4376,11 @@ def race_review_line(cfg: TrainConfig) -> str:
     racers = "; ".join(f"{n}: {race.format_overrides(o) or 'the base setup'}" for n, _, o in rows)
     rules = []
     if cfg.race_follow:
+        if cfg.race_pick:
+            wait = (f"up to {cfg.race_pick_minutes:g} minutes, then the highest score leads"
+                    if cfg.race_pick_minutes > 0 else "until you pick")
+            return (f"{len(rows)} racers ({racers}); a relay where you pick on the Monitor, after each round, the racer "
+                    f"everyone continues from (the run waits {wait}); the last round's pick is the run's LoRA")
         return (f"{len(rows)} racers ({racers}); a relay: after each round everyone continues from the round's "
                 f"winner, and the last round's winner is the run's LoRA")
     if cfg.race_drop_lowest:
@@ -6470,6 +6483,16 @@ class Wizard:
                           "racer); the last round's winner is the run's LoRA. Racers must share the LoRA's shape: no "
                           "rank, alpha, layer or network type rows."):
             self.bind(ui.switch("Relay: continue from the round's winner"), "race_follow")
+        with self.setting(None, "Pick the racer to continue from yourself",
+                          "After each round the run waits while you look at the probe images, then everyone continues "
+                          "from the racer you pick with its Continue from button on the Monitor, not from the highest "
+                          "likeness score. The GPUs sit idle while it waits.", show_if=("race_follow", bool)):
+            self.bind(ui.switch("Pick the leader after each round"), "race_pick")
+        with self.setting(None, "Wait for the pick at most",
+                          "Minutes a round waits for your pick; then the highest likeness score leads as usual. 0 waits "
+                          "until you pick (a rented GPU bills all the while).", show_if=("race_pick", bool)):
+            self.bind(ui.number("Minutes (0 = until you pick)", min=0, precision=0), "race_pick_minutes") \
+                .classes("w-full")
         with self.setting(None, "Drop the lowest racer after each round",
                           "Every racer trains until its next probe, then the next one does; after a round the one with "
                           "the lowest likeness score leaves. Fast and cheap, but a racer that learns slowly and would "
@@ -10265,6 +10288,18 @@ def build_page(local: bool = True):
                                          "run's LoRA, the others are saved as _final files, and the best checkpoint "
                                          "any of them reached is <job>_best. The rows must share the LoRA's shape (no "
                                          "rank, alpha, layer or network type rows); not with one configuration per GPU.")
+                            w["race_pick"] = ui.switch("Pick the leader yourself after each round",
+                                                       value=d.race_pick) \
+                                .tooltip("Relay only. After each round the run waits while you look at the round's "
+                                         "probe images; the Monitor's race table then has a Continue from button on "
+                                         "each racer, and everyone continues from the one you pick instead of the "
+                                         "highest likeness score. In the last round your pick is the run's LoRA. The "
+                                         "GPUs sit idle while it waits.")
+                            w["race_pick_minutes"] = ui.number("Wait for the pick (minutes, 0 = no limit)",
+                                                               value=d.race_pick_minutes, min=0,
+                                                               precision=0).classes("w-80") \
+                                .tooltip("No pick by then: the highest likeness score leads, as without picking. A "
+                                         "stop while it waits does the same and then stops.")
                             w["race_drop_lowest"] = ui.switch("Drop the lowest after each round",
                                                               value=d.race_drop_lowest) \
                                 .tooltip("Off: nobody is dropped for being behind; every configuration trains all the "
@@ -10333,6 +10368,8 @@ def build_page(local: bool = True):
 
                         def race_rules_visible(_=None):
                             relay = bool(w["race_follow"].value)
+                            w["race_pick"].set_visibility(relay)
+                            w["race_pick_minutes"].set_visibility(relay and bool(w["race_pick"].value))
                             w["race_drop_lowest"].set_visibility(not relay)
                             drift_on = not relay and float(w["race_drop_drift"].value or 0) > 0
                             w["race_drop_drift"].set_visibility(not relay)
@@ -10349,7 +10386,7 @@ def build_page(local: bool = True):
                                                                      and bool(w["race_patience_drop"].value))
 
                         for key in ("race_follow", "race_drop_lowest", "race_patience_drop", "race_paired",
-                                    "race_drop_drift"):
+                                    "race_drop_drift", "race_pick"):
                             w[key].on_value_change(race_rules_visible)
                         race_rules_visible()
 
@@ -10372,8 +10409,9 @@ def build_page(local: bool = True):
                             if w["race_follow"].value:
                                 race_summary.text = (
                                     f"Relay of {len(rows)} configurations: {est['rounds']} rounds, after each one "
-                                    f"everyone continues from its winner; {est['total']} training steps in all "
-                                    f"({est['ratio']:.0f}x the run)."
+                                    f"everyone continues from "
+                                    f"{'the racer you pick' if w['race_pick'].value else 'its winner'}; "
+                                    f"{est['total']} training steps in all ({est['ratio']:.0f}x the run)."
                                     + (f" Steps must be a multiple of {every}." if steps % every else ""))
                                 return
                             patience = (f" A configuration leaves after {int(w['race_patience'].value or 0)} probes "
@@ -10423,7 +10461,8 @@ def build_page(local: bool = True):
                                 .tooltip("One racer per seed, the run's settings otherwise, and the relay on: after "
                                          "each probe round every seed continues from the one that probed best")
                         for key in ("steps", "probe_every", "race_warmup_probes", "race_drop_lowest",
-                                    "race_patience_drop", "race_patience", "race_follow", "race_patience_rising"):
+                                    "race_patience_drop", "race_patience", "race_follow", "race_patience_rising",
+                                    "race_pick"):
                             w[key].on_value_change(lambda _: race_summary_update())
                         with advanced("What a configuration may change"):
                             from rulztrainer.race import RACE_KEYS
@@ -10686,8 +10725,15 @@ def build_page(local: bool = True):
                         {"name": "drift", "label": "Off-prompt now", "field": "drift"},
                         {"name": "rounds", "label": "Score after each round", "field": "rounds", "align": "left"},
                         {"name": "settings", "label": "Settings", "field": "settings", "align": "left"},
+                        {"name": "pick", "label": "", "field": "can_pick"},
                         {"name": "drop", "label": "", "field": "can_drop"}],
                         rows=[], row_key="name").classes("w-full")
+                    race_table.add_slot("body-cell-pick", """
+                        <q-td :props="props">
+                            <q-btn v-if="props.row.can_pick" unelevated dense no-caps size="sm" color="primary"
+                                   icon="call_split" label="Continue from"
+                                   @click="() => $parent.$emit('pick', props.row.name)" />
+                        </q-td>""")
                     race_table.add_slot("body-cell-drop", """
                         <q-td :props="props">
                             <q-btn v-if="props.row.can_drop" flat dense no-caps size="sm" color="negative"
@@ -10719,6 +10765,16 @@ def build_page(local: bool = True):
 
                     drop_go.on_click(do_drop)
                     race_table.on("drop", ask_drop)
+
+                    def do_pick(e):
+                        name = str(e.args)
+                        if _job_dir is None or not _running():
+                            ui.notify("No job is running.", type="warning")
+                            return
+                        request_race_pick(_job_dir, name)
+                        ui.notify(f"Everyone continues from {name}.", type="positive")
+
+                    race_table.on("pick", do_pick)
                 race_exp.visible = False
                 with section("Likeness probes & controller", "How much the probe images look like the person "
                              "(0 = a stranger, 100 = your references)", "insights") as probe_exp:
@@ -11303,7 +11359,9 @@ def build_page(local: bool = True):
                                  else "training" if (n in (rc.get("lanes") or []) or (rc.get("active") == n
                                                                                        and not rc.get("parallel")))
                                  else "waiting its turn")
-                        if rc.get("follow") and rc.get("leader") == n and not rc.get("winner"):
+                        if rc.get("awaiting") and n in (rc.get("alive") or []):
+                            state = "waiting for your pick" + (" (highest score)" if rc.get("awaiting") == n else "")
+                        elif rc.get("follow") and rc.get("leader") == n and not rc.get("winner"):
                             state += " (led the last round)"
                         spared = ((rc.get("history") or [{}])[-1].get("spared") or {}).get(n)
                         if spared and n not in dropped:
@@ -11319,11 +11377,21 @@ def build_page(local: bool = True):
                                      "rounds": " / ".join(f1(s) + ("" if st is None else f" @{st}")
                                                           for s, st in per_round) or "-",
                                      "settings": (rc.get("settings") or {}).get(n) or "the page's own settings",
-                                     "can_drop": n not in dropped and not rc.get("winner") and running_now})
+                                     "can_pick": bool(rc.get("awaiting")) and n in (rc.get("alive") or [])
+                                     and running_now,
+                                     "can_drop": n not in dropped and not rc.get("winner") and running_now
+                                     and not rc.get("awaiting")})
                     race_table.rows = rows
                     race_table.update()
                     est = rc.get("estimate") or {}
-                    race_label.text = (f"{rc.get('winner')} won the relay's last round; its LoRA is the run's"
+                    last_round = (rc.get("history") or [{}])[-1]
+                    race_label.text = (f"Relay round {last_round.get('round')} is over: look at its probe images, then "
+                                       f"press Continue from on the racer everyone should go on from"
+                                       + (" (the last round: your pick is the run's LoRA)"
+                                          if last_round.get("final") else "")
+                                       + f". {rc.get('awaiting')} scored highest and leads if you do not pick in time."
+                                       if rc.get("awaiting") else
+                                       f"{rc.get('winner')} won the relay's last round; its LoRA is the run's"
                                        if rc.get("winner") and rc.get("follow") else
                                        f"{rc.get('winner')} won; it trains on to the end" if rc.get("winner") else
                                        f"Relay round {rc.get('round')}: everyone continues from "
@@ -12104,6 +12172,12 @@ seed, image order and noise. *Add seed racers* (seeds such as `1-4`) adds one `s
 best of several seeds at every probe instead of separate runs. Every racer trains all the steps (N racers, N runs'
 steps); the last round's winner is the run's LoRA, the others are `_final` files, and `<job>_best` is the best any of
 them reached. Rows may not change the LoRA's shape (rank, alpha, layers, adapter); not with one configuration per GPU.
+
+*Pick the leader yourself after each round* (relay only) lets you choose that winner. At the end of each round the run
+waits; look at the round's probe images (Monitor > Images, each racer's carry its name), then press *Continue from* on
+the racer everyone should go on from in the Monitor's race table. In the last round your pick is the run's LoRA. With
+no pick within *Wait for the pick* minutes (0 = no limit) the highest likeness score leads as usual, and so does a Stop
+while it waits. The GPUs sit idle while it waits, which a rented GPU bills for.
 
 ## LoRA Isolation
 *LoRA Isolation* (Train tab) keeps your subject(s) off everyone else in a picture, after Fizgig's: every caption that
