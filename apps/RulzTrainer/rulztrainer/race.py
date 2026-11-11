@@ -73,7 +73,7 @@ RACE_KEYS: dict[str, tuple[str, ...]] = {
         "attn_localize", "attn_localize_weight", "id_align", "id_align_weight", "body_align", "body_align_weight",
         "likeness_curriculum", "likeness_curriculum_strength", "likeness_lr_control", "likeness_lr_min",
         "likeness_lr_max", "likeness_lr_step", "loss_watch", "per_image_lr", "loss_watch_buckets",
-        "loss_watch_beta", "loss_watch_high", "loss_watch_low", "loss_watch_improve_tol",
+        "loss_watch_beta", "loss_watch_high", "loss_watch_fence", "loss_watch_low", "loss_watch_improve_tol",
         "loss_watch_healthy_mult", "loss_watch_exclude_after"),
     "LoRA rank & layers": (
         "lora_rank", "lora_alpha", "lora_targets", "lora_blocks", "train_text_embedder", "lora_dropout",

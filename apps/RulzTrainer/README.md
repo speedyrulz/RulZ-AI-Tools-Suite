@@ -46,6 +46,17 @@ Then double-click `run_webui.bat` to start the UI and open it in your browser (o
 **Linux:** `./install.sh` does the same (`venv/`, cu128 PyTorch wheels by default, pass another index URL as the
 first argument, or `system` to keep an already installed torch), then `./run_webui.sh [port] [host]`.
 
+**Windows with an NVIDIA card: training suddenly several times slower.** The driver can let a run that no longer fits
+the card spill into system RAM ("shared GPU memory" in Task Manager's GPU page) instead of failing. Nothing crashes;
+steps just take several times as long. It often starts after a driver or Windows update, which turn the setting back
+on. To turn it off: NVIDIA Control Panel, *Manage 3D settings*, **Global Settings**, *CUDA - Sysmem Fallback Policy* =
+**Prefer No Sysmem Fallback**, Apply, then restart the WebUI. Use Global Settings, not Program Settings:
+`venv\Scripts\python.exe` only starts the Python that `venv\` was made from, so a per-program setting on it never
+reaches the process that uses the GPU. With the fallback off, a run too large for the card stops with an
+out-of-memory error instead of crawling: lower the memory it needs (`block_swap`, a smaller resolution or rank) and
+start it again. (From Fizgig's notes of 11 November 2026, where people went from 10-15 s a step back to about 2.5; not
+measured here.)
+
 **Old NVIDIA drivers.** A CUDA build of PyTorch newer than the driver supports installs without error and then sees
 no GPU. Without an index URL, both installers read the CUDA version the driver supports from `nvidia-smi`
 (`scripts/torch_index.py`) and install the newest of cu130, cu128 and cu126 it runs, never newer than their default,
@@ -424,7 +435,8 @@ what the rules have not downloaded by then is gone.
     | `40` | 40% all run |
     | `75:5:40` | 75% for 5 epochs, then 40% |
     | `60:7:30:15` | 60% until epoch 7, sliding in a straight line to 30% by epoch 15 |
-    | `60:7:30:8:3` | 60% until epoch 7, 30% at epoch 8, then 60% with every 3rd epoch at 30% at half the learning rate (Fizgig's MOSS default, the WebUI's *Slide* button) |
+    | `60:7:30:8:3` | 60% until epoch 7, 30% at epoch 8, then 60% with every 3rd epoch at 30% at half the learning rate (Fizgig's MOSS default until 8 November 2026, the WebUI's *Slide* button) |
+    | `11:7:40:8:3` | 11% until epoch 7, 40% at epoch 8, then 40% with every 3rd epoch at 11% at half the learning rate (Fizgig's MOSS default since 10 November 2026, for Muon: *Slide Muon*) |
     | `11:4:30:8:2` | a full fine-tune's: the model's own ~11% until rotation 4, sliding to 30% by rotation 8, then 30% with every 2nd rotation at 11% at half the learning rate (*Slide FT*) |
 
   - **The fifth number.** After the slide, every epoch trains at the higher of the two shares and every Nth one at
@@ -436,7 +448,14 @@ what the rules have not downloaded by then is gone.
     best of eight schedules. It led from epoch 12 and still held 71% likeness at epoch 60. A sudden drop from 75% to
     40% dipped likeness two epochs later. `60:7:30:8:3` then held likeness about 5 points over `60:7:30:15:2` from
     epoch 9 to 20 on a 53-photo dataset.
-  - **Unmeasured here.** RulzTrainer's default already starts at 50%, so race `clean_share: "60:7:30:8:3"` against
+  - **Fizgig's default has since moved, for Muon.** Its MOSS presets now train on Muon, which it says trains
+    differently enough from AdamW that the old order was no longer the best. On 8 November 2026 the default became the
+    reverse, `30:7:60:8:3` (composition first, then likeness), and on 10 November `11:7:40:8:3`, which starts at about
+    the model's own share. Fizgig reports that starting at 11 stopped the hair darkening late in a run and gave higher
+    late likeness. It tuned that schedule together with its Element boost (the face and hair counting 9x early in the
+    run), which RulzTrainer does not have, and still offers `60:7:30:8:3` as slower to train but known to work well.
+  - **Unmeasured here**, but for one Krea 2 run of `60:7:30:8:3` that tied the plain run. RulzTrainer's default
+    already starts at 50%, so race `clean_share: "60:7:30:8:3"` (or `"11:7:40:8:3"` with `optimizer: muon`) against
     `""` on your own data. It works with every model and timestep mode.
 - **Flow matching loss.** `x_t = (1 - sigma) x0 + sigma * noise`, target `noise - x0`, timestep = `sigma * 1000`,
   sigmas snapped to the model's 1000-step training grid. Default sampling is logit-normal; `timestep_shift`
@@ -970,10 +989,16 @@ An image that runs out of GPU memory is segmented on the CPU, and the next one t
 
 `loss_watch: true` records every image's loss normalised by the expected loss at its noise level (40 sigma
 buckets, kernel-smoothed) and smooths the residual per image. At each epoch boundary every image gets a
-verdict relative to the cohort median: *easy*, *healthy*, *suspect* (hard but improving), *stuck* (hard and not
-improving for two epochs) or *exhausted* (learned, flat). `per_image_lr: true` acts on the verdicts the way
-Fizgig's loss watch does: stuck images are throttled x0.5, then x0.25, then x0.125 (recovering one rung per
-improving epoch), exhausted ones ease to x0.6, the healthy cohort gets `loss_watch_healthy_mult`. With batch
+verdict relative to the cohort median: *easy*, *healthy*, *suspect* (hard, but still improving or not an outlier),
+*stuck* (an outlier that has stopped improving) or *exhausted* (learned, flat). `per_image_lr: true` acts on the
+verdicts the way Fizgig's loss watch does: stuck images are throttled x0.5, then x0.25 (recovering one rung per
+epoch they are no longer stuck), exhausted ones ease to x0.6, the healthy cohort gets `loss_watch_healthy_mult`.
+An outlier is above `loss_watch_high` x the median and also above the median + `loss_watch_fence` (1.5) x the
+interquartile range of the dataset's residuals (with 4 images or more). Late in a run almost no image still improves
+by 3% an epoch, so without the fence every hard image ends up throttled: Fizgig replayed 39 real runs and found
+about a third of each dataset throttled, most of them images that kept getting easier at the full rate; it added
+the fence and stopped its throttle at x0.25 on 9 November 2026, and RulzTrainer follows since 3.7.1 (before: no
+fence, and a third rung at x0.125). `loss_watch_fence: 0` is the old rule. With batch
 size 1 and no gradient accumulation this is a true per-image learning rate (the optimizer lr is scaled for that
 step); otherwise it becomes a per-sample loss weight. `loss_watch_exclude_after: N` benches an image that stays
 at the lowest throttle for N more epochs; exclusions are remembered in `<dataset>/.rulz_cache/excluded.json`
@@ -1210,10 +1235,31 @@ The **Training maps** tab shows them over the picture as training saw it (the bu
 | Not learned yet | Where the prediction still misses (red most, then yellow, then blue). Fine detail always looks warmer. |
 | Where the LoRA acts | How much the LoRA changes the prediction (the same prediction with the LoRA switched off). |
 | Where the LoRA acts without the trigger word | With `training_maps_trigger_off`: the same, with the trigger word taken out of the caption. |
-| Trigger word | The trigger word's share of each area's attention over the caption, averaged over heads and every block. With several trigger words in a caption, each word on its own too. |
+| Trigger word | The trigger word's share of each area's attention over the caption, averaged over heads and every block, coloured from the quietest area up. With several trigger words in a caption, each word on its own too. |
 
 Pick the picture, the map, the noise level (All levels is the mean of the three) and the capture; Play steps
-through the captures. Each map keeps one colour scale across all captures so they compare. How to read them:
+through the captures. Each map keeps one colour scale across all captures so they compare.
+
+**Learned, measured as** (shown with *Learned since the start*; after Fizgig's viewer of 10 November 2026):
+
+| Choice | Shows |
+| --- | --- |
+| Amount (the default) | The error gone since the first capture. The part that learned most sets the scale, so a part with little to learn stays pale even when it is nearly done. |
+| Share of its own start | The error gone as a share of that part's own starting error: how far along each part is, whatever it started at. Taken per noise level against that level's own start, then averaged. A nearly clean part's start is floored at the picture's 10th percentile, so its share is not noise over almost nothing. |
+| Share, same scale for every run | The same share on one fixed scale: full colour is half of the starting error gone (or come back). Two runs' maps, or two epochs, compare by eye. |
+
+On the first real run with maps (Krea 2, 2,000 steps) the amount left a plain sweater and the background nearly blank,
+while the share showed them learned about as far as the face. The fixed scale's top is 50%, not Fizgig's 20%: on that
+run the median part was 20% along at the last step (half the picture would have been at full colour), and 2% of it
+was past 50%.
+
+**The trigger-word map counts from its quietest area up** (the 2nd percentile of its lowest capture, as Fizgig's since
+9 November 2026). A new word's attention is spread almost evenly on some models and with long captions: on the same
+Krea 2 run every part of a picture gave the trigger between 0.06 and 0.22 of its attention, so counted from zero the
+whole picture was one colour. The map now shows where the word gets more attention than elsewhere; it no longer shows
+how much it gets in all (`maps.jsonl` keeps the stored shares).
+
+How to read them:
 
 - a face that stays warm on *Not learned yet* while the rest cools: likeness is slow; check the face is large enough
   in the photos;
@@ -3281,7 +3327,7 @@ wizard.
 
 RulzTrainer trains **text-to-image LoRAs** for
 [MiniMaxAI/MiniMax-H3-Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image), MiniMax's own image model (released
-10 November 2026): the H3 transformer (33B, 50 blocks) without its audio stream, distilled to render in 6 steps with
+3 November 2026): the H3 transformer (33B, 50 blocks) without its audio stream, distilled to render in 6 steps with
 no guidance, at 4 to 20 megapixels. It keeps H3's Qwen3-VL-32B text encoder unchanged and has its own image VAE (16x,
 24 channels; a token is a 2x2 patch, 32 x 32 px). Pick the **MiniMax-H3-Image** preset. Experimental; edit training
 (its image editing with up to 16 reference pictures) is not supported here, only text-to-image.
@@ -3379,8 +3425,40 @@ training adapter on (`auto`), 1 MP buckets on the 32 px grid, and samples and pr
 alpha 16, the adapter and the 6 training sigmas are ai-toolkit's defaults for the model; the rest are starting values
 taken from the siblings. None of it is measured here.
 
+**What Fizgig reports for this model** (its v9.6.0 to v9.6.2 of 11 November 2026 and its
+[guide](https://github.com/shootthesound/Fizgig/blob/master/docs/MINIMAX_IMAGE.md); none of it is measured or built
+here, so these are things to try, not defaults):
+
+- **More steps on the last noise level.** Its presets put 40% of the steps on the nearly clean level (sigma 0.232),
+  where skin, eyes and fine detail are made, and share the rest evenly over the five levels above. It says a higher
+  share gives more detail and likeness, a lower one more layout. RulzTrainer draws the six levels evenly (about 17%
+  each, ai-toolkit's rule) and `clean_share` does not apply to this model.
+- **Its own training adapter**,
+  [ShootTheSound/Fizgig-MiniMax-H3-Image-Training-Adapter](https://huggingface.co/ShootTheSound/Fizgig-MiniMax-H3-Image-Training-Adapter)
+  (0.15 GB, trained on 7,600 photos and 1,000 of the model's own renders, published for any trainer). Fizgig reports
+  caricatures without an adapter and photographic skin with its own. RulzTrainer uses ostris' adapter; the two have
+  not been compared, and Fizgig's file has not been tried with `training_adapter`.
+- **Optimizer and size.** Its presets train on Automagic v3 at 0.5 MP, started at 2.8e-4, which gave its best
+  previews (the rate eased down about 20% over the first 400 steps); 2.8e-4 also held at 1 MP in one test run.
+- **Memory**, rank 8 on an RTX 5090 with a 2048 x 2048 preview setting the peak: int8 22.7 GB (21.0 to 21.7 GB while
+  training at 0.25 to 1 MP), 4-bit NF4 12.8 GB. A compiled int8 run without gradient checkpointing was about 1.5x
+  faster on a card of 40 GB or more (23.4 GB at 0.25 MP, 30.6 GB at 1 MP).
+- **Samples against ComfyUI.** The int8 file asks for INT8 attention in every block, which ComfyUI uses. Fizgig
+  measured its own renders 22 dB (PSNR) from ComfyUI's without it and 27 dB with it, at 2048 px on the same LoRA,
+  prompt and seed. RulzTrainer's samples and probes do not use INT8 attention, so expect a gap of the first kind
+  between a sample here and the same seed in ComfyUI.
+- **Sliders from prompts did not work** on this model for Fizgig (a smile slider moved clothes and light instead):
+  a change of prompt rearranges the whole picture.
+
 **Export**: H3's layout (`diffusion_model.blocks.<n>.attn.qkv_proj.lora_A/B`, alpha = rank), which ComfyUI's Load
 LoRA reads on the MiniMax-H3-Image files. The output heads are never a LoRA target.
+
+**In ComfyUI the LoRA can look weaker than in the trainer's samples.** ComfyUI's default loading (dynamic VRAM) adds a
+LoRA to each weight in the weight's own dtype, and in bf16 the smallest changes round away
+([Comfy-Org/ComfyUI#17690](https://github.com/Comfy-Org/ComfyUI/issues/17690), open on 11 November 2026). Fizgig
+measured about 15% of its test LoRA lost on this model: the same seed came out cleaner and a little less like the
+subject. Start ComfyUI with `--disable-dynamic-vram` to apply the LoRA in full, or raise its strength. Not reproduced
+here.
 
 Tests: `tests/test_h3image.py` (weight-free) checks the port against the reference forward on the packed image
 layout, the heads in their three layouts and which heads a training or sampling forward uses, the released files'
