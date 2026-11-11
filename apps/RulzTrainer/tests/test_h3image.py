@@ -518,6 +518,37 @@ def _shards(tdir, state, stem):
     save_file({k: v.contiguous() for k, v in state.items()}, str(tdir / f"{stem}.safetensors"))
 
 
+def test_a_bf16_folder_pruned_on_load_runs_in_bf16(tmp_path):
+    """MiniMaxAI's folder keeps the AdaLN in bf16 and the shard reader reads it so: pruning on load makes each AdaLN
+    weight fp32, and its bias must follow (a bf16 bias beside it failed the first sample with "BFloat16 and Float")."""
+    _, _, dstate = diffusers_state(8)
+    model = MiniMaxH3Transformer(**TINY).float().eval()
+    model.load_state_dict(C.fold_diffusers_pdd_heads(C.diffusers_to_port({k: v.clone() for k, v in dstate.items()})))
+    orig = tmp_path / "MiniMaxAI__MiniMax-H3-Image"
+    port = {k: v.clone() for k, v in model.state_dict().items()}
+    fw, fb = C.unstack_pdd_heads(port.pop("final_layer.video_out.weight"), port.pop("final_layer.video_out.bias"), HEADS)
+    for k in [k for k in port if k.endswith("qkv_proj.weight")]:
+        port[k] = C.interleave_qkv(port[k], 2, 32)
+    port["final_layer.video_out.weight"], port["final_layer.video_out.bias"] = torch.randn(96, 48), torch.randn(96)
+    _shards(orig / "transformer", {k: v.bfloat16() for k, v in port.items()} | {"rope.inv_freq": inv_freq(4)}, "model")
+    (orig / "transformer" / "config.json").write_text(json.dumps({
+        "_class_name": "MiniMaxH3DiTModel", "audio_enabled": False, "audio_latents_dim": 32,
+        **{k: v for k, v in TINY.items() if k not in ("audio_latents_dim", "pdd_steps", "pdd_sigmas", "rope_theta")}}))
+    from safetensors.torch import save_file
+
+    save_file({"video_out.weight": fw.contiguous(), "video_out.bias": fb.contiguous()}, str(orig / IL.PDD_FILE))
+    (orig / IL.PDD_CONFIG).write_text(json.dumps({"num_inference_steps": HEADS, "sigmas": GRID}))
+    m = IL.load_transformer(orig, "cpu", quant="none", dtype=torch.bfloat16)
+    assert m.adaln_rank is not None  # pruned on load
+    for proj in [b.adaln_proj.linear for b in m.blocks] + [m.final_layer.adaln_proj.linear]:
+        assert proj.weight.dtype == proj.bias.dtype == torch.float32
+    x, enc = torch.randn(1, 24, 4, 6), torch.randn(1, 5, 40)
+    with torch.no_grad():
+        got = m(x.bfloat16(), 450.0, enc.bfloat16(), None, sigma_next=0.0).float()
+        want = model(x, 450.0, enc, None, sigma_next=0.0)
+    assert torch.isfinite(got).all() and (got - want).abs().max() / want.abs().max() < 0.15
+
+
 def test_both_folder_layouts_load_the_same_model(tmp_path, monkeypatch):
     from safetensors.torch import save_file
 
