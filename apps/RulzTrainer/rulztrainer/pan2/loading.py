@@ -126,6 +126,10 @@ def get_transformer(cfg: TrainConfig, model_dir: Path | None, device: str | None
 
         device, gpus = "cpu", parse_devices(cfg.devices, cfg.device)  # split right after loading: staged on the CPU
     device = device or cfg.device
+    if gpus is None and torch.device(device).type == "cpu" and torch.device(cfg.device).type == "cuda":
+        # staged in RAM (block swap): quantize on the training GPU, shard by shard, and bring the result back. On the
+        # CPU the 29B weights were not done after 4.7 minutes on 24 cores (NVFP4, measured)
+        gpus = [cfg.device]
     if use_file:
         return sf.load_transformer_file(cfg.transformer_file, device, cfg.transformer_quant, quant_devices=gpus,
                                         quant_norms=quant_norms(cfg))
@@ -266,10 +270,35 @@ def get_text_encoder(cfg: TrainConfig, model_dir: Path | None):
     return load_text_encoder(_need_dir(model_dir, "text encoder"), cfg.text_encoder_device, cfg.text_encoder_quant), tokenizer
 
 
+def structured(prompt: str, seconds: float = 0.0) -> str:
+    """A plain caption inside PAN 2's structured ("world state") caption format; a caption that is already JSON, and
+    the empty prompt, as they are.
+
+    PAN 2 was trained on structured captions alone. Measured on the released weights (one RTX 5090, NVFP4, 50 steps
+    at CFG 2.5): a plain sentence gives an unreadable picture with the structured negative, with an empty negative
+    and without guidance; the same sentence under `init_frame_visual_description` alone is no better, with a style,
+    one subject and the quality block it is recognisable but torn, and in this skeleton (those plus one event that
+    repeats the description under a static camera) it is a clean picture."""
+    text = (prompt or "").strip()
+    if not text or text.startswith("{"):
+        return text
+    span = f"0 to {seconds:g}"
+    return json.dumps({
+        "video_style": "Photorealistic, sharp detail", "lighting": "", "perspective_view": "",
+        "subjects_lifecycle": [{"subject_id": "<|Subject1|>", "display_name": "subject", "subject_attribute": ""}],
+        "init_frame_visual_description": text,
+        "events": [{"event_index": 0, "time_range_sec": span, "event_description": text,
+                    "camera_motion": [{"time_range_sec": span, "camera_motion": ["static"]}],
+                    "contained_actions": []}],
+        "quality": {"video_quality": "High clarity", "text_logos_overlays": None, "artifacts": None},
+    }, ensure_ascii=False, separators=(",", ":"))
+
+
 def format_prompt(prompt: str) -> str:
-    """The templated prompt Qwen reads. The chat template trims the user turn, so an empty prompt (caption dropout,
-    the reference's single space) is an empty turn."""
-    return TEMPLATE.format((prompt or "").strip())
+    """The templated prompt Qwen reads: the caption in the structured format (`structured`), in the reference's chat
+    template. The chat template trims the user turn, so an empty prompt (caption dropout, the reference's single
+    space) is an empty turn."""
+    return TEMPLATE.format(structured(prompt))
 
 
 def _find(ids: list[int], sub: list[int]) -> int:

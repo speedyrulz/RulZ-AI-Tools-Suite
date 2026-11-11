@@ -353,22 +353,57 @@ class FakeTokenizer:
         return out
 
 
+def test_a_model_staged_in_ram_is_quantized_on_the_training_gpu(monkeypatch, tmp_path):
+    """Block swap loads the transformer to the CPU. Its 29B weights were not quantized there after 4.7 minutes (measured),
+    so the loader is handed the training GPU to quantize on; a model loaded straight to a device needs none."""
+    seen = []
+    monkeypatch.setattr(PL.sf, "load_transformer_dir", lambda tdir, device, quant, quant_devices=None, quant_norms=True:
+                        seen.append((str(device), quant, quant_devices)))
+    cfg = TrainConfig(model_arch="pan2", model_source="hf", transformer_quant="nvfp4", device="cuda:1")
+    PL.get_transformer(cfg, tmp_path, device="cpu")
+    PL.get_transformer(cfg, tmp_path)
+    PL.get_transformer(TrainConfig(model_arch="pan2", model_source="hf", device="cpu"), tmp_path, device="cpu")
+    assert seen == [("cpu", "nvfp4", ["cuda:1"]), ("cuda:1", "nvfp4", None), ("cpu", "auto", None)]
+
+
+def test_plain_captions_are_wrapped_in_the_structured_format():
+    """PAN 2 reads structured captions alone (a plain sentence gives an unreadable picture on the released
+    weights), so a plain caption goes into the skeleton that was measured to work; JSON passes verbatim."""
+    wrapped = json.loads(PL.structured('  ohwx woman, "quoted" portrait\nsecond line '))
+    caption = 'ohwx woman, "quoted" portrait\nsecond line'
+    assert wrapped["init_frame_visual_description"] == caption
+    assert wrapped["events"][0]["event_description"] == caption
+    assert wrapped["events"][0]["time_range_sec"] == "0 to 0"  # a still, as the default negative's ranges
+    assert wrapped["events"][0]["camera_motion"] == [{"time_range_sec": "0 to 0", "camera_motion": ["static"]}]
+    assert wrapped["subjects_lifecycle"][0]["subject_id"] == "<|Subject1|>"
+    assert set(wrapped) == {"video_style", "lighting", "perspective_view", "subjects_lifecycle",
+                            "init_frame_visual_description", "events", "quality"}
+    assert json.loads(PL.structured("a fox", seconds=5))["events"][0]["time_range_sec"] == "0 to 5"
+    ready = '{"video_style":"film"}'
+    assert PL.structured(ready) == ready and PL.structured("") == "" and PL.structured("  ") == ""
+    assert PL.structured(PL.structured("a fox")) == PL.structured("a fox")
+    assert PL.structured(PL.default_negative()) == PL.default_negative()
+    assert PL.structured("a fox") in PL.format_prompt("a fox")
+
+
 def test_prompt_template_and_crop():
     tok = FakeTokenizer()
-    text = PL.format_prompt("  a red fox \n")
+    fox = '{"video_style":"film","init_frame_visual_description":"a red fox"}'
+    text = PL.format_prompt(f"  {fox} \n")
     assert text == ("<|im_start|>system\nYou are a helpful assistant. Generate the video with the following "
-                    "instructions.<|im_end|>\n<|im_start|>user\na red fox<|im_end|>\n<|im_start|>assistant\n<think>\n")
+                    f"instructions.<|im_end|>\n<|im_start|>user\n{fox}<|im_end|>\n<|im_start|>assistant\n<think>\n")
     assert PL.format_prompt("") == PL.format_prompt(" ")  # the reference's empty prompt
-    ids, start = PL.tokenize(tok, "a red fox")
-    assert ids[start:start + 9].tolist() == [ord(c) for c in "a red fox"]
+    assert "<|im_start|>user\n<|im_end|>" in PL.format_prompt("")  # ... stays empty: it is not wrapped
+    ids, start = PL.tokenize(tok, fox)
+    assert ids[start:start + len(fox)].tolist() == [ord(c) for c in fox]
     assert ids[start - 6:start].tolist() == [200_000, *(ord(c) for c in "user\n")]  # right after the user header
     assert ids.numel() == len(tok(text)["input_ids"])  # the end of the turn and the opened assistant turn stay
     long_ids, long_start = PL.tokenize(tok, "x" * 5000)
     assert long_start == start and long_ids.numel() == start + MAX_TEXT_TOKENS
     assert PL.tokenize(tok, "x" * 5000, max_length=100)[0].numel() == start + 100
-    shown, offsets, dropped, kept = PL.prompt_tokens(tok, "a red fox")
+    shown, offsets, dropped, kept = PL.prompt_tokens(tok, fox)
     assert shown == text and dropped == start and kept == ids.numel() - start
-    assert shown[offsets[dropped][0]:offsets[dropped + 8][1]] == "a red fox"
+    assert shown[offsets[dropped][0]:offsets[dropped + len(fox) - 1][1]] == fox
 
     class Encoder(nn.Module):  # returns each token's id as its feature: the crop is visible in the output
         def __init__(self):
@@ -378,9 +413,9 @@ def test_prompt_template_and_crop():
         def forward(self, input_ids, attention_mask, **_):
             return type("Out", (), {"last_hidden_state": input_ids.float().unsqueeze(-1) * attention_mask.unsqueeze(-1)})
 
-    rows = PL.encode_prompts(Encoder(), tok, ["a red fox", "hi"])
-    assert rows[0].dtype == torch.bfloat16 and rows[0][:9, 0].tolist() == [float(ord(c)) for c in "a red fox"]
-    assert rows[1].shape[0] == rows[0].shape[0] - 7 and rows[1][:2, 0].tolist() == [float(ord("h")), float(ord("i"))]
+    rows = PL.encode_prompts(Encoder(), tok, ["{a red fox}", "{hi}"])
+    assert rows[0].dtype == torch.bfloat16 and rows[0][:11, 0].tolist() == [float(ord(c)) for c in "{a red fox}"]
+    assert rows[1].shape[0] == rows[0].shape[0] - 7 and rows[1][:4, 0].tolist() == [float(ord(c)) for c in "{hi}"]
     with pytest.raises(ValueError, match="not PAN 2's Qwen3.5 tokenizer"):
         PL.check_tokenizer(range(151_000))
 
