@@ -120,6 +120,81 @@ def test_port_matches_the_reference_as_a_one_frame_text_to_video_request():
         assert torch.allclose(got, want, atol=2e-5), float((got - want).abs().max())
 
 
+def test_a_clip_matches_the_reference_as_text_to_video():
+    """Sample and probe clips: several latent frames in, the same shape out, as the reference computes them."""
+    from rulztrainer.pan2 import sampler as PS
+
+    model = tiny()
+    state = model.state_dict()
+    for frames, h, w, s in ((3, 4, 6, 9), (2, 6, 4, 5)):
+        x, text, t = torch.randn(2, 48, frames, h, w), torch.randn(2, s, 24), torch.tensor([731.0, 55.0])
+        full = torch.cat([x, torch.zeros(2, 49, frames, h, w)], dim=1)
+        with torch.no_grad():
+            want = reference(state, model.config, full, t, text)
+            got = model(x, t, text, torch.ones(2, s, dtype=torch.bool))
+        assert got.shape == x.shape and got.dtype == torch.float32
+        assert torch.allclose(got, want, atol=2e-5), float((got - want).abs().max())
+    with torch.no_grad():  # one latent frame as a clip is the still
+        x = torch.randn(1, 48, 4, 6)
+        still = model(x, 500.0, text[:1], None)
+        assert torch.allclose(model(x.unsqueeze(2), 500.0, text[:1], None)[:, :, 0], still, atol=1e-5)
+    assert [PS.latent_frames(f) for f in (1, 5, 49, 121, 50)] == [1, 2, 13, 31, 13]
+    assert [PS.snap_frames(f) for f in (1, 2, 48, 49, 50)] == [1, 1, 45, 49, 49]
+    lat = PS.sample(model, text[:1], torch.ones(1, text.shape[1], dtype=torch.bool), None, None, width=96, height=64, steps=2, cfg=1.0, device="cpu", frames=9)
+    assert lat.shape == (1, 48, 3, 4, 6)
+
+
+def test_clip_settings_prompts_and_files(tmp_path):
+    """sample_frames / probe_frames: a video model's samples and probes as clips, each beside its middle frame."""
+    from PIL import Image
+
+    from rulztrainer import clips
+
+    cfg = TrainConfig(model_arch="pan2", sample_frames=49, probe_frames=17)
+    cfg.validate()
+    with pytest.raises(ValueError, match="need a video model"):
+        TrainConfig(model_arch="krea2", sample_frames=49).validate()
+    with pytest.raises(ValueError, match="1 .a still. or more"):
+        TrainConfig(model_arch="pan2", probe_frames=0).validate()
+    assert ARCH.supports_video and ARCH.snap_frames(50) == 49 and not archs.arch_by_name("krea2").supports_video
+    # a clip's prompt and negative carry its length (48 frames after the first at 24 fps: 2 seconds)
+    wrapped = json.loads(ARCH.render_prompt("a red fox runs", 49))
+    assert wrapped["events"][0]["time_range_sec"] == "0 to 2" and wrapped["init_frame_visual_description"] == "a red fox runs"
+    ready = '{"video_style":"film"}'
+    assert ARCH.render_prompt(ready, 49) == ready and ARCH.render_prompt("a red fox runs", 1) == "a red fox runs"
+    assert json.loads(ARCH.render_negative(49))["events"][0]["time_range_sec"] == "0 to 2"
+    assert ARCH.render_negative(1) == ARCH.default_negative
+
+    frames = torch.linspace(-1, 1, 5).view(5, 1, 1, 1).expand(5, 3, 16, 24)
+    arr = clips.to_uint8(frames)
+    assert arr.shape == (5, 16, 24, 3) and arr[0].max() == 0 and arr[-1].min() == 255
+    assert clips.still_index(5) == 2 and clips.still_index(1) == 0
+    still = tmp_path / "step000200_0.png"
+    out = clips.save_clip(clips.clip_path(still), arr, 24)
+    assert out == tmp_path / "step000200_0.webp"
+    with Image.open(out) as im:
+        assert im.n_frames == 5 and im.size == (24, 16)
+
+
+def test_a_clip_decodes_through_the_vae_frame_by_frame():
+    class Vae:  # 2 latent frames -> 5 frames, as the Wan 2.2 VAE: every channel's mean of the latents, de-normalized
+        device = torch.device("cpu")
+
+        class config:
+            latents_mean = [1.0] * 48
+            latents_std = [2.0] * 48
+
+        def parameters(self):
+            return iter([torch.zeros(1)])
+
+        def decode(self, z, return_dict=False):
+            frames = (z.shape[2] - 1) * 4 + 1
+            return (z.mean(dim=(1, 2), keepdim=True).expand(1, 3, frames, z.shape[3], z.shape[4]) / 10,)
+
+    out = PL.decode_video(Vae(), torch.zeros(1, 48, 2, 4, 6))
+    assert out.shape == (5, 3, 4, 6) and torch.allclose(out, torch.full_like(out, 0.1))
+
+
 def test_a_padded_batch_gives_each_sample_what_it_gets_alone():
     model = tiny(1)
     x, text, t = torch.randn(2, 48, 4, 6), torch.randn(2, 9, 24), torch.tensor([400.0, 900.0])

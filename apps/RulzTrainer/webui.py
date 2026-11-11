@@ -1545,6 +1545,7 @@ class Form:
             compile_model=v("compile_model"), compile_cache=s("compile_cache") or "auto",
             sample_seed=int(v("sample_seed")),
             sample_walk_seed=bool(v("sample_walk_seed")), sample_before_training=bool(v("sample_before_training")),
+            sample_frames=int(v("sample_frames") or 1), probe_frames=int(v("probe_frames") or 1),
             steps=0 if v("soup_run") or v("noise_run") else int(v("steps")), batch_size=int(v("batch_size")),
             gradient_accumulation=int(v("gradient_accumulation")), learning_rate=float(v("learning_rate")),
             optimizer=v("optimizer"), lr_scheduler=v("lr_scheduler"), warmup_steps=int(v("warmup_steps")),
@@ -2910,6 +2911,12 @@ def history_job_dir(rec: dict, runs: list[dict]) -> Path | None:
     return None if later else d
 
 
+def clip_or_still(path) -> Path:
+    """A sample or probe picture's clip (the same name, .webp: a video model's render) when there is one."""
+    clip = Path(path).with_suffix(".webp")
+    return clip if Path(path).suffix.lower() == ".png" and clip.is_file() else Path(path)
+
+
 def image_url(path) -> str:
     """The page's URL for an image file on this machine, served by one fixed route (/rz-image) and versioned by the
     file's modification time. NiceGUI's own route for a local file is shared by every element and page showing that
@@ -3955,8 +3962,9 @@ def build_samples_tab(f: Form):
         with grid:
             for p in files[:120]:
                 with ui.card().tight().classes("w-full rz-thumb"):
-                    ui.image(image_url(p)).props("fit=contain").classes("w-full h-64 rz-imgbg cursor-pointer") \
-                        .on("click", lambda _, q=p: show_full(q)).tooltip("Click to view full size")
+                    shown = clip_or_still(p)  # a video model's sample: its clip plays in place of the still
+                    ui.image(image_url(shown)).props("fit=contain").classes("w-full h-64 rz-imgbg cursor-pointer") \
+                        .on("click", lambda _, q=shown: show_full(q)).tooltip("Click to view full size")
                     sc = scores.get(p.name)
                     label = p.name + (score_caption(sc) if sc is not None else "")
                     ui.label(label).classes("text-xs px-2 py-1")
@@ -9280,6 +9288,14 @@ def build_page(local: bool = True):
                                                                   value=d.sample_walk_seed)
                                 w["sample_before_training"] = ui.switch("Samples before training starts",
                                                                         value=d.sample_before_training)
+                                w["sample_frames"] = ui.number("Frames per sample", value=d.sample_frames, min=1,
+                                                               max=481, precision=0).classes("w-40") \
+                                    .tooltip("PAN 2 only. 1 renders a still. More renders a clip at 24 frames per "
+                                             "second (49 is 2 seconds; rounded down to 4k + 1), saved as an animated "
+                                             "WebP beside its middle frame. A clip takes many times a still's time "
+                                             "and memory: use a small size, about 0.35 MP.") \
+                                    .bind_visibility_from(w["model_preset"], "value",
+                                                          lambda p: preset_arch(p, w["model_path"].value) == "pan2")
                             w["sample_negative"] = ui.input("Negative prompt (optional)", value=d.sample_negative) \
                                 .classes("w-full")
                             with fields():
@@ -10092,6 +10108,13 @@ def build_page(local: bool = True):
                                                               "trigger word)").classes("w-full")
                         with advanced("Probe scoring"):
                             with fields():
+                                w["probe_frames"] = ui.number("Frames per probe", value=d.probe_frames, min=1,
+                                                              max=481, precision=0).classes("w-40") \
+                                    .tooltip("PAN 2 only. 1 scores a still. More renders each probe as a clip (24 "
+                                             "frames per second, 4k + 1 frames) and scores its middle frame, so the "
+                                             "score tells how the likeness holds in motion. Much slower.") \
+                                    .bind_visibility_from(w["model_preset"], "value",
+                                                          lambda p: preset_arch(p, w["model_path"].value) == "pan2")
                                 w["probe_seeds"] = ui.number("Seeds per probe", value=d.probe_seeds, min=1, max=8,
                                                              precision=0).classes("w-36") \
                                     .tooltip("Use 8 for a race. Even then, gaps of about 3 body points did not hold up "

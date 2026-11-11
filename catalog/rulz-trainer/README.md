@@ -3498,8 +3498,8 @@ Checked without a GPU before that: the port gives the same numbers, bit for bit,
 ComfyUI build on the same random weights; the prompt tokens equal ComfyUI's for the same text; the released VAE
 gives ComfyUI's latents for the same picture and a 49 dB round trip.
 
-Not run yet: int8 on the real weights (only NVFP4 ran), a two-card model split, likeness probes, longer runs and
-other learning rates. One short run is a working start, not a tuned recipe.
+Not run yet: int8 on the real weights (only NVFP4 ran), a two-card model split, body probes, longer runs and
+other learning rates. Face probes ran in a 200-step check, as clips. One short run is a working start, not a tuned recipe.
 
 **Getting the model.** Two ways:
 
@@ -3584,10 +3584,23 @@ took about 20 s on that card (from a warm disk cache); the folder's 58 GB are ne
   them quantized (`PAN2_int8_convrot_full`, `PAN2_nvfp4`); quantizing on load covers the block norm projections too
   (12 GB of fp32 otherwise).
 
-**Samples and probes.** Single-frame videos at the released settings: 50 steps at CFG 2.5 on shift 9 with the
+**Samples and probes.** Single-frame videos by default, at the released settings: 50 steps at CFG 2.5 on shift 9 with the
 model's structured negative prompt (`sample_negative` replaces it). There is no turbo LoRA and no training adapter
 for PAN 2. PAN 2 saw images in pretraining but was finished on video alone, so a still shows what the LoRA learned
 rather than the model at its best.
+
+**Video samples and probes.** Set `sample_frames` above 1 (*Frames per sample* under the sample settings) and
+each sample is a clip, text-to-video at 24 frames per second: 49 frames are 2 seconds, and the count is rounded down
+to 4k + 1. The clip is saved as an animated WebP beside its middle frame (`step000200_0.webp` next to
+`step000200_0.png`); the Samples tab plays the clip, and everything else (history, the run report, similarity
+scores) reads the still. `probe_frames` does the same for likeness probes and prompt checks: each probe is a clip
+and **its middle frame is scored**, so the score says how the likeness holds in motion rather than in a still. A
+plain prompt is wrapped with the clip's length in its time ranges, and the default negative follows.
+
+Measured on one RTX 5090 with the whole NVFP4 model on the card: a 49-frame 480 x 704 sample at 30 steps takes about
+30 s, a 17-frame 512 x 512 probe about 22 s, and the run peaked at 28.6 GB. Keep clips small: a clip costs its
+frame count / 4 times a still's tokens, and the VAE decodes all frames at once. In a 200-step check the clips
+followed the motion in the prompt and showed the character arriving, as the stills do.
 
 **In ComfyUI.** The LoRA uses the generic key format under the checkpoint's own layer names:
 

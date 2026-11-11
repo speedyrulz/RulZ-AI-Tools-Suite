@@ -310,22 +310,34 @@ class PAN2Transformer(nn.Module):
         return block(*args)
 
     def embed_patches(self, latents: torch.Tensor) -> torch.Tensor:
-        """[B, 48, h, w] -> [B, h/2 * w/2, dim]: the patch embedding on the noisy channels (see the module docstring:
-        the condition latents and their mask are zero for a still, so their weights add nothing)."""
+        """[B, 48, h, w] or a clip [B, 48, T, h, w] -> [B, T * h/2 * w/2, dim]: the patch embedding on the noisy
+        channels (see the module docstring: the condition latents and their mask are zero for text-to-video, so
+        their weights add nothing)."""
         w = self.x_embedder.weight
-        x = F.conv3d(latents.unsqueeze(2).to(w.dtype), w[:, : self.latent_channels], self.x_embedder.bias,
+        if latents.ndim == 4:
+            latents = latents.unsqueeze(2)
+        x = F.conv3d(latents.to(w.dtype), w[:, : self.latent_channels], self.x_embedder.bias,
                      stride=self.x_embedder.stride)
         return x.flatten(2).transpose(1, 2)
 
     def forward(self, hidden_states: torch.Tensor, timestep, encoder_hidden_states: torch.Tensor,
                 encoder_attention_mask: torch.Tensor | None = None, skip_layers=None) -> torch.Tensor:
-        """timestep: the noise level in 0..1000 (sigma * 1000). Returns the velocity noise - x0, [B, 48, h, w] fp32."""
+        """timestep: the noise level in 0..1000 (sigma * 1000). Returns the velocity noise - x0, [B, 48, h, w] fp32.
+
+        A clip [B, 48, T, h, w] (T latent frames, sample and probe renders) comes back in that shape. The training
+        losses' taps read stills only."""
         skip_layers = frozenset(skip_layers or ())
-        if hidden_states.ndim != 4 or hidden_states.shape[1] != self.latent_channels:
-            raise ValueError(f"hidden_states must be one frame of latents [B, {self.latent_channels}, H/16, W/16]")
+        clip = hidden_states.ndim == 5
+        if hidden_states.ndim not in (4, 5) or hidden_states.shape[1] != self.latent_channels:
+            raise ValueError(f"hidden_states must be latents [B, {self.latent_channels}, H/16, W/16] or a clip "
+                             f"[B, {self.latent_channels}, T, H/16, W/16]")
+        n_frames = hidden_states.shape[2] if clip else 1
+        if clip:  # frames ride in the batch axis for the padding below, and come back after it
+            hidden_states = hidden_states.transpose(1, 2).flatten(0, 1)
         if encoder_hidden_states.ndim != 3 or encoder_hidden_states.shape[2] != self.text_dim:
             raise ValueError(f"encoder_hidden_states must be [B, S, {self.text_dim}]")
-        batch, _, out_h, out_w = hidden_states.shape
+        out_h, out_w = hidden_states.shape[-2:]
+        batch = hidden_states.shape[0] // n_frames
         if out_h % PATCH or out_w % PATCH:  # not a 32 px image (a probe size): padded to whole tokens, cropped after
             hidden_states = F.pad(hidden_states, (0, out_w % PATCH, 0, out_h % PATCH), mode="circular")
         height, width = hidden_states.shape[-2:]
@@ -333,7 +345,9 @@ class PAN2Transformer(nn.Module):
         device = hidden_states.device
         dtype = _wdtype(self.context_embedder[1])
         text_len = encoder_hidden_states.shape[1]
-        n_video = hp * wp
+        n_video = n_frames * hp * wp
+        if clip:
+            hidden_states = hidden_states.unflatten(0, (batch, n_frames)).transpose(1, 2)  # [B, 48, T, h, w]
 
         t = torch.as_tensor(timestep, device=device, dtype=torch.float32).reshape(-1).expand(batch)
         temb = self.time_embedder(timestep_embedding(t))  # fp32
@@ -344,7 +358,7 @@ class PAN2Transformer(nn.Module):
             if not bool(valid.all()):
                 txt_mask = valid[:, None, None, :]
                 key_mask = torch.cat([valid.new_ones(batch, n_video), valid], dim=1)[:, None, None, :]
-        cos, sin = rope_tables((1, hp, wp), self.rope_axes_dim, self.rope_theta, self.rope_temporal_scale, device)
+        cos, sin = rope_tables((n_frames, hp, wp), self.rope_axes_dim, self.rope_theta, self.rope_temporal_scale, device)
 
         x = self.embed_patches(hidden_states).to(dtype)
         context = self.context_embedder[1](self.context_embedder[0](encoder_hidden_states.to(device, dtype)))
@@ -354,6 +368,8 @@ class PAN2Transformer(nn.Module):
 
         split = getattr(self, "split_devices", None)  # blocks may live on several devices (model split)
         taps = getattr(self, "_rz_taps", None)  # rulztrainer.alignment (training-only losses), on the latent cells
+        if clip:
+            taps = None
         if taps is not None:
             for blk in self.transformer_blocks:
                 blk.attn.rz_grid = (hp, wp)
@@ -382,5 +398,8 @@ class PAN2Transformer(nn.Module):
         scale, shift = self.norm_out(temb).unsqueeze(1).chunk(2, dim=-1)
         x = self.proj_out(modulated_norm(x, scale, shift).to(_wdtype(self.proj_out))).float()
         # [B, N, 2 * 2 * C] with the channel first inside a token, as the reference unpatchifies
+        if clip:
+            x = x.reshape(batch, n_frames, hp, wp, self.latent_channels, PATCH, PATCH).permute(0, 4, 1, 2, 5, 3, 6)
+            return x.reshape(batch, self.latent_channels, n_frames, height, width)[..., :out_h, :out_w].to(device)
         x = x.reshape(batch, hp, wp, self.latent_channels, PATCH, PATCH).permute(0, 3, 1, 4, 2, 5)
         return x.reshape(batch, self.latent_channels, height, width)[:, :, :out_h, :out_w].to(device)
