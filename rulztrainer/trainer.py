@@ -293,8 +293,9 @@ def sample_sigmas(cfg: TrainConfig, n: int, gen: torch.Generator, logit_shift: f
     mode = cfg.timestep_sampling
     if mode == "reference":
         arch = arch or get_arch(cfg)
-        if arch.reference_sigmas_exact:  # a step-distilled model's own sampling sigmas, used as drawn
-            return arch.reference_sigmas(n, gen, tokens)
+        if arch.reference_sigmas_exact:  # a step-distilled model's own sampling sigmas, used as drawn; clean_share
+            # alone moves steps between them (MiniMaxH3ImageArch.reference_sigmas), not the curriculum's shift
+            return arch.reference_sigmas(n, gen, tokens, logit_shift if cfg.clean_share else 0.0)
     if strata is not None and mode != "reference":
         u = strata.uniform(n, gen)
         rand, randn = (lambda: u), (lambda: torch.special.ndtri(u))
@@ -1084,10 +1085,14 @@ class Trainer(RaceParallelMixin):
                             "timestep_sampling: %s trains at noise levels between them, which sampling never uses; "
                             "timestep_sampling: reference trains on the sampling steps themselves (ai-toolkit's "
                             "rule)", self.arch.label, cfg.timestep_sampling)
-            elif cfg.timestep_shift != 1.0 or cfg.sigma_min > 0.0 or cfg.sigma_max < 1.0 or cfg.clean_share:
-                log.warning("timestep_sampling: reference trains %s on its own sampling noise levels only: "
-                            "timestep_shift, sigma_min / sigma_max and clean_share do not move them",
-                            self.arch.label)
+            else:
+                if cfg.timestep_shift != 1.0 or cfg.sigma_min > 0.0 or cfg.sigma_max < 1.0:
+                    log.warning("timestep_sampling: reference trains %s on its own sampling noise levels only: "
+                                "timestep_shift and sigma_min / sigma_max do not move them", self.arch.label)
+                if cfg.clean_share:
+                    log.info("clean_share on %s: the share is the steps at its last noise level (0.232, where skin, "
+                             "eyes and fine detail are made), the rest split evenly over the other five; "
+                             "even is 16.7%%", self.arch.label)
         self.replicas = [(model, injected, self.devices[0])]
         if cfg.multi_gpu == "data_parallel":
             from .multigpu import DataParallelLoRA
