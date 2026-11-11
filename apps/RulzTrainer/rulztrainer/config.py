@@ -538,6 +538,9 @@ class TrainConfig:
     save_state_every: int = 0  # steps between state saves; 0 = same as save_every
     keep_states: int = 1  # rolling number of state folders to keep; 0 = keep all
     resume_state: str = ""  # path to a state_XXXXXX directory to resume training from
+    # a run that ends because GPU or system memory ran out is started again by the WebUI, at most this many times
+    # (oom_recovery.py: from its newest state, then one step lighter); 0 = off. The trainer itself does not read it
+    oom_retries: int = 3
     compile_model: bool | str = "auto"  # torch.compile the DiT blocks: true | false | auto (runs of 100+ steps on a GPU
     #                                     with triton; measured 26% faster per step on MOSS-Image, 12% on Krea 2)
     compile_cache: str = "auto"  # compiled kernels kept across machines: auto (<models_dir>/.rulz_compile, also read
@@ -1254,6 +1257,8 @@ class TrainConfig:
             raise ValueError("dora works on a LoRA or a LoKr; OFT rotates the weights instead (turn one off)")
         if self.dora and self.finetune:
             raise ValueError("dora is an adapter option; a fine-tune trains the weights themselves (turn one off)")
+        if self.oom_retries < 0:
+            raise ValueError("oom_retries must be 0 (off) or the number of automatic tries after running out of memory")
         if self.keep_checkpoints < 0:
             raise ValueError("keep_checkpoints must be 0 (keep all) or the number of checkpoints to keep")
         if self.block_swap:

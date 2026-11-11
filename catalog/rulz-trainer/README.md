@@ -861,6 +861,25 @@ over, and the log says so. The image order, the per-image loss watch and the ide
 - **A run that fails.** After an error the weights are still in memory, so the run saves them first: a normal checkpoint
   of the last finished step and a training state to resume from. A race saves the configurations training at that
   moment, with no state. A LoRA that holds non-finite weights is not saved.
+- **A run that runs out of memory** (3.9.0, `oom_retries`, default 3; 0 = off). A step that runs out with blocks
+  keeping their activations is trained again with fewer of them, as before. When a run ends because GPU or system
+  memory ran out anyway, the WebUI starts it again by itself, before the next queued run:
+  - GPU memory, with a training state of this run (the one the failed run saves, or an earlier one): it carries on
+    from the newest state on the same settings, since memory that fragments over hours is the usual cause late in a
+    run. Out again within one state interval of that point: it carries on one step lighter, in this order: gradient
+    checkpointing on, no blocks keeping their activations (`checkpoint_keep_blocks: 0`), then an eighth of the model's
+    blocks more block swap (at least 2).
+  - GPU memory before the first state was due: one fresh start, one step lighter. Later, with no state to carry on
+    from (a race, a full fine-tune, `save_state` off), it stops: a fresh start would throw away the steps trained.
+  - System memory (Python's `MemoryError`, Windows' "paging file is too small", or Linux killing the process): one
+    try from the newest state on the same settings, then it stops, since more block swap would take more RAM.
+
+  It never changes the batch size, the resolution or the precision, since those change what the run trains; when
+  nothing lighter is left, the log says what to change. Each try is kept in `oom_recovery.json` in the job folder (a
+  restarted WebUI keeps the count), the failed try's logs are kept as `train_oom1.log` and `console_oom1.log`, and the
+  new `train.log` opens with what was tried. Only runs the WebUI started or reattached to while they ran are retried;
+  a run you killed or stopped never is. The new field is in Advanced, *Resume and training states*. After Fizgig 9.6's
+  out-of-memory recovery; it has not run on a real out-of-memory failure yet.
 - **A render that fails.** A sample round, a probe or a self-training round that fails (out of memory, say) is logged
   with its traceback and training goes on without it. A failure before the first step still stops the run: nothing is
   lost, and it is usually a setting.
