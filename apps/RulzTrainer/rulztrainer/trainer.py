@@ -527,6 +527,7 @@ class Trainer(RaceParallelMixin):
             self.stop_file.unlink()
         # a drop asked of an earlier run of this job name (Drop, then Kill or a crash) must not drop this run's row
         (self.job_dir / "RACE_DROP").unlink(missing_ok=True)
+        (self.job_dir / "RACE_PICK").unlink(missing_ok=True)
         self.device = torch.device(cfg.device)
         self.arch = get_arch(cfg)  # confirmed against the model's transformer config once the model dir is resolved
         self.vae = None
@@ -2330,6 +2331,10 @@ class Trainer(RaceParallelMixin):
                      "own settings, seed, image order and noise. %d training steps in all (%.0fx one %d-step run); "
                      "the last round's winner is the run's LoRA", len(rows), cfg.probe_every, est["total"],
                      est["ratio"], cfg.steps)
+            if cfg.race_pick:
+                log.info("Relay race: you pick the leader after each round on the Monitor (%s; then the highest score "
+                         "leads)", f"waiting up to {cfg.race_pick_minutes:g} minutes" if cfg.race_pick_minutes > 0
+                         else "waiting until you pick")
         elif cfg.race_drop_lowest:
             log.info("Configuration race: %d configurations, %d warm-up probe round(s), a probe every %d steps: %d "
                      "rounds and %d probes, about %d training steps in all (%.1fx one %d-step run)", len(rows),
@@ -2393,7 +2398,8 @@ class Trainer(RaceParallelMixin):
                                       base.race_patience if base.race_patience_drop else 0, base.steps,
                                       follow=base.race_follow, rising=base.race_patience_rising,
                                       confidence=base.race_drop_confidence, max_close=base.race_max_close_rounds,
-                                      drift=base.race_drop_drift, drift_probes=base.race_drop_drift_probes)
+                                      drift=base.race_drop_drift, drift_probes=base.race_drop_drift_probes,
+                                      pick=base.race_pick)
         if sched.drift > 0:
             log.info("Race: a configuration whose probes leave their prompts' frame (prompt check drift at or over "
                      "%.0f%%) for %d of its own probes in a row is dropped; the last one never is",
@@ -2483,6 +2489,9 @@ class Trainer(RaceParallelMixin):
         cur = rr.active
         rounds = len(rr.schedule.history)
         self._race_record(cur, self.controller)
+        if rr.schedule.awaiting is not None:  # race_pick: the round is over; you pick who everyone continues from
+            log.info("Race round %s", race_mod.describe_round(rr.schedule.history[-1], rr.schedule))
+            self._race_wait_pick()
         if len(rr.schedule.history) > rounds:
             log.info("Race round %s", race_mod.describe_round(rr.schedule.history[-1], rr.schedule))
         for i in rr.schedule.just_dropped:
@@ -2500,6 +2509,42 @@ class Trainer(RaceParallelMixin):
             self._race_finish()
         self._race_report()
         return nxt
+
+    def _race_wait_pick(self, poll: float = 2.0) -> None:
+        """A relay race with race_pick, at the end of a round (everyone probed, nobody continuing from anyone yet):
+        wait for the Monitor's pick (RACE_PICK in the job folder: the racer's name), at most race_pick_minutes (0 =
+        until you pick). No pick in time, or a stop, leaves the lead to the highest score."""
+        rr = self.race
+        sched = rr.schedule
+        minutes = float(getattr(rr.base_cfg, "race_pick_minutes", 0) or 0)
+        deadline = time.time() + 60 * minutes if minutes > 0 else None
+        request = self.job_dir / "RACE_PICK"
+        suggested = sched.names[sched.awaiting]
+        log.info("Relay race: round %d is over; pick the racer everyone continues from on the Monitor (%s scored "
+                 "highest; %s)", sched.history[-1]["round"], suggested,
+                 f"it leads if you do not pick within {minutes:g} minutes" if deadline else "waiting until you pick")
+        self._race_report()
+        self.status.update(stage="waiting for your relay pick")
+        idx, how = None, "waited"
+        while True:
+            if request.exists():
+                try:
+                    name = request.read_text(encoding="utf-8").strip().splitlines()[-1].strip()
+                    request.unlink()
+                except (OSError, IndexError):
+                    name = ""
+                if name in sched.names and sched.names.index(name) in sched.alive:
+                    idx, how = sched.names.index(name), "you"
+                    break
+                log.warning("Relay race: cannot continue from %r (not a racer still in the race)", name)
+            if self.stop_file.exists():
+                how = "stopped"
+                break
+            if deadline is not None and time.time() >= deadline:
+                break
+            time.sleep(poll)
+        sched.choose(idx, how)
+        self.status.update(stage="training")
 
     def _race_follow(self, win) -> None:
         """A relay race's round is over (everyone parked): every other configuration continues from the winner."""

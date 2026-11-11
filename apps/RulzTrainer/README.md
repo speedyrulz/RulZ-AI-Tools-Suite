@@ -2409,6 +2409,16 @@ or DoRA rows; `lora_dropout` is fine), the drop and patience rules are ignored, 
 log says so; Automagic 3 and 4 count as different kinds). With 4 seeds the round's best of 4 probes is somewhat lucky: the probe noise (a few points) is part of
 what picks the winner, so more probe seeds (`probe_seeds`) make the choice steadier.
 
+**Pick the relay's leader yourself (`race_pick: true`, since v3.12.0).** In a relay, each round ends with the run
+waiting instead of following the highest score: look at the round's probe images (Monitor > Images; each racer's carry
+its name), then press **Continue from** on a racer in the Monitor's race table, and everyone continues from that one's
+LoRA as above. In the last round your pick is the run's LoRA (`<job>.safetensors`, `<job>_winner.yaml`). The run waits
+`race_pick_minutes` at most (default 30, `0` = until you pick); with no pick by then, or a Stop while it waits, the
+highest smoothed score leads as without picking. The log and `race.json` record each round's pick (`picked`: `you`,
+`waited` or `stopped`) and the highest scorer (`suggested`). The GPUs sit idle while the run waits, and a rental bills
+for that time. The pick reaches the trainer as a `RACE_PICK` file in the job folder (the racer's name), so a script can
+pick too. Not used outside a relay.
+
 **One configuration per GPU (`race_parallel: true`).** With `multi_gpu: data_parallel` on two or more GPUs, the
 configurations of a round train side by side instead of in turn: each GPU's model copy trains its own configuration
 at the same moment, both run the same `probe_every` steps, and each is probed at the end of its turn as before. With

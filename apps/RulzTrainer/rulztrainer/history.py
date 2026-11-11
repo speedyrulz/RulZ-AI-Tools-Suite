@@ -31,7 +31,7 @@ CONFIG_KEYS = ("job_name", "preset", "network_type", "lora_rank", "lokr_factor",
                "body_scale_span", "body_scale_curve", "probe_face_prompt", "probe_body_prompt", "probe_seed",
                "probe_seeds", "probe_size", "probe_steps", "probe_cfg", "turbo_lora", "resolutions",
                "reward_steps", "body_align", "selftrain", "probe_ema", "body_score", "lora_plus_ratio", "race_follow",
-               "race_patience_rising")
+               "race_patience_rising", "race_pick")
 
 
 def new_run_id(job_name: str, now: float | None = None) -> str:

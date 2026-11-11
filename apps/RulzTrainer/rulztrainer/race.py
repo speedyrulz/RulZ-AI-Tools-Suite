@@ -32,6 +32,9 @@ highest smoothed score): its LoRA weights, optimizer state, weight average and l
 own settings, seed, image order and noise. With seed rows, every round tries a few random paths from the best LoRA so
 far and keeps the one that probed best. Every configuration trains `steps` of its own (n x one run); the last round's
 winner is the run's LoRA. The configurations must share the LoRA's shape (no rank, alpha, layer or network rows).
+race_pick lets you choose that winner instead: at the end of each round the run waits (race_pick_minutes at most,
+0 = until you pick) for the Monitor's pick (RACE_PICK in the job folder), then everyone continues from the racer you
+picked; with no pick in time, or a stop, the highest score leads as without it (RaceSchedule.choose).
 
 With race_parallel (data parallel, 2+ GPUs) the configurations train side by side instead: a "wave" of one
 configuration per GPU runs the same steps at the same time, each on its GPU's own model copy, and is probed at the
@@ -220,6 +223,8 @@ def validate(cfg) -> None:
     if getattr(cfg, "race_patience_drop", False) and int(cfg.race_patience) < 1:
         raise ValueError("race_patience must be 1 or more (probes without improvement before a configuration leaves)")
     follow = bool(getattr(cfg, "race_follow", False))
+    if float(getattr(cfg, "race_pick_minutes", 30.0) or 0.0) < 0:
+        raise ValueError("race_pick_minutes must be 0 (wait until you pick) or more")
     if follow and float(getattr(cfg, "race_drop_drift", 0.0) or 0.0) > 0:
         raise ValueError("a relay race (race_follow) keeps every configuration to the last round: set race_drop_drift "
                          "to 0")
@@ -310,7 +315,8 @@ class RaceSchedule:
 
     def __init__(self, names: list[str], warmup: int, drop_lowest: bool = True, patience: int = 0,
                  total_steps: int | None = None, follow: bool = False, rising: bool = False,
-                 confidence: float = 0.0, max_close: int = 3, drift: float = 0.0, drift_probes: int = 2):
+                 confidence: float = 0.0, max_close: int = 3, drift: float = 0.0, drift_probes: int = 2,
+                 pick: bool = False):
         self.names = list(names)
         # drift > 0 (race_drop_drift): a configuration whose probes have left their prompts' frame (the prompt check's
         # drift share at or above it) for drift_probes of its own probes in a row leaves at the end of that round,
@@ -340,6 +346,11 @@ class RaceSchedule:
         self.last: dict[int, float | None] = {}  # each configuration's previous probe score
         self.spared: dict[int, int] = {}  # this round's: index -> probes without improvement it stayed on with
         self.leader: int | None = None  # the latest round's winner (follow)
+        # pick (a relay only): each round's leader is chosen by hand. A round ends with `awaiting` set to the highest
+        # score (the suggestion) and nobody continuing from anyone yet; choose() names the leader and, in the last
+        # round, leaves the others (finished)
+        self.pick = bool(pick) and self.follow
+        self.awaiting: int | None = None
         self.total_steps = total_steps
         self.alive = list(range(len(names)))
         self.round = 1
@@ -439,13 +450,14 @@ class RaceSchedule:
         if self.follow:  # the round's highest score leads (a tie keeps the leader, else the earlier row wins)
             self.leader = max(self.alive, key=lambda i: (key(i)[0], i == self.leader, -i))
             entry["leader"] = self.names[self.leader]
-            if self.total_steps and all((self.steps.get(i) or 0) >= self.total_steps for i in self.alive):
-                for i in [i for i in self.alive if i != self.leader]:
-                    self.alive.remove(i)
-                    self.dropped[i] = self.round
-                    self.finished.add(i)
-                    self.just_dropped.append(i)
+            final = bool(self.total_steps) and all((self.steps.get(i) or 0) >= self.total_steps for i in self.alive)
+            if final:
                 entry["final"] = True
+            if self.pick:  # the leader waits for choose(); so do the last round's departures
+                entry["suggested"] = self.names[self.leader]
+                self.awaiting = self.leader
+            elif final:
+                self._relay_final(self.round)
         elif self.drop_lowest and self.round > self.warmup and not self.done and not drift_round:
             # (a round that dropped for drift, or kept its least drifted, drops nobody for the score as well)
             lowest = min(self.alive, key=key)
@@ -464,6 +476,37 @@ class RaceSchedule:
         self.pending = [] if self.done else list(self.alive)
         self.members = list(self.alive)
         return dropped
+
+    def _relay_final(self, rnd: int) -> None:
+        """A relay's last round (rnd): everyone but the leader has trained all its steps and leaves (finished)."""
+        for i in [i for i in self.alive if i != self.leader]:
+            self.alive.remove(i)
+            self.dropped[i] = rnd
+            self.finished.add(i)
+            self.just_dropped.append(i)
+
+    def choose(self, idx: int | None, how: str = "you") -> int:
+        """A relay with pick: name the leader of the round that just ended (idx None: the suggested one, the highest
+        score). how says why for the log: "you" (picked on the Monitor), "waited" (no pick in time), "stopped" (the run
+        was stopped while waiting). In the last round the others leave (finished) and the leader wins; just_dropped
+        lists them. Returns the leader."""
+        if self.awaiting is None:
+            raise ValueError("no relay round is waiting for a pick")
+        if idx is None:
+            idx = self.awaiting
+        if idx not in self.alive:
+            raise ValueError(f"configuration {idx} is not in the race")
+        entry = self.history[-1]
+        self.leader = idx
+        entry["leader"] = self.names[idx]
+        entry["picked"] = how
+        self.awaiting = None
+        self.just_dropped = []
+        if entry.get("final"):
+            self._relay_final(entry["round"])
+            self.pending = []
+            self.members = list(self.alive)
+        return idx
 
     def _drift_drops(self) -> int | None:
         """At the end of a round, after the warm-up: everyone whose probes were at or over the drift threshold for
@@ -589,6 +632,8 @@ class RaceSchedule:
                 "follow": self.follow, "confidence": self.confidence, "max_close": self.max_close,
                 "close": self.close,
                 "leader": self.names[self.leader] if self.leader is not None else None,
+                "pick": self.pick,
+                "awaiting": self.names[self.awaiting] if self.awaiting is not None else None,
                 "best": {self.names[i]: b for i, b in self.best.items()},
                 "best_step": {self.names[i]: s for i, s in self.best_step.items()},
                 "last": self.names[self.alive[0]] if self.done and self.alive else None,
@@ -922,10 +967,16 @@ def describe_round(entry: dict, schedule: RaceSchedule) -> str:
         parts.append(f"{entry['drift_stay']} stays although over the drift limit: the least drifted of those left")
     parts += [f"{n} stays: {k} probes without improvement but rising again" for n, k in
               (entry.get("spared") or {}).items()]
-    if entry.get("leader") and entry.get("final"):
-        parts.append(f"{entry['leader']} wins the last round")
+    picked, sug = entry.get("picked"), entry.get("suggested")
+    how = {"you": " (your pick" + ("" if sug == entry.get("leader") else f"; {sug} scored highest") + ")",
+           "waited": " (highest score: no pick in time)",
+           "stopped": " (highest score: stopped while waiting for a pick)"}.get(picked, "")
+    if sug and not picked:
+        parts.append(f"waiting for your pick ({sug} scored highest)")
+    elif entry.get("leader") and entry.get("final"):
+        parts.append(f"{entry['leader']} wins the last round{how}")
     elif entry.get("leader"):
-        parts.append(f"{entry['leader']} leads: everyone continues from its LoRA")
+        parts.append(f"{entry['leader']} leads{how}: everyone continues from its LoRA")
     if entry.get("dropped"):
         how = "by hand" if entry.get("manual") else "lowest"
         t = entry.get("test")
