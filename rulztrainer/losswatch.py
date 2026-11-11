@@ -7,10 +7,17 @@ relative to the cohort median and from whether it is still improving:
 
     easy       well below the median and still improving          x1.0
     healthy    around the median                                   x healthy_mult (default 1.0)
-    suspect    well above the median but still improving           x1.0
-    stuck      well above the median and not improving (2 epochs)  x0.5, then x0.25, then x0.125
+    suspect    well above the median: still improving, or not an   x1.0
+               outlier of the cohort
+    stuck      an outlier (above the fence) and not improving      x0.5, then x0.25
     exhausted  well below the median and not improving             x0.6
     excluded   stuck at the lowest throttle for `exclude_after` more epochs; weight 0, remembered on disk
+
+The fence (loss_watch_fence, after Fizgig's of 9 November 2026) is the cohort's median + 1.5 x its interquartile
+range. Late in a run almost no image still improves by loss_watch_improve_tol an epoch, so "well above the median
+and not improving" alone turns into "every hard image": Fizgig replayed 39 real runs and found about a third of
+each dataset throttled that way, most of them images that kept getting easier at the full rate. The ladder stops at
+x0.25 for the same reason (it went on to x0.125).
 
 The watch itself only observes. `per_image_lr` applies the multipliers: as a true per-image learning rate
 when the batch is a single image, else as a per-sample loss weight.
@@ -28,7 +35,8 @@ from pathlib import Path
 log = logging.getLogger("rulztrainer")
 
 VERDICTS = ("new", "healthy", "easy", "suspect", "stuck", "exhausted", "excluded")
-STUCK_LADDER = (0.5, 0.25, 0.125)
+STUCK_LADDER = (0.5, 0.25)
+FENCE_MIN_IMAGES = 4  # a cohort smaller than this has no quartiles worth the name: the median rule alone
 EXHAUSTED_MULT = 0.6
 
 
@@ -62,6 +70,17 @@ def _flush_at_exit(ref) -> None:
         watch.flush()
 
 
+def outlier_fence(values: list[float], median: float, k: float) -> float:
+    """The residual an image must be above to count as an outlier of its cohort: median + k x the interquartile
+    range (quartiles by index, as Fizgig's). -inf, so nothing is held back, with k 0 or under FENCE_MIN_IMAGES."""
+    n = len(values)
+    if k <= 0 or n < FENCE_MIN_IMAGES:
+        return -math.inf
+    ordered = sorted(values)
+    iqr = ordered[int(0.75 * (n - 1))] - ordered[int(0.25 * (n - 1))]
+    return median + k * iqr
+
+
 def _caption_hash(caption: str) -> str:
     return hashlib.sha1(caption.encode("utf-8")).hexdigest()[:12]
 
@@ -84,6 +103,7 @@ class LossWatch:
         self.epoch_obs = 0
         self.excluded_file = excluded_file
         self.cohort_median: float | None = None
+        self.cohort_fence: float | None = None  # None: no fence this epoch (off, or too few images)
         self.log_path = self.job_dir / "per_image_loss.jsonl"
         import threading
 
@@ -209,8 +229,11 @@ class LossWatch:
         active = [st for st in self.stats.values() if not st.excluded and st.history]
         if not active:
             return self.summary(step)
-        median = statistics.median(st.history[-1] for st in active)
+        latest = [st.history[-1] for st in active]
+        median = statistics.median(latest)
         self.cohort_median = median
+        fence = outlier_fence(latest, median, float(getattr(cfg, "loss_watch_fence", 0.0)))
+        self.cohort_fence = fence if math.isfinite(fence) else None
         high, low, tol = cfg.loss_watch_high, cfg.loss_watch_low, cfg.loss_watch_improve_tol
         newly_excluded = []
         for st in active:
@@ -218,15 +241,16 @@ class LossWatch:
             enough = len(st.history) >= 2
             improving = enough and r < st.history[-2] * (1 - tol)
             is_high, is_low = r > median * high, r < median * low
-            if is_high and enough and not improving:
+            if is_high and r > fence and enough and not improving:
                 st.stuck_epochs += 1
                 st.verdict = "stuck"
                 st.multiplier = STUCK_LADDER[min(st.stuck_epochs - 1, len(STUCK_LADDER) - 1)]
                 if cfg.loss_watch_exclude_after > 0 and st.stuck_epochs >= len(STUCK_LADDER) + cfg.loss_watch_exclude_after:
                     st.excluded, st.verdict, st.multiplier = True, "excluded", 0.0
                     newly_excluded.append(st.key)
-            elif is_high:  # hard but improving: recover from a throttle one rung at a time
-                st.stuck_epochs = max(0, st.stuck_epochs - 1)
+            elif is_high:  # hard but improving, or inside the fence: recover from a throttle one rung at a time
+                # (from the lowest rung, however long it was held: stuck_epochs counts on past the ladder's end)
+                st.stuck_epochs = max(0, min(st.stuck_epochs, len(STUCK_LADDER)) - 1)
                 st.verdict = "suspect"
                 st.multiplier = STUCK_LADDER[st.stuck_epochs - 1] if st.stuck_epochs > 0 else 1.0
             elif is_low and enough and not improving:
@@ -273,10 +297,10 @@ class LossWatch:
 
     def summary(self, step: int) -> dict:
         return {"epoch": self.epoch, "step": step, "counts": self.counts(), "median": self.cohort_median,
-                "rows": self.rows(), "active": self.active_count(), "total": len(self.stats)}
+                "fence": self.cohort_fence, "rows": self.rows(), "active": self.active_count(), "total": len(self.stats)}
 
     def write_table(self) -> None:
-        data = {"epoch": self.epoch, "median": self.cohort_median,
+        data = {"epoch": self.epoch, "median": self.cohort_median, "fence": self.cohort_fence,
                 "images": {k: asdict(st) for k, st in self.stats.items()}}
         try:
             (self.job_dir / "per_image_loss.json").write_text(json.dumps(data, indent=1), encoding="utf-8")
