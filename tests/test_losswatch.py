@@ -5,7 +5,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from rulztrainer.config import TrainConfig  # noqa: E402
 from rulztrainer.dataset import Item  # noqa: E402
-from rulztrainer.losswatch import LossWatch, read_verdicts  # noqa: E402
+from rulztrainer.losswatch import STUCK_LADDER, LossWatch, outlier_fence, read_verdicts  # noqa: E402
 
 
 def _items(tmp_path, n):
@@ -60,7 +60,61 @@ def test_stuck_ladder(tmp_path):
             watch.observe(step, str(it.image), 1.0 * (3.0 if i == 0 else 1.0), 0.5)
         watch.end_epoch(step)
         ladder.append(watch.stats[str(items[0].image)].multiplier)
-    assert 0.5 in ladder and 0.25 in ladder and ladder[-1] == 0.125
+    assert 0.5 in ladder and ladder[-1] == 0.25 and min(ladder) == 0.25  # the ladder stops at x0.25
     cfg2 = TrainConfig(loss_watch=True, per_image_lr=False)
     watch2 = LossWatch(cfg2, items, tmp_path)
     assert watch2.multiplier(str(items[0].image)) == 1.0  # observe-only never scales
+
+
+def _flat_run(tmp_path, cfg, factors, epochs=8):
+    """Every image at its own constant multiple of the loss, so nothing improves: {index: verdict} at the end."""
+    items = _items(tmp_path, len(factors))
+    watch = LossWatch(cfg, items, tmp_path)
+    step = 0
+    for _ in range(epochs):
+        for it, factor in zip(items, factors):
+            step += 1
+            watch.observe(step, str(it.image), factor, 0.5)
+        summary = watch.end_epoch(step)
+    return [watch.stats[str(it.image)].verdict for it in items], summary
+
+
+def test_outlier_fence_spares_the_hard_end_of_a_spread(tmp_path):
+    """A dataset whose losses are simply spread out, none improving (late in a run): the median rule alone calls the
+    whole hard end stuck; with the fence only the image far outside the rest is."""
+    factors = [0.6, 0.7, 0.8, 0.9, 1.0, 1.0, 1.1, 1.2, 1.6, 1.7, 1.8, 4.0]
+    old, _ = _flat_run(tmp_path / "old", TrainConfig(loss_watch=True, per_image_lr=True, loss_watch_fence=0.0), factors)
+    new, summary = _flat_run(tmp_path / "new", TrainConfig(loss_watch=True, per_image_lr=True), factors)
+    assert [i for i, v in enumerate(old) if v == "stuck"] == [8, 9, 10, 11]
+    assert [i for i, v in enumerate(new) if v == "stuck"] == [11]
+    assert [new[i] for i in (8, 9, 10)] == ["suspect"] * 3  # hard and watched, at the full rate
+    assert summary["fence"] is not None and summary["fence"] > summary["median"]
+
+
+def test_outlier_fence_values():
+    import math
+
+    assert outlier_fence([1, 2, 3, 4, 5], 3, 1.5) == 3 + 1.5 * (4 - 2)
+    assert outlier_fence([1, 2, 3, 4, 5], 3, 0) == -math.inf  # off
+    assert outlier_fence([1, 2, 9], 2, 1.5) == -math.inf  # too few images for quartiles: the median rule alone
+
+
+def test_long_stuck_image_recovers_a_rung_an_epoch(tmp_path):
+    """An image held at the lowest rung for longer than the ladder is long, then improving: back up one rung per
+    epoch (before 3.7.1 this read past the ladder's end and stopped the run with an IndexError)."""
+    cfg = TrainConfig(loss_watch=True, per_image_lr=True)
+    items = _items(tmp_path, 6)
+    watch = LossWatch(cfg, items, tmp_path)
+    hard = watch.stats[str(items[0].image)]
+    step, mults = 0, []
+    for epoch in range(24):
+        for i, it in enumerate(items):
+            step += 1
+            factor = 1.0 if i else (4.0 if epoch < 8 else 4.0 * 0.6 ** (epoch - 7))  # flat, then easier every epoch
+            watch.observe(step, str(it.image), factor, 0.5)
+        watch.end_epoch(step)
+        mults.append(hard.multiplier)
+    last_low = max(i for i, m in enumerate(mults) if m == 0.25)
+    assert mults.count(0.25) > len(STUCK_LADDER) + 1  # held at the lowest rung for longer than the ladder is long
+    assert mults[last_low + 1:last_low + 3] == [0.5, 1.0], mults
+    assert all(m == 1.0 for m in mults[last_low + 2:]), mults

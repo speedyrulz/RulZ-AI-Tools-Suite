@@ -678,10 +678,12 @@ class TrainConfig:
     body_weight: float = 0.3
     # --- per-image loss watch ---
     loss_watch: bool = False  # track every image's timestep-normalised loss and give epoch verdicts
-    per_image_lr: bool = False  # act on verdicts: stuck x0.5/0.25/0.125, exhausted x0.6 (not with automagic3/4)
+    per_image_lr: bool = False  # act on verdicts: stuck x0.5 then x0.25, exhausted x0.6 (not with automagic3/4)
     loss_watch_buckets: int = 40  # sigma buckets for loss normalisation
     loss_watch_beta: float = 0.9  # per-image residual EMA
     loss_watch_high: float = 1.3  # residual above median x this = hard
+    loss_watch_fence: float = 1.5  # stuck also needs a residual above median + this x the cohort's interquartile
+    #                                range: an outlier, not just a hard image (0 = off, the rule before 3.7.1)
     loss_watch_low: float = 0.7  # residual below median x this = easy / learned
     loss_watch_improve_tol: float = 0.03  # relative epoch-to-epoch drop that counts as improving
     loss_watch_healthy_mult: float = 1.0  # lr multiplier for the healthy cohort (Fizgig uses 1.1)
