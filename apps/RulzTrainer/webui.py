@@ -28,7 +28,7 @@ from rulztrainer.archs import get_arch
 from rulztrainer.config import (AUTOMAGIC, KEEL, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
                                 MODEL_PRESETS, ARCH_SAMPLE_LORA,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
-from rulztrainer import __version__, bodysim, facesim, history, lookfilter, machine, promptcheck
+from rulztrainer import __version__, bodysim, facesim, history, lookfilter, machine, oom_recovery, promptcheck
 from rulztrainer.train_queue import TrainQueue
 from rulztrainer.dataset import skipped as dataset_skipped
 from rulztrainer.pictures import to_rgb
@@ -168,6 +168,8 @@ PAGE_KEEP_SECONDS = 3600.0
 QUEUE = TrainQueue()  # runs waiting for the current one (output/_queue.json); queue_loop() starts them in turn
 _start_lock = threading.RLock()  # the queue's thread and a page may start a run at the same moment
 AUTOSTOP = machine.AutoStop()  # "stop this instance when the runs are done" (a vast.ai rental), queue_loop()
+_watched: dict = {}  # the job this WebUI saw running ({"pid", "job_dir"}): when it ends, out-of-memory recovery looks
+_killed_pids: set[int] = set()  # jobs you killed: never a memory failure to recover from
 
 
 # ---------------------------------------------------------------- backend helpers
@@ -502,7 +504,9 @@ def start_training(cfg: TrainConfig) -> str:
         return _start_training(cfg)
 
 
-def _start_training(cfg: TrainConfig) -> str:
+def _start_training(cfg: TrainConfig, recovery_note: str | None = None) -> str:
+    """Start a run. recovery_note: the start is out-of-memory recovery's (oom_recovery), and the new train.log opens
+    with this note; any other start begins with no recovery tries."""
     global _proc, _adopted, _job_dir
     reattach_job()
     if _running():
@@ -520,13 +524,15 @@ def _start_training(cfg: TrainConfig) -> str:
                 return f"{n} not found: {getattr(cfg, n)!r}"
     _job_dir = cfg.job_dir()
     _job_dir.mkdir(parents=True, exist_ok=True)
+    if recovery_note is None:
+        oom_recovery.reset(_job_dir)
     cfg_path = _job_dir / "config.yaml"
     cfg.save(cfg_path)
     for stale in ("status.json", "STOP", "RACE_DROP"):  # (a drop asked of an earlier run of this job name)
         p = _job_dir / stale
         if p.exists():
             p.unlink()
-    (_job_dir / "train.log").write_text("", encoding="utf-8")
+    (_job_dir / "train.log").write_text(recovery_note or "", encoding="utf-8")
     env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
     # detached from the WebUI (own process group / session, no console): closing or restarting the WebUI leaves the
     # job running, and the next WebUI reattaches to it through JOB_FILE
@@ -566,6 +572,7 @@ def kill_training() -> str:
     paused = bool(QUEUE.snapshot()["waiting"])
     if paused:
         QUEUE.set_paused(True)
+    _killed_pids.add(_job_pid())
     if _proc is not None:
         _proc.kill()
     else:
@@ -616,12 +623,90 @@ def queue_run(cfg: TrainConfig) -> tuple[bool, str]:
     return True, f"Queued '{cfg.job_name}' (#{n}): it starts when the runs before it are done."
 
 
+def _job_pid() -> int | None:
+    if _proc is not None:
+        return _proc.pid
+    return _adopted.pid if _adopted is not None else None
+
+
+def _oom_block_count(cfg: TrainConfig) -> int:
+    try:
+        from rulztrainer.archs import guess_arch_name
+
+        return int(N_BLOCKS.get(guess_arch_name(cfg), 0))
+    except Exception:  # noqa: BLE001
+        return int(N_BLOCKS.get(cfg.arch_name(), 0))
+
+
+def recover_after_oom(job_dir: Path, returncode: int | None = None, killed: bool = False) -> str | None:
+    """A run this WebUI watched has ended: when memory ran out, start it again as oom_recovery decides (under the
+    start lock, before the queue's next run). Returns what it did for the log, or None when it was no memory failure."""
+    job_dir = Path(job_dir)
+    try:
+        status = json.loads((job_dir / "status.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        status = {}
+    if status.get("done") and not status.get("error"):
+        return None  # finished or stopped
+    kind = oom_recovery.classify(status.get("error"), oom_recovery.console_tail(job_dir), returncode, killed)
+    if kind is None:
+        return None
+    try:
+        cfg = TrainConfig.load(job_dir / "config.yaml")
+    except Exception as e:  # noqa: BLE001
+        return f"{job_dir.name}: out of memory, but its config could not be read again ({e}); not retried"
+    tries = oom_recovery.read_tries(job_dir)
+    d = oom_recovery.plan(cfg.to_dict(), status, kind, tries, _oom_block_count(cfg))
+    what = "GPU memory" if kind == "gpu" else "system memory"
+    step = status.get("step")
+    if d["do"] in ("continue", "restart"):
+        action = ("carried on from " + Path(d["save"]).name if d["do"] == "continue" else "started again") + \
+            (f", {d['change']}" if d["change"] else ", same settings")
+        try:
+            new_cfg = validated_config(TrainConfig.from_dict(d["config"]))
+        except (TypeError, ValueError) as e:
+            d = {**d, "do": "stop", "why": f"the lighter settings are not valid ({e})"}
+        else:
+            tries = oom_recovery.add_try(job_dir, kind, step, action)
+            kept = oom_recovery.keep_logs(job_dir, len(tries))
+            note = (f"[oom recovery] try {len(tries)} of {cfg.oom_retries}: the last try ran out of {what} at step "
+                    f"{step}; {d['why']}: {action}. Its logs: {', '.join(kept) or 'none'}.\n")
+            msg = _start_training(new_cfg, recovery_note=note)
+            if msg.startswith("Started"):
+                return f"{job_dir.name}: out of {what} at step {step}; {d['why']}: {action}"
+            d = {**d, "do": "stop", "why": f"it could not start again ({msg})"}
+    text = (f"\n[oom recovery] The run ran out of {what} at step {step} and is not retried: {d['why']}.\n"
+            f"{oom_recovery.advice(kind, d.get('save'))}\n{oom_recovery.summary(tries)}\n")
+    try:
+        with open(job_dir / "train.log", "a", encoding="utf-8") as f:
+            f.write(text)
+    except OSError:
+        pass
+    return f"{job_dir.name}: out of {what} at step {step}, not retried: {d['why']}"
+
+
 def queue_tick() -> None:
     """One step of the queue: start the next waiting run when the job has ended (under the start lock, so a run the
-    page starts in between is seen as running, not failed as "already running" with the queue paused)."""
+    page starts in between is seen as running, not failed as "already running" with the queue paused). A watched run
+    that ran out of memory is started again first (recover_after_oom); it then holds the queue like any run."""
+    note = None
     with _start_lock:
         reattach_job()
-        done = QUEUE.advance(_running(), _start_queued)
+        running = _running()
+        pid = _job_pid()
+        if running and pid is not None and _job_dir is not None:
+            _watched.update(pid=pid, job_dir=_job_dir)
+        elif _watched.get("pid") is not None:
+            seen, _watched["pid"] = _watched["pid"], None
+            code = _proc.poll() if _proc is not None and _proc.pid == seen else None
+            try:
+                note = recover_after_oom(_watched["job_dir"], code, seen in _killed_pids)
+            except Exception as e:  # noqa: BLE001  (recovery must never stop the queue)
+                note = f"recovery failed: {type(e).__name__}: {e}"
+            running = _running()
+        done = QUEUE.advance(running, _start_queued)
+    if note:
+        print(f"[oom recovery] {note}", flush=True)
     if done is not None:
         print(f"[queue] {done.get('job')}: {done.get('message')}", flush=True)
 
@@ -1542,6 +1627,7 @@ class Form:
             lora_save_dtype=v("lora_save_dtype"), lora_ema=float(v("lora_ema") or 0),
             save_state=bool(v("save_state")), resume_state=s("resume_state"),
             save_state_every=int(v("save_state_every")), keep_states=int(v("keep_states")),
+            oom_retries=3 if v("oom_retries") is None else max(0, int(v("oom_retries"))),
             compile_model=v("compile_model"), compile_cache=s("compile_cache") or "auto",
             sample_seed=int(v("sample_seed")),
             sample_walk_seed=bool(v("sample_walk_seed")), sample_before_training=bool(v("sample_before_training")),
@@ -8836,6 +8922,13 @@ def build_page(local: bool = True):
                                     .classes("w-80")
                                 w["keep_states"] = ui.number("States to keep (rolling, 0 = all)", value=d.keep_states,
                                                              precision=0).classes("w-60")
+                                w["oom_retries"] = ui.number("Out-of-memory retries (0 = off)", value=d.oom_retries,
+                                                             min=0, precision=0).classes("w-60") \
+                                    .tooltip("When a run ends because GPU or system memory ran out, the WebUI starts "
+                                             "it again by itself, before the next queued run: from its newest "
+                                             "training state, first on the same settings, then one step lighter "
+                                             "(checkpointing, kept blocks, block swap) if it runs out again at about "
+                                             "the same point. This many tries a run at most")
                             path_input(f, "resume_state", "Resume from training state folder (state_XXXXXX, optional)",
                                        "dir", "", "w-[40rem]")
 
@@ -11661,6 +11754,12 @@ improvement end training (two separate counts, default 1 each). Step-up needs pr
 scheduler + RNG + likeness controller). Point *Resume from training state folder* at one of them to continue where it
 stopped, with the best score, patience and likeness scale it had. A run that fails on an error saves its LoRA and a
 state first; a failed sample or probe is logged and training goes on.
+
+*Out-of-memory retries* (default 3, 0 = off): a run that ends because GPU or system memory ran out is started again by
+itself, before the next queued run. It carries on from its newest training state on the same settings first; if it
+runs out again at about the same point, one step lighter (gradient checkpointing on, then no blocks keeping their
+activations, then more block swap). Batch size, resolution and precision are never changed: when nothing lighter is
+left the log says what to change. The failed try's logs are kept as train_oom1.log and console_oom1.log.
 
 ## Unequal GPUs
 *Data parallel balance* (Model, next to the GPU settings): in data parallel every step waits for the slowest GPU.
