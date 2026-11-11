@@ -1523,6 +1523,28 @@ class Trainer(RaceParallelMixin):
                 retry_jobs = (per_rep, step_images)  # the same images, not the next ones from the iterator
                 free_cuda()
                 continue
+            except RuntimeError as e:
+                # cuDNN's fused attention failed while it ran (PyTorch only falls back when cuDNN declines a call up
+                # front): cuDNN attention off for the rest of the run, the step redone on PyTorch's pick
+                if not attention.is_cudnn_failure(e) or not attention.fall_back(compiled=self.compiled):
+                    raise
+                log.warning("cuDNN attention failed at step %d (%s). It is switched off for the rest of this run and "
+                            "the step is trained again on PyTorch's pick%s. Set attention_backend: torch to skip "
+                            "this on the next run.", step + 1, str(e).split("  (")[0][:160],
+                            "; the compiled blocks compile again" if self.compiled else "")
+                optimizer.zero_grad(set_to_none=True)
+                if self.dp is not None:
+                    self.dp.zero_grads()
+                if prof is not None:
+                    prof.stop(None)
+                if snap is not None:
+                    snap.stop("_cudnn")
+                if self.compiled:  # every graph was dropped: replicas compile one after another again, samples retrace
+                    self.dp_quiet_steps = 0
+                    self.sample_graphs = set()
+                retry_jobs = (per_rep, step_images)
+                free_cuda()
+                continue
             if self.dp is not None:  # (Keel scales each replica's sum by the step's band and counts its vote)
                 self.dp.reduce_grads(take=getattr(optimizer, "take_replica", None))
             gather = getattr(optimizer, "gather", None)
