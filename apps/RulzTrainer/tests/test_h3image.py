@@ -900,3 +900,32 @@ def test_wizard_recommends_the_h3_image_setup():
     assert webui.block_swap_plan(TrainConfig(model_path="MiniMaxAI/MiniMax-H3-Image", model_source="files",
                                              model_file_quant="w4a8"), 16.0, "auto")[0] > 0  # int8 in memory
     assert "## MiniMax-H3-Image" in webui.HELP
+
+
+def test_clean_share_puts_its_share_of_steps_on_the_last_level_and_keeps_the_six():
+    """clean_share on MiniMax-H3-Image (Fizgig's presets: 40): that share of the steps at the last sampling level
+    (0.232, below 0.5), the rest evenly over the other five, solved by clean_share's own bisection; the levels stay
+    exact. Without clean_share the curriculum's shift moves nothing (ai-toolkit's even draw)."""
+    from rulztrainer.clean_share import CleanShare, offset_for
+    from rulztrainer.trainer import sample_sigmas
+
+    grid = torch.tensor(H3_IMAGE_PDD_SIGMAS[:-1], dtype=torch.float32)
+    assert archs.clean_end_weights(grid, 0.0).tolist() == pytest.approx([1.0 / 6] * 6)
+    cfg = TrainConfig(model_path="MiniMaxAI/MiniMax-H3-Image", timestep_sampling="reference", clean_share="40")
+    off, got = offset_for(cfg, 40.0, 4096, ARCH)
+    assert got == pytest.approx(40.0, abs=0.5) and off < 0  # more clean steps: a negative shift, as on a curve
+    s = sample_sigmas(cfg, 60000, torch.Generator().manual_seed(3), off, tokens=4096, arch=ARCH)
+    assert set(s.tolist()) == set(grid.tolist())
+    share = [float((s == g).float().mean()) for g in grid]
+    assert share[-1] == pytest.approx(0.40, abs=0.01)
+    assert all(x == pytest.approx(0.12, abs=0.01) for x in share[:-1]), share
+    # a schedule works as on any model: 11% (below even) then 40%
+    cs = CleanShare(TrainConfig(model_path="MiniMaxAI/MiniMax-H3-Image", timestep_sampling="reference",
+                                clean_share="11:2:40"), ARCH)
+    low, high = cs.offset(0, 100, 4096), cs.offset(250, 100, 4096)
+    assert low > 0 > high
+    # no clean_share: a shift (the likeness curriculum's) leaves the even draw alone
+    plain = TrainConfig(model_path="MiniMaxAI/MiniMax-H3-Image", timestep_sampling="reference")
+    a = sample_sigmas(plain, 500, torch.Generator().manual_seed(4), -2.0, tokens=4096, arch=ARCH)
+    b = ARCH.reference_sigmas(500, torch.Generator().manual_seed(4), 4096)
+    assert torch.equal(a, b)

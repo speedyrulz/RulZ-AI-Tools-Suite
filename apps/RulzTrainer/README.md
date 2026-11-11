@@ -458,7 +458,9 @@ what the rules have not downloaded by then is gone.
     run), which RulzTrainer does not have, and still offers `60:7:30:8:3` as slower to train but known to work well.
   - **Unmeasured here**, but for one Krea 2 run of `60:7:30:8:3` that tied the plain run. RulzTrainer's default
     already starts at 50%, so race `clean_share: "60:7:30:8:3"` (or `"11:7:40:8:3"` with `optimizer: muon`) against
-    `""` on your own data. It works with every model and timestep mode.
+    `""` on your own data. It works with every model and timestep mode. On MiniMax-H3-Image, whose steps train only at
+    its 6 fixed levels, the share is the steps at its last level (0.232); the *H3 Image 40* button fills in Fizgig's
+    `40`.
 - **Flow matching loss.** `x_t = (1 - sigma) x0 + sigma * noise`, target `noise - x0`, timestep = `sigma * 1000`,
   sigmas snapped to the model's 1000-step training grid. Default sampling is logit-normal; `timestep_shift`
   is available.
@@ -3381,17 +3383,27 @@ from diffusers' `minimax_h3_image` modular pipeline, ComfyUI's `MiniMaxH3ImageMo
   rule for the model (its `fixed_train_sigmas`, commit 5b1670a of 10 November 2026) since v3.7.0: a step trains at
   one of the 6 sigmas the model samples at (1, 0.968, 0.888, 0.75, 0.533, 0.232), picked evenly, through that
   sigma's own head. Each head was distilled at its one sigma, so nothing trains in between. The sigmas are used as
-  drawn: `timestep_shift`, `sigma_min` / `sigma_max`, `clean_share` and `timestep_buckets` do not move them (the log
-  says so), and they are not rounded to the 1000-step grid, where 0.968, 0.888 and 0.533 would land above their grid
+  drawn: `timestep_shift`, `sigma_min` / `sigma_max` and `timestep_buckets` do not move them (the log says so), and
+  they are not rounded to the 1000-step grid, where 0.968, 0.888 and 0.533 would land above their grid
   points and train the head before. Before v3.7.0 `reference` drew a position anywhere along the grid, so a head also
   trained on sigmas between its step and the next. The other samplers (logit-normal and so on) still work as for any
   model and still do that; the log warns when one is set.
+- **Clean-end share** (v3.11.0, `clean_share`, off by default; Fizgig's MiniMax-H3-Image presets use `40`). On this
+  model it is the share of steps at the last level, 0.232 (the only one below 0.5: the nearly finished picture, where
+  skin, eyes and fine detail are made); the other five levels share the rest evenly. `40` gives 40% there and 12% on
+  each of the others, against about 17% each without it. The levels stay the exact six, and every `clean_share`
+  schedule works as on any model (`11:7:40:8:3` and so on). Fizgig says a higher share gives more detail and likeness,
+  a lower one more layout and composition. Without `clean_share` the draw is ai-toolkit's even one, also with the
+  likeness curriculum's timestep shift. **Measured once** (11 November 2026, a race of `""` against `"40"`, 1000
+  steps each, one character set, one seed, 4 probe seeds): a tie. Smoothed combined likeness 28.5 even and 29.3 at
+  40% at step 1000 (they swapped the lead from round to round, within the 5 points runs differ by luck); 40% scored
+  the face about 1 point higher and the body about 4 points lower, and the probes of the two looked nearly the same.
 - **Training adapter.** The model is step- and guidance-distilled, so `training_adapter: auto` downloads ostris'
   [minimax_h3_training_adapter](https://huggingface.co/ostris/minimax_h3_training_adapter)
   `minimax_h3_image_training_adapter_v1.safetensors` (rank 16, 0.16 GB, `diffusion_model.*.lora_A/B`, no alpha, on
   the 200 block layers and the 8 token-refiner layers), the adapter ai-toolkit trains MiniMax-H3-Image with by
   default (since v3.7.0; before, none existed). It is on while the LoRA trains and off for samples and probes, and
-  never saved. Its header is checked against the port's module names and shapes; it has not been run here.
+  never saved. It matched all 208 of its modules on the real model (11 November 2026).
   circlestone-labs' *MiniMax-H3-Image-Training-Adapter* (`minimax_h3_image_training_adapter.safetensors`, no version
   in the name) is an image adapter for H3 itself, despite its name, and is refused here.
 - **What ai-toolkit does that this trainer does not**: edit training (reference images, labelled `Picture 1: ` and
@@ -3413,9 +3425,13 @@ from diffusers' `minimax_h3_image` modular pipeline, ComfyUI's `MiniMaxH3ImageMo
   generated character, encoding and decoding gave 28.8 to 36.6 dB (mean 32.5) at their own size, with fine facial
   detail visibly redrawn, and 35.6 to 40.4 dB (mean 38.0) when the same photos were encoded at twice the size and
   scaled back. Whether training above 1 MP gives a better LoRA has not been measured.
-- **Run on the real weights so far** (10 November 2026): the VAE round trip above and the w4a8 reader below, on the
-  released files. **Not yet run**: the transformer on its real weights, a sample, or a training step. Its forward is
-  checked against the reference math on tiny random weights only, so treat a first run as the test.
+- **Run on the real weights** (11 November 2026, one RTX 5090, int8 transformer, nvfp4 text encoder, ostris'
+  adapter, rank 16, 1 MP, `timestep_sampling: reference`): the step-0 samples and probes at 6 steps are clean,
+  photographic and follow their prompts, so the port, the per-step heads, the text encoder and the VAE work. A LoRA
+  step took about 0.7 s (26 of 50 blocks keeping their activations, 28.0 of 31 GB). In 1000 steps on one character
+  set the face likeness rose steadily, the probes kept their framing, and the loss stayed calm. The VAE round trip
+  above and the w4a8 reader below were checked on the released files on 10 November. Not yet run: the w4a8 file in
+  training, block swap, the model split over two cards, pictures above 1 MP.
 
 **Files.** `model_source: files` downloads from
 [Comfy-Org/MiniMax-H3-Image](https://huggingface.co/Comfy-Org/MiniMax-H3-Image) (sizes from the Hub): the transformer
@@ -3447,13 +3463,14 @@ alpha 16, the adapter and the 6 training sigmas are ai-toolkit's defaults for th
 taken from the siblings. None of it is measured here.
 
 **What Fizgig reports for this model** (its v9.6.0 to v9.6.2 of 11 November 2026 and its
-[guide](https://github.com/shootthesound/Fizgig/blob/master/docs/MINIMAX_IMAGE.md); none of it is measured or built
-here, so these are things to try, not defaults):
+[guide](https://github.com/shootthesound/Fizgig/blob/master/docs/MINIMAX_IMAGE.md); only the clean-end share is built
+and measured here, so the rest are things to try, not defaults):
 
 - **More steps on the last noise level.** Its presets put 40% of the steps on the nearly clean level (sigma 0.232),
   where skin, eyes and fine detail are made, and share the rest evenly over the five levels above. It says a higher
   share gives more detail and likeness, a lower one more layout. RulzTrainer draws the six levels evenly (about 17%
-  each, ai-toolkit's rule) and `clean_share` does not apply to this model.
+  each, ai-toolkit's rule); since v3.11.0 `clean_share: "40"` gives Fizgig's split (see *Clean-end share* above),
+  which tied the even draw in its one race here.
 - **Its own training adapter**,
   [ShootTheSound/Fizgig-MiniMax-H3-Image-Training-Adapter](https://huggingface.co/ShootTheSound/Fizgig-MiniMax-H3-Image-Training-Adapter)
   (0.15 GB, trained on 7,600 photos and 1,000 of the model's own renders, published for any trainer). Fizgig reports

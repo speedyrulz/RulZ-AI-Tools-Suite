@@ -2375,6 +2375,7 @@ def theme_colors() -> None:
 CLEAN_SLIDE = "60:7:30:8:3"  # Fizgig's MOSS-Image Slide until 8 November 2026 (rulztrainer.clean_share.SLIDE)
 CLEAN_SLIDE_MUON = "11:7:40:8:3"  # its Slide since 10 November 2026, for Muon (rulztrainer.clean_share.SLIDE_MUON)
 CLEAN_SLIDE_FT = "11:4:30:8:2"  # its full fine-tune default, in rotations (rulztrainer.clean_share.FT_SLIDE)
+CLEAN_H3_IMAGE = "40"  # Fizgig's MiniMax-H3-Image presets: 40% of the steps at the last of its 6 levels (0.232)
 
 
 def parse_ranks(text) -> list[int]:
@@ -9204,7 +9205,9 @@ def build_page(local: bool = True):
                                         "40 = 40% all run. 75:5:40 = 75% for 5 epochs, then 40%. 60:7:30:8:3 = "
                                         "Fizgig's MOSS-Image Slide: 60% until epoch 7, 30% at epoch 8, then 60% with "
                                         "every 3rd epoch at 30%, at half the learning rate. A full fine-tune counts "
-                                        "rotations instead of epochs (Slide FT: 11:4:30:8:2).")
+                                        "rotations instead of epochs (Slide FT: 11:4:30:8:2). MiniMax-H3-Image "
+                                        "trains at 6 fixed noise levels only: there it is the share of steps at the "
+                                        "last one (0.232).")
                                 ui.button("Slide", on_click=lambda: w["clean_share"].set_value(CLEAN_SLIDE)) \
                                     .props("flat dense").tooltip("Fizgig's MOSS-Image LoRA default until 8 November "
                                                                  "2026, 60:7:30:8:3 (measured on AdamW)")
@@ -9218,6 +9221,13 @@ def build_page(local: bool = True):
                                 ui.button("Slide FT", on_click=lambda: w["clean_share"].set_value(CLEAN_SLIDE_FT)) \
                                     .props("flat dense").tooltip("Fizgig's MOSS-Image full fine-tune default, "
                                                                  "11:4:30:8:2 (rotations)")
+                                ui.button("H3 Image 40",
+                                          on_click=lambda: w["clean_share"].set_value(CLEAN_H3_IMAGE)) \
+                                    .props("flat dense").tooltip(
+                                        "Fizgig's MiniMax-H3-Image presets: 40% of the steps at the model's last "
+                                        "noise level (0.232), where skin, eyes and fine detail are made, and 12% on "
+                                        "each of the other five (about 17% each without it). With timestep sampling "
+                                        "reference")
                                 clean_hint = hint("")
 
                                 def clean_hint_update(_=None):
