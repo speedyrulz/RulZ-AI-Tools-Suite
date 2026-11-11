@@ -28,6 +28,8 @@ A simple diffusion-model LoRA trainer with a WebUI. Supported models:
 - **MiniMax-H3-Image** (33B, MiniMax): experimental text-to-image LoRAs for MiniMax's own 6-step, guidance-free image
   model (4 to 20 MP), with ostris' MiniMax-H3-Image training adapter; two 16 GB cards or one with block swap
   ([details](#minimax-h3-image)).
+- **PAN 2** (29B video model, IFM): experimental LoRAs trained on still images as one-frame videos, for use in PAN 2
+  video generation; the LoRA loads in a ComfyUI build with PAN 2 support ([details](#pan-2)).
 
 | Dark | Light |
 | --- | --- |
@@ -3390,6 +3392,99 @@ diffusion models, both VAE layouts, the heads file, the first and last shard of 
 decoder and its tiling, the sampler, the training sigmas and the head each one uses, the released training adapter's
 header against the port, and detection, downloads, caches and the wizard.
 
+## PAN 2
+
+RulzTrainer trains **LoRAs for [IFM/PAN2](https://huggingface.co/IFM/PAN2)**, IFM's 29B video model (44 joint
+blocks, 4096 wide; Qwen3.5-9B text encoder; the Wan 2.2 VAE, 16x with 48 channels), **on still images**. Each image is
+a one-frame video, which is how IFM's own trainer mixes images into video training
+([docs/data.md](https://github.com/ifm-ai/PAN2/blob/main/docs/data.md): images are encoded as one-frame videos and
+always train as text-to-video). Pick the **PAN-2** preset. Experimental.
+
+**What it is for.** A character, object or style LoRA you then use for video in ComfyUI. Training on video clips is
+not supported: the trainer has no video data path.
+
+**Status.** Checked without a GPU: the port gives the same numbers, bit for bit, as the PAN 2 model code in the
+ComfyUI build below on the same random weights; the prompt tokens equal ComfyUI's for the same text; the released
+VAE gives ComfyUI's latents for the same picture and a 49 dB round trip; every tensor of the converted files has its
+place in the port. **Not yet run on the real transformer**: no sample and no training step. The first run is the
+test. A wrong picture at step 0 would mean a port bug, not a training problem.
+
+**Getting the model.** Two ways:
+
+- **Hugging Face source** (`model_source: hf`, `model_path: IFM/PAN2`): downloads the diffusers folder, about 81 GB
+  (transformer 63, text encoder 15, VAE 2.7), and quantizes the transformer on load in `transformer_quant`
+  (shard by shard, so the 58 GB of bf16 weights are never in memory at once).
+- **Single files** (`model_source: files`): nobody publishes single files of PAN 2, so there is nothing to
+  download. Make them once with [`scripts/pan2/convert_pan2.py`](scripts/pan2/README.md) (CPU only) and set all
+  three:
+
+  | File | Size | |
+  | --- | --- | --- |
+  | `PAN2_int8_convrot.safetensors` | 39.8 GiB | int8 ConvRot, the fp32 norm layers kept |
+  | `PAN2_int8_convrot_full.safetensors` | 27.4 GiB | int8 ConvRot, those layers quantized too |
+  | `PAN2_nvfp4.safetensors` | 15.5 GiB | NVFP4 (4-bit) |
+  | `PAN2_qwen3_5_int8_convrot.safetensors` / `PAN2_qwen3_5_nvfp4.safetensors` | 8.4 / 4.6 GiB | text encoder |
+  | `PAN2_vae_fp16.safetensors` | 1.3 GiB | VAE |
+
+  These are the files the ComfyUI build with PAN 2 support loads, so one set serves both. With
+  `transformer_quant: auto` a file keeps the format it has.
+
+```yaml
+model_path: IFM/PAN2
+model_source: files
+transformer_file: /models/diffusion_models/PAN2_int8_convrot_full.safetensors
+text_encoder_file: /models/text_encoders/PAN2_qwen3_5_int8_convrot.safetensors
+vae_file: /models/vae/PAN2_vae_fp16.safetensors
+timestep_sampling: reference
+```
+
+**Memory.** The frozen transformer is 29.4 GB in int8 and 16.6 GB in nvfp4, plus the activations of a step. It has
+not been measured here: expect one 48 GB card for int8, and nvfp4 with block swap or a two-card model split on
+smaller cards. A token is a 2x2 patch (32 x 32 px), so a 1 MP image is 1024 image tokens.
+
+**How it trains.**
+
+- **Timesteps.** `timestep_sampling: reference` is IFM's fine-tuning recipe
+  ([config/sft_29B_720p.yaml](https://github.com/ifm-ai/PAN2/blob/main/config/sft_29B_720p.yaml)): a uniform draw
+  through the fixed shift 9, so half the steps train above sigma 0.9. That recipe is made for 720p video; whether a
+  lower shift suits single 1 MP images better is not tested.
+- **Loss.** The velocity `noise - x0`, as the reference; the 49 condition and mask channels of the model's input are
+  zero for a still (text-to-video).
+- **Captions.** The caption goes to the model verbatim. PAN 2 was trained on structured JSON captions (its "world
+  state" format: `video_style`, `lighting`, `subjects_lifecycle`, `events`, ...); plain captions are accepted, and
+  how well a LoRA trained on them carries over to structured video prompts is not tested. With a structured caption
+  the trigger word goes in front of the first subject's `display_name`, so the caption stays valid JSON; a plain
+  caption gets it in front. Up to 1536 tokens are used. Caption dropout trains on the empty prompt, as IFM's
+  `cfg_drop_prob` does (they use 0.05).
+- **LoRA targets.** The six usual groups, each on the video stream and on the text stream of a joint block
+  (`to_q` with `add_q_proj`, `ff` with `ff_context`, ...). In the last block the text stream's query, attention
+  output and feed-forward layers reach no output, so they are left out. **Token refiner** adds the 4 text-refiner
+  blocks.
+- **fp32 islands.** The checkpoint keeps the time embedder, every block's norm projection (`norm1.linear`) and text
+  modulation table, and the output norm in fp32, and the reference runs them so. They stay fp32 unless a file has
+  them quantized (`PAN2_int8_convrot_full`, `PAN2_nvfp4`); quantizing on load covers the block norm projections too
+  (12 GB of fp32 otherwise).
+
+**Samples and probes.** Single-frame videos at the released settings: 50 steps at CFG 2.5 on shift 9 with the
+model's structured negative prompt (`sample_negative` replaces it). There is no turbo LoRA and no training adapter
+for PAN 2. PAN 2 saw images in pretraining but was finished on video alone, so a still shows what the LoRA learned
+rather than the model at its best.
+
+**In ComfyUI.** The LoRA uses the generic key format under the checkpoint's own layer names:
+
+```
+diffusion_model.transformer_blocks.<n>.attn.<to_q|to_k|to_v|to_out.0|add_q_proj|add_k_proj|add_v_proj|to_add_out>.lora_down.weight
+diffusion_model.transformer_blocks.<n>.<ff|ff_context>.net.<0.proj|2>.lora_up.weight
+diffusion_model.transformer_blocks.<n>.(...).alpha
+```
+
+It needs a ComfyUI build with PAN 2 support, such as <https://github.com/speedyrulz/ComfyUI>: stock ComfyUI does
+not know the model. Add a standard **Load LoRA** node (model only) after *Load Diffusion Model*. Not yet tried with a
+trained file.
+
+**Licence.** IFM releases the code under Apache-2.0; check the model page for the terms of the weights before
+sharing a LoRA or converted files.
+
 ## Using the LoRA in ComfyUI
 
 Recent ComfyUI builds support MOSS-Image natively (`comfy/ldm/moss_image`, CLIP type `moss_image`), so no
@@ -3603,6 +3698,7 @@ rulztrainer/
   archs.py         the model families (MOSS-Image, FIBO 2.0, Krea 2) behind one interface
   fibo/            Bria FIBO 2.0: DiT port, loading, VGL prompts, sampler
   krea2/           Krea 2: DiT port, loading (Qwen-Image VAE, Qwen3-VL layer stack), sampler
+  pan2/            PAN 2: the video model for one-frame targets, loading (Wan 2.2 VAE, Qwen3.5-9B), sampler
 webui.py           NiceGUI web UI (runs training as a subprocess)
 configs/           example configs
 tests/             smoke tests (no weights needed): python -m pytest tests
@@ -3611,6 +3707,7 @@ install.bat / run_webui.bat   Windows install and start;  install.sh / run_webui
 scripts/vast/      vast.ai: provision.sh (PROVISIONING_SCRIPT), supervisor wrapper + conf, create_template.sh,
                    rulz_remote.py (reach an instance's runs from your computer) and its instance side rulz_agent.py
 scripts/bench.py   short timing runs that wait for idle GPUs (s/step, warm-up, peak memory)
+scripts/pan2/      convert_pan2.py: IFM/PAN2 into single files for ComfyUI and this trainer; verify_pan2.py checks one
 Dockerfile         optional vast.ai image with the install baked in
 ```
 
