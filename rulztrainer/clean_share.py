@@ -11,7 +11,9 @@ clean_share takes Fizgig's notation, percentages and 1-based epochs of the run's
   "75:5:40"         75% for the first 5 epochs, then 40%
   "60:7:30:15"      60% until epoch 7, then down in a straight line to 30% by epoch 15, 30% after
   "60:7:30:8:3"     60% until epoch 7, 30% at epoch 8, then the higher share (60%) with every 3rd epoch at the lower
-                    one (30%), at half the learning rate (Fizgig's MOSS default since 28 Oct 2026, Slide)
+                    one (30%), at half the learning rate (Fizgig's MOSS default from 28 Oct to 8 Nov 2026, Slide)
+  "11:7:40:8:3"     11% until epoch 7, 40% at epoch 8, then 40% with every 3rd epoch at 11%, at half the learning
+                    rate (Fizgig's MOSS default since 10 Nov 2026, for Muon)
 
 With a fifth number R, every epoch after the slide trains at the higher of the two shares and every Rth one at the
 lower, whichever share comes first, at half the learning rate: those epochs reset structure, but at the full rate
@@ -23,15 +25,25 @@ the model knows hold).
 Fizgig measured Slide on MOSS-Image, against MOSS's own ~11% curve: the first Slide (60:7:30:15:2, back to 60% every
 2nd epoch) led from epoch 12 on its hardest dataset and held 71% likeness at epoch 60; 60:7:30:8:3 then held
 likeness about 5 points over 60:7:30:15:2 from epoch 9 to 20 on a 53-photo dataset. A sudden drop (75 to 40) dipped
-likeness two epochs later. Unmeasured here, and RulzTrainer's default already sits at 50%: race it against "" (off)
-on your own data."""
+likeness two epochs later.
+
+Fizgig's default moved twice once its MOSS presets trained on Muon, which it says trains differently enough from AdamW
+that the old order was no longer the best: on 8 November 2026 to the reverse, 30:7:60:8:3 (composition first, then
+likeness), and on 10 November to 11:7:40:8:3 (SLIDE_MUON), which starts at about the model's own share. Fizgig reports
+that starting at 11 stopped the hair darkening late in a run and gave higher late likeness, and that it was tuned
+together with its Element boost (the face and hair counting 9x early in the run), which RulzTrainer does not have. It
+still offers 60:7:30:8:3 as "slower to train but known to work well".
+
+Unmeasured here but for one Krea 2 run of 60:7:30:8:3 (it tied the plain run), and RulzTrainer's default already sits
+at 50%: race a schedule against "" (off) on your own data."""
 from __future__ import annotations
 
 import math
 
 import torch
 
-SLIDE = "60:7:30:8:3"  # Fizgig's MOSS-Image LoRA default
+SLIDE = "60:7:30:8:3"  # Fizgig's MOSS-Image LoRA default until 8 November 2026 (measured on AdamW)
+SLIDE_MUON = "11:7:40:8:3"  # its default since 10 November 2026, for Muon
 FT_SLIDE = "11:4:30:8:2"  # its full fine-tune default (in rotations)
 HALF_LR = 0.5  # the learning rate of the lower-share epochs after the slide
 CLEAN_SIGMA = 0.5
