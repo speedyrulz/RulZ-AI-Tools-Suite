@@ -3424,7 +3424,11 @@ from diffusers' `minimax_h3_image` modular pipeline, ComfyUI's `MiniMaxH3ImageMo
   at the model's real quality. The VAE also keeps less of a small picture: on three 768 x 1152 portraits of a
   generated character, encoding and decoding gave 28.8 to 36.6 dB (mean 32.5) at their own size, with fine facial
   detail visibly redrawn, and 35.6 to 40.4 dB (mean 38.0) when the same photos were encoded at twice the size and
-  scaled back. Whether training above 1 MP gives a better LoRA has not been measured.
+  scaled back. Whether training above 1 MP gives a better LoRA has not been measured, but a LoRA trained at 1 MP
+  holds up at the model's own sizes (11 November 2026: the two 1000-step LoRAs of the race below, rendered at 1, 2
+  and 4 MP with the probe prompts and seeds, each size scored against the base model at that size): same person
+  at every size, sharper skin and eyes at 4 MP, combined likeness 34-35 at 1 MP, 33 at 2 MP and 37-40 at 4 MP. A
+  6-step render took 1.6 s at 1 MP, 2.7-3.1 s at 2 MP and 6-6.7 s at 4 MP on one RTX 5090 (int8, 22 GB).
 - **Run on the real weights** (11 November 2026, one RTX 5090, int8 transformer, nvfp4 text encoder, ostris'
   adapter, rank 16, 1 MP, `timestep_sampling: reference`): the step-0 samples and probes at 6 steps are clean,
   photographic and follow their prompts, so the port, the per-step heads, the text encoder and the VAE work. A LoRA
