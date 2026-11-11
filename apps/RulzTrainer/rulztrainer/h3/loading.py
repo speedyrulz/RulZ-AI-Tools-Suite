@@ -160,6 +160,8 @@ def build_transformer(reader, device, quant: str = "auto", dtype=torch.bfloat16,
     for k, v in reader(lambda key: True):
         if prune and k.endswith(".adaln_proj.linear.weight"):
             v = prune_weight(v, projection, work)
+        elif prune and k.endswith(".adaln_proj.linear.bias"):
+            v = v.float()  # with its fp32 pruned weight (a bf16 source's bias would otherwise install in bf16)
         elif (stream_fmt and hsf.QUANT_FILTER(k) and k.endswith(".weight") and isinstance(v, torch.Tensor)
               and v.dtype != torch.float32 and Q.can_quantize(v, stream_fmt)):
             on = v.to(work) if work is not None else v
