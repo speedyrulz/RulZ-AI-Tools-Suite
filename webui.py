@@ -96,7 +96,8 @@ SAMPLE_LORA_MODES = {"auto": "The model's sampling LoRA (downloaded; MOSS-Image 
                      "file": "A LoRA file"}
 ADAPTER_MODES = {"auto":"The model's training adapter (downloaded; Qwen-Image 2.1)", "none": "None",
                  "file": "A LoRA file"}
-ADAPTER_MODES["auto"] = "The model's training adapter (downloaded; Qwen-Image 2.1, MiniMax H3, P-H3-Image)"
+ADAPTER_MODES["auto"] = ("The model's training adapter (downloaded; Qwen-Image 2.1, MiniMax H3, P-H3-Image, "
+                         "MiniMax-H3-Image)")
 # MiniMax H3's Comfy-Org formats (h3/loading.py: the pruned files drop the ~13B AdaLN parameters)
 FILE_QUANT_LABELS.update({"pruned_int8_convrot": "pruned int8 ConvRot (21.0 GB, for 16 GB cards)",
                           "pruned_bf16": "pruned bf16 (40.2 GB)", "nvfp4_awq": "NVFP4 AWQ (15.7 GB)"})
@@ -4450,8 +4451,8 @@ MODEL_NOTES = {
                                          "Trains on Comfy-Org's files (int8 21.0 GB, the same size as H3's: two 16 GB "
                                          "cards in model split, or one with block swap) with H3's Qwen3-VL-32B text "
                                          "encoder (27.1 GB int8, 15.7 GB NVFP4; an H3 download is reused) and a small "
-                                         "image VAE (1.2 GB). No training adapter exists for it yet, so it trains on "
-                                         "the distilled model as it is. Text-to-image only here (no edit training). "
+                                         "image VAE (1.2 GB), with ostris' MiniMax-H3-Image training adapter on by "
+                                         "default. Text-to-image only here (no edit training). "
                                          "MiniMax-H3-Image Community License: it excludes the USA, EU, UK and South "
                                          "Korea unless MiniMax authorizes it (platform.minimax.io/license), which "
                                          "is also required above 1 million USD of annual revenue or to offer it as "
@@ -4756,8 +4757,8 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
 def h3image_recommendations(cfg: TrainConfig, r: dict, goal: str | None, gpus: list[dict], vram: float | None,
                             character: bool) -> None:
     """MiniMax-H3-Image: H3's recipe and memory plan (the same pruned 21 GB transformer and the same text encoder),
-    with its own files, no training adapter (none exists yet) and its 6-step sampling. Estimates, not measurements:
-    nothing has been trained on it here."""
+    with its own files, adapter and 6-step sampling (ai-toolkit's MiniMax-H3-Image defaults). Estimates, not
+    measurements: nothing has been trained on it here."""
     h3_recommendations(cfg, r, goal, gpus, vram, character)
     if cfg.model_source == "files":
         r["model_file_quant"] = ("int8_convrot", "Comfy-Org's pruned int8 file (21.0 GB): the attention and "
@@ -4766,12 +4767,12 @@ def h3image_recommendations(cfg: TrainConfig, r: dict, goal: str | None, gpus: l
                                                  "lower precision)")
     r["resolutions"] = ([1.0], "1 MP: 1024 image tokens a step (a token covers 32 x 32 px). The model itself renders "
                                "at 4 MP and up, 4096 tokens a step: train higher if your photos are that large")
-    r["timestep_sampling"] = ("reference", "a position drawn evenly along the model's own 6-step noise schedule, so "
-                                           "each of its 6 output heads gets an equal share of the steps (this "
-                                           "trainer's choice: MiniMax has not published how it was trained)")
+    r["timestep_sampling"] = ("reference", "only the 6 noise levels the model samples at, picked evenly, each "
+                                           "through its own output head, as ai-toolkit trains MiniMax-H3-Image (the "
+                                           "other choices train at noise levels its sampling never uses)")
     if not cfg.finetune:
-        r["adapter_mode"] = ("none", "no training adapter exists for MiniMax-H3-Image yet. It is step- and "
-                                     "guidance-distilled, so a LoRA trained on it bare may drift: watch the samples")
+        r["adapter_mode"] = ("auto", "ostris' MiniMax-H3-Image training adapter (what ai-toolkit trains it with): the "
+                                     "model is step- and guidance-distilled, and a LoRA trained on it bare may drift")
     r["sample_steps"] = (6, "MiniMax-H3-Image's own 6-step schedule (one output head per step)")
     r["sample_cfg"] = (1.0, "MiniMax-H3-Image is guidance-distilled: no CFG")
     if character:
@@ -6039,8 +6040,8 @@ class Wizard:
                           "A small LoRA that stays on while your LoRA trains and off for samples and probes, and is "
                           "never saved into it. Fizgig measured on Qwen-Image 2.1: without one, LoRAs collapse into "
                           "texture or wobble part-way; with it likeness reached 77 against 56. MiniMax H3's is "
-                          "circlestone-labs' image training adapter, P-H3-Image's ostris' (the one ai-toolkit uses). "
-                          "MiniMax-H3-Image has none yet: pick a file once one is published.",
+                          "circlestone-labs' image training adapter; P-H3-Image's and MiniMax-H3-Image's are ostris' "
+                          "(the ones ai-toolkit uses).",
                           show_if=is_qwen, adv=True):
             self.bind(ui.select(ADAPTER_MODES, label="Training adapter"), "adapter_mode").classes("w-full")
         hw = ui.column().classes("w-full gap-3 pt-2")
@@ -8715,9 +8716,9 @@ def build_page(local: bool = True):
                                          "2.1's is Fizgig's (downloaded, 80 MB): without one its LoRAs collapse "
                                          "into texture or wobble part-way (likeness 77 with it, 56 without). "
                                          "MiniMax H3's is circlestone-labs' image training adapter (0.62 GB), "
-                                         "P-H3-Image's ostris' P-H3-Image adapter (0.16 GB). The "
-                                         "other models have none of their own (MiniMax-H3-Image: none exists "
-                                         "yet); a file works on any.")
+                                         "P-H3-Image's and MiniMax-H3-Image's are ostris' adapters for them "
+                                         "(0.16 GB each). The other models have none of their own; a file "
+                                         "works on any.")
                             path_input(f, "training_adapter", "Training adapter file", "file", "", "w-[30rem]")
                             f.w["training_adapter"].parent_slot.parent.bind_visibility_from(w["adapter_mode"], "value",
                                                                                             lambda x: x == "file")
@@ -12189,10 +12190,12 @@ download that takes the same memory as int8), and the image VAE (1.2 GB). The te
 Qwen3-VL-32B file (int8 27.1 GB or NVFP4 15.7 GB), so a copy downloaded for H3 is used again. Memory is as for
 MiniMax H3: two 16 GB cards in **model split**, or one with **block swap**.
 
-The model has one output head for each of its 6 sampling steps. Training sends every step through the head whose
-part of the noise schedule it falls in, and *reference* timesteps (the wizard's suggestion) give each head an equal
-share. It is step- and guidance-distilled and **no training adapter exists for it yet**, so it trains on the distilled
-model as it is: watch the samples for drift, and switch an adapter on (Training adapter: a file) once one is published.
+The model has one output head for each of its 6 sampling steps, each made for the one noise level of its step.
+*Reference* timesteps (the wizard's suggestion) train on exactly those 6 noise levels, picked evenly, each through
+its own head, as ai-toolkit trains the model; timestep shift, the sigma range and clean share do not move them. The
+other timestep choices train at noise levels in between, which sampling never uses. The model is step- and
+guidance-distilled, so the **training adapter** is on by default: ostris' MiniMax-H3-Image adapter (0.16 GB,
+downloaded), the one ai-toolkit trains it with. It is on while the LoRA trains and off for samples and probes.
 
 Samples render its own 6 steps at CFG 1. MiniMax's pipeline renders anything under 4 MP on a 4 MP canvas and scales
 it down; here a preview renders at the size you set, so set the sample resolution to 4 MP to judge the LoRA at the
