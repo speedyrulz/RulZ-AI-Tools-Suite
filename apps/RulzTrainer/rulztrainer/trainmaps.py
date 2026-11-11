@@ -482,22 +482,73 @@ def level_map(capture: dict, probe_id: str, kind: str, sigma: str = "all", word:
     return np.mean(found, axis=0)
 
 
-def series(data: dict, probe_id: str, kind: str, sigma: str = "all", word: str = "") -> list:
-    """Every capture's map for one view, [numpy or None] in capture order. "learned" is the first loss map minus
-    each capture's (positive = improved)."""
+# How "Learned since the start" is measured (after Fizgig's viewer, 10 November 2026). The amount is the loss removed:
+# the part that learned most sets the scale, so a part with little to learn (a plain background) stays pale even when
+# it is nearly done. The share is the loss removed over the cell's own starting loss: how far along each part is,
+# whatever it started at. "fixed" is the share on one scale for every run, so two runs' maps compare by eye.
+LEARNED_AS = {"amount": "Amount", "share": "Share of its own start", "fixed": "Share, same scale for every run"}
+FIXED_SHARE_TOP = 0.5  # the fixed scale's full colour: half of a cell's starting loss gone (or come back)
+SHARE_FLOOR_PCT = 10  # a nearly clean cell's start is floored at this percentile of the picture's, or its share
+#                       would be noise over almost nothing
+ATTN_FLOOR_PCT = 2  # the trigger map counts from its quietest share up: this percentile, the lowest of any capture
+
+
+def _learned_share(data: dict, probe_id: str, sigma: str) -> list:
+    """Every capture's share of the starting loss removed, per cell: taken per noise level against that level's own
+    start (a level's loss has its own size), then the plain mean of the levels."""
+    import numpy as np
+
     caps = data.get("captures") or []
+    levels = [sigma]
+    if sigma == "all":
+        levels = sorted({lv for c in caps for lv in ((c.get("maps") or {}).get(probe_id) or {})})
+    per_level = []
+    for lv in levels:
+        losses = [level_map(c, probe_id, "loss", lv) for c in caps]
+        first = next((a for a in losses if a is not None), None)
+        if first is None:
+            continue
+        floor = max(float(np.percentile(first, SHARE_FLOOR_PCT)), 1e-8)
+        start = np.maximum(first, floor)
+        per_level.append([None if a is None or a.shape != first.shape else (first - a) / start for a in losses])
+    out = []
+    for i in range(len(caps)):
+        found = [lv[i] for lv in per_level if lv[i] is not None]
+        ok = bool(found) and all(a.shape == found[0].shape for a in found)
+        out.append(np.mean(found, axis=0) if ok else None)
+    return out
+
+
+def series(data: dict, probe_id: str, kind: str, sigma: str = "all", word: str = "",
+           learned_as: str = "amount") -> list:
+    """Every capture's map for one view, [numpy or None] in capture order. "learned" is the first loss map minus
+    each capture's (positive = improved), or with learned_as "share" / "fixed" that as a share of each cell's own
+    start. "attn" counts from the series' quietest share up (ATTN_FLOOR_PCT): some models spread a new word's
+    attention almost evenly, more so with long captions, and counted from zero the whole picture is one colour."""
+    import numpy as np
+
+    caps = data.get("captures") or []
+    if kind == "attn":
+        maps = [level_map(c, probe_id, kind, sigma, word) for c in caps]
+        lows = [float(np.percentile(a, ATTN_FLOOR_PCT)) for a in maps if a is not None]
+        low = min(lows) if lows else 0.0
+        return [None if a is None else np.maximum(a - low, 0.0) for a in maps]
     if kind != "learned":
         return [level_map(c, probe_id, kind, sigma, word) for c in caps]
+    if learned_as in ("share", "fixed"):
+        return _learned_share(data, probe_id, sigma)
     losses = [level_map(c, probe_id, "loss", sigma) for c in caps]
     first = next((a for a in losses if a is not None), None)
     return [None if a is None or first is None or a.shape != first.shape else first - a for a in losses]
 
 
-def scale(maps: list, kind: str) -> float:
+def scale(maps: list, kind: str, learned_as: str = "amount") -> float:
     """One colour scale for a whole series (so captures compare): the 99th percentile of every value (of the absolute
-    value for "learned"), never 0."""
+    value for "learned"), never 0. learned_as "fixed": FIXED_SHARE_TOP, whatever the series holds."""
     import numpy as np
 
+    if kind == "learned" and learned_as == "fixed":
+        return FIXED_SHARE_TOP
     vals = [np.abs(a).ravel() if kind == "learned" else a.ravel() for a in maps if a is not None]
     if not vals:
         return 1.0

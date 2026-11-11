@@ -1634,6 +1634,7 @@ class Form:
             loss_watch=bool(v("loss_watch")), per_image_lr=bool(v("per_image_lr")),
             loss_watch_buckets=int(v("loss_watch_buckets")), loss_watch_beta=float(v("loss_watch_beta")),
             loss_watch_high=float(v("loss_watch_high")), loss_watch_low=float(v("loss_watch_low")),
+            loss_watch_fence=float(v("loss_watch_fence") or 0),
             loss_watch_improve_tol=float(v("loss_watch_improve_tol")),
             loss_watch_healthy_mult=float(v("loss_watch_healthy_mult")),
             loss_watch_exclude_after=int(v("loss_watch_exclude_after")),
@@ -2280,7 +2281,8 @@ def theme_colors() -> None:
               positive="#22C55E", negative="#FF453A", info="#3F3F46", warning="#F59E0B")
 
 
-CLEAN_SLIDE = "60:7:30:8:3"  # Fizgig's MOSS-Image Slide (rulztrainer.clean_share.SLIDE)
+CLEAN_SLIDE = "60:7:30:8:3"  # Fizgig's MOSS-Image Slide until 8 November 2026 (rulztrainer.clean_share.SLIDE)
+CLEAN_SLIDE_MUON = "11:7:40:8:3"  # its Slide since 10 November 2026, for Muon (rulztrainer.clean_share.SLIDE_MUON)
 CLEAN_SLIDE_FT = "11:4:30:8:2"  # its full fine-tune default, in rotations (rulztrainer.clean_share.FT_SLIDE)
 
 
@@ -3974,7 +3976,14 @@ MAP_HINTS = {
                   "changes the prediction. Little here means the LoRA is tied to its trigger; as much as with the "
                   "trigger means it acts whatever the caption says (it has bled into the model's idea of a person).",
     "attn": "How much attention each area gives the trigger word. It should sit on the subject; on a logo, watermark "
-            "or object means the trigger is tied to that.",
+            "or object means the trigger is tied to that. The colours count from the quietest area up, so they show "
+            "where the word gets more attention than elsewhere, not how much it gets in all.",
+}
+LEARNED_AS_HINTS = {
+    "share": " Shown as a share of each part's own starting error: how far along each part is, whatever it started "
+             "at. A part with little to learn (a plain wall, a plain sweater) shows here; by amount it stays pale.",
+    "fixed": " Shown as a share of each part's own starting error on one scale for every run: full colour is half of "
+             "the starting error gone (or come back). Two runs' maps compare by eye.",
 }
 
 
@@ -4026,6 +4035,8 @@ def build_maps_tab(f: Form):
             kind = ui.select({k: v for k, v in TM.MAP_KINDS.items()}, value="learned", label="Map").classes("w-64")
             level = ui.select({"all": "All levels", **{f"{s:g}": TM.sigma_label(f"{s:g}") for s in TM.SIGMAS}},
                               value="all", label="Noise").classes("w-52")
+            learned_as = ui.select(dict(TM.LEARNED_AS), value="amount", label="Learned, measured as").classes("w-72")
+            learned_as.bind_visibility_from(kind, "value", backward=lambda v: v == "learned")
         with fields():
             play = ui.button(icon="play_arrow").props("flat dense round").tooltip("Play through the captures")
             at = ui.slider(min=0, max=0, step=1, value=0).classes("w-80 max-w-full")
@@ -4065,9 +4076,10 @@ def build_maps_tab(f: Form):
         k, word = (kind.value or "learned"), ""
         if k.startswith("attn:"):
             k, word = "attn", k[5:]
-        state["series"] = TM.series(data, pick.value, k, level.value or "all", word)
-        state["top"] = TM.scale(state["series"], k)
-        state["view"] = k
+        how = (learned_as.value or "amount") if k == "learned" else "amount"
+        state["series"] = TM.series(data, pick.value, k, level.value or "all", word, how)
+        state["top"] = TM.scale(state["series"], k, how)
+        state["view"], state["how"] = k, how
 
     def draw():
         data, caps = state["data"], (state["data"] or {}).get("captures") or []
@@ -4090,7 +4102,7 @@ def build_maps_tab(f: Form):
             info.text = f"{probe['image']} is missing from {data['dir']}"
             return
         a = state["series"][i] if i < len(state["series"]) else None
-        meaning.text = MAP_HINTS.get(state["view"] or "", "")
+        meaning.text = MAP_HINTS.get(state["view"] or "", "") + LEARNED_AS_HINTS.get(state.get("how") or "", "")
         if a is None and state["view"] == "attn":
             meaning.text = "No trigger-word map for this picture: its caption doesn't name the trigger."
         elif a is None and state["view"] == "effect" and i == 0:
@@ -4154,7 +4166,7 @@ def build_maps_tab(f: Form):
         play.props(f"icon={'pause' if timer_play.active else 'play_arrow'}")
 
     play.on_click(toggle_play)
-    for wd in (pick, kind, level):
+    for wd in (pick, kind, level, learned_as):
         wd.on_value_change(lambda _: (rebuild(), draw()))
     for wd in (at, smooth, colour, opacity):
         wd.on_value_change(lambda _: draw())
@@ -5388,13 +5400,16 @@ EXPERIMENTS = [
      "cost": "None per step. Needs MediaPipe for the parts maps. Not together with the region-weighted loss, so not "
              "with the identity recipe as it is, and not with Hull's region gains."},
     {"key": "clean_share", "group": "How noise levels are trained", "title": "Clean-end share", "off": "",
-     "control": "text", "hint": "empty = off; Fizgig's best: 60:7:30:8:3", "evidence": "mixed",
+     "control": "text", "hint": "empty = off; Fizgig's: 60:7:30:8:3, or 11:7:40:8:3 with Muon", "evidence": "mixed",
      "short": "More steps at the clean end, where faces and fine detail settle.",
      "what": "Sets, by epoch, how many of the steps land at the clean, low-noise end of training, where faces and "
-             "fine detail are refined. Empty = off; Fizgig's best schedule is 60:7:30:8:3.",
+             "fine detail are refined. Empty = off. Fizgig's schedule was 60:7:30:8:3; since its presets train on "
+             "Muon it is 11:7:40:8:3 (the Slide Muon button).",
      "tested": "Fizgig, on MOSS-Image: 60:7:30:8:3 was the best of eight schedules, still at 71% likeness at epoch "
-               "60 and about 5 points over 60:7:30:15:2. On Krea 2 here it tied plain: 31.2 combined, one seed of "
-               "one small set.",
+               "60 and about 5 points over 60:7:30:15:2. With Muon it now uses 11:7:40:8:3, which it says stopped "
+               "hair darkening late in a run; that one was tuned with a face boost RulzTrainer does not have, and "
+               "is not measured here. On Krea 2 here 60:7:30:8:3 tied plain: 31.2 combined, one seed of one small "
+               "set.",
      "cost": "None beyond the choice."},
     {"key": "timestep_buckets", "group": "How noise levels are trained", "title": "Even noise coverage", "off": 0,
      "control": "number", "precision": 0, "hint": "0 = off; 10-20 is the usual start", "evidence": "worse",
@@ -9083,7 +9098,15 @@ def build_page(local: bool = True):
                                         "every 3rd epoch at 30%, at half the learning rate. A full fine-tune counts "
                                         "rotations instead of epochs (Slide FT: 11:4:30:8:2).")
                                 ui.button("Slide", on_click=lambda: w["clean_share"].set_value(CLEAN_SLIDE)) \
-                                    .props("flat dense").tooltip("Fizgig's MOSS-Image LoRA default, 60:7:30:8:3")
+                                    .props("flat dense").tooltip("Fizgig's MOSS-Image LoRA default until 8 November "
+                                                                 "2026, 60:7:30:8:3 (measured on AdamW)")
+                                ui.button("Slide Muon",
+                                          on_click=lambda: w["clean_share"].set_value(CLEAN_SLIDE_MUON)) \
+                                    .props("flat dense").tooltip(
+                                        "Fizgig's MOSS-Image LoRA default since 10 November 2026, 11:7:40:8:3: 11% "
+                                        "until epoch 7, 40% from epoch 8, every 3rd epoch at 11% at half the learning "
+                                        "rate. Tuned for Muon, together with a face boost RulzTrainer does not have; "
+                                        "not measured here")
                                 ui.button("Slide FT", on_click=lambda: w["clean_share"].set_value(CLEAN_SLIDE_FT)) \
                                     .props("flat dense").tooltip("Fizgig's MOSS-Image full fine-tune default, "
                                                                  "11:4:30:8:2 (rotations)")
@@ -9521,8 +9544,9 @@ def build_page(local: bool = True):
                                           "rule"):
                         hint("Tracks every image's loss normalised by its timestep bucket and, at each epoch boundary, "
                              "classes it as easy / healthy / suspect / stuck / exhausted. Per-image LR then throttles "
-                             "stuck images (x0.5, x0.25, x0.125), eases exhausted ones (x0.6) and can exclude images "
-                             "that stay stuck. A true per-image learning rate needs batch size 1 (otherwise per-sample "
+                             "stuck images (x0.5, then x0.25), eases exhausted ones (x0.6) and can exclude images "
+                             "that stay stuck. Stuck means an outlier of the dataset, not just one of its harder "
+                             "pictures. A true per-image learning rate needs batch size 1 (otherwise per-sample "
                              "loss weights). Not available with automagic3 or automagic4.")
                         with fields():
                             w["loss_watch"] = ui.switch("Loss watch (observe)", value=d.loss_watch)
@@ -9676,6 +9700,13 @@ def build_page(local: bool = True):
                                                                  max=0.99, step=0.05).classes("w-32")
                                 w["loss_watch_high"] = ui.number("Hard above median x", value=d.loss_watch_high,
                                                                  step=0.05).classes("w-44")
+                                w["loss_watch_fence"] = ui.number("Stuck above median + x IQR",
+                                                                  value=d.loss_watch_fence, min=0,
+                                                                  step=0.25).classes("w-52").tooltip(
+                                    "A hard picture that has stopped improving is only called stuck when it is "
+                                    "also an outlier: above the median by this many times the spread of the "
+                                    "middle half of the pictures. Late in a run few pictures still improve, so "
+                                    "without it every hard picture ends up throttled. 0 = off.")
                                 w["loss_watch_low"] = ui.number("Easy below median x", value=d.loss_watch_low,
                                                                 step=0.05).classes("w-44")
                                 w["loss_watch_improve_tol"] = ui.number("Improving = drop >",
@@ -11807,7 +11838,9 @@ training and about once an epoch at three fixed noise levels with fixed noise, s
 captures. The **Training maps** tab draws them over each picture: *Learned since the start* (green better, magenta
 worse; read it first), *Not learned yet* (red misses most), *Where the LoRA acts* (should sit on the subject; on a
 recurring background or prop the LoRA learns that too) and *Trigger word* (should sit on the subject, not on a logo,
-watermark or object). They only observe, a few seconds per capture; not in a configuration race.
+watermark or object; coloured from the quietest area up). *Learned, measured as* shows the first map as the amount
+of error gone, or as a share of each part's own starting error (how far along each part is, whatever it started at),
+or as that share on one scale for every run (full colour = half gone), to compare two runs. They only observe, a few seconds per capture; not in a configuration race.
 
 ## Previous runs (run history)
 
