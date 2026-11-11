@@ -71,6 +71,10 @@ N_BLOCKS["p_h3_image"] = 50  # P-H3-Image: H3's transformer
 N_BLOCKS["minimax_h3_image"] = 50  # MiniMax-H3-Image: H3's transformer without the audio stream
 EXTRA_TARGETS["token_refiner"] = (("minimax_h3", "p_h3_image", "minimax_h3_image"),
                                   EXTRA_TARGETS["token_refiner"][1])
+N_BLOCKS["pan2"] = 44  # PAN 2: 44 joint blocks; its 4 text-refiner blocks are a LoRA target of their own
+EXTRA_TARGETS["token_refiner"] = (EXTRA_TARGETS["token_refiner"][0] + ("pan2",),
+                                  "the token-refiner blocks over the text (MiniMax H3: 2, which musubi-tuner leaves "
+                                  "out and the training adapters train; PAN 2: 4)")
 COMPILE_CHOICES = {"auto": "auto: runs of 100+ steps", True: "on", False: "off"}
 N_BLOCKS_MAX = max(N_BLOCKS.values())
 
@@ -4373,6 +4377,9 @@ MODEL_GB["p_h3_image"] = {"bf16": 40.5, "int8": 21.2, "nvfp4": 12.5}
 # MiniMax-H3-Image: the same pruned transformer less the audio projections (Comfy-Org/MiniMax-H3-Image: bf16 40.2 GB,
 # int8_convrot 21.0 GB; the 12.5 GB w4a8 file holds int8 weights once it is read)
 MODEL_GB["minimax_h3_image"] = {"bf16": 40.2, "int8": 21.0, "nvfp4": 12.5}
+# PAN 2: the diffusers folder's transformer is 67.6 GB (bf16 with fp32 norm projections); the converted files with
+# those layers quantized too are 29.4 GB (PAN2_int8_convrot_full) and 16.6 GB (PAN2_nvfp4)
+MODEL_GB["pan2"] = {"bf16": 67.6, "int8": 29.4, "nvfp4": 16.6}
 STEP_HEADROOM_GB = 4.5
 
 
@@ -9224,6 +9231,13 @@ def build_page(local: bool = True):
                              "ignored. The turbo LoRA was distilled on video, not checked on stills."
                              ).bind_visibility_from(w["model_preset"], "value",
                                                     lambda p: preset_arch(p, w["model_path"].value) == "minimax_h3")
+                        hint("PAN 2: samples are single-frame videos at the released settings, 50 steps at CFG 2.5 "
+                             "with the model's structured negative prompt; Shift is ignored (its own is 9) and there "
+                             "is no turbo LoRA. PAN 2 is a video model that was finished on video alone, so a still "
+                             "shows what the LoRA learned rather than the model at its best. Single files are not "
+                             "published: make them with scripts/pan2/convert_pan2.py and set all three."
+                             ).bind_visibility_from(w["model_preset"], "value",
+                                                    lambda p: preset_arch(p, w["model_path"].value) == "pan2")
                         hint("P-H3-Image: samples render on the plain model (the training adapter off) at its own "
                              "8-step grid, CFG 1; Shift is ignored. It is tuned for 4-8 MP images: 1 MP previews show "
                              "more artifacts in faces, hands and small details than the finished LoRA will at full "

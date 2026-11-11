@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -102,6 +103,8 @@ def family_named_in(text: str) -> str | None:
     if "minimax-h3-image" in hint or "minimax_h3_image" in hint:
         if "adapter" not in hint or "minimax_h3_image_training_adapter_v" in hint:
             return "minimax_h3_image"
+    if re.search(r"(^|[^a-z0-9])pan[-_ ]?2", hint):  # IFM/PAN2, PAN2_nvfp4.safetensors, pan2_int8.safetensors
+        return "pan2"
     for word, family in (("ideogram", "ideogram4"), ("minimax", "minimax_h3"), ("fibo", "fibo2"), ("krea", "krea2"),
                          ("moss", "moss_image")):
         if word in hint:
@@ -332,6 +335,18 @@ COMFY_TEXT_ENCODER_QUANTS["minimax_h3_image"] = COMFY_TEXT_ENCODER_QUANTS["minim
 COMFY_TEXT_ENCODER_REPOS["minimax_h3_image"] = {q: COMFY_REPOS["minimax_h3"]
                                                 for q in COMFY_TEXT_ENCODER_QUANTS["minimax_h3"]}
 COMFY_VAE_FILES["minimax_h3_image"] = "vae/minimax_h3_image_vae_fp16.safetensors"
+
+# PAN 2 (IFM, November 2026): the 29B video model, trained here on stills as one-frame videos (rulztrainer.pan2), the
+# way IFM's own trainer mixes images in. IFM/PAN2 is a diffusers folder of about 81 GB (transformer 63, Qwen3.5-9B
+# text encoder 15, Wan 2.2 VAE 2.7). Nobody publishes single files of it: scripts/pan2/convert_pan2.py makes them
+# (int8_convrot 39.8 GB with the fp32 norm layers kept or 27.4 GB without, nvfp4 15.5 GB; text encoder 8.4 / 4.6 GB;
+# VAE fp16 1.3 GB), so model_source "files" needs all three files set (COMFY_REPOS has no entry: nothing to fetch).
+# Sampling: the released 50 steps at CFG 2.5 on shift 9, with its structured negative prompt. No turbo LoRA and no
+# training adapter exist for it (the model is not distilled).
+MODEL_PRESETS["PAN-2"] = "IFM/PAN2"
+ARCH_NAMES += ("pan2",)
+ARCH_DEFAULT_TARGETS["pan2"] = _CORE_TARGETS
+ARCH_FULL_SAMPLE["pan2"] = (50, 2.5)
 
 
 # Named presets: values applied over a config (UI toggle, --preset on the CLI, or `preset:` in YAML).

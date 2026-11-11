@@ -28,6 +28,8 @@ A simple diffusion-model LoRA trainer with a WebUI. Supported models:
 - **MiniMax-H3-Image** (33B, MiniMax): experimental text-to-image LoRAs for MiniMax's own 6-step, guidance-free image
   model (4 to 20 MP), with ostris' MiniMax-H3-Image training adapter; two 16 GB cards or one with block swap
   ([details](#minimax-h3-image)).
+- **PAN 2** (29B video model, IFM): experimental LoRAs trained on still images as one-frame videos, for use in PAN 2
+  video generation; the LoRA loads in a ComfyUI build with PAN 2 support ([details](#pan-2)).
 
 | Dark | Light |
 | --- | --- |
@@ -3468,6 +3470,143 @@ diffusion models, both VAE layouts, the heads file, the first and last shard of 
 decoder and its tiling, the sampler, the training sigmas and the head each one uses, the released training adapter's
 header against the port, and detection, downloads, caches and the wizard.
 
+## PAN 2
+
+RulzTrainer trains **LoRAs for [IFM/PAN2](https://huggingface.co/IFM/PAN2)**, IFM's 29B video model (44 joint
+blocks, 4096 wide; Qwen3.5-9B text encoder; the Wan 2.2 VAE, 16x with 48 channels), **on still images**. Each image is
+a one-frame video, which is how IFM's own trainer mixes images into video training
+([docs/data.md](https://github.com/ifm-ai/PAN2/blob/main/docs/data.md): images are encoded as one-frame videos and
+always train as text-to-video). Pick the **PAN-2** preset. Experimental.
+
+**What it is for.** A character, object or style LoRA you then use for video in ComfyUI. Training on video clips is
+not supported: the trainer has no video data path.
+
+**Status.** Run on the released weights on one RTX 5090 (NVFP4, November 2026):
+
+- **Samples at step 0** are clean pictures that follow the prompt, from the diffusers folder and from the single
+  files alike.
+- **A 600-step run** (rank 16, lr 1e-4, `timestep_sampling: reference`, 0.59 MP, 62 pictures of one character with
+  captions that describe them) learned the character by about step 400 while the scenes still followed the
+  prompts; a prompt without the trigger word kept its subject. At step 600 the pictures show a fine grain.
+- **In ComfyUI** (the build below) that LoRA attached to all 524 layers and changed single frames and a 49-frame
+  clip.
+  In the clip the scene, the motion and the prompt held; the likeness was clearer in single frames than in the
+  480 x 704 clip.
+- **Block swap** and `model_source: files` both train, to the same loss as the folder on the GPU.
+
+Checked without a GPU before that: the port gives the same numbers, bit for bit, as the PAN 2 model code in that
+ComfyUI build on the same random weights; the prompt tokens equal ComfyUI's for the same text; the released VAE
+gives ComfyUI's latents for the same picture and a 49 dB round trip.
+
+Not run yet: int8 on the real weights (only NVFP4 ran), a two-card model split, likeness probes, longer runs and
+other learning rates. One short run is a working start, not a tuned recipe.
+
+**Getting the model.** Two ways:
+
+- **Hugging Face source** (`model_source: hf`, `model_path: IFM/PAN2`): downloads the diffusers folder, about 81 GB
+  (transformer 63, text encoder 15, VAE 2.7), and quantizes the transformer on load in `transformer_quant`
+  (shard by shard, so the 58 GB of bf16 weights are never in memory at once).
+- **Single files** (`model_source: files`): nobody publishes single files of PAN 2, so there is nothing to
+  download. Make them once with [`scripts/pan2/convert_pan2.py`](scripts/pan2/README.md) (CPU only) and set all
+  three:
+
+  | File | Size | |
+  | --- | --- | --- |
+  | `PAN2_int8_convrot.safetensors` | 39.8 GiB | int8 ConvRot, the fp32 norm layers kept |
+  | `PAN2_int8_convrot_full.safetensors` | 27.4 GiB | int8 ConvRot, those layers quantized too |
+  | `PAN2_nvfp4.safetensors` | 15.5 GiB | NVFP4 (4-bit) |
+  | `PAN2_qwen3_5_int8_convrot.safetensors` / `PAN2_qwen3_5_nvfp4.safetensors` | 8.4 / 4.6 GiB | text encoder |
+  | `PAN2_vae_fp16.safetensors` | 1.3 GiB | VAE |
+
+  These are the files the ComfyUI build with PAN 2 support loads, so one set serves both. With
+  `transformer_quant: auto` a file keeps the format it has.
+
+```yaml
+model_path: IFM/PAN2
+model_source: files
+transformer_file: /models/diffusion_models/PAN2_int8_convrot_full.safetensors
+text_encoder_file: /models/text_encoders/PAN2_qwen3_5_int8_convrot.safetensors
+vae_file: /models/vae/PAN2_vae_fp16.safetensors
+timestep_sampling: reference
+```
+
+**Memory.** The frozen transformer is 29.4 GB in int8 and 16.6 GB in nvfp4, plus the activations of a step.
+Measured with nvfp4 on one RTX 5090 (32 GB), 640 x 928 training pictures, batch 1, rank 16:
+
+| | GPU after loading | Peak while training | Peak with samples | Step |
+| --- | --- | --- | --- | --- |
+| whole model on the GPU | 17.7 GB | 20.5 GB | 27.0 GB | 0.62 s (compiled) |
+| `block_swap: 24` | 9.0 GB | | 13.6 GB | 1.5 s |
+
+So a 24 GB card holds nvfp4 whole for training, and a 16 GB card trains it with `block_swap: 24` (8.6 GB of the
+weights then sit pinned in RAM). The samples are the larger load: a 768 x 1152 picture with the 1477-token default
+negative. int8 has not been run: expect a 48 GB card, or block swap. Loading the folder and quantizing it to nvfp4
+took about 20 s on that card (from a warm disk cache); the folder's 58 GB are never in memory at once. A token is a
+2x2 patch (32 x 32 px), so a 1 MP image is 1024 image tokens.
+
+**How it trains.**
+
+- **Timesteps.** `timestep_sampling: reference` is IFM's fine-tuning recipe
+  ([config/sft_29B_720p.yaml](https://github.com/ifm-ai/PAN2/blob/main/config/sft_29B_720p.yaml)): a uniform draw
+  through the fixed shift 9, so half the steps train above sigma 0.9. That recipe is made for 720p video; whether a
+  lower shift suits single 1 MP images better is not tested.
+- **Loss.** The velocity `noise - x0`, as the reference; the 49 condition and mask channels of the model's input are
+  zero for a still (text-to-video).
+- **Captions.** PAN 2 reads structured JSON captions only (its "world state" format: `video_style`, `lighting`,
+  `subjects_lifecycle`, `events`, ...). Measured on the released weights: a plain sentence gives an unreadable
+  picture, with the default negative, with an empty one and without guidance; so does the sentence under
+  `init_frame_visual_description` alone; with a style, a subject, one event and the quality block around it the
+  picture is clean. So **a plain caption is wrapped in that structure automatically** (sample and probe prompts
+  too), and a caption that already is JSON (it starts with `{`) goes to the model verbatim:
+
+  ```json
+  {"video_style":"Photorealistic, sharp detail","lighting":"","perspective_view":"",
+   "subjects_lifecycle":[{"subject_id":"<|Subject1|>","display_name":"subject","subject_attribute":""}],
+   "init_frame_visual_description":"<your caption>",
+   "events":[{"event_index":0,"time_range_sec":"0 to 0","event_description":"<your caption>",
+              "camera_motion":[{"time_range_sec":"0 to 0","camera_motion":["static"]}],"contained_actions":[]}],
+   "quality":{"video_quality":"High clarity","text_logos_overlays":null,"artifacts":null}}
+  ```
+
+  The caption appears twice in it, so a plain caption has room for about 700 of the 1536 tokens. A plain caption
+  gets the trigger word in front, as always; a structured one gets it in front of its first subject's
+  `display_name`, so it stays valid JSON. Caption dropout trains on the empty prompt, as IFM's `cfg_drop_prob` does
+  (they use 0.05).
+- **Captions have to describe their own picture.** The same run on the same pictures with the captions shuffled
+  between them lost the prompt within 200 steps: the scenes were gone and the pictures hazy. With matching captions
+  it did not happen.
+- **LoRA targets.** The six usual groups, each on the video stream and on the text stream of a joint block
+  (`to_q` with `add_q_proj`, `ff` with `ff_context`, ...). In the last block the text stream's query, attention
+  output and feed-forward layers reach no output, so they are left out. **Token refiner** adds the 4 text-refiner
+  blocks.
+- **fp32 islands.** The checkpoint keeps the time embedder, every block's norm projection (`norm1.linear`) and text
+  modulation table, and the output norm in fp32, and the reference runs them so. They stay fp32 unless a file has
+  them quantized (`PAN2_int8_convrot_full`, `PAN2_nvfp4`); quantizing on load covers the block norm projections too
+  (12 GB of fp32 otherwise).
+
+**Samples and probes.** Single-frame videos at the released settings: 50 steps at CFG 2.5 on shift 9 with the
+model's structured negative prompt (`sample_negative` replaces it). There is no turbo LoRA and no training adapter
+for PAN 2. PAN 2 saw images in pretraining but was finished on video alone, so a still shows what the LoRA learned
+rather than the model at its best.
+
+**In ComfyUI.** The LoRA uses the generic key format under the checkpoint's own layer names:
+
+```
+diffusion_model.transformer_blocks.<n>.attn.<to_q|to_k|to_v|to_out.0|add_q_proj|add_k_proj|add_v_proj|to_add_out>.lora_down.weight
+diffusion_model.transformer_blocks.<n>.<ff|ff_context>.net.<0.proj|2>.lora_up.weight
+diffusion_model.transformer_blocks.<n>.(...).alpha
+```
+
+It needs a ComfyUI build with PAN 2 support, such as <https://github.com/speedyrulz/ComfyUI>: stock ComfyUI does
+not know the model. Add a standard **Load LoRA** node (model only) after *Load Diffusion Model*. Tried with a
+trained file: the console reports "524 patches attached" for the default targets, one per trained layer, and no
+key is left over. Write the prompt in the structured format there (ComfyUI does not wrap a plain one) and put the
+trigger word where your captions had it: in `init_frame_visual_description` and the event descriptions, and as the
+subject's `display_name`.
+
+**Licence.** IFM releases the code under Apache-2.0; check the model page for the terms of the weights before
+sharing a LoRA or converted files.
+
 ## Using the LoRA in ComfyUI
 
 Recent ComfyUI builds support MOSS-Image natively (`comfy/ldm/moss_image`, CLIP type `moss_image`), so no
@@ -3681,6 +3820,7 @@ rulztrainer/
   archs.py         the model families (MOSS-Image, FIBO 2.0, Krea 2) behind one interface
   fibo/            Bria FIBO 2.0: DiT port, loading, VGL prompts, sampler
   krea2/           Krea 2: DiT port, loading (Qwen-Image VAE, Qwen3-VL layer stack), sampler
+  pan2/            PAN 2: the video model for one-frame targets, loading (Wan 2.2 VAE, Qwen3.5-9B), sampler
 webui.py           NiceGUI web UI (runs training as a subprocess)
 configs/           example configs
 tests/             smoke tests (no weights needed): python -m pytest tests
@@ -3689,6 +3829,7 @@ install.bat / run_webui.bat   Windows install and start;  install.sh / run_webui
 scripts/vast/      vast.ai: provision.sh (PROVISIONING_SCRIPT), supervisor wrapper + conf, create_template.sh,
                    rulz_remote.py (reach an instance's runs from your computer) and its instance side rulz_agent.py
 scripts/bench.py   short timing runs that wait for idle GPUs (s/step, warm-up, peak memory)
+scripts/pan2/      convert_pan2.py: IFM/PAN2 into single files for ComfyUI and this trainer; verify_pan2.py checks one
 Dockerfile         optional vast.ai image with the install baked in
 ```
 

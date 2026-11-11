@@ -33,6 +33,7 @@ ARCH_NAMES += ("ideogram4",)
 ARCH_NAMES += ("minimax_h3",)
 ARCH_NAMES += ("p_h3_image",)
 ARCH_NAMES += ("minimax_h3_image",)
+ARCH_NAMES += ("pan2",)
 
 
 def _match_suffix(name: str, suffixes: Iterable[str]) -> bool:
@@ -1210,6 +1211,142 @@ class MiniMaxH3ImageArch(MiniMaxH3Arch):
 
 
 _ARCHS["minimax_h3_image"] = MiniMaxH3ImageArch
+
+
+class Pan2Arch(Arch):
+    """PAN 2 (IFM), the 29B video model, trained on stills as one-frame videos (rulztrainer.pan2), which is how IFM's
+    own trainer feeds images: the Wan 2.2 VAE's 16x latents with 48 channels read unpatched [B, 48, H/16, W/16] on a
+    32 px grid (the model patchifies 2x2), its own latents; Qwen3.5-9B's hidden state two layers before the last."""
+    name = "pan2"
+    label = "PAN 2"
+    modelspec = "pan2"
+    # diffusion_model.<module>.lora_down/up + alpha under the checkpoint's own (diffusers) module names: what the
+    # ComfyUI build with PAN 2 support maps for every weight of the model
+    lora_format = "comfy"
+    n_blocks = 44
+    # the video stream's and the text stream's projections of each joint block go together (to_q with add_q_proj, ...)
+    GROUPS = {"q": ("attn.to_q", "attn.add_q_proj"), "k": ("attn.to_k", "attn.add_k_proj"),
+              "v": ("attn.to_v", "attn.add_v_proj"), "o": ("attn.to_out.0", "attn.to_add_out"),
+              "ffn_up_gate": ("ff.net.0.proj", "ff_context.net.0.proj"), "ffn_down": ("ff.net.2", "ff_context.net.2")}
+    target_groups = {"q": "attention q (video and text projections)", "k": "attention k (video and text)",
+                     "v": "attention v (video and text)", "o": "attention out (video and text)",
+                     "ffn_up_gate": "feed-forward in (video and text)", "ffn_down": "feed-forward out (video and text)",
+                     "token_refiner": "the 4 text-refiner blocks over the caption"}
+    default_targets = ARCH_DEFAULT_TARGETS["pan2"]
+    text_prefixes = ("context_refiner.",)
+    supports_single_files = True  # the files scripts/pan2/convert_pan2.py makes (nobody publishes them)
+    empty_prompt = ""  # the reference's empty prompt template (cfg_drop_prob)
+    default_sample_steps, default_sample_cfg = ARCH_FULL_SAMPLE["pan2"]
+    latent_tag = "_wan22vae"
+    size_multiple = 32
+
+    def __init__(self):
+        from .pan2 import loading
+
+        self._loading = loading
+        self.default_negative = loading.default_negative(0.0)  # the released structured negative, for a still
+
+    def resolve_for_config(self, cfg):
+        return self._loading.resolve_for_config(cfg)
+
+    def get_transformer(self, cfg, model_dir, device=None):
+        return self._loading.get_transformer(cfg, model_dir, device)
+
+    def get_vae(self, cfg, model_dir):
+        return self._loading.get_vae(cfg, model_dir)
+
+    def get_text_encoder(self, cfg, model_dir):
+        return self._loading.get_text_encoder(cfg, model_dir)
+
+    def load_any_transformer(self, path, device, quant="auto", models_dir="models"):
+        return self._loading.load_any_transformer(path, device, quant, models_dir)
+
+    def encode_prompt(self, text_encoder, tokenizer, prompt, max_length):
+        return self._loading.encode_prompt(text_encoder, tokenizer, prompt, max_length)
+
+    def pad_embeds(self, rows):
+        return self._loading.pad_embeds(rows)
+
+    def encode_images(self, vae, images):
+        return self._loading.encode_images(vae, images)
+
+    def decode_latents(self, vae, latents):
+        return self._loading.decode_latents(vae, latents)
+
+    def decode_latents_grad(self, vae, latents):
+        return self._loading.decode_latents_grad(vae, latents)
+
+    def grad_vae(self, vae):
+        return self._loading.grad_vae(vae)
+
+    def sample(self, model, pos_e, pos_m, neg_e, neg_m, **kw):
+        from .pan2.sampler import sample
+
+        return sample(model, pos_e, pos_m, neg_e, neg_m, **kw)
+
+    def sample_sigmas(self, model, steps, height, width, shift):
+        from .pan2.sampler import pan2_sigmas
+
+        return pan2_sigmas(steps, getattr(model, "shift", 9.0))
+
+    def add_trigger(self, caption, trigger):
+        """A plain caption gets the trigger in front. A structured (JSON) caption stays valid JSON: the trigger goes
+        in front of its first subject's display name."""
+        if not trigger or trigger in (caption or ""):
+            return caption
+        text = (caption or "").strip()
+        if text.startswith("{"):
+            try:
+                data = json.loads(text)
+                subject = data["subjects_lifecycle"][0]
+                subject["display_name"] = f"{trigger} {subject.get('display_name', '')}".strip()
+                return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+            except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+                pass
+        return super().add_trigger(caption, trigger)
+
+    def lora_module_names(self, model, targets, blocks, include_text_embedder=False):
+        from .lora import _is_linear_like
+
+        targets = set(targets)
+        if include_text_embedder:
+            targets.add("token_refiner")
+        block_set = None if blocks is None else {int(b) for b in blocks}
+        in_block = sorted({s for t in targets for s in self.GROUPS.get(t, ())})
+        refiner = ("attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0", "ff.net.0.proj", "ff.net.2")
+        # the last block's text stream is never read again: its text queries, its attention's text output and its
+        # text feed-forward only write to the text tokens, which reach no output, so a LoRA there would get no
+        # gradient (its text keys and values still feed the video tokens)
+        last = f"transformer_blocks.{len(model.transformer_blocks) - 1}."
+        dead = tuple(last + m for m in ("attn.add_q_proj", "attn.to_add_out", "ff_context.net.0.proj",
+                                        "ff_context.net.2"))
+        names = []
+        for name, module in model.named_modules():
+            if not _is_linear_like(module):
+                continue
+            if name.startswith("transformer_blocks."):
+                if block_set is not None and int(name.split(".")[1]) not in block_set:
+                    continue
+                if _match_suffix(name, in_block) and name not in dead:
+                    names.append(name)
+            elif name.startswith("context_refiner."):
+                if "token_refiner" in targets and _match_suffix(name, refiner):
+                    names.append(name)
+        return names
+
+    def compile_blocks(self, model):
+        return list(model.transformer_blocks)
+
+    def reference_sigmas(self, n, gen, tokens):
+        # IFM's fine-tuning recipe (config/sft_29B_720p.yaml): a uniform draw, kept 1e-5 inside (0, 1), through the
+        # fixed shift 9 (pretraining drew a logit-normal instead, under the same shift)
+        from .pan2.model import SHIFT, shift_sigma
+
+        u = torch.rand(n, generator=gen) * (1.0 - 2e-5) + 1e-5
+        return shift_sigma(u, SHIFT)
+
+
+_ARCHS["pan2"] = Pan2Arch
 _cache: dict[str, Arch] = {}
 
 
@@ -1260,6 +1397,8 @@ def arch_from_transformer_file(path: str) -> str | None:
                 found = "p_h3_image" if _is_ph3_dit(p) else "minimax_h3"
             elif "video_patch_proj.weight" in names and "condition_proj.weight" in names:
                 found = "minimax_h3_image"  # H3's layout without the audio stream (ComfyUI's detection rule)
+            elif "context_type_embedding" in names and "transformer_blocks.0.attn.add_q_proj.weight" in names:
+                found = "pan2"
         except Exception:  # noqa: BLE001
             found = None
         _FILE_ARCH_CACHE[key] = found
@@ -1314,7 +1453,8 @@ def detect_arch(cfg: TrainConfig, model_dir: Path | None) -> Arch:
                  "Flux3Transformer2DModel": "flux3_klein", "Flux2Transformer2DModel": "flux2_klein",
                  "Ideogram4Transformer2DModel": "ideogram4",
                  "MiniMaxH3Transformer3DModel": "minimax_h3", "MiniMaxH3DiTModel": "minimax_h3",
-                 "MiniMaxH3ImageTransformer2DModel": "minimax_h3_image"}.get(cls)
+                 "MiniMaxH3ImageTransformer2DModel": "minimax_h3_image",
+                 "PAN2Transformer3DModel": "pan2"}.get(cls)
         if found in (None, "minimax_h3"):
             from .h3image.loading import is_h3_image_dir
 

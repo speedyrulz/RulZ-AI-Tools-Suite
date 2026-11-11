@@ -28,7 +28,13 @@ def planned_downloads(cfg: TrainConfig) -> list[tuple[str, str, str]]:
     """(config field, repo, file) for every file the config leaves to a download."""
     fam = cfg.arch_name()
     out = []
-    if cfg.model_source == "files":
+    if cfg.model_source == "files" and fam not in COMFY_REPOS:
+        # a family nobody publishes single files of (PAN 2): every file has to be set
+        missing = [f for f in ("transformer_file", "text_encoder_file", "vae_file") if not getattr(cfg, f)]
+        if missing:
+            raise ValueError(f"No single-file download exists for {fam}: set {', '.join(missing)} (for PAN 2, the "
+                             "files scripts/pan2/convert_pan2.py makes), or use the Hugging Face source")
+    elif cfg.model_source == "files":
         repo = COMFY_REPOS[fam]
         if not cfg.transformer_file:
             pattern = COMFY_DIFFUSION_FILES.get(cfg.model_path)
