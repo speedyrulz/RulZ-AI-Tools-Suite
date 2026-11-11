@@ -63,3 +63,50 @@ def test_choosing_a_backend_leaves_every_other_one_enabled():
         if name != "torch":
             assert order[0] == int(A.BACKENDS[name])
     assert torch._C._get_sdp_priority_order() == A._DEFAULT_ORDER  # "torch": PyTorch's own order again
+
+
+CUDNN_ERROR = ("Expected mha_graph.execute(handle, variant_pack, workspace_ptr.get()).is_good() to be true, but got "
+               "false.  (Could this error message be improved?  If so, please report an enhancement request to PyTorch.)")
+
+
+def test_a_cudnn_attention_failure_is_told_from_other_errors():
+    assert A.is_cudnn_failure(RuntimeError(CUDNN_ERROR))
+    assert A.is_cudnn_failure(RuntimeError("aten::_scaled_dot_product_cudnn_attention: cuDNN Frontend error"))
+    assert not A.is_cudnn_failure(RuntimeError("mat1 and mat2 shapes cannot be multiplied"))
+    assert not A.is_cudnn_failure(torch.OutOfMemoryError("CUDA out of memory in mha_graph"))  # has its own retry
+    assert not A.is_cudnn_failure(ValueError(CUDNN_ERROR))
+
+
+def test_fall_back_switches_cudnn_attention_off_once_and_set_backend_brings_it_back():
+    A.set_backend("cudnn")
+    assert torch.compiler.config.cache_key_tag.endswith("|rulz-sdpa=cudnn")
+    assert A.fall_back()
+    assert not torch.backends.cuda.cudnn_sdp_enabled() and A.backend_name() == "torch"
+    assert torch.backends.cuda.flash_sdp_enabled() and torch.backends.cuda.mem_efficient_sdp_enabled()
+    assert torch.backends.cuda.math_sdp_enabled()
+    assert torch._C._get_sdp_priority_order() == A._DEFAULT_ORDER
+    assert torch.compiler.config.cache_key_tag.endswith("|rulz-sdpa=torch-nocudnn")
+    assert not A.fall_back()  # already off: a second failure is not one a retry gets past
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(1, 4, 9, 16) for _ in range(3))
+    assert torch.equal(A.sdpa(q, k, v), F.scaled_dot_product_attention(q, k, v))
+    A.set_backend("cudnn")  # the next run in this process starts clean
+    assert torch.backends.cuda.cudnn_sdp_enabled() and A.backend_name() == "cudnn"
+    assert torch.compiler.config.cache_key_tag.count("rulz-sdpa=") == 1  # replaced, not stacked
+
+
+def test_fall_back_drops_compiled_graphs_so_they_trace_again():
+    """A compiled graph has its attention kernel written into it: after a fall-back it must compile again."""
+    from torch._dynamo.utils import counters
+
+    A.set_backend("cudnn")
+    fn = torch.compile(lambda q, k, v: A.sdpa(q, k, v) + 1, backend="eager")
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(1, 4, 9, 16) for _ in range(3))
+    ref = fn(q, k, v)
+    before = int(counters["frames"]["total"])
+    fn(q, k, v)
+    assert int(counters["frames"]["total"]) == before  # cached
+    assert A.fall_back(compiled=True)
+    assert torch.equal(fn(q, k, v), ref)
+    assert int(counters["frames"]["total"]) > before

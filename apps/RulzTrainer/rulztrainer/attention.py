@@ -11,7 +11,11 @@ to be a per-call sdpa_kernel(backend) context, which disables every other backen
 duration of the call: with samples and probes rendering on several GPUs in threads at once, another thread's fp32 VAE
 attention (Krea 2's) then found no backend enabled and failed with "No available kernel". The priority order applies to
 every scaled_dot_product_attention in the process (text encoders, VAEs, scorers); each still runs on the first backend
-that takes its call."""
+that takes its call.
+
+cuDNN's attention can also fail while it runs (seen on MiniMax-H3, 56 heads of 128: "Expected mha_graph.execute(...)
+.is_good() to be true, but got false"), which PyTorch does not catch. The trainer then calls fall_back(): cuDNN
+attention off for the rest of the run, the step trained again on PyTorch's pick."""
 from __future__ import annotations
 
 import logging
@@ -61,16 +65,65 @@ def priority_order(key: str) -> list[int] | None:
     return [int(first), *(b for b in _DEFAULT_ORDER if b != int(first))]
 
 
+def _tag_compile_cache(key: str) -> None:
+    """The backend's name in torch.compile's cache keys. A compiled block has its attention kernel written into it
+    (aten._scaled_dot_product_cudnn_attention, ...), and neither dynamo's guards nor the on-disk cache keys look at the
+    backend order: without the tag, a run with another attention_backend would get the first backend's graphs back
+    from the cache."""
+    try:
+        cfg = torch.compiler.config
+        if hasattr(cfg, "cache_key_tag"):
+            base = str(cfg.cache_key_tag or "").split("|rulz-sdpa=")[0]
+            cfg.cache_key_tag = f"{base}|rulz-sdpa={key}"
+    except Exception:  # noqa: BLE001  (a torch without the tag: the caches are as they were)
+        pass
+
+
 def set_backend(name: str, device="cuda") -> None:
     global _name
     key = resolve(name, device)
     order = priority_order(key)
+    if not torch.backends.cuda.cudnn_sdp_enabled():  # an earlier fall_back() in this process switched it off
+        torch.backends.cuda.enable_cudnn_sdp(True)
     if order is not None:
         torch._C._set_sdp_priority_order(order)
     elif BACKENDS.get(key) is not None:
         log.warning("This PyTorch has no SDPA priority order: attention_backend %s is ignored", key)
         key = "torch"
     _name = key
+    _tag_compile_cache(key)
+
+
+def is_cudnn_failure(exc: BaseException) -> bool:
+    """An error out of cuDNN's fused attention while it ran. PyTorch only tries the next backend when cuDNN declines a
+    call up front (a mask, a dtype); a failure while its graph builds or executes ("Expected mha_graph.execute(...)
+    .is_good() to be true, but got false": its workspace did not fit in the free memory, or a shape it cannot run)
+    raises a plain RuntimeError instead. Out-of-memory errors are not this: they have their own retry."""
+    if not isinstance(exc, RuntimeError) or isinstance(exc, torch.OutOfMemoryError):
+        return False
+    text = str(exc)
+    return "mha_graph" in text or "cudnn_attention" in text
+
+
+def fall_back(compiled: bool = False) -> bool:
+    """After a cuDNN attention failure: cuDNN attention off for the rest of the process and PyTorch's own order for the
+    others. True when that changed something (False: cuDNN attention was already off, so the error is not one a retry
+    can get past). compiled: blocks are torch.compiled; their graphs call cuDNN's kernel by name, so every compiled
+    graph is dropped and compiles again on the next call (under the new cache tag)."""
+    global _name
+    if not torch.backends.cuda.cudnn_sdp_enabled():
+        return False
+    torch.backends.cuda.enable_cudnn_sdp(False)
+    order = priority_order("torch")
+    if order is not None:
+        torch._C._set_sdp_priority_order(order)
+    _name = "torch"
+    _tag_compile_cache("torch-nocudnn")
+    if compiled:
+        import torch._dynamo as dynamo
+
+        dynamo.reset()
+    return True
 
 
 def backend_name() -> str:
