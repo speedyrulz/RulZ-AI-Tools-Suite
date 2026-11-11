@@ -458,7 +458,9 @@ what the rules have not downloaded by then is gone.
     run), which RulzTrainer does not have, and still offers `60:7:30:8:3` as slower to train but known to work well.
   - **Unmeasured here**, but for one Krea 2 run of `60:7:30:8:3` that tied the plain run. RulzTrainer's default
     already starts at 50%, so race `clean_share: "60:7:30:8:3"` (or `"11:7:40:8:3"` with `optimizer: muon`) against
-    `""` on your own data. It works with every model and timestep mode.
+    `""` on your own data. It works with every model and timestep mode. On MiniMax-H3-Image, whose steps train only at
+    its 6 fixed levels, the share is the steps at its last level (0.232); the *H3 Image 40* button fills in Fizgig's
+    `40`.
 - **Flow matching loss.** `x_t = (1 - sigma) x0 + sigma * noise`, target `noise - x0`, timestep = `sigma * 1000`,
   sigmas snapped to the model's 1000-step training grid. Default sampling is logit-normal; `timestep_shift`
   is available.
@@ -3381,11 +3383,18 @@ from diffusers' `minimax_h3_image` modular pipeline, ComfyUI's `MiniMaxH3ImageMo
   rule for the model (its `fixed_train_sigmas`, commit 5b1670a of 10 November 2026) since v3.7.0: a step trains at
   one of the 6 sigmas the model samples at (1, 0.968, 0.888, 0.75, 0.533, 0.232), picked evenly, through that
   sigma's own head. Each head was distilled at its one sigma, so nothing trains in between. The sigmas are used as
-  drawn: `timestep_shift`, `sigma_min` / `sigma_max`, `clean_share` and `timestep_buckets` do not move them (the log
-  says so), and they are not rounded to the 1000-step grid, where 0.968, 0.888 and 0.533 would land above their grid
+  drawn: `timestep_shift`, `sigma_min` / `sigma_max` and `timestep_buckets` do not move them (the log says so), and
+  they are not rounded to the 1000-step grid, where 0.968, 0.888 and 0.533 would land above their grid
   points and train the head before. Before v3.7.0 `reference` drew a position anywhere along the grid, so a head also
   trained on sigmas between its step and the next. The other samplers (logit-normal and so on) still work as for any
   model and still do that; the log warns when one is set.
+- **Clean-end share** (v3.11.0, `clean_share`, off by default; Fizgig's MiniMax-H3-Image presets use `40`). On this
+  model it is the share of steps at the last level, 0.232 (the only one below 0.5: the nearly finished picture, where
+  skin, eyes and fine detail are made); the other five levels share the rest evenly. `40` gives 40% there and 12% on
+  each of the others, against about 17% each without it. The levels stay the exact six, and every `clean_share`
+  schedule works as on any model (`11:7:40:8:3` and so on). Fizgig says a higher share gives more detail and likeness,
+  a lower one more layout and composition. Without `clean_share` the draw is ai-toolkit's even one, also with the
+  likeness curriculum's timestep shift.
 - **Training adapter.** The model is step- and guidance-distilled, so `training_adapter: auto` downloads ostris'
   [minimax_h3_training_adapter](https://huggingface.co/ostris/minimax_h3_training_adapter)
   `minimax_h3_image_training_adapter_v1.safetensors` (rank 16, 0.16 GB, `diffusion_model.*.lora_A/B`, no alpha, on
@@ -3453,7 +3462,7 @@ here, so these are things to try, not defaults):
 - **More steps on the last noise level.** Its presets put 40% of the steps on the nearly clean level (sigma 0.232),
   where skin, eyes and fine detail are made, and share the rest evenly over the five levels above. It says a higher
   share gives more detail and likeness, a lower one more layout. RulzTrainer draws the six levels evenly (about 17%
-  each, ai-toolkit's rule) and `clean_share` does not apply to this model.
+  each, ai-toolkit's rule); since v3.11.0 `clean_share: "40"` gives Fizgig's split (see *Clean-end share* above).
 - **Its own training adapter**,
   [ShootTheSound/Fizgig-MiniMax-H3-Image-Training-Adapter](https://huggingface.co/ShootTheSound/Fizgig-MiniMax-H3-Image-Training-Adapter)
   (0.15 GB, trained on 7,600 photos and 1,000 of the model's own renders, published for any trainer). Fizgig reports

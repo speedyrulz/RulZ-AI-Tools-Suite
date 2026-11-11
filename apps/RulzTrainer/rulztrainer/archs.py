@@ -1170,6 +1170,18 @@ class PH3ImageArch(MiniMaxH3Arch):
 _ARCHS["p_h3_image"] = PH3ImageArch
 
 
+def clean_end_weights(grid: torch.Tensor, logit_shift: float, clean_sigma: float = 0.5) -> torch.Tensor:
+    """Draw weights for fixed noise levels moved by a logit shift: the levels below clean_sigma share
+    sigmoid(logit(their count / all) - shift) evenly, the rest share the remainder evenly. Shift 0: every level alike;
+    a larger shift: fewer clean steps, as it gives a curve. All levels at one end: every level alike."""
+    clean = grid < clean_sigma
+    k, m = int(clean.sum()), grid.numel()
+    if k in (0, m):
+        return torch.ones(m)
+    p = 1.0 / (1.0 + math.exp(-(math.log(k / (m - k)) - float(logit_shift))))
+    return torch.where(clean, torch.full((m,), p / k), torch.full((m,), (1.0 - p) / (m - k)))
+
+
 class MiniMaxH3ImageArch(MiniMaxH3Arch):
     """MiniMax-H3-Image (MiniMaxAI): H3's transformer without the audio stream, distilled to 6 sampling steps with one
     output head per step and no guidance (rulztrainer.h3image). H3's LoRA names, text encoder and latent layout; its
@@ -1201,15 +1213,21 @@ class MiniMaxH3ImageArch(MiniMaxH3Arch):
 
     reference_sigmas_exact = True
 
-    def reference_sigmas(self, n, gen, tokens):
+    def reference_sigmas(self, n, gen, tokens, logit_shift: float = 0.0):
         # ai-toolkit's rule for the model (its scheduler's fixed_train_sigmas, commit 5b1670a), which its training
         # adapter is made with: only the 6 sigmas the model samples at, picked evenly, each through its own output
         # head. A head was distilled at its one sigma, so no step lands between them. Exact values: rounded to the
-        # 1000-step grid, 0.968, 0.888 and 0.533 would fall above their grid points, into the head before
+        # 1000-step grid, 0.968, 0.888 and 0.533 would fall above their grid points, into the head before.
+        # logit_shift (only with clean_share, trainer.sample_sigmas): moves steps between the clean end and the rest
+        # the way it moves a curve, with the levels kept. The levels below sigma 0.5 (the last, 0.232) take a share
+        # sigmoid(logit(their even share) - shift) of the steps, split evenly, the others the rest evenly: 0 is the
+        # even draw, and clean_share's bisection finds the shift for a share (Fizgig's MiniMax-H3-Image presets: 40%)
         from .h3image.loading import PDD_SIGMAS
 
         grid = torch.tensor(PDD_SIGMAS[:-1], dtype=torch.float32)
-        return grid[torch.randint(0, grid.numel(), (n,), generator=gen)]
+        if not logit_shift:
+            return grid[torch.randint(0, grid.numel(), (n,), generator=gen)]
+        return grid[torch.multinomial(clean_end_weights(grid, logit_shift), n, replacement=True, generator=gen)]
 
 
 _ARCHS["minimax_h3_image"] = MiniMaxH3ImageArch
