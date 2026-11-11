@@ -152,6 +152,10 @@ class Arch:
         return "other"
 
     # ---- timesteps
+    # True: reference_sigmas returns the exact sigmas to train on (a step-distilled model's own sampling sigmas), so
+    # the trainer uses them as drawn: no logit shift, timestep_shift, sigma range or 1000-step rounding
+    reference_sigmas_exact = False
+
     def reference_sigmas(self, n: int, gen: torch.Generator, tokens: int) -> torch.Tensor:
         """The family's own training noise-level distribution (timestep_sampling: reference)."""
         raise NotImplementedError(f"{self.name} has no reference timestep recipe")
@@ -1192,17 +1196,17 @@ class MiniMaxH3ImageArch(MiniMaxH3Arch):
     def distilled_sample_model(self, path: str) -> bool:
         return True  # the released model is the 6-step distilled one: no turbo LoRA on top
 
+    reference_sigmas_exact = True
+
     def reference_sigmas(self, n, gen, tokens):
-        # MiniMax has not published H3-Image's training noise distribution. This is the trainer's choice: the sampler's
-        # own, a position drawn uniformly along the 6-interval sigma grid (the grid read piecewise-linearly in its
-        # index, as ComfyUI's sampling does), so each output head trains on an equal share of the steps and on the
-        # sigmas its sampling step covers
+        # ai-toolkit's rule for the model (its scheduler's fixed_train_sigmas, commit 5b1670a), which its training
+        # adapter is made with: only the 6 sigmas the model samples at, picked evenly, each through its own output
+        # head. A head was distilled at its one sigma, so no step lands between them. Exact values: rounded to the
+        # 1000-step grid, 0.968, 0.888 and 0.533 would fall above their grid points, into the head before
         from .h3image.loading import PDD_SIGMAS
 
-        grid = torch.tensor(PDD_SIGMAS, dtype=torch.float32)
-        pos = torch.rand(n, generator=gen) * (grid.numel() - 1)
-        i = pos.floor().long().clamp(max=grid.numel() - 2)
-        return torch.lerp(grid[i], grid[i + 1], pos - i).clamp(0.0, 1.0)
+        grid = torch.tensor(PDD_SIGMAS[:-1], dtype=torch.float32)
+        return grid[torch.randint(0, grid.numel(), (n,), generator=gen)]
 
 
 _ARCHS["minimax_h3_image"] = MiniMaxH3ImageArch
