@@ -3403,11 +3403,25 @@ always train as text-to-video). Pick the **PAN-2** preset. Experimental.
 **What it is for.** A character, object or style LoRA you then use for video in ComfyUI. Training on video clips is
 not supported: the trainer has no video data path.
 
-**Status.** Checked without a GPU: the port gives the same numbers, bit for bit, as the PAN 2 model code in the
-ComfyUI build below on the same random weights; the prompt tokens equal ComfyUI's for the same text; the released
-VAE gives ComfyUI's latents for the same picture and a 49 dB round trip; every tensor of the converted files has its
-place in the port. **Not yet run on the real transformer**: no sample and no training step. The first run is the
-test. A wrong picture at step 0 would mean a port bug, not a training problem.
+**Status.** Run on the released weights on one RTX 5090 (NVFP4, November 2026):
+
+- **Samples at step 0** are clean pictures that follow the prompt, from the diffusers folder and from the single
+  files alike.
+- **A 600-step run** (rank 16, lr 1e-4, `timestep_sampling: reference`, 0.59 MP, 62 pictures of one character with
+  captions that describe them) learned the character by about step 400 while the scenes still followed the
+  prompts; a prompt without the trigger word kept its subject. At step 600 the pictures show a fine grain.
+- **In ComfyUI** (the build below) that LoRA attached to all 524 layers and changed single frames and a 49-frame
+  clip.
+  In the clip the scene, the motion and the prompt held; the likeness was clearer in single frames than in the
+  480 x 704 clip.
+- **Block swap** and `model_source: files` both train, to the same loss as the folder on the GPU.
+
+Checked without a GPU before that: the port gives the same numbers, bit for bit, as the PAN 2 model code in that
+ComfyUI build on the same random weights; the prompt tokens equal ComfyUI's for the same text; the released VAE
+gives ComfyUI's latents for the same picture and a 49 dB round trip.
+
+Not run yet: int8 on the real weights (only NVFP4 ran), a two-card model split, likeness probes, longer runs and
+other learning rates. One short run is a working start, not a tuned recipe.
 
 **Getting the model.** Two ways:
 
@@ -3438,9 +3452,19 @@ vae_file: /models/vae/PAN2_vae_fp16.safetensors
 timestep_sampling: reference
 ```
 
-**Memory.** The frozen transformer is 29.4 GB in int8 and 16.6 GB in nvfp4, plus the activations of a step. It has
-not been measured here: expect one 48 GB card for int8, and nvfp4 with block swap or a two-card model split on
-smaller cards. A token is a 2x2 patch (32 x 32 px), so a 1 MP image is 1024 image tokens.
+**Memory.** The frozen transformer is 29.4 GB in int8 and 16.6 GB in nvfp4, plus the activations of a step.
+Measured with nvfp4 on one RTX 5090 (32 GB), 640 x 928 training pictures, batch 1, rank 16:
+
+| | GPU after loading | Peak while training | Peak with samples | Step |
+| --- | --- | --- | --- | --- |
+| whole model on the GPU | 17.7 GB | 20.5 GB | 27.0 GB | 0.62 s (compiled) |
+| `block_swap: 24` | 9.0 GB | | 13.6 GB | 1.5 s |
+
+So a 24 GB card holds nvfp4 whole for training, and a 16 GB card trains it with `block_swap: 24` (8.6 GB of the
+weights then sit pinned in RAM). The samples are the larger load: a 768 x 1152 picture with the 1477-token default
+negative. int8 has not been run: expect a 48 GB card, or block swap. Loading the folder and quantizing it to nvfp4
+took about 20 s on that card (from a warm disk cache); the folder's 58 GB are never in memory at once. A token is a
+2x2 patch (32 x 32 px), so a 1 MP image is 1024 image tokens.
 
 **How it trains.**
 
@@ -3450,12 +3474,29 @@ smaller cards. A token is a 2x2 patch (32 x 32 px), so a 1 MP image is 1024 imag
   lower shift suits single 1 MP images better is not tested.
 - **Loss.** The velocity `noise - x0`, as the reference; the 49 condition and mask channels of the model's input are
   zero for a still (text-to-video).
-- **Captions.** The caption goes to the model verbatim. PAN 2 was trained on structured JSON captions (its "world
-  state" format: `video_style`, `lighting`, `subjects_lifecycle`, `events`, ...); plain captions are accepted, and
-  how well a LoRA trained on them carries over to structured video prompts is not tested. With a structured caption
-  the trigger word goes in front of the first subject's `display_name`, so the caption stays valid JSON; a plain
-  caption gets it in front. Up to 1536 tokens are used. Caption dropout trains on the empty prompt, as IFM's
-  `cfg_drop_prob` does (they use 0.05).
+- **Captions.** PAN 2 reads structured JSON captions only (its "world state" format: `video_style`, `lighting`,
+  `subjects_lifecycle`, `events`, ...). Measured on the released weights: a plain sentence gives an unreadable
+  picture, with the default negative, with an empty one and without guidance; so does the sentence under
+  `init_frame_visual_description` alone; with a style, a subject, one event and the quality block around it the
+  picture is clean. So **a plain caption is wrapped in that structure automatically** (sample and probe prompts
+  too), and a caption that already is JSON (it starts with `{`) goes to the model verbatim:
+
+  ```json
+  {"video_style":"Photorealistic, sharp detail","lighting":"","perspective_view":"",
+   "subjects_lifecycle":[{"subject_id":"<|Subject1|>","display_name":"subject","subject_attribute":""}],
+   "init_frame_visual_description":"<your caption>",
+   "events":[{"event_index":0,"time_range_sec":"0 to 0","event_description":"<your caption>",
+              "camera_motion":[{"time_range_sec":"0 to 0","camera_motion":["static"]}],"contained_actions":[]}],
+   "quality":{"video_quality":"High clarity","text_logos_overlays":null,"artifacts":null}}
+  ```
+
+  The caption appears twice in it, so a plain caption has room for about 700 of the 1536 tokens. A plain caption
+  gets the trigger word in front, as always; a structured one gets it in front of its first subject's
+  `display_name`, so it stays valid JSON. Caption dropout trains on the empty prompt, as IFM's `cfg_drop_prob` does
+  (they use 0.05).
+- **Captions have to describe their own picture.** The same run on the same pictures with the captions shuffled
+  between them lost the prompt within 200 steps: the scenes were gone and the pictures hazy. With matching captions
+  it did not happen.
 - **LoRA targets.** The six usual groups, each on the video stream and on the text stream of a joint block
   (`to_q` with `add_q_proj`, `ff` with `ff_context`, ...). In the last block the text stream's query, attention
   output and feed-forward layers reach no output, so they are left out. **Token refiner** adds the 4 text-refiner
@@ -3479,8 +3520,11 @@ diffusion_model.transformer_blocks.<n>.(...).alpha
 ```
 
 It needs a ComfyUI build with PAN 2 support, such as <https://github.com/speedyrulz/ComfyUI>: stock ComfyUI does
-not know the model. Add a standard **Load LoRA** node (model only) after *Load Diffusion Model*. Not yet tried with a
-trained file.
+not know the model. Add a standard **Load LoRA** node (model only) after *Load Diffusion Model*. Tried with a
+trained file: the console reports "524 patches attached" for the default targets, one per trained layer, and no
+key is left over. Write the prompt in the structured format there (ComfyUI does not wrap a plain one) and put the
+trigger word where your captions had it: in `init_frame_visual_description` and the event descriptions, and as the
+subject's `display_name`.
 
 **Licence.** IFM releases the code under Apache-2.0; check the model page for the terms of the weights before
 sharing a LoRA or converted files.
