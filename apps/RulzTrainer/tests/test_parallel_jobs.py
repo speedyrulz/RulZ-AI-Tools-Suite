@@ -113,8 +113,9 @@ def test_board_combines_per_gpu_progress():
 
 def test_render_job_shape_key():
     j = RenderJob("p", 1024, 768, 8, 1.0, 0, Path("x.png"), "probe face")
-    assert j.shape_key == (1024, 768, False)
-    assert RenderJob("p", 1024, 768, 8, 3.0, 0, Path("x.png"), "s").shape_key == (1024, 768, True)
+    assert j.shape_key == (1024, 768, False, 1)
+    assert RenderJob("p", 1024, 768, 8, 3.0, 0, Path("x.png"), "s").shape_key == (1024, 768, True, 1)
+    assert RenderJob("p", 480, 704, 30, 2.5, 0, Path("x.png"), "s", frames=49).shape_key == (480, 704, True, 49)
 
 
 def _items(tmp_path, n, flip=True):

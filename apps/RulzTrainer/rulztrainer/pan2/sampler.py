@@ -5,8 +5,10 @@ model's), ending at 0, as IFM's FlowEulerScheduler steps it. Guidance is plain c
 trainer's convention, uncond + cfg * (cond - uncond), which is the reference's v_neg + scale * (v_pos - v_neg);
 the released settings are 50 steps at 2.5 with the structured negative prompt (pan2/loading.default_negative).
 
-A sample is a single-frame video. PAN 2 saw stills in pretraining (image_sample_prob 0.2) but was finished on video
-alone, so a one-frame sample shows what a LoRA learned; it is not what the model is tuned to produce."""
+A sample is a single-frame video by default. PAN 2 saw stills in pretraining (image_sample_prob 0.2) but was finished
+on video alone, so a one-frame sample shows what a LoRA learned; it is not what the model is tuned to produce. With
+`frames` above 1 the sample is a clip, text-to-video: (frames - 1) / 4 + 1 latent frames (the Wan 2.2 VAE packs 4
+frames into one after the first), at 24 frames per second."""
 from __future__ import annotations
 
 import torch
@@ -20,15 +22,30 @@ def pan2_sigmas(steps: int, shift: float = SHIFT) -> torch.Tensor:
     return torch.unique_consecutive(shift_sigma(base, float(shift)))
 
 
+FPS = 24  # the released model's frame rate
+TEMPORAL = 4  # frames per latent frame after the first (the Wan 2.2 VAE)
+
+
+def latent_frames(frames: int) -> int:
+    return (max(1, int(frames)) - 1) // TEMPORAL + 1
+
+
+def snap_frames(frames: int) -> int:
+    """The clip length the VAE gives back for a request: 4k + 1 frames."""
+    return (latent_frames(frames) - 1) * TEMPORAL + 1
+
+
 @torch.no_grad()
 def sample(model, pos_embeds, pos_mask, neg_embeds, neg_mask, *, width, height, steps=50, cfg=2.5, shift=None,
-           seed=0, skip_layer=-1, device="cuda", progress=None, sigmas=None) -> torch.Tensor:
-    """Returns normalized latents [1, 48, H/16, W/16] (fp32), the trainer's layout. `shift` (the trainer's
+           seed=0, skip_layer=-1, device="cuda", progress=None, sigmas=None, frames=1) -> torch.Tensor:
+    """Returns normalized latents [1, 48, H/16, W/16] (fp32), the trainer's layout; for a clip (frames above 1)
+    [1, 48, T, H/16, W/16] with T = latent_frames(frames). `shift` (the trainer's
     sample_shift, made for MOSS-Image) and `skip_layer` are accepted for the shared signature and ignored: PAN 2
     samples on its own shift. Width and height are rounded down to whole 32 px (a token covers 2 x 2 latent cells)."""
     gen = torch.Generator("cpu").manual_seed(seed)
     h, w = max(2, height // 32 * 2), max(2, width // 32 * 2)
-    latents = torch.randn((1, model.latent_channels, h, w), generator=gen).to(device)
+    shape = (1, model.latent_channels, h, w) if frames <= 1 else (1, model.latent_channels, latent_frames(frames), h, w)
+    latents = torch.randn(shape, generator=gen).to(device)
     sigmas = pan2_sigmas(steps, getattr(model, "shift", SHIFT)) if sigmas is None else torch.as_tensor(sigmas, dtype=torch.float32)
     sigmas = sigmas.to(device)
     pos_embeds, pos_mask = pos_embeds.to(device), pos_mask.to(device)
