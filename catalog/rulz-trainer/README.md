@@ -3434,8 +3434,8 @@ from diffusers' `minimax_h3_image` modular pipeline, ComfyUI's `MiniMaxH3ImageMo
   photographic and follow their prompts, so the port, the per-step heads, the text encoder and the VAE work. A LoRA
   step took about 0.7 s (26 of 50 blocks keeping their activations, 28.0 of 31 GB). In 1000 steps on one character
   set the face likeness rose steadily, the probes kept their framing, and the loss stayed calm. The VAE round trip
-  above and the w4a8 reader below were checked on the released files on 10 November. Not yet run: the w4a8 file in
-  training, block swap, the model split over two cards, pictures above 1 MP.
+  above and the w4a8 reader below were checked on the released files on 10 November. Not yet run: block swap, the
+  model split over two cards, training above 1 MP.
 
 **Files.** `model_source: files` downloads from
 [Comfy-Org/MiniMax-H3-Image](https://huggingface.co/Comfy-Org/MiniMax-H3-Image) (sizes from the Hub): the transformer
@@ -3445,7 +3445,9 @@ Comfy-Org's H3 files, and the image VAE (1.2 GB). The text encoder is MiniMax H3
 fetched from Comfy-Org/MiniMax-H3 and a copy already downloaded for H3 is used again. `model_source: hf` downloads
 what it reads of MiniMaxAI/MiniMax-H3-Image (about 125 GB): `transformer/` in MiniMaxAI's own layout (per-head
 interleaved qkv, full AdaLN, pruned on load to rank 8), `pdd_fused_heads.safetensors`, `pdd_config.json`, the text
-encoder's first 11 shards (layers 0-49), the tokenizer and `vae/`. A folder that holds only diffusers'
+encoder's first 11 shards (layers 0-49), the tokenizer and `vae/` (since v3.11.2 its pruned AdaLN keeps the bias in
+fp32 with the weight; before, the first sample failed with "BFloat16 and Float"; checked on the real folder, nvfp4, 13.7
+GB to render at 1 MP). A folder that holds only diffusers'
 `transformer_diffusers/` and `vae_diffusers/` loads too.
 
 **The w4a8 file** is ComfyUI's 4-bit format (`asym_w4a8_int8`, comfy-kitchen's `AsymW4A8Int8Layout`): each weight a
@@ -3455,7 +3457,11 @@ ComfyUI computes, but the model then takes int8's memory (21 GB, not 12.5): it i
 precision than the int8 file. Checked on the released files: four layers decoded from the w4a8 file match the same
 layers of the int8 file at cosine 0.997 (a relative error of 7.4%, the 4-bit format's own; with the nibbles swapped
 the cosine is 0, without the codebook 0.86). The same reader takes the 6-bit `w6a8_int8` files of H3 and
-P-H3-Image's `w4a8`, whose headers declare the same layout (not tried on those files).
+P-H3-Image's `w4a8`, whose headers declare the same layout (not tried on those files). **Trained once** (11 November
+2026, one RTX PRO 5000 48 GB, the settings of the even run of the race above, 1000 steps): it works like the int8
+file. Smoothed combined likeness 30.4 at step 1000 (the int8 run: 28.5; face 54.6 / body 39.8 against 52.8 / 43.4),
+every probe kept its framing, and the probes show the same person. It held 22.0 GB once loaded, as int8 does, so it
+does not let a smaller card train; decoding it at load took about 6 minutes.
 
 **Memory** is as for [MiniMax H3](#minimax-h3) (the same 21 GB transformer, less the audio projections): two 16 GB
 cards in `multi_gpu: model_split`, one 16 GB card with `block_swap`, or one 24-32 GB card whole.
