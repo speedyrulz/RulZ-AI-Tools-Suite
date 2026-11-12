@@ -18,4 +18,5 @@ mediapipe>=0.10
 # optional: identity loss with the arcface backend (id_loss_backend: arcface)
 onnx2torch>=1.5
 psutil>=5.9  # WebUI reattaches to a running training job
+av>=12  # video clip training (PAN 2, MiniMax H3): reads the dataset's video files (FFmpeg bundled)
 matplotlib>=3.8  # the run report (run_report, python -m rulztrainer.runreport)

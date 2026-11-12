@@ -347,7 +347,10 @@ MODEL_PRESETS["PAN-2"] = "IFM/PAN2"
 ARCH_NAMES += ("pan2",)
 ARCH_DEFAULT_TARGETS["pan2"] = _CORE_TARGETS
 ARCH_FULL_SAMPLE["pan2"] = (50, 2.5)
-VIDEO_ARCHS = ("pan2",)  # families whose samples and probes can be clips (sample_frames, probe_frames)
+# families that train on video clips (train_frames) and render samples and probes as clips (sample_frames,
+# probe_frames). MiniMax H3 is the video + audio model, not MiniMax-H3-Image or P-H3-Image (stills only).
+VIDEO_ARCHS = ("pan2", "minimax_h3")
+VIDEO_EXTS = (".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v")  # video files a dataset trains as clips
 
 
 # Named presets: values applied over a config (UI toggle, --preset on the CLI, or `preset:` in YAML).
@@ -498,6 +501,14 @@ class TrainConfig:
     min_bucket_side: int = 512
     max_bucket_side: int = 2048
     flip_augment: bool = False
+    # a video model (PAN 2, MiniMax H3): video files in the dataset train as clips of this many frames at the model's
+    # 24 fps (snapped to what its VAE takes: PAN 2 4k + 1, H3 17n + 5); 1 = video files are skipped, pictures only
+    train_frames: int = 1
+    train_video_mode: str = "fps"  # fps: real time from the clip's start (ai-toolkit's trim) | spread: the whole video
+    # a clip's bucket side in px (area = side^2, the video's aspect kept); 0 = the run's first training resolution. A
+    # clip holds a latent frame per 4 frames (PAN 2) or 5 per 17 (H3), so it costs many stills: 512 keeps a 2 s clip
+    # near the token count of a 4 MP picture
+    video_resolution: int = 512
     caption_ext: str = ".txt"
     trigger_word: str = ""
     caption_dropout: float = 0.05
@@ -649,7 +660,7 @@ class TrainConfig:
     sample_cfg: float = 1.0
     sample_shift: float = 5.0
     sample_seed: int = 42
-    sample_frames: int = 1  # a video model (PAN 2): frames per sample at 24 fps, 4k + 1 (49 is 2 s); 1 = a still
+    sample_frames: int = 1  # a video model (PAN 2, MiniMax H3): frames per sample at 24 fps (PAN 2 4k + 1, H3 17n + 5); 1 = a still
     sample_walk_seed: bool = True  # seed + i for the i-th sample prompt; off = same seed for every prompt
     sample_before_training: bool = False  # generate samples at step 0 before the first training step
     sample_negative: str = ""
@@ -817,7 +828,7 @@ class TrainConfig:
     noise_seeds: int = 16  # seeds per file (the same ones for every file: paired)
     # --- likeness probes & controller (character LoRAs) ---
     probe_every: int = 0  # steps between probe renders; 0 = off (needs face_refs and/or body_refs)
-    probe_frames: int = 1  # a video model (PAN 2): frames per probe render; its middle frame is scored. 1 = a still
+    probe_frames: int = 1  # a video model (PAN 2, MiniMax H3): frames per probe render; its middle frame is scored. 1 = a still
     probe_at_start: bool = True  # also probe at step 0 for a baseline
     probe_face_prompt: str = ""  # headshot prompt; empty = no face probe
     probe_body_prompt: str = ""  # full-body prompt; empty = no body probe
@@ -1154,11 +1165,20 @@ class TrainConfig:
                              f"whose frame is known (set probe_face_expect / probe_body_expect, or add probe_checks)")
 
     def validate(self) -> None:
-        if min(self.sample_frames, self.probe_frames) < 1:
-            raise ValueError("sample_frames and probe_frames must be 1 (a still) or more")
+        if min(self.sample_frames, self.probe_frames, self.train_frames) < 1:
+            raise ValueError("sample_frames, probe_frames and train_frames must be 1 (a still) or more")
         if max(self.sample_frames, self.probe_frames) > 1 and self.arch_name() not in VIDEO_ARCHS:
             raise ValueError(f"sample_frames / probe_frames above 1 need a video model ({', '.join(VIDEO_ARCHS)}): "
                              f"{self.arch_name()} renders stills")
+        if self.train_frames > 1:
+            if self.arch_name() not in VIDEO_ARCHS:
+                raise ValueError(f"train_frames above 1 (video clip training) needs a video model "
+                                 f"({', '.join(VIDEO_ARCHS)}): {self.arch_name()} trains on stills")
+            if self.train_video_mode not in ("fps", "spread"):
+                raise ValueError(f"train_video_mode must be fps or spread, got {self.train_video_mode!r}")
+            if self.isolation:
+                raise ValueError("LoRA Isolation builds side-by-side pictures from the dataset's photos: it does not "
+                                 "take video clips (set train_frames to 1, or turn isolation off)")
         if self.optimizer.lower() == "hull":
             self.validate_hull()
         self.validate_region_actions()

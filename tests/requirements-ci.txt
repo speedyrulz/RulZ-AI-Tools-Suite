@@ -3,6 +3,7 @@
 # requirements.txt stays open-ended for real installs; raise these when a new version has been tested.
 --extra-index-url https://download.pytorch.org/whl/cpu
 accelerate==1.15.0
+av==16.1.0
 diffusers==0.42.1
 huggingface_hub==2.4.0
 mediapipe==1.2.2

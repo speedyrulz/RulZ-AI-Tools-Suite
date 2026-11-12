@@ -82,6 +82,61 @@ ONE_FRAME_AUDIO_LATENTS = 2  # audio latent frames per channel for a one-frame t
 ROPE_SPATIAL_SCALE = 32.0
 PATCH = 2  # the transformer's 1x2x2 patch (latents per token edge)
 
+# ---------------------------------------------------------------- clips (text-to-video: samples, training clips)
+# The video VAE encodes 17 pixel frames per chunk into 5 latent frames and drops 3 at the end, so a clip is
+# 17n + 5 frames and 5n + 2 latent frames (diffusers' align_num_frames / video_latent_num_frames). Rotary time runs
+# 5/3 units per pixel frame: latent frame k after the first spans 5/3 * (1, 4, 4, 4, 4)[k % 5] (the VAE's 17 ->
+# 5 grouping), and the audio stream's 40 latents per second, one unit each, keep pace with the 24 fps video.
+FPS = 24
+VAE_CHUNK_FRAMES, VAE_CHUNK_LATENTS = 17, 5
+AUDIO_LATENTS_PER_SECOND = 40
+ROPE_FRAME_RESCALE = 5.0 / 3.0
+ROPE_FRAMES_PER_LATENT = (1, 4, 4, 4, 4)
+
+
+def snap_frames(frames: int) -> int:
+    """A clip length the VAE takes: 1 (a still) or the next 17n + 5 up (diffusers' align_num_frames; 5, 22, 39, 56,
+    ...)."""
+    frames = int(frames)
+    if frames <= 1:
+        return 1
+    while frames % VAE_CHUNK_FRAMES != VAE_CHUNK_LATENTS:
+        frames += 1
+    return frames
+
+
+def video_latent_frames(frames: int) -> int:
+    """Latent frames of a 17n + 5 clip: 5n + 2 (a still: 1)."""
+    frames = int(frames)
+    if frames <= 1:
+        return 1
+    if frames % VAE_CHUNK_FRAMES != VAE_CHUNK_LATENTS:
+        raise ValueError(f"a MiniMax H3 clip is 17n + 5 frames, got {frames}")
+    return (frames - VAE_CHUNK_LATENTS) // VAE_CHUNK_FRAMES * VAE_CHUNK_LATENTS + 2
+
+
+def pixel_frames(latent_frames: int) -> int:
+    """The clip length of 5n + 2 latent frames (ai-toolkit's inverse): 17n + 5; one latent frame is a still."""
+    t = int(latent_frames)
+    if t <= 1:
+        return 1
+    if (t - 2) % VAE_CHUNK_LATENTS:
+        raise ValueError(f"a MiniMax H3 clip has 5n + 2 latent frames, got {t}")
+    return (t - 2) // VAE_CHUNK_LATENTS * VAE_CHUNK_FRAMES + VAE_CHUNK_LATENTS
+
+
+def audio_latent_frames(frames: int) -> int:
+    """Audio latent frames per stereo channel that cover `frames` video frames: round(frames / 24 * 40) (diffusers'
+    audio_latent_num_frames; a still: 2, the one-frame layout's)."""
+    return int(round(int(frames) / FPS * AUDIO_LATENTS_PER_SECOND))
+
+
+def temporal_positions(latent_frames: int) -> torch.Tensor:
+    """[T] float64 rotary time of each latent frame from 0 (diffusers' _temporal_position_grid without its origin)."""
+    spans = torch.tensor([ROPE_FRAME_RESCALE * ROPE_FRAMES_PER_LATENT[k % len(ROPE_FRAMES_PER_LATENT)]
+                          for k in range(int(latent_frames))], dtype=torch.float64)
+    return torch.cat([torch.zeros(1, dtype=torch.float64), spans[:-1].cumsum(0)])
+
 
 def shift_sigma(base, shift: float):
     """The schedulers' exponential shift: s * b / (1 + (s - 1) * b)."""
@@ -477,6 +532,8 @@ class MiniMaxH3Transformer(nn.Module):
         # the audio VAE's encoding of 1600 zero samples, normalized: [4, 32] rows (left f0, f1, right f0, f1). Set by
         # the loader (h3/loading.py); None: zeros (logged once)
         self.audio_silence: torch.Tensor | None = None
+        # [2, frames, 32]: a 15 s zero waveform's encoding, normalized, per channel (clips: h3/loading.py)
+        self.audio_silence_long: torch.Tensor | None = None
         self.audio_noise_seed = 0  # the placeholder's noise: a fresh draw per forward, reproducible per run
         apply_silu = not self.pruned and adaln_rank is None
         t_dim = adaln_rank + 1 if adaln_rank is not None else time_embed_dim
@@ -544,15 +601,28 @@ class MiniMaxH3Transformer(nn.Module):
         return emb
 
     # ---- layout
-    def positions(self, text_lens: torch.Tensor, text_len: int, height: int, width: int) -> torch.Tensor:
+    def audio_frames_for(self, latent_frames: int = 1) -> int:
+        """Audio latent frames per channel beside a target of `latent_frames` video latent frames (0 without audio):
+        the one-frame layout's 2 for a still, the clip's length at 40 per second for a clip."""
+        if not self.has_audio:
+            return 0
+        if latent_frames <= 1:
+            return self.audio_frames
+        return audio_latent_frames(pixel_frames(latent_frames))
+
+    def positions(self, text_lens: torch.Tensor, text_len: int, height: int, width: int,
+                  latent_frames: int = 1) -> torch.Tensor:
         """[B, S + 4 + N, 3] float64 RoPE positions of [text | audio | video] (see the module docstring); without an
         audio stream [B, S + N, 3] of [text | image], diffusers' build_image_packed_sequence for a text-to-image
-        request."""
+        request. A clip (latent_frames above 1) is diffusers' build_packed_sequence for t2va: its latent frames
+        frame-major at the rotary times of temporal_positions from L, its audio rows audio_frames_for(T) per
+        channel."""
         batch = text_lens.shape[0]
-        frames = self.audio_frames
+        frames = self.audio_frames_for(latent_frames)
         n_audio = frames * AUDIO_CHANNELS
         grid, w_axis = frame_grid(height, width)
-        n_video = grid.shape[0]
+        per_frame = grid.shape[0]
+        n_video = per_frame * int(latent_frames)
         pos = torch.zeros(batch, text_len + n_audio + n_video, 3, dtype=torch.float64)
         pos[:, :text_len, 0] = torch.arange(text_len, dtype=torch.float64)
         cursor = text_lens.detach().to("cpu", torch.float64).view(batch, 1)
@@ -561,14 +631,22 @@ class MiniMaxH3Transformer(nn.Module):
             pos[:, a0:v0, 0] = cursor + torch.arange(frames, dtype=torch.float64).repeat(AUDIO_CHANNELS)[None]
             pos[:, a0:v0, 2] = torch.cat([torch.full((frames,), float(w_axis[0]), dtype=torch.float64),
                                           torch.full((frames,), float(w_axis[-1]), dtype=torch.float64)])[None]
-        pos[:, v0:, 0] = cursor
-        pos[:, v0:, 1:] = grid[None]
+        times = temporal_positions(latent_frames).repeat_interleave(per_frame)  # [T * N], 0 for a still
+        pos[:, v0:, 0] = cursor + times[None]
+        pos[:, v0:, 1:] = grid.repeat(int(latent_frames), 1)[None]
         return pos
 
-    def audio_placeholder(self, sigma_a: torch.Tensor, batch: int, device, noise: torch.Tensor | None = None):
-        """[B, 4, 32] fp32: the silence latent noised to each sample's audio sigma."""
-        n_audio = self.audio_frames * AUDIO_CHANNELS
+    def audio_placeholder(self, sigma_a: torch.Tensor, batch: int, device, noise: torch.Tensor | None = None,
+                          frames: int | None = None):
+        """[B, 2 * frames, 32] fp32 (frames: audio latent frames per channel, default the one-frame layout's 2): the
+        silence latent noised to each sample's audio sigma. A clip's silence is the first `frames` of each channel
+        of the long silence latent (audio_silence_long, a 15 s zero waveform encoded once), else its still one
+        repeated."""
+        frames = self.audio_frames if frames is None else int(frames)
+        n_audio = frames * AUDIO_CHANNELS
         silence = self.audio_silence
+        if frames != self.audio_frames and silence is not None:
+            silence = self._clip_silence(frames)
         if silence is None:
             if not getattr(self, "_warned_silence", False):
                 import logging
@@ -584,6 +662,15 @@ class MiniMaxH3Transformer(nn.Module):
             noise = torch.randn(batch, n_audio, self.audio_channels, generator=gen)
         s = sigma_a.to(device, torch.float32).view(-1, 1, 1)
         return (1.0 - s) * silence + s * noise.to(device, torch.float32)
+
+    def _clip_silence(self, frames: int) -> torch.Tensor:
+        """[2 * frames, 32] channel-major silence for a clip: the long silence latent's first frames per channel;
+        without one (or a clip longer than it), the still silence's last frame of each channel repeated."""
+        long = self.audio_silence_long
+        if long is not None and long.shape[1] >= frames:
+            return long[:, :frames].reshape(-1, long.shape[-1])
+        still = self.audio_silence.reshape(AUDIO_CHANNELS, -1, self.audio_channels)
+        return still[:, -1:].expand(AUDIO_CHANNELS, frames, self.audio_channels).reshape(-1, self.audio_channels)
 
     def pdd_weights(self, sigma: torch.Tensor, sigma_next=None) -> torch.Tensor | None:
         """[B, pdd_steps] head weights for a forward at `sigma` [B] (None without PDD heads): the interval holding each
@@ -604,28 +691,39 @@ class MiniMaxH3Transformer(nn.Module):
         """timestep: the video noise level in 0..1000 (sigma * 1000). audio_states: [B, 4, 32] audio rows at the
         matching audio sigma (None: the noised silence placeholder). Returns the noise-ward velocity [B, 24, h, w]
         (fp32), and with return_audio also the audio rows' [B, 4, 32]. sigma_next (PDD heads only): the sigma a
-        sampling step goes to, for the heads it spans; None is a training forward."""
+        sampling step goes to, for the heads it spans; None is a training forward.
+
+        A clip [B, 24, T, h, w] (T = 5n + 2 latent frames: clip samples, video clip training; H3 with its audio stream
+        only) comes back in that shape, its audio rows 2 * audio_frames_for(T). The alignment taps read stills only."""
         skip_layers = frozenset(skip_layers or ())
-        if hidden_states.ndim != 4 or hidden_states.shape[1] != self.latent_channels:
-            raise ValueError(f"hidden_states must be one frame of latents [B, {self.latent_channels}, H/16, W/16]")
+        clip = hidden_states.ndim == 5
+        if hidden_states.ndim not in (4, 5) or hidden_states.shape[1] != self.latent_channels:
+            raise ValueError(f"hidden_states must be latents [B, {self.latent_channels}, H/16, W/16] or a clip "
+                             f"[B, {self.latent_channels}, T, H/16, W/16]")
+        if clip and not self.has_audio:
+            raise ValueError("this model renders stills only (MiniMax-H3-Image): no clips")
         if encoder_hidden_states.ndim != 3 or encoder_hidden_states.shape[2] != self.text_dim:
             raise ValueError(f"encoder_hidden_states must be [B, S, {self.text_dim}]")
-        batch, _, out_h, out_w = hidden_states.shape
+        n_frames = hidden_states.shape[2] if clip else 1
+        if not clip:
+            hidden_states = hidden_states.unsqueeze(2)  # one layout below: [B, C, T, h, w]
+        batch, out_h, out_w = hidden_states.shape[0], hidden_states.shape[-2], hidden_states.shape[-1]
         if out_h % PATCH or out_w % PATCH:  # not a 32 px image (a probe size): padded to whole tokens and cropped
             # after, as ComfyUI's pad_to_patch_size does (circular); training buckets are multiples of 32 px
-            hidden_states = F.pad(hidden_states, (0, out_w % PATCH, 0, out_h % PATCH), mode="circular")
+            hidden_states = F.pad(hidden_states, (0, out_w % PATCH, 0, out_h % PATCH, 0, 0), mode="circular")
         height, width = hidden_states.shape[-2:]
         device = hidden_states.device
         dtype = _wdtype(self.condition_proj)
         text_len = encoder_hidden_states.shape[1]
-        n_audio = self.audio_frames * AUDIO_CHANNELS
+        audio_frames = self.audio_frames_for(n_frames)
+        n_audio = audio_frames * AUDIO_CHANNELS
 
         sigma_v = torch.as_tensor(timestep, device=device, dtype=torch.float32).reshape(-1).expand(batch) / 1000.0
         if self.has_audio:
             sigma_a = audio_sigma(sigma_v, self.shift_video, self.shift_audio)
             temb = self.time_embedding(torch.cat([1.0 - sigma_v, 1.0 - sigma_a]))  # [2B, t_dim]: video, then audio
             if audio_states is None:
-                audio_states = self.audio_placeholder(sigma_a, batch, device)
+                audio_states = self.audio_placeholder(sigma_a, batch, device, frames=audio_frames)
             if audio_states.shape != (batch, n_audio, self.audio_channels):
                 raise ValueError(f"audio_states must be [B, {n_audio}, {self.audio_channels}]")
         else:
@@ -640,16 +738,18 @@ class MiniMaxH3Transformer(nn.Module):
         else:
             valid, padded = None, False
             text_lens = torch.full((batch,), text_len, device=device, dtype=torch.long)
-        n_video = (height // PATCH) * (width // PATCH)
+        n_video = n_frames * (height // PATCH) * (width // PATCH)
         key_mask = txt_mask = None
         if padded:
             key_mask = torch.cat([valid, valid.new_ones(batch, n_audio + n_video)], dim=1)[:, None, None, :]
             txt_mask = valid[:, None, None, :]
-        pos = self.positions(text_lens, text_len, height, width).to(device)
+        pos = self.positions(text_lens, text_len, height, width, n_frames).to(device)
         cos, sin = rope_tables(pos, inv_freq(self.rope_freq_dim, self.rope_theta, device))
 
         txt = self.token_refiner(self.condition_proj(encoder_hidden_states.to(device, dtype)), txt_mask)
-        vid = self.video_patch_proj(patchify(hidden_states).to(_wdtype(self.video_patch_proj))).to(txt.dtype)
+        # frame-major rows, each frame row-major (diffusers' patchify_video_latents with a 1x2x2 patch)
+        rows = patchify(hidden_states.transpose(1, 2).flatten(0, 1)).unflatten(0, (batch, n_frames)).flatten(1, 2)
+        vid = self.video_patch_proj(rows.to(_wdtype(self.video_patch_proj))).to(txt.dtype)
         if self.has_audio:
             aud = self.audio_patch_proj(audio_states.to(device, _wdtype(self.audio_patch_proj))).to(txt.dtype)
             x = torch.cat([txt, aud, vid], dim=1)
@@ -658,6 +758,8 @@ class MiniMaxH3Transformer(nn.Module):
 
         split = getattr(self, "split_devices", None)  # blocks may live on several devices (model split)
         taps = getattr(self, "_rz_taps", None)  # rulztrainer.alignment (training-only losses), on the latent cells
+        if clip:
+            taps = None
         hp, wp = height // PATCH, width // PATCH
         if taps is not None:
             for blk in self.blocks:
@@ -684,7 +786,12 @@ class MiniMaxH3Transformer(nn.Module):
             if fdev is not None and x.device != fdev:
                 x, temb = x.to(fdev), temb.to(fdev)
         video, audio = self.final_layer(x, temb, text_len, n_audio, self.pdd_weights(sigma_v, sigma_next))
-        out = -unpatchify(video.float(), self.latent_channels, height, width)[:, :, :out_h, :out_w].to(device)
+        if clip:  # frame-major rows -> [B, C, T, h, w]
+            frames = unpatchify(video.float().unflatten(1, (n_frames, hp * wp)).flatten(0, 1), self.latent_channels,
+                                height, width)
+            out = -frames.unflatten(0, (batch, n_frames)).transpose(1, 2)[..., :out_h, :out_w].to(device)
+        else:
+            out = -unpatchify(video.float(), self.latent_channels, height, width)[:, :, :out_h, :out_w].to(device)
         if return_audio:
             return out, -audio.float().to(device)
         return out
