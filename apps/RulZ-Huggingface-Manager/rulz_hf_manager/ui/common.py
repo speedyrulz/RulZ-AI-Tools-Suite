@@ -260,6 +260,7 @@ def frame(active: str = '') -> Iterator[PageLook]:
                 ui.label('HUGGINGFACE MANAGER').classes('rz-wordmark gt-xs')
             ui.element('div').classes('w-3')
             for label, icon, target, key in (('My Hub', 'space_dashboard', '/', 'hub'),
+                                             ('vast.ai', 'dns', '/vast', 'vast'),
                                              ('Settings', 'settings', '/settings', 'settings')):
                 btn = ui.button(label, icon=icon, on_click=lambda t=target: ui.navigate.to(t), color=None) \
                     .props('flat no-caps dense').classes('rz-nav-btn gt-sm')

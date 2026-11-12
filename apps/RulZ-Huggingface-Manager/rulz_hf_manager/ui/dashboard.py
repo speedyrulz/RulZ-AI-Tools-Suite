@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from nicegui import run, ui
 
-from .. import config, hub
+from .. import config, hub, vast
 from .common import SIZE_FORMAT_JS, browse_url, fmt_ago, fmt_date, frame, notify_error
 from .repo_actions import create_dialog, delete_dialog, duplicate_dialog, rename_dialog, visibility_dialog
+from .vast_page import add_to_basket, send_dialog
 
 _last_namespace: str | None = None
 
@@ -30,6 +31,13 @@ async def dashboard_page() -> None:
                     ui.icon('filter_list')
                 ui.space()
                 ui.button(icon='refresh', on_click=lambda: load()).props('flat round').tooltip('Refresh')
+                with ui.button('To vast.ai', icon='cloud_upload').props('flat no-caps') as vast_btn:
+                    with ui.menu().props('auto-close'):
+                        ui.menu_item('Send the ticked repos to my vast.ai instance...',
+                                     on_click=lambda: send_dialog(selected_sources()))
+                        ui.menu_item('Add them to the vast.ai transfer list',
+                                     on_click=lambda: add_to_basket(selected_sources()))
+                vast_btn.tooltip('Tick repos in the table, then send them whole to your vast.ai instance')
                 new_btn = ui.button('New', icon='add', on_click=lambda: create_dialog(
                     state['namespaces'], ns_select.value or '', kind_toggle.value if kind_toggle.value != 'all' else 'model'))
             stats = ui.row().classes('w-full gap-3')
@@ -46,7 +54,7 @@ async def dashboard_page() -> None:
             {'name': 'stats', 'label': '', 'field': 'stats', 'align': 'left'},
             {'name': 'actions', 'label': '', 'field': 'id', 'align': 'right'},
         ]
-        table = ui.table(columns=columns, rows=[], row_key='key',
+        table = ui.table(columns=columns, rows=[], row_key='key', selection='multiple',
                          pagination={'rowsPerPage': 50, 'sortBy': 'updated', 'descending': True}) \
             .props('flat bordered binary-state-sort :rows-per-page-options="[25,50,100,0]" '
                    'no-data-label="Nothing here yet." loading-label="Loading..." no-results-label="No match."') \
@@ -81,6 +89,13 @@ async def dashboard_page() -> None:
                     <q-item clickable @click="$parent.$emit('act', {action: 'favorite', row: props.row})">
                       <q-item-section avatar><q-icon :name="props.row.favorite ? 'star' : 'star_outline'"/></q-item-section>
                       <q-item-section>{{ props.row.favorite ? 'Remove from favorites' : 'Add to favorites' }}</q-item-section></q-item>
+                    <q-item clickable @click="$parent.$emit('act', {action: 'vast', row: props.row})">
+                      <q-item-section avatar><q-icon name="cloud_upload"/></q-item-section>
+                      <q-item-section>Send to vast.ai...</q-item-section></q-item>
+                    <q-item clickable @click="$parent.$emit('act', {action: 'basket', row: props.row})">
+                      <q-item-section avatar><q-icon name="playlist_add"/></q-item-section>
+                      <q-item-section>Add to vast.ai transfer list</q-item-section></q-item>
+                    <q-separator/>
                     <q-item clickable @click="$parent.$emit('act', {action: 'rename', row: props.row})">
                       <q-item-section avatar><q-icon name="drive_file_rename_outline"/></q-item-section>
                       <q-item-section>Rename / transfer</q-item-section></q-item>
@@ -113,6 +128,17 @@ async def dashboard_page() -> None:
             'size': r.size, 'updated': fmt_date(r.updated), 'updated_ago': fmt_ago(r.updated),
             'stats': ' / '.join(bits), 'favorite': settings.is_favorite(r.kind, r.id),
         }
+
+    def selected_sources() -> list[vast.Source]:
+        return [vast.Source(r['kind'], r['id']) for r in table.selected]
+
+    def update_vast_btn() -> None:
+        n = len(table.selected)
+        vast_btn.set_text(f'To vast.ai ({n})' if n else 'To vast.ai')
+        vast_btn.set_enabled(n > 0)
+
+    table.on_select(lambda _: update_vast_btn())
+    update_vast_btn()
 
     def apply_filter() -> None:
         kind = kind_toggle.value
@@ -184,6 +210,10 @@ async def dashboard_page() -> None:
             await visibility_dialog(kind, repo_id, row['visibility'] != 'public', on_done=lambda _: load())
         elif action == 'duplicate':
             await duplicate_dialog(kind, repo_id)
+        elif action == 'vast':
+            await send_dialog([vast.Source(kind, repo_id)])
+        elif action == 'basket':
+            add_to_basket([vast.Source(kind, repo_id)])
         elif action == 'delete':
             await delete_dialog(kind, repo_id, on_done=load)
 

@@ -65,7 +65,7 @@ def main(argv: list[str] | None = None) -> None:
 
     from nicegui import app, ui
 
-    from .ui import browser, dashboard, settings_page, theme  # noqa: F401  (registers the pages)
+    from .ui import browser, dashboard, settings_page, theme, vast_page  # noqa: F401  (registers the pages)
 
     theme.setup()
 
