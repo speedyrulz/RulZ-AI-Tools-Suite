@@ -24,6 +24,12 @@ class Settings:
     port: int = 8765
     favorites: list[dict] = field(default_factory=list)  # [{"kind": "model", "id": "user/name"}]
     recent: list[dict] = field(default_factory=list)
+    # vast.ai
+    vast_api_key: str = ''  # empty: VAST_API_KEY or the key the vastai CLI saved
+    ssh_key: str = ''  # empty: ssh's own defaults (~/.ssh/id_ed25519, id_rsa...)
+    vast_conn: dict = field(default_factory=dict)  # the attached instance (see vast.Conn)
+    vast_recent_dests: list[str] = field(default_factory=list)
+    vast_layout: str = 'keep'
 
     def effective_download_dir(self) -> Path:
         return Path(self.download_dir).expanduser() if self.download_dir else default_download_dir()

@@ -12,12 +12,13 @@ from urllib.parse import unquote
 
 from nicegui import app, events, run, ui
 
-from .. import config, hub
+from .. import config, hub, vast
 from ..jobs import Job
 from .common import (SIZE_FORMAT_JS, browse_url, commit_fields, confirm, fmt_ago, fmt_date, frame, notify_error,
                      notify_ok, prompt, run_job)
 from .pickers import pick_local, pick_remote_folder
 from .repo_actions import delete_dialog, duplicate_dialog, rename_dialog, visibility_dialog
+from .vast_page import add_to_basket, send_dialog
 
 TEXT_EXT = {'.md', '.txt', '.json', '.jsonl', '.yaml', '.yml', '.toml', '.py', '.js', '.ts', '.tsx', '.jsx', '.sh',
             '.cfg', '.ini', '.csv', '.tsv', '.html', '.css', '.xml', '.sql', '.gitattributes', '.gitignore',
@@ -194,6 +195,14 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
                                 if is_bucket:
                                     ui.menu_item('Sync bucket folder to this computer...',
                                                  on_click=lambda: sync_dialog('down'))
+                        with ui.button('To vast.ai', icon='cloud_upload').props('flat no-caps') as vast_btn:
+                            with ui.menu().props('auto-close'):
+                                ui.menu_item('Send to my vast.ai instance...',
+                                             on_click=lambda: send_dialog([vast_source()]))
+                                ui.menu_item('Add to the vast.ai transfer list',
+                                             on_click=lambda: add_to_basket([vast_source()]))
+                        vast_btn.tooltip('Straight from Hugging Face to your vast.ai instance: the ticked files '
+                                         'and folders, or everything here')
                         rename_btn = ui.button('Rename', icon='drive_file_rename_outline',
                                                on_click=lambda: rename_selected()).props('flat no-caps')
                         move_btn = ui.button('Move', icon='drive_file_move', on_click=lambda: move_selected(False)) \
@@ -274,8 +283,19 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
     def selected_entries() -> list[hub.Entry]:
         return [state['entries'][r['path']] for r in table.selected if r['path'] in state['entries']]
 
+    def vast_source() -> vast.Source:
+        picked = selected_entries()
+        if picked:
+            return vast.Source.from_entries(kind, repo_id, fs.revision, picked)
+        folder = state['folder']
+        if folder:
+            return vast.Source(kind, repo_id, fs.revision, [folder], [folder])
+        return vast.Source(kind, repo_id, fs.revision)
+
     def update_buttons() -> None:
         n = len(table.selected)
+        vast_btn.set_text(f'To vast.ai ({n})' if n else ('To vast.ai (this folder)' if state['folder']
+                                                          else 'To vast.ai (whole repo)'))
         for b in (move_btn, copy_btn, copy_to_btn, delete_btn):
             b.set_enabled(n > 0)
         rename_btn.set_enabled(n == 1)
