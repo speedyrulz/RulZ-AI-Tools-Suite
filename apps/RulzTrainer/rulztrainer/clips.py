@@ -1,6 +1,17 @@
-"""Sample and probe clips of a video model (PAN 2): the frames as an animated WebP beside the still the galleries,
-the scorers and the run report read. A WebP plays in every browser as an image, so it needs no player and no video
-codec."""
+"""Clips of a video model (PAN 2, MiniMax H3).
+
+Samples and probes: the frames as an animated WebP beside the still the galleries, the scorers and the run report
+read. A WebP plays in every browser as an image, so it needs no player and no video codec.
+
+Training clips: video files in a dataset (train_frames above 1) are read with PyAV (`av`, which bundles its own
+FFmpeg). Which frames a clip takes follows ai-toolkit's dataloader (toolkit/dataloader_mixins.py):
+  - "fps" (default): real time from the start of the video, at the model's frame rate (24): frame i is the source
+    frame nearest i * source_fps / 24, so motion keeps its speed and the tail that does not fit is left out
+    (ai-toolkit's auto_frame_count + trim_auto_frame_count_tail, the one it recommends for MiniMax H3). A video too
+    short for that is spread over instead (its own fallback).
+  - "spread": the whole video squeezed or stretched onto the frame count, evenly spaced (ai-toolkit's default,
+    shrink_video_to_frames), which speeds motion up on a long video.
+Frames are decoded in one sequential pass (no seeking, which lands off by a frame on B-frame streams)."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -31,3 +42,81 @@ def save_clip(path: str | Path, frames: np.ndarray, fps: float, quality: int = 8
     images[0].save(path, format="WEBP", save_all=True, append_images=images[1:], duration=max(1, round(1000 / fps)),
                    loop=0, quality=quality, method=3)
     return path
+
+
+def video_info(path: str | Path) -> tuple[int, int, int, float]:
+    """(width, height, frame count, frames per second) of a video file from its header. The frame count is the
+    container's (or duration x rate when it has none), so it can be off by a few; reading tolerates that."""
+    import av
+
+    with av.open(str(path)) as c:
+        st = c.streams.video[0]
+        w, h = int(st.codec_context.width), int(st.codec_context.height)
+        fps = float(st.average_rate or st.guessed_rate or 24.0)
+        n = int(st.frames or 0)
+        if n <= 0:
+            dur = float(st.duration * st.time_base) if st.duration is not None else (
+                float(c.duration) / 1e6 if c.duration else 0.0)
+            n = int(round(dur * fps))
+        rot = _rotation(st)
+    if rot in (90, 270):
+        w, h = h, w
+    return w, h, max(1, n), fps
+
+
+def _rotation(stream) -> int:
+    """The display rotation a phone video carries (0, 90, 180, 270), from its side data or metadata."""
+    try:
+        for sd in getattr(stream, "side_data", None) or []:
+            rot = getattr(sd, "rotation", None)
+            if rot is not None:
+                return int(round(-float(rot))) % 360
+    except Exception:  # noqa: BLE001 - older PyAV: no side data
+        pass
+    try:
+        return int(stream.metadata.get("rotate", 0)) % 360
+    except (TypeError, ValueError):
+        return 0
+
+
+def pick_frames(total: int, src_fps: float, frames: int, fps: float, mode: str = "fps") -> list[int]:
+    """The source frame indices of a clip of `frames` frames at `fps` (see the module docstring). Ascending, and
+    repeated where a short video has to be stretched."""
+    total, frames = max(1, int(total)), max(1, int(frames))
+    last = total - 1
+    if frames == 1:
+        return [0]
+    ratio = (src_fps / fps) if src_fps and src_fps > 0 else 1.0
+    if mode == "fps" and round((frames - 1) * ratio) <= last:
+        return [min(int(round(i * ratio)), last) for i in range(frames)]
+    step = last / (frames - 1)
+    return [min(int(round(i * step)), last) for i in range(frames)]
+
+
+def read_frames(path: str | Path, frames: int, fps: float, mode: str = "fps") -> list:
+    """A clip of `frames` frames (PIL RGB pictures, upright) from a video file. A container that holds fewer frames
+    than its header said repeats its last frame."""
+    import av
+
+    _, _, total, src_fps = video_info(path)
+    want = pick_frames(total, src_fps, frames, fps, mode)
+    need = sorted(set(want))
+    got: dict[int, Image.Image] = {}
+    with av.open(str(path)) as c:
+        st = c.streams.video[0]
+        st.thread_type = "AUTO"
+        rot = _rotation(st)
+        k = 0
+        for frame in c.decode(st):
+            if k in need:
+                img = frame.to_image().convert("RGB")
+                if rot in (90, 180, 270):  # counter-clockwise in PIL: the display turns it clockwise
+                    img = img.rotate(-rot, expand=True)
+                got[k] = img
+            k += 1
+            if k > need[-1]:
+                break
+    if not got:
+        raise ValueError(f"no video frames could be read from {path}")
+    last_read = max(got)
+    return [got[min(i, last_read)] for i in want]

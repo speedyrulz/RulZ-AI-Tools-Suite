@@ -41,7 +41,7 @@ def forward_backward(job):
     cfg = ctx.cfg
     latents = latents.to(rdev, torch.float32)
     embeds, mask, sigma, noise = embeds.to(rdev), mask.to(rdev), sigma.to(rdev), noise.to(rdev)
-    s = sigma.view(-1, 1, 1, 1)
+    s = sigma.view(-1, *([1] * (latents.ndim - 1)))  # a still [B, C, h, w] or a clip [B, C, T, h, w]
     noisy = (1 - s) * latents + s * noise
     target = noise - latents
     noisy_in = noisy.to(torch.bfloat16)
@@ -56,7 +56,7 @@ def forward_backward(job):
         class_w = regionwatch.weight_maps([rm.parts for rm in regions.meta], [fixed] * len(batch), sq) if fixed else None
         if class_w is not None:
             sq = sq * class_w
-    per = sq.mean(dim=(1, 2, 3))
+    per = sq.mean(dim=tuple(range(1, sq.ndim)))
     if regions is not None and cfg.region_weights and cfg.region_prior_weight > 0 and bool(regions.prior.any()):
         lora_mod.set_multiplier(rinj, 0.0)
         try:
@@ -90,7 +90,7 @@ def work_list(entry):
     for job in entry[1]:
         t0 = time.perf_counter()
         res = forward_backward(job)  # its .item() waits for the GPU, so this is the batch's own time
-        out.append((res, time.perf_counter() - t0, job[2].shape[2] * job[2].shape[3]))
+        out.append((res, time.perf_counter() - t0, job[2][0, 0].numel()))
     return out
 
 
@@ -225,7 +225,7 @@ class RaceParallelMixin:
                     batch = next(st["batch_iter"])
                     step_images[v.idx] = step_images.get(v.idx, 0) + len(batch)
                     latents, embeds, mask, regions = load_batch(batch, cfg, st["rng"])
-                    tok = latents.shape[2] * latents.shape[3]
+                    tok = latents.shape[-2] * latents.shape[-1]
                     shift = st["ts_logit_shift"] + (self._clean_offset(  # clean_share: the epoch's share
                         cfg, st["step"], tok, st.get("batcher"), cfg.batch_size * cfg.gradient_accumulation)
                         if cfg.clean_share else 0.0)

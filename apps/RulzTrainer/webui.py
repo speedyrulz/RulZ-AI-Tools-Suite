@@ -26,7 +26,7 @@ from nicegui import app, background_tasks, run, ui
 
 from rulztrainer.archs import get_arch
 from rulztrainer.config import (AUTOMAGIC, KEEL, OPTIMIZERS, ARCH_DEFAULT_TARGETS, ARCH_SAMPLE_DEFAULTS, ARCH_TURBO, MEGAPIXEL_CHOICES,
-                                MODEL_PRESETS, ARCH_SAMPLE_LORA,
+                                MODEL_PRESETS, ARCH_SAMPLE_LORA, VIDEO_ARCHS, VIDEO_EXTS,
                                 PRESET_PROBE_PROMPTS, PRESETS, TrainConfig, apply_preset, mp_to_side, side_to_mp)
 from rulztrainer import __version__, bodysim, facesim, history, lookfilter, machine, oom_recovery, promptcheck
 from rulztrainer.train_queue import TrainQueue
@@ -1638,6 +1638,8 @@ class Form:
             sample_seed=int(v("sample_seed")),
             sample_walk_seed=bool(v("sample_walk_seed")), sample_before_training=bool(v("sample_before_training")),
             sample_frames=int(v("sample_frames") or 1), probe_frames=int(v("probe_frames") or 1),
+            train_frames=int(v("train_frames") or 1), train_video_mode=v("train_video_mode") or "fps",
+            video_resolution=int(v("video_resolution") or 0),
             steps=0 if v("soup_run") or v("noise_run") else int(v("steps")), batch_size=int(v("batch_size")),
             gradient_accumulation=int(v("gradient_accumulation")), learning_rate=float(v("learning_rate")),
             optimizer=v("optimizer"), lr_scheduler=v("lr_scheduler"), warmup_steps=int(v("warmup_steps")),
@@ -3082,6 +3084,7 @@ def make_thumbs(images: list[Path], root: Path) -> list[Path]:
 DATASETS_ROOT = ROOT / "datasets"  # where Create dataset puts new datasets (git-ignored)
 DATASETS_REGISTRY = ".rulz_datasets.json"  # in DATASETS_ROOT: dataset folders elsewhere that were added to the list
 CAPTION_EXTS = {".txt", ".json"}
+DATASET_FILE_EXTS = IMAGE_EXTS | CAPTION_EXTS | set(VIDEO_EXTS)  # what an upload or a folder copy takes
 _RESERVED_NAMES = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
 
 
@@ -3176,10 +3179,11 @@ def known_datasets(extra=(), root: Path | None = None) -> list[str]:
 
 
 def upload_target(dest, name: str) -> Path | None:
-    """Where an uploaded file goes in a dataset folder: its own file name (a same-named file is replaced), for images
-    and .txt / .json captions only; None for any other kind of file. The folder is created."""
+    """Where an uploaded file goes in a dataset folder: its own file name (a same-named file is replaced), for images,
+    video clips (PAN 2 and MiniMax H3 train them) and .txt / .json captions only; None for any other kind of file.
+    The folder is created."""
     fname = Path(str(name).replace("\\", "/")).name  # the name only: never a folder from the browser
-    if not fname or fname.startswith(".") or Path(fname).suffix.lower() not in IMAGE_EXTS | CAPTION_EXTS:
+    if not fname or fname.startswith(".") or Path(fname).suffix.lower() not in DATASET_FILE_EXTS:
         return None
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
@@ -3187,7 +3191,7 @@ def upload_target(dest, name: str) -> Path | None:
 
 
 def copy_into_dataset(src, dest) -> dict:
-    """Copy the images and captions (.txt, .json) of a folder on this machine into a dataset, sub-folders included
+    """Copy the images, video clips and captions (.txt, .json) of a folder on this machine into a dataset, sub-folders included
     and kept; files the dataset already has stay as they are. Returns {"copied", "kept", "ignored"} counts."""
     src, dest = Path(src), Path(dest)
     if not src.is_dir():
@@ -3198,7 +3202,7 @@ def copy_into_dataset(src, dest) -> dict:
     for p in sorted(src.rglob("*")):
         if not p.is_file() or ".rulz_cache" in p.parts:
             continue
-        if p.suffix.lower() not in IMAGE_EXTS | CAPTION_EXTS:
+        if p.suffix.lower() not in DATASET_FILE_EXTS:
             out["ignored"] += 1
             continue
         target = dest / p.relative_to(src)
@@ -3591,7 +3595,7 @@ def build_dataset_tab(f: Form):
         with ui.row().classes("w-full items-center gap-3"):
             upload = ui.upload(label="Upload images and captions (drop files here)", multiple=True, auto_upload=True,
                                on_multi_upload=lambda e: on_upload(e)) \
-                .props("accept=.png,.jpg,.jpeg,.webp,.bmp,.txt,.json flat bordered color=transparent") \
+                .props(f"accept={','.join(sorted(DATASET_FILE_EXTS))} flat bordered color=transparent") \
                 .classes("w-[36rem] max-w-full")
             ui.space()
             with ui.row().classes("items-center gap-1 no-wrap"):
@@ -8663,6 +8667,31 @@ def build_page(local: bool = True):
                         with fields():
                             w["enable_buckets"] = ui.switch("Aspect-ratio buckets", value=True)
                             w["flip_augment"] = ui.switch("Horizontal flip augment", value=False)
+                        with fields() as video_row:
+                            w["train_frames"] = ui.number("Frames per training clip", value=d.train_frames, min=1,
+                                                          max=361, precision=0).classes("w-48") \
+                                .tooltip("Video clip training. 1 trains on pictures only and leaves video files "
+                                         "(.mp4, .mov, .webm, .mkv, .avi, .m4v) out. More trains every video file of "
+                                         "the dataset as a clip of that many frames at 24 frames per second, with "
+                                         "its caption file beside it, as for a picture; pictures in the same "
+                                         "dataset still train as stills. PAN 2 rounds down to 4k + 1 (49 is 2 "
+                                         "seconds), MiniMax H3 up to 17n + 5 (39, 56, ...). Face crops, region "
+                                         "weights and the identity loss work on pictures only.")
+                            w["train_video_mode"] = ui.select(
+                                {"fps": "Real time from the start", "spread": "Spread over the whole video"},
+                                value=d.train_video_mode, label="Clip frames").classes("w-64") \
+                                .tooltip("Real time keeps motion at its speed: the clip is the first seconds of "
+                                         "the video at 24 fps (a video too short for it is spread instead). Spread "
+                                         "squeezes the whole video onto the clip's frames, which speeds motion up. "
+                                         "Trim your videos to the part you want for real time.")
+                            w["video_resolution"] = ui.number("Clip size (px, 0 = training resolution)",
+                                                              value=d.video_resolution, min=0, step=64,
+                                                              precision=0).classes("w-64") \
+                                .tooltip("A clip's square-equivalent side (its aspect ratio kept). A clip costs "
+                                         "about a picture per latent frame (PAN 2: one per 4 frames, MiniMax H3: 5 "
+                                         "per 17), so 512 keeps a 2 second clip near a 4 MP picture's memory.")
+                        video_row.bind_visibility_from(w["model_preset"], "value",
+                                                       lambda p: preset_arch(p, w["model_path"].value) in VIDEO_ARCHS)
                         with advanced("Captions and cache"):
                             with fields():
                                 w["caption_dropout"] = ui.number("Caption dropout", value=d.caption_dropout, min=0,
@@ -9416,12 +9445,14 @@ def build_page(local: bool = True):
                                                                         value=d.sample_before_training)
                                 w["sample_frames"] = ui.number("Frames per sample", value=d.sample_frames, min=1,
                                                                max=481, precision=0).classes("w-40") \
-                                    .tooltip("PAN 2 only. 1 renders a still. More renders a clip at 24 frames per "
-                                             "second (49 is 2 seconds; rounded down to 4k + 1), saved as an animated "
-                                             "WebP beside its middle frame. A clip takes many times a still's time "
-                                             "and memory: use a small size, about 0.35 MP.") \
+                                    .tooltip("PAN 2 and MiniMax H3 only. 1 renders a still. More renders a clip at "
+                                             "24 frames per second, saved as an animated WebP beside its middle "
+                                             "frame. PAN 2 rounds down to 4k + 1 (49 is 2 seconds), MiniMax H3 up to "
+                                             "17n + 5 (39, 56, ...). A clip takes many times a still's time and "
+                                             "memory: use a small size, about 0.35 MP.") \
                                     .bind_visibility_from(w["model_preset"], "value",
-                                                          lambda p: preset_arch(p, w["model_path"].value) == "pan2")
+                                                          lambda p: preset_arch(p, w["model_path"].value)
+                                                          in VIDEO_ARCHS)
                             w["sample_negative"] = ui.input("Negative prompt (optional)", value=d.sample_negative) \
                                 .classes("w-full")
                             with fields():
@@ -10236,11 +10267,13 @@ def build_page(local: bool = True):
                             with fields():
                                 w["probe_frames"] = ui.number("Frames per probe", value=d.probe_frames, min=1,
                                                               max=481, precision=0).classes("w-40") \
-                                    .tooltip("PAN 2 only. 1 scores a still. More renders each probe as a clip (24 "
-                                             "frames per second, 4k + 1 frames) and scores its middle frame, so the "
-                                             "score tells how the likeness holds in motion. Much slower.") \
+                                    .tooltip("PAN 2 and MiniMax H3 only. 1 scores a still. More renders each probe "
+                                             "as a clip (24 frames per second; PAN 2 4k + 1 frames, MiniMax H3 "
+                                             "17n + 5) and scores its middle frame, so the score tells how the "
+                                             "likeness holds in motion. Much slower.") \
                                     .bind_visibility_from(w["model_preset"], "value",
-                                                          lambda p: preset_arch(p, w["model_path"].value) == "pan2")
+                                                          lambda p: preset_arch(p, w["model_path"].value)
+                                                          in VIDEO_ARCHS)
                                 w["probe_seeds"] = ui.number("Seeds per probe", value=d.probe_seeds, min=1, max=8,
                                                              precision=0).classes("w-36") \
                                     .tooltip("Use 8 for a race. Even then, gaps of about 3 body points did not hold up "

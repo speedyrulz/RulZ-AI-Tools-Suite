@@ -1031,13 +1031,19 @@ class Trainer(RaceParallelMixin):
             self.race_base = cfg
             cfg = self.cfg = self._race_prep_config(cfg)
         items = scan_dataset(cfg)
-        log.info("Dataset: %d images in %s", len({it.image for it in items}),
+        # video clips (train_frames above 1) skip what reads pictures: face analysis, crops, region maps, the
+        # held-out photos, the look filter; their batches train on the plain loss (load_batch gives them no regions)
+        clips = [it for it in items if it.frames > 1]
+        items = [it for it in items if it.frames <= 1]
+        log.info("Dataset: %d images%s in %s", len({it.image for it in items}),
+                 f" and {len(clips)} video clips of {clips[0].frames} frames" if clips else "",
                  ", ".join(spec.path for spec in cfg.dataset_specs()))
         items = self.analyze_dataset(items)
         items = self._split_holdout(cfg, items)
         self.look_outliers = self._look_outlier_images(cfg, items)
         if cfg.isolation:
             items = self._isolation_prepare(cfg, items)
+        items = items + clips
         self.prepare_cache(items + self.holdout_items)  # (the held-out photos need latents and texts for their sweeps)
 
         self.status.update(stage="loading transformer", step=0, total=cfg.steps)
@@ -1334,7 +1340,7 @@ class Trainer(RaceParallelMixin):
                 observe(sigma, hook=rmodel is model)  # gradient reaches take_replica, not the hook
             latents = latents.to(rdev, torch.float32)
             embeds, mask, sigma, noise = embeds.to(rdev), mask.to(rdev), sigma.to(rdev), noise.to(rdev)
-            s = sigma.view(-1, 1, 1, 1)
+            s = sigma.view(-1, *([1] * (latents.ndim - 1)))  # [B, C, h, w], or a clip's [B, C, T, h, w]
             noisy = (1 - s) * latents + s * noise
             target = noise - latents
             noisy_in = noisy.to(torch.bfloat16)
@@ -1386,7 +1392,7 @@ class Trainer(RaceParallelMixin):
                 sq = sq * wmap
             elif class_w is not None:
                 sq = sq * class_w
-            per = sq.mean(dim=(1, 2, 3))
+            per = sq.mean(dim=tuple(range(1, sq.ndim)))
             base_pred = None
 
             def lora_off_pred():
@@ -1464,7 +1470,7 @@ class Trainer(RaceParallelMixin):
             for job in entry[1]:
                 t0 = time.perf_counter()
                 res = work(job)  # its .item() waits for the GPU, so this is the batch's own time
-                out.append((res, time.perf_counter() - t0, job[2].shape[2] * job[2].shape[3]))
+                out.append((res, time.perf_counter() - t0, job[2][0, 0].numel()))  # latent cells (all frames)
             return out
 
         def ft_rotate(at_step: int) -> None:
@@ -1518,7 +1524,7 @@ class Trainer(RaceParallelMixin):
                     batch = next(self.batch_iter)  # lockstep order: copy 0, copy 1, copy 0, ...
                     step_images += len(batch)
                     latents, embeds, mask, regions = load_batch(batch, cfg, rng)
-                    tok = latents.shape[2] * latents.shape[3]
+                    tok = latents.shape[-2] * latents.shape[-1]  # one frame's cells (the shifts are per picture)
                     shift = self.ts_logit_shift + self._clean_offset(
                         cfg, step, tok, self.batcher, cfg.batch_size * cfg.gradient_accumulation * n_dev)
                     sigma, step_sigma = draw_sigmas(cfg, latents.shape[0], gen, shift, tok, self.arch, step_sigma,
@@ -2221,14 +2227,14 @@ class Trainer(RaceParallelMixin):
         kept per GPU, and keep as many of the last trained blocks as the free memory allows."""
         cfg = self.cfg
         rng, gen = random.Random(0), torch.Generator("cpu").manual_seed(0)  # the run's own streams stay untouched
-        big = max(items, key=lambda it: (it.width // 16) * (it.height // 16))
+        big = max(items, key=lambda it: it.tokens)  # (a video clip counts every latent frame)
         # the worst case: the most image tokens with the longest caption (the blocks see text and image tokens)
         big = dataclasses.replace(big, text_path=_longest_text_path(items, self.arch.pad_embeds))
         latents, embeds, mask, _ = load_batch([big] * cfg.batch_size, dataclasses.replace(cfg, caption_dropout=0.0),
                                               rng)
         noise = torch.randn(latents.shape, generator=gen)
         sigma = torch.full((latents.shape[0],), 0.5)
-        tokens = (big.width // 16) * (big.height // 16) + mask.shape[1]
+        tokens = big.tokens + mask.shape[1]
 
         for m, inj, dev in self.replicas:
             dev = norm_device(dev)

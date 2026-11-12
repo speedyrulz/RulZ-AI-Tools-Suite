@@ -49,7 +49,7 @@ class Arch:
     target_groups: dict[str, str] = {}  # lora_targets name -> description (for the UI)
     default_targets: tuple[str, ...] = ()
     supports_single_files = False
-    supports_video = False  # samples and probes can be clips (sample_frames / probe_frames above 1)
+    supports_video = False  # trains on video clips (train_frames) and renders clips (sample_frames / probe_frames)
     video_fps = 24
     empty_prompt = ""  # what caption dropout trains on
     default_negative = ""  # negative prompt for samples/probes when none is given
@@ -108,6 +108,30 @@ class Arch:
         return grad_vae(vae)
 
     def sample(self, model, pos_e, pos_m, neg_e, neg_m, **kw) -> torch.Tensor: ...
+
+    # ---- video (supports_video: clips to train on, clip samples and probes)
+    def snap_frames(self, frames: int) -> int:
+        """The clip length the VAE takes for a request (stills: 1)."""
+        return 1
+
+    def latent_frames(self, frames: int) -> int:
+        """Latent frames of a clip of `frames` pixel frames (as snap_frames gives them)."""
+        return 1
+
+    def encode_video(self, vae, frames: torch.Tensor) -> torch.Tensor:
+        """frames [B, 3, F, H, W] in [-1, 1] -> normalized latents [B, C, T, H/16, W/16]."""
+        raise NotImplementedError(f"{self.label} does not train on video clips")
+
+    def decode_video(self, vae, latents: torch.Tensor) -> torch.Tensor:
+        """A clip's latents [1, C, T, h, w] -> its frames [F, 3, H, W] in [-1, 1]."""
+        raise NotImplementedError(f"{self.label} does not render clips")
+
+    def render_prompt(self, prompt: str, frames: int = 1) -> str:
+        """A prompt as a render (or a training clip) of `frames` frames reads it."""
+        return prompt
+
+    def render_negative(self, frames: int = 1) -> str:
+        return self.default_negative
 
     def distilled_sample_model(self, path: str) -> bool:
         """Does sample_model_path name a distilled (few-step, no guidance) model? By name: a turbo model."""
@@ -1037,11 +1061,28 @@ class MiniMaxH3Arch(Arch):
     default_sample_steps, default_sample_cfg = ARCH_FULL_SAMPLE["minimax_h3"]
     latent_tag = "_h3vae"
     size_multiple = 32
+    supports_video = True  # clips of 17n + 5 frames at 24 fps (5n + 2 latent frames), with the silent audio stream
 
     def __init__(self):
         from .h3 import loading
 
         self._loading = loading
+
+    def snap_frames(self, frames):
+        from .h3.sampler import snap_frames
+
+        return snap_frames(frames)
+
+    def latent_frames(self, frames):
+        from .h3.model import video_latent_frames
+
+        return video_latent_frames(frames)
+
+    def encode_video(self, vae, frames):
+        return self._loading.encode_video(vae, frames)
+
+    def decode_video(self, vae, latents):
+        return self._loading.decode_video(vae, latents)
 
     def resolve_for_config(self, cfg):
         return self._loading.resolve_for_config(cfg)
@@ -1147,6 +1188,7 @@ class PH3ImageArch(MiniMaxH3Arch):
     default_targets = ARCH_DEFAULT_TARGETS["p_h3_image"]
     default_sample_steps, default_sample_cfg = ARCH_FULL_SAMPLE["p_h3_image"]
     latent_tag = "_ph3vae"
+    supports_video = False  # an image model: H3's clip methods stay unused (the trainer reads supports_video)
 
     def __init__(self):
         from .ph3 import loading
@@ -1192,6 +1234,7 @@ class MiniMaxH3ImageArch(MiniMaxH3Arch):
     default_targets = ARCH_DEFAULT_TARGETS["minimax_h3_image"]
     default_sample_steps, default_sample_cfg = ARCH_FULL_SAMPLE["minimax_h3_image"]
     latent_tag = "_h3ivae"
+    supports_video = False  # no audio stream, no temporal decoder: stills only, unlike MiniMax H3
 
     def __init__(self):
         from .h3image import loading
@@ -1309,6 +1352,14 @@ class Pan2Arch(Arch):
         from .pan2.sampler import snap_frames
 
         return snap_frames(frames)
+
+    def latent_frames(self, frames):
+        from .pan2.sampler import latent_frames
+
+        return latent_frames(frames)
+
+    def encode_video(self, vae, frames):
+        return self._loading.encode_video(vae, frames)
 
     def render_prompt(self, prompt, frames=1):
         """A clip's prompt carries the clip's length in its time ranges, so a plain one is wrapped here, ahead of
