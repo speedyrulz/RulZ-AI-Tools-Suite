@@ -35,7 +35,7 @@ import {
   type EtagEntry,
   type Release
 } from './github'
-import { capture, launchDetached, runCommand } from './process'
+import { capture, launchDetached, programsRunningFrom, runCommand } from './process'
 import { ensureRequirements, invalidateRequirements, requirementLabel } from './requirements'
 import { createShortcut, foreignShortcutPaths, removeShortcut, shortcutPaths } from './shortcuts'
 import type { Store } from './store'
@@ -632,11 +632,11 @@ export class AppManager {
     })
   }
 
-  update(appId: string): void {
+  async update(appId: string): Promise<void> {
     const app = this.app(appId)
     const info = this.o.store.getInstalled(appId)
     if (!info?.managed) throw new Error(`${app.name} wasn't installed by the launcher, so it can't update it.`)
-    if (this.running.has(appId)) throw new Error(`Close ${app.name} first, then update.`)
+    await this.assertNotRunning(app, info, 'update')
     const opts: InstallOptions = {
       dir: info.dir,
       desktopShortcut: !!info.shortcuts.desktop,
@@ -652,17 +652,31 @@ export class AppManager {
   }
 
   /** Runs the setup steps again (after a failed or cancelled setup), or reinstalls the release. */
-  repair(appId: string): void {
+  async repair(appId: string): Promise<void> {
     const app = this.app(appId)
     const info = this.o.store.getInstalled(appId)
     if (!info?.managed) throw new Error(`${app.name} wasn't installed by the launcher.`)
     if (app.install.kind !== 'source') return this.update(appId)
+    await this.assertNotRunning(app, info, 'repair')
     this.startJob(appId, 'repair', async (ctx) => {
       await this.ensurePrerequisites(ctx, app)
       await this.runSetupSteps(ctx, app, info)
       const launchPath = await this.resolveLaunch(app, info.dir)
       await this.o.store.setInstalled(appId, { ...info, launchPath, needsSetup: false })
     })
+  }
+
+  /**
+   * Refuses to change an app's folder while a program runs from it, also one the launcher didn't start (it forgets
+   * them when it closes on launch). Setup would fail half-way: `python -m venv` can't replace a running python.exe.
+   */
+  private async assertNotRunning(app: CatalogApp, info: InstalledInfo, then: string): Promise<void> {
+    if (this.running.has(app.id)) throw new Error(`Close ${app.name} first, then ${then}.`)
+    if (!existsSync(info.dir)) return
+    const programs = await programsRunningFrom(info.dir)
+    if (programs.length) {
+      throw new Error(`${app.name} is still running (${programs.join(', ')} from its folder). Close it first, then ${then}.`)
+    }
   }
 
   /** Installs missing prerequisites with winget; stops the job if any are still missing. */
@@ -966,11 +980,11 @@ export class AppManager {
     return this.jobs.size > 0
   }
 
-  uninstall(appId: string): void {
+  async uninstall(appId: string): Promise<void> {
     const app = this.app(appId)
     const info = this.o.store.getInstalled(appId)
     if (!info) throw new Error(`${app.name} isn't installed.`)
-    if (info.managed && this.running.has(appId)) throw new Error(`Close ${app.name} first, then uninstall it.`)
+    if (info.managed) await this.assertNotRunning(app, info, 'uninstall it')
     this.startJob(appId, 'uninstall', async (ctx) => {
       ctx.set({ phase: 'removing', label: 'Removing…' })
       if (info.managed) {
