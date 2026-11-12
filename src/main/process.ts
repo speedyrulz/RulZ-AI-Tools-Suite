@@ -155,3 +155,31 @@ export async function refreshPath(): Promise<void> {
   }
   process.env.PATH = merged.join(';')
 }
+
+/**
+ * Names of the programs in `listing` (one executable path per line) that live inside `dir`. Pure, for tests.
+ */
+export function programsInside(listing: string | null, dir: string): string[] {
+  if (!listing) return []
+  const root = dir.replace(/[\\/]+$/, '').toLowerCase() + '\\'
+  const names = new Set<string>()
+  for (const raw of listing.split(/\r?\n/)) {
+    const path = raw.trim().replace(/\//g, '\\')
+    if (path && path.toLowerCase().startsWith(root)) names.add(path.slice(path.lastIndexOf('\\') + 1))
+  }
+  return [...names].sort()
+}
+
+/**
+ * Programs running from inside an app's folder, whoever started them: the launcher only knows about the apps it
+ * started since it opened, and "close on launch" means it often didn't. Empty when the list can't be read.
+ */
+export async function programsRunningFrom(dir: string): Promise<string[]> {
+  if (process.platform !== 'win32') return []
+  const listing = await capture(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-Command', 'Get-CimInstance Win32_Process | ForEach-Object { $_.ExecutablePath }'],
+    20000
+  )
+  return programsInside(listing, dir)
+}
