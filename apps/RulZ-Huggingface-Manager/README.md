@@ -106,6 +106,27 @@ Windows and WSL keep separate settings, so add the token once in each.
 - Repos: **Push a whole folder** in one commit, optionally mirroring (deleting remote files that are gone locally).
 - Copy the `hf://` path of any folder for use with the `hf` CLI or Python.
 
+**vast.ai: send models straight to your instance**
+- Attach a vast.ai instance: the **vast.ai** page lists your instances (with the API key the `vastai` CLI already
+  saved, or one you paste) and connects over ssh with one click. Without an API key, paste the ssh command from the
+  instance's *Connect* button instead; any Linux machine you reach with ssh works the same way.
+- Pick what to send from anywhere: tick repos on **My Hub** (yours, an organization's, or any user's), tick files
+  and folders in any repo's file browser and press **To vast.ai**, paste huggingface.co links (repo, folder or single
+  file), or search the Hub on the vast.ai page. Collect several into the **transfer list** and send them together.
+- Choose where they go on the instance: type a path, browse the instance's folders, or click a suggestion (the
+  instance's ComfyUI model folders, RulZ Trainer's models folder, `/workspace`, your recent destinations). Choose how:
+  keep the repo's folders, files only (for ComfyUI's `loras`, `checkpoints`...), a folder named after the repo, or
+  the Hugging Face cache (`HF_HOME`) for `from_pretrained()`. Optional filters (`*.safetensors`, skip `*.bin`...).
+  The dialog shows the total size against the free space there.
+- The **instance downloads the files itself**, straight from Hugging Face at datacenter speed: nothing passes through
+  your computer. The transfer runs in the background on the instance and keeps going if you close the app or lose
+  your connection. Progress shows in the Activity panel and under *Transfers on the instance*, with Cancel and
+  Retry; sending again skips files that are already there with the same size.
+- Your Hugging Face token goes to the instance over ssh for private and gated repos, inside the transfer process's
+  environment only (never on a command line or on the instance's disk). The first transfer installs
+  `huggingface_hub` into `~/.rulz-hf` on the instance (about 30 MB); the instance's own Python environments are not
+  touched.
+
 **Activity panel**: uploads, downloads and moves run in the background with progress; the panel lists every
 job with its result, errors in plain language, and an **Open folder** button for downloads.
 
@@ -121,6 +142,9 @@ want; switch any time with the sun / moon button at the top right or under Setti
 - Downloads into the download folder include a small `.cache/huggingface` folder used by `huggingface_hub` to
   skip unchanged files next time.
 - Requires `nicegui>=4.0` and `huggingface_hub>=2.4` (bucket support).
+- vast.ai needs an `ssh` program (built into Windows 10/11 and Linux) and your ssh key in your vast.ai account.
+  The vast.ai API key and the attached instance are stored in the same settings file as the token. Each instance gets
+  its own known-hosts file next to it (`ssh/`), because vast.ai reuses addresses for new rentals.
 
 ## Project layout
 
@@ -129,12 +153,15 @@ rulz_hf_manager/
   main.py            command line + server start
   config.py          settings file (token, download folder, preferences)
   hub.py             huggingface_hub wrapper: one file-system interface for repos and buckets
+  vast.py            vast.ai: instances, ssh, planning a transfer, following it
+  remote_agent.py    the instance's side (standard library only, piped over ssh on every call)
   jobs.py            background jobs with progress
   platform_utils.py  Windows / WSL / Linux helpers
-  ui/                NiceGUI pages: dashboard, browser, settings, pickers, dialogs
+  ui/                NiceGUI pages: dashboard, browser, vast.ai, settings, pickers, dialogs
   ui/theme.py        the RulZ look (colors, dark / light, "Choose your look")
   static/            the RulZ logo (dark and light) and the browser-tab icon
 assets/              app icon (.png, .ico) for shortcuts
+tests/               pytest tests (no network, token or instance needed)
 start-windows.bat    Windows launcher
 start-linux.sh       Ubuntu / WSL launcher
 ```
