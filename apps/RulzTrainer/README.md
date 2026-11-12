@@ -3728,7 +3728,31 @@ layout (its audio rows denoised alongside and never decoded) and decoded by the 
 LoRA was distilled on video, so 8-step clip samples are what it was made for. The released H3 makes 5-15 s clips
 (121-360 frames); shorter ones are what samples can afford.
 
-<!-- VIDEO-RESULTS -->
+**Run on the real models** (one RTX 5090, 32 GB, November 2026). The test set was 16 short clips made from 16
+pictures of one fictional character (slow camera push-ins, pull-backs and tilts, 3 s at 24 fps, the picture's caption
+plus a sentence for the camera move) and 16 other pictures of her as stills: a check that the path works, not a
+measure of what real footage teaches.
+
+- **MiniMax H3** (Comfy-Org's int8 FL2VA file, AdaLN pruned on load, the circlestone-labs image adapter, rank 16,
+  lr 1e-4, `adamw8bit`, `timestep_sampling: reference`; clips of 39 frames = 12 latent frames at 416 x 640, stills at
+  640 x 928). Clip latents for 32 items cached in 41 s. The checkpointing calibration measured the 39-frame clip
+  (12,583 tokens with the caption): 7 of 50 blocks kept, 27.6 of 31 GB at the peak; 1.4-1.6 s per step averaged over
+  clips and stills, 7.7 GB of RAM. **The step-0 clip samples** (39 frames, 8-step turbo LoRA, 8-15 s each)
+  were clean text-to-video with the prompt's motion: a woman turning to the camera and smiling under a push-in, a dog
+  running at the camera; that is the port's first multi-frame output on the real weights. By step 200 the woman in
+  the trigger prompt's clip had the character's face and hair, and the motion held through step 400; the
+  prompt without the trigger stayed a dog. **Clip probes** (22 frames, 512 x 512, 2 seeds, about 8 s a probe; the
+  middle frame scored): face 16.8 % at step 0, 25.7 % at 50, 40.4 % at 100, framing kept by the prompt check.
+- **PAN 2** (the diffusers folder, NVFP4 on load, the same recipe; clips of 33 frames = 9 latent frames at
+  416 x 640): clip latents cached in 10.5 s; 20 of 44 blocks kept at 9,683 tokens, 28.1 of 31 GB; about 1.8 s per
+  step with torch.compile, 4.4 GB of RAM. Step-0 clip samples (33 frames, 30 steps at CFG 2.5) took 27 s each,
+  17-frame probes about 5 s. The base model's step-0 clip of the character prompt had a text-like smear across the
+  face at this size (before any training; earlier 480 x 704 clips had none); at step 300 the clip was clean, showed
+  the character, and kept the prompt's turn and smile, and the dog prompt stayed a dog. Clip probes: face 1.4 % at
+  step 0, 7.6 % at 150, 16.0 % at 300.
+
+Not run: clip training with block swap or two GPUs, `train_video_mode: spread`, real footage, longer clips than
+39 frames, and how a clip-trained LoRA behaves in ComfyUI.
 
 ## Using the LoRA in ComfyUI
 
