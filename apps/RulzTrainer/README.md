@@ -21,15 +21,17 @@ A simple diffusion-model LoRA trainer with a WebUI. Supported models:
   Klein ([details](#flux2-klein-9b)).
 - **Ideogram 4** (9.3B): LoRAs on one 16 GB card from the fp8 release, structured JSON captions or wrapped plain
   ones; non-commercial license ([details](#ideogram-4)).
-- **MiniMax H3** (33B video + audio): experimental one-frame image LoRAs for H3 video generation, as musubi-tuner
-  trains them; two 16 GB cards or one with block swap ([details](#minimax-h3)).
+- **MiniMax H3** (33B video + audio): experimental LoRAs for H3 video generation from pictures (one-frame, as
+  musubi-tuner trains them) and video clips, with clip samples and probes; two 16 GB cards or one with block swap
+  ([details](#minimax-h3), [video clips](#video-clip-training-pan-2-minimax-h3)).
 - **P-H3-Image** (33B, PrunaAI): experimental text-to-image LoRAs for PrunaAI's 8-step, guidance-free H3 image model,
   with ostris' P-H3-Image training adapter; two 16 GB cards or one with block swap ([details](#p-h3-image)).
 - **MiniMax-H3-Image** (33B, MiniMax): experimental text-to-image LoRAs for MiniMax's own 6-step, guidance-free image
   model (4 to 20 MP), with ostris' MiniMax-H3-Image training adapter; two 16 GB cards or one with block swap
   ([details](#minimax-h3-image)).
-- **PAN 2** (29B video model, IFM): experimental LoRAs trained on still images as one-frame videos, for use in PAN 2
-  video generation; the LoRA loads in a ComfyUI build with PAN 2 support ([details](#pan-2)).
+- **PAN 2** (29B video model, IFM): experimental LoRAs trained on still images as one-frame videos and on video
+  clips, for use in PAN 2 video generation; the LoRA loads in a ComfyUI build with PAN 2 support ([details](#pan-2),
+  [video clips](#video-clip-training-pan-2-minimax-h3)).
 
 | Dark | Light |
 | --- | --- |
@@ -3179,7 +3181,9 @@ generation in ComfyUI, diffusers or musubi-tuner. **Experimental**: musubi-tuner
 released training distribution, and how a stills LoRA carries into motion is not established. Pick
 **MiniMax-H3-FL2VA** (the text / first-last-frame checkpoint the released T2VA path uses). *MiniMax-H3-Ref2VA* (the
 reference-to-video checkpoint) is listed as not for training: this trainer makes text-only LoRAs, and diffusers notes
-that a LoRA for one H3 checkpoint degrades the other.
+that a LoRA for one H3 checkpoint degrades the other. **Video clips** train too (`train_frames`, 17n + 5 frames), and
+samples and probes can be clips (`sample_frames`, `probe_frames`): see
+[Video clip training](#video-clip-training-pan-2-minimax-h3).
 
 **Licence.** The MiniMax H3 Community License Agreement. It excludes the USA, the EU, the UK and South Korea: users
 there must apply to MiniMax for a licence first ([application form](https://platform.minimax.io/h3-license); see the
@@ -3534,8 +3538,8 @@ a one-frame video, which is how IFM's own trainer mixes images into video traini
 ([docs/data.md](https://github.com/ifm-ai/PAN2/blob/main/docs/data.md): images are encoded as one-frame videos and
 always train as text-to-video). Pick the **PAN-2** preset. Experimental.
 
-**What it is for.** A character, object or style LoRA you then use for video in ComfyUI. Training on video clips is
-not supported: the trainer has no video data path.
+**What it is for.** A character, object or style LoRA you then use for video in ComfyUI. Video clips train too, mixed
+with pictures or alone: see [Video clip training](#video-clip-training-pan-2-minimax-h3).
 
 **Status.** Run on the released weights on one RTX 5090 (NVFP4, November 2026):
 
@@ -3675,6 +3679,80 @@ subject's `display_name`.
 
 **Licence.** IFM releases the code under Apache-2.0; check the model page for the terms of the weights before
 sharing a LoRA or converted files.
+
+## Video clip training (PAN 2, MiniMax H3)
+
+The two video models train on **video clips** as well as on pictures: [PAN 2](#pan-2) and the original
+[MiniMax H3](#minimax-h3) (the 33B video + audio model, FL2VA). Not MiniMax-H3-Image and not P-H3-Image: those are
+image models and refuse clips. Experimental.
+
+**How to use it.** Put video files (`.mp4`, `.mov`, `.webm`, `.mkv`, `.avi`, `.m4v`) in the dataset folder with a
+caption file of the same name beside each one (`walk.mp4` + `walk.txt`), as for a picture, and set *Frames per
+training clip* (`train_frames`, on the Training tab next to the flip switch, shown for the two video models) above 1.
+Pictures in the same folder still train as stills, so one dataset can mix both. With `train_frames: 1` (the default)
+video files are left out, and the log says how many. The Dataset tab's upload and folder copy take video files too.
+
+| Setting | What it does |
+|---|---|
+| `train_frames` | Frames per clip at 24 frames per second. PAN 2 rounds down to 4k + 1 (49 is 2 s), MiniMax H3 up to 17n + 5 (22, 39, 56, ...: the H3 VAE encodes 17 frames into 5 latent frames). 1 = pictures only |
+| `train_video_mode` | `fps` (default): the clip is the start of the video in real time at 24 fps, so motion keeps its speed and the rest of a longer video is left out; a video too short for that is spread instead. `spread`: the whole video squeezed onto the clip's frames, evenly spaced, which speeds motion up. These are ai-toolkit's two modes (`auto_frame_count` + `trim_auto_frame_count_tail`, which it recommends for MiniMax H3, and `shrink_video_to_frames`). Trim your videos to the part you want |
+| `video_resolution` | A clip's size as a square-equivalent side in px, the video's aspect ratio kept (default 512; 0 = the run's first training resolution). A clip costs about one picture per latent frame (PAN 2: one per 4 frames, H3: 5 per 17), so a 39-frame H3 clip at 512 holds 12 latent frames |
+
+What happens to a clip:
+
+- **Reading.** PyAV (`av`, which brings its own FFmpeg; installed with the requirements) reads the frames in one pass,
+  turns phone videos upright, and the frames are resized and centre-cropped to the clip's bucket. Clips batch only
+  with clips of the same size and length.
+- **Latents.** The family's own video VAE encodes the whole clip once and the latents are cached like a picture's
+  (named after the file, the frame count, the mode and the frame rate, so a change of any of them encodes again);
+  `flip_augment` mirrors every frame. PAN 2: the Wan 2.2 VAE, `[48, (F - 1) / 4 + 1, H/16, W/16]`. MiniMax H3: its
+  own VAE's chunked encode (17 frames per chunk, the last 3 latents dropped, ImageNet-normalized as for a picture),
+  `[24, 5n + 2, H/16, W/16]`.
+- **Captions.** MiniMax H3 reads the caption as it is. PAN 2 wraps a plain caption in its structured format with the
+  clip's length in the time ranges (a JSON caption stays as it is); write JSON captions to describe the motion in
+  events of their own.
+- **The model.** PAN 2 trains the clip text-to-video, all latent frames noised, the way IFM's trainer runs t2v.
+  MiniMax H3 trains it on the t2va layout diffusers' pipeline builds for a clip (`build_packed_sequence`): the latent
+  frames frame-major at their own rotary times (5/3 per frame in the VAE's 1-4-4-4-4 grouping), and audio rows for the
+  clip's length (40 per second per stereo channel: 65 per channel for 39 frames), which are the silence latent of a
+  15 s zero waveform noised to the audio sigma, as for a picture, never in the loss. The port's clip forward is
+  checked against diffusers' `MiniMaxH3Transformer3DModel` on that layout (tests/test_video_clips.py).
+- **The loss** is the plain flow loss over every latent cell of every frame. Face crops, region weights, the identity
+  loss, the alignment losses, training maps and region sweeps read pictures: they act on the stills of a mixed set and
+  leave the clips alone. LoRA Isolation refuses clips. Time per step and memory grow with the latent frames; the
+  checkpointing calibration measures the largest clip.
+
+**Samples and probes as clips** work on both models: *Frames per sample* (`sample_frames`) and *Frames per probe*
+(`probe_frames`), as described under [PAN 2](#pan-2). On MiniMax H3 a clip sample is text-to-video on the same
+layout (its audio rows denoised alongside and never decoded) and decoded by the VAE's own chunked decoder; the turbo
+LoRA was distilled on video, so 8-step clip samples are what it was made for. The released H3 makes 5-15 s clips
+(121-360 frames); shorter ones are what samples can afford.
+
+**Run on the real models** (one RTX 5090, 32 GB, November 2026). The test set was 16 short clips made from 16
+pictures of one fictional character (slow camera push-ins, pull-backs and tilts, 3 s at 24 fps, the picture's caption
+plus a sentence for the camera move) and 16 other pictures of her as stills: a check that the path works, not a
+measure of what real footage teaches.
+
+- **MiniMax H3** (Comfy-Org's int8 FL2VA file, AdaLN pruned on load, the circlestone-labs image adapter, rank 16,
+  lr 1e-4, `adamw8bit`, `timestep_sampling: reference`; clips of 39 frames = 12 latent frames at 416 x 640, stills at
+  640 x 928). Clip latents for 32 items cached in 41 s. The checkpointing calibration measured the 39-frame clip
+  (12,583 tokens with the caption): 7 of 50 blocks kept, 27.6 of 31 GB at the peak; 1.4-1.6 s per step averaged over
+  clips and stills, 7.7 GB of RAM. **The step-0 clip samples** (39 frames, 8-step turbo LoRA, 8-15 s each)
+  were clean text-to-video with the prompt's motion: a woman turning to the camera and smiling under a push-in, a dog
+  running at the camera; that is the port's first multi-frame output on the real weights. By step 200 the woman in
+  the trigger prompt's clip had the character's face and hair, and the motion held through step 400; the
+  prompt without the trigger stayed a dog. **Clip probes** (22 frames, 512 x 512, 2 seeds, about 8 s a probe; the
+  middle frame scored): face 16.8 % at step 0, 25.7 % at 50, 40.4 % at 100, framing kept by the prompt check.
+- **PAN 2** (the diffusers folder, NVFP4 on load, the same recipe; clips of 33 frames = 9 latent frames at
+  416 x 640): clip latents cached in 10.5 s; 20 of 44 blocks kept at 9,683 tokens, 28.1 of 31 GB; about 1.8 s per
+  step with torch.compile, 4.4 GB of RAM. Step-0 clip samples (33 frames, 30 steps at CFG 2.5) took 27 s each,
+  17-frame probes about 5 s. The base model's step-0 clip of the character prompt had a text-like smear across the
+  face at this size (before any training; earlier 480 x 704 clips had none); at step 300 the clip was clean, showed
+  the character, and kept the prompt's turn and smile, and the dog prompt stayed a dog. Clip probes: face 1.4 % at
+  step 0, 7.6 % at 150, 16.0 % at 300.
+
+Not run: clip training with block swap or two GPUs, `train_video_mode: spread`, real footage, longer clips than
+39 frames, and how a clip-trained LoRA behaves in ComfyUI.
 
 ## Using the LoRA in ComfyUI
 

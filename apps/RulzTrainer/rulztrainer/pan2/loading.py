@@ -184,6 +184,16 @@ def encode_images(vae, images: torch.Tensor) -> torch.Tensor:
     return (z - mean) / std
 
 
+@torch.no_grad()
+def encode_video(vae, frames: torch.Tensor) -> torch.Tensor:
+    """frames: [B, 3, F, H, W] in [-1, 1], F = 4k + 1 (a training clip). Returns normalized latents
+    [B, 48, (F - 1) / 4 + 1, H/16, W/16], the posterior mode, as IFM's trainer encodes a video."""
+    x = frames.to(vae.device, _vae_dtype(vae))
+    z = vae.encode(x).latent_dist.mode().float()
+    mean, std = _stats(vae, z[:, :, 0])
+    return (z - mean.unsqueeze(2)) / std.unsqueeze(2)
+
+
 def _decode(vae, latents: torch.Tensor) -> torch.Tensor:
     z = latents.to(vae.device, torch.float32)
     mean, std = _stats(vae, z)

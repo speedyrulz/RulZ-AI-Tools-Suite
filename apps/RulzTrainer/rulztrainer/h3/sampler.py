@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import torch
 
-from .model import AUDIO_CHANNELS, SHIFT_VIDEO, audio_sigma, shift_sigma
+from .model import AUDIO_CHANNELS, SHIFT_VIDEO, audio_sigma, shift_sigma, snap_frames, video_latent_frames  # noqa: F401
 
 
 def h3_sigmas(steps: int, shift: float = SHIFT_VIDEO) -> torch.Tensor:
@@ -34,15 +34,22 @@ def uses_distilled_schedule(model) -> bool:
 
 @torch.no_grad()
 def sample(model, pos_embeds, pos_mask, neg_embeds, neg_mask, *, width, height, steps=30, cfg=1.0, shift=None,
-           seed=0, skip_layer=-1, device="cuda", progress=None, sigmas=None) -> torch.Tensor:
+           seed=0, skip_layer=-1, device="cuda", progress=None, sigmas=None, frames=1) -> torch.Tensor:
     """Returns normalized latents [1, 24, H/16, W/16] (fp32), the trainer's layout. `shift` (the trainer's sample_shift)
     and `skip_layer` are accepted for the shared signature and ignored: H3's shifts are its own (12 video, 3 audio).
     Width and height are rounded down to whole 32 px (each token covers 2 x 2 latent cells). sigmas: the video schedule
-    (ending in 0) instead of h3_sigmas(steps) (P-H3-Image's own 8-step grid)."""
+    (ending in 0) instead of h3_sigmas(steps) (P-H3-Image's own 8-step grid).
+
+    frames above 1 (snapped up to 17n + 5): a text-to-video clip [1, 24, 5n + 2, H/16, W/16] at 24 fps, its audio rows
+    (40 latents per second per channel) stepped along and never decoded, as for a still. The released model makes
+    5-15 s clips (121-360 frames); shorter ones are what the trainer's clip samples and probes can afford."""
     gen = torch.Generator("cpu").manual_seed(seed)
     h, w = max(2, height // 32 * 2), max(2, width // 32 * 2)
-    latents = torch.randn((1, model.latent_channels, h, w), generator=gen).to(device)
-    audio = torch.randn((1, model.audio_frames * AUDIO_CHANNELS, model.audio_channels), generator=gen).to(device)
+    t = video_latent_frames(snap_frames(frames))
+    shape = (1, model.latent_channels, h, w) if t <= 1 else (1, model.latent_channels, t, h, w)
+    latents = torch.randn(shape, generator=gen).to(device)
+    n_audio = model.audio_frames_for(t) * AUDIO_CHANNELS
+    audio = torch.randn((1, n_audio, model.audio_channels), generator=gen).to(device)
     sigmas = (h3_sigmas(steps, model.shift_video) if sigmas is None else torch.as_tensor(sigmas, dtype=torch.float32))
     sigmas = sigmas.to(device)
     pos_embeds, pos_mask = pos_embeds.to(device), pos_mask.to(device)

@@ -15,7 +15,7 @@ from safetensors.torch import load_file
 
 from .archs import get_arch
 from .atomic import save_safetensors
-from .config import TrainConfig
+from .config import VIDEO_EXTS, TrainConfig
 from .pictures import file_has_alpha, has_alpha, to_rgb
 
 log = logging.getLogger("rulztrainer")
@@ -56,6 +56,13 @@ class Item:
     dop_caption: str | None = None  # LoRA Isolation: the trigger-free caption of its DOP pass (None: no DOP)
     dop_text_path: Path | None = None  # its cached text features
     pair_side: str = ""  # LoRA Isolation's side-by-side pairs: the subject's panel ("left" / "right"; never mirrored)
+    frames: int = 1  # above 1: a video clip of that many frames (category "clip", `image` is the video file)
+    latent_frames: int = 1  # its latent frames (the VAE packs several frames into one)
+
+    @property
+    def tokens(self) -> int:
+        """Latent cells of the item (16 px each, every latent frame): what its memory and time grow with."""
+        return (self.width // 16) * (self.height // 16) * max(1, self.latent_frames)
 
     @property
     def key(self) -> str:
@@ -105,7 +112,9 @@ def bucket_size(w: int, h: int, cfg: TrainConfig, side: int | None = None) -> tu
 
 
 def items_for_side(items: list["Item"], side: int) -> list["Item"]:
-    return [it for it in items if it.side == side]
+    """The items of one training resolution (resolution_step_up's stages); video clips have their own size
+    (video_resolution) and train at every stage."""
+    return [it for it in items if it.side == side or it.frames > 1]
 
 
 def describe_sides(cfg: TrainConfig) -> str:
@@ -173,7 +182,14 @@ def scan_dataset(cfg: TrainConfig) -> list[Item]:
         if not Path(spec.path).is_dir():
             raise FileNotFoundError(f"Dataset dir not found: {spec.path}")
     (cfg.resolved_cache_dir() / "text").mkdir(parents=True, exist_ok=True)
-    tag = get_arch(cfg).latent_tag  # latents of another VAE get their own files
+    arch = get_arch(cfg)
+    tag = arch.latent_tag  # latents of another VAE get their own files
+    clip_frames = arch.snap_frames(cfg.train_frames) if cfg.train_frames > 1 and arch.supports_video else 1
+    if clip_frames > 1:
+        log.info("Video clips: %d frames at %g fps (%d asked for, %s), %d latent frames each, around %d px "
+                 "(video_resolution)", clip_frames, arch.video_fps, cfg.train_frames,
+                 "real time from the start" if cfg.train_video_mode == "fps" else "spread over the whole video",
+                 arch.latent_frames(clip_frames), cfg.video_resolution or cfg.resolution)
     items = []
     summary = []
     for spec in specs:
@@ -184,7 +200,17 @@ def scan_dataset(cfg: TrainConfig) -> list[Item]:
         (cache / "latents").mkdir(parents=True, exist_ok=True)
         sides = cfg.dataset_sides(spec)
         n_images = 0
+        n_skipped_videos = 0
         for p in sorted(root.rglob("*")):
+            if p.suffix.lower() in VIDEO_EXTS and not skipped(p, root):
+                if clip_frames > 1:
+                    clip = _clip_item(p, cfg, spec, root, cache, tag, clip_frames, arch)
+                    if clip is not None:
+                        items.append(clip)
+                        n_images += 1
+                else:
+                    n_skipped_videos += 1
+                continue
             if p.suffix.lower() not in IMAGE_EXTS or skipped(p, root):
                 continue
             try:
@@ -210,6 +236,10 @@ def scan_dataset(cfg: TrainConfig) -> list[Item]:
                     region_path=cache / "regions" / f"{stem}_regions.safetensors",
                     side=side, repeats=spec.repeats, dataset=str(root),
                 ))
+        if n_skipped_videos:
+            log.info("Dataset %s: %d video file(s) left out: %s", root, n_skipped_videos,
+                     "set train_frames above 1 to train them as clips" if getattr(arch, "supports_video", False)
+                     else f"{arch.label} trains on pictures (video clips need PAN 2 or MiniMax H3)")
         if not n_images:
             raise ValueError(f"No images found in {root}")
         summary.append((root, n_images, sides, spec.repeats))
@@ -223,6 +253,40 @@ def scan_dataset(cfg: TrainConfig) -> list[Item]:
         log.info("Training resolutions: %s (%d items = %d images x %d resolutions)", describe_sides(cfg), len(items),
                  summary[0][1], len(summary[0][2]))
     return items
+
+
+def _clip_item(p: Path, cfg: TrainConfig, spec, root: Path, cache: Path, tag: str, frames: int, arch) -> Item | None:
+    """One video file as a training clip of `frames` frames (None when it cannot be read). The caption sits beside it
+    as for a picture; a family whose captions carry the clip's length (PAN 2) has it wrapped here, ahead of the text
+    cache."""
+    from . import clips
+    from .regions import _file_key
+
+    try:
+        w, h, _, _ = clips.video_info(p)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Skipping unreadable video %s: %s", p, e)
+        return None
+    side = int(cfg.video_resolution or 0) or cfg.dataset_sides(spec)[0]
+    bw, bh = bucket_size(w, h, cfg, side)
+    caption = arch.render_prompt(read_caption(p, cfg, spec.trigger or cfg.trigger_word), frames)
+    stem = _hash(_file_key(p) + f"|clip{frames}:{cfg.train_video_mode}:{arch.video_fps:g}") + f"_{bw}x{bh}"
+    return Item(
+        image=p, caption=caption, width=bw, height=bh,
+        latent_path=cache / "latents" / f"{stem}{tag}.safetensors",
+        latent_flip_path=(cache / "latents" / f"{stem}_flip{tag}.safetensors") if cfg.flip_augment else None,
+        text_path=text_cache_path(cfg, caption), region_path=None, category="clip", side=side,
+        repeats=spec.repeats, dataset=str(root), frames=frames, latent_frames=arch.latent_frames(frames))
+
+
+def load_clip_fit(path: Path, frames: int, w: int, h: int, cfg: TrainConfig, fps: float) -> torch.Tensor:
+    """A clip's frames resized and centre-cropped to its bucket: [3, F, H, W] in [-1, 1]."""
+    from . import clips
+
+    pics = clips.read_frames(path, frames, fps, cfg.train_video_mode)
+    arr = np.stack([np.asarray(ImageOps.fit(to_rgb(im), (w, h), method=Image.Resampling.LANCZOS,
+                                            centering=(0.5, 0.5))) for im in pics])  # [F, H, W, 3]
+    return torch.from_numpy(arr).permute(3, 0, 1, 2).float() / 127.5 - 1.0
 
 
 def crop_caption(template: str, caption: str, cfg: TrainConfig) -> str:
@@ -323,15 +387,22 @@ def cache_latents(items: list[Item], cfg: TrainConfig, vae, progress=None, vaes:
     """Encode and save the latents still missing. `vaes` (one VAE per GPU) splits the images across GPUs."""
     from .multigpu import run_queue
 
-    encode_images = get_arch(cfg).encode_images
+    arch = get_arch(cfg)
+    encode_images = arch.encode_images
     todo = latents_todo(items, cfg)
     workers = [(v, v.device) for v in (vaes or [vae])]
     log.info("Caching latents: %d of %d images need encoding%s", len(todo), len(items),
              f" (split across {', '.join(str(d) for _, d in workers)})" if len(workers) > 1 else "")
 
     def prepare(it):
+        if it.frames > 1:  # a video clip: [3, F, H, W]
+            return load_clip_fit(it.image, it.frames, it.width, it.height, cfg, arch.video_fps)
         img = load_image_fit(it.image, it.width, it.height, it.src_box)
         return torch.from_numpy(np.asarray(img).copy()).permute(2, 0, 1).float() / 127.5 - 1.0
+
+    def enc(v, t):
+        """[3, H, W] or a clip [3, F, H, W] -> its latents on the CPU."""
+        return (arch.encode_video if t.ndim == 4 else encode_images)(v, t.unsqueeze(0))[0].cpu()
 
     # the next pictures are decoded and resized on CPU threads while the VAE encodes this one
     prefetch = LatentPrefetch(todo, prepare, ahead=PREFETCH_AHEAD + len(workers))
@@ -341,10 +412,10 @@ def cache_latents(items: list[Item], cfg: TrainConfig, vae, progress=None, vaes:
         v = worker[0]
         it = todo[i]
         t = prefetch.get(i)
-        lat = encode_images(v, t.unsqueeze(0))[0].cpu()
+        lat = enc(v, t)
         save_safetensors({"latent": lat.contiguous()}, it.latent_path)
         if it.latent_flip_path:
-            lat_f = encode_images(v, t.flip(-1).unsqueeze(0))[0].cpu()
+            lat_f = enc(v, t.flip(-1))
             save_safetensors({"latent": lat_f.contiguous()}, it.latent_flip_path)
 
     count = [0]
@@ -497,7 +568,7 @@ def text_cache_path(cfg: TrainConfig, prompt: str) -> Path:
 
 
 class BucketBatcher:
-    """Yields batches of Items with identical bucket size, shuffled each epoch. An item with repeats N comes up N
+    """Yields batches of Items with identical bucket size (clips batch with clips of their length), shuffled each epoch. An item with repeats N comes up N
     times per epoch (its dataset's repeats)."""
 
     def __init__(self, items: list[Item], batch_size: int, seed: int):
@@ -506,8 +577,9 @@ class BucketBatcher:
         self.rng = random.Random(seed)
         self.buckets: dict[tuple[int, int], list[Item]] = {}
         for it in items:
-            self.buckets.setdefault((it.width, it.height), []).extend([it] * max(1, int(it.repeats or 1)))
-        log.info("Buckets: %s", {f"{k[0]}x{k[1]}": len(v) for k, v in self.buckets.items()})
+            self.buckets.setdefault((it.width, it.height, it.frames), []).extend([it] * max(1, int(it.repeats or 1)))
+        log.info("Buckets: %s", {f"{k[0]}x{k[1]}" + (f"x{k[2]}f" if k[2] > 1 else ""): len(v)
+                                 for k, v in self.buckets.items()})
         self.weights: dict[str, float] | None = None
 
     def set_weights(self, weights: dict[str, float] | None) -> None:
@@ -554,7 +626,8 @@ class BucketBatcher:
 
 
 def load_batch(batch: list[Item], cfg: TrainConfig, rng: random.Random):
-    """Returns latents [B,128,h,w], embeds [B,S,4096], mask [B,S], regions (RegionBatch | None).
+    """Returns latents [B,128,h,w], embeds [B,S,4096], mask [B,S], regions (RegionBatch | None). A batch of video clips
+    gives latents [B, C, T, h, w] and no regions (the face and region features read pictures).
 
     Only this function knows whether the flipped latent was picked, so it flips the region map (and mirrors
     its landmarks) to match."""
@@ -564,7 +637,7 @@ def load_batch(batch: list[Item], cfg: TrainConfig, rng: random.Random):
 
     latents, rows, maps, paths = [], [], [], []
     empty = dropout_text_path(cfg)
-    want_regions = cfg.wants_regions()
+    want_regions = cfg.wants_regions() and not any(it.frames > 1 for it in batch)
     for it in batch:
         path = it.latent_path
         flipped = False

@@ -263,17 +263,22 @@ def load_transformer(model_dir: Path, device, quant: str = "auto", dtype=torch.b
 
 
 @torch.no_grad()
-def silence_latent(encoder, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-    """[4, 32]: the audio posterior mode of a zero waveform of 2 latent frames per channel (both stereo channels as
-    the batch, as the pipeline encodes them), normalized, channel-major (left f0, f1, right f0, f1)."""
+def silence_latent(encoder, mean: torch.Tensor, std: torch.Tensor, frames: int = ONE_FRAME_AUDIO_LATENTS) -> torch.Tensor:
+    """[2 * frames, 32]: the audio posterior mode of a zero waveform of `frames` latent frames per channel (both stereo
+    channels as the batch, as the pipeline encodes them), normalized, channel-major (left f0, f1, ..., right f0, ...).
+    The default 2 frames is the one-frame layout's [4, 32]."""
     hop = int(getattr(encoder, "hop_length", 800))
-    wav = torch.zeros(AUDIO_CHANNELS, 1, ONE_FRAME_AUDIO_LATENTS * hop)
-    post = encoder.encode(wav).latent_dist
+    wav = torch.zeros(AUDIO_CHANNELS, 1, int(frames) * hop)
+    with torch.no_grad():
+        post = encoder.encode(wav).latent_dist
     z = post.mode().float().transpose(1, 2)  # [2, frames, 32]
-    if z.shape[1] != ONE_FRAME_AUDIO_LATENTS:
+    if z.shape[1] != int(frames):
         raise ValueError(f"the audio VAE gave {z.shape[1]} latent frames for {wav.shape[-1]} samples")
     z = (z - mean.view(1, 1, -1)) / std.view(1, 1, -1)
     return z.reshape(-1, z.shape[-1]).contiguous()
+
+
+LONG_SILENCE_FRAMES = 600  # 15 s at 40 audio latents per second: the longest clip MiniMax H3 makes
 
 
 def _file_id(path: Path) -> str:
@@ -296,14 +301,16 @@ def audio_vae_source(cfg: TrainConfig, model_dir: Path | None) -> Path:
     return ensure_hf_file(hsf.COMFY_REPO, hsf.AUDIO_VAE_FILE, Path(hsf.AUDIO_VAE_FILE).name)
 
 
-def get_silence(cfg: TrainConfig, model_dir: Path | None) -> torch.Tensor:
-    """The silence placeholder, from the cache in models_dir or computed once from the audio VAE (CPU, then freed)."""
+def get_silence(cfg: TrainConfig, model_dir: Path | None, frames: int = ONE_FRAME_AUDIO_LATENTS) -> torch.Tensor:
+    """The silence placeholder of `frames` audio latent frames per channel (the one-frame layout's 2, or the long one
+    clips slice), from the cache in models_dir or computed once from the audio VAE (CPU, then freed)."""
     from safetensors import safe_open
     from safetensors.torch import save_file
 
     src = audio_vae_source(cfg, model_dir)
     ident = _file_id(src / "diffusion_pytorch_model.safetensors" if src.is_dir() else src)
-    cache = Path(cfg.models_dir) / SILENCE_FILE
+    name = SILENCE_FILE if frames == ONE_FRAME_AUDIO_LATENTS else SILENCE_FILE.replace(".safetensors", f"_{frames}.safetensors")
+    cache = Path(cfg.models_dir) / name
     if cache.is_file():
         try:
             with safe_open(str(cache), "pt") as f:
@@ -318,17 +325,26 @@ def get_silence(cfg: TrainConfig, model_dir: Path | None) -> torch.Tensor:
         mean, std = torch.tensor(enc.config.latents_mean), torch.tensor(enc.config.latents_std)
     else:
         enc, mean, std = hsf.load_audio_encoder_file(src)
-    silence = silence_latent(enc, mean, std)
+    silence = silence_latent(enc, mean, std, frames)
     del enc
     cache.parent.mkdir(parents=True, exist_ok=True)
     save_file({"silence": silence}, str(cache), metadata={"source": ident})
-    log.info("MiniMax H3 audio placeholder: the silence latent of %s (cached in %s)", src.name, cache)
+    log.info("MiniMax H3 audio placeholder: the silence latent of %s, %d frames per channel (cached in %s)", src.name,
+             frames, cache)
     return silence
+
+
+def wants_clips(cfg: TrainConfig) -> bool:
+    """Does the run train on or render clips (the long silence latent is then needed)?"""
+    return max(int(getattr(cfg, k, 1) or 1) for k in ("train_frames", "sample_frames", "probe_frames")) > 1
 
 
 def attach_silence(model: MiniMaxH3Transformer, cfg: TrainConfig, model_dir: Path | None) -> MiniMaxH3Transformer:
     try:
         model.audio_silence = get_silence(cfg, model_dir)
+        if model.has_audio and wants_clips(cfg):
+            long = get_silence(cfg, model_dir, LONG_SILENCE_FRAMES)
+            model.audio_silence_long = long.reshape(AUDIO_CHANNELS, LONG_SILENCE_FRAMES, -1)
     except Exception as e:  # noqa: BLE001 - the model still runs on a zero placeholder
         log.warning("MiniMax H3: the audio VAE could not give the silence latent (%s); the audio placeholder is zeros",
                     e)
@@ -393,6 +409,31 @@ def decode_latents(vae, latents: torch.Tensor) -> torch.Tensor:
 def decode_latents_grad(vae, latents: torch.Tensor) -> torch.Tensor:
     """decode_latents with gradients to `latents` (identity loss on a face crop), not clamped."""
     return _decode(vae, latents)
+
+
+@torch.no_grad()
+def encode_video(vae, frames: torch.Tensor) -> torch.Tensor:
+    """frames: [B, 3, F, H, W] in [-1, 1], F = 17n + 5 (a training clip). Returns normalized latents
+    [B, 24, 5n + 2, H/16, W/16]: ImageNet-normalized, encoded 17 frames per chunk with the 3 trailing latents dropped
+    (the diffusers VAE's own encode), its posterior mode."""
+    x = frames.to(vae.device, torch.float32)
+    pm, ps = _pixel_norm(x[:, :, 0])
+    x = ((x + 1.0) / 2.0 - pm.unsqueeze(2)) / ps.unsqueeze(2)
+    z = vae.encode(x.to(next(vae.parameters()).dtype)).latent_dist.mode().float()
+    mean, std = _stats(vae, z[:, :, 0])
+    return (z - mean.unsqueeze(2)) / std.unsqueeze(2)
+
+
+@torch.no_grad()
+def decode_video(vae, latents: torch.Tensor) -> torch.Tensor:
+    """A clip's latents [1, 24, 5n + 2, h, w] -> its frames [17n + 5, 3, H, W] in [-1, 1] (the diffusers VAE's own
+    chunked decode, cross-faded where its chunks overlap)."""
+    z = latents.to(vae.device, torch.float32)
+    mean, std = _stats(vae, z[:, :, 0])
+    z = (z * std.unsqueeze(2) + mean.unsqueeze(2)).to(next(vae.post_quant_conv.parameters()).dtype)
+    x = vae.decode(z, return_dict=False)[0][0].transpose(0, 1).float()  # [F, 3, H, W], ImageNet space
+    pm, ps = _pixel_norm(x)
+    return ((x * ps + pm) * 2.0 - 1.0).clamp(-1, 1)
 
 
 def grad_vae(vae):
@@ -596,4 +637,7 @@ def load_any_transformer(path: str, device, quant: str = "auto", models_dir: str
         from safetensors.torch import load_file
 
         model.audio_silence = load_file(str(cache))["silence"]
+        long = cache.with_name(SILENCE_FILE.replace(".safetensors", f"_{LONG_SILENCE_FRAMES}.safetensors"))
+        if long.is_file() and model.has_audio:
+            model.audio_silence_long = load_file(str(long))["silence"].reshape(AUDIO_CHANNELS, LONG_SILENCE_FRAMES, -1)
     return model
