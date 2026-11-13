@@ -41,10 +41,12 @@ KINDS = ("face", "body", "gold")
 # ---------------------------------------------------------------- models
 
 
-def face_model(provider: str = "cpu", det_size: int = 640):
-    key = ("face", provider, int(det_size))
+def face_model(provider: str = "cpu", det_size: int = 640, model_name: str = "buffalo_l"):
+    """The face scorer for an InsightFace pack (the trainer's face_model: buffalo_l or antelopev2), kept for reuse."""
+    model_name = model_name or "buffalo_l"
+    key = ("face", provider, int(det_size), model_name)
     if key not in _MODELS:
-        _MODELS[key] = facesim.FaceScorer(provider, int(det_size))
+        _MODELS[key] = facesim.FaceScorer(provider, int(det_size), model_name=model_name)
     return _MODELS[key]
 
 
@@ -129,6 +131,7 @@ class RefSet:
     labels: dict = field(default_factory=dict)  # file path -> the name shown for it (images given as a batch)
     notes: list = field(default_factory=list)
     gold_name: str = ""  # the gold recognizer: adaface / facenet
+    face_model: str = "buffalo_l"  # the InsightFace pack of the face score (the trainer's face_model)
 
     @property
     def face_ceiling(self):
@@ -186,13 +189,13 @@ class RefSet:
 
 def build_references(face_paths, body_paths, *, face_provider="cpu", det_size=640, body_kind="appearance",
                      body_backend="mediapipe+sam3", body_device="cuda:0", sam3_model="facebook/sam3",
-                     models_dir="models", labels=None, gold="adaface") -> RefSet:
+                     models_dir="models", labels=None, gold="adaface", face_model_name="buffalo_l") -> RefSet:
     """Embed the references as the trainer does (set_references, then the gold recognizer's set_gold). face_paths /
     body_paths: image files or folders; an empty list leaves that kind out. gold: "adaface" or "facenet" (the held-out
-    gold face too) or "off"."""
-    refs = RefSet(body_kind=body_kind, labels=dict(labels or {}))
+    gold face too) or "off". face_model_name: the face score's InsightFace pack (buffalo_l or antelopev2)."""
+    refs = RefSet(body_kind=body_kind, labels=dict(labels or {}), face_model=face_model_name or "buffalo_l")
     if face_paths:
-        scorer = face_model(face_provider, det_size)
+        scorer = face_model(face_provider, det_size, refs.face_model)
         scorer.gold = scorer.gold_refs = scorer.gold_self_similarity = None  # the shared scorer: no earlier gold
         refs.face_info = scorer.set_references(face_paths)
         if scorer.refs and gold in ("adaface", "facenet"):
@@ -265,7 +268,9 @@ def job_scale(job_dir) -> dict:
             continue
         if rec.get("scale"):
             scale = {**rec["scale"], "gold_select": bool(rec.get("gold_select")),
-                     "gold_name": rec.get("gold_name") or "facenet"}  # records before 3.14.0: FaceNet
+                     "gold_name": rec.get("gold_name") or "facenet",  # records before 3.14.0: FaceNet
+                     # records before 3.19.0: buffalo_l, and the body score unknown
+                     "face_model": rec.get("face_model") or "buffalo_l", "body_score": rec.get("body_score") or ""}
     if not scale:
         raise ValueError(f"{p} has no normalized scale (the run had likeness_normalize off)")
     return scale
@@ -298,6 +303,16 @@ def build_scale(refs: RefSet, normalize=True, baseline_rows=None, job=None, face
                 # the run's gold scale is another recognizer's raw numbers: keep the references' own
                 log.info("The run's gold face scale is %s's, not %s's: the gold face keeps its own scale",
                          gold_label(job.get("gold_name")), gold_label(refs.gold_name))
+                continue
+            if kind == "face" and str(job.get("face_model") or "buffalo_l") != (refs.face_model or "buffalo_l"):
+                # another InsightFace pack's raw numbers (face_model): the face keeps the references' own scale
+                log.info("The run's face scale is %s's, not %s's: the face keeps its own scale (pick the run's face "
+                         "model on the references node to use it)", job.get("face_model"), refs.face_model)
+                continue
+            if kind == "body" and job.get("body_score") and job["body_score"] != refs.body_kind:
+                # another body score's raw numbers: the body keeps the references' own scale
+                log.info("The run's body scale is body_score %s's, not %s's: the body keeps its own scale",
+                         job["body_score"], refs.body_kind)
                 continue
             if kind in job:
                 fixed[kind] = [float(job[kind][0]), float(job[kind][1])]
@@ -339,11 +354,11 @@ def score_rows(refs: RefSet, items, progress=None, interrupted=None) -> list[dic
             interrupted()
         row = {"index": i + 1, "image": label, "path": str(path), "faces": None, "face_cosine": None,
                "face_raw": None, "best_face_ref": None, "gold_cosine": None, "gold_raw": None, "body_raw": None,
-               "body_compared": None}
-        if refs.face is not None:
-            s = refs.face.score(path, gold=True) if refs.has_gold else refs.face.score(path)
+               "body_compared": None, "face_skipped": ""}
+        if refs.face is not None:  # with the probes' subject check: an ambiguous or tiny face stays unscored
+            s = refs.face.score(path, gold=refs.has_gold, qc=True)
             row.update(faces=s.faces, face_cosine=s.cosine, face_raw=s.percent, best_face_ref=refs.label(s.best_ref),
-                       gold_cosine=s.gold_cosine, gold_raw=s.gold_percent)
+                       gold_cosine=s.gold_cosine, gold_raw=s.gold_percent, face_skipped=s.skipped)
         if refs.body is not None:
             row["body_raw"], row["body_compared"] = refs.body.score(path)
         rows.append(row)
@@ -424,7 +439,8 @@ def summary_text(summary: dict, refs: RefSet) -> str:
 def details_text(rows) -> str:
     out = []
     for r in rows:
-        face = pct(r["face"]) if r["face"] is not None else ("no face" if r["faces"] == 0 else "n/a")
+        face = (pct(r["face"]) if r["face"] is not None else f"unscored ({r['face_skipped']})"
+                if r.get("face_skipped") else "no face" if r["faces"] == 0 else "n/a")
         body = pct(r["body"]) if r["body"] is not None else "n/a"
         gold = f" | gold face {pct(r['gold'])}" if r.get("gold") is not None else ""
         out.append(f"{r['index']:>3}. {Path(r['image']).name}: overall {pct(r['overall'])} | face {face}{gold} | "
@@ -437,7 +453,8 @@ def details_text(rows) -> str:
 IMAGE_COLUMNS = [  # (key, header)
     ("index", "#"), ("image", "Image"), ("overall", "Overall"), ("face", "Face"), ("body", "Body"),
     ("gold", "Gold face"), ("overall_arcface", "Overall with ArcFace's face"),
-    ("faces", "Faces found"), ("best_face_ref", "Closest face reference"), ("face_cosine", "Face cosine"),
+    ("faces", "Faces found"), ("face_skipped", "Face unscored because"), ("best_face_ref", "Closest face reference"),
+    ("face_cosine", "Face cosine"),
     ("face_raw", "Face raw %"), ("gold_cosine", "Gold face cosine"), ("gold_raw", "Gold face raw %"),
     ("body_raw", "Body raw %"), ("body_compared", "Body references compared"),
     ("overall_raw", "Overall raw %"), ("path", "File")]

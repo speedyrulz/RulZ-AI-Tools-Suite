@@ -191,6 +191,11 @@ class ProbeRecord:
     gold_select: bool = False
     arc_combined_ema: float | None = None
     gold_name: str = ""  # the gold recognizer: adaface / facenet ("" with no gold, and in records before 3.14.0: FaceNet)
+    # what the face and body scores measured (face_model's InsightFace pack, body_score), so a reader of the run's scale
+    # (the ComfyUI likeness nodes) applies it only to the same kind of score; "" with no such score, and in records
+    # before 3.19.0 (buffalo_l, body unknown)
+    face_model: str = ""
+    body_score: str = ""
     # the copy check (copy_check, copycheck.py), logged only: the highest SSCD match of this probe's renders among the
     # training photos, that photo, and the photos' own typical best match among themselves
     copy: float | None = None
@@ -207,6 +212,12 @@ class ProbeRecord:
     # from the step-0 probe's, and the kept / drift share of the prompt that drifted most ({}: nothing was checked)
     prompt_check: dict = field(default_factory=dict)
     best_held: bool = False  # likeness_best_min_kept kept this probe from setting a new best
+    # logged only (after the ai-toolkit fork's identity eval): each raw score's place between the step-0 floor (0) and
+    # the references' own level (1), unclipped and unstretched; above 1 the probe matches the references better than
+    # they match each other, which the capped normalized score hides (a memorization watch, beside the copy check)
+    face_over: float | None = None
+    body_over: float | None = None
+    gold_over: float | None = None
 
 
 # what a training state keeps of the controller (ceilings and shapes come back from the references and the config)
@@ -330,6 +341,20 @@ class LikenessController:
         floor = self.floor[kind] if self.floor[kind] is not None else FLOOR_DEFAULT[kind]
         least = max(MIN_SPAN[kind], MIN_ROOM_SHARE[kind] * (100.0 - floor))
         return floor, floor + (max(self.ceiling[kind], floor + least) - floor) * self._shape(kind)[0]
+
+    def over(self, kind: str, value):
+        """A raw score's place from the step-0 floor (0) to the references' own level (1): unclipped, before the
+        span's stretch and without the least span the scale keeps above the floor, so a probe past the references
+        reads above 1 even where the scale itself gave them more room. None without likeness_normalize or a score, and
+        when the references' own level is not above the floor."""
+        if value is None or not self.normalize:
+            return None
+        if kind == "body" and self.anchored_body:  # its 100 is the references' mean by construction
+            lo, top = ANCHORED_BODY_SCALE
+        else:
+            lo = self.floor[kind] if self.floor[kind] is not None else FLOOR_DEFAULT[kind]
+            top = self.ceiling[kind]
+        return (value - lo) / (top - lo) if top > lo else None
 
     def norm(self, kind: str, value):
         """A raw score on the normalized scale (the raw score itself with likeness_normalize off)."""
@@ -567,6 +592,13 @@ class LikenessController:
         if self.has_gold:
             rec.gold, rec.gold_ema, rec.gold_norm = gold, self.gold_ema, self.norm("gold", gold)
             rec.gold_norm_ema, rec.gold_select, rec.arc_combined_ema = gold_n, self.gold_select, arc_comb
+        rec.face_over, rec.body_over = self.over("face", face), self.over("body", body_measured)
+        rec.gold_over = self.over("gold", gold) if self.has_gold else None
+        past = [f"{k} {v:.2f}x" for k, v in (("face", rec.face_over), ("body", rec.body_over),
+                                              ("gold face", rec.gold_over)) if v is not None and v > 1.0]
+        if past and step > 0:
+            log.info("Probe step %d past the references' own level (%s): it matches them better than they match each "
+                     "other, a memorization watch (logged only)", step, ", ".join(past))
         if "step_up" in actions:
             self.enter_stage(actions["step_up"])
         return rec, actions

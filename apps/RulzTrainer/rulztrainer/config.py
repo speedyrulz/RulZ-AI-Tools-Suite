@@ -411,7 +411,8 @@ LOSS_WEIGHTINGS = ("none", "min_snr", "sigma_sqrt")
 
 
 
-BODY_SCORES = ("appearance", "anchored", "proportions", "skeleton3d", "smplx")
+BODY_SCORES = ("appearance", "anchored", "proportions", "skeleton3d", "smplx", "smplx_ratio")
+FACE_MODELS = ("buffalo_l", "antelopev2")  # InsightFace packs the likeness face score can embed with
 
 @dataclass(frozen=True)
 class DatasetSpec:
@@ -691,14 +692,19 @@ class TrainConfig:
     face_refs: list[str] = field(default_factory=list)  # dataset images whose largest face is the reference identity
     face_provider: str = "cpu"  # cpu | cuda (onnxruntime provider for InsightFace)
     face_det_size: int = 640
+    # the InsightFace pack the likeness face score (probes, samples, reward, self-training) embeds with: buffalo_l
+    # (ArcFace R50, w600k_r50) or antelopev2 (ArcFace R100, glintr100; on one test set it showed training progress
+    # ~1.4x as clearly). The dataset's face analysis, identity alignment and the identity loss stay on buffalo_l
+    face_model: str = "buffalo_l"
     body_refs: list[str] = field(default_factory=list)  # dataset images (full body, neutral pose) for proportions
     body_score: str = "appearance"  # appearance (DINOv2 of the person crop, best match against the references) |
     #   anchored (SigLIP 2 + DINOv2 of the body window with its photographic look taken out: 0 = the step-0 probe's
     #   base-model renders, 100 = the references' mean; bodyanchor.py) |
     #   proportions (2D skeleton ratios from body_backend, + SAM 3 silhouette widths with mediapipe+sam3) |
     #   skeleton3d (3D bone ratios, + silhouette widths where upright and frontal; bodyshape.py) |
-    #   smplx (NLF's SMPL-X body shape measured in the T-pose; its model is downloaded by hand, see nlf_model)
-    nlf_model: str = ""  # body_score smplx: NLF's TorchScript file or its folder; empty = models/nlf/
+    #   smplx (NLF's SMPL-X body shape measured in the T-pose; its model is downloaded by hand, see nlf_model) |
+    #   smplx_ratio (the same fit: nine neck-to-knee measurements, log-ratio to the references' median)
+    nlf_model: str = ""  # body_score smplx / smplx_ratio: NLF's TorchScript file or its folder; empty = models/nlf/
     body_backend: str = "mediapipe+sam3"  # mediapipe+sam3 (SAM 3 person masks too) | mediapipe (skeleton only)
     sam3_model: str = "facebook/sam3"  # HF repo id or local transformers-format directory
     body_device: str = "cuda:0"  # where SAM 3 runs while scoring (moved back to CPU afterwards)
@@ -1344,6 +1350,8 @@ class TrainConfig:
             raise ValueError("id_loss_every must be at least 1")
         if str(self.face_gold).lower() not in ("auto", "off", "adaface", "facenet"):
             raise ValueError(f"face_gold must be auto, off, adaface or facenet, got {self.face_gold!r}")
+        if self.face_model not in FACE_MODELS:
+            raise ValueError(f"face_model must be one of {FACE_MODELS}, got {self.face_model!r}")
         if str(self.face_gold).lower() == "facenet" and self.trains_on_facenet():
             raise ValueError("face_gold facenet: the identity loss trains on FaceNet (id_loss_backend facenet), so it "
                              "is no held-out judge; use face_gold adaface or id_loss_backend arcface")

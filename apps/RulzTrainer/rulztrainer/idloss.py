@@ -191,17 +191,25 @@ def embed_image(embedder: Embedder, image: torch.Tensor, kps) -> torch.Tensor:
     return embedder(warp(image.to(dev), theta[None], embedder.size))[0]
 
 
-def reference_embeddings(embedder: Embedder, face_scorer, check: bool = False) -> torch.Tensor:
+def reference_embeddings(embedder: Embedder, face_scorer, check: bool = False, detector=None) -> torch.Tensor:
     """[N, D] reference embeddings from FaceScorer.refs, re-embedded by `embedder` through the differentiable
     alignment. With check (arcface backend), each one must match the ONNX scorer's embedding (cosine > 0.99),
-    which validates the onnx2torch port and the alignment together."""
+    which validates the onnx2torch port and the alignment together. detector: a buffalo_l FaceScorer that finds the
+    faces and landmarks instead (and gives the embeddings the check compares with) when face_scorer embeds with
+    another pack (face_model antelopev2): the loss trains on buffalo_l's R50 either way."""
+    if check and detector is None and getattr(face_scorer, "model_name", "buffalo_l") != "buffalo_l":
+        log.warning("Identity loss: the arcface port self-check is skipped: no buffalo_l face detector to compare "
+                    "with (the face score's %s embeds otherwise)", face_scorer.model_name)
+        check = False
     out = []
     for path, onnx_emb in face_scorer.refs:
-        faces = face_scorer.faces(path)
+        faces = (detector or face_scorer).faces(path)
         if not faces or getattr(faces[0], "kps", None) is None:
             continue
         emb = embed_image(embedder, load_rgb(path), faces[0].kps).float().cpu()
         if check:
+            if detector is not None:
+                onnx_emb = faces[0].normed_embedding
             cos = float(emb @ torch.from_numpy(np.asarray(onnx_emb, np.float32)))
             if cos <= 0.99:
                 raise RuntimeError(f"arcface port self-check failed on {Path(path).name}: cosine {cos:.4f} vs the "
@@ -281,14 +289,15 @@ class IdentityLoss:
         return torch.stack(losses).mean(), len(idx)
 
 
-def build(cfg, face_scorer, decode, device, progress=None) -> IdentityLoss:
-    """The configured backend with its references (and, for arcface, the port self-check)."""
+def build(cfg, face_scorer, decode, device, progress=None, detector=None) -> IdentityLoss:
+    """The configured backend with its references (and, for arcface, the port self-check). detector: a buffalo_l
+    FaceScorer when face_scorer embeds with another pack (reference_embeddings)."""
     if cfg.id_loss_backend == "facenet":
         emb = facenet_embedder(cfg.models_dir, progress)
     else:
         emb = arcface_embedder()
     emb = emb.to(device)
-    refs = reference_embeddings(emb, face_scorer, check=cfg.id_loss_backend == "arcface")
+    refs = reference_embeddings(emb, face_scorer, check=cfg.id_loss_backend == "arcface", detector=detector)
     return IdentityLoss(emb, refs, decode, cfg.id_loss_sigma_max, cfg.id_loss_every, cfg.id_loss_margin_cells,
                         cfg.id_loss_min_face_cells, cfg.id_loss_random_ref, seed=cfg.seed)
 

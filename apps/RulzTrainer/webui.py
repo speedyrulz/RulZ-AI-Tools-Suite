@@ -997,12 +997,13 @@ def set_progress(text: str, frac=None) -> None:
     _task_progress.update(text=text, frac=frac)
 
 
-def face_preview(paths: list[str], provider: str, det_size: int) -> tuple[str, list[tuple[str, str]]]:
+def face_preview(paths: list[str], provider: str, det_size: int,
+                 model_name: str = "buffalo_l") -> tuple[str, list[tuple[str, str]]]:
     """Detect reference faces and save crops under output/_face_refs for the UI. Returns (info, [(crop, caption)])."""
     ok, msg = facesim.available()
     if not ok:
         return msg, []
-    scorer = facesim.FaceScorer(provider, int(det_size), progress=set_progress)
+    scorer = facesim.FaceScorer(provider, int(det_size), model_name=model_name or "buffalo_l", progress=set_progress)
     set_progress("Detecting faces...", None)
     paths = [str(p) for p in facesim.expand_refs(paths)]
     if not paths:
@@ -1029,13 +1030,14 @@ def body_preview(paths: list[str], backend: str = "mediapipe", sam3_model: str =
     ok, msg = bodysim.available()
     if not ok:
         return msg
-    if body_score in ("skeleton3d", "smplx"):
+    if body_score in ("skeleton3d", "smplx", "smplx_ratio"):
         from rulztrainer import bodyshape
 
-        if body_score == "smplx":
+        if body_score in ("smplx", "smplx_ratio"):
             if bodyshape.find_nlf(nlf_model, "models") is None:
                 return bodyshape.missing_nlf_message("models")
-            scorer = bodyshape.SMPLXScorer(nlf_model, "models", device, progress=set_progress)
+            scorer = bodyshape.SMPLXScorer(nlf_model, "models", device, progress=set_progress,
+                                           measure="ratio" if body_score == "smplx_ratio" else "tpose")
         else:
             scorer = bodyshape.Skeleton3DScorer("models", progress=set_progress)
         set_progress("Measuring bodies...", None)
@@ -1047,10 +1049,11 @@ def body_preview(paths: list[str], backend: str = "mediapipe", sam3_model: str =
                 scorer.set_references(paths)
         else:
             scorer.set_references(paths)
-        need = "the body down to the knees" if body_score == "smplx" else "a usable pose"
+        need = "the body down to the knees" if body_score in ("smplx", "smplx_ratio") else "a usable pose"
         text = f"{scorer.ref_count} of {len(paths)} body references show {need} and are measured."
         if scorer.profile:
-            text += " Profile (median +/- the photos' own spread): " + ", ".join(
+            what = "the photos' median" if body_score == "smplx_ratio" else "median +/- the photos' own spread"
+            text += f" Profile ({what}): " + ", ".join(
                 f"{k} {v}" for k, v in scorer.profile.describe().items())
         if scorer.ref_self_similarity is not None:
             text += f". The references' own level {scorer.ref_self_similarity * 100:.1f}% (the normalized 100)."
@@ -1116,7 +1119,8 @@ def score_caption(sc: dict) -> str:
             v = sc.get(raw_key)
         return f"{label} {v:.0f}%" if v is not None else None
 
-    parts = [one("face", "face_norm", "percent") or "no face"]
+    parts = [one("face", "face_norm", "percent")
+             or (f"face unscored ({sc['skipped']})" if sc.get("skipped") else "no face")]
     for label, nk, rk in (("body", "body_norm", "body_percent"), ("combined", "combined_norm", "combined_percent")):
         p = one(label, nk, rk)
         if p:
@@ -1903,6 +1907,7 @@ class Form:
                                             else 1.0),
             face_refs=[p.strip() for p in (v("face_refs") or "").splitlines() if p.strip()],
             face_provider=v("face_provider"), face_det_size=int(v("face_det_size")),
+            face_model=v("face_model") or "buffalo_l",
             body_refs=[p.strip() for p in (v("body_refs") or "").splitlines() if p.strip()],
             face_weight=float(v("face_weight")), body_weight=float(v("body_weight")),
             body_backend=v("body_backend"), sam3_model=(v("sam3_model") or "facebook/sam3").strip(),
@@ -3899,7 +3904,7 @@ def short_scores(sc: dict | None) -> str:
         if v is not None:
             parts.append(f"{label} {v:.0f}%")
         elif label == "face":
-            parts.append("no face")
+            parts.append(f"face unscored ({sc['skipped']})" if sc.get("skipped") else "no face")
     return " · ".join(parts)
 
 
@@ -10325,6 +10330,15 @@ def build_page(local: bool = True):
                                                            label="Face model device").classes("w-40")
                             w["face_det_size"] = ui.number("Detector size", value=d.face_det_size, precision=0) \
                                 .classes("w-32")
+                            w["face_model"] = ui.select({"buffalo_l": "ArcFace R50 (buffalo_l)",
+                                                         "antelopev2": "ArcFace R100 (antelopev2)"},
+                                                        value=d.face_model, label="Face score model") \
+                                .classes("w-56") \
+                                .tooltip("The InsightFace pack the face score embeds with (probes, samples, reward, "
+                                         "self-training). ArcFace R100 (glintr100, about 360 MB, downloaded once) "
+                                         "showed training progress about 1.4x as clearly on one test set, with less "
+                                         "seed noise. The dataset's face analysis, identity alignment and the identity "
+                                         "loss stay on buffalo_l. Scores of the two are not comparable across runs.")
 
                             async def on_face_preview():
                                 paths = [p.strip() for p in (w["face_refs"].value or "").splitlines() if p.strip()]
@@ -10335,7 +10349,7 @@ def build_page(local: bool = True):
                                 _begin("Preparing face model...")
                                 try:
                                     text, crops = await run.io_bound(face_preview, paths, w["face_provider"].value,
-                                                                     w["face_det_size"].value)
+                                                                     w["face_det_size"].value, w["face_model"].value)
                                 except Exception as e:  # noqa: BLE001
                                     face_info.text = f"Error: {e}"
                                     return
@@ -10361,7 +10375,8 @@ def build_page(local: bool = True):
                                                          "anchored": "anchored (SigLIP 2 + DINOv2)",
                                                          "proportions": "proportions (2D skeleton)",
                                                          "skeleton3d": "proportions 3D (skeleton + silhouette)",
-                                                         "smplx": "SMPL-X body shape (NLF)"},
+                                                         "smplx": "SMPL-X body shape (NLF)",
+                                                         "smplx_ratio": "SMPL-X proportions, log-ratio (NLF)"},
                                                         value=d.body_score, label="Body score").classes("w-64") \
                                 .tooltip("appearance: a DINOv2 embedding of the body from the neck to mid-thigh, "
                                          "turned upright and cut out from the background, best match against the "
@@ -10380,14 +10395,17 @@ def build_page(local: bool = True):
                                          "widths where the person stands upright facing the camera. SMPL-X: NLF fits "
                                          "the SMPL-X body model and measures it in its T-pose (bust, waist, hip, "
                                          "thigh, limb lengths over the height); needs photos down to the knees and "
-                                         "NLF's file, downloaded by hand (noncommercial license). The last three "
+                                         "NLF's file, downloaded by hand (noncommercial license). SMPL-X "
+                                         "proportions: the same NLF fit, nine neck-to-knee measurements compared by "
+                                         "log-ratio to the references' median (on one test set it showed training "
+                                         "progress about 1.5x as clearly as SMPL-X body shape). The last four "
                                          "ignore clothing and skin; each compares against the references' own spread.")
                             w["nlf_model"] = ui.input("NLF model (file or folder; empty = models/nlf)",
                                                       value=d.nlf_model).classes("w-72") \
                                 .tooltip("SMPL-X needs NLF (noncommercial research license, not downloaded for you): "
                                          "nlf_l_multi_0.3.2.patch6.torchscript, 550 MB, from "
                                          "github.com/isarandi/nlf/releases (v0.3.2), into models/nlf/") \
-                                .bind_visibility_from(w["body_score"], "value", lambda x: x == "smplx")
+                                .bind_visibility_from(w["body_score"], "value", lambda x: x in ("smplx", "smplx_ratio"))
                             w["body_backend"] = ui.select(["mediapipe", "mediapipe+sam3"], value=d.body_backend,
                                                           label="Pose / mask backend").classes("w-48") \
                                 .tooltip("mediapipe: pose landmarks (the person box, skeleton ratios, region masks). "
@@ -10401,7 +10419,7 @@ def build_page(local: bool = True):
 
                             def body_device_visible(_=None):
                                 w["body_device"].set_visibility(w["body_backend"].value == "mediapipe+sam3"
-                                                                or w["body_score"].value == "smplx")
+                                                                or w["body_score"].value in ("smplx", "smplx_ratio"))
 
                             w["body_backend"].on_value_change(body_device_visible)
                             w["body_score"].on_value_change(body_device_visible)
@@ -12145,8 +12163,12 @@ def build_page(local: bool = True):
                     chips = [("Step", f"{latest_step:,}", False)]
                     if cv:
                         chips.append(("Combined", f"{sum(cv) / len(cv):.1f}%", False))
-                    chips.append(("Face", f"{sum(fv) / len(fv):.1f}% ({len(fv)} of {len(latest)} with a face)" if fv
-                                  else f"no face in {len(latest)} sample(s)", not fv))
+                    unscored = sum(1 for sc in latest if sc.get("skipped"))  # the subject check: ambiguous or tiny
+                    face_txt = (f"{sum(fv) / len(fv):.1f}% ({len(fv)} of {len(latest)} with a face)" if fv
+                                else f"no face in {len(latest)} sample(s)")
+                    if unscored:
+                        face_txt += f", {unscored} left unscored (two faces or a tiny one)"
+                    chips.append(("Face", face_txt, not fv))
                     if st.get("body_refs"):
                         chips.append(("Body", f"{sum(bv) / len(bv):.1f}% ({len(bv)} of {len(latest)} with a person)"
                                       if bv else "no usable person", not bv))
