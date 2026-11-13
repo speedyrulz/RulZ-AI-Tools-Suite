@@ -245,7 +245,8 @@ def reattach_job() -> bool:
 
         proc = psutil.Process(int(data["pid"]))
         created = data.get("create_time")
-        if created is not None and abs(proc.create_time() - float(created)) > 1.0:
+        # no create time: the job had ended before it was recorded, and its pid may be another process's by now
+        if created is None or abs(proc.create_time() - float(created)) > 1.0:
             return False
         _adopted = proc
     except Exception:  # noqa: BLE001  (gone, access denied, psutil missing)
@@ -564,27 +565,43 @@ def request_race_pick(job_dir: Path, name: str) -> None:
 
 
 def stop_training() -> str:
-    reattach_job()
-    if not _running():
-        return "No job running."
-    (_job_dir / "STOP").touch()
+    with _start_lock:  # the queue's thread must not swap in the next job between the check and the STOP file
+        reattach_job()
+        if not _running():
+            return "No job running."
+        (_job_dir / "STOP").touch()
     return "Stop requested; the trainer will save the LoRA after the current step."
 
 
+def _kill_tree(proc) -> None:
+    """Kill a job and the processes it started: the probe process (probe_async) holds a second model on a GPU, and a
+    kill of the job alone leaves it rendering until it next writes to the job, while the next run starts."""
+    try:
+        import psutil
+
+        children = psutil.Process(proc.pid).children(recursive=True)  # before the kill: then they have no parent
+    except Exception:  # noqa: BLE001  (gone already, access denied, psutil missing)
+        children = []
+    proc.kill()
+    for child in children:
+        try:
+            child.kill()
+        except Exception:  # noqa: BLE001  (ended on its own)
+            pass
+
+
 def kill_training() -> str:
-    reattach_job()
-    if not _running():
-        return "No job running."
-    # a kill usually means "stop everything": the queued runs wait for Resume (paused first, so the queue's next tick
-    # cannot start one between the kill and the pause)
-    paused = bool(QUEUE.snapshot()["waiting"])
-    if paused:
-        QUEUE.set_paused(True)
-    _killed_pids.add(_job_pid())
-    if _proc is not None:
-        _proc.kill()
-    else:
-        _adopted.kill()
+    with _start_lock:  # as in stop_training: the job checked is the job killed
+        reattach_job()
+        if not _running():
+            return "No job running."
+        # a kill usually means "stop everything": the queued runs wait for Resume (paused first, so the queue's next
+        # tick cannot start one between the kill and the pause)
+        paused = bool(QUEUE.snapshot()["waiting"])
+        if paused:
+            QUEUE.set_paused(True)
+        _killed_pids.add(_job_pid())
+        _kill_tree(_proc if _proc is not None else _adopted)
     note = ""
     if AUTOSTOP.armed:  # a kill means "let me look": the rented instance must not stop under that
         AUTOSTOP.disarm("switched off by Kill")
@@ -768,6 +785,49 @@ def tail_lines(path: Path, n: int, chunk: int = 65536) -> list[str]:
     if pos > 0:  # the first line read may start mid-line
         lines = lines[1:]
     return lines[-n:] if n > 0 else []
+
+
+LOG_FIRST_BYTES = 256 * 1024  # the Monitor's log opens on this much of a long train.log (it keeps 600 lines)
+LOG_HEAD_BYTES = 64  # a log's first bytes, read on each poll to tell a log written again from one that grew
+
+
+def log_news(path: Path, state: dict, reset=lambda: None) -> list[str]:
+    """The lines written to a log since the last call, read from where that call stopped (state: "pos", "rest",
+    "decoder", "head"), not the whole file on every poll. A file written again (a new run in the same folder) starts
+    with other bytes than the ones read first ("head": its start, a time stamp), or is shorter: reset() clears the
+    view and it is read from the start. The first read of a long file starts LOG_FIRST_BYTES from its end, at a line.
+    A line still being written waits for its end."""
+    import codecs
+
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return []
+    try:
+        with open(path, "rb") as f:
+            first = f.read(LOG_HEAD_BYTES)
+            head = state.get("head") or b""
+            if state["pos"] and (size < state["pos"] or first[:len(head)] != head):
+                reset()
+                state.update(pos=0, rest="", decoder=None, head=b"")
+            if len(state.get("head") or b"") < len(first):  # (a start shorter than LOG_HEAD_BYTES grows into it)
+                state["head"] = first
+            if size == state["pos"]:
+                return []
+            if state["pos"] == 0 and size > LOG_FIRST_BYTES:
+                f.seek(size - LOG_FIRST_BYTES)
+                f.readline()  # the first line read would start part way
+            else:
+                f.seek(state["pos"])
+            data = f.read(size - f.tell())
+            state["pos"] = f.tell()
+    except OSError:
+        return []
+    if state.get("decoder") is None:  # a character split between two reads decodes whole on the next one
+        state["decoder"] = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    lines = (state["rest"] + state["decoder"].decode(data)).split("\n")
+    state["rest"] = lines.pop()
+    return [line.rstrip("\r") for line in lines]
 
 
 def read_log_tail(n: int = 80) -> str:
@@ -1378,6 +1438,31 @@ def analyse_and_preview(cfg_dict: dict, what: str) -> tuple[str, list[tuple[str,
     return text, thumbs
 
 
+_gpu_cache: dict = {"at": 0.0, "stats": [], "busy": False}
+_gpu_cache_lock = threading.Lock()
+
+
+def gpu_stats_cached(max_age: float = 2.0) -> list[dict]:
+    """gpu_stats() for page timers: the last sample, taken again in a thread once it is older than max_age. nvidia-smi
+    takes up to 3 s and must not run on the event loop every page shares, and open pages share one call."""
+    with _gpu_cache_lock:
+        stale = time.time() - _gpu_cache["at"] > max_age and not _gpu_cache["busy"]
+        if stale:
+            _gpu_cache["busy"] = True
+        stats = _gpu_cache["stats"]
+    if stale:
+        def sample():
+            fresh = []
+            try:
+                fresh = gpu_stats()
+            finally:
+                with _gpu_cache_lock:
+                    _gpu_cache.update(at=time.time(), stats=fresh, busy=False)
+
+        threading.Thread(target=sample, daemon=True, name="gpu-stats").start()
+    return stats
+
+
 def gpu_stats() -> list[dict]:
     """Per-GPU utilization and memory via nvidia-smi (no CUDA context in the UI process)."""
     try:
@@ -1705,6 +1790,13 @@ class Form:
         model_path = (v("model_path") or "").strip() if preset == CUSTOM else MODEL_PRESETS[preset]
         prompts = [p.strip() for p in (v("sample_prompts") or "").splitlines() if p.strip()]
         s = lambda k: (v(k) or "").strip()  # noqa: E731
+
+        def num(key: str, cast):
+            """A number box where 0 means something (off, none, exact): an emptied box (None) is the trainer's
+            default, not 0."""
+            val = v(key)
+            return cast(TrainConfig.__dataclass_fields__[key].default) if val in (None, "") else cast(val)
+
         kw = dict(
             preset="identity" if self.w.get("preset_toggle") is not None and self.w["preset_toggle"].value else "",
             job_name=s("job_name") or "my_lora", output_dir=s("output_dir") or "output", seed=int(v("seed")),
@@ -1738,12 +1830,12 @@ class Form:
             finetune_window_gb=float(v("finetune_window_gb") or 0), finetune_reserve_gb=float(v("finetune_reserve_gb") or 0),
             finetune_extract_ranks=parse_ranks(v("finetune_extract_ranks")),
             finetune_save_delta=bool(v("finetune_save_delta")), finetune_resume=s("finetune_resume"),
-            finetune_anchor=float(v("finetune_anchor") or 0.0),
+            finetune_anchor=num("finetune_anchor", float),
             lora_targets=[t for t in TARGETS + list(EXTRA_TARGETS) if self.w.get(f"target_{t}") is not None
                           and self.w[f"target_{t}"].value],
             train_text_embedder=bool(v("train_text_embedder")), resume_from=s("resume_from"),
             lora_blocks=s("lora_blocks"),
-            lora_save_dtype=v("lora_save_dtype"), lora_ema=float(v("lora_ema") or 0),
+            lora_save_dtype=v("lora_save_dtype"), lora_ema=num("lora_ema", float),
             save_state=bool(v("save_state")), resume_state=s("resume_state"),
             save_state_every=int(v("save_state_every")), keep_states=int(v("keep_states")),
             oom_retries=3 if v("oom_retries") is None else max(0, int(v("oom_retries"))),
@@ -1752,7 +1844,7 @@ class Form:
             sample_walk_seed=bool(v("sample_walk_seed")), sample_before_training=bool(v("sample_before_training")),
             sample_frames=int(v("sample_frames") or 1), probe_frames=int(v("probe_frames") or 1),
             train_frames=int(v("train_frames") or 1), train_video_mode=v("train_video_mode") or "fps",
-            video_resolution=int(v("video_resolution") or 0),
+            video_resolution=num("video_resolution", int),
             steps=0 if v("soup_run") or v("noise_run") else int(v("steps")), batch_size=int(v("batch_size")),
             gradient_accumulation=int(v("gradient_accumulation")), learning_rate=float(v("learning_rate")),
             optimizer=v("optimizer"), lr_scheduler=v("lr_scheduler"), warmup_steps=int(v("warmup_steps")),
@@ -1787,7 +1879,7 @@ class Form:
             reward_group=int(v("reward_group") or 4),
             reward_prompts=[p.strip() for p in (v("reward_prompts") or "").splitlines() if p.strip()],
             reward_sample_steps=int(v("reward_sample_steps") or 0), reward_train_steps=int(v("reward_train_steps") or 4),
-            reward_noise=float(v("reward_noise") or 0.7), reward_kl=float(v("reward_kl") or 0.0),
+            reward_noise=float(v("reward_noise") or 0.7), reward_kl=num("reward_kl", float),
             reward_size=int(v("reward_size") or 0),
             selftrain=bool(v("selftrain")), selftrain_at=s("selftrain_at") or "0.5",
             selftrain_images=int(v("selftrain_images") or 32),
@@ -1846,7 +1938,7 @@ class Form:
             loss_watch=bool(v("loss_watch")), per_image_lr=bool(v("per_image_lr")),
             loss_watch_buckets=int(v("loss_watch_buckets")), loss_watch_beta=float(v("loss_watch_beta")),
             loss_watch_high=float(v("loss_watch_high")), loss_watch_low=float(v("loss_watch_low")),
-            loss_watch_fence=float(v("loss_watch_fence") or 0),
+            loss_watch_fence=num("loss_watch_fence", float),
             loss_watch_improve_tol=float(v("loss_watch_improve_tol")),
             loss_watch_healthy_mult=float(v("loss_watch_healthy_mult")),
             loss_watch_exclude_after=int(v("loss_watch_exclude_after")),
@@ -1854,10 +1946,10 @@ class Form:
             region_class_weights=str(v("region_class_weights") or "").strip(),
             region_steer=bool(v("region_steer")),
             region_steer_regions=str(v("region_steer_regions") or "background,clothes"),
-            region_steer_cap=float(v("region_steer_cap") or 0), region_steer_ahead=float(v("region_steer_ahead") or 0),
+            region_steer_cap=num("region_steer_cap", float), region_steer_ahead=num("region_steer_ahead", float),
             region_steer_boost=float(v("region_steer_boost") or 0),
             region_steer_prior=float(v("region_steer_prior") or 0),
-            region_steer_min=float(v("region_steer_min") or 0), region_steer_step=float(v("region_steer_step")),
+            region_steer_min=num("region_steer_min", float), region_steer_step=float(v("region_steer_step")),
             region_steer_strength=float(v("region_steer_strength")),
             region_steer_signal=str(v("region_steer_signal") or "steps"),
             region_steer_holdout=float(v("region_steer_holdout") or 0),
@@ -1871,7 +1963,7 @@ class Form:
             training_maps_trigger_off=bool(v("training_maps_trigger_off")),
             isolation=bool(v("isolation")), isolation_class=s("isolation_class"),
             isolation_kind=v("isolation_kind") or "auto", dop_weight=float(v("dop_weight")),
-            dop_every=int(v("dop_every") or 1), isolation_pairs=int(v("isolation_pairs") or 0),
+            dop_every=int(v("dop_every") or 2), isolation_pairs=num("isolation_pairs", int),
             isolation_pair_weight=float(v("isolation_pair_weight")), isolation_balance=bool(v("isolation_balance")),
             look_warmup=bool(v("look_warmup")), look_warmup_start=float(v("look_warmup_start")),
             look_warmup_epochs=float(v("look_warmup_epochs")),
@@ -1879,10 +1971,10 @@ class Form:
             body_loss_weight=float(v("body_loss_weight")), background_loss_weight=float(v("background_loss_weight")),
             face_margin=float(v("face_margin")), region_feather_cells=int(v("region_feather_cells")),
             region_prior_weight=float(v("region_prior_weight")),
-            attn_localize=bool(v("attn_localize")), attn_localize_weight=float(v("attn_localize_weight") or 0.0),
+            attn_localize=bool(v("attn_localize")), attn_localize_weight=num("attn_localize_weight", float),
             attn_localize_layers=s("attn_localize_layers"), id_align=bool(v("id_align")),
-            id_align_weight=float(v("id_align_weight") or 0.0), id_align_layer=int(v("id_align_layer")),
-            body_align=bool(v("body_align")), body_align_weight=float(v("body_align_weight") or 0.0),
+            id_align_weight=num("id_align_weight", float), id_align_layer=int(v("id_align_layer")),
+            body_align=bool(v("body_align")), body_align_weight=num("body_align_weight", float),
             id_loss_weight=float(v("id_loss_weight")), id_loss_sigma_max=float(v("id_loss_sigma_max")),
             id_loss_every=int(v("id_loss_every")), id_loss_backend=v("id_loss_backend"),
             id_loss_margin_cells=int(v("id_loss_margin_cells")),
@@ -1899,15 +1991,15 @@ class Form:
             race_patience=int(v("race_patience") or 3), race_patience_rising=bool(v("race_patience_rising")),
             race_parallel=bool(v("race_parallel")), race_follow=bool(v("race_follow")),
             race_pick=bool(v("race_pick")) and bool(v("race_follow")),
-            race_pick_minutes=float(v("race_pick_minutes") or 0),
+            race_pick_minutes=num("race_pick_minutes", float),
             race_drop_confidence=float(v("race_drop_confidence") or 0) if v("race_paired") else 0.0,
-            race_max_close_rounds=int(v("race_max_close_rounds") or 0),
+            race_max_close_rounds=num("race_max_close_rounds", int),
             race_drop_drift=float(v("race_drop_drift") or 0),
             race_drop_drift_probes=int(v("race_drop_drift_probes") or 2),
             race_configs=self.w["race_configs"].value,
             soup_files=([p.strip() for p in (v("soup_files") or "").splitlines() if p.strip()]
                         if v("soup_run") else []),
-            soup_rank=int(v("soup_rank") or 0), soup_strengths=s("soup_strengths") or "1.0",
+            soup_rank=num("soup_rank", int), soup_strengths=s("soup_strengths") or "1.0",
             noise_files=([p.strip().strip('"') for p in (v("noise_files") or "").splitlines() if p.strip()]
                          if v("noise_run") else []),
             noise_seeds=int(v("noise_seeds") or 16),
@@ -11794,14 +11886,14 @@ def build_page(local: bool = True):
 
             ui.timer(2.0, while_connected(queue_draw))
             ui.timer(2.0, while_connected(autostop_draw))
-            log_state = {"job": None, "n": 0, "console_shown": False}
+            log_state = {"job": None, "pos": 0, "rest": "", "decoder": None, "head": b"", "console_shown": False}
 
             def show(key: str, value: str, sub: str = ""):
                 tiles[key][0].text = value
                 tiles[key][1].text = sub
 
             def update_gpus():
-                stats = gpu_stats()
+                stats = gpu_stats_cached()
                 if len(gpu_widgets) != len(stats):
                     gpu_box.clear()
                     gpu_widgets.clear()
@@ -11886,17 +11978,10 @@ def build_page(local: bool = True):
                 if _job_dir is None:
                     return
                 if log_state["job"] != str(_job_dir):
-                    log_state.update(job=str(_job_dir), n=0, console_shown=False)
+                    log_state.update(job=str(_job_dir), pos=0, rest="", decoder=None, head=b"", console_shown=False)
                     log_view.clear()
-                lp = _job_dir / "train.log"
-                if lp.exists():
-                    lines = lp.read_text(encoding="utf-8", errors="replace").splitlines()
-                    if len(lines) < log_state["n"]:
-                        log_view.clear()
-                        log_state["n"] = 0
-                    for line in lines[log_state["n"]:]:
-                        log_view.push(line)
-                    log_state["n"] = len(lines)
+                for line in log_news(_job_dir / "train.log", log_state, log_view.clear):
+                    log_view.push(line)
                 st = read_status() or {}
                 if not _running() and not log_state["console_shown"] and (st.get("error") or not st.get("done")):
                     cp = _job_dir / "console.log"

@@ -220,8 +220,11 @@ def describe(reasons: Counter) -> str:
 
 def record(path: Path, rnd: int, step: int, bar: float, cands: list[Candidate], copy_max: float | None = None) -> None:
     """Append the round to selftrain.json: every candidate's scores and verdict (the kept ones rebuild the round's
-    images when a run resumes); copy_max: the round's copy limit (None: no copy check)."""
+    images when a run resumes); copy_max: the round's copy limit (None: no copy check). The file is written whole:
+    a kill mid-write left a torn file, which the next round read as empty and so lost every earlier round."""
     import json
+
+    from .atomic import writing
 
     data = []
     if path.exists():
@@ -239,7 +242,8 @@ def record(path: Path, rnd: int, step: int, bar: float, cands: list[Candidate], 
          "sharpness_of": "face" if c.face_sharp else "picture",
          **({"copy": round(c.copy, 3), "copy_of": c.copy_of} if c.copy is not None else {}),
          "verdict": c.verdict} for c in cands]})
-    path.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    with writing(path) as tmp:
+        tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
 
 
 def last_kept(path: Path, before: int) -> tuple[int, list[tuple[str, str]]] | None:

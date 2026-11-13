@@ -328,14 +328,22 @@ def _find(ids: list[int], sub: list[int]) -> int:
     raise ValueError(f"The user-turn header {USER_HEADER!r} was not found in the templated prompt")
 
 
+def text_length(max_length: int) -> int:
+    """How many tokens after the user-turn header are encoded for the trainer's max_token_length: PAN 2's own 1536
+    when it is left at the trainer's default (1024, which cut the released structured negative, about 1480 tokens,
+    and long structured captions short of what the model reads), else the value asked for, at most 1536."""
+    if int(max_length) == TrainConfig.max_token_length:
+        return MAX_TEXT_TOKENS
+    return max(1, min(int(max_length), MAX_TEXT_TOKENS))
+
+
 def tokenize(tokenizer, prompt: str, max_length: int = MAX_TEXT_TOKENS) -> tuple[torch.Tensor, int]:
-    """(token ids of the templated prompt, cut so that at most max_length follow the user-turn header; the index of
-    the first of those)."""
+    """(token ids of the templated prompt, cut so that at most text_length(max_length) follow the user-turn header;
+    the index of the first of those)."""
     ids = tokenizer(format_prompt(prompt), add_special_tokens=False)["input_ids"]
     header = tokenizer(USER_HEADER, add_special_tokens=False)["input_ids"]
     start = _find(ids, header) + len(header)
-    keep = max(1, min(int(max_length), MAX_TEXT_TOKENS))
-    return torch.tensor(ids[: start + keep], dtype=torch.long), start
+    return torch.tensor(ids[: start + text_length(max_length)], dtype=torch.long), start
 
 
 @torch.no_grad()
@@ -354,12 +362,12 @@ def encode_prompt(text_encoder, tokenizer, prompt: str, max_length: int = MAX_TE
     return encode_prompts(text_encoder, tokenizer, [prompt], max_length)[0]
 
 
-def prompt_tokens(tokenizer, prompt: str) -> tuple[str, list, int, int]:
+def prompt_tokens(tokenizer, prompt: str, max_length: int = MAX_TEXT_TOKENS) -> tuple[str, list, int, int]:
     """encode_prompt's text with its token offsets, the leading tokens the cache drops (the system turn and the user
-    header) and the cached length."""
+    header) and the cached length, cut where encode_prompt cuts at the same max_length."""
     text = format_prompt(prompt)
     offsets = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)["offset_mapping"]
-    rows, start = tokenize(tokenizer, prompt)
+    rows, start = tokenize(tokenizer, prompt, max_length)
     return text, [tuple(o) for o in offsets[: rows.numel()]], start, rows.numel() - start
 
 

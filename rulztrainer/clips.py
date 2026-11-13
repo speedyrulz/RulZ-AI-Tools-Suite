@@ -93,22 +93,20 @@ def pick_frames(total: int, src_fps: float, frames: int, fps: float, mode: str =
     return [min(int(round(i * step)), last) for i in range(frames)]
 
 
-def read_frames(path: str | Path, frames: int, fps: float, mode: str = "fps") -> list:
-    """A clip of `frames` frames (PIL RGB pictures, upright) from a video file. A container that holds fewer frames
-    than its header said repeats its last frame."""
+def _decode(path: str | Path, need: list[int]) -> tuple[dict, int]:
+    """The frames at the indices `need` (ascending) as upright PIL RGB pictures, and how many frames were decoded:
+    all of the video's when it ended before need[-1]."""
     import av
 
-    _, _, total, src_fps = video_info(path)
-    want = pick_frames(total, src_fps, frames, fps, mode)
-    need = sorted(set(want))
     got: dict[int, Image.Image] = {}
+    wanted = set(need)
     with av.open(str(path)) as c:
         st = c.streams.video[0]
         st.thread_type = "AUTO"
         rot = _rotation(st)
         k = 0
         for frame in c.decode(st):
-            if k in need:
+            if k in wanted:
                 img = frame.to_image().convert("RGB")
                 if rot in (90, 180, 270):  # counter-clockwise in PIL: the display turns it clockwise
                     img = img.rotate(-rot, expand=True)
@@ -116,6 +114,23 @@ def read_frames(path: str | Path, frames: int, fps: float, mode: str = "fps") ->
             k += 1
             if k > need[-1]:
                 break
+    return got, k
+
+
+def read_frames(path: str | Path, frames: int, fps: float, mode: str = "fps") -> list:
+    """A clip of `frames` frames (PIL RGB pictures, upright) from a video file. A container that holds fewer frames
+    than its header said (a WebM or MKV without a frame count, whose duration includes a longer audio track) is read
+    again with the frames picked from the ones it has: else every index past its end was its last frame, a frozen
+    tail in "spread" mode."""
+    _, _, total, src_fps = video_info(path)
+    want = pick_frames(total, src_fps, frames, fps, mode)
+    need = sorted(set(want))
+    got, decoded = _decode(path, need)
+    if got and 1 < decoded <= need[-1]:  # the video ended before the last frame asked for
+        want = pick_frames(decoded, src_fps, frames, fps, mode)
+        need = sorted(set(want))
+        if any(i not in got for i in need):
+            got, _ = _decode(path, need)
     if not got:
         raise ValueError(f"no video frames could be read from {path}")
     last_read = max(got)

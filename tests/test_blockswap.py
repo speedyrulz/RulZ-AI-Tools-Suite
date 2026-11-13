@@ -157,3 +157,27 @@ def test_logsnr_timesteps():
     assert float((s < 0.5).float().mean()) < 0.08  # mostly noisy steps
     with pytest.raises(ValueError, match="logsnr_std"):
         TrainConfig(timestep_sampling="logsnr", logsnr_std=0).validate()
+
+
+def test_the_block_prefetched_next_follows_the_pass_turning_round():
+    """A forward runs the swapped blocks up, its recomputation runs them down: the turn (the last block twice) and a
+    new forward after a recomputation that stopped above block 0 prefetch the block that really comes next."""
+    from rulztrainer.blockswap import BlockSwap
+
+    bs = BlockSwap.__new__(BlockSwap)
+    bs.indices, bs.last, bs.down = [0, 1, 2, 3], None, False
+
+    def run(order):
+        out = []
+        for i in order:
+            out.append(bs._next(i))
+            bs.last = i
+        return out
+
+    assert run([0, 1, 2, 3]) == [1, 2, 3, None]
+    assert run([3, 2, 1, 0]) == [2, 1, 0, None]  # the turn: block 2 is fetched while block 3 recomputes
+    assert run([0, 1, 2, 3]) == [1, 2, 3, None]  # the next forward
+    assert run([3, 2]) == [2, 1]  # a recomputation that stops at block 2 (blocks 0 and 1 kept their activations)
+    assert run([0]) == [1]  # the next forward starts at block 0: up, not down
+    run([1, 2, 3])
+    assert run([1]) == [0]  # a recomputation starting below the late blocks that kept their activations

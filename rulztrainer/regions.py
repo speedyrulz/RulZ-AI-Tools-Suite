@@ -95,7 +95,12 @@ def analyze_faces(items, face_scorer, cache_path: Path, progress=None, recache: 
                   embeddings: bool = False) -> dict[str, dict]:
     """Largest face per *source image* in source pixels: {str(resolved path): {bbox, kps, det, W, H}} (bbox None if
     no face), with embeddings=True also its ArcFace embedding ("emb", 512 floats; identity alignment). Cached in
-    faces.json keyed by path|mtime|size; a face cached without an embedding is analysed again when one is wanted."""
+    faces.json keyed by path|mtime|size; a face cached without an embedding is analysed again when one is wanted.
+
+    Only what a detector looked at is cached ("detected"): with no detector (InsightFace missing, or it failed to
+    start) or a detector that failed on the image, the image counts as faceless for this run only. Caching that
+    used to make every later run, a working detector included, train without the image's face (regions, crops,
+    curriculum, identity loss) until recache; a faceless record from then (no "detected") is looked at again."""
     from PIL import Image, ImageOps
 
     cache: dict[str, dict] = {}
@@ -107,8 +112,15 @@ def analyze_faces(items, face_scorer, cache_path: Path, progress=None, recache: 
     sources: dict[str, Path] = {}
     for it in items:
         sources.setdefault(str(it.image.resolve()), it.image)
-    todo = [(k, p) for k, p in sources.items() if _file_key(p) not in cache
-            or (embeddings and cache[_file_key(p)].get("bbox") and not cache[_file_key(p)].get("emb"))]
+    def wanted(rec: dict | None) -> bool:
+        if rec is None:
+            return True
+        if not rec.get("bbox"):
+            return not rec.get("detected")
+        return embeddings and not rec.get("emb")
+
+    todo = [(k, p) for k, p in sources.items() if wanted(cache.get(_file_key(p)))]
+    passing: dict[str, dict] = {}  # this run's records of images no detector looked at: never cached
     for i, (k, p) in enumerate(todo):
         rec: dict = {"bbox": None, "kps": None, "det": 0.0, "W": 0, "H": 0}
         try:
@@ -117,6 +129,7 @@ def analyze_faces(items, face_scorer, cache_path: Path, progress=None, recache: 
             rec["W"], rec["H"] = W, H
             if face_scorer is not None:
                 faces = face_scorer.faces(p)
+                rec["detected"] = True
                 if faces:
                     f = faces[0]
                     rec["bbox"] = [float(v) for v in f.bbox]
@@ -128,12 +141,23 @@ def analyze_faces(items, face_scorer, cache_path: Path, progress=None, recache: 
                         rec["emb"] = [round(float(v), 6) for v in emb]
         except Exception as e:  # noqa: BLE001
             log.warning("face analysis failed for %s: %s", p, e)
-        cache[_file_key(p)] = rec
+            rec.pop("detected", None)
+        old = cache.get(_file_key(p))
+        if rec.get("detected"):
+            cache[_file_key(p)] = rec
+        elif old is not None and old.get("bbox"):
+            pass  # a face found before stays (only its embedding was wanted, and that failed)
+        else:
+            cache.pop(_file_key(p), None)
+            passing[_file_key(p)] = rec
         if progress:
             progress(i + 1, len(todo))
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(json.dumps(cache), encoding="utf-8")
-    return {k: cache[_file_key(p)] for k, p in sources.items()}
+    from .atomic import writing
+
+    with writing(cache_path) as tmp:  # a run killed while it writes must not leave a torn cache
+        tmp.write_text(json.dumps(cache), encoding="utf-8")
+    return {k: cache.get(_file_key(p)) or passing[_file_key(p)] for k, p in sources.items()}
 
 
 def analyze_bodies(items, embed, cache_path: Path, progress=None, recache: bool = False) -> dict[str, list | None]:
@@ -228,6 +252,7 @@ class RegionMap:
     parts: torch.Tensor | None = None  # [PARTS, h, w] uint8: the parser's class fractions, then the silhouette ring
     parts_print: str = ""  # what built `parts`: a mismatch rebuilds the map
     weights_print: str = ""  # what built `weight` and `prior` (weights_print): a mismatch rebuilds the map
+    face_print: str = ""  # "1" when the face analysis had a face for the image when the map was built, else "0"
 
 
 def build_weight_map(bw: int, bh: int, face_bbox_px, person_mask: np.ndarray | None, face_w: float, body_w: float,
@@ -361,6 +386,8 @@ def save_region_map(path: Path, rm: RegionMap) -> None:
         meta["parts_print"] = rm.parts_print
     if rm.weights_print:
         meta["weights_print"] = rm.weights_print
+    if rm.face_print:
+        meta["face_print"] = rm.face_print
     path.parent.mkdir(parents=True, exist_ok=True)
     save_safetensors(tensors, path, metadata=meta)
 
@@ -377,7 +404,7 @@ def load_region_map(path: Path) -> RegionMap | None:
     fc = tuple(int(v) for v in meta["face_cells"].split(",")) if meta.get("face_cells") else None
     kps = json.loads(meta["kps"]) if meta.get("kps") else None
     return RegionMap(weight, prior, fc, kps, meta.get("has_person") == "1", parts, meta.get("parts_print", ""),
-                     meta.get("weights_print", ""))
+                     meta.get("weights_print", ""), meta.get("face_print", ""))
 
 
 def _stale(path: Path, key: str, want: str) -> bool:
@@ -389,6 +416,36 @@ def _stale(path: Path, key: str, want: str) -> bool:
             return (f.metadata() or {}).get(key) != want
     except Exception:  # noqa: BLE001
         return True
+
+
+def _map_meta(path: Path) -> dict | None:
+    from safetensors import safe_open
+
+    try:
+        with safe_open(str(path), "pt") as f:
+            return f.metadata() or {}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _map_stale(it, recache: bool, wprint: str, parts_want: str | None, analysis: dict[str, dict]) -> bool:
+    """A cached region map built another way than this run would build it: other weights, no parts or other parts,
+    or a face the analysis has (or no longer has) since. A map from before face_print is rebuilt only when it has no
+    face and the analysis now has one (it was built while no detector ran)."""
+    if recache or not it.region_path.exists():
+        return True
+    meta = _map_meta(it.region_path)
+    if meta is None or meta.get("weights_print") != wprint:
+        return True
+    if parts_want is not None and meta.get("parts_print") != parts_want:
+        return True
+    rec = analysis.get(str(it.image.resolve()))
+    if rec is not None and not rec.get("bbox") and not rec.get("detected"):
+        return False  # no detector looked at it this run: the cached map's face (or none) is the better guess
+    face = "1" if rec and rec.get("bbox") else "0"
+    if not meta.get("face_print"):
+        return face == "1" and not meta.get("face_cells")
+    return meta["face_print"] != face
 
 
 def _parts_stale(path: Path, want: str) -> bool:
@@ -425,9 +482,8 @@ def cache_region_maps(items, cfg, analysis: dict[str, dict], person_mask_fn=None
     counts = {"face": 0, "person": 0, "none": 0}
     workers = person_mask_fns or [(person_mask_fn, "cpu")]
     wprint = weights_print(cfg, any(fn is not None for fn, _ in workers))
-    todo = [it for it in items if it.region_path is not None and (
-        cfg.recache or not it.region_path.exists() or _stale(it.region_path, "weights_print", wprint)
-        or (parts_fn is not None and _parts_stale(it.region_path, parts_print(cfg, it.width, it.height))))]
+    todo = [it for it in items if it.region_path is not None and _map_stale(
+        it, cfg.recache, wprint, parts_print(cfg, it.width, it.height) if parts_fn is not None else None, analysis)]
     if len(workers) > 1:
         log.info("Region maps: %d images split across %s", len(todo), ", ".join(str(d) for _, d in workers))
     done_n = [0]
@@ -463,6 +519,8 @@ def _region_map_for(it, cfg, analysis: dict[str, dict], person_mask_fn, parts_fn
                           cfg.background_loss_weight, cfg.face_margin, cfg.region_feather_cells)
     rm.kps = kps_px
     rm.weights_print = wprint
+    rm.face_print = "1" if rec and rec.get("bbox") else "0"  # the analysis' face, as _map_stale reads it (a face
+    # outside this crop counts: else the map was rebuilt on every run)
     if parts_fn is not None:
         rm.parts = build_parts(parts_fn(load_image_fit(it.image, it.width, it.height, it.src_box)), it.width, it.height,
                                rm.face_cells, cfg.hull_ring_cells)

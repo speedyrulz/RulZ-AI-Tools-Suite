@@ -66,6 +66,7 @@ class BlockSwap:
         self.entries: dict[int, list] = {}  # block -> [(module, name, is_buffer, cpu tensor)]
         self.ready: dict[int, tuple] = {}  # block -> (gpu tensors, event) copied in ahead
         self.last: int | None = None
+        self.down = False  # the direction of the last move: down while the recomputation runs the blocks backwards
         self.installed: set[int] = set()  # swapped blocks whose modules hold their GPU copies right now
         self.max_inflight = max(1, int(max_inflight))
         self.inflight: collections.deque = collections.deque()  # events of swapped blocks the GPU may still be running
@@ -130,9 +131,26 @@ class BlockSwap:
         return tensors, event
 
     def _next(self, i: int) -> int | None:
-        """The swapped block that runs after block i: the next one up in a forward, down in the recomputation."""
+        """The swapped block that runs after block i: the next one up in a forward, down in the recomputation.
+
+        The same block twice in a row is the turn from a forward to its recomputation (or back), so the direction
+        turns round; a jump down after going up is a recomputation starting below blocks that kept their activations,
+        and a jump down after going down is a new forward starting (the last recomputation stopped above block 0).
+        Read as "up" (as this did by i < last alone), those passes copied their second block in without overlap."""
         k = self.indices.index(i)
-        down = self.last is not None and i < self.last
+        if self.last is None or self.last not in self.indices:
+            down = False
+        else:
+            kl = self.indices.index(self.last)
+            if k == kl:
+                down = not self.down
+            elif k == kl - 1:
+                down = True
+            elif k < kl:
+                down = not self.down
+            else:
+                down = False
+        self.down = down
         j = k - 1 if down else k + 1
         return self.indices[j] if 0 <= j < len(self.indices) else None
 
@@ -171,6 +189,7 @@ class BlockSwap:
         """Forget prefetched copies (between a step's passes and a render, so nothing stale is waited on)."""
         self.ready.clear()
         self.last = None
+        self.down = False
         self.inflight.clear()
 
     def remove(self) -> None:

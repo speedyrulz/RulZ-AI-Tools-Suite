@@ -369,13 +369,15 @@ class LikenessController:
         """A probe's per-seed raw scores ({"face": [...], "body": [...]}, seed order, None = unscored) as the record
         keeps them: raw, normalized, and each seed's face and body combined (the seeds a probe without one kind of
         prompt renders count with the other kind alone). With a "gold" list its seeds are kept too, and with
-        gold_select the gold face is the one combined."""
+        gold_select the gold face is the one combined. The normalized body seeds count lost body renders as the
+        smoothed score does (framed_seeds); the raw ones stay as measured. A face the scorer did not find stays
+        unscored: the smoothed face score leaves such a render out too."""
         cfg = self.cfg
         face = list((seeds or {}).get("face") or [])
         body = list((seeds or {}).get("body") or [])
         gold = list((seeds or {}).get("gold") or [])
         face_n = [self.norm("face", v) for v in face]
-        body_n = [self.norm("body", v) for v in body]
+        body_n = [self.norm("body", v) for v in self.framed_seeds(body)]
         gold_n = [self.norm("gold", v) for v in gold]
         comb = combine_seeds(gold_n if self.gold_select else face_n, body_n, cfg.face_weight, cfg.body_weight)
         out = {"face_seeds": face, "body_seeds": body, "face_norm_seeds": face_n, "body_norm_seeds": body_n,
@@ -410,6 +412,34 @@ class LikenessController:
         mean = sum(min(v, top) for v in measured) / len(measured)
         return floor + (mean - floor) * rel
 
+    def framed_seeds(self, renders: list) -> list:
+        """The body probe's renders one by one (raw, seed order) as framed_body counts them, so the per-seed scores
+        that paired race drops and likeness_stats read agree with the smoothed one: the mean over the scored renders
+        is framed_body's score. Before, a render without a body left its seed to the face alone, and a racer whose
+        body probe had turned into portraits read higher per seed than one that kept its body.
+
+        One render stops at the scale's top. While no more renders were lost than at the first probe that measured
+        one (or framing is off, or no probe has measured a body yet), a render without a body stays unscored, as
+        framed_body then leaves the body score as measured. Once renders were lost, those without a body share what
+        framed_body still credits them: each is the scale's zero when every render showed a body at that first probe
+        (the usual case); when that probe already missed some, the ones lost beyond its share make up the zeros.
+        Reads body_ref_share and never sets it (framed_body does, in update)."""
+        renders = list(renders or [])
+        if not self.framing or not renders or self.body_ref_share is None:
+            return renders
+        floor, top = self.scale("body") if self.normalize else (0.0, 100.0)
+        n, m = len(renders), sum(1 for v in renders if v is not None)
+        if not m:
+            return [floor] * n
+        capped = [None if v is None else min(float(v), top) for v in renders]
+        rel = min(1.0, m / n / self.body_ref_share)
+        if rel >= 1.0:
+            return capped
+        mean = sum(v for v in capped if v is not None) / m
+        # (n - m) lost renders at this value bring the mean over all n to framed_body's floor + (mean - floor) * rel
+        lost = floor + (mean - floor) * (rel * n - m) / (n - m)
+        return [lost if v is None else v for v in capped]
+
     def update(self, step: int, face: float | None, body: float | None, images: list[str] | None = None,
                seeds: dict | None = None):
         """Feed one probe result (seeds: its per-seed raw scores, {"face": [...], "body": [...]} and "gold" with the
@@ -428,12 +458,13 @@ class LikenessController:
         gold = mean_of((seeds or {}).get("gold"))
         if self.normalize and step == 0:
             self._set_floors(face, body, gold)
-        per_seed = self.seed_scores(seeds)
-        self.last_seeds = per_seed["combined_seeds"]
         # likeness_framing: from here on `body` counts the renders that lost their body as zero
         body_renders = list((seeds or {}).get("body") or [])
         body_missing = sum(1 for v in body_renders if v is None)
         body_measured, body = body, self.framed_body(body, body_renders)
+        # after framed_body: the first probe that measures a body sets the share the per-seed scores count against
+        per_seed = self.seed_scores(seeds)
+        self.last_seeds = per_seed["combined_seeds"]
         self.face_ema = self._ema(self.face_ema, face)
         self.body_ema = self._ema(self.body_ema, body)
         self.gold_ema = self._ema(self.gold_ema, gold)

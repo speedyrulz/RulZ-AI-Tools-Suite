@@ -139,8 +139,10 @@ class RegionSweep:
                 "held": [p["key"] for p in self.probes if p["held"]], "history": self.history[-400:],
                 "best": list(self.best) if self.best else None, "since_best": self.since_best,
                 "held_best": self.held_best, "held_flat": self.held_flat}
-        with contextlib.suppress(OSError):
-            (self.job_dir / STATE_FILE).write_text(json.dumps(data), encoding="utf-8")
+        from .atomic import writing  # here, not at the top: atomic loads PyTorch, which this module leaves to callers
+
+        with contextlib.suppress(OSError), writing(self.job_dir / STATE_FILE) as tmp:  # whole: a resumed run reads it
+            tmp.write_text(json.dumps(data), encoding="utf-8")
 
     # ------------------------------------------------------------ schedule
     def due(self, step: int, last: bool = False) -> bool:

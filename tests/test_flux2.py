@@ -385,10 +385,44 @@ def test_text_model_builds_from_the_real_key_layout(monkeypatch, rotary_takes_de
         FSF.TEXT_CONFIG.update(cfg_real)
     assert model.rotary_emb.inv_freq.device.type == "cpu"
     assert model.config.rope_parameters["rope_theta"] == 1000000.0
+    assert len(model.layers) == FSF.TE_LAYERS == max(FL.SELECT_LAYERS) and isinstance(model.norm, torch.nn.Identity)
+    assert not state  # consumed: the layers past the cut and the norm were dropped unread
     ids = torch.tensor([[3, 4, 5]])
     with torch.no_grad():
-        assert torch.allclose(model.float()(input_ids=ids).last_hidden_state,
-                              te(input_ids=ids).last_hidden_state, atol=2e-2)
+        got = model.float()(input_ids=ids, output_hidden_states=True).hidden_states
+        want = te(input_ids=ids, output_hidden_states=True).hidden_states
+    for k in FL.SELECT_LAYERS:
+        assert torch.allclose(got[k], want[k], atol=2e-2)
+
+
+def test_text_encoder_cut_at_layer_27_gives_the_same_features(monkeypatch):
+    """Layers 28-36 of Qwen3-8B never reach a feature (SELECT_LAYERS is 9, 18, 27), so they are not built. transformers
+    overwrites the last hidden state with the normed one, which the cut makes layer 27's: the final norm is an
+    identity, so the cached features of the 27-layer build equal the 36-layer model's, bit for bit."""
+    from transformers import Qwen3Config, Qwen3Model
+
+    tiny = {**FSF.TEXT_CONFIG, "vocab_size": 100, "hidden_size": 16, "intermediate_size": 32, "num_hidden_layers": 36,
+            "num_attention_heads": 2, "num_key_value_heads": 2, "head_dim": 8}
+    torch.manual_seed(3)
+    full = Qwen3Model(Qwen3Config(**tiny)).eval()
+    with torch.no_grad():
+        for p in full.parameters():  # bf16 weights as the build installs them (the rotary table stays fp32)
+            p.data = p.data.to(torch.bfloat16)
+            p.data.add_(torch.randn_like(p.data) * 0.05)  # beyond the init, so the norm's weight is not all ones
+    state = {f"model.{k}": v.clone() for k, v in full.state_dict().items()}
+    state["lm_head.weight"] = state["model.embed_tokens.weight"].clone()
+    monkeypatch.setattr(FSF, "TEXT_CONFIG", tiny)
+    cut = FSF.build_text_model(state, "none")
+    assert len(cut.layers) == 27 and len(full.layers) == 36
+    prompts = ["a cat", "a longer prompt about a dog on a beach", ""]
+    with torch.no_grad():
+        want = FL.encode_prompts(full, StubTok(), prompts, 512)
+        got = FL.encode_prompts(cut, StubTok(), prompts, 512)
+        # without the identity the last of the cut's hidden states (layer 27) would come out normed
+        normed = full(input_ids=torch.tensor([[3, 4, 5]]), output_hidden_states=True).hidden_states
+        assert not torch.equal(full.norm(normed[27]), normed[27])
+    for a, b in zip(want, got):
+        assert a.shape == (512, 48) and torch.equal(a, b)
 
 
 def test_detection_caches_buckets_and_downloads(tmp_path):
@@ -408,7 +442,7 @@ def test_detection_caches_buckets_and_downloads(tmp_path):
     item, fitem = D.scan_dataset(klein)[0], D.scan_dataset(fibo)[0]
     assert item.width % 16 == 0 and item.height % 16 == 0
     assert item.latent_path == fitem.latent_path  # the same Flux2 VAE latents as FIBO 2.0 / MOSS-Image
-    assert D.text_cache_path(klein, "p").name.endswith("_flux2_klein.safetensors")
+    assert D.text_cache_path(klein, "p").name.endswith("_flux2_klein_wo.safetensors")
     comfy = "Comfy-Org/Flux-2-Klein-9B"
     plan = {f: (r, n) for f, r, n in planned_downloads(TrainConfig(model_path=BASE))}
     assert plan == {

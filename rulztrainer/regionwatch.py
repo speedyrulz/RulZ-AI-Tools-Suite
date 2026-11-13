@@ -339,8 +339,11 @@ class RegionWatch:
                 "pictures": {k: {"seen": st.seen, "start_n": st.start_n, "start_log": st.start_log,
                                  "contrast_log": st.contrast_log, "cells": st.cells, "gain": st.gain}
                              for k, st in self.stats.items()}}
-        try:
-            (self.job_dir / STATE_FILE).write_text(json.dumps(data), encoding="utf-8")
+        from .atomic import writing  # here, not at the top: the WebUI imports this module and atomic loads PyTorch
+
+        try:  # written whole: a resumed run reads it, and a kill mid-write left a torn file that read as no state
+            with writing(self.job_dir / STATE_FILE) as tmp:
+                tmp.write_text(json.dumps(data), encoding="utf-8")
         except OSError:
             pass
 

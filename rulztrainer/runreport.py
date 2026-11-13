@@ -28,6 +28,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .history import probe_racer as _probe_racer
+
 INK, MUTED, FAINT, GRID, SURFACE, CARD = "#1a1a19", "#6b6a63", "#9b9a92", "#e4e3dd", "#f4f3ef", "#ffffff"
 BAND, BAND_INK, BAND_MUTED = "#1f2937", "#ffffff", "#b6c0cf"
 BLUE, ORANGE, AQUA, YELLOW, GOLD, RED = "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#c98500", "#c9413f"
@@ -69,6 +71,7 @@ class Run:
     lr: list = field(default_factory=list)  # [(step, lr)] from the log
     notes: list = field(default_factory=list)  # the log's warnings and errors
     started: str = ""
+    racer_of: dict = field(default_factory=dict, repr=False)  # id(probe record) -> its racer (probe_racer)
 
     @property
     def job(self) -> str:
@@ -240,13 +243,61 @@ def duration(seconds) -> str:
     return f"{h} h {m:02d} min" if h else f"{m} min {s % 60:02d} s"
 
 
+def race_names(run: Run) -> list[str]:
+    return [str(n) for n in ((run.status.get("race") or {}).get("names") or [])]
+
+
+def race_winner(run: Run) -> str:
+    """The race's winner as the trainer records it (status.json's race "winner", RaceSchedule.state), "" while none
+    is decided and for a run without a race."""
+    return str((run.status.get("race") or {}).get("winner") or "")
+
+
+def probe_racer(run: Run, rec: dict) -> str:
+    """The race configuration a probe record is from, named as run.images names it: "" outside a race and for the
+    probes after it (the one that trained on to the end, whose renders carry no name)."""
+    names = race_names(run)
+    if not names:
+        return ""
+    key = id(rec)  # the records live in run.probes for as long as the run does; each page asks again
+    if key not in run.racer_of:
+        run.racer_of[key] = _probe_racer(rec, names)
+    return run.racer_of[key]
+
+
+def best_racers(run: Run) -> set[str]:
+    """The racers (run.images' naming) whose probe records hold the run's best checkpoint: everyone outside a race;
+    in a race the winner, with the probes after the race when it is the one that trained on (the race's "last"),
+    and while no winner is decided the configuration of the latest probe. In a race the latest probe can be any
+    configuration's, so its best is not the run's."""
+    names = race_names(run)
+    if not names:
+        return {""}
+    race = run.status.get("race") or {}
+    win = race_winner(run)
+    if win:
+        return {win, ""} if win == race.get("last") else {win}
+    return {probe_racer(run, run.probes[-1])} if run.probes else {""}
+
+
 def best(run: Run) -> tuple:
-    """(score, step) of the best checkpoint as the run recorded it."""
-    if run.probes:
-        last = run.probes[-1]
-        return last.get("best"), last.get("best_step")
+    """(score, step) of the best checkpoint as the run recorded it: the latest probe record of the racers that hold
+    it (best_racers), in a race the winner's own step count."""
+    owners = best_racers(run)
+    recs = [r for r in run.probes if probe_racer(run, r) in owners]
+    if recs:
+        return recs[-1].get("best"), recs[-1].get("best_step")
+    race = run.status.get("race") or {}
+    win = race_winner(run)
+    if win and (race.get("best") or {}).get(win) is not None:  # its records fell out of status.json's last 500
+        return race["best"][win], (race.get("best_step") or {}).get(win)
     like = run.status.get("likeness") or {}
     return like.get("best"), like.get("best_step")
+
+
+def is_best(run: Run, racer: str, step) -> bool:
+    """Is this racer's probe at `step` the best checkpoint's? (Racers share step numbers: each counts its own.)"""
+    return step is not None and step == best(run)[1] and racer in best_racers(run)
 
 
 def steps_shown(run: Run, n: int, racer: str = "") -> list[int]:
@@ -255,7 +306,7 @@ def steps_shown(run: Run, n: int, racer: str = "") -> list[int]:
     if len(have) <= n:
         return have
     keep = {have[0], have[-1]}
-    b = best(run)[1]
+    b = best(run)[1] if racer in best_racers(run) else None
     if b in have:
         keep.add(b)
     spread = [have[round(i * (len(have) - 1) / (n - 1))] for i in range(n)]
@@ -266,9 +317,11 @@ def steps_shown(run: Run, n: int, racer: str = "") -> list[int]:
     return sorted(keep)
 
 
-def record_at(run: Run, step: int) -> dict:
+def record_at(run: Run, step: int, racer: str = "") -> dict:
+    """The probe record of `racer` (run.images' naming) at `step`: in a race every configuration is probed at the
+    same own step counts, so the step alone names one of several."""
     for r in run.probes:
-        if r.get("step") == step:
+        if r.get("step") == step and probe_racer(run, r) == racer:
             return r
     return {}
 
@@ -314,9 +367,8 @@ def verdict(run: Run) -> list[tuple[str, str]]:
         if (peak.get("held") or {}).get("subject") is not None:
             out.append(("note", f"Held-out photos peaked at step {peak['step']} "
                                 f"({100 * peak['held']['subject']:.1f}% of the subject learned)."))
-    race = run.status.get("race") or {}
-    if race.get("champion") or race.get("winner"):
-        out.append(("good", f"Race won by {race.get('champion') or race.get('winner')}."))
+    if race_winner(run):
+        out.append(("good", f"Race won by {race_winner(run)}."))
     if run.status.get("error"):
         out.append(("warn", f"The run ended with an error: {_short(run.status['error'], 140)}"))
     elif not run.status.get("done"):
@@ -524,12 +576,13 @@ def probe_grid(page: Page, x, y, run: Run, steps, kind: str, seeds: int, cell_h:
     aspect = 1.0 if kind == "face" else 2 / 3
     cell_w = cell_h * aspect
     pitch = cell_h + (0.3 if scores else 0.08)
-    b_step = best(run)[1]
     for r, step in enumerate(steps):
         files = run.images.get((racer, step, kind)) or {}
-        rec = record_at(run, step)
+        rec = record_at(run, step, racer)
         sc = seed_scores(rec, kind)
-        valid = [(v, i) for i, v in enumerate(sc[:seeds]) if v is not None]
+        # a render without a body reads "no body", also where likeness_framing counted it as the scale's zero
+        lost = [v is None for v in rec.get("body_seeds") or []] if kind == "body" else []
+        valid = [(v, i) for i, v in enumerate(sc[:seeds]) if v is not None and not (i < len(lost) and lost[i])]
         top = max(valid)[1] if len(valid) > 1 else None
         for k in range(seeds):
             cx, cy = x + k * (cell_w + gap), y + r * pitch
@@ -538,21 +591,21 @@ def probe_grid(page: Page, x, y, run: Run, steps, kind: str, seeds: int, cell_h:
             if path is None or page.picture(cx, cy, cell_w, cell_h, path, edge=edge) is None:
                 page.box(cx, cy, cell_w, cell_h, color=SURFACE, edge=GRID, radius=0.02)
             if scores and k < len(sc):
-                page.text(cx + cell_w / 2, cy + cell_h + 0.03, "no body" if (sc[k] is None and kind == "body") else _num(sc[k], 0),
+                gone = kind == "body" and (sc[k] is None or (k < len(lost) and lost[k]))
+                page.text(cx + cell_w / 2, cy + cell_h + 0.03, "no body" if gone else _num(sc[k], 0),
                           size=6.5, color=AQUA if top == k else MUTED, ha="center", weight="bold" if top == k else "normal")
-        if step == b_step:
+        if is_best(run, racer, step):
             page.box(x - 0.07, y + r * pitch - 0.07, seeds * (cell_w + gap) - gap + 0.14,
                      cell_h + (0.3 if scores else 0.14), color="none",
                      edge=GOLD, lw=2.2, radius=0.03, z=4)
     return seeds * (cell_w + gap) - gap, len(steps) * pitch
 
 
-def step_labels(page: Page, x, y, run: Run, steps, cell_h: float, pitch: float, width: float):
-    b_step = best(run)[1]
+def step_labels(page: Page, x, y, run: Run, steps, cell_h: float, pitch: float, width: float, racer: str = ""):
     for r, step in enumerate(steps):
-        rec = record_at(run, step)
+        rec = record_at(run, step, racer)
         cy = y + r * pitch
-        if step == b_step:
+        if is_best(run, racer, step):
             page.box(x - 0.08, cy - 0.07, width, cell_h + 0.3, color="#fbf3dc", edge="none", radius=0.03)
             page.text(x, cy + cell_h - 0.24, "★ BEST CHECKPOINT", size=6.5, color=GOLD, weight="bold")
         page.text(x, cy + 0.02, f"Step {step}", size=10, weight="bold")
@@ -636,15 +689,18 @@ def summary(run: Run, path: Path, dpi: int = 150) -> Path:
     card_h = 9.5
     x, y, w, h = page.card(0.6, top, W - 1.2, card_h, "Probe renders through the run: the same seeds at each step")
     kinds = [k for k in ("face", "body") if any(kk == k for (_r, _s, kk) in run.images)]
-    race_names = racers(run)
+    named = racers(run)
     racer = ""
-    if race_names and not any(r == "" for (r, _s, _k) in run.images):
-        champ = (run.status.get("race") or {}).get("champion")
-        racer = champ if champ in race_names else race_names[0]
+    if named:
+        # the winner's renders: those after the race when it trained on to the end (they carry no name), else its
+        # own; with no winner decided yet the probes after the race, or the first configuration's
+        win, plain = race_winner(run), any(r == "" for (r, _s, _k) in run.images)
+        if not (plain and (not win or "" in best_racers(run))):
+            racer = win if win in named else ("" if plain else named[0])
         face_steps = steps_shown(run, 6, racer)
     if face_steps and kinds:
         cell_h, pitch = 1.14, 1.44
-        step_labels(page, x + 0.08, y + 0.12, run, face_steps, cell_h, pitch, 2.35)
+        step_labels(page, x + 0.08, y + 0.12, run, face_steps, cell_h, pitch, 2.35, racer)
         gx = x + 2.5
         for kind, seeds in (("face", 5), ("body", 6)):
             if kind not in kinds:
@@ -829,15 +885,15 @@ def pdf(run: Run, path: Path) -> Path:
             for i, r in enumerate(run.probes[:30]):
                 yy = y + 0.25 + i * 0.21
                 face = r.get("gold_norm") if r.get("gold_select") else r.get("face_norm", r.get("face"))
-                is_best = r.get("step") == bs
-                if is_best:
+                best_row = is_best(run, probe_racer(run, r), r.get("step"))
+                if best_row:
                     page.box(x - 0.06, yy - 0.035, w + 0.12, 0.2, color="#fbf3dc", edge="none", radius=0.02)
                 vals = [str(r.get("step")), _num(face), _num(r.get("body_norm", r.get("body"))), _num(r.get("combined")),
                         _num(r.get("combined_ema")), f"{_num(r.get('best'))} @ {r.get('best_step')}",
                         "" if r.get("copy") is None else f"{r['copy']:.2f}",
                         f"{r.get('body_missing')}/{r.get('body_probes')}" if r.get("body_probes") else ""]
                 for (label, dx), v in zip(cols, vals):
-                    page.text(x + dx, yy, v, size=7.8, weight="bold" if is_best else "normal")
+                    page.text(x + dx, yy, v, size=7.8, weight="bold" if best_row else "normal")
             done(out, page)
 
         # 4: sweeps
@@ -867,8 +923,11 @@ def pdf(run: Run, path: Path) -> Path:
             x, y, w, h = page.card(0.5, 0.9, W - 1.0, 0.9 + 0.24 * len(names), "Configurations")
             for label, dx in (("name", 0.0), ("best score", 2.6), ("left the race", 3.8)):
                 page.text(x + dx, y, label, size=7.5, color=MUTED, weight="bold")
-            champ = race.get("champion")
-            left, dropped, bests = race.get("left") or {}, race.get("dropped") or {}, race.get("best") or {}
+            champ = race_winner(run)
+            dropped, bests = race.get("dropped") or {}, race.get("best") or {}
+            # why each one left, from the state's lists (a round's lowest score is in none of them)
+            left = {n: why for key, why in (("finished", "finished"), ("stale", "patience"), ("drifted", "drift"),
+                                            ("manual", "by hand")) for n in race.get(key) or []}
             for i, name in enumerate(names):
                 yy = y + 0.27 + i * 0.24
                 if name == champ:
@@ -890,14 +949,14 @@ def pdf(run: Run, path: Path) -> Path:
                 page = new("Probe renders" + (f": {racer}" if racer else ""))
                 yy = 0.9
                 for step in steps[i:i + per]:
-                    rec = record_at(run, step)
-                    is_best = step == bs and (not racer or racer == (race.get("champion") or racer))
+                    rec = record_at(run, step, racer)
+                    best_row = is_best(run, racer, step)
                     x, y, w, h = page.card(0.5, yy, W - 1.0, 3.3, "")
-                    if is_best:
+                    if best_row:
                         page.box(0.5, yy, W - 1.0, 3.3, color="none", edge=GOLD, lw=2, z=3)
                     face = rec.get("gold_norm") if rec.get("gold_select") else rec.get("face_norm", rec.get("face"))
-                    page.text(x, y - 0.02, f"Step {step}" + ("   ★ best checkpoint" if is_best else ""), size=10.5, weight="bold",
-                              color=GOLD if is_best else INK)
+                    page.text(x, y - 0.02, f"Step {step}" + ("   ★ best checkpoint" if best_row else ""), size=10.5,
+                              weight="bold", color=GOLD if best_row else INK)
                     page.text(x + w, y, f"face {_num(face)}   body {_num(rec.get('body_norm', rec.get('body')))}   "
                               f"score {_num(rec.get('combined'))}   smoothed {_num(rec.get('combined_ema'))}"
                               + ("" if rec.get("copy") is None else f"   copy {rec['copy']:.2f}"), size=8, color=MUTED, ha="right")

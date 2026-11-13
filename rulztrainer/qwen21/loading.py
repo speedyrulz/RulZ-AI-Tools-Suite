@@ -22,7 +22,6 @@ from pathlib import Path
 
 import torch
 
-from .. import quant as Q
 from ..config import TrainConfig
 from ..moss import loading as moss_loading
 from ..moss import single_file as sf
@@ -124,11 +123,10 @@ def load_text_encoder(model_dir: Path, device: str = "auto", quant: str = "auto"
 
     from ..fibo.loading import place_text_encoder
     from ..krea2.single_file import load_hf_text_model
-    from .single_file import TE_INT8_MATMUL
 
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir / "processor"))
     model = load_hf_text_model(model_dir / "text_encoder", "none" if quant == "auto" else quant, device)
-    Q.configure_int8(model, TE_INT8_MATMUL)
+    sf.weight_only(model)  # int8 and nvfp4 layers alike: no int8 / FP4 activations (load_hf_text_model does it too)
     return place_text_encoder(model, device), tokenizer
 
 
@@ -180,13 +178,15 @@ def get_tokenizer(cfg: TrainConfig, model_dir: Path | None):
     return AutoTokenizer.from_pretrained(str(_need_dir(cfg, model_dir, "tokenizer") / "processor"))
 
 
-def prompt_tokens(tokenizer, prompt: str) -> tuple[str, list, int, int]:
+def prompt_tokens(tokenizer, prompt: str, max_length: int = 1024) -> tuple[str, list, int, int]:
     """encode_prompt's text (the template up to and including the prompt; the suffix follows) with its token
-    offsets; the cache drops the system turn's tokens and keeps the suffix ones."""
+    offsets, cut where encode_prompt cuts the user turn at the same max_length; the cache drops the system turn's
+    tokens and keeps the suffix ones."""
     text = PROMPT_PREFIX + (prompt or " ")
     offsets = tokenizer(text, return_offsets_mapping=True, add_special_tokens=False)["offset_mapping"]
     drop = system_tokens(tokenizer)
     n_suffix = len(tokenizer(PROMPT_SUFFIX, add_special_tokens=False).input_ids)
+    offsets = offsets[: drop + max(8, int(max_length) - n_suffix)]
     return text, [tuple(o) for o in offsets], drop, len(offsets) - drop + n_suffix
 
 
@@ -292,9 +292,10 @@ def get_transformer(cfg: TrainConfig, model_dir: Path | None, device: str | None
         if use_file:
             return qsf.load_transformer_file(cfg.transformer_file, "cpu", cfg.transformer_quant, quant_devices=gpus)
         return load_transformer(model_dir, "cpu", cfg.transformer_quant, quant_devices=gpus)
-    if use_file:
-        return qsf.load_transformer_file(cfg.transformer_file, device or cfg.device, cfg.transformer_quant)
-    return load_transformer(model_dir, device or cfg.device, cfg.transformer_quant)
+    with sf.quantize_staged_on(sf.staging_gpu(cfg, device)):  # block swap: quantized on the GPU, kept in RAM
+        if use_file:
+            return qsf.load_transformer_file(cfg.transformer_file, device or cfg.device, cfg.transformer_quant)
+        return load_transformer(model_dir, device or cfg.device, cfg.transformer_quant)
 
 
 def get_vae(cfg: TrainConfig, model_dir: Path | None):

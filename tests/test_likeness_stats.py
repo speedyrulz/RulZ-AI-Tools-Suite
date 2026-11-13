@@ -2,6 +2,7 @@
 needs, a run's noise from its likeness.jsonl, the noise check's report and stage, per-seed scores in probe records, and
 the race's paired drop rule (race_drop_confidence)."""
 import contextlib
+import dataclasses
 import json
 import math
 import sys
@@ -72,8 +73,15 @@ def test_probe_records_keep_every_seed(tmp_path):
     rec, _ = c.update(10, 40.0, None, [], {"face": [30.0, None, 50.0], "body": [None, None, None]})
     assert rec.face_seeds == [30.0, None, 50.0] and rec.body_seeds == [None, None, None]
     assert rec.face_norm_seeds == [25.0, None, 75.0]  # floor 20, ceiling 60, linear
-    assert rec.combined_seeds == [25.0, None, 75.0] and c.last_seeds == rec.combined_seeds  # the face alone
+    # likeness_framing: step 0 showed a body on every render, so these lost ones count as the body scale's zero, as
+    # in the smoothed score (0.7 x face + 0.3 x 0); a seed without a face is the body alone
+    assert rec.body_norm_seeds == [0.0, 0.0, 0.0] and rec.body_norm == 0.0
+    assert rec.combined_seeds == pytest.approx([17.5, 0.0, 52.5]) and c.last_seeds == rec.combined_seeds
     assert c.update(20, 40.0, 85.0)[0].combined_seeds == [] and c.last_seeds == []  # an old caller: no seeds
+    old = LikenessController(dataclasses.replace(cfg, likeness_framing=False), face_ceiling=60.0, body_ceiling=90.0)
+    old.update(0, 20.0, 80.0, [], {"face": [18.0, 22.0], "body": [80.0, 80.0]})
+    rec, _ = old.update(10, 40.0, None, [], {"face": [30.0, None, 50.0], "body": [None, None, None]})
+    assert rec.combined_seeds == [25.0, None, 75.0]  # without it: the face alone, as before
     rows = [{"step": 0, "combined_seeds": [0.0, 0.0]},
             {"step": 10, "combined_seeds": [40.0, 50.0], "face_norm_seeds": [40.0, 50.0]},
             {"step": 20, "combined_seeds": [45.0, 53.0], "face_norm_seeds": [45.0, 53.0]},

@@ -72,9 +72,10 @@ def test_a_rank_keeps_what_the_files_share(tmp_path):
 
 
 def test_peft_files_keep_their_alpha_per_module(tmp_path):
-    """A PEFT file whose layers have different alphas keeps them in alpha_pattern; the sampling-LoRA reader used
-    the file-wide lora_alpha for every layer before."""
-    from rulztrainer.lora import parse_comfy_lora, read_peft_metadata
+    """A PEFT file whose layers have different alphas and ranks: each layer's change is alpha / rank x B A whichever
+    way it is read (alpha / rank folded into lora_B, as ComfyUI reads no alpha from the metadata; the metadata says
+    scale 1 per layer, ranks in rank_pattern / alpha_pattern), and loading it back restores the trained alphas."""
+    from rulztrainer.lora import parse_comfy_lora, read_folded_alpha, read_peft_metadata
 
     g = torch.Generator().manual_seed(0)
     stubs = {NAMES[0]: stub("lora", {"lora_down": torch.randn(8, IN, generator=g),
@@ -83,9 +84,16 @@ def test_peft_files_keep_their_alpha_per_module(tmp_path):
                                      "lora_up": torch.randn(OUT, 4, generator=g)}, alpha=1, rank=4)}
     save_lora(stubs, tmp_path / "p.safetensors", dtype=torch.float32, fmt="peft")
     meta = read_peft_metadata(tmp_path / "p.safetensors")
-    got = parse_comfy_lora(load_file(str(tmp_path / "p.safetensors")), meta.get("lora_alpha"),
-                           meta.get("alpha_pattern"))
-    assert got[NAMES[0]][3] == pytest.approx(1.0) and got[NAMES[1]][3] == pytest.approx(0.25)
+    state = load_file(str(tmp_path / "p.safetensors"))
+    got = parse_comfy_lora(state, meta.get("lora_alpha"), meta.get("alpha_pattern"))
+    assert got[NAMES[0]][3] == pytest.approx(1.0) and got[NAMES[1]][3] == pytest.approx(1.0)
+    for name, alpha, rank in ((NAMES[0], 8, 8), (NAMES[1], 1, 4)):
+        p = stubs[name].adapter_params()
+        want = p["lora_up"] @ p["lora_down"] * (alpha / rank)
+        b, a = state[f"transformer.{name}.lora_B.weight"], state[f"transformer.{name}.lora_A.weight"]
+        assert torch.allclose(b @ a, want, atol=1e-5)  # ComfyUI: no .alpha key, scale 1
+        assert torch.allclose(S.delta_of(got[name]), want, atol=1e-5)
+    assert read_folded_alpha(tmp_path / "p.safetensors") == {NAMES[0]: 8.0, NAMES[1]: 1.0}
 
 
 def test_lokr_needs_a_rank_and_oft_is_refused(tmp_path):

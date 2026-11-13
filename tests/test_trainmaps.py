@@ -399,7 +399,7 @@ class FakeArch:
     def get_tokenizer(self, cfg, model_dir):
         return None
 
-    def prompt_tokens(self, tokenizer, caption):
+    def prompt_tokens(self, tokenizer, caption, max_length=None):
         """One token per word."""
         offsets, at = [], 0
         for word in caption.split(" "):

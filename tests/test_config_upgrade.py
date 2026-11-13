@@ -132,3 +132,34 @@ def test_settings_the_trainer_cannot_act_on_are_refused_at_start(bad, msg):
     untrained, an lr_scheduler typo ran constant, a timestep_sampling typo failed at step 1."""
     with pytest.raises(ValueError, match=msg):
         TrainConfig(**bad).validate()
+
+
+def test_hand_written_switches_read_as_meant():
+    """YAML 1.1 reads a bare off as false and a quoted 'false' stays a (true) string."""
+    import yaml
+
+    from rulztrainer.config import TrainConfig as TC
+
+    cfg = TC.from_dict(yaml.safe_load("dp_balance: off\nhull_regions: off\nmulti_gpu: off\nflip_augment: 'false'\n"
+                                      "recache: 'yes'\n"))
+    assert (cfg.dp_balance, cfg.hull_regions, cfg.multi_gpu) == ("off", "off", "off")
+    assert cfg.flip_augment is False and cfg.recache is True
+    cfg.validate()
+
+
+def test_multi_gpu_takes_only_its_modes():
+    from rulztrainer.config import TrainConfig as TC
+
+    with pytest.raises(ValueError, match="multi_gpu"):
+        TC.from_dict({"multi_gpu": True}).validate()  # a bare on: which mode is meant?
+    TC(multi_gpu="data_parallel").validate()
+
+
+def test_a_misspelt_save_dtype_is_refused_before_the_run():
+    """Not at the first save, which may be the last one after hours of training."""
+    import pytest as _pytest
+
+    from rulztrainer.config import TrainConfig as TC
+
+    with _pytest.raises(ValueError, match="lora_save_dtype"):
+        TC(lora_save_dtype="bfloat16").validate()

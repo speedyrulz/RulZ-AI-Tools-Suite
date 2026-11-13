@@ -125,6 +125,71 @@ def cuda_index(provider: str, device=None) -> int | None:
     return 0
 
 
+def cpu_thread_cap(quota=None) -> int | None:
+    """The CPU threads face scoring should use in a container whose CPU quota is below the CPUs it shows, else None
+    (leave onnxruntime and OpenCV as they are). onnxruntime starts a thread per physical core it sees and OpenCV one
+    per CPU, which a vast.ai quota (24 CPUs shown, 11.5 allowed) throttles to a crawl; the trainer caps PyTorch's
+    threads for the same reason (trainer.cap_cpu_threads), and this follows its count, at most the quota (a process
+    that did not cap PyTorch, like the WebUI, still gets the quota). Outside such a container nothing changes:
+    PyTorch's default, one thread per physical core, is onnxruntime's own, and limiting it would only reload the face
+    models for nothing."""
+    import os
+    import sys
+
+    try:
+        from . import machine
+
+        quota = machine.cpu_quota() if quota is None else quota
+        if quota is None:
+            return None
+        n = max(1, int(quota))
+        torch = sys.modules.get("torch")
+        if torch is not None:
+            n = min(n, int(torch.get_num_threads()))
+    except Exception:  # noqa: BLE001  (never a reason for face scoring not to start)
+        return None
+    return n if 0 < n < (os.cpu_count() or 0) else None
+
+
+def limit_threads(app, threads: int) -> int:
+    """Rebuild FaceAnalysis' CPU onnxruntime sessions with intra_op_num_threads = threads, and set OpenCV's thread
+    count (the detector resizes with it) to the same. insightface (0.7) hands its sessions only the providers, so the
+    option cannot go in when they are made. A session that cannot be rebuilt is kept as it was. Returns how many
+    sessions were rebuilt."""
+    try:
+        import cv2
+
+        cv2.setNumThreads(int(threads))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import onnxruntime as ort
+    except Exception:  # noqa: BLE001
+        return 0
+    done = 0
+    for name, model in list((getattr(app, "models", None) or {}).items()):
+        sess = getattr(model, "session", None)
+        path = (getattr(sess, "model_path", None) or getattr(sess, "_model_path", None)
+                or getattr(model, "model_file", None))
+        try:
+            providers = list(sess.get_providers())
+            if not path or not providers or providers[0] != "CPUExecutionProvider":
+                continue  # a GPU session does its work on the GPU: its CPU threads are not the ones throttled
+            had = sess.get_session_options().intra_op_num_threads
+            if 0 < had <= threads:
+                continue
+            opts = ort.SessionOptions()
+            opts.intra_op_num_threads = int(threads)
+            per = sess.get_provider_options() or {}
+            cls = type(sess) if isinstance(sess, ort.InferenceSession) else ort.InferenceSession
+            model.session = cls(str(path), sess_options=opts, providers=providers,
+                                provider_options=[per.get(p, {}) for p in providers])
+            done += 1
+        except Exception as e:  # noqa: BLE001
+            log.debug("Face model %s keeps its onnxruntime threads: %s", name, e)
+    return done
+
+
 class FaceScorer:
     def __init__(self, provider: str = "cpu", det_size: int = 640, model_name: str = "buffalo_l", progress=None,
                  device=None):
@@ -149,6 +214,15 @@ class FaceScorer:
         self.app = FaceAnalysis(name=model_name, providers=providers,
                                 allowed_modules=["detection", "recognition"])
         self.app.prepare(ctx_id=index if index is not None else -1, det_size=(det_size, det_size))
+        cap = cpu_thread_cap()
+        if cap is not None:
+            try:
+                n = limit_threads(self.app, cap)
+            except Exception as e:  # noqa: BLE001  (an insightface whose models look otherwise: score as it is)
+                n = 0
+                log.debug("Face scoring keeps its CPU threads: %s", e)
+            if n:
+                log.info("CPU quota: face scoring uses %d CPU threads (%d onnxruntime session(s), OpenCV)", cap, n)
         self.progress = progress  # (text, fraction): the reference loops below report through it too
         self.refs: list[tuple[str, np.ndarray]] = []
         self.ref_self_similarity: float | None = None

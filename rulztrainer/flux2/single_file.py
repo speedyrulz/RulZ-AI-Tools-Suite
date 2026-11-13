@@ -7,7 +7,9 @@ folder, Flux2Transformer2DModel) is fused back into them on load: the inverse of
 convert_flux2_transformer_checkpoint_to_diffusers. Klein's Base and distilled files have the same keys, so the
 distilled model is known by its file name alone.
 
-The text encoder is plain Qwen3-8B (Qwen3ForCausalLM's `model.*`): built as a text-only Qwen3Model, the LM head left out.
+The text encoder is plain Qwen3-8B (Qwen3ForCausalLM's `model.*`): built as a text-only Qwen3Model, the LM head left
+out, cut to the first TE_LAYERS of its 36 layers (the deepest hidden state FLUX.2 reads is layer 27's) without the
+final norm.
 """
 from __future__ import annotations
 
@@ -17,6 +19,7 @@ import re
 from pathlib import Path
 
 import torch
+from torch import nn
 
 from .. import quant as Q
 from ..moss import single_file as sf
@@ -36,6 +39,9 @@ TEXT_CONFIG = dict(vocab_size=151936, hidden_size=4096, intermediate_size=12288,
                    attention_dropout=0.0, use_sliding_window=False, sliding_window=None, tie_word_embeddings=False,
                    bos_token_id=151643, eos_token_id=151645, rope_parameters={"rope_type": "default",
                                                                               "rope_theta": 1000000.0})
+# loading.SELECT_LAYERS reads layers 9, 18 and 27: the last 9 of the 36 never reach a feature, so they are not built
+# (about 3.5 GB of bf16 weights)
+TE_LAYERS = 27
 TOKENIZER_REPO = "Qwen/Qwen3-8B"
 TOKENIZER_FILES = ["tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt"]
 
@@ -172,14 +178,24 @@ def load_transformer_file(path: str | Path, device, quant: str = "auto", dtype=t
 
 
 def build_text_model(state: dict, quant: str = "none", work_device=None):
-    """Text-only Qwen3-8B from an HF-style state dict, which is consumed. work_device: where to quantize."""
+    """Text-only Qwen3-8B, its first TE_LAYERS layers without the final norm, from an HF-style state dict, which is
+    consumed (the layers past the cut and the norm are dropped unread). work_device: where to quantize. Its quantized
+    layers run weight-only (moss.single_file.weight_only).
+
+    The norm becomes an identity because transformers overwrites the last of hidden_states with the normed state:
+    with 27 layers built, hidden_states[27] is the last one, and it has to stay layer 27's raw output, as it is in the
+    full model (ComfyUI, diffusers and ai-toolkit read it unnormed)."""
     from transformers import Qwen3Config, Qwen3Model
 
-    cfg = Qwen3Config(**TEXT_CONFIG)
-    state = {k: v for k, v in state.items() if not k.startswith("lm_head.")}
-    state = sf.strip_prefix(state, ("model.",))
+    keep = min(TE_LAYERS, int(TEXT_CONFIG["num_hidden_layers"]))
+    cfg = Qwen3Config(**{**TEXT_CONFIG, "num_hidden_layers": keep})
+    state = sf.strip_prefix(sf.take_state(state, ("lm_head.",)), ("model.",))
+    for k in list(state):
+        if k.startswith("norm.") or (k.startswith("layers.") and int(k.split(".")[1]) >= keep):
+            del state[k]
     with torch.device("meta"):
         model = Qwen3Model(cfg)
+        model.norm = nn.Identity()
     sf.install_state(model, state, quant, torch.bfloat16, ignore_missing=("inv_freq",), work_device=work_device)
     rot_cls = type(model.rotary_emb)  # its buffers were created on the meta device: build it again for real
     kwargs = {"device": "cpu"} if "device" in inspect.signature(rot_cls.__init__).parameters else {}
@@ -187,7 +203,7 @@ def build_text_model(state: dict, quant: str = "none", work_device=None):
     for name, p in model.named_parameters():
         if p.device.type == "meta":
             raise ValueError(f"Text encoder parameter {name} was not loaded")
-    return model.eval().requires_grad_(False)
+    return sf.weight_only(model).eval().requires_grad_(False)
 
 
 def load_text_encoder_file(path: str | Path, device: str = "auto", quant: str = "auto"):

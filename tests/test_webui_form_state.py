@@ -252,3 +252,20 @@ def test_the_run_report_switch_goes_to_the_page_and_back():
     on = _filled_form(TrainConfig(run_report=True, datasets=[{"path": "a"}]))
     on.w["datasets"].value = [{"path": "a"}]
     assert on.to_config().run_report is True
+
+
+def test_an_emptied_number_box_is_the_trainers_default_and_a_typed_zero_stays():
+    """lora_ema 0 switches the weight average off; an emptied box (None) used to do the same."""
+    f = _filled_form(TrainConfig(datasets=[{"path": "a"}]))
+    f.w["datasets"].value = [{"path": "a"}]
+    for key in ("lora_ema", "video_resolution", "isolation_pairs", "soup_rank", "race_pick_minutes", "dop_every"):
+        f.w[key].value = None
+    out = f.to_config()
+    d = TrainConfig()
+    assert (out.lora_ema, out.video_resolution, out.isolation_pairs, out.soup_rank, out.race_pick_minutes,
+            out.dop_every) == (d.lora_ema, d.video_resolution, d.isolation_pairs, d.soup_rank, d.race_pick_minutes,
+                               d.dop_every)
+    f.w["lora_ema"].value = 0
+    f.w["soup_rank"].value = 0
+    out = f.to_config()
+    assert out.lora_ema == 0 and out.soup_rank == 0

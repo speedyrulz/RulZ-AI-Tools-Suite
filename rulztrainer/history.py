@@ -15,9 +15,12 @@ overwrites the job folder's own), each with its step, kind, seed, configuration 
 from their job folders' status.json."""
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import re
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -245,11 +248,35 @@ def has_data(record: dict) -> bool:
         record["probes"].get(k) for k in ("face", "body", "combined"))
 
 
+REPLACE_TRIES = 6  # on Windows a reader (the Previous Runs poll, a scan) can briefly hold the target open
+
+
+def _replace(tmp: Path, path: Path) -> None:
+    """os.replace, tried again for a moment while Windows refuses it (as atomic._replace, which this module does not
+    import: atomic loads PyTorch, and nothing else here needs it)."""
+    for attempt in range(REPLACE_TRIES):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == REPLACE_TRIES - 1:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+
+
 def _write(path: Path, record: dict) -> None:
+    """A history file written whole: into a temporary file beside it, which then takes its place. The trainer
+    (save_run) and the WebUI (set_label) write the same file from two processes, so each write has a temporary name
+    of its own: with one shared <id>.tmp a writer could move the other's half-written file into place, or find its
+    own gone. The name does not end in .json, so list_runs and signature never read one."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(record), encoding="utf-8")
-    tmp.replace(path)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}-{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        tmp.write_text(json.dumps(record), encoding="utf-8")
+        _replace(tmp, path)
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
 
 
 def save_run(cfg, run_id: str, started: float, status: dict, state: str = "running",
@@ -260,11 +287,13 @@ def save_run(cfg, run_id: str, started: float, status: dict, state: str = "runni
     if not has_data(record):
         return None
     path = root / f"{run_id}.json"
+    record["probe_images"] = keep_probe_images(run_id, status, root)
+    # the label is read last, right before the write: copying the pictures takes a while, and a label the WebUI set
+    # meanwhile (set_label) was written over with the one read before it
     try:
         record["label"] = json.loads(path.read_text(encoding="utf-8")).get("label", "")
     except (OSError, ValueError):
         pass
-    record["probe_images"] = keep_probe_images(run_id, status, root)
     _write(path, record)
     return path
 

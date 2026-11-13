@@ -573,14 +573,17 @@ class RaceSchedule:
     def decide(self, bests: dict[int, float | None] | None = None) -> int:
         """The winner: the last one left, or with keeps_all the highest best score any configuration reached (bests:
         the controllers' final ones, which include the last one's training after the race; a tie goes to the one
-        left in the race)."""
+        left in the race). One that left for drift or was dropped by hand cannot win on an earlier best: the drop
+        says what its LoRA does (or what you saw in it), whatever its score was. Only when that is everyone with a
+        score does the pool fall back to all of them."""
         if bests:
             self.best.update({i: b for i, b in bests.items() if b is not None})
         if not self.keeps_all or not self.best:
             self.champion = self.alive[0]
             return self.champion
         last = self.alive[0] if self.alive else None
-        pool = {i: b for i, b in self.best.items() if i not in self.drifted} or self.best  # drifted ones cannot win
+        out = self.drifted | self.manual
+        pool = {i: b for i, b in self.best.items() if i not in out} or self.best
         self.champion = max(pool, key=lambda i: (pool[i], i == last, -i))
         return self.champion
 

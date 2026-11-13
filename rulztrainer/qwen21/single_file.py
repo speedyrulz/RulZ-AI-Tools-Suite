@@ -192,9 +192,6 @@ def load_vae_file(path: str | Path, device, dtype=torch.bfloat16):
 
 # ---------------------------------------------------------------- text encoder (Qwen3-VL-8B, text only)
 
-# the encoder's int8 layers multiply with the weight dequantized (weight-only), not W8A8: the int8 activations moved the
-# cached features 5-8% (cosine 0.998) against weight-only on the same file, at about the same caching time
-TE_INT8_MATMUL = False
 TOKENIZER_REPO = "Qwen/Qwen-Image-2.1"  # its processor/ files (Fizgig: they differ from Qwen3-VL-4B's copy)
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt", "added_tokens.json",
                    "special_tokens_map.json", "chat_template.jinja")
@@ -211,7 +208,7 @@ def load_text_encoder_file(path: str | Path, device: str = "auto", quant: str = 
     state = sf.read_state(path, torch.bfloat16)
     model = build_text_model(state, quant, "cpu", config=text_config(),
                              work_device=sf.quant_target(device).get("work_device"))
-    Q.configure_int8(model, TE_INT8_MATMUL)
+    sf.weight_only(model)  # int8 and nvfp4 layers alike: no int8 / FP4 activations (build_text_model does it too)
     n_q = sum(1 for m in model.modules() if isinstance(m, Q.QuantLinear))
     log.info("Loaded Qwen3-VL-8B text encoder from %s (%d layers%s)", Path(path).name,
              model.config.num_hidden_layers, f", {n_q} quantized Linear layers" if n_q else "")

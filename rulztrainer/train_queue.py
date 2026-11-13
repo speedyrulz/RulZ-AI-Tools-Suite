@@ -11,7 +11,9 @@ file across processes: advance holds the queue while a run starts, and a run add
 written over and lost without a word."""
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import sys
 import threading
 import time
@@ -21,6 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 QUEUE_FILE = ROOT / "output" / "_queue.json"
 DONE_KEPT = 10  # started / failed runs kept for the queue's "recently" list
+REPLACE_TRIES = 6  # on Windows a reader (a virus scan, the search indexer) can briefly hold the queue file open
 
 
 def _lock_file(f) -> None:
@@ -87,10 +90,24 @@ class TrainQueue:
         return data
 
     def _write(self, data: dict) -> None:
+        """The queue written whole (callers hold the lock, so one temporary name is enough). On Windows a reader
+        holding the file briefly makes the replace fail: it is tried again, as atomic._replace does (atomic loads
+        PyTorch, and rulz_fleet.py imports this module for QueueLock without it)."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
-        tmp.replace(self.path)
+        try:
+            tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+            for attempt in range(REPLACE_TRIES):
+                try:
+                    os.replace(tmp, self.path)
+                    break
+                except PermissionError:
+                    if attempt == REPLACE_TRIES - 1:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
+        finally:
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
 
     def snapshot(self) -> dict:
         """{"waiting": [entry], "paused": bool, "recent": [entry with "started" or "error"]}."""

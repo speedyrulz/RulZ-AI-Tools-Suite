@@ -1028,7 +1028,8 @@ class TrainConfig:
 
     def __post_init__(self) -> None:
         # YAML 1.1 and race rows read a bare on / off as true / false: the switches with an "off" mode take it back
-        for name in ("face_gold", "copy_check"):
+        # (dp_balance: off read as false failed validate; multi_gpu: on is refused there instead of read as true)
+        for name in ("face_gold", "copy_check", "dp_balance", "hull_regions", "multi_gpu"):
             if isinstance(getattr(self, name), bool):
                 setattr(self, name, "on" if getattr(self, name) else "off")
 
@@ -1356,6 +1357,10 @@ class TrainConfig:
             raise ValueError(f"lora_ema must be 0 (off) or a decay below 1, got {self.lora_ema!r}")
         if self.dp_balance not in ("off", "auto", "grow"):
             raise ValueError(f"dp_balance must be off, auto or grow, got {self.dp_balance!r}")
+        if self.multi_gpu not in ("off", "data_parallel", "model_split"):
+            raise ValueError(f"multi_gpu must be off, data_parallel or model_split, got {self.multi_gpu!r}")
+        if self.lora_save_dtype not in ("bf16", "fp16", "fp32"):  # else a KeyError at the first save, maybe the last
+            raise ValueError(f"lora_save_dtype must be bf16, fp16 or fp32, got {self.lora_save_dtype!r}")
         if self.optimizer.lower() not in OPTIMIZERS:
             raise ValueError(f"optimizer must be one of {OPTIMIZERS}, got {self.optimizer!r}")
         if self.automagic_groups not in ("single", "by_type"):
@@ -1537,6 +1542,13 @@ class TrainConfig:
         kinds = {f.name: str(f.type) for f in dataclasses.fields(cls)}
         out = dict(data)
         for key, value in data.items():
+            if isinstance(value, str) and kinds.get(key) == "bool":  # a quoted 'false' is a true value otherwise
+                word = value.strip().lower()
+                if word in ("true", "yes", "on", "1"):
+                    out[key] = True
+                elif word in ("false", "no", "off", "0", ""):
+                    out[key] = False
+                continue
             if not isinstance(value, str) or kinds.get(key) not in ("float", "int"):
                 continue
             try:

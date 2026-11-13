@@ -213,4 +213,4 @@ def test_moss_tokenizer_is_moss_own(tmp_path):
         ML.check_tokenizer(_Tok(151_669))  # Qwen3-VL's (Krea 2, FIBO 2.0)
     from rulztrainer.dataset import text_cache_path
 
-    assert text_cache_path(TrainConfig(), "x").name.endswith("_q35.safetensors")  # the old caches are not reused
+    assert text_cache_path(TrainConfig(), "x").name.endswith("_q35_wo.safetensors")  # the old caches are not reused
