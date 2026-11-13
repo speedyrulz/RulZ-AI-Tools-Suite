@@ -220,10 +220,10 @@ def test_run_activity(tmp_path):
     os.utime(job / "train.log", (now - 5, now - 5))
     st = {"stage": "finding the faces in the face references (87 of 173)", "stage_since": now - 76,
           "stage_frac": 0.5}
-    a = webui.run_activity(job, st, now, cpu=104.2)
+    a = webui.run_activity(job, st, now, cpu=104.2, cores=11.5)
     assert a["since"] == pytest.approx(76) and a["frac"] == 0.5 and a["quiet"] == pytest.approx(5, abs=0.01)
     assert not a["stale"] and a["line"] == "INFO Face references: 111 of 173 images had a face"
-    assert a["text"] == "1 min 16 s in this stage · 50% of it done · trainer CPU 104% · last update 5 s ago"
+    assert a["text"] == "1 min 16 s in this stage · 50% of it done · trainer CPU 1.0 of 11.5 cores · last update 5 s ago"
     # an older trainer (no stage_since / stage_frac), nothing written for 11 minutes
     os.utime(job / "status.json", (now - 700, now - 700))
     os.utime(job / "train.log", (now - 660, now - 660))
@@ -322,3 +322,12 @@ def test_face_references_report_progress(monkeypatch, tmp_path):
     assert seen == [(f"finding the faces in the face references ({i + 1} of 3)", i / 3) for i in range(3)]
     s.progress = lambda text, frac: 1 / 0  # a broken callback never stops the loop
     assert len(s.set_references(paths)) == 3
+
+
+def test_trainer_cpu_is_shown_in_cores_not_a_percent_over_100(tmp_path):
+    """A percent of one core went past 100 (127%) whenever more than one core was busy; cores against what the
+    machine allows read plainly."""
+    now = time.time()
+    assert "trainer CPU 1.3 of 24 cores" in webui.run_activity(tmp_path, {}, now, cpu=127.0, cores=24)["text"]
+    assert "trainer CPU 0.4 of 11.5 cores" in webui.run_activity(tmp_path, {}, now, cpu=40.0, cores=11.5)["text"]
+    assert "trainer CPU 2.0 cores" in webui.run_activity(tmp_path, {}, now, cpu=200.0, cores=0)["text"]
