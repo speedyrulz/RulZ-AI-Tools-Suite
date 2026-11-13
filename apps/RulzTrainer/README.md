@@ -369,6 +369,15 @@ and write the same files in `~/.rulz_vast/fleet`.
   `gpu_mem_mb`). It fires once per run, or with `--repeat` every time the number comes back to that side. `wait`
   blocks until a watch fires or a run ends and prints the events, so an AI assistant sets its lines, starts `wait` in
   the background and is woken by the event instead of checking by hand.
+- **Each instance's own controls.** *Open WebUI* on a card opens that instance's RulzTrainer page in a new tab, signed
+  in through vast.ai's Instance Portal (the link carries the portal's token, as vast.ai's Open button does; it is asked
+  of the instance each time and never kept). The card's **⋮** menu has *Update RulzTrainer…*: it first shows the
+  installed and the newest version (the `app/rulz-trainer` branch the instance was cloned from) and anything changed
+  on the instance, then puts the newest code in place, installs the requirements when they changed, renews the WebUI's
+  supervisor files and restarts the WebUI. It waits while a run is going, and a dropped connection does not stop it half
+  way (`output/_update.log` on the instance says how it went). *Reboot the instance…* has vast.ai stop and start its
+  container (`vastai reboot instance`): the disk is kept and the GPU stays yours, a run going there is killed (the
+  dialog says so first), and the fleet waits up to 15 minutes for it before calling it out of reach.
 
 ```bash
 python scripts/vast/rulz_fleet.py instances --refresh      # find the running instances
@@ -380,6 +389,9 @@ python scripts/vast/rulz_fleet.py watch add avg_loss above 0.5 --note "diverging
 python scripts/vast/rulz_fleet.py daemon                   # keeps looking (or keep the WebUI open)
 python scripts/vast/rulz_fleet.py wait                     # blocks until a watch fires or a run ends
 python scripts/vast/rulz_fleet.py runs --last 20           # past runs; run KEY for one, group NAME for a split race
+python scripts/vast/rulz_fleet.py update 1234 --check      # installed and newest RulzTrainer; update 1234 installs it
+python scripts/vast/rulz_fleet.py reboot 1234              # vast.ai stops and starts its container
+python scripts/vast/rulz_fleet.py webui 1234 --open        # its own WebUI in this computer's browser, signed in
 ```
 
 | Command | What it does |
@@ -393,11 +405,15 @@ python scripts/vast/rulz_fleet.py runs --last 20           # past runs; run KEY 
 | `wait`, `events` | Blocks until an event that needs a look (`--on KIND` picks others, `--timeout S` exits 2); the list of what happened. Each reader (`--reader NAME`) is given every event once |
 | `daemon`, `tick` | The loop that does the work; one look |
 | `stop NAME`, `stop NAME --kill` | The WebUI's Stop or Kill on the instance that runs that job |
+| `update ID`, `update ID --check` | The instance's RulzTrainer to the newest, its WebUI restarted. `--discard` replaces files changed there (by `rulz_remote.py sync`), `--force` updates under a running job, `--reinstall` installs the requirements anyway |
+| `reboot ID` | vast.ai stops and starts its container. `--kill` even while a run goes (it is killed, no final save); `--force` past every guard (a run, an update, a run being sent, a reboot under way) |
+| `webui ID` | The address of its own WebUI with the portal's sign-in token; `--open` opens it in the browser here |
 
 Something has to keep looking for the queue, the downloads and the watches to work: the WebUI on your computer,
 `daemon`, or a `wait` while it blocks. Only one of them looks at a time (a lock file); the others read what it wrote.
-Like `rulz_remote.py`, the fleet never rents, stops or destroys an instance, a run it starts goes through that
-instance's own WebUI queue, and an instance left running keeps billing. An instance's disk goes with the instance:
+Like `rulz_remote.py`, the fleet never rents, stops or destroys an instance (it reboots one, or updates its
+RulzTrainer, only when told to), a run it starts goes through that instance's own WebUI queue, and an instance left
+running keeps billing. An instance's disk goes with the instance:
 what the rules have not downloaded by then is gone.
 
 ## How it trains
