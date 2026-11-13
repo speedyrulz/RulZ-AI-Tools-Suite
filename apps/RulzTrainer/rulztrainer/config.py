@@ -877,9 +877,10 @@ class TrainConfig:
     # experimental, unit-tested only: a probe whose renders keep their prompt's frame in less than this share (the
     # prompt check's kept share, against the step-0 probe) cannot set a new best checkpoint. 0 = off
     likeness_best_min_kept: float = 0.0
-    # a second, held-out face recognizer on the probes (likeness.py): auto = FaceNet whenever the run trains against
-    # ArcFace (reward_steps, id_loss_backend arcface, id_align), off, or facenet (always). Nothing ever trains on it,
-    # so with face_gold_select it, not ArcFace, picks the best checkpoint, stops early and ranks a race
+    # a second, held-out face recognizer on the probes (likeness.py): auto = AdaFace (adaface.py) whenever the run
+    # trains against ArcFace (reward_steps, id_loss_backend arcface, id_align) or the noise check runs, off, adaface
+    # (always) or facenet (always; the gold scorer before 3.14.0). Nothing ever trains on it, so with face_gold_select
+    # it, not ArcFace, picks the best checkpoint, stops early and ranks a race
     face_gold: str = "auto"
     face_gold_select: bool = True
     likeness_patience: int = 0  # stop after N probes without improvement; 0 = never
@@ -1003,13 +1004,14 @@ class TrainConfig:
         return bool(self.id_loss_weight > 0 and self.id_loss_backend == "facenet")
 
     def gold_backend(self) -> str:
-        """The held-out face recognizer the probes add ("" = none): face_gold facenet always; auto when the run trains
-        against ArcFace and not against FaceNet, and for the noise check (it measures both recognizers)."""
+        """The held-out face recognizer the probes add ("" = none): face_gold adaface / facenet always; auto = AdaFace
+        when the run trains against ArcFace, and for the noise check (it measures both recognizers). Nothing trains on
+        AdaFace, so an identity loss on FaceNet leaves it held out."""
         mode = str(self.face_gold or "auto").lower()
-        if mode == "facenet":
-            return "facenet"
-        if mode == "auto" and (self.trains_on_arcface() or self.noise_files) and not self.trains_on_facenet():
-            return "facenet"
+        if mode in ("adaface", "facenet"):
+            return mode
+        if mode == "auto" and (self.trains_on_arcface() or self.noise_files):
+            return "adaface"
         return ""
 
     def __post_init__(self) -> None:
@@ -1057,9 +1059,9 @@ class TrainConfig:
             raise ValueError("optimizer hull keeps FaceNet as a held-out judge: id_loss_backend facenet trains on it")
         if self.reward_steps > 0 or self.selftrain:
             raise ValueError("optimizer hull refuses reward_steps and selftrain: a judge's score must not train")
-        if self.race and (self.face_gold != "facenet" or self.copy_check != "on"):
-            raise ValueError("optimizer hull in a race needs face_gold: facenet and copy_check: on (the guards that "
-                             "decide whether a row stays)")
+        if self.race and (self.face_gold not in ("adaface", "facenet") or self.copy_check != "on"):
+            raise ValueError("optimizer hull in a race needs face_gold: adaface (or facenet) and copy_check: on (the "
+                             "guards that decide whether a row stays)")
         if self.hull_regions not in ("off", "parts"):
             raise ValueError(f"hull_regions must be off or parts, got {self.hull_regions!r}")
         if not 0.5 <= self.hull_gain_body <= self.hull_gain_max or not 0.5 <= self.hull_gain_background <= 1.0:
@@ -1327,11 +1329,11 @@ class TrainConfig:
             raise ValueError(f"id_loss_backend must be arcface or facenet, got {self.id_loss_backend!r}")
         if self.id_loss_every < 1:
             raise ValueError("id_loss_every must be at least 1")
-        if str(self.face_gold).lower() not in ("auto", "off", "facenet"):
-            raise ValueError(f"face_gold must be auto, off or facenet, got {self.face_gold!r}")
+        if str(self.face_gold).lower() not in ("auto", "off", "adaface", "facenet"):
+            raise ValueError(f"face_gold must be auto, off, adaface or facenet, got {self.face_gold!r}")
         if str(self.face_gold).lower() == "facenet" and self.trains_on_facenet():
             raise ValueError("face_gold facenet: the identity loss trains on FaceNet (id_loss_backend facenet), so it "
-                             "is no held-out judge; use face_gold off or id_loss_backend arcface")
+                             "is no held-out judge; use face_gold adaface or id_loss_backend arcface")
         if str(self.copy_check).lower() not in ("auto", "on", "off"):
             raise ValueError(f"copy_check must be auto, on or off, got {self.copy_check!r}")
         if not 0.0 < self.copy_max <= 1.0:

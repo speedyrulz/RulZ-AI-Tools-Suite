@@ -473,7 +473,7 @@ RACE_OF_HULLS = ["--set", "optimizer=hull", "--set", "hull_rho=0.01", "--set", "
     (["--job", "new", "--set", "dataset_dir=datasets/gone"], "Dataset folder not found"),
     (["--job", "new", "--set", "broken"], "Not KEY=VALUE"),
     (["--job", "new", "--set", "loss_type=huber"], "loss_type must be"),  # refused only by validate, as training does
-    (["--job", "new", *RACE_OF_HULLS], "needs face_gold: facenet"),  # a real run's: dry-run passed, then it failed
+    (["--job", "new", *RACE_OF_HULLS], "needs face_gold: adaface"),  # a real run's: dry-run passed, then it failed
 ])
 def test_what_a_start_refuses_queues_nothing(install, capsys, extra, why, dry_run):
     make_job("old")

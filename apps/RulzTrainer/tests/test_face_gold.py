@@ -19,16 +19,20 @@ from rulztrainer.likeness import LikenessController  # noqa: E402
 
 def test_when_the_gold_scorer_turns_on():
     assert TrainConfig().gold_backend() == ""  # nothing trains against ArcFace
-    assert TrainConfig(reward_steps=10).gold_backend() == "facenet"
-    assert TrainConfig(id_align=True).gold_backend() == "facenet"
-    assert TrainConfig(id_loss_weight=0.2).gold_backend() == "facenet"  # arcface backend
-    assert TrainConfig(noise_files=["a.safetensors"]).gold_backend() == "facenet"  # the noise check measures it
-    assert TrainConfig(id_loss_weight=0.2, id_loss_backend="facenet").gold_backend() == ""  # trains on FaceNet
-    assert TrainConfig(id_loss_weight=0.2, id_loss_backend="facenet", id_align=True).gold_backend() == ""
+    # auto: AdaFace (3.14.0; FaceNet before)
+    assert TrainConfig(reward_steps=10).gold_backend() == "adaface"
+    assert TrainConfig(id_align=True).gold_backend() == "adaface"
+    assert TrainConfig(id_loss_weight=0.2).gold_backend() == "adaface"  # arcface backend
+    assert TrainConfig(noise_files=["a.safetensors"]).gold_backend() == "adaface"  # the noise check measures it
+    assert TrainConfig(id_loss_weight=0.2, id_loss_backend="facenet").gold_backend() == ""  # not against ArcFace
+    # training on FaceNet leaves AdaFace held out
+    assert TrainConfig(id_loss_weight=0.2, id_loss_backend="facenet", id_align=True).gold_backend() == "adaface"
     assert TrainConfig(reward_steps=10, face_gold="off").gold_backend() == ""
     assert TrainConfig(face_gold="facenet").gold_backend() == "facenet"
+    assert TrainConfig(face_gold="adaface").gold_backend() == "adaface"
+    TrainConfig(face_gold="adaface", id_loss_weight=0.2, id_loss_backend="facenet").validate()
     with pytest.raises(ValueError, match="face_gold must be"):
-        TrainConfig(face_gold="adaface").validate()
+        TrainConfig(face_gold="arcface").validate()
     with pytest.raises(ValueError, match="no held-out judge"):
         TrainConfig(face_gold="facenet", id_loss_weight=0.2, id_loss_backend="facenet").validate()
 
@@ -139,16 +143,28 @@ def test_the_trainer_sets_the_gold_scale_and_loads_it_only_when_wanted(monkeypat
             loads.append(dev)
             return self
 
-    monkeypatch.setattr(idloss, "facenet_embedder", lambda *a, **k: Emb())
+    asked = []
+
+    def gold(backend, *a, **k):
+        asked.append(backend)
+        return Emb()
+
+    monkeypatch.setattr(idloss, "gold_embedder", gold)
     sc = SimpleNamespace(gold="stale", gold_refs=None, gold_self_similarity=0.75)
     sc.set_gold = lambda emb: setattr(sc, "gold", emb) or setattr(sc, "gold_refs", np.zeros((2, 4)))
     tr._setup_gold(sc)  # nothing trains against ArcFace
     assert sc.gold is None and loads == []
     tr.cfg = _cfg(reward_steps=5)
     tr._setup_gold(sc)
-    assert isinstance(sc.gold, Emb) and loads == ["cpu"] and status["face_gold"] == "facenet"
-    # a race where one configuration trains on FaceNet: no held-out judge for all of them
+    assert isinstance(sc.gold, Emb) and loads == ["cpu"] and status["face_gold"] == "adaface"
+    assert asked == ["adaface"] and tr._gold_label() == "AdaFace"
+    # a race where one configuration trains on FaceNet: AdaFace is still held out
     tr.race_rows = [("a", _cfg(id_loss_weight=0.2), {}), ("b", _cfg(id_loss_weight=0.2, id_loss_backend="facenet"), {})]
+    sc.gold = None
+    tr._setup_gold(sc)
+    assert isinstance(sc.gold, Emb) and asked[-1] == "adaface"
+    # face_gold facenet with a configuration training on FaceNet: no held-out judge for any of them
+    tr.cfg = _cfg(reward_steps=5, face_gold="facenet")
     tr._setup_gold(sc)
     assert sc.gold is None
 
@@ -181,7 +197,7 @@ def test_the_noise_report_measures_the_gold_face_too():
     assert rep["kinds"]["face"]["sd_diff"] == pytest.approx(0.0) and rep["kinds"]["gold"]["sd_diff"] > 2
     assert "suggested_noise_band_gold" in rep and rep["suggested_noise_band_gold"] > rep["suggested_noise_band"]
     lines = S.describe(rep)
-    assert any(line.startswith("gold face (FaceNet):") for line in lines)
+    assert any(line.startswith("gold face:") for line in lines)
     assert any("gold face in charge" in line for line in lines)
     no_gold = S.noise_report({k: {kk: v[kk] for kk in ("face", "body", "combined")} for k, v in files.items()}, 2, 0.5)
     assert set(no_gold["kinds"]) == {"face", "body", "combined"} and "suggested_noise_band_gold" not in no_gold

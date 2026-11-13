@@ -12,7 +12,8 @@ not help on another set, and most rows ran on one training seed.
 - Rows raced with no drops, sharing their start, image order and noise. Settings that cannot be race rows ran alone.
 - **Combined** is the mean of the FaceNet face score and the body score. Rows are read on their mean from step 1000 on,
   because a best score rewards one lucky probe.
-- FaceNet is the held-out judge: nothing trains on it. Identity features train on ArcFace, so a rise on ArcFace alone is
+- FaceNet is the held-out judge: nothing trains on it (these runs are from before 3.14.0, which made AdaFace the
+  default gold face scorer; FaceNet is still `face_gold: facenet`). Identity features train on ArcFace, so a rise on ArcFace alone is
   not a gain.
 - **Copy** is the closest match to a training photo, limit 0.50. High likeness with high copy is memorising.
 - The body probe uses a scene and pose unlike the data, so it shows whether the subject carries over.

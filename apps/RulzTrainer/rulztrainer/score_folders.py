@@ -15,7 +15,7 @@ Baseline. The base model's renders of the same prompts without a LoRA (the train
 zero (their mean face score) and the anchored body score's strangers (bodyanchor.py: their body windows set its zero;
 4 to 8 seeds of the body prompt). Without baseline body pictures there is no body score.
 
-Scores. face: ArcFace's best match among the face references (facesim); gold face: FaceNet's (nothing trains on it,
+Scores. face: ArcFace's best match among the face references (facesim); gold face: AdaFace's (--gold facenet: FaceNet's; nothing trains on it,
 so it checks a run that trained against ArcFace); body: the anchored score (0 = the baseline's bodies, 100 = the body
 references' mean). Each is put on the trainer's likeness scale (likeness.py: the face from its baseline to the
 references' own level, stretched and curved by face_scale_span / _curve; the anchored body as it is) and combined with
@@ -55,7 +55,7 @@ class Picture:
     kind: str  # face | body | both
     step: int | None
     face: float | None = None  # ArcFace best match, raw %
-    gold: float | None = None  # FaceNet best match, raw %
+    gold: float | None = None  # the gold recognizer's (AdaFace, or FaceNet) best match, raw %
     faces: int | None = None  # faces found
     body: float | None = None  # anchored body score
     cover: float | None = None  # the share of the body window inside the picture
@@ -108,9 +108,10 @@ def parse_run(text: str) -> tuple[str, str]:
 
 def score(face_refs: list[str], body_refs: list[str], baseline: str | Path | None, runs: list[tuple[str, str]],
           models_dir: str | Path = "models", device: str = "cuda:0", face_provider: str = "cpu",
-          gold: bool = True, step_pattern: str = "", progress=None) -> dict:
+          gold: bool | str = True, step_pattern: str = "", progress=None) -> dict:
     """Score every picture: {"pictures": [Picture as dict], "refs": {...}, "runs": [names]}; progress(text,
-    fraction)."""
+    fraction). gold: the gold face recognizer, "adaface" (True) or "facenet"; False / "" for none."""
+    gold = "adaface" if gold is True else (str(gold).lower() if gold else "")
     from . import bodyanchor, bodysim, facesim
     from .bodysim import WINDOW_MIN_SCORE_COVER
 
@@ -150,14 +151,15 @@ def score(face_refs: list[str], body_refs: list[str], baseline: str | Path | Non
             from . import idloss
 
             try:
-                fs.set_gold(idloss.facenet_embedder(models_dir, progress=progress))
+                fs.set_gold(idloss.gold_embedder(gold, models_dir, progress=progress))
             except Exception as e:  # noqa: BLE001
-                log.warning("No gold face scores (FaceNet could not load: %s)", e)
+                log.warning("No gold face scores (%s could not load: %s)", idloss.gold_label(gold), e)
                 fs.gold = None
         if fs is not None:
             refs["face"] = [name for name, _ in fs.refs]
             refs["face_level"] = fs.ref_self_similarity
             refs["gold_level"] = fs.gold_self_similarity if getattr(fs, "gold", None) is not None else None
+            refs["gold_name"] = gold if getattr(fs, "gold", None) is not None else ""
 
     bs = None
     body_ok, body_why = bodysim.available() if body_refs and bodies else (False, "")
@@ -276,6 +278,12 @@ def summary_lines(result: dict, face_weight: float = 0.7) -> list[str]:
 # ------------------------------------------------------------ the workbook
 
 
+def _gold_label(refs: dict) -> str:
+    from .idloss import gold_label
+
+    return gold_label(refs.get("gold_name"))
+
+
 def build_workbook(result: dict, face_weight: float = 0.7, title: str = "Likeness of finished runs"):
     from openpyxl import Workbook
     from openpyxl.chart import LineChart, Reference
@@ -326,7 +334,7 @@ def build_workbook(result: dict, face_weight: float = 0.7, title: str = "Likenes
                       "references' mean. Empty: no face found, or no body window in the picture.")
     pictures["A2"].font = muted
     header(pictures, 4, ["Run", "Step", "Kind", "Picture (below the run folder)", "Face raw (ArcFace %)",
-                         "Gold face raw (FaceNet %)", "Body raw (anchored)", "Faces found", "Body window in frame"],
+                         f"Gold face raw ({_gold_label(refs)} %)", "Body raw (anchored)", "Faces found", "Body window in frame"],
            [26, 8, 7, 44, 12, 12, 12, 9, 11])
     for i, p in enumerate(pics):
         r = p0 + i
@@ -364,8 +372,8 @@ def build_workbook(result: dict, face_weight: float = 0.7, title: str = "Likenes
              MIN_SPAN["face"], d.face_scale_span, d.face_scale_curve,
              "Floor: the baseline face pictures' mean (the trainer's default without them). Level: each face "
              "reference's best match among the others, the median."),
-            ("Gold face (FaceNet)", f"={base_gold}", _pct(refs.get("gold_level")) or CEILING_DEFAULT["gold"],
-             MIN_SPAN["gold"], "=E5", "=F5", "The same with FaceNet; shaped like the face, as the trainer does."),
+            (f"Gold face ({_gold_label(refs)})", f"={base_gold}", _pct(refs.get("gold_level")) or CEILING_DEFAULT["gold"],
+             MIN_SPAN["gold"], "=E5", "=F5", f"The same with {_gold_label(refs)}; shaped like the face, as the trainer does."),
             ("Body (anchored)", 0.0, 100.0, 0.0, 1.0, 1.0,
              "Fixed by construction: the baseline's bodies average 0, the body references' mean is 100, linear. "
              "Leave these as they are.")]
@@ -570,8 +578,9 @@ def build_workbook(result: dict, face_weight: float = 0.7, title: str = "Likenes
     lines = [
         ("Face", "ArcFace (InsightFace buffalo_l): the largest face's best cosine match among the face references, "
                  f"as a %. {len(refs.get('face') or [])} face references have a face."),
-        ("Gold face", "FaceNet (VGGFace2) on the same face. Nothing in RulzTrainer trains on it, so it checks runs "
-                      "that trained against ArcFace."),
+        ("Gold face", ("AdaFace (ViT-Base, WebFace4M)" if refs.get("gold_name") != "facenet" else
+                       "FaceNet (VGGFace2)") + " on the same face. Nothing in RulzTrainer trains on it, so it checks "
+                      "runs that trained against ArcFace."),
         ("Body", "The anchored body score (bodyanchor.py): the body from the neck to mid-thigh, upright, cut out, "
                  "its colour and sharpness normalised, embedded by SigLIP 2 and DINOv2; how far it moved from the "
                  "baseline's bodies toward the body references, 0 = the baseline's mean, 100 = the references' mean. "
@@ -621,14 +630,16 @@ def main(argv=None) -> int:
     ap.add_argument("--models-dir", default="models")
     ap.add_argument("--device", default="cuda:0", help="for SigLIP 2 and DINOv2")
     ap.add_argument("--face-provider", default="cpu", help="cpu | cuda (InsightFace)")
-    ap.add_argument("--no-gold", action="store_true", help="skip the FaceNet gold face")
+    ap.add_argument("--gold", default="adaface", choices=("adaface", "facenet"),
+                    help="the gold face recognizer (default adaface; facenet: the one before 3.14.0)")
+    ap.add_argument("--no-gold", action="store_true", help="skip the gold face")
     ap.add_argument("--step-pattern", default="", help="a regular expression whose first group is the step")
     a = ap.parse_args(argv)
     if not a.run:
         ap.error("give at least one --run NAME=FOLDER")
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     result = score(a.face_refs, a.body_refs, a.baseline or None, [parse_run(r) for r in a.run], a.models_dir,
-                   a.device, a.face_provider, not a.no_gold, a.step_pattern)
+                   a.device, a.face_provider, "" if a.no_gold else a.gold, a.step_pattern)
     out = export(result, a.out, a.face_weight)
     print("\n".join(summary_lines(result, a.face_weight)))
     print(f"Saved {out} and {out.with_suffix('.json').name}")
