@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import posixpath
+import queue
+import threading
 import time
 
 from nicegui import run, ui
@@ -19,6 +21,8 @@ from .common import browse_url, confirm, fmt_duration, frame, notify_error, noti
 # What the user collected to send together (lives as long as the app runs).
 BASKET: list[vast.Source] = []
 _info: dict = {'conn': None, 'info': None, 'at': 0.0}
+# Command prompt history and each instance's current folder (as long as the app runs).
+SHELL: dict = {'history': [], 'cwd': {}}
 
 STATE_LOOK = {
     'queued': ('schedule', 'grey'), 'starting': ('hourglass_top', 'grey'), 'installing': ('build', 'warning'),
@@ -437,6 +441,41 @@ async def vast_page() -> None:
                          'rented, or added to the instance afterwards. Keys are stored only on this computer.') \
                     .classes('text-xs rulz-muted')
 
+        # ------------------------------------------------------------------ command prompt
+        with ui.card().classes('rulz-card w-full p-5 gap-3'):
+            with ui.row().classes('w-full items-center gap-3 no-wrap'):
+                ui.icon('terminal').classes('rz-sec-icon')
+                ui.label('Command prompt').classes('rz-title')
+                ui.space()
+                ui.button('Clear', icon='clear_all', on_click=lambda: clear_shell()).props('flat no-caps')
+                ui.button('Copy ssh command', icon='content_copy', on_click=lambda: copy_ssh()) \
+                    .props('flat no-caps').tooltip('To paste into a terminal of your own')
+                ui.button('Open terminal', icon='open_in_new', on_click=lambda: open_terminal()) \
+                    .props('flat no-caps').tooltip('A terminal window on this computer, logged in to the instance')
+            ui.label('Runs one command at a time on the attached instance, in a bash shell with vast\'s Python venv '
+                     'on PATH. The folder carries over to the next command (cd works); variables do not. Stopping '
+                     'or closing the app ends the command: start long jobs with nohup, or use Open terminal (vast '
+                     'keeps that session in tmux).').classes('text-xs rulz-muted')
+            shell_log = ui.log(max_lines=3000).classes('w-full h-72 rulz-mono text-xs rz-box p-2')
+            shell_progress = ui.label().classes('w-full rulz-mono text-xs rulz-muted ellipsis')
+            shell_progress.set_visibility(False)
+            with ui.row().classes('w-full items-center gap-2 no-wrap'):
+                shell_cwd = ui.label().classes('rulz-mono text-sm whitespace-nowrap')
+                shell_input = ui.input(placeholder='nvidia-smi, ls -la, df -h, pip list | grep torch...') \
+                    .props('outlined dense autocomplete=off spellcheck=false').classes('flex-1 rulz-mono')
+                shell_run_btn = ui.button('Run', icon='play_arrow', on_click=lambda: shell_enter())
+                shell_stop_btn = ui.button('Stop', icon='stop', color='negative', on_click=lambda: stop_shell()) \
+                    .props('outline')
+                shell_stop_btn.set_visibility(False)
+            with ui.row().classes('w-full items-center gap-1'):
+                for cmd in ('nvidia-smi', 'df -h /workspace', 'ls -la', 'free -h', 'pip list'):
+                    ui.button(cmd, on_click=lambda c=cmd: run_shell(c)).props('flat dense no-caps size=sm') \
+                        .classes('rulz-mono')
+            shell_input.on('keydown.enter', lambda: shell_enter())
+            shell_input.on('keydown', lambda e: shell_history(-1 if e.args == 'ArrowUp' else 1),
+                           js_handler='(e) => { if (e.key === "ArrowUp" || e.key === "ArrowDown") '
+                                      '{ e.preventDefault(); emit(e.key); } }')
+
         # ------------------------------------------------------------------ pick
         with ui.card().classes('rulz-card w-full p-5 gap-3'):
             with ui.row().classes('items-center gap-3 no-wrap'):
@@ -486,6 +525,7 @@ async def vast_page() -> None:
     # ======================================================================== instance
     def render_attached(info: dict | None = None, error: str = '') -> None:
         conn = vast.attached()
+        render_shell()
         attached_box.clear()
         with attached_box:
             if not conn:
@@ -809,12 +849,145 @@ async def vast_page() -> None:
             notify_error(e)
         await load_jobs()
 
+    # ======================================================================== command prompt
+    shell: dict = {'run': None, 'queue': queue.SimpleQueue(), 'hpos': len(SHELL['history']), 'draft': ''}
+
+    def shell_folder() -> str:
+        conn = vast.attached()
+        return SHELL['cwd'].get(conn.key, '/workspace') if conn else '/workspace'
+
+    def render_shell() -> None:
+        conn = vast.attached()
+        running = shell['run'] is not None
+        shell_cwd.text = f'{shell_folder()} $' if conn else 'not attached'
+        shell_input.set_enabled(bool(conn))
+        shell_run_btn.set_visibility(not running)
+        shell_run_btn.set_enabled(bool(conn))
+        shell_stop_btn.set_visibility(running)
+        shell_input.props['placeholder'] = ('Type an answer for the running command (Enter sends it)' if running
+                                            else 'nvidia-smi, ls -la, df -h, pip list | grep torch...')
+        shell_input.update()
+
+    def shell_enter() -> None:
+        text = shell_input.value or ''
+        if shell['run'] is not None:
+            shell['run'].send(text)
+            shell_input.value = ''
+            return
+        if text.strip():
+            run_shell(text)
+
+    def shell_history(step: int) -> None:
+        hist = SHELL['history']
+        if not hist or shell['run'] is not None:
+            return
+        if shell['hpos'] == len(hist):
+            shell['draft'] = shell_input.value or ''
+        shell['hpos'] = max(0, min(len(hist), shell['hpos'] + step))
+        shell_input.value = hist[shell['hpos']] if shell['hpos'] < len(hist) else shell['draft']
+
+    def run_shell(command: str) -> None:
+        command = command.strip()
+        if not command or shell['run'] is not None:
+            return
+        conn = vast.attached()
+        if not conn:
+            ui.notify('Attach an instance first', type='warning')
+            return
+        if command in {'clear', 'cls'}:
+            clear_shell()
+            shell_input.value = ''
+            return
+        hist = SHELL['history']
+        if not hist or hist[-1] != command:
+            hist.append(command)
+            del hist[:-200]
+        shell['hpos'] = len(hist)
+        shell_input.value = ''
+        shell_log.push(f'{shell_folder()} $ {command}')
+        try:
+            proc = vast.ShellRun(conn, command, shell_folder())
+        except vast.VastError as e:
+            shell_log.push(str(e))
+            return
+        shell['run'] = proc
+        q = shell['queue']
+
+        def pump() -> None:
+            try:
+                for event in proc.events():
+                    q.put(event)
+            except Exception as e:  # noqa: BLE001
+                proc.error = str(e)
+                q.put(('done', ''))
+
+        threading.Thread(target=pump, daemon=True, name='rulz-shell').start()
+        render_shell()
+
+    def drain_shell() -> None:
+        q = shell['queue']
+        lines: list[str] = []
+        progress = None
+        finished = False
+        while not q.empty():
+            kind, text = q.get()
+            if kind == 'line':
+                lines.append(text)
+                progress = ''
+            elif kind == 'cr':
+                progress = text
+            elif kind == 'done':
+                finished = True
+        if lines:
+            shell_log.push('\n'.join(lines))
+        if progress is not None:
+            shell_progress.text = progress
+            shell_progress.set_visibility(bool(progress.strip()))
+        if finished and (proc := shell['run']) is not None:
+            shell['run'] = None
+            shell_progress.set_visibility(False)
+            conn = vast.attached()
+            if conn:
+                SHELL['cwd'][conn.key] = proc.cwd
+            if proc.error:
+                shell_log.push(f'[{proc.error}]')
+            elif proc.stopped:
+                shell_log.push('[stopped]')
+            elif proc.code:
+                shell_log.push(f'[exit code {proc.code}]')
+            render_shell()
+            shell_input.run_method('focus')
+
+    def stop_shell() -> None:
+        if (proc := shell['run']) is not None:
+            threading.Thread(target=proc.stop, daemon=True).start()
+
+    def clear_shell() -> None:
+        shell_log.clear()
+        shell_progress.set_visibility(False)
+
+    def copy_ssh() -> None:
+        conn = vast.attached()
+        if not conn:
+            ui.notify('Attach an instance first', type='warning')
+            return
+        ui.clipboard.write(vast.ssh_login_text(conn))
+        ui.notify('ssh command copied', type='positive')
+
+    async def open_terminal() -> None:
+        try:
+            what = await run.io_bound(vast.open_terminal)
+            notify_ok(f'Opened {what}')
+        except Exception as e:  # noqa: BLE001
+            notify_error(e)
+
     async def auto_refresh() -> None:
         if any(j.get('state') in {'running', 'installing', 'starting', 'queued'} for j in state['jobs']):
             await load_jobs()
 
     async def init() -> None:
         render_attached()
+        render_shell()
         render_basket()
         render_jobs()
         await gather_in(attached_box, load_instances(),
@@ -822,3 +995,4 @@ async def vast_page() -> None:
 
     ui.timer(0.01, init, once=True)
     ui.timer(5.0, auto_refresh)
+    ui.timer(0.15, drain_shell)

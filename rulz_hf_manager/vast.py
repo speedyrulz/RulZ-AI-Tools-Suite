@@ -17,6 +17,7 @@ import posixpath
 import re
 import shutil
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -420,6 +421,178 @@ def remote() -> Remote:
     if not conn:
         raise VastError('No vast.ai instance attached. Attach one on the vast.ai page first.')
     return Remote(conn)
+
+
+# --------------------------------------------------------------------------------------------------
+# Command prompt: one shell command at a time on the attached instance
+# --------------------------------------------------------------------------------------------------
+
+SHELL_MARK = '__RULZ_SHELL_DONE__'
+_ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>]')
+_MARK_RE = re.compile(rf'^{SHELL_MARK} (\d+) (.*)$')
+
+
+def shell_script(command: str, cwd: str) -> str:
+    """The bash script one prompt line runs as: in ``cwd``, with vast's venv on PATH (a non-interactive shell does not
+    get it from .bashrc), then a last line that reports the exit code and the folder the command ended in."""
+    q = "'" + cwd.replace("'", "'\\''") + "'"
+    return (f'cd {q} 2>/dev/null || cd ~\n'
+            'if [ -x /venv/main/bin/python ]; then export VIRTUAL_ENV=/venv/main PATH="/venv/main/bin:$PATH"; fi\n'
+            'export TERM=dumb PAGER=cat GIT_PAGER=cat SYSTEMD_PAGER=cat PYTHONUNBUFFERED=1 NO_COLOR=1\n'
+            f'{command}\n'
+            f'__rulz_rc=$?; printf "\\n{SHELL_MARK} %s %s\\n" "$__rulz_rc" "$PWD"\n')
+
+
+def shell_ssh_command(conn: Conn, command: str, cwd: str) -> list[str]:
+    """ssh with a forced tty, so stopping (closing the connection) hangs the command up instead of leaving it running,
+    and programs flush their output line by line. Not an interactive shell: vast's .bashrc would start tmux."""
+    encoded = base64.b64encode(shell_script(command, cwd).encode('utf-8')).decode('ascii')
+    return ssh_command(conn) + ['-tt', f'bash -lc "$(echo {encoded} | base64 -d)"']
+
+
+def clean_terminal_text(text: str) -> str:
+    return _ANSI_RE.sub('', text).replace('\x07', '').replace('\x08', '')
+
+
+def split_output(buffer: str) -> tuple[list[tuple[str, str]], str]:
+    """Cut terminal output into ('line', text) for finished lines and ('cr', text) for a line that a carriage return
+    redraws (progress bars); returns the pieces and the unfinished rest."""
+    out: list[tuple[str, str]] = []
+    buffer = buffer.replace('\r\n', '\n')
+    while True:
+        nl, cr = buffer.find('\n'), buffer.find('\r')
+        if nl < 0 and cr < 0:
+            return out, buffer
+        if cr >= 0 and (nl < 0 or cr < nl):
+            if cr == len(buffer) - 1:  # might be the start of \r\n: wait for more
+                return out, buffer
+            piece, buffer = buffer[:cr], buffer[cr + 1:]
+            if piece:
+                out.append(('cr', piece))
+        else:
+            out.append(('line', buffer[:nl]))
+            buffer = buffer[nl + 1:]
+
+
+class ShellRun:
+    """A command running on the instance. ``events()`` yields ('line'|'cr', text) while it runs and finally
+    ('done', ''); afterwards ``code`` and ``cwd`` hold its exit code and the folder it ended in."""
+
+    def __init__(self, conn: Conn, command: str, cwd: str) -> None:
+        self.conn = conn
+        self.command = command
+        self.cwd = cwd
+        self.code: int | None = None
+        self.stopped = False
+        self.error = ''
+        self.proc = subprocess.Popen(shell_ssh_command(conn, command, cwd), stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=_NO_WINDOW)
+
+    def events(self) -> Iterator[tuple[str, str]]:
+        assert self.proc.stdout
+        rest = ''
+        blank = 0  # empty lines held back: the last one comes from the end marker's own newline
+        while True:
+            chunk = self.proc.stdout.read1(65536) if hasattr(self.proc.stdout, 'read1') else self.proc.stdout.read(1)
+            if not chunk:
+                break
+            pieces, rest = split_output(rest + clean_terminal_text(chunk.decode('utf-8', 'replace')))
+            for kind, text in pieces:
+                if kind == 'line' and (m := _MARK_RE.match(text.strip())):
+                    self.code, self.cwd = int(m.group(1)), m.group(2) or self.cwd
+                    blank = max(0, blank - 1)
+                    continue
+                if kind == 'line' and not text.strip():
+                    blank += 1
+                    continue
+                for _ in range(blank):
+                    yield 'line', ''
+                blank = 0
+                yield kind, text
+        for _ in range(blank):
+            yield 'line', ''
+        if rest.strip() and not _MARK_RE.match(rest.strip()):
+            yield 'line', rest
+        try:
+            self.proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+        if self.code is None and not self.stopped:
+            if self.proc.returncode == SSH_FAILED:
+                err = self.proc.stderr.read() if self.proc.stderr else b''
+                self.error = _ssh_error(err, self.conn)
+            else:
+                self.code = self.proc.returncode
+        yield 'done', ''
+
+    def send(self, text: str) -> None:
+        """Type a line into the running command (an answer to a y/n question, say)."""
+        if self.proc.poll() is None and self.proc.stdin:
+            try:
+                self.proc.stdin.write(text.encode('utf-8') + b'\n')
+                self.proc.stdin.flush()
+            except OSError:
+                pass
+
+    def stop(self) -> None:
+        """Close the connection: the command's terminal goes away and the command gets a hangup."""
+        self.stopped = True
+        if self.proc.poll() is None:
+            if self.proc.stdin:
+                try:
+                    self.proc.stdin.write(b'\x03')  # Ctrl+C through the tty first
+                    self.proc.stdin.flush()
+                except OSError:
+                    pass
+            try:
+                self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+
+def run_shell(command: str, cwd: str = '/workspace') -> ShellRun:
+    conn = attached()
+    if not conn:
+        raise VastError('No vast.ai instance attached. Attach one on the vast.ai page first.')
+    return ShellRun(conn, command, cwd)
+
+
+def ssh_login_command(conn: Conn) -> list[str]:
+    """ssh for a person at a keyboard: a terminal, and ssh may ask questions (key passphrase)."""
+    cmd = ssh_command(conn, batch=False)
+    cmd.remove('-T')
+    return cmd
+
+
+def ssh_login_text(conn: Conn) -> str:
+    key = config.get().ssh_key.strip()
+    return f'ssh -p {conn.port}' + (f' -i "{key}"' if key else '') + f' {conn.user}@{conn.host}'
+
+
+def open_terminal(conn: Conn | None = None) -> str:
+    """Open a terminal window on this computer with an ssh session to the instance. Returns what was started."""
+    conn = conn or attached()
+    if not conn:
+        raise VastError('No vast.ai instance attached. Attach one on the vast.ai page first.')
+    cmd = ssh_login_command(conn)
+    if IS_WINDOWS:
+        subprocess.Popen(cmd, creationflags=subprocess.CREATE_NEW_CONSOLE)  # type: ignore[attr-defined]
+        return 'a console window'
+    if is_wsl() and shutil.which('cmd.exe') and shutil.which('wsl.exe'):
+        # A Windows terminal running this same ssh inside WSL (the WSL side has the keys and known hosts).
+        subprocess.Popen(['cmd.exe', '/c', 'start', 'vast.ai', 'wsl.exe', '-d',
+                          os.environ.get('WSL_DISTRO_NAME', ''), '--', *cmd], cwd='/mnt/c')
+        return 'a Windows console running WSL'
+    for term, args in (('x-terminal-emulator', ['-e']), ('gnome-terminal', ['--']), ('konsole', ['-e']),
+                       ('xfce4-terminal', ['-x']), ('kitty', []), ('alacritty', ['-e']), ('xterm', ['-e'])):
+        if shutil.which(term):
+            subprocess.Popen([term, *args, *cmd], start_new_session=True)
+            return term
+    if sys.platform == 'darwin':
+        script = ' '.join("'" + c.replace("'", "'\\''") + "'" for c in cmd)
+        subprocess.Popen(['osascript', '-e', f'tell app "Terminal" to do script "{script}"'])
+        return 'Terminal'
+    raise VastError('No terminal program found here. Copy the ssh command and run it in a terminal.')
 
 
 # --------------------------------------------------------------------------------------------------
