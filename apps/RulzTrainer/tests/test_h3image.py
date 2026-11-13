@@ -937,6 +937,7 @@ def test_clean_share_puts_its_share_of_steps_on_the_last_level_and_keeps_the_six
     """clean_share on MiniMax-H3-Image (Fizgig's presets: 40): that share of the steps at the last sampling level
     (0.232, below 0.5), the rest evenly over the other five, solved by clean_share's own bisection; the levels stay
     exact. Without clean_share the curriculum's shift moves nothing (ai-toolkit's even draw)."""
+    from rulztrainer.clean_share import H3_LIKENESS as CS_H3_LIKENESS
     from rulztrainer.clean_share import CleanShare, offset_for
     from rulztrainer.trainer import sample_sigmas
 
@@ -955,6 +956,11 @@ def test_clean_share_puts_its_share_of_steps_on_the_last_level_and_keeps_the_six
                                 clean_share="11:2:40"), ARCH)
     low, high = cs.offset(0, 100, 4096), cs.offset(250, 100, 4096)
     assert low > 0 > high
+    # Fizgig's Likeness optimization: the even share, then 75 / 33 / 75 / 50 / 75, each reached on the six levels
+    lk = TrainConfig(model_path="MiniMaxAI/MiniMax-H3-Image", timestep_sampling="reference",
+                     clean_share=CS_H3_LIKENESS)
+    for share in (16.67, 33.33, 50.0, 75.0):
+        assert offset_for(lk, share, 1024, ARCH)[1] == pytest.approx(share, abs=0.5)
     # no clean_share: a shift (the likeness curriculum's) leaves the even draw alone
     plain = TrainConfig(model_path="MiniMaxAI/MiniMax-H3-Image", timestep_sampling="reference")
     a = sample_sigmas(plain, 500, torch.Generator().manual_seed(4), -2.0, tokens=4096, arch=ARCH)

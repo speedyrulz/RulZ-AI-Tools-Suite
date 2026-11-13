@@ -2393,6 +2393,10 @@ CLEAN_SLIDE = "60:7:30:8:3"  # Fizgig's MOSS-Image Slide until 8 November 2026 (
 CLEAN_SLIDE_MUON = "11:7:40:8:3"  # its Slide since 10 November 2026, for Muon (rulztrainer.clean_share.SLIDE_MUON)
 CLEAN_SLIDE_FT = "11:4:30:8:2"  # its full fine-tune default, in rotations (rulztrainer.clean_share.FT_SLIDE)
 CLEAN_H3_IMAGE = "40"  # Fizgig's MiniMax-H3-Image presets: 40% of the steps at the last of its 6 levels (0.232)
+CLEAN_H3_LIKENESS = "16.67,75,33.33,75,50,75"  # its Likeness optimization since 9.7.0 (rulztrainer.clean_share.H3_LIKENESS)
+# the rest of Fizgig's MiniMax-H3-Image Standard preset with it (9.7.0): Automagic v4 at 2.5e-4, its ceiling, 0.25 MP
+H3_LIKENESS_RECIPE = {"clean_share": CLEAN_H3_LIKENESS, "optimizer": "automagic4", "learning_rate": 2.5e-4,
+                      "automagic_max_lr": 2.5e-4, "resolutions": [0.25], "timestep_sampling": "reference"}
 
 
 def parse_ranks(text) -> list[int]:
@@ -2421,6 +2425,10 @@ def clean_share_hint(form) -> str:
     text = f"These timestep settings put {own:.0f}% of steps at the clean end on their own."
     if schedule is None:
         return text
+    if isinstance(schedule, cs.PerEpoch):
+        unit = "rotation" if cfg.finetune else "epoch"
+        return text + " With the schedule: " + ", ".join(f"{s:g}%" for s in schedule) + \
+            f" for {unit}s 1 to {len(schedule)}, then {schedule[-1]:g}% (all at the full learning rate)."
     first, until, rest, end, every = schedule
     if first == rest:
         return text + f" With the schedule: {first:g}% all run."
@@ -4982,7 +4990,8 @@ def h3_recommendations(cfg: TrainConfig, r: dict, goal: str | None, gpus: list[d
                                            "curve (the audio sigma follows on shift 3), as the released schedulers "
                                            "and musubi-tuner train")
     if not cfg.finetune:
-        r["adapter_mode"] = ("auto", "circlestone-labs' image training adapter: H3 is CFG-distilled, and musubi-tuner "
+        r["adapter_mode"] = ("auto", "ostris' v3 training adapter for the base you train (FL2VA or Ref2VA): H3 is "
+                                     "CFG-distilled, and musubi-tuner "
                                      "saw one-frame LoRAs trained without an adapter break up within about 50 steps")
     if cfg.turbo_lora != "auto":
         r["sample_steps"] = (30, "musubi-tuner's one-frame example (H3's pipeline: 49 evaluations)")
@@ -6180,9 +6189,9 @@ class Wizard:
         with self.setting("adapter_mode", "Training adapter",
                           "A small LoRA that stays on while your LoRA trains and off for samples and probes, and is "
                           "never saved into it. Fizgig measured on Qwen-Image 2.1: without one, LoRAs collapse into "
-                          "texture or wobble part-way; with it likeness reached 77 against 56. MiniMax H3's is "
-                          "circlestone-labs' image training adapter; P-H3-Image's and MiniMax-H3-Image's are ostris' "
-                          "(the ones ai-toolkit uses).",
+                          "texture or wobble part-way; with it likeness reached 77 against 56. MiniMax H3's, "
+                          "P-H3-Image's and MiniMax-H3-Image's are ostris' (the ones ai-toolkit uses; H3 has one for "
+                          "each of its two bases).",
                           show_if=is_qwen, adv=True):
             self.bind(ui.select(ADAPTER_MODES, label="Training adapter"), "adapter_mode").classes("w-full")
         hw = ui.column().classes("w-full gap-3 pt-2")
@@ -8891,9 +8900,9 @@ def build_page(local: bool = True):
                                          "never saved into it, so your LoRA works on the plain model. Qwen-Image "
                                          "2.1's is Fizgig's (downloaded, 80 MB): without one its LoRAs collapse "
                                          "into texture or wobble part-way (likeness 77 with it, 56 without). "
-                                         "MiniMax H3's is circlestone-labs' image training adapter (0.62 GB), "
-                                         "P-H3-Image's and MiniMax-H3-Image's are ostris' adapters for them "
-                                         "(0.16 GB each). The other models have none of their own; a file "
+                                         "MiniMax H3's are ostris' v3 adapters, one for FL2VA and one for "
+                                         "Ref2VA (0.31 GB each), P-H3-Image's and MiniMax-H3-Image's are ostris' "
+                                         "adapters for them (0.16 GB each). The other models have none of their own; a file "
                                          "works on any.")
                             path_input(f, "training_adapter", "Training adapter file", "file", "", "w-[30rem]")
                             f.w["training_adapter"].parent_slot.parent.bind_visibility_from(w["adapter_mode"], "value",
@@ -9261,7 +9270,9 @@ def build_page(local: bool = True):
                                     .classes("w-64").tooltip(
                                         "The share of training steps at the clean end (noise below half), where faces "
                                         "and fine detail are refined; the sampling curve above is moved to hit it. "
-                                        "40 = 40% all run. 75:5:40 = 75% for 5 epochs, then 40%. 60:7:30:8:3 = "
+                                        "40 = 40% all run. 75:5:40 = 75% for 5 epochs, then 40%. A list with "
+                                        "commas gives each epoch its own share, the last held: 16.67,75,33.33,75,50,75. "
+                                        "60:7:30:8:3 = "
                                         "Fizgig's MOSS-Image Slide: 60% until epoch 7, 30% at epoch 8, then 60% with "
                                         "every 3rd epoch at 30%, at half the learning rate. A full fine-tune counts "
                                         "rotations instead of epochs (Slide FT: 11:4:30:8:2). MiniMax-H3-Image "
@@ -9287,6 +9298,25 @@ def build_page(local: bool = True):
                                         "noise level (0.232), where skin, eyes and fine detail are made, and 12% on "
                                         "each of the other five (about 17% each without it). With timestep sampling "
                                         "reference")
+
+                                def h3_likeness_recipe():
+                                    for key, value in H3_LIKENESS_RECIPE.items():
+                                        w[key].set_value(list(value) if isinstance(value, list) else value)
+                                    ui.notify("Fizgig's MiniMax-H3-Image Likeness optimization: the clean-end "
+                                              "schedule, Automagic 4 at 2.5e-4 (also its ceiling) and 0.25 MP. Fizgig "
+                                              "trains 30 epochs (a run peaked around 15): set the steps to fit",
+                                              type="info")
+
+                                ui.button("H3 Image likeness", on_click=h3_likeness_recipe) \
+                                    .props("flat dense").tooltip(
+                                        "Fizgig's MiniMax-H3-Image Likeness optimization (9.7.0): 16.67, 75, 33.33, "
+                                        "75, 50, 75% of the steps at the model's last noise level for epochs 1 to 6, "
+                                        "75% after; with it Automagic 4 at 2.5e-4 with its ceiling at 2.5e-4, 0.25 MP "
+                                        "and the reference timesteps. Fizgig reports its best likeness with it on "
+                                        "three people's sets; not measured here yet") \
+                                    .bind_visibility_from(w["model_preset"], "value",
+                                                          lambda p: preset_arch(p, w["model_path"].value)
+                                                          == "minimax_h3_image")
                                 clean_hint = hint("")
 
                                 def clean_hint_update(_=None):
@@ -12430,7 +12460,8 @@ placeholder. Nothing fits one 16 GB card whole. Estimates, not measured: two 16 
 10.5 GB of weights each), or one card with **block swap** (about 25 of the 50 blocks in pinned system RAM; 64 GB of
 RAM advised). The text encoder spreads over the GPUs and system RAM (*Text encoder device* auto).
 
-H3 is CFG-distilled, so the **training adapter** is on by default: circlestone-labs' image training adapter, on while
+H3 is CFG-distilled, so the **training adapter** is on by default: ostris' v3 adapter for the base you train (FL2VA or
+Ref2VA; circlestone-labs' image adapter before 3.15.0), on while
 your LoRA trains, off for samples and probes, never saved into the file (musubi-tuner saw one-frame LoRAs break up
 within about 50 steps without an adapter). The setup wizard suggests the recipe musubi-tuner and DiffSynth-Studio use:
 rank 16 (32 for styles), alpha = rank, learning rate 1e-4, adamw8bit, H3's own timesteps (*reference*: one base time,
