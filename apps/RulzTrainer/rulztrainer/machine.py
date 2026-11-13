@@ -89,6 +89,52 @@ def memory() -> dict | None:
     return {"total": total / GB, "used": used / GB}
 
 
+CPU_MAX_V2 = Path("/sys/fs/cgroup/cpu.max")
+CPU_QUOTA_V1 = Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+CPU_PERIOD_V1 = Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+THREAD_ENV = ("OMP_NUM_THREADS", "MKL_NUM_THREADS")  # a thread count of the user's own: left as it is
+
+
+def _read(path: Path) -> str | None:
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+
+
+def cpu_quota(v2: Path = CPU_MAX_V2, v1_quota: Path = CPU_QUOTA_V1, v1_period: Path = CPU_PERIOD_V1) -> float | None:
+    """How many CPUs this container may use (its cgroup quota over its period), or None when it has no limit or the
+    files are not there. A vast.ai container can show every CPU of the host (os.cpu_count, nproc: 24) while its quota
+    is half of them (11.5): a program that starts a thread per CPU it sees then spends most of its time throttled.
+    cgroup v2 cpu.max is "<quota> <period>" ("max <period>": no limit); cgroup v1 has the two numbers in their own
+    files (quota -1: no limit)."""
+    def ratio(quota: str, period: str) -> float | None:
+        try:
+            q, p = float(quota), float(period)
+        except (TypeError, ValueError):
+            return None
+        return q / p if q > 0 and p > 0 else None
+
+    text = _read(v2)
+    if text is not None:
+        parts = text.split()
+        if len(parts) == 2 and parts[0] == "max":
+            return None
+        return ratio(*parts) if len(parts) == 2 else None
+    return ratio(_read(v1_quota), _read(v1_period))
+
+
+def cpu_thread_cap(threads: int, quota: float | None, env=None) -> int | None:
+    """The CPU thread count to use instead of `threads` (PyTorch's, one per CPU the machine shows) when the
+    container's quota is smaller, else None: nothing to change, no quota, or the user set OMP_NUM_THREADS /
+    MKL_NUM_THREADS themselves."""
+    env = os.environ if env is None else env
+    if quota is None or any(str(env.get(name) or "").strip() for name in THREAD_ENV):
+        return None
+    cap = max(1, int(quota))
+    return cap if threads > cap else None
+
+
 def _container_env(env=None, env_file: Path = _ENV_FILE) -> dict[str, str]:
     """The process's variables, with vast.ai's from /etc/environment for the ones a service did not inherit."""
     values = dict(os.environ if env is None else env)

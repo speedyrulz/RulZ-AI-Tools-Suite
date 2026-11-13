@@ -3,3 +3,6 @@ out/
 dist/
 *.log
 .DS_Store
+# agent instructions kept local to this machine (not in the repository)
+/AGENTS.md
+/CLAUDE.md
