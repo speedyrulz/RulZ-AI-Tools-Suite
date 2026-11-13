@@ -104,6 +104,22 @@ def test_sft_lora_attaches_to_moss_layout(tmp_path):
     assert torch.allclose(u @ d, (up @ down)[2 * dim:])
 
 
+def test_norm_offsets_of_two_sampling_loras_add_up(tmp_path):
+    """A turbo LoRA and a sample LoRA that both carry a .diff for one norm: sampling uses the sum (the last file's
+    offset alone before), training the original weight."""
+    m = _Moss()
+    norm = m.layers[0].q_norm.weight
+    original = norm.detach().clone()
+    for name, value in (("a", 0.1), ("b", 0.2)):
+        save_file({"diffusion_model.layers.0.q_norm.diff": torch.full_like(original, value)},
+                  str(tmp_path / f"{name}.safetensors"))
+        L.attach_extra_lora(m, str(tmp_path / f"{name}.safetensors"), 1.0)
+    L.set_extras_enabled(m, True)
+    assert torch.allclose(norm, original + 0.3)
+    L.set_extras_enabled(m, False)
+    assert torch.equal(norm, original)
+
+
 def test_a_sampling_lora_matching_nothing_stops_the_run(tmp_path):
     from rulztrainer.trainer import Trainer
 

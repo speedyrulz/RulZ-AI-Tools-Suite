@@ -561,7 +561,16 @@ def text_cache_path(cfg: TrainConfig, prompt: str) -> Path:
     models/, and the features cached then (no suffix) must not be reused."""
     arch = cfg.arch_name()
     tag = "_q35" if arch == "moss_image" else f"_{arch}"
-    return cfg.resolved_cache_dir() / "text" / f"{_hash(prompt)}_{cfg.max_token_length}{tag}.safetensors"
+    if arch not in ("minimax_h3", "minimax_h3_image"):
+        # since 3.18.0 a quantized text encoder runs weight-only, as ComfyUI does (int8 / FP4 activations before, which
+        # moved the features a few percent): features cached before are not mixed with new ones. H3's ran so already
+        tag += "_wo"
+    length = cfg.max_token_length
+    if arch == "pan2":  # PAN 2 encodes 1536 tokens at the default 1024 since 3.18.0: its caches cut at 1024 are not
+        from .pan2.loading import text_length  # reused (the key names the length encoded)
+
+        length = text_length(length)
+    return cfg.resolved_cache_dir() / "text" / f"{_hash(prompt)}_{length}{tag}.safetensors"
 
 
 # ---------------------------------------------------------------- batching

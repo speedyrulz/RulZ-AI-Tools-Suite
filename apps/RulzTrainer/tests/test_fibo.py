@@ -84,7 +84,10 @@ def test_lora_names_peft_export_and_reload(tmp_path):
     assert state["transformer.layers.0.attention.to_q.lora_B.weight"].shape == (64, 4)
     with safe_open(str(path), "pt") as f:
         meta = json.loads(f.metadata()["lora_adapter_metadata"])
-    assert meta["transformer.r"] == 4 and meta["transformer.lora_alpha"] == 8.0
+    # alpha / rank (8 / 4) is folded into lora_B and the config says alpha = r: ComfyUI reads no alpha from it
+    assert meta["transformer.r"] == 4 and meta["transformer.lora_alpha"] == 4.0
+    up = inj["layers.0.attention.to_q"].lora_up.weight
+    assert torch.allclose(state["transformer.layers.0.attention.to_q.lora_B.weight"], up * 2.0)
     assert meta["transformer.peft_type"] == "LORA" and set(meta["transformer.target_modules"]) == set(names)
     # the PEFT convention (alpha / r * B @ A) is what the wrapper applies
     mod = inj["layers.0.attention.to_q"]
@@ -98,11 +101,14 @@ def test_lora_names_peft_export_and_reload(tmp_path):
     assert L.load_lora_weights(inj2, path) == len(names)
     assert inj2["layers.0.attention.to_q"].alpha == 8.0
     assert torch.equal(inj2["layers.0.attention.to_q"].lora_up.weight, mod.lora_up.weight)
-    # a sampling-only ("extra") LoRA in PEFT format takes its alpha from the metadata
+    # a sampling-only ("extra") LoRA in PEFT format takes its alpha from the metadata: alpha = r, the training's
+    # alpha / rank already in lora_B, so the change is the trained one at the strength asked for
     m3 = tiny()
     assert L.attach_extra_lora(m3, str(path), strength=0.5) == len(names)
-    extra = m3.get_submodule("layers.0.attention.to_q").extras[0]
-    assert extra[0] == "lora" and abs(extra[3] - (8.0 / 4) * 0.5) < 1e-6  # (kind, down, up, scale)
+    kind, down, up, scale = m3.get_submodule("layers.0.attention.to_q").extras[0]
+    assert kind == "lora" and abs(scale - 0.5) < 1e-6
+    want = (8.0 / 4) * 0.5 * mod.lora_up.weight.float() @ mod.lora_down.weight.float()
+    assert torch.allclose(scale * up.float() @ down.float(), want, atol=1e-5)
 
 
 def test_prompts_cleaning_trigger_and_null_caption():
@@ -153,8 +159,8 @@ def test_arch_detection_captions_and_cache_names(tmp_path):
     moss_cfg = TrainConfig(trigger_word="zxc", cache_dir=str(tmp_path / "c"))
     assert D.read_caption(img, moss_cfg) == "zxc, a woman on a beach"
     # text caches of the two text encoders never collide; MOSS keeps its original file names
-    assert D.text_cache_path(fibo_cfg, "p").name.endswith("_fibo2.safetensors")
-    assert D.text_cache_path(moss_cfg, "p").name == f"{D._hash('p')}_{moss_cfg.max_token_length}_q35.safetensors"
+    assert D.text_cache_path(fibo_cfg, "p").name.endswith("_fibo2_wo.safetensors")
+    assert D.text_cache_path(moss_cfg, "p").name == f"{D._hash('p')}_{moss_cfg.max_token_length}_q35_wo.safetensors"
     assert D.empty_text_path(fibo_cfg) == D.text_cache_path(fibo_cfg, P.NULL_CAPTION)
     assert D.empty_text_path(moss_cfg) == D.text_cache_path(moss_cfg, "")
 

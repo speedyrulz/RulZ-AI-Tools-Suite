@@ -122,6 +122,25 @@ def test_allocator_retries_give_back_one_kept_block_per_gpu():
     assert C.kept_blocks(model) == [0, 1, 3]
 
 
+def test_allocator_retries_on_a_data_parallel_copy_ease_that_copy():
+    """Data parallel: each copy's blocks are on its own GPU, so retries on cuda:1 give back cuda:1's copy's block
+    (they changed nothing before, while retries on cuda:0 took a block from both copies)."""
+    from rulztrainer.trainer import Trainer
+
+    torch.manual_seed(0)
+    first, _, _ = moss()
+    second, _, _ = moss()
+    trainer = Trainer.__new__(Trainer)
+    trainer.replicas = [(first, {}, "cuda:0"), (second, {}, "cuda:1")]
+    trainer.devices = ["cuda:0", "cuda:1"]
+    trainer.kept = {id(first): [0, 1, 2, 3], id(second): [0, 1, 2, 3]}
+    C.set_kept_blocks(first, [0, 1, 2, 3])
+    C.set_kept_blocks(second, [0, 1, 2, 3])
+    trainer._alloc_retries = lambda: {"cuda:0": 0, "cuda:1": 4}
+    trainer._ease_memory_pressure({"cuda:0": 0, "cuda:1": 1})
+    assert C.kept_blocks(first) == [0, 1, 2, 3] and C.kept_blocks(second) == [1, 2, 3]
+
+
 def test_calibration_uses_the_longest_caption(tmp_path):
     """The blocks see text and image tokens, so the activation memory is measured with the longest cached caption
     (for each family's own embeds layout)."""
@@ -167,3 +186,28 @@ def test_allocator_config_and_rendering_frees_training_memory(monkeypatch):
         m(torch.randn(2, 4)).sum().backward()
     Trainer._free_for_rendering(SimpleNamespace(replicas=[(a, None, "cpu"), (b, None, "cpu")]))
     assert all(p.grad is None for m in (a, b) for p in m.parameters())
+
+
+def test_atomic_writes_clear_temporaries_killed_writers_left(tmp_path, monkeypatch):
+    """Each writer names its own temporary file, so a killed one's is not overwritten by the next save: it goes once
+    it is old and its process has ended; a live writer's and a fresh one stay."""
+    import os
+    import time as _time
+
+    from rulztrainer import atomic
+
+    target = tmp_path / "faces.json"
+    dead = tmp_path / "faces.json.999999-0123abcd.tmp"
+    live = tmp_path / f"faces.json.{os.getppid()}-0123abcd.tmp"
+    old_style = tmp_path / "faces.json.tmp"
+    fresh = tmp_path / "faces.json.999998-0123abcd.tmp"
+    for p in (dead, live, old_style, fresh):
+        p.write_text("half")
+    old = _time.time() - 2 * atomic.STALE_TMP_SECONDS
+    for p in (dead, live, old_style):
+        os.utime(p, (old, old))
+    monkeypatch.setattr("psutil.pid_exists", lambda pid: pid == os.getppid())
+    with atomic.writing(target) as tmp:
+        tmp.write_text("{}")
+    assert target.read_text() == "{}"
+    assert not dead.exists() and not old_style.exists() and live.exists() and fresh.exists()

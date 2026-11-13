@@ -461,7 +461,7 @@ def test_detection_caches_buckets_and_downloads(tmp_path):
     item, fitem = D.scan_dataset(klein)[0], D.scan_dataset(fibo)[0]
     assert item.width % 16 == 0 and item.height % 16 == 0
     assert item.latent_path == fitem.latent_path  # the same Flux2 VAE latents as FIBO 2.0 / MOSS-Image
-    assert D.text_cache_path(klein, "p").name.endswith("_flux3_klein.safetensors")
+    assert D.text_cache_path(klein, "p").name.endswith("_flux3_klein_wo.safetensors")
     repo = "black-forest-labs/flux-3-image-klein-comfy"
     plan = {f: (r, n) for f, r, n in planned_downloads(TrainConfig(
         model_path="black-forest-labs/flux-3-image-klein-base"))}
@@ -506,6 +506,65 @@ def test_prompt_template_window_and_token_positions():
         assert text == want and drop == 0 and length == ids.shape[1] and len(offsets) == n
     _, mask, _ = FL.tokenize(tok, "word " * 2000, 1024)
     assert mask.shape[1] == 1024
+
+
+class _CharTok:
+    """One id per character, with pad / eos ids: enough for tokenize / encode_prompts / prompt_tokens."""
+    pad_token_id, eos_token_id = 0, 1
+
+    def __call__(self, text, truncation=False, max_length=None, return_offsets_mapping=False):
+        ids = [2 + (ord(c) % 90) for c in text]
+        offsets = [(i, i + 1) for i in range(len(text))]
+        if truncation and max_length is not None:
+            ids, offsets = ids[:max_length], offsets[:max_length]
+        out = type("Enc", (dict,), {})(offset_mapping=offsets)
+        out.input_ids = ids
+        return out
+
+
+def test_text_encoder_cut_at_layer_32_gives_the_same_features(monkeypatch):
+    """FLUX 3 reads hidden layers 4, 8, ..., 32 of Qwen3-VL-4B's 36, so its encoder is built to layer 32 only.
+    transformers overwrites the last hidden state with the normed one, so the cut's final norm is an identity: the
+    features of the 32-layer build equal the 36-layer model's, bit for bit."""
+    from transformers import Qwen3VLTextConfig, Qwen3VLTextModel
+
+    from rulztrainer.krea2 import single_file as KSF
+
+    cfg = dict(vocab_size=128, hidden_size=16, intermediate_size=32, num_hidden_layers=36, num_attention_heads=2,
+               num_key_value_heads=1, head_dim=8, rope_parameters={"rope_type": "default", "rope_theta": 5000000.0,
+                                                                   "mrope_section": [2, 1, 1],
+                                                                   "mrope_interleaved": True})
+    torch.manual_seed(5)
+    full = Qwen3VLTextModel(Qwen3VLTextConfig(**cfg)).eval()
+    with torch.no_grad():
+        for p in full.parameters():  # bf16 weights as the build installs them (the rotary table stays fp32)
+            p.data = p.data.to(torch.bfloat16)
+            p.data.add_(torch.randn_like(p.data) * 0.05)  # beyond the init, so the norm's weight is not all ones
+    state = {f"model.language_model.{k}": v.clone() for k, v in full.state_dict().items()}
+    cut = KSF.build_text_model(state, "none", config=cfg, layers=FL.TE_LAYERS)
+    assert FL.TE_LAYERS == max(FL.SELECT_LAYERS) == 32 and len(cut.layers) == 32 and not state
+    assert isinstance(cut.norm, torch.nn.Identity) and cut.config.num_hidden_layers == 32
+    prompts = ["a red fox in snow, shtm style", "", "x " * 90]
+    with torch.no_grad():
+        want = FL.encode_prompts(full, _CharTok(), prompts, 1024)
+        got = FL.encode_prompts(cut, _CharTok(), prompts, 1024)
+    for a, b in zip(want, got):
+        assert a.shape[1] == 8 * 16 and torch.equal(a, b)
+    seen = []  # the single file (the default source) is built to the same depth
+    monkeypatch.setattr(KSF, "load_text_encoder_file", lambda path, device, quant, layers=None: seen.append(layers))
+    FSF.load_text_encoder_file("qwen3vl_4b.safetensors", "cpu", "none")
+    assert seen == [32]
+
+
+def test_prompt_tokens_follow_the_runs_max_length():
+    """The cache cuts a caption at max_token_length and pads it to its window; prompt_tokens did both at 1024
+    whatever the run asked for."""
+    tok = _CharTok()
+    prompt = "zxc woman, " + "word " * 400
+    for max_length in (100, 400, 1024, 8192):
+        ids, _, _ = FL.tokenize(tok, prompt, max_length)
+        _, offsets, drop, length = FL.prompt_tokens(tok, prompt, max_length)
+        assert length == ids.shape[1] and len(offsets) <= length
 
 
 def test_wizard_suggests_bfl_recipe_and_klein_sampling(tmp_path):

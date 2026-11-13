@@ -191,6 +191,22 @@ def portal_url(scheme, ip, port, path, token) -> str:
     return url + (f"?token={urllib.parse.quote(str(token), safe='')}" if token else "")
 
 
+def repoint_dataset(config, name: str, new_name: str):
+    """config with its paths into datasets/<name> (as point_at_pushed wrote them) reading datasets/<new_name>."""
+    old = f"datasets/{name}"
+
+    def swap(value):
+        if isinstance(value, dict):
+            return {k: swap(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [swap(v) for v in value]
+        if isinstance(value, str) and (value == old or value.startswith(old + "/")):
+            return f"datasets/{new_name}" + value[len(old):]
+        return value
+
+    return swap(config)
+
+
 def point_at_pushed(config, push) -> dict:
     """A config whose paths into a pushed folder read where the folder lands on the instance: a dataset that is
     C:\\sets\\anna here is datasets/anna there, wherever the settings name it (the dataset, its face references)."""
@@ -770,7 +786,8 @@ class Fleet:
                 "id": e["id"], "job": e["job"], "instance": e.get("instance"), "group": e.get("group"),
                 "race_rows": e.get("race_rows") or None, "steps": cfg.get("steps"), "preset": cfg.get("preset"),
                 "set": e.get("set") or None, "push": e.get("push") or None, "label": e.get("label") or None,
-                "refused_by": e.get("refused_by") or None, "sent_to": e.get("sent_to")}.items() if v is not None}
+                "refused_by": e.get("refused_by") or None, "sent_to": e.get("sent_to"),
+                "uncertain_on": e.get("uncertain")}.items() if v is not None}
 
         return {"paused": q["paused"], "waiting": [line(e) for e in q["waiting"]],
                 "starting": [line(e) for e in q["active"]], "recent": q["recent"][:8]}
@@ -791,6 +808,43 @@ class Fleet:
             return False
         return snap.get("polled", 0) > inst.get("settled", 0)
 
+    @staticmethod
+    def _may_take(st: dict, entry: dict, iid: str) -> bool:
+        """A run whose start on another instance went unanswered stays that instance's while it may be there, unless
+        that instance is gone or switched off (the run then goes to the next free one)."""
+        held = entry.get("uncertain")
+        if held in (None, iid):
+            return True
+        other = st["instances"].get(held)
+        return other is None or other.get("gone") or not other.get("enabled", True)
+
+    def settle_uncertain(self, st: dict, snaps: dict[str, dict]) -> None:
+        """Runs whose start went unanswered (entry "uncertain"), found on their instance by this look: settled as
+        sent, never started again. Before observe(), which makes a run's record from the instance's "pending" (the
+        entry's download rule, label and group) the first time it sees the run going; the instance may be busy with
+        that very run, so this cannot wait for a dispatch."""
+        q, now = st["queue"], self.now()
+        for entry in list(q["waiting"]):
+            held = entry.get("uncertain")
+            snap = snaps.get(held) if held else None
+            state = self.found_there(snap, entry["job"], entry.get("uncertain_at"), snap.get("polled")) \
+                if snap and snap.get("ok") else ""
+            if not state:
+                continue
+            q["waiting"].remove(entry)
+            entry.pop("uncertain", None)
+            entry.pop("uncertain_at", None)
+            live = st["instances"].get(held)
+            if live is not None:  # observe() makes the run's record from it in this tick, an ended one's too
+                live.setdefault("pending", {})[entry["job"]] = {
+                    k: v for k, v in (("entry", entry["id"]), ("group", entry.get("group")),
+                                      ("download", entry.get("download")), ("label", entry.get("label"))) if v}
+            note = "the connection dropped after it was sent"
+            q["recent"] = ([{"id": entry["id"], "job": entry["job"], "instance": int(held), "group": entry.get("group"),
+                             "time": now, "state": state, "note": note}] + q["recent"])[:RECENT_KEPT]
+            self.event(st, "dispatched", instance=int(held), job=entry["job"], entry=entry["id"],
+                       group=entry.get("group"), state=state, note=note)
+
     def schedule(self, st: dict, snaps: dict[str, dict]) -> None:
         """After a look: hand each idle instance the first run it may take, and ask for the files that are due."""
         q, now = st["queue"], self.now()
@@ -800,7 +854,7 @@ class Fleet:
                 if not self.idle(inst, snaps.get(iid)):
                     continue
                 entry = next((e for e in q["waiting"] if e.get("instance") in (None, int(iid))
-                              and iid not in (e.get("refused_by") or [])), None)
+                              and iid not in (e.get("refused_by") or []) and self._may_take(st, e, iid)), None)
                 if entry is None:
                     continue
                 q["waiting"].remove(entry)
@@ -875,30 +929,104 @@ class Fleet:
             args.append("--overwrite")
         return args + (["--dry-run"] if dry_run else ["--resume-queue"])
 
+    def push_datasets(self, target, entry: dict, snap: dict) -> dict:
+        """Send the run's datasets the instance lacks, and return its config pointed at them. Each goes as
+        datasets/<name> with the digest of what was sent (remote.dataset_digest) beside it. A folder of that name on
+        the instance that was sent from something else (a folder changed here since, or another folder of the same
+        name) is left alone, as a run there may be reading it: this one goes beside it as <name>_<digest> and the
+        config sent with the run reads that. A folder that has no digest (put there by hand, or sent by an older
+        fleet) is taken as it is, and so is one whose local folder is gone."""
+        config = entry["config"]
+        have = set(snap.get("datasets") or [])
+        marks = snap.get("dataset_marks")  # None: a look from before marks were kept
+        for path in entry.get("push") or []:
+            local, name = Path(path), Path(path).name
+            if name in have and (marks is None or not local.exists() or not marks.get(name)):
+                continue
+            digest = remote.dataset_digest(local)
+            if name in have and marks.get(name) == digest:
+                continue
+            if name in have:
+                versioned = f"{name}_{digest[:8]}"
+                config = repoint_dataset(config, name, versioned)
+                name = versioned
+                if name in have and marks.get(name) == digest:
+                    continue
+            self.send(target, [(local, name)], "datasets", hidden=False, staged=True, marks={name: digest})
+        return config
+
+    @staticmethod
+    def found_there(snap: dict, job: str, since: float | None = None, local_now: float | None = None) -> str:
+        """Whether an instance's look shows the run: "queued", "running", or (since: when its start was sent, by this
+        computer's clock) started from that instance's queue since then, a run that already ended ("done"); "" when it
+        does not. local_now: this computer's time when the look was asked for, to turn `since` into the instance's
+        clock (its "now"). A job folder's time is no sign: an earlier run of the same name writes it too."""
+        queue = snap.get("queue") or {}
+        if job in [w.get("job") for w in (queue.get("waiting") or [])]:
+            return "queued"
+        if snap.get("job_running") and (snap.get("job") or {}).get("job") == job:
+            return "running"
+        if since is not None:
+            if snap.get("now") and local_now:
+                since += float(snap["now"]) - float(local_now)
+            for line in queue.get("recent") or []:
+                if line.get("job") == job and (line.get("started") or 0) >= since - 30:
+                    return "done"
+        return ""
+
+    def landed(self, target, job: str, since: float | None = None) -> str | None:
+        """Whether a run whose start lost its connection got there anyway (found_there: "queued", "running", or ended
+        since), so that it is not sent a second time, there or to another instance; "" when the instance says it did
+        not, None when the instance still can't be asked (it may be there: the run stays this instance's until it
+        can)."""
+        asked = self.now()
+        try:
+            snap = target.agent_json("snapshot")
+        except (SystemExit, remote.Unreachable, ValueError, OSError, subprocess.SubprocessError):
+            return None
+        return self.found_there(snap, job, since, asked)
+
     def dispatch(self, inst: dict, entry: dict, snap: dict) -> None:
         """Send a queued run to an instance: its dataset first when it is not there, then the run into that
-        instance's own queue. A refusal sends the run on to the next instance; refused by all, it is set aside."""
+        instance's own queue. A refusal sends the run on to the next instance; refused by all, it is set aside.
+        The start is not sent twice when the connection drops: the run may be there already, in which case asking
+        again is refused (the job name is taken) and the run would go on to a second instance."""
         iid = str(inst["id"])
         outcome, message, reply = "refused", "", {}
+        started = self.now()
         try:
             target = self.remote_for(inst)
-            for path in entry.get("push") or []:
-                if Path(path).name not in (snap.get("datasets") or []):
-                    self.send(target, [(Path(path), Path(path).name)], "datasets", hidden=False)
-            done = target.agent(*self.start_args(entry), config=config_bytes(entry["config"]))
-            try:
-                reply = json.loads(done.stdout or b"{}")
-            except ValueError:
-                reply = {}
-            message = (done.stderr or b"").decode("utf-8", "replace").strip()[-400:] or str(reply.get("message") or "")
-            if done.returncode == remote.SSH_FAILED:
-                outcome = "unreachable"
+            # a start of this run here whose answer was lost: ask first whether it got there, never start it twice
+            known = self.landed(target, entry["job"], entry.get("uncertain_at")) \
+                if entry.get("uncertain") == iid else ""
+            if known is None:
+                raise remote.Unreachable("still out of reach to ask whether the run got there")
+            if known:
+                done, reply = None, {"state": known}
+                outcome, message = "sent", "the connection dropped after it was sent"
+            else:
+                config = self.push_datasets(target, entry, snap)
+                done = target.agent(*self.start_args(entry), config=config_bytes(config), retry=False)
+                try:
+                    reply = json.loads(done.stdout or b"{}")
+                except ValueError:
+                    reply = {}
+                message = (done.stderr or b"").decode("utf-8", "replace").strip()[-400:] \
+                    or str(reply.get("message") or "")
+            if done is None:
+                pass
+            elif done.returncode == remote.SSH_FAILED:
+                state = self.landed(target, entry["job"], started)
+                if state:
+                    outcome, reply, message = "sent", {"state": state}, "the connection dropped after it was sent"
+                else:  # None: it may be there, so only this instance takes it again (asking first)
+                    outcome = "unreachable" if state == "" else "uncertain"
             elif done.returncode == 0 and reply.get("state") in ("running", "queued"):
                 outcome = "sent"
             elif reply.get("state") == "queued":  # queued there, but that WebUI is not running to start it
                 outcome, message = "sent", reply.get("note") or message
         except remote.Unreachable as e:
-            outcome, message = "unreachable", str(e)
+            outcome, message = ("uncertain" if entry.get("uncertain") == iid else "unreachable"), str(e)
         except (SystemExit, OSError, subprocess.SubprocessError) as e:
             outcome, message = "refused", str(e)
         with self.edit() as st:
@@ -923,6 +1051,12 @@ class Fleet:
                     self.event(st, "queue_empty")
                 return
             entry.pop("sent_to", None)
+            if outcome == "uncertain":
+                entry.setdefault("uncertain_at", started)
+                entry["uncertain"] = iid
+            else:
+                entry.pop("uncertain", None)
+                entry.pop("uncertain_at", None)
             if outcome == "refused":
                 entry["refused_by"] = sorted(set(entry.get("refused_by") or []) | {iid})
                 entry["refusal"] = message
@@ -940,7 +1074,10 @@ class Fleet:
         with self.edit() as st:
             q = st["queue"]
             for entry in reversed(q["active"]):
-                entry.pop("sent_to", None)
+                sent_to = entry.pop("sent_to", None)
+                if sent_to is not None:  # it may have got there before the looker died: asked there first
+                    entry["uncertain"] = str(sent_to)
+                    entry.setdefault("uncertain_at", entry.get("added") or self.now())
                 q["waiting"].insert(0, entry)
             q["active"] = []
             for inst in st["instances"].values():
@@ -1281,6 +1418,8 @@ class Fleet:
         live = [i for i in st["instances"].values() if i.get("enabled", True) and not i.get("gone")]
         snaps = self.poll_all(live)
         with self.edit() as st:
+            if act:
+                self.settle_uncertain(st, snaps)
             for iid, snap in snaps.items():
                 if iid in st["instances"]:
                     self.observe(st, st["instances"][iid], snap)

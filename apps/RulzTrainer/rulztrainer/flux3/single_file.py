@@ -218,10 +218,11 @@ TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "vocab.json", "mer
 
 
 def load_text_encoder_file(path: str | Path, device: str = "auto", quant: str = "auto"):
-    """The Qwen3-VL-4B file (text only): the one Krea 2 and FIBO 2.0 load."""
+    """The Qwen3-VL-4B file (text only): the one Krea 2 and FIBO 2.0 load, built to layer 32 (loading.TE_LAYERS)."""
     from ..krea2.single_file import load_text_encoder_file as krea_te
+    from .loading import TE_LAYERS
 
-    return krea_te(path, device, quant)
+    return krea_te(path, device, quant, layers=TE_LAYERS)
 
 
 def load_vae_file(path: str | Path, device):

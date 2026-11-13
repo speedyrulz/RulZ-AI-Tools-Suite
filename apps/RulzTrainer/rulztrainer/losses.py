@@ -45,11 +45,22 @@ def band_weights(latents: torch.Tensor, noise: torch.Tensor, sigma: torch.Tensor
         return snr_k / (1 + snr_k)
 
 
+_BAND_CLIP_WARNED = False
+
+
 def band_loss(pred: torch.Tensor, target: torch.Tensor, latents: torch.Tensor, noise: torch.Tensor,
               sigma: torch.Tensor, levels: int = BAND_LEVELS) -> torch.Tensor:
     """Squared band-weighted residual, pred's (N, C, H, W) shape (see the module docstring)."""
     pred, target = pred.float(), target.float()
-    if pred.dim() != 4:
+    if pred.dim() != 4:  # video clip latents (N, C, T, H, W): the bands are 2-D
+        global _BAND_CLIP_WARNED
+        if not _BAND_CLIP_WARNED:
+            _BAND_CLIP_WARNED = True
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "loss_type band works on still pictures only: video clips train with plain MSE (a run of stills and "
+                "clips mixes the two losses' scales)")
         return (pred - target).pow(2)
     w = band_weights(latents.to(pred.device), noise.to(pred.device), sigma.to(pred.device), levels)
     w = w.t().reshape(levels + 1, -1, 1, 1, 1)

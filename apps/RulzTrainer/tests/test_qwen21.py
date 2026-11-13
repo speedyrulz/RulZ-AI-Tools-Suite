@@ -175,10 +175,14 @@ def test_lora_names_peft_export_and_comfy_mapping(tmp_path):
     assert "transformer.transformer_blocks.0.img_mlp.gate_layer.lora_A.weight" in state
     assert "transformer.transformer_blocks.2.img_mlp.proj.lora_B.weight" in state
     assert "transformer.modulation.1.lora_A.weight" in state and "transformer.txt_in.out_layer.lora_B.weight" in state
-    with torch.no_grad():  # merged into diffusers' model the PEFT way, it predicts what our LoRA model predicts
+    # merged into diffusers' model the PEFT way (the file's alpha = r: the training's alpha / rank, 8 / 4, is folded into
+    # lora_B, as ComfyUI reads no alpha), it predicts what our LoRA model predicts
+    meta = L.read_peft_metadata(path)
+    assert meta["lora_alpha"] == meta["r"] == 4
+    with torch.no_grad():
         for name in names:
             a, b = state[f"transformer.{name}.lora_A.weight"], state[f"transformer.{name}.lora_B.weight"]
-            ref.get_submodule(name).weight += (8.0 / 4) * b @ a
+            ref.get_submodule(name).weight += b @ a
         x, enc = torch.randn(1, 64, 2, 4), torch.randn(1, 5, 48)
         assert torch.allclose(ours(x, 400.0, enc, None), ref_call(ref, x, torch.tensor([0.4]), enc),
                               atol=1e-3, rtol=1e-3)
@@ -288,7 +292,7 @@ def test_detection_caches_buckets_and_downloads(tmp_path):
     item = D.scan_dataset(qwen)[0]
     assert item.width % 32 == 0 and item.height % 32 == 0 and item.latent_path.name.endswith("_qi21vae.safetensors")
     assert abs(item.width * item.height - 0.5 * 2**20) < 0.08 * 2**20
-    assert D.text_cache_path(qwen, "p").name.endswith("_qwen_image21.safetensors")
+    assert D.text_cache_path(qwen, "p").name.endswith("_qwen_image21_wo.safetensors")
     plan = {f: (r, n) for f, r, n in planned_downloads(TrainConfig(model_path="Qwen/Qwen-Image-2.1"))}
     assert plan["transformer_file"] == ("Comfy-Org/Qwen-Image-2.1",
                                         "diffusion_models/qwen_image_2.1_int8_convrot.safetensors")

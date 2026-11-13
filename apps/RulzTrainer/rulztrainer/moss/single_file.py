@@ -6,8 +6,10 @@ or int8 / int8_convrot / nvfp4) is applied when the model is built.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import threading
 from pathlib import Path
 
 import torch
@@ -66,10 +68,14 @@ def _qw_to(w: Q.QuantWeight, device) -> Q.QuantWeight:
                          w.scale2.to(device) if w.scale2 is not None else None, w.orig_shape, w.group)
 
 
+_STAGING = threading.local()  # .gpu: where a model staged in RAM quantizes (quantize_staged_on), per thread
+
+
 def quant_target(device, quant_devices=None) -> dict:
     """install_state's work_device / keep_on_work_device for a model loaded onto `device`: a CUDA device quantizes
     there and keeps the result; a model staged on the CPU for a split (quant_devices: its GPUs) quantizes on the
-    first of them and comes back to the CPU; "auto" (a text encoder placed later) on the current GPU, back to the CPU.
+    first of them and comes back to the CPU; "auto" (a text encoder placed later) on the current GPU, back to the CPU;
+    a model staged on the CPU for block swap (inside quantize_staged_on) on the training GPU, back to the CPU.
     Anything else (no GPU, a CPU model) quantizes on the CPU, as before."""
     if not torch.cuda.is_available():
         return {}
@@ -79,7 +85,36 @@ def quant_target(device, quant_devices=None) -> dict:
         return {"work_device": torch.device(device), "keep_on_work_device": True}
     gpus = [d for d in ([quant_devices] if isinstance(quant_devices, (str, torch.device)) else quant_devices or [])
             if torch.device(d).type == "cuda"]
-    return {"work_device": torch.device(gpus[0])} if gpus else {}
+    if gpus:
+        return {"work_device": torch.device(gpus[0])}
+    staged = getattr(_STAGING, "gpu", None)
+    if staged is not None and device is not None and torch.device(device).type == "cpu":
+        return {"work_device": torch.device(staged)}
+    return {}
+
+
+@contextlib.contextmanager
+def quantize_staged_on(gpu):
+    """While the block runs, a model loaded onto the CPU with no GPUs of its own (quant_target) quantizes on `gpu`
+    and its weights still come back to the CPU. Block swap loads the transformer into RAM, and quantizing a bf16
+    source there runs on the CPU: PAN 2's 29B weights were not in NVFP4 after 4.7 minutes on 24 cores (measured).
+    Only where the work runs changes: quant "auto" still picks the format for a model on the CPU (the smallest GPU),
+    as before, which passing the GPU as quant_devices would have changed. None changes nothing. Per thread, so a
+    model another thread loads meanwhile is not affected."""
+    prev = getattr(_STAGING, "gpu", None)
+    _STAGING.gpu = gpu
+    try:
+        yield
+    finally:
+        _STAGING.gpu = prev
+
+
+def staging_gpu(cfg, device) -> str | None:
+    """The training GPU when a transformer is loaded into RAM for a run on a GPU (block swap passes device "cpu"),
+    for quantize_staged_on; None otherwise."""
+    if device is None or torch.device(device).type != "cpu" or torch.device(cfg.device).type != "cuda":
+        return None
+    return cfg.device
 
 
 def install_state(model: nn.Module, state: dict, quant: str, dtype=torch.bfloat16, min_dim: int = 1024,
@@ -326,6 +361,17 @@ TE_DROP = ("lm_head.", "visual.", "model.visual.", "mtp.", "model.mtp.", "langua
            "model.language_model.mtp.")
 
 
+def weight_only(model: nn.Module) -> nn.Module:
+    """A text encoder's quantized layers multiply with their weight dequantized (weight-only), as ComfyUI runs them:
+    no int8 or FP4 activations. The trainer makes W8A8 and native FP4 the default of every quantized layer built
+    after it reads the config, which is before the captions are cached, so an encoder would pick them up otherwise.
+    int8 activations moved Qwen-Image 2.1's cached features 5-8% (cosine 0.998) against weight-only on the same
+    file, at about the same caching time."""
+    Q.configure_int8(model, False)
+    Q.configure_nvfp4(model, False)
+    return model
+
+
 def take_state(state: dict, drop: tuple[str, ...]) -> dict:
     """The entries of `state` whose key does not start with `drop`, moved out of it (the caller's dict is emptied, so
     it does not keep the unquantized weights alive while install_state replaces them)."""
@@ -358,7 +404,7 @@ def build_text_model(state: dict, quant: str = "auto", device="cpu", work_device
     for name, p in model.named_parameters():
         if p.device.type == "meta":
             raise ValueError(f"Text encoder parameter {name} was not loaded")
-    return model.to(device).eval().requires_grad_(False)
+    return weight_only(model).to(device).eval().requires_grad_(False)
 
 
 def load_text_encoder_file(path: str | Path, device: str = "auto", quant: str = "auto"):

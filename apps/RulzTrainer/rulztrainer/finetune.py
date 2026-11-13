@@ -250,7 +250,9 @@ class FineTuner:
     def _frozen_module(self, slot: Slot, weight: torch.Tensor, bias) -> nn.Module:
         """The trunk's layer for a slot that is not training: re-quantized from original + delta."""
         if slot.fmt == "bf16":
-            lin = nn.Linear(slot.shape[1], slot.shape[0], bias=bias is not None)
+            # made on "meta": its weights are replaced at once, and a CPU layer made a random fp32 weight first, for
+            # every bf16 layer at every window rotation
+            lin = nn.Linear(slot.shape[1], slot.shape[0], bias=bias is not None, device="meta")
             lin.weight = nn.Parameter(weight.to(self.device, slot.compute_dtype), requires_grad=False)
             if bias is not None:
                 lin.bias = nn.Parameter(bias.to(self.device, slot.compute_dtype), requires_grad=False)

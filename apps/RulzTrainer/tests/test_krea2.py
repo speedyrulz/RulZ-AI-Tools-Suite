@@ -161,11 +161,14 @@ def test_lora_names_match_krea_layout_and_export(tmp_path):
     assert "transformer.final_layer.linear.lora_B.weight" in state and "transformer.img_in.lora_A.weight" in state
     assert "transformer.text_fusion.refiner_blocks.1.attn.to_q.lora_A.weight" in state
     assert "transformer.text_fusion.projector.lora_B.weight" in state
-    # merged into diffusers' model the PEFT way (W + alpha / r * B @ A), it predicts what our LoRA model predicts
+    # merged into diffusers' model the PEFT way (W + alpha / r * B @ A, with the file's alpha = r: alpha / rank of
+    # the training, 8 / 4, is folded into lora_B, as ComfyUI reads no alpha), it predicts what our LoRA model predicts
+    meta = L.read_peft_metadata(path)
+    assert meta["lora_alpha"] == meta["r"] == 4
     with torch.no_grad():
         for name in names:
             a, b = state[f"transformer.{name}.lora_A.weight"], state[f"transformer.{name}.lora_B.weight"]
-            ref.get_submodule(name).weight += (8.0 / 4) * b @ a
+            ref.get_submodule(name).weight += b @ a
         x, enc = torch.randn(1, 64, 2, 3), torch.randn(1, 5, 3, 40)
         got = ours(x, 400.0, enc, None)
         want = ref_call(ref, x, torch.tensor([0.4]), enc, None)
@@ -220,4 +223,4 @@ def test_pad_embeds_detection_and_cache_names(tmp_path):
     assert k_item.latent_path.name == m_item.latent_path.name.replace(".safetensors", "_qwenvae.safetensors")
     assert k_item.latent_flip_path.name.endswith("_flip_qwenvae.safetensors")
     assert k_item.region_path == m_item.region_path
-    assert D.text_cache_path(krea, "p").name.endswith("_krea2.safetensors")
+    assert D.text_cache_path(krea, "p").name.endswith("_krea2_wo.safetensors")

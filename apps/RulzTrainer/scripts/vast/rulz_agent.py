@@ -198,10 +198,13 @@ def machine_status() -> dict:
     disk = shutil.disk_usage(".")
     active = running_dir()
     datasets = Path("datasets")
+    names = sorted(p.name for p in datasets.iterdir() if p.is_dir() and not p.name.startswith("."))         if datasets.is_dir() else []  # not .rulz_incoming, where rulz_fleet.py unpacks a dataset before it is whole
     data = {"root": str(Path.cwd()), "webui_running": webui_running(), "gpus": gpus,
             "disk_free_gb": round(disk.free / 1e9, 1), "disk_total_gb": round(disk.total / 1e9, 1),
-            "datasets": sorted(p.name for p in datasets.iterdir() if p.is_dir()) if datasets.is_dir() else [],
-            "job_running": active is not None, "queue": queue_view(), "trainer": install_info(), "booted": booted()}
+            "datasets": names,
+            "dataset_marks": {n: mark for n in names if (mark := read_text(datasets / n / ".rulz_upload").strip())},
+            "job_running": active is not None, "queue": queue_view(), "trainer": install_info(), "booted": booted(),
+            "now": time.time()}  # the instance's clock, for comparing its file times with the fleet's
     update = update_state()
     if update:
         data["update"] = {k: update.get(k) for k in ("state", "started", "ended", "from", "to", "error", "note")
@@ -427,8 +430,9 @@ def cmd_poll(args) -> int:
 
 
 def cmd_files(args) -> int:
-    """A job's files to fetch: {"base": folder, "files": [{"path" under base, "size"}]}. --what picks logs (default),
-    probes, samples, maps (the training_maps folder), loras, best or all; --step keeps that step's images and LoRA."""
+    """A job's files to fetch: {"base": folder, "files": [{"path" under base, "size", "mtime"}]}. --what picks logs
+    (default), probes, samples, maps (the training_maps folder), loras, best or all; --step keeps that step's images
+    and LoRA."""
     d = job_dir(args.name)
     tag = f"{args.step:06d}" if args.step is not None else None
     what = set(args.what or ["logs"])
@@ -447,8 +451,11 @@ def cmd_files(args) -> int:
         picked += [p for p in loras if tag is None or tag in p.name]
     elif "best" in what:
         picked += [p for p in loras if p.stem.endswith("_best")]
-    show({"base": str(d.parent.resolve()), "files": [{"path": p.relative_to(d.parent).as_posix(), "size": p.stat().st_size}
-                                           for p in dict.fromkeys(picked)]})
+    files = []
+    for p in dict.fromkeys(picked):
+        st = p.stat()
+        files.append({"path": p.relative_to(d.parent).as_posix(), "size": st.st_size, "mtime": int(st.st_mtime)})
+    show({"base": str(d.parent.resolve()), "files": files})
     return 0
 
 

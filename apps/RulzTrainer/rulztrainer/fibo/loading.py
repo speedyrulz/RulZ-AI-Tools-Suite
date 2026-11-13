@@ -87,8 +87,8 @@ def load_transformer(model_dir: Path, device, quant: str = "auto", dtype=torch.b
 def load_text_encoder(model_dir: Path, device: str = "auto", quant: str = "auto"):
     """Qwen3-VL's language model + its processor: text only, from the folder's Qwen3VLForConditionalGeneration weights
     without the vision tower and the LM head (0.8 GB that prompts never use, and the LM head computed [S, 151936]
-    logits per prompt that were thrown away). quant int8/int8_convrot/nvfp4 quantizes its Linear layers (W8A8) so the
-    8.9 GB encoder takes about half the memory."""
+    logits per prompt that were thrown away). quant int8/int8_convrot/nvfp4 quantizes its Linear layers (run
+    weight-only) so the 8.9 GB encoder takes about half the memory."""
     from transformers import Qwen3VLProcessor
 
     from ..krea2.single_file import load_hf_text_model
@@ -171,12 +171,12 @@ def get_tokenizer(cfg: TrainConfig, model_dir: Path | None):
     return AutoTokenizer.from_pretrained(str(Path(model_dir) / "processor"))
 
 
-def prompt_tokens(tokenizer, prompt: str) -> tuple[str, list, int, int]:
-    """encode_prompt's text (the chat template around the cleaned prompt) with its token offsets; the cache keeps
-    every token."""
+def prompt_tokens(tokenizer, prompt: str, max_length: int = 4096) -> tuple[str, list, int, int]:
+    """encode_prompt's text (the chat template around the cleaned prompt) with its token offsets, cut where
+    encode_prompt cuts at the same max_length; the cache keeps every token it encoded."""
     tok = getattr(tokenizer, "tokenizer", tokenizer)  # a processor, or the tokenizer itself
     text = PROMPT_TEMPLATE.format(clean_prompt(prompt))
-    offsets = tok(text, return_offsets_mapping=True)["offset_mapping"]
+    offsets = tok(text, return_offsets_mapping=True)["offset_mapping"][: int(max_length)]
     return text, [tuple(o) for o in offsets], 0, len(offsets)
 
 
@@ -216,9 +216,10 @@ def get_transformer(cfg: TrainConfig, model_dir: Path | None, device: str | None
         if use_file:
             return fsf.load_transformer_file(cfg.transformer_file, "cpu", cfg.transformer_quant, quant_devices=gpus)
         return load_transformer(model_dir, "cpu", cfg.transformer_quant, quant_devices=gpus)
-    if use_file:
-        return fsf.load_transformer_file(cfg.transformer_file, device or cfg.device, cfg.transformer_quant)
-    return load_transformer(model_dir, device or cfg.device, cfg.transformer_quant)
+    with sf.quantize_staged_on(sf.staging_gpu(cfg, device)):  # block swap: quantized on the GPU, kept in RAM
+        if use_file:
+            return fsf.load_transformer_file(cfg.transformer_file, device or cfg.device, cfg.transformer_quant)
+        return load_transformer(model_dir, device or cfg.device, cfg.transformer_quant)
 
 
 def get_vae(cfg: TrainConfig, model_dir: Path | None):

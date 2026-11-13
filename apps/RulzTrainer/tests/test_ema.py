@@ -187,3 +187,26 @@ def test_data_parallel_replicas_render_with_the_average(tmp_path):
         assert all(torch.equal(p, s) for p, s in zip(params(rinj), trainer.ema.shadow))
     assert all(torch.equal(p, r) for p, r in zip(params(rinj), raw))
     assert all(torch.equal(p, r) for p, r in zip(params(inj), raw))
+
+
+def test_states_of_an_earlier_run_in_the_folder_leave_the_new_runs_states_alone(tmp_path):
+    """A job name used again: the earlier run's state_002000 must not make each new state delete itself."""
+    from rulztrainer.trainer import build_optimizer, build_scheduler
+
+    model, inj = lora()
+    trainer = _trainer(tmp_path, inj, model)
+    trainer.cfg.keep_states = 1
+    old = tmp_path / "state_002000"
+    old.mkdir()
+    (old / "train_state.pt").write_bytes(b"old")
+    stale = tmp_path / "state_000250"  # the earlier run's state of the same step: replaced whole
+    stale.mkdir()
+    (stale / "extra.bin").write_bytes(b"old")
+    opt = build_optimizer(trainer.cfg.__class__(optimizer="adamw"), list(L.lora_parameters(inj)))
+    sched = build_scheduler(trainer.cfg, opt)
+    gen, rng = torch.Generator().manual_seed(0), random.Random(0)
+    first = trainer.save_state(250, inj, opt, sched, gen, rng)
+    assert first.is_dir() and not (first / "extra.bin").exists() and old.is_dir()
+    second = trainer.save_state(500, inj, opt, sched, gen, rng)
+    assert second.is_dir() and not first.exists() and old.is_dir()
+    assert trainer.status.data["states"] == [str(second)]

@@ -495,6 +495,35 @@ def test_prompt_template_and_crop():
         PL.check_tokenizer(range(151_000))
 
 
+def test_text_length_is_pans_own_1536_at_the_default_max_token_length():
+    """The trainer's default max_token_length (1024) cut PAN 2's long structured captions, and its released
+    structured negative (about 1480 tokens), short of the 1536 the model reads: at that default PAN 2 encodes 1536;
+    another value is taken as asked, at most 1536. prompt_tokens cuts at the same length as the cache."""
+    assert PL.text_length(TrainConfig.max_token_length) == MAX_TEXT_TOKENS == 1536
+    assert PL.text_length(512) == 512 and PL.text_length(4096) == 1536 and PL.text_length(1536) == 1536
+    assert PL.text_length(0) == 1
+    tok, long = FakeTokenizer(), "x" * 5000
+    ids, start = PL.tokenize(tok, long, max_length=1024)
+    assert ids.numel() == start + 1536
+    _, offsets, dropped, kept = PL.prompt_tokens(tok, long, 1024)
+    assert dropped == start and kept == 1536 and len(offsets) == ids.numel()
+    assert PL.prompt_tokens(tok, long, 700)[3] == 700 and PL.prompt_tokens(tok, long)[3] == 1536
+
+    class Encoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(1, 1)
+
+        def forward(self, input_ids, attention_mask, **_):
+            hidden = input_ids.float().unsqueeze(-1) * attention_mask.unsqueeze(-1)
+            return type("Out", (), {"last_hidden_state": hidden})
+
+    rows = PL.encode_prompts(Encoder(), tok, [long, "a fox"], TrainConfig.max_token_length)
+    assert rows[0].shape[0] == 1536 == PL.prompt_tokens(tok, long, TrainConfig.max_token_length)[3]
+    assert rows[1].shape[0] == PL.prompt_tokens(tok, "a fox", TrainConfig.max_token_length)[3]
+    assert ARCH.prompt_tokens(tok, long)[3] == 1536  # what the trainer asks for at the default
+
+
 def test_negative_prompt_and_triggers():
     neg = json.loads(ARCH.default_negative)
     assert neg["events"][0]["time_range_sec"] == "0 to 0" and "watermark" in neg["video_style"]
@@ -505,7 +534,33 @@ def test_negative_prompt_and_triggers():
     with_trigger = json.loads(ARCH.add_trigger(structured, "ohwx"))
     assert with_trigger["subjects_lifecycle"][0]["display_name"] == "ohwx woman" and with_trigger["video_style"] == "film"
     assert ARCH.add_trigger(structured.replace("woman", "ohwx woman"), "ohwx") == structured.replace("woman", "ohwx woman")
-    assert ARCH.add_trigger('{"no": "subjects"}', "ohwx").startswith("ohwx, {")
+
+
+def test_trigger_is_matched_as_a_word_and_json_stays_json():
+    """"ana" inside "banana" is not the trigger; a structured caption without a subject keeps its JSON (the trigger
+    goes into its description, its first event, or a subject of its own), so it is not wrapped as plain text."""
+    assert ARCH.add_trigger("a banana on a table", "ana") == "ana, a banana on a table"
+    assert ARCH.add_trigger("ana holding a banana", "ana") == "ana holding a banana"
+    assert ARCH.add_trigger("portrait of <sks>, smiling", "<sks>") == "portrait of <sks>, smiling"
+    assert ARCH.add_trigger("portrait of x<sks>y", "<sks>") == "<sks>, portrait of x<sks>y"
+    assert ARCH.add_trigger("ohwx_2 on a beach", "ohwx") == "ohwx, ohwx_2 on a beach"  # a longer token
+    named = json.dumps({"subjects_lifecycle": [{"subject_id": "<|Subject1|>", "display_name": "bananas"}]})
+    assert json.loads(ARCH.add_trigger(named, "ana"))["subjects_lifecycle"][0]["display_name"] == "ana bananas"
+
+    described = ARCH.add_trigger('{"video_style": "film", "init_frame_visual_description": "a woman"}', "ohwx")
+    assert json.loads(described)["init_frame_visual_description"] == "ohwx, a woman"
+    evented = json.loads(ARCH.add_trigger('{"events": [{"event_description": "she waves"}]}', "ohwx"))
+    assert evented["events"][0]["event_description"] == "ohwx, she waves"
+    bare = ARCH.add_trigger('{"no": "subjects"}', "ohwx")
+    assert json.loads(bare) == {"no": "subjects", "subjects_lifecycle": [
+        {"subject_id": "<|Subject1|>", "display_name": "ohwx", "subject_attribute": ""}]}
+    assert PL.structured(bare) == bare  # still JSON: PAN 2 reads it verbatim instead of wrapping it
+    assert json.loads(ARCH.add_trigger('{"subjects_lifecycle": []}', "ohwx"))["subjects_lifecycle"][0][
+        "display_name"] == "ohwx"
+    # no field to put it in: an object with a subject list it cannot read, and text that is not JSON
+    assert ARCH.add_trigger('{"subjects_lifecycle": ["x"]}', "ohwx") == 'ohwx, {"subjects_lifecycle": ["x"]}'
+    assert ARCH.add_trigger("{a red fox}", "ohwx") == "ohwx, {a red fox}"
+    assert ARCH.add_trigger('["a", "list"]', "ohwx") == 'ohwx, ["a", "list"]'
 
 
 # ---------------------------------------------------------------- VAE

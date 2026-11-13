@@ -29,14 +29,24 @@ def _job(tmp_path: Path, probes: bool = True, maps: bool = True, dataset: bool =
                       learning_rate=5e-05, lora_rank=8, probe_every=10, probe_seeds=3, region_watch=True).to_dict()
     (job / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
     records = []
+    prefix = racer + "_" if racer else ""
     for i, step in enumerate((0, 10, 20, 30, 40)):
         body = [20.0 + 5 * i, None if step >= 30 else 25.0 + 5 * i, 30.0 + i]
+        images = [f"output/demo run/probes/{prefix}step{step:06d}_{kind}_{k}.png" for kind in ("face", "body")
+                  for k in range(3)]
         records.append({"step": step, "face": 50.0 + i, "body": 25.0, "combined": 30.0 + 4 * i, "face_ema": 50.0 + i,
                         "body_ema": 25.0, "combined_ema": 28.0 + 4 * i - (9 if step == 40 else 0), "best": 40.0,
                         "best_step": 30, "face_norm": 10.0 * i, "body_norm": 25.0, "face_norm_ema": 10.0 * i,
                         "body_norm_ema": 25.0, "face_norm_seeds": [10.0 * i, 12.0 * i + 1, 8.0 * i],
-                        "body_norm_seeds": body, "copy": 0.4 + 0.07 * i, "body_probes": 3,
-                        "body_missing": sum(v is None for v in body)})
+                        "body_norm_seeds": body, "body_seeds": [None if v is None else 80.0 + v / 10 for v in body],
+                        "copy": 0.4 + 0.07 * i, "body_probes": 3, "body_missing": sum(v is None for v in body),
+                        "images": images})
+        if racer:
+            # the other configuration, probed after the winner at the same own steps each round until it left for
+            # drift after round 5: the file's last record is its, with its own best
+            records.append({"step": step, "face": 40.0, "body": 20.0, "combined": 22.0, "combined_ema": 22.0,
+                            "best": 22.0, "best_step": 10, "body_norm_seeds": [1.0, 2.0, 3.0],
+                            "images": [p.replace(prefix, "other_") for p in images]})
         if probes:
             for k in range(3):
                 _png(job / "probes" / f"{racer + '_' if racer else ''}step{step:06d}_face_{k}.png", (64, 64), (40 * k, 90, 120))
@@ -46,9 +56,10 @@ def _job(tmp_path: Path, probes: bool = True, maps: bool = True, dataset: bool =
               "losses": [0.3 - 0.002 * i for i in range(40)], "saved": ["output/demo run/demo run.safetensors"],
               "run_id": "demo_run-20260102-030405", "peak_mem": {"cuda:0": 9.5},
               "near_duplicates": {"count": 2}}
-    if racer:
-        status["race"] = {"names": [racer, "other"], "champion": racer, "dropped": {"other": 2},
-                          "left": {"other": "drift"}, "best": {racer: 40.0, "other": 22.0}}
+    if racer:  # the keys RaceSchedule.state() writes (the trainer's _race_status)
+        status["race"] = {"names": [racer, "other"], "winner": racer, "last": racer, "alive": [racer],
+                          "dropped": {"other": 5}, "drifted": ["other"], "manual": [], "stale": [], "finished": [],
+                          "best": {racer: 40.0, "other": 22.0}, "best_step": {racer: 30, "other": 10}}
     (job / "status.json").write_text(json.dumps(status), encoding="utf-8")
     (job / "train.log").write_text(
         "10:00:00 INFO step 10/40 loss 0.25 avg 0.26 lr 5.00e-05 grad 0.02 0.4s/it\n"
@@ -117,11 +128,45 @@ def test_a_race_shows_its_winner_and_the_command_line_writes_one_file(tmp_path, 
     run = R.load(job)
     assert R.racers(run) == ["seed43"] and R.steps_shown(run, 3, "seed43") == [0, 30, 40]
     assert any("Race won by seed43" in t for _, t in R.verdict(run))
+    # the trainer writes "winner"; the file's last record is the other configuration's, with its own best
+    assert R.race_winner(run) == "seed43" and run.probes[-1]["best"] == 22.0
+    assert R.best(run) == (40.0, 30)
+    # both configurations were probed at step 30 of their own: each record is found by its racer
+    assert R.seed_scores(R.record_at(run, 30, "seed43"), "body") == [35.0, None, 33.0]
+    assert R.record_at(run, 30, "other")["best"] == 22.0 and R.record_at(run, 30) == {}
+    assert R.is_best(run, "seed43", 30) and not R.is_best(run, "other", 30) and not R.is_best(run, "seed43", 20)
+    assert R.generate(job, out_dir=tmp_path / "picture", pdf_file=False)["image"].is_file()
     assert R.main([str(job), "--pdf"]) == 0
     out = capsys.readouterr().out.strip().splitlines()
     assert len(out) == 1 and out[0].endswith("demo_run_report.pdf") and Path(out[0]).is_file()
     assert not (job / "report" / "demo_run_report.png").exists()
     assert R.main([str(tmp_path / "missing")]) == 1 and "no report" in capsys.readouterr().err
+
+
+def test_the_best_checkpoint_is_the_race_winner_s():
+    def rec(name, step, best, best_step):
+        prefix = f"{name}_" if name else ""
+        return {"step": step, "best": best, "best_step": best_step,
+                "images": [f"output/job/probes/{prefix}step{step:06d}_face_0.png"]}
+
+    probes = [rec("a", 10, 30.0, 10), rec("b", 10, 50.0, 10), rec("a", 20, 35.0, 20), rec("", 30, 45.0, 30)]
+    race = {"names": ["a", "b"], "winner": "a", "last": "a"}
+    run = R.Run(Path("job"), Path("."), status={"race": race}, probes=probes)
+    # a won and trained on after the race: its probes then carry no name and hold its latest best
+    assert R.best_racers(run) == {"a", ""} and R.best(run) == (45.0, 30) and R.is_best(run, "", 30)
+    # a race decided at the end that b won on an earlier best, while a was the last one racing
+    run = R.Run(Path("job"), Path("."), status={"race": {**race, "winner": "b"}}, probes=probes)
+    assert R.best_racers(run) == {"b"} and R.best(run) == (50.0, 10) and not R.is_best(run, "", 30)
+    # no winner decided yet: the latest probe's configuration, as before
+    run = R.Run(Path("job"), Path("."), status={"race": {**race, "winner": None}}, probes=probes[:3])
+    assert R.best_racers(run) == {"a"} and R.best(run) == (35.0, 20)
+    # the winner's records fell out of status.json's last probes: the race's own best
+    run = R.Run(Path("job"), Path("."), probes=probes[1:2],
+                status={"race": {**race, "winner": "a", "best": {"a": 44.0}, "best_step": {"a": 25}}})
+    assert R.best(run) == (44.0, 25)
+    # outside a race every record is the run's own
+    run = R.Run(Path("job"), Path("."), probes=[rec("", 10, 12.0, 10), rec("", 20, 15.0, 20)])
+    assert R.best_racers(run) == {""} and R.best(run) == (15.0, 20) and R.record_at(run, 10)["best"] == 12.0
 
 
 def test_the_setting_is_off_by_default_and_round_trips():
