@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 from pathlib import Path
 from typing import Iterable
 
@@ -38,6 +39,13 @@ ARCH_NAMES += ("pan2",)
 
 def _match_suffix(name: str, suffixes: Iterable[str]) -> bool:
     return any(name == s or name.endswith("." + s) for s in suffixes)
+
+
+def contains_word(text: str, word: str) -> bool:
+    """Does `text` hold `word` as a whole word ("ana" is not in "banana")? No word character may touch it on either
+    side: lookarounds rather than word boundaries, which would miss a trigger that starts or ends with punctuation
+    ("<sks>")."""
+    return bool(word) and re.search(rf"(?<!\w){re.escape(word)}(?!\w)", text) is not None
 
 
 class Arch:
@@ -81,10 +89,12 @@ class Arch:
         """The text encoder's tokenizer alone (a few MB), for finding the trigger word's tokens."""
         return self._loading.get_tokenizer(cfg, model_dir)
 
-    def prompt_tokens(self, tokenizer, prompt: str) -> tuple[str, list, int, int]:
-        """(text, token offsets, leading tokens the cache drops, cached length) of a prompt as encode_prompt forms it,
-        so a word's tokens can be found in the cached features."""
-        return self._loading.prompt_tokens(tokenizer, prompt)
+    def prompt_tokens(self, tokenizer, prompt: str, max_length: int | None = None) -> tuple[str, list, int, int]:
+        """(text, token offsets, leading tokens the cache drops, cached length) of a prompt as encode_prompt forms it
+        at max_length (the run's max_token_length; None: the config's default), so a word's tokens can be found in
+        the cached features: a long caption is cut where its cache was cut, and its positions stay inside it."""
+        return self._loading.prompt_tokens(tokenizer, prompt,
+                                           TrainConfig.max_token_length if max_length is None else int(max_length))
 
     def encode_images(self, vae, images: torch.Tensor) -> torch.Tensor:
         from .moss.loading import encode_images
@@ -264,9 +274,10 @@ class MossArch(Arch):
         z = torch.randn(n * 4, generator=gen) * 0.95 - 1.09
         s = torch.sigmoid(-z)
         s = s[s <= 0.95][:n] / 0.95
-        while s.numel() < n:  # pathological draw: top up
+        while s.numel() < n:  # pathological draw: top up, truncated and rescaled the same way
             z = torch.randn(n * 4, generator=gen) * 0.95 - 1.09
-            s = torch.cat([s, torch.sigmoid(-z)[:n]])[:n]
+            more = torch.sigmoid(-z)
+            s = torch.cat([s, more[more <= 0.95] / 0.95])[:n]
         u = torch.rand(n, generator=gen)
         return torch.where(u < 0.01, torch.rand(n, generator=gen), s)
 
@@ -1383,19 +1394,48 @@ class Pan2Arch(Arch):
 
     def add_trigger(self, caption, trigger):
         """A plain caption gets the trigger in front. A structured (JSON) caption stays valid JSON: the trigger goes
-        in front of its first subject's display name."""
-        if not trigger or trigger in (caption or ""):
+        in front of its first subject's display name; without a subject, in front of its first-frame description,
+        else of its first event's description; with neither, it becomes the display name of a subject of its own
+        (the skeleton's <|Subject1|>). A caption that names the trigger as a word already is left alone.
+
+        Only a caption that does not parse as a JSON object gets the trigger in front: "trigger, {..." then reads as
+        plain text and is wrapped (structured), since there is no field to put it in."""
+        if not trigger or contains_word(caption or "", trigger):
             return caption
         text = (caption or "").strip()
         if text.startswith("{"):
             try:
                 data = json.loads(text)
-                subject = data["subjects_lifecycle"][0]
-                subject["display_name"] = f"{trigger} {subject.get('display_name', '')}".strip()
+            except ValueError:
+                data = None
+            if isinstance(data, dict) and self._trigger_into(data, trigger):
                 return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-            except (ValueError, KeyError, IndexError, TypeError, AttributeError):
-                pass
         return super().add_trigger(caption, trigger)
+
+    @staticmethod
+    def _trigger_into(data: dict, trigger: str) -> bool:
+        """Put the trigger into a structured caption (add_trigger's order); False when it has no place for it."""
+        def front(text: str) -> str:
+            return f"{trigger}, {text}" if text.strip() else trigger
+
+        subjects = data.get("subjects_lifecycle")
+        if isinstance(subjects, list) and subjects and isinstance(subjects[0], dict):
+            name = subjects[0].get("display_name")
+            subjects[0]["display_name"] = f"{trigger} {name if isinstance(name, str) else ''}".strip()
+            return True
+        if isinstance(data.get("init_frame_visual_description"), str):
+            data["init_frame_visual_description"] = front(data["init_frame_visual_description"])
+            return True
+        events = data.get("events")
+        first = events[0] if isinstance(events, list) and events else None
+        if isinstance(first, dict) and isinstance(first.get("event_description"), str):
+            first["event_description"] = front(first["event_description"])
+            return True
+        if subjects is None or subjects == []:
+            data["subjects_lifecycle"] = [{"subject_id": "<|Subject1|>", "display_name": trigger,
+                                           "subject_attribute": ""}]
+            return True
+        return False
 
     def lora_module_names(self, model, targets, blocks, include_text_embedder=False):
         from .lora import _is_linear_like

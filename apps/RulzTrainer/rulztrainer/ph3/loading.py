@@ -128,9 +128,10 @@ def get_transformer(cfg: TrainConfig, model_dir: Path | None, device: str | None
 
         quant_devices, device = parse_devices(cfg.devices, cfg.device), "cpu"
     device = device or cfg.device
-    if use_file:
-        return load_transformer_file(cfg.transformer_file, device, cfg.transformer_quant, quant_devices)
-    return load_transformer(model_dir, device, cfg.transformer_quant, quant_devices)
+    with sf.quantize_staged_on(sf.staging_gpu(cfg, device)):  # block swap: quantized on the GPU, kept in RAM
+        if use_file:
+            return load_transformer_file(cfg.transformer_file, device, cfg.transformer_quant, quant_devices)
+        return load_transformer(model_dir, device, cfg.transformer_quant, quant_devices)
 
 
 def load_any_transformer(path: str, device, quant: str = "auto", models_dir: str = "models"):

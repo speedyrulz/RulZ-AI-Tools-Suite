@@ -27,6 +27,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
+import hashlib
+import io
 import json
 import os
 import shlex
@@ -36,6 +39,7 @@ import sys
 import tarfile
 import threading
 import time
+import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -50,6 +54,8 @@ AGENT_COMMANDS = {"status", "jobs", "job", "log", "probes", "config", "start", "
 CONFIG_SLOT = b'SENT_CONFIG = ""'  # the line of rulz_agent.py that takes a local config
 SSH_FAILED = 255  # ssh's own exit status: it could not connect, or the connection dropped
 SYNC_PATHS = ("rulztrainer", "webui.py", "scripts", "requirements.txt")  # what a run needs of the code
+VASTAI_TIMEOUT = 120  # seconds for one vastai CLI call: a hung API request must not hold up every look after it
+UPLOAD_MARK = ".rulz_upload"  # in a dataset sent by rulz_fleet.py: dataset_digest() of what was sent
 
 
 class Unreachable(Exception):
@@ -63,7 +69,11 @@ def vastai(*args: str) -> str:
     exe = shutil.which("vastai")
     if exe is None:
         raise Unreachable("The vastai CLI is not installed: pip install vastai && vastai set api-key <your key>")
-    done = subprocess.run([exe, *args], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    try:
+        done = subprocess.run([exe, *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=VASTAI_TIMEOUT)
+    except subprocess.TimeoutExpired as e:
+        raise Unreachable(f"vastai {args[0]} did not answer in {VASTAI_TIMEOUT} s") from e
     if done.returncode != 0:
         raise Unreachable(f"vastai {args[0]} failed: {(done.stderr or done.stdout).strip()[:300]}")
     return done.stdout
@@ -263,10 +273,18 @@ def attach_key(args) -> int:
 
 
 def pull_plan(files: list[dict], dest: Path) -> list[dict]:
-    """The listed files that are not here yet at their size: a log that grew comes again, a probe image does not."""
+    """The listed files that are not here yet at their size and time: a log that grew comes again, a probe image does
+    not, and neither does a LoRA of the same size unless the run was made again (an --overwrite run of the same name
+    writes files of the same size). tar keeps a file's time, so a fetched copy has the instance's; 2 s of slack for a
+    FAT drive. A listing without "mtime" (an older agent) leaves the size alone to decide."""
     def here(entry: dict) -> bool:
         path = dest / entry["path"]
-        return path.is_file() and path.stat().st_size == entry["size"]
+        if not path.is_file():
+            return False
+        st = path.stat()
+        if st.st_size != entry["size"]:
+            return False
+        return entry.get("mtime") is None or abs(st.st_mtime - entry["mtime"]) <= 2
 
     return [f for f in files if not here(f)]
 
@@ -326,19 +344,80 @@ def without_hidden(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
     return tar_info_for_instance(info)
 
 
-def send(remote: Remote, items: list[tuple[Path, str]], target: str, hidden: bool = True) -> None:
+def dataset_digest(path: Path) -> str:
+    """What a dataset folder holds, as send(hidden=False) sends it: each file below it by path, size and time (hidden
+    files and folders left out, as send leaves them out). rulz_fleet.py keeps it with the copy it sends, so a folder
+    changed here since (captions fixed, pictures added) is not taken for the copy already on an instance."""
+    root = Path(path)
+    rows = []
+    if root.is_file():
+        st = root.stat()
+        rows.append(f"{root.name}\t{st.st_size}\t{int(st.st_mtime)}")
+    for folder, dirs, names in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for name in sorted(names):
+            if name.startswith("."):
+                continue
+            file = Path(folder) / name
+            try:
+                st = file.stat()
+            except OSError:
+                continue
+            rows.append(f"{file.relative_to(root).as_posix()}\t{st.st_size}\t{int(st.st_mtime)}")
+    return hashlib.sha1("\n".join(rows).encode("utf-8")).hexdigest()[:16]
+
+
+def _pipe_gone(e: OSError) -> bool:
+    """A write into ssh that failed because ssh (or the far end) went away, not because a file here could not be read:
+    Windows reports a pipe with no reader as EINVAL, POSIX as EPIPE."""
+    return isinstance(e, (BrokenPipeError, ConnectionResetError)) or (
+        getattr(e, "filename", None) is None and e.errno in (errno.EPIPE, errno.EINVAL))
+
+
+def send(remote: Remote, items: list[tuple[Path, str]], target: str, hidden: bool = True, *, staged: bool = False,
+         marks: dict[str, str] | None = None) -> None:
     """Stream local paths, each with its name in the archive, into a folder on the instance; hidden=False leaves
-    out hidden files and folders below each item."""
+    out hidden files and folders below each item. staged=True unpacks into a hidden folder beside them first and
+    moves each item into place only once all of it is there, so a dropped connection leaves no half copy under the
+    item's name for the next look to take as sent (stage folders left by a dropped copy go after 6 hours); marks
+    puts a small UPLOAD_MARK file holding the given text into each named item.
+
+    A file here that can't be read (moved, locked, shrunk while it was read) stops the copy with SystemExit: it used
+    to be taken for the far end going away, which left ssh waiting for the rest of the archive."""
     quoted = shlex.quote(target)
-    proc = subprocess.Popen(remote.command(f"mkdir -p {quoted} && tar -xf - -C {quoted}"), stdin=subprocess.PIPE)
+    if staged:
+        incoming = f"{target}/.rulz_incoming"
+        stage = f"{incoming}/{uuid.uuid4().hex[:12]}"
+        moves = " && ".join(f"rm -rf {shlex.quote(f'{target}/{name}')} && "
+                            f"mv {shlex.quote(f'{stage}/{name}')} {shlex.quote(f'{target}/{name}')}"
+                            for _, name in items) or "true"
+        shell = (f"{{ find {shlex.quote(incoming)} -mindepth 1 -maxdepth 1 -mmin +360 -exec rm -rf {{}} + "
+                 f"2>/dev/null || true; }} && mkdir -p {shlex.quote(stage)} && "
+                 f"{{ tar -xf - -C {shlex.quote(stage)} && {moves}; }}; rc=$?; rm -rf {shlex.quote(stage)}; exit $rc")
+    else:
+        shell = f"mkdir -p {quoted} && tar -xf - -C {quoted}"
+    proc = subprocess.Popen(remote.command(shell), stdin=subprocess.PIPE)
     keep = tar_info_for_instance if hidden else without_hidden
     try:
         with tarfile.open(fileobj=proc.stdin, mode="w|") as tar:
             for path, name in items:
                 tar.add(path, arcname=name, filter=keep)
-        proc.stdin.close()
-    except OSError:  # the other end went away: its exit status says so below
-        pass
+                mark = (marks or {}).get(name)
+                if mark is not None:
+                    data = mark.encode("utf-8")
+                    info = tar_info_for_instance(tarfile.TarInfo(f"{name}/{UPLOAD_MARK}"))
+                    info.size, info.mtime = len(data), int(time.time())
+                    tar.addfile(info, io.BytesIO(data))
+    except OSError as e:
+        if not _pipe_gone(e):  # a file here, not the far end: stop rather than send part of it
+            proc.kill()
+            proc.wait()
+            raise SystemExit(f"Could not read {getattr(e, 'filename', None) or 'a file'} here: {e}") from e
+    finally:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
     if proc.wait() != 0:
         raise SystemExit(f"tar on the instance ended with {proc.returncode}: the copy may be incomplete")
 

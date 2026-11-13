@@ -333,7 +333,7 @@ def _build_text_encoder(state: dict, device, quant: str, source: str):
 
     model = build_text_model(state, "none" if quant == "auto" else quant, "cpu", config=qsf.text_config(),
                              work_device=sf.quant_target(device).get("work_device"))
-    Q.configure_int8(model, qsf.TE_INT8_MATMUL)
+    sf.weight_only(model)  # int8 and nvfp4 layers alike: no int8 / FP4 activations (build_text_model does it too)
     log.info("Loaded Qwen3-VL-8B text encoder from %s (%d layers, fp8 release weights dequantized)", source,
              model.config.num_hidden_layers)
     return place_text_encoder(model, device)

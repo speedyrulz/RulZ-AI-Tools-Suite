@@ -17,7 +17,8 @@ Text features: diffusers' Flux3TextEncoderStep. The prompt goes through Qwen3-VL
 with the generation prompt ("<|im_start|>user\\n{prompt}<|im_end|>\\n<|im_start|>assistant\\n", no system turn),
 is right-padded with the pad token to a multiple of 80 tokens (at most max_length) and runs with the padding masked
 inside Qwen3-VL and the padding's position ids set to 1 (the training environment's). Hidden layers 4, 8, ..., 32
-are stacked per token along the channels: [S, 8 * 2560 = 20480]. FLUX 3 attends to the padding rows (they are part of
+are stacked per token along the channels: [S, 8 * 2560 = 20480]; the encoder is built to layer 32 only (TE_LAYERS),
+without the final norm. FLUX 3 attends to the padding rows (they are part of
 the recipe), so the cache keeps the whole padded window; only a batch's extra padding is masked in the DiT. There is
 no pooled embedding. The trainer does not run BFL's prompt upsampler (flux-3-image-klein-pup): captions should be
 full scene captions (framing, subject, background, lighting).
@@ -54,6 +55,7 @@ AUTO_BF16_FROM_GB, AUTO_INT8_FROM_GB = 15, 9.5
 PROMPT_PREFIX = "<|im_start|>user\n"
 PROMPT_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n"
 SELECT_LAYERS = (4, 8, 12, 16, 20, 24, 28, 32)  # config.json text_encoder.layers
+TE_LAYERS = max(SELECT_LAYERS)  # Qwen3-VL-4B is built to layer 32 of its 36: the last 4 never reach a feature
 PAD_MULTIPLE = 80  # config.json text_encoder.pad_multiple
 MAX_TOKENS = 8192  # the pipeline's max_sequence_length (the trainer's max_token_length caps it)
 HF_PATTERNS = ["*.json", "transformer/*", "text_encoder/*", "vae/*", "LICENSE.md", "NOTICE.md"]
@@ -179,7 +181,7 @@ def load_text_encoder(model_dir: Path, device: str = "auto", quant: str = "auto"
 
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir / "text_encoder"))
     fmt = "none" if quant == "auto" else quant
-    model = load_hf_text_model(model_dir / "text_encoder", fmt, device)
+    model = load_hf_text_model(model_dir / "text_encoder", fmt, device, layers=TE_LAYERS)
     if fmt != "none":
         n = sum(1 for m in model.modules() if isinstance(m, Q.QuantLinear))
         log.info("Text encoder: %d Linear layers quantized to %s", n, fmt)
@@ -254,13 +256,14 @@ def get_tokenizer(cfg: TrainConfig, model_dir: Path | None):
     return AutoTokenizer.from_pretrained(str(_need_dir(cfg, model_dir, "tokenizer") / "text_encoder"))
 
 
-def prompt_tokens(tokenizer, prompt: str) -> tuple[str, list, int, int]:
-    """encode_prompt's text (the whole chat template) with its token offsets; the cache keeps every token and the
-    padding up to the window (at the default max_token_length, 1024)."""
+def prompt_tokens(tokenizer, prompt: str, max_length: int = MAX_TOKENS) -> tuple[str, list, int, int]:
+    """encode_prompt's text (the whole chat template) with its token offsets, cut where encode_prompt cuts at the
+    same max_length; the cache keeps every token and the padding up to the window."""
     tok = getattr(tokenizer, "tokenizer", tokenizer)
     text = chat_text(prompt)
-    offsets = tok(text, return_offsets_mapping=True)["offset_mapping"]
-    return text, [tuple(o) for o in offsets], 0, window_length(len(offsets), 1024)
+    limit = min(int(max_length), MAX_TOKENS)
+    offsets = tok(text, return_offsets_mapping=True)["offset_mapping"][:limit]
+    return text, [tuple(o) for o in offsets], 0, window_length(len(offsets), limit)
 
 
 def pad_embeds(rows: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -320,10 +323,11 @@ def get_transformer(cfg: TrainConfig, model_dir: Path | None, device: str | None
             return _trainable(fsf.load_transformer_file(cfg.transformer_file, "cpu", cfg.transformer_quant,
                                                         quant_devices=gpus), source)
         return _trainable(load_transformer(model_dir, "cpu", cfg.transformer_quant, quant_devices=gpus), source)
-    if use_file:
-        return _trainable(fsf.load_transformer_file(cfg.transformer_file, device or cfg.device,
-                                                    cfg.transformer_quant), source)
-    return _trainable(load_transformer(model_dir, device or cfg.device, cfg.transformer_quant), source)
+    with sf.quantize_staged_on(sf.staging_gpu(cfg, device)):  # block swap: quantized on the GPU, kept in RAM
+        if use_file:
+            return _trainable(fsf.load_transformer_file(cfg.transformer_file, device or cfg.device,
+                                                        cfg.transformer_quant), source)
+        return _trainable(load_transformer(model_dir, device or cfg.device, cfg.transformer_quant), source)
 
 
 def get_vae(cfg: TrainConfig, model_dir: Path | None):

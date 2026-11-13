@@ -13,7 +13,8 @@ encoder and VAE as single files and is not.
 Text features, where ComfyUI, diffusers and ai-toolkit agree: the prompt goes through Qwen3's chat template as one user
 turn, thinking off ("<|im_start|>user\\n{prompt}<|im_end|>\\n<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n"), is
 right-padded with the pad token to 512 tokens (cut at 512) and runs with the padding masked inside Qwen3. Hidden layers
-9, 18, 27 are stacked per token: [512, 3 * 4096 = 12288]. Klein attends to the padding rows, so the cache keeps all 512.
+9, 18, 27 are stacked per token: [512, 3 * 4096 = 12288] (the encoder is built to layer 27 only, single_file.TE_LAYERS).
+Klein attends to the padding rows, so the cache keeps all 512.
 Fizgig also runs these layers through Qwen3's final RMSNorm; ComfyUI (layer_norm_hidden_state=False), diffusers and
 ai-toolkit do not, and ComfyUI is where the LoRAs are used, so neither does this.
 """
@@ -195,11 +196,12 @@ def get_tokenizer(cfg: TrainConfig, model_dir: Path | None):
     return AutoTokenizer.from_pretrained(str(model_dir / "tokenizer"))
 
 
-def prompt_tokens(tokenizer, prompt: str) -> tuple[str, list, int, int]:
-    """encode_prompt's text (the whole chat template) with its token offsets; the cache keeps all 512 rows."""
+def prompt_tokens(tokenizer, prompt: str, max_length: int = MAX_TOKENS) -> tuple[str, list, int, int]:
+    """encode_prompt's text (the whole chat template) with its token offsets, cut where encode_prompt cuts at the
+    same max_length (a token past the cut is a padding row in the cache); the cache keeps all 512 rows."""
     tok = getattr(tokenizer, "tokenizer", tokenizer)
     text = chat_text(prompt)
-    offsets = tok(text, return_offsets_mapping=True)["offset_mapping"]
+    offsets = tok(text, return_offsets_mapping=True)["offset_mapping"][: min(int(max_length), MAX_TOKENS)]
     return text, [tuple(o) for o in offsets], 0, MAX_TOKENS
 
 
@@ -246,10 +248,11 @@ def get_transformer(cfg: TrainConfig, model_dir: Path | None, device: str | None
             return _trainable(fsf.load_transformer_file(cfg.transformer_file, "cpu", cfg.transformer_quant,
                                                         quant_devices=gpus), source)
         return _trainable(load_transformer(model_dir, "cpu", cfg.transformer_quant, quant_devices=gpus), source)
-    if use_file:
-        return _trainable(fsf.load_transformer_file(cfg.transformer_file, device or cfg.device,
-                                                    cfg.transformer_quant), source)
-    return _trainable(load_transformer(model_dir, device or cfg.device, cfg.transformer_quant), source)
+    with sf.quantize_staged_on(sf.staging_gpu(cfg, device)):  # block swap: quantized on the GPU, kept in RAM
+        if use_file:
+            return _trainable(fsf.load_transformer_file(cfg.transformer_file, device or cfg.device,
+                                                        cfg.transformer_quant), source)
+        return _trainable(load_transformer(model_dir, device or cfg.device, cfg.transformer_quant), source)
 
 
 def get_vae(cfg: TrainConfig, model_dir: Path | None):

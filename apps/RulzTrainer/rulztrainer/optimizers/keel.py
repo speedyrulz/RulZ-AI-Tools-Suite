@@ -183,8 +183,10 @@ def gauge_precondition(g_down: torch.Tensor, g_up: torch.Tensor, down: torch.Ten
     m_down = B.T @ B  # [r, r]: scales g_down
     delta = torch.maximum(m_up.diagonal().mean(), m_down.diagonal().mean()) * eps + GAUGE_FLOOR
     eye = torch.eye(r, device=A.device, dtype=torch.float32)
-    new_up = torch.linalg.solve(m_up + delta * eye, gu.T).T  # g_up M^-1, M symmetric
-    new_down = torch.linalg.solve(m_down + delta * eye, gd)
+    # solve_ex without its error check: solve checked the result on the host, two GPU syncs per LoRA pair and step
+    # (M + delta I is positive definite, never singular; a NaN gradient stays NaN for the caller's nan_to_num_)
+    new_up = torch.linalg.solve_ex(m_up + delta * eye, gu.T, check_errors=False)[0].T  # g_up M^-1, M symmetric
+    new_down = torch.linalg.solve_ex(m_down + delta * eye, gd, check_errors=False)[0]
     return new_down, new_up
 
 

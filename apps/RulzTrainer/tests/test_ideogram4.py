@@ -599,7 +599,7 @@ def test_dataset_captions_caches_buckets_and_downloads(tmp_path):
     assert a.latent_path.name.endswith("_ideo4.safetensors")  # not MOSS / FIBO's Flux2 latents
     assert json.loads(a.caption)["compositional_deconstruction"]["elements"] == [{"type": "obj", "desc": "zxc"}]
     assert json.loads(b.caption)["compositional_deconstruction"]["elements"][0]["desc"] == "zxc, A bicycle."
-    assert D.text_cache_path(cfg, "p").name.endswith("_ideogram4.safetensors")
+    assert D.text_cache_path(cfg, "p").name.endswith("_ideogram4_wo.safetensors")
     assert D.empty_text_path(cfg) == D.text_cache_path(cfg, P.EMPTY_CAPTION)
     assert json.loads(D.dropout_prompt(cfg))["compositional_deconstruction"]["elements"] == [
         {"type": "obj", "desc": "zxc"}]

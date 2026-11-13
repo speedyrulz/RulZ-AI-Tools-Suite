@@ -307,6 +307,35 @@ def test_patience_drops_each_one_when_it_stalls_and_the_best_ever_wins():
     assert s.decide({2: 30.0}) == 2  # a tie goes to the one that trained to the end
 
 
+def test_a_configuration_dropped_by_hand_cannot_win_on_an_earlier_best():
+    """In a race decided at the end (race_patience_drop, or race_drop_lowest off) the winner was the best score among
+    everyone but the drifted ones, so one taken out with the Monitor's Drop button could still win and be copied to
+    <job>_best.safetensors."""
+    s = R.RaceSchedule(["a", "b", "c"], warmup=0, drop_lowest=False, total_steps=100)
+    assert s.keeps_all
+    s.record(0, 60.0, 10, best=60.0, best_step=10, since_improve=0)
+    s.record(1, 30.0, 10, best=30.0, best_step=10, since_improve=0)
+    s.record(2, 40.0, 10, best=40.0, best_step=10, since_improve=0)
+    s.drop(0)  # a had the highest score, and you dropped it
+    s.drop(1)
+    assert s.done and s.manual == {0, 1}
+    assert s.decide({0: 60.0, 1: 30.0, 2: 45.0}) == 2 and s.state()["winner"] == "c"
+    # patience drops with the round's lowest leaving too: a dropped by hand mid-round, b the round's lowest
+    s = R.RaceSchedule(["a", "b", "c"], warmup=0, patience=2, total_steps=100)
+    assert s.keeps_all
+    s.record(0, 60.0, 10, best=60.0, best_step=10, since_improve=0)
+    s.drop(0)
+    s.record(1, 30.0, 10, best=30.0, best_step=10, since_improve=0)
+    assert s.record(2, 40.0, 10, best=40.0, best_step=10, since_improve=0) == 1 and s.done
+    assert s.decide({0: 60.0, 1: 30.0, 2: 45.0}) == 2  # a's 60 does not count; b's 30 still could have
+    # dropped by hand or for drift, everyone with a score: the highest of them all, rather than no winner
+    s = R.RaceSchedule(["a", "b"], warmup=0, drop_lowest=False, total_steps=100)
+    s.record(0, 50.0, 10, best=50.0, best_step=10, since_improve=0)
+    s.record(1, 20.0, 10, best=None, since_improve=0)
+    s.drop(0)
+    assert s.decide() == 0
+
+
 def test_without_dropping_the_lowest_everyone_trains_all_the_steps():
     s = R.RaceSchedule(["a", "b", "c"], warmup=0, drop_lowest=False, total_steps=20)
     for step in (10, 20):

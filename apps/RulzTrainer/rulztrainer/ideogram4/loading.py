@@ -35,6 +35,7 @@ import torch
 from ..config import TrainConfig
 from ..downloads import component_ready
 from ..moss import loading as moss_loading
+from ..moss import single_file as sf
 from . import prompts
 from . import single_file as isf
 from .model import Ideogram4Transformer
@@ -264,15 +265,16 @@ def get_tokenizer(cfg: TrainConfig, model_dir: Path | None):
     return AutoTokenizer.from_pretrained(str(_need_dir(cfg, model_dir, "tokenizer") / "tokenizer"))
 
 
-def prompt_tokens(tokenizer, prompt: str) -> tuple[str, list, int, int]:
-    """encode_prompt's text (the chat turn up to and including the caption; its end follows) with its token offsets;
-    the cache keeps every token."""
+def prompt_tokens(tokenizer, prompt: str, max_length: int = 1024) -> tuple[str, list, int, int]:
+    """encode_prompt's text (the chat turn up to and including the caption; its end follows) with its token offsets,
+    cut where _prompt_ids cuts at the same max_length; the cache keeps every token it encoded."""
     caption = prompts.as_caption(prompt)
     if not caption:
         return "", [], 0, 0
     text = PROMPT_PREFIX + caption
     offsets = tokenizer(text, return_offsets_mapping=True, add_special_tokens=False)["offset_mapping"]
     n_suffix = len(tokenizer(PROMPT_SUFFIX, add_special_tokens=False).input_ids)
+    offsets = offsets[: max(16, min(int(max_length), MAX_TEXT_TOKENS)) - n_suffix]
     return text, [tuple(o) for o in offsets], 0, len(offsets) + n_suffix
 
 
@@ -369,9 +371,10 @@ def get_transformer(cfg: TrainConfig, model_dir: Path | None, device: str | None
         if use_file:
             return isf.load_transformer_file(cfg.transformer_file, "cpu", cfg.transformer_quant, quant_devices=gpus)
         return load_transformer(model_dir, "cpu", cfg.transformer_quant, quant_devices=gpus)
-    if use_file:
-        return isf.load_transformer_file(cfg.transformer_file, device or cfg.device, cfg.transformer_quant)
-    return load_transformer(model_dir, device or cfg.device, cfg.transformer_quant)
+    with sf.quantize_staged_on(sf.staging_gpu(cfg, device)):  # block swap: quantized on the GPU, kept in RAM
+        if use_file:
+            return isf.load_transformer_file(cfg.transformer_file, device or cfg.device, cfg.transformer_quant)
+        return load_transformer(model_dir, device or cfg.device, cfg.transformer_quant)
 
 
 def get_vae(cfg: TrainConfig, model_dir: Path | None):

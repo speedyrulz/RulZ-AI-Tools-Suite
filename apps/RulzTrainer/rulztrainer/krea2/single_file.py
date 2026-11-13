@@ -27,6 +27,7 @@ import logging
 from pathlib import Path
 
 import torch
+from torch import nn
 
 from .. import quant as Q
 from ..moss import single_file as sf
@@ -194,16 +195,34 @@ TOKENIZER_REPO = "Qwen/Qwen3-VL-4B-Instruct"  # the same Qwen2 tokenizer as Krea
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt", "chat_template.json")
 
 
-def build_text_model(state: dict, quant: str = "auto", device="cpu", config: dict | None = None, work_device=None):
+def build_text_model(state: dict, quant: str = "auto", device="cpu", config: dict | None = None, work_device=None,
+                     layers: int | None = None):
     """Text-only Qwen3-VL from an HF- or ComfyUI-style (possibly quantized) state dict, which is consumed.
-    work_device: where to quantize (moss.single_file.quant_target; the model is built on the CPU)."""
+    work_device: where to quantize (moss.single_file.quant_target; the model is built on the CPU). Its quantized
+    layers run weight-only (moss.single_file.weight_only), for every family that builds its encoder here.
+
+    layers: build only the first `layers` decoder layers, without the final norm, for a family that reads no deeper
+    hidden state (FLUX 3 reads layers 4 to 32 of 36). The norm becomes an identity because transformers overwrites the
+    last of hidden_states with the normed state: without it the deepest layer read would come out normed."""
     from transformers import Qwen3VLTextConfig, Qwen3VLTextModel
 
-    cfg = Qwen3VLTextConfig(**(config or json.loads((HERE / "qwen3vl_4b_text_config.json").read_text("utf-8"))))
+    cfg_dict = dict(config or json.loads((HERE / "qwen3vl_4b_text_config.json").read_text("utf-8")))
+    cut = layers is not None and int(layers) < int(cfg_dict["num_hidden_layers"])
+    if cut:
+        cfg_dict["num_hidden_layers"] = int(layers)
+        if cfg_dict.get("layer_types"):
+            cfg_dict["layer_types"] = list(cfg_dict["layer_types"])[: int(layers)]
+    cfg = Qwen3VLTextConfig(**cfg_dict)
     state = sf.take_state(state, TE_DROP)
     state = sf.strip_prefix(state, TE_PREFIXES)
+    if cut:  # the layers past the cut and the final norm never run: their weights are not installed
+        for k in list(state):
+            if k.startswith("norm.") or (k.startswith("layers.") and int(k.split(".")[1]) >= int(layers)):
+                del state[k]
     with torch.device("meta"):
         model = Qwen3VLTextModel(cfg)
+        if cut:
+            model.norm = nn.Identity()
     sf.install_state(model, state, quant, torch.bfloat16, ignore_missing=("inv_freq",), work_device=work_device)
     import inspect
 
@@ -213,14 +232,16 @@ def build_text_model(state: dict, quant: str = "auto", device="cpu", config: dic
     for name, p in model.named_parameters():
         if p.device.type == "meta":
             raise ValueError(f"Text encoder parameter {name} was not loaded")
-    return model.to(device).eval().requires_grad_(False)
+    return sf.weight_only(model).to(device).eval().requires_grad_(False)
 
 
-def load_text_encoder_file(path: str | Path, device: str = "auto", quant: str = "auto"):
+def load_text_encoder_file(path: str | Path, device: str = "auto", quant: str = "auto", layers: int | None = None):
+    """layers: build_text_model's cut (FLUX 3 builds 32 of the 36 layers; Krea 2 and FIBO 2.0 need them all)."""
     from ..fibo.loading import place_text_encoder
 
     state = sf.read_state(path, torch.bfloat16)
-    model = build_text_model(state, quant, "cpu", work_device=sf.quant_target(device).get("work_device"))
+    model = build_text_model(state, quant, "cpu", work_device=sf.quant_target(device).get("work_device"),
+                             layers=layers)
     n_q = sum(1 for m in model.modules() if isinstance(m, Q.QuantLinear))
     log.info("Loaded Qwen3-VL text encoder from %s (%d layers%s)", Path(path).name, model.config.num_hidden_layers,
              f", {n_q} quantized Linear layers" if n_q else "")
@@ -240,15 +261,15 @@ def hf_text_config(te_dir: Path) -> dict:
     return text_cfg
 
 
-def load_hf_text_model(te_dir: Path, quant: str = "none", device="auto"):
+def load_hf_text_model(te_dir: Path, quant: str = "none", device="auto", layers: int | None = None):
     """The text-only Qwen3-VL language model from an HF text_encoder/ folder (Qwen3VLModel or
     Qwen3VLForConditionalGeneration weights): the vision tower and the LM head are never loaded. Built on the CPU;
-    `device` only picks where a quantization runs."""
+    `device` only picks where a quantization runs. layers: build_text_model's cut."""
     from ..moss.loading import _read_sharded
 
     state = _read_sharded(Path(te_dir), "model")
     return build_text_model(state, quant, "cpu", config=hf_text_config(te_dir),
-                            work_device=sf.quant_target(device).get("work_device"))
+                            work_device=sf.quant_target(device).get("work_device"), layers=layers)
 
 
 def resolve_tokenizer(tokenizer_path: str, models_dir: str = "models") -> Path:

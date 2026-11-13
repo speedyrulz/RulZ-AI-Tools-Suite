@@ -272,7 +272,7 @@ def build_text_model(state: dict, quant: str = "auto", device="cpu", work_device
     for name, p in model.named_parameters():
         if p.device.type == "meta":
             raise ValueError(f"Text encoder parameter {name} was not loaded")
-    return model.to(device).eval().requires_grad_(False)
+    return msf.weight_only(model).to(device).eval().requires_grad_(False)
 
 
 def load_text_encoder_file(path: str | Path, device: str = "auto", quant: str = "auto"):

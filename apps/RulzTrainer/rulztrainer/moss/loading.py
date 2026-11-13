@@ -121,9 +121,10 @@ def get_transformer(cfg: TrainConfig, model_dir: Path | None, device: str | None
             return sf.load_transformer_file(cfg.transformer_file, "cpu", cfg.transformer_quant, quant_devices=gpus)
         return load_transformer(model_dir, "cpu", quant=cfg.transformer_quant, quant_devices=gpus)
     device = device or cfg.device
-    if use_file:
-        return sf.load_transformer_file(cfg.transformer_file, device, cfg.transformer_quant)
-    return load_transformer(model_dir, device, quant=cfg.transformer_quant)
+    with sf.quantize_staged_on(sf.staging_gpu(cfg, device)):  # block swap: quantized on the GPU, kept in RAM
+        if use_file:
+            return sf.load_transformer_file(cfg.transformer_file, device, cfg.transformer_quant)
+        return load_transformer(model_dir, device, quant=cfg.transformer_quant)
 
 
 def get_vae(cfg: TrainConfig, model_dir: Path | None):
@@ -299,11 +300,13 @@ def get_tokenizer(cfg: TrainConfig, model_dir: Path | None):
     return tokenizer
 
 
-def prompt_tokens(tokenizer, prompt: str) -> tuple[str, list, int, int]:
-    """encode_prompt's text (the chat template) with its token offsets; the cache keeps every token."""
+def prompt_tokens(tokenizer, prompt: str, max_length: int = 4096) -> tuple[str, list, int, int]:
+    """encode_prompt's text (the chat template) with its token offsets, cut at max_length as encode_prompt cuts it;
+    the cache keeps every token it encoded."""
     formatted = tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True, enable_thinking=True)
-    offsets = tokenizer(formatted, return_offsets_mapping=True, truncation=True, max_length=4096)["offset_mapping"]
+    offsets = tokenizer(formatted, return_offsets_mapping=True, truncation=True,
+                        max_length=int(max_length))["offset_mapping"]
     return formatted, [tuple(o) for o in offsets], 0, len(offsets)
 
 

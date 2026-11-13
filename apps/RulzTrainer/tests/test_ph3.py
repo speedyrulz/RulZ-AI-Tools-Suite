@@ -423,7 +423,7 @@ def test_detection_downloads_and_caches(tmp_path):
     cfg = TrainConfig(model_path="PrunaAI/P-H3-Image", dataset_dir=str(data), resolutions=[1.0])
     item = D.scan_dataset(cfg)[0]
     assert item.width % 32 == 0 and item.height % 32 == 0 and item.latent_path.name.endswith("_ph3vae.safetensors")
-    assert D.text_cache_path(cfg, "p").name.endswith("_p_h3_image.safetensors")
+    assert D.text_cache_path(cfg, "p").name.endswith("_p_h3_image_wo.safetensors")
     assert "transformer/*" in PL.ALLOW_PATTERNS and not any("upsampler" in a for a in PL.ALLOW_PATTERNS)
 
 

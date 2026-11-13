@@ -175,6 +175,46 @@ def test_face_analysis_keeps_embeddings(tmp_path):
     assert len(calls) == 2 and len(next(iter(again.values()))["emb"]) == A.FACE_EMB_DIM
 
 
+def test_no_face_detector_leaves_no_faceless_record_behind(tmp_path):
+    """Without a detector (InsightFace missing, or it failed to start) or with one that fails on the image, the image
+    is faceless for this run only: caching it made every later run train without its face until recache."""
+    import json
+
+    from PIL import Image
+
+    from rulztrainer import regions as R
+
+    img = tmp_path / "a.png"
+    Image.new("RGB", (32, 32)).save(img)
+    item = SimpleNamespace(image=img)
+    cache = tmp_path / "faces.json"
+    calls = []
+
+    class Scorer:
+        def __init__(self, found=True, fail=False):
+            self.found, self.fail = found, fail
+
+        def faces(self, p):
+            calls.append(p)
+            if self.fail:
+                raise RuntimeError("CUDA provider failed")
+            return [SimpleNamespace(bbox=[1, 2, 10, 12], kps=None, det_score=0.9)] if self.found else []
+
+    rec = next(iter(R.analyze_faces([item], None, cache).values()))
+    assert rec["bbox"] is None and rec["W"] == 32 and json.loads(cache.read_text()) == {}
+    R.analyze_faces([item], Scorer(fail=True), cache)
+    assert json.loads(cache.read_text()) == {} and len(calls) == 1
+    assert next(iter(R.analyze_faces([item], Scorer(), cache).values()))["bbox"] == [1.0, 2.0, 10.0, 12.0]
+    assert len(calls) == 2
+    R.analyze_faces([item], None, cache)  # a face found before stays found
+    assert next(iter(json.loads(cache.read_text()).values()))["bbox"]
+
+    cache.write_text(json.dumps({R._file_key(img): {"bbox": None, "kps": None, "det": 0.0, "W": 32, "H": 32}}))
+    R.analyze_faces([item], Scorer(found=False), cache)  # an old faceless record: looked at again, once
+    R.analyze_faces([item], Scorer(found=False), cache)
+    assert len(calls) == 3 and next(iter(json.loads(cache.read_text()).values()))["detected"] is True
+
+
 def test_config_checks():
     TrainConfig(attn_localize=True, trigger_word="zkrea", id_align=True).validate()
     assert TrainConfig(attn_localize=True).wants_regions() and TrainConfig(attn_localize=True).wants_person_masks()

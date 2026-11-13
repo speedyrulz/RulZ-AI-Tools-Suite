@@ -518,10 +518,12 @@ def get_tokenizer(cfg: TrainConfig, model_dir: Path | None):
     return tok
 
 
-def prompt_tokens(tokenizer, prompt: str) -> tuple[str, list, int, int]:
-    """encode_prompt's text (the prompt itself) with its token offsets; nothing is dropped from the cache."""
+def prompt_tokens(tokenizer, prompt: str, max_length: int = 1024) -> tuple[str, list, int, int]:
+    """encode_prompt's text (the prompt itself) with its token offsets, cut where encode_prompt cuts at the same
+    max_length; nothing is dropped from the cache."""
     text = prompt or " "
     offsets = tokenizer(text, return_offsets_mapping=True, add_special_tokens=False)["offset_mapping"]
+    offsets = offsets[: max(8, int(max_length))]
     return text, [tuple(o) for o in offsets], 0, len(offsets)
 
 
@@ -593,11 +595,12 @@ def get_transformer(cfg: TrainConfig, model_dir: Path | None, device: str | None
 
         quant_devices, device = parse_devices(cfg.devices, cfg.device), "cpu"
     device = device or cfg.device
-    if use_file:
-        model = hsf.load_transformer_file(cfg.transformer_file, device, cfg.transformer_quant,
-                                          quant_devices=quant_devices)
-    else:
-        model = load_transformer(model_dir, device, cfg.transformer_quant, quant_devices=quant_devices, ref=ref)
+    with sf.quantize_staged_on(sf.staging_gpu(cfg, device)):  # block swap: quantized on the GPU, kept in RAM
+        if use_file:
+            model = hsf.load_transformer_file(cfg.transformer_file, device, cfg.transformer_quant,
+                                              quant_devices=quant_devices)
+        else:
+            model = load_transformer(model_dir, device, cfg.transformer_quant, quant_devices=quant_devices, ref=ref)
     return attach_silence(model, cfg, model_dir)
 
 

@@ -212,6 +212,40 @@ def test_cache_region_maps_splits_images_across_mask_fns(tmp_path):
     assert R.cache_region_maps(items, heavier, {}) == {"face": 0, "person": 0, "none": 6}
 
 
+def test_a_region_map_built_without_a_face_is_rebuilt_once_the_face_is_found(tmp_path):
+    cfg = TrainConfig(cache_dir=str(tmp_path), region_weights=True)
+    items = _items(tmp_path, 3, flip=False)
+    assert R.cache_region_maps(items, cfg, {}) == {"face": 0, "person": 0, "none": 3}
+    face = {str(items[0].image.resolve()): {"bbox": [16, 16, 40, 40], "kps": None, "det": 0.9, "W": 64, "H": 64}}
+    assert R.cache_region_maps(items, cfg, face) == {"face": 1, "person": 0, "none": 0}
+    assert R.load_region_map(items[0].region_path).face_print == "1"
+    assert R.cache_region_maps(items, cfg, face) == {"face": 0, "person": 0, "none": 0}
+    assert R.cache_region_maps(items, cfg, {}) == {"face": 0, "person": 0, "none": 1}  # the face is gone again
+
+
+def test_a_run_without_a_detector_keeps_the_cached_face_maps(tmp_path):
+    """No detector this run (no "detected" in the analysis): a map built with the face stays as it is."""
+    cfg = TrainConfig(cache_dir=str(tmp_path), region_weights=True)
+    items = _items(tmp_path, 1, flip=False)
+    key = str(items[0].image.resolve())
+    face = {key: {"bbox": [16, 16, 40, 40], "kps": None, "det": 0.9, "W": 64, "H": 64, "detected": True}}
+    assert R.cache_region_maps(items, cfg, face) == {"face": 1, "person": 0, "none": 0}
+    passing = {key: {"bbox": None, "kps": None, "det": 0.0, "W": 64, "H": 64}}
+    assert R.cache_region_maps(items, cfg, passing) == {"face": 0, "person": 0, "none": 0}
+    assert R.load_region_map(items[0].region_path).face_cells
+
+
+def test_a_face_outside_the_crop_does_not_rebuild_the_map_every_run(tmp_path):
+    cfg = TrainConfig(cache_dir=str(tmp_path), region_weights=True)
+    items = _items(tmp_path, 1, flip=False)
+    items[0].src_box = (0, 32, 64, 64)  # the crop is the lower half; the face is in the upper one
+    face = {str(items[0].image.resolve()): {"bbox": [20, 2, 40, 20], "kps": None, "det": 0.9, "W": 64, "H": 64,
+                                            "detected": True}}
+    R.cache_region_maps(items, cfg, face)
+    assert R.load_region_map(items[0].region_path).face_print == "1"
+    assert R.cache_region_maps(items, cfg, face) == {"face": 0, "person": 0, "none": 0}
+
+
 def test_side_devices_follow_multi_gpu_and_switch():
     from rulztrainer.trainer import Trainer
 

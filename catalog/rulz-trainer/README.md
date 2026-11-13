@@ -323,7 +323,7 @@ python scripts/vast/rulz_remote.py wait test1               # blocks until the r
 | `connect` | Finds the instance with the `vastai` CLI (`--instance ID` when several run) and tries its direct port, then vast's ssh proxy. `--wait 600` waits for one still installing; `--attach-key` adds your ssh key to an instance rented before you added it to the account |
 | `status`, `jobs`, `job NAME` | GPU, disk and queue; every run; one run's numbers |
 | `log`, `probes`, `config NAME --diff OTHER` | Logs, likeness scores, and the settings two runs differ in |
-| `pull NAME` | Copies `--what logs` (default), `probes`, `samples`, `loras`, `best` or `all`, optionally of one `--step`. Files already here at their size are skipped, so it can repeat during a run |
+| `pull NAME` | Copies `--what logs` (default), `probes`, `samples`, `loras`, `best` or `all`, optionally of one `--step`. Files already here at their size and time are skipped, so it can repeat during a run (a LoRA of a run made again under the same name has the same size: its time tells) |
 | `start --job NAME` | Queues a run from `--from JOB` or a local `--config FILE`, with `--set KEY=VALUE` and `--preset`. `--dry-run` shows what would change and queues nothing. With or without it, the settings get the trainer's full check first, so what training would refuse is refused here. It refuses a job name in use and an existing job folder unless `--overwrite` |
 | `wait NAME` | Blocks until the run ends (or `--step N`), riding out dropped connections. Exit status 0 finished, 1 failed, 2 `--timeout`, 3 unreachable |
 | `stop`, `stop --kill`, `queue` | The WebUI's Stop and Kill; the queue, with `queue pause`, `resume` and `remove ID` |
@@ -350,8 +350,12 @@ and write the same files in `~/.rulz_vast/fleet`.
 - **A queue over the instances.** A queued run goes to the first instance with nothing running and nothing waiting in
   its own queue, and when an instance finishes its run it takes the next one. A run can be tied to one instance. A local
   dataset folder can be sent first when the instance does not have it; the settings' paths into that folder are pointed
-  at `datasets/<name>` there. A run an instance refuses is offered to the others, and one refused by all is set aside
-  with the reason.
+  at `datasets/<name>` there. It is unpacked beside the datasets and moved into place once whole, so a dropped
+  connection leaves no half dataset to be taken for sent, and a note of what was sent (each file's name, size and time)
+  goes with it: a folder changed here since (captions fixed, pictures added), or another folder of the same name, goes
+  beside the old copy as `datasets/<name>_<8 hex>` (a run there may still be reading the old one) and the run reads
+  that. A start whose connection drops is not sent again when the instance has the run queued or running. A run an
+  instance refuses is offered to the others, and one refused by all is set aside with the reason.
 - **A race split over instances.** `--split` (the tab's *Split a race over the instances*) deals a race's
   configurations over the instances, one part each. A part with one configuration trains as a plain run with that
   row's settings, a part with several as a race among them; the parts form a group that is compared by best likeness
@@ -1770,7 +1774,9 @@ and new bests at probes with no body at all. Fed through the new rule, the same 
 its framing where it was ([the table](docs/experimental-test-results.md)). The log's framing line gives the measured
 score beside the counted one, and `likeness.jsonl` keeps it (`body_measured`). Everything that reads the body score
 follows: the best checkpoints, early stop, the lr control, a race's scores and the curriculum (so
-`likeness_curriculum_framing` has nothing left to add while this is on). `likeness_framing: false` brings the old score
+`likeness_curriculum_framing` has nothing left to add while this is on); since 3.18.0 also the per-seed scores that
+`race_drop_confidence` and the noise numbers read, which before counted a seed without a body as its face score
+alone. `likeness_framing: false` brings the old score
 back. The rule was replayed on recorded probes; it has not yet decided a training.
 [prompt check](#probe-prompt-presets-and-the-prompt-check) counts the same drift against the step-0 probe, for any
 probe prompt, and `likeness_best_min_kept` holds such a best back.
@@ -2494,7 +2500,9 @@ thick, the body dashed; after the race the winner's go on as `winner`.
 a confirmation). The trainer reads the request after the current step: the configuration stops, its LoRA is saved as
 `<job>_<name>_dropped.safetensors`, and the race goes on without it. If it was the one training, the next one takes
 over at once; a round it was the last of to be probed ends with this drop instead of dropping the lowest score as well;
-with one left, that one wins and trains on to `steps` like any winner. Without the WebUI, put the configuration's name
+with one left, that one wins and trains on to `steps` like any winner. In a race decided at the end
+(`race_patience_drop`, or `race_drop_lowest: false`), a configuration dropped by hand cannot win on an earlier best
+score (before 3.18.0 it could). Without the WebUI, put the configuration's name
 in a file `RACE_DROP` in the job folder (one name per line); the trainer reads and removes it.
 
 ```yaml
@@ -2865,7 +2873,8 @@ detected from the model; `model_arch: auto`). The repo is gated: accept its term
   sigmas, CFG as a second pass with the null caption); Bria samples dev at 50 steps / CFG 5, 20-30 steps is fine for
   previews. The MOSS-only sample shift and skip layer are ignored.
 - **Output format.** FIBO LoRAs are saved in the diffusers / PEFT format (`transformer.<module>.lora_A/B.weight` plus
-  the adapter config in the file metadata), since ComfyUI has no FIBO 2.0 support yet:
+  the adapter config in the file metadata, alpha / rank folded into `lora_B` as for Krea 2), since ComfyUI has no
+  FIBO 2.0 support yet:
 
   ```python
   import torch
@@ -2942,8 +2951,10 @@ Hugging Face and `hf auth login`. The download skips the repo's 26 GB single-fil
   every block, `lora_blocks` no longer skips the backward of the earlier blocks while they are trained. ComfyUI loads
   these keys (`transformer.text_fusion.*` and `attn.to_gate` map to its `txtfusion.*` / `attn.gate`).
 - **Export** is the diffusers / PEFT format with the same module names as Krea's LoRAs
-  (`transformer.transformer_blocks.<n>.attn.to_q.lora_A.weight`), with the adapter config (alpha) in the metadata.
-  Loaders that ignore the metadata assume alpha = rank, so keep alpha equal to rank (the default) for those.
+  (`transformer.transformer_blocks.<n>.attn.to_q.lora_A.weight`). Alpha / rank is folded into `lora_B` and the
+  adapter config in the metadata says alpha = rank, so every loader applies the strength the samples showed: ComfyUI
+  reads no alpha from the metadata, and before 3.18.0 a LoRA with alpha unlike its rank (rank 32, alpha 16) acted at
+  rank / alpha times that strength there. The trained alphas are kept in the metadata for resuming.
 - **Timesteps**: `timestep_sampling: reference` is a logit-normal shifted like the sampler (Krea has not published its
   training distribution); the default `logit_normal` works as for the other models.
 
@@ -2999,8 +3010,8 @@ layer before the final norm, and its own RGBA VAE: 16x, 64 channels). Pick **Qwe
   (ffn_up_gate) and `img_mlp.out` (ffn_down); `text_in` adds the text projection and `embed` the image / timestep
   projections, the shared modulation and the final layer.
 - **Export** is the diffusers / PEFT format (`transformer.transformer_blocks.<n>.attn.to_q.lora_A.weight`). ComfyUI's
-  LoRA loader maps these keys, `img_mlp.gate_layer` / `img_mlp.proj` onto the two halves of its fused `gate_up`;
-  keep alpha equal to rank (the default) for loaders that ignore the metadata.
+  LoRA loader maps these keys, `img_mlp.gate_layer` / `img_mlp.proj` onto the two halves of its fused `gate_up`.
+  Alpha / rank is folded into `lora_B` (as for Krea 2), so any alpha loads at the trained strength.
 - **Measured** on an RTX 5060 Ti (16 GB), int8, 0.5 MP, rank 8, identity preset: about 2.5 s per step with
   torch.compile, 10 of 32 blocks keeping their activations at a 13.1 GB peak.
 - **Licence**: the Qwen Research License, non-commercial use unless Qwen grants more; a shared LoRA or fine-tune must
@@ -3861,6 +3872,15 @@ ComfyUI's `custom_nodes` and load `workflows/RulzTrainer Likeness Scoring.json`;
 The DiT in bf16 is about 10 GB. The text encoder is about 18 GB in bf16, so it is loaded only for caching
 with `device_map="auto"`; set `text_encoder_quant` to `int8`, `int8_convrot` or `nvfp4` if you want it on a single
 GPU.
+
+A quantized text encoder runs weight-only, as ComfyUI runs it: the weights are int8 / FP4, the activations stay bf16.
+Before 3.18.0 every family but MiniMax H3 also quantized the activations (W8A8, or FP4 on an RTX 50 card), which
+moved the cached features a few percent away from what ComfyUI computes; so the first run after updating encodes the
+captions again (the cache files gained `_wo` in their names). Block swap now quantizes a bf16 transformer on the
+training GPU, block by block, instead of on the CPU (minutes for the 29-33B models), and the FLUX.2 Klein 9B / FLUX 3
+Klein text encoders are built only as deep as the layers they are read at (27 and 32 of 36: about 3.5 / 0.8 GB less).
+PAN 2 encodes up to its own 1536 caption tokens when `max_token_length` is left at 1024 (its released negative is
+about 1480 tokens and was cut before).
 
 ### Selective checkpointing (`checkpoint_keep_blocks`)
 

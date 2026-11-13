@@ -163,7 +163,10 @@ def oft_rotation(blocks: torch.Tensor, constraint: float = 0.0) -> torch.Tensor:
         norm = q.norm() + 1e-8
         q = torch.where(norm > constraint, q * (constraint / norm), q)
     eye = torch.eye(q.shape[-1], device=q.device, dtype=q.dtype)
-    return (eye + q) @ torch.linalg.inv(eye - q)
+    # (I + Q)(I - Q)^-1 = (I - Q)^-1 (I + Q): the two commute. solve_ex without its error check: inv checked for a
+    # singular matrix on the host, a GPU sync in every OFT layer's forward and recomputation (I - Q with Q skew-symmetric
+    # is never singular)
+    return torch.linalg.solve_ex(eye - q, eye + q, check_errors=False)[0]
 
 
 def dense_weight(base: nn.Module) -> torch.Tensor:
@@ -929,7 +932,7 @@ def export_state_dict(injected: dict[str, LoRALinear], dtype=torch.bfloat16, fmt
             out[f"{key}.alpha"] = torch.tensor(1.0, dtype=torch.float32)  # full factors: no scaling
             continue
         down, up = parts["lora_down"], parts["lora_up"]
-        if fmt in ("folded", "comfy_ab"):
+        if fmt in ("folded", "comfy_ab", "peft"):  # peft: ComfyUI reads no alpha from the metadata, so scale 1
             # alpha / rank folded into lora_B, from the full-precision weight; the stubs a fine-tune extraction, a race
             # configuration or a weight average save have only adapter_params, alpha and rank
             raw = m.adapter_params()["lora_up"].detach().to("cpu", torch.float32)
@@ -956,16 +959,18 @@ def network_kinds(injected: dict) -> set[str]:
 
 
 def peft_adapter_metadata(injected: dict[str, LoRALinear]) -> dict:
-    """The PEFT LoraConfig for these modules, keys prefixed "transformer." as diffusers' loader expects."""
+    """The PEFT LoraConfig for these modules, keys prefixed "transformer." as diffusers' loader expects. alpha = rank
+    everywhere: export_state_dict folds each module's alpha / rank into its lora_B for this format, since ComfyUI's
+    loader reads no alpha from this metadata and applies a file without .alpha keys at scale 1 (a Krea 2 LoRA of rank
+    32, alpha 16 acted at twice the strength its samples showed). The trained alphas are in FOLDED_ALPHA_KEY."""
     cfg = dict(PEFT_CONFIG_TEMPLATE)
     injected = {n: m for n, m in injected.items() if m.kind == "lora" and getattr(m, "trainable", True)}
     ranks = {m.rank for m in injected.values()}
-    alphas = {float(m.alpha) for m in injected.values()}
     cfg["r"] = max(ranks)
-    cfg["lora_alpha"] = max(alphas)
+    cfg["lora_alpha"] = float(cfg["r"])
     cfg["target_modules"] = sorted(injected)
     cfg["rank_pattern"] = {n: m.rank for n, m in injected.items() if m.rank != cfg["r"]}
-    cfg["alpha_pattern"] = {n: float(m.alpha) for n, m in injected.items() if float(m.alpha) != cfg["lora_alpha"]}
+    cfg["alpha_pattern"] = {n: float(m.rank) for n, m in injected.items() if m.rank != cfg["r"]}
     return {f"{PEFT_PREFIX}{k}": v for k, v in cfg.items()}
 
 
@@ -1000,7 +1005,9 @@ def save_lora(injected: dict[str, LoRALinear], path, metadata: dict | None = Non
         meta["rulztrainer_dora"] = "input axis: <stem>.dora_scale [1, in], ComfyUI's weight_decompose"
     if fmt == "peft" and "lora" in kinds:
         meta["lora_adapter_metadata"] = json.dumps(peft_adapter_metadata(injected), indent=2, sort_keys=True)
-    if fmt == "folded" and "lora" in kinds:
+    if fmt == "peft" and "lora" in kinds and "ss_network_dim" in meta:  # folded: read at alpha = rank
+        meta["ss_network_alpha"] = meta["ss_network_dim"]
+    if fmt in ("folded", "peft") and "lora" in kinds:  # what each lora_B was multiplied by (load_lora_weights)
         meta[FOLDED_ALPHA_KEY] = json.dumps({n: float(m.alpha) for n, m in injected.items()
                                              if m.kind == "lora" and getattr(m, "trainable", True)}, sort_keys=True)
     if fmt == "comfy_ab" and "lora" in kinds:
@@ -1351,8 +1358,12 @@ def set_extras_enabled(model: nn.Module, enabled: bool) -> None:
             else:
                 m.unstage_extras()  # the GPU copies go; the originals stay in RAM
     with torch.no_grad():  # norm weight offsets: swapped in for sampling, the original weight back for training
-        for weight, original, delta in model.__dict__.get("_rz_param_diffs", []):
+        per_weight: dict[int, list] = {}  # several files' offsets on one weight add up (each was set alone, so the
+        for weight, original, delta in model.__dict__.get("_rz_param_diffs", []):  # last file's won)
             if weight.device != original.device:  # the model moved since the LoRA was attached
                 original.data = original.data.to(weight.device)
                 delta.data = delta.data.to(weight.device)
-            weight.copy_((original.float() + delta).to(weight.dtype) if enabled else original)
+            row = per_weight.setdefault(id(weight), [weight, original, None])  # the first file's copy: the original
+            row[2] = delta.float() if row[2] is None else row[2] + delta
+        for weight, original, total in per_weight.values():
+            weight.copy_((original.float() + total).to(weight.dtype) if enabled else original)

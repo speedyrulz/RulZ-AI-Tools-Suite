@@ -157,7 +157,7 @@ class World:
 
         return Fleet(home=tmp_path / "fleet", connect=lambda inst: FakeRemote(self.machines[str(inst["id"])]),
                      list_instances=lambda: self.listed(), fetch=fetch,
-                     send=lambda target, items, where, hidden=True: self.sent.append(
+                     send=lambda target, items, where, hidden=True, **kw: self.sent.append(
                          (target.machine.id, [name for _, name in items], where)), now=self.clock)
 
     def tick(self, seconds=30.0):
@@ -388,6 +388,131 @@ def test_a_run_sent_to_an_instance_that_dropped_out_goes_back_to_the_head_of_the
     assert world.starts(1) == ["q1"]
 
 
+def test_a_start_whose_connection_dropped_after_it_landed_is_not_sent_again(world):
+    world.fleet.set_instance(2, enabled=False)
+    world.fleet.enqueue("q1", {"steps": 1})
+    machine = world.machines["1"]
+    answer = machine.answer
+
+    def lands_then_drops(args, config):
+        if args[0] == "start":
+            answer(args, config)  # the run is queued and starts there; the reply never comes back
+            return 255, b"", b""
+        return answer(args, config)
+
+    machine.answer = lands_then_drops
+    world.tick()
+    q = world.fleet.read()["queue"]
+    assert q["waiting"] == [] and q["active"] == [] and world.starts(1) == ["q1"]
+    assert [e["job"] for e in world.kinds("dispatched")] == ["q1"]
+    assert [c[0] for c in machine.calls].count("start") == 1
+
+
+def test_a_start_that_cannot_be_confirmed_stays_with_its_instance_until_it_can(world):
+    """The start's answer is lost and the instance can't be asked: the run may be there, so no other instance takes
+    it; once the instance answers, it is asked first and the run is not started again."""
+    world.fleet.enqueue("q1", {"steps": 1})
+    one, two = world.machines["1"], world.machines["2"]
+    answer = one.answer
+
+    def lands_then_goes_dark(args, config):
+        if args[0] == "start":
+            answer(args, config)
+            one.down = True  # the reply and the next look are both lost
+            return 255, b"", b""
+        return answer(args, config)
+
+    one.answer = lands_then_goes_dark
+    two.down = True  # busy elsewhere: only instance 1 is free for the first tick
+    world.tick()
+    q = world.fleet.read()["queue"]
+    assert [(e["job"], e.get("uncertain")) for e in q["waiting"]] == [("q1", "1")]
+    two.down = False
+    world.tick()  # instance 2 is free, but the run may be on instance 1
+    assert world.starts(2) == [] and world.fleet.read()["queue"]["waiting"][0]["uncertain"] == "1"
+    one.down = False
+    one.answer = answer
+    world.tick()
+    q = world.fleet.read()["queue"]
+    assert q["waiting"] == [] and q["active"] == [] and world.starts(1) == ["q1"]  # asked, not started twice
+    assert [e["job"] for e in world.kinds("dispatched")] == ["q1"]
+
+
+def test_a_run_settled_after_an_unanswered_start_keeps_its_own_download_rule(world):
+    """Settled from the look that finds it running, before that look makes its record: the record has the entry's
+    rule and label (they were lost when the run was settled after the record was made)."""
+    world.fleet.set_download({k: "off" for k in fleet_module.DOWNLOAD_KINDS})
+    world.fleet.enqueue("q1", {"steps": 1}, download={"loras": "end"}, label="mine")
+    one, two = world.machines["1"], world.machines["2"]
+    answer = one.answer
+
+    def lands_then_goes_dark(args, config):
+        if args[0] == "start":
+            answer(args, config)
+            one.down = True
+            return 255, b"", b""
+        return answer(args, config)
+
+    one.answer, two.down = lands_then_goes_dark, True
+    world.tick()
+    assert world.fleet.read()["queue"]["waiting"][0]["uncertain"] == "1"
+    one.down, one.answer = False, answer
+    world.tick()
+    rec, = world.fleet.runs(job="q1")
+    assert rec.get("download") == {"loras": "end"} and rec.get("label") == "mine"
+    one.finish()
+    world.tick()
+    assert world.fetched == [(1, ["q1/loras.bin"])] and world.starts(1) == ["q1"]
+
+
+def test_an_earlier_run_of_the_same_name_is_no_sign_that_a_start_got_there(world):
+    """Only the instance's queue history (a start since the one sent) settles a run that already ended."""
+    from rulz_fleet import Fleet as F
+
+    snap = {"queue": {"waiting": [], "recent": [{"job": "q1", "started": 1000.0}]}, "now": 2000.0,
+            "jobs": [{"job": "q1", "modified": 2000}], "job_running": False}
+    assert F.found_there(snap, "q1", since=1500.0, local_now=2000.0) == ""  # the folder was written, not started
+    assert F.found_there(snap, "q1", since=990.0, local_now=2000.0) == "done"
+    assert F.found_there(dict(snap, now=2600.0), "q1", since=400.0, local_now=2000.0) == "done"  # clocks 600 s apart
+    assert F.found_there(dict(snap, now=2600.0), "q1", since=500.0, local_now=2000.0) == ""
+    assert F.found_there(dict(snap, now=1400.0), "q1", since=1500.0, local_now=2000.0) == "done"
+
+
+def test_a_dataset_changed_here_goes_beside_the_copy_a_run_may_be_reading(world, tmp_path):
+    from rulz_fleet import point_at_pushed
+
+    local = tmp_path / "set"
+    local.mkdir()
+    (local / "a.png").write_bytes(b"x")
+    world.fleet.set_instance(2, enabled=False)
+    machine = world.machines["1"]
+    machine.datasets = ["set"]
+    sends = []
+    world.fleet.send = lambda target, items, where, hidden=True, **kw: sends.append((items[0][1], kw))
+    world.fleet.enqueue("q1", point_at_pushed({"steps": 1, "dataset_dir": str(local)}, [local]), push=[local])
+    snap = machine.snapshot
+    machine.snapshot = lambda: dict(snap(), dataset_marks={"set": "an-older-copy"})
+    world.tick()
+    digest = remote.dataset_digest(local)
+    (name, kw), = sends
+    assert name == f"set_{digest[:8]}" and kw == {"staged": True, "marks": {name: digest}}
+    assert machine.configs["q1"]["dataset_dir"] == f"datasets/{name}"
+
+
+def test_a_dataset_already_there_from_this_folder_is_not_sent_again(world, tmp_path):
+    local = tmp_path / "set"
+    local.mkdir()
+    (local / "a.png").write_bytes(b"x")
+    world.fleet.set_instance(2, enabled=False)
+    machine = world.machines["1"]
+    machine.datasets = ["set"]
+    snap = machine.snapshot
+    machine.snapshot = lambda: dict(snap(), dataset_marks={"set": remote.dataset_digest(local)})
+    world.fleet.enqueue("q1", {"steps": 1}, push=[local])
+    world.tick()
+    assert world.sent == [] and world.starts(1) == ["q1"]
+
+
 def test_a_dataset_is_pushed_first_when_the_instance_lacks_it(world, tmp_path):
     (tmp_path / "newset").mkdir()
     (tmp_path / "set").mkdir()
@@ -421,6 +546,12 @@ def test_runs_being_sent_when_the_looker_died_are_queued_again(world):
     world.fleet.recover()
     st = world.fleet.read()
     assert [e["job"] for e in st["queue"]["waiting"]] == ["q1"] and "dispatching" not in st["instances"]["1"]
+    with world.fleet.edit() as st:  # one that was being sent to an instance: it may be there, asked there first
+        entry = st["queue"]["waiting"].pop()
+        entry["sent_to"] = 2
+        st["queue"]["active"].append(entry)
+    world.fleet.recover()
+    assert world.fleet.read()["queue"]["waiting"][0]["uncertain"] == "2"
 
 
 # ---------------------------------------------------------------- a race over several instances

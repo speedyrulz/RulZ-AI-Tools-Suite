@@ -194,6 +194,40 @@ def test_keep_checkpoints_prunes_the_oldest(tmp_path):
         TrainConfig(keep_checkpoints=-1).validate()
 
 
+def test_a_job_name_used_again_does_not_prune_the_new_runs_checkpoints(tmp_path):
+    """An earlier run's checkpoints up to step 2000 sit in the folder; the new run is at step 250."""
+    from rulztrainer.trainer import prune_checkpoints
+
+    for step in (1000, 1500, 2000):
+        (tmp_path / f"job_{step:06d}.safetensors").write_text("old")
+    (tmp_path / "job_000250.safetensors").write_text("new")
+    assert prune_checkpoints(tmp_path, "job", 1, up_to=250) == []
+    (tmp_path / "job_000500.safetensors").write_text("new")
+    assert [p.name for p in prune_checkpoints(tmp_path, "job", 1, up_to=500)] == ["job_000250.safetensors"]
+    assert {p.name for p in tmp_path.iterdir()} == {f"job_{s:06d}.safetensors" for s in (500, 1000, 1500, 2000)}
+
+
+def test_a_fresh_run_prunes_only_its_own_checkpoints(tmp_path):
+    """An earlier run's job_000200 sits between this run's 100 and 300: it is not this run's to count or delete."""
+    from rulztrainer.trainer import prune_checkpoints
+
+    (tmp_path / "job_000200.safetensors").write_text("old")
+    own = set()
+    for step in (100, 300, 500):
+        p = tmp_path / f"job_{step:06d}.safetensors"
+        p.write_text("new")
+        own.add(str(p))
+        prune_checkpoints(tmp_path, "job", 2, up_to=step, own=own)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["job_000200.safetensors", "job_000300.safetensors",
+                                                          "job_000500.safetensors"]
+    # a run resumed at step 300 carries on the one before: its files up to 300 take part (500 is rewritten by the
+    # resumed run when it gets there, and is its own then)
+    p = tmp_path / "job_000700.safetensors"
+    p.write_text("new")
+    gone = prune_checkpoints(tmp_path, "job", 2, up_to=700, own={str(p)}, lineage=300)
+    assert [g.name for g in gone] == ["job_000200.safetensors"]
+
+
 def test_trainer_save_prunes_and_forgets_deleted_files(tmp_path):
     cfg = TrainConfig(job_name="job", keep_checkpoints=2)
     tr = Trainer.__new__(Trainer)

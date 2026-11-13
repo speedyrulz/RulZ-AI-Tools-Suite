@@ -146,11 +146,17 @@ def cap_cpu_threads(quota=None, env=None) -> int | None:
     return cap
 
 
-def prune_checkpoints(job_dir: Path, stem: str, keep: int) -> list[Path]:
+def prune_checkpoints(job_dir: Path, stem: str, keep: int, up_to: int | None = None, own=None,
+                      lineage: int = 0) -> list[Path]:
     """Keep the newest `keep` step checkpoints of `stem` (<stem>_<step>.safetensors and its extra ranks
     <stem>_<step>_r<rank>.safetensors) in a job folder and delete the older ones. The final file, <stem>_best and
     the dropped / winner files are never numbered, so they are never touched. keep <= 0 keeps everything. Returns the
-    files deleted."""
+    files deleted.
+
+    up_to: the run's current step: checkpoints numbered above it are left alone. own (the paths this run saved) and
+    lineage (the step it resumed from, 0 for a fresh run): only those files, and the ones numbered up to lineage (the
+    run it carries on), take part. An earlier run in the same job folder (a job name used again) keeps its files:
+    counted in, they made the new run delete each checkpoint it had just saved, or one between them."""
     if keep <= 0:
         return []
     import re
@@ -159,8 +165,11 @@ def prune_checkpoints(job_dir: Path, stem: str, keep: int) -> list[Path]:
     by_step: dict[int, list[Path]] = {}
     for p in Path(job_dir).iterdir():
         m = pat.match(p.name)
-        if m:
-            by_step.setdefault(int(m.group(1)), []).append(p)
+        if not m or (up_to is not None and int(m.group(1)) > up_to):
+            continue
+        if own is not None and str(p) not in own and int(m.group(1)) > lineage:
+            continue
+        by_step.setdefault(int(m.group(1)), []).append(p)
     gone = []
     for step in sorted(by_step)[: max(0, len(by_step) - keep)]:
         for p in by_step[step]:
@@ -173,11 +182,12 @@ def prune_checkpoints(job_dir: Path, stem: str, keep: int) -> list[Path]:
 
 
 def free_cuda():
+    """Collect garbage and give every GPU's cached blocks back. One empty_cache covers every GPU the allocator has
+    used; switching to each device first (as this did) made a CUDA context, about 0.3-0.5 GB, on cards the run never
+    used (a probe GPU, a card ComfyUI is on)."""
     gc.collect()
-    if torch.cuda.is_available():
-        for i in range(torch.cuda.device_count()):
-            with torch.cuda.device(i):
-                torch.cuda.empty_cache()
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
 
 
 def unload_model(model) -> None:
@@ -720,6 +730,9 @@ class Trainer(RaceParallelMixin):
         home = norm_device(self.vae.device)
         if not home.startswith("cuda"):
             return
+        # the copies on the other GPUs (data parallel, parallel_jobs) are dropped: _vae_on makes them again from the
+        # parked VAE for the next render, and kept they held a whole VAE on each of those GPUs for the rest of training
+        self.vaes.clear()
         if getattr(self, "vae_park_rows", None) is None:
             rows = []
             for mod in self.vae.modules():
@@ -1369,6 +1382,7 @@ class Trainer(RaceParallelMixin):
         self.status.update(stage="training", step=step)
         start = time.time()
         start_step = step
+        self.run_start_step = step  # what pruning counts as the run this one carries on (0: a fresh run)
         compute_done = 0  # optimizer steps of every configuration (a race trains several)
         step_times: list[float] = []  # seconds per optimizer step, training only (no saves, samples or probes)
         profile_at = profiling.requested_step()
@@ -1958,9 +1972,12 @@ class Trainer(RaceParallelMixin):
         n = len(self.ft.windows)
         return step % self.ft_rotate_steps == 0 and (step // self.ft_rotate_steps) % n == 0
 
-    def _prune_saved(self, stem: str) -> None:
-        """keep_checkpoints: delete the step checkpoints beyond the newest N (and forget them in the status)."""
-        for p in prune_checkpoints(self.job_dir, stem, self.cfg.keep_checkpoints):
+    def _prune_saved(self, stem: str, step: int | None = None) -> None:
+        """keep_checkpoints: delete the step checkpoints beyond the newest N (and forget them in the status); step:
+        the step just saved (prune_checkpoints' up_to)."""
+        for p in prune_checkpoints(self.job_dir, stem, self.cfg.keep_checkpoints, up_to=step,
+                                   own=set(self.status.data.get("saved") or []),
+                                   lineage=getattr(self, "run_start_step", 0)):
             log.info("Deleted the old checkpoint %s (keep_checkpoints %d)", p.name, self.cfg.keep_checkpoints)
             if str(p) in self.status.data["saved"]:
                 self.status.data["saved"].remove(str(p))
@@ -1990,7 +2007,7 @@ class Trainer(RaceParallelMixin):
                 self.status.data["saved"].append(str(path))
             first = first or path
         if not final:
-            self._prune_saved(f"{cfg.job_name}{label}")
+            self._prune_saved(f"{cfg.job_name}{label}", step)
         if cfg.finetune_save_delta:
             dpath = self.job_dir / f"{cfg.job_name}{label}_finetune.safetensors"
             ft.save_delta(dpath, {**meta, "lora_format": self.arch.lora_format})
@@ -2043,12 +2060,29 @@ class Trainer(RaceParallelMixin):
         log.info("Saved %s (%s)", path, cfg.lora_save_dtype)
         self.status.data["saved"].append(str(path))
         if not final:
-            self._prune_saved(f"{cfg.job_name}{tag}")
+            self._prune_saved(f"{cfg.job_name}{tag}", step)
         self.status.write()
         return path
 
-    def save_state(self, step, injected, optimizer, scheduler, gen, rng) -> Path:
+    def save_state(self, step, injected, optimizer, scheduler, gen, rng) -> Path | None:
+        """Write the training state of `step` (None when an earlier run's state folder of that step stays locked)."""
         state_dir = self.job_dir / f"state_{step:06d}"
+        if state_dir.is_dir():  # an earlier run's state of this step (a job name used again): never half its files
+            import shutil
+
+            # its train_state.pt (what makes a folder complete) first, and not past a lock: else new weights could sit
+            # beside the old optimizer and step. A scanner's brief lock is waited out; a lasting one skips this save
+            for attempt in range(atomic.REPLACE_TRIES):
+                try:
+                    (state_dir / "train_state.pt").unlink(missing_ok=True)
+                    break
+                except PermissionError as e:
+                    if attempt == atomic.REPLACE_TRIES - 1:
+                        log.warning("Training state of step %d not saved: %s holds a locked train_state.pt (%s)",
+                                    step, state_dir, e)
+                        return None
+                    time.sleep(0.05 * (attempt + 1))
+            shutil.rmtree(state_dir, ignore_errors=True)
         state_dir.mkdir(exist_ok=True)
         lora_mod.save_lora(injected, state_dir / "lora.safetensors", dtype=torch.float32, fmt=self.arch.lora_format)
         controller = getattr(self, "controller", None)
@@ -2069,7 +2103,12 @@ class Trainer(RaceParallelMixin):
         if self.cfg.keep_states > 0:
             import shutil
 
-            states = sorted(p for p in self.job_dir.glob("state_*") if p.is_dir())
+            # this run's states and those of the run it resumed (numbered up to its first step); an earlier run's in
+            # the same job folder are left alone (see prune_checkpoints)
+            own = set(self.status.data["states"]) | {str(state_dir)}
+            lineage = getattr(self, "run_start_step", 0)
+            states = sorted(p for p in self.job_dir.glob("state_*") if p.is_dir() and p.name[6:].isdigit()
+                            and int(p.name[6:]) <= step and (str(p) in own or int(p.name[6:]) <= lineage))
             for old in states[: max(0, len(states) - self.cfg.keep_states)]:
                 shutil.rmtree(old, ignore_errors=True)
                 log.info("Removed old training state %s", old)
@@ -2097,7 +2136,9 @@ class Trainer(RaceParallelMixin):
             return
         log.info("Saved the LoRA of step %d after the error: %s", step, self.save(injected, step))
         if state is not None:
-            log.info("To continue, resume from %s", self.save_state(step, injected, *state))
+            saved = self.save_state(step, injected, *state)
+            if saved is not None:
+                log.info("To continue, resume from %s", saved)
 
     def _save_after_crash(self) -> None:
         """The run failed: the weights are still in memory, so keep what it learned since the last save."""
@@ -2337,14 +2378,15 @@ class Trainer(RaceParallelMixin):
         """A step with allocator retries is slower than recomputing a block: give one kept block back on every GPU
         that retried (the earliest kept one there), until the steps run without retries."""
         after = self._alloc_retries()
-        hit = {d for d, n in after.items() if n > before.get(d, 0)}
+        hit = {norm_device(d) for d, n in after.items() if n > before.get(d, 0)}
         if not hit:
             return
-        for m, _, _ in self.replicas:
+        for m, _, rep_dev in self.replicas:
             keep = self.kept.get(id(m), [])
             assignment = [norm_device(d) for d in getattr(m, "split_assignment", None) or []]
+            home = norm_device(rep_dev)  # data parallel: a replica's blocks are all on its own GPU
             for d in hit:
-                on_d = [i for i in keep if (assignment[i] if assignment else norm_device(self.devices[0])) == d]
+                on_d = [i for i in keep if (assignment[i] if assignment else home) == d]
                 if on_d:
                     keep.remove(on_d[0])
             self.kept[id(m)] = keep
@@ -3449,10 +3491,13 @@ class Trainer(RaceParallelMixin):
 
     def _epoch_images(self, batcher) -> int:
         """Images in one epoch of an image queue (repeats counted)."""
-        cache = self.__dict__.setdefault("_epoch_sizes", {})
-        size = cache.get(id(batcher))
+        size = getattr(batcher, "_rz_epoch_images", None)  # on the queue: a rebuilt one may reuse a freed one's id()
         if size is None:
-            size = cache[id(batcher)] = max(1, sum(max(1, int(it.repeats or 1)) for it in batcher.items))
+            size = max(1, sum(max(1, int(it.repeats or 1)) for it in batcher.items))
+            try:
+                batcher._rz_epoch_images = size
+            except AttributeError:  # a queue that takes no attributes: counted again next time (cheap)
+                pass
         return size
 
     def _clean_schedule(self, cfg, batcher, images_per_step: int):
@@ -3705,7 +3750,7 @@ class Trainer(RaceParallelMixin):
             tok = self.arch.get_tokenizer(cfg, self.model_dir)
             out = {}
             for it in items:
-                text, offsets, drop, length = self.arch.prompt_tokens(tok, it.caption)
+                text, offsets, drop, length = self.arch.prompt_tokens(tok, it.caption, cfg.max_token_length)
                 cached = self._cached_text_length(it.text_path)
                 if cached is not None and cached != length:
                     continue  # the cache was made another way: positions would point at the wrong tokens
@@ -3818,7 +3863,7 @@ class Trainer(RaceParallelMixin):
         tok = self.arch.get_tokenizer(cfg, self.model_dir)
         out, mismatched = {}, 0
         for path, caption in captions.items():
-            text, offsets, drop, length = self.arch.prompt_tokens(tok, caption)
+            text, offsets, drop, length = self.arch.prompt_tokens(tok, caption, cfg.max_token_length)
             pos = A.token_positions(text, offsets, triggers, drop)
             if Path(path).exists():
                 cached = self._cached_text_length(path)
@@ -4430,6 +4475,7 @@ class Trainer(RaceParallelMixin):
         models = [m for m, _, _ in self.replicas] or [model]
         sizes = {id(mod): (len(mod.extras), len(mod.extra_biases)) for m in models for mod in m.modules()
                  if isinstance(mod, LoRALinear)}
+        diffs = {id(m): len(m.__dict__.get("_rz_param_diffs", [])) for m in models}  # the file's norm offsets too
         try:
             for m in models:
                 lora_mod.attach_extra_lora(m, str(path), 1.0, rename=getattr(self.arch, "lora_module_name", None),
@@ -4444,6 +4490,8 @@ class Trainer(RaceParallelMixin):
                         n_e, n_b = sizes.get(id(mod), (0, 0))
                         del mod.extras[n_e:]
                         del mod.extra_biases[n_b:]
+                if "_rz_param_diffs" in m.__dict__:  # (_probe_with switched the extras off: the weights are back)
+                    del m.__dict__["_rz_param_diffs"][diffs.get(id(m), 0):]
         return face, body, seeds
 
     def _likeness_scale(self):
@@ -4476,14 +4524,14 @@ class Trainer(RaceParallelMixin):
         """Render and score one probe: (face, body, images, seeds), face / body the mean raw score over the seeds that
         were scored, seeds each seed's own ({"face": [...], "body": [...]}, seed order, None = no face / body found;
         "gold" too with the held-out recognizer). n_seeds overrides probe_seeds (the noise check)."""
-        for sl in slots:
-            sl.model.eval()
-            lora_mod.set_extras_enabled(sl.model, True)
-        neg_e, neg_m = self.arch.pad_embeds([load_text_embeds(self.cfg, render_negative(self, "probe"))])
-        jobs = self._probe_jobs(step, tag, n_seeds, len(slots))
-        title = f"probes at step {step} on {len(slots)} GPUs" if len(slots) > 1 and len(jobs) > 1 else ""
-        board = _Board(self.status, title)
-        try:
+        try:  # the sampling extras go off again whatever fails: left on, training would go on against them
+            for sl in slots:
+                sl.model.eval()
+                lora_mod.set_extras_enabled(sl.model, True)
+            neg_e, neg_m = self.arch.pad_embeds([load_text_embeds(self.cfg, render_negative(self, "probe"))])
+            jobs = self._probe_jobs(step, tag, n_seeds, len(slots))
+            title = f"probes at step {step} on {len(slots)} GPUs" if len(slots) > 1 and len(jobs) > 1 else ""
+            board = _Board(self.status, title)
             images = self._render_round(slots, jobs, neg_e, neg_m, board)
         finally:
             for sl in slots:
@@ -5030,25 +5078,26 @@ class Trainer(RaceParallelMixin):
     @torch.no_grad()
     def _sample_with(self, slots, step):
         cfg = self.cfg
-        for sl in slots:
-            sl.model.eval()
-            lora_mod.set_extras_enabled(sl.model, True)
-        self.status.update(stage=f"sampling (step {step})")
-        neg_e, neg_m = self.arch.pad_embeds([load_text_embeds(cfg, render_negative(self, "sample"))])
-        out_dir = self.job_dir / "samples"
-        out_dir.mkdir(exist_ok=True)
         n_prompts = len(cfg.sample_prompts)
-        frames = render_frames(self, "sample")
-        jobs = [RenderJob(render_prompt(self, prompt, "sample"), cfg.sample_width, cfg.sample_height, cfg.sample_steps,
-                          cfg.sample_cfg, cfg.sample_seed + (i if cfg.sample_walk_seed else 0),
-                          out_dir / f"{self._image_prefix()}step{step:06d}_{i}.png",
-                          f"sampling {i + 1}/{n_prompts} at step {step}" if len(slots) == 1
-                          else f"sample {i + 1}/{n_prompts}", frames=frames, shown=prompt)
-                for i, prompt in enumerate(cfg.sample_prompts)]
-        title = f"sampling at step {step} on {len(slots)} GPUs" if len(slots) > 1 and n_prompts > 1 else ""
-        board = _Board(self.status, title)
         t0 = time.time()
-        try:
+        try:  # as in _probe_with: the sampling extras go off again whatever fails
+            for sl in slots:
+                sl.model.eval()
+                lora_mod.set_extras_enabled(sl.model, True)
+            self.status.update(stage=f"sampling (step {step})")
+            neg_e, neg_m = self.arch.pad_embeds([load_text_embeds(cfg, render_negative(self, "sample"))])
+            out_dir = self.job_dir / "samples"
+            out_dir.mkdir(exist_ok=True)
+            frames = render_frames(self, "sample")
+            jobs = [RenderJob(render_prompt(self, prompt, "sample"), cfg.sample_width, cfg.sample_height,
+                              cfg.sample_steps, cfg.sample_cfg, cfg.sample_seed + (i if cfg.sample_walk_seed else 0),
+                              out_dir / f"{self._image_prefix()}step{step:06d}_{i}.png",
+                              f"sampling {i + 1}/{n_prompts} at step {step}" if len(slots) == 1
+                              else f"sample {i + 1}/{n_prompts}", frames=frames, shown=prompt)
+                    for i, prompt in enumerate(cfg.sample_prompts)]
+            title = f"sampling at step {step} on {len(slots)} GPUs" if len(slots) > 1 and n_prompts > 1 else ""
+            board = _Board(self.status, title)
+            t0 = time.time()
             paths = self._render_round(slots, jobs, neg_e, neg_m, board,
                                        on_done=lambda i, job, p: log.info("Sample saved %s", p))
         finally:

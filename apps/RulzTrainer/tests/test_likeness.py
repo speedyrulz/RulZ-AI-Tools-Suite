@@ -446,6 +446,60 @@ def test_framing_on_a_normalized_scale_pulls_towards_its_floor():
     assert rec.body == pytest.approx(top) and rec.body_norm == pytest.approx(100.0)
 
 
+def test_per_seed_bodies_count_lost_renders_as_the_smoothed_score_does():
+    """The mean over a probe's scored per-seed bodies is the framed body score in every case framed_body has: nothing
+    lost against the first probe, renders lost, a render over the top, no body at all."""
+    faces = {"face": [60.0] * 4}
+
+    def check(c, step, body):
+        rec, _ = c.update(step, 60.0, L.mean_of(body), seeds={**faces, "body": body})
+        scored = [v for v in rec.body_norm_seeds if v is not None]
+        assert rec.body_seeds == body  # the raw seeds stay as measured
+        assert sum(scored) / len(scored) == pytest.approx(rec.body)
+        return rec.body_norm_seeds
+
+    half = _plain()  # the scorer measures half the renders from the first probe on
+    assert check(half, 0, [50.0, 50.0, None, None]) == [50.0, 50.0, None, None]
+    assert check(half, 10, [None, 50.0, None, 50.0]) == [None, 50.0, None, 50.0]  # nothing lost: unscored, as before
+    # one lost beyond the first probe's half: the three without a body share the one zero
+    assert check(half, 20, [50.0, None, None, None]) == pytest.approx([50.0, 50 / 3, 50 / 3, 50 / 3])
+    whole = _plain()  # every render showed a body at the first probe (the usual case): a lost one is the zero
+    check(whole, 0, [20.0] * 4)
+    assert check(whole, 10, [80.0, None, None, None]) == [80.0, 0.0, 0.0, 0.0]
+    assert check(whole, 20, [120.0, 110.0, 30.0, 40.0]) == [100.0, 100.0, 30.0, 40.0]  # one render stops at the top
+    rec, _ = whole.update(30, 60.0, None, seeds={**faces, "body": [None] * 4})
+    assert rec.body_norm_seeds == [0.0] * 4 and rec.body == 0.0
+    off = _plain(likeness_framing=False)
+    off.update(0, 60.0, 20.0, seeds={**faces, "body": [20.0] * 4})
+    assert off.update(10, 60.0, 80.0, seeds={**faces, "body": [80.0, None, None, None]})[0].body_norm_seeds == \
+        [80.0, None, None, None]
+
+
+def test_a_seed_that_lost_its_body_no_longer_outscores_one_that_kept_it():
+    """Two racers on the same seeds: b's body probe turned into portraits on two of three seeds (a slightly better
+    face, as a portrait shows it larger). Per seed b read the face alone and came out ahead of a, so a paired race
+    drop (race_drop_confidence) would have kept b and dropped a; the smoothed score had b behind all along."""
+    from rulztrainer import race as R
+
+    cfg = _cfg(likeness_lr_control=False, likeness_curriculum=False, likeness_normalize=True, likeness_patience=0)
+    racers = {}
+    for name, face, body in (("a", 50.0, [86.0, 86.0, 86.0]), ("b", 52.0, [None, None, 86.0])):
+        c = L.LikenessController(cfg)
+        c.update(0, 20.0, 82.0, seeds={"face": [20.0] * 3, "body": [82.0] * 3})
+        racers[name] = (c, c.update(10, face, L.mean_of(body), seeds={"face": [face] * 3, "body": body})[0])
+    (ca, a), (cb, b) = racers["a"], racers["b"]
+    assert b.combined_ema < a.combined_ema  # the smoothed score
+    assert b.combined_seeds[0] < a.combined_seeds[0] and b.combined_seeds[1] < a.combined_seeds[1]
+    assert b.combined_seeds[2] > a.combined_seeds[2]  # the seed b kept its body on: its better face counts
+    # on these linear scales the seeds' mean is the probe's own combined score, as the smoothed path counts it
+    assert sum(b.combined_seeds) / 3 == pytest.approx(b.combined)
+    s = R.RaceSchedule(["a", "b"], warmup=0, confidence=0.9)
+    s.record(0, ca.combined_ema, 10, seeds=ca.last_seeds)
+    s.record(1, cb.combined_ema, 10, seeds=cb.last_seeds)
+    t = s.history[-1].get("test") or s.history[-1].get("close")
+    assert (t["lowest"], t["vs"], t["n"]) == ("b", "a", 3) and t["diff"] > 0  # a above b per seed too
+
+
 def test_framing_reaches_the_curriculum_and_survives_a_resume():
     faces = {"face": [60.0] * 4}
     c = L.LikenessController(_cfg(likeness_lr_control=False, likeness_curriculum_framing=1.0))

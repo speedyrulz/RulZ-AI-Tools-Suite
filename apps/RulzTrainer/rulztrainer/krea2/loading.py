@@ -118,8 +118,8 @@ def load_vae(model_dir: Path, device):
 
 def load_text_encoder(model_dir: Path, device: str = "auto", quant: str = "auto"):
     """Qwen3-VL's language model (text only: the folder's Qwen3VLModel without its vision tower, which text prompts
-    never use, 0.8 GB) + tokenizer. quant int8/int8_convrot/nvfp4 quantizes its Linear layers (W8A8) so the 8.9 GB
-    encoder takes about half the memory."""
+    never use, 0.8 GB) + tokenizer. quant int8/int8_convrot/nvfp4 quantizes its Linear layers (run weight-only) so
+    the 8.9 GB encoder takes about half the memory."""
     from transformers import AutoTokenizer
 
     from .single_file import load_hf_text_model
@@ -172,12 +172,15 @@ def get_tokenizer(cfg: TrainConfig, model_dir: Path | None):
     return AutoTokenizer.from_pretrained(str(_need_dir(cfg, model_dir, "tokenizer") / "tokenizer"))
 
 
-def prompt_tokens(tokenizer, prompt: str) -> tuple[str, list, int, int]:
-    """encode_prompt's text (the system prefix + the prompt; the suffix follows) with its token offsets; the cache
-    drops the PREFIX_TOKENS prefix tokens and keeps the SUFFIX_TOKENS suffix ones."""
+def prompt_tokens(tokenizer, prompt: str, max_length: int = MAX_TEXT_TOKENS) -> tuple[str, list, int, int]:
+    """encode_prompt's text (the system prefix + the prompt; the suffix follows) with its token offsets, cut where
+    encode_prompt cuts the prompt at the same max_length; the cache drops the PREFIX_TOKENS prefix tokens and keeps
+    the suffix ones (SUFFIX_TOKENS with Qwen3-VL's tokenizer, counted as encode_prompt tokenizes the suffix)."""
     text = PROMPT_PREFIX + prompt
     offsets = tokenizer(text, return_offsets_mapping=True)["offset_mapping"]
-    return text, [tuple(o) for o in offsets], PREFIX_TOKENS, len(offsets) - PREFIX_TOKENS + SUFFIX_TOKENS
+    offsets = offsets[: min(int(max_length), MAX_TEXT_TOKENS) + PREFIX_TOKENS - SUFFIX_TOKENS]
+    n_suffix = len(tokenizer(PROMPT_SUFFIX)["input_ids"])
+    return text, [tuple(o) for o in offsets], PREFIX_TOKENS, len(offsets) - PREFIX_TOKENS + n_suffix
 
 
 def pad_embeds(rows: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -286,9 +289,10 @@ def get_transformer(cfg: TrainConfig, model_dir: Path | None, device: str | None
         if use_file:
             return ksf.load_transformer_file(cfg.transformer_file, "cpu", cfg.transformer_quant, quant_devices=gpus)
         return load_transformer(model_dir, "cpu", cfg.transformer_quant, quant_devices=gpus)
-    if use_file:
-        return ksf.load_transformer_file(cfg.transformer_file, device or cfg.device, cfg.transformer_quant)
-    return load_transformer(model_dir, device or cfg.device, cfg.transformer_quant)
+    with sf.quantize_staged_on(sf.staging_gpu(cfg, device)):  # block swap: quantized on the GPU, kept in RAM
+        if use_file:
+            return ksf.load_transformer_file(cfg.transformer_file, device or cfg.device, cfg.transformer_quant)
+        return load_transformer(model_dir, device or cfg.device, cfg.transformer_quant)
 
 
 def get_vae(cfg: TrainConfig, model_dir: Path | None):

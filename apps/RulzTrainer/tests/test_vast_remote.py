@@ -168,6 +168,91 @@ def test_pull_skips_what_is_here_at_its_size(tmp_path):
     assert [f["path"] for f in remote.pull_plan(files, tmp_path)] == ["j/train.log", "j/new.png"]
 
 
+def test_pull_fetches_a_file_of_the_same_size_made_again(tmp_path):
+    """An --overwrite run of the same name writes LoRAs of the same size: the time tells them apart."""
+    (tmp_path / "j").mkdir()
+    lora = tmp_path / "j" / "a.safetensors"
+    lora.write_bytes(b"12345")
+    os.utime(lora, (1_000_000, 1_000_000))
+    same = {"path": "j/a.safetensors", "size": 5, "mtime": 1_000_001}
+    redone = {"path": "j/a.safetensors", "size": 5, "mtime": 2_000_000}
+    assert remote.pull_plan([same], tmp_path) == []
+    assert remote.pull_plan([redone], tmp_path) == [redone]
+
+
+def test_a_dataset_digest_follows_what_send_sends(tmp_path):
+    d = tmp_path / "set"
+    (d / ".rulz_cache").mkdir(parents=True)
+    (d / "a.png").write_bytes(b"x")
+    (d / "a.txt").write_text("a photo", encoding="utf-8")
+    first = remote.dataset_digest(d)
+    (d / ".rulz_cache" / "latents.pt").write_bytes(b"cache")  # hidden: never sent, so no change
+    (d / ".DS_Store").write_bytes(b"x")
+    assert remote.dataset_digest(d) == first
+    (d / "a.txt").write_text("a fixed caption", encoding="utf-8")
+    assert remote.dataset_digest(d) != first
+
+
+class PipeRemote:
+    """A Remote whose command reads the archive into a file here, standing in for ssh and tar."""
+
+    def __init__(self, out: Path, fail: bool = False):
+        self.out, self.fail, self.shells = out, fail, []
+
+    def command(self, shell, in_folder=True):
+        self.shells.append(shell)
+        code = (f"import sys; open({str(self.out)!r}, 'wb').write(sys.stdin.buffer.read()); "
+                f"sys.exit({1 if self.fail else 0})")
+        return [sys.executable, "-c", code]
+
+
+def test_a_file_that_cannot_be_read_stops_a_send_instead_of_passing(tmp_path, monkeypatch):
+    (tmp_path / "set").mkdir()
+    (tmp_path / "set" / "a.png").write_bytes(b"x")
+    target = PipeRemote(tmp_path / "archive.tar")
+
+    def unreadable(self, name, *a, **k):
+        raise PermissionError(13, "Permission denied", name)
+
+    monkeypatch.setattr(tarfile.TarFile, "add", unreadable)
+    with pytest.raises(SystemExit, match="Could not read"):
+        remote.send(target, [(tmp_path / "set", "set")], "datasets", hidden=False)
+
+
+def test_a_staged_send_moves_the_dataset_in_whole_with_its_mark(tmp_path):
+    (tmp_path / "set").mkdir()
+    (tmp_path / "set" / "a.png").write_bytes(b"x")
+    target = PipeRemote(tmp_path / "archive.tar")
+    remote.send(target, [(tmp_path / "set", "set_ab12")], "datasets", hidden=False, staged=True,
+                marks={"set_ab12": "digest1"})
+    shell, = target.shells
+    assert "tar -xf - -C datasets/.rulz_incoming/" in shell and "mv datasets/.rulz_incoming/" in shell
+    assert shell.index("tar -xf") < shell.index("mv ") and shell.endswith("exit $rc")
+    with tarfile.open(tmp_path / "archive.tar") as tar:
+        names = tar.getnames()
+        assert tar.extractfile(f"set_ab12/{remote.UPLOAD_MARK}").read() == b"digest1"
+    assert "set_ab12/a.png" in names and names[-1] == f"set_ab12/{remote.UPLOAD_MARK}"
+
+
+def test_a_failed_send_still_says_so(tmp_path):
+    (tmp_path / "set").mkdir()
+    (tmp_path / "set" / "a.png").write_bytes(b"x")
+    with pytest.raises(SystemExit, match="incomplete"):
+        remote.send(PipeRemote(tmp_path / "archive.tar", fail=True), [(tmp_path / "set", "set")], "datasets")
+
+
+def test_a_hung_vastai_call_gives_up(monkeypatch):
+    monkeypatch.setattr(remote.shutil, "which", lambda name: "vastai")
+
+    def hang(*a, **k):
+        assert k["timeout"] == remote.VASTAI_TIMEOUT
+        raise subprocess.TimeoutExpired(a[0], k["timeout"])
+
+    monkeypatch.setattr(remote.subprocess, "run", hang)
+    with pytest.raises(remote.Unreachable, match="did not answer"):
+        remote.vastai("show", "instances")
+
+
 def tar_stream(name: str, data: bytes) -> io.BytesIO:
     out = io.BytesIO()
     with tarfile.open(fileobj=out, mode="w") as tar:
@@ -304,6 +389,14 @@ def test_status_works_on_an_empty_install(install, capsys):
     assert code == 0 and data["job_running"] is False and data["datasets"] == ["set"] and "job" not in data
 
 
+def test_datasets_list_their_upload_mark_and_hide_a_copy_still_coming_in(install, capsys):
+    (install / "datasets" / ".rulz_incoming" / "x1").mkdir(parents=True)
+    (install / "datasets" / "sent").mkdir()
+    (install / "datasets" / "sent" / ".rulz_upload").write_text("abc123\n", encoding="utf-8")
+    code, data = run_json(capsys, "status")
+    assert data["datasets"] == ["sent", "set"] and data["dataset_marks"] == {"sent": "abc123"}
+
+
 def test_the_per_step_series_are_summed_up(install, capsys):
     d = make_job("a", losses=[0.1] * 500, step_times=[1] * 500, saved=["x", "y"],
                  probes=[{"step": 1, "combined_ema": 3.0, "images": ["a.png"]}])
@@ -394,6 +487,7 @@ def test_files_report_the_folder_they_are_under(install, capsys):
     data = run_json(capsys, "files", "a")[1]
     base = Path(data["base"])
     assert base.is_absolute() and base.name == "output" and data["files"][0]["path"].startswith("a/")
+    assert all(isinstance(f["mtime"], int) for f in data["files"])
 
 
 def test_poll_says_how_a_job_stands(install, capsys, running_job):
