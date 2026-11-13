@@ -6,29 +6,55 @@ import { app } from 'electron'
 import type { SelfUpdate } from '@shared/types'
 import { download, publishedSha256 } from './download'
 import type { Store } from './store'
-import { findAsset, isNewer, latestRelease } from './github'
+import { findAsset, isNewer, latestRelease, type Release } from './github'
 
 const execFileAsync = promisify(execFile)
 
 export const SELF_REPO = 'speedyrulz/RulZ-AI-Tools-Suite'
 export const SETUP_ASSET = '^RulZ-AI-Tools-Suite-Setup-[\\d.]+\\.exe$'
+/** Where the launcher's setup programs are downloaded from; nothing else is run as an update. */
+export const SELF_DOWNLOADS = `https://github.com/${SELF_REPO}/releases/download/`
+
+/**
+ * True when the update's download is the launcher setup of its own tag (the repository's releases also hold the
+ * apps' setups), and its checksum list comes from the same place. The answer may come from a cached file.
+ */
+function isOwnSetup(u: SelfUpdate): boolean {
+  const base = `${SELF_DOWNLOADS}${u.tag}/`
+  if (!u.url.startsWith(base) || (u.sumsUrl && !u.sumsUrl.startsWith(base))) return false
+  return new RegExp(SETUP_ASSET, 'i').test(decodeURIComponent(u.url.slice(base.length)))
+}
+
+/** The update the last check offered: "Update now" installs this one, whatever the window sends back. */
+let offered: SelfUpdate | null = null
+
+/** The update this run offered with that tag, or null. */
+export function offeredUpdate(tag: string): SelfUpdate | null {
+  return offered?.tag === tag ? offered : null
+}
 
 /** The newer launcher release, or null when this is the latest (or a dev run, which has no installer to replace). */
 export async function checkSelfUpdate(store: Store, force = false): Promise<SelfUpdate | null> {
   if (!app.isPackaged) return null
   // Answers from the last 30 minutes are reused (GitHub allows 60 unauthenticated requests an hour).
   const cache = await store.loadCache<{ at: number; version: string; update: SelfUpdate | null } | null>('self-check.json', null)
-  if (!force && cache && cache.version === app.getVersion() && Date.now() - cache.at < 30 * 60_000) return cache.update
+  if (!force && cache && cache.version === app.getVersion() && Date.now() - cache.at < 30 * 60_000) {
+    offered = cache.update
+    return cache.update
+  }
   const update = await lookUp()
+  offered = update
   await store.saveCache('self-check.json', { at: Date.now(), version: app.getVersion(), update })
   return update
 }
 
 async function lookUp(): Promise<SelfUpdate | null> {
-  // One retry: GitHub or the network sometimes fails right as the app starts.
-  const release = await latestRelease(SELF_REPO).catch(async () => {
+  // A release whose setup is still uploading is passed over (and offered once it's there, not after the cache's
+  // half hour of "no update"). One retry: GitHub or the network sometimes fails right as the app starts.
+  const usable = (r: Release): boolean => !!findAsset(r, SETUP_ASSET)
+  const release = await latestRelease(SELF_REPO, 'v', usable).catch(async () => {
     await new Promise((r) => setTimeout(r, 4000))
-    return latestRelease(SELF_REPO)
+    return latestRelease(SELF_REPO, 'v', usable)
   })
   if (!release || !isNewer(release.tag, app.getVersion())) return null
   const asset = findAsset(release, SETUP_ASSET)
@@ -93,6 +119,7 @@ export async function installSelfUpdate(
     if (reason) throw new Error(reason)
   }
   refuse()
+  if (!isOwnSetup(u)) throw new Error("That update isn't one of the launcher's own releases.")
   const dl = join(app.getPath('temp'), 'RulZ AI Tools Suite')
   const setup = join(dl, `RulZ-AI-Tools-Suite-Setup-${u.version}.exe`)
   // Releases since SHA256SUMS was added are checked against it; older ones (and old cached answers) aren't.

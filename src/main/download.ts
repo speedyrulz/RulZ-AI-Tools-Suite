@@ -1,9 +1,10 @@
 import { createHash, type Hash } from 'node:crypto'
 import { createReadStream, createWriteStream } from 'node:fs'
-import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
+import { renameRetrying } from './archive'
 import { getFetch } from './github'
 
 export interface DownloadProgress {
@@ -52,9 +53,16 @@ async function readMeta(path: string): Promise<PartMeta | null> {
   }
 }
 
-/** Feeds the bytes already in a .part file into the hash, so a resumed download is checked whole. */
-async function hashFile(path: string, hash: Hash): Promise<void> {
-  for await (const chunk of createReadStream(path)) hash.update(chunk as Buffer)
+/**
+ * Feeds the bytes already in a .part file into the hash, so a resumed download is checked whole. `alive` is called as
+ * it reads: reading back gigabytes from a slow disk can take longer than the stall limit, and isn't a stall.
+ */
+async function hashFile(path: string, hash: Hash, alive: () => void, signal: AbortSignal): Promise<void> {
+  for await (const chunk of createReadStream(path)) {
+    signal.throwIfAborted()
+    hash.update(chunk as Buffer)
+    alive()
+  }
 }
 
 /**
@@ -97,6 +105,11 @@ async function fetchTo(
   const meta = await readMeta(metaPath)
   const have = meta?.url === url && meta.validator ? ((await stat(part).catch(() => null))?.size ?? 0) : 0
 
+  // The part is read into the hash before asking for the rest: reading gigabytes back while the answer waits unread
+  // could let the server drop the connection. Wasted (and redone) only when the server sends the whole file again.
+  let hash = opts.sha256 ? createHash('sha256') : null
+  if (hash && have > 0) await hashFile(part, hash, alive, signal)
+
   const headers: Record<string, string> = { 'User-Agent': 'RulZ-AI-Tools-Suite' }
   if (have > 0 && meta) {
     headers.Range = `bytes=${have}-`
@@ -125,9 +138,7 @@ async function fetchTo(
   if (validator) await writeFile(metaPath, JSON.stringify({ url, validator } satisfies PartMeta), 'utf8')
   else await rm(metaPath, { force: true })
 
-  const hash = opts.sha256 ? createHash('sha256') : null
-  if (hash && resumeAt) await hashFile(part, hash)
-  // Reading a large part file back for the hash isn't the connection stalling.
+  if (hash && have > 0 && !resumeAt) hash = createHash('sha256')
   alive()
 
   let bytes = resumeAt
@@ -166,6 +177,12 @@ async function fetchTo(
     throw new Error(`Download ended early (${bytes} of ${total} bytes).`)
   }
   await rm(metaPath, { force: true })
+  // The size GitHub lists for the file wins over the response's own: a short file sent with a matching
+  // Content-Length would pass the check above, and older releases have no checksum to catch it.
+  if (opts.expectedSize && bytes !== opts.expectedSize) {
+    await rm(part, { force: true })
+    throw new Error(`The download isn't the size of the published file (${bytes} of ${opts.expectedSize} bytes). Try again.`)
+  }
   if (hash && opts.sha256) {
     const got = hash.digest('hex')
     if (got.toLowerCase() !== opts.sha256.toLowerCase()) {
@@ -177,7 +194,8 @@ async function fetchTo(
   }
   opts.onProgress?.({ bytes, total: total ?? bytes, speed: 0 })
   await rm(dest, { force: true })
-  await rename(part, dest)
+  // An antivirus scan of the file just written can hold it for a moment.
+  await renameRetrying(part, dest)
 }
 
 /** Parses a SHA256SUMS file ("<hex>  <name>" lines, as sha256sum writes them) into name → lower-case hash. */

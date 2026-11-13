@@ -25,7 +25,8 @@ let last: PhoneApp | null = null
 export async function latestPhoneApp(sources = PHONE_SOURCES): Promise<PhoneApp | null> {
   try {
     for (const [repo, prefix] of sources) {
-      const release = await latestRelease(repo, prefix)
+      // A newer release without an APK (its build failed, or it is still uploading) leaves the one before it.
+      const release = await latestRelease(repo, prefix, (r) => !!findAsset(r, APK))
       const apk = release && findAsset(release, APK)
       if (release && apk) {
         last = {

@@ -43,6 +43,8 @@ export interface RequirementRef {
   id: RequirementId
   optional?: boolean
   note?: string
+  /** The oldest version the app works with ("3.11"), when it needs more than the check itself asks for. Python only. */
+  minVersion?: string
 }
 
 export interface CatalogApp {
@@ -93,6 +95,11 @@ export interface InstalledInfo {
   components: string[]
   /** The files are in place but a setup step failed or was cancelled; Repair runs the steps again. */
   needsSetup: boolean
+  /**
+   * While needsSetup: the shortcuts and optional parts the install was started with, which come after the setup.
+   * Repair adds them once the setup has run.
+   */
+  pending?: { desktop: boolean; startMenu: boolean; components: string[] }
 }
 
 export interface LatestInfo {
@@ -153,7 +160,9 @@ export interface RequirementStatus {
   label: string
   ok: boolean
   detail: string
-  /** winget can install it. */
+  /** The version found ("3.12.4"), where an app may need a newer one (Python). */
+  version?: string
+  /** winget can install it (whether or not it is missing: an app may need a newer Python than the one found). */
   canInstall: boolean
   helpUrl: string
 }

@@ -38,7 +38,7 @@ export const CATALOG: CatalogApp[] = [
       'Base models (about 10 to 20 GB each, up to 50 GB for the biggest) are downloaded later from the WebUI, into this folder.',
       'Launch opens a console window and the WebUI in your browser. Closing the console stops it.'
     ],
-    highlights: ['Nine image models', 'Wizard with recommended settings', 'Multi-GPU', 'ComfyUI-ready LoRAs']
+    highlights: ['Ten image models + PAN 2 video', 'Wizard with recommended settings', 'Multi-GPU', 'ComfyUI-ready LoRAs']
   },
   {
     id: 'image-organizer',
@@ -235,7 +235,7 @@ export const CATALOG: CatalogApp[] = [
     },
     launch: { target: 'Start Image Crawler.bat', icon: 'assets\\icon.ico' },
     requirements: [
-      { id: 'python', note: 'Python 3.11 or newer' },
+      { id: 'python', minVersion: '3.11', note: 'Python 3.11 or newer' },
       { id: 'nvidia', note: 'NVIDIA GPU with about 12 GB of VRAM or more' },
       { id: 'git', optional: true, note: 'Lets the launcher update it with git pull' }
     ],

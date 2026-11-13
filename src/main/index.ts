@@ -8,7 +8,7 @@ import { setFetch } from './github'
 import { broadcast, handle } from './ipc'
 import { latestPhoneApp } from './phoneApp'
 import { checkRequirements, installRequirement } from './requirements'
-import { checkSelfUpdate, installSelfUpdate } from './selfUpdate'
+import { checkSelfUpdate, installSelfUpdate, offeredUpdate } from './selfUpdate'
 import { Store } from './store'
 
 const isDev = !app.isPackaged && !!process.env.ELECTRON_RENDERER_URL
@@ -167,7 +167,10 @@ async function main(): Promise<void> {
   handle('self:check', (force) => checkSelfUpdate(store, !!force).catch(() => null))
   handle('self:install', async (u) => {
     try {
-      await installSelfUpdate(u, (f) => broadcast('self:progress', f), () => apps.activeJobNames())
+      // Installs the update this process found on GitHub; the window only says which one.
+      const known = offeredUpdate(u.tag)
+      if (!known) throw new Error('Check for updates again, then update.')
+      await installSelfUpdate(known, (f) => broadcast('self:progress', f), () => apps.activeJobNames())
     } catch (e) {
       broadcast('self:progress', -1)
       throw e
