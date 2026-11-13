@@ -1,7 +1,7 @@
 # RulzTrainer likeness scoring for ComfyUI
 
 Score any images against a person's reference photos exactly as the RulzTrainer trainer scores its likeness probes
-and samples: the same face model, the same held-out gold face (FaceNet), the same body score, the same normalized
+and samples: the same face model, the same held-out gold face (AdaFace, or FaceNet), the same body score, the same normalized
 scale and the same face / body weights.
 The nodes import the trainer's own scoring code from a RulzTrainer checkout, so the numbers are the trainer's.
 
@@ -24,7 +24,7 @@ image widths when reading the person mask, which RulzTrainer works around by pad
 so their body scores can differ from other machines by a hair.
 
 The first run downloads InsightFace `buffalo_l` (into `~/.insightface`), DINOv2 base (into the Hugging Face cache),
-the MediaPipe pose model and the FaceNet VGGFace2 weights (into the checkout's `models/`), as the trainer does.
+the MediaPipe pose model and the gold face's weights (AdaFace ViT, about 460 MB, or FaceNet VGGFace2; into the checkout's `models/`), as the trainer does.
 
 Load `workflows/RulzTrainer Likeness Scoring.json` for a ready-made workflow.
 
@@ -39,10 +39,11 @@ Load `workflows/RulzTrainer Likeness Scoring.json` for a ready-made workflow.
   and turned upright) or `proportions` (body ratios from the pose skeleton, plus SAM 3 silhouette widths with
   `body_backend: mediapipe+sam3`; SAM 3 is gated on Hugging Face).
 - `face_provider`, `face_det_size`, `body_device`: as the trainer's settings of the same names.
-- `gold_face` (`facenet`): the trainer's held-out gold face (`face_gold`). FaceNet (VGGFace2), which nothing trains
-  on, scores the same detected face against its own embeddings of the references. A run that trains against ArcFace
+- `gold_face` (`adaface`): the trainer's held-out gold face (`face_gold`). AdaFace ViT-Base (the trainer's default
+  since 3.14.0) or FaceNet (VGGFace2, the one before), which nothing trains on, scores the same detected face against its own embeddings of the references. A run that trains against ArcFace
   (the reward stage, the identity loss on its arcface backend, identity alignment) can raise the ArcFace face score
-  without raising the likeness; the gold face shows when that happens. `off` skips it.
+  without raising the likeness; the gold face shows when that happens. `off` skips it. With a run's scale
+  loaded, pick the run's own gold scorer: a run's FaceNet scale is not used for AdaFace scores (or the reverse).
 
 **RulzTrainer Likeness Score**: scores the images and averages them.
 - `images` and/or `image_paths`: one image, a batch, files or folders.

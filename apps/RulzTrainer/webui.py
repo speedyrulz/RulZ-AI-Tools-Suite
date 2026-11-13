@@ -1005,6 +1005,11 @@ def group_by_generation(paths, names: list[str]) -> list[tuple[int, str, list[tu
 probe_racer = history.probe_racer
 
 
+def _gold_name(rec: dict | None) -> str:
+    """The display name of a probe record's gold face recognizer (records before 3.14.0 carry none: FaceNet)."""
+    return {"adaface": "AdaFace"}.get(str((rec or {}).get("gold_name") or "").lower(), "FaceNet")
+
+
 def _probe_points(probes: list[dict], key: str, fallback: str | None = None) -> list[list]:
     """[step, score] of each probe record for a key (normalized where the record has it, raw for older runs)."""
     out = []
@@ -1036,9 +1041,10 @@ def probe_chart_series(probes: list[dict], names: list[str],
                    "data": _probe_points(probes, "body_norm", "body"), "itemStyle": {"color": "#A1A1AA"}}]
         legend = list(PROBE_DEFAULT_SERIES)
         gold = _probe_points(probes, "gold_norm_ema", "gold_ema")
-        if gold:  # the held-out FaceNet face (face_gold): drawn next to ArcFace's, so a gap between them shows
-            series.append(_line("face (FaceNet)", "#22D3EE", lineStyle={"type": "dashed"}, data=gold))
-            legend.append("face (FaceNet)")
+        if gold:  # the held-out gold face (face_gold): drawn next to ArcFace's, so a gap between them shows
+            name = f"face ({_gold_name(probes[-1])})"
+            series.append(_line(name, "#22D3EE", lineStyle={"type": "dashed"}, data=gold))
+            legend.append(name)
         return series, legend
     by: dict[str, list[dict]] = {}
     for pr in probes:
@@ -1130,7 +1136,8 @@ def probe_score_line(rec: dict | None) -> str:
     gold = rec.get("gold_norm")
     if face is None and body is None and not rec.get("scale"):
         face, body, gold = rec.get("face"), rec.get("body"), rec.get("gold")
-    parts = [f"{label} {v:.0f}%" for label, v in (("overall", comb), ("face", face), ("FaceNet face", gold),
+    parts = [f"{label} {v:.0f}%" for label, v in (("overall", comb), ("face", face),
+                                                   (f"{_gold_name(rec)} face", gold),
                                                    ("body", body)) if v is not None]
     if rec.get("copy") is not None:  # the copy check: its closest training photo (SSCD cosine)
         parts.append(f"copy {rec['copy']:.2f}")
@@ -10138,11 +10145,12 @@ def build_page(local: bool = True):
                                 .classes("w-96 max-w-full") \
                                 .tooltip("Not used while Resolution step-up is on (its two counts replace it).")
                         with fields():
-                            w["face_gold"] = ui.select({"auto": "auto (when training against ArcFace)", "off": "off",
+                            w["face_gold"] = ui.select({"auto": "auto (AdaFace, when training against ArcFace)",
+                                                        "off": "off", "adaface": "AdaFace, always",
                                                         "facenet": "FaceNet, always"}, value=d.face_gold,
                                                        label="Gold face scorer").classes("w-72") \
-                                .tooltip("A second face recognizer (FaceNet, VGGFace2, about 110 MB, downloaded once) "
-                                         "scores every probe face too. Nothing trains on it, so it can judge a run that "
+                                .tooltip("A second face recognizer (AdaFace ViT, about 460 MB, downloaded once; or "
+                                         "FaceNet, the one before 3.14.0, about 110 MB) scores every probe face too. Nothing trains on it, so it can judge a run that "
                                          "trains against the probes' own ArcFace: the reward stage, the identity loss "
                                          "on its arcface backend, identity alignment. Those can raise the ArcFace score "
                                          "without the face looking more like the person. auto turns it on for them "
@@ -11449,7 +11457,8 @@ def build_page(local: bool = True):
                     chips = [("Step", f"{last['step']:,}", False), ("Combined", f2(last.get("combined_ema")), False),
                              ("Face", f2(fe), False)]
                     if ge is not None:
-                        chips.append(("FaceNet face" + (" (in charge)" if last.get("gold_select") else ""), f2(ge),
+                        chips.append((f"{_gold_name(last)} face" + (" (in charge)" if last.get("gold_select")
+                                                                      else ""), f2(ge),
                                       False))
                     chips += [("Body", f2(be), False),
                               ("Best", f"{f2(lk.get('best'))} at step {lk.get('best_step') or 0:,}"
@@ -12031,13 +12040,14 @@ and a noise band that fits your probe settings. In a race, *Drop only when the p
 drops the lowest racer only when its scores, seed by seed, sit below the leader's with the confidence you set (0.9 is a
 good start); a round too close to call drops nobody, at most a few rounds in a row. Use 2 or more probe seeds with it.
 
-## Gold face scorer (FaceNet)
+## Gold face scorer (AdaFace)
 The probes judge the face with ArcFace. The reward stage, the identity loss on its arcface backend and identity
 alignment train against that same ArcFace, so they can raise its score without the face looking more like the person.
-*Gold face scorer* (Likeness probes section) adds a second recognizer, FaceNet, that nothing trains on: it scores the
+*Gold face scorer* (Likeness probes section) adds a second recognizer, AdaFace (FaceNet before 3.14.0, still a
+choice), that nothing trains on: it scores the
 same faces against the same references on its own scale, and (*Best checkpoint, early stop and race follow it*, on by
 default) its score replaces ArcFace's in the decisions. *auto* turns it on for those runs and for the probe noise
-check. The Monitor draws it as a dashed "face (FaceNet)" line; ArcFace pulling away from it is the warning sign, and the
+check. The Monitor draws it as a dashed "face (AdaFace)" line; ArcFace pulling away from it is the warning sign, and the
 reward stage logs a warning when ArcFace runs more than 10 points further ahead than when the stage began.
 
 ## Probes on the second GPU

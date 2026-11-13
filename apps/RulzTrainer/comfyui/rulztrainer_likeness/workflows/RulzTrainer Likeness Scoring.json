@@ -315,7 +315,7 @@
         "cpu",
         640,
         "facebook/sam3",
-        "facenet"
+        "adaface"
       ],
       "widgets_values_named": {
         "reference_paths": "",
@@ -327,7 +327,7 @@
         "face_provider": "cpu",
         "face_det_size": 640,
         "sam3_model": "facebook/sam3",
-        "gold_face": "facenet"
+        "gold_face": "adaface"
       }
     },
     {

@@ -462,7 +462,8 @@ def likeness_chart(ax, run: Run, legend=True):
         return
     steps = [r["step"] for r in pr]
     gold = any(r.get("gold_select") for r in pr)
-    series = [("Face" + (" (FaceNet)" if gold else ""), "gold_norm_ema" if gold else "face_norm_ema", BLUE, "o"),
+    gold_name = "AdaFace" if any(r.get("gold_name") == "adaface" for r in pr) else "FaceNet"
+    series = [("Face" + (f" ({gold_name})" if gold else ""), "gold_norm_ema" if gold else "face_norm_ema", BLUE, "o"),
               ("Body", "body_norm_ema", ORANGE, "s"), ("Combined", "combined_ema", AQUA, "D")]
     for label, key, color, marker in series:
         ys = [r.get(key) if r.get(key) is not None else (r.get(key.replace("_norm", "")) if "_norm" in key else None)

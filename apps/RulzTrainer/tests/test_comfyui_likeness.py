@@ -25,7 +25,7 @@ from rulztrainer_likeness import core, nodes  # noqa: E402
 
 FACE = {"a.png": 60.0, "b.png": 40.0, "c.png": None, "ref1.png": 70.0, "ref2.png": 66.0, "base.png": 20.0}
 BODY = {"a.png": 85.0, "b.png": None, "c.png": 83.0, "base.png": 81.0}
-GOLD = {"a.png": 50.0, "b.png": 30.0, "base.png": 10.0}  # the held-out FaceNet face (c.png has no face)
+GOLD = {"a.png": 50.0, "b.png": 30.0, "base.png": 10.0}  # the held-out gold face (c.png has no face)
 
 
 class FakeFace:
@@ -240,7 +240,7 @@ def test_the_gold_face_in_the_overall_matches_the_trainer(fakes, tmp_path):
 
     refs, info = nodes.RZLikenessReferences().build(str(fakes / "refs"), "", "", "appearance", "mediapipe+sam3",
                                                     "cpu", "cpu", 640, "x")
-    assert refs.has_gold and refs.gold_ceiling == pytest.approx(60.0) and "Gold face (FaceNet" in info
+    assert refs.has_gold and refs.gold_ceiling == pytest.approx(60.0) and "Gold face (AdaFace" in info
     images = "\n".join(str(fakes / n) for n in ("a.png", "b.png", "c.png"))
     report, summary, details, overall, face, body, gold = nodes.RZLikenessScore().score(
         refs, images, 0.7, 0.3, True, "", "", -1, -1, -1, -1, "gold")
@@ -257,9 +257,15 @@ def test_the_gold_face_in_the_overall_matches_the_trainer(fakes, tmp_path):
     # a trainer run whose probes had the gold face in charge: auto follows it, with the run's gold scale
     job = tmp_path / "job"
     job.mkdir()
-    (job / "likeness.jsonl").write_text(json.dumps({"step": 0, "gold_select": True, "scale": {
+    # a run from before 3.14.0 (no gold_name: FaceNet): its gold scale is not AdaFace's, so it is not taken
+    rec_old = {"step": 0, "gold_select": True, "scale": {
         "face": [13.8, 94.7], "body": [73.3, 90.0], "gold": [8.0, 80.0],
-        "curve": {"face": 1.5, "body": 1.5, "gold": 1.5}}}))
+        "curve": {"face": 1.5, "body": 1.5, "gold": 1.5}}}
+    (job / "likeness.jsonl").write_text(json.dumps(rec_old))
+    report_old = nodes.RZLikenessScore().score(refs, images, 0.7, 0.3, True, "", str(job), -1, -1, -1, -1, "auto")[0]
+    assert report_old["scale"].gold != (8.0, 80.0) and report_old["scale"].sources["gold"]["floor"] != "trainer run"
+    assert report_old["scale"].sources["face"]["floor"] == "trainer run"
+    (job / "likeness.jsonl").write_text(json.dumps({**rec_old, "gold_name": "adaface"}))
     report2, _, _, overall2, _, _, gold2 = nodes.RZLikenessScore().score(
         refs, images, 0.7, 0.3, True, "", str(job), -1, -1, -1, -1, "auto")
     assert report2["scale"].gold == (8.0, 80.0) and report2["scale"].sources["gold"]["floor"] == "trainer run"
@@ -302,9 +308,9 @@ def test_spreadsheet_has_the_gold_face(fakes, tmp_path):
     wb = openpyxl.load_workbook(core.export(report["rows"], report["summary"], report["scale"], refs,
                                             tmp_path / "lk", "xlsx")[0])
     head = [c.value for c in wb["Images"][1]]
-    assert head[5] == "Gold face (FaceNet)" and wb["Images"].cell(2, 6).value == pytest.approx(
+    assert head[5] == "Gold face" and wb["Images"].cell(2, 6).value == pytest.approx(
         report["rows"][0]["gold"], abs=1e-3)
-    assert wb["Summary"]["E1"].value == "Gold face (FaceNet)"
+    assert wb["Summary"]["E1"].value == "Gold face (AdaFace)"
     assert wb["Summary"]["E2"].value == pytest.approx(report["summary"]["gold"], abs=1e-3)
     labels = [r[0].value for r in wb["Summary"].iter_rows()]
     assert "Gold face scale (raw floor, ceiling)" in labels and "Face in the overall score" in labels
