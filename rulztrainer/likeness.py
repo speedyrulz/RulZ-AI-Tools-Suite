@@ -38,7 +38,7 @@ references' mean, so curving it would squash the differences between runs.
 
 Gold face score. A run that trains against ArcFace (the reward stage, the identity loss on its arcface backend,
 identity alignment) can raise the ArcFace score without raising the likeness: the score it is judged by is the one it
-optimizes. With `face_gold` the probes also score each face with FaceNet (VGGFace2), which nothing trains on, on its
+optimizes. With `face_gold` the probes also score each face with AdaFace (adaface.py; or FaceNet), which nothing trains on, on its
 own scale (its own step-0 floor and reference ceiling, the face's span and curve). With `face_gold_select` (the
 default) the gold face takes the ArcFace face's place in the combined score that picks the best checkpoint, stops
 early, steps up the resolution and ranks a race (and in the per-seed scores paired race drops use); the lr control
@@ -190,6 +190,7 @@ class ProbeRecord:
     gold_norm_seeds: list = field(default_factory=list)
     gold_select: bool = False
     arc_combined_ema: float | None = None
+    gold_name: str = ""  # the gold recognizer: adaface / facenet ("" with no gold, and in records before 3.14.0: FaceNet)
     # the copy check (copy_check, copycheck.py), logged only: the highest SSCD match of this probe's renders among the
     # training photos, that photo, and the photos' own typical best match among themselves
     copy: float | None = None

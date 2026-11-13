@@ -22,10 +22,11 @@ import sys
 from pathlib import Path
 from statistics import NormalDist
 
-# gold: the held-out FaceNet face (face_gold); combined_gold: it combined with the body, as the decisions read it then
+# gold: the held-out gold face (face_gold: AdaFace, or FaceNet);
+# combined_gold: it combined with the body, as the decisions read it then
 KINDS = ("face", "body", "combined", "gold", "combined_gold")
 GOLD_KINDS = ("gold", "combined_gold")  # only when the probes had the gold face
-LABELS = {"gold": "gold face (FaceNet)", "combined_gold": "combined with the gold face"}
+LABELS = {"gold": "gold face", "combined_gold": "combined with the gold face"}
 # a run's own records: where each kind's per-seed normalized scores are (combined_seeds: the combination the run's
 # decisions read, with the gold face when it was in charge)
 RECORD_KEYS = {"face": "face_norm_seeds", "body": "body_norm_seeds", "gold": "gold_norm_seeds",

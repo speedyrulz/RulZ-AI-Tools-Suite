@@ -4645,6 +4645,8 @@ class Trainer(RaceParallelMixin):
         rec, actions = self.controller.update(step, face, body, images, seeds)
         # the copy check reads the likeness renders alone, so its number does not depend on the extra prompts
         copy_note = self._copy_probe(rec, [p for p in images if "_check-" not in Path(p).name])
+        if rec.gold is not None or rec.gold_norm_ema is not None:
+            rec.gold_name = self._gold_backend_name()
         append_record(self.job_dir, rec)
         fmt = lambda v: "n/a" if v is None else f"{v:.1f}%"  # noqa: E731
         who = f"[{self.race.active.name}] " if self._race_running() else ""
@@ -4679,8 +4681,8 @@ class Trainer(RaceParallelMixin):
                      100 * cfg.likeness_best_min_kept)
         if self.controller.has_gold:
             arc, gold = rec.face_norm_ema if self.controller.normalize else rec.face_ema, rec.gold_norm_ema
-            log.info("%sGold face (FaceNet) step %d: %s (normalized %s) | ema %s vs ArcFace %s%s%s", who, step,
-                     fmt(rec.gold), fmt(rec.gold_norm), fmt(gold), fmt(arc),
+            log.info("%sGold face (%s) step %d: %s (normalized %s) | ema %s vs ArcFace %s%s%s", who,
+                     self._gold_label(), step, fmt(rec.gold), fmt(rec.gold_norm), fmt(gold), fmt(arc),
                      f" (ArcFace {arc - gold:+.1f})" if arc is not None and gold is not None else "",
                      " | the decisions follow the gold face" if rec.gold_select else "")
             self._check_gold_gap(step)
@@ -4968,8 +4970,8 @@ class Trainer(RaceParallelMixin):
         if gap - base > limit:
             self._gold_gap_warned = True
             log.warning("Reward stage, step %d: ArcFace's face score has run %.1f points further ahead of the gold "
-                        "(FaceNet) face than when the stage started (%+.1f -> %+.1f): the reward may be gaming "
-                        "ArcFace rather than improving the likeness. %s", step, gap - base, base, gap,
+                        "(%s) face than when the stage started (%+.1f -> %+.1f): the reward may be gaming "
+                        "ArcFace rather than improving the likeness. %s", step, gap - base, self._gold_label(), base, gap,
                         "The best checkpoint follows the gold face" if self.controller.gold_select else
                         "Compare the probes by eye; face_gold_select makes the best checkpoint follow the gold face")
             self.status.update(gold_gap_warning=step)
@@ -5051,27 +5053,40 @@ class Trainer(RaceParallelMixin):
         self._setup_gold(scorer)
         return scorer
 
+    def _gold_backend_name(self) -> str:
+        """The gold recognizer the run loaded (status face_gold: adaface / facenet), "" before it loads."""
+        data = getattr(getattr(self, "status", None), "data", None)
+        return str(data.get("face_gold") or "") if isinstance(data, dict) else ""
+
+    def _gold_label(self) -> str:
+        from .idloss import gold_label
+
+        return gold_label(self._gold_backend_name())
+
     def _setup_gold(self, scorer) -> None:
-        """The held-out gold face recognizer (face_gold, likeness.py): FaceNet on the face scorer when the run, or any
-        race configuration, trains against ArcFace (or face_gold is facenet, or the noise check runs), on the face
-        scorer's device. Never when a configuration trains on FaceNet itself."""
+        """The held-out gold face recognizer (face_gold, likeness.py): AdaFace (or FaceNet, face_gold facenet) on the
+        face scorer when the run, or any race configuration, trains against ArcFace (or face_gold names one, or the
+        noise check runs), on the face scorer's device. One recognizer serves a whole race: the main configuration's,
+        else the first row's that has one. Never FaceNet when a configuration trains on FaceNet itself."""
         cfgs = [self.cfg] + [c for _, c, _ in (getattr(self, "race_rows", None) or [])]
-        if not any(c.gold_backend() for c in cfgs):
-            scorer.gold = None
-            return
-        if any(c.trains_on_facenet() for c in cfgs):
-            log.warning("Gold face scorer off: a race configuration trains on FaceNet (id_loss_backend facenet), so "
-                        "it is no held-out judge; the probes judge with ArcFace alone")
+        backend = next((c.gold_backend() for c in cfgs if c.gold_backend()), "")
+        if not backend:
             scorer.gold = None
             return
         from . import facesim, idloss
 
+        label = idloss.gold_label(backend)
+        if backend == "facenet" and any(c.trains_on_facenet() for c in cfgs):
+            log.warning("Gold face scorer off: a configuration trains on FaceNet (id_loss_backend facenet), so it is "
+                        "no held-out judge; use face_gold adaface. The probes judge with ArcFace alone")
+            scorer.gold = None
+            return
         cfg = self.cfg
-        self.status.update(stage="loading the gold face scorer (FaceNet)")
+        self.status.update(stage=f"loading the gold face scorer ({label})")
         index = facesim.cuda_index(cfg.face_provider)
         dev = f"cuda:{index}" if index is not None and torch.cuda.is_available() else "cpu"
         try:
-            emb = idloss.facenet_embedder(cfg.models_dir, progress=lambda t, f: self.status.update(stage=t))
+            emb = idloss.gold_embedder(backend, cfg.models_dir, progress=lambda t, f: self.status.update(stage=t))
             scorer.set_gold(emb.to(dev))
         except Exception as e:  # noqa: BLE001
             log.warning("Could not load the gold face scorer (%s); the probes judge with ArcFace alone", e)
@@ -5082,11 +5097,14 @@ class Trainer(RaceParallelMixin):
             scorer.gold = None
             return
         why = ("the run trains against ArcFace" if any(c.trains_on_arcface() for c in cfgs)
-               else "the noise check measures it" if cfg.noise_files else "face_gold facenet")
-        log.info("Gold face scorer on (%s): FaceNet (VGGFace2), which nothing trains on, scores every probe face "
-                 "too; %s", why, "the best checkpoint, early stop and race ranking follow it, the lr control and "
+               else "the noise check measures it" if cfg.noise_files else f"face_gold {backend}")
+        log.info("Gold face scorer on (%s): %s, which nothing trains on, scores every probe face "
+                 "too; %s", why, {"adaface": "AdaFace (ViT-Base, WebFace4M)", "facenet": "FaceNet (VGGFace2)"}[backend],
+                 "the best checkpoint, early stop and race ranking follow it, the lr control and "
                  "curriculum keep ArcFace" if cfg.face_gold_select else "logged next to ArcFace (face_gold_select off)")
-        self.status.update(face_gold="facenet", face_gold_similarity=scorer.gold_self_similarity)
+        self.status.update(face_gold=backend, face_gold_similarity=scorer.gold_self_similarity)
+        if isinstance(getattr(self.status, "data", None), dict):
+            self.status.data.setdefault("face_gold", backend)
 
     def _make_id_loss(self):
         """The direct identity loss (experimental), or None when it is off or cannot run."""

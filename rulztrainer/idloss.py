@@ -148,6 +148,30 @@ def facenet_embedder(models_dir: str | Path = "models", progress=None) -> Embedd
     return Embedder(net, 160, 127.5 / 128.0, "facenet")
 
 
+def adaface_embedder(models_dir: str | Path = "models", progress=None) -> Embedder:
+    """AdaFace ViT-Base / WebFace4M (112 px, the face and its mirror image summed). Input (rgb - 127.5) / 127.5."""
+    from . import adaface
+
+    return Embedder(adaface.FlipSum(adaface.load(adaface.ensure_weights(models_dir, progress))), 112, 1.0, "adaface")
+
+
+GOLD_NAMES = {"adaface": "AdaFace", "facenet": "FaceNet"}
+
+
+def gold_embedder(backend: str, models_dir: str | Path = "models", progress=None) -> Embedder:
+    """The held-out gold face recognizer by face_gold's name: adaface or facenet."""
+    if backend == "adaface":
+        return adaface_embedder(models_dir, progress)
+    if backend == "facenet":
+        return facenet_embedder(models_dir, progress)
+    raise ValueError(f"unknown gold face recognizer {backend!r}")
+
+
+def gold_label(backend) -> str:
+    """The display name of a run's gold recognizer (status face_gold); runs from before 3.14.0 had only FaceNet."""
+    return GOLD_NAMES.get(str(backend or "facenet").lower(), "FaceNet")
+
+
 def load_rgb(path) -> torch.Tensor:
     """[1,3,H,W] in [-1, 1] at full resolution (EXIF-rotated, matching FaceScorer.faces' coordinates)."""
     from PIL import Image, ImageOps

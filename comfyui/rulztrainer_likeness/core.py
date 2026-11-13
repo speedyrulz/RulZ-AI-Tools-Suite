@@ -7,7 +7,7 @@ proportions score with MediaPipe, optionally with SAM 3 silhouettes), the same n
 100 = 1.35x as far above a stranger as a typical reference's best match among the others, curved by 1.5, capped at
 100) and the same face / body weighting.
 
-The held-out gold face (the trainer's face_gold: FaceNet VGGFace2 on the same detected face, against its own
+The held-out gold face (the trainer's face_gold: AdaFace ViT, or FaceNet VGGFace2, on the same detected face, against its own
 embeddings of the references, on its own scale shaped like the face's) is scored too when the references have it. With
 the trainer's face_gold_select it takes ArcFace's place in the overall score; the overall with ArcFace's face is kept
 next to it (the trainer's arc_combined_ema).
@@ -48,32 +48,37 @@ def face_model(provider: str = "cpu", det_size: int = 640):
     return _MODELS[key]
 
 
-def gold_model(models_dir: str, provider: str = "cpu"):
-    """The trainer's held-out gold face recognizer (FaceNet VGGFace2, idloss.facenet_embedder), on the face scorer's
-    GPU as the trainer places it (the CPU with the cpu provider)."""
+def gold_model(models_dir: str, provider: str = "cpu", backend: str = "adaface"):
+    """The trainer's held-out gold face recognizer (AdaFace ViT or FaceNet VGGFace2, idloss.gold_embedder), on the face
+    scorer's GPU as the trainer places it (the CPU with the cpu provider)."""
     import torch
 
     index = facesim.cuda_index(provider)
     device = f"cuda:{index}" if index is not None and torch.cuda.is_available() else "cpu"
-    key = ("gold", str(models_dir), device)
+    key = ("gold", backend, str(models_dir), device)
     if key not in _MODELS:
         from rulztrainer import idloss
 
-        _MODELS[key] = idloss.facenet_embedder(models_dir).to(device)
+        _MODELS[key] = idloss.gold_embedder(backend, models_dir).to(device)
     return _MODELS[key]
 
 
-def _setup_gold(scorer, models_dir: str, provider: str) -> list[str]:
+def gold_label(backend) -> str:
+    return {"adaface": "AdaFace"}.get(str(backend or "").lower(), "FaceNet")
+
+
+def _setup_gold(scorer, models_dir: str, provider: str, backend: str = "adaface") -> list[str]:
     """The gold recognizer on the face scorer, after its references (as the trainer's _setup_gold). Returns notes."""
+    name = gold_label(backend)
     try:
-        scorer.set_gold(gold_model(models_dir, provider))
+        scorer.set_gold(gold_model(models_dir, provider, backend))
     except Exception as e:  # noqa: BLE001
         log.warning("Could not load the gold face scorer (%s); the faces are scored with ArcFace alone", e)
         scorer.gold = scorer.gold_refs = scorer.gold_self_similarity = None
-        return [f"Gold face (FaceNet): could not load ({e}); no gold face score"]
+        return [f"Gold face ({name}): could not load ({e}); no gold face score"]
     if scorer.gold_refs is None:
         scorer.gold = scorer.gold_self_similarity = None
-        return ["Gold face (FaceNet): no reference face with landmarks; no gold face score"]
+        return [f"Gold face ({name}): no reference face with landmarks; no gold face score"]
     return []
 
 
@@ -123,6 +128,7 @@ class RefSet:
     body_kind: str = "appearance"
     labels: dict = field(default_factory=dict)  # file path -> the name shown for it (images given as a batch)
     notes: list = field(default_factory=list)
+    gold_name: str = ""  # the gold recognizer: adaface / facenet
 
     @property
     def face_ceiling(self):
@@ -168,7 +174,7 @@ class RefSet:
         else:
             lines.append("Face references: none (no face score)")
         if self.has_gold:
-            lines.append(f"Gold face (FaceNet, held out): {self.gold_count} reference face"
+            lines.append(f"Gold face ({gold_label(self.gold_name)}, held out): {self.gold_count} reference face"
                          f"{'s' if self.gold_count != 1 else ''}")
         if self.body is not None:
             what = "show the body window" if self.body_kind == "appearance" else "have a pose"
@@ -180,17 +186,18 @@ class RefSet:
 
 def build_references(face_paths, body_paths, *, face_provider="cpu", det_size=640, body_kind="appearance",
                      body_backend="mediapipe+sam3", body_device="cuda:0", sam3_model="facebook/sam3",
-                     models_dir="models", labels=None, gold="facenet") -> RefSet:
+                     models_dir="models", labels=None, gold="adaface") -> RefSet:
     """Embed the references as the trainer does (set_references, then the gold recognizer's set_gold). face_paths /
-    body_paths: image files or folders; an empty list leaves that kind out. gold: "facenet" (the held-out gold face
-    too) or "off"."""
+    body_paths: image files or folders; an empty list leaves that kind out. gold: "adaface" or "facenet" (the held-out
+    gold face too) or "off"."""
     refs = RefSet(body_kind=body_kind, labels=dict(labels or {}))
     if face_paths:
         scorer = face_model(face_provider, det_size)
         scorer.gold = scorer.gold_refs = scorer.gold_self_similarity = None  # the shared scorer: no earlier gold
         refs.face_info = scorer.set_references(face_paths)
-        if scorer.refs and gold == "facenet":
-            refs.notes += _setup_gold(scorer, models_dir, face_provider)
+        if scorer.refs and gold in ("adaface", "facenet"):
+            refs.gold_name = gold
+            refs.notes += _setup_gold(scorer, models_dir, face_provider, gold)
         if scorer.refs:
             refs.face, refs.face_state = scorer, _snapshot(scorer)
         else:
@@ -257,7 +264,8 @@ def job_scale(job_dir) -> dict:
         except json.JSONDecodeError:
             continue
         if rec.get("scale"):
-            scale = {**rec["scale"], "gold_select": bool(rec.get("gold_select"))}
+            scale = {**rec["scale"], "gold_select": bool(rec.get("gold_select")),
+                     "gold_name": rec.get("gold_name") or "facenet"}  # records before 3.14.0: FaceNet
     if not scale:
         raise ValueError(f"{p} has no normalized scale (the run had likeness_normalize off)")
     return scale
@@ -286,6 +294,11 @@ def build_scale(refs: RefSet, normalize=True, baseline_rows=None, job=None, face
             sources[kind]["floor"] = f"baseline images ({len(vals)})"
     if job:
         for kind in kinds:
+            if kind == "gold" and str(job.get("gold_name") or "facenet") != (refs.gold_name or "facenet"):
+                # the run's gold scale is another recognizer's raw numbers: keep the references' own
+                log.info("The run's gold face scale is %s's, not %s's: the gold face keeps its own scale",
+                         gold_label(job.get("gold_name")), gold_label(refs.gold_name))
+                continue
             if kind in job:
                 fixed[kind] = [float(job[kind][0]), float(job[kind][1])]
                 sources[kind] = {"floor": "trainer run", "ceiling": "trainer run"}
@@ -397,7 +410,7 @@ def summary_text(summary: dict, refs: RefSet) -> str:
         " (no usable body in any body reference)" if refs.body_info else " (no body references)")
     lines = [f"Likeness of {n} image{'s' if n != 1 else ''}", f"Overall {pct(summary['overall'])}", face]
     if summary.get("has_gold"):
-        lines.append(f"Gold face (FaceNet) {pct(summary['gold'])}" + (
+        lines.append(f"Gold face ({gold_label(refs.gold_name)}) {pct(summary['gold'])}" + (
             " (in charge of the overall score)" if summary["gold_select"] else " (not in the overall score)"))
     lines.append(body)
     if summary.get("gold_select"):
@@ -423,7 +436,7 @@ def details_text(rows) -> str:
 
 IMAGE_COLUMNS = [  # (key, header)
     ("index", "#"), ("image", "Image"), ("overall", "Overall"), ("face", "Face"), ("body", "Body"),
-    ("gold", "Gold face (FaceNet)"), ("overall_arcface", "Overall with ArcFace's face"),
+    ("gold", "Gold face"), ("overall_arcface", "Overall with ArcFace's face"),
     ("faces", "Faces found"), ("best_face_ref", "Closest face reference"), ("face_cosine", "Face cosine"),
     ("face_raw", "Face raw %"), ("gold_cosine", "Gold face cosine"), ("gold_raw", "Gold face raw %"),
     ("body_raw", "Body raw %"), ("body_compared", "Body references compared"),
@@ -435,7 +448,7 @@ COSINE_KEYS = {"face_cosine", "gold_cosine"}
 
 def _summary_rows(summary, scale: Scale, refs: RefSet):
     s = lambda key: [summary[f"{k}_{key}" if key else k] for k in ("overall", "face", "body", "gold")]  # noqa: E731
-    yield ["", "Overall", "Face", "Body", "Gold face (FaceNet)"]
+    yield ["", "Overall", "Face", "Body", f"Gold face ({gold_label(refs.gold_name)})"]
     yield ["Average (as the trainer averages a probe)"] + s("")
     yield ["Mean of the images' own scores"] + s("image_mean")
     yield ["Lowest image"] + s("min")
@@ -446,7 +459,8 @@ def _summary_rows(summary, scale: Scale, refs: RefSet):
     yield []
     yield ["Images", summary["images"]]
     yield ["Face / body weight", f"{summary['face_weight']:g} / {summary['body_weight']:g}"]
-    yield ["Face in the overall score", "gold face (FaceNet)" if summary["gold_select"] else "ArcFace"]
+    yield ["Face in the overall score", f"gold face ({gold_label(refs.gold_name)})" if summary["gold_select"]
+           else "ArcFace"]
     yield ["Overall with ArcFace's face", summary["overall_arcface"]]
     yield ["Normalized", "yes" if scale.normalize else "no"]
     for kind in scale.kinds():
@@ -455,7 +469,7 @@ def _summary_rows(summary, scale: Scale, refs: RefSet):
                f"floor: {scale.sources[kind]['floor']}, ceiling: {scale.sources[kind]['ceiling']}"
                + (f", curve x{scale.curve[kind]:g}" if scale.curve.get(kind, 1.0) != 1.0 else "")]
     yield ["Face references (with a face, given)", refs.face_count, len(refs.face_info)]
-    yield ["Gold face references (FaceNet)", refs.gold_count if refs.has_gold else "off"]
+    yield [f"Gold face references ({gold_label(refs.gold_name)})", refs.gold_count if refs.has_gold else "off"]
     yield [f"Body references ({refs.body_kind}; usable, given)", refs.body_count, len(refs.body_info)]
 
 

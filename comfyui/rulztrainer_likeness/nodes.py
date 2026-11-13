@@ -140,12 +140,15 @@ class RZLikenessReferences:
                                   "Face detector input size (the trainer's default is 640)."}),
                 "sam3_model": ("STRING", {"default": "facebook/sam3", "tooltip":
                                "SAM 3 repo id or local folder (proportions with mediapipe+sam3 only)."}),
-                "gold_face": (["facenet", "off"], {"default": "facenet", "tooltip":
-                              "The trainer's held-out gold face score (face_gold): FaceNet (VGGFace2), which nothing "
+                "gold_face": (["adaface", "facenet", "off"], {"default": "adaface", "tooltip":
+                              "The trainer's held-out gold face score (face_gold): AdaFace ViT (the trainer's default "
+                              "since 3.14.0; FaceNet VGGFace2 before), which nothing "
                               "trains on, scores the same face against its own embeddings of the references. A run "
                               "that trains against ArcFace (reward stage, identity loss, identity alignment) can "
                               "raise the ArcFace face score without raising the likeness; the gold face shows it. "
-                              "Downloads the FaceNet weights into the checkout's models/ the first time."}),
+                              "Downloads its weights into the checkout's models/ the first time (AdaFace about "
+                              "460 MB, FaceNet about 110 MB). Match it to the run's own gold scorer when you load a "
+                              "run's scale."}),
             },
             "optional": {
                 "reference_images": ("IMAGE", {"tooltip": "Reference images for both scores."}),
@@ -165,7 +168,7 @@ class RZLikenessReferences:
         return _files_signature(reference_paths, face_paths, body_paths)
 
     def build(self, reference_paths, face_paths, body_paths, body_score, body_backend, body_device, face_provider,
-              face_det_size, sam3_model, gold_face="facenet", reference_images=None, face_images=None,
+              face_det_size, sam3_model, gold_face="adaface", reference_images=None, face_images=None,
               body_images=None):
         with tempfile.TemporaryDirectory(prefix="rz_refs_", dir=_temp_root()) as tmp:
             labels = {}
@@ -232,7 +235,7 @@ class RZLikenessScore:
                                  "Raw body score that counts as 100 (-1: from the run, the references, or the "
                                  "default)."}),
                 "overall_face": (["auto", "arcface", "gold"], {"default": "auto", "tooltip":
-                                 "Which face score goes into the overall score. gold: the held-out FaceNet face, as "
+                                 "Which face score goes into the overall score. gold: the held-out gold face, as "
                                  "the trainer's face_gold_select does when its gold scorer is on (runs that train "
                                  "against ArcFace). arcface: ArcFace's face, as a run without the gold scorer. auto: "
                                  "as the trainer_run did, else ArcFace. Both overalls are in the details and the "
@@ -255,7 +258,7 @@ class RZLikenessScore:
     OUTPUT_TOOLTIPS = ("Everything, for the export node.", "The averages.", "Each image's scores.",
                        "Average overall score (-1: none).", "Average ArcFace face score (-1: no face found).",
                        "Average body score (-1: no usable body).",
-                       "Average gold face score, FaceNet (-1: off or no face found).")
+                       "Average gold face score, AdaFace or FaceNet (-1: off or no face found).")
     FUNCTION = "score"
     CATEGORY = CATEGORY
     DESCRIPTION = __doc__
@@ -289,7 +292,7 @@ class RZLikenessScore:
                                  gold_floor, gold_ceiling)
         gold_select = bool(job and job.get("gold_select")) if overall_face == "auto" else overall_face == "gold"
         if gold_select and not refs.has_gold:
-            log.warning("RulzTrainer likeness: the references have no gold face (gold_face off, or FaceNet found no "
+            log.warning("RulzTrainer likeness: the references have no gold face (gold_face off, or it found no "
                         "reference face); the overall score uses ArcFace's face")
         core.apply_scale(rows, scale, face_weight, body_weight, gold_select)
         summary = core.summarize(rows, scale, face_weight, body_weight, gold_select)
