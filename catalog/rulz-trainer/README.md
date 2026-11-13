@@ -277,6 +277,13 @@ the Monitor's *Disk* tile and a warning banner tell you before a rental's fixed-
 download is still going, the Monitor says so and how much has arrived. Browse buttons open a browser of the instance's
 files, and every download button hands the file to your browser.
 
+**CPU quota.** A vast.ai container can show every CPU of its host while its quota is smaller (24 CPUs shown, 11.5
+allowed). PyTorch starts one thread per CPU it sees, and with too many threads its work on the CPU crawls: embedding
+111 reference faces with the gold face scorer (`face_provider: cpu`) took 19 min 38 s on such an instance against
+53 s on one with room. The trainer reads the container's quota (cgroup `cpu.max`) at start and caps PyTorch's CPU
+threads to it, logging `CPU quota 11.5 CPUs: PyTorch CPU threads 24 -> 11`; a thread count you set yourself
+(`OMP_NUM_THREADS`, `MKL_NUM_THREADS`) is kept. The speed-up is not yet measured on a quota-limited instance.
+
 **Stop the instance when the runs are done.** An instance bills while it sits idle. On an instance the Monitor's
 *Queue* section has the switch *Stop this vast.ai instance when the runs are done*: three minutes after the last run
 ends (finished, stopped or failed) with nothing left in the queue, the instance stops itself. The GPU's billing ends,

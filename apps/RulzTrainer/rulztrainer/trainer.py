@@ -123,6 +123,29 @@ def setup_logging(job_dir: Path) -> None:
         log.addHandler(h)
 
 
+def cap_cpu_threads(quota=None, env=None) -> int | None:
+    """PyTorch's CPU threads down to the container's CPU quota (machine.cpu_quota) when it starts more than that, so
+    the work it does on the CPU (the gold face scorer with face_provider cpu, body and face models on the CPU) is not
+    throttled to a crawl: on a vast.ai instance showing 24 CPUs with a quota of 11.5, embedding 111 reference faces
+    with AdaFace took 19 min 38 s against 53 s on one with 96 CPUs and a quota of 23, with the container throttled in
+    74% of its periods. Left alone when the user set OMP_NUM_THREADS / MKL_NUM_THREADS. Returns the new count, or
+    None when nothing changed."""
+    from . import machine
+
+    try:
+        quota = machine.cpu_quota() if quota is None else quota
+        before = torch.get_num_threads()
+        cap = machine.cpu_thread_cap(before, quota, env)
+        if cap is None:
+            return None
+        torch.set_num_threads(cap)
+    except Exception as e:  # noqa: BLE001  (never a reason for a run not to start)
+        log.debug("CPU thread cap skipped: %s", e)
+        return None
+    log.info("CPU quota %.1f CPUs: PyTorch CPU threads %d -> %d", quota, before, cap)
+    return cap
+
+
 def prune_checkpoints(job_dir: Path, stem: str, keep: int) -> list[Path]:
     """Keep the newest `keep` step checkpoints of `stem` (<stem>_<step>.safetensors and its extra ranks
     <stem>_<step>_r<rank>.safetensors) in a job folder and delete the older ones. The final file, <stem>_best and
@@ -529,6 +552,7 @@ class Trainer(RaceParallelMixin):
         self.cfg = cfg
         self.job_dir = cfg.job_dir()
         setup_logging(self.job_dir)
+        cap_cpu_threads()
         cfg.save(self.job_dir / "config.yaml")
         self.status = Status(self.job_dir / "status.json")
         self.run_id = history.new_run_id(cfg.job_name)  # this run's file in output/_history (Previous Runs tab)
