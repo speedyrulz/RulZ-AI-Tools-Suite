@@ -81,3 +81,30 @@ describe('Store', () => {
     expect(store.getInstalled('app1')).toBeNull()
   })
 })
+
+describe('launch options', () => {
+  it('keeps quick toggles of different options and apps, and reads settings saved without the field', async () => {
+    await writeFile(join(dir, 'settings.json'), JSON.stringify({ closeOnLaunch: true }))
+    const store = new Store(dir)
+    await store.init()
+    expect(store.getSettings().launchOptions).toBeUndefined()
+    await Promise.all([
+      store.setLaunchOption('rulz-trainer', 'tailscale', true),
+      store.setLaunchOption('rulz-trainer', 'other', true),
+      store.setLaunchOption('llm-suite', 'x', true)
+    ])
+    await store.setLaunchOption('rulz-trainer', 'other', false)
+    await store.setLaunchOption('rulz-trainer', 'tailscale', true)
+    const again = new Store(dir)
+    await again.init()
+    expect(again.getSettings().launchOptions).toEqual({ 'rulz-trainer': ['tailscale'], 'llm-suite': ['x'] })
+    expect(again.getSettings().closeOnLaunch).toBe(true)
+  })
+
+  it('replaces a hand-edited value that is not a list', async () => {
+    await writeFile(join(dir, 'settings.json'), JSON.stringify({ launchOptions: { 'rulz-trainer': 'tailscale' } }))
+    const store = new Store(dir)
+    await store.init()
+    expect((await store.setLaunchOption('rulz-trainer', 'tailscale', false)).launchOptions).toEqual({ 'rulz-trainer': [] })
+  })
+})

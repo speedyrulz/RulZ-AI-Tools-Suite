@@ -26,7 +26,19 @@ export const CATALOG: CatalogApp[] = [
       kind: 'source',
       setup: [{ label: 'Installing the Python environment and CUDA PyTorch', run: ['install.bat'] }]
     },
-    launch: { target: 'run_webui.bat' },
+    launch: {
+      target: 'run_webui.bat',
+      options: [
+        {
+          id: 'tailscale',
+          label: 'Tailscale remote access',
+          hint:
+            'Also serves the WebUI over HTTPS to your own Tailscale devices (tailscale serve). Needs Tailscale ' +
+            'installed and logged in, with HTTPS certificates on for the tailnet.',
+          env: { RULZ_TAILSCALE: '1' }
+        }
+      ]
+    },
     requirements: [
       { id: 'python', note: 'Python 3.10 to 3.12' },
       { id: 'nvidia', note: 'CUDA GPU; 16 GB of VRAM or more recommended' },
@@ -36,7 +48,8 @@ export const CATALOG: CatalogApp[] = [
     notes: [
       'Setup downloads CUDA PyTorch and the training libraries (about 4 GB).',
       'Base models (about 10 to 20 GB each, up to 50 GB for the biggest) are downloaded later from the WebUI, into this folder.',
-      'Launch opens a console window and the WebUI in your browser. Closing the console stops it.'
+      'Launch opens a console window and the WebUI in your browser. Closing the console stops it.',
+      'Turn on Tailscale remote access on this page to use the WebUI from your laptop or phone; the console shows its address.'
     ],
     highlights: ['Ten image models + PAN 2 video', 'Wizard with recommended settings', 'Multi-GPU', 'ComfyUI-ready LoRAs']
   },
@@ -361,6 +374,15 @@ export const CATALOG: CatalogApp[] = [
     highlights: ['Repos and buckets in one table', 'Move, copy, rename in one commit', 'Big uploads from disk', 'Bucket sync']
   }
 ]
+
+/** The environment variables of an app's launch options that are on (ids the catalog no longer has are ignored). */
+export function launchEnv(app: CatalogApp, enabled: string[] | undefined): Record<string, string> {
+  const env: Record<string, string> = {}
+  // settings.json can be edited by hand: a string there would match by substring.
+  const on = Array.isArray(enabled) ? enabled : []
+  for (const option of app.launch.options ?? []) if (on.includes(option.id)) Object.assign(env, option.env)
+  return env
+}
 
 /** The app's folder on GitHub. */
 export function githubUrl(app: CatalogApp): string | null {

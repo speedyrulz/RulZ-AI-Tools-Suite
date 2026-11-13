@@ -56,6 +56,10 @@ click, keep it updated, and launch it, all from a single black-and-red window (o
   (it closes, installs over itself and reopens). It also checks your installed apps. Both checks can be turned off in
   Settings.
 - **Close on launch:** an optional setting (off by default) closes the launcher when you open an app.
+- **Launch options:** some apps have switches on their page that change how **Launch** starts them. RulzTrainer's
+  *Tailscale remote access* also serves its WebUI over HTTPS to your own Tailscale devices (the same as
+  `run_webui_tailscale.bat`). The switch is remembered and applies the next time you press Launch; shortcuts start
+  the app without it. Switching it off doesn't clear a `RULZ_TAILSCALE=1` you set in Windows yourself.
 - **Dark or light:** the first launch asks which look you want (dark is the default). Switch any time with the
   sun/moon button in the top bar or under Settings ▸ Appearance.
 
@@ -135,7 +139,8 @@ Pushing a `v*` tag builds the launcher's installer on GitHub Actions and attache
    `git subtree add --prefix=apps/<folder> <url> <branch>`).
 2. Add an entry to `src/shared/catalog.ts`. `install.kind` is `zip` (a portable zip on its latest release),
    `installer` (an NSIS setup .exe on its latest release) or `source` (its `app/<id>` branch plus setup commands),
-   and `launch.target` is the program to start, relative to the install folder.
+   and `launch.target` is the program to start, relative to the install folder. `launch.options` adds switches to
+   the app's page, each setting environment variables for the Launch button while it's on.
 3. Add a build for it to `.github/workflows/apps.yml` (and its tag prefix to the tag list there); a source app goes
    in `app-branches.yml` instead.
 4. Add it to `tools/sync_catalog.py` and run `npm run sync-catalog` to copy its README, README images and icon into

@@ -23,6 +23,16 @@ export interface LaunchSpec {
   args?: string[]
   /** Icon for shortcuts, relative to the install folder. Defaults to the target's own icon (or the catalog icon). */
   icon?: string
+  /** Switches on the app's page that change how the Launch button starts it. Shortcuts don't use them. */
+  options?: LaunchOption[]
+}
+
+/** A launch switch: while it's on, the Launch button starts the app with these environment variables. */
+export interface LaunchOption {
+  id: string
+  label: string
+  hint?: string
+  env: Record<string, string>
 }
 
 /** An optional download added to the install folder, e.g. a llama.cpp build. */
@@ -230,4 +240,6 @@ export interface Settings {
   closeOnLaunch: boolean
   /** An update the user chose "Skip" for. */
   skippedUpdate?: string
+  /** The launch options turned on, per app id (LaunchSpec.options). */
+  launchOptions?: Record<string, string[]>
 }
