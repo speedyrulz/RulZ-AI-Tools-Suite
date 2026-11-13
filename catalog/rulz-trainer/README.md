@@ -966,7 +966,8 @@ norm, the per-image loss watch and the region watch, each when the run has it) a
 last opens again. A **run strip** under the tabs shows the state, job, step, progress and time left on every tab, and
 the browser tab's title carries the progress, so a background tab still tells you how far the run is. While a run is
 going, a second line in the strip tells a long step from a stuck one: how long the current stage has run, how far it
-is when the stage says (the face references, model downloads and the other loaders report it), the trainer's CPU use,
+is when the stage says (the face references, model downloads and the other loaders report it), the trainer's CPU use
+in cores against the CPUs the machine allows ("1.3 of 11.5 cores": on vast.ai the container's CPU quota),
 how long since its status or log last changed, and the newest log line. Before the first step the strip's bar
 follows the stage (it moves when the stage gives no count) instead of sitting at 0%, and the Monitor's *Stage* tile
 says the same. With no status update and no log line for 10 minutes the line turns amber: compare the CPU and the

@@ -123,25 +123,64 @@ def ensure_hf_snapshot(repo_id: str, label: str, progress: ProgressFn | None = N
     return _snapshot_download(repo_id, label, progress, allow_patterns, **kwargs)
 
 
-def _snapshot_download(repo_id: str, label: str, progress: ProgressFn | None = None,
-                       allow_patterns: list[str] | None = None, **kwargs) -> str:
-    """Download (the allowed files of) a repo with progress through the callback."""
-    from huggingface_hub import snapshot_download
+class _NullFile:
+    def write(self, s):
+        return len(s)
+
+    def flush(self):
+        pass
+
+
+REPORT_EVERY_PCT = 2  # a progress line per this many percent of the bytes...
+REPORT_EVERY_S = 15.0  # ...or at least this often while bytes arrive
+
+
+def _reporting_tqdm(label: str, progress: ProgressFn | None):
+    """A tqdm class for snapshot_download that reports byte progress through the callback and the log.
+
+    huggingface_hub builds its bars with disable=None, which tqdm turns into "off" when stderr is no terminal (a
+    training run writing train.log): a disabled bar never advances n and has no unit, so nothing was reported and the
+    log sat at the opening 0%. This bar is always on and draws nothing. Since huggingface_hub 1.0 the bytes come as two
+    aggregate bars: "Downloading bytes" (network, its total a growing guess: skipped) and "Reconstructing" (bytes
+    written, against the summed file sizes: reported)."""
+    import time
+
     from huggingface_hub.utils import tqdm as hf_tqdm
 
-    class ReportingTqdm(hf_tqdm):  # one instance per file plus one "Fetching N files" counter
-        def display(self, *a, **k):  # silent: we report through the callback instead of the console
+    class ReportingTqdm(hf_tqdm):
+        def __init__(self, *a, **k):
+            k["disable"], k["file"] = False, _NullFile()
+            super().__init__(*a, **k)
+            self._last_pct, self._last_t = -REPORT_EVERY_PCT, 0.0
+
+        def display(self, *a, **k):  # silent: reported through the callback instead of the console
             return None
 
         def update(self, n=1):
             super().update(n)
             total, done = getattr(self, "total", 0) or 0, getattr(self, "n", 0) or 0
-            if getattr(self, "unit", "") == "B" and total > 50e6:  # a weights file
-                _report(progress, f"Downloading {label} ({getattr(self, 'desc', '') or repo_id}): "
-                                  f"{done / 1e9:.2f} / {total / 1e9:.2f} GB", done / total if total else None)
+            if getattr(self, "unit", "") != "B" or str(getattr(self, "desc", "")).startswith("Downloading bytes"):
+                return
+            if total <= 50e6:  # configs and tokenizers: only weights are worth a line
+                return
+            done = min(done, total)
+            pct, now = int(done * 100 / total), time.monotonic()
+            if pct - self._last_pct < REPORT_EVERY_PCT and now - self._last_t < REPORT_EVERY_S and done < total:
+                return
+            self._last_pct, self._last_t = pct, now
+            _report(progress, f"Downloading {label}: {done / 1e9:.2f} / {total / 1e9:.2f} GB", done / total)
+
+    return ReportingTqdm
+
+
+def _snapshot_download(repo_id: str, label: str, progress: ProgressFn | None = None,
+                       allow_patterns: list[str] | None = None, **kwargs) -> str:
+    """Download (the allowed files of) a repo with progress through the callback."""
+    from huggingface_hub import snapshot_download
 
     _report(progress, f"Downloading {label} from Hugging Face ({repo_id})...", 0.0)
-    path = snapshot_download(repo_id, allow_patterns=allow_patterns, tqdm_class=ReportingTqdm, **kwargs)
+    path = snapshot_download(repo_id, allow_patterns=allow_patterns, tqdm_class=_reporting_tqdm(label, progress),
+                             **kwargs)
     _report(progress, f"Downloaded {label}", 1.0)
     return path
 

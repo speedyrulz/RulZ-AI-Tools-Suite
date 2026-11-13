@@ -914,11 +914,13 @@ def last_log_line(path, tail_bytes: int = 16384) -> str:
     return ""
 
 
-def run_activity(job_dir, st: dict, now: float, cpu: float | None = None) -> dict:
+def run_activity(job_dir, st: dict, now: float, cpu: float | None = None, cores: float | None = None) -> dict:
     """What a running job is doing, beyond its stage line, so a long setup step does not look hung: how long the
     stage has run (status stage_since), how far it is (stage_frac, 0-1), how long since status.json or train.log last
     changed, the trainer's CPU use and the newest log line. {"since", "frac", "quiet", "stale", "text", "line"};
-    "text" is the run strip's second line."""
+    "text" is the run strip's second line. cpu is in percent of one core (127 = 1.3 cores busy); it is shown in cores
+    against `cores`, the CPUs this machine allows (CPU_CORES: the container's quota, else the CPU count), since a
+    percent over 100 read as more than everything."""
     since = st.get("stage_since")
     since = max(0.0, now - float(since)) if isinstance(since, (int, float)) else None
     frac = st.get("stage_frac")
@@ -937,7 +939,9 @@ def run_activity(job_dir, st: dict, now: float, cpu: float | None = None) -> dic
     if frac is not None:
         parts.append(f"{frac * 100:.0f}% of it done")
     if cpu is not None:
-        parts.append(f"trainer CPU {cpu:.0f}%")
+        cores = CPU_CORES if cores is None else cores
+        busy = f"{cpu / 100:.1f}"
+        parts.append(f"trainer CPU {busy} of {cores:g} cores" if cores else f"trainer CPU {busy} cores")
     if stale:
         parts.append(f"no status update or log line for {duration_text(quiet)}: see the CPU and GPU load "
                      "(Monitor) to tell a long step from a stuck one")
@@ -947,6 +951,14 @@ def run_activity(job_dir, st: dict, now: float, cpu: float | None = None) -> dic
     return {"since": since, "frac": frac, "quiet": quiet, "stale": stale, "text": " · ".join(parts), "line": line}
 
 
+def _cpu_cores() -> float | None:
+    try:
+        return machine.cpu_quota() or os.cpu_count()
+    except Exception:  # noqa: BLE001
+        return os.cpu_count()
+
+
+CPU_CORES = _cpu_cores()  # what "trainer CPU" is shown against: the container's CPU quota, else the CPU count
 _cpu_seen: dict = {}  # pid -> psutil.Process: cpu_percent() measures since the previous call on the same object
 _cpu_last: dict = {"pid": None, "at": 0.0, "value": None}
 CPU_SAMPLE_SECONDS = 1.5  # every open page asks each tick: one reading serves them all, over a long enough span
