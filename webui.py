@@ -887,15 +887,22 @@ def run_activity(job_dir, st: dict, now: float, cpu: float | None = None) -> dic
 
 
 _cpu_seen: dict = {}  # pid -> psutil.Process: cpu_percent() measures since the previous call on the same object
+_cpu_last: dict = {"pid": None, "at": 0.0, "value": None}
+CPU_SAMPLE_SECONDS = 1.5  # every open page asks each tick: one reading serves them all, over a long enough span
 
 
-def job_cpu_percent() -> float | None:
-    """The running job's CPU use since the last call, its child processes included (100 = one core fully busy);
-    None when unknown, and on the first call for a process (nothing to measure against yet)."""
+def job_cpu_percent(now: float | None = None) -> float | None:
+    """The running job's CPU use, its child processes included (100 = one core fully busy), measured over the time
+    since the last reading and kept for CPU_SAMPLE_SECONDS, so two open pages do not cut each other's span to a few
+    milliseconds; None when unknown, and on the first reading for a process (nothing to measure against yet)."""
+    now = time.time() if now is None else now
     pid = _proc.pid if _proc is not None else _adopted.pid if _adopted is not None else None
     if pid is None:
         _cpu_seen.clear()
+        _cpu_last.update(pid=None, at=0.0, value=None)
         return None
+    if _cpu_last["pid"] == pid and now - _cpu_last["at"] < CPU_SAMPLE_SECONDS:
+        return _cpu_last["value"]
     try:
         import psutil
 
@@ -905,15 +912,20 @@ def job_cpu_percent() -> float | None:
         for child in root.children(recursive=True):
             known = _cpu_seen.get(child.pid)
             p = known or child
-            value = p.cpu_percent(None)
+            try:
+                value = p.cpu_percent(None)
+            except psutil.Error:  # ended between the listing and the reading
+                continue
             total += value if known is not None else 0.0
             seen[child.pid] = p
         _cpu_seen.clear()
         _cpu_seen.update(seen)
-        return None if fresh else total
-    except Exception:  # noqa: BLE001  (gone between the calls, access denied, psutil missing)
+        value = None if fresh else total
+    except Exception:  # noqa: BLE001  (the job itself gone, access denied, psutil missing)
         _cpu_seen.clear()
-        return None
+        value = None
+    _cpu_last.update(pid=pid, at=now, value=value)
+    return value
 
 
 VAST_INSTANCE = machine.vast_instance()  # None unless this is a vast.ai instance
@@ -2482,7 +2494,8 @@ window.rzUpload = (function () {
   }
   function show(item, offset, note) {
     var b = batch, sent = b.doneBytes + offset, pct = b.bytes ? Math.floor(sent * 100 / b.bytes) : 100;
-    say(item.zone, 'Uploading ' + b.index + ' of ' + b.count + ': ' + item.file.name + ' · ' + mb(sent) +
+    say(item.zone, 'Uploading ' + b.index + ' of ' + b.count + (item.dataset ? ' into ' + item.dataset : '') + ': ' +
+        item.file.name + ' · ' + mb(sent) +
         ' of ' + mb(b.bytes) + ' (' + pct + '%)' + (note ? ' · ' + note : ''), note ? 'warn' : 'busy');
   }
   function sleep(s) { return new Promise(function (r) { setTimeout(r, s * 1000); }); }
@@ -2527,9 +2540,13 @@ window.rzUpload = (function () {
         if (++tries > RETRY.length) return 'kept getting out of step with the machine';
         continue;
       }
-      if (TRANSIENT.indexOf(r.code) < 0) return r.body.error || ('the machine answered ' + r.code);
-      if (tries >= RETRY.length)
-        return {lost: r.code ? 'the machine kept answering ' + r.code : 'no connection to the machine'};
+      if (TRANSIENT.indexOf(r.code) < 0 || r.body.fatal) return r.body.error || ('the machine answered ' + r.code);
+      if (tries >= RETRY.length) {
+        // only a connection that stays down (or a proxy in front of the machine that keeps failing) ends the batch;
+        // the machine's own error ends just this file
+        if (r.code === 0 || r.code >= 502) return {lost: r.code ? 'the machine kept answering ' + r.code : 'no connection to the machine'};
+        return r.body.error || ('the machine kept answering ' + r.code);
+      }
       for (var s = RETRY[tries++]; s > 0; s--) {
         show(item, offset, (r.code ? 'the machine answered ' + r.code : 'connection lost') + ', trying again in ' + s + ' s');
         await sleep(1);
@@ -2580,7 +2597,8 @@ window.rzUpload = (function () {
     if (!batch) batch = {zone: zone, ok: 0, failed: [], skipped: [], unsent: 0, count: 0, bytes: 0, doneBytes: 0, index: 0};
     files.forEach(function (f) {
       if (!accepted(zone, f)) { batch.skipped.push(f.name); return; }
-      queue.push({file: f, token: token, zone: zone});
+      queue.push({file: f, token: token, zone: zone, dataset: zone.dataset.name || ''});  // where it goes, even if
+      // another dataset is opened meanwhile
       batch.count++;
       batch.bytes += f.size;
     });
@@ -3517,7 +3535,26 @@ def upload_part_path(target: Path, tag: str) -> Path:
     """Where the pieces of an upload gather until the last one: hidden (a dot name) and not a dataset file kind, so
     neither training, the gallery nor Copy from a folder picks it up. `tag` is the upload's own id (the page draws a
     new one for each file it sends), so two uploads of one name never share a part file."""
-    return target.with_name(f".{target.name}.{tag}.part")
+    import hashlib
+
+    # short whatever the file's name (a long name still fits), and one per file and upload
+    digest = hashlib.sha1(target.name.encode("utf-8", "surrogatepass")).hexdigest()[:10]
+    return target.with_name(f".rzup-{tag}-{digest}.part")
+
+
+_WINDOWS_BAD_NAME = re.compile(r'[<>:"|?*\x00-\x1f]|[. ]$')  # what NTFS refuses (":" would write a hidden stream)
+
+
+def upload_error_is_lasting(e: OSError) -> bool:
+    """Whether a write error will come back on every try (a full disk, a name the file system refuses, no right to
+    the folder), so the page gives the file up at once, or may pass (Windows: another program has the file open)."""
+    import errno
+
+    if getattr(e, "winerror", None) in (5, 32, 33):  # access denied / sharing / lock violation: an open file
+        return False
+    lasting = {getattr(errno, n, None) for n in ("ENOSPC", "EDQUOT", "ENAMETOOLONG", "EINVAL", "EROFS", "EACCES",
+                                                  "EPERM", "EISDIR", "ENOTDIR", "ENOENT")}
+    return e.errno is not None and e.errno in lasting
 
 
 _upload_lock = threading.Lock()  # one piece at a time: a retry that overlaps its first try cannot write twice
@@ -3538,6 +3575,8 @@ def write_upload_piece(dest, name: str, offset: int, total: int, data: bytes, ta
     if target is None:
         shown = Path(str(name).replace("\\", "/")).name or str(name)
         raise ValueError(f"{shown}: not an image, a video clip or a .txt / .json caption")
+    if os.name == "nt" and _WINDOWS_BAD_NAME.search(target.name):
+        raise ValueError(f"{target.name}: Windows cannot store a file with that name; rename it and upload it again")
     if not re.fullmatch(r"[A-Za-z0-9]{6,40}", str(tag)):
         raise ValueError("a malformed upload id")
     offset, total = int(offset), int(total)
@@ -3600,19 +3639,25 @@ async def _upload_piece(token: str, request: Request, name: str = "", offset: in
     declared = request.headers.get("content-length") or ""
     if declared.isdigit() and int(declared) > UPLOAD_PIECE_MAX:
         return JSONResponse({"error": "piece too large"}, status_code=413)
+    from starlette.requests import ClientDisconnect
+
     data = bytearray()
-    async for chunk in request.stream():
-        data += chunk
-        if len(data) > UPLOAD_PIECE_MAX:
-            return JSONResponse({"error": "piece too large"}, status_code=413)
+    try:
+        async for chunk in request.stream():
+            data += chunk
+            if len(data) > UPLOAD_PIECE_MAX:
+                return JSONResponse({"error": "piece too large"}, status_code=413)
+    except ClientDisconnect:  # the page went away mid-piece (a phone's connection dropped): it sends the piece again
+        return JSONResponse({"error": "the piece did not arrive whole"}, status_code=408)
     try:
         _, done = await run.io_bound(write_upload_piece, folder, name, offset, total, bytes(data), uid)
     except UploadOffsetError as e:
         return JSONResponse({"error": str(e), "have": e.have}, status_code=409)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
-    except OSError as e:
-        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
+    except OSError as e:  # "fatal": every try would fail the same way, so the page gives this file up at once
+        return JSONResponse({"error": f"{type(e).__name__}: {e.strerror or e}", "fatal": upload_error_is_lasting(e)},
+                            status_code=500)
     return {"done": done, "have": int(offset) + len(data)}
 
 
@@ -4369,6 +4414,7 @@ def build_dataset_tab(f: Form):
             state["sync"] = False
         remove_btn.visible = any(_same_path(path, p) for p in registered_datasets())
         drop.props["data-token"] = upload_slot(Path(path).resolve())  # uploads from here on land in this dataset
+        drop.props["data-name"] = Path(path).name or path
         drop.update()
         editor.visible = True
         await run.io_bound(clean_upload_parts, path)

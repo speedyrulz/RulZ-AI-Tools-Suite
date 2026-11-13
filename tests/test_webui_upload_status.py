@@ -25,7 +25,7 @@ def test_piece_writer_whole_file_in_pieces(tmp_path):
     target, done = webui.write_upload_piece(ds, "photo.JPG", 0, 25, data[:10], tag="up0001")
     assert target == ds / "photo.JPG" and not done and not target.exists()
     part = webui.upload_part_path(target, "up0001")
-    assert part.name == ".photo.JPG.up0001.part" and part.read_bytes() == data[:10]
+    assert part.name.startswith(".rzup-up0001-") and part.name.endswith(".part") and part.read_bytes() == data[:10]
     assert webui.write_upload_piece(ds, "photo.JPG", 10, 25, data[10:20], tag="up0001") == (target, False)
     assert webui.write_upload_piece(ds, "photo.JPG", 20, 25, data[20:], tag="up0001") == (target, True)
     assert target.read_bytes() == data and not part.exists()
@@ -123,6 +123,27 @@ def test_clean_upload_parts_and_slots(tmp_path):
     assert tokens[0] not in webui._upload_slots and webui._upload_slots[tokens[-1]] == str(ds)
 
 
+def test_upload_errors_lasting_or_passing(tmp_path):
+    import errno
+
+    assert webui.upload_error_is_lasting(OSError(errno.ENOSPC, "No space left on device"))
+    assert webui.upload_error_is_lasting(OSError(errno.ENAMETOOLONG, "File name too long"))
+    assert webui.upload_error_is_lasting(PermissionError(errno.EACCES, "Permission denied"))
+    locked = PermissionError(errno.EACCES, "used by another process")
+    locked.winerror = 32  # Windows: another program has the file open, which passes
+    assert not webui.upload_error_is_lasting(locked)
+    assert not webui.upload_error_is_lasting(OSError(errno.EIO, "I/O error"))
+    assert webui._WINDOWS_BAD_NAME.search("a.txt:b.png") and webui._WINDOWS_BAD_NAME.search('x?.jpg')
+    assert webui._WINDOWS_BAD_NAME.search("photo.png.") and not webui._WINDOWS_BAD_NAME.search("PXL_1 (2).jpg")
+    if os.name == "nt":
+        with pytest.raises(ValueError, match="Windows cannot store"):
+            webui.write_upload_piece(tmp_path / "ds", "a.txt:b.png", 0, 3, b"abc", tag="upiiii")
+    else:  # a name near the file system's limit: the part file's own name stays short, so it still uploads
+        long_name = "x" * 245 + ".png"
+        target, done = webui.write_upload_piece(tmp_path / "ds", long_name, 0, 3, b"abc", tag="upjjjj")
+        assert done and target.read_bytes() == b"abc"
+
+
 # ---------------------------------------------------------------- the /rz-upload route
 
 
@@ -153,6 +174,24 @@ def test_upload_route(tmp_path):
     big = b"x" * (webui.UPLOAD_PIECE_MAX + 1)
     r = piece("big.png", 0, len(big), big)
     assert r.status_code == 413 and not (ds / "big.png").exists()
+
+
+def test_upload_route_marks_lasting_errors(tmp_path, monkeypatch):
+    import errno
+
+    token = webui.upload_slot(tmp_path / "ds")
+    client = TestClient(app)
+
+    def fail(err):
+        def write(*a, **k):
+            raise err
+        return write
+
+    for err, fatal in ((OSError(errno.ENOSPC, "No space left on device"), True), (OSError(errno.EIO, "I/O"), False)):
+        monkeypatch.setattr(webui, "write_upload_piece", fail(err))
+        r = client.post(f"/rz-upload/{token}", params={"name": "a.png", "offset": 0, "total": 3, "uid": "lzq81abc"},
+                        content=b"abc")
+        assert r.status_code == 500 and r.json()["fatal"] is fatal
 
 
 # ---------------------------------------------------------------- the run strip's activity line
@@ -209,10 +248,14 @@ def test_job_cpu_percent_of_this_process(monkeypatch):
 
     monkeypatch.setattr(webui, "_proc", Fake())
     webui._cpu_seen.clear()
-    assert webui.job_cpu_percent() is None  # the first look: nothing to measure against yet
+    webui._cpu_last.update(pid=None, at=0.0, value=None)
+    t = time.time()
+    assert webui.job_cpu_percent(t) is None  # the first look: nothing to measure against yet
     sum(i * i for i in range(200000))
-    value = webui.job_cpu_percent()
+    assert webui.job_cpu_percent(t + 0.5) is None  # another page a moment later: the same reading
+    value = webui.job_cpu_percent(t + webui.CPU_SAMPLE_SECONDS + 0.1)
     assert value is not None and value >= 0
+    assert webui.job_cpu_percent(t + webui.CPU_SAMPLE_SECONDS + 0.2) == value
     assert psutil.pid_exists(os.getpid())
 
 
