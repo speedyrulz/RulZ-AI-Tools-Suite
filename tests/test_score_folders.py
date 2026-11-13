@@ -59,7 +59,7 @@ class FakeFaces:
         self.refs = [(str(p), None) for p in paths]
         self.ref_self_similarity = 0.7
 
-    def score(self, path, gold=False):
+    def score(self, path, gold=False, qc=False):
         v = FACES.get(Path(path).stem)
         return SimpleNamespace(percent=v, gold_percent=None, faces=int(v is not None))
 

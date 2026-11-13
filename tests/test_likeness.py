@@ -1,5 +1,4 @@
 import json
-import random
 import sys
 from pathlib import Path
 
@@ -151,6 +150,37 @@ def test_normalized_scores_put_face_and_body_on_one_scale():
     assert rec.body_norm == 0.0
 
 
+def test_records_keep_the_unclipped_place_past_the_references(caplog):
+    """face_over / body_over: the raw score's place from the step-0 floor (0) to the references' own level (1),
+    unclipped and before the span's stretch; above 1 is logged as a memorization watch and decides nothing."""
+    c = L.LikenessController(_cfg(likeness_normalize=True, face_scale_span=1.35, body_scale_span=1.35),
+                             face_ceiling=70.0, body_ceiling=94.0)
+    rec, _ = c.update(0, 15.0, 82.0)
+    assert rec.face_over == 0.0 and rec.body_over == 0.0
+    rec, _ = c.update(10, 42.5, 88.0)
+    assert abs(rec.face_over - 0.5) < 1e-9 and abs(rec.body_over - 0.5) < 1e-9
+    with caplog.at_level("INFO", logger="rulztrainer"):
+        rec, act = c.update(20, 81.0, 88.0)  # the face 1.2x past the references' own level
+    assert abs(rec.face_over - 1.2) < 1e-9 and rec.face_norm < 100.0  # the stretched scale still has room
+    assert "face 1.20x" in caplog.text and "body" not in caplog.text.split("(")[1].split(")")[0]
+    assert rec.gold_over is None
+    assert L.LikenessController(_cfg()).update(10, 42.5, 88.0)[0].face_over is None  # likeness_normalize off
+
+
+def test_the_place_past_the_references_ignores_the_scales_least_span():
+    """The scale lifts a ceiling close to the floor (MIN_SPAN, MIN_ROOM_SHARE); the place past the references does not:
+    a body floor of 80 with the references at 85 puts a probe at 86 past them (1.2), not at 0.6 of a lifted 90."""
+    c = L.LikenessController(_cfg(likeness_normalize=True), body_ceiling=85.0)
+    c.update(0, None, 80.0)
+    assert c.scale("body")[1] > 85.0  # the scale's own ceiling sits higher
+    assert c.update(10, None, 86.0)[0].body_over == pytest.approx(1.2)
+    low = L.LikenessController(_cfg(likeness_normalize=True), body_ceiling=78.0)
+    low.update(0, None, 80.0)
+    assert low.update(10, None, 86.0)[0].body_over is None  # the references below the floor: no place to give
+    anchored = L.LikenessController(_cfg(likeness_normalize=True, body_score="anchored"))
+    assert anchored.update(10, None, 120.0)[0].body_over == pytest.approx(1.2)  # 100 = the references' mean
+
+
 def test_the_face_scale_is_stretched_and_curved_so_it_keeps_room_to_improve():
     """An ArcFace cosine saturates: on a real run a decent face read 90 while the body, on the same pictures, read 51.
     The face's 100 sits face_scale_span x as far above a stranger as the references do, and the position on that scale
@@ -226,7 +256,7 @@ def test_sample_scores_carry_normalized_values_and_captions_show_them(tmp_path):
     c = L.LikenessController(_cfg(likeness_normalize=True, face_weight=0.5, body_weight=0.5), face_ceiling=70.0,
                              body_ceiling=60.0)
     c.update(0, 15.0, 8.0)  # the floors
-    face = SimpleNamespace(score=lambda p, step, i: facesim.FaceScore(step, str(p), i, 1, 0.425, 42.5, "ref"))
+    face = SimpleNamespace(score=lambda p, step, i, qc=False: facesim.FaceScore(step, str(p), i, 1, 0.425, 42.5, "ref"))
     body = SimpleNamespace(score=lambda p: (34.0, 3))
     (tmp_path / "s.png").write_bytes(b"")
     scores = facesim.score_samples(face, [str(tmp_path / "s.png")], 10, tmp_path, body, 0.5, 0.5, scale=c)
@@ -515,3 +545,13 @@ def test_framing_reaches_the_curriculum_and_survives_a_resume():
     rec, _ = again.update(20, 60.0, 70.0, seeds={**faces, "body": [70.0, None, None, None]})
     assert rec.body == pytest.approx(17.5)  # still counted against the first probe of the run, not of this session
     assert TrainConfig().likeness_framing is True
+
+
+def test_the_place_past_the_references_reads_the_measured_body_not_the_framed_one():
+    """likeness_framing counts a lost render as zero and caps a render at the scale's top; body_over is the raw score
+    of the renders that show a body, so a copying probe with one lost render still reads past the references."""
+    c = L.LikenessController(_cfg(likeness_normalize=True, likeness_framing=True), body_ceiling=85.0)
+    c.update(0, None, 80.0, seeds={"body": [80.0, 80.0]})
+    rec, _ = c.update(10, None, 90.0, seeds={"body": [90.0, None]})
+    assert rec.body < 90.0  # the framed body lost a render
+    assert rec.body_over == pytest.approx(2.0)  # (90 - 80) / (85 - 80)

@@ -1,8 +1,8 @@
 """Face similarity scoring for character LoRAs.
 
 Reference faces come from one or more dataset images; each generated sample's largest detected face is
-embedded with InsightFace (ArcFace "buffalo_l") and compared by cosine similarity against every reference
-embedding. The reported score is the best match. A typical reference's best match among the others (the median,
+embedded with InsightFace (ArcFace "buffalo_l", or "antelopev2" with face_model) and compared by cosine similarity
+against every reference embedding. The reported score is the best match. A typical reference's best match among the others (the median,
 faces cut off by the frame left out) is reported too: the realistic ceiling, the 100 of the normalized scale.
 
 Cosine similarity for ArcFace: same identity is typically 0.5 to 0.8, different people 0.0 to 0.3.
@@ -92,6 +92,27 @@ class FaceScore:
     # the held-out recognizer's best cosine and percent (set_gold; None = off or no face)
     gold_cosine: float | None = None
     gold_percent: float | None = None
+    skipped: str = ""  # why a detected face went unscored (score(qc=True): ambiguous or too small)
+
+
+# score(qc=True), after the ai-toolkit fork's identity eval: a second face at least this share of the largest one's
+# area makes the subject ambiguous (the largest may be the wrong person), and a face whose shorter side is under
+# MIN_FACE_PX source pixels is too small for a meaningful embedding; either leaves the picture unscored
+AMBIGUOUS_FACE_RATIO = 0.6
+MIN_FACE_PX = 48
+
+
+def subject_problem(faces) -> str:
+    """Why the largest of `faces` (largest first, source-pixel boxes) is no reliable subject, or "" when it is."""
+    if not faces:
+        return ""
+    area = [(f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]) for f in faces]
+    if len(faces) > 1 and area[1] >= AMBIGUOUS_FACE_RATIO * area[0]:
+        return f"ambiguous: {len(faces)} faces of similar size"
+    side = float(min(faces[0].bbox[2] - faces[0].bbox[0], faces[0].bbox[3] - faces[0].bbox[1]))
+    if side < MIN_FACE_PX:
+        return f"face too small ({side:.0f} px)"
+    return ""
 
 
 def combine(face, body, face_weight: float, body_weight: float):
@@ -224,6 +245,7 @@ class FaceScorer:
             if n:
                 log.info("CPU quota: face scoring uses %d CPU threads (%d onnxruntime session(s), OpenCV)", cap, n)
         self.progress = progress  # (text, fraction): the reference loops below report through it too
+        self.model_name = model_name
         self.refs: list[tuple[str, np.ndarray]] = []
         self.ref_self_similarity: float | None = None
         self.ref_kps: list = []  # each reference face's landmarks (source pixels) and whether the frame cuts it off
@@ -386,12 +408,17 @@ class FaceScorer:
                  f"{self.gold_self_similarity:.3f}" if self.gold_self_similarity is not None else "n/a")
 
     # ------------------------------------------------------------ scoring
-    def score(self, image: str | Path, step: int = 0, prompt_index: int = 0, gold: bool = False) -> FaceScore:
-        """The largest face's best ArcFace match; gold: the held-out recognizer's too (set_gold), on the same face."""
+    def score(self, image: str | Path, step: int = 0, prompt_index: int = 0, gold: bool = False,
+              qc: bool = False) -> FaceScore:
+        """The largest face's best ArcFace match; gold: the held-out recognizer's too (set_gold), on the same face.
+        qc: leave the picture unscored (skipped says why) when that face is ambiguous or too small (subject_problem)."""
         fs = self.faces(image)
         self._remember(image, fs)
         if not fs or not self.refs:
             return FaceScore(step, str(image), prompt_index, len(fs), None, None, None)
+        problem = subject_problem(fs) if qc else ""
+        if problem:
+            return FaceScore(step, str(image), prompt_index, len(fs), None, None, None, skipped=problem)
         emb = fs[0].normed_embedding.astype(np.float32)
         best, best_ref = -1.0, None
         for name, ref in self.refs:
@@ -447,7 +474,7 @@ def score_samples(scorer, paths: list[str], step: int, job_dir: Path, body_score
     t0 = time.time()
     scores = []
     for i, p in enumerate(paths):
-        s = scorer.score(p, step, i) if scorer is not None else FaceScore(step, str(p), i, 0, None, None, None)
+        s = scorer.score(p, step, i, qc=True) if scorer is not None else FaceScore(step, str(p), i, 0, None, None, None)
         if body_scorer is not None:
             s.body_percent, s.body_ratios = body_scorer.score(p)
         s.combined_percent = combine(s.percent, s.body_percent, face_weight, body_weight)
@@ -458,7 +485,7 @@ def score_samples(scorer, paths: list[str], step: int, job_dir: Path, body_score
     append_scores(job_dir, scores)
     for s in scores:
         face = (f"face {s.percent:.1f}% (cos {s.cosine:.3f})" if s.percent is not None
-                else f"face: none ({s.faces} found)")
+                else f"face: skipped ({s.skipped})" if s.skipped else f"face: none ({s.faces} found)")
         body = ""
         if body_scorer is not None:
             body = (f"body {s.body_percent:.1f}% ({s.body_ratios} ratios)" if s.body_percent is not None

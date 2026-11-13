@@ -198,7 +198,7 @@ def score(face_refs: list[str], body_refs: list[str], baseline: str | Path | Non
     for p in faces if fs is not None else []:
         done += 1
         say(f"Faces: {p.run}: {p.rel}", done / total)
-        sc = fs.score(p.path, gold=True)
+        sc = fs.score(p.path, gold=True, qc=True)  # with the probes' subject check
         p.face, p.gold, p.faces = sc.percent, sc.gold_percent, sc.faces
     return {"pictures": [asdict(p) for p in pics], "refs": refs, "runs": names,
             "baseline": bool(baseline), "steps_from": step_pattern or "file names"}
