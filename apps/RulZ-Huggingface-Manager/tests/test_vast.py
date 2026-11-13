@@ -181,3 +181,55 @@ def test_runner_target_stays_inside_destination(tmp_path):
     for bad in ('../escape', 'a/../../b', '', 'a//b'):
         with pytest.raises(ValueError):
             r.target({'dest': bad})
+
+
+# ---------------------------------------------------------------- command prompt
+
+def test_split_output_lines_and_redraws():
+    pieces, rest = vast.split_output('one\r\ntwo\n\r 10%\r 50%\r100%\npart')
+    assert pieces == [('line', 'one'), ('line', 'two'), ('cr', ' 10%'), ('cr', ' 50%'), ('line', '100%')]
+    assert rest == 'part'
+
+
+def test_split_output_waits_on_trailing_cr():
+    pieces, rest = vast.split_output('abc\r')
+    assert pieces == [] and rest == 'abc\r'
+    pieces, rest = vast.split_output(rest + '\nnext')
+    assert pieces == [('line', 'abc')] and rest == 'next'
+
+
+def test_clean_terminal_text_drops_colours_and_titles():
+    assert vast.clean_terminal_text('\x1b[01;34mblue\x1b[0m \x1b]0;title\x07ok\x1b[?2004h') == 'blue ok'
+
+
+def test_shell_script_runs_in_folder_and_reports(tmp_path):
+    script = vast.shell_script('echo hi; cd ..', "/work space/it's")
+    assert r"cd '/work space/it'\''s' 2>/dev/null || cd ~" in script
+    assert 'echo hi; cd ..\n' in script
+    assert script.rstrip().endswith(r'printf "\n' + vast.SHELL_MARK + r' %s %s\n" "$__rulz_rc" "$PWD"')
+
+
+@pytest.mark.skipif(sys.platform.startswith('win'), reason='needs bash')
+def test_shell_script_in_bash(tmp_path):
+    (tmp_path / 'sub').mkdir()
+    out = subprocess.run(['bash', '-c', vast.shell_script('cd sub; echo hi; false', str(tmp_path))],
+                         capture_output=True, text=True).stdout
+    assert out.splitlines()[0] == 'hi'
+    assert out.splitlines()[-1] == f'{vast.SHELL_MARK} 1 {tmp_path / "sub"}'
+
+
+def test_shell_ssh_command_forces_tty_and_encodes_script():
+    conn = vast.Conn(host='1.2.3.4', port=41022, instance_id=7)
+    cmd = vast.shell_ssh_command(conn, 'echo "$HOME" | tee x', '/workspace')
+    assert cmd[-2] == '-tt'
+    encoded = cmd[-1].split('echo ')[1].split(' |')[0]
+    assert 'echo "$HOME" | tee x' in base64.b64decode(encoded).decode()
+    assert 'root@1.2.3.4' in cmd
+
+
+def test_ssh_login_command_is_interactive():
+    config.get().ssh_key = '~/.ssh/my key'
+    conn = vast.Conn(host='1.2.3.4', port=41022, instance_id=7)
+    cmd = vast.ssh_login_command(conn)
+    assert '-T' not in cmd and 'BatchMode=yes' not in cmd
+    assert vast.ssh_login_text(conn) == 'ssh -p 41022 -i "~/.ssh/my key" root@1.2.3.4'
