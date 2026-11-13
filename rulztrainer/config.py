@@ -180,11 +180,23 @@ ARCH_TRAINING_ADAPTER = {
     "qwen_image21": {"repo": "ShootTheSound/Fizgig-Qwen-Image-2.1-Training-Adapter",
                      "file": "fizgig_qwen_image_2.1_training_adapter_v2.safetensors"},
     # MiniMax H3 (CFG-distilled: musubi-tuner saw one-frame LoRAs break up within ~50 steps without an adapter or a
-    # guidance loss): circlestone-labs' image training adapter (rank 64, made for image-only training on FL2VA,
-    # 0.62 GB), the first of the three musubi-tuner tested; ostris' v2 (rank 32) is the alternative
-    "minimax_h3": {"repo": "circlestone-labs/MiniMax-H3-Image-Training-Adapter",
-                   "file": "minimax_h3_image_training_adapter.safetensors"},
+    # guidance loss): ostris' v3 adapters (rank 32, 0.31 GB each, the same 208 modules and key names as the others),
+    # one per base: the fl2va file on FL2VA, the ref2va file ("ref2va_file") on Ref2VA, as Fizgig picks them since
+    # 9.7.0 (it dropped circlestone-labs' image adapter, rank 64, 0.62 GB, FL2VA only, which RulzTrainer used before
+    # 3.15.0 on both bases; still usable as a path)
+    "minimax_h3": {"repo": "ostris/minimax_h3_training_adapter", "file": "minimax_h3_training_adapter_v3.safetensors",
+                   "ref2va_file": "minimax_h3_ref2va_training_adapter_v3.safetensors"},
 }
+
+
+def training_adapter_for(family: str, model_path: str = "") -> tuple[str, str] | None:
+    """(repo, file) of a family's own training adapter for this model_path (MiniMax H3: the Ref2VA base,
+    "MiniMaxAI/MiniMax-H3#ref2va", gets its own), or None when the family has none."""
+    entry = ARCH_TRAINING_ADAPTER.get(family)
+    if entry is None:
+        return None
+    ref = str(model_path or "").strip().lower().endswith("#ref2va")
+    return entry["repo"], entry.get("ref2va_file") if ref and entry.get("ref2va_file") else entry["file"]
 # Each family's sampling LoRA (sample_lora: auto downloads it), applied with the turbo LoRA while samples render the
 # family's base checkpoint, never in training. MOSS-Image: Kijai's SFT LoRA (SFT minus Base, rank 512, blocks 3, 4
 # and 21-41 with their norms), so samples of a LoRA trained on Base show it as it looks on SFT. Kijai's card uses it

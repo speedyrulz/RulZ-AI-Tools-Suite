@@ -442,6 +442,7 @@ what the rules have not downloaded by then is gone.
     | `60:7:30:8:3` | 60% until epoch 7, 30% at epoch 8, then 60% with every 3rd epoch at 30% at half the learning rate (Fizgig's MOSS default until 8 November 2026, the WebUI's *Slide* button) |
     | `11:7:40:8:3` | 11% until epoch 7, 40% at epoch 8, then 40% with every 3rd epoch at 11% at half the learning rate (Fizgig's MOSS default since 10 November 2026, for Muon: *Slide Muon*) |
     | `11:4:30:8:2` | a full fine-tune's: the model's own ~11% until rotation 4, sliding to 30% by rotation 8, then 30% with every 2nd rotation at 11% at half the learning rate (*Slide FT*) |
+    | `16.67,75,33.33,75,50,75` | one share per epoch, separated by commas, the last held to the end, every epoch at the full learning rate (since 3.15.0; this one is Fizgig's MiniMax-H3-Image Likeness optimization) |
 
   - **The fifth number.** After the slide, every epoch trains at the higher of the two shares and every Nth one at
     the lower, whichever share comes first, at half the learning rate: those epochs reset structure, but at the full
@@ -3274,14 +3275,17 @@ file over two cards, or keeps what does not fit a single card in system RAM (NVF
 too (`text_encoder_device: cpu`), slowly.
 
 **Training adapter** (`training_adapter: auto`, the default). The released H3 is CFG-distilled; musubi-tuner found
-one-frame LoRAs trained on the plain flow loss break up within about 50 steps. `auto` downloads circlestone-labs'
+one-frame LoRAs trained on the plain flow loss break up within about 50 steps. Since 3.15.0 `auto` downloads ostris'
+v3 adapter for the base you train from [ostris/minimax_h3_training_adapter](https://huggingface.co/ostris/minimax_h3_training_adapter):
+`minimax_h3_training_adapter_v3.safetensors` on FL2VA, `minimax_h3_ref2va_training_adapter_v3.safetensors` on Ref2VA
+(`MiniMaxAI/MiniMax-H3#ref2va`), rank 32, 0.31 GB each, the same 208 modules as the others. Fizgig 9.7.0 made these
+its only H3 adapters. It is on while your LoRA trains, off for samples and probes, and never saved into your file (the
+Qwen-Image 2.1 mechanism). Before 3.15.0 `auto` used circlestone-labs'
 [MiniMax-H3-Image-Training-Adapter](https://huggingface.co/circlestone-labs/MiniMax-H3-Image-Training-Adapter) (rank
-64, 0.62 GB, made for image-only training on FL2VA), the first of the three adapters musubi-tuner tested; it is on
-while your LoRA trains, off for samples and probes, and never saved into your file (the Qwen-Image 2.1 mechanism).
-Alternatives as a path: [ostris/minimax_h3_training_adapter](https://huggingface.co/ostris/minimax_h3_training_adapter)
-`minimax_h3_training_adapter_v2.safetensors` (rank 32, 0.31 GB; musubi-tuner tested v2) or its `_ref2va_` adapter for
-Ref2VA. circlestone-labs advises against a guidance-preservation loss on top of it (this trainer has none). Quality with
-the adapter has not been evaluated here.
+64, 0.62 GB, made for image-only training on FL2VA, on both bases), the first of the three adapters musubi-tuner
+tested; it still works as a path (`training_adapter`). circlestone-labs advises against a guidance-preservation loss on
+top of it (this trainer has none). Neither adapter's quality has been compared here, and the v3 files have not yet
+trained a run here.
 
 **Recipe** (what the setup wizard suggests): rank 16 (musubi-tuner's examples; DiffSynth-Studio's use 32), alpha =
 rank, learning rate 1e-4 (both), `adamw8bit`, gradient checkpointing, `timestep_sampling: reference`, 1 MP buckets on
@@ -3430,6 +3434,16 @@ from diffusers' `minimax_h3_image` modular pipeline, ComfyUI's `MiniMaxH3ImageMo
   steps each, one character set, one seed, 4 probe seeds): a tie. Smoothed combined likeness 28.5 even and 29.3 at
   40% at step 1000 (they swapped the lead from round to round, within the 5 points runs differ by luck); 40% scored
   the face about 1 point higher and the body about 4 points lower, and the probes of the two looked nearly the same.
+- **Likeness optimization** (Fizgig 9.7.0's MiniMax-H3-Image Standard preset, 12 November 2026; the Train tab's *H3
+  Image likeness* button, since 3.15.0). The clean-end share changes by epoch: `clean_share: "16.67,75,33.33,75,50,75"`,
+  the even share (1 in 6) in epoch 1, then 75%, 33%, 75%, 50%, 75%, and 75% after epoch 6 (the low share climbs to 50 on
+  the odd epochs, alternating with 75). With it Fizgig trains on `optimizer: automagic4` at `learning_rate: 2.5e-4`
+  with `automagic_max_lr: 2.5e-4` (the rate never climbs above where it starts), at `resolutions: [0.25]`, for 30
+  epochs; a run peaked around epoch 15. The button sets all of these except the steps (30 epochs is 30 times the
+  pictures in an epoch). Fizgig reports its best likeness on three people's sets with it: the face shape came earliest
+  and the backgrounds stayed clean; Automagic 4 at its ceiling beat Automagic 3 and Muon most on a set with few
+  headshots, and 0.5 MP did not hold up against 0.25 MP. **Not measured here yet**: the race above (1 MP, AdamW) is
+  the only H3 Image comparison RulzTrainer has.
 - **Training adapter.** The model is step- and guidance-distilled, so `training_adapter: auto` downloads ostris'
   [minimax_h3_training_adapter](https://huggingface.co/ostris/minimax_h3_training_adapter)
   `minimax_h3_image_training_adapter_v1.safetensors` (rank 16, 0.16 GB, `diffusion_model.*.lora_A/B`, no alpha, on
@@ -3751,7 +3765,8 @@ pictures of one fictional character (slow camera push-ins, pull-backs and tilts,
 plus a sentence for the camera move) and 16 other pictures of her as stills: a check that the path works, not a
 measure of what real footage teaches.
 
-- **MiniMax H3** (Comfy-Org's int8 FL2VA file, AdaLN pruned on load, the circlestone-labs image adapter, rank 16,
+- **MiniMax H3** (Comfy-Org's int8 FL2VA file, AdaLN pruned on load, the circlestone-labs image adapter (the default
+  before 3.15.0), rank 16,
   lr 1e-4, `adamw8bit`, `timestep_sampling: reference`; clips of 39 frames = 12 latent frames at 416 x 640, stills at
   640 x 928). Clip latents for 32 items cached in 41 s. The checkpointing calibration measured the 39-frame clip
   (12,583 tokens with the caption): 7 of 50 blocks kept, 27.6 of 31 GB at the peak; 1.4-1.6 s per step averaged over

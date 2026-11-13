@@ -14,6 +14,9 @@ clean_share takes Fizgig's notation, percentages and 1-based epochs of the run's
                     one (30%), at half the learning rate (Fizgig's MOSS default from 28 Oct to 8 Nov 2026, Slide)
   "11:7:40:8:3"     11% until epoch 7, 40% at epoch 8, then 40% with every 3rd epoch at 11%, at half the learning
                     rate (Fizgig's MOSS default since 10 Nov 2026, for Muon)
+  "16.67,75,33.33,75,50,75"
+                    one share per epoch, separated by commas, the last held to the end (Fizgig's MiniMax-H3-Image
+                    Likeness optimization, H3_LIKENESS); every epoch at the full learning rate
 
 With a fifth number R, every epoch after the slide trains at the higher of the two shares and every Rth one at the
 lower, whichever share comes first, at half the learning rate: those epochs reset structure, but at the full rate
@@ -34,6 +37,14 @@ that starting at 11 stopped the hair darkening late in a run and gave higher lat
 together with its Element boost (the face and hair counting 9x early in the run), which RulzTrainer does not have. It
 still offers 60:7:30:8:3 as "slower to train but known to work well".
 
+MiniMax-H3-Image trains on its 6 sampling noise levels only, so there the share is the steps on the last one (0.232;
+1 in 6 = 16.67% is the even draw). Fizgig's Likeness optimization (9.7.0, 12 Nov 2026), H3_LIKENESS: the even share,
+then 75%, 33%, 75%, 50%, 75% for epochs 1 to 6 (the low share climbing to 50 on the odd epochs, 75 on the even ones),
+75% after. Fizgig trains it on Automagic v4 at 2.5e-4 with its ceiling at 2.5e-4, at 0.25 MP, for 30 epochs (a run
+peaked around epoch 15), and reports its best likeness on three people's sets with it, the face shape coming earliest
+and the backgrounds clean. RulzTrainer's own MiniMax-H3-Image race (1 MP, AdamW 1e-4, 1000 steps) was a tie between the
+even draw and 40%; the schedule itself is not measured here.
+
 Unmeasured here but for one Krea 2 run of 60:7:30:8:3 (it tied the plain run), and RulzTrainer's default already sits
 at 50%: race a schedule against "" (off) on your own data."""
 from __future__ import annotations
@@ -45,16 +56,31 @@ import torch
 SLIDE = "60:7:30:8:3"  # Fizgig's MOSS-Image LoRA default until 8 November 2026 (measured on AdamW)
 SLIDE_MUON = "11:7:40:8:3"  # its default since 10 November 2026, for Muon
 FT_SLIDE = "11:4:30:8:2"  # its full fine-tune default (in rotations)
+H3_LIKENESS = "16.67,75,33.33,75,50,75"  # its MiniMax-H3-Image Likeness optimization, per epoch, 75 held after
 HALF_LR = 0.5  # the learning rate of the lower-share epochs after the slide
 CLEAN_SIGMA = 0.5
 _SOLVE_N = 16384  # draws per bisection step (fixed seed: the same offset every time)
 
 
+class PerEpoch(tuple):
+    """A per-epoch schedule: one share per epoch from epoch 1, the last held after."""
+
+
 def parse(spec) -> tuple | None:
-    """(first, until, rest, end, every) in percent / epochs, or None for "" (off). Raises ValueError."""
+    """(first, until, rest, end, every) in percent / epochs, a PerEpoch of shares for a comma list, or None for ""
+    (off). Raises ValueError."""
     text = str(spec or "").replace("%", "").replace(" ", "").strip()
     if not text:
         return None
+    if "," in text:
+        try:
+            shares = PerEpoch(float(x) for x in text.strip(",").split(","))
+        except ValueError:
+            raise ValueError(f"clean_share {spec!r}: a per-epoch list is shares separated by ',' "
+                             "(16.67,75,33.33,75,50,75)") from None
+        if not shares or any(not 0.0 < s < 100.0 for s in shares):
+            raise ValueError(f"clean_share {spec!r}: shares are percentages between 0 and 100")
+        return shares
     try:
         parts = [float(x) for x in text.split(":")]
     except ValueError:
@@ -80,8 +106,10 @@ def share_at(schedule, epoch: int) -> float | None:
     """The clean-end share in percent for a 1-based epoch (None: no schedule)."""
     if schedule is None:
         return None
-    first, until, rest, end, every = schedule
     e = max(1, int(epoch))
+    if isinstance(schedule, PerEpoch):
+        return round(schedule[min(e, len(schedule)) - 1], 2)
+    first, until, rest, end, every = schedule
     if e <= until:
         share = first
     elif e >= end:
@@ -94,13 +122,15 @@ def share_at(schedule, epoch: int) -> float | None:
 
 
 def _lower_epoch(schedule, e: int) -> bool:
+    if isinstance(schedule, PerEpoch):
+        return False
     first, until, rest, end, every = schedule
     return every > 0 and e > end and (e - end) % every == 0
 
 
 def lr_scale_at(schedule, epoch: int) -> float:
     """The learning-rate factor for a 1-based epoch: HALF_LR on the lower-share epochs after the slide, else 1."""
-    if schedule is None or schedule[0] == schedule[2]:
+    if schedule is None or isinstance(schedule, PerEpoch) or schedule[0] == schedule[2]:
         return 1.0
     return HALF_LR if _lower_epoch(schedule, max(1, int(epoch))) else 1.0
 

@@ -14,7 +14,7 @@ import logging
 
 from .config import (ARCH_SAMPLE_LORA, ARCH_TRAINING_ADAPTER, ARCH_TURBO, COMFY_DIFFUSION_FILES, COMFY_DIFFUSION_QUANTS, COMFY_REPOS,
                      COMFY_TEXT_ENCODER_FILES, COMFY_TEXT_ENCODER_QUANTS, COMFY_VAE_FILES, TrainConfig)
-from .config import COMFY_DEFAULT_QUANT, COMFY_TEXT_ENCODER_REPOS
+from .config import COMFY_DEFAULT_QUANT, COMFY_TEXT_ENCODER_REPOS, training_adapter_for
 
 log = logging.getLogger("rulztrainer")
 
@@ -68,7 +68,7 @@ def planned_downloads(cfg: TrainConfig) -> list[tuple[str, str, str]]:
     if cfg.sample_lora == "auto" and fam in ARCH_SAMPLE_LORA and cfg.samples_on_base_model():
         out.append(("sample_lora", ARCH_SAMPLE_LORA[fam]["repo"], ARCH_SAMPLE_LORA[fam]["file"]))
     if cfg.training_adapter == "auto" and fam in ARCH_TRAINING_ADAPTER and not cfg.finetune:
-        out.append(("training_adapter", ARCH_TRAINING_ADAPTER[fam]["repo"], ARCH_TRAINING_ADAPTER[fam]["file"]))
+        out.append(("training_adapter", *training_adapter_for(fam, cfg.model_path)))
     return out
 
 

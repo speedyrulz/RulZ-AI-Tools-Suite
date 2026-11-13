@@ -796,13 +796,15 @@ def test_detection_caches_buckets_and_downloads(tmp_path):
     assert plan["text_encoder_file"][1] == "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
     assert plan["vae_file"][1] == "vae/minimax_h3_video_vae_fp16.safetensors"
     assert plan["turbo_lora"] == (ARCH_TURBO["minimax_h3"]["repo"], ARCH_TURBO["minimax_h3"]["file"])
-    assert plan["training_adapter"] == ("circlestone-labs/MiniMax-H3-Image-Training-Adapter",
-                                        "minimax_h3_image_training_adapter.safetensors")
-    assert ARCH_TRAINING_ADAPTER["minimax_h3"]["repo"].startswith("circlestone-labs/")
+    # ostris' v3 adapters since 3.15.0, one per base (Fizgig 9.7.0)
+    assert plan["training_adapter"] == ("ostris/minimax_h3_training_adapter",
+                                        "minimax_h3_training_adapter_v3.safetensors")
+    assert ARCH_TRAINING_ADAPTER["minimax_h3"]["repo"].startswith("ostris/")
     ref = {f: n for f, _, n in planned_downloads(TrainConfig(model_path="MiniMaxAI/MiniMax-H3#ref2va",
                                                              text_encoder_file_quant="nvfp4_awq",
                                                              model_file_quant="pruned_int8_convrot"))}
     assert ref["transformer_file"].endswith("minimax_h3_ref2va_pruned_int8_convrot.safetensors")
+    assert ref["training_adapter"] == "minimax_h3_ref2va_training_adapter_v3.safetensors"
     assert ref["text_encoder_file"].endswith("qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors")
     allow = HL._allow_patterns(False)
     assert "transformer/*" in allow and "transformer_ref/*" not in allow and \
