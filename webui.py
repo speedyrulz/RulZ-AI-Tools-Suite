@@ -7,6 +7,7 @@ reloaded page, a second browser or a restarted WebUI reattaches to it.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import copy
 import dataclasses
 import json
@@ -7905,7 +7906,29 @@ _FLEET_LOCK = threading.Lock()
 # an instance's state -> (what the card says, the dot's class)
 FLEET_STATES = {"running": ("Training", "live"), "starting": ("Starting a run", "live"), "idle": ("Idle", "done"),
                 "unreachable": ("Out of reach", "error"), "gone": ("Stopped or destroyed", ""),
-                "off": ("Not watched", ""), "new": ("Not looked at yet", "")}
+                "off": ("Not watched", ""), "new": ("Not looked at yet", ""), "rebooting": ("Rebooting", "live"),
+                "updating": ("Updating RulzTrainer", "live")}
+# the tab that Open WebUI opens in the click itself (a tab opened later, once the address is known, is a pop-up that
+# browsers block); open_webui then points it at the instance, or closes it when there is no address
+def fleet_open_tab_js(iid) -> str:
+    """The click handler that opens the instance's tab at once, kept per instance so two quick clicks on two cards
+    each get their own tab."""
+    key = json.dumps(str(iid))
+    return ("() => { const t = window.open('', '_blank'); if (t) { t.document.title = 'RulzTrainer'; "
+            "t.document.body.innerHTML = '<p style=\"font: 15px sans-serif; padding: 24px\">Opening the "
+            "instance\u2019s WebUI\u2026</p>'; } (window.rzFleetTabs = window.rzFleetTabs || {})[" + key + "] = t; "
+            "emit(); }")
+
+
+def fleet_tab_js(iid, url: str | None) -> str:
+    """Point the tab fleet_open_tab_js opened at url (opening one when it is gone), or close it when url is None."""
+    take = (f"const tabs = window.rzFleetTabs || {{}}; const t = tabs[{json.dumps(str(iid))}]; "
+            f"delete tabs[{json.dumps(str(iid))}]; ")
+    if url is None:
+        return "(() => { " + take + "if (t && !t.closed) t.close(); })()"
+    target = json.dumps(url)
+    return "(() => { " + take + (f"if (t && !t.closed) {{ t.opener = null; t.location.replace({target}); }} "
+                                 f"else window.open({target}, '_blank', 'noopener'); }})()")
 FLEET_RUN_COLUMNS = [
     {"name": "job", "label": "Run", "field": "job", "align": "left", "sortable": True},
     {"name": "state", "label": "State", "field": "state", "align": "left", "sortable": True},
@@ -8012,8 +8035,73 @@ def fleet_event_text(e: dict) -> str:
              "instance_down": f"{on} is out of reach: {e.get('error')}", "instance_up": f"{on} is back",
              "instance_gone": f"{on} is {e.get('status')}", "instance_added": f"{on} joined the fleet",
              "download_failed": f"{job}'s files could not be downloaded from {on}: {e.get('error')}",
-             "queue_empty": "The fleet's queue is empty"}
+             "queue_empty": "The fleet's queue is empty",
+             "instance_rebooting": f"{on} is rebooting" + (f": {job} was killed" if job else ""),
+             "instance_rebooted": f"{on} is back after its reboot",
+             "instance_updated": f"{on} updated RulzTrainer" + (f" from {e['was']}" if e.get("was") else "")
+             + (f" to {e['version']}" if e.get("version") else "") + (f" · {e['note']}" if e.get("note") else ""),
+             "update_failed": f"{on} could not update RulzTrainer: {e.get('error')}"}
     return table.get(kind, str(kind))
+
+
+def fleet_version_line(inst: dict) -> str:
+    """The instance's RulzTrainer on its card: "RulzTrainer 3.15.0 (1a2b3c4d5e) · 3.16.0 is out"."""
+    trainer, newer, update = inst.get("trainer") or {}, inst.get("newer") or {}, inst.get("update") or {}
+    if not trainer:
+        return ""
+    text = f"RulzTrainer {trainer.get('version') or '?'}" + (f" ({trainer['commit']})" if trainer.get("commit") else "")
+    if update.get("state") == "running":
+        return text + " · updating now"
+    if newer:
+        if newer.get("version") and newer["version"] != trainer.get("version"):
+            return text + f" · {newer['version']} is out"
+        behind = newer.get("behind") or 0
+        return text + f" · {behind} newer commit{'s' if behind != 1 else ''}"
+    if update.get("state") in ("failed", "interrupted"):
+        return text + " · its last update failed"
+    return text
+
+
+def fleet_update_plan_text(plan: dict) -> tuple[list[tuple[str, str]], bool]:
+    """What the update dialog says about an instance's check, as (kind, text) lines ("warning" or ""), and whether
+    it offers the update."""
+    current, latest = plan.get("current") or {}, plan.get("latest") or {}
+
+    def name(v: dict) -> str:
+        return (v.get("version") or "?") + (f" ({v['commit']})" if v.get("commit") else "")
+
+    lines = [("", f"Installed: RulzTrainer {name(current)}"),
+             ("", f"Newest ({plan.get('branch') or 'app/rulz-trainer'}): RulzTrainer {name(latest)}")]
+    count = plan.get("changed_count") or 0
+    can = True
+    if plan.get("unfinished"):
+        lines.append(("warning", "Its last update did not finish: this one runs it again, the requirements and the "
+                                 "WebUI's restart included."))
+    elif plan.get("up_to_date") and not count:
+        lines.append(("", "It already runs the newest RulzTrainer."))
+        can = False
+    elif plan.get("behind"):
+        lines.append(("", f"{plan['behind']} newer commit{'s' if plan['behind'] != 1 else ''} on the branch."))
+    if not plan.get("checkout"):
+        lines.append(("", "This install is not a git checkout (a copy from the Docker image): the update makes it one "
+                          "and replaces its files with the newest release's."))
+    if plan.get("ahead"):
+        lines.append(("warning", f"It has {plan['ahead']} commit{'s' if plan['ahead'] != 1 else ''} of its own, which "
+                                 "the update leaves behind."))
+    if count:
+        names = ", ".join((plan.get("changed") or [])[:6]) + (", ..." if count > 6 else "")
+        lines.append(("warning", f"{count} file{'s were' if count != 1 else ' was'} changed on the instance (by "
+                                 f"rulz_remote.py sync?): {names}. The update replaces "
+                                 f"{'them' if count != 1 else 'it'} with the newest release's."))
+    if can and plan.get("installs"):
+        lines.append(("", "The requirements changed: installing them adds a few minutes."))
+    if can:
+        lines.append(("", "Its WebUI restarts on the new code when the update is done."))
+    if plan.get("job_running"):
+        lines.append(("warning", f"{plan.get('job') or 'A run'} is running there: update after it ends, or stop it "
+                                 "first. Changing the code under a run can break it."))
+        can = False
+    return lines, can
 
 
 def fleet_run_rows(runs: list[dict]) -> list[dict]:
@@ -8108,7 +8196,7 @@ def build_fleet_tab(form_config=None):
              "key on your vast.ai account). This WebUI looks at them every few seconds while it runs; closed, "
              "nothing moves the queue, downloads files or checks the watches unless "
              "python scripts/vast/rulz_fleet.py daemon runs instead. Nothing here rents, stops or destroys an "
-             "instance.")
+             "instance; an instance's menu can reboot it or update its RulzTrainer when you ask.")
     grid = ui.element("div").classes("rz-fleet-grid w-full")
     no_instances = hint("No instances in the fleet yet. Rent one from your RulzTrainer template on vast.ai, then "
                         "Find instances.")
@@ -8127,6 +8215,98 @@ def build_fleet_tab(form_config=None):
         if go:
             await act(fl.stop_run, str(iid), ok=f"{job} is stopping")
 
+    async def open_webui(iid: int):
+        """Point the tab the click opened at the instance's WebUI (or close it again when there is no address)."""
+        try:
+            link = await run.io_bound(fl.webui_link, iid)
+        except Exception as e:  # noqa: BLE001  (whatever went wrong, the blank tab must not stay behind)
+            ui.run_javascript(fleet_tab_js(iid, None))
+            ui.notify(str(e) or "The instance did not say where its WebUI is.", type="warning", multi_line=True)
+            return
+        ui.run_javascript(fleet_tab_js(iid, link["url"]))
+        if link.get("webui_running") is False:
+            ui.notify(f"Instance {iid}'s WebUI is not running at the moment: its page may not answer.", type="warning")
+        elif not link.get("signed_in"):
+            ui.notify("The instance did not give its portal token: the page asks for a login (user vastai, password "
+                      "the instance's OPEN_BUTTON_TOKEN).", type="info", multi_line=True)
+
+    async def answer_of(dlg) -> object:
+        return await dlg
+
+    async def update_trainer(iid: int):
+        """Check what an update would change, show it, and on a yes update the instance and restart its WebUI."""
+        with ui.dialog() as dlg, ui.card().classes("w-[34rem] max-w-full"):
+            ui.label(f"Update RulzTrainer on instance {iid}").classes("text-base font-medium")
+            body = ui.column().classes("w-full gap-2")
+            with body, ui.row().classes("items-center gap-2 no-wrap"):
+                ui.spinner(size="sm")
+                hint("Asking the instance for the newest RulzTrainer (it fetches the code; nothing changes yet)…")
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("Cancel", on_click=lambda: dlg.submit(False)).props("flat")
+                go = ui.button("Update and restart its WebUI", icon="system_update_alt",
+                               on_click=lambda: dlg.submit(True)).props("unelevated no-caps")
+                go.disable()
+        answer = asyncio.ensure_future(answer_of(dlg))  # opens it; the check runs while it shows
+        plan, error = None, ""
+        try:
+            plan = await run.io_bound(fl.check_update, iid)
+        except (rulz_fleet.Refused, rulz_fleet.remote.Unreachable, SystemExit, OSError) as e:
+            error = str(e) or "The check did not work."
+        if not answer.done():
+            body.clear()
+            with body:
+                if plan is None:
+                    ui.label(error).classes("rz-banner warning")
+                else:
+                    lines, can = fleet_update_plan_text(plan)
+                    for kind, text in lines:
+                        if kind:
+                            ui.label(text).classes(f"rz-banner {kind}")
+                        else:
+                            hint(text)
+                    if can:
+                        go.enable()
+            refresh(force=True)
+        ok = await answer
+        dlg.delete()
+        if not ok or plan is None:
+            return
+        ui.notify(f"Updating instance {iid}: the code, then the requirements when they changed, then its WebUI "
+                  "restarts. This page says when it is done.", type="info", multi_line=True)
+        try:
+            reply = await run.io_bound(fl.update_trainer, iid, discard=bool(plan.get("changed_count")))
+        except (rulz_fleet.Refused, rulz_fleet.remote.Unreachable, SystemExit, OSError) as e:
+            ui.notify(str(e) or "The update did not work.", type="warning", multi_line=True)
+            refresh(force=True)
+            return
+        await run.io_bound(look_once)  # the card's version from a fresh look, not the one before the update
+        refresh(force=True)
+        now_on = (reply.get("to") if reply.get("state") == "done" else reply.get("current")) or {}
+        if reply.get("state") == "current":
+            ui.notify(f"Instance {iid} already runs the newest RulzTrainer.", type="info")
+        else:
+            ui.notify(f"Instance {iid} now runs RulzTrainer {now_on.get('version') or now_on.get('commit') or ''}"
+                      + (f". {reply['note']}" if reply.get("note") else ""),
+                      type="positive" if reply.get("restarted") else "warning", multi_line=True)
+
+    async def reboot_instance(iid: int, job: str):
+        with ui.dialog() as dlg, ui.card().classes("w-[32rem] max-w-full"):
+            ui.label(f"Reboot instance {iid}?").classes("text-base font-medium")
+            hint("vast.ai stops and starts its container. Its disk (the install, datasets, models and runs) is kept and "
+                 "the GPU stays its own. Its WebUI is back after a minute or two; the fleet waits for it before it "
+                 "calls the instance out of reach.")
+            if job:
+                ui.label(f"{job} is running there: the reboot kills it without a final save. Stop the run first to "
+                         "keep its last steps.").classes("rz-banner warning")
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("Cancel", on_click=lambda: dlg.submit(False)).props("flat")
+                ui.button("Reboot and kill the run" if job else "Reboot", icon="restart_alt",
+                          on_click=lambda: dlg.submit(True)).props("unelevated no-caps")
+        go = await dlg
+        dlg.delete()
+        if go:
+            await act(fl.reboot, iid, kill=bool(job), ok=f"Instance {iid} is rebooting")
+
     def make_card(inst: dict) -> dict:
         iid = inst["id"]
         w: dict = {}
@@ -8144,15 +8324,22 @@ def build_fleet_tab(form_config=None):
             w["probe"] = hint("")
             w["chart"] = ui.echart(fleet_spark(None)).classes("w-full h-36")
             w["machine"] = hint("")
+            w["version"] = hint("")
             w["theirs"] = hint("")
             with ui.row().classes("w-full items-center gap-2"):
                 w["stop"] = ui.button("Stop run", icon="stop", color=None).props("outline dense no-caps")
+                w["open"] = ui.button("Open WebUI", icon="open_in_new", color=None).props("outline dense no-caps") \
+                    .tooltip("This instance's own RulzTrainer page in a new tab, signed in through vast.ai's Instance "
+                             "Portal")
                 w["accept"] = ui.switch("Takes queued runs", value=inst.get("accept", True),
                                         on_change=lambda e, i=iid: act(fl.set_instance, i, accept=bool(e.value))
                                         if e.value != state["accept"].get(i, True) else None)
                 ui.space()
                 with ui.button(icon="more_vert", color=None).props("flat dense round"):
                     with ui.menu():
+                        w["update_item"] = ui.menu_item("Update RulzTrainer…")
+                        w["reboot_item"] = ui.menu_item("Reboot the instance…")
+                        ui.separator()
                         w["watch_item"] = ui.menu_item("")
                         ui.menu_item("Remove from the fleet", on_click=lambda i=iid: act(
                             fl.remove_instance, i, ok=f"Instance {i} removed; its runs stay on record"))
@@ -8188,6 +8375,13 @@ def build_fleet_tab(form_config=None):
         w["theirs"].visible = bool(w["theirs"].text)
         w["stop"].visible = running
         w["stop_target"] = (iid, job.get("job") or "")
+        w["version"].text = fleet_version_line(inst)
+        w["version"].visible = bool(w["version"].text)
+        usable = inst["state"] != "gone"
+        w["open"].visible = usable
+        w["update_item"].set_enabled(usable)
+        w["reboot_item"].set_enabled(usable)
+        w["reboot_target"] = (iid, (job.get("job") or "") if running else "")
         state["accept"][iid] = inst.get("accept", True)
         if w["accept"].value != inst.get("accept", True):
             w["accept"].value = inst.get("accept", True)
@@ -8206,6 +8400,9 @@ def build_fleet_tab(form_config=None):
                 for inst in instances:
                     w = state["cards"][inst["id"]] = make_card(inst)
                     w["stop"].on_click(lambda _, w=w: stop_run(*w["stop_target"]))
+                    w["open"].on("click", lambda _, i=inst["id"]: open_webui(i), js_handler=fleet_open_tab_js(inst["id"]))
+                    w["update_item"].on_click(lambda _, i=inst["id"]: update_trainer(i))
+                    w["reboot_item"].on_click(lambda _, w=w: reboot_instance(*w["reboot_target"]))
                     w["watch_item"].on_click(lambda _, w=w: act(fl.set_instance, w["watch_target"][0],
                                                                 enabled=w["watch_target"][1]))
         for inst in instances:
@@ -12385,6 +12582,12 @@ instance is gone.
 The WebUI does the looking while it runs. Closed, run `python scripts/vast/rulz_fleet.py daemon` instead, or nothing
 moves the queue, downloads files or checks the watches. The same file is the command line for all of this
 (`rulz_fleet.py --help`). Nothing here rents, stops or destroys an instance.
+
+**An instance's own controls**: **Open WebUI** on its card opens that instance's RulzTrainer page in a new tab, signed
+in through vast.ai's Instance Portal (the same token as vast.ai's Open button). Its **⋮** menu has **Update
+RulzTrainer…**, which shows the installed and the newest version first, then updates the code (and the requirements
+when they changed) and restarts its WebUI; it waits while a run is going. **Reboot the instance…** has vast.ai stop
+and start its container: the disk is kept, a run going there is killed (the dialog says so first).
 
 ## Wizard
 New to LoRA training? The **Wizard** tab sets up a character / person LoRA in six short pages: who you are training

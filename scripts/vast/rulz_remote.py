@@ -11,6 +11,7 @@ start and stop runs. For a person at a terminal and for an AI assistant with a s
     python scripts/vast/rulz_remote.py start --job test1 --from my_lora --set steps=300 --dry-run
     python scripts/vast/rulz_remote.py wait test1           # blocks until the run ends
     python scripts/vast/rulz_remote.py ssh -- nvidia-smi    # any command in the install folder
+    python scripts/vast/rulz_remote.py update --check       # the newest RulzTrainer; update installs it, restarts the WebUI
 
 Needs: ssh on PATH, and the vastai CLI with an API key to find the instance (`vastai set api-key <key>`). Your account's
 ssh key reaches every instance rented after it was added; connect --attach-key adds it to one rented before. The
@@ -18,7 +19,8 @@ standard library is enough here: the instance's side is rulz_agent.py, sent over
 installed there and the instance's checkout may be of any age.
 
 Reads change nothing on the instance. start queues a run in the WebUI's queue, so it shows on the Monitor, and stop
-is the WebUI's Stop. This tool never rents, stops or destroys an instance.
+is the WebUI's Stop; update replaces the install's code with the newest release's and restarts the WebUI. This tool
+never rents, stops or destroys an instance.
 
 Exit status: 0 fine, 1 refused or the run failed, 2 wait timed out, 3 the instance can't be reached."""
 from __future__ import annotations
@@ -44,7 +46,7 @@ PULLS = STATE / "runs"  # outside the checkout: pulled runs outlive a branch or 
 REMOTE_DIR = "/workspace/RulzTrainer"
 PYTHON = '"$(test -x /venv/main/bin/python && echo /venv/main/bin/python || echo python3)"'
 AGENT_COMMANDS = {"status", "jobs", "job", "log", "probes", "config", "start", "stop", "queue", "snapshot",
-                  "record"}  # rulz_agent.py's
+                  "record", "update", "webui"}  # rulz_agent.py's
 CONFIG_SLOT = b'SENT_CONFIG = ""'  # the line of rulz_agent.py that takes a local config
 SSH_FAILED = 255  # ssh's own exit status: it could not connect, or the connection dropped
 SYNC_PATHS = ("rulztrainer", "webui.py", "scripts", "requirements.txt")  # what a run needs of the code
@@ -184,18 +186,21 @@ class Remote:
     def command(self, shell: str, in_folder: bool = True) -> list[str]:
         return ssh_command(self.conn, self.key) + [f"cd {shlex.quote(self.folder)} && {shell}" if in_folder else shell]
 
-    def run(self, shell: str, data: bytes | None = None, in_folder: bool = True) -> subprocess.CompletedProcess:
+    def run(self, shell: str, data: bytes | None = None, in_folder: bool = True,
+            retry: bool = True) -> subprocess.CompletedProcess:
+        """The command over ssh. When ssh fails, the route is looked up again and the command runs once more, unless
+        retry=False: a connection that dropped part way may have left the command running there (an update)."""
         done = subprocess.run(self.command(shell, in_folder), input=data, capture_output=True,
                               stdin=subprocess.DEVNULL if data is None else None)
-        if done.returncode == SSH_FAILED:
+        if done.returncode == SSH_FAILED and retry:
             self.conn = find_connection(self.instance, self.key, self.remember)
             done = subprocess.run(self.command(shell, in_folder), input=data, capture_output=True,
                                   stdin=subprocess.DEVNULL if data is None else None)
         return done
 
-    def agent(self, *args: str, config: bytes | None = None) -> subprocess.CompletedProcess:
+    def agent(self, *args: str, config: bytes | None = None, retry: bool = True) -> subprocess.CompletedProcess:
         """rulz_agent.py on the instance: piped in, so it is always this one."""
-        return self.run(f"{PYTHON} - {shlex.join(args)}", agent_program(config))
+        return self.run(f"{PYTHON} - {shlex.join(args)}", agent_program(config), retry=retry)
 
     def agent_json(self, *args: str):
         done = self.agent(*args)
@@ -485,7 +490,8 @@ def main(argv=None) -> int:
     try:
         if rest and rest[0] in AGENT_COMMANDS:
             words, config = agent_args(rest)
-            return forward(Remote(opts.instance, opts.key, opts.dir).agent(*words, config=config))
+            once = words[0] == "update" and "--check" not in words  # never run twice by a reconnect
+            return forward(Remote(opts.instance, opts.key, opts.dir).agent(*words, config=config, retry=not once))
         args = parser().parse_args(argv)
         if args.func is not cmd_connect:
             args.remote = Remote(args.instance, args.key, args.dir)

@@ -123,13 +123,17 @@ def test_agent_commands_reach_the_agent_with_global_options_taken_out(monkeypatc
         def __init__(self, instance, key, folder):
             seen.update(instance=instance, folder=folder)
 
-        def agent(self, *args, config=None):
-            seen["args"] = args
+        def agent(self, *args, config=None, retry=True):
+            seen.update(args=args, retry=retry)
             return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(remote, "Remote", Fake)
     assert remote.main(["--instance", "5", "--dir", "/w", "log", "job", "-n", "3", "--grep", "x y"]) == 0
-    assert seen == {"instance": 5, "folder": "/w", "args": ("log", "job", "-n", "3", "--grep", "x y")}
+    assert seen == {"instance": 5, "folder": "/w", "args": ("log", "job", "-n", "3", "--grep", "x y"), "retry": True}
+    remote.main(["update", "--check"])
+    assert seen["retry"] is True
+    remote.main(["update", "--discard"])  # a reconnect must not start a second update
+    assert seen["args"] == ("update", "--discard") and seen["retry"] is False
 
 
 def test_a_local_config_is_taken_out_of_the_arguments(tmp_path):
