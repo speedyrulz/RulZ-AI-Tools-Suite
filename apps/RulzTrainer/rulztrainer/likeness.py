@@ -177,6 +177,12 @@ class ProbeRecord:
     copy: float | None = None
     copy_of: str = ""
     copy_baseline: float | None = None
+    # logged only (after the ai-toolkit fork's identity eval): each raw score's place between the step-0 floor (0) and
+    # the references' own level (1), unclipped and unstretched; above 1 the probe matches the references better than
+    # they match each other, which the capped normalized score hides (a memorization watch, beside the copy check)
+    face_over: float | None = None
+    body_over: float | None = None
+    gold_over: float | None = None
 
 
 class LikenessController:
@@ -261,6 +267,15 @@ class LikenessController:
         floor = self.floor[kind] if self.floor[kind] is not None else FLOOR_DEFAULT[kind]
         least = max(MIN_SPAN[kind], MIN_ROOM_SHARE[kind] * (100.0 - floor))
         return floor, floor + (max(self.ceiling[kind], floor + least) - floor) * self._shape(kind)[0]
+
+    def over(self, kind: str, value):
+        """A raw score's place from the floor (0) to the references' own level (1), unclipped and before the span's
+        stretch (None without likeness_normalize or a score)."""
+        if value is None or not self.normalize:
+            return None
+        lo, hi = self.scale(kind)
+        top = lo + (hi - lo) / self._shape(kind)[0]
+        return (value - lo) / (top - lo)
 
     def norm(self, kind: str, value):
         """A raw score on the normalized scale (the raw score itself with likeness_normalize off)."""
@@ -414,6 +429,13 @@ class LikenessController:
         if self.has_gold:
             rec.gold, rec.gold_ema, rec.gold_norm = gold, self.gold_ema, self.norm("gold", gold)
             rec.gold_norm_ema, rec.gold_select, rec.arc_combined_ema = gold_n, self.gold_select, arc_comb
+        rec.face_over, rec.body_over = self.over("face", face), self.over("body", body)
+        rec.gold_over = self.over("gold", gold) if self.has_gold else None
+        past = [f"{k} {v:.2f}x" for k, v in (("face", rec.face_over), ("body", rec.body_over),
+                                              ("gold face", rec.gold_over)) if v is not None and v > 1.0]
+        if past and step > 0:
+            log.info("Probe step %d past the references' own level (%s): it matches them better than they match each "
+                     "other, a memorization watch (logged only)", step, ", ".join(past))
         if "step_up" in actions:
             self.enter_stage(actions["step_up"])
         return rec, actions

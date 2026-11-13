@@ -64,6 +64,9 @@ def ensure_insightface_pack(name: str = "buffalo_l", root: str = "~/.insightface
     pack_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path) as zf:
         zf.extractall(pack_dir)
+    if not any(pack_dir.glob("*.onnx")):  # antelopev2's zip holds its files in a folder of the pack's name
+        for f in pack_dir.glob("*/*.onnx"):
+            f.replace(pack_dir / f.name)
     return pack_dir
 
 

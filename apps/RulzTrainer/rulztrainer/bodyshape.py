@@ -17,11 +17,18 @@ measure the body so that a bent leg is still the same leg:
     NLF's weights are for noncommercial research use, so they are not downloaded for you: put
     nlf_l_multi_0.3.2.patch6.torchscript (github.com/isarandi/nlf/releases, v0.3.2, 550 MB) in models/nlf/.
 
+  * smplx_ratio: the same NLF fit, measured the way the ai-toolkit fork's identity eval does: nine measurements over
+    the neck-to-knee height (shoulder width, torso, thigh, upper arm and forearm length; chest, waist, hip and thigh
+    girth), compared through RatioProfile. On one woman's 19 photos and 998 body probes of 26 MOSS-Image runs it
+    showed training progress about 1.5x as clearly as smplx (rise over step 0: 5.0 against 3.2 seed-noise units)
+    and told her photos from the base model's body as well (9.6 against 10.8).
+
 Both compare a picture with the references through a calibrated profile (Profile): per measurement the references'
 median and their own spread (a robust standard deviation, at least 3% of the median), so a measurement that varies a
 lot between the photos of the one person counts for little and a steady one counts for a lot. The score is the mean
 over the shared measurements of exp(-z^2 / 2), as a percent; the references' own level (the normalized 100) is each
-reference scored against the others (leave one out).
+reference scored against the others (leave one out). smplx_ratio's RatioProfile drops the spread: the score is
+exp(-3 * mean |log(measurement / reference median)|), as a percent, with the same leave-one-out level.
 """
 from __future__ import annotations
 
@@ -40,6 +47,10 @@ MIN_REL = 0.03  # a measurement's spread is at least this share of its median (o
 DEFAULT_REL = 0.10  # the spread of a measurement fewer than MIN_REFS references have
 MIN_REFS = 3
 MIN_KEYS = 3  # a picture needs this many measurements in common with the references to be scored
+# RatioProfile's exp(-k * mean |log ratio|): with k = 1 the base model's step-0 body read ~90 and the references ~97,
+# narrower than the likeness scale's least body span (MIN_SPAN 8 points), so the references' level read ~49 instead
+# of ~64; k = 3 spreads the same order over ~72 .. ~90
+RATIO_SHARPNESS = 3.0
 
 
 class Profile:
@@ -82,10 +93,39 @@ class Profile:
                 for k in self.median}
 
 
+class RatioProfile(Profile):
+    """The references' per-measurement median with no spread: a picture's score is
+    exp(-RATIO_SHARPNESS * mean |log(value / median)|) over the shared positive measurements, as a percent (100 = the
+    median body; 5% off on every measurement ~86)."""
+
+    def similarity(self, sample: dict[str, float], min_keys: int = MIN_KEYS) -> tuple[float | None, int]:
+        shared = [k for k in self.median if k in sample and sample[k] > 0 and self.median[k] > 0]
+        if len(shared) < min_keys:
+            return None, len(shared)
+        dev = float(np.mean([abs(math.log(sample[k] / self.median[k])) for k in shared]))
+        return math.exp(-RATIO_SHARPNESS * dev) * 100.0, len(shared)
+
+    @staticmethod
+    def self_similarity(samples: list[dict[str, float]]) -> float | None:
+        sims = []
+        for i, s in enumerate(samples):
+            others = samples[:i] + samples[i + 1:]
+            if len(others) < 2:
+                continue
+            pct, _ = RatioProfile(others).similarity(s)
+            if pct is not None:
+                sims.append(pct)
+        return float(np.mean(sims)) / 100.0 if sims else None
+
+    def describe(self) -> dict[str, str]:
+        return {k: f"{v:.3f}" for k, v in self.median.items()}
+
+
 class _ProfileScorer:
     """set_references / score / ready / ref_count / ref_self_similarity on top of a ratios(path) method."""
 
     kind = "body"
+    profile_class = Profile
 
     def ratios(self, path) -> dict[str, float] | None:  # pragma: no cover - subclasses
         raise NotImplementedError
@@ -101,9 +141,9 @@ class _ProfileScorer:
                 per_image.append(r)
             else:
                 log.info("Body reference %s: no measurable body (%s)", Path(p).name, self.kind)
-        self.profile = Profile(per_image) if per_image else None
+        self.profile = self.profile_class(per_image) if per_image else None
         self.ref_count = len(per_image)
-        self.ref_self_similarity = Profile.self_similarity(per_image) if len(per_image) >= 3 else None
+        self.ref_self_similarity = self.profile_class.self_similarity(per_image) if len(per_image) >= 3 else None
         if self.profile:
             log.info("Body references (%s): %d of %d measurable; profile %s; references' own level %s", self.kind,
                      len(per_image), len(info), self.profile.describe(),
@@ -310,15 +350,55 @@ def tpose_measurements(verts: np.ndarray, joints: np.ndarray, part: np.ndarray) 
     return out
 
 
+RATIO_BAND = 0.012  # a girth slice: the vertices within this many metres of its level (the fork's identity eval)
+
+
+def neck_knee_measurements(verts: np.ndarray, joints: np.ndarray, part: np.ndarray) -> dict[str, float]:
+    """body_score smplx_ratio: nine measurements of an SMPL-X T-pose body (metres, y up) over its neck-to-knee
+    height, as the ai-toolkit fork's identity eval takes them: shoulder width; torso, thigh, upper arm and forearm
+    length; chest, waist, hip and thigh girth (convex hulls of the trunk / thigh vertices at a joint's height)."""
+    y = verts[:, 1]
+    stature = float(joints[NECK, 1] - (joints[KNEE_L, 1] + joints[KNEE_R, 1]) / 2)
+    if stature <= 0:
+        return {}
+
+    def dist(a, b):
+        return float(np.linalg.norm(joints[a] - joints[b]))
+
+    def girth(level: float, parts) -> float | None:
+        sel = (np.abs(y - level) < RATIO_BAND) & np.isin(part, parts)
+        return _convex_perimeter(verts[sel][:, [0, 2]]) if sel.sum() >= 3 else None
+
+    trunk = (PELVIS, SPINE1, SPINE2, SPINE3)
+    out = {"shoulder width": dist(SHO_L, SHO_R), "torso": dist(PELVIS, NECK),
+           "thigh": (dist(HIP_L, KNEE_L) + dist(HIP_R, KNEE_R)) / 2,
+           "upper arm": (dist(SHO_L, ELB_L) + dist(SHO_R, ELB_R)) / 2,
+           "forearm": (dist(ELB_L, WRI_L) + dist(ELB_R, WRI_R)) / 2}
+    for name, level, parts in (("chest girth", joints[SPINE3, 1], trunk), ("waist girth", joints[SPINE1, 1], trunk),
+                               ("hip girth", joints[PELVIS, 1] - 0.04, trunk + (HIP_L, HIP_R)),
+                               ("thigh girth", (joints[HIP_L, 1] + joints[KNEE_L, 1]) / 2, (HIP_L,))):
+        g = girth(level, parts)
+        if g:
+            out[name] = g
+    return {k: v / stature for k, v in out.items()}
+
+
 class SMPLXScorer(_ProfileScorer):
     """body_score "smplx": NLF's SMPL-X shape, measured in the T-pose. The model waits on the CPU between pictures
-    (hold() keeps it on the GPU for a batch)."""
+    (hold() keeps it on the GPU for a batch). measure "ratio" (body_score smplx_ratio): the neck-to-knee measurements
+    through RatioProfile instead."""
 
     kind = "smplx"
 
     def __init__(self, model_path: str = "", models_dir: str | Path = "models", device: str = "cuda:0",
-                 beta_regularizer: float = NLF_BETA_REGULARIZER, progress=None):
+                 beta_regularizer: float = NLF_BETA_REGULARIZER, progress=None, measure: str = "tpose"):
         import torch
+
+        if measure not in ("tpose", "ratio"):
+            raise ValueError(f"measure must be tpose or ratio, got {measure!r}")
+        self.measure = measure
+        if measure == "ratio":
+            self.kind, self.profile_class = "smplx_ratio", RatioProfile
         import torchvision  # noqa: F401  (registers the detector's ops NLF's TorchScript calls)
 
         path = find_nlf(model_path, models_dir)
@@ -401,4 +481,5 @@ class SMPLXScorer(_ProfileScorer):
         if b is None:
             return None
         verts, joints = self.tpose(b)
-        return tpose_measurements(verts, joints, self.parts) or None
+        measure = neck_knee_measurements if self.measure == "ratio" else tpose_measurements
+        return measure(verts, joints, self.parts) or None

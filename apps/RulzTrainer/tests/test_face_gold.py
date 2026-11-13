@@ -28,7 +28,17 @@ def test_when_the_gold_scorer_turns_on():
     assert TrainConfig(reward_steps=10, face_gold="off").gold_backend() == ""
     assert TrainConfig(face_gold="facenet").gold_backend() == "facenet"
     with pytest.raises(ValueError, match="face_gold must be"):
-        TrainConfig(face_gold="adaface").validate()
+        TrainConfig(face_gold="arcface").validate()
+    # AdaFace: always with face_gold adaface, or auto's recognizer with face_gold_model; training on FaceNet does not
+    # disqualify it
+    assert TrainConfig(face_gold="adaface").gold_backend() == "adaface"
+    assert TrainConfig(reward_steps=10, face_gold_model="adaface").gold_backend() == "adaface"
+    assert TrainConfig(face_gold_model="adaface").gold_backend() == ""  # auto: still only when training on ArcFace
+    assert TrainConfig(id_loss_weight=0.2, id_loss_backend="facenet", id_align=True,
+                       face_gold_model="adaface").gold_backend() == "adaface"
+    TrainConfig(face_gold="adaface", id_loss_weight=0.2, id_loss_backend="facenet").validate()
+    with pytest.raises(ValueError, match="face_gold_model"):
+        TrainConfig(face_gold_model="arcface").validate()
     with pytest.raises(ValueError, match="no held-out judge"):
         TrainConfig(face_gold="facenet", id_loss_weight=0.2, id_loss_backend="facenet").validate()
 
@@ -151,6 +161,14 @@ def test_the_trainer_sets_the_gold_scale_and_loads_it_only_when_wanted(monkeypat
     tr.race_rows = [("a", _cfg(id_loss_weight=0.2), {}), ("b", _cfg(id_loss_weight=0.2, id_loss_backend="facenet"), {})]
     tr._setup_gold(sc)
     assert sc.gold is None
+    # AdaFace is held out from a FaceNet identity loss, so that race keeps its gold judge
+    monkeypatch.setattr(idloss, "adaface_embedder", lambda *a, **k: Emb())
+    tr.race_rows = [("a", _cfg(id_loss_weight=0.2, face_gold_model="adaface"), {}),
+                    ("b", _cfg(id_loss_weight=0.2, id_loss_backend="facenet", id_align=True,
+                               face_gold_model="adaface"), {})]
+    tr.cfg = tr.race_rows[0][1]
+    tr._setup_gold(sc)
+    assert isinstance(sc.gold, Emb) and status["face_gold"] == "adaface" and tr.gold_name == "AdaFace KP-RPE"
 
 
 def test_the_reward_stage_warns_when_arcface_runs_ahead_of_the_gold_face(caplog):
@@ -181,7 +199,7 @@ def test_the_noise_report_measures_the_gold_face_too():
     assert rep["kinds"]["face"]["sd_diff"] == pytest.approx(0.0) and rep["kinds"]["gold"]["sd_diff"] > 2
     assert "suggested_noise_band_gold" in rep and rep["suggested_noise_band_gold"] > rep["suggested_noise_band"]
     lines = S.describe(rep)
-    assert any(line.startswith("gold face (FaceNet):") for line in lines)
+    assert any(line.startswith("gold face:") for line in lines)
     assert any("gold face in charge" in line for line in lines)
     no_gold = S.noise_report({k: {kk: v[kk] for kk in ("face", "body", "combined")} for k, v in files.items()}, 2, 0.5)
     assert set(no_gold["kinds"]) == {"face", "body", "combined"} and "suggested_noise_band_gold" not in no_gold
@@ -199,10 +217,10 @@ def test_the_monitor_draws_the_gold_face():
     probes = [{"step": 100, "face_norm_ema": 50.0, "body_norm_ema": None, "combined_ema": 40.0, "gold_norm_ema": 40.0,
                "face_norm": 50.0, "gold_norm": 40.0, "combined": 40.0, "scale": {"face": [20, 70]}}]
     series, legend = webui.probe_chart_series(probes, [])
-    assert legend[-1] == "face (FaceNet)" and series[-1]["data"] == [[100, 40.0]]
-    assert "FaceNet face 40%" in webui.probe_score_line(probes[0])
+    assert legend[-1] == "face (gold)" and series[-1]["data"] == [[100, 40.0]]
+    assert "gold face 40%" in webui.probe_score_line(probes[0])
     _, plain = webui.probe_chart_series([{k: v for k, v in probes[0].items() if not k.startswith("gold")}], [])
-    assert "face (FaceNet)" not in plain
+    assert "face (gold)" not in plain
 
 
 def test_the_noise_check_reports_both_recognizers(tmp_path):

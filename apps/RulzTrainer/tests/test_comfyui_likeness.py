@@ -41,7 +41,7 @@ class FakeFace:
         self.ref_self_similarity = 0.68 if len(paths) >= 2 else None
         return [{"image": str(p), "faces": 1} for p in paths]
 
-    def score(self, image, step=0, prompt_index=0):
+    def score(self, image, step=0, prompt_index=0, qc=False):
         v = FACE.get(Path(image).name)
         return FaceScore(step, str(image), prompt_index, 0 if v is None else 1, None if v is None else v / 100,
                          v, self.refs[0][0] if v is not None else None)

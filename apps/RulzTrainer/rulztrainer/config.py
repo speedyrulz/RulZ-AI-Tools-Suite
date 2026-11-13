@@ -198,7 +198,9 @@ DATASET_KEYS = ("path", "resolutions", "repeats")
 
 
 
-BODY_SCORES = ("appearance", "proportions", "skeleton3d", "smplx")
+BODY_SCORES = ("appearance", "proportions", "skeleton3d", "smplx", "smplx_ratio")
+FACE_MODELS = ("buffalo_l", "antelopev2")  # InsightFace packs the likeness face score can embed with
+GOLD_MODELS = ("facenet", "adaface")  # the held-out gold face recognizers
 
 @dataclass(frozen=True)
 class DatasetSpec:
@@ -402,12 +404,17 @@ class TrainConfig:
     face_refs: list[str] = field(default_factory=list)  # dataset images whose largest face is the reference identity
     face_provider: str = "cpu"  # cpu | cuda (onnxruntime provider for InsightFace)
     face_det_size: int = 640
+    # the InsightFace pack the likeness face score (probes, samples, reward, self-training) embeds with: buffalo_l
+    # (ArcFace R50, w600k_r50) or antelopev2 (ArcFace R100, glintr100; on one test set it showed training progress
+    # ~1.4x as clearly). The dataset's face analysis, identity alignment and the identity loss stay on buffalo_l
+    face_model: str = "buffalo_l"
     body_refs: list[str] = field(default_factory=list)  # dataset images (full body, neutral pose) for proportions
     body_score: str = "appearance"  # appearance (DINOv2 of the person crop, best match against the references) |
     #   proportions (2D skeleton ratios from body_backend, + SAM 3 silhouette widths with mediapipe+sam3) |
     #   skeleton3d (3D bone ratios, + silhouette widths where upright and frontal; bodyshape.py) |
-    #   smplx (NLF's SMPL-X body shape measured in the T-pose; its model is downloaded by hand, see nlf_model)
-    nlf_model: str = ""  # body_score smplx: NLF's TorchScript file or its folder; empty = models/nlf/
+    #   smplx (NLF's SMPL-X body shape measured in the T-pose; its model is downloaded by hand, see nlf_model) |
+    #   smplx_ratio (the same fit: nine neck-to-knee measurements, log-ratio to the references' median)
+    nlf_model: str = ""  # body_score smplx / smplx_ratio: NLF's TorchScript file or its folder; empty = models/nlf/
     body_backend: str = "mediapipe+sam3"  # mediapipe+sam3 (SAM 3 person masks too) | mediapipe (skeleton only)
     sam3_model: str = "facebook/sam3"  # HF repo id or local transformers-format directory
     body_device: str = "cuda:0"  # where SAM 3 runs while scoring (moved back to CPU afterwards)
@@ -528,10 +535,12 @@ class TrainConfig:
     # a best checkpoint (overall, face, body) is replaced by any higher smoothed score, not only one that beats it by
     # the noise band; whether the run still improves (early stop, step-up) still needs the band
     likeness_best_any_rise: bool = False
-    # a second, held-out face recognizer on the probes (likeness.py): auto = FaceNet whenever the run trains against
-    # ArcFace (reward_steps, id_loss_backend arcface, id_align), off, or facenet (always). Nothing ever trains on it,
-    # so with face_gold_select it, not ArcFace, picks the best checkpoint, stops early and ranks a race
+    # a second, held-out face recognizer on the probes (likeness.py): auto = face_gold_model whenever the run trains
+    # against ArcFace (reward_steps, id_loss_backend arcface, id_align), off, or facenet / adaface (always, that
+    # one). Nothing ever trains on it, so with face_gold_select it, not ArcFace, picks the best checkpoint, stops
+    # early and ranks a race
     face_gold: str = "auto"
+    face_gold_model: str = "facenet"  # auto's recognizer: facenet (VGGFace2) | adaface (CVLFace AdaFace KP-RPE)
     face_gold_select: bool = True
     likeness_patience: int = 0  # stop after N probes without improvement; 0 = never
     likeness_lr_control: bool = False  # bounded lr multiplier driven by the probe trend
@@ -628,13 +637,16 @@ class TrainConfig:
         return bool(self.id_loss_weight > 0 and self.id_loss_backend == "facenet")
 
     def gold_backend(self) -> str:
-        """The held-out face recognizer the probes add ("" = none): face_gold facenet always; auto when the run trains
-        against ArcFace and not against FaceNet, and for the noise check (it measures both recognizers)."""
+        """The held-out face recognizer the probes add ("" = none, "facenet" or "adaface"): face_gold facenet / adaface
+        always; auto face_gold_model when the run trains against ArcFace and not against that recognizer, and for the
+        noise check (it measures both recognizers)."""
         mode = str(self.face_gold or "auto").lower()
-        if mode == "facenet":
-            return "facenet"
-        if mode == "auto" and (self.trains_on_arcface() or self.noise_files) and not self.trains_on_facenet():
-            return "facenet"
+        if mode in GOLD_MODELS:
+            return mode
+        backend = str(self.face_gold_model or "facenet").lower()
+        if mode == "auto" and (self.trains_on_arcface() or self.noise_files) and not (
+                backend == "facenet" and self.trains_on_facenet()):
+            return backend
         return ""
 
     def __post_init__(self) -> None:
@@ -769,8 +781,12 @@ class TrainConfig:
             raise ValueError(f"id_loss_backend must be arcface or facenet, got {self.id_loss_backend!r}")
         if self.id_loss_every < 1:
             raise ValueError("id_loss_every must be at least 1")
-        if str(self.face_gold).lower() not in ("auto", "off", "facenet"):
-            raise ValueError(f"face_gold must be auto, off or facenet, got {self.face_gold!r}")
+        if str(self.face_gold).lower() not in ("auto", "off") + GOLD_MODELS:
+            raise ValueError(f"face_gold must be auto, off, facenet or adaface, got {self.face_gold!r}")
+        if str(self.face_gold_model).lower() not in GOLD_MODELS:
+            raise ValueError(f"face_gold_model must be one of {GOLD_MODELS}, got {self.face_gold_model!r}")
+        if self.face_model not in FACE_MODELS:
+            raise ValueError(f"face_model must be one of {FACE_MODELS}, got {self.face_model!r}")
         if str(self.face_gold).lower() == "facenet" and self.trains_on_facenet():
             raise ValueError("face_gold facenet: the identity loss trains on FaceNet (id_loss_backend facenet), so it "
                              "is no held-out judge; use face_gold off or id_loss_backend arcface")

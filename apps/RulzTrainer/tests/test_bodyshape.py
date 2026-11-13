@@ -79,7 +79,7 @@ def test_a_girth_is_the_convex_perimeter_of_a_slice():
     assert BS._convex_perimeter(square) == pytest.approx(4.0)
 
 
-def test_tpose_measurements_of_a_cylinder_person():
+def _cylinder_person():
     """A crude body: a torso cylinder (part 0) between y 0.9 and 1.5, a thigh cylinder (part 1) below, 1.6 m tall."""
     t = np.linspace(0, 2 * math.pi, 40, endpoint=False)
     verts, parts = [], []
@@ -97,11 +97,47 @@ def test_tpose_measurements_of_a_cylinder_person():
                  (BS.SPINE3, 1.35), (BS.NECK, 1.5), (BS.KNEE_L, 0.5), (BS.KNEE_R, 0.5), (BS.ANKLE_L, 0.1),
                  (BS.ANKLE_R, 0.1)):
         joints[j, 1] = y
-    m = BS.tpose_measurements(np.array(verts), joints, np.array(parts))
+    for j, x, y in ((BS.SHO_L, -0.2, 1.45), (BS.SHO_R, 0.2, 1.45), (BS.ELB_L, -0.5, 1.45), (BS.ELB_R, 0.5, 1.45),
+                    (BS.WRI_L, -0.75, 1.45), (BS.WRI_R, 0.75, 1.45)):
+        joints[j, :2] = x, y
+    return np.array(verts), joints, np.array(parts)
+
+
+def test_tpose_measurements_of_a_cylinder_person():
+    m = BS.tpose_measurements(*_cylinder_person())
     assert m["smplx waist/height"] == pytest.approx(2 * math.pi * 0.12 / 1.6, rel=0.02)
     assert m["smplx hip/height"] == pytest.approx(2 * math.pi * 0.16 / 1.6, rel=0.02)
     assert m["smplx waist/hip"] == pytest.approx(0.12 / 0.16, rel=0.03)
     assert m["smplx thigh/height"] == pytest.approx(2 * math.pi * 0.08 / 1.6, rel=0.02)
+
+
+def test_neck_knee_measurements_of_a_cylinder_person():
+    """smplx_ratio: lengths and girths over the neck-to-knee height (1.5 - 0.5 = 1.0 here)."""
+    m = BS.neck_knee_measurements(*_cylinder_person())
+    assert m["shoulder width"] == pytest.approx(0.4)
+    assert m["torso"] == pytest.approx(0.55)  # pelvis 0.95 to neck 1.5
+    assert m["thigh"] == pytest.approx(0.4)
+    assert m["upper arm"] == pytest.approx(0.3) and m["forearm"] == pytest.approx(0.25)
+    assert m["chest girth"] == pytest.approx(2 * math.pi * 0.15, rel=0.02)  # at the spine3 joint, 1.35
+    assert m["waist girth"] == pytest.approx(2 * math.pi * 0.16, rel=0.02)  # at the spine1 joint, 1.05
+    assert m["thigh girth"] == pytest.approx(2 * math.pi * 0.08, rel=0.02)  # halfway from hip to knee
+
+
+def test_ratio_profile_scores_the_log_distance_to_the_median():
+    refs = [{"a": 1.0, "b": 2.0, "c": 3.0}, {"a": 1.0, "b": 2.0, "c": 3.0}, {"a": 1.1, "b": 2.2, "c": 3.3}]
+    p = BS.RatioProfile(refs)
+    assert p.similarity({"a": 1.0, "b": 2.0, "c": 3.0}) == (pytest.approx(100.0), 3)
+    off = p.similarity({"a": 1.05, "b": 2.1, "c": 3.15})[0]  # 5% off on every measurement
+    assert off == pytest.approx(100 * math.exp(-BS.RATIO_SHARPNESS * math.log(1.05)))
+    assert p.similarity({"a": 1.0, "b": 2.0}) == (None, 2)  # fewer than MIN_KEYS shared
+    assert p.similarity({"a": 1.0, "b": 2.0, "c": 0.0})[0] is None  # a non-positive value is not measured
+    assert BS.RatioProfile.self_similarity(refs[:2] + [refs[0]]) == pytest.approx(1.0)
+    assert BS.RatioProfile.self_similarity(refs) < 1.0
+
+
+def test_smplx_ratio_is_a_body_score_of_its_own():
+    with pytest.raises(ValueError, match="measure"):
+        BS.SMPLXScorer.__init__(object.__new__(BS.SMPLXScorer), measure="girths")
 
 
 def test_smplx_needs_nlf_downloaded_by_hand(tmp_path):
@@ -118,7 +154,7 @@ def test_smplx_needs_nlf_downloaded_by_hand(tmp_path):
 def test_body_score_must_be_known():
     from rulztrainer.config import TrainConfig
 
-    for name in ("appearance", "proportions", "skeleton3d", "smplx"):
+    for name in ("appearance", "proportions", "skeleton3d", "smplx", "smplx_ratio"):
         TrainConfig(body_score=name).validate()
     with pytest.raises(ValueError, match="body_score"):
         TrainConfig(body_score="smpl").validate()

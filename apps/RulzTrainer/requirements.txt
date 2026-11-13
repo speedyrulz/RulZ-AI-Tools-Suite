@@ -17,4 +17,8 @@ onnxruntime-gpu>=1.17
 mediapipe>=0.10
 # optional: identity loss with the arcface backend (id_loss_backend: arcface)
 onnx2torch>=1.5
+# optional: the AdaFace gold face scorer (face_gold adaface / face_gold_model adaface); its code ships with the weights
+timm>=1.0
+omegaconf>=2.3
+easydict>=1.10
 psutil>=5.9  # WebUI reattaches to a running training job

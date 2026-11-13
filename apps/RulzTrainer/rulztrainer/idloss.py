@@ -148,6 +148,88 @@ def facenet_embedder(models_dir: str | Path = "models", progress=None) -> Embedd
     return Embedder(net, 160, 127.5 / 128.0, "facenet")
 
 
+ADAFACE_REPO = "minchul/cvlface_adaface_vit_base_kprpe_webface12m"
+ADAFACE_ALIGNER_REPO = "minchul/cvlface_DFA_mobilenet"
+_CVLFACE_FILES = ["*.py", "*.yaml", "*.json", "model.safetensors"]
+
+
+def _import_repo(repo_dir: str, package: str):
+    """A Hugging Face repo's top-level code package (CVLFace ships its model code as `models` / `aligners`)."""
+    import sys
+
+    sys.path.insert(0, repo_dir)
+    try:
+        mod = __import__(package)
+    finally:
+        sys.path.remove(repo_dir)
+    if not os.path.abspath(mod.__file__).startswith(os.path.abspath(repo_dir)):
+        raise RuntimeError(f"another package named {package!r} is already loaded ({mod.__file__}); CVLFace's code "
+                           "cannot be imported next to it")
+    return mod
+
+
+def _load_prefixed(module: nn.Module, path: str, prefix: str = "model.") -> None:
+    from safetensors.torch import load_file
+
+    sd = load_file(path)
+    module.load_state_dict({k[len(prefix):] if k.startswith(prefix) else k: v for k, v in sd.items()}, strict=True)
+
+
+class _KpRpeFace(nn.Module):
+    """CVLFace AdaFace ViT-B KP-RPE: the DFA aligner finds the five landmarks on the aligned 112 px crop and the ViT
+    takes them as its keypoint relative position encoding (as the ai-toolkit fork's identity eval runs it)."""
+
+    def __init__(self, model: nn.Module, aligner: nn.Module):
+        super().__init__()
+        self.model, self.aligner = model, aligner
+
+    def forward(self, x):
+        _, ldmks, _, _, _, _ = self.aligner(x)
+        return self.model(x, ldmks)
+
+
+def adaface_embedder(progress=None) -> Embedder:
+    """CVLFace AdaFace ViT-B KP-RPE (WebFace12M, 112 px, RGB in [-1, 1]) with its DFA MobileNet aligner, from Hugging
+    Face (about 440 MB). Its code comes with the weights and needs timm, omegaconf and easydict."""
+    import sys
+    import types
+
+    import yaml
+
+    try:
+        from easydict import EasyDict
+    except ImportError as e:
+        raise RuntimeError("the AdaFace gold scorer needs timm, omegaconf and easydict "
+                           "(pip install timm omegaconf easydict)") from e
+    from .downloads import ensure_hf_snapshot
+
+    repo = ensure_hf_snapshot(ADAFACE_REPO, "AdaFace KP-RPE face recognizer", progress, _CVLFACE_FILES)
+    aligner_repo = ensure_hf_snapshot(ADAFACE_ALIGNER_REPO, "CVLFace DFA aligner", progress, _CVLFACE_FILES)
+    # the repo compiles and installs a C++ op when it is missing (setup.py install, then exit): registered as absent,
+    # its pure torch path runs
+    stub = types.ModuleType("models.vit_kprpe.RPE.rpe_ops.rpe_index")
+    stub.RPEIndexFunction = None
+    sys.modules[stub.__name__] = stub
+    models, aligners = _import_repo(repo, "models"), _import_repo(aligner_repo, "aligners")
+    with open(os.path.join(repo, "pretrained_model", "model.yaml"), encoding="utf-8") as f:
+        model = models.get_model(EasyDict(yaml.safe_load(f)))
+    _load_prefixed(model, os.path.join(repo, "model.safetensors"))
+    with open(os.path.join(aligner_repo, "pretrained_model", "model.yaml"), encoding="utf-8") as f:
+        aligner = aligners.get_aligner(EasyDict(yaml.safe_load(f)))
+    _load_prefixed(aligner, os.path.join(aligner_repo, "model.safetensors"))
+    return Embedder(_KpRpeFace(model, aligner), 112, 1.0, "adaface")
+
+
+def gold_embedder(backend: str, models_dir: str | Path = "models", progress=None) -> Embedder:
+    """The held-out gold face recognizer by name (TrainConfig.gold_backend)."""
+    if backend == "adaface":
+        return adaface_embedder(progress)
+    return facenet_embedder(models_dir, progress)
+
+
+GOLD_NAMES = {"facenet": "FaceNet (VGGFace2)", "adaface": "AdaFace KP-RPE (CVLFace)"}
+
+
 def load_rgb(path) -> torch.Tensor:
     """[1,3,H,W] in [-1, 1] at full resolution (EXIF-rotated, matching FaceScorer.faces' coordinates)."""
     from PIL import Image, ImageOps
@@ -263,7 +345,9 @@ def build(cfg, face_scorer, decode, device, progress=None) -> IdentityLoss:
     else:
         emb = arcface_embedder()
     emb = emb.to(device)
-    refs = reference_embeddings(emb, face_scorer, check=cfg.id_loss_backend == "arcface")
+    # the port self-check compares with the scorer's own ONNX embeddings: only when that is the same network
+    refs = reference_embeddings(emb, face_scorer, check=cfg.id_loss_backend == "arcface"
+                                and getattr(face_scorer, "model_name", "buffalo_l") == "buffalo_l")
     return IdentityLoss(emb, refs, decode, cfg.id_loss_sigma_max, cfg.id_loss_every, cfg.id_loss_margin_cells,
                         cfg.id_loss_min_face_cells, cfg.id_loss_random_ref, seed=cfg.seed)
 

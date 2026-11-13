@@ -641,12 +641,13 @@ def set_progress(text: str, frac=None) -> None:
     _task_progress.update(text=text, frac=frac)
 
 
-def face_preview(paths: list[str], provider: str, det_size: int) -> tuple[str, list[tuple[str, str]]]:
+def face_preview(paths: list[str], provider: str, det_size: int,
+                 model_name: str = "buffalo_l") -> tuple[str, list[tuple[str, str]]]:
     """Detect reference faces and save crops under output/_face_refs for the UI. Returns (info, [(crop, caption)])."""
     ok, msg = facesim.available()
     if not ok:
         return msg, []
-    scorer = facesim.FaceScorer(provider, int(det_size), progress=set_progress)
+    scorer = facesim.FaceScorer(provider, int(det_size), model_name=model_name or "buffalo_l", progress=set_progress)
     set_progress("Detecting faces...", None)
     paths = [str(p) for p in facesim.expand_refs(paths)]
     if not paths:
@@ -673,13 +674,14 @@ def body_preview(paths: list[str], backend: str = "mediapipe", sam3_model: str =
     ok, msg = bodysim.available()
     if not ok:
         return msg
-    if body_score in ("skeleton3d", "smplx"):
+    if body_score in ("skeleton3d", "smplx", "smplx_ratio"):
         from rulztrainer import bodyshape
 
-        if body_score == "smplx":
+        if body_score in ("smplx", "smplx_ratio"):
             if bodyshape.find_nlf(nlf_model, "models") is None:
                 return bodyshape.missing_nlf_message("models")
-            scorer = bodyshape.SMPLXScorer(nlf_model, "models", device, progress=set_progress)
+            scorer = bodyshape.SMPLXScorer(nlf_model, "models", device, progress=set_progress,
+                                           measure="ratio" if body_score == "smplx_ratio" else "tpose")
         else:
             scorer = bodyshape.Skeleton3DScorer("models", progress=set_progress)
         set_progress("Measuring bodies...", None)
@@ -691,7 +693,7 @@ def body_preview(paths: list[str], backend: str = "mediapipe", sam3_model: str =
                 scorer.set_references(paths)
         else:
             scorer.set_references(paths)
-        need = "the body down to the knees" if body_score == "smplx" else "a usable pose"
+        need = "the body down to the knees" if body_score in ("smplx", "smplx_ratio") else "a usable pose"
         text = f"{scorer.ref_count} of {len(paths)} body references show {need} and are measured."
         if scorer.profile:
             text += " Profile (median +/- the photos' own spread): " + ", ".join(
@@ -832,9 +834,9 @@ def probe_chart_series(probes: list[dict], names: list[str]) -> tuple[list[dict]
                    "data": _probe_points(probes, "body_norm", "body"), "itemStyle": {"color": "#A1A1AA"}}]
         legend = list(PROBE_DEFAULT_SERIES)
         gold = _probe_points(probes, "gold_norm_ema", "gold_ema")
-        if gold:  # the held-out FaceNet face (face_gold): drawn next to ArcFace's, so a gap between them shows
-            series.append(_line("face (FaceNet)", "#22D3EE", lineStyle={"type": "dashed"}, data=gold))
-            legend.append("face (FaceNet)")
+        if gold:  # the held-out gold face (face_gold): drawn next to ArcFace's, so a gap between them shows
+            series.append(_line("face (gold)", "#22D3EE", lineStyle={"type": "dashed"}, data=gold))
+            legend.append("face (gold)")
         return series, legend
     by: dict[str, list[dict]] = {}
     for pr in probes:
@@ -861,7 +863,7 @@ def probe_score_line(rec: dict | None) -> str:
     gold = rec.get("gold_norm")
     if face is None and body is None and not rec.get("scale"):
         face, body, gold = rec.get("face"), rec.get("body"), rec.get("gold")
-    parts = [f"{label} {v:.0f}%" for label, v in (("overall", comb), ("face", face), ("FaceNet face", gold),
+    parts = [f"{label} {v:.0f}%" for label, v in (("overall", comb), ("face", face), ("gold face", gold),
                                                    ("body", body)) if v is not None]
     if rec.get("copy") is not None:  # the copy check: its closest training photo (SSCD cosine)
         parts.append(f"copy {rec['copy']:.2f}")
@@ -1303,6 +1305,7 @@ class Form:
                                             else 1.0),
             face_refs=[p.strip() for p in (v("face_refs") or "").splitlines() if p.strip()],
             face_provider=v("face_provider"), face_det_size=int(v("face_det_size")),
+            face_model=v("face_model") or "buffalo_l",
             body_refs=[p.strip() for p in (v("body_refs") or "").splitlines() if p.strip()],
             face_weight=float(v("face_weight")), body_weight=float(v("body_weight")),
             body_backend=v("body_backend"), sam3_model=(v("sam3_model") or "facebook/sam3").strip(),
@@ -1318,7 +1321,8 @@ class Form:
             likeness_track_best_face=bool(v("likeness_track_best_face")),
             likeness_track_best_body=bool(v("likeness_track_best_body")),
             likeness_best_any_rise=bool(v("likeness_best_any_rise")),
-            face_gold=v("face_gold") or "auto", face_gold_select=bool(v("face_gold_select")),
+            face_gold=v("face_gold") or "auto", face_gold_model=v("face_gold_model") or "facenet",
+            face_gold_select=bool(v("face_gold_select")),
             likeness_normalize=bool(v("likeness_normalize")),
             face_scale_span=float(v("face_scale_span")), face_scale_curve=float(v("face_scale_curve")),
             body_scale_span=float(v("body_scale_span")), body_scale_curve=float(v("body_scale_curve")),
@@ -6274,6 +6278,15 @@ def build_page(local: bool = True):
                                                            label="Face model device").classes("w-40")
                             w["face_det_size"] = ui.number("Detector size", value=d.face_det_size, precision=0) \
                                 .classes("w-32")
+                            w["face_model"] = ui.select({"buffalo_l": "ArcFace R50 (buffalo_l)",
+                                                         "antelopev2": "ArcFace R100 (antelopev2)"},
+                                                        value=d.face_model, label="Face score model") \
+                                .classes("w-56") \
+                                .tooltip("The InsightFace pack the face score embeds with (probes, samples, reward, "
+                                         "self-training). ArcFace R100 (glintr100, about 360 MB, downloaded once) "
+                                         "showed training progress about 1.4x as clearly on one test set, with less "
+                                         "seed noise. The dataset's face analysis, identity alignment and the identity "
+                                         "loss stay on buffalo_l. Scores of the two are not comparable across runs.")
 
                             async def on_face_preview():
                                 paths = [p.strip() for p in (w["face_refs"].value or "").splitlines() if p.strip()]
@@ -6284,7 +6297,7 @@ def build_page(local: bool = True):
                                 _begin("Preparing face model...")
                                 try:
                                     text, crops = await run.io_bound(face_preview, paths, w["face_provider"].value,
-                                                                     w["face_det_size"].value)
+                                                                     w["face_det_size"].value, w["face_model"].value)
                                 except Exception as e:  # noqa: BLE001
                                     face_info.text = f"Error: {e}"
                                     return
@@ -6309,7 +6322,8 @@ def build_page(local: bool = True):
                             w["body_score"] = ui.select({"appearance": "appearance (DINOv2)",
                                                          "proportions": "proportions (2D skeleton)",
                                                          "skeleton3d": "proportions 3D (skeleton + silhouette)",
-                                                         "smplx": "SMPL-X body shape (NLF)"},
+                                                         "smplx": "SMPL-X body shape (NLF)",
+                                                         "smplx_ratio": "SMPL-X proportions, log-ratio (NLF)"},
                                                         value=d.body_score, label="Body score").classes("w-64") \
                                 .tooltip("appearance: a DINOv2 embedding of the body from the neck to mid-thigh, "
                                          "turned upright and cut out from the background, best match against the "
@@ -6321,14 +6335,17 @@ def build_page(local: bool = True):
                                          "widths where the person stands upright facing the camera. SMPL-X: NLF fits "
                                          "the SMPL-X body model and measures it in its T-pose (bust, waist, hip, "
                                          "thigh, limb lengths over the height); needs photos down to the knees and "
-                                         "NLF's file, downloaded by hand (noncommercial license). The last three "
+                                         "NLF's file, downloaded by hand (noncommercial license). SMPL-X "
+                                         "proportions: the same NLF fit, nine neck-to-knee measurements compared by "
+                                         "log-ratio to the references' median (on one test set it showed training "
+                                         "progress about 1.5x as clearly as SMPL-X body shape). The last four "
                                          "ignore clothing and skin; each compares against the references' own spread.")
                             w["nlf_model"] = ui.input("NLF model (file or folder; empty = models/nlf)",
                                                       value=d.nlf_model).classes("w-72") \
                                 .tooltip("SMPL-X needs NLF (noncommercial research license, not downloaded for you): "
                                          "nlf_l_multi_0.3.2.patch6.torchscript, 550 MB, from "
                                          "github.com/isarandi/nlf/releases (v0.3.2), into models/nlf/") \
-                                .bind_visibility_from(w["body_score"], "value", lambda x: x == "smplx")
+                                .bind_visibility_from(w["body_score"], "value", lambda x: x in ("smplx", "smplx_ratio"))
                             w["body_backend"] = ui.select(["mediapipe", "mediapipe+sam3"], value=d.body_backend,
                                                           label="Pose / mask backend").classes("w-48") \
                                 .tooltip("mediapipe: pose landmarks (the person box, skeleton ratios, region masks). "
@@ -6342,7 +6359,7 @@ def build_page(local: bool = True):
 
                             def body_device_visible(_=None):
                                 w["body_device"].set_visibility(w["body_backend"].value == "mediapipe+sam3"
-                                                                or w["body_score"].value == "smplx")
+                                                                or w["body_score"].value in ("smplx", "smplx_ratio"))
 
                             w["body_backend"].on_value_change(body_device_visible)
                             w["body_score"].on_value_change(body_device_visible)
@@ -6677,14 +6694,23 @@ def build_page(local: bool = True):
                                 .tooltip("Not used while Resolution step-up is on (its two counts replace it).")
                         with fields():
                             w["face_gold"] = ui.select({"auto": "auto (when training against ArcFace)", "off": "off",
-                                                        "facenet": "FaceNet, always"}, value=d.face_gold,
-                                                       label="Gold face scorer").classes("w-72") \
-                                .tooltip("A second face recognizer (FaceNet, VGGFace2, about 110 MB, downloaded once) "
-                                         "scores every probe face too. Nothing trains on it, so it can judge a run that "
+                                                        "facenet": "FaceNet, always", "adaface": "AdaFace, always"},
+                                                       value=d.face_gold, label="Gold face scorer").classes("w-72") \
+                                .tooltip("A second face recognizer (FaceNet, VGGFace2, about 110 MB, or AdaFace KP-RPE, "
+                                         "about 440 MB, downloaded once) scores every probe face too. Nothing trains on it, so it can judge a run that "
                                          "trains against the probes' own ArcFace: the reward stage, the identity loss "
                                          "on its arcface backend, identity alignment. Those can raise the ArcFace score "
                                          "without the face looking more like the person. auto turns it on for them "
                                          "(and for the probe noise check); the Monitor draws it as a dashed line.")
+                            w["face_gold_model"] = ui.select({"facenet": "FaceNet (VGGFace2)",
+                                                              "adaface": "AdaFace KP-RPE (CVLFace)"},
+                                                             value=d.face_gold_model, label="auto uses") \
+                                .classes("w-56") \
+                                .bind_visibility_from(w["face_gold"], "value", backward=lambda m: m == "auto") \
+                                .tooltip("The recognizer auto turns on. AdaFace told the person's photos from the base "
+                                         "model's faces more clearly than FaceNet on one test set and ranked runs like "
+                                         "the ArcFace models did (FaceNet often disagreed with all of them). It needs "
+                                         "timm, omegaconf and easydict (pip install timm omegaconf easydict).")
                             w["face_gold_select"] = ui.switch("Best checkpoint, early stop and race follow it",
                                                               value=d.face_gold_select) \
                                 .bind_visibility_from(w["face_gold"], "value", backward=lambda m: m != "off") \
@@ -7526,7 +7552,7 @@ def build_page(local: bool = True):
                     fe = last.get("face_norm_ema") if normed else last.get("face_ema")
                     be = last.get("body_norm_ema") if normed else last.get("body_ema")
                     ge = last.get("gold_norm_ema") if normed else last.get("gold_ema")
-                    gold_txt = (f" FaceNet face {f2(ge)}" + (" (in charge)" if last.get("gold_select") else "")
+                    gold_txt = (f" gold face {f2(ge)}" + (" (in charge)" if last.get("gold_select") else "")
                                 if ge is not None else "")
                     probe_label.text = (f"Probe @ step {last['step']}: face {f2(fe)}{gold_txt} body {f2(be)}"
                                         f" combined {f2(last.get('combined_ema'))} | best {f2(lk.get('best'))} @ step {lk.get('best_step')}"
@@ -7909,13 +7935,13 @@ and a noise band that fits your probe settings. In a race, *Drop only when the p
 drops the lowest racer only when its scores, seed by seed, sit below the leader's with the confidence you set (0.9 is a
 good start); a round too close to call drops nobody, at most a few rounds in a row. Use 2 or more probe seeds with it.
 
-## Gold face scorer (FaceNet)
+## Gold face scorer (FaceNet or AdaFace)
 The probes judge the face with ArcFace. The reward stage, the identity loss on its arcface backend and identity
 alignment train against that same ArcFace, so they can raise its score without the face looking more like the person.
-*Gold face scorer* (Likeness probes section) adds a second recognizer, FaceNet, that nothing trains on: it scores the
+*Gold face scorer* (Likeness probes section) adds a second recognizer, FaceNet or AdaFace, that nothing trains on: it scores the
 same faces against the same references on its own scale, and (*Best checkpoint, early stop and race follow it*, on by
 default) its score replaces ArcFace's in the decisions. *auto* turns it on for those runs and for the probe noise
-check. The Monitor draws it as a dashed "face (FaceNet)" line; ArcFace pulling away from it is the warning sign, and the
+check. The Monitor draws it as a dashed "face (gold)" line; ArcFace pulling away from it is the warning sign, and the
 reward stage logs a warning when ArcFace runs more than 10 points further ahead than when the stage began.
 
 ## Probes on the second GPU

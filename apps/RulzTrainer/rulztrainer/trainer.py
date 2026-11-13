@@ -3515,7 +3515,9 @@ class Trainer(RaceParallelMixin):
         self.status.update(stage=f"scoring probes (step {step})")
         for job, p in zip(jobs, images):  # scoring stays in this thread: the scorers are not shared across threads
             if job.kind == "face":
-                sc = self.face_scorer.score(p, step, 0, gold=True) if gold else self.face_scorer.score(p, step, 0)
+                sc = self.face_scorer.score(p, step, 0, gold=gold, qc=True)
+                if sc.skipped:
+                    log.info("Probe step %d: %s face left unscored (%s)", step, Path(p).name, sc.skipped)
                 seeds["face"].append(sc.percent)
                 if gold:
                     seeds["gold"].append(sc.gold_percent)
@@ -3584,7 +3586,8 @@ class Trainer(RaceParallelMixin):
                      rec.lr_factor, rec.face_bias, took)
         if self.controller.has_gold:
             arc, gold = rec.face_norm_ema if self.controller.normalize else rec.face_ema, rec.gold_norm_ema
-            log.info("%sGold face (FaceNet) step %d: %s (normalized %s) | ema %s vs ArcFace %s%s%s", who, step,
+            log.info("%sGold face (%s) step %d: %s (normalized %s) | ema %s vs ArcFace %s%s%s", who,
+                     getattr(self, "gold_name", "FaceNet"), step,
                      fmt(rec.gold), fmt(rec.gold_norm), fmt(gold), fmt(arc),
                      f" (ArcFace {arc - gold:+.1f})" if arc is not None and gold is not None else "",
                      " | the decisions follow the gold face" if rec.gold_select else "")
@@ -3818,8 +3821,9 @@ class Trainer(RaceParallelMixin):
         if gap - base > limit:
             self._gold_gap_warned = True
             log.warning("Reward stage, step %d: ArcFace's face score has run %.1f points further ahead of the gold "
-                        "(FaceNet) face than when the stage started (%+.1f -> %+.1f): the reward may be gaming "
-                        "ArcFace rather than improving the likeness. %s", step, gap - base, base, gap,
+                        "(%s) face than when the stage started (%+.1f -> %+.1f): the reward may be gaming "
+                        "ArcFace rather than improving the likeness. %s", step, gap - base,
+                        getattr(self, "gold_name", "FaceNet"), base, gap,
                         "The best checkpoint follows the gold face" if self.controller.gold_select else
                         "Compare the probes by eye; face_gold_select makes the best checkpoint follow the gold face")
             self.status.update(gold_gap_warning=step)
@@ -3886,9 +3890,13 @@ class Trainer(RaceParallelMixin):
             log.warning("%s; face scoring disabled", msg)
             return None
         try:
-            scorer = self.face_detector or facesim.FaceScorer(cfg.face_provider, cfg.face_det_size,
-                                                               progress=lambda t, f: self.status.update(stage=t))
-            self.face_detector = scorer
+            if cfg.face_model == "buffalo_l":  # shared with the dataset's face analysis
+                scorer = self.face_detector or facesim.FaceScorer(cfg.face_provider, cfg.face_det_size,
+                                                                   progress=lambda t, f: self.status.update(stage=t))
+                self.face_detector = scorer
+            else:  # its own pack: the analysis cache and identity alignment keep buffalo_l's embeddings
+                scorer = facesim.FaceScorer(cfg.face_provider, cfg.face_det_size, model_name=cfg.face_model,
+                                            progress=lambda t, f: self.status.update(stage=t))
             scorer.set_references(cfg.face_refs)
         except Exception as e:  # noqa: BLE001
             log.warning("Could not initialise face scoring (%s); disabled", e)
@@ -3901,14 +3909,19 @@ class Trainer(RaceParallelMixin):
         return scorer
 
     def _setup_gold(self, scorer) -> None:
-        """The held-out gold face recognizer (face_gold, likeness.py): FaceNet on the face scorer when the run, or any
-        race configuration, trains against ArcFace (or face_gold is facenet, or the noise check runs), on the face
-        scorer's device. Never when a configuration trains on FaceNet itself."""
+        """The held-out gold face recognizer (face_gold, likeness.py): FaceNet or AdaFace (gold_backend) on the face
+        scorer when the run, or any race configuration, trains against ArcFace (or face_gold names it, or the noise
+        check runs), on the face scorer's device. Never FaceNet when a configuration trains on FaceNet itself."""
         cfgs = [self.cfg] + [c for _, c, _ in (getattr(self, "race_rows", None) or [])]
-        if not any(c.gold_backend() for c in cfgs):
+        backends = [b for b in (c.gold_backend() for c in cfgs) if b]
+        if not backends:
             scorer.gold = None
             return
-        if any(c.trains_on_facenet() for c in cfgs):
+        backend = backends[0]
+        if len(set(backends)) > 1:
+            log.warning("Race configurations ask for different gold face scorers (%s); all use %s",
+                        ", ".join(sorted(set(backends))), backend)
+        if backend == "facenet" and any(c.trains_on_facenet() for c in cfgs):
             log.warning("Gold face scorer off: a race configuration trains on FaceNet (id_loss_backend facenet), so "
                         "it is no held-out judge; the probes judge with ArcFace alone")
             scorer.gold = None
@@ -3916,11 +3929,12 @@ class Trainer(RaceParallelMixin):
         from . import facesim, idloss
 
         cfg = self.cfg
-        self.status.update(stage="loading the gold face scorer (FaceNet)")
+        name = idloss.GOLD_NAMES[backend]
+        self.status.update(stage=f"loading the gold face scorer ({name})")
         index = facesim.cuda_index(cfg.face_provider)
         dev = f"cuda:{index}" if index is not None and torch.cuda.is_available() else "cpu"
         try:
-            emb = idloss.facenet_embedder(cfg.models_dir, progress=lambda t, f: self.status.update(stage=t))
+            emb = idloss.gold_embedder(backend, cfg.models_dir, progress=lambda t, f: self.status.update(stage=t))
             scorer.set_gold(emb.to(dev))
         except Exception as e:  # noqa: BLE001
             log.warning("Could not load the gold face scorer (%s); the probes judge with ArcFace alone", e)
@@ -3931,11 +3945,12 @@ class Trainer(RaceParallelMixin):
             scorer.gold = None
             return
         why = ("the run trains against ArcFace" if any(c.trains_on_arcface() for c in cfgs)
-               else "the noise check measures it" if cfg.noise_files else "face_gold facenet")
-        log.info("Gold face scorer on (%s): FaceNet (VGGFace2), which nothing trains on, scores every probe face "
-                 "too; %s", why, "the best checkpoint, early stop and race ranking follow it, the lr control and "
+               else "the noise check measures it" if cfg.noise_files else f"face_gold {backend}")
+        log.info("Gold face scorer on (%s): %s, which nothing trains on, scores every probe face "
+                 "too; %s", why, name, "the best checkpoint, early stop and race ranking follow it, the lr control and "
                  "curriculum keep ArcFace" if cfg.face_gold_select else "logged next to ArcFace (face_gold_select off)")
-        self.status.update(face_gold="facenet", face_gold_similarity=scorer.gold_self_similarity)
+        self.gold_name = name.split(" (")[0]
+        self.status.update(face_gold=backend, face_gold_similarity=scorer.gold_self_similarity)
 
     def _make_id_loss(self):
         """The direct identity loss (experimental), or None when it is off or cannot run."""
@@ -3985,11 +4000,12 @@ class Trainer(RaceParallelMixin):
                 from .bodyshape import Skeleton3DScorer
 
                 scorer = Skeleton3DScorer(cfg.models_dir, progress=lambda t, f: self.status.update(stage=t))
-            elif cfg.body_score == "smplx":
+            elif cfg.body_score in ("smplx", "smplx_ratio"):
                 from .bodyshape import SMPLXScorer
 
                 scorer = SMPLXScorer(cfg.nlf_model, cfg.models_dir, cfg.body_device,
-                                     progress=lambda t, f: self.status.update(stage=t))
+                                     progress=lambda t, f: self.status.update(stage=t),
+                                     measure="ratio" if cfg.body_score == "smplx_ratio" else "tpose")
             else:
                 sil = None
                 if cfg.body_backend == "mediapipe+sam3":
@@ -4011,7 +4027,8 @@ class Trainer(RaceParallelMixin):
             return None
         if not scorer.ready:
             log.warning("No usable %s in any body reference image; body scoring disabled",
-                        {"appearance": "person", "smplx": "body down to the knees"}.get(cfg.body_score, "pose"))
+                        {"appearance": "person", "smplx": "body down to the knees",
+                         "smplx_ratio": "body down to the knees"}.get(cfg.body_score, "pose"))
             return None
         self.status.update(body_ref_similarity=scorer.ref_self_similarity, body_refs=scorer.ref_count)
         return scorer

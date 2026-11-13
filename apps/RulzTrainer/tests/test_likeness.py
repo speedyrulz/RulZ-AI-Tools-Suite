@@ -151,6 +151,23 @@ def test_normalized_scores_put_face_and_body_on_one_scale():
     assert rec.body_norm == 0.0
 
 
+def test_records_keep_the_unclipped_place_past_the_references(caplog):
+    """face_over / body_over: the raw score's place from the step-0 floor (0) to the references' own level (1),
+    unclipped and before the span's stretch; above 1 is logged as a memorization watch and decides nothing."""
+    c = L.LikenessController(_cfg(likeness_normalize=True, face_scale_span=1.35, body_scale_span=1.35),
+                             face_ceiling=70.0, body_ceiling=94.0)
+    rec, _ = c.update(0, 15.0, 82.0)
+    assert rec.face_over == 0.0 and rec.body_over == 0.0
+    rec, _ = c.update(10, 42.5, 88.0)
+    assert abs(rec.face_over - 0.5) < 1e-9 and abs(rec.body_over - 0.5) < 1e-9
+    with caplog.at_level("INFO", logger="rulztrainer"):
+        rec, act = c.update(20, 81.0, 88.0)  # the face 1.2x past the references' own level
+    assert abs(rec.face_over - 1.2) < 1e-9 and rec.face_norm < 100.0  # the stretched scale still has room
+    assert "face 1.20x" in caplog.text and "body" not in caplog.text.split("(")[1].split(")")[0]
+    assert rec.gold_over is None
+    assert L.LikenessController(_cfg()).update(10, 42.5, 88.0)[0].face_over is None  # likeness_normalize off
+
+
 def test_the_face_scale_is_stretched_and_curved_so_it_keeps_room_to_improve():
     """An ArcFace cosine saturates: on a real run a decent face read 90 while the body, on the same pictures, read 51.
     The face's 100 sits face_scale_span x as far above a stranger as the references do, and the position on that scale
@@ -226,7 +243,7 @@ def test_sample_scores_carry_normalized_values_and_captions_show_them(tmp_path):
     c = L.LikenessController(_cfg(likeness_normalize=True, face_weight=0.5, body_weight=0.5), face_ceiling=70.0,
                              body_ceiling=60.0)
     c.update(0, 15.0, 8.0)  # the floors
-    face = SimpleNamespace(score=lambda p, step, i: facesim.FaceScore(step, str(p), i, 1, 0.425, 42.5, "ref"))
+    face = SimpleNamespace(score=lambda p, step, i, qc=False: facesim.FaceScore(step, str(p), i, 1, 0.425, 42.5, "ref"))
     body = SimpleNamespace(score=lambda p: (34.0, 3))
     (tmp_path / "s.png").write_bytes(b"")
     scores = facesim.score_samples(face, [str(tmp_path / "s.png")], 10, tmp_path, body, 0.5, 0.5, scale=c)
