@@ -126,6 +126,13 @@ Windows and WSL keep separate settings, so add the token once in each.
   environment only (never on a command line or on the instance's disk). The first transfer installs
   `huggingface_hub` into `~/.rulz-hf` on the instance (about 30 MB); the instance's own Python environments are not
   touched.
+- **Command prompt** on the vast.ai page: run shell commands on the attached instance (`nvidia-smi`, `ls`, `df -h`,
+  `pip list`...) and watch their output as it comes, with progress bars shown as one live line. Commands run in bash
+  with the instance's `/venv/main` Python on PATH; `cd` carries over to the next command (variables do not). ↑ / ↓
+  step through earlier commands, Enter while a command runs types an answer into it (a `y/n` question), and **Stop**
+  sends Ctrl+C and closes the connection. Closing the app also ends the command, so start long jobs with `nohup` or
+  in a terminal. **Open terminal** opens a real ssh window on your computer logged in to the instance (vast.ai keeps
+  that session in tmux); **Copy ssh command** copies the line to paste into your own terminal.
 
 **Activity panel**: uploads, downloads and moves run in the background with progress; the panel lists every
 job with its result, errors in plain language, and an **Open folder** button for downloads.
@@ -153,7 +160,7 @@ rulz_hf_manager/
   main.py            command line + server start
   config.py          settings file (token, download folder, preferences)
   hub.py             huggingface_hub wrapper: one file-system interface for repos and buckets
-  vast.py            vast.ai: instances, ssh, planning a transfer, following it
+  vast.py            vast.ai: instances, ssh, planning a transfer, following it, command prompt
   remote_agent.py    the instance's side (standard library only, piped over ssh on every call)
   jobs.py            background jobs with progress
   platform_utils.py  Windows / WSL / Linux helpers
