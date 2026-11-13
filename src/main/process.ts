@@ -126,11 +126,15 @@ export function killTree(pid: number | undefined): void {
   execFile('taskkill', ['/pid', String(pid), '/t', '/f'], { windowsHide: true }, () => undefined)
 }
 
-/** Starts an app on its own (it keeps running after the launcher closes). Batch files get a console window. */
-export function launchDetached(target: string, args: string[], cwd: string): ChildProcess {
+/**
+ * Starts an app on its own (it keeps running after the launcher closes). Batch files get a console window. `env` is
+ * added to the launcher's environment.
+ */
+export function launchDetached(target: string, args: string[], cwd: string, env?: Record<string, string>): ChildProcess {
   const { file, args: argv, verbatim } = spawnArgs(target, args)
   const child = spawn(file, argv, {
     cwd,
+    env: env && Object.keys(env).length ? { ...process.env, ...env } : process.env,
     detached: true,
     stdio: 'ignore',
     windowsHide: false,

@@ -30,6 +30,8 @@ export interface IpcInvoke {
   'app:info': () => AppInfo
   'settings:get': () => Settings
   'settings:update': (patch: Partial<Settings>) => Settings
+  /** Turns one of an app's launch options on or off (merged in main, so quick toggles don't undo each other). */
+  'settings:launchOption': (appId: string, optionId: string, on: boolean) => Settings
   'dialog:pickFolder': (opts: { title?: string; defaultPath?: string }) => string | null
   'shell:openExternal': (url: string) => void
 

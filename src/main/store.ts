@@ -92,6 +92,13 @@ export class Store {
     return this.settings
   }
 
+  /** Turns one launch option of an app on or off. Other apps' options and this app's others are kept. */
+  setLaunchOption(appId: string, optionId: string, on: boolean): Promise<Settings> {
+    const all = this.settings.launchOptions ?? {}
+    const current = Array.isArray(all[appId]) ? all[appId].filter((o) => o !== optionId) : []
+    return this.updateSettings({ launchOptions: { ...all, [appId]: on ? [...current, optionId] : current } })
+  }
+
   getInstalled(id: string): InstalledInfo | null {
     return this.installed[id] ?? null
   }

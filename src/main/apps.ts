@@ -3,7 +3,7 @@ import { existsSync, readdirSync } from 'node:fs'
 import { copyFile, mkdir, readdir, readFile, rm, stat } from 'node:fs/promises'
 import { basename, dirname, join, relative } from 'node:path'
 import { shell } from 'electron'
-import { CATALOG, findApp } from '@shared/catalog'
+import { CATALOG, findApp, launchEnv } from '@shared/catalog'
 import { requirementRefLabel } from '@shared/requirements'
 import type { LogLine } from '@shared/ipc'
 import type {
@@ -1182,7 +1182,12 @@ export class AppManager {
     if (!fromJob && this.busy(appId)) throw new Error(`Wait for ${app.name} to finish installing, updating or uninstalling.`)
     if (info.needsSetup) throw new Error(`${app.name}'s setup didn't finish. Use Repair to run it again.`)
     if (!existsSync(info.launchPath)) throw new Error(`${info.launchPath} is missing. Reinstall ${app.name}.`)
-    const child = launchDetached(info.launchPath, info.launchArgs, info.dir)
+    const child = launchDetached(
+      info.launchPath,
+      info.launchArgs,
+      info.dir,
+      launchEnv(app, this.o.store.getSettings().launchOptions?.[appId])
+    )
     // Counted as running at once: an update checking in the moment before Windows reports the start must see it.
     this.running.set(appId, child)
     const forget = (): void => {

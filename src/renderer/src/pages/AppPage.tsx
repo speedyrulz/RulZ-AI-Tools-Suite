@@ -30,6 +30,48 @@ import { invoke } from '../lib/api'
 import { formatBytes, formatDate, formatVersion } from '../lib/format'
 import { act, isActive, useApps } from '../stores/apps'
 
+/** The app's launch switches (catalog launch.options), saved in the launcher's settings. */
+function LaunchOptions({ view }: { view: AppView }) {
+  const id = view.app.id
+  const saved = useApps((s) => s.settings?.launchOptions?.[id])
+  const enabled = Array.isArray(saved) ? saved : []
+  const [pending, setPending] = useState<string | null>(null)
+  const toggle = (option: string, on: boolean): void => {
+    if (pending) return
+    setPending(option)
+    void act(async () => {
+      try {
+        useApps.setState({ settings: await invoke('settings:launchOption', id, option, on) })
+      } finally {
+        setPending(null)
+      }
+    })
+  }
+  return (
+    <div className="relative flex flex-col gap-3 border-t border-border px-7 py-3">
+      {view.app.launch.options!.map((option) => (
+        <div key={option.id} className="flex items-center justify-between gap-4">
+          <div
+            className="min-w-0 cursor-pointer"
+            onClick={() => toggle(option.id, !enabled.includes(option.id))}
+          >
+            <div className="text-sm">{option.label}</div>
+            <div className="text-xs text-faint">
+              {option.hint ? `${option.hint} ` : ''}Applies the next time you press Launch.
+            </div>
+          </div>
+          <Switch
+            checked={enabled.includes(option.id)}
+            disabled={pending !== null}
+            onChange={(v) => toggle(option.id, v)}
+            aria-label={option.label}
+          />
+        </div>
+      ))}
+    </div>
+  )
+}
+
 export function AppPage({ view, onBack, onInstall }: { view: AppView; onBack: () => void; onInstall: () => void }) {
   const { app, installed } = view
   const job = useJob(view)
@@ -124,6 +166,8 @@ export function AppPage({ view, onBack, onInstall }: { view: AppView; onBack: ()
             </Menu>
           </div>
         </div>
+
+        {installed && !!app.launch.options?.length && <LaunchOptions view={view} />}
 
         {job && (job.phase === 'error' || job.phase === 'cancelled') && (
           <div className="relative flex items-center gap-3 border-t border-accent/30 bg-banner px-7 py-3 text-[13px]">

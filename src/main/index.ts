@@ -117,6 +117,7 @@ async function main(): Promise<void> {
   // ---- IPC ----
   handle('app:info', () => ({ version: app.getVersion(), userData, platform: process.platform }))
   handle('settings:get', () => store.getSettings())
+  handle('settings:launchOption', (appId, optionId, on) => store.setLaunchOption(appId, optionId, on))
   handle('settings:update', async (patch) => {
     const next = await store.updateSettings(patch)
     if (patch.theme) applyTheme(mainWindow, patch.theme)
