@@ -197,6 +197,13 @@ def load_text_embeds(cfg: TrainConfig, prompt: str) -> torch.Tensor:
     return load_file(str(text_cache_path(cfg, prompt)))["embeds"]
 
 
+def stage_key(stage) -> str:
+    """A stage line with its numbers taken out: "reward fine-tuning 3/100" and "4/100" are one stage."""
+    import re
+
+    return re.sub(r"\d+(?:[.,]\d+)*", "#", str(stage or ""))
+
+
 class Status:
     """Writes a small JSON file the WebUI polls."""
 
@@ -207,11 +214,16 @@ class Status:
         self.lock = threading.RLock()  # GPU worker threads report progress concurrently
         self.data = {"stage": "starting", "step": 0, "total": 0, "loss": None, "avg_loss": None,
                      "elapsed": 0.0, "eta": None, "samples": [], "saved": [], "error": None, "done": False,
-                     "losses": [], "states": []}
+                     "losses": [], "states": [], "stage_since": time.time(), "stage_frac": None}
         self.write()
 
     def update(self, **kw):
+        """stage_since is when the stage began (the WebUI shows how long it has run) and stage_frac how far it is
+        (0-1, None when unknown); both start over when the stage changes, counts in it aside ("3 of 9", "4/100")."""
         with self.lock:
+            if "stage" in kw and stage_key(kw["stage"]) != stage_key(self.data.get("stage")):
+                kw.setdefault("stage_since", time.time())
+                kw.setdefault("stage_frac", None)
             self.data.update(kw)
             self.write()
 
@@ -723,6 +735,14 @@ class Trainer(RaceParallelMixin):
         return bool(cfg.wants_regions() or (cfg.crop_augment or "none") != "none" or cfg.likeness_curriculum
                     or (cfg.isolation and cfg.isolation_pairs > 0))  # pairs crop the subject around the face
 
+    def _stage_progress(self, text: str, frac=None) -> None:
+        """A loader's progress(text, fraction) callback: the stage line, and how far it is (0-1) when it says."""
+        try:
+            frac = None if frac is None else max(0.0, min(1.0, float(frac)))
+        except (TypeError, ValueError):
+            frac = None
+        self.status.update(stage=text, stage_frac=frac)
+
     def _ensure_face_detector(self):
         """A FaceScorer used as a detector (no references needed); shared with the likeness scorer."""
         if self.face_detector is not None:
@@ -735,7 +755,7 @@ class Trainer(RaceParallelMixin):
             return None
         try:
             self.face_detector = facesim.FaceScorer(self.cfg.face_provider, self.cfg.face_det_size,
-                                                    progress=lambda t, f: self.status.update(stage=t))
+                                                    progress=self._stage_progress)
         except Exception as e:  # noqa: BLE001
             log.warning("Could not initialise the face detector (%s); face-based features disabled", e)
         return self.face_detector
@@ -774,7 +794,7 @@ class Trainer(RaceParallelMixin):
                     from .bodysim import SilhouetteScorer
 
                     sil = SilhouetteScorer(cfg.sam3_model, cfg.body_device,
-                                           progress=lambda t, f: self.status.update(stage=t))
+                                           progress=self._stage_progress)
                     holder.append(sil)
                     person_fn = sil.person_mask
                 except Exception as e:  # noqa: BLE001
@@ -784,7 +804,7 @@ class Trainer(RaceParallelMixin):
                     from .bodysim import BodyScorer, available
 
                     if available()[0]:
-                        bs = BodyScorer(cfg.models_dir, progress=lambda t, f: self.status.update(stage=t))
+                        bs = BodyScorer(cfg.models_dir, progress=self._stage_progress)
                         holder.append(bs)
 
                         def person_fn(img, _bs=bs):
@@ -806,10 +826,10 @@ class Trainer(RaceParallelMixin):
             parts_fn = None
             rows_cfg = [r[1] for r in self.race_rows] if self.race_rows is not None else [cfg]
             if any(c.wants_parts() for c in rows_cfg):
-                parts_fn = R.PartsParser(cfg.models_dir, progress=lambda t, f: self.status.update(stage=t))
+                parts_fn = R.PartsParser(cfg.models_dir, progress=self._stage_progress)
             elif any(c.wants_part_maps() for c in rows_cfg):  # the region watch, steering, fixed class weights
                 try:
-                    parts_fn = R.PartsParser(cfg.models_dir, progress=lambda t, f: self.status.update(stage=t))
+                    parts_fn = R.PartsParser(cfg.models_dir, progress=self._stage_progress)
                 except Exception as e:  # noqa: BLE001
                     self.region_watch_off = f"{type(e).__name__}: {str(e)[:200]}"
                     log.warning("The region watch, region steering and region_class_weights are off: the picture "
@@ -1008,7 +1028,7 @@ class Trainer(RaceParallelMixin):
         from .comfy_files import resolve_downloads
 
         self.status.update(stage="model files")
-        cfg = self.cfg = resolve_downloads(cfg, progress=lambda text, frac=None: self.status.update(stage=text))
+        cfg = self.cfg = resolve_downloads(cfg, progress=self._stage_progress)
         self.arch = get_arch(cfg)  # a downloaded single file names its own family
         self.status.update(stage="resolving model")
         Q.set_int8_defaults(cfg.int8_matmul, cfg.int8_backward)  # every QuantLinear built from here on
@@ -3613,7 +3633,7 @@ class Trainer(RaceParallelMixin):
             return
         self.status.update(stage="embedding the photos' bodies")
         scorer = bodysim.AppearanceScorer(self.cfg.models_dir, self.cfg.body_device,
-                                          progress=lambda t, f: self.status.update(stage=t))
+                                          progress=self._stage_progress)
 
         def embed(path):
             win = scorer.window(path)
@@ -4889,7 +4909,7 @@ class Trainer(RaceParallelMixin):
             if checker is None:
                 self.status.update(stage="checking the photos for near-duplicates (SSCD)")
                 checker = copycheck.CopyChecker(cfg.models_dir, self._copy_device(),
-                                                progress=lambda t, f: self.status.update(stage=t))
+                                                progress=self._stage_progress)
                 checker.set_photos(photos)
             limit = copycheck.copy_limit(cfg.copy_max, checker.baseline)
             pairs = checker.near_duplicates(limit)
@@ -4936,7 +4956,7 @@ class Trainer(RaceParallelMixin):
         self.status.update(stage="loading the copy check (SSCD)")
         t0 = time.time()
         try:
-            checker = copycheck.CopyChecker(cfg.models_dir, dev, progress=lambda t, f: self.status.update(stage=t))
+            checker = copycheck.CopyChecker(cfg.models_dir, dev, progress=self._stage_progress)
             checker.set_photos(photos)
         except Exception as e:  # noqa: BLE001
             log.warning("Could not load the copy check (%s); off", e)
@@ -5040,7 +5060,7 @@ class Trainer(RaceParallelMixin):
             return None
         try:
             scorer = self.face_detector or facesim.FaceScorer(cfg.face_provider, cfg.face_det_size,
-                                                               progress=lambda t, f: self.status.update(stage=t))
+                                                               progress=self._stage_progress)
             self.face_detector = scorer
             scorer.set_references(cfg.face_refs)
         except Exception as e:  # noqa: BLE001
@@ -5086,7 +5106,7 @@ class Trainer(RaceParallelMixin):
         index = facesim.cuda_index(cfg.face_provider)
         dev = f"cuda:{index}" if index is not None and torch.cuda.is_available() else "cpu"
         try:
-            emb = idloss.gold_embedder(backend, cfg.models_dir, progress=lambda t, f: self.status.update(stage=t))
+            emb = idloss.gold_embedder(backend, cfg.models_dir, progress=self._stage_progress)
             scorer.set_gold(emb.to(dev))
         except Exception as e:  # noqa: BLE001
             log.warning("Could not load the gold face scorer (%s); the probes judge with ArcFace alone", e)
@@ -5121,7 +5141,7 @@ class Trainer(RaceParallelMixin):
         self.status.update(stage=f"loading the identity loss ({cfg.id_loss_backend})")
         try:
             loss = idloss.build(cfg, self.face_scorer, lambda z: self.arch.decode_latents_grad(vae, z), dev,
-                                progress=lambda t, f: self.status.update(stage=t))
+                                progress=self._stage_progress)
         except Exception as e:  # noqa: BLE001
             log.warning("Could not initialise the identity loss (%s); disabled", e)
             return None
@@ -5149,32 +5169,32 @@ class Trainer(RaceParallelMixin):
         try:
             if cfg.body_score == "appearance":
                 scorer = bodysim.AppearanceScorer(cfg.models_dir, cfg.body_device,
-                                                  progress=lambda t, f: self.status.update(stage=t))
+                                                  progress=self._stage_progress)
             elif cfg.body_score == "anchored":
                 from .bodyanchor import AnchoredScorer
 
                 scorer = AnchoredScorer(cfg.models_dir, cfg.body_device,
-                                        progress=lambda t, f: self.status.update(stage=t))
+                                        progress=self._stage_progress)
             elif cfg.body_score == "skeleton3d":
                 from .bodyshape import Skeleton3DScorer
 
-                scorer = Skeleton3DScorer(cfg.models_dir, progress=lambda t, f: self.status.update(stage=t))
+                scorer = Skeleton3DScorer(cfg.models_dir, progress=self._stage_progress)
             elif cfg.body_score == "smplx":
                 from .bodyshape import SMPLXScorer
 
                 scorer = SMPLXScorer(cfg.nlf_model, cfg.models_dir, cfg.body_device,
-                                     progress=lambda t, f: self.status.update(stage=t))
+                                     progress=self._stage_progress)
             else:
                 sil = None
                 if cfg.body_backend == "mediapipe+sam3":
                     try:
                         sil = bodysim.SilhouetteScorer(cfg.sam3_model, cfg.body_device,
-                                                       progress=lambda t, f: self.status.update(stage=t))
+                                                       progress=self._stage_progress)
                     except Exception as e:  # noqa: BLE001
                         log.warning("SAM 3 unavailable (%s); body scoring uses MediaPipe only. For facebook/sam3 "
                                     "accept the license on huggingface.co and run 'hf auth login'.", e)
                 scorer = bodysim.BodyScorer(cfg.models_dir, silhouette=sil,
-                                            progress=lambda t, f: self.status.update(stage=t))
+                                            progress=self._stage_progress)
             if hasattr(scorer, "hold"):  # SMPL-X: keep NLF on the GPU for the whole reference batch
                 with scorer.hold():
                     scorer.set_references(cfg.body_refs)

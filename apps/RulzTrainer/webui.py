@@ -22,6 +22,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from fastapi import Request
 from nicegui import app, background_tasks, run, ui
 
 from rulztrainer.archs import get_arch
@@ -821,6 +822,98 @@ def eta_text(seconds: float | None) -> str:
     if minutes < 60:
         return f"{minutes} min"
     return f"{minutes // 60} h {minutes % 60:02d} min"
+
+
+STALE_SECONDS = 600  # a running job with no status update and no new log line for this long: the run strip warns
+
+
+def duration_text(seconds) -> str:
+    """ "45 s", "12 min 05 s" or "2 h 03 min" for a duration in seconds."""
+    s = max(0, int(seconds or 0))
+    if s < 60:
+        return f"{s} s"
+    if s < 3600:
+        return f"{s // 60} min {s % 60:02d} s"
+    return f"{s // 3600} h {s % 3600 // 60:02d} min"
+
+
+def last_log_line(path, tail_bytes: int = 16384) -> str:
+    """The last non-empty line of a log file, its leading time ("15:36:16 ") taken off, read from the end of the file
+    only; "" when there is none."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - tail_bytes))
+            data = fh.read()
+    except OSError:
+        return ""
+    for line in reversed(data.decode("utf-8", errors="replace").splitlines()):
+        if line.strip():
+            return re.sub(r"^\d{1,2}:\d{2}:\d{2}\s+", "", line.strip())
+    return ""
+
+
+def run_activity(job_dir, st: dict, now: float, cpu: float | None = None) -> dict:
+    """What a running job is doing, beyond its stage line, so a long setup step does not look hung: how long the
+    stage has run (status stage_since), how far it is (stage_frac, 0-1), how long since status.json or train.log last
+    changed, the trainer's CPU use and the newest log line. {"since", "frac", "quiet", "stale", "text", "line"};
+    "text" is the run strip's second line."""
+    since = st.get("stage_since")
+    since = max(0.0, now - float(since)) if isinstance(since, (int, float)) else None
+    frac = st.get("stage_frac")
+    frac = max(0.0, min(1.0, float(frac))) if isinstance(frac, (int, float)) else None
+    stamps = []
+    for name in ("status.json", "train.log"):
+        try:
+            stamps.append((Path(job_dir) / name).stat().st_mtime)
+        except (OSError, TypeError):
+            pass
+    quiet = max(0.0, now - max(stamps)) if stamps else None
+    stale = quiet is not None and quiet >= STALE_SECONDS
+    parts = []
+    if since is not None:
+        parts.append(f"{duration_text(since)} in this stage")
+    if frac is not None:
+        parts.append(f"{frac * 100:.0f}% of it done")
+    if cpu is not None:
+        parts.append(f"trainer CPU {cpu:.0f}%")
+    if stale:
+        parts.append(f"no status update or log line for {duration_text(quiet)}: see the CPU and GPU load "
+                     "(Monitor) to tell a long step from a stuck one")
+    elif quiet is not None:
+        parts.append("updated just now" if quiet < 3 else f"last update {duration_text(quiet)} ago")
+    line = last_log_line(Path(job_dir) / "train.log") if job_dir is not None else ""
+    return {"since": since, "frac": frac, "quiet": quiet, "stale": stale, "text": " · ".join(parts), "line": line}
+
+
+_cpu_seen: dict = {}  # pid -> psutil.Process: cpu_percent() measures since the previous call on the same object
+
+
+def job_cpu_percent() -> float | None:
+    """The running job's CPU use since the last call, its child processes included (100 = one core fully busy);
+    None when unknown, and on the first call for a process (nothing to measure against yet)."""
+    pid = _proc.pid if _proc is not None else _adopted.pid if _adopted is not None else None
+    if pid is None:
+        _cpu_seen.clear()
+        return None
+    try:
+        import psutil
+
+        fresh = pid not in _cpu_seen
+        root = _cpu_seen.get(pid) or psutil.Process(pid)
+        seen, total = {pid: root}, root.cpu_percent(None)
+        for child in root.children(recursive=True):
+            known = _cpu_seen.get(child.pid)
+            p = known or child
+            value = p.cpu_percent(None)
+            total += value if known is not None else 0.0
+            seen[child.pid] = p
+        _cpu_seen.clear()
+        _cpu_seen.update(seen)
+        return None if fresh else total
+    except Exception:  # noqa: BLE001  (gone between the calls, access denied, psutil missing)
+        _cpu_seen.clear()
+        return None
 
 
 VAST_INSTANCE = machine.vast_instance()  # None unless this is a vast.ai instance
@@ -1995,6 +2088,10 @@ body {
 .rz-run-note { margin-left: auto; font-size: 13px; color: var(--rz-text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .rz-run-note.rz-warn { color: var(--rz-warn-text); font-weight: 600; }
 .rz-run-go { color: var(--rz-muted); font-size: 18px; }
+.rz-run-live { padding-top: 0; min-height: 24px; gap: 14px; }
+.rz-run-activity { font-size: 12.5px; color: var(--rz-text-2); white-space: nowrap; font-variant-numeric: tabular-nums; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
+.rz-run-activity.rz-warn { color: var(--rz-warn-text); font-weight: 600; }
+.rz-run-log { font-size: 12px; color: var(--rz-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1 1 0; min-width: 0; }
 .rz-dot { width: 9px; height: 9px; border-radius: 50%; background: #52525B; display: inline-block; flex-shrink: 0; }
 .rz-dot.live { background: var(--rz-red-bright); animation: rz-pulse 1.6s infinite; }
 .rz-dot.done { background: var(--rz-ok); }
@@ -2133,6 +2230,15 @@ html[data-theme="light"] .q-btn.rz-danger, html[data-theme="light"] .q-btn.rz-da
 .rz-banner.info { background: var(--rz-surface); border: 1px solid var(--rz-border-strong); color: var(--rz-text-2); }
 .rz-banner.ok { background: rgba(34, 197, 94, .10); border: 1px solid rgba(34, 197, 94, .40); color: #86EFAC; }
 .q-uploader { background: var(--rz-surface); border: 1px dashed var(--rz-border-strong); border-radius: 12px; }
+.rz-drop { display: flex; align-items: center; gap: 12px; padding: 12px 16px; background: var(--rz-surface);
+  border: 1px dashed var(--rz-border-strong); border-radius: 12px; cursor: pointer; transition: border-color .15s, background .15s; }
+.rz-drop:hover, .rz-drop.rz-drop-over { border-color: var(--rz-red); background: var(--rz-surface-2); }
+.rz-drop-icon { font-size: 26px; color: var(--rz-red-bright); }
+.rz-drop-status { font-size: 13px; color: var(--rz-muted); overflow-wrap: anywhere; }
+.rz-drop-status:empty::before { content: "Drop files here, or click to pick them"; }
+.rz-drop-status[data-state="busy"] { color: var(--rz-text-2); font-variant-numeric: tabular-nums; }
+.rz-drop-status[data-state="warn"] { color: var(--rz-warn-text); }
+.rz-drop-status[data-state="ok"] { color: var(--rz-ok-text); }
 .q-uploader__header { color: var(--rz-text); border-bottom: 1px solid var(--rz-border); }
 .rz-log { background: var(--rz-deep); border: 1px solid var(--rz-border); border-radius: 10px; color: var(--rz-text-2); }
 .rz-thumb { background: var(--rz-surface-2); border: 1px solid var(--rz-border); border-radius: 10px; overflow: hidden; }
@@ -2255,6 +2361,13 @@ html[data-theme="light"] .q-btn.rz-danger, html[data-theme="light"] .q-btn.rz-da
   .rz-views .q-btn .q-icon { display: none; }
   .rz-run-row { padding-left: 12px; padding-right: 12px; gap: 8px; }
   .rz-run-job, .rz-run-go { display: none; }
+  .rz-run-live { row-gap: 0; }
+  .rz-run-activity { white-space: normal; }
+  .rz-run-log { flex-basis: 100%; }
+  /* the machine row sits above every Monitor view: GPUs full width, disks and memory two to a row */
+  .rz-machine { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .rz-machine-gpus > .rz-tile { grid-column: 1 / -1; }
+  .rz-machine .rz-tile { padding: 9px 12px; }
   .rz-run-bar { min-width: 32px; }
   .rz-views { width: 100%; }
   .rz-views .q-btn { flex: 1 1 auto; padding: 6px 6px; font-size: 14px; white-space: nowrap; }
@@ -2344,6 +2457,169 @@ THEME_HEAD = """<script>
 </script>
 <style>html[data-theme="light"], html[data-theme="light"] body { background: #FFFFFF; }</style>""" % {"key": THEME_KEY}
 
+# The dataset uploader (build_dataset_tab's .rz-drop): files picked or dropped go one at a time, in pieces of
+# UPLOAD_PIECE_BYTES, to /rz-upload/<the page's token for the open dataset>. A piece that fails on the way (no
+# connection, a timeout, a 5xx from a proxy) is sent again after a pause; one the machine has out of step with (409)
+# goes on from what it has. While it uploads the phone's screen is kept on where the browser allows it (a sleeping
+# screen ends the upload) and leaving the page asks first. rz_upload_saved (every 10 files) and rz_upload_done (the
+# counts) tell the page to refresh the gallery.
+UPLOAD_HEAD = """<script>
+window.rzUpload = (function () {
+  var PIECE = __PIECE__;
+  var RETRY = [1, 2, 4, 8, 15, 30, 30, 30, 30, 30];  // seconds before each new try of a piece
+  var TRANSIENT = [0, 408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 530];
+  var queue = [], running = false, batch = null, lock = null;
+
+  function zoneOf(el) { return el && el.closest ? el.closest('.rz-drop') : null; }
+  function mb(n) { return (n / 1048576).toFixed(n < 10485760 ? 1 : 0) + ' MB'; }
+  function say(zone, text, state) {
+    var el = zone && zone.querySelector('.rz-drop-status');
+    if (el) { el.textContent = text; el.dataset.state = state || ''; }
+  }
+  function accepted(zone, f) {
+    var exts = (zone.dataset.accept || '').split(','), i = f.name.lastIndexOf('.');
+    return i > 0 && exts.indexOf(f.name.slice(i).toLowerCase()) >= 0;
+  }
+  function show(item, offset, note) {
+    var b = batch, sent = b.doneBytes + offset, pct = b.bytes ? Math.floor(sent * 100 / b.bytes) : 100;
+    say(item.zone, 'Uploading ' + b.index + ' of ' + b.count + ': ' + item.file.name + ' · ' + mb(sent) +
+        ' of ' + mb(b.bytes) + ' (' + pct + '%)' + (note ? ' · ' + note : ''), note ? 'warn' : 'busy');
+  }
+  function sleep(s) { return new Promise(function (r) { setTimeout(r, s * 1000); }); }
+  function post(url, blob, progress) {
+    return new Promise(function (resolve) {
+      var x = new XMLHttpRequest();
+      x.open('POST', url);
+      x.setRequestHeader('Content-Type', 'application/octet-stream');
+      x.timeout = 300000;  // a piece stuck for 5 minutes is sent again
+      x.upload.onprogress = function (e) { if (e.lengthComputable) progress(e.loaded); };
+      x.onload = function () {
+        var body = {};
+        try { body = JSON.parse(x.responseText); } catch (e) { body = {}; }
+        resolve({code: x.status, body: body || {}});
+      };
+      x.onerror = x.ontimeout = x.onabort = function () { resolve({code: 0, body: {}}); };
+      x.send(blob);
+    });
+  }
+  // true when the file is on the machine; else why not ({lost: ...} when the connection stayed down)
+  async function send(item) {
+    var f = item.file, offset = 0, tries = 0, steps = 0;
+    // this upload's own id: its pieces gather in a part file of their own on the machine
+    var uid = Date.now().toString(36) + Math.random().toString(36).slice(2, 10).replace(/[^a-z0-9]/g, '');
+    for (;;) {
+      if (++steps > 100000) return 'gave up';
+      var end = Math.min(offset + PIECE, f.size), start = offset;
+      show(item, offset, tries ? 'try ' + (tries + 1) : '');
+      var r = await post((window.path_prefix || '') + '/rz-upload/' + encodeURIComponent(item.token) +
+                         '?name=' + encodeURIComponent(f.name) + '&offset=' + offset + '&total=' + f.size +
+                         '&uid=' + uid,
+                         f.slice(offset, end), function (n) { show(item, start + n, tries ? 'try ' + (tries + 1) : ''); });
+      if (r.code >= 200 && r.code < 300) {
+        tries = 0;
+        offset = end;
+        if (r.body.done) return true;
+        if (end >= f.size) return 'the machine did not finish the file';
+        continue;
+      }
+      if (r.code === 409 && typeof r.body.have === 'number' && r.body.have >= 0 && r.body.have <= f.size) {
+        offset = r.body.have;  // go on from what the machine has
+        if (++tries > RETRY.length) return 'kept getting out of step with the machine';
+        continue;
+      }
+      if (TRANSIENT.indexOf(r.code) < 0) return r.body.error || ('the machine answered ' + r.code);
+      if (tries >= RETRY.length)
+        return {lost: r.code ? 'the machine kept answering ' + r.code : 'no connection to the machine'};
+      for (var s = RETRY[tries++]; s > 0; s--) {
+        show(item, offset, (r.code ? 'the machine answered ' + r.code : 'connection lost') + ', trying again in ' + s + ' s');
+        await sleep(1);
+      }
+    }
+  }
+  async function awake() {  // the browser lets go of it when the page is hidden: taken again on return
+    try {
+      if (!navigator.wakeLock || document.visibilityState !== 'visible') return;
+      lock = await navigator.wakeLock.request('screen');
+      lock.addEventListener('release', function () { lock = null; });
+    } catch (e) { lock = null; }
+  }
+  async function run() {
+    running = true;
+    await awake();
+    while (queue.length) {
+      var item = queue.shift(), r;
+      batch.index++;
+      try { r = await send(item); } catch (e) { r = String(e); }
+      if (r === true) {
+        batch.ok++;
+        if (batch.ok % 10 === 0 && typeof emitEvent === 'function') emitEvent('rz_upload_saved', {ok: batch.ok});
+      } else if (r && r.lost) {
+        batch.failed.push(item.file.name + ': ' + r.lost);
+        batch.unsent = queue.length;  // the connection is gone: the rest would fail the same way
+        queue = [];
+      } else {
+        batch.failed.push(item.file.name + ': ' + r);
+      }
+      batch.doneBytes += item.file.size;
+    }
+    if (lock) { try { await lock.release(); } catch (e) {} lock = null; }
+    var b = batch;
+    batch = null;
+    running = false;
+    var text = 'Uploaded ' + b.ok + ' of ' + b.count + (b.count === 1 ? ' file' : ' files');
+    if (b.failed.length) text += ', ' + b.failed.length + ' failed';
+    if (b.unsent) text += ', ' + b.unsent + ' not sent';
+    if (b.skipped.length) text += ', ' + b.skipped.length + ' skipped';
+    say(b.zone, text + '. Drop more here, or click to pick them.', b.failed.length || b.unsent ? 'warn' : 'ok');
+    if (typeof emitEvent === 'function')
+      emitEvent('rz_upload_done', {ok: b.ok, count: b.count, failed: b.failed, unsent: b.unsent, skipped: b.skipped});
+  }
+  function add(zone, files) {
+    var token = zone.dataset.token;
+    if (!token || !files.length) return;
+    if (!batch) batch = {zone: zone, ok: 0, failed: [], skipped: [], unsent: 0, count: 0, bytes: 0, doneBytes: 0, index: 0};
+    files.forEach(function (f) {
+      if (!accepted(zone, f)) { batch.skipped.push(f.name); return; }
+      queue.push({file: f, token: token, zone: zone});
+      batch.count++;
+      batch.bytes += f.size;
+    });
+    if (!running) {
+      if (batch.count) run();
+      else { say(zone, 'Skipped ' + batch.skipped.length + ': not an image, a video clip or a .txt / .json caption.', 'warn'); batch = null; }
+    }
+  }
+  document.addEventListener('change', function (e) {
+    var t = e.target, zone = zoneOf(t);
+    if (!zone || t.type !== 'file') return;
+    add(zone, Array.prototype.slice.call(t.files || []));
+    t.value = '';  // the same files can be picked again
+  });
+  ['dragenter', 'dragover'].forEach(function (type) {
+    document.addEventListener(type, function (e) {
+      var zone = zoneOf(e.target);
+      if (!zone) return;
+      e.preventDefault();
+      zone.classList.add('rz-drop-over');
+    });
+  });
+  document.addEventListener('dragleave', function (e) {
+    var zone = zoneOf(e.target);
+    if (zone && !zone.contains(e.relatedTarget)) zone.classList.remove('rz-drop-over');
+  });
+  document.addEventListener('drop', function (e) {
+    var zone = zoneOf(e.target);
+    if (!zone) return;
+    e.preventDefault();
+    zone.classList.remove('rz-drop-over');
+    add(zone, Array.prototype.slice.call((e.dataTransfer && e.dataTransfer.files) || []));
+  });
+  document.addEventListener('visibilitychange', function () { if (running && !lock) awake(); });
+  window.addEventListener('beforeunload', function (e) { if (running) { e.preventDefault(); e.returnValue = ''; } });
+  return {busy: function () { return running; }};
+})();
+</script>"""
+
 # ECharts colors are options, not CSS: the light look swaps these (and back). Keys and values must not overlap.
 CHART_LIGHT = {"#F4F4F5": "#1C1C21", "#D4D4D8": "#3A3A40", "#A1A1AA": "#6E6E77", "#3F3F46": "#B8B8C0",
                "#222222": "#E6E6EA", "#18181B": "#FFFFFE", "#52525B": "#9A9AA3", "#F59E0B": "#D97706",
@@ -2374,6 +2650,7 @@ def setup_theme() -> None:
     """Once per process, before the first page: logo files, the stylesheet and outlined form fields."""
     app.add_static_files("/assets", ASSETS)
     ui.add_head_html(THEME_HEAD, shared=True)
+    ui.add_head_html(UPLOAD_HEAD.replace("__PIECE__", str(UPLOAD_PIECE_BYTES)), shared=True)
     # Quasar starts in the look saved in this browser (set by THEME_HEAD) instead of always dark, so a reload in
     # the light look does not flash dark first
     app.config.vue_config_script = app.config.vue_config_script.replace(
@@ -3205,6 +3482,140 @@ def upload_target(dest, name: str) -> Path | None:
     return dest / fname
 
 
+# Uploads into a dataset go one file at a time, in pieces of UPLOAD_PIECE_BYTES, each piece retried on its own (the
+# page's rzUpload script). They used to go as one request holding every file picked: 20 phone photos of about 7 MB
+# made one request of 140 MB, and a connection that dropped anywhere in it (a phone's screen turning off, the network
+# changing) lost all of them, with nothing in the WebUI's log, since the request never reached it.
+UPLOAD_PIECE_BYTES = 8 * 1024 * 1024
+UPLOAD_PIECE_MAX = 2 * UPLOAD_PIECE_BYTES  # a bigger request is refused
+UPLOAD_PART_MAX_AGE = 6 * 3600  # an unfinished upload's part file older than this goes when its dataset opens
+UPLOAD_SLOTS_KEPT = 256
+_upload_slots: dict[str, str] = {}  # token -> the dataset folder a page opened (the newest last); the browser only
+# ever names the token, never a folder
+
+
+class UploadOffsetError(ValueError):
+    """A piece that does not continue the file: .have is how many of its bytes this machine has."""
+
+    def __init__(self, have: int):
+        super().__init__(f"this machine has the first {have} bytes of the file")
+        self.have = have
+
+
+def upload_slot(folder) -> str:
+    """A new upload token for a dataset folder (a page opened it); the oldest are forgotten past UPLOAD_SLOTS_KEPT."""
+    import secrets
+
+    token = secrets.token_urlsafe(18)
+    _upload_slots[token] = str(folder)
+    while len(_upload_slots) > UPLOAD_SLOTS_KEPT:
+        del _upload_slots[next(iter(_upload_slots))]
+    return token
+
+
+def upload_part_path(target: Path, tag: str) -> Path:
+    """Where the pieces of an upload gather until the last one: hidden (a dot name) and not a dataset file kind, so
+    neither training, the gallery nor Copy from a folder picks it up. `tag` is the upload's own id (the page draws a
+    new one for each file it sends), so two uploads of one name never share a part file."""
+    return target.with_name(f".{target.name}.{tag}.part")
+
+
+_upload_lock = threading.Lock()  # one piece at a time: a retry that overlaps its first try cannot write twice
+_upload_finished: dict[str, bool] = {}  # part paths of uploads completed lately (the newest last)
+UPLOAD_FINISHED_KEPT = 2048
+
+
+def write_upload_piece(dest, name: str, offset: int, total: int, data: bytes, tag: str) -> tuple[Path, bool]:
+    """Write one piece of an uploaded file into a dataset folder: bytes offset .. offset+len(data) of a file of
+    `total` bytes, for the upload `tag` (an id the page draws for each file it sends). A piece must continue the part
+    file exactly, else UploadOffsetError says how much is there and the page goes on from that; so a piece that comes
+    twice, or late, is never written twice and never cuts the part short. The last piece moves the part file onto the
+    file's name, replacing a same-named file; that last piece sent again (its answer lost on the way back) is
+    answered "complete" from the uploads finished lately. Returns (the file's path, whether it is complete).
+    ValueError for a file kind a dataset does not take, a piece outside the file, a malformed tag or a part file that
+    is a link."""
+    target = upload_target(dest, name)
+    if target is None:
+        shown = Path(str(name).replace("\\", "/")).name or str(name)
+        raise ValueError(f"{shown}: not an image, a video clip or a .txt / .json caption")
+    if not re.fullmatch(r"[A-Za-z0-9]{6,40}", str(tag)):
+        raise ValueError("a malformed upload id")
+    offset, total = int(offset), int(total)
+    if offset < 0 or total < 0 or offset + len(data) > total:
+        raise ValueError(f"a piece at byte {offset} of {len(data)} bytes does not fit a file of {total} bytes")
+    part = upload_part_path(target, tag)
+    key = str(part)
+    with _upload_lock:
+        if key in _upload_finished:  # this upload is done: only its last piece can come again
+            if offset + len(data) == total:
+                return target, True
+            raise UploadOffsetError(total)
+        if part.is_symlink():
+            raise ValueError("the upload's part file is a link")
+        have = part.stat().st_size if part.is_file() else 0
+        if have != offset:
+            raise UploadOffsetError(have)
+        flags = (os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if offset == 0 else os.O_APPEND)
+                 | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+        with os.fdopen(os.open(part, flags, 0o644), "wb") as fh:
+            fh.write(data)
+        if offset + len(data) < total:
+            return target, False
+        os.replace(part, target)
+        _upload_finished[key] = True
+        while len(_upload_finished) > UPLOAD_FINISHED_KEPT:
+            del _upload_finished[next(iter(_upload_finished))]
+    return target, True
+
+
+def clean_upload_parts(folder, max_age: float = UPLOAD_PART_MAX_AGE, now: float | None = None) -> int:
+    """Delete the part files of uploads into a dataset folder that were left unfinished more than `max_age` seconds
+    ago. Returns how many."""
+    now = time.time() if now is None else now
+    gone = 0
+    try:
+        for p in Path(folder).glob(".*.part"):
+            try:
+                if p.is_file() and now - p.stat().st_mtime > max_age:
+                    p.unlink()
+                    gone += 1
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return gone
+
+
+@app.post("/rz-upload/{token}")
+async def _upload_piece(token: str, request: Request, name: str = "", offset: int = 0, total: int = 0,
+                        uid: str = ""):
+    """One piece of a file uploaded into the dataset a page has open (write_upload_piece); the page's token names the
+    folder, uid the upload. 409 with {"have"} when the piece does not continue what is here."""
+    from fastapi.responses import JSONResponse
+
+    folder = _upload_slots.get(token)
+    if folder is None:
+        return JSONResponse({"error": "This upload belongs to a page that is gone: reload the page and drop the files "
+                                      "again."}, status_code=404)
+    declared = request.headers.get("content-length") or ""
+    if declared.isdigit() and int(declared) > UPLOAD_PIECE_MAX:
+        return JSONResponse({"error": "piece too large"}, status_code=413)
+    data = bytearray()
+    async for chunk in request.stream():
+        data += chunk
+        if len(data) > UPLOAD_PIECE_MAX:
+            return JSONResponse({"error": "piece too large"}, status_code=413)
+    try:
+        _, done = await run.io_bound(write_upload_piece, folder, name, offset, total, bytes(data), uid)
+    except UploadOffsetError as e:
+        return JSONResponse({"error": str(e), "have": e.have}, status_code=409)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except OSError as e:
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
+    return {"done": done, "have": int(offset) + len(data)}
+
+
 def copy_into_dataset(src, dest) -> dict:
     """Copy the images, video clips and captions (.txt, .json) of a folder on this machine into a dataset, sub-folders included
     and kept; files the dataset already has stay as they are. Returns {"copied", "kept", "ignored"} counts."""
@@ -3560,10 +3971,13 @@ def build_dataset_tab(f: Form):
                 spinner = ui.spinner(size="sm")
                 spinner.visible = False
                 info = ui.label("").classes("text-sm")
-            hint("Upload sends images and their .txt or .json captions from the computer this browser runs on to the "
-                 "machine running RulzTrainer; on the same machine that is a plain copy. A file with the same name is "
-                 "replaced. Click a picture to see it full size. Captions are saved to the image's .txt file as you "
-                 "type. Face ref / Body ref pick the images that character LoRAs are scored against.")
+            hint("Upload sends images, video clips and their .txt or .json captions from the computer or phone this "
+                 "browser runs on to the machine running RulzTrainer; on the same machine that is a plain copy. Files "
+                 "go one at a time in 8 MB pieces: when the connection drops, the piece is sent again after a pause "
+                 "and the files already sent stay, so keep the page open until it says Uploaded (on a phone the "
+                 "screen is kept on meanwhile where the browser allows it). A file with the same name is replaced. "
+                 "Click a picture to see it full size. Captions are saved to the image's .txt file as you type. "
+                 "Face ref / Body ref pick the images that character LoRAs are scored against.")
             hint("Ideogram 4 was trained on structured JSON captions only: a same-name .json caption in its schema "
                  "(github.com/ideogram-oss/ideogram4, docs/prompting.md) trains it best and wins over the .txt. A "
                  "plain .txt caption is wrapped into the smallest valid JSON caption, and the trigger word goes into "
@@ -3608,10 +4022,19 @@ def build_dataset_tab(f: Form):
                 ui.button("Move them out", icon="drive_file_move", color="negative",
                           on_click=lambda: look_move()).props("unelevated")
         with ui.row().classes("w-full items-center gap-3"):
-            upload = ui.upload(label="Upload images and captions (drop files here)", multiple=True, auto_upload=True,
-                               on_multi_upload=lambda e: on_upload(e)) \
-                .props(f"accept={','.join(sorted(DATASET_FILE_EXTS))} flat bordered color=transparent") \
-                .classes("w-[36rem] max-w-full")
+            # files go one at a time in pieces (UPLOAD_HEAD's script, /rz-upload): a dropped connection costs a
+            # piece, not the whole selection. data-token, set when a dataset opens, names the folder.
+            accept = ",".join(sorted(DATASET_FILE_EXTS))
+            with ui.element("label").classes("rz-drop w-[36rem] max-w-full") as drop:
+                ui.icon("cloud_upload").classes("rz-drop-icon")
+                with ui.column().classes("gap-0 min-w-0"):
+                    ui.label("Upload images, video clips and captions").classes("text-sm font-medium")
+                    ui.element("span").classes("rz-drop-status")  # the script writes its progress here
+                file_in = ui.element("input").classes("hidden")
+            file_in.props["type"] = "file"
+            file_in.props["multiple"] = True
+            file_in.props["accept"] = accept
+            drop.props["data-accept"] = accept
             ui.space()
             with ui.row().classes("items-center gap-1 no-wrap"):
                 ui.button(icon="chevron_left", on_click=lambda: page(-1)).props("flat dense round")
@@ -3638,20 +4061,43 @@ def build_dataset_tab(f: Form):
             status_label.text = f"error: {e}"
             ui.notify(f"Could not save {cap.name}: {e}", type="negative")
 
-    async def on_upload(e):
-        """Every file of an upload is saved before the gallery refreshes: NiceGUI runs each on_upload handler as a
-        background task and fires on_multi_upload at once, so saving there showed only the files done by then."""
-        upload.reset()
-        if state["open"] is None:
-            return
-        for file in e.files:
-            target = upload_target(Path(state["open"]), file.name)
-            if target is None:
-                ui.notify(f"Skipped {Path(file.name).name}: not an image or a .txt / .json caption", type="warning")
-                continue
-            await file.save(target)  # streamed to disk
+    async def refresh_after_upload():
+        """The gallery and the cards again once files arrived; a refresh already going would skip this one."""
+        import asyncio
+
+        for _ in range(100):
+            if not state["busy"]:
+                break
+            await asyncio.sleep(0.1)
         await refresh()
         await refresh_cards()
+
+    def upload_args(e) -> dict:
+        a = e.args[0] if isinstance(e.args, list) and e.args else e.args
+        return a if isinstance(a, dict) else {}
+
+    def names_text(names: list, n: int = 5) -> str:
+        return "; ".join(str(x) for x in names[:n]) + (f" and {len(names) - n} more" if len(names) > n else "")
+
+    async def upload_done(e):
+        a = upload_args(e)
+        ok, count, unsent = int(a.get("ok") or 0), int(a.get("count") or 0), int(a.get("unsent") or 0)
+        failed, skipped = list(a.get("failed") or []), list(a.get("skipped") or [])
+        lines = [f"Uploaded {ok} of {count} file{'' if count == 1 else 's'}."] if count else []
+        if failed:
+            lines.append(f"Failed: {names_text(failed)}")
+        if unsent:
+            lines.append(f"{unsent} not sent: the connection to the machine was lost. Drop them again; the files that "
+                         "arrived stay.")
+        if skipped:
+            lines.append(f"Skipped (not an image, a video clip or a .txt / .json caption): {names_text(skipped)}")
+        trouble = bool(failed or unsent or skipped)
+        ui.notify("\n".join(lines), type="warning" if trouble else "positive", multi_line=True,
+                  timeout=20000 if trouble else 5000, close_button="OK" if trouble else False)
+        await refresh_after_upload()
+
+    ui.on("rz_upload_done", upload_done)
+    ui.on("rz_upload_saved", lambda _: refresh_after_upload())  # every 10 files of a long upload
 
     async def render():
         imgs = state["images"]
@@ -3922,7 +4368,10 @@ def build_dataset_tab(f: Form):
         finally:
             state["sync"] = False
         remove_btn.visible = any(_same_path(path, p) for p in registered_datasets())
+        drop.props["data-token"] = upload_slot(Path(path).resolve())  # uploads from here on land in this dataset
+        drop.update()
         editor.visible = True
+        await run.io_bound(clean_upload_parts, path)
         await run.io_bound(look_load, path)
         await refresh()
         await refresh_cards()
@@ -8160,6 +8609,12 @@ def build_page(local: bool = True):
                 run_eta = ui.label("").classes("rz-run-step")
                 run_note = ui.label("").classes("rz-run-note")
                 ui.icon("chevron_right").classes("rz-run-go")
+            # while a job runs: how long its stage has run, how far it is, the trainer's CPU use, how fresh its
+            # status and log are, and the newest log line, so a long setup step does not look hung
+            with ui.row().classes("rz-run-row rz-run-live items-center") as run_live_row:
+                run_live = ui.label("").classes("rz-run-activity")
+                run_log = ui.label("").classes("rz-run-log rz-mono")
+            run_live_row.visible = False
         run_strip.tooltip("Open the Monitor")
 
     def goto(name: str):
@@ -10718,11 +11173,12 @@ def build_page(local: bool = True):
                 disk_box.visible = False
                 bucket_box = ui.label("").classes("rz-banner info")
                 bucket_box.visible = False
-                # one part of the run at a time instead of one long page
-                monitor_view = ViewSwitch(MONITOR_VIEWS, "overview")
-                with ui.element("div").classes("rz-machine") as machine_row:
+                # GPU, disk and memory above the view switch: in view on every view, not just the Overview
+                with ui.element("div").classes("rz-machine"):
                     gpu_box = ui.element("div").classes("rz-machine-gpus")
                     sys_box = ui.element("div").classes("rz-machine-sys")
+                # one part of the run at a time instead of one long page
+                monitor_view = ViewSwitch(MONITOR_VIEWS, "overview")
                 gpu_widgets: list[dict] = []
                 sys_widgets: dict = {}
                 with section("Queue", "Runs that start one after another when the current one is done",
@@ -10998,7 +11454,7 @@ def build_page(local: bool = True):
                 # the views: each section into its view's column, in this order
                 view_boxes: dict = {}
                 for name, members, empty in (
-                        ("overview", (machine_row, queue_exp, near_dup_label, race_exp, probe_exp, loss_exp), ""),
+                        ("overview", (queue_exp, near_dup_label, race_exp, probe_exp, loss_exp), ""),
                         ("images", (probe_img_exp, sample_exp), ""),
                         ("details", (face_exp, grad_card, lw_exp, rw_exp),
                          "Nothing here for this run yet. This view fills in with what the run has switched on: the "
@@ -11264,8 +11720,16 @@ def build_page(local: bool = True):
                 state = ("Running" if running else "Error" if st.get("error") else "Finished" if st.get("done")
                          else "Stopped")
                 show("state", state, _job_dir.name if _job_dir else "")
-                show("stage", str(st.get("stage") or "-"), f"resolution {st['resolution']}"
-                     if st.get("resolution") else "")
+                act = run_activity(_job_dir, st, time.time()) if running and _job_dir is not None else None
+                stage_sub = [f"for {duration_text(act['since'])}"] if act and act["since"] is not None else []
+                if act and act["frac"] is not None:
+                    stage_sub.append(f"{act['frac'] * 100:.0f}% done")
+                if st.get("resolution"):
+                    stage_sub.append(f"resolution {st['resolution']}")
+                show("stage", str(st.get("stage") or "-"), " · ".join(stage_sub))
+                if tiles["stage"][0].props.get("title") != str(st.get("stage") or ""):  # the whole line on hover
+                    tiles["stage"][0].props["title"] = str(st.get("stage") or "")
+                    tiles["stage"][0].update()
                 show("step", f"{step:,}", f"of {total:,} · {step / total * 100:.0f}% done" if total else "")
                 if loss is not None:
                     show("loss", f"{loss:.4f}", f"average {st.get('avg_loss') or 0:.4f}")
@@ -11273,7 +11737,14 @@ def build_page(local: bool = True):
                 show("eta", eta_text(eta) if running else "-")
                 error_box.text = f"Error: {st['error']}" if st.get("error") else ""
                 error_box.visible = bool(st.get("error"))
-                job_bar.value = (step / total) if total else 0
+                # before the first step the run's bar moves (the Stage tile says how far the stage is), so a long
+                # setup step does not sit at a still 0%
+                setup = act is not None and step == 0 and not str(st.get("stage") or "").startswith("training")
+                if setup:
+                    job_bar.props("indeterminate")
+                else:
+                    job_bar.props(remove="indeterminate")
+                    job_bar.value = (step / total) if total else 0
                 job_bar.props(f"color={'primary' if running else 'warning' if st.get('error') else 'positive' if st.get('done') else 'grey-6'}")
                 losses = st.get("losses") or []
                 if losses:
@@ -11606,8 +12077,24 @@ def build_page(local: bool = True):
                 title = f"{run_state.text} · {job} · RulzTrainer"
         run_job.text = job
         run_bar.props(f"color={'positive' if state == 'done' else 'warning' if state == 'error' else 'primary'}")
-        run_bar.value = frac
-        run_bar.visible = bool(total)
+        act = run_activity(_job_dir, st, time.time(), job_cpu_percent()) if running and _job_dir is not None \
+            else None
+        run_live_row.visible = act is not None
+        if act is not None:
+            run_live.text = act["text"]
+            run_live.classes(add="rz-warn") if act["stale"] else run_live.classes(remove="rz-warn")
+            run_log.text = act["line"]
+        # before the first step (loading, caching, scoring the references) the bar is the stage's own: how far it is
+        # when it says, else moving, instead of a "0%" that looks stuck
+        setup = act is not None and step == 0 and not str(st.get("stage") or "").startswith("training")
+        if setup and act["frac"] is None:
+            run_bar.props("indeterminate")
+        else:
+            run_bar.props(remove="indeterminate")
+            run_bar.value = act["frac"] if setup else frac
+        run_bar.visible = bool(total) or setup
+        if setup and total:  # the bar is the stage's, not the run's: no "0%" beside it
+            run_step.text = f"before step 1 of {total:,}"
         left = AUTOSTOP.seconds_left()
         waiting = len(QUEUE.snapshot()["waiting"])
         notes = [f"{waiting} queued"] if waiting else []
