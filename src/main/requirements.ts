@@ -1,6 +1,6 @@
 import { existsSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
-import { REQUIREMENT_GUIDES } from '@shared/requirements'
+import { REQUIREMENT_GUIDES, statusFor } from '@shared/requirements'
 import type { RequirementId, RequirementRef, RequirementStatus } from '@shared/types'
 import { capture, refreshPath, runCommand } from './process'
 
@@ -11,7 +11,7 @@ interface RequirementDef {
   winget?: string
   /** Replaces the package's own silent-install switches. */
   wingetOverride?: string
-  check: () => Promise<{ ok: boolean; detail: string }>
+  check: () => Promise<{ ok: boolean; detail: string; version?: string }>
 }
 
 /**
@@ -89,7 +89,8 @@ const DEFS: Record<RequirementId, RequirementDef> = {
       if (!m && adoptPythonInstall()) m = await pythonVersion()
       if (!m) return { ok: false, detail: 'Not found on PATH' }
       const ok = Number(m[1]) === 3 && Number(m[2]) >= 10
-      return { ok, detail: ok ? `Python ${m[1]}.${m[2]}.${m[3]}` : `Python ${m[1]}.${m[2]} is too old` }
+      const version = `${m[1]}.${m[2]}.${m[3]}`
+      return { ok, version, detail: ok ? `Python ${version}` : `Python ${m[1]}.${m[2]} is too old` }
     }
   },
   ffmpeg: {
@@ -172,7 +173,7 @@ async function runChecks(): Promise<RequirementStatus[]> {
     ids.map(async (id) => {
       const def = DEFS[id]
       const r = await def.check().catch(() => ({ ok: false, detail: 'Check failed' }))
-      return { id, label: def.label, ...r, canInstall: !r.ok && hasWinget && !!def.winget, helpUrl: def.helpUrl }
+      return { id, label: def.label, ...r, canInstall: hasWinget && !!def.winget, helpUrl: def.helpUrl }
     })
   )
 }
@@ -233,14 +234,17 @@ export async function ensureRequirements(
   onInstalling: (label: string) => void,
   signal?: AbortSignal
 ): Promise<RequirementId[]> {
-  const needed = refs.filter((r) => !r.optional).map((r) => r.id)
+  const needed = refs.filter((r) => !r.optional)
   if (!needed.length) return []
   // An install decides on a fresh check, not one from up to a minute ago.
   invalidateRequirements()
   let status = await checkRequirements()
-  for (const id of needed) {
-    const s = status.find((x) => x.id === id)!
-    if (s.ok || !s.canInstall) continue
+  // The app's own view: it may need a newer version than the general check asks for.
+  const find = (ref: RequirementRef): RequirementStatus | undefined => statusFor(ref, status.find((x) => x.id === ref.id))
+  for (const ref of needed) {
+    const id = ref.id
+    const s = find(ref)
+    if (!s || s.ok || !s.canInstall) continue
     onInstalling(s.label)
     log(`${s.label} is missing; installing it with winget (Windows may ask for permission).`)
     try {
@@ -251,5 +255,5 @@ export async function ensureRequirements(
     }
     status = await checkRequirements()
   }
-  return needed.filter((id) => !status.find((x) => x.id === id)?.ok)
+  return needed.filter((ref) => !find(ref)?.ok).map((ref) => ref.id)
 }

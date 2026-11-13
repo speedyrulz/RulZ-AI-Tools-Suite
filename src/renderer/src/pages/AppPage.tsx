@@ -16,7 +16,7 @@ import {
 } from 'lucide-react'
 import { useState, type ReactNode } from 'react'
 import { githubUrl } from '@shared/catalog'
-import { REQUIREMENT_GUIDES } from '@shared/requirements'
+import { refFor, requirementRefLabel } from '@shared/requirements'
 import type { AppView } from '@shared/types'
 import { AppActions, jobDetail, useJob } from '../components/AppActions'
 import { StatusBadge } from '../components/AppCard'
@@ -131,11 +131,14 @@ export function AppPage({ view, onBack, onInstall }: { view: AppView; onBack: ()
             <span className="min-w-0 flex-1 text-banner-text">
               {job.phase === 'cancelled' ? 'Cancelled.' : job.error}
             </span>
-            {job.missing?.map((id) => (
-              <Button key={id} size="sm" onClick={() => useApps.setState({ guideId: id })}>
-                <BookOpen className="size-3.5" /> How to install {REQUIREMENT_GUIDES[id].label}
-              </Button>
-            ))}
+            {job.missing?.map((id) => {
+              const ref = refFor(app.requirements, id)
+              return (
+                <Button key={id} size="sm" onClick={() => useApps.setState({ guide: ref })}>
+                  <BookOpen className="size-3.5" /> How to install {requirementRefLabel(ref)}
+                </Button>
+              )
+            })}
             <Button size="sm" variant="ghost" onClick={() => setLogOpen(true)}>
               <FileText className="size-3.5" /> Show log
             </Button>

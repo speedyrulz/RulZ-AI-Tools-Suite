@@ -1,4 +1,38 @@
-import type { RequirementId } from './types'
+import type { RequirementId, RequirementRef, RequirementStatus } from './types'
+
+/** True when version `a` ("3.10.11") is older than `b` ("3.11"). */
+function olderThan(a: string, b: string): boolean {
+  const x = a.split('.').map(Number)
+  const y = b.split('.').map(Number)
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    const d = (x[i] ?? 0) - (y[i] ?? 0)
+    if (d) return d < 0
+  }
+  return false
+}
+
+/** The name of an app's requirement, with the version it needs when that's more than usual ("Python 3.11+"). */
+export function requirementRefLabel(ref: RequirementRef): string {
+  return ref.minVersion && ref.id === 'python' ? `Python ${ref.minVersion}+` : REQUIREMENT_GUIDES[ref.id].label
+}
+
+/** An app's requirement `id`, with the version it asks for (just the id when the app doesn't list it). */
+export function refFor(refs: RequirementRef[] | undefined, id: RequirementId): RequirementRef {
+  return refs?.find((r) => r.id === id) ?? { id }
+}
+
+/**
+ * One app's view of a requirement's status: a Python that passes the general check but is older than the app needs
+ * counts as missing. winget's Python goes first on the user's PATH, which is enough unless the old one was installed
+ * for all users; then the check after the install still finds the old one and the guide takes over.
+ */
+export function statusFor(ref: RequirementRef, status: RequirementStatus | undefined): RequirementStatus | undefined {
+  if (!status || !ref.minVersion) return status
+  const label = requirementRefLabel(ref)
+  if (!status.ok || !status.version || !olderThan(status.version, ref.minVersion)) return { ...status, label }
+  const found = status.version.split('.').slice(0, 2).join('.')
+  return { ...status, label, ok: false, detail: `Python ${found} is too old for this app` }
+}
 
 // What each prerequisite is and how to install it by hand, for when winget can't do it.
 

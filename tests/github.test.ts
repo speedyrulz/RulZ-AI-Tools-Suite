@@ -59,7 +59,7 @@ describe('ETags', () => {
       const tag = (init?.headers as Record<string, string>)['If-None-Match']
       seen.push(tag)
       if (tag === '"abc"') return new Response(null, { status: 304 })
-      const body = { sha: 'f00', commit: { message: 'Fix it\n\nmore', committer: { date: '2026-10-01' } }, files: ['big'] }
+      const body = [{ sha: 'f00', commit: { message: 'Fix it\n\nmore', committer: { date: '2026-10-01' } }, extra: ['big'] }]
       return new Response(JSON.stringify(body), { status: 200, headers: { etag: '"abc"' } })
     })
     const first = await headCommit('o/e1', 'app/x')
@@ -70,7 +70,7 @@ describe('ETags', () => {
   })
 
   it('survives a restart through the snapshot, kept slim', async () => {
-    setFetch(async () => new Response(JSON.stringify({ sha: 's', commit: { message: 'm', committer: null } }), { status: 200, headers: { etag: 'W/"1"' } }))
+    setFetch(async () => new Response(JSON.stringify([{ sha: 's', commit: { message: 'm', committer: null } }]), { status: 200, headers: { etag: 'W/"1"' } }))
     await headCommit('o/e2', 'main')
     const saved = JSON.parse(JSON.stringify(etagSnapshot()))
     clearEtags()

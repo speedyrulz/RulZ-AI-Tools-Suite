@@ -17,7 +17,7 @@ click, keep it updated, and launch it, all from a single black-and-red window (o
 
 | App | What it does | How it installs |
 | --- | --- | --- |
-| [RulzTrainer](apps/RulzTrainer) | LoRA trainer for MOSS-Image, FIBO 2.0 and Krea 2, with a guided WebUI | From source, then its `install.bat` (venv + CUDA PyTorch) |
+| [RulzTrainer](apps/RulzTrainer) | LoRA trainer for ten image models (MOSS-Image, FIBO 2.0, Krea 2, Qwen-Image 2.1, MiniMax-H3-Image and more) and the PAN 2 video model, with a guided WebUI | From source, then its `install.bat` (venv + CUDA PyTorch) |
 | [RulZ Image Organizer](apps/RulZ-Image-Organizer) | Offline face grouping and search for your photo library | Portable release zip |
 | [RulZ Image Tournament](apps/RulZ-Image-Tournament) | Finds your favorite image, two at a time | Portable release zip (a single .exe) |
 | [RulZ LLM Suite](apps/rulz-llm-suite) | Local LLMs with llama.cpp: models, chat, MCP tools, API server | Its setup program, run silently |

@@ -1,5 +1,6 @@
 import { AlertTriangle, BookOpen, FolderOpen, Info, Wand2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
+import { refFor, statusFor } from '@shared/requirements'
 import type { AppView, InstallOptions, RequirementStatus } from '@shared/types'
 import { invoke } from '../lib/api'
 import { formatBytes } from '../lib/format'
@@ -43,7 +44,7 @@ export function InstallDialog({ view, onClose }: { view: AppView | null; onClose
   // Required prerequisites that aren't installed: winget can do some, the rest need the guide.
   const missing = app.requirements
     .filter((r) => !r.optional)
-    .map((r) => requirements.find((s) => s.id === r.id))
+    .map((r) => statusFor(r, requirements.find((s) => s.id === r.id)))
     .filter((s) => s && !s.ok) as RequirementStatus[]
   const automatic = missing.filter((s) => s.canInstall)
   const manual = missing.filter((s) => !s.canInstall || (opts && !opts.installPrerequisites))
@@ -178,7 +179,7 @@ export function InstallDialog({ view, onClose }: { view: AppView | null; onClose
                   </p>
                   <div className="flex flex-wrap items-center gap-2 pl-6">
                     {manual.map((s) => (
-                      <Button key={s.id} size="sm" onClick={() => useApps.setState({ guideId: s.id })}>
+                      <Button key={s.id} size="sm" onClick={() => useApps.setState({ guide: refFor(app.requirements, s.id) })}>
                         <BookOpen className="size-3.5" /> How to install {s.label}
                       </Button>
                     ))}

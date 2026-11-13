@@ -98,6 +98,19 @@ describe('install folder', () => {
     expect(await installFolder(`  ${target}  `)).toBe(target)
   })
 
+  it("refuses a %NAME% in the path, which cmd.exe would replace even in quotes", async () => {
+    dir = await mkdtemp(join(tmpdir(), 'rulz-test-'))
+    await expect(installFolder(join(dir, 'p%OS%q'))).rejects.toThrow(/without "%OS%"/)
+    // A lone % is left alone by cmd.exe.
+    expect(await installFolder(join(dir, '100% done'))).toBe(join(dir, '100% done'))
+  })
+
+  it("refuses the launcher's own working folders, which an update deletes", async () => {
+    dir = await mkdtemp(join(tmpdir(), 'rulz-test-'))
+    await expect(installFolder(join(dir, 'Organizer.rulz-old'))).rejects.toThrow(/used by the launcher/)
+    await expect(installFolder(join(dir, 'Organizer.rulz-new', 'Grid'))).rejects.toThrow(/used by the launcher/)
+  })
+
   it('accepts an empty folder', async () => {
     dir = await mkdtemp(join(tmpdir(), 'rulz-test-'))
     expect(await installFolder(dir)).toBe(dir)

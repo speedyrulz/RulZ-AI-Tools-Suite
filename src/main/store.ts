@@ -1,6 +1,7 @@
 import { copyFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { InstalledInfo, Settings } from '@shared/types'
+import { renameRetrying } from './archive'
 
 export function defaultSettings(): Settings {
   const local = process.env.LOCALAPPDATA ?? join(process.env.USERPROFILE ?? 'C:\\', 'AppData', 'Local')
@@ -17,19 +18,6 @@ async function readJson<T>(path: string, fallback: T): Promise<T> {
 
 const writes = new Map<string, Promise<void>>()
 let tmpSeq = 0
-
-/** Windows refuses a rename while another program (an antivirus scan, say) has the file open; that passes quickly. */
-async function renameRetrying(from: string, to: string): Promise<void> {
-  for (let attempt = 1; ; attempt++) {
-    try {
-      return await rename(from, to)
-    } catch (e) {
-      const code = (e as NodeJS.ErrnoException).code
-      if (attempt >= 5 || (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES')) throw e
-      await new Promise((r) => setTimeout(r, 50 * attempt))
-    }
-  }
-}
 
 /**
  * Writes JSON atomically (a temporary file renamed over the old one). Writes to the same file run one after another

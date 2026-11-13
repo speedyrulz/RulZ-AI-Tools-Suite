@@ -1,7 +1,8 @@
 import { toast } from 'sonner'
 import { create } from 'zustand'
 import { appendLogLines } from '@shared/log'
-import type { AppView, JobState, SelfUpdate, RequirementId, RequirementStatus, Settings, ThemeName } from '@shared/types'
+import { refFor } from '@shared/requirements'
+import type { AppView, JobState, SelfUpdate, RequirementRef, RequirementStatus, Settings, ThemeName } from '@shared/types'
 import { errorMessage, invoke, on } from '../lib/api'
 import { applyThemeClass, initialTheme } from '../lib/theme'
 
@@ -23,8 +24,8 @@ interface AppsState {
   requirements: RequirementStatus[]
   settings: Settings | null
   selectedId: string | null
-  /** The prerequisite whose install guide is open. */
-  guideId: RequirementId | null
+  /** The prerequisite whose install guide is open, as the app asks for it (a minimum Python version, say). */
+  guide: RequirementRef | null
   /** The theme in use; settings.theme stays unset until the first-launch choice. */
   theme: ThemeName
   /** A newer launcher release to offer, and the install progress (null before it starts, -1 on failure). */
@@ -59,7 +60,7 @@ export const useApps = create<AppsState>((set, get) => ({
   requirements: [],
   settings: null,
   selectedId: null,
-  guideId: null,
+  guide: null,
   theme: initialTheme,
   selfUpdate: null,
   selfProgress: null,
@@ -80,7 +81,7 @@ export const useApps = create<AppsState>((set, get) => ({
       if (isActive(prev) || !prev) notify(job, get().apps.find((a) => a.app.id === job.appId)?.app.name ?? job.appId)
       // Something has to be installed by hand: walk them through it.
       if (job.phase === 'error' && job.missing?.length) {
-        set({ guideId: job.missing[0] })
+        set({ guide: refFor(get().apps.find((a) => a.app.id === job.appId)?.app.requirements, job.missing[0]) })
         void get().checkRequirements()
       }
       // A prerequisite may have just been installed.
@@ -118,7 +119,12 @@ export const useApps = create<AppsState>((set, get) => ({
   },
 
   checkRequirements: async (reloadPath) => {
-    set({ requirements: await invoke('requirements:check', reloadPath) })
+    // Called without waiting from several places; a failed check keeps the last answer instead of an unhandled error.
+    try {
+      set({ requirements: await invoke('requirements:check', reloadPath) })
+    } catch (e) {
+      console.warn('Requirement check failed:', errorMessage(e))
+    }
   },
 
   select: (id) => set({ selectedId: id }),

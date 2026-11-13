@@ -9,6 +9,15 @@ export function quoteArg(arg: string): string {
   return `"${arg.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, '$1$1')}"`
 }
 
+/**
+ * Quotes one argument for a command line that cmd.exe reads first (a .bat or .cmd): besides spaces, its own special
+ * characters and separators need quotes, or "D:\R&D\run.bat" runs "D:\R" and then "D\run.bat", and "D:\a,b\run.bat"
+ * runs "D:\a". (A %NAME% is replaced even inside quotes; installFolder refuses folders with one.)
+ */
+export function quoteCmdArg(arg: string): string {
+  return /[&|<>^(),;=]/.test(arg) && !/[\s"]/.test(arg) ? `"${arg.replace(/(\\+)$/, '$1$1')}"` : quoteArg(arg)
+}
+
 function isBatch(path: string): boolean {
   return /\.(bat|cmd)$/i.test(path)
 }
@@ -27,7 +36,7 @@ export function resolveProgram(program: string, cwd: string): string {
 export function spawnArgs(program: string, args: string[]): { file: string; args: string[]; verbatim: boolean } {
   if (!isBatch(program)) return { file: program, args, verbatim: false }
   // cmd /s /c "<line>" strips the outer quotes and runs <line> as typed.
-  const line = [program, ...args].map(quoteArg).join(' ')
+  const line = [program, ...args].map(quoteCmdArg).join(' ')
   return { file: process.env.ComSpec || 'cmd.exe', args: ['/d', '/s', '/c', `"${line}"`], verbatim: true }
 }
 
@@ -131,20 +140,40 @@ export function launchDetached(target: string, args: string[], cwd: string): Chi
   return child
 }
 
-async function regPath(key: string): Promise<string> {
-  const out = await capture('reg', ['query', key, '/v', 'Path'])
-  const m = out && /Path\s+REG_(?:EXPAND_)?SZ\s+(.*)$/im.exec(out)
-  if (!m) return ''
-  return m[1].replace(/%([^%]+)%/g, (whole, name: string) => process.env[name] ?? whole)
+/**
+ * Runs a PowerShell script and returns its trimmed output (null when it fails). The output is UTF-8: by default
+ * PowerShell writes the console's code page, which turns "C:\Users\José" into "C:\Users\Jos?" (reg.exe does too).
+ */
+export function powershell(script: string, timeoutMs = 20000): Promise<string | null> {
+  return capture(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-Command', `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${script}`],
+    timeoutMs
+  )
 }
+
+/** A single-quoted PowerShell string. */
+export function psString(text: string): string {
+  return `'${text.replace(/'/g, "''")}'`
+}
+
+/** Separates the machine and user PATH in refreshPath's PowerShell output. */
+const PATH_SPLIT = '<<rulz-user-path>>'
 
 /**
  * Reloads PATH from the registry, so tools installed while the launcher runs (winget, Python's installer)
  * are found without a restart. Entries only present in the current PATH are kept.
  */
 export async function refreshPath(): Promise<void> {
-  const machine = await regPath('HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment')
-  const user = await regPath('HKCU\\Environment')
+  // GetValue expands %VARIABLES% in REG_EXPAND_SZ values, with this process's environment.
+  const out = await powershell(
+    "$m = (Get-Item 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment').GetValue('Path'); " +
+      "$k = Get-Item 'HKCU:\\Environment' -ErrorAction SilentlyContinue; " +
+      "$u = if ($k) { $k.GetValue('Path') } else { '' }; " +
+      `"$m${PATH_SPLIT}$u"`
+  )
+  if (!out) return
+  const [machine = '', user = ''] = out.split(PATH_SPLIT)
   const seen = new Set<string>()
   const merged: string[] = []
   for (const entry of [machine, user, process.env.PATH ?? ''].join(';').split(';')) {
@@ -176,10 +205,6 @@ export function programsInside(listing: string | null, dir: string): string[] {
  */
 export async function programsRunningFrom(dir: string): Promise<string[]> {
   if (process.platform !== 'win32') return []
-  const listing = await capture(
-    'powershell.exe',
-    ['-NoProfile', '-NonInteractive', '-Command', 'Get-CimInstance Win32_Process | ForEach-Object { $_.ExecutablePath }'],
-    20000
-  )
+  const listing = await powershell('Get-CimInstance Win32_Process | ForEach-Object { $_.ExecutablePath }')
   return programsInside(listing, dir)
 }

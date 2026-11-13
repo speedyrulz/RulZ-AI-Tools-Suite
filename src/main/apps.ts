@@ -1,9 +1,10 @@
 import type { ChildProcess } from 'node:child_process'
 import { existsSync, readdirSync } from 'node:fs'
-import { copyFile, mkdir, readdir, readFile, rename, rm, stat } from 'node:fs/promises'
+import { copyFile, mkdir, readdir, readFile, rm, stat } from 'node:fs/promises'
 import { basename, dirname, join, relative } from 'node:path'
 import { shell } from 'electron'
 import { CATALOG, findApp } from '@shared/catalog'
+import { requirementRefLabel } from '@shared/requirements'
 import type { LogLine } from '@shared/ipc'
 import type {
   AppView,
@@ -17,10 +18,22 @@ import type {
   RequirementId,
   ShortcutOptions
 } from '@shared/types'
-import { exists, extractZip, findFile, flattenSingleFolder, installFolder, overlay, swapInto } from './archive'
+import {
+  exists,
+  extractZip,
+  findFile,
+  flattenSingleFolder,
+  installFolder,
+  overlay,
+  renameRetrying,
+  stagingDir,
+  swapInto
+} from './archive'
 import { download, publishedSha256 } from './download'
 import {
+  branchSha,
   commitsSince,
+  dropSharedLists,
   etagSnapshot,
   findAsset,
   GitHubError,
@@ -35,8 +48,8 @@ import {
   type EtagEntry,
   type Release
 } from './github'
-import { capture, launchDetached, programsRunningFrom, runCommand } from './process'
-import { ensureRequirements, invalidateRequirements, requirementLabel } from './requirements'
+import { capture, launchDetached, powershell, programsRunningFrom, psString, runCommand } from './process'
+import { ensureRequirements, requirementLabel } from './requirements'
 import { createShortcut, foreignShortcutPaths, removeShortcut, shortcutPaths } from './shortcuts'
 import type { Store } from './store'
 
@@ -73,6 +86,7 @@ const IMAGE_EXT = /\.(png|jpe?g|webp|gif)$/i
 const ACCESS_VIOLATION = 0xc0000005
 
 interface JobContext {
+  appId: string
   signal: AbortSignal
   set: (patch: Partial<JobState>) => void
   log: (line: string) => void
@@ -129,6 +143,18 @@ function progressKey(line: string): string | null {
   return /^(.{3,60}?:)\s+\d{1,3}% /.exec(`${line} `)?.[1] ?? null
 }
 
+/**
+ * Waits (checking twice a second) until `done` is true or `ms` have passed. A cancelled job stops waiting at once:
+ * quitting gives jobs only a few seconds to stop.
+ */
+async function waitUntil(done: () => boolean, ms: number, signal: AbortSignal): Promise<void> {
+  for (let waited = 0; waited < ms && !done(); waited += 500) {
+    if (signal.aborted) throw new Error('Cancelled')
+    await new Promise((r) => setTimeout(r, 500))
+  }
+  if (signal.aborted) throw new Error('Cancelled')
+}
+
 /** Runs an NSIS setup or uninstaller silently, retrying the occasional startup crash. */
 async function runSetupProgram(run: string[], ctx: JobContext): Promise<number> {
   let code = 0
@@ -142,9 +168,13 @@ async function runSetupProgram(run: string[], ctx: JobContext): Promise<number> 
 
 /** The install can't go on until these are installed by hand. */
 class MissingRequirementsError extends Error {
-  constructor(readonly missing: RequirementId[]) {
+  /** `labels` name what is needed, in the app's terms ("Python 3.11+"). */
+  constructor(
+    readonly missing: RequirementId[],
+    labels: string[]
+  ) {
     super(
-      `${missing.map(requirementLabel).join(' and ')} ${missing.length > 1 ? 'are' : 'is'} needed first. ` +
+      `${labels.join(' and ')} ${missing.length > 1 ? 'are' : 'is'} needed first. ` +
         'Follow the install steps, then try again.'
     )
   }
@@ -155,26 +185,38 @@ function errorText(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
 }
 
+/**
+ * The first usable entry in findUninstallEntry's output: one JSON object per line, with the install location (l),
+ * uninstall command (u) and version (v). Pure, for tests.
+ */
+export function parseUninstallEntries(out: string | null): { location: string; version: string | null } | null {
+  for (const line of out?.split(/\r?\n/) ?? []) {
+    let e: { l?: unknown; u?: unknown; v?: unknown }
+    try {
+      e = JSON.parse(line) as typeof e
+    } catch {
+      continue
+    }
+    const text = (v: unknown): string => (typeof v === 'string' ? v.trim() : '')
+    // electron-builder leaves InstallLocation empty here; the uninstaller sits in the install folder.
+    const uninstaller = /^"?([^"]+\.exe)/i.exec(text(e.u))?.[1]
+    const location = text(e.l) || (uninstaller ? dirname(uninstaller) : null)
+    if (location) return { location, version: text(e.v) || null }
+  }
+  return null
+}
+
 /** Finds an app installed by its own setup program in the Windows "Installed apps" list. */
 async function findUninstallEntry(displayName: string): Promise<{ location: string; version: string | null } | null> {
-  // Both hives are searched at once; the per-user one wins when both have it.
-  const hives = await Promise.all(
-    ['HKCU', 'HKLM'].map(async (hive) => {
-      const root = `${hive}\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall`
-      const hits = await capture('reg', ['query', root, '/s', '/f', displayName, '/d', '/e'])
-      for (const key of hits?.split(/\r?\n/).filter((l) => l.startsWith('HKEY_')) ?? []) {
-        const values = await capture('reg', ['query', key.trim()])
-        const value = (name: string): string | null =>
-          new RegExp(`^\\s*${name}\\s+REG_\\w+\\s+(.*)$`, 'im').exec(values ?? '')?.[1]?.trim() ?? null
-        // electron-builder leaves InstallLocation empty here; the uninstaller sits in the install folder.
-        const uninstaller = /^"?([^"]+\.exe)/i.exec(value('UninstallString') ?? '')?.[1]
-        const location = value('InstallLocation') || (uninstaller ? dirname(uninstaller) : null)
-        if (value('DisplayName') === displayName && location) return { location, version: value('DisplayVersion') }
-      }
-      return null
-    })
+  // One PowerShell call reads both lists, the per-user one first (it wins when both have the app). Its output is
+  // UTF-8: reg.exe's would garble an install path under C:\Users\José.
+  const out = await powershell(
+    "Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*', " +
+      "'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*' -ErrorAction SilentlyContinue | " +
+      `Where-Object { $_.DisplayName -eq ${psString(displayName)} } | ` +
+      'ForEach-Object { ConvertTo-Json -Compress @{ l = [string]$_.InstallLocation; u = [string]$_.UninstallString; v = [string]$_.DisplayVersion } }'
   )
-  return hives.find((h) => h) ?? null
+  return parseUninstallEntries(out)
 }
 
 /** Installs, updates, launches and removes the apps in the catalog. */
@@ -195,6 +237,10 @@ export class AppManager {
   private refreshing: { force: boolean; done: Promise<void> } | null = null
   /** Set once quitting has begun: no new jobs. */
   private closing = false
+  /** Apps between the first check of an action and its job's start (the checks wait for PowerShell, say). */
+  private preparing = new Set<string>()
+  /** The folders that running installs fill, by app. */
+  private installDirs = new Map<string, string>()
 
   constructor(private readonly o: AppManagerOptions) {}
 
@@ -206,7 +252,7 @@ export class AppManager {
       this.screenshots.set(app.id, files.map((f) => `rulz://catalog/${app.id}/screenshots/${encodeURIComponent(f)}`))
     }
     // The last GitHub answers, so cards have versions at once and repeated launches don't use up the API's
-    // 60 requests an hour; with their ETags, asking again costs nothing while nothing changed.
+    // 60 requests an hour; with their ETags, asking again is a short answer while nothing changed (still a request).
     const cache = await this.o.store.loadCache<LatestCache | null>('latest-cache.json', null)
     for (const [id, entry] of readLatestCache(cache)) this.latest.set(id, entry)
     loadEtags(await this.o.store.loadCache<Record<string, EtagEntry> | null>('github-etags.json', null))
@@ -310,8 +356,8 @@ export class AppManager {
             version = entry.version ? `v${entry.version}` : null
           }
         }
-        // An install started while this looked doesn't get replaced.
-        if (launchPath && this.o.store.getInstalled(app.id) === known && !this.jobs.has(app.id)) {
+        // An install started (or still in its checks) while this looked doesn't get replaced.
+        if (launchPath && this.o.store.getInstalled(app.id) === known && !this.busy(app.id)) {
           await this.o.store.setInstalled(app.id, this.externalInfo(app, launchPath, version))
         }
       })
@@ -358,6 +404,8 @@ export class AppManager {
   }
 
   private async checkLatest(force: boolean): Promise<void> {
+    // Asked for: the release pages and branch heads the apps share are fetched again, not taken from the last minute.
+    if (force) dropSharedLists()
     // Cheap: only the catalog's known program paths (the registry search ran at startup).
     await this.reconcileInstalls(false)
     const now = Date.now()
@@ -391,10 +439,18 @@ export class AppManager {
       if (app.install.kind === 'source') {
         // Source installs follow the app's branch; the label names the latest release when there is one, plus the
         // app's commits since (counted on main, where the branch is split from).
-        const [c, release] = await Promise.all([headCommit(app.repo, app.branch), latestRelease(app.repo, app.tagPrefix)])
+        const repo = app.repo
+        const old = prev?.info
+        // One shared request names every source app's branch head; the commit itself (for its date) is only asked
+        // for when the head moved.
+        const head = async (): Promise<{ sha: string; date: string | null }> => {
+          const sha = await branchSha(repo, app.branch).catch(() => null)
+          if (sha && old?.version === sha) return { sha, date: old.date }
+          return headCommit(repo, app.branch)
+        }
+        const [c, release] = await Promise.all([head(), latestRelease(repo, app.tagPrefix)])
         const tag = release && releaseVersion(release.tag, app.tagPrefix)
         // The count only changes with the app's branch, so an unchanged head keeps the label it had.
-        const old = prev?.info
         const same = !!tag && old?.version === c.sha && (old.label === tag || old.label.startsWith(`${tag} + `))
         let label = `${app.branch} @ ${c.sha.slice(0, 7)}`
         if (same && old) label = old.label
@@ -417,19 +473,20 @@ export class AppManager {
           at: Date.now()
         }
       }
-      const release = await latestRelease(app.repo, app.tagPrefix)
-      if (!release) return { info: null, error: 'No release has been published yet.', release: null }
-      const asset = findAsset(release, app.install.asset)
+      // A release whose files are still uploading (or failed to) is passed over for the one before it.
+      const pattern = app.install.asset
+      const release = await latestRelease(app.repo, app.tagPrefix, (r) => !!findAsset(r, pattern))
+      if (!release) return { info: null, error: 'No release with a Windows download has been published yet.', release: null }
       const version = releaseVersion(release.tag, app.tagPrefix)
       return {
         info: {
           version,
           label: version,
           date: release.date,
-          downloadSize: asset?.size ?? null,
+          downloadSize: findAsset(release, pattern)?.size ?? null,
           url: release.htmlUrl
         },
-        error: asset ? null : 'The latest release has no Windows download.',
+        error: null,
         release,
         at: Date.now()
       }
@@ -499,6 +556,7 @@ export class AppManager {
     this.logs.set(appId, log)
 
     const ctx: JobContext = {
+      appId,
       files: [],
       signal: abort.signal,
       set: (patch) => {
@@ -535,12 +593,69 @@ export class AppManager {
       )
       .finally(() => {
         this.jobs.delete(appId)
-        // An install may have added a prerequisite (Python, Git…) or a GPU-using app.
-        invalidateRequirements()
+        // The requirement checks aren't dropped here: a winget install drops them itself, and checking again after
+        // every job (uninstalls too) would start six programs for nothing.
         this.changed()
         for (const f of ctx.files) void rm(f, { force: true }).catch(() => undefined)
         finished()
       })
+  }
+
+  /**
+   * Marks the app busy from an action's first check until its job starts. Those checks wait (for PowerShell, say), and
+   * a second click, or Uninstall clicked during an update's checks, must not pass them on the record the first saw.
+   * Call the returned function once the job has started (or the checks failed).
+   */
+  private reserve(appId: string): () => void {
+    if (this.closing) throw new Error('The launcher is closing.')
+    if (this.jobs.has(appId) || this.preparing.has(appId)) throw new Error('This app is already being installed or updated.')
+    this.preparing.add(appId)
+    return () => this.preparing.delete(appId)
+  }
+
+  /** True while the app has a job, or one is about to start. */
+  private busy(appId: string): boolean {
+    return this.jobs.has(appId) || this.preparing.has(appId)
+  }
+
+  /**
+   * The name of an app whose folder overlaps `dir` (the same folder, one inside it, or one around it): a running
+   * install that will fill it, or a launcher-made install. Its update would replace the folder, and its uninstall would
+   * recycle it, with the other app inside.
+   */
+  private dirInUse(appId: string, dir: string): string | null {
+    const a = dir.toLowerCase().replace(/[\\/]+$/, '')
+    const overlaps = (other: string): boolean => {
+      const b = other.toLowerCase().replace(/[\\/]+$/, '')
+      return a === b || a.startsWith(`${b}\\`) || b.startsWith(`${a}\\`)
+    }
+    for (const [id, other] of this.installDirs) if (id !== appId && overlaps(other)) return findApp(id)?.name ?? id
+    for (const app of CATALOG) {
+      const info = this.o.store.getInstalled(app.id)
+      if (app.id !== appId && info?.managed && overlaps(info.dir)) return app.name
+    }
+    return null
+  }
+
+  /**
+   * Refuses to replace or recycle an app's folder while another installed app lives inside it (an install made
+   * before overlapping folders were refused): a portable app's update deletes the old folder, and an uninstall moves
+   * all of it to the Recycle Bin.
+   */
+  private assertNothingInside(app: CatalogApp, dir: string, what: string): void {
+    const root = `${dir.toLowerCase().replace(/[\\/]+$/, '')}\\`
+    // An install whose folder is already gone (deleted by hand) has nothing left to lose.
+    const inside = CATALOG.filter((a) => {
+      const other = a.id === app.id ? undefined : this.o.store.getInstalled(a.id)
+      return !!other && other.dir.toLowerCase().startsWith(root) && existsSync(other.dir)
+    })
+    if (!inside.length) return
+    const names = inside.map((a) => a.name).join(' and ')
+    const many = inside.length > 1
+    throw new Error(
+      `${names} ${many ? 'are' : 'is'} installed inside ${app.name}'s folder, and ${what} would take ${many ? 'them' : 'it'} ` +
+        `too. Uninstall or move ${many ? 'them' : 'it'} first.`
+    )
   }
 
   cancel(appId: string): void {
@@ -560,9 +675,9 @@ export class AppManager {
     this.flushLogs()
   }
 
-  /** Names of the apps with a running job, for the quit question. */
+  /** Names of the apps with a running job, or one about to start, for the quit question and the self-update. */
   activeJobNames(): string[] {
-    return [...this.jobs.keys()].map((id) => findApp(id)?.name ?? id)
+    return [...new Set([...this.jobs.keys(), ...this.preparing])].map((id) => findApp(id)?.name ?? id)
   }
 
   private async fetchFile(
@@ -573,7 +688,9 @@ export class AppManager {
     label: string,
     sha256: string | null = null
   ): Promise<string> {
-    const file = join(this.o.downloadsDir, name)
+    // Named after the app too: two apps installing at once can fetch the same file (both have a llama.cpp option),
+    // and must not share one .part file.
+    const file = join(this.o.downloadsDir, `${ctx.appId}-${name}`)
     ctx.files.push(file)
     ctx.log(`Downloading ${url}`)
     if (sha256) ctx.log(`Expecting SHA-256 ${sha256}`)
@@ -614,56 +731,120 @@ export class AppManager {
 
   async install(appId: string, options: InstallOptions): Promise<void> {
     const app = this.app(appId)
-    await this.detected
-    if (this.o.store.getInstalled(appId)) throw new Error(`${app.name} is already installed.`)
-    const opts: InstallOptions = { ...options, dir: await installFolder(options.dir) }
-    await this.o.store.setDetectHidden(appId, false)
-    this.startJob(appId, 'install', async (ctx) => {
+    const release = this.reserve(appId)
+    try {
+      await this.detected
+      if (this.o.store.getInstalled(appId)) throw new Error(`${app.name} is already installed.`)
+      const opts: InstallOptions = { ...options, dir: await installFolder(options.dir) }
+      if (this.o.store.getInstalled(appId)) throw new Error(`${app.name} is already installed.`)
+      const clash = this.dirInUse(appId, opts.dir)
+      if (clash) throw new Error(`Choose another folder: ${opts.dir} overlaps the folder of ${clash}.`)
+      // Claimed at once, before anything else waits: another install's check may run in the meantime.
+      this.installDirs.set(appId, opts.dir)
       try {
-        await this.runInstall(ctx, app, opts, null)
+        await this.o.store.setDetectHidden(appId, false)
+        // The release seen at the last check may be half an hour old, or seen before its files were uploaded.
+        this.forgetRelease(appId)
+        this.startJob(appId, 'install', async (ctx) => {
+          try {
+            await this.runInstall(ctx, app, opts, null)
+          } catch (e) {
+            // The folder was empty before, so anything in it now came from this attempt.
+            if (!this.o.store.getInstalled(appId)) {
+              await rm(opts.dir, { recursive: true, force: true }).catch(() => undefined)
+              await rm(stagingDir(opts.dir), { recursive: true, force: true }).catch(() => undefined)
+            }
+            throw e
+          } finally {
+            this.installDirs.delete(appId)
+          }
+        })
       } catch (e) {
-        // The folder was empty before, so anything in it now came from this attempt.
-        if (!this.o.store.getInstalled(appId)) {
-          await rm(opts.dir, { recursive: true, force: true }).catch(() => undefined)
-          await rm(`${opts.dir}.new`, { recursive: true, force: true }).catch(() => undefined)
-        }
+        this.installDirs.delete(appId)
         throw e
       }
-    })
+    } finally {
+      release()
+    }
+  }
+
+  /**
+   * The install record an action checked, if it is still the current one after the checks' waiting: an uninstall
+   * or another window may have changed it meanwhile.
+   */
+  private unchanged(app: CatalogApp, info: InstalledInfo): void {
+    if (this.o.store.getInstalled(app.id) !== info) throw new Error(`${app.name} changed meanwhile. Try again.`)
   }
 
   async update(appId: string): Promise<void> {
     const app = this.app(appId)
-    const info = this.o.store.getInstalled(appId)
-    if (!info?.managed) throw new Error(`${app.name} wasn't installed by the launcher, so it can't update it.`)
-    await this.assertNotRunning(app, info, 'update')
+    const release = this.reserve(appId)
+    try {
+      const info = this.o.store.getInstalled(appId)
+      if (!info?.managed) throw new Error(`${app.name} wasn't installed by the launcher, so it can't update it.`)
+      await this.assertNotRunning(app, info, 'update')
+      this.unchanged(app, info)
+      // A portable app's update replaces the whole folder, and a setup program's update runs the old uninstaller,
+      // which empties it (electron-builder's NSIS RMDir /r); git and the source archive only add to it.
+      if (app.install.kind !== 'source') this.assertNothingInside(app, info.dir, 'updating it replaces that folder and')
+      this.startUpdate(app, info)
+    } finally {
+      release()
+    }
+  }
+
+  private startUpdate(app: CatalogApp, info: InstalledInfo): void {
+    const appId = app.id
+    // An install whose setup never finished still owes the shortcuts and optional parts it was started with.
+    const p = info.pending
     const opts: InstallOptions = {
       dir: info.dir,
-      desktopShortcut: !!info.shortcuts.desktop,
-      startMenuShortcut: !!info.shortcuts.startMenu,
-      components: [],
+      desktopShortcut: p?.desktop ?? !!info.shortcuts.desktop,
+      startMenuShortcut: p?.startMenu ?? !!info.shortcuts.startMenu,
+      components: p?.components ?? [],
       launchAfter: false,
       installPrerequisites: true
     }
-    // Always fetch the newest release for an update (the version shown stays until then).
+    this.forgetRelease(appId)
+    this.startJob(appId, 'update', (ctx) => this.runInstall(ctx, app, opts, info))
+  }
+
+  /** The next install or update looks up the newest release again (the version shown stays until then). */
+  private forgetRelease(appId: string): void {
     const known = this.latest.get(appId)
     if (known) this.latest.set(appId, { ...known, release: null })
-    this.startJob(appId, 'update', (ctx) => this.runInstall(ctx, app, opts, info))
   }
 
   /** Runs the setup steps again (after a failed or cancelled setup), or reinstalls the release. */
   async repair(appId: string): Promise<void> {
     const app = this.app(appId)
-    const info = this.o.store.getInstalled(appId)
-    if (!info?.managed) throw new Error(`${app.name} wasn't installed by the launcher.`)
     if (app.install.kind !== 'source') return this.update(appId)
-    await this.assertNotRunning(app, info, 'repair')
-    this.startJob(appId, 'repair', async (ctx) => {
-      await this.ensurePrerequisites(ctx, app)
-      await this.runSetupSteps(ctx, app, info)
-      const launchPath = await this.resolveLaunch(app, info.dir)
-      await this.o.store.setInstalled(appId, { ...info, launchPath, needsSetup: false })
-    })
+    const release = this.reserve(appId)
+    try {
+      const info = this.o.store.getInstalled(appId)
+      if (!info?.managed) throw new Error(`${app.name} wasn't installed by the launcher.`)
+      await this.assertNotRunning(app, info, 'repair')
+      this.unchanged(app, info)
+      this.startJob(appId, 'repair', async (ctx) => {
+        await this.ensurePrerequisites(ctx, app)
+        await this.runSetupSteps(ctx, app, info)
+        const launchPath = await this.resolveLaunch(app, info.dir)
+        const p = info.pending
+        if (!p) return this.o.store.setInstalled(appId, { ...info, launchPath, needsSetup: false })
+        // The install whose setup this finishes was started with optional parts and shortcuts: they come now.
+        const opts: InstallOptions = {
+          dir: info.dir,
+          desktopShortcut: p.desktop,
+          startMenuShortcut: p.startMenu,
+          components: p.components,
+          launchAfter: false,
+          installPrerequisites: false
+        }
+        await this.finishInstall(ctx, app, opts, info, launchPath, info.version, info.method)
+      })
+    } finally {
+      release()
+    }
   }
 
   /**
@@ -688,7 +869,13 @@ export class AppManager {
       (label) => ctx.set({ label: `Installing ${label}…` }),
       ctx.signal
     )
-    if (missing.length) throw new MissingRequirementsError(missing)
+    if (missing.length) {
+      const labels = missing.map((id) => {
+        const ref = app.requirements.find((r) => r.id === id)
+        return ref ? requirementRefLabel(ref) : requirementLabel(id)
+      })
+      throw new MissingRequirementsError(missing, labels)
+    }
   }
 
   private async runInstall(ctx: JobContext, app: CatalogApp, opts: InstallOptions, prev: InstalledInfo | null): Promise<void> {
@@ -705,7 +892,7 @@ export class AppManager {
       version = releaseVersion(release.tag, app.tagPrefix)
       const sha256 = await this.releaseSha256(ctx, release, asset)
       const zip = await this.fetchFile(ctx, asset.url, asset.name, asset.size, `Downloading ${version}`, sha256)
-      const staged = `${dir}.new`
+      const staged = stagingDir(dir)
       await rm(staged, { recursive: true, force: true })
       ctx.set({ phase: 'extracting', label: 'Extracting…', progress: 0 })
       await extractZip(zip, staged, (f) => ctx.set({ progress: f }))
@@ -728,7 +915,7 @@ export class AppManager {
       const code = await runSetupProgram([setup, '/S', '/currentuser', `/D="${dir}"`], ctx)
       if (code !== 0) throw new Error(`The setup program exited with code ${code}.`)
       launchPath = join(dir, app.launch.target)
-      for (let i = 0; i < 60 && !existsSync(launchPath); i++) await new Promise((r) => setTimeout(r, 500))
+      await waitUntil(() => existsSync(launchPath), 30_000, ctx.signal)
       if (!existsSync(launchPath)) throw new Error(`Setup finished, but ${launchPath} wasn't created.`)
       // The setup program makes its own shortcuts; the launcher's options decide which ones exist.
       for (const lnk of foreignShortcutPaths(spec.shortcutName)) await removeShortcut(lnk)
@@ -749,13 +936,28 @@ export class AppManager {
         installedAt: prev?.installedAt ?? new Date().toISOString(),
         shortcuts: prev?.shortcuts ?? { desktop: null, startMenu: null },
         components: prev?.components ?? [],
-        needsSetup: true
+        needsSetup: true,
+        // What the rest of this install would add, for Repair to finish if the setup stops here.
+        pending: { desktop: opts.desktopShortcut, startMenu: opts.startMenuShortcut, components: opts.components }
       }
       await this.o.store.setInstalled(app.id, partial)
       await this.runSetupSteps(ctx, app, partial)
       launchPath = await this.resolveLaunch(app, dir)
     }
+    await this.finishInstall(ctx, app, opts, prev, launchPath, version, method)
+  }
 
+  /** What follows once the files are in place: optional parts, shortcuts, the install record, then launching it. */
+  private async finishInstall(
+    ctx: JobContext,
+    app: CatalogApp,
+    opts: InstallOptions,
+    prev: InstalledInfo | null,
+    launchPath: string,
+    version: string | null,
+    method: InstalledInfo['method']
+  ): Promise<void> {
+    const dir = opts.dir
     const components = [...(prev?.components ?? [])]
     for (const c of app.components ?? []) {
       if (!opts.components.includes(c.id)) continue
@@ -785,12 +987,16 @@ export class AppManager {
     )
     await this.o.store.setInstalled(app.id, info)
     ctx.log(`Installed ${app.name} ${version ?? ''} in ${dir}`)
-    const latest = mergeLatest(this.latest.get(app.id), await this.fetchLatest(app, this.latest.get(app.id)))
-    this.latest.set(app.id, latest)
-    if (latest.info && latest.info.version === version && latest.info.label !== version) {
-      await this.o.store.setInstalled(app.id, { ...info, versionLabel: latest.info.label })
+    // A commit's label ("v1.2.0 + 3 commits") comes with the newest version's details. A release's label is its tag,
+    // and the release was just looked up, so asking GitHub again would only use up requests.
+    if (app.install.kind === 'source') {
+      const latest = mergeLatest(this.latest.get(app.id), await this.fetchLatest(app, this.latest.get(app.id)))
+      this.latest.set(app.id, latest)
+      if (latest.info && latest.info.version === version && latest.info.label !== version) {
+        await this.o.store.setInstalled(app.id, { ...info, versionLabel: latest.info.label })
+      }
     }
-    if (opts.launchAfter) await this.launch(app.id).catch((e) => ctx.log(`Couldn't start it: ${errorText(e)}`))
+    if (opts.launchAfter) await this.launch(app.id, true).catch((e) => ctx.log(`Couldn't start it: ${errorText(e)}`))
   }
 
   /** Gets the repository: git clone/pull when git is available, otherwise the source archive. */
@@ -846,7 +1052,7 @@ export class AppManager {
       null,
       `Downloading ${app.branch} @ ${commit.sha.slice(0, 7)}`
     )
-    const staged = `${dir}.new`
+    const staged = stagingDir(dir)
     await rm(staged, { recursive: true, force: true })
     ctx.set({ phase: 'extracting', label: 'Extracting…', progress: 0 })
     await extractZip(zip, staged, (f) => ctx.set({ progress: f }))
@@ -859,7 +1065,7 @@ export class AppManager {
     } else {
       await mkdir(dirname(dir), { recursive: true })
       await rm(dir, { recursive: true, force: true }) // empty (checked before the install started)
-      await rename(staged, dir)
+      await renameRetrying(staged, dir)
     }
     await rm(zip, { force: true })
     return { version: commit.sha, method: 'archive' }
@@ -907,9 +1113,14 @@ export class AppManager {
     const src = join(this.o.catalogDir, app.id, 'icon.ico')
     if (!existsSync(src)) return undefined
     const dest = join(this.o.iconsDir, `${app.id}.ico`)
-    await mkdir(this.o.iconsDir, { recursive: true })
-    await copyFile(src, dest)
-    return dest
+    try {
+      await mkdir(this.o.iconsDir, { recursive: true })
+      await copyFile(src, dest)
+      return dest
+    } catch {
+      // A shortcut without its icon still works; failing here would fail an install whose files are already in place.
+      return existsSync(dest) ? dest : undefined
+    }
   }
 
   private async applyShortcuts(
@@ -948,43 +1159,74 @@ export class AppManager {
     const info = this.o.store.getInstalled(appId)
     if (!info) throw new Error(`${app.name} isn't installed.`)
     // A running job writes the shortcuts it started with when it ends, which would undo this change.
-    if (this.jobs.has(appId)) throw new Error(`Wait for ${app.name} to finish installing, updating or uninstalling.`)
-    const shortcuts = await this.applyShortcuts(app, info, opts)
-    await this.o.store.setInstalled(appId, { ...info, shortcuts })
+    if (this.busy(appId)) throw new Error(`Wait for ${app.name} to finish installing, updating or uninstalling.`)
+    // Held while the shortcuts are made, so an uninstall can't start and then have its record written back.
+    const release = this.reserve(appId)
+    try {
+      const shortcuts = await this.applyShortcuts(app, info, opts)
+      await this.o.store.setInstalled(appId, { ...info, shortcuts })
+    } finally {
+      release()
+    }
     this.changed()
   }
 
   // ---------- Launch / remove ----------
 
-  async launch(appId: string): Promise<void> {
+  /** Starts the app. `fromJob` is an install starting the app it has just finished. */
+  async launch(appId: string, fromJob = false): Promise<void> {
     const app = this.app(appId)
     const info = this.o.store.getInstalled(appId)
     if (!info) throw new Error(`${app.name} isn't installed.`)
+    // Its files may be half replaced or on their way to the Recycle Bin, and a running copy would stop the job.
+    if (!fromJob && this.busy(appId)) throw new Error(`Wait for ${app.name} to finish installing, updating or uninstalling.`)
     if (info.needsSetup) throw new Error(`${app.name}'s setup didn't finish. Use Repair to run it again.`)
     if (!existsSync(info.launchPath)) throw new Error(`${info.launchPath} is missing. Reinstall ${app.name}.`)
     const child = launchDetached(info.launchPath, info.launchArgs, info.dir)
-    await new Promise<void>((resolve, reject) => {
-      child.once('spawn', resolve)
-      child.once('error', (e) => reject(new Error(`Couldn't start ${app.name}: ${e.message}`)))
-    })
+    // Counted as running at once: an update checking in the moment before Windows reports the start must see it.
     this.running.set(appId, child)
-    child.once('exit', () => {
+    const forget = (): void => {
       if (this.running.get(appId) === child) this.running.delete(appId)
+    }
+    child.once('exit', () => {
+      forget()
       this.changed()
     })
+    try {
+      await new Promise<void>((resolve, reject) => {
+        child.once('spawn', resolve)
+        child.once('error', (e) => reject(new Error(`Couldn't start ${app.name}: ${e.message}`)))
+      })
+    } catch (e) {
+      forget()
+      throw e
+    }
     this.changed()
   }
 
-  /** True while any app is being installed, updated or removed. */
+  /** True while any app is being installed, updated or removed, or about to be. */
   hasActiveJobs(): boolean {
-    return this.jobs.size > 0
+    return this.jobs.size > 0 || this.preparing.size > 0
   }
 
   async uninstall(appId: string): Promise<void> {
     const app = this.app(appId)
-    const info = this.o.store.getInstalled(appId)
-    if (!info) throw new Error(`${app.name} isn't installed.`)
-    if (info.managed) await this.assertNotRunning(app, info, 'uninstall it')
+    const release = this.reserve(appId)
+    try {
+      const info = this.o.store.getInstalled(appId)
+      if (!info) throw new Error(`${app.name} isn't installed.`)
+      if (info.managed) await this.assertNotRunning(app, info, 'uninstall it')
+      this.unchanged(app, info)
+      // Checked last, after the waiting: an app may have been located inside the folder meanwhile.
+      if (info.managed) this.assertNothingInside(app, info.dir, 'uninstalling it recycles that folder and')
+      this.startUninstall(app, info)
+    } finally {
+      release()
+    }
+  }
+
+  private startUninstall(app: CatalogApp, info: InstalledInfo): void {
+    const appId = app.id
     this.startJob(appId, 'uninstall', async (ctx) => {
       ctx.set({ phase: 'removing', label: 'Removing…' })
       if (info.managed) {
@@ -993,18 +1235,26 @@ export class AppManager {
           if (existsSync(uninstaller)) {
             ctx.set({ label: 'Running the uninstaller…' })
             ctx.log(`> ${basename(uninstaller)} /S /currentuser`)
-            await runSetupProgram([uninstaller, '/S', '/currentuser'], ctx)
+            const code = await runSetupProgram([uninstaller, '/S', '/currentuser'], ctx)
+            // Its leftovers are recycled below either way; the code says why Windows may still list the app.
+            if (code !== 0) ctx.log(`Warning: the uninstaller exited with code ${code}.`)
             // NSIS uninstallers copy themselves to %TEMP% and return at once; wait for the files to go.
-            for (let i = 0; i < 120 && existsSync(info.launchPath); i++) await new Promise((r) => setTimeout(r, 500))
+            await waitUntil(() => !existsSync(info.launchPath), 60_000, ctx.signal)
           }
         }
         if (existsSync(info.dir)) {
+          if (ctx.signal.aborted) throw new Error('Cancelled')
           ctx.set({ label: 'Moving the files to the Recycle Bin…' })
           ctx.log(`Recycling ${info.dir}`)
           try {
             await shell.trashItem(info.dir)
           } catch (e) {
-            throw new Error(`Couldn't remove ${info.dir}: ${errorText(e)}. Close the app and try again.`)
+            // A folder on a network drive (or one Windows won't recycle) never goes; deleting it by hand is the way
+            // out, and Uninstall then only removes the shortcuts and the record.
+            throw new Error(
+              `Couldn't move ${info.dir} to the Recycle Bin: ${errorText(e)}. Close the app and try again, or delete ` +
+                'the folder yourself and click Uninstall again.'
+            )
           }
         }
       }
@@ -1023,8 +1273,15 @@ export class AppManager {
     const app = this.app(appId)
     if (!existsSync(file)) throw new Error(`${file} doesn't exist.`)
     if (!/\.(exe|bat|cmd)$/i.test(file)) throw new Error('Pick the program file (.exe or .bat).')
-    await this.o.store.setDetectHidden(appId, false)
-    await this.o.store.setInstalled(appId, this.externalInfo(app, file, null))
+    // An install that is running would replace this record when it ends.
+    if (this.busy(appId)) throw new Error(`Wait for ${app.name} to finish installing.`)
+    const release = this.reserve(appId)
+    try {
+      await this.o.store.setDetectHidden(appId, false)
+      await this.o.store.setInstalled(appId, this.externalInfo(app, file, null))
+    } finally {
+      release()
+    }
     this.changed()
   }
 
