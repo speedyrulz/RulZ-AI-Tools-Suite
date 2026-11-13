@@ -13,14 +13,18 @@ Fleet tab and for an AI assistant with a shell alike.
     python scripts/vast/rulz_fleet.py daemon                    # the loop that does the work (or keep the WebUI open)
     python scripts/vast/rulz_fleet.py wait                      # blocks until a watch fires or a run ends
     python scripts/vast/rulz_fleet.py runs --last 20            # past runs; run KEY for one
+    python scripts/vast/rulz_fleet.py update 1234 --check       # what an update to the newest RulzTrainer changes
+    python scripts/vast/rulz_fleet.py update 1234               # update it and restart its WebUI
+    python scripts/vast/rulz_fleet.py reboot 1234               # vast.ai stops and starts its container
+    python scripts/vast/rulz_fleet.py webui 1234 --open         # its own WebUI in the browser, signed in
 
 Something has to keep looking for the queue, the downloads and the watches to work: `daemon`, a `wait`, or the WebUI
 on this computer (its Fleet tab). Only one of them does the looking at a time (a lock file); the others read what it
 wrote. Everything is kept in ~/.rulz_vast/fleet (state.json, events.jsonl, runs/); downloaded files go where
 rulz_remote.py pull puts them, ~/.rulz_vast/runs/<instance>/<job>.
 
-Like rulz_remote.py this never rents, stops or destroys an instance. Output is JSON.
-Exit status: 0 fine, 1 refused, 2 wait timed out, 3 nothing reachable."""
+This never rents, stops or destroys an instance; it reboots one, or updates its RulzTrainer, only when told to.
+Output is JSON. Exit status: 0 fine, 1 refused, 2 wait timed out, 3 nothing reachable."""
 from __future__ import annotations
 
 import argparse
@@ -34,6 +38,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -76,13 +81,21 @@ MACHINE_METRICS = ("disk_free_gb", "gpu_temp", "gpu_util", "gpu_mem_mb")
 METRICS = RUN_METRICS + PROBE_METRICS + MACHINE_METRICS
 # the events a wait ends on unless told otherwise: the ones somebody has to look at
 WAIT_KINDS = ("watch", "run_done", "run_failed", "run_ended", "run_lost", "dispatch_failed", "instance_down",
-              "instance_gone", "download_failed", "queue_empty")
-EVENT_KINDS = WAIT_KINDS + ("run_started", "dispatched", "instance_up", "instance_added")
+              "instance_gone", "download_failed", "queue_empty", "update_failed")
+EVENT_KINDS = WAIT_KINDS + ("run_started", "dispatched", "instance_up", "instance_added", "instance_rebooting",
+                            "instance_rebooted", "instance_updated")
 RECENT_KEPT = 30
 FILLS_PER_TICK = 3  # runs whose settings and probes are fetched per instance and look
 PULL_RETRIES = 5
 DISPATCH_STALE = 900.0  # a dispatch that has not reported for this long is taken for dead
 SERIES_KEPT = 400
+# a rebooting instance may be out of reach, or not "running" on vast.ai, this long before that counts as usual
+REBOOT_GRACE = 900.0
+UPDATE_STALE = 3600.0  # an update this computer started and never heard back from is taken for over after this
+# an update cut off by a dropped connection that no look has seen begin (the instance writes its record after the
+# fetch, which may take up to 300 s) is taken for one that never began after this
+UPDATE_SETTLE = 420.0
+PORTAL_PORT = 7870  # the WebUI's Instance Portal port in the container (the template's PORTAL_CONFIG)
 
 
 class Refused(Exception):
@@ -160,6 +173,24 @@ def race_parts(config: dict, parts: int) -> list[list[str]]:
     return [names[i::parts] for i in range(parts)]
 
 
+def portal_url(scheme, ip, port, path, token) -> str:
+    """An instance's WebUI address from what the instance and vast.ai said, refused unless it is a plain http(s)
+    address of an IP and a port: the link opens in a browser on this computer, so nothing else may get in."""
+    import ipaddress
+
+    try:
+        address = ipaddress.ip_address(str(ip).strip())
+        port = int(port)
+    except (TypeError, ValueError) as e:
+        raise Refused(f"Not an address for the WebUI: {ip!r} port {port!r}") from e
+    if scheme not in ("http", "https") or not 0 < port < 65536:
+        raise Refused(f"Not an address for the WebUI: {scheme!r} port {port}")
+    path = path if isinstance(path, str) and re.fullmatch(r"/[A-Za-z0-9._~/-]*", path) else "/"
+    host = f"[{address}]" if address.version == 6 else str(address)
+    url = f"{scheme}://{host}:{port}{path}"
+    return url + (f"?token={urllib.parse.quote(str(token), safe='')}" if token else "")
+
+
 def point_at_pushed(config, push) -> dict:
     """A config whose paths into a pushed folder read where the folder lands on the instance: a dataset that is
     C:\\sets\\anna here is datasets/anna there, wherever the settings name it (the dataset, its face references)."""
@@ -210,7 +241,7 @@ class Lane:
 class Fleet:
     def __init__(self, home: Path | None = None, pulls: Path | None = None, key: str | None = None,
                  folder: str = remote.REMOTE_DIR, connect=None, list_instances=None, fetch=None, send=None,
-                 now=time.time):
+                 vast=None, now=time.time):
         self.home = Path(home) if home else remote.STATE / "fleet"
         self.pulls = Path(pulls) if pulls else (remote.PULLS if home is None else self.home / "files")
         self.key, self.folder, self.now = key, folder, now
@@ -218,6 +249,7 @@ class Fleet:
         self.list_instances = list_instances or remote.list_instances
         self.fetch = fetch or remote.fetch
         self.send = send or remote.send
+        self.vast = vast or remote.vastai  # the vastai CLI: its arguments in, its output out
         self.lock = QueueLock(self.home / "state.lock")
         self.state_file = self.home / "state.json"
         self.events_file = self.home / "events.jsonl"
@@ -466,6 +498,8 @@ class Fleet:
                 inst["status"] = status
                 if status == "running":
                     inst.pop("gone", None)
+                elif self._rebooting(inst):
+                    pass  # stopping and starting again: not gone
                 elif not inst.get("gone"):
                     inst["gone"] = self.now()
                     self.event(st, "instance_gone", instance=int(iid), status=status)
@@ -517,16 +551,40 @@ class Fleet:
         """Take one look into the record: the instance's reach, its runs' states (a run that ended is closed, its
         last files asked for), and the watches."""
         iid, now = str(inst["id"]), self.now()
+        reboot = inst.get("rebooting")
+        if reboot and not self._rebooting(inst):  # its grace is over: whatever it is now counts as usual
+            inst.pop("rebooting", None)
+            reboot = None
         if not snap.get("ok"):
+            if reboot:  # stopping and starting: expected, not an instance going down
+                reboot["down_seen"] = True
+                return
             if not inst.get("down"):
                 inst["down"] = now
                 inst["error"] = snap.get("error")
                 self.event(st, "instance_down", instance=int(iid), error=snap.get("error"))
             return
+        rebooted = False
+        if reboot:  # back: its container started anew, or (when that can't be told) it was seen out of reach since
+            was, booted = reboot.get("booted"), snap.get("booted")
+            anew = abs(float(booted) - float(was)) > 5 if was and booted else reboot.get("down_seen")
+            if anew:
+                inst.pop("rebooting", None)
+                rebooted = True
+                self.event(st, "instance_rebooted", instance=int(iid))
         if inst.pop("down", None):
             inst.pop("error", None)
-            self.event(st, "instance_up", instance=int(iid))
+            if not rebooted:
+                self.event(st, "instance_up", instance=int(iid))
         first_look = not inst.get("last_seen")
+        update = snap.get("update") or {}
+        self._note_update(st, inst, update, quiet=first_look)
+        guard = inst.get("updating")
+        if guard and update.get("state") != "running" and (
+                update.get("started") not in (None, guard.get("prior")) or now - guard.get("since", 0) > UPDATE_SETTLE):
+            # the update ended, or it never began (the instance writes its record within UPDATE_SETTLE): also when
+            # this computer lost touch with it (a dropped connection, Ctrl+C, a closed WebUI)
+            inst.pop("updating", None)
         inst["last_seen"] = now
         if not inst.get("gpu") and snap.get("gpus"):
             inst["gpu"] = snap["gpus"][0].get("name")
@@ -721,6 +779,8 @@ class Fleet:
         """Free for the next queued run: reachable, its WebUI up (it starts the runs), nothing running or waiting
         there, and no dispatch of ours on its way."""
         if not inst.get("enabled", True) or inst.get("gone") or inst.get("accept") is False:
+            return False
+        if self._rebooting(inst) or self._updating(inst, snap):
             return False
         if not snap or not snap.get("ok") or not snap.get("webui_running") or snap.get("job_running"):
             return False
@@ -971,6 +1031,213 @@ class Fleet:
             raise Refused((done.stderr or b"").decode("utf-8", "replace").strip() or "stop failed")
         return dict(json.loads(done.stdout), instance=inst["id"])
 
+    # ---------------------------------------------------------------- an instance itself: reboot, update, its WebUI
+
+    def _rebooting(self, inst: dict) -> bool:
+        reboot = inst.get("rebooting")
+        return bool(reboot) and self.now() - reboot.get("since", 0) < REBOOT_GRACE
+
+    def _updating(self, inst: dict, snap: dict | None = None) -> bool:
+        """An update going: one this computer started (and has not heard back from), or one the instance reports."""
+        mine = inst.get("updating")
+        if mine and self.now() - mine.get("since", 0) < UPDATE_STALE:
+            return True
+        snap = snap or {}
+        return snap.get("ok") is not False and (snap.get("update") or {}).get("state") == "running"
+
+    def _note_update(self, st: dict, inst: dict, update: dict, quiet: bool = False) -> None:
+        """An update's end, the first time a look or the update's own answer reports it: one event for each."""
+        if update.get("state") not in ("done", "failed", "interrupted") or update.get("started") is None:
+            return
+        if inst.get("update_seen") == update["started"]:
+            return
+        inst["update_seen"] = update["started"]
+        if quiet:  # one that ended before the fleet first looked at this instance
+            return
+        if update["state"] == "done":
+            self.event(st, "instance_updated", instance=int(inst["id"]), version=(update.get("to") or {}).get("version"),
+                       was=(update.get("from") or {}).get("version"), note=update.get("note"))
+        else:
+            self.event(st, "update_failed", instance=int(inst["id"]),
+                       error=str(update.get("error") or "it was interrupted before it ended")[-400:])
+
+    @staticmethod
+    def _answer(done) -> tuple[dict, str]:
+        """A remote command's JSON reply ({} when there is none) and its message, without the agent's [refused]."""
+        try:
+            reply = json.loads(done.stdout or b"{}")
+        except ValueError:
+            reply = {}
+        message = (done.stderr or b"").decode("utf-8", "replace").strip()
+        return (reply if isinstance(reply, dict) else {}), message.removeprefix("[refused] ")
+
+    def _usable(self, iid) -> dict:
+        inst = self.instance(iid)
+        if inst.get("gone"):
+            raise Refused(f"Instance {iid} is {inst.get('status') or 'gone'} on vast.ai.")
+        return inst
+
+    def reboot(self, iid, force: bool = False, kill: bool = False) -> dict:
+        """Reboot an instance: vast.ai stops and starts its container. Its disk (the install, datasets, models and
+        runs) is kept and the GPU stays its own. A run going there is killed without a final save, so that needs kill
+        (or force); an update going, a run being sent or a reboot already under way need force. The fleet then waits
+        for it (REBOOT_GRACE) before an instance out of reach or not running on vast.ai counts as down or gone."""
+        iid = str(iid)
+        snap = self.snapshots().get(iid) or {}
+        running = next(iter(self.runs(instance=iid, state="running")), None)
+        job = (running or {}).get("job") or ((snap.get("job") or {}).get("job") if snap.get("job_running") else None)
+        # the container's start time, to tell the new one by: only from a recent look (it may have restarted since)
+        fresh = snap.get("ok") and self.now() - (snap.get("polled") or 0) < 120
+        with self.edit() as st:  # checked and taken in one go: from here on the queue sends it nothing
+            inst = st["instances"].get(iid)
+            if inst is None:
+                raise Refused(f"Instance {iid} is not in the fleet (see instances).")
+            if inst.get("gone"):
+                raise Refused(f"Instance {iid} is {inst.get('status') or 'gone'} on vast.ai.")
+            if self._rebooting(inst) and not force:
+                raise Refused(f"Instance {iid} is already rebooting.")
+            if job and not (kill or force):
+                raise Refused(f"{job} is running on instance {iid}: a reboot kills it without a final save. Stop the "
+                              "run first, or force the reboot.")
+            if self._updating(inst, snap) and not force:
+                raise Refused(f"Instance {iid} is updating its RulzTrainer: a reboot now can leave the update half "
+                              "done.")
+            sending = inst.get("dispatching")
+            if sending and self.now() - sending.get("since", 0) < DISPATCH_STALE and not force:
+                raise Refused(f"A queued run is being sent to instance {iid} right now: try again in a minute.")
+            before = inst.get("rebooting")
+            inst["rebooting"] = {"since": self.now(), "booted": snap.get("booted") if fresh else None}
+        try:
+            said = self.vast("reboot", "instance", iid)
+            if "rebooting instance" not in said.lower():  # the CLI says why on stdout and still ends with 0
+                raise Refused(f"vast.ai did not reboot instance {iid}: {said.strip()[:300] or 'no answer'}")
+        except (Refused, remote.Unreachable) as e:
+            with self.edit() as st:
+                live = st["instances"].get(iid)
+                if live is not None:
+                    if before:
+                        live["rebooting"] = before
+                    else:
+                        live.pop("rebooting", None)
+            raise Refused(str(e)) from e
+        with self.edit() as st:
+            live = st["instances"].get(iid)
+            if live is not None:
+                live["settled"] = self.now()
+            self.event(st, "instance_rebooting", instance=int(iid), job=job)
+        with self.guard:
+            self.remotes.pop(iid, None)  # vast.ai may give it another port when it comes back
+        return {"instance": int(iid), "state": "rebooting", "killed": job, "said": said.strip()}
+
+    def check_update(self, iid) -> dict:
+        """What an update to the newest RulzTrainer would change on an instance (it fetches the code; nothing on it
+        changes). The answer is kept, so the overview can say that a newer version is out."""
+        iid = str(iid)
+        done = self.remote_for(self._usable(iid)).agent("update", "--check")
+        plan, message = self._answer(done)
+        if done.returncode != 0 or not plan.get("latest"):
+            raise Refused(message or f"The check on instance {iid} failed (exit {done.returncode}).")
+        with self.edit() as st:
+            live = st["instances"].get(iid)
+            if live is not None:
+                live["latest"] = {"version": plan["latest"].get("version"), "commit": plan["latest"].get("commit"),
+                                  "behind": plan.get("behind"), "of": (plan.get("current") or {}).get("commit"),
+                                  "checked": self.now()}
+        return plan
+
+    def update_trainer(self, iid, discard: bool = False, force: bool = False, reinstall: bool = False) -> dict:
+        """Update an instance's RulzTrainer to the newest and restart its WebUI on it (the agent's update): seconds,
+        or minutes when the requirements changed. The queue sends it nothing meanwhile. discard replaces files
+        changed there (by rulz_remote.py sync); force updates under a running job."""
+        iid = str(iid)
+        with self.edit() as st:
+            inst = st["instances"].get(iid)
+            if inst is None:
+                raise Refused(f"Instance {iid} is not in the fleet (see instances).")
+            if inst.get("gone"):
+                raise Refused(f"Instance {iid} is {inst.get('status') or 'gone'} on vast.ai.")
+            if self._rebooting(inst):
+                raise Refused(f"Instance {iid} is rebooting: update it once it is back.")
+            if self._updating(inst, self.snapshots().get(iid)):
+                raise Refused(f"Instance {iid} is already updating.")
+            sending = inst.get("dispatching")
+            if sending and self.now() - sending.get("since", 0) < DISPATCH_STALE:
+                raise Refused(f"A queued run is being sent to instance {iid} right now: try again in a minute.")
+            guard = {"since": self.now(), "prior": ((self.snapshots().get(iid) or {}).get("update") or {}).get("started")}
+            inst["updating"] = guard
+            target = dict(inst)
+        flags = [flag for flag, on in (("--discard", discard), ("--force", force), ("--reinstall", reinstall)) if on]
+        reply, message, code, settled = {}, "", None, False
+        try:
+            try:
+                target_remote = self.remote_for(target)
+                # a cheap first call, reconnecting when the saved route went stale: the update itself is sent once
+                # (after a dropped connection it may still be going there), so a 255 from it means just that
+                probe = target_remote.run("true", in_folder=False)
+                if probe.returncode == remote.SSH_FAILED:
+                    raise remote.Unreachable((probe.stderr or b"").decode("utf-8", "replace").strip()
+                                             or f"ssh to instance {iid} failed")
+            except (remote.Unreachable, SystemExit, OSError, subprocess.SubprocessError) as e:
+                message, settled = str(e) or f"Instance {iid} is out of reach.", True  # nothing ran there
+            else:
+                done = target_remote.agent("update", *flags, retry=False)
+                reply, message = self._answer(done)
+                code = done.returncode
+                settled = code != remote.SSH_FAILED
+        finally:  # an answer clears the guard; otherwise (a dropped connection, Ctrl+C) a later look settles it
+            with self.edit() as st:
+                live = st["instances"].get(iid)
+                if live is not None:
+                    if settled:
+                        live.pop("updating", None)
+                    else:
+                        live["updating"] = dict(guard, since=self.now(), unsure=True)
+                    live["settled"] = self.now()
+        if code is None:
+            raise Refused(message)
+        with self.edit() as st:
+            live = st["instances"].get(iid)
+            if live is not None:
+                self._note_update(st, live, reply)
+                now_on = reply.get("to") if reply.get("state") == "done" else \
+                    reply.get("current") if reply.get("state") == "current" else None
+                if now_on:
+                    live["latest"] = {"version": now_on.get("version"), "commit": now_on.get("commit"), "behind": 0,
+                                      "of": now_on.get("commit"), "checked": self.now()}
+        if code == 0 and reply.get("state") in ("done", "current"):
+            return dict(reply, instance=int(iid))
+        if code == remote.SSH_FAILED:
+            raise Refused(f"Instance {iid} dropped out of reach during the update ({message or 'no answer'}). An "
+                          "update that had started goes on there; its card says when it is done.")
+        raise Refused(str(reply.get("error") or message or f"The update on instance {iid} failed (exit {code})."))
+
+    def webui_link(self, iid) -> dict:
+        """The address of an instance's own WebUI, with the Instance Portal's token in it so the browser is signed in
+        (as vast.ai's Open button does). Asked of the instance each time: the token is never kept here."""
+        iid = str(iid)
+        try:
+            info = self.remote_for(self._usable(iid)).agent_json("webui")
+        except (SystemExit, ValueError) as e:
+            raise Refused(f"Instance {iid} did not say where its WebUI is: {e}") from e
+        if not isinstance(info, dict):
+            raise Refused(f"Instance {iid} did not say where its WebUI is.")
+        port, ip, host_port = info.get("port") or PORTAL_PORT, info.get("ip"), info.get("host_port")
+        if not ip or not host_port:  # an older image without vast.ai's variables: the account's listing has them
+            try:
+                raw = next((i for i in self.list_instances() if str(i.get("id")) == iid), None) or {}
+            except (remote.Unreachable, ValueError):
+                raw = {}
+            mapped = (raw.get("ports") or {}).get(f"{port}/tcp") or []
+            ip = ip or str(raw.get("public_ipaddr") or "").strip() or None
+            host_port = host_port or (mapped[0].get("HostPort") if mapped and isinstance(mapped[0], dict) else None)
+        if not ip or not host_port:
+            raise Refused(f"vast.ai maps no public port to instance {iid}'s WebUI (port {port} in the container): "
+                          "open it from the instance's Open button on vast.ai instead.")
+        return {"instance": int(iid), "url": portal_url(info.get("scheme"), ip, host_port, info.get("path"),
+                                                        info.get("token")),
+                "signed_in": bool(info.get("token")), "https": info.get("scheme") == "https",
+                "webui_running": info.get("webui_running")}
+
     # ---------------------------------------------------------------- the loop
 
     def hold(self) -> bool:
@@ -1074,8 +1341,12 @@ class Fleet:
                 state = "gone"
             elif not inst.get("enabled", True):
                 state = "off"
+            elif self._rebooting(inst):
+                state = "rebooting"
             elif inst.get("down") or snap.get("ok") is False:
                 state = "unreachable"
+            elif self._updating(inst, snap):
+                state = "updating"
             elif not snap:
                 state = "new"
             elif snap.get("job_running"):
@@ -1090,8 +1361,12 @@ class Fleet:
                     "disk_free_gb": snap.get("disk_free_gb"), "disk_total_gb": snap.get("disk_total_gb"),
                     "gpus": snap.get("gpus"), "datasets": snap.get("datasets"),
                     "age": round(now - snap["polled"]) if snap.get("polled") else None,
-                    "queue": (snap.get("queue") or {}).get("waiting") or None}
-            if job and state in ("running", "starting", "idle"):
+                    "queue": (snap.get("queue") or {}).get("waiting") or None,
+                    "trainer": snap.get("trainer") or None, "update": snap.get("update") or None}
+            latest, trainer = inst.get("latest") or {}, snap.get("trainer") or {}
+            if latest.get("behind") and latest.get("of") and latest.get("of") == trainer.get("commit"):
+                line["newer"] = {"version": latest.get("version"), "behind": latest["behind"]}  # from the last check
+            if job and state in ("running", "starting", "idle", "updating"):
                 line["job"] = {k: job.get(k) for k in ("job", "stage", "step", "total", "loss", "avg_loss", "lr",
                                                        "eta", "elapsed", "error", "done", "last_probe", "step_time",
                                                        "probes_count", "saved_count") if job.get(k) is not None}
@@ -1416,6 +1691,31 @@ def cmd_stop(fleet: Fleet, args) -> int:
     return 0
 
 
+def cmd_update(fleet: Fleet, args) -> int:
+    if args.check:
+        show(fleet.check_update(args.id))
+        return 0
+    print(f"[fleet] updating instance {args.id}: fetching the newest RulzTrainer, installing what changed, restarting "
+          "its WebUI", file=sys.stderr, flush=True)
+    show(fleet.update_trainer(args.id, discard=args.discard, force=args.force, reinstall=args.reinstall))
+    return 0
+
+
+def cmd_reboot(fleet: Fleet, args) -> int:
+    show(fleet.reboot(args.id, force=args.force, kill=args.kill))
+    return 0
+
+
+def cmd_webui(fleet: Fleet, args) -> int:
+    link = fleet.webui_link(args.id)
+    if args.open:
+        import webbrowser
+
+        webbrowser.open(link["url"])
+    show(link)
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], allow_abbrev=False)
     ap.add_argument("--key", help="ssh private key; default: ssh's own choice, or RULZ_VAST_KEY")
@@ -1503,6 +1803,21 @@ def parser() -> argparse.ArgumentParser:
     p = command("stop", cmd_stop)
     p.add_argument("name", help="a running job's name, or an instance id")
     p.add_argument("--kill", action="store_true", help="kill the process: no final save")
+    p = command("update", cmd_update, "update an instance's RulzTrainer to the newest and restart its WebUI")
+    p.add_argument("id")
+    p.add_argument("--check", action="store_true", help="only say what would change (versions, changed files)")
+    p.add_argument("--discard", action="store_true",
+                   help="replace files changed on the instance (by rulz_remote.py sync) with the newest release's")
+    p.add_argument("--force", action="store_true", help="even while a run goes there")
+    p.add_argument("--reinstall", action="store_true", help="install the requirements even when they are the same")
+    p = command("reboot", cmd_reboot, "reboot an instance: vast.ai stops and starts its container, the disk stays")
+    p.add_argument("id")
+    p.add_argument("--kill", action="store_true", help="even while a run goes there (it is killed, no final save)")
+    p.add_argument("--force", action="store_true",
+                   help="whatever goes on there: a run, an update, a run being sent, a reboot under way")
+    p = command("webui", cmd_webui, "the address of an instance's own WebUI, with the portal's sign-in token")
+    p.add_argument("id")
+    p.add_argument("--open", action="store_true", help="open it in this computer's browser")
     return ap
 
 

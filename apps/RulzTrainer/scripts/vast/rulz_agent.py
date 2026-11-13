@@ -2,8 +2,8 @@
 """The instance side of rulz_remote.py: reads a RulzTrainer install's runs and queues new ones, as JSON or plain text.
 
 rulz_remote.py pipes this file over ssh for every call (`cd /workspace/RulzTrainer && python - status`), so it works
-on an instance that is already running, whatever its checkout's age, and it never restarts or changes the WebUI. It
-needs the standard library, plus psutil, yaml and the repo's own modules where noted; keep it ASCII.
+on an instance that is already running, whatever its checkout's age. Only `update` changes the install and restarts
+the WebUI. It needs the standard library, plus psutil, yaml and the repo's own modules where noted; keep it ASCII.
 
 It talks to the trainer the way the WebUI does: a new run goes into output/_queue.json and the WebUI's queue thread
 starts it, so the run shows on the Monitor and can never collide with one started from the page; Stop is the job
@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,24 @@ SERIES_POINTS = 150  # the loss series sent with a snapshot, for rulz_fleet.py's
 SERIES_PROBES = 60  # and the probes sent with it
 PROBE_COLUMNS = ("step", "face", "body", "combined", "face_ema", "body_ema", "combined_ema", "face_norm_ema",
                  "body_norm_ema", "best", "best_step", "since_improve", "lr_factor", "stage", "gold_ema", "copy")
+# update: where the newest RulzTrainer comes from (provision.sh's defaults), and what it keeps on the instance
+DEFAULT_REPO = "https://github.com/speedyrulz/RulZ-AI-Tools-Suite.git"
+DEFAULT_BRANCH = "app/rulz-trainer"  # rebuilt from the suite's apps/RulzTrainer on every change to main
+UPDATE_STATE = OUTPUT / "_update.json"  # output/ is git-ignored: an update leaves both alone
+UPDATE_LOG = OUTPUT / "_update.log"
+UPDATE_LOCK = OUTPUT / "_update.lock"  # held while an update (or its check) runs: two at once would mix their files
+INSTALL_FILES = ("requirements.txt", "install.sh")  # a change in one of these runs install.sh again
+# the WebUI's supervisor service, as provision.sh and the Dockerfile install it: copied again when it changed
+SUPERVISOR_FILES = (("scripts/vast/rulztrainer.sh", "/opt/supervisor-scripts/rulztrainer.sh", 0o755),
+                    ("scripts/vast/rulztrainer.conf", "/etc/supervisor/conf.d/rulztrainer.conf", 0o644))
+# the requirements into the image's /venv/main (its torch kept), as provision.sh does
+INSTALL_COMMAND = ["bash", "-c", "[ -f /venv/main/bin/activate ] && . /venv/main/bin/activate; exec bash install.sh system"]
+WEBUI_SERVICE = "rulztrainer"
+# webui: the Instance Portal (Caddy) puts the WebUI on this port with its login in front; vast.ai maps it outside
+PORTAL_FILE = Path("/etc/portal.yaml")
+PORTAL_PORT = 7870  # the template's PORTAL_CONFIG: localhost:7870:17870:/:RulzTrainer
+ENV_FILE = Path("/etc/environment")  # vast.ai's images write the container's variables here
+FIRST_PROCESS_ENV = Path("/proc/1/environ")  # and docker starts the container's first process with them
 
 
 class Refused(Exception):
@@ -55,20 +74,38 @@ def read_json(path: Path, default=None):
         return default
 
 
-def job_process():
-    """The psutil.Process of the job in .webui_job.json while it runs, else None (the WebUI's reattach_job: a pid only
-    counts with its create time, pids get reused)."""
+def read_text(path) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def write_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=1, default=str), encoding="utf-8")
+    tmp.replace(path)
+
+
+def live_process(pid, created=None):
+    """The psutil.Process with this pid while it runs, else None. A pid only counts with its create time when one is
+    given: pids get reused."""
     import psutil
 
-    data = read_json(JOB_FILE) or {}
     try:
-        proc = psutil.Process(int(data["pid"]))
-        created = data.get("create_time")
+        proc = psutil.Process(int(pid))
         if created is not None and abs(proc.create_time() - float(created)) > 1.0:
             return None
         return proc if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE else None
-    except (KeyError, TypeError, ValueError, psutil.Error):
+    except (TypeError, ValueError, psutil.Error):
         return None
+
+
+def job_process():
+    """The psutil.Process of the job in .webui_job.json while it runs, else None (the WebUI's reattach_job)."""
+    data = read_json(JOB_FILE) or {}
+    return live_process(data.get("pid"), data.get("create_time")) if data.get("pid") is not None else None
 
 
 def current_job_dir() -> Path | None:
@@ -161,10 +198,68 @@ def machine_status() -> dict:
     disk = shutil.disk_usage(".")
     active = running_dir()
     datasets = Path("datasets")
-    return {"root": str(Path.cwd()), "webui_running": webui_running(), "gpus": gpus,
+    data = {"root": str(Path.cwd()), "webui_running": webui_running(), "gpus": gpus,
             "disk_free_gb": round(disk.free / 1e9, 1), "disk_total_gb": round(disk.total / 1e9, 1),
             "datasets": sorted(p.name for p in datasets.iterdir() if p.is_dir()) if datasets.is_dir() else [],
-            "job_running": active is not None, "queue": queue_view()}
+            "job_running": active is not None, "queue": queue_view(), "trainer": install_info(), "booted": booted()}
+    update = update_state()
+    if update:
+        data["update"] = {k: update.get(k) for k in ("state", "started", "ended", "from", "to", "error", "note")
+                          if update.get(k) is not None}
+    return data
+
+
+def trainer_version(text: str) -> str | None:
+    found = re.search(r"""^__version__\s*=\s*["']([^"']+)["']""", text or "", re.M)
+    return found.group(1) if found else None
+
+
+def git(*args: str, check: bool = True, timeout: float = 300) -> str:
+    """A git command in the install folder, its output stripped; a failure is a refusal (check) or ""."""
+    try:
+        done = subprocess.run(["git", *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=timeout, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as e:
+        if check:
+            raise Refused(f"git {args[0]}: {e}") from e
+        return ""
+    if done.returncode != 0:
+        if check:
+            raise Refused(f"git {args[0]} failed: {(done.stderr or done.stdout).strip()[-400:]}")
+        return ""
+    return done.stdout.strip()
+
+
+def install_info() -> dict:
+    """The RulzTrainer installed here: its version, and its commit and branch when the folder is a git checkout."""
+    info = {"version": trainer_version(read_text("rulztrainer/__init__.py"))}
+    if Path(".git").is_dir():
+        info["commit"] = git("rev-parse", "--short=10", "HEAD", check=False, timeout=15)
+        head = read_text(".git/HEAD").strip()
+        if info["commit"] and head.startswith("ref: refs/heads/"):
+            info["branch"] = head[len("ref: refs/heads/"):]
+    return {k: v for k, v in info.items() if v}
+
+
+def booted() -> float | None:
+    """When this container started (its first process). It differs after a reboot, which is how rulz_fleet.py tells
+    that one happened without comparing this machine's clock with its own."""
+    try:
+        import psutil
+
+        return round(psutil.Process(1).create_time(), 1)
+    except Exception:  # noqa: BLE001  (no psutil, or no such process: no answer)
+        return None
+
+
+def update_state() -> dict | None:
+    """The last update's record, "interrupted" when it says running but its process is gone."""
+    data = read_json(UPDATE_STATE)
+    if not isinstance(data, dict):
+        return None
+    if data.get("state") == "running" and live_process(data.get("pid"), data.get("pid_created")) is None:
+        data["state"] = "interrupted"
+    return data
 
 
 def cmd_status(args) -> int:
@@ -506,6 +601,290 @@ def cmd_queue(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- the install itself: update, the WebUI's address
+
+
+class UpdateFailed(Exception):
+    pass
+
+
+def container_env(env_file: Path | None = None, first_process: Path | None = None, own=None) -> dict[str, str]:
+    """The container's variables. An ssh session inherits none of what docker started the container with, so they
+    come from /etc/environment (where vast.ai's images write them), then the first process's environment, and this
+    process's own on top."""
+    values: dict[str, str] = {}
+    for line in read_text(env_file or ENV_FILE).splitlines():
+        name, sep, value = line.strip().removeprefix("export ").partition("=")
+        if sep and name and not name.startswith("#"):
+            values[name.strip()] = value.strip().strip("'\"")
+    try:
+        raw = (first_process or FIRST_PROCESS_ENV).read_bytes()
+    except OSError:  # not Linux, or not allowed
+        raw = b""
+    for item in raw.split(b"\0"):
+        name, sep, value = item.decode("utf-8", "replace").partition("=")
+        if sep and name:
+            values[name] = value
+    values.update(os.environ if own is None else own)
+    return values
+
+
+def public_url(url: str) -> str:
+    """A git remote without the user name or token some clones carry in it."""
+    return re.sub(r"^([a-z][a-z0-9+.-]*://)[^/@]+@", r"\1", url or "", flags=re.I)
+
+
+def update_source(branch: str = "") -> tuple[str, str, bool]:
+    """Where the newest RulzTrainer comes from, and whether this folder is a checkout (its HEAD names a commit):
+    the checkout's own origin and branch, else provision.sh's (RULZ_REPO, RULZ_BRANCH, or their defaults)."""
+    env = container_env()
+    info = install_info()
+    checkout = bool(info.get("commit"))
+    origin = git("remote", "get-url", "origin", check=False, timeout=15) if Path(".git").is_dir() else ""
+    url = origin or env.get("RULZ_REPO") or DEFAULT_REPO
+    return url, branch or info.get("branch") or env.get("RULZ_BRANCH") or DEFAULT_BRANCH, checkout
+
+
+def update_plan(branch: str = "") -> dict:
+    """Fetch the newest RulzTrainer and say what an update to it would change. A folder that is no checkout (a
+    Docker image's copy) gets a .git of its own for the fetch; its files stay as they are until the update."""
+    url, branch, checkout = update_source(branch)
+    if not Path(".git").is_dir():
+        git("init", "--quiet")
+    if not git("remote", "get-url", "origin", check=False, timeout=15):
+        git("remote", "add", "origin", url)
+    git("fetch", "--quiet", "--no-tags", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+    target = f"origin/{branch}"
+    current = install_info()
+    latest = {"version": trainer_version(git("show", f"{target}:rulztrainer/__init__.py", check=False)),
+              "commit": git("rev-parse", "--short=10", target)}
+    plan = {"checkout": checkout, "repo": public_url(url), "branch": branch, "current": current,
+            "latest": {k: v for k, v in latest.items() if v}, "behind": None, "ahead": None, "up_to_date": False,
+            "changed": [], "changed_count": 0, "installs": True}
+    if checkout:
+        ahead, behind = (int(n) for n in git("rev-list", "--left-right", "--count", f"HEAD...{target}").split())
+        changed = [n for n in git("diff", "--name-only", "-z", "HEAD").split("\0") if n.strip()]
+        # files here that git does not track (a sync's new file, an ignored one) but the newest release brings:
+        # the update writes over them
+        tracked = set(git("ls-files", "-z").split("\0"))
+        changed += [n for n in git("ls-tree", "-r", "--name-only", "-z", target).split("\0")
+                    if n and n not in tracked and Path(n).exists()]
+        plan.update(ahead=ahead, behind=behind, changed=changed[:40], changed_count=len(changed),
+                    up_to_date=git("rev-parse", "HEAD") == git("rev-parse", target),
+                    installs=bool(git("diff", "--name-only", "HEAD", target, "--", *INSTALL_FILES)))
+    active = running_dir()
+    plan.update(job_running=active is not None, job=active.name if active is not None else None)
+    return plan
+
+
+def copy_service_files(log) -> bool:
+    """The WebUI's supervisor files where provision.sh put them, when the update changed them. True when it did."""
+    changed = False
+    for source, target, mode in SUPERVISOR_FILES:
+        source, target = Path(source), Path(target)
+        if not source.is_file() or not target.parent.is_dir():
+            continue
+        if target.is_file() and target.read_bytes() == source.read_bytes():
+            continue
+        shutil.copyfile(source, target)
+        os.chmod(target, mode)
+        log.write(f"== service: {source} -> {target}\n")
+        changed = True
+    return changed
+
+
+def hold_lock(path: Path):
+    """An open file holding an OS lock on path, or None when another process holds it. Files Python opens are not
+    inherited by the commands an update runs, so the lock ends with this process."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, "a+b")  # noqa: SIM115
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
+def supervisorctl() -> list[str] | None:
+    """The command that restarts the WebUI's service (vast.ai's images run it under supervisor), or None."""
+    found = shutil.which("supervisorctl") or next(
+        (p for p in ("/usr/local/bin/supervisorctl", "/usr/bin/supervisorctl", "/venv/main/bin/supervisorctl")
+         if os.access(p, os.X_OK)), None)  # vast.ai's images pip-install it into /usr/local/bin
+    return [found] if found else None
+
+
+def hold_queue():
+    """Pause the WebUI's own queue while the code changes under it (a waiting run would start on new code with old
+    packages); returns how to put it back as it was. Never fails an update: no queue, nothing to hold."""
+    try:
+        q = queue()
+        was = bool(q.snapshot()["paused"])
+        q.set_paused(True)
+    except Exception:  # noqa: BLE001  (an old or broken install: the update goes on without)
+        return lambda: None
+
+    def restore() -> None:
+        try:
+            q.set_paused(was)
+        except Exception:  # noqa: BLE001
+            pass
+
+    return restore
+
+
+def tail(path: Path, lines: int = 12) -> str:
+    return "\n".join(read_text(path).strip().splitlines()[-lines:])
+
+
+def run_update(plan: dict, reinstall: bool = False) -> int:
+    """Put the newest code in place, install the requirements when they changed, renew the supervisor files, and
+    restart the WebUI on the new code. A dropped ssh connection does not stop it half way: it goes on, and its
+    record (output/_update.json, the log next to it) says how it ended."""
+    for name in ("SIGHUP", "SIGPIPE"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), signal.SIG_IGN)
+    me = live_process(os.getpid())
+    record = {"state": "running", "pid": os.getpid(), "pid_created": me.create_time() if me else None,
+              "started": round(time.time(), 1), "branch": plan["branch"], "from": plan["current"],
+              "to": plan["latest"], "steps": []}
+    write_json(UPDATE_STATE, record)
+    restarted, note = False, ""
+    restore_queue = hold_queue()
+    with open(UPDATE_LOG, "w", encoding="utf-8") as log:
+        def step(name: str, cmd: list[str], fatal: bool = True) -> bool:
+            log.write(f"== {name}: {' '.join(cmd)}\n")
+            log.flush()
+            done = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+            log.flush()
+            record["steps"].append(name)
+            if done.returncode != 0 and fatal:
+                raise UpdateFailed(f"{name} failed (exit {done.returncode}):\n{tail(UPDATE_LOG)}")
+            return done.returncode == 0
+
+        try:
+            step("code", ["git", "checkout", "--quiet", "--force", "-B", plan["branch"], f"origin/{plan['branch']}"])
+            if plan.get("installs") or reinstall:
+                step("requirements", list(INSTALL_COMMAND))
+            service = copy_service_files(log)
+            ctl = supervisorctl()
+            if ctl is None:
+                note = "No supervisorctl here: restart the WebUI yourself to run the new code."
+            else:
+                if service:
+                    step("service", [*ctl, "update"], fatal=False)
+                restarted = step("restart", [*ctl, "restart", WEBUI_SERVICE], fatal=False)
+                if not restarted:
+                    note = f"The code is new, but the WebUI did not restart:\n{tail(UPDATE_LOG, 4)}"
+        except (UpdateFailed, OSError, subprocess.SubprocessError) as e:
+            record.update(state="failed", ended=round(time.time(), 1), error=str(e)[-800:])
+            write_json(UPDATE_STATE, record)
+            show(record)
+            return 1
+        finally:
+            restore_queue()
+    record.update(state="done", ended=round(time.time(), 1), to=install_info(), restarted=restarted,
+                  installed="requirements" in record["steps"], note=note or None)
+    write_json(UPDATE_STATE, record)
+    show(record)
+    return 0
+
+
+def cmd_update(args) -> int:
+    """Bring this install to the newest RulzTrainer (the branch it was cloned from, app/rulz-trainer by default) and
+    restart the WebUI on it. --check only says what would change. Refuses while a run goes (--force), and when files
+    were changed here, by rulz_remote.py sync say (--discard replaces them with the newest release's)."""
+    last = update_state()
+    lock = hold_lock(UPDATE_LOCK)  # kept until this returns; the OS lets go when the process ends
+    if lock is None or (last and last.get("state") == "running"):
+        going = last and last.get("state") == "running"
+        since = f", started {max(0, round((time.time() - (last.get('started') or time.time())) / 60))} min ago" \
+            if going else ""  # minutes, not a clock time: this machine's time zone is not the reader's
+        raise Refused(f"An update (or its check) is already going here{since}: see {UPDATE_LOG}.")
+    plan = update_plan(args.branch)
+    # an update that failed or died after the code moved on: the code compares as current, the rest is redone
+    plan["unfinished"] = bool(last) and last.get("state") in ("failed", "interrupted")
+    if plan["unfinished"]:
+        plan["installs"] = True
+    if args.check:
+        show(plan)
+        return 0
+    if plan["job_running"] and not args.force:
+        raise Refused(f"{plan['job']} is running: an update changes the code under it. Wait for it to end, stop it, "
+                      "or --force.")
+    if plan["changed_count"] and not args.discard:
+        names = ", ".join(plan["changed"][:5]) + (", ..." if plan["changed_count"] > 5 else "")
+        raise Refused(f"{plan['changed_count']} file(s) changed here since the last update ({names}), by "
+                      "rulz_remote.py sync perhaps: --discard replaces them with the newest release's.")
+    if plan["up_to_date"] and not plan["changed_count"] and not args.reinstall and not plan["unfinished"]:
+        show(dict(plan, state="current", note=f"Already the newest RulzTrainer "
+                                              f"({plan['current'].get('version') or plan['current'].get('commit')})."))
+        return 0
+    return run_update(plan, args.reinstall)
+
+
+def portal_entry(text: str, config: str = "") -> tuple[int, str]:
+    """The Instance Portal's port and path for RulzTrainer: /etc/portal.yaml, else PORTAL_CONFIG
+    (host:external:internal:path:name entries split by |), else the template's 7870."""
+    try:
+        import yaml
+
+        apps = (yaml.safe_load(text or "") or {}).get("applications") or {}
+    except Exception:  # noqa: BLE001  (no yaml, or not the file expected: the other sources)
+        apps = {}
+    for key, app in apps.items() if isinstance(apps, dict) else ():
+        if isinstance(app, dict) and "rulztrainer" in f"{key} {app.get('name') or ''}".lower():
+            try:
+                return int(app.get("external_port")), str(app.get("open_path") or "/")
+            except (TypeError, ValueError):
+                break
+    for entry in (config or "").split("|"):
+        parts = entry.split(":")
+        if len(parts) >= 5 and "rulztrainer" in parts[4].lower() and parts[1].isdigit():
+            return int(parts[1]), parts[3] or "/"
+    return PORTAL_PORT, "/"
+
+
+def portal_scheme(port: int, env: dict) -> str:
+    """http or https: whether the portal's port answers a TLS handshake, else what ENABLE_HTTPS says."""
+    import socket
+    import ssl
+
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
+            with context.wrap_socket(sock, server_hostname="localhost"):
+                return "https"
+    except ssl.SSLError:
+        return "http"
+    except OSError:
+        pass
+    return "https" if str(env.get("ENABLE_HTTPS", "")).strip().lower() in ("1", "true", "yes") else "http"
+
+
+def cmd_webui(args) -> int:
+    """How this instance's WebUI is reached from outside: the Instance Portal's port for it, the port vast.ai maps
+    that to and the public address (when the container knows them), http or https, and the portal's token, which
+    signs a browser in when a link carries it as ?token=."""
+    env = container_env()
+    port, path = portal_entry(read_text(PORTAL_FILE), env.get("PORTAL_CONFIG", ""))
+    host_port = env.get(f"VAST_TCP_PORT_{port}", "")
+    show({"port": port, "path": path, "scheme": portal_scheme(port, env), "ip": env.get("PUBLIC_IPADDR") or None,
+          "host_port": int(host_port) if host_port.isdigit() else None, "token": env.get("OPEN_BUTTON_TOKEN") or None,
+          "webui_running": webui_running()})
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="rulz_agent", description="RulzTrainer's runs on this machine")
     sub = ap.add_subparsers(dest="command", required=True)
@@ -554,6 +933,13 @@ def parser() -> argparse.ArgumentParser:
     p = command("queue", cmd_queue)
     p.add_argument("action", nargs="?", choices=("show", "pause", "resume", "remove"), default="show")
     p.add_argument("id", nargs="?", help="remove: the waiting run's id")
+    p = command("update", cmd_update)
+    p.add_argument("--check", action="store_true", help="fetch and say what would change, change nothing")
+    p.add_argument("--branch", default="", help="default: the checkout's branch, else RULZ_BRANCH or app/rulz-trainer")
+    p.add_argument("--discard", action="store_true", help="replace files changed here (by rulz_remote.py sync)")
+    p.add_argument("--force", action="store_true", help="even while a run goes")
+    p.add_argument("--reinstall", action="store_true", help="run install.sh even when the requirements are the same")
+    command("webui", cmd_webui)
     return ap
 
 

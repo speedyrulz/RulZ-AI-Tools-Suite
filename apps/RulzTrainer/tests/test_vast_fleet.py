@@ -114,7 +114,12 @@ class FakeRemote:
         self.machine = machine
         self.conn = {"id": machine.id, "host": "h", "port": 1}
 
-    def agent(self, *args, config=None):
+    def run(self, shell, data=None, in_folder=True, retry=True):
+        down = self.machine.down or getattr(self.machine, "probe_fails", False)
+        return SimpleNamespace(returncode=255 if down else 0, stdout=b"", stderr=b"ssh: connect refused" if down else b"")
+
+    def agent(self, *args, config=None, retry=True):
+        self.retry = retry
         code, out, err = self.machine.answer(args, config)
         return SimpleNamespace(returncode=code, stdout=out if isinstance(out, bytes) else json.dumps(out).encode(),
                                stderr=err)
