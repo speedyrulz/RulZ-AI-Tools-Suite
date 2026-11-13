@@ -151,6 +151,11 @@ class RZLikenessReferences:
                               "run's scale."}),
             },
             "optional": {
+                "face_model": (["buffalo_l", "antelopev2"], {"default": "buffalo_l", "tooltip":
+                               "The trainer's face score model (face_model): buffalo_l (ArcFace R50, the default) or "
+                               "antelopev2 (ArcFace R100, about 360 MB, downloaded once). The two score on different "
+                               "scales: pick the run's own model when you load a run's scale (a run of the other "
+                               "model keeps the references' own face scale)."}),
                 "reference_images": ("IMAGE", {"tooltip": "Reference images for both scores."}),
                 "face_images": ("IMAGE", {"tooltip": "Face reference images."}),
                 "body_images": ("IMAGE", {"tooltip": "Body reference images."}),
@@ -169,7 +174,7 @@ class RZLikenessReferences:
 
     def build(self, reference_paths, face_paths, body_paths, body_score, body_backend, body_device, face_provider,
               face_det_size, sam3_model, gold_face="adaface", reference_images=None, face_images=None,
-              body_images=None):
+              body_images=None, face_model="buffalo_l"):
         with tempfile.TemporaryDirectory(prefix="rz_refs_", dir=_temp_root()) as tmp:
             labels = {}
 
@@ -187,7 +192,7 @@ class RZLikenessReferences:
             refs = core.build_references(face, body, face_provider=face_provider, det_size=face_det_size,
                                          body_kind=body_score, body_backend=body_backend, body_device=body_device,
                                          sam3_model=sam3_model, models_dir=str(REPO_DIR / "models"), labels=labels,
-                                         gold=gold_face)
+                                         gold=gold_face, face_model_name=face_model)
         if refs.face is None and refs.body is None:
             raise ValueError("No usable reference: no face and no body was found in any of them\n" + refs.describe())
         info = refs.describe()

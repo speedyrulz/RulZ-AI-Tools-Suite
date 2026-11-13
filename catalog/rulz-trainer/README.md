@@ -1017,7 +1017,21 @@ Monitor chart and the sample captions:
 - **Face**: the largest face in the sample is embedded with InsightFace (ArcFace, `buffalo_l`) and compared by
   cosine similarity to every reference face; the best match is reported as a percent (cosine x 100). For
   ArcFace, 50%+ generally means the same person; a typical reference's best match among the others is shown as
-  the realistic ceiling.
+  the realistic ceiling. Since 3.19.0 samples and likeness probes are left unscored (the log says why) when a second face is at
+  least 60% the size of the largest, which may then be the wrong person, or the largest face's shorter side is
+  under 48 pixels.
+- **Face model** (`face_model`): `buffalo_l` (the default, ArcFace R50 `w600k_r50`) or `antelopev2` (ArcFace R100
+  `glintr100`, about 360 MB, downloaded once). It changes the face score of the probes, samples, reward stage and
+  self-training; the dataset's face analysis, identity alignment and the identity loss stay on `buffalo_l`. On one
+  woman's 10 face references and the 1,000 face probes of 26 MOSS-Image runs (gaps in seed-noise units):
+
+  | Face model | Noise (one seed) | Her photos over the base model's faces | Rise with training (last 3 probes) |
+  |---|---|---|---|
+  | `buffalo_l` | 4.7 | 13.5 x noise | 11.5 x noise |
+  | `antelopev2` | 3.6 | 18.6 x noise | **15.7 x noise** |
+
+  The R100 showed training progress about 1.4x as clearly. Its numbers are on its own scale (her references' best
+  match 0.77 against 0.73), so compare runs within one face model.
 - **Body** (`body_score: appearance`, the default): the body from the neck to mid-thigh, turned upright, cut out
   from the background and without the head, embedded with DINOv2 and compared with the reference photos that show
   the same part of the body; the best match is reported as a percent (details under *Body score* below). Body
@@ -1035,8 +1049,8 @@ Monitor chart and the sample captions:
   are (20% deviation on a ratio ~ 61%). Silhouette features are only used when the skeleton confirms a full-body
   view, and samples without a usable pose get no body score. Body references should be full-body, upright,
   fairly neutral poses, and the same goes for the sample prompts you want body-scored.
-- **Body** (`body_score: skeleton3d` or `smplx`): proportions measured so that the pose does not change them, against
-  the references' own spread (details under *Body score* below).
+- **Body** (`body_score: skeleton3d`, `smplx` or `smplx_ratio`): proportions measured so that the pose does not
+  change them, against the references' own spread or median (details under *Body score* below).
 - **Combined**: `face_weight` x face + `body_weight` x body (defaults 0.7 / 0.3; whichever is available).
 
 Model downloads (the InsightFace pack, the MediaPipe pose model and SAM 3) happen on first use with a progress
@@ -1852,7 +1866,8 @@ and the window keeps the pose. It is tested on one character so far, so `appeara
 models (about 1.9 GB of downloads, SigLIP 2's file holding its unused text half too; about 0.4 GB on the
 GPU) run on `body_device`.
 
-`skeleton3d` and `smplx` measure proportions so that a bent leg is still the same leg (`bodyshape.py`):
+`skeleton3d`, `smplx` and `smplx_ratio` measure proportions so that a bent leg is still the same leg
+(`bodyshape.py`):
 
 - `skeleton3d`: bone-length ratios from MediaPipe's 3D landmarks (its own depth estimate): shoulder / hip width,
   torso / leg, thigh / shin, upper arm / forearm, arm / torso, shoulder width / torso, head / shoulder width. The
@@ -1867,8 +1882,11 @@ GPU) run on `body_device`.
   for you: put `nlf_l_multi_0.3.2.patch6.torchscript` (550 MB,
   [isarandi/nlf v0.3.2](https://github.com/isarandi/nlf/releases/tag/v0.3.2)) in `models/nlf/` or set `nlf_model`.
   About 0.35 s a picture on an RTX 4060 Ti; it waits on the CPU between probes and runs on `body_device`.
+- `smplx_ratio`: the same NLF fit, measured the way the ai-toolkit fork's identity eval does: nine measurements
+  over the neck-to-knee height (shoulder width; torso, thigh, upper arm and forearm length; chest, waist, hip and
+  thigh girth), compared with the references' median by log ratio (below). Same model, same requirements, same time.
 
-Both compare through a calibrated profile: per measurement the references' median and their own spread (a robust
+`skeleton3d` and `smplx` compare through a calibrated profile: per measurement the references' median and their own spread (a robust
 standard deviation, at least 3% of the median), so a measurement that varies a lot between the photos of the one
 person counts for little; the score is the mean of exp(-z^2 / 2) over the shared measurements, and the references'
 own level is each reference against the others. Clothing, skin and nudity do not count, unlike `appearance`.
@@ -1887,6 +1905,22 @@ level. SMPL-X separates them: her photos measure a fuller build than the base mo
 0.52 against 0.38, bust 0.64 against 0.53, waist / hip 0.82 against 0.68), training moved the probes toward it
 (the best run to 0.48, 0.61 and 0.76), and limb lengths matched everywhere (they carry no identity here). Five
 photos are a thin profile, most of them sitting or kneeling: a few standing full-length photos make it sturdier.
+
+`smplx_ratio` drops the spread: the score is exp(-3 x the mean |log(measurement / the references' median)|), as a
+percent (5% off on every measurement reads ~86), and the references' own level is again each against the others. On
+the same photos and the 998 body probes of 26 of those runs, with the rise and the gap counted in seed-noise units
+(how far one probe's seeds spread):
+
+| Body score | Photos measured | References' own level | Stranger (step 0) | Noise (one seed) | Her photos over the stranger | Rise with training (last 3 probes) |
+|---|---|---|---|---|---|---|
+| `smplx` | 5 | 68.4 | 31.7 | 4.5 | 10.8 x noise | 3.2 x noise |
+| `smplx_ratio` | 5 | 89.9 | 72.5 | 2.3 | 8.4 x noise | **4.9 x noise** |
+
+Both tell her photos from the base model's woman by a wide margin; `smplx_ratio` shows training progress about 1.5x
+as clearly, so its best checkpoint, early stop and race decisions rest on steadier differences. On the normalized
+scale her photos read ~64 on both; the late probes ~34 with `smplx_ratio` against ~16 with `smplx`. The same test
+ran the fork's own body models (SAM 3D Body and SMPLest-X) on these pictures: SAM 3D Body could not tell her photos
+from the base model's (3 of 19 photos measured), and SMPLest-X separated them less clearly than NLF did.
 
 **One scale for face and body** (`likeness_normalize`, on by default). Raw, the two scores are not comparable: the
 face score is an ArcFace cosine (a stranger scores ~10-25, your references against each other ~60-80), the proportion
@@ -1932,6 +1966,13 @@ Samples tab show only the normalized scores (the log and `likeness.jsonl` keep t
 `face`, `body`, `face_norm`, `body_norm`, `scale`); probe images carry their overall / face / body score underneath.
 In a race, the Monitor and the Samples tab put the same generation (step, prompt or probe kind, seed) of every
 configuration side by side (on the Monitor, under a heading per prompt or probe image). Earlier runs' `likeness.jsonl` keep their raw combined scores.
+
+**Past the references** (logged only). The normalized score stops at 100, so it cannot show a probe that matches the
+references better than they match each other, a sign it is copying them rather than learning the person. Each
+`likeness.jsonl` record keeps `face_over` / `body_over` (and `gold_over` with the gold face): the raw score's place
+from the step-0 floor (0) to the references' own level (1), unclipped and before the span's stretch (the body's
+over the renders that show one, before `likeness_framing` counts the lost ones). A probe above 1
+logs a "past the references' own level" line; it decides nothing (see also the [copy check](#copy-check-copy_check)).
 
 **Export spreadsheet** (Monitor, *Likeness probes & controller*, during or after a run) downloads `<job>_likeness.xlsx`,
 also written into the job folder: *Updated scores* has every probe's smoothed and per-probe face, body and combined

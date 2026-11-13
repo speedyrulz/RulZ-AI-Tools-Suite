@@ -447,10 +447,10 @@ class _Face:
             raise share
         return [] if share is None else [face(share)]
 
-    def score(self, path, step, index, gold=False):
+    def score(self, path, step, index, gold=False, qc=False):
         from types import SimpleNamespace
 
-        return SimpleNamespace(percent=60.0, gold_percent=None)
+        return SimpleNamespace(percent=60.0, gold_percent=None, skipped="")
 
 
 class _Body:

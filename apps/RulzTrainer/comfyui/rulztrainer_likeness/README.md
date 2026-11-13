@@ -39,6 +39,10 @@ Load `workflows/RulzTrainer Likeness Scoring.json` for a ready-made workflow.
   and turned upright) or `proportions` (body ratios from the pose skeleton, plus SAM 3 silhouette widths with
   `body_backend: mediapipe+sam3`; SAM 3 is gated on Hugging Face).
 - `face_provider`, `face_det_size`, `body_device`: as the trainer's settings of the same names.
+- `face_model` (optional, `buffalo_l`): the trainer's face score model, `buffalo_l` (ArcFace R50) or `antelopev2`
+  (ArcFace R100, about 360 MB, downloaded once). The two score on different scales: with a run's scale loaded, pick
+  the run's own model. A run of the other model (or of another `body_score`) keeps the references' own face (or
+  body) scale; runs from before 3.19.0 count as `buffalo_l`.
 - `gold_face` (`adaface`): the trainer's held-out gold face (`face_gold`). AdaFace ViT-Base (the trainer's default
   since 3.14.0) or FaceNet (VGGFace2, the one before), which nothing trains on, scores the same detected face against its own embeddings of the references. A run that trains against ArcFace
   (the reward stage, the identity loss on its arcface backend, identity alignment) can raise the ArcFace face score
@@ -66,7 +70,8 @@ Load `workflows/RulzTrainer Likeness Scoring.json` for a ready-made workflow.
   details and the spreadsheet.
 - Outputs:
   - `summary`: overall, face, gold face and body averages.
-  - `details`: one line per image.
+  - `details`: one line per image. A face is left unscored, as in the trainer's probes, when a second face is at
+    least 60% the size of the largest or the largest is under 48 pixels; the line and the spreadsheet say why.
   - `overall`, `face`, `body`, `gold_face` as numbers, -1 when there is no score.
   - `report`: for the export node.
 

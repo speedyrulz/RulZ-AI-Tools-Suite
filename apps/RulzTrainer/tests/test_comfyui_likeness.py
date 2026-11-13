@@ -48,7 +48,7 @@ class FakeFace:
         self.ref_self_similarity = 0.68 if len(paths) >= 2 else None
         return [{"image": str(p), "faces": 1} for p in paths]
 
-    def score(self, image, step=0, prompt_index=0, gold=False):
+    def score(self, image, step=0, prompt_index=0, gold=False, qc=False):
         v = FACE.get(Path(image).name)
         s = FaceScore(step, str(image), prompt_index, 0 if v is None else 1, None if v is None else v / 100,
                       v, self.refs[0][0] if v is not None else None)
@@ -314,3 +314,49 @@ def test_spreadsheet_has_the_gold_face(fakes, tmp_path):
     assert wb["Summary"]["E2"].value == pytest.approx(report["summary"]["gold"], abs=1e-3)
     labels = [r[0].value for r in wb["Summary"].iter_rows()]
     assert "Gold face scale (raw floor, ceiling)" in labels and "Face in the overall score" in labels
+
+
+def test_a_run_of_another_face_model_or_body_score_keeps_the_references_scale(fakes, tmp_path):
+    """A run's face scale is one InsightFace pack's raw numbers and its body scale one body score's: the nodes apply
+    them only to the same kind (the trainer records face_model / body_score since 3.19.0; older records count as
+    buffalo_l with the body score unknown)."""
+    build = nodes.RZLikenessReferences().build
+    refs, _ = build(str(fakes / "refs"), "", "", "appearance", "mediapipe+sam3", "cpu", "cpu", 640, "x")
+    assert refs.face_model == "buffalo_l"
+    job = tmp_path / "job"
+    job.mkdir()
+    (job / "likeness.jsonl").write_text(json.dumps({"step": 0, "scale": {"face": [13.8, 69.2], "body": [73.3, 81.3]},
+                                                    "face_model": "antelopev2", "body_score": "smplx_ratio"}))
+    run = core.job_scale(job)
+    assert run["face_model"] == "antelopev2" and run["body_score"] == "smplx_ratio"
+    s = core.build_scale(refs, job=run)
+    assert s.sources["face"]["floor"] == "default" and s.sources["body"]["floor"] == "default"
+    r100, _ = build(str(fakes / "refs"), "", "", "appearance", "mediapipe+sam3", "cpu", "cpu", 640, "x",
+                    face_model="antelopev2")
+    assert r100.face_model == "antelopev2"
+    s = core.build_scale(r100, job={**run, "body_score": "appearance"})
+    assert s.face == (13.8, 69.2) and s.body == (73.3, 81.3)  # the same face model and body score: the run's scale
+    (job / "likeness.jsonl").write_text(json.dumps({"step": 0, "scale": {"face": [13.8, 69.2], "body": [73.3, 81.3]}}))
+    old = core.job_scale(job)  # a run from before 3.19.0
+    assert old["face_model"] == "buffalo_l" and old["body_score"] == ""
+    assert core.build_scale(refs, job=old).sources["body"]["floor"] == "trainer run"
+
+
+def test_an_ambiguous_or_tiny_face_stays_unscored_as_in_the_probes(fakes, monkeypatch):
+    """The nodes score with the probes' subject check (FaceScorer.score qc): the reason shows in the details."""
+    refs, _ = nodes.RZLikenessReferences().build(str(fakes / "refs"), "", "", "appearance", "mediapipe+sam3", "cpu",
+                                                 "cpu", 640, "x")
+    asked, real = [], FakeFace.score
+
+    def score(self, image, step=0, prompt_index=0, gold=False, qc=False):
+        asked.append(qc)
+        if qc and Path(image).name == "b.png":
+            return FaceScore(step, str(image), prompt_index, 2, None, None, None, skipped="ambiguous: 2 faces")
+        return real(self, image, step, prompt_index, gold, qc)
+
+    monkeypatch.setattr(FakeFace, "score", score)
+    rows = core.score_rows(refs, [("a.png", fakes / "a.png"), ("b.png", fakes / "b.png")])
+    assert asked and all(asked)
+    assert rows[0]["face_raw"] == 60.0 and rows[1]["face_raw"] is None and rows[1]["face_skipped"] == "ambiguous: 2 faces"
+    text = core.details_text(core.apply_scale(rows, core.build_scale(refs)))
+    assert "face unscored (ambiguous: 2 faces)" in text

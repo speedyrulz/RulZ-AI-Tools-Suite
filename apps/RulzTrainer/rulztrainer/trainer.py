@@ -781,7 +781,8 @@ class Trainer(RaceParallelMixin):
         self.status.update(stage=text, stage_frac=frac)
 
     def _ensure_face_detector(self):
-        """A FaceScorer used as a detector (no references needed); shared with the likeness scorer."""
+        """A buffalo_l FaceScorer used as a detector (no references needed); the likeness scorer too, unless face_model
+        picks another pack."""
         if self.face_detector is not None:
             return self.face_detector
         from . import facesim
@@ -796,6 +797,13 @@ class Trainer(RaceParallelMixin):
         except Exception as e:  # noqa: BLE001
             log.warning("Could not initialise the face detector (%s); face-based features disabled", e)
         return self.face_detector
+
+    def _buffalo_detector(self):
+        """A buffalo_l FaceScorer for what must keep buffalo_l's embeddings (the faces.json analysis cache, the identity
+        loss's references): the likeness scorer itself, unless face_model picks another pack (None: unavailable)."""
+        if self.face_scorer is not None and getattr(self.face_scorer, "model_name", "buffalo_l") == "buffalo_l":
+            return self.face_scorer
+        return self._ensure_face_detector()
 
     def analyze_dataset(self, items):
         """Face analysis cache, crop augmentation and region weight maps. Returns the (possibly extended) items."""
@@ -1254,6 +1262,12 @@ class Trainer(RaceParallelMixin):
             self.controller = self._make_controller(items)
             self._resume_body_strangers(step)
         self.id_loss = self._make_id_loss()
+        if self.face_scorer is not None and self.face_detector is not None and self.face_detector is not self.face_scorer:
+            # face_model antelopev2: buffalo_l's detector served the dataset analysis, the curriculum and the identity
+            # loss's references. Not held for the whole run beside the R100 scorer (both on GPU 0 with face_provider
+            # cuda); _ensure_face_detector makes it again if self-training analyses new pictures
+            self.face_detector = None
+            gc.collect()
         self._park_vae()  # to RAM until the first sample or probe (kept on the GPU with the identity loss)
         if torch.cuda.is_available():
             from .multigpu import gpu_memory_summary
@@ -3607,12 +3621,13 @@ class Trainer(RaceParallelMixin):
 
         ctrl = LikenessController(cfg, **self._controller_ceilings())
         if cfg.likeness_curriculum:
-            if self.face_scorer is None:
+            detector = self._buffalo_detector() if self.face_scorer is not None else None
+            if detector is None:
                 log.warning("Curriculum needs face_refs (face detector); curriculum disabled")
             else:
                 self.status.update(stage="classifying dataset images (face area)")
                 self.item_face_frac = face_area_fractions(
-                    self.face_scorer, items, cfg.resolved_cache_dir() / "faces.json",
+                    detector, items, cfg.resolved_cache_dir() / "faces.json",
                     progress=lambda i, n: self.status.update(step=i, total=n), recache=cfg.recache)
                 nf, nb = classify_counts(self.item_face_frac)
                 log.info("Curriculum: %d face-heavy and %d body/other images in the dataset", nf, nb)
@@ -4629,7 +4644,9 @@ class Trainer(RaceParallelMixin):
         self.status.update(stage=f"scoring probes (step {step})")
         for job, p in zip(jobs, images):  # scoring stays in this thread: the scorers are not shared across threads
             if job.kind == "face":
-                sc = self.face_scorer.score(p, step, 0, gold=True) if gold else self.face_scorer.score(p, step, 0)
+                sc = self.face_scorer.score(p, step, 0, gold=gold, qc=True)
+                if sc.skipped:
+                    log.info("Probe step %d: %s face left unscored (%s)", step, Path(p).name, sc.skipped)
                 seeds["face"].append(sc.percent)
                 if gold:
                     seeds["gold"].append(sc.gold_percent)
@@ -4739,6 +4756,10 @@ class Trainer(RaceParallelMixin):
         copy_note = self._copy_probe(rec, [p for p in images if "_check-" not in Path(p).name])
         if rec.gold is not None or rec.gold_norm_ema is not None:
             rec.gold_name = self._gold_backend_name()
+        if self.face_scorer is not None:
+            rec.face_model = getattr(self.face_scorer, "model_name", "buffalo_l")
+        if self.body_scorer is not None:
+            rec.body_score = cfg.body_score
         append_record(self.job_dir, rec)
         fmt = lambda v: "n/a" if v is None else f"{v:.1f}%"  # noqa: E731
         who = f"[{self.race.active.name}] " if self._race_running() else ""
@@ -5132,9 +5153,13 @@ class Trainer(RaceParallelMixin):
             log.warning("%s; face scoring disabled", msg)
             return None
         try:
-            scorer = self.face_detector or facesim.FaceScorer(cfg.face_provider, cfg.face_det_size,
-                                                               progress=self._stage_progress)
-            self.face_detector = scorer
+            if cfg.face_model == "buffalo_l":  # shared with the dataset's face analysis
+                scorer = self.face_detector or facesim.FaceScorer(cfg.face_provider, cfg.face_det_size,
+                                                                   progress=self._stage_progress)
+                self.face_detector = scorer
+            else:  # its own pack: the analysis cache and identity alignment keep buffalo_l's embeddings
+                scorer = facesim.FaceScorer(cfg.face_provider, cfg.face_det_size, model_name=cfg.face_model,
+                                            progress=self._stage_progress)
             scorer.set_references(cfg.face_refs)
         except Exception as e:  # noqa: BLE001
             log.warning("Could not initialise face scoring (%s); disabled", e)
@@ -5213,8 +5238,10 @@ class Trainer(RaceParallelMixin):
         vae = self.arch.grad_vae(self._vae_on(dev))
         self.status.update(stage=f"loading the identity loss ({cfg.id_loss_backend})")
         try:
+            other_pack = getattr(self.face_scorer, "model_name", "buffalo_l") != "buffalo_l"  # face_model antelopev2
             loss = idloss.build(cfg, self.face_scorer, lambda z: self.arch.decode_latents_grad(vae, z), dev,
-                                progress=self._stage_progress)
+                                progress=self._stage_progress,
+                                detector=self._buffalo_detector() if other_pack else None)
         except Exception as e:  # noqa: BLE001
             log.warning("Could not initialise the identity loss (%s); disabled", e)
             return None
@@ -5252,11 +5279,12 @@ class Trainer(RaceParallelMixin):
                 from .bodyshape import Skeleton3DScorer
 
                 scorer = Skeleton3DScorer(cfg.models_dir, progress=self._stage_progress)
-            elif cfg.body_score == "smplx":
+            elif cfg.body_score in ("smplx", "smplx_ratio"):
                 from .bodyshape import SMPLXScorer
 
                 scorer = SMPLXScorer(cfg.nlf_model, cfg.models_dir, cfg.body_device,
-                                     progress=self._stage_progress)
+                                     progress=self._stage_progress,
+                                     measure="ratio" if cfg.body_score == "smplx_ratio" else "tpose")
             else:
                 sil = None
                 if cfg.body_backend == "mediapipe+sam3":
@@ -5278,8 +5306,8 @@ class Trainer(RaceParallelMixin):
             return None
         if not scorer.ready:
             log.warning("No usable %s in any body reference image; body scoring disabled",
-                        {"appearance": "person", "anchored": "person",
-                         "smplx": "body down to the knees"}.get(cfg.body_score, "pose"))
+                        {"appearance": "person", "anchored": "person", "smplx": "body down to the knees",
+                         "smplx_ratio": "body down to the knees"}.get(cfg.body_score, "pose"))
             return None
         if getattr(scorer, "needs_strangers", False) and (cfg.probe_every <= 0 or not cfg.probe_body_prompt):
             log.warning("The anchored body score takes its zero from the step-0 body probe (the base model's renders "
