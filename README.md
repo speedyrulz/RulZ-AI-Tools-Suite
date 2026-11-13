@@ -228,7 +228,11 @@ shows in the Instance Portal's log viewer. Then click *Open* on the instance: th
 to the internet unauthenticated), Jupyter (file browser + terminal for uploads and downloads) and the tunnel links.
 
 Datasets: on the WebUI's Dataset tab, *Create dataset*, open it and upload images and `.txt` captions from your own
-computer (drag and drop), or put them into `/workspace/RulzTrainer/datasets/<name>` with Jupyter / `scp` / Syncthing.
+computer or phone (drag and drop, or click to pick), or put them into `/workspace/RulzTrainer/datasets/<name>` with
+Jupyter / `scp` / Syncthing. Uploads go one file at a time in 8 MB pieces, so a dropped connection (a phone's screen
+turning off, a network switch) costs one piece, which is sent again after a pause, and the files already sent stay;
+the uploader shows each file and the megabytes sent, keeps a phone's screen on while it works (where the browser
+allows it, over https) and asks before you leave the page mid-upload.
 Results are written to
 `/workspace/RulzTrainer/output/<job>/`; download them from Jupyter before destroying the instance (the disk is gone
 with it; stopping keeps it). `models/` on the instance disk caches the downloaded base model between runs.
@@ -927,15 +931,21 @@ it has not been measured on the models here.
 `sample_before_training` renders a sample set at step 0 for comparison. The log reports each prompt and the
 Monitor page shows the sampling step.
 
-The Monitor shows one view at a time, under the run's numbers (status, stage, step, loss, learning rate, time left):
-**Overview** (per-GPU VRAM and load, disk and memory, the queue, a race's table, the likeness chart and the loss with
-its smoothing slider), **Images** (the probe images and the samples by step; a race's configurations side by side),
-**Details** (the samples' identity similarity, the gradient norm, the per-image loss watch and the region watch, each
-when the run has it) and **Log & files**. The view you used last opens again. A **run strip** under the tabs shows
-the state, job, step, progress and time left on every tab, and the browser tab's title carries the progress, so a
-background tab still tells you how far the run is. The chip at the top right shows the free space of the drive with
-your runs and models: amber under 15 GB, red under 5 GB, with a banner on the Monitor (a save that does not fit ends
-the run).
+The Monitor shows one view at a time, under the run's numbers (status, stage, step, loss, learning rate, time left)
+and the machine's per-GPU VRAM and load, disk and memory, which stay in sight on every view: **Overview** (the queue,
+a race's table, the likeness chart and the loss with its smoothing slider), **Images** (the probe images and the
+samples by step; a race's configurations side by side), **Details** (the samples' identity similarity, the gradient
+norm, the per-image loss watch and the region watch, each when the run has it) and **Log & files**. The view you used
+last opens again. A **run strip** under the tabs shows the state, job, step, progress and time left on every tab, and
+the browser tab's title carries the progress, so a background tab still tells you how far the run is. While a run is
+going, a second line in the strip tells a long step from a stuck one: how long the current stage has run, how far it
+is when the stage says (the face references, model downloads and the other loaders report it), the trainer's CPU use,
+how long since its status or log last changed, and the newest log line. Before the first step the strip's bar
+follows the stage (it moves when the stage gives no count) instead of sitting at 0%, and the Monitor's *Stage* tile
+says the same. With no status update and no log line for 10 minutes the line turns amber: compare the CPU and the
+GPU load to tell a slow step from a hung one. The chip at the top right shows the free space of the drive with your
+runs and models: amber under 15 GB, red under 5 GB, with a banner on the Monitor (a save that does not fit ends the
+run).
 
 *Log & files* has an auto-scrolling log and, under *Saved files*, the run's downloads: pick any LoRA in
 the job folder (the checkpoints, the best and the final file, newest first) and *Download* it, *All LoRAs (.zip)* packs

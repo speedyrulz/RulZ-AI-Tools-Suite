@@ -149,6 +149,7 @@ class FaceScorer:
         self.app = FaceAnalysis(name=model_name, providers=providers,
                                 allowed_modules=["detection", "recognition"])
         self.app.prepare(ctx_id=index if index is not None else -1, det_size=(det_size, det_size))
+        self.progress = progress  # (text, fraction): the reference loops below report through it too
         self.refs: list[tuple[str, np.ndarray]] = []
         self.ref_self_similarity: float | None = None
         self.ref_kps: list = []  # each reference face's landmarks (source pixels) and whether the frame cuts it off
@@ -232,6 +233,15 @@ class FaceScorer:
             return last[1]
         return self._remember(path, self.faces(path))
 
+    def _report(self, text: str, frac: float | None) -> None:
+        """Progress of a long loop to whoever built the scorer (the run's status line); never fails the loop."""
+        cb = getattr(self, "progress", None)
+        if cb is not None:
+            try:
+                cb(text, frac)
+            except Exception:  # noqa: BLE001
+                pass
+
     def set_references(self, paths: list[str | Path]) -> list[dict]:
         """Embed the largest face of each reference image. Returns per-image info for the UI."""
         from .likeness import reference_ceiling
@@ -240,7 +250,8 @@ class FaceScorer:
         info = []
         cut = []
         paths = expand_refs(paths)
-        for p in paths:
+        for i, p in enumerate(paths):
+            self._report(f"finding the faces in the face references ({i + 1} of {len(paths)})", i / len(paths))
             fs = self.faces(p)
             if not fs:
                 info.append({"image": str(p), "faces": 0})
@@ -285,9 +296,13 @@ class FaceScorer:
         from .likeness import reference_ceiling
 
         embs, usable = [], []
-        for (path, _), kps, off in zip(self.refs, self.ref_kps, self.ref_cut or [False] * len(self.refs)):
+        name = getattr(self.gold, "name", "") or "held-out"
+        for i, ((path, _), kps, off) in enumerate(zip(self.refs, self.ref_kps,
+                                                       self.ref_cut or [False] * len(self.refs))):
             if kps is None:
                 continue
+            self._report(f"embedding the face references with the {name} face scorer ({i + 1} of {len(self.refs)})",
+                         i / len(self.refs))
             embs.append(self._gold_embed(path, kps))
             usable.append(not off)
         self.gold_refs = np.stack(embs) if embs else None
