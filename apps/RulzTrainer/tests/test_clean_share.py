@@ -108,3 +108,20 @@ def test_lr_scale_and_fine_tune_rotations(caplog):
     with caplog.at_level(logging.INFO, logger="rulztrainer"):
         ft._clean_offset(cfg, 12, 4096, batcher, 2)
     assert "from rotation 2" in caplog.text
+
+
+def test_a_per_epoch_list_gives_each_epoch_its_share_and_holds_the_last():
+    """16.67,75,33.33,75,50,75 (Fizgig's MiniMax-H3-Image Likeness optimization): one share per epoch, the last held,
+    every epoch at the full learning rate; bad lists are refused."""
+    s = CS.parse(CS.H3_LIKENESS)
+    assert isinstance(s, CS.PerEpoch) and len(s) == 6
+    assert [CS.share_at(s, e) for e in range(1, 10)] == [16.67, 75, 33.33, 75, 50, 75, 75, 75, 75]
+    assert all(CS.lr_scale_at(s, e) == 1.0 for e in range(1, 10))
+    assert CS.parse("40, 60,") == (40.0, 60.0) and CS.share_at(CS.parse("40,60"), 0) == 40.0
+    for bad in ("40,abc", "40,0", "40,100"):
+        with pytest.raises(ValueError, match="clean_share"):
+            CS.parse(bad)
+    TrainConfig(clean_share=CS.H3_LIKENESS).validate()
+    cs = CS.CleanShare(TrainConfig(clean_share="30,60"))
+    assert cs.offset(0, 100, 4096) > cs.offset(100, 100, 4096) == cs.offset(900, 100, 4096)
+    assert cs.lr_scale(150, 100) == 1.0
