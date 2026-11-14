@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import gc
 import hashlib
-import importlib.util
 import sys
 import threading
 from pathlib import Path
@@ -18,6 +17,7 @@ import cv2
 import numpy as np
 
 from . import config, imageio
+from .ai_jpeg import package_installed
 
 REPO = "unsloth/sam3.1"
 REVISION = "cd3538905f98152ba184d2791fc5aa5d06e2ae45"
@@ -39,7 +39,7 @@ DOWNLOAD_SIZE = sum(size for _, size, _ in FILES)
 MASK_MAX_SIDE = 1008
 
 READY, NO_TORCH, NO_LIBS, NO_MODEL = "ready", "no_torch", "no_libs", "no_model"
-LIBS = ("transformers", "torchvision", "PIL")
+LIBS = {"transformers": "transformers", "torchvision": "torchvision", "PIL": "pillow"}  # module: pip package
 
 
 def file_url(name: str) -> str:
@@ -52,16 +52,12 @@ def model_dir() -> Path:
     return path
 
 
-def _installed(name: str) -> bool:
-    return importlib.util.find_spec(name) is not None
-
-
 def torch_installed() -> bool:
-    return _installed("torch")
+    return package_installed("torch")
 
 
 def libs_installed() -> bool:
-    return all(_installed(n) for n in LIBS)
+    return all(package_installed(module, dist) for module, dist in LIBS.items())
 
 
 def missing_files() -> list[tuple[str, int, str]]:
@@ -95,6 +91,7 @@ def verify_download(path: Path, size: int, sha256: str) -> bool:
 _model = None
 _lock = threading.Lock()
 _release_pending = False
+_releases = 0  # how many times release() was called (see warm_up_task)
 
 
 def _load():
@@ -140,7 +137,8 @@ def _drop() -> None:
 def release() -> None:
     """Unload SAM to free its (GPU) memory; the next use loads it again. Never waits: while a picture is
     being searched, the model is dropped as soon as that finishes."""
-    global _release_pending
+    global _release_pending, _releases
+    _releases += 1
     if not _lock.acquire(blocking=False):
         _release_pending = True
         return
@@ -183,23 +181,35 @@ def find(img: np.ndarray, prompt: str, confidence: float = 0.5, mask_threshold: 
     score is at least `confidence` (only the highest-scoring one with best_only), and the scores kept.
     An empty mask (and no scores) means nothing was found.
     """
-    import torch
-
     small = imageio.to_8bit(imageio.shrink(img, MASK_MAX_SIDE))
     if small.ndim == 2 or small.shape[2] == 1:
         rgb = cv2.cvtColor(small, cv2.COLOR_GRAY2RGB)
     else:
         rgb = cv2.cvtColor(small[:, :, :3], cv2.COLOR_BGR2RGB)
-    with _lock, torch.inference_mode():
+    # PyTorch is imported with the lock held: its first import takes seconds, and a release() then (Auto crop
+    # closed straight after opening) found nothing to drop while the warm-up went on to load SAM and kept it.
+    with _lock:
         try:
-            return _run(rgb, prompt, confidence, mask_threshold, best_only)
+            import torch
+
+            with torch.inference_mode():
+                return _run(rgb, prompt, confidence, mask_threshold, best_only)
         finally:
             if _release_pending:
                 _drop()
 
 
-def warm_up() -> None:
+def warm_up_task():
+    """warm_up() to hand to a thread pool now. It does nothing if release() comes before it starts (Auto crop
+    closed again straight away), so it can't load SAM after the screen let it go."""
+    released = _releases
+    return lambda: warm_up(released)
+
+
+def warm_up(released: int | None = None) -> None:
     """Load the model and run a tiny image, so the first preview doesn't pay the start-up cost."""
+    if released is not None and released != _releases:
+        return
     try:
         find(np.zeros((64, 64, 3), np.uint8), "object")
     except Exception:  # noqa: BLE001 - the real call reports problems

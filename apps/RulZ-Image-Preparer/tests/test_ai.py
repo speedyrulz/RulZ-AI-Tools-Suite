@@ -24,6 +24,56 @@ class _BlockingNet:
         return t
 
 
+class InstalledTests(unittest.TestCase):
+    def test_a_package_counts_only_when_pip_finished_it(self):
+        self.assertTrue(ai_jpeg.package_installed("numpy"))
+        # importable but with no pip metadata, like a PyTorch whose setup was cancelled halfway
+        self.assertFalse(ai_jpeg.package_installed("json"))
+        self.assertFalse(ai_jpeg.package_installed("no_such_module_here"))
+
+    def test_a_half_written_dist_info_does_not_count(self):
+        import importlib
+        import sys
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "halfpkg").mkdir()
+            (Path(d) / "halfpkg" / "__init__.py").write_text("")
+            info = Path(d) / "halfpkg-1.0.dist-info"
+            info.mkdir()
+            (info / "LICENSE").write_text("")  # pip stopped before METADATA
+            sys.path.insert(0, d)
+            try:
+                importlib.invalidate_caches()
+                self.assertFalse(ai_jpeg.package_installed("halfpkg"))
+                (info / "METADATA").write_text("Metadata-Version: 2.1\nName: halfpkg\nVersion: 1.0\n")
+                importlib.invalidate_caches()
+                self.assertTrue(ai_jpeg.package_installed("halfpkg"))
+            finally:
+                sys.path.remove(d)
+                importlib.invalidate_caches()
+
+
+class WarmUpTests(unittest.TestCase):
+    def test_a_warm_up_released_before_it_starts_does_nothing(self):
+        """Auto crop closed (or Best quality switched off) before the queued warm-up ran: it mustn't load the
+        model afterwards and keep it."""
+        for mod, name in ((ai_jpeg, "remove_artifacts"), (ai_mask, "find")):
+            calls = []
+            saved = getattr(mod, name)
+            setattr(mod, name, lambda *a, **k: calls.append(a))
+            try:
+                task = mod.warm_up_task()
+                mod.release()
+                task()
+                self.assertEqual(calls, [], mod.__name__)
+                mod.warm_up_task()()  # nothing released since it was queued: it runs
+                self.assertEqual(len(calls), 1, mod.__name__)
+            finally:
+                setattr(mod, name, saved)
+
+
 @unittest.skipUnless(HAVE_TORCH, "needs PyTorch")
 class JpegReleaseTests(unittest.TestCase):
     def setUp(self):
