@@ -52,8 +52,23 @@ function rehypeReadme(doc: ReadmeDoc) {
   }
 }
 
-/** Memoized: parsing a long README is slow, and the app page re-renders with every install progress update. */
-export const Readme = memo(function Readme({ appId }: { appId: string }) {
+/** A section heading of the README, for the page's "On this page" list. */
+export interface ReadmeHeading {
+  id: string
+  text: string
+}
+
+/**
+ * Memoized: parsing a long README is slow, and the app page re-renders with every install progress update.
+ * `onHeadings` gets the README's sections (its h2 headings) once it is on screen; pass a stable function.
+ */
+export const Readme = memo(function Readme({
+  appId,
+  onHeadings
+}: {
+  appId: string
+  onHeadings?: (headings: ReadmeHeading[]) => void
+}) {
   const [doc, setDoc] = useState<ReadmeDoc | null>(null)
   const [error, setError] = useState<string | null>(null)
   const root = useRef<HTMLDivElement>(null)
@@ -73,6 +88,13 @@ export const Readme = memo(function Readme({ appId }: { appId: string }) {
 
   const markdown = useMemo(() => (doc ? prepareReadme(doc.markdown) : ''), [doc])
   const rehypePlugins = useMemo(() => (doc ? [rehypeRaw, [rehypeSanitize, schema], rehypeReadme(doc)] : []), [doc])
+
+  // After the README is in the page: the ids are the ones rehypeReadme gave the headings.
+  useEffect(() => {
+    if (!onHeadings || !doc) return
+    const found = [...(root.current?.querySelectorAll('.md h2[id]') ?? [])]
+    onHeadings(found.map((h) => ({ id: h.id, text: h.textContent?.trim() ?? '' })).filter((h) => h.id && h.text))
+  }, [doc, onHeadings])
 
   if (error) return <p className="text-sm text-danger">Couldn't load the README: {error}</p>
   if (!doc)

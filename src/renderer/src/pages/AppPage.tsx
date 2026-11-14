@@ -1,7 +1,10 @@
 import {
   AlertCircle,
   ArrowLeft,
+  ArrowUp,
   BookOpen,
+  ChevronLeft,
+  ChevronRight,
   ExternalLink,
   FileText,
   FolderOpen,
@@ -14,7 +17,7 @@ import {
   Wrench,
   X
 } from 'lucide-react'
-import { useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { githubUrl } from '@shared/catalog'
 import { refFor, requirementRefLabel } from '@shared/requirements'
 import type { AppView } from '@shared/types'
@@ -23,11 +26,11 @@ import { StatusBadge } from '../components/AppCard'
 import { Gallery } from '../components/Gallery'
 import { LogDialog } from '../components/LogDialog'
 import { PhoneAppQr } from '../components/PhoneAppQr'
-import { Readme } from '../components/Readme'
+import { Readme, type ReadmeHeading } from '../components/Readme'
 import { RequirementList } from '../components/Requirements'
-import { Badge, Button, Dialog, Menu, MenuContent, MenuItem, MenuSeparator, MenuTrigger, Switch } from '../components/ui'
+import { Badge, Button, Dialog, IconButton, Menu, MenuContent, MenuItem, MenuSeparator, MenuTrigger, Switch } from '../components/ui'
 import { invoke } from '../lib/api'
-import { formatBytes, formatDate, formatVersion } from '../lib/format'
+import { cn, formatBytes, formatDate, formatVersion } from '../lib/format'
 import { act, isActive, useApps } from '../stores/apps'
 
 /** The app's launch switches (catalog launch.options), saved in the launcher's settings. */
@@ -72,7 +75,34 @@ function LaunchOptions({ view }: { view: AppView }) {
   )
 }
 
-export function AppPage({ view, onBack, onInstall }: { view: AppView; onBack: () => void; onInstall: () => void }) {
+/** Another app's page, one step away (the Previous / Next buttons). */
+interface Neighbor {
+  name: string
+  go: () => void
+}
+
+/** How far below the window's top a README heading counts as the section being read (the two bars, and a little more). */
+const READING_LINE = 150
+
+/** A README with fewer sections than this gets no "On this page" list. */
+const MIN_SECTIONS = 3
+
+export function AppPage({
+  view,
+  onBack,
+  onInstall,
+  previous,
+  next,
+  focusArrow
+}: {
+  view: AppView
+  onBack: () => void
+  onInstall: () => void
+  previous: Neighbor | null
+  next: Neighbor | null
+  /** The arrow that led here, which gets the keyboard focus (each app's page is a new one, so it would be lost). */
+  focusArrow: 'previous' | 'next' | null
+}) {
   const { app, installed } = view
   const job = useJob(view)
   const dismissJob = useApps((s) => s.dismissJob)
@@ -82,17 +112,128 @@ export function AppPage({ view, onBack, onInstall }: { view: AppView; onBack: ()
   const lastLine = useApps((s) => s.logs[app.id]?.at(-1) ?? '')
   const busy = isActive(job)
 
-  return (
-    <div className="mx-auto max-w-[1280px] px-8 pt-5 pb-16">
-      <button
-        onClick={onBack}
-        className="mb-5 inline-flex cursor-pointer items-center gap-1.5 text-[13px] text-muted transition-colors hover:text-text"
-      >
-        <ArrowLeft className="size-4" /> All apps
-      </button>
+  const header = useRef<HTMLElement>(null)
+  const readme = useRef<HTMLDivElement>(null)
+  const sections = useRef<HTMLElement>(null)
+  const previousArrow = useRef<HTMLButtonElement>(null)
+  const nextArrow = useRef<HTMLButtonElement>(null)
+  /** The header has scrolled out of view: the bar at the top shows the app's name and buttons instead. */
+  const [pinned, setPinned] = useState(false)
+  const [headings, setHeadings] = useState<ReadmeHeading[]>([])
+  const [reading, setReading] = useState<string | null>(null)
 
+  useEffect(() => {
+    const el = header.current
+    if (!el) return
+    // 96px: the window's top bar and this page's bar, which cover the header before it leaves the window.
+    // The newest entry counts: a fast jump can queue two crossings before this runs.
+    const seen = new IntersectionObserver((entries) => setPinned(!entries[entries.length - 1].isIntersecting), {
+      rootMargin: '-96px 0px 0px 0px'
+    })
+    seen.observe(el)
+    return () => seen.disconnect()
+  }, [])
+
+  useEffect(() => {
+    const el = focusArrow === 'previous' ? previousArrow.current : focusArrow === 'next' ? nextArrow.current : null
+    el?.focus({ preventScroll: true })
+    // Only when the page opens: the arrows stay put after that.
+  }, [])
+
+  // Marks the README section being read in the "On this page" list.
+  useEffect(() => {
+    setReading(null)
+    const scroller = header.current?.closest('[data-scroller]')
+    if (!scroller || headings.length < MIN_SECTIONS) return
+    const els = [...(readme.current?.querySelectorAll<HTMLElement>('.md h2[id]') ?? [])]
+    let frame = 0
+    const update = (): void => {
+      frame = 0
+      let id: string | null = null
+      for (const h of els) {
+        if (h.getBoundingClientRect().top > READING_LINE) break
+        id = h.id
+      }
+      // At the very bottom the last sections can't reach the line any more: the last one is the one in view.
+      if (els.length && scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2) id = els[els.length - 1].id
+      setReading(id)
+    }
+    const onScroll = (): void => {
+      if (!frame) frame = requestAnimationFrame(update)
+    }
+    scroller.addEventListener('scroll', onScroll, { passive: true })
+    update()
+    return () => {
+      scroller.removeEventListener('scroll', onScroll)
+      if (frame) cancelAnimationFrame(frame)
+    }
+  }, [headings])
+
+  // Keeps the marked section in sight in a list longer than its box, without moving the page itself.
+  useEffect(() => {
+    const list = sections.current
+    const mark = list?.querySelector<HTMLElement>('[aria-current]')
+    if (!list || !mark) return
+    // The list is the entries' offset parent (it is positioned), so offsetTop is measured from its top.
+    const top = mark.offsetTop
+    if (top < list.scrollTop) list.scrollTop = top
+    else if (top + mark.offsetHeight > list.scrollTop + list.clientHeight) list.scrollTop = top + mark.offsetHeight - list.clientHeight
+  }, [reading])
+
+  const toTop = (): void => header.current?.closest('[data-scroller]')?.scrollTo({ top: 0, behavior: 'smooth' })
+  const toSection = (id: string): void =>
+    readme.current?.querySelector(`.md [id="${CSS.escape(id)}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+
+  return (
+    <>
+      {/* Stays at the top while the page scrolls: the way back, and the app's buttons once its header is out of view. */}
+      <div
+        className={cn(
+          'sticky top-0 z-20 border-b bg-bg/90 backdrop-blur transition-colors',
+          pinned ? 'border-border' : 'border-transparent'
+        )}
+      >
+        <div className="mx-auto flex h-12 max-w-[1280px] items-center gap-3 px-8">
+          <button
+            onClick={onBack}
+            title="Back to all apps (Esc)"
+            className="inline-flex shrink-0 cursor-pointer items-center gap-1.5 text-[13px] text-muted transition-colors hover:text-text"
+          >
+            <ArrowLeft className="size-4" /> All apps
+          </button>
+          {pinned && (
+            <button
+              onClick={toTop}
+              title="Back to the top of the page"
+              className="flex min-w-0 cursor-pointer items-center gap-2.5 border-l border-border pl-3"
+            >
+              <img src={view.icon} alt="" draggable={false} className="size-7 shrink-0 rounded-md border border-border bg-panel-2" />
+              <span className="truncate font-[family-name:var(--font-display)] text-[14px] font-semibold">{app.name}</span>
+              <StatusBadge view={view} />
+            </button>
+          )}
+          <div className="flex-1" />
+          {pinned && (
+            <div className={cn('flex shrink-0 justify-end', busy && 'w-[280px]')}>
+              <AppActions view={view} onInstall={onInstall} compact />
+            </div>
+          )}
+          {previous && next && (
+            <div className="flex shrink-0 items-center">
+              <IconButton ref={previousArrow} label={`Previous app: ${previous.name}`} className="size-8" onClick={previous.go}>
+                <ChevronLeft className="size-4" />
+              </IconButton>
+              <IconButton ref={nextArrow} label={`Next app: ${next.name}`} className="size-8" onClick={next.go}>
+                <ChevronRight className="size-4" />
+              </IconButton>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="mx-auto max-w-[1280px] px-8 pt-1 pb-16">
       {/* Header */}
-      <header className="relative overflow-hidden rounded-2xl border border-border">
+      <header ref={header} className="relative overflow-hidden rounded-2xl border border-border">
         <div className="hero absolute inset-0" />
         <div className="hero-slashes absolute inset-0" />
         <div className="relative flex flex-wrap items-center gap-6 px-7 py-6">
@@ -202,29 +343,26 @@ export function AppPage({ view, onBack, onInstall }: { view: AppView; onBack: ()
       </header>
 
       {/* Body */}
-      <div className="mt-8 grid grid-cols-1 gap-8 lg:grid-cols-[minmax(0,1fr)_320px]">
+      <div className="mt-7 grid grid-cols-[minmax(0,1fr)_300px] gap-8">
         <main className="min-w-0">
-          <p className="mb-6 text-[15px] leading-relaxed text-body">{app.description}</p>
+          <p className="max-w-[860px] text-[15px] leading-relaxed text-body">{app.description}</p>
+          <ul className="mt-4 mb-6 flex flex-wrap gap-1.5" aria-label="Highlights">
+            {app.highlights.map((h) => (
+              <li key={h}>
+                <Badge className="h-7 bg-panel-2 px-3 text-[12.5px] text-text">{h}</Badge>
+              </li>
+            ))}
+          </ul>
           <Gallery images={view.screenshots} name={app.name} />
           <h2 className="mt-10 mb-4 flex items-center gap-2 font-[family-name:var(--font-display)] text-xs font-semibold tracking-[0.16em] text-faint uppercase">
             <span className="h-3 w-1 -skew-x-[20deg] bg-accent" /> Read me
           </h2>
-          <div className="rounded-xl border border-border bg-panel px-7 py-6">
-            <Readme appId={app.id} />
+          <div ref={readme} className="rounded-xl border border-border bg-panel px-7 py-6">
+            <Readme appId={app.id} onHeadings={setHeadings} />
           </div>
         </main>
 
         <aside className="space-y-4">
-          <SideCard title="Highlights">
-            <div className="flex flex-wrap gap-1.5">
-              {app.highlights.map((h) => (
-                <Badge key={h} className="bg-panel-2">
-                  {h}
-                </Badge>
-              ))}
-            </div>
-          </SideCard>
-
           <SideCard title="Details">
             <dl className="space-y-2.5 text-[13px]">
               {installed && (
@@ -273,19 +411,6 @@ export function AppPage({ view, onBack, onInstall }: { view: AppView; onBack: ()
             </dl>
           </SideCard>
 
-          {app.id === 'coding-agent' && (
-            <SideCard title="Phone app">
-              <PhoneAppQr variant="card" />
-            </SideCard>
-          )}
-
-          {installed && (
-            <SideCard title="Shortcuts">
-              <ShortcutRow view={view} where="desktop" label="Desktop" busy={busy} />
-              <ShortcutRow view={view} where="startMenu" label="Start Menu" busy={busy} />
-            </SideCard>
-          )}
-
           {app.requirements.length > 0 && (
             <SideCard title="Requirements">
               <RequirementList refs={app.requirements} />
@@ -301,6 +426,46 @@ export function AppPage({ view, onBack, onInstall }: { view: AppView; onBack: ()
                 </p>
               ))}
             </SideCard>
+          )}
+
+          {installed && (
+            <SideCard title="Shortcuts">
+              <ShortcutRow view={view} where="desktop" label="Desktop" busy={busy} />
+              <ShortcutRow view={view} where="startMenu" label="Start Menu" busy={busy} />
+            </SideCard>
+          )}
+
+          {app.id === 'coding-agent' && (
+            <SideCard title="Phone app">
+              <PhoneAppQr variant="card" />
+            </SideCard>
+          )}
+
+          {headings.length >= MIN_SECTIONS && (
+            <section className="sticky top-16 flex max-h-[calc(100vh-136px)] flex-col rounded-xl border border-border bg-panel py-3.5">
+              <div className="mb-2 flex items-center justify-between px-4">
+                <h3 className="text-[11px] font-semibold tracking-[0.14em] text-faint uppercase">On this page</h3>
+                <button onClick={toTop} className="inline-flex cursor-pointer items-center gap-1 text-xs text-link hover:underline">
+                  <ArrowUp className="size-3" /> Top
+                </button>
+              </div>
+              <nav ref={sections} className="relative min-h-0 overflow-y-auto px-2" aria-label="README sections">
+                {headings.map((h) => (
+                  <button
+                    key={h.id}
+                    onClick={() => toSection(h.id)}
+                    aria-current={reading === h.id ? 'location' : undefined}
+                    className={cn(
+                      'block w-full cursor-pointer truncate rounded-md border-l-2 px-2 py-1 text-left text-[13px] transition-colors hover:bg-hover hover:text-text',
+                      reading === h.id ? 'border-accent text-text' : 'border-transparent text-muted'
+                    )}
+                    title={h.text}
+                  >
+                    {h.text}
+                  </button>
+                ))}
+              </nav>
+            </section>
           )}
         </aside>
       </div>
@@ -347,7 +512,8 @@ export function AppPage({ view, onBack, onInstall }: { view: AppView; onBack: ()
           )}
         </Dialog>
       )}
-    </div>
+      </div>
+    </>
   )
 }
 

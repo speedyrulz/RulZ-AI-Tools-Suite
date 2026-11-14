@@ -23,6 +23,21 @@
    "check": "document.body.innerText.slice(0, 400).split(String.fromCharCode(10)).join(' | ')"
   },
   {
+   "name": "list",
+   "js": "document.querySelector('button[aria-label=\"List view\"]').click(), 'ok'",
+   "waitMs": 800
+  },
+  {
+   "name": "home-list.png",
+   "waitMs": 400,
+   "check": "document.querySelector('[data-scroller]').scrollHeight + ' px tall'"
+  },
+  {
+   "name": "cards",
+   "js": "document.querySelector('button[aria-label=\"Cards view\"]').click(), 'ok'",
+   "waitMs": 800
+  },
+  {
    "name": "open",
    "js": "(() => { const el = [...document.querySelectorAll('h3, h2, div, span')].filter(e => e.children.length === 0 && e.textContent.trim() === 'Rulz Training Captioner')[0]; if (!el) return 'none'; el.click(); return 'ok' })()",
    "waitMs": 3500
@@ -56,7 +71,7 @@
   },
   {
    "name": "home-light.png",
-   "js": "window.scrollTo(0, 0), 'top'",
+   "js": "document.querySelector('[data-scroller]').scrollTo(0, 0), 'top'",
    "waitMs": 800
   },
   {

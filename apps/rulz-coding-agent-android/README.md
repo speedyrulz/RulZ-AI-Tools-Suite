@@ -16,9 +16,9 @@ and [Phone Access](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/wiki/Coding
 2. On the computer, update RulZ Coding Agent to **0.6.0** or later, open **Settings** and, under **Phone access**,
    turn on **Let my phone connect**. The first time, Windows may ask whether RulZ Coding Agent may use your networks:
    allow it.
-3. Install this app on the phone: scan the QR code on the **RulZ AI Tools Suite** launcher's home page (or the
-   RulZ Coding Agent page there) with the phone's camera, download the APK and open it (allow installing from that
-   source). The QR code always points at the newest release; the APKs are also on the suite's
+3. Install this app on the phone: on the **RulZ AI Tools Suite** launcher's home page press **Coding Agent for
+   Android** (or open the RulZ Coding Agent page there), scan the QR code with the phone's camera, download the APK
+   and open it (allow installing from that source). The QR code always points at the newest release; the APKs are also on the suite's
    [Releases](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/releases) page, tagged `coding-agent-android-v<version>`.
    Or build it yourself, see *Building* below.
 4. Scan the QR code from the computer's Settings with the phone's camera and tap the link, or tap **Add computer**, then

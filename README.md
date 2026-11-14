@@ -11,31 +11,41 @@ click, keep it updated, and launch it, all from a single black-and-red window (o
 | --- | --- |
 | ![The launcher's home page in dark mode](docs/screenshots/home-dark.png) | ![The launcher's home page in light mode](docs/screenshots/home-light.png) |
 
-![An app's page: screenshot gallery, details, requirements and its README](docs/screenshots/app-page.png)
+![The home page as a compact list, one row per app](docs/screenshots/home-list.png)
+
+![An app's page: highlights, screenshot gallery, details, requirements and its README](docs/screenshots/app-page.png)
 
 ![Installing an app: folder, shortcuts, optional components and prerequisites](docs/screenshots/install-dialog.png)
 
 | App | What it does | How it installs |
 | --- | --- | --- |
-| [RulzTrainer](apps/RulzTrainer) | LoRA trainer for ten image models (MOSS-Image, FIBO 2.0, Krea 2, Qwen-Image 2.1, MiniMax-H3-Image and more) and the PAN 2 video model, with a guided WebUI | From source, then its `install.bat` (venv + CUDA PyTorch) |
+| [RulzTrainer](apps/RulzTrainer) | LoRA trainer for nine image models (MOSS-Image, FIBO 2.0, Krea 2, Qwen-Image 2.1, MiniMax-H3-Image and more) and two video models (MiniMax H3, PAN 2), with a guided WebUI | From source, then its `install.bat` (venv + CUDA PyTorch) |
 | [RulZ Image Organizer](apps/RulZ-Image-Organizer) | Offline face grouping and search for your photo library | Portable release zip |
 | [RulZ Image Tournament](apps/RulZ-Image-Tournament) | Finds your favorite image, two at a time | Portable release zip (a single .exe) |
 | [RulZ LLM Suite](apps/rulz-llm-suite) | Local LLMs with llama.cpp: models, chat, MCP tools, API server, reverse engineering | Its setup program, run silently |
 | [RulZ Coding Agent](apps/rulz-coding-agent) | Describe an app in plain English and a local model builds it (works with the LLM Suite) | Its setup program, run silently |
-| [RulZ Coding Agent for Android](apps/rulz-coding-agent-android) | Watch and control RulZ Coding Agent from an Android phone, over Tailscale | Not by the launcher: scan the QR code on its home page (or the Coding Agent page) with the phone to download the newest APK |
+| [RulZ Coding Agent for Android](apps/rulz-coding-agent-android) | Watch and control RulZ Coding Agent from an Android phone, over Tailscale | Not by the launcher: press **Coding Agent for Android** on its home page (or open the Coding Agent page) and scan the QR code with the phone to download the newest APK |
 | [Rulz Training Captioner](apps/Rulz-Training-Captioner) | Captions image datasets with a local vision LLM | From source (venv), plus an optional llama.cpp CUDA build |
 | [RulZ Simple Video Clip Extractor](apps/rulz-simple-video-clip-extractor) | Frame-accurate clips with lossless cuts, NVENC export and distortion repair | Portable release zip |
 | [RulZ Image Crawler](apps/rulz-image-crawler) | Crawls a website or folder and keeps the images that match your description (local vision model) | From source (venv + Chromium), plus the model download and an optional llama.cpp CUDA build |
-| [RulZ Image Preparer](apps/RulZ-Image-Preparer) | Cleans up image datasets for training: color noise, JPEG artifacts (fast filter or GPU AI model) and detail recovery, globally or per image; Auto crop crops pictures to something you describe, found with SAM 3.1 | From source (venv); the AI features' PyTorch and models are set up from the app on first use |
+| [RulZ Image Preparer](apps/RulZ-Image-Preparer) | Cleans up image datasets for training: color noise, JPEG artifacts (fast filter or GPU AI model), detail recovery and shadow lift, globally or per image; Auto crop crops pictures to something you describe, found with SAM 3.1 | From source (venv); the AI features' PyTorch and models are set up from the app on first use |
 | [RulZ Image Grid](apps/RulZ-Image-Grid) | Arranges images into a labelled grid (file names, row and column labels) and exports it as one PNG or JPG | Portable release zip (a single .exe) |
 | [RulZ Huggingface Manager](apps/RulZ-Huggingface-Manager) | Manages your Hugging Face models, datasets, spaces and buckets: browse, upload, download, move, copy and rename files from one page, and send models straight to a vast.ai instance | From source (venv) |
 
 ## Using the launcher
 
-- **Home** shows a card per app with its screenshot, description and status (installed, update available,
-  running). Filter by category or search.
-- **Click an app** for its page: a screenshot gallery (click for full size, arrow keys to browse), the full README,
-  version details, requirements and shortcuts.
+- **Home** lists the apps: the ones you have installed first, then the others by category. Each card shows a
+  screenshot, a one-line description, the version and the status (installed, update available, running). The chips
+  above the list filter it by category, **Installed** or **Updates**, each with its count. The two buttons at the
+  right switch between cards and a compact list with one row per app. The list stays where you left it (filter and
+  scroll position) when you come back from an app's page.
+- **Search** (the box in the top bar, or Ctrl+K) finds apps by the words in their name, description, category or
+  highlights; every word you type has to match.
+- **Click an app** for its page: its highlights, a screenshot gallery (click for full size, arrow keys to browse),
+  the full README with an **On this page** list of its sections, version details, requirements and shortcuts. A bar
+  at the top stays in view while you scroll: it has the way back (also Esc, Alt+Left or the mouse's Back button),
+  the app's Launch, Update or Install button, and arrows to the previous and next app.
+- **Coding Agent for Android** on the home page shows the QR code that downloads the phone app.
 - **Install** asks where to put the app (default `%LOCALAPPDATA%\Programs\RulZ AI Tools\<app>`), whether to add
   **Desktop** and **Start Menu** shortcuts (the Start Menu ones go in a *RulZ AI Tools Suite* folder), and any
   optional parts. Progress, download speed and the setup log show on the page.

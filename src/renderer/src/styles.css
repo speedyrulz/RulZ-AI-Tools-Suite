@@ -11,7 +11,8 @@
   --border-strong: #34343b;
   --text: #f2f2f3;
   --muted: #a3a3ab;
-  --faint: #6c6c75;
+  /* Small labels: 4.5:1 or better on both panel colors (it was 3.8:1). */
+  --faint: #82828c;
   --accent: #ed000d;
   --accent-hover: #ff2633;
   --accent-soft: rgb(237 0 13 / 0.13);
@@ -52,7 +53,7 @@
   --border-strong: #c4c4cb;
   --text: #111114;
   --muted: #5f6068;
-  --faint: #8a8b93;
+  --faint: #68696f;
   --accent-hover: #c8000b;
   --accent-soft: rgb(237 0 13 / 0.08);
   --danger: #d4161c;
@@ -230,7 +231,8 @@ body {
   font-family: var(--font-display);
   font-weight: 650;
   line-height: 1.3;
-  scroll-margin-top: 16px;
+  /* Clear of the app page's bar, which stays at the top while scrolling. */
+  scroll-margin-top: 76px;
 }
 .md h1 {
   font-size: 1.6em;

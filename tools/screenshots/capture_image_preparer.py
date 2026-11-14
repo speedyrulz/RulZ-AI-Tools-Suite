@@ -8,8 +8,11 @@ Run with the app's own venv (PySide6, OpenCV and numpy; no installs):
 * The demo pictures in --images (make_demo_images.py) are damaged into --config\\photos so there is something to
   clean up: speckled color noise, then saved as low-quality JPEGs. The originals are not changed.
 * The app's QSettings (registry) are swapped for an .ini in --config, and LOCALAPPDATA points there too, so default
-  settings are shown and nothing of the real install is read or written. Best quality (AI) mode and Auto crop
-  (SAM) aren't used, so no model is loaded.
+  settings are shown and nothing of the real install is read or written. Best quality (AI) mode isn't used and
+  Auto crop's Preview is never pressed, so no model is loaded.
+* --auto-crop "the mountain" opens the Auto crop screen over the picture list (without the PyTorch/SAM setup
+  check), types the text, captures it from a timer inside its event loop with PrintWindow (wincap.py), composited
+  over the main window at its real position, and closes it.
 * The --shadow picture also gets a soft, bluish cloud shadow before the damage; 04 paints over it (Shadow areas,
   strokes added the way a brush stroke adds them).
 * The app runs from apps/RulZ-Image-Preparer in this repository; only the main window is grabbed (QWidget.grab()).
@@ -35,6 +38,9 @@ ap.add_argument("--out", required=True)
 ap.add_argument("--size", default="1600x960")
 ap.add_argument("--closeup", default="Hillside", help="file name start of the picture opened for 02 and 03")
 ap.add_argument("--shadow", default="Desert", help="file name start of the picture given a cloud shadow for 04")
+ap.add_argument("--auto-crop", default="", metavar="TEXT",
+                help="also capture 04-auto-crop.png: the Auto crop screen with TEXT typed in, before Preview")
+ap.add_argument("--crop-picture", default="Alpine Haze", help="file name start of the picture Auto crop shows")
 args = ap.parse_args()
 
 config_dir, out = Path(args.config), Path(args.out)
@@ -202,4 +208,63 @@ if args.shadow:
     save("04-shadow-areas.png")
 
 win._show_library()
+pump(1.0)
+
+# ---- Auto crop: the screen with a description typed in, before Preview. It is opened the way the toolbar
+# button opens it, minus ensure_crop_ready() (the PyTorch/SAM setup offer) and ai_mask.warm_up_task(), so SAM
+# is never loaded; nothing in the screen touches the model until Preview or Crop is pressed.
+if args.auto_crop:
+    from PySide6.QtCore import QPoint, QTimer
+    from PySide6.QtGui import QColor, QPainter
+
+    import wincap
+    from rulz.ui.auto_crop import AutoCropDialog
+
+    def grab_frame(widget):
+        """PrintWindow capture with the title bar drawn active (WM_NCACTIVATE; the focus isn't taken)."""
+        hwnd = int(widget.winId())
+        ctypes.windll.user32.SendMessageW(ctypes.c_void_p(hwnd), 0x0086, 1, 0)
+        pump(0.3)
+        cw, ch, bgra = wincap.capture(hwnd, "frame")
+        return wincap.to_qimage(cw, ch, bgra)
+
+    def composite(main, dlg):
+        """Main window grab with the dialog (title bar included) pasted where it really is, the window dimmed."""
+        base = main.grab().toImage()
+        shot = grab_frame(dlg)
+        dw, dh = shot.width(), shot.height()
+        left, top, _, _ = wincap.frame_rect(int(dlg.winId()))
+        origin = main.mapToGlobal(QPoint(0, 0))
+        x, y = left - origin.x(), top - origin.y()
+        p = QPainter(base)
+        p.fillRect(base.rect(), QColor(0, 0, 0, 90))
+        for i in range(14, 0, -1):
+            p.fillRect(x - i + 6, y - i + 10, dw + 2 * i - 12, dh + 2 * i - 12, QColor(0, 0, 0, 10))
+        p.drawImage(x, y, shot)
+        p.setPen(QColor(70, 70, 76))
+        p.drawRect(x, y, dw - 1, dh - 1)
+        p.end()
+        return base
+
+    def grab_auto_crop():
+        dlg = next(w for w in QApplication.topLevelWidgets() if isinstance(w, AutoCropDialog) and w.isVisible())
+        row = next((i for i, it in enumerate(dlg.items) if it.path.stem.startswith(args.crop_picture)), 0)
+        dlg.strip.setCurrentRow(row)
+        dlg.prompt.setText(args.auto_crop)
+        assert dlg._finder is None and not ai_mask.loaded(), "SAM must not be loaded"
+        pump(1.0)
+        path = out / "04-auto-crop.png"
+        composite(win, dlg).save(str(path))
+        print("saved", path, flush=True)
+        dlg.reject()
+
+    from rulz import ai_mask
+
+    QTimer.singleShot(1500, grab_auto_crop)
+    crop_dlg = AutoCropDialog(list(win.items), win.globals, win.mode, win, library=win.items)
+    crop_dlg.exec()
+    crop_dlg.deleteLater()
+    pump(0.3)
+    assert not ai_mask.loaded()
+
 win.close()

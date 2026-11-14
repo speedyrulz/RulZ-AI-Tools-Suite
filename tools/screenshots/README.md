@@ -58,9 +58,11 @@ node tools\screenshots\cdp_capture.mjs tools\screenshots\launcher.plan.json
 
 Run from the suite's root, after the apps' catalog images are in place (the cards show them). `--user-data-dir`
 gives the launcher a blank profile, and the install folder setting makes the install dialog show an `R:\` path
-instead of one with your user name. The plan picks Dark, then captures the home page, the Rulz Training Captioner
-page, its install dialog (closed with Cancel; nothing is installed) and the home page in light mode, at 1400x900.
-The status counters are real: RulZ LLM Suite and RulZ Coding Agent installs on the PC are found and counted.
+instead of one with your user name. The plan picks Dark, then captures the home page as cards and as a list, the
+Rulz Training Captioner page, its install dialog (closed with Cancel; nothing is installed) and the home page in
+light mode, at 1400x900. The Installed section is real: RulZ LLM Suite and RulZ Coding Agent installs on the PC are
+found and listed there. Run npm from PowerShell (from Git Bash its install scripts can't find node), and add
+`--force-device-scale-factor=1` on a scaled screen (it is in the command above).
 
 ## image-organizer (PySide6)
 
@@ -154,7 +156,7 @@ composited over the main window at its real position. No llama-server is started
 
 ```bat
 IO -B make_demo_images.py R:\Dataset\preparer --count 12 --seed 21 --names titles --size 1600
-IO -B capture_image_preparer.py --images R:\Dataset\preparer --config R:\ip-config --out R:\out\image-preparer
+IO -B capture_image_preparer.py --images R:\Dataset\preparer --config R:\ip-config --out R:\out\image-preparer --auto-crop "the mountain"
 ```
 
 The app runs from `apps\RulZ-Image-Preparer`. The demo pictures are copied into `--config\photos` with
@@ -162,6 +164,11 @@ blotchy color noise added and saved as low-quality JPEGs, so there is something 
 (registry) are swapped for an .ini in `--config` and `LOCALAPPDATA` points there too; Best quality (AI) mode and
 Auto crop aren't used, so no model is loaded. `02` and `03` open the `Hillside` picture (`--closeup`). `--shadow`
 also captures a painted shadow area; that one isn't in the gallery, because the lifted shadow left a visible edge.
+`--auto-crop` also saves `04-auto-crop.png`: the Auto crop screen over the picture list, showing the first
+`Alpine Haze` picture (`--crop-picture`), with the text typed in before Preview is pressed. The screen is opened
+the way the Auto crop button opens it, but without the PyTorch and SAM setup check and the model warm-up. Nothing in
+that screen uses the model until Preview or Crop is pressed, so SAM is never loaded (the script checks this). The
+picture in it is soft because the app shows the small thumbnail there until Preview is pressed.
 
 ## clip-extractor (PySide6)
 
@@ -217,7 +224,26 @@ VENV\python.exe -B capture_image_crawler.py --folder R:\Pictures\Wallpapers --re
 
 It scans the demo folder for "landscapes with mountains" with the real model: the checklist the model wrote, the
 matches grid, and the same run in light mode. Stop the app and the model server afterwards. (Last made 2026-10-29;
-the 2026-11-13 refresh skipped it because it needs the model on a GPU.)
+these three folder-scan pictures still match the page: what changed since shows only in website mode or when there
+are errors.)
+
+The two website pictures need no GPU:
+
+```bat
+IO -B make_demo_images.py R:\Pictures\Wallpapers --count 30 --seed 17 --names titles --size 1600
+"%LOCALAPPDATA%\Programs\RulZ AI Tools\RulZ Image Crawler\.venv\Scripts\python.exe" -B capture_image_crawler_demo.py --images R:\Pictures\Wallpapers --work R:\ic-demo --out R:\out\rulz-image-crawler
+```
+
+`capture_image_crawler_demo.py` imports the app from this checkout and serves it on port 18791 with a scripted
+stand-in for the model: "Generate checklist" returns a fixed checklist for "landscapes with mountains", and each
+picture is judged by the name `make_demo_images.py` gave it (mountain titles match, the rest don't), so the
+confidence figures and reasons in the picture are scripted, not the model's. No llama-server is started. Any venv
+with the app's packages, Playwright and its Chromium works; the launcher's install has them. `04-website` has
+`https://example.com/gallery` typed in with the website options showing, before anything is started (the address
+is never contacted). `05-website-run` crawls a two-page gallery of the demo pictures that the script serves on
+127.0.0.1:18792. One image link on it is broken on purpose, so the Problems list has an entry. Playwright's
+downloader can't resolve `*.localhost` names, so the address shows as 127.0.0.1. `--work` must be a new folder; the
+demo site and the app's output go there. The server and both browsers stop when the script ends.
 
 ## hf-manager (NiceGUI)
 
@@ -242,5 +268,22 @@ browser when done.
 
 ## image-grid (WPF)
 
-Not refreshed on 2026-11-13 (1.2.0 changed little on screen); its images are from 1.1.x. It has no harness yet:
-opening Export or switching the theme needs UI automation.
+```bat
+IO -B make_demo_images.py R:\Grid-demo --count 12 --seed 5 --names titles --size 1200
+powershell -ExecutionPolicy Bypass -File capture_image_grid.ps1 -Build R:\grid-build -Data R:\grid-data -Images R:\Grid-demo -Out R:\grid-out\image-grid -Readme R:\grid-out-readme
+IO -B -c "from PIL import Image; [Image.open(rf'R:\grid-out-readme\{n}.png').convert('RGB').save(rf'..\..\apps\RulZ-Image-Grid\docs\screenshots\{n}.jpg', quality=90, optimize=True, progressive=True) for n in ('01-dark', '02-light', '03-export-dark', '04-choose-your-look')]"
+```
+
+The app keeps `settings.ini` in `%APPDATA%\RulZ Image Grid`; since 1.2.0 it uses
+`<RULZ_IMAGEGRID_DATA>\RulZ Image Grid` instead when that variable is set. The script sets it to `-Data`, which
+must be a new folder. It copies `build.ps1`, `src\` and `assets\` to `-Build` (also a new folder) and builds them
+there, so no `bin\` folder appears in the repo. Then it compiles `capture_image_grid.cs` against the built
+`RulZ Image Grid.exe` with the same Roslyn csc and runs it. The harness opens the main window off screen with a
+fresh `Settings` object and never activates a window. It adds the pictures with the app's own `AddFiles` (what a
+drop calls), in the order they were drawn, then types 4 columns and the row and column labels into the side panel.
+It captures the dark look, the Export window over the main window, the light look (switched with the toolbar
+checkbox) and the "Choose your look" dialog. Windows are captured one at a time with PrintWindow, title bar
+included (drawn inactive, because no window is activated). The Export window is placed over the main window at its
+real position, with a drawn shadow. The harness process is DPI-unaware, so the images are 1600x1000 at 100% on a
+scaled screen. Nothing is saved or exported. `-Readme` writes the README set as PNGs, and the last command saves
+them as the README's JPEGs. The gallery's `03-export` is the README's `03-export-dark`.
