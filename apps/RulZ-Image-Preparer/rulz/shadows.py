@@ -22,6 +22,7 @@ from .filters import _guided_coeffs
 DEFAULT_STRENGTH, DEFAULT_BLEND = 70, 40
 MASK_MAX_SIDE = 2048  # the painted area is drawn at this size or smaller, then scaled up
 FIELD_MAX_SIDE = 256  # the surrounding light level is filled in at this size
+CLOSE_RADIUS = 16  # at that size: dips in a shadow's share up to about 12% of the picture across are filled
 MAX_LIFT = 2.5  # natural log: at most ~12x brighter
 GAMMA = 2.2
 LUMA = np.array([0.0722, 0.7152, 0.2126], np.float32)  # B, G, R weights of luminance
@@ -106,6 +107,23 @@ def _fill(values: np.ndarray, weights: np.ndarray) -> np.ndarray:
         a = np.clip(wt * 4.0, 0.0, 1.0)  # trust the level's own value where it has enough support
         est = a * known + (1.0 - a) * up
     return est
+
+
+def _fill_dips(values: np.ndarray, seeds: np.ndarray) -> np.ndarray:
+    """values raised, at each pixel, to the lowest level a path from a seed has to climb to reach it: a dip that
+    no seed is in comes up to the level of its rim, while a slope down to a seed stays as it is (a grayscale
+    reconstruction by erosion). values: float32 0..1; seeds: bool, same shape. With no seeds, all of it is 1.
+    Each step spreads the levels by one pixel; a winding dip that would need more steps than twice the
+    picture's height plus width is left part filled (too high) rather than taking seconds."""
+    out = np.where(seeds, values, np.float32(1.0)).astype(np.float32)
+    k = np.ones((3, 3), np.uint8)
+    for _ in range(0, 2 * sum(values.shape), 8):
+        before = out
+        for _ in range(8):  # a few steps between checks
+            out = np.maximum(cv2.erode(out, k), values)
+        if np.array_equal(out, before, equal_nan=True):
+            break
+    return out
 
 
 def _lighting(log_y: np.ndarray) -> np.ndarray:
@@ -235,9 +253,10 @@ def lift_shadows(bgr: np.ndarray, edit: ShadowEdit, lighting: Lighting | None = 
     # The depth is the median over painted pixels clearly darker than their surroundings, so lit bits painted
     # over don't water it down. With hardly any of those, there's no shadow to lift.
     # From here on, full-size work is done in the painted area's box (outside it the mask is 0, so nothing
-    # changes there), and in a wider box for the shadow's reach (`part`), which is blurred at the small size:
-    # wide enough for that blur (radius 12 there) and the resizing on either side of it.
-    reach = _grow(box, int(np.ceil(16 * max(w / fs[0], h / fs[1]))) + 2, h, w)
+    # changes there), and in a wider box for the shadow's reach (`part`), which is worked on at the small size:
+    # wide enough for the closing there (it reads 2 * CLOSE_RADIUS around), its blur (radius 12) and the
+    # resizing on either side.
+    reach = _grow(box, int(np.ceil((2 * CLOSE_RADIUS + 4) * max(w / fs[0], h / fs[1]))) + 2, h, w)
     inner = _within(box, reach)
     gap_r = around[reach] - light[reach]
     gap, mb = gap_r[inner], m[box]
@@ -247,19 +266,38 @@ def lift_shadows(bgr: np.ndarray, edit: ShadowEdit, lighting: Lighting | None = 
         return bgr
     depth = float(np.clip(np.median(dark), 0.0, MAX_LIFT))
     # How much each pixel is in the shadow. Near the edge of the painting, where the shadow's soft fringe and
-    # any lit bits painted over are, it's the pixel's own share of the depth. Deeper inside, everything counts
-    # as shadow unless its neighborhood is plainly lit (a brush stroke running on past the shadow); decided
-    # per neighborhood so a bright object in the shadow doesn't turn blotchy.
+    # any lit bits painted over are, it's the pixel's own share of the depth. Deeper inside, a bright object in
+    # the shadow gets the full share too (below).
     radius = max((st.radius for st in edit.strokes if not st.erase), default=0.0) * max(fs)
     band = max(1.0, 0.35 * radius)
     inside = cv2.distanceTransform((m_s > 0.5).astype(np.uint8), cv2.DIST_L2, 3)
     deep = np.clip((inside - band) / band, 0.0, 1.0)
     deep = cv2.resize(cv2.GaussianBlur(deep, (0, 0), 1.0), (w, h), interpolation=cv2.INTER_LINEAR)[box]
+    # A pixel's own share of the depth is too low on a bright object in the shadow, whose edges the lighting
+    # takes for less shadow, but right on the shadow's soft edge, where the light really fades in. They differ
+    # in what's around them: the object is a dip or notch in the share with shadow on both sides, the soft edge
+    # a slope down to lit ground. Two fills raise the dips and notches but leave a slope as it is:
+    # - a grayscale closing fills any dip or notch narrower than 2 * CLOSE_RADIUS, also an object that reaches
+    #   out of the shadow (a person standing at its edge) or has a lit-looking middle;
+    # - _fill_dips fills a dip of any size that shadow encloses (one that no path from plainly lit ground, or
+    #   from outside the painting, reaches without climbing).
+    # As before, the less plainly a spot is shadow, the less it's filled. (Taking every neighborhood that is a
+    # third shadow as all shadow gave the soft edge the full depth: a bright ring around the shadow wherever
+    # the painting ran past it.) A lit gap narrower than the closing between two painted shadows still looks
+    # like an object in the shadow and is lifted, as before 0.5.1.
     part_r = np.clip(gap_r / depth, 0.0, 1.0)
-    part_s = cv2.GaussianBlur(cv2.resize(_pasted(part_r, reach, h, w), fs, interpolation=cv2.INTER_AREA),
-                              (0, 0), 3.0)
-    not_lit = cv2.resize(np.clip((part_s - 0.1) / 0.25, 0.0, 1.0), (w, h), interpolation=cv2.INTER_LINEAR)[box]
-    share = np.maximum(part_r[inner], deep * not_lit)
+    part_s = cv2.resize(_pasted(part_r, reach, h, w), fs, interpolation=cv2.INTER_AREA)
+    not_lit = np.clip((cv2.GaussianBlur(part_s, (0, 0), 3.0) - 0.1) / 0.25, 0.0, 1.0)
+    window = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * CLOSE_RADIUS + 1,) * 2)
+    filled = np.maximum(cv2.morphologyEx(part_s, cv2.MORPH_CLOSE, window),
+                        _fill_dips(part_s, (not_lit <= 0.0) | (m_s < 0.02)))  # outside the painting: seeds,
+    filled = part_s + (filled - part_s) * not_lit  # so the fill never reaches past `reach`
+    # Close to the full depth counts as the full depth: in the shadow's core such small differences are the
+    # measurement's wobble, so the core and anything in it are lifted by one depth, as a real light would
+    # (about a twentieth of the depth more at most, on the inner side of a soft edge).
+    filled += (1.0 - filled) * np.clip((filled - 0.85) / 0.1, 0.0, 1.0)
+    filled = cv2.resize(filled, (w, h), interpolation=cv2.INTER_LINEAR)[box]
+    share = np.maximum(part_r[inner], deep * filled)
     lift = depth * share * (s * mb)
     out = lin * np.exp(lift)[..., None]
 

@@ -163,7 +163,8 @@ The app runs from `apps\RulZ-Image-Preparer`. The demo pictures are copied into 
 blotchy color noise added and saved as low-quality JPEGs, so there is something to clean up. The app's QSettings
 (registry) are swapped for an .ini in `--config` and `LOCALAPPDATA` points there too; Best quality (AI) mode and
 Auto crop aren't used, so no model is loaded. `02` and `03` open the `Hillside` picture (`--closeup`). `--shadow`
-also captures a painted shadow area; that one isn't in the gallery, because the lifted shadow left a visible edge.
+(`Desert`) gets a soft cloud shadow and only light damage, and `05-shadow-areas.png` paints over the whole shadow,
+soft edge included, at Shadow lift 85 (until 0.5.1 a brush running past the soft edge left a bright ring there).
 `--auto-crop` also saves `04-auto-crop.png`: the Auto crop screen over the picture list, showing the first
 `Alpine Haze` picture (`--crop-picture`), with the text typed in before Preview is pressed. The screen is opened
 the way the Auto crop button opens it, but without the PyTorch and SAM setup check and the model warm-up. Nothing in
