@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -13,7 +15,7 @@ namespace RulZImageGrid
 {
     public class ExportWindow : Window
     {
-        const int JpegMaxSide = 65535;
+        public const int JpegMaxSide = 65500; // the JPEG format allows 65,535, but Windows' encoder refuses more than 65,500
         const double MaxPixels = 500_000_000; // ~2 GB of 32-bit pixels: beyond this WPF can't allocate the bitmap
 
         readonly GridSettings S;
@@ -32,7 +34,7 @@ namespace RulZImageGrid
         readonly Panel presets;
         readonly DispatcherTimer previewTimer;
         double percent = 100;
-        bool busy, syncing;
+        bool busy, syncing, checking;
 
         // The preview only changes when its drawing scale (or, for a transparent background, the format) changes.
         string previewKey;               // what the preview shows, or is being rendered to show
@@ -247,8 +249,11 @@ namespace RulZImageGrid
             int w = OutW, h = OutH;
             double mp = (double)w * h / 1e6;
             resText.Text = $"{w:N0} × {h:N0} px";
-            // Drawing needs the finished image plus a full-size working copy: measured at about twice the image.
-            detailText.Text = $"{mp:0.0} megapixels · about {(double)w * h * 8 / 1048576:N0} MB in memory while saving";
+            // Measured: the finished image plus about 5%, and the source images drawn so far that haven't been freed
+            // yet (up to about ten). Each source image is drawn in and dropped, so they're never all in memory at once.
+            double tile = layout.CellW * Scale * layout.CellH * Scale * 4;
+            double bytes = (double)w * h * 4 * 1.05 + Math.Min(items.Count, 10) * tile;
+            detailText.Text = $"{mp:0.0} megapixels · about {bytes / 1048576:N0} MB in memory while saving";
 
             var warnings = new List<string>();
             bool blocked = false;
@@ -280,7 +285,7 @@ namespace RulZImageGrid
 
         async void RenderPreview()
         {
-            if (!IsLoaded) return;
+            if (!IsLoaded || busy) return; // never alongside a save; SetBusy(false) catches up
             double pscale = PreviewScale;
             bool opaque = IsJpg && S.Transparent; // JPG only changes the picture when the background is transparent
             string key = pscale.ToString("R", CultureInfo.InvariantCulture) + (opaque ? "|opaque" : "");
@@ -317,12 +322,40 @@ namespace RulZImageGrid
 
         async void Save()
         {
+            if (busy || checking) return;
+            // Say up front which images are gone, rather than failing partway through a long save. Checked off the UI
+            // thread: on a slow or unavailable network drive each check can take a while.
+            var paths = items.Select(i => i.Path).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            List<string> missing;
+            checking = true;
+            Cursor = System.Windows.Input.Cursors.Wait;
+            statusText.Text = "Checking the images…";
+            try { missing = await Task.Run(() => paths.Where(p => !File.Exists(p)).ToList()); }
+            finally
+            {
+                checking = false;
+                Cursor = null;
+                statusText.Text = "";
+            }
+            if (!IsVisible) return; // the window was closed while checking
+            if (missing.Count > 0)
+            {
+                MessageBox.Show(this,
+                    "These images can't be found, so the grid can't be saved. They were moved, renamed or deleted " +
+                    "after they were added, or they're on a drive that isn't available right now:\n\n" +
+                    string.Join("\n", missing.Take(15)) + (missing.Count > 15 ? $"\n…and {missing.Count - 15} more" : "") +
+                    "\n\nPut them back (or reconnect the drive), or remove them from the grid, and try again.",
+                    "Export", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
             bool jpg = IsJpg;
             string ext = jpg ? ".jpg" : ".png";
             var dlg = new SaveFileDialog
             {
                 Title = "Save grid image",
-                Filter = jpg ? "JPEG image (*.jpg)|*.jpg;*.jpeg" : "PNG image (*.png)|*.png",
+                Filter = "PNG image (*.png)|*.png|JPEG image (*.jpg)|*.jpg;*.jpeg",
+                FilterIndex = jpg ? 2 : 1,
                 FileName = "RulZ Image Grid" + ext,
                 DefaultExt = ext,
                 AddExtension = true,
@@ -331,6 +364,27 @@ namespace RulZImageGrid
             if (dlg.ShowDialog(this) != true) return;
 
             string path = dlg.FileName;
+            // The name decides the format, so typing "grid.png" while JPG is picked saves a real PNG. Any other ending
+            // (grid.bmp, grid.webp) is refused rather than writing PNG data under that name.
+            bool? named = FormatOf(path);
+            if (named == null)
+            {
+                MessageBox.Show(this,
+                    $"RulZ Image Grid saves PNG and JPG images only, so it can't save \"{Path.GetFileName(path)}\".\n\n" +
+                    "End the file name with .png or .jpg and try again.",
+                    "Export", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+            if (named.Value != jpg)
+            {
+                (named.Value ? jpgRadio : pngRadio).IsChecked = true; // shows what's saved and re-checks the size limits
+                if (!saveBtn.IsEnabled)
+                {
+                    MessageBox.Show(this, warnText.Text, "Export", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+                jpg = named.Value;
+            }
             double scale = Scale;
             string size = $"{OutW:N0} × {OutH:N0}";
             int quality = (int)qualitySlider.Value;
@@ -361,6 +415,17 @@ namespace RulZImageGrid
             }
         }
 
+        /// <summary>True for a JPEG file name, false for PNG, null for anything else (the picked format is kept).</summary>
+        public static bool? FormatOf(string path)
+        {
+            switch (Path.GetExtension(path).ToLowerInvariant())
+            {
+                case ".jpg": case ".jpeg": case ".jpe": case ".jfif": return true;
+                case ".png": return false;
+                default: return null;
+            }
+        }
+
         void Report(string msg) => Dispatcher.BeginInvoke(new Action(() => statusText.Text = msg));
 
         void SetBusy(bool on)
@@ -370,6 +435,15 @@ namespace RulZImageGrid
             cancelBtn.IsEnabled = !on;
             scaleSlider.IsEnabled = scaleBox.IsEnabled = pngRadio.IsEnabled = jpgRadio.IsEnabled = !on;
             presets.IsEnabled = qualitySlider.IsEnabled = !on;
+            // No preview renders alongside a save (switching the format from the file name would start one): stop any
+            // that's under way, and bring the preview up to date if the save fails and the window stays open.
+            previewTimer.Stop();
+            if (on && previewPending)
+            {
+                previewCancel?.Cancel();
+                previewKey = null;
+            }
+            if (!on) previewTimer.Start();
             UpdateResolution();
         }
     }
