@@ -89,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
     from .ui.main_window import MainWindow
 
     theme.apply_theme(app)
-    app.setWindowIcon(theme.make_icon())
+    app.setWindowIcon(theme.app_icon())
 
     store = ConfigStore(config_path)
     store.load()

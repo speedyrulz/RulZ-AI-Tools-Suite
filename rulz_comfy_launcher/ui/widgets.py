@@ -132,7 +132,7 @@ class LogView(QPlainTextEdit):
         self.setFont(theme.mono_font(10))
         self.setMaximumBlockCount(max_lines)
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-        self.setStyleSheet(f"QPlainTextEdit {{ background: #0f1115; border: 1px solid {theme.BORDER}; "
+        self.setStyleSheet(f"QPlainTextEdit {{ background: {theme.LOG_BG}; border: 1px solid {theme.BORDER}; "
                            "border-radius: 8px; padding: 6px; }")
         self._stream = TextStream()
         self._pending: list[str] = []

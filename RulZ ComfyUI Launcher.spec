@@ -8,6 +8,7 @@ a = Analysis(
     datas=[
         ("rulz_comfy_launcher/builtin_catalog.json", "rulz_comfy_launcher"),
         ("rulz_comfy_launcher/scripts/introspect_args.py", "rulz_comfy_launcher/scripts"),
+        ("rulz_comfy_launcher/assets", "rulz_comfy_launcher/assets"),
     ],
     hiddenimports=[],
     hookspath=[],
@@ -30,7 +31,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,
-    icon="assets/app.ico",
+    icon="rulz_comfy_launcher/assets/icon.ico",
 )
 coll = COLLECT(
     exe,

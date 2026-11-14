@@ -142,7 +142,7 @@ class MainWindow(QMainWindow):
         self._tray: QSystemTrayIcon | None = None
 
         self.setWindowTitle(APP_NAME)
-        self.setWindowIcon(theme.make_icon())
+        self.setWindowIcon(theme.app_icon())
         self.resize(1280, 860)
         self.setMinimumSize(980, 620)
 
@@ -187,12 +187,28 @@ class MainWindow(QMainWindow):
         sidebar.setObjectName("sidebar")
         sidebar.setMinimumWidth(330)
         side = QVBoxLayout(sidebar)
-        side.setContentsMargins(0, 12, 0, 10)
+        side.setContentsMargins(0, 18, 0, 10)
         side.setSpacing(8)
 
+        # Brand block, the same as in the other RulZ apps: logo, then the app's name.
+        logo = QLabel()
+        logo.setContentsMargins(18, 0, 0, 0)
+        pixmap = theme.logo_pixmap(150)
+        if pixmap.isNull():
+            logo.setText("RulZ")
+            logo.setObjectName("pageTitle")
+        else:
+            logo.setPixmap(pixmap)
+        side.addWidget(logo)
+        brand = QLabel("COMFYUI LAUNCHER")
+        brand.setObjectName("brandSub")
+        brand.setContentsMargins(20, 0, 0, 0)
+        side.addWidget(brand)
+        side.addSpacing(12)
+
         title = QLabel("Configurations")
-        title.setObjectName("cardTitle")
-        title.setContentsMargins(14, 0, 0, 0)
+        title.setObjectName("sideTitle")
+        title.setContentsMargins(16, 0, 0, 0)
         side.addWidget(title)
 
         tools = QHBoxLayout()
@@ -547,7 +563,7 @@ class MainWindow(QMainWindow):
         self.title.setText(profile.name or "(no name)")
         text, color, external = self._display_state(profile)
         self.pill.setText(text)
-        self.pill.setStyleSheet(f"background: {color}; color: #0d1117;")
+        self.pill.setStyleSheet(f"background: {color}; color: {theme.ON_STATUS};")
         state = self.manager.state(profile.id)
         idle = state in (State.STOPPED, State.FAILED)
         self.start_button.setEnabled(idle and not external)

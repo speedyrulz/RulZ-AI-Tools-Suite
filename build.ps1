@@ -6,9 +6,6 @@ Set-Location -LiteralPath $PSScriptRoot
 python -m pytest -q tests
 if ($LASTEXITCODE -ne 0) { throw 'Tests failed.' }
 
-python tools\make_icon.py
-if ($LASTEXITCODE -ne 0) { throw 'The icon could not be written.' }
-
 python -m PyInstaller --noconfirm 'RulZ ComfyUI Launcher.spec'
 if ($LASTEXITCODE -ne 0) { throw 'Packaging failed.' }
 

@@ -4,6 +4,8 @@ A Windows app that starts and stops ComfyUI servers running inside WSL. Each sav
 configuration has its own port, GPUs, ComfyUI options and environment, and several
 configurations can run at the same time.
 
+![The launcher's main window](docs/screenshot-settings.png)
+
 ## What it does
 
 - **Configurations.** Create, duplicate, reorder and delete configurations. Changes are
@@ -47,7 +49,7 @@ python -m pip install -r requirements-dev.txt
 .\build.ps1
 ```
 
-The script runs the tests, writes the icon and runs PyInstaller.
+The script runs the tests and then PyInstaller.
 
 ## Settings of a configuration
 
@@ -112,11 +114,11 @@ from the number you would type by hand for the same card.
 | `rulz_comfy_launcher/instance.py` | Running instances: start, stop, restart, the start queue. |
 | `rulz_comfy_launcher/wsl.py`, `gpus.py`, `winjob.py` | `wsl.exe` helpers, GPU monitor, Windows job object. |
 | `rulz_comfy_launcher/textstream.py` | Terminal-style handling of process output. |
-| `rulz_comfy_launcher/ui/` | The window. |
+| `rulz_comfy_launcher/ui/` | The window. `ui/theme.py` holds the RulZ colours (black with the logo red `#ED000D`). |
+| `rulz_comfy_launcher/assets/` | The RulZ logo and app icon (see [LOGO-NOTICE.md](LOGO-NOTICE.md)). |
 | `rulz_comfy_launcher/scripts/introspect_args.py` | Runs inside WSL and lists ComfyUI's options. |
 | `tests/` | Unit tests: `python -m pytest -q tests`. |
 | `tools/smoke_test.py` | Starts and stops a fake server inside WSL to check the process handling: `python tools/smoke_test.py`. |
-| `tools/make_icon.py` | Writes `assets/app.ico` for the packaged app. |
 
 ## Limits
 
