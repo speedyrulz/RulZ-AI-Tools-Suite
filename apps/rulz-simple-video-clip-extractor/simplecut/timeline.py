@@ -29,6 +29,7 @@ class Timeline(QWidget):
         self.mark_in: float | None = None
         self.mark_out: float | None = None
         self.selection: tuple[float, float] | None = None  # fixed-length mode
+        self.clips: list[tuple[float, float, bool]] = []   # clip list entries: (start, end, saved)
         self._press = None  # (x, mode, offset_seconds)
         self._dragging = False
         self._ticks: list[QLineF] = []
@@ -54,6 +55,13 @@ class Timeline(QWidget):
     def set_selection(self, sel: tuple[float, float] | None):
         self.selection = sel
         self.update()
+
+    def set_clips(self, clips: list[tuple[float, float, bool]]):
+        """The clip list's entries, drawn as a strip above the bar: (start, end, already saved)."""
+        clips = list(clips)
+        if clips != self.clips:
+            self.clips = clips
+            self.update()
 
     # --- geometry ---------------------------------------------------------
     def _x(self, t: float) -> float:
@@ -170,7 +178,17 @@ class Timeline(QWidget):
                 p.fillRect(QRectF(self._x(a), bar_top, self._x(b) - self._x(a), bar_bot - bar_top),
                            theme.Q_TL_INOUT)
 
-        # keyframe ticks (thin out when there are too many for the width)
+        # clip list entries: a strip just above the bar, solid while a clip waits, outlined once saved
+        for a, b, saved in self.clips:
+            xa = self._x(max(a, self.start))
+            r = QRectF(xa, bar_top - 6.5, max(self._x(min(b, self.end)) - xa, 2.0), 4)
+            if saved:
+                p.setPen(QPen(theme.Q_MUTED, 1))
+                p.setBrush(Qt.NoBrush)
+                p.drawRect(r)
+            else:
+                p.fillRect(r, theme.Q_RED)
+
         ticks = self._tick_lines(bar_top)
         if ticks:
             p.setPen(QPen(theme.Q_TL_TICK, 1))

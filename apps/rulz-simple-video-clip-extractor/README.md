@@ -4,7 +4,9 @@
 
 A small Windows video trimmer: frame-accurate stepping, keyframe navigation,
 In/Out marks, and export either **lossless** (stream copy, when In and Out are
-on keyframes) or **re-encoded with NVIDIA NVENC** to MP4. The
+on keyframes) or **re-encoded with NVIDIA NVENC** to MP4. A
+[clip list](#clip-list) collects several clips of a video and exports them in
+one go. The
 [Distortion repair](#distortion-repair) window brings the lens, perspective and
 horizon corrections of RulZ Image Distortion Repair to every clip and frame you
 export.
@@ -72,6 +74,8 @@ python -m venv .venv
 | Export              |        | Ctrl+E        |
 | Preferences         |        | Ctrl+,        |
 | Quick export        |        | Ctrl+Shift+E  |
+| Add selection to the clip list | | A        |
+| Export the clip list |       | Ctrl+Shift+A  |
 | Open last export    |        | Ctrl+Shift+O  |
 | Save frame as PNG   | 💾     | S             |
 | Rotate 90° clockwise |       | R             |
@@ -320,6 +324,61 @@ While fixed length is on:
 
 Turning fixed length off restores your In/Out marks.
 
+## Clip list
+
+Mark several clips first and export them all in one go, instead of waiting for
+each export before marking the next.
+
+![The clip list beside the video: two clips already saved and one cropped clip waiting, with a strip above the timeline showing where each clip is](docs/screenshots/clip-list.png)
+
+- **Add to list** (A) keeps the current selection (the In/Out marks or the
+  fixed-length box) in a list to the right of the video. Each clip is stored
+  with the rotation, flip, crop, "Scale to" size, colour match and distortion
+  repair as they are at that moment, so you can change any of them for the
+  next clip without touching the ones already listed. With Fixed length on,
+  pressing A and then N adds back-to-back clips.
+- The list shows each clip's In, Out and length, what is applied to it
+  ("turned", "crop", "colour", "repair"; hover a row for the details) and its
+  status. A strip above the timeline bar shows where the clips are: solid red
+  while a clip waits, outlined once it is saved.
+- **Export list** (Ctrl+Shift+A) exports every clip that is not saved yet, one
+  after another, in the background. The encode settings are Quick export's
+  (Preferences → Quick export), read when you press the button, and the files
+  go to the output folder with the usual names. A clip is cut losslessly when
+  Quick export is allowed to do that and the clip qualifies; otherwise it is
+  re-encoded with NVENC. The status bar shows which clip is being written,
+  with a progress bar and **Cancel**.
+- You can keep working while the list exports: mark and add more clips (press
+  Export list again to queue them), or open another video. The export goes on
+  with the first video's clips. Quick export and Export wait until the list
+  is done, since one export runs at a time.
+- A clip that fails is marked "failed" and the rest still export; a message
+  at the end shows the first failure, and the next Export list tries the
+  failed clips again. Cancel stops the clip being written, deletes its partial
+  file and leaves the clips not written yet in the list. Closing the app does
+  the same.
+- Double-click a clip to go to it: the In/Out marks (or the fixed-length box)
+  and the playhead move there. This does not bring back the crop, rotation or
+  other settings the clip was added with; to change a listed clip, remove it
+  and add it again.
+- **Remove** takes the selected clips out of the list and **Clear** empties
+  it; exported files are never deleted. Right-click a clip for "Export again",
+  which puts a saved or failed clip back in line. Adding a selection that is
+  already listed does not list it twice (a saved one is queued again).
+- The list belongs to the video and is saved as you go: open the video again,
+  also after restarting the app, and its clips are back with their status.
+  Lists are kept per user in `%LOCALAPPDATA%\SimpleCut\clip-lists` (beside the
+  .ini file when `SIMPLECUT_SETTINGS_INI` is set), not next to your videos. A
+  list is not loaded when the video file has changed since (another size or
+  date), because its times would point at other frames; the status bar says
+  so, and the old list is kept beside the new one as a `.old` file the first
+  time you add a clip. The same happens with stored clips that can't be read.
+  Lists of videos that have been gone for 90 days are removed.
+- Right after opening a large video, Export list asks you to try again in a
+  moment while the keyframes are still being read (the status bar says
+  "finding keyframes…"): it needs them to tell which clips can be cut
+  losslessly.
+
 ## Settings
 
 The **Settings** menu sets the default output folder used for both clips and
@@ -423,6 +482,8 @@ clips exported before this fix, this repairs one without touching the video:
 - `simplecut/timeline.py` — timeline widget (marks, fixed-length box)
 - `simplecut/cropview.py` — video preview with interactive crop box
 - `simplecut/export.py` — ffmpeg command builder + async job
+- `simplecut/cliplist.py` — the clip list: entries, their per-video storage,
+  the background batch export and the list panel
 - `simplecut/app.py` — main window and export dialog
 - `simplecut/defaults.py` — stored preferences and the Preferences window
 - `simplecut/theme.py` — RulZ name, logo assets and the dark and light themes
