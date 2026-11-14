@@ -4,34 +4,86 @@
   "width": 1600,
   "height": 960,
   "outDir": "R:/out/rulz-trainer",
-  "startWaitMs": 1500,
+  "startWaitMs": 6000,
+  "beforeShot": "document.querySelectorAll('.q-notification').forEach(n => n.remove()); 'ok'",
   "shots": [
     {
-      "name": "wizard-tab",
-      "js": "localStorage.setItem('rulz.tab', 'Wizard'); setTimeout(() => location.reload(), 50); 'reloading'",
-      "waitMs": 5000,
-      "check": "[...document.querySelectorAll('.q-tab')].map(t => t.textContent.trim() + (t.classList.contains('q-tab--active') ? '*' : '')).join(' | ')"
+      "name": "05-choose-your-look.png",
+      "waitMs": 300,
+      "check": "document.body.innerText.includes('Choose your look') ? 'first-visit dialog' : 'NO DIALOG (use a fresh browser profile)'"
     },
     {
-      "name": "04-wizard-goal.png",
+      "name": "continue",
+      "js": "(() => { const b = [...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'Continue'); if (!b) return 'no button'; b.click(); return 'ok' })()",
+      "waitMs": 1500
+    },
+    {
+      "name": "train",
+      "js": "[...document.querySelectorAll('.q-tab')].find(t => t.textContent.includes('Train')).click(), 'ok'",
+      "waitMs": 2000
+    },
+    {
+      "name": "01-train-dark.png",
+      "js": "(() => { const b = [...document.querySelectorAll('.rz-nav-btn')].filter(b => b.offsetParent !== null && b.textContent.trim().endsWith('Model'))[0]; if (!b) return 'not found'; b.click(); return 'ok' })()",
+      "waitMs": 2500,
+      "check": "document.documentElement.dataset.theme"
+    },
+    {
+      "name": "wizard",
       "js": "[...document.querySelectorAll('.q-tab')].find(t => t.textContent.includes('Wizard')).click(), 'ok'",
       "waitMs": 1500
     },
     {
-      "name": "02-wizard-hardware.png",
-      "js": "(() => { const el = [...document.querySelectorAll('.q-stepper__tab *')].find(e => e.children.length === 0 && e.textContent.trim() === 'Hardware'); if (!el) return 'not found'; el.closest('.q-stepper__tab').click(); return 'ok' })()",
-      "waitMs": 2500
+      "name": "04-wizard-goal.png",
+      "js": "(() => { const el = [...document.querySelectorAll('.q-stepper__tab *')].filter(e => e.offsetParent !== null && e.children.length === 0 && e.textContent.trim() === 'Start')[0]; if (!el) return 'not found'; el.closest('.q-stepper__tab').click(); return 'ok' })()",
+      "waitMs": 2000
     },
     {
-      "name": "01-train-settings.png",
-      "js": "[...document.querySelectorAll('.q-tab')].find(t => t.textContent.includes('Train')).click(), 'ok'",
-      "waitMs": 2500
+      "name": "03-wizard-model.png",
+      "js": "(() => { const el = [...document.querySelectorAll('.q-stepper__tab *')].filter(e => e.offsetParent !== null && e.children.length === 0 && e.textContent.trim() === 'Model')[0]; if (!el) return 'not found'; el.closest('.q-stepper__tab').click(); return 'ok' })()",
+      "waitMs": 3000
     },
     {
-      "name": "03-monitor.png",
+      "name": "start-again",
+      "js": "(() => { const el = [...document.querySelectorAll('.q-stepper__tab *')].filter(e => e.offsetParent !== null && e.children.length === 0 && e.textContent.trim() === 'Start')[0]; if (!el) return 'not found'; el.closest('.q-stepper__tab').click(); return 'ok' })()",
+      "waitMs": 800
+    },
+    {
+      "name": "04-monitor.png",
       "js": "[...document.querySelectorAll('.q-tab')].find(t => t.textContent.includes('Monitor')).click(), 'ok'",
       "waitMs": 3000,
       "check": "document.body.innerText.includes('no job yet') ? 'idle, no job' : 'JOB PRESENT?'"
+    },
+    {
+      "name": "dataset-tab",
+      "js": "[...document.querySelectorAll('.q-tab')].find(t => t.textContent.includes('Dataset')).click(), 'ok'",
+      "waitMs": 2500
+    },
+    {
+      "name": "open-dataset",
+      "js": "(() => { const el = [...document.querySelectorAll('*')].filter(e => e.offsetParent !== null && e.children.length === 0 && e.textContent.trim() === 'landscapes')[0]; if (!el) return 'no demo dataset'; el.click(); return 'ok' })()",
+      "waitMs": 4000
+    },
+    {
+      "name": "07-dataset.png",
+      "js": "(() => { const el = [...document.querySelectorAll('*')].filter(e => e.offsetParent !== null && e.children.length === 0 && e.textContent.trim() === 'Look consistency filter')[0]; if (!el) return 'none'; el.scrollIntoView({block: 'start'}); window.scrollBy(0, -150); return 'ok' })()",
+      "waitMs": 2500
+    },
+    {
+      "name": "light",
+      "js": "(() => { window.rzSetTheme('light', true); [...document.querySelectorAll('.q-tab')].find(t => t.textContent.includes('Train')).click(); return 'ok' })()",
+      "waitMs": 2000
+    },
+    {
+      "name": "02-train-light.png",
+      "js": "(() => { const b = [...document.querySelectorAll('.rz-nav-btn')].filter(b => b.offsetParent !== null && b.textContent.trim().endsWith('Model'))[0]; if (!b) return 'not found'; b.click(); return 'ok' })()",
+      "waitMs": 2000,
+      "check": "document.documentElement.dataset.theme"
+    },
+    {
+      "name": "back-dark",
+      "js": "(window.rzSetTheme('dark', true), 'ok')",
+      "waitMs": 800
     }
   ]
 }

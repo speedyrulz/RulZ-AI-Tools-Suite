@@ -2,18 +2,24 @@
 
 Run with the app's own venv (PySide6, OpenCV and numpy; no installs):
 
-    "C:\\coding\\RulZ AI Tools\\RulZ Image Preparer\\.venv\\Scripts\\python.exe" -B capture_image_preparer.py ^
+    "%LOCALAPPDATA%\\Programs\\RulZ AI Tools\\RulZ Image Preparer\\.venv\\Scripts\\python.exe" -B capture_image_preparer.py ^
         --images R:\\Dataset\\preparer --config R:\\ip-config --out R:\\out\\image-preparer
 
 * The demo pictures in --images (make_demo_images.py) are damaged into --config\\photos so there is something to
   clean up: speckled color noise, then saved as low-quality JPEGs. The originals are not changed.
 * The app's QSettings (registry) are swapped for an .ini in --config, and LOCALAPPDATA points there too, so default
-  settings are shown and nothing of the real install is read or written. Best quality (AI) mode isn't used.
+  settings are shown and nothing of the real install is read or written. Best quality (AI) mode and Auto crop
+  (SAM) aren't used, so no model is loaded.
+* The --shadow picture also gets a soft, bluish cloud shadow before the damage; 04 paints over it (Shadow areas,
+  strokes added the way a brush stroke adds them).
 * The app runs from apps/RulZ-Image-Preparer in this repository; only the main window is grabbed (QWidget.grab()).
+* Qt renders at 100 % (QT_SCALE_FACTOR = 96 / system DPI), so the images have the same pixel size whatever the
+  display scaling is.
 """
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
 import sys
 import time
@@ -28,6 +34,7 @@ ap.add_argument("--config", required=True)
 ap.add_argument("--out", required=True)
 ap.add_argument("--size", default="1600x960")
 ap.add_argument("--closeup", default="Hillside", help="file name start of the picture opened for 02 and 03")
+ap.add_argument("--shadow", default="Desert", help="file name start of the picture given a cloud shadow for 04")
 args = ap.parse_args()
 
 config_dir, out = Path(args.config), Path(args.out)
@@ -38,14 +45,46 @@ os.environ["LOCALAPPDATA"] = str(config_dir)
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(APP))
 
+
+def system_dpi() -> int:
+    u = ctypes.windll.user32
+    u.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+    u.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+    old = u.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))  # per-monitor v2, this thread only
+    try:
+        return u.GetDpiForSystem()
+    finally:
+        u.SetThreadDpiAwarenessContext(old)
+
+
+if system_dpi() != 96:
+    os.environ.setdefault("QT_SCALE_FACTOR", f"{96 / system_dpi():.6f}")
+
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
+
+# ---- a cloud shadow for the Shadow areas shot: an ellipse (centre and radii as fractions of width/height,
+# angle in degrees), soft edge, bluish
+SHADOW = (0.66, 0.60, 0.13, 0.06, -6)
+
+
+def cloud_shadow(img):
+    h, w = img.shape[:2]
+    cx, cy, rx, ry, angle = SHADOW
+    mask = np.zeros((h, w), np.float32)
+    cv2.ellipse(mask, (int(cx * w), int(cy * h)), (int(rx * w), int(ry * h)), angle, 0, 360, 1.0, -1)
+    mask = cv2.GaussianBlur(mask, (0, 0), 0.006 * w)[..., None]
+    shade = np.array([0.66, 0.52, 0.46], np.float32)  # B, G, R: darker, with a blue cast
+    return (img.astype(np.float32) * (1 - mask + mask * shade) + 0.5).astype(np.uint8)
+
 
 # ---- demo damage: chroma noise like a high-ISO photo, then heavy JPEG compression ----
 rng = np.random.default_rng(5)
 sources = sorted(p for p in Path(args.images).iterdir() if p.suffix.lower() in (".jpg", ".jpeg", ".png"))
 for i, src in enumerate(sources):
     img = cv2.imdecode(np.fromfile(str(src), np.uint8), cv2.IMREAD_COLOR)
+    if args.shadow and src.stem.startswith(args.shadow):
+        img = cloud_shadow(img)
     lab = cv2.cvtColor(img.astype(np.float32) / 255, cv2.COLOR_BGR2Lab)
     noise = rng.normal(0, 9 + 3 * (i % 3), lab[:, :, 1:].shape).astype(np.float32)
     lab[:, :, 1:] += cv2.GaussianBlur(noise, (0, 0), 1.4) * 2.6  # blotchy, not per-pixel
@@ -129,6 +168,38 @@ save("02-side-by-side.png")
 ed._set_mode(SLIDER, save=False)
 show(1.25, 0.5, 0.5)
 save("03-slider.png")
+
+# ---- Shadow areas: brush strokes over the cloud shadow, then the whole picture side by side
+if args.shadow:
+    import math
+
+    from rulz.shadows import Stroke
+
+    row = next(i for i, it in enumerate(win.items) if it.path.stem.startswith(args.shadow))
+    win._open(row)
+    wait_editor()
+    ed._set_mode(SIDE, save=False)
+    ed.brush.setValue(26)
+    ed.show_areas.setChecked(False)  # the red tint would hide the shadow on the original
+    ed.shadow_rows["strength"].slider.setValue(100)  # 100 = as bright as the surroundings
+    full_h, full_w = ed._full.shape[:2]
+    side = max(full_h, full_w)
+    radius = 0.003 + 0.197 * (26 / 100.0) ** 2  # the Brush slider's size, as the editor computes it
+    cx, cy, rx, ry, angle = SHADOW
+    a = math.radians(angle)
+    for v in (-0.66, -0.33, 0.0, 0.33, 0.66):  # rows that fill the ellipse, kept inside its edge
+        half = rx * full_w * math.sqrt(1 - v * v) - radius * side
+        pts = []
+        for t in np.linspace(-1, 1, 24):
+            x, y = half * t, v * ry * full_h
+            pts.append(((cx * full_w + x * math.cos(a) - y * math.sin(a)) / full_w,
+                        (cy * full_h + x * math.sin(a) + y * math.cos(a)) / full_h))
+        ed._on_stroke(Stroke(tuple(pts), radius))
+        pump(0.2)
+    wait_editor(120)
+    ed.view.fit()
+    pump(1.0)
+    save("04-shadow-areas.png")
 
 win._show_library()
 win.close()

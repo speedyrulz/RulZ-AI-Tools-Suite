@@ -33,9 +33,12 @@ Discover/downloads, RAG and a CLI are planned.
     MTP layers built into the model file (Qwen3.5+ "MTP" GGUFs) are detected too and preferred. A **Draft model**
     picker can choose built-in layers or any draft file in the models folder instead.
 - **Chat** — streaming replies, collapsible reasoning ("thinking") blocks, Markdown with tables, LaTeX and
-  highlighted code, image and text-file attachments (drag-drop / paste), edit, regenerate, continue, branch,
-  delete; tok/s, time-to-first-token and token stats; context usage meter with "truncate middle" or "stop" overflow
-  policy; folders, pinning, search; per-chat system prompt and sampling settings; presets; JSON-schema structured output.
+  highlighted code, image and text-file attachments (drag-drop / paste), copy, edit, regenerate, continue, branch,
+  delete (with undo); a note typed while the model replies is sent now (stopping the reply, keeping its thinking) or
+  after it; tok/s, time-to-first-token and token stats; context usage meter with "truncate middle" or "stop" overflow
+  policy; folders, pinning, search; per-chat system prompt, sampling and thinking settings (on/off, reasoning effort,
+  thinking budget); presets; JSON-schema structured output. A message sent while its model is still loading waits for
+  that load.
 - **Chat handoff** — at 85% context (or any time via the header button) the model writes a handoff summary and
   a new chat with the same settings continues from it.
 - **MCP tools** — configure servers in `mcp.json` (same format as LM Studio / Cursor; stdio `command` or remote
@@ -112,6 +115,8 @@ Discover/downloads, RAG and a CLI are planned.
     `kind` and `practice`. RulZ Coding Agent 0.18.0 and its phone app use these to show and start RE tasks.
 - **Dark and light themes** — dark is the default; the first launch asks which look you want ("Choose your look").
   Switch any time with the sun/moon button in the top bar or in Settings ▸ Appearance (Dark, Light or System).
+- **System tray** — optional minimize-to-tray and close-to-tray (Settings ▸ Appearance), so loaded models and the API
+  server keep running with the window hidden.
 - GPU/RAM meters (nvidia-smi), keyboard shortcuts (see Settings).
 
 ## Engine

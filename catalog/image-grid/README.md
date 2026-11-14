@@ -6,7 +6,7 @@ A Windows app for arranging images into a labelled grid and exporting it as one 
 
 ## Run
 
-Install it from the RulZ AI Tools Suite launcher, or download `RulZ-Image-Grid-v<version>-win64.zip` from the suite's Releases page, unzip it anywhere and double-click `RulZ Image Grid.exe`. It runs on any Windows 10/11 PC (uses the built-in .NET Framework 4.8). You can also drag images or a folder onto the .exe.
+Install it from the RulZ AI Tools Suite launcher, or download `RulZ-Image-Grid-v<version>-win64.zip` from the suite's Releases page, unzip it anywhere and double-click `RulZ Image Grid.exe`. It runs on any Windows 10/11 PC (it uses .NET Framework 4.8, built into Windows 10 version 1903 and later, and Windows 11). You can also drag images or a folder onto the .exe.
 
 ## Features
 
@@ -19,7 +19,7 @@ Install it from the RulZ AI Tools Suite launcher, or download `RulZ-Image-Grid-v
 - **Dark or light look**: black and red (the default) or white and red, matching the other RulZ apps. You choose on first launch; switch any time with the *Light mode* checkbox at the right end of the toolbar. The choice is saved in `%APPDATA%\RulZ Image Grid\settings.ini`.
 - **Export** (Ctrl+E): set a scale from 1–200% of full resolution and see the exact output size in pixels before saving. Save as PNG or JPG (with a quality setting); the file name you type decides which, so `grid.png` is always a real PNG. There's a live preview. Images are drawn in one at a time, so saving needs memory for the finished picture plus a few source images, not all of them. If an image was moved or deleted after you added it, the export lists it instead of failing partway.
 
-Sizes (padding, text) are in output pixels at 100%, so what you see on screen is a scaled-down version of the export. Each tile is as big as the largest image, so 100% export keeps every image at its original resolution.
+Sizes (padding, text) are in output pixels at 100%, so what you see on screen is a scaled-down version of the export. Tiles are as wide as the widest image and as tall as the tallest, so a 100% export never shrinks a picture: the largest keep their original resolution, and smaller ones are enlarged to fit their tile while **Enlarge smaller images to fill tiles** is on.
 
 ## Build
 

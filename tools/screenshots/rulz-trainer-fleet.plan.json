@@ -1,0 +1,16 @@
+{
+  "port": 9341,
+  "match": "127.0.0.1:7899",
+  "width": 1500,
+  "height": 1000,
+  "outDir": "R:/out/rulz-trainer",
+  "startWaitMs": 1000,
+  "beforeShot": "document.querySelectorAll('.q-notification').forEach(n => n.remove()); 'ok'",
+  "shots": [
+    {
+      "name": "06-fleet.png",
+      "js": "[...document.querySelectorAll('.q-tab')].find(t => t.textContent.includes('Fleet')).click(), 'ok'",
+      "waitMs": 5000
+    }
+  ]
+}

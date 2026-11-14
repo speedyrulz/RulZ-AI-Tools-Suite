@@ -29,8 +29,9 @@ here (or have LM Studio installed, or set `LLAMA_SERVER_EXE`).
 
 Double-click **`Start Image Crawler.bat`**. It:
 
-1. loads the model once on **each** NVIDIA card with room for it (ports 8080, 8081, …), reusing any that are
-   already running; images are spread over all of them, so two GPUs check about twice as many per second,
+1. loads the model once on **each** NVIDIA card with about 12 GB of memory or more (GPU 0 if none has; ports
+   8080, 8081, …), reusing a vision llama-server already running on one of those ports; images are spread over
+   all of them, so two GPUs check about twice as many per second,
 2. waits for the model to load (about 10–20 s); a card that fails (e.g. busy with another program) is skipped,
 3. starts the app (port 8000) and opens <http://127.0.0.1:8000> in your browser.
 
@@ -58,21 +59,33 @@ powershell -ExecutionPolicy Bypass -File start_app.ps1 -Gpu 1 -NoBrowser
    EXCLUDE). Set the confidence to save at (0.8 is suggested for small body details like hands or eyes), a
    **minimum size in megapixels** (0 = any) and the crawl limits.
 3. **Crawl & Download** (or **Scan & Copy matches**). Matches appear as they're found, each with its size;
-   Pause, Resume and Cancel at any time.
-4. Use the slider to hide less certain matches and **Download shown as zip**, or grab single images.
+   Pause, Resume and Cancel at any time. Anything that went wrong (a page that failed, a site asking to slow
+   down) shows under **Problems** as it happens. Reloading or reopening the page brings a running search back
+   with its controls.
+4. Use the slider to hide less certain matches and **Download shown as zip** (it starts at once; the zip is made
+   while it downloads, and its `matches.json` lists every match of the run), or grab single images.
 5. **Past searches** lists every earlier run (also from before a restart); **View** reopens its matches.
 
 **Full-size originals** (on by default): for each picture the app first tries the full-size original — the
 image file a thumbnail links to, or the address with the site's resize markers removed (Wikimedia,
 WordPress `-300x200`, Shopify, Google/Blogger, `?w=…` CDN parameters) — and falls back to the page's own copy.
-At most two downloads per site run at once; if a site answers "too many requests" the app uses the page's
-copies for that site until it says to try again, and notes this under Problems.
+At most two downloads per site run at once. If a site answers "too many requests" to a guessed original, the
+app uses the page's copies for that site until it says to try again; if it says so for the page's own copy,
+downloads from that site wait as long as it asks, then try once more. Either way it's noted under Problems.
+Pictures served as AVIF are kept like any other format.
+
+**Stay in this folder** (off by default): only follow links inside the start address's folder and below.
+Starting at `example.com/gallery/cats` (or `.../cats/`, or `.../cats/index.html`) crawls `/gallery/cats/...`
+but never `/gallery/dogs/` or the site's home page. Off, the crawler follows any link on the same site.
+Either way, a link that redirects off the site (or out of the folder) is skipped once the crawler sees where
+it landed, and so is a page **Respect robots.txt** rules out at its new address; they count as *pages skipped*.
 
 **Confidence** is the model's own probability for its yes/no answer, so clear-cut images score ~1.00 and
 borderline ones lower; the slider is most useful for subtle prompts.
 
 Each run is saved to `output\<date>_<site or folder>_<tag>\` with the image files and `matches.json`. Folder
-scans **copy** matches there; the scanned folder is never changed.
+scans **copy** matches there; the scanned folder is never changed. If that disk fills up, the run pauses with a
+message (the match it was saving is kept); free some space and press Resume.
 Expect roughly 1–2 s per new image; images checked before come from the cache instantly.
 
 ## Where things are
@@ -89,14 +102,14 @@ Expect roughly 1–2 s per new image; images checked before come from the cache 
 ## Tests
 
 ```powershell
-python -m pytest crawler_app        # 23 tests, real Chromium + a fake model; no GPU needed
-python -m pytest image_detection    # 37 engine tests, no GPU needed
+python -m pytest crawler_app        # 57 tests, real Chromium + a fake model; no GPU needed
+python -m pytest image_detection    # 55 engine tests, no GPU needed
 python image_detection\scripts\eval_labeled.py   # accuracy on your labeled images (see image_detection\README.md)
 ```
 
 ## Requirements
 
-Windows, Python 3.11+, an NVIDIA GPU with ~16 GB, and a llama.cpp CUDA build: the `llama.cpp` folder here, LM
+Windows, Python 3.11+, an NVIDIA GPU with ~12 GB or more, and a llama.cpp CUDA build: the `llama.cpp` folder here, LM
 Studio's CUDA 12 backend, or `LLAMA_SERVER_EXE`. The start script uses `.venv` when it's there, otherwise
 `python` on PATH. See [Install](#install).
 

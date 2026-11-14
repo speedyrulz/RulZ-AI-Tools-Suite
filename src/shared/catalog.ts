@@ -98,8 +98,8 @@ export const CATALOG: CatalogApp[] = [
     tagline: 'Run local LLMs with llama.cpp: models, chat, tools and an API server',
     description:
       'A desktop app for running local LLMs in your own llama.cpp build. Browse your GGUF models, load them with a ' +
-      'memory estimate, chat with streaming and reasoning blocks, use MCP tools, and serve OpenAI- and ' +
-      'Anthropic-compatible APIs.',
+      'memory estimate, chat with streaming and reasoning blocks, use MCP tools, analyse programs on the Reverse ' +
+      'Engineering page, and serve OpenAI- and Anthropic-compatible APIs.',
     category: 'LLM',
     repo: SUITE_REPO,
     path: 'apps/rulz-llm-suite',
@@ -127,7 +127,8 @@ export const CATALOG: CatalogApp[] = [
     description:
       'Type what you want ("make a video upscaler with a drag-and-drop window") and a local model creates the files, ' +
       'installs what is needed, runs the app, reads the errors and fixes them, asking for your OK before risky steps. ' +
-      'Every task can be undone. It talks to RulZ LLM Suite, so nothing leaves your computer.',
+      'Every task can be undone. It talks to RulZ LLM Suite, so nothing leaves your computer, and its Android app (the QR code on the home page) lets ' +
+      'you follow and steer it from your phone.',
     category: 'LLM',
     repo: SUITE_REPO,
     path: 'apps/rulz-coding-agent',
@@ -343,7 +344,8 @@ export const CATALOG: CatalogApp[] = [
       'Every repo and storage bucket in your Hugging Face account in one table, with sizes and visibility. Open one ' +
       'to browse its files, then upload, download, rename, move, copy or delete them with a click: changes to a repo ' +
       'go into one commit (or a pull request), bucket moves run on the Hub, and big uploads are read straight from ' +
-      'disk. Runs in your browser on this computer; your token stays here.',
+      'disk. Send models and whole repos to your vast.ai instance, which downloads them itself, and run commands on ' +
+      'it from the same page. Runs in your browser on this computer; your token stays here.',
     category: 'AI Training',
     repo: SUITE_REPO,
     path: 'apps/RulZ-Huggingface-Manager',
@@ -371,7 +373,7 @@ export const CATALOG: CatalogApp[] = [
       'Add a Hugging Face access token (Write) under Settings. It is kept in %APPDATA%\\RulZ-HF-Manager, ' +
         'separate from the program.'
     ],
-    highlights: ['Repos and buckets in one table', 'Move, copy, rename in one commit', 'Big uploads from disk', 'Bucket sync']
+    highlights: ['Repos and buckets in one table', 'Move, copy, rename in one commit', 'Send to vast.ai', 'Bucket sync']
   }
 ]
 

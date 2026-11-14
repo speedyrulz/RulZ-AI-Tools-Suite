@@ -108,12 +108,15 @@ def install_demo(hub) -> None:
     hub.repo_summary = repo_summary
 
     class DemoFS(hub.RepoFS):
-        def list_dir(self, folder):
+        def list_dir(self, folder, expand=False):
             entries = []
             for name, is_dir, size, modified, storage in MODEL_FILES.get(folder.strip('/'), []):
                 entries.append(hub.Entry(hub.join(folder, name), is_dir, size, modified, lfs=storage == 'lfs',
                                          xet_hash='demo' if storage == 'xet' else None, raw=object()))
             return entries
+
+        def last_commit_dates(self, folder, limit=hub.DATES_LIMIT, should_stop=None):
+            return {e.path: e.modified for e in self.list_dir(folder) if e.modified}
 
         def list_files(self, folder=''):
             return [e for e in self.list_dir(folder) if not e.is_dir]
@@ -134,6 +137,64 @@ def install_demo(hub) -> None:
             return README.encode() if path.lower().endswith('.md') else b'{}'
 
     hub.open_fs = lambda kind, repo_id, revision=None: DemoFS(kind, repo_id, revision)
+
+
+DEMO_CONN = {'host': '203.0.113.24', 'port': 41022, 'user': 'root', 'route': 'direct', 'instance_id': 61204417,
+             'label': 'trainer-5090'}  # 203.0.113.0/24 is a documentation-only address range
+GiB = 1024 ** 3
+NOW_TS = NOW.timestamp()
+REMOTE_TREE = {
+    '/workspace': (['ComfyUI', 'RulzTrainer', 'datasets', 'models'],
+                   [('provision.log', 48_210), ('requirements.txt', 1_204)]),
+    '/workspace/models': (['tiny-chat-3b-gguf'], [('watercolor_sdxl_lora.safetensors', int(228.5 * MB))]),
+}
+REMOTE_JOBS = [
+    {'id': '20261113-1412-a1', 'title': 'demo-user/tiny-chat-3b-gguf', 'state': 'running', 'dest': '/workspace/models/tiny-chat-3b-gguf',
+     'mode': 'repo', 'files_done': 3, 'files_total': 7, 'bytes_total': int(9.84 * GB), 'bytes_done': int(5.1 * GB),
+     'speed': 412 * MB, 'started': NOW_TS - 14},
+    {'id': '20261113-1405-b7', 'title': 'demo-user/watercolor-sdxl-lora: watercolor_sdxl_lora.safetensors', 'state': 'done',
+     'dest': '/workspace/ComfyUI/models/loras', 'mode': 'files', 'files_done': 1, 'files_total': 1,
+     'bytes_total': int(228.5 * MB), 'bytes_done': int(228.5 * MB), 'started': NOW_TS - 420, 'finished': NOW_TS - 418},
+]
+
+
+def install_vast_demo(vast) -> None:
+    """A made-up attached vast.ai instance: nothing reaches vast.ai and no ssh is run."""
+    vast.api_key = lambda: 'demo'
+    vast.key_source = lambda: 'saved in this app'
+    route = [{'route': 'direct', 'host': DEMO_CONN['host'], 'port': DEMO_CONN['port']}]
+    vast.list_instances = lambda: [
+        vast.Instance(61204417, 'trainer-5090', 'running', 'RTX 5090', 1, 0.90, 200.0, 64.0, 'vastai/pytorch',
+                      'RulzTrainer', '', route),
+        vast.Instance(61207733, 'comfy-4090', 'running', 'RTX 4090', 1, 0.45, 120.0, 38.0, 'vastai/comfy', 'ComfyUI',
+                      '', route),
+    ]
+    vast.reachable = lambda conn: True
+    vast.reconnect = lambda conn: conn
+
+    def call(self, cmd, timeout=90, **args):
+        disk = {'free': int(136 * GiB), 'total': int(200 * GiB)}
+        if cmd == 'info':
+            return {'hostname': 'C.61204417', 'home': '/root', 'python': '/venv/main/bin/python',
+                    'python_version': '3.12.3', 'gpus': ['NVIDIA GeForce RTX 5090, 32607 MiB'], 'workspace': disk,
+                    'home_disk': disk, 'hf_home': ['/workspace/.hf_home'],
+                    'suggestions': [{'label': 'ComfyUI loras', 'path': '/workspace/ComfyUI/models/loras', 'kind': 'comfy'},
+                                    {'label': 'ComfyUI checkpoints', 'path': '/workspace/ComfyUI/models/checkpoints', 'kind': 'comfy'},
+                                    {'label': 'ComfyUI models', 'path': '/workspace/ComfyUI/models', 'kind': 'comfy'},
+                                    {'label': 'workspace', 'path': '/workspace', 'kind': 'folder'}],
+                    'running': 1}
+        if cmd == 'ls':
+            path = (args.get('path') or '/workspace').rstrip('/') or '/'
+            dirs, files = REMOTE_TREE.get(path, ([], []))
+            return {'path': path, 'parent': path.rsplit('/', 1)[0] or '/', 'exists': True,
+                    'dirs': [{'name': d, 'mtime': NOW_TS - 3600} for d in dirs],
+                    'files': [{'name': n, 'size': s, 'mtime': NOW_TS - 7200} for n, s in files], 'more': False, **disk}
+        if cmd == 'df':
+            return {'path': args.get('path') or '/workspace', 'exists': True, **disk}
+        if cmd == 'jobs':
+            return {'jobs': REMOTE_JOBS}
+        return {}
+    vast.Remote.call = call
 
 
 def main() -> None:
@@ -162,13 +223,15 @@ def main() -> None:
                       {'kind': 'bucket', 'id': 'demo-user/training-runs'}],
         'recent': [{'kind': 'dataset', 'id': 'demo-user/landscape-captions-10k'},
                    {'kind': 'model', 'id': 'demo-user/tiny-chat-3b-gguf'}],
+        'vast_conn': DEMO_CONN,
     }, indent=2), encoding='utf-8')
     os.chdir(data)  # NiceGUI keeps its .nicegui storage folder in the working directory
 
     sys.path.insert(0, str(Path(a.app).resolve()))
-    from rulz_hf_manager import hub, main as app_main
+    from rulz_hf_manager import hub, main as app_main, vast
 
     install_demo(hub)
+    install_vast_demo(vast)
     app_main.main(['--port', str(a.port), '--no-browser'])
 
 
