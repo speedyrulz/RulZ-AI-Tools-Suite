@@ -17,7 +17,7 @@ Install it from the RulZ AI Tools Suite launcher, or download `RulZ-Image-Grid-v
 - **Row/column labels**: type them in the side panel (one per line), or double-click a header on the grid. Each set can be turned off. A set of labels you leave completely empty takes no space in the saved image (one empty label in a set that has others still keeps its space); the faint *Column 1* / *Row 1* placeholders only show in the editor.
 - **Layout**: columns, padding, text sizes, background (white/gray/black/transparent), text color, and whether smaller images are enlarged to fill their tile.
 - **Dark or light look**: black and red (the default) or white and red, matching the other RulZ apps. You choose on first launch; switch any time with the *Light mode* checkbox at the right end of the toolbar. The choice is saved in `%APPDATA%\RulZ Image Grid\settings.ini`.
-- **Export** (Ctrl+E): set a scale from 1–200% of full resolution and see the exact output size in pixels before saving. Save as PNG or JPG (with a quality setting). There's a live preview.
+- **Export** (Ctrl+E): set a scale from 1–200% of full resolution and see the exact output size in pixels before saving. Save as PNG or JPG (with a quality setting); the file name you type decides which, so `grid.png` is always a real PNG. There's a live preview. Images are drawn in one at a time, so saving needs memory for the finished picture plus a few source images, not all of them. If an image was moved or deleted after you added it, the export lists it instead of failing partway.
 
 Sizes (padding, text) are in output pixels at 100%, so what you see on screen is a scaled-down version of the export. Each tile is as big as the largest image, so 100% export keeps every image at its original resolution.
 

@@ -306,8 +306,10 @@ export class ModelLibrary {
       }
       files.push({ path: f.path, sizeBytes: f.size, mtimeMs: f.mtimeMs, info: entry.info, error: entry.error })
     }
+    // Only this folder's entries: a plain prefix would also drop a sibling's, like C:\LLM2 for C:\LLM.
+    const under = root.endsWith(sep) ? root : root + sep
     for (const p of Object.keys(this.cache)) {
-      if (!seen.has(p) && p.startsWith(root)) {
+      if (!seen.has(p) && p.startsWith(under)) {
         delete this.cache[p]
         dirty = true
       }

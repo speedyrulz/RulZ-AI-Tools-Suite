@@ -2,7 +2,7 @@ import os
 import subprocess
 import threading
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (QAbstractItemDelegate, QApplication, QCheckBox, QComboBox, QDockWidget, QFileDialog, QFormLayout,
                                QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
@@ -11,13 +11,14 @@ from PySide6.QtWidgets import (QAbstractItemDelegate, QApplication, QCheckBox, Q
 
 from . import config, theme
 from .backend import CaptionEngine, ServerManager, StartCancelled, external_endpoints
-from .gridview import ImageGrid
+from .gridview import CaptionEditor, ImageGrid
 from .model import (BUSY, ERROR, IDLE, QUEUED, FilterProxy, ImageModel, caption_clashes, caption_path,
-                    collect_images, load_entries, unique_new)
+                    collect_images, load_entries, read_caption, unique_new)
 from .settings_dialog import SettingsDialog
 
 MANAGED_KEYS = ("llama_server", "model", "mmproj", "gpus", "gpu_mode", "tensor_split", "ctx_size", "ngl",
                 "slots_per_server", "extra_args", "base_port", "disable_thinking", "thinking_budget")
+SEARCH_DELAY_MS = 200
 
 
 class ServerBridge(QObject):
@@ -151,7 +152,11 @@ class MainWindow(QMainWindow):
         self.search.setPlaceholderText("Search captions / names")
         self.search.setClearButtonEnabled(True)
         self.search.setMaximumWidth(220)
-        self.search.textChanged.connect(lambda t: self.proxy.set_filter(text=t) or self._update_stats())
+        # filter once typing pauses: each pass checks every image (tens of ms at 20,000, more when
+        # many cards hide or show), which made typing a word stutter
+        self.search_timer = QTimer(self, singleShot=True, interval=SEARCH_DELAY_MS)
+        self.search_timer.timeout.connect(self._apply_search)
+        self.search.textChanged.connect(lambda _: self.search_timer.start())
         tb.addWidget(self.search)
         tb.addWidget(QLabel("  Thumbnails: "))
         sl = QSlider(Qt.Horizontal)
@@ -251,8 +256,8 @@ class MainWindow(QMainWindow):
             return self.save_prompt_as()
         self.prompts[i]["system"] = self.sys_edit.toPlainText()
         self.prompts[i]["user"] = self.user_edit.toPlainText().strip()
-        config.save_prompts(self.prompts)
-        self.statusBar().showMessage(f"Saved prompt '{self.prompts[i]['name']}'", 3000)
+        if self._save_prompts():
+            self.statusBar().showMessage(f"Saved prompt '{self.prompts[i]['name']}'", 3000)
 
     def save_prompt_as(self):
         name, ok = QInputDialog.getText(self, "Save prompt", "Name:", text=self.prompt_combo.currentText())
@@ -266,7 +271,7 @@ class MainWindow(QMainWindow):
                 break
         else:
             self.prompts.append(entry)
-        config.save_prompts(self.prompts)
+        self._save_prompts()
         self._reload_prompt_combo(name)
 
     def delete_prompt(self):
@@ -274,8 +279,16 @@ class MainWindow(QMainWindow):
         if i < 0 or QMessageBox.question(self, "Delete prompt", f"Delete '{self.prompts[i]['name']}'?") != QMessageBox.Yes:
             return
         del self.prompts[i]
-        config.save_prompts(self.prompts)
+        self._save_prompts()
         self._reload_prompt_combo()
+
+    def _save_prompts(self):
+        if config.save_prompts(self.prompts):
+            return True
+        QMessageBox.warning(self, "Prompts not saved", f"{config.PROMPTS_FILE} couldn't be read when the app "
+                            "started (another program may have it open), so it isn't overwritten. Your "
+                            "prompt change lasts until you close the app.")
+        return False
 
     # ------------------------------------------------------------------ images
     def add_images(self):
@@ -324,6 +337,12 @@ class MainWindow(QMainWindow):
             msg += f"; {len(unreadable)} folder(s) couldn't be read (see log)"
             for d in unreadable:
                 self._log(f"Couldn't read folder: {d}")
+        bad = [e for e in entries if e.get("unreadable")]
+        if bad:
+            msg += f"; {len(bad)} caption file(s) couldn't be read (see log)"
+            for e in bad:
+                self._log(f"Couldn't read {caption_path(e['path'])}, so it is left alone: {e['unreadable']}")
+            self.log_dock.show()
         if err:
             self._log(f"Adding images failed: {err}")
             QMessageBox.warning(self, "Add images", f"Adding images failed:\n\n{err}")
@@ -361,12 +380,30 @@ class MainWindow(QMainWindow):
     def remove_selected(self):
         rows = self._selected_rows()
         if rows:
+            # don't spend GPU time on images that are off the list
+            gone = {self.model.items[r]["path"] for r in rows}
+            if self.engine.active:
+                self.engine.drop(gone)
+            if self.pending_job:  # a job still waiting for the model
+                paths, *rest = self.pending_job
+                paths = [p for p in paths if p not in gone]
+                self.pending_job = (paths, *rest) if paths else None
             self.model.remove_rows(rows)
 
     def clear_list(self):
         if (self.model.items or self.adding) and QMessageBox.question(self, "Clear list", "Remove all images from the list?\n(Files on disk are not touched.)") == QMessageBox.Yes:
             self.add_gen += 1  # images still being scanned are dropped too
+            if self.engine.active:
+                self.engine.drop(list(self.model.index_of))  # replies on their way are unwanted too
+                self.engine.cancel()  # nothing left to caption
+            self.pending_job = None  # nor for a job waiting for the model (which goes on loading)
             self.model.clear()
+
+    def _apply_search(self):
+        self.search_timer.stop()
+        if self.search.text().lower() != self.proxy.text:
+            self.proxy.set_filter(text=self.search.text())
+            self._update_stats()
 
     def _thumb_size(self, v):
         self.s["thumb_size"] = v
@@ -393,9 +430,20 @@ class MainWindow(QMainWindow):
 
     def _clear_selected_captions(self):
         rows = self._selected_rows()
-        if rows and QMessageBox.question(self, "Clear captions", f"Empty the caption of {len(rows)} image(s)?") == QMessageBox.Yes:
-            for r in rows:
-                self.model.set_caption(r, "")
+        if not rows or QMessageBox.question(self, "Clear captions", f"Empty the caption of {len(rows)} image(s)?") != QMessageBox.Yes:
+            return
+        failed = []
+        for r in rows:  # one file that can't be written no longer stops the rest (with an uncaught error)
+            try:
+                self.model.set_caption(r, "", stats=False)
+            except RuntimeError as e:
+                failed.append(str(e))
+        self.model.stats_changed.emit()
+        if failed:
+            for m in failed:
+                self._log(m)
+            QMessageBox.warning(self, "Clear captions", f"{len(failed)} caption file(s) couldn't be written "
+                                f"(see View ▸ Log):\n\n" + "\n".join(failed[:5]))
 
     # ------------------------------------------------------------------ settings / servers
     def current_settings(self):
@@ -407,7 +455,10 @@ class MainWindow(QMainWindow):
         dlg = SettingsDialog(self.current_settings(), self)
         if dlg.exec():
             self.s = dlg.result_settings()
-            config.save_settings(self.s)
+            if not config.save_settings(self.s):
+                QMessageBox.warning(self, "Settings not saved", f"{config.SETTINGS_FILE} couldn't be read when "
+                                    "the app started (another program may have it open), so it isn't "
+                                    "overwritten. The new settings last until you close the app.")
 
     def set_light_mode(self, on):
         """Switch the whole app between the dark and light theme right away and remember it."""
@@ -436,11 +487,13 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Loading model onto GPU(s)… (see View ▸ Log)")
         self.log_dock.show()
 
+        ticket = self.servers.begin()  # here, so a Stop pressed from now on reaches this start
+
         def run():
             # start() kills what it launched if it fails or is cancelled, so no stop() here:
             # that could kill servers a newer start already brought up
             try:
-                eps = self.servers.start(s, self.bridge.log.emit)
+                eps = self.servers.start(s, self.bridge.log.emit, ticket=ticket)
                 self.bridge.ready.emit(eps)
             except StartCancelled:
                 self.bridge.cancelled.emit()
@@ -476,12 +529,16 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Servers stopped", 3000)
 
     def _servers_ready(self, eps):
+        if not self.servers.running():  # stopped (or one died) between its health check and now
+            return self._servers_cancelled()
         self.starting = False
         self.progress.setVisible(False)
         self.statusBar().showMessage(f"{len(eps)} server(s) ready", 4000)
         if self.pending_job:
-            self._run_engine(eps, *self.pending_job)
-            self.pending_job = None
+            job, self.pending_job = self.pending_job, None
+            self._run_engine(eps, *job)
+        elif not self.engine.active:
+            self.a_stop.setEnabled(False)  # its job was cleared away while the model loaded
 
     def _servers_error(self, msg):
         self.starting = False
@@ -502,16 +559,28 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Server start stopped", 4000)
 
     # ------------------------------------------------------------------ captioning
+    def _commit_open_editors(self):
+        """Save what is typed in an open caption box and close it (Ctrl+Return works from inside one),
+        so the job sees it as the image's caption."""
+        for ed in self.grid.viewport().findChildren(CaptionEditor):
+            if not ed.isHidden():  # closed editors are hidden until they are deleted
+                self.grid.commitData(ed)
+                self.grid.closeEditor(ed, QAbstractItemDelegate.NoHint)
+
     def caption(self, which):
         if self.engine.active or self.starting:
             return
+        self._commit_open_editors()
+        self._apply_search()  # Caption All takes what the grid shows: a search still being typed counts
         s = self.current_settings()
         if which == "selected":
             rows = self._selected_rows()
         else:  # everything currently visible in the grid
             rows = [self.proxy.mapToSource(self.proxy.index(i, 0)).row() for i in range(self.proxy.rowCount())]
         if s["skip_existing"] and which == "all":
-            rows = [r for r in rows if not self.model.items[r]["caption"].strip()]
+            # a caption file that couldn't be read may well hold a caption: leave it alone too
+            rows = [r for r in rows if not self.model.items[r]["caption"].strip()
+                    and not self.model.items[r].get("unreadable")]
         paths = [self.model.items[r]["path"] for r in rows]
         if not paths:
             self.statusBar().showMessage("Nothing to caption", 3000)
@@ -519,13 +588,14 @@ class MainWindow(QMainWindow):
         if s["backend"] == "external" and not external_endpoints(s):
             QMessageBox.warning(self, "Settings", "Add at least one endpoint URL in Settings.")
             return
-        for p in paths:
-            self.model.set_status(p, QUEUED)
+        self.model.set_statuses(rows, QUEUED)
         self.snapshots = {self.model.items[r]["path"]: self.model.items[r]["caption"] for r in rows}
         self.failures = self.warnings = 0
         self.run_managed = s["backend"] == "managed"
         self.a_stop.setEnabled(True)
-        job = (paths, self.sys_edit.toPlainText(), self.user_edit.toPlainText().strip())
+        # the settings go with the job: ones changed while the model loads apply to the next job, not
+        # to this one (whose servers were started with the old ones)
+        job = (paths, self.sys_edit.toPlainText(), self.user_edit.toPlainText().strip(), s)
         if s["backend"] == "external":
             self._run_engine(external_endpoints(s), *job)
         elif self.servers.running() and self.server_sig == self._managed_sig():
@@ -535,13 +605,13 @@ class MainWindow(QMainWindow):
             self.server_sig = self._managed_sig()
             self._launch_servers()
 
-    def _run_engine(self, eps, paths, system, user):
+    def _run_engine(self, eps, paths, system, user, s):
         self.progress.setVisible(True)
         self.progress.setRange(0, len(paths))
         self.progress.setValue(0)
         workers = sum(e["slots"] for e in eps)
         self._log(f"Captioning {len(paths)} image(s) with {workers} worker(s) on {len(eps)} endpoint(s)")
-        self.engine.start(paths, eps, system, user, self.s)
+        self.engine.start(paths, eps, system, user, s)
         if not self.engine.active:  # no endpoints: nothing ran
             self._on_finished()
             return
@@ -554,13 +624,11 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Stopping after in-flight requests finish…")
 
     def _reset_queued(self):
-        for it in self.model.items:
-            if it["status"] in (QUEUED, BUSY):
-                self.model.set_status(it["path"], IDLE)
+        self.model.set_statuses(range(len(self.model.items)), IDLE, only=(QUEUED, BUSY))
 
     def _on_captioned(self, path, text):
         row = self.model.index_of.get(path)
-        if row is None:
+        if row is None or self.engine.is_dropped(path):  # removed during the job (maybe added again)
             return
         # an inline editor open on this card holds the old text: commit it now, so it can't
         # overwrite the model's caption later and any typing in it counts as an edit below
@@ -573,6 +641,21 @@ class MainWindow(QMainWindow):
             self.model.set_status(path, IDLE)
             self._log(f"Kept your edit of {os.path.basename(path)} (model caption not saved): {text}")
             return
+        # and the file itself: another program (or the other image of a pair sharing one caption file)
+        # may have written it since it was read
+        try:
+            on_disk, exists = read_caption(path)
+        except OSError as e:
+            self.failures += 1
+            self.model.set_status(path, ERROR)
+            self._log(f"FAILED {os.path.basename(path)}: couldn't read the caption file already there, "
+                      f"so it wasn't replaced ({e})")
+            return
+        if exists and on_disk != self.model.items[row]["caption"]:
+            self.model.show_caption(row, on_disk)
+            self._log(f"Kept {os.path.basename(caption_path(path))}: it changed on disk while "
+                      f"{os.path.basename(path)} was being captioned (model caption not saved): {text}")
+            return
         try:
             self.model.set_caption(row, text, force=True)
         except RuntimeError as e:  # captioned, but the .txt couldn't be written: that image failed
@@ -580,6 +663,8 @@ class MainWindow(QMainWindow):
             self._log(f"FAILED {os.path.basename(path)}: {e}")
 
     def _on_failed(self, path, err):
+        if self.engine.is_dropped(path):
+            return
         self.failures += 1
         self.model.set_status(path, ERROR)
         self._log(f"FAILED {os.path.basename(path)}: {err}")
@@ -594,6 +679,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Captioning {done}/{total}")
 
     def _on_finished(self):
+        if self.engine.active:  # late signal of the previous job, after the next one started
+            return
         self._reset_queued()
         self.progress.setVisible(False)
         self.a_stop.setEnabled(False)

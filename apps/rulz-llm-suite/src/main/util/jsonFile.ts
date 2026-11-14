@@ -69,10 +69,18 @@ export function writeJsonAtomic(path: string, data: unknown): Promise<void> {
 
 async function doWrite(path: string, data: unknown): Promise<void> {
   await fs.mkdir(dirname(path), { recursive: true })
+  await writeTextAtomic(path, JSON.stringify(data, null, 2))
+}
+
+/**
+ * Writes text via a temp file + rename, retrying the rename while Windows locks the target. The
+ * caller serializes writes to one path (the temp name is per process, not per call).
+ */
+export async function writeTextAtomic(path: string, text: string): Promise<void> {
   const tmp = `${path}.${process.pid}.tmp`
   const fh = await fs.open(tmp, 'w')
   try {
-    await fh.writeFile(JSON.stringify(data, null, 2), 'utf8')
+    await fh.writeFile(text, 'utf8')
     // Without this a power cut can leave the renamed file empty: the rename reaches the disk
     // before the data does.
     await fh.sync()

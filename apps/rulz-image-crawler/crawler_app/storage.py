@@ -2,18 +2,31 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
-import tempfile
 import threading
 import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .fetcher import FetchedImage
 from .urls import file_stem, site_key, slug
+
+REPLACE_TRIES = 10  # matches.json replace attempts, 50 ms apart
+
+
+def _plain_name(name: object) -> bool:
+    return isinstance(name, str) and name not in ("", ".", "..") and Path(name).name == name and "\\" not in name and ":" not in name
+
+
+def _unlink_quietly(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def make_run_dir(
@@ -48,9 +61,16 @@ class RunStorage:
         """A finished (or interrupted) run read back from its matches.json; only files that are
         listed there and still on disk are served."""
         doc = json.loads((folder / "matches.json").read_text(encoding="utf-8"))
+        if not isinstance(doc, dict):
+            raise ValueError("matches.json is not an object")
         entries = doc.pop("matches", [])
         st = cls(folder, doc)
-        st.entries = [e for e in entries if isinstance(e, dict) and (folder / str(e.get("file", ""))).is_file()]
+        # Plain file names only: a hand-edited "../x" or "C:\x" must never be served from outside the folder.
+        st.entries = [
+            e
+            for e in (entries if isinstance(entries, list) else [])
+            if isinstance(e, dict) and _plain_name(e.get("file")) and (folder / e["file"]).is_file()
+        ]
         st._names = {e["file"] for e in st.entries}
         return st
 
@@ -64,8 +84,12 @@ class RunStorage:
         path = self.folder / name
         if name not in self._names:
             tmp = path.with_suffix(path.suffix + ".part")
-            tmp.write_bytes(img.data)
-            os.replace(tmp, path)
+            try:
+                tmp.write_bytes(img.data)
+                os.replace(tmp, path)
+            except BaseException:
+                _unlink_quietly(tmp)  # no half-written .part left behind (disk full, path too long)
+                raise
             self._names.add(name)
         entry = {
             "file": name,
@@ -88,11 +112,23 @@ class RunStorage:
         return {**self.meta, "matches": list(self.entries)}
 
     def write_manifest(self) -> None:
+        """Rewrites matches.json. Marked clean only once the new file is in place: on Windows the
+        replace fails while anyone has the old file open (the history list reading it), and the next
+        flush has to try again rather than believe it was written."""
         with self._lock:
-            self._dirty = False
             tmp = self.folder / "matches.json.part"
             tmp.write_text(json.dumps(self._doc(), indent=2, ensure_ascii=False), encoding="utf-8")
-            os.replace(tmp, self.folder / "matches.json")
+            target = self.folder / "matches.json"
+            for attempt in range(REPLACE_TRIES):
+                try:
+                    os.replace(tmp, target)
+                    break
+                except PermissionError:  # a reader has it open for a few milliseconds
+                    if attempt == REPLACE_TRIES - 1:
+                        _unlink_quietly(tmp)
+                        raise
+                    time.sleep(0.05)
+            self._dirty = False
 
     @property
     def dirty(self) -> bool:
@@ -109,35 +145,83 @@ class RunStorage:
     def has_file(self, name: str) -> bool:
         return name in self._names
 
-    def build_zip(self, min_confidence: float, dest_dir: Path) -> Path:
-        """Zip of saved files at or above min_confidence, plus matches.json, as a new file in dest_dir
-        that the caller deletes once it is sent. Never in the run folder: a fixed name there can't be
-        replaced while an earlier download still has it open (Windows), and every slider position
-        would leave another full copy of the matches behind. Images are already compressed, so they
-        are stored as-is."""
+    def iter_zip(self, min_confidence: float) -> Iterator[bytes]:
+        """Zip of saved files at or above min_confidence, plus matches.json, made while it is sent: the
+        download starts at once, and no temporary copy of the matches is written (a big run's zip used
+        to be built in full on disk first). Images are already compressed, so they are stored as-is.
+        A plain (blocking) generator: the web server runs it in a worker thread."""
         # Snapshot under the lock, zip outside it: saves (and the manifest flush) carry on meanwhile.
         # Saved image files are never rewritten, so reading them unlocked is safe.
         with self._lock:
             doc = self._doc()
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        fd, name = tempfile.mkstemp(prefix=f"{self.folder.name[:80]}_", suffix=".zip", dir=dest_dir)
-        os.close(fd)
-        target = Path(name)
-        try:
-            with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_STORED) as zf:
-                for e in doc["matches"]:
-                    path = self.folder / e["file"]
-                    if e["confidence"] >= min_confidence and path.is_file():  # skip files deleted by hand
-                        zf.write(path, e["file"])
-                zf.writestr("matches.json", json.dumps(doc, indent=2, ensure_ascii=False))
-        except BaseException:
-            target.unlink(missing_ok=True)
-            raise
-        return target
+        out = _ZipStream()
+        with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_STORED) as zf:
+            for e in doc["matches"]:
+                conf = e.get("confidence")
+                # A hand-edited entry without a number is left out: an error here would cut off a
+                # download that has already started.
+                if not isinstance(conf, (int, float)) or conf < min_confidence:
+                    continue
+                try:
+                    zf.write(self.folder / e["file"], e["file"])
+                except OSError:  # deleted (or locked) by hand since it was saved
+                    continue
+                yield out.take()
+            zf.writestr("matches.json", json.dumps(doc, indent=2, ensure_ascii=False))
+        yield out.take()
+
+
+class _ZipStream(io.RawIOBase):
+    """Where a zip being streamed is written. zipfile goes back to each entry's header to fill in its
+    size and CRC once the entry's data is written, so the entry being written is held here until it
+    is finished; take() hands out everything finished so far. Seeking back into bytes already handed
+    out is refused (zipfile never does it)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._buf = bytearray()
+        self._base = 0  # stream offset of _buf[0]
+        self._pos = 0
+
+    def writable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if whence == io.SEEK_CUR:
+            offset += self._pos
+        elif whence == io.SEEK_END:
+            offset += self._base + len(self._buf)
+        if offset < self._base:
+            raise OSError("cannot seek back into data that was already sent")
+        self._pos = offset
+        return offset
+
+    def write(self, b) -> int:
+        data = bytes(b)
+        i = self._pos - self._base
+        if i > len(self._buf):
+            self._buf.extend(bytes(i - len(self._buf)))
+        self._buf[i : i + len(data)] = data
+        self._pos += len(data)
+        return len(data)
+
+    def take(self) -> bytes:
+        """Everything before the current position, which zipfile has finished with."""
+        n = self._pos - self._base
+        chunk = bytes(self._buf[:n])
+        del self._buf[:n]
+        self._base = self._pos
+        return chunk
 
 
 def sweep_zips(zip_dir: Path, older_than_s: float = 3600.0) -> None:
-    """Deletes zips left behind in zip_dir (a download that was cut off never runs its cleanup)."""
+    """Deletes zips left behind in zip_dir by versions before 1.4.0, which built each download there."""
     if not zip_dir.is_dir():
         return
     cutoff = time.time() - older_than_s

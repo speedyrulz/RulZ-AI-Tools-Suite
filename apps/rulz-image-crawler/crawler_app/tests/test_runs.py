@@ -140,16 +140,16 @@ def _past_run(out, name="2026-11-01_1200_e-com_red_shape") -> RunStorage:
     return st
 
 
-def test_zips_get_their_own_file_outside_the_run_folder(tmp_path):
+def test_two_downloads_of_one_zip_at_once_do_not_clash(tmp_path):
     st = _past_run(tmp_path / "out")
-    zips = tmp_path / "out" / ".zips"
-    first = st.build_zip(0.8, zips)
-    with open(first, "rb"):  # still being downloaded: a second download of the same zip doesn't clash
-        second = st.build_zip(0.8, zips)
-    assert first != second
-    with zipfile.ZipFile(second) as zf:
-        assert sorted(n.split("_")[0] for n in zf.namelist()) == ["blue", "green", "matches.json"]
-    assert not list(st.folder.glob("*.zip"))
+    first, second = st.iter_zip(0.8), st.iter_zip(0.8)
+    a = [next(first)]  # the first download is part-way through when the second starts
+    b = list(second)
+    a += list(first)
+    for chunks in (a, b):
+        with zipfile.ZipFile(io.BytesIO(b"".join(chunks))) as zf:
+            assert sorted(n.split("_")[0] for n in zf.namelist()) == ["blue", "green", "matches.json"]
+    assert not list(st.folder.glob("*.zip")) and not (tmp_path / "out" / ".zips").exists()
 
 
 def test_api_zip_history_cache_and_this_pc_only(tmp_path, fake_service):

@@ -9,9 +9,20 @@ namespace RulZ.ImageTournament
     // Images are paired in order (1v2, 3v4, ...). When a round has an odd image out it
     // advances automatically and is placed first in the next round, so it faces the winner
     // of the first match and the bye passes to a different image.
+    //
+    // Undo snapshots (TakeSnapshot) keep references to the round and winner lists and how long
+    // they were, instead of copying them. That only works because those lists are never changed
+    // except by appending (Choose, Add): anything that removes or reorders builds new lists.
     public sealed class Tournament
     {
         const string Header = "RulZImageTournament/1";
+
+        // A cheap record of the bracket for undo: O(1) to take, however many images there are.
+        public sealed class Snapshot
+        {
+            internal List<string> Round, Winners;
+            internal int RoundCount, WinnersCount, Pos, RoundNumber, Played;
+        }
 
         List<string> _round = new List<string>();
         List<string> _winners = new List<string>();
@@ -80,12 +91,18 @@ namespace RulZ.ImageTournament
         public bool Remove(string path)
         {
             if (!Contains(path)) return false;
+            // Removing builds a new list: an undo snapshot may still refer to the old one.
             int i = IndexOf(_round, path, _pos);
-            if (i >= 0) _round.RemoveAt(i);
+            if (i >= 0)
+            {
+                _round = new List<string>(_round);
+                _round.RemoveAt(i);
+            }
             else
             {
                 i = IndexOf(_winners, path, 0);
                 if (i < 0) return false;
+                _winners = new List<string>(_winners);
                 _winners.RemoveAt(i);
             }
             MarkGone(path);
@@ -93,16 +110,67 @@ namespace RulZ.ImageTournament
             return true;
         }
 
+        // Drops every listed image still in the running in one pass (Remove is O(n) per image, so removing
+        // thousands of missing files one by one took quadratic time). Returns how many were dropped.
+        public int RemoveAll(IEnumerable<string> paths)
+        {
+            var drop = new HashSet<string>(paths.Where(Contains), StringComparer.OrdinalIgnoreCase);
+            if (drop.Count == 0) return 0;
+            int before = Remaining;
+            var round = new List<string>(_round.Count);
+            for (int i = 0; i < _round.Count; i++)
+                if (i < _pos || !drop.Contains(_round[i])) round.Add(_round[i]);
+            _round = round;
+            _winners = _winners.Where(p => !drop.Contains(p)).ToList();
+            RebuildAlive();
+            Advance();
+            return before - Remaining;
+        }
+
         public IEnumerable<string> AliveImages()
         {
             return _round.Skip(_pos).Concat(_winners);
         }
 
-        // Images of the matches after the current one in this round, for preloading.
+        // Images of the next matches after the current one, for preloading. Past the end of this round it
+        // looks into the next one, which starts with this round's bye (if any) and then the winners so far,
+        // so the first match of a new round is ready as soon as the last one of the old round is decided.
         public IEnumerable<string> Upcoming(int count)
         {
-            for (int i = _pos + 2; i < _round.Count && i < _pos + 2 + count; i++)
-                yield return _round[i];
+            int n = 0;
+            for (int i = _pos + 2; i < _round.Count && n < count; i++, n++) yield return _round[i];
+            for (int i = 0; i < _winners.Count && n < count; i++, n++) yield return _winners[i];
+        }
+
+        public Snapshot TakeSnapshot()
+        {
+            return new Snapshot
+            {
+                Round = _round, RoundCount = _round.Count,
+                Winners = _winners, WinnersCount = _winners.Count,
+                Pos = _pos, RoundNumber = Round, Played = MatchesPlayed,
+            };
+        }
+
+        // Goes back to a snapshot taken earlier from this tournament (undo). Images that joined after it
+        // was taken and are still in the running stay in, at the end of the restored round, so undoing a
+        // pick never drops images that were added after the pick.
+        public void Restore(Snapshot s)
+        {
+            List<string> now = AliveImages().ToList();
+            _round = s.Round.GetRange(0, s.RoundCount);
+            _winners = s.Winners.GetRange(0, s.WinnersCount);
+            _pos = s.Pos;
+            Round = s.RoundNumber;
+            MatchesPlayed = s.Played;
+            RebuildAlive();
+            foreach (var p in now)
+                if (!Contains(p))
+                {
+                    _round.Add(p);
+                    MarkAlive(p);
+                }
+            Advance();
         }
 
         public Tournament Clone()
@@ -202,8 +270,11 @@ namespace RulZ.ImageTournament
                     case "pos": t._pos = value; break;
                 }
             }
-            if (t._pos < 0 || t._pos > t._round.Count) return null;
+            // The app only ever writes an even position (it steps two images per match), a round of at
+            // least 1, and each image once; anything else is a damaged or hand-edited file.
+            if (t._pos < 0 || t._pos > t._round.Count || t._pos % 2 != 0 || t.Round < 1 || t.MatchesPlayed < 0) return null;
             t.RebuildAlive();
+            if (t._alive.Values.Any(n => n > 1)) return null;
             t.Advance();
             return t;
         }

@@ -3,6 +3,7 @@
 // read_file, which only work inside the session's output folder (and, for reading, its target).
 import { promises as fs, type Dirent } from 'node:fs'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import { unquotePath } from '@shared/re'
 import type { FileToolScope } from '@shared/types'
 
 export const FILE_TOOLS_SERVER = 'rulz'
@@ -335,8 +336,14 @@ export async function writeFile(args: { path?: unknown; content?: unknown; appen
   if (typeof args.content !== 'string') return { text: 'content must be text.', isError: true }
   if (args.content.length > MAX_WRITE_CHARS) return { text: `That is ${args.content.length.toLocaleString('en-US')} characters; write at most ${MAX_WRITE_CHARS.toLocaleString('en-US')} per call (use append for the rest).`, isError: true }
   if (full === resolve(scope.writeRoot)) return { text: 'Give a file name, not the output folder itself.', isError: true }
-  // The output folder may sit next to (or around) the target; never overwrite what is being analysed.
-  if (scope.target && isInside(resolve(scope.target), full)) return { text: 'That path is part of the target being analysed; write the clone somewhere else in the output folder.', isError: true }
+  // The output folder may sit next to (or around) the target; never overwrite what is being analysed,
+  // also not through another name for it (a junction or link, or a short name like TARGET~1).
+  if (scope.target) {
+    const target = resolve(scope.target)
+    if (isInside(target, full) || isInside(await realish(target), await realish(full))) {
+      return { text: 'That path is part of the target being analysed; write the clone somewhere else in the output folder.', isError: true }
+    }
+  }
   try {
     await fs.mkdir(dirname(full), { recursive: true })
     const st = await fs.stat(full).catch(() => null)
@@ -389,7 +396,10 @@ export function runFileTool(
   if (name === 'list_directory') return listDirectory(args)
   if (name === 'find_files') return findFiles(args, signal)
   if (SCOPED_FILE_TOOLS.has(name) && !scope?.writeRoot) return Promise.resolve({ text: `${name} only works in a clone session.`, isError: true })
-  if (name === 'write_file') return writeFile(args, scope!)
-  if (name === 'read_file') return readFile(args, scope!)
+  // A pasted path may keep its quotes; "C:\app" in quotes resolves as a relative path, and the
+  // guard against writing to the target would then miss it.
+  const clean = scope && { ...scope, writeRoot: unquotePath(scope.writeRoot), ...(scope.target ? { target: unquotePath(scope.target) } : {}) }
+  if (name === 'write_file') return writeFile(args, clean!)
+  if (name === 'read_file') return readFile(args, clean!)
   return Promise.resolve({ text: `Unknown tool "${name}".`, isError: true })
 }

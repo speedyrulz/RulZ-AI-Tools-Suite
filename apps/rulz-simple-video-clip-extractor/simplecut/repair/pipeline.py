@@ -24,6 +24,7 @@ import numpy as np
 from .core.geometry import Frame, IdentityStage, build_stages, focal_from_35mm
 from .core.params import Corrections, Orientation
 from .core.render import FrameMapper, crop_rect_for
+from .core.tiltshift import BLUR_SHAPES
 
 PRESET_KIND = "rulz-distortion-repair"
 PRESET_VERSION = 1
@@ -146,11 +147,35 @@ def from_json(text: str) -> Corrections:
     c = Corrections()
     _sanitize(c, d["corrections"])
     c.orientation = Orientation()
+    if c.crop.rect is not None and not _usable_rect(c.crop.rect):
+        raise ValueError("the settings could not be used: the crop rectangle is empty or outside the picture")
+    # The miniature effect reads these per frame, and only when its blur is big enough to show,
+    # which the small test render below may not reach.
+    ts = c.tiltshift
+    if not (isinstance(ts.center, list) and len(ts.center) == 2
+            and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+                    for v in ts.center)):
+        raise ValueError("the settings could not be used: the miniature effect's centre is not a point")
+    if ts.blur_shape not in BLUR_SHAPES:
+        ts.blur_shape = "circular"
     try:  # anything still unusable (e.g. a malformed point list) is caught here, not mid-export
-        RepairPipeline(c, 64, 48)
+        # Render a small frame too, so settings that are only read per frame get used once.
+        RepairPipeline(c, 64, 48).apply(np.zeros((48, 64, 3), np.uint8), full=True)
     except Exception as e:  # noqa: BLE001
         raise ValueError(f"the settings could not be used: {e}") from e
     return c
+
+
+def _usable_rect(rect) -> bool:
+    """A manual crop [x, y, w, h] in normalised coordinates: four finite numbers, a size above
+    zero, inside the frame (the window keeps it there, with 2 % as the smallest side)."""
+    if not isinstance(rect, (list, tuple)) or len(rect) != 4:
+        return False
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in rect):
+        return False
+    x, y, w, h = rect
+    tol = 1e-6
+    return w > 1e-3 and h > 1e-3 and x >= -tol and y >= -tol and x + w <= 1 + tol and y + h <= 1 + tol
 
 
 # ------------------------------------------------------------------ pipeline
@@ -203,9 +228,18 @@ class RepairPipeline:
         h, w = rgb.shape[:2]
         out = self.mapper(w, h, full).apply(rgb)
         if full:
-            ow, oh = self.out_size
-            out = np.ascontiguousarray(out[:oh, :ow])
+            out = fit_size(out, self.out_size)
         return out
+
+
+def fit_size(px: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """The mapper's frame trimmed to `size` (the even-sided output). It is never smaller, except
+    for a crop under 2 pixels: then it is stretched, so a raw-video pipe still gets every byte
+    of every frame it was promised."""
+    ow, oh = size
+    if px.shape[1] < ow or px.shape[0] < oh:
+        px = cv2.resize(px, (max(ow, px.shape[1]), max(oh, px.shape[0])), interpolation=cv2.INTER_NEAREST)
+    return np.ascontiguousarray(px[:oh, :ow])
 
 
 @dataclass

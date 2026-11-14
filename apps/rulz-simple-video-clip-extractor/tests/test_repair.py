@@ -111,6 +111,59 @@ def test_presets_round_trip_and_bad_files_are_refused():
         from_json(json.dumps(d))
 
 
+def test_presets_with_unusable_crop_or_miniature_settings_are_refused():
+    def preset(**changes):
+        d = json.loads(to_json(Corrections()))
+        for module, values in changes.items():
+            d["corrections"][module].update(values)
+        return json.dumps(d)
+
+    # an empty manual crop used to give 1x1 frames to an encoder told 2x2 (frames merged or lost)
+    for rect in ([0, 0, 0, 0], [0.5, 0.5, 0.8, 0.8], [0.1, 0.1, float("inf"), 0.5], [0.1, 0.2, 0.3]):
+        with pytest.raises(ValueError):
+            from_json(preset(crop={"enabled": True, "auto": False, "rect": rect}))
+    ok = from_json(preset(crop={"enabled": True, "auto": False, "rect": [0.1, 0.2, 0.5, 0.6]}))
+    assert ok.crop.rect == [0.1, 0.2, 0.5, 0.6]
+    # the miniature effect's centre is only read when a frame is rendered: it used to load fine
+    # and fail with IndexError in the middle of an export
+    for center in ([], [0.5], ["a", 0.5]):
+        with pytest.raises(ValueError):
+            from_json(preset(tiltshift={"enabled": True, "intensity": 5, "center": center}))
+    back = from_json(preset(tiltshift={"enabled": True, "blur_shape": "blades"}))   # int("") once
+    assert back.tiltshift.blur_shape == "circular"
+
+
+def test_tiny_crop_still_fills_every_promised_byte():
+    """A crop under 2 pixels: the frames the export writes are exactly out_size (the size the
+    encoder was told), never smaller."""
+    c = Corrections()
+    c.crop.enabled, c.crop.auto, c.crop.rect = True, False, [0.2, 0.2, 0.001, 0.001]
+    rx = _repair_export(640, 360, c)
+    out = rx.process(pattern(640, 360))
+    assert (out.shape[1], out.shape[0]) == rx.out_size == (2, 2) and out.flags.c_contiguous
+
+
+def test_empty_areas_are_black_and_the_miniature_effect_matches_the_still_tool():
+    from simplecut.repair.core.tiltshift import apply_tiltshift
+    img = pattern(320, 180)
+    c = Corrections()
+    c.distortion.enabled, c.distortion.kind, c.distortion.intensity = True, "pincushion", 60
+    c.crop.enabled = False
+    full = Renderer(StillImage(img)).render(c, full=True).rgba
+    out = RepairPipeline(c, 320, 180).apply(img, full=True)
+    empty = full[..., 3] == 0   # (the still tool marks it transparent and leaves colour under it)
+    assert empty.any() and not out[empty].any()   # empty area: exactly black
+    assert np.abs(out.astype(int) - full[..., :3].astype(int))[~empty].max() <= 1
+    c = Corrections()
+    c.tiltshift.enabled, c.tiltshift.intensity, c.tiltshift.angle = True, 70, 20.0
+    c.tiltshift.blur_shape = "blades6"
+    ref = apply_tiltshift(img.astype(np.float32) / 255.0, c.tiltshift)
+    ref = np.clip(ref * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    got = RepairPipeline(c, 320, 180).apply(img, full=True)
+    assert not np.array_equal(got, img)           # the effect did something
+    assert np.abs(got.astype(int) - ref.astype(int)).max() <= 1
+
+
 # ------------------------------------------------------------------ export commands
 def _info(**kw):
     base = dict(path="in.mp4", width=1920, height=1080, fps=30.0, duration=10.0, keyframes=[0.0, 1.0, 2.0, 3.0],
@@ -213,10 +266,30 @@ def test_cancelled_piped_job_stops_both_processes_and_does_not_retry():
     got = []
     job.finished.connect(lambda ok, log: got.append(ok))
     job.start()
-    time.sleep(0.6)
+    end = time.time() + 15
+    while job.frames < 3 and time.time() < end:   # cancel in the middle of the run
+        time.sleep(0.05)
     job.cancel()
     assert job.wait(10000)
     assert got == [False] and job.cancelled and job.frames > 0 and job.cmd[0] == dec
+
+
+def test_cancel_stops_a_decoder_that_has_not_sent_a_frame_yet():
+    """A decoder still seeking through a long file sends nothing for a long time; the worker sits
+    in a blocking read and used to see the cancel only when a frame finally came."""
+    py = sys.executable
+    rx = _repair_export(8, 4)
+    job = PipedExportJob(_info(width=8, height=4), 0.0, 100.0, "unused.mp4",
+                         ExportSettings(mode="nvenc", repair=rx))
+    job.attempts = [([py, "-c", "import time; time.sleep(60)"], [py, "-c", "import sys; sys.stdin.buffer.read()"])]
+    got = []
+    job.finished.connect(lambda ok, log: got.append(ok))
+    job.start()
+    time.sleep(1.0)   # both processes are running and the worker is waiting for the first frame
+    t = time.time()
+    job.cancel()
+    assert job.wait(10000) and time.time() - t < 5
+    assert got == [False] and job.frames == 0
 
 
 # ------------------------------------------------------------------ real exports
@@ -341,6 +414,10 @@ def test_main_window_previews_saves_frames_and_rotates_with_the_repair(tmp_path,
         w.mark_in, w.mark_out = w.info.start_time, w.info.end_time   # both ends: lossless would be fine
         assert not w._lossless_possible()
         w.save_frame()
+        end = time.time() + 30
+        while w._saving and time.time() < end:   # the PNG is written in the background
+            APP.processEvents()
+            time.sleep(0.01)
         (png,) = [p for p in os.listdir(tmp_path) if p.endswith(".png")]
         from PySide6.QtGui import QImage
         img = QImage(str(tmp_path / png))

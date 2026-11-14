@@ -6,7 +6,7 @@ import { extractAnswer, isStaticReTool, reFirstMessage, reSampling } from '@shar
 import { DEFAULT_SAMPLING } from '@shared/defaults'
 import type { ChatMessage, Conversation, ReSession, WireMessage } from '@shared/types'
 import type { RecordedRound } from '../src/main/chat/service'
-import { buildSample, exportDataset, scrub, TraceStore, type RequestFile, type ResponseLine } from '../src/main/re/traces'
+import { buildSample, exportDataset, sampleLine, scrub, TraceStore, type RequestFile, type ResponseLine } from '../src/main/re/traces'
 import { checkAnswer, gradePractice, listPractice, preparePractice, type KitTask } from '../src/main/re/practice'
 import { parseSettings } from '../src/main/settings/schema'
 import { buildWire } from '../src/renderer/src/lib/wire'
@@ -110,6 +110,12 @@ describe('building training samples', () => {
   it('replaces email addresses', () => {
     expect(scrub('{"a":"me@example.org wrote"}')).toBe('{"a":"user@example.com wrote"}')
   })
+
+  it('keeps the line valid JSON when an address follows a newline or tab', () => {
+    const sample = { messages: [{ role: 'tool' as const, tool_call_id: 'c1', content: 'strings:\nsupport@vendor.com\ttech@vendor.com' }], tools: [], meta: {} }
+    const parsed = JSON.parse(sampleLine(sample))
+    expect(parsed.messages[0].content).toBe('strings:\nuser@example.com\tuser@example.com')
+  })
 })
 
 describe('recording and exporting', () => {
@@ -195,6 +201,76 @@ describe('recording and exporting', () => {
   it('rejects conversation ids that could leave the data folder', () => {
     const store = new TraceStore(join(dir, 'data'))
     expect(() => store.record('../x', round('r', [], {}))).toThrow()
+  })
+
+  it('lists new rounds as they are recorded, and keeps the trim mark across restarts', async () => {
+    const data = join(dir, 'data')
+    const store = new TraceStore(data)
+    const two: WireMessage[] = [{ role: 'user', content: 'go' }, { role: 'assistant', content: 'a' }]
+    await store.record('api-x', round('r1', two, { content: 'one' }), { shrinkIsTrim: true })
+    expect(await store.info('api-x')).toMatchObject({ responses: 1, trimmed: false })
+    await store.record('api-x', round('r2', [...two, { role: 'user', content: 'more' }], { toolCalls: [call('c1', 'rea__open_binary')] }), { shrinkIsTrim: true })
+    expect(await store.info('api-x')).toMatchObject({ responses: 2, toolRounds: 1, trimmed: false })
+    // A new store (the app restarted) reads the previous request to notice the shrink.
+    const after = new TraceStore(data)
+    await after.record('api-x', round('r3', two.slice(0, 1), { content: 'three' }), { shrinkIsTrim: true })
+    expect(await after.info('api-x')).toMatchObject({ responses: 3, trimmed: true })
+    await after.delete('api-x')
+    expect(await after.info('api-x')).toBeNull()
+  })
+
+  it('sees a session change even when the file keeps its size and time', async () => {
+    const store = new TraceStore(join(dir, 'data'))
+    await store.record('api-o', round('r1', [{ role: 'user', content: 'go' }], { content: 'ANSWER: 1' }))
+    await store.updateApiSession('api-o', { outcome: 'solved' })
+    expect((await store.info('api-o'))?.api?.outcome).toBe('solved')
+    // Same length ("solved" / "failed"); the write count changes the cache key whatever the clock says.
+    await store.updateApiSession('api-o', { outcome: 'failed' })
+    expect((await store.info('api-o'))?.api?.outcome).toBe('failed')
+  })
+
+  it('deletes a chat after its pending rounds, and records nothing that arrives later', async () => {
+    const store = new TraceStore(join(dir, 'data'))
+    const msgs: WireMessage[] = [{ role: 'user', content: 'go' }]
+    // Sent without waiting: the delete must still land after the round already queued.
+    const first = store.record('chat-d', round('r1', msgs, { content: 'one' }))
+    const removed = store.delete('chat-d', undefined, { forever: true })
+    await Promise.all([first, removed])
+    expect(await store.info('chat-d')).toBeNull()
+    // A stopped reply's last round finishing after the delete does not bring the folder back.
+    await store.record('chat-d', round('r2', msgs, { content: 'late' }))
+    expect(await store.info('chat-d')).toBeNull()
+    // Deleting only the trace lets a session that carries on be recorded again.
+    await store.record('chat-e', round('r1', msgs, { content: 'one' }))
+    await store.delete('chat-e')
+    await store.record('chat-e', round('r2', msgs, { content: 'two' }))
+    expect(await store.info('chat-e')).toMatchObject({ responses: 1 })
+  })
+
+  it('gives an API session default details only when it has none', async () => {
+    const store = new TraceStore(join(dir, 'data'))
+    // Sent together: the app's own description wins over the defaults however they interleave.
+    const described = store.updateApiSession('api-a', { client: 'RulZ Coding Agent', title: 'Find the key' })
+    const ensured = store.ensureApiSession('api-a', { client: 'Another app', title: 'a' })
+    await Promise.all([described, ensured])
+    expect(await store.apiSession('api-a')).toMatchObject({ client: 'RulZ Coding Agent', title: 'Find the key' })
+    await store.ensureApiSession('api-b', { client: 'Another app', title: 'b' })
+    expect(await store.apiSession('api-b')).toMatchObject({ client: 'Another app', title: 'b', outcome: 'unrated' })
+  })
+
+  it('exports API clone sessions with their kind and valid lines whatever the text holds', async () => {
+    const store = new TraceStore(join(dir, 'data'))
+    await store.record('api-c', round('r1', [{ role: 'user', content: 'clone it' }], { content: 'Done.\nContact:\nme@vendor.com' }))
+    const r = await exportDataset(store, [{ id: 'api-c', source: 'RulZ Coding Agent', kind: 'clone-full', re: { target: 'x.exe', goal: 'g', collect: true, outcome: 'solved' } }], {
+      outDir: join(dir, 'out'),
+      outcomes: ['solved'],
+      skipTrimmed: true,
+      maxPerTask: 2
+    })
+    expect(r.kept).toBe(1)
+    const sample = JSON.parse((await readFile(join(dir, 'out', 'train.jsonl'), 'utf8')).trim())
+    expect(sample.meta).toMatchObject({ source: 'RulZ Coding Agent', kind: 'clone-full' })
+    expect(sample.messages.at(-1).content).toBe('Done.\nContact:\nuser@example.com')
   })
 })
 

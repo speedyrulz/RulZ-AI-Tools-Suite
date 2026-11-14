@@ -1,6 +1,7 @@
 """Run with:  python -m pytest tests   (from the app folder, inside its .venv)."""
 import os
 import random
+import subprocess
 import sys
 import tempfile
 import time
@@ -224,8 +225,56 @@ def test_nvenc_tries_gpu_decoding_first_then_without():
     assert hw[i + 1] == "cuda" and i < hw.index("-i")
     assert "-hwaccel" not in sw
     assert [c for c in hw if c not in ("-hwaccel", "cuda")] == sw
-    (lossless,) = build_commands(_info(), 1.0, 2.0, "out.mp4", ExportSettings(mode="lossless"))
-    assert "-hwaccel" not in lossless
+    every, av_only = build_commands(_info(), 1.0, 2.0, "out.mp4", ExportSettings(mode="lossless"))
+    assert "-hwaccel" not in every and "-hwaccel" not in av_only
+    # lossless copies every track, then (if the container refuses one) just video and audio
+    assert every[every.index("-map") + 1] == "0"
+    assert [av_only[i + 1] for i, c in enumerate(av_only) if c == "-map"] == ["0:v", "0:a?"]
+
+
+def test_lossless_cut_into_a_container_that_refuses_a_track_keeps_video_and_audio(tmp_path):
+    """MKV with ASS subtitles saved as .mp4: copying every track fails ("Could not find tag for
+    codec ass"), so the retry copies the video and audio and says what was left out."""
+    from simplecut.export import make_export_job
+    from simplecut.probe import probe
+    srt = tmp_path / "s.srt"
+    srt.write_text("1\n00:00:00,000 --> 00:00:05,000\nhello\n")
+    src = str(tmp_path / "subs.mkv")
+    r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x96:rate=25",
+                        "-f", "lavfi", "-i", "sine=frequency=440", "-i", str(srt), "-t", "3",
+                        "-map", "0", "-map", "1", "-map", "2", "-c:v", "libx264", "-g", "25", "-c:a", "aac",
+                        "-c:s", "ass", src], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-400:]
+    info = probe(src)
+    out = str(tmp_path / "cut.mp4")
+    job = make_export_job(info, info.keyframes[1], info.end_time, out, ExportSettings(mode="lossless"))
+    got = _run_job(job, timeout=60)
+    assert got and got[0][0] is True, got
+    assert job.warning and "subtitles" in job.warning
+    kinds = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", out],
+                           capture_output=True, text=True).stdout.split()
+    assert kinds == ["video", "audio"]
+    # into MKV every track fits: one attempt, nothing to warn about
+    job = make_export_job(info, info.keyframes[1], info.end_time, str(tmp_path / "cut.mkv"),
+                          ExportSettings(mode="lossless"))
+    got = _run_job(job, timeout=60)
+    assert got and got[0][0] is True and job.warning == "" and job._attempt == 0
+
+
+def test_retry_note_survives_a_long_log():
+    py = sys.executable
+    noisy = [py, "-c", "import sys\nfor i in range(200): print('line', i, file=sys.stderr)\nsys.exit(1)"]
+    job = ExportJob([noisy, noisy], 1.0, retry_note="(the retry note)")
+    got = _run_job(job)
+    assert got and got[0][0] is False and got[0][1].splitlines()[-1] == "(the retry note)"
+
+
+def test_clip_names_count_from_the_first_frame():
+    """MPEG-TS clocks often start at 1.4 s (or hours in); the name uses the times the app shows."""
+    from simplecut.export import default_output_path
+    info = VideoInfo(path="C:/v/rec.ts", fps=25.0, duration=60.0, start_time=1.4)
+    assert default_output_path(info, 3.4, 8.9, "nvenc").endswith("rec_clip_2_00-7_50.mp4")
+    assert default_output_path(info, 1.4, 61.4, "lossless", whole=True).endswith("rec_clip_full.ts")
 
 
 def _run_job(job, timeout=20):

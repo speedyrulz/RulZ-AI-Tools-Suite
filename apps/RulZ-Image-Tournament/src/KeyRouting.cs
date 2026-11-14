@@ -19,5 +19,13 @@ namespace RulZ.ImageTournament
             return focused is TextBoxBase || focused is ComboBox || focused is UpDownBase
                 || focused is ListControl || focused is DateTimePicker || focused is TrackBar;
         }
+
+        // True for the repeats Windows sends while a key is held down (bit 30 of a key-down's lParam: the
+        // key was already down). Picks ignore them, so holding an arrow key can't decide the next matches
+        // before they are even seen.
+        public static bool IsRepeat(Message msg)
+        {
+            return (msg.LParam.ToInt64() & 0x40000000) != 0;
+        }
     }
 }

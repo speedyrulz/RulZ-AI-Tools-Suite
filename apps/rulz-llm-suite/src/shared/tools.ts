@@ -56,8 +56,15 @@ export function toolSummary(description: string | undefined, max = 160): string 
 }
 
 /** Rough token cost of one tool definition as sent to the model (~3.5 characters per token). */
+/** Per tool object: the auto tool mode sums this over every tool (hundreds with REA) on each check. */
+const tokenCache = new WeakMap<object, number>()
+
 export function toolTokens(t: Pick<McpToolInfo, 'qualifiedName' | 'description' | 'inputSchema'>): number {
-  return Math.ceil(JSON.stringify({ name: t.qualifiedName, description: t.description, parameters: t.inputSchema }).length / 3.5)
+  const cached = tokenCache.get(t)
+  if (cached !== undefined) return cached
+  const n = Math.ceil(JSON.stringify({ name: t.qualifiedName, description: t.description, parameters: t.inputSchema }).length / 3.5)
+  tokenCache.set(t, n)
+  return n
 }
 
 /** Keyword search over tool names and descriptions; name hits weigh more. */

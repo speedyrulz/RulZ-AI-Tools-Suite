@@ -37,7 +37,7 @@ exit /b 0
 
 :maybe_wipe
 if /i "%WIPE%"=="y" (
-    del "%RULZ_DATA_DIR%\settings.ini" "%RULZ_DATA_DIR%\tournament.txt" "%RULZ_DATA_DIR%\tournament.txt.tmp" 2>nul
+    del "%RULZ_DATA_DIR%\settings.ini" "%RULZ_DATA_DIR%\settings.ini.tmp" "%RULZ_DATA_DIR%\tournament.txt" "%RULZ_DATA_DIR%\tournament.txt.tmp" 2>nul
     rmdir "%RULZ_DATA_DIR%" 2>nul
     echo Settings deleted.
 )

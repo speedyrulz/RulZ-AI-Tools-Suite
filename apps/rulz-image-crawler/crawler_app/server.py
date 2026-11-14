@@ -16,7 +16,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -24,7 +24,6 @@ from fastapi.staticfiles import StaticFiles
 from image_detection import DetectionService, ModelError, ModelServerDown
 from image_detection.rubrics import TAG_ID_RE
 from pydantic import BaseModel, Field, field_validator, model_validator
-from starlette.background import BackgroundTask
 
 from .config import AppSettings
 from .folder import pick_folder
@@ -98,18 +97,26 @@ class RunIn(BaseModel):
     @field_validator("folder")
     @classmethod
     def _valid_folder(cls, v: str | None) -> str | None:
+        # Only tidied here: checking the disk happens in a worker thread (resolve_folder), since a
+        # network path to a sleeping NAS would otherwise freeze the whole app while it times out.
         if v is None or not v.strip():
             return None
-        path = Path(v.strip().strip('"')).expanduser()
-        if not path.is_dir():
-            raise ValueError(f"folder not found: {path}")
-        return str(path.resolve())
+        return v.strip().strip('"')
 
     @model_validator(mode="after")
     def _one_source(self) -> RunIn:
         if bool(self.url) == bool(self.folder):
             raise ValueError("give either a website address or a folder")
         return self
+
+
+def resolve_folder(folder: str) -> str:
+    """The folder to scan as an absolute path; ValueError if it isn't one. Touches the disk: call it
+    in a worker thread."""
+    path = Path(folder).expanduser()
+    if not path.is_dir():
+        raise ValueError(f"folder not found: {path}")
+    return str(path.resolve())
 
 
 _FOLDER_RE = re.compile(r"^[\w.-]{1,200}$")
@@ -204,11 +211,11 @@ def _host_name(host_header: str) -> str:
         return ""
 
 
-def _remove(path: Path) -> None:
-    try:
-        path.unlink(missing_ok=True)
-    except OSError:  # pragma: no cover - swept on the next download or start
-        pass
+def _attachment(filename: str) -> str:
+    """Content-Disposition for a download, with the RFC 5987 form for names that aren't plain ASCII."""
+    if filename.isascii() and '"' not in filename and "\\" not in filename:
+        return f'attachment; filename="{filename}"'
+    return f"attachment; filename*=utf-8''{quote(filename)}"
 
 
 def _sse(event: dict[str, Any]) -> str:
@@ -233,22 +240,31 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        await asyncio.to_thread(sweep_zips, zip_dir, 0)  # no download is running yet
+        await asyncio.to_thread(sweep_zips, zip_dir, 0)  # zips older versions left behind
         svc = service or DetectionService()
         pw = None
+        relaunch = None
         b = browser
         if b is None:
             from playwright.async_api import async_playwright
 
             pw = await async_playwright().start()
-            b = await pw.chromium.launch(headless=settings.headless)
-        app.state.manager = RunManager(settings, svc, b)
+
+            async def launch_chromium():
+                return await pw.chromium.launch(headless=settings.headless)
+
+            relaunch = launch_chromium
+            b = await relaunch()
+        app.state.manager = RunManager(settings, svc, b, relaunch=relaunch)
         try:
             yield
         finally:
             await app.state.manager.shutdown()
             if pw is not None:
-                await b.close()
+                try:
+                    await app.state.manager.browser.close()
+                except Exception:  # noqa: BLE001 - pragma: no cover - it crashed already
+                    pass
                 await pw.stop()
             if service is None:
                 await svc.aclose()
@@ -301,12 +317,20 @@ def create_app(
     @app.post("/api/runs")
     async def create_run(body: RunIn, request: Request):
         mgr = _manager(request)
+        folder = None
+        if body.folder:
+            try:
+                folder = await asyncio.to_thread(resolve_folder, body.folder)
+            except (ValueError, OSError) as e:
+                raise HTTPException(422, str(e))
         if (await mgr.svc.health())["server"] != "up":
             raise ModelServerDown("health check failed")
+        if not folder:
+            await mgr.ensure_browser()
         run = mgr.create(
             RunOptions(
                 url=body.url or "",
-                folder=body.folder,
+                folder=folder,
                 recursive=body.recursive,
                 tag_id=body.tag.id,
                 rubric=body.tag.rubric,
@@ -395,14 +419,12 @@ def create_app(
         await run.wait()
         return {"status": run.status}
 
-    async def _send_zip(st: RunStorage, min_confidence: float) -> FileResponse:
-        await asyncio.to_thread(sweep_zips, zip_dir)  # leftovers of downloads that were cut off
-        path = await asyncio.to_thread(st.build_zip, min_confidence, zip_dir)
-        return FileResponse(
-            path,
+    def _send_zip(st: RunStorage, min_confidence: float) -> StreamingResponse:
+        # Streamed while it is made (see RunStorage.iter_zip); the generator runs in a worker thread.
+        return StreamingResponse(
+            st.iter_zip(min_confidence),
             media_type="application/zip",
-            filename=f"{st.folder.name}.zip",
-            background=BackgroundTask(_remove, path),  # each download gets its own file, deleted once sent
+            headers={"Content-Disposition": _attachment(f"{st.folder.name}.zip")},
         )
 
     @app.get("/api/runs/{run_id}/zip")
@@ -410,7 +432,7 @@ def create_app(
         run = _run(request, run_id)
         if run.storage is None:
             raise HTTPException(409, "run has no output yet")
-        return await _send_zip(run.storage, min_confidence)
+        return _send_zip(run.storage, min_confidence)
 
     @app.get("/api/runs/{run_id}/files/{name}")
     async def download_file(run_id: str, name: str, request: Request):
@@ -463,7 +485,7 @@ def create_app(
     @app.get("/api/history/{name}/zip")
     async def history_zip(name: str, min_confidence: float = 0.0):
         st = await asyncio.to_thread(_history_storage, name)
-        return await _send_zip(st, min_confidence)
+        return _send_zip(st, min_confidence)
 
     if (STATIC_DIR / "index.html").exists():
         app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="ui")

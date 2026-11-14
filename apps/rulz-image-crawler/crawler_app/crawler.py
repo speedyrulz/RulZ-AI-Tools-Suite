@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Callable
@@ -182,8 +183,15 @@ def extract_candidates(
 
 
 async def load_page(
-    context: BrowserContext, url: str, timeout_s: float, max_scroll_steps: int, prefer_originals: bool = True
+    context: BrowserContext,
+    url: str,
+    timeout_s: float,
+    max_scroll_steps: int,
+    prefer_originals: bool = True,
+    keep: Callable[[str], bool] | None = None,
 ) -> PageResult:
+    """`keep(final_url)` False (a redirect left the crawl): the page is returned empty, without the
+    scrolling and waiting, which are the slow part."""
     page = await context.new_page()
     try:
         try:
@@ -196,13 +204,24 @@ async def load_page(
             ctype = (await resp.all_headers()).get("content-type", "")
             if ctype and "html" not in ctype:
                 raise PageError(f"not a web page ({ctype.split(';')[0]})")
+        final = normalize_page_url(page.url) or url
+        if keep is not None and not keep(final):
+            return PageResult(final, [], [])
+
+        # evaluate() has no timeout of its own: a page whose script never yields would hold the crawl
+        # forever. The scroll takes at most ~0.75 s a step, the image wait 1.5 s. (asyncio.timeout, not
+        # wait_for: on Python 3.11 wait_for can swallow a Cancel that arrives as the script finishes.)
+        budget = timeout_s + 0.75 * max_scroll_steps + IMAGES_WAIT_MS / 1000
         try:
-            await page.evaluate(SCROLL_JS, max_scroll_steps)
-            await page.evaluate(IMAGES_DONE_JS, IMAGES_WAIT_MS)
-            raw = await page.evaluate(EXTRACT_JS)
+            async with asyncio.timeout(budget):
+                await page.evaluate(SCROLL_JS, max_scroll_steps)
+                await page.evaluate(IMAGES_DONE_JS, IMAGES_WAIT_MS)
+                raw = await page.evaluate(EXTRACT_JS)
+        except TimeoutError as e:
+            raise PageError(f"page scripts did not finish within {budget:.0f} s") from e
         except PlaywrightError as e:
             raise PageError(f"page script failed: {str(e).splitlines()[0]}") from e
-        final = normalize_page_url(page.url) or url
+        final = normalize_page_url(page.url) or url  # scripts can change the address (history.pushState)
         images, links = extract_candidates(raw, final, prefer_originals)
         return PageResult(final, images, links)
     finally:
@@ -227,20 +246,31 @@ class Robots:
             parser: RobotFileParser | None = None
             try:
                 resp = await self._context.request.get(f"{origin}/robots.txt", timeout=self._timeout_ms)
-                if resp.ok:
-                    parser = RobotFileParser()
-                    parser.parse((await resp.text()).splitlines())
-                elif resp.status >= 500:
-                    parser = RobotFileParser()
-                    parser.disallow_all = True
-                    if self._on_note:
-                        self._on_note(
-                            f"robots.txt on {origin} answered HTTP {resp.status}, so the site counts as closed to "
-                            "crawlers; turn off Respect robots.txt to crawl it anyway"
-                        )
-                await resp.dispose()
+                try:
+                    if resp.ok:
+                        # Not resp.text(): it decodes strictly, and one Latin-1 comment ("# Café") would
+                        # raise and end the whole run.
+                        text = (await resp.body()).decode("utf-8", "replace")
+                        parser = RobotFileParser()
+                        parser.parse(text.splitlines())
+                    elif resp.status >= 500:
+                        parser = RobotFileParser()
+                        parser.disallow_all = True
+                        if self._on_note:
+                            self._on_note(
+                                f"robots.txt on {origin} answered HTTP {resp.status}, so the site counts as closed "
+                                "to crawlers; turn off Respect robots.txt to crawl it anyway"
+                            )
+                finally:
+                    try:
+                        await resp.dispose()
+                    except PlaywrightError:  # pragma: no cover - the context is already closing
+                        pass
             except PlaywrightError as e:
                 log.info("robots.txt unavailable for %s: %s", origin, str(e).splitlines()[0])
+            except Exception as e:  # noqa: BLE001 - an unreadable robots.txt is a missing one, never a failed run
+                log.info("robots.txt unreadable for %s: %s: %s", origin, type(e).__name__, e)
+                parser = None
             self._parsers[origin] = parser
         return self._parsers[origin]
 

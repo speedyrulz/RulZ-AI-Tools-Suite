@@ -37,6 +37,11 @@ def download(name: str) -> None:
     if have > total:
         part.unlink()
         have = 0
+    if have == total and part.exists():
+        # Complete, but the last run stopped before the rename. Asking for bytes=<total>- would get HTTP 416.
+        part.replace(target)
+        print(f"{name}: done")
+        return
     headers = {"User-Agent": "rulz-image-crawler"}
     if have:
         headers["Range"] = f"bytes={have}-"

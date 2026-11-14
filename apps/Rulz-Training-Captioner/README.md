@@ -54,6 +54,15 @@ Double-click `run.bat` (creates a venv and installs PySide6 + requests on first 
 - "Skip images that already have a caption" applies to *Caption All*; *Caption Selected* always overwrites.
 - Big folders are added in the background, so the window stays usable while they load. Images in subfolders
   stay grouped by folder.
+- A caption is saved as a new file that then replaces the old one, so a full disk, a dropped network drive or
+  a crash while saving leaves the old caption as it was. (When another program keeps the file open, it is
+  written in place instead, as before.)
+- If a caption file changes on disk while its image is being captioned (another program wrote it), the file is
+  kept and the log says so. A caption file that can't be read is shown in red, skipped by *Caption All* when
+  "skip existing" is on, and never replaced by a caption you haven't seen.
+- Images you remove (or clear) during a run are skipped instead of captioned for nothing.
+- If `settings.json` or `prompts.json` can't be read, it is renamed to `settings.bad-<time>.json` /
+  `prompts.bad-<time>.json` (so a hand edit gone wrong can be repaired) and the defaults are used.
 - The log (View ▸ Log) shows llama-server output, useful if a model fails to load.
 
 ## Settings folder

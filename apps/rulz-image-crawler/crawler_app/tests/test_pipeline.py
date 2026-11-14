@@ -298,8 +298,7 @@ def test_storage_flushes_manifest_once_and_zips_a_snapshot(tmp_path):
     assert len(json.loads((folder / "matches.json").read_text(encoding="utf-8"))["matches"]) == 3
 
     st.save(check_image_bytes("http://x/w.jpg", "http://x/", jpeg("white"), 10**7), 0.95, "w")  # not flushed
-    zips = tmp_path / "zips"
-    with zipfile.ZipFile(st.build_zip(0.8, zips)) as zf:
+    with zipfile.ZipFile(io.BytesIO(b"".join(st.iter_zip(0.8)))) as zf:
         names = sorted(zf.namelist())
         doc = json.loads(zf.read("matches.json"))
     assert len(names) == 3 and "matches.json" in names  # green (0.9) and white (0.95) + manifest

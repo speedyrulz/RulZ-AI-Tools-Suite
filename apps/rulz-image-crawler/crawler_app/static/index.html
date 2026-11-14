@@ -283,16 +283,19 @@
     ["images_fetched", "downloaded"], ["classified", "checked by model"], ["cached", "from cache"],
     ["matches", "matches saved"], ["originals", "full-size originals"], ["too_small_mp", "below min size"],
     ["skipped", "too small"], ["duplicates", "duplicates"],
-    ["fetch_errors", "download errors"], ["errors", "model errors"], ["pages_failed", "pages failed"],
+    ["fetch_errors", "download errors"], ["errors", "model or save errors"], ["pages_failed", "pages failed"],
+    ["pages_blocked", "pages skipped (robots.txt or redirected away)"],
   ];
   // Shown only when non-zero.
   const OPTIONAL_STATS = new Set(["fetch_errors", "errors", "pages_failed", "duplicates", "skipped",
-                                  "originals", "too_small_mp"]);
+                                  "originals", "too_small_mp", "pages_blocked"]);
   const FINAL = new Set(["done", "cancelled", "failed"]);
   const STATUS_TEXT = { starting: "Starting", running: "Running", paused: "Paused", done: "Done",
                         cancelled: "Cancelled", failed: "Failed" };
 
   let runId = null, es = null, runThreshold = 0.7, status = null, liveFolder = null, runSource = "web";
+  let problems = [];  // the current search's Problems list, kept live from "problem" events
+  const MAX_PROBLEMS = 100;
 
   function sourceMode() {
     return document.querySelector('input[name="source"]:checked').value;
@@ -399,8 +402,7 @@
     $("startBtn").disabled = true;
     try {
       const r = await api("/api/runs", { method: "POST", body: JSON.stringify(body) });
-      runSource = folderMode ? "folder" : "web";
-      startWatching(r.run_id, body.threshold);
+      startWatching(r.run_id, body.threshold, folderMode ? "folder" : "web");
     } catch (e) {
       setError($("startError"), e.message);
       $("startBtn").disabled = false;
@@ -412,10 +414,33 @@
     if (view.live && folder) $("folder").textContent = `Saved to: ${folder}`;
   }
 
-  function startWatching(id, threshold) {
+  // A search still running after the page was reloaded (or the tab closed and reopened): show it with
+  // its Pause / Resume / Cancel controls again, instead of leaving it running out of reach.
+  async function resumeWatching(id) {
+    try {
+      const run = await api(`/api/runs/${id}`);
+      if (FINAL.has(run.status)) return false;
+      startWatching(id, run.options.threshold, run.options.folder ? "folder" : "web");
+      return true;
+    } catch (e) {
+      console.warn("Couldn't show the running search again:", e);
+      return false;
+    }
+  }
+  async function attachToLiveRun() {
+    try {
+      const runs = await api("/api/runs");
+      const live = runs.filter(r => !FINAL.has(r.status)).pop();  // the newest one still going
+      if (live && runId === null) await resumeWatching(live.id);
+    } catch { /* the app is starting or gone; the health line says so */ }
+  }
+
+  function startWatching(id, threshold, source) {
     runId = id;
     runThreshold = threshold;
+    runSource = source;
     liveFolder = null;
+    problems = [];
     matches.clear();
     showLive();
     setError($("runError"), "");
@@ -435,6 +460,11 @@
       renderErrors(run.errors);
       setFolder(run.folder);
       setStatus(run.status, run.message);
+    });
+    es.addEventListener("problem", (ev) => {
+      problems.push(JSON.parse(ev.data).text);
+      if (problems.length > MAX_PROBLEMS) problems.shift();  // the server keeps the newest 100 too
+      renderErrors(problems);
     });
     es.addEventListener("stats", (ev) => {
       const d = JSON.parse(ev.data);
@@ -499,6 +529,7 @@
   }
 
   function renderErrors(errors) {
+    problems = [...errors];
     show($("errorsBox"), errors.length > 0);
     $("errorCount").textContent = errors.length;
     $("errorList").replaceChildren(...errors.map(e => el("li", {}, e)));
@@ -658,6 +689,8 @@
   async function openHistory(it) {
     if (it.run_id && it.run_id === runId) {
       showLive();
+    } else if (it.run_id && !FINAL.has(it.status) && await resumeWatching(it.run_id)) {
+      // a search still running that this page wasn't showing: it is the current search again
     } else {
       try {
         const doc = await api(`/api/history/${encodeURIComponent(it.id)}`);
@@ -672,6 +705,7 @@
   }
   $("historyRefresh").addEventListener("click", loadHistory);
   loadHistory();
+  attachToLiveRun();
 })();
 </script>
 </body>
