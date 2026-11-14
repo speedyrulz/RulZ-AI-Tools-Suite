@@ -37,6 +37,28 @@ const REG_WRITE = new RegExp(String.raw`\b(set|new|remove|rename|clear|copy|move
 const DOWNLOAD = /\b(iwr|irm|curl|wget|invoke-webrequest|invoke-restmethod|start-bitstransfer|downloadstring|downloaddata|downloadfile)\b|\bcertutil(\.exe)?\b[^\n]*-urlcache\b|\bbitsadmin\b[^\n]*\/transfer\b/i
 const RUN_TEXT = /\b(iex|invoke-expression)\b|\[scriptblock\]::create\b/i
 
+/**
+ * A command run from a value rather than a name written out: `& $x`, `. $x`, `& "$a$b"`,
+ * `Start-Process $x`, in a place where a command starts (so `"*.$ext"` in a filter doesn't count).
+ */
+const CALL_BY_VALUE =
+  /(?:(?:^|[;|{(=,\n\r]|&&|\b(?:return|throw|exit)\s)\s*(?:[&.]\s*(?:\$|"[^"\n]*\$)|(?:start-process|saps|start|invoke-item|ii)\s+(?:-filepath[\s:]+)?(?:\$|"[^"\n]*\$|\())|["']\s*&\s*(?:\$|"[^"\n]*\$))/i
+/** The same, with a target put together from several pieces: `& "$a$b"`, `& "$(...)x"`. */
+const CALL_BY_PIECES =
+  /(?:^|[;|{(=,\n\r]|&&|\b(?:return|throw|exit)\s)\s*(?:[&.]|(?:start-process|saps|start|invoke-item|ii)\s+(?:-filepath[\s:]+)?)\s*"(?:[^"\n]*\$){2}|(?:^|[;|{(=,\n\r]|&&|\b(?:return|throw|exit)\s)\s*[&.]\s*"[^"\n]*\$\(/i
+/**
+ * The rule before 0.19.0, kept so nothing it caught gets through: a call by value anywhere that
+ * isn't inside a word, with a name joined from quoted pieces.
+ */
+const CALL_ANYWHERE = /(?:^|[^\w.\-\\/$@&])[&.]\s*\$/
+const QUOTED_JOIN = /['"]\s*\+\s*['"]|-join\b|\s-f\s|\[char\]/i
+/**
+ * Ways to put a name together while the command runs: joining or splitting strings, replacing,
+ * reversing, characters by number, decoding, and command names looked up by wildcard.
+ */
+const STRING_BUILD =
+  /['"]\s*\+|\+\s*['"]|\+=|\$[\w:]+\s*\+\s*\$|-join\b|\s-f\s|\[char\]|-c?replace\b|-split\b|\.(?:replace|substring|insert|remove|split|reverse)\s*\(|\[(?:system\.)?string\]::|\[(?:system\.)?convert\]::|\.getstring\s*\(|-bxor\b|\[regex\]::|\[array\]::reverse|\b(?:gcm|get-command|gal|get-alias)\b[^\n;|]*[*?]/i
+
 const REFUSE: Rule[] = [
   {
     re: /\bformat(\.com)?\s+[a-z]:|\b(format-volume|clear-disk|initialize-disk|remove-partition|new-partition|resize-partition|set-partition|diskpart|mkfs)\b|\bcipher(\.exe)?\s+\/w\b|\b(vssadmin|wbadmin)(\.exe)?\s+delete\b|\b(bcdedit|bootrec|bcdboot)\b/i,
@@ -76,7 +98,19 @@ const HIDDEN: Rule[] = [
   // runs (`&&` is not a call).
   { re: /(?:^|[^\w.\-\\/$@&])[&.]\s*\(/, reason: 'This runs a command whose name is put together while it runs, so it can’t be checked first.' },
   {
-    test: (c) => /(?:^|[^\w.\-\\/$@&])[&.]\s*\$/.test(c) && /['"]\s*\+\s*['"]|-join\b|\s-f\s|\[char\]/i.test(c),
+    // `$c = 'Restart-' + 'Computer'; & $c`, `$x = 'shut'; $x += 'down'; & $x`, `& "$a$b"`.
+    // Also `return & $c`, `-Command "& $c"` (run by another PowerShell) and lines split by a bare CR.
+    test: (c) => CALL_BY_PIECES.test(c) || (CALL_BY_VALUE.test(c) && STRING_BUILD.test(c)) || (CALL_ANYWHERE.test(c) && QUOTED_JOIN.test(c)),
+    reason: 'This runs a command whose name is put together while it runs, so it can’t be checked first.'
+  },
+  {
+    // An alias for a name put together while it runs: `Set-Alias x ('Stop-' + 'Computer'); x`.
+    test: (c) => /\b(?:set-alias|new-alias|sal|nal)\b/i.test(c) && STRING_BUILD.test(c),
+    reason: 'This runs a command whose name is put together while it runs, so it can’t be checked first.'
+  },
+  {
+    // cmd's own variables: `cmd /c "set a=shut&& call %a%down"`.
+    test: (c) => /\bcmd(?:\.exe)?\b[^\n]*\s\/[ck]\b/i.test(c) && /\bset\s+"?\w+=/i.test(c) && /%\w+%|!\w+!/.test(c),
     reason: 'This runs a command whose name is put together while it runs, so it can’t be checked first.'
   },
   {
@@ -123,7 +157,7 @@ const DELETE = new RegExp(
 )
 
 const ENV_PATH =
-  /\$\{?env:(userprofile|appdata|localappdata|programfiles|programdata|windir|systemroot|systemdrive|temp|tmp|homepath|homedrive|public|onedrive|allusersprofile)\b|%(userprofile|appdata|localappdata|programfiles|programdata|windir|systemroot|systemdrive|temp|tmp|homepath|homedrive|public|onedrive)%|\$home\b|\$profile\b|\[(system\.)?environment\]::getfolderpath\b|(^|[\s'"(=,;:])~(?=$|[\\/\s'";)])/i
+  /\$\{?env:(userprofile|appdata|localappdata|programfiles|programdata|windir|systemroot|systemdrive|temp|tmp|homepath|homedrive|public|onedrive|allusersprofile)\b|%(userprofile|appdata|localappdata|programfiles|programdata|windir|systemroot|systemdrive|temp|tmp|homepath|homedrive|public|onedrive)%|\$home\b|\$profile\b|\[(system\.)?environment\]::getfolderpath\b|(^|[\s'"(=,;:])~(?=$|[\\/\s'";)])|\[(system\.)?environment\]::getenvironmentvariable\s*\(\s*['"](userprofile|appdata|localappdata|programfiles|programdata|windir|systemroot|systemdrive|temp|tmp|homepath|homedrive|public|onedrive|allusersprofile)['"]|(^|[\s'"(=,;])env:[\\/]?(userprofile|appdata|localappdata|programfiles|programdata|windir|systemroot|systemdrive|temp|tmp|homepath|homedrive|public|onedrive|allusersprofile)\b/i
 const QUOTED_PATH = /(["'])([a-z]:[\\/][^"'\n]*|\\\\[^"'\n]+)\1/gi
 const ABS_PATH = /(?:^|[\s'"(=,;:>])([a-z]:[\\/][^\s'"`;|&)<>,]*|\\\\[^\s'"`;|&)<>,]+)/gi
 /** `\Users\me`: a path from the root of the project's drive. */
@@ -181,6 +215,24 @@ export function outsidePaths(command: string, root: string): string[] {
   const env = command.match(ENV_PATH)
   if (env) found.push(env[0].trim())
   return found
+}
+
+/**
+ * The check for a start command the model wrote (its RUN: line), which "Run my app" later runs with
+ * one click and no question: refused commands, and commands that hide what they run, are not taken.
+ * Other risks are only pointed out, since starting an app can need the internet or a delete.
+ */
+export function classifyStartCommand(command: string, root: string): CommandVerdict {
+  // `open:<file>` opens the file with its Windows program, which runs a .bat, .exe or shortcut:
+  // only a web page inside the project is opened.
+  if (command.startsWith('open:')) {
+    const page = command.slice('open:'.length).trim()
+    if (/\.html?$/i.test(page) && isInside(root, resolve(root, page))) return { verdict: 'ok' }
+    return { verdict: 'refuse', reason: '"Run my app" only opens a web page (an .html file) that is in the project.' }
+  }
+  const v = classifyCommand(command, root)
+  if (v.verdict === 'ask' && v.risks.some((r) => r.kind === 'hidden')) return { verdict: 'refuse', reason: v.risks.find((r) => r.kind === 'hidden')!.reason }
+  return v
 }
 
 export function classifyCommand(command: string, root: string): CommandVerdict {

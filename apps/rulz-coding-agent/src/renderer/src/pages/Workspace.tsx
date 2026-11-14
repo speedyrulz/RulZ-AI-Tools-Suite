@@ -654,6 +654,11 @@ function Composer() {
   const [text, setText] = useState('')
   const ref = useRef<HTMLTextAreaElement>(null)
   const answering = prompt?.kind === 'question'
+  const questionId = answering ? prompt.id : undefined
+  /** The question the text in the box was typed to answer, if any. */
+  const draftFor = useRef<string | undefined>(undefined)
+  /** One send at a time: the box now keeps its text until the send went through. */
+  const sending = useRef(false)
   /** While a task runs, what's typed is a note for it (unless it is answering my question). */
   const noting = running && !answering
   const canSend = connected && !!text.trim()
@@ -667,15 +672,31 @@ function Composer() {
     return () => window.removeEventListener('rulz:fill', fill)
   }, [])
   useEffect(() => {
-    if (answering) ref.current?.focus()
-  }, [answering])
+    if (!questionId) return
+    // An answer typed for an earlier question (answered on the phone meanwhile) isn't one for this.
+    if (draftFor.current && draftFor.current !== questionId) {
+      setText('')
+      draftFor.current = undefined
+    }
+    ref.current?.focus()
+  }, [questionId])
 
   /** `now` cuts the model's current reply short so the note applies at once. */
-  const submit = (now = false): void => {
-    if (!canSend) return
-    if (noting) void addNote(text, now)
-    else void send(text)
-    setText('')
+  const submit = async (now = false): Promise<void> => {
+    if (!canSend || sending.current) return
+    const sent = text
+    // The box is emptied only once it went through (a task can't start while another one runs).
+    sending.current = true
+    let ok = false
+    try {
+      ok = noting ? await addNote(sent, now) : await send(sent, questionId)
+    } finally {
+      sending.current = false
+    }
+    if (ok) {
+      setText((current) => (current === sent ? '' : current))
+      draftFor.current = undefined
+    }
   }
 
   return (
@@ -701,11 +722,14 @@ function Composer() {
         <textarea
           ref={ref}
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => {
+            setText(e.target.value)
+            draftFor.current = questionId
+          }}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault()
-              submit(e.ctrlKey || e.metaKey)
+              void submit(e.ctrlKey || e.metaKey)
             }
           }}
           rows={3}

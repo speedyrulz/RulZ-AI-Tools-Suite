@@ -43,9 +43,12 @@ export function writeJsonAtomic(path: string, data: unknown, opts: { compact?: b
   const previous = writeQueues.get(path) ?? Promise.resolve()
   const next = previous.catch(() => undefined).then(() => doWrite(path, data, opts.compact ?? false))
   writeQueues.set(path, next)
-  void next.finally(() => {
+  // Cleanup on both outcomes; a failed write is the caller's to handle (through `next`), so this
+  // branch must not leave a second, unhandled rejection behind.
+  const forget = (): void => {
     if (writeQueues.get(path) === next) writeQueues.delete(path)
-  })
+  }
+  next.then(forget, forget)
   return next
 }
 

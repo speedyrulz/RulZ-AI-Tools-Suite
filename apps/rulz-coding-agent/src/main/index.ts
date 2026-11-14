@@ -20,6 +20,9 @@ import { SettingsStore } from './settings'
 
 const isDev = !app.isPackaged && !!process.env.ELECTRON_RENDERER_URL
 
+/** The longest quitting waits for the running task to stop and the project to be saved. */
+const QUIT_WAIT_MS = 3000
+
 // Tests run with their own data folder.
 if (process.env.RULZ_AGENT_USER_DATA) app.setPath('userData', resolve(process.env.RULZ_AGENT_USER_DATA))
 
@@ -116,8 +119,9 @@ async function main(): Promise<void> {
   await settings.init()
   const store = new ProjectStore(userData)
   const hasGit = await gitInstalled()
-  // Background commands and "Run my app" shells left running by a crash are stopped now.
-  await childPids.init(join(userData, 'child-pids.json')).catch(() => undefined)
+  // Shells left running by a crash are stopped now. Not waited for: finding them after a crash
+  // can take PowerShell a few seconds, and shells started meanwhile are recorded all the same.
+  void childPids.init(join(userData, 'child-pids.json')).catch(() => undefined)
 
   // ---- Connection to RulZ LLM Suite ----
   let connection: ConnectionInfo = { status: 'checking', url: '', models: [] }
@@ -138,6 +142,10 @@ async function main(): Promise<void> {
   const connect = (): Promise<ConnectionInfo> => {
     connecting ??= findServer(candidates(), settings.get().apiKey)
       .then((info) => {
+        // One slow answer while a task runs (the server busy reading a long prompt, say) must not
+        // blank the address and reset the client under the task, whose next request would then
+        // fail. The last working address stays; the next model poll tries again.
+        if (info.status !== 'connected' && connection.status === 'connected' && session?.isRunning) return connection
         setConnection(info)
         return info
       })
@@ -374,11 +382,15 @@ async function main(): Promise<void> {
   })
 
   handle('run:state', (path) => requireRunner(path).get())
-  handle('run:start', (path) => requireRunner(path).start(requireSession(path).data.runCommand))
+  handle('run:start', (path) => {
+    const { runCommand, runCommandByOwner } = requireSession(path).data
+    return requireRunner(path).start(runCommand, runCommandByOwner === true)
+  })
   handle('run:stop', (path) => requireRunner(path).stop())
   handle('run:setCommand', async (path, command) => {
     const s = requireSession(path)
     s.data.runCommand = command?.trim() || null
+    s.data.runCommandByOwner = !!s.data.runCommand
     await s.saveNow()
     if (!s.data.runCommand) requireRunner(path).forgetCommand()
     projectChanged()
@@ -405,6 +417,8 @@ async function main(): Promise<void> {
 
   // ---- Lifecycle ----
   mainWindow = createWindow(settings.get().theme)
+  // Quitting can take a few seconds after the window is gone (see before-quit): nothing may use it then.
+  mainWindow.on('closed', () => (mainWindow = null))
   void connect()
   void phone.start()
 
@@ -414,13 +428,39 @@ async function main(): Promise<void> {
     mainWindow.focus()
   })
   app.on('window-all-closed', () => app.quit())
-  app.on('before-quit', () => {
-    void runner?.stop()
-    session?.stop()
-    void session?.background.stopAll()
-    if (session) void store.save(session.data)
-    void toolServers.dispose()
-    void phone.dispose()
+
+  // Quitting waits (up to QUIT_WAIT_MS) for the running task to stop and the project to be saved,
+  // so its final state (the task marked stopped, its last steps) isn't lost. The first before-quit
+  // is held back while that happens; the quit that follows goes through.
+  let shuttingDown = false
+  let readyToQuit = false
+  const shutDown = async (): Promise<void> => {
+    const deadline = Date.now() + QUIT_WAIT_MS
+    const s = session
+    const closeSession = async (): Promise<void> => {
+      if (!s) return
+      s.stop()
+      // The task's own clean-up marks it stopped and saves; wait for that (leaving time for the
+      // last save) before closing the session, which stops background commands and saves again.
+      while (s.isRunning && Date.now() < deadline - 500) await new Promise((r) => setTimeout(r, 50))
+      await s.close()
+    }
+    const work = Promise.allSettled([runner?.stop(), closeSession(), toolServers.dispose(), phone.dispose()])
+    let timer: NodeJS.Timeout | undefined
+    await Promise.race([work, new Promise((r) => (timer = setTimeout(r, Math.max(0, deadline - Date.now()))))])
+    clearTimeout(timer)
+  }
+  app.on('before-quit', (e) => {
+    if (readyToQuit) return
+    e.preventDefault()
+    if (shuttingDown) return
+    shuttingDown = true
+    void shutDown()
+      .catch(() => undefined)
+      .finally(() => {
+        readyToQuit = true
+        app.quit()
+      })
   })
 }
 

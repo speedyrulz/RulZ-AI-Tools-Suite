@@ -1,5 +1,25 @@
-import type { WireMessage } from '@shared/types'
+import type { WireMessage, WireToolCall } from '@shared/types'
 import { parseToolArgs } from '../agent/tools'
+
+/**
+ * Both fixes below run over every tool call in the history before every turn. A call's result
+ * depends only on its arguments text, and the history keeps the same call objects from turn to
+ * turn, so each call is worked out once and remembered (per call object, so nothing is kept alive
+ * after the history drops the call). The arguments text is checked too, in case it was changed.
+ */
+type CallCache = WeakMap<WireToolCall, { raw: string; out: WireToolCall }>
+
+function cachedCall(cache: CallCache, c: WireToolCall, work: (raw: string) => WireToolCall): WireToolCall {
+  const raw = c.function.arguments ?? ''
+  const hit = cache.get(c)
+  if (hit && hit.raw === raw) return hit.out
+  const out = work(raw)
+  cache.set(c, { raw, out })
+  return out
+}
+
+const validCache: CallCache = new WeakMap()
+const jsonCache: CallCache = new WeakMap()
 
 /**
  * Makes every earlier tool call's arguments a JSON object. llama.cpp parses them to fill in the
@@ -14,22 +34,26 @@ export function validToolCallArgs(messages: WireMessage[]): WireMessage[] {
     if (!m.tool_calls?.length) return m
     let fixed = false
     const calls = m.tool_calls.map((c) => {
-      const raw = c.function.arguments ?? ''
-      try {
-        const v: unknown = JSON.parse(raw)
-        if (v && typeof v === 'object' && !Array.isArray(v)) return c
-      } catch {
-        // repaired below
-      }
-      const parsed = parseToolArgs(raw)
-      fixed = true
-      return { ...c, function: { ...c.function, arguments: 'args' in parsed ? JSON.stringify(parsed.args) : '{}' } }
+      const v = cachedCall(validCache, c, (raw) => validCall(c, raw))
+      if (v !== c) fixed = true
+      return v
     })
     if (!fixed) return m
     changed = true
     return { ...m, tool_calls: calls }
   })
   return changed ? out : messages
+}
+
+function validCall(c: WireToolCall, raw: string): WireToolCall {
+  try {
+    const v: unknown = JSON.parse(raw)
+    if (v && typeof v === 'object' && !Array.isArray(v)) return c
+  } catch {
+    // repaired below
+  }
+  const parsed = parseToolArgs(raw)
+  return { ...c, function: { ...c.function, arguments: 'args' in parsed ? JSON.stringify(parsed.args) : '{}' } }
 }
 
 /**
@@ -50,20 +74,19 @@ export function templateStringifiesArgs(template: string | undefined): boolean {
 export function jsonifyToolCallArgs(messages: WireMessage[]): WireMessage[] {
   return messages.map((m) => {
     if (!m.tool_calls?.length) return m
-    return {
-      ...m,
-      tool_calls: m.tool_calls.map((c) => {
-        let args: unknown
-        try {
-          args = JSON.parse(c.function.arguments || '{}')
-        } catch {
-          return c
-        }
-        if (!args || typeof args !== 'object' || Array.isArray(args)) return c
-        const out: Record<string, string> = {}
-        for (const [k, v] of Object.entries(args)) out[k] = typeof v === 'string' ? v : JSON.stringify(v)
-        return { ...c, function: { ...c.function, arguments: JSON.stringify(out) } }
-      })
-    }
+    return { ...m, tool_calls: m.tool_calls.map((c) => cachedCall(jsonCache, c, (raw) => jsonifyCall(c, raw))) }
   })
+}
+
+function jsonifyCall(c: WireToolCall, raw: string): WireToolCall {
+  let args: unknown
+  try {
+    args = JSON.parse(raw || '{}')
+  } catch {
+    return c
+  }
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return c
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(args)) out[k] = typeof v === 'string' ? v : JSON.stringify(v)
+  return { ...c, function: { ...c.function, arguments: JSON.stringify(out) } }
 }

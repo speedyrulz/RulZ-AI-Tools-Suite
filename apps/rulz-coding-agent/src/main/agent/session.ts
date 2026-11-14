@@ -24,7 +24,7 @@ import type {
 import { DEFAULT_MAX_OUTPUT_TOKENS, MAX_INSTRUCTION_CHARS, samplingRequest, skipsThinking } from '@shared/defaults'
 import { dropExchange, dropReply, forModel, requestItem, whyNotDelete, whyNotRedo } from '@shared/history'
 import { splitThink } from '@shared/think'
-import { friendlyServerError, pickDefaultModel, RE_SESSION_HEADER, type RulzClient, type TurnResult } from '../rulz/client'
+import { friendlyServerError, pickDefaultModel, RE_SESSION_HEADER, ServerError, type RulzClient, type TurnResult } from '../rulz/client'
 import { addDraft } from '../rulz/draft'
 import type { Snapshot, Snapshotter } from '../project/snapshots'
 import type { ProjectData, ProjectStore } from '../project/store'
@@ -34,6 +34,7 @@ import {
   CONTEXT_SHARE,
   estimateTokens,
   fitMessages,
+  MAX_TOKEN_SCALE,
   mechanicalSummary,
   SMALL_CONTEXT,
   SUMMARY_PROMPT,
@@ -48,8 +49,8 @@ import { LoopGuard, type GuardTrip } from './loopGuard'
 import { cutTurnContent, NoteQueue, noteMessage } from './notes'
 import { formatPageReport, pageHasProblems, pageTarget, type PageReport, type PageTarget } from './pageCheck'
 import { resolveInProject } from './pathGuard'
-import { backgroundNote, HOW_TO_RUN_TASK, parseRunLine, parseShareLine, systemPrompt } from './prompt'
-import { approvalKey, classifyCommand, needsApproval, type ActionKind } from './safety'
+import { backgroundNote, HOW_TO_RUN_TASK, lastBackgroundNoteIn, NO_BACKGROUND_NOTE, parseRunLine, parseShareLine, systemPrompt } from './prompt'
+import { approvalKey, classifyCommand, classifyStartCommand, needsApproval, type ActionKind } from './safety'
 import { describeStep, EXTRA_TOOL_DEFS, EXTRA_TOOL_NAMES, parseToolArgs, serverLabel, TOOL_DEFS, TOOL_NAMES } from './tools'
 import { toolSummary } from '../mcp/config'
 import type { ToolInfo, ToolServers } from '../mcp/toolServers'
@@ -69,11 +70,9 @@ const LAST_RESORT_REPLY_TOKENS = 256
 const SAVE_DELAY_MS = 1500
 const SAVE_DELAY_RUNNING_MS = 5000
 
-/** Appends `note` to the last message (a user or tool message when a request is made). */
-export function withTrailingNote(messages: WireMessage[], note: string): WireMessage[] {
-  const last = messages[messages.length - 1]
-  if (!note || !last || last.role === 'system' || last.role === 'assistant') return messages
-  return [...messages.slice(0, -1), { ...last, content: `${last.content}\n\n${note}` }]
+/** Whether a server error says the request didn't fit the model's context. */
+export function isContextOverflow(e: unknown): boolean {
+  return e instanceof ServerError && /exceeds? the available context|context (size|length|window)|too many tokens|prompt is too long/i.test(e.message)
 }
 
 export interface SessionDeps {
@@ -137,6 +136,10 @@ export class ProjectSession {
   private nCtx = DEFAULT_CTX
   /** Notes the owner writes while the task runs. */
   private notes = new NoteQueue()
+  /** Set while Undo, Redo or Delete change the project or its history, so nothing else starts meanwhile. */
+  private busy: string | null = null
+  /** The background-commands note last put into the history (it goes in only when it changes). */
+  private lastBackgroundNote = ''
 
   constructor(
     public data: ProjectData,
@@ -228,11 +231,26 @@ export class ProjectSession {
 
   // ---------- public actions ----------
 
+  /**
+   * Runs `fn` with nothing else allowed to start meanwhile: Undo resets the project's files, and a
+   * task (from this window or the phone) starting during it would work on files being put back.
+   */
+  private async exclusive<T>(what: string, fn: () => Promise<T>): Promise<T> {
+    if (this.busy) throw new Error(`Wait for ${this.busy} to finish first.`)
+    this.busy = what
+    try {
+      return await fn()
+    } finally {
+      this.busy = null
+    }
+  }
+
   /** `shown` is what the conversation shows when the model gets a longer text (e.g. "Fix this"). */
   start(text: string, opts: { howToRun?: boolean; share?: boolean; shown?: string; re?: ReTaskInfo } = {}): void {
     const trimmed = text.trim()
     if (!trimmed) return
     if (this.running) throw new Error('A task is already running. Wait for it to finish or press Stop.')
+    if (this.busy) throw new Error(`Wait for ${this.busy} to finish first.`)
     const visible = opts.shown?.trim() || trimmed
     const title = visible.split('\n')[0].slice(0, 80) + (visible.split('\n')[0].length > 80 ? '…' : '')
     const task: TaskRecord = { id: randomUUID(), title: opts.howToRun ? 'Finding out how to run the app' : title, startedAt: Date.now(), outcome: 'running', steps: [], files: [] }
@@ -282,7 +300,11 @@ export class ProjectSession {
   }
 
   /** "Undo last task" with no id; History's "Go back to before this" with one (that task and every later one are undone). */
-  async undo(taskId?: string): Promise<void> {
+  undo(taskId?: string): Promise<void> {
+    return this.exclusive('the undo', () => this.undoNow(taskId))
+  }
+
+  private async undoNow(taskId?: string): Promise<void> {
     if (this.running) throw new Error('Wait for the current task to finish (or press Stop) before undoing.')
     const target = taskId ? this.data.tasks.find((t) => t.id === taskId) : this.canUndo()
     if (!target) throw new Error('There is nothing to undo.')
@@ -309,8 +331,10 @@ export class ProjectSession {
         : `The owner clicked "Undo last task", so the project files are back to how they were before the task "${target.title}"`) +
         '. Everything those tasks created or changed is gone; check the files again before relying on earlier results.'
     )
+    // Without git, only the files the agent changed with its file tools were copied aside.
+    const copied = target.snapshot.kind === 'copy' ? " Changes made by commands aren't covered without Git for Windows, so check those files." : ''
     this.notice(
-      `Undone: "${target.title}"${later.length ? ` and ${later.length} later task${later.length > 1 ? 's' : ''}` : ''}. The project is back to how it was before that task.`,
+      `Undone: "${target.title}"${later.length ? ` and ${later.length} later task${later.length > 1 ? 's' : ''}` : ''}. The project is back to how it was before that task.${copied}`,
       'ok',
       target.id
     )
@@ -319,13 +343,15 @@ export class ProjectSession {
   }
 
   /** Deletes a message: a request takes its whole exchange with it (History keeps the task), a reply only itself. */
-  async deleteItem(itemId: string): Promise<void> {
-    const why = whyNotDelete(this.data.timeline, this.data.tasks, itemId, this.running)
-    if (why) throw new Error(why)
-    const item = this.data.timeline.find((i) => i.id === itemId)!
-    if (item.kind === 'assistant') dropReply(this.data, itemId)
-    else if (item.kind === 'user') this.forgetExchange(item.taskId, item.text)
-    await this.saveNow()
+  deleteItem(itemId: string): Promise<void> {
+    return this.exclusive('the delete', async () => {
+      const why = whyNotDelete(this.data.timeline, this.data.tasks, itemId, this.running)
+      if (why) throw new Error(why)
+      const item = this.data.timeline.find((i) => i.id === itemId)!
+      if (item.kind === 'assistant') dropReply(this.data, itemId)
+      else if (item.kind === 'user') this.forgetExchange(item.taskId, item.text)
+      await this.saveNow()
+    })
   }
 
   /**
@@ -333,18 +359,21 @@ export class ProjectSession {
    * then its exchange is replaced by the new run (History keeps the first try, marked undone).
    */
   async redo(taskId: string, text?: string): Promise<void> {
-    const item = requestItem(this.data.timeline, taskId)
-    const why = whyNotRedo(this.data.timeline, this.data.tasks, item?.id ?? '', this.running)
-    if (why || !item) throw new Error(why ?? 'Only a request can be run again.')
-    const task = this.data.tasks.find((t) => t.id === taskId)!
-    const changed = task.files.length > 0 && !task.undone
-    if (changed) {
-      await this.undo(task.id)
-      // The exchange goes too, so the model has nothing left to be told about.
-      this.data.notes.pop()
-    }
-    this.forgetExchange(task.id, item.text)
-    if (changed) this.notice(`Put back the files “${task.title}” changed, then ran your request again.`, 'info')
+    const { task, item } = await this.exclusive('the redo', async () => {
+      const item = requestItem(this.data.timeline, taskId)
+      const why = whyNotRedo(this.data.timeline, this.data.tasks, item?.id ?? '', this.running)
+      if (why || !item) throw new Error(why ?? 'Only a request can be run again.')
+      const task = this.data.tasks.find((t) => t.id === taskId)!
+      const changed = task.files.length > 0 && !task.undone
+      if (changed) {
+        await this.undoNow(task.id)
+        // The exchange goes too, so the model has nothing left to be told about.
+        this.data.notes.pop()
+      }
+      this.forgetExchange(task.id, item.text)
+      if (changed) this.notice(`Put back the files “${task.title}” changed, then ran your request again.`, 'info')
+      return { task, item }
+    })
     const edited = text?.trim()
     if (edited && edited !== item.text) this.start(edited)
     else if (task.request) this.start(task.request.text, { howToRun: task.request.howToRun, share: task.request.share, shown: item.text, re: task.re })
@@ -372,7 +401,12 @@ export class ProjectSession {
       const snap = await this.deps.snapshotter(task.snapshot.kind)
       out.before = decode(await snap.fileBefore(task.snapshot, target.rel))
     }
-    out.after = decode(await fs.readFile(target.abs).catch(() => null))
+    // Size first: a huge file (a video, a model) isn't read into memory just to be refused.
+    const size = await fs.stat(target.abs).then((s) => s.size, () => -1)
+    if (size > MAX_DIFF_BYTES) {
+      out.tooLarge = true
+      out.before = null
+    } else if (size >= 0) out.after = decode(await fs.readFile(target.abs).catch(() => null))
     return out
   }
 
@@ -396,6 +430,10 @@ export class ProjectSession {
       const nCtx = await this.prepareModel(model, signal)
       this.nCtx = nCtx
       this.extraServers = (await this.deps.toolServers?.configured().catch(() => [])) ?? []
+      // Tools loaded from a server the owner has since turned off or removed aren't offered any more.
+      for (const [name, tool] of this.loaded) if (!this.extraServers.includes(tool.server)) this.loaded.delete(name)
+      // What the history last told the model: commands may have ended since (Undo, a crash, reopening).
+      this.lastBackgroundNote = lastBackgroundNoteIn(this.data.messages)
 
       const notes = this.data.notes.splice(0)
       const body = howToRun ? HOW_TO_RUN_TASK : text
@@ -408,9 +446,15 @@ export class ProjectSession {
       if (howToRun) {
         const last = [...this.data.messages].reverse().find((m) => m.role === 'assistant' && m.content.trim())
         const cmd = last ? parseRunLine(last.content) : null
-        if (cmd) {
+        // "Run my app" runs this line later without asking, so it gets the same check as any command.
+        const verdict = cmd ? classifyStartCommand(cmd, this.root) : null
+        if (cmd && verdict?.verdict === 'refuse') {
+          this.notice(`I won't save \`${cmd}\` as the way to run this app: ${verdict.reason}`, 'warn', task.id)
+        } else if (cmd) {
           this.data.runCommand = cmd
-          this.notice('Saved how to run this app. Click **Run my app** to start it.', 'ok', task.id)
+          this.data.runCommandByOwner = false
+          const careful = verdict?.verdict === 'ask' ? ` Before you do, note: ${verdict.risks.map((r) => r.reason).join(' ')}` : ''
+          this.notice(`Saved how to run this app. Click **Run my app** to start it.${careful}`, careful ? 'warn' : 'ok', task.id)
         } else this.notice("I couldn't work out how to run this app.", 'warn', task.id)
       }
       if (share) await this.reportShare(task)
@@ -429,20 +473,22 @@ export class ProjectSession {
       }
     } finally {
       this.closeOpenCalls()
+      for (const s of task.steps) if (s.status === 'running' || s.status === 'waiting') this.updateStep(s, { status: 'skipped' })
+      task.endedAt = Date.now()
+      if (snap) await this.refreshFiles(task, snap, { rescan: true }).catch(() => undefined)
+      // Taken last: notes are accepted until `running` goes false, so one written during the final
+      // look at the files would otherwise wait unseen and go into the next task.
       const unsent = this.notes.take()
       if (unsent.length) {
         this.notice(`Not sent, because the task ended first: ${unsent.map((n) => `"${n.text}"`).join(', ')}`, 'warn', task.id)
         this.emit({ type: 'notes', notes: [] })
       }
-      for (const s of task.steps) if (s.status === 'running' || s.status === 'waiting') this.updateStep(s, { status: 'skipped' })
-      task.endedAt = Date.now()
-      if (snap) await this.refreshFiles(task, snap, { rescan: true }).catch(() => undefined)
       this.running = false
       this.abort = null
       this.setStatus({ phase: 'idle' })
       this.deps.activity('idle')
       this.deps.refreshModels()
-      this.emit({ type: 'task-end', task })
+      this.emit({ type: 'task-end', task, runCommand: this.data.runCommand })
       await this.saveNow().catch(() => undefined)
     }
   }
@@ -531,13 +577,26 @@ export class ProjectSession {
     let limit = settings.maxSteps
     let steps = 0
     let textCalls = 0
+    let cutOffs = 0
+    let overflowRetried = false
     const guard = new LoopGuard()
 
     for (;;) {
       if (signal.aborted) throw new StopTask()
       this.deliverNotes(task)
       const request = await this.buildRequest(model, nCtx, signal)
-      const turn = await this.streamTurn(task, model, request, nCtx, signal)
+      let turn: Awaited<ReturnType<ProjectSession['streamTurn']>>
+      try {
+        turn = await this.streamTurn(task, model, request, nCtx, signal)
+      } catch (e) {
+        // The server counted more tokens than estimated (text in Chinese, minified code): estimate
+        // higher, which tidies up the history harder, and try once more.
+        if (signal.aborted || overflowRetried || !isContextOverflow(e)) throw e
+        overflowRetried = true
+        this.scale = Math.min(MAX_TOKEN_SCALE * 1.6, Math.max(this.scale * 1.5, 1.5))
+        continue
+      }
+      overflowRetried = false
       if (turn.cut) {
         // Keep what the model had so far, then hand it the notes along with its thinking.
         this.data.messages.push({ role: 'assistant', content: cutTurnContent(cleanContent(turn.content)), item: turn.itemId })
@@ -549,6 +608,23 @@ export class ProjectSession {
       this.data.messages.push({ role: 'assistant', content, item: turn.itemId, ...(calls.length ? { tool_calls: calls } : {}) })
 
       if (!calls.length) {
+        // Cut off first: a tool call that was cut off comes through as text, and the fix for it is
+        // writing in smaller parts, not the tool-calling format.
+        if (turn.finishReason === 'length') {
+          if (++cutOffs <= MAX_TEXT_CALLS) {
+            this.data.messages.push({
+              role: 'user',
+              content: '[Note: Your last reply was cut off because it was too long. Continue from where you stopped; write big files in smaller parts.]'
+            })
+            continue
+          }
+          this.notice(
+            "My replies kept getting cut off before they were finished, so I stopped here. If the model's working memory is nearly full, start a new task or load the model with a larger context length in RulZ LLM Suite.",
+            'warn',
+            task.id
+          )
+          return
+        }
         // Tool calls that came through as plain text: ask for a proper call.
         if (/<tool_call>|<function=/.test(content) && ++textCalls <= MAX_TEXT_CALLS) {
           this.data.messages.push({
@@ -557,17 +633,12 @@ export class ProjectSession {
           })
           continue
         }
-        if (turn.finishReason === 'length') {
-          this.data.messages.push({
-            role: 'user',
-            content: '[Note: Your last reply was cut off because it was too long. Continue from where you stopped; write big files in smaller parts.]'
-          })
-          if (++textCalls <= MAX_TEXT_CALLS) continue
-        }
         // A note that came in during the final reply: the model gets to act on it.
         if (this.notes.size) continue
         return
       }
+      textCalls = 0
+      cutOffs = 0
 
       let trip: GuardTrip | null = null
       let lastTitle = ''
@@ -718,14 +789,31 @@ export class ProjectSession {
           ? { servers: this.extraServers.map(serverLabel), advice: this.deps.toolServers?.instructions().map((i) => ({ ...i, server: serverLabel(i.server) })) ?? [] }
           : undefined
       })
-      const note = backgroundNote(this.background.running())
-      const fit = fitMessages(this.data.messages, budget, estimateTokens(system) + estimateTokens(note) + estimateTokens(JSON.stringify(this.toolDefs())))
+      this.noteBackground()
+      const fit = fitMessages(this.data.messages, budget, estimateTokens(system) + estimateTokens(JSON.stringify(this.toolDefs())))
       // Fitting the budget isn't enough if the reply would get less room than it needs.
       const roomy = nCtx - Math.ceil(fit.tokens * this.scale) - 256 >= minReply
       const range = (fit.fits && roomy) || attempt >= 3 ? null : summaryRange(this.data.messages, this.taskStart)
-      if (!range) return withTrailingNote([{ role: 'system' as const, content: system }, ...forModel(fit.messages)], note)
+      if (!range) return [{ role: 'system' as const, content: system }, ...forModel(fit.messages)]
       await this.summarise(model, range, budget, signal)
     }
+  }
+
+  /**
+   * Tells the model which background commands are still running, at the end of the history, but
+   * only when that changes. The note stays where it was put: a note moved to the end at every step
+   * would change an earlier message each time, and the server would have to read everything after
+   * it again (including whole files the model wrote) instead of taking it from its prompt cache.
+   */
+  private noteBackground(): void {
+    const note = backgroundNote(this.background.running())
+    if (note === this.lastBackgroundNote) return
+    // When the last one ends, the model is told so; otherwise the earlier note would still say they run.
+    const text = note || NO_BACKGROUND_NOTE
+    const last = this.data.messages[this.data.messages.length - 1]
+    if (!last || (last.role !== 'user' && last.role !== 'tool')) return
+    last.content = `${last.content}\n\n${text}`
+    this.lastBackgroundNote = note
   }
 
   private async summarise(model: string, range: { from: number; to: number }, budget: number, signal: AbortSignal): Promise<void> {
@@ -735,7 +823,7 @@ export class ProjectSession {
     const maxChars = Math.max(4000, Math.floor((budget - 2500) * CHARS_PER_TOKEN) - earlier.length)
     let summary: string
     try {
-      summary = await this.deps.client.complete(
+      const reply = await this.deps.client.complete(
         model,
         [
           { role: 'system', content: SUMMARY_PROMPT },
@@ -744,14 +832,19 @@ export class ProjectSession {
         1500,
         signal
       )
-      if (!summary.trim()) throw new Error('empty summary')
+      // Checked without the thinking: a reply that was all <think> (cut off while thinking) would
+      // otherwise replace the summary, and everything folded into it, with nothing.
+      summary = cleanContent(reply).trim()
+      if (!summary) throw new Error('empty summary')
     } catch (e) {
       if (signal.aborted) throw e
       summary = `${this.data.summary ? `${this.data.summary}\n` : ''}${mechanicalSummary(part)}`
     }
-    this.data.summary = cleanContent(summary)
+    this.data.summary = summary
     this.data.messages.splice(range.from, range.to - range.from)
     if (range.to <= this.taskStart) this.taskStart -= range.to - range.from
+    // The note may have been in what was folded away; it is said again if anything still runs.
+    this.lastBackgroundNote = lastBackgroundNoteIn(this.data.messages)
   }
 
   /** One model turn. `cut` is set when a note cut it short: the result then holds what came so far. */
@@ -870,10 +963,16 @@ export class ProjectSession {
   private async extraTool(name: string, signal: AbortSignal): Promise<ToolInfo | undefined> {
     const servers = this.deps.toolServers
     if (!servers || !this.extraServers.length || !name.includes('__')) return undefined
-    const found = servers.find(name)
+    const found = this.findTool(name)
     if (found) return found
     await this.startToolServers(signal)
-    return servers.find(name)
+    return this.findTool(name)
+  }
+
+  /** A tool from one of the servers set up now (a server turned off keeps running until restarted, but its tools are not used). */
+  private findTool(name: string): ToolInfo | undefined {
+    const t = this.deps.toolServers?.find(name)
+    return t && this.extraServers.includes(t.server) ? t : undefined
   }
 
   /** Starts the tool servers that aren't running; Stop ends the wait at once (they keep starting, for next time). */
@@ -960,7 +1059,9 @@ export class ProjectSession {
       if ('denied' in result) return finish(result.outcome, 'skipped', "You didn't allow this.")
       if ('refused' in result) return finish(result.outcome, 'refused', result.refused)
       // A command can change anything, so ask the restore point; a file tool says what it changed.
-      if (name === 'run_command' || name === 'start_background_command') {
+      // (A background command has only just started, so there is nothing to see yet; the look at
+      // the end of the task covers what it changes.)
+      if (name === 'run_command') {
         if (snap) await this.refreshFiles(task, snap, { rescan: false }).catch(() => undefined)
       } else if (result.changed?.length && snap) {
         await this.refreshFiles(task, snap, { changed: result.changed }).catch(() => undefined)
@@ -1126,7 +1227,10 @@ export class ProjectSession {
         const states = servers.status().servers.filter((s) => this.extraServers.includes(s.name))
         const broken = states.filter((s) => s.state === 'error').map((s) => `${serverLabel(s.name)} could not start: ${s.error ?? 'unknown problem'}`)
         const limit = typeof args.limit === 'number' ? Math.min(30, Math.max(1, Math.round(args.limit))) : 10
-        const hits = servers.search(query, limit)
+        const hits = servers
+          .search(query, limit * 3)
+          .filter((t) => this.extraServers.includes(t.server))
+          .slice(0, limit)
         const lines = hits.map((t) => `- ${t.qualifiedName}: ${toolSummary(t.description)}${t.destructive ? ' (can change things: the owner is asked separately)' : ''}${this.loaded.has(t.qualifiedName) ? ' [loaded]' : ''}`)
         const running = states.filter((s) => s.state === 'connected').map((s) => `${serverLabel(s.name)} (${s.tools} tools)`)
         const text = [
@@ -1145,7 +1249,7 @@ export class ProjectSession {
         const names = (Array.isArray(args.names) ? args.names : typeof args.names === 'string' ? args.names.split(/[,\s]+/) : []).map(String).filter(Boolean)
         if (!names.length) return { text: 'Give the tool names to load, e.g. ["rea__open_binary"].', isError: true }
         await this.startToolServers(signal)
-        const found = names.map((n) => ({ n, t: servers.find(n.trim()) }))
+        const found = names.map((n) => ({ n, t: this.findTool(n.trim()) }))
         const tools = found.flatMap((f) => (f.t ? [f.t] : []))
         const missing = found.filter((f) => !f.t).map((f) => f.n)
         const unloaded = this.loadTools(tools)

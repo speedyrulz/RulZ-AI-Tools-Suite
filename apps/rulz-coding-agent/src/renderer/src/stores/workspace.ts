@@ -40,10 +40,14 @@ interface WorkspaceState {
   open: (path: string) => Promise<boolean>
   create: (name: string, parentDir: string | null) => Promise<boolean>
   close: () => Promise<void>
-  send: (text: string) => Promise<void>
+  /**
+   * Starts a task, or answers my question when `promptId` (the question shown when the owner
+   * pressed Send) is given. False when it didn't go through, so the typed text can stay.
+   */
+  send: (text: string, promptId?: string) => Promise<boolean>
   stop: () => void
   /** A note for the running task: before its next step, or at once (cutting the model's reply short) with `interrupt`. */
-  addNote: (text: string, interrupt: boolean) => Promise<void>
+  addNote: (text: string, interrupt: boolean) => Promise<boolean>
   cancelNote: (id: string) => void
   /** Cuts the model's current reply short so the waiting notes apply now. */
   interrupt: () => void
@@ -97,9 +101,18 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       memory: state.memory,
       context: state.context,
       status: same && state.running ? get().status : ({ phase: state.running ? 'working' : 'idle', text: 'Working…' } as AgentStatus),
-      selectedTaskId: same ? get().selectedTaskId : null
+      selectedTaskId: same ? get().selectedTaskId : null,
+      // Another project's Run panel (its output, Stop, Fix this) mustn't stay up for this one.
+      ...(same ? {} : { run: null })
     })
-    void invoke('run:state', state.project.path).then((run) => set({ run }), () => undefined)
+    const path = state.project.path
+    void invoke('run:state', path).then(
+      (run) => {
+        // Another project may have been opened while this was on its way.
+        if (isMine(path)) set({ run })
+      },
+      () => undefined
+    )
   }
 
   const isMine = (projectPath: string): boolean => get().project?.path.toLowerCase() === projectPath.toLowerCase()
@@ -142,6 +155,21 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     flushTimer = null
     pendingText = new Map()
     pendingOutput = new Map()
+    // Run output isn't replaced by the project's state, so it is applied rather than dropped
+    // (another project's panel is cleared right after).
+    flushRun()
+  }
+
+  // "Run my app" output too: a busy dev server can send many small pieces a second.
+  let pendingRun = ''
+  let runTimer: ReturnType<typeof setTimeout> | null = null
+  const flushRun = (): void => {
+    if (runTimer) clearTimeout(runTimer)
+    runTimer = null
+    if (!pendingRun) return
+    const chunk = pendingRun
+    pendingRun = ''
+    set((s) => (s.run ? { run: { ...s.run, output: (s.run.output + chunk).slice(-100_000) } } : {}))
   }
 
   on('agent:event', (e: AgentEvent) => {
@@ -195,7 +223,10 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
         break
       case 'task-end':
         set((s) => ({ tasks: updateTask(s.tasks, e.task.id, () => e.task), running: false, prompt: null, notes: [], status: { phase: 'idle' } }))
-        void invoke('projects:open', e.projectPath).then((st) => set({ runCommand: st.runCommand }), () => undefined)
+        // The event carries the way to run the app (a "how do I run this?" task may have found it);
+        // an older main process didn't send it, so the project is read again then.
+        if (e.runCommand !== undefined) set({ runCommand: e.runCommand })
+        else void invoke('projects:open', e.projectPath).then((st) => set({ runCommand: st.runCommand }), () => undefined)
         break
       case 'tasks':
         set({ tasks: e.tasks })
@@ -214,8 +245,14 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
 
   on('run:event', (e: RunEvent) => {
     if (!isMine(e.projectPath)) return
-    if (e.type === 'state') set({ run: e.state })
-    else set((s) => (s.run ? { run: { ...s.run, output: (s.run.output + e.chunk).slice(-100_000) } } : {}))
+    if (e.type === 'state') {
+      // The output that came before a new state belongs to it.
+      flushRun()
+      set({ run: e.state })
+    } else {
+      pendingRun += e.chunk
+      runTimer ??= setTimeout(flushRun, FLUSH_MS)
+    }
   })
 
   // The open project can change from the phone app (or after Undo); every screen follows it.
@@ -267,18 +304,26 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       }
     },
 
-    send: async (text) => {
+    send: async (text, promptId) => {
       const project = get().project
-      if (!project || !text.trim()) return
+      if (!project || !text.trim()) return false
       const prompt = get().prompt
-      if (prompt?.kind === 'question') {
+      if (promptId !== undefined || prompt?.kind === 'question') {
+        // Only the question the owner was answering: it may have been answered on the phone, and
+        // another one may be waiting now.
+        if (!prompt || prompt.kind !== 'question' || prompt.id !== promptId) {
+          toast.error(promptId ? 'That question was already answered (from your phone?). What you typed is still in the box.' : 'I asked you something meanwhile: read my question first.')
+          return false
+        }
         get().answer({ kind: 'question', text: text.trim() })
-        return
+        return true
       }
       try {
         await invoke('task:start', project.path, text)
+        return true
       } catch (e) {
         toast.error(errorMessage(e))
+        return false
       }
     },
 
@@ -289,11 +334,13 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
 
     addNote: async (text, interrupt) => {
       const project = get().project
-      if (!project || !text.trim()) return
+      if (!project || !text.trim()) return false
       try {
         await invoke('task:note', project.path, text, interrupt)
+        return true
       } catch (e) {
         toast.error(errorMessage(e))
+        return false
       }
     },
 
@@ -425,5 +472,7 @@ export function undoableTask(tasks: TaskRecord[]): TaskRecord | undefined {
 
 /** The tasks going back to before `task` would undo: it and every later task not undone yet. */
 export function tasksUndoneBy(tasks: TaskRecord[], task: TaskRecord): TaskRecord[] {
-  return tasks.slice(tasks.indexOf(task)).filter((t) => !t.undone && t.outcome !== 'running')
+  // By id: the list is replaced with fresh copies whenever the project changes (from the phone, say).
+  const i = tasks.findIndex((t) => t.id === task.id)
+  return i < 0 ? [] : tasks.slice(i).filter((t) => !t.undone && t.outcome !== 'running')
 }

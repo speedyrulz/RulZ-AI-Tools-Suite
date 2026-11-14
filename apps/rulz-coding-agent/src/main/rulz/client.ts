@@ -119,6 +119,9 @@ export interface ModelProps {
   nCtx?: number
 }
 
+/** A context length the server actually reported. */
+const known = (n: number | undefined): n is number => typeof n === 'number' && n > 0
+
 export interface TurnResult {
   content: string
   toolCalls: WireToolCall[]
@@ -170,10 +173,13 @@ export class RulzClient {
     if (!res.ok) throw new ServerError(errorFromBody(res.status, await res.text()), res.status)
     const models = parseModels(await res.json()).models
     // A model reloaded with another context (in RulZ LLM Suite, or by another app) makes the cached
-    // props stale; the list reports the context it is loaded with now.
+    // props stale; the list reports the context it is loaded with now. Only two known, different
+    // numbers mean that: forgetting the props on every poll would switch the Qwen3-Coder argument fix
+    // (decided by the chat template in them) off until the next task, changing how the history is
+    // written and throwing away the server's prompt cache.
     for (const m of models) {
       const cached = this.props.get(m.id)
-      if (cached && m.loadedContext && cached.nCtx !== m.loadedContext) this.props.delete(m.id)
+      if (cached && known(cached.nCtx) && known(m.loadedContext) && cached.nCtx !== m.loadedContext) this.props.delete(m.id)
     }
     return models
   }
@@ -214,7 +220,9 @@ export class RulzClient {
     const res = await fetch(`${url}/v1/chat/completions`, {
       method: 'POST',
       headers: { ...headers(apiKey, true), ...extra },
-      body: JSON.stringify({ ...body, messages: this.prepareMessages(body.model, body.messages), stream: true }),
+      // return_progress: llama-server then streams prompt_progress chunks while it reads the prompt
+      // (RulZ LLM Suite passes the body through unchanged), which onProgress turns into a percentage.
+      body: JSON.stringify({ ...body, messages: this.prepareMessages(body.model, body.messages), stream: true, return_progress: true }),
       signal
     })
     if (!res.ok || !res.body) throw new ServerError(errorFromBody(res.status, await res.text()), res.status)
@@ -392,11 +400,31 @@ export function parseLoadInfo(json: unknown): ModelLoadInfo {
   }
 }
 
+/** Socket-level error codes (Node's own and undici's) that mean the server couldn't be reached or the connection broke. */
+const NETWORK_CODES = new Set(['ECONNREFUSED', 'ECONNRESET', 'ECONNABORTED', 'ENOTFOUND', 'EAI_AGAIN', 'ETIMEDOUT', 'EPIPE', 'EHOSTUNREACH', 'ENETUNREACH', 'ENETDOWN'])
+/** undici codes for mistakes in the request itself rather than in the connection. */
+const NOT_NETWORK_UNDICI = new Set(['UND_ERR_INVALID_ARG', 'UND_ERR_INVALID_RETURN_VALUE', 'UND_ERR_NOT_SUPPORTED'])
+
+/**
+ * True for a failure to reach the server or a connection that broke mid-reply: fetch's
+ * `TypeError: fetch failed` / `terminated`, or an error (or its cause) with a network error code.
+ * Other TypeErrors are mistakes in the code and keep their own message.
+ */
+export function isNetworkError(e: unknown): boolean {
+  let cur = e as { code?: unknown; cause?: unknown } | null | undefined
+  for (let depth = 0; depth < 5 && cur && typeof cur === 'object'; depth++) {
+    const code = cur.code
+    if (typeof code === 'string' && (NETWORK_CODES.has(code) || (code.startsWith('UND_ERR_') && !NOT_NETWORK_UNDICI.has(code)))) return true
+    cur = cur.cause as typeof cur
+  }
+  return e instanceof TypeError && (e.message === 'fetch failed' || e.message === 'terminated')
+}
+
 /** Plain-language explanation of a server error for the owner. */
 export function friendlyServerError(e: unknown): string {
-  const err = e as Error & { status?: number; cause?: { code?: string } }
+  const err = (e ?? {}) as Error & { status?: number }
   if (err.name === 'AbortError') return 'Stopped.'
-  if (err instanceof TypeError || err.cause?.code === 'ECONNREFUSED' || err.cause?.code === 'ECONNRESET') {
+  if (isNetworkError(e)) {
     return 'I lost the connection to RulZ LLM Suite. Check that it is open and its server is started (Developer page), then try again.'
   }
   if (err instanceof ServerError) {

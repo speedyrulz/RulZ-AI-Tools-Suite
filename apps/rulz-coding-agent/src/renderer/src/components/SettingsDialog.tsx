@@ -1,5 +1,5 @@
 import { ChevronDown, Eye, EyeOff, FolderOpen, RefreshCw, Smartphone } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { MAX_INSTRUCTION_CHARS } from '@shared/defaults'
 import type { RemotePairing, RemoteStatus, Theme, ToolServersInfo } from '@shared/types'
 import { invoke, on } from '../lib/api'
@@ -69,6 +69,8 @@ function PhoneAccess() {
   const [pairing, setPairing] = useState<RemotePairing | null>(null)
   const [showCode, setShowCode] = useState(false)
   const [busy, setBusy] = useState(false)
+  /** Counts pairing requests, so a slow one can't put an older code back on screen. */
+  const pairingRequest = useRef(0)
   useEffect(() => {
     void invoke('remote:status').then(setStatus, () => undefined)
     return on('remote:changed', setStatus)
@@ -76,8 +78,18 @@ function PhoneAccess() {
   const ready = status?.state === 'on'
   const where = status?.addresses.join()
   useEffect(() => {
-    if (ready) void invoke('remote:pairing').then(setPairing, () => undefined)
+    if (!ready) return
+    const n = ++pairingRequest.current
+    void invoke('remote:pairing').then((p) => n === pairingRequest.current && setPairing(p), () => undefined)
+    return () => {
+      pairingRequest.current++
+    }
   }, [ready, where])
+  const newCode = async (): Promise<void> => {
+    const n = ++pairingRequest.current
+    const p = await invoke('remote:newToken')
+    if (n === pairingRequest.current) setPairing(p)
+  }
   if (!status) return <p className="text-[13px] text-faint">Loading…</p>
 
   const toggle = async (enabled: boolean): Promise<void> => {
@@ -123,7 +135,7 @@ function PhoneAccess() {
                 {showCode ? <EyeOff size={14} /> : <Eye size={14} />}
               </button>
             </p>
-            <Button size="sm" onClick={async () => setPairing(await invoke('remote:newToken'))} title="Phones using the old code are disconnected">
+            <Button size="sm" onClick={() => void newCode()} title="Phones using the old code are disconnected">
               <RefreshCw size={12} /> Make a new code
             </Button>
           </div>

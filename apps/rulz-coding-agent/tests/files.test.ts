@@ -160,6 +160,15 @@ describe('write_file and edit_file', () => {
     expect(readFileSync(join(root, 'crlf.txt'), 'utf8')).toBe('uno\r\ndos\r\nthree\r\n')
   })
 
+  it('reports a snippet found many times quickly, with the first few lines', async () => {
+    // 60,000 matches in a 1.4 MB file: the line numbers are counted once, not per match.
+    writeFileSync(join(root, 'many.js'), '}\n'.repeat(60_000) + 'x'.repeat(1_200_000))
+    const started = Date.now()
+    const r = await editFile(root, { path: 'many.js', old_text: '}', new_text: ']' })
+    expect(Date.now() - started).toBeLessThan(2000)
+    expect(r.text).toMatch(/appears 60000 times .*lines 1, 2, 3, 4, 5, 6, 7, 8\)/)
+  })
+
   it('asks for old_text and points to write_file', async () => {
     expect((await editFile(root, { path: 'edit.js', new_text: 'x' })).text).toMatch(/write_file/)
   })
@@ -176,5 +185,19 @@ describe('delete_path', () => {
     expect(trashed).toEqual([join(root, 'old.txt')])
     expect(r.changed).toEqual([{ path: 'old.txt', change: 'deleted' }])
     expect((await deletePath(root, { path: '..' }, async () => undefined)).isError).toBe(true)
+  })
+
+  it('leaves a folder with a repository of its own alone', async () => {
+    mkdirSync(join(root, 'vendor-lib', '.git'), { recursive: true })
+    writeFileSync(join(root, 'vendor-lib', 'index.js'), 'x')
+    const trashed: string[] = []
+    const r = await deletePath(root, { path: 'vendor-lib' }, async (abs) => {
+      trashed.push(abs)
+    })
+    expect(r.isError).toBe(true)
+    expect(r.text).toMatch(/repository of its own/)
+    expect(trashed).toEqual([])
+    // A file inside it can still go.
+    expect((await deletePath(root, { path: 'vendor-lib/index.js' }, async (abs) => void trashed.push(abs))).isError).toBe(false)
   })
 })

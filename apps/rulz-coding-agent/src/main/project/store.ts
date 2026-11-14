@@ -8,6 +8,8 @@ export interface ProjectData {
   version: 1
   path: string
   runCommand: string | null
+  /** The owner typed `runCommand` (rather than the AI working it out), since 0.19.0. */
+  runCommandByOwner?: boolean
   /** Summary of conversation that no longer fits. */
   summary: string
   /** The conversation with the model (without the system prompt). */

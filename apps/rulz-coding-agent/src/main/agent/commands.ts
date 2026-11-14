@@ -178,6 +178,8 @@ async function endLeftovers(child: ChildProcess, kids: { pid: number }[]): Promi
 
 /** How long an exited PowerShell's output may stay open (a program it started holds it) before that program is stopped. */
 export const EXIT_GRACE_MS = 3000
+/** After killTree has given up, how much longer a command that won't stop is waited for before it is reported as left running. */
+export const STOP_GIVE_UP_MS = 5000
 
 export function startShell(command: string, cwd: string, opts: { waitForStarted?: boolean } = {}): ChildProcess {
   const shell = process.platform === 'win32' ? 'powershell.exe' : 'pwsh'
@@ -219,6 +221,9 @@ export function runCommand(
       resolve({ exitCode: null, output: `Could not start PowerShell: ${(e as Error).message}`, timedOut: false, stopped: false })
       return
     }
+    // Recorded while it runs, so a shell left behind (by a crash, or one that couldn't be stopped)
+    // is stopped the next time the app starts.
+    childPids.add(child.pid)
     const take = (decoder: InstanceType<typeof TextDecoder>) => (buf: Buffer) => {
       const chunk = decoder.decode(buf, { stream: true })
       if (!chunk) return
@@ -230,9 +235,10 @@ export function runCommand(
     child.stdout?.on('data', take(new TextDecoder()))
     child.stderr?.on('data', take(new TextDecoder()))
 
-    const finish = (code: number | null, extra = ''): void => {
+    const finish = (code: number | null, extra = '', leftRunning = false): void => {
       if (settled) return
       settled = true
+      if (!leftRunning) childPids.remove(child.pid)
       clearTimeout(timer)
       clearTimeout(graceTimer)
       opts.signal?.removeEventListener('abort', onAbort)
@@ -251,7 +257,12 @@ export function runCommand(
       })())
     const stopAll = (): void => {
       if (exited) void cleanUpAfterExit()
-      else void killTree(child)
+      else
+        void killTree(child).then(() => {
+          // killTree gives up after 5 s; a PowerShell that still hasn't exited (taskkill refused,
+          // a process stuck in the system) mustn't keep the task waiting for good.
+          if (!settled && !exited) setTimeout(() => finish(null, '\n[The command could not be stopped and was left running.]', true), STOP_GIVE_UP_MS)
+        })
     }
     const timer = setTimeout(() => {
       timedOut = true

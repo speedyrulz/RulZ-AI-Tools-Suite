@@ -70,7 +70,37 @@ export function dropReply(data: { messages: WireMessage[]; timeline: TimelineIte
   if (m) m.content = m.tool_calls?.length ? '' : DELETED_REPLY
 }
 
-/** The history as sent to the model: without the links back to the timeline. */
+/** The result the model sees for a tool call that never got one (the app was closed during the step). */
+export const NOT_RUN_RESULT = 'Not run: the task ended before this step ran.'
+
+/**
+ * The history as sent to the model: without the links back to the timeline, and in a shape strict
+ * chat templates (Gemma, Mistral) accept. Two user messages in a row (a note that came right after
+ * the request, a task that ended without a reply, the "cut off" and "try another way" notes) are
+ * sent as one, and a tool call left without a result gets one, so the roles still alternate.
+ */
 export function forModel(messages: WireMessage[]): WireMessage[] {
-  return messages.map(({ task: _task, item: _item, ...m }) => m)
+  const out: WireMessage[] = []
+  let open: string[] = []
+  const closeOpen = (): void => {
+    for (const id of open) out.push({ role: 'tool', tool_call_id: id, content: NOT_RUN_RESULT })
+    open = []
+  }
+  for (const { task: _task, item: _item, ...m } of messages) {
+    if (m.role === 'tool') {
+      open = open.filter((id) => id !== m.tool_call_id)
+      out.push(m)
+      continue
+    }
+    closeOpen()
+    const last = out[out.length - 1]
+    if (m.role === 'user' && last?.role === 'user') {
+      out[out.length - 1] = { ...last, content: `${last.content}\n\n${m.content}` }
+      continue
+    }
+    out.push(m)
+    if (m.role === 'assistant' && m.tool_calls?.length) open = m.tool_calls.map((c) => c.id)
+  }
+  closeOpen()
+  return out
 }
