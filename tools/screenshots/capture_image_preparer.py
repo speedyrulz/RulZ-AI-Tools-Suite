@@ -13,8 +13,8 @@ Run with the app's own venv (PySide6, OpenCV and numpy; no installs):
 * --auto-crop "the mountain" opens the Auto crop screen over the picture list (without the PyTorch/SAM setup
   check), types the text, captures it from a timer inside its event loop with PrintWindow (wincap.py), composited
   over the main window at its real position, and closes it.
-* The --shadow picture also gets a soft, bluish cloud shadow before the damage; 04 paints over it (Shadow areas,
-  strokes added the way a brush stroke adds them).
+* The --shadow picture also gets a soft, bluish cloud shadow before the damage; 05 paints over it, soft edge
+  included, as the wiki says to (Shadow areas, strokes added the way a brush stroke adds them).
 * The app runs from apps/RulZ-Image-Preparer in this repository; only the main window is grabbed (QWidget.grab()).
 * Qt renders at 100 % (QT_SCALE_FACTOR = 96 / system DPI), so the images have the same pixel size whatever the
   display scaling is.
@@ -37,7 +37,7 @@ ap.add_argument("--config", required=True)
 ap.add_argument("--out", required=True)
 ap.add_argument("--size", default="1600x960")
 ap.add_argument("--closeup", default="Hillside", help="file name start of the picture opened for 02 and 03")
-ap.add_argument("--shadow", default="Desert", help="file name start of the picture given a cloud shadow for 04")
+ap.add_argument("--shadow", default="Desert", help="file name start of the picture given a cloud shadow for 05")
 ap.add_argument("--auto-crop", default="", metavar="TEXT",
                 help="also capture 04-auto-crop.png: the Auto crop screen with TEXT typed in, before Preview")
 ap.add_argument("--crop-picture", default="Alpine Haze", help="file name start of the picture Auto crop shows")
@@ -89,14 +89,17 @@ rng = np.random.default_rng(5)
 sources = sorted(p for p in Path(args.images).iterdir() if p.suffix.lower() in (".jpg", ".jpeg", ".png"))
 for i, src in enumerate(sources):
     img = cv2.imdecode(np.fromfile(str(src), np.uint8), cv2.IMREAD_COLOR)
-    if args.shadow and src.stem.startswith(args.shadow):
+    shadowed = bool(args.shadow) and src.stem.startswith(args.shadow)
+    if shadowed:
         img = cloud_shadow(img)
     lab = cv2.cvtColor(img.astype(np.float32) / 255, cv2.COLOR_BGR2Lab)
-    noise = rng.normal(0, 9 + 3 * (i % 3), lab[:, :, 1:].shape).astype(np.float32)
+    # The shadow picture is damaged lightly: in its deep shadow, heavy noise and JPEG blocks come up about
+    # five times with the lift (clipped noise there also drains the color), which hides what 05 is showing.
+    noise = rng.normal(0, 4 if shadowed else 9 + 3 * (i % 3), lab[:, :, 1:].shape).astype(np.float32)
     lab[:, :, 1:] += cv2.GaussianBlur(noise, (0, 0), 1.4) * 2.6  # blotchy, not per-pixel
     lab[:, :, 0] += rng.normal(0, 1.5, lab[:, :, 0].shape).astype(np.float32)
     noisy = (np.clip(cv2.cvtColor(lab, cv2.COLOR_Lab2BGR), 0, 1) * 255 + 0.5).astype(np.uint8)
-    quality = (12, 22, 35)[i % 3]
+    quality = 75 if shadowed else (12, 22, 35)[i % 3]
     cv2.imencode(".jpg", noisy, [cv2.IMWRITE_JPEG_QUALITY, quality])[1].tofile(str(photos / f"{src.stem}.jpg"))
 
 from PySide6.QtCore import QEventLoop, QSettings  # noqa: E402
@@ -185,16 +188,19 @@ if args.shadow:
     win._open(row)
     wait_editor()
     ed._set_mode(SIDE, save=False)
-    ed.brush.setValue(26)
+    brush = 30
+    ed.brush.setValue(brush)
     ed.show_areas.setChecked(False)  # the red tint would hide the shadow on the original
-    ed.shadow_rows["strength"].slider.setValue(100)  # 100 = as bright as the surroundings
+    # 100 is as bright as the light filled in from around the shadow, which on this dune (darker toward the
+    # bottom) comes out a little too bright; 85 is what the wiki's tip would settle on.
+    ed.shadow_rows["strength"].slider.setValue(85)
     full_h, full_w = ed._full.shape[:2]
     side = max(full_h, full_w)
-    radius = 0.003 + 0.197 * (26 / 100.0) ** 2  # the Brush slider's size, as the editor computes it
+    radius = 0.003 + 0.197 * (brush / 100.0) ** 2  # the Brush slider's size, as the editor computes it
     cx, cy, rx, ry, angle = SHADOW
     a = math.radians(angle)
-    for v in (-0.66, -0.33, 0.0, 0.33, 0.66):  # rows that fill the ellipse, kept inside its edge
-        half = rx * full_w * math.sqrt(1 - v * v) - radius * side
+    for v in (-0.75, -0.25, 0.25, 0.75):  # rows that cover the ellipse and run a little past its soft edge
+        half = rx * full_w * math.sqrt(1 - v * v) + 0.4 * radius * side
         pts = []
         for t in np.linspace(-1, 1, 24):
             x, y = half * t, v * ry * full_h
@@ -205,7 +211,7 @@ if args.shadow:
     wait_editor(120)
     ed.view.fit()
     pump(1.0)
-    save("04-shadow-areas.png")
+    save("05-shadow-areas.png")
 
 win._show_library()
 pump(1.0)
