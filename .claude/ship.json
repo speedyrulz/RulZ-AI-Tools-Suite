@@ -1,0 +1,250 @@
+{
+  "configVersion": 1,
+  "name": "RulZ AI Tools Suite",
+  "approval": {
+    "default": "auto",
+    "source": "Memory ship-without-asking (2026-11-09): \"Open pr, merge it, then release it. Going forward always do those things.\" and, the same day, \"going forward, always ship it automatically with new updates\". Memory release-and-wiki-after-main-changes (2026-10-28): \"always do both after merging a PR or changing main in any way\". RulzTrainer memories release-per-commit (2026-10-25): \"going forward, create a new release for every commit\" and wiki-per-feature (2026-10-25): \"going forward always update the wiki when features are added or changed\"."
+  },
+  "checks": [],
+  "neverStage": ["AGENTS.md", "CLAUDE.md"],
+  "delivery": {
+    "mode": "pr",
+    "base": "main",
+    "mergeMethod": "merge",
+    "ci": "wait",
+    "prTitle": "<App> X.Y.Z: <what changed>, e.g. \"HF Manager 1.5.0: file dates\" or \"Coding Agent 0.19.0 and Android 0.6.0: fixes from an audit\""
+  },
+  "version": {
+    "bump": "feature-minor",
+    "when": "in-pr"
+  },
+  "tag": {
+    "pattern": "{id}-v{version}",
+    "create": "push"
+  },
+  "release": {
+    "mode": "ci-on-tag",
+    "workflow": "apps.yml",
+    "latest": false,
+    "skipWhenOnly": ["apps/*/README.md", "apps/*/docs/**", "catalog/*/README.md", "catalog/*/repo/**", "tools/screenshots/README.md"]
+  },
+  "wiki": {
+    "enabled": true,
+    "when": "every-ship",
+    "url": "https://github.com/speedyrulz/RulZ-AI-Tools-Suite.wiki.git",
+    "branch": "master",
+    "clone": "scratchpad",
+    "public": true,
+    "review": ["Home.md", "_Sidebar.md"],
+    "order": "after-release",
+    "rules": "Each app's home page (<Prefix>.md) has a 'Recent versions' or 'What's new' list: add the new version there. The launcher's release-history table is in Settings-and-Launcher-Updates.md (Home.md links to it). Pages are CRLF: keep CRLF (the scratchpad clone uses core.autocrlf=false). Stage edited pages by name, never git add -A / commit -a (on 2026-11-13 that swept line-ending-only rewrites of six other apps' pages into a commit); git diff --cached --stat must list only your pages. Fetch and rebase before pushing: parallel sessions push wiki commits too. New pages must be linked from _Sidebar.md. Public wiki: no personal details, local paths, dataset specifics or secrets."
+  },
+  "pulls": {
+    "mainCheckout": true
+  },
+  "extraSteps": [],
+  "components": [
+    {
+      "id": "launcher",
+      "name": "RulZ AI Tools Suite launcher",
+      "paths": [
+        "src/**",
+        "catalog/**",
+        "build/**",
+        "assets/**",
+        "tests/**",
+        "tools/**",
+        "package.json",
+        "package-lock.json",
+        "electron-builder.yml",
+        "electron.vite.config.ts",
+        "tsconfig.json",
+        "tsconfig.node.json",
+        "tsconfig.web.json",
+        "vitest.config.ts",
+        "install.bat",
+        "run.bat",
+        ".github/workflows/ci.yml",
+        ".github/workflows/release.yml"
+      ],
+      "version": {
+        "source": "files",
+        "files": [
+          { "path": "package.json", "json": "version" },
+          { "path": "package-lock.json", "json": "version" },
+          { "path": "package-lock.json", "json": ["packages", "", "version"] }
+        ]
+      },
+      "tag": { "pattern": "v{version}" },
+      "release": {
+        "workflow": "release.yml",
+        "latest": true,
+        "expectAssets": ["RulZ-AI-Tools-Suite-Setup-*.exe", "RulZ-AI-Tools-Suite-Setup-*.exe.blockmap", "SHA256SUMS"]
+      },
+      "wiki": { "pages": ["Home.md", "Settings-and-Launcher-Updates.md"] }
+    },
+    {
+      "id": "rulz-trainer",
+      "name": "RulzTrainer",
+      "paths": ["apps/RulzTrainer/**"],
+      "version": {
+        "source": "files",
+        "files": [
+          { "path": "apps/RulzTrainer/pyproject.toml", "regex": "^version\\s*=\\s*\"([^\"]+)\"" },
+          { "path": "apps/RulzTrainer/rulztrainer/__init__.py", "regex": "^__version__\\s*=\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "release": { "expectAssets": [] },
+      "wiki": { "pages": ["RulzTrainer*.md"] }
+    },
+    {
+      "id": "training-captioner",
+      "name": "Rulz Training Captioner",
+      "paths": ["apps/Rulz-Training-Captioner/**"],
+      "version": { "source": "tags" },
+      "release": { "expectAssets": [] },
+      "wiki": { "pages": ["Training-Captioner*.md"] }
+    },
+    {
+      "id": "image-organizer",
+      "name": "RulZ Image Organizer",
+      "paths": ["apps/RulZ-Image-Organizer/**"],
+      "version": {
+        "source": "files",
+        "files": [
+          { "path": "apps/RulZ-Image-Organizer/rulz/config.py", "regex": "^APP_VERSION\\s*=\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "release": { "expectAssets": ["RulZ-Image-Organizer-v*-win64.zip", "SHA256SUMS"] },
+      "wiki": { "pages": ["Image-Organizer*.md"] }
+    },
+    {
+      "id": "image-tournament",
+      "name": "RulZ Image Tournament",
+      "paths": ["apps/RulZ-Image-Tournament/**"],
+      "version": {
+        "source": "files",
+        "files": [
+          { "path": "apps/RulZ-Image-Tournament/src/Program.cs", "regex": "Assembly(?:File)?Version\\(\"(\\d+\\.\\d+\\.\\d+)\\.\\d+\"\\)", "count": 2 }
+        ]
+      },
+      "release": { "expectAssets": ["RulZ-Image-Tournament-v*-win64.zip", "SHA256SUMS"] },
+      "wiki": { "pages": ["Image-Tournament*.md"] }
+    },
+    {
+      "id": "image-grid",
+      "name": "RulZ Image Grid",
+      "paths": ["apps/RulZ-Image-Grid/**"],
+      "version": {
+        "source": "files",
+        "files": [
+          { "path": "apps/RulZ-Image-Grid/src/Program.cs", "regex": "Assembly(?:File)?Version\\(\"(\\d+\\.\\d+\\.\\d+)\\.\\d+\"\\)", "count": 2 }
+        ]
+      },
+      "release": { "expectAssets": ["RulZ-Image-Grid-v*-win64.zip", "SHA256SUMS"] },
+      "wiki": { "pages": ["Image-Grid*.md"] }
+    },
+    {
+      "id": "llm-suite",
+      "name": "RulZ LLM Suite",
+      "paths": ["apps/rulz-llm-suite/**"],
+      "version": {
+        "source": "files",
+        "files": [
+          { "path": "apps/rulz-llm-suite/package.json", "json": "version" },
+          { "path": "apps/rulz-llm-suite/package-lock.json", "json": "version" },
+          { "path": "apps/rulz-llm-suite/package-lock.json", "json": ["packages", "", "version"] }
+        ]
+      },
+      "release": { "expectAssets": ["RulZ-LLM-Suite-Setup-*.exe", "RulZ-LLM-Suite-Setup-*.exe.blockmap", "SHA256SUMS"] },
+      "wiki": { "pages": ["LLM-Suite*.md"] }
+    },
+    {
+      "id": "coding-agent",
+      "name": "RulZ Coding Agent",
+      "paths": ["apps/rulz-coding-agent/**"],
+      "version": {
+        "source": "files",
+        "files": [
+          { "path": "apps/rulz-coding-agent/package.json", "json": "version" },
+          { "path": "apps/rulz-coding-agent/package-lock.json", "json": "version" },
+          { "path": "apps/rulz-coding-agent/package-lock.json", "json": ["packages", "", "version"] }
+        ]
+      },
+      "release": { "expectAssets": ["RulZ-Coding-Agent-Setup-*.exe", "RulZ-Coding-Agent-Setup-*.exe.blockmap", "SHA256SUMS"] },
+      "wiki": { "pages": ["Coding-Agent*.md"] }
+    },
+    {
+      "id": "coding-agent-android",
+      "name": "RulZ Coding Agent for Android",
+      "paths": ["apps/rulz-coding-agent-android/**"],
+      "version": {
+        "source": "files",
+        "files": [
+          { "path": "apps/rulz-coding-agent-android/package.json", "json": "version" },
+          { "path": "apps/rulz-coding-agent-android/package-lock.json", "json": "version" },
+          { "path": "apps/rulz-coding-agent-android/package-lock.json", "json": ["packages", "", "version"] },
+          { "path": "apps/rulz-coding-agent-android/android/app/build.gradle", "regex": "versionName\\s+\"([^\"]+)\"" }
+        ]
+      },
+      "release": { "expectAssets": ["RulZ-Agent-*.apk", "SHA256SUMS"] },
+      "wiki": { "pages": ["Coding-Agent-Android-App.md", "Coding-Agent-Phone-Access.md", "Coding-Agent.md"] }
+    },
+    {
+      "id": "clip-extractor",
+      "name": "RulZ Simple Video Clip Extractor",
+      "paths": ["apps/rulz-simple-video-clip-extractor/**"],
+      "version": {
+        "source": "files",
+        "files": [
+          { "path": "apps/rulz-simple-video-clip-extractor/simplecut/__init__.py", "regex": "^__version__\\s*=\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "release": { "expectAssets": ["RulZ-Simple-Video-Clip-Extractor-v*-win64.zip", "SHA256SUMS"] },
+      "wiki": { "pages": ["Clip-Extractor*.md"] }
+    },
+    {
+      "id": "rulz-image-crawler",
+      "name": "RulZ Image Crawler",
+      "paths": ["apps/rulz-image-crawler/**"],
+      "version": {
+        "source": "files",
+        "files": [
+          { "path": "apps/rulz-image-crawler/crawler_app/__init__.py", "regex": "^__version__\\s*=\\s*\"([^\"]+)\"" },
+          { "path": "apps/rulz-image-crawler/crawler_app/pyproject.toml", "regex": "^version\\s*=\\s*\"([^\"]+)\"" },
+          { "path": "apps/rulz-image-crawler/image_detection/pyproject.toml", "regex": "^version\\s*=\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "release": { "expectAssets": [] },
+      "wiki": { "pages": ["Image-Crawler*.md"] }
+    },
+    {
+      "id": "image-preparer",
+      "name": "RulZ Image Preparer",
+      "paths": ["apps/RulZ-Image-Preparer/**"],
+      "version": {
+        "source": "files",
+        "files": [
+          { "path": "apps/RulZ-Image-Preparer/rulz/config.py", "regex": "^APP_VERSION\\s*=\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "release": { "expectAssets": [] },
+      "wiki": { "pages": ["Image-Preparer*.md"] }
+    },
+    {
+      "id": "hf-manager",
+      "name": "RulZ Huggingface Manager",
+      "paths": ["apps/RulZ-Huggingface-Manager/**"],
+      "version": {
+        "source": "files",
+        "files": [
+          { "path": "apps/RulZ-Huggingface-Manager/rulz_hf_manager/__init__.py", "regex": "^__version__\\s*=\\s*'([^']+)'" },
+          { "path": "apps/RulZ-Huggingface-Manager/pyproject.toml", "regex": "^version\\s*=\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "release": { "expectAssets": [] },
+      "wiki": { "pages": ["HF-Manager*.md"] }
+    }
+  ],
+  "notes": "Ship finished, tested work straight through without a 'ship it?' question; when CI is pending, wait in the background (gh pr checks <n> --watch) and merge yourself: main has no required checks, so never use auto-merge. Still stop if CI fails or the work is unverified, and say in the closing message what was never tried with a real model or app. The main checkout often holds other sessions' uncommitted work: never commit it; work in a worktree off origin/main. Run the changed app's own tests before shipping (CI runs them too: apps.yml per app, ci.yml for the launcher); worktree tests can use ../../../node_modules. Launcher tag: release.yml does not compare the tag with package.json, so all three version fields must agree before pushing v<version>; moving a pushed tag needs the user's OK. App releases are never marked Latest (that badge is the launcher's). If an app README changes, re-run tools/sync_catalog.py so catalog/*/README.md keeps up (that makes it a launcher change too). Android: also raise versionCode in apps/rulz-coding-agent-android/android/app/build.gradle by 1 (not a version field); tag builds need the ANDROID_DEBUG_KEYSTORE repo secret, still unset at 0.6.0, so check gh secret list first: without it the Apps run fails at the key check and the APK is built locally and uploaded with gh release create --latest=false (recipe in memory android-app-in-suite)."
+}
