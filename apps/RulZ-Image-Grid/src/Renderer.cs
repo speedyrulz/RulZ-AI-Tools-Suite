@@ -134,18 +134,32 @@ namespace RulZImageGrid
             // with the user's own files (CreateNew refuses to overwrite) and is never longer than the target's name
             // could be.
             string tmp = SiblingName(path, ".tmp");
+            bool created = false; // only ever delete a file this save made
             try
             {
-                using (var fs = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None)) enc.Save(fs);
+                using (var fs = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
+                    created = true;
+                    enc.Save(fs);
+                }
                 SwapIn(tmp, path);
             }
-            finally { TryDelete(tmp); }
+            finally { if (created) TryDelete(tmp); }
         }
 
-        static string SiblingName(string path, string ext) =>
-            Path.Combine(Path.GetDirectoryName(Path.GetFullPath(path)), "~" + Path.GetRandomFileName() + ext);
+        /// <summary>A short random name in the target's folder that isn't taken.</summary>
+        static string SiblingName(string path, string ext)
+        {
+            string dir = Path.GetDirectoryName(Path.GetFullPath(path)), name;
+            do name = Path.Combine(dir, "~" + Path.GetRandomFileName() + ext);
+            while (File.Exists(name) || Directory.Exists(name));
+            return name;
+        }
 
-        /// <summary>Moves the finished file into place. The old file is never removed before the new one is there.</summary>
+        /// <summary>
+        /// Moves the finished file into place. The old file is never removed before the new one is there: if the swap
+        /// fails halfway, the old file is put back, or the error says what it's called now.
+        /// </summary>
         static void SwapIn(string tmp, string path)
         {
             if (!File.Exists(path))
@@ -164,18 +178,22 @@ namespace RulZImageGrid
                     File.Move(tmp, path);
                 }
             }
-            finally
+            catch (Exception ex) when (File.Exists(bak))
             {
-                // If the old file was moved aside but the new one didn't take its place, put the old one back.
-                if (!File.Exists(path) && File.Exists(bak))
+                // The old file was moved aside but the new one isn't in its place.
+                if (!File.Exists(path))
                 {
                     try { File.Move(bak, path); }
-                    catch (IOException) { }
-                    catch (UnauthorizedAccessException) { }
+                    catch (Exception) { throw KeptAs(bak, ex); }
+                    throw;
                 }
-                else TryDelete(bak);
+                throw KeptAs(bak, ex); // something else is at the target now: leave both alone
             }
+            TryDelete(bak);
         }
+
+        static IOException KeptAs(string bak, Exception ex) =>
+            new IOException($"{ex.Message}\n\nThe file that was there before is kept as \"{bak}\".", ex);
 
         static void TryDelete(string file)
         {

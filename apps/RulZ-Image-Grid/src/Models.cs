@@ -141,8 +141,12 @@ namespace RulZImageGrid
                     if (Directory.Exists(p))
                         files.AddRange(Directory.EnumerateFiles(p).Where(IsImage)
                             .OrderBy(f => System.IO.Path.GetFileName(f), natural));
-                    else if (File.Exists(p) && IsImage(p))
-                        files.Add(p);
+                    else if (File.Exists(p))
+                    {
+                        if (IsImage(p)) files.Add(p); // other files are skipped quietly
+                    }
+                    else // both say "no" when it's gone, offline or not ours to read
+                        failed.Add($"{p}: not found, or no permission to open it");
                 }
                 catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException
                                            || ex is System.Security.SecurityException || ex is ArgumentException)

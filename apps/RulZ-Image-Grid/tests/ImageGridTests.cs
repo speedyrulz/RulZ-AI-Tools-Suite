@@ -208,7 +208,7 @@ static class ImageGridTests
         var names = found.files.Select(Path.GetFileName).ToList();
         Check(names.SequenceEqual(new[] { "img2.jpg", "img10.jpg", Path.GetFileName(files[3]) }),
             "a folder adds its own images in name order, then the loose files: " + string.Join(", ", names));
-        Check(found.failed.Count == 0, "a path that no longer exists is skipped quietly");
+        Check(found.failed.Count == 1 && found.failed[0].Contains("gone.jpg"), "a path that can't be found is reported, the rest still added");
         Directory.Delete(folder, true);
     }
 
@@ -226,6 +226,20 @@ static class ImageGridTests
         Check(File.ReadAllText(target + ".tmp") == "keep me", "saving leaves a file named like the old temporary file alone");
         var left = Directory.GetFiles(folder).Select(Path.GetFileName).OrderBy(n => n).ToList();
         Check(left.SequenceEqual(new[] { "grid.png", "grid.png.tmp" }), "no temporary or backup files are left: " + string.Join(", ", left));
+
+        // Open in another program that doesn't let it be replaced: File.Replace fails, and so does the swap by hand.
+        long before = new FileInfo(target).Length;
+        bool threw = false;
+        using (new FileStream(target, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            try { Renderer.Save(bmp, target, false, 90, false); }
+            catch (IOException) { threw = true; }
+            catch (UnauthorizedAccessException) { threw = true; }
+        }
+        Check(threw, "saving over a file another program has open reports an error");
+        Check(new FileInfo(target).Length == before, "that file is left as it was");
+        left = Directory.GetFiles(folder).Select(Path.GetFileName).OrderBy(n => n).ToList();
+        Check(left.SequenceEqual(new[] { "grid.png", "grid.png.tmp" }), "and nothing is left behind: " + string.Join(", ", left));
         Directory.Delete(folder, true);
     }
 
