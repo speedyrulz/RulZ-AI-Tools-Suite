@@ -49,11 +49,13 @@ sudo apt update && sudo apt install -y python3 python3-venv
 --port 8765       use another port (also configurable in Settings)
 --host 0.0.0.0    listen on the network (not recommended: anyone who can reach it can use your token)
 --no-browser      don't open a browser window
+--version         print the version and exit
 ```
 
 Example: `start-windows.bat --port 9000` or `./start-linux.sh --no-browser`.
 
-Starting the app a second time just opens the already-running instance.
+Starting the app a second time just opens the already-running instance. If something else has the port, the app
+takes the next free one and the console says which.
 
 ## First steps
 
@@ -74,7 +76,8 @@ The token is stored only on your computer:
 | Windows | `%APPDATA%\RulZ-HF-Manager\settings.json` |
 | WSL / Linux | `~/.config/rulz-hf-manager/settings.json` (permissions `600`) |
 
-Windows and WSL keep separate settings, so add the token once in each.
+Windows and WSL keep separate settings, so add the token once in each. To keep the settings file somewhere else,
+set `RULZ_HF_CONFIG_DIR` to a folder before starting the app.
 
 ## Features
 
@@ -106,7 +109,7 @@ Windows and WSL keep separate settings, so add the token once in each.
 - **Preview and edit** text files (README, JSON, YAML, Python...) with syntax highlighting, and preview images.
   Saving creates a commit (or PR).
 - **New folder**: create (nested) folders, then upload into them.
-- Repos: switch **branches**, create branches, see the **commit history**.
+- Repos: switch **branches**, create branches, see the **commit history** (the newest 200 commits).
 - Buckets: **Sync** a local folder up to the bucket, or a bucket folder down to your computer, rsync-style:
   preview exactly what will be uploaded/downloaded/deleted, then run it.
 - Repos: **Push a whole folder** (a big folder goes in several commits; a push that broke off continues where it
@@ -155,7 +158,7 @@ want; switch any time with the sun / moon button at the top right or under Setti
   it through a name of its own pointed at your computer ("DNS rebinding"). To open it under another name (a hosts-file
   alias, a reverse proxy), set `RULZ_HF_ALLOWED_HOSTS=name1,name2` before starting it (`*` turns the check off).
 - Temporary files (zips for browser downloads, sync plans) that an earlier run left behind, for example because the
-  console window was closed, are removed the next time the app starts.
+  console window was closed, are removed when the app starts, once nothing in them has changed for three days.
 - Files you pick with "from this computer" are read directly from disk, so multi-GB uploads don't pass through
   the browser. Under WSL, Windows drives are under `/mnt/c`, `/mnt/d`...; you can also paste a Windows path
   like `C:\Users\me\model` and it is converted automatically.
