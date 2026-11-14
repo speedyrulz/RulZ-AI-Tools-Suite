@@ -6,8 +6,38 @@ const PARTITION = 'check-page'
 const LOAD_TIMEOUT_MS = 20_000
 const SNAPSHOT_TIMEOUT_MS = 5_000
 
-const timeout = <T>(p: Promise<T>, ms: number, what: string): Promise<T> =>
-  Promise.race([p, new Promise<T>((_, reject) => setTimeout(() => reject(new Error(what)), ms))])
+/** Stop was pressed while waiting for the page. */
+class Stopped extends Error {}
+
+/** Settles with `p`, or rejects with `what` after `ms`, or with Stopped as soon as `signal` fires. */
+function bounded<T>(p: Promise<T>, ms: number, what: string, signal?: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const settle = (): void => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+    }
+    const onAbort = (): void => {
+      settle()
+      reject(new Stopped())
+    }
+    const timer = setTimeout(() => {
+      settle()
+      reject(new Error(what))
+    }, ms)
+    p.then(
+      (v) => {
+        settle()
+        resolve(v)
+      },
+      (e: unknown) => {
+        settle()
+        reject(e)
+      }
+    )
+    if (signal?.aborted) onAbort()
+    else signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -71,22 +101,27 @@ export async function checkPageInWindow(target: PageTarget, waitMs: number, sign
     if (isMainFrame && code !== -3) report.loadError = `${description || `error ${code}`} (${url})`
   })
 
+  // Stop ends the check at once, whatever it is waiting for (the load, the wait, the page's answer);
+  // the window is destroyed below, which also cancels the load. The session sees the stop itself.
   try {
     try {
-      await timeout(win.loadURL(target.url), LOAD_TIMEOUT_MS, 'slow')
+      await bounded(win.loadURL(target.url), LOAD_TIMEOUT_MS, 'slow', signal)
     } catch (e) {
+      if (e instanceof Stopped) return report
       // did-fail-load has the details of a failed page; a timeout is reported here.
       if ((e as Error).message === 'slow' && !report.loadError) report.crashed = `the page took more than ${LOAD_TIMEOUT_MS / 1000} seconds to load.`
     }
     if (!report.loadError) {
       await sleep(waitMs, signal)
+      if (signal?.aborted) return report
       try {
-        const snap = (await timeout(wc.executeJavaScript(PAGE_SNAPSHOT_SCRIPT, true), SNAPSHOT_TIMEOUT_MS, 'no answer')) as Pick<
+        const snap = (await bounded(wc.executeJavaScript(PAGE_SNAPSHOT_SCRIPT, true), SNAPSHOT_TIMEOUT_MS, 'no answer', signal)) as Pick<
           PageReport,
           'title' | 'text' | 'controls' | 'visuals'
         >
         Object.assign(report, snap)
-      } catch {
+      } catch (e) {
+        if (e instanceof Stopped) return report
         report.crashed ??= 'the page stopped responding (a script may be stuck in an endless loop).'
       }
     }

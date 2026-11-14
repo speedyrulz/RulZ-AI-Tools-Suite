@@ -6,19 +6,19 @@ import remarkGfm from 'remark-gfm'
 import { cn } from '../lib/format'
 import { openInBrowser } from '../lib/native'
 
-function highlight(code: string, lang: string | undefined): string {
+function highlight(code: string, lang: string | undefined, streaming: boolean): string {
   try {
     if (lang && hljs.getLanguage(lang)) return hljs.highlight(code, { language: lang, ignoreIllegals: true }).value
-    if (code.length < 4000) return hljs.highlightAuto(code).value
+    if (!streaming && code.length < 4000) return hljs.highlightAuto(code).value
   } catch {
     // fall through to plain text
   }
   return code.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]!)
 }
 
-export function CodeBlock({ code, lang }: { code: string; lang?: string }) {
+export function CodeBlock({ code, lang, streaming = false }: { code: string; lang?: string; streaming?: boolean }) {
   const [copied, setCopied] = useState(false)
-  const html = useMemo(() => highlight(code, lang), [code, lang])
+  const html = useMemo(() => highlight(code, lang, streaming), [code, lang, streaming])
   return (
     <div className="group/code my-3 overflow-hidden rounded-lg border border-border bg-code">
       <div className="flex items-center justify-between border-b border-border px-3 py-1 text-[11px] text-faint">
@@ -42,14 +42,14 @@ export function CodeBlock({ code, lang }: { code: string; lang?: string }) {
   )
 }
 
-const components: Components = {
+const makeComponents = (streaming: boolean): Components => ({
   pre({ children }) {
     const child = Children.toArray(children)[0]
     if (!isValidElement(child)) return <pre>{children}</pre>
     const props = (child as ReactElement<{ className?: string; children?: ReactNode }>).props
     const lang = /language-([\w+#.-]+)/.exec(props.className ?? '')?.[1]
     const code = String(Children.toArray(props.children).join('')).replace(/\n$/, '')
-    return <CodeBlock code={code} lang={lang} />
+    return <CodeBlock code={code} lang={lang} streaming={streaming} />
   },
   a({ href, children }) {
     return (
@@ -68,12 +68,15 @@ const components: Components = {
     // Remote images are blocked by the CSP; show the link instead.
     return <span className="text-faint">[image: {alt || String(src ?? '')}]</span>
   }
-}
+})
 
-export const Markdown = memo(function Markdown({ text, className }: { text: string; className?: string }) {
+const staticComponents = makeComponents(false)
+const streamingComponents = makeComponents(true)
+
+export const Markdown = memo(function Markdown({ text, className, streaming = false }: { text: string; className?: string; streaming?: boolean }) {
   return (
     <div className={cn('md', className)}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={streaming ? streamingComponents : staticComponents}>
         {text}
       </ReactMarkdown>
     </div>

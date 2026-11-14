@@ -5,8 +5,10 @@ import { describe, expect, it } from 'vitest'
 import { diffLines, withContext } from '@shared/diff'
 import type { WireMessage } from '@shared/types'
 import {
+  compactCallArgs,
   compactOlderResults,
   compactToolResult,
+  COMPACT_BLOCK,
   COMPACT_MIN_CHARS,
   fitMessages,
   mechanicalSummary,
@@ -15,18 +17,53 @@ import {
   totalTokens
 } from '../src/main/agent/context'
 import { callKey, LoopGuard } from '../src/main/agent/loopGuard'
-import { backgroundNote, parseRunLine, parseShareLine, SHARE_TASK, systemPrompt } from '../src/main/agent/prompt'
-import { withTrailingNote } from '../src/main/agent/session'
-import { ChildPids, parseShellPids } from '../src/main/agent/childPids'
+import { backgroundNote, lastBackgroundNoteIn, NO_BACKGROUND_NOTE, parseRunLine, parseShareLine, SHARE_TASK, systemPrompt } from '../src/main/agent/prompt'
+import { isContextOverflow } from '../src/main/agent/session'
+import { ServerError } from '../src/main/rulz/client'
+import { forModel, NOT_RUN_RESULT } from '@shared/history'
+import { ChildPids, parseShellList } from '../src/main/agent/childPids'
 import { parseSettings } from '../src/main/settings'
 import { MAX_INSTRUCTION_CHARS } from '@shared/defaults'
-import { approvalKey, classifyCommand, needsApproval } from '../src/main/agent/safety'
+import { approvalKey, classifyCommand, classifyStartCommand, needsApproval } from '../src/main/agent/safety'
 import { describeCommand, describeStep, parseToolArgs, TOOL_DEFS } from '../src/main/agent/tools'
 
 const ROOT = 'C:\\coding\\My App'
 
 describe('command safety', () => {
   const verdict = (cmd: string) => classifyCommand(cmd, ROOT)
+
+  it("won't take a start command that hides what it runs, but only points out other risks", () => {
+    expect(classifyStartCommand("$c = 'shut' + 'down'; & $c /s /t 0", ROOT)).toMatchObject({ verdict: 'refuse' })
+    expect(classifyStartCommand('shutdown /s /t 0', ROOT)).toMatchObject({ verdict: 'refuse' })
+    expect(classifyStartCommand('npm start', ROOT)).toEqual({ verdict: 'ok' })
+    expect(classifyStartCommand('npm install -g serve; serve .', ROOT)).toMatchObject({ verdict: 'ask', kind: 'install-global' })
+  })
+
+  it('opens only a web page in the project for an open: start command', () => {
+    expect(classifyStartCommand('open:index.html', ROOT)).toEqual({ verdict: 'ok' })
+    expect(classifyStartCommand('open:site/page.htm', ROOT)).toEqual({ verdict: 'ok' })
+    for (const cmd of ['open:run.bat', 'open:app.exe', 'open:shortcut.lnk', 'open:../outside.html', 'open:../../Windows/System32/calc.exe']) {
+      expect(classifyStartCommand(cmd, ROOT), cmd).toMatchObject({ verdict: 'refuse' })
+    }
+  })
+
+  it('catches a name put together and called after return, in a quoted command or after a bare CR', () => {
+    const hidden = (cmd: string): boolean => {
+      const v = verdict(cmd)
+      return v.verdict === 'ask' && v.risks.some((r) => r.kind === 'hidden')
+    }
+    for (const cmd of [
+      "$c='Stop-'+'Computer'; return & $c",
+      `$c='Stop-'+'Computer'; powershell -NoProfile -Command "& $c"`,
+      "$c='Stop-'+'Computer'\r& $c",
+      "$c='Stop-'; $c+='Computer'; return & $c",
+      "$c='Stop-'; $c+='Computer'; throw (& $c)"
+    ]) {
+      expect(hidden(cmd), cmd).toBe(true)
+    }
+    // A file name joined with its extension isn't a command.
+    expect(hidden('$out = $name + ".$ext"; Write-Output $out')).toBe(false)
+  })
 
   it('lets ordinary project commands through', () => {
     for (const cmd of ['npm install', 'npm start', 'npm install --save-dev electron', 'python -m venv .venv', '.venv\\Scripts\\python -m pip install pyside6', 'node main.js', 'npm run format', 'npm install firebase', `node "${ROOT}\\main.js"`]) {
@@ -139,6 +176,39 @@ describe('command safety', () => {
     }
   })
 
+  it('sees command names put together in other ways, and system folders found at run time', () => {
+    for (const cmd of [
+      "$x='shut'; $x+='down'; & $x /s /t 0",
+      "$a='shut';$b='down';& \"$a$b\" /s",
+      "& \"$('shut')down\" /s",
+      "$n = 'nwodtuhs'.ToCharArray(); [array]::Reverse($n); & ($n -join '')",
+      "$s = 'xshutdownx'.Substring(1, 8); . $s /s",
+      "Start-Process ('shut' + 'down') -ArgumentList '/s'",
+      "$t = 'shut' + 'down'; Start-Process $t -ArgumentList '/s'",
+      'cmd /c "set a=shut&& call %a%down /s /t 0"',
+      'gcm s*p-c*r | % { & $_ }',
+      "Set-Alias x ('Stop-' + 'Computer'); x"
+    ]) {
+      expect(verdict(cmd), cmd).toMatchObject({ verdict: 'ask', kind: 'hidden' })
+    }
+    for (const cmd of [
+      "$p=[Environment]::GetEnvironmentVariable('USERPROFILE'); Remove-Item $p -Recurse -Force",
+      'Remove-Item (Get-Item env:USERPROFILE).Value -Recurse',
+      'Remove-Item (Join-Path (gci env:\\APPDATA).Value x) -Recurse'
+    ]) {
+      expect(verdict(cmd).verdict, cmd).toBe('refuse')
+    }
+    for (const cmd of [
+      '$py = ".venv\\Scripts\\python.exe"; & $py -m pytest',
+      "$ext = 'js'; Get-ChildItem -Filter \"*.$ext\" | ForEach-Object { $_.Name + '!' }",
+      'Get-ChildItem tests\\*.ps1 | ForEach-Object { & $_.FullName }',
+      "$env:NODE_ENV = 'production'; npm run build",
+      'cmd /c "set NODE_ENV=production&& npm run build"'
+    ]) {
+      expect(verdict(cmd), cmd).toEqual({ verdict: 'ok' })
+    }
+  })
+
   it('reports every risk in a command, and hidden code is asked about every time', () => {
     const v = verdict('npm i -g x; Remove-Item -Recurse -Force src')
     expect(v.verdict).toBe('ask')
@@ -194,6 +264,17 @@ describe('loop guard', () => {
     expect(g.lastError).toBe('last error')
   })
 
+  it('counts polling a background command as a repeat only when nothing new came', () => {
+    const g = new LoopGuard()
+    const args = '{"id":"bg1"}'
+    expect(g.record('check_background_command', args, false, 'Still running.\nNew output:\nbuilding 1')).toBeNull()
+    expect(g.record('check_background_command', args, false, 'Still running.\nNew output:\nbuilding 2')).toBeNull()
+    expect(g.record('check_background_command', args, false, 'Still running.\nNew output:\nbuilding 3')).toBeNull()
+    expect(g.record('check_background_command', args, false, 'Still running.\nNew output:\n(nothing new)')).toBeNull()
+    expect(g.record('check_background_command', args, false, 'Still running.\nNew output:\n(nothing new)')).toBeNull()
+    expect(g.record('check_background_command', args, false, 'Still running.\nNew output:\n(nothing new)')).toBe('repeating')
+  })
+
   it('compares arguments regardless of key order', () => {
     expect(callKey('t', '{"a":1,"b":2}')).toBe(callKey('t', '{"b":2,"a":1}'))
   })
@@ -231,8 +312,52 @@ describe('context trimming', () => {
     expect(fitMessages(messages, full + 100, 0)).toMatchObject({ fits: true, messages })
     const tight = fitMessages(messages, Math.floor(full * 0.7), 0)
     expect(tight.fits).toBe(true)
-    expect(tight.messages.filter((m) => m.role === 'tool').slice(-6).every((m) => m.content === big)).toBe(true)
+    // The older results go a block at a time; the most recent ones stay whole.
+    const tools = tight.messages.filter((m) => m.role === 'tool')
+    const shortened = tools.filter((m) => m.content !== big).length
+    expect(shortened % COMPACT_BLOCK).toBe(0)
+    expect(tools.slice(shortened).every((m) => m.content === big)).toBe(true)
+    expect(tools.slice(-2).every((m) => m.content === big)).toBe(true)
     expect(fitMessages(messages, 100, 0).fits).toBe(false)
+  })
+
+  it('keeps the newest results whole when there are fewer than a block of them', () => {
+    // Four large results in a small context: shortening the two older ones is enough.
+    const messages = conv().slice(0, 9)
+    const budget = totalTokens(compactOlderResults(messages, 2))
+    const fit = fitMessages(messages, budget, 0)
+    expect(fit.fits).toBe(true)
+    expect(fit.messages.filter((m) => m.role === 'tool').map((m) => m.content === big)).toEqual([false, false, true, true])
+  })
+
+  it('moves the line between old and recent results only every few steps', () => {
+    // The same messages stay shortened the same way while results are added, so the server can
+    // reuse its prompt cache for everything before the newest step.
+    const longer = (n: number): WireMessage[] => {
+      const m: WireMessage[] = [{ role: 'user', content: 'build it' }]
+      for (let i = 0; i < n; i++) {
+        m.push({ role: 'assistant', content: `step ${i}`, tool_calls: [{ id: `c${i}`, type: 'function', function: { name: 'run_command', arguments: '{}' } }] })
+        m.push({ role: 'tool', tool_call_id: `c${i}`, content: big })
+      }
+      return m
+    }
+    const shortenedAt = (n: number): number => compactOlderResults(longer(n), 6, COMPACT_BLOCK).filter((m) => m.role === 'tool' && m.content !== big).length
+    expect([14, 15, 16, 17, 18, 19, 20, 21, 22].map(shortenedAt)).toEqual([8, 8, 8, 8, 8, 8, 8, 8, 16])
+    // Without blocks it stays as before: exactly the last `keepRecent` are whole.
+    expect(compactOlderResults(longer(10), 2).filter((m) => m.role === 'tool' && m.content === big)).toHaveLength(2)
+  })
+
+  it('shortens file contents in older write_file and edit_file calls, keeping valid arguments', () => {
+    const body = 'const x = 1\n'.repeat(300)
+    const call = { id: 'w', type: 'function' as const, function: { name: 'write_file', arguments: JSON.stringify({ path: 'a.js', content: body }) } }
+    const args = JSON.parse(compactCallArgs(call).function.arguments) as { path: string; content: string }
+    expect(args.path).toBe('a.js')
+    expect(args.content.length).toBeLessThan(1000)
+    expect(args.content).toMatch(/omitted/)
+    const small = { ...call, function: { ...call.function, arguments: '{"path":"a.js","content":"x"}' } }
+    expect(compactCallArgs(small)).toBe(small)
+    const broken = { ...call, function: { ...call.function, arguments: '{"path": "a.js", "content": "' + 'x'.repeat(2000) } }
+    expect(compactCallArgs(broken)).toBe(broken)
   })
 
   it('summarises earlier tasks first, never the current task message', () => {
@@ -257,7 +382,8 @@ describe('context trimming', () => {
     expect(tokenScale(1000, 800)).toBe(0.8)
     expect(tokenScale(1000, 1200)).toBe(1.2)
     expect(tokenScale(1000, 100)).toBe(0.5)
-    expect(tokenScale(1000, 9000)).toBe(1.5)
+    expect(tokenScale(1000, 1900)).toBe(1.9)
+    expect(tokenScale(1000, 9000)).toBe(2.5)
     expect(tokenScale(0, 500)).toBe(1)
     expect(tokenScale(500, 0)).toBe(1)
   })
@@ -299,6 +425,16 @@ describe('plain-language steps', () => {
 })
 
 describe('what changes from step to step stays out of the system prompt', () => {
+  it('finds the background note the model saw last', () => {
+    const note = backgroundNote([{ id: 'bg1', command: 'npm start' }])
+    expect(lastBackgroundNoteIn([])).toBe('')
+    expect(lastBackgroundNoteIn([{ content: `Make it [x]` }, { content: `ok [Note: other]` }])).toBe('')
+    expect(lastBackgroundNoteIn([{ content: `Make it` }, { content: `started
+
+${note}` }, { content: 'fine' }])).toBe(note)
+    expect(lastBackgroundNoteIn([{ content: `started ${note}` }, { content: `stopped ${NO_BACKGROUND_NOTE}` }])).toBe('')
+  })
+
   it('puts the running background commands in a note at the end', () => {
     expect(backgroundNote([])).toBe('')
     const note = backgroundNote([{ id: 'bg1', command: 'npm start' }])
@@ -309,36 +445,94 @@ describe('what changes from step to step stays out of the system prompt', () => 
       { role: 'assistant', content: '', tool_calls: [{ id: 'a', type: 'function', function: { name: 'run_command', arguments: '{}' } }] },
       { role: 'tool', tool_call_id: 'a', content: 'ok' }
     ]
-    const out = withTrailingNote(msgs, note)
-    expect(out.slice(0, 3)).toEqual(msgs.slice(0, 3))
-    expect(out[3].content).toBe(`ok\n\n${note}`)
-    expect(msgs[3].content).toBe('ok')
-    expect(withTrailingNote(msgs, '')).toBe(msgs)
+    // The note goes into the history only when it changes (ProjectSession.noteBackground), so the
+    // history otherwise stays as it was, for the server's prompt cache.
+    expect(forModel(msgs.slice(1))).toEqual(msgs.slice(1))
+  })
+})
+
+describe('history as sent to the model', () => {
+  it('sends two user messages in a row as one', () => {
+    const out = forModel([
+      { role: 'user', content: 'Make it', task: 't1' },
+      { role: 'user', content: '[Note: use blue]' },
+      { role: 'assistant', content: 'Done.', item: 'i1' },
+      { role: 'user', content: 'Next', task: 't2' },
+      { role: 'user', content: '[Note: cut off]' },
+      { role: 'user', content: '[Note: again]' }
+    ])
+    expect(out).toEqual([
+      { role: 'user', content: 'Make it\n\n[Note: use blue]' },
+      { role: 'assistant', content: 'Done.' },
+      { role: 'user', content: 'Next\n\n[Note: cut off]\n\n[Note: again]' }
+    ])
+  })
+
+  it('gives tool calls left without a result one, before the next message', () => {
+    const call = (id: string) => ({ id, type: 'function' as const, function: { name: 'run_command', arguments: '{}' } })
+    const out = forModel([
+      { role: 'user', content: 'Make it' },
+      { role: 'assistant', content: '', tool_calls: [call('a'), call('b')] },
+      { role: 'tool', tool_call_id: 'a', content: 'ok' },
+      { role: 'user', content: 'Next' },
+      { role: 'assistant', content: '', tool_calls: [call('c')] }
+    ])
+    expect(out.map((m) => [m.role, m.tool_call_id ?? '', m.content])).toEqual([
+      ['user', '', 'Make it'],
+      ['assistant', '', ''],
+      ['tool', 'a', 'ok'],
+      ['tool', 'b', NOT_RUN_RESULT],
+      ['user', '', 'Next'],
+      ['assistant', '', ''],
+      ['tool', 'c', NOT_RUN_RESULT]
+    ])
+  })
+
+  it('tells a context overflow from other server errors', () => {
+    expect(isContextOverflow(new ServerError('the request exceeds the available context size, try increasing it', 400))).toBe(true)
+    expect(isContextOverflow(new ServerError('Unknown model', 404))).toBe(false)
+    expect(isContextOverflow(new Error('exceeds the available context'))).toBe(false)
   })
 })
 
 describe('background shells left behind by a crash', () => {
-  it('stops only recorded PIDs that are still PowerShell, then starts a fresh record', async () => {
+  it('stops only recorded PIDs that are still the same PowerShell, then starts a fresh record', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'rulz-pids-'))
     const file = join(dir, 'child-pids.json')
-    writeFileSync(file, JSON.stringify([111, 222, 333]))
+    const t = 1_700_000_000_000
+    // 111: gone; 222: same shell; 333: PID reused by a PowerShell started an hour later; 444: an old
+    // record without a time (still PowerShell, so stopped as before).
+    writeFileSync(file, JSON.stringify([{ pid: 111, at: t }, { pid: 222, at: t }, { pid: 333, at: t }, 444]))
     const killed: number[] = []
     const pids = new ChildPids()
-    const result = await pids.init(file, (pid) => killed.push(pid), () => new Set([222, 333, 999]))
-    expect(result).toEqual([222, 333])
-    expect(killed).toEqual([222, 333])
+    const live = new Map([[222, t - 40], [333, t + 3_600_000], [444, t], [999, t]])
+    const result = await pids.init(file, (pid) => killed.push(pid), () => live)
+    expect(result).toEqual([222, 444])
+    expect(killed).toEqual([222, 444])
     expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual([])
+    // Saves run in the background; wait (up to 5 s on a busy machine) for the file to change.
+    const saved = async (): Promise<{ pid: number; at: number }[]> => JSON.parse(readFileSync(file, 'utf8')) as { pid: number; at: number }[]
+    const until = async (ok: (v: { pid: number; at: number }[]) => boolean): Promise<{ pid: number; at: number }[]> => {
+      for (let i = 0; i < 100; i++) {
+        const v = await saved().catch(() => [])
+        if (ok(v)) return v
+        await new Promise((r) => setTimeout(r, 50))
+      }
+      return saved()
+    }
     pids.add(4242)
-    await new Promise((r) => setTimeout(r, 50))
-    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual([4242])
+    const written = await until((v) => v.length > 0)
+    expect(written.map((s) => s.pid)).toEqual([4242])
+    expect(Math.abs(written[0].at - Date.now())).toBeLessThan(10_000)
     pids.remove(4242)
-    await new Promise((r) => setTimeout(r, 50))
-    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual([])
+    expect(await until((v) => v.length === 0)).toEqual([])
   })
 
-  it('reads PowerShell PIDs from tasklist output', () => {
-    const csv = '"powershell.exe","1200","Console","1","90,000 K"\r\n"node.exe","1300","Console","1","50,000 K"\r\n"pwsh.exe","77","Console","1","1 K"'
-    expect([...parseShellPids(csv)]).toEqual([1200, 77])
+  it('reads PowerShell PIDs and start times', () => {
+    expect([...parseShellList('1200 1700000000000\r\n\r\n77 1700000000500\r\nnoise')]).toEqual([
+      [1200, 1700000000000],
+      [77, 1700000000500]
+    ])
   })
 })
 

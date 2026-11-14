@@ -1,7 +1,7 @@
 // Keeps each request under ~80% of the model's context: older tool results are shortened first,
 // and when that isn't enough, older turns are summarised. The system prompt and the current
 // task are never dropped.
-import type { WireMessage } from '@shared/types'
+import type { WireMessage, WireToolCall } from '@shared/types'
 
 /** Code and command output run at roughly 3 characters per token; err on the safe side. */
 export const CHARS_PER_TOKEN = 3.2
@@ -13,13 +13,18 @@ export const estimateTokens = (text: string): number => Math.ceil(text.length / 
 /** Contexts this small fill up after a few files; the owner is told how to raise it. */
 export const SMALL_CONTEXT = 16384
 
+/** The most the estimate is corrected by (see tokenScale). */
+export const MAX_TOKEN_SCALE = 2.5
+
 /**
  * How far off the estimate was, from the server's exact count of the last request. Estimates
  * are multiplied by this; it is kept within limits so one odd request can't skew it far.
  */
 export function tokenScale(estimated: number, actual: number): number {
   if (!(estimated > 0) || !(actual > 0)) return 1
-  return Math.min(1.5, Math.max(0.5, actual / estimated))
+  // Up to 2.5: text in Chinese or Japanese, minified code and base64 take far more tokens per
+  // character than the estimate, and a lower cap left such conversations too long for the model.
+  return Math.min(MAX_TOKEN_SCALE, Math.max(0.5, actual / estimated))
 }
 
 export function messageTokens(m: WireMessage): number {
@@ -47,12 +52,62 @@ export function compactToolResult(text: string): string {
   return `${head}\n[… ${omitted.toLocaleString('en-US')} characters of this older result omitted to save space; run the tool again if you need them …]\n${tail}`
 }
 
-/** Compacts every tool result except the `keepRecent` most recent ones. */
-export function compactOlderResults(messages: WireMessage[], keepRecent: number): WireMessage[] {
-  const toolIdx = messages.flatMap((m, i) => (m.role === 'tool' ? [i] : []))
-  const keep = new Set(keepRecent > 0 ? toolIdx.slice(-keepRecent) : [])
-  return messages.map((m, i) => (m.role === 'tool' && !keep.has(i) ? { ...m, content: compactToolResult(m.content) } : m))
+/** File contents in the arguments of older write_file / edit_file calls, shortened like tool results. */
+const BULKY_ARGS = ['content', 'new_text', 'old_text']
+
+function compactArgText(text: string): string {
+  if (text.length <= COMPACT_MIN_CHARS) return text
+  const omitted = text.length - HEAD_CHARS - TAIL_CHARS
+  return `${text.slice(0, HEAD_CHARS)}\n[… ${omitted.toLocaleString('en-US')} characters omitted to save space; read the file if you need them …]\n${text.slice(-TAIL_CHARS)}`
 }
+
+/** A call's arguments with the file contents in them shortened (still valid JSON); the same call when there is nothing to shorten. */
+export function compactCallArgs(call: WireToolCall): WireToolCall {
+  if (call.function.arguments.length <= COMPACT_MIN_CHARS) return call
+  let args: unknown
+  try {
+    args = JSON.parse(call.function.arguments)
+  } catch {
+    return call
+  }
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return call
+  let changed = false
+  const out: Record<string, unknown> = { ...(args as Record<string, unknown>) }
+  for (const key of BULKY_ARGS) {
+    const v = out[key]
+    if (typeof v === 'string' && v.length > COMPACT_MIN_CHARS) {
+      out[key] = compactArgText(v)
+      changed = true
+    }
+  }
+  return changed ? { ...call, function: { ...call.function, arguments: JSON.stringify(out) } } : call
+}
+
+/**
+ * Compacts every tool result before the `keepRecent` most recent ones, and the file contents in
+ * the tool calls before them. With `block`, the line between old and recent moves only every
+ * `block` results (more are kept in between), so the server's prompt cache, which holds everything
+ * up to the first change, keeps working for several steps instead of being redone at every step.
+ */
+export function compactOlderResults(messages: WireMessage[], keepRecent: number, block = 1): WireMessage[] {
+  const toolIdx = messages.flatMap((m, i) => (m.role === 'tool' ? [i] : []))
+  const count = Math.max(0, Math.floor((toolIdx.length - keepRecent) / block) * block)
+  if (!count) return messages
+  // Everything before the first result that is kept in full is old.
+  const boundary = count < toolIdx.length ? toolIdx[count] : messages.length
+  return messages.map((m, i) => {
+    if (i >= boundary) return m
+    if (m.role === 'tool') return { ...m, content: compactToolResult(m.content) }
+    if (m.role === 'assistant' && m.tool_calls?.length) {
+      const calls = m.tool_calls.map(compactCallArgs)
+      return calls.some((c, j) => c !== m.tool_calls![j]) ? { ...m, tool_calls: calls } : m
+    }
+    return m
+  })
+}
+
+/** How many results the line between old and recent moves by at a time (see compactOlderResults). */
+export const COMPACT_BLOCK = 8
 
 /** Tries progressively stronger compaction; `fits` is false when only summarising will help. */
 export function fitMessages(
@@ -63,8 +118,17 @@ export function fitMessages(
   let tokens = fixedTokens + totalTokens(messages)
   if (tokens <= budget) return { messages, fits: true, tokens }
   let out = messages
-  for (const keep of [6, 2, 0]) {
-    out = compactOlderResults(messages, keep)
+  for (const [keep, block] of [
+    [6, COMPACT_BLOCK],
+    [2, COMPACT_BLOCK],
+    [0, COMPACT_BLOCK],
+    // With fewer results than a block, the steps above shorten nothing: the newest results (often
+    // the file the model just asked for) are kept whole as long as possible.
+    [2, 1],
+    [1, 1],
+    [0, 1]
+  ]) {
+    out = compactOlderResults(messages, keep, block)
     tokens = fixedTokens + totalTokens(out)
     if (tokens <= budget) return { messages: out, fits: true, tokens }
   }

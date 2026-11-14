@@ -28,7 +28,7 @@ interface Harness {
   prompts: PendingPrompt[]
   requests: Awaited<ReturnType<typeof startMockRulz>>['requests']
   reSessions: Awaited<ReturnType<typeof startMockRulz>>['reSessions']
-  run: (text: string, opts?: { shown?: string; share?: boolean; re?: ReTaskInfo }) => Promise<TaskRecord>
+  run: (text: string, opts?: { shown?: string; share?: boolean; howToRun?: boolean; re?: ReTaskInfo }) => Promise<TaskRecord>
   /** Resolves when the next task ends (for tasks started some other way, such as redo). */
   nextEnd: () => Promise<TaskRecord>
   close: () => Promise<void>
@@ -1056,6 +1056,97 @@ describe('stopping and approving safely', () => {
       await h.run('Install it')
       expect(h.prompts).toHaveLength(2)
       expect(h.prompts[1]).toMatchObject({ kind: 'approval', risk: expect.stringMatching(/whole computer[\s\S]*deletes files/) })
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+})
+
+describe('audit fixes (0.19.0)', () => {
+  it("doesn't let a task start while Undo is putting files back", async () => {
+    const h = await harness([{ toolCalls: [call('write_file', { path: 'a.txt', content: 'a\n', summary: 'Writing a' })] }, { content: 'Done.' }])
+    try {
+      await h.run('Write a')
+      const undoing = h.session.undo()
+      expect(() => h.session.start('Something else')).toThrow(/Wait for the undo/)
+      await expect(h.session.undo()).rejects.toThrow(/Wait for the undo/)
+      await undoing
+      expect(existsSync(join(h.root, 'a.txt'))).toBe(false)
+    } finally {
+      await h.close()
+    }
+  }, 60_000)
+
+  it('stops after replies keep getting cut off, ending on its own reply', async () => {
+    const cut = { content: 'Here is the first part of', finish: 'length' }
+    const h = await harness([cut, cut, cut, cut, { content: 'never asked for' }])
+    try {
+      const task = await h.run('Write a long story')
+      expect(task.outcome).toBe('done')
+      expect(h.requests).toHaveLength(4)
+      const msgs = h.session.data.messages
+      expect(msgs[msgs.length - 1].role).toBe('assistant')
+      expect(h.session.data.timeline.some((i) => i.kind === 'notice' && /kept getting cut off/.test(i.text))).toBe(true)
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it("won't save a way to run the app that would be refused", async () => {
+    const h = await harness([{ content: 'Found it.\nRUN: shutdown /s /t 0' }])
+    try {
+      await h.run('How do I run this app?', { howToRun: true })
+      expect(h.session.data.runCommand).toBeNull()
+      expect(h.session.data.timeline.some((i) => i.kind === 'notice' && /won't save/.test(i.text))).toBe(true)
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('tries once more with a higher estimate when the server says the request was too long', async () => {
+    const h = await harness([{ status: 400, error: 'the request exceeds the available context size, try increasing it' }, { content: 'Done.' }])
+    try {
+      const task = await h.run('Hello')
+      expect(task.outcome).toBe('done')
+      expect(h.requests).toHaveLength(2)
+    } finally {
+      await h.close()
+    }
+  }, 30_000)
+
+  it('tells the model when the last background command has stopped', async () => {
+    const h = await harness(
+      [
+        { toolCalls: [call('start_background_command', { command: 'Start-Sleep -Seconds 30', summary: 'Waiting' })] },
+        { toolCalls: [call('stop_background_command', { id: 'bg1' })] },
+        { content: 'Done.' }
+      ],
+      { settings: { approval: 'handsoff' } }
+    )
+    try {
+      await h.run('Start and stop')
+      expect(h.requests).toHaveLength(3)
+      const lastOf = (i: number) => h.requests[i].body.messages!.at(-1)!.content as string
+      expect(lastOf(1)).toMatch(/Still running in the background: bg1/)
+      expect(lastOf(2)).toMatch(/No commands are running in the background/)
+      // The earlier note stays where it was, so the server's prompt cache still matches.
+      expect(JSON.stringify(h.requests[2].body.messages)).toContain(JSON.stringify(lastOf(1)).slice(1, -1))
+    } finally {
+      await h.close()
+    }
+  }, 60_000)
+
+  it('sends a note written while the model loads together with the request, as one user message', async () => {
+    const h = await harness([{ content: 'Done in blue.' }], {
+      onEvent: (e, s) => {
+        if (e.type === 'task-start') s.addNote('Make it blue')
+      }
+    })
+    try {
+      await h.run('Make a page')
+      const roles = h.requests[0].body.messages!.map((m) => m.role)
+      expect(roles).toEqual(['system', 'user'])
+      expect(h.requests[0].body.messages![1].content).toMatch(/Make a page[\s\S]*Make it blue/)
     } finally {
       await h.close()
     }

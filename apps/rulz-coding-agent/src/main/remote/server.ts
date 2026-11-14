@@ -29,6 +29,20 @@ const PING_MS = 25_000
 const MAX_BUFFERED = 16 * 1024 * 1024
 const MAX_FAILURES = 10
 const LOCKOUT_MS = 10 * 60_000
+/** Connections that haven't said hello yet, at most (each is dropped after HELLO_TIMEOUT_MS anyway). */
+const MAX_PENDING = 16
+/** The same from one address (one of your devices), so a single device can't fill every slot and keep your phone out. */
+const MAX_PENDING_PER_ADDRESS = 8
+
+/**
+ * Pages allowed to connect: the phone app (its WebView serves the app from http://localhost) and
+ * clients that aren't browsers (no Origin). A web page open in a browser on a device in the
+ * tailnet can't connect, so it can't use up the wrong-code limit and lock the phone out.
+ */
+export function originAllowed(origin: string | undefined): boolean {
+  if (!origin) return true
+  return /^(https?|capacitor):\/\/localhost(:\d+)?$/i.test(origin)
+}
 
 export interface RemoteHost {
   invoke(channel: string, args: unknown[]): Promise<unknown>
@@ -78,6 +92,9 @@ export class RemoteServer {
   private servers: Server[] = []
   private readonly wss = new WebSocketServer({ noServer: true, maxPayload: 4 * 1024 * 1024 })
   private readonly conns = new Map<string, Conn>()
+  /** Connections still waiting for their hello. */
+  /** Connections waiting for their pairing code, and where each comes from. */
+  private readonly pending = new Map<WebSocket, string>()
   private readonly failures = new Map<string, { count: number; until: number }>()
   private token = ''
   private unsubscribe: (() => void) | null = null
@@ -131,6 +148,8 @@ export class RemoteServer {
     this.pinger = null
     for (const c of this.conns.values()) c.ws.terminate()
     this.conns.clear()
+    for (const ws of this.pending.keys()) ws.terminate()
+    this.pending.clear()
     const servers = this.servers
     this.servers = []
     await Promise.all(servers.map((s) => new Promise<void>((r) => s.close(() => r()))))
@@ -162,7 +181,18 @@ export class RemoteServer {
       socket.end('HTTP/1.1 404 Not Found\r\n\r\n')
       return
     }
-    this.wss.handleUpgrade(req, socket, head, (ws) => this.accept(ws, req.socket.remoteAddress ?? ''))
+    if (!originAllowed(req.headers.origin)) {
+      socket.end('HTTP/1.1 403 Forbidden\r\n\r\n')
+      return
+    }
+    const address = req.socket.remoteAddress ?? ''
+    let fromHere = 0
+    for (const a of this.pending.values()) if (a === address) fromHere++
+    if (this.pending.size >= MAX_PENDING || fromHere >= MAX_PENDING_PER_ADDRESS) {
+      socket.end('HTTP/1.1 503 Service Unavailable\r\n\r\n')
+      return
+    }
+    this.wss.handleUpgrade(req, socket, head, (ws) => this.accept(ws, address))
   }
 
   private lockedOut(address: string): boolean {
@@ -184,16 +214,25 @@ export class RemoteServer {
 
   private accept(ws: WebSocket, address: string): void {
     const deny = (reason: 'wrong-code' | 'locked' | 'timeout' | 'bad-hello'): void => {
+      // No longer waiting for a code (closing can take a while, and mustn't hold a slot meanwhile).
+      this.pending.delete(ws)
       ws.send(JSON.stringify({ t: 'denied', reason }))
       ws.close(4001, reason)
     }
     if (this.lockedOut(address)) return deny('locked')
+    this.pending.set(ws, address)
+    ws.once('close', () => this.pending.delete(ws))
     const timer = setTimeout(() => deny('timeout'), HELLO_TIMEOUT_MS)
 
     ws.once('message', (data) => {
       clearTimeout(timer)
+      this.pending.delete(ws)
+      // Already refused (the hello came too late, while the socket was closing).
+      if (ws.readyState !== WebSocket.OPEN) return
       const msg = parse(data)
       if (msg?.t !== 'hello') return deny('bad-hello')
+      // Checked again here: connections opened side by side would each get a guess past the limit.
+      if (this.lockedOut(address)) return deny('locked')
       if (!tokenMatches(msg.token, this.token)) {
         this.failed(address)
         return deny(this.lockedOut(address) ? 'locked' : 'wrong-code')

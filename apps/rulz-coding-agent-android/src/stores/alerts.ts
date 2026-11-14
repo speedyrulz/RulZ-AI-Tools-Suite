@@ -96,7 +96,7 @@ export const useAlerts = create<AlertsState>((set, get) => {
         const s = currentStatus()
         await KeepAlive.start(s)
         lastStatus = JSON.stringify(s)
-        await KeepAlive.setBusy({ busy: useWorkspace.getState().running })
+        await KeepAlive.setBusy({ busy: link.connected && useWorkspace.getState().running })
       } else {
         await KeepAlive.stop()
       }
@@ -162,7 +162,7 @@ export const useAlerts = create<AlertsState>((set, get) => {
       }
 
       link.on('agent:event', (e) => {
-        if (e.type === 'task-start' || e.type === 'task-end') void KeepAlive.setBusy({ busy: e.type === 'task-start' }).catch(() => undefined)
+        if (e.type === 'prompt' || e.type === 'task-end') return
         const actions = alertFor(e, {
           prefs: get().prefs,
           projectName: useWorkspace.getState().project?.name ?? 'your project',
@@ -174,9 +174,29 @@ export const useAlerts = create<AlertsState>((set, get) => {
       })
 
       useWorkspace.subscribe((s, prev) => {
+        if (s.running !== prev.running && isNative) void KeepAlive.setBusy({ busy: s.running && link.connected }).catch(() => undefined)
+        if (s.prompt?.id !== prev.prompt?.id) {
+          const actions = alertFor({ type: 'prompt', projectPath: s.project?.path ?? '', prompt: s.prompt }, {
+            prefs: get().prefs, projectName: s.project?.name ?? 'your project', timeline: s.timeline, finishedCount
+          })
+          void show(active ? actions.filter((a) => a.kind === 'cancel') : actions)
+        }
+        if (prev.running && !s.running && s.project?.path === prev.project?.path) {
+          const ended = s.tasks.find((t) => t.outcome !== 'running' && prev.tasks.some((old) => old.id === t.id && old.outcome === 'running'))
+          if (ended) {
+            const actions = alertFor({ type: 'task-end', projectPath: s.project!.path, task: ended }, {
+              prefs: get().prefs, projectName: s.project!.name, timeline: s.timeline, finishedCount
+            })
+            void show(active ? actions.filter((a) => a.kind === 'cancel') : actions)
+          }
+        }
         if (s.running !== prev.running || s.prompt !== prev.prompt || s.status !== prev.status || s.project !== prev.project) refreshOngoing()
       })
       useLink.subscribe((s, prev) => {
+        if (s.state.kind !== prev.state.kind && isNative) {
+          if (s.state.kind !== 'connected') void KeepAlive.setBusy({ busy: false }).catch(() => undefined)
+          else void KeepAlive.setBusy({ busy: useWorkspace.getState().running }).catch(() => undefined)
+        }
         if (s.currentId !== prev.currentId) void syncBackground()
         else if (s.state !== prev.state) refreshOngoing()
       })

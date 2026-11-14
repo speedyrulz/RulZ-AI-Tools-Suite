@@ -38,7 +38,9 @@ export class RemoteLink implements RulzApi {
   private ws: SocketLike | null = null
   private attempt = 0
   private retryTimer: ReturnType<typeof setTimeout> | null = null
+  private heartbeat: ReturnType<typeof setInterval> | null = null
   private nextId = 1
+  backgroundIdle = false
   private readonly pending = new Map<string, Pending>()
   private readonly listeners = new Map<string, Set<(payload: unknown) => void>>()
   private readonly stateListeners = new Set<(s: LinkState) => void>()
@@ -75,11 +77,14 @@ export class RemoteLink implements RulzApi {
 
   /** After the phone slept, the connection can look open but be dead; a quick request tells. */
   async check(): Promise<void> {
-    if (!this.connected) return this.retryNow()
+    // A refused code isn't tried again by itself: each try would count towards the computer's
+    // wrong-code limit. The banner's "Try again" (retryNow) does it on purpose.
+    if (!this.connected) return this.state.kind === 'denied' || this.state.kind === 'outdated' ? undefined : this.retryNow()
+    const socket = this.ws
     try {
-      await this.request('server:status', [], 5000)
+      await this.request('server:status', [], 10000)
     } catch {
-      if (!this.computer) return
+      if (!this.computer || this.ws !== socket) return
       this.drop()
       this.open()
     }
@@ -166,13 +171,14 @@ export class RemoteLink implements RulzApi {
           }
           this.attempt = 0
           this.setState({ kind: 'connected', name: String(msg.name ?? c.name), version: String(msg.version ?? '') })
+          this.heartbeat = setInterval(() => void this.check(), 40_000)
           break
         case 'denied':
           clearTimeout(openTimer)
           settled = true
-          this.computer = null
           this.drop()
-          this.setState({ kind: 'denied', reason: String(msg.reason) })
+          if (msg.reason === 'timeout' || msg.reason === 'bad-hello') this.lost('The connection dropped.')
+          else this.setState({ kind: 'denied', reason: String(msg.reason) })
           break
         case 'result': {
           const p = this.pending.get(String(msg.id))
@@ -193,6 +199,8 @@ export class RemoteLink implements RulzApi {
       clearTimeout(openTimer)
       if (this.ws !== ws) return
       this.ws = null
+      if (this.heartbeat) clearInterval(this.heartbeat)
+      this.heartbeat = null
       this.failPending(`Lost the connection to ${c.name}.`)
       this.lost(settled ? 'The connection dropped.' : `Can't reach ${c.name}.`)
     }
@@ -202,7 +210,7 @@ export class RemoteLink implements RulzApi {
   private lost(error: string): void {
     if (!this.computer) return
     this.attempt++
-    const delay = Math.min(1000 * 2 ** Math.min(this.attempt - 1, 4), MAX_BACKOFF_MS)
+    const delay = Math.min(1000 * 2 ** Math.min(this.attempt - 1, 7), this.backgroundIdle ? 90_000 : MAX_BACKOFF_MS)
     this.setState({ kind: 'connecting', attempt: this.attempt, error })
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null
@@ -212,6 +220,8 @@ export class RemoteLink implements RulzApi {
 
   /** Closes the socket without retrying. */
   private drop(): void {
+    if (this.heartbeat) clearInterval(this.heartbeat)
+    this.heartbeat = null
     if (this.retryTimer) clearTimeout(this.retryTimer)
     this.retryTimer = null
     const ws = this.ws

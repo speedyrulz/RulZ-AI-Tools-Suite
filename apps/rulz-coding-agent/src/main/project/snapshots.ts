@@ -293,8 +293,7 @@ async function scanProject(root: string): Promise<{ big: string[]; nested: strin
           if (!EXCLUDED_DIRS.has(e.name.toLowerCase()) && !e.isSymbolicLink()) next.push(abs)
         } else if (e.isFile()) filesHere.push(abs)
       }
-      // One folder's files are looked at together rather than one after another.
-      const sizes = await Promise.all(filesHere.map((abs) => fs.stat(abs).then((s) => s.size, () => 0)))
+      const sizes = await sizesOf(filesHere)
       filesHere.forEach((abs, i) => {
         if (sizes[i] > BIG_FILE_BYTES) big.push(toRel(root, abs))
       })
@@ -302,6 +301,15 @@ async function scanProject(root: string): Promise<{ big: string[]; nested: strin
     level = next
   }
   return { big, nested }
+}
+
+/** File sizes (0 for one that can't be read), looked at a batch at a time: a folder can hold tens of thousands. */
+async function sizesOf(paths: string[]): Promise<number[]> {
+  const out: number[] = []
+  for (let i = 0; i < paths.length; i += 256) {
+    out.push(...(await Promise.all(paths.slice(i, i + 256).map((abs) => fs.stat(abs).then((s) => s.size, () => 0)))))
+  }
+  return out
 }
 
 /** Excluded file names (`*.log`, `Thumbs.db`, …) as tests. */
@@ -336,7 +344,7 @@ async function filesUnder(root: string, rel: string, limits: { maxFiles?: number
         if (!EXCLUDED_DIRS.has(e.name.toLowerCase()) && !e.isSymbolicLink()) dirs.push(abs)
       } else if (e.isFile() && !EXCLUDED_FILES.some((re) => re.test(e.name))) files.push(abs)
     }
-    const sizes = await Promise.all(files.map((abs) => fs.stat(abs).then((s) => s.size, () => 0)))
+    const sizes = await sizesOf(files)
     files.forEach((abs, i) => {
       if (sizes[i] > BIG_FILE_BYTES) return
       out.push(toRel(root, abs))

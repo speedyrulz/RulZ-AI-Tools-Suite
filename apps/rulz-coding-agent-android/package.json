@@ -1,7 +1,7 @@
 {
   "name": "rulz-coding-agent-android",
   "productName": "RulZ Coding Agent for Android",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Watch and control RulZ Coding Agent on your computer from an Android phone, over Tailscale.",
   "author": "RulZ",
   "license": "MIT",

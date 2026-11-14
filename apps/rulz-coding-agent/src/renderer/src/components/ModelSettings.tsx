@@ -279,13 +279,19 @@ function Loading({ model }: { model: string }) {
     setInfo(null)
     setDraft(null)
     setError('')
+    // A slow answer for the model picked before must not fill in (and then save) this one's settings.
+    let current = true
     invoke('models:loadSettings', model).then(
       (i) => {
+        if (!current) return
         setInfo(i)
         setDraft(i.config)
       },
-      (e: Error) => setError(e.message)
+      (e: Error) => current && setError(e.message)
     )
+    return () => {
+      current = false
+    }
   }, [model])
 
   if (error && !draft) return <p className="text-[13px] text-warn">{error}</p>

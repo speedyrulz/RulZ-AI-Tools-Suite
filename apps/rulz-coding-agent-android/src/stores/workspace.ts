@@ -41,9 +41,9 @@ interface WorkspaceState {
   create: (name: string, parentDir: string | null) => Promise<boolean>
   /** Closes the project on the computer too. */
   close: () => Promise<void>
-  send: (text: string) => Promise<boolean>
+  send: (text: string, promptId?: string) => Promise<boolean>
   stop: () => void
-  answer: (answer: PromptAnswer) => void
+  answer: (promptId: string, answer: PromptAnswer) => Promise<boolean>
   undo: (taskId?: string) => Promise<void>
   startRun: () => Promise<void>
   stopRun: () => Promise<void>
@@ -71,7 +71,21 @@ const CLOSED = {
 } satisfies Partial<WorkspaceState>
 
 export const useWorkspace = create<WorkspaceState>((set, get) => {
+  const chunks = new Map<string, { text: string; reasoning: string }>()
+  let chunkTimer: ReturnType<typeof setTimeout> | null = null
+  const flushChunks = (): void => {
+    if (chunkTimer) clearTimeout(chunkTimer)
+    chunkTimer = null
+    if (!chunks.size) return
+    const pending = new Map(chunks)
+    chunks.clear()
+    set((s) => ({ timeline: s.timeline.map((x) => {
+      const chunk = pending.get(x.id)
+      return chunk && x.kind === 'assistant' ? { ...x, text: x.text + chunk.text, reasoning: (x.reasoning ?? '') + chunk.reasoning } : x
+    }) }))
+  }
   const apply = (state: ProjectState, same = false): void => {
+    flushChunks()
     set({
       project: state.project,
       timeline: state.timeline,
@@ -90,12 +104,14 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
   const isMine = (projectPath: string): boolean => get().project?.path.toLowerCase() === projectPath.toLowerCase()
 
   const closed = (): void => {
+    flushChunks()
     set(CLOSED)
     if (useUi.getState().view === 'workspace') useUi.getState().go('projects')
   }
 
   on('agent:event', (e: AgentEvent) => {
     if (!isMine(e.projectPath)) return
+    if (e.type !== 'delta' && e.type !== 'reasoning') flushChunks()
     switch (e.type) {
       case 'task-start':
         set((s) => ({ tasks: [...s.tasks, e.task], timeline: [...s.timeline, e.item], running: true, selectedTaskId: null }))
@@ -114,17 +130,14 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
         })
         break
       case 'delta':
-        set((s) => ({
-          timeline: s.timeline.map((x) => (x.id === e.itemId && x.kind === 'assistant' ? { ...x, text: x.text + e.text } : x))
-        }))
+      case 'reasoning': {
+        const chunk = chunks.get(e.itemId) ?? { text: '', reasoning: '' }
+        if (e.type === 'delta') chunk.text += e.text
+        else chunk.reasoning += e.text
+        chunks.set(e.itemId, chunk)
+        if (!chunkTimer) chunkTimer = setTimeout(flushChunks, 50)
         break
-      case 'reasoning':
-        set((s) => ({
-          timeline: s.timeline.map((x) =>
-            x.id === e.itemId && x.kind === 'assistant' ? { ...x, reasoning: (x.reasoning ?? '') + e.text } : x
-          )
-        }))
-        break
+      }
       case 'step':
         set((s) => ({
           tasks: updateTask(s.tasks, e.step.taskId, (t) => {
@@ -153,7 +166,8 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
         break
       case 'task-end':
         set((s) => ({ tasks: updateTask(s.tasks, e.task.id, () => e.task), running: false, prompt: null, status: { phase: 'idle' } }))
-        void invoke('projects:open', e.projectPath).then((st) => set({ runCommand: st.runCommand }), () => undefined)
+        if ('runCommand' in e) set({ runCommand: e.runCommand ?? null })
+        else void invoke('projects:open', e.projectPath).then((st) => { if (isMine(e.projectPath)) set({ runCommand: st.runCommand }) }, () => undefined)
         break
       case 'tasks':
         set({ tasks: e.tasks })
@@ -235,13 +249,11 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       }
     },
 
-    send: async (text) => {
+    send: async (text, promptId) => {
       const project = get().project
       if (!project || !text.trim()) return false
-      if (get().prompt?.kind === 'question') {
-        get().answer({ kind: 'question', text: text.trim() })
-        return true
-      }
+      if (promptId) return get().answer(promptId, { kind: 'question', text: text.trim() })
+      if (get().prompt) return false
       try {
         await invoke('task:start', project.path, text)
         return true
@@ -253,15 +265,18 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
 
     stop: () => void withProject((p) => invoke('task:stop', p)),
 
-    answer: (answer) => {
+    answer: async (promptId, answer) => {
       const { project, prompt } = get()
-      if (!project || !prompt) return
+      if (!project || !prompt || prompt.id !== promptId) return false
       set({ prompt: null })
-      invoke('task:answer', project.path, prompt.id, answer).catch((e) => {
-        // The answer didn't arrive; show the question again.
-        set({ prompt })
+      try {
+        await invoke('task:answer', project.path, promptId, answer)
+        return true
+      } catch (e) {
+        if (!get().prompt && get().project?.path === project.path) set({ prompt })
         toast.error(errorMessage(e))
-      })
+        return false
+      }
     },
 
     undo: (taskId) =>

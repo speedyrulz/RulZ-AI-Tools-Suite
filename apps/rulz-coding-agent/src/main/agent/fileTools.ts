@@ -346,7 +346,21 @@ function countOccurrences(text: string, needle: string): number[] {
   return at
 }
 
-const lineOf = (text: string, index: number): number => text.slice(0, index).split('\n').length
+/** 1-based line number of each index (ascending), counted in one pass instead of slicing the file per index. */
+function linesOf(text: string, indexes: number[]): number[] {
+  const out: number[] = []
+  let line = 1
+  let pos = 0
+  for (const index of indexes) {
+    for (let nl = text.indexOf('\n', pos); nl !== -1 && nl < index; nl = text.indexOf('\n', nl + 1)) {
+      line++
+      pos = nl + 1
+    }
+    out.push(line)
+  }
+  return out
+}
+const lineOf = (text: string, index: number): number => linesOf(text, [index])[0]
 
 export async function editFile(
   root: string,
@@ -381,7 +395,7 @@ export async function editFile(
       return fail(`old_text was not found in ${target.rel}.${hint} Read the file again with read_file and copy the text exactly, without the line numbers.`)
     }
     if (found.length > 1) {
-      const lines = found.map((i) => lineOf(text, i)).slice(0, 8)
+      const lines = linesOf(text, found.slice(0, 8))
       return fail(`old_text appears ${found.length} times in ${target.rel} (lines ${lines.join(', ')}). Include more of the surrounding lines so it matches only one place.`)
     }
     const updated = text.slice(0, found[0]) + newText + text.slice(found[0] + oldText.length)
@@ -402,6 +416,10 @@ export async function deletePath(
   try {
     target = await resolveInProject(root, args.path, { write: true })
     const st = await fs.stat(target.abs)
+    // A folder with a repository of its own: its history isn't in restore points, so Undo couldn't bring it back.
+    if (st.isDirectory() && (await fs.lstat(join(target.abs, '.git')).then(() => true, () => false))) {
+      return fail(`${target.rel}/ holds a git repository of its own (it has a .git), so it is not deleted. Ask the owner to delete it if it really should go.`)
+    }
     await trash(target.abs)
     return ok(`Moved ${target.rel}${st.isDirectory() ? '/' : ''} to the Recycle Bin.`, [{ path: target.rel, change: 'deleted' }])
   } catch (e) {

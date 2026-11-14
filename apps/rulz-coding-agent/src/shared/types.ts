@@ -341,7 +341,8 @@ export type AgentEvent =
   | { type: 'output'; projectPath: string; stepId: string; chunk: string }
   | { type: 'files'; projectPath: string; taskId: string; files: ChangedFile[] }
   | { type: 'prompt'; projectPath: string; prompt: PendingPrompt | null }
-  | { type: 'task-end'; projectPath: string; task: TaskRecord }
+  /** `runCommand`: how to run the app after the task (sent since 0.19.0; older versions leave it out). */
+  | { type: 'task-end'; projectPath: string; task: TaskRecord; runCommand?: string | null }
   | { type: 'tasks'; projectPath: string; tasks: TaskRecord[] }
   | { type: 'context'; projectPath: string; context: ContextUsage }
   | { type: 'draft'; projectPath: string; taskId: string; draft: DraftStats }

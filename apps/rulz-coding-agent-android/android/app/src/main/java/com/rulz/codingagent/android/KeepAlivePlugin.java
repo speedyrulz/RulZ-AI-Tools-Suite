@@ -29,6 +29,13 @@ public class KeepAlivePlugin extends Plugin {
         ConnectionService.createChannels(getContext());
     }
 
+    @Override
+    protected void handleOnDestroy() {
+        ConnectionService.setBusy(false);
+        getContext().stopService(new Intent(getContext(), ConnectionService.class));
+        super.handleOnDestroy();
+    }
+
     /** Starts the background connection: { title, text }. Only allowed while the app is on screen. */
     @PluginMethod
     public void start(PluginCall call) {

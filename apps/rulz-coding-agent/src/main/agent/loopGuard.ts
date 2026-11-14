@@ -21,6 +21,12 @@ export function callKey(name: string, args: string): string {
   return `${name}:${JSON.stringify(entries)}`
 }
 
+/**
+ * Tools that are called again on purpose to see what changed: the same call counts as a repeat only
+ * when it also brought the same result (polling a build whose output keeps coming is progress).
+ */
+const POLLING_TOOLS = new Set(['check_background_command'])
+
 export class LoopGuard {
   private lastKey = ''
   private repeats = 0
@@ -28,13 +34,13 @@ export class LoopGuard {
   /** Last error text, for the plain-language message. */
   lastError = ''
 
-  record(name: string, args: string, isError: boolean, errorText = ''): GuardTrip | null {
-    const key = callKey(name, args)
+  record(name: string, args: string, isError: boolean, resultText = ''): GuardTrip | null {
+    const key = callKey(name, args) + (POLLING_TOOLS.has(name) ? `\n${resultText}` : '')
     this.repeats = key === this.lastKey ? this.repeats + 1 : 1
     this.lastKey = key
     if (isError) {
       this.errors++
-      this.lastError = errorText
+      this.lastError = resultText
     } else this.errors = 0
     if (this.repeats >= REPEAT_LIMIT) return 'repeating'
     if (this.errors >= ERROR_LIMIT) return 'errors'

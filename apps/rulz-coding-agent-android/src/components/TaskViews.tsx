@@ -6,7 +6,7 @@ import { errorMessage, invoke } from '../lib/api'
 import { draftSummary } from '../lib/drafts'
 import { cn } from '../lib/format'
 import { shownTask, useWorkspace } from '../stores/workspace'
-import { Badge, Select, Sheet } from './ui'
+import { Badge, Button, Select, Sheet } from './ui'
 
 /** Which task's steps and files are shown, when there is more than one. */
 export function TaskPicker() {
@@ -169,8 +169,10 @@ function DiffSheet({ task, file, onClose }: { task: TaskRecord; file: ChangedFil
   const project = useWorkspace((s) => s.project)
   const [diff, setDiff] = useState<FileDiff | null>(null)
   const [error, setError] = useState('')
+  const [limit, setLimit] = useState(2000)
 
   useEffect(() => {
+    setLimit(2000)
     setDiff(null)
     setError('')
     if (!file || !project) return
@@ -199,7 +201,7 @@ function DiffSheet({ task, file, onClose }: { task: TaskRecord; file: ChangedFil
         {lines && (
           <div className="overflow-x-auto rounded-lg border border-border bg-code font-mono text-[11.5px] leading-relaxed">
             {lines.length === 0 && <p className="p-3 text-faint">(empty file)</p>}
-            {lines.map((l, i) =>
+            {lines.slice(0, limit).map((l, i) =>
               l === null ? (
                 <div key={i} className="border-y border-border bg-panel-2 px-3 py-0.5 text-[11px] text-faint">
                   ⋯
@@ -214,6 +216,7 @@ function DiffSheet({ task, file, onClose }: { task: TaskRecord; file: ChangedFil
             )}
           </div>
         )}
+        {lines && lines.length > limit && <Button onClick={() => setLimit((n) => n + 2000)}>Show more</Button>}
       </div>
     </Sheet>
   )

@@ -46,6 +46,8 @@ The light look is one click away: use the sun/moon button in the top bar (or **S
   `public/index.html` or `src/index.html`), with its output in a panel and an **Open in browser** button for web
   servers. If it can't tell how, **Ask the AI to work it out** finds the command and remembers it, or
   **I know the command** lets you type it; **Show details → Reset how to run** forgets the saved command.
+  A command the agent would refuse is never started, whoever wrote it. A command the AI worked out is also turned
+  down when it hides what it runs, and a page it names (`open:`) must be an `.html` file in the project.
   When the app crashes or prints an error, **Fix this** stops it and hands the error to the agent to find and fix.
 - **Undo last task** puts the project back exactly as it was before the last task (press again to go further back).
 - **History** lists every task in the project, newest first, with when it ran and how many files it changed.
@@ -112,8 +114,9 @@ approvals, follow the steps and changed files, run your app and undo, while ever
 
 Settings lists the phones connected now, and this window follows what the phone opens, closes or undoes. The app
 listens only on this computer's Tailscale address (port 7420), so only your own devices can reach it; each connection
-needs the pairing code, 10 wrong codes lock a device out for 10 minutes, and **Make a new code** disconnects every
-phone using the old one. The phone can do what this window does, except change phone access, the RulZ LLM Suite
+needs the pairing code, 10 wrong codes lock a device out for 10 minutes (also when tried side by side), web
+pages from other sites are turned away, a device can't hold more than 8 connections waiting for the code, and
+**Make a new code** disconnects every phone using the old one. The phone can do what this window does, except change phone access, the RulZ LLM Suite
 address and API key, open dialogs, the browser or Explorer here.
 
 ## Approvals
@@ -186,7 +189,8 @@ else is open.
   it often lists files that matter (`.env`, a data folder); only a whole ignored folder with more than 1,000 files
   or 100 MB (build output) stays out. Files are kept byte for byte (`.gitattributes` doesn't change line endings),
   and folders with a git repository of their own (`git init web`, `cargo new app`) are kept file by file, leaving
-  their own `.git` alone. Without Git for Windows, files are copied aside before the agent changes them.
+  their own `.git` alone (the agent won't delete such a folder either). Without Git for Windows, files are copied aside before
+  the agent changes them with its file tools; what its commands change can only be undone with Git installed.
   Going back from History resets to that task's commit; with copied files, each later task is restored in turn,
   newest first. The agent is told what was undone at the start of its next task.
 - **Data**: `%APPDATA%\RulZ Coding Agent` holds settings, recent projects, each project's history and restore points.

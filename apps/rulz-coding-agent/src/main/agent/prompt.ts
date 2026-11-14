@@ -91,7 +91,27 @@ export function systemPrompt(info: PromptInfo): string {
  */
 export function backgroundNote(background: { id: string; command: string }[]): string {
   if (!background.length) return ''
-  return `[Note: Still running in the background: ${background.map((b) => `${b.id} (${b.command})`).join('; ')}. Stop these with stop_background_command before starting the same app again.]`
+  return `${STILL_RUNNING}${background.map((b) => `${b.id} (${b.command})`).join('; ')}. ${STILL_RUNNING_END}`
+}
+
+const STILL_RUNNING = '[Note: Still running in the background: '
+const STILL_RUNNING_END = 'Stop these with stop_background_command before starting the same app again.]'
+/** Added once the last background command has ended, so the model doesn't go by an older note. */
+export const NO_BACKGROUND_NOTE = '[Note: No commands are running in the background any more.]'
+
+/** The background note the model saw last in this history ('' for none, or for one saying none run). */
+export function lastBackgroundNoteIn(messages: { content: string }[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const text = messages[i].content
+    if (typeof text !== 'string') continue
+    const still = text.lastIndexOf(STILL_RUNNING)
+    const none = text.lastIndexOf(NO_BACKGROUND_NOTE)
+    if (still < 0 && none < 0) continue
+    if (none > still) return ''
+    const end = text.indexOf(STILL_RUNNING_END, still)
+    return end < 0 ? text.slice(still) : text.slice(still, end + STILL_RUNNING_END.length)
+  }
+  return ''
 }
 
 /** Text of the special task "Run my app" starts when it can't tell how to run the project. */

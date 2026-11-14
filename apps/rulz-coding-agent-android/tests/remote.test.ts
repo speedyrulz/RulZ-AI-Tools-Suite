@@ -172,4 +172,38 @@ describe('RemoteLink', () => {
     expect(FakeSocket.all).toHaveLength(3)
     expect(last().url).toBe('ws://100.88.114.32:7420/rulz')
   })
+  it.each(['timeout', 'bad-hello'])('retries transient denial %s', (reason) => {
+    link.connect(computer, 'Pixel')
+    last().open()
+    last().reply({ t: 'denied', reason })
+    expect(link.state.kind).toBe('connecting')
+    vi.advanceTimersByTime(1000)
+    expect(FakeSocket.all).toHaveLength(2)
+  })
+
+  it('checks a connected socket and reconnects when the heartbeat times out', async () => {
+    link.connect(computer, 'Pixel')
+    last().welcome()
+    await vi.advanceTimersByTimeAsync(40_000)
+    expect(last().sent.at(-1)).toMatchObject({ channel: 'server:status' })
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(FakeSocket.all).toHaveLength(2)
+    expect(link.state.kind).toBe('connecting')
+  })
+
+  it('uses a longer retry delay while idle in the background', () => {
+    link.backgroundIdle = true
+    link.connect(computer, 'Pixel')
+    for (const delay of [1000, 2000, 4000, 8000, 16000, 32000, 64000]) {
+      last().close()
+      vi.advanceTimersByTime(delay)
+    }
+    last().close()
+    const count = FakeSocket.all.length
+    vi.advanceTimersByTime(89_999)
+    expect(FakeSocket.all).toHaveLength(count)
+    vi.advanceTimersByTime(1)
+    expect(FakeSocket.all).toHaveLength(count + 1)
+  })
+
 })

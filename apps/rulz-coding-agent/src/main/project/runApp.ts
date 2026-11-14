@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import type { RunEvent, RunState } from '@shared/types'
 import { childPids } from '../agent/childPids'
 import { cleanOutput, killTree, startShell } from '../agent/commands'
+import { classifyCommand, classifyStartCommand } from '../agent/safety'
 
 /** A plain web page: opened in the browser rather than run. */
 export const OPEN_PREFIX = 'open:'
@@ -57,7 +58,8 @@ export class AppRunner {
     this.emit({ type: 'state', projectPath: this.root, state: this.get() })
   }
 
-  async start(saved: string | null): Promise<RunState> {
+  /** `byOwner`: the owner typed the saved command (the AI didn't write it). */
+  async start(saved: string | null, byOwner = false): Promise<RunState> {
     if (this.child) return this.get()
     const detected = saved ? null : await detectRunCommand(this.root)
     const command = saved ?? detected
@@ -65,6 +67,19 @@ export class AppRunner {
     if (!command) {
       this.set({ command: null, source, running: false, unknown: true })
       return this.get()
+    }
+    // A saved command the AI wrote (its RUN: line, also one saved by an older version) gets the same
+    // check as when it is saved; one the owner typed is only refused like any command would be.
+    // Other risks run: the owner clicked Run. `open:` only ever opens a web page in the project.
+    const verdict = byOwner && !command.startsWith(OPEN_PREFIX) ? classifyCommand(command, this.root) : classifyStartCommand(command, this.root)
+    if (verdict.verdict === 'refuse') {
+      // Shown like a command that isn't known, so the owner can type the right one or ask the AI again.
+      this.set({ command: null, source: 'none', running: false, unknown: true })
+      const shown = command.length > 120 ? `${command.slice(0, 117)}…` : command
+      throw new Error(
+        `I didn't start your app, because its start command (${shown}) isn't safe to run. ${verdict.reason} ` +
+          'Type the right command, or ask the AI to work it out again.'
+      )
     }
     if (command.startsWith(OPEN_PREFIX)) {
       const page = command.slice(OPEN_PREFIX.length)

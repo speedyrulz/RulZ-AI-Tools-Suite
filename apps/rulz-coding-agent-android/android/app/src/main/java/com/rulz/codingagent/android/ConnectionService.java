@@ -36,6 +36,7 @@ public class ConnectionService extends Service {
     private static String title = "Connected";
     private static String text = "";
     private PowerManager.WakeLock wakeLock;
+    private boolean destroyed;
 
     static void createChannels(Context context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
@@ -83,9 +84,10 @@ public class ConnectionService extends Service {
 
     /** Changes what the ongoing notification says. Works while the app is in the background. */
     static synchronized boolean update(Context context, String newTitle, String newText) {
+        // Kept even while the service isn't running: the next start shows it.
         title = newTitle;
         text = newText;
-        if (running == null) return false;
+        if (running == null || running.destroyed) return false;
         try {
             NotificationManagerCompat.from(context).notify(NOTIFICATION_ID, build(running));
         } catch (SecurityException e) {
@@ -96,6 +98,8 @@ public class ConnectionService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+      synchronized (ConnectionService.class) {
+        if (destroyed) return START_NOT_STICKY;
         if (intent != null && intent.hasExtra(EXTRA_TITLE)) title = intent.getStringExtra(EXTRA_TITLE);
         if (intent != null && intent.hasExtra(EXTRA_TEXT)) text = intent.getStringExtra(EXTRA_TEXT);
         createChannels(this);
@@ -108,6 +112,7 @@ public class ConnectionService extends Service {
         running = this;
         applyBusy();
         return START_NOT_STICKY;
+      }
     }
 
     /** While a task runs on the computer, the phone stays awake so its messages arrive right away. */
@@ -116,7 +121,9 @@ public class ConnectionService extends Service {
         if (running != null) running.applyBusy();
     }
 
-    private synchronized void applyBusy() {
+    private void applyBusy() {
+        // Caller holds ConnectionService.class.
+        if (destroyed || running != this) return;
         if (busy) {
             if (wakeLock == null) {
                 PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
@@ -131,9 +138,20 @@ public class ConnectionService extends Service {
 
     @Override
     public void onDestroy() {
-        running = null;
-        if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+        synchronized (ConnectionService.class) {
+            destroyed = true;
+            if (running == this) { running = null; busy = false; }
+            if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+            wakeLock = null;
+        }
         super.onDestroy();
+    }
+
+    @Override
+    public void onTaskRemoved(Intent rootIntent) {
+        setBusy(false);
+        stopSelf();
+        super.onTaskRemoved(rootIntent);
     }
 
     @Override

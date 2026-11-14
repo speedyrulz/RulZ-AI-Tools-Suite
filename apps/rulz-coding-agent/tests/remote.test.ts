@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { WebSocket } from 'ws'
 import { DEFAULT_SETTINGS, REMOTE_PROTOCOL } from '../src/shared/defaults'
 import type { EventChannel } from '../src/shared/ipc'
-import { REMOTE_PATH, RemoteServer, settingsForPhone, settingsPatchFromPhone, type RemoteHost } from '../src/main/remote/server'
+import { originAllowed, REMOTE_PATH, RemoteServer, settingsForPhone, settingsPatchFromPhone, type RemoteHost } from '../src/main/remote/server'
 import { isTailscaleIPv4, tailscaleAddresses } from '../src/main/remote/tailscale'
 
 type Msg = Record<string, unknown>
@@ -138,6 +138,46 @@ describe('RemoteServer', () => {
     }
     const p = await t.pair()
     expect(await p.next()).toEqual({ t: 'denied', reason: 'locked' })
+  })
+
+  it('gives connections opened side by side no extra guesses past the limit', async () => {
+    const t = await start()
+    for (let i = 0; i < 6; i++) await (await t.pair('wrong')).closed
+    // All open before any of them says hello, so each was accepted before the lockout.
+    const opened = await Promise.all(Array.from({ length: 6 }, () => t.connect()))
+    for (const p of opened.slice(0, 4)) {
+      p.send({ t: 'hello', token: 'wrong', device: 'x', protocol: REMOTE_PROTOCOL })
+      await p.closed
+    }
+    const late = opened[4]
+    late.send({ t: 'hello', token: 'right-code', device: 'x', protocol: REMOTE_PROTOCOL })
+    expect(await late.next()).toEqual({ t: 'denied', reason: 'locked' })
+  })
+
+  it('refuses web pages from other sites, but not the phone app or clients without an origin', async () => {
+    await start()
+    const refused = new WebSocket(`ws://127.0.0.1:${server!.port}${REMOTE_PATH}`, { origin: 'https://evil.example' })
+    const status = await new Promise<number>((resolve) => refused.once('unexpected-response', (_req, res) => resolve(res.statusCode ?? 0)).once('error', () => resolve(-1)))
+    expect(status).toBe(403)
+    expect(originAllowed('http://localhost')).toBe(true)
+    expect(originAllowed('https://localhost')).toBe(true)
+    expect(originAllowed('capacitor://localhost')).toBe(true)
+    expect(originAllowed(undefined)).toBe(true)
+    expect(originAllowed('http://localhost.evil.example')).toBe(false)
+    expect(originAllowed('http://100.64.0.1:5173')).toBe(false)
+  })
+
+  it('caps connections that have not paired yet, and drops them when phone access stops', async () => {
+    await start()
+    // Eight from one device (the test's own address); the limit for all devices together is 16.
+    const waiting = await Promise.all(Array.from({ length: 8 }, () => Phone.connect(server!.port!)))
+    phones.push(...waiting)
+    const extra = new WebSocket(`ws://127.0.0.1:${server!.port}${REMOTE_PATH}`)
+    const status = await new Promise<number>((resolve) => extra.once('unexpected-response', (_req, res) => resolve(res.statusCode ?? 0)).once('error', () => resolve(-1)))
+    expect(status).toBe(503)
+    await server!.close()
+    server = null
+    expect(await Promise.all(waiting.map((p) => p.closed))).toHaveLength(8)
   })
 
   it('runs requests and returns results and errors', async () => {

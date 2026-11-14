@@ -1,11 +1,11 @@
 import { Ban, Check, ChevronRight, Circle, FileMinus, FilePen, FilePlus, Hourglass, LoaderCircle, Minus, X } from 'lucide-react'
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { diffLines, withContext } from '@shared/diff'
 import type { ChangedFile, FileDiff, Step } from '@shared/types'
 import { errorMessage, invoke } from '../lib/api'
 import { cn } from '../lib/format'
 import { shownTask, useWorkspace } from '../stores/workspace'
-import { Badge, Dialog, Select } from './ui'
+import { Badge, Button, Dialog, Select } from './ui'
 
 export function SidePanel() {
   const tasks = useWorkspace((s) => s.tasks)
@@ -122,7 +122,8 @@ const STATUS_WORD: Partial<Record<Step['status'], string>> = {
   skipped: 'Skipped'
 }
 
-function StepRow({ step }: { step: Step }) {
+/** Kept as is while other steps change (command output arrives for the running one only). */
+const StepRow = memo(function StepRow({ step }: { step: Step }) {
   const [open, setOpen] = useState(false)
   const outRef = useRef<HTMLPreElement>(null)
   useEffect(() => {
@@ -156,18 +157,31 @@ function StepRow({ step }: { step: Step }) {
       )}
     </div>
   )
-}
+})
+
+/** A big new or deleted file is shown in part first: every line is its own row on screen. */
+const MAX_SHOWN_LINES = 2000
 
 function DiffDialog({ taskId, file, onClose }: { taskId: string; file: ChangedFile | null; onClose: () => void }) {
   const project = useWorkspace((s) => s.project)
   const [diff, setDiff] = useState<FileDiff | null>(null)
   const [error, setError] = useState('')
+  const [limit, setLimit] = useState(MAX_SHOWN_LINES)
 
   useEffect(() => {
     setDiff(null)
     setError('')
+    setLimit(MAX_SHOWN_LINES)
     if (!file || !project) return
-    invoke('files:diff', project.path, taskId, file.path).then(setDiff, (e) => setError(errorMessage(e)))
+    // Clicking another file before this one's diff arrives must not show this one under its name.
+    let current = true
+    invoke('files:diff', project.path, taskId, file.path).then(
+      (d) => current && setDiff(d),
+      (e) => current && setError(errorMessage(e))
+    )
+    return () => {
+      current = false
+    }
   }, [file, project, taskId])
 
   const lines = useMemo(() => {
@@ -192,7 +206,7 @@ function DiffDialog({ taskId, file, onClose }: { taskId: string; file: ChangedFi
         {lines && (
           <div className="overflow-x-auto rounded-lg border border-border bg-code font-mono text-[12px] leading-relaxed">
             {lines.length === 0 && <p className="p-3 text-faint">(empty file)</p>}
-            {lines.map((l, i) =>
+            {lines.slice(0, limit).map((l, i) =>
               l === null ? (
                 <div key={i} className="border-y border-border bg-panel-2 px-3 py-0.5 text-[11px] text-faint">
                   ⋯
@@ -205,6 +219,14 @@ function DiffDialog({ taskId, file, onClose }: { taskId: string; file: ChangedFi
                 </div>
               )
             )}
+          </div>
+        )}
+        {lines && lines.length > limit && (
+          <div className="mt-2 flex items-center gap-3 text-[13px] text-muted">
+            Showing {limit.toLocaleString()} of {lines.length.toLocaleString()} lines.
+            <Button size="sm" onClick={() => setLimit(lines.length)}>
+              Show all
+            </Button>
           </div>
         )}
       </div>

@@ -1,5 +1,6 @@
+import type { TimelineItem } from '@shared/types'
 import { ArrowLeft, ArrowUp, Binary, Brain, Check, ChevronDown, ChevronRight, EllipsisVertical, SlidersHorizontal, History, LoaderCircle, NotebookPen, Package, Play, Settings, Square, Undo2 } from 'lucide-react'
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import { memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { splitThink, thinkingOpen } from '@shared/think'
 import { modelLabel } from '../components/common'
 import { LogoMark } from '../components/Logo'
@@ -328,47 +329,7 @@ function Conversation() {
       }}
     >
       <div className="space-y-4 px-4 py-4">
-        {timeline.map((item) => {
-          if (item.kind === 'user') {
-            return (
-              <div key={item.id} className="flex justify-end">
-                <div className="max-w-[88%] rounded-2xl rounded-br-md bg-accent-soft px-3.5 py-2.5 text-[15px] whitespace-pre-wrap">{item.text}</div>
-              </div>
-            )
-          }
-          if (item.kind === 'assistant') {
-            const inline = splitThink(item.text)
-            const reasoning = [item.reasoning?.trim(), inline.reasoning].filter(Boolean).join('\n\n')
-            if (!reasoning && !inline.answer) return null
-            const live = running && status.phase === 'thinking' && !inline.answer && item.id === last.id
-            return (
-              <div key={item.id} className="flex gap-2.5">
-                <span className="mt-1 w-5 shrink-0">
-                  <LogoMark className="w-5" />
-                </span>
-                <div className="min-w-0 flex-1 space-y-2">
-                  {reasoning && <ThinkingBox text={reasoning} live={live} />}
-                  {inline.answer && <Markdown text={inline.answer} className="text-[15px]" />}
-                </div>
-              </div>
-            )
-          }
-          return (
-            <div
-              key={item.id}
-              className={cn(
-                'rounded-lg border px-3 py-2 text-center text-[13px]',
-                item.tone === 'error' && 'border-danger/30 bg-danger/10 text-danger',
-                item.tone === 'warn' && 'border-warn/30 bg-warn/10 text-warn',
-                item.tone === 'ok' && 'border-ok/30 bg-ok/10 text-ok',
-                item.tone === 'info' && 'border-border bg-panel-2 text-muted'
-              )}
-            >
-              <Markdown text={item.text} />
-              {item.reveal && <p className="mt-1 font-mono text-[11px] break-all text-faint">{item.reveal}</p>}
-            </div>
-          )
-        })}
+        {timeline.map((item) => <ChatItem key={item.id} item={item} streaming={running && item.id === last.id} thinking={running && status.phase === 'thinking' && item.id === last.id} />)}
         {running && status.phase !== 'idle' && !thoughtsShown && (
           <div className="flex items-center gap-2.5 pl-7 text-[14px] text-muted">
             {status.phase === 'waiting' ? <span className="size-2 rounded-full bg-warn" /> : <LoaderCircle size={16} className="animate-spin text-accent" />}
@@ -379,6 +340,47 @@ function Conversation() {
     </div>
   )
 }
+
+const ChatItem = memo(function ChatItem({ item, streaming, thinking }: { item: TimelineItem; streaming: boolean; thinking: boolean }) {
+  if (item.kind === 'user') {
+    return (
+      <div className="flex justify-end">
+        <div className="max-w-[88%] rounded-2xl rounded-br-md bg-accent-soft px-3.5 py-2.5 text-[15px] whitespace-pre-wrap">{item.text}</div>
+      </div>
+    )
+  }
+  if (item.kind === 'assistant') {
+    const inline = splitThink(item.text)
+    const reasoning = [item.reasoning?.trim(), inline.reasoning].filter(Boolean).join('\n\n')
+    if (!reasoning && !inline.answer) return null
+    const live = thinking && !inline.answer
+    return (
+      <div className="flex gap-2.5">
+        <span className="mt-1 w-5 shrink-0">
+          <LogoMark className="w-5" />
+        </span>
+        <div className="min-w-0 flex-1 space-y-2">
+          {reasoning && <ThinkingBox text={reasoning} live={live} />}
+          {inline.answer && <Markdown text={inline.answer} className="text-[15px]" streaming={streaming} />}
+        </div>
+      </div>
+    )
+  }
+  return (
+    <div
+      className={cn(
+        'rounded-lg border px-3 py-2 text-center text-[13px]',
+        item.tone === 'error' && 'border-danger/30 bg-danger/10 text-danger',
+        item.tone === 'warn' && 'border-warn/30 bg-warn/10 text-warn',
+        item.tone === 'ok' && 'border-ok/30 bg-ok/10 text-ok',
+        item.tone === 'info' && 'border-border bg-panel-2 text-muted'
+      )}
+    >
+      <Markdown text={item.text} />
+      {item.reveal && <p className="mt-1 font-mono text-[11px] break-all text-faint">{item.reveal}</p>}
+    </div>
+  )
+})
 
 /** The model's thinking above a reply: open while it streams, folded away once the answer starts (unless the computer's setting keeps it open). */
 function ThinkingBox({ text, live }: { text: string; live: boolean }) {
@@ -483,16 +485,16 @@ function PromptCard() {
         <Textarea className="mt-3" rows={2} autoFocus placeholder="Optional: tell me what to try instead" value={text} onChange={(e) => setText(e.target.value)} />
       )}
       <div className="mt-3 flex flex-wrap gap-2">
-        <Button variant="primary" onClick={() => answer({ kind: 'stuck', decision: 'continue' })}>
+        <Button variant="primary" onClick={() => answer(prompt.id, { kind: 'stuck', decision: 'continue' })}>
           Keep going
         </Button>
         {!limit &&
           (changing ? (
-            <Button onClick={() => answer({ kind: 'stuck', decision: 'change', text })}>Try that</Button>
+            <Button onClick={() => answer(prompt.id, { kind: 'stuck', decision: 'change', text })}>Try that</Button>
           ) : (
             <Button onClick={() => setChanging(true)}>Try another way</Button>
           ))}
-        <Button variant="ghost" onClick={() => answer({ kind: 'stuck', decision: 'stop' })}>
+        <Button variant="ghost" onClick={() => answer(prompt.id, { kind: 'stuck', decision: 'stop' })}>
           Stop
         </Button>
       </div>
@@ -530,8 +532,7 @@ function Composer() {
   const submit = async (): Promise<void> => {
     if (!canSend) return
     const sent = text
-    setText('')
-    if (!(await send(sent))) setText(sent)
+    if (await send(sent, answering ? prompt.id : undefined)) setText((current) => current === sent ? '' : current)
   }
 
   return (

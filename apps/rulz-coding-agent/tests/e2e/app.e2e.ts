@@ -158,7 +158,7 @@ describe('RulZ Coding Agent', () => {
     await page.getByRole('dialog').getByRole('button', { name: 'Undo' }).click()
     await page.getByText(/^Undone: "Do something slow"/).waitFor()
 
-    await page.getByRole('button', { name: 'History' }).click()
+    await page.getByRole('button', { name: 'History', exact: true }).click()
     const rows = page.getByTestId('history-row')
     await expect.poll(() => rows.allInnerTexts()).toEqual([
       expect.stringMatching(/^Do something slow[\s\S]*Undone/),
@@ -176,7 +176,7 @@ describe('RulZ Coding Agent', () => {
     expect(existsSync(join(projectsDir, 'E2E App', 'app.js'))).toBe(false)
     expect(existsSync(join(projectsDir, 'E2E App', 'shop.html'))).toBe(false)
     expect(existsSync(join(projectsDir, 'E2E App', 'package.json'))).toBe(false)
-    await page.getByRole('button', { name: 'History' }).click()
+    await page.getByRole('button', { name: 'History', exact: true }).click()
     await expect.poll(() => rows.getByRole('button', { name: 'Go back to before this' }).count()).toBe(0)
     await page.screenshot({ path: join(shots, '5-undone.png') })
     await page.keyboard.press('Escape')

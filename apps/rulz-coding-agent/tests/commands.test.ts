@@ -1,9 +1,10 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, type ChildProcess } from 'node:child_process'
+import { EventEmitter } from 'node:events'
 import { afterAll, describe, expect, it } from 'vitest'
-import { BackgroundCommands, cleanOutput, commandEnv, commandHints, commandReport, headTail, runCommand } from '../src/main/agent/commands'
+import { BackgroundCommands, cleanOutput, commandEnv, commandHints, commandReport, headTail, runCommand, STOP_GIVE_UP_MS } from '../src/main/agent/commands'
 
 const cwd = mkdtempSync(join(tmpdir(), 'rulz-agent-cmd-'))
 // Killed processes can hold the folder for a moment.
@@ -92,6 +93,16 @@ describe.runIf(process.platform === 'win32')('running commands', { timeout: 30_0
     await new Promise((res) => setTimeout(res, 500))
     expect(processWithMarker('127.0.0.79')).toBe(false)
   }, 40_000)
+
+  it("doesn't wait for good for a command that can't be stopped", async () => {
+    // A process that never exits or closes, and that killing can't reach (no PID to kill).
+    const stuck = (): ChildProcess => Object.assign(new EventEmitter(), { pid: undefined, exitCode: null, signalCode: null, stdout: null, stderr: null }) as unknown as ChildProcess
+    const started = Date.now()
+    const r = await runCommand('stuck', { cwd, timeoutMs: 100, start: stuck })
+    expect(Date.now() - started).toBeLessThan(STOP_GIVE_UP_MS + 3000)
+    expect(r.timedOut).toBe(true)
+    expect(r.output).toMatch(/could not be stopped/)
+  }, 20_000)
 
   it('runs, checks and stops background commands', async () => {
     const bg = new BackgroundCommands()
