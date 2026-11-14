@@ -10,6 +10,7 @@ Everything in here is blocking I/O: call it from ``nicegui.run.io_bound`` or a b
 from __future__ import annotations
 
 import base64
+import codecs
 import fnmatch
 import json
 import os
@@ -18,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -327,25 +329,41 @@ class Remote:
 
     def stream(self, cmd: str, **args: Any) -> Iterator[dict]:
         """Run a call that prints a JSON line now and then (``watch``) and yield each line as it arrives."""
-        proc = subprocess.Popen(ssh_command(self.conn) + [REMOTE_PYTHON], stdin=subprocess.PIPE,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=_NO_WINDOW)
-        try:
-            assert proc.stdin and proc.stdout
-            proc.stdin.write(agent_program({'cmd': cmd, **args}))
-            proc.stdin.close()
-            for line in proc.stdout:
-                line = line.strip()
-                if line.startswith(b'{'):
-                    try:
-                        yield json.loads(line)
-                    except ValueError:
-                        continue
-            proc.wait(timeout=30)
-            if proc.returncode == SSH_FAILED:
-                raise VastError(_ssh_error(proc.stderr.read() if proc.stderr else b'', self.conn))
-        finally:
-            if proc.poll() is None:
-                proc.kill()
+        # stderr goes to a temp file, not a pipe nobody reads while the call runs (a full pipe would stall ssh).
+        with tempfile.TemporaryFile() as err:
+            proc = subprocess.Popen(ssh_command(self.conn) + [REMOTE_PYTHON], stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, stderr=err, creationflags=_NO_WINDOW)
+            got = False
+            try:
+                assert proc.stdin and proc.stdout
+                proc.stdin.write(agent_program({'cmd': cmd, **args}))
+                proc.stdin.close()
+                for line in proc.stdout:
+                    line = line.strip()
+                    if line.startswith(b'{'):
+                        try:
+                            data = json.loads(line)
+                        except ValueError:
+                            continue
+                        got = True
+                        yield data
+                try:
+                    proc.wait(timeout=30)
+                except subprocess.TimeoutExpired as e:
+                    raise VastError(f'{self.conn.title} stopped answering.') from e
+                if proc.returncode == SSH_FAILED or (proc.returncode and not got):
+                    # Nothing understandable came back (ssh failed, or the instance could not run the helper):
+                    # a failure, so the caller backs off instead of reconnecting at once, forever.
+                    err.seek(0)
+                    text = err.read()
+                    if proc.returncode == SSH_FAILED:
+                        raise VastError(_ssh_error(text, self.conn))
+                    raise VastError('The instance could not run the helper: '
+                                    + (text.decode('utf-8', 'replace').strip()[-400:] or f'exit {proc.returncode}'))
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
 
     def test(self) -> dict:
         return self.call('info', timeout=60)
@@ -428,7 +446,12 @@ def remote() -> Remote:
 # --------------------------------------------------------------------------------------------------
 
 SHELL_MARK = '__RULZ_SHELL_DONE__'
-_ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>]')
+# CSI (with private parameters like "\x1b[>4;1m"), OSC titles, charset picks, and the two-character escapes
+# (ESC 7 / ESC 8 save and restore the cursor around apt's progress line, ESC M, ESC =, ...).
+_ANSI_RE = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]'
+                      r'|\x1b[78=>DEHMNOZc]')
+# What can still grow into one of those when more output arrives (held back until it does).
+_ANSI_START_RE = re.compile(r'\x1b(?:\[[0-?]*[ -/]*|\][^\x07\x1b]*\x1b?|[()])?')
 _MARK_RE = re.compile(rf'^{SHELL_MARK} (\d+) (.*)$')
 
 
@@ -452,6 +475,32 @@ def shell_ssh_command(conn: Conn, command: str, cwd: str) -> list[str]:
 
 def clean_terminal_text(text: str) -> str:
     return _ANSI_RE.sub('', text).replace('\x07', '').replace('\x08', '')
+
+
+def split_unfinished_escape(text: str) -> tuple[str, str]:
+    """Cut off an escape sequence that a read split in two (``\\x1b[3`` now, ``2m`` with the next read), so it is
+    cleaned as a whole next time instead of leaking ``2m`` into the output."""
+    start = text.rfind('\x1b')
+    if start < 0 or len(text) - start > 64 or not _ANSI_START_RE.fullmatch(text, start):
+        return text, ''  # no escape at the end, or a finished one (or junk): nothing to wait for
+    return text[:start], text[start:]
+
+
+class TerminalDecoder:
+    """Bytes from the terminal to clean text, chunk by chunk: a UTF-8 character or an escape sequence cut in two by
+    a read is held back until the rest arrives."""
+
+    def __init__(self) -> None:
+        self._utf8 = codecs.getincrementaldecoder('utf-8')(errors='replace')
+        self._held = ''
+
+    def feed(self, chunk: bytes) -> str:
+        text, self._held = split_unfinished_escape(self._held + self._utf8.decode(chunk))
+        return clean_terminal_text(text)
+
+    def flush(self) -> str:
+        text, self._held = self._held + self._utf8.decode(b'', final=True), ''
+        return clean_terminal_text(text)
 
 
 def split_output(buffer: str) -> tuple[list[tuple[str, str]], str]:
@@ -492,11 +541,10 @@ class ShellRun:
         assert self.proc.stdout
         rest = ''
         blank = 0  # empty lines held back: the last one comes from the end marker's own newline
+        decoder = TerminalDecoder()
         while True:
             chunk = self.proc.stdout.read1(65536) if hasattr(self.proc.stdout, 'read1') else self.proc.stdout.read(1)
-            if not chunk:
-                break
-            pieces, rest = split_output(rest + clean_terminal_text(chunk.decode('utf-8', 'replace')))
+            pieces, rest = split_output(rest + (decoder.feed(chunk) if chunk else decoder.flush()))
             for kind, text in pieces:
                 if kind == 'line' and (m := _MARK_RE.match(text.strip())):
                     self.code, self.cwd = int(m.group(1)), m.group(2) or self.cwd
@@ -509,6 +557,8 @@ class ShellRun:
                     yield 'line', ''
                 blank = 0
                 yield kind, text
+            if not chunk:
+                break
         for _ in range(blank):
             yield 'line', ''
         if rest.strip() and not _MARK_RE.match(rest.strip()):
@@ -633,11 +683,7 @@ def source_from_text(text: str) -> Source:
     kind, repo_id, path = hub.parse_location(text)
     if kind is None:
         kind = hub.detect_kind(repo_id)
-    revision = None
-    m = re.search(r'/(?:tree|blob|resolve)/([^/]+)/', text + '/')
-    if m and kind != 'bucket':
-        revision = urllib.request.unquote(m.group(1))
-        revision = None if revision == 'main' else revision
+    revision = hub.parse_revision(text, kind)
     if not path:
         return Source(kind, repo_id, revision)
     is_dir = '/tree/' in text or text.rstrip().endswith('/')
@@ -791,9 +837,9 @@ def follow(job_id: str, job: Job | None = None, conn: Conn | None = None) -> dic
     """Follow a transfer on the instance until it ends, reporting into ``job``. Reconnects when the connection drops;
     the transfer itself never depends on this."""
     rem = Remote(conn) if conn else remote()
-    last: dict = {}
     failures = 0
     while True:
+        last: dict = {}
         try:
             for st in rem.stream('watch', id=job_id, interval=2, timeout=900):
                 last = st
@@ -802,6 +848,8 @@ def follow(job_id: str, job: Job | None = None, conn: Conn | None = None) -> dic
                     report(job, st)
                 if st.get('state') in {'done', 'error', 'cancelled', 'stopped'}:
                     return st
+            if not last:
+                raise VastError('The instance sent no status.')
         except VastError:
             failures += 1
             if failures > 8:
@@ -811,9 +859,9 @@ def follow(job_id: str, job: Job | None = None, conn: Conn | None = None) -> dic
             time.sleep(min(60, 5 * failures))
             if rem.conn.instance_id and (fresh := reconnect(rem.conn)):
                 rem = Remote(fresh)
-        else:
-            if last.get('error') and not last.get('state'):
-                raise VastError(last['error'])
+            continue
+        if last.get('error') and not last.get('state'):
+            raise VastError(last['error'])  # the helper itself refused (bad job id...): retrying will not help
 
 
 def report(job: Job, st: dict) -> None:

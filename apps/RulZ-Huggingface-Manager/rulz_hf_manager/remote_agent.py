@@ -17,6 +17,7 @@ instance's own Python environments).
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import shutil
@@ -73,10 +74,19 @@ def read_json(path: str, default=None):
 
 
 def write_json(path: str, data) -> None:
-    tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(data, f)
-    os.replace(tmp, path)
+    # A temp name of its own per process and thread: the runner, start/retry and cancel can all write status.json
+    # at once, and a shared temp file would let one writer move the other's half-written file into place.
+    tmp = '%s.%d.%d.tmp' % (path, os.getpid(), threading.get_ident())
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def pid_alive(pid) -> bool:
@@ -216,7 +226,7 @@ def job_status(job_id: str) -> dict:
     st.setdefault('dest', job.get('dest'))
     st.setdefault('mode', job.get('mode'))
     st.setdefault('created', job.get('created'))
-    if st.get('state') not in FINAL and not pid_alive(st.get('pid')):
+    if st.get('state') not in FINAL and not pid_alive(runner_pid(folder, st)):
         started = st.get('spawned') or 0
         if time.time() - started > 20:  # give a fresh process time to write its first status
             st['state'] = 'stopped'
@@ -244,7 +254,14 @@ def spawn(folder: str, token: str, source: str) -> int:
     proc = subprocess.Popen([sys.executable, os.path.join(folder, 'runner.py'), '--run', folder],
                             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, env=env,
                             cwd=folder, start_new_session=True, close_fds=True)
+    # In a file of its own, which the runner never writes: status.json belongs to the runner from here on, but a
+    # Cancel that comes before the runner's first status still has to find the process.
+    write_json(os.path.join(folder, 'runner.pid'), proc.pid)
     return proc.pid
+
+
+def runner_pid(folder: str, st: dict):
+    return st.get('pid') or read_json(os.path.join(folder, 'runner.pid'), None)
 
 
 def cmd_start(p: dict) -> dict:
@@ -261,11 +278,10 @@ def cmd_start(p: dict) -> dict:
                {'id': job_id, 'state': 'queued', 'title': job.get('title'), 'dest': job['dest'], 'mode': job.get('mode'),
                 'created': job['created'], 'spawned': time.time(), 'files_total': len(job.get('items', [])),
                 'files_done': 0, 'bytes_total': total, 'bytes_done': 0})
-    pid = spawn(folder, p.get('token') or '', base64.b64decode(p['source']).decode('utf-8'))
-    st = read_json(os.path.join(folder, 'status.json'), {}) or {}
-    if st.get('state') == 'queued':  # the runner had no time to write its own status yet
-        st['pid'] = pid
-        write_json(os.path.join(folder, 'status.json'), st)
+    # From here on only the runner writes status.json (its first write, with its pid, comes as it starts): a write
+    # from this side after the spawn could put an older state back over the runner's newer one.
+    # Until then job_status counts a fresh "queued" job without a pid as starting (20 s grace).
+    spawn(folder, p.get('token') or '', base64.b64decode(p['source']).decode('utf-8'))
     return job_status(job_id)
 
 
@@ -274,10 +290,9 @@ def cmd_retry(p: dict) -> dict:
     st = job_status(p['id'])
     if st.get('state') not in FINAL:
         return st
-    st.update({'state': 'queued', 'error': '', 'failed': [], 'spawned': time.time(), 'finished': None})
+    st.update({'state': 'queued', 'error': '', 'failed': [], 'spawned': time.time(), 'finished': None, 'pid': None})
     write_json(os.path.join(folder, 'status.json'), st)
-    st['pid'] = spawn(folder, p.get('token') or '', base64.b64decode(p['source']).decode('utf-8'))
-    write_json(os.path.join(folder, 'status.json'), st)
+    spawn(folder, p.get('token') or '', base64.b64decode(p['source']).decode('utf-8'))  # the runner writes from now on
     return job_status(p['id'])
 
 
@@ -286,7 +301,7 @@ def cmd_cancel(p: dict) -> dict:
     st = job_status(p['id'])
     if st.get('state') in FINAL:
         return st
-    pid = st.get('pid')
+    pid = runner_pid(folder, st)
     if pid and pid_alive(pid):
         try:
             os.killpg(int(pid), signal.SIGTERM)
@@ -299,11 +314,12 @@ def cmd_cancel(p: dict) -> dict:
             if not pid_alive(pid):
                 break
             time.sleep(0.2)
-        else:
-            try:
-                os.killpg(int(pid), signal.SIGKILL)
-            except OSError:
-                pass
+        # The whole group, whether or not the runner itself went quietly: a child it started (pip installing
+        # huggingface_hub, say) must not outlive a cancelled transfer.
+        try:
+            os.killpg(int(pid), signal.SIGKILL)
+        except OSError:
+            pass
     st = read_json(os.path.join(folder, 'status.json'), {}) or st
     if st.get('state') not in FINAL:
         st.update({'state': 'cancelled', 'finished': time.time()})
@@ -344,6 +360,8 @@ class Runner:
         self.job = read_json(os.path.join(folder, 'job.json'), {})
         self.status_path = os.path.join(folder, 'status.json')
         old = read_json(self.status_path, {}) or {}
+        if old.get('state') == 'cancelled':
+            raise SystemExit(0)  # cancelled before this process got going: leave it cancelled, start nothing
         self.items = self.job.get('items', [])
         self.mode = self.job.get('mode') or 'keep'
         self.dest = self.job['dest']
@@ -362,6 +380,7 @@ class Runner:
                    'message': '', 'error': '', 'failed': [], 'speed': 0}
         self.job['staging'] = self.staging
         write_json(os.path.join(folder, 'job.json'), self.job)
+        write_json(self.status_path, self.st)  # "starting", with this process's pid: the status is ours now
 
     # ---- status
     def cache_dir(self) -> str:
@@ -415,33 +434,60 @@ class Runner:
         pylib = os.path.join(STATE, 'pylib-py%d%d' % sys.version_info[:2])
         marker = os.path.join(pylib, '.rulz-ok')
         if not os.path.exists(marker):
-            self.write(state='installing', message='Installing huggingface_hub on the instance (once)...')
-            cmd = [sys.executable, '-m', 'pip', 'install', '--quiet', '--disable-pip-version-check',
-                   '--no-warn-script-location', '--upgrade', '--target', pylib, HUB_REQUIREMENT]
-            done = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            if done.returncode != 0:
-                ensure = subprocess.run([sys.executable, '-m', 'ensurepip', '--upgrade'],
-                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                done = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) \
-                    if ensure.returncode == 0 else done
-            if done.returncode != 0:
-                tail = done.stdout.decode(errors='replace').strip().splitlines()[-6:]
-                raise RuntimeError('Could not install huggingface_hub on the instance:\n' + '\n'.join(tail))
-            open(marker, 'w').close()
+            os.makedirs(STATE, exist_ok=True)
+            # Two transfers started close together on a fresh instance must not run pip into the same folder at
+            # once: the second waits here, then finds the marker the first one left.
+            with open(pylib + '.lock', 'w') as lock:
+                try:
+                    import fcntl  # noqa: PLC0415  (POSIX only; the instance is Linux)
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                except (ImportError, OSError):
+                    pass
+                if not os.path.exists(marker):
+                    self.install_hub(pylib, marker)
         sys.path.insert(0, pylib)
         import huggingface_hub  # noqa: PLC0415
         return huggingface_hub
 
+    def install_hub(self, pylib: str, marker: str) -> None:
+        self.write(state='installing', message='Installing huggingface_hub on the instance (once)...')
+        cmd = [sys.executable, '-m', 'pip', 'install', '--quiet', '--disable-pip-version-check',
+               '--no-warn-script-location', '--upgrade', '--target', pylib, HUB_REQUIREMENT]
+        done = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if done.returncode != 0:
+            ensure = subprocess.run([sys.executable, '-m', 'ensurepip', '--upgrade'],
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            done = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) \
+                if ensure.returncode == 0 else done
+        if done.returncode != 0:
+            tail = done.stdout.decode(errors='replace').strip().splitlines()[-6:]
+            raise RuntimeError('Could not install huggingface_hub on the instance:\n' + '\n'.join(tail))
+        open(marker, 'w').close()
+
     # ---- one file
-    def target(self, item: dict) -> str:
-        rel = item['dest'].strip('/')
+    @staticmethod
+    def parts(path: str, what: str) -> list:
+        rel = (path or '').strip('/')
         if not rel or any(part in ('', '.', '..') for part in rel.split('/')):
-            raise ValueError('bad destination path %r' % item['dest'])
-        return os.path.join(self.dest, *rel.split('/'))
+            raise ValueError('bad %s path %r' % (what, path))
+        return rel.split('/')
+
+    def target(self, item: dict) -> str:
+        return os.path.join(self.dest, *self.parts(item['dest'], 'destination'))
+
+    def staging_for(self, item: dict) -> str:
+        """Each repo (and revision) gets a staging folder of its own: two repos that both have a config.json are
+        downloaded side by side by different workers and must never share, or swap, one temporary file."""
+        name = '%s--%s' % (item['kind'], item['repo'].replace('/', '--'))
+        if item.get('rev'):
+            # Readable, plus a hash of the exact revision: "a/b" and "a_b" must not share a folder.
+            readable = ''.join(c if c.isalnum() or c in '-_.' else '_' for c in item['rev'])[:40]
+            name += '@%s-%s' % (readable, hashlib.sha1(item['rev'].encode('utf-8')).hexdigest()[:8])
+        return os.path.join(self.staging, name)
 
     def fetch(self, hf, api, item: dict) -> None:
         kind, repo, path = item['kind'], item['repo'], item['path']
-        size = int(item.get('size') or 0)
+        size = item.get('size')
         if self.mode == 'cache':
             if kind == 'bucket':
                 raise ValueError('buckets have no Hugging Face cache layout: pick a folder instead')
@@ -449,17 +495,19 @@ class Runner:
                                cache_dir=self.cache_dir())
             return
         final = self.target(item)
-        if os.path.isfile(final) and (not size or os.path.getsize(final) == size):
+        # Only the same size counts as "already there": an empty file in the repo must not keep an old big file.
+        if size is not None and os.path.isfile(final) and os.path.getsize(final) == int(size):
             with self.lock:
                 self.skipped += 1
             return
-        staged = os.path.join(self.staging, *path.split('/'))
+        staging = self.staging_for(item)
+        staged = os.path.join(staging, *self.parts(path, 'repo file'))
         if kind == 'bucket':
             os.makedirs(os.path.dirname(staged), exist_ok=True)
             api.download_bucket_files(repo, files=[(path, staged)], raise_on_missing_files=True)
         else:
             staged = hf.hf_hub_download(repo, path, repo_type=kind, revision=item.get('rev') or None,
-                                        local_dir=self.staging)
+                                        local_dir=staging)
         os.makedirs(os.path.dirname(final), exist_ok=True)
         try:
             os.replace(staged, final)

@@ -19,6 +19,8 @@ _WIN_HIDDEN = 0x2 | 0x4  # FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM
 
 
 def _scan(path: Path, folders_only: bool, show_hidden: bool) -> list[dict]:
+    if not path.is_dir():  # here, in the worker thread: a slow or gone network drive must not stall the page
+        raise NotADirectoryError(f'Not a folder: {path}')
     rows: list[dict] = []
     with os.scandir(path) as it:
         for entry in it:
@@ -51,7 +53,8 @@ async def pick_local(mode: str = 'any', title: str | None = None, start: str | P
     """
     folders_only = mode == 'folder'
     title = title or ('Choose a folder' if folders_only else 'Choose files and folders')
-    initial = Path(start) if start and Path(start).exists() else (_last_local_dir or Path.home())
+    places = await run.io_bound(quick_locations)
+    initial = Path(start) if start and await run.io_bound(Path(start).exists) else (_last_local_dir or Path.home())
     state = {'cwd': initial, 'hidden': False}
 
     with ui.dialog().props('maximized-mobile') as dialog, \
@@ -66,7 +69,7 @@ async def pick_local(mode: str = 'any', title: str | None = None, start: str | P
         with ui.row().classes('w-full flex-1 no-wrap gap-0 overflow-hidden'):
             with ui.column().classes('w-48 p-2 gap-0 overflow-auto gt-xs'):
                 ui.label('Places').classes('text-xs uppercase rulz-muted px-2 pt-1')
-                for label, icon, p in quick_locations():
+                for label, icon, p in places:
                     ui.button(label, icon=icon, on_click=lambda p=p: go(p)) \
                         .props('flat no-caps align=left dense').classes('w-full')
             ui.separator().props('vertical')
@@ -140,8 +143,6 @@ async def pick_local(mode: str = 'any', title: str | None = None, start: str | P
         global _last_local_dir
         try:
             path = path.expanduser()
-            if not path.is_dir():
-                raise NotADirectoryError(f'Not a folder: {path}')
             rows = await run.io_bound(_scan, path, folders_only, state['hidden'])
         except Exception as e:  # noqa: BLE001
             notify_error(e if isinstance(e, str) else str(e))

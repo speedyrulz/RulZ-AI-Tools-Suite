@@ -10,6 +10,7 @@ import sys
 import urllib.request
 
 from . import APP_NAME, __version__, config
+from .hostcheck import LocalHostOnly, extra_hosts_from_env, is_loopback_bind
 from .platform_utils import is_wsl, open_url, platform_label
 
 PING_PATH = '/api/rulz-ping'
@@ -69,13 +70,18 @@ def main(argv: list[str] | None = None) -> None:
 
     theme.setup()
 
+    # Only this computer's own names may reach a server that listens on this computer only (DNS rebinding:
+    # see hostcheck.py). Listening on the network is the user's explicit choice and is left open.
+    if is_loopback_bind(host) and (extra := extra_hosts_from_env()) is not None:
+        app.add_middleware(LocalHostOnly, extra=extra)
+
     @app.get(PING_PATH)
     def ping() -> dict:
         return {'app': APP_NAME, 'version': __version__}
 
     print(f'\n  {APP_NAME} {__version__} on {platform_label()}')
     print(f'  Open {url} in your browser  (Ctrl+C to stop)\n')
-    if host not in {'127.0.0.1', 'localhost'}:
+    if not is_loopback_bind(host):
         print('  WARNING: listening on the network. Anyone who can reach this port can use your HF token.\n')
 
     # NiceGUI's own browser opening does not work from inside WSL; open the Windows browser ourselves.

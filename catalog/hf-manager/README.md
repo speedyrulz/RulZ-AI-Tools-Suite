@@ -63,6 +63,8 @@ Starting the app a second time just opens the already-running instance.
    If you already ran `hf auth login`, the app uses that login automatically (or click **Import from "hf auth login" / HF_TOKEN** to save it).
    Note: recent `hf` versions log in through the browser with a *temporary* OAuth token that expires after a
    few weeks; Settings shows the expiry date. For a setup that keeps working, save a regular access token.
+   Once saved, the token is never sent back to the browser: the box shows only its first and last characters
+   (`hf_...abcd`). Paste a new token to replace it, or click **Remove saved token**. The vast.ai key works the same way.
 3. Pick a **download folder** (default: `Downloads/HuggingFace`; under WSL this is your Windows Downloads folder).
 
 The token is stored only on your computer:
@@ -103,7 +105,9 @@ Windows and WSL keep separate settings, so add the token once in each.
 - Repos: switch **branches**, create branches, see the **commit history**.
 - Buckets: **Sync** a local folder up to the bucket, or a bucket folder down to your computer, rsync-style:
   preview exactly what will be uploaded/downloaded/deleted, then run it.
-- Repos: **Push a whole folder** in one commit, optionally mirroring (deleting remote files that are gone locally).
+- Repos: **Push a whole folder** (a big folder goes in several commits; a push that broke off continues where it
+  stopped), optionally mirroring: remote files that are gone locally are deleted in a last commit, once every upload
+  has gone through.
 - Copy the `hf://` path of any folder for use with the `hf` CLI or Python.
 
 **vast.ai: send models straight to your instance**
@@ -142,7 +146,12 @@ want; switch any time with the sun / moon button at the top right or under Setti
 
 ## Notes
 
-- The app listens on `127.0.0.1` only by default, so only your own computer can reach it.
+- The app listens on `127.0.0.1` only by default, so only your own computer can reach it. It also answers only to
+  this computer's own names (`localhost`, `127.0.0.1`, `[::1]`), so another website open in your browser cannot reach
+  it through a name of its own pointed at your computer ("DNS rebinding"). To open it under another name (a hosts-file
+  alias, a reverse proxy), set `RULZ_HF_ALLOWED_HOSTS=name1,name2` before starting it (`*` turns the check off).
+- Temporary files (zips for browser downloads, sync plans) that an earlier run left behind, for example because the
+  console window was closed, are removed the next time the app starts.
 - Files you pick with "from this computer" are read directly from disk, so multi-GB uploads don't pass through
   the browser. Under WSL, Windows drives are under `/mnt/c`, `/mnt/d`...; you can also paste a Windows path
   like `C:\Users\me\model` and it is converted automatically.
@@ -164,6 +173,7 @@ rulz_hf_manager/
   remote_agent.py    the instance's side (standard library only, piped over ssh on every call)
   jobs.py            background jobs with progress
   platform_utils.py  Windows / WSL / Linux helpers
+  hostcheck.py       refuses requests addressed to any name but this computer's (DNS rebinding)
   ui/                NiceGUI pages: dashboard, browser, vast.ai, settings, pickers, dialogs
   ui/theme.py        the RulZ look (colors, dark / light, "Choose your look")
   static/            the RulZ logo (dark and light) and the browser-tab icon
