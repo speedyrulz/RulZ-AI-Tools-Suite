@@ -20,7 +20,10 @@ anything to the internet.
 4. Scan the QR code from the computer's Settings with the phone's camera and tap the link, or tap **No camera? Type it
    in instead** and type the address, port and pairing code shown under the QR code.
 
-The app remembers the computer and reconnects by itself, also after the phone sleeps or switches networks.
+The app remembers the computer and reconnects by itself, also after the phone sleeps or switches networks
+(more slowly while the app is in the background, to save battery). After a wrong pairing code it doesn't try again
+by itself, since every try counts towards the computer's limit; **Try again** on the banner does. The app's data
+(the computer's address and pairing code) is left out of Android backups.
 
 ## What you can do
 

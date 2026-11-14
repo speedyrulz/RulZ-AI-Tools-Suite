@@ -21,11 +21,11 @@ export function linkProblem(state: LinkState, name: string): { title: string; te
     case 'denied':
       return state.reason === 'locked'
         ? { title: 'Too many wrong codes', text: 'The computer stopped listening to this phone for 10 minutes. Then scan its QR code again.', retry: true }
-        : {
+        : state.reason === 'wrong-code' ? {
             title: 'The pairing code doesn’t match',
             text: 'It may have been changed on the computer. Open Settings > Phone access on the computer and scan the QR code again.',
             retry: true
-          }
+          } : { title: 'Connection refused', text: `The computer refused the connection (${state.reason}). Try again.`, retry: true }
     case 'outdated':
       return state.theirs > state.ours
         ? { title: 'This app needs an update', text: 'RulZ Coding Agent on the computer is newer than this app. Install the latest version of this app.', retry: false }
@@ -46,9 +46,10 @@ export function LinkBanner() {
     >
       {state.kind === 'connecting' ? <LoaderCircle size={15} className="shrink-0 animate-spin" /> : <CloudOff size={15} className="shrink-0" />}
       <span className="min-w-0 flex-1">{state.kind === 'connecting' ? `Reconnecting to ${name}…` : problem?.title}</span>
-      {state.kind === 'connecting' && state.attempt > 1 && (
+      {/* Not for a version mismatch: trying again can't help until one of the apps is updated. */}
+      {(state.kind === 'denied' || (state.kind === 'connecting' && state.attempt > 1)) && (
         <Button size="sm" variant="ghost" className="h-7 text-warn" onClick={() => link.retryNow()}>
-          Try now
+          Try again
         </Button>
       )}
     </div>

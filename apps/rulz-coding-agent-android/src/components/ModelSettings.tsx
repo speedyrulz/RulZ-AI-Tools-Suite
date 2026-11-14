@@ -61,9 +61,11 @@ const SAMPLING_FIELDS: { key: NumericKey; label: string; hint: string; min: numb
   { key: 'maxOutputTokens', label: 'Longest answer', hint: 'Tokens in one reply or tool call', min: 256, max: 131072, step: 256 }
 ]
 
+const EMPTY_SAMPLING: Record<string, SamplingSettings> = {}
+
 /** How the model writes: the owner's values over the recommended ones, saved per model on the computer. */
 function Sampling({ model }: { model: string }) {
-  const all = useApp((s) => s.settings?.modelSampling ?? {})
+  const all = useApp((s) => s.settings?.modelSampling ?? EMPTY_SAMPLING)
   const update = useApp((s) => s.updateSettings)
   const own = all[model] ?? {}
   const rec: SamplingSettings = { maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS, ...recommendedSampling(model) }

@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react'
+import { App as CapacitorApp } from '@capacitor/app'
 import { Toaster } from 'sonner'
 import { ApprovalSheet } from './components/ApprovalSheet'
 import { LinkBanner } from './components/LinkStatus'
 import { Button, Sheet } from './components/ui'
 import { parsePairingLink, type Computer } from './lib/computers'
 import { link } from './lib/remote'
-import { onBackButton, onPairingLink, onResume } from './lib/native'
+import { isNative, onBackButton, onPairingLink, onResume } from './lib/native'
 import { Computers, Connecting } from './pages/Computers'
 import { Projects } from './pages/Projects'
 import { Settings } from './pages/Settings'
@@ -32,7 +33,12 @@ function start(askToPair: (c: Omit<Computer, 'id'>) => void): void {
     void useApp.getState().resync()
     void useWorkspace.getState().resync()
   })
-  onResume(() => void link.check())
+  let active = true
+  const updateBackoff = (): void => { link.backgroundIdle = !active && !useWorkspace.getState().running }
+  useWorkspace.subscribe(updateBackoff)
+  if (isNative) void CapacitorApp.addListener('appStateChange', ({ isActive }) => { active = isActive; updateBackoff() })
+  else document.addEventListener('visibilitychange', () => { active = document.visibilityState === 'visible'; updateBackoff() })
+  onResume(() => { active = true; updateBackoff(); void link.check() })
   onPairingLink((url) => {
     // A tapped notification (rulzagent://open/project): go to the project; a pending approval shows itself.
     if (/^rulzagent:\/\/open\b/i.test(url)) {

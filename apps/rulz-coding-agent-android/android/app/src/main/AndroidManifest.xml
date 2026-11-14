@@ -3,7 +3,9 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
+        android:fullBackupContent="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
@@ -37,6 +39,7 @@
         <!-- Keeps the connection to the computer while the app is in the background, for notifications. -->
         <service
             android:name=".ConnectionService"
+            android:stopWithTask="true"
             android:exported="false"
             android:foregroundServiceType="specialUse">
             <property

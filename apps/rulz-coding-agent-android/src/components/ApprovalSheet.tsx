@@ -14,7 +14,7 @@ export function ApprovalSheet() {
 
   const open = prompt?.kind === 'approval'
   const req = open ? prompt : null
-  const decide = (decision: 'allow' | 'allow-task' | 'deny'): void => answer({ kind: 'approval', decision })
+  const decide = (decision: 'allow' | 'allow-task' | 'deny'): void => { if (req) void answer(req.id, { kind: 'approval', decision }) }
 
   return (
     <Sheet
