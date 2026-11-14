@@ -1911,9 +1911,40 @@ class Trainer(RaceParallelMixin):
             path = self._reward_stage(model, injected, step) or path
         self.status.update(stage="finished", done=True)
         self._save_history("finished" if step >= cfg.steps else "stopped")
+        self._record_memory()
         log.info("Done. Final LoRA: %s", path)
         if cfg.run_report:
             self._run_report()
+
+    def _record_memory(self) -> None:
+        """The finished run's measured memory into the record the wizard's block swap plan reads (measured.py: what a
+        step took at the start, held against the run's peak), with each GPU's size and each block's frozen weights
+        beside it in status.json (gpu_total_gb, block_gb, GiB) so the record can be rebuilt from the job folder.
+        Never fails the run."""
+        try:
+            from . import measured
+
+            cards = {}
+            if torch.cuda.is_available():
+                cards = {str(d): round(torch.cuda.get_device_properties(torch.device(d)).total_memory / 2 ** 30, 2)
+                         for d in self.devices if str(d).startswith("cuda")}
+            if cards:
+                self.status.update(gpu_total_gb=cards)
+            try:  # each block's frozen weights: what one block more or fewer swapped changes (sizes only)
+                from .blockswap import frozen_block_gb
+
+                self.status.update(block_gb=frozen_block_gb(self.replicas[0][0]))
+            except Exception as e:  # noqa: BLE001  (no model in memory: the plan adjusts with the estimate's size)
+                log.debug("Block sizes not kept: %s", e)
+            row, why = measured.measurement(self.cfg, self.status.data, folder=self.job_dir)
+            if row is None:
+                log.info("Memory not kept for the block swap plan: %s", why)
+                return
+            measured.add(row)
+            log.info("Memory kept for the block swap plan: a step took %.2f GB at %d blocks swapped (%s; %s)",
+                     row["step_gb"], row["block_swap"], row["step_from"], measured.RECORD_FILE)
+        except Exception as e:  # noqa: BLE001
+            log.debug("Memory not recorded: %s", e)
 
     def _run_report(self) -> None:
         """run_report: the run's summary picture and PDF into its job folder. Never fails the run."""
@@ -2355,6 +2386,7 @@ class Trainer(RaceParallelMixin):
         noise = torch.randn(latents.shape, generator=gen)
         sigma = torch.full((latents.shape[0],), 0.5)
         tokens = big.tokens + mask.shape[1]
+        figures: dict = {}  # per GPU, for status.json (checkpoint_memory)
 
         for m, inj, dev in self.replicas:
             dev = norm_device(dev)
@@ -2397,12 +2429,27 @@ class Trainer(RaceParallelMixin):
                 k = ckpt.choose_kept_blocks(n, peak_one, per_block, budget)
                 keep += ckpt.kept_indices(per_dev[d], k)
                 peak_k = peak_one + max(0, k - 1) * per_block
+                self._note_calibration(figures, d, k, n, peak_one, per_block, budget, total, one[d][1])
                 notes.append(f"{d}: {k} of {n} ({per_block / ckpt.GB:.2f} GB per extra block, peak "
                              f"{peak_k / ckpt.GB:.1f} of {total / ckpt.GB:.0f} GB, budget {budget / ckpt.GB:.1f})")
             self.kept[id(m)] = sorted(keep)
             ckpt.set_kept_blocks(m, keep)
             log.info("Checkpointing: %d of %d blocks keep their activations, measured at %d tokens (%s)", len(keep),
                      n_blocks, tokens, "; ".join(notes))
+
+    def _note_calibration(self, figures: dict, device, kept: int, candidates: int, peak_one: float, per_block: float,
+                          budget: float, total: float, alloc_one: float | None = None) -> None:
+        """One GPU's calibration figures into status.json (checkpoint_memory): what a step took with one block kept,
+        before the spare memory went to kept blocks. The wizard's block swap plan is made from them once the run has
+        finished (measured.py). Never fails the calibration."""
+        try:
+            from . import measured
+
+            figures[str(device)] = measured.calibration(kept, candidates, peak_one, per_block, budget, total,
+                                                        alloc_one)
+            self.status.update(checkpoint_memory=dict(figures))
+        except Exception as e:  # noqa: BLE001
+            log.debug("Calibration figures not kept: %s", e)
 
     def _alloc_retries(self) -> dict[str, int]:
         """cudaMalloc retries per training GPU so far: the allocator ran out, freed its cache and tried again (slow)."""
