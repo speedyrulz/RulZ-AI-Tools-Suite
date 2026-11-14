@@ -24,6 +24,8 @@ import {
 import { ChatReplyCapture } from './reCapture'
 
 const MAX_BODY_BYTES = 64 * 1024 * 1024
+/** How much of a too-large body is read and thrown away so the client can read the 413. */
+const DRAIN_LIMIT_BYTES = 1024 * 1024 * 1024
 const MAX_LOG = 300
 const IDLE_CHECK_MS = 15_000
 
@@ -116,7 +118,14 @@ export class ApiServer {
     if (this.server) return this.getStatus()
     const s = this.deps.getSettings()
     const host = s.bind === 'lan' ? '0.0.0.0' : '127.0.0.1'
-    const server = http.createServer((req, res) => void this.handle(req, res))
+    const server = http.createServer((req, res) => {
+      // Last resort: a request that fails outside the handler's own error handling still gets an answer.
+      this.handle(req, res).catch((err: unknown) => {
+        console.error('API request failed:', err)
+        if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'application/json' }).end(errorBody(String(err), 'server_error'))
+        else res.destroy()
+      })
+    })
     server.keepAliveTimeout = 65_000
     await new Promise<void>((resolve, reject) => {
       server.once('error', reject)
@@ -167,7 +176,14 @@ export class ApiServer {
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const settings = this.deps.getSettings()
-    const url = new URL(req.url ?? '/', 'http://localhost')
+    let url: URL
+    try {
+      url = new URL(req.url ?? '/', 'http://localhost')
+    } catch {
+      // A target like "//[" isn't a URL at all.
+      res.writeHead(400, { 'Content-Type': 'application/json' }).end(errorBody('Invalid request URL.', 'invalid_request_error'))
+      return
+    }
     const path = url.pathname.replace(/\/+$/, '') || '/'
     const method = (req.method ?? 'GET').toUpperCase()
 
@@ -195,6 +211,23 @@ export class ApiServer {
     const fail = (status: number, message: string, type?: string): void => {
       res.writeHead(status, { 'Content-Type': 'application/json' }).end(errorBody(message, type))
       finish(status, message)
+    }
+    /** The body as a JSON object; on anything else the request has been answered and this gives null. */
+    const jsonBody = async (): Promise<Record<string, unknown> | null> => {
+      // A body over the limit throws BodyTooLarge, answered with 413 below.
+      const text = (await readBody(req)).toString('utf8')
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(text || '{}')
+      } catch {
+        fail(400, 'The request body is not valid JSON.')
+        return null
+      }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        fail(400, 'The request body must be a JSON object.')
+        return null
+      }
+      return parsed as Record<string, unknown>
     }
 
     if (!authorized(settings.apiKey, req.headers as Record<string, string>)) {
@@ -225,12 +258,8 @@ export class ApiServer {
         if (!model) return fail(404, 'Model not found.', 'not_found_error')
         let preview: LoadConfig | undefined
         if (method === 'POST') {
-          let json: { config?: unknown; reload?: unknown; dry_run?: unknown }
-          try {
-            json = JSON.parse((await readBody(req)).toString('utf8') || '{}') as typeof json
-          } catch {
-            return fail(400, 'The request body is not valid JSON.')
-          }
+          const json = await jsonBody()
+          if (!json) return
           const parsed = parseRemoteLoadPatch(json.config ?? {})
           if (!parsed.ok) return fail(400, `Invalid load setting ${parsed.error}`, 'invalid_request_error')
           const patch = { ...parsed.patch }
@@ -269,12 +298,8 @@ export class ApiServer {
         const taskId = decodeURIComponent(rawId ?? '')
         if (rest.length || (action !== 'prepare' && action !== 'grade')) return fail(404, `Unknown endpoint: ${method} ${path}`, 'not_found_error')
         if (!PRACTICE_ID.test(taskId)) return fail(400, 'Practice task ids are 1-80 letters, digits, _ or -.', 'invalid_request_error')
-        let json: Record<string, unknown>
-        try {
-          json = JSON.parse((await readBody(req)).toString('utf8') || '{}') as Record<string, unknown>
-        } catch {
-          return fail(400, 'The request body is not valid JSON.')
-        }
+        const json = await jsonBody()
+        if (!json) return
         let out: unknown
         try {
           if (action === 'prepare') out = await re.preparePractice(taskId)
@@ -295,12 +320,8 @@ export class ApiServer {
         if (!API_RE_ID.test(id)) return fail(400, 'Session ids are 1-56 letters, digits, _ or -.', 'invalid_request_error')
         let session: ApiReSession | null
         if (method === 'POST') {
-          let json: Record<string, unknown>
-          try {
-            json = JSON.parse((await readBody(req)).toString('utf8') || '{}') as Record<string, unknown>
-          } catch {
-            return fail(400, 'The request body is not valid JSON.')
-          }
+          const json = await jsonBody()
+          if (!json) return
           const patch = parseReSessionPatch(json)
           if (typeof patch === 'string') return fail(400, patch, 'invalid_request_error')
           session = re.enabled() || patch.outcome ? await re.update(id, patch) : await re.session(id)
@@ -417,8 +438,13 @@ export class ApiServer {
         this.touch(inst.instanceId)
       }
     } catch (err) {
-      if (!res.headersSent) fail(500, (err as Error).message, 'server_error')
-      else finish(res.statusCode, (err as Error).message)
+      if (res.headersSent) finish(res.statusCode, (err as Error).message)
+      else if (err instanceof BodyTooLarge) {
+        // No "Connection: close": closing while the client still sends resets the connection and
+        // the client never reads the 413. readBody discards the rest of the body instead.
+        fail(413, err.message, 'invalid_request_error')
+      } else if (err instanceof URIError) fail(400, 'The request path has a malformed %-escape.', 'invalid_request_error')
+      else fail(500, (err as Error).message, 'server_error')
     }
   }
 
@@ -455,7 +481,12 @@ export class ApiServer {
           const usage = new UsageReader(sse)
           const reply = capture && ures.statusCode === 200 ? new ChatReplyCapture(sse) : null
           ures.on('data', (chunk: Buffer) => {
-            res.write(chunk)
+            // A client reading slower than the model writes (a big embeddings reply, say) would
+            // otherwise have the whole reply buffered here.
+            if (!res.write(chunk)) {
+              ures.pause()
+              res.once('drain', () => ures.resume())
+            }
             usage.push(chunk)
             reply?.push(chunk)
           })
@@ -639,19 +670,35 @@ export class ApiServer {
   }
 }
 
+class BodyTooLarge extends Error {
+  constructor() {
+    super(`The request body is larger than ${MAX_BODY_BYTES / (1024 * 1024)} MiB.`)
+  }
+}
+
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
     let size = 0
-    req.on('data', (c: Buffer) => {
+    const onData = (c: Buffer): void => {
       size += c.length
       if (size > MAX_BODY_BYTES) {
-        reject(new Error('Request body too large'))
-        req.destroy()
+        // Stop keeping it, but read the rest so the client finishes sending and then reads the 413.
+        // Past DRAIN_LIMIT_BYTES more it is cut off: nobody is told anything about an endless body.
+        req.off('data', onData)
+        chunks.length = 0
+        let drained = 0
+        req.on('data', (d: Buffer) => {
+          drained += d.length
+          if (drained > DRAIN_LIMIT_BYTES) req.destroy()
+        })
+        req.resume()
+        reject(new BodyTooLarge())
         return
       }
       chunks.push(c)
-    })
+    }
+    req.on('data', onData)
     req.on('end', () => resolve(Buffer.concat(chunks)))
     req.on('error', reject)
   })

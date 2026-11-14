@@ -1,5 +1,6 @@
 import { RotateCcw, Save, Trash2 } from 'lucide-react'
 import { useState, type ReactNode } from 'react'
+import { useShallow } from 'zustand/react/shallow'
 import { REASONING_EFFORTS, type ReasoningEffort, type SamplingParams } from '@shared/types'
 import { useApp } from '../../stores/app'
 import { useChat } from '../../stores/chat'
@@ -28,7 +29,8 @@ function SliderRow({
     <Field label={label} hint={hint}>
       <div className="flex items-center gap-2.5">
         <Slider value={value} min={min} max={max} step={step} onChange={onChange} />
-        <NumberInput className="w-18" value={value} min={min} max={max} step={step} onChange={(v) => onChange(v ?? min)} />
+        {/* Typed values keep to the slider's range: a repeat penalty of 0, say, wrecks the output. */}
+        <NumberInput className="w-18" value={value} min={min} max={max} step={step} onChange={(v) => onChange(Math.min(max, Math.max(min, v ?? min)))} />
       </div>
     </Field>
   )
@@ -175,7 +177,11 @@ function ToolsSection() {
 }
 
 export function InferencePanel() {
-  const current = useChat((s) => s.current)
+  // Only the fields shown here: `current` itself is a new object on every streaming flush, which
+  // would re-render all the sliders (and the tool list) about 11 times a second.
+  const current = useChat(
+    useShallow((s) => (s.current ? { sampling: s.current.sampling, presetId: s.current.presetId, systemPrompt: s.current.systemPrompt } : null))
+  )
   const presets = useChat((s) => s.presets)
   const mutate = useChat((s) => s.mutateCurrent)
   const { applyPreset, savePreset, deletePreset } = useChat.getState()

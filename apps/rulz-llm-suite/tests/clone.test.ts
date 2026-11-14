@@ -58,6 +58,31 @@ describe('clone file tools', () => {
     expect(readFileSync(join(app, 'tool.exe'), 'utf8')).toBe('MZ\0\0binary')
   })
 
+  it('never overwrite the target through another name for it', async () => {
+    // The target is a link inside the output folder; writing to the real folder must still be refused.
+    const root = join(base, 'alias')
+    const real = join(root, 'actual')
+    mkdirSync(real, { recursive: true })
+    writeFileSync(join(real, 'main.c'), 'original')
+    try {
+      symlinkSync(real, join(root, 'link'), 'junction')
+    } catch {
+      return // links need rights this machine may not grant
+    }
+    const r = await runFileTool('write_file', { path: 'actual/main.c', content: 'x' }, undefined, { writeRoot: root, target: join(root, 'link') })
+    expect(r.isError).toBe(true)
+    expect(readFileSync(join(real, 'main.c'), 'utf8')).toBe('original')
+  })
+
+  it('never overwrite the target when its path was pasted with quotes', async () => {
+    // Explorer's "Copy as path" adds the quotes; unquoted, "C:\app" would resolve as a relative path.
+    const r = await runFileTool('write_file', { path: 'tool.exe', content: 'x' }, undefined, { writeRoot: app, target: `"${app}"` })
+    expect(r.isError).toBe(true)
+    expect(readFileSync(join(app, 'tool.exe'), 'utf8')).toBe('MZ\0\0binary')
+    expect((await runFileTool('write_file', { path: 'quoted.txt', content: 'ok' }, undefined, { writeRoot: `"${out}"`, target: `"${app}"` })).isError).toBe(false)
+    expect(readFileSync(join(out, 'quoted.txt'), 'utf8')).toBe('ok')
+  })
+
   it('only work in a clone session', async () => {
     expect((await runFileTool('write_file', { path: 'a.txt', content: 'x' })).text).toMatch(/only works in a clone session/)
     expect((await runFileTool('read_file', { path: 'a.txt' })).isError).toBe(true)

@@ -60,6 +60,8 @@ export interface IpcInvoke {
 
   'instances:list': () => LoadedInstance[]
   'instances:load': (modelId: string, config: LoadConfig | null) => LoadedInstance
+  /** The model's running or loading instance whatever its settings, or else a new one with its defaults. */
+  'instances:ensure': (modelId: string) => LoadedInstance
   'instances:unload': (instanceId: string) => void
   'instances:unloadAll': () => void
   'instances:log': (instanceId: string) => string[]

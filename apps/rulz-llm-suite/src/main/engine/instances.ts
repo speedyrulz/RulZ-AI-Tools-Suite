@@ -213,8 +213,8 @@ export class InstanceManager {
   private attachOutput(run: Running): void {
     const splitter = new LogLineSplitter()
     let lastEmit = 0
-    const onData = (chunk: Buffer): void => {
-      const { lines, dots } = splitter.push(chunk.toString())
+    const onData = (chunk: Buffer | string): void => {
+      const { lines, dots } = splitter.push(String(chunk))
       let p = { progress: run.info.progress, stage: run.info.stage }
       for (const line of lines) {
         run.log.push(line)
@@ -235,6 +235,9 @@ export class InstanceManager {
         }
       }
     }
+    // Decoded as streams, so a character split between two chunks (non-ASCII file names) isn't garbled.
+    run.proc.stdout?.setEncoding?.('utf8')
+    run.proc.stderr?.setEncoding?.('utf8')
     run.proc.stdout?.on('data', onData)
     run.proc.stderr?.on('data', onData)
 

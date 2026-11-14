@@ -3,7 +3,8 @@ import { Eye, RotateCcw, Search, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { DEFAULT_LOAD_CONFIG } from '@shared/defaults'
 import type { LoadConfig, ModelEntry } from '@shared/types'
-import { invoke } from '../../lib/api'
+import { toast } from 'sonner'
+import { errorMessage, invoke } from '../../lib/api'
 import { cn, formatBytes } from '../../lib/format'
 import { useApp } from '../../stores/app'
 import { useModels } from '../../stores/models'
@@ -163,17 +164,26 @@ function LoadPanel({ model, onDone }: { model: ModelEntry; onDone: () => void })
   const inst = instances.find((i) => i.modelId === model.id && i.status !== 'stopping')
 
   useEffect(() => {
-    void invoke('models:getDefaults', model.id).then(({ config, custom }) => {
-      setConfig(inst?.config ?? config)
-      setRemember(custom)
-      setHasCustom(custom)
-    })
+    invoke('models:getDefaults', model.id)
+      .then(({ config, custom }) => {
+        setConfig(inst?.config ?? config)
+        setRemember(custom)
+        setHasCustom(custom)
+      })
+      .catch((e) => {
+        // Without this the panel stays blank; fall back to the app defaults.
+        toast.error(`Could not read this model's saved settings: ${errorMessage(e)}`)
+        setConfig(inst?.config ?? useApp.getState().settings?.defaultLoadConfig ?? DEFAULT_LOAD_CONFIG)
+      })
   }, [model.id])
 
   if (!config) return <div className="flex-1" />
 
   const doLoad = async (): Promise<void> => {
-    if (remember) await invoke('models:setDefaults', model.id, config)
+    if (remember) {
+      // Not remembering them is no reason not to load.
+      await invoke('models:setDefaults', model.id, config).catch((e) => toast.error(`Could not save the settings: ${errorMessage(e)}`))
+    }
     onDone()
     useApp.getState().setPage('chat')
     await load(model.id, config)
@@ -196,7 +206,12 @@ function LoadPanel({ model, onDone }: { model: ModelEntry; onDone: () => void })
             <button
               className="flex items-center gap-1 text-xs text-muted hover:text-text"
               onClick={async () => {
-                await invoke('models:setDefaults', model.id, null)
+                try {
+                  await invoke('models:setDefaults', model.id, null)
+                } catch (e) {
+                  toast.error(`Could not reset the settings: ${errorMessage(e)}`)
+                  return
+                }
                 setHasCustom(false)
                 setRemember(false)
                 if (settings) setConfig(settings.defaultLoadConfig)
