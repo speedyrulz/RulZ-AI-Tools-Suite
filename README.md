@@ -11,7 +11,8 @@ A simple diffusion-model LoRA trainer with a WebUI. Supported models:
 
 - **MOSS-Image** (5B single-stream DiT by OpenMOSS), both the **Base** and **SFT** checkpoints. Output LoRAs load
   directly in ComfyUI with the standard *Load LoRA* node.
-- **Bria FIBO 2.0** (8B): train on dev, use on Edit Turbo ([details](#fibo-20-bria-training-on-dev-using-the-lora-on-edit-turbo)).
+- **Bria FIBO 2.0** (8B): train on dev, use on Edit Turbo; the LoRAs load in diffusers, not ComfyUI
+  ([details](#fibo-20-bria-training-on-dev-using-the-lora-on-edit-turbo)).
 - **Krea 2** (12B): train on Raw, use on Turbo ([details](#krea-2-training-on-raw-using-the-lora-on-turbo)).
 - **Qwen-Image 2.1** (7B): text-to-image LoRAs on one 16 GB card, with Fizgig's training adapter
   ([details](#qwen-image-21)).
@@ -37,9 +38,9 @@ A simple diffusion-model LoRA trainer with a WebUI. Supported models:
 | --- | --- |
 | ![The Train tab in the dark look](docs/screenshots/01-train-dark.png) | ![The Train tab in the light look](docs/screenshots/02-train-light.png) |
 
-| Wizard: hardware step | Monitor | First visit |
+| Wizard: which model | Monitor | First visit |
 | --- | --- | --- |
-| ![The wizard's hardware step with recommendations](docs/screenshots/03-wizard-hardware.png) | ![The Monitor tab](docs/screenshots/04-monitor.png) | ![Choose your look](docs/screenshots/05-choose-your-look.png) |
+| ![The wizard's model step: a card per model with its download size and GPU needs](docs/screenshots/03-wizard-model.png) | ![The Monitor tab](docs/screenshots/04-monitor.png) | ![Choose your look](docs/screenshots/05-choose-your-look.png) |
 
 ## Install
 
@@ -65,7 +66,8 @@ measured here.)
 no GPU. Without an index URL, both installers read the CUDA version the driver supports from `nvidia-smi`
 (`scripts/torch_index.py`) and install the newest of cu130, cu128 and cu126 it runs, never newer than their default,
 with a warning to update the driver (after OneTrainer). On a headless
-box (no display) the WebUI has no native Browse dialogs: type paths, or upload datasets on the Dataset tab.
+box (no display) the WebUI has no native Browse dialogs: Browse opens a browser of that machine's files inside the
+page instead, and datasets can be uploaded on the Dataset tab.
 Cloud GPUs: see [Running on vast.ai](#running-on-vastai).
 
 **Manual:**
@@ -74,7 +76,8 @@ Cloud GPUs: see [Running on vast.ai](#running-on-vastai).
 pip install -r requirements.txt
 ```
 
-Requires a CUDA build of PyTorch 2.9+, diffusers 0.41+ and transformers 5.3+ (Qwen3.5 support).
+Requires Python 3.10+ (`install.bat` asks for 3.10 to 3.12), a CUDA build of PyTorch 2.9+, diffusers 0.41+ and
+transformers 5.3+ (Qwen3.5 support).
 
 **No telemetry.** Importing RulzTrainer sets `ORT_DISABLE_TELEMETRY=1` and `HF_HUB_DISABLE_TELEMETRY=1` before
 anything loads onnxruntime or Hugging Face's libraries, so the WebUI and every job it starts inherit them, and it
@@ -115,7 +118,8 @@ with LoRA rank 32 / alpha 32, adamw8bit at 1e-4, and recommendations worked out 
 photos (count and size) for the hardware, resolution, steps and samples. *Reset* puts that setup back. **Advanced**, at
 the top of the wizard, shows every setting on every page, each with its recommendation (*Use* takes one, *Apply
 recommended* every one on the page), and the same switch on the **Train** tab shows that tab's *Advanced options*
-panels, experimental settings and tool sections (Configuration race, Seed soup, Post-hoc EMA, Probe noise check):
+panels, experimental settings and tool sections (LoRA Isolation, Configuration race, Seed soup, Post-hoc EMA, Probe
+noise check):
 with it off the Train tab keeps to the everyday settings, though an experimental setting that is switched on stays in
 view. The wizard edits the same settings as the Train tab, which is also where styles and concepts are set up.
 *Start training*, *Stop* and *Kill* sit in the bar at the bottom of the Train and Monitor tabs.
@@ -133,9 +137,11 @@ is kept per browser (its local storage).
 1. **Dataset**: a folder of images. Each image may have a same-name `.txt` caption. Use *Scan dataset*
    to see the aspect-ratio buckets. Pick one or more *Training resolutions* (megapixels); see
    "Training resolutions and resolution step-up" below.
-2. **Model**: choose one of the ten base models (or a custom local directory / HF repo id).
-   *Download / verify model* fetches its files into `models/`: about 10 to 20 GB for most, about 32 GB for
-   P-H3-Image, about 50 GB for MiniMax-H3-Image and over 50 GB for MiniMax H3.
+2. **Model**: choose one of the eleven base models (or a custom local directory / HF repo id).
+   *Download now* fetches its single files ahead of the first run (into Hugging Face's cache): about 10 to 20 GB for
+   most, about 32 GB for P-H3-Image, about 50 GB for MiniMax-H3-Image and over 50 GB for MiniMax H3. With a
+   diffusers folder (`model_source: hf`) the button is *Download / verify model* and the folder goes into `models/`.
+   PAN 2 has no single files to download: make them once with `scripts/pan2/convert_pan2.py` (see [PAN 2](#pan-2)).
 3. **Start training**. Before it starts, the Train tab lists the usual mistakes, with *Start anyway* (never a
    block): images with no caption, captions that already hold the trigger word (it is put at the start of every
    caption, so they would have it twice) and a learning rate well outside the usual range (a third of the lowest to
@@ -143,7 +149,7 @@ is kept per browser (its local storage).
    checked). The wizard's review lists the same. The *Monitor* tab shows progress, loss curve, log tail and sample images. Training runs
    as its own process: reloading or closing the page, opening it from another browser, or restarting the
    WebUI does not stop it, and the page reconnects to the running job (it opens on *Monitor* and loads the
-   job's settings into the form). *Stop (save)* and *Kill* work on a reconnected job too. Switching to another tab
+   job's settings into the form). *Stop* (saves the LoRA) and *Kill* work on a reconnected job too. Switching to another tab
    and back does not reload the page: it stays as you left it for up to an hour away, then catches up.
 4. Results: `output/<job>/<job>_<step>.safetensors` (checkpoints) and `output/<job>/<job>.safetensors` (final).
 
@@ -175,7 +181,8 @@ use when the WebUI runs on another computer. Every setting and the *Advanced* sw
 
 To use the WebUI from your other devices (laptop, phone), start it with Tailscale. On Windows, double-click
 `run_webui_tailscale.bat` or run `run_webui.bat 7870 tailscale`. On Linux, run `./run_webui.sh 7870 127.0.0.1 tailscale`.
-`python webui.py --tailscale` and `RULZ_TAILSCALE=1` do the same.
+`python webui.py --tailscale` and `RULZ_TAILSCALE=1` do the same. In the RulZ AI Tools Suite launcher (1.13.0 or newer),
+turn on *Tailscale remote access* on RulzTrainer's page and press *Launch*.
 
 It runs `tailscale serve`, so the WebUI stays bound to `127.0.0.1`. Tailscale publishes it over HTTPS at
 `https://<machine>.<tailnet>.ts.net:7870`, and only devices logged in to your tailnet can open it. The URL is printed
@@ -185,8 +192,9 @@ not touched. When the WebUI stops (Ctrl+C, closing its console window, logging o
 Only a hard kill (Task Manager, a crash) leaves the 502. `tailscale serve --https=7870 off` removes the address for good.
 
 Requirements: Tailscale installed and logged in on this machine, and HTTPS certificates turned on for the tailnet
-(admin console > DNS > HTTPS Certificates). Browsers that connect remotely get no native *Browse* buttons, because
-those dialogs would open on this machine's screen. Type server paths instead, or upload datasets on the Dataset tab.
+(admin console > DNS > HTTPS Certificates). Browsers that connect remotely get no native *Browse* dialogs, because
+those would open on this machine's screen: *Browse* opens a browser of this machine's files inside the page instead,
+and datasets can be uploaded on the Dataset tab.
 
 ### CLI
 
@@ -235,7 +243,8 @@ the uploader shows each file and the megabytes sent, keeps a phone's screen on w
 allows it, over https) and asks before you leave the page mid-upload.
 Results are written to
 `/workspace/RulzTrainer/output/<job>/`; download them from Jupyter before destroying the instance (the disk is gone
-with it; stopping keeps it). `models/` on the instance disk caches the downloaded base model between runs.
+with it; stopping keeps it). Downloaded model files stay on the instance disk between runs (single files in Hugging
+Face's cache, a diffusers folder in `models/`).
 
 Every path field's Browse button opens a browser of the instance's own disk inside the page (folders, and files of
 the field's type with their sizes; shortcuts to RulzTrainer's `models` / `datasets` / `output`, `/workspace`, home and
@@ -272,7 +281,8 @@ Linux) to your bucket's `.rulz_compile/` folder: the next rental of the same GPU
 With `RULZ_MODEL_INCLUDE`, add `.rulz_compile/*` to its patterns.
 The WebUI also keeps torch's own compile caches under `/workspace/.cache`, so a restarted instance stays warm.
 
-**In the WebUI on an instance.** The chip at the top right shows the instance number and the free disk space, and
+**In the WebUI on an instance.** The chip at the top right shows the free disk space ("vast.ai · N GB free"; the
+instance number is in its tooltip), and
 the Monitor's *Disk* tile and a warning banner tell you before a rental's fixed-size disk fills up. While the bucket
 download is still going, the Monitor says so and how much has arrived. Browse buttons open a browser of the instance's
 files, and every download button hands the file to your browser.
@@ -282,7 +292,9 @@ allowed). PyTorch starts one thread per CPU it sees, and with too many threads i
 111 reference faces with the gold face scorer (`face_provider: cpu`) took 19 min 38 s on such an instance against
 53 s on one with room. The trainer reads the container's quota (cgroup `cpu.max`) at start and caps PyTorch's CPU
 threads to it, logging `CPU quota 11.5 CPUs: PyTorch CPU threads 24 -> 11`; a thread count you set yourself
-(`OMP_NUM_THREADS`, `MKL_NUM_THREADS`) is kept. The speed-up is not yet measured on a quota-limited instance.
+(`OMP_NUM_THREADS`, `MKL_NUM_THREADS`) is kept. Since 3.18.0 face scoring (onnxruntime and OpenCV) follows the same
+cap and logs `CPU quota: face scoring uses N CPU threads`. The speed-up is not yet measured on a quota-limited
+instance.
 
 **Stop the instance when the runs are done.** An instance bills while it sits idle. On an instance the Monitor's
 *Queue* section has the switch *Stop this vast.ai instance when the runs are done*: three minutes after the last run
@@ -323,11 +335,11 @@ python scripts/vast/rulz_remote.py wait test1               # blocks until the r
 | `connect` | Finds the instance with the `vastai` CLI (`--instance ID` when several run) and tries its direct port, then vast's ssh proxy. `--wait 600` waits for one still installing; `--attach-key` adds your ssh key to an instance rented before you added it to the account |
 | `status`, `jobs`, `job NAME` | GPU, disk and queue; every run; one run's numbers |
 | `log`, `probes`, `config NAME --diff OTHER` | Logs, likeness scores, and the settings two runs differ in |
-| `pull NAME` | Copies `--what logs` (default), `probes`, `samples`, `loras`, `best` or `all`, optionally of one `--step`. Files already here at their size and time are skipped, so it can repeat during a run (a LoRA of a run made again under the same name has the same size: its time tells) |
+| `pull NAME` | Copies `--what logs` (default), `probes`, `samples`, `maps` (training maps), `loras`, `best` or `all`, optionally of one `--step`. Files already here at their size and time are skipped, so it can repeat during a run (a LoRA of a run made again under the same name has the same size: its time tells) |
 | `start --job NAME` | Queues a run from `--from JOB` or a local `--config FILE`, with `--set KEY=VALUE` and `--preset`. `--dry-run` shows what would change and queues nothing. With or without it, the settings get the trainer's full check first, so what training would refuse is refused here. It refuses a job name in use and an existing job folder unless `--overwrite` |
 | `wait NAME` | Blocks until the run ends (or `--step N`), riding out dropped connections. Exit status 0 finished, 1 failed, 2 `--timeout`, 3 unreachable |
 | `stop`, `stop --kill`, `queue` | The WebUI's Stop and Kill; the queue, with `queue pause`, `resume` and `remove ID` |
-| `sync` | Copies this checkout's code to the instance, to test a change before a release. It refuses while a job runs; `--restart-webui` restarts the WebUI on the new code. It only adds and overwrites |
+| `sync` | Copies this checkout's code to the instance, to test a change before a release. It refuses while a job runs unless `--force`; `--restart-webui` restarts the WebUI on the new code. It only adds and overwrites |
 | `push PATH FOLDER`, `ssh -- COMMAND` | Copies files up (a dataset into `datasets`); runs anything in the install folder. A pushed folder's hidden files and folders stay here, its `.rulz_cache` of latents and text features among them (it can be gigabytes, and the instance encodes its own); `--with-cache` sends them too |
 
 Reading changes nothing on the instance. A run started this way goes through the WebUI's queue, so it shows on the
@@ -340,7 +352,7 @@ and `RULZ_VAST_HOME` set the defaults. In Git Bash, set `MSYS_NO_PATHCONV=1` or 
 
 `scripts/vast/rulz_fleet.py` and the WebUI's **Fleet** tab treat every instance you have running as one fleet, from
 your own computer. Run the WebUI here (`python webui.py`, no GPU needed for this tab) or the command line; both read
-and write the same files in `~/.rulz_vast/fleet`.
+and write the same files in `~/.rulz_vast/fleet`. The tab is not shown when the WebUI runs on an instance.
 
 ![The Fleet tab: two instances, the fleet queue](docs/screenshots/06-fleet.png)
 
@@ -421,6 +433,9 @@ running keeps billing. An instance's disk goes with the instance:
 what the rules have not downloaded by then is gone.
 
 ## How it trains
+
+MOSS-Image is the example below; each model uses its own VAE, text encoder, blocks and LoRA targets (see its own
+section) and samples with its own turbo LoRA by default where it has one ([Turbo LoRA for samples](#turbo-lora-for-samples)).
 
 - **Caching first.** On the first run the Flux2 VAE encodes every image into normalized 128-channel
   latents (2x2 patchified, batch-norm normalized exactly as the reference pipeline does), and the
@@ -515,7 +530,9 @@ what the rules have not downloaded by then is gone.
   training only later blocks is also faster per step. The exported file simply omits the untrained blocks.
   Optionally also the two text-projection blocks inside the DiT. The Qwen text encoder stays frozen, as the
   authors recommend.
-- **Samples** are generated with the reference Euler schedule (shift 5, CFG 3, negative-branch layer-22 skip).
+- **Samples** use MOSS-Image's turbo LoRA by default (12 steps, CFG 1, shift 5; on Base also Kijai's SFT sampling
+  LoRA). With *Turbo LoRA* set to none they use the reference Euler schedule (shift 5, CFG 3, negative-branch
+  layer-22 skip).
 
 ## Using two GPUs
 
@@ -598,7 +615,9 @@ With `multi_gpu: off` the second GPU can render the likeness probes while traini
 **Single safetensors files (the default, `model_source: files`)**: the model you pick comes as ComfyUI files from
 Comfy-Org's repackages on Hugging Face, downloaded on the first run (into Hugging Face's cache, reused after that; the
 WebUI's *Download now* fetches them ahead of time). `model_file_quant` and `text_encoder_file_quant` pick the format,
-`int8_convrot` by default (about half of bf16, trains as fast, under 1% error):
+`int8_convrot` by default (about half of bf16, trains as fast, under 1% error). While a run downloads, `train.log`
+gets a line per 2% of the bytes written, or every 15 seconds (since 3.19.1; before, it showed 0% and then nothing until
+the file was there):
 
 | Model | Repo | Diffusion model | Text encoder | VAE |
 |---|---|---|---|---|
@@ -612,6 +631,7 @@ WebUI's *Download now* fetches them ahead of time). `model_file_quant` and `text
 | MiniMax H3 FL2VA / Ref2VA | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3) | pruned_int8_convrot 21.0 GB, pruned_bf16 40.2 GB, int8_convrot 34.0 GB, bf16 66.3 GB | Qwen3-VL-32B (50 layers) int8_convrot 27.1 GB, nvfp4_awq 15.7 GB, bf16 51.5 GB | `minimax_h3_video_vae_fp16` (5.2 GB) + `minimax_h3_audio_vae_fp32` (0.6 GB) |
 | P-H3-Image | [PrunaAI/P-H3-Image-Comfy](https://huggingface.co/PrunaAI/P-H3-Image-Comfy) | int8_convrot 21.2 GB, bf16 40.5 GB (both pruned; the w4a8 file reads when you set it yourself) | Qwen3-VL-4B + text connector int8_convrot 5.1 GB, bf16 9.1 GB | `p-h3-image_vae_bf16` (5.6 GB) |
 | MiniMax-H3-Image | [Comfy-Org/MiniMax-H3-Image](https://huggingface.co/Comfy-Org/MiniMax-H3-Image) | int8_convrot 21.0 GB, bf16 40.2 GB, w4a8 12.5 GB (all pruned; w4a8 holds int8 weights once read) | MiniMax H3's Qwen3-VL-32B files, from Comfy-Org/MiniMax-H3 (the same bytes) | `minimax_h3_image_vae_fp16` (1.2 GB) |
+| PAN 2 | none published: make them once from [IFM/PAN2](https://huggingface.co/IFM/PAN2) with `scripts/pan2/convert_pan2.py` and set all three file fields | see [PAN 2](#pan-2) | Qwen3.5-9B (30 of its 32 layers), from the same converter | Wan 2.2 VAE, from the same converter |
 
 To use files you already have, set `transformer_file`, `text_encoder_file` and `vae_file` (the WebUI's optional file
 fields): only the ones left empty are downloaded. Fused-qkv ("repacked") files are split back automatically. The
@@ -653,15 +673,16 @@ nvfp4 file keeps about a quarter of its block weights in bf16 (4.8 GB loaded); `
 Klein file quantizes them all (3.0 GB). See [FLUX 3 Klein](#flux-3-klein).
 
 Accepted weight formats: bf16 / fp16 / fp32, fp8 (upcast) and ComfyUI's scaled fp8 (`weight_scale` applied on load),
-ComfyUI `int8_tensorwise` with or without ConvRot (Hadamard rotation), and ComfyUI `nvfp4`. Those two quantized
-formats are decoded exactly as comfy_kitchen does (verified against the HF weights: re-quantizing them with
+ComfyUI `int8_tensorwise` with or without ConvRot (Hadamard rotation), ComfyUI's grouped `w4a8` / `w6a8` int files
+(read as the int8 ConvRot weights they decode to, so they save download size, not memory), and ComfyUI `nvfp4`.
+The int8 and nvfp4 formats are decoded exactly as comfy_kitchen does (verified against the HF weights: re-quantizing them with
 RulzTrainer reproduces the ComfyUI file bit for bit).
 
 *Diffusion model quant* / *Text encoder quant*:
 
 | value | effect |
 |---|---|
-| `auto` | keep the file's format (bf16 stays bf16, int8/nvfp4 files stay quantized) |
+| `auto` | keep a quantized file's format (int8/nvfp4 files stay quantized). A bf16 file stays bf16 on MOSS-Image; FIBO 2.0, Krea 2, Qwen-Image 2.1, both Kleins and Ideogram 4 quantize it to fit your GPU's memory (see each model's section) |
 | `none` | dequantize everything to bf16 |
 | `int8`, `int8_convrot` | quantize eligible Linear layers on load (about half the VRAM) |
 | `nvfp4` | quantize on load to FP4 with FP8 block scales (about a quarter of the VRAM) |
@@ -932,8 +953,10 @@ over, and the log says so. The image order, the per-image loss watch and the ide
 fine-tune's extra ranks). `keep_checkpoints: N` keeps only the newest N of those and deletes the oldest each time a new
 one is saved; 0 (the default) keeps them all. The final file (`<job>.safetensors`), the best-likeness file
 (`<job>_best`), a race's dropped and winner files and the training states are never deleted: states have their own
-`keep_states`. In a race each configuration keeps its own newest N. The WebUI's *Checkpoints to keep* field is in
-Saving & samples.
+`keep_states`. In a race each configuration keeps its own newest N. Since 3.18.0 both count only this run's own
+files (and the ones it resumed from): a job name used again no longer makes each new save give way to the old run's
+higher-numbered files, and a fresh run leaves an earlier run's files alone. The WebUI's *Checkpoints to keep* field is
+in Saving & samples.
 
 ## Weight average (`lora_ema`)
 
@@ -984,8 +1007,8 @@ and `samples/` hold them. So a run on a rented or remote GPU hands its LoRAs str
 browser. Only files inside a run's folder (one with a `status.json`) are served. Every Monitor chart folds away like
 the other sections.
 
-The Monitor puts the likeness first: the race (when there is one), *Likeness probes & controller*, *Sample images* and
-*Identity similarity*, then the loss and gradient charts and the log. The probe and the identity sections lead with
+The *Overview* puts the likeness before the loss: the queue, the race (when there is one), *Likeness probes &
+controller*, then the loss chart. The probe and the identity sections lead with
 their current scores as small chips (combined, face, body, the best so far, probes since the best, the controller's
 learning-rate factor and face bias). *Probe images* and *Sample images* show one training step at a time: the arrows
 and the step list go back through every step the run kept (the newest is shown, and followed, until you pick another;
@@ -1081,8 +1104,9 @@ size 1 and no gradient accumulation this is a true per-image learning rate (the 
 step); otherwise it becomes a per-sample loss weight. `loss_watch_exclude_after: N` benches an image that stays
 at the lowest throttle for N more epochs; exclusions are remembered in `<dataset>/.rulz_cache/excluded.json`
 and cleared by editing the image's caption. Output: `per_image_loss.jsonl` (every observation),
-`per_image_loss.json` (the table), a Monitor table and verdict badges on the Dataset tab. Not used with
-`automagic3` / `automagic4`, whose step normalisation would absorb the per-image scaling. Verdicts need a few epochs to mean
+`per_image_loss.json` (the table), a Monitor table and verdict badges on the Dataset tab. The per-image rate is not
+used with the self-tuning optimizers (`automagic3`, `automagic4`, `keel`, `keel_fb`), whose step normalisation would
+absorb the per-image scaling; the watch then only observes. Verdicts need a few epochs to mean
 anything, so this suits typical character sets trained for thousands of steps.
 
 ## Run report (`run_report`)
@@ -1180,8 +1204,9 @@ No benefit is claimed for either, and the defaults are uncalibrated. Both use th
 
 **`region_class_weights`** is the plain one: a fixed loss weight per region for the whole run, such as
 `face=3, hair=1.5, skin=1.5, clothes=0.5, background=0.3`. A region left out stays at 1, `0` masks one out, and the
-weights are rescaled to mean 1 per picture. It is applied from the parts map at each step, so it can be a
-configuration-race row. Not together with `region_weights` (the face box / silhouette weighting of the identity
+weights are rescaled to mean 1 per picture. It is applied from the parts map at each step. It is one setting for the
+whole run: a race row cannot change it (a race applies the run's value to every row), so compare it with a run
+without it. Not together with `region_weights` (the face box / silhouette weighting of the identity
 recipe): they are two fixed weightings of the same loss.
 
 **`region_steer: true`** lets the region watch (turned on with it) move loss weights once an epoch. Each rule has its
@@ -1479,7 +1504,8 @@ For character likeness the balance throttles exactly the tensors identity traini
 values and keys of blocks 1 to 9, the text-fusion output projections, the timestep path), which is the point: they get
 a Newton-like step instead of the bulk's. Whether that beats Automagic 3 or adamw8bit on the likeness probes is not
 measured yet, so the Wizard keeps recommending adamw8bit; race them (`race` rows with `optimizer`). A reasonable
-start: `learning_rate: 1e-4` with `automagic_max_lr: 1e-3`, `automagic_groups: by_type` on Krea 2, Qwen-Image 2.1,
+start: `learning_rate: 1e-4` with `automagic_max_lr: 1e-3`, `automagic_groups: by_type` (with Keel use `single`, see
+below) on Krea 2, Qwen-Image 2.1,
 MOSS-Image and FIBO (their text-side layers are a small minority that one pooled vote drowns out; `txt_in` now counts
 as text-side on Krea 2 and FIBO's timestep embedder as "other"), polarity history 8 to 16. The likeness controller's
 rate multiplier scales the adapted rate; on a noise-dominated loss the vote leaves it alone, and when the gradients
@@ -1595,7 +1621,8 @@ layer (`automagic_groups: single`) beat `by_type` by 4.4 body points (p = 0.03),
 and 3e-4 tied at 1000 steps with every racer still improving. Use `single`, keep or lower the ceiling as you prefer, and
 plan on more than 1000 steps. The other Keel settings have no results yet.
 
-**MiniMax H3 and FLUX Klein** are trained in ai-toolkit, not here (RulzTrainer's own ports came later). `rulztrainer/optimizers/automagic4.py` depends only
+**For ai-toolkit users** (MiniMax H3 and FLUX Klein were trained there before RulzTrainer had its own ports):
+`rulztrainer/optimizers/automagic4.py` depends only
 on `automagic3.py` next to it and keeps ai-toolkit's constructor (`step_target` is accepted and ignored), so copying it
 over `ai-toolkit/toolkit/optimizers/automagic4.py` gives ai-toolkit the fixed controller, including in its fused mode
 (where no gradient clipping runs, so set `max_lr` about 10x the start rate). On H3, the `adaln_proj` layers call their
@@ -1604,7 +1631,7 @@ Fizgig's ablations put identity in blocks 20 to 49.
 
 ## Identity training: what each step teaches (character LoRAs)
 
-Four levers change the training objective and data for likeness, all off by default:
+These levers change the training objective and data for likeness, all off by default:
 
 - **Region-weighted loss** (`region_weights`): at cache time the largest face (InsightFace) and the person
   silhouette (SAM 3 with `body_backend: mediapipe+sam3`, else a MediaPipe landmark hull) are mapped onto the
@@ -1673,8 +1700,10 @@ reference is one random face reference per step (`id_loss_random_ref`) or their 
 
 - Backends (`id_loss_backend`): `arcface` ports InsightFace's `buffalo_l/w600k_r50.onnx` to torch with
   `onnx2torch` (`pip install onnx2torch`; a self-check against the ONNX scorer on a reference face must reach
-  cosine > 0.99, else the loss is disabled). This is the very network the face probe scores with, so **the probe
-  metric becomes the training target** and can climb without a real likeness gain. `facenet` uses a vendored
+  cosine > 0.99, else the loss is disabled). With `face_model: buffalo_l` (the default) this is the very network the
+  face probe scores with, so **the probe metric becomes the training target** and can climb without a real likeness
+  gain. With `face_model: antelopev2` the probe scores with ArcFace R100, a related but different network, while
+  the loss still trains on `buffalo_l`'s R50. `facenet` uses a vendored
   InceptionResnetV1 with VGGFace2 weights (downloaded once to `models/facenet/`) and keeps the probe an
   independent check.
 - Needs `face_refs` (the reference identity) and builds the face cells / landmarks cache even without
@@ -1698,8 +1727,8 @@ score), not a default.
 
 ### Trigger attention and identity alignment (`attn_localize`, `id_align`)
 
-Two training-only losses that read the model's insides and reuse what the trainer already has (the region maps'
-person mask and face box, the face analysis); the saved LoRA is the same kind of file. Both are switches in the
+Three training-only losses that read the model's insides and reuse what the trainer already has (the region maps'
+person mask and face box, the face analysis); the saved LoRA is the same kind of file. All three are switches in the
 Region-weighted loss section (*Trigger attention and identity alignment*) and among the Wizard's experimental extras,
 and race keys. Neither is measured for likeness yet: race them against the run's own settings.
 
@@ -1744,7 +1773,8 @@ of the normalized scale, renders at least `probe_floor_seeds` (4). Scores are sm
 and only changes beyond `likeness_noise_band` count. The last step is always probed too, whether or not
 `probe_every` divides `steps`, so the final LoRA has its own score (it can be the best). Every probe record also keeps
 each seed's own score (`face_seeds`, `body_seeds`, their normalized `face_norm_seeds` / `body_norm_seeds`, and
-`combined_seeds`, None where a render had no face or body), so `python -m rulztrainer.likeness_stats <job folder>`
+`combined_seeds`, None where a render had no face or body, or, since 3.19.0, a face left unscored by the second-face
+or small-face check), so `python -m rulztrainer.likeness_stats <job folder>`
 reports a finished run's probe noise: the seed-to-seed spread inside a probe and the per-seed change between
 consecutive probes (see [Probe noise check](#probe-noise-check-noise_files)). The controller then, each individually switchable:
 
@@ -1771,13 +1801,14 @@ consecutive probes (see [Probe noise check](#probe-noise-check-noise_files)). Th
 head-and-shoulders picture where a body was asked for) used to show only as a missing score. The log now says how many
 renders of a probe that is (`Body probe framing step N: 5 of 8 renders show no measurable body`), and `likeness.jsonl`
 keeps it (`body_probes`, `body_missing`). `likeness_curriculum_framing` (0 = off, experimental and never run in a real
-training) lets the curriculum read it: a render without a body counts against the body, so a body probe that has
+training; it acts only with `likeness_framing: false`, below) lets the curriculum read it: a render without a body counts against the body, so a body probe that has
 turned into portraits pulls the sampling towards the full-body photos instead of leaving the curriculum on a stale
 body score. At 1 a probe with no body in any render reads as a body score of 0. It was added after five Qwen-Image
 2.1 runs lost the body probe's framing in this way with nothing reacting to it. On a Qwen-Image 2.1 fine-tune the count
 read 2 of 8 at step 600, 4 at step 1000 and 8 of 8 from step 1600, a thousand steps before the body score itself went
 missing. With most renders gone, the few that are left can lift the combined score (62.5 from 2 renders), so look at
-the count before trusting a late best. The
+the count before trusting a late best. The [prompt check](#probe-prompt-presets-and-the-prompt-check) counts the
+same drift against the step-0 probe, for any probe prompt, and `likeness_best_min_kept` holds such a best back.
 
 **Lost renders count against the body score (`likeness_framing`, on by default since 3.4.0).** A body probe render with
 no measurable body counts as zero in the body score, against the share that showed one at the first probe, and one
@@ -1793,8 +1824,6 @@ follows: the best checkpoints, early stop, the lr control, a race's scores and t
 `race_drop_confidence` and the noise numbers read, which before counted a seed without a body as its face score
 alone. `likeness_framing: false` brings the old score
 back. The rule was replayed on recorded probes; it has not yet decided a training.
-[prompt check](#probe-prompt-presets-and-the-prompt-check) counts the same drift against the step-0 probe, for any
-probe prompt, and `likeness_best_min_kept` holds such a best back.
 
 The scores never enter the loss; they steer data, lr and stopping. Use the same reference set and prompts for a
 whole run so the series is comparable.
@@ -1974,6 +2003,8 @@ references better than they match each other, a sign it is copying them rather t
 from the step-0 floor (0) to the references' own level (1), unclipped and before the span's stretch (the body's
 over the renders that show one, before `likeness_framing` counts the lost ones). A probe above 1
 logs a "past the references' own level" line; it decides nothing (see also the [copy check](#copy-check-copy_check)).
+Since 3.19.0 each record also names what its scores measured (`face_model`, `body_score`), so a reader of the run's
+scale, such as the ComfyUI likeness nodes, applies it only to scores of the same kind.
 
 **Export spreadsheet** (Monitor, *Likeness probes & controller*, during or after a run) downloads `<job>_likeness.xlsx`,
 also written into the job folder: *Updated scores* has every probe's smoothed and per-probe face, body and combined
@@ -2121,8 +2152,10 @@ there. `keep_checkpoints` limits how far back it can reach.
 
 ## Gold face scorer (`face_gold`)
 
-The probes judge the face with ArcFace, and three things train against that same ArcFace: the reward stage, the
-identity loss on its `arcface` backend and identity alignment (`id_align`). They can raise the ArcFace score without
+The probes judge the face with ArcFace, and three things train against ArcFace too: the reward stage, the identity
+loss on its `arcface` backend and identity alignment (`id_align`). With the default `face_model: buffalo_l` it is the
+very same network; with `antelopev2` the probes use ArcFace R100 and the identity loss and `id_align` stay on R50, a
+close relative. They can raise the ArcFace score without
 the face looking more like the person, the same trap as a reward model in RLHF: the score a run is judged by should
 not be the one it optimizes. `face_gold` adds a second recognizer that nothing trains on. Since 3.14.0 it is
 **AdaFace ViT-Base** (CVLface, trained on WebFace4M; downloaded once to `models/adaface/`, about 460 MB, from a pinned
@@ -2272,7 +2305,7 @@ face boxes and the body scorer's pose landmarks, and sorts the render into one o
 
 `full` does not ask for the feet. The models draw a "full body" prompt from head to thigh as often as from head to
 toe, and knees and ankles come and go with the pose, so they would report drift where the framing has not changed. A
-second face of comparable size never keeps a one-person prompt. Without a body scorer the face's size alone decides,
+second face at least half as tall as the largest never keeps a one-person prompt. Without a body scorer the face's size alone decides,
 without a face scorer the hips do; a render with neither a face nor a pose counts as unclear.
 
 **Drift is counted against the base model, not against the words.** The step-0 probe of the same prompt and seed is
@@ -2296,7 +2329,7 @@ adds a face detection and a pose detection per body render: about 0.3 s a render
 
 **Preset prompts for a character LoRA.** The Train tab has a preset list beside each probe prompt. Picking one writes
 the prompt into the field with your trigger word and the **subject** (`probe_subject`, a few words such as "a young
-woman with long dark brown hair"; empty = the dataset's class from LoRA Isolation, else "a person") and sets what it
+woman with long dark brown hair"; empty = the first dataset row's *Class* from LoRA Isolation, else "a person") and sets what it
 should show. The prompt stays editable.
 
 | Preset | Probe | Shows |
@@ -2362,8 +2395,10 @@ most like the person. Each reward step:
 1. renders `reward_group` (4) pictures of one prompt from different seeds with a stochastic sampler: the usual sampler
    turned into an SDE with the same marginals (Flow-GRPO's step, noise level `reward_noise` 0.7), so every denoising
    move is a Gaussian with a known probability. Steps and guidance are the probes' (`reward_sample_steps` 0 =
-   `probe_steps`, `probe_cfg`), with the turbo LoRA the probes use;
-2. scores each with the probes' scorers on their scale, uncurved (0 = a stranger, 1 = the references; a missing
+   `probe_steps`, `probe_cfg`), with the turbo LoRA the probes use, at `reward_size` (0 = `probe_size`; square, a
+   full-body prompt 2:3);
+2. scores each with the probes' scorers on their scale, uncurved (0 = a stranger, 1 = the scale's 100, which with the
+   default span of 1.35 puts the references themselves at about 0.74; a missing
    face counts -1), each part kept within -0.5 .. 1.5, combined with `face_weight` / `body_weight`. Far below a
    stranger says nothing about likeness: it is a body in a coat against unclothed body references, or an upper-body
    shot against full-body ones. Uncapped, such a body score (its scale several times narrower than the face's)
@@ -2409,7 +2444,7 @@ from before the history existed are imported from their job folders when the tab
 Tick any number of runs in the table (name, start, state, steps, adapter, learning rate, last and best scores) to
 overlay them: one colour per run, solid lines for the face, dashed for the body and thick for the combined score. The
 legend has one entry per run (click it to hide all of that run's lines) and the tooltip names each line (`<run> ·
-face`). Above each chart is a *Show lines (all runs)* bar of Face / Body / Combined chips above each chart: switch one off to hide that line of
+face`). Above each chart is a *Show lines (all runs)* bar of Face / Body / Combined chips: switch one off to hide that line of
 every ticked run at once, and on again to bring it back. A race run draws each configuration's probe lines in its own colour, named
 after it (`<run> lora16`; the winner's after the race: `winner`); *Import old runs* adds that split to race runs
 saved before it existed, while their job folder is still there. *Rename* gives a run a name of your own and *Remove from history* deletes
@@ -2505,9 +2540,9 @@ several random paths at every probe, instead of whole runs on different seeds: t
 steps (`steps` must be a multiple of `probe_every`): N configurations cost N runs' steps. The last round's winner is the
 run's LoRA (`<job>.safetensors`, its settings `<job>_winner.yaml`), the others are saved as
 `<job>_<name>_final.safetensors`, and since they share one lineage, the best checkpoint any of them reached is
-`<job>_best.safetensors`. Rows must share the LoRA's shape (no `lora_rank`, `lora_alpha`, targets, blocks, network type
-or DoRA rows; `lora_dropout` is fine), the drop and patience rules are ignored, and it does not run with
-`race_parallel`. A configuration on another kind of optimizer than the winner's starts its optimizer state over (the
+`<job>_best.safetensors`. Rows must share the LoRA's shape (no `lora_rank`, `lora_alpha`, targets, blocks, text
+embedder, network type, LoKr factor, OFT or DoRA rows; `lora_dropout` is fine), the drop and patience rules are
+ignored, `race_drop_drift` must be 0, and it does not run with `race_parallel`. A configuration on another kind of optimizer than the winner's starts its optimizer state over (the
 log says so; Automagic 3 and 4 count as different kinds). With 4 seeds the round's best of 4 probes is somewhat lucky: the probe noise (a few points) is part of
 what picks the winner, so more probe seeds (`probe_seeds`) make the choice steadier.
 
@@ -2530,7 +2565,7 @@ GPU alone (by 5%), else on the first GPU only. The winner trains on the same way
 `batch_size` x `gradient_accumulation` images per step, wherever it runs, so the comparison stays fair (plain data
 parallel gives each step that many images on every GPU). Each configuration owns its parameters, optimizer and weight
 average, parked on the CPU while it waits; the model copies carry the weights of whoever trains there. Not with the
-identity loss; `torch.compile` is off; no training states. Manual drops, the gallery and the race table work as before
+identity loss or self-training; `torch.compile` is off; no training states. Manual drops, the gallery and the race table work as before
 (the table marks every configuration that is training). A three-configuration test on an RTX 5060 Ti and an RTX 4060
 Ti ran two at once at about 6.6 s per step each, against about 13 s one after the other.
 
@@ -2592,8 +2627,9 @@ data"; ~20% slower steps; files ~1/64 of the weights, about 400 MB on a 12B mode
 
 - `lora_rank`, `lora_alpha`, `lora_plus_ratio` and `lora_dropout` are LoRA-only; a LoKr layer's scale is 1.
 - Saved keys are LyCORIS: `<stem>.lokr_w1`, `.lokr_w2`, `.alpha` (1.0), with the family's usual stems
-  (`diffusion_model.<module>` for MOSS-Image, `transformer.<module>` for Krea 2 and FIBO). ComfyUI's LoRA loader
-  takes both for MOSS-Image and Krea 2 (it maps the diffusers stems); diffusers has no LoKr loader, so a FIBO 2.0
+  (`transformer.<module>` for the families saved in the diffusers / PEFT layout, FIBO 2.0, Krea 2 and Qwen-Image 2.1;
+  `diffusion_model.<module>` for the others). ComfyUI's LoRA loader takes both for MOSS-Image and Krea 2 (it maps the
+  diffusers stems); diffusers has no LoKr loader and ComfyUI has no map for FIBO 2.0's diffusers names, so a FIBO 2.0
   LoKr loads only back into RulzTrainer. The metadata carries `ss_network_module: lycoris.kohya` and
   `ss_network_args: {"algo": "lokr", "factor": N}`.
 - A LoKr file (Fizgig's, ai-toolkit's, LyCORIS) also works as a sampling-only `turbo_lora` / `sample_lora`;
@@ -2761,9 +2797,15 @@ probe images, never during training steps.
 | FIBO 2.0 | `fibo_2.0_turbo_lora_avg_rank_270_bf16` ([Comfy-Org/Fibo-2.0](https://huggingface.co/Comfy-Org/Fibo-2.0)): Edit Turbo as a LoRA on dev | 4 | 1 | from the image size |
 | Qwen-Image 2.1 | `qwen_image_2.1_turbo_lora_avg_rank_178_bf16` ([Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1)), extracted from Qwen-Image-2.1-Turbo | 8 | 1 | the Turbo checkpoint's own sigmas |
 | Ideogram 4 | `ideogram_4_turbotime_v1` ([ostris/ideogram_4_turbotime_lora](https://huggingface.co/ostris/ideogram_4_turbotime_lora), community, rank 128, 847 MB): few steps, no CFG and no unconditional model | 8 | 1 | logit-normal, mu 0, std 1.75 (ai-toolkit's sampler, its samples') |
+| MiniMax H3 | lightx2v's `minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16` ([Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3)), the FL2VA Turbo 8-step LoRA | 8 | 1 | 12 |
+| FLUX.2 Klein 9B | vafipas663's `flux-2-klein-9b_extracted_lora_rank_256-bf16` ([vafipas663/flux2-klein-base-9b-distill-lora](https://huggingface.co/vafipas663/flux2-klein-base-9b-distill-lora)), the distilled Klein extracted against Base | 4 | 1 | 2.02 |
+
+FLUX 3 Klein, P-H3-Image, MiniMax-H3-Image and PAN 2 have none: P-H3-Image and MiniMax-H3-Image are distilled
+already (8 and 6 steps, no guidance), PAN 2 samples at 50 steps, CFG 2.5, and FLUX 3 Klein at 50 steps unless the
+distilled Klein is the sampling model (see each model's section).
 
 When the model that renders samples is itself a Turbo checkpoint (training on Krea-2-Turbo or Qwen-Image-2.1-Turbo,
-a file name containing "turbo", or a Turbo `sample_model_path`), `auto` adds no turbo LoRA: the Raw-to-Turbo LoRA
+a file name containing "turbo", a Klein name without "base", or a Turbo `sample_model_path`), `auto` adds no turbo LoRA: the Raw-to-Turbo LoRA
 on top of a Turbo model would distil it twice, so samples and probes would not show the LoRA as it is used. A turbo
 LoRA set by hand on a Turbo model logs a warning.
 
@@ -2790,7 +2832,8 @@ and a sampling LoRA that matches no layer of the model stops the run with its na
 LoRA layers (`lora_down/up`, `lora_A/B`), `diff_b` bias offsets and `diff` offsets of normalization weights (swapped
 in only while sampling) are applied; Krea 2 LoRAs may use ComfyUI's module names (`blocks.N.attn.wq`) or ours, and a
 FIBO 2.0 LoRA in ComfyUI's fused layout (Comfy-Org's Turbo LoRA) is split back into the model's own, and so is a
-Qwen-Image 2.1 LoRA on ComfyUI's fused feed-forward (`img_mlp.gate_up`, Comfy-Org's Turbo LoRA). LoKr / LoHa /
+Qwen-Image 2.1 LoRA on ComfyUI's fused feed-forward (`img_mlp.gate_up`, Comfy-Org's Turbo LoRA). LoKr
+(`lokr_w1` / `lokr_w2`, also stored low-rank) is applied too. LoHa, DoRA scales, Tucker LoKr (`lokr_t2`) and
 full-weight diffs of linear layers cannot be applied while sampling and are named in a warning. With a turbo LoRA,
 Krea 2 samples on its distilled schedule (fixed shift, as ComfyUI does), and the log warns about guidance other than
 CFG 1.
@@ -2818,9 +2861,13 @@ the WebUI (where *Create dataset* makes new ones; git-ignored) and folders elsew
 (remembered in `datasets/.rulz_datasets.json`; *Remove from list* forgets one without touching its files). Click a
 dataset to open it:
 
-- *Upload* sends images and their `.txt` or `.json` captions from the computer the browser runs on to the machine
-  running RulzTrainer, a vast.ai instance included; on the same machine that is a plain copy. Files keep their names
-  and a file with the same name is replaced.
+![An open dataset: each picture with its Face ref / Body ref / Baseline ticks and its caption](docs/screenshots/07-dataset.png)
+
+- *Upload* sends images, video clips and their `.txt` or `.json` captions from the computer the browser runs on to the
+  machine running RulzTrainer, a vast.ai instance included; on the same machine that is a plain copy. Files keep their
+  names and a file with the same name is replaced; other kinds of files are skipped and listed. Since 3.16.0 files go
+  one at a time in 8 MB pieces: when the connection drops, the piece is sent again after a pause and the files already
+  sent stay. The box shows each file and the megabytes sent; keep the page open until it says *Uploaded*.
 - *Copy from a folder* copies the images and captions of a folder on the machine running RulzTrainer into the dataset,
   sub-folders kept; files the dataset already has are left alone.
 - The grid shows every picture with its caption, saved to the `.txt` file as you type, and the *Face ref* / *Body ref*
@@ -2850,7 +2897,7 @@ so does an unusual pose or a rear view when the baselines are all front views. D
 together, so there are no ArcFace-style 0.45 / 0.30 rules: the colours read off the scan's median and fence, and the fence
 has no floor. A picture without shoulders and hips in the frame, or with under 60% of its window inside it (a
 portrait), gets no score. It runs on the *Body score device* (Identity similarity) and downloads the pose model and DINOv2
-once, as the trainer does. On the 60 AZav50 photos, 22 had a usable window; with three front views as baselines the
+once, as the trainer does. On one 60-photo set, 22 had a usable window; with three front views as baselines the
 fence flagged a pose lying on sand and two rear views. *Warm up look outliers* eases in the outliers of both scans.
 
 On a real 60-photo set with three front-facing baselines, the scan took about a minute on the CPU. The median match was
@@ -2914,9 +2961,11 @@ detected from the model; `model_arch: auto`). The repo is gated: accept its term
   the image size, 10% uniform); the other modes work as for MOSS. Previews use the pipeline's schedule (size-shifted
   sigmas, CFG as a second pass with the null caption); Bria samples dev at 50 steps / CFG 5, 20-30 steps is fine for
   previews. The MOSS-only sample shift and skip layer are ignored.
-- **Output format.** FIBO LoRAs are saved in the diffusers / PEFT format (`transformer.<module>.lora_A/B.weight` plus
-  the adapter config in the file metadata, alpha / rank folded into `lora_B` as for Krea 2), since ComfyUI has no
-  FIBO 2.0 support yet:
+- **Output format.** FIBO LoRAs are saved in the diffusers / PEFT format (`transformer.<module>.lora_A/B.weight` with
+  Bria's module names, plus the adapter config in the file metadata, alpha / rank folded into `lora_B` as for
+  Krea 2). ComfyUI runs FIBO 2.0 from Comfy-Org's single files, but in its own fused layout (`attention.qkv`,
+  `feed_forward.w13`), and its LoRA loader has no map from Bria's names onto it, so these files are not expected to
+  load there (not tried; nothing in RulzTrainer writes ComfyUI's FIBO layout). Use the LoRA in diffusers:
 
   ```python
   import torch
@@ -3030,8 +3079,9 @@ layer before the final norm, and its own RGBA VAE: 16x, 64 channels). Pick **Qwe
   to warn you; trained with a frozen *training adapter* (a small LoRA that is on for every training step, off for
   samples and probes, and never saved into your file) likeness reached 77 against 56 without. `auto` downloads
   Fizgig's ([ShootTheSound/Fizgig-Qwen-Image-2.1-Training-Adapter](https://huggingface.co/ShootTheSound/Fizgig-Qwen-Image-2.1-Training-Adapter),
-  80 MB); `""` trains without one, a path uses another, `training_adapter_strength` scales it. The other families
-  have none of their own, and a path works on them too. Not used by a full fine-tune.
+  80 MB); `""` trains without one, a path uses another, `training_adapter_strength` scales it. MiniMax H3, P-H3-Image and
+  MiniMax-H3-Image have their own too (see their sections); the other families have none, and a path works on them
+  too. Not used by a full fine-tune.
 - **Recipe** (Fizgig's, which the setup wizard suggests): 0.5 MP (it keeps more of the model's sharpness than 1 MP and
   is quicker), rank 8 at learning rate 2e-4 (rank 16 at half the rate for big or mixed datasets; 1.5e-4 for styles),
   EMA 0.98. Fizgig found identity sits in blocks 10-14 (`lora_blocks: 10-14` trains only those).
@@ -3135,7 +3185,7 @@ only.
   text encoder (4.9 GB, the same model Krea 2 and FIBO 2.0 load) and `flux2-vae`. The diffusers repo
   (`model_source: hf`) works too and downloads only `transformer/`, `text_encoder/`, `vae/` and the configs (about
   20 GB; not BFL's root single files or the fp8 / nvfp4 variants). `transformer_quant: auto` keeps a bf16 model bf16
-  on a 16 GB card, int8 from 10 GB, nvfp4 below.
+  on a 16 GB card (15 GB and up), int8 from 9.5 GB, nvfp4 below.
 - **Memory**, measured on an RTX 5060 Ti (16 GB) with the real shapes and random weights (not yet a real-weights run):
   a rank-32 step on the default targets at 1 MP with gradient checkpointing and AdamW peaked at 12.2 GB reserved in
   bf16 (5.6 s per step), 7.8 GB in int8 (4.9 s) and 6.0 GB in nvfp4 (4.7 s); one sampling forward at 1 MP took 1.5 s
@@ -3333,8 +3383,9 @@ What is modeled on evidence, and what is not:
   single latent decodes badly on its own, so previews decode it as a 5-latent clip of copies and keep the first real
   frame, ComfyUI's still path. The Sol VAE and the int8 VAE are not read (for a still the Sol decoder decodes as the
   stock one does in ComfyUI).
-- **Not verified without the weights**: everything numeric about memory, speed and quality below; the turbo LoRA on
-  single frames; a whole training run.
+- **Not verified without the weights** (written before the first real runs): everything numeric about memory, speed
+  and quality below; the turbo LoRA on single frames. A real training run on stills plus clips is in
+  [Video clip training](#video-clip-training-pan-2-minimax-h3); a long run on stills alone has not been made.
 
 **Files.** `model_source: files` downloads from [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3)
 (sizes from the Hub): the diffusion model as `pruned_int8_convrot` (21.0 GB; the WebUI and the wizard pick it for H3),
@@ -3685,7 +3736,7 @@ other learning rates. Face probes ran in a 200-step check, as clips. One short r
   (transformer 63, text encoder 15, VAE 2.7), and quantizes the transformer on load in `transformer_quant`
   (shard by shard, so the 58 GB of bf16 weights are never in memory at once).
 - **Single files** (`model_source: files`): nobody publishes single files of PAN 2, so there is nothing to
-  download. Make them once with [`scripts/pan2/convert_pan2.py`](scripts/pan2/README.md) (CPU only) and set all
+  download. Make them once with [`scripts/pan2/convert_pan2.py`](scripts/pan2/README.md) (on the CPU by default) and set all
   three:
 
   | File | Size | |
@@ -3875,10 +3926,18 @@ Not run: clip training with block swap or two GPUs, `train_video_mode: spread`, 
 
 ## Using the LoRA in ComfyUI
 
-Recent ComfyUI builds support MOSS-Image natively (`comfy/ldm/moss_image`, CLIP type `moss_image`), so no
-plugin is required. Copy the trained `.safetensors` into `ComfyUI/models/loras/` and add a standard
-**Load LoRA** node after *Load Diffusion Model*. Both the unfused checkpoints and ComfyUI's repacked
-fused-qkv files work: ComfyUI maps the `proj.q/k/v` LoRA keys onto slices of the fused weight.
+Copy the trained `.safetensors` into `ComfyUI/models/loras/` and add a standard **Load LoRA** node after *Load
+Diffusion Model*. Current ComfyUI builds run MOSS-Image, Krea 2, Qwen-Image 2.1, FLUX 3 Klein, FLUX.2 Klein 9B,
+Ideogram 4, MiniMax H3, P-H3-Image and MiniMax-H3-Image natively, so no plugin is needed. Two exceptions:
+
+- **FIBO 2.0**: ComfyUI runs the model, but its LoRA loader does not map the diffusers layout RulzTrainer saves FIBO
+  LoRAs in; use them in diffusers (see [FIBO 2.0](#fibo-20-bria-training-on-dev-using-the-lora-on-edit-turbo)).
+- **PAN 2**: stock ComfyUI does not know the model; use a build with PAN 2 support (see [PAN 2](#pan-2)).
+
+Each model's own section gives its file layout and how to use the LoRA (steps, CFG, which checkpoint). The rest of
+this section is MOSS-Image's layout. ComfyUI runs it natively (`comfy/ldm/moss_image`, CLIP type `moss_image`).
+Both the unfused checkpoints and ComfyUI's repacked fused-qkv files work: ComfyUI maps the `proj.q/k/v` LoRA keys onto
+slices of the fused weight.
 
 The file uses the generic ComfyUI key format (the same one ComfyUI's own MOSS-Image LoRAs use):
 
@@ -3888,12 +3947,13 @@ diffusion_model.layers.<n>.proj.<...>.lora_up.weight
 diffusion_model.layers.<n>.proj.<...>.alpha
 ```
 
-These names are identical in the diffusers checkpoint and the ComfyUI plugin model, so no key conversion is needed.
+These names are identical in the diffusers checkpoint and ComfyUI's MOSS-Image model, so no key conversion is needed.
 
 ### Scoring likeness in ComfyUI
 
 `comfyui/rulztrainer_likeness` is a ComfyUI node pack that scores any images against a person's references with the
-trainer's own scoring code and defaults: face, body and overall on the normalized scale, averaged over one image, a
+trainer's own scoring code and defaults: face, gold face (AdaFace or FaceNet), body and overall on the normalized
+scale, with the same face model choice (`face_model`) and the same second-face / small-face check, averaged over one image, a
 batch or folders of images, with every image's own scores and an optional .xlsx or CSV export. References can be
 shared or separate for face and body, as in the trainer. An optional set of base-model images sets the 0 of the scale
 like the trainer's step-0 probe, and a trainer job folder can supply that run's exact scale. Link the folder into
@@ -3911,7 +3971,7 @@ ComfyUI's `custom_nodes` and load `workflows/RulzTrainer Likeness Scoring.json`;
 | Text encoder device | `auto` (spreads over all GPUs + CPU during caching only) |
 | Max caption tokens | 512 to 1024 unless you train on very long prompts |
 
-The DiT in bf16 is about 10 GB. The text encoder is about 18 GB in bf16, so it is loaded only for caching
+For MOSS-Image: the DiT in bf16 is about 10 GB. The text encoder is about 18 GB in bf16, so it is loaded only for caching
 with `device_map="auto"`; set `text_encoder_quant` to `int8`, `int8_convrot` or `nvfp4` if you want it on a single
 GPU.
 
@@ -4087,42 +4147,60 @@ rulztrainer/
   compiling.py     torch.compile settings, the compile_model auto rule, compile stats, the compile cache file
   profiling.py     one-step GPU profile by kernel group (RULZ_PROFILE_STEP), peak RAM, memory snapshots
   race.py          configuration race: settings, round schedule, swapping configurations' LoRAs
+  race_parallel.py one configuration per GPU at the same time
   promptcheck.py   probe prompt presets, and the prompt check: a probe render's frame against its prompt's
+  likeness.py      likeness probes, the normalized scale and the controller; facesim.py, bodysim.py, bodyshape.py,
+                   bodyanchor.py, adaface.py, facenet.py the face and body scorers
+  clips.py         video clips: training clips' frames, clip samples and probes as animated WebP
+  blockswap.py     block swap; multigpu.py data parallel and model split
+  isolation.py     LoRA Isolation; finetune.py / extract_finetune.py full fine-tune and LoRA extraction
+  comfy_files.py   the single files per model; downloads.py Hugging Face downloads with progress
+  runreport.py     run report (summary picture and PDF); history.py run history for Previous Runs
+  train_queue.py   the WebUI's training queue; oom_recovery.py out-of-memory restarts
+  optimizers/      Automagic 3 and 4, Keel, Muon / NorMuon, Hull
   train.py         CLI entry point
   moss/model.py    MOSS-Image DiT (vendored, Apache-2.0, OpenMOSS)
   moss/loading.py  download + load (HF layout or single files), quant dispatch, encode helpers
   moss/single_file.py  ComfyUI single-file loaders (dequant, unfuse qkv, text-only Qwen3.5)
-  archs.py         the model families (MOSS-Image, FIBO 2.0, Krea 2) behind one interface
+  archs.py         the eleven model families behind one interface
   fibo/            Bria FIBO 2.0: DiT port, loading, VGL prompts, sampler
   krea2/           Krea 2: DiT port, loading (Qwen-Image VAE, Qwen3-VL layer stack), sampler
-  pan2/            PAN 2: the video model for one-frame targets, loading (Wan 2.2 VAE, Qwen3.5-9B), sampler
+  qwen21/ flux3/ flux2/ ideogram4/   Qwen-Image 2.1, FLUX 3 Klein, FLUX.2 Klein 9B, Ideogram 4
+  h3/ ph3/ h3image/                  MiniMax H3, P-H3-Image, MiniMax-H3-Image
+  pan2/            PAN 2: the video model (stills as one-frame videos, and clips), loading (Wan 2.2 VAE,
+                   Qwen3.5-9B), sampler
 webui.py           NiceGUI web UI (runs training as a subprocess)
 configs/           example configs
 tests/             smoke tests (no weights needed): python -m pytest tests
                    (CI runs them on the CPU with the versions in tests/requirements-ci.txt)
-install.bat / run_webui.bat   Windows install and start;  install.sh / run_webui.sh   the same for Linux
+install.bat / run_webui.bat   Windows install and start;  install.sh / run_webui.sh   the same for Linux;
+                   run_webui_tailscale.bat starts it with Tailscale
 scripts/vast/      vast.ai: provision.sh (PROVISIONING_SCRIPT), supervisor wrapper + conf, create_template.sh,
-                   rulz_remote.py (reach an instance's runs from your computer) and its instance side rulz_agent.py
+                   download_models.sh (the model bucket), rulz_remote.py (reach an instance's runs from your
+                   computer) and its instance side rulz_agent.py, rulz_fleet.py (several instances at once)
 scripts/bench.py   short timing runs that wait for idle GPUs (s/step, warm-up, peak memory)
+scripts/soup.py, posthoc_ema.py, check_lora.py, hull_agreement.py, torch_index.py   command-line helpers
 scripts/pan2/      convert_pan2.py: IFM/PAN2 into single files for ComfyUI and this trainer; verify_pan2.py checks one
+comfyui/rulztrainer_likeness/   the ComfyUI likeness scoring nodes
+docs/              test results, the Keel and Hull designs, screenshots
 Dockerfile         optional vast.ai image with the install baked in
 ```
 
 ## Adding another model
 
-Model families are `Arch` classes in `rulztrainer/archs.py` (MOSS-Image, FIBO 2.0, Krea 2, Qwen-Image 2.1 and
-FLUX 3 Klein today). An Arch provides
+Model families are `Arch` classes in `rulztrainer/archs.py` (the eleven listed at the top of this page). An Arch
+provides
 the loading functions (transformer, VAE, text encoder), `encode_prompt` / `pad_embeds`, `encode_images` /
 `decode_latents` for its VAE, a sampler, the LoRA module names for the target groups, the export format, and its
 reference timestep recipe. A family with a VAE of its own sets `latent_tag`, so its latents are cached under their own
 file names. The transformer must take the trainer's convention, `model(latents, sigma * 1000, embeds, mask)` with the
 normalized 2x2-patchified latents [B, C, H/16, W/16], and expose `.layers` (the blocks) for block selection, compile
-and the model split, plus `split_tail_modules()` (what runs after the last block); `rulztrainer/krea2/` is the most
-recent template, and `tests/test_krea2.py` checks a port against the diffusers model with tiny random weights.
+and the model split, plus `split_tail_modules()` (what runs after the last block); `rulztrainer/krea2/` is a clean
+template, and `tests/test_krea2.py` checks a port against the diffusers model with tiny random weights.
 
 ## License
 
-Open source under the [MIT License](LICENSE). Base models you download (MOSS-Image, FIBO, Krea, text encoders) keep their own licenses.
+Open source under the [MIT License](LICENSE). Base models you download (the models, text encoders, VAEs, turbo LoRAs and training adapters) keep their own licenses; each model's section names its license where it limits use.
 
 The RulZ name and logo are excluded from the MIT License; all rights reserved. If you fork or redistribute this
 project, remove or replace the RulZ branding. See [LOGO-NOTICE.md](LOGO-NOTICE.md).
