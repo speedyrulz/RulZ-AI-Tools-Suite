@@ -170,12 +170,14 @@ class Settings:
     last_profile: str = ""
     geometry: str = ""             # base64 of the saved window geometry
     splitter: list[int] = field(default_factory=list)
+    close_to_tray: bool = False    # closing the window hides it to the tray instead of exiting
 
     def to_dict(self) -> dict:
         return {
             "stagger_seconds": self.stagger_seconds,
             "stop_timeout": self.stop_timeout,
             "log_max_lines": self.log_max_lines,
+            "close_to_tray": self.close_to_tray,
             "last_profile": self.last_profile,
             "geometry": self.geometry,
             "splitter": list(self.splitter),
@@ -199,6 +201,7 @@ class Settings:
         s.stagger_seconds = number("stagger_seconds", 3.0, 0.0, 120.0, float)
         s.stop_timeout = number("stop_timeout", 10, 1, 300, int)
         s.log_max_lines = number("log_max_lines", 5000, 200, 200000, int)
+        s.close_to_tray = data.get("close_to_tray") is True
         s.last_profile = str(data.get("last_profile") or "")
         s.geometry = str(data.get("geometry") or "")
         splitter = data.get("splitter") or []
