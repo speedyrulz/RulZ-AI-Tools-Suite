@@ -1,9 +1,9 @@
 import type { ChildProcess } from 'node:child_process'
 import { existsSync, readdirSync } from 'node:fs'
 import { copyFile, mkdir, readdir, readFile, rm, stat } from 'node:fs/promises'
-import { basename, dirname, join, relative } from 'node:path'
+import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { shell } from 'electron'
-import { CATALOG, findApp, launchEnv } from '@shared/catalog'
+import { CATALOG, findApp, launchEnv, SUITE_REPO } from '@shared/catalog'
 import { requirementRefLabel } from '@shared/requirements'
 import type { LogLine } from '@shared/ipc'
 import type {
@@ -29,6 +29,7 @@ import {
   stagingDir,
   swapInto
 } from './archive'
+import { CatalogCache } from './catalogCache'
 import { download, publishedSha256 } from './download'
 import {
   branchSha,
@@ -41,7 +42,6 @@ import {
   isNewer,
   latestRelease,
   loadEtags,
-  rawFile,
   recentReleases,
   releaseVersion,
   sourceArchiveUrl,
@@ -57,8 +57,10 @@ const LOG_LIMIT = 3000
 /** A log is cut back to LOG_LIMIT lines once it is this many longer, not on every line (each cut moves every line). */
 const LOG_SLACK = 500
 const LATEST_TTL_MS = 30 * 60_000
-/** After a README can't be fetched from GitHub (offline, say), the bundled copy is shown at once for this long. */
-const README_RETRY_MS = 5 * 60_000
+/** GitHub is asked about newer READMEs and screenshots at most this often, unless the user asks for a check. */
+const CATALOG_TTL_MS = 30 * 60_000
+/** ...or this often while files from the last check are still to be fetched. */
+const CATALOG_RETRY_MS = 5 * 60_000
 /** Log lines are sent to the window in batches: a pip install can print hundreds a second. */
 const LOG_FLUSH_MS = 100
 /** Leftover partial downloads (kept so a retry can resume) are deleted after this long. */
@@ -126,6 +128,10 @@ export function readLatestCache(cache: LatestCache | null): Map<string, LatestEn
 export interface AppManagerOptions {
   store: Store
   catalogDir: string
+  /** Where newer READMEs and screenshots from GitHub are kept; without it only the bundled catalog is shown. */
+  catalogCacheDir?: string
+  /** The launcher's version: a cache written by another version starts over. */
+  launcherVersion?: string
   downloadsDir: string
   iconsDir: string
   emitApps: (apps: AppView[]) => void
@@ -225,14 +231,13 @@ export class AppManager {
   private jobs = new Map<string, { state: JobState; abort: AbortController; done: Promise<void> }>()
   private logs = new Map<string, string[]>()
   private running = new Map<string, ChildProcess>()
-  private readmes = new Map<string, ReadmeDoc>()
+  /** The screenshots shipped with the launcher, by app. */
   private screenshots = new Map<string, string[]>()
+  private catalog: CatalogCache | null
   /** Finding installs made outside the launcher (searches the registry); done once, after the window is up. */
   private detected: Promise<void> = Promise.resolve()
   private pendingLogs: LogLine[] = []
   private logTimer: ReturnType<typeof setTimeout> | null = null
-  /** When each app's README last failed to come from GitHub. */
-  private readmeFailed = new Map<string, number>()
   /** The GitHub check in progress, shared by calls made while it runs. */
   private refreshing: { force: boolean; done: Promise<void> } | null = null
   /** Set once quitting has begun: no new jobs. */
@@ -242,7 +247,24 @@ export class AppManager {
   /** The folders that running installs fill, by app. */
   private installDirs = new Map<string, string>()
 
-  constructor(private readonly o: AppManagerOptions) {}
+  constructor(private readonly o: AppManagerOptions) {
+    this.catalog =
+      o.catalogCacheDir && o.launcherVersion
+        ? new CatalogCache({
+            repo: SUITE_REPO,
+            branch: 'main',
+            bundledDir: o.catalogDir,
+            cacheDir: o.catalogCacheDir,
+            launcherVersion: o.launcherVersion,
+            appIds: CATALOG.map((a) => a.id)
+          })
+        : null
+  }
+
+  /** Newer READMEs and screenshots from GitHub are used (the setting is on, and there is a cache). */
+  private get liveCatalog(): CatalogCache | null {
+    return this.o.store.getSettings().liveReadme ? this.catalog : null
+  }
 
   /** Quick: everything the first window needs. The slower search for outside installs runs afterwards. */
   async init(): Promise<void> {
@@ -251,6 +273,7 @@ export class AppManager {
       const files = existsSync(dir) ? readdirSync(dir).filter((f) => IMAGE_EXT.test(f)).sort() : []
       this.screenshots.set(app.id, files.map((f) => `rulz://catalog/${app.id}/screenshots/${encodeURIComponent(f)}`))
     }
+    await this.catalog?.load()
     // The last GitHub answers, so cards have versions at once and repeated launches don't use up the API's
     // 60 requests an hour; with their ETags, asking again is a short answer while nothing changed (still a request).
     const cache = await this.o.store.loadCache<LatestCache | null>('latest-cache.json', null)
@@ -289,8 +312,8 @@ export class AppManager {
     const latest = this.latest.get(app.id)
     return {
       app,
-      icon: `rulz://catalog/${app.id}/icon.png`,
-      screenshots: this.screenshots.get(app.id) ?? [],
+      icon: this.iconUrl(app.id),
+      screenshots: this.screenshotUrls(app.id),
       installed,
       // Kept rather than forgotten: a drive that isn't connected, or a folder moved for a moment, comes back.
       missing: !!installed && !installed.needsSetup && !existsSync(installed.launchPath),
@@ -310,6 +333,45 @@ export class AppManager {
 
   private changed(): void {
     this.o.emitApps(this.views())
+  }
+
+  // ---------- Catalog files (README, screenshots, icon) ----------
+
+  /** The app's screenshots: GitHub's list once known, with each file's hash in the URL so a new picture isn't cached. */
+  private screenshotUrls(appId: string): string[] {
+    const live = this.liveCatalog?.screenshots(appId)
+    if (!live) return this.screenshots.get(appId) ?? []
+    return live.map((s) => `rulz://catalog/${appId}/screenshots/${encodeURIComponent(s.name)}?v=${s.sha.slice(0, 12)}`)
+  }
+
+  private iconUrl(appId: string): string {
+    const sha = this.liveCatalog?.entry(`${appId}/icon.png`)?.sha
+    return `rulz://catalog/${appId}/icon.png${sha ? `?v=${sha.slice(0, 12)}` : ''}`
+  }
+
+  /** The file behind a rulz://catalog/ path: a newer copy from GitHub when there is one, else the bundled file. */
+  catalogFile(rel: string): string | null {
+    if (this.catalog) return this.catalog.file(rel, !!this.liveCatalog)
+    const file = resolve(this.o.catalogDir, rel)
+    return file.startsWith(resolve(this.o.catalogDir) + sep) ? file : null
+  }
+
+  /**
+   * Asks GitHub for newer READMEs, README images, screenshots and icons (one API request; the files themselves come
+   * from raw.githubusercontent.com, which has no hourly limit) and keeps them. Unless `force`, a check from the last
+   * 30 minutes is enough. Off when the "latest README" setting is.
+   */
+  async syncCatalog(force: boolean): Promise<void> {
+    const cache = this.liveCatalog
+    const ttl = cache?.hasFailures() ? CATALOG_RETRY_MS : CATALOG_TTL_MS
+    if (!cache || (!force && Date.now() - cache.checkedAt() < ttl)) return
+    try {
+      const r = await cache.sync()
+      await this.o.store.saveCache('github-etags.json', etagSnapshot()).catch(() => undefined)
+      if (r.changed) this.changed()
+    } catch {
+      // Offline or rate-limited: the files known so far stay, and the next check tries again.
+    }
   }
 
   defaultDir(appId: string): string {
@@ -406,6 +468,8 @@ export class AppManager {
   private async checkLatest(force: boolean): Promise<void> {
     // Asked for: the release pages and branch heads the apps share are fetched again, not taken from the last minute.
     if (force) dropSharedLists()
+    // Newer READMEs and screenshots, alongside the version checks.
+    const catalog = this.syncCatalog(force)
     // Cheap: only the catalog's known program paths (the registry search ran at startup).
     await this.reconcileInstalls(false)
     const now = Date.now()
@@ -423,7 +487,14 @@ export class AppManager {
       )
       await this.saveLatestCache()
     }
+    await catalog
     this.changed()
+  }
+
+  /** After a settings change: turning the GitHub README setting on or off changes which files are shown. */
+  settingsChanged(): void {
+    this.changed()
+    void this.syncCatalog(false)
   }
 
   private async saveLatestCache(): Promise<void> {
@@ -498,30 +569,15 @@ export class AppManager {
   async readme(appId: string, live: boolean): Promise<ReadmeDoc> {
     const app = this.app(appId)
     const linkBase = app.repo ? `https://github.com/${app.repo}/blob/main/${app.path}/` : null
-    if (live && app.repo) {
-      const cached = this.readmes.get(appId)
-      if (cached) return cached
-      // A recent failure isn't retried at once: on a bad connection each page would wait for the timeout first.
-      if (Date.now() - (this.readmeFailed.get(appId) ?? 0) >= README_RETRY_MS) {
-        try {
-          const markdown = await rawFile(app.repo, 'main', `${app.path}/README.md`)
-          const doc: ReadmeDoc = {
-            markdown,
-            assetBase: `https://raw.githubusercontent.com/${app.repo}/main/${app.path}/`,
-            linkBase,
-            source: 'github'
-          }
-          this.readmes.set(appId, doc)
-          this.readmeFailed.delete(appId)
-          return doc
-        } catch {
-          // Offline or not published: the copy shipped with the launcher.
-          this.readmeFailed.set(appId, Date.now())
-        }
-      }
-    }
-    const markdown = await readFile(join(this.o.catalogDir, appId, 'README.md'), 'utf8').catch(() => `# ${app.name}\n\n${app.description}`)
-    return { markdown, assetBase: `rulz://catalog/${appId}/repo/`, linkBase, source: 'bundled' }
+    // The catalog copy, newer from GitHub when one was fetched (syncCatalog); its images are kept the same way.
+    const cache = live ? this.liveCatalog : null
+    const file = this.catalogFile(`${appId}/README.md`) ?? join(this.o.catalogDir, appId, 'README.md')
+    const markdown = await readFile(file, 'utf8').catch(() => `# ${app.name}\n\n${app.description}`)
+    const source = cache?.readmeFromGitHub(appId) ? 'github' : 'bundled'
+    // Each image's hash goes in its URL, so one replaced since it was last shown isn't taken from Chromium's cache.
+    const assetVersions: Record<string, string> = {}
+    for (const [path, e] of cache?.entries(`${appId}/repo/`) ?? []) assetVersions[path] = e.sha.slice(0, 12)
+    return { markdown, assetBase: `rulz://catalog/${appId}/repo/`, linkBase, source, assetVersions }
   }
 
   // ---------- Jobs ----------

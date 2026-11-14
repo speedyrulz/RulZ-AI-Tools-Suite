@@ -4,7 +4,7 @@ import ReactMarkdown from 'react-markdown'
 import rehypeRaw from 'rehype-raw'
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
 import remarkGfm from 'remark-gfm'
-import { createSlugger, prepareReadme, resolveReadmeUrl } from '@shared/readme'
+import { createSlugger, prepareReadme, resolveReadmeUrl, withAssetVersion } from '@shared/readme'
 import type { ReadmeDoc } from '@shared/types'
 import { invoke } from '../lib/api'
 
@@ -38,12 +38,13 @@ function textOf(node: HastNode): string {
 function rehypeReadme(doc: ReadmeDoc) {
   return () => (tree: HastNode) => {
     const slug = createSlugger()
+    const asset = (url: string): string => withAssetVersion(resolveReadmeUrl(url, doc.assetBase), doc.assetBase, doc.assetVersions)
     const walk = (node: HastNode): void => {
       const p = node.properties
       if (p && node.type === 'element') {
-        if (typeof p.src === 'string') p.src = resolveReadmeUrl(p.src, doc.assetBase)
-        if (typeof p.srcSet === 'string') p.srcSet = resolveReadmeUrl(p.srcSet.split(/\s+/)[0], doc.assetBase)
-        if (Array.isArray(p.srcSet)) p.srcSet = resolveReadmeUrl(String(p.srcSet[0]).split(/\s+/)[0], doc.assetBase)
+        if (typeof p.src === 'string') p.src = asset(p.src)
+        if (typeof p.srcSet === 'string') p.srcSet = asset(p.srcSet.split(/\s+/)[0])
+        if (Array.isArray(p.srcSet)) p.srcSet = asset(String(p.srcSet[0]).split(/\s+/)[0])
         if (/^h[1-6]$/.test(node.tagName ?? '')) p.id = slug(textOf(node))
       }
       node.children?.forEach(walk)

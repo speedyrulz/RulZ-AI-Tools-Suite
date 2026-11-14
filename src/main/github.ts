@@ -81,8 +81,8 @@ export function clearEtags(): void {
 }
 
 /** `slim` keeps only what the launcher reads (release lists are large), before the answer is remembered. */
-async function api<T>(path: string, slim: (body: never) => T = (b) => b as T): Promise<T> {
-  const known = etags.get(path)
+async function api<T>(path: string, slim: (body: never) => T = (b) => b as T, remember = true): Promise<T> {
+  const known = remember ? etags.get(path) : undefined
   const res = await fetchImpl(`https://api.github.com${path}`, {
     headers: {
       Accept: 'application/vnd.github+json',
@@ -95,7 +95,7 @@ async function api<T>(path: string, slim: (body: never) => T = (b) => b as T): P
   if (res.ok) {
     const body = slim((await res.json()) as never)
     const etag = res.headers.get('etag')
-    if (etag) {
+    if (etag && remember) {
       etags.delete(path)
       etags.set(path, { etag, body })
       while (etags.size > ETAG_LIMIT) etags.delete(etags.keys().next().value!)
@@ -269,12 +269,43 @@ export async function branchSha(repo: string, branch: string): Promise<string | 
   return (await hit.heads).find(([name]) => name === branch)?.[1] ?? null
 }
 
-export async function rawFile(repo: string, branch: string, path: string): Promise<string> {
-  const res = await fetchImpl(`https://raw.githubusercontent.com/${repo}/${branch}/${path}`, {
-    signal: AbortSignal.timeout(10_000)
+/**
+ * A file from raw.githubusercontent.com, which doesn't count against the API's 60 requests an hour. Asked for by
+ * commit, not branch: a branch name is cached there for a few minutes and can hand out the file from before a push.
+ */
+export async function rawBytes(repo: string, ref: string, path: string, timeoutMs = 30_000): Promise<Uint8Array> {
+  const encoded = path.split('/').map(encodeURIComponent).join('/')
+  const res = await fetchImpl(`https://raw.githubusercontent.com/${repo}/${ref}/${encoded}`, {
+    signal: AbortSignal.timeout(timeoutMs)
   })
   if (!res.ok) throw new GitHubError(`Couldn't fetch ${path} (${res.status})`, res.status)
-  return res.text()
+  return new Uint8Array(await res.arrayBuffer())
+}
+
+/** A file in a folder on GitHub: its path below that folder and git's hash of its contents. */
+export interface TreeFile {
+  path: string
+  sha: string
+  size: number
+}
+
+/**
+ * Every file below `dir` at `commit`, with git's hash of each, in one request ("<sha>:catalog" is a tree-ish the trees
+ * API accepts). A commit's tree never changes, so the answer isn't kept for an ETag.
+ */
+export async function folderTree(repo: string, commit: string, dir: string): Promise<TreeFile[]> {
+  const ref = encodeURIComponent(`${commit}:${dir}`)
+  const tree = await api(
+    `/repos/${repo}/git/trees/${ref}?recursive=1`,
+    (body: { truncated?: boolean; tree?: { path: string; type: string; sha: string; size?: number }[] }) => ({
+      truncated: !!body.truncated,
+      files: (body.tree ?? []).filter((e) => e.type === 'blob').map((e) => ({ path: e.path, sha: e.sha, size: e.size ?? 0 }))
+    }),
+    false
+  )
+  // A cut-short list would look like files were deleted.
+  if (tree.truncated) throw new GitHubError(`GitHub's list of ${dir} was cut short.`, 0)
+  return tree.files
 }
 
 export function findAsset(release: Release, pattern: string): ReleaseAsset | undefined {
