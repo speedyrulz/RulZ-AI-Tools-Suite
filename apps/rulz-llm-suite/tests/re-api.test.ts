@@ -179,7 +179,8 @@ describe('recording RE sessions from the API server', () => {
       await server.stop()
       await new Promise<void>((r) => upstream.close(() => r()))
     }
-  })
+    // Two servers, real HTTP and file writes: it passed in about 3 s alone but timed out at the default 5 s on a busy machine.
+  }, 20_000)
 
   it('counts a request with fewer messages than the last one as trimmed', async () => {
     const traces = new TraceStore(join(dir, 're-data'))

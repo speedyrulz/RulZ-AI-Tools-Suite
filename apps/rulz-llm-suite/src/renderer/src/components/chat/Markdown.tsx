@@ -1,11 +1,12 @@
 import hljs from 'highlight.js/lib/common'
 import { Check, Copy } from 'lucide-react'
 import { Children, isValidElement, memo, useMemo, useState, type ReactElement, type ReactNode } from 'react'
-import ReactMarkdown, { type Components } from 'react-markdown'
+import ReactMarkdown, { type Components, type Options } from 'react-markdown'
 import rehypeKatex from 'rehype-katex'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import { cn } from '../../lib/format'
+import { liveBlocks } from '../../lib/mdBlocks'
 
 /**
  * Models often write LaTeX as \( … \) and \[ … \]; remark-math only knows $ and $$.
@@ -89,18 +90,33 @@ const components: Components = {
 
 const liveComponents: Components = { ...components, pre: makePre(true) }
 
+const remarkPlugins: Options['remarkPlugins'] = [remarkGfm, [remarkMath, { singleDollarTextMath: true }]]
+const rehypePlugins: Options['rehypePlugins'] = [rehypeKatex]
+
+/** One block of a streaming reply; unchanged blocks skip re-parsing. */
+const LiveBlock = memo(function LiveBlock({ text }: { text: string }) {
+  return (
+    <ReactMarkdown remarkPlugins={remarkPlugins} rehypePlugins={rehypePlugins} components={liveComponents}>
+      {text}
+    </ReactMarkdown>
+  )
+})
+
 /** `live`: the text is still streaming in; unlabelled code blocks get highlighted once it is done. */
 export const Markdown = memo(function Markdown({ text, className, live = false }: { text: string; className?: string; live?: boolean }) {
   const source = useMemo(() => normalizeMath(text), [text])
+  // While streaming, parse block by block: re-parsing the whole reply (with math) on every update
+  // costs more the longer it gets. The finished text is rendered in one piece.
+  const blocks = useMemo(() => (live ? liveBlocks(source) : null), [live, source])
   return (
     <div className={cn('md', className)}>
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm, [remarkMath, { singleDollarTextMath: true }]]}
-        rehypePlugins={[rehypeKatex]}
-        components={live ? liveComponents : components}
-      >
-        {source}
-      </ReactMarkdown>
+      {blocks ? (
+        blocks.map((b, i) => <LiveBlock key={i} text={b} />)
+      ) : (
+        <ReactMarkdown remarkPlugins={remarkPlugins} rehypePlugins={rehypePlugins} components={components}>
+          {source}
+        </ReactMarkdown>
+      )}
     </div>
   )
 })

@@ -212,8 +212,7 @@ async function main(): Promise<void> {
         const dir = apiRe(id)
         // A session the app never described still gets an entry, so it shows on the page.
         void traces
-          .apiSession(dir)
-          .then((s) => (s ? undefined : traces.updateApiSession(dir, { client: 'Another app', title: id })))
+          .ensureApiSession(dir, { client: 'Another app', title: id })
           .then(() => traces.record(dir, round, { shrinkIsTrim: true }))
           .then(() => broadcast('re:changed', undefined))
           .catch((err) => console.error('Could not record an RE round:', err))
@@ -326,6 +325,13 @@ async function main(): Promise<void> {
     apiServer.forget(inst.instanceId)
     return inst
   })
+  // A chat that needs its model: an instance already loading (from the picker, with other settings)
+  // is waited for rather than replaced by one with the saved defaults.
+  handle('instances:ensure', async (modelId) => {
+    const { instance } = await instances.ensure(modelId)
+    apiServer.forget(instance.instanceId)
+    return instance
+  })
   handle('instances:unload', (id) => {
     apiServer.forget(id)
     return instances.unload(id)
@@ -350,9 +356,9 @@ async function main(): Promise<void> {
   handle('conversations:save', (c) => conversations.save(c))
   handle('conversations:delete', async (id) => {
     await conversations.delete(id)
-    // Its recorded RE data goes too (to the Recycle Bin, like the chat).
-    const dir = join(userData, 're-data', id)
-    await shell.trashItem(dir).catch(() => traces.delete(id).catch(() => undefined))
+    // Its recorded RE data goes too (to the Recycle Bin, like the chat), after any round still being
+    // written; a round that finishes later (a stopped reply's last event) is not recorded.
+    await traces.delete(id, (dir) => shell.trashItem(dir), { forever: true }).catch(() => undefined)
   })
   handle('folders:list', () => conversations.listFolders())
   handle('folders:save', (f) => conversations.saveFolders(f))
@@ -404,7 +410,14 @@ async function main(): Promise<void> {
     // Sessions other apps ran through the API server.
     for (const t of await traces.list()) {
       if (!t.api) continue
-      sessions.push({ id: t.conversationId, source: t.api.client, re: { target: t.api.target, goal: t.api.goal, collect: true, outcome: t.api.outcome, notes: t.api.notes } })
+      const a = t.api
+      sessions.push({
+        id: t.conversationId,
+        source: a.client,
+        kind: a.kind,
+        // The practice task too, so these samples carry it and count toward the per-task limit.
+        re: { target: a.target, goal: a.goal, collect: true, outcome: a.outcome, notes: a.notes, ...(a.practice ? { practice: a.practice } : {}) }
+      })
     }
     return exportDataset(traces, sessions, opts)
   })

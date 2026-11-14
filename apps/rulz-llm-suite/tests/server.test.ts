@@ -304,6 +304,62 @@ describe('GET/POST /v1/models/{id}/load-config', () => {
   })
 })
 
+describe('malformed requests', () => {
+  it('get a 400 instead of a hung request or a 500', async () => {
+    const port = await freePort()
+    const server = new ApiServer({
+      instances: { list: () => [], readyFor: () => undefined } as unknown as InstanceManager,
+      getModels: () => models,
+      getSettings: () => ({ autoStart: false, port, bind: 'localhost', apiKey: '', cors: false, idleUnloadMinutes: 0, defaultModelId: '', unknownModelFallback: true }),
+      getLoadDefaults: () => ({ config: DEFAULT_LOAD_CONFIG, custom: false }),
+      setLoadDefaults: async () => undefined,
+      estimate: () => null as unknown as MemoryEstimate,
+      gpus: () => [],
+      onStatus: () => undefined,
+      onRequest: () => undefined
+    })
+    await server.start()
+    try {
+      // A request target that isn't a URL ("//[" has an invalid host), sent raw.
+      const status = await new Promise<number>((resolve, reject) => {
+        const req = http.request({ host: '127.0.0.1', port, path: '//[', method: 'GET' }, (res) => {
+          res.resume()
+          resolve(res.statusCode ?? 0)
+        })
+        req.on('error', reject)
+        req.end()
+      })
+      expect(status).toBe(400)
+      const loadConfig = `http://127.0.0.1:${port}/v1/models/${encodeURIComponent('Qwen3.5-9B-Q8_0')}/load-config`
+      expect((await fetch(loadConfig, { method: 'POST', body: 'null' })).status).toBe(400)
+      expect((await fetch(loadConfig, { method: 'POST', body: '[1]' })).status).toBe(400)
+      expect((await fetch(`http://127.0.0.1:${port}/v1/models/%E0%A4%A/load-config`)).status).toBe(400)
+
+      // A body far over the 64 MiB limit, streamed: the client must get the 413, not a reset.
+      const big = await new Promise<number>((resolve, reject) => {
+        const req = http.request({ host: '127.0.0.1', port, path: '/v1/chat/completions', method: 'POST' }, (res) => {
+          res.resume()
+          resolve(res.statusCode ?? 0)
+        })
+        req.on('error', reject)
+        const chunk = Buffer.alloc(1024 * 1024, 0x61)
+        let left = 80
+        const pump = (): void => {
+          while (left > 0) {
+            left--
+            if (!req.write(chunk)) return void req.once('drain', pump)
+          }
+          req.end()
+        }
+        pump()
+      })
+      expect(big).toBe(413)
+    } finally {
+      await server.stop()
+    }
+  }, 30_000)
+})
+
 describe('POST /v1/models/{id}/unload', () => {
   it('unloads every running instance of the model and only that model', async () => {
     let running = [

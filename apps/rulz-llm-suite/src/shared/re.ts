@@ -1,6 +1,6 @@
 // Reverse engineering mode: the system prompt, which tools it starts with, and which of them may
 // run without asking.
-import type { ReClone, ReSettings, SamplingParams } from './types'
+import type { ReClone, ReSession, ReSettings, SamplingParams } from './types'
 
 /** The model RE mode was first tuned for (id relative to the models folder). */
 export const RE_DEFAULT_MODEL_ID = 'Ornith 1.5 35B/Ornith-1.5-35B-A3B-Heretic-MTP-APEX-I-Mini.gguf'
@@ -166,7 +166,9 @@ const STATIC_SET = new Set(REA_STATIC)
 
 /** Can this tool run without asking in an RE session (with auto-approve on)? */
 export function isStaticReTool(server: string, name: string): boolean {
-  if (server === 'calc' || server === 'rulz') return true
+  // Only the calculator's own tool: a "calc" server in mcp.json replaces the built-in one.
+  if (server === 'calc') return name === 'calc'
+  if (server === 'rulz') return true
   return server === 'rea' && STATIC_SET.has(name)
 }
 
@@ -179,6 +181,33 @@ export function extractAnswer(text: string): string | null {
   let answer = matches.at(-1)![1].trim()
   while (answer.length >= 2 && answer[0] === answer.at(-1) && '`\'"'.includes(answer[0])) answer = answer.slice(1, -1).trim()
   return answer || null
+}
+
+/**
+ * Should this final reply of a practice session be graded? A grade the user set by hand stays, and
+ * once the app has graded a session only a reply with a new ANSWER line changes it, so a follow-up
+ * question ("explain the hash routine") does not turn Solved into Failed.
+ */
+export function shouldGradePractice(re: Pick<ReSession, 'practice' | 'outcome' | 'autoGraded'>, text: string): boolean {
+  if (!re.practice) return false
+  if (re.outcome !== 'unrated' && !re.autoGraded) return false
+  return !re.autoGraded || extractAnswer(text) !== null
+}
+
+/** A path without the quotes Explorer's "Copy as path" puts around it. */
+export function unquotePath(p: string): string {
+  return p.trim().replace(/^["']+|["']+$/g, '').trim()
+}
+
+/**
+ * Is the clone output folder the target or inside it? Main refuses every write inside the target,
+ * so such a session could not write anything. Compares as Windows does: any separator, any case.
+ */
+export function outputInsideTarget(outputDir: string, target: string): boolean {
+  const norm = (p: string): string => unquotePath(p).replace(/[\\/]+/g, '\\').replace(/\\+$/, '').toLowerCase()
+  const out = norm(outputDir)
+  const t = norm(target)
+  return !!out && !!t && (out === t || out.startsWith(`${t}\\`))
 }
 
 /** Tools a clone session starts with, on top of RE_STARTER_TOOLS. */

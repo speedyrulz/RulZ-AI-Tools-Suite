@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import { toast } from 'sonner'
 import type { HardwareSnapshot, LoadConfig, LoadedInstance, ModelEntry } from '@shared/types'
 import { errorMessage, invoke, on } from '../lib/api'
+import { pickActive } from '../lib/activeModel'
 import { once } from '../lib/once'
 
 interface ModelsState {
@@ -14,55 +15,27 @@ interface ModelsState {
   init: () => Promise<void>
   rescan: () => Promise<void>
   load: (modelId: string, config: LoadConfig | null) => Promise<LoadedInstance | null>
+  /** The model's loaded or loading instance whatever its settings, or a new one with its defaults. */
+  ensure: (modelId: string) => Promise<LoadedInstance | null>
   unload: (instanceId: string) => Promise<void>
   unloadAll: () => Promise<void>
   setActive: (modelId: string) => void
 }
 
-export const useModels = create<ModelsState>((set, get) => ({
-  models: [],
-  scanned: false,
-  instances: [],
-  hardware: null,
-  activeModelId: null,
+/** The model the newest load from this window is starting (see pickActive). */
+let loadingModelId: string | null = null
+/** That load's token: an older load of the same model ending (say, cancelled by it) leaves it alone. */
+let loadingToken: object | null = null
 
-  init: once(async () => {
-    on('models:changed', (models) => set({ models, scanned: true }))
-    on('instances:changed', (instances) => {
-      const active = get().activeModelId
-      const stillThere = instances.some((i) => i.modelId === active && i.status !== 'stopping')
-      const newest = [...instances].filter((i) => i.status !== 'stopping').sort((a, b) => b.startedAt - a.startedAt)[0]
-      set({ instances, activeModelId: stillThere ? active : (newest?.modelId ?? null) })
-    })
-    on('instances:error', (e) => {
-      toast.error(`${e.modelName}: ${e.error}`, { description: e.logTail.slice(-4).join('\n'), duration: 15000 })
-    })
-    on('hardware:update', (hardware) => set({ hardware }))
-    const [models, instances, hardware] = await Promise.all([
-      invoke('models:list'),
-      invoke('instances:list'),
-      invoke('hardware:snapshot')
-    ])
-    set((s) => ({ models: s.models.length ? s.models : models, scanned: s.scanned || models.length > 0, instances, hardware }))
-    // An empty (or missing) folder scans so fast that its result can arrive before the listener
-    // above, leaving "Scanning models…" up for good. Ask for the scan's result directly.
-    if (!get().scanned) void get().rescan()
-  }),
-
-  rescan: async () => {
-    try {
-      set({ models: await invoke('models:rescan') })
-    } catch (e) {
-      toast.error(errorMessage(e))
-    } finally {
-      set({ scanned: true })
-    }
-  },
-
-  load: async (modelId, config) => {
+export const useModels = create<ModelsState>((set, get) => {
+  /** Runs a load of `modelId` and makes it the active model; null (after a toast) if it failed. */
+  const loadWith = async (modelId: string, run: () => Promise<LoadedInstance>): Promise<LoadedInstance | null> => {
     set({ activeModelId: modelId })
+    const token = {}
+    loadingModelId = modelId
+    loadingToken = token
     try {
-      return await invoke('instances:load', modelId, config)
+      return await run()
     } catch (e) {
       const msg = errorMessage(e)
       if (msg !== 'Load cancelled') {
@@ -70,19 +43,66 @@ export const useModels = create<ModelsState>((set, get) => ({
         toast.error(first, { description: rest.join('\n') || undefined, duration: 20000 })
       }
       return null
+    } finally {
+      if (loadingToken === token) {
+        loadingModelId = null
+        loadingToken = null
+        // A failed load leaves no instance; pick the active model again from what is loaded.
+        set((s) => ({ activeModelId: pickActive(s.instances, s.activeModelId, loadingModelId) }))
+      }
     }
-  },
+  }
 
-  unload: async (instanceId) => {
-    await invoke('instances:unload', instanceId).catch((e) => toast.error(errorMessage(e)))
-  },
+  return {
+    models: [],
+    scanned: false,
+    instances: [],
+    hardware: null,
+    activeModelId: null,
 
-  unloadAll: async () => {
-    await invoke('instances:unloadAll').catch((e) => toast.error(errorMessage(e)))
-  },
+    init: once(async () => {
+      on('models:changed', (models) => set({ models, scanned: true }))
+      on('instances:changed', (instances) => set({ instances, activeModelId: pickActive(instances, get().activeModelId, loadingModelId) }))
+      on('instances:error', (e) => {
+        toast.error(`${e.modelName}: ${e.error}`, { description: e.logTail.slice(-4).join('\n'), duration: 15000 })
+      })
+      on('hardware:update', (hardware) => set({ hardware }))
+      const [models, instances, hardware] = await Promise.all([
+        invoke('models:list'),
+        invoke('instances:list'),
+        invoke('hardware:snapshot')
+      ])
+      set((s) => ({ models: s.models.length ? s.models : models, scanned: s.scanned || models.length > 0, instances, hardware }))
+      // An empty (or missing) folder scans so fast that its result can arrive before the listener
+      // above, leaving "Scanning models…" up for good. Ask for the scan's result directly.
+      if (!get().scanned) void get().rescan()
+    }),
 
-  setActive: (activeModelId) => set({ activeModelId })
-}))
+    rescan: async () => {
+      try {
+        set({ models: await invoke('models:rescan') })
+      } catch (e) {
+        toast.error(errorMessage(e))
+      } finally {
+        set({ scanned: true })
+      }
+    },
+
+    load: (modelId, config) => loadWith(modelId, () => invoke('instances:load', modelId, config)),
+
+    ensure: (modelId) => loadWith(modelId, () => invoke('instances:ensure', modelId)),
+
+    unload: async (instanceId) => {
+      await invoke('instances:unload', instanceId).catch((e) => toast.error(errorMessage(e)))
+    },
+
+    unloadAll: async () => {
+      await invoke('instances:unloadAll').catch((e) => toast.error(errorMessage(e)))
+    },
+
+    setActive: (activeModelId) => set({ activeModelId })
+  }
+})
 
 export function readyInstance(modelId: string | null): LoadedInstance | undefined {
   if (!modelId) return undefined

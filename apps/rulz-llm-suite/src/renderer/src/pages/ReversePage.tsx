@@ -1,7 +1,7 @@
 import { Download, FileSearch, FolderOpen, GraduationCap, LoaderCircle, MessageSquare, Play, RefreshCw, Trash2 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { toast } from 'sonner'
-import { CLONE_LANGUAGES, CLONE_PIECES, RE_DEFAULT_MODEL_ID, RE_GOALS } from '@shared/re'
+import { CLONE_LANGUAGES, CLONE_PIECES, outputInsideTarget, RE_DEFAULT_MODEL_ID, RE_GOALS } from '@shared/re'
 import type { ReClone, ReOutcome, RePracticeInfo, ReSettings, ReTraceInfo } from '@shared/types'
 import { OutcomeButtons } from '../components/chat/ReBanner'
 import { Badge, Button, Field, IconButton, Input, NumberInput, Select, Switch, Textarea, Tooltip } from '../components/ui'
@@ -195,7 +195,8 @@ function NewSession({ re }: { re: ReSettings }) {
     const p = await invoke('dialog:pickFolder', { title: 'Folder for the cloned code' })
     if (p) setOutputDir(p)
   }
-  const sameFolder = !!outputDir.trim() && !!target.trim() && outputDir.trim().replace(/[\\/]+$/, '').toLowerCase() === target.trim().replace(/[\\/]+$/, '').toLowerCase()
+  // Main refuses every write inside the target, so the output folder must be outside it.
+  const sameFolder = outputInsideTarget(outputDir, target)
   const cloneReady = !!outputDir.trim() && !sameFolder && (scope === 'full' || !!pieces.trim())
   const start = (): void => {
     const clone: ReClone | undefined =
@@ -302,7 +303,7 @@ function NewSession({ re }: { re: ReSettings }) {
                 ))}
               </Select>
             </Field>
-            <Field label="Output folder" hint={sameFolder ? 'Pick a different folder from the target.' : 'The session can write only here.'}>
+            <Field label="Output folder" hint={sameFolder ? 'Pick a folder outside the target: nothing can be written inside it.' : 'The session can write only here.'}>
               <div className="flex gap-2">
                 <Input className="font-mono text-xs" value={outputDir} placeholder="C:\path\to\clone" onChange={(e) => setOutputDir(e.target.value)} />
                 <Button onClick={() => void pickOutput()}>Folder…</Button>

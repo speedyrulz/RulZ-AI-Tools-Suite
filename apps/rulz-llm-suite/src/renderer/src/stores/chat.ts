@@ -33,7 +33,9 @@ import {
   RE_STARTER_TOOLS,
   RE_SYSTEM_PROMPT,
   reFirstMessage,
-  reSampling
+  reSampling,
+  shouldGradePractice,
+  unquotePath
 } from '@shared/re'
 import { readyInstance, useModels } from './models'
 import { META_LOAD, META_SEARCH, META_TOOLS, resolveTool, searchTools } from '@shared/tools'
@@ -204,6 +206,11 @@ function baseName(path: string): string {
 const saveTimers = new Map<string, ReturnType<typeof setTimeout>>()
 /** Chats deleted this session. A reply or tool call still finishing in one must not save it back. */
 const deletedIds = new Set<string>()
+/**
+ * The newest copy of each chat whose save is waiting (debounced) or still being written. Reading the
+ * chat from disk meanwhile would show an older copy, and the next edit would save that over the newer one.
+ */
+const unsaved = new Map<string, Conversation>()
 
 function upsertSummary(list: ConversationSummary[], s: ConversationSummary): ConversationSummary[] {
   return [s, ...list.filter((x) => x.id !== s.id)].sort((a, b) => b.updatedAt - a.updatedAt)
@@ -218,8 +225,12 @@ function cancelSave(id: string): void {
 async function persistNow(conv: Conversation): Promise<void> {
   cancelSave(conv.id)
   if (deletedIds.has(conv.id)) return
+  unsaved.set(conv.id, conv)
   try {
-    const summary = await invoke('conversations:save', conv)
+    const summary = await invoke('conversations:save', conv).finally(() => {
+      // A newer copy may have been handed over meanwhile; that one is still on its way.
+      if (unsaved.get(conv.id) === conv) unsaved.delete(conv.id)
+    })
     // Deleted while the save was in flight: keep it out of the list.
     if (deletedIds.has(conv.id)) return
     useChat.setState((s) => ({ summaries: upsertSummary(s.summaries, summary) }))
@@ -233,6 +244,7 @@ async function persistNow(conv: Conversation): Promise<void> {
 function persistSoon(conv: Conversation): void {
   if (deletedIds.has(conv.id)) return
   cancelSave(conv.id)
+  unsaved.set(conv.id, conv)
   saveTimers.set(conv.id, setTimeout(() => void persistNow(conv), 500))
 }
 
@@ -436,7 +448,9 @@ export const useChat = create<ChatState>((set, get) => {
   const runMetaTool = (call: ToolCall): ToolResult => {
     let args: { query?: string; limit?: number; names?: unknown } = {}
     try {
-      args = call.arguments.trim() ? JSON.parse(call.arguments) : {}
+      const parsed: unknown = call.arguments.trim() ? JSON.parse(call.arguments) : {}
+      // `null` (or a bare number) parses too; treat it as no arguments rather than throw on it.
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) args = parsed
     } catch {
       return { text: `The arguments were not valid JSON: ${call.arguments}`, isError: true }
     }
@@ -484,6 +498,23 @@ export const useChat = create<ChatState>((set, get) => {
   const runTools = async (requestId: string, calls: ToolCall[]): Promise<void> => {
     try {
       await runToolRound(requestId, calls)
+    } catch (e) {
+      // A failure in the round must not leave the chat stuck in the tools phase, showing Stop.
+      if (inToolPhase(requestId)) {
+        const error = errorMessage(e)
+        applyToGenMessage((m) => ({
+          ...m,
+          error,
+          toolCalls: m.toolCalls?.map((c) =>
+            c.status === 'pending' || c.status === 'running' ? { ...c, status: 'error', result: `Not run: ${error}` } : c
+          )
+        }))
+        const conv = get().genConversation
+        set({ generation: null, genConversation: null, toolApproval: null })
+        if (conv) void persistNow(conv)
+      } else {
+        toast.error(`The tool round failed: ${errorMessage(e)}`)
+      }
     } finally {
       // By now the next round has started (and holds the model itself) or the turn has ended.
       void invoke('chat:releaseTurn', requestId)
@@ -546,8 +577,6 @@ export const useChat = create<ChatState>((set, get) => {
     const conv = get().genConversation
     set({ generation: null, genConversation: null })
     if (!conv) return
-    // Not awaited: the next round must start before anything else (a Resend, say) can slip in.
-    void persistNow(conv)
 
     let rounds = 0
     for (let i = conv.messages.length - 1; i >= 0 && conv.messages[i].role === 'assistant'; i--) {
@@ -556,9 +585,12 @@ export const useChat = create<ChatState>((set, get) => {
     const reSettings = useApp.getState().settings?.re
     const maxRounds = conv.re ? ((conv.re.clone ? reSettings?.cloneMaxToolRounds : reSettings?.maxToolRounds) ?? 80) : MAX_TOOL_ROUNDS
     if (rounds >= maxRounds) {
+      void persistNow(conv)
       toast.warning(`Stopped after ${maxRounds} rounds of tool calls without a final answer.`)
       return
     }
+    // startGeneration saves the chat with these results (on every path), so it is not saved here
+    // too: a long RE chat is several MB, written in full each time.
     await startGeneration(conv, 'new')
   }
 
@@ -590,7 +622,8 @@ export const useChat = create<ChatState>((set, get) => {
     if (!inst) {
       void persistNow(conv)
       set({ autoLoadingModelId: modelId })
-      inst = (await useModels.getState().load(modelId, null)) ?? undefined
+      // A load still running (from the picker, with its own settings) is waited for, not replaced.
+      inst = (await useModels.getState().ensure(modelId)) ?? undefined
       set({ autoLoadingModelId: null })
       if (!inst || deletedIds.has(conv.id)) return
       const latest = get().current
@@ -674,19 +707,22 @@ export const useChat = create<ChatState>((set, get) => {
    * Reads a saved chat. null: it no longer exists. undefined: it exists but couldn't be read
    * (locked by another program, say); that is reported here and the chat stays in the list.
    */
-  const readConversation = (id: string): Promise<Conversation | null | undefined> =>
-    invoke('conversations:get', id).catch((e) => {
+  const readConversation = async (id: string): Promise<Conversation | null | undefined> => {
+    // A save still on its way holds a newer copy than the disk.
+    const waiting = unsaved.get(id)
+    if (waiting) return waiting
+    return invoke('conversations:get', id).catch((e) => {
       toast.error(`Could not open chat: ${errorMessage(e)}`)
       return undefined
     })
+  }
 
   /** Checks a practice session's final reply against the task's answer and records the outcome. */
   const gradePractice = async (conv: Conversation, messageId: string): Promise<void> => {
     const re = conv.re
     const practice = re?.practice
-    // A session the user graded by hand keeps their grade.
-    if (!re || !practice || (re.outcome !== 'unrated' && !re.autoGraded)) return
     const text = conv.messages.find((m) => m.id === messageId)?.content ?? ''
+    if (!re || !practice || !shouldGradePractice(re, text)) return
     const kitDir = useApp.getState().settings?.re.kitDir ?? ''
     try {
       const r = await invoke('re:practiceGrade', kitDir, practice.taskId, re.target, text)
@@ -957,11 +993,14 @@ export const useChat = create<ChatState>((set, get) => {
       } catch (e) {
         deletedIds.delete(id)
         toast.error(errorMessage(e))
-        // The chat is still there; keep what was on screen, including a reply that ended meanwhile.
+        // The chat is still there; keep what was on screen (including a reply that ended meanwhile)
+        // or the edit whose save was waiting.
         const cur = get().current
-        if (cur?.id === id) void persistNow(cur)
+        const keep = cur?.id === id ? cur : unsaved.get(id)
+        if (keep) void persistNow(keep)
         return
       }
+      unsaved.delete(id)
       const summaries = get().summaries.filter((s) => s.id !== id)
       set({ summaries })
       if (get().current?.id === id) {
@@ -1008,7 +1047,13 @@ export const useChat = create<ChatState>((set, get) => {
         sampling: cur.sampling,
         updatedAt: Date.now()
       }
-      const presets = await invoke('presets:save', preset)
+      let presets: Preset[]
+      try {
+        presets = await invoke('presets:save', preset)
+      } catch (e) {
+        toast.error(`Could not save the preset: ${errorMessage(e)}`)
+        return
+      }
       set({ presets })
       get().mutateCurrent((c) => ({ ...c, presetId: preset.id }))
       toast.success(`Saved preset "${preset.name}"`)
@@ -1022,7 +1067,12 @@ export const useChat = create<ChatState>((set, get) => {
     },
 
     deletePreset: async (id) => {
-      set({ presets: await invoke('presets:delete', id) })
+      try {
+        set({ presets: await invoke('presets:delete', id) })
+      } catch (e) {
+        toast.error(`Could not delete the preset: ${errorMessage(e)}`)
+        return
+      }
       if (get().current?.presetId === id) get().mutateCurrent((c) => ({ ...c, presetId: null }))
     },
 
@@ -1051,7 +1101,7 @@ export const useChat = create<ChatState>((set, get) => {
       set({ handoff: { requestId, source: conv, modelId, text: '', status: 'loading', promptProgress: null } })
 
       let inst = readyInstance(modelId)
-      if (!inst) inst = (await useModels.getState().load(modelId, null)) ?? undefined
+      if (!inst) inst = (await useModels.getState().ensure(modelId)) ?? undefined
       if (get().handoff?.requestId !== requestId) return // cancelled while loading
       if (!inst) return set({ handoff: null })
 
@@ -1079,10 +1129,16 @@ export const useChat = create<ChatState>((set, get) => {
       set({ handoff: null })
     },
 
-    startRe: async (opts) => {
+    startRe: async (input) => {
       if (isChatBusy(get()) || get().handoff) {
         toast('Wait for the current reply to finish first.')
         return
+      }
+      // Pasted paths may keep their quotes (Explorer's "Copy as path"); the tools need them without.
+      const opts = {
+        ...input,
+        target: unquotePath(input.target),
+        ...(input.clone ? { clone: { ...input.clone, outputDir: unquotePath(input.clone.outputDir) } } : {})
       }
       const s = useApp.getState().settings
       const models = useModels.getState()

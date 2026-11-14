@@ -309,7 +309,7 @@ function ServerCard({ server }: { server: McpServerStatus }) {
           </Button>
         )}
         {server.transport !== 'builtin' && (
-          <IconButton size="sm" label="Reconnect" onClick={() => void invoke('mcp:restart', server.name)}>
+          <IconButton size="sm" label="Reconnect" onClick={() => void invoke('mcp:restart', server.name).catch((e) => toast.error(errorMessage(e)))}>
             <RefreshCw size={13} />
           </IconButton>
         )}

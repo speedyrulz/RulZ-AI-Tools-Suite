@@ -45,12 +45,18 @@ export const useServer = create<ServerState>((set, get) => ({
     set({ busy: true })
     try {
       set({ status: await invoke('server:stop') })
+    } catch (e) {
+      toast.error(errorMessage(e))
     } finally {
       set({ busy: false })
     }
   },
   clearLog: async () => {
-    await invoke('server:clearLog')
-    set({ log: [] })
+    try {
+      await invoke('server:clearLog')
+      set({ log: [] })
+    } catch (e) {
+      toast.error(errorMessage(e))
+    }
   }
 }))
