@@ -23,6 +23,20 @@ DEFAULT_STRENGTH, DEFAULT_BLEND = 70, 40
 MASK_MAX_SIDE = 2048  # the painted area is drawn at this size or smaller, then scaled up
 FIELD_MAX_SIDE = 256  # the surrounding light level is filled in at this size
 CLOSE_RADIUS = 16  # at that size: dips in a shadow's share up to about 12% of the picture across are filled
+# Telling lit ground from a bright thing, at that size, by how far a spot's light is from the light of the plain
+# lit ground around the painting, in shadow depths (0 = as lit, 1 = a full depth darker): within LIT_LEVEL it's at
+# the lit level. A spot brighter than the lit ground by BRIGHTER is part of a bright thing if some spot of that
+# patch is brighter by BRIGHT_PEAK; a patch that is only a little brighter is the ground's texture. Each is
+# (shadow depths, natural log), the larger of the two counting, as in a shallow shadow texture alone can be a few
+# tenths of a depth. The plain lit ground's light is an average of the light outside the painting, over a near
+# and a wide reach (LIT_REF_BLUR, Gaussian sigmas), leaving out the cells further than BRIGHTER's depths from either
+# (bright things, a shadow's unpainted fringe): the wide one as wide as the closing, so that no bright thing the
+# closing could fill makes up most of it.
+LIT_LEVEL = (-0.15, 0.4)
+BRIGHTER = (0.25, 0.15)
+BRIGHT_PEAK = (0.5, 0.2)
+LIT_REF_BLUR = (8.0, 2.0 * CLOSE_RADIUS)
+FLOOD_STEP = 0.05  # how finely lit ground and bright things are grown, level by level
 MAX_LIFT = 2.5  # natural log: at most ~12x brighter
 GAMMA = 2.2
 LUMA = np.array([0.0722, 0.7152, 0.2126], np.float32)  # B, G, R weights of luminance
@@ -124,6 +138,107 @@ def _fill_dips(values: np.ndarray, seeds: np.ndarray) -> np.ndarray:
         if np.array_equal(out, before, equal_nan=True):
             break
     return out
+
+
+def _lit_level(light_s: np.ndarray, outside: np.ndarray, depth: float) -> np.ndarray | None:
+    """How far each cell's light is from the light of the plain lit ground around the painting, in shadow depths
+    (+ darker, - brighter), or None with no plain lit ground outside the painting. light_s: the log lighting at
+    the field size; outside: bool, the cells outside the painting.
+    The light around the painting that the lift aims for takes on a bright thing's light where that thing crosses
+    the painting's edge, so next to it the thing doesn't look brighter than around. Here the cells outside the
+    painting that are much brighter or darker than the averages of those around them (see LIT_REF_BLUR) are left
+    out, a few rounds, as much on either side, and the painting is filled in from the rest. A bright thing wider
+    than the closing can stay in, but its shaded part is then too wide for the closing to fill anyway."""
+    hgt, wid = light_s.shape
+    quarter = (max(1, round(wid / 4)), max(1, round(hgt / 4)))
+    keep = outside & np.isfinite(light_s)
+    for _ in range(4):
+        num, den = np.where(keep, light_s, 0.0).astype(np.float32), keep.astype(np.float32)
+        new = outside.copy()
+        for sigma in LIT_REF_BLUR:
+            if sigma > 8:  # wide: blurred at a quarter of the size, which loses nothing at this width and is quick
+                n, d = (cv2.resize(cv2.GaussianBlur(cv2.resize(a, quarter, interpolation=cv2.INTER_AREA), (0, 0),
+                                                    sigma / 4), (wid, hgt), interpolation=cv2.INTER_LINEAR)
+                        for a in (num, den))
+            else:
+                n, d = (cv2.GaussianBlur(a, (0, 0), sigma) for a in (num, den))
+            ref = np.divide(n, d, out=light_s.copy(), where=d > 1e-3)
+            new &= np.abs(ref - light_s) <= BRIGHTER[0] * depth
+        if np.array_equal(new, keep):
+            break
+        keep = new
+    if not keep.any():
+        return None
+    lit = _fill(np.where(keep, light_s, 0.0).astype(np.float32), keep.astype(np.float32))
+    return (lit - light_s) / depth
+
+
+def _lit_ground(level: np.ndarray, outside: np.ndarray, depth: float) -> np.ndarray:
+    """Which cells of the painting are lit ground joined to the lit ground outside it, or a slope down to that:
+    a lit gap between two painted shadows, or one cutting into a shadow, and its soft edges. level: float32,
+    from _lit_level; outside: bool, the cells outside the painting, which are taken as they are and never
+    passed through; depth: the shadow's depth (natural log), for the floors of BRIGHTER and BRIGHT_PEAK.
+    A bright thing reaching out of the shadow (a person at its edge) is left out, as its shaded part can be at
+    the lit level too (when it's about as many times brighter than the ground as the shadow is darker), and the
+    lit ground beside it then reaches its shaded part through the soft edge where the shadow crosses it, all the
+    more so when the thing itself has a soft edge. So lit ground and bright things are grown together, side by
+    side, from the lowest level up (a priority flood), each taking only cells the other hasn't: lit ground from
+    the lit cells outside the painting, through cells at the lit level; bright things from their lit parts (see
+    BRIGHT_PEAK), through any cell. Climbing from its lit part, a bright thing reaches its own shaded part at
+    lower levels than the lit ground can, round through the shadow's soft edge, so it gets there first. The other
+    side of this: a bright thing in a lit gap, or at its mouth, takes the part of the gap nearer to it than to
+    where the lit ground comes in, and that part is lifted as before 0.5.2.
+    The slopes are the cells whose steepest way down, side by side, passes through lit ground. Only the
+    painting's box and the cells round it are worked on (nothing else changes; the box is found here, not with
+    _extent). Growing spreads one cell a step, each level's capped at twice the box's height plus width steps,
+    and a cell that isn't a number is never passed through."""
+    lo, hi = LIT_LEVEL
+    finite = np.isfinite(level)
+    # bright things over the whole field, as a patch's brightest spot can be far outside the painting
+    brighter = finite & (level < -max(BRIGHTER[0], BRIGHTER[1] / depth))
+    count, labels = cv2.connectedComponents(brighter.view(np.uint8), connectivity=8)
+    patch = np.asarray(labels, np.int32)
+    peaked = np.zeros(count, bool)
+    peaked[patch[brighter & (level < -max(BRIGHT_PEAK[0], BRIGHT_PEAK[1] / depth))]] = True
+    peaked[0] = False
+    bright_all = peaked[patch]
+    tops = np.arange(lo - FLOOD_STEP, hi + FLOOD_STEP / 2, FLOOD_STEP)
+    result = outside & finite & (level >= lo) & (level <= tops[-1]) & ~bright_all  # outside: as it is
+    x, y, bw, bh = cv2.boundingRect((~outside).view(np.uint8))
+    if not (bw and bh):
+        return result
+    box = _grow((slice(y, y + bh), slice(x, x + bw)), 1, *level.shape)
+    level, outside, finite, bright = level[box], outside[box], finite[box], bright_all[box]
+    lit = result[box].copy()
+    free = ~outside & finite & ~bright
+    cross = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+    for top in tops:
+        open_b = free & (level <= top) & ~lit & ~bright
+        open_l = open_b & (level >= lo)
+        for _ in range(2 * sum(level.shape)):
+            to_b = (cv2.dilate(bright.view(np.uint8), cross) > 0) & open_b
+            to_l = (cv2.dilate(lit.view(np.uint8), cross) > 0) & open_l & ~to_b  # a tie: the bright thing's
+            if not (to_b.any() or to_l.any()):
+                break
+            bright, lit = bright | to_b, lit | to_l
+            open_b &= ~(to_b | to_l)
+            open_l &= ~(to_b | to_l)
+    # Each cell of the painting steps to its lowest side neighbor while that's lower: the steepest way down.
+    # Going only down, it never loops, so where each way leads is found by doubling how far is looked each
+    # round (a cell outside the painting or of a bright thing, or with nothing lower beside it, stays where it is).
+    padded = np.pad(np.where(finite, level, np.inf), 1, constant_values=np.inf)
+    sides = np.stack([padded[:-2, 1:-1], padded[2:, 1:-1], padded[1:-1, :-2], padded[1:-1, 2:]])
+    which = np.argmin(sides, axis=0)
+    down = ~outside & ~bright & finite & (np.take_along_axis(sides, which[None], 0)[0] < level)
+    wid = level.shape[1]
+    here = np.arange(level.size).reshape(level.shape)
+    step = np.where(down, here + np.array([-wid, wid, -1, 1])[which], here).ravel()
+    ends_lit = lit.ravel()
+    for _ in range(max(1, int(level.size).bit_length())):
+        ends_lit = ends_lit | ends_lit[step]
+        step = step[step]
+    result[box] = ends_lit.reshape(level.shape)
+    return result
 
 
 def _lighting(log_y: np.ndarray) -> np.ndarray:
@@ -278,19 +393,27 @@ def lift_shadows(bgr: np.ndarray, edit: ShadowEdit, lighting: Lighting | None = 
     # in what's around them: the object is a dip or notch in the share with shadow on both sides, the soft edge
     # a slope down to lit ground. Two fills raise the dips and notches but leave a slope as it is:
     # - a grayscale closing fills any dip or notch narrower than 2 * CLOSE_RADIUS, also an object that reaches
-    #   out of the shadow (a person standing at its edge) or has a lit-looking middle;
+    #   out of the shadow (a person standing at its edge) or has a lit-looking middle; but not lit ground
+    #   joined to the lit ground outside the painting, or its soft edges (_lit_ground, which keeps such objects
+    #   out of it): a lit gap between two painted shadows, or one cutting into a shadow, is a notch too, and
+    #   filling it gave it and its edges the full depth (before 0.5.2);
     # - _fill_dips fills a dip of any size that shadow encloses (one that no path from plainly lit ground, or
     #   from outside the painting, reaches without climbing).
     # As before, the less plainly a spot is shadow, the less it's filled. (Taking every neighborhood that is a
     # third shadow as all shadow gave the soft edge the full depth: a bright ring around the shadow wherever
-    # the painting ran past it.) A lit gap narrower than the closing between two painted shadows still looks
-    # like an object in the shadow and is lifted, as before 0.5.1.
+    # the painting ran past it.) Still lifted like a bright object: a lit spot that shadow encloses (sun through
+    # leaves), a lit gap so narrow that its middle is still mostly in the shadow's soft edge, often one in a
+    # shallow shadow on ground whose texture is about as strong as the shadow, the part of a lit gap near a bright
+    # thing in it or at its mouth, and partly one under lighting that changes a lot across the picture.
     part_r = np.clip(gap_r / depth, 0.0, 1.0)
     part_s = cv2.resize(_pasted(part_r, reach, h, w), fs, interpolation=cv2.INTER_AREA)
     not_lit = np.clip((cv2.GaussianBlur(part_s, (0, 0), 3.0) - 0.1) / 0.25, 0.0, 1.0)
     window = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * CLOSE_RADIUS + 1,) * 2)
-    filled = np.maximum(cv2.morphologyEx(part_s, cv2.MORPH_CLOSE, window),
-                        _fill_dips(part_s, (not_lit <= 0.0) | (m_s < 0.02)))  # outside the painting: seeds,
+    closed = cv2.morphologyEx(part_s, cv2.MORPH_CLOSE, window)
+    level = _lit_level(light_s, m_s < 0.02, depth)  # from the whole picture's lighting: the same in the box
+    if level is not None:
+        closed = np.where(_lit_ground(level, m_s < 0.02, depth), part_s, closed)
+    filled = np.maximum(closed, _fill_dips(part_s, (not_lit <= 0.0) | (m_s < 0.02)))  # outside the painting: seeds,
     filled = part_s + (filled - part_s) * not_lit  # so the fill never reaches past `reach`
     # Close to the full depth counts as the full depth: in the shadow's core such small differences are the
     # measurement's wobble, so the core and anything in it are lifted by one depth, as a real light would
