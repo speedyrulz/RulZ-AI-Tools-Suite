@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import posixpath
 import shutil
 import tempfile
@@ -34,6 +35,10 @@ WEIGHT_EXT = {'.safetensors', '.bin', '.pt', '.pth', '.ckpt', '.gguf', '.onnx', 
               '.pb', '.mlmodel', '.npz', '.npy', '.model', '.ggml', '.engine', '.pkl', '.joblib', '.keras'}
 TABLE_EXT = {'.parquet', '.csv', '.tsv', '.arrow', '.jsonl', '.feather', '.avro', '.orc', '.xlsx', '.lance'}
 PREVIEW_LIMIT = 5 * 1024 * 1024
+MOD_TIP_REPO = 'Date of the last commit that changed it. The Hub keeps no date for when a file was first added.'
+MOD_TIP_BUCKET = "The file's own date (its last change before the upload), or else when it was uploaded"
+
+log = logging.getLogger(__name__)
 
 _temp_downloads: list[Path] = []
 
@@ -241,7 +246,9 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
                               '{numeric: true, sensitivity: "base"})'},
                     {'name': 'size', 'label': 'Size', 'field': 'size', 'align': 'right', 'sortable': True,
                      ':format': SIZE_FORMAT_JS},
-                    {'name': 'modified', 'label': 'Modified', 'field': 'modified', 'align': 'left',
+                    {'name': 'modified', 'label': 'Updated', 'field': 'modified', 'align': 'left',
+                     'sortable': True},
+                    {'name': 'uploaded', 'label': 'Uploaded', 'field': 'uploaded', 'align': 'left',
                      'sortable': True},
                     {'name': 'actions', 'label': '', 'field': 'path', 'align': 'right'},
                 ]
@@ -263,8 +270,15 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
                         <q-badge v-if="props.row.virtual" class="rz-badge rz-new" label="new"/>
                       </div>
                     </q-td>''')
+                # The date itself, with "3 d ago" on hover. Sorting works on the text: it is YYYY-MM-DD HH:MM.
                 table.add_slot('body-cell-modified', r'''
-                    <q-td :props="props"><span :title="props.row.modified">{{ props.row.modified_ago }}</span></q-td>''')
+                    <q-td :props="props"><span :title="props.row.modified_ago">{{ props.row.modified }}</span></q-td>''')
+                table.add_slot('body-cell-uploaded', r'''
+                    <q-td :props="props"><span :title="props.row.uploaded_ago">{{ props.row.uploaded }}</span></q-td>''')
+                table.add_slot('header-cell-modified', '<q-th :props="props">{{ props.col.label }}<q-tooltip>'
+                               + (MOD_TIP_BUCKET if is_bucket else MOD_TIP_REPO) + '</q-tooltip></q-th>')
+                table.add_slot('header-cell-uploaded', '<q-th :props="props">{{ props.col.label }}<q-tooltip>'
+                               'When this version was uploaded to the bucket</q-tooltip></q-th>')
                 table.add_slot('body-cell-actions', r'''
                     <q-td :props="props" auto-width>
                       <q-btn v-if="!props.row.is_dir && props.row.previewable" flat dense round size="sm" icon="visibility"
@@ -340,7 +354,8 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
             storage = 'Xet' if e.xet_hash else ('LFS' if e.lfs else '')
         return {
             'path': e.path, 'name': e.name, 'is_dir': e.is_dir, 'size': e.size, 'icon': file_icon(e.name, e.is_dir),
-            'modified': fmt_date(e.modified), 'modified_ago': fmt_ago(e.modified), 'storage': storage,
+            'modified': fmt_date(e.modified), 'modified_ago': fmt_ago(e.modified),
+            'uploaded': fmt_date(e.uploaded), 'uploaded_ago': fmt_ago(e.uploaded), 'storage': storage,
             'virtual': virtual, 'previewable': is_text_file(e.name) or _suffix(e.name) in IMAGE_EXT,
         }
 
@@ -368,6 +383,10 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
         table.props(remove='loading')
         if not settings.show_hidden:
             entries = [e for e in entries if not e.name.startswith('.')]
+        known = state.setdefault('dates', {}).get((fs.revision, folder), {}) if not is_bucket else {}
+        for e in entries:  # dates already fetched for this folder stay while a refresh fetches them again
+            if e.modified is None and e.path in known:
+                e.modified = known[e.path]
         state['entries'] = {e.path: e for e in entries}
         rows = [to_row(e) for e in entries]
         for v in sorted(state['virtual']):
@@ -377,9 +396,7 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
                     state['entries'][v] = ve
                     rows.append(to_row(ve, virtual=True))
         rows.sort(key=lambda r: (not r['is_dir'], r['name'].lower()))
-        has_dates = any(r['modified'] for r in rows)
-        table.columns[2]['classes'] = '' if has_dates else 'hidden'
-        table.columns[2]['headerClasses'] = '' if has_dates else 'hidden'
+        show_date_columns(rows)
         prev = {r['path'] for r in table.selected} if keep_selection else set()
         table.update_rows(rows)
         if prev:
@@ -387,6 +404,39 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
         table.update()
         virtual_note.set_visibility(folder in state['virtual'] and not entries)
         update_buttons()
+        if not is_bucket and settings.repo_dates and entries:
+            await fill_dates(folder, ticket)
+
+    def show_date_columns(rows: list[dict]) -> None:
+        # A date column only when some row has that date: repos have no "Uploaded", and dates may still be loading.
+        for col in table.columns:
+            if col['name'] in ('modified', 'uploaded'):
+                cls = '' if any(r.get(col['name']) for r in rows) else 'hidden'
+                col['classes'] = col['headerClasses'] = cls
+
+    async def fill_dates(folder: str, ticket: int) -> None:
+        """Fill in each repo file's last-commit date after the list shows: that listing is about 10x slower."""
+        try:
+            dates = await run.io_bound(fs.last_commit_dates, folder, hub.DATES_LIMIT,
+                                       lambda: state['listing'] != ticket)
+        except Exception as e:  # noqa: BLE001  (the list is already there: missing dates are not worth an error)
+            log.info('No dates for %s: %s', folder, e)
+            return
+        if state['listing'] != ticket or not dates:
+            return  # another folder (or a refresh) was opened meanwhile
+        cache = state.setdefault('dates', {})
+        cache[(fs.revision, folder)] = dates
+        while len(cache) > 50:
+            cache.pop(next(iter(cache)))
+        for row in table.rows:
+            d = dates.get(row['path'])
+            if d:
+                row['modified'], row['modified_ago'] = fmt_date(d), fmt_ago(d)
+                entry = state['entries'].get(row['path'])
+                if entry:
+                    entry.modified = d
+        show_date_columns(table.rows)
+        table.update()
 
     async def navigate(folder: str) -> None:
         state['folder'] = folder.strip('/')
@@ -448,8 +498,12 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
                 ui.chip(f'{s["likes"]}', icon='favorite_border').props('dense square outline')
             if s.get('gated'):
                 ui.chip(f'gated: {s["gated"]}', icon='how_to_reg').props('dense square outline')
+            if s.get('created'):
+                ui.chip(f'created {fmt_date(s["created"])[:10]}', icon='event').props('dense square outline') \
+                    .tooltip(fmt_date(s['created']))
             if s.get('updated'):
-                ui.chip(f'updated {fmt_ago(s["updated"])}', icon='update').props('dense square outline')
+                ui.chip(f'updated {fmt_ago(s["updated"])}', icon='update').props('dense square outline') \
+                    .tooltip(fmt_date(s['updated']))
 
     async def load_branches() -> None:
         try:

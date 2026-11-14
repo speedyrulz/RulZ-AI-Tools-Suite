@@ -581,3 +581,94 @@ def test_masked_hint_never_shows_the_key():
     assert 'hf_' in hint and '1234' in hint and 'abcdefghijkl' not in hint
     assert masked_hint('', 'hf_...') == 'hf_...'
     assert 'short' not in masked_hint('short')
+
+
+# ---------------------------------------------------------------- file dates
+
+def test_repo_list_is_quick_and_dates_come_separately(monkeypatch):
+    from datetime import datetime, timezone
+    from huggingface_hub.hf_api import RepoFile, RepoFolder
+
+    day = datetime(2025, 3, 1, tzinfo=timezone.utc)
+    pulled = []
+
+    def list_repo_tree(repo_id, path_in_repo=None, *, expand=False, **kw):
+        def items():
+            for i in range(10):
+                pulled.append(i)
+                commit = {'id': 'c', 'title': 't', 'date': '2025-03-01T00:00:00.000Z'} if expand else None
+                if i == 0:
+                    yield RepoFolder(path='sub', oid='o', **({'lastCommit': commit} if commit else {}))
+                else:
+                    yield RepoFile(path=f'f{i}.txt', size=i, oid='o', **({'lastCommit': commit} if commit else {}))
+        api.calls.append(('list_repo_tree', expand))
+        return items()
+
+    api = FakeApi(list_repo_tree=list_repo_tree)
+    monkeypatch.setattr(hub, 'api', lambda: api)
+    fs = hub.RepoFS('model', 'a/m')
+    entries = fs.list_dir('')
+    assert api.calls[-1] == ('list_repo_tree', False) and all(e.modified is None for e in entries)
+    pulled.clear()
+    dates = fs.last_commit_dates('', limit=4)
+    assert api.calls[-1] == ('list_repo_tree', True)
+    assert dates == {'sub': day, 'f1.txt': day, 'f2.txt': day, 'f3.txt': day}
+    assert len(pulled) <= 5  # stopped reading pages at the limit
+    assert fs.list_folders('') == ['sub'] and api.calls[-1] == ('list_repo_tree', False)
+
+
+def test_bucket_entries_keep_the_upload_date():
+    from datetime import datetime, timezone
+    own, up = datetime(2024, 1, 1, tzinfo=timezone.utc), datetime(2025, 1, 1, tzinfo=timezone.utc)
+    fs = hub.BucketFS('bucket', 'a/b')
+    item = types.SimpleNamespace(type='file', path='x.bin', size=1, mtime=own, uploaded_at=up, xet_hash='h')
+    e = fs._entry(item)
+    assert (e.modified, e.uploaded) == (own, up)
+    item.mtime = None
+    assert fs._entry(item).modified == up  # no date of its own: the upload
+
+
+def test_repo_summary_has_the_creation_date(monkeypatch):
+    from datetime import datetime, timezone
+    made = datetime(2022, 3, 2, tzinfo=timezone.utc)
+
+    def model_info(repo_id, expand=None):
+        assert 'createdAt' in expand
+        return types.SimpleNamespace(private=False, used_storage=1, likes=0, downloads=0, last_modified=None,
+                                     created_at=made, sha='s', gated=False)
+    monkeypatch.setattr(hub, 'api', lambda: FakeApi(model_info=model_info))
+    assert hub.repo_summary('model', 'a/m')['created'] == made
+
+
+def test_local_created_time(tmp_path):
+    from rulz_hf_manager.ui.pickers import _scan, created_time
+    f = tmp_path / 'a.txt'
+    f.write_text('x')
+    st = f.stat()
+    rows = _scan(tmp_path, False, True)
+    if os.name == 'nt':
+        assert created_time(st) and rows[0]['created']
+    elif not hasattr(st, 'st_birthtime'):
+        assert created_time(st) is None and rows[0]['created'] == ''  # Linux keeps no creation date
+    assert rows[0]['modified']
+
+
+def test_instance_listing_has_modification_times(tmp_path):
+    (tmp_path / 'sub').mkdir()
+    (tmp_path / 'm.safetensors').write_bytes(b'12')
+    r = remote_agent.cmd_ls({'path': str(tmp_path)})
+    assert r['dirs'][0]['mtime'] > 0 and r['files'][0]['mtime'] > 0 and r['files'][0]['size'] == 2
+
+
+def test_repo_dates_stop_when_nobody_waits(monkeypatch):
+    from huggingface_hub.hf_api import RepoFile
+    pulled = []
+
+    def list_repo_tree(*a, **k):
+        for i in range(100):
+            pulled.append(i)
+            yield RepoFile(path=f'f{i}', size=1, oid='o', lastCommit={'id': 'c', 'title': 't',
+                                                                     'date': '2025-03-01T00:00:00.000Z'})
+    monkeypatch.setattr(hub, 'api', lambda: FakeApi(list_repo_tree=list_repo_tree))
+    dates = hub.RepoFS('model', 'a/m').last_commit_dates('', should_stop=lambda: len(pulled) >= 3)
+    assert len(dates) == 2 and len(pulled) == 3

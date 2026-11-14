@@ -89,6 +89,10 @@ Windows and WSL keep separate settings, so add the token once in each.
 
 **File browser (repos and buckets)**
 - Folder navigation with breadcrumbs, multi-select, filter, sizes, LFS/Xet badges.
+- Dates: **Updated** for every file (in a repo: its last commit, filled in a moment after the list shows; the Hub
+  keeps no date for when a file was first added), plus **Uploaded** in a bucket. The repo header shows when it was
+  created. The file picker on this computer shows **Created** and **Modified**, the vast.ai folder browser the
+  modification date.
 - **Upload** files and whole folders straight from disk (best for big model files), or drag & drop in the browser.
   Files that would be overwritten are flagged before you confirm.
 - **Download** a selection (or everything in the current folder) to your download folder, keeping the folder
@@ -134,7 +138,7 @@ Windows and WSL keep separate settings, so add the token once in each.
   `pip list`...) and watch their output as it comes, with progress bars shown as one live line. Commands run in bash
   with the instance's `/venv/main` Python on PATH; `cd` carries over to the next command (variables do not). ↑ / ↓
   step through earlier commands, Enter while a command runs types an answer into it (a `y/n` question), and **Stop**
-  sends Ctrl+C and closes the connection. Closing the app also ends the command, so start long jobs with `nohup` or
+  sends Ctrl+C and closes the connection. Leaving the vast.ai page or closing the app also ends the command, so start long jobs with `nohup` or
   in a terminal. **Open terminal** opens a real ssh window on your computer logged in to the instance (vast.ai keeps
   that session in tmux); **Copy ssh command** copies the line to paste into your own terminal.
 

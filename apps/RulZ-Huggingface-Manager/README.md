@@ -89,6 +89,10 @@ Windows and WSL keep separate settings, so add the token once in each.
 
 **File browser (repos and buckets)**
 - Folder navigation with breadcrumbs, multi-select, filter, sizes, LFS/Xet badges.
+- Dates: **Updated** for every file (in a repo: its last commit, filled in a moment after the list shows; the Hub
+  keeps no date for when a file was first added), plus **Uploaded** in a bucket. The repo header shows when it was
+  created. The file picker on this computer shows **Created** and **Modified**, the vast.ai folder browser the
+  modification date.
 - **Upload** files and whole folders straight from disk (best for big model files), or drag & drop in the browser.
   Files that would be overwritten are flagged before you confirm.
 - **Download** a selection (or everything in the current folder) to your download folder, keeping the folder

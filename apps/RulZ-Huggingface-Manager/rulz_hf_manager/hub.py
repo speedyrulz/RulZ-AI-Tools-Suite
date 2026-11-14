@@ -19,7 +19,7 @@ import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 from urllib.parse import quote, unquote, urlparse
 
 from huggingface_hub import CommitOperationAdd, CommitOperationCopy, CommitOperationDelete, HfApi, get_token
@@ -356,13 +356,14 @@ def repo_summary(kind: str, repo_id: str) -> dict[str, Any]:
         b = a.bucket_info(repo_id)
         return {'private': b.private, 'size': b.size, 'files': b.total_files, 'created': b.created_at}
     getter = {'model': a.model_info, 'dataset': a.dataset_info, 'space': a.space_info}[kind]
-    expand = ['private', 'lastModified', 'usedStorage', 'likes', 'sha']
+    expand = ['private', 'lastModified', 'createdAt', 'usedStorage', 'likes', 'sha']
     if kind != 'space':  # the Hub answers 400 to "gated" or "downloads" for a Space
         expand += ['downloads', 'gated']
     info = getter(repo_id, expand=expand)
     return {
         'private': bool(info.private), 'size': getattr(info, 'used_storage', None), 'likes': info.likes,
-        'downloads': getattr(info, 'downloads', None), 'updated': info.last_modified, 'sha': info.sha,
+        'downloads': getattr(info, 'downloads', None), 'updated': info.last_modified,
+        'created': getattr(info, 'created_at', None), 'sha': info.sha,
         'gated': getattr(info, 'gated', None),
     }
 
@@ -405,12 +406,16 @@ def duplicate_repo(kind: str, from_id: str, to_id: str, private: bool) -> str:
 # File-system abstraction
 # --------------------------------------------------------------------------------------------------
 
+DATES_LIMIT = 3000  # items per folder whose last-commit date is fetched (about 9 s per 1000)
+
+
 @dataclass
 class Entry:
     path: str
     is_dir: bool
     size: int | None = None
-    modified: datetime | None = None
+    modified: datetime | None = None  # repo: last commit touching it; bucket: the file's own date (or its upload)
+    uploaded: datetime | None = None  # bucket only: when this version was uploaded
     lfs: bool = False
     xet_hash: str | None = None
     raw: Any = None
@@ -714,15 +719,33 @@ class RepoFS(RemoteFS):
         return Entry(item.path, False, size=item.size, modified=modified, lfs=item.lfs is not None,
                      xet_hash=item.xet_hash, raw=item)
 
-    def list_dir(self, folder: str, expand: bool | None = None) -> list[Entry]:
+    def list_dir(self, folder: str, expand: bool = False) -> list[Entry]:
+        # Without expand: asking for every file's last commit is about 10x slower (2.6 s against 0.3 s for 300 files),
+        # so the file list comes first and last_commit_dates() fills the dates in afterwards.
         items = self.api.list_repo_tree(self.repo_id, path_in_repo=folder or None, recursive=False,
-                                        expand=config.get().load_last_modified if expand is None else expand,
-                                        repo_type=self.kind, revision=self.revision)
+                                        expand=expand, repo_type=self.kind, revision=self.revision)
         return [self._entry(i) for i in items]
 
+    def last_commit_dates(self, folder: str, limit: int = DATES_LIMIT,
+                          should_stop: Callable[[], bool] | None = None) -> dict[str, datetime]:
+        """Date of the last commit that changed each file / folder directly in ``folder`` (at most ``limit`` items).
+
+        The Hub has no per-file history, so this is the "updated" date only; when a file was first added is not
+        available without walking every commit. ``should_stop`` (checked per item) ends a fetch nobody waits for any
+        more, so quick clicks through big folders do not leave several slow listings running."""
+        items = self.api.list_repo_tree(self.repo_id, path_in_repo=folder or None, recursive=False, expand=True,
+                                        repo_type=self.kind, revision=self.revision)
+        out: dict[str, datetime] = {}
+        for item in itertools.islice(items, limit):  # lazy pages: stops asking once the limit is reached
+            if should_stop and should_stop():
+                break
+            e = self._entry(item)
+            if e.modified:
+                out[e.path] = e.modified
+        return out
+
     def list_folders(self, folder: str) -> list[str]:
-        # Folder names only: never ask for every file's last commit here, whatever the "last modified" setting.
-        return sorted(e.path for e in self.list_dir(folder, expand=False) if e.is_dir)
+        return sorted(e.path for e in self.list_dir(folder) if e.is_dir)
 
     def list_files(self, folder: str = '') -> list[Entry]:
         items = self.api.list_repo_tree(self.repo_id, path_in_repo=folder or None, recursive=True,
@@ -854,7 +877,7 @@ class BucketFS(RemoteFS):
     def _entry(self, item: Any) -> Entry:
         if item.type == 'file':
             return Entry(item.path, False, size=item.size, modified=item.mtime or item.uploaded_at,
-                         xet_hash=item.xet_hash, raw=item)
+                         uploaded=item.uploaded_at, xet_hash=item.xet_hash, raw=item)
         return Entry(item.path.rstrip('/'), True, modified=getattr(item, 'uploaded_at', None), raw=item)
 
     def list_dir(self, folder: str) -> list[Entry]:

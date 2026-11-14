@@ -186,9 +186,10 @@ def cmd_ls(p: dict) -> dict:
             for e in it:
                 try:
                     if e.is_dir():
-                        dirs.append({'name': e.name})
+                        dirs.append({'name': e.name, 'mtime': e.stat().st_mtime})
                     elif e.is_file():
-                        files.append({'name': e.name, 'size': e.stat().st_size})
+                        st = e.stat()
+                        files.append({'name': e.name, 'size': st.st_size, 'mtime': st.st_mtime})
                 except OSError:
                     continue
     except OSError as e:

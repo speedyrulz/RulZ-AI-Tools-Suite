@@ -10,13 +10,14 @@ import posixpath
 import queue
 import threading
 import time
+from datetime import datetime, timezone
 
 from nicegui import run, ui
 
 from .. import config, hub, vast
 from ..jobs import Job
 from ..remote_agent import COMFY_DIRS
-from .common import browse_url, confirm, fmt_duration, frame, masked_hint, notify_error, notify_ok, prompt, run_job
+from .common import browse_url, confirm, fmt_date, fmt_duration, frame, masked_hint, notify_error, notify_ok, prompt, run_job
 
 # What the user collected to send together (lives as long as the app runs).
 BASKET: list[vast.Source] = []
@@ -66,6 +67,11 @@ async def instance_info(force: bool = False) -> dict | None:
 # --------------------------------------------------------------------------------------------------
 # Remote folder picker
 # --------------------------------------------------------------------------------------------------
+
+def _stamp(ts: float | None) -> str:
+    """A modification time from the instance (seconds since 1970), shown in this computer's time zone."""
+    return fmt_date(datetime.fromtimestamp(ts, timezone.utc)) if ts else ''
+
 
 async def pick_vast_folder(start: str = '/workspace', title: str = 'Choose a folder on the instance') -> str | None:
     state = {'path': start or '/workspace', 'hidden': False}
@@ -137,6 +143,8 @@ async def pick_vast_folder(start: str = '/workspace', title: str = 'Choose a fol
                         ui.icon('folder').classes('rz-ic-dir')
                     with ui.item_section():
                         ui.item_label(d['name'])
+                    with ui.item_section().props('side'):
+                        ui.label(_stamp(d.get('mtime'))).classes('text-xs rulz-muted').tooltip('Last modified')
             for f in files[:300]:
                 with ui.item().classes('rounded opacity-60'):
                     with ui.item_section().props('avatar'):
@@ -145,6 +153,8 @@ async def pick_vast_folder(start: str = '/workspace', title: str = 'Choose a fol
                         ui.item_label(f['name'])
                     with ui.item_section().props('side'):
                         ui.label(hub.human_size(f['size'])).classes('text-xs rulz-muted')
+                    with ui.item_section().props('side'):
+                        ui.label(_stamp(f.get('mtime'))).classes('text-xs rulz-muted').tooltip('Last modified')
             if len(files) > 300:
                 ui.label(f'... and {len(files) - 300} more files').classes('text-xs rulz-muted p-2')
 
