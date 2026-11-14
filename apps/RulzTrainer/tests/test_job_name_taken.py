@@ -175,6 +175,15 @@ def test_queue_and_start_refuse_a_taken_name_and_touch_nothing(ui):
     assert not ok and "run_2" in msg and snapshot(job) == before
 
 
+def test_the_wizards_review_names_a_taken_job_name(ui):
+    webui, cfg, _ = ui
+    data = {"images": 3, "captioned": 3}
+    assert not any("is free" in text for _, text in webui.review_issues(cfg(), None, data, 1))
+    saved_lora(cfg().job_dir())
+    errors = [text for kind, text in webui.review_issues(cfg(), None, data, 1) if kind == "error"]
+    assert any("'run_2' is free" in text for text in errors)
+
+
 def test_a_free_name_and_a_leftovers_folder_start(ui):
     webui, cfg, started = ui
     leftovers(cfg("run").job_dir())
