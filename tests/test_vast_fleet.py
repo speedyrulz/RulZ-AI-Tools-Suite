@@ -1003,6 +1003,28 @@ def test_settings_that_point_into_a_pushed_folder_point_at_its_place_on_the_inst
     assert world.fleet.plan("q", config)[0]["config"] == config
 
 
+def test_a_regularisation_folder_of_this_computer_is_sent_with_the_run(world, tmp_path):
+    """reg_dir by its full path here cannot be read on an instance: it goes to datasets/<name> with the run's own
+    folders, and the config reads it there. A relative one (a folder the instance has) is left alone."""
+    local, reg = tmp_path / "sets" / "anna", tmp_path / "reg" / "people"
+    local.mkdir(parents=True)
+    reg.mkdir(parents=True)
+    config = {"dataset_dir": str(local), "reg_dir": str(reg), "steps": 5}
+    entry = world.fleet.plan("q", config, push=[local])[0]
+    assert entry["push"] == [str(local), str(reg.resolve())]
+    assert entry["config"] == dict(config, dataset_dir="datasets/anna", reg_dir="datasets/people")
+    alone = world.fleet.plan("q", dict(config, dataset_dir="datasets/anna"))[0]  # the dataset is there already
+    assert alone["push"] == [str(reg.resolve())] and alone["config"]["reg_dir"] == "datasets/people"
+    there = dict(config, reg_dir="datasets/people")
+    assert world.fleet.plan("q", there)[0]["push"] == [] and world.fleet.plan("q", there)[0]["config"] == there
+    inside = world.fleet.plan("q", dict(config, reg_dir=str(reg)), push=[local, tmp_path / "reg"])[0]
+    assert len(inside["push"]) == 2 and inside["config"]["reg_dir"] == "datasets/reg/people"
+    twin = tmp_path / "other" / "anna"
+    twin.mkdir(parents=True)
+    with pytest.raises(Refused, match="same name"):
+        world.fleet.plan("q", dict(config, reg_dir=str(twin)), push=[local])
+
+
 def test_a_run_that_started_and_ended_between_two_looks_is_still_closed_and_downloaded(world):
     world.fleet.set_instance(2, enabled=False)
     world.tick()  # the instance has been looked at: what appears from now on ran in the fleet's time

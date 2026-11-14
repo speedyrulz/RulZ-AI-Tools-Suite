@@ -31,7 +31,7 @@ from .config import AUTOMAGIC, KEEL, MUON_EDGE_TARGETS, TrainConfig, keel_band_w
 from .config import side_to_mp
 from .dataset import (BucketBatcher, augment_items, cache_latents, cache_text, describe_sides, dropout_text_path,
                       items_for_side, load_batch,
-                      scan_dataset, text_cache_path, TEXT_BATCH)
+                      scan_dataset, scan_reg, text_cache_path, TEXT_BATCH)
 from .archs import detect_arch, get_arch
 from .idloss import effective_weight as idloss_weight
 from .losses import elementwise_loss
@@ -611,6 +611,7 @@ class Trainer(RaceParallelMixin):
         self.region_watch_off = ""  # why it cannot run (no parser), when it cannot
         self.curriculum_w: dict[str, float] | None = None
         self.all_items: list = []
+        self.reg_items: list = []  # the regularisation dataset's pictures: in the caches and the image queue only
         self.sides: list[int] = []
         self.res_stage = 0
         self.batch_iter = None
@@ -1096,6 +1097,13 @@ class Trainer(RaceParallelMixin):
             self.race_base = cfg
             cfg = self.cfg = self._race_prep_config(cfg)
         items = scan_dataset(cfg)
+        # the regularisation dataset (reg_dir): read now, so a folder without captions stops the run before the
+        # analysis and the caching. Kept out of `items`: nothing below that reads the subject sees its pictures
+        self.reg_items = scan_reg(cfg)
+        if self.reg_items:
+            log.info("Regularisation dataset: %d pictures in %s at a loss weight of x%g; they train whole and plain "
+                     "(their own captions, no trigger word, no caption dropout, crops, region weights, loss watch or "
+                     "likeness references)", len({it.image for it in self.reg_items}), cfg.reg_dir, cfg.reg_weight)
         # video clips (train_frames above 1) skip what reads pictures: face analysis, crops, region maps, the
         # held-out photos, the look filter; their batches train on the plain loss (load_batch gives them no regions)
         clips = [it for it in items if it.frames > 1]
@@ -1109,7 +1117,8 @@ class Trainer(RaceParallelMixin):
         if cfg.isolation:
             items = self._isolation_prepare(cfg, items)
         items = items + clips
-        self.prepare_cache(items + self.holdout_items)  # (the held-out photos need latents and texts for their sweeps)
+        # (the held-out photos need latents and texts for their sweeps)
+        self.prepare_cache(items + self.reg_items + self.holdout_items)
 
         self.status.update(stage="loading transformer", step=0, total=cfg.steps)
         # block swap: loaded in RAM, the swapped blocks' frozen weights stay there and the rest moves to the GPU
@@ -1497,14 +1506,24 @@ class Trainer(RaceParallelMixin):
             if self.loss_watch is not None:
                 per_cpu, sig_cpu = per.detach().cpu().tolist(), sigma.detach().cpu().tolist()
                 for it, lv, sv in zip(batch, per_cpu, sig_cpu):
+                    if it.reg:  # a regularisation picture: never recorded, judged, throttled or excluded
+                        mults.append(1.0)
+                        continue
                     self.loss_watch.observe(cur_step, it.key, float(lv), float(sv))
                     mults.append(self.loss_watch.multiplier(it.key))
                 if cfg.per_image_lr and not true_per_image_lr:
                     weights = weights * torch.tensor(mults, device=weights.device, dtype=weights.dtype)
             if region_obs is not None:  # a dropped caption's loss is another quantity: counted, not read
-                self.region_watch.observe([it.key for it in batch], sigma.detach().cpu().tolist(), *region_obs,
-                                          skip=[str(it.text_path) != tp for it, tp in zip(batch, regions.text_paths)])
-            if any(it.loss_scale != 1.0 for it in batch):  # LoRA Isolation's side-by-side pairs
+                # (a regularisation picture is not the watch's: left out, so it does not count towards its epoch)
+                own = [i for i, it in enumerate(batch) if not it.reg]
+                sig_cpu = sigma.detach().cpu().tolist()
+                if own:
+                    self.region_watch.observe(
+                        [batch[i].key for i in own], [sig_cpu[i] for i in own],
+                        *([row[i] for i in own] for row in region_obs),
+                        skip=[str(batch[i].text_path) != regions.text_paths[i] for i in own])
+            if any(it.loss_scale != 1.0 for it in batch):  # LoRA Isolation's side-by-side pairs, self-training's
+                # pictures, the regularisation dataset's (reg_weight)
                 weights = weights * torch.tensor([it.loss_scale for it in batch], device=weights.device,
                                                  dtype=weights.dtype)
             loss = (per * weights).mean() / n_total  # the step's update is the mean over all of its batches
@@ -2308,7 +2327,9 @@ class Trainer(RaceParallelMixin):
             return
         self.status.update(stage="measuring activation memory")
         try:
-            self._calibrate_checkpointing(items, candidates, n_blocks)
+            # (the regularisation pictures too: the largest bucket may be one of theirs)
+            self._calibrate_checkpointing(list(items) + list(getattr(self, "reg_items", None) or []), candidates,
+                                          n_blocks)
         except Exception as e:  # noqa: BLE001  (an OOM while measuring included: then nothing is kept)
             log.warning("Checkpointing calibration failed (%s: %s); every block is checkpointed",
                         type(e).__name__, str(e)[:200])
@@ -2567,7 +2588,9 @@ class Trainer(RaceParallelMixin):
         st["ts_strata"] = make_strata(cfg)
         st["curriculum_w"], st["ts_logit_shift"] = None, 0.0
         self.all_items, self.curriculum_w, self.ts_logit_shift, self.loss_watch = st["items"], None, 0.0, None
-        self._enter_stage(0, 0, initial=True)  # its own image queue, seeded like every other configuration's
+        # its own image queue, seeded like every other configuration's (self.batcher is still the configuration
+        # before it: its regularisation pass is not this one's to go on with)
+        self._enter_stage(0, 0, initial=True, carry_reg=False)
         st["batcher"], st["batch_iter"] = self.batcher, self.batch_iter
         st["loss_watch"] = self._make_loss_watch(st["items"], st["optimizer"])
         st["true_per_image_lr"] = (st["loss_watch"] is not None and cfg.per_image_lr and cfg.batch_size == 1
@@ -3343,8 +3366,10 @@ class Trainer(RaceParallelMixin):
             return f"{side_to_mp(side):g} MP (stage {self.res_stage + 1}/{len(self.sides)})"
         return describe_sides(self.cfg)
 
-    def _enter_stage(self, stage: int, step: int, initial: bool = False) -> None:
-        """Build the batcher for a resolution stage (all resolutions at once unless resolution_step_up)."""
+    def _enter_stage(self, stage: int, step: int, initial: bool = False, carry_reg: bool = True) -> None:
+        """Build the batcher for a resolution stage (all resolutions at once unless resolution_step_up). carry_reg:
+        the regularisation pictures go on with the pass the queue before this one was in (a rebuild of the same
+        run's queue); off for a race configuration's first queue, which the queue before it is not its own."""
         cfg = self.cfg
         self.res_stage = max(0, min(stage, len(self.sides) - 1))
         if cfg.resolution_step_up:
@@ -3353,7 +3378,20 @@ class Trainer(RaceParallelMixin):
                 raise ValueError(f"No dataset items for resolution stage {self.res_stage}")
         else:
             items = self.all_items
-        self.batcher = BucketBatcher(items, cfg.batch_size, cfg.seed + step)
+        reg = list(getattr(self, "reg_items", None) or [])  # the regularisation dataset's pictures of this stage
+        if reg and cfg.resolution_step_up:
+            reg = items_for_side(reg, self.sides[self.res_stage])
+        old = getattr(self, "batcher", None)
+        self.batcher = BucketBatcher(items + reg, cfg.batch_size, cfg.seed + step, reg_per_epoch=cfg.reg_per_epoch)
+        if reg:
+            if carry_reg:
+                self.batcher.carry_reg_pass(old)
+            n_reg, n_all = self.batcher.reg_images(), self.batcher.epoch_images()
+            log.info("Regularisation: an epoch trains %d subject and %d regularisation pictures (of %d in the folder "
+                     "at this size, a different handful each epoch): %.0f%% of the steps go to regularisation "
+                     "pictures, so the subject trains on %.0f%% of the steps it would without them", n_all - n_reg,
+                     n_reg, len(reg), 100 * n_reg / max(1, n_all), 100 * (n_all - n_reg) / max(1, n_all))
+            self.status.update(reg_images=len({it.image for it in reg}), reg_per_epoch=n_reg)
         self.batch_iter = iter(self.batcher)
         self._refresh_batcher_weights()
         if self.balancer is not None and not initial:  # a new resolution changes the GPUs' speeds: measure again
@@ -3507,7 +3545,9 @@ class Trainer(RaceParallelMixin):
         """Images in one epoch of an image queue (repeats counted)."""
         size = getattr(batcher, "_rz_epoch_images", None)  # on the queue: a rebuilt one may reuse a freed one's id()
         if size is None:
-            size = max(1, sum(max(1, int(it.repeats or 1)) for it in batcher.items))
+            count = getattr(batcher, "epoch_images", None)  # (BucketBatcher: with the epoch's share of the
+            size = max(1, count() if count is not None else  # regularisation pictures, not all of them)
+                       sum(max(1, int(it.repeats or 1)) for it in batcher.items))
             try:
                 batcher._rz_epoch_images = size
             except AttributeError:  # a queue that takes no attributes: counted again next time (cheap)
@@ -3750,7 +3790,10 @@ class Trainer(RaceParallelMixin):
         """(steps in one epoch, images per step) for the batcher training reads now."""
         cfg = self.cfg
         per_step = max(1, cfg.batch_size * cfg.gradient_accumulation * len(self.replicas))
-        images = sum(len(v) for v in self.batcher.buckets.values()) if self.batcher is not None else 0
+        images = 0
+        if self.batcher is not None:  # (with the epoch's regularisation pictures, which wait outside the buckets)
+            images = sum(len(v) for v in self.batcher.buckets.values()) + sum(
+                (getattr(self.batcher, "reg_quota", None) or {}).values())
         return max(1, -(-images // per_step)), per_step
 
     def _map_triggers(self, cfg, items) -> dict[str, dict[str, list[int]]]:
@@ -3790,7 +3833,10 @@ class Trainer(RaceParallelMixin):
             return []
         words = self._trigger_words([cfg])
         held = {str(it.key) for it in self.holdout_items}
-        chosen = trainmaps.pick_items([it for it in items if str(it.key) not in held], cfg.training_maps_images)
+        # the subject's pictures only, as _setup_maps picks them (items is everything to cache: the regularisation
+        # dataset's pictures too, which are never mapped)
+        chosen = trainmaps.pick_items([it for it in items if str(it.key) not in held and not it.reg],
+                                      cfg.training_maps_images)
         return sorted({s for s, it in ((trainmaps.strip_trigger(it.caption, words), it) for it in chosen)
                        if s and s != it.caption})
 

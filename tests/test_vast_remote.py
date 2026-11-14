@@ -554,7 +554,7 @@ def test_a_run_the_webui_could_not_start_is_reported(install, capsys):
 
 
 def test_a_dry_run_queues_nothing_but_checks_everything(install, capsys):
-    make_job("old")
+    (make_job("old") / "old.safetensors").write_bytes(b"")  # a folder that holds a run's LoRA is refused
     code, data = run_json(capsys, "start", "--job", "new", "--from", "old", "--dry-run")
     assert code == 0 and data["dry_run"] and not Path(agent.QUEUE_FILE).exists()
     assert run(capsys, "start", "--job", "old", "--from", "old", "--dry-run")[0] == 1
@@ -574,7 +574,7 @@ RACE_OF_HULLS = ["--set", "optimizer=hull", "--set", "hull_rho=0.01", "--set", "
     (["--job", "new", *RACE_OF_HULLS], "needs face_gold: adaface"),  # a real run's: dry-run passed, then it failed
 ])
 def test_what_a_start_refuses_queues_nothing(install, capsys, extra, why, dry_run):
-    make_job("old")
+    (make_job("old") / "old.safetensors").write_bytes(b"")  # a folder that holds a run's LoRA is refused
     code, _, err = run(capsys, "start", "--from", "old", *extra, *dry_run)
     assert code == 1 and why in err and not Path(agent.QUEUE_FILE).exists()
 
@@ -584,9 +584,53 @@ def test_a_start_needs_a_base(install, capsys):
 
 
 def test_overwrite_is_asked_for_by_name(install, capsys):
-    make_job("old")
+    old = make_job("old")
+    (old / "old.safetensors").write_bytes(b"")
     picks_up()
-    assert run_json(capsys, "start", "--job", "old", "--from", "old", "--overwrite")[0] == 0
+    code, data = run_json(capsys, "start", "--job", "old", "--from", "old", "--overwrite")
+    assert code == 0
+    # the earlier run's folder is moved aside, whole, so the new run's files cannot mix with it
+    moved = Path(data["moved_aside"])
+    assert (moved / "old.safetensors").is_file() and not (old / "old.safetensors").exists()
+
+
+def test_an_overwrite_that_cannot_move_the_folder_queues_nothing(install, capsys, monkeypatch):
+    old = make_job("old")
+    (old / "old.safetensors").write_bytes(b"")
+
+    def held(self, target):
+        raise PermissionError("a file of it is open")
+
+    monkeypatch.setattr(Path, "rename", held)
+    code, _, err = run(capsys, "start", "--job", "old", "--from", "old", "--overwrite")
+    assert code == 1 and "Could not move" in err and not Path(agent.QUEUE_FILE).exists()
+    assert (old / "old.safetensors").is_file()
+
+
+def test_an_overwrite_that_cannot_be_queued_puts_the_folder_back(install, capsys, monkeypatch):
+    old = make_job("old")
+    (old / "old.safetensors").write_bytes(b"")
+
+    def full(self, *a, **kw):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(TrainQueue, "add", full)
+    with pytest.raises(OSError):
+        agent.main(["start", "--job", "old", "--from", "old", "--overwrite"])
+    assert (old / "old.safetensors").is_file()
+    assert [p.name for p in Path("output").iterdir() if p.is_dir()] == ["old"]  # nothing left moved aside
+
+
+def test_a_folder_whose_run_saved_nothing_is_free(install, capsys):
+    make_job("old")  # its config and status only
+    picks_up()
+    assert run_json(capsys, "start", "--job", "old", "--from", "old")[0] == 0
+
+
+def test_a_taken_name_is_told_the_free_one(install, capsys):
+    (make_job("old") / "old.safetensors").write_bytes(b"")
+    (make_job("old_2") / "state_000100").mkdir()
+    assert "'old_3' is free" in run(capsys, "start", "--job", "old", "--from", "old")[2]
 
 
 def test_a_job_name_in_use_is_refused(install, capsys, running_job):

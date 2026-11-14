@@ -75,10 +75,16 @@ def forward_backward(job):
     if ctx.loss_watch is not None:
         per_cpu, sig_cpu = per.detach().cpu().tolist(), sigma.detach().cpu().tolist()
         for it, lv, sv in zip(batch, per_cpu, sig_cpu):
+            if getattr(it, "reg", False):  # a regularisation picture: never recorded, judged or throttled
+                mults.append(1.0)
+                continue
             ctx.loss_watch.observe(cur_step, it.key, float(lv), float(sv))
             mults.append(ctx.loss_watch.multiplier(it.key))
         if cfg.per_image_lr:
             weights = weights * torch.tensor(mults, device=weights.device, dtype=weights.dtype)
+    if any(getattr(it, "reg", False) for it in batch):  # the regularisation dataset's loss weight (reg_weight)
+        weights = weights * torch.tensor([it.loss_scale if getattr(it, "reg", False) else 1.0 for it in batch],
+                                         device=weights.device, dtype=weights.dtype)
     loss = (per * weights).mean() / n_total  # the step's update is the mean over all of its batches
     loss.backward()
     return loss.item(), mults, None
