@@ -155,7 +155,7 @@ def test_agent_ls_and_df(tmp_path):
     (tmp_path / '.hidden').write_text('x')
     r = run_agent({'cmd': 'ls', 'path': str(tmp_path)})
     assert [d['name'] for d in r['dirs']] == ['sub']
-    assert r['files'] == [{'name': 'file.bin', 'size': 5}]
+    assert [(f['name'], f['size']) for f in r['files']] == [('file.bin', 5)] and r['files'][0]['mtime'] > 0
     assert r['free'] > 0
     r = run_agent({'cmd': 'ls', 'path': str(tmp_path), 'hidden': True})
     assert {f['name'] for f in r['files']} == {'file.bin', '.hidden'}

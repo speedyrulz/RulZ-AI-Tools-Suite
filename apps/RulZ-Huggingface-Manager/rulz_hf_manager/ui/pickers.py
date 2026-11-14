@@ -18,6 +18,16 @@ _last_local_dir: Path | None = None
 _WIN_HIDDEN = 0x2 | 0x4  # FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM
 
 
+def created_time(st: os.stat_result) -> float | None:
+    """When a file was created, where the system keeps it: st_birthtime (Windows since Python 3.12, macOS), or
+    st_ctime on older Windows Pythons (there it is the creation time). Linux / WSL: None (st_ctime is the last
+    metadata change there, not the creation)."""
+    birth = getattr(st, 'st_birthtime', None)
+    if birth:
+        return birth
+    return st.st_ctime if os.name == 'nt' else None
+
+
 def _scan(path: Path, folders_only: bool, show_hidden: bool) -> list[dict]:
     if not path.is_dir():  # here, in the worker thread: a slow or gone network drive must not stall the page
         raise NotADirectoryError(f'Not a folder: {path}')
@@ -37,6 +47,7 @@ def _scan(path: Path, folders_only: bool, show_hidden: bool) -> list[dict]:
                     'path': entry.path, 'name': entry.name, 'is_dir': is_dir,
                     'size': None if is_dir else st.st_size,
                     'modified': fmt_date(datetime.fromtimestamp(st.st_mtime)),
+                    'created': fmt_date(datetime.fromtimestamp(c)) if (c := created_time(st)) else '',
                     'icon': 'folder' if is_dir else 'draft',
                 })
             except OSError:
@@ -92,6 +103,7 @@ async def pick_local(mode: str = 'any', title: str | None = None, start: str | P
                     {'name': 'name', 'label': 'Name', 'field': 'name', 'align': 'left', 'sortable': True},
                     {'name': 'size', 'label': 'Size', 'field': 'size', 'align': 'right', 'sortable': True,
                      ':format': SIZE_FORMAT_JS},
+                    {'name': 'created', 'label': 'Created', 'field': 'created', 'align': 'left', 'sortable': True},
                     {'name': 'modified', 'label': 'Modified', 'field': 'modified', 'align': 'left', 'sortable': True},
                 ]
                 table = ui.table(columns=columns, rows=[], row_key='path',
@@ -150,6 +162,8 @@ async def pick_local(mode: str = 'any', title: str | None = None, start: str | P
         state['cwd'] = path
         _last_local_dir = path
         path_input.value = str(path)
+        cls = '' if any(r['created'] for r in rows) else 'hidden'  # Linux keeps no creation date
+        table.columns[2]['classes'] = table.columns[2]['headerClasses'] = cls
         table.update_rows(rows)
         update_status()
 

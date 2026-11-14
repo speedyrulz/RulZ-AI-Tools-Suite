@@ -19,7 +19,7 @@ class Settings:
     dark_mode: str = 'dark'  # 'dark' | 'light' ('auto', from older versions, follows the system)
     look_chosen: bool = False  # False until the first-start "Choose your look" dialog was answered
     show_hidden: bool = True
-    load_last_modified: bool = False  # slower: asks the Hub for the last commit of every file
+    repo_dates: bool = True  # fill in each repo file's "Updated" date after the list shows (one more listing)
     page_size: int = 100
     host: str = '127.0.0.1'
     port: int = 8765
