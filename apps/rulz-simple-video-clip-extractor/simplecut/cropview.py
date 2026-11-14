@@ -95,11 +95,23 @@ class VideoView(QWidget):
         self.update()
         self.cropChanged.emit()
 
-    def set_aspect(self, aspect: float | None):
-        """Lock the crop to width/height = aspect (None = free) and refit the current box."""
+    def set_aspect(self, aspect: float | None, expand: bool = False):
+        """Lock the crop to width/height = aspect (None = free) and refit the current box.
+
+        expand=True is for a ratio the user just picked: a box of another shape becomes the
+        largest box of the new shape that fits the frame, placed as near as it can be to where
+        the old box was. Without it the box keeps its width, so 9:16 -> 16:9 on a 1920x1080
+        frame left a 607x342 box that had to be dragged back out by hand. A box that already
+        has the picked shape is left alone, and so is every refit that isn't a pick (an output
+        size typed with a preset on only nudges the ratio by its even-pixel rounding)."""
         self.aspect = aspect
-        if self.crop is not None and aspect:
-            self.crop = self._refit_aspect(self.crop, aspect)
+        if self.crop is not None and aspect and self._frame_w:
+            r = self.crop
+            same_shape = r.height() > 0 and abs(r.width() / r.height() - aspect) <= 1e-6 * aspect
+            if expand and not same_shape:
+                self.crop = self._largest_box(aspect, r.center().x(), r.center().y())
+            else:
+                self.crop = self._refit_aspect(r, aspect)
         self.update()
         self.cropChanged.emit()
 
@@ -145,10 +157,18 @@ class VideoView(QWidget):
         W, H = self._frame_w, self._frame_h
         if not self.aspect:
             return QRectF(0, 0, W, H)
-        w, h = W, W / self.aspect
+        return self._largest_box(self.aspect, W / 2, H / 2)
+
+    def _largest_box(self, aspect: float, cx: float, cy: float) -> QRectF:
+        """The largest box of this aspect that fits the frame, centred on (cx, cy) as far as the
+        frame allows. It always spans the frame in one direction and slides along the other."""
+        W, H = self._frame_w, self._frame_h
+        w, h = W, W / aspect
         if h > H:
-            h, w = H, H * self.aspect
-        return QRectF((W - w) / 2, (H - h) / 2, w, h)
+            h, w = H, H * aspect
+        x = min(max(cx - w / 2, 0), W - w)
+        y = min(max(cy - h / 2, 0), H - h)
+        return QRectF(x, y, w, h)
 
     def _refit_aspect(self, r: QRectF, aspect: float) -> QRectF:
         W, H = self._frame_w, self._frame_h

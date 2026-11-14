@@ -530,6 +530,7 @@ class MainWindow(QMainWindow):
         # crop controls
         self.b_crop = btn("Crop  [C]", "Toggle crop box. Drag inside to move, drag edges/corners to resize, "
                           "drag outside to draw a new box.", self._toggle_crop, checkable=True)
+        self._aspect_pick_expands = True   # off only while Preferences re-applies the default
         self.aspect_combo = QComboBox()
         self.aspect_combo.addItems(list(ASPECT_PRESETS.keys()))
         self.aspect_combo.currentTextChanged.connect(self._aspect_changed)
@@ -969,7 +970,13 @@ class MainWindow(QMainWindow):
         ui = load_ui_defaults()
         if ASPECT_PRESETS.get(ui.aspect) == "custom":
             self.aspect_edit.setText(ui.custom_aspect)
-        self.aspect_combo.setCurrentText(ui.aspect)
+        # Saving Preferences puts the default aspect back: that refits a box already drawn, but
+        # must not blow it up to the largest size the way a pick in the Aspect box does.
+        self._aspect_pick_expands = False
+        try:
+            self.aspect_combo.setCurrentText(ui.aspect)
+        finally:
+            self._aspect_pick_expands = True
         if ASPECT_PRESETS.get(ui.aspect) == "custom":
             self._apply_aspect()
         self.fixed_unit = ui.fixed_unit
@@ -1347,7 +1354,7 @@ class MainWindow(QMainWindow):
         if ASPECT_PRESETS.get(key) == "custom" and not self.aspect_edit.text():
             self.aspect_edit.setFocus()
             return
-        self._apply_aspect()
+        self._apply_aspect(expand=self._aspect_pick_expands)
 
     def _custom_aspect_entered(self):
         try:
@@ -1355,9 +1362,18 @@ class MainWindow(QMainWindow):
         except ValueError:
             self.status.showMessage("Aspect must look like 16:9 or 1.78", 4000)
             return
-        self._apply_aspect()
+        # Only a ratio that was typed is a pick. Enter on untouched text (the field also holds
+        # text the app wrote: the rounded "1:2.333" after a rotation, the stored default) must
+        # not grow a box sized by hand, and under "Scale to" the box's shape is no guide: it
+        # follows the typed output size, which can differ from the ratio by a few pixels.
+        typed = self.aspect_edit.isModified()
+        self.aspect_edit.setModified(False)
+        self._apply_aspect(expand=typed)
 
-    def _apply_aspect(self):
+    def _apply_aspect(self, expand: bool = False):
+        """Lock the crop box to the chosen shape. expand is for a ratio the user just picked in
+        the Aspect box: the crop box then grows to the largest one of that shape (see
+        VideoView.set_aspect) instead of keeping its width and shrinking."""
         a = self._current_aspect()
         if self.rb_scale.isChecked():
             preset = self._preset_aspect()
@@ -1367,7 +1383,7 @@ class MainWindow(QMainWindow):
                 self.out_h.setValue(even(self.out_w.value() / preset))
                 self._block_out(False)
                 a = self.out_w.value() / self.out_h.value()
-        self.view.set_aspect(a)
+        self.view.set_aspect(a, expand=expand)
 
     def _preset_aspect(self) -> float | None:
         v = ASPECT_PRESETS.get(self.aspect_combo.currentText())

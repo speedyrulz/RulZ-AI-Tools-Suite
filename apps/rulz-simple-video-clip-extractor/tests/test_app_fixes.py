@@ -12,6 +12,9 @@ import pytest
 
 from test_core import APP, make_video  # noqa: F401  (sets up Qt, the settings file and sys.path)
 
+from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
+
 from simplecut.defaults import settings  # noqa: E402
 from simplecut.export import (ExportSettings, build_command, keeps_rotation_flag,  # noqa: E402
                               lossless_can_rotate, lossless_end_ok, lossless_start_ok)
@@ -419,3 +422,156 @@ def test_bad_stored_settings_fall_back_to_the_defaults():
     finally:
         for k in keys:
             st.remove(k)
+
+
+# ------------------------------------------------------------------ crop aspect picks
+def _crop_box(w):
+    r = w.view.crop
+    return r.x(), r.y(), r.width(), r.height()
+
+
+def _type_custom(w, text):
+    """Type a ratio into the Custom field and press Enter, as the user does."""
+    w.aspect_edit.selectAll()
+    QTest.keyClicks(w.aspect_edit, text)
+    QTest.keyClick(w.aspect_edit, Qt.Key_Return)
+    assert w.aspect_edit.text() == text
+
+
+def test_picking_an_aspect_grows_the_crop_box_to_the_frame_edges(window, clip):
+    """On the 160x96 test clip 9:16 is 54x96. Picking 16:9 next kept the 54 px width and gave a
+    54x30 box; it is now the largest 16:9 box, 160x90."""
+    w = window
+    _open(w, clip)
+    w.b_crop.setChecked(True)
+    w.aspect_combo.setCurrentText("9:16")
+    assert _crop_box(w) == pytest.approx((53, 0, 54, 96))
+    w.aspect_combo.setCurrentText("16:9")
+    assert _crop_box(w) == pytest.approx((0, 3, 160, 90))
+    assert w.view.crop_rect_int() == (0, 2, 160, 90) and "160×90" in w.crop_label.text()
+    w.aspect_combo.setCurrentText("1:1")
+    assert _crop_box(w) == pytest.approx((32, 0, 96, 96))
+    w.aspect_combo.setCurrentText("Free")              # Free keeps the box as it is
+    assert _crop_box(w) == pytest.approx((32, 0, 96, 96))
+
+
+def test_custom_aspect_grows_the_box_once_and_enter_again_leaves_it(window, clip):
+    from PySide6.QtCore import QRectF
+    w = window
+    _open(w, clip)
+    w.b_crop.setChecked(True)
+    w.aspect_combo.setCurrentText("1:1")
+    w.aspect_combo.setCurrentText("Custom…")           # nothing typed yet: the box waits
+    assert _crop_box(w) == pytest.approx((32, 0, 96, 96))
+    _type_custom(w, "2:1")
+    assert _crop_box(w) == pytest.approx((0, 8, 160, 80))
+    w.view.crop = QRectF(10, 10, 60, 30)               # resized by hand, still 2:1
+    QTest.keyClick(w.aspect_edit, Qt.Key_Return)       # Enter again
+    assert _crop_box(w) == pytest.approx((10, 10, 60, 30))
+    _type_custom(w, "1:2")                             # a new ratio typed: grows again
+    assert _crop_box(w) == pytest.approx((16, 0, 48, 96))
+
+
+def test_enter_on_untouched_custom_text_never_grows_the_box(window, clip):
+    """Two cases where the box's shape differs a little from the text in the Custom field, so
+    Enter with nothing typed threw a hand-sized box to the largest size: an output height typed
+    under "Scale to" (176x100 is not exactly 16:9), and a rotation, after which the field shows
+    the rounded "1:2.333" for 9:21."""
+    from PySide6.QtCore import QRectF
+    w = window
+    _open(w, clip)
+    w.b_crop.setChecked(True)
+    w.aspect_combo.setCurrentText("Custom…")
+    _type_custom(w, "16:9")
+    w.view.crop = QRectF(40, 20, 64, 36)
+    w.rb_scale.setChecked(True)
+    w.out_h.setValue(100)
+    assert (w.out_w.value(), w.out_h.value()) == (176, 100)
+    QTest.keyClick(w.aspect_edit, Qt.Key_Return)
+    assert w.view.crop.width() == pytest.approx(64) and w.view.crop.height() < 40
+
+    w.rb_native.setChecked(True)
+    w.aspect_combo.setCurrentText("21:9")
+    w.view.crop = QRectF(40, 20, 42, 18)
+    w.rotate()
+    assert _wait(lambda: w.view.frame_size == (96, 160))
+    assert w.aspect_combo.currentText() == "Custom…" and w.aspect_edit.text() == "1:2.333"
+    assert (w.view.crop.width(), w.view.crop.height()) == pytest.approx((18, 42))
+    QTest.keyClick(w.aspect_edit, Qt.Key_Return)
+    assert w.view.crop.width() == pytest.approx(18) and w.view.crop.height() < 43
+
+
+def test_typing_an_output_size_does_not_grow_a_hand_sized_box(window, clip):
+    """With a preset on, a typed output width only nudges the ratio by its even-pixel rounding
+    (9:16 at width 50 is 50x88 = 0.568): that must not throw the box back to the largest size."""
+    from PySide6.QtCore import QRectF
+    w = window
+    _open(w, clip)
+    w.b_crop.setChecked(True)
+    w.aspect_combo.setCurrentText("9:16")
+    w.view.crop = QRectF(20, 10, 27, 48)
+    w.rb_scale.setChecked(True)
+    w.out_w.setValue(50)
+    assert (w.out_w.value(), w.out_h.value()) == (50, 88)
+    x, y, bw, bh = _crop_box(w)
+    assert bw == pytest.approx(27) and bh == pytest.approx(27 * 88 / 50)
+    w.aspect_combo.setCurrentText("1:1")               # a pick still grows it, scaling or not
+    assert (w.out_w.value(), w.out_h.value()) == (50, 50)
+    assert _crop_box(w) == pytest.approx((0, 0, 96, 96))
+
+
+def test_saving_preferences_refits_the_box_without_growing_it(window, clip):
+    from PySide6.QtCore import QRectF
+    w = window
+    _open(w, clip)
+    w.b_crop.setChecked(True)
+    w.aspect_combo.setCurrentText("1:1")
+    w.view.crop = QRectF(40, 20, 40, 40)
+    st = settings()
+    try:
+        st.setValue("defaults/aspect", "16:9")
+        w._apply_ui_defaults()                         # what a saved Preferences dialog runs
+        assert w.aspect_combo.currentText() == "16:9"
+        assert _crop_box(w) == pytest.approx((40, 28.75, 40, 22.5))
+        w.aspect_combo.setCurrentText("9:16")          # and picks grow the box again afterwards
+        assert _crop_box(w) == pytest.approx((33, 0, 54, 96))
+    finally:
+        st.remove("defaults/aspect")
+
+
+def test_picking_an_aspect_under_scale_to_with_free_grows_the_box(window, clip):
+    from PySide6.QtCore import QRectF
+    w = window
+    _open(w, clip)
+    w.b_crop.setChecked(True)
+    w.view.crop = QRectF(10, 10, 60, 40)
+    w.rb_scale.setChecked(True)                        # Free: output seeded 60x40, box unchanged
+    assert (w.out_w.value(), w.out_h.value()) == (60, 40)
+    assert _crop_box(w) == pytest.approx((10, 10, 60, 40))
+    w.aspect_combo.setCurrentText("1:1")
+    assert (w.out_w.value(), w.out_h.value()) == (60, 60)
+    assert _crop_box(w) == pytest.approx((0, 0, 96, 96))
+    w.b_crop.setChecked(False)                         # the box survives crop off and on
+    w.b_crop.setChecked(True)
+    assert _crop_box(w) == pytest.approx((0, 0, 96, 96))
+
+
+def test_saving_preferences_with_a_custom_default_does_not_grow_the_box(window, clip):
+    from PySide6.QtCore import QRectF
+    w = window
+    _open(w, clip)
+    w.b_crop.setChecked(True)
+    w.aspect_combo.setCurrentText("1:1")
+    w.view.crop = QRectF(40, 20, 40, 40)
+    st = settings()
+    try:
+        st.setValue("defaults/aspect", "Custom…")
+        st.setValue("defaults/custom_aspect", "2:1")
+        w._apply_ui_defaults()
+        assert w.aspect_combo.currentText() == "Custom…" and w.aspect_edit.text() == "2:1"
+        assert _crop_box(w) == pytest.approx((40, 30, 40, 20))
+        QTest.keyClick(w.aspect_edit, Qt.Key_Return)   # Enter on the text Preferences wrote
+        assert _crop_box(w) == pytest.approx((40, 30, 40, 20))
+    finally:
+        st.remove("defaults/aspect")
+        st.remove("defaults/custom_aspect")

@@ -82,6 +82,91 @@ def test_growing_frame_leaves_a_locked_box_alone():
     assert (v.crop.x(), v.crop.y(), v.crop.width(), v.crop.height()) == pytest.approx(before)
 
 
+def box(v):
+    r = v.crop
+    return r.x(), r.y(), r.width(), r.height()
+
+
+def test_picking_a_wider_aspect_grows_the_box_to_the_frame_edges():
+    """9:16 on 1920x1080 is 607.5x1080. Picking 16:9 kept the 607.5 width and left a
+    607.5x341.7 box in the middle, which had to be dragged back out to the edges by hand."""
+    v = make_view(aspect=9 / 16)
+    assert box(v) == pytest.approx((656.25, 0, 607.5, 1080))
+    v.set_aspect(16 / 9, expand=True)
+    assert box(v) == pytest.approx((0, 0, 1920, 1080))
+    v.set_aspect(1.0, expand=True)
+    assert box(v) == pytest.approx((420, 0, 1080, 1080))
+    v.set_aspect(21 / 9, expand=True)                      # wider than the frame: full width
+    assert box(v) == pytest.approx((0, (1080 - 1920 * 9 / 21) / 2, 1920, 1920 * 9 / 21))
+
+
+def test_a_refit_that_is_not_a_pick_still_keeps_the_width():
+    v = make_view(aspect=9 / 16)
+    v.set_aspect(16 / 9)
+    assert box(v) == pytest.approx((656.25, 540 - 607.5 * 9 / 32, 607.5, 607.5 * 9 / 16))
+
+
+@pytest.mark.parametrize("x, want_x", [(100, 0), (700, 463.75), (1300, 840)])
+def test_grown_box_stays_as_near_the_old_one_as_the_frame_allows(x, want_x):
+    """A 9:16 box over someone at the left of the frame becomes the 1:1 box at the left edge,
+    not the one in the middle of the frame."""
+    v = make_view(aspect=9 / 16)
+    v.crop = QRectF(x, 0, 607.5, 1080)
+    v.set_aspect(1.0, expand=True)
+    assert box(v) == pytest.approx((want_x, 0, 1080, 1080))
+
+
+def test_grown_wide_box_slides_up_and_down_only():
+    v = make_view(aspect=1.0)
+    v.crop = QRectF(1500, 700, 300, 300)                   # bottom right
+    v.set_aspect(2.39, expand=True)
+    h = 1920 / 2.39
+    assert box(v) == pytest.approx((0, 1080 - h, 1920, h))  # centre 850 would end below the frame
+
+
+def test_a_box_that_already_has_the_picked_shape_is_left_alone():
+    """1:1 -> Free -> 1:1, or Enter pressed twice in the Custom field: nothing to grow."""
+    v = make_view(aspect=1.0)
+    v.crop = QRectF(300, 200, 250, 250)
+    v.set_aspect(None)
+    assert box(v) == (300, 200, 250, 250)
+    v.set_aspect(1.0, expand=True)
+    assert box(v) == (300, 200, 250, 250)
+
+
+def test_a_free_box_grows_too_when_an_aspect_is_picked():
+    v = make_view()
+    v.crop = QRectF(100, 100, 500, 300)
+    v.set_aspect(4 / 3, expand=True)
+    assert box(v) == pytest.approx((0, 0, 1440, 1080))     # centre x 350 - 720 is left of the frame
+
+
+@pytest.mark.parametrize("frame", [(1920, 1080), (1080, 1920), (1000, 1000), (160, 96)])
+@pytest.mark.parametrize("old", [None, 9 / 16, 1.0, 16 / 9])
+@pytest.mark.parametrize("new", [9 / 16, 2 / 3, 1.0, 4 / 3, 16 / 9, 2.39])
+@pytest.mark.parametrize("where", [(0.0, 0.0), (0.5, 0.5), (1.0, 0.3), (0.2, 1.0)])
+def test_grown_box_has_the_aspect_fits_the_frame_and_spans_it_one_way(frame, old, new, where):
+    fw, fh = frame
+    v = make_view(fw=fw, fh=fh, aspect=old)
+    w, h = v.crop.width() * 0.4, v.crop.height() * 0.4     # a small box somewhere in the frame
+    v.crop = QRectF((fw - w) * where[0], (fh - h) * where[1], w, h)
+    before, c = box(v), v.crop.center()
+    v.set_aspect(new, expand=True)
+    r = v.crop
+    if abs(w / h - new) < 1e-9:    # already that shape (also a free box on a frame of the shape)
+        assert box(v) == pytest.approx(before)
+        return
+    assert r.width() / r.height() == pytest.approx(new, abs=1e-9)
+    assert_inside(v, r)
+    assert r.width() == pytest.approx(fw) or r.height() == pytest.approx(fh)
+    # along the direction it does not span, the box is centred on the old one or stopped by an edge
+    for lo, size, full, centre in ((r.x(), r.width(), fw, c.x()), (r.y(), r.height(), fh, c.y())):
+        assert lo + size / 2 == pytest.approx(centre) or lo == pytest.approx(0) \
+            or lo + size == pytest.approx(full)
+    x, y, w, h = v.crop_rect_int()
+    assert x >= 0 and y >= 0 and x + w <= fw and y + h <= fh
+
+
 def drag(v, p0, p1):
     """Press at frame point p0, move to p1 and release, through the widget's mouse handlers."""
     s = v._scale()

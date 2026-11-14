@@ -170,7 +170,10 @@ rotation) are shown above the box and in the crop panel.
 
 - **Aspect** locks the box shape: Free, 16:9, 9:16, 4:3, 3:4, 1:1, 21:9,
   2.39:1, 3:2, 2:3, or Custom (type `W:H`, e.g. `5:4`, or a decimal).
-  Changing the aspect refits the current box around its centre.
+  Picking another aspect grows the box to the largest one of that shape that
+  fits the frame, as close as the frame allows to where the box was (a 9:16
+  box at the left edge becomes the 1:1 box at the left edge). Free keeps the
+  box as it is.
 - **Output**: "Crop size" exports the box at its native pixel size. "Scale to"
   lets you type an output width and height; the box is then locked to that
   shape. With an aspect preset chosen, editing one dimension fills in the other.
