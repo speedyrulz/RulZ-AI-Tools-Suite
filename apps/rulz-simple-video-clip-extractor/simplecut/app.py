@@ -26,6 +26,8 @@ from .export import (ExportSettings, ExportJob, NVENC_CODECS, FPS_PRESETS, parse
                      make_export_job, default_output_path, unique_path, keeps_rotation_flag,
                      lossless_can_rotate, lossless_end_ok, lossless_start_ok)
 from . import theme
+from .cliplist import (BatchExport, ClipEntry, ClipList, ClipListPanel, clean_store, video_key,
+                       DONE, FAILED, PENDING, RUNNING)
 from .colormatch import ColorMatchDialog, apply_tables, clean_temp, write_cube_1d
 try:
     from .repair.export import RepairExport
@@ -123,6 +125,7 @@ class ProbeThread(QThread):
 
 
 NO_FFMPEG = "ffmpeg / ffprobe were not found on PATH. Install them (e.g. `winget install Gyan.FFmpeg`)."
+BATCH_BUSY = "The clip list is being exported; wait for it to finish or cancel it first."
 
 
 # ----------------------------------------------------------------------------
@@ -408,6 +411,13 @@ class MainWindow(QMainWindow):
         self._probe_token = 0                          # bumped per open/close; stale probe results are dropped
         self._video_token: int | None = None           # the token of the video on screen (its keyframes)
         clean_temp()  # colour-match LUTs / reference images left by earlier sessions
+        clean_store()  # clip lists of videos that have been gone for months
+        self.clips: ClipList | None = None             # the open video's clip list
+        # Every list opened this session, by video: a batch that is still exporting a video's
+        # clips and the panel showing that video again work on the same entries.
+        self._clip_lists: dict[str, ClipList] = {}
+        self._clip_note = ""    # what the open video's stored list could not bring back (status bar)
+        self.batch = BatchExport(self)
         self._saving: set[str] = set()                 # frame PNGs being written in the background
         self._save_threads: list[threading.Thread] = []
         self._frame_saved.connect(self._frame_save_done)
@@ -512,6 +522,21 @@ class MainWindow(QMainWindow):
         self.quick_job: ExportJob | None = None
         self.b_quick.setObjectName("primary")
         self.b_export.setObjectName("primary")
+        self.b_add = btn("Add to list  [A]", "Keep this selection, with the rotation, flip, crop, colour match "
+                         "and distortion repair as they are now, in the clip list for a batch export",
+                         self.add_to_list)
+        self.clip_panel = ClipListPanel()
+        self.clip_panel.setVisible(False)
+        self.clip_panel.goRequested.connect(self.goto_clip)
+        self.clip_panel.removeRequested.connect(self._remove_clips)
+        self.clip_panel.resetRequested.connect(self._reset_clips)
+        self.clip_panel.clearRequested.connect(self._clear_clips)
+        self.clip_panel.exportRequested.connect(self.export_list)
+        self.batch.changed.connect(self._refresh_clips)
+        self.batch.clip_started.connect(self._batch_clip_started)
+        self.batch.progress.connect(self._batch_progress)
+        self.batch.exported.connect(self._note_export)
+        self.batch.finished.connect(self._batch_finished)
         self.b_last = btn("Open last export", "Close the current video and open the most recently exported file",
                           self.open_last_export)
         self.last_export: str | None = settings().value("last_export", "", type=str) or None
@@ -641,6 +666,9 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.b_flip)
         controls.addWidget(self.rot_label)
         controls.addWidget(self.b_snap)
+        # (here, not beside the export buttons below: that row is the one that sets the window's
+        # smallest width, and this one has room)
+        controls.addWidget(self.b_add)
 
         marks = QHBoxLayout()
         marks.addWidget(self.b_in)
@@ -693,6 +721,7 @@ class MainWindow(QMainWindow):
         views.setSpacing(6)
         views.addWidget(self.view, 1)
         views.addWidget(self.end_view, 1)   # hidden outside fixed-length mode
+        views.addWidget(self.clip_panel)    # hidden while the clip list is empty
         lay.addLayout(views, 1)
         lay.addWidget(self.timeline)
         lay.addLayout(controls)
@@ -726,8 +755,12 @@ class MainWindow(QMainWindow):
         self.a_close = QAction("&Close video", self, shortcut="Ctrl+W", triggered=self.close_video)
         self.a_close.setEnabled(False)
         a_quit = QAction("&Quit", self, shortcut="Ctrl+Q", triggered=self.close)
+        a_add_clip = QAction("&Add selection to clip list", self, shortcut="A", triggered=self.add_to_list)
+        a_export_list = QAction("Export clip l&ist", self, shortcut="Ctrl+Shift+A", triggered=self.export_list)
         m.addAction(a_open)
         m.addAction(a_export)
+        m.addAction(a_add_clip)
+        m.addAction(a_export_list)
         m.addAction(self.a_last)
         m.addAction(self.a_close)
         self._refresh_last_export()
@@ -831,10 +864,10 @@ class MainWindow(QMainWindow):
         for b in (self.b_start, self.b_prev, self.b_play, self.b_next,
                   self.b_end, self.b_in, self.b_out, self.b_clear, self.b_snap,
                   self.b_rotate, self.b_flip, self.b_crop, self.b_fixed, self.len_sec,
-                  self.len_frames):
+                  self.len_frames, self.b_add):
             b.setEnabled(on)
         self._set_keyframe_buttons(on)
-        self.b_quick.setEnabled(on and self.quick_job is None)
+        self.b_quick.setEnabled(on and not self._exporting())
         self.b_match.setEnabled(on)
         self.b_repair.setEnabled(on and not REPAIR_UNAVAILABLE)
         self.a_close.setEnabled(on)
@@ -1139,6 +1172,7 @@ class MainWindow(QMainWindow):
         self.timeline.set_range(info.start_time, info.end_time)
         self.timeline.set_keyframes(info.keyframes)
         self.setWindowTitle(f"{os.path.basename(info.path)} — {theme.APP_NAME}")
+        self._open_clip_list()   # (before the status line, which mentions a list that was not loaded)
         self._show_info_status("finding keyframes…")
         self._set_enabled(True)
         self._sync_length_boxes()
@@ -1153,7 +1187,8 @@ class MainWindow(QMainWindow):
         info = self.info
         self.status.showMessage(
             f"{info.width}x{info.height}  {info.fps:.3f} fps  {info.codec}  "
-            f"{keyframes}  audio: {info.audio_codec or 'none'}")
+            f"{keyframes}  audio: {info.audio_codec or 'none'}"
+            + (f"   —   Note: {self._clip_note}." if self._clip_note else ""))
 
     def _keyframes_found(self, kfs: list, dts: dict, token: int):
         # (by the video's token, not the newest open's: a file still probing may yet fail)
@@ -1189,6 +1224,8 @@ class MainWindow(QMainWindow):
         self.player.setSource(QUrl())
         self._audio_ok = False
         self.info = None
+        self.clips = None   # (a batch still exporting this video's clips keeps its own hold on them)
+        self._refresh_clips()
         self.rotation = 0
         self.flip = False
         self._set_color(None, "")
@@ -2020,7 +2057,7 @@ class MainWindow(QMainWindow):
         self.in_label.setText(lab("In", self.mark_in))
         self.out_label.setText(lab("Out", self.mark_out))
         ready = self._export_range() is not None
-        self.b_export.setEnabled(ready)
+        self.b_export.setEnabled(ready and not self.batch.running)
         if ready:
             self.b_export.setText("Export (lossless)…  [Ctrl+E]" if self._lossless_possible()
                                   else "Export (NVENC)…  [Ctrl+E]")
@@ -2066,6 +2103,9 @@ class MainWindow(QMainWindow):
         """Export the selection (or the whole video) with the default settings, no dialog."""
         if not self.info or self.quick_job is not None:
             return
+        if self.batch.running:
+            self.status.showMessage(BATCH_BUSY, 5000)
+            return
         if not have_ffmpeg():
             QMessageBox.critical(self, "Quick export", NO_FFMPEG)
             return
@@ -2103,6 +2143,9 @@ class MainWindow(QMainWindow):
         self.quick_job.start()
 
     def _quick_cancel(self):
+        if self.batch.running:   # (the status bar's Cancel button serves both)
+            self.batch.cancel()
+            return
         if self.quick_job is not None:
             self._quick_cancelled = True
             self.quick_job.cancel()
@@ -2116,7 +2159,8 @@ class MainWindow(QMainWindow):
         self.quick_job = None
         if job is not None:
             job.deleteLater()   # (a repair job holds the full-size remap tables)
-        self.b_quick.setEnabled(self.info is not None)
+        # (b_play, not self.info: while another file is being opened the controls are off)
+        self.b_quick.setEnabled(self.b_play.isEnabled() and not self._exporting())
         if self._quick_cancelled:
             remove_partial(self._quick_out)
             self.status.showMessage("Export cancelled.", 5000)
@@ -2126,6 +2170,164 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.critical(self, "Quick export failed",
                                  f"ffmpeg failed.\n\nCommand:\n{cmd_text}\n\nLog:\n{log}")
+
+    # ------------------------------------------------------------ clip list
+    def _exporting(self) -> bool:
+        """Quick export or the clip list is writing a file (one export runs at a time)."""
+        return self.quick_job is not None or self.batch.running
+
+    def _open_clip_list(self):
+        """Attach the opened video's stored clip list."""
+        key = video_key(self.info.path)
+        self._clip_note = ""
+        lst = self._clip_lists.get(key)
+        if lst is not None and not lst.busy() and not lst.matches_file():
+            lst = None   # the file was replaced since: its list is checked against the new one
+        if lst is None:
+            try:
+                lst = ClipList.load(self.info.path)
+                self._clip_note = lst.note()
+            except Exception as e:  # noqa: BLE001 - a stored list must never stop a video from opening
+                lst = ClipList(self.info.path)
+                self._clip_note = f"the stored clip list could not be read ({e})"
+            self._clip_lists[key] = lst
+        self.clips = lst
+        self._refresh_clips()
+
+    def _refresh_clips(self):
+        """The panel and the strip above the timeline bar follow the open video's list."""
+        entries = self.clips.entries if self.clips is not None and self.info else []
+        self.clip_panel.set_clips(entries, self.info.start_time if self.info else 0.0)
+        self.clip_panel.setVisible(bool(entries))
+        self.timeline.set_clips([(e.start, e.end, e.status == DONE) for e in entries])
+
+    def _save_clips(self):
+        if self.clips is not None and not self.clips.save():
+            self.status.showMessage(f"The clip list could not be saved ({self.clips.save_error}); it is kept "
+                                    f"until the app closes.", 8000)
+
+    def add_to_list(self):
+        """Keep the selection for a batch export, with the picture settings as they are now."""
+        if not self.info or self.clips is None:
+            return
+        rng = self._export_range()
+        if rng is None:
+            self.status.showMessage("Set an In or Out mark first, or enable Fixed length.", 5000)
+            return
+        crop, out_size = self._export_geometry()
+        entry = ClipEntry(rng[0], rng[1], self.rotation, self.flip, crop, out_size)
+        if self.color_tables is not None:
+            entry.color_tables = np.array(self.color_tables, dtype=np.uint8)
+            entry.color_desc = self.color_desc
+        if self.repair is not None:
+            s = self.repair.settings
+            entry.repair = RepairSettings(s.corrections, s.base_rotation, s.base_flip)   # (its own copy)
+        old = self.clips.find(entry)
+        if old is None:
+            self.clips.entries.append(entry)
+            msg = f"Added clip {len(self.clips)} to the list."
+        elif old.status in (DONE, FAILED):
+            old.status, old.error = PENDING, ""
+            msg = "That clip is in the list already; it will be exported again."
+        else:
+            msg = "That clip is in the list already."
+        self._save_clips()
+        self._refresh_clips()
+        self.status.showMessage(msg, 5000)
+
+    def goto_clip(self, entry: ClipEntry):
+        """Show a clip of the list: the marks (or the fixed-length box) and the playhead go to it."""
+        if not self.info or not self.dec:
+            return
+        self.stop()
+        if self.fixed:
+            self._set_sel_start(entry.start, seek=True)
+            return
+        self.mark_in, self.mark_out = entry.start, entry.end
+        self._selection_changed()
+        self.seek_to(entry.start)
+
+    def _remove_clips(self, entries):
+        if self.clips is None:
+            return
+        entries = [e for e in entries if e.status != RUNNING]   # the one being written finishes first
+        self.batch.discard(entries)
+        gone = {id(e) for e in entries}
+        self.clips.entries = [e for e in self.clips.entries if id(e) not in gone]
+        self._save_clips()
+        self._refresh_clips()
+
+    def _clear_clips(self):
+        if self.clips is None or not self.clips.entries:
+            return
+        n = len(self.clips)
+        what = f"all {n} clips" if n > 1 else "the clip"
+        if QMessageBox.question(self, "Clip list", f"Remove {what} from the list?\n\nFiles already exported "
+                                "are kept.", QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        self._remove_clips(list(self.clips.entries))
+
+    def _reset_clips(self, entries):
+        """Export again: saved or failed clips wait for the next "Export list"."""
+        for e in entries:
+            if e.status in (DONE, FAILED):
+                e.status, e.error = PENDING, ""
+        self._save_clips()
+        self._refresh_clips()
+
+    def export_list(self):
+        """Export every clip of the list that is not saved yet, in the background, one by one."""
+        if not self.info or self.clips is None:
+            return
+        if self.quick_job is not None:
+            self.status.showMessage("Wait for the export that is running to finish.", 5000)
+            return
+        waiting = self.clips.waiting()
+        if not waiting:
+            self.status.showMessage("Nothing in the clip list is waiting to be exported "
+                                    "(press A to add the selection).", 5000)
+            return
+        if not have_ffmpeg():
+            QMessageBox.critical(self, "Clip list", NO_FFMPEG)
+            return
+        if not self.info.keyframes and any(t.token == self._video_token and t.isRunning()
+                                           for t in self._probe_threads):
+            # (the batch keeps this video's details as they are now: without the keyframes every
+            # clip would be re-encoded, and each one would seek from the start of the file)
+            self.status.showMessage("The keyframes of this video are still being read; try again in a moment.",
+                                    5000)
+            return
+        # The encode settings are Quick export's, as they are now, for every clip queued here.
+        self.batch.add(self.info, self.clips, waiting, load_quick_defaults(), quick_lossless_when_possible(),
+                       output_dir())
+
+    def _batch_clip_started(self, name: str, n: int, total: int):
+        self.qx_label.setText(f"Exporting clip {n} of {total} → {name}")
+        self.qx_progress.setValue(0)
+        for wdg in (self.qx_label, self.qx_progress, self.qx_cancel):
+            wdg.setVisible(True)
+        self.b_quick.setEnabled(False)
+        self.b_export.setEnabled(False)
+
+    def _batch_progress(self, f: float):
+        self.qx_progress.setValue(int(f * 1000))
+        self.clip_panel.update_status()
+
+    def _batch_finished(self, saved: int, failed: int, cancelled: bool):
+        for wdg in (self.qx_label, self.qx_progress, self.qx_cancel):
+            wdg.setVisible(False)
+        self.b_quick.setEnabled(self.b_play.isEnabled() and not self._exporting())
+        self._selection_changed()   # (the Export button is available again)
+        clips = f"{saved} clip{'s' if saved != 1 else ''}"
+        if cancelled:
+            self.status.showMessage(f"Clip list export cancelled ({clips} saved before that).", 10000)
+            return
+        self.status.showMessage(f"Clip list exported: {clips} saved" + (f", {failed} failed" if failed else "")
+                                + ".", 10000)
+        if failed:
+            QMessageBox.critical(self, "Clip list export",
+                                 f"{failed} clip{'s' if failed != 1 else ''} could not be exported (marked "
+                                 f"\"failed\" in the list). The first one:\n\n{self.batch.first_failure}")
 
     def _lut_for_export(self) -> str | None:
         """The colour LUT file, written again if needed: it lives in the temp folder, where another
@@ -2140,6 +2342,9 @@ class MainWindow(QMainWindow):
         if not self.info or rng is None:
             QMessageBox.information(self, "Export", "Set an In or Out mark first, or enable Fixed length.")
             return
+        if self.batch.running:
+            self.status.showMessage(BATCH_BUSY, 5000)
+            return
         self.stop()
         crop, out_size = self._export_geometry()
         dlg = ExportDialog(self.info, rng[0], rng[1], self._lossless_possible(),
@@ -2151,6 +2356,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e):
         self.stop()
+        if self.batch.running:   # the clips not written yet stay in their lists for next time
+            self.batch.cancel()
+            self.batch.wait()
         if self.quick_job is not None:  # don't leave ffmpeg running and a half-written clip behind
             self._quick_cancel()
             self.quick_job.wait()

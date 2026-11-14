@@ -20,7 +20,7 @@ Run with a venv that has PySide6, av and numpy; Pillow is not needed:
   (wincap.py), composites it over QWidget.grab() of the main window at its real offset, then cancels it.
   Nothing is exported.
 * --out gets the catalog set (01-05), --readme the app README's docs/screenshots set (main-dark, main-light,
-  choose-your-look, export-dialog, colour-match, distortion-repair).
+  clip-list, choose-your-look, export-dialog, colour-match, distortion-repair).
 """
 from __future__ import annotations
 
@@ -284,6 +284,33 @@ win.b_fixed.setChecked(False)
 win.b_crop.setChecked(False)
 win.aspect_combo.setCurrentText("Free")
 pump(0.5)
+
+# ---- the clip list: two clips already saved and a cropped one waiting (nothing is exported)
+if args.readme:
+    for a, b in ((1.0, 2.5), (4.0, 6.0)):
+        win.seek_to(a)
+        win.set_in()
+        win.seek_to(b)
+        win.set_out()
+        win.add_to_list()
+    for e in win.clips.entries:
+        e.status, e.out_path = "done", os.path.join(args.videos, "test_pattern_10s_clip.mp4")
+    win.b_crop.setChecked(True)
+    win.aspect_combo.setCurrentText("9:16")
+    win.seek_to(7.0)
+    win.set_in()
+    win.seek_to(9.0)
+    win.set_out()
+    win.add_to_list()
+    win.seek_to(7.5)
+    win.status.clearMessage()
+    pump(1.0)
+    save(win.grab().toImage(), args.readme, "clip-list.png")
+    win._remove_clips(list(win.clips.entries))   # (the list is stored beside the .ini in --config)
+    win.clear_marks()
+    win.b_crop.setChecked(False)
+    win.aspect_combo.setCurrentText("Free")
+    pump(0.5)
 
 # ---- In/Out on keyframes -> the Export dialog offers a lossless stream copy
 win.seek_to(2.0)
