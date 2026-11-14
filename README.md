@@ -19,7 +19,9 @@ Windows desktop app for captioning image datasets with a local vision LLM.
 
 ## Run
 
-Double-click `run.bat` (creates a venv and installs PySide6 + requests on first run).
+Double-click `run.bat` (creates a venv and installs PySide6 + requests on first run). It needs Python 3.10+ on
+PATH. If that first run was interrupted, delete `.venv` and run it again: the packages are only installed when
+`.venv` doesn't exist yet.
 
 ## Set up the model (managed mode)
 
@@ -61,8 +63,11 @@ Double-click `run.bat` (creates a venv and installs PySide6 + requests on first 
   kept and the log says so. A caption file that can't be read is shown in red, skipped by *Caption All* when
   "skip existing" is on, and never replaced by a caption you haven't seen.
 - Images you remove (or clear) during a run are skipped instead of captioned for nothing.
-- If `settings.json` or `prompts.json` can't be read, it is renamed to `settings.bad-<time>.json` /
-  `prompts.bad-<time>.json` (so a hand edit gone wrong can be repaired) and the defaults are used.
+- If `settings.json` or `prompts.json` is broken (not valid JSON, a value of the wrong type, an entry that
+  isn't a prompt), it is moved or copied aside as `settings.bad-<time>.json` / `prompts.bad-<time>.json` (so a
+  hand edit gone wrong can be repaired) and the defaults, or the parts that were fine, are used. A file that
+  can't be opened at all (another program has it locked) is left alone: the app doesn't save over it while it
+  runs, and says so when you press OK in Settings or save a prompt.
 - The log (View ▸ Log) shows llama-server output, useful if a model fails to load.
 
 ## Settings folder
