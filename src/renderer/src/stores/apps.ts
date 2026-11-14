@@ -1,5 +1,6 @@
 import { toast } from 'sonner'
 import { create } from 'zustand'
+import type { HomeFilter } from '@shared/arrange'
 import { appendLogLines } from '@shared/log'
 import { refFor } from '@shared/requirements'
 import type { AppView, JobState, SelfUpdate, RequirementRef, RequirementStatus, Settings, ThemeName } from '@shared/types'
@@ -24,6 +25,8 @@ interface AppsState {
   requirements: RequirementStatus[]
   settings: Settings | null
   selectedId: string | null
+  /** The home page's filter chip. Kept here so it is still set after a visit to an app's page. */
+  homeFilter: HomeFilter
   /** The prerequisite whose install guide is open, as the app asks for it (a minimum Python version, say). */
   guide: RequirementRef | null
   /** The theme in use; settings.theme stays unset until the first-launch choice. */
@@ -38,6 +41,7 @@ interface AppsState {
   refresh: () => Promise<void>
   checkRequirements: (reloadPath?: boolean) => Promise<void>
   select: (id: string | null) => void
+  setHomeFilter: (filter: HomeFilter) => void
   dismissJob: (id: string) => void
   updateAll: () => Promise<void>
   updateSettings: (patch: Partial<Settings>) => Promise<void>
@@ -60,6 +64,7 @@ export const useApps = create<AppsState>((set, get) => ({
   requirements: [],
   settings: null,
   selectedId: null,
+  homeFilter: 'all',
   guide: null,
   theme: initialTheme,
   selfUpdate: null,
@@ -128,6 +133,8 @@ export const useApps = create<AppsState>((set, get) => ({
   },
 
   select: (id) => set({ selectedId: id }),
+
+  setHomeFilter: (homeFilter) => set({ homeFilter }),
 
   dismissJob: (id) =>
     set((s) => {

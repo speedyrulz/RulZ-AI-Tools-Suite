@@ -1,4 +1,5 @@
 import { ArrowUpCircle, Loader2, Moon, RefreshCw, Search, Settings, Sun, X } from 'lucide-react'
+import type { RefObject } from 'react'
 import { cn } from '../lib/format'
 import { LOGOS } from '../lib/theme'
 import { updatable, useApps } from '../stores/apps'
@@ -10,12 +11,15 @@ export function TopBar({
   query,
   onQuery,
   onHome,
-  onSettings
+  onSettings,
+  searchRef
 }: {
   query: string
   onQuery: (q: string) => void
   onHome: () => void
   onSettings: () => void
+  /** The search box, so Ctrl+K can put the cursor in it. */
+  searchRef: RefObject<HTMLInputElement | null>
 }) {
   const refreshing = useApps((s) => s.refreshing)
   const refresh = useApps((s) => s.refresh)
@@ -36,15 +40,23 @@ export function TopBar({
 
       <div className="flex-1" />
 
-      <div className="no-drag relative w-[300px]">
+      <div className="no-drag relative w-[320px]">
         <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-faint" />
         <input
+          ref={searchRef}
           value={query}
           onChange={(e) => onQuery(e.target.value)}
           placeholder="Search apps"
+          aria-label="Search apps"
+          title="Search apps (Ctrl+K)"
           spellCheck={false}
-          className="h-8 w-full rounded-lg border border-border bg-panel pr-8 pl-9 text-[13px] outline-none placeholder:text-faint focus:border-accent"
+          className="peer h-8 w-full rounded-lg border border-border bg-panel pr-16 pl-9 text-[13px] outline-none placeholder:text-faint focus:border-accent"
         />
+        {!query && (
+          <kbd className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 rounded border border-border bg-panel-2 px-1.5 font-sans text-[11px] leading-5 text-faint peer-focus:hidden">
+            Ctrl K
+          </kbd>
+        )}
         {query && (
           <button
             onClick={() => onQuery('')}

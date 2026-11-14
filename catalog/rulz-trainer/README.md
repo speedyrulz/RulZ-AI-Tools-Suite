@@ -435,7 +435,7 @@ what the rules have not downloaded by then is gone.
 ## How it trains
 
 MOSS-Image is the example below; each model uses its own VAE, text encoder, blocks and LoRA targets (see its own
-section) and samples with its own turbo LoRA by default ([Turbo LoRA for samples](#turbo-lora-for-samples)).
+section) and samples with its own turbo LoRA by default where it has one ([Turbo LoRA for samples](#turbo-lora-for-samples)).
 
 - **Caching first.** On the first run the Flux2 VAE encodes every image into normalized 128-channel
   latents (2x2 patchified, batch-norm normalized exactly as the reference pipeline does), and the

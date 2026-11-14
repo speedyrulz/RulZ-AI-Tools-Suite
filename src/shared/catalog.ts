@@ -6,17 +6,26 @@ import type { CatalogApp } from './types'
 
 export const SUITE_REPO = 'speedyrulz/RulZ-AI-Tools-Suite'
 
+/** The categories, in the order the home page lists them, each with a line on what its apps are for. */
+export const CATEGORIES: { name: string; blurb: string }[] = [
+  { name: 'AI Training', blurb: 'Prepare datasets, train LoRAs and manage your models' },
+  { name: 'Images', blurb: 'Collect, sort, compare and lay out pictures' },
+  { name: 'Video', blurb: 'Cut and repair clips' },
+  { name: 'LLM', blurb: 'Run local language models and build apps with them' }
+]
+
 export const CATALOG: CatalogApp[] = [
   {
     id: 'rulz-trainer',
     name: 'RulzTrainer',
     tagline: 'LoRA trainer for diffusion models, with a guided WebUI',
     description:
-      'Train LoRAs for ten image models (MOSS-Image, Bria FIBO 2.0, Krea 2, Qwen-Image 2.1, FLUX 3 Klein, ' +
-      'FLUX.2 Klein 9B, Ideogram 4, MiniMax H3, P-H3-Image and MiniMax-H3-Image) and for the PAN 2 video model ' +
-      'from your browser. A step-by-step ' +
-      'wizard recommends every setting from your GPU memory and dataset, and the finished LoRAs load straight into ' +
-      'ComfyUI.',
+      'Train LoRAs for nine image models (MOSS-Image, Bria FIBO 2.0, Krea 2, Qwen-Image 2.1, FLUX 3 Klein, ' +
+      'FLUX.2 Klein 9B, Ideogram 4, P-H3-Image and MiniMax-H3-Image) and two video models (MiniMax H3 and PAN 2, ' +
+      'from pictures or video clips) in your browser. A step-by-step wizard recommends every setting from your GPU ' +
+      'memory and dataset, likeness probes score each checkpoint against your photos, and the Fleet tab queues runs ' +
+      'on your vast.ai instances. The finished LoRAs load in ComfyUI (FIBO 2.0 LoRAs in diffusers; PAN 2 needs a ' +
+      'ComfyUI build with PAN 2 support).',
     category: 'AI Training',
     repo: SUITE_REPO,
     path: 'apps/RulzTrainer',
@@ -47,11 +56,17 @@ export const CATALOG: CatalogApp[] = [
     folderName: 'RulzTrainer',
     notes: [
       'Setup downloads CUDA PyTorch and the training libraries (about 4 GB).',
-      'Base models (about 10 to 20 GB each, up to 50 GB for the biggest) are downloaded later from the WebUI, into this folder.',
+      'Base models (about 10 to 35 GB each, up to 50 GB for the biggest) are downloaded later from the WebUI, into this folder.',
       'Launch opens a console window and the WebUI in your browser. Closing the console stops it.',
       'Turn on Tailscale remote access on this page to use the WebUI from your laptop or phone; the console shows its address.'
     ],
-    highlights: ['Ten image models + PAN 2 video', 'Wizard with recommended settings', 'Multi-GPU', 'ComfyUI-ready LoRAs']
+    highlights: [
+      '9 image and 2 video models',
+      'Wizard with recommended settings',
+      'Likeness probes',
+      'Multi-GPU and vast.ai fleet',
+      'ComfyUI-ready LoRAs'
+    ]
   },
   {
     id: 'image-organizer',
@@ -60,7 +75,7 @@ export const CATALOG: CatalogApp[] = [
     description:
       'A photo library that works like Google Photos’ People view. Add folders and it detects every face, groups ' +
       'them by person, and lets you search by person, expression, head direction and body pose. Nothing leaves your PC.',
-    category: 'Photos',
+    category: 'Images',
     repo: SUITE_REPO,
     path: 'apps/RulZ-Image-Organizer',
     tagPrefix: 'image-organizer-v',
@@ -70,7 +85,7 @@ export const CATALOG: CatalogApp[] = [
     requirements: [],
     folderName: 'RulZ Image Organizer',
     notes: ['Library data is kept in %LOCALAPPDATA%\\RulZ Image Organizer, separate from the program.'],
-    highlights: ['Face grouping', 'Search by expression & pose', 'HEIC support', 'Runs offline']
+    highlights: ['Face grouping', 'Keeps your corrections', 'Search by expression & pose', 'HEIC support', 'Runs offline']
   },
   {
     id: 'image-tournament',
@@ -78,8 +93,9 @@ export const CATALOG: CatalogApp[] = [
     tagline: 'Finds your favorite image, two at a time',
     description:
       'A single-elimination tournament for your images. Compare two side by side or in a split view with synced ' +
-      'zoom and pan, keep one, and the other goes to a Losers folder until one champion is left.',
-    category: 'Photos',
+      'zoom and pan, keep one, and the other goes to a Losers folder (or the Recycle Bin, or stays where it is) ' +
+      'until one champion is left.',
+    category: 'Images',
     repo: SUITE_REPO,
     path: 'apps/RulZ-Image-Tournament',
     tagPrefix: 'image-tournament-v',
@@ -98,8 +114,9 @@ export const CATALOG: CatalogApp[] = [
     tagline: 'Run local LLMs with llama.cpp: models, chat, tools and an API server',
     description:
       'A desktop app for running local LLMs in your own llama.cpp build. Browse your GGUF models, load them with a ' +
-      'memory estimate, chat with streaming and reasoning blocks, use MCP tools, analyse programs on the Reverse ' +
-      'Engineering page, and serve OpenAI- and Anthropic-compatible APIs.',
+      'memory estimate (MoE experts can stay in system RAM), chat with streaming and reasoning blocks, use MCP ' +
+      'tools, analyse or clone programs on the Reverse Engineering page, and serve OpenAI- and ' +
+      'Anthropic-compatible APIs.',
     category: 'LLM',
     repo: SUITE_REPO,
     path: 'apps/rulz-llm-suite',
@@ -112,10 +129,14 @@ export const CATALOG: CatalogApp[] = [
       shortcutName: 'RulZ LLM Suite'
     },
     launch: { target: 'RulZ LLM Suite.exe' },
-    requirements: [{ id: 'nvidia', optional: true, note: 'For GPU offload in llama.cpp' }],
+    requirements: [
+      { id: 'nvidia', optional: true, note: 'For GPU offload in llama.cpp' },
+      { id: 'python', optional: true, note: 'For the calc tool of Reverse Engineering mode' }
+    ],
     folderName: 'RulZ LLM Suite',
     notes: [
       'Needs a llama.cpp build with llama-server.exe; set its folder in the app under Settings ▸ Engine.',
+      'Models are read from C:\\LLM unless you pick another folder under Settings ▸ Models.',
       'Installs with its own setup program (silently), and can be removed from Windows Settings too.'
     ],
     highlights: ['GGUF model library', 'Chat with tools (MCP)', 'Speculative decoding', 'Local OpenAI/Anthropic API']
@@ -127,8 +148,9 @@ export const CATALOG: CatalogApp[] = [
     description:
       'Type what you want ("make a video upscaler with a drag-and-drop window") and a local model creates the files, ' +
       'installs what is needed, runs the app, reads the errors and fixes them, asking for your OK before risky steps. ' +
-      'Every task can be undone. It talks to RulZ LLM Suite, so nothing leaves your computer, and its Android app (the QR code on the home page) lets ' +
-      'you follow and steer it from your phone.',
+      'Every task can be undone, and History takes the project back to before any earlier one. It talks to RulZ ' +
+      'LLM Suite, so nothing leaves your computer, and its Android app (the QR code in the Phone app box on this ' +
+      'page) lets you follow and steer it from your phone.',
     category: 'LLM',
     repo: SUITE_REPO,
     path: 'apps/rulz-coding-agent',
@@ -145,9 +167,11 @@ export const CATALOG: CatalogApp[] = [
     folderName: 'RulZ Coding Agent',
     notes: [
       'Needs a model server: in RulZ LLM Suite open the Developer page and start the server (Qwen3-Coder works best).',
+      'The phone app needs Tailscale on this computer and the phone (same account), and the "Let my phone ' +
+        'connect" switch turned on under Settings ▸ Phone access.',
       'Installs with its own setup program (silently), and can be removed from Windows Settings too.'
     ],
-    highlights: ['Plain-English app building', 'Asks before risky steps', 'Undo last task', 'Runs fully local']
+    highlights: ['Plain-English app building', 'Asks before risky steps', 'Undo and task history', 'Runs fully local']
   },
   {
     id: 'training-captioner',
@@ -190,7 +214,10 @@ export const CATALOG: CatalogApp[] = [
       }
     ],
     folderName: 'Rulz Training Captioner',
-    notes: ['You also need a vision-capable GGUF model and its mmproj file (Qwen-VL, Gemma 3, MiniCPM-V…).'],
+    notes: [
+      'You also need a vision-capable GGUF model and its mmproj file (Qwen-VL, Gemma 3, MiniCPM-V…).',
+      'Settings and saved prompts are kept in %APPDATA%\\RulzCaptioner, separate from the program.'
+    ],
     highlights: ['Editable caption grid', 'Multi-GPU parallel or split', 'Custom prompts', 'Any OpenAI-compatible server']
   },
   {
@@ -199,7 +226,8 @@ export const CATALOG: CatalogApp[] = [
     tagline: 'Frame-accurate clip extraction with lossless cuts and NVENC export',
     description:
       'A small video trimmer: step frame by frame or keyframe by keyframe, mark In and Out, and export losslessly or ' +
-      're-encoded with NVIDIA NVENC. Crop, rotate, fixed-length clips and skin-tone colour matching included, plus a ' +
+      're-encoded with NVIDIA NVENC. Crop, rotate, fixed-length clips, Quick export and skin-tone colour matching ' +
+      'included, plus a ' +
       'Distortion repair window (lens, perspective, horizon, reshape and miniature effect) applied to the preview, ' +
       'frame PNGs and every export.',
     category: 'Video',
@@ -219,12 +247,12 @@ export const CATALOG: CatalogApp[] = [
   {
     id: 'rulz-image-crawler',
     name: 'RulZ Image Crawler',
-    tagline: 'Crawls a website or folder and keeps only the images that match your description',
+    tagline: 'Saves the images from a website or folder that match your description',
     description:
       'Describe what you want ("women with red hair", "sunsets over the sea"), point it at a website or a folder, ' +
       'and a local vision model checks every picture and saves the ones that match, full size where it can find ' +
-      'them. Runs on your own NVIDIA GPU; nothing is sent anywhere.',
-    category: 'Photos',
+      'them. The pictures are checked on your own NVIDIA GPU, not by an online service.',
+    category: 'Images',
     repo: SUITE_REPO,
     path: 'apps/rulz-image-crawler',
     tagPrefix: 'rulz-image-crawler-v',
@@ -276,7 +304,7 @@ export const CATALOG: CatalogApp[] = [
   {
     id: 'image-preparer',
     name: 'RulZ Image Preparer',
-    tagline: 'Cleans up and crops image datasets before training: color noise, JPEG artifacts, lost detail',
+    tagline: 'Cleans up and crops image datasets before training',
     description:
       'Drop in a folder of training images and clean them up in one go: remove color noise, remove JPEG ' +
       'compression artifacts (a fast filter, or an AI model on your GPU for the best quality) and sharpen detail ' +
@@ -311,7 +339,7 @@ export const CATALOG: CatalogApp[] = [
       'Best quality JPEG mode is optional: the first time you pick it, the app offers to install CUDA PyTorch ' +
         '(about 3 GB) and download the FBCNN model (288 MB) into %LOCALAPPDATA%\\RulZ\\Image Preparer.',
       'Auto crop is optional too: the first time you use it, the app offers to install CUDA PyTorch (shared with ' +
-        'Best quality), Transformers and the SAM 3.1 model (1.7 GB).'
+        'Best quality), Transformers and TorchVision (about 100 MB), and to download the SAM 3.1 model (1.7 GB).'
     ],
     highlights: ['Color noise removal', 'JPEG artifact removal (fast or AI)', 'Auto crop with SAM 3.1', 'Shadow lift', 'Global + per-image']
   },
@@ -322,8 +350,8 @@ export const CATALOG: CatalogApp[] = [
     description:
       'Drop in images or a folder and lay them out in a grid with their file names underneath and your own row and ' +
       'column labels. Drag tiles to rearrange them, set the columns, padding, text and background, then export the ' +
-      'whole grid as one PNG or JPG at up to full resolution, with the exact size shown before you save.',
-    category: 'Photos',
+      'whole grid as one PNG or JPG at 1 to 200% of full resolution, with the exact size shown before you save.',
+    category: 'Images',
     repo: SUITE_REPO,
     path: 'apps/RulZ-Image-Grid',
     tagPrefix: 'image-grid-v',
@@ -339,7 +367,7 @@ export const CATALOG: CatalogApp[] = [
   {
     id: 'hf-manager',
     name: 'RulZ Huggingface Manager',
-    tagline: 'Manage your Hugging Face models, datasets, spaces and buckets from one page',
+    tagline: 'Manage your Hugging Face repos and storage buckets from one page',
     description:
       'Every repo and storage bucket in your Hugging Face account in one table, with sizes and visibility. Open one ' +
       'to browse its files, then upload, download, rename, move, copy or delete them with a click: changes to a repo ' +
@@ -371,7 +399,8 @@ export const CATALOG: CatalogApp[] = [
       'Setup installs the app’s Python packages (about 110 MB).',
       'Launch opens a console window and the app in your browser. Closing the console stops it.',
       'Add a Hugging Face access token (Write) under Settings. It is kept in %APPDATA%\\RulZ-HF-Manager, ' +
-        'separate from the program.'
+        'separate from the program.',
+      'Sending to vast.ai needs ssh (built into Windows 10 and 11) and your ssh key in your vast.ai account.'
     ],
     highlights: ['Repos and buckets in one table', 'Move, copy, rename in one commit', 'Send to vast.ai', 'Bucket sync']
   }

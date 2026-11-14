@@ -36,7 +36,7 @@ describe('RulZ Image Grid', () => {
   })
 
   it('has its catalog README, icon and screenshots', () => {
-    for (const f of ['README.md', 'icon.png', 'icon.ico', 'screenshots/01-dark.jpg'])
+    for (const f of ['README.md', 'icon.png', 'icon.ico', 'screenshots/01-dark.png'])
       expect(existsSync(join(ROOT, 'catalog', 'image-grid', f)), f).toBe(true)
   })
 })

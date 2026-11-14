@@ -113,8 +113,9 @@ Watch and control your projects from your Android phone with
 approvals, follow the steps and changed files, run your app and undo, while everything still runs here. The wiki's
 [Android App](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/wiki/Coding-Agent-Android-App) page describes it.
 
-0. Install the app: scan the QR code on the RulZ AI Tools Suite launcher's home page (or on this app's page there)
-   with the phone's camera, download the APK and open it. The code always points at the newest release.
+0. Install the app: on the RulZ AI Tools Suite launcher's home page press **Coding Agent for Android** (or open this
+   app's page there), scan the QR code with the phone's camera, download the APK and open it. The code always points
+   at the newest release.
 1. Install [Tailscale](https://tailscale.com) on this computer and the phone, signed in to the same account.
 2. **Settings > Phone access**: turn on **Let my phone connect**. The first time, Windows may ask whether RulZ Coding
    Agent may use your networks: allow it.

@@ -45,15 +45,17 @@ export function Gallery({ images, name }: { images: string[]; name: string }) {
       </button>
 
       {images.length > 1 && (
-        <div className="mt-3 flex gap-2 overflow-x-auto pb-1">
+        <div className="mt-3 flex gap-2 overflow-x-auto p-0.5 pb-1.5">
           {images.map((src, i) => (
             <button
               key={src}
               type="button"
+              aria-label={`Screenshot ${i + 1} of ${images.length}`}
+              aria-pressed={i === index}
               onClick={() => setIndex(i)}
               className={cn(
                 'relative aspect-[16/10] w-32 shrink-0 cursor-pointer overflow-hidden rounded-lg border-2 bg-media transition-all',
-                i === index ? 'border-accent' : 'border-transparent opacity-55 hover:opacity-100'
+                i === index ? 'border-accent' : 'border-transparent opacity-60 hover:opacity-100'
               )}
             >
               <img

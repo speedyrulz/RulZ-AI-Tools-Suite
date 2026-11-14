@@ -240,6 +240,8 @@ export interface Settings {
   closeOnLaunch: boolean
   /** An update the user chose "Skip" for. */
   skippedUpdate?: string
+  /** How the home page lists the apps: cards with a screenshot (the default) or one compact row each. */
+  homeView?: 'grid' | 'list'
   /** The launch options turned on, per app id (LaunchSpec.options). */
   launchOptions?: Record<string, string[]>
 }
