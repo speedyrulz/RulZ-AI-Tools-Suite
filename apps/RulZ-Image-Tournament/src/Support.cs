@@ -160,12 +160,17 @@ namespace RulZ.ImageTournament
             return s;
         }
 
+        // Written to a temporary file that then replaces the old one, so a crash mid-write (settings are now
+        // saved whenever an option changes) can't leave a half-written file.
         public void Save()
         {
             try
             {
                 Directory.CreateDirectory(Folder);
-                File.WriteAllLines(FilePath, _values.Select(kv => kv.Key + "=" + kv.Value));
+                string tmp = FilePath + ".tmp";
+                File.WriteAllLines(tmp, _values.Select(kv => kv.Key + "=" + kv.Value));
+                if (File.Exists(FilePath)) File.Replace(tmp, FilePath, null);
+                else File.Move(tmp, FilePath);
             }
             catch (IOException) { }
             catch (UnauthorizedAccessException) { }
@@ -215,6 +220,93 @@ namespace RulZ.ImageTournament
         static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
 
         const uint SWP_NOSIZE = 0x1, SWP_NOMOVE = 0x2, SWP_NOZORDER = 0x4, SWP_NOACTIVATE = 0x10, SWP_FRAMECHANGED = 0x20;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr security,
+            uint disposition, uint flags, IntPtr template);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetFileInformationByHandle(Microsoft.Win32.SafeHandles.SafeFileHandle file, out ByHandleInfo info);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetFileInformationByHandleEx(Microsoft.Win32.SafeHandles.SafeFileHandle file, int infoClass, out FileIdInfo info, int size);
+
+        [DllImport("user32.dll")]
+        static extern bool ShowWindow(IntPtr hwnd, int command);
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct ByHandleInfo
+        {
+            public uint Attributes;
+            public System.Runtime.InteropServices.ComTypes.FILETIME Created, Accessed, Written;
+            public uint VolumeSerial, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+        }
+
+        // FILE_ID_INFO: the 64-bit volume serial and the full 128-bit file ID (ReFS IDs don't fit in 64 bits).
+        [StructLayout(LayoutKind.Sequential)]
+        struct FileIdInfo
+        {
+            public ulong VolumeSerial, IdLow, IdHigh;
+        }
+
+        struct FileIdentity
+        {
+            public ulong Volume, IdLow, IdHigh;
+            public long Size, Written;
+        }
+
+        const uint FILE_READ_ATTRIBUTES = 0x80, FILE_SHARE_ALL = 0x7, OPEN_EXISTING = 3, FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+        const int FileIdInfoClass = 18, SW_RESTORE = 9;
+
+        // Brings a minimized window back the way it was before (maximized if it was).
+        public static void Restore(IntPtr hwnd)
+        {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
+
+        // True when two paths are the same file on disk, even when spelled differently (a mapped drive and
+        // its UNC path, a short 8.3 name, a junction or a hard link). False when either can't be opened or
+        // the file system has no usable file IDs. The size and last-write time must match too, as a second
+        // check against file systems whose IDs aren't unique: a wrong "same" would leave a loser in place.
+        public static bool IsSameFile(string a, string b)
+        {
+            if (string.Equals(a, b, StringComparison.OrdinalIgnoreCase)) return true;
+            FileIdentity x, y;
+            return Identify(a, out x) && Identify(b, out y) && x.Volume == y.Volume && x.IdLow == y.IdLow && x.IdHigh == y.IdHigh
+                && x.Size == y.Size && x.Written == y.Written;
+        }
+
+        // A string naming a file or folder on disk however its path is spelled, or null if it can't be
+        // opened or the file system has no usable file IDs.
+        public static string FileKey(string path)
+        {
+            FileIdentity id;
+            return Identify(path, out id) ? id.Volume.ToString("X") + ":" + id.IdHigh.ToString("X") + ":" + id.IdLow.ToString("X") : null;
+        }
+
+        static bool Identify(string path, out FileIdentity id)
+        {
+            id = new FileIdentity();
+            using (var h = CreateFile(path, FILE_READ_ATTRIBUTES, FILE_SHARE_ALL, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero))
+            {
+                ByHandleInfo info;
+                if (h.IsInvalid || !GetFileInformationByHandle(h, out info)) return false;
+                id.Volume = info.VolumeSerial;
+                id.IdLow = (ulong)info.IndexHigh << 32 | info.IndexLow;
+                id.Size = (long)info.SizeHigh << 32 | info.SizeLow;
+                id.Written = (long)(uint)info.Written.dwHighDateTime << 32 | (uint)info.Written.dwLowDateTime;
+                FileIdInfo full;
+                if (GetFileInformationByHandleEx(h, FileIdInfoClass, out full, Marshal.SizeOf(typeof(FileIdInfo))))
+                {
+                    id.Volume = full.VolumeSerial;
+                    id.IdLow = full.IdLow;
+                    id.IdHigh = full.IdHigh;
+                }
+                // Some network and virtual file systems (WebDAV, some NAS and virtual-machine shares) report 0
+                // for every file, which would make everything look like the same file.
+                return (id.IdLow | id.IdHigh) != 0;
+            }
+        }
 
         // A dark or light title bar (Windows 10 20H1+ and 11). Redraws the frame so it also applies to an open window.
         public static void UseDarkTitleBar(IntPtr hwnd, bool dark)

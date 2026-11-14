@@ -145,6 +145,108 @@ static class TournamentTests
         Check(t.Remaining == 20000 && t.Contains(@"c:\big\IMG19999.PNG"), "large set added");
         Check(watch.ElapsedMilliseconds < 2000, "large set add took " + watch.ElapsedMilliseconds + " ms");
 
+        // Undo snapshots: restoring one gives exactly what a full copy taken at the same moment gives, with
+        // images added after the snapshot appended, through random picks, adds, removes and nested undos.
+        rng = new Random(11);
+        for (int trial = 0; trial < 60; trial++)
+        {
+            t = new Tournament();
+            t.Start(Images(rng.Next(2, 40)));
+            var history = new List<KeyValuePair<Tournament.Snapshot, Tournament>>();
+            nextId = 5000;
+            for (int step = 0; step < 200; step++)
+            {
+                int roll = rng.Next(20);
+                if (roll < 11 && t.HasMatch)
+                {
+                    history.Add(new KeyValuePair<Tournament.Snapshot, Tournament>(t.TakeSnapshot(), t.Clone()));
+                    t.Choose(rng.Next(2) == 0);
+                }
+                else if (roll < 14) t.Add(Enumerable.Range(0, rng.Next(1, 4)).Select(i => "a" + (nextId++)).ToList());
+                else if (roll < 15 && t.Remaining > 1) t.Remove(t.AliveImages().ElementAt(rng.Next(t.Remaining)));
+                else if (history.Count > 0)
+                {
+                    var last = history[history.Count - 1];
+                    history.RemoveAt(history.Count - 1);
+                    var expected = last.Value;
+                    expected.Add(t.AliveImages().Where(p => !expected.Contains(p)).ToList());
+                    t.Restore(last.Key);
+                    var a = new StringWriter(); t.Save(a);
+                    var b = new StringWriter(); expected.Save(b);
+                    Check(a.ToString() == b.ToString(), "snapshot restore matches a full copy, trial " + trial + " step " + step);
+                    Check(t.AliveImages().All(t.Contains) && t.AliveImages().Count() == t.Remaining
+                          && t.AliveImages().Distinct().Count() == t.Remaining, "membership after restore, trial " + trial);
+                }
+            }
+        }
+
+        // Undoing a pick keeps images added after it.
+        t.Start(Images(4));
+        var snap = t.TakeSnapshot();
+        t.Choose(true); // 1 beats 2
+        t.Add(new[] { "5", "6" });
+        t.Restore(snap);
+        Check(t.Left == "1" && t.Right == "2" && t.Contains("2") && t.Contains("5") && t.Contains("6") && t.Remaining == 6,
+              "undo keeps images added after the pick");
+        Check(PlayLeft(t) == "1:1v2 1:3v4 1:5v6 2:1v3 3:5v1", "undo then play with the added images");
+
+        // Snapshots are O(1): taking one per pick over a large set stays fast and small.
+        t = new Tournament();
+        t.Start(Enumerable.Range(0, 20000).Select(i => @"C:\Big\img" + i + ".png"));
+        watch = System.Diagnostics.Stopwatch.StartNew();
+        var snaps = new List<Tournament.Snapshot>();
+        for (int i = 0; i < 2000; i++) { snaps.Add(t.TakeSnapshot()); t.Choose(i % 2 == 0); }
+        Check(watch.ElapsedMilliseconds < 500, "2000 snapshots over 20000 images took " + watch.ElapsedMilliseconds + " ms");
+        t.Restore(snaps[0]);
+        Check(t.MatchesPlayed == 0 && t.Remaining == 20000 && t.Left == @"C:\Big\img0.png", "restore the first of many snapshots");
+
+        // Preloading looks into the next round: the next pair is always among Upcoming(2) or the current pair.
+        rng = new Random(3);
+        for (int n = 2; n <= 40; n++)
+        {
+            t.Start(Images(n));
+            while (t.HasMatch)
+            {
+                var near = new HashSet<string>(t.Upcoming(2)) { t.Left, t.Right };
+                t.Choose(rng.Next(2) == 0);
+                if (t.HasMatch) Check(near.Contains(t.Left) && near.Contains(t.Right), "next pair was preloaded, n=" + n);
+            }
+        }
+        t.Start(Images(10));
+        for (int i = 0; i < 4; i++) t.Choose(true); // round 1 down to 9 v 10; winners so far 1, 3, 5, 7
+        Check(string.Join(",", t.Upcoming(2)) == "1,3", "last match of a round preloads the next round's first match");
+        t.Start(Images(5));
+        t.Choose(true); // 3 v 4 next, 5 has the bye
+        Check(string.Join(",", t.Upcoming(2)) == "5,1", "bye and first winner are preloaded at the end of a round");
+
+        // RemoveAll drops many images in one pass and keeps the bracket valid.
+        t.Start(Images(6));
+        t.Choose(true); // 1 beats 2
+        Check(t.RemoveAll(new[] { "3", "6", "2", "nope" }) == 2 && !t.Contains("3") && !t.Contains("6") && t.Remaining == 3,
+              "remove all counts only images in the running");
+        Check(PlayLeft(t) == "1:4v5 2:1v4", "remove all keeps the round order");
+        t = new Tournament();
+        var many = Enumerable.Range(0, 20000).Select(i => @"C:\Gone\img" + i + ".png").ToList();
+        t.Start(many);
+        watch = System.Diagnostics.Stopwatch.StartNew();
+        Check(t.RemoveAll(many.Skip(1)) == 19999 && t.Champion == many[0], "remove all but one leaves a champion");
+        Check(watch.ElapsedMilliseconds < 500, "removing 19999 images took " + watch.ElapsedMilliseconds + " ms");
+
+        // A damaged or hand-edited state file is refused rather than resumed wrongly.
+        Func<string, Tournament> load = s => Tournament.Load(new StringReader(s));
+        string good = "RulZImageTournament/1\nround=1\nplayed=1\npos=2\n[round]\na\nb\nc\nd\n[winners]\na\n";
+        Check(load(good) != null && load(good).Left == "c", "well-formed state loads");
+        Check(load(good.Replace("pos=2", "pos=1")) == null, "odd position refused");
+        Check(load(good.Replace("pos=2", "pos=6")) == null, "position past the round refused");
+        Check(load(good.Replace("round=1", "round=0")) == null, "round 0 refused");
+        Check(load(good.Replace("played=1", "played=-1")) == null, "negative matches refused");
+        Check(load(good.Replace("[winners]\na\n", "[winners]\nc\n")) == null, "an image listed twice is refused");
+        Check(load(good.Replace("RulZImageTournament/1", "Something/1")) == null, "wrong header refused");
+
+        // Held-down keys: the repeats Windows sends while a key stays down are recognised.
+        Check(KeyRouting.IsRepeat(System.Windows.Forms.Message.Create(IntPtr.Zero, 0x100, IntPtr.Zero, new IntPtr(0x40000001))), "key repeat detected");
+        Check(!KeyRouting.IsRepeat(System.Windows.Forms.Message.Create(IntPtr.Zero, 0x100, IntPtr.Zero, new IntPtr(1))), "first key press is not a repeat");
+
         // Shortcut keys stay with controls that use typing or arrows themselves.
         Check(KeyRouting.IsInputControl(new System.Windows.Forms.TextBox()), "text box keeps keys");
         Check(KeyRouting.IsInputControl(new System.Windows.Forms.ComboBox()), "combo box keeps keys");
