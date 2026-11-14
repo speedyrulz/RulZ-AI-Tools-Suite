@@ -41,9 +41,13 @@ Open a photo and paint over a shadow to brighten it to the light level around it
 
 It doesn't just raise brightness: the app separates the lighting from the surface detail, measures
 how deep the shadow is, and undoes it the way extra light would, so texture and contrast are kept,
-dark and bright things in the shadow keep their difference, lit parts you brush over are left alone,
-the shadow's soft edge is brightened only as much as it was darkened (so brushing past it onto open lit
-ground leaves no bright ring), and a blue shadow tint is matched to the surroundings. Painted areas are per photo and are applied by
+dark and bright things in the shadow keep their difference, lit parts you brush over are left alone
+(a lit strip between two shadows, or cutting into one, too), the shadow's soft edge is brightened only as
+much as it was darkened (so brushing past it leaves no bright ring), and a blue shadow tint is matched to
+the surroundings. A lit spot with shadow all around it, like sun through leaves, looks just like a bright
+object in the shadow and is brightened too: erase it, and any lit strip that still comes out too bright
+(one in a faint shadow on busy ground such as gravel or grass, or with something bright in it). Painted
+areas are per photo and are applied by
 **Save all** and by Auto crop's clean-up option. They aren't kept after the app closes.
 
 ## Auto crop
