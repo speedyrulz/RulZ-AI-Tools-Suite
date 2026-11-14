@@ -18,6 +18,10 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci --no-audit --no-fund
+      # Electron fetches its program on first use, not during npm ci. Two test files use it at the same time, and
+      # two downloads into one folder can break each other (the first v1.14.0 release build failed that way).
+      - name: Fetch Electron
+        run: node node_modules/electron/install.js
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
