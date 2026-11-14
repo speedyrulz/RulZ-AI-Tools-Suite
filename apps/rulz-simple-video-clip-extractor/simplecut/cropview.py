@@ -25,11 +25,16 @@ class VideoView(QWidget):
 
     cropChanged = Signal()
 
-    def __init__(self):
+    def __init__(self, interactive: bool = True):
+        """interactive=False is a second, look-only view (the clip's last frame beside the main
+        view in fixed-length mode): it shows the crop box it is given with mirror_crop(), but the
+        mouse does nothing on it, and it stays blank instead of showing the "Open a video" hint."""
         super().__init__()
         self.setMinimumSize(320, 180)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setMouseTracking(True)
+        self.interactive = interactive
+        self.caption = ""               # a short label painted in the frame's bottom-left corner
+        self.setMouseTracking(interactive)
         self._pix: QPixmap | None = None
         self._frame_w = 0
         self._frame_h = 0
@@ -95,11 +100,23 @@ class VideoView(QWidget):
         self.update()
         self.cropChanged.emit()
 
-    def set_aspect(self, aspect: float | None):
-        """Lock the crop to width/height = aspect (None = free) and refit the current box."""
+    def set_aspect(self, aspect: float | None, expand: bool = False):
+        """Lock the crop to width/height = aspect (None = free) and refit the current box.
+
+        expand=True is for a ratio the user just picked: a box of another shape becomes the
+        largest box of the new shape that fits the frame, placed as near as it can be to where
+        the old box was. Without it the box keeps its width, so 9:16 -> 16:9 on a 1920x1080
+        frame left a 607x342 box that had to be dragged back out by hand. A box that already
+        has the picked shape is left alone, and so is every refit that isn't a pick (an output
+        size typed with a preset on only nudges the ratio by its even-pixel rounding)."""
         self.aspect = aspect
-        if self.crop is not None and aspect:
-            self.crop = self._refit_aspect(self.crop, aspect)
+        if self.crop is not None and aspect and self._frame_w:
+            r = self.crop
+            same_shape = r.height() > 0 and abs(r.width() / r.height() - aspect) <= 1e-6 * aspect
+            if expand and not same_shape:
+                self.crop = self._largest_box(aspect, r.center().x(), r.center().y())
+            else:
+                self.crop = self._refit_aspect(r, aspect)
         self.update()
         self.cropChanged.emit()
 
@@ -120,6 +137,18 @@ class VideoView(QWidget):
         if self.crop is not None and self._frame_w:
             r = self.crop
             self.crop = QRectF(self._frame_w - (r.x() + r.width()), r.y(), r.width(), r.height())
+
+    def set_caption(self, text: str):
+        if text != self.caption:
+            self.caption = text
+            self.update()
+
+    def mirror_crop(self, other: "VideoView"):
+        """Show the other view's crop box (for the look-only view; both show the same frame size)."""
+        self.crop_enabled = other.crop_enabled
+        self.aspect = other.aspect
+        self.crop = QRectF(other.crop) if other.crop is not None else None
+        self.update()
 
     def clear(self):
         self._pix = None
@@ -145,10 +174,18 @@ class VideoView(QWidget):
         W, H = self._frame_w, self._frame_h
         if not self.aspect:
             return QRectF(0, 0, W, H)
-        w, h = W, W / self.aspect
+        return self._largest_box(self.aspect, W / 2, H / 2)
+
+    def _largest_box(self, aspect: float, cx: float, cy: float) -> QRectF:
+        """The largest box of this aspect that fits the frame, centred on (cx, cy) as far as the
+        frame allows. It always spans the frame in one direction and slides along the other."""
+        W, H = self._frame_w, self._frame_h
+        w, h = W, W / aspect
         if h > H:
-            h, w = H, H * self.aspect
-        return QRectF((W - w) / 2, (H - h) / 2, w, h)
+            h, w = H, H * aspect
+        x = min(max(cx - w / 2, 0), W - w)
+        y = min(max(cy - h / 2, 0), H - h)
+        return QRectF(x, y, w, h)
 
     def _refit_aspect(self, r: QRectF, aspect: float) -> QRectF:
         W, H = self._frame_w, self._frame_h
@@ -176,7 +213,7 @@ class VideoView(QWidget):
         return r
 
     def _hit(self, p: QPointF) -> str | None:
-        if not self.crop_enabled or not self._frame_w:
+        if not self.interactive or not self.crop_enabled or not self._frame_w:
             return None
         if self.crop is None:
             return "new"
@@ -332,6 +369,9 @@ class VideoView(QWidget):
     def paintEvent(self, _):
         p = QPainter(self)
         p.fillRect(self.rect(), theme.Q_BG)
+        if not self._pix and not self.interactive:
+            p.end()
+            return
         if not self._pix:
             # empty state: the RulZ logo with a hint underneath
             logo = theme.logo_pixmap(max(40, min(120, self.height() // 5)))
@@ -372,12 +412,13 @@ class VideoView(QWidget):
             p.setPen(QPen(QColor(255, 255, 255), 1))
             p.setBrush(QBrush(theme.Q_RED))
             cx, cy = wr.center().x(), wr.center().y()
-            for hx, hy in ((wr.left(), wr.top()), (cx, wr.top()), (wr.right(), wr.top()),
-                           (wr.left(), cy), (wr.right(), cy),
-                           (wr.left(), wr.bottom()), (cx, wr.bottom()), (wr.right(), wr.bottom())):
+            handles = ((wr.left(), wr.top()), (cx, wr.top()), (wr.right(), wr.top()),
+                       (wr.left(), cy), (wr.right(), cy),
+                       (wr.left(), wr.bottom()), (cx, wr.bottom()), (wr.right(), wr.bottom()))
+            for hx, hy in handles if self.interactive else ():   # (nothing to grab on a look-only view)
                 p.drawRect(QRectF(hx - 4, hy - 4, 8, 8))
             # size label
-            r = self.crop_rect_int()
+            r = self.crop_rect_int() if self.interactive else None
             if r:
                 txt = f"{r[2]}×{r[3]}  @ {r[0]},{r[1]}"
                 p.setPen(QColor(255, 255, 255))
@@ -387,4 +428,18 @@ class VideoView(QWidget):
                 ty = wr.top() - 22 if wr.top() > 24 else wr.top() + 4
                 p.drawRect(QRectF(wr.left(), ty, tw, 18))
                 p.drawText(QRectF(wr.left() + 5, ty, tw, 18), Qt.AlignVCenter, txt)
+        if self.caption:
+            # In the picture's bottom-left corner. A portrait picture is narrower than the text:
+            # the label then moves left into the empty side (and is shortened if even the widget
+            # is too narrow), so it is never cut off at the widget's right edge.
+            d, fm = self._disp, p.fontMetrics()
+            text = fm.elidedText(self.caption, Qt.ElideRight, max(int(self.width()) - 24, 20))
+            tw = fm.horizontalAdvance(text) + 12
+            x = min(d.left() + 6, self.width() - 6 - tw)
+            box = QRectF(max(x, 6.0), d.bottom() - 26, tw, 20)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(QColor(theme.OVERLAY_LABEL_BG)))
+            p.drawRect(box)
+            p.setPen(QColor(255, 255, 255))
+            p.drawText(box, Qt.AlignCenter, text)
         p.end()

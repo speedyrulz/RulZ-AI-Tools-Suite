@@ -445,6 +445,15 @@ class MainWindow(QMainWindow):
         # --- widgets
         self.view = VideoView()
         self.view.cropChanged.connect(self._crop_changed)
+        # Fixed-length mode shows a second, look-only view to the right of the main one: the last
+        # frame of the clip as it is selected now. It has a decoder of its own, so finding that
+        # frame never moves the playhead or empties the main decoder's cache of nearby frames.
+        self.end_view = VideoView(interactive=False)
+        self.end_view.setFocusPolicy(Qt.NoFocus)
+        self.end_view.setVisible(False)
+        self.end_dec: Decoder | None = None
+        self._end_key: tuple | None = None   # what the end view shows (see _end_wanted); None = stale
+        self._end_timer = QTimer(self, singleShot=True, interval=0, timeout=self._render_end_view)
         self.timeline = Timeline()
         self.timeline.seekRequested.connect(self.seek_to)
         self.timeline.selectionMoveRequested.connect(self._move_selection)
@@ -530,6 +539,7 @@ class MainWindow(QMainWindow):
         # crop controls
         self.b_crop = btn("Crop  [C]", "Toggle crop box. Drag inside to move, drag edges/corners to resize, "
                           "drag outside to draw a new box.", self._toggle_crop, checkable=True)
+        self._aspect_pick_expands = True   # off only while Preferences re-applies the default
         self.aspect_combo = QComboBox()
         self.aspect_combo.addItems(list(ASPECT_PRESETS.keys()))
         self.aspect_combo.currentTextChanged.connect(self._aspect_changed)
@@ -679,7 +689,11 @@ class MainWindow(QMainWindow):
 
         root = QWidget()
         lay = QVBoxLayout(root)
-        lay.addWidget(self.view, 1)
+        views = QHBoxLayout()
+        views.setSpacing(6)
+        views.addWidget(self.view, 1)
+        views.addWidget(self.end_view, 1)   # hidden outside fixed-length mode
+        lay.addLayout(views, 1)
         lay.addWidget(self.timeline)
         lay.addLayout(controls)
         lay.addLayout(marks)
@@ -795,6 +809,7 @@ class MainWindow(QMainWindow):
         # or it stays upscaled and blurry until the next step.
         self._resize_timer = QTimer(self, singleShot=True, interval=120, timeout=self._rerender_paused)
         self.view.installEventFilter(self)
+        self.end_view.installEventFilter(self)
 
     def _release_focus(self):
         self.view.setFocus()
@@ -803,13 +818,14 @@ class MainWindow(QMainWindow):
         if ev.type() == QEvent.KeyPress and ev.key() == Qt.Key_Escape and obj in self._inputs:
             self._release_focus()
             return True
-        if ev.type() == QEvent.Resize and obj is self.view:
+        if ev.type() == QEvent.Resize and (obj is self.view or obj is self.end_view):
             self._resize_timer.start()
         return super().eventFilter(obj, ev)
 
     def _rerender_paused(self):
         if self.dec is not None and self.dec.current is not None and not self.play_timer.isActive():
             self._show_current()
+        self._queue_end_view()   # (its frame never changes during playback: also while playing)
 
     def _set_enabled(self, on: bool):
         for b in (self.b_start, self.b_prev, self.b_play, self.b_next,
@@ -870,6 +886,7 @@ class MainWindow(QMainWindow):
         self.color_label.setText("colour matched" if tables is not None else "")
         self.color_label.setToolTip(desc)
         self.b_match_clear.setEnabled(tables is not None)
+        self._end_key = None
         if self.dec is not None and self.dec.current is not None:
             self._show_current()
         self._selection_changed()
@@ -923,6 +940,7 @@ class MainWindow(QMainWindow):
         self.repair_label.setText("distortion repaired" if state else "")
         self.repair_label.setToolTip(describe_repair(state.settings.corrections) if state else "")
         self.b_repair_clear.setEnabled(state is not None)
+        self._end_key = None
         if self.dec is not None and self.dec.current is not None:
             self._show_current()   # the frame size can change (the repair's crop): the crop box refits
         self._crop_changed()
@@ -963,13 +981,20 @@ class MainWindow(QMainWindow):
             self._show_current()
         self.timeline.update()
         self.view.update()
+        self.end_view.update()
 
     def _apply_ui_defaults(self):
         """Push the stored crop-aspect and fixed-length defaults into the controls."""
         ui = load_ui_defaults()
         if ASPECT_PRESETS.get(ui.aspect) == "custom":
             self.aspect_edit.setText(ui.custom_aspect)
-        self.aspect_combo.setCurrentText(ui.aspect)
+        # Saving Preferences puts the default aspect back: that refits a box already drawn, but
+        # must not blow it up to the largest size the way a pick in the Aspect box does.
+        self._aspect_pick_expands = False
+        try:
+            self.aspect_combo.setCurrentText(ui.aspect)
+        finally:
+            self._aspect_pick_expands = True
         if ASPECT_PRESETS.get(ui.aspect) == "custom":
             self._apply_aspect()
         self.fixed_unit = ui.fixed_unit
@@ -1089,6 +1114,7 @@ class MainWindow(QMainWindow):
         if self.dec:
             self.dec.close()
         self.dec = dec
+        self._close_end_view()   # (it reads the previous file; Fixed length is switched off below)
         self._video_token = token
         self._cancel_probes(keep=token)   # the previous video's scan, if it was still running
         self._restore_fixed_length()
@@ -1136,6 +1162,8 @@ class MainWindow(QMainWindow):
         self.info.keyframes, self.info.keyframe_dts = kfs, dts
         if self.dec:
             self.dec.keyframes = kfs
+        if self.end_dec:
+            self.end_dec.keyframes = kfs
         self.timeline.set_keyframes(kfs)
         self._show_info_status(f"{len(kfs)} keyframes")
         self._set_keyframe_buttons(self.b_play.isEnabled())
@@ -1156,6 +1184,7 @@ class MainWindow(QMainWindow):
         if self.dec:
             self.dec.close()
             self.dec = None
+        self._close_end_view()
         self.player.stop()
         self.player.setSource(QUrl())
         self._audio_ok = False
@@ -1347,7 +1376,7 @@ class MainWindow(QMainWindow):
         if ASPECT_PRESETS.get(key) == "custom" and not self.aspect_edit.text():
             self.aspect_edit.setFocus()
             return
-        self._apply_aspect()
+        self._apply_aspect(expand=self._aspect_pick_expands)
 
     def _custom_aspect_entered(self):
         try:
@@ -1355,9 +1384,18 @@ class MainWindow(QMainWindow):
         except ValueError:
             self.status.showMessage("Aspect must look like 16:9 or 1.78", 4000)
             return
-        self._apply_aspect()
+        # Only a ratio that was typed is a pick. Enter on untouched text (the field also holds
+        # text the app wrote: the rounded "1:2.333" after a rotation, the stored default) must
+        # not grow a box sized by hand, and under "Scale to" the box's shape is no guide: it
+        # follows the typed output size, which can differ from the ratio by a few pixels.
+        typed = self.aspect_edit.isModified()
+        self.aspect_edit.setModified(False)
+        self._apply_aspect(expand=typed)
 
-    def _apply_aspect(self):
+    def _apply_aspect(self, expand: bool = False):
+        """Lock the crop box to the chosen shape. expand is for a ratio the user just picked in
+        the Aspect box: the crop box then grows to the largest one of that shape (see
+        VideoView.set_aspect) instead of keeping its width and shrinking."""
         a = self._current_aspect()
         if self.rb_scale.isChecked():
             preset = self._preset_aspect()
@@ -1367,7 +1405,7 @@ class MainWindow(QMainWindow):
                 self.out_h.setValue(even(self.out_w.value() / preset))
                 self._block_out(False)
                 a = self.out_w.value() / self.out_h.value()
-        self.view.set_aspect(a)
+        self.view.set_aspect(a, expand=expand)
 
     def _preset_aspect(self) -> float | None:
         v = ASPECT_PRESETS.get(self.aspect_combo.currentText())
@@ -1431,6 +1469,11 @@ class MainWindow(QMainWindow):
         self.view.set_aspect(self.out_w.value() / self.out_h.value())
 
     def _crop_changed(self):
+        # The same box over the clip's last frame. Right after a rotation or a repair the end view
+        # still shows the frame at its old size until its redraw (queued): the new box would be
+        # drawn against the old frame, so it waits for that redraw, which mirrors the box itself.
+        if self.end_dec is not None and self.end_view.frame_size == self.view.frame_size:
+            self.end_view.mirror_crop(self.view)
         r = self.view.crop_rect_int()
         if not r:
             self.crop_label.setText("")
@@ -1511,12 +1554,77 @@ class MainWindow(QMainWindow):
         self.sel_panel.setVisible(on)
         if on:
             self.stop()
+            self._open_end_view()
             self.fixed_unit = "seconds" if self.len_sec.hasFocus() else self.fixed_unit
             self._set_sel_start(self.dec.time if self.dec else self.info.start_time, seek=True)
         else:
+            self._close_end_view()
             self.timeline.set_selection(None)
             self.sel_label.setText("")
             self._selection_changed()
+
+    # --- the second view: the clip's last frame (fixed-length mode only)
+    def _open_end_view(self):
+        self._close_end_view()
+        try:
+            self.end_dec = Decoder(self.info.path, self.info.keyframes)
+        except Exception as e:  # noqa: BLE001  (the file was moved or locked since it was opened)
+            self.status.showMessage(f"The clip's last frame can't be shown: {e}", 6000)
+            return
+        self.end_view.mirror_crop(self.view)
+        self.end_view.setVisible(True)
+
+    def _close_end_view(self):
+        self._end_timer.stop()
+        if self.end_dec is not None:
+            self.end_dec.close()
+            self.end_dec = None
+        self._end_key = None
+        self.end_view.setVisible(False)
+        self.end_view.clear()
+        self.end_view.set_caption("")
+
+    def _end_wanted(self) -> tuple:
+        """Everything the end view's picture depends on, apart from the colour match and the
+        repair (those reset _end_key when they change): the frame, how it is turned, the size it
+        is drawn at."""
+        return (self.sel_last_frame, self.rotation, self.flip,
+                self.end_view.width(), self.end_view.height(), self.end_view.devicePixelRatioF())
+
+    def _queue_end_view(self):
+        """Bring the end view up to date once the event loop is idle. Cheap when nothing changed:
+        _show_current calls this for every frame played. Deferred, so a drag of the clip box on
+        the timeline moves the main view first and the end view follows between mouse moves."""
+        if self.fixed and self.info and self.end_dec is not None and self._end_wanted() != self._end_key:
+            self._end_timer.start()
+
+    def _render_end_view(self):
+        if not (self.fixed and self.info and self.end_dec is not None):
+            return
+        key = self._end_wanted()
+        t = key[0]
+        # Like the main view: while the mouse drags the timeline, video whose exact seeks are slow
+        # (4K) shows the keyframe before the frame; _scrub_finished asks again for the exact one.
+        try:
+            if self.timeline.scrubbing:
+                f, exact = self.end_dec.scrub(t)
+            else:
+                f, exact = self.end_dec.seek(t), True
+        except Exception:  # noqa: BLE001  (a damaged stretch of the file, or it was removed)
+            f, exact = None, True
+        if f is None:
+            # Keep what is shown and remember the request as answered: _show_current asks again
+            # for every frame played, and a seek that fails must not be retried for each of them.
+            self.end_view.set_caption("The clip's last frame can't be decoded")
+            self._end_key = key
+            return
+        self._render_frame(self.end_view, f)
+        self.end_view.mirror_crop(self.view)
+        info = self.info
+        ft = f.time if f.time is not None else t
+        self.end_view.set_caption(f"Last frame of clip   {fmt_time(ft - info.start_time)}   "
+                                  f"frame {round((ft - info.start_time) * info.fps)}")
+        self._end_key = key if exact else None
 
     # --- moving the selection box (fixed-length mode only)
     def sel_move_frames(self, n: int):
@@ -1595,6 +1703,7 @@ class MainWindow(QMainWindow):
             self.stop()
             self._decoder_seek(self.sel_start)
             self._show_current()
+        self._queue_end_view()
 
     def _move_selection(self, start: float):
         if self.fixed and self.info:
@@ -1612,16 +1721,8 @@ class MainWindow(QMainWindow):
         if not self.dec or self.dec.current is None:
             return
         f = self.dec.current
-        # Scale in the decoder (swscale) so we never push huge RGB buffers to Qt. The target is
-        # in device pixels, so the picture stays sharp with display scaling above 100%.
-        dpr = self.view.devicePixelRatioF()
-        vw, vh = max(self.view.width(), 64) * dpr, max(self.view.height(), 64) * dpr
-        if self.total_rotation in (90, 270):
-            vw, vh = vh, vw
-        scale = min(vw / f.width, vh / f.height, 1.0)
-        w, h = max(int(f.width * scale) & ~1, 2), max(int(f.height * scale) & ~1, 2)
-        fw, fh = self._rotated_frame_size()
-        self.view.set_frame(self._frame_image(f, w, h), fw, fh)
+        self._render_frame(self.view, f)
+        self._queue_end_view()   # (rotation, flip, colour or repair changed: its picture too)
 
         t = f.time or 0.0
         info = self.info
@@ -1629,6 +1730,19 @@ class MainWindow(QMainWindow):
         self.time_label.setText(f"{fmt_time(t - info.start_time)} / {fmt_time(info.duration)}")
         self.frame_label.setText(f"  frame {round((t - info.start_time) * info.fps)}")
         self._update_keyframe_label()
+
+    def _render_frame(self, view: VideoView, f):
+        """Draw a decoded frame in a view, scaled for the view's size."""
+        # Scale in the decoder (swscale) so we never push huge RGB buffers to Qt. The target is
+        # in device pixels, so the picture stays sharp with display scaling above 100%.
+        dpr = view.devicePixelRatioF()
+        vw, vh = max(view.width(), 64) * dpr, max(view.height(), 64) * dpr
+        if self.total_rotation in (90, 270):
+            vw, vh = vh, vw
+        scale = min(vw / f.width, vh / f.height, 1.0)
+        w, h = max(int(f.width * scale) & ~1, 2), max(int(f.height * scale) & ~1, 2)
+        fw, fh = self._rotated_frame_size()
+        view.set_frame(self._frame_image(f, w, h), fw, fh)
 
     def _update_keyframe_label(self):
         f = self.dec.current if self.dec else None
@@ -1765,6 +1879,7 @@ class MainWindow(QMainWindow):
         if t is not None and self.dec:
             self.dec.seek(t)
             self._show_current()
+        self._queue_end_view()   # (the exact last frame, if the drag left a keyframe there)
 
     def step_forward(self):
         if not self.dec:
@@ -2047,6 +2162,7 @@ class MainWindow(QMainWindow):
             t.join(30)  # frame PNGs still being written: finish them, don't leave half files
         if self.dec:
             self.dec.close()
+        self._close_end_view()
         super().closeEvent(e)
 
 

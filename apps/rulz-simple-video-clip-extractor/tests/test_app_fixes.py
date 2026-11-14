@@ -12,6 +12,9 @@ import pytest
 
 from test_core import APP, make_video  # noqa: F401  (sets up Qt, the settings file and sys.path)
 
+from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
+
 from simplecut.defaults import settings  # noqa: E402
 from simplecut.export import (ExportSettings, build_command, keeps_rotation_flag,  # noqa: E402
                               lossless_can_rotate, lossless_end_ok, lossless_start_ok)
@@ -419,3 +422,391 @@ def test_bad_stored_settings_fall_back_to_the_defaults():
     finally:
         for k in keys:
             st.remove(k)
+
+
+# ------------------------------------------------------------------ crop aspect picks
+def _crop_box(w):
+    r = w.view.crop
+    return r.x(), r.y(), r.width(), r.height()
+
+
+def _type_custom(w, text):
+    """Type a ratio into the Custom field and press Enter, as the user does."""
+    w.aspect_edit.selectAll()
+    QTest.keyClicks(w.aspect_edit, text)
+    QTest.keyClick(w.aspect_edit, Qt.Key_Return)
+    assert w.aspect_edit.text() == text
+
+
+def test_picking_an_aspect_grows_the_crop_box_to_the_frame_edges(window, clip):
+    """On the 160x96 test clip 9:16 is 54x96. Picking 16:9 next kept the 54 px width and gave a
+    54x30 box; it is now the largest 16:9 box, 160x90."""
+    w = window
+    _open(w, clip)
+    w.b_crop.setChecked(True)
+    w.aspect_combo.setCurrentText("9:16")
+    assert _crop_box(w) == pytest.approx((53, 0, 54, 96))
+    w.aspect_combo.setCurrentText("16:9")
+    assert _crop_box(w) == pytest.approx((0, 3, 160, 90))
+    assert w.view.crop_rect_int() == (0, 2, 160, 90) and "160×90" in w.crop_label.text()
+    w.aspect_combo.setCurrentText("1:1")
+    assert _crop_box(w) == pytest.approx((32, 0, 96, 96))
+    w.aspect_combo.setCurrentText("Free")              # Free keeps the box as it is
+    assert _crop_box(w) == pytest.approx((32, 0, 96, 96))
+
+
+def test_custom_aspect_grows_the_box_once_and_enter_again_leaves_it(window, clip):
+    from PySide6.QtCore import QRectF
+    w = window
+    _open(w, clip)
+    w.b_crop.setChecked(True)
+    w.aspect_combo.setCurrentText("1:1")
+    w.aspect_combo.setCurrentText("Custom…")           # nothing typed yet: the box waits
+    assert _crop_box(w) == pytest.approx((32, 0, 96, 96))
+    _type_custom(w, "2:1")
+    assert _crop_box(w) == pytest.approx((0, 8, 160, 80))
+    w.view.crop = QRectF(10, 10, 60, 30)               # resized by hand, still 2:1
+    QTest.keyClick(w.aspect_edit, Qt.Key_Return)       # Enter again
+    assert _crop_box(w) == pytest.approx((10, 10, 60, 30))
+    _type_custom(w, "1:2")                             # a new ratio typed: grows again
+    assert _crop_box(w) == pytest.approx((16, 0, 48, 96))
+
+
+def test_enter_on_untouched_custom_text_never_grows_the_box(window, clip):
+    """Two cases where the box's shape differs a little from the text in the Custom field, so
+    Enter with nothing typed threw a hand-sized box to the largest size: an output height typed
+    under "Scale to" (176x100 is not exactly 16:9), and a rotation, after which the field shows
+    the rounded "1:2.333" for 9:21."""
+    from PySide6.QtCore import QRectF
+    w = window
+    _open(w, clip)
+    w.b_crop.setChecked(True)
+    w.aspect_combo.setCurrentText("Custom…")
+    _type_custom(w, "16:9")
+    w.view.crop = QRectF(40, 20, 64, 36)
+    w.rb_scale.setChecked(True)
+    w.out_h.setValue(100)
+    assert (w.out_w.value(), w.out_h.value()) == (176, 100)
+    QTest.keyClick(w.aspect_edit, Qt.Key_Return)
+    assert w.view.crop.width() == pytest.approx(64) and w.view.crop.height() < 40
+
+    w.rb_native.setChecked(True)
+    w.aspect_combo.setCurrentText("21:9")
+    w.view.crop = QRectF(40, 20, 42, 18)
+    w.rotate()
+    assert _wait(lambda: w.view.frame_size == (96, 160))
+    assert w.aspect_combo.currentText() == "Custom…" and w.aspect_edit.text() == "1:2.333"
+    assert (w.view.crop.width(), w.view.crop.height()) == pytest.approx((18, 42))
+    QTest.keyClick(w.aspect_edit, Qt.Key_Return)
+    assert w.view.crop.width() == pytest.approx(18) and w.view.crop.height() < 43
+
+
+def test_typing_an_output_size_does_not_grow_a_hand_sized_box(window, clip):
+    """With a preset on, a typed output width only nudges the ratio by its even-pixel rounding
+    (9:16 at width 50 is 50x88 = 0.568): that must not throw the box back to the largest size."""
+    from PySide6.QtCore import QRectF
+    w = window
+    _open(w, clip)
+    w.b_crop.setChecked(True)
+    w.aspect_combo.setCurrentText("9:16")
+    w.view.crop = QRectF(20, 10, 27, 48)
+    w.rb_scale.setChecked(True)
+    w.out_w.setValue(50)
+    assert (w.out_w.value(), w.out_h.value()) == (50, 88)
+    x, y, bw, bh = _crop_box(w)
+    assert bw == pytest.approx(27) and bh == pytest.approx(27 * 88 / 50)
+    w.aspect_combo.setCurrentText("1:1")               # a pick still grows it, scaling or not
+    assert (w.out_w.value(), w.out_h.value()) == (50, 50)
+    assert _crop_box(w) == pytest.approx((0, 0, 96, 96))
+
+
+def test_saving_preferences_refits_the_box_without_growing_it(window, clip):
+    from PySide6.QtCore import QRectF
+    w = window
+    _open(w, clip)
+    w.b_crop.setChecked(True)
+    w.aspect_combo.setCurrentText("1:1")
+    w.view.crop = QRectF(40, 20, 40, 40)
+    st = settings()
+    try:
+        st.setValue("defaults/aspect", "16:9")
+        w._apply_ui_defaults()                         # what a saved Preferences dialog runs
+        assert w.aspect_combo.currentText() == "16:9"
+        assert _crop_box(w) == pytest.approx((40, 28.75, 40, 22.5))
+        w.aspect_combo.setCurrentText("9:16")          # and picks grow the box again afterwards
+        assert _crop_box(w) == pytest.approx((33, 0, 54, 96))
+    finally:
+        st.remove("defaults/aspect")
+
+
+def test_picking_an_aspect_under_scale_to_with_free_grows_the_box(window, clip):
+    from PySide6.QtCore import QRectF
+    w = window
+    _open(w, clip)
+    w.b_crop.setChecked(True)
+    w.view.crop = QRectF(10, 10, 60, 40)
+    w.rb_scale.setChecked(True)                        # Free: output seeded 60x40, box unchanged
+    assert (w.out_w.value(), w.out_h.value()) == (60, 40)
+    assert _crop_box(w) == pytest.approx((10, 10, 60, 40))
+    w.aspect_combo.setCurrentText("1:1")
+    assert (w.out_w.value(), w.out_h.value()) == (60, 60)
+    assert _crop_box(w) == pytest.approx((0, 0, 96, 96))
+    w.b_crop.setChecked(False)                         # the box survives crop off and on
+    w.b_crop.setChecked(True)
+    assert _crop_box(w) == pytest.approx((0, 0, 96, 96))
+
+
+def test_saving_preferences_with_a_custom_default_does_not_grow_the_box(window, clip):
+    from PySide6.QtCore import QRectF
+    w = window
+    _open(w, clip)
+    w.b_crop.setChecked(True)
+    w.aspect_combo.setCurrentText("1:1")
+    w.view.crop = QRectF(40, 20, 40, 40)
+    st = settings()
+    try:
+        st.setValue("defaults/aspect", "Custom…")
+        st.setValue("defaults/custom_aspect", "2:1")
+        w._apply_ui_defaults()
+        assert w.aspect_combo.currentText() == "Custom…" and w.aspect_edit.text() == "2:1"
+        assert _crop_box(w) == pytest.approx((40, 30, 40, 20))
+        QTest.keyClick(w.aspect_edit, Qt.Key_Return)   # Enter on the text Preferences wrote
+        assert _crop_box(w) == pytest.approx((40, 30, 40, 20))
+    finally:
+        st.remove("defaults/aspect")
+        st.remove("defaults/custom_aspect")
+
+
+# ------------------------------------------------------------------ fixed length: the last-frame view
+def _grey(view):
+    """The grey level of the frame a view shows (frame i of the test clip is flat grey 3*i % 256)."""
+    return view._pix.toImage().pixelColor(view._pix.width() // 2, view._pix.height() // 2).red()
+
+
+def _end_settled(w):
+    return _wait(lambda: w._end_key is not None and w._end_key == w._end_wanted()
+                 and not w._end_timer.isActive())
+
+
+def _frame_no(w, t):
+    return round((t - w.info.start_time) / w.info.frame_duration)
+
+
+def test_fixed_length_shows_the_clips_last_frame_in_a_second_view(window, clip):
+    w = window
+    _open(w, clip)
+    fd = w.info.frame_duration
+    assert w.end_view.isHidden() and w.end_dec is None
+    w.len_sec.setValue(2.0)                              # 60 frames
+    w.seek_to(w.info.start_time + 10 * fd)
+    w.b_fixed.setChecked(True)
+    assert not w.end_view.isHidden() and w.end_dec is not None
+    assert _end_settled(w)
+    assert _frame_no(w, w.sel_last_frame) == 69 and _frame_no(w, w.end_dec.time) == 69
+    assert _grey(w.end_view) == pytest.approx(69 * 3, abs=8)
+    assert "frame 69" in w.end_view.caption
+    # the main view and its decoder are where they were: the clip's first frame
+    assert _frame_no(w, w.dec.time) == 10 and _grey(w.view) == pytest.approx(30, abs=8)
+
+    w.sel_move_frames(5)                                 # the clip box moves: both views follow
+    assert _end_settled(w)
+    assert _frame_no(w, w.dec.time) == 15 and _frame_no(w, w.end_dec.time) == 74
+    assert _grey(w.end_view) == pytest.approx(74 * 3, abs=8) and "frame 74" in w.end_view.caption
+
+    w.len_frames.setValue(30)                            # a shorter clip: only the end view changes
+    assert _end_settled(w)
+    assert _frame_no(w, w.dec.time) == 15 and _frame_no(w, w.end_dec.time) == 44
+    assert _grey(w.end_view) == pytest.approx(44 * 3, abs=8)
+
+    w.sel_to_end()                                       # the video's own last frame
+    assert _end_settled(w)
+    assert _frame_no(w, w.end_dec.time) == 299
+
+    w.b_fixed.setChecked(False)
+    assert w.end_view.isHidden() and w.end_dec is None and w.end_view._pix is None
+    assert w.end_view.caption == "" and not w._end_timer.isActive()
+
+
+def test_end_view_is_not_redrawn_while_nothing_about_it_changes(window, clip):
+    """_show_current runs for every frame played: it must not seek or draw the end view again."""
+    w = window
+    _open(w, clip)
+    w.b_fixed.setChecked(True)
+    assert _end_settled(w)
+    drawn = []
+    real = w._render_frame
+    w._render_frame = lambda view, f: (drawn.append(view), real(view, f))[1]
+    for _ in range(5):
+        w.step_forward()
+        APP.processEvents()
+    assert drawn == [w.view] * 5 and not w._end_timer.isActive()
+    w.go_end()                                           # the playhead on the clip's last frame
+    APP.processEvents()
+    assert w.end_view not in drawn
+    assert _frame_no(w, w.dec.time) == _frame_no(w, w.end_dec.time)
+
+
+def test_end_view_follows_rotation_colour_and_the_crop_box(window, clip):
+    import numpy as np
+    from PySide6.QtCore import QEvent, QPointF
+    from PySide6.QtGui import QMouseEvent
+    w = window
+    _open(w, clip)
+    w.len_sec.setValue(1.0)
+    w.b_fixed.setChecked(True)                           # frames 0..29
+    assert _end_settled(w)
+    assert _grey(w.end_view) == pytest.approx(87, abs=8)
+
+    w.rotate()
+    assert _end_settled(w)
+    assert w.view.frame_size == (96, 160) and w.end_view.frame_size == (96, 160)
+
+    w._set_color(np.tile(np.arange(255, -1, -1, dtype=np.uint8), (3, 1)), "inverted")
+    assert _end_settled(w)
+    assert _grey(w.end_view) == pytest.approx(255 - 87, abs=8)
+    w._set_color(None, "")
+    assert _end_settled(w)
+    assert _grey(w.end_view) == pytest.approx(87, abs=8)
+
+    w.b_crop.setChecked(True)
+    w.aspect_combo.setCurrentText("1:1")
+    assert w.end_view.crop_enabled and w.end_view.crop == w.view.crop and w.end_view.crop is not w.view.crop
+    w.view.reset_crop()
+    assert w.end_view.crop == w.view.crop
+    # the mouse does nothing on the end view
+    before = w.end_view.crop
+    p = QPointF(w.end_view.width() / 2, w.end_view.height() / 2)
+    w.end_view.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, p, p, Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+    w.end_view.mouseMoveEvent(QMouseEvent(QEvent.MouseMove, p + QPointF(30, 20), p + QPointF(30, 20),
+                                          Qt.NoButton, Qt.LeftButton, Qt.NoModifier))
+    w.end_view.mouseReleaseEvent(QMouseEvent(QEvent.MouseButtonRelease, p, p, Qt.LeftButton, Qt.NoButton, Qt.NoModifier))
+    assert w.end_view.crop == before and w.view.crop == before
+    w.b_crop.setChecked(False)
+    assert not w.end_view.crop_enabled
+
+
+def test_end_view_closes_with_the_video_and_on_a_new_one(window, clip, tmp_path):
+    w = window
+    _open(w, clip)
+    w.b_fixed.setChecked(True)
+    assert _end_settled(w)
+    other = make_video(str(tmp_path / "other.mp4"), n=60, fps=30, gop=30)
+    _open(w, other)                                      # a new video switches Fixed length off
+    assert not w.b_fixed.isChecked() and w.end_view.isHidden() and w.end_dec is None
+    w.b_fixed.setChecked(True)
+    assert _end_settled(w)
+    assert w.end_dec.container.name.endswith("other.mp4")
+    w.close_video()
+    assert w.end_view.isHidden() and w.end_dec is None and not w.fixed
+    APP.processEvents()                                  # a queued redraw finds nothing to do
+    assert w.end_view._pix is None
+
+
+def test_end_view_resize_draws_its_frame_again_at_the_new_size(window, clip):
+    w = window
+    _open(w, clip)
+    w.b_fixed.setChecked(True)
+    assert _end_settled(w)
+    from PySide6.QtGui import QResizeEvent
+    old = w.end_view.size()
+    w.end_view.resize(old.width() + 40, old.height() + 30)
+    # (a window that was never shown holds resize events back: deliver it as the layout would)
+    APP.sendEvent(w.end_view, QResizeEvent(w.end_view.size(), old))
+    assert w._resize_timer.isActive()
+    assert _wait(lambda: w._end_key is not None and w._end_key[3:5] == (w.end_view.width(), w.end_view.height()))
+
+
+def _timeline_mouse(kind, x, button, buttons):
+    from PySide6.QtCore import QEvent, QPointF
+    from PySide6.QtGui import QMouseEvent
+    p = QPointF(x, 10)
+    return QMouseEvent(getattr(QEvent, kind), p, p, button, buttons, Qt.NoModifier)
+
+
+def test_dragging_the_clip_box_on_slow_video_ends_on_the_exact_last_frame(window, clip):
+    """On video with slow exact seeks (4K) a drag shows keyframes; the release must bring the
+    end view to the clip's real last frame, like the main view."""
+    w = window
+    _open(w, clip)
+    w.timeline.resize(1000, 40)
+    w.len_sec.setValue(1.0)
+    w.b_fixed.setChecked(True)
+    assert _end_settled(w)
+    w.dec.seek_ms = w.end_dec.seek_ms = 1000.0          # as measured on heavy video
+    tl = w.timeline
+    x0 = tl._x(w.sel_start + 0.5)                        # inside the clip box
+    tl.mousePressEvent(_timeline_mouse("MouseButtonPress", x0, Qt.LeftButton, Qt.LeftButton))
+    for dx in (20, 40, 77):
+        tl.mouseMoveEvent(_timeline_mouse("MouseMove", x0 + dx, Qt.NoButton, Qt.LeftButton))
+        APP.processEvents()
+    assert w.sel_start > w.info.start_time               # the box moved
+    assert w._end_key is None and w.end_dec.current.key_frame   # a keyframe stands in, marked stale
+    tl.mouseReleaseEvent(_timeline_mouse("MouseButtonRelease", x0 + 77, Qt.LeftButton, Qt.NoButton))
+    assert _end_settled(w)
+    last = _frame_no(w, w.sel_last_frame)
+    assert _frame_no(w, w.end_dec.time) == last and f"frame {last}" in w.end_view.caption
+    assert _grey(w.end_view) == pytest.approx(last * 3 % 256, abs=8)
+
+
+def test_end_frame_that_fails_to_decode_is_not_retried_for_every_frame_played(window, clip):
+    w = window
+    _open(w, clip)
+    w.b_fixed.setChecked(True)
+    assert _end_settled(w)
+    calls = []
+
+    def broken(t):
+        calls.append(t)
+        raise OSError("read error")
+    w.end_dec.seek = broken
+    w.sel_move_frames(3)
+    assert _end_settled(w)
+    assert len(calls) == 1 and "can't be decoded" in w.end_view.caption
+    for _ in range(4):                                   # what playback does for each frame
+        w._show_current()
+        APP.processEvents()
+    assert len(calls) == 1 and not w._end_timer.isActive()
+    del w.end_dec.seek                                   # readable again: the next move shows it
+    w.sel_move_frames(1)
+    assert _end_settled(w)
+    assert _frame_no(w, w.end_dec.time) == _frame_no(w, w.sel_last_frame)
+    assert "frame" in w.end_view.caption
+
+
+def test_end_view_follows_flip_and_a_rotation_keeps_the_box_until_the_redraw(window, clip):
+    w = window
+    _open(w, clip)
+    w.b_fixed.setChecked(True)
+    w.b_crop.setChecked(True)
+    w.aspect_combo.setCurrentText("1:1")
+    assert _end_settled(w)
+    before = w.end_view._pix.toImage()
+    w.flip_h()
+    assert _end_settled(w)
+    assert w._end_key[2] is True and w.end_view.crop == w.view.crop
+    assert w.end_view._pix.toImage().size() == before.size()
+    w.rotate()
+    # not yet redrawn: the end view still has the old frame and, with it, the old box
+    assert w.end_view.frame_size == (160, 96) and w.view.frame_size == (96, 160)
+    assert w.end_view.crop != w.view.crop
+    assert _end_settled(w)
+    assert w.end_view.frame_size == (96, 160) and w.end_view.crop == w.view.crop
+
+
+def test_a_failed_open_keeps_the_end_view_of_the_video_that_stays(window, clip, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    w = window
+    _open(w, clip)
+    w.b_fixed.setChecked(True)
+    assert _end_settled(w)
+    monkeypatch.setattr(QMessageBox, "critical", lambda *a, **k: None)
+    bad = tmp_path / "not-a-video.mp4"
+    bad.write_bytes(b"nothing to decode here")
+    token = w._probe_token
+    w.open_file(str(bad))
+    assert _wait(lambda: w._probe_token != token and w._probe_thread is not None
+                 and not w._probe_thread.isRunning())
+    for _ in range(20):
+        APP.processEvents()
+    assert w.info is not None and w.info.path == clip and w.b_fixed.isChecked()
+    assert not w.end_view.isHidden() and w.end_dec is not None and w.end_view._pix is not None
