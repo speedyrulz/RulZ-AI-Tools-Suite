@@ -37,7 +37,8 @@ Load `workflows/RulzTrainer Likeness Scoring.json` for a ready-made workflow.
   the shared ones for that score, like `face_refs` and `body_refs` in the trainer.
 - `body_score`: `appearance` (the trainer's default: a DINOv2 embedding of the body from the neck to mid-thigh, cut out
   and turned upright) or `proportions` (body ratios from the pose skeleton, plus SAM 3 silhouette widths with
-  `body_backend: mediapipe+sam3`; SAM 3 is gated on Hugging Face).
+  `body_backend: mediapipe+sam3`; SAM 3 is gated on Hugging Face). The trainer's other body scores (`anchored`,
+  `skeleton3d`, `smplx`, `smplx_ratio`) are not in the nodes.
 - `face_provider`, `face_det_size`, `body_device`: as the trainer's settings of the same names.
 - `face_model` (optional, `buffalo_l`): the trainer's face score model, `buffalo_l` (ArcFace R50) or `antelopev2`
   (ArcFace R100, about 360 MB, downloaded once). The two score on different scales: with a run's scale loaded, pick
@@ -80,7 +81,8 @@ gold face and body scores; each average is then normalized and they are combined
 a usable body, simply has no score of that kind (a headshot has no body score: the body window needs shoulders and
 hips).
 
-**RulzTrainer Likeness Export**: with `export_spreadsheet` on, writes to ComfyUI's output folder:
+**RulzTrainer Likeness Export**: with `export_spreadsheet` on, writes to ComfyUI's output folder, under
+`filename_prefix` (`likeness/likeness`, with a counter added), in the `format` picked (`xlsx` or `csv`):
 - an `.xlsx` with three sheets:
   - **Summary**: the averages, the mean, lowest, highest and spread of the images' own scores, and the scale used.
   - **Images**: every image's normalized and raw scores (ArcFace and gold face), faces found, the closest face

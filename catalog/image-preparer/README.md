@@ -2,11 +2,17 @@
 
 A Windows app for preparing image datasets before training models.
 
+Part of the [RulZ AI Tools Suite](https://github.com/speedyrulz/RulZ-AI-Tools-Suite): the easiest way to install
+it is the suite's launcher (under **AI Training**). Guide: [the wiki](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/wiki/Image-Preparer).
+
 ## Adjustments
 
 Each adjustment has a **global** slider (main screen) that applies to every image, and the same
 slider per image (click a photo) to override it for just that one. Overridden images get a red
-**Custom** badge; the ↺ button next to a slider sends that image back to the global value.
+**Custom** badge; the ↺ button next to a slider sends that image back to the global value, and
+**Use global for all** does it for all three. **Set all to 0** moves the global sliders to 0 (main screen) or
+gives the open image its own 0 on all three (single-image view). **Reset all to global** on the main screen
+clears every image's own values.
 
 | Adjustment | What it does |
 |---|---|

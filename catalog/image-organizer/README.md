@@ -26,7 +26,8 @@ Everything runs on your PC. No photos or face data ever leave your computer.
   folder counts as a deletion plus a new photo). A photo whose file date changes but whose picture doesn't
   (a backup or copy tool, a clock change on a memory card) keeps its tags, and a folder that can't be read
   during a scan (access denied, a network drop) keeps its photos until it can be read again.
-- **Photos**: a timeline of all photos grouped by month (from EXIF date taken). Ctrl + mouse wheel zooms
+- **Photos**: a timeline of all photos grouped by month (by EXIF date taken, or the file date if there is
+  none). Ctrl + mouse wheel zooms
   the grid. Search by person, facial expression, head direction and body pose. Words in one
   comma-separated group describe one person:
 
@@ -49,7 +50,7 @@ Everything runs on your PC. No photos or face data ever leave your computer.
   up/down is less reliable than left/right). Standing and sitting are only decided when the person's ankles
   are in the photo, so head-and-shoulders and waist-up shots never get those; lying down and arms raised
   need only the upper body. Only people whose face was found are covered.
-- **People**: automatic face groups. Click a group to name it. Select several groups (hover → tick the
+- **People**: automatic face groups. Click a group, then its name, to name it. Select several groups (hover → tick the
   circle) and **Merge** them. Naming a group with an existing name offers to merge them. Hide people you
   don't care about. **Ungroup** dissolves a wrong group.
 - **Corrections** (on a person's page):
@@ -91,7 +92,8 @@ python -m venv .venv
 .\.venv\Scripts\python.exe run.py
 ```
 
-**Build the .exe:** `powershell -ExecutionPolicy Bypass -File .\build.ps1`
+**Build the .exe:** `powershell -ExecutionPolicy Bypass -File .\build.ps1` (add `-Test` to run the tests
+first; GitHub Actions always does).
 
 Library data (database, thumbnails, face crops) lives in `%LOCALAPPDATA%\RulZ Image Organizer`.
 Your preferences (theme, window size) are kept there too, in `settings.ini`.

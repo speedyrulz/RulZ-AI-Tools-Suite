@@ -9,6 +9,7 @@
 //   "width": 1600, "height": 960,       // CSS-pixel viewport forced with Emulation.setDeviceMetricsOverride
 //   "outDir": "R:\\out\\llm-suite",
 //   "startWaitMs": 4000,
+//   "beforeShot": "js run right before every capture (optional)",
 //   "shots": [ { "name": "01-x.png", "js": "...click something...", "waitMs": 1500, "check": "js returning a string" } ]
 // }
 // "check" is evaluated after the wait and printed, so the run log shows what was on screen (e.g. headings).
@@ -70,6 +71,7 @@ for (const shot of plan.shots) {
   await sleep(shot.waitMs ?? 1500)
   if (shot.check) console.log(shot.name, 'check ->', await evaluate(shot.check))
   if (!shot.name.endsWith('.png')) continue // action-only step
+  if (plan.beforeShot) await evaluate(plan.beforeShot) // e.g. remove toasts left over from a click
   const { data } = await send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })
   writeFileSync(join(plan.outDir, shot.name), Buffer.from(data, 'base64'))
   console.log('saved', join(plan.outDir, shot.name))

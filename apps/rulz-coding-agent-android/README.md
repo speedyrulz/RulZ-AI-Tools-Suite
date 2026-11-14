@@ -5,20 +5,25 @@ Android phone. Give it tasks, answer its "Is this OK?" questions, follow its ste
 run your app, undo, all from the phone, while the AI and your projects stay on the computer.
 
 The phone reaches the computer over [Tailscale](https://tailscale.com), so it works from anywhere without opening
-anything to the internet.
+anything to the internet. It needs Android 7.0 or later.
+
+**Documentation:** the wiki's [Android App](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/wiki/Coding-Agent-Android-App)
+and [Phone Access](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/wiki/Coding-Agent-Phone-Access) pages.
 
 ## Getting started
 
 1. Install Tailscale on the computer and on the phone, and sign in to the same account on both.
-2. On the computer, update RulZ Coding Agent to **0.6.0** or later, open **Settings** and turn on **Phone access**.
-   The first time, Windows may ask whether RulZ Coding Agent may use your networks: allow it.
+2. On the computer, update RulZ Coding Agent to **0.6.0** or later, open **Settings** and, under **Phone access**,
+   turn on **Let my phone connect**. The first time, Windows may ask whether RulZ Coding Agent may use your networks:
+   allow it.
 3. Install this app on the phone: scan the QR code on the **RulZ AI Tools Suite** launcher's home page (or the
    RulZ Coding Agent page there) with the phone's camera, download the APK and open it (allow installing from that
    source). The QR code always points at the newest release; the APKs are also on the suite's
    [Releases](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/releases) page, tagged `coding-agent-android-v<version>`.
    Or build it yourself, see *Building* below.
-4. Scan the QR code from the computer's Settings with the phone's camera and tap the link, or tap **No camera? Type it
-   in instead** and type the address, port and pairing code shown under the QR code.
+4. Scan the QR code from the computer's Settings with the phone's camera and tap the link, or tap **Add computer**, then
+   **No camera? Type it in instead**, and paste the pairing link or type the address, port and pairing code shown next
+   to the QR code.
 
 The app remembers the computer and reconnects by itself, also after the phone sleeps or switches networks
 (more slowly while the app is in the background, to save battery). After a wrong pairing code it doesn't try again
@@ -59,7 +64,8 @@ by itself, since every try counts towards the computer's limit; **Try again** on
   top K, repeat penalty, longest answer and thinking (with a warning that a budget of 0 skips thinking), saved per model. **How it loads** covers context length, GPU
   layers, flash attention, KV cache, GPU split sliders, the draft model (automatic, built-in MTP layers or any draft
   file in RulZ's models folder) and draft (MTP) tuning, with RulZ's memory estimate as you change them; saving
-  restarts a loaded model. This needs RulZ Coding Agent 0.8.0 on the computer; the GPU split, draft tuning and
+  restarts a loaded model. Expert offload (MoE) is only on the computer; the phone sends only the settings you
+  change, so a value set on the computer is kept. This needs RulZ Coding Agent 0.8.0 on the computer; the GPU split, draft tuning and
   estimate need RulZ LLM Suite 0.3.7, and the draft model choice needs RulZ Coding Agent 0.9.2 and RulZ LLM Suite 0.3.9.
 - **Reverse engineering** (⋮ menu, and a card on a new project's first screen): start the tasks RulZ LLM Suite's
   Reverse Engineering page offers, run on the computer in the open project: analyse a program or folder with the
@@ -67,10 +73,13 @@ by itself, since every try counts towards the computer's limit; **Try again** on
   **Practice** tasks (with how often each was solved; the answer is checked when the agent finishes). **Done** lists
   every RE session with its grade. **Record for training** records them in RulZ LLM Suite. Needs RulZ Coding Agent
   0.18.0 and RulZ LLM Suite 0.15.0 on the computer.
-- **Settings**: the AI model, keeping thinking open, approval level, instructions and extra tools (these change the
-  computer's settings);
-  this phone's look and name; switch or forget computers. The RulZ LLM Suite address and API key, and phone access
-  itself, can only be changed on the computer.
+- **Settings**: the AI model, keeping thinking open, approval level, instructions, extra tools and, under **Show
+  details**, the folder for new projects, the step limit and the command time limit (these change the computer's
+  settings); notifications; this phone's look and name; switch or forget computers. The RulZ LLM Suite address and
+  API key, phone access itself and recording tasks for reverse-engineering training can only be changed on the
+  computer.
+- **Only on the computer**: adding a note while a task runs, and the Copy, Edit, Run again and Delete buttons on
+  messages.
 
 ## Security
 
@@ -78,6 +87,8 @@ by itself, since every try counts towards the computer's limit; **Try again** on
   Tailscale encrypts the connection (WireGuard), and only devices in your tailnet can reach it.
 - Every connection must start with the pairing code. After 10 wrong codes from one device, the computer stops
   listening to it for 10 minutes. **Make a new code** on the computer disconnects every phone using the old one.
+  Since RulZ Coding Agent 0.19.0, codes tried over several connections at once count too, web pages from other sites
+  are turned away, and one device can't hold more than 8 connections waiting for the code.
 - The phone never receives the pairing code back, and can't change phone access, open dialogs on the computer, open
   its browser, or show files in Explorer.
 - The pairing code is kept in the app's private storage on the phone.

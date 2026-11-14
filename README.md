@@ -20,15 +20,15 @@ click, keep it updated, and launch it, all from a single black-and-red window (o
 | [RulzTrainer](apps/RulzTrainer) | LoRA trainer for ten image models (MOSS-Image, FIBO 2.0, Krea 2, Qwen-Image 2.1, MiniMax-H3-Image and more) and the PAN 2 video model, with a guided WebUI | From source, then its `install.bat` (venv + CUDA PyTorch) |
 | [RulZ Image Organizer](apps/RulZ-Image-Organizer) | Offline face grouping and search for your photo library | Portable release zip |
 | [RulZ Image Tournament](apps/RulZ-Image-Tournament) | Finds your favorite image, two at a time | Portable release zip (a single .exe) |
-| [RulZ LLM Suite](apps/rulz-llm-suite) | Local LLMs with llama.cpp: models, chat, MCP tools, API server | Its setup program, run silently |
+| [RulZ LLM Suite](apps/rulz-llm-suite) | Local LLMs with llama.cpp: models, chat, MCP tools, API server, reverse engineering | Its setup program, run silently |
 | [RulZ Coding Agent](apps/rulz-coding-agent) | Describe an app in plain English and a local model builds it (works with the LLM Suite) | Its setup program, run silently |
 | [RulZ Coding Agent for Android](apps/rulz-coding-agent-android) | Watch and control RulZ Coding Agent from an Android phone, over Tailscale | Not by the launcher: scan the QR code on its home page (or the Coding Agent page) with the phone to download the newest APK |
 | [Rulz Training Captioner](apps/Rulz-Training-Captioner) | Captions image datasets with a local vision LLM | From source (venv), plus an optional llama.cpp CUDA build |
-| [RulZ Simple Video Clip Extractor](apps/rulz-simple-video-clip-extractor) | Frame-accurate clips with lossless cuts and NVENC export | Portable release zip |
+| [RulZ Simple Video Clip Extractor](apps/rulz-simple-video-clip-extractor) | Frame-accurate clips with lossless cuts, NVENC export and distortion repair | Portable release zip |
 | [RulZ Image Crawler](apps/rulz-image-crawler) | Crawls a website or folder and keeps the images that match your description (local vision model) | From source (venv + Chromium), plus the model download and an optional llama.cpp CUDA build |
 | [RulZ Image Preparer](apps/RulZ-Image-Preparer) | Cleans up image datasets for training: color noise, JPEG artifacts (fast filter or GPU AI model) and detail recovery, globally or per image; Auto crop crops pictures to something you describe, found with SAM 3.1 | From source (venv); the AI features' PyTorch and models are set up from the app on first use |
 | [RulZ Image Grid](apps/RulZ-Image-Grid) | Arranges images into a labelled grid (file names, row and column labels) and exports it as one PNG or JPG | Portable release zip (a single .exe) |
-| [RulZ Huggingface Manager](apps/RulZ-Huggingface-Manager) | Manages your Hugging Face models, datasets, spaces and buckets: browse, upload, download, move, copy and rename files from one page | From source (venv) |
+| [RulZ Huggingface Manager](apps/RulZ-Huggingface-Manager) | Manages your Hugging Face models, datasets, spaces and buckets: browse, upload, download, move, copy and rename files from one page, and send models straight to a vast.ai instance | From source (venv) |
 
 ## Using the launcher
 
@@ -128,7 +128,7 @@ Pushing a `v*` tag builds the launcher's installer on GitHub Actions and attache
 | Requirement checks and winget installs | `src/main/requirements.ts` |
 | UI (React + Tailwind) | `src/renderer/src/` |
 | Logo and icon generation from `assets/logo-source.webp` | `tools/make_logo.py` |
-| How the catalog screenshots were made (demo content only) | `tools/screenshots/` |
+| How the screenshots were made (demo content only) and how to make them again | `tools/screenshots/` |
 | The Android app's download QR code (newest `coding-agent-android-v*` release) | `src/main/phoneApp.ts`, `src/renderer/src/components/PhoneAppQr.tsx` |
 | The apps' source | `apps/` |
 | App builds and releases; the source apps' branches | `.github/workflows/apps.yml`, `app-branches.yml` |

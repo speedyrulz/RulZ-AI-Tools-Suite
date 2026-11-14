@@ -33,7 +33,8 @@ To build that zip yourself:
 
 ## Requirements
 
-- Windows 10/11, Python 3.10+ on PATH
+- Windows 10/11
+- Python 3.10+ on PATH, only to run from source (the release zip needs none)
 - `ffmpeg` and `ffprobe` on PATH (`winget install Gyan.FFmpeg`)
 - An NVIDIA GPU with current drivers for NVENC export
 
@@ -57,6 +58,7 @@ python -m venv .venv
 
 | Action              | Button | Key           |
 | ------------------- | ------ | ------------- |
+| Open a video (or drop it on the window) | | Ctrl+O |
 | Go to start         | ⏮      | Home          |
 | Previous keyframe   | ◀K     | Shift+Left    |
 | Previous frame      | ◀      | Left          |
@@ -75,6 +77,7 @@ python -m venv .venv
 | Rotate 90° clockwise |       | R             |
 | Flip horizontally   |        | F             |
 | Close video         |        | Ctrl+W        |
+| Quit                |        | Ctrl+Q        |
 | Toggle crop box     |        | C             |
 | Toggle fixed length |        | L             |
 | Match colour to reference photo | | B        |
@@ -110,7 +113,13 @@ full source resolution as a PNG. It saves immediately, with no dialog, as
 `<video name>_<timecode>_f<frame>.png` in the output folder (with `_repair`
 added while a distortion repair is on, and `_crop` while the crop is on); an
 existing name gets a `_1`, `_2`, ... suffix instead of being overwritten. The
-status bar shows the saved path.
+PNG is compressed in the background, so the app stays responsive on 4K frames;
+the status bar shows the saved path when it is written.
+
+Non-square-pixel video (HDV 1440×1080, DVD) is shown, cropped and saved in
+its stored pixels, so it looks horizontally squeezed; re-encoded exports keep
+the source's pixel aspect flag, except distortion-repair exports, which come
+out with square pixels (squeezed the same way).
 
 ## Rotation and flip
 
@@ -119,7 +128,8 @@ press adds another 90° and the fourth press returns to upright. Press **F**
 (or the Flip button) to mirror the picture left-to-right. Both always act on
 what you see on screen, in any order: rotate always turns the current view
 clockwise and flip always mirrors the current view. The label next to the
-buttons shows the stored rotation and whether the view is mirrored. Both
+buttons shows the added rotation, whether the view is mirrored, and the
+file's own rotation flag if it has one. Both
 reset when a new file is opened. Sources that carry their own rotation flag
 (phone recordings) are shown upright automatically.
 
@@ -128,16 +138,22 @@ Exports keep the rotation and flip:
 - **Frame PNG**: pixels are rotated and mirrored.
 - **NVENC re-encode**: rotation and flip are baked into the pixels.
 - **Lossless**: pixels cannot change without re-encoding. Rotation alone is
-  written as a display-rotation flag in the container (MP4, MOV, MKV), which
-  every mainstream player honors. A flip has no reliably honored flag, so
-  lossless is unavailable while the view is mirrored; use NVENC.
+  written as a display-rotation flag in the container (MP4, MOV, MKV, WebM),
+  which every mainstream player honors. MPEG-TS (.ts, .m2ts, .mts), AVI and
+  FLV have no such flag, so a rotated lossless cut of those is saved as MKV
+  (the export dialog says so, and refuses a .ts/.avi/.flv name for it). An
+  AVI with B-frames (many DivX/Xvid and H.264 AVIs) stores no timestamps that
+  MKV can take, so rotating one needs NVENC. A flip
+  has no reliably honored flag, so lossless is unavailable while the view is
+  mirrored; use NVENC.
 
 ## Open last export
 
 **Open last export** (button beside Quick export, or File → Open last export,
 Ctrl+Shift+O) closes the current video and opens the file most recently
-written by Export or Quick export. It is remembered between runs and greys
-out if that file no longer exists.
+written by Export or Quick export. It is remembered between runs. If that file
+has been moved or deleted, it greys out (checked at start, after each export
+and when you use it).
 
 ## Close video
 
@@ -181,7 +197,10 @@ The correction is a per-channel exposure and colour balance plus a contrast
 (gamma) term, fitted in linear light so the video's skin matches the
 reference's average skin colour and its spread of brightness. "Match
 contrast" turns the gamma term off and keeps only the balance, and
-**Strength** blends between the original and the full correction.
+**Strength** blends between the original and the full correction (at 0 % there
+is nothing to apply, and Apply leaves the video uncorrected). A reference
+photo with its own colour profile (Display P3 from an iPhone, Adobe RGB) is
+converted to sRGB first, so its skin is compared as it looks.
 
 Apply makes the correction part of the view: the preview, frame PNGs and every
 export use it. It is implemented as three lookup tables, which ffmpeg applies
@@ -214,9 +233,10 @@ layout:
 The header switch turns a panel on or off and ↺ resets it; **Reset all**
 clears everything. Canvas tools (perspective lines, horizon line, reshape grid,
 crop, miniature band) show their options along the bottom: **Enter** or Apply
-keeps the change, **Esc** or Reset drops it. Ctrl+Z / Ctrl+Y undo and redo,
-"Show original" compares, Fit / 1:1 / Grid help you look closely. Double-click
-a slider to restore its default.
+keeps the change, **Esc** drops it, and Reset starts the drawing over. Ctrl+Z /
+Ctrl+Y (or Ctrl+Shift+Z) undo and redo, "Show original" compares, Fit / 1:1
+(Ctrl+0 / Ctrl+1) and Grid help you look closely. Double-click a slider to
+restore its default.
 
 **Save** closes the window and makes the adjustments part of the view: the
 preview (also while playing), frame PNGs and every export use them, and a red
@@ -253,7 +273,8 @@ use the manual Distortion panel.
 Press **L** (or the Fixed length button) to pick a clip by length instead of
 by In/Out marks. Type the length in **seconds** (to 0.01 s) or in **frames**;
 the other box updates to match. Whichever you typed last is what gets exported
-exactly. A length longer than the video is clamped to the video.
+exactly. A length longer than the video is clamped to the video (for that
+video only: the next one gets your length back).
 
 While fixed length is on:
 
@@ -264,7 +285,8 @@ While fixed length is on:
   inside the selection and stop at its last frame. Pressing play at the end
   restarts from the selection start.
 - Mark In moves the selection to start at the current frame; Mark Out moves it
-  to end just before the current frame.
+  to end just before the current frame (counted in whole frames, so a length
+  like 2.01 s never takes the current frame in).
 - A **Move clip** row appears with six buttons that mirror the playback row
   but move the selection box instead of the playhead: to the start of the
   video, back one keyframe, back one frame, forward one frame, forward one
@@ -329,12 +351,19 @@ path; that file is used instead.
 - **Out** is *exclusive*: the clip ends just before the Out frame. This lets
   you go to a keyframe, press O, and get a clip that ends cleanly at that GOP
   boundary. Pressing O on the very last frame includes it (Out = end of video).
+- A lone mark works too, as the timeline shades it: In alone exports from In
+  to the end of the video, Out alone from the start to Out.
 - If In and Out are both keyframes (or the start/end of the file), the export
   dialog offers **Lossless**: all streams are stream-copied with no
   re-encoding, into the same container type as the source. Cuts land exactly
   on In and Out in MP4, MOV, MKV, WebM, MPEG-TS, FLV and AVI. HEVC encoded with
   open GOPs (x265's default) can lose the last few frames before Out, because
   the frames just before a keyframe there depend on that keyframe.
+  When the output can't hold one of the source's tracks (ASS subtitles saved
+  as .mp4, an iPhone metadata track), the cut is retried with only the video
+  and audio, and the "Saved" message says so.
+- Clip names count In and Out from the first frame, as the app shows them
+  (MPEG-TS clocks often start at 1.4 s or later).
 - Otherwise the export re-encodes with **NVENC** (h264, hevc, or av1) to MP4.
   Cut points are frame-accurate. Audio is copied when MP4-compatible,
   otherwise converted to AAC. Quality is controlled by the CQ value
@@ -354,12 +383,12 @@ path; that file is used instead.
 selection (In/Out marks or the fixed-length box), or the **whole video** when
 nothing is selected, straight to the output folder using the default NVENC
 settings from Preferences (out of the box: H.264, CQ 18, preset p5, 24 fps,
-audio copied when MP4-compatible).
-The current rotation, flip, crop, scale, colour match and distortion repair are
-applied. It re-encodes unless the
-Quick export tab in Preferences allows lossless cuts and the clip qualifies. Progress and a Cancel button appear in the status bar, the file
-is named like a normal export (`_clip_full` for the whole video), and an
-existing name gets a numeric suffix rather than being overwritten.
+audio copied when MP4-compatible). The current rotation, flip, crop, scale,
+colour match and distortion repair are applied. It re-encodes unless the Quick
+export tab in Preferences allows lossless cuts and the clip qualifies. Progress
+and a Cancel button appear in the status bar (Cancel deletes the partial file),
+the file is named like a normal export (`_clip_full` for the whole video), and
+an existing name gets a numeric suffix rather than being overwritten.
 
 Note on lossless cuts: audio packets do not line up exactly with video
 keyframes, so a lossless clip may begin with a few milliseconds of audio

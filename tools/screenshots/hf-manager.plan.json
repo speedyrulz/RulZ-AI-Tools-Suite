@@ -47,6 +47,16 @@
       "waitMs": 2000
     },
     {
+      "name": "vast",
+      "js": "location.href = '/vast', 'loading'",
+      "waitMs": 4000
+    },
+    {
+      "name": "06-vast.png",
+      "waitMs": 300,
+      "check": "document.body.innerText.includes('trainer-5090') ? 'instance attached' : 'NO INSTANCE'"
+    },
+    {
       "name": "hub",
       "js": "location.href = '/', 'loading'",
       "waitMs": 3000
@@ -61,5 +71,6 @@
       "waitMs": 300,
       "check": "document.body.className"
     }
-  ]
+  ],
+  "beforeShot": "document.querySelectorAll('.q-notification').forEach(n => n.remove()); 'ok'"
 }

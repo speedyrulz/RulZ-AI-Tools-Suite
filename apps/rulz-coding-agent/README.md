@@ -8,6 +8,8 @@ Everything runs on your computer. The model is served by
 [RulZ LLM Suite](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/tree/main/apps/rulz-llm-suite); this app is the "hands" that edit files and run
 commands. No cloud services and no accounts.
 
+**Documentation:** setup, guides and troubleshooting are in the [wiki](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/wiki/Coding-Agent).
+
 ## Screenshots
 
 | Dark | Light |
@@ -37,7 +39,10 @@ The light look is one click away: use the sun/moon button in the top bar (or **S
 ## What you see
 
 - **Conversation** on the left: what you asked and what the agent says, in plain words. **Stop** (or `Esc`)
-  stops it at any moment, even mid-command.
+  stops it at any moment, even mid-command. While it works you can type a note: `Enter` (**Add note**) hands it over
+  before the agent's next step, `Ctrl+Enter` (**Now**) cuts its current reply short so the note applies at once
+  (running commands are never cut). Hover a message to **Copy** it, **Edit** or **Run again** your latest request
+  (its file changes are undone first), or **Delete** a request or a reply.
 - **Steps** on the right: each thing the agent does ("Installing the pieces your app needs") with a status icon.
   Click a step to see the exact command and its output.
 - **Files changed**: every file the task created, changed or deleted. Click one to see what changed.
@@ -61,6 +66,8 @@ The light look is one click away: use the sun/moon button in the top bar (or **S
 - **Memory** under the message box shows how full the model's context is ("23% of 100K"), using the exact token
   counts RulZ reports after each reply. When the model is loaded with 16K or less, the agent says once that bigger
   projects need a larger context length in RulZ.
+- **Drafts** next to Memory: when the model drafts tokens ahead (a draft model or built-in MTP layers), the share of
+  drafted tokens it accepted and about how much time that saved in the task.
 - **Thinking**: with a model that reasons before it answers (Qwen3, gpt-oss, DeepSeek-R1 and the like), each reply
   gets a **Thinking…** box above it that fills in live as the model reasons and folds away once it starts answering.
   Click it to open or close it again, now or later, to see why the agent did what it did. Turn on **Keep thinking
@@ -103,7 +110,8 @@ The light look is one click away: use the sun/moon button in the top bar (or **S
 
 Watch and control your projects from your Android phone with
 [RulZ Coding Agent for Android](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/tree/main/apps/rulz-coding-agent-android): give it tasks, answer
-approvals, follow the steps and changed files, run your app and undo, while everything still runs here.
+approvals, follow the steps and changed files, run your app and undo, while everything still runs here. The wiki's
+[Android App](https://github.com/speedyrulz/RulZ-AI-Tools-Suite/wiki/Coding-Agent-Android-App) page describes it.
 
 0. Install the app: scan the QR code on the RulZ AI Tools Suite launcher's home page (or on this app's page there)
    with the phone's camera, download the APK and open it. The code always points at the newest release.
@@ -117,7 +125,8 @@ listens only on this computer's Tailscale address (port 7420), so only your own 
 needs the pairing code, 10 wrong codes lock a device out for 10 minutes (also when tried side by side), web
 pages from other sites are turned away, a device can't hold more than 8 connections waiting for the code, and
 **Make a new code** disconnects every phone using the old one. The phone can do what this window does, except change phone access, the RulZ LLM Suite
-address and API key, open dialogs, the browser or Explorer here.
+address and API key, open dialogs, the browser or Explorer here. Notes added during a task, the buttons on messages
+and expert offload (MoE) are also only in this window.
 
 ## Approvals
 

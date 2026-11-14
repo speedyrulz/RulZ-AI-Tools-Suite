@@ -33,7 +33,8 @@ To build that zip yourself:
 
 ## Requirements
 
-- Windows 10/11, Python 3.10+ on PATH
+- Windows 10/11
+- Python 3.10+ on PATH, only to run from source (the release zip needs none)
 - `ffmpeg` and `ffprobe` on PATH (`winget install Gyan.FFmpeg`)
 - An NVIDIA GPU with current drivers for NVENC export
 
@@ -57,6 +58,7 @@ python -m venv .venv
 
 | Action              | Button | Key           |
 | ------------------- | ------ | ------------- |
+| Open a video (or drop it on the window) | | Ctrl+O |
 | Go to start         | ⏮      | Home          |
 | Previous keyframe   | ◀K     | Shift+Left    |
 | Previous frame      | ◀      | Left          |
@@ -75,6 +77,7 @@ python -m venv .venv
 | Rotate 90° clockwise |       | R             |
 | Flip horizontally   |        | F             |
 | Close video         |        | Ctrl+W        |
+| Quit                |        | Ctrl+Q        |
 | Toggle crop box     |        | C             |
 | Toggle fixed length |        | L             |
 | Match colour to reference photo | | B        |
@@ -125,7 +128,8 @@ press adds another 90° and the fourth press returns to upright. Press **F**
 (or the Flip button) to mirror the picture left-to-right. Both always act on
 what you see on screen, in any order: rotate always turns the current view
 clockwise and flip always mirrors the current view. The label next to the
-buttons shows the stored rotation and whether the view is mirrored. Both
+buttons shows the added rotation, whether the view is mirrored, and the
+file's own rotation flag if it has one. Both
 reset when a new file is opened. Sources that carry their own rotation flag
 (phone recordings) are shown upright automatically.
 
@@ -147,8 +151,9 @@ Exports keep the rotation and flip:
 
 **Open last export** (button beside Quick export, or File → Open last export,
 Ctrl+Shift+O) closes the current video and opens the file most recently
-written by Export or Quick export. It is remembered between runs and greys
-out if that file no longer exists.
+written by Export or Quick export. It is remembered between runs. If that file
+has been moved or deleted, it greys out (checked at start, after each export
+and when you use it).
 
 ## Close video
 
@@ -228,9 +233,10 @@ layout:
 The header switch turns a panel on or off and ↺ resets it; **Reset all**
 clears everything. Canvas tools (perspective lines, horizon line, reshape grid,
 crop, miniature band) show their options along the bottom: **Enter** or Apply
-keeps the change, **Esc** or Reset drops it. Ctrl+Z / Ctrl+Y undo and redo,
-"Show original" compares, Fit / 1:1 / Grid help you look closely. Double-click
-a slider to restore its default.
+keeps the change, **Esc** drops it, and Reset starts the drawing over. Ctrl+Z /
+Ctrl+Y (or Ctrl+Shift+Z) undo and redo, "Show original" compares, Fit / 1:1
+(Ctrl+0 / Ctrl+1) and Grid help you look closely. Double-click a slider to
+restore its default.
 
 **Save** closes the window and makes the adjustments part of the view: the
 preview (also while playing), frame PNGs and every export use them, and a red
@@ -377,12 +383,12 @@ path; that file is used instead.
 selection (In/Out marks or the fixed-length box), or the **whole video** when
 nothing is selected, straight to the output folder using the default NVENC
 settings from Preferences (out of the box: H.264, CQ 18, preset p5, 24 fps,
-audio copied when MP4-compatible).
-The current rotation, flip, crop, scale, colour match and distortion repair are
-applied. It re-encodes unless the
-Quick export tab in Preferences allows lossless cuts and the clip qualifies. Progress and a Cancel button appear in the status bar, the file
-is named like a normal export (`_clip_full` for the whole video), and an
-existing name gets a numeric suffix rather than being overwritten.
+audio copied when MP4-compatible). The current rotation, flip, crop, scale,
+colour match and distortion repair are applied. It re-encodes unless the Quick
+export tab in Preferences allows lossless cuts and the clip qualifies. Progress
+and a Cancel button appear in the status bar (Cancel deletes the partial file),
+the file is named like a normal export (`_clip_full` for the whole video), and
+an existing name gets a numeric suffix rather than being overwritten.
 
 Note on lossless cuts: audio packets do not line up exactly with video
 keyframes, so a lossless clip may begin with a few milliseconds of audio

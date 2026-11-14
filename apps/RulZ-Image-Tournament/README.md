@@ -29,7 +29,7 @@ RulZ Image Tournament under **Photos** and click **Install**. Without the launch
 
 Double-click **`launch.bat`**. It builds the app first if needed. You can also drop images or folders onto `launch.bat` to start a tournament with them.
 
-The app needs nothing beyond Windows 10/11 (.NET Framework 4.8 is built in). You can also run `bin\RulZ Image Tournament.exe` directly, or pass images and folders to it on the command line.
+The app needs nothing beyond Windows 10/11 (.NET Framework 4.8 is built into Windows 10 version 1903 and later, and Windows 11). You can also run `bin\RulZ Image Tournament.exe` directly, or pass images and folders to it on the command line.
 
 Only one copy runs at a time. Starting it again while it's open (with **Send to**, a double-click, or files dropped on the `.exe`) brings the open window to the front and adds those images to its tournament.
 
@@ -78,7 +78,7 @@ Images you add during a tournament join the end of the current round. Images you
 | Move the split line | Drag the red divider | |
 | Add images / folder | **Add Images…**, **Add Folder…**, or drag and drop | `Ctrl+O`, `Ctrl+Shift+O` |
 
-Zoom and pan stay in sync. Both images show the same spot measured as a fraction of each image's size from its center, so images of different resolutions still line up. Past 300% zoom, true pixels are shown without smoothing.
+Zoom and pan stay in sync. Both images show the same spot measured as a fraction of each image's size from its center, so images of different resolutions still line up. From 300% zoom up, true pixels are shown without smoothing.
 
 A pick needs a fresh key press or click. Holding a key down doesn't decide one match after another, and a click that comes within a quarter of a second of a new pair appearing (the second half of a double-click) is ignored. The same goes for the buttons on the champion screen.
 
@@ -100,7 +100,7 @@ The first time the app starts, it asks you to choose a look, Dark or Light. Clos
 
 ![The first-run "Choose your look" window](docs/screenshots/05-choose-your-look.png)
 
-Progress is saved after every pick. If the app is closed mid-tournament, it offers to resume the next time it starts. If some of the images can't be found then (for example, a drive isn't connected yet), it says how many and asks before going on without them. If you answer No, the saved tournament is kept until you start a new one (adding images then asks before replacing it), so you can connect the drive and start the app again. Options are saved as soon as you change them. Settings (including the look) and progress are stored in `%APPDATA%\RulZ Image Tournament`.
+Progress is saved a moment after every pick, and when the app closes. If the app is closed mid-tournament, it offers to resume the next time it starts (answering No there discards the saved tournament). If some of the images can't be found then (for example, a drive isn't connected yet), it says how many and asks before going on without them. If you answer No, the saved tournament is kept until you start a new one (adding images then asks before replacing it), so you can connect the drive and start the app again. Options are saved as soon as you change them (the Losers folder box when you leave it). Settings (including the look) and progress are stored in `%APPDATA%\RulZ Image Tournament`.
 
 To keep them somewhere else, set the `RULZ_TOURNAMENT_DATA` environment variable to a folder before starting the app. It then uses `<that folder>\RulZ Image Tournament` and leaves the normal settings and saved tournament alone. This is handy for testing or a portable copy, for example:
 

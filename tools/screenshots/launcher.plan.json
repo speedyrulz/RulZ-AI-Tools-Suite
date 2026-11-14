@@ -1,0 +1,68 @@
+{
+ "port": 9361,
+ "match": "index.html",
+ "width": 1400,
+ "height": 900,
+ "outDir": "R:/out/launcher",
+ "startWaitMs": 6000,
+ "beforeShot": "document.querySelectorAll('[data-sonner-toast]').forEach(n => n.remove()); 'ok'",
+ "shots": [
+  {
+   "name": "choose-your-look.png",
+   "waitMs": 300,
+   "check": "document.body.innerText.includes('Choose your look') ? 'dialog' : 'NO DIALOG'"
+  },
+  {
+   "name": "continue",
+   "js": "(() => { const b = [...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'Continue'); if (!b) return 'none'; b.click(); return 'ok' })()",
+   "waitMs": 4000
+  },
+  {
+   "name": "home-dark.png",
+   "waitMs": 500,
+   "check": "document.body.innerText.slice(0, 400).split(String.fromCharCode(10)).join(' | ')"
+  },
+  {
+   "name": "open",
+   "js": "(() => { const el = [...document.querySelectorAll('h3, h2, div, span')].filter(e => e.children.length === 0 && e.textContent.trim() === 'Rulz Training Captioner')[0]; if (!el) return 'none'; el.click(); return 'ok' })()",
+   "waitMs": 3500
+  },
+  {
+   "name": "app-page.png",
+   "waitMs": 500,
+   "check": "document.body.innerText.slice(0, 200).split(String.fromCharCode(10)).join(' | ')"
+  },
+  {
+   "name": "install-dialog.png",
+   "js": "(() => { const b = [...document.querySelectorAll('main button, button')].find(b => b.textContent.trim() === 'Install'); if (!b) return 'none'; b.click(); return 'ok' })()",
+   "waitMs": 2500,
+   "check": "document.querySelector('[role=dialog]') ? document.querySelector('[role=dialog]').innerText.slice(0, 300).split(String.fromCharCode(10)).join(' | ') : 'NO DIALOG'"
+  },
+  {
+   "name": "cancel",
+   "js": "(() => { const b = [...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'Cancel'); if (!b) return 'none'; b.click(); return 'ok' })()",
+   "waitMs": 1000,
+   "check": "document.querySelector('[role=dialog]') ? 'DIALOG STILL OPEN' : 'closed'"
+  },
+  {
+   "name": "home",
+   "js": "(() => { const b = document.querySelector('button[title=\"All apps\"]'); b.click(); return 'ok' })()",
+   "waitMs": 2000
+  },
+  {
+   "name": "light",
+   "js": "document.querySelector('button[aria-label=\"Switch to light mode\"]').click(), 'ok'",
+   "waitMs": 1500
+  },
+  {
+   "name": "home-light.png",
+   "js": "window.scrollTo(0, 0), 'top'",
+   "waitMs": 800
+  },
+  {
+   "name": "dark",
+   "js": "document.querySelector('button[aria-label=\"Switch to dark mode\"]').click(), 'ok'",
+   "waitMs": 800
+  }
+ ]
+}

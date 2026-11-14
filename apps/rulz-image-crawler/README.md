@@ -29,8 +29,9 @@ here (or have LM Studio installed, or set `LLAMA_SERVER_EXE`).
 
 Double-click **`Start Image Crawler.bat`**. It:
 
-1. loads the model once on **each** NVIDIA card with room for it (ports 8080, 8081, …), reusing any that are
-   already running; images are spread over all of them, so two GPUs check about twice as many per second,
+1. loads the model once on **each** NVIDIA card with about 12 GB of memory or more (GPU 0 if none has; ports
+   8080, 8081, …), reusing a vision llama-server already running on one of those ports; images are spread over
+   all of them, so two GPUs check about twice as many per second,
 2. waits for the model to load (about 10–20 s); a card that fails (e.g. busy with another program) is skipped,
 3. starts the app (port 8000) and opens <http://127.0.0.1:8000> in your browser.
 
@@ -62,7 +63,7 @@ powershell -ExecutionPolicy Bypass -File start_app.ps1 -Gpu 1 -NoBrowser
    down) shows under **Problems** as it happens. Reloading or reopening the page brings a running search back
    with its controls.
 4. Use the slider to hide less certain matches and **Download shown as zip** (it starts at once; the zip is made
-   while it downloads), or grab single images.
+   while it downloads, and its `matches.json` lists every match of the run), or grab single images.
 5. **Past searches** lists every earlier run (also from before a restart); **View** reopens its matches.
 
 **Full-size originals** (on by default): for each picture the app first tries the full-size original — the

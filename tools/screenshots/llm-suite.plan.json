@@ -4,40 +4,84 @@
   "width": 1600,
   "height": 960,
   "outDir": "R:/out/llm-suite",
-  "startWaitMs": 3000,
+  "startWaitMs": 4000,
+  "beforeShot": "document.querySelectorAll('[data-sonner-toast]').forEach(n => n.remove()); 'ok'",
   "shots": [
     {
-      "name": "close-any-open-dialog",
-      "js": "(() => { const d = document.querySelector('[role=dialog]'); if (!d) return 'no dialog'; const b = [...d.querySelectorAll('button')].find(x => /close/i.test(x.getAttribute('aria-label') || '') || x.textContent.trim() === '×'); if (b) { b.click(); return 'closed via button' } document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); return 'sent Escape' })()",
-      "waitMs": 1000,
-      "check": "document.querySelector('[role=dialog]') ? 'DIALOG STILL OPEN' : 'no dialog'"
+      "name": "choose-your-look.png",
+      "waitMs": 300,
+      "check": "document.body.innerText.includes('Choose your look') ? 'dialog' : 'NO DIALOG'"
     },
     {
-      "name": "01-my-models.png",
-      "js": "document.querySelector('button[aria-label=\"My Models\"]').click(), 'ok'",
-      "waitMs": 2500,
-      "check": "document.querySelector('main, body').innerText.match(/\\d+ models[^\\n]*/)?.[0]"
+      "name": "continue",
+      "js": "(() => { const b = [...document.querySelectorAll('button')].find(b => b.textContent.trim().startsWith('Continue')); if (!b) return 'none'; b.click(); return 'ok' })()",
+      "waitMs": 1200
     },
     {
-      "name": "03-developer-api.png",
-      "js": "document.querySelector('button[aria-label=\"Developer\"]').click(), 'ok'",
-      "waitMs": 1500
-    },
-    {
-      "name": "04-settings.png",
-      "js": "document.querySelector('button[aria-label=\"Settings\"]').click(), 'ok'",
-      "waitMs": 3000
-    },
-    {
-      "name": "go-to-chat",
+      "name": "chat",
       "js": "document.querySelector('button[aria-label=\"Chat\"]').click(), 'ok'",
-      "waitMs": 1000,
-      "check": "document.body.innerText.includes('No chats yet') ? 'chat list is empty' : 'CHATS PRESENT'"
+      "waitMs": 1200,
+      "check": "document.body.innerText.includes('Fibonacci') ? 'chats listed' : 'NO CHATS'"
     },
     {
-      "name": "02-load-model.png",
-      "js": "[...document.querySelectorAll('button')].find(b => b.textContent.includes('Select a model to load')).click(), 'ok'",
+      "name": "chat-dark.png",
+      "js": "(() => { const el = [...document.querySelectorAll('*')].filter(e => e.children.length === 0 && e.textContent.trim() === 'Fibonacci approaches')[0]; if (!el) return 'none'; el.click(); return 'ok' })()",
+      "waitMs": 2500
+    },
+    {
+      "name": "my-models.png",
+      "js": "document.querySelector('button[aria-label=\"My Models\"]').click(), 'ok'",
+      "waitMs": 2500
+    },
+    {
+      "name": "load-model.png",
+      "js": "(() => { const b = [...document.querySelectorAll('button')].find(b => b.textContent.trim().startsWith('Select a model to load')); if (!b) return 'none'; b.click(); return 'ok' })()",
       "waitMs": 2000
+    },
+    {
+      "name": "close",
+      "js": "document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })), 'esc'",
+      "waitMs": 800
+    },
+    {
+      "name": "reverse-engineering.png",
+      "js": "document.querySelector('button[aria-label=\"Reverse Engineering\"]').click(), 'ok'",
+      "waitMs": 2500
+    },
+    {
+      "name": "mcp-tools.png",
+      "js": "document.querySelector('button[aria-label=\"MCP Tools\"]').click(), 'ok'",
+      "waitMs": 2000
+    },
+    {
+      "name": "developer-api.png",
+      "js": "document.querySelector('button[aria-label=\"Developer\"]').click(), 'ok'",
+      "waitMs": 2000
+    },
+    {
+      "name": "settings.png",
+      "js": "document.querySelector('button[aria-label=\"Settings\"]').click(), 'ok'",
+      "waitMs": 2500
+    },
+    {
+      "name": "light",
+      "js": "document.querySelector('button[aria-label=\"Switch to light mode\"]').click(), 'ok'",
+      "waitMs": 1000
+    },
+    {
+      "name": "chat2",
+      "js": "document.querySelector('button[aria-label=\"Chat\"]').click(), 'ok'",
+      "waitMs": 1000
+    },
+    {
+      "name": "chat-light.png",
+      "js": "(() => { const el = [...document.querySelectorAll('*')].filter(e => e.children.length === 0 && e.textContent.trim() === 'Fibonacci approaches')[0]; if (!el) return 'none'; el.click(); return 'ok' })()",
+      "waitMs": 2500
+    },
+    {
+      "name": "dark",
+      "js": "document.querySelector('button[aria-label=\"Switch to dark mode\"]').click(), 'ok'",
+      "waitMs": 800
     }
   ]
 }
