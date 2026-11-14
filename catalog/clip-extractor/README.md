@@ -11,7 +11,7 @@ export.
 
 | Dark | Light |
 | --- | --- |
-| ![RulZ Simple Video Clip Extractor in the dark theme, with a 16:9 crop box and a 2.5 second fixed-length selection](docs/screenshots/main-dark.png) | ![The same view in the light theme](docs/screenshots/main-light.png) |
+| ![RulZ Simple Video Clip Extractor in the dark theme, with a 16:9 crop box and a 2.5 second fixed-length selection: the frame at the playhead on the left, the clip's last frame on the right](docs/screenshots/main-dark.png) | ![The same view in the light theme](docs/screenshots/main-light.png) |
 
 | Choose your look (first launch) | Export dialog | Match colour to a reference photo |
 | --- | --- | --- |
@@ -170,7 +170,10 @@ rotation) are shown above the box and in the crop panel.
 
 - **Aspect** locks the box shape: Free, 16:9, 9:16, 4:3, 3:4, 1:1, 21:9,
   2.39:1, 3:2, 2:3, or Custom (type `W:H`, e.g. `5:4`, or a decimal).
-  Changing the aspect refits the current box around its centre.
+  Picking another aspect grows the box to the largest one of that shape that
+  fits the frame, as close as the frame allows to where the box was (a 9:16
+  box at the left edge becomes the 1:1 box at the left edge). Free keeps the
+  box as it is.
 - **Output**: "Crop size" exports the box at its native pixel size. "Scale to"
   lets you type an output width and height; the box is then locked to that
   shape. With an aspect preset chosen, editing one dimension fills in the other.
@@ -278,6 +281,15 @@ video only: the next one gets your length back).
 
 While fixed length is on:
 
+- The video area shows **two views**. The left one is the normal view: the
+  frame at the playhead, with playback, stepping and the crop box as usual.
+  The right one shows the **last frame of the clip** as it is selected now,
+  with its time and frame number, so you see where the clip ends without
+  moving the playhead. It follows the clip box and the length you type, and
+  shows the same rotation, flip, colour match, distortion repair and crop box
+  (the box can only be changed in the left view). While you drag the clip box
+  on video with slow seeks (4K), it shows the keyframe before that frame until
+  you let go.
 - A red box on the timeline shows the selection. Drag it to move the clip,
   or click anywhere outside it to jump the clip start there. Clicking inside
   the box seeks within the clip. Shift-drag scrubs.

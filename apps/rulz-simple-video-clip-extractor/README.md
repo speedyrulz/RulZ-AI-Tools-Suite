@@ -11,7 +11,7 @@ export.
 
 | Dark | Light |
 | --- | --- |
-| ![RulZ Simple Video Clip Extractor in the dark theme, with a 16:9 crop box and a 2.5 second fixed-length selection](docs/screenshots/main-dark.png) | ![The same view in the light theme](docs/screenshots/main-light.png) |
+| ![RulZ Simple Video Clip Extractor in the dark theme, with a 16:9 crop box and a 2.5 second fixed-length selection: the frame at the playhead on the left, the clip's last frame on the right](docs/screenshots/main-dark.png) | ![The same view in the light theme](docs/screenshots/main-light.png) |
 
 | Choose your look (first launch) | Export dialog | Match colour to a reference photo |
 | --- | --- | --- |
