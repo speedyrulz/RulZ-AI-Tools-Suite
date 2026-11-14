@@ -73,8 +73,10 @@ Everything runs on your PC. No photos or face data ever leave your computer.
 - Once you say a face is *not* someone, it will never be auto-assigned to them again, even if you say so
   while a scan is grouping faces.
 - Faces from a dissolved group can still join existing people, but won't re-form the same group.
-- A face you tag by hand stays, even on a photo the scan hasn't analyzed yet. Only a real change to the
-  picture itself (an edit, a rotation) clears its faces so they can be found again.
+- A face you tag by hand stays, even on a photo the scan hasn't analyzed yet.
+- When a photo file changes (an edit, or a rating or tags another program writes into it), it is analyzed
+  again and your corrections move over to the same faces found again in the same places. Boxes you drew
+  stay unless the picture was rotated, mirrored or cropped.
 
 ## Running
 

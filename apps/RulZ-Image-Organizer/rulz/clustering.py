@@ -18,7 +18,7 @@ BLOCK_CELLS = 1 << 24  # similarity-matrix cells per block (64 MB of float32), s
 
 
 def _rows_per_block(n_cols: int) -> int:
-    return max(64, min(CHUNK, BLOCK_CELLS // max(1, n_cols)))
+    return max(8, min(CHUNK, BLOCK_CELLS // max(1, n_cols)))
 
 
 def _components(vecs: np.ndarray, t_link: float) -> np.ndarray:

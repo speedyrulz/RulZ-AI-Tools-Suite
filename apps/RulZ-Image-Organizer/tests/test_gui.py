@@ -125,6 +125,35 @@ def test_remove_folder_during_scan_runs_in_background_and_resumes(qapp, window, 
     assert s["photos"] == 7 and s["pending"] == 0  # the scan carried on with the other folder
 
 
+def test_remove_survives_a_refresh_while_confirming_and_pause(qapp, window, tmp_path, monkeypatch):
+    from PySide6.QtCore import Qt
+
+    from rulz.ui import dialogs
+
+    a, b = _photos(tmp_path / "a", 15), _photos(tmp_path / "b", 3)
+    window.db.add_folder(str(a))
+    window.db.add_folder(str(b))
+    window.navigate(window.LIBRARY)
+    lib = window.library
+    lib.list.setCurrentRow(next(i for i in range(lib.list.count())
+                                if lib.list.item(i).data(Qt.UserRole + 1) == str(a)))
+
+    def confirm_while_a_scan_refreshes(*args, **kwargs):
+        lib.refresh()  # deletes the list item _remove started from
+        return True
+
+    monkeypatch.setattr(dialogs, "confirm", confirm_while_a_scan_refreshes)
+    window.scanner.scan()
+    _wait(qapp, lambda: window.scanner.running)
+    lib._remove()
+    lib.refresh()
+    texts = [lib.list.item(i).text() for i in range(lib.list.count())]
+    assert any(t.endswith("Removing…") for t in texts)  # still marked after a refresh
+    window.scanner.stop()  # Pause: drops the follow-up scan, not the removal
+    _wait(qapp, lambda: not window.scanner.running, 120)
+    assert [r["path"] for r in window.db.folders()] == [str(b)]
+
+
 def test_opening_a_person_that_is_gone_shows_the_overview(qapp, window):
     from rulz.faces import DetectedFace, FaceAttrs
 

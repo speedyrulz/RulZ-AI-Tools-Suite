@@ -11,8 +11,10 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
+import numpy as np
+
 from . import clustering, config, imaging
-from .db import Database
+from .db import Database, from_blob
 from .faces import FaceEngine
 
 Progress = Callable[[int, int, str], None]
@@ -73,8 +75,12 @@ def _under(path: str, roots: set[str]) -> bool:
     return False
 
 
-def sync_files(db: Database, progress: Progress, should_stop: Callable[[], bool]) -> int:
-    """Bring the photos table in line with what's on disk. Returns number of new/changed photos."""
+def sync_files(db: Database, progress: Progress, should_stop: Callable[[], bool],
+               rewritten: Rewritten | None = None) -> int:
+    """Bring the photos table in line with what's on disk. Returns number of new/changed photos.
+
+    ``rewritten`` hears the ids of deleted photos and faces: new rows may get those ids, and their cached
+    thumbnails must not show up for them."""
     changed = 0
     for folder in db.folders():
         fid, root = folder["id"], folder["path"]
@@ -114,10 +120,10 @@ def sync_files(db: Database, progress: Progress, should_stop: Callable[[], bool]
             if not (updated or touched or moved or new_rows):
                 return
             with db.transaction():
-                for photo_id, size, mtime, fp in updated:
-                    db.clear_photo_faces(photo_id)
-                    db.x("UPDATE photos SET size=?, mtime=?, fp=?, faces_done=0, error=NULL WHERE id=?",
-                         (size, mtime, fp, photo_id))
+                # A changed file is analyzed again; its faces stay until then, and the user's work on them
+                # moves over to the new detection (_replace_faces).
+                db.conn.executemany("UPDATE photos SET size=?, mtime=?, fp=?, faces_done=0, error=NULL WHERE id=?",
+                                    [(size, mtime, fp, photo_id) for photo_id, size, mtime, fp in updated])
                 db.conn.executemany("UPDATE photos SET mtime=? WHERE id=?", touched)
                 db.conn.executemany("UPDATE photos SET path=?, mtime=? WHERE id=?", moved)
                 db.conn.executemany("INSERT OR IGNORE INTO photos(folder_id, path, size, mtime, fp, taken_at) "
@@ -166,17 +172,123 @@ def sync_files(db: Database, progress: Progress, should_stop: Callable[[], bool]
         # A moved file keeps its size: a missing photo the size of an unreadable new file may just have moved.
         gone = [r["id"] for r in missing.values() if r["size"] not in unsure_sizes]
         if gone:
-            db.delete_photos(gone)
+            deleted = db.delete_photos(gone)
+            if rewritten is not None:
+                rewritten(*deleted)
     db.cleanup_people()
     return changed
 
 
-def _iou(a, b) -> float:
-    """Overlap of two (x, y, w, h) boxes: intersection over union."""
+def _inter(a, b) -> float:
+    """Area shared by two (x, y, w, h) boxes."""
     ix = max(0.0, min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]))
     iy = max(0.0, min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]))
-    inter = ix * iy
+    return ix * iy
+
+
+def _iou(a, b) -> float:
+    """Overlap of two (x, y, w, h) boxes: intersection over union."""
+    inter = _inter(a, b)
     return inter / (a[2] * a[3] + b[2] * b[3] - inter + 1e-12)
+
+
+def _box(r) -> tuple[float, float, float, float]:
+    return r["x"], r["y"], r["w"], r["h"]
+
+
+def _replace_faces(db: Database, row, full_size, found: list, crops: list) -> list[int]:
+    """Store a fresh detection for a photo (inside the caller's transaction); returns the new face ids.
+
+    The user's work on the old faces carries over, so a re-analysis (the file changed: an edit, or just
+    metadata such as a star rating written into it) doesn't lose it:
+      * a new detection on the spot of an old one (IoU >= 0.5, best overlaps first) takes over its person,
+        how it was assigned, "not a face", the "not this person" answers, and being someone's profile photo;
+      * boxes they drew stay while the picture is still laid out the same (same size, and old detections
+        line up with new ones where there were any: not rotated or cropped), and a detection of the same
+        face isn't added next to one.
+    New faces are inserted before the old rows go, so none of them can reuse an old face's id here.
+    """
+    pid = row["id"]
+    old = db.q("SELECT id, x, y, w, h, person_id, assigned_by, ignored, manual, embedding FROM faces "
+               "WHERE photo_id=?", (pid,))
+    prev = [o for o in old if not o["manual"]]
+    boxes = [f.box for f in found]
+    # Same spot AND same face: after a mirror, a crop or a turn, another person can land on the spot.
+    t_same = db.match_threshold()
+    pairs = sorted(((_iou(b, _box(o)), i, j) for i, b in enumerate(boxes) for j, o in enumerate(prev)),
+                   key=lambda t: -t[0])
+    match: dict[int, int] = {}  # found index -> prev index
+    taken: set[int] = set()
+    for v, i, j in pairs:
+        if v < 0.5:
+            break
+        if i in match or j in taken:
+            continue
+        emb = prev[j]["embedding"]
+        if emb is not None and float(np.dot(from_blob(emb), found[i].embedding)) < t_same:
+            continue
+        match[i] = j
+        taken.add(j)
+    # Drawn boxes stay unless the picture was laid out anew: another size, or faces found again but none
+    # where they were. (Nothing found at all says nothing about the layout.)
+    same_layout = (row["width"] is None or (row["width"], row["height"]) == tuple(full_size)) \
+        and (not prev or not found or bool(match))
+    keep = [o for o in old if o["manual"] and same_layout]
+    rejected: dict[int, list[int]] = {}
+    covers: dict[int, list[int]] = {}
+    if prev:
+        marks = ",".join("?" * len(prev))
+        ids = [o["id"] for o in prev]
+        for f, p in db.q(f"SELECT face_id, person_id FROM rejections WHERE face_id IN ({marks})", ids):
+            rejected.setdefault(f, []).append(p)
+        for p, f in db.q(f"SELECT id, cover_face_id FROM people WHERE cover_face_id IN ({marks})", ids):
+            covers.setdefault(f, []).append(p)
+
+    # A detection that is an old detected face found again is never mistaken for a drawn one.
+    skip = _covered_by_manual(boxes, [_box(o) for o in keep], exclude=set(match))
+    new_ids: list[int] = []
+    for i, (f, crop) in enumerate(zip(found, crops)):
+        if i in skip:
+            continue
+        face_id = db.insert_face(pid, f)
+        new_ids.append(face_id)
+        try:
+            imaging.save_crop(crop, config.face_crop_path(face_id))
+        except OSError:
+            pass
+        if i not in match:
+            continue
+        best = prev[match[i]]
+        db.x("UPDATE faces SET person_id=?, assigned_by=?, ignored=? WHERE id=?",
+             (best["person_id"], best["assigned_by"], best["ignored"], face_id))
+        db.conn.executemany("INSERT OR IGNORE INTO rejections(face_id, person_id) VALUES(?,?)",
+                            [(face_id, p) for p in rejected.get(best["id"], ())])
+        db.conn.executemany("UPDATE people SET cover_face_id=? WHERE id=?",
+                            [(face_id, p) for p in covers.get(best["id"], ())])
+    kept = {o["id"] for o in keep}
+    db.delete_faces([o["id"] for o in old if o["id"] not in kept])
+    return new_ids
+
+
+def _covered_by_manual(found: list, manual: list, exclude: set[int] = frozenset()) -> set[int]:
+    """Indexes of detections that are a hand-drawn face again. For each drawn box: of the detections at
+    least half inside it (or IoU >= 0.3; drawn boxes are usually much looser than the detector's), the one
+    whose center is nearest the box's center, i.e. the face it was drawn around. ``exclude``: never these."""
+    skip: set[int] = set()
+    for box in manual:
+        cx, cy = box[0] + box[2] / 2, box[1] + box[3] / 2
+        best, best_d = None, None
+        for i, b in enumerate(found):
+            if i in skip or i in exclude:
+                continue
+            if _inter(b, box) / max(b[2] * b[3], 1e-12) < 0.5 and _iou(b, box) < 0.3:
+                continue
+            d = (b[0] + b[2] / 2 - cx) ** 2 + (b[1] + b[3] / 2 - cy) ** 2
+            if best_d is None or d < best_d:
+                best, best_d = i, d
+        if best is not None:
+            skip.add(best)
+    return skip
 
 
 def _uncompressed(path: str) -> bool:
@@ -244,7 +356,7 @@ def process_pending(db: Database, progress: Progress, changed: Callable[[], None
     """Analyze photos that need it. ``rewritten(photo_ids, face_ids)`` hears which thumbnails and face
     crops were (re)written, so the UI can drop stale cached copies: an edited photo keeps its id, and
     SQLite hands a deleted face's id to the next new face."""
-    pending = db.q("SELECT id, path, mtime FROM photos WHERE faces_done=0 ORDER BY id")
+    pending = db.q("SELECT id, path, mtime, width, height FROM photos WHERE faces_done=0 ORDER BY id")
     total = len(pending)
     if not total:
         return 0
@@ -283,23 +395,15 @@ def process_pending(db: Database, progress: Progress, changed: Callable[[], None
                 raise Cancelled
             row, full_size, taken_at, found, crops, err = window.popleft().result()
             fill()
-            if full_size is None:
+            if full_size is None or (err and not found):
+                # Unreadable, or the detector failed: the faces it had (and the user's work on them) stay.
                 db.x("UPDATE photos SET faces_done=1, error=? WHERE id=?", (err, row["id"]))
+                if full_size is not None:
+                    new_photos.append(row["id"])  # its thumbnail was written all the same
             else:
                 w, h = full_size
                 with db.transaction():
-                    # A face the user tagged by hand before the scan got here stays (with its name);
-                    # a detection of that same face is not added twice.
-                    manual = db.clear_photo_faces(row["id"], keep_manual=True)
-                    for f, crop in zip(found, crops):
-                        if any(_iou(f.box, box) >= 0.3 for box in manual):
-                            continue
-                        face_id = db.insert_face(row["id"], f)
-                        new_faces.append(face_id)
-                        try:
-                            imaging.save_crop(crop, config.face_crop_path(face_id))
-                        except OSError:
-                            pass
+                    new_faces += _replace_faces(db, row, full_size, found, crops)
                     db.x("UPDATE photos SET width=?, height=?, taken_at=?, faces_done=1, error=? WHERE id=?",
                          (w, h, taken_at or row["mtime"], err, row["id"]))
                 new_photos.append(row["id"])
@@ -383,7 +487,7 @@ def backfill_attributes(db: Database, engine: FaceEngine | Callable[[], FaceEngi
 def full_scan(db: Database, engine: FaceEngine | Callable[[], FaceEngine], progress: Progress,
               changed: Callable[[], None], should_stop: Callable[[], bool],
               rewritten: Rewritten | None = None) -> str:
-    n_changed = sync_files(db, progress, should_stop)
+    n_changed = sync_files(db, progress, should_stop, rewritten)
     if n_changed:
         changed()
     n = process_pending(db, progress, changed, should_stop, rewritten=rewritten)

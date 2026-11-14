@@ -34,7 +34,7 @@ class _Thread(QThread):
                 return
             if self.job == "remove":
                 self.progress.emit(0, 0, "Removing the folder from your library…")
-                db.remove_folder(self.arg)
+                self.rewritten.emit(*db.remove_folder(self.arg))  # their ids may come back for new photos
                 self.changed.emit()
                 self.done.emit("Folder removed")
                 return
@@ -70,6 +70,14 @@ class ScanController(QObject):
     def running(self) -> bool:
         return self.thread is not None
 
+    @property
+    def removing(self) -> set[int]:
+        """Folder ids whose removal is queued or running."""
+        ids = {arg for job, arg in self.queued if job == "remove"}
+        if self.thread is not None and self.thread.job == "remove":
+            ids.add(self.thread.arg)
+        return ids
+
     def scan(self):
         self._enqueue("scan", None)
 
@@ -78,8 +86,10 @@ class ScanController(QObject):
 
     def remove_folder(self, folder_id: int):
         """Remove a library folder on the background thread: a running scan stops first (it may be writing
-        that folder's photos), then scanning carries on with the other folders."""
-        self.stop()
+        that folder's photos), then scanning carries on with the other folders. A queued regroup stays."""
+        self.queued = [q for q in self.queued if q[0] != "scan"]
+        if self.thread is not None and self.thread.job == "scan":
+            self.thread.stop_requested = True
         self._enqueue("remove", folder_id)
         self._enqueue("scan", None)
 

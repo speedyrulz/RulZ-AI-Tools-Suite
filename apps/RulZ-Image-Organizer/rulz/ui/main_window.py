@@ -231,6 +231,13 @@ class MainWindow(QMainWindow):
         if not quiet:
             self._refresh_visible()
 
+    def reload_after_conflict(self):
+        """An edit failed because a scan or regroup changed what it referred to: show the current state,
+        in the viewer too (pages are refreshed when it closes)."""
+        self.data_changed()
+        if self.root.currentWidget() is self.viewer and self.viewer.ids:
+            self.viewer._load_faces()
+
     def _schedule_refresh(self):
         self.data_version += 1  # the scanner changed something
         ThumbLoader.instance().failed.clear()  # thumbnails that didn't exist yet may exist now
@@ -273,6 +280,8 @@ class MainWindow(QMainWindow):
     # ---- scan status -----------------------------------------------------------
     def _scan_started(self):
         self._scan_stats = None
+        if self._closing:
+            return  # a confirmed folder removal still runs; keep saying "Finishing…"
         self.side_progress.show()
         self.side_progress.setRange(0, 0)
         self.side_status.setText("Scanning…")

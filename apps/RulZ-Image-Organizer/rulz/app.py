@@ -40,9 +40,9 @@ def _install_busy_handler() -> None:
                 win = QApplication.activeWindow()
                 dialogs.info(win, *text)
                 main = next((w for w in QApplication.topLevelWidgets()
-                             if hasattr(w, "data_changed") and w.isVisible()), None)
+                             if hasattr(w, "reload_after_conflict") and w.isVisible()), None)
                 if main is not None and text[0] == "Library changed":
-                    main.data_changed()
+                    main.reload_after_conflict()
             finally:
                 showing = False
             return

@@ -221,26 +221,40 @@ class Database:
                     self.x("DELETE FROM folders WHERE id=?", (row["id"],))
         return None
 
-    def remove_folder(self, folder_id: int) -> None:
+    def remove_folder(self, folder_id: int) -> tuple[list[int], list[int]]:
+        """Remove a library folder and its photos; returns the deleted (photo ids, face ids)."""
         photo_ids = [r[0] for r in self.q("SELECT id FROM photos WHERE folder_id=?", (folder_id,))]
-        self.delete_photos(photo_ids)
+        deleted = self.delete_photos(photo_ids)
         self.x("DELETE FROM folders WHERE id=?", (folder_id,))
         self.cleanup_people()
+        return deleted
 
     # ---- photos --------------------------------------------------------------
-    def delete_photos(self, photo_ids: list[int]) -> None:
+    def delete_photos(self, photo_ids: list[int]) -> tuple[list[int], list[int]]:
+        """Delete photos with their faces, thumbnails and crops; returns the deleted (photo ids, face ids)."""
         if not photo_ids:
-            return
+            return [], []
         face_ids: list[int] = []
         with self.transaction():
             for chunk in _chunks(photo_ids, 500):
                 marks = ",".join("?" * len(chunk))
                 face_ids += [r[0] for r in self.q(f"SELECT id FROM faces WHERE photo_id IN ({marks})", chunk)]
                 self.x(f"DELETE FROM photos WHERE id IN ({marks})", chunk)
-        for pid in photo_ids:
-            _unlink(config.thumb_path(pid))
-        for fid in face_ids:
-            _unlink(config.face_crop_path(fid))
+        # The files go after the commit, in short locked chunks, so thousands of deletes never hold the write
+        # lock for long. SQLite hands the highest deleted ids to the next new rows: a chunk skips ids the other
+        # connection has reused (a face tagged in the viewer keeps its new crop), and the lock keeps a new row
+        # from taking one between that check and the delete.
+        for table, ids, path_of in (("photos", photo_ids, config.thumb_path), ("faces", face_ids, config.face_crop_path)):
+            for chunk in _chunks(ids, 200):
+                with self.transaction():
+                    reused = self._existing(table, chunk)
+                    for i in chunk:
+                        if i not in reused:
+                            _unlink(path_of(i))
+        return photo_ids, face_ids
+
+    def _existing(self, table: str, ids: list[int]) -> set[int]:
+        return {r[0] for r in self.q(f"SELECT id FROM {table} WHERE id IN ({','.join('?' * len(ids))})", ids)}
 
     def photos(self, person_ids: list[int] | None = None) -> list[Photo]:
         """All photos newest first; optionally only photos containing *all* given people."""
@@ -312,16 +326,10 @@ class Database:
             for fid in face_ids:
                 _unlink(config.face_crop_path(fid))
 
-    def clear_photo_faces(self, photo_id: int, keep_manual: bool = False) -> list[tuple[float, float, float, float]]:
-        """Delete the faces of a photo (it changed, or is being analyzed again), crop files included.
-
-        ``keep_manual`` keeps boxes the user drew (the file hasn't changed since) and returns them.
-        """
+    def clear_photo_faces(self, photo_id: int) -> None:
+        """Delete every face of a photo, crop files included."""
         with self.transaction():
-            rows = self.q("SELECT id, manual, x, y, w, h FROM faces WHERE photo_id=?", (photo_id,))
-            kept = [r for r in rows if keep_manual and r["manual"]]
-            self.delete_faces([r["id"] for r in rows if not (keep_manual and r["manual"])])
-        return [(r["x"], r["y"], r["w"], r["h"]) for r in kept]
+            self.delete_faces([r[0] for r in self.q("SELECT id FROM faces WHERE photo_id=?", (photo_id,))])
 
     def set_face_attrs(self, face_id: int, attrs: "FaceAttrs | None") -> None:
         if attrs is None:

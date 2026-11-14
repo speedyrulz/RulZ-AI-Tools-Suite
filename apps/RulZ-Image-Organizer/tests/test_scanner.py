@@ -221,18 +221,194 @@ def test_face_tagged_before_analysis_survives_the_scan(db, tmp_path):
     assert db.one("SELECT COUNT(*) FROM faces WHERE photo_id=?", (p2,))[0] == 2
 
 
-def test_changed_file_drops_hand_drawn_faces_too(db, tmp_path):
+def test_loose_hand_drawn_box_is_not_detected_again(db, tmp_path):
     folder = _photos(tmp_path / "pics", 1)
     db.add_folder(str(folder))
     scanner.sync_files(db, lambda *a: None, _never)
     pid = db.one("SELECT id FROM photos")[0]
-    db.x("UPDATE photos SET faces_done=1 WHERE id=?", (pid,))
     emb = np.ones(128, np.float32) / np.sqrt(128)
-    db.insert_face(pid, DetectedFace((0.3, 0.3, 0.4, 0.4), 0, emb, FaceAttrs()), manual=True)
-    Image.new("RGB", (80, 80), (1, 2, 3)).save(folder / "img000.jpg")  # new picture: old boxes are void
-    db.x("UPDATE photos SET mtime=mtime-100 WHERE id=?", (pid,))
+    # Twice the detector's (0.25, 0.25, 0.5, 0.5) each way: IoU only 0.25, but the detection lies inside it.
+    db.insert_face(pid, DetectedFace((0.0, 0.0, 1.0, 1.0), 0, emb, FaceAttrs()), manual=True)
+    scanner.process_pending(db, lambda *a: None, lambda: None, _never, engine_factory=_FakeEngine)
+    assert db.one("SELECT COUNT(*) FROM faces WHERE photo_id=?", (pid,))[0] == 1
+
+
+def _analyzed_photo(db, tmp_path):
+    folder = _photos(tmp_path / "pics", 1)
+    db.add_folder(str(folder))
     scanner.sync_files(db, lambda *a: None, _never)
-    assert db.one("SELECT COUNT(*) FROM faces WHERE photo_id=?", (pid,))[0] == 0
+    scanner.process_pending(db, lambda *a: None, lambda: None, _never, engine_factory=_FakeEngine)
+    pid, fid = db.one("SELECT photo_id, id FROM faces")
+    return folder / "img000.jpg", pid, fid
+
+
+def test_changed_file_keeps_corrections_on_the_same_faces(db, tmp_path):
+    # e.g. a star rating or tags another program writes into the file: new bytes, same picture
+    path, pid, fid = _analyzed_photo(db, tmp_path)
+    mom, dad = db.create_person("Mom"), db.create_person("Dad")
+    db.assign_faces([fid], mom)
+    db.reject_faces([fid], dad)
+    db.set_cover(mom, fid)
+    emb = np.ones(128, np.float32) / np.sqrt(128)
+    drawn = db.insert_face(pid, DetectedFace((0.0, 0.0, 0.1, 0.1), 0, emb, FaceAttrs()), manual=True)
+    db.assign_faces([drawn], dad)
+    path.write_bytes(path.read_bytes() + b"metadata")
+    assert scanner.sync_files(db, lambda *a: None, _never) == 1
+    assert db.one("SELECT COUNT(*) FROM faces WHERE photo_id=?", (pid,))[0] == 2  # kept until re-analyzed
+    scanner.process_pending(db, lambda *a: None, lambda: None, _never, engine_factory=_FakeEngine)
+    rows = db.q("SELECT id, person_id, assigned_by, manual FROM faces WHERE photo_id=? ORDER BY manual", (pid,))
+    (new, by_hand) = rows
+    assert new["id"] != fid and (new["person_id"], new["assigned_by"]) == (mom, "user")
+    assert db.one("SELECT COUNT(*) FROM rejections WHERE face_id=? AND person_id=?", (new["id"], dad))[0] == 1
+    assert db.one("SELECT cover_face_id FROM people WHERE id=?", (mom,))[0] == new["id"]
+    assert (by_hand["id"], by_hand["person_id"]) == (drawn, dad)
+    assert not config.face_crop_path(fid).exists() and config.face_crop_path(new["id"]).exists()
+
+
+def test_rotated_or_cropped_file_drops_hand_drawn_boxes(db, tmp_path):
+    path, pid, fid = _analyzed_photo(db, tmp_path)
+    emb = np.ones(128, np.float32) / np.sqrt(128)
+    db.insert_face(pid, DetectedFace((0.0, 0.0, 0.1, 0.1), 0, emb, FaceAttrs()), manual=True)
+    Image.new("RGB", (48, 64), (1, 2, 3)).save(path)  # new size: the drawn box no longer fits
+    scanner.sync_files(db, lambda *a: None, _never)
+    scanner.process_pending(db, lambda *a: None, lambda: None, _never, engine_factory=_FakeEngine)
+    assert db.one("SELECT COUNT(*) FROM faces WHERE photo_id=? AND manual=1", (pid,))[0] == 0
+
+
+def _unit(seed):
+    v = np.random.default_rng(seed).normal(size=128).astype(np.float32)
+    return v / np.linalg.norm(v)
+
+
+class _BoxEngine:
+    """Finds the boxes in ``boxes``: (x, y, w, h) or ((x, y, w, h), embedding). Fails when it is None."""
+    boxes: list | None = []
+
+    def detect(self, bgr):
+        if _BoxEngine.boxes is None:
+            raise RuntimeError("detector broke")
+        same = np.ones(128, np.float32) / np.sqrt(128)
+        out = []
+        for b in _BoxEngine.boxes:
+            box, emb = (b, same) if len(b) == 4 else b
+            out.append(DetectedFace(box, 0.9, emb, FaceAttrs()))
+        return out
+
+
+def _analyze(db, boxes):
+    _BoxEngine.boxes = boxes
+    db.x("UPDATE photos SET faces_done=0")
+    scanner.process_pending(db, lambda *a: None, lambda: None, _never, engine_factory=_BoxEngine)
+
+
+def _person_at(db, box):
+    return db.one("SELECT person_id FROM faces WHERE abs(x-?)<1e-6 AND abs(y-?)<1e-6", box[:2])[0]
+
+
+def test_reanalysis_matches_best_overlap_first(db, tmp_path):
+    _photos(tmp_path / "pics", 1)
+    db.add_folder(str(tmp_path / "pics"))
+    scanner.sync_files(db, lambda *a: None, _never)
+    alice_box = (0.1, 0.1, 0.2, 0.2)
+    _analyze(db, [alice_box])
+    alice = db.create_person("Alice")
+    db.assign_faces([db.one("SELECT id FROM faces")[0]], alice)
+    shifted = (0.15, 0.1, 0.2, 0.2)  # IoU 0.6 with Alice's old box, and found first
+    _analyze(db, [shifted, alice_box])  # the same spot again: IoU 1.0
+    assert _person_at(db, alice_box) == alice and _person_at(db, shifted) is None
+
+
+def test_detector_failure_keeps_the_faces(db, tmp_path):
+    _photos(tmp_path / "pics", 1)
+    db.add_folder(str(tmp_path / "pics"))
+    scanner.sync_files(db, lambda *a: None, _never)
+    _analyze(db, [(0.1, 0.1, 0.2, 0.2)])
+    fid = db.one("SELECT id FROM faces")[0]
+    db.assign_faces([fid], db.create_person("Mom"))
+    _analyze(db, None)
+    assert db.one("SELECT assigned_by FROM faces WHERE id=?", (fid,))[0] == "user"
+    assert "detector broke" in db.one("SELECT error FROM photos")[0]
+
+
+def test_loose_box_around_two_faces_skips_the_one_it_was_drawn_around(db, tmp_path):
+    _photos(tmp_path / "pics", 1)
+    db.add_folder(str(tmp_path / "pics"))
+    scanner.sync_files(db, lambda *a: None, _never)
+    pid = db.one("SELECT id FROM photos")[0]
+    emb = np.ones(128, np.float32) / np.sqrt(128)
+    db.insert_face(pid, DetectedFace((0.3, 0.3, 0.4, 0.4), 0, emb, FaceAttrs()), manual=True)  # center 0.5
+    near, other = (0.42, 0.42, 0.16, 0.16), (0.31, 0.31, 0.12, 0.12)  # both wholly inside the drawn box
+    _analyze(db, [other, near])
+    assert db.one("SELECT COUNT(*) FROM faces WHERE manual=0 AND abs(x-0.31)<1e-6")[0] == 1
+    assert db.one("SELECT COUNT(*) FROM faces WHERE manual=0 AND abs(x-0.42)<1e-6")[0] == 0
+
+
+def test_drawn_box_dropped_when_detections_no_longer_line_up(db, tmp_path):
+    # A same-size change that moved everything (a 180-degree turn, a crop resized back): no old face lines up.
+    _photos(tmp_path / "pics", 1)
+    db.add_folder(str(tmp_path / "pics"))
+    scanner.sync_files(db, lambda *a: None, _never)
+    pid = db.one("SELECT id FROM photos")[0]
+    _analyze(db, [(0.1, 0.1, 0.2, 0.2)])
+    emb = np.ones(128, np.float32) / np.sqrt(128)
+    db.insert_face(pid, DetectedFace((0.6, 0.6, 0.1, 0.1), 0, emb, FaceAttrs()), manual=True)
+    _analyze(db, [(0.7, 0.7, 0.2, 0.2)])
+    assert db.one("SELECT COUNT(*) FROM faces WHERE manual=1")[0] == 0
+    _analyze(db, [(0.7, 0.7, 0.2, 0.2)])  # unchanged layout this time
+    db.insert_face(pid, DetectedFace((0.1, 0.1, 0.1, 0.1), 0, emb, FaceAttrs()), manual=True)
+    _analyze(db, [(0.7, 0.7, 0.2, 0.2)])
+    assert db.one("SELECT COUNT(*) FROM faces WHERE manual=1")[0] == 1
+
+
+def test_mirrored_photo_does_not_swap_names(db, tmp_path):
+    _photos(tmp_path / "pics", 1)
+    db.add_folder(str(tmp_path / "pics"))
+    scanner.sync_files(db, lambda *a: None, _never)
+    left, right = (0.1, 0.1, 0.2, 0.2), (0.6, 0.1, 0.2, 0.2)
+    a, b = _unit(1), _unit(2)
+    _analyze(db, [(left, a), (right, b)])
+    alice, bob = db.create_person("Alice"), db.create_person("Bob")
+    db.assign_faces([db.one("SELECT id FROM faces WHERE abs(x-0.1)<1e-6")[0]], alice)
+    db.assign_faces([db.one("SELECT id FROM faces WHERE abs(x-0.6)<1e-6")[0]], bob)
+    _analyze(db, [(left, b), (right, a)])  # flipped: Bob is on the left now
+    assert _person_at(db, left) is None and _person_at(db, right) is None  # no wrong names; regrouped later
+
+
+def test_drawn_box_does_not_swallow_a_neighbour_found_again(db, tmp_path):
+    _photos(tmp_path / "pics", 1)
+    db.add_folder(str(tmp_path / "pics"))
+    scanner.sync_files(db, lambda *a: None, _never)
+    pid = db.one("SELECT id FROM photos")[0]
+    mom_box = (0.45, 0.45, 0.1, 0.1)
+    _analyze(db, [mom_box])
+    mom = db.create_person("Mom")
+    db.assign_faces([db.one("SELECT id FROM faces")[0]], mom)
+    emb = np.ones(128, np.float32) / np.sqrt(128)
+    # A loose box drawn around a missed face right next to Mom: Mom's box lies wholly inside it.
+    db.insert_face(pid, DetectedFace((0.3, 0.3, 0.4, 0.4), 0, emb, FaceAttrs()), manual=True)
+    _analyze(db, [mom_box])  # the missed face is missed again
+    assert _person_at(db, mom_box) == mom
+    assert db.one("SELECT COUNT(*) FROM faces WHERE manual=1")[0] == 1
+
+
+def test_nothing_found_keeps_drawn_boxes(db, tmp_path):
+    _photos(tmp_path / "pics", 1)
+    db.add_folder(str(tmp_path / "pics"))
+    scanner.sync_files(db, lambda *a: None, _never)
+    pid = db.one("SELECT id FROM photos")[0]
+    _analyze(db, [(0.1, 0.1, 0.2, 0.2)])
+    emb = np.ones(128, np.float32) / np.sqrt(128)
+    db.insert_face(pid, DetectedFace((0.6, 0.6, 0.1, 0.1), 0, emb, FaceAttrs()), manual=True)
+    _analyze(db, [])  # a borderline face isn't found this time
+    assert db.one("SELECT COUNT(*) FROM faces WHERE manual=1")[0] == 1
+
+
+def test_sync_reports_deleted_ids(db, tmp_path):
+    path, pid, fid = _analyzed_photo(db, tmp_path)
+    path.unlink()
+    calls = []
+    scanner.sync_files(db, lambda *a: None, _never, rewritten=lambda p, f: calls.append((p, f)))
+    assert calls == [([pid], [fid])]
 
 
 def test_data_dir_follows_the_environment(tmp_path, monkeypatch):
