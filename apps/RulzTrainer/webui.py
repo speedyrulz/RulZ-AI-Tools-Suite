@@ -5145,6 +5145,7 @@ MODEL_GB["minimax_h3_image"] = {"bf16": 40.2, "int8": 21.0, "nvfp4": 12.5}
 # those layers quantized too are 29.4 GB (PAN2_int8_convrot_full) and 16.6 GB (PAN2_nvfp4)
 MODEL_GB["pan2"] = {"bf16": 67.6, "int8": 29.4, "nvfp4": 16.6}
 STEP_HEADROOM_GB = 4.5  # set for the default run's adapter; a bigger one adds runplan.adapter_extra_gb on top
+H3_PLAN_FAMILIES = ("minimax_h3", "p_h3_image", "minimax_h3_image")  # planned by h3_recommendations (21 GB, 50 blocks)
 # Adapter keys of the wizard's picks that change what the adapter holds (runplan.adapter_gb reads them)
 ADAPTER_PLAN_KEYS = ("network_type", "lora_rank", "lokr_factor", "oft_block_size", "dora", "optimizer", "lora_ema",
                      "lora_targets", "lora_blocks", "train_text_embedder", "keel_lookahead", "finetune")
@@ -5185,6 +5186,142 @@ def adapter_words(cfg: TrainConfig, overrides: dict | None = None) -> str:
     return f"the {name}, its gradients and {get('optimizer')} state{average}"
 
 
+def plan_quant_of(fam: str, model_source: str, model_file_quant: str, vram: float | None, quant: str) -> str | None:
+    """The quantization the memory plan counts (a key of MODEL_GB's rows) for a transformer_quant setting: auto is the
+    file's own format, or for a model that is quantized as it loads the one its family picks for a card of `vram` GB.
+    None when that card is not known (a run in the measured record that did not keep it)."""
+    if quant == "auto":
+        if model_source == "files" and fam != "flux2_klein":  # its float files are quantized for the memory
+            quant = "bf16" if model_file_quant == "bf16" else "int8"
+            quant = "nvfp4" if model_file_quant == "nvfp4_mixed" else quant  # Ideogram 4's 5.5 GB file
+        elif vram is None:
+            return None
+        else:
+            quant = {"krea2": "int8" if vram >= 22 else "nvfp4", "fibo2": "int8" if vram < 22 else "bf16",
+                     "qwen_image21": "bf16" if vram >= 24 else "int8" if vram >= 11 else "nvfp4",
+                     "flux3_klein": "bf16" if vram >= 15 else "int8" if vram >= 9.5 else "nvfp4",
+                     "flux2_klein": "bf16" if vram >= 30 else "int8" if vram >= 18 else "nvfp4",
+                     "ideogram4": "bf16" if vram >= 30 else "int8" if vram >= 15 else "nvfp4"}.get(fam, "bf16")
+    return {"int8_convrot": "int8", "none": "bf16"}.get(quant, quant)
+
+
+def plan_quant(cfg: TrainConfig, vram: float, quant: str) -> str:
+    """plan_quant_of for a config on a card of `vram` GB."""
+    return plan_quant_of(cfg.arch_name(), cfg.model_source, cfg.model_file_quant, vram, quant)
+
+
+# The wizard's picks besides the adapter's that decide which measured runs are comparable (rulztrainer/measured.py);
+# like the adapter's, only those it applies along with the block swap (WIZARD_AUTO) are read instead of the form's
+MEASURED_PLAN_KEYS = ("resolutions", "gradient_checkpointing", "transformer_quant")
+ESTIMATED_NOTE = "; estimated (no comparable finished run of yours yet)"
+
+
+# Families whose `auto` quantization of a model that is quantized as it loads is known by card size (plan_quant_of)
+AUTO_QUANT_BY_CARD = ("krea2", "fibo2", "qwen_image21", "flux3_klein", "flux2_klein", "ideogram4")
+# Families whose bf16 file is quantized for the card too (h3_recommendations: "a bf16 source is quantized for the GPUs")
+QUANTIZED_FROM_BF16 = H3_PLAN_FAMILIES + ("pan2",)
+
+
+def measured_quant(fam: str, model_source: str, model_file_quant: str, vram: float | None, quant: str) -> str | None:
+    """plan_quant_of where it says what the model really is in memory, else None: a measured run is comparable only
+    then. The estimate may count an `auto` it cannot place as bf16 (it only picks a size); two runs told apart by
+    it must not be taken for the same model. Unknown: auto on a repo of a family with no rule by card size, and
+    auto on a bf16 file of a family that quantizes it for the card."""
+    if quant == "auto":
+        from_file = model_source == "files" and fam != "flux2_klein"
+        if from_file and model_file_quant == "bf16" and fam in QUANTIZED_FROM_BF16:
+            return None
+        if not from_file and fam not in AUTO_QUANT_BY_CARD:
+            return None
+    return plan_quant_of(fam, model_source, model_file_quant, vram, quant)
+
+
+def same_card(card_gb, vram: float):
+    """A measured run's card size for placing its quantization: the form's card when the two are the same card to
+    within what the sources differ by (nvidia-smi's MiB, torch's bytes, a log's whole GB: 15.93 against 16), so a
+    threshold that falls between them does not part a run from its own card."""
+    try:
+        return vram if card_gb is not None and abs(float(card_gb) - vram) <= 0.6 else card_gb
+    except (TypeError, ValueError):
+        return None
+
+
+def measured_swap(cfg: TrainConfig, vram: float, quant: str, r: dict, per_block_gb: float | None = None,
+                  max_swap: int | None = None, picks: dict | None = None) -> tuple[dict | None, bool]:
+    """(plan, the record has runs): the block swap count from the measured peak VRAM of a comparable finished run of
+    the user's own (rulztrainer/measured.py: find), or None when no run is comparable and close enough, and the
+    estimate stands. Without a record nothing changes. r: the wizard's picks so far; picks: values to read instead
+    of r's; per_block_gb / max_swap: the estimate's own terms when they are not the model's size over its blocks
+    and all but two blocks (MiniMax H3's plan)."""
+    try:
+        from rulztrainer import measured, runplan
+
+        rows = measured.load()
+        if not rows:
+            return None, False
+        fam = cfg.arch_name()
+        resolved = measured_quant(fam, cfg.model_source, cfg.model_file_quant, vram, quant)
+        if resolved is None:
+            return None, True
+        blocks = get_arch(cfg).n_blocks or 28
+        if per_block_gb is None:
+            per_block_gb = MODEL_GB.get(fam, MODEL_GB["moss_image"]).get(resolved, 10.0) / blocks
+        adapter = adapter_overrides(r)
+        over = {**adapter, **{k: r[k][0] for k in MEASURED_PLAN_KEYS if k in r and k in WIZARD_AUTO}, **(picks or {})}
+        want = measured.settings(cfg, over)
+        want["quant"] = resolved
+        plan = measured.find(
+            rows, want, vram=vram, per_block_gb=per_block_gb, max_swap=blocks - 2 if max_swap is None else max_swap,
+            blocks=blocks, adapter_gb=runplan.adapter_gb(cfg, adapter),
+            quant_of=lambda row: measured_quant(row.get("family"), row.get("model_source"),
+                                                row.get("model_file_quant"), same_card(row.get("card_gb"), vram),
+                                                row.get("transformer_quant")))
+        return plan, True
+    except Exception:  # noqa: BLE001  (a record or a form the lookup cannot read: the estimate stands)
+        return None, False
+
+
+def measured_reason(plan: dict, vram: float) -> str:
+    """The block swap pick's reason when it comes from a measured run (measured_swap): which run, what it measured,
+    what was adjusted, and a warning when that run came close to its card."""
+    row, n, n_m = plan["row"], plan["swap"], plan["at_blocks"]
+    at = f"{n_m} blocks swapped" if n_m else "no block swap"
+    if plan["from"] == "peak":  # a run that did not fill the card by itself: its own peak
+        text = f"measured on your run '{row.get('job') or 'unnamed'}': {plan['step_gb']:.1f} GB at {at}"
+    else:  # the run's start-of-run measurement of a step; its peak includes the blocks it kept in spare memory
+        text = f"measured on your run '{row.get('job') or 'unnamed'}': a step took {plan['step_gb']:.1f} GB at {at}"
+        if plan["kept_blocks"] > 1:
+            text += (f" (its {plan['run_peak_gb']:.1f} GB peak includes the {plan['kept_blocks']} blocks it kept in "
+                     "spare memory)")
+    notes = []
+    if n != n_m:  # where the blocks' size comes from: the run's own model, its log, or the estimate
+        sized = {"measured": "their weights as that run's model holds them", "log": "at the size that run's log gives",
+                 "estimate": "at the estimate's size"}[plan["blocks_from"]]
+        notes.append(f"{abs(n - n_m)} {'more' if n > n_m else 'fewer'} blocks swapped ({sized})")
+    delta = plan["adapter_delta_gb"]
+    if abs(delta) >= 0.1:
+        notes.append(f"this adapter's {abs(delta):.1f} GB {'more' if delta > 0 else 'less'} (counted)")
+    text += f"; adjusted for {' and '.join(notes)}, " if notes else ": "
+    free = f"about {max(0.0, plan['free_gb']):.1f} GB of {vram:.0f} GB free"
+    if n:
+        text += (f"{n} blocks' frozen weights ({plan['saved_gb']:.1f} GB) wait in system RAM and stream in as each "
+                 f"block runs, leaving a step {free}")
+    else:
+        text += f"it fits {vram:.0f} GB as it is, a step leaving {free}; swapping only slows the steps"
+    if plan["tight"]:
+        text += ("; even so the fit is tight: a smaller adapter, a lighter optimizer or a smaller quantization "
+                 "leaves room")
+    if plan["close_call"]:
+        gap, card = plan["headroom_gb"], plan["card_gb"]
+        if card:
+            text += (f"; that run came within {gap:.1f} GB of its {card:.0f} GB card" if gap > 0 else
+                     f"; that run filled its {card:.0f} GB card")
+        else:  # (its card is not known: held against this one)
+            text += f"; that run's peak is within {max(0.0, gap):.1f} GB of this card's memory"
+        text += ": watch the first steps"
+    return text
+
+
 def block_swap_plan(cfg: TrainConfig, vram: float, quant: str, adapter_gb: float | None = None) -> tuple[int, float]:
     """(blocks to swap, GB of weights they hold) so the model plus a step's memory fits in `vram` GB; 0 when it fits.
     adapter_gb: what the run's adapter holds beyond the step allowance (None: counted from cfg, adapter_extra_gb)."""
@@ -5197,17 +5334,7 @@ def block_swap_fit(cfg: TrainConfig, vram: float, quant: str,
     """block_swap_plan, plus whether the fit is tight: even the most blocks it may swap (all but 2) leave the model
     and a step's memory over `vram`."""
     fam = cfg.arch_name()
-    if quant == "auto":
-        if cfg.model_source == "files" and fam != "flux2_klein":  # its float files are quantized for the memory
-            quant = "bf16" if cfg.model_file_quant == "bf16" else "int8"
-            quant = "nvfp4" if cfg.model_file_quant == "nvfp4_mixed" else quant  # Ideogram 4's 5.5 GB file
-        else:
-            quant = {"krea2": "int8" if vram >= 22 else "nvfp4", "fibo2": "int8" if vram < 22 else "bf16",
-                     "qwen_image21": "bf16" if vram >= 24 else "int8" if vram >= 11 else "nvfp4",
-                     "flux3_klein": "bf16" if vram >= 15 else "int8" if vram >= 9.5 else "nvfp4",
-                     "flux2_klein": "bf16" if vram >= 30 else "int8" if vram >= 18 else "nvfp4",
-                     "ideogram4": "bf16" if vram >= 30 else "int8" if vram >= 15 else "nvfp4"}.get(fam, "bf16")
-    quant = {"int8_convrot": "int8", "none": "bf16"}.get(quant, quant)
+    quant = plan_quant(cfg, vram, quant)
     gb = MODEL_GB.get(fam, MODEL_GB["moss_image"]).get(quant, 10.0)
     blocks = get_arch(cfg).n_blocks or 28
     extra = adapter_extra_gb(cfg) if adapter_gb is None else max(0.0, float(adapter_gb or 0.0))
@@ -5574,17 +5701,24 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
                                   (body_p.format(trigger=subject), "an upright full-body shot scores the build"))
     if plan_swap:  # the form's adapter counts too (with the weight average picked above): a big one swaps more
         picks = adapter_overrides(r)
+        quant = r.get("transformer_quant", (cfg.transformer_quant,))[0]
+        # a comparable finished run of the user's own beats the count (MiniMax H3's families plan below)
+        measured, recorded = (None, False) if cfg.arch_name() in H3_PLAN_FAMILIES else measured_swap(cfg, vram, quant, r)
         extra = adapter_extra_gb(cfg, picks)
-        swap, saved, tight = block_swap_fit(cfg, vram, r.get("transformer_quant", (cfg.transformer_quant,))[0], extra)
+        swap, saved, tight = block_swap_fit(cfg, vram, quant, extra)
         counted = (f" (counting {extra:.1f} GB more for {adapter_words(cfg, picks)} than a default rank-16 LoRA's)"
                    if extra >= 0.1 else "")
-        if swap:
+        if measured is not None:
+            r["block_swap"] = (measured["swap"], measured_reason(measured, vram))
+        elif swap:
             r["block_swap"] = (swap, f"the model and a step's memory do not fit {vram:.0f} GB{counted}: {swap} blocks' "
                                      f"frozen weights ({saved:.1f} GB) wait in system RAM and stream in as each block "
                                      "runs" + ("; even so the fit is tight: a smaller adapter, a lighter optimizer or "
                                                "a smaller quantization leaves room" if tight else ""))
         else:
             r["block_swap"] = (0, f"the model fits {vram:.0f} GB as it is{counted}; swapping only slows the steps")
+        if measured is None and recorded:
+            r["block_swap"] = (r["block_swap"][0], r["block_swap"][1] + ESTIMATED_NOTE)
     if cfg.arch_name() == "minimax_h3":
         h3_recommendations(cfg, r, goal, gpus, vram, character)
     elif cfg.arch_name() == "p_h3_image":
@@ -5673,9 +5807,16 @@ def h3_recommendations(cfg: TrainConfig, r: dict, goal: str | None, gpus: list[d
         counted = (f", counting {extra:.1f} GB more for {adapter_words(cfg, picks)} than a default rank-16 LoRA's"
                    if extra >= 0.1 else "")
         r["multi_gpu"] = ("off", "one GPU found")
-        r["block_swap"] = (swap, f"the 21 GB model does not fit {vram:.0f} GB: {swap} of the 50 blocks' frozen weights "
-                                 f"({swap * 0.387:.1f} GB) wait in pinned system RAM and stream in as each runs "
-                                 f"(an estimate{counted}; musubi-tuner swaps up to 48)")
+        # a comparable finished run of the user's own beats the count (the three H3 families train at 1 MP, set below)
+        measured, recorded = measured_swap(cfg, vram, r["transformer_quant"][0], r, per_block_gb=0.387, max_swap=48,
+                                           picks={"resolutions": [1.0]})
+        if measured is not None:
+            r["block_swap"] = (measured["swap"], measured_reason(measured, vram))
+        else:
+            r["block_swap"] = (swap, f"the 21 GB model does not fit {vram:.0f} GB: {swap} of the 50 blocks' frozen "
+                                     f"weights ({swap * 0.387:.1f} GB) wait in pinned system RAM and stream in as "
+                                     f"each runs (an estimate{counted}; musubi-tuner swaps up to 48)"
+                                     + (ESTIMATED_NOTE if recorded else ""))
     r["resolutions"] = ([1.0], "1 MP: about H3's own 768 x 1344 canvas, and 1024 video tokens a step")
     if not cfg.finetune and cfg.network_type == "lora":
         rank = 32 if goal == "style" else 16
