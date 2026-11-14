@@ -28,6 +28,20 @@ app = QApplication.instance() or QApplication([])
 theme.apply(app)
 
 
+def tearDownModule():
+    """Free every window while the QApplication is still there. A dialog's lambda slots keep it alive where
+    Python's garbage collector can't see, so it was freed only as Python exited, after the application, and
+    the process crashed then (exit code 0xC0000005 although every test had passed). The app itself deletes
+    its dialogs after use (deleteLater)."""
+    import shiboken6
+    from PySide6.QtCore import QCoreApplication, QEvent
+
+    for w in QApplication.topLevelWidgets():
+        if shiboken6.isValid(w):
+            shiboken6.delete(w)
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+
+
 def _wait(cond, timeout=20.0):
     end = time.time() + timeout
     while not cond():
@@ -54,6 +68,69 @@ class FoundTests(unittest.TestCase):
         f = Found.of(m, [0.8], (3000, 2000))
         np.testing.assert_array_equal(f.mask, m)
         self.assertLess(f.bits.nbytes, m.size // 7)
+
+
+class CompareViewTests(unittest.TestCase):
+    def _event(self, kind, pos, buttons=None):
+        from PySide6.QtCore import QEvent, QPointF, Qt
+        from PySide6.QtGui import QMouseEvent
+
+        kinds = {"press": QEvent.MouseButtonPress, "move": QEvent.MouseMove, "release": QEvent.MouseButtonRelease}
+        held = Qt.NoButton if kind == "release" else Qt.LeftButton
+        return QMouseEvent(kinds[kind], QPointF(pos), QPointF(pos), Qt.LeftButton, held, Qt.NoModifier)
+
+    def test_a_stroke_keeps_its_place(self):
+        """The full picture replacing the thumbnail mid-stroke put the first points in the top-left corner,
+        and in Side by side a stroke dragged on into the other pane jumped across the picture."""
+        from PySide6.QtCore import QPointF
+        from PySide6.QtGui import QPixmap
+
+        from rulz.ui.compare_view import PAINT, SIDE, CompareView
+
+        v = CompareView()
+        v.resize(820, 400)
+        v.set_mode(SIDE)
+        v.set_images(QPixmap(200, 150), None)  # the thumbnail
+        v.set_tool(PAINT)
+        strokes = []
+        v.stroked.connect(strokes.append)
+        left = v._panes()[0]
+        t = v._target(left)
+
+        def at(fx, fy):
+            return QPointF(t.left() + fx * t.width(), t.top() + fy * t.height())
+
+        v.mousePressEvent(self._event("press", at(0.5, 0.5)))
+        v.mouseMoveEvent(self._event("move", at(0.6, 0.5)))
+        v.set_images(QPixmap(4000, 3000), None)  # the full picture arrives: same shape, same place on screen
+        v.mouseMoveEvent(self._event("move", at(0.7, 0.5)))
+        past = QPointF(left.right() + 30, at(0.7, 0.5).y())  # on into the right-hand pane
+        v.mouseMoveEvent(self._event("move", past))
+        v.mouseReleaseEvent(self._event("release", past))
+        pts = strokes[0].points
+        self.assertAlmostEqual(pts[0][0], 0.5, delta=0.01)
+        self.assertEqual([round(x, 2) for x, _ in pts], [0.5, 0.6, 0.7, 1.0])  # 1.0: clamped at the edge
+        self.assertTrue(all(abs(y - 0.5) < 0.01 for _, y in pts))
+
+    def test_overlay_is_redrawn_only_when_the_strokes_change(self):
+        from dataclasses import replace
+
+        from PySide6.QtGui import QPixmap
+
+        from rulz.shadows import ShadowEdit, Stroke
+        from rulz.ui.compare_view import CompareView
+
+        v = CompareView()
+        v.set_images(QPixmap(400, 300), None)
+        edit = ShadowEdit((Stroke(((0.3, 0.3), (0.6, 0.6)), 0.05),))
+        v.set_shadow(edit)
+        first = v._overlay
+        v.set_shadow(replace(edit, strength=30, blend=80))  # Shadow lift / Edge blend steps
+        self.assertIs(v._overlay, first)
+        v.set_shadow(replace(edit, strokes=edit.strokes + (Stroke(((0.1, 0.1),), 0.02),)))
+        self.assertIsNot(v._overlay, first)
+        v.set_images(QPixmap(200, 150), None)  # another picture size: redrawn for it
+        self.assertEqual((v._overlay.width(), v._overlay.height()), (200, 150))
 
 
 class WindowTests(unittest.TestCase):
@@ -93,6 +170,68 @@ class WindowTests(unittest.TestCase):
         self.assertFalse(gone & set(w._cards))
         self.assertEqual([w.grid.item(r).data(ITEM_ROLE) for r in range(w.grid.count())], w.items)
         w._on_global("color", 0)
+
+    def test_cards_on_screen_render_first_every_time(self):
+        """While a global slider is dragged, cards already rendered once went to the back of the queue."""
+        from PySide6.QtCore import QRect
+
+        w = self.win
+        w._render_timer.stop()
+        shown = {id(w.items[4]), id(w.items[5])}
+        inside, outside = QRect(0, 0, 10, 10), QRect(-500, -500, 10, 10)
+        w.grid.visualItemRect = lambda li: inside if id(li.data(ITEM_ROLE)) in shown else outside
+        try:
+            w._queue_render(w.items)  # the first slider step
+            self.assertEqual(list(w._render_queue)[:2], [w.items[4], w.items[5]])
+            for _ in range(2):  # the two on screen are rendered...
+                w._queued.discard(id(w._render_queue.popleft()))
+            w._queue_render(w.items)  # ...and the next step puts them first again, not last
+            self.assertEqual(list(w._render_queue), [w.items[i] for i in (4, 5, 0, 1, 2, 3)])
+            self.assertEqual(w._queued, {id(it) for it in w.items})
+            w._render_queue.clear()
+            w._queued.clear()
+            w._on_global("detail", 30)  # thumbnails don't show it: nothing to render
+            self.assertFalse(w._render_queue)
+        finally:
+            del w.grid.visualItemRect
+            w._on_global("detail", 0)
+
+    def test_arrow_keys_nudge_a_slider_that_has_the_keyboard(self):
+        w = self.win
+        w._open(0)
+        ed = w.editor
+        moved = []
+        ed.navigate.connect(moved.append)
+        slider = ed.rows["color"].slider
+        w.activateWindow()
+        slider.setFocus()
+        app.processEvents()
+        if QApplication.focusWidget() is not slider:
+            self.skipTest("this platform gives no keyboard focus offscreen")
+        ed._arrow(1)
+        self.assertEqual((slider.value(), moved), (1, []))
+        self.assertEqual(ed.item.custom.get("color"), 1)
+        ed.view.setFocus()
+        app.processEvents()
+        ed._arrow(1)
+        self.assertEqual(moved, [1])
+        w._show_library()
+
+    def test_removed_pictures_are_not_loaded(self):
+        from rulz.ui.workers import ImageItem, ThumbLoad
+
+        got = []
+
+        class Emitter:
+            class done:
+                @staticmethod
+                def emit(*a):
+                    got.append(a)
+
+        it = ImageItem(self.paths[0])
+        it.removed = True
+        ThumbLoad(it, Emitter).run()
+        self.assertEqual(got, [])
 
     def test_repeats_are_skipped_and_removed_pictures_can_come_back(self):
         w = self.win
@@ -208,6 +347,99 @@ class AutoCropTests(unittest.TestCase):
         self.assertEqual(self.calls["release"], 1)
         self.assertEqual(len(dlg._pix), 0)
 
+    def test_changing_the_words_stops_the_search(self):
+        gate, calls = threading.Event(), []
+
+        def slow(img, prompt, *_args):
+            calls.append(prompt)
+            gate.wait(10)
+            m = np.zeros((300, 400), bool)
+            m[100:200, 150:250] = True
+            return m, [0.9]
+
+        ai_mask.find = slow
+        dlg = AutoCropDialog(self.items, {"color": 0, "jpeg": 0, "detail": 0}, "balanced")
+        dlg.show()
+        dlg.prompt.setText("thing")
+        dlg._preview()
+        _wait(lambda: calls)
+        self.assertFalse(dlg.preview_btn.isEnabled())
+        dlg.prompt.setText("other thing")  # the search for "thing" stops after the picture it's on
+        gate.set()
+        _wait(lambda: dlg._finder is None, timeout=5)
+        self.assertEqual(calls, ["thing"])
+        self.assertTrue(dlg.preview_btn.isEnabled())
+        dlg.prompt.setText("thing")  # back to the old words: what was found for them is still there
+        self.assertEqual(len(dlg._found), 1)
+        dlg.reject()
+
+    def test_closing_does_not_wait_for_a_search(self):
+        """SAM can take half a minute to load; closing the screen meanwhile hung the window."""
+        gate, calls = threading.Event(), []
+
+        def slow(img, prompt, *_args):
+            calls.append(prompt)
+            gate.wait(10)
+            return np.zeros((300, 400), bool), []
+
+        ai_mask.find = slow
+        dlg = AutoCropDialog(self.items, {"color": 0, "jpeg": 0, "detail": 0}, "balanced")
+        dlg.show()
+        dlg.prompt.setText("thing")
+        dlg._preview()
+        _wait(lambda: calls)
+        finder = dlg._finder
+        t0 = time.perf_counter()
+        dlg.reject()
+        self.assertLess(time.perf_counter() - t0, 2)
+        self.assertTrue(finder.isRunning())
+        self.assertEqual(self.calls["release"], 1)
+        gate.set()
+        auto_crop.finish_searches()  # what closing the app does
+        self.assertFalse(finder.isRunning())
+        self.assertEqual(calls, ["thing"])  # stopped after the picture it was on
+        self.assertEqual(self.calls["release"], 2)  # and let SAM go once it ended
+        self.assertEqual(dlg._found, {})
+
+    def test_a_search_left_running_spares_the_next_screens_sam(self):
+        """Close Auto crop mid-search and open it again: the old search ending mustn't drop the SAM the new
+        screen has loaded."""
+        gate, calls = threading.Event(), []
+
+        def slow(img, prompt, *_args):
+            calls.append(prompt)
+            gate.wait(10)
+            return np.zeros((300, 400), bool), []
+
+        ai_mask.find = slow
+        first = AutoCropDialog(self.items, {"color": 0, "jpeg": 0, "detail": 0}, "balanced")
+        first.prompt.setText("thing")
+        first._preview()
+        _wait(lambda: calls)
+        finder = first._finder
+        first.reject()  # 1 release: the closing screen's own
+        second = AutoCropDialog(self.items, {"color": 0, "jpeg": 0, "detail": 0}, "balanced")
+        gate.set()
+        _wait(lambda: not finder.isRunning())
+        self.assertEqual(self.calls["release"], 1)  # not again while the second screen is open
+        second.reject()
+        self.assertEqual(self.calls["release"], 2)
+
+    def test_folders_are_searched_with_subfolders(self):
+        from rulz.ui.main_window import _images_in
+
+        root = Path(self.dir.name) / "scan"
+        (root / "sub" / "deeper").mkdir(parents=True)
+        for rel in ("a.jpg", "sub/b.PNG", "sub/deeper/c.webp", "notes.txt", "sub/d.tif.bak"):
+            (root / rel).write_bytes(b"")
+        got = sorted(p.relative_to(root).as_posix() for p in _images_in(root))
+        self.assertEqual(got, ["a.jpg", "sub/b.PNG", "sub/deeper/c.webp"])
+        try:
+            os.symlink(root / "gone.jpg", root / "broken.jpg")  # a link to nothing isn't a picture
+        except OSError:
+            return  # needs Developer Mode or admin rights on Windows
+        self.assertNotIn("broken.jpg", [p.name for p in _images_in(root)])
+
     def test_starting_note_shows_until_the_first_result(self):
         dlg = AutoCropDialog(self.items[:2], {"color": 0, "jpeg": 0, "detail": 0}, "balanced")
         dlg.show()
@@ -258,8 +490,78 @@ class SaveTests(unittest.TestCase):
         self.assertEqual(len({d.name.lower() for d in dests}), len(dests))
         self.assertEqual([d.name for d in dests], ["a_prepared.jpg", "b_prepared.jpg", "a_prepared_2.jpg",
                                                    "A_prepared_prepared.jpg"])
+        # Auto crop of only Y/a.jpg into X: X/a.jpg is in the list too, just not selected
+        crop = output_paths([ImageItem(srcs[2])], x, srcs)
+        self.assertEqual([d.name for d in crop], ["a_prepared.jpg"])
+        self.assertEqual([d.name for d in output_paths([ImageItem(srcs[2])], x)], ["a.jpg"])  # nothing else listed
+
+    def test_links_count_as_the_file_they_point_to(self):
+        """Folders are resolved once, not each file; a file that is a link must still be taken for its target."""
+        from rulz.ui.workers import ImageItem, output_paths
+
+        x, y, z = self.tmp / "X", self.tmp / "Y", self.tmp / "Z"
+        for d in (x, y, z):
+            d.mkdir()
+        target = y / "photo.jpg"
+        target.write_bytes(b"")
+        try:
+            os.symlink(target, x / "photo.jpg")
+        except OSError:  # Windows needs Developer Mode or admin rights for this (the CI runner has them)
+            self.skipTest("this account can't make symbolic links")
+        # the list holds a link to Y/photo.jpg: saving into Y must not write over what it points to
+        self.assertEqual([d.name for d in output_paths([ImageItem(x / "photo.jpg")], y)], ["photo_prepared.jpg"])
+        # an existing name in the output folder that links to a listed picture isn't written through either
+        src = z / "b.jpg"
+        src.write_bytes(b"")
+        os.symlink(src, y / "b.jpg")
+        self.assertEqual([d.name for d in output_paths([ImageItem(src)], y)], ["b_prepared.jpg"])
+
+    def test_auto_crop_never_writes_over_an_unselected_picture(self):
+        x, y = self.tmp / "X", self.tmp / "Y"
+        x.mkdir()
+        y.mkdir()
+        listed = [x / "a.jpg", y / "a.jpg"]
+        for p in listed:
+            p.write_bytes(b"")
+        from rulz.ui.workers import ImageItem
+
+        items = [ImageItem(p) for p in listed]
+        got = {}
+
+        class Signal:
+            def connect(self, _fn):
+                pass
+
+        class FakeCropAll:  # records what would be written instead of writing it
+            progress = finished_all = Signal()
+
+            def __init__(self, jobs, *_args):
+                got["dests"] = [d for _, d, _, _ in jobs]
+
+            def start(self):
+                pass
+
+            def cancel(self):
+                pass
+
+            def isRunning(self):
+                return False
+
+        saved = auto_crop.CropAll, auto_crop.QFileDialog.getExistingDirectory, auto_crop.QMessageBox.question
+        auto_crop.CropAll = FakeCropAll
+        auto_crop.QFileDialog.getExistingDirectory = staticmethod(lambda *a, **k: str(x))
+        auto_crop.QMessageBox.question = staticmethod(lambda *a, **k: auto_crop.QMessageBox.No)
+        try:
+            dlg = AutoCropDialog(items[1:], {"color": 0, "jpeg": 0, "detail": 0}, "balanced", library=items)
+            dlg.prompt.setText("thing")
+            dlg._crop()  # only Y/a.jpg is selected; the crop goes into X, where X/a.jpg is
+            self.assertEqual(got.get("dests"), [x / "a_prepared.jpg"])
+            dlg.reject()
+        finally:
+            auto_crop.CropAll, auto_crop.QFileDialog.getExistingDirectory, auto_crop.QMessageBox.question = saved
 
     def test_unchanged_pictures_are_copied_not_re_encoded(self):
+        from rulz.ui import workers
         from rulz.ui.workers import SaveAll
 
         src = _pictures(self.tmp, 1)[0]
@@ -279,7 +581,9 @@ class SaveTests(unittest.TestCase):
         self.assertEqual(done["saved"], 2)
         # reported, not copied, in list order although two pictures are saved at a time
         self.assertEqual([n for n, _ in done["errors"]], ["empty2.jpg", "empty.jpg"])
-        self.assertEqual(SaveAll(jobs, "best").workers(), 1)
+        # Best quality's GPU model takes one picture at a time, but only pictures with JPEG removal use it
+        self.assertEqual(SaveAll(jobs, "best").workers(), workers.SAVE_WORKERS)
+        self.assertEqual(SaveAll(jobs + [(src, out / "j.jpg", {**zero, "jpeg": 30}, None)], "best").workers(), 1)
         self.assertFalse((out / "empty.jpg").exists())
         self.assertEqual((out / "same.jpg").read_bytes(), src.read_bytes())
         self.assertNotEqual((out / "cleaned.jpg").read_bytes(), src.read_bytes())

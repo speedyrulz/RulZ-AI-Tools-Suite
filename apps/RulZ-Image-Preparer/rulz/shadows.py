@@ -24,6 +24,7 @@ MASK_MAX_SIDE = 2048  # the painted area is drawn at this size or smaller, then 
 FIELD_MAX_SIDE = 256  # the surrounding light level is filled in at this size
 MAX_LIFT = 2.5  # natural log: at most ~12x brighter
 GAMMA = 2.2
+LUMA = np.array([0.0722, 0.7152, 0.2126], np.float32)  # B, G, R weights of luminance
 
 
 @dataclass(frozen=True)
@@ -85,7 +86,7 @@ def render_mask(edit: ShadowEdit, h: int, w: int, feather: bool = True) -> np.nd
             m = cv2.GaussianBlur(m, (0, 0), sigma)
     if (sh, sw) != (h, w):
         m = cv2.resize(m, (w, h), interpolation=cv2.INTER_LINEAR)
-    return np.clip(m, 0.0, 1.0)
+    return np.clip(m, 0.0, 1.0, out=m)  # m is always a new array here: no full-size copy
 
 
 def _fill(values: np.ndarray, weights: np.ndarray) -> np.ndarray:
@@ -153,8 +154,47 @@ def _pasted(part: np.ndarray, box: tuple[slice, slice], h: int, w: int) -> np.nd
     return full
 
 
-def lift_shadows(bgr: np.ndarray, edit: ShadowEdit) -> np.ndarray:
+def _field_size(h: int, w: int) -> tuple[int, int]:
+    """(width, height) the surrounding light level is filled in at."""
+    f = min(1.0, FIELD_MAX_SIDE / max(h, w))
+    return max(1, round(w * f)), max(1, round(h * f))
+
+
+@dataclass(frozen=True, eq=False)
+class Lighting:
+    """What lift_shadows measures on the picture alone, whatever is painted: the slow part of a lift. Made by
+    measure() and passed back for each brush stroke on the same picture. One full-size channel (4 bytes a
+    pixel), the rest at the field size; read-only, as it's shared between strokes."""
+
+    light: np.ndarray  # log of the lighting, full size
+    light_s: np.ndarray  # it at the field size
+    tint: np.ndarray  # each channel's log ratio to luminance, at the field size
+
+
+def measure(bgr: np.ndarray) -> Lighting:
+    """The picture's Lighting for lift_shadows(bgr, ..., lighting); bgr as there."""
+    return _measure(cv2.pow(np.clip(bgr, 0.0, 1.0).astype(np.float32, copy=False), GAMMA))
+
+
+def _measure(lin: np.ndarray) -> Lighting:
+    """lin: the clipped picture in linear light."""
+    h, w = lin.shape[:2]
+    y = lin @ LUMA
+    light = _lighting(np.log(y + 1e-4))
+    fs = _field_size(h, w)
+    lin_s = cv2.resize(lin, fs, interpolation=cv2.INTER_AREA)
+    y_s = cv2.resize(y, fs, interpolation=cv2.INTER_AREA)
+    tint = np.log(lin_s + 1e-4) - np.log(y_s + 1e-4)[..., None]
+    lighting = Lighting(light, cv2.resize(light, fs, interpolation=cv2.INTER_AREA), tint)
+    for a in (lighting.light, lighting.light_s, lighting.tint):
+        a.flags.writeable = False  # a change would carry over into the next stroke's result
+    return lighting
+
+
+def lift_shadows(bgr: np.ndarray, edit: ShadowEdit, lighting: Lighting | None = None) -> np.ndarray:
     """bgr: float32 HxWx3 in 0..1 (gamma-encoded). Returns the picture with the painted shadows lifted.
+    lighting: measure(bgr), kept from an earlier call for the same picture, to skip measuring it again; the
+    result is the same either way.
 
     The lighting and the light level around the painting are measured on the whole picture, but every
     full-size step after that is worked out only where it can change something: inside the painted area
@@ -163,6 +203,8 @@ def lift_shadows(bgr: np.ndarray, edit: ShadowEdit) -> np.ndarray:
     if not edit.active:
         return bgr
     h, w = bgr.shape[:2]
+    if lighting is not None and lighting.light.shape != (h, w):
+        raise ValueError("the lighting was measured on a picture of another size")
     s = edit.strength / 100.0
     m = render_mask(edit, h, w)
     box = _extent(m)
@@ -170,15 +212,16 @@ def lift_shadows(bgr: np.ndarray, edit: ShadowEdit) -> np.ndarray:
         return bgr
 
     result = np.clip(bgr, 0.0, 1.0).astype(np.float32, copy=False)  # the painted box is replaced at the end
-    lin = cv2.pow(result, GAMMA)
-    y = lin @ np.array([0.0722, 0.7152, 0.2126], np.float32)
-    log_y = np.log(y + 1e-4)
-    light = _lighting(log_y)
+    if lighting is None:
+        lin = cv2.pow(result, GAMMA)
+        lighting = _measure(lin)
+        lin = lin[box]
+    else:
+        lin = cv2.pow(result[box], GAMMA)  # pixel by pixel: the same as the whole picture's, cut to the box
+    light, light_s, tint = lighting.light, lighting.light_s, lighting.tint
 
     # The light level around the painted area, filled in across it.
-    f = min(1.0, FIELD_MAX_SIDE / max(h, w))
-    fs = (max(1, round(w * f)), max(1, round(h * f)))
-    light_s = cv2.resize(light, fs, interpolation=cv2.INTER_AREA)
+    fs = _field_size(h, w)
     m_s = cv2.resize(m, fs, interpolation=cv2.INTER_AREA)
     outside = (m_s < 0.02).astype(np.float32)
     if outside.sum() < 1:  # painted everywhere: lift toward the brighter parts of the picture
@@ -218,15 +261,12 @@ def lift_shadows(bgr: np.ndarray, edit: ShadowEdit) -> np.ndarray:
     not_lit = cv2.resize(np.clip((part_s - 0.1) / 0.25, 0.0, 1.0), (w, h), interpolation=cv2.INTER_LINEAR)[box]
     share = np.maximum(part_r[inner], deep * not_lit)
     lift = depth * share * (s * mb)
-    out = lin[box] * np.exp(lift)[..., None]
+    out = lin * np.exp(lift)[..., None]
 
     # Match the shadow's tint (often blue from the sky) to the surroundings. It's measured in a band on
     # each side of the edge (inside the shadow, and outside the painting), where the surface is usually
     # the same material, with medians so a brightly
     # colored object in the shadow doesn't skew it; then applied in proportion to each pixel's lift.
-    lin_s = cv2.resize(lin, fs, interpolation=cv2.INTER_AREA)
-    y_s = cv2.resize(y, fs, interpolation=cv2.INTER_AREA)
-    tint = np.log(lin_s + 1e-4) - np.log(y_s + 1e-4)[..., None]
     lift_s = cv2.resize(_pasted(lift, box, h, w), fs, interpolation=cv2.INTER_AREA)
     k = np.ones((2 * max(2, round(max(fs) * 0.06)) + 1,) * 2, np.uint8)
     painted = (m_s > 0.02).astype(np.uint8)
@@ -235,7 +275,7 @@ def lift_shadows(bgr: np.ndarray, edit: ShadowEdit) -> np.ndarray:
     shaded = (shaded > 0) & (cv2.erode(shaded, k) == 0)  # the shadow's inner edge band
     if shaded.sum() >= 8 and ring.sum() >= 8:
         cast = np.median(tint[shaded], axis=0) - np.median(tint[ring], axis=0)
-        cast = np.clip(cast - cast @ np.array([0.0722, 0.7152, 0.2126], np.float32), -0.5, 0.5)
+        cast = np.clip(cast - cast @ LUMA, -0.5, 0.5)
         amount = np.clip(lift / max(s * depth, 1e-3), 0.0, 1.0)
         out *= np.exp(-cast[None, None, :] * amount[..., None])
 

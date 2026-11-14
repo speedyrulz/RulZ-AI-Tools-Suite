@@ -6,8 +6,8 @@ from dataclasses import replace
 from PySide6.QtCore import QThreadPool, QTimer, Qt, Signal
 from PySide6.QtGui import QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QButtonGroup, QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton, QSlider, QVBoxLayout,
-    QWidget,
+    QAbstractSlider, QApplication, QButtonGroup, QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton,
+    QSlider, QVBoxLayout, QWidget,
 )
 
 from .. import config, imageio
@@ -164,8 +164,8 @@ class EditorPage(QWidget):
 
         for key, fn in (
             (Qt.Key_Escape, lambda: self._set_tool(None) if self.view.tool else self.back.emit()),
-            (Qt.Key_Left, lambda: self.navigate.emit(-1)),
-            (Qt.Key_Right, lambda: self.navigate.emit(1)), (Qt.Key_V, self._toggle_mode),
+            (Qt.Key_Left, lambda: self._arrow(-1)),
+            (Qt.Key_Right, lambda: self._arrow(1)), (Qt.Key_V, self._toggle_mode),
             (Qt.Key_B, lambda: self._set_tool(None if self.view.tool == PAINT else PAINT)),
             (Qt.Key_E, lambda: self._set_tool(None if self.view.tool == ERASE else ERASE)),
             (Qt.Key_BracketLeft, lambda: self.brush.setValue(self.brush.value() - 5)),
@@ -233,6 +233,15 @@ class EditorPage(QWidget):
             sliders.addWidget(r, 1)
         v.addLayout(sliders)
         return box
+
+    def _arrow(self, step: int):
+        """Left/Right: the next or previous picture, but a slider just dragged (it keeps the keyboard) is
+        nudged instead, as sliders usually are; before, the key opened another picture."""
+        w = QApplication.focusWidget()
+        if isinstance(w, QAbstractSlider):
+            w.triggerAction(QAbstractSlider.SliderSingleStepAdd if step > 0 else QAbstractSlider.SliderSingleStepSub)
+        else:
+            self.navigate.emit(step)
 
     # ---- shadow areas ------------------------------------------------------
     def _set_tool(self, tool: str | None):
@@ -409,8 +418,8 @@ class EditorPage(QWidget):
             self.view.set_busy(False)
             self.message.setText(f"Couldn't open: {result}")
             return
-        self._full = result
-        self.view.set_images(_pixmap(result), None)
+        self._full, image = result
+        self.view.set_images(QPixmap.fromImage(image), None)
         self.view.set_busy(True)
         self._request()
 
@@ -424,10 +433,10 @@ class EditorPage(QWidget):
                 self.message.setText(f"Couldn't process: {result}")
                 self._shown_key = wanted  # don't retry the same failing settings in a loop
             else:
-                result, self._cache = result
+                image, self._cache = result
                 self.message.setText("")
                 self._shown_key = wanted
-                self.view.set_processed(_pixmap(result))
+                self.view.set_processed(QPixmap.fromImage(image))
         self._request()
         if self.item is not None and self._shown_key == self._wanted():
             self.view.set_busy(False)

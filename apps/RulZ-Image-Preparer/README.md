@@ -48,9 +48,10 @@ Crops pictures to something you describe, such as `face` or `dog`, found by AI. 
 2. **Preview** finds it with [SAM 3.1](https://ai.meta.com/sam3/) (Meta's Segment Anything 3.1) and
    shows the found area in red and the crop as a dashed box. Use the strip below to check each picture.
    Crop settings update the box straight away; changes to the words or the "Finding it" settings need
-   another Preview.
+   another Preview (a Preview still running stops after the picture it's on, so you can start the new one).
 3. **Crop…** asks for a folder, then crops every selected picture and saves it there with the same name as
-   **Save all** would use (`_prepared` is added rather than writing over a picture in the list), asking first
+   **Save all** would use (`_prepared` is added rather than writing over any picture in the list, selected or
+   not), asking first
    if files of those names already exist. Pictures where nothing was found are skipped and listed.
 
 | Setting | What it does |
@@ -78,15 +79,20 @@ NVIDIA GPU (about 2 GB of video memory).
 - Click a photo to compare original vs. processed:
   - **Side by side** or **Slider** (drag the divider). Press `V` to switch.
   - Scroll to zoom, drag to pan, double-click for 100% / fit. Both sides stay in sync.
-  - `←` / `→` move between photos, `Esc` goes back.
+  - `←` / `→` move between photos (right after you drag a slider, they nudge that slider instead; click the
+    picture to go back to moving between photos), `Esc` goes back.
 - Thumbnails only show color noise removal and painted shadow areas — JPEG blocks and fine detail are too small to see at
   that size. Open a photo to judge those.
 - **Save all…** writes every image with its own settings to a folder you pick. File names and
   formats are kept; a file is never written over any picture in the list (`_prepared` is added instead).
   Pictures with nothing to change are copied as they are, so they lose nothing to re-compression.
+  JPEGs are saved at quality 97 with full color resolution (4:4:4), so the color edges the clean-up
+  restores aren't blurred again. A photo's color profile (Display P3, Adobe RGB…) is kept in JPEG, PNG
+  and WebP files, so it looks the same in other apps; other details (camera, date, location) are only
+  kept in pictures copied as they are.
 
 Supported: JPG, PNG, WebP, BMP, TIFF (8- and 16-bit, transparency kept for PNG/WebP/TIFF; a gray TIFF
-with transparency loses it when it's cleaned up).
+with transparency loses it when it's cleaned up, and a cleaned-up TIFF loses its color profile).
 
 ## Running
 

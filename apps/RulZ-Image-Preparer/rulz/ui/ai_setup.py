@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import importlib
 import importlib.metadata
-import importlib.util
 import sys
 import urllib.request
 from pathlib import Path
@@ -264,7 +263,7 @@ class CropSetupDialog(_SetupDialog):
 
     def requirements(self):
         runs = []
-        if not (ai_mask.torch_installed() and importlib.util.find_spec("torchvision")):
+        if not (ai_mask.torch_installed() and ai_jpeg.package_installed("torchvision")):
             runs.append(["-r", str(config.resource_path("requirements-ai.txt")), *_torch_pin(), "torchvision"])
         runs.append(["-r", str(config.resource_path("requirements-crop.txt"))])
         return runs

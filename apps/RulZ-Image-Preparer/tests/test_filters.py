@@ -4,7 +4,7 @@ import unittest
 import cv2
 import numpy as np
 
-from rulz import filters
+from rulz import filters, shadows
 from rulz.filters import BALANCED, process, process_cached, process_crop
 from rulz.shadows import ShadowEdit, Stroke
 
@@ -18,6 +18,14 @@ def _jpeg_picture(h=520, w=700, quality=25):
     img = np.clip(img / img.max() * 255, 0, 255).astype(np.uint8)
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
     return cv2.imdecode(buf, cv2.IMREAD_COLOR)
+
+
+def _shadowed(h=240, w=320):
+    """A JPEG picture with a dark, soft-edged shadow in the middle."""
+    yy, xx = np.mgrid[:h, :w]
+    e = ((xx - w / 2) / (w / 4)) ** 2 + ((yy - h / 2) / (h / 4)) ** 2
+    soft = cv2.GaussianBlur((e < 1).astype(np.float32), (0, 0), 3)
+    return np.round(_jpeg_picture(h, w, 60) * (1 - 0.6 * soft)[..., None]).astype(np.uint8)
 
 
 BOXES = [(150, 120, 431, 377), (0, 0, 200, 150), (500, 333, 700, 520), (3, 7, 699, 515)]
@@ -114,6 +122,50 @@ class ProcessCachedTests(unittest.TestCase):
         self.assertIs(cleaned[2], cleaned[4])
         out, cache = process_cached(img, {**settings, "jpeg": 60}, BALANCED, two, cache)
         self.assertIsNot(cache[2], cleaned[4])  # JPEG changed: done again
+
+    def test_brush_strokes_reuse_the_lighting(self):
+        """The shadow lift's measurement of the picture is kept between strokes, and made again for a new JPEG step."""
+        img = _shadowed()
+        one = ShadowEdit((Stroke(((0.3, 0.5), (0.7, 0.5)), 0.12),))
+        two = ShadowEdit(one.strokes + (Stroke(((0.5, 0.35), (0.5, 0.65)), 0.05, True),))
+        three = ShadowEdit(two.strokes + (Stroke(((0.45, 0.45),), 0.1),), 70, 80)
+        base = {"color": 20, "jpeg": 50, "detail": 30}
+        j60, j0 = {**base, "jpeg": 60}, {**base, "jpeg": 0}
+        steps = ((base, None), (base, one), (base, two), ({**base, "detail": 60}, two),
+                 (base, ShadowEdit(two.strokes, 40)), (base, three), (base, None), (base, three),  # Clear, Undo
+                 (j60, three), (j60, two),  # JPEG changed
+                 (j0, two), (j0, one))  # no JPEG step: the picture itself goes into the lift
+        wanted = [process(img, settings, BALANCED, shadow=sh) for settings, sh in steps]
+        painted = (slice(110, 130), slice(100, 140))
+        self.assertGreater(wanted[1][painted].mean(), 1.3 * wanted[0][painted].mean())  # it lifted the shadow
+        measured = []
+        saved = shadows.measure
+        shadows.measure = lambda bgr: measured.append(saved(bgr)) or measured[-1]
+        try:
+            cache, kept = None, []
+            for (settings, sh), want in zip(steps, wanted):
+                out, cache = process_cached(img, settings, BALANCED, sh, cache)
+                np.testing.assert_array_equal(out, want)
+                kept.append(cache[3])
+        finally:
+            shadows.measure = saved
+        self.assertEqual(len(measured), 3)  # once for each JPEG setting, and only once a lift needs it
+        self.assertIsNone(kept[0])
+        for i, k in enumerate(kept[1:], 1):
+            self.assertIs(k, measured[0 if i < 8 else 1 if i < 10 else 2], i)
+
+    def test_gray_picture_reuses_the_lighting(self):
+        img = np.round(cv2.cvtColor(_shadowed(), cv2.COLOR_BGR2GRAY).astype(np.float32) * 257).astype(np.uint16)
+        one = ShadowEdit((Stroke(((0.3, 0.5), (0.7, 0.5)), 0.12),))
+        two = ShadowEdit(one.strokes + (Stroke(((0.4, 0.4),), 0.1),), 90)
+        cache, kept = None, []
+        for settings, sh in (({"jpeg": 0}, one), ({"jpeg": 0, "detail": 40}, two), ({"jpeg": 40}, two)):
+            out, cache = process_cached(img, settings, BALANCED, sh, cache)
+            np.testing.assert_array_equal(out, process(img, settings, BALANCED, shadow=sh))
+            self.assertEqual(out.shape, img.shape)
+            kept.append(cache[3])
+        self.assertIs(kept[0], kept[1])
+        self.assertIsNot(kept[1], kept[2])
 
     def test_noop(self):
         img = _jpeg_picture(64, 64)

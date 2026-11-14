@@ -43,7 +43,11 @@ class CompareView(QWidget):
         self.show_areas = False
         self._edit: ShadowEdit | None = None
         self._overlay: QPixmap | None = None
-        self._stroke: list[QPointF] = []  # picture coordinates (pixels of the shown pixmap)
+        self._overlay_key = None  # (strokes, picture size) the overlay was drawn for
+        # Fractions of the picture's width and height, not pixels: the full-size picture can replace the
+        # thumbnail in the middle of a stroke, which put the points painted before it in the top-left corner.
+        self._stroke: list[QPointF] = []
+        self._stroke_pane = 0  # the pane the stroke started in, used for all of it
         self._mouse: QPointF | None = None
 
     # ---- content ---------------------------------------------------------
@@ -92,8 +96,15 @@ class CompareView(QWidget):
         self.update()
 
     def set_shadow(self, edit: ShadowEdit | None):
-        """The painted areas to show; their tint is redrawn at a modest size and scaled up."""
+        """The painted areas to show; their tint is redrawn at a modest size and scaled up (only when the
+        strokes or the picture size changed, not for each Shadow lift or Edge blend step)."""
         self._edit = edit
+        size = None if self._orig is None else (self._orig.width(), self._orig.height())
+        key = (edit.strokes if edit is not None else (), size)
+        if key == self._overlay_key:
+            self.update()
+            return
+        self._overlay_key = key
         self._overlay = None
         if edit is not None and edit.strokes and self._orig is not None:
             w, h = self._orig.width(), self._orig.height()
@@ -107,10 +118,16 @@ class CompareView(QWidget):
             self._overlay = QPixmap.fromImage(q.copy())
         self.update()
 
+    def _stroke_target(self) -> QRectF:
+        """Where the picture lands in the pane the stroke started in. In Side by side, a stroke dragged on
+        into the other pane jumped across the picture when each point was measured in its own pane."""
+        panes = self._panes()
+        return self._target(panes[min(self._stroke_pane, len(panes) - 1)])
+
     def _to_picture(self, pos: QPointF) -> QPointF:
-        t = self._target(self._pane_at(pos))
-        s = self.scale()
-        return QPointF((pos.x() - t.left()) / s, (pos.y() - t.top()) / s)
+        """pos as fractions of the picture's width and height."""
+        t = self._stroke_target()
+        return QPointF((pos.x() - t.left()) / t.width(), (pos.y() - t.top()) / t.height())
 
     def _brush_px(self) -> float:
         """Brush radius in picture pixels."""
@@ -118,8 +135,7 @@ class CompareView(QWidget):
 
     def _finish_stroke(self):
         if self._stroke and self._orig is not None:
-            w, h = self._orig.width(), self._orig.height()
-            pts = tuple((min(1.0, max(0.0, p.x() / w)), min(1.0, max(0.0, p.y() / h))) for p in self._stroke)
+            pts = tuple((min(1.0, max(0.0, p.x())), min(1.0, max(0.0, p.y()))) for p in self._stroke)
             self.stroked.emit(Stroke(pts, self.brush, self.tool == ERASE))
         self._stroke = []
 
@@ -234,7 +250,8 @@ class CompareView(QWidget):
             p.drawPixmap(target, self._overlay, QRectF(self._overlay.rect()))
         if self._stroke:
             s = self.scale()
-            pts = [QPointF(target.left() + q.x() * s, target.top() + q.y() * s) for q in self._stroke]
+            pts = [QPointF(target.left() + q.x() * target.width(), target.top() + q.y() * target.height())
+                   for q in self._stroke]
             color = QColor(0, 0, 0, 150) if self.tool == ERASE else QColor(237, 0, 13, 110)
             p.setRenderHint(QPainter.Antialiasing, True)
             p.setPen(QPen(color, 2 * self._brush_px() * s, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
@@ -303,6 +320,7 @@ class CompareView(QWidget):
         pos = e.position()
         if e.button() == Qt.LeftButton and self.tool and self._orig is not None:
             self._drag = "paint"
+            self._stroke_pane = self._panes().index(self._pane_at(pos))
             self._stroke = [self._to_picture(pos)]
             self.update()
         elif e.button() == Qt.LeftButton and self._near_split(pos):
@@ -318,7 +336,8 @@ class CompareView(QWidget):
         if self._drag == "paint":
             q = self._to_picture(pos)
             # keep points a few screen pixels apart so long strokes stay light
-            if (q - self._stroke[-1]).manhattanLength() * self.scale() >= 3:
+            t, last = self._stroke_target(), self._stroke[-1]
+            if abs(q.x() - last.x()) * t.width() + abs(q.y() - last.y()) * t.height() >= 3:
                 self._stroke.append(q)
             self.update()
         elif self._drag == "split":

@@ -78,6 +78,7 @@ class FindAll(QThread):
         super().__init__()
         self.items, self.find = items, find
         self._cancel = False
+        self.release_after = False  # set when its screen closed without waiting for it: let SAM go at the end
 
     def cancel(self):
         self._cancel = True
@@ -87,13 +88,35 @@ class FindAll(QThread):
             if self._cancel:
                 break
             try:
-                img = imageio.load(it.path)
+                # SAM works at 1008 px and the screen shows 1600, so a big JPEG is decoded at 1/2-1/8 size:
+                # about half the time of a full decode for a 24 MP photo
+                img, size = imageio.load_sized(it.path, DISPLAY_MAX_SIDE)
+                if self._cancel:  # don't load SAM again for a screen that has closed meanwhile
+                    break
                 mask, scores = ai_mask.find(img, self.find.prompt, self.find.confidence,
                                             self.find.mask_threshold, self.find.best_only)
-                self.found.emit(it, Found.of(mask, scores, img.shape[:2]), _display(img))
+                self.found.emit(it, Found.of(mask, scores, size), _display(img))
             except Exception as e:  # noqa: BLE001 - shown for that picture
                 self.found.emit(it, e, None)
+        # Not if Auto crop was opened again meanwhile: release() isn't tied to one screen, and the new one
+        # would lose the SAM it just loaded (another load of up to half a minute).
+        if self.release_after and _open_screens == 0:
+            ai_mask.release()
         self.finished_all.emit()
+
+
+# Searches still finishing after their screen closed (AutoCropDialog.done doesn't wait for them); kept here so
+# they aren't freed while running, and waited for when the app closes.
+_finishing: list[FindAll] = []
+_open_screens = 0  # Auto crop screens open now
+
+
+def finish_searches() -> None:
+    """Stop and wait for the searches left running by closed Auto crop screens (the app is closing)."""
+    for t in _finishing:
+        t.cancel()
+        t.wait()
+    _finishing.clear()
 
 
 class _DisplayLoad(QRunnable):
@@ -132,7 +155,8 @@ class CropAll(QThread):
                 break
             self.progress.emit(i, it.path.name)
             try:
-                img = imageio.load(it.path)
+                data = imageio.read(it.path)  # once, for the picture and its color profile
+                img = imageio.decode(data, it.path.name)
                 mask = found.mask if found is not None else ai_mask.find(
                     img, self.find.prompt, self.find.confidence, self.find.mask_threshold, self.find.best_only)[0]
                 box = crop_box(mask, self.crop, *img.shape[:2])
@@ -145,7 +169,7 @@ class CropAll(QThread):
                     x0, y0, x1, y1 = box
                     out = np.ascontiguousarray(img[y0:y1, x0:x1])
                 del img
-                imageio.save(dst, out)
+                imageio.save(dst, out, imageio.icc_profile(data))
                 saved += 1
             except Exception as e:  # noqa: BLE001
                 errors.append((it.path.name, str(e)))
@@ -229,11 +253,17 @@ def _number(lo: float, hi: float, step: float, decimals: int, suffix: str = "") 
 
 
 class AutoCropDialog(QDialog):
-    def __init__(self, items: list[ImageItem], globals_: dict[str, int], mode: str, parent=None):
+    def __init__(self, items: list[ImageItem], globals_: dict[str, int], mode: str, parent=None,
+                 library: list[ImageItem] | None = None):
         super().__init__(parent)
         self.setWindowTitle(f"Auto crop - {len(items)} picture{'s' * (len(items) != 1)}")
         self.resize(1240, 820)
         self.items, self.globals, self.mode = items, globals_, mode
+        # every picture in the list, selected or not: a crop is never written over any of them
+        self.library = library if library is not None else items
+        global _open_screens
+        _open_screens += 1
+        self._open = True
         self._found: dict[int, Found | Exception] = {}  # id(item) -> result for self._found_for
         self._found_for: FindSettings | None = None
         self._pix: OrderedDict[int, QPixmap] = OrderedDict()  # id(item) -> preview, last shown last
@@ -456,6 +486,10 @@ class AutoCropDialog(QDialog):
 
     # ---- reacting to changes -----------------------------------------------------
     def _find_changed(self, *_):
+        if self._finder is not None and self._finder.find != self.find_settings():
+            # a search for the old words would hold Preview up until it had been through every picture;
+            # it stops after the current one (what it found so far is kept for those words)
+            self._finder.cancel()
         self._update_buttons()
         self._show_current()
 
@@ -599,7 +633,7 @@ class AutoCropDialog(QDialog):
             return
         config.settings().setValue(DIR_KEY, out)
         out_dir = Path(out)
-        dests = output_paths(self.items, out_dir)
+        dests = output_paths(self.items, out_dir, [it.path for it in self.library])
         existing = [d for d in dests if d.exists()]
         if existing and QMessageBox.question(
             self, "Replace files?",
@@ -635,7 +669,10 @@ class AutoCropDialog(QDialog):
             open_btn = box.addButton("Open folder", QMessageBox.ActionRole)
             box.addButton(QMessageBox.Ok)
             box.exec()
-            if box.clickedButton() is open_btn:
+            opened = box.clickedButton() is open_btn
+            box.deleteLater()
+            dlg.deleteLater()
+            if opened:
                 from PySide6.QtCore import QUrl
                 from PySide6.QtGui import QDesktopServices
 
@@ -647,13 +684,30 @@ class AutoCropDialog(QDialog):
         worker.start()
 
     def done(self, r):
-        for w in (self._finder, self._cropper):
-            if w is not None and w.isRunning():
-                w.cancel()
-                w.wait()
+        global _open_screens
+        if self._open:
+            self._open = False
+            _open_screens -= 1
+        finder, self._finder = self._finder, None
+        if finder is not None and finder.isRunning():
+            # Not waited for: SAM may still be loading (up to half a minute), and the window hung meanwhile.
+            # It stops after the picture it's on, tells this screen nothing, and lets SAM go when it ends.
+            finder.release_after = True  # before cancel(), so a search that sees the cancel sees this too
+            finder.cancel()
+            for sig in (finder.found, finder.finished_all):
+                try:
+                    sig.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
+            _finishing[:] = [t for t in _finishing if t.isRunning()]
+            _finishing.append(finder)
+        if self._cropper is not None and self._cropper.isRunning():  # behind its own modal progress window
+            self._cropper.cancel()
+            self._cropper.wait()
         self._pool.clear()
         self._pool.waitForDone()
         self._pix.clear()
+        self._found.clear()
         ai_mask.release()  # SAM holds ~2 GB of GPU memory; it's loaded again next time
         self._save_settings()
         super().done(r)

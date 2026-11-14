@@ -165,10 +165,16 @@ def _float_bgr(img: np.ndarray, gray: bool) -> np.ndarray:
     return cv2.cvtColor(f.reshape(f.shape[:2]), cv2.COLOR_GRAY2BGR) if gray else f
 
 
-def _prepare(img: np.ndarray, jpeg: int, mode: str, shadow, cleaned: np.ndarray | None = None):
-    """(Stage, cleaned): the picture after JPEG clean-up and shadow lift, plus the picture after JPEG
+def _prepare(img: np.ndarray, jpeg: int, mode: str, shadow, cleaned: np.ndarray | None = None,
+             lighting=None, keep_lighting: bool = False):
+    """(Stage, cleaned, lighting): the picture after JPEG clean-up and shadow lift, plus the picture after JPEG
     clean-up alone when it was made in BGR on the way (Best quality, or Balanced before a shadow lift), else
-    None. Pass that back as `cleaned` for the same picture, jpeg and mode to skip the JPEG step."""
+    None. Pass that back as `cleaned` for the same picture, jpeg and mode to skip the JPEG step.
+
+    lighting: the shadows.Lighting of the picture going into the shadow lift (the slow part of a lift, which
+    doesn't depend on the painting), or None. With keep_lighting, it's measured here the first time a lift
+    needs it (a one-shot save leaves it to the lift, which skips it when nothing is painted). It's returned
+    either way, to pass back like `cleaned`."""
     gray = img.ndim == 2 or img.shape[2] == 1
     alpha = img[:, :, 3:] if not gray and img.shape[2] == 4 else None
     if jpeg and (mode == BEST or shadow):  # lift the cleaned picture, not its JPEG blocks
@@ -184,13 +190,15 @@ def _prepare(img: np.ndarray, jpeg: int, mode: str, shadow, cleaned: np.ndarray 
     else:
         f, cleaned = _float_bgr(img, gray), None
     if shadow:
-        from .shadows import lift_shadows
+        from .shadows import lift_shadows, measure
 
-        f = lift_shadows(f, shadow)  # a new picture: `cleaned` is never changed
+        if keep_lighting and lighting is None:
+            lighting = measure(f)
+        f = lift_shadows(f, shadow, lighting)  # a new picture: `cleaned` is never changed
     lab = cv2.cvtColor(f, cv2.COLOR_BGR2Lab)
     if jpeg:  # Balanced without shadow areas: straight in Lab
         _jpeg_balanced(lab, jpeg)
-    return Stage(lab, gray, alpha, _scale(img.dtype), img.dtype, img.shape), cleaned
+    return Stage(lab, gray, alpha, _scale(img.dtype), img.dtype, img.shape), cleaned, lighting
 
 
 def _finish(stage: Stage, color: int, detail: int, keep: bool = False) -> np.ndarray:
@@ -213,20 +221,24 @@ def _finish(stage: Stage, color: int, detail: int, keep: bool = False) -> np.nda
 def process_cached(img: np.ndarray, settings: dict, mode: str = BALANCED, shadow=None, cache=None):
     """process() for one picture edited again and again, reusing `cache` (what the last call returned):
     when only color noise or detail changed, the JPEG clean-up and shadow lift are reused; when only the
-    shadow areas changed, the JPEG clean-up is, so a brush stroke doesn't wait for it again.
-    Returns (result, cache); the cache is (key, Stage, picture after JPEG clean-up or None)."""
+    shadow areas changed, the JPEG clean-up and the shadow lift's measurement of the picture are, so a brush
+    stroke doesn't wait for them again.
+    Returns (result, cache); the cache is (key, Stage, picture after JPEG clean-up or None, shadows.Lighting
+    of the picture going into the shadow lift or None)."""
     shadow = shadow if shadow is not None and shadow.active else None
     if img is None or (is_noop(settings) and shadow is None):
         return img, cache
     jpeg = settings.get("jpeg", 0)
     key = (jpeg, mode if jpeg else BALANCED, shadow)
     if cache is not None and cache[0] == key:
-        _, stage, cleaned = cache
+        _, stage, cleaned, lighting = cache
     else:
-        reuse = cache[2] if cache is not None and cache[0][:2] == key[:2] else None
-        stage, cleaned = _prepare(img, jpeg, mode, shadow, reuse)
+        # Same JPEG step: the same picture goes into the shadow lift (the cleaned one, or the picture itself).
+        reuse, lighting = cache[2:] if cache is not None and cache[0][:2] == key[:2] else (None, None)
+        stage, cleaned, lighting = _prepare(img, jpeg, mode, shadow, reuse, lighting, keep_lighting=True)
         cleaned = reuse if cleaned is None else cleaned  # kept for when shadow areas come back (Undo)
-    return _finish(stage, settings.get("color", 0), settings.get("detail", 0), keep=True), (key, stage, cleaned)
+    return (_finish(stage, settings.get("color", 0), settings.get("detail", 0), keep=True),
+            (key, stage, cleaned, lighting))
 
 
 # Pixels kept around a crop when only it is cleaned up: more than every filter's reach that doesn't scale

@@ -4,7 +4,7 @@ import unittest
 import cv2
 import numpy as np
 
-from rulz import shadows
+from rulz import filters, shadows
 from rulz.filters import process
 from rulz.shadows import ShadowEdit, Stroke, lift_shadows, render_mask
 
@@ -91,6 +91,37 @@ class ShadowTests(unittest.TestCase):
             outside = np.ones(shot.shape[:2], bool)
             outside[box] = False
             np.testing.assert_array_equal(got[outside], np.clip(shot, 0, 1)[outside])
+
+    def test_kept_lighting_changes_nothing(self):
+        """A brush stroke reuses the picture's measured lighting; the result must be the very same."""
+        shot, _, _, _ = _scene(500, 900)
+        shot[0, 0], shot[1, 1] = 1.2, -0.1  # out of range, as a Lab round trip can give
+        corners = np.ascontiguousarray(np.roll(shot, (250, 450), (0, 1)))  # the shadow split over the corners
+        gray = filters._float_bgr(np.round(np.clip(shot[..., 1], 0, 1) * 65535).astype(np.uint16), True)
+        paint = Stroke(((0.3, 0.5), (0.5, 0.5), (0.7, 0.5)), 0.12)
+        cases = ((shot, ShadowEdit((paint,))),  # paint only
+                 (shot, ShadowEdit((paint, Stroke(((0.5, 0.2), (0.5, 0.8)), 0.04, True)), 60, 20)),  # and erase
+                 (shot, ShadowEdit((Stroke(((0.0, 0.5), (0.45, 0.5)), 0.05),), 80, 100)),  # off the picture's edge
+                 (shot, _over_shadow(500, 900)),
+                 (corners, ShadowEdit((Stroke(((0.0, 0.08), (0.12, 0.0)), 0.06),), 90, 0)),  # in a corner
+                 (corners, ShadowEdit((Stroke(((0.0, 0.08), (0.12, 0.0)), 0.06),
+                                       Stroke(((1.0, 0.92), (0.88, 1.0)), 0.06)), 90)),  # two corners
+                 (gray, _over_shadow(500, 900)))  # a gray picture as the pipeline hands it over
+        lightings = {}
+        for img, edit in cases:
+            lighting = lightings.setdefault(id(img), shadows.measure(img))
+            before = [a.copy() for a in (lighting.light, lighting.light_s, lighting.tint)]
+            want = lift_shadows(img, edit)
+            self.assertIsNot(want, img)  # it found a shadow to lift
+            np.testing.assert_array_equal(lift_shadows(img, edit, lighting), want)
+            for a, b in zip((lighting.light, lighting.light_s, lighting.tint), before):
+                np.testing.assert_array_equal(a, b)  # left as it was for the next stroke
+        lighting = lightings[id(shot)]
+        self.assertIs(lift_shadows(shot, ShadowEdit(), lighting), shot)
+        lit = ShadowEdit((Stroke(((0.05, 0.1), (0.2, 0.1)), 0.04),))
+        np.testing.assert_array_equal(lift_shadows(shot, lit, lighting), lift_shadows(shot, lit))
+        with self.assertRaises(ValueError):
+            lift_shadows(shot[:400], _over_shadow(400, 900), lighting)
 
     def test_round_trip_and_pipeline(self):
         edit = ShadowEdit((Stroke(((0.1, 0.2), (0.3, 0.4)), 0.05), Stroke(((0.5, 0.5),), 0.02, True)), 40, 70)

@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import importlib.metadata
 import importlib.util
 import sys
 import threading
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -37,8 +39,22 @@ def model_path() -> Path:
     return config.models_dir() / MODEL_FILE
 
 
+def package_installed(module: str, dist: str | None = None) -> bool:
+    """True when the package imports and pip finished installing it. Its metadata (dist-info) is unpacked
+    last, so a setup cancelled halfway leaves a folder that would import but isn't counted: before, the app
+    took a broken PyTorch for ready and never offered the setup again."""
+    if importlib.util.find_spec(module) is None:
+        return False
+    try:  # None for a dist-info folder whose METADATA isn't written yet (newer Pythons: KeyError)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)  # "Implicit None ... will raise KeyErrors"
+            return bool(importlib.metadata.version(dist or module))
+    except (importlib.metadata.PackageNotFoundError, KeyError):
+        return False
+
+
 def torch_installed() -> bool:
-    return importlib.util.find_spec("torch") is not None
+    return package_installed("torch")
 
 
 def model_ok(path: Path | None = None) -> bool:
@@ -148,6 +164,7 @@ def _build():
 _model = None
 _lock = threading.Lock()
 _release_pending = False
+_releases = 0  # how many times release() was called (see warm_up_task)
 
 
 def _load():
@@ -185,7 +202,8 @@ def _drop() -> None:
 def release() -> None:
     """Unload the model to free its (GPU) memory; the next use loads it again. Never waits: while a picture
     is being cleaned up, the model is dropped as soon as that finishes."""
-    global _release_pending
+    global _release_pending, _releases
+    _releases += 1
     if not _lock.acquire(blocking=False):
         _release_pending = True
         return
@@ -235,31 +253,43 @@ def _run(rgb: np.ndarray, damage: float, tile: int | None = None) -> np.ndarray:
 
 def remove_artifacts(rgb: np.ndarray, strength: float) -> np.ndarray:
     """rgb: float32 HxWx3 in 0..1. Returns the cleaned image, same shape."""
-    import torch
-
     # FBCNN control = 1 - JPEG quality: higher cleans harder. 100 treats it like a quality-10 JPEG.
     damage = 0.9 * min(max(strength, 0.0), 100.0) / 100.0
-    with _lock, torch.inference_mode():
+    # PyTorch is imported with the lock held, so a release() during its slow first import (Best quality
+    # switched off right after being picked) waits for this run instead of being missed by the warm-up.
+    with _lock:
         try:
-            tile = None
-            while True:
-                try:
-                    return _run(rgb, damage, tile)
-                except torch.cuda.OutOfMemoryError:
-                    if _model is None:  # not even the model fits
-                        raise
-                    # something else took the memory meanwhile: try again with smaller tiles
-                    tile = (tile or _tile_size(torch, _model[1])) // 2 // 8 * 8
-                    if tile < MIN_TILE:
-                        raise
-                torch.cuda.empty_cache()  # out here the failed attempt's tensors are gone
+            import torch
+
+            with torch.inference_mode():
+                tile = None
+                while True:
+                    try:
+                        return _run(rgb, damage, tile)
+                    except torch.cuda.OutOfMemoryError:
+                        if _model is None:  # not even the model fits
+                            raise
+                        # something else took the memory meanwhile: try again with smaller tiles
+                        tile = (tile or _tile_size(torch, _model[1])) // 2 // 8 * 8
+                        if tile < MIN_TILE:
+                            raise
+                    torch.cuda.empty_cache()  # out here the failed attempt's tensors are gone
         finally:
             if _release_pending:
                 _drop()
 
 
-def warm_up() -> None:
+def warm_up_task():
+    """warm_up() to hand to a thread pool now. It does nothing if release() comes before it starts (Best
+    quality switched off again straight away), so it can't load the model after it was let go."""
+    released = _releases
+    return lambda: warm_up(released)
+
+
+def warm_up(released: int | None = None) -> None:
     """Load the model and run a tiny image so the first real preview doesn't pay the start-up cost."""
+    if released is not None and released != _releases:
+        return
     try:
         remove_artifacts(np.zeros((64, 64, 3), np.float32), 50)
     except Exception:  # noqa: BLE001 - the real call reports problems
