@@ -184,14 +184,19 @@ async def dashboard_page() -> None:
         if not ns:
             return
         _last_namespace = ns
+        state['loading'] = ticket = state.get('loading', 0) + 1
         table.props('loading')
         try:
-            state['rows'] = await run.io_bound(hub.list_namespace, ns)
+            rows = await run.io_bound(hub.list_namespace, ns)
         except Exception as e:  # noqa: BLE001
+            if state['loading'] != ticket:
+                return
             notify_error(e)
-            state['rows'] = []
-        finally:
-            table.props(remove='loading')
+            rows = []
+        if state['loading'] != ticket:
+            return  # a newer load was started meanwhile (another namespace, a refresh): it shows its own rows
+        table.props(remove='loading')
+        state['rows'] = rows
         apply_filter()
 
     ns_select.on_value_change(lambda: load())

@@ -7,6 +7,7 @@ Everything in here is blocking I/O and is meant to be called from a worker threa
 from __future__ import annotations
 
 import glob
+import itertools
 import os
 import posixpath
 import re
@@ -19,11 +20,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from huggingface_hub import CommitOperationAdd, CommitOperationCopy, CommitOperationDelete, HfApi, get_token
 from huggingface_hub import errors as hf_errors
-from huggingface_hub.hf_api import RepoFolder
+from huggingface_hub.hf_api import DEFAULT_IGNORE_PATTERNS, RepoFolder
+from huggingface_hub.utils import build_hf_headers, filter_repo_objects, paginate, parse_datetime, parse_hf_uri
 from huggingface_hub.utils import tqdm as hf_tqdm
 
 from . import __version__, config
@@ -39,8 +41,7 @@ _URI_PREFIX = {'model': '', 'dataset': 'datasets/', 'space': 'spaces/', 'bucket'
 _URL_PREFIX_TO_KIND = {'datasets': 'dataset', 'spaces': 'space', 'buckets': 'bucket', 'models': 'model'}
 
 # Files we never upload when walking a local folder.
-_SKIP_DIRS = {'.git', '__pycache__', '.ipynb_checkpoints'}
-_SKIP_SUFFIX = ('.cache/huggingface',)
+_SKIP_DIRS = {'.git', '__pycache__', '.ipynb_checkpoints'}  # and .cache/huggingface (see local_items_to_uploads)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -210,35 +211,55 @@ def hf_uri(kind: str, repo_id: str, path: str = '', revision: str | None = None)
 _ID_RE = re.compile(r'^[\w.\-]+/[\w.\-]+$')
 
 
-def parse_location(text: str) -> tuple[str | None, str, str]:
-    """Parse a URL / hf:// URI / id typed by the user into (kind or None, repo_id, path)."""
+def _parse(text: str) -> tuple[str | None, str, str, str | None]:
+    """(kind or None, repo_id, path, revision or None) from a URL / hf:// path / id typed by the user."""
     text = text.strip().strip('"').strip("'")
     if not text:
         raise ValueError('Nothing to open.')
-    path = ''
     if text.startswith('hf://'):
-        parts = text[5:].strip('/').split('/')
-    elif '://' in text:
-        parsed = urlparse(text)
-        parts = [p for p in parsed.path.split('/') if p]
+        # huggingface_hub's own parser knows the special refs written out with slashes
+        # (hf://datasets/u/d@refs/convert/parquet/default/...), which no simple split can tell from the path.
+        try:
+            uri = parse_hf_uri(text)
+        except Exception as e:  # noqa: BLE001
+            raise ValueError(f'"{text}" is not a valid hf:// path.') from e
+        kind, repo_id, path, rev = uri.type, uri.id, (uri.path_in_repo or '').strip('/'), uri.revision
+        if kind not in KINDS:
+            raise ValueError(f'This app cannot open {kind} repos.')
     else:
-        parts = [p for p in text.split('/') if p]
-    kind: str | None = None
-    if parts and parts[0] in _URL_PREFIX_TO_KIND:
-        kind = _URL_PREFIX_TO_KIND[parts.pop(0)]
-    if len(parts) < 2:
-        raise ValueError('Expected something like "username/name" or a huggingface.co link.')
-    repo_id = f'{parts[0]}/{parts[1].split("@")[0]}'
-    rest = parts[2:]
-    if rest and rest[0] in {'tree', 'blob', 'resolve'} and len(rest) >= 2:
-        path = '/'.join(rest[2:])
-    elif kind == 'bucket' and rest:
-        path = '/'.join(rest)
-    if kind is None and '://' in text:
-        kind = 'model'  # huggingface.co/<user>/<name> is a model
+        parts = [p for p in (urlparse(text).path if '://' in text else text).split('/') if p]
+        kind = _URL_PREFIX_TO_KIND[parts.pop(0)] if parts and parts[0] in _URL_PREFIX_TO_KIND else None
+        if len(parts) < 2:
+            raise ValueError('Expected something like "username/name" or a huggingface.co link.')
+        repo_id = f'{parts[0]}/{parts[1].split("@")[0]}'
+        rest, path, rev = parts[2:], '', None
+        # Only right after the repo id: an owner or repo that happens to be called "tree" names no branch.
+        if rest and rest[0] in {'tree', 'blob', 'resolve'} and len(rest) >= 2:
+            rev, path = unquote(rest[1]), '/'.join(rest[2:])
+        elif kind == 'bucket' and rest:
+            path = '/'.join(rest)
+        if kind is None and '://' in text:
+            kind = 'model'  # huggingface.co/<user>/<name> is a model
     if not _ID_RE.match(repo_id):
         raise ValueError(f'"{repo_id}" does not look like a valid repo id.')
-    return kind, repo_id, path
+    if kind == 'bucket' or rev in (None, '', 'main'):
+        rev = None  # buckets have no revisions; main is the default anyway
+    return kind, repo_id, path, rev
+
+
+def parse_location(text: str) -> tuple[str | None, str, str]:
+    """Parse a URL / hf:// URI / id typed by the user into (kind or None, repo_id, path)."""
+    return _parse(text)[:3]
+
+
+def parse_revision(text: str, kind: str | None = None) -> str | None:
+    """The branch / revision a link or hf:// path names (``.../tree/dev/...``, ``hf://user/name@dev``); None for
+    main or when it names none. Buckets have no revisions."""
+    try:
+        rev = _parse(text)[3]
+    except ValueError:
+        return None
+    return None if kind == 'bucket' else rev
 
 
 def detect_kind(repo_id: str) -> str:
@@ -335,9 +356,9 @@ def repo_summary(kind: str, repo_id: str) -> dict[str, Any]:
         b = a.bucket_info(repo_id)
         return {'private': b.private, 'size': b.size, 'files': b.total_files, 'created': b.created_at}
     getter = {'model': a.model_info, 'dataset': a.dataset_info, 'space': a.space_info}[kind]
-    expand = ['private', 'lastModified', 'usedStorage', 'likes', 'sha', 'gated']
-    if kind != 'space':
-        expand.append('downloads')
+    expand = ['private', 'lastModified', 'usedStorage', 'likes', 'sha']
+    if kind != 'space':  # the Hub answers 400 to "gated" or "downloads" for a Space
+        expand += ['downloads', 'gated']
     info = getter(repo_id, expand=expand)
     return {
         'private': bool(info.private), 'size': getattr(info, 'used_storage', None), 'likes': info.likes,
@@ -409,6 +430,16 @@ def join(folder: str, name: str) -> str:
     return f'{folder}/{name}' if folder else name
 
 
+def local_target(root: Path, remote_path: str) -> Path:
+    """Where a remote file goes under ``root`` on this computer. Refuses paths that would land outside it
+    (``../x``, ``/etc/x``, ``C:\\x``): a download must never write anywhere but the folder it was given."""
+    windows = os.name == 'nt'  # there "\" separates folders too, and "C:x" would switch drives
+    parts = (remote_path.replace('\\', '/') if windows else remote_path).split('/')
+    if not remote_path or any(p in {'', '.', '..'} or (windows and ':' in p) for p in parts):
+        raise ValueError(f'Refusing to download "{remote_path}": that path would leave the download folder.')
+    return root.joinpath(*parts)
+
+
 def validate_name(name: str) -> str:
     name = name.strip().strip('/')
     if not name:
@@ -428,18 +459,28 @@ def local_items_to_uploads(local_paths: list[str | Path], dest_folder: str) -> l
         if p.is_file():
             pairs.append((p, join(dest_folder, p.name)))
         elif p.is_dir():
+            # A drive root (C:\, /) has no name of its own to keep: its contents go straight into dest_folder.
+            base = p.parent if p.name else p
             for root, dirs, files in os.walk(p):
-                dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
-                rel_root = Path(root).relative_to(p.parent).as_posix()
-                if rel_root.endswith(_SKIP_SUFFIX) or '/.cache/huggingface' in rel_root:
-                    continue
+                # Skipped folders are pruned here, so os.walk never descends into them (a big
+                # .cache/huggingface download cache used to be walked file by file, then thrown away).
+                dirs[:] = [d for d in dirs if d not in _SKIP_DIRS
+                           and not (d == 'huggingface' and os.path.basename(root) == '.cache')]
+                rel_root = Path(root).relative_to(base).as_posix()
                 for f in files:
-                    pairs.append((Path(root) / f, join(dest_folder, f'{rel_root}/{f}')))
+                    pairs.append((Path(root) / f, join(dest_folder, f if rel_root == '.' else f'{rel_root}/{f}')))
     return pairs
 
 
-def job_tqdm(job: Job):
-    """A tqdm class that reports progress into a Job instead of the console."""
+def local_relative_files(folder: Path, ignore_patterns: list[str]) -> set[str]:
+    """The files an upload_folder of ``folder`` sends, as paths relative to it (same filter as huggingface_hub)."""
+    rel = [p.relative_to(folder).as_posix() for p in folder.glob('**/*') if p.is_file()]
+    return set(filter_repo_objects(rel, ignore_patterns=[*ignore_patterns, *DEFAULT_IGNORE_PATTERNS]))
+
+
+def job_tqdm(job: Job, file_size: int | None = None):
+    """A tqdm class that reports progress into a Job instead of the console. ``file_size``: the class goes to a
+    single file's download, whose byte bar is the whole job's progress."""
 
     class JobTqdm(hf_tqdm):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -462,7 +503,13 @@ def job_tqdm(job: Job):
         def _job_report(self) -> None:
             total = getattr(self, 'total', None)
             if self._job_unit == 'B':
-                if self._job_desc.startswith('Downloading'):
+                if file_size is not None:
+                    # hf_hub_download: an http bar named after the file, or xet's "<file>: downloading bytes" next
+                    # to its "reconstructing" bar (the same bytes again, so that one is left out).
+                    if 'reconstructing' not in self._job_desc:
+                        job.set(progress=min(1.0, self._job_n / file_size) if file_size else None,
+                                detail=f'{human_size(self._job_n)} of {human_size(file_size)}')
+                elif self._job_desc.startswith('Downloading'):
                     job.set(detail=f'{human_size(self._job_n)} transferred')
             elif total:
                 job.set(progress=min(1.0, self._job_n / total), message=f'{int(self._job_n)}/{int(total)} files')
@@ -574,21 +621,25 @@ class RemoteFS:
             for i, e in enumerate(entries):
                 if job:
                     job.set(progress=i / len(entries), message=e.path)
-                # copy_files copies a folder's *contents*, so name the destination folder explicitly
-                # (keeps "sel/x.bin" as "<dest>/sel/x.bin", like the other copy paths).
+                # Name the destination folder explicitly ("sel/x.bin" -> "<dest>/sel/x.bin", like the other copy
+                # paths) and copy the folder's *contents* into it (source ends in "/"). Without that slash,
+                # copy_files nests the folder when the destination already exists: a second copy went to
+                # "<dest>/sel/sel/x.bin".
                 target = join(dest_folder, e.name) if e.is_dir else dest_folder
-                self.api.copy_files(self.uri(e.path), hf_uri('bucket', dest_id, target) + '/')
+                source = self.uri(e.path) + ('/' if e.is_dir else '')
+                self.api.copy_files(source, hf_uri('bucket', dest_id, target) + '/')
         elif self.kind == 'bucket':
             # The Hub cannot copy bucket -> repo server-side: download to a temp folder then commit.
             with tempfile.TemporaryDirectory(prefix='rulz-hf-', ignore_cleanup_errors=True) as tmp:
                 if job:
                     job.set(message='Downloading from bucket...')
                 files = self.expand(entries)
-                self.api.download_bucket_files(self.repo_id, files=[(f.raw or f.path, Path(tmp) / f.path) for f in files])
+                self.api.download_bucket_files(self.repo_id, files=[(f.raw or f.path, local_target(Path(tmp), f.path))
+                                                                    for f in files])
                 if job:
                     job.set(message='Committing to repository...')
-                ops = [CommitOperationAdd(join(dest_folder, _rel_to_selection(f, entries)), str(Path(tmp) / f.path))
-                       for f in files]
+                ops = [CommitOperationAdd(join(dest_folder, _rel_to_selection(f, entries)),
+                                          str(local_target(Path(tmp), f.path))) for f in files]
                 self.api.create_commit(dest_id, ops, repo_type=dest_kind, revision=dest_revision,
                                        commit_message=message or f'Copy {len(files)} file(s) from bucket {self.repo_id}')
         else:
@@ -617,8 +668,31 @@ class RemoteFS:
                 rel = f.relative_to(root).as_posix()
                 if f.is_file() and not rel.startswith('.cache/'):
                     arc = rel[len(base) + 1:] if base and rel.startswith(base + '/') else rel
-                    zf.write(f, arc)
+                    zf.write(f, arc, compress_type=zip_method(f))
         return zip_path, name
+
+
+# Already compressed, or model weights that deflate barely shrinks: stored as they are. Deflating a 10 GB checkpoint
+# costs minutes of one CPU core for a few percent.
+_STORED_EXT = {'.safetensors', '.bin', '.pt', '.pth', '.ckpt', '.gguf', '.ggml', '.onnx', '.h5', '.msgpack', '.npz',
+               '.zip', '.gz', '.tgz', '.xz', '.zst', '.7z', '.bz2', '.parquet', '.arrow', '.png', '.jpg', '.jpeg',
+               '.webp', '.gif', '.mp4', '.webm', '.mkv', '.mov', '.mp3', '.flac', '.ogg', '.m4a'}
+_STORE_ABOVE = 64 * 1024 * 1024
+
+
+def zip_method(path: Path) -> int:
+    if path.suffix.lower() in _STORED_EXT or path.stat().st_size > _STORE_ABOVE:
+        return zipfile.ZIP_STORED
+    return zipfile.ZIP_DEFLATED
+
+
+def sources_to_delete(plan: list[tuple[Entry, str]]) -> list[str]:
+    """The originals a move removes: every source, except one that another file of the same move is copied onto.
+
+    Flattening ``x/x`` into ``x`` moves ``x/x/a`` to ``x/a`` *and* ``x/x/x/a`` to ``x/x/a``: deleting the source
+    ``x/x/a`` as well would delete the file that was just copied there."""
+    dests = {d for _, d in plan}
+    return [f.path for f, _ in plan if f.path not in dests]
 
 
 def _rel_to_selection(f: Entry, selection: list[Entry]) -> str:
@@ -640,11 +714,15 @@ class RepoFS(RemoteFS):
         return Entry(item.path, False, size=item.size, modified=modified, lfs=item.lfs is not None,
                      xet_hash=item.xet_hash, raw=item)
 
-    def list_dir(self, folder: str) -> list[Entry]:
+    def list_dir(self, folder: str, expand: bool | None = None) -> list[Entry]:
         items = self.api.list_repo_tree(self.repo_id, path_in_repo=folder or None, recursive=False,
-                                        expand=config.get().load_last_modified,
+                                        expand=config.get().load_last_modified if expand is None else expand,
                                         repo_type=self.kind, revision=self.revision)
         return [self._entry(i) for i in items]
+
+    def list_folders(self, folder: str) -> list[str]:
+        # Folder names only: never ask for every file's last commit here, whatever the "last modified" setting.
+        return sorted(e.path for e in self.list_dir(folder, expand=False) if e.is_dir)
 
     def list_files(self, folder: str = '') -> list[Entry]:
         items = self.api.list_repo_tree(self.repo_id, path_in_repo=folder or None, recursive=True,
@@ -669,12 +747,39 @@ class RepoFS(RemoteFS):
                for src, dest in items]
         return self._commit(ops, message, create_pr)
 
+    _PUSH_IGNORE = ['.git/*', '.cache/huggingface/*']
+
     def upload_folder(self, local_dir: Path, dest_folder: str, message: str, mirror: bool,
                       create_pr: bool = False) -> Any:
-        return self.api.upload_folder(repo_id=self.repo_id, folder_path=local_dir, path_in_repo=dest_folder or None,
+        """Upload a local folder. With hf_xet installed huggingface_hub commits a big folder in several parts, and it
+        puts a mirror's deletions into the *first* part: a push that broke off halfway left the repo with files
+        deleted and the new ones only partly there. So the deletions go last here, in a commit of their own, once
+        every upload has gone through."""
+        dest_folder = dest_folder.strip('/')
+        doomed: list[str] = []
+        if mirror:
+            # Planned before the upload, from the branch as it is now (main for a pull request, like
+            # huggingface_hub does): a file someone else adds to the folder while the upload runs is not deleted.
+            base = RepoFS(self.kind, self.repo_id, None if create_pr else self.revision)
+            try:
+                remote = [f.path for f in base.list_files(dest_folder)]
+            except (hf_errors.EntryNotFoundError, hf_errors.RemoteEntryNotFoundError):
+                remote = []  # the folder is new: nothing to mirror away
+            local = local_relative_files(Path(local_dir), self._PUSH_IGNORE)
+            prefix = dest_folder + '/' if dest_folder else ''
+            doomed = [p for p in remote if p[len(prefix):] not in local and p != '.gitattributes']
+        info = self.api.upload_folder(repo_id=self.repo_id, folder_path=local_dir, path_in_repo=dest_folder or None,
                                       commit_message=message, repo_type=self.kind, revision=self.revision,
-                                      create_pr=create_pr, delete_patterns=['*'] if mirror else None,
-                                      ignore_patterns=['.git/*', '.cache/huggingface/*'])
+                                      create_pr=create_pr, ignore_patterns=list(self._PUSH_IGNORE))
+        if doomed:
+            # Into the pull request the upload opened, not a second one. When the upload changed nothing,
+            # huggingface_hub opens no pull request at all: then the deletions open it, never land on the branch.
+            pr = getattr(info, 'pr_revision', None)
+            target = RepoFS(self.kind, self.repo_id, pr or self.revision)
+            target._commit([CommitOperationDelete(path_in_repo=p) for p in doomed],
+                           f'{message} (remove {len(doomed)} file(s) gone from the local folder)',
+                           create_pr and not pr)
+        return info
 
     def delete(self, entries, message, create_pr=False):
         ops = [CommitOperationDelete(path_in_repo=e.path + '/' if e.is_dir else e.path, is_folder=e.is_dir)
@@ -684,7 +789,7 @@ class RepoFS(RemoteFS):
     def move(self, plan, message, create_pr=False):
         ops: list = [CommitOperationCopy(src_path_in_repo=f.path, path_in_repo=dest, src_revision=self.revision)
                      for f, dest in plan]
-        ops += [CommitOperationDelete(path_in_repo=f.path) for f, _ in plan]
+        ops += [CommitOperationDelete(path_in_repo=p) for p in sources_to_delete(plan)]
         return self._commit(ops, message, create_pr)
 
     def copy(self, plan, message, create_pr=False):
@@ -693,9 +798,19 @@ class RepoFS(RemoteFS):
         return self._commit(ops, message, create_pr)
 
     def download(self, entries, local_dir, job=None):
-        patterns = [glob.escape(e.path) + ('/*' if e.is_dir else '') for e in entries]
         local_dir.mkdir(parents=True, exist_ok=True)
-        self.api.snapshot_download(self.repo_id, repo_type=self.kind, revision=self.revision,
+        # Ask the Hub for the commit first. When the Hub cannot be reached, snapshot_download quietly returns
+        # whatever is already in local_dir: an earlier download there turned an outage into "Saved to ...".
+        sha = self.api.repo_info(self.repo_id, repo_type=self.kind, revision=self.revision, expand=['sha']).sha
+        if len(entries) == 1 and not entries[0].is_dir:
+            # One file: fetch just it. snapshot_download lists the whole repo first, which on a big dataset takes
+            # longer than the file itself (and a browser download always starts in a fresh folder).
+            e = entries[0]
+            self.api.hf_hub_download(self.repo_id, e.path, repo_type=self.kind, revision=sha, local_dir=local_dir,
+                                     tqdm_class=job_tqdm(job, file_size=e.size or 0) if job else None)
+            return local_dir
+        patterns = [glob.escape(e.path) + ('/*' if e.is_dir else '') for e in entries]
+        self.api.snapshot_download(self.repo_id, repo_type=self.kind, revision=sha or self.revision,
                                    local_dir=local_dir, allow_patterns=patterns,
                                    tqdm_class=job_tqdm(job) if job else None)
         return local_dir
@@ -716,9 +831,21 @@ class RepoFS(RemoteFS):
         self.api.create_branch(self.repo_id, branch=name, revision=from_revision, repo_type=self.kind)
 
     def history(self, limit: int = 200) -> list[dict]:
-        commits = self.api.list_repo_commits(self.repo_id, repo_type=self.kind, revision=self.revision)
-        return [{'id': c.commit_id, 'short': c.commit_id[:8], 'title': c.title, 'authors': ', '.join(c.authors),
-                 'date': c.created_at} for c in commits[:limit]]
+        """The newest ``limit`` commits. Reads only the pages it needs: ``list_repo_commits`` fetches the whole
+        history first, page by page, which takes long on repos with thousands of commits."""
+        a = self.api
+        rev = quote(self.revision or 'main', safe='')
+        headers = build_hf_headers(token=a.token, library_name=a.library_name, library_version=a.library_version)
+        items = paginate(f'{a.endpoint}/api/{self.kind}s/{self.repo_id}/commits/{rev}', params={}, headers=headers)
+        out = []
+        for c in itertools.islice(items, limit):
+            try:
+                date = parse_datetime(c['date']) if c.get('date') else None
+            except ValueError:
+                date = None
+            out.append({'id': c['id'], 'short': c['id'][:8], 'title': c.get('title') or '',
+                        'authors': ', '.join(au.get('user') or '' for au in c.get('authors') or []), 'date': date})
+        return out
 
 
 class BucketFS(RemoteFS):
@@ -773,7 +900,8 @@ class BucketFS(RemoteFS):
         if not plan:
             return None
         self._server_copy(plan)  # copy first; only delete the originals once every copy succeeded
-        self.api.batch_bucket_files(self.repo_id, delete=[f.path for f, _ in plan])
+        if doomed := sources_to_delete(plan):
+            self.api.batch_bucket_files(self.repo_id, delete=doomed)
         return None
 
     def copy(self, plan, message='', create_pr=False):
@@ -785,7 +913,8 @@ class BucketFS(RemoteFS):
         local_dir.mkdir(parents=True, exist_ok=True)
         if job:
             job.set(message=f'{len(files)} file(s), {human_size(sum(f.size or 0 for f in files))}')
-        self.api.download_bucket_files(self.repo_id, files=[(f.raw or f.path, local_dir / f.path) for f in files])
+        self.api.download_bucket_files(self.repo_id, files=[(f.raw or f.path, local_target(local_dir, f.path))
+                                                            for f in files])
         return local_dir
 
     def read_bytes(self, path):
@@ -808,6 +937,44 @@ class BucketFS(RemoteFS):
 
 def open_fs(kind: str, repo_id: str, revision: str | None = None) -> RemoteFS:
     return BucketFS(kind, repo_id) if kind == 'bucket' else RepoFS(kind, repo_id, revision)
+
+
+TEMP_PREFIX = 'rulz-hf-'  # every temp folder this app makes: rulz-hf-dl-, rulz-hf-up-, rulz-hf-plan-...
+
+
+def _touched_since(folder: Path, cutoff: float) -> bool:
+    """Whether anything in ``folder`` (the folder itself, or any file or folder inside) changed after ``cutoff``.
+    A folder's own time does not move when a file deep inside it is written, so every entry is looked at."""
+    if folder.stat().st_mtime >= cutoff:
+        return True
+    for root, dirs, files in os.walk(folder):
+        for name in (*dirs, *files):
+            try:
+                if os.lstat(os.path.join(root, name)).st_mtime >= cutoff:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def sweep_stale_temp(max_age_hours: float = 72, folder: str | Path | None = None) -> int:
+    """Remove this app's temp folders that an earlier run left behind: nothing in them changed for
+    ``max_age_hours`` (a transfer still writing into one keeps it fresh)."""
+    root = Path(folder or tempfile.gettempdir())
+    cutoff = time.time() - max_age_hours * 3600
+    removed = 0
+    try:
+        candidates = [p for p in root.iterdir() if p.name.startswith(TEMP_PREFIX)]
+    except OSError:
+        return 0
+    for p in candidates:
+        try:
+            if p.is_dir() and not p.is_symlink() and not _touched_since(p, cutoff):
+                shutil.rmtree(p, ignore_errors=True)
+                removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def cleanup_temp(path: Path) -> None:

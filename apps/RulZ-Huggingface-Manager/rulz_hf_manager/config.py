@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
@@ -55,6 +56,7 @@ class Settings:
 
 _lock = threading.Lock()
 _settings: Settings | None = None
+_unread = False  # the settings file existed but could not be read at start
 
 
 def settings_path() -> Path:
@@ -72,21 +74,59 @@ def _load() -> Settings:
     path = settings_path()
     if not path.exists():
         return Settings()
-    try:
-        data = json.loads(path.read_text(encoding='utf-8'))
-    except (OSError, ValueError):
+    global _unread
+    text = None
+    for attempt in range(3):  # a virus scanner may hold the file for a moment
+        try:
+            text = path.read_text(encoding='utf-8-sig')  # -sig: a file once saved by Notepad starts with a BOM
+            break
+        except OSError:
+            time.sleep(0.2 * (attempt + 1))
+    if text is None:
+        _unread = True  # save() keeps this file aside before writing over it
         return Settings()
-    known = {f.name for f in fields(Settings)}
-    return Settings(**{k: v for k, v in data.items() if k in known})
+    try:
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError('not a JSON object')
+    except ValueError:
+        # Damaged: start with defaults, but keep the file aside. The next save() would otherwise overwrite it,
+        # and the token, keys and favorites in it would be gone for good.
+        try:
+            path.replace(path.with_name(f'{path.name}.broken-{time.strftime("%Y%m%d-%H%M%S")}'))
+        except OSError:
+            pass
+        return Settings()
+    known = {f.name: f for f in fields(Settings)}
+    defaults = Settings()
+    values = {}
+    for k, v in data.items():
+        if k in known and isinstance(v, type(getattr(defaults, k))):  # a wrong type falls back to the default
+            values[k] = v
+    return Settings(**values)
 
 
 def save() -> None:
+    global _unread
     settings = get()
     path = settings_path()
     with _lock:
         path.parent.mkdir(parents=True, exist_ok=True)
+        if _unread and path.exists():  # never read at start: keep it rather than overwrite it with defaults
+            try:
+                path.replace(path.with_name(f'{path.name}.unread-{time.strftime("%Y%m%d-%H%M%S")}'))
+            except OSError:
+                pass
+        _unread = False
         tmp = path.with_suffix('.tmp')
-        tmp.write_text(json.dumps(asdict(settings), indent=2), encoding='utf-8')
-        if not IS_WINDOWS:
-            os.chmod(tmp, 0o600)  # the file contains the HF token
+        text = json.dumps(asdict(settings), indent=2)
+        if IS_WINDOWS:
+            tmp.write_text(text, encoding='utf-8')
+        else:
+            # Created private (the file holds the HF token and the vast.ai key): never readable by others, not
+            # even for the moment between writing and a later chmod.
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                f.write(text)
+            os.chmod(tmp, 0o600)  # an older temp file may have had wider permissions
         os.replace(tmp, path)

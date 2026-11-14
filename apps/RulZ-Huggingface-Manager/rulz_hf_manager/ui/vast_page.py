@@ -16,7 +16,7 @@ from nicegui import run, ui
 from .. import config, hub, vast
 from ..jobs import Job
 from ..remote_agent import COMFY_DIRS
-from .common import browse_url, confirm, fmt_duration, frame, notify_error, notify_ok, prompt, run_job
+from .common import browse_url, confirm, fmt_duration, frame, masked_hint, notify_error, notify_ok, prompt, run_job
 
 # What the user collected to send together (lives as long as the app runs).
 BASKET: list[vast.Source] = []
@@ -212,10 +212,11 @@ async def send_dialog(sources: list[vast.Source], on_started=None) -> None:
 
         with ui.expansion('Only some files', icon='filter_alt').classes('w-full rz-box').props('dense'):
             with ui.row().classes('w-full gap-2 no-wrap'):
+                # debounce: the plan is rebuilt once typing pauses, not on every key (big repos have many files)
                 include = ui.input('Only files matching', placeholder='*.safetensors, *.json') \
-                    .props('outlined dense clearable').classes('flex-1 rulz-mono')
+                    .props('outlined dense clearable debounce=350').classes('flex-1 rulz-mono')
                 exclude = ui.input('Skip files matching', placeholder='*.bin, *.pt, onnx/*') \
-                    .props('outlined dense clearable').classes('flex-1 rulz-mono')
+                    .props('outlined dense clearable debounce=350').classes('flex-1 rulz-mono')
             ui.label('Patterns match the file name or its path in the repo. Files already on the instance with the '
                      'same size are skipped, so sending again only fetches what is missing.') \
                 .classes('text-xs rulz-muted')
@@ -277,10 +278,11 @@ async def send_dialog(sources: list[vast.Source], on_started=None) -> None:
 
     def update_warning() -> None:
         plan: vast.Plan | None = state['plan']
+        clashes = plan.collisions() if plan else []
         msgs = []
         if plan and state.get('free') is not None and plan.total > state['free']:
             msgs.append(f'Needs {hub.human_size(plan.total)} but only {hub.human_size(state["free"])} is free there.')
-        if plan and (clashes := plan.collisions()):
+        if clashes:
             msgs.append(f'{len(clashes)} file(s) would get the same name (e.g. {clashes[0]}): '
                         'keep the folders or use a folder per repo.')
         if plan is not None and not plan.items:
@@ -290,7 +292,7 @@ async def send_dialog(sources: list[vast.Source], on_started=None) -> None:
             ui.icon('warning')
             ui.label(' '.join(msgs)).classes('text-sm')
         warn.set_visibility(bool(msgs))
-        start_btn.set_enabled(bool(plan and plan.items) and not (plan and plan.collisions()))
+        start_btn.set_enabled(bool(plan and plan.items) and not clashes)
 
     def replan() -> None:
         if len(state['listed']) < len(sources):
@@ -363,12 +365,14 @@ async def send_dialog(sources: list[vast.Source], on_started=None) -> None:
             render_chips(i)
 
         async def files() -> None:
-            for n, s in enumerate(sources):
-                try:
-                    state['listed'][n] = await run.io_bound(vast.list_source_files, s)
-                except Exception as e:  # noqa: BLE001
-                    summary.text = f'{s.repo_id}: {hub.friendly_error(e)}'
+            # All sources at once: a transfer list of ten repos is ten Hub listings, not ten in a row.
+            results = await asyncio.gather(*(run.io_bound(vast.list_source_files, s) for s in sources),
+                                           return_exceptions=True)
+            for n, (s, r) in enumerate(zip(sources, results)):
+                if isinstance(r, BaseException):
+                    summary.text = f'{s.repo_id}: {hub.friendly_error(r)}'
                     return
+                state['listed'][n] = r
             replan()
 
         render_chips(None)
@@ -378,15 +382,27 @@ async def send_dialog(sources: list[vast.Source], on_started=None) -> None:
     await dialog
 
 
+_following: dict[tuple[str, str], Job] = {}  # (instance, transfer id) -> the Activity job mirroring it
+
+
 def follow_job(job_id: str, title: str, conn: vast.Conn | None = None) -> Job:
-    """A job in the Activity panel that mirrors a transfer on the instance."""
+    """A job in the Activity panel that mirrors a transfer on the instance (one per transfer: pressing Follow on a
+    transfer that is already followed does not open a second ssh watch)."""
     conn = conn or vast.attached()
+    key = (conn.key if conn else '', job_id)
+    if (existing := _following.get(key)) is not None and existing.active:
+        ui.notify('Already followed in the Activity panel')
+        return existing
 
     def work(job: Job) -> str:
         job.set(message='Starting on the instance...')
         return vast.describe_outcome(vast.follow(job_id, job, conn))
 
-    return run_job(title, work, icon='cloud_upload', success=lambda job: f'Sent: {job.result}')
+    job = run_job(title, work, icon='cloud_upload', success=lambda job: f'Sent: {job.result}')
+    for k in [k for k, j in _following.items() if not j.active]:
+        del _following[k]
+    _following[key] = job
+    return job
 
 
 # --------------------------------------------------------------------------------------------------
@@ -426,11 +442,12 @@ async def vast_page() -> None:
             with ui.expansion('vast.ai API key and ssh key', icon='key').classes('w-full rz-box').props('dense'):
                 key_note = ui.label().classes('text-xs rulz-muted')
                 with ui.row().classes('w-full items-center gap-2 no-wrap'):
-                    key_input = ui.input('vast.ai API key', value=settings.vast_api_key, password=True,
-                                         password_toggle_button=True,
-                                         placeholder='empty: use the vastai CLI\'s key') \
-                        .props('outlined dense').classes('flex-1 rulz-mono')
+                    # The saved key never goes to the browser: the box takes a new key only.
+                    key_input = ui.input('vast.ai API key', password=True, password_toggle_button=True) \
+                        .props('outlined dense stack-label').classes('flex-1 rulz-mono')
                     ui.button('Save', icon='save', on_click=lambda: save_keys())
+                    forget_key_btn = ui.button(icon='key_off', on_click=lambda: forget_key()) \
+                        .props('flat round').tooltip('Forget the key saved in this app')
                     ui.button('Get a key', icon='open_in_new',
                               on_click=lambda: ui.navigate.to('https://cloud.vast.ai/manage-keys/', new_tab=True)) \
                         .props('flat no-caps')
@@ -453,9 +470,9 @@ async def vast_page() -> None:
                 ui.button('Open terminal', icon='open_in_new', on_click=lambda: open_terminal()) \
                     .props('flat no-caps').tooltip('A terminal window on this computer, logged in to the instance')
             ui.label('Runs one command at a time on the attached instance, in a bash shell with vast\'s Python venv '
-                     'on PATH. The folder carries over to the next command (cd works); variables do not. Stopping '
-                     'or closing the app ends the command: start long jobs with nohup, or use Open terminal (vast '
-                     'keeps that session in tmux).').classes('text-xs rulz-muted')
+                     'on PATH. The folder carries over to the next command (cd works); variables do not. Stopping, '
+                     'leaving this page or closing the app ends the command: start long jobs with nohup, or use '
+                     'Open terminal (vast keeps that session in tmux).').classes('text-xs rulz-muted')
             shell_log = ui.log(max_lines=3000).classes('w-full h-72 rulz-mono text-xs rz-box p-2')
             shell_progress = ui.label().classes('w-full rulz-mono text-xs rulz-muted ellipsis')
             shell_progress.set_visibility(False)
@@ -655,11 +672,26 @@ async def vast_page() -> None:
         render_instances()
         await load_jobs()
 
+    def render_key_box() -> None:
+        key_input.props['placeholder'] = masked_hint(settings.vast_api_key, 'empty: use the vastai CLI\'s key')
+        key_input.update()
+        forget_key_btn.set_visibility(bool(settings.vast_api_key))
+
     async def save_keys() -> None:
-        settings.vast_api_key = (key_input.value or '').strip()
+        if new_key := (key_input.value or '').strip():  # an empty box keeps the saved key
+            settings.vast_api_key = new_key
         settings.ssh_key = (ssh_key_input.value or '').strip()
         config.save()
+        key_input.value = ''
+        render_key_box()
         notify_ok('Saved')
+        await load_instances()
+
+    async def forget_key() -> None:
+        settings.vast_api_key = ''
+        config.save()
+        render_key_box()
+        notify_ok('Forgot the saved vast.ai key')
         await load_instances()
 
     # ======================================================================== picking
@@ -986,6 +1018,7 @@ async def vast_page() -> None:
             await load_jobs()
 
     async def init() -> None:
+        render_key_box()
         render_attached()
         render_shell()
         render_basket()
@@ -993,6 +1026,14 @@ async def vast_page() -> None:
         await gather_in(attached_box, load_instances(),
                         test_attached() if vast.attached() else asyncio.sleep(0))
 
+    def page_closed() -> None:
+        # The tab is gone for good (NiceGUI waited out its reconnect time): end its command, or the ssh session
+        # keeps running a command nobody can see or stop.
+        if (proc := shell['run']) is not None:
+            shell['run'] = None
+            threading.Thread(target=proc.stop, daemon=True).start()
+
+    ui.context.client.on_delete(page_closed)
     ui.timer(0.01, init, once=True)
     ui.timer(5.0, auto_refresh)
     ui.timer(0.15, drain_shell)

@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
+from typing import Any
 
 from nicegui import run, ui
 
 from .. import hub
 from .common import browse_url, confirm, notify_error, notify_ok, prompt
+
+
+async def _done(on_done: Callable[..., Any] | None, *args: Any) -> None:
+    """Run the caller's follow-up, awaiting it when it is async (My Hub passes its async reload: called without
+    await it only made a coroutine that never ran, so the list kept showing a deleted or renamed repo)."""
+    if on_done is not None and inspect.isawaitable(result := on_done(*args)):
+        await result
 
 
 def _id_error(v: str) -> str | None:
@@ -71,8 +80,7 @@ async def rename_dialog(kind: str, repo_id: str, on_done: Callable[[str], None] 
         notify_error(e)
         return
     notify_ok(f'Renamed to {new_id}')
-    if on_done:
-        on_done(new_id)
+    await _done(on_done, new_id)
 
 
 async def visibility_dialog(kind: str, repo_id: str, currently_private: bool,
@@ -90,8 +98,7 @@ async def visibility_dialog(kind: str, repo_id: str, currently_private: bool,
         notify_error(e)
         return
     notify_ok(f'{repo_id} is now {"private" if target else "public"}')
-    if on_done:
-        on_done(target)
+    await _done(on_done, target)
 
 
 async def duplicate_dialog(kind: str, repo_id: str) -> None:
@@ -127,5 +134,4 @@ async def delete_dialog(kind: str, repo_id: str, on_done: Callable[[], None] | N
         notify_error(e)
         return
     notify_ok(f'Deleted {repo_id}')
-    if on_done:
-        on_done()
+    await _done(on_done)

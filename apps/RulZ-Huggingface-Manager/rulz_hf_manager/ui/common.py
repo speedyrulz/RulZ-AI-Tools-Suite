@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import posixpath
+import re
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -62,6 +64,15 @@ SIZE_FORMAT_JS = ('(v, row) => (row && row.is_dir) || v === null || v === undefi
                   '(v < 1024 ? v + " B" : v < 1048576 ? (v/1024).toFixed(1) + " KB" : '
                   'v < 1073741824 ? (v/1048576).toFixed(1) + " MB" : v < 1099511627776 ? '
                   '(v/1073741824).toFixed(2) + " GB" : (v/1099511627776).toFixed(2) + " TB")')
+
+
+def masked_hint(secret: str, empty: str = '') -> str:
+    """What a key box shows instead of the saved key itself (which never goes to the browser)."""
+    secret = (secret or '').strip()
+    if not secret:
+        return empty
+    shown = f'{secret[:3]}...{secret[-4:]}' if len(secret) > 12 else '****'
+    return f'Saved: {shown} (type a new one to replace it)'
 
 
 def browse_url(kind: str, repo_id: str, path: str = '', rev: str | None = None) -> str:
@@ -194,9 +205,15 @@ async def open_location(text: str) -> None:
         kind, repo_id, path = hub.parse_location(text)
         if kind is None:
             kind = await run.io_bound(hub.detect_kind, repo_id)
-        ui.navigate.to(browse_url(kind, repo_id, path))
+        if path and not text.strip().startswith('hf://') and re.search(r'/(?:blob|resolve)/', text):
+            # a huggingface.co link to a file: open the folder holding it
+            path = posixpath.dirname(path)
+        ui.navigate.to(browse_url(kind, repo_id, path, hub.parse_revision(text, kind)))
     except Exception as e:  # noqa: BLE001
         notify_error(e)
+
+
+JOBS_SHOWN = 60  # the drawer lists the newest jobs; older ones stay in memory until "Clear finished"
 
 
 def _job_list() -> None:
@@ -205,7 +222,13 @@ def _job_list() -> None:
             ui.icon('inbox', size='lg')
             ui.label('No activity yet')
         return
-    for job in manager.jobs:
+    jobs = list(manager.jobs)
+    shown = [j for j in jobs if j.active] + [j for j in jobs if not j.active]
+    if len(shown) > JOBS_SHOWN:
+        shown = shown[:JOBS_SHOWN]
+        ui.label(f'Showing the newest {JOBS_SHOWN} of {len(jobs)}. "Clear finished" tidies up.') \
+            .classes('text-xs rulz-muted')
+    for job in sorted(shown, key=lambda j: -j.id):
         with ui.card().classes('w-full rulz-card rz-job p-3 gap-1').props('flat'):
             with ui.row().classes('w-full items-center no-wrap gap-2'):
                 if job.status == 'running':
@@ -284,20 +307,22 @@ def frame(active: str = '') -> Iterator[PageLook]:
                 ui.tooltip('Switch between the dark and the light look')
             avatar_slot = ui.row().classes('items-center')
 
-    state = {'version': -1, 'active': 0}
+    state = {'version': -1, 'active': 0, 'shown': -1}
 
     def tick() -> None:
-        if manager.version != state['version']:
-            state['version'] = manager.version
-            jobs_view.refresh()
-            n = manager.active_count
+        version, n = manager.version, manager.active_count
+        if version != state['version']:
+            state['version'] = version
             badge.set_text(str(n) if n else '')
             badge.set_visibility(bool(n))
             if n > state['active'] and not drawer.value:
                 drawer.show()
             state['active'] = n
-        elif manager.active_count:
-            jobs_view.refresh()  # keep elapsed time ticking
+        # Rebuilding the list is the expensive part (every job card, every tab, several times a second while a
+        # transfer reports progress): only while the drawer is open. Opening it catches up at the next tick.
+        if drawer.value and (state['shown'] != version or n):
+            state['shown'] = version
+            jobs_view.refresh()  # also keeps the elapsed time of running jobs ticking
     ui.timer(0.7, tick)
 
     async def load_identity() -> None:
