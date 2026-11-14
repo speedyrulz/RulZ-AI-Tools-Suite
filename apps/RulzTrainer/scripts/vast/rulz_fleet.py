@@ -233,6 +233,26 @@ def point_at_pushed(config, push) -> dict:
     return swap(config) if roots else config
 
 
+def with_reg_folder(config, push) -> list:
+    """The folders to send with a run, its regularisation folder (reg_dir) added: one named by its full path on this
+    computer cannot be read on an instance, so it goes to datasets/<name> like a dataset, and point_at_pushed then
+    reads it there. Left as it is: a relative reg_dir (a folder the instance has), one that is no folder here, and
+    one that is, or lies inside, a folder already being sent."""
+    push = list(push)
+    reg = config.get("reg_dir") if isinstance(config, dict) else None
+    if not isinstance(reg, str) or not reg or not Path(reg).is_absolute() or not Path(reg).is_dir():
+        return push
+    path = Path(reg).resolve()
+    roots = [Path(p).resolve() for p in push]
+    if any(path == root or root in path.parents for root in roots):
+        return push
+    same = [str(p) for p, root in zip(push, roots) if root.name.lower() == path.name.lower()]
+    if same:
+        raise Refused(f"The regularisation folder {reg} has the same name as a folder being sent ({same[0]}): both "
+                      f"would land in datasets/{path.name} on the instance. Rename one of them.")
+    return push + [path]
+
+
 class Lane:
     """Jobs done one after another on a daemon thread: an instance's downloads, or its dispatches. A daemon thread,
     so a wait that ends is not held up by a download still going (files copied in part come again: a pull skips a
@@ -737,6 +757,7 @@ class Fleet:
         missing = [str(p) for p in push if not Path(p).exists()]
         if missing:
             raise Refused(f"Not found here: {', '.join(missing)}")
+        push = with_reg_folder(config, push)
         base = {"config": point_at_pushed(config, push), "set": list(sets), "preset": preset or "", "push": [str(Path(p)) for p in push],
                 "instance": int(instance) if instance else None, "download": modes, "overwrite": bool(overwrite),
                 "label": label or "", "added": self.now()}
@@ -1622,7 +1643,8 @@ def check_entries(fleet: Fleet, entries: list[dict]) -> list[dict]:
         message = (done.stderr or b"").decode("utf-8", "replace").strip()
         # not a reason to refuse: the dataset is pushed at the start, another instance may have the name free, or
         # this one just dropped out of reach
-        fine_later = (entry.get("push") and "Dataset folder not found" in message) \
+        fine_later = (entry.get("push") and ("Dataset folder not found" in message
+                                             or "Regularisation folder not found" in message)) \
             or ("already exists" in message and len(pool) > 1) or done.returncode == remote.SSH_FAILED
         if not fine_later:
             raise Refused(f"{entry['job']} on instance {inst['id']}: {message}")

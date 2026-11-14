@@ -513,6 +513,16 @@ def race_rows(data: dict, wanted: list[str]) -> dict:
     return race.variant_configs(TrainConfig.from_dict(dict(data, race_configs=picked)))[0][1].to_dict()
 
 
+def moved_aside_name(job_dir: Path) -> Path:
+    """Where start --overwrite moves an earlier run's folder: <job>_replaced_<date-time> beside it (a number added if
+    that is taken too), so the new run starts in an empty folder and the old run's files stay readable."""
+    base = job_dir.with_name(f"{job_dir.name}_replaced_{time.strftime('%Y%m%d-%H%M%S')}")
+    out, n = base, 2
+    while out.exists():
+        out, n = base.with_name(f"{base.name}_{n}"), n + 1
+    return out
+
+
 def cmd_start(args) -> int:
     """Queue a run. The checks of the WebUI's queue_run, the trainer's own validate, and refusing to overwrite an
     earlier run's folder."""
@@ -537,23 +547,60 @@ def cmd_start(args) -> int:
     q = queue()
     active = running_dir()
     taken = {e["job"] for e in q.snapshot()["waiting"]} | ({active.name} if active is not None else set())
-    if cfg.job_name in taken:
-        raise Refused(f"Job name {cfg.job_name!r} is already running or queued.")
-    if cfg.job_dir().exists() and not args.overwrite:
-        raise Refused(f"{cfg.job_dir()} already exists: pick a new job name, or --overwrite to replace that run.")
+    try:  # an install from before runplan.py: its WebUI starts into any folder, so the old rule (no folder) stays
+        from rulztrainer import runplan
+    except ImportError:
+        runplan = None
+    if (runplan.name_in(cfg.job_name, taken) if hasattr(runplan, "name_in") else cfg.job_name in taken):
+        free = f" ({runplan.next_free_name(cfg.job_name, taken, cfg.output_dir)!r} is free)" if runplan else ""
+        raise Refused(f"Job name {cfg.job_name!r} is already running or queued{free}.")
+    if runplan is None:
+        if cfg.job_dir().exists() and not args.overwrite:
+            raise Refused(f"{cfg.job_dir()} already exists: pick a new job name, or --overwrite to replace that run.")
+        aside = None
+    else:
+        # the WebUI refuses to start a new run in a folder that holds an earlier run's output (a folder whose run
+        # saved nothing is free, and so is carrying that run on from its own state); --overwrite moves the earlier
+        # run's folder aside first, so nothing of it is written over. ("already exists": rulz_fleet.py tries another
+        # instance on it.)
+        free = runplan.job_name_taken(cfg.job_name, cfg.output_dir, cfg.resume_state, taken)
+        if free is not None and not args.overwrite:
+            raise Refused(f"{cfg.job_dir()} already exists and holds an earlier run's files: pick a new job name "
+                          f"({free!r} is free), or --overwrite to move that run's folder aside and start afresh.")
+        aside = cfg.job_dir() if free is not None else None
     missing = [sp.path or "(none picked)" for sp in cfg.dataset_specs() if not sp.path or not Path(sp.path).is_dir()]
     if missing:
         raise Refused(f"Dataset folder not found: {', '.join(missing)}")
+    reg = getattr(cfg, "reg_dir", "")  # (an install from before the regularisation dataset has no such setting)
+    if reg and not Path(reg).is_dir():
+        raise Refused(f"Regularisation folder not found: {reg}")
     plan = {"job": cfg.job_name, "arch": cfg.arch_name(), "steps": cfg.steps,
             "datasets": [sp.path for sp in cfg.dataset_specs()],
             "changed": {k: [before.get(k), v] for k, v in cfg.to_dict().items()
                         if before.get(k) != v and k != "job_name"}}
+    if aside is not None:
+        plan["moved_aside"] = str(moved_aside_name(aside))
     if args.dry_run:
         show(dict(plan, dry_run=True, job_running=active is not None, queue=queue_view()))
         return 0
-    if args.resume_queue:
-        q.set_paused(False)
-    return report_start(q, q.add(cfg.to_dict(), label=cfg.arch_name()), plan, active is not None)
+    if aside is not None:
+        try:
+            aside.rename(plan["moved_aside"])
+        except OSError as e:  # a file of it is open, no permission: nothing was moved and nothing is queued
+            raise Refused(f"Could not move the earlier run's folder {aside} aside ({e}): nothing was queued. Pick a "
+                          f"new job name, or close what is reading that folder.") from e
+    try:
+        if args.resume_queue:
+            q.set_paused(False)
+        entry = q.add(cfg.to_dict(), label=cfg.arch_name())
+    except BaseException:  # not queued after all: the earlier run goes back under its name
+        if aside is not None and not aside.exists():
+            try:
+                Path(plan["moved_aside"]).rename(aside)
+            except OSError:
+                pass
+        raise
+    return report_start(q, entry, plan, active is not None)
 
 
 def report_start(q, entry: dict, plan: dict, busy: bool) -> int:
@@ -932,7 +979,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
     p.add_argument("--race-rows", default="", metavar="NAME[,NAME]",
                    help="of a race config, keep only these configurations (one alone: a plain run with its settings)")
-    p.add_argument("--overwrite", action="store_true", help="replace an existing job folder of that name")
+    p.add_argument("--overwrite", action="store_true",
+                   help="start afresh under a name whose folder holds an earlier run (that folder is moved aside)")
     p.add_argument("--dry-run", action="store_true", help="check everything, show the plan, queue nothing")
     p.add_argument("--resume-queue", action="store_true", help="also resume the queue when it is paused")
     p = command("stop", cmd_stop)
