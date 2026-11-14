@@ -6,7 +6,7 @@ from nicegui import run, ui
 
 from .. import __version__, config, hub
 from ..platform_utils import open_folder, platform_label, to_local_path
-from .common import frame, notify_error, notify_ok
+from .common import frame, masked_hint, notify_error, notify_ok
 from .pickers import pick_local
 
 TOKEN_SOURCES = {
@@ -35,8 +35,10 @@ async def settings_page() -> None:
                         f'in `{config.settings_path()}`.').classes('text-sm')
             source_row = ui.row().classes('items-center gap-2 text-sm')
             with ui.row().classes('w-full items-center gap-2 no-wrap'):
-                token_input = ui.input('Token', value=s.token, password=True, password_toggle_button=True,
-                                       placeholder='hf_...').props('outlined').classes('flex-1 rulz-mono')
+                # The saved token itself never goes to the browser (with "Whole network" anyone on the LAN could
+                # read it from the page): the box shows a masked hint and takes a new token only.
+                token_input = ui.input('Token', password=True, password_toggle_button=True) \
+                    .props('outlined stack-label').classes('flex-1 rulz-mono')
                 ui.button('Save & test', icon='save', on_click=lambda: save_token())
             with ui.row().classes('gap-2'):
                 ui.button('Test current token', icon='verified_user', on_click=lambda: test_token()) \
@@ -48,6 +50,8 @@ async def settings_page() -> None:
             result = ui.column().classes('w-full gap-1')
 
         def render_source() -> None:
+            token_input.props['placeholder'] = masked_hint(s.token, 'hf_...')
+            token_input.update()
             src = hub.token_source()
             icon, color, text = TOKEN_SOURCES[src]
             source_row.clear()
@@ -101,28 +105,36 @@ async def settings_page() -> None:
                         ui.label('This is a read-only token: browsing and downloading work, but uploads, moves, '
                                  'renames and deletes will fail.')
 
-        async def save_token() -> None:
-            value = (token_input.value or '').strip()
-            if value and not value.startswith('hf_'):
-                ui.notify('Hugging Face tokens usually start with "hf_". Saved anyway.', type='warning')
+        async def store_token(value: str, note: str) -> None:
             s.token = value
             config.save()
             hub.forget_identity()
+            token_input.value = ''
             render_source()
-            notify_ok('Token saved' if value else 'Token removed')
+            notify_ok(note)
             await test_token()
 
+        async def save_token() -> None:
+            value = (token_input.value or '').strip()
+            if not value:
+                if s.token:  # an empty box keeps the saved token ("Remove saved token" removes it)
+                    await test_token()
+                else:
+                    notify_error('Paste a token first.')
+                return
+            if not value.startswith('hf_'):
+                ui.notify('Hugging Face tokens usually start with "hf_". Saved anyway.', type='warning')
+            await store_token(value, 'Token saved')
+
         async def clear_token() -> None:
-            token_input.value = ''
-            await save_token()
+            await store_token('', 'Token removed')
 
         async def import_token() -> None:
             tok = hub.external_token()
             if not tok:
                 notify_error('No token found from "hf auth login" or HF_TOKEN.')
                 return
-            token_input.value = tok
-            await save_token()
+            await store_token(tok, 'Token imported')
 
         # ------------------------------------------------------------------ downloads
         with ui.card().classes('rulz-card w-full p-5 gap-3'):

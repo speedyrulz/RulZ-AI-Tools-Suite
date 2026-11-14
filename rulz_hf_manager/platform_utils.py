@@ -88,6 +88,19 @@ def default_download_dir() -> Path:
     return Path.home() / 'Downloads' / 'HuggingFace'
 
 
+def windows_drive_letters() -> list[str]:
+    """The drive letters Windows has, from one bitmask call. Asking each letter with ``exists()`` instead waits on
+    disconnected network drives and empty card readers, seconds per letter, while the file picker opens."""
+    try:
+        import ctypes  # noqa: PLC0415
+        mask = ctypes.windll.kernel32.GetLogicalDrives()  # type: ignore[attr-defined]
+    except (ImportError, AttributeError, OSError):
+        mask = 0
+    if not mask:
+        return [c for c in string.ascii_uppercase if os.path.exists(f'{c}:\\')]
+    return [c for i, c in enumerate(string.ascii_uppercase) if mask >> i & 1]
+
+
 def quick_locations() -> list[tuple[str, str, Path]]:
     """(label, icon, path) shortcuts shown in the local file picker."""
     home = Path.home()
@@ -101,13 +114,8 @@ def quick_locations() -> list[tuple[str, str, Path]]:
     if win_home is not None:
         locations.append(('Windows home', 'window', win_home))
     if IS_WINDOWS:
-        for letter in string.ascii_uppercase:
-            drive = Path(f'{letter}:\\')
-            try:
-                if drive.exists():
-                    locations.append((f'{letter}:', 'storage', drive))
-            except OSError:
-                continue
+        for letter in windows_drive_letters():
+            locations.append((f'{letter}:', 'storage', Path(f'{letter}:\\')))
     else:
         locations.append(('/', 'storage', Path('/')))
         mnt = Path('/mnt')

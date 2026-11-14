@@ -43,6 +43,13 @@ def _cleanup_temp_downloads() -> None:
         hub.cleanup_temp(p)
 
 
+async def _sweep_old_temp() -> None:
+    # Closing the console window kills the app before its shutdown hook runs, which used to leave the zips made
+    # for browser downloads (often GBs) in the temp folder for good: clear what earlier runs left behind.
+    await run.io_bound(hub.sweep_stale_temp)
+
+
+app.on_startup(_sweep_old_temp)
 app.on_shutdown(_cleanup_temp_downloads)
 
 
@@ -339,10 +346,13 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
 
     async def refresh(keep_selection: bool = False) -> None:
         folder = state['folder']
+        state['listing'] = ticket = state.get('listing', 0) + 1
         table.props('loading')
         try:
             entries = await run.io_bound(fs.list_dir, folder)
         except Exception as e:  # noqa: BLE001
+            if state['listing'] != ticket:
+                return
             entries = []
             missing = isinstance(e, (hub.hf_errors.EntryNotFoundError, hub.hf_errors.RemoteEntryNotFoundError))
             if not (missing and folder in state['virtual']):
@@ -351,8 +361,11 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
                     table.props(remove='loading')
                     await navigate(folder.rsplit('/', 1)[0] if '/' in folder else '')
                     return
-        finally:
-            table.props(remove='loading')
+        if state['listing'] != ticket:
+            # A newer listing was asked for meanwhile (a quick click into another folder): showing this older,
+            # slower one would put folder A's files under folder B's breadcrumbs, and act on the wrong folder.
+            return
+        table.props(remove='loading')
         if not settings.show_hidden:
             entries = [e for e in entries if not e.name.startswith('.')]
         state['entries'] = {e.path: e for e in entries}
@@ -523,11 +536,19 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
     # ======================================================================== upload
     async def confirm_upload(pairs: list[tuple[str | Path, str]], source_label: str) -> tuple[bool, str, bool]:
         """Show a summary of what will be uploaded. Returns (ok, commit message, create_pr)."""
+        seen: set[str] = set()
+        twice = sorted({d for _, d in pairs if d in seen or seen.add(d)})
+        if twice:
+            # Two picked files with the same name (a/model.bin and b/model.bin) would both go to one path, and one
+            # of them would silently not be uploaded.
+            notify_error(f'{len(twice)} file(s) would be uploaded to the same place, e.g. "{twice[0]}". '
+                         'Pick their folders instead, or upload them one at a time.')
+            return False, '', False
         try:
             conflicts = await run.io_bound(fs.existing, [d for _, d in pairs])
         except Exception:  # noqa: BLE001
             conflicts = set()
-        total = sum(Path(s).stat().st_size for s, _ in pairs if isinstance(s, (str, Path)) and Path(s).exists())
+        total = await run.io_bound(_local_total, [s for s, _ in pairs])  # thousands of stat calls: not on the loop
         dest = state['folder'] or '(root)'
         with ui.dialog() as dialog, ui.card().classes('rulz-card w-[620px] max-w-[95vw] gap-3'):
             ui.label('Upload').classes('text-lg font-semibold')
@@ -579,6 +600,8 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
 
             async def on_upload(e: events.UploadEventArguments) -> None:
                 filename = Path(e.file.name).name or 'file'
+                if filename in staged:
+                    ui.notify(f'"{filename}" was already dropped: the newer one replaces it', type='warning')
                 target = tmp / filename
                 await e.file.save(target)
                 staged[filename] = target
@@ -713,7 +736,10 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
             local_dir = Path(to_local_path(local.value or ''))
 
             def work(job: Job) -> Path | None:
-                fs.sync('', '', 'up', False, None, None, apply_file=plan_file)
+                try:
+                    fs.sync('', '', 'up', False, None, None, apply_file=plan_file)
+                finally:
+                    shutil.rmtree(Path(plan_file).parent, ignore_errors=True)
                 return local_dir if down else None
             run_job(f'Sync {repo_id}', work, icon='sync', success='Sync finished', after=after_change)
         preview_btn.on_click(do_preview)
@@ -723,8 +749,9 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
     async def push_folder_dialog() -> None:
         with ui.dialog() as dialog, ui.card().classes('rulz-card w-[680px] max-w-[95vw] gap-3'):
             ui.label('Push a whole folder').classes('text-lg font-semibold')
-            ui.label('Uploads the contents of a local folder into the current repo folder in a single commit. '
-                     'Unchanged large files are de-duplicated by the Hub, so re-pushing is fast.') \
+            ui.label('Uploads the contents of a local folder into the current repo folder (a big folder goes in '
+                     'several commits). Unchanged large files are de-duplicated by the Hub, so re-pushing is fast, '
+                     'and a push that broke off continues where it stopped.') \
                 .classes('text-sm rulz-muted')
             with ui.row().classes('w-full items-center no-wrap gap-2'):
                 local = ui.input('Local folder').props('outlined dense').classes('flex-1 rulz-mono')
@@ -738,6 +765,10 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
                 .classes('w-full rulz-mono')
             mirror = ui.checkbox('Mirror: delete files in that repo folder that are not in the local folder')
             msg, pr = commit_fields(fs, 'Upload folder')
+            if pr is not None and fs.revision not in (None, 'main'):
+                # huggingface_hub refuses a pull request for a folder upload on any branch but main
+                pr.value = False
+                pr.set_visibility(False)
             with ui.row().classes('w-full justify-end gap-2'):
                 ui.button('Cancel', on_click=lambda: dialog.submit(False)).props('flat')
                 ui.button('Push', icon='upload', on_click=lambda: dialog.submit(True))
@@ -749,8 +780,8 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
             notify_error(f'Local folder not found: {local_dir}')
             return
         if mirror.value and not await confirm('Mirror the folder?', 'Files in the repo folder that do not exist '
-                                              'locally will be deleted in the same commit.', ok_label='Mirror',
-                                              ok_color='warning'):
+                                              'locally will be deleted, in a last commit once every upload has '
+                                              'gone through.', ok_label='Mirror', ok_color='warning'):
             return
         dest, message, create_pr, mirror_v = (remote.value or '').strip('/'), msg.value or 'Upload folder', \
             bool(pr.value), bool(mirror.value)
@@ -1005,10 +1036,7 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
             dialog.open()
             return
 
-        try:
-            content = data.decode('utf-8')
-        except UnicodeDecodeError:
-            content = data.decode('latin-1')
+        content, encoding, newline = decode_text(data)
         dark = config.get().dark_mode != 'light'
         lang = LANGUAGE.get(suffix) or ('Markdown' if entry.name.lower().startswith('readme') else None)
         editor_state: dict = {'editor': None}
@@ -1048,6 +1076,12 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
             if new_content == content:
                 ui.notify('No changes')
                 return
+            try:
+                new_data = encode_text(new_content, encoding, newline)
+            except UnicodeEncodeError as e:
+                notify_error(f'This file is {encoding}, which cannot hold "{new_content[e.start:e.end]}". '
+                             'Remove that character, or download, edit and upload the file.')
+                return
             message = f'Update {entry.path}'
             create_pr = False
             if not is_bucket:
@@ -1062,7 +1096,7 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
                 message, create_pr = (m.value if m else '') or message, bool(p.value) if p else False
             save_btn.props('loading')
             try:
-                await run.io_bound(fs.write_bytes, entry.path, new_content.encode('utf-8'), message, create_pr)
+                await run.io_bound(fs.write_bytes, entry.path, new_data, message, create_pr)
             except Exception as e:  # noqa: BLE001
                 notify_error(e)
                 return
@@ -1085,6 +1119,36 @@ async def browse_page(kind: str, namespace: str, name: str, path: str = '', rev:
     ui.timer(0.01, load_summary, once=True)
     if not is_bucket:
         ui.timer(0.01, load_branches, once=True)
+
+
+def decode_text(data: bytes) -> tuple[str, str, str]:
+    """Text for the editor, plus what saving needs to give the file back as it was: its encoding and line ending.
+    The editor works with "\\n" only; a CRLF file saved as LF would turn the commit into a whole-file change."""
+    try:
+        text, encoding = data.decode('utf-8'), 'utf-8'
+    except UnicodeDecodeError:
+        text, encoding = data.decode('latin-1'), 'latin-1'
+    crlf = text.count('\r\n')
+    newline = '\r\n' if crlf and crlf >= text.count('\n') - crlf else '\n'  # mixed: whichever most lines use
+    return text.replace('\r\n', '\n'), encoding, newline
+
+
+def encode_text(text: str, encoding: str, newline: str) -> bytes:
+    text = text.replace('\r\n', '\n')
+    if newline != '\n':
+        text = text.replace('\n', newline)
+    return text.encode(encoding)
+
+
+def _local_total(sources: list) -> int:
+    total = 0
+    for s in sources:
+        if isinstance(s, (str, Path)):
+            try:
+                total += Path(s).stat().st_size
+            except OSError:
+                pass
+    return total
 
 
 def _strip_front_matter(text: str) -> str:
