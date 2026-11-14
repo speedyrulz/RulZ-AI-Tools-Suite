@@ -10,20 +10,30 @@ from pathlib import Path
 LOCAL_IMAGE_EXTS = {".jpg", ".jpeg", ".jfif", ".png", ".gif", ".webp", ".bmp", ".avif", ".heic", ".heif"}
 
 
-def list_image_files(root: Path, recursive: bool, exclude: Path | None = None) -> list[Path]:
-    """Image files under root by extension, sorted by path. Folders that can't be read are skipped,
-    and so is `exclude` (the app's own output folder, so a scan never re-reads its earlier results)."""
+def list_image_files(
+    root: Path, recursive: bool, exclude: Path | None = None, limit: int | None = None
+) -> list[Path]:
+    """Image files under root by extension: each folder's files by name, then its subfolders by name.
+    Folders that can't be read are skipped, and so is `exclude` (the app's own output folder, so a scan
+    never re-reads its earlier results). Stops after `limit` files, so a scan capped at 300 images
+    doesn't first list a whole drive."""
     exclude = exclude.resolve() if exclude else None
     out: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
         here = Path(dirpath)
         if exclude is not None:
-            dirnames[:] = [d for d in dirnames if (here / d).resolve() != exclude]
-        dirnames.sort()
-        out.extend(here / f for f in filenames if Path(f).suffix.lower() in LOCAL_IMAGE_EXTS)
+            # Resolving every subfolder is a system call each: only those named like the output folder.
+            name = exclude.name.lower()
+            dirnames[:] = [d for d in dirnames if d.lower() != name or (here / d).resolve() != exclude]
+        dirnames.sort(key=str.lower)
+        for f in sorted(filenames, key=str.lower):
+            if Path(f).suffix.lower() in LOCAL_IMAGE_EXTS:
+                out.append(here / f)
+                if limit is not None and len(out) >= limit:
+                    return out
         if not recursive:
             break
-    return sorted(out)
+    return out
 
 
 _picker_lock = threading.Lock()

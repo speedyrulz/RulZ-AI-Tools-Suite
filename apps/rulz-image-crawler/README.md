@@ -58,8 +58,11 @@ powershell -ExecutionPolicy Bypass -File start_app.ps1 -Gpu 1 -NoBrowser
    EXCLUDE). Set the confidence to save at (0.8 is suggested for small body details like hands or eyes), a
    **minimum size in megapixels** (0 = any) and the crawl limits.
 3. **Crawl & Download** (or **Scan & Copy matches**). Matches appear as they're found, each with its size;
-   Pause, Resume and Cancel at any time.
-4. Use the slider to hide less certain matches and **Download shown as zip**, or grab single images.
+   Pause, Resume and Cancel at any time. Anything that went wrong (a page that failed, a site asking to slow
+   down) shows under **Problems** as it happens. Reloading or reopening the page brings a running search back
+   with its controls.
+4. Use the slider to hide less certain matches and **Download shown as zip** (it starts at once; the zip is made
+   while it downloads), or grab single images.
 5. **Past searches** lists every earlier run (also from before a restart); **View** reopens its matches.
 
 **Full-size originals** (on by default): for each picture the app first tries the full-size original — the
@@ -73,12 +76,15 @@ Pictures served as AVIF are kept like any other format.
 **Stay in this folder** (off by default): only follow links inside the start address's folder and below.
 Starting at `example.com/gallery/cats` (or `.../cats/`, or `.../cats/index.html`) crawls `/gallery/cats/...`
 but never `/gallery/dogs/` or the site's home page. Off, the crawler follows any link on the same site.
+Either way, a link that redirects off the site (or out of the folder) is skipped once the crawler sees where
+it landed, and so is a page **Respect robots.txt** rules out at its new address; they count as *pages skipped*.
 
 **Confidence** is the model's own probability for its yes/no answer, so clear-cut images score ~1.00 and
 borderline ones lower; the slider is most useful for subtle prompts.
 
 Each run is saved to `output\<date>_<site or folder>_<tag>\` with the image files and `matches.json`. Folder
-scans **copy** matches there; the scanned folder is never changed.
+scans **copy** matches there; the scanned folder is never changed. If that disk fills up, the run pauses with a
+message (the match it was saving is kept); free some space and press Resume.
 Expect roughly 1–2 s per new image; images checked before come from the cache instantly.
 
 ## Where things are
@@ -95,8 +101,8 @@ Expect roughly 1–2 s per new image; images checked before come from the cache 
 ## Tests
 
 ```powershell
-python -m pytest crawler_app        # 40 tests, real Chromium + a fake model; no GPU needed
-python -m pytest image_detection    # 44 engine tests, no GPU needed
+python -m pytest crawler_app        # 57 tests, real Chromium + a fake model; no GPU needed
+python -m pytest image_detection    # 55 engine tests, no GPU needed
 python image_detection\scripts\eval_labeled.py   # accuracy on your labeled images (see image_detection\README.md)
 ```
 

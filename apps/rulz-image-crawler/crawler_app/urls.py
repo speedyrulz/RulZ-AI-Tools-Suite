@@ -25,6 +25,8 @@ def _is_tracking(key: str) -> bool:
 
 def _clean_netloc(scheme: str, host: str, port: int | None) -> str:
     default = {"http": 80, "https": 443}[scheme]
+    if ":" in host:  # an IPv6 address: urlsplit drops its brackets, the URL needs them back
+        host = f"[{host}]"
     return host if port in (None, default) else f"{host}:{port}"
 
 
@@ -66,6 +68,16 @@ def site_key(url: str) -> str:
     """Host used for the same-site check; `www.example.com` and `example.com` are the same site."""
     host = (urlsplit(url).hostname or "").lower()
     return host[4:] if host.startswith("www.") else host
+
+
+def page_key(url: str) -> str:
+    """What makes two page URLs the same page for the crawl: the site (www or not), port, path and
+    query, but not http vs https. A link to `http://www.example.com/a` is the page already read at
+    `https://example.com/a`."""
+    p = urlsplit(url)
+    default = {"http": 80, "https": 443}.get(p.scheme.lower())
+    port = f":{p.port}" if p.port not in (None, default) else ""
+    return f"{site_key(url)}{port}{p.path or '/'}?{p.query}"
 
 
 def path_scope(url: str) -> str:

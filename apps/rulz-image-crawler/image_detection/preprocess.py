@@ -10,6 +10,8 @@ import base64
 import binascii
 import hashlib
 import io
+import math
+import sys
 from dataclasses import dataclass
 
 import httpx
@@ -95,6 +97,28 @@ def _has_transparency(img: Image.Image) -> bool:
     return False
 
 
+# 16-bit grayscale modes -> offset of each pixel's high byte in tobytes() (I;16N is the machine's order).
+_HIGH_BYTE = {"I;16": 1, "I;16L": 1, "I;16B": 0, "I;16N": 0 if sys.byteorder == "big" else 1}
+
+
+def _to_8bit(img: Image.Image) -> Image.Image:
+    """High-bit-depth grayscale to 8-bit "L". convert("RGB") clips every value above 255, so a 16-bit
+    grayscale PNG (mode I;16) would reach the model almost white. Every other mode is returned as is."""
+    if img.mode in _HIGH_BYTE:
+        # value // 256, exactly: keep each pixel's high byte. (Pillow's own I;16N -> I conversion clips.)
+        out = Image.frombytes("L", img.size, img.tobytes()[_HIGH_BYTE[img.mode] :: 2])
+        out.info = dict(img.info)
+    elif img.mode in ("I", "F"):
+        top = img.getextrema()[1]
+        if top > 255 and math.isfinite(top):
+            img = img.point(lambda v: v * (255 / top) + 0.5)  # + 0.5: round, as the convert below truncates
+        out = img.convert("L")
+    else:
+        return img
+    out.info.pop("transparency", None)  # in the old units, and ignored for grayscale anyway
+    return out
+
+
 def prepare_image(raw: bytes, max_edge: int, min_short_edge: int, jpeg_quality: int = 90) -> PreparedImage:
     """CPU-bound; call via asyncio.to_thread."""
     try:
@@ -117,6 +141,8 @@ def prepare_image(raw: bytes, max_edge: int, min_short_edge: int, jpeg_quality: 
         raise ImageError(f"cannot decode image: {e}") from e
 
     img = ImageOps.exif_transpose(img)
+    # Before the resize too: Pillow's reduce() (used by reducing_gap) refuses I;16 images.
+    img = _to_8bit(img)
     w, h = img.size
 
     scale = max_edge / max(w, h)
