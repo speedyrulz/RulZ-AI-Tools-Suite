@@ -1,7 +1,7 @@
 """Dialogs: text input, confirmation, person picker, and the rename/merge flows."""
 from __future__ import annotations
 
-from PySide6.QtCore import QRectF, QSize, Qt
+from PySide6.QtCore import QRectF, QSize, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (QAbstractButton, QApplication, QDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget,
                                QListWidgetItem, QVBoxLayout, QWidget)
@@ -106,6 +106,12 @@ class PersonPicker(_Base):
         self.lay.addWidget(self.list)
         self.people = [p for p in db.people(include_hidden=True) if p.id not in (exclude or set())]
         self._icons: dict[int, QIcon] = {}
+        # Avatars are painted a few at a time after the list shows: hundreds of groups made the dialog take
+        # seconds to open.
+        self._placeholder = QIcon(circle_pixmap(None, 36))
+        self._icon_rows: list[tuple[int, Person]] = []
+        self._icon_timer = QTimer(self, interval=0)
+        self._icon_timer.timeout.connect(self._icon_step)
         self.search.textChanged.connect(self._fill)
         self.search.returnPressed.connect(self._enter)
         self.list.itemActivated.connect(self._choose)
@@ -124,8 +130,19 @@ class PersonPicker(_Base):
             self._icons[p.id] = QIcon(circle_pixmap(face_image(p.cover_face_id), 36))
         return self._icons[p.id]
 
+    def _icon_step(self):
+        for _ in range(16):
+            if not self._icon_rows:
+                self._icon_timer.stop()
+                return
+            row, p = self._icon_rows.pop(0)
+            it = self.list.item(row)
+            if it is not None and it.data(Qt.UserRole) == p.id:  # still the same row after a new search
+                it.setIcon(self._icon(p))
+
     def _fill(self, text: str):
         self.list.clear()
+        self._icon_rows = []
         q = text.strip().lower()
         if self.allow_new and q and not any((p.name or "").lower() == q for p in self.people):
             it = QListWidgetItem(theme.icon("add_person", theme.C["accent"], 22), f'Add new person "{text.strip()}"')
@@ -139,11 +156,16 @@ class PersonPicker(_Base):
         for p in self.people:
             if q and q not in (p.name or "").lower():
                 continue
-            label = p.name or f"Unnamed person"
-            it = QListWidgetItem(self._icon(p), f"{label}   ·   {plural(p.photo_count, 'photo')}"
+            label = p.name or "Unnamed person"
+            icon = self._icons.get(p.id)
+            it = QListWidgetItem(icon or self._placeholder, f"{label}   ·   {plural(p.photo_count, 'photo')}"
                                  + ("   (hidden)" if p.hidden else ""))
             it.setData(Qt.UserRole, p.id)
             self.list.addItem(it)
+            if icon is None:
+                self._icon_rows.append((self.list.count() - 1, p))
+        if self._icon_rows:
+            self._icon_timer.start()
         for i in range(self.list.count()):
             if self.list.item(i).flags() & Qt.ItemIsEnabled:
                 self.list.setCurrentRow(i)

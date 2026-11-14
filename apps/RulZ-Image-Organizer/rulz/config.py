@@ -7,7 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 
 APP_NAME = "RulZ Image Organizer"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 IMAGE_EXTS = {
     ".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".bmp", ".gif", ".webp",
@@ -36,18 +36,25 @@ def resource_path(*parts: str) -> Path:
 
 
 def data_dir() -> Path:
-    override = os.environ.get("RULZ_DATA_DIR")
-    if override:
-        return _ensure_dir(override)
-    return _ensure_dir(str(Path(os.environ.get("LOCALAPPDATA", Path.home())) / APP_NAME))
+    return _data_dir(os.environ.get("RULZ_DATA_DIR") or "", os.environ.get("LOCALAPPDATA") or "")
 
 
-@lru_cache(maxsize=4)
-def _ensure_dir(path: str) -> Path:
-    # Cached: thumb_path()/face_crop_path() run once per tile, and a mkdir per call was slow.
-    root = Path(path)
+def _data_dir_str() -> str:
+    return _data_dir_text(os.environ.get("RULZ_DATA_DIR") or "", os.environ.get("LOCALAPPDATA") or "")
+
+
+# Cached by the environment values: thumb_file()/face_crop_file() run once per grid tile (50k times for a big
+# timeline), and resolving the folder each time (Path.home(), Path objects, a mkdir) took seconds.
+@lru_cache(maxsize=8)
+def _data_dir(override: str, local_appdata: str) -> Path:
+    root = Path(override) if override else Path(local_appdata or Path.home()) / APP_NAME
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+@lru_cache(maxsize=8)
+def _data_dir_text(override: str, local_appdata: str) -> str:
+    return str(_data_dir(override, local_appdata))
 
 
 def settings():
@@ -72,11 +79,11 @@ def face_crop_path(face_id: int) -> Path:
 
 # String versions for building thousands of grid tiles quickly (Path objects are slow in bulk).
 def thumb_file(photo_id: int) -> str:
-    return f"{data_dir()}\\thumbs\\{photo_id % 256:02x}\\{photo_id}.jpg"
+    return f"{_data_dir_str()}\\thumbs\\{photo_id % 256:02x}\\{photo_id}.jpg"
 
 
 def face_crop_file(face_id: int) -> str:
-    return f"{data_dir()}\\faces\\{face_id % 256:02x}\\{face_id}.jpg"
+    return f"{_data_dir_str()}\\faces\\{face_id % 256:02x}\\{face_id}.jpg"
 
 
 DETECTOR_MODEL = resource_path("models", "face_detection_yunet_2023mar.onnx")

@@ -52,7 +52,7 @@ class LibraryPage(QWidget):
         self.list.setIconSize(QSize(22, 22))
         self.list.setMinimumHeight(170)
         self.list.itemSelectionChanged.connect(self._sel)
-        self.list.itemDoubleClicked.connect(lambda it: os.startfile(it.data(Qt.UserRole + 1)))
+        self.list.itemDoubleClicked.connect(lambda it: self._open_folder(it))
         folders.lay.addWidget(self.list)
         row = QHBoxLayout()
         self.add_btn = button("Add folder…", "add", primary=True)
@@ -60,7 +60,7 @@ class LibraryPage(QWidget):
         self.remove_btn = button("Remove from library", "delete")
         self.remove_btn.clicked.connect(self._remove)
         self.open_btn = button("Open", "open_folder")
-        self.open_btn.clicked.connect(lambda: os.startfile(self.list.currentItem().data(Qt.UserRole + 1)))
+        self.open_btn.clicked.connect(lambda: self._open_folder(self.list.currentItem()))
         row.addWidget(self.add_btn)
         row.addWidget(self.remove_btn)
         row.addWidget(self.open_btn)
@@ -201,6 +201,15 @@ class LibraryPage(QWidget):
         self.refresh()
         self.ctx.scanner.scan()
 
+    def _open_folder(self, it):
+        path = it.data(Qt.UserRole + 1) if it is not None else None
+        if not path:
+            return
+        try:
+            os.startfile(path)
+        except OSError as e:
+            dialogs.info(self, "Folder not found", f"Windows can't open\n{path}\n\n{e.strerror or e}")
+
     def _remove(self):
         it = self.list.currentItem()
         if it is None:
@@ -209,10 +218,12 @@ class LibraryPage(QWidget):
         if dialogs.confirm(self, "Remove folder", f"Stop showing photos from\n{path}?\n\nThe files on your PC "
                            "are not deleted. Face tags for these photos are removed from RulZ.",
                            ok_text="Remove", danger=True):
-            self.ctx.scanner.stop()
-            self.ctx.scanner.wait()
-            self.ctx.db.remove_folder(it.data(Qt.UserRole))
-            self.ctx.data_changed()
+            # Runs on the scan thread once a running scan has stopped (deleting thousands of thumbnails
+            # froze the window here), then the scan carries on with the other folders.
+            self.ctx.scanner.remove_folder(it.data(Qt.UserRole))
+            it.setText(f"{path}\nRemoving…")
+            it.setFlags(Qt.NoItemFlags)
+            self._sel()
 
     def _slider_moved(self, v: int, save: bool = True):
         t = v / 100

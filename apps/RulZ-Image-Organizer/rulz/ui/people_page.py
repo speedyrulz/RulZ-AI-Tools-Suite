@@ -38,7 +38,10 @@ class PeoplePage(QStackedWidget):
         self.detail.tabs.set_current(tab)
         self.detail.stack.setCurrentIndex(tab)
         self.setCurrentWidget(self.detail)
-        self.detail.refresh(reset_scroll=True)
+        if not self.detail.refresh(reset_scroll=True):
+            # Gone since the tile or face was shown (a regroup, merge or rescan): don't leave the previous
+            # person's page up under this id.
+            self.back()
 
     def back(self):
         self.setCurrentWidget(self.overview)
@@ -136,8 +139,9 @@ class PeopleOverview(QWidget):
     def _toggle_hidden(self):
         ids = self._ids()
         hide = self.hide_btn.text() == "Hide"
-        for i in ids:
-            self.ctx.db.set_hidden(i, hide)
+        with self.ctx.db.transaction():  # all or nothing if the library is busy
+            for i in ids:
+                self.ctx.db.set_hidden(i, hide)
         self.grid.clear_selection()
         self.ctx.data_changed()
 
@@ -146,8 +150,9 @@ class PeopleOverview(QWidget):
         if dialogs.confirm(self, "Ungroup", f"Dissolve {plural(len(ids), 'group')}? Their faces become "
                            "unassigned and won't be grouped together automatically again. Names are removed.",
                            ok_text="Ungroup", danger=True):
-            for i in ids:
-                self.ctx.db.ungroup_person(i)
+            with self.ctx.db.transaction():
+                for i in ids:
+                    self.ctx.db.ungroup_person(i)
             self.grid.clear_selection()
             self.ctx.data_changed()
 
@@ -196,6 +201,8 @@ class PersonPage(QWidget):
         self._cache: OrderedDict[int, _PersonData] = OrderedDict()
         self._shown: tuple[int, int] | None = None  # (person, version) currently in the grids
         self._shown_sug: tuple[int, int] | None = None  # same, for the suggestions grid
+        # (person, tiles) left after a Yes/No: reused instead of recomputing every suggestion on each click.
+        self._carry_sug: tuple[int, list[Tile]] | None = None
         self.setObjectName("Page")
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -306,14 +313,16 @@ class PersonPage(QWidget):
                 version,
                 month_sections(db.photos([person_id])),
                 [Tile(key=f.id, image=face_image(f.id), data=f) for f, _ in db.faces_of_person(person_id)])
+            if self._carry_sug is not None and self._carry_sug[0] == person_id:
+                data.suggestion_tiles = self._carry_sug[1]
             self._cache[person_id] = data
+        self._carry_sug = None
         self._cache.move_to_end(person_id)
         while len(self._cache) > self.CACHE_SIZE:
             self._cache.popitem(last=False)
         return data
 
     def refresh(self, reset_scroll: bool = False) -> bool:
-        db = self.ctx.db
         p = self._p()
         if p is None or p.face_count == 0:
             return False
@@ -467,11 +476,20 @@ class PersonPage(QWidget):
     def _accept_suggestions(self):
         ids = [t.key for t in self.suggest.selected_tiles()]
         self.ctx.db.assign_faces(ids, self.person_id)
-        self.suggest.clear_selection()
-        self.ctx.data_changed()
+        self._answered(ids)
 
     def _reject_suggestions(self):
         ids = [t.key for t in self.suggest.selected_tiles()]
         self.ctx.db.reject_faces(ids, self.person_id)
+        self._answered(ids)
+
+    def _answered(self, ids: list[int]):
+        """After Yes/No, the other suggestions stand: keep them rather than recompute all of them (it
+        compares against every unassigned face, about a second per click in a big library)."""
+        cached = self._cache.get(self.person_id)
+        if cached is not None and cached.suggestion_tiles is not None:
+            done = set(ids)
+            self._carry_sug = (self.person_id, [t for t in cached.suggestion_tiles if t.key not in done])
         self.suggest.clear_selection()
         self.ctx.data_changed()
+        self._carry_sug = None

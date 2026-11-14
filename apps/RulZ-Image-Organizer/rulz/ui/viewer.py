@@ -14,6 +14,7 @@ from .. import config, imaging
 from ..db import Face
 from . import dialogs, theme
 from .common import circle_pixmap, face_image, show_in_explorer, open_default
+from .thumbs import ThumbLoader
 
 
 def _fmt_size(n: int) -> str:
@@ -329,6 +330,7 @@ class ViewerPage(QWidget):
         theme.set_style(self.people_hint, "color: %(muted)s; font-size: 12px;")
         il.addWidget(self.people_hint)
         scroll = QScrollArea()
+        scroll.setFocusPolicy(Qt.NoFocus)  # clicking a face row must not take the arrow keys from the viewer
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setStyleSheet("background: transparent;")
@@ -390,6 +392,9 @@ class ViewerPage(QWidget):
         self._loading = True
         self.canvas.message = ""
         self.setCursor(Qt.BusyCursor)
+        # Decodes still queued are for photos the user already stepped past: drop them, or holding an arrow
+        # key leaves a backlog of full-size decodes before the photo they stopped on.
+        self._pool.clear()
         self._pool.start(_LoadJob(self._gen, ph.path, self._sig))
         self._load_faces()
         self._set_details(ph)
@@ -409,7 +414,11 @@ class ViewerPage(QWidget):
         self._load_faces()
 
     def _set_details(self, ph):
-        taken = datetime.fromtimestamp(ph.taken_at).strftime("%A, %B %d, %Y · %I:%M %p") if ph.taken_at else "Unknown"
+        try:
+            taken = datetime.fromtimestamp(ph.taken_at).strftime("%A, %B %d, %Y · %I:%M %p") if ph.taken_at \
+                else "Unknown"
+        except (OSError, OverflowError, ValueError):  # Windows refuses dates before 1970 (a file-date fallback)
+            taken = "Unknown"
         dims = f"{ph.width} × {ph.height}" if ph.width else ""
         mp = f" · {ph.width * ph.height / 1e6:.1f} MP" if ph.width else ""
         self.details.setText(
@@ -470,6 +479,8 @@ class ViewerPage(QWidget):
         else:
             m.addAction(theme.icon("close"), "Not a face / ignore", lambda: self._apply(lambda: db.ignore_faces([face.id])))
         m.exec(pos)
+        if self.isVisible():
+            self.setFocus()  # ← / → browse again after a choice made from the info panel
 
     def _apply(self, fn):
         fn()
@@ -502,6 +513,8 @@ class ViewerPage(QWidget):
             imaging.save_face_crop(self.pil, found.box, config.face_crop_path(face_id))
         except OSError:
             pass
+        # SQLite may have handed out a just-removed face's id: its old crop must not stay cached.
+        ThumbLoader.instance().invalidate(config.face_crop_file(face_id))
         pid = dialogs.pick_person(self, db, title="Who is this?")
         if pid is None:
             db.delete_faces([face_id])

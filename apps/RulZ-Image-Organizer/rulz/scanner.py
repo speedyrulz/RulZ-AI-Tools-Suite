@@ -20,13 +20,20 @@ Progress = Callable[[int, int, str], None]
 # Library changes are written in short transactions of this many photos, so the UI can save its own
 # edits in between instead of waiting on (or failing behind) the scanner's write lock.
 BATCH = 1000
+# Seconds between the grouping passes that run during a long scan (stretched when grouping is slow).
+GROUP_EVERY = 20
 
 
 class Cancelled(Exception):
     pass
 
 
-def _walk(root: str, should_stop: Callable[[], bool]):
+def _walk(root: str, should_stop: Callable[[], bool], unreadable: set[str] | None = None):
+    """Yield (path, size, mtime) of every image under ``root``.
+
+    Folders and files that can't be read right now (access denied, a network hiccup) are added to
+    ``unreadable``, so the caller can tell "gone" from "couldn't look".
+    """
     stack = [root]
     while stack:
         if should_stop():
@@ -45,9 +52,25 @@ def _walk(root: str, should_stop: Callable[[], bool]):
                             st = e.stat()
                             yield e.path, st.st_size, st.st_mtime
                     except OSError:
+                        if unreadable is not None:
+                            unreadable.add(e.path)
                         continue
         except OSError:
+            if unreadable is not None:
+                unreadable.add(d)
             continue
+
+
+def _under(path: str, roots: set[str]) -> bool:
+    """True if ``path`` is one of ``roots`` or inside one of them."""
+    while path:
+        if path in roots:
+            return True
+        parent = os.path.dirname(path)
+        if parent == path:
+            return False
+        path = parent
+    return False
 
 
 def sync_files(db: Database, progress: Progress, should_stop: Callable[[], bool]) -> int:
@@ -60,31 +83,48 @@ def sync_files(db: Database, progress: Progress, should_stop: Callable[[], bool]
         progress(0, 0, f"Looking for photos in {root}")
         known = {r["path"]: r for r in db.q("SELECT id, path, size, mtime, fp FROM photos WHERE folder_id=?", (fid,))}
         found: dict[str, tuple[int, float]] = {}
-        for path, size, mtime in _walk(root, should_stop):
+        unreadable: set[str] = set()
+        for path, size, mtime in _walk(root, should_stop, unreadable):
             found[path] = (size, mtime)
             if len(found) % 500 == 0:
                 progress(0, 0, f"Looking for photos… {len(found):,} found")
 
         missing = {p: r for p, r in known.items() if p not in found}
-        missing_by_fp = {r["fp"]: r for r in missing.values() if r["fp"]}
+        if unreadable:
+            # A folder we couldn't list this time is not a deleted folder: keep its photos and their tags.
+            missing = {p: r for p, r in missing.items() if not _under(p, unreadable)}
+        missing_by_fp: dict[str, list] = {}
+        for r in missing.values():
+            if r["fp"]:
+                missing_by_fp.setdefault(r["fp"], []).append(r)
+        # name -> sizes of the new files with that name (a duplicate's moved copy keeps its name and size)
+        new_names: dict[str, set[int]] = {}
+        if missing_by_fp:
+            for p, (size, _) in found.items():
+                if p not in known:
+                    new_names.setdefault(os.path.basename(p).lower(), set()).add(size)
+        unsure_sizes: set[int] = set()  # sizes of new files that couldn't be read: a missing photo may be one
         updated: list[tuple[int, int, float, str]] = []  # (photo id, size, mtime, fp) of changed files
+        touched: list[tuple[float, int]] = []            # (mtime, photo id): new date, same content
         moved: list[tuple[str, float, int]] = []
         new_rows: list[tuple] = []
 
         def flush():
             nonlocal changed
-            if not (updated or moved or new_rows):
+            if not (updated or touched or moved or new_rows):
                 return
             with db.transaction():
                 for photo_id, size, mtime, fp in updated:
                     db.clear_photo_faces(photo_id)
                     db.x("UPDATE photos SET size=?, mtime=?, fp=?, faces_done=0, error=NULL WHERE id=?",
                          (size, mtime, fp, photo_id))
+                db.conn.executemany("UPDATE photos SET mtime=? WHERE id=?", touched)
                 db.conn.executemany("UPDATE photos SET path=?, mtime=? WHERE id=?", moved)
                 db.conn.executemany("INSERT OR IGNORE INTO photos(folder_id, path, size, mtime, fp, taken_at) "
                                     "VALUES(?,?,?,?,?,?)", new_rows)
             changed += len(updated) + len(new_rows)
             updated.clear()
+            touched.clear()
             moved.clear()
             new_rows.clear()
 
@@ -99,23 +139,75 @@ def sync_files(db: Database, progress: Progress, should_stop: Callable[[], bool]
             row = known.get(path)
             if row is not None:
                 if row["size"] != size or abs((row["mtime"] or 0) - mtime) > 1:
-                    updated.append((row["id"], size, mtime, imaging.fingerprint(path, size)))
+                    fp = imaging.fingerprint(path, size)
+                    if not fp:
+                        continue  # can't read it right now: leave it (and its tags) for the next scan
+                    if fp == row["fp"] and row["size"] == size and not _uncompressed(path):
+                        # Only the file date moved (a copy or backup tool, a DST shift on a FAT32 card):
+                        # the picture is the same, so its faces and the user's corrections stay.
+                        touched.append((mtime, row["id"]))
+                    else:
+                        updated.append((row["id"], size, mtime, fp))
             else:
                 fp = imaging.fingerprint(path, size)
-                moved_row = missing_by_fp.pop(fp, None) if fp else None
+                if not fp:
+                    unsure_sizes.add(size)
+                    continue  # added on a later scan, once it can be read
+                moved_row = _take_moved(missing_by_fp, fp, path, new_names)
                 if moved_row is not None:
                     # Same file, new name/location: keep its faces and people.
                     moved.append((path, mtime, moved_row["id"]))
                     missing.pop(moved_row["path"], None)
                 else:
                     new_rows.append((fid, path, size, mtime, fp, mtime))
-            if len(updated) + len(moved) + len(new_rows) >= BATCH:
+            if len(updated) + len(touched) + len(moved) + len(new_rows) >= BATCH:
                 flush()
         flush()
-        if missing:
-            db.delete_photos([r["id"] for r in missing.values()])
+        # A moved file keeps its size: a missing photo the size of an unreadable new file may just have moved.
+        gone = [r["id"] for r in missing.values() if r["size"] not in unsure_sizes]
+        if gone:
+            db.delete_photos(gone)
     db.cleanup_people()
     return changed
+
+
+def _iou(a, b) -> float:
+    """Overlap of two (x, y, w, h) boxes: intersection over union."""
+    ix = max(0.0, min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    return inter / (a[2] * a[3] + b[2] * b[3] - inter + 1e-12)
+
+
+def _uncompressed(path: str) -> bool:
+    """Formats where a local edit keeps the file size and the fingerprinted start and end of the file: for
+    these a new date may mean new pixels, so the photo is analyzed again."""
+    return os.path.splitext(path)[1].lower() in (".bmp", ".tif", ".tiff")
+
+
+def _take_moved(missing_by_fp: dict[str, list], fp: str, path: str, new_names: dict[str, set[int]]):
+    """Pick (and remove) the missing photo a new file at ``path`` was moved from, or None.
+
+    Several missing photos can share a fingerprint (duplicate copies): prefer the one with the same file
+    name, so each renamed or moved copy keeps its own row and tags. Rows whose name and size another new
+    file has (``new_names``: lower-case name -> sizes) are left for that file; if every candidate is taken
+    that way, this file is an extra copy and gets a row of its own.
+    """
+    rows = missing_by_fp.get(fp)
+    if not rows:
+        return None
+    name = os.path.basename(path).lower()
+    names = [os.path.basename(r["path"]).lower() for r in rows]
+    pick = next((i for i, n in enumerate(names) if n == name), None)
+    if pick is None:
+        pick = next((i for i, (n, r) in enumerate(zip(names, rows)) if r["size"] not in new_names.get(n, ())),
+                    None)
+        if pick is None:
+            return None
+    row = rows.pop(pick)
+    if not rows:
+        del missing_by_fp[fp]
+    return row
 
 
 _local = threading.local()
@@ -143,13 +235,31 @@ def _prepare(row, engine_factory: Callable[[], FaceEngine]) -> tuple:
     return row, li.full_size, li.taken_at, found, crops, err
 
 
+Rewritten = Callable[[list[int], list[int]], None]
+
+
 def process_pending(db: Database, progress: Progress, changed: Callable[[], None],
-                    should_stop: Callable[[], bool], engine_factory: Callable[[], FaceEngine] = FaceEngine) -> int:
+                    should_stop: Callable[[], bool], engine_factory: Callable[[], FaceEngine] = FaceEngine,
+                    rewritten: Rewritten | None = None) -> int:
+    """Analyze photos that need it. ``rewritten(photo_ids, face_ids)`` hears which thumbnails and face
+    crops were (re)written, so the UI can drop stale cached copies: an edited photo keeps its id, and
+    SQLite hands a deleted face's id to the next new face."""
     pending = db.q("SELECT id, path, mtime FROM photos WHERE faces_done=0 ORDER BY id")
     total = len(pending)
     if not total:
         return 0
     last_notify = last_group = time.monotonic()
+    group_every = GROUP_EVERY
+    new_photos: list[int] = []
+    new_faces: list[int] = []
+
+    def notify():
+        if rewritten is not None and (new_photos or new_faces):
+            rewritten(new_photos[:], new_faces[:])
+        new_photos.clear()
+        new_faces.clear()
+        changed()
+
     done = 0
     # Detection runs on these threads too. OpenCV DNN already spreads each call over several cores and
     # every thread loads its own models (~90 MB before buffers), so a handful of threads is enough.
@@ -178,35 +288,52 @@ def process_pending(db: Database, progress: Progress, changed: Callable[[], None
             else:
                 w, h = full_size
                 with db.transaction():
-                    db.clear_photo_faces(row["id"])
+                    # A face the user tagged by hand before the scan got here stays (with its name);
+                    # a detection of that same face is not added twice.
+                    manual = db.clear_photo_faces(row["id"], keep_manual=True)
                     for f, crop in zip(found, crops):
+                        if any(_iou(f.box, box) >= 0.3 for box in manual):
+                            continue
                         face_id = db.insert_face(row["id"], f)
+                        new_faces.append(face_id)
                         try:
                             imaging.save_crop(crop, config.face_crop_path(face_id))
                         except OSError:
                             pass
                     db.x("UPDATE photos SET width=?, height=?, taken_at=?, faces_done=1, error=? WHERE id=?",
                          (w, h, taken_at or row["mtime"], err, row["id"]))
+                new_photos.append(row["id"])
             done += 1
             progress(done, total, f"Analyzing photos… {done:,} of {total:,}")
             now = time.monotonic()
-            if now - last_group > 20:  # group periodically so People fills in during long scans
+            if now - last_group > group_every:  # group periodically so People fills in during long scans
                 clustering.cluster(db)
-                last_group = now
+                took = time.monotonic() - now
+                # Grouping reads every face, so it slows down as the library grows: never let it take
+                # more than about a fifth of the scan.
+                group_every = max(GROUP_EVERY, 5 * took)
+                last_group = now = time.monotonic()
             if now - last_notify > 1.5:
-                changed()
+                notify()
                 last_notify = now
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
+        if rewritten is not None and (new_photos or new_faces):
+            rewritten(new_photos[:], new_faces[:])
     return done
 
 
-def backfill_attributes(db: Database, engine: FaceEngine, progress: Progress, changed: Callable[[], None],
-                        should_stop: Callable[[], bool]) -> int:
+def backfill_attributes(db: Database, engine: FaceEngine | Callable[[], FaceEngine], progress: Progress,
+                        changed: Callable[[], None], should_stop: Callable[[], bool]) -> int:
     """Add expression, head direction and body pose to faces found before those features existed.
 
-    Works from the stored face boxes, so people assignments stay untouched.
+    Works from the stored face boxes, so people assignments stay untouched. ``engine`` may be a factory:
+    the models (~90 MB) are then only loaded when some face still needs this.
     """
+    if not db.one("SELECT 1 FROM faces WHERE attrs_done=0 OR body_done=0 LIMIT 1"):
+        return 0
+    if not isinstance(engine, FaceEngine) and callable(engine):
+        engine = engine()
     want_body = engine.body is not None
     pending = "f.attrs_done=0" + (" OR f.body_done=0" if want_body else "")
     rows = db.q(f"SELECT DISTINCT p.id, p.path FROM photos p JOIN faces f ON f.photo_id=p.id "
@@ -253,12 +380,13 @@ def backfill_attributes(db: Database, engine: FaceEngine, progress: Progress, ch
     return total
 
 
-def full_scan(db: Database, engine: FaceEngine, progress: Progress, changed: Callable[[], None],
-              should_stop: Callable[[], bool]) -> str:
+def full_scan(db: Database, engine: FaceEngine | Callable[[], FaceEngine], progress: Progress,
+              changed: Callable[[], None], should_stop: Callable[[], bool],
+              rewritten: Rewritten | None = None) -> str:
     n_changed = sync_files(db, progress, should_stop)
     if n_changed:
         changed()
-    n = process_pending(db, progress, changed, should_stop)
+    n = process_pending(db, progress, changed, should_stop, rewritten=rewritten)
     if backfill_attributes(db, engine, progress, changed, should_stop):
         changed()
     progress(0, 0, "Grouping faces…")

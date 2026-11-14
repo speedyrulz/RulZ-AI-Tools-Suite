@@ -23,7 +23,9 @@ Everything runs on your PC. No photos or face data ever leave your computer.
 - **Library**: add any number of folders (subfolders included). Scans run in the background on startup,
   or when you click **Scan now** (F5). New, changed, deleted and *moved/renamed* photos are picked up;
   files moved or renamed within the same library folder keep their face tags (a move to another library
-  folder counts as a deletion plus a new photo).
+  folder counts as a deletion plus a new photo). A photo whose file date changes but whose picture doesn't
+  (a backup or copy tool, a clock change on a memory card) keeps its tags, and a folder that can't be read
+  during a scan (access denied, a network drop) keeps its photos until it can be read again.
 - **Photos**: a timeline of all photos grouped by month (from EXIF date taken). Ctrl + mouse wheel zooms
   the grid. Search by person, facial expression, head direction and body pose. Words in one
   comma-separated group describe one person:
@@ -68,8 +70,11 @@ Everything runs on your PC. No photos or face data ever leave your computer.
 
 ### How corrections stick
 - Faces you assign by hand are never moved automatically.
-- Once you say a face is *not* someone, it will never be auto-assigned to them again.
+- Once you say a face is *not* someone, it will never be auto-assigned to them again, even if you say so
+  while a scan is grouping faces.
 - Faces from a dissolved group can still join existing people, but won't re-form the same group.
+- A face you tag by hand stays, even on a photo the scan hasn't analyzed yet. Only a real change to the
+  picture itself (an edit, a rotation) clears its faces so they can be found again.
 
 ## Running
 

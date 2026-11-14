@@ -22,6 +22,10 @@ class SearchResult:
     problem: str | None = None   # explanation when a name couldn't be found
 
 
+def _norm(name: str) -> str:
+    return " ".join(name.lower().split())
+
+
 def split_groups(text: str) -> list[str]:
     return [g.strip() for g in re.split(r",|&|\+|;|\band\b", text, flags=re.IGNORECASE) if g.strip()]
 
@@ -32,13 +36,20 @@ def search(db: Database, text: str, extra_conditions: list[str] | None = None) -
     if not groups and not extra:
         return SearchResult(None)
     people = [p for p in db.people(include_hidden=True) if p.name]
+    by_name: dict[str, list[int]] = {}
+    for p in people:
+        by_name.setdefault(_norm(p.name), []).append(p.id)
 
     def matching(name: str) -> list[int]:
-        exact = [p.id for p in people if p.name.lower() == name]
-        return exact or [p.id for p in people if name in p.name.lower()]
+        exact = by_name.get(name)
+        return exact or [p.id for p in people if name in _norm(p.name)]
 
     queries: list[tuple[list[int] | None, list[str]]] = []
     for g in groups or [""]:
+        whole = by_name.get(_norm(g))
+        if whole:  # someone is called exactly this ("Happy", "Sad Sam"): it's them, not an expression
+            queries.append((whole, extra))
+            continue
         name, conds, _ = attributes.parse_group(g)
         conds = conds + [c for c in extra if c not in conds]
         if not name:

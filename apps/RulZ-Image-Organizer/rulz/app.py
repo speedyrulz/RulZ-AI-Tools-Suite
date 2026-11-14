@@ -8,24 +8,41 @@ os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
 
 
 def _install_busy_handler() -> None:
-    """A UI edit that can't get the library's write lock in time shows a message instead of a traceback."""
+    """A UI edit that can't get the library's write lock in time, or that refers to something a scan or
+    regroup just changed, shows a message instead of a traceback (nobody sees those in the windowed app)."""
     import sqlite3
+
+    from .db import PersonGone
 
     default = sys.excepthook
     showing = False
 
+    def message(exc_type, exc) -> tuple[str, str] | None:
+        if issubclass(exc_type, sqlite3.OperationalError) and "locked" in str(exc):
+            return ("Library is busy", "RulZ is saving scan results right now, so this change wasn't saved. "
+                    "Please try again in a moment.")
+        if issubclass(exc_type, PersonGone) or (issubclass(exc_type, sqlite3.IntegrityError)
+                                                and "FOREIGN KEY" in str(exc)):
+            return ("Library changed", "That person or face was just changed by a scan or regroup, so this "
+                    "change wasn't saved. The page has been updated; please try again.")
+        return None
+
     def hook(exc_type, exc, tb):
         nonlocal showing
-        if issubclass(exc_type, sqlite3.OperationalError) and "locked" in str(exc) and not showing:
+        text = message(exc_type, exc)
+        if text is not None and not showing:
             from PySide6.QtWidgets import QApplication
 
             from .ui import dialogs
 
             showing = True
             try:
-                dialogs.info(QApplication.activeWindow(), "Library is busy",
-                             "RulZ is saving scan results right now, so this change wasn't saved. "
-                             "Please try again in a moment.")
+                win = QApplication.activeWindow()
+                dialogs.info(win, *text)
+                main = next((w for w in QApplication.topLevelWidgets()
+                             if hasattr(w, "data_changed") and w.isVisible()), None)
+                if main is not None and text[0] == "Library changed":
+                    main.data_changed()
             finally:
                 showing = False
             return

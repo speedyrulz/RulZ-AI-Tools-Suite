@@ -1,4 +1,4 @@
-"""Background thread that runs library scans and regrouping."""
+"""Background thread that runs library scans, regrouping and folder removal."""
 from __future__ import annotations
 
 import traceback
@@ -13,12 +13,13 @@ from ..faces import FaceEngine
 class _Thread(QThread):
     progress = Signal(int, int, str)
     changed = Signal()
+    rewritten = Signal(list, list)  # photo ids, face ids whose thumbnail / crop file was (re)written
     done = Signal(str)
 
-    def __init__(self, job: str, threshold: float | None):
+    def __init__(self, job: str, arg):
         super().__init__()
         self.job = job
-        self.threshold = threshold
+        self.arg = arg  # regroup: match threshold (or None); remove: folder id
         self.stop_requested = False
 
     def run(self):
@@ -27,13 +28,19 @@ class _Thread(QThread):
             db = Database()
             if self.job == "regroup":
                 self.progress.emit(0, 0, "Regrouping faces…")
-                r = clustering.regroup(db, self.threshold)
+                r = clustering.regroup(db, self.arg)
                 self.changed.emit()
                 self.done.emit(f"Grouping updated · {r['new_people']} groups found")
                 return
-            engine = FaceEngine()
-            msg = scanner.full_scan(db, engine, self.progress.emit, self.changed.emit,
-                                    lambda: self.stop_requested)
+            if self.job == "remove":
+                self.progress.emit(0, 0, "Removing the folder from your library…")
+                db.remove_folder(self.arg)
+                self.changed.emit()
+                self.done.emit("Folder removed")
+                return
+            # A factory: the models only load if old faces still need expressions or poses.
+            msg = scanner.full_scan(db, FaceEngine, self.progress.emit, self.changed.emit,
+                                    lambda: self.stop_requested, self.rewritten.emit)
             self.done.emit(msg)
         except scanner.Cancelled:
             self.changed.emit()
@@ -49,13 +56,14 @@ class _Thread(QThread):
 class ScanController(QObject):
     progress = Signal(int, int, str)
     changed = Signal()
+    rewritten = Signal(list, list)
     started = Signal()
     finished = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.thread: _Thread | None = None
-        self.queued: list[tuple[str, float | None]] = []
+        self.queued: list[tuple[str, object]] = []
         self.last_message = ""
 
     @property
@@ -68,24 +76,33 @@ class ScanController(QObject):
     def regroup(self, threshold: float | None = None):
         self._enqueue("regroup", threshold)
 
+    def remove_folder(self, folder_id: int):
+        """Remove a library folder on the background thread: a running scan stops first (it may be writing
+        that folder's photos), then scanning carries on with the other folders."""
+        self.stop()
+        self._enqueue("remove", folder_id)
+        self._enqueue("scan", None)
+
     def stop(self):
-        self.queued.clear()
+        # Pause / close drop queued scans, but a removal the user confirmed still happens.
+        self.queued = [q for q in self.queued if q[0] == "remove"]
         if self.thread:
             self.thread.stop_requested = True
 
-    def _enqueue(self, job: str, threshold):
+    def _enqueue(self, job: str, arg):
         if self.thread is None:
-            self._start(job, threshold)
-        elif (job, threshold) not in self.queued:
+            self._start(job, arg)
+        elif (job, arg) not in self.queued:
             if job == "scan" and self.thread.job == "scan":
                 # A scan is already running – run another afterwards to catch new changes.
                 self.queued = [q for q in self.queued if q[0] != "scan"]
-            self.queued.append((job, threshold))
+            self.queued.append((job, arg))
 
-    def _start(self, job, threshold):
-        t = _Thread(job, threshold)
+    def _start(self, job, arg):
+        t = _Thread(job, arg)
         t.progress.connect(self.progress)
         t.changed.connect(self.changed)
+        t.rewritten.connect(self.rewritten)
         t.done.connect(self._on_done)
         t.finished.connect(self._on_finished)
         self.thread = t
@@ -100,8 +117,8 @@ class ScanController(QObject):
         if t is not None:
             t.deleteLater()
         if self.queued:
-            job, threshold = self.queued.pop(0)
-            self._start(job, threshold)
+            job, arg = self.queued.pop(0)
+            self._start(job, arg)
         else:
             self.finished.emit(self.last_message)
 
