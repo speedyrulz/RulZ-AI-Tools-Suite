@@ -25,11 +25,16 @@ class VideoView(QWidget):
 
     cropChanged = Signal()
 
-    def __init__(self):
+    def __init__(self, interactive: bool = True):
+        """interactive=False is a second, look-only view (the clip's last frame beside the main
+        view in fixed-length mode): it shows the crop box it is given with mirror_crop(), but the
+        mouse does nothing on it, and it stays blank instead of showing the "Open a video" hint."""
         super().__init__()
         self.setMinimumSize(320, 180)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setMouseTracking(True)
+        self.interactive = interactive
+        self.caption = ""               # a short label painted in the frame's bottom-left corner
+        self.setMouseTracking(interactive)
         self._pix: QPixmap | None = None
         self._frame_w = 0
         self._frame_h = 0
@@ -133,6 +138,18 @@ class VideoView(QWidget):
             r = self.crop
             self.crop = QRectF(self._frame_w - (r.x() + r.width()), r.y(), r.width(), r.height())
 
+    def set_caption(self, text: str):
+        if text != self.caption:
+            self.caption = text
+            self.update()
+
+    def mirror_crop(self, other: "VideoView"):
+        """Show the other view's crop box (for the look-only view; both show the same frame size)."""
+        self.crop_enabled = other.crop_enabled
+        self.aspect = other.aspect
+        self.crop = QRectF(other.crop) if other.crop is not None else None
+        self.update()
+
     def clear(self):
         self._pix = None
         self._frame_w = self._frame_h = 0
@@ -196,7 +213,7 @@ class VideoView(QWidget):
         return r
 
     def _hit(self, p: QPointF) -> str | None:
-        if not self.crop_enabled or not self._frame_w:
+        if not self.interactive or not self.crop_enabled or not self._frame_w:
             return None
         if self.crop is None:
             return "new"
@@ -352,6 +369,9 @@ class VideoView(QWidget):
     def paintEvent(self, _):
         p = QPainter(self)
         p.fillRect(self.rect(), theme.Q_BG)
+        if not self._pix and not self.interactive:
+            p.end()
+            return
         if not self._pix:
             # empty state: the RulZ logo with a hint underneath
             logo = theme.logo_pixmap(max(40, min(120, self.height() // 5)))
@@ -392,12 +412,13 @@ class VideoView(QWidget):
             p.setPen(QPen(QColor(255, 255, 255), 1))
             p.setBrush(QBrush(theme.Q_RED))
             cx, cy = wr.center().x(), wr.center().y()
-            for hx, hy in ((wr.left(), wr.top()), (cx, wr.top()), (wr.right(), wr.top()),
-                           (wr.left(), cy), (wr.right(), cy),
-                           (wr.left(), wr.bottom()), (cx, wr.bottom()), (wr.right(), wr.bottom())):
+            handles = ((wr.left(), wr.top()), (cx, wr.top()), (wr.right(), wr.top()),
+                       (wr.left(), cy), (wr.right(), cy),
+                       (wr.left(), wr.bottom()), (cx, wr.bottom()), (wr.right(), wr.bottom()))
+            for hx, hy in handles if self.interactive else ():   # (nothing to grab on a look-only view)
                 p.drawRect(QRectF(hx - 4, hy - 4, 8, 8))
             # size label
-            r = self.crop_rect_int()
+            r = self.crop_rect_int() if self.interactive else None
             if r:
                 txt = f"{r[2]}×{r[3]}  @ {r[0]},{r[1]}"
                 p.setPen(QColor(255, 255, 255))
@@ -407,4 +428,18 @@ class VideoView(QWidget):
                 ty = wr.top() - 22 if wr.top() > 24 else wr.top() + 4
                 p.drawRect(QRectF(wr.left(), ty, tw, 18))
                 p.drawText(QRectF(wr.left() + 5, ty, tw, 18), Qt.AlignVCenter, txt)
+        if self.caption:
+            # In the picture's bottom-left corner. A portrait picture is narrower than the text:
+            # the label then moves left into the empty side (and is shortened if even the widget
+            # is too narrow), so it is never cut off at the widget's right edge.
+            d, fm = self._disp, p.fontMetrics()
+            text = fm.elidedText(self.caption, Qt.ElideRight, max(int(self.width()) - 24, 20))
+            tw = fm.horizontalAdvance(text) + 12
+            x = min(d.left() + 6, self.width() - 6 - tw)
+            box = QRectF(max(x, 6.0), d.bottom() - 26, tw, 20)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(QColor(theme.OVERLAY_LABEL_BG)))
+            p.drawRect(box)
+            p.setPen(QColor(255, 255, 255))
+            p.drawText(box, Qt.AlignCenter, text)
         p.end()

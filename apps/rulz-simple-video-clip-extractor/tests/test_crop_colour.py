@@ -327,3 +327,30 @@ def test_apply_tables_on_a_padded_read_only_frame_buffer(use_cv2, monkeypatch):
 def test_apply_tables_on_an_empty_image():
     tables = next(table_sets())
     assert apply_tables(np.zeros((0, 4, 3), np.uint8), tables).shape == (0, 4, 3)
+
+
+# ------------------------------------------------------------------ the look-only view
+def test_look_only_view_mirrors_a_crop_box_and_ignores_the_mouse():
+    """The second view of fixed-length mode: it draws the main view's crop box and a caption,
+    has nothing to grab, and stays blank (no "Open a video" hint) without a frame."""
+    main = make_view(aspect=1.0)
+    v = VideoView(interactive=False)
+    v.resize(480, 270)
+    blank = qimage_to_rgb(v.grab().toImage())
+    assert (blank == blank[0, 0]).all()                    # one flat colour: no logo, no hint
+    hint = VideoView()
+    hint.resize(480, 270)
+    drawn = qimage_to_rgb(hint.grab().toImage())
+    assert not (drawn == drawn[0, 0]).all()                # (the main view does draw its hint)
+    v.set_frame(preview(), 1920, 1080)
+    v.set_caption("Last frame of clip")
+    v.mirror_crop(main)
+    assert v.crop_enabled and v.aspect == 1.0 and box(v) == box(main) and v.crop is not main.crop
+    assert v._hit(QPointF(240, 135)) is None and v._hit(QPointF(2, 2)) is None
+    drag(v, (100, 100), (900, 700))
+    assert box(v) == box(main)
+    img = v.grab().toImage()                 # paints the shaded frame, the box and the caption
+    assert img.pixelColor(5, 135).red() < img.pixelColor(240, 135).red()   # outside the box is darker
+    main.set_crop_enabled(False)
+    v.mirror_crop(main)
+    assert not v.crop_enabled and v.crop_rect_int() is None

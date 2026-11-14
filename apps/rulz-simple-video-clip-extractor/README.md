@@ -281,6 +281,15 @@ video only: the next one gets your length back).
 
 While fixed length is on:
 
+- The video area shows **two views**. The left one is the normal view: the
+  frame at the playhead, with playback, stepping and the crop box as usual.
+  The right one shows the **last frame of the clip** as it is selected now,
+  with its time and frame number, so you see where the clip ends without
+  moving the playhead. It follows the clip box and the length you type, and
+  shows the same rotation, flip, colour match, distortion repair and crop box
+  (the box can only be changed in the left view). While you drag the clip box
+  on video with slow seeks (4K), it shows the keyframe before that frame until
+  you let go.
 - A red box on the timeline shows the selection. Drag it to move the clip,
   or click anywhere outside it to jump the clip start there. Clicking inside
   the box seeks within the clip. Shift-drag scrubs.
