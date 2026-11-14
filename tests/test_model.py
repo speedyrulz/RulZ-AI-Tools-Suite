@@ -139,8 +139,16 @@ def test_clone_and_snapshot_are_deep_copies():
 # -- Settings ----------------------------------------------------------------
 def test_settings_round_trip():
     s = Settings(stagger_seconds=1.5, stop_timeout=20, log_max_lines=1000,
-                 last_profile="abc", geometry="AAAA", splitter=[100, 200])
+                 last_profile="abc", geometry="AAAA", splitter=[100, 200], close_to_tray=True)
     assert Settings.from_dict(s.to_dict()) == s
+
+
+@pytest.mark.parametrize("raw, expected", [
+    (True, True), (False, False), (None, False), ("true", False), (1, False),
+])
+def test_settings_close_to_tray_needs_a_real_bool(raw, expected):
+    assert Settings.from_dict({"close_to_tray": raw}).close_to_tray is expected
+    assert Settings.from_dict({}).close_to_tray is False
 
 
 @pytest.mark.parametrize("data, field, expected", [

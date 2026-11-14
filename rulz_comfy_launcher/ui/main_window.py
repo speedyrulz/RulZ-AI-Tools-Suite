@@ -114,6 +114,14 @@ class PreferencesDialog(QDialog):
         form.addRow("Pause between simultaneous starts", self.stagger)
         form.addRow("Wait for a clean stop", self.stop_timeout)
         form.addRow("Log lines kept per instance", self.log_lines)
+        self.close_to_tray = QCheckBox("Closing the window keeps the launcher in the tray")
+        self.close_to_tray.setChecked(settings.close_to_tray)
+        self.close_to_tray.setToolTip("The close button hides the window to the notification area instead "
+                                      "of exiting. Use Exit in the tray menu to quit.")
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self.close_to_tray.setEnabled(False)
+            self.close_to_tray.setToolTip("No notification area is available on this system.")
+        form.addRow(self.close_to_tray)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -138,6 +146,8 @@ class MainWindow(QMainWindow):
         self._logs: dict[str, LogView] = {}
         self._quitting = False
         self._closing_for_real = False
+        self._exit_requested = False     # Exit from the tray menu: skip close-to-tray
+        self._tray_hint_shown = False
         self._save_error = ""
         self._tray: QSystemTrayIcon | None = None
 
@@ -360,6 +370,11 @@ class MainWindow(QMainWindow):
         start.triggered.connect(self._start_checked)
         stop = QAction("Stop all", menu)
         stop.triggered.connect(self._stop_all)
+        to_tray = QAction("Close to tray", menu)
+        to_tray.setCheckable(True)
+        to_tray.setChecked(self.store.settings.close_to_tray)
+        to_tray.toggled.connect(self._set_close_to_tray)
+        self._close_to_tray_action = to_tray
         leave = QAction("Exit", menu)
         leave.triggered.connect(self._exit_from_tray)
         menu.addAction(show)
@@ -367,6 +382,7 @@ class MainWindow(QMainWindow):
         menu.addAction(start)
         menu.addAction(stop)
         menu.addSeparator()
+        menu.addAction(to_tray)
         menu.addAction(leave)
         tray.setContextMenu(menu)
         self._tray_menu = menu
@@ -912,7 +928,19 @@ class MainWindow(QMainWindow):
             settings.log_max_lines = dialog.log_lines.value()
             for log in self._logs.values():
                 log.setMaximumBlockCount(settings.log_max_lines)
+            if dialog.close_to_tray.isEnabled():
+                self._set_close_to_tray(dialog.close_to_tray.isChecked())
             self._schedule_save()
+
+    def _set_close_to_tray(self, on: bool):
+        """One place for the setting, so Preferences and the tray menu stay in step."""
+        self.store.settings.close_to_tray = bool(on)
+        action = getattr(self, "_close_to_tray_action", None)
+        if action is not None and action.isChecked() != bool(on):
+            action.blockSignals(True)
+            action.setChecked(bool(on))
+            action.blockSignals(False)
+        self._schedule_save()
 
     def _schedule_save(self):
         self._save_timer.start()
@@ -957,7 +985,20 @@ class MainWindow(QMainWindow):
 
     def _exit_from_tray(self):
         self.show_and_raise()
-        self.close()
+        self._exit_requested = True
+        try:
+            self.close()
+        finally:
+            # Still here (the user cancelled the "still running" question): the next
+            # close-button click goes back to the tray again.
+            self._exit_requested = False
+
+    def _hide_to_tray(self):
+        self.hide()
+        if self._tray is not None and not self._tray_hint_shown:
+            self._tray_hint_shown = True
+            self._tray.showMessage(APP_NAME, "Still running here. Click the icon to open the window.",
+                                   QSystemTrayIcon.MessageIcon.Information, 4000)
 
     def closeEvent(self, event):
         if self._closing_for_real:
@@ -965,6 +1006,10 @@ class MainWindow(QMainWindow):
             return
         if self._quitting:
             event.ignore()
+            return
+        if self._tray is not None and self.store.settings.close_to_tray and not self._exit_requested:
+            event.ignore()
+            self._hide_to_tray()
             return
         if not self.manager.any_active():
             event.ignore()
@@ -986,10 +1031,7 @@ class MainWindow(QMainWindow):
         if clicked is stop:
             self._begin_quit()
         elif keep is not None and clicked is keep:
-            self.hide()
-            if self._tray is not None:
-                self._tray.showMessage(APP_NAME, "Still running here. Click the icon to open the window.",
-                                       QSystemTrayIcon.MessageIcon.Information, 4000)
+            self._hide_to_tray()
 
     def _begin_quit(self):
         self._quitting = True

@@ -87,7 +87,10 @@ from the number you would type by hand for the same card.
 - Each instance is one `wsl.exe` process with ComfyUI attached to it. They live and end
   together, so instances belong to the launcher: **closing the launcher stops them.**
   Closing the window while something runs asks whether to stop everything or keep the
-  launcher running in the notification area.
+  launcher running in the notification area. To always keep it there instead, tick
+  **Closing the window keeps the launcher in the tray** in Preferences (or **Close to tray**
+  in the tray icon's menu); then the close button only hides the window, and **Exit** in the
+  tray menu quits.
 - If the launcher crashes or is ended from Task Manager, Windows ends the `wsl.exe`
   processes and WSL ends the ComfyUI servers. Nothing is left running without an owner.
 - Stop sends SIGINT (Ctrl+C) to ComfyUI and everything it started. After the waiting time
