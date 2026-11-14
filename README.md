@@ -157,7 +157,15 @@ Pushing a `v*` tag builds the launcher's installer on GitHub Actions and attache
    `catalog/<id>/`. Run the same command after changing any app's README.
 5. Put 2–4 screenshots in `catalog/<id>/screenshots/` (`01-…` is the card thumbnail).
 
-The launcher shows the README from GitHub when it can, and the copy in `catalog/` when offline.
+The launcher keeps itself current with `catalog/` on GitHub's `main` branch, so a changed README or screenshot
+reaches users once it is merged, with no launcher release. At startup (and on Refresh), at most every 30 minutes,
+it asks GitHub for the catalog's file list (two API requests), downloads only the READMEs, README images, screenshots
+and icons that differ from its bundled copy, checks each against git's hash and keeps them in
+`%APPDATA%\RulZ AI Tools Suite\catalog-cache`. Offline, it shows what it has. A launcher update clears the cache,
+since the new bundled copy is at least as new. This only picks up what is in `catalog/`, so run
+`npm run sync-catalog` and merge the result after changing an app's README. Settings → "Get the latest READMEs and
+screenshots from GitHub" turns it off. Dev runs (`npm run dev` / `npm start`) skip the cache unless
+`RULZ_CATALOG_CACHE=1` is set, so local `catalog/` edits show.
 
 ## License
 

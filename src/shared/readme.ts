@@ -26,6 +26,19 @@ export function resolveReadmeUrl(url: string, base: string): string {
   }
 }
 
+/** Adds ?v=<version> to an image URL below `base` that has a known version; other URLs are returned unchanged. */
+export function withAssetVersion(url: string, base: string, versions: Record<string, string> | undefined): string {
+  if (!versions || !url.startsWith(base) || url.includes('?') || url.includes('#')) return url
+  let rel: string
+  try {
+    rel = decodeURIComponent(url.slice(base.length))
+  } catch {
+    return url
+  }
+  const v = versions[rel]
+  return v ? `${url}?v=${encodeURIComponent(v)}` : url
+}
+
 /** GitHub's heading anchors: lower case, punctuation dropped, spaces to dashes, duplicates numbered. */
 export function createSlugger(): (text: string) => string {
   const seen = new Map<string, number>()

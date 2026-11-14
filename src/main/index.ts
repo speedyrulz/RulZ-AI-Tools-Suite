@@ -1,4 +1,4 @@
-import { join, resolve, sep } from 'node:path'
+import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { app, BrowserWindow, dialog, nativeTheme, net, protocol, shell } from 'electron'
 import { findApp } from '@shared/catalog'
@@ -93,18 +93,14 @@ async function main(): Promise<void> {
   const userData = app.getPath('userData')
   const catalogDir = app.isPackaged ? join(process.resourcesPath, 'catalog') : join(app.getAppPath(), 'catalog')
 
-  protocol.handle('rulz', (req) => {
-    const url = new URL(req.url)
-    const file = resolve(catalogDir, decodeURIComponent(url.pathname).replace(/^\/+/, ''))
-    if (url.host !== 'catalog' || !file.startsWith(catalogDir + sep)) return new Response('Not found', { status: 404 })
-    return net.fetch(pathToFileURL(file).toString())
-  })
-
   const store = new Store(userData)
   await store.init()
   const apps = new AppManager({
     store,
     catalogDir,
+    // Not in a dev run (unless RULZ_CATALOG_CACHE=1): a fetched copy would hide edits made to catalog/ here.
+    catalogCacheDir: app.isPackaged || process.env.RULZ_CATALOG_CACHE === '1' ? join(userData, 'catalog-cache') : undefined,
+    launcherVersion: app.getVersion(),
     downloadsDir: join(app.getPath('temp'), 'RulZ AI Tools Suite'),
     iconsDir: join(userData, 'icons'),
     emitApps: (list) => broadcast('apps:changed', list),
@@ -114,6 +110,21 @@ async function main(): Promise<void> {
   // Quick (cached answers and the bundled files); the registry search for outside installs runs once the window is up.
   await apps.init()
 
+  // Newer copies fetched from GitHub first (catalog-cache), then the files shipped with the launcher. The ?v= that
+  // screenshot URLs carry only keeps Chromium from showing an old picture; it isn't part of the file name.
+  protocol.handle('rulz', (req) => {
+    const url = new URL(req.url)
+    let rel: string
+    try {
+      rel = decodeURIComponent(url.pathname).replace(/^\/+/, '')
+    } catch {
+      return new Response('Not found', { status: 404 })
+    }
+    const file = url.host === 'catalog' ? apps.catalogFile(rel) : null
+    if (!file) return new Response('Not found', { status: 404 })
+    return net.fetch(pathToFileURL(file).toString()).catch(() => new Response('Not found', { status: 404 }))
+  })
+
   // ---- IPC ----
   handle('app:info', () => ({ version: app.getVersion(), userData, platform: process.platform }))
   handle('settings:get', () => store.getSettings())
@@ -121,6 +132,7 @@ async function main(): Promise<void> {
   handle('settings:update', async (patch) => {
     const next = await store.updateSettings(patch)
     if (patch.theme) applyTheme(mainWindow, patch.theme)
+    if ('liveReadme' in patch) apps.settingsChanged()
     return next
   })
   handle('dialog:pickFolder', async ({ title, defaultPath }) => {
@@ -189,6 +201,8 @@ async function main(): Promise<void> {
   mainWindow = createWindow(theme)
   void apps.detectInstalls().then(() => {
     if (store.getSettings().checkUpdatesOnStart) void apps.refreshLatest(false)
+    // Newer READMEs and screenshots follow their own setting (the update check runs this too, sharing the request).
+    else void apps.syncCatalog(false)
   })
 
   // Quitting mid-install would leave pip, git or a setup program running on their own, with a half-made install

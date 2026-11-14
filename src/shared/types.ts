@@ -196,6 +196,8 @@ export interface ReadmeDoc {
   markdown: string
   /** Base URL for relative image paths. */
   assetBase: string
+  /** A version per image path below assetBase ("docs/shot.png"), added to its URL as ?v= so a replaced image shows. */
+  assetVersions?: Record<string, string>
   /** Base URL for relative links, or null when they can't be opened. */
   linkBase: string | null
   source: 'github' | 'bundled'
