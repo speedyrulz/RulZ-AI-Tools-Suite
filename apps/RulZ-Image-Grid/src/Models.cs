@@ -78,13 +78,29 @@ namespace RulZImageGrid
 
     public static class TextMetrics
     {
-        public static Typeface Face(bool bold) =>
-            new Typeface(new FontFamily("Segoe UI"), FontStyles.Normal,
-                bold ? FontWeights.SemiBold : FontWeights.Normal, FontStretches.Normal);
+        // One pair per thread: the editor draws every file name each rebuild, and the export runs on its own thread.
+        [ThreadStatic] static Typeface regular, bold;
 
-        public static FormattedText Make(string text, double size, bool bold, Brush brush) =>
+        public static Typeface Face(bool semiBold) => semiBold
+            ? bold ?? (bold = new Typeface(new FontFamily("Segoe UI"), FontStyles.Normal, FontWeights.SemiBold, FontStretches.Normal))
+            : regular ?? (regular = new Typeface(new FontFamily("Segoe UI"), FontStyles.Normal, FontWeights.Normal, FontStretches.Normal));
+
+        public static FormattedText Make(string text, double size, bool bold, Brush brush, double pixelsPerDip = 1.0) =>
             new FormattedText(text ?? "", CultureInfo.CurrentUICulture, FlowDirection.LeftToRight,
-                Face(bold), Math.Max(1, size), brush ?? Brushes.Black, 1.0);
+                Face(bold), Math.Max(1, size), brush ?? Brushes.Black, pixelsPerDip);
+
+        /// <summary>Draws a file name under its tile. The export and the editor both use this, so they match.</summary>
+        public static void DrawCaption(DrawingContext dc, GridLayout layout, int index, string name, double size,
+            Brush brush, double pixelsPerDip = 1.0)
+        {
+            var cr = layout.CaptionRect(index);
+            var ft = Make(name, size, false, brush, pixelsPerDip);
+            ft.MaxTextWidth = cr.Width;
+            ft.MaxLineCount = 1;
+            ft.Trimming = TextTrimming.CharacterEllipsis;
+            ft.TextAlignment = TextAlignment.Center;
+            dc.DrawText(ft, cr.TopLeft);
+        }
 
         public static double LineHeight(double size, bool bold) => Make("Ag", size, bold, null).Height;
 
@@ -107,6 +123,35 @@ namespace RulZImageGrid
             Extensions.Contains(System.IO.Path.GetExtension(path).ToLowerInvariant());
 
         static bool Rotated90(int o) => o >= 5 && o <= 8;
+
+        /// <summary>
+        /// The image files among dropped or picked paths. A folder adds its own images (not subfolders') in name order,
+        /// img2 before img10. A folder or file that can't be read is listed in <c>failed</c> instead of stopping the rest.
+        /// Can be slow on big or network folders, so the window calls it off the UI thread.
+        /// </summary>
+        public static (List<string> files, List<string> failed) FindImages(IEnumerable<string> paths)
+        {
+            var natural = new NaturalComparer();
+            var files = new List<string>();
+            var failed = new List<string>();
+            foreach (var p in paths)
+            {
+                try
+                {
+                    if (Directory.Exists(p))
+                        files.AddRange(Directory.EnumerateFiles(p).Where(IsImage)
+                            .OrderBy(f => System.IO.Path.GetFileName(f), natural));
+                    else if (File.Exists(p) && IsImage(p))
+                        files.Add(p);
+                }
+                catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException
+                                           || ex is System.Security.SecurityException || ex is ArgumentException)
+                {
+                    failed.Add(ex.Message);
+                }
+            }
+            return (files, failed);
+        }
 
         /// <summary>
         /// Reads many images on several background threads at once. Results keep the order of <paramref name="files"/>.

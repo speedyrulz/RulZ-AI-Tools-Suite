@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Windows;
@@ -13,7 +14,7 @@ namespace RulZImageGrid
 {
     public class ExportWindow : Window
     {
-        const int JpegMaxSide = 65535;
+        public const int JpegMaxSide = 65500; // the JPEG format allows 65,535, but Windows' encoder refuses more than 65,500
         const double MaxPixels = 500_000_000; // ~2 GB of 32-bit pixels: beyond this WPF can't allocate the bitmap
 
         readonly GridSettings S;
@@ -247,8 +248,11 @@ namespace RulZImageGrid
             int w = OutW, h = OutH;
             double mp = (double)w * h / 1e6;
             resText.Text = $"{w:N0} × {h:N0} px";
-            // Drawing needs the finished image plus a full-size working copy: measured at about twice the image.
-            detailText.Text = $"{mp:0.0} megapixels · about {(double)w * h * 8 / 1048576:N0} MB in memory while saving";
+            // Measured: the finished image plus about 5%, and the source images drawn so far that haven't been freed
+            // yet (up to about ten). Each source image is drawn in and dropped, so they're never all in memory at once.
+            double tile = layout.CellW * Scale * layout.CellH * Scale * 4;
+            double bytes = (double)w * h * 4 * 1.05 + Math.Min(items.Count, 10) * tile;
+            detailText.Text = $"{mp:0.0} megapixels · about {bytes / 1048576:N0} MB in memory while saving";
 
             var warnings = new List<string>();
             bool blocked = false;
@@ -317,12 +321,25 @@ namespace RulZImageGrid
 
         async void Save()
         {
+            // Say up front which images are gone, rather than failing partway through a long save.
+            var missing = items.Select(i => i.Path).Distinct(StringComparer.OrdinalIgnoreCase).Where(p => !File.Exists(p)).ToList();
+            if (missing.Count > 0)
+            {
+                MessageBox.Show(this,
+                    "These images were moved, renamed or deleted after they were added, so the grid can't be saved:\n\n" +
+                    string.Join("\n", missing.Take(15)) + (missing.Count > 15 ? $"\n…and {missing.Count - 15} more" : "") +
+                    "\n\nPut them back, or remove them from the grid, and try again.",
+                    "Export", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
             bool jpg = IsJpg;
             string ext = jpg ? ".jpg" : ".png";
             var dlg = new SaveFileDialog
             {
                 Title = "Save grid image",
-                Filter = jpg ? "JPEG image (*.jpg)|*.jpg;*.jpeg" : "PNG image (*.png)|*.png",
+                Filter = "PNG image (*.png)|*.png|JPEG image (*.jpg)|*.jpg;*.jpeg",
+                FilterIndex = jpg ? 2 : 1,
                 FileName = "RulZ Image Grid" + ext,
                 DefaultExt = ext,
                 AddExtension = true,
@@ -331,6 +348,18 @@ namespace RulZImageGrid
             if (dlg.ShowDialog(this) != true) return;
 
             string path = dlg.FileName;
+            // The name decides the format, so typing "grid.png" while JPG is picked saves a real PNG.
+            bool? named = FormatOf(path);
+            if (named.HasValue && named.Value != jpg)
+            {
+                (named.Value ? jpgRadio : pngRadio).IsChecked = true; // shows what's saved and re-checks the size limits
+                if (!saveBtn.IsEnabled)
+                {
+                    MessageBox.Show(this, warnText.Text, "Export", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+                jpg = named.Value;
+            }
             double scale = Scale;
             string size = $"{OutW:N0} × {OutH:N0}";
             int quality = (int)qualitySlider.Value;
@@ -358,6 +387,17 @@ namespace RulZImageGrid
                 MessageBox.Show(this,
                     "Couldn't save the image:\n\n" + ex.Message + (memory ? "\n\nTry a lower scale." : ""),
                     "Export failed", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        /// <summary>True for a JPEG file name, false for PNG, null for anything else (the picked format is kept).</summary>
+        public static bool? FormatOf(string path)
+        {
+            switch (Path.GetExtension(path).ToLowerInvariant())
+            {
+                case ".jpg": case ".jpeg": case ".jpe": case ".jfif": return true;
+                case ".png": return false;
+                default: return null;
             }
         }
 

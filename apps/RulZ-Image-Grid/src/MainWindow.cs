@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -33,6 +34,7 @@ namespace RulZImageGrid
         readonly TextBlock infoText = Ui.Dim(new TextBlock { TextWrapping = TextWrapping.Wrap, LineHeight = 20 });
         readonly TextBlock statusText = Ui.Dim(new TextBlock { Margin = new Thickness(12, 5, 12, 5), TextTrimming = TextTrimming.CharacterEllipsis });
         readonly Image logoImage = new Image { Height = 22, Margin = new Thickness(2, 0, 10, 0), VerticalAlignment = VerticalAlignment.Center };
+        readonly Image hintLogo = new Image { Height = 40, Opacity = 0.9, Margin = new Thickness(0, 0, 0, 18), HorizontalAlignment = HorizontalAlignment.Center };
         readonly List<Image> tileImages = new List<Image>();
         Rectangle selRect, dropMarker, fileDropMarker;
         Image ghost;
@@ -177,10 +179,8 @@ namespace RulZImageGrid
             var dash = new Rectangle { StrokeThickness = 2, StrokeDashArray = new DoubleCollection { 4, 3 }, RadiusX = 12, RadiusY = 12 };
             dash.SetResourceReference(Shape.StrokeProperty, "Border");
             var hintStack = new StackPanel { Margin = new Thickness(64, 40, 64, 40), HorizontalAlignment = HorizontalAlignment.Center };
-            var hintLogo = new Image { Height = 40, Opacity = 0.9, Margin = new Thickness(0, 0, 0, 18), HorizontalAlignment = HorizontalAlignment.Center };
             RenderOptions.SetBitmapScalingMode(hintLogo, BitmapScalingMode.HighQuality);
             hintLogo.Source = logoImage.Source;
-            Theme.Changed += () => hintLogo.Source = Theme.LoadLogo(Theme.Current);
             hintStack.Children.Add(hintLogo);
             hintStack.Children.Add(new TextBlock { Text = "Drop images here", FontSize = 22, FontWeight = FontWeights.SemiBold, HorizontalAlignment = HorizontalAlignment.Center });
             hintStack.Children.Add(Ui.Dim(new TextBlock { Text = "or click  Add Images…", FontSize = 15, Margin = new Thickness(0, 4, 0, 0), HorizontalAlignment = HorizontalAlignment.Center }));
@@ -223,7 +223,7 @@ namespace RulZImageGrid
 
         void OnThemeChanged()
         {
-            logoImage.Source = Theme.LoadLogo(Theme.Current);
+            logoImage.Source = hintLogo.Source = Theme.LoadLogo(Theme.Current);
             if (lightCheck != null && lightCheck.IsChecked != Theme.IsLight) lightCheck.IsChecked = Theme.IsLight;
         }
 
@@ -361,6 +361,10 @@ namespace RulZImageGrid
         {
             if (canvasHolder == null) return; // still constructing
             rebuildPending = false;
+            if (selected >= items.Count) selected = -1;
+            // The tiles are about to be replaced, so a tile being pressed or dragged would point at the wrong image
+            // (or past the end) once images finish loading or one is removed.
+            if (dragIndex >= 0) EndDrag();
             layout = GridLayout.Compute(S, items.Select(i => new Size(i.PixelW, i.PixelH)).ToList());
             canvas.Children.Clear();
             tileImages.Clear();
@@ -388,23 +392,12 @@ namespace RulZImageGrid
                 RenderOptions.SetBitmapScalingMode(img, BitmapScalingMode.HighQuality);
                 Place(img, r.X, r.Y);
                 tileImages.Add(img);
-
-                if (S.ShowCaptions)
-                {
-                    var cr = layout.CaptionRect(i);
-                    Place(new TextBlock
-                    {
-                        Text = it.Name,
-                        Width = cr.Width,
-                        FontFamily = family,
-                        FontSize = S.CaptionFont,
-                        Foreground = textBrush,
-                        TextAlignment = TextAlignment.Center,
-                        TextTrimming = TextTrimming.CharacterEllipsis,
-                        IsHitTestVisible = false,
-                    }, cr.X, cr.Y);
-                }
             }
+
+            // File names are drawn in one pass, the way the export draws them: one TextBlock per tile made a rebuild
+            // of a few hundred images take several times longer.
+            if (S.ShowCaptions)
+                Place(new CaptionLayer(layout, items.Select(i => i.Name).ToArray(), S.CaptionFont, textBrush), 0, 0);
 
             if (S.ShowColLabels)
                 for (int c = 0; c < layout.Cols; c++)
@@ -594,7 +587,9 @@ namespace RulZImageGrid
                     var r = layout.ImageRect(i, it.PixelW, it.PixelH);
                     if (!r.IntersectsWith(view) || it.Thumb == null || it.Thumb.PixelWidth >= it.PixelW) continue;
                     int need = (int)Math.Ceiling(r.Width * Zoom * dpi);
-                    if (need > it.Thumb.PixelWidth) want[it] = need;
+                    // A full-size copy is as sharp as the tile gets, even shown bigger than that; asking for more made
+                    // every scroll or zoom reload it.
+                    if (need > it.Thumb.PixelWidth) want[it] = Math.Min(need, it.PixelW);
                 }
             }
 
@@ -774,7 +769,7 @@ namespace RulZImageGrid
         {
             dragIndex = -1;
             dragging = false;
-            Cursor = null;
+            Cursor = loading > 0 ? Cursors.Wait : null;
             if (ghost != null) { canvas.Children.Remove(ghost); ghost = null; }
             if (dropMarker != null) { canvas.Children.Remove(dropMarker); dropMarker = null; }
             foreach (var img in tileImages) img.Opacity = 1;
@@ -857,47 +852,68 @@ namespace RulZImageGrid
 
         public async void AddFiles(IEnumerable<string> paths, int insertAt = -1)
         {
-            var natural = new NaturalComparer();
-            var files = new List<string>();
-            foreach (var p in paths)
+            var dropped = paths.ToArray();
+            // The tile the new images go in front of (null: the end), so they still land there if the grid changes
+            // while they load.
+            ImageItem before = insertAt >= 0 && insertAt < items.Count ? items[insertAt] : null;
+            LoadingStarted();
+            try
             {
-                if (Directory.Exists(p))
-                    files.AddRange(Directory.GetFiles(p).Where(ImageLoader.IsImage)
-                        .OrderBy(f => System.IO.Path.GetFileName(f), natural)); // img2 before img10, like Sort A–Z
-                else if (File.Exists(p) && ImageLoader.IsImage(p))
-                    files.Add(p);
-            }
-            if (files.Count == 0)
-            {
-                statusText.Text = "No supported image files found.";
-                return;
-            }
+                statusText.Text = "Looking for images…";
+                // Off the UI thread: listing a big or network folder can take a while.
+                var (files, failed) = await Task.Run(() => ImageLoader.FindImages(dropped));
+                var ok = new List<ImageItem>();
+                if (files.Count > 0)
+                {
+                    statusText.Text = $"Loading {files.Count} image{(files.Count == 1 ? "" : "s")}…";
+                    int step = Math.Max(1, files.Count / 50); // about 50 progress updates at most
+                    var result = await ImageLoader.ReadInfoMany(files, done =>
+                    {
+                        if (done % step == 0 && done < files.Count)
+                            Dispatcher.BeginInvoke(new Action(() => statusText.Text = $"Loading images… {done} of {files.Count}"));
+                    });
+                    ok = result.ok;
+                    failed.AddRange(result.failed);
+                }
 
-            statusText.Text = $"Loading {files.Count} image{(files.Count == 1 ? "" : "s")}…";
-            Cursor = Cursors.Wait;
-            int step = Math.Max(1, files.Count / 50); // about 50 progress updates at most
-            var result = await ImageLoader.ReadInfoMany(files, done =>
-            {
-                if (done % step == 0 && done < files.Count)
-                    Dispatcher.BeginInvoke(new Action(() => statusText.Text = $"Loading images… {done} of {files.Count}"));
-            });
-            Cursor = null;
+                if (ok.Count > 0)
+                {
+                    bool wasEmpty = items.Count == 0;
+                    int at = before != null ? items.IndexOf(before) : items.Count;
+                    if (at < 0) at = Math.Min(insertAt, items.Count); // that tile was removed meanwhile
+                    var sel = selected >= 0 && selected < items.Count ? items[selected] : null;
+                    items.InsertRange(at, ok);
+                    selected = sel == null ? -1 : items.IndexOf(sel); // the same tile stays selected
+                    if (wasEmpty)
+                    {
+                        if (!userSized) AutoSize();
+                        autoFit = true;
+                    }
+                    Rebuild();
+                }
 
-            bool wasEmpty = items.Count == 0;
-            if (insertAt < 0 || insertAt > items.Count) insertAt = items.Count;
-            items.InsertRange(insertAt, result.ok);
-            if (wasEmpty && result.ok.Count > 0)
-            {
-                if (!userSized) AutoSize();
-                autoFit = true;
+                statusText.Text = files.Count == 0 && failed.Count == 0
+                    ? "No supported image files found."
+                    : $"Added {ok.Count} image{(ok.Count == 1 ? "" : "s")}." +
+                      (failed.Count > 0 ? $" {failed.Count} could not be opened." : "");
+                if (failed.Count > 0)
+                    MessageBox.Show(this, "These could not be opened:\n\n" + string.Join("\n", failed.Take(15)) +
+                        (failed.Count > 15 ? $"\n…and {failed.Count - 15} more" : ""),
+                        "RulZ Image Grid", MessageBoxButton.OK, MessageBoxImage.Warning);
             }
-            Rebuild();
+            finally { LoadingEnded(); }
+        }
 
-            statusText.Text = $"Added {result.ok.Count} image{(result.ok.Count == 1 ? "" : "s")}." +
-                (result.failed.Count > 0 ? $" {result.failed.Count} could not be opened." : "");
-            if (result.failed.Count > 0)
-                MessageBox.Show(this, "These files could not be opened:\n\n" + string.Join("\n", result.failed.Take(15)),
-                    "RulZ Image Grid", MessageBoxButton.OK, MessageBoxImage.Warning);
+        int loading; // AddFiles calls still reading files; they can overlap
+
+        void LoadingStarted()
+        {
+            if (loading++ == 0 && dragIndex < 0) Cursor = Cursors.Wait;
+        }
+
+        void LoadingEnded()
+        {
+            if (--loading == 0 && dragIndex < 0) Cursor = null;
         }
 
         void RemoveSelected()
@@ -950,7 +966,37 @@ namespace RulZImageGrid
             if (ctrl && e.Key == Key.E) { ShowExport(); e.Handled = true; return; }
             if (e.Key == Key.Escape && dragIndex >= 0) { EndDrag(); Rebuild(); e.Handled = true; return; }
             if (Keyboard.FocusedElement is TextBox) return;
-            if (e.Key == Key.Delete) { RemoveSelected(); e.Handled = true; }
+            if (e.Key == Key.Delete)
+            {
+                if (dragIndex < 0) RemoveSelected(); // not while a tile is held down
+                e.Handled = true;
+            }
+        }
+    }
+
+    /// <summary>Every file name under the tiles, drawn by the same code as the export so the two match.</summary>
+    sealed class CaptionLayer : FrameworkElement
+    {
+        readonly GridLayout layout;
+        readonly string[] names;
+        readonly double size;
+        readonly Brush brush;
+
+        public CaptionLayer(GridLayout layout, string[] names, double size, Brush brush)
+        {
+            this.layout = layout;
+            this.names = names;
+            this.size = size;
+            this.brush = brush;
+            Width = layout.Width;
+            Height = layout.Height;
+            IsHitTestVisible = false;
+        }
+
+        protected override void OnRender(DrawingContext dc)
+        {
+            double ppd = VisualTreeHelper.GetDpi(this).PixelsPerDip;
+            for (int i = 0; i < names.Length; i++) TextMetrics.DrawCaption(dc, layout, i, names[i], size, brush, ppd);
         }
     }
 
