@@ -92,6 +92,10 @@ def write_json(path: str, data) -> None:
 def pid_alive(pid) -> bool:
     if not pid:
         return False
+    if os.name == 'nt':
+        # The agent runs on Linux instances; this is only the test suite on Windows, where os.kill(pid, 0) does not
+        # test anything: signal 0 is CTRL_C_EVENT, which presses Ctrl+C in the whole console.
+        return True
     try:
         os.kill(int(pid), 0)
     except (OSError, ValueError):
