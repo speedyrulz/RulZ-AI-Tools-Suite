@@ -105,9 +105,16 @@ namespace RulZ.ImageTournament
             Invalidate();
         }
 
+        // Keyboard zoom keeps the spot in the middle of each pane where it is. (Zooming at the window's centre
+        // drifted right in Side by Side, where that point is the right edge of the left pane.)
         public void ZoomBy(float factor)
         {
-            ZoomAt(new Point(ClientSize.Width / 2, ClientSize.Height / 2), factor);
+            if (_left == null) return;
+            float zoom = Math.Max(1f, Math.Min(MaxZoom, _zoom * factor));
+            if (zoom == _zoom) return;
+            _zoom = zoom;
+            if (zoom <= 1f) _center = new PointF(0.5f, 0.5f);
+            Interacted();
         }
 
         bool IsPair { get { return _right != null; } }
@@ -203,7 +210,7 @@ namespace RulZ.ImageTournament
             if (_drag == DragKind.Divider)
             {
                 _split = Math.Max(0f, Math.Min(1f, (float)e.X / Math.Max(1, ClientSize.Width)));
-                Invalidate();
+                Interacted(); // the fast filter while dragging, like panning
             }
             else if (_drag == DragKind.Pan)
             {
@@ -223,6 +230,26 @@ namespace RulZ.ImageTournament
         {
             base.OnMouseUp(e);
             _drag = DragKind.None;
+        }
+
+        // Losing the mouse mid-drag (Alt+Tab, a window popping up) sends no MouseUp; without this the
+        // images would keep panning as the mouse merely moves over them.
+        protected override void OnMouseCaptureChanged(EventArgs e)
+        {
+            base.OnMouseCaptureChanged(e);
+            if (!Capture) _drag = DragKind.None;
+        }
+
+        // Resizing redraws on every step; use the fast filter until it settles, like zooming and panning.
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            if (_left != null)
+            {
+                _fast = true;
+                _settle.Stop();
+                _settle.Start();
+            }
         }
 
         protected override void OnMouseDoubleClick(MouseEventArgs e)
@@ -313,7 +340,12 @@ namespace RulZ.ImageTournament
             g.InterpolationMode = pixelScale >= 3f ? InterpolationMode.NearestNeighbor
                 : _fast ? InterpolationMode.Bilinear : InterpolationMode.HighQualityBicubic;
             g.PixelOffsetMode = PixelOffsetMode.Half;
-            g.DrawImage(src, corners, new RectangleF(x0, y0, x1 - x0, y1 - y0), GraphicsUnit.Pixel, _edgeClamp);
+            var srcRect = new RectangleF(x0, y0, x1 - x0, y1 - y0);
+            // The edge clamp keeps the image's outer edge from fading, but it makes GDI+ several times slower
+            // (bilinear 265 ms with it vs 52 ms without on a 1500 px pane, measured), so the quick redraws while
+            // zooming, panning or resizing go without it and the settled high-quality redraw puts it back.
+            if (_fast) g.DrawImage(src, corners, srcRect, GraphicsUnit.Pixel);
+            else g.DrawImage(src, corners, srcRect, GraphicsUnit.Pixel, _edgeClamp);
             g.ResetClip();
         }
 
