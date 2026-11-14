@@ -164,6 +164,19 @@ the queue; *Stop* goes on to the next run. The queue is kept in `output/_queue.j
 the next run, so keep it running; a WebUI restarted with runs waiting and nothing running pauses the queue until you
 *Resume* it.
 
+**One name, one run.** *Start training* and *Add to queue* also refuse a job name whose folder already holds an
+earlier run's files, and name the next free one (`my_lora_2`, `my_lora_3`, ...; a name that ends in a number counts on
+from it). Two runs in one folder mix their checkpoints, training states, samples and probe records, and the later one
+writes over files of the same step. What takes a folder: a LoRA file (`.safetensors`), a `state_XXXXXX` folder, or a
+picture or clip under `samples`, `probes` or `training_maps` from after step 0. A folder whose run saved none of
+these is free: a run that failed while loading, or one you stopped in its first minutes to fix a setting (it has its
+settings, logs, and the step-0 sample and probe a run makes before it trains). Carrying the same run on is not a new
+run: *Resume from training state* with a state folder of that job (or a file in it), and out-of-memory recovery's
+restarts, start as before. A run that starts from a LoRA file (*Resume from*), a fine-tune's *Continue from deltas*,
+a probe-picked seed soup and a probe noise check are runs of their own and need their own name: each would replace
+the earlier run's settings and logs in that folder. On Windows, names that differ only in upper and lower case are
+one folder and count as one name. After Fizgig's "one name, one run" (November 2026).
+
 The Train tab shows one section at a time: pick it in the list on the left (a *Section* dropdown on a narrow
 screen). Each setting's explanation sits beside it; click a long one to read all of it.
 
@@ -336,7 +349,7 @@ python scripts/vast/rulz_remote.py wait test1               # blocks until the r
 | `status`, `jobs`, `job NAME` | GPU, disk and queue; every run; one run's numbers |
 | `log`, `probes`, `config NAME --diff OTHER` | Logs, likeness scores, and the settings two runs differ in |
 | `pull NAME` | Copies `--what logs` (default), `probes`, `samples`, `maps` (training maps), `loras`, `best` or `all`, optionally of one `--step`. Files already here at their size and time are skipped, so it can repeat during a run (a LoRA of a run made again under the same name has the same size: its time tells) |
-| `start --job NAME` | Queues a run from `--from JOB` or a local `--config FILE`, with `--set KEY=VALUE` and `--preset`. `--dry-run` shows what would change and queues nothing. With or without it, the settings get the trainer's full check first, so what training would refuse is refused here. It refuses a job name in use and an existing job folder unless `--overwrite` |
+| `start --job NAME` | Queues a run from `--from JOB` or a local `--config FILE`, with `--set KEY=VALUE` and `--preset`. `--dry-run` shows what would change and queues nothing. With or without it, the settings get the trainer's full check first, so what training would refuse is refused here. It refuses a job name in use, and a job folder that holds an earlier run's files (it names the next free name; a folder whose run saved nothing is free). `--overwrite` starts afresh under that name: the earlier run's folder is first moved aside to `<job>_replaced_<date-time>`, nothing is deleted (if it cannot be moved, nothing is queued) |
 | `wait NAME` | Blocks until the run ends (or `--step N`), riding out dropped connections. Exit status 0 finished, 1 failed, 2 `--timeout`, 3 unreachable |
 | `stop`, `stop --kill`, `queue` | The WebUI's Stop and Kill; the queue, with `queue pause`, `resume` and `remove ID` |
 | `sync` | Copies this checkout's code to the instance, to test a change before a release. It refuses while a job runs unless `--force`; `--restart-webui` restarts the WebUI on the new code. It only adds and overwrites |
@@ -2731,6 +2744,55 @@ trains as it is, not as a subject. In a short Krea 2 test on a 16 GB card a step
 long as one without (an extra forward without gradients and one with); Fizgig reports about 1.5x over a run. Not with
 a fine-tune or a `race_parallel` race.
 
+## Regularisation dataset (`reg_dir`)
+
+For a LoRA that changes too much besides its subject: plain prompts drift toward the subject, or the whole look of the
+model shifts. `reg_dir` names a second folder of ordinary pictures of the same kind of thing (other people for a
+person, other characters for a character, other pictures in the genre for a style), and they train beside the
+datasets, so the model's idea of that kind of thing is held in place while the subject trains. After Fizgig's
+Regularisation dataset (November 2026). **Unmeasured**: Fizgig published no numbers for it and no run here has
+compared a LoRA with and without one, so treat it as something to try, not as a known gain.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `reg_dir` | empty (off) | The folder, its sub-folders included. |
+| `reg_weight` | 1.0 | Loss weight of its pictures. 1 trains them as firmly as the subject's; lower makes them a lighter anchor. |
+| `reg_per_epoch` | -1 | How many of them an epoch trains on: -1 as many as the subject's pictures (repeats and crops counted), 0 all of them, N that many. Never more than the folder holds. |
+
+- **The pictures.** Real pictures, not ones the model made (those teach it its own mistakes). Every picture needs a
+  caption that describes it; the run stops at the start, before anything loads, and names the pictures without one.
+  A caption that uses a trigger word of the run is warned about in the log: that picture teaches the trigger what it
+  shows.
+- **Each epoch takes a share.** Every size bucket of the folder gives a fixed count per epoch, the next pictures of a
+  shuffled pass through it: the whole folder comes up before any picture comes up again, and none twice in one epoch.
+  They batch together with the subject's pictures of the same size. With several training resolutions a picture's
+  copy at each resolution counts on its own, as the subject's do. A resumed run and a new resolution stage start a
+  new pass.
+- **Steps are shared.** A run is counted in steps, so with the default share half of them train regularisation
+  pictures and the subject gets half the steps it would get without the folder. The log says the share at the start
+  ("50% of the steps go to regularisation pictures"); raise `steps` to give the subject as many as before.
+- **They train whole and plain.** Their own captions with no trigger word, never dropped (a dropped caption trains on
+  the trigger word alone, which would teach the trigger that picture). No crops, region weights, identity loss,
+  attention localization or look warm-up. The per-image loss watch never records, throttles or excludes them, the
+  region watch does not read them, and nothing that reads the subject sees them: face analysis, held-out photos, the
+  look filter, likeness references, the copy check, training maps, self-training's cap.
+- **Caches.** Latents go to the folder's own `.rulz_cache` (reused by every run that names the folder); captions to
+  the run's text cache with the others. Video files in the folder are left out.
+- **Not with** LoRA Isolation (both hold everything but the subject in place, in different ways: pick one) or a full
+  fine-tune. A race shares the folder and its weight across its configurations; each configuration walks its own
+  pass through it, seeded like the others'.
+- The folder must be apart from every dataset: not a dataset itself, not inside one, not around one.
+- **In the WebUI:** the *Regularisation dataset* section of the Train tab (under Likeness): the folder, the loss
+  weight and the pictures per epoch.
+- **On vast.ai:** a run queued through the fleet sends the folder along when `reg_dir` is a full path on this
+  computer: it lands in `datasets/<folder name>` on the instance like a dataset, and the run reads it there. Give it
+  another name than the dataset folders sent with it (the fleet refuses two of one name). A relative `reg_dir` is
+  taken as a folder the instance already has, and so is one given with `--set reg_dir=...` (a `--set` value is
+  applied on the instance as typed, as for a dataset).
+
+Checked here on the CPU only (the scan, each epoch's share, and a run on a tiny model). Never run on a real model or a
+GPU, and the fleet's sending of the folder never on a real instance.
+
 ## Full fine-tune, then extract a LoRA (`finetune`)
 
 A LoRA confines every update to a few directions, so concepts compete for them and pull pose, framing and lighting
@@ -4060,6 +4122,18 @@ stay on the GPU.
 - **Limits.** Single GPU only (`model_split` spreads blocks over GPUs instead). Not with data parallel or a fine-tune.
   torch.compile is turned off unless `block_swap_compile` is on. A sampling model swapped in and out keeps the split.
   The *Block swap* field is on the Train tab's memory section.
+- **The wizard's plan counts the adapter.** The wizard picks N from the model's size, a flat 4.5 GB for a step's
+  memory, and what the run's adapter holds beyond a default one. The flat allowance was set for a rank-16 LoRA on the
+  family's default layers with AdamW and the weight average; a bigger adapter keeps more on the GPU (its weights,
+  their gradients, the optimizer's state and the average's copy), and the plan now swaps more blocks for it and says
+  so in its reason ("counting 2.8 GB more for the LoKr (factor 8), ..."). Counted for the layers the run would wrap
+  (`lora_targets`, `lora_blocks`), the adapter type and size, DoRA, the optimizer and the weight average. Examples on
+  Krea 2: rank 64 with AdamW 3.4 GB more, LoKr factor 8 with AdamW 2.8 GB, rank 32 with adamw8bit 0.5 GB. A race
+  counts its largest configuration (one is on the GPU at a time, and a row may change the adapter). When even
+  the most blocks it may swap do not make room, the reason says the fit is tight. After Fizgig's fix of the same gap
+  (it planned for the frozen model alone, and a LoKr run on a 16 GB card went past its memory). **These are counts
+  of tensors, not measurements:** activations and DoRA's working memory are not in them, and no run here has
+  compared the plan with a card's real peak. Out-of-memory recovery's own steps are unchanged.
 - **Compile with block swap (`block_swap_compile`, experimental, untested).** `block.compile()` compiles a block's
   whole call, its hooks included, so dynamo would trace block swap's streaming (CUDA streams, events, weights swapped
   in and out); that is why block swap turns compile off. With `block_swap_compile: true` the swapped blocks compile

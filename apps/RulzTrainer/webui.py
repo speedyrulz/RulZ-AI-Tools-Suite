@@ -517,6 +517,8 @@ def _start_training(cfg: TrainConfig, recovery_note: str | None = None) -> str:
     missing = [sp.path or "(none picked)" for sp in cfg.dataset_specs() if not sp.path or not Path(sp.path).is_dir()]
     if missing:
         return f"Dataset folder not found: {', '.join(missing)}"
+    if cfg.reg_dir and not Path(cfg.reg_dir).is_dir():
+        return f"Regularisation folder not found: {cfg.reg_dir}"
     foreign = cfg.foreign_sampling_files()
     if foreign:  # TrainConfig.validate refuses it in the job too: say so here instead of in its log
         return (f"Not started: this run trains {cfg.arch_name()}, but these settings name another model's files: "
@@ -525,6 +527,10 @@ def _start_training(cfg: TrainConfig, recovery_note: str | None = None) -> str:
         for n in ("transformer_file", "text_encoder_file", "vae_file"):
             if getattr(cfg, n) and not Path(getattr(cfg, n)).is_file():
                 return f"{n} not found: {getattr(cfg, n)!r}"
+    if recovery_note is None:  # out-of-memory recovery carries the same run on in its own folder
+        taken = job_name_refusal(cfg, _waiting_job_names())
+        if taken:
+            return f"Not started: {taken}"
     _job_dir = cfg.job_dir()
     _job_dir.mkdir(parents=True, exist_ok=True)
     if recovery_note is None:
@@ -631,16 +637,41 @@ def _start_queued(config: dict) -> tuple[bool, str]:
     return msg.startswith("Started"), msg
 
 
+def _waiting_job_names() -> set[str]:
+    """The job names of the runs waiting in the queue."""
+    try:
+        return {e["job"] for e in QUEUE.snapshot()["waiting"]}
+    except Exception:  # noqa: BLE001  (an unreadable queue file: no names to skip)
+        return set()
+
+
+def job_name_refusal(cfg: TrainConfig, busy: set[str] = frozenset()) -> str | None:
+    """Why a new run may not use cfg's job name, or None: its folder holds an earlier run's output and the run does
+    not carry that run on from one of its own states (rulztrainer/runplan.py). busy: names running or waiting, which
+    the suggested free name skips too."""
+    from rulztrainer import runplan
+
+    free = runplan.job_name_taken(cfg.job_name, cfg.output_dir, cfg.resume_state, busy)
+    return None if free is None else runplan.name_taken_message(cfg.job_name, cfg.job_dir(), free)
+
+
 def queue_run(cfg: TrainConfig) -> tuple[bool, str]:
     """Add a run to the queue (it starts once nothing runs). Refuses a job name the running job or a waiting run
-    already uses: the later run would write over the earlier one's folder."""
+    already uses, or whose folder holds an earlier run's output: the later run would write over the earlier one's
+    files."""
     reattach_job()
-    taken = {e["job"] for e in QUEUE.snapshot()["waiting"]}
+    taken = _waiting_job_names()
     if _running() and _job_dir is not None:
         taken.add(_job_dir.name)
-    if cfg.job_name in taken:
+    from rulztrainer import runplan
+
+    if runplan.name_in(cfg.job_name, taken):  # (on Windows `Portrait` and `portrait` are one folder)
+        free = runplan.next_free_name(cfg.job_name, taken, cfg.output_dir)
         return False, (f"Job name '{cfg.job_name}' is already running or queued; give this run another job name so "
-                       "it doesn't overwrite that one's folder.")
+                       f"it doesn't overwrite that one's folder ('{free}' is free).")
+    refusal = job_name_refusal(cfg, taken)
+    if refusal:
+        return False, refusal
     QUEUE.add(cfg.to_dict(), label=cfg.arch_name())
     n = len(QUEUE.snapshot()["waiting"])
     if not _running():
@@ -1982,6 +2013,7 @@ class Form:
             isolation_kind=v("isolation_kind") or "auto", dop_weight=float(v("dop_weight")),
             dop_every=int(v("dop_every") or 2), isolation_pairs=num("isolation_pairs", int),
             isolation_pair_weight=float(v("isolation_pair_weight")), isolation_balance=bool(v("isolation_balance")),
+            reg_dir=s("reg_dir"), reg_weight=num("reg_weight", float), reg_per_epoch=num("reg_per_epoch", int),
             look_warmup=bool(v("look_warmup")), look_warmup_start=float(v("look_warmup_start")),
             look_warmup_epochs=float(v("look_warmup_epochs")),
             region_weights=bool(v("region_weights")), face_loss_weight=float(v("face_loss_weight")),
@@ -5112,11 +5144,58 @@ MODEL_GB["minimax_h3_image"] = {"bf16": 40.2, "int8": 21.0, "nvfp4": 12.5}
 # PAN 2: the diffusers folder's transformer is 67.6 GB (bf16 with fp32 norm projections); the converted files with
 # those layers quantized too are 29.4 GB (PAN2_int8_convrot_full) and 16.6 GB (PAN2_nvfp4)
 MODEL_GB["pan2"] = {"bf16": 67.6, "int8": 29.4, "nvfp4": 16.6}
-STEP_HEADROOM_GB = 4.5
+STEP_HEADROOM_GB = 4.5  # set for the default run's adapter; a bigger one adds runplan.adapter_extra_gb on top
+# Adapter keys of the wizard's picks that change what the adapter holds (runplan.adapter_gb reads them)
+ADAPTER_PLAN_KEYS = ("network_type", "lora_rank", "lokr_factor", "oft_block_size", "dora", "optimizer", "lora_ema",
+                     "lora_targets", "lora_blocks", "train_text_embedder", "keel_lookahead", "finetune")
 
 
-def block_swap_plan(cfg: TrainConfig, vram: float, quant: str) -> tuple[int, float]:
-    """(blocks to swap, GB of weights they hold) so the model plus a step's memory fits in `vram` GB; 0 when it fits."""
+def adapter_extra_gb(cfg: TrainConfig, overrides: dict | None = None) -> float:
+    """GB this run's adapter (and its gradients, optimizer state and weight average) holds beyond the default run's,
+    which STEP_HEADROOM_GB already covers; 0 when it cannot be counted (see rulztrainer/runplan.py)."""
+    try:
+        from rulztrainer.runplan import adapter_extra_gb as extra
+
+        return extra(cfg, overrides)
+    except Exception:
+        return 0.0
+
+
+def adapter_overrides(r: dict) -> dict:
+    """The wizard's picks (wizard_recommendations' {key: (value, reason)}) that change what the adapter holds and that
+    it applies along with the block swap (WIZARD_AUTO: the weight average). The others (rank, network type, optimizer)
+    wait for a click, and the plan is made again from the form once one is taken."""
+    return {k: r[k][0] for k in ADAPTER_PLAN_KEYS if k in r and k in WIZARD_AUTO}
+
+
+def adapter_words(cfg: TrainConfig, overrides: dict | None = None) -> str:
+    """The adapter and its training state in a few words, for the memory plan's reason."""
+    o = overrides or {}
+
+    def get(key):
+        return o[key] if key in o else getattr(cfg, key)
+
+    if get("race") and getattr(cfg, "race_configs", None):
+        return "the race's largest configuration (its adapter, gradients, optimizer state and weight average)"
+    kind = get("network_type")
+    name = (f"LoKr (factor {get('lokr_factor')})" if kind == "lokr" else
+            f"OFT (block {get('oft_block_size')})" if kind == "oft" else f"rank-{get('lora_rank')} LoRA")
+    name += " with DoRA" if get("dora") and kind != "oft" else ""
+    average = " and weight average" if get("lora_ema") else ""
+    return f"the {name}, its gradients and {get('optimizer')} state{average}"
+
+
+def block_swap_plan(cfg: TrainConfig, vram: float, quant: str, adapter_gb: float | None = None) -> tuple[int, float]:
+    """(blocks to swap, GB of weights they hold) so the model plus a step's memory fits in `vram` GB; 0 when it fits.
+    adapter_gb: what the run's adapter holds beyond the step allowance (None: counted from cfg, adapter_extra_gb)."""
+    n, saved, _tight = block_swap_fit(cfg, vram, quant, adapter_gb)
+    return n, saved
+
+
+def block_swap_fit(cfg: TrainConfig, vram: float, quant: str,
+                   adapter_gb: float | None = None) -> tuple[int, float, bool]:
+    """block_swap_plan, plus whether the fit is tight: even the most blocks it may swap (all but 2) leave the model
+    and a step's memory over `vram`."""
     fam = cfg.arch_name()
     if quant == "auto":
         if cfg.model_source == "files" and fam != "flux2_klein":  # its float files are quantized for the memory
@@ -5131,11 +5210,12 @@ def block_swap_plan(cfg: TrainConfig, vram: float, quant: str) -> tuple[int, flo
     quant = {"int8_convrot": "int8", "none": "bf16"}.get(quant, quant)
     gb = MODEL_GB.get(fam, MODEL_GB["moss_image"]).get(quant, 10.0)
     blocks = get_arch(cfg).n_blocks or 28
-    over = gb + STEP_HEADROOM_GB - vram
+    extra = adapter_extra_gb(cfg) if adapter_gb is None else max(0.0, float(adapter_gb or 0.0))
+    over = gb + STEP_HEADROOM_GB + extra - vram
     if over <= 0:
-        return 0, 0.0
+        return 0, 0.0, False
     n = max(1, min(blocks - 2, math.ceil(blocks * over / gb)))
-    return n, gb * n / blocks
+    return n, gb * n / blocks, gb * n / blocks < over
 
 
 MODEL_NOTES = {
@@ -5290,13 +5370,9 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
     r["checkpoint_keep_blocks"] = (-1, "measured at the start: as many blocks as fit skip the recompute")
     r["compile_model"] = ("auto", "measured 26% (MOSS-Image) and 12% (Krea 2) faster per step after a warm-up of "
                                   "under a minute; auto skips it for short test runs")
-    if vram is not None and cfg.multi_gpu == "off" and not cfg.finetune:
-        swap, saved = block_swap_plan(cfg, vram, r.get("transformer_quant", (cfg.transformer_quant,))[0])
-        if swap:
-            r["block_swap"] = (swap, f"the model and a step's memory do not fit {vram:.0f} GB: {swap} blocks' frozen "
-                                     f"weights ({saved:.1f} GB) wait in system RAM and stream in as each block runs")
-        else:
-            r["block_swap"] = (0, f"the model fits {vram:.0f} GB as it is; swapping only slows the steps")
+    plan_swap = vram is not None and cfg.multi_gpu == "off" and not cfg.finetune
+    if plan_swap:  # its place in the list; filled in below, once the weight average pick is known
+        r["block_swap"] = (0, "")
     # dataset
     target = 1.0 if vram is None or vram >= 12 else 0.5
     reason = ("1 MP (1024x1024) is the size the model was trained at" if target == 1.0
@@ -5496,6 +5572,19 @@ def wizard_recommendations(cfg: TrainConfig, goal: str | None, gpus: list[dict],
         r["probe_body_prompt"] = (("", "face only: each probe renders the headshot alone, in half the time")
                                   if face_only else
                                   (body_p.format(trigger=subject), "an upright full-body shot scores the build"))
+    if plan_swap:  # the form's adapter counts too (with the weight average picked above): a big one swaps more
+        picks = adapter_overrides(r)
+        extra = adapter_extra_gb(cfg, picks)
+        swap, saved, tight = block_swap_fit(cfg, vram, r.get("transformer_quant", (cfg.transformer_quant,))[0], extra)
+        counted = (f" (counting {extra:.1f} GB more for {adapter_words(cfg, picks)} than a default rank-16 LoRA's)"
+                   if extra >= 0.1 else "")
+        if swap:
+            r["block_swap"] = (swap, f"the model and a step's memory do not fit {vram:.0f} GB{counted}: {swap} blocks' "
+                                     f"frozen weights ({saved:.1f} GB) wait in system RAM and stream in as each block "
+                                     "runs" + ("; even so the fit is tight: a smaller adapter, a lighter optimizer or "
+                                               "a smaller quantization leaves room" if tight else ""))
+        else:
+            r["block_swap"] = (0, f"the model fits {vram:.0f} GB as it is{counted}; swapping only slows the steps")
     if cfg.arch_name() == "minimax_h3":
         h3_recommendations(cfg, r, goal, gpus, vram, character)
     elif cfg.arch_name() == "p_h3_image":
@@ -5577,12 +5666,16 @@ def h3_recommendations(cfg: TrainConfig, r: dict, goal: str | None, gpus: list[d
                                          "each); a copy per card (data parallel) does not fit")
         r["block_swap"] = (0, "model split holds the whole model on the GPUs")
     elif vram is not None and not cfg.finetune:
-        resident = max(1.0, vram - 4.5 - 1.6)  # the step's memory and the non-block weights (refiner, heads)
+        picks = adapter_overrides(r)
+        extra = adapter_extra_gb(cfg, picks)  # a bigger adapter than the default LoRA leaves fewer blocks resident
+        resident = max(1.0, vram - 4.5 - 1.6 - extra)  # the step's memory and the non-block weights (refiner, heads)
         swap = max(1, min(48, math.ceil(50 - resident / 0.387)))  # a pruned int8 block holds 0.387 GB
+        counted = (f", counting {extra:.1f} GB more for {adapter_words(cfg, picks)} than a default rank-16 LoRA's"
+                   if extra >= 0.1 else "")
         r["multi_gpu"] = ("off", "one GPU found")
         r["block_swap"] = (swap, f"the 21 GB model does not fit {vram:.0f} GB: {swap} of the 50 blocks' frozen weights "
                                  f"({swap * 0.387:.1f} GB) wait in pinned system RAM and stream in as each runs "
-                                 "(an estimate; musubi-tuner swaps up to 48)")
+                                 f"(an estimate{counted}; musubi-tuner swaps up to 48)")
     r["resolutions"] = ([1.0], "1 MP: about H3's own 768 x 1344 canvas, and 1024 video tokens a step")
     if not cfg.finetune and cfg.network_type == "lora":
         rank = 32 if goal == "style" else 16
@@ -5757,6 +5850,11 @@ def review_issues(cfg: TrainConfig, goal: str | None, data: dict | None, n_gpus:
             out.append(("error", "The datasets have no images (png, jpg, webp or bmp)."))
         else:
             out += [("warning", w) for w in start_warnings(cfg)]
+    if cfg.reg_dir and not Path(cfg.reg_dir).is_dir():
+        out.append(("error", f"Regularisation folder not found: {cfg.reg_dir}"))
+    taken = job_name_refusal(cfg, _waiting_job_names())  # Start and Add to queue refuse it: say so here first
+    if taken:
+        out.append(("error", taken))
     try:
         cfg.validate()
     except ValueError as e:
@@ -10824,6 +10922,32 @@ def build_page(local: bool = True):
                                          "largest.")
                         iso_fields.bind_visibility_from(w["isolation"], "value")
 
+                    # ---- Regularisation dataset
+                    with sections.section("Likeness", "Regularisation dataset",
+                                          "Pictures of other subjects of the same kind, trained beside yours",
+                                          "collections"):
+                        hint("After Fizgig's regularisation dataset (kohya's regularisation images). A folder of "
+                             "pictures of other subjects of the same kind (other people for a person, other dogs for "
+                             "a dog), each with its own caption and without your trigger word. They train beside your "
+                             "pictures at their own loss weight, so the model's idea of the kind stays broad while "
+                             "the LoRA learns your subject. Every picture needs a caption: the run stops at its start "
+                             "when one has none. Sub-folders count; videos are left out. The folder must be apart "
+                             "from the dataset folders. Not with LoRA Isolation or a full fine-tune. Never run on a "
+                             "real model here (unit-tested only), and Fizgig published no measurements for it.")
+                        with fields():
+                            path_input(f, "reg_dir", "Regularisation folder (empty = off)", "dir", d.reg_dir)
+                            w["reg_weight"] = ui.number("Loss weight", value=d.reg_weight, min=0.01, step=0.1) \
+                                .classes("w-32").tooltip("How much a regularisation picture's loss counts against "
+                                                         "one of yours (1 = the same). It does not change how often "
+                                                         "they train.")
+                            w["reg_per_epoch"] = ui.number("Pictures per epoch", value=d.reg_per_epoch, min=-1,
+                                                           precision=0).classes("w-44") \
+                                .tooltip("-1 = as many as your own pictures (repeats counted), so about half of the "
+                                         "steps train them and a run needs about twice the steps for the same "
+                                         "number of passes over your pictures; 0 = the whole folder every epoch; "
+                                         "N = that many. Each epoch takes the next pictures of a shuffled pass, so "
+                                         "the whole folder is seen before any picture repeats.")
+
                     # ---- Likeness probes
                     with sections.section("Likeness", "Likeness probes & controller",
                                           "Best checkpoint, early stop and curriculum", "insights"):
@@ -13500,6 +13624,10 @@ if __name__ in {"__main__", "__mp_main__"}:
         on_exit_signals(park)
 
     app.on_startup(lambda: threading.Thread(target=queue_loop, name="rulz-queue", daemon=True).start())
+    # the memory plan's first count builds a model on the meta device, which spends seconds setting torch's meta
+    # kernels up once: done here, off the page, so the wizard's first refresh does not stall
+    app.on_startup(lambda: threading.Thread(target=adapter_extra_gb, args=(TrainConfig(),), name="rulz-memplan",
+                                            daemon=True).start())
     if VAST_INSTANCE is None:  # this computer looks after the vast.ai instances; an instance looks after itself
         app.on_startup(lambda: threading.Thread(target=fleet_loop, name="rulz-fleet", daemon=True).start())
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
 import random
@@ -58,6 +59,7 @@ class Item:
     pair_side: str = ""  # LoRA Isolation's side-by-side pairs: the subject's panel ("left" / "right"; never mirrored)
     frames: int = 1  # above 1: a video clip of that many frames (category "clip", `image` is the video file)
     latent_frames: int = 1  # its latent frames (the VAE packs several frames into one)
+    reg: bool = False  # a picture of the regularisation dataset (scan_reg): trains whole and plain at reg_weight
 
     @property
     def tokens(self) -> int:
@@ -253,6 +255,116 @@ def scan_dataset(cfg: TrainConfig) -> list[Item]:
         log.info("Training resolutions: %s (%d items = %d images x %d resolutions)", describe_sides(cfg), len(items),
                  summary[0][1], len(summary[0][2]))
     return items
+
+
+REG_NAMED = 5  # file names a message about the regularisation folder lists before "and N more"
+
+
+def _named(paths: list[Path]) -> str:
+    return ", ".join(p.name for p in paths[:REG_NAMED]) + (f" and {len(paths) - REG_NAMED} more"
+                                                           if len(paths) > REG_NAMED else "")
+
+
+def reg_triggers(cfg: TrainConfig) -> list[str]:
+    """Every trigger word of the run (the run's and each dataset's), longest first."""
+    words = {str(cfg.trigger_word or "").strip()} | {spec.trigger for spec in cfg.dataset_specs()}
+    return sorted((w for w in words if w), key=len, reverse=True)
+
+
+def scan_reg(cfg: TrainConfig) -> list[Item]:
+    """The regularisation dataset's items (cfg.reg_dir; [] when it is off): one per picture and training resolution of
+    the run, marked `reg`, at the loss weight reg_weight, with its own caption and no trigger word, in the folder's own
+    latent cache. They are kept apart from the datasets' items: nothing that reads the subject (face analysis, crops,
+    region maps, held-out photos, the look filter, likeness references, the loss watch, training maps, the copy
+    check) sees them; only the caches and the image queue (BucketBatcher) do.
+
+    Every picture needs a caption that describes it: one without is refused (it would train on the empty prompt, and
+    hold nothing in place under the words the subject is prompted with). A caption that uses a trigger word is warned
+    about: that picture teaches the trigger someone else's look. Video files are left out."""
+    root = str(cfg.reg_dir or "").strip()
+    if not root:
+        return []
+    root = Path(root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Regularisation folder not found: {root}")
+    arch = get_arch(cfg)
+    tag = arch.latent_tag
+    cache = cfg.dataset_cache_dir(root)
+    (cache / "latents").mkdir(parents=True, exist_ok=True)
+    sides = cfg.training_sides()
+    triggers = [t.lower() for t in reg_triggers(cfg)]
+    items: list[Item] = []
+    uncaptioned: list[Path] = []
+    triggered: list[Path] = []
+    n_images = n_videos = 0
+    for p in sorted(root.rglob("*")):
+        if skipped(p, root):
+            continue
+        if p.suffix.lower() in VIDEO_EXTS:
+            n_videos += 1
+            continue
+        if p.suffix.lower() not in IMAGE_EXTS:
+            continue
+        try:
+            w, h, transparent = upright_header(p)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Skipping unreadable regularisation image %s: %s", p, e)
+            continue
+        cap_file = arch.caption_file(p, cfg)  # the file itself: a family with JSON captions wraps an empty one
+        raw = cap_file.read_text(encoding="utf-8").strip() if cap_file.is_file() else ""
+        if raw and cap_file.suffix.lower() == ".json":
+            try:
+                raw = raw if json.loads(raw) else ""  # {} or [] describes nothing
+            except ValueError:
+                pass  # not JSON after all: read as the plain caption it is
+        if not raw:
+            uncaptioned.append(p)
+            continue
+        caption = read_caption(p, cfg, "")
+        n_images += 1
+        if any(t in caption.lower() for t in triggers):
+            triggered.append(p)
+        seen: set[tuple[int, int]] = set()
+        for side in sides:
+            bw, bh = bucket_size(w, h, cfg, side)
+            if (bw, bh) in seen:
+                continue
+            seen.add((bw, bh))
+            stem = _hash(latent_key(p, transparent)) + f"_{bw}x{bh}"
+            items.append(Item(
+                image=p, caption=caption, width=bw, height=bh,
+                latent_path=cache / "latents" / f"{stem}{tag}.safetensors",
+                latent_flip_path=(cache / "latents" / f"{stem}_flip{tag}.safetensors") if cfg.flip_augment else None,
+                text_path=text_cache_path(cfg, caption), region_path=None, side=side, repeats=1, dataset=str(root),
+                loss_scale=float(cfg.reg_weight), reg=True))
+    if uncaptioned:
+        raise ValueError(f"{len(uncaptioned)} regularisation picture(s) in {root} have no caption: {_named(uncaptioned)}. "
+                         "Every regularisation picture needs a caption that describes it (and does not use the "
+                         "trigger word); caption them, or move them out of the folder")
+    if not n_images:
+        raise ValueError(f"No images found in the regularisation folder {root}")
+    if triggered:
+        log.warning("Regularisation: %d caption(s) use a trigger word of this run (%s): those pictures teach the "
+                    "trigger what they show. Take the word out of their captions", len(triggered), _named(triggered))
+    if n_videos:
+        log.info("Regularisation folder %s: %d video file(s) left out (its pictures only)", root, n_videos)
+    return items
+
+
+def reg_quotas(sizes: dict, subject: int, per_epoch: int) -> dict:
+    """How many regularisation pictures each size bucket gives an epoch. sizes: {bucket: its regularisation pictures};
+    subject: the subject pictures an epoch trains (repeats counted); per_epoch: reg_per_epoch (-1 = as many as
+    `subject`, 0 = all of them, N = that many; never more than there are). Each bucket gives a fixed share by its size
+    (largest remainders first, so the shares add up to the count): an epoch has the same number of steps every time."""
+    total = sum(sizes.values())
+    want = total if per_epoch == 0 else min(total, max(0, subject if per_epoch < 0 else per_epoch))
+    if want >= total:
+        return dict(sizes)
+    raw = {k: want * n / total for k, n in sizes.items()}
+    quota = {k: int(v) for k, v in raw.items()}
+    for k in sorted(sizes, key=lambda k: raw[k] - quota[k], reverse=True)[:want - sum(quota.values())]:
+        quota[k] += 1
+    return quota
 
 
 def _clip_item(p: Path, cfg: TrainConfig, spec, root: Path, cache: Path, tag: str, frames: int, arch) -> Item | None:
@@ -578,22 +690,75 @@ def text_cache_path(cfg: TrainConfig, prompt: str) -> Path:
 
 class BucketBatcher:
     """Yields batches of Items with identical bucket size (clips batch with clips of their length), shuffled each epoch. An item with repeats N comes up N
-    times per epoch (its dataset's repeats)."""
+    times per epoch (its dataset's repeats).
 
-    def __init__(self, items: list[Item], batch_size: int, seed: int):
-        self.items = items
+    Regularisation pictures (Item.reg) are queued apart: an epoch takes reg_per_epoch of them (reg_quotas: each size
+    bucket its share), the next ones of a shuffled pass through the bucket, so every picture of the folder comes up
+    before any comes up again, and never twice in one epoch. They batch with the subject's pictures of their size,
+    and the sampling weights (the curriculum, the loss watch's exclusions) never touch them."""
+
+    def __init__(self, items: list[Item], batch_size: int, seed: int, reg_per_epoch: int = -1):
+        # `items` is the subject's alone: what reads the queue's pictures (training maps, region sweeps, the
+        # curriculum, the crops' weights) never meets a regularisation picture. Those are in reg_items
+        self.reg_items = [it for it in items if getattr(it, "reg", False)]
+        self.items = [it for it in items if not getattr(it, "reg", False)] if self.reg_items else items
         self.batch_size = batch_size
         self.rng = random.Random(seed)
         self.buckets: dict[tuple[int, int], list[Item]] = {}
+        self.reg_buckets: dict[tuple[int, int], list[Item]] = {}
         for it in items:
+            if getattr(it, "reg", False):
+                self.reg_buckets.setdefault((it.width, it.height, it.frames), []).append(it)
+                continue
             self.buckets.setdefault((it.width, it.height, it.frames), []).extend([it] * max(1, int(it.repeats or 1)))
         log.info("Buckets: %s", {f"{k[0]}x{k[1]}" + (f"x{k[2]}f" if k[2] > 1 else ""): len(v)
                                  for k, v in self.buckets.items()})
+        self.reg_quota = reg_quotas({k: len(v) for k, v in self.reg_buckets.items()},
+                                    sum(len(v) for v in self.buckets.values()), int(reg_per_epoch))
+        self._reg_decks: dict[tuple[int, int], list[Item]] = {}  # the rest of each bucket's current pass
+        if self.reg_buckets:
+            log.info("Regularisation buckets: %s", {f"{k[0]}x{k[1]}": f"{self.reg_quota[k]} of {len(v)} per epoch"
+                                                    for k, v in self.reg_buckets.items()})
         self.weights: dict[str, float] | None = None
 
     def set_weights(self, weights: dict[str, float] | None) -> None:
         """Per-image sampling weights keyed by item.key; None restores uniform shuffling."""
         self.weights = weights
+
+    def reg_images(self) -> int:
+        """Regularisation pictures an epoch trains on."""
+        return sum(self.reg_quota.values())
+
+    def carry_reg_pass(self, old: "BucketBatcher | None") -> None:
+        """Go on with the pass through the regularisation pictures where the queue this one replaces had got to
+        (self-training rebuilds the queue every round): a bucket's pass is taken over when it holds the same
+        pictures here. Another resolution stage has other buckets and starts its own; so does a resumed run."""
+        for key, deck in (getattr(old, "_reg_decks", None) or {}).items():
+            mine = self.reg_buckets.get(key)
+            if mine is not None and {id(it) for it in mine} == {id(it) for it in old.reg_buckets.get(key, [])}:
+                self._reg_decks[key] = list(deck)
+
+    def epoch_images(self) -> int:
+        """Pictures in one epoch: the subject's (repeats counted) and the epoch's share of regularisation pictures."""
+        return sum(len(v) for v in self.buckets.values()) + self.reg_images()
+
+    def _reg_draw(self, key) -> list[Item]:
+        """A bucket's regularisation pictures for this epoch: the next ones of its shuffled pass. When the pass runs
+        out mid-epoch a new one starts, with the pictures already drawn this epoch at its end (a quota is never more
+        than the bucket holds, so none comes up twice in one epoch)."""
+        want = self.reg_quota.get(key, 0)
+        out: list[Item] = []
+        if want <= 0:
+            return out
+        deck = self._reg_decks.setdefault(key, [])
+        while len(out) < want:
+            if not deck:
+                fresh = self.reg_buckets[key][:]
+                self.rng.shuffle(fresh)
+                drawn = {id(it) for it in out}
+                deck.extend([it for it in fresh if id(it) not in drawn] + [it for it in fresh if id(it) in drawn])
+            out.append(deck.pop(0))
+        return out
 
     def _resample(self, group: list[Item], ws: list[float]) -> list[Item]:
         """len(group) draws in proportion to the weights, systematically: each item comes up the floor or the ceiling
@@ -617,11 +782,16 @@ class BucketBatcher:
 
     def epoch(self):
         batches = []
-        for group in self.buckets.values():
-            if self.weights:
+        # the subject's buckets in their own order, then the sizes only regularisation pictures have (none: the
+        # shuffles below draw exactly as they did before there was a regularisation dataset)
+        for key in list(self.buckets) + [k for k in self.reg_buckets if k not in self.buckets]:
+            group = self.buckets.get(key, [])
+            if self.weights and group:
                 group = self._resample(group, [max(0.0, float(self.weights.get(it.key, 1.0))) for it in group])
             else:
                 group = group[:]
+            if self.reg_buckets:
+                group += self._reg_draw(key)
             self.rng.shuffle(group)
             for i in range(0, len(group), self.batch_size):
                 batches.append(group[i:i + self.batch_size])
@@ -653,7 +823,10 @@ def load_batch(batch: list[Item], cfg: TrainConfig, rng: random.Random):
         if it.latent_flip_path and rng.random() < 0.5:
             path, flipped = it.latent_flip_path, True
         latents.append(load_file(str(path))["latent"])
-        tp = empty if (cfg.caption_dropout > 0 and rng.random() < cfg.caption_dropout) else it.text_path
+        # a regularisation picture keeps its caption: a dropped one trains on the trigger word alone
+        # (caption_dropout_keep_trigger), which would teach the trigger that picture
+        drop = cfg.caption_dropout > 0 and not it.reg and rng.random() < cfg.caption_dropout
+        tp = empty if drop else it.text_path
         rows.append(load_file(str(tp))["embeds"])
         paths.append(tp)
         if want_regions:

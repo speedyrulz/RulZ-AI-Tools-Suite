@@ -529,6 +529,14 @@ class TrainConfig:
     max_token_length: int = 1024
     cache_dir: str = ""  # defaults to <dataset>/.rulz_cache per dataset (the run's own files: the first dataset's)
     recache: bool = False
+    # --- regularisation dataset (after Fizgig's, Nov 2026): a second folder of ordinary captioned pictures of the same
+    # kind of thing as the subject (other people for a person, other pictures in the genre for a style), trained beside
+    # the datasets so the LoRA changes less besides its subject. Its pictures train whole and plain: no trigger word,
+    # no caption dropout, no crops, region weights, loss watch, likeness references or training maps ---
+    reg_dir: str = ""  # the folder (its sub-folders included); empty = off
+    reg_weight: float = 1.0  # loss weight of its pictures: 1 trains them as firmly as the subject's, lower is a lighter anchor
+    reg_per_epoch: int = -1  # how many of them an epoch trains on, a different handful each epoch: -1 = as many as the
+    #                          subject's pictures (half of every epoch), 0 = all of them, N = that many
 
     # --- lora ---
     lora_rank: int = 16
@@ -1472,6 +1480,42 @@ class TrainConfig:
                 if a != b and a.startswith(b.rstrip("\\/") + os.sep):
                     raise ValueError(f"Dataset {seen[a]} lies inside dataset {seen[b]}, whose scan includes its "
                                      "sub-folders: its images would train twice")
+        self.validate_reg(seen)
+
+    def validate_reg(self, datasets: dict[str, str]) -> None:
+        """The regularisation dataset: its numbers, what it cannot run with, and a folder apart from every dataset
+        (`datasets`: normalized path -> path as written). Whether the folder exists and its pictures have captions is
+        for the scan (dataset.scan_reg), which reads it."""
+        import os
+
+        reg = str(self.reg_dir or "").strip()
+        if not reg:
+            return
+        if not self.reg_weight > 0:
+            raise ValueError(f"reg_weight must be above 0, got {self.reg_weight!r} (clear reg_dir to train without "
+                             "the regularisation dataset)")
+        if self.reg_per_epoch < -1:
+            raise ValueError("reg_per_epoch must be -1 (as many as the subject's pictures), 0 (all of them) or a count, "
+                             f"got {self.reg_per_epoch!r}")
+        if self.isolation:
+            raise ValueError("A regularisation dataset and LoRA Isolation both hold the model's idea of everything "
+                             "but the subject in place, in different ways: use one (clear reg_dir, or turn isolation "
+                             "off)")
+        if self.finetune:
+            raise ValueError("A regularisation dataset is for LoRA runs: a fine-tune counts its rotations in its own "
+                             "pictures (clear reg_dir, or turn finetune off)")
+        key = os.path.normcase(os.path.abspath(reg)).rstrip("\\/")
+        for other, path in datasets.items():
+            other = other.rstrip("\\/")
+            if key == other:
+                raise ValueError(f"reg_dir is the dataset {path} itself: the regularisation pictures are other "
+                                 "pictures of the same kind of thing, in a folder of their own")
+            if key.startswith(other + os.sep):
+                raise ValueError(f"reg_dir lies inside the dataset {path}, whose scan includes its sub-folders: its "
+                                 "pictures would train as the subject too")
+            if other.startswith(key + os.sep):
+                raise ValueError(f"The dataset {path} lies inside reg_dir, whose scan includes its sub-folders: the "
+                                 "subject's pictures would train as regularisation pictures too")
 
     def wants_regions(self) -> bool:
         """Region maps (face cells, landmarks, the subject's cells) are needed by the region-weighted loss, the identity
