@@ -100,6 +100,8 @@ export function App() {
       name: view.app.name,
       go: () => {
         arrow.current = which
+        // Going back from here leads to this app's card, not the one the browsing started from.
+        opened.current = view.app.id
         select(view.app.id)
       }
     }
