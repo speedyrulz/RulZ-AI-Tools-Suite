@@ -18,7 +18,7 @@ from PySide6.QtCore import QObject, Qt, Signal
 
 from ..export import ExportSettings, build_piped_commands, command_cwd, command_text, output_rate
 from ..probe import VideoInfo
-from .pipeline import RepairState, orient, oriented_size
+from .pipeline import RepairState, fit_size, orient, oriented_size
 
 NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW: no console window per ffmpeg on Windows
 
@@ -58,8 +58,7 @@ class RepairExport:
         p = self.state.pipeline
         if self._mapper is None:  # held for the whole export, whatever the preview evicts
             self._mapper = p.mapper(rgb.shape[1], rgb.shape[0], True)
-        ow, oh = p.out_size
-        out = self._mapper.apply(rgb)[:oh, :ow]
+        out = fit_size(self._mapper.apply(rgb), p.out_size)
         return np.ascontiguousarray(orient(out, *self._delta))
 
 
@@ -85,8 +84,11 @@ class PipedExportJob(QObject):
         self.expected = max(1, round((end - start) * rate))
         self.cancelled = False
         self.done = False
+        self.warning = ""  # (ExportJob interface; nothing to report here)
         self.frames = 0
         self._cancel = threading.Event()
+        self._procs: list[subprocess.Popen] = []   # the running attempt's decoder and encoder
+        self._procs_lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._result: tuple[bool, str] | None = None
         self._progress_q.connect(self._on_progress, Qt.QueuedConnection)
@@ -102,8 +104,19 @@ class PipedExportJob(QObject):
         self._thread.start()
 
     def cancel(self):
+        """Stop now. The worker may be blocked reading a frame (a decoder that is still seeking
+        through a long file sends nothing for minutes) or writing one, where it can't see the
+        flag; killing both processes ends those reads and writes at once."""
         self.cancelled = True
         self._cancel.set()
+        with self._procs_lock:
+            procs = list(self._procs)
+        for p in procs:
+            if p.poll() is None:
+                try:
+                    p.kill()
+                except OSError:
+                    pass
 
     def wait(self, msecs: int = 30000) -> bool:
         """Block until the worker has stopped; `finished` is emitted before this returns."""
@@ -148,12 +161,17 @@ class PipedExportJob(QObject):
         try:
             dec = subprocess.Popen(dec_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=dec_err,
                                    creationflags=NO_WINDOW)
+            with self._procs_lock:
+                self._procs = [dec]
             enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=enc_err,
                                    cwd=self.cwd, creationflags=NO_WINDOW)
+            with self._procs_lock:
+                self._procs = [dec, enc]
+            # (a cancel() that came before the list was set is seen by the loop condition)
             prev_in = prev_out = None
             while not self._cancel.is_set():
                 buf = dec.stdout.read(nbytes)
-                if not buf:
+                if not buf or self._cancel.is_set():
                     break
                 if len(buf) < nbytes:
                     error = f"the decoder stopped in the middle of a frame ({len(buf)} of {nbytes} bytes)"
@@ -165,8 +183,9 @@ class PipedExportJob(QObject):
                     prev_in, prev_out = buf, out
                 try:
                     enc.stdin.write(out.data)
-                except OSError:
-                    error = "the encoder stopped accepting frames"
+                except (OSError, ValueError):  # (ValueError: a pipe closed by a cancel)
+                    if not self._cancel.is_set():
+                        error = "the encoder stopped accepting frames"
                     break
                 frames += 1
                 self.frames = frames
@@ -186,8 +205,11 @@ class PipedExportJob(QObject):
                     enc.stdin.close()
                 except OSError:
                     pass
+            # (still listed while they finish: a cancel during the encoder's final flush kills it)
             dec_code = dec.wait() if dec is not None else -1
             enc_code = enc.wait() if enc is not None else -1
+            with self._procs_lock:
+                self._procs = []
             if dec is not None:
                 dec.stdout.close()
             logs = []

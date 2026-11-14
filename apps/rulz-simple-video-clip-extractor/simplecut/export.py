@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+from bisect import bisect_left
 from dataclasses import dataclass
 from fractions import Fraction
 
@@ -97,6 +98,59 @@ DTS_SEEKING_FORMATS = ("matroska", "flv", "avi")
 DTS_SEEK_HEURISTIC = 3 / 23
 
 
+ROTATION_FLAG_FORMATS = ("mov", "mp4", "matroska", "webm")       # ffprobe format names
+ROTATION_FLAG_EXTS = (".mp4", ".m4v", ".mov", ".3gp", ".mkv", ".webm")
+
+
+def keeps_rotation_flag(container: str, out_path: str | None = None) -> bool:
+    """Whether a lossless cut can store a display rotation: MP4/MOV and Matroska/WebM do;
+    MPEG-TS, AVI and FLV silently drop ffmpeg's -display_rotation. out_path: the file being
+    written, when it is known (its extension picks the container)."""
+    if out_path is not None:
+        return os.path.splitext(out_path)[1].lower() in ROTATION_FLAG_EXTS
+    return any(f in container.split(",") for f in ROTATION_FLAG_FORMATS)
+
+
+def ends_with_video(info: VideoInfo, end: float) -> bool:
+    """An exclusive end inside the last frame (or past it) includes the last frame: nothing
+    follows it to cut off. A fixed-length clip of 2.01 s at 30 fps moved to the end ends there."""
+    return end > info.end_time - info.frame_duration + 1e-4
+
+
+def end_keyframe(info: VideoInfo, end: float) -> float | None:
+    """The keyframe a lossless cut ending at `end` stops in front of, when that ends the clip
+    exactly: a keyframe at the end or up to half a frame after it. A keyframe just *before* an
+    exclusive end is the clip's own last frame (a 2.01 s box at 30 fps that ends 0.01 s after a
+    keyframe holds it), and cutting there would lose it. A tenth of a frame before still counts,
+    for timestamps rounded by the container (Matroska stores milliseconds)."""
+    fd = info.frame_duration
+    kfs = info.keyframes
+    i = bisect_left(kfs, end - fd / 10)
+    if i < len(kfs) and kfs[i] <= end + fd / 2:
+        return kfs[i]
+    return None
+
+
+def lossless_start_ok(info: VideoInfo, start: float) -> bool:
+    """A stream copy can start exactly here: on a keyframe, or at the first frame."""
+    return start <= info.start_time + 1e-4 or info.is_keyframe_time(start)
+
+
+def lossless_end_ok(info: VideoInfo, end: float) -> bool:
+    """A stream copy can end exactly here: in front of a keyframe, or with the video's last frame."""
+    return ends_with_video(info, end) or end_keyframe(info, end) is not None
+
+
+def lossless_can_rotate(info: VideoInfo) -> bool:
+    """Whether a rotated lossless cut can be written. The rotation goes in the container's
+    display matrix, and files whose container has none are cut to MKV instead; but an AVI with
+    B-frames stores no presentation timestamps, and ffmpeg can't write its packets to MKV
+    ("unknown timestamp"). -fflags +genpts rebuilds them for MPEG-4 Part 2 but puts H.264's
+    B-pyramid frames out of order, so rotating such a file needs a re-encode."""
+    return keeps_rotation_flag(info.container) or not (
+        "avi" in info.container.split(",") and info.has_b_frames)
+
+
 def lossless_seek_nudge(info: VideoInfo) -> float:
     """Seconds to add to a lossless input -ss (and take off -t) so ffmpeg's own early aim
     lands on the In keyframe again. 1 ms extra keeps it from falling just short of it."""
@@ -116,9 +170,14 @@ def seek_keyframe(info: VideoInfo, start: float) -> float:
 
 
 def build_command(info: VideoInfo, start: float, end: float,
-                  out_path: str, s: ExportSettings, hwaccel: bool = False) -> list[str]:
+                  out_path: str, s: ExportSettings, hwaccel: bool = False,
+                  copy_all: bool = True) -> list[str]:
     """hwaccel: decode the source on the GPU (NVDEC) for re-encodes. Frames are copied back to
     system memory, so every filter below works unchanged.
+
+    copy_all: a lossless cut copies every track (subtitles, data, chapters' timecode tracks);
+    False copies only the video and audio tracks, for an output container that can't hold the
+    others (ASS subtitles into MP4, an iPhone metadata track).
 
     Paths are made absolute: with a colour LUT ffmpeg runs in the LUT's folder (command_cwd)."""
     src = os.path.abspath(info.path)
@@ -128,8 +187,8 @@ def build_command(info: VideoInfo, start: float, end: float,
         # ffmpeg stops stream-copying when a packet's *decode* timestamp reaches
         # the cut point; with B-frames the Out keyframe's dts is earlier than its
         # pts, so cut at the keyframe's dts to end exactly before it.
-        k = info.keyframe_at(end)
-        if k is not None and end < info.end_time - 1e-4:
+        k = end_keyframe(info, end)
+        if k is not None and not ends_with_video(info, end):
             cut = info.keyframe_dts.get(k, k)
             if "avi" in info.container.split(","):
                 # AVI stores no pts; ffmpeg's running dts there is a frame later than the
@@ -170,7 +229,8 @@ def build_command(info: VideoInfo, start: float, end: float,
                 "-ss", f"{max(start - k, 0.0):.6f}", "-t", f"{duration:.6f}"]
 
     if s.mode == "lossless":
-        cmd += ["-map", "0", "-c", "copy", "-avoid_negative_ts", "make_zero"]
+        cmd += ["-map", "0"] if copy_all else ["-map", "0:v", "-map", "0:a?"]
+        cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero"]
         if out_path.lower().endswith(".mp4"):
             cmd += ["-movflags", "+faststart"]
     else:
@@ -235,11 +295,21 @@ def video_filters(info: VideoInfo, s: ExportSettings) -> list[str]:
 def build_commands(info: VideoInfo, start: float, end: float,
                    out_path: str, s: ExportSettings) -> list[list[str]]:
     """Commands to try in order: re-encodes first with GPU decoding (2-4x faster on 4K), then,
-    if that fails (no CUDA device, a format NVDEC can't take), the same without it."""
+    if that fails (no CUDA device, a format NVDEC can't take), the same without it. Lossless
+    cuts copy every track first, then (when the output container refuses one) only the video
+    and audio."""
     if s.mode == "lossless":
-        return [build_command(info, start, end, out_path, s)]
+        return [build_command(info, start, end, out_path, s),
+                build_command(info, start, end, out_path, s, copy_all=False)]
     return [build_command(info, start, end, out_path, s, hwaccel=True),
             build_command(info, start, end, out_path, s)]
+
+
+GPU_RETRY_NOTE = "(the GPU-decoding attempt failed; this log is from the retry that decodes on the CPU)"
+TRACKS_RETRY_NOTE = ("(copying every track failed; this log is from the retry that copies only the video "
+                     "and audio)")
+TRACKS_DROPPED = ("Only the video and audio were copied: the output format can't hold the source's "
+                  "other tracks (subtitles or data).")
 
 
 def command_cwd(s: ExportSettings) -> str | None:
@@ -398,6 +468,9 @@ def make_export_job(info: VideoInfo, start: float, end: float, out_path: str, s:
     if s.mode != "lossless" and s.repair is not None:
         from .repair.export import PipedExportJob
         return PipedExportJob(info, start, end, out_path, s, parent)
+    if s.mode == "lossless":
+        return ExportJob(build_commands(info, start, end, out_path, s), end - start, parent,
+                         retry_note=TRACKS_RETRY_NOTE, fallback_warning=TRACKS_DROPPED)
     return ExportJob(build_commands(info, start, end, out_path, s), end - start, parent, cwd=command_cwd(s))
 
 
@@ -405,15 +478,19 @@ class ExportJob(QObject):
     """Runs ffmpeg asynchronously via QProcess and reports progress in [0,1].
 
     `cmd` is one command or a list of them: when one fails (and wasn't cancelled) the next is
-    tried; `finished` reports the last attempt."""
+    tried; `finished` reports the last attempt. retry_note ends the log of a retry;
+    fallback_warning becomes `warning` when a retry is what succeeded (empty otherwise)."""
     progress = Signal(float)
     finished = Signal(bool, str)   # ok, stderr tail
 
     def __init__(self, cmd: list[str] | list[list[str]], duration: float, parent=None,
-                 cwd: str | None = None):
+                 cwd: str | None = None, retry_note: str = GPU_RETRY_NOTE, fallback_warning: str = ""):
         super().__init__(parent)
         self.cmds = [cmd] if cmd and isinstance(cmd[0], str) else list(cmd)
         self.cmd = self.cmds[0]
+        self.retry_note = retry_note
+        self.fallback_warning = fallback_warning
+        self.warning = ""  # something the user should know about a successful export
         self.duration = max(duration, 1e-6)
         self.proc = QProcess(self)
         if cwd:
@@ -477,37 +554,51 @@ class ExportJob(QObject):
             self._attempt += 1
             self.progress.emit(0.0)
             self.start()  # e.g. GPU decoding unavailable: same export, decoded on the CPU
-            self._err_tail.append("(the GPU-decoding attempt failed; this log is from the retry that decodes on the CPU)")
             return
         self.done = True
-        self.finished.emit(ok, "\n".join(self._err_tail))
+        log = self._err_tail[:]
+        if self._attempt:
+            # (added here, not before the retry: the 40-line tail would push it out)
+            log.append(self.retry_note)
+            if ok:
+                self.warning = self.fallback_warning
+        self.finished.emit(ok, "\n".join(log))
 
 
 def default_output_path(info: VideoInfo, start: float, end: float, mode: str,
                         out_dir: str | None = None, cropped: bool = False,
-                        whole: bool = False, repaired: bool = False) -> str:
+                        whole: bool = False, repaired: bool = False, rotation: int = 0) -> str:
     """Default clip path: <out_dir or source folder>/<source name>_clip_<in>-<out>.<ext>
-    (or _clip_full for the whole video), plus _repair / _crop when those are on."""
+    (or _clip_full for the whole video), plus _repair / _crop when those are on.
+
+    In and Out are named as the app shows them, from the video's first frame (MPEG-TS and some
+    MP4s start their clock at 1.4 s, or hours in). A lossless cut keeps the source's container,
+    except a rotated one that can't store the rotation flag (MPEG-TS, AVI, FLV): that is MKV."""
     base, ext = os.path.splitext(info.path)
     if out_dir:
         base = os.path.join(out_dir, os.path.basename(base))
-    tag = "full" if whole else f"{start:.2f}-{end:.2f}".replace(".", "_")
+    t0 = info.start_time
+    tag = "full" if whole else f"{max(start - t0, 0.0):.2f}-{max(end - t0, 0.0):.2f}".replace(".", "_")
     if repaired:
         tag += "_repair"
     if cropped:
         tag += "_crop"
     if mode == "lossless":
         # keep the source container so any codec can be copied as-is
-        return f"{base}_clip_{tag}{ext or '.mkv'}"
+        if not ext or (rotation and not keeps_rotation_flag(info.container)):
+            ext = ".mkv"
+        return f"{base}_clip_{tag}{ext}"
     return f"{base}_clip_{tag}.mp4"
 
 
-def unique_path(path: str) -> str:
-    """Append _1, _2, ... if the file already exists."""
-    if not os.path.exists(path):
+def unique_path(path: str, taken=()) -> str:
+    """Append _1, _2, ... if the file already exists (or is in `taken`: files being written)."""
+    def free(p):
+        return not os.path.exists(p) and p not in taken
+    if free(path):
         return path
     base, ext = os.path.splitext(path)
     n = 1
-    while os.path.exists(f"{base}_{n}{ext}"):
+    while not free(f"{base}_{n}{ext}"):
         n += 1
     return f"{base}_{n}{ext}"

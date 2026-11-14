@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 import os
 import sys
+import threading
 import traceback
 
 import numpy as np
@@ -22,7 +23,8 @@ from .decoder import Decoder, rgb_reformat_args
 from .timeline import Timeline
 from .cropview import VideoView, even
 from .export import (ExportSettings, ExportJob, NVENC_CODECS, FPS_PRESETS, parse_fps,
-                     make_export_job, default_output_path, unique_path)
+                     make_export_job, default_output_path, unique_path, keeps_rotation_flag,
+                     lossless_can_rotate, lossless_end_ok, lossless_start_ok)
 from . import theme
 from .colormatch import ColorMatchDialog, apply_tables, clean_temp, write_cube_1d
 try:
@@ -65,8 +67,7 @@ def remove_partial(path: str | None):
 
 
 def fmt_time(t: float) -> str:
-    if t < 0:
-        t = 0
+    t = max(round(t, 3), 0.0)  # (rounded first: 59.9996 would show as 00:00:60.000)
     h, rem = divmod(t, 3600)
     m, s = divmod(rem, 60)
     return f"{int(h):02d}:{int(m):02d}:{s:06.3f}"
@@ -147,8 +148,9 @@ class ExportDialog(QDialog):
 
         lay = QVBoxLayout(self)
         n_frames = max(1, math.ceil((end - start) * info.fps - 1e-6))
+        t0 = info.start_time   # times as the main window shows them, from the first frame
         lay.addWidget(QLabel(
-            f"Clip: {fmt_time(start)}  →  {fmt_time(end)}   "
+            f"Clip: {fmt_time(start - t0)}  →  {fmt_time(end - t0)}   "
             f"({end - start:.3f} s, {n_frames} frames)"))
         if crop:
             x, y, w, h = crop
@@ -174,12 +176,17 @@ class ExportDialog(QDialog):
                 why = "horizontal flip requires re-encoding"
             elif needs_reencode:
                 why = "crop / scale require re-encoding"
+            elif rotation and not lossless_can_rotate(info):
+                why = "this AVI has B-frames and can't be rotated without re-encoding"
             else:
                 why = "In and Out must both be on keyframes"
             self.rb_lossless.setText(f"Lossless (unavailable: {why})")
         lay.addWidget(self.rb_lossless)
         if rotation and self.lossless_ok:
-            note = QLabel(f"      Rotation {rotation}° is stored as a metadata flag (players honor it; pixels are untouched).")
+            text = f"      Rotation {rotation}° is stored as a metadata flag (players honor it; pixels are untouched)."
+            if not keeps_rotation_flag(info.container):
+                text += "\n      This file type has no such flag, so the lossless clip is saved as MKV."
+            note = QLabel(text)
             note.setObjectName("note")
             lay.addWidget(note)
         lay.addWidget(self.rb_nvenc)
@@ -240,7 +247,7 @@ class ExportDialog(QDialog):
 
         row = QHBoxLayout()
         self.out_path = QLineEdit()
-        browse = QPushButton("Browse…")
+        browse = self.browse = QPushButton("Browse…")
         browse.clicked.connect(self._browse)
         row.addWidget(QLabel("Output"))
         row.addWidget(self.out_path, 1)
@@ -273,7 +280,8 @@ class ExportDialog(QDialog):
         # never suggest the name of a clip exported earlier: ffmpeg runs with -y
         self.out_path.setText(unique_path(default_output_path(self.info, self.start, self.end, mode,
                                                               output_dir(), cropped=self.crop is not None,
-                                                              repaired=self.repair is not None)))
+                                                              repaired=self.repair is not None,
+                                                              rotation=self.rotation)))
 
     def _browse(self):
         filt = "MP4 video (*.mp4)" if self._mode() == "nvenc" else "Video (*.*)"
@@ -306,6 +314,10 @@ class ExportDialog(QDialog):
         if same_file(out, self.info.path):
             QMessageBox.warning(self, "Export", "Output must differ from the source file.")
             return
+        if self._mode() == "lossless" and self.rotation and not keeps_rotation_flag(self.info.container, out):
+            QMessageBox.warning(self, "Export", "This file type can't store a rotation flag, so a lossless cut "
+                                "would come out unrotated. Save as .mp4, .mov or .mkv, or re-encode with NVENC.")
+            return
         if os.path.exists(out) and out != self._replace_ok:
             if QMessageBox.question(self, "Export", f"{out}\n\nalready exists. Replace it?",
                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
@@ -328,22 +340,32 @@ class ExportDialog(QDialog):
         self.job.progress.connect(lambda f: self.progress.setValue(int(f * 1000)))
         self.job.finished.connect(self._done)
         self.progress.setVisible(True)
-        self.buttons.button(QDialogButtonBox.Ok).setEnabled(False)
+        self._set_inputs_enabled(False)
         self.job.start()
+
+    def _set_inputs_enabled(self, on: bool):
+        """While ffmpeg writes self._out, the settings and the output name can't change under it
+        (a mode switch used to rename the field, so "Saved:" and Open last export named another file)."""
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(on)
+        for w in (self.out_path, self.browse, self.rb_nvenc):
+            w.setEnabled(on)
+        self.rb_lossless.setEnabled(on and self.lossless_ok)
+        self.form_widget.setEnabled(on and self._mode() == "nvenc")
 
     @property
     def cmd_text(self) -> str:
         return self.job.cmd_text if self.job else ""
 
     def _done(self, ok: bool, log: str):
-        self.buttons.button(QDialogButtonBox.Ok).setEnabled(True)
+        self._set_inputs_enabled(True)
         if self.job is not None and self.job.cancelled:
             remove_partial(self._out)  # cancelled: no error box, no half-written clip left behind
             return
         if ok:
             self.progress.setValue(1000)
-            self.exported.emit(self.out_path.text())
-            QMessageBox.information(self, "Export", f"Saved:\n{self.out_path.text()}")
+            self.exported.emit(self._out)
+            warning = getattr(self.job, "warning", "")
+            QMessageBox.information(self, "Export", f"Saved:\n{self._out}" + (f"\n\n{warning}" if warning else ""))
             self.accept()
         else:
             QMessageBox.critical(self, "Export failed",
@@ -359,6 +381,8 @@ class ExportDialog(QDialog):
 
 # ----------------------------------------------------------------------------
 class MainWindow(QMainWindow):
+    _frame_saved = Signal(str, bool)   # path, ok: a frame PNG written by a background thread
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(theme.APP_NAME)
@@ -382,7 +406,11 @@ class MainWindow(QMainWindow):
         self._probe_thread: ProbeThread | None = None  # the newest one
         self._probe_threads: list[ProbeThread] = []    # every one still running, kept referenced
         self._probe_token = 0                          # bumped per open/close; stale probe results are dropped
+        self._video_token: int | None = None           # the token of the video on screen (its keyframes)
         clean_temp()  # colour-match LUTs / reference images left by earlier sessions
+        self._saving: set[str] = set()                 # frame PNGs being written in the background
+        self._save_threads: list[threading.Thread] = []
+        self._frame_saved.connect(self._frame_save_done)
 
         # fixed-length selection mode
         self.fixed = False
@@ -390,6 +418,8 @@ class MainWindow(QMainWindow):
         self.fixed_unit = ui.fixed_unit  # which spinbox the user last edited
         self.fixed_seconds = ui.fixed_seconds
         self.fixed_frames = ui.fixed_frames
+        # the length the user chose; a video shorter than it shrinks it for that video only
+        self._fixed_wanted = (ui.fixed_seconds, ui.fixed_frames)
         self.sel_start = 0.0
 
         self.play_timer = QTimer(self)
@@ -406,6 +436,9 @@ class MainWindow(QMainWindow):
         self._audio_ok = False
         self._wall = QElapsedTimer()
         self._wall_origin = 0.0
+        # The player's position moves in steps of ~50 ms; between them the clock runs on the wall
+        # clock from the last step (see _clock), or playback would judder at 20 Hz.
+        self._audio_step: tuple[int, int] | None = None   # (player ms, wall ms when it changed)
         self.audio_out.setVolume(settings().value("volume", 80, type=int) / 100)
         self.audio_out.setMuted(settings().value("muted", False, type=bool))
 
@@ -724,7 +757,9 @@ class MainWindow(QMainWindow):
             ("Ctrl+Shift+Right", lambda: self.sel_move_keyframe(1)),
             ("Ctrl+Home", self.sel_to_start), ("Ctrl+End", self.sel_to_end),
             ("N", self.sel_next_clip),
-            ("C", lambda: self.b_crop.toggle()), ("L", lambda: self.b_fixed.toggle()),
+            # (a disabled button would still toggle: with no video, C and L changed state anyway)
+            ("C", lambda: self.b_crop.isEnabled() and self.b_crop.toggle()),
+            ("L", lambda: self.b_fixed.isEnabled() and self.b_fixed.toggle()),
         ):
             QShortcut(QKeySequence(key), self, activated=slot)
 
@@ -756,6 +791,10 @@ class MainWindow(QMainWindow):
             sb.editingFinished.connect(self._release_focus)
         self.aspect_combo.activated.connect(lambda _: self._release_focus())
         self.view.setFocus()
+        # A paused frame is scaled for the view's size: render it again after a resize (maximize),
+        # or it stays upscaled and blurry until the next step.
+        self._resize_timer = QTimer(self, singleShot=True, interval=120, timeout=self._rerender_paused)
+        self.view.installEventFilter(self)
 
     def _release_focus(self):
         self.view.setFocus()
@@ -764,18 +803,38 @@ class MainWindow(QMainWindow):
         if ev.type() == QEvent.KeyPress and ev.key() == Qt.Key_Escape and obj in self._inputs:
             self._release_focus()
             return True
+        if ev.type() == QEvent.Resize and obj is self.view:
+            self._resize_timer.start()
         return super().eventFilter(obj, ev)
 
+    def _rerender_paused(self):
+        if self.dec is not None and self.dec.current is not None and not self.play_timer.isActive():
+            self._show_current()
+
     def _set_enabled(self, on: bool):
-        for b in (self.b_start, self.b_prev_kf, self.b_prev, self.b_play, self.b_next,
-                  self.b_next_kf, self.b_end, self.b_in, self.b_out, self.b_clear, self.b_snap,
+        for b in (self.b_start, self.b_prev, self.b_play, self.b_next,
+                  self.b_end, self.b_in, self.b_out, self.b_clear, self.b_snap,
                   self.b_rotate, self.b_flip, self.b_crop, self.b_fixed, self.len_sec,
                   self.len_frames):
             b.setEnabled(on)
+        self._set_keyframe_buttons(on)
         self.b_quick.setEnabled(on and self.quick_job is None)
         self.b_match.setEnabled(on)
         self.b_repair.setEnabled(on and not REPAIR_UNAVAILABLE)
         self.a_close.setEnabled(on)
+
+    def _set_keyframe_buttons(self, on: bool = True):
+        """Keyframe stepping waits for the keyframe scan (without it ◀K jumped to the start)."""
+        ok = on and self.info is not None and bool(self.info.keyframes)
+        for b in (self.b_prev_kf, self.b_next_kf):
+            b.setEnabled(ok)
+
+    def _keyframes_known(self) -> bool:
+        if self.info is not None and self.info.keyframes:
+            return True
+        if self.info is not None:
+            self.status.showMessage("The keyframes aren't known yet (the scan is still running or failed).", 4000)
+        return False
 
     # ----------------------------------------------------------- colour match
     def match_color(self):
@@ -789,8 +848,16 @@ class MainWindow(QMainWindow):
         frame = self._frame_image(self.dec.current)
         self.color_tables = saved
         dlg = ColorMatchDialog(frame, self)
-        if dlg.exec() == QDialog.Accepted and dlg.tables is not None:
-            self._set_color(dlg.tables, dlg.correction.describe())
+        accepted = dlg.exec() == QDialog.Accepted
+        tables, desc = dlg.tables, (dlg.correction.describe() if dlg.correction is not None else "")
+        dlg.deleteLater()   # (parented dialogs otherwise stay alive with their images until exit)
+        if accepted and tables is not None:
+            if np.array_equal(tables, np.tile(np.arange(256, dtype=np.uint8), (3, 1))):
+                # strength 0 (or nothing to change): not a correction, and it would block lossless cuts
+                self._set_color(None, "")
+                self.status.showMessage("The colour match changes nothing, so no correction is applied.", 6000)
+                return
+            self._set_color(tables, desc)
             self.status.showMessage("Colour correction applied; it is used by the preview, frame PNGs and exports.", 6000)
 
     def clear_color(self):
@@ -832,8 +899,11 @@ class MainWindow(QMainWindow):
             note += (" The frame is shown the way it was turned when you made them; "
                      "the rotation or flip you added since is applied after them.")
         dlg = AdjustmentsWindow(rgb, corrections, note, self)
-        if dlg.exec() == QDialog.Accepted and dlg.result is not None:
-            self._set_repair(RepairSettings(dlg.result, rot, flip))
+        accepted = dlg.exec() == QDialog.Accepted
+        result = dlg.result
+        dlg.deleteLater()   # it holds the full-size frame and its render caches
+        if accepted and result is not None:
+            self._set_repair(RepairSettings(result, rot, flip))
             if self.repair is not None:
                 self.status.showMessage("Distortion repair saved; the preview, frame PNGs and exports use it.", 6000)
             else:
@@ -866,10 +936,13 @@ class MainWindow(QMainWindow):
     # --------------------------------------------------------------- defaults
     def edit_preferences(self, start_tab: int = 0):
         dlg = PreferencesDialog(self, start_tab)
-        if dlg.exec() == QDialog.Accepted:
+        accepted = dlg.exec() == QDialog.Accepted
+        light = dlg.rb_light.isChecked()
+        dlg.deleteLater()
+        if accepted:
             self._apply_ui_defaults()
             self._refresh_outdir_action()
-            self.set_theme(theme.LIGHT if dlg.rb_light.isChecked() else theme.DARK)
+            self.set_theme(theme.LIGHT if light else theme.DARK)
             self.status.showMessage("Preferences saved.", 4000)
 
     edit_defaults = edit_preferences   # old name
@@ -902,6 +975,7 @@ class MainWindow(QMainWindow):
         self.fixed_unit = ui.fixed_unit
         self.fixed_seconds = ui.fixed_seconds
         self.fixed_frames = ui.fixed_frames
+        self._fixed_wanted = (ui.fixed_seconds, ui.fixed_frames)
         self.len_sec.blockSignals(True)
         self.len_frames.blockSignals(True)
         self.len_sec.setValue(ui.fixed_seconds)
@@ -952,10 +1026,14 @@ class MainWindow(QMainWindow):
             self.open_file(p)
 
     def open_file(self, path: str):
+        if not path:   # (a dropped web link has no local file)
+            return
         self.stop()
         self.status.showMessage(f"Probing {os.path.basename(path)}…")
         self._set_enabled(False)
-        self._cancel_probes()
+        # Earlier opens still probing lose; the open video's keyframe scan keeps going, so a file
+        # that fails to open leaves it as it was.
+        self._cancel_probes(keep=self._video_token)
         self._probe_token += 1
         t = ProbeThread(path, self._probe_token)
         t.done.connect(self._probed)
@@ -967,9 +1045,10 @@ class MainWindow(QMainWindow):
         self._probe_threads.append(t)  # a QThread dropped while running crashes the app
         t.start()
 
-    def _cancel_probes(self):
+    def _cancel_probes(self, keep: int | None = None):
         for t in self._probe_threads:
-            t.cancel()
+            if keep is None or t.token != keep:
+                t.cancel()
 
     def _probe_thread_finished(self):
         self._probe_threads = [t for t in self._probe_threads if t.isRunning()]
@@ -977,22 +1056,42 @@ class MainWindow(QMainWindow):
     def _probe_failed(self, msg: str, token: int):
         if token != self._probe_token:
             return  # another file was opened meanwhile
+        self._open_failed("", msg)
+
+    def _open_failed(self, path: str, msg: str):
+        """The video that was open (if any) stays open and usable; its keyframe scan was left running."""
+        self._cancel_probes(keep=self._video_token)   # (the failed file's own scan, if it started)
         if self.info:
-            self._set_enabled(True)  # the video that was open stays usable
+            self._set_enabled(True)
+            self.status.showMessage(f"Could not open {os.path.basename(path)}" if path else "Could not open the file",
+                                    6000)
+        else:
+            self.status.clearMessage()
         QMessageBox.critical(self, "Open failed", msg)
 
     def _probed(self, info: VideoInfo, token: int = 0):
         if token != self._probe_token:
             return  # a newer open (or close) wins over this slower probe
+        self.stop()   # (Space pressed while it was probing must not carry over)
+        dec = None
+        try:
+            dec = Decoder(info.path, info.keyframes)
+            # The first seek is part of opening: raw .h264/.hevc streams can't seek at all.
+            if dec.seek(info.start_time) is None:
+                raise ValueError("no video frame could be decoded")
+        except Exception as e:  # noqa: BLE001
+            if dec is not None:
+                dec.close()
+            self._open_failed(info.path, f"{os.path.basename(info.path)} can't be opened for frame-accurate "
+                                         f"editing: {e}\n\nA raw video stream (.h264, .hevc) can be put in an "
+                                         f"MP4 or MKV first, e.g.  ffmpeg -i in.h264 -c copy out.mkv")
+            return
         if self.dec:
             self.dec.close()
-            self.dec = None
-        try:
-            self.dec = Decoder(info.path, info.keyframes)
-        except Exception as e:  # noqa: BLE001
-            self.close_video()  # the old decoder is closed: don't leave its UI pointing at it
-            QMessageBox.critical(self, "Open failed", str(e))
-            return
+        self.dec = dec
+        self._video_token = token
+        self._cancel_probes(keep=token)   # the previous video's scan, if it was still running
+        self._restore_fixed_length()
         self.info = info
         self.rotation = 0
         self.flip = False
@@ -1007,6 +1106,9 @@ class MainWindow(QMainWindow):
         self.clear_marks()
         self._audio_ok = False
         self.player.stop()
+        # (cleared first: setting the URL that is already loaded reports no new media status, so
+        # re-opening the same file left _audio_ok False and played it silently)
+        self.player.setSource(QUrl())
         self.player.setSource(QUrl.fromLocalFile(info.path) if info.has_audio else QUrl())
         self.timeline.set_range(info.start_time, info.end_time)
         self.timeline.set_keyframes(info.keyframes)
@@ -1014,9 +1116,12 @@ class MainWindow(QMainWindow):
         self._show_info_status("finding keyframes…")
         self._set_enabled(True)
         self._sync_length_boxes()
-        self.dec.seek(info.start_time)
         self._show_current()
         self.view.setFocus()
+
+    def _restore_fixed_length(self):
+        """Back to the length the user chose (the last video may have shrunk it to fit)."""
+        self.fixed_seconds, self.fixed_frames = self._fixed_wanted
 
     def _show_info_status(self, keyframes: str):
         info = self.info
@@ -1025,18 +1130,20 @@ class MainWindow(QMainWindow):
             f"{keyframes}  audio: {info.audio_codec or 'none'}")
 
     def _keyframes_found(self, kfs: list, dts: dict, token: int):
-        if token != self._probe_token or not self.info:
+        # (by the video's token, not the newest open's: a file still probing may yet fail)
+        if token != self._video_token or not self.info:
             return
         self.info.keyframes, self.info.keyframe_dts = kfs, dts
         if self.dec:
             self.dec.keyframes = kfs
         self.timeline.set_keyframes(kfs)
         self._show_info_status(f"{len(kfs)} keyframes")
+        self._set_keyframe_buttons(self.b_play.isEnabled())
         self._selection_changed()  # lossless export may be possible now
-        self._show_current()       # keyframe label
+        self._update_keyframe_label()
 
     def _keyframes_failed(self, msg: str, token: int):
-        if token == self._probe_token and self.info:
+        if token == self._video_token and self.info:
             last = msg.strip().splitlines()[-1] if msg.strip() else "scan failed"
             self._show_info_status(f"keyframes unknown ({last})")
 
@@ -1045,6 +1152,7 @@ class MainWindow(QMainWindow):
         self.stop()
         self._cancel_probes()
         self._probe_token += 1  # a probe still running must not open its file afterwards
+        self._video_token = None
         if self.dec:
             self.dec.close()
             self.dec = None
@@ -1175,7 +1283,11 @@ class MainWindow(QMainWindow):
                                            self.rotation, self.flip, full=not (width and height))
             h, w = out.shape[:2]
             return QImage(out.data, w, h, w * 3, QImage.Format_RGB888).copy()
-        kw = {"format": "rgb24", **rgb_reformat_args(f)}
+        # Without a colour correction the frame is converted straight to 32-bit BGRX, Qt's own
+        # RGB32 layout: an RGB888 image was converted again by every QPixmap.fromImage (6-13 ms
+        # a frame at preview sizes). The tables work on RGB, so a corrected frame stays RGB888.
+        bgrx = self.color_tables is None
+        kw = {"format": "bgra" if bgrx else "rgb24", **rgb_reformat_args(f)}
         if width and height:
             kw.update(width=width, height=height)
         rgb = f.reformat(**kw)
@@ -1183,11 +1295,11 @@ class MainWindow(QMainWindow):
         # Wrap the plane's memory without copying it (no bytes(plane)); the one .copy() below
         # gives the QImage its own pixels before the frame is freed.
         buf = np.frombuffer(plane, dtype=np.uint8).reshape(rgb.height, plane.line_size)
-        if self.color_tables is not None:
+        if bgrx:
+            img = QImage(buf.data, rgb.width, rgb.height, plane.line_size, QImage.Format_RGB32).copy()
+        else:
             arr = apply_tables(buf[:, :rgb.width * 3].reshape(rgb.height, rgb.width, 3), self.color_tables)
             img = QImage(arr.data, rgb.width, rgb.height, rgb.width * 3, QImage.Format_RGB888).copy()
-        else:
-            img = QImage(buf.data, rgb.width, rgb.height, plane.line_size, QImage.Format_RGB888).copy()
         rot = self.total_rotation
         if rot:
             img = img.transformed(QTransform().rotate(rot))
@@ -1377,12 +1489,14 @@ class MainWindow(QMainWindow):
     def _len_seconds_edited(self, v: float):
         self.fixed_unit = "seconds"
         self.fixed_seconds = v
+        self._fixed_wanted = (v, self._fixed_wanted[1])
         self._sync_length_boxes()
         self._fixed_length_changed()
 
     def _len_frames_edited(self, v: int):
         self.fixed_unit = "frames"
         self.fixed_frames = v
+        self._fixed_wanted = (self._fixed_wanted[0], v)
         self._sync_length_boxes()
         self._fixed_length_changed()
 
@@ -1413,6 +1527,8 @@ class MainWindow(QMainWindow):
         if not (self.fixed and self.info):
             return
         info = self.info
+        if not self._keyframes_known():
+            return
         k = info.next_keyframe(self.sel_start) if direction > 0 else info.prev_keyframe(self.sel_start)
         if k is None:
             k = info.end_time if direction > 0 else info.start_time
@@ -1451,19 +1567,25 @@ class MainWindow(QMainWindow):
         if self.fixed and self.info:
             self._set_sel_start(self.info.end_time, seek=True)
 
+    def _video_frames(self) -> int:
+        """Frames in the video, from its duration (ffprobe's 6 decimals can land a hair short of
+        a whole frame: 10.009999 s at 29.97 fps is 300 frames, not 299)."""
+        return max(1, int(self.info.duration * self.info.fps + 1e-3))
+
     def _set_sel_start(self, t: float, seek: bool):
         info = self.info
         dur = self._fixed_duration()
         if dur > info.duration:
-            # clip longer than the video: shrink to fit
+            # clip longer than the video: shrink to fit (this video only, see _restore_fixed_length)
             if self.fixed_unit == "frames":
-                self.fixed_frames = max(1, int(info.duration * info.fps))
+                self.fixed_frames = self._video_frames()
             else:
-                self.fixed_seconds = round(info.duration, 2)
+                self.fixed_seconds = max(round(info.duration, 2), 0.01)
             self._sync_length_boxes()
-            dur = self._fixed_duration()
-        t = self._snap(t)
-        t = max(info.start_time, min(t, self._snap(info.end_time - dur)))
+        # The latest start whose last frame is still in the video, in whole frames. (Snapping
+        # end - length to the nearest frame could start a frame late: one frame short at the end.)
+        last = info.start_time + max(0, self._video_frames() - self._fixed_nframes()) * info.frame_duration
+        t = max(info.start_time, min(self._snap(t), last))
         self.sel_start = t
         self.timeline.set_selection((self.sel_start, self.sel_end))
         self.sel_label.setText(
@@ -1506,9 +1628,17 @@ class MainWindow(QMainWindow):
         self.timeline.set_position(t)
         self.time_label.setText(f"{fmt_time(t - info.start_time)} / {fmt_time(info.duration)}")
         self.frame_label.setText(f"  frame {round((t - info.start_time) * info.fps)}")
-        on_kf = f.key_frame or info.is_keyframe_time(t)
-        self.kf_label.setText("  ● keyframe" if on_kf else "")
-        self.kf_label.setStyleSheet(f"color:{theme.ACCENT_TEXT};font-weight:bold" if on_kf else "")
+        self._update_keyframe_label()
+
+    def _update_keyframe_label(self):
+        f = self.dec.current if self.dec else None
+        if f is None or not self.info:
+            return
+        on_kf = bool(f.key_frame) or self.info.is_keyframe_time(f.time or 0.0)
+        if self.kf_label.text() != ("  ● keyframe" if on_kf else ""):
+            # (only on a change: a style sheet re-polishes the label, and this runs per frame)
+            self.kf_label.setText("  ● keyframe" if on_kf else "")
+            self.kf_label.setStyleSheet(f"color:{theme.ACCENT_TEXT};font-weight:bold" if on_kf else "")
 
     # ------------------------------------------------------------ playback
     def toggle_play(self):
@@ -1565,14 +1695,24 @@ class MainWindow(QMainWindow):
         """Begin playback timing at absolute pts t."""
         self._wall_origin = t
         self._wall.start()
+        self._audio_step = None
         if self._audio_ok:
             self.player.setPosition(int(max(t - self.info.fmt_start_time, 0.0) * 1000))
             self.player.play()
 
+    AUDIO_STEP_MAX_MS = 120   # never run on past the last position update by more than this
+
     def _clock(self) -> float:
-        """Current playback time in absolute pts seconds (audio clock when available)."""
+        """Current playback time in absolute pts seconds (audio clock when available).
+
+        The player reports its position in steps of about 50 ms; frames shown only on those steps
+        move at 20 Hz. So the clock is the last step plus the wall time since it, capped."""
         if self._audio_ok and self.player.playbackState() == QMediaPlayer.PlayingState:
-            pos = self.player.position() / 1000 + self.info.fmt_start_time
+            ms, now = self.player.position(), self._wall.elapsed()
+            if self._audio_step is None or ms != self._audio_step[0]:
+                self._audio_step = (ms, now)
+            since = min(now - self._audio_step[1], self.AUDIO_STEP_MAX_MS)
+            pos = (ms + since) / 1000 + self.info.fmt_start_time
             # Until the player's seek lands, its position may still be stale: hold.
             if pos >= self._wall_origin - 0.05:
                 return pos
@@ -1653,7 +1793,7 @@ class MainWindow(QMainWindow):
         self._show_current()
 
     def next_keyframe(self):
-        if not self.dec:
+        if not self.dec or not self._keyframes_known():
             return
         k = self.info.next_keyframe(self.dec.time)
         if self.fixed:
@@ -1665,7 +1805,7 @@ class MainWindow(QMainWindow):
             self.seek_to(k)
 
     def prev_keyframe(self):
-        if not self.dec:
+        if not self.dec or not self._keyframes_known():
             return
         k = self.info.prev_keyframe(self.dec.time)
         if self.fixed:
@@ -1709,9 +1849,12 @@ class MainWindow(QMainWindow):
             return
         t = self.dec.time
         if self.fixed:
-            # Out is exclusive: the selection ends just before the current frame.
-            end = self.info.end_time if self._is_last_frame(t) else t
-            self._set_sel_start(end - self._fixed_duration(), seek=False)
+            # Out is exclusive: the selection's last frame is the one before the current frame.
+            # Counted in whole frames, so a length that isn't (2.01 s at 30 fps = 61 frames)
+            # doesn't take the current frame in.
+            fd = self.info.frame_duration
+            end = t + fd if self._is_last_frame(t) else t
+            self._set_sel_start(end - self._fixed_nframes() * fd, seek=False)
             return
         # Marking Out on the very last frame means "through the end of the video".
         self.mark_out = self.info.end_time if self._is_last_frame(t) else t
@@ -1724,23 +1867,30 @@ class MainWindow(QMainWindow):
         self._selection_changed()
 
     def _export_range(self) -> tuple[float, float] | None:
-        if self.fixed and self.info:
-            return self.sel_start, self.sel_end
-        if self.mark_in is not None and self.mark_out is not None and self.mark_out > self.mark_in:
-            return self.mark_in, self.mark_out
-        return None
-
-    def _on_keyframe_or_edge(self, t: float) -> bool:
         info = self.info
-        return (info.is_keyframe_time(t) or t <= info.start_time + 1e-4
-                or t >= info.end_time - 1e-4)
+        if not info:
+            return None
+        if self.fixed:
+            return self.sel_start, self.sel_end
+        if self.mark_in is None and self.mark_out is None:
+            return None
+        # A lone In runs to the end and a lone Out from the start, as the timeline shades them.
+        a = self.mark_in if self.mark_in is not None else info.start_time
+        b = self.mark_out if self.mark_out is not None else info.end_time
+        return (a, b) if b > a else None
+
+    def _cuts_losslessly(self, rng: tuple[float, float]) -> bool:
+        """A stream copy can cut exactly this range, with the current rotation."""
+        info = self.info
+        return (lossless_start_ok(info, rng[0]) and lossless_end_ok(info, rng[1])
+                and (not self.rotation or lossless_can_rotate(info)))
 
     def _lossless_possible(self) -> bool:
         rng = self._export_range()
         if (not rng or not self.info or self.view.crop_rect_int() or self.flip or self.color_tables is not None
                 or self.repair is not None):
             return False
-        return self._on_keyframe_or_edge(rng[0]) and self._on_keyframe_or_edge(rng[1])
+        return self._cuts_losslessly(rng)
 
     def _selection_changed(self):
         self.timeline.set_marks(self.mark_in, self.mark_out)
@@ -1749,7 +1899,7 @@ class MainWindow(QMainWindow):
         def lab(name, t):
             if t is None or not info:
                 return f"{name}: —"
-            ok = self._on_keyframe_or_edge(t)
+            ok = lossless_start_ok(info, t) if name == "In" else lossless_end_ok(info, t)
             return f"{name}: {fmt_time(t - info.start_time)} {'● K' if ok else '(not keyframe)'}"
 
         self.in_label.setText(lab("In", self.mark_in))
@@ -1779,8 +1929,19 @@ class MainWindow(QMainWindow):
         frame_no = round(t * self.info.fps)
         tags = ("_repair" if self.repair is not None else "") + ("_crop" if crop else "")
         name = f"{stem}_{fmt_time(t).replace(':', '-')}_f{frame_no}{tags}.png"
-        path = unique_path(os.path.join(self._effective_output_dir(), name))
-        if img.save(path, "PNG"):
+        # (names being written count as taken, so pressing S twice can't give one name twice)
+        path = unique_path(os.path.join(self._effective_output_dir(), name), taken=self._saving)
+        # PNG compression of a 4K frame takes seconds: it runs in the background, the UI stays live.
+        self._saving.add(path)
+        self.status.showMessage(f"Saving frame: {path}…")
+        th = threading.Thread(target=lambda: self._frame_saved.emit(path, img.save(path, "PNG")),
+                              name="save-frame", daemon=True)
+        self._save_threads = [x for x in self._save_threads if x.is_alive()] + [th]
+        th.start()
+
+    def _frame_save_done(self, path: str, ok: bool):
+        self._saving.discard(path)
+        if ok:
             self.status.showMessage(f"Saved frame: {path}", 6000)
         else:
             QMessageBox.critical(self, "Save frame", f"Could not write:\n{path}")
@@ -1802,14 +1963,14 @@ class MainWindow(QMainWindow):
         s = load_quick_defaults()
         lossless = (quick_lossless_when_possible() and crop is None and out_size is None
                     and not self.flip and self.color_lut_path is None and self.repair is None
-                    and self._on_keyframe_or_edge(rng[0]) and self._on_keyframe_or_edge(rng[1]))
+                    and self._cuts_losslessly(rng))
         mode = "lossless" if lossless else "nvenc"
         s.mode, s.rotation, s.hflip, s.crop, s.out_size = mode, self.rotation, self.flip, crop, out_size
-        s.lut_path = self.color_lut_path
+        s.lut_path = self._lut_for_export()
         s.repair = self._repair_export() if mode == "nvenc" else None
         out = unique_path(default_output_path(self.info, rng[0], rng[1], mode, output_dir(),
                                               cropped=crop is not None, whole=whole,
-                                              repaired=s.repair is not None))
+                                              repaired=s.repair is not None, rotation=self.rotation))
         self._quick_out = out
         self._quick_cancelled = False
         try:
@@ -1834,31 +1995,44 @@ class MainWindow(QMainWindow):
     def _quick_done(self, ok: bool, log: str):
         for wdg in (self.qx_label, self.qx_progress, self.qx_cancel):
             wdg.setVisible(False)
-        cmd_text = self.quick_job.cmd_text if self.quick_job else ""
+        job = self.quick_job
+        cmd_text = job.cmd_text if job else ""
+        warning = getattr(job, "warning", "") if job else ""
         self.quick_job = None
+        if job is not None:
+            job.deleteLater()   # (a repair job holds the full-size remap tables)
         self.b_quick.setEnabled(self.info is not None)
         if self._quick_cancelled:
             remove_partial(self._quick_out)
             self.status.showMessage("Export cancelled.", 5000)
         elif ok:
-            self.status.showMessage(f"Saved: {self._quick_out}", 10000)
+            self.status.showMessage(f"Saved: {self._quick_out}" + (f"  ({warning})" if warning else ""), 10000)
             self._note_export(self._quick_out)
         else:
             QMessageBox.critical(self, "Quick export failed",
                                  f"ffmpeg failed.\n\nCommand:\n{cmd_text}\n\nLog:\n{log}")
 
+    def _lut_for_export(self) -> str | None:
+        """The colour LUT file, written again if needed: it lives in the temp folder, where another
+        instance's clean-up may have removed it after a day."""
+        if self.color_tables is None:
+            return None
+        self.color_lut_path = write_cube_1d(self.color_tables)
+        return self.color_lut_path
+
     def export_clip(self):
         rng = self._export_range()
         if not self.info or rng is None:
-            QMessageBox.information(self, "Export", "Set both In and Out marks first, or enable Fixed length.")
+            QMessageBox.information(self, "Export", "Set an In or Out mark first, or enable Fixed length.")
             return
         self.stop()
         crop, out_size = self._export_geometry()
         dlg = ExportDialog(self.info, rng[0], rng[1], self._lossless_possible(),
-                           self.rotation, crop, out_size, self.flip, self.color_lut_path, self,
+                           self.rotation, crop, out_size, self.flip, self._lut_for_export(), self,
                            repair=self._repair_export())
         dlg.exported.connect(self._note_export)
         dlg.exec()
+        dlg.deleteLater()   # (it and its job hold the export's remap tables and frames otherwise)
 
     def closeEvent(self, e):
         self.stop()
@@ -1869,6 +2043,8 @@ class MainWindow(QMainWindow):
         self._cancel_probes()
         for t in list(self._probe_threads):
             t.wait()  # a QThread destroyed while running takes the process down with it
+        for t in self._save_threads:
+            t.join(30)  # frame PNGs still being written: finish them, don't leave half files
         if self.dec:
             self.dec.close()
         super().closeEvent(e)
