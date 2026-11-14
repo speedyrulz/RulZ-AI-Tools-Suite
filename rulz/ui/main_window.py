@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import os
 import time
 from collections import deque
 from pathlib import Path
@@ -18,10 +19,10 @@ from .. import ai_jpeg, ai_mask, config, imageio
 from ..filters import ADJUSTMENTS, BALANCED, BEST, process
 from . import theme
 from .ai_setup import ensure_crop_ready, ensure_ready
-from .auto_crop import AutoCropDialog
+from .auto_crop import AutoCropDialog, finish_searches
 from .controls import AdjustRow, ModeSwitch
 from .editor_page import EditorPage
-from .workers import ImageItem, SaveAll, ThumbLoad, make_emitter, output_paths
+from .workers import ImageItem, SaveAll, ThumbLoad, make_emitter, output_paths, path_key
 
 ITEM_ROLE = Qt.UserRole + 1
 CARD_W, CARD_H, PAD = 220, 250, 10
@@ -40,6 +41,30 @@ def _thumb_side() -> int:
 
     dpr = max((s.devicePixelRatio() for s in QApplication.screens()), default=1.0)
     return max(64, min(config.THUMB_MAX_SIDE, math.ceil(max(PIC_W, PIC_H) * dpr)))
+
+
+THUMB_KEYS = ("color",)  # thumbnails are too small to show JPEG blocks or fine detail (see _thumb_key)
+
+
+def _images_in(folder: Path) -> list[Path]:
+    """Every picture file in the folder and its subfolders (not following folder links). The folder listing
+    already says what is a file (rglob plus a look at each file took seconds for a few thousand pictures);
+    a link counts when it leads to a file, as before."""
+    found, todo = [], [folder]
+    while todo:
+        try:
+            entries = list(os.scandir(todo.pop()))
+        except OSError:  # unreadable subfolder: skipped, like rglob did
+            continue
+        for e in entries:
+            try:
+                if e.is_dir() and not e.is_symlink():
+                    todo.append(e.path)
+                elif imageio.is_image(e.name) and e.is_file():
+                    found.append(Path(e.path))
+            except OSError:
+                pass
+    return found
 
 
 def _thumb_key(it: ImageItem, globals_: dict) -> tuple:
@@ -125,7 +150,7 @@ class MainWindow(QMainWindow):
         self.mode = BEST if s.value(JPEG_MODE_KEY, BALANCED) == BEST and ai_jpeg.status() == ai_jpeg.READY \
             else BALANCED
         if self.mode == BEST:
-            QThreadPool.globalInstance().start(ai_jpeg.warm_up)
+            QThreadPool.globalInstance().start(ai_jpeg.warm_up_task())
         self._cards: dict[int, QListWidgetItem] = {}  # id(item) -> its grid entry
         self._known: dict[str, ImageItem] = {}  # resolved, lower-case path -> its picture, to skip repeats
         self._render_queue: deque[ImageItem] = deque()
@@ -138,6 +163,7 @@ class MainWindow(QMainWindow):
         self._emitter.done.connect(self._on_thumb)
         self._thumb_side = _thumb_side()
         self._saver: SaveAll | None = None
+        self._closing = False
 
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
@@ -264,8 +290,9 @@ class MainWindow(QMainWindow):
 
     def add_paths(self, paths):
         added = 0
+        folders: dict = {}
         for path in self._expand(paths):
-            key = str(path.resolve()).lower()  # only new paths: resolving is slow on Windows
+            key = path_key(path, folders)  # resolving each file would take ~2 ms a picture on Windows
             if key in self._known:
                 continue
             it = ImageItem(path)
@@ -287,7 +314,7 @@ class MainWindow(QMainWindow):
         for raw in paths:
             p = Path(raw)
             if p.is_dir():
-                yield from sorted(f for f in p.rglob("*") if f.is_file() and imageio.is_image(f))
+                yield from sorted(_images_in(p))
             elif p.is_file() and imageio.is_image(p):
                 yield p
 
@@ -336,10 +363,19 @@ class MainWindow(QMainWindow):
 
     # ---- previews --------------------------------------------------------
     def _queue_render(self, items):
-        new = [it for it in items if it.thumb is not None and id(it) not in self._queued and id(it) in self._cards]
-        if len(new) > 1:  # the cards on screen first
+        items = [it for it in items if it.thumb is not None and id(it) in self._cards]
+        if len(items) > 1:
+            # The cards on screen first, also ones still waiting further back from an earlier change: while a
+            # slider was dragged they went to the end of the queue and showed the old value the longest.
             view = self.grid.viewport().rect()
-            new.sort(key=lambda it: not view.intersects(self.grid.visualItemRect(self._cards[id(it)])))
+            shown = [it for it in items if view.intersects(self.grid.visualItemRect(self._cards[id(it)]))]
+            if shown:
+                ids = set(map(id, shown))
+                if ids & self._queued:
+                    self._render_queue = deque(it for it in self._render_queue if id(it) not in ids)
+                self._render_queue.extendleft(reversed(shown))
+                self._queued |= ids
+        new = [it for it in items if id(it) not in self._queued]
         self._render_queue.extend(new)
         self._queued.update(map(id, new))
         if self._render_queue:
@@ -369,7 +405,8 @@ class MainWindow(QMainWindow):
     def _on_global(self, key: str, v: int):
         self.globals[key] = v
         config.settings().setValue(f"global/{key}", v)
-        self._queue_render([it for it in self.items if key not in it.custom])
+        if key in THUMB_KEYS:  # the others only change the cards' badges
+            self._queue_render([it for it in self.items if key not in it.custom])
         self.grid.viewport().update()
         self.editor.set_globals(self.globals, self.mode)
 
@@ -381,6 +418,7 @@ class MainWindow(QMainWindow):
             self.globals[key] = 0
             self.global_rows[key].set_value(0)
             config.settings().setValue(f"global/{key}", 0)
+        changed = [k for k in changed if k in THUMB_KEYS]
         self._queue_render([it for it in self.items if any(k not in it.custom for k in changed)])
         self.grid.viewport().update()
         self.editor.set_globals(self.globals, self.mode)
@@ -390,7 +428,7 @@ class MainWindow(QMainWindow):
             if not ensure_ready(self):
                 mode = BALANCED
             elif self.mode != BEST:
-                QThreadPool.globalInstance().start(ai_jpeg.warm_up)  # load the model before it's needed
+                QThreadPool.globalInstance().start(ai_jpeg.warm_up_task())  # load the model before it's needed
         if mode == BALANCED:
             ai_jpeg.release()  # hand its GPU memory back; switching back loads it again
         self.mode = mode
@@ -436,6 +474,7 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         m.addAction(theme.icon("delete"), f"Remove from list ({len(rows)})", self._remove_selected)
         m.exec(self.grid.viewport().mapToGlobal(pos))
+        m.deleteLater()  # a child of the window: kept until it closed otherwise, one more per right-click
 
     def _reset_rows(self, rows):
         for li in rows:
@@ -448,6 +487,7 @@ class MainWindow(QMainWindow):
         rows = sorted((self.grid.row(li) for li in self.grid.selectedItems()), reverse=True)
         for row in rows:
             it = self.grid.takeItem(row).data(ITEM_ROLE)
+            it.removed = True  # its thumbnail, if still waiting to load, isn't loaded
             del self.items[row]  # the grid and self.items keep the same order
             self._cards.pop(id(it), None)
         self._known = {k: it for k, it in self._known.items() if id(it) in self._cards}
@@ -461,6 +501,11 @@ class MainWindow(QMainWindow):
         if QMessageBox.question(self, "Clear list", "Remove all images from the list?\n(Files on disk are not touched.)") \
                 != QMessageBox.Yes:
             return
+        # Thumbnails still waiting to load are dropped: with thousands queued, the pictures added next waited
+        # for all of them.
+        self._pool.clear()
+        for it in self.items:
+            it.removed = True
         self.grid.clear()
         self.items.clear()
         self._cards.clear()
@@ -501,8 +546,10 @@ class MainWindow(QMainWindow):
         items = [self.items[r] for r in rows] or list(self.items)
         if not items or not ensure_crop_ready(self):
             return
-        QThreadPool.globalInstance().start(ai_mask.warm_up)  # load the model while the screen opens
-        AutoCropDialog(items, self.globals, self.mode, self).exec()
+        QThreadPool.globalInstance().start(ai_mask.warm_up_task())  # load the model while the screen opens
+        dlg = AutoCropDialog(items, self.globals, self.mode, self, library=self.items)
+        dlg.exec()
+        dlg.deleteLater()  # it's the window's child: kept, with every picture's mask, until the app closed
 
     # ---- saving ----------------------------------------------------------
     def _save_all(self):
@@ -538,6 +585,8 @@ class MainWindow(QMainWindow):
         def finished(saved, errors):
             dlg.reset()
             ai_jpeg.release()  # Best quality's model, if it was used; the editor loads it again when needed
+            if self._closing:  # queued before the application's quit: no message after the window has gone
+                return
             msg = f"Saved {saved} of {len(jobs)} image(s) to\n{out_dir}"
             if errors:
                 msg += "\n\nProblems:\n" + "\n".join(f"• {n}: {e}" for n, e in errors[:10])
@@ -546,7 +595,10 @@ class MainWindow(QMainWindow):
             open_btn = box.addButton("Open folder", QMessageBox.ActionRole)
             box.addButton(QMessageBox.Ok)
             box.exec()
-            if box.clickedButton() is open_btn:
+            opened = box.clickedButton() is open_btn
+            box.deleteLater()
+            dlg.deleteLater()
+            if opened:
                 from PySide6.QtCore import QUrl
                 from PySide6.QtGui import QDesktopServices
 
@@ -558,9 +610,11 @@ class MainWindow(QMainWindow):
         saver.start()
 
     def closeEvent(self, e):
+        self._closing = True  # Save all's "Saved…" message, even one already queued, isn't shown any more
         if self._saver is not None and self._saver.isRunning():
             self._saver.cancel()
             self._saver.wait()
+        finish_searches()  # Auto crop searches still ending after their screen closed
         self._render_timer.stop()
         self._pool.clear()
         self._pool.waitForDone()  # running thumbnail loads finish before their receiver goes away

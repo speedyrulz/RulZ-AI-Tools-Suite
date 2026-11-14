@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -40,6 +39,7 @@ def _total_memory() -> int | None:
 
 # A 24 MP picture takes about 1.7 GB while it's cleaned, a 50 MP one twice that: two at once only with 16 GB.
 SAVE_WORKERS = 2 if (_total_memory() or 0) >= 15 * 2 ** 30 else 1
+COPY_CHECK_SIDE = 64  # a picture copied as it is is decoded this small, just to check that it reads
 
 
 @dataclass(eq=False)
@@ -51,6 +51,7 @@ class ImageItem:
     preview: object = None  # QPixmap of the processed thumbnail
     preview_key: tuple | None = None
     error: str | None = None
+    removed: bool = False  # taken out of the list (its thumbnail isn't loaded any more)
 
     def value(self, key: str, globals_: dict[str, int]) -> int:
         return self.custom.get(key, globals_[key])
@@ -73,6 +74,8 @@ class ThumbLoad(QRunnable):
         self.item, self.emitter, self.side = item, emitter, side
 
     def run(self):
+        if self.item.removed:
+            return
         try:
             img = imageio.shrink(imageio.load(self.item.path, self.side), self.side)
             result = imageio.to_8bit(img)
@@ -82,6 +85,9 @@ class ThumbLoad(QRunnable):
 
 
 class FullLoad(QRunnable):
+    """The editor's picture at full size. Emits (picture, QImage of it): the screen copy is made here, not on
+    the GUI thread, where it held the window up to 0.3 s for a big 16-bit photo."""
+
     def __init__(self, item: ImageItem, emitter: _Emitter, key=None):
         super().__init__()
         self.item, self.emitter = item, emitter
@@ -89,15 +95,16 @@ class FullLoad(QRunnable):
 
     def run(self):
         try:
-            result = imageio.load(self.item.path)
+            img = imageio.load(self.item.path)
+            result = (img, imageio.to_qimage(img))
         except Exception as e:  # noqa: BLE001
             result = e
         self.emitter.done.emit(self.key, result)
 
 
 class Process(QRunnable):
-    """The editor's full-size preview. Emits (result, cache): pass the cache to the next Process of the same
-    picture, so moving only the color noise or detail slider skips the JPEG and shadow steps."""
+    """The editor's full-size preview. Emits (QImage of the result, cache): pass the cache to the next Process
+    of the same picture, so moving only the color noise or detail slider skips the JPEG and shadow steps."""
 
     def __init__(self, key, img: np.ndarray, settings: dict, mode: str, emitter: _Emitter,
                  shadow: ShadowEdit | None = None, cache=None):
@@ -107,7 +114,8 @@ class Process(QRunnable):
 
     def run(self):
         try:
-            result = process_cached(self.img, self.settings, self.mode, self.shadow, self.cache)
+            img, cache = process_cached(self.img, self.settings, self.mode, self.shadow, self.cache)
+            result = (imageio.to_qimage(img), cache)
         except Exception as e:  # noqa: BLE001
             result = e
         self.cache = self.img = None
@@ -118,24 +126,46 @@ def make_emitter(parent: QObject | None = None) -> _Emitter:
     return _Emitter(parent)
 
 
-def output_paths(items: list[ImageItem], out_dir: Path) -> list[Path]:
-    """Same file names in out_dir; never overwrite any picture in the batch and never reuse a name in it.
+def path_key(path: Path, folders: dict) -> str:
+    """The file's full path, case-folded and resolved (links, junctions, short names), to tell whether two
+    paths are the same file. Path.resolve() costs about 2 ms a file on Windows and far more for a file that
+    doesn't exist yet (3,000 pictures: over a minute), so it's done once per folder, cached in `folders`:
+    each folder is resolved and listed once, and only the files its listing shows to be links (to a file
+    somewhere else, maybe a picture in the list) are resolved on their own."""
+    folder = path.parent
+    known = folders.get(folder)
+    if known is None:
+        try:
+            links = {os.path.normcase(e.name) for e in os.scandir(folder) if e.is_symlink()}
+        except OSError:  # not there (yet): nothing in it is a link
+            links = set()
+        known = folders[folder] = (folder.resolve(), links)
+    real, links = known
+    if os.path.normcase(path.name) in links:
+        return os.path.normcase(str(path.resolve()))
+    return os.path.normcase(str(real / path.name))
+
+
+def output_paths(items: list[ImageItem], out_dir: Path, others=()) -> list[Path]:
+    """Same file names in out_dir; never overwrite any picture in the batch or in `others` (the paths of the
+    rest of the list) and never reuse a name in it.
 
     Every source counts, not just the picture's own: with X/a.jpg and Y/a.jpg in the list, saving into X
-    must not put Y's result over X's original."""
-    sources = {it.path.resolve() for it in items}
+    must not put Y's result over X's original - also when only Y/a.jpg is being saved. Links count as the
+    file they point to, both in the list and in out_dir."""
+    folders: dict = {}
+    sources = {path_key(it.path, folders) for it in items} | {path_key(Path(p), folders) for p in others}
     used: set[str] = set()
     paths = []
     for it in items:
         stem, ext = it.path.stem, it.path.suffix
-        candidate = out_dir / f"{stem}{ext}"
+        name = f"{stem}{ext}"
         n = 1
-        while candidate.name.lower() in used or candidate.resolve() in sources:
-            suffix = "_prepared" if n == 1 else f"_prepared_{n}"
-            candidate = out_dir / f"{stem}{suffix}{ext}"
+        while name.lower() in used or path_key(out_dir / name, folders) in sources:
+            name = f"{stem}{'_prepared' if n == 1 else f'_prepared_{n}'}{ext}"
             n += 1
-        used.add(candidate.name.lower())
-        paths.append(candidate)
+        used.add(name.lower())
+        paths.append(out_dir / name)
     return paths
 
 
@@ -155,8 +185,10 @@ class SaveAll(QThread):
     def workers(self) -> int:
         """Pictures saved at the same time. Much of a picture's time is spent in steps that use one CPU core
         (decoding, encoding, parts of the filters), so two at once finish a batch sooner (six 24 MP photos:
-        15 s instead of 22 s). Best quality runs on the GPU one picture at a time anyway."""
-        return 1 if self.mode == BEST else SAVE_WORKERS
+        15 s instead of 22 s). Best quality runs on the GPU one picture at a time anyway, but only pictures with
+        JPEG artifact removal on use it."""
+        uses_ai = self.mode == BEST and any(settings.get("jpeg", 0) > 0 for _, _, settings, _ in self.jobs)
+        return 1 if uses_ai else SAVE_WORKERS
 
     def run(self):
         lock = threading.Lock()
@@ -170,11 +202,16 @@ class SaveAll(QThread):
             with lock:
                 self.progress.emit(state["done"], src.name)
             try:
-                img = imageio.load(src)  # also when it's copied: a file that can't be read is reported, not copied
-                if is_noop(settings) and (shadow is None or not shadow.active) and imageio.can_copy_unchanged(src):
-                    shutil.copyfile(src, dst)  # nothing to change: re-encoding would only add loss and size
+                data = imageio.read(src)  # read once for the decoding, the checks and the copy
+                copy = is_noop(settings) and (shadow is None or not shadow.active) and imageio.can_copy_unchanged(data)
+                # Decoded also when it's copied, so a file that can't be read is reported, not copied; for
+                # that check a big JPEG is decoded at 1/8 size, several times faster.
+                img = imageio.decode(data, src.name, COPY_CHECK_SIDE if copy else None)
+                if copy:
+                    data.tofile(str(dst))  # nothing to change: re-encoding would only add loss and size
                 else:
-                    imageio.save(dst, process(img, settings, self.mode, shadow=shadow))
+                    imageio.save(dst, process(img, settings, self.mode, shadow=shadow), imageio.icc_profile(data))
+                del img, data
                 ok = True
             except Exception as e:  # noqa: BLE001
                 ok = False
