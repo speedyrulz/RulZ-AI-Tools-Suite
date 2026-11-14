@@ -9,13 +9,14 @@ racing ahead. If the model server goes down the run pauses (nothing is lost) unt
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import time
 import uuid
 from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from image_detection import DetectionService, ImageInput, ModelServerDown, Tag
 from image_detection.preprocess import BROWSER_UA
@@ -26,12 +27,13 @@ from .crawler import ImageCandidate, PageError, Robots, load_page
 from .fetcher import FetchedImage, FetchError, HostGate, check_image_bytes, fetch_image
 from .folder import list_image_files
 from .storage import RunStorage, make_run_dir
-from .urls import in_path_scope, looks_like_page, normalize_page_url, path_scope, site_key
+from .urls import in_path_scope, looks_like_page, normalize_page_url, page_key, path_scope, site_key
 
 log = logging.getLogger("crawler_app.runs")
 
 FINAL_STATUSES = {"done", "cancelled", "failed"}
 ENGINE_DOWN_MESSAGE = "The model server is not responding. Start the model, then press Resume."
+DISK_FULL_MESSAGE = "The disk the matches are saved to is full. Free some space, then press Resume."
 
 def _duration(s: float) -> str:
     return f"{s:.0f} s" if s < 90 else f"{s / 60:.0f} min"
@@ -102,6 +104,8 @@ class Run:
         )
         self._context: BrowserContext | None = None
         self._task: asyncio.Task | None = None
+        self._cancelling = False
+        self._saves: set[asyncio.Future] = set()  # matched files being written in worker threads
 
     # ---- control ---------------------------------------------------------------------
 
@@ -121,7 +125,10 @@ class Run:
         self._resume.set()
 
     def cancel(self) -> None:
-        if self._task and not self._task.done():
+        # Not once the run is cleaning up (_main sets _cancelling first thing): a cancel landing there
+        # would cut off waiting for saves, writing the last matches.json or closing the browser context,
+        # and leave the run "running" for good. Before that, a second Cancel click does no harm.
+        if self._task and not self._task.done() and not self._cancelling:
             self._task.cancel()
 
     async def wait(self) -> None:
@@ -158,6 +165,7 @@ class Run:
     def _error(self, text: str) -> None:
         self.errors.append(text)
         log.info("run %s: %s", self.id, text)
+        self._publish({"type": "problem", "text": text})  # the page's Problems list updates live
 
     def _set_status(self, status: str, message: str = "") -> None:
         self.status, self.message = status, message
@@ -189,6 +197,7 @@ class Run:
         }
 
     async def _ticker(self) -> None:
+        flush_error: str | None = None
         while True:
             await asyncio.sleep(0.5)
             if self._dirty:
@@ -196,64 +205,82 @@ class Run:
             if self.storage is not None and self.storage.dirty:
                 try:
                     await asyncio.to_thread(self.storage.flush)
-                except OSError as e:  # pragma: no cover - retried on the next tick
-                    log.warning("run %s: could not write matches.json: %s", self.id, e)
+                    flush_error = None
+                except OSError as e:  # still dirty: retried on the next tick
+                    if str(e) != flush_error:  # logged once, not twice a second while the disk stays full
+                        log.warning("run %s: could not write matches.json: %s", self.id, e)
+                    flush_error = str(e)
+                    if e.errno == errno.ENOSPC:  # nothing more is saved until there is room again
+                        self.pause(DISK_FULL_MESSAGE)
 
     # ---- pipeline --------------------------------------------------------------------
 
     async def _main(self) -> None:
         ticker = asyncio.create_task(self._ticker())
         try:
-            o = self.opts
-            label = f"folder-{Path(o.folder).name or 'drive'}" if o.folder else None
-            folder = await asyncio.to_thread(make_run_dir, self.s.output_dir, o.url, o.tag_id, None, label)
-            self.storage = RunStorage(
-                folder,
-                {
-                    "source": "folder" if o.folder else "web",
-                    "start_url": o.folder or o.url,
-                    "tag": {"id": self.opts.tag_id, "rubric": self.opts.rubric},
-                    "threshold": self.opts.threshold,
-                    "options": asdict(self.opts),
-                    "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "status": "running",
-                },
-            )
-            await asyncio.to_thread(self.storage.write_manifest)
-            if o.folder:
-                await self._main_folder()
-                return
-            self._context = await self.browser.new_context(
-                user_agent=BROWSER_UA, viewport={"width": 1366, "height": 900}
-            )
-            self._mark_running()
-
-            fetch_q: asyncio.Queue[ImageCandidate | None] = asyncio.Queue(maxsize=200)
-            classify_q: asyncio.Queue[FetchedImage | None] = asyncio.Queue(maxsize=self._in_flight())
-            async with asyncio.TaskGroup() as tg:
-                tg.create_task(self._crawl(fetch_q))
-                tg.create_task(self._fetch_stage(fetch_q, classify_q))
-                tg.create_task(self._classify_loop(classify_q))
-            if self.stats["pages_crawled"] == 0 and not self.message:
-                self.message = self.errors[-1] if self.errors else "No pages could be crawled."
-            self._finish("done", self.message)
+            status, message = await self._pipeline()
         except asyncio.CancelledError:
-            self._finish("cancelled", "Cancelled.")
+            self._cancelling = True
+            status, message = "cancelled", "Cancelled."
         except BaseException as e:  # noqa: BLE001 - surface anything unexpected as a failed run
+            self._cancelling = True
             leaf = e
             while isinstance(leaf, BaseExceptionGroup):
                 leaf = leaf.exceptions[0]
             log.exception("run %s failed", self.id, exc_info=e)
-            self._finish("failed", f"{type(leaf).__name__}: {leaf}")
-        finally:
+            status, message = "failed", f"{type(leaf).__name__}: {leaf}"
+        # Cleanup can't be cancelled any more (see cancel()), so it always reaches a final status.
+        self._cancelling = True
+        try:
             ticker.cancel()
+            await self._saves_done()
+            await self._finish(status, message)
+        finally:
             if self._context is not None:
                 try:
                     await self._context.close()
                 except Exception:  # pragma: no cover - browser already gone
                     pass
 
-    async def _main_folder(self) -> None:
+    async def _pipeline(self) -> tuple[str, str]:
+        """The run itself; returns its final (status, message)."""
+        o = self.opts
+        label = f"folder-{Path(o.folder).name or 'drive'}" if o.folder else None
+        folder = await asyncio.to_thread(make_run_dir, self.s.output_dir, o.url, o.tag_id, None, label)
+        self.storage = RunStorage(
+            folder,
+            {
+                "source": "folder" if o.folder else "web",
+                "start_url": o.folder or o.url,
+                "tag": {"id": self.opts.tag_id, "rubric": self.opts.rubric},
+                "threshold": self.opts.threshold,
+                "options": asdict(self.opts),
+                "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "status": "running",
+            },
+        )
+        await asyncio.to_thread(self.storage.write_manifest)
+        if o.folder:
+            return await self._main_folder()
+        # accept_downloads=False: a link that turns out to be a file download (a "download all" zip
+        # behind /gallery/12/download) is refused, instead of streaming into a temp folder until
+        # the run ends.
+        self._context = await self.browser.new_context(
+            user_agent=BROWSER_UA, viewport={"width": 1366, "height": 900}, accept_downloads=False
+        )
+        self._mark_running()
+
+        fetch_q: asyncio.Queue[ImageCandidate | None] = asyncio.Queue(maxsize=200)
+        classify_q: asyncio.Queue[FetchedImage | None] = asyncio.Queue(maxsize=self._in_flight())
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(self._crawl(fetch_q))
+            tg.create_task(self._fetch_stage(fetch_q, classify_q))
+            tg.create_task(self._classify_loop(classify_q))
+        if self.stats["pages_crawled"] == 0 and not self.message:
+            self.message = self.errors[-1] if self.errors else "No pages could be crawled."
+        return "done", self.message
+
+    async def _main_folder(self) -> tuple[str, str]:
         self._mark_running()
         classify_q: asyncio.Queue[FetchedImage | None] = asyncio.Queue(maxsize=self._in_flight())
         async with asyncio.TaskGroup() as tg:
@@ -261,13 +288,13 @@ class Run:
             tg.create_task(self._classify_loop(classify_q))
         if self.stats["images_found"] == 0 and not self.message:
             self.message = self.errors[-1] if self.errors else "No images found in that folder."
-        self._finish("done", self.message)
+        return "done", self.message
 
     async def _scan_folder(self, classify_q: asyncio.Queue) -> None:
         o, s = self.opts, self.s
         root = Path(o.folder)
         try:
-            files = await asyncio.to_thread(list_image_files, root, o.recursive, s.output_dir)
+            files = await asyncio.to_thread(list_image_files, root, o.recursive, s.output_dir, o.max_images)
             self.stats["pages_queued"] = 0
             for path in files:
                 if self.stats["images_found"] >= o.max_images:
@@ -287,7 +314,7 @@ class Run:
             self._dirty = True
         await classify_q.put(None)
 
-    def _finish(self, status: str, message: str) -> None:
+    async def _finish(self, status: str, message: str) -> None:
         self.current_page = None
         self.finished_at = time.time()
         if self.storage is not None:  # recorded for the history list
@@ -295,48 +322,104 @@ class Run:
                 status=status, message=message, stats=dict(self.stats), finished=time.strftime("%Y-%m-%dT%H:%M:%S")
             )
             try:
-                self.storage.write_manifest()
-            except OSError as e:  # pragma: no cover - disk gone; the run result is still in memory
+                # In a worker thread: it can wait out a reader holding the file (write_manifest's retries).
+                await asyncio.to_thread(self.storage.write_manifest)
+            except OSError as e:  # the matches are still listed on the page; say why Past searches won't have them
                 log.warning("run %s: could not write matches.json: %s", self.id, e)
+                self._error(f"could not write matches.json: {e}")
+                message = f"{message} The list of matches (matches.json) could not be written: {e}".strip()
         self._set_status(status, message)
+
+    async def _saves_done(self) -> None:
+        """Waits for saves still running in worker threads (a cancel doesn't stop a thread), so the final
+        matches.json lists every file that ends up in the run folder."""
+        if self._saves:
+            await asyncio.gather(*list(self._saves), return_exceptions=True)
 
     async def _crawl(self, fetch_q: asyncio.Queue) -> None:
         o, s = self.opts, self.s
         start = normalize_page_url(o.url)
         robots = Robots(self._context, s.fetch_timeout_s, self._error) if o.respect_robots else None
         queue: deque[tuple[str, int]] = deque([(start, 0)]) if start else deque()
-        seen_pages = {start}
+        # Page keys (see urls.page_key: www and http/https variants are one page) of everything queued
+        # or read, and of the pages actually read, under the address they ended up at after redirects.
+        seen_pages = {page_key(start)} if start else set()
+        crawled: set[str] = set()
         seen_images: set[str] = set()
         site: str | None = None
         scope = "/"
+        http_tried = False
+        next_load_at = 0.0  # time.monotonic() before which the next page isn't loaded
+        # Every page that loads counts toward Max pages, kept or not: a gallery of 200 links that all
+        # redirect to other sites must not mean 200 page loads on a 10-page search.
+        loaded = 0
+
+        def in_crawl(u: str) -> bool:
+            """Inside the site (and the folder, with Stay in this folder); anything before the start page
+            has defined the site."""
+            return site is None or (site_key(u) == site and in_path_scope(u, scope))
+
         try:
-            while queue and self.stats["pages_crawled"] < o.max_pages and self.stats["images_found"] < o.max_images:
+            while queue and loaded < o.max_pages and self.stats["images_found"] < o.max_images:
                 await self._resume.wait()
                 url, depth = queue.popleft()
                 self.stats["pages_queued"] = len(queue)
+                if page_key(url) in crawled:  # already read: an earlier link redirected there
+                    continue
                 if robots and not await robots.allowed(url):
                     self._bump("pages_blocked")
                     self._error(f"blocked by robots.txt: {url}")
                     continue
 
+                # The page delay is kept between any two page loads (failed or redirected ones too),
+                # and nothing is waited for after the last one.
+                delay = o.page_delay_s
+                if robots:
+                    delay = max(delay, min(10.0, await robots.crawl_delay(url)))
+                if (wait := next_load_at - time.monotonic()) > 0:
+                    await asyncio.sleep(wait)
+                    await self._resume.wait()  # Pause pressed during the delay holds this page too
                 self.current_page = url
                 self._dirty = True
                 try:
                     page = await load_page(
-                        self._context, url, s.page_timeout_s, s.max_scroll_steps, o.prefer_originals
+                        self._context, url, s.page_timeout_s, s.max_scroll_steps, o.prefer_originals, keep=in_crawl
                     )
                 except PageError as e:
-                    if site is None and url.startswith("https://"):
+                    next_load_at = time.monotonic() + delay
+                    if site is None and url.startswith("https://") and not http_tried:
                         # Start page failed over https (the default when no scheme is typed): try http once.
-                        fallback = "http://" + url[len("https://"):]
-                        if fallback not in seen_pages:
-                            seen_pages.add(fallback)
-                            queue.appendleft((fallback, depth))
-                            self._error(f"page {url}: {e}; retrying over http")
-                            continue
+                        http_tried = True
+                        queue.appendleft(("http://" + url[len("https://"):], depth))
+                        self._error(f"page {url}: {e}; retrying over http")
+                        continue
                     self._bump("pages_failed")
                     self._error(f"page {url}: {e}")
                     continue
+
+                next_load_at = time.monotonic() + delay
+                loaded += 1
+
+                # The checks above were for the link; a redirect can land anywhere, so check where the
+                # page really is before taking its images and links. (load_page already skipped the
+                # scrolling on a page outside the crawl.)
+                final = page_key(page.url)
+                if final in crawled:
+                    continue
+                if not in_crawl(page.url):
+                    # e.g. /out.php?id=3 or a login that sends you to another site; its robots.txt
+                    # is none of this search's business
+                    self._bump("pages_blocked")
+                    log.info("run %s: %s redirected out of the crawl to %s", self.id, url, page.url)
+                    seen_pages.add(final)
+                    continue
+                if robots and page.url != url and not await robots.allowed(page.url):
+                    self._bump("pages_blocked")
+                    self._error(f"blocked by robots.txt: {page.url} (redirected from {url})")
+                    seen_pages.add(final)
+                    continue
+                crawled.add(final)
+                seen_pages.add(final)
                 self._bump("pages_crawled")
                 if site is None:
                     site = site_key(page.url)  # the start page after redirects defines the site
@@ -357,21 +440,16 @@ class Run:
 
                 if depth < o.max_depth:
                     for link in page.links:
+                        key = page_key(link)
                         if (
-                            link not in seen_pages
+                            key not in seen_pages
                             and site_key(link) == site
                             and in_path_scope(link, scope)
                             and looks_like_page(link)
                         ):
-                            seen_pages.add(link)
+                            seen_pages.add(key)
                             queue.append((link, depth + 1))
                 self.stats["pages_queued"] = len(queue)
-
-                if queue and self.stats["pages_crawled"] < o.max_pages:
-                    delay = o.page_delay_s
-                    if robots:
-                        delay = max(delay, min(10.0, await robots.crawl_delay(url)))
-                    await asyncio.sleep(delay)
         finally:
             self.current_page = None
             self._dirty = True
@@ -470,7 +548,24 @@ class Run:
             self._bump("cached")
         t = res["tags"][tag.id]
         if t["match"] and t["confidence"] >= self.opts.threshold:
-            entry = await asyncio.to_thread(self.storage.save, img, t["confidence"], t["evidence"])
+            while True:
+                save = asyncio.ensure_future(asyncio.to_thread(self.storage.save, img, t["confidence"], t["evidence"]))
+                self._saves.add(save)
+                save.add_done_callback(self._saves.discard)
+                try:
+                    # shield: a cancel leaves the save running (its thread can't be stopped) for _saves_done
+                    entry = await asyncio.shield(save)
+                    break
+                except OSError as e:
+                    if e.errno == errno.ENOSPC:  # the run waits (keeping this match) until there is room
+                        self.pause(DISK_FULL_MESSAGE)
+                        await self._resume.wait()
+                        continue
+                    # A file that can't be written (a path too long, a scanner holding it) loses only
+                    # this match, never the run.
+                    self._bump("errors")
+                    self._error(f"could not save {img.url[:200]}: {e}")
+                    return
             self._bump("matches")
             self._publish({"type": "match", "match": entry})
 
@@ -479,11 +574,32 @@ class RunManager:
     # Finished runs stay readable from disk (Past searches); only the newest few are kept in memory.
     KEEP_FINISHED = 10
 
-    def __init__(self, settings: AppSettings, service: DetectionService, browser: Browser):
+    def __init__(
+        self,
+        settings: AppSettings,
+        service: DetectionService,
+        browser: Browser,
+        relaunch: Callable[[], Awaitable[Browser]] | None = None,
+    ):
         self.s = settings
         self.svc = service
         self.browser = browser
         self.runs: dict[str, Run] = {}
+        self._relaunch = relaunch
+        self._relaunch_lock = asyncio.Lock()
+
+    async def ensure_browser(self) -> None:
+        """Starts Chromium again if it has stopped (crashed, or closed by hand), so the next run
+        works instead of every run failing until the app is restarted. Runs already going keep the
+        browser they have."""
+        if self._relaunch is None:
+            return
+        async with self._relaunch_lock:
+            connected = getattr(self.browser, "is_connected", None)
+            if connected is None or connected():
+                return
+            log.warning("Chromium has stopped; starting it again")
+            self.browser = await self._relaunch()
 
     def _prune(self) -> None:
         finished = [r for r in self.runs.values() if r.finished]  # oldest first

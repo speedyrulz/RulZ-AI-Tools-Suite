@@ -38,6 +38,11 @@ class ModelError(Exception):
     """A single model call failed (timeout, bad output twice, HTTP error). Fails only that image."""
 
 
+class ModelTimeout(ModelError):
+    """The server took the request but didn't answer in time (it may be stalled). Still fails only that image;
+    with several servers the pool first retries it on another one."""
+
+
 class OutputParseError(Exception):
     pass
 
@@ -112,6 +117,45 @@ def parse_classify_output(text: str, tag_ids: Sequence[str]) -> tuple[dict[str, 
 _MATCH_KEY_RE = re.compile(r'"match"\s*:\s*$')
 
 
+def _value_probability(tok: dict, piece: str) -> float | None:
+    """P(true) from one value token's log-probabilities, normalised over true/false. None if neither word is
+    among them."""
+    listed = tok.get("top_logprobs")
+    alts = listed or [{"token": piece, "logprob": tok.get("logprob", 0.0)}]
+    p_true = p_false = 0.0
+    seen_true = seen_false = False
+    probs: list[float] = []
+    for alt in alts:
+        try:
+            p = math.exp(float(alt.get("logprob", -math.inf)))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isnan(p):
+            continue
+        probs.append(p)
+        word = (alt.get("token") or "").strip().lower()
+        if word == "true":
+            p_true, seen_true = p_true + p, True
+        elif word == "false":
+            p_false, seen_false = p_false + p, True
+    if not (seen_true or seen_false):
+        return None
+    if not (seen_true and seen_false):
+        # Only one answer was observed. Normalising it by itself would always say 1.0, so give the other
+        # one its largest possible probability instead: no more than what the listed tokens leave over,
+        # and (top_logprobs are the most likely tokens) no more than the least likely listed one. With
+        # only the chosen token known, that is 1 - p, and the confidence is p itself.
+        missing = max(0.0, 1.0 - sum(probs))
+        if listed:
+            missing = min(missing, min(probs))
+        if seen_true:
+            p_false = missing
+        else:
+            p_true = missing
+    total = p_true + p_false
+    return p_true / total if total > 0 else None
+
+
 def match_probabilities(tokens: Sequence[dict] | None, tag_ids: Sequence[str]) -> dict[str, float]:
     """P(match is true) per tag, read from the log-probabilities of the token generated right after
     each "match": key and normalised over true/false. Tags whose value token isn't found are left out."""
@@ -120,19 +164,10 @@ def match_probabilities(tokens: Sequence[dict] | None, tag_ids: Sequence[str]) -
     for tok in tokens or ():
         piece = tok.get("token") or ""
         if _MATCH_KEY_RE.search(text[-40:]):
-            alts = tok.get("top_logprobs") or [{"token": piece, "logprob": tok.get("logprob", 0.0)}]
-            p_true = p_false = 0.0
-            for alt in alts:
-                word = (alt.get("token") or "").strip().lower()
-                if word in ("true", "false"):
-                    p = math.exp(float(alt.get("logprob", -math.inf)))
-                    if word == "true":
-                        p_true += p
-                    else:
-                        p_false += p
+            p = _value_probability(tok, piece)
             owner = max(tag_ids, key=lambda t: text.rfind(f'"{t}"'), default=None)
-            if owner is not None and p_true + p_false > 0 and text.rfind(f'"{owner}"') >= 0 and owner not in out:
-                out[owner] = p_true / (p_true + p_false)
+            if owner is not None and p is not None and text.rfind(f'"{owner}"') >= 0 and owner not in out:
+                out[owner] = p
         text += piece
     return out
 
@@ -157,6 +192,7 @@ class LlamaClient:
         self._owns_client = client is None
         self.stats = Stats()
         self._model_id: str | None = settings.model_id
+        self._seen_down = False
 
     async def aclose(self) -> None:
         if self._owns_client:
@@ -172,8 +208,8 @@ class LlamaClient:
             )
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.RemoteProtocolError, httpx.ReadError) as e:
             raise ModelServerDown(f"{type(e).__name__}: {e}") from e
-        except httpx.TimeoutException as e:
-            raise ModelError(f"model request timed out after {self.s.request_timeout_s:.0f}s") from e
+        except httpx.TimeoutException as e:  # connected, but no answer: a busy or stalled server
+            raise ModelTimeout(f"model request timed out after {self.s.request_timeout_s:.0f}s") from e
         except httpx.HTTPError as e:
             raise ModelError(f"model request failed: {type(e).__name__}: {e}") from e
         if resp.status_code == 503:  # llama-server answers 503 while the model is loading
@@ -285,9 +321,17 @@ class LlamaClient:
     async def is_up(self) -> bool:
         try:
             r = await self._client.get(f"{self.url}/health", timeout=3)
-            return r.status_code == 200
+            up = r.status_code == 200
         except httpx.HTTPError:
-            return False
+            up = False
+        if not up:
+            self._seen_down = True
+        elif self._seen_down:
+            # Back after being down: it may have been restarted with another model, so read the id again
+            # (the cache key must not reuse the old model's answers).
+            self._seen_down = False
+            self._model_id = self.s.model_id
+        return up
 
     async def slots_free(self) -> int | None:
         try:

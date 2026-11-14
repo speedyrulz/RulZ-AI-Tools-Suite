@@ -77,18 +77,55 @@ function Wait-Url([string]$url, [int]$seconds, [System.Diagnostics.Process]$proc
 }
 
 # "all" = every NVIDIA card with room for the model (~11.5 GB with start_llama_server.ps1's default
-# -c 8192 and q8_0 KV cache), else a list like "0" or "0,1".
+# -c 8192 and q8_0 KV cache), else a list like "0" or "0,1". Returns objects with the card's Index and
+# its free memory in MiB (FreeMiB; -1 when not known).
 function Get-ModelGpus([string]$spec) {
     if ($spec -ne "all") {
-        return @($spec -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+        return @($spec -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" } |
+            ForEach-Object { [pscustomobject]@{ Index = $_; FreeMiB = -1 } })
     }
-    if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) { return @("0") }
-    $gpus = @(& nvidia-smi --query-gpu=index,memory.total --format=csv,noheader,nounits 2>$null | ForEach-Object {
-        $idx, $mem = $_ -split ","
-        if ([int]$mem.Trim() -ge 12000) { $idx.Trim() }
+    $fallback = @([pscustomobject]@{ Index = "0"; FreeMiB = -1 })
+    if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) { return $fallback }
+    try {
+        # In PowerShell 5.1 with ErrorActionPreference Stop, any stderr line from a program throws even
+        # with 2>$null, losing the good rows too (e.g. one card nvidia-smi warns about): not here.
+        $rows = @(& {
+            $ErrorActionPreference = "Continue"
+            & nvidia-smi --query-gpu=index,memory.total,memory.free --format=csv,noheader,nounits 2>$null
+        })
+    } catch {
+        $rows = @()
+    }
+    # Chosen on total memory, not free: a 12 GB card that also drives the display has a little less
+    # free and still holds the model. Rows nvidia-smi can't fill in (e.g. "[N/A]") are skipped.
+    $gpus = @(foreach ($row in $rows) {
+        $cols = @("$row" -split "," | ForEach-Object { $_.Trim() })
+        $idx = 0; $total = 0; $free = 0
+        if ($cols.Count -lt 2) { continue }
+        if (-not [int]::TryParse($cols[0], [ref]$idx)) { continue }
+        if (-not [int]::TryParse($cols[1], [ref]$total)) { continue }
+        if ($total -lt 12000) { continue }
+        if ($cols.Count -lt 3 -or -not [int]::TryParse($cols[2], [ref]$free)) { $free = -1 }
+        [pscustomobject]@{ Index = "$idx"; FreeMiB = $free }
     })
-    if ($gpus.Count -eq 0) { return @("0") }
+    if ($gpus.Count -eq 0) { return $fallback }
     return $gpus
+}
+
+# Something already answers on a model server's port. Reuse it only if it is a llama-server (its
+# /props names the model file) whose model can read images; anything else would fail every image.
+function Assert-ReusableServer([string]$url, [int]$port) {
+    $props = $null
+    try { $props = Invoke-RestMethod "$url/props" -UseBasicParsing -TimeoutSec 3 } catch { }
+    $path = $null
+    if ($props -is [System.Management.Automation.PSCustomObject]) { $path = [string]$props.model_path }
+    if ([string]::IsNullOrWhiteSpace($path)) {
+        throw "Port $port is used by another program. Close it, or start with -LlamaPort <another port>."
+    }
+    if ($props.modalities -and $props.modalities.vision -eq $false) {
+        $file = ($path -split '[\\/]')[-1]
+        throw "Port $port runs a llama-server whose model can't read images ($file). Stop it, or start with -LlamaPort <another port>."
+    }
 }
 
 $started = @()
@@ -101,17 +138,23 @@ try {
     }
 
     # ---- 1. model servers: one per GPU, on consecutive ports ---------------------------------
-    $gpus = Get-ModelGpus $Gpu
+    $gpus = @(Get-ModelGpus $Gpu)  # @(): one card comes back as a single object, not an array
     $servers = @()
     for ($k = 0; $k -lt $gpus.Count; $k++) {
-        $g = $gpus[$k]
+        $g = $gpus[$k].Index
         $gpuPort = $LlamaPort + $k
         $url = "http://127.0.0.1:$gpuPort"
         $log = Join-Path $logDir "llama-server-gpu$g.log"
         if (Test-Url "$url/health") {
+            Assert-ReusableServer $url $gpuPort
             Write-Host "Model server already running on port $gpuPort - reusing it."
             $servers += [pscustomobject]@{ Gpu = $g; Url = $url; Proc = $null; Log = $log }
             continue
+        }
+        # Only for cards it starts a model on: a reused server's own model would count as "another program".
+        $free = $gpus[$k].FreeMiB
+        if ($free -ge 0 -and $free -lt 11500) {
+            Write-Host "GPU $g has only $free MiB free: another program is using it; the model may fail to load there or run slowly." -ForegroundColor Yellow
         }
         Write-Host "Starting the model on GPU $g (port $gpuPort, log: $log)"
         $proc = Start-Process powershell -PassThru -WindowStyle Hidden `
