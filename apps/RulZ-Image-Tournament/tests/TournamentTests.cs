@@ -26,8 +26,22 @@ static class TournamentTests
         return string.Join(" ", log);
     }
 
-    static int Main()
+    // build.ps1 -Test runs this on the built .exe: csc adds no target framework attribute by itself, and without one
+    // .NET runs the app with .NET 4.5's defaults (long paths blocked, WinForms accessibility improvements off).
+    static int CheckExe(string exe)
     {
+        var asm = System.Reflection.Assembly.ReflectionOnlyLoadFrom(Path.GetFullPath(exe));
+        var tf = System.Reflection.CustomAttributeData.GetCustomAttributes(asm)
+            .FirstOrDefault(a => a.Constructor.DeclaringType.FullName == "System.Runtime.Versioning.TargetFrameworkAttribute");
+        string name = tf == null ? null : tf.ConstructorArguments[0].Value as string;
+        Check(name == ".NETFramework,Version=v4.8", "the .exe targets .NET Framework 4.8 (found: " + (name ?? "no attribute") + ")");
+        Console.WriteLine(_failures == 0 ? "The .exe targets .NET Framework 4.8." : _failures + " failure(s).");
+        return _failures == 0 ? 0 : 1;
+    }
+
+    static int Main(string[] args)
+    {
+        if (args.Length == 2 && args[0] == "--exe") return CheckExe(args[1]);
         var t = new Tournament();
         t.Start(Images(10));
         Check(PlayLeft(t) == "1:1v2 1:3v4 1:5v6 1:7v8 1:9v10 2:1v3 2:5v7 3:9v1 4:5v9", "10 images bracket order");

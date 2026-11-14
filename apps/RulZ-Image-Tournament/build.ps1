@@ -25,4 +25,9 @@ if ($Test) {
     "/r:$wpf\PresentationCore.dll" "/r:$wpf\WindowsBase.dll" /r:System.Xaml.dll `
     src\*.cs
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if ($Test) {
+    # Run in its own process, so the check doesn't keep the .exe open in this PowerShell session.
+    & .\bin\TournamentTests.exe --exe "bin\RulZ Image Tournament.exe"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
 Write-Host "Built bin\RulZ Image Tournament.exe"
