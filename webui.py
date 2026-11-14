@@ -5852,6 +5852,9 @@ def review_issues(cfg: TrainConfig, goal: str | None, data: dict | None, n_gpus:
             out += [("warning", w) for w in start_warnings(cfg)]
     if cfg.reg_dir and not Path(cfg.reg_dir).is_dir():
         out.append(("error", f"Regularisation folder not found: {cfg.reg_dir}"))
+    taken = job_name_refusal(cfg, _waiting_job_names())  # Start and Add to queue refuse it: say so here first
+    if taken:
+        out.append(("error", taken))
     try:
         cfg.validate()
     except ValueError as e:
