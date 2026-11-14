@@ -240,6 +240,19 @@ static class ImageGridTests
         Check(new FileInfo(target).Length == before, "that file is left as it was");
         left = Directory.GetFiles(folder).Select(Path.GetFileName).OrderBy(n => n).ToList();
         Check(left.SequenceEqual(new[] { "grid.png", "grid.png.tmp" }), "and nothing is left behind: " + string.Join(", ", left));
+
+        // A read-only file is refused, never quietly replaced (renaming it aside would work, so this guards the swap).
+        var original = File.ReadAllBytes(target);
+        File.SetAttributes(target, FileAttributes.ReadOnly);
+        threw = false;
+        try { Renderer.Save(bmp, target, false, 90, false); }
+        catch (IOException) { threw = true; }
+        catch (UnauthorizedAccessException) { threw = true; }
+        finally { File.SetAttributes(target, FileAttributes.Normal); }
+        Check(threw, "saving over a read-only file reports an error");
+        Check(File.ReadAllBytes(target).SequenceEqual(original), "and leaves it unchanged");
+        left = Directory.GetFiles(folder).Select(Path.GetFileName).OrderBy(n => n).ToList();
+        Check(left.SequenceEqual(new[] { "grid.png", "grid.png.tmp" }), "with nothing left behind: " + string.Join(", ", left));
         Directory.Delete(folder, true);
     }
 

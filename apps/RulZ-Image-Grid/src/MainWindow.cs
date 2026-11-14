@@ -998,6 +998,10 @@ namespace RulZImageGrid
             double ppd = VisualTreeHelper.GetDpi(this).PixelsPerDip;
             for (int i = 0; i < names.Length; i++) TextMetrics.DrawCaption(dc, layout, i, names[i], size, brush, ppd);
         }
+
+        // Moving to a monitor with other scaling only re-measures elements, and this one's size never changes, so ask
+        // for a redraw to lay the text out for the new monitor.
+        protected override void OnDpiChanged(DpiScale oldDpi, DpiScale newDpi) => InvalidateVisual();
     }
 
     /// <summary>Sorts "img2" before "img10".</summary>

@@ -4,6 +4,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -33,7 +34,7 @@ namespace RulZImageGrid
         readonly Panel presets;
         readonly DispatcherTimer previewTimer;
         double percent = 100;
-        bool busy, syncing;
+        bool busy, syncing, checking;
 
         // The preview only changes when its drawing scale (or, for a transparent background, the format) changes.
         string previewKey;               // what the preview shows, or is being rendered to show
@@ -284,7 +285,7 @@ namespace RulZImageGrid
 
         async void RenderPreview()
         {
-            if (!IsLoaded) return;
+            if (!IsLoaded || busy) return; // never alongside a save; SetBusy(false) catches up
             double pscale = PreviewScale;
             bool opaque = IsJpg && S.Transparent; // JPG only changes the picture when the background is transparent
             string key = pscale.ToString("R", CultureInfo.InvariantCulture) + (opaque ? "|opaque" : "");
@@ -321,14 +322,29 @@ namespace RulZImageGrid
 
         async void Save()
         {
-            // Say up front which images are gone, rather than failing partway through a long save.
-            var missing = items.Select(i => i.Path).Distinct(StringComparer.OrdinalIgnoreCase).Where(p => !File.Exists(p)).ToList();
+            if (busy || checking) return;
+            // Say up front which images are gone, rather than failing partway through a long save. Checked off the UI
+            // thread: on a slow or unavailable network drive each check can take a while.
+            var paths = items.Select(i => i.Path).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            List<string> missing;
+            checking = true;
+            Cursor = System.Windows.Input.Cursors.Wait;
+            statusText.Text = "Checking the images…";
+            try { missing = await Task.Run(() => paths.Where(p => !File.Exists(p)).ToList()); }
+            finally
+            {
+                checking = false;
+                Cursor = null;
+                statusText.Text = "";
+            }
+            if (!IsVisible) return; // the window was closed while checking
             if (missing.Count > 0)
             {
                 MessageBox.Show(this,
-                    "These images were moved, renamed or deleted after they were added, so the grid can't be saved:\n\n" +
+                    "These images can't be found, so the grid can't be saved. They were moved, renamed or deleted " +
+                    "after they were added, or they're on a drive that isn't available right now:\n\n" +
                     string.Join("\n", missing.Take(15)) + (missing.Count > 15 ? $"\n…and {missing.Count - 15} more" : "") +
-                    "\n\nPut them back, or remove them from the grid, and try again.",
+                    "\n\nPut them back (or reconnect the drive), or remove them from the grid, and try again.",
                     "Export", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
@@ -348,9 +364,18 @@ namespace RulZImageGrid
             if (dlg.ShowDialog(this) != true) return;
 
             string path = dlg.FileName;
-            // The name decides the format, so typing "grid.png" while JPG is picked saves a real PNG.
+            // The name decides the format, so typing "grid.png" while JPG is picked saves a real PNG. Any other ending
+            // (grid.bmp, grid.webp) is refused rather than writing PNG data under that name.
             bool? named = FormatOf(path);
-            if (named.HasValue && named.Value != jpg)
+            if (named == null)
+            {
+                MessageBox.Show(this,
+                    $"RulZ Image Grid saves PNG and JPG images only, so it can't save \"{Path.GetFileName(path)}\".\n\n" +
+                    "End the file name with .png or .jpg and try again.",
+                    "Export", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+            if (named.Value != jpg)
             {
                 (named.Value ? jpgRadio : pngRadio).IsChecked = true; // shows what's saved and re-checks the size limits
                 if (!saveBtn.IsEnabled)
@@ -410,6 +435,15 @@ namespace RulZImageGrid
             cancelBtn.IsEnabled = !on;
             scaleSlider.IsEnabled = scaleBox.IsEnabled = pngRadio.IsEnabled = jpgRadio.IsEnabled = !on;
             presets.IsEnabled = qualitySlider.IsEnabled = !on;
+            // No preview renders alongside a save (switching the format from the file name would start one): stop any
+            // that's under way, and bring the preview up to date if the save fails and the window stays open.
+            previewTimer.Stop();
+            if (on && previewPending)
+            {
+                previewCancel?.Cancel();
+                previewKey = null;
+            }
+            if (!on) previewTimer.Start();
             UpdateResolution();
         }
     }
