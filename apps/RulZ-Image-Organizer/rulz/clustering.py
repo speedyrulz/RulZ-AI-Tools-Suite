@@ -14,6 +14,51 @@ from .db import Database
 
 CHUNK = 512
 MAX_EXEMPLARS = 400  # per-person sample used for suggestions
+BLOCK_CELLS = 1 << 24  # similarity-matrix cells per block (64 MB of float32), so big libraries don't spike RAM
+
+
+def _rows_per_block(n_cols: int) -> int:
+    return max(8, min(CHUNK, BLOCK_CELLS // max(1, n_cols)))
+
+
+def _components(vecs: np.ndarray, t_link: float) -> np.ndarray:
+    """Connected components of "similarity >= t_link". Returns each row's component label: the smallest
+    row index in its component.
+
+    Same result as a union-find walking every linked pair, but linked pairs are merged in a few vectorized
+    rounds: a big library has tens of millions of them (every pair of photos of the same person), and a
+    Python loop over them took minutes.
+    """
+    n = len(vecs)
+    parent = np.arange(n)
+    step = _rows_per_block(n)
+    for lo in range(0, n, step):
+        hi = min(n, lo + step)
+        sims = vecs[lo:hi] @ vecs[lo:].T  # columns lo.. only: every pair is looked at once
+        linked = sims >= t_link
+        linked[:, :hi - lo] = np.triu(linked[:, :hi - lo], 1)  # not itself, not pairs already seen
+        r, c = np.nonzero(linked)
+        _union(parent, r + lo, c + lo)
+    return parent
+
+
+def _union(parent: np.ndarray, u: np.ndarray, v: np.ndarray) -> None:
+    """Merge the components of each pair (u[i], v[i]). ``parent`` holds every node's root (always its
+    component's smallest index) before and after."""
+    while len(u):
+        ru, rv = parent[u], parent[v]
+        differ = ru != rv
+        if not differ.any():
+            return
+        u, v, ru, rv = u[differ], v[differ], ru[differ], rv[differ]
+        # Hook each larger root onto the smallest root it is linked to. Pointers only ever go to smaller
+        # indices, so there are no cycles, and each round leaves fewer roots.
+        np.minimum.at(parent, np.maximum(ru, rv), np.minimum(ru, rv))
+        while True:  # path compression: every node points straight at its root again
+            up = parent[parent]
+            if np.array_equal(up, parent):
+                break
+            parent[:] = up
 
 
 def cluster(db: Database, threshold: float | None = None) -> dict:
@@ -41,8 +86,9 @@ def cluster(db: Database, threshold: float | None = None) -> dict:
         for fid, pid in rejected:
             if pid in col_of:
                 rejected_cols.setdefault(fid, []).append(col_of[pid])
-        for lo in range(0, len(cand_ids), CHUNK):
-            block = cand[lo:lo + CHUNK]
+        step = _rows_per_block(len(known))
+        for lo in range(0, len(cand_ids), step):
+            block = cand[lo:lo + step]
             cent_sim = block @ centroids.T                                   # [b, P]
             best_single = np.maximum.reduceat(block @ known.T, starts, axis=1)  # [b, P]
             # A face matches a person if it's close to their average face, or very close to one of
@@ -67,51 +113,46 @@ def cluster(db: Database, threshold: float | None = None) -> dict:
     new_groups: list[list[int]] = []
     if len(rest) >= 2:
         sub = cand[rest]
-        parent = list(range(len(rest)))
-
-        def find(a):
-            while parent[a] != a:
-                parent[a] = parent[parent[a]]
-                a = parent[a]
-            return a
-
-        for lo in range(0, len(rest), CHUNK):
-            sims = sub[lo:lo + CHUNK] @ sub.T
-            rows, cols = np.nonzero(sims >= t_link)
-            for r, c in zip(rows, cols):
-                a, b = find(lo + int(r)), find(int(c))
-                if a != b:
-                    parent[a] = b
-        comps: dict[int, list[int]] = {}
-        for i in range(len(rest)):
-            comps.setdefault(find(i), []).append(i)
-        for members in comps.values():
+        label = _components(sub, t_link)
+        # Components in order of their smallest member, members ascending (as the old union-find gave them).
+        order = np.argsort(label, kind="stable")
+        bounds = np.flatnonzero(np.diff(label[order])) + 1
+        for members in np.split(order, bounds):
             if len(members) < 2:
                 continue
             # Drop outliers that only joined through a chain of look-alikes.
             vecs = sub[members]
             cen = vecs.sum(0)
             cen /= max(float(np.linalg.norm(cen)), 1e-6)
-            keep = [m for m, s in zip(members, vecs @ cen) if s >= t_assign]
+            keep = members[vecs @ cen >= t_assign]
             if len(keep) >= 2:
                 new_groups.append([int(cand_ids[rest[m]]) for m in keep])
 
     # ---- 3. write -------------------------------------------------------------
+    # The user may have edited faces while this was computed (the UI writes on its own connection), so each
+    # write re-checks: still unassigned, not "not a face", not rejected from that person since, and for a
+    # new group, never touched by the user (ungrouped faces must not re-form a group).
     with db.transaction():
         live = {r[0] for r in db.q("SELECT id FROM people")}
-        n_assigned = 0
-        for fid, pid in assignments.items():
-            if pid not in live:
-                continue
-            n_assigned += db.x("UPDATE faces SET person_id=?, assigned_by='auto' "
-                               "WHERE id=? AND person_id IS NULL AND ignored=0", (pid, fid)).rowcount
+        n_assigned = db.conn.executemany(
+            "UPDATE faces SET person_id=?, assigned_by='auto' WHERE id=? AND person_id IS NULL AND ignored=0 "
+            "AND NOT EXISTS(SELECT 1 FROM rejections r WHERE r.face_id=faces.id AND r.person_id=?)",
+            [(pid, fid, pid) for fid, pid in assignments.items() if pid in live]).rowcount
+        n_new = 0
         for group in new_groups:
+            still = []
+            for lo in range(0, len(group), 500):
+                part = group[lo:lo + 500]
+                still += [r[0] for r in db.q(f"SELECT id FROM faces WHERE id IN ({','.join('?' * len(part))}) "
+                                             "AND person_id IS NULL AND ignored=0 AND assigned_by IS NULL", part)]
+            if len(still) < 2:
+                continue  # edits since left fewer than two faces: not a group any more
             pid = db.create_person()
-            for fid in group:
-                n_assigned += db.x("UPDATE faces SET person_id=?, assigned_by='auto' "
-                                   "WHERE id=? AND person_id IS NULL AND ignored=0", (pid, fid)).rowcount
+            n_new += 1
+            n_assigned += db.conn.executemany("UPDATE faces SET person_id=?, assigned_by='auto' WHERE id=?",
+                                              [(pid, fid) for fid in still]).rowcount
     db.cleanup_people()
-    return {"assigned": n_assigned, "new_people": len(new_groups)}
+    return {"assigned": n_assigned, "new_people": n_new}
 
 
 def regroup(db: Database, threshold: float | None = None) -> dict:

@@ -102,6 +102,108 @@ def test_slider_saves_once_settled(qapp, window):
     assert window.db.match_threshold() == pytest.approx(0.38)
 
 
+def test_remove_folder_during_scan_runs_in_background_and_resumes(qapp, window, tmp_path, monkeypatch):
+    from PySide6.QtCore import Qt
+
+    from rulz.ui import dialogs
+
+    a, b = _photos(tmp_path / "a", 15), _photos(tmp_path / "b", 6)
+    window.db.add_folder(str(a))
+    window.db.add_folder(str(b))
+    window.navigate(window.LIBRARY)
+    lib = window.library
+    row = next(i for i in range(lib.list.count()) if lib.list.item(i).data(Qt.UserRole + 1) == str(a))
+    lib.list.setCurrentRow(row)
+    monkeypatch.setattr(dialogs, "confirm", lambda *a, **k: True)
+    window.scanner.scan()
+    _wait(qapp, lambda: window.scanner.running)
+    lib._remove()  # returns at once: no wait on the GUI thread
+    assert window.scanner.running
+    _wait(qapp, lambda: not window.scanner.running, 120)
+    assert [r["path"] for r in window.db.folders()] == [str(b)]
+    s = window.db.stats()
+    assert s["photos"] == 7 and s["pending"] == 0  # the scan carried on with the other folder
+
+
+def test_remove_survives_a_refresh_while_confirming_and_pause(qapp, window, tmp_path, monkeypatch):
+    from PySide6.QtCore import Qt
+
+    from rulz.ui import dialogs
+
+    a, b = _photos(tmp_path / "a", 15), _photos(tmp_path / "b", 3)
+    window.db.add_folder(str(a))
+    window.db.add_folder(str(b))
+    window.navigate(window.LIBRARY)
+    lib = window.library
+    lib.list.setCurrentRow(next(i for i in range(lib.list.count())
+                                if lib.list.item(i).data(Qt.UserRole + 1) == str(a)))
+
+    def confirm_while_a_scan_refreshes(*args, **kwargs):
+        lib.refresh()  # deletes the list item _remove started from
+        return True
+
+    monkeypatch.setattr(dialogs, "confirm", confirm_while_a_scan_refreshes)
+    window.scanner.scan()
+    _wait(qapp, lambda: window.scanner.running)
+    lib._remove()
+    lib.refresh()
+    texts = [lib.list.item(i).text() for i in range(lib.list.count())]
+    assert any(t.endswith("Removing…") for t in texts)  # still marked after a refresh
+    window.scanner.stop()  # Pause: drops the follow-up scan, not the removal
+    _wait(qapp, lambda: not window.scanner.running, 120)
+    assert [r["path"] for r in window.db.folders()] == [str(b)]
+
+
+def test_opening_a_person_that_is_gone_shows_the_overview(qapp, window):
+    from rulz.faces import DetectedFace, FaceAttrs
+
+    db = window.db
+    db.x("INSERT INTO folders(id, path) VALUES(1, 'x')")
+    db.x("INSERT INTO photos(id, folder_id, path, faces_done) VALUES(1, 1, 'x\\p.jpg', 1)")
+    fid = db.insert_face(1, DetectedFace((0.1, 0.1, 0.3, 0.3), 0.9, np.ones(128, np.float32), FaceAttrs()))
+    mom = db.create_person("Mom")
+    db.assign_faces([fid], mom)
+    window.open_person(mom)
+    assert window.people.currentWidget() is window.people.detail
+    window.open_person(mom + 99)  # e.g. a stale tile after a regroup
+    assert window.people.currentWidget() is window.people.overview
+
+
+def test_rewritten_files_leave_the_thumbnail_cache(qapp, window):
+    from PySide6.QtGui import QPixmap
+
+    from rulz import config
+    from rulz.ui.thumbs import ThumbLoader
+
+    loader = ThumbLoader.instance()
+    for key in (config.thumb_file(5), config.face_crop_file(9)):
+        pm = QPixmap(4, 4)
+        loader.cache[key] = pm
+        loader.cache_bytes += 64
+    window._files_rewritten([5], [9])
+    assert config.thumb_file(5) not in loader.cache and config.face_crop_file(9) not in loader.cache
+
+
+def test_edit_on_a_person_that_is_gone_shows_message(qapp, window, monkeypatch):
+    import sys
+
+    from rulz import app
+    from rulz.db import PersonGone
+    from rulz.ui import dialogs
+
+    shown = []
+    monkeypatch.setattr(dialogs, "info", lambda parent, title, text: shown.append(title))
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+    app._install_busy_handler()
+    version = window.data_version
+    try:
+        window.db.assign_faces([1], 12345)
+    except PersonGone:
+        sys.excepthook(*sys.exc_info())
+    assert shown == ["Library changed"]
+    assert window.data_version > version  # the page was refreshed
+
+
 def test_locked_database_shows_message(qapp, window, monkeypatch):
     import sys
 

@@ -132,6 +132,10 @@ class Person:
         return self.name or "Unnamed"
 
 
+class PersonGone(Exception):
+    """The person an edit refers to was merged, ungrouped or regrouped away since the screen was drawn."""
+
+
 def to_blob(vec: np.ndarray) -> bytes:
     return np.asarray(vec, dtype=np.float32).tobytes()
 
@@ -153,7 +157,13 @@ class Database:
         have = {r[1] for r in self.conn.execute("PRAGMA table_info(faces)")}
         for name, definition in MIGRATIONS:
             if name not in have:
-                self.conn.execute(f"ALTER TABLE faces ADD COLUMN {name} {definition}")
+                try:
+                    self.conn.execute(f"ALTER TABLE faces ADD COLUMN {name} {definition}")
+                except sqlite3.OperationalError as e:
+                    # The UI and the scanner open the library at the same moment on startup: the other
+                    # one may have just added it.
+                    if "duplicate column" not in str(e).lower():
+                        raise
 
     def close(self):
         self.conn.close()
@@ -211,26 +221,40 @@ class Database:
                     self.x("DELETE FROM folders WHERE id=?", (row["id"],))
         return None
 
-    def remove_folder(self, folder_id: int) -> None:
+    def remove_folder(self, folder_id: int) -> tuple[list[int], list[int]]:
+        """Remove a library folder and its photos; returns the deleted (photo ids, face ids)."""
         photo_ids = [r[0] for r in self.q("SELECT id FROM photos WHERE folder_id=?", (folder_id,))]
-        self.delete_photos(photo_ids)
+        deleted = self.delete_photos(photo_ids)
         self.x("DELETE FROM folders WHERE id=?", (folder_id,))
         self.cleanup_people()
+        return deleted
 
     # ---- photos --------------------------------------------------------------
-    def delete_photos(self, photo_ids: list[int]) -> None:
+    def delete_photos(self, photo_ids: list[int]) -> tuple[list[int], list[int]]:
+        """Delete photos with their faces, thumbnails and crops; returns the deleted (photo ids, face ids)."""
         if not photo_ids:
-            return
+            return [], []
         face_ids: list[int] = []
         with self.transaction():
             for chunk in _chunks(photo_ids, 500):
                 marks = ",".join("?" * len(chunk))
                 face_ids += [r[0] for r in self.q(f"SELECT id FROM faces WHERE photo_id IN ({marks})", chunk)]
                 self.x(f"DELETE FROM photos WHERE id IN ({marks})", chunk)
-        for pid in photo_ids:
-            _unlink(config.thumb_path(pid))
-        for fid in face_ids:
-            _unlink(config.face_crop_path(fid))
+        # The files go after the commit, in short locked chunks, so thousands of deletes never hold the write
+        # lock for long. SQLite hands the highest deleted ids to the next new rows: a chunk skips ids the other
+        # connection has reused (a face tagged in the viewer keeps its new crop), and the lock keeps a new row
+        # from taking one between that check and the delete.
+        for table, ids, path_of in (("photos", photo_ids, config.thumb_path), ("faces", face_ids, config.face_crop_path)):
+            for chunk in _chunks(ids, 200):
+                with self.transaction():
+                    reused = self._existing(table, chunk)
+                    for i in chunk:
+                        if i not in reused:
+                            _unlink(path_of(i))
+        return photo_ids, face_ids
+
+    def _existing(self, table: str, ids: list[int]) -> set[int]:
+        return {r[0] for r in self.q(f"SELECT id FROM {table} WHERE id IN ({','.join('?' * len(ids))})", ids)}
 
     def photos(self, person_ids: list[int] | None = None) -> list[Photo]:
         """All photos newest first; optionally only photos containing *all* given people."""
@@ -303,7 +327,7 @@ class Database:
                 _unlink(config.face_crop_path(fid))
 
     def clear_photo_faces(self, photo_id: int) -> None:
-        """Delete every face of a photo (it changed, or is being analyzed again), crop files included."""
+        """Delete every face of a photo, crop files included."""
         with self.transaction():
             self.delete_faces([r[0] for r in self.q("SELECT id FROM faces WHERE photo_id=?", (photo_id,))])
 
@@ -339,7 +363,8 @@ class Database:
             return np.empty(0, np.int64), np.empty(0, np.int64), np.empty((0, 128), np.float32)
         ids = np.fromiter((r[0] for r in rows), np.int64, len(rows))
         pids = np.fromiter((r[1] if r[1] is not None else -1 for r in rows), np.int64, len(rows))
-        embs = np.stack([from_blob(r[2]) for r in rows])
+        # One buffer instead of one array per face: grouping reads every face's embedding on each pass.
+        embs = np.frombuffer(b"".join(r[2] for r in rows), np.float32).reshape(len(rows), -1)
         return ids, pids, embs
 
     # ---- people --------------------------------------------------------------
@@ -398,9 +423,14 @@ class Database:
             self.x("UPDATE faces SET person_id=NULL, assigned_by='user' WHERE person_id=?", (person_id,))
             self.x("DELETE FROM people WHERE id=?", (person_id,))
 
+    # The correction methods below run as one transaction each (cleanup included), so a click that hits a
+    # busy library saves all of it or none of it. Faces deleted by a rescan since the screen was drawn are
+    # skipped rather than failing the whole batch.
     def assign_faces(self, face_ids: list[int], person_id: int) -> None:
         """User correction: these faces belong to ``person_id``."""
         with self.transaction():
+            if self.one("SELECT 1 FROM people WHERE id=?", (person_id,)) is None:
+                raise PersonGone(person_id)
             for fid in face_ids:
                 row = self.one("SELECT person_id FROM faces WHERE id=?", (fid,))
                 if row is None:
@@ -410,7 +440,7 @@ class Database:
                     self.x("INSERT OR IGNORE INTO rejections(face_id, person_id) VALUES(?,?)", (fid, old))
                 self.x("DELETE FROM rejections WHERE face_id=? AND person_id=?", (fid, person_id))
                 self.x("UPDATE faces SET person_id=?, assigned_by='user', ignored=0 WHERE id=?", (person_id, fid))
-        self.cleanup_people()
+            self.cleanup_people()
 
     def unassign_faces(self, face_ids: list[int]) -> None:
         """User correction: these faces are *not* the person they are currently assigned to."""
@@ -422,20 +452,22 @@ class Database:
                 if row[0] is not None:
                     self.x("INSERT OR IGNORE INTO rejections(face_id, person_id) VALUES(?,?)", (fid, row[0]))
                 self.x("UPDATE faces SET person_id=NULL, assigned_by='user' WHERE id=?", (fid,))
-        self.cleanup_people()
+            self.cleanup_people()
 
     def reject_faces(self, face_ids: list[int], person_id: int) -> None:
         """User said 'no' to a suggestion: never auto-assign these faces to ``person_id``."""
         with self.transaction():
             for fid in face_ids:
-                self.x("INSERT OR IGNORE INTO rejections(face_id, person_id) VALUES(?,?)", (fid, person_id))
+                self.x("INSERT OR IGNORE INTO rejections(face_id, person_id) SELECT ?, ? "
+                       "WHERE EXISTS(SELECT 1 FROM faces WHERE id=?) AND EXISTS(SELECT 1 FROM people WHERE id=?)",
+                       (fid, person_id, fid, person_id))
 
     def ignore_faces(self, face_ids: list[int]) -> None:
         """User said 'not a face' (or doesn't want it tracked)."""
         with self.transaction():
             for fid in face_ids:
                 self.x("UPDATE faces SET ignored=1, person_id=NULL, assigned_by='user' WHERE id=?", (fid,))
-        self.cleanup_people()
+            self.cleanup_people()
 
     def cleanup_people(self) -> None:
         """Delete unnamed people with no faces and fix stale cover faces."""
@@ -468,8 +500,14 @@ class _Tx:
         if self.nested:
             return False
         if exc_type is None:
-            self.conn.execute("COMMIT")
-        else:
+            try:
+                self.conn.execute("COMMIT")
+            except sqlite3.Error:
+                # Never leave the transaction open: every later write would join it and never be saved.
+                if self.conn.in_transaction:
+                    self.conn.execute("ROLLBACK")
+                raise
+        elif self.conn.in_transaction:
             self.conn.execute("ROLLBACK")
         return False
 

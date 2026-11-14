@@ -1,5 +1,7 @@
 # Builds dist\RulZ Image Organizer\RulZ Image Organizer.exe
-# Usage:  powershell -ExecutionPolicy Bypass -File .\build.ps1
+# Usage:  powershell -ExecutionPolicy Bypass -File .\build.ps1 [-Test]
+# -Test runs the test suite first (always on in GitHub Actions, where a failure stops the release).
+param([switch]$Test)
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
@@ -25,6 +27,12 @@ foreach ($m in @("person_detection_mediapipe", "pose_estimation_mediapipe")) {
 }
 if (-not (Test-Path "$models\emotion-ferplus-8.onnx")) {
     Invoke-WebRequest "https://media.githubusercontent.com/media/onnx/models/main/validated/vision/body_analysis/emotion_ferplus/model/emotion-ferplus-8.onnx" -OutFile "$models\emotion-ferplus-8.onnx"
+}
+
+if ($Test -or $env:GITHUB_ACTIONS -eq "true") {
+    .\.venv\Scripts\python.exe -m pip install --quiet pytest
+    .\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider tests
+    if ($LASTEXITCODE) { exit $LASTEXITCODE }
 }
 
 .\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean RulZImageOrganizer.spec

@@ -66,6 +66,7 @@ class MainWindow(QMainWindow):
         self._refresh_timer = QTimer(self, singleShot=True, interval=REFRESH_MS)
         self._refresh_timer.timeout.connect(self._scheduled_refresh)
         self.scanner.changed.connect(self._schedule_refresh)
+        self.scanner.rewritten.connect(self._files_rewritten)
         self.scanner.progress.connect(self._progress)
         self.scanner.started.connect(self._scan_started)
         self.scanner.finished.connect(self._scan_finished)
@@ -230,6 +231,13 @@ class MainWindow(QMainWindow):
         if not quiet:
             self._refresh_visible()
 
+    def reload_after_conflict(self):
+        """An edit failed because a scan or regroup changed what it referred to: show the current state,
+        in the viewer too (pages are refreshed when it closes)."""
+        self.data_changed()
+        if self.root.currentWidget() is self.viewer and self.viewer.ids:
+            self.viewer._load_faces()
+
     def _schedule_refresh(self):
         self.data_version += 1  # the scanner changed something
         ThumbLoader.instance().failed.clear()  # thumbnails that didn't exist yet may exist now
@@ -238,6 +246,16 @@ class MainWindow(QMainWindow):
         interval = SCAN_REFRESH_MS if self.scanner.running and self._scan_stats is not None else REFRESH_MS
         if not self._refresh_timer.isActive() or self._refresh_timer.remainingTime() > interval:
             self._refresh_timer.start(interval)
+
+    @staticmethod
+    def _files_rewritten(photo_ids: list, face_ids: list):
+        """The scanner wrote new thumbnails / face crops: cached copies under the same name are stale (an
+        edited or rotated photo keeps its id, and a new face can get a deleted face's id)."""
+        loader = ThumbLoader.instance()
+        for pid in photo_ids:
+            loader.invalidate(config.thumb_file(pid))
+        for fid in face_ids:
+            loader.invalidate(config.face_crop_file(fid))
 
     def _scheduled_refresh(self):
         if self.scanner.running:
@@ -262,6 +280,8 @@ class MainWindow(QMainWindow):
     # ---- scan status -----------------------------------------------------------
     def _scan_started(self):
         self._scan_stats = None
+        if self._closing:
+            return  # a confirmed folder removal still runs; keep saying "Finishing…"
         self.side_progress.show()
         self.side_progress.setRange(0, 0)
         self.side_status.setText("Scanning…")
