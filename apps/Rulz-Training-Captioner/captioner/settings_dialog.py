@@ -2,7 +2,7 @@ import os
 import shutil
 import sys
 
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
+from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
                                QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
                                QRadioButton, QSpinBox, QTabWidget, QVBoxLayout, QWidget)
 
@@ -86,7 +86,7 @@ class SettingsDialog(QDialog):
             v.addWidget(QLabel("nvidia-smi not found — no GPU selection; llama-server will choose its own devices."))
         self.gpu_checks = []
         for idx, name, mem in self.gpus:
-            c = QCheckBox(f"GPU {idx}: {name}  ({mem / 1024:.0f} GB)")
+            c = QCheckBox(f"GPU {idx}: {name}" + (f"  ({mem / 1024:.0f} GB)" if mem else ""))
             # Show what will run. These used to all show ticked when none were saved, but no GPU saved
             # runs one llama-server that picks its own GPUs, and pressing OK then saved them all ticked,
             # quietly switching to one server per GPU in Parallel mode.

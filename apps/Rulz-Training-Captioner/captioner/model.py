@@ -3,6 +3,7 @@ import functools
 import os
 import re
 import threading
+import time
 from collections import OrderedDict
 from pathlib import Path
 
@@ -48,6 +49,10 @@ def sort_key(p):
     return _folder_key(folder), tuple(_natural(name))
 
 
+def _has_text(caption):
+    return 1 if caption.strip() else 0
+
+
 def caption_path(img_path):
     return str(Path(img_path).with_suffix(".txt"))
 
@@ -62,7 +67,13 @@ def caption_clashes(paths):
 
 def decode_caption(data):
     """UTF-8 (with or without BOM); captions saved by older Windows tools in the ANSI code page
-    still read correctly instead of turning into replacement characters."""
+    still read correctly instead of turning into replacement characters, and so do Notepad's
+    "Unicode" (UTF-16 with a BOM) files, which cp1252 turned into letters with NULs between them."""
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        try:
+            return data.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
     try:
         return data.decode("utf-8-sig")
     except UnicodeDecodeError:
@@ -74,17 +85,59 @@ def decode_caption(data):
 
 
 def read_caption(img_path):
+    """(caption, True), or ("", False) when there is no caption file. A caption file that is there but
+    can't be read (locked, no permission, a folder of that name) raises OSError: treating it as
+    missing let Caption All with "skip existing" caption the image and overwrite the file."""
     cp = caption_path(img_path)
     try:
         with open(cp, "rb") as f:
             return decode_caption(f.read()), True
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
         return "", False
 
 
+REPLACE_TRIES = 3        # a program reading the caption file (a trainer) blocks replacing it meanwhile
+REPLACE_WAIT = 0.05      # (on the UI thread, so short)
+
+
+def _write_in_place(path, data):
+    with open(path, "wb") as f:
+        f.write(data)
+
+
 def write_caption(img_path, text):
-    with open(caption_path(img_path), "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
+    """Write the caption file as a new file next to it, then swap it in. Writing in place emptied the
+    old caption first, so a full disk, a dropped network share or a crash part way left it empty or
+    cut short. Where swapping can't work, it is written in place as before: another program keeps the
+    file open without allowing that, the folder allows writing but not deleting, or the longer
+    temporary name is over Windows' path limit."""
+    path = caption_path(img_path)
+    if os.path.isfile(path) and not os.access(path, os.W_OK):  # read-only: no point in retrying
+        raise PermissionError(13, "The caption file is read-only", path)
+    data = text.encode("utf-8")
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        try:
+            with open(tmp, "wb") as f:
+                f.write(data)
+                if data:  # or the swap can reach the disk before the text does (a power cut)
+                    f.flush()
+                    os.fsync(f.fileno())
+        except (PermissionError, FileNotFoundError):  # can't create it (a full disk is raised)
+            return _write_in_place(path, data)
+        for attempt in range(REPLACE_TRIES):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt + 1 < REPLACE_TRIES:
+                    time.sleep(REPLACE_WAIT)
+        _write_in_place(path, data)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def _is_image(name):
@@ -94,7 +147,7 @@ def _is_image(name):
 def collect_images(paths, recursive=False, unreadable=None, listing=None):
     """Image files in `paths` (files, or folders and optionally their subfolders). Folders that can't
     be listed are skipped and appended to `unreadable` when given. When `listing` is a dict, it gets
-    {normcase(folder): normcase'd names of the files in it} for every folder listed, which
+    {normcase(folder): normcase'd names of everything in it} for every folder listed, which
     load_entries() uses to skip opening caption files that don't exist."""
     out = []
     folders = []
@@ -109,9 +162,10 @@ def collect_images(paths, recursive=False, unreadable=None, listing=None):
         try:
             with os.scandir(d) as it:  # on Windows the listing already says file or folder: no stat per file
                 for e in it:
+                    # every name, folders too: a folder called photo.txt is a caption that can't be read
+                    names.add(os.path.normcase(e.name))
                     try:
                         if e.is_file():
-                            names.add(os.path.normcase(e.name))
                             if _is_image(e.name):
                                 out.append(e.path)
                         elif recursive and e.is_dir(follow_symlinks=False):
@@ -149,11 +203,14 @@ def load_entries(paths, progress=None, listing=None):
     for i, p in enumerate(sorted(paths, key=sort_key), 1):
         folder, name = os.path.split(caption_path(p))
         names = listing.get(os.path.normcase(folder)) if listing else None
-        if names is not None and os.path.normcase(name) not in names:
-            cap, has = "", False
-        else:
-            cap, has = read_caption(p)
-        entries.append({"path": p, "caption": cap, "has_file": has, "status": IDLE})
+        e = {"path": p, "caption": "", "has_file": False, "status": IDLE}
+        if names is None or os.path.normcase(name) in names:
+            try:
+                e["caption"], e["has_file"] = read_caption(p)
+            except OSError as err:
+                # there, but unreadable: shown in red, and Caption All leaves it alone
+                e.update(has_file=True, status=ERROR, unreadable=str(err))
+        entries.append(e)
         if progress and i % 500 == 0:
             progress(i)
     return entries
@@ -198,8 +255,10 @@ class ImageModel(QAbstractListModel):
 
     def __init__(self):
         super().__init__()
-        self.items = []          # dicts: path, caption, has_file, status
+        self.items = []          # dicts: path, caption, has_file, status (+ unreadable: error text)
         self.index_of = {}       # path -> row
+        self.captioned = 0       # items with a non-blank caption, kept up to date (counting on every
+                                 # save scanned the whole list: clearing 5,000 of 20,000 took 75 s)
         self.cache = OrderedDict()  # path -> thumbnail QPixmap, least recently drawn first
         self.cache_bytes = 0
         self.pending = set()
@@ -297,6 +356,7 @@ class ImageModel(QAbstractListModel):
         for e in entries:
             self.index_of[e["path"]] = len(self.items)
             self.items.append(e)
+            self.captioned += _has_text(e["caption"])
         self.endInsertRows()
         self.stats_changed.emit()
         return len(entries)
@@ -317,6 +377,7 @@ class ImageModel(QAbstractListModel):
             self.beginRemoveRows(QModelIndex(), lo, hi)
             for it in self.items[lo:hi + 1]:
                 self._uncache(it["path"])
+                self.captioned -= _has_text(it["caption"])
             del self.items[lo:hi + 1]
             self.endRemoveRows()
             k += 1
@@ -325,15 +386,19 @@ class ImageModel(QAbstractListModel):
 
     def clear(self):
         self.beginResetModel()
-        self.items, self.index_of = [], {}
+        self.items, self.index_of, self.captioned = [], {}, 0
         self.cache.clear()
         self.cache_bytes = 0
         self.endResetModel()
         self.stats_changed.emit()
 
-    def set_caption(self, row, text, force=False):
+    def set_caption(self, row, text, force=False, stats=True):
+        """Save `text` as the caption of `row`. stats=False leaves stats_changed to the caller, for
+        many captions at once."""
         it = self.items[row]
         text = text.strip("\r\n") if text.strip() else ""
+        if it.get("unreadable"):
+            self._recheck_unreadable(row, text)
         if text == it["caption"] and it["has_file"] and not force:
             return False
         if text == it["caption"] and not it["has_file"] and not text and not force:
@@ -344,12 +409,41 @@ class ImageModel(QAbstractListModel):
             it["status"] = ERROR
             self._changed(row)
             raise RuntimeError(f"Could not write {caption_path(it['path'])}: {e}")
-        it["caption"], it["has_file"] = text, True
+        self._store(it, text)
         if it["status"] in (BUSY, QUEUED, ERROR):
             it["status"] = IDLE
         self._changed(row)
-        self.stats_changed.emit()
+        if stats:
+            self.stats_changed.emit()
         return True
+
+    def _recheck_unreadable(self, row, text):
+        """Before replacing a caption file that couldn't be read: it is shown empty, so the user would
+        overwrite a caption they never saw. Raises unless it is gone, empty, or holds `text` already."""
+        it = self.items[row]
+        cp = caption_path(it["path"])
+        try:
+            disk, exists = read_caption(it["path"])
+        except OSError as e:
+            raise RuntimeError(f"Couldn't read {cp}, so it wasn't replaced: {e}")
+        if exists and disk.strip() and disk != text:
+            self.show_caption(row, disk)
+            raise RuntimeError(f"{cp} couldn't be read when it was added, but it can now and it holds a "
+                               "caption, which is now shown. Nothing was saved: edit that caption instead.")
+        it.pop("unreadable", None)
+
+    def show_caption(self, row, text):
+        """Show `text`, read from the caption file, without writing it (the file changed on disk)."""
+        it = self.items[row]
+        self._store(it, text)
+        it["status"] = IDLE
+        self._changed(row)
+        self.stats_changed.emit()
+
+    def _store(self, it, text):
+        self.captioned += _has_text(text) - _has_text(it["caption"])
+        it["caption"], it["has_file"] = text, True
+        it.pop("unreadable", None)
 
     def set_status(self, path, status):
         row = self.index_of.get(path)
@@ -357,12 +451,32 @@ class ImageModel(QAbstractListModel):
             self.items[row]["status"] = status
             self._changed(row)
 
+    def set_statuses(self, rows, status, only=None):
+        """set_status for many rows, with one change signal per run of rows instead of one per row
+        (0.31 s for 20,000 at the start and again at the end of every big job). With `only`, rows
+        whose status isn't in it are left as they are."""
+        changed = []
+        for row in rows:
+            it = self.items[row]
+            if it["status"] != status and (only is None or it["status"] in only):
+                it["status"] = status
+                changed.append(row)
+        changed.sort()
+        k = 0
+        while k < len(changed):
+            lo = hi = changed[k]
+            while k + 1 < len(changed) and changed[k + 1] == hi + 1:
+                k += 1
+                hi = changed[k]
+            self.dataChanged.emit(self.index(lo), self.index(hi), [StatusRole])
+            k += 1
+
     def _changed(self, row):
         i = self.index(row)
         self.dataChanged.emit(i, i)
 
     def captioned_count(self):
-        return sum(1 for it in self.items if it["caption"].strip())
+        return self.captioned
 
 
 class FilterProxy(QSortFilterProxyModel):

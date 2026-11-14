@@ -1,6 +1,7 @@
 """llama.cpp server management and the multi-worker captioning engine."""
 import atexit
 import base64
+import ipaddress
 import os
 import queue
 import re
@@ -10,6 +11,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlsplit
 
 import requests
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QObject, Qt, Signal
@@ -41,6 +43,28 @@ def port_in_use(port, host="127.0.0.1"):
 
 class StartCancelled(RuntimeError):
     """Server start was stopped by the user (not a failure)."""
+
+
+def is_loopback(url):
+    """True for a server on this computer (localhost, 127.x.x.x, ::1)."""
+    host = (urlsplit(url).hostname or "").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def local_session(url="http://127.0.0.1"):
+    """A requests session that, for a server on this computer, ignores proxy settings. requests
+    takes the system proxy from Windows' settings or HTTP_PROXY, and Windows' "don't use the proxy
+    for local addresses" doesn't cover 127.0.0.1 there, so every request to a local llama-server
+    went to the proxy: the health check never passed and the app gave up after 15 minutes."""
+    session = requests.Session()
+    if is_loopback(url):
+        session.trust_env = False
+    return session
 
 
 # --------------------------------------------------------------------------- servers
@@ -80,20 +104,32 @@ class ServerManager:
         env.update(env_over)
         return env
 
-    def start(self, s, log, progress=None):
-        """Start servers and block until all report healthy. Returns endpoint list.
-
-        Raises StartCancelled when stop()/cancel() is called meanwhile. On any failure the
-        processes this call launched are killed here, so the caller doesn't need to stop()
-        (which could kill servers a newer start already launched)."""
-        self.stop()
+    def begin(self):
+        """Claim the next start and return its ticket for start(). From here on, a Stop
+        (cancel()/stop()) cancels that start. Call it where Stop is handled (the UI thread) before
+        handing start() to another thread: resetting the stop flag inside start() wiped out a Stop
+        pressed before that thread got going, or while the old servers were being killed (up to 10 s)."""
         with self._lock:
             self._stop = False
             self._gen += 1
-            gen = self._gen
+            old, self.procs, self.endpoints = self.procs, [], []
+            return self._gen, old
+
+    def start(self, s, log, progress=None, ticket=None):
+        """Start servers and block until all report healthy. Returns endpoint list.
+
+        Raises StartCancelled when stop()/cancel() is called meanwhile (after begin(), when a ticket
+        is passed). On any failure the processes this call launched are killed here, so the caller
+        doesn't need to stop() (which could kill servers a newer start already launched)."""
+        gen, old = ticket if ticket is not None else self.begin()
+        self._kill([p for p, _ in old])  # the servers this start replaces
         procs, endpoints = [], []
         try:
-            return self._start(s, log, progress, gen, procs, endpoints)
+            eps = self._start(s, log, progress, gen, procs, endpoints)
+            with self._lock:
+                if self._cancelled(gen):  # stopped after the last health check: don't report ready
+                    raise StartCancelled("Cancelled")
+            return eps
         except BaseException:
             self._kill([p for p, _ in procs])
             with self._lock:
@@ -115,6 +151,9 @@ class ServerManager:
         slots = max(1, int(s["slots_per_server"]))
         extra = shlex.split(s["extra_args"], posix=False) if s["extra_args"].strip() else []
         extra = [a.strip('"') for a in extra]
+        if not s["mmproj"]:
+            log("note: no vision projector (mmproj) is set; without it most models can't see the images "
+                "and every image fails. Set it in Settings ▸ Backend.")
         plan = self.build_plan(s)
         busy = [port for port, _, _ in plan if port_in_use(port)]
         if busy:
@@ -154,27 +193,28 @@ class ServerManager:
 
         deadline = time.time() + 900
         pending = list(range(len(procs)))
-        while pending:
-            if self._cancelled(gen):
-                raise StartCancelled("Cancelled")
-            if time.time() > deadline:
-                raise RuntimeError("Timed out waiting for llama-server to load the model.")
-            for i in list(pending):
-                p, tail = procs[i]
-                if p.poll() is not None:
-                    if self._cancelled(gen):  # killed by stop(), not a crash
-                        raise StartCancelled("Cancelled")
-                    raise RuntimeError("llama-server exited (code %s):\n%s" % (p.returncode, "\n".join(tail[-12:])))
-                url = endpoints[i]["url"].replace("/v1", "/health")
-                try:
-                    if requests.get(url, timeout=2).status_code == 200:
-                        pending.remove(i)
-                        log(f"[{endpoints[i]['name']}] ready")
-                except requests.RequestException:
-                    pass
-            if progress:
-                progress(len(procs) - len(pending), len(procs))
-            time.sleep(1)
+        with local_session() as health:
+            while pending:
+                if self._cancelled(gen):
+                    raise StartCancelled("Cancelled")
+                if time.time() > deadline:
+                    raise RuntimeError("Timed out waiting for llama-server to load the model.")
+                for i in list(pending):
+                    p, tail = procs[i]
+                    if p.poll() is not None:
+                        if self._cancelled(gen):  # killed by stop(), not a crash
+                            raise StartCancelled("Cancelled")
+                        raise RuntimeError("llama-server exited (code %s):\n%s" % (p.returncode, "\n".join(tail[-12:])))
+                    url = endpoints[i]["url"].replace("/v1", "/health")
+                    try:
+                        if health.get(url, timeout=2).status_code == 200:
+                            pending.remove(i)
+                            log(f"[{endpoints[i]['name']}] ready")
+                    except requests.RequestException:
+                        pass
+                if progress:
+                    progress(len(procs) - len(pending), len(procs))
+                time.sleep(0.25)
         return list(endpoints)
 
     @staticmethod
@@ -233,6 +273,8 @@ def external_endpoints(s):
     out = []
     for line in s["external_urls"].replace(",", "\n").splitlines():
         u = line.strip().rstrip("/")
+        if u.endswith("/chat/completions"):  # the full request URL pasted from a server's docs
+            u = u[:-len("/chat/completions")].rstrip("/")
         if u:
             if not u.endswith("/v1"):
                 u += "/v1"
@@ -242,6 +284,10 @@ def external_endpoints(s):
 
 
 # --------------------------------------------------------------------------- captioning
+# formats every JPEG decoder reads the same way (3-channel colour, or grey)
+JPEG_READY_FORMATS = (QImage.Format_RGB32, QImage.Format_RGB888, QImage.Format_Grayscale8)
+
+
 def encode_image(path, max_side):
     """Load (honouring EXIF), downscale and return base64 JPEG."""
     r = QImageReader(path)
@@ -262,6 +308,11 @@ def encode_image(path, max_side):
         pt.drawImage(0, 0, img)
         pt.end()
         img = flat
+    elif img.format() not in JPEG_READY_FORMATS:
+        # Qt 6.8+ reads CMYK JPEGs (print and stock photos) as CMYK and would save them that way, and
+        # decoders disagree on CMYK JPEGs (stb_image, used by llama.cpp, expects Adobe's inverted ink
+        # values), so the server could see other colours than the thumbnail shows. Send plain RGB.
+        img = img.convertToFormat(QImage.Format_RGB32)
     ba = QByteArray()
     buf = QBuffer(ba)
     buf.open(QIODevice.WriteOnly)
@@ -305,7 +356,9 @@ def is_retryable(exc):
     reply that took the whole 15-minute read timeout: three more tries could hold one image for an hour."""
     if isinstance(exc, HTTPStatusError):
         return exc.status in RETRY_STATUSES or 500 <= exc.status <= 599
-    if isinstance(exc, requests.ReadTimeout):
+    # a 200 reply that isn't JSON (a web page at that URL) comes back the same every time; requests
+    # files it under RequestException, so it was asked four times for each image
+    if isinstance(exc, (requests.ReadTimeout, requests.exceptions.InvalidJSONError)):
         return False
     return isinstance(exc, requests.RequestException)
 
@@ -404,6 +457,7 @@ class CaptionEngine(QObject):
         self._running = 0
         self._names = set()   # every endpoint of the job
         self._down = set()    # endpoints that stopped responding
+        self._dropped = set()  # paths taken off the list during the job: not worth the GPU time
         self.active = False
         self.stop_reason = ""  # set when the engine stopped the job itself (no server responding)
 
@@ -418,7 +472,7 @@ class CaptionEngine(QObject):
         for p in paths:
             self._q.put(p)
         self._done, self._total = 0, len(paths)
-        self._names, self._down = {ep["name"] for ep in endpoints}, set()
+        self._names, self._down, self._dropped = {ep["name"] for ep in endpoints}, set(), set()
         self.active = True
         self.progress.emit(0, self._total)
         self._threads = []
@@ -432,18 +486,36 @@ class CaptionEngine(QObject):
     def cancel(self):
         self._cancel.set()
 
+    def drop(self, paths):
+        """Skip `paths` if they are still waiting (they were removed from the list); requests already
+        on their way finish, and the window ignores their results."""
+        with self._lock:
+            self._dropped.update(paths)
+
+    def is_dropped(self, path):
+        """True when `path` was removed from the list during this job (its result is unwanted, even if
+        the image was added again since)."""
+        return path in self._dropped
+
     def _take(self, pool, max_side):
         """Next queued path and a future encoding it, or None when done/cancelled."""
-        if self._cancel.is_set():
-            return None
-        try:
-            path = self._q.get_nowait()
-        except queue.Empty:
-            return None
-        return path, pool.submit(encode_image, path, max_side)
+        while not self._cancel.is_set():
+            try:
+                path = self._q.get_nowait()
+            except queue.Empty:
+                return None
+            with self._lock:
+                dropped = path in self._dropped
+                if dropped:
+                    self._done += 1
+                    done = self._done
+            if not dropped:
+                return path, pool.submit(encode_image, path, max_side)
+            self.progress.emit(done, self._total)
+        return None
 
     def _worker(self, ep, system, user, s):
-        session = requests.Session()
+        session = local_session(ep["url"])
         max_side = int(s["max_image_side"])
         last = False
         try:
@@ -514,6 +586,10 @@ class CaptionEngine(QObject):
                 nxt[1].cancel()
             self.warning.emit("", f"{ep['name']} stopped responding; the other server(s) take over its images. ({err})")
             return True
+        if self._cancel.is_set():
+            # the last other server went down too and stopped the job meanwhile (it left, so the
+            # hand-back above found nobody): the image stays uncaptioned, like the others
+            return False
         # every other worker already finished (the queue was empty): nobody to hand this image to
         self.failed.emit(path, str(err))
         return False

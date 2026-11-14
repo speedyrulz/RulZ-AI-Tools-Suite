@@ -105,10 +105,22 @@ class CardDelegate(QStyledItemDelegate):
         return CaptionEditor(parent)
 
     def setEditorData(self, editor, index):
-        editor.setPlainText(index.data(Qt.EditRole))
+        # Qt calls this again for every change to the row (its thumbnail arriving, its status dot), not
+        # only when the editor opens; reloading then wiped whatever was being typed. Load the caption
+        # when it is new to the editor, and never over typing.
+        text = index.data(Qt.EditRole)
+        if editor.property("loaded") == text or editor.document().isModified():
+            return
+        editor.setProperty("loaded", text)
+        editor.setPlainText(text)
         editor.moveCursor(QTextCursor.End)
 
     def setModelData(self, editor, model, index):
+        # Only what was typed is saved. The editor turns CRLF into LF and non-breaking spaces into
+        # spaces, so committing an untouched editor rewrote the file and, during a job, looked like an
+        # edit made meanwhile: the new model caption was thrown away.
+        if not editor.document().isModified():
+            return
         try:
             model.setData(index, editor.toPlainText(), Qt.EditRole)
         except RuntimeError as e:
