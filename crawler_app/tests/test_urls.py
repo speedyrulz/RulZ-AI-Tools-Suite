@@ -9,6 +9,7 @@ from crawler_app.urls import (
     normalize_page_url,
     in_path_scope,
     original_candidates,
+    page_key,
     path_scope,
     site_key,
     sniff_image,
@@ -34,6 +35,18 @@ def test_image_url_keeps_query_verbatim():
 def test_site_key_treats_www_as_same_site():
     assert site_key("https://www.example.com/x") == site_key("http://example.com/") == "example.com"
     assert site_key("https://shop.example.com/") != "example.com"
+
+
+def test_page_key_is_one_page_across_scheme_and_www_but_not_ports():
+    assert page_key("https://example.com/a?x=1") == page_key("http://www.example.com/a?x=1")
+    assert page_key("https://example.com/a") != page_key("https://example.com/a?x=1")
+    assert page_key("http://example.com:443/a") != page_key("http://example.com/a")  # 443 is only https's default
+    assert page_key("http://example.com:8080/a") != page_key("http://example.com/a")
+
+
+def test_ipv6_hosts_keep_their_brackets():
+    assert normalize_page_url("http://[::1]:8000/a#x") == "http://[::1]:8000/a"
+    assert normalize_image_url("https://[2001:db8::1]/p.jpg") == "https://[2001:db8::1]/p.jpg"
 
 
 def test_path_scope_is_the_start_folder():

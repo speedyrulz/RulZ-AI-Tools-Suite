@@ -96,7 +96,7 @@ res = await svc.classify([ImageInput("a", data_b64=b64)],
 | Stage | Behaviour |
 |---|---|
 | Input | Uses base64 bytes if given. Otherwise fetches the URL server-side (10 s timeout, browser User-Agent). A failed fetch errors that image only. |
-| Preprocess | Applies EXIF rotation and takes the first frame of animations. Skips the image if the short edge is under 96 px. Shrinks the long edge to `MAX_EDGE` without ever upscaling. Re-encodes as JPEG q90, or PNG if there is real transparency. |
+| Preprocess | Applies EXIF rotation and takes the first frame of animations. 16-bit grayscale (and 32-bit) images are scaled to 8 bits. Skips the image if the short edge is under `MIN_SHORT_EDGE` (96 px). Shrinks the long edge to `MAX_EDGE` without ever upscaling. Re-encodes as JPEG q90, or PNG if there is real transparency. |
 | Identity | SHA-256 of the re-encoded bytes. |
 | Cache | SQLite `(image_hash, rubric_hash, model_id)` → result. Only `ok` answers are cached. Tags that the model left out of its answer ("missing") are not cached. Editing a rubric invalidates only that tag. |
 | Prompting | One image per call with up to `MAX_TAGS_PER_CALL` rubrics. Uses the verbatim system prompt from the spec. The user message lists the exact keys the answer must contain. Sends `temperature 0`, `max_tokens = 60 + 40×tags`, and a `json_schema` response_format so llama.cpp's grammar sampler enforces valid JSON. |
@@ -109,7 +109,7 @@ res = await svc.classify([ImageInput("a", data_b64=b64)],
 |---|---|---|
 | `LLAMA_URL` | `http://127.0.0.1:8080` | llama-server base URL |
 | `LLAMA_PARALLEL` | `2` | must equal llama-server `--parallel` |
-| `LLAMA_URLS` | (unset) | several llama-servers, comma-separated (e.g. one per GPU); work goes to the least busy, and a server that stops answering is skipped while the others carry on |
+| `LLAMA_URLS` | (unset) | several llama-servers, comma-separated (e.g. one per GPU); work goes to the least busy, and a server that stops answering (or takes a request and doesn't answer within `LLAMA_TIMEOUT_S`) is skipped for 15 s while the others carry on; the image it held is tried on another |
 | `CONFIDENCE_FROM_LOGPROBS` | `1` | confidence = the model's probability of its true/false answer (from token log-probabilities) instead of the number it writes; `0` turns it off |
 | `LLAMA_TIMEOUT_S` | `60` | per model request |
 | `MAX_EDGE` | `1024` | 768 is about 40% faster but loses hand and hair detail. Use 1280 only for fine-detail tags. Changing it changes image hashes, so the cache misses. |
@@ -125,7 +125,7 @@ res = await svc.classify([ImageInput("a", data_b64=b64)],
 ## Tests
 
 ```powershell
-python -m pytest                      # 21 unit tests against a fake llama-server; no GPU needed
+python -m pytest                      # 55 unit tests against a fake llama-server; no GPU needed
 python scripts\acceptance.py          # live checklist against the running service + model
 python scripts\eval_labeled.py        # precision/recall per tag on tests\labeled\
 python scripts\eval_labeled.py --yes F:\yes --no F:\no --text "women with blonde hair"   # folder mode

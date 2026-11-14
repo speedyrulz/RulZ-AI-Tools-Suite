@@ -5,13 +5,16 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import dataclasses
+import email.utils
 import hashlib
 import io
 import time
 import warnings
 from dataclasses import dataclass
-from typing import Callable
+from datetime import datetime, timezone
+from typing import AsyncIterator, Callable
 from urllib.parse import urlsplit
 
 from PIL import Image, features
@@ -94,12 +97,32 @@ class HostGate:
         while (left := self._hold_until.get(host, 0.0) - time.monotonic()) > 0:
             await asyncio.sleep(left)
 
+    @contextlib.asynccontextmanager
+    async def slot_after_hold(self, host: str) -> AsyncIterator[None]:
+        """A download slot for `host`, taken only when the host is not on hold. The hold is checked
+        again once the slot is ours: requests queued behind a full host would otherwise all go out
+        the moment a 429 started the hold, and each get another 429."""
+        while True:
+            await self.wait_hold(host)
+            async with self.slot(host):
+                if not self.holding(host):
+                    yield
+                    return
+
 
 def _retry_after(value: str | None) -> float:
+    """Seconds to wait from a Retry-After header: delay-seconds or an HTTP date, kept within 5 s - 15 min."""
     try:
-        return min(900.0, max(5.0, float(value)))
+        seconds = float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
+        try:
+            when = email.utils.parsedate_to_datetime(value)  # type: ignore[arg-type]
+            seconds = (when - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return 60.0
+    if seconds != seconds:  # NaN
         return 60.0
+    return min(900.0, max(5.0, seconds))
 
 
 @dataclass(frozen=True)
@@ -170,9 +193,10 @@ async def fetch_image(
         if guess and gate.cooling(host):
             continue
         for attempt in (1, 2):
-            await gate.wait_hold(host)
             try:
-                async with gate.slot(host):
+                async with gate.slot_after_hold(host):
+                    if guess and gate.cooling(host):  # a 429 arrived while this waited for a slot
+                        break
                     img = await _fetch_one(context, url, cand.page, timeout_s, max_bytes)
             except RateLimited as e:
                 gate.limited(host, e.retry_after_s, hold=not guess)

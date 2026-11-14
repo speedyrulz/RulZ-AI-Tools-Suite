@@ -37,6 +37,8 @@ class FakeLlama:
         self.requests: list[dict] = []
         self.queue: list = []  # items: str content, (content, finish_reason), or Exception
         self.down = False
+        self.stalled = False  # takes chat requests but never answers (httpx.ReadTimeout)
+        self.model_path = "C:/models/Test-Q8_0.gguf"
 
     def default(self, body: dict) -> str:
         tag_ids = body["response_format"]["json_schema"]["schema"]["properties"]["results"]["required"]
@@ -51,12 +53,14 @@ class FakeLlama:
         if path == "/health":
             return httpx.Response(200, json={"status": "ok"})
         if path == "/props":
-            return httpx.Response(200, json={"model_path": "C:/models/Test-Q8_0.gguf"})
+            return httpx.Response(200, json={"model_path": self.model_path})
         if path == "/slots":
             return httpx.Response(200, json=[{"is_processing": False}, {"is_processing": True}])
         if path == "/v1/chat/completions":
             body = json.loads(request.content)
             self.requests.append(body)
+            if self.stalled:
+                raise httpx.ReadTimeout("timed out", request=request)
             item = self.queue.pop(0) if self.queue else self.default(body)
             if isinstance(item, Exception):
                 raise item
@@ -126,6 +130,49 @@ def test_resize_never_upscales_and_caps_long_edge():
 def test_transparency_kept_as_png():
     raw = base64.b64decode(png_b64((300, 300), (255, 0, 0, 0), "RGBA"))
     assert prepare_image(raw, 1024, 96).mime == "image/png"
+
+
+def _png(im: Image.Image) -> bytes:
+    buf = io.BytesIO()
+    im.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def test_16bit_grayscale_is_scaled_not_clipped_to_white():
+    from PIL import ImageStat
+
+    w, h = 512, 256
+    im = Image.new("I;16", (w, h))
+    im.putdata([x * 65535 // (w - 1) for x in range(w)] * h)  # black to white, left to right
+    raw = _png(im)
+    assert Image.open(io.BytesIO(raw)).mode == "I;16"
+    p = prepare_image(raw, 1024, 96)
+    out = Image.open(io.BytesIO(p.data)).convert("L")
+    assert 120 < ImageStat.Stat(out).mean[0] < 136  # was ~254: every value above 255 became white
+    lo, hi = out.getextrema()
+    assert lo < 10 and hi > 245
+
+    # big enough for the fast reduce step, which Pillow refuses on I;16 (this used to raise ValueError)
+    big = prepare_image(_png(Image.new("I;16", (7000, 200), 30000)), 1024, 96)
+    assert big.width == 1024
+    assert ImageStat.Stat(Image.open(io.BytesIO(big.data)).convert("L")).mean[0] == pytest.approx(30000 / 256, abs=2)
+
+
+def test_high_bit_depth_modes_to_8bit_others_untouched():
+    from image_detection.preprocess import _to_8bit
+
+    for mode in ("I", "F"):
+        im = Image.new(mode, (256, 1))
+        im.putdata([x * 16 for x in range(256)])  # 0..4080: scaled by 255 / 4080
+        out = _to_8bit(im)
+        assert out.mode == "L" and out.getextrema() == (0, 255)
+        assert out.getpixel((128, 0)) == round(128 * 16 * 255 / 4080)
+    small = Image.new("I", (4, 1))
+    small.putdata([0, 10, 200, 255])  # already within 0..255: values kept
+    assert list(_to_8bit(small).tobytes()) == [0, 10, 200, 255]
+    for mode in ("1", "L", "LA", "P", "RGB", "RGBA", "CMYK"):
+        im = Image.new(mode, (4, 4))
+        assert _to_8bit(im) is im
 
 
 # ---- service behaviour -----------------------------------------------------------------
@@ -363,6 +410,53 @@ def test_without_logprobs_the_written_confidence_is_kept(client):
     assert r["tags"]["red_disc"]["confidence"] == 0.9
 
 
+def _value(tok: dict) -> list[dict]:
+    """Token stream for one tag "a" whose match value token is `tok`."""
+    return [_tok('{"results":{"a":{"match":'), tok, _tok(',"confidence":1.0,"evidence":"x"}}}')]
+
+
+def test_both_answers_listed_normalised_over_the_two():
+    # Unchanged behaviour: variants summed, other tokens ignored, 0.6 / (0.6 + 0.2).
+    probs = match_probabilities(_value(_tok("true", {"true": 0.5, " true": 0.1, "false": 0.2, "yes": 0.1})), ["a"])
+    assert probs["a"] == pytest.approx(0.75)
+
+
+def test_only_one_answer_listed_is_not_certain():
+    # "false" isn't listed: it gets its largest possible probability, here what the list leaves over
+    # (1 - 0.99 = 0.01, below the least likely listed token, 0.03). It used to come out as exactly 1.0.
+    probs = match_probabilities(_value(_tok("true", {"true": 0.9, "maybe": 0.06, "yes": 0.03})), ["a"])
+    assert probs["a"] == pytest.approx(0.9 / 0.91)
+    # here the least likely listed token (0.1) is the tighter bound (1 - 0.6 = 0.4 is left over)
+    probs = match_probabilities(_value(_tok("true", {"true": 0.4, " true": 0.1, "yes": 0.1})), ["a"])
+    assert probs["a"] == pytest.approx(0.5 / 0.6)
+    # and the same the other way round: only "false" listed
+    probs = match_probabilities(_value(_tok("false", {"false": 0.7, "no": 0.2})), ["a"])
+    assert probs["a"] == pytest.approx(0.1 / 0.8)
+    # a list that really holds everything still says certain
+    assert match_probabilities(_value(_tok("true", {"true": 1.0})), ["a"])["a"] == pytest.approx(1.0)
+
+
+def test_without_top_logprobs_confidence_is_the_chosen_tokens_probability(client, fake):
+    import math
+
+    def chosen(token: str, p: float) -> dict:
+        return {"token": token, "logprob": math.log(p)}  # no top_logprobs
+
+    assert match_probabilities(_value(chosen("true", 0.7)), ["a"])["a"] == pytest.approx(0.7)
+    assert match_probabilities(_value(chosen("false", 0.8)), ["a"])["a"] == pytest.approx(0.2)
+
+    tokens = [
+        {"token": '{"results":{"red_disc":{"match":', "logprob": 0.0},
+        chosen("true", 0.7),
+        {"token": ',"confidence":1.0,"evidence":"red"},"blue_square":{"match":', "logprob": 0.0},
+        chosen("false", 0.8),
+        {"token": ',"confidence":1.0,"evidence":"no"}}}', "logprob": 0.0},
+    ]
+    fake.queue = [{"content": "".join(t["token"] for t in tokens), "logprobs": tokens}]
+    r = classify(client, [{"id": "i", "data_b64": png_b64()}], TAGS, threshold=0).json()["results"]["i"]
+    assert r["tags"]["red_disc"]["confidence"] == 0.7 and r["tags"]["blue_square"]["confidence"] == 0.8
+
+
 # ---- several model servers (one per GPU) ------------------------------------------------
 
 
@@ -410,6 +504,40 @@ def test_one_server_down_work_moves_to_the_other(tmp_path):
     fakes[1].down = True
     with pytest.raises(ModelServerDown):
         asyncio.run(svc.classify([ImageInput("x", data_b64=png_b64(color="blue"))], [Tag("red_disc", RUBRIC_A)]))
+
+
+def test_stalled_server_work_moves_to_the_other(tmp_path):
+    import asyncio
+
+    from image_detection.service import ImageInput, Tag
+
+    tag = [Tag("red_disc", RUBRIC_A)]
+    fakes, svc = _two_server_service(tmp_path)
+    fakes[0].stalled = True  # takes the request, never answers
+    out = asyncio.run(svc.classify([ImageInput("a", data_b64=png_b64())], tag))
+    assert out["a"]["status"] == "ok"
+    assert len(fakes[0].requests) == 1 and len(fakes[1].requests) == 1  # tried there first, then moved
+
+    # kept out of rotation for a while: the next images go straight to the other server
+    imgs = [ImageInput(str(i), data_b64=png_b64(color=(0, 0, 40 + i * 20))) for i in range(3)]
+    out = asyncio.run(svc.classify(imgs, tag))
+    assert all(r["status"] == "ok" for r in out.values())
+    assert len(fakes[0].requests) == 1 and len(fakes[1].requests) == 4
+
+    # every server stalled: that image fails on its own, never ModelServerDown (which pauses a crawler run)
+    fakes[1].stalled = True
+    out = asyncio.run(svc.classify([ImageInput("b", data_b64=png_b64(color="blue"))], tag))
+    assert out["b"]["status"] == "error" and "timed out" in out["b"]["message"]
+    asyncio.run(svc.aclose())
+
+
+def test_stalled_single_server_fails_only_the_image(client, fake):
+    fake.stalled = True
+    r = classify(client, [{"id": "i", "data_b64": png_b64()}], TAGS)
+    assert r.status_code == 200
+    res = r.json()["results"]["i"]
+    assert res["status"] == "error" and "timed out" in res["message"]
+    assert len(fake.requests) == 1  # one server: tried once, as before
 
 
 # ---- raw-bytes cache, in-process bytes, faster resize -------------------------------------
@@ -541,3 +669,92 @@ def test_caller_supplied_hash_is_not_computed_again(tmp_path, fake, monkeypatch)
     again = asyncio.run(svc.classify([ImageInput("b", data=raw)], [tag]))["b"]
     assert again["cached"] and hashed == [1]
     asyncio.run(svc.aclose())
+
+
+def test_raising_min_short_edge_skips_a_cached_image(tmp_path, fake):
+    import asyncio
+
+    from image_detection.service import ImageInput, Tag
+
+    s = Settings(cache_path=tmp_path / "cache.sqlite3", llama_url="http://llama", min_short_edge=96)
+    svc = DetectionService(s, llama=LlamaClient(s, httpx.AsyncClient(transport=httpx.MockTransport(fake.handler))))
+    raw, tag = _jpeg((400, 150)), [Tag("red_disc", RUBRIC_A)]
+    assert asyncio.run(svc.classify([ImageInput("a", data=raw)], tag))["a"]["status"] == "ok"
+    assert asyncio.run(svc.classify([ImageInput("a", data=raw)], tag))["a"]["cached"]
+    s.min_short_edge = 200  # the fully cached image must still be checked against the new minimum
+    assert asyncio.run(svc.classify([ImageInput("a", data=raw)], tag))["a"]["status"] == "skipped"
+    assert len(fake.requests) == 1
+    asyncio.run(svc.aclose())
+
+
+# ---- model id after a server restart -------------------------------------------------------
+
+
+def test_model_id_read_again_after_server_restart(tmp_path, fake):
+    import asyncio
+
+    from image_detection.service import ImageInput, Tag
+
+    s = Settings(cache_path=tmp_path / "cache.sqlite3", llama_url="http://llama", model_id=None)
+    svc = DetectionService(s, llama=LlamaClient(s, httpx.AsyncClient(transport=httpx.MockTransport(fake.handler))))
+    img, tag = [ImageInput("a", data=_jpeg((400, 300)))], [Tag("red_disc", RUBRIC_A)]
+
+    async def go():
+        assert (await svc.health())["model"] == "Test-Q8_0"
+        assert not (await svc.classify(img, tag))["a"]["cached"]
+        fake.model_path = "C:/models/Other-Q4_K_M.gguf"
+        # never seen down: the id stays cached (no /props call on every health poll)
+        assert (await svc.health())["model"] == "Test-Q8_0"
+        assert (await svc.classify(img, tag))["a"]["cached"]
+        # restarted with the other model; a health poll sees it go down and come back
+        fake.down = True
+        assert (await svc.health())["server"] == "down"
+        fake.down = False
+        assert (await svc.health())["model"] == "Other-Q4_K_M"
+        again = (await svc.classify(img, tag))["a"]
+        assert again["status"] == "ok" and not again["cached"]  # the old model's answer isn't reused
+        await svc.aclose()
+
+    asyncio.run(go())
+    assert len(fake.requests) == 2
+
+
+def test_model_id_override_kept_after_server_restart(tmp_path, fake):
+    import asyncio
+
+    s = Settings(cache_path=tmp_path / "cache.sqlite3", llama_url="http://llama", model_id="Pinned-Q8_0")
+    llama = LlamaClient(s, httpx.AsyncClient(transport=httpx.MockTransport(fake.handler)))
+
+    async def go():
+        fake.down = True
+        assert not await llama.is_up()
+        fake.down = False
+        assert await llama.is_up()
+        return await llama.model_id()
+
+    assert asyncio.run(go()) == "Pinned-Q8_0"
+
+
+# ---- model download script -------------------------------------------------------------
+
+
+def test_download_finishes_a_complete_part_file_without_a_request(tmp_path, monkeypatch, capsys):
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "download_model.py"
+    spec = importlib.util.spec_from_file_location("download_model_under_test", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(mod, "DEST", tmp_path)
+    monkeypatch.setattr(mod, "remote_size", lambda url: 10)
+
+    def no_request(*a, **k):  # a Range of bytes=10- would get HTTP 416 from the server
+        raise AssertionError("no download request expected")
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", no_request)
+    (tmp_path / "model.gguf.part").write_bytes(b"x" * 10)  # complete; the last run stopped before the rename
+    mod.download("model.gguf")
+    assert (tmp_path / "model.gguf").read_bytes() == b"x" * 10
+    assert not (tmp_path / "model.gguf.part").exists()
+    assert "model.gguf: done" in capsys.readouterr().out

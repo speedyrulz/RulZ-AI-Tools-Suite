@@ -13,7 +13,7 @@ import httpx
 
 from .cache import ResultCache, TagResult, rubric_hash
 from .config import Settings
-from .llm import LlamaClient, ModelError, ModelServerDown
+from .llm import LlamaClient, ModelError, ModelServerDown, ModelTimeout
 from .preprocess import ImageError, ImageTooSmall, PreparedImage, decode_b64, fetch_url, prepare_image
 from .rubrics import enforce_adult_subject, normalize_tag_id
 
@@ -23,7 +23,8 @@ EXPANSION_VERSION = "v2"
 # "p1" = confidence is the model's probability of its answer, not the number it wrote.
 SCORING_VERSION = "p1"
 # Part of the raw-bytes -> prepared-hash key: bump when prepare_image's output for the same input changes.
-PREPARE_VERSION = "r2"
+# "r3" = 16-bit grayscale is scaled to 8 bits instead of clipped to white, and MIN_SHORT_EDGE joined the key.
+PREPARE_VERSION = "r3"
 
 T = TypeVar("T")
 
@@ -64,7 +65,9 @@ def _chunks(seq: Sequence, n: int) -> list[Sequence]:
 class LlamaPool:
     """Spreads model calls over one or more llama-servers (e.g. one per GPU), `parallel` at a time
     on each, least busy first. A server that stops answering is skipped for a while and the call is
-    retried on another; only when every server is down does the caller see ModelServerDown."""
+    retried on another; only when every server is down does the caller see ModelServerDown. A server
+    that takes the request but times out is treated the same while another is left to try; after the
+    last one it stays a ModelTimeout, which fails only that image."""
 
     DOWN_FOR_S = 15.0
 
@@ -110,6 +113,15 @@ class LlamaPool:
                 if len(tried) == len(self.clients):
                     raise
                 log.warning("model server %s is down; retrying on another", self.clients[i].url)
+            except ModelTimeout:
+                # Connected but no answer (a stalled server). Keep it out of rotation for a while and
+                # retry elsewhere; with none left, the image fails on its own (never ModelServerDown,
+                # which would pause the caller's whole run).
+                tried.add(i)
+                if len(tried) == len(self.clients):
+                    raise
+                self._down_until[i] = time.monotonic() + self.DOWN_FOR_S
+                log.warning("model server %s did not answer in time; retrying on another", self.clients[i].url)
             finally:
                 self._release(i)
 
@@ -244,8 +256,9 @@ class DetectionService:
         raise ImageError("image has neither data_b64 nor url")
 
     def _prep_key(self) -> str:
-        """Everything that changes the prepared bytes for the same raw bytes."""
-        return f"{PREPARE_VERSION}|{self.s.max_edge}|{self.s.jpeg_quality}"
+        """Everything that changes the prepared bytes, or whether there are any, for the same raw bytes. The
+        minimum size is in it because a fully cached image skips prepare_image and its size check."""
+        return f"{PREPARE_VERSION}|{self.s.max_edge}|{self.s.jpeg_quality}|{self.s.min_short_edge}"
 
     def _known_results(
         self, raw_hash: str, hashes: dict[str, str], model_id: str
