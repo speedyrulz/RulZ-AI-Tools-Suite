@@ -164,8 +164,13 @@ class VideoView(QWidget):
         return QRectF(x, y, w, h)
 
     def _fit_free(self, r: QRectF) -> QRectF:
+        """Bring the box inside a frame whose size changed (a repair's auto-crop, say).
+        Clipping changes the box's shape, so with a locked aspect the clipped box is refitted to
+        it: a 9:16 box must stay 9:16 or "Scale to 1080x1920" stretches the export unevenly."""
         W, H = self._frame_w, self._frame_h
         r = r.intersected(QRectF(0, 0, W, H))
+        if self.aspect and not r.isEmpty():
+            r = self._refit_aspect(r, self.aspect)
         if r.width() < MIN_SIZE or r.height() < MIN_SIZE:
             return self._default_crop()
         return r
@@ -282,6 +287,11 @@ class VideoView(QWidget):
             h = min(max(h, MIN_SIZE), max_h)
         x = ax if sx > 0 else ax - w
         y = ay if sy > 0 else ay - h
+        # The MIN_SIZE box above can be bigger than the room left past the anchor (a press a few
+        # px from an edge): shift it back inside, or crop_rect_int would export another place
+        # than the one drawn. A no-op for every box that already fits.
+        x = min(max(x, 0.0), max(W - w, 0.0))
+        y = min(max(y, 0.0), max(H - h, 0.0))
         return QRectF(x, y, w, h)
 
     # ------------------------------------------------------------- events

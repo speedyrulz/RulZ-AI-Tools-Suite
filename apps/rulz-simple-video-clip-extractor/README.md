@@ -110,7 +110,13 @@ full source resolution as a PNG. It saves immediately, with no dialog, as
 `<video name>_<timecode>_f<frame>.png` in the output folder (with `_repair`
 added while a distortion repair is on, and `_crop` while the crop is on); an
 existing name gets a `_1`, `_2`, ... suffix instead of being overwritten. The
-status bar shows the saved path.
+PNG is compressed in the background, so the app stays responsive on 4K frames;
+the status bar shows the saved path when it is written.
+
+Non-square-pixel video (HDV 1440×1080, DVD) is shown, cropped and saved in
+its stored pixels, so it looks horizontally squeezed; re-encoded exports keep
+the source's pixel aspect flag, except distortion-repair exports, which come
+out with square pixels (squeezed the same way).
 
 ## Rotation and flip
 
@@ -128,9 +134,14 @@ Exports keep the rotation and flip:
 - **Frame PNG**: pixels are rotated and mirrored.
 - **NVENC re-encode**: rotation and flip are baked into the pixels.
 - **Lossless**: pixels cannot change without re-encoding. Rotation alone is
-  written as a display-rotation flag in the container (MP4, MOV, MKV), which
-  every mainstream player honors. A flip has no reliably honored flag, so
-  lossless is unavailable while the view is mirrored; use NVENC.
+  written as a display-rotation flag in the container (MP4, MOV, MKV, WebM),
+  which every mainstream player honors. MPEG-TS (.ts, .m2ts, .mts), AVI and
+  FLV have no such flag, so a rotated lossless cut of those is saved as MKV
+  (the export dialog says so, and refuses a .ts/.avi/.flv name for it). An
+  AVI with B-frames (many DivX/Xvid and H.264 AVIs) stores no timestamps that
+  MKV can take, so rotating one needs NVENC. A flip
+  has no reliably honored flag, so lossless is unavailable while the view is
+  mirrored; use NVENC.
 
 ## Open last export
 
@@ -181,7 +192,10 @@ The correction is a per-channel exposure and colour balance plus a contrast
 (gamma) term, fitted in linear light so the video's skin matches the
 reference's average skin colour and its spread of brightness. "Match
 contrast" turns the gamma term off and keeps only the balance, and
-**Strength** blends between the original and the full correction.
+**Strength** blends between the original and the full correction (at 0 % there
+is nothing to apply, and Apply leaves the video uncorrected). A reference
+photo with its own colour profile (Display P3 from an iPhone, Adobe RGB) is
+converted to sRGB first, so its skin is compared as it looks.
 
 Apply makes the correction part of the view: the preview, frame PNGs and every
 export use it. It is implemented as three lookup tables, which ffmpeg applies
@@ -253,7 +267,8 @@ use the manual Distortion panel.
 Press **L** (or the Fixed length button) to pick a clip by length instead of
 by In/Out marks. Type the length in **seconds** (to 0.01 s) or in **frames**;
 the other box updates to match. Whichever you typed last is what gets exported
-exactly. A length longer than the video is clamped to the video.
+exactly. A length longer than the video is clamped to the video (for that
+video only: the next one gets your length back).
 
 While fixed length is on:
 
@@ -264,7 +279,8 @@ While fixed length is on:
   inside the selection and stop at its last frame. Pressing play at the end
   restarts from the selection start.
 - Mark In moves the selection to start at the current frame; Mark Out moves it
-  to end just before the current frame.
+  to end just before the current frame (counted in whole frames, so a length
+  like 2.01 s never takes the current frame in).
 - A **Move clip** row appears with six buttons that mirror the playback row
   but move the selection box instead of the playhead: to the start of the
   video, back one keyframe, back one frame, forward one frame, forward one
@@ -329,12 +345,19 @@ path; that file is used instead.
 - **Out** is *exclusive*: the clip ends just before the Out frame. This lets
   you go to a keyframe, press O, and get a clip that ends cleanly at that GOP
   boundary. Pressing O on the very last frame includes it (Out = end of video).
+- A lone mark works too, as the timeline shades it: In alone exports from In
+  to the end of the video, Out alone from the start to Out.
 - If In and Out are both keyframes (or the start/end of the file), the export
   dialog offers **Lossless**: all streams are stream-copied with no
   re-encoding, into the same container type as the source. Cuts land exactly
   on In and Out in MP4, MOV, MKV, WebM, MPEG-TS, FLV and AVI. HEVC encoded with
   open GOPs (x265's default) can lose the last few frames before Out, because
   the frames just before a keyframe there depend on that keyframe.
+  When the output can't hold one of the source's tracks (ASS subtitles saved
+  as .mp4, an iPhone metadata track), the cut is retried with only the video
+  and audio, and the "Saved" message says so.
+- Clip names count In and Out from the first frame, as the app shows them
+  (MPEG-TS clocks often start at 1.4 s or later).
 - Otherwise the export re-encodes with **NVENC** (h264, hevc, or av1) to MP4.
   Cut points are frame-accurate. Audio is copied when MP4-compatible,
   otherwise converted to AAC. Quality is controlled by the CQ value

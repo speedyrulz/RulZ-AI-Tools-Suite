@@ -14,9 +14,10 @@ import numpy as np
 from .autodetect import aspect_value, auto_crop_rect
 from .geometry import Frame, build_stages, chain_inverse, focal_from_35mm
 from .params import Corrections, Orientation
-from .tiltshift import apply_tiltshift
+from .tiltshift import TiltShiftPlan, apply_tiltshift
 
 PREVIEW_MAX = 1800
+OFF_FRAME = -16.0  # remap coordinate whose whole interpolation window (cubic: 4x4) is outside
 
 
 @dataclass
@@ -204,10 +205,12 @@ class FrameMapper:
             s = max_side / max(out_w, out_h)
             out_w, out_h = max(1, round(out_w * s)), max(1, round(out_h * s))
         self.out_size = (out_w, out_h)
+        # Clip Extractor change: the effect's per-frame-size data is worked out once (TiltShiftPlan)
+        self.tiltshift_plan = TiltShiftPlan((out_h, out_w), self.tiltshift) if self.tiltshift is not None else None
         stages = build_stages(c, frame, focal)
         # pure resize (no geometry, no crop): skip the remap entirely
         self.plain = all(type(s).__name__ == "IdentityStage" for s in stages.values()) and crop == [0.0, 0.0, 1.0, 1.0]
-        self.mx = self.my = self.invalid = None
+        self.mx = self.my = None
         if self.plain:
             return
         # Clip Extractor change: the tables are built in strips of rows, so a 4K frame needs
@@ -221,9 +224,13 @@ class FrameMapper:
             su, sv = chain_inverse(stages, u, v)
             self.mx[y0:y0 + 256] = su * w - 0.5
             self.my[y0:y0 + 256] = sv * h - 0.5
-        self.invalid = ~((self.mx >= -0.5) & (self.mx <= w - 0.5) & (self.my >= -0.5) & (self.my <= h - 0.5))
-        if not self.invalid.any():
-            self.invalid = None
+        # Clip Extractor change: output pixels that sample outside the source (the empty area) point
+        # far off the frame instead, where remap's constant border gives exactly 0, so no per-frame
+        # mask is needed (same pixels; at 4K the mask cost as much as the remap).
+        invalid = ~((self.mx >= -0.5) & (self.mx <= w - 0.5) & (self.my >= -0.5) & (self.my <= h - 0.5))
+        if invalid.any():
+            self.mx[invalid] = OFF_FRAME
+            self.my[invalid] = OFF_FRAME
 
     def apply(self, rgb: np.ndarray, effects: bool = True) -> np.ndarray:
         """RGB uint8 frame (not yet oriented) → corrected RGB uint8 frame."""
@@ -235,9 +242,6 @@ class FrameMapper:
                 cv2.resize(px, self.out_size, interpolation=cv2.INTER_AREA)
         else:
             out = cv2.remap(px, self.mx, self.my, self.interp, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-            if self.invalid is not None:
-                out[self.invalid] = 0
-        if effects and self.tiltshift is not None:
-            f = apply_tiltshift(out.astype(np.float32) / 255.0, self.tiltshift)
-            out = np.clip(f * 255.0 + 0.5, 0, 255).astype(np.uint8)
+        if effects and self.tiltshift_plan is not None:
+            out = self.tiltshift_plan.apply(out)
         return np.ascontiguousarray(out)

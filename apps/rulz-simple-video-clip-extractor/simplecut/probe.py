@@ -131,14 +131,42 @@ def probe_streams(path: str) -> VideoInfo:
     for key in ("color_space", "color_range", "color_primaries", "color_transfer"):
         v = vstream.get(key, "") or ""
         setattr(info, key, "" if v in ("unknown", "reserved", "unspecified") else v)
+    info.start_time = float(vstream.get("start_time", 0) or 0)
     if vstream.get("duration"):
         info.duration = float(vstream["duration"])
-    info.start_time = float(vstream.get("start_time", 0) or 0)
+    else:
+        # Matroska/WebM store no stream duration, only a per-track DURATION tag; the container's
+        # duration runs to the end of the longest track, so audio that runs past the video would
+        # put the end of the video in a stretch with no frames. ffmpeg's tag is where the track
+        # ends (5.0 for 3 s of video starting at 2.0); mkvmerge's statistics tags (written with
+        # _STATISTICS_WRITING_APP) hold its length instead.
+        tags = vstream.get("tags") or {}
+        tag = _tag_seconds(tags, "DURATION")
+        if tag:
+            is_length = any(k.upper().split("-")[0] == "_STATISTICS_WRITING_APP" for k in tags)
+            end = info.start_time + tag if is_length else tag
+            if end > info.start_time and (not info.duration or end <= info.duration + 0.5):
+                info.duration = end - info.start_time
     for sd in vstream.get("side_data_list", []) or []:
         if "rotation" in sd:
             # ffprobe reports counter-clockwise-positive; we keep clockwise.
             info.rotation = int(round(-float(sd["rotation"]))) % 360
     return info
+
+
+def _tag_seconds(tags: dict, name: str) -> float | None:
+    """A Matroska duration tag ("00:00:03.000000000"; the key may carry a language, DURATION-eng)
+    in seconds, or None."""
+    for key, value in tags.items():
+        if key.upper().split("-")[0] != name:
+            continue
+        try:
+            h, m, s = str(value).strip().split(":")
+            secs = int(h) * 3600 + int(m) * 60 + float(s)
+        except ValueError:
+            return None
+        return secs if secs > 0 else None
+    return None
 
 
 def scan_keyframes(path: str, on_start=None) -> tuple[list[float], dict[float, float]]:

@@ -19,7 +19,11 @@ from dataclasses import dataclass
 
 import numpy as np
 from PySide6.QtCore import Qt, Signal, QRectF, QPointF
-from PySide6.QtGui import QImage, QImageReader, QPainter, QColor, QPen, QPixmap
+from PySide6.QtGui import QImage, QImageReader, QPainter, QColor, QColorSpace, QPen, QPixmap
+try:
+    import cv2
+except ImportError:  # OpenCV is optional (an old source-install .venv); apply_tables uses numpy then
+    cv2 = None
 from . import theme
 from .defaults import settings as _settings
 from PySide6.QtWidgets import (
@@ -45,8 +49,30 @@ def linear_to_srgb(x: np.ndarray) -> np.ndarray:
 _SRGB2LIN = srgb_to_linear(np.arange(256) / 255.0)
 
 
+def to_srgb(img: QImage) -> QImage:
+    """img with its pixels in sRGB. A photo carrying another colour space (Display P3 from an
+    iPhone, Adobe RGB) is converted, so its skin is compared as it looks instead of being read
+    as less saturated sRGB numbers. An image without a colour space is taken as sRGB already and
+    returned as it is (the video frame from the app is one)."""
+    cs = img.colorSpace()
+    if img.isNull() or not cs.isValid():
+        return img
+    srgb = QColorSpace(QColorSpace.NamedColorSpace.SRgb)
+    if cs == srgb:
+        return img
+    try:
+        model = getattr(cs, "colorModel", None)  # Qt 6.8+; older Qt has RGB colour spaces only
+        if model is None or model() == QColorSpace.ColorModel.Rgb:
+            out = img.convertedToColorSpace(srgb)
+        else:  # a grey or CMYK profile: the sRGB result needs an RGB format
+            out = img.convertedToColorSpace(srgb, QImage.Format_RGB32)
+    except Exception:  # noqa: BLE001 - a profile Qt cannot convert: keep the pixels as they are
+        return img
+    return img if out.isNull() else out
+
+
 def qimage_to_rgb(img: QImage) -> np.ndarray:
-    img = img.convertToFormat(QImage.Format_RGB888)
+    img = to_srgb(img).convertToFormat(QImage.Format_RGB888)
     w, h, bpl = img.width(), img.height(), img.bytesPerLine()
     buf = np.frombuffer(img.constBits(), dtype=np.uint8, count=bpl * h)
     return buf.reshape(h, bpl)[:, :w * 3].reshape(h, w, 3).copy()
@@ -156,6 +182,12 @@ def build_tables(corr: Correction) -> np.ndarray:
 
 
 def apply_tables(rgb: np.ndarray, tables: np.ndarray) -> np.ndarray:
+    """Each channel of an (h, w, 3) uint8 image through its table; returns a new contiguous array.
+    Runs on every preview frame, so cv2.LUT does it in one pass when OpenCV is there (3-4x
+    faster than numpy indexing, same output)."""
+    if cv2 is not None and rgb.dtype == np.uint8 and rgb.ndim == 3 and rgb.shape[2] == 3 and rgb.size:
+        lut = np.ascontiguousarray(np.asarray(tables, dtype=np.uint8).T).reshape(256, 1, 3)
+        return cv2.LUT(rgb, lut)
     out = np.empty_like(rgb)
     for c in range(3):
         out[..., c] = tables[c][rgb[..., c]]
@@ -191,12 +223,13 @@ def ffmpeg_lut_filter(path: str) -> str:
 
 
 def load_image(path: str) -> QImage | None:
-    """Load a photo honouring EXIF rotation; fall back to ffmpeg for formats Qt lacks (HEIC)."""
+    """Load a photo honouring EXIF rotation and its ICC profile (converted to sRGB, see to_srgb);
+    fall back to ffmpeg for formats Qt lacks (HEIC)."""
     reader = QImageReader(path)
     reader.setAutoTransform(True)
     img = reader.read()
     if not img.isNull():
-        return img
+        return to_srgb(img)
     tmp = os.path.join(temp_dir(), "ref_" + hashlib.md5(path.encode("utf-8")).hexdigest()[:12] + ".png")
     os.makedirs(os.path.dirname(tmp), exist_ok=True)
     r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", path, "-frames:v", "1", tmp],
@@ -208,7 +241,7 @@ def load_image(path: str) -> QImage | None:
         os.remove(tmp)  # the pixels are in memory now
     except OSError:
         pass
-    return None if img.isNull() else img
+    return None if img.isNull() else to_srgb(img)  # when ffmpeg carried an ICC profile into the PNG
 
 
 def temp_dir() -> str:

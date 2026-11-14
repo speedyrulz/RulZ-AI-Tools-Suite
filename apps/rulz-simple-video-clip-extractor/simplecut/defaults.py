@@ -102,6 +102,16 @@ def _load_encode(prefix: str, base: ExportSettings | None = None) -> ExportSetti
         s.codec = ExportSettings.codec
     if s.audio not in AUDIO_KEYS:
         s.audio = ExportSettings.audio
+    # A hand-edited or damaged settings file must not reach ffmpeg as a bad argument.
+    if not 0 <= s.cq <= 51:
+        s.cq = ExportSettings.cq
+    if s.preset not in [label.split()[0] for label in PRESET_LABELS]:
+        s.preset = ExportSettings.preset
+    if s.fps:
+        try:
+            s.fps = parse_fps(s.fps)
+        except ValueError:
+            s.fps = ExportSettings.fps
     return s
 
 
@@ -158,6 +168,10 @@ def load_ui_defaults() -> UiDefaults:
     d.custom_aspect = st.value("defaults/custom_aspect", "", type=str)
     d.fixed_seconds = st.value("defaults/fixed_seconds", d.fixed_seconds, type=float)
     d.fixed_frames = st.value("defaults/fixed_frames", d.fixed_frames, type=int)
+    if not d.fixed_seconds >= 0.01:   # (also catches NaN) a zero-length clip box
+        d.fixed_seconds = BUILTIN_FIXED_SECONDS
+    if d.fixed_frames < 1:
+        d.fixed_frames = BUILTIN_FIXED_FRAMES
     d.fixed_unit = st.value("defaults/fixed_unit", d.fixed_unit, type=str)
     if d.fixed_unit not in ("seconds", "frames"):
         d.fixed_unit = BUILTIN_FIXED_UNIT
