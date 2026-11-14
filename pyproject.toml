@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rulz-hf-manager"
-version = "1.4.0"
+version = "1.5.0"
 description = "RulZ Huggingface Manager: a friendly local web app to browse and manage your Hugging Face models, datasets, spaces and buckets."
 readme = "README.md"
 requires-python = ">=3.10"

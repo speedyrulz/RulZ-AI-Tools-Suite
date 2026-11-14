@@ -192,8 +192,8 @@ async def settings_page() -> None:
                 config.save()
             ui.switch('Show hidden files (names starting with ".")', value=s.show_hidden,
                       on_change=lambda e: set_flag('show_hidden', e.value))
-            ui.switch('Show "last modified" for repo files (slower on big folders)', value=s.load_last_modified,
-                      on_change=lambda e: set_flag('load_last_modified', e.value))
+            ui.switch('Show when repo files were last updated (filled in after the list; a few seconds for big '
+                      'folders)', value=s.repo_dates, on_change=lambda e: set_flag('repo_dates', e.value))
             with ui.row().classes('items-center gap-3'):
                 ui.label('Rows per page')
                 ui.select([50, 100, 250, 0], value=s.page_size if s.page_size in (50, 100, 250, 0) else 100,
