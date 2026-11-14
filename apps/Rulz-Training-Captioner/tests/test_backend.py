@@ -312,6 +312,22 @@ def test_every_endpoint_down_stops_instead_of_failing_each_image(monkeypatch):
     assert eng.stop_reason.startswith("No server is responding")
 
 
+def test_servers_going_down_together_fail_no_image():
+    # worker A finds only its own server down, then worker B finds the last one down, stops the job
+    # and leaves before A hands its image back: A's image used to be marked failed
+    eng = backend.CaptionEngine()
+    failed = []
+    eng.failed.connect(lambda p, e: failed.append(p), Qt.DirectConnection)
+    eng._names, eng._down, eng._running = {"a", "b"}, set(), 1
+
+    def b_stopped_the_job_meanwhile(paths):
+        eng._cancel.set()
+        return False
+    eng._retire = b_stopped_the_job_meanwhile
+    assert eng._endpoint_down(_ep("a"), backend.EndpointDown("refused"), "img0.png", None) is False
+    assert failed == []
+
+
 def test_stopping_mid_request_is_not_a_failure(monkeypatch):
     def reply(eng, ep):  # the user stops the job, then the servers drop the connection
         eng.cancel()
@@ -499,13 +515,16 @@ def test_remove_rows_in_runs(tmp_path):
 
 
 def test_remove_many_rows_is_fast():
-    m = ImageModel()
-    m.add_entries([{"path": f"C:\\d\\{i:06}.png", "caption": "", "has_file": False, "status": "idle"}
-                   for i in range(20000)])
-    t = time.perf_counter()
-    m.remove_rows(range(0, 20000, 2))  # every other row: the worst case, 10,000 runs of one
-    took = time.perf_counter() - t
-    assert len(m.items) == 10000 and took < 0.5, f"took {took:.2f}s (1.07s before)"
+    took = []
+    for _ in range(3):  # the best of three: a busy machine (other tests, the garbage collector) is noise
+        m = ImageModel()
+        m.add_entries([{"path": f"C:\\d\\{i:06}.png", "caption": "", "has_file": False, "status": "idle"}
+                       for i in range(20000)])
+        t = time.perf_counter()
+        m.remove_rows(range(0, 20000, 2))  # every other row: the worst case, 10,000 runs of one
+        took.append(time.perf_counter() - t)
+        assert len(m.items) == 10000
+    assert min(took) < 0.5, f"took {min(took):.2f}s (1.07s before)"
 
 
 def test_thumbnail_cache_is_capped_by_size(monkeypatch):
@@ -548,3 +567,316 @@ def test_server_stop_cancels_pending_start(monkeypatch):
     assert not sm._cancelled(gen)
     sm.stop()
     assert sm._cancelled(gen)
+
+
+# ------------------------------------------------------------------ 2026-11-13 audit
+def test_decode_caption_reads_notepad_unicode_files():
+    # Notepad's "Unicode" is UTF-16 with a BOM; cp1252 made it letters with NULs between them
+    assert decode_caption("﻿café, a cat".encode("utf-16-le")) == "café, a cat"
+    assert decode_caption("﻿café".encode("utf-16-be")) == "café"
+
+
+def test_read_caption_tells_a_missing_file_from_an_unreadable_one(tmp_path):
+    img = str(tmp_path / "a.png")
+    assert model_mod.read_caption(img) == ("", False)
+    (tmp_path / "a.txt").mkdir()  # there, but can't be read as a file
+    with pytest.raises(OSError):
+        model_mod.read_caption(img)
+
+
+def test_load_entries_marks_unreadable_caption_files(tmp_path):
+    a, b = _touch(tmp_path / "a.png"), _touch(tmp_path / "b.png")
+    (tmp_path / "a.txt").mkdir()
+    (tmp_path / "b.txt").write_text("a dog", encoding="utf-8")
+    ea, eb = load_entries([a, b])
+    assert ea["status"] == "error" and ea["has_file"] and ea["caption"] == "" and ea["unreadable"]
+    assert eb["caption"] == "a dog" and "unreadable" not in eb
+    # the same when the folder is listed first (the listing named only files, so a.txt looked absent)
+    listing = {}
+    found = collect_images([str(tmp_path)], listing=listing)
+    ea, eb = load_entries([os.path.normpath(p) for p in found], listing=listing)
+    assert ea["unreadable"] and eb["caption"] == "a dog"
+
+
+def test_write_caption_swaps_the_whole_file_in(tmp_path, monkeypatch):
+    img = str(tmp_path / "a.png")
+    model_mod.write_caption(img, "first")
+    model_mod.write_caption(img, "second, line\nnext")
+    assert (tmp_path / "a.txt").read_bytes() == b"second, line\nnext"
+    assert sorted(os.listdir(tmp_path)) == ["a.txt"]  # no temporary file left behind
+
+    def broken_replace(src, dst):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(model_mod.os, "replace", broken_replace)
+    with pytest.raises(OSError):
+        model_mod.write_caption(img, "third")
+    assert (tmp_path / "a.txt").read_bytes() == b"second, line\nnext"  # the old caption is intact
+    assert sorted(os.listdir(tmp_path)) == ["a.txt"]
+
+
+def test_write_caption_waits_out_a_reader_then_writes_in_place(tmp_path, monkeypatch):
+    img = str(tmp_path / "a.png")
+    model_mod.write_caption(img, "old")
+    monkeypatch.setattr(model_mod, "REPLACE_WAIT", 0)
+    real, calls = os.replace, []
+
+    def busy_twice(src, dst):  # a program reading the file blocks replacing it for a moment
+        calls.append(1)
+        if len(calls) <= 2:
+            raise PermissionError(13, "Access is denied")
+        real(src, dst)
+    monkeypatch.setattr(model_mod.os, "replace", busy_twice)
+    model_mod.write_caption(img, "new")
+    assert (tmp_path / "a.txt").read_bytes() == b"new" and len(calls) == 3
+
+    def always_busy(src, dst):  # kept open by another program, or no right to delete in this folder
+        raise PermissionError(13, "Access is denied")
+    monkeypatch.setattr(model_mod.os, "replace", always_busy)
+    model_mod.write_caption(img, "newer")  # written in place, as before the swap existed
+    assert (tmp_path / "a.txt").read_bytes() == b"newer"
+    assert sorted(os.listdir(tmp_path)) == ["a.txt"]
+
+
+def test_write_caption_keeps_the_old_caption_when_the_disk_is_full(tmp_path, monkeypatch):
+    img = str(tmp_path / "a.png")
+    model_mod.write_caption(img, "old caption")
+    real_open = open
+
+    def full_disk(path, *a, **k):
+        if str(path).endswith(".tmp"):
+            f = real_open(path, *a, **k)
+            f.write(b"half")
+            f.close()
+            raise OSError(28, "No space left on device")
+        return real_open(path, *a, **k)
+    monkeypatch.setattr("builtins.open", full_disk)
+    with pytest.raises(OSError):
+        model_mod.write_caption(img, "a much longer new caption")
+    monkeypatch.undo()
+    assert (tmp_path / "a.txt").read_bytes() == b"old caption"
+    assert sorted(os.listdir(tmp_path)) == ["a.txt"]
+
+
+def test_write_caption_writes_in_place_where_it_cant_create_files(tmp_path, monkeypatch):
+    img = str(tmp_path / "a.png")
+    model_mod.write_caption(img, "old")
+    real_open = open
+
+    def no_create(path, *a, **k):  # no right to create files, or a name over the path limit
+        if str(path).endswith(".tmp"):
+            raise FileNotFoundError(2, "path too long")
+        return real_open(path, *a, **k)
+    monkeypatch.setattr("builtins.open", no_create)
+    model_mod.write_caption(img, "new")
+    monkeypatch.undo()
+    assert (tmp_path / "a.txt").read_bytes() == b"new"
+
+
+def test_write_caption_refuses_a_read_only_file_at_once(tmp_path, monkeypatch):
+    img = str(tmp_path / "a.png")
+    model_mod.write_caption(img, "old")
+    os.chmod(tmp_path / "a.txt", 0o444)
+    tried = []
+    monkeypatch.setattr(model_mod.os, "replace", lambda *a: tried.append(a))
+    try:
+        with pytest.raises(PermissionError):
+            model_mod.write_caption(img, "new")
+    finally:
+        os.chmod(tmp_path / "a.txt", 0o666)
+    assert tried == [] and sorted(os.listdir(tmp_path)) == ["a.txt"]
+
+
+def test_captioned_count_is_kept_up_to_date(tmp_path):
+    m = ImageModel()
+    m.add_entries([{"path": str(tmp_path / f"{i}.png"), "caption": c, "has_file": bool(c), "status": "idle"}
+                   for i, c in enumerate(["a cat", "", "  ", "a dog"])])
+    assert m.captioned_count() == 2
+    m.set_caption(1, "a bird")
+    m.set_caption(0, "")
+    assert m.captioned_count() == 2
+    m.show_caption(2, "from disk")
+    assert m.captioned_count() == 3
+    m.remove_rows([0, 2])
+    assert m.captioned_count() == sum(1 for it in m.items if it["caption"].strip()) == 2
+    m.clear()
+    assert m.captioned_count() == 0
+
+
+def test_caption_count_doesnt_rescan_the_list(tmp_path):
+    # the window asks for it after every save: clearing 5,000 captions of 20,000 took 75 s
+    m = ImageModel()
+    m.add_entries([{"path": str(tmp_path / f"{i}.png"), "caption": "a cat", "has_file": True, "status": "idle"}
+                   for i in range(20000)])
+    t = time.perf_counter()
+    for _ in range(2000):
+        m.captioned_count()
+    took = time.perf_counter() - t
+    assert took < 0.05, f"took {took:.2f}s (a full count per save took about 4.5 ms each)"
+
+
+@pytest.mark.skipif(not hasattr(QImage, "Format_CMYK8888"), reason="Qt before 6.8 reads CMYK as RGB")
+def test_encode_image_sends_cmyk_jpegs_as_rgb(tmp_path):
+    img = QImage(64, 48, QImage.Format_RGB32)
+    img.fill(QColor(200, 30, 30))
+    img = img.convertToFormat(QImage.Format_CMYK8888)  # fill() leaves a CMYK image uninitialised
+    p = str(tmp_path / "print.jpg")
+    assert img.save(p, "JPEG")
+    assert QImageReader(p).read().format() == QImage.Format_CMYK8888
+    jpeg = base64.b64decode(backend.encode_image(p, 1024))
+    sof = max(jpeg.find(b"\xff\xc0"), jpeg.find(b"\xff\xc2"))
+    assert sof > 0 and jpeg[sof + 9] == 3  # three colour channels, not four CMYK ones
+    want = QColor(QImageReader(p).read().convertToFormat(QImage.Format_RGB32).pixel(5, 5))
+    got = QColor(QImage.fromData(jpeg).pixel(5, 5))
+    assert max(abs(want.red() - got.red()), abs(want.green() - got.green()), abs(want.blue() - got.blue())) < 10
+    assert want.red() > 150 and want.green() < 80  # and it is the red that was saved
+
+
+def test_encode_image_sends_palette_images_as_rgb(tmp_path):
+    img = QImage(40, 40, QImage.Format_RGB32)
+    img.fill(QColor(30, 160, 40))
+    p = str(tmp_path / "pal.png")
+    assert img.convertToFormat(QImage.Format_Indexed8).save(p, "PNG")
+    assert QImageReader(p).read().format() == QImage.Format_Indexed8
+    jpeg = base64.b64decode(backend.encode_image(p, 1024))
+    sof = max(jpeg.find(b"\xff\xc0"), jpeg.find(b"\xff\xc2"))
+    assert jpeg[sof + 9] == 3
+    c = QColor(QImage.fromData(jpeg).pixel(5, 5))
+    assert c.green() > 120 and c.red() < 70
+
+
+def test_external_endpoints_accept_the_full_request_url():
+    s = {"external_urls": "http://127.0.0.1:1234/v1/chat/completions\nhttp://h:8000/chat/completions/\n"
+                          "http://h2:9000", "external_model": "", "slots_per_server": 1}
+    assert [ep["url"] for ep in backend.external_endpoints(s)] == [
+        "http://127.0.0.1:1234/v1", "http://h:8000/v1", "http://h2:9000/v1"]
+
+
+def test_stop_after_the_last_health_check_is_not_reported_ready(monkeypatch):
+    sm = backend.ServerManager()
+
+    def start_then_stopped(s, log, progress, gen, procs, endpoints):
+        sm.stop()  # Stop Servers lands between the last health check and the return
+        return [EP]
+    monkeypatch.setattr(sm, "_start", start_then_stopped)
+    with pytest.raises(backend.StartCancelled):
+        sm.start({}, lambda line: None)
+
+
+def test_workers_use_a_proxy_free_session_for_local_servers(monkeypatch):
+    urls = []
+    real = backend.local_session
+    monkeypatch.setattr(backend, "local_session", lambda url="http://127.0.0.1": urls.append(url) or real(url))
+    run_engine(monkeypatch, [_ep("127.0.0.1:9")], lambda eng, ep: ("a cat", "stop"), n=2)
+    assert urls == ["http://127.0.0.1:9/v1"]
+
+
+def test_local_servers_are_reached_without_the_proxy(monkeypatch):
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    for url in ("http://127.0.0.1:8090/v1", "http://localhost:1234/v1", "http://[::1]:8000/v1", "http://127.0.0.2/v1"):
+        assert backend.is_loopback(url)
+        sess = backend.local_session(url)
+        assert not sess.trust_env  # requests would have sent it to HTTP_PROXY
+        assert sess.merge_environment_settings(url, {}, None, None, None)["proxies"] == {}
+    for url in ("http://192.168.1.5:8000/v1", "https://api.example.com/v1", "http://localhost.example.com/v1"):
+        assert not backend.is_loopback(url)
+        assert backend.local_session(url).trust_env  # a remote server keeps the user's proxy
+
+
+def test_reply_that_isnt_json_is_not_retried():
+    class HtmlPage(FakeResponse):
+        def json(self):
+            raise requests.exceptions.JSONDecodeError("Expecting value", "<html>", 0)
+    sess = FakeSession([HtmlPage(200, "<html>")] * 4)
+    with pytest.raises(requests.exceptions.InvalidJSONError):
+        backend.request_with_retry(EP, "b64", "", "hi", S, sess, wait=lambda s: False)
+    assert sess.calls == 1
+
+
+def test_images_removed_from_the_list_are_skipped(monkeypatch):
+    eng_box = []
+    asked = []
+
+    def reply(eng, ep):
+        if not eng_box:
+            eng_box.append(eng)
+            eng.drop([f"img{i}.png" for i in range(5, 12)])  # removed while the first one runs
+        return "a cat", "stop"
+    monkeypatch.setattr(backend, "encode_image", lambda path, side: asked.append(path) or "b64")
+    monkeypatch.setattr(backend, "retry_delay", lambda attempt, retry_after=None: 0)
+    eng = backend.CaptionEngine()
+    monkeypatch.setattr(backend, "request_caption", lambda ep, *a: reply(eng, ep))
+    done, progress, captioned = threading.Event(), [], []
+    eng.progress.connect(lambda d, t: progress.append((d, t)), Qt.DirectConnection)
+    eng.captioned.connect(lambda p, c: captioned.append(p), Qt.DirectConnection)
+    eng.finished.connect(done.set, Qt.DirectConnection)
+    eng.start([f"img{i}.png" for i in range(12)], [_ep("a")], "", "hi", ENGINE_S)
+    assert done.wait(10)
+    assert len(captioned) <= 6 and not any(p in captioned for p in ("img7.png", "img11.png"))
+    assert "img11.png" not in asked
+    assert progress[-1] == (12, 12)  # skipped ones still count, so the bar fills
+
+
+def test_stop_while_old_servers_are_killed_is_not_lost(monkeypatch):
+    sm = backend.ServerManager()
+    monkeypatch.setattr(sm, "_kill", lambda procs: sm.cancel())  # Stop pressed during the kill
+    seen = []
+    monkeypatch.setattr(sm, "_start", lambda s, log, progress, gen, procs, eps: seen.append(sm._cancelled(gen)) or [])
+    with pytest.raises(backend.StartCancelled):
+        sm.start({}, lambda line: None)
+    assert seen == [True]  # _start would not launch anything
+
+
+def test_stop_before_the_start_thread_runs_is_not_lost(monkeypatch):
+    sm = backend.ServerManager()
+    ticket = sm.begin()  # the window claims the start before handing it to a thread
+    sm.cancel()          # Stop pressed before that thread gets going
+    seen = []
+    monkeypatch.setattr(sm, "_start", lambda s, log, progress, gen, procs, eps: seen.append(sm._cancelled(gen)) or [])
+    with pytest.raises(backend.StartCancelled):
+        sm.start({}, lambda line: None, ticket=ticket)
+    assert seen == [True]
+
+
+def test_nvidia_smi_without_a_memory_size(monkeypatch):
+    from captioner import config
+
+    class Done:
+        stdout = "0, NVIDIA RTX 5090, 32607\n1, Some vGPU, [N/A]\n"
+    monkeypatch.setattr(config.subprocess, "run", lambda *a, **k: Done())
+    assert config._query_gpus() == [(0, "NVIDIA RTX 5090", 32607), (1, "Some vGPU", 0)]
+
+
+def test_set_statuses_changes_rows_in_runs(tmp_path):
+    m = ImageModel()
+    m.add_entries([{"path": str(tmp_path / f"{i}.png"), "caption": "", "has_file": False, "status": "idle"}
+                   for i in range(10)])
+    m.items[4]["status"] = "error"
+    runs = []
+    m.dataChanged.connect(lambda a, b, roles: runs.append((a.row(), b.row())))
+    m.set_statuses([9, 0, 1, 2, 4, 5, 7], "queued")
+    assert runs == [(0, 2), (4, 5), (7, 7), (9, 9)]
+    assert [it["status"] for it in m.items] == ["queued"] * 3 + ["idle", "queued", "queued", "idle", "queued", "idle",
+                                                                  "queued"]
+    m.items[4]["status"] = "error"
+    m.set_statuses(range(10), "idle", only=("queued", "busy"))
+    assert [it["status"] for it in m.items].count("error") == 1
+
+
+def test_editing_an_unreadable_caption_never_replaces_what_wasnt_shown(tmp_path, monkeypatch):
+    p = _touch(tmp_path / "a.png")
+    (tmp_path / "a.txt").write_text("ORIGINAL caption", encoding="utf-8")
+    real = model_mod.read_caption
+    monkeypatch.setattr(model_mod, "read_caption", lambda path: (_ for _ in ()).throw(PermissionError(13, "locked")))
+    m = ImageModel()
+    m.add_entries(load_entries([p]))
+    assert m.items[0]["unreadable"] and m.items[0]["caption"] == ""
+    with pytest.raises(RuntimeError, match="wasn't replaced"):  # still locked
+        m.set_caption(0, "my new caption")
+    monkeypatch.setattr(model_mod, "read_caption", real)  # the lock is gone
+    with pytest.raises(RuntimeError, match="now shown"):
+        m.set_caption(0, "my new caption")
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "ORIGINAL caption"
+    assert m.items[0]["caption"] == "ORIGINAL caption" and "unreadable" not in m.items[0]
+    assert m.set_caption(0, "edited") and (tmp_path / "a.txt").read_text(encoding="utf-8") == "edited"
