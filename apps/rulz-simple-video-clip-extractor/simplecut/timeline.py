@@ -30,6 +30,7 @@ class Timeline(QWidget):
         self.mark_out: float | None = None
         self.selection: tuple[float, float] | None = None  # fixed-length mode
         self.clips: list[tuple[float, float, bool]] = []   # clip list entries: (start, end, saved)
+        self.scene_cuts: list[float] = []                  # first frames of new scenes, seconds
         self._press = None  # (x, mode, offset_seconds)
         self._dragging = False
         self._ticks: list[QLineF] = []
@@ -61,6 +62,13 @@ class Timeline(QWidget):
         clips = list(clips)
         if clips != self.clips:
             self.clips = clips
+            self.update()
+
+    def set_scene_cuts(self, cuts: list[float]):
+        """Scene cuts, drawn as coloured lines across the bar."""
+        cuts = list(cuts)
+        if cuts != self.scene_cuts:
+            self.scene_cuts = cuts
             self.update()
 
     # --- geometry ---------------------------------------------------------
@@ -181,7 +189,8 @@ class Timeline(QWidget):
         # clip list entries: a strip just above the bar, solid while a clip waits, outlined once saved
         for a, b, saved in self.clips:
             xa = self._x(max(a, self.start))
-            r = QRectF(xa, bar_top - 6.5, max(self._x(min(b, self.end)) - xa, 2.0), 4)
+            # (1 px short at the end, so back-to-back clips, such as every scene of a video, show apart)
+            r = QRectF(xa, bar_top - 6.5, max(self._x(min(b, self.end)) - xa - 1, 2.0), 4)
             if saved:
                 p.setPen(QPen(theme.Q_MUTED, 1))
                 p.setBrush(Qt.NoBrush)
@@ -193,6 +202,17 @@ class Timeline(QWidget):
         if ticks:
             p.setPen(QPen(theme.Q_TL_TICK, 1))
             p.drawLines(ticks)
+
+        # scene cuts: a line across the bar at the first frame of each new scene (one per 2 px)
+        if self.scene_cuts:
+            lines, last_x = [], -10.0
+            for c in self.scene_cuts:
+                x = self._x(c)
+                if x - last_x >= 2:
+                    lines.append(QLineF(x, bar_top + 1, x, bar_bot - 1))
+                    last_x = x
+            p.setPen(QPen(theme.Q_TL_SCENE, 2))
+            p.drawLines(lines)
 
         # in/out markers (hidden in fixed-length mode)
         if not self.selection:

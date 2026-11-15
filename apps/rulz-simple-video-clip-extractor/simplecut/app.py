@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import os
+from bisect import bisect_left, bisect_right
 import sys
 import threading
 import traceback
@@ -10,7 +11,7 @@ import traceback
 import numpy as np
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSettings, QRect, QEvent, QUrl, QElapsedTimer
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
-from PySide6.QtGui import QImage, QKeySequence, QAction, QShortcut, QTransform
+from PySide6.QtGui import QImage, QKeySequence, QAction, QActionGroup, QShortcut, QTransform
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout,
     QHBoxLayout, QFileDialog, QMessageBox, QDialog, QDialogButtonBox,
@@ -29,6 +30,8 @@ from . import theme
 from .cliplist import (BatchExport, ClipEntry, ClipList, ClipListPanel, clean_store, video_key,
                        DONE, FAILED, PENDING, RUNNING)
 from .colormatch import ColorMatchDialog, apply_tables, clean_temp, write_cube_1d
+from .scenes import (DEFAULT_SENSITIVITY, SENSITIVITY, SENSITIVITY_LABELS, SceneScanThread, SceneScores,
+                     clean_scores, load_scores, scenes_between)
 try:
     from .repair.export import RepairExport
     from .repair.pipeline import RepairSettings, RepairState, describe as describe_repair, orient
@@ -124,6 +127,7 @@ class ProbeThread(QThread):
             self.keyframes.emit(kfs, dts, self.token)
 
 
+SCENE_EPS = 1e-4   # seconds: a decoded frame's time and a scene cut's are the same frame times
 NO_FFMPEG = "ffmpeg / ffprobe were not found on PATH. Install them (e.g. `winget install Gyan.FFmpeg`)."
 BATCH_BUSY = "The clip list is being exported; wait for it to finish or cancel it first."
 
@@ -412,6 +416,16 @@ class MainWindow(QMainWindow):
         self._video_token: int | None = None           # the token of the video on screen (its keyframes)
         clean_temp()  # colour-match LUTs / reference images left by earlier sessions
         clean_store()  # clip lists of videos that have been gone for months
+        clean_scores()  # the same for stored scene-cut scans
+        # Scene cuts of the open video: the scan's scores (stored per video) and the cuts picked
+        # from them at the chosen sensitivity.
+        self.scene_scores: SceneScores | None = None
+        self.scene_cuts: list[float] = []
+        self._scene_thread: SceneScanThread | None = None   # the open video's scan, while it runs
+        self._scene_threads: list[SceneScanThread] = []     # every one still running, kept referenced
+        self._scene_serial = 0   # numbers each scan: only _scene_thread's reports are taken
+        sens = settings().value("scene_sensitivity", DEFAULT_SENSITIVITY, type=str)
+        self.scene_sensitivity = sens if sens in SENSITIVITY else DEFAULT_SENSITIVITY
         self.clips: ClipList | None = None             # the open video's clip list
         # Every list opened this session, by video: a batch that is still exporting a video's
         # clips and the panel showing that video again work on the same entries.
@@ -511,6 +525,12 @@ class MainWindow(QMainWindow):
         self.b_next = btn("▶", "Next frame (Right)", self.step_forward)
         self.b_next_kf = btn("K▶", "Next keyframe (Shift+Right)", self.next_keyframe)
         self.b_end = btn("", "Go to end (End)", self.go_end, QStyle.SP_MediaSkipForward)
+        self.b_prev_scene = btn("◀S", "Previous scene cut (Page Up); in Fixed length, moves the clip there",
+                                self.prev_scene)
+        self.b_next_scene = btn("S▶", "Next scene cut (Page Down); in Fixed length, moves the clip there",
+                                self.next_scene)
+        self.b_scenes = btn("Scene cuts  [X]", "Find the scene cuts of this video (read once in the background "
+                            "and kept for next time); they show as lines on the timeline", self.find_scene_cuts)
 
         self.b_in = btn("Mark In  [I]", "Set clip start at current frame", self.set_in)
         self.b_out = btn("Mark Out  [O]", "Set clip end at current frame (exclusive)", self.set_out)
@@ -548,7 +568,17 @@ class MainWindow(QMainWindow):
         self.qx_cancel = QPushButton("Cancel")
         self.qx_cancel.setFocusPolicy(Qt.NoFocus)
         self.qx_cancel.clicked.connect(self._quick_cancel)
-        for wdg in (self.qx_label, self.qx_progress, self.qx_cancel):
+        # the scene-cut search has its own progress (it can run beside an export)
+        self.sc_label = QLabel("Finding scene cuts")
+        self.sc_progress = QProgressBar()
+        self.sc_progress.setRange(0, 1000)
+        self.sc_progress.setFixedWidth(120)
+        self.sc_cancel = QPushButton("Stop")
+        self.sc_cancel.setToolTip("Stop finding scene cuts")
+        self.sc_cancel.setFocusPolicy(Qt.NoFocus)
+        self.sc_cancel.clicked.connect(self._scene_cancel)
+        for wdg in (self.sc_label, self.sc_progress, self.sc_cancel,
+                    self.qx_label, self.qx_progress, self.qx_cancel):
             wdg.setVisible(False)
             self.status.addPermanentWidget(wdg)
         self.b_export.setEnabled(False)
@@ -651,8 +681,8 @@ class MainWindow(QMainWindow):
             lab.setMinimumWidth(w)
 
         controls = QHBoxLayout()
-        for b in (self.b_start, self.b_prev_kf, self.b_prev, self.b_play,
-                  self.b_next, self.b_next_kf, self.b_end):
+        for b in (self.b_start, self.b_prev_scene, self.b_prev_kf, self.b_prev, self.b_play,
+                  self.b_next, self.b_next_kf, self.b_next_scene, self.b_end):
             controls.addWidget(b)
         controls.addSpacing(24)
         controls.addWidget(self.time_label)
@@ -705,6 +735,9 @@ class MainWindow(QMainWindow):
         crop_row.addSpacing(12)
         crop_row.addWidget(self.crop_label)
         crop_row.addStretch(1)
+        # (in this row, not beside ◀S S▶: the playback row would then set the window's smallest width)
+        crop_row.addWidget(self.b_scenes)
+        crop_row.addSpacing(12)
         crop_row.addWidget(self.b_repair)
         crop_row.addWidget(self.repair_label)
         crop_row.addWidget(self.b_repair_clear)
@@ -766,6 +799,24 @@ class MainWindow(QMainWindow):
         self._refresh_last_export()
         m.addSeparator()
         m.addAction(a_quit)
+        scm = self.menuBar().addMenu("Sc&enes")
+        for text, key, slot in (("&Find scene cuts", "X", self.find_scene_cuts),
+                                ("&Previous scene cut", "PgUp", self.prev_scene),
+                                ("&Next scene cut", "PgDown", self.next_scene),
+                                ("&Select this scene", "Shift+X", self.select_scene),
+                                ("&Add scenes to clip list", "Ctrl+Shift+X", self.add_scenes_to_list)):
+            scm.addAction(QAction(text, self, shortcut=key, triggered=slot))
+        scm.addSeparator()
+        sens_menu = scm.addMenu("Se&nsitivity")
+        sens_group = QActionGroup(self)
+        self.sens_actions: dict[str, QAction] = {}
+        for key in ("low", "normal", "high"):
+            a = QAction(SENSITIVITY_LABELS[key], self, checkable=True)
+            a.setChecked(key == self.scene_sensitivity)
+            a.triggered.connect(lambda _=False, k=key: self.set_scene_sensitivity(k))
+            sens_group.addAction(a)
+            sens_menu.addAction(a)
+            self.sens_actions[key] = a
         sm = self.menuBar().addMenu("&Settings")
         self.a_outdir = QAction("", self, triggered=self.choose_output_dir)
         a_outdir_reset = QAction("Save next to source video", self, triggered=self.reset_output_dir)
@@ -848,6 +899,10 @@ class MainWindow(QMainWindow):
         self.view.setFocus()
 
     def eventFilter(self, obj, ev):
+        if (ev.type() == QEvent.ShortcutOverride and obj in self._inputs
+                and ev.key() in (Qt.Key_PageUp, Qt.Key_PageDown)):
+            ev.accept()   # a number box steps by 10 on Page Up/Down; the scene-cut keys wait
+            return True
         if ev.type() == QEvent.KeyPress and ev.key() == Qt.Key_Escape and obj in self._inputs:
             self._release_focus()
             return True
@@ -864,9 +919,10 @@ class MainWindow(QMainWindow):
         for b in (self.b_start, self.b_prev, self.b_play, self.b_next,
                   self.b_end, self.b_in, self.b_out, self.b_clear, self.b_snap,
                   self.b_rotate, self.b_flip, self.b_crop, self.b_fixed, self.len_sec,
-                  self.len_frames, self.b_add):
+                  self.len_frames, self.b_add, self.b_scenes):
             b.setEnabled(on)
         self._set_keyframe_buttons(on)
+        self._set_scene_buttons(on)
         self.b_quick.setEnabled(on and not self._exporting())
         self.b_match.setEnabled(on)
         self.b_repair.setEnabled(on and not REPAIR_UNAVAILABLE)
@@ -1173,6 +1229,7 @@ class MainWindow(QMainWindow):
         self.timeline.set_keyframes(info.keyframes)
         self.setWindowTitle(f"{os.path.basename(info.path)} — {theme.APP_NAME}")
         self._open_clip_list()   # (before the status line, which mentions a list that was not loaded)
+        self._open_scenes()
         self._show_info_status("finding keyframes…")
         self._set_enabled(True)
         self._sync_length_boxes()
@@ -1226,6 +1283,7 @@ class MainWindow(QMainWindow):
         self.info = None
         self.clips = None   # (a batch still exporting this video's clips keeps its own hold on them)
         self._refresh_clips()
+        self._close_scenes()
         self.rotation = 0
         self.flip = False
         self._set_color(None, "")
@@ -2214,14 +2272,7 @@ class MainWindow(QMainWindow):
         if rng is None:
             self.status.showMessage("Set an In or Out mark first, or enable Fixed length.", 5000)
             return
-        crop, out_size = self._export_geometry()
-        entry = ClipEntry(rng[0], rng[1], self.rotation, self.flip, crop, out_size)
-        if self.color_tables is not None:
-            entry.color_tables = np.array(self.color_tables, dtype=np.uint8)
-            entry.color_desc = self.color_desc
-        if self.repair is not None:
-            s = self.repair.settings
-            entry.repair = RepairSettings(s.corrections, s.base_rotation, s.base_flip)   # (its own copy)
+        entry = self._make_entry(*rng)
         old = self.clips.find(entry)
         if old is None:
             self.clips.entries.append(entry)
@@ -2234,6 +2285,241 @@ class MainWindow(QMainWindow):
         self._save_clips()
         self._refresh_clips()
         self.status.showMessage(msg, 5000)
+
+    def _make_entry(self, start: float, end: float) -> ClipEntry:
+        """A clip-list entry for start..end with the picture settings as they are now."""
+        crop, out_size = self._export_geometry()
+        entry = ClipEntry(start, end, self.rotation, self.flip, crop, out_size)
+        if self.color_tables is not None:
+            entry.color_tables = np.array(self.color_tables, dtype=np.uint8)
+            entry.color_desc = self.color_desc
+        if self.repair is not None:
+            s = self.repair.settings
+            entry.repair = RepairSettings(s.corrections, s.base_rotation, s.base_flip)   # (its own copy)
+        return entry
+
+    # ------------------------------------------------------------- scene cuts
+    def _open_scenes(self):
+        """The opened video's scene cuts, when an earlier scan of this very file was kept."""
+        self._close_scenes()
+        self.scene_scores = load_scores(self.info.path)
+        self._refresh_scenes()
+
+    def _close_scenes(self):
+        """Forget the scene cuts on screen and stop a search that is still reading the video."""
+        for t in self._scene_threads:
+            t.cancel()
+        self._scene_thread = None
+        self._show_scene_progress(False)
+        self.scene_scores = None
+        self._refresh_scenes()
+
+    def _refresh_scenes(self):
+        s = self.scene_scores
+        self.scene_cuts = s.cuts(self.scene_sensitivity) if s is not None and self.info else []
+        self.timeline.set_scene_cuts(self.scene_cuts)
+        self._set_scene_buttons(self.b_play.isEnabled())
+
+    def _set_scene_buttons(self, on: bool = True):
+        ok = on and bool(self.scene_cuts)
+        for b in (self.b_prev_scene, self.b_next_scene):
+            b.setEnabled(ok)
+
+    def _show_scene_progress(self, on: bool):
+        if on:
+            self.sc_progress.setValue(0)
+        for wdg in (self.sc_label, self.sc_progress, self.sc_cancel):
+            wdg.setVisible(on)
+
+    def _scene_scan_running(self) -> bool:
+        t = self._scene_thread
+        return t is not None and t.isRunning() and not t.cancelled
+
+    def find_scene_cuts(self):
+        """Read the video once in the background and mark where its scenes change."""
+        if not self.info or not self.dec:
+            return
+        if self._scene_scan_running():
+            self.status.showMessage("The scene cuts are being found; the progress is in the status bar.", 4000)
+            return
+        if self.scene_scores is None:
+            # (a scan stopped just as it finished may have stored its result after all)
+            self.scene_scores = load_scores(self.info.path)
+            self._refresh_scenes()
+        if self.scene_scores is not None:
+            self.status.showMessage(self._scene_summary() + " Change the sensitivity in the Scenes menu.", 6000)
+            return
+        self._scene_serial += 1
+        t = SceneScanThread(self.info.path, self._scene_serial)
+        t.progress.connect(self._scene_progress)
+        t.done.connect(self._scene_found)
+        t.failed.connect(self._scene_failed)
+        t.finished.connect(self._scene_thread_finished)
+        self._scene_thread = t
+        self._scene_threads.append(t)   # (a QThread dropped while running crashes the app)
+        self._show_scene_progress(True)
+        t.start()
+
+    def _scene_summary(self) -> str:
+        n = len(self.scene_cuts)
+        label = SENSITIVITY_LABELS[self.scene_sensitivity]
+        if not n:
+            more = " Try a higher one in the Scenes menu." if self.scene_sensitivity != "high" else ""
+            return f"No scene cuts found at sensitivity {label}.{more}"
+        return f"{n} scene cut{'s' if n != 1 else ''} at sensitivity {label} ({n + 1} scenes)."
+
+    def _current_scan(self, token: int) -> bool:
+        """A report from the search on screen (not one that was stopped, or of another video:
+        closing or opening a video lets its search go)."""
+        return self._scene_thread is not None and token == self._scene_thread.token and self.info is not None
+
+    def _scene_progress(self, f: float, token: int):
+        if self._current_scan(token):
+            self.sc_progress.setValue(int(f * 1000))
+
+    def _scene_found(self, scores: SceneScores, token: int):
+        if not self._current_scan(token):
+            return
+        self._scene_thread = None
+        self._show_scene_progress(False)
+        self.scene_scores = scores
+        self._refresh_scenes()
+        self.status.showMessage(self._scene_summary(), 8000)
+
+    def _scene_failed(self, msg: str, token: int):
+        if not self._current_scan(token):
+            return
+        self._scene_thread = None
+        self._show_scene_progress(False)
+        last = msg.strip().splitlines()[0] if msg.strip() else "unknown error"
+        self.status.showMessage(f"The scene cuts could not be found: {last}", 10000)
+
+    def _scene_cancel(self):
+        if self._scene_thread is not None:
+            self._scene_thread.cancel()
+        self._scene_thread = None
+        self._show_scene_progress(False)
+        self.status.showMessage("Stopped finding scene cuts.", 4000)
+
+    def _scene_thread_finished(self):
+        self._scene_threads = [t for t in self._scene_threads if t.isRunning()]
+
+    def set_scene_sensitivity(self, key: str):
+        if key not in SENSITIVITY:
+            return
+        self.scene_sensitivity = key
+        settings().setValue("scene_sensitivity", key)
+        self.sens_actions[key].setChecked(True)
+        self._refresh_scenes()
+        if self.scene_scores is not None:
+            self.status.showMessage(self._scene_summary(), 6000)
+
+    def _scenes_known(self) -> bool:
+        """The open video's scene cuts have been found (there may be none); says why not otherwise."""
+        if self.scene_scores is not None:
+            return True
+        if self._scene_scan_running():
+            self.status.showMessage("The scene cuts are still being found.", 4000)
+        else:
+            self.status.showMessage("Find the scene cuts first (X, or Scene cuts).", 5000)
+        return False
+
+    def next_scene(self):
+        self._jump_scene(1)
+
+    def prev_scene(self):
+        self._jump_scene(-1)
+
+    def _jump_scene(self, direction: int):
+        """Playhead to the next / previous scene cut; in Fixed length the clip box moves there."""
+        if not self.dec or not self._scenes_known():
+            return
+        info = self.info
+        # The playhead stands exactly on a frame time, as the cuts do. The clip box's start is
+        # rounded to the frame grid of the average frame rate, which is up to half a frame off
+        # a cut in variable-frame-rate video.
+        ref = self.sel_start if self.fixed else self.dec.time
+        eps = info.frame_duration / 2 if self.fixed else SCENE_EPS
+        cuts = self.scene_cuts
+        if direction > 0:
+            i = bisect_right(cuts, ref + eps)
+            t = cuts[i] if i < len(cuts) else None
+            if t is None:
+                self.status.showMessage("No scene cut after this one.", 3000)
+                return
+        else:
+            i = bisect_left(cuts, ref - eps)
+            t = cuts[i - 1] if i > 0 else info.start_time
+        if self.fixed:
+            self._set_sel_start(t, seek=True)
+            if self.sel_start < t - info.frame_duration / 2:
+                self.status.showMessage(f"The clip doesn't fit after the cut at {fmt_time(t - info.start_time)}; "
+                                        f"it is at the end of the video.", 5000)
+        else:
+            self.seek_to(t)
+
+    def _scene_around(self, t: float) -> tuple[float, float]:
+        """The scene the frame at t (a decoded frame's time) belongs to: (its first frame, its
+        end), end exclusive."""
+        info = self.info
+        eps = SCENE_EPS
+        cuts = self.scene_cuts
+        i = bisect_right(cuts, t + eps)
+        start = cuts[i - 1] if i > 0 else info.start_time
+        end = cuts[i] if i < len(cuts) else info.end_time
+        return start, end
+
+    def select_scene(self):
+        """Mark the scene under the playhead (In on its first frame, Out where the next one starts);
+        in Fixed length the clip box moves to its start."""
+        if not self.dec or not self._scenes_known():
+            return
+        start, end = self._scene_around(self.dec.time)
+        if self.fixed:
+            self._set_sel_start(start, seek=True)
+            return
+        self.mark_in, self.mark_out = start, end
+        self._selection_changed()
+
+    def add_scenes_to_list(self):
+        """Every scene, or the scenes between In and Out, as clips of the list. In Fixed length, a
+        clip of that length at the start of each scene that is long enough for one."""
+        if not self.info or self.clips is None or not self._scenes_known():
+            return
+        info = self.info
+        fd = info.frame_duration
+        if self.fixed:
+            lo, hi = info.start_time, info.end_time
+        else:
+            lo, hi = self._export_range() or (info.start_time, info.end_time)
+        scenes = scenes_between(self.scene_cuts, lo, hi)
+        ranges: list[tuple[float, float]] = []
+        if self.fixed:
+            length = self._fixed_duration()
+            ranges = [(a, a + length) for a, b in scenes if b - a >= length - fd / 4]
+            why = "shorter than the clip length"
+        else:
+            ranges = [(a, b) for a, b in scenes if b - a >= 3 * fd - fd / 4]
+            why = "shorter than 3 frames"
+        skipped = len(scenes) - len(ranges)
+        new = [e for e in (self._make_entry(a, b) for a, b in ranges) if self.clips.find(e) is None]
+        if not new:
+            msg = "Every scene is in the clip list already." if ranges else f"Every scene is {why}."
+            self.status.showMessage(msg, 5000)
+            return
+        if len(new) > 25 and QMessageBox.question(
+                self, "Clip list", f"Add {len(new)} scenes to the clip list?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) != QMessageBox.Yes:
+            return
+        self.clips.entries.extend(new)
+        self._save_clips()
+        self._refresh_clips()
+        msg = f"Added {len(new)} scene{'s' if len(new) != 1 else ''} to the clip list."
+        if len(ranges) > len(new):
+            msg += f" {len(ranges) - len(new)} already there."
+        if skipped:
+            msg += f" {skipped} left out ({why})."
+        self.status.showMessage(msg, 8000)
 
     def goto_clip(self, entry: ClipEntry):
         """Show a clip of the list: the marks (or the fixed-length box) and the playhead go to it."""
@@ -2364,7 +2650,9 @@ class MainWindow(QMainWindow):
             self.quick_job.wait()
         self._probe_token += 1
         self._cancel_probes()
-        for t in list(self._probe_threads):
+        for t in self._scene_threads:
+            t.cancel()
+        for t in list(self._probe_threads) + list(self._scene_threads):
             t.wait()  # a QThread destroyed while running takes the process down with it
         for t in self._save_threads:
             t.join(30)  # frame PNGs still being written: finish them, don't leave half files
