@@ -67,8 +67,8 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             onChange={(v) => void act(() => update({ closeOnLaunch: v }))}
           />
           <Toggle
-            label="Show the latest README from GitHub"
-            hint="Off: show the copy that came with the launcher"
+            label="Get the latest READMEs and screenshots from GitHub"
+            hint="Changed ones are downloaded and kept, so no launcher update is needed. Off: show the copies that came with the launcher"
             checked={settings.liveReadme}
             onChange={(v) => void act(() => update({ liveReadme: v }))}
           />

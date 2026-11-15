@@ -215,6 +215,9 @@ and datasets can be uploaded on the Dataset tab.
 python -m rulztrainer.train --config configs/example.yaml --set steps=1000 --set job_name=cat_lora
 ```
 
+`python -m rulztrainer.checkrun` queues short runs of the features that have not run on a real model yet and reports
+which passed: see [Check run](#check-run-the-untested-features-on-a-real-model-rulztrainercheckrun).
+
 ## Running on vast.ai
 
 Everything needed is in `scripts/vast/` and the repo is public, so a template only has to point at it.
@@ -4243,6 +4246,116 @@ block swap above was estimated; this measures it. `RULZ_MEMORY_SNAPSHOT_STEP=N` 
 N with its Python stack and writes `memory_snapshot_step_N.pickle` to the job folder (`_oom` added when that step ran
 out of memory), to open on https://pytorch.org/memory_viz. Recording slows that step.
 
+## Check run: the untested features on a real model (`rulztrainer.checkrun`)
+
+**New in 3.21.0.** Several features here were released after unit tests on the CPU only (this README says so where
+it describes them). The check run turns trying them on a real model into one step: it queues a set of short training
+runs, each switching on one such feature, and afterwards reads the job folders and writes a pass / fail table.
+
+**The check run itself has not been run on a real model yet.** It was built and tested with made-up job folders on
+the CPU, so its first real use also tests the check run: read a failed case's checks before taking its word.
+
+```bash
+python -m rulztrainer.checkrun --list                                # the cases, what each sets, needs and is checked for
+python -m rulztrainer.checkrun queue --config my_run.yaml --dry-run  # the plan on your config; nothing is queued
+python -m rulztrainer.checkrun queue --config my_run.yaml            # add the runs to the WebUI's queue
+python -m rulztrainer.checkrun report                                # the table of the newest check run
+```
+
+It starts nothing itself. `queue` adds the runs to the WebUI's own training queue (Monitor tab), and the WebUI starts
+them one after another, so keep it open; if the queue shows paused, press Resume or queue with `--resume`. Each run
+is 30 steps by default (`--steps`), so the time goes into loading the model once per run.
+
+**The base config** (`--config`) is a config that already trains on that machine: its model, dataset and output
+folder (a `config.yaml` from a job folder works). Every run is that config made short and plain, plus the settings of
+its one case. Short and plain means: the step count, one save and one sample at the end, no probes, no race, no
+resume, no fine-tune, no compile, no training maps, sweeps or held-out photos, no regularisation folder or LoRA
+Isolation, and two settings for the sake of the comparison:
+
+- `checkpoint_keep_blocks: 0`: its default fills the free GPU memory with kept activations, which would put every
+  run's peak VRAM at the card's size and make two runs impossible to compare;
+- `oom_retries: 0`: a run that runs out of memory would otherwise be started again by the WebUI with more block swap
+  and pass on settings its case never planned (the `oom_recovery` case sets it back to 3).
+
+The dry run lists every setting it changes and its value before. `--set key=value` changes the base config first.
+
+| Case | Switches on | Needs |
+| --- | --- | --- |
+| `baseline` | nothing: the short plain run itself. The other runs' peak VRAM and step time are shown beside it, and when it fails the base config is what to fix first | |
+| `reg_dir` | the [regularisation dataset](#regularisation-dataset-reg_dir) | `--reg-dir`, or `reg_dir` in the base config |
+| `block_swap_rank64` | [block swap](#block-swap-block_swap) at the count the wizard's memory plan gives a rank-64 LoRA, which counts the adapter | `--vram` |
+| `block_swap_lokr` | the same for a LoKr (factor 8) | `--vram` |
+| `block_swap_compile` | `block_swap_compile` with `compile_model: true`, on at least 4 swapped blocks | triton on that machine |
+| `activation_offload` | [activation offloading](#activation-offloading-activation_offload-experimental-untested) | |
+| `normuon` | `optimizer: normuon` | |
+| `oft_scaled_lr` | `oft_scaled_lr` on OFT blocks of 64, with `optimizer: adamw` (the self-tuning optimizers ignore it) | |
+| `oom_recovery` | [out-of-memory recovery](#when-something-goes-wrong): the run starts without gradient checkpointing so that it runs out of GPU memory, and the WebUI should start it again with it on | a card that holds the model without block swap |
+| `face_antelopev2` | likeness probes scored with `face_model: antelopev2` | `face_refs` in the base config |
+| `body_smplx_ratio` | `body_score: smplx_ratio` | `body_refs`, and NLF's model in `models/nlf` |
+| `relay_race_pick` | a relay race of two seeds over two rounds with `race_pick`; each round waits a minute for a pick on the Monitor, then the highest score leads, so it also finishes unattended | `face_refs` or `body_refs` |
+| `h3_image_likeness` | the *H3 Image likeness* recipe of the Train tab | a MiniMax-H3-Image base config |
+| `run_report` | `run_report` | matplotlib |
+
+A case whose needs are not met is left out and the plan says why; so is a case whose settings the trainer's own
+checks refuse with your base config (its message is shown). `--only a,b` and `--skip a,b` pick cases; a case that is
+read beside the baseline brings the baseline along.
+
+**What counts as a pass** is read from the files the run leaves in its job folder, nothing else:
+
+- every run: `status.json` says it finished without an error at its last step, the loss is a finite number and no
+  step was left out for non-finite gradients, the final LoRA was saved and the final sample was rendered;
+- the feature: the line it writes to `train.log` (for example `Regularisation dataset: N pictures in ...`, or
+  `Activation offload: N GB of block inputs sent to RAM` with N above 0), the `status.json` fields it sets, the files
+  it writes (`race.json`, `oom_recovery.json`), and for the probe cases a record of the trained LoRA in
+  `likeness.jsonl` measured with the face pack or body score asked for;
+- the two block swap plan cases: the peak VRAM stays within the `--vram` the plan was made for (the card size is
+  the driver's, in GiB, and the peak is converted to it), and the adapter holds no more than the plan counts. The
+  plan's count is `runplan.adapter_gb` of the run minus the baseline's. The measurement is the difference in peak
+  VRAM, with the swapped blocks' weights that are off the GPU added back on both sides: the GB the block swap line
+  logs, less the two blocks block swap keeps on the GPU at a time. More than 1 GB over fails the case: the plan would
+  then be too low on a card of that size. Three limits of this measurement: the peak is the whole process's, so a
+  baseline whose highest point was while loading hides an excess (the notes say so when the adapter measures far
+  under the count); a run that encoded prompts first had the text encoder on the GPU, so its peak is not compared
+  (queue the check run once more: the prompts are cached then); and a baseline on several GPUs is not compared.
+
+The table has each run's verdict, last step, average loss, peak VRAM (`peak_mem` in `status.json`: PyTorch's own
+count of what the training process allocated, which is below what nvidia-smi shows) and seconds per step, with the
+failed checks and the comparison with the baseline in the notes. The verdicts:
+
+| Verdict | Meaning |
+| --- | --- |
+| pass | every check held |
+| fail | the run failed, or a check of the feature did not hold; the notes name the check |
+| not exercised | the run finished, but the feature never got to act: torch.compile without triton, an out-of-memory case that never ran out of memory |
+| not finished | `status.json` has no end yet: still running or waiting, or the process was killed |
+| not started | no job folder, or none with a `status.json` |
+| skipped / refused | never queued: the plan's reason |
+
+`report` prints the table and saves it as `report.md` and `report.json` beside the check run's manifest
+(`output/_checkrun/<tag>/manifest.json`, written by `queue`: every case's job name, settings and what counts as a
+pass). Its exit status is 0 when nothing failed, 1 with a failed case and 2 when runs have not finished. Job names are
+`check_<tag>_<case>` (`--tag`, default the date and time); a tag that an earlier check run used is refused, and a
+name that is running, waiting or whose folder already holds a run's files gets the next free one, as the trainer
+refuses to start a run there.
+
+
+**`--vram`** is the card size in GB the block swap is planned for; without it the card is asked through nvidia-smi.
+A smaller number than the real card plans as for a smaller one (a 16 GB plan on a 24 GB card), which is how to try
+block swap on a card that would not need it; the peak VRAM is then held against that number.
+
+**On vast.ai:** `queue --fleet --vram 24` adds the runs to the [fleet](#several-instances-at-once-the-fleet)'s queue
+instead, so they go to the first instance that falls idle (`--instance ID` for one, `--push FOLDER` to send a dataset
+folder first, as `rulz_fleet.py queue add`). The base config's paths are then the instance's. Something has to look
+after the fleet's queue (the Fleet tab, or `rulz_fleet.py daemon`). The runs' logs and records are fetched as they
+run and `report` reads them from `~/.rulz_vast/runs/<instance>/<job>`; LoRA files are not fetched, so the report
+takes the final LoRA from `status.json`'s list of saved files. Or run the check run on the instance itself (over
+ssh) with `queue` and `report` there. The out-of-memory case needs that instance's WebUI to be the one that started
+the run, which it is either way.
+
+What it does not do: judge quality (30 steps show that a feature runs, not that it helps), cover features with no
+log line or file of their own to check (`likeness_best_min_kept`, `race_drop_drift` and `likeness_curriculum_framing`
+act only once probes drift), or rent, stop or pay for anything.
+
 ## Layout
 
 ```
@@ -4272,6 +4385,7 @@ rulztrainer/
   comfy_files.py   the single files per model; downloads.py Hugging Face downloads with progress
   runreport.py     run report (summary picture and PDF); history.py run history for Previous Runs
   train_queue.py   the WebUI's training queue; oom_recovery.py out-of-memory restarts
+  checkrun.py      check run: short real-model runs of the untested features, and their pass / fail table
   optimizers/      Automagic 3 and 4, Keel, Muon / NorMuon, Hull
   train.py         CLI entry point
   moss/model.py    MOSS-Image DiT (vendored, Apache-2.0, OpenMOSS)
