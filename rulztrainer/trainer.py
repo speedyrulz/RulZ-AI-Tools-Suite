@@ -13,6 +13,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from PIL import Image
@@ -188,6 +189,38 @@ def free_cuda():
     gc.collect()
     if torch.cuda.is_available() and torch.cuda.is_initialized():
         torch.cuda.empty_cache()
+
+
+def optimizer_carry(opt):
+    """What a fine-tune's next window takes over from the last window's optimizer (Automagic's adapted lr, Automagic
+    4's sensitivity reference), without the optimizer itself: holding that would keep the old window's weights,
+    gradients and state on the GPU. None for no optimizer."""
+    if opt is None:
+        return None
+    carry = SimpleNamespace()
+    if hasattr(opt, "get_avg_learning_rate"):
+        lr = float(opt.get_avg_learning_rate())
+        carry.get_avg_learning_rate = lambda: lr
+    ref = getattr(opt, "_ref", None)
+    if ref is not None:
+        carry._ref = ref
+    return carry
+
+
+def release_optimizer(opt) -> None:
+    """Let an optimizer's parameters, gradients and state go now. A gradient hook (Keel, Automagic 3) makes a cycle,
+    parameter -> hook -> optimizer -> parameter, that reference counting never frees: without this the old window
+    of a fine-tune stayed on the GPU until Python's next full garbage collection, and the windows piled up."""
+    if opt is None:
+        return
+    for h in getattr(opt, "_hook_handles", None) or []:
+        h.remove()
+    if hasattr(opt, "_hook_handles"):
+        opt._hook_handles = []
+    for g in opt.param_groups:
+        for p in g["params"]:
+            p.grad = None
+    opt.state.clear()
 
 
 def unload_model(model) -> None:
@@ -1567,7 +1600,12 @@ class Trainer(RaceParallelMixin):
         def ft_rotate(at_step: int) -> None:
             """A fine-tune's next window: the trained one written back, the next one up, a fresh optimizer."""
             nonlocal params, optimizer, scheduler
-            params, optimizer, scheduler = self._finetune_rotate(cfg, at_step, optimizer)
+            # the old window's optimizer let go of first: still held while the next window comes up, its weights,
+            # gradients and state (about 15 bytes per weight with Keel) sat beside the new window's on the GPU
+            carry = optimizer_carry(optimizer)
+            release_optimizer(optimizer)
+            params, optimizer, scheduler = [], None, None
+            params, optimizer, scheduler = self._finetune_rotate(cfg, at_step, carry)
 
         def crash_save():
             """After an error: the LoRA as it stands, with a training state to go on from where the run can have one."""
@@ -1699,14 +1737,14 @@ class Trainer(RaceParallelMixin):
                 continue
             if self.dp is not None:  # (Keel scales each replica's sum by the step's band and counts its vote)
                 self.dp.reduce_grads(take=getattr(optimizer, "take_replica", None))
-            gather = getattr(optimizer, "gather", None)
-            if gather is not None:  # Keel: the micro-batch sums join the replicas' on p.grad for the clip
-                gather()
+            # (called through the optimizer, never kept in a local: a bound method left in this loop's scope held a
+            # fine-tune's old optimizer, and its window's fp32 weights, on the GPU through the next window's first step)
+            if getattr(optimizer, "gather", None) is not None:  # Keel: the micro-batch sums join the replicas' on
+                optimizer.gather()                              # p.grad for the clip
             grad_norm = step_grad_norm(params, cfg.clip_norm)
             if bad_gradients(params, grad_norm):  # the step counts, but nothing of it reaches the LoRA
-                disarm = getattr(optimizer, "disarm", None)
-                if disarm is not None:  # Keel: no step() to end its accumulation (zero_grad arms it again)
-                    disarm()
+                if getattr(optimizer, "disarm", None) is not None:  # Keel: no step() to end its accumulation
+                    optimizer.disarm()                              # (zero_grad arms it again)
                 self.bad_steps += 1
                 self._skip_bad_step(step + 1, self.bad_steps)
                 if not math.isfinite(accum_loss):  # (the chart and the running average stay readable)
@@ -2027,9 +2065,16 @@ class Trainer(RaceParallelMixin):
             log.info("Fine-tune: cycle %d complete at step %d (every window trained)", ft.cycles, step)
         from .finetune import describe_window
 
-        log.info("Fine-tune: window %d of %d (%s) from step %d", nxt + 1, len(ft.windows), describe_window(ft.windows[nxt]),
-                 step)
+        log.info("Fine-tune: window %d of %d (%s) from step %d%s", nxt + 1, len(ft.windows),
+                 describe_window(ft.windows[nxt]), step, self._ft_gpu_note())
         return self._finetune_window(cfg, nxt, step, prev)
+
+    def _ft_gpu_note(self) -> str:
+        """", 12.3 GiB in use on the GPU" between two windows: what the trunk and the run hold with no window up."""
+        dev = self.devices[0]
+        if not (str(dev).startswith("cuda") and torch.cuda.is_available()):
+            return ""
+        return f", {torch.cuda.memory_allocated(torch.device(dev)) / 2**30:.1f} GiB in use on the GPU"
 
     def _finetune_cycle_done(self, step: int) -> bool:
         """True at the steps that end a cycle (the last window's last step)."""
